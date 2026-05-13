@@ -66,6 +66,12 @@ jobs:
           head-sha: ${{ github.event.pull_request.head.sha }}
 ```
 
+## 本仓库的自托管 Gate
+
+本 action 仓库也在 `.github/workflows/codex-review-gate.yml` 中为自己的 PR 启用了 `codex/review-gate`。因为该 workflow 是 privileged `pull_request_target` automation，它会 checkout `github.event.repository.default_branch`，再通过 `uses: ./` 调用可信 default branch 上的本地 action；不会运行 PR 提供的 action 代码，也不依赖可移动 release tag。
+
+与任何首次启用一样，引入该 workflow 的 PR 要等 workflow 合入 default branch 后，才能完整验证 `pull_request_target` 路径。
+
 ## Inputs
 
 | Input | 默认值 | 说明 |

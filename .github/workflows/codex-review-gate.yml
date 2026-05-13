@@ -1,0 +1,40 @@
+name: Codex Review Gate
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to gate
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: codex-review-gate-${{ github.event.pull_request.number || github.event.inputs.pull_request || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  codex-review-gate:
+    name: codex/review-gate runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    steps:
+      - name: Check out trusted default-branch action
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Run Codex review gate
+        uses: ./
+        with:
+          github-token: ${{ github.token }}
+          pull-request: ${{ github.event.pull_request.number || github.event.inputs.pull_request }}
+          head-sha: ${{ github.event.pull_request.head.sha }}

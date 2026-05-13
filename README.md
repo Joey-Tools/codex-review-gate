@@ -66,6 +66,12 @@ jobs:
           head-sha: ${{ github.event.pull_request.head.sha }}
 ```
 
+## Self-Gating This Repository
+
+This action repository also enables `codex/review-gate` for its own pull requests in `.github/workflows/codex-review-gate.yml`. Because that workflow is privileged `pull_request_target` automation, it checks out `github.event.repository.default_branch` and invokes the trusted local action with `uses: ./`; it does not run PR-supplied action code or depend on a movable release tag.
+
+As with any first rollout, the PR that introduces the workflow cannot fully exercise the `pull_request_target` path until the workflow exists on the default branch.
+
 ## Inputs
 
 | Input | Default | Description |
