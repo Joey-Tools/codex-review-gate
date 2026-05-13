@@ -1,0 +1,90 @@
+name: Codex Review Gate
+description: Gate a pull request on a controlled Codex review signal.
+
+inputs:
+  github-token:
+    description: Token used to read PR review state, create comments, and write commit statuses.
+    required: true
+  pull-request:
+    description: Pull request number to gate.
+    required: true
+  head-sha:
+    description: Expected PR head SHA. Leave empty for workflow_dispatch lookups.
+    required: false
+    default: ""
+  status-context:
+    description: Commit status context written by the gate.
+    required: false
+    default: "codex/review-gate"
+  state-marker:
+    description: Hidden HTML marker used for the sticky state comment.
+    required: false
+    default: "codex-review-gate-state"
+  marker-comment-marker:
+    description: Hidden HTML marker used for controlled Codex request comments.
+    required: false
+    default: "codex-review-gate-marker"
+  max-wait-seconds:
+    description: Overall maximum wait time before failing closed.
+    required: false
+    default: "7200"
+  marker-timeout-seconds:
+    description: Time to wait for a controlled marker before marking it stalled and retrying.
+    required: false
+    default: "3600"
+  marker-ack-timeout-seconds:
+    description: Initial time to wait for Codex to acknowledge a marker before retrying.
+    required: false
+    default: "300"
+  marker-ack-timeout-max-seconds:
+    description: Maximum exponential backoff wait for unacknowledged markers.
+    required: false
+    default: "1800"
+  poll-interval-seconds:
+    description: Poll interval for GitHub PR review signals.
+    required: false
+    default: "30"
+  bootstrap-grace-seconds:
+    description: Initial quiet period used to baseline PR-open automatic Codex review signals.
+    required: false
+    default: "60"
+  bootstrap-timeout-seconds:
+    description: Deprecated compatibility input. Bootstrap now closes after the grace period and starts a controlled marker.
+    required: false
+    default: "3600"
+  codex-bot-logins:
+    description: Comma-separated GitHub logins accepted as Codex bot identities.
+    required: false
+    default: "chatgpt-codex-connector,chatgpt-codex-connector[bot]"
+  trusted-comment-logins:
+    description: Comma-separated GitHub logins trusted for gate state and marker comments.
+    required: false
+    default: "github-actions[bot]"
+
+runs:
+  using: composite
+  steps:
+    - name: Run Codex review gate
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+        GITHUB_API_URL: ${{ github.api_url }}
+        PR_NUMBER: ${{ inputs.pull-request }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        STATUS_CONTEXT: ${{ inputs.status-context }}
+        STATE_MARKER: ${{ inputs.state-marker }}
+        MARKER_COMMENT: ${{ inputs.marker-comment-marker }}
+        MAX_WAIT_SECONDS: ${{ inputs.max-wait-seconds }}
+        MARKER_TIMEOUT_SECONDS: ${{ inputs.marker-timeout-seconds }}
+        MARKER_ACK_TIMEOUT_SECONDS: ${{ inputs.marker-ack-timeout-seconds }}
+        MARKER_ACK_TIMEOUT_MAX_SECONDS: ${{ inputs.marker-ack-timeout-max-seconds }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+        BOOTSTRAP_GRACE_SECONDS: ${{ inputs.bootstrap-grace-seconds }}
+        BOOTSTRAP_TIMEOUT_SECONDS: ${{ inputs.bootstrap-timeout-seconds }}
+        CODEX_BOT_LOGINS: ${{ inputs.codex-bot-logins }}
+        TRUSTED_COMMENT_LOGINS: ${{ inputs.trusted-comment-logins }}
+      run: node "$GITHUB_ACTION_PATH/src/gate.mjs"
