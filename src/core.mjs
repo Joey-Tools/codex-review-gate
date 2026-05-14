@@ -294,6 +294,10 @@ export function hasNewEyesTransition(baselineEyes, currentEyes, markerCreatedAt)
   return !sameReactionIdentity(baselineEyes, currentEyes);
 }
 
+export function markerCanAcceptAckSignal(activeMarker) {
+  return activeMarker?.state === "waiting_ack";
+}
+
 export function hasNewCompletionComment(
   baselineComment,
   currentComment,

@@ -244,6 +244,8 @@ If the sticky state comment exists but marker creation failed before a marker co
 
 Scheduled runs process retry deadlines. They should scan open PRs, load state only for candidate PRs, and advance markers whose `nextRetryAt`, `ackDeadlineAt`, or `resultDeadlineAt` has elapsed.
 
+If a scheduled or manual scan fails while processing a specific PR, the gate writes an `error` status to that PR head before reporting the aggregate scan failure. This keeps a previous `success` status from surviving an inconclusive recovery run.
+
 Consecutive `missed_ack` outcomes on the same head use exponential backoff. A head change or any non-`missed_ack` outcome resets that ack backoff history for the new marker.
 
 ## Branch Protection

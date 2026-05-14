@@ -28,6 +28,7 @@ import {
   isCodexBot,
   isRetryableHttpStatus,
   markerAckTimeoutSecondsForHistory,
+  markerCanAcceptAckSignal,
   markerFromComment,
   markerTimeoutOutcome,
   normalizeEventMode,
@@ -256,12 +257,34 @@ async function scanOpenPullRequests(trigger) {
     } catch (error) {
       failures += 1;
       console.error(`failed to process PR #${pullRequest.number}: ${error.stack || error.message}`);
+      await failClosedScannedPullRequest(pullRequest, error);
     }
   }
 
   if (failures > 0) {
     statusReady = false;
     throw new Error(`failed to process ${failures} pull request(s)`);
+  }
+}
+
+async function failClosedScannedPullRequest(pullRequest, error) {
+  activePrNumber = pullRequest.number;
+  statusSha = statusSha || pullRequest.head?.sha || "";
+  statusReady = false;
+  if (!statusSha) {
+    console.error(`failed to set ${STATUS_CONTEXT}=error for PR #${activePrNumber}: missing head SHA`);
+    return;
+  }
+
+  try {
+    await setCommitStatus("error", `Codex review gate errored while scanning PR #${activePrNumber}`);
+  } catch (statusError) {
+    console.error(
+      `failed to set ${STATUS_CONTEXT}=error for PR #${activePrNumber} ` +
+        `after ${error.name || "Error"}: ${statusError.message}`,
+    );
+  } finally {
+    statusReady = false;
   }
 }
 
@@ -520,7 +543,10 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
       return { kind: "done", state, stateComment };
     }
 
-    if (hasNewEyesTransition(activeMarker.baseline?.eyes, snapshot.reactions.eyes, activeMarker.createdAt)) {
+    if (
+      markerCanAcceptAckSignal(activeMarker) &&
+      hasNewEyesTransition(activeMarker.baseline?.eyes, snapshot.reactions.eyes, activeMarker.createdAt)
+    ) {
       state = normalizeState({
         ...state,
         updatedAt: isoNow(),
@@ -537,6 +563,7 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
     const submittedReview = selectLatestCodexSubmittedReview(snapshot.reviews, config.codexBotLogins);
     if (
       submittedReview &&
+      markerCanAcceptAckSignal(activeMarker) &&
       hasNewReviewTransition(activeMarker.baseline?.submittedReview, submittedReview, activeMarker.createdAt)
     ) {
       state = normalizeState({

@@ -26,6 +26,7 @@ import {
   isRetryableHttpStatus,
   issueCommentIdentity,
   markerAckTimeoutSecondsForHistory,
+  markerCanAcceptAckSignal,
   markerFromComment,
   markerTimeoutOutcome,
   NonJsonResponseError,
@@ -439,6 +440,30 @@ test("new eyes transition prevents marker ack timeout once state is waiting-resu
     ),
     false,
   );
+});
+
+test("waiting-result markers do not consume repeated ack signals before stalled retry", () => {
+  const activeMarker = {
+    state: "waiting_result",
+    createdAt: "2026-04-26T10:00:00Z",
+    resultDeadlineAt: "2026-04-26T10:10:00Z",
+    maxWaitDeadlineAt: "2026-04-26T12:00:00Z",
+  };
+  const eyes = {
+    id: "1",
+    content: "eyes",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+  const review = {
+    id: "2",
+    submittedAt: "2026-04-26T10:02:00Z",
+  };
+
+  assert.equal(markerTimeoutOutcome(activeMarker, Date.parse("2026-04-26T10:11:00Z")), "stalled");
+  assert.equal(hasNewEyesTransition(null, eyes, activeMarker.createdAt), true);
+  assert.equal(hasNewReviewTransition(null, review, activeMarker.createdAt), true);
+  assert.equal(markerCanAcceptAckSignal(activeMarker), false);
 });
 
 test("requires Codex completion comments to be after the marker", () => {
