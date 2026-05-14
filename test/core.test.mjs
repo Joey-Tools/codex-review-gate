@@ -25,6 +25,7 @@ import {
   issueCommentIdentity,
   markerAckTimeoutSecondsForHistory,
   markerFromComment,
+  markerTimeoutOutcome,
   NonJsonResponseError,
   normalizeEventMode,
   normalizeMarkerAckTimeoutSeconds,
@@ -337,6 +338,32 @@ test("uses fallback ack timeout for older active marker state", () => {
       300,
     ),
     true,
+  );
+});
+
+test("max wait timeout takes precedence over marker retry outcomes", () => {
+  assert.equal(
+    markerTimeoutOutcome(
+      {
+        state: "waiting_ack",
+        ackDeadlineAt: "2026-04-26T10:01:00Z",
+        nextRetryAt: "2026-04-26T10:01:00Z",
+        maxWaitDeadlineAt: "2026-04-26T10:02:00Z",
+      },
+      Date.parse("2026-04-26T10:03:00Z"),
+    ),
+    "max_wait",
+  );
+  assert.equal(
+    markerTimeoutOutcome(
+      {
+        state: "waiting_result",
+        resultDeadlineAt: "2026-04-26T10:01:00Z",
+        maxWaitDeadlineAt: "2026-04-26T10:02:00Z",
+      },
+      Date.parse("2026-04-26T10:03:00Z"),
+    ),
+    "max_wait",
   );
 });
 

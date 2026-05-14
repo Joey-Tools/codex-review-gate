@@ -316,6 +316,28 @@ export function activeMarkerAckTimedOut(activeMarker, nowMs, fallbackAckTimeoutS
   return markerAgeMs >= ackTimeoutSeconds * 1000;
 }
 
+export function markerTimeoutOutcome(activeMarker, nowMs = Date.now()) {
+  if (activeMarker.maxWaitDeadlineAt && nowMs >= parseTimestamp(activeMarker.maxWaitDeadlineAt, "max wait deadline")) {
+    return "max_wait";
+  }
+  if (
+    activeMarker.state === "waiting_ack" &&
+    activeMarker.ackDeadlineAt &&
+    nowMs >= parseTimestamp(activeMarker.ackDeadlineAt, "marker ack deadline") &&
+    (!activeMarker.nextRetryAt || nowMs >= parseTimestamp(activeMarker.nextRetryAt, "marker retry deadline"))
+  ) {
+    return "missed_ack";
+  }
+  if (
+    activeMarker.state === "waiting_result" &&
+    activeMarker.resultDeadlineAt &&
+    nowMs >= parseTimestamp(activeMarker.resultDeadlineAt, "marker result deadline")
+  ) {
+    return "stalled";
+  }
+  return null;
+}
+
 export function codexAutoReviewLooksOngoing(reactions) {
   if (!reactions.eyes) {
     return false;
