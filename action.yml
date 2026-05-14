@@ -7,9 +7,10 @@ inputs:
     required: true
   pull-request:
     description: Pull request number to gate.
-    required: true
+    required: false
+    default: ""
   head-sha:
-    description: Expected PR head SHA. Leave empty for workflow_dispatch lookups.
+    description: Deprecated compatibility input. Event-driven runs load the current PR head from GitHub.
     required: false
     default: ""
   status-context:
@@ -41,11 +42,11 @@ inputs:
     required: false
     default: "1800"
   poll-interval-seconds:
-    description: Poll interval for GitHub PR review signals.
+    description: Deprecated compatibility input. Event-driven runs do not poll.
     required: false
     default: "30"
   bootstrap-grace-seconds:
-    description: Initial quiet period used to baseline PR-open automatic Codex review signals.
+    description: Deprecated compatibility input. Event-driven runs create controlled markers directly.
     required: false
     default: "60"
   bootstrap-timeout-seconds:
@@ -60,6 +61,10 @@ inputs:
     description: Comma-separated GitHub logins trusted for gate state and marker comments.
     required: false
     default: "github-actions[bot]"
+  event-mode:
+    description: Event processing mode: standard, comment-only, or full.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -85,6 +90,7 @@ runs:
         POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
         BOOTSTRAP_GRACE_SECONDS: ${{ inputs.bootstrap-grace-seconds }}
         BOOTSTRAP_TIMEOUT_SECONDS: ${{ inputs.bootstrap-timeout-seconds }}
+        EVENT_MODE_INPUT: ${{ inputs.event-mode }}
         CODEX_BOT_LOGINS: ${{ inputs.codex-bot-logins }}
         TRUSTED_COMMENT_LOGINS: ${{ inputs.trusted-comment-logins }}
       run: node "$GITHUB_ACTION_PATH/src/gate.mjs"

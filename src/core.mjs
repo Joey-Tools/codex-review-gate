@@ -41,6 +41,29 @@ export function parseLoginSet(raw, fallback) {
   );
 }
 
+export function normalizeEventMode(raw) {
+  const mode = raw || "standard";
+  if (mode === "standard" || mode === "comment-only" || mode === "full") {
+    return mode;
+  }
+  throw new Error("CODEX_REVIEW_GATE_EVENT_MODE must be exactly standard, comment-only, or full");
+}
+
+export function eventModeHandlesEvent(eventName, eventMode = "standard") {
+  const mode = normalizeEventMode(eventMode);
+  if (eventName === "pull_request_review") {
+    return mode !== "comment-only";
+  }
+  if (eventName === "pull_request_review_comment") {
+    return mode === "full";
+  }
+  return true;
+}
+
+export function autoRetryEnabled(raw) {
+  return String(raw || "").trim().toLowerCase() !== "false";
+}
+
 export function isRetryableHttpStatus(status) {
   return RETRYABLE_HTTP_STATUSES.has(Number(status));
 }
@@ -579,6 +602,11 @@ export function buildMarkerCommentBody(marker) {
 
   if (marker.ackTimeoutSeconds !== undefined) {
     hidden.ackTimeoutSeconds = marker.ackTimeoutSeconds;
+  }
+  for (const key of ["ackDeadlineAt", "resultDeadlineAt", "nextRetryAt", "headStartedAt", "maxWaitDeadlineAt"]) {
+    if (marker[key] !== undefined) {
+      hidden[key] = marker[key];
+    }
   }
 
   return ["@codex review", "", buildHiddenJson(MARKER_COMMENT, hidden)].join("\n");

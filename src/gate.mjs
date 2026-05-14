@@ -1,28 +1,32 @@
 #!/usr/bin/env node
 
+import { readFileSync } from "node:fs";
+
 import {
   DEFAULT_CODEX_BOT_LOGINS,
   DEFAULT_TRUSTED_COMMENT_LOGINS,
   GateFailure,
   NonJsonResponseError,
   STATUS_CONTEXT,
-  activeMarkerAckTimedOut,
   activeMarkerIsObsolete,
+  addSeconds,
+  autoRetryEnabled,
   buildMarkerCommentBody,
   buildStateCommentBody,
   closeActiveMarker,
   collectCurrentHeadCodexFindings,
   createInitialState,
-  decideBootstrapProgress,
+  eventModeHandlesEvent,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
   hasNewCompletionComment,
   hasNewEyesTransition,
-  hasNewPlusOneTransition,
   isoNow,
+  isCodexBot,
   isRetryableHttpStatus,
   markerAckTimeoutSecondsForHistory,
   markerFromComment,
+  normalizeEventMode,
   normalizeState,
   normalizeMarkerAckTimeoutSeconds,
   parseLoginSet,
@@ -96,6 +100,7 @@ const REVIEW_THREAD_COMMENTS_QUERY = `
   }
 `;
 
+let activePrNumber = config.prNumber;
 let statusSha = config.headSha;
 let statusReady = false;
 const MAX_REQUEST_ATTEMPTS = 4;
@@ -119,75 +124,204 @@ main().catch(async (error) => {
 });
 
 async function main() {
-  const pullRequest = await loadPullRequest();
-  statusSha = statusSha || pullRequest.head.sha;
-
-  await setCommitStatus("pending", "Waiting for Codex review on current head");
-  statusReady = true;
-  failIfLoadedPullRequestHeadChanged(pullRequest, "before starting Codex review");
-
-  if (pullRequest.draft) {
-    console.log(`PR #${config.prNumber} is draft; leaving ${STATUS_CONTEXT} pending.`);
+  const trigger = readTrigger();
+  if (trigger.kind === "skip") {
+    console.log(trigger.reason);
     return;
   }
 
-  await driveGate();
+  if (trigger.kind === "scan") {
+    await scanOpenPullRequests(trigger);
+    return;
+  }
+
+  await processPullRequest(trigger.prNumber, trigger);
 }
 
-async function driveGate() {
-  const deadline = Date.now() + config.maxWaitMs;
-  let stateComment = null;
-  let state = null;
+function readTrigger() {
+  const eventName = process.env.GITHUB_EVENT_NAME || "";
+  const event = readEventPayload();
+  if (config.prNumber && (!eventName || eventName === "workflow_dispatch")) {
+    return { kind: "single", prNumber: config.prNumber, allowCreateMarker: true };
+  }
+  if (!eventModeHandlesEvent(eventName, config.eventMode)) {
+    return {
+      kind: "skip",
+      reason: `Skipping ${eventName}; event mode is ${config.eventMode}.`,
+    };
+  }
 
-  while (true) {
-    await failIfPullRequestHeadChanged();
-    const snapshot = await loadSnapshot();
-    failIfCurrentHeadHasCodexFindings(snapshot.findings);
+  if (eventName === "workflow_dispatch") {
+    return { kind: "scan", allowCreateMarker: true };
+  }
 
-    ({ state, stateComment } = await ensureState(snapshot, state, stateComment));
+  if (eventName === "schedule") {
+    if (!autoRetryEnabled(config.autoRetry)) {
+      return { kind: "skip", reason: "Scheduled retry is disabled." };
+    }
+    return { kind: "scan", allowCreateMarker: false };
+  }
+
+  if (eventName === "pull_request_target") {
+    const number = Number(event.pull_request?.number || "");
+    return number > 0
+      ? { kind: "single", prNumber: number, allowCreateMarker: true }
+      : { kind: "skip", reason: "pull_request_target event did not include a PR number." };
+  }
+
+  if (eventName === "issue_comment") {
+    if (!event.issue?.pull_request) {
+      return { kind: "skip", reason: "Issue comment is not on a pull request." };
+    }
+    if (!isCodexBot(event.comment?.user?.login, config.codexBotLogins)) {
+      return { kind: "skip", reason: "Issue comment was not posted by a configured Codex bot." };
+    }
+    const number = Number(event.issue?.number || "");
+    return number > 0
+      ? { kind: "single", prNumber: number, allowCreateMarker: false }
+      : { kind: "skip", reason: "issue_comment event did not include a PR number." };
+  }
+
+  if (eventName === "pull_request_review") {
+    if (!isCodexBot(event.review?.user?.login, config.codexBotLogins)) {
+      return { kind: "skip", reason: "Pull request review was not submitted by a configured Codex bot." };
+    }
+    const number = Number(event.pull_request?.number || "");
+    return number > 0
+      ? { kind: "single", prNumber: number, allowCreateMarker: false }
+      : { kind: "skip", reason: "pull_request_review event did not include a PR number." };
+  }
+
+  if (eventName === "pull_request_review_comment") {
+    if (!isCodexBot(event.comment?.user?.login, config.codexBotLogins)) {
+      return {
+        kind: "skip",
+        reason: "Pull request review comment was not posted by a configured Codex bot.",
+      };
+    }
+    const number = Number(event.pull_request?.number || "");
+    return number > 0
+      ? { kind: "single", prNumber: number, allowCreateMarker: false }
+      : { kind: "skip", reason: "pull_request_review_comment event did not include a PR number." };
+  }
+
+  return { kind: "skip", reason: `Unsupported event ${eventName || "<unknown>"}.` };
+}
+
+function readEventPayload() {
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath) {
+    return {};
+  }
+  try {
+    return JSON.parse(readFileSync(eventPath, "utf8"));
+  } catch (error) {
+    throw new Error(`failed to read GITHUB_EVENT_PATH: ${error.message}`);
+  }
+}
+
+async function scanOpenPullRequests(trigger) {
+  const pullRequests = await paginate(repoPath + "/pulls", { state: "open", per_page: "100" });
+  let failures = 0;
+
+  for (const pullRequest of pullRequests) {
+    try {
+      await processPullRequest(pullRequest.number, {
+        ...trigger,
+        allowCreateMarker: trigger.allowCreateMarker === true,
+        scan: true,
+      });
+    } catch (error) {
+      failures += 1;
+      console.error(`failed to process PR #${pullRequest.number}: ${error.stack || error.message}`);
+    }
+  }
+
+  if (failures > 0) {
+    statusReady = false;
+    throw new Error(`failed to process ${failures} pull request(s)`);
+  }
+}
+
+async function processPullRequest(prNumber, trigger) {
+  activePrNumber = prNumber;
+  statusSha = "";
+  statusReady = false;
+
+  const pullRequest = await loadPullRequest();
+  statusSha = pullRequest.head.sha;
+
+  if (pullRequest.draft) {
+    if (trigger.kind === "scan") {
+      console.log(`PR #${activePrNumber} is draft; skipping scheduled scan.`);
+      return;
+    }
+    await setCommitStatus("pending", "Draft PR is waiting for Codex review gate");
+    statusReady = true;
+    console.log(`PR #${activePrNumber} is draft; leaving ${STATUS_CONTEXT} pending.`);
+    return;
+  }
+
+  if (trigger.kind === "scan" && !trigger.allowCreateMarker) {
+    const comments = await paginate(`${repoPath}/issues/${activePrNumber}/comments`, { per_page: "100" });
+    const stateComment = findLatestTrustedStateComment(comments, config.trustedCommentLogins);
+    if (!stateComment) {
+      console.log(`PR #${activePrNumber} has no gate state; skipping scheduled scan.`);
+      return;
+    }
+  }
+
+  const snapshot = await loadSnapshot();
+
+  let { state, stateComment: savedStateComment } = await ensureState(snapshot, null, null);
+  state = migrateStateForEventDrivenDeadlines(state);
+
+  if (trigger.kind === "scan" && !trigger.allowCreateMarker && !state.activeMarker) {
+    console.log(`PR #${activePrNumber} has no active marker; skipping scheduled scan.`);
+    return;
+  }
+
+  let allowCreateMarker = trigger.allowCreateMarker;
+  if (state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha)) {
+    if (state.activeMarker) {
+      state = closeActiveMarker(state, "obsolete_head", isoNow(), { currentHeadSha: statusSha });
+      savedStateComment = await saveState(state, savedStateComment);
+    }
+    allowCreateMarker = true;
+    await setCommitStatus("pending", "Waiting for Codex review on current head");
+    statusReady = true;
     state = updateStateForStatus(state, {
       now: isoNow(),
       statusHead: statusSha,
       runUrl,
       status: "pending",
     });
+  } else {
+    statusReady = true;
+  }
 
-    const bootstrapResult = await advanceBootstrap(state, stateComment, snapshot);
-    state = bootstrapResult.state;
-    stateComment = bootstrapResult.stateComment;
-    if (bootstrapResult.kind === "wait") {
-      await waitOrTimeout(deadline, bootstrapResult.description);
-      continue;
-    }
+  if (snapshot.findings.count > 0) {
+    await failFromFindings(snapshot.findings, state, savedStateComment);
+    return;
+  }
 
-    const markerResult = await advanceMarker(state, stateComment, snapshot);
-    state = markerResult.state;
-    stateComment = markerResult.stateComment;
+  if (
+    !state.activeMarker &&
+    state.lastStatus?.headSha === statusSha &&
+    state.lastStatus?.state === "success"
+  ) {
+    console.log(`PR #${activePrNumber} already has a successful ${STATUS_CONTEXT} for ${statusSha}.`);
+    return;
+  }
 
-    if (markerResult.kind === "pass") {
-      await failIfPullRequestHeadChanged("before passing Codex review gate");
-      const finalSnapshot = await loadSnapshot();
-      failIfCurrentHeadHasCodexFindings(finalSnapshot.findings);
-      await setCommitStatus("success", "Codex completion observed and current head has no Codex findings");
-      state = closeActiveMarker(state, "passed", isoNow(), {
-        observedPlusOne: state.activeMarker?.observedPlusOne || snapshot.reactions.plusOne,
-        observedCompletionComment:
-          state.activeMarker?.observedCompletionComment || snapshot.completionComment,
-      });
-      try {
-        stateComment = await saveState(state, stateComment);
-      } catch (stateError) {
-        console.error(`failed to close gate marker after success: ${stateError.message}`);
-      }
-      console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
-      return;
-    }
-
-    if (markerResult.kind === "continue") {
-      continue;
-    }
-
-    await waitOrTimeout(deadline, markerResult.description);
+  const result = await advanceEventDrivenMarker(
+    state,
+    savedStateComment,
+    snapshot,
+    { ...trigger, allowCreateMarker },
+  );
+  if (result.kind === "save") {
+    await saveState(result.state, result.stateComment);
   }
 }
 
@@ -234,202 +368,246 @@ async function ensureState(snapshot, previousState, previousComment) {
         findings: snapshot.findings,
       });
 
+  state.bootstrap = {
+    ...(state.bootstrap || {}),
+    status: "closed",
+    closedAt: state.bootstrap?.closedAt || now,
+    closeReason: state.bootstrap?.closeReason || "event_driven",
+  };
+
   const createdStateComment = await saveState(state, null);
   return { state, stateComment: createdStateComment };
 }
 
-async function advanceBootstrap(state, stateComment, snapshot) {
-  if (state.bootstrap?.status === "closed") {
-    return { kind: "continue", state, stateComment };
-  }
+async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) {
+  let allowCreateMarker = trigger.allowCreateMarker;
 
-  const now = isoNow();
-  const startedAt = state.bootstrap?.startedAt || now;
-  const bootstrapProgress = decideBootstrapProgress({
-    startedAt,
-    nowMs: Date.now(),
-    graceSeconds: config.bootstrapGraceSeconds,
-    reactions: snapshot.reactions,
-  });
+  for (let iteration = 0; iteration < 4; iteration += 1) {
+    if (!state.activeMarker) {
+      if (!allowCreateMarker) {
+        console.log(`PR #${activePrNumber} has no active marker; skipping ${trigger.kind} trigger.`);
+        return { kind: "done", state, stateComment };
+      }
 
-  state = normalizeState({
-    ...state,
-    updatedAt: now,
-    bootstrap: {
-      ...state.bootstrap,
-      status: bootstrapProgress.status,
-      startedAt,
-      graceEndsAt: bootstrapProgress.graceEndsAt,
-      baseline: snapshot.baseline,
-      currentHeadFindingIds: snapshot.findings.ids,
-      closedAt: bootstrapProgress.closedAt || state.bootstrap?.closedAt,
-      closeReason: bootstrapProgress.closeReason,
-      autoReviewLooksOngoing: bootstrapProgress.autoReviewLooksOngoing,
-    },
-  });
-
-  stateComment = await saveState(state, stateComment);
-
-  if (state.bootstrap.status === "closed") {
-    console.log(`Bootstrap baseline closed: ${state.bootstrap.closeReason}.`);
-    return { kind: "continue", state, stateComment };
-  }
-
-  return {
-    kind: "wait",
-    description: "Waiting for initial Codex auto-review baseline grace period",
-    state,
-    stateComment,
-  };
-}
-
-async function advanceMarker(state, stateComment, snapshot) {
-  if (!state.activeMarker) {
-    const marker = await createGateMarker(snapshot.baseline, state);
-    state = normalizeState({
-      ...state,
-      updatedAt: isoNow(),
-      activeMarker: marker,
-    });
-    stateComment = await saveState(state, stateComment);
-    await setCommitStatus("pending", "Waiting for Codex +1 on controlled review marker");
-    return {
-      kind: "wait",
-      description: `Created controlled Codex marker ${marker.url || `#${marker.id}`}`,
-      state,
-      stateComment,
-    };
-  }
-
-  let activeMarker = state.activeMarker;
-  if (activeMarkerIsObsolete(activeMarker, statusSha)) {
-    const closure = {
-      currentHeadSha: statusSha,
-      lastObservedPlusOne: snapshot.reactions.plusOne,
-      lastObservedEyes: snapshot.reactions.eyes,
-      lastObservedCompletionComment: snapshot.completionComment,
-    };
-    if (activeMarker.observedPlusOne) {
-      closure.observedPlusOne = activeMarker.observedPlusOne;
+      const marker = await createGateMarker(snapshot.baseline, state);
+      state = normalizeState({
+        ...state,
+        updatedAt: isoNow(),
+        activeMarker: marker,
+      });
+      stateComment = await saveState(state, stateComment);
+      await setCommitStatus("pending", "Waiting for Codex review on controlled marker");
+      console.log(`PR #${activePrNumber} is waiting for Codex review marker ${marker.id}.`);
+      return { kind: "done", state, stateComment };
     }
 
-    state = closeActiveMarker(state, "obsolete_head", isoNow(), closure);
-    stateComment = await saveState(state, stateComment);
-    await setCommitStatus("pending", "Previous Codex marker was for an obsolete head; retrying");
-    console.log(
-      `Closed obsolete Codex marker ${activeMarker.id} for ${activeMarker.headSha}; current head is ${statusSha}.`,
-    );
-    return { kind: "continue", state, stateComment };
-  }
+    state = migrateStateForEventDrivenDeadlines(state);
+    const activeMarker = state.activeMarker;
 
-  if (activeMarker.state === "pass_candidate") {
-    return { kind: "pass", state, stateComment };
-  }
+    if (activeMarkerIsObsolete(activeMarker, statusSha)) {
+      state = closeActiveMarker(state, "obsolete_head", isoNow(), { currentHeadSha: statusSha });
+      stateComment = await saveState(state, stateComment);
+      await setCommitStatus("pending", "Previous Codex marker was for an obsolete head");
+      allowCreateMarker = true;
+      continue;
+    }
 
-  if (hasNewEyesTransition(activeMarker.baseline?.eyes, snapshot.reactions.eyes, activeMarker.createdAt)) {
-    activeMarker = {
-      ...activeMarker,
-      state: "waiting_result",
-      observedEyes: snapshot.reactions.eyes,
-    };
-    state = normalizeState({
-      ...state,
-      updatedAt: isoNow(),
-      activeMarker,
-    });
-    stateComment = await saveState(state, stateComment);
-  }
+    const approvedReview = selectLatestCodexApprovedReview(snapshot.reviews, config.codexBotLogins);
+    if (hasNewReviewTransition(activeMarker.baseline?.approvedReview, approvedReview, activeMarker.createdAt)) {
+      await passGate(state, stateComment, snapshot, {
+        observedApprovedReview: approvedReview,
+      });
+      return { kind: "done", state, stateComment };
+    }
 
-  if (
-    hasNewPlusOneTransition(
-      activeMarker.baseline?.plusOne,
-      snapshot.reactions.plusOne,
-      activeMarker.createdAt,
-    )
-  ) {
-    state = normalizeState({
-      ...state,
-      updatedAt: isoNow(),
-      activeMarker: {
-        ...activeMarker,
-        state: "pass_candidate",
-        passCandidateAt: isoNow(),
-        observedPlusOne: snapshot.reactions.plusOne,
-      },
-    });
-    stateComment = await saveState(state, stateComment);
-    return { kind: "pass", state, stateComment };
-  }
-
-  if (
-    hasNewCompletionComment(
-      activeMarker.baseline?.completionComment,
-      snapshot.completionComment,
-      activeMarker.createdAt,
-    )
-  ) {
-    state = normalizeState({
-      ...state,
-      updatedAt: isoNow(),
-      activeMarker: {
-        ...activeMarker,
-        state: "pass_candidate",
-        passCandidateAt: isoNow(),
+    if (
+      hasNewCompletionComment(
+        activeMarker.baseline?.completionComment,
+        snapshot.completionComment,
+        activeMarker.createdAt,
+      )
+    ) {
+      await passGate(state, stateComment, snapshot, {
         observedCompletionComment: snapshot.completionComment,
-      },
-    });
-    stateComment = await saveState(state, stateComment);
-    return { kind: "pass", state, stateComment };
+      });
+      return { kind: "done", state, stateComment };
+    }
+
+    if (hasNewEyesTransition(activeMarker.baseline?.eyes, snapshot.reactions.eyes, activeMarker.createdAt)) {
+      state = normalizeState({
+        ...state,
+        updatedAt: isoNow(),
+        activeMarker: {
+          ...activeMarker,
+          state: "waiting_result",
+          observedEyes: snapshot.reactions.eyes,
+        },
+      });
+      stateComment = await saveState(state, stateComment);
+      return { kind: "done", state, stateComment };
+    }
+
+    const submittedReview = selectLatestCodexSubmittedReview(snapshot.reviews, config.codexBotLogins);
+    if (
+      submittedReview &&
+      hasNewReviewTransition(activeMarker.baseline?.submittedReview, submittedReview, activeMarker.createdAt)
+    ) {
+      state = normalizeState({
+        ...state,
+        updatedAt: isoNow(),
+        activeMarker: {
+          ...activeMarker,
+          state: "waiting_result",
+          observedReview: submittedReview,
+        },
+      });
+      stateComment = await saveState(state, stateComment);
+      return { kind: "done", state, stateComment };
+    }
+
+    const timeoutOutcome = markerTimeoutOutcome(activeMarker);
+    if (timeoutOutcome === "max_wait") {
+      state = closeActiveMarker(state, "timed_out", isoNow(), {
+        timedOutAfterSeconds: Math.round(config.maxWaitMs / 1000),
+      });
+      state = updateStateForStatus(state, {
+        now: isoNow(),
+        statusHead: statusSha,
+        runUrl,
+        status: "failure",
+      });
+      stateComment = await saveState(state, stateComment);
+      await setCommitStatus("failure", "Timed out waiting for Codex review signal");
+      return { kind: "done", state, stateComment };
+    }
+
+    if (timeoutOutcome === "missed_ack") {
+      state = closeActiveMarker(state, "missed_ack", isoNow(), {
+        ackTimeoutSeconds: activeMarker.ackTimeoutSeconds || config.markerAckTimeoutSeconds,
+        lastObservedEyes: snapshot.reactions.eyes,
+        lastObservedCompletionComment: snapshot.completionComment,
+      });
+      stateComment = await saveState(state, stateComment);
+      allowCreateMarker = true;
+      continue;
+    }
+
+    if (timeoutOutcome === "stalled") {
+      state = closeActiveMarker(state, "stalled", isoNow(), {
+        stalledAfterSeconds: Math.round(config.markerTimeoutMs / 1000),
+        lastObservedEyes: snapshot.reactions.eyes,
+        lastObservedCompletionComment: snapshot.completionComment,
+      });
+      stateComment = await saveState(state, stateComment);
+      allowCreateMarker = true;
+      continue;
+    }
+
+    console.log(`PR #${activePrNumber} has no due Codex review gate transition.`);
+    return { kind: "done", state, stateComment };
   }
 
-  const nowMs = Date.now();
-  const markerAgeMs = nowMs - parseTimestamp(activeMarker.createdAt, "marker creation time");
-  const ackTimeoutSeconds = activeMarker.ackTimeoutSeconds || config.markerAckTimeoutSeconds;
-  if (activeMarkerAckTimedOut(activeMarker, nowMs, config.markerAckTimeoutSeconds)) {
-    state = closeActiveMarker(state, "missed_ack", isoNow(), {
-      ackTimeoutSeconds,
-      lastObservedPlusOne: snapshot.reactions.plusOne,
-      lastObservedEyes: snapshot.reactions.eyes,
-      lastObservedCompletionComment: snapshot.completionComment,
-    });
-    stateComment = await saveState(state, stateComment);
-    await setCommitStatus("pending", "Codex review marker was not acknowledged; retrying");
-    console.log(
-      `Marker ${activeMarker.id} was not acknowledged after ${ackTimeoutSeconds}s; ` +
-        "re-baselining before retry.",
+  throw new Error(`PR #${activePrNumber} exceeded event-driven transition budget`);
+}
+
+async function passGate(state, stateComment, snapshot, observed) {
+  await failIfPullRequestHeadChanged("before passing Codex review gate");
+  const finalSnapshot = await loadSnapshot();
+  failIfCurrentHeadHasCodexFindings(finalSnapshot.findings);
+  const passedState = updateStateForStatus(closeActiveMarker(state, "passed", isoNow(), {
+    observedCompletionComment: observed.observedCompletionComment || snapshot.completionComment,
+    observedApprovedReview: observed.observedApprovedReview || null,
+  }), {
+    now: isoNow(),
+    statusHead: statusSha,
+    runUrl,
+    status: "success",
+  });
+  await saveState(passedState, stateComment);
+  await setCommitStatus("success", "Codex completion observed and current head has no Codex findings");
+  console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
+}
+
+async function failFromFindings(findings, state, stateComment) {
+  const sample = findings.samples[0];
+  const suffix = sample ? ` First finding: ${sample}` : "";
+  const failedState = state.activeMarker
+    ? closeActiveMarker(state, "failed_findings", isoNow(), {
+        currentHeadFindingIds: findings.ids,
+      })
+    : state;
+  const statusState = updateStateForStatus(failedState, {
+    now: isoNow(),
+    statusHead: statusSha,
+    runUrl,
+    status: "failure",
+  });
+  await saveState(statusState, stateComment);
+  await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
+  console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
+}
+
+function migrateStateForEventDrivenDeadlines(state) {
+  if (!state.activeMarker) {
+    return normalizeState(state);
+  }
+
+  const marker = state.activeMarker;
+  const createdAt = marker.createdAt || state.updatedAt || state.createdAt || isoNow();
+  const ackTimeoutSeconds =
+    marker.ackTimeoutSeconds ||
+    markerAckTimeoutSecondsForHistory(
+      state.history,
+      marker.headSha || statusSha,
+      config.markerAckTimeoutSeconds,
+      config.markerAckTimeoutMaxSeconds,
     );
-    return { kind: "continue", state, stateComment };
+  const ackDeadlineAt = marker.ackDeadlineAt || addSeconds(createdAt, ackTimeoutSeconds);
+  const resultDeadlineAt =
+    marker.resultDeadlineAt || addSeconds(createdAt, Math.round(config.markerTimeoutMs / 1000));
+  const headStartedAt = marker.headStartedAt || state.headStartedAt || createdAt;
+  const maxWaitDeadlineAt =
+    marker.maxWaitDeadlineAt || addSeconds(headStartedAt, Math.round(config.maxWaitMs / 1000));
+  const nextRetryAt =
+    marker.nextRetryAt ||
+    (marker.state === "waiting_result" ? resultDeadlineAt : ackDeadlineAt);
+
+  return normalizeState({
+    ...state,
+    activeMarker: {
+      ...marker,
+      state: marker.state || "waiting_ack",
+      ackTimeoutSeconds,
+      ackDeadlineAt,
+      resultDeadlineAt,
+      nextRetryAt,
+      headStartedAt,
+      maxWaitDeadlineAt,
+    },
+  });
+}
+
+function markerTimeoutOutcome(activeMarker) {
+  const nowMs = Date.now();
+  if (activeMarker.maxWaitDeadlineAt && nowMs >= parseTimestamp(activeMarker.maxWaitDeadlineAt, "max wait deadline")) {
+    return "max_wait";
   }
-
-  if (markerAgeMs >= config.markerTimeoutMs) {
-    state = closeActiveMarker(state, "stalled", isoNow(), {
-      stalledAfterSeconds: Math.round(config.markerTimeoutMs / 1000),
-      lastObservedPlusOne: snapshot.reactions.plusOne,
-      lastObservedEyes: snapshot.reactions.eyes,
-      lastObservedCompletionComment: snapshot.completionComment,
-    });
-    stateComment = await saveState(state, stateComment);
-    await setCommitStatus("pending", "Codex review marker stalled; retrying with fresh baseline");
-    console.log(`Marker ${activeMarker.id} stalled; re-baselining before retry.`);
-    return { kind: "continue", state, stateComment };
+  if (
+    activeMarker.state === "waiting_ack" &&
+    activeMarker.ackDeadlineAt &&
+    nowMs >= parseTimestamp(activeMarker.ackDeadlineAt, "marker ack deadline") &&
+    (!activeMarker.nextRetryAt || nowMs >= parseTimestamp(activeMarker.nextRetryAt, "marker retry deadline"))
+  ) {
+    return "missed_ack";
   }
-
-  const waitTimeoutMs =
-    activeMarker.state === "waiting_ack"
-      ? Math.min(config.markerTimeoutMs, ackTimeoutSeconds * 1000)
-      : config.markerTimeoutMs;
-  const remainingSeconds = Math.round((waitTimeoutMs - markerAgeMs) / 1000);
-  const waitDescription =
-    activeMarker.state === "waiting_ack"
-      ? `Waiting for Codex ack transition (${remainingSeconds}s before marker retry)`
-      : `Waiting for Codex +1 transition (${remainingSeconds}s before marker retry)`;
-
-  return {
-    kind: "wait",
-    description: waitDescription,
-    state,
-    stateComment,
-  };
+  if (
+    activeMarker.state === "waiting_result" &&
+    activeMarker.resultDeadlineAt &&
+    nowMs >= parseTimestamp(activeMarker.resultDeadlineAt, "marker result deadline")
+  ) {
+    return "stalled";
+  }
+  return null;
 }
 
 async function createGateMarker(reactionBaseline, state) {
@@ -452,7 +630,7 @@ async function createGateMarker(reactionBaseline, state) {
     ackTimeoutSeconds,
   };
 
-  const { data } = await request("POST", `${repoPath}/issues/${config.prNumber}/comments`, {
+  const { data } = await request("POST", `${repoPath}/issues/${activePrNumber}/comments`, {
     body: buildMarkerCommentBody(marker),
   });
 
@@ -462,8 +640,20 @@ async function createGateMarker(reactionBaseline, state) {
     url: data.html_url || null,
     createdAt: data.created_at,
   };
+  created.headStartedAt = headStartedAtForState(state, created.createdAt);
+  created.ackDeadlineAt = addSeconds(created.createdAt, ackTimeoutSeconds);
+  created.resultDeadlineAt = addSeconds(created.createdAt, Math.round(config.markerTimeoutMs / 1000));
+  created.nextRetryAt = created.ackDeadlineAt;
+  created.maxWaitDeadlineAt = addSeconds(created.headStartedAt, Math.round(config.maxWaitMs / 1000));
   console.log(`Created controlled Codex marker ${created.url || `#${created.id}`} for ${statusSha}.`);
   return created;
+}
+
+function headStartedAtForState(state, fallback) {
+  const sameHead = [...(state.history || [])]
+    .reverse()
+    .find((marker) => marker.headSha === statusSha && marker.headStartedAt);
+  return sameHead?.headStartedAt || state.activeMarker?.headStartedAt || fallback;
 }
 
 async function saveState(state, stateComment) {
@@ -473,17 +663,17 @@ async function saveState(state, stateComment) {
     return data;
   }
 
-  const { data } = await request("POST", `${repoPath}/issues/${config.prNumber}/comments`, { body });
+  const { data } = await request("POST", `${repoPath}/issues/${activePrNumber}/comments`, { body });
   console.log(`Created gate state comment ${data.html_url || `#${data.id}`}.`);
   return data;
 }
 
 async function loadSnapshot() {
   const [comments, issueReactions, reviewComments, reviews, reviewThreads] = await Promise.all([
-    paginate(`${repoPath}/issues/${config.prNumber}/comments`, { per_page: "100" }),
-    paginate(`${repoPath}/issues/${config.prNumber}/reactions`, { per_page: "100" }),
-    paginate(`${repoPath}/pulls/${config.prNumber}/comments`, { per_page: "100" }),
-    paginate(`${repoPath}/pulls/${config.prNumber}/reviews`, { per_page: "100" }),
+    paginate(`${repoPath}/issues/${activePrNumber}/comments`, { per_page: "100" }),
+    paginate(`${repoPath}/issues/${activePrNumber}/reactions`, { per_page: "100" }),
+    paginate(`${repoPath}/pulls/${activePrNumber}/comments`, { per_page: "100" }),
+    paginate(`${repoPath}/pulls/${activePrNumber}/reviews`, { per_page: "100" }),
     loadReviewThreads(),
   ]);
 
@@ -496,6 +686,8 @@ async function loadSnapshot() {
   );
   const reactions = summarizeCodexReactions(issueReactions, config.codexBotLogins);
   const completionComment = selectLatestCodexCompletionComment(comments, config.codexBotLogins);
+  const approvedReview = selectLatestCodexApprovedReview(reviews, config.codexBotLogins);
+  const submittedReview = selectLatestCodexSubmittedReview(reviews, config.codexBotLogins);
 
   return {
     comments,
@@ -505,9 +697,13 @@ async function loadSnapshot() {
     reviewThreads,
     reactions,
     completionComment,
+    approvedReview,
+    submittedReview,
     baseline: {
       ...reactions,
       completionComment,
+      approvedReview,
+      submittedReview,
     },
     findings,
   };
@@ -516,10 +712,11 @@ async function loadSnapshot() {
 function readConfig() {
   const token = requiredEnv("GITHUB_TOKEN");
   const repository = requiredEnv("GITHUB_REPOSITORY");
-  const prNumber = Number(process.env.PR_NUMBER || "");
+  const prNumberRaw = (process.env.PR_NUMBER || "").trim();
+  const prNumber = prNumberRaw ? Number(prNumberRaw) : null;
   const headSha = (process.env.HEAD_SHA || "").trim();
 
-  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+  if (prNumber !== null && (!Number.isInteger(prNumber) || prNumber <= 0)) {
     throw new Error("PR_NUMBER must be a positive integer");
   }
 
@@ -550,6 +747,8 @@ function readConfig() {
     markerAckTimeoutMaxSeconds: markerAckTimeoutConfig.markerAckTimeoutMaxSeconds,
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
     bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),
+    eventMode: normalizeEventMode(process.env.EVENT_MODE_INPUT || process.env.CODEX_REVIEW_GATE_EVENT_MODE || ""),
+    autoRetry: process.env.CODEX_REVIEW_GATE_AUTO_RETRY || "",
     codexBotLogins: parseLoginSet(process.env.CODEX_BOT_LOGINS || "", DEFAULT_CODEX_BOT_LOGINS),
     trustedCommentLogins: parseLoginSet(
       process.env.TRUSTED_COMMENT_LOGINS || "",
@@ -592,11 +791,11 @@ function stripTrailingSlash(value) {
 }
 
 async function loadPullRequest() {
-  const { data } = await request("GET", `${repoPath}/pulls/${config.prNumber}`);
+  const { data } = await request("GET", `${repoPath}/pulls/${activePrNumber}`);
   if (!statusSha) {
     statusSha = data.head.sha;
   }
-  console.log(`Loaded PR #${config.prNumber}; PR head is ${data.head.sha}; gate head is ${statusSha}.`);
+  console.log(`Loaded PR #${activePrNumber}; PR head is ${data.head.sha}; gate head is ${statusSha}.`);
   return data;
 }
 
@@ -631,22 +830,62 @@ function failIfCurrentHeadHasCodexFindings(findings) {
   );
 }
 
-async function waitOrTimeout(deadline, description) {
-  const remainingMs = deadline - Date.now();
-  if (remainingMs <= 0) {
-    throw new GateFailure(
-      "failure",
-      "Timed out waiting for Codex review signal",
-      `Timed out after ${Math.round(config.maxWaitMs / 1000)}s. Last state: ${description}.`,
-    );
+function reviewIdentity(review) {
+  if (!review) {
+    return null;
   }
+  return {
+    id: String(review.id),
+    state: review.state,
+    commitId: review.commit_id || "",
+    submittedAt: review.submitted_at || review.created_at || "",
+    user: review.user?.login || "",
+  };
+}
 
-  const sleepMs = Math.min(config.pollIntervalMs, remainingMs);
-  console.log(
-    `${description}; sleeping ${Math.round(sleepMs / 1000)}s ` +
-      `(${Math.round(remainingMs / 1000)}s remaining).`,
-  );
-  await sleep(sleepMs);
+function selectLatestCodexApprovedReview(reviews, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
+  return selectLatestCodexReview(reviews, botLogins, (review) => review.state === "APPROVED");
+}
+
+function selectLatestCodexSubmittedReview(reviews, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
+  return selectLatestCodexReview(reviews, botLogins, (review) => review.state === "COMMENTED");
+}
+
+function selectLatestCodexReview(reviews, botLogins, predicate) {
+  const matches = reviews
+    .filter((review) =>
+      isCodexBot(review.user?.login, botLogins) &&
+      review.commit_id === statusSha &&
+      predicate(review),
+    )
+    .map(reviewIdentity);
+
+  matches.sort((left, right) => {
+    const bySubmittedAt = parseTimestamp(right.submittedAt, "Codex review submission time") -
+      parseTimestamp(left.submittedAt, "Codex review submission time");
+    if (bySubmittedAt !== 0) {
+      return bySubmittedAt;
+    }
+    return Number(right.id) - Number(left.id);
+  });
+
+  return matches[0] || null;
+}
+
+function hasNewReviewTransition(baselineReview, currentReview, markerCreatedAt) {
+  if (!currentReview) {
+    return false;
+  }
+  const submittedAt = parseTimestamp(currentReview.submittedAt, "Codex review submission time");
+  const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
+  if (submittedAt < markerCreated) {
+    return false;
+  }
+  if (!baselineReview) {
+    return true;
+  }
+  return String(baselineReview.id) !== String(currentReview.id) ||
+    baselineReview.submittedAt !== currentReview.submittedAt;
 }
 
 async function setCommitStatus(state, description) {
@@ -684,7 +923,7 @@ async function loadReviewThreads() {
     const { data } = await graphqlRequest(REVIEW_THREADS_QUERY, {
       owner: repo.owner,
       repo: repo.name,
-      number: config.prNumber,
+      number: activePrNumber,
       after,
     });
     const connection = data?.repository?.pullRequest?.reviewThreads;

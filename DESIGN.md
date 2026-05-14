@@ -20,6 +20,8 @@ The recommended workflow listens for:
 
 The workflow must run trusted default-branch action code. It must not check out or execute PR-supplied code from `pull_request_target` events.
 
+The workflow should use one repository-wide concurrency group with `cancel-in-progress: false`. Scheduled scans can modify any open PR, so they must not run concurrently with PR-specific Codex signal runs.
+
 ## Configuration Controls
 
 Repository and organization variables are the preferred control surface for options that should affect workflow routing before a runner starts. Runtime environment variables are accepted as compatibility input once a runner is already running.
@@ -45,6 +47,8 @@ Supported modes:
 - `standard`: Default. Handle Codex top-level comments and submitted pull request reviews.
 - `comment-only`: Handle only Codex top-level comments as completion signals. Codex findings still block branch protection by leaving the status pending until a scheduled or manual scan evaluates them.
 - `full`: Handle Codex top-level comments, submitted pull request reviews, and individual pull request review comments.
+
+These values are exact lower-case strings so workflow-level routing and action runtime validation stay consistent.
 
 `+1` reactions are diagnostic in this design. They are recorded when useful, but they are not the primary pass signal because reactions do not provide a reliable workflow wake event.
 

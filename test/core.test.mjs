@@ -5,12 +5,14 @@ import test from "node:test";
 import {
   activeMarkerAckTimedOut,
   activeMarkerIsObsolete,
+  autoRetryEnabled,
   buildMarkerCommentBody,
   buildStateCommentBody,
   codexReviewBodyFindingSample,
   codexAutoReviewLooksOngoing,
   collectCurrentHeadCodexFindings,
   decideBootstrapProgress,
+  eventModeHandlesEvent,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
   hasNewCompletionComment,
@@ -22,6 +24,7 @@ import {
   markerAckTimeoutSecondsForHistory,
   markerFromComment,
   NonJsonResponseError,
+  normalizeEventMode,
   normalizeMarkerAckTimeoutSeconds,
   parseJsonResponseText,
   parseStateCommentBody,
@@ -33,6 +36,29 @@ import {
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
 } from "../src/core.mjs";
+
+test("normalizes event mode configuration", () => {
+  assert.equal(normalizeEventMode(""), "standard");
+  assert.equal(normalizeEventMode("full"), "full");
+  assert.equal(normalizeEventMode("comment-only"), "comment-only");
+  assert.throws(() => normalizeEventMode(" FULL "), /exactly standard, comment-only, or full/);
+  assert.throws(() => normalizeEventMode("reviews-only"), /exactly standard, comment-only, or full/);
+});
+
+test("filters optional workflow events by event mode", () => {
+  assert.equal(eventModeHandlesEvent("issue_comment", "standard"), true);
+  assert.equal(eventModeHandlesEvent("pull_request_review", "standard"), true);
+  assert.equal(eventModeHandlesEvent("pull_request_review", "comment-only"), false);
+  assert.equal(eventModeHandlesEvent("pull_request_review_comment", "standard"), false);
+  assert.equal(eventModeHandlesEvent("pull_request_review_comment", "full"), true);
+});
+
+test("treats only explicit false as auto retry disabled", () => {
+  assert.equal(autoRetryEnabled("false"), false);
+  assert.equal(autoRetryEnabled(" FALSE "), false);
+  assert.equal(autoRetryEnabled(""), true);
+  assert.equal(autoRetryEnabled("0"), true);
+});
 
 test("reads status context and hidden marker names from process environment at import time", () => {
   const output = execFileSync(
