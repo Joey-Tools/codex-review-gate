@@ -28,6 +28,12 @@ The runner implements a reaction-driven serialized marker flow:
 - `src/core.mjs`: testable state and signal helpers.
 - `DESIGN.md`: target signal model and state machine.
 
+## Advanced Operation
+
+For the event-driven review-gate design, state machine, automatic retry controls, runner-minutes model, and manual recovery behaviour, see [DESIGN.md](DESIGN.md).
+
+The advanced design uses repository or organisation variables for controls that must take effect before a runner is allocated. For example, `CODEX_REVIEW_GATE_AUTO_RETRY=false` can skip scheduled retry jobs at the job `if` layer. Runtime `env` values are still useful for action behaviour after a job has started, but they cannot prevent GitHub Actions from assigning a runner.
+
 ## Workflow Usage
 
 ```yaml

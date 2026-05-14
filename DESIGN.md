@@ -1,127 +1,231 @@
-# Codex Review Gate Design
+# Codex Review Gate Advanced Design
 
 ## Goal
 
-`codex/review-gate` should give branch protection a deterministic commit status for Codex review, even though Codex GitHub review currently exposes signals as PR reactions, top-level comments, and inline review comments rather than a first-class check run.
+`codex/review-gate` turns a controlled `@codex review` request into a deterministic commit status that can be required by branch protection. The status should remain `pending` or become `failure` unless the gate can prove that the current PR head has a clean Codex result.
 
-The gate should fail closed. If the current head cannot be confidently associated with a clean Codex result, the status stays `pending` until timeout or becomes `failure`; it must not reuse an old clean signal.
+The gate is event-driven. Workflow runs create markers, triage Codex signals, resume stored state, or process retry deadlines. They do not need to keep a runner active while Codex reviews the PR.
 
-The runner is packaged as a local composite action so this directory can later move to an independent repository with the same call shape.
+## Workflow Shape
 
-## Observed Signals
+The recommended workflow listens for:
 
-- Codex inline PR review comments and Codex review-body findings are the strongest failure signals. Review-body findings carry a reviewed commit through the PR review API. Inline comments carry review-comment commit identity, but GitHub can remap REST `commit_id` on old comments that still appear in later diffs, so inline comments are active findings only when their GraphQL review thread is not `isResolved` and not `isOutdated`.
-- Codex `eyes` reactions are liveness only. They mean Codex has likely accepted or started work, but they are not a pass signal.
-- Codex `+1` reactions can be used as a clean/pass candidate only when the active reaction is new relative to the gate baseline. A pre-existing unchanged `+1` is not enough.
-- Codex top-level comments after the active marker can be used as review-completion evidence. Their natural language wording is not authoritative and should not be parsed for pass/fail; the pass/fail decision still comes from whether current-head Codex findings exist.
-- PR-open auto review is out of band. Its first `+1`, inline review comments, or review-body findings should be recorded as bootstrap baseline, not used to pass a later controlled review marker.
+- `pull_request_target` on `opened`, `reopened`, `ready_for_review`, and `synchronize`
+- `issue_comment` on `created`
+- `pull_request_review` on `submitted`
+- `schedule` for automatic retry scans
+- `workflow_dispatch` for manual recovery
+
+`pull_request_review_comment` is optional. It belongs in the `full` event mode for repositories that want the fastest inline-finding triage and accept that a PR with many inline comments may trigger more workflow runs.
+
+The workflow must run trusted default-branch action code. It must not check out or execute PR-supplied code from `pull_request_target` events.
+
+## Configuration Controls
+
+Repository and organization variables are the preferred control surface for options that should affect workflow routing before a runner starts. Runtime environment variables are accepted as compatibility input once a runner is already running.
+
+### `CODEX_REVIEW_GATE_AUTO_RETRY`
+
+Set this repository or organization variable to `false` to disable scheduled retry work:
+
+```yaml
+jobs:
+  codex-review-gate:
+    if: ${{ github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false' }}
+```
+
+This must be a `vars` value if the intent is to avoid allocating a runner for scheduled retries. A normal workflow or job `env` value can be read by the action after the job starts, but it cannot prevent the scheduled job from being sent to a runner.
+
+### `CODEX_REVIEW_GATE_EVENT_MODE`
+
+`CODEX_REVIEW_GATE_EVENT_MODE` may be supplied as a repository or organization variable, or as a workflow/job environment variable. If both are supplied, the workflow should pass the most explicit runtime value to the action.
+
+Supported modes:
+
+- `standard`: Default. Handle Codex top-level comments and submitted pull request reviews.
+- `comment-only`: Handle only Codex top-level comments as completion signals. Codex findings still block branch protection by leaving the status pending until a scheduled or manual scan evaluates them.
+- `full`: Handle Codex top-level comments, submitted pull request reviews, and individual pull request review comments.
+
+`+1` reactions are diagnostic in this design. They are recorded when useful, but they are not the primary pass signal because reactions do not provide a reliable workflow wake event.
+
+## Minutes Model
+
+The happy path normally uses two short jobs:
+
+1. A PR event creates or refreshes state, writes `pending`, and posts a controlled `@codex review` marker for the current head.
+2. A Codex top-level completion comment or `APPROVED` review wakes triage. The gate reloads the PR, verifies that the head is unchanged, confirms there are no current-head Codex findings, writes `success`, and closes the marker.
+
+Finding paths depend on event mode. In `standard` mode, a Codex submitted review can wake triage and write `failure`. In `comment-only` mode, the status may stay `pending` until a scheduled or manual scan observes the findings.
+
+The default schedule example is:
+
+```yaml
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+```
+
+Each scheduled run scans open PRs in one job. It should skip PRs that are draft, already successful or failed for the current head, missing gate state, or not due for retry. Open PR count affects API calls and wall-clock time, but it should not create one job per PR.
+
+Approximate scheduled runner minutes:
+
+```text
+monthly_minutes ~= ceil(avg_schedule_run_seconds / 60) * runs_per_month
+runs_per_month ~= 30 * 24 * 60 / cron_interval_minutes
+```
+
+For cost-sensitive private repositories, use one or more of:
+
+- a self-hosted runner
+- a less frequent schedule
+- `CODEX_REVIEW_GATE_AUTO_RETRY=false`
+- `CODEX_REVIEW_GATE_EVENT_MODE=comment-only`
 
 ## State Model
 
-The workflow should maintain one sticky PR comment with hidden state metadata. The state comment lets canceled, rerun, or later workflow runs share the same serialized view.
+The gate stores one trusted sticky PR state comment with hidden JSON metadata. The state is the source of truth across event runs, scheduled retries, manual dispatches, and reruns.
 
-The state should record at least:
+The state records:
 
-- `state_version`
-- current tracked `head_sha`
-- bootstrap status and timestamp
-- active Codex PR-body `+1` reaction identity, including `id` and `created_at` when present
-- active Codex `eyes` reaction identity when present
-- active Codex top-level completion comment identity when present
-- known Codex inline review-comment ids and review-body finding ids already counted as baseline
-- outstanding marker comment id, marker head sha, marker creation time, and marker attempt number
-- marker baseline `+1`, `eyes`, and top-level completion comment identities
-- marker state: `waiting_ack`, `waiting_result`, `pass_candidate`, `missed_ack`, `stalled`, `passed`, or `failed`
-- last status write head and run url
+- current tracked head SHA
+- last written status state, head, and run URL
+- active marker ID, URL, head SHA, created time, and attempt number
+- marker baseline identities for Codex comments, reviews, and diagnostic reactions
+- marker deadlines: `ackDeadlineAt`, `resultDeadlineAt`, `nextRetryAt`, and `headStartedAt`
+- marker state: `waiting_ack`, `waiting_result`, `passed`, `failed_findings`, `missed_ack`, `stalled`, `obsolete_head`, or `state_lost`
+- bounded marker history for retry backoff and recovery
 
-The script should also be able to reconstruct enough state from PR comments, reactions, and review comments if the sticky comment is missing. If reconstruction is ambiguous, fail closed or stay pending instead of passing. In particular, if the sticky state comment is missing but a trusted marker comment is still visible, that marker must not be reactivated as an active pass candidate. The safe recovery path records the marker as `state_lost`, baselines the currently visible reactions, and issues a fresh marker for the current head.
+State comments and marker comments are trusted only from configured trusted authors. The default trusted author is `github-actions[bot]`, matching the repository workflow's `GITHUB_TOKEN` path.
 
-The current implementation trusts state and marker comments only from configured trusted authors. The default trusted author is `github-actions[bot]`, which matches the repository workflow's `GITHUB_TOKEN` path.
+## State Machine
 
-## Bootstrap Round
+```mermaid
+flowchart TD
+  start["Ready PR event / new commit"] --> pending["Write pending status"]
+  pending --> marker["Create or refresh state and marker"]
+  marker --> waitingAck["WaitingAck"]
 
-The first round has special handling because PR-open auto review may already be running without a gate-controlled marker.
+  waitingAck -->|Codex APPROVED review| validatePass["Validate head and findings"]
+  waitingAck -->|Codex top-level completion comment| validatePass
+  validatePass -->|Head unchanged and no findings| passed["Passed"]
+  validatePass -->|Findings or stale head| failed["FailedFindings"]
 
-On the first gate run for a PR:
+  waitingAck -->|Codex submitted review| validateReview["Validate current-head findings"]
+  validateReview -->|Findings exist| failed
+  validateReview -->|No findings yet| waitingResult["WaitingResult"]
 
-1. Collect current Codex reactions, top-level comments, PR reviews, inline review comments, and GraphQL review-thread state.
-2. Record all existing Codex `eyes`, `+1`, inline findings, and review-body findings as bootstrap baseline.
-3. If current `HEAD_SHA` already has Codex findings, fail the current status.
-4. Keep the gate pending only during a short bootstrap grace period, so PR-open auto review signals that are already visible can be recorded.
-5. After the grace period, close bootstrap even if an old `eyes` reaction still looks ongoing, then create the first controlled `@codex review` marker for the current head. The controlled marker may supersede the out-of-band auto review.
+  waitingAck -->|ackDeadlineAt elapsed| missedAck["Close marker as missed_ack"]
+  missedAck --> backoff["Apply same-head backoff"]
+  backoff --> marker
 
-The first out-of-band `+1` or review comments are only baseline evidence. They do not pass `codex/review-gate`.
+  waitingResult -->|APPROVED review or completion comment| validatePass
+  waitingResult -->|Current-head findings| failed
+  waitingResult -->|resultDeadlineAt elapsed| stalled["Close marker as stalled"]
+  stalled --> marker
 
-## Controlled Marker Loop
+  passed -->|New commit| pending
+  failed -->|New commit| pending
+  waitingAck -->|Head changed| obsolete["Close marker as obsolete_head"]
+  waitingResult -->|Head changed| obsolete
+  obsolete --> pending
 
-After bootstrap, the gate enforces a serialized marker relationship:
+  start -->|Draft PR| draft["Keep pending; do not create marker"]
+```
 
-1. At most one controlled `@codex review` marker is outstanding for the PR.
-2. Before creating a marker, record the current active Codex `+1` reaction identity as the marker baseline.
-3. Do not create another marker until the outstanding marker has either observed a new `+1` transition or timed out.
-4. `eyes` after the marker moves the state to ongoing, but the status remains `pending`.
-5. A pass candidate exists when the active Codex `+1` reaction is absent in the marker baseline and now present, its `id` / `created_at` changed after the marker baseline, or a new Codex top-level completion comment appears after the marker baseline.
-6. A pre-existing unchanged `+1` is never reused for pass.
-7. On a pass candidate, persist `pass_candidate` on the active marker before final validation so a rerun can recover the observed `+1`.
-8. Re-fetch the PR and fail closed if `HEAD_SHA` changed.
-9. Re-check Codex findings for the current head. If any exist, set `codex/review-gate=failure`.
-10. If head is unchanged and current-head Codex findings are absent, set `codex/review-gate=success`, then close the active marker as `passed`.
+```text
+NoState / Passed / FailedFindings
+  on ready PR event or new commit:
+    write pending
+    create or refresh sticky state
+    close obsolete active marker if present
+    create @codex review marker for current head
+    set ackDeadlineAt, resultDeadlineAt, nextRetryAt, headStartedAt
+    -> WaitingAck
 
-If a push happens while a marker is outstanding, the new head should remain `pending`. The workflow should immediately close the old marker as `obsolete_head`, record the latest observed reaction identities, then baseline again and issue a fresh marker for the latest head. Later reactions attributable only to the obsolete marker must not pass the new head.
+WaitingAck
+  on Codex APPROVED review after marker for the same head:
+    validate current head and current-head findings
+    -> Passed or FailedFindings
 
-`After the marker` means the Codex signal must not be older than the marker comment. GitHub exposes reaction and comment timestamps with second-level granularity, so a signal with the same timestamp second as the marker is treated as a candidate only when its identity differs from the recorded baseline. An unchanged baseline identity is never reused.
+  on Codex top-level completion comment after marker:
+    validate current head and current-head findings
+    -> Passed or FailedFindings
 
-Observed Codex behavior suggests that newer `@codex review` triggers can supersede earlier onflight reviews. Older marker comments may keep their `eyes` reaction even when their review never produces a completion. The gate therefore treats stale marker `eyes` as non-terminal evidence and relies on current-head review comments, current-head `+1` transitions, and explicit marker state instead of assuming every `eyes` has a matching completion.
+  on Codex submitted review after marker for the same head:
+    validate current-head findings
+    -> FailedFindings if findings exist
+    -> WaitingResult otherwise
 
-## Missed Ack Retry
+  on manual, rerun, or schedule when ackDeadlineAt elapsed:
+    close active marker as missed_ack
+    compute exponential backoff from same-head missed_ack history
+    create retry marker when nextRetryAt is due
+    -> WaitingAck
 
-The gate separates "Codex did not acknowledge the marker" from "Codex acknowledged the marker but has not finished reviewing".
+WaitingResult
+  on Codex APPROVED review or top-level completion comment after marker:
+    validate current head and current-head findings
+    -> Passed or FailedFindings
 
-While a marker is still `waiting_ack`, the runner waits only for the marker's ack timeout. The default first timeout is 300 seconds. If no new Codex `eyes`, `+1`, or top-level completion comment appears in that window, the marker is closed as `missed_ack`, the latest visible Codex signals are recorded, and the runner immediately creates a fresh marker.
+  on current-head Codex findings:
+    write failure
+    close active marker as failed_findings
+    -> FailedFindings
 
-Consecutive `missed_ack` outcomes on the same head use exponential backoff to avoid comment spam: 300 seconds, 600 seconds, 1200 seconds, then a default cap of 1800 seconds. The effective ack timeout and cap are also capped by the marker result timeout, so existing workflows with shorter `marker-timeout-seconds` continue to use their shorter wait window. A head change or any non-`missed_ack` marker outcome resets this ack backoff.
+  on manual, rerun, or schedule when resultDeadlineAt elapsed:
+    close active marker as stalled
+    create retry marker
+    -> WaitingAck
 
-Once Codex posts `eyes`, the marker moves to `waiting_result` and the fast ack retry no longer applies. That path uses the longer marker result timeout.
+AnyState
+  on draft PR:
+    keep or write pending
+    do not create a new marker
 
-## Stalled Retry
+  on head change:
+    close active marker as obsolete_head
+    write pending for latest ready head
+    create marker for latest ready head
+    -> WaitingAck
+```
 
-Because a GitHub PR-body `+1` is an active reaction state rather than an append-only event stream, Codex may leave an old `+1` unchanged after a later clean review. In that case the gate cannot prove that the later review completed.
+## Signal Rules
 
-For that case:
+Codex terminal pass signals are:
 
-1. Keep the status `pending` while the marker is within its wait window.
-2. After a bounded timeout, such as one hour, mark the marker `stalled`.
-3. Record the current reaction identities as the new baseline.
-4. Issue a new controlled marker for the latest PR head.
-5. The new marker still requires a `+1` transition after its own baseline.
+- a Codex `APPROVED` pull request review submitted after the active marker for the same head
+- a Codex top-level completion comment created after the active marker
 
-This is retry, not pass. The unchanged old `+1` remains unusable.
+Before writing `success`, the gate must reload the PR and verify:
+
+- the current PR head still matches the active marker head
+- there are no current-head Codex findings
+- the terminal signal is newer than the active marker or has a distinct same-second identity that was not in the marker baseline
+
+Codex findings are current-head findings when they are attached to the current head through pull request review metadata, inline review comments, or review-body links. Inline findings should use GraphQL review-thread state where available so resolved or outdated threads are not treated as active findings.
+
+If PR-open automatic Codex review is still enabled, its output is not trusted as a pass by itself. Only terminal signals after the active controlled marker can pass the gate, and the final current-head finding check still applies.
+
+## Retry and Recovery
+
+`workflow_dispatch` may target one PR or scan open PRs. A rerun should behave like a resume operation: reload the current PR state from GitHub, ignore stale event head assumptions, and advance the state machine only from current evidence.
+
+If the sticky state comment is missing but a trusted marker comment exists, the gate must recover safely:
+
+1. Record the recovered marker as `state_lost`.
+2. Baseline currently visible Codex signals.
+3. Do not pass from the recovered marker.
+4. Create a fresh marker or fail from current-head findings.
+
+Scheduled runs process retry deadlines. They should scan open PRs, load state only for candidate PRs, and advance markers whose `nextRetryAt`, `ackDeadlineAt`, or `resultDeadlineAt` has elapsed.
+
+Consecutive `missed_ack` outcomes on the same head use exponential backoff. A head change or any non-`missed_ack` outcome resets that ack backoff history for the new marker.
 
 ## Branch Protection
 
-The repository ruleset should require:
+Repository rulesets should require:
 
 - the `codex/review-gate` status check
-- GitHub's native "require conversations to be resolved" protection
+- GitHub's native conversation-resolution protection, when the repository wants unresolved inline conversations to block merges
 
-Conversation resolution is intentionally separate from the status script. The status script decides whether Codex produced a clean current-head signal; branch protection decides whether human-visible review threads are resolved.
-
-## Design Review
-
-The strong parts are:
-
-- Current-head Codex findings are deterministic enough to fail on when they are unresolved, non-outdated inline review threads or review-body findings with a commit-specific code link. The inline path cross-checks GraphQL thread state and paginates thread comment IDs to avoid treating resolved or outdated discussions as new current-head findings when REST `commit_id` is remapped.
-- The pass path no longer depends on clean-summary wording.
-- Old `+1` reactions are not reused.
-- Serial markers avoid two controlled requests racing for the same visible `+1` transition.
-- Pushes during an outstanding review do not cause an immediate new marker, which preserves the one-marker-at-a-time relationship.
-
-The thin parts are:
-
-- PR-body `+1` is not append-only. If GitHub keeps one active reaction per bot/content pair, there may be no new event for later clean reviews, so the gate can only stay pending and retry.
-- Timeout retry weakens strict attribution. A very delayed old review that deletes/re-adds or otherwise updates the `+1`, or posts a top-level completion comment after a new marker, could be misattributed to the new marker. Observed Codex behavior suggests newer review triggers supersede older onflight reviews, and serial markers plus fresh baselines reduce the risk, but it cannot be eliminated without a Codex-provided token, commit id, or per-marker reaction target.
-- Bootstrap is inherently weaker because PR-open auto review is not marker controlled. The first round treats existing signals as baseline only, waits for a short grace period, then starts a controlled marker even when a stale `eyes` reaction remains visible.
-- If Codex stops emitting PR-body `+1` for clean reviews, the gate should stall rather than pass. That is fail-closed but may block merges until the signal model is revised.
-- If Codex moves findings from review comments/review bodies to top-level issue comments, the current script would not classify them as findings. This is accepted for now and partially covered by requiring conversation resolution, but it is not a full substitute for a first-class Codex verdict.
-- If GitHub review APIs omit or misreport commit ids, current-head finding detection becomes weaker. The implementation should prefer review/comment `commit_id` plus GraphQL review-thread state for inline comments, and treat ambiguous Codex findings conservatively when possible. If a current-head REST inline comment cannot be mapped to GraphQL thread metadata, it remains a finding.
-- The sticky state comment can be edited or deleted. The implementation must reconstruct from GitHub state or fail closed, not silently restart and reuse old signals.
+The status check decides whether the current head has a clean Codex review signal. Conversation resolution remains a separate branch-protection concern.
