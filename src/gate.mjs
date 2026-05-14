@@ -38,7 +38,7 @@ import {
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
   stateFromRecoveredMarkerComment,
-  summarizeCodexReactions,
+  summarizeCodexSignalReactions,
   truncate,
   updateStateForStatus,
 } from "./core.mjs";
@@ -676,6 +676,10 @@ async function loadSnapshot() {
     paginate(`${repoPath}/pulls/${activePrNumber}/reviews`, { per_page: "100" }),
     loadReviewThreads(),
   ]);
+  const markerComment = findLatestTrustedMarkerComment(comments, config.trustedCommentLogins);
+  const markerCommentReactions = markerComment?.id
+    ? await paginate(`${repoPath}/issues/comments/${markerComment.id}/reactions`, { per_page: "100" })
+    : [];
 
   const findings = collectCurrentHeadCodexFindings(
     reviewComments,
@@ -684,7 +688,11 @@ async function loadSnapshot() {
     config.codexBotLogins,
     reviewThreads,
   );
-  const reactions = summarizeCodexReactions(issueReactions, config.codexBotLogins);
+  const reactions = summarizeCodexSignalReactions(
+    issueReactions,
+    markerCommentReactions,
+    config.codexBotLogins,
+  );
   const completionComment = selectLatestCodexCompletionComment(comments, config.codexBotLogins);
   const approvedReview = selectLatestCodexApprovedReview(reviews, config.codexBotLogins);
   const submittedReview = selectLatestCodexSubmittedReview(reviews, config.codexBotLogins);
@@ -692,6 +700,7 @@ async function loadSnapshot() {
   return {
     comments,
     issueReactions,
+    markerCommentReactions,
     reviewComments,
     reviews,
     reviewThreads,

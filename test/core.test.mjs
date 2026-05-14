@@ -18,6 +18,7 @@ import {
   hasNewCompletionComment,
   hasNewEyesTransition,
   hasNewPlusOneTransition,
+  isCodexCompletionComment,
   isCurrentHeadCodexReviewBodyFinding,
   isRetryableHttpStatus,
   issueCommentIdentity,
@@ -35,6 +36,7 @@ import {
   selectLatestCodexCompletionComment,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
+  summarizeCodexSignalReactions,
 } from "../src/core.mjs";
 
 test("normalizes event mode configuration", () => {
@@ -383,8 +385,8 @@ test("accepts same-second eyes when the reaction identity changed", () => {
   assert.equal(hasNewEyesTransition(current, current, "2026-04-26T10:01:00Z"), false);
 });
 
-test("summarizes only Codex bot PR-body reactions", () => {
-  const reactions = [
+test("summarizes only Codex bot signal reactions", () => {
+  const issueReactions = [
     { id: 1, content: "+1", created_at: "2026-04-26T10:00:00Z", user: { login: "octocat" } },
     {
       id: 2,
@@ -392,6 +394,8 @@ test("summarizes only Codex bot PR-body reactions", () => {
       created_at: "2026-04-26T10:01:00Z",
       user: { login: "chatgpt-codex-connector[bot]" },
     },
+  ];
+  const markerCommentReactions = [
     {
       id: 3,
       content: "eyes",
@@ -400,9 +404,13 @@ test("summarizes only Codex bot PR-body reactions", () => {
     },
   ];
 
-  assert.deepEqual(summarizeCodexReactions(reactions), {
-    plusOne: reactionIdentity(reactions[1]),
-    eyes: reactionIdentity(reactions[2]),
+  assert.deepEqual(summarizeCodexReactions([...issueReactions, ...markerCommentReactions]), {
+    plusOne: reactionIdentity(issueReactions[1]),
+    eyes: reactionIdentity(markerCommentReactions[0]),
+  });
+  assert.deepEqual(summarizeCodexSignalReactions(issueReactions, markerCommentReactions), {
+    plusOne: reactionIdentity(issueReactions[1]),
+    eyes: reactionIdentity(markerCommentReactions[0]),
   });
 });
 
@@ -412,17 +420,27 @@ test("selects only Codex bot top-level completion comments", () => {
       id: 1,
       created_at: "2026-04-26T10:00:00Z",
       html_url: "https://example.invalid/comments/1",
+      body: "Codex Review: Didn't find any major issues.",
       user: { login: "octocat" },
     },
     {
       id: 2,
       created_at: "2026-04-26T10:01:00Z",
       html_url: "https://example.invalid/comments/2",
+      body: "To use Codex here, create a Codex account and connect to github.",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+    {
+      id: 3,
+      created_at: "2026-04-26T10:02:00Z",
+      html_url: "https://example.invalid/comments/3",
+      body: "Codex Review: Didn't find any major issues. Chef's kiss.",
       user: { login: "chatgpt-codex-connector[bot]" },
     },
   ];
 
-  assert.deepEqual(selectLatestCodexCompletionComment(comments), issueCommentIdentity(comments[1]));
+  assert.equal(isCodexCompletionComment(comments[1]), false);
+  assert.deepEqual(selectLatestCodexCompletionComment(comments), issueCommentIdentity(comments[2]));
 });
 
 test("retries only transient HTTP statuses", () => {

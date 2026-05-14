@@ -52,6 +52,8 @@ These values are exact lower-case strings so workflow-level routing and action r
 
 `+1` reactions are diagnostic in this design. They are recorded when useful, but they are not the primary pass signal because reactions do not provide a reliable workflow wake event.
 
+`eyes` reactions are liveness signals. The gate checks both PR-body reactions and reactions on the active marker comment. They move `WaitingAck` to `WaitingResult`, but they do not pass the gate.
+
 ## Minutes Model
 
 The happy path normally uses two short jobs:
@@ -110,7 +112,7 @@ flowchart TD
   marker --> waitingAck["WaitingAck"]
 
   waitingAck -->|Codex APPROVED review| validatePass["Validate head and findings"]
-  waitingAck -->|Codex top-level completion comment| validatePass
+  waitingAck -->|Codex top-level clean completion comment| validatePass
   validatePass -->|Head unchanged and no findings| passed["Passed"]
   validatePass -->|Findings or stale head| failed["FailedFindings"]
 
@@ -198,7 +200,7 @@ AnyState
 Codex terminal pass signals are:
 
 - a Codex `APPROVED` pull request review submitted after the active marker for the same head
-- a Codex top-level completion comment created after the active marker
+- a Codex top-level clean completion comment created after the active marker, currently identified by the `Codex Review:` prefix
 
 Before writing `success`, the gate must reload the PR and verify:
 

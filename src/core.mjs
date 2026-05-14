@@ -140,6 +140,17 @@ export function summarizeCodexReactions(reactions, botLogins = DEFAULT_CODEX_BOT
   };
 }
 
+export function summarizeCodexSignalReactions(
+  issueReactions,
+  markerCommentReactions,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+) {
+  return summarizeCodexReactions(
+    [...(issueReactions || []), ...(markerCommentReactions || [])],
+    botLogins,
+  );
+}
+
 export function selectLatestCodexReaction(reactions, content, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   const matches = reactions
     .filter((reaction) => reaction.content === content && isCodexBot(reaction.user?.login, botLogins))
@@ -159,7 +170,7 @@ export function selectLatestCodexReaction(reactions, content, botLogins = DEFAUL
 
 export function selectLatestCodexCompletionComment(comments, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   const matches = comments
-    .filter((comment) => isCodexBot(comment.user?.login, botLogins))
+    .filter((comment) => isCodexCompletionComment(comment, botLogins))
     .map(issueCommentIdentity);
 
   matches.sort((left, right) => {
@@ -172,6 +183,14 @@ export function selectLatestCodexCompletionComment(comments, botLogins = DEFAULT
   });
 
   return matches[0] || null;
+}
+
+export function isCodexCompletionComment(comment, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
+  if (!isCodexBot(comment?.user?.login, botLogins)) {
+    return false;
+  }
+
+  return /^Codex Review\s*:/i.test(String(comment.body || "").trim());
 }
 
 export function sameReactionIdentity(left, right) {
