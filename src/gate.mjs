@@ -401,7 +401,7 @@ async function ensureState(snapshot, previousState, previousComment) {
 }
 
 async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) {
-  let allowCreateMarker = trigger.allowCreateMarker;
+  let allowCreateMarker = trigger.allowCreateMarker || stateNeedsFreshMarkerAfterRecovery(state);
 
   for (let iteration = 0; iteration < 4; iteration += 1) {
     if (!state.activeMarker) {
