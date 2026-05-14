@@ -44,6 +44,7 @@ import {
   selectLatestCodexCompletionComment,
   shouldCreateFreshHeadMarker,
   shouldFailFindingsBeforeMarker,
+  shouldSkipScheduledScanWithoutMarker,
   stateNeedsFreshMarkerAfterMissingMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
@@ -324,20 +325,21 @@ async function processPullRequest(prNumber, trigger) {
   stateNeedsFreshMarker = stateNeedsFreshMarker ||
     stateNeedsFreshMarkerAfterRecovery(state) ||
     stateNeedsFreshMarkerAfterMissingMarker(state, statusSha);
+  const headChanged = state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha);
 
-  if (
-    trigger.kind === "scan" &&
-    !trigger.allowCreateMarker &&
-    !dependabotScheduleRecovery &&
-    !state.activeMarker &&
-    !stateNeedsFreshMarker
-  ) {
+  if (shouldSkipScheduledScanWithoutMarker({
+    triggerKind: trigger.kind,
+    allowCreateMarker: trigger.allowCreateMarker,
+    dependabotScheduleRecovery,
+    hasActiveMarker: Boolean(state.activeMarker),
+    headChanged,
+    stateNeedsFreshMarker,
+  })) {
     console.log(`PR #${activePrNumber} has no active marker; skipping scheduled scan.`);
     return;
   }
 
   let allowCreateMarker = trigger.allowCreateMarker || stateNeedsFreshMarker;
-  const headChanged = state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha);
   if (headChanged) {
     if (state.activeMarker) {
       state = closeActiveMarker(state, "obsolete_head", isoNow(), { currentHeadSha: statusSha });
@@ -582,7 +584,10 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
 async function passGate(state, stateComment, snapshot, observed) {
   await failIfPullRequestHeadChanged("before passing Codex review gate");
   const finalSnapshot = await loadSnapshot();
-  failIfCurrentHeadHasCodexFindings(finalSnapshot.findings);
+  if (finalSnapshot.findings.count > 0) {
+    await failFromFindings(finalSnapshot.findings, state, stateComment);
+    return;
+  }
   const passedState = updateStateForStatus(closeActiveMarker(state, "passed", isoNow(), {
     observedCompletionComment: observed.observedCompletionComment || snapshot.completionComment,
     observedApprovedReview: observed.observedApprovedReview || null,
@@ -658,6 +663,8 @@ function migrateStateForEventDrivenDeadlines(state) {
 
 async function createGateMarker(reactionBaseline, state) {
   const attempt = (state.history || []).length + 1;
+  const createdAtFallback = isoNow();
+  const headStartedAt = headStartedAtForState(state, createdAtFallback);
   const ackTimeoutSeconds = markerAckTimeoutSecondsForHistory(
     state.history,
     statusSha,
@@ -674,6 +681,8 @@ async function createGateMarker(reactionBaseline, state) {
     baseline: reactionBaseline,
     state: "waiting_ack",
     ackTimeoutSeconds,
+    headStartedAt,
+    maxWaitDeadlineAt: addSeconds(headStartedAt, Math.round(config.maxWaitMs / 1000)),
   };
 
   const { data } = await request("POST", `${repoPath}/issues/${activePrNumber}/comments`, {
@@ -686,11 +695,9 @@ async function createGateMarker(reactionBaseline, state) {
     url: data.html_url || null,
     createdAt: data.created_at,
   };
-  created.headStartedAt = headStartedAtForState(state, created.createdAt);
   created.ackDeadlineAt = addSeconds(created.createdAt, ackTimeoutSeconds);
   created.resultDeadlineAt = addSeconds(created.createdAt, Math.round(config.markerTimeoutMs / 1000));
   created.nextRetryAt = created.ackDeadlineAt;
-  created.maxWaitDeadlineAt = addSeconds(created.headStartedAt, Math.round(config.maxWaitMs / 1000));
   console.log(`Created controlled Codex marker ${created.url || `#${created.id}`} for ${statusSha}.`);
   return created;
 }

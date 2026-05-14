@@ -56,9 +56,9 @@ These values are exact lower-case strings so workflow-level routing and action r
 
 ### `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS`
 
-`CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS` may be supplied as a repository or organization variable and passed to the action through `completion-signal-buffer-seconds`. The default is `60`. Set it to `0` to disable the buffer.
+`CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS` may be supplied as a repository or organization variable and passed to the action through `completion-signal-buffer-seconds`. The default is `60`. Set it to `0` to disable the extra buffer; completion comments created in the same second as the marker are still rejected because GitHub timestamps are second-resolution.
 
-The buffer applies only to Codex top-level clean completion comments because those comments do not identify the reviewed commit. A completion comment must be created at least this many seconds after the active marker before it can pass the gate. This reduces the chance that a delayed clean completion from an older Codex review is accepted for a newer head. `APPROVED` pull request reviews still use review metadata and do not need this buffer.
+The buffer applies only to Codex top-level clean completion comments because those comments do not identify the reviewed commit. A completion comment must be created after the active marker and outside the configured buffer window before it can pass the gate. This reduces the chance that a delayed clean completion from an older Codex review is accepted for a newer head. `APPROVED` pull request reviews still use review metadata and do not need this buffer.
 
 `+1` reactions are diagnostic in this design. They are recorded when useful, but they are not the primary pass signal because reactions do not provide a reliable workflow wake event.
 
@@ -107,8 +107,8 @@ The state records:
 - last written status state, head, and run URL
 - active marker ID, URL, head SHA, created time, and attempt number
 - marker baseline identities for Codex comments, reviews, and diagnostic reactions
-- marker deadlines: `ackDeadlineAt`, `resultDeadlineAt`, `nextRetryAt`, and `headStartedAt`
-- marker state: `waiting_ack`, `waiting_result`, `passed`, `failed_findings`, `missed_ack`, `stalled`, `obsolete_head`, or `state_lost`
+- marker deadlines: `ackDeadlineAt`, `resultDeadlineAt`, `nextRetryAt`, `headStartedAt`, and `maxWaitDeadlineAt`
+- marker state: `waiting_ack`, `waiting_result`, `passed`, `failed_findings`, `missed_ack`, `stalled`, `timed_out`, `obsolete_head`, or `state_lost`
 - bounded marker history for retry backoff and recovery
 
 State comments and marker comments are trusted only from configured trusted authors. The default trusted author is `github-actions[bot]`, matching the repository workflow's `GITHUB_TOKEN` path.
@@ -211,7 +211,7 @@ AnyState
 Codex terminal pass signals are:
 
 - a Codex `APPROVED` pull request review submitted strictly after the active marker for the same head
-- a Codex top-level clean completion comment created after the active marker plus the configured completion signal buffer, currently identified by the `Codex Review:` prefix
+- a Codex top-level clean completion comment created strictly after the active marker plus the configured completion signal buffer, currently identified by the `Codex Review:` prefix
 
 Before writing `success`, the gate must reload the PR and verify:
 

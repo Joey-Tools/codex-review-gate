@@ -94,6 +94,24 @@ export function shouldCreateFreshHeadMarker({
   return Boolean(allowCreateMarker && !hasActiveMarker && (headChanged || stateNeedsFreshMarker));
 }
 
+export function shouldSkipScheduledScanWithoutMarker({
+  triggerKind,
+  allowCreateMarker,
+  dependabotScheduleRecovery,
+  hasActiveMarker,
+  headChanged,
+  stateNeedsFreshMarker,
+}) {
+  return Boolean(
+    triggerKind === "scan" &&
+      !allowCreateMarker &&
+      !dependabotScheduleRecovery &&
+      !hasActiveMarker &&
+      !headChanged &&
+      !stateNeedsFreshMarker,
+  );
+}
+
 export function hasTrustedGateStateOrMarker(comments, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
   return Boolean(
     findLatestTrustedStateComment(comments, trustedLogins) ||
@@ -289,7 +307,7 @@ export function hasNewCompletionComment(
   const currentCreatedAt = parseTimestamp(currentComment.createdAt, "Codex completion comment creation time");
   const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
   const minimumCreatedAt = markerCreated + Math.max(0, Number(bufferSeconds) || 0) * 1000;
-  if (currentCreatedAt < minimumCreatedAt) {
+  if (currentCreatedAt <= markerCreated || currentCreatedAt < minimumCreatedAt) {
     return false;
   }
 

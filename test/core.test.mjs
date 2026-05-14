@@ -41,6 +41,7 @@ import {
   selectLatestCodexCompletionComment,
   shouldCreateFreshHeadMarker,
   shouldFailFindingsBeforeMarker,
+  shouldSkipScheduledScanWithoutMarker,
   stateNeedsFreshMarkerAfterMissingMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
@@ -205,7 +206,7 @@ test("accepts a new Codex completion comment after the marker", () => {
   );
 });
 
-test("accepts a same-second new Codex completion comment at the marker boundary", () => {
+test("rejects a same-second Codex completion comment at the marker boundary", () => {
   const baseline = {
     id: "1",
     createdAt: "2026-04-26T10:01:00Z",
@@ -221,7 +222,7 @@ test("accepts a same-second new Codex completion comment at the marker boundary"
 
   assert.equal(
     hasNewCompletionComment(baseline, current, "2026-04-26T10:01:00Z"),
-    true,
+    false,
   );
   assert.equal(
     hasNewCompletionComment(current, current, "2026-04-26T10:01:00Z"),
@@ -230,6 +231,12 @@ test("accepts a same-second new Codex completion comment at the marker boundary"
 });
 
 test("requires Codex completion comments to satisfy the configured marker buffer", () => {
+  const sameSecond = {
+    id: "1",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/1",
+  };
   const tooSoon = {
     id: "2",
     createdAt: "2026-04-26T10:01:59Z",
@@ -243,6 +250,10 @@ test("requires Codex completion comments to satisfy the configured marker buffer
     url: "https://example.invalid/comments/3",
   };
 
+  assert.equal(
+    hasNewCompletionComment(null, sameSecond, "2026-04-26T10:01:00Z", { bufferSeconds: 0 }),
+    false,
+  );
   assert.equal(
     hasNewCompletionComment(null, tooSoon, "2026-04-26T10:01:00Z", { bufferSeconds: 60 }),
     false,
@@ -652,7 +663,7 @@ test("finds the latest trusted marker comment", () => {
   });
 });
 
-test("persists marker ack timeout when present", () => {
+test("persists marker recovery fields when present", () => {
   const markerBody = buildMarkerCommentBody({
     headSha: "abc123",
     runUrl: "https://example.invalid/runs/1",
@@ -662,17 +673,19 @@ test("persists marker ack timeout when present", () => {
     baseline: { plusOne: null, eyes: null },
     state: "waiting_ack",
     ackTimeoutSeconds: 300,
+    headStartedAt: "2026-04-26T10:00:00Z",
+    maxWaitDeadlineAt: "2026-04-26T12:00:00Z",
+  });
+  const marker = markerFromComment({
+    id: 2,
+    body: markerBody,
+    created_at: "2026-04-26T10:01:00Z",
+    user: { login: "github-actions[bot]" },
   });
 
-  assert.equal(
-    markerFromComment({
-      id: 2,
-      body: markerBody,
-      created_at: "2026-04-26T10:01:00Z",
-      user: { login: "github-actions[bot]" },
-    }).ackTimeoutSeconds,
-    300,
-  );
+  assert.equal(marker.ackTimeoutSeconds, 300);
+  assert.equal(marker.headStartedAt, "2026-04-26T10:00:00Z");
+  assert.equal(marker.maxWaitDeadlineAt, "2026-04-26T12:00:00Z");
 });
 
 test("collects only current-head Codex inline findings", () => {
@@ -1141,6 +1154,31 @@ test("allows a fresh marker for no-state current-head findings", () => {
       hasActiveMarker: true,
       headChanged: true,
       stateNeedsFreshMarker: true,
+    }),
+    false,
+  );
+});
+
+test("scheduled scans without markers still recover head changes", () => {
+  assert.equal(
+    shouldSkipScheduledScanWithoutMarker({
+      triggerKind: "scan",
+      allowCreateMarker: false,
+      dependabotScheduleRecovery: false,
+      hasActiveMarker: false,
+      headChanged: false,
+      stateNeedsFreshMarker: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldSkipScheduledScanWithoutMarker({
+      triggerKind: "scan",
+      allowCreateMarker: false,
+      dependabotScheduleRecovery: false,
+      hasActiveMarker: false,
+      headChanged: true,
+      stateNeedsFreshMarker: false,
     }),
     false,
   );

@@ -109,7 +109,8 @@ jobs:
       - uses: JoeyTeng/codex-review-gate@v1
         with:
           github-token: ${{ github.token }}
-          pull-request: ${{ github.event.inputs.pull_request }}
+          pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
+          head-sha: ${{ github.event.pull_request.head.sha || '' }}
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
           completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
@@ -135,7 +136,7 @@ jobs:
 | `marker-timeout-seconds` | `3600` | 已 ack marker 等待结果的时间，超时后重试。 |
 | `marker-ack-timeout-seconds` | `300` | Codex ack marker 前的初始等待时间。 |
 | `marker-ack-timeout-max-seconds` | `1800` | 未 ack marker 指数退避等待上限。 |
-| `completion-signal-buffer-seconds` | `60` | Marker 创建后至少等待多少秒，才接受 Codex top-level clean completion comment。设为 `0` 可关闭 buffer。 |
+| `completion-signal-buffer-seconds` | `60` | Marker 创建后至少等待多少秒，才接受 Codex top-level clean completion comment。设为 `0` 可关闭额外 buffer；同一秒的 comment 仍会被拒绝。 |
 | `event-mode` | empty | Event mode override：精确小写 `standard`、`comment-only` 或 `full`。留空时使用 `CODEX_REVIEW_GATE_EVENT_MODE` 或 `standard`。 |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input。Event-driven runs 不轮询。 |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input。Event-driven runs 会直接创建 controlled marker。 |
