@@ -50,6 +50,10 @@ Supported modes:
 
 These values are exact lower-case strings so workflow-level routing and action runtime validation stay consistent.
 
+### `CODEX_REVIEW_GATE_BOT_LOGINS`
+
+`CODEX_REVIEW_GATE_BOT_LOGINS` may be supplied as a repository or organization variable when the Codex bot identity differs from the defaults. The sample workflow uses this `vars` value in job-level event filters so custom bot comments and reviews can wake the gate before a runner is allocated. The action also accepts the same comma-separated value through the `codex-bot-logins` input at runtime.
+
 `+1` reactions are diagnostic in this design. They are recorded when useful, but they are not the primary pass signal because reactions do not provide a reliable workflow wake event.
 
 `eyes` reactions are liveness signals. The gate checks both PR-body reactions and reactions on the active marker comment. They move `WaitingAck` to `WaitingResult`, but they do not pass the gate.
@@ -211,6 +215,10 @@ Before writing `success`, the gate must reload the PR and verify:
 Codex findings are current-head findings when they are attached to the current head through pull request review metadata, inline review comments, or review-body links. Inline findings should use GraphQL review-thread state where available so resolved or outdated threads are not treated as active findings.
 
 If PR-open automatic Codex review is still enabled, its output is not trusted as a pass by itself. Only terminal signals after the active controlled marker can pass the gate, and the final current-head finding check still applies.
+
+## Fork and Dependabot PRs
+
+GitHub documents that [PR-related events other than `pull_request_target` can receive a read-only `GITHUB_TOKEN`](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories) for fork and Dependabot PRs. The gate therefore treats `issue_comment`, `pull_request_review`, and `pull_request_review_comment` wake events as opportunistic: if the current PR head is from a fork, the action skips the write path and relies on the scheduled or manual `pull_request_target` recovery path to advance the state with write permissions.
 
 ## Retry and Recovery
 

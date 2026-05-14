@@ -509,6 +509,16 @@ export function stateFromRecoveredMarkerComment({
   });
 }
 
+export function stateNeedsFreshMarkerAfterRecovery(state) {
+  if (state?.activeMarker) {
+    return false;
+  }
+
+  const history = state?.history || [];
+  const latest = history[history.length - 1];
+  return latest?.outcome === "state_lost";
+}
+
 export function normalizeState(state) {
   return {
     ...state,

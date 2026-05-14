@@ -76,16 +76,16 @@ jobs:
         (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
         (github.event_name != 'issue_comment' ||
           (github.event.issue.pull_request &&
-            (github.event.comment.user.login == 'chatgpt-codex-connector' ||
-             github.event.comment.user.login == 'chatgpt-codex-connector[bot]'))) &&
+            contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)))) &&
         (github.event_name != 'pull_request_review' ||
           (vars.CODEX_REVIEW_GATE_EVENT_MODE != 'comment-only' &&
-            (github.event.review.user.login == 'chatgpt-codex-connector' ||
-             github.event.review.user.login == 'chatgpt-codex-connector[bot]'))) &&
+            contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.review.user.login)))) &&
         (github.event_name != 'pull_request_review_comment' ||
           (vars.CODEX_REVIEW_GATE_EVENT_MODE == 'full' &&
-            (github.event.comment.user.login == 'chatgpt-codex-connector' ||
-             github.event.comment.user.login == 'chatgpt-codex-connector[bot]')))
+            contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login))))
       }}
     runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15
@@ -95,6 +95,7 @@ jobs:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.inputs.pull_request }}
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
+          codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
 ```
 
 ## Self-Gating This Repository

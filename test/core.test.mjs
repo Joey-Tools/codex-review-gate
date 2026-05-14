@@ -34,6 +34,7 @@ import {
   restRequestRetryAllowed,
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
+  stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
   summarizeCodexSignalReactions,
@@ -936,8 +937,27 @@ test("does not reactivate a marker when the sticky state comment is missing", ()
   assert.equal(state.history.length, 1);
   assert.equal(state.history[0].id, "2");
   assert.equal(state.history[0].outcome, "state_lost");
+  assert.equal(stateNeedsFreshMarkerAfterRecovery(state), true);
   assert.equal(state.bootstrap.baseline.plusOne.id, "99");
   assert.deepEqual(state.bootstrap.currentHeadFindingIds, ["finding-1"]);
+});
+
+test("requires a fresh recovery marker only after state-loss recovery", () => {
+  assert.equal(stateNeedsFreshMarkerAfterRecovery({ activeMarker: { id: "1" }, history: [] }), false);
+  assert.equal(
+    stateNeedsFreshMarkerAfterRecovery({
+      activeMarker: null,
+      history: [{ id: "1", outcome: "missed_ack" }],
+    }),
+    false,
+  );
+  assert.equal(
+    stateNeedsFreshMarkerAfterRecovery({
+      activeMarker: null,
+      history: [{ id: "1", outcome: "state_lost" }],
+    }),
+    true,
+  );
 });
 
 test("fails closed when state and latest trusted marker disagree", () => {

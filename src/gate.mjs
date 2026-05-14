@@ -37,6 +37,7 @@ import {
   restRequestRetryAllowed,
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
+  stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
   summarizeCodexSignalReactions,
   truncate,
@@ -220,6 +221,18 @@ function readEventPayload() {
   }
 }
 
+function eventMayHaveReadOnlyForkToken() {
+  return new Set(["issue_comment", "pull_request_review", "pull_request_review_comment"]).has(
+    process.env.GITHUB_EVENT_NAME || "",
+  );
+}
+
+function pullRequestIsFromFork(pullRequest) {
+  const headRepo = pullRequest.head?.repo?.full_name;
+  const baseRepo = pullRequest.base?.repo?.full_name;
+  return Boolean(headRepo && baseRepo && headRepo !== baseRepo);
+}
+
 async function scanOpenPullRequests(trigger) {
   const pullRequests = await paginate(repoPath + "/pulls", { state: "open", per_page: "100" });
   let failures = 0;
@@ -250,6 +263,13 @@ async function processPullRequest(prNumber, trigger) {
 
   const pullRequest = await loadPullRequest();
   statusSha = pullRequest.head.sha;
+  if (eventMayHaveReadOnlyForkToken() && pullRequestIsFromFork(pullRequest)) {
+    console.log(
+      `Skipping ${process.env.GITHUB_EVENT_NAME} for fork PR #${activePrNumber}; ` +
+        "scheduled or manual pull_request_target runs can resume with a write-capable token.",
+    );
+    return;
+  }
 
   if (pullRequest.draft) {
     if (trigger.kind === "scan") {
@@ -275,13 +295,14 @@ async function processPullRequest(prNumber, trigger) {
 
   let { state, stateComment: savedStateComment } = await ensureState(snapshot, null, null);
   state = migrateStateForEventDrivenDeadlines(state);
+  const recoveryNeedsFreshMarker = stateNeedsFreshMarkerAfterRecovery(state);
 
-  if (trigger.kind === "scan" && !trigger.allowCreateMarker && !state.activeMarker) {
+  if (trigger.kind === "scan" && !trigger.allowCreateMarker && !state.activeMarker && !recoveryNeedsFreshMarker) {
     console.log(`PR #${activePrNumber} has no active marker; skipping scheduled scan.`);
     return;
   }
 
-  let allowCreateMarker = trigger.allowCreateMarker;
+  let allowCreateMarker = trigger.allowCreateMarker || recoveryNeedsFreshMarker;
   if (state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha)) {
     if (state.activeMarker) {
       state = closeActiveMarker(state, "obsolete_head", isoNow(), { currentHeadSha: statusSha });
