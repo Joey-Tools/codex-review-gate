@@ -54,6 +54,12 @@ These values are exact lower-case strings so workflow-level routing and action r
 
 `CODEX_REVIEW_GATE_BOT_LOGINS` may be supplied as a repository or organization variable when the Codex bot identity differs from the defaults. The sample workflow uses this `vars` value in job-level event filters so custom bot comments and reviews can wake the gate before a runner is allocated. The action also accepts the same comma-separated value through the `codex-bot-logins` input at runtime.
 
+### `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS`
+
+`CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS` may be supplied as a repository or organization variable and passed to the action through `completion-signal-buffer-seconds`. The default is `60`. Set it to `0` to disable the buffer.
+
+The buffer applies only to Codex top-level clean completion comments because those comments do not identify the reviewed commit. A completion comment must be created at least this many seconds after the active marker before it can pass the gate. This reduces the chance that a delayed clean completion from an older Codex review is accepted for a newer head. `APPROVED` pull request reviews still use review metadata and do not need this buffer.
+
 `+1` reactions are diagnostic in this design. They are recorded when useful, but they are not the primary pass signal because reactions do not provide a reliable workflow wake event.
 
 `eyes` reactions are liveness signals. The gate checks both PR-body reactions and reactions on the active marker comment. They move `WaitingAck` to `WaitingResult`, but they do not pass the gate.
@@ -205,13 +211,13 @@ AnyState
 Codex terminal pass signals are:
 
 - a Codex `APPROVED` pull request review submitted after the active marker for the same head
-- a Codex top-level clean completion comment created after the active marker, currently identified by the `Codex Review:` prefix
+- a Codex top-level clean completion comment created after the active marker plus the configured completion signal buffer, currently identified by the `Codex Review:` prefix
 
 Before writing `success`, the gate must reload the PR and verify:
 
 - the current PR head still matches the active marker head
 - there are no current-head Codex findings
-- the terminal signal is newer than the active marker or has a distinct same-second identity that was not in the marker baseline
+- the terminal signal is newer than the active marker and, for top-level completion comments, outside the configured buffer window
 
 Codex findings are current-head findings when they are attached to the current head through pull request review metadata, inline review comments, or review-body links. Inline findings should use GraphQL review-thread state where available so resolved or outdated threads are not treated as active findings.
 

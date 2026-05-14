@@ -17,7 +17,7 @@ The runner implements an event-driven serialized marker flow:
 - Serializes controlled `@codex review` marker comments.
 - Treats Codex reactions as diagnostic signals only; `eyes` reactions on the active marker comment count as liveness, not pass.
 - Uses scheduled or manual resume runs to retry unacknowledged or stalled markers.
-- Passes only after a Codex top-level clean completion comment or `APPROVED` review appears after the active marker and the current head has no Codex findings.
+- Passes only after a Codex top-level clean completion comment or `APPROVED` review appears after the active marker and the current head has no Codex findings. Top-level completion comments must also satisfy the configured completion signal buffer.
 - Ignores PR-open automatic review output unless it appears after the active controlled marker and passes final current-head validation.
 
 ## Files
@@ -98,6 +98,7 @@ jobs:
           pull-request: ${{ github.event.inputs.pull_request }}
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
+          completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
 ```
 
 ## Self-Gating This Repository
@@ -120,6 +121,7 @@ As with any first rollout, the PR that introduces the workflow cannot fully exer
 | `marker-timeout-seconds` | `3600` | Time to wait for an acknowledged marker result before retrying. |
 | `marker-ack-timeout-seconds` | `300` | Initial time to wait for Codex to acknowledge a marker before retrying. |
 | `marker-ack-timeout-max-seconds` | `1800` | Maximum exponential backoff wait for unacknowledged markers. |
+| `completion-signal-buffer-seconds` | `60` | Minimum seconds after a marker before accepting a Codex top-level clean completion comment. Set to `0` to disable the buffer. |
 | `event-mode` | empty | Event mode override: exactly `standard`, `comment-only`, or `full`. Empty falls back to `CODEX_REVIEW_GATE_EVENT_MODE` or `standard`. |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input. Event-driven runs do not poll. |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input. Event-driven runs create controlled markers directly. |

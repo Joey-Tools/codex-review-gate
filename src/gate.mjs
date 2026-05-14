@@ -454,6 +454,7 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
         activeMarker.baseline?.completionComment,
         snapshot.completionComment,
         activeMarker.createdAt,
+        { bufferSeconds: config.completionSignalBufferSeconds },
       )
     ) {
       await passGate(state, stateComment, snapshot, {
@@ -783,6 +784,9 @@ function readConfig() {
     markerTimeoutMs: markerTimeoutSeconds * 1000,
     markerAckTimeoutSeconds: markerAckTimeoutConfig.markerAckTimeoutSeconds,
     markerAckTimeoutMaxSeconds: markerAckTimeoutConfig.markerAckTimeoutMaxSeconds,
+    completionSignalBufferSeconds: secondsEnv("COMPLETION_SIGNAL_BUFFER_SECONDS", 60, {
+      allowZero: true,
+    }),
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
     bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),
     eventMode: normalizeEventMode(process.env.EVENT_MODE_INPUT || process.env.CODEX_REVIEW_GATE_EVENT_MODE || ""),

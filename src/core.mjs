@@ -247,14 +247,20 @@ export function hasNewEyesTransition(baselineEyes, currentEyes, markerCreatedAt)
   return !sameReactionIdentity(baselineEyes, currentEyes);
 }
 
-export function hasNewCompletionComment(baselineComment, currentComment, markerCreatedAt) {
+export function hasNewCompletionComment(
+  baselineComment,
+  currentComment,
+  markerCreatedAt,
+  { bufferSeconds = 0 } = {},
+) {
   if (!currentComment) {
     return false;
   }
 
   const currentCreatedAt = parseTimestamp(currentComment.createdAt, "Codex completion comment creation time");
   const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
-  if (currentCreatedAt < markerCreated) {
+  const minimumCreatedAt = markerCreated + Math.max(0, Number(bufferSeconds) || 0) * 1000;
+  if (currentCreatedAt < minimumCreatedAt) {
     return false;
   }
 

@@ -207,6 +207,30 @@ test("accepts a same-second new Codex completion comment at the marker boundary"
   );
 });
 
+test("requires Codex completion comments to satisfy the configured marker buffer", () => {
+  const tooSoon = {
+    id: "2",
+    createdAt: "2026-04-26T10:01:59Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/2",
+  };
+  const afterBuffer = {
+    id: "3",
+    createdAt: "2026-04-26T10:02:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/3",
+  };
+
+  assert.equal(
+    hasNewCompletionComment(null, tooSoon, "2026-04-26T10:01:00Z", { bufferSeconds: 60 }),
+    false,
+  );
+  assert.equal(
+    hasNewCompletionComment(null, afterBuffer, "2026-04-26T10:01:00Z", { bufferSeconds: 60 }),
+    true,
+  );
+});
+
 test("starts marker ack timeout at the configured base", () => {
   assert.equal(markerAckTimeoutSecondsForHistory([], "head", 300, 1800), 300);
 });
