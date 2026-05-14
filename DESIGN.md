@@ -210,7 +210,7 @@ AnyState
 
 Codex terminal pass signals are:
 
-- a Codex `APPROVED` pull request review submitted after the active marker for the same head
+- a Codex `APPROVED` pull request review submitted strictly after the active marker for the same head
 - a Codex top-level clean completion comment created after the active marker plus the configured completion signal buffer, currently identified by the `Codex Review:` prefix
 
 Before writing `success`, the gate must reload the PR and verify:
@@ -239,6 +239,8 @@ If the sticky state comment is missing but a trusted marker comment exists, the 
 2. Baseline currently visible Codex signals.
 3. Do not pass from the recovered marker.
 4. Create a fresh marker or fail from current-head findings.
+
+If the sticky state comment exists but marker creation failed before a marker comment was persisted, scheduled recovery treats the current-head pending state as needing a fresh marker. The same retry rule applies after a marker is closed as `missed_ack` or `stalled` but posting the replacement marker fails.
 
 Scheduled runs process retry deadlines. They should scan open PRs, load state only for candidate PRs, and advance markers whose `nextRetryAt`, `ackDeadlineAt`, or `resultDeadlineAt` has elapsed.
 

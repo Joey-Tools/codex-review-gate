@@ -296,6 +296,22 @@ export function hasNewCompletionComment(
   return !sameIssueCommentIdentity(baselineComment, currentComment);
 }
 
+export function hasNewReviewTransition(baselineReview, currentReview, markerCreatedAt) {
+  if (!currentReview) {
+    return false;
+  }
+  const submittedAt = parseTimestamp(currentReview.submittedAt, "Codex review submission time");
+  const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
+  if (submittedAt <= markerCreated) {
+    return false;
+  }
+  if (!baselineReview) {
+    return true;
+  }
+  return String(baselineReview.id) !== String(currentReview.id) ||
+    baselineReview.submittedAt !== currentReview.submittedAt;
+}
+
 export function markerAckTimeoutSecondsForHistory(history, headSha, baseSeconds, maxSeconds) {
   let timeoutSeconds = baseSeconds;
   for (const marker of [...(history || [])].reverse()) {
@@ -582,6 +598,24 @@ export function stateNeedsFreshMarkerAfterRecovery(state) {
   const history = state?.history || [];
   const latest = history[history.length - 1];
   return latest?.outcome === "state_lost";
+}
+
+export function stateNeedsFreshMarkerAfterMissingMarker(state, statusHead) {
+  if (!state || state.activeMarker || !statusHead || state.statusHead !== statusHead) {
+    return false;
+  }
+  if (state.lastStatus?.headSha !== statusHead || state.lastStatus?.state !== "pending") {
+    return false;
+  }
+
+  const latestForHead = [...(state.history || [])]
+    .reverse()
+    .find((marker) => marker.headSha === statusHead);
+  if (!latestForHead) {
+    return true;
+  }
+
+  return new Set(["missed_ack", "stalled"]).has(latestForHead.outcome || latestForHead.state);
 }
 
 export function normalizeState(state) {

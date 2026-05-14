@@ -22,6 +22,7 @@ import {
   findLatestTrustedStateComment,
   hasNewCompletionComment,
   hasNewEyesTransition,
+  hasNewReviewTransition,
   isoNow,
   hasTrustedGateStateOrMarker,
   isCodexBot,
@@ -43,6 +44,7 @@ import {
   selectLatestCodexCompletionComment,
   shouldCreateFreshHeadMarker,
   shouldFailFindingsBeforeMarker,
+  stateNeedsFreshMarkerAfterMissingMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
   summarizeCodexSignalReactions,
@@ -319,7 +321,9 @@ async function processPullRequest(prNumber, trigger) {
     needsFreshMarker: stateNeedsFreshMarker,
   } = await ensureState(snapshot, null, null);
   state = migrateStateForEventDrivenDeadlines(state);
-  stateNeedsFreshMarker = stateNeedsFreshMarker || stateNeedsFreshMarkerAfterRecovery(state);
+  stateNeedsFreshMarker = stateNeedsFreshMarker ||
+    stateNeedsFreshMarkerAfterRecovery(state) ||
+    stateNeedsFreshMarkerAfterMissingMarker(state, statusSha);
 
   if (
     trigger.kind === "scan" &&
@@ -487,8 +491,8 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
         runUrl,
         status: "failure",
       });
-      stateComment = await saveState(state, stateComment);
       await setCommitStatus("failure", "Timed out waiting for Codex review signal");
+      stateComment = await saveState(state, stateComment);
       return { kind: "done", state, stateComment };
     }
 
@@ -607,8 +611,8 @@ async function failFromFindings(findings, state, stateComment) {
     runUrl,
     status: "failure",
   });
-  await saveState(statusState, stateComment);
   await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
+  await saveState(statusState, stateComment);
   console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
 }
 
@@ -924,22 +928,6 @@ function selectLatestCodexReview(reviews, botLogins, predicate) {
   });
 
   return matches[0] || null;
-}
-
-function hasNewReviewTransition(baselineReview, currentReview, markerCreatedAt) {
-  if (!currentReview) {
-    return false;
-  }
-  const submittedAt = parseTimestamp(currentReview.submittedAt, "Codex review submission time");
-  const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
-  if (submittedAt < markerCreated) {
-    return false;
-  }
-  if (!baselineReview) {
-    return true;
-  }
-  return String(baselineReview.id) !== String(currentReview.id) ||
-    baselineReview.submittedAt !== currentReview.submittedAt;
 }
 
 async function setCommitStatus(state, description) {

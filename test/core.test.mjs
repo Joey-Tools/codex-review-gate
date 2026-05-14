@@ -20,6 +20,7 @@ import {
   hasNewCompletionComment,
   hasNewEyesTransition,
   hasNewPlusOneTransition,
+  hasNewReviewTransition,
   isCodexCompletionComment,
   isCurrentHeadCodexReviewBodyFinding,
   isRetryableHttpStatus,
@@ -40,6 +41,7 @@ import {
   selectLatestCodexCompletionComment,
   shouldCreateFreshHeadMarker,
   shouldFailFindingsBeforeMarker,
+  stateNeedsFreshMarkerAfterMissingMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
@@ -247,6 +249,26 @@ test("requires Codex completion comments to satisfy the configured marker buffer
   );
   assert.equal(
     hasNewCompletionComment(null, afterBuffer, "2026-04-26T10:01:00Z", { bufferSeconds: 60 }),
+    true,
+  );
+});
+
+test("requires Codex reviews to be strictly after the marker", () => {
+  const sameSecondReview = {
+    id: "2",
+    submittedAt: "2026-04-26T10:01:00Z",
+  };
+  const afterMarkerReview = {
+    id: "3",
+    submittedAt: "2026-04-26T10:01:01Z",
+  };
+
+  assert.equal(
+    hasNewReviewTransition(null, sameSecondReview, "2026-04-26T10:01:00Z"),
+    false,
+  );
+  assert.equal(
+    hasNewReviewTransition(null, afterMarkerReview, "2026-04-26T10:01:00Z"),
     true,
   );
 });
@@ -1028,6 +1050,41 @@ test("requires a fresh recovery marker only after state-loss recovery", () => {
       history: [{ id: "1", outcome: "state_lost" }],
     }),
     true,
+  );
+});
+
+test("requires a fresh marker when pending state never got a marker", () => {
+  const baseState = {
+    statusHead: "head",
+    activeMarker: null,
+    history: [],
+    lastStatus: {
+      headSha: "head",
+      state: "pending",
+    },
+  };
+
+  assert.equal(stateNeedsFreshMarkerAfterMissingMarker(baseState, "head"), true);
+  assert.equal(
+    stateNeedsFreshMarkerAfterMissingMarker({
+      ...baseState,
+      history: [{ headSha: "head", outcome: "missed_ack" }],
+    }, "head"),
+    true,
+  );
+  assert.equal(
+    stateNeedsFreshMarkerAfterMissingMarker({
+      ...baseState,
+      history: [{ headSha: "head", outcome: "passed" }],
+    }, "head"),
+    false,
+  );
+  assert.equal(
+    stateNeedsFreshMarkerAfterMissingMarker({
+      ...baseState,
+      lastStatus: { headSha: "head", state: "failure" },
+    }, "head"),
+    false,
   );
 });
 
