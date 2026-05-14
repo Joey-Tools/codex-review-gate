@@ -225,7 +225,7 @@ function readEventPayload() {
 }
 
 function eventMayHaveReadOnlyForkToken() {
-  return new Set(["issue_comment", "pull_request_review", "pull_request_review_comment"]).has(
+  return new Set(["pull_request_review", "pull_request_review_comment"]).has(
     process.env.GITHUB_EVENT_NAME || "",
   );
 }
@@ -452,6 +452,22 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
       continue;
     }
 
+    const timeoutOutcome = markerTimeoutOutcome(activeMarker);
+    if (timeoutOutcome === "max_wait") {
+      state = closeActiveMarker(state, "timed_out", isoNow(), {
+        timedOutAfterSeconds: Math.round(config.maxWaitMs / 1000),
+      });
+      state = updateStateForStatus(state, {
+        now: isoNow(),
+        statusHead: statusSha,
+        runUrl,
+        status: "failure",
+      });
+      stateComment = await saveState(state, stateComment);
+      await setCommitStatus("failure", "Timed out waiting for Codex review signal");
+      return { kind: "done", state, stateComment };
+    }
+
     const approvedReview = selectLatestCodexApprovedReview(snapshot.reviews, config.codexBotLogins);
     if (hasNewReviewTransition(activeMarker.baseline?.approvedReview, approvedReview, activeMarker.createdAt)) {
       await passGate(state, stateComment, snapshot, {
@@ -503,22 +519,6 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
         },
       });
       stateComment = await saveState(state, stateComment);
-      return { kind: "done", state, stateComment };
-    }
-
-    const timeoutOutcome = markerTimeoutOutcome(activeMarker);
-    if (timeoutOutcome === "max_wait") {
-      state = closeActiveMarker(state, "timed_out", isoNow(), {
-        timedOutAfterSeconds: Math.round(config.maxWaitMs / 1000),
-      });
-      state = updateStateForStatus(state, {
-        now: isoNow(),
-        statusHead: statusSha,
-        runUrl,
-        status: "failure",
-      });
-      stateComment = await saveState(state, stateComment);
-      await setCommitStatus("failure", "Timed out waiting for Codex review signal");
       return { kind: "done", state, stateComment };
     }
 

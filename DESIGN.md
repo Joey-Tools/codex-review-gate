@@ -225,7 +225,7 @@ If PR-open automatic Codex review is still enabled, its output is not trusted as
 
 ## Fork and Dependabot PRs
 
-GitHub documents that [PR-related events other than `pull_request_target` can receive a read-only `GITHUB_TOKEN`](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories) for fork and Dependabot PRs. The gate therefore treats `issue_comment`, `pull_request_review`, and `pull_request_review_comment` wake events as opportunistic: if the current PR head is from a fork, the action skips the write path and relies on the scheduled or manual `pull_request_target` recovery path to advance the state with write permissions.
+GitHub documents that [PR review events other than `pull_request_target` can receive a read-only `GITHUB_TOKEN`](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories) for fork and Dependabot PRs. The gate therefore treats `pull_request_review` and `pull_request_review_comment` wake events as opportunistic: if the current PR head is from a fork, the action skips the write path and relies on the scheduled or manual `pull_request_target` recovery path to advance the state with write permissions. Top-level `issue_comment` wakeups still run because Codex clean completion comments use that event path.
 
 ## Retry and Recovery
 
