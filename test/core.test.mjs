@@ -12,6 +12,7 @@ import {
   codexAutoReviewLooksOngoing,
   collectCurrentHeadCodexFindings,
   decideBootstrapProgress,
+  eventMayHaveReadOnlyDependabotToken,
   eventModeHandlesEvent,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
@@ -31,6 +32,7 @@ import {
   normalizeMarkerAckTimeoutSeconds,
   parseJsonResponseText,
   parseStateCommentBody,
+  pullRequestIsDependabot,
   reconcileStateWithMarkerComment,
   reactionIdentity,
   restRequestRetryAllowed,
@@ -58,6 +60,21 @@ test("filters optional workflow events by event mode", () => {
   assert.equal(eventModeHandlesEvent("pull_request_review", "comment-only"), false);
   assert.equal(eventModeHandlesEvent("pull_request_review_comment", "standard"), false);
   assert.equal(eventModeHandlesEvent("pull_request_review_comment", "full"), true);
+});
+
+test("treats Dependabot event wakeups as read-only token candidates", () => {
+  assert.equal(eventMayHaveReadOnlyDependabotToken("pull_request_target"), true);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("issue_comment"), true);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("pull_request_review"), true);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("pull_request_review_comment"), true);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("schedule"), false);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("workflow_dispatch"), false);
+});
+
+test("detects Dependabot-authored pull requests", () => {
+  assert.equal(pullRequestIsDependabot({ user: { login: "dependabot[bot]" } }), true);
+  assert.equal(pullRequestIsDependabot({ user: { login: "octocat" } }), false);
+  assert.equal(pullRequestIsDependabot({}), false);
 });
 
 test("treats only explicit false as auto retry disabled", () => {

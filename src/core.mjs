@@ -60,6 +60,19 @@ export function eventModeHandlesEvent(eventName, eventMode = "standard") {
   return true;
 }
 
+export function eventMayHaveReadOnlyDependabotToken(eventName) {
+  return new Set([
+    "pull_request_target",
+    "issue_comment",
+    "pull_request_review",
+    "pull_request_review_comment",
+  ]).has(eventName || "");
+}
+
+export function pullRequestIsDependabot(pullRequest) {
+  return pullRequest?.user?.login === "dependabot[bot]";
+}
+
 export function autoRetryEnabled(raw) {
   return String(raw || "").trim().toLowerCase() !== "false";
 }

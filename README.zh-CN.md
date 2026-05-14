@@ -74,18 +74,34 @@ jobs:
     if: >-
       ${{
         (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
+        (github.event_name != 'pull_request_target' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'issue_comment' ||
+          github.event.issue.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'pull_request_review' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'pull_request_review_comment' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
         (github.event_name != 'issue_comment' ||
           (github.event.issue.pull_request &&
-            (github.event.comment.user.login == 'chatgpt-codex-connector' ||
-             github.event.comment.user.login == 'chatgpt-codex-connector[bot]'))) &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.comment.user.login))))) &&
         (github.event_name != 'pull_request_review' ||
           (vars.CODEX_REVIEW_GATE_EVENT_MODE != 'comment-only' &&
-            (github.event.review.user.login == 'chatgpt-codex-connector' ||
-             github.event.review.user.login == 'chatgpt-codex-connector[bot]'))) &&
+            github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.review.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.review.user.login))))) &&
         (github.event_name != 'pull_request_review_comment' ||
           (vars.CODEX_REVIEW_GATE_EVENT_MODE == 'full' &&
-            (github.event.comment.user.login == 'chatgpt-codex-connector' ||
-             github.event.comment.user.login == 'chatgpt-codex-connector[bot]')))
+            github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.comment.user.login)))))
       }}
     runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15
@@ -95,6 +111,8 @@ jobs:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.inputs.pull_request }}
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
+          codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
+          completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
 ```
 
 ## 本仓库的自托管 Gate
@@ -117,6 +135,7 @@ jobs:
 | `marker-timeout-seconds` | `3600` | 已 ack marker 等待结果的时间，超时后重试。 |
 | `marker-ack-timeout-seconds` | `300` | Codex ack marker 前的初始等待时间。 |
 | `marker-ack-timeout-max-seconds` | `1800` | 未 ack marker 指数退避等待上限。 |
+| `completion-signal-buffer-seconds` | `60` | Marker 创建后至少等待多少秒，才接受 Codex top-level clean completion comment。设为 `0` 可关闭 buffer。 |
 | `event-mode` | empty | Event mode override：精确小写 `standard`、`comment-only` 或 `full`。留空时使用 `CODEX_REVIEW_GATE_EVENT_MODE` 或 `standard`。 |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input。Event-driven runs 不轮询。 |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input。Event-driven runs 会直接创建 controlled marker。 |

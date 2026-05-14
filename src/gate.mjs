@@ -16,6 +16,7 @@ import {
   closeActiveMarker,
   collectCurrentHeadCodexFindings,
   createInitialState,
+  eventMayHaveReadOnlyDependabotToken,
   eventModeHandlesEvent,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
@@ -35,6 +36,7 @@ import {
   parseJsonResponseText,
   parseStateCommentBody,
   parseTimestamp,
+  pullRequestIsDependabot,
   reconcileStateWithMarkerComment,
   restRequestRetryAllowed,
   retryAfterDelayMs,
@@ -267,6 +269,17 @@ async function processPullRequest(prNumber, trigger) {
 
   const pullRequest = await loadPullRequest();
   statusSha = pullRequest.head.sha;
+  if (
+    eventMayHaveReadOnlyDependabotToken(process.env.GITHUB_EVENT_NAME) &&
+    pullRequestIsDependabot(pullRequest)
+  ) {
+    console.log(
+      `Skipping ${process.env.GITHUB_EVENT_NAME} for Dependabot PR #${activePrNumber}; ` +
+        "scheduled or manual runs can resume with a write-capable token.",
+    );
+    return;
+  }
+
   if (eventMayHaveReadOnlyForkToken() && pullRequestIsFromFork(pullRequest)) {
     console.log(
       `Skipping ${process.env.GITHUB_EVENT_NAME} for fork PR #${activePrNumber}; ` +
@@ -286,7 +299,11 @@ async function processPullRequest(prNumber, trigger) {
     return;
   }
 
-  if (trigger.kind === "scan" && !trigger.allowCreateMarker) {
+  const dependabotScheduleRecovery = trigger.kind === "scan" &&
+    !trigger.allowCreateMarker &&
+    pullRequestIsDependabot(pullRequest);
+
+  if (trigger.kind === "scan" && !trigger.allowCreateMarker && !dependabotScheduleRecovery) {
     const comments = await paginate(`${repoPath}/issues/${activePrNumber}/comments`, { per_page: "100" });
     if (!hasTrustedGateStateOrMarker(comments, config.trustedCommentLogins)) {
       console.log(`PR #${activePrNumber} has no gate state; skipping scheduled scan.`);
@@ -304,7 +321,13 @@ async function processPullRequest(prNumber, trigger) {
   state = migrateStateForEventDrivenDeadlines(state);
   stateNeedsFreshMarker = stateNeedsFreshMarker || stateNeedsFreshMarkerAfterRecovery(state);
 
-  if (trigger.kind === "scan" && !trigger.allowCreateMarker && !state.activeMarker && !stateNeedsFreshMarker) {
+  if (
+    trigger.kind === "scan" &&
+    !trigger.allowCreateMarker &&
+    !dependabotScheduleRecovery &&
+    !state.activeMarker &&
+    !stateNeedsFreshMarker
+  ) {
     console.log(`PR #${activePrNumber} has no active marker; skipping scheduled scan.`);
     return;
   }
@@ -565,8 +588,8 @@ async function passGate(state, stateComment, snapshot, observed) {
     runUrl,
     status: "success",
   });
-  await saveState(passedState, stateComment);
   await setCommitStatus("success", "Codex completion observed and current head has no Codex findings");
+  await saveState(passedState, stateComment);
   console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
 }
 

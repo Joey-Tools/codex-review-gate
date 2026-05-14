@@ -74,6 +74,14 @@ jobs:
     if: >-
       ${{
         (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
+        (github.event_name != 'pull_request_target' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'issue_comment' ||
+          github.event.issue.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'pull_request_review' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'pull_request_review_comment' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
         (github.event_name != 'issue_comment' ||
           (github.event.issue.pull_request &&
             (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',

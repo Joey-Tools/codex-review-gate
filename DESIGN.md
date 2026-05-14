@@ -225,7 +225,9 @@ If PR-open automatic Codex review is still enabled, its output is not trusted as
 
 ## Fork and Dependabot PRs
 
-GitHub documents that [PR review events other than `pull_request_target` can receive a read-only `GITHUB_TOKEN`](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories) for fork and Dependabot PRs. The gate therefore treats `pull_request_review` and `pull_request_review_comment` wake events as opportunistic: if the current PR head is from a fork, the action skips the write path and relies on the scheduled or manual `pull_request_target` recovery path to advance the state with write permissions. Top-level `issue_comment` wakeups still run because Codex clean completion comments use that event path.
+GitHub documents that [PR review events other than `pull_request_target` can receive a read-only `GITHUB_TOKEN`](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories) for fork and Dependabot PRs, and Dependabot-triggered `pull_request_target`, review, and comment events can also run with a read-only token. The sample workflow therefore filters Dependabot event wakeups before runner allocation, and the action skips the same write path defensively if a user workflow omits that filter.
+
+Fork PR review events are opportunistic: if the current PR head is from a fork, the action skips `pull_request_review` and `pull_request_review_comment` writes and relies on top-level `issue_comment`, schedule, or manual recovery. Dependabot PRs rely on schedule or manual recovery for all write-capable progress. Scheduled scans may initialise a Dependabot PR with no prior gate state because the per-event wakeups are intentionally ignored.
 
 ## Retry and Recovery
 
