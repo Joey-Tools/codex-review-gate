@@ -149,6 +149,7 @@ NoState / Passed / FailedFindings
     create or refresh sticky state
     close obsolete active marker if present
     create @codex review marker for current head
+    do not let existing unresolved findings from an earlier marker block the fresh-head marker
     set ackDeadlineAt, resultDeadlineAt, nextRetryAt, headStartedAt
     -> WaitingAck
 

@@ -64,6 +64,14 @@ export function autoRetryEnabled(raw) {
   return String(raw || "").trim().toLowerCase() !== "false";
 }
 
+export function shouldFailFindingsBeforeMarker({ findingsCount, freshHeadMarkerAllowed }) {
+  if (Number(findingsCount || 0) <= 0) {
+    return false;
+  }
+
+  return !freshHeadMarkerAllowed;
+}
+
 export function isRetryableHttpStatus(status) {
   return RETRYABLE_HTTP_STATUSES.has(Number(status));
 }

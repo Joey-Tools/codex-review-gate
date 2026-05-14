@@ -34,6 +34,7 @@ import {
   restRequestRetryAllowed,
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
+  shouldFailFindingsBeforeMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
@@ -957,6 +958,21 @@ test("requires a fresh recovery marker only after state-loss recovery", () => {
       history: [{ id: "1", outcome: "state_lost" }],
     }),
     true,
+  );
+});
+
+test("defers existing findings when a fresh-head marker is allowed", () => {
+  assert.equal(
+    shouldFailFindingsBeforeMarker({ findingsCount: 2, freshHeadMarkerAllowed: true }),
+    false,
+  );
+  assert.equal(
+    shouldFailFindingsBeforeMarker({ findingsCount: 2, freshHeadMarkerAllowed: false }),
+    true,
+  );
+  assert.equal(
+    shouldFailFindingsBeforeMarker({ findingsCount: 0, freshHeadMarkerAllowed: false }),
+    false,
   );
 });
 

@@ -37,6 +37,7 @@ import {
   restRequestRetryAllowed,
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
+  shouldFailFindingsBeforeMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
   summarizeCodexSignalReactions,
@@ -303,7 +304,8 @@ async function processPullRequest(prNumber, trigger) {
   }
 
   let allowCreateMarker = trigger.allowCreateMarker || recoveryNeedsFreshMarker;
-  if (state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha)) {
+  const headChanged = state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha);
+  if (headChanged) {
     if (state.activeMarker) {
       state = closeActiveMarker(state, "obsolete_head", isoNow(), { currentHeadSha: statusSha });
       savedStateComment = await saveState(state, savedStateComment);
@@ -321,7 +323,13 @@ async function processPullRequest(prNumber, trigger) {
     statusReady = true;
   }
 
-  if (snapshot.findings.count > 0) {
+  const freshHeadMarkerAllowed = headChanged && allowCreateMarker && !state.activeMarker;
+  if (
+    shouldFailFindingsBeforeMarker({
+      findingsCount: snapshot.findings.count,
+      freshHeadMarkerAllowed,
+    })
+  ) {
     await failFromFindings(snapshot.findings, state, savedStateComment);
     return;
   }
