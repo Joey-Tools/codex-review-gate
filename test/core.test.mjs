@@ -15,6 +15,7 @@ import {
   eventModeHandlesEvent,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
+  hasTrustedGateStateOrMarker,
   hasNewCompletionComment,
   hasNewEyesTransition,
   hasNewPlusOneTransition,
@@ -34,6 +35,7 @@ import {
   restRequestRetryAllowed,
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
+  shouldCreateFreshHeadMarker,
   shouldFailFindingsBeforeMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
@@ -982,6 +984,64 @@ test("requires a fresh recovery marker only after state-loss recovery", () => {
       history: [{ id: "1", outcome: "state_lost" }],
     }),
     true,
+  );
+});
+
+test("scheduled scans continue when either trusted state or marker exists", () => {
+  const markerBody = buildMarkerCommentBody({
+    headSha: "abc123",
+    runUrl: "https://example.invalid/runs/1",
+    runId: "1",
+    runAttempt: "1",
+    attempt: 1,
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+  });
+  const stateBody = buildStateCommentBody({
+    version: 1,
+    createdAt: "2026-04-26T10:00:00Z",
+    updatedAt: "2026-04-26T10:00:00Z",
+    statusHead: "abc123",
+    bootstrap: { status: "closed" },
+    activeMarker: null,
+    history: [],
+  });
+
+  assert.equal(hasTrustedGateStateOrMarker([], new Set(["github-actions[bot]"])), false);
+  assert.equal(
+    hasTrustedGateStateOrMarker(
+      [{ id: 1, body: stateBody, user: { login: "github-actions[bot]" } }],
+      new Set(["github-actions[bot]"]),
+    ),
+    true,
+  );
+  assert.equal(
+    hasTrustedGateStateOrMarker(
+      [{ id: 2, body: markerBody, user: { login: "github-actions[bot]" } }],
+      new Set(["github-actions[bot]"]),
+    ),
+    true,
+  );
+});
+
+test("allows a fresh marker for no-state current-head findings", () => {
+  assert.equal(
+    shouldCreateFreshHeadMarker({
+      allowCreateMarker: true,
+      hasActiveMarker: false,
+      headChanged: false,
+      stateNeedsFreshMarker: true,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldCreateFreshHeadMarker({
+      allowCreateMarker: true,
+      hasActiveMarker: true,
+      headChanged: true,
+      stateNeedsFreshMarker: true,
+    }),
+    false,
   );
 });
 

@@ -72,6 +72,22 @@ export function shouldFailFindingsBeforeMarker({ findingsCount, freshHeadMarkerA
   return !freshHeadMarkerAllowed;
 }
 
+export function shouldCreateFreshHeadMarker({
+  allowCreateMarker,
+  hasActiveMarker,
+  headChanged,
+  stateNeedsFreshMarker,
+}) {
+  return Boolean(allowCreateMarker && !hasActiveMarker && (headChanged || stateNeedsFreshMarker));
+}
+
+export function hasTrustedGateStateOrMarker(comments, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
+  return Boolean(
+    findLatestTrustedStateComment(comments, trustedLogins) ||
+      findLatestTrustedMarkerComment(comments, trustedLogins),
+  );
+}
+
 export function isRetryableHttpStatus(status) {
   return RETRYABLE_HTTP_STATUSES.has(Number(status));
 }

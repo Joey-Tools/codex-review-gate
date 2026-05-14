@@ -22,6 +22,7 @@ import {
   hasNewCompletionComment,
   hasNewEyesTransition,
   isoNow,
+  hasTrustedGateStateOrMarker,
   isCodexBot,
   isRetryableHttpStatus,
   markerAckTimeoutSecondsForHistory,
@@ -37,6 +38,7 @@ import {
   restRequestRetryAllowed,
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
+  shouldCreateFreshHeadMarker,
   shouldFailFindingsBeforeMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
@@ -285,8 +287,7 @@ async function processPullRequest(prNumber, trigger) {
 
   if (trigger.kind === "scan" && !trigger.allowCreateMarker) {
     const comments = await paginate(`${repoPath}/issues/${activePrNumber}/comments`, { per_page: "100" });
-    const stateComment = findLatestTrustedStateComment(comments, config.trustedCommentLogins);
-    if (!stateComment) {
+    if (!hasTrustedGateStateOrMarker(comments, config.trustedCommentLogins)) {
       console.log(`PR #${activePrNumber} has no gate state; skipping scheduled scan.`);
       return;
     }
@@ -294,16 +295,20 @@ async function processPullRequest(prNumber, trigger) {
 
   const snapshot = await loadSnapshot();
 
-  let { state, stateComment: savedStateComment } = await ensureState(snapshot, null, null);
+  let {
+    state,
+    stateComment: savedStateComment,
+    needsFreshMarker: stateNeedsFreshMarker,
+  } = await ensureState(snapshot, null, null);
   state = migrateStateForEventDrivenDeadlines(state);
-  const recoveryNeedsFreshMarker = stateNeedsFreshMarkerAfterRecovery(state);
+  stateNeedsFreshMarker = stateNeedsFreshMarker || stateNeedsFreshMarkerAfterRecovery(state);
 
-  if (trigger.kind === "scan" && !trigger.allowCreateMarker && !state.activeMarker && !recoveryNeedsFreshMarker) {
+  if (trigger.kind === "scan" && !trigger.allowCreateMarker && !state.activeMarker && !stateNeedsFreshMarker) {
     console.log(`PR #${activePrNumber} has no active marker; skipping scheduled scan.`);
     return;
   }
 
-  let allowCreateMarker = trigger.allowCreateMarker || recoveryNeedsFreshMarker;
+  let allowCreateMarker = trigger.allowCreateMarker || stateNeedsFreshMarker;
   const headChanged = state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha);
   if (headChanged) {
     if (state.activeMarker) {
@@ -323,7 +328,12 @@ async function processPullRequest(prNumber, trigger) {
     statusReady = true;
   }
 
-  const freshHeadMarkerAllowed = headChanged && allowCreateMarker && !state.activeMarker;
+  const freshHeadMarkerAllowed = shouldCreateFreshHeadMarker({
+    allowCreateMarker,
+    hasActiveMarker: Boolean(state.activeMarker),
+    headChanged,
+    stateNeedsFreshMarker,
+  });
   if (
     shouldFailFindingsBeforeMarker({
       findingsCount: snapshot.findings.count,
@@ -356,7 +366,7 @@ async function processPullRequest(prNumber, trigger) {
 
 async function ensureState(snapshot, previousState, previousComment) {
   if (previousState && previousComment) {
-    return { state: previousState, stateComment: previousComment };
+    return { state: previousState, stateComment: previousComment, needsFreshMarker: false };
   }
 
   const stateComment = findLatestTrustedStateComment(snapshot.comments, config.trustedCommentLogins);
@@ -374,6 +384,7 @@ async function ensureState(snapshot, previousState, previousComment) {
     return {
       state: reconciled.state,
       stateComment: reconciledStateComment,
+      needsFreshMarker: false,
     };
   }
 
@@ -405,7 +416,7 @@ async function ensureState(snapshot, previousState, previousComment) {
   };
 
   const createdStateComment = await saveState(state, null);
-  return { state, stateComment: createdStateComment };
+  return { state, stateComment: createdStateComment, needsFreshMarker: true };
 }
 
 async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) {
