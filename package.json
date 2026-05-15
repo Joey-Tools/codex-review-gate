@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "check": "node --check src/core.mjs && node --check src/gate.mjs && node --check test/core.test.mjs && node --check test/gate-runner.test.mjs && node --check test/support/fake-github-fetch.mjs",
-    "test": "node --test"
+    "check:state-machine": "node --check src/core.mjs && node --check src/gate.mjs && node --check test/gate-runner.test.mjs && node --check test/support/fake-github-fetch.mjs",
+    "test": "node --test",
+    "test:state-machine": "node --test test/gate-runner.test.mjs"
   },
   "repository": {
     "type": "git",
