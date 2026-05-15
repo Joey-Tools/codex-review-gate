@@ -662,6 +662,9 @@ test("finds the latest trusted marker comment", () => {
     state: "waiting_ack",
   });
 
+  assert.equal(markerBody.startsWith("@codex review\n\n> [!NOTE]"), true);
+  assert.match(markerBody, /Codex may post AI-generated comments or reviews on this pull request\./);
+
   const comment = findLatestTrustedMarkerComment([
     { id: 1, body: markerBody, created_at: "2026-04-26T10:00:00Z", user: { login: "octocat" } },
     {

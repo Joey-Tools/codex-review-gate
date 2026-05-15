@@ -46,6 +46,7 @@ test("pull_request_target creates current-head state, marker, and pending status
 
     const markerComment = harness.findMarkerComments().at(-1);
     assert.equal(markerComment.body.startsWith("@codex review"), true);
+    assert.match(markerComment.body, /This workflow is requesting a Codex generative AI review\./);
     const marker = parseMarkerCommentBody(markerComment.body);
     assert.equal(marker.headSha, "head-1");
     assert.equal(marker.state, "waiting_ack");
