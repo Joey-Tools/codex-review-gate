@@ -44,7 +44,7 @@ inputs:
   completion-signal-buffer-seconds:
     description: Minimum seconds after a marker before accepting a Codex top-level clean completion comment.
     required: false
-    default: "60"
+    default: "30"
   poll-interval-seconds:
     description: Deprecated compatibility input. Event-driven runs do not poll.
     required: false

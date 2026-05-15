@@ -56,7 +56,7 @@ These values are exact lower-case strings so workflow-level routing and action r
 
 ### `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS`
 
-`CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS` may be supplied as a repository or organization variable and passed to the action through `completion-signal-buffer-seconds`. The default is `60`. Set it to `0` to disable the extra buffer; completion comments created in the same second as the marker are still rejected because GitHub timestamps are second-resolution.
+`CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS` may be supplied as a repository or organization variable and passed to the action through `completion-signal-buffer-seconds`. The default is `30`. Set it to `0` to disable the extra buffer; completion comments created in the same second as the marker are still rejected because GitHub timestamps are second-resolution.
 
 The buffer applies only to Codex top-level clean completion comments because those comments do not identify the reviewed commit. A completion comment must be created after the active marker and outside the configured buffer window before it can pass the gate. This reduces the chance that a delayed clean completion from an older Codex review is accepted for a newer head. `APPROVED` pull request reviews still use review metadata and do not need this buffer.
 

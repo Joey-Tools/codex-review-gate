@@ -834,7 +834,7 @@ function readConfig() {
     markerTimeoutMs: markerTimeoutSeconds * 1000,
     markerAckTimeoutSeconds: markerAckTimeoutConfig.markerAckTimeoutSeconds,
     markerAckTimeoutMaxSeconds: markerAckTimeoutConfig.markerAckTimeoutMaxSeconds,
-    completionSignalBufferSeconds: secondsEnv("COMPLETION_SIGNAL_BUFFER_SECONDS", 60, {
+    completionSignalBufferSeconds: secondsEnv("COMPLETION_SIGNAL_BUFFER_SECONDS", 30, {
       allowZero: true,
     }),
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
