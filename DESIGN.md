@@ -1,8 +1,14 @@
 # Codex Review Gate Advanced Design
 
+Languages: [British English (en-GB)](DESIGN.md) | [简体中文 (zh-CN)](DESIGN.zh-CN.md)
+
 ## Goal
 
 `codex/review-gate` turns a controlled `@codex review` request into a deterministic commit status that can be required by branch protection. The status should remain `pending` or become `failure` unless the gate can prove that the current PR head has a clean Codex result.
+
+## Generative AI Disclosure
+
+The controlled marker comment includes a visible notice that the workflow is requesting a Codex generative AI review and that Codex may post AI-generated comments or reviews. The gate treats those comments and reviews as review signals, but maintainers should verify AI-generated output before relying on it for security, correctness, or merge decisions.
 
 The gate is event-driven. Workflow runs create markers, triage Codex signals, resume stored state, or process retry deadlines. They do not need to keep a runner active while Codex reviews the PR.
 
@@ -64,7 +70,7 @@ The buffer applies only to Codex top-level clean completion comments because tho
 
 `eyes` reactions are liveness signals. The gate checks both PR-body reactions and reactions on the active marker comment. They move `WaitingAck` to `WaitingResult`, but they do not pass the gate.
 
-## Minutes Model
+## GHA Cost Model
 
 The happy path normally uses two short jobs:
 
