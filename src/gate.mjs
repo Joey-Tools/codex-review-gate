@@ -295,6 +295,7 @@ async function processPullRequest(prNumber, trigger) {
 
   const pullRequest = await loadPullRequest();
   statusSha = pullRequest.head.sha;
+  statusReady = true;
   if (
     eventMayHaveReadOnlyDependabotToken(process.env.GITHUB_EVENT_NAME) &&
     pullRequestIsDependabot(pullRequest)
@@ -320,7 +321,6 @@ async function processPullRequest(prNumber, trigger) {
       return;
     }
     await setCommitStatus("pending", "Draft PR is waiting for Codex review gate");
-    statusReady = true;
     console.log(`PR #${activePrNumber} is draft; leaving ${STATUS_CONTEXT} pending.`);
     return;
   }
@@ -370,15 +370,12 @@ async function processPullRequest(prNumber, trigger) {
     }
     allowCreateMarker = true;
     await setCommitStatus("pending", "Waiting for Codex review on current head");
-    statusReady = true;
     state = updateStateForStatus(state, {
       now: isoNow(),
       statusHead: statusSha,
       runUrl,
       status: "pending",
     });
-  } else {
-    statusReady = true;
   }
 
   const freshHeadMarkerAllowed = shouldCreateFreshHeadMarker({

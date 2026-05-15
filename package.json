@@ -4,7 +4,7 @@
   "description": "Deterministic GitHub status gate for Codex pull request reviews.",
   "type": "module",
   "scripts": {
-    "check": "node --check src/core.mjs && node --check src/gate.mjs && node --check test/core.test.mjs",
+    "check": "node --check src/core.mjs && node --check src/gate.mjs && node --check test/core.test.mjs && node --check test/gate-runner.test.mjs && node --check test/support/fake-github-fetch.mjs",
     "test": "node --test"
   },
   "repository": {
