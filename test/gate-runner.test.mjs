@@ -183,6 +183,198 @@ test("issue_comment completion fails closed when final reload sees current-head 
   });
 });
 
+test("issue_comment clean completion recovers resolved failed findings", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push({
+      id: "thread-3001",
+      isResolved: true,
+      isOutdated: false,
+      comments: { nodes: [{ databaseId: 3001 }] },
+    });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.pullLoads, 2);
+    assert.equal(harness.snapshotLoads, 2);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    assert.equal(harness.statuses.at(-1).body.description, "Codex completion observed after resolved findings");
+
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.lastStatus.state, "success");
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
+  });
+});
+
+test("issue_comment clean completion does not recover failed findings when disabled", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+      env: { FAILED_FINDINGS_RECOVERY: "false" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.lastStatus.state, "failure");
+  });
+
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+      env: {
+        FAILED_FINDINGS_RECOVERY_INPUT: "false",
+        FAILED_FINDINGS_RECOVERY: "true",
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+  });
+});
+
+test("issue_comment clean completion keeps failed findings blocked when unresolved findings remain", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push({
+      id: "thread-3001",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: [{ databaseId: 3001 }] },
+    });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.lastStatus.state, "failure");
+  });
+});
+
+test("issue_comment clean completion recovery requires a new completion after failed findings", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000, closedAt: "2026-05-14T10:00:00Z" });
+    const comment = codexCleanComment(2001, "2026-05-14T10:00:00Z");
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.lastStatus.state, "failure");
+  });
+});
+
+test("issue_comment recovery requires a Codex clean completion and failed_findings history", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    const nonCompletion = {
+      ...codexCleanComment(2001),
+      body: "@codex review",
+    };
+    harness.issueComments.push(nonCompletion);
+
+    const nonCompletionResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: nonCompletion,
+      },
+    });
+
+    assert.equal(nonCompletionResult.code, 0, nonCompletionResult.stderr);
+    assert.equal(harness.statuses.length, 0);
+  });
+
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000, outcome: "missed_ack" });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+  });
+});
+
+test("issue_comment recovery ignores non-Codex comments", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    const comment = {
+      ...codexCleanComment(2001),
+      user: { login: "octocat" },
+    };
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+  });
+});
+
 test("submitted Codex review acknowledges marker and moves WaitingAck to WaitingResult", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
@@ -542,6 +734,16 @@ function currentHeadInlineFinding(id) {
   };
 }
 
+function codexCleanComment(id, createdAt = "2026-05-14T10:00:00Z") {
+  return {
+    id,
+    body: "Codex Review: Didn't find any major issues.",
+    created_at: createdAt,
+    html_url: `https://github.example/owner/repo/pull/1#issuecomment-${id}`,
+    user: { login: "chatgpt-codex-connector[bot]" },
+  };
+}
+
 class GateHarness {
   constructor() {
     this.now = Date.parse("2026-05-14T10:01:00Z");
@@ -708,6 +910,65 @@ class GateHarness {
       user: { login: "github-actions[bot]" },
     });
     this.issueComments.push(markerCommentFor(activeMarker));
+    this.nextCommentId = Math.max(this.nextCommentId, id + 1);
+  }
+
+  seedFailedFindingsState({
+    id,
+    headSha = "head-1",
+    closedAt = "2026-05-14T09:58:00Z",
+    outcome = "failed_findings",
+    stateHead = headSha,
+    pullHead = headSha,
+    currentHeadFindingIds = ["3001"],
+  }) {
+    this.pullRequest = this.pullRequestForHead(pullHead);
+    const failedMarker = {
+      version: 1,
+      id: String(id),
+      url: `https://github.example/owner/repo/pull/1#issuecomment-${id}`,
+      headSha,
+      runUrl: "https://github.example/owner/repo/actions/runs/999",
+      runId: "999",
+      runAttempt: "1",
+      attempt: 1,
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+      state: outcome,
+      outcome,
+      ackTimeoutSeconds: 300,
+      createdAt: "2026-05-14T09:55:00Z",
+      closedAt,
+      currentHeadFindingIds,
+    };
+    const stateValue = {
+      version: 1,
+      createdAt: "2026-05-14T09:50:00Z",
+      updatedAt: closedAt,
+      statusHead: stateHead,
+      bootstrap: { status: "closed" },
+      activeMarker: null,
+      history: [failedMarker],
+      lastStatus: {
+        headSha: stateHead,
+        state: "failure",
+        updatedAt: closedAt,
+        runUrl: "https://github.example/owner/repo/actions/runs/999",
+      },
+    };
+    this.issueComments.push({
+      id: 1000,
+      body: stateCommentBody(stateValue),
+      created_at: "2026-05-14T09:50:00Z",
+      html_url: "https://github.example/owner/repo/pull/1#issuecomment-1000",
+      user: { login: "github-actions[bot]" },
+    });
+    this.issueComments.push(markerCommentFor(failedMarker));
     this.nextCommentId = Math.max(this.nextCommentId, id + 1);
   }
 

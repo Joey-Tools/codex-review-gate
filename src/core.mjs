@@ -77,6 +77,10 @@ export function autoRetryEnabled(raw) {
   return String(raw || "").trim().toLowerCase() !== "false";
 }
 
+export function failedFindingsRecoveryEnabled(raw) {
+  return String(raw || "").trim().toLowerCase() !== "false";
+}
+
 export function shouldFailFindingsBeforeMarker({ findingsCount, freshHeadMarkerAllowed }) {
   if (Number(findingsCount || 0) <= 0) {
     return false;

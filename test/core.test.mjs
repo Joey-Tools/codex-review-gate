@@ -14,6 +14,7 @@ import {
   decideBootstrapProgress,
   eventMayHaveReadOnlyDependabotToken,
   eventModeHandlesEvent,
+  failedFindingsRecoveryEnabled,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
   hasTrustedGateStateOrMarker,
@@ -86,6 +87,13 @@ test("treats only explicit false as auto retry disabled", () => {
   assert.equal(autoRetryEnabled(" FALSE "), false);
   assert.equal(autoRetryEnabled(""), true);
   assert.equal(autoRetryEnabled("0"), true);
+});
+
+test("treats only explicit false as failed findings recovery disabled", () => {
+  assert.equal(failedFindingsRecoveryEnabled("false"), false);
+  assert.equal(failedFindingsRecoveryEnabled(" FALSE "), false);
+  assert.equal(failedFindingsRecoveryEnabled(""), true);
+  assert.equal(failedFindingsRecoveryEnabled("0"), true);
 });
 
 test("reads status context and hidden marker names from process environment at import time", () => {

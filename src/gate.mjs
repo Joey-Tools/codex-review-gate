@@ -18,6 +18,7 @@ import {
   createInitialState,
   eventMayHaveReadOnlyDependabotToken,
   eventModeHandlesEvent,
+  failedFindingsRecoveryEnabled,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
   hasNewCompletionComment,
@@ -26,7 +27,9 @@ import {
   isoNow,
   hasTrustedGateStateOrMarker,
   isCodexBot,
+  isCodexCompletionComment,
   isRetryableHttpStatus,
+  issueCommentIdentity,
   markerAckTimeoutSecondsForHistory,
   markerCanAcceptAckSignal,
   markerFromComment,
@@ -188,8 +191,11 @@ function readTrigger() {
       return { kind: "skip", reason: "Issue comment was not posted by a configured Codex bot." };
     }
     const number = Number(event.issue?.number || "");
+    const completionComment = isCodexCompletionComment(event.comment, config.codexBotLogins)
+      ? issueCommentIdentity(event.comment)
+      : null;
     return number > 0
-      ? { kind: "single", prNumber: number, allowCreateMarker: false }
+      ? { kind: "single", prNumber: number, allowCreateMarker: false, completionComment }
       : { kind: "skip", reason: "issue_comment event did not include a PR number." };
   }
 
@@ -400,6 +406,10 @@ async function processPullRequest(prNumber, trigger) {
     state.lastStatus?.state === "success"
   ) {
     console.log(`PR #${activePrNumber} already has a successful ${STATUS_CONTEXT} for ${statusSha}.`);
+    return;
+  }
+
+  if (await recoverFailedFindingsFromCompletion(state, savedStateComment, trigger)) {
     return;
   }
 
@@ -626,6 +636,60 @@ async function passGate(state, stateComment, snapshot, observed) {
   console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
 }
 
+async function recoverFailedFindingsFromCompletion(state, stateComment, trigger) {
+  const failedMarker = failedFindingsRecoveryMarker(state, trigger);
+  if (!failedMarker) {
+    return false;
+  }
+
+  await failIfPullRequestHeadChanged("before recovering failed Codex findings");
+  const finalSnapshot = await loadSnapshot();
+  if (finalSnapshot.findings.count > 0) {
+    await failFromFindings(finalSnapshot.findings, state, stateComment);
+    return true;
+  }
+
+  const recoveredState = updateStateForStatus(state, {
+    now: isoNow(),
+    statusHead: statusSha,
+    runUrl,
+    status: "success",
+  });
+  await setCommitStatus("success", "Codex completion observed after resolved findings");
+  await saveState(recoveredState, stateComment);
+  console.log(`${STATUS_CONTEXT} recovered for ${statusSha} after failed marker ${failedMarker.id}.`);
+  return true;
+}
+
+function failedFindingsRecoveryMarker(state, trigger) {
+  if (!config.failedFindingsRecovery) {
+    return null;
+  }
+  if (!trigger.completionComment || state?.activeMarker) {
+    return null;
+  }
+  if (!statusSha || state?.statusHead !== statusSha) {
+    return null;
+  }
+
+  const latestForHead = [...(state.history || [])]
+    .reverse()
+    .find((marker) => marker.headSha === statusSha);
+  if ((latestForHead?.outcome || latestForHead?.state) !== "failed_findings") {
+    return null;
+  }
+  if (!latestForHead.closedAt) {
+    return null;
+  }
+
+  const completionCreatedAt = parseTimestamp(
+    trigger.completionComment.createdAt,
+    "Codex completion comment creation time",
+  );
+  const failedClosedAt = parseTimestamp(latestForHead.closedAt, "failed findings marker close time");
+  return completionCreatedAt > failedClosedAt ? latestForHead : null;
+}
+
 async function failFromFindings(findings, state, stateComment) {
   const sample = findings.samples[0];
   const suffix = sample ? ` First finding: ${sample}` : "";
@@ -834,6 +898,9 @@ function readConfig() {
     completionSignalBufferSeconds: secondsEnv("COMPLETION_SIGNAL_BUFFER_SECONDS", 30, {
       allowZero: true,
     }),
+    failedFindingsRecovery: failedFindingsRecoveryEnabled(
+      process.env.FAILED_FINDINGS_RECOVERY_INPUT || process.env.FAILED_FINDINGS_RECOVERY || "",
+    ),
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
     bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),
     eventMode: normalizeEventMode(process.env.EVENT_MODE_INPUT || process.env.CODEX_REVIEW_GATE_EVENT_MODE || ""),

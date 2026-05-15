@@ -70,6 +70,12 @@ The buffer applies only to Codex top-level clean completion comments because tho
 
 `eyes` reactions are liveness signals. The gate checks both PR-body reactions and reactions on the active marker comment. They move `WaitingAck` to `WaitingResult`, but they do not pass the gate.
 
+### `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`
+
+`CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY` may be supplied as a repository or organization variable and passed to the action through `failed-findings-recovery`. The runtime `FAILED_FINDINGS_RECOVERY` environment variable is also accepted. If both are present, the action input takes precedence. Empty or unset values default to enabled; set either value to `false` to disable this recovery path.
+
+When enabled, a Codex top-level clean completion comment can recover a same-head `failed_findings` status after maintainers resolve the Codex review threads. The recovery path does not create a marker and does not poll. It reuses the existing `issue_comment` wakeup from the Codex clean completion comment, reloads the PR, verifies that the current head has no unresolved or not-outdated Codex findings, and writes `success`.
+
 ## GHA Cost Model
 
 The happy path normally uses two short jobs:
@@ -78,6 +84,8 @@ The happy path normally uses two short jobs:
 2. A Codex top-level completion comment or `APPROVED` review wakes triage. The gate reloads the PR, verifies that the head is unchanged, confirms there are no current-head Codex findings, writes `success`, and closes the marker.
 
 Finding paths depend on event mode. In `standard` mode, a Codex submitted review can wake triage and write `failure`. In `comment-only` mode, the status may stay `pending` until a scheduled or manual scan observes the findings.
+
+The resolved-findings recovery path does not add a scheduled job or polling loop. After a `failed_findings` status, maintainers resolve the Codex review threads and a later Codex top-level clean completion comment wakes the same `issue_comment` workflow that already handles pass signals. That short job performs one normal snapshot load plus a final validation reload before writing `success`. Compared with manual `workflow_dispatch` recovery, the common clean recovery case avoids one extra manual job.
 
 The default schedule example is:
 
@@ -147,6 +155,7 @@ flowchart TD
 
   passed -->|New commit| pending
   failed -->|New commit| pending
+  failed -->|Later Codex clean completion and no findings| passed
   waitingAck -->|Head changed| obsolete["Close marker as obsolete_head"]
   waitingResult -->|Head changed| obsolete
   obsolete --> pending
@@ -210,6 +219,15 @@ AnyState
     write pending for latest ready head
     create marker for latest ready head
     -> WaitingAck
+
+FailedFindings
+  on later Codex top-level clean completion comment:
+    require failed-findings recovery to be enabled
+    require latest same-head marker outcome to be failed_findings
+    require completion comment to be newer than failed marker close time
+    validate current head and current-head findings
+    -> Passed if no findings remain
+    -> FailedFindings if findings remain
 ```
 
 ## Signal Rules
@@ -228,6 +246,8 @@ Before writing `success`, the gate must reload the PR and verify:
 Codex findings are current-head findings when they are attached to the current head through pull request review metadata, inline review comments, or review-body links. Inline findings should use GraphQL review-thread state where available so resolved or outdated threads are not treated as active findings.
 
 If PR-open automatic Codex review is still enabled, its output is not trusted as a pass by itself. Only terminal signals after the active controlled marker can pass the gate, and the final current-head finding check still applies.
+
+There is one recovery exception for `failed_findings`: if `failed-findings-recovery` is enabled, the latest same-head marker outcome is `failed_findings`, and the triggering issue comment is a Codex top-level clean completion comment created after that marker was closed, the gate may write `success` without an active marker after the final current-head finding check passes. This accepts only the Codex bot's clean completion comment that triggered the workflow. Human `@codex review` comments and older clean comments cannot recover the gate.
 
 ## Fork and Dependabot PRs
 
@@ -253,6 +273,8 @@ Scheduled runs process retry deadlines. They should scan open PRs, load state on
 If a scheduled or manual scan fails while processing a specific PR, the gate writes an `error` status to that PR head before reporting the aggregate scan failure. This keeps a previous `success` status from surviving an inconclusive recovery run.
 
 Consecutive `missed_ack` outcomes on the same head use exponential backoff. A head change or any non-`missed_ack` outcome resets that ack backoff history for the new marker.
+
+After `failed_findings`, maintainers can resolve the Codex review threads and request a fresh Codex review. The later Codex clean completion comment triggers `issue_comment` and can recover the status when `failed-findings-recovery` is enabled. If this event-driven recovery is disabled or inconclusive, `workflow_dispatch` remains the manual recovery path.
 
 ## Branch Protection
 
