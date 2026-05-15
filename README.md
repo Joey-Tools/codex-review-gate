@@ -8,18 +8,17 @@ Target repositories keep a thin workflow at `.github/workflows/codex-review-gate
 
 ## What It Checks
 
-The runner implements a reaction-driven serialized marker flow:
+The runner implements an event-driven serialized marker flow:
 
 - Runs under `pull_request_target` from the repository default branch.
 - Writes the configured commit status, `codex/review-gate` by default, to the PR head SHA.
 - Fails when current-head Codex inline review threads or review-body findings are unresolved and not outdated.
 - Keeps a trusted sticky PR state comment with hidden metadata.
-- Treats PR-open automatic review output as first-round baseline only.
 - Serializes controlled `@codex review` marker comments.
-- Treats Codex `eyes` reactions as liveness only.
-- Retries unacknowledged markers after a 300 second ack timeout with exponential backoff capped at 1800 seconds and by the marker result timeout.
-- Passes only after a new Codex PR-body `+1` reaction identity or Codex top-level completion comment appears after the active marker baseline and the current head has no Codex findings.
-- Keeps unchanged old `+1` reactions pending or stalled instead of reusing them.
+- Treats Codex reactions as diagnostic signals only; `eyes` reactions on the active marker comment count as liveness, not pass.
+- Uses scheduled or manual resume runs to retry unacknowledged or stalled markers.
+- Passes only after a Codex top-level clean completion comment or `APPROVED` review appears after the active marker and the current head has no Codex findings. Top-level completion comments must also satisfy the configured completion signal buffer.
+- Ignores PR-open automatic review output unless it appears after the active controlled marker and passes final current-head validation.
 
 ## Files
 
@@ -27,6 +26,14 @@ The runner implements a reaction-driven serialized marker flow:
 - `src/gate.mjs`: GitHub Actions runner script.
 - `src/core.mjs`: testable state and signal helpers.
 - `DESIGN.md`: target signal model and state machine.
+
+## Advanced Operation
+
+For the event-driven review-gate design, state machine, automatic retry controls, runner-minutes model, and manual recovery behaviour, see [DESIGN.md](DESIGN.md).
+
+The advanced design uses repository or organisation variables for controls that must take effect before a runner is allocated. For example, `CODEX_REVIEW_GATE_AUTO_RETRY=false` can skip scheduled retry jobs at the job `if` layer. Runtime `env` values are still useful for action behaviour after a job has started, but they cannot prevent GitHub Actions from assigning a runner.
+
+The workflow example defaults to `ubuntu-slim`. Set `CODEX_REVIEW_GATE_RUNNER_LABELS` to a JSON array such as `["self-hosted","linux","x64","codex-review-gate"]` to run the gate on a self-hosted runner.
 
 ## Workflow Usage
 
@@ -36,12 +43,20 @@ name: Codex Review Gate
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  schedule:
+    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       pull_request:
-        description: Pull request number to gate
-        required: true
-        type: number
+        description: Optional pull request number to gate
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -50,20 +65,55 @@ permissions:
   statuses: write
 
 concurrency:
-  group: codex-review-gate-${{ github.event.pull_request.number || github.event.inputs.pull_request || github.run_id }}
-  cancel-in-progress: true
+  group: codex-review-gate-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   codex-review-gate:
     name: codex/review-gate runner
-    runs-on: ubuntu-latest
-    timeout-minutes: 130
+    if: >-
+      ${{
+        (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
+        (github.event_name != 'pull_request_target' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'issue_comment' ||
+          github.event.issue.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'pull_request_review' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'pull_request_review_comment' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'issue_comment' ||
+          (github.event.issue.pull_request &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.comment.user.login))))) &&
+        (github.event_name != 'pull_request_review' ||
+          (vars.CODEX_REVIEW_GATE_EVENT_MODE != 'comment-only' &&
+            github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.review.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.review.user.login))))) &&
+        (github.event_name != 'pull_request_review_comment' ||
+          (vars.CODEX_REVIEW_GATE_EVENT_MODE == 'full' &&
+            github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.comment.user.login)))))
+      }}
+    runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-slim"]') }}
+    timeout-minutes: 15
     steps:
       - uses: JoeyTeng/codex-review-gate@v1
         with:
           github-token: ${{ github.token }}
-          pull-request: ${{ github.event.pull_request.number || github.event.inputs.pull_request }}
-          head-sha: ${{ github.event.pull_request.head.sha }}
+          pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
+          head-sha: ${{ github.event.pull_request.head.sha || '' }}
+          event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
+          codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
+          completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
 ```
 
 ## Self-Gating This Repository
@@ -77,8 +127,8 @@ As with any first rollout, the PR that introduces the workflow cannot fully exer
 | Input | Default | Description |
 | --- | --- | --- |
 | `github-token` | required | Token used to read PR review state, create comments, and write commit statuses. |
-| `pull-request` | required | Pull request number to gate. |
-| `head-sha` | empty | Expected PR head SHA. Leave empty for `workflow_dispatch` lookups. |
+| `pull-request` | empty | Pull request number to gate. Leave empty for event payload routing or open-PR scans. |
+| `head-sha` | empty | Deprecated compatibility input. Event-driven runs load the current PR head from GitHub. |
 | `status-context` | `codex/review-gate` | Commit status context written by the gate. |
 | `state-marker` | `codex-review-gate-state` | Hidden HTML marker used for the sticky state comment. |
 | `marker-comment-marker` | `codex-review-gate-marker` | Hidden HTML marker used for controlled Codex request comments. |
@@ -86,8 +136,10 @@ As with any first rollout, the PR that introduces the workflow cannot fully exer
 | `marker-timeout-seconds` | `3600` | Time to wait for an acknowledged marker result before retrying. |
 | `marker-ack-timeout-seconds` | `300` | Initial time to wait for Codex to acknowledge a marker before retrying. |
 | `marker-ack-timeout-max-seconds` | `1800` | Maximum exponential backoff wait for unacknowledged markers. |
-| `poll-interval-seconds` | `30` | Poll interval for GitHub PR review signals. |
-| `bootstrap-grace-seconds` | `60` | Initial quiet period used to baseline PR-open automatic Codex review signals. |
+| `completion-signal-buffer-seconds` | `60` | Minimum seconds after a marker before accepting a Codex top-level clean completion comment. Set to `0` to disable the extra buffer; same-second comments are still rejected. |
+| `event-mode` | empty | Event mode override: exactly `standard`, `comment-only`, or `full`. Empty falls back to `CODEX_REVIEW_GATE_EVENT_MODE` or `standard`. |
+| `poll-interval-seconds` | `30` | Deprecated compatibility input. Event-driven runs do not poll. |
+| `bootstrap-grace-seconds` | `60` | Deprecated compatibility input. Event-driven runs create controlled markers directly. |
 | `codex-bot-logins` | `chatgpt-codex-connector,chatgpt-codex-connector[bot]` | Comma-separated GitHub logins accepted as Codex bot identities. |
 | `trusted-comment-logins` | `github-actions[bot]` | Comma-separated GitHub logins trusted for gate state and marker comments. |
 
@@ -112,4 +164,4 @@ Do not require `codex/review-gate` before the workflow exists on the protected d
 - For the cleanest signal, disable Codex automatic review-on-push and let the gate marker comment trigger the current-head review.
 - The runner uses REST pull request comments plus GraphQL `reviewThreads` metadata to avoid treating resolved or outdated Codex inline threads as current findings.
 - Review-body findings do not have resolvable review threads, so the runner matches them by `PullRequestReview.commit_id` and current-head blob links.
-- Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff capped by the marker result timeout, 1 hour per marker result, and 60 seconds bootstrap grace.
+- Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff capped by the marker result timeout, and 1 hour per marker result. The recommended schedule example checks retry deadlines every 2 hours.

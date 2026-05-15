@@ -5,34 +5,88 @@ import test from "node:test";
 import {
   activeMarkerAckTimedOut,
   activeMarkerIsObsolete,
+  autoRetryEnabled,
   buildMarkerCommentBody,
   buildStateCommentBody,
   codexReviewBodyFindingSample,
   codexAutoReviewLooksOngoing,
   collectCurrentHeadCodexFindings,
   decideBootstrapProgress,
+  eventMayHaveReadOnlyDependabotToken,
+  eventModeHandlesEvent,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
+  hasTrustedGateStateOrMarker,
   hasNewCompletionComment,
   hasNewEyesTransition,
   hasNewPlusOneTransition,
+  hasNewReviewTransition,
+  isCodexCompletionComment,
   isCurrentHeadCodexReviewBodyFinding,
   isRetryableHttpStatus,
   issueCommentIdentity,
   markerAckTimeoutSecondsForHistory,
+  markerCanAcceptAckSignal,
   markerFromComment,
+  markerTimeoutOutcome,
   NonJsonResponseError,
+  normalizeEventMode,
   normalizeMarkerAckTimeoutSeconds,
   parseJsonResponseText,
   parseStateCommentBody,
+  pullRequestIsDependabot,
   reconcileStateWithMarkerComment,
   reactionIdentity,
   restRequestRetryAllowed,
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
+  shouldCreateFreshHeadMarker,
+  shouldFailFindingsBeforeMarker,
+  shouldSkipScheduledScanWithoutMarker,
+  stateNeedsFreshMarkerAfterMissingMarker,
+  stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
+  summarizeCodexSignalReactions,
 } from "../src/core.mjs";
+
+test("normalizes event mode configuration", () => {
+  assert.equal(normalizeEventMode(""), "standard");
+  assert.equal(normalizeEventMode("full"), "full");
+  assert.equal(normalizeEventMode("comment-only"), "comment-only");
+  assert.throws(() => normalizeEventMode(" FULL "), /exactly standard, comment-only, or full/);
+  assert.throws(() => normalizeEventMode("reviews-only"), /exactly standard, comment-only, or full/);
+});
+
+test("filters optional workflow events by event mode", () => {
+  assert.equal(eventModeHandlesEvent("issue_comment", "standard"), true);
+  assert.equal(eventModeHandlesEvent("pull_request_review", "standard"), true);
+  assert.equal(eventModeHandlesEvent("pull_request_review", "comment-only"), false);
+  assert.equal(eventModeHandlesEvent("pull_request_review_comment", "standard"), false);
+  assert.equal(eventModeHandlesEvent("pull_request_review_comment", "full"), true);
+});
+
+test("treats Dependabot event wakeups as read-only token candidates", () => {
+  assert.equal(eventMayHaveReadOnlyDependabotToken("pull_request_target"), true);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("issue_comment"), true);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("pull_request_review"), true);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("pull_request_review_comment"), true);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("schedule"), false);
+  assert.equal(eventMayHaveReadOnlyDependabotToken("workflow_dispatch"), false);
+});
+
+test("detects Dependabot-authored pull requests", () => {
+  assert.equal(pullRequestIsDependabot({ user: { login: "dependabot[bot]" } }), true);
+  assert.equal(pullRequestIsDependabot({ user: { login: "octocat" } }), false);
+  assert.equal(pullRequestIsDependabot({}), false);
+});
+
+test("treats only explicit false as auto retry disabled", () => {
+  assert.equal(autoRetryEnabled("false"), false);
+  assert.equal(autoRetryEnabled(" FALSE "), false);
+  assert.equal(autoRetryEnabled(""), true);
+  assert.equal(autoRetryEnabled("0"), true);
+});
 
 test("reads status context and hidden marker names from process environment at import time", () => {
   const output = execFileSync(
@@ -153,7 +207,7 @@ test("accepts a new Codex completion comment after the marker", () => {
   );
 });
 
-test("accepts a same-second new Codex completion comment at the marker boundary", () => {
+test("rejects a same-second Codex completion comment at the marker boundary", () => {
   const baseline = {
     id: "1",
     createdAt: "2026-04-26T10:01:00Z",
@@ -169,11 +223,65 @@ test("accepts a same-second new Codex completion comment at the marker boundary"
 
   assert.equal(
     hasNewCompletionComment(baseline, current, "2026-04-26T10:01:00Z"),
-    true,
+    false,
   );
   assert.equal(
     hasNewCompletionComment(current, current, "2026-04-26T10:01:00Z"),
     false,
+  );
+});
+
+test("requires Codex completion comments to satisfy the configured marker buffer", () => {
+  const sameSecond = {
+    id: "1",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/1",
+  };
+  const tooSoon = {
+    id: "2",
+    createdAt: "2026-04-26T10:01:59Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/2",
+  };
+  const afterBuffer = {
+    id: "3",
+    createdAt: "2026-04-26T10:02:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/3",
+  };
+
+  assert.equal(
+    hasNewCompletionComment(null, sameSecond, "2026-04-26T10:01:00Z", { bufferSeconds: 0 }),
+    false,
+  );
+  assert.equal(
+    hasNewCompletionComment(null, tooSoon, "2026-04-26T10:01:00Z", { bufferSeconds: 60 }),
+    false,
+  );
+  assert.equal(
+    hasNewCompletionComment(null, afterBuffer, "2026-04-26T10:01:00Z", { bufferSeconds: 60 }),
+    true,
+  );
+});
+
+test("requires Codex reviews to be strictly after the marker", () => {
+  const sameSecondReview = {
+    id: "2",
+    submittedAt: "2026-04-26T10:01:00Z",
+  };
+  const afterMarkerReview = {
+    id: "3",
+    submittedAt: "2026-04-26T10:01:01Z",
+  };
+
+  assert.equal(
+    hasNewReviewTransition(null, sameSecondReview, "2026-04-26T10:01:00Z"),
+    false,
+  );
+  assert.equal(
+    hasNewReviewTransition(null, afterMarkerReview, "2026-04-26T10:01:00Z"),
+    true,
   );
 });
 
@@ -284,6 +392,32 @@ test("uses fallback ack timeout for older active marker state", () => {
   );
 });
 
+test("max wait timeout takes precedence over marker retry outcomes", () => {
+  assert.equal(
+    markerTimeoutOutcome(
+      {
+        state: "waiting_ack",
+        ackDeadlineAt: "2026-04-26T10:01:00Z",
+        nextRetryAt: "2026-04-26T10:01:00Z",
+        maxWaitDeadlineAt: "2026-04-26T10:02:00Z",
+      },
+      Date.parse("2026-04-26T10:03:00Z"),
+    ),
+    "max_wait",
+  );
+  assert.equal(
+    markerTimeoutOutcome(
+      {
+        state: "waiting_result",
+        resultDeadlineAt: "2026-04-26T10:01:00Z",
+        maxWaitDeadlineAt: "2026-04-26T10:02:00Z",
+      },
+      Date.parse("2026-04-26T10:03:00Z"),
+    ),
+    "max_wait",
+  );
+});
+
 test("new eyes transition prevents marker ack timeout once state is waiting-result", () => {
   const activeMarker = {
     state: "waiting_ack",
@@ -306,6 +440,30 @@ test("new eyes transition prevents marker ack timeout once state is waiting-resu
     ),
     false,
   );
+});
+
+test("waiting-result markers do not consume repeated ack signals before stalled retry", () => {
+  const activeMarker = {
+    state: "waiting_result",
+    createdAt: "2026-04-26T10:00:00Z",
+    resultDeadlineAt: "2026-04-26T10:10:00Z",
+    maxWaitDeadlineAt: "2026-04-26T12:00:00Z",
+  };
+  const eyes = {
+    id: "1",
+    content: "eyes",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+  const review = {
+    id: "2",
+    submittedAt: "2026-04-26T10:02:00Z",
+  };
+
+  assert.equal(markerTimeoutOutcome(activeMarker, Date.parse("2026-04-26T10:11:00Z")), "stalled");
+  assert.equal(hasNewEyesTransition(null, eyes, activeMarker.createdAt), true);
+  assert.equal(hasNewReviewTransition(null, review, activeMarker.createdAt), true);
+  assert.equal(markerCanAcceptAckSignal(activeMarker), false);
 });
 
 test("requires Codex completion comments to be after the marker", () => {
@@ -357,8 +515,8 @@ test("accepts same-second eyes when the reaction identity changed", () => {
   assert.equal(hasNewEyesTransition(current, current, "2026-04-26T10:01:00Z"), false);
 });
 
-test("summarizes only Codex bot PR-body reactions", () => {
-  const reactions = [
+test("summarizes only Codex bot signal reactions", () => {
+  const issueReactions = [
     { id: 1, content: "+1", created_at: "2026-04-26T10:00:00Z", user: { login: "octocat" } },
     {
       id: 2,
@@ -366,6 +524,8 @@ test("summarizes only Codex bot PR-body reactions", () => {
       created_at: "2026-04-26T10:01:00Z",
       user: { login: "chatgpt-codex-connector[bot]" },
     },
+  ];
+  const markerCommentReactions = [
     {
       id: 3,
       content: "eyes",
@@ -374,9 +534,13 @@ test("summarizes only Codex bot PR-body reactions", () => {
     },
   ];
 
-  assert.deepEqual(summarizeCodexReactions(reactions), {
-    plusOne: reactionIdentity(reactions[1]),
-    eyes: reactionIdentity(reactions[2]),
+  assert.deepEqual(summarizeCodexReactions([...issueReactions, ...markerCommentReactions]), {
+    plusOne: reactionIdentity(issueReactions[1]),
+    eyes: reactionIdentity(markerCommentReactions[0]),
+  });
+  assert.deepEqual(summarizeCodexSignalReactions(issueReactions, markerCommentReactions), {
+    plusOne: reactionIdentity(issueReactions[1]),
+    eyes: reactionIdentity(markerCommentReactions[0]),
   });
 });
 
@@ -386,17 +550,27 @@ test("selects only Codex bot top-level completion comments", () => {
       id: 1,
       created_at: "2026-04-26T10:00:00Z",
       html_url: "https://example.invalid/comments/1",
+      body: "Codex Review: Didn't find any major issues.",
       user: { login: "octocat" },
     },
     {
       id: 2,
       created_at: "2026-04-26T10:01:00Z",
       html_url: "https://example.invalid/comments/2",
+      body: "To use Codex here, create a Codex account and connect to github.",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+    {
+      id: 3,
+      created_at: "2026-04-26T10:02:00Z",
+      html_url: "https://example.invalid/comments/3",
+      body: "Codex Review: Didn't find any major issues. Chef's kiss.",
       user: { login: "chatgpt-codex-connector[bot]" },
     },
   ];
 
-  assert.deepEqual(selectLatestCodexCompletionComment(comments), issueCommentIdentity(comments[1]));
+  assert.equal(isCodexCompletionComment(comments[1]), false);
+  assert.deepEqual(selectLatestCodexCompletionComment(comments), issueCommentIdentity(comments[2]));
 });
 
 test("retries only transient HTTP statuses", () => {
@@ -514,7 +688,7 @@ test("finds the latest trusted marker comment", () => {
   });
 });
 
-test("persists marker ack timeout when present", () => {
+test("persists marker recovery fields when present", () => {
   const markerBody = buildMarkerCommentBody({
     headSha: "abc123",
     runUrl: "https://example.invalid/runs/1",
@@ -524,17 +698,19 @@ test("persists marker ack timeout when present", () => {
     baseline: { plusOne: null, eyes: null },
     state: "waiting_ack",
     ackTimeoutSeconds: 300,
+    headStartedAt: "2026-04-26T10:00:00Z",
+    maxWaitDeadlineAt: "2026-04-26T12:00:00Z",
+  });
+  const marker = markerFromComment({
+    id: 2,
+    body: markerBody,
+    created_at: "2026-04-26T10:01:00Z",
+    user: { login: "github-actions[bot]" },
   });
 
-  assert.equal(
-    markerFromComment({
-      id: 2,
-      body: markerBody,
-      created_at: "2026-04-26T10:01:00Z",
-      user: { login: "github-actions[bot]" },
-    }).ackTimeoutSeconds,
-    300,
-  );
+  assert.equal(marker.ackTimeoutSeconds, 300);
+  assert.equal(marker.headStartedAt, "2026-04-26T10:00:00Z");
+  assert.equal(marker.maxWaitDeadlineAt, "2026-04-26T12:00:00Z");
 });
 
 test("collects only current-head Codex inline findings", () => {
@@ -892,8 +1068,160 @@ test("does not reactivate a marker when the sticky state comment is missing", ()
   assert.equal(state.history.length, 1);
   assert.equal(state.history[0].id, "2");
   assert.equal(state.history[0].outcome, "state_lost");
+  assert.equal(stateNeedsFreshMarkerAfterRecovery(state), true);
   assert.equal(state.bootstrap.baseline.plusOne.id, "99");
   assert.deepEqual(state.bootstrap.currentHeadFindingIds, ["finding-1"]);
+});
+
+test("requires a fresh recovery marker only after state-loss recovery", () => {
+  assert.equal(stateNeedsFreshMarkerAfterRecovery({ activeMarker: { id: "1" }, history: [] }), false);
+  assert.equal(
+    stateNeedsFreshMarkerAfterRecovery({
+      activeMarker: null,
+      history: [{ id: "1", outcome: "missed_ack" }],
+    }),
+    false,
+  );
+  assert.equal(
+    stateNeedsFreshMarkerAfterRecovery({
+      activeMarker: null,
+      history: [{ id: "1", outcome: "state_lost" }],
+    }),
+    true,
+  );
+});
+
+test("requires a fresh marker when pending state never got a marker", () => {
+  const baseState = {
+    statusHead: "head",
+    activeMarker: null,
+    history: [],
+    lastStatus: {
+      headSha: "head",
+      state: "pending",
+    },
+  };
+
+  assert.equal(stateNeedsFreshMarkerAfterMissingMarker(baseState, "head"), true);
+  assert.equal(
+    stateNeedsFreshMarkerAfterMissingMarker({
+      ...baseState,
+      history: [{ headSha: "head", outcome: "missed_ack" }],
+    }, "head"),
+    true,
+  );
+  assert.equal(
+    stateNeedsFreshMarkerAfterMissingMarker({
+      ...baseState,
+      history: [{ headSha: "head", outcome: "passed" }],
+    }, "head"),
+    false,
+  );
+  assert.equal(
+    stateNeedsFreshMarkerAfterMissingMarker({
+      ...baseState,
+      lastStatus: { headSha: "head", state: "failure" },
+    }, "head"),
+    false,
+  );
+});
+
+test("scheduled scans continue when either trusted state or marker exists", () => {
+  const markerBody = buildMarkerCommentBody({
+    headSha: "abc123",
+    runUrl: "https://example.invalid/runs/1",
+    runId: "1",
+    runAttempt: "1",
+    attempt: 1,
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+  });
+  const stateBody = buildStateCommentBody({
+    version: 1,
+    createdAt: "2026-04-26T10:00:00Z",
+    updatedAt: "2026-04-26T10:00:00Z",
+    statusHead: "abc123",
+    bootstrap: { status: "closed" },
+    activeMarker: null,
+    history: [],
+  });
+
+  assert.equal(hasTrustedGateStateOrMarker([], new Set(["github-actions[bot]"])), false);
+  assert.equal(
+    hasTrustedGateStateOrMarker(
+      [{ id: 1, body: stateBody, user: { login: "github-actions[bot]" } }],
+      new Set(["github-actions[bot]"]),
+    ),
+    true,
+  );
+  assert.equal(
+    hasTrustedGateStateOrMarker(
+      [{ id: 2, body: markerBody, user: { login: "github-actions[bot]" } }],
+      new Set(["github-actions[bot]"]),
+    ),
+    true,
+  );
+});
+
+test("allows a fresh marker for no-state current-head findings", () => {
+  assert.equal(
+    shouldCreateFreshHeadMarker({
+      allowCreateMarker: true,
+      hasActiveMarker: false,
+      headChanged: false,
+      stateNeedsFreshMarker: true,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldCreateFreshHeadMarker({
+      allowCreateMarker: true,
+      hasActiveMarker: true,
+      headChanged: true,
+      stateNeedsFreshMarker: true,
+    }),
+    false,
+  );
+});
+
+test("scheduled scans without markers still recover head changes", () => {
+  assert.equal(
+    shouldSkipScheduledScanWithoutMarker({
+      triggerKind: "scan",
+      allowCreateMarker: false,
+      dependabotScheduleRecovery: false,
+      hasActiveMarker: false,
+      headChanged: false,
+      stateNeedsFreshMarker: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldSkipScheduledScanWithoutMarker({
+      triggerKind: "scan",
+      allowCreateMarker: false,
+      dependabotScheduleRecovery: false,
+      hasActiveMarker: false,
+      headChanged: true,
+      stateNeedsFreshMarker: false,
+    }),
+    false,
+  );
+});
+
+test("defers existing findings when a fresh-head marker is allowed", () => {
+  assert.equal(
+    shouldFailFindingsBeforeMarker({ findingsCount: 2, freshHeadMarkerAllowed: true }),
+    false,
+  );
+  assert.equal(
+    shouldFailFindingsBeforeMarker({ findingsCount: 2, freshHeadMarkerAllowed: false }),
+    true,
+  );
+  assert.equal(
+    shouldFailFindingsBeforeMarker({ findingsCount: 0, freshHeadMarkerAllowed: false }),
+    false,
+  );
 });
 
 test("fails closed when state and latest trusted marker disagree", () => {

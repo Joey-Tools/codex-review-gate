@@ -41,6 +41,84 @@ export function parseLoginSet(raw, fallback) {
   );
 }
 
+export function normalizeEventMode(raw) {
+  const mode = raw || "standard";
+  if (mode === "standard" || mode === "comment-only" || mode === "full") {
+    return mode;
+  }
+  throw new Error("CODEX_REVIEW_GATE_EVENT_MODE must be exactly standard, comment-only, or full");
+}
+
+export function eventModeHandlesEvent(eventName, eventMode = "standard") {
+  const mode = normalizeEventMode(eventMode);
+  if (eventName === "pull_request_review") {
+    return mode !== "comment-only";
+  }
+  if (eventName === "pull_request_review_comment") {
+    return mode === "full";
+  }
+  return true;
+}
+
+export function eventMayHaveReadOnlyDependabotToken(eventName) {
+  return new Set([
+    "pull_request_target",
+    "issue_comment",
+    "pull_request_review",
+    "pull_request_review_comment",
+  ]).has(eventName || "");
+}
+
+export function pullRequestIsDependabot(pullRequest) {
+  return pullRequest?.user?.login === "dependabot[bot]";
+}
+
+export function autoRetryEnabled(raw) {
+  return String(raw || "").trim().toLowerCase() !== "false";
+}
+
+export function shouldFailFindingsBeforeMarker({ findingsCount, freshHeadMarkerAllowed }) {
+  if (Number(findingsCount || 0) <= 0) {
+    return false;
+  }
+
+  return !freshHeadMarkerAllowed;
+}
+
+export function shouldCreateFreshHeadMarker({
+  allowCreateMarker,
+  hasActiveMarker,
+  headChanged,
+  stateNeedsFreshMarker,
+}) {
+  return Boolean(allowCreateMarker && !hasActiveMarker && (headChanged || stateNeedsFreshMarker));
+}
+
+export function shouldSkipScheduledScanWithoutMarker({
+  triggerKind,
+  allowCreateMarker,
+  dependabotScheduleRecovery,
+  hasActiveMarker,
+  headChanged,
+  stateNeedsFreshMarker,
+}) {
+  return Boolean(
+    triggerKind === "scan" &&
+      !allowCreateMarker &&
+      !dependabotScheduleRecovery &&
+      !hasActiveMarker &&
+      !headChanged &&
+      !stateNeedsFreshMarker,
+  );
+}
+
+export function hasTrustedGateStateOrMarker(comments, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
+  return Boolean(
+    findLatestTrustedStateComment(comments, trustedLogins) ||
+      findLatestTrustedMarkerComment(comments, trustedLogins),
+  );
+}
+
 export function isRetryableHttpStatus(status) {
   return RETRYABLE_HTTP_STATUSES.has(Number(status));
 }
@@ -117,6 +195,17 @@ export function summarizeCodexReactions(reactions, botLogins = DEFAULT_CODEX_BOT
   };
 }
 
+export function summarizeCodexSignalReactions(
+  issueReactions,
+  markerCommentReactions,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+) {
+  return summarizeCodexReactions(
+    [...(issueReactions || []), ...(markerCommentReactions || [])],
+    botLogins,
+  );
+}
+
 export function selectLatestCodexReaction(reactions, content, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   const matches = reactions
     .filter((reaction) => reaction.content === content && isCodexBot(reaction.user?.login, botLogins))
@@ -136,7 +225,7 @@ export function selectLatestCodexReaction(reactions, content, botLogins = DEFAUL
 
 export function selectLatestCodexCompletionComment(comments, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   const matches = comments
-    .filter((comment) => isCodexBot(comment.user?.login, botLogins))
+    .filter((comment) => isCodexCompletionComment(comment, botLogins))
     .map(issueCommentIdentity);
 
   matches.sort((left, right) => {
@@ -149,6 +238,14 @@ export function selectLatestCodexCompletionComment(comments, botLogins = DEFAULT
   });
 
   return matches[0] || null;
+}
+
+export function isCodexCompletionComment(comment, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
+  if (!isCodexBot(comment?.user?.login, botLogins)) {
+    return false;
+  }
+
+  return /^Codex Review\s*:/i.test(String(comment.body || "").trim());
 }
 
 export function sameReactionIdentity(left, right) {
@@ -197,18 +294,44 @@ export function hasNewEyesTransition(baselineEyes, currentEyes, markerCreatedAt)
   return !sameReactionIdentity(baselineEyes, currentEyes);
 }
 
-export function hasNewCompletionComment(baselineComment, currentComment, markerCreatedAt) {
+export function markerCanAcceptAckSignal(activeMarker) {
+  return activeMarker?.state === "waiting_ack";
+}
+
+export function hasNewCompletionComment(
+  baselineComment,
+  currentComment,
+  markerCreatedAt,
+  { bufferSeconds = 0 } = {},
+) {
   if (!currentComment) {
     return false;
   }
 
   const currentCreatedAt = parseTimestamp(currentComment.createdAt, "Codex completion comment creation time");
   const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
-  if (currentCreatedAt < markerCreated) {
+  const minimumCreatedAt = markerCreated + Math.max(0, Number(bufferSeconds) || 0) * 1000;
+  if (currentCreatedAt <= markerCreated || currentCreatedAt < minimumCreatedAt) {
     return false;
   }
 
   return !sameIssueCommentIdentity(baselineComment, currentComment);
+}
+
+export function hasNewReviewTransition(baselineReview, currentReview, markerCreatedAt) {
+  if (!currentReview) {
+    return false;
+  }
+  const submittedAt = parseTimestamp(currentReview.submittedAt, "Codex review submission time");
+  const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
+  if (submittedAt <= markerCreated) {
+    return false;
+  }
+  if (!baselineReview) {
+    return true;
+  }
+  return String(baselineReview.id) !== String(currentReview.id) ||
+    baselineReview.submittedAt !== currentReview.submittedAt;
 }
 
 export function markerAckTimeoutSecondsForHistory(history, headSha, baseSeconds, maxSeconds) {
@@ -242,6 +365,28 @@ export function activeMarkerAckTimedOut(activeMarker, nowMs, fallbackAckTimeoutS
   const ackTimeoutSeconds = activeMarker.ackTimeoutSeconds || fallbackAckTimeoutSeconds;
   const markerAgeMs = nowMs - parseTimestamp(activeMarker.createdAt, "marker creation time");
   return markerAgeMs >= ackTimeoutSeconds * 1000;
+}
+
+export function markerTimeoutOutcome(activeMarker, nowMs = Date.now()) {
+  if (activeMarker.maxWaitDeadlineAt && nowMs >= parseTimestamp(activeMarker.maxWaitDeadlineAt, "max wait deadline")) {
+    return "max_wait";
+  }
+  if (
+    activeMarker.state === "waiting_ack" &&
+    activeMarker.ackDeadlineAt &&
+    nowMs >= parseTimestamp(activeMarker.ackDeadlineAt, "marker ack deadline") &&
+    (!activeMarker.nextRetryAt || nowMs >= parseTimestamp(activeMarker.nextRetryAt, "marker retry deadline"))
+  ) {
+    return "missed_ack";
+  }
+  if (
+    activeMarker.state === "waiting_result" &&
+    activeMarker.resultDeadlineAt &&
+    nowMs >= parseTimestamp(activeMarker.resultDeadlineAt, "marker result deadline")
+  ) {
+    return "stalled";
+  }
+  return null;
 }
 
 export function codexAutoReviewLooksOngoing(reactions) {
@@ -467,6 +612,34 @@ export function stateFromRecoveredMarkerComment({
   });
 }
 
+export function stateNeedsFreshMarkerAfterRecovery(state) {
+  if (state?.activeMarker) {
+    return false;
+  }
+
+  const history = state?.history || [];
+  const latest = history[history.length - 1];
+  return latest?.outcome === "state_lost";
+}
+
+export function stateNeedsFreshMarkerAfterMissingMarker(state, statusHead) {
+  if (!state || state.activeMarker || !statusHead || state.statusHead !== statusHead) {
+    return false;
+  }
+  if (state.lastStatus?.headSha !== statusHead || state.lastStatus?.state !== "pending") {
+    return false;
+  }
+
+  const latestForHead = [...(state.history || [])]
+    .reverse()
+    .find((marker) => marker.headSha === statusHead);
+  if (!latestForHead) {
+    return true;
+  }
+
+  return new Set(["missed_ack", "stalled"]).has(latestForHead.outcome || latestForHead.state);
+}
+
 export function normalizeState(state) {
   return {
     ...state,
@@ -579,6 +752,11 @@ export function buildMarkerCommentBody(marker) {
 
   if (marker.ackTimeoutSeconds !== undefined) {
     hidden.ackTimeoutSeconds = marker.ackTimeoutSeconds;
+  }
+  for (const key of ["ackDeadlineAt", "resultDeadlineAt", "nextRetryAt", "headStartedAt", "maxWaitDeadlineAt"]) {
+    if (marker[key] !== undefined) {
+      hidden[key] = marker[key];
+    }
   }
 
   return ["@codex review", "", buildHiddenJson(MARKER_COMMENT, hidden)].join("\n");
