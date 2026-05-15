@@ -25,11 +25,11 @@ Runner 实现了 event-driven serialized marker flow：
 - `action.yml`: runner 的 composite action wrapper。
 - `src/gate.mjs`: GitHub Actions runner script。
 - `src/core.mjs`: 可测试的 state 和 signal helpers。
-- `DESIGN.md`: 目标 signal model 和 state machine。
+- `DESIGN.md` / `DESIGN.zh-CN.md`: 目标 signal model、state machine 和 GHA 成本模型。
 
 ## 高级运行模型
 
-Event-driven review gate 的状态机、自动重试开关、runner minutes 成本模型和手动恢复行为见 [DESIGN.md](DESIGN.md)。
+Event-driven review gate 的状态机、自动重试开关、**GHA 成本模型 (cost model)** 和手动恢复行为见 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)。
 
 高级设计中，需要在 runner 分配前生效的控制项应使用 repository 或 organization variables。例如，`CODEX_REVIEW_GATE_AUTO_RETRY=false` 可以在 job `if` 层跳过 scheduled retry job。Runtime `env` 仍可用于 job 启动后的 action 行为兼容，但不能阻止 GitHub Actions 分配 runner。
 

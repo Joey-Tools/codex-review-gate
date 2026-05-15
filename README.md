@@ -1,6 +1,6 @@
 # Codex Review Gate
 
-Languages: [English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
+Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
 `codex-review-gate` is a reusable GitHub Action that owns a deterministic `codex/review-gate` status check. It is designed for repositories that want a required status to stay pending or failing until Codex review output for the current PR head is clean.
 
@@ -25,11 +25,11 @@ The runner implements an event-driven serialized marker flow:
 - `action.yml`: composite action wrapper for the runner.
 - `src/gate.mjs`: GitHub Actions runner script.
 - `src/core.mjs`: testable state and signal helpers.
-- `DESIGN.md`: target signal model and state machine.
+- `DESIGN.md`: target signal model, state machine, and GHA cost model.
 
 ## Advanced Operation
 
-For the event-driven review-gate design, state machine, automatic retry controls, runner-minutes model, and manual recovery behaviour, see [DESIGN.md](DESIGN.md).
+For the event-driven review-gate design, state machine, automatic retry controls, **GHA cost model**, and manual recovery behaviour, see [DESIGN.md](DESIGN.md).
 
 The advanced design uses repository or organisation variables for controls that must take effect before a runner is allocated. For example, `CODEX_REVIEW_GATE_AUTO_RETRY=false` can skip scheduled retry jobs at the job `if` layer. Runtime `env` values are still useful for action behaviour after a job has started, but they cannot prevent GitHub Actions from assigning a runner.
 
