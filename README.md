@@ -2,9 +2,22 @@
 
 Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
+## QuickStart
+
+1. Copy the workflow in [Workflow Usage](#workflow-usage) to `.github/workflows/codex-review-gate.yml`.
+2. Use `JoeyTeng/codex-review-gate-action@v1.2`, merge it to the default branch, then open a follow-up test PR.
+3. After `codex/review-gate` behaves as expected, add it as a required status check. For recovery recipes, see the [cookbook](COOKBOOK.md).
+
 `codex-review-gate` is a reusable GitHub Action that owns a deterministic `codex/review-gate` status check. It is designed for repositories that want a required status to stay pending or failing until Codex review output for the current PR head is clean.
 
 Target repositories keep a thin workflow at `.github/workflows/codex-review-gate.yml`; the review state machine lives in this action.
+
+## Generative AI Notice
+
+> [!NOTE]
+> This action requests and evaluates Codex generative AI review output. It keeps controlled `@codex review` marker comments minimal for reliable command parsing, and writes this disclosure to the GitHub Actions step summary when it requests a review. Codex may respond with AI-generated comments or reviews on the pull request. Review and verify AI-generated output before relying on it for security, correctness, or merge decisions.
+>
+> The action itself does not execute pull request code. It coordinates GitHub comments, reviews, reactions, and commit statuses so repository maintainers can make Codex review a required branch-protection signal.
 
 ## What It Checks
 

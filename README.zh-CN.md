@@ -2,9 +2,22 @@
 
 语言：[British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
+## 快速开始
+
+1. 把 [Workflow 用法](#workflow-用法) 中的 workflow 复制到 `.github/workflows/codex-review-gate.yml`。
+2. 使用 `JoeyTeng/codex-review-gate-action@v1.2`，合入 default branch 后再开一个后续测试 PR。
+3. 确认 `codex/review-gate` 行为符合预期后，把它加入 required status checks。恢复和排障 recipes 见 [cookbook](COOKBOOK.zh-CN.md)。
+
 `codex-review-gate` 是一个可复用 GitHub Action，负责提供 deterministic `codex/review-gate` status check。它适用于希望把 required status 保持为 pending 或 failing，直到当前 PR head 的 Codex review output 干净为止的仓库。
 
 目标仓库只需要在 `.github/workflows/codex-review-gate.yml` 保留一个薄 workflow；review state machine 位于这个 action 内。
+
+## 生成式 AI 提醒
+
+> [!NOTE]
+> 这个 action 会请求并评估 Codex 生成式 AI review output。它会保持受控 `@codex review` marker comments 最小化，以便 command parsing 更可靠；请求 review 时，会把此 disclosure 写入 GitHub Actions step summary。Codex 可能会在 pull request 中回复 AI-generated comments 或 reviews。在把 AI-generated output 用于安全性、正确性或合并决策前，请先人工 review 和验证。
+>
+> Action 本身不会执行 pull request 代码。它只协调 GitHub comments、reviews、reactions 和 commit statuses，让仓库维护者可以把 Codex review 作为 required branch-protection signal。
 
 ## 它检查什么
 
