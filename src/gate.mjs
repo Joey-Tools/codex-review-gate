@@ -35,6 +35,7 @@ import {
   markerFromComment,
   markerTimeoutOutcome,
   normalizeEventMode,
+  normalizeFailedFindingsRecoveryMode,
   normalizeState,
   normalizeMarkerAckTimeoutSeconds,
   parseLoginSet,
@@ -390,6 +391,11 @@ async function processPullRequest(prNumber, trigger) {
     headChanged,
     stateNeedsFreshMarker,
   });
+
+  if (await recoverFailedFindingsFromCompletion(state, savedStateComment, trigger)) {
+    return;
+  }
+
   if (
     shouldFailFindingsBeforeMarker({
       findingsCount: snapshot.findings.count,
@@ -406,10 +412,6 @@ async function processPullRequest(prNumber, trigger) {
     state.lastStatus?.state === "success"
   ) {
     console.log(`PR #${activePrNumber} already has a successful ${STATUS_CONTEXT} for ${statusSha}.`);
-    return;
-  }
-
-  if (await recoverFailedFindingsFromCompletion(state, savedStateComment, trigger)) {
     return;
   }
 
@@ -645,7 +647,10 @@ async function recoverFailedFindingsFromCompletion(state, stateComment, trigger)
   await failIfPullRequestHeadChanged("before recovering failed Codex findings");
   const finalSnapshot = await loadSnapshot();
   if (finalSnapshot.findings.count > 0) {
-    await failFromFindings(finalSnapshot.findings, state, stateComment);
+    const rejectedState = config.failedFindingsRecoveryMode === "fresh"
+      ? recordRejectedRecoveryCompletion(state, failedMarker, trigger.completionComment)
+      : state;
+    await failFromFindings(finalSnapshot.findings, rejectedState, stateComment);
     return true;
   }
 
@@ -687,7 +692,45 @@ function failedFindingsRecoveryMarker(state, trigger) {
     "Codex completion comment creation time",
   );
   const failedClosedAt = parseTimestamp(latestForHead.closedAt, "failed findings marker close time");
+  if (
+    config.failedFindingsRecoveryMode === "fresh" &&
+    recoveryCompletionWasRejected(latestForHead, trigger.completionComment)
+  ) {
+    return null;
+  }
   return completionCreatedAt > failedClosedAt ? latestForHead : null;
+}
+
+function recoveryCompletionWasRejected(marker, completionComment) {
+  return (marker.rejectedRecoveryCompletions || []).some((rejected) =>
+    String(rejected.id) === String(completionComment.id) &&
+      rejected.createdAt === completionComment.createdAt,
+  );
+}
+
+function recordRejectedRecoveryCompletion(state, failedMarker, completionComment) {
+  const rejected = {
+    id: String(completionComment.id),
+    createdAt: completionComment.createdAt,
+    rejectedAt: isoNow(),
+  };
+  return normalizeState({
+    ...state,
+    updatedAt: rejected.rejectedAt,
+    history: (state.history || []).map((marker) => {
+      if (String(marker.id || "") !== String(failedMarker.id || "")) {
+        return marker;
+      }
+      const existing = marker.rejectedRecoveryCompletions || [];
+      if (recoveryCompletionWasRejected(marker, completionComment)) {
+        return marker;
+      }
+      return {
+        ...marker,
+        rejectedRecoveryCompletions: [...existing, rejected].slice(-20),
+      };
+    }),
+  });
 }
 
 async function failFromFindings(findings, state, stateComment) {
@@ -900,6 +943,11 @@ function readConfig() {
     }),
     failedFindingsRecovery: failedFindingsRecoveryEnabled(
       process.env.FAILED_FINDINGS_RECOVERY_INPUT || process.env.FAILED_FINDINGS_RECOVERY || "",
+    ),
+    failedFindingsRecoveryMode: normalizeFailedFindingsRecoveryMode(
+      process.env.FAILED_FINDINGS_RECOVERY_MODE_INPUT ||
+        process.env.FAILED_FINDINGS_RECOVERY_MODE ||
+        "",
     ),
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
     bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),

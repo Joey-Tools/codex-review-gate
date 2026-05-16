@@ -20,8 +20,8 @@
 
 1. 在代码中处理 finding，或确认该 finding 不需要代码修改。
 2. 在 GitHub 中 resolve Codex review thread。
-3. 请求一次新的 Codex review，例如发布 `@codex review`。
-4. 当 Codex 之后发布 top-level clean completion comment 时，`issue_comment` workflow 会唤醒 gate。
+3. 请求或等待同一 head 的 Codex clean result。发布 `@codex review` 是创建 fresh signal 最清楚的方式。
+4. 当 Codex 发布 top-level clean completion comment 时，`issue_comment` workflow 会唤醒 gate。
 5. 如果 `failed-findings-recovery` 已启用，且 PR 没有 unresolved 或 not-outdated current-head Codex findings，gate 会写入 `success`。
 
 该恢复路径是 event-driven 的。它不会增加 polling 或 scheduled runner minutes。
@@ -33,13 +33,21 @@
 ```yaml
 with:
   failed-findings-recovery: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY }}
+  failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
 把 `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY=false` 设为 repository 或 organization variable，可以在 action 启动前关闭该路径。Runtime environments 也可以设置 `FAILED_FINDINGS_RECOVERY=false`；两者同时存在时 action input 优先生效。
 
+`failed-findings-recovery-mode` 控制一个 same-head clean signal 能否在 blocked recovery attempt 之后被重新评估：
+
+- `head` 是默认值。如果最新 branch head 有 Codex clean completion comment，且全部 current-head Codex findings 现在都已 resolved 或 outdated，那么 rerun 同一个 comment event 也可以恢复 status。
+- `fresh` 会记录一次因 findings 仍存在而被拒绝的 clean completion comment。之后 rerun 这个旧 event 不会通过；resolve findings 后，需要请求新的 Codex review，并等待新的 clean completion comment。
+
+如果希望 gate 表达“最新 head 的 Codex review result 已经 clean”，使用 `head`。如果希望每次 resolved-findings recovery 都绑定到 blocked recovery attempt 之后出现的新 clean comment，使用 `fresh`。
+
 ## 手动恢复
 
-当 event-driven recovery 被关闭、没有新的 Codex clean completion comment，或 operator 想明确重新评估某个 PR 时，使用 `workflow_dispatch`。
+当 event-driven recovery 被关闭、没有可用的 Codex clean completion comment，或 operator 想明确重新评估某个 PR 时，使用 `workflow_dispatch`。
 
 1. 打开 `Codex Review Gate` workflow。
 2. 手动运行 workflow，并填写 PR number。

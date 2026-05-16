@@ -81,6 +81,14 @@ export function failedFindingsRecoveryEnabled(raw) {
   return String(raw || "").trim().toLowerCase() !== "false";
 }
 
+export function normalizeFailedFindingsRecoveryMode(raw) {
+  const mode = String(raw || "").trim().toLowerCase() || "head";
+  if (mode === "head" || mode === "fresh") {
+    return mode;
+  }
+  throw new Error("FAILED_FINDINGS_RECOVERY_MODE must be exactly head or fresh");
+}
+
 export function shouldFailFindingsBeforeMarker({ findingsCount, freshHeadMarkerAllowed }) {
   if (Number(findingsCount || 0) <= 0) {
     return false;

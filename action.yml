@@ -49,6 +49,10 @@ inputs:
     description: Allow a later Codex clean completion comment to recover from resolved failed findings.
     required: false
     default: ""
+  failed-findings-recovery-mode:
+    description: "Failed findings recovery mode. Use head or fresh."
+    required: false
+    default: ""
   poll-interval-seconds:
     description: Deprecated compatibility input. Event-driven runs do not poll.
     required: false
@@ -97,6 +101,7 @@ runs:
         MARKER_ACK_TIMEOUT_MAX_SECONDS: ${{ inputs.marker-ack-timeout-max-seconds }}
         COMPLETION_SIGNAL_BUFFER_SECONDS: ${{ inputs.completion-signal-buffer-seconds }}
         FAILED_FINDINGS_RECOVERY_INPUT: ${{ inputs.failed-findings-recovery }}
+        FAILED_FINDINGS_RECOVERY_MODE_INPUT: ${{ inputs.failed-findings-recovery-mode }}
         POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
         BOOTSTRAP_GRACE_SECONDS: ${{ inputs.bootstrap-grace-seconds }}
         BOOTSTRAP_TIMEOUT_SECONDS: ${{ inputs.bootstrap-timeout-seconds }}

@@ -292,7 +292,189 @@ test("issue_comment clean completion keeps failed findings blocked when unresolv
   });
 });
 
-test("issue_comment clean completion recovery requires a new completion after failed findings", async () => {
+test("issue_comment clean completion recovery in head mode can reuse a same-head clean signal after findings resolve", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push({
+      id: "thread-3001",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: [{ databaseId: 3001 }] },
+    });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const firstResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+    });
+
+    assert.equal(firstResult.code, 0, firstResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(
+      parseStateCommentBody(harness.findStateComment().body).history.at(-1).rejectedRecoveryCompletions,
+      undefined,
+    );
+
+    harness.reviewThreads[0].isResolved = true;
+    const secondResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+    });
+
+    assert.equal(secondResult.code, 0, secondResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
+test("issue_comment clean completion recovery in fresh mode rejects a previously failed clean signal", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push({
+      id: "thread-3001",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: [{ databaseId: 3001 }] },
+    });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const firstResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(firstResult.code, 0, firstResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    let state = parseStateCommentBody(harness.findStateComment().body);
+    assert.deepEqual(state.history.at(-1).rejectedRecoveryCompletions, [
+      {
+        id: "2001",
+        createdAt: "2026-05-14T10:00:00Z",
+        rejectedAt: "2026-05-14T10:01:00.000Z",
+      },
+    ]);
+
+    harness.reviewThreads[0].isResolved = true;
+    const statusCount = harness.statuses.length;
+    const secondResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(secondResult.code, 0, secondResult.stderr);
+    assert.equal(harness.statuses.length, statusCount);
+    state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.lastStatus.state, "failure");
+  });
+});
+
+test("issue_comment clean completion recovery in fresh mode accepts a new clean signal", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push({
+      id: "thread-3001",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: [{ databaseId: 3001 }] },
+    });
+    const oldComment = codexCleanComment(2001);
+    harness.issueComments.push(oldComment);
+
+    const firstResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: oldComment,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(firstResult.code, 0, firstResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+
+    harness.reviewThreads[0].isResolved = true;
+    const newComment = codexCleanComment(2002, "2026-05-14T10:05:00Z");
+    harness.issueComments.push(newComment);
+    const secondResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: newComment,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(secondResult.code, 0, secondResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
+test("issue_comment fresh recovery mode input takes precedence over runtime environment", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push({
+      id: "thread-3001",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: [{ databaseId: 3001 }] },
+    });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const firstResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+      env: {
+        FAILED_FINDINGS_RECOVERY_MODE_INPUT: "fresh",
+        FAILED_FINDINGS_RECOVERY_MODE: "head",
+      },
+    });
+
+    assert.equal(firstResult.code, 0, firstResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+
+    harness.reviewThreads[0].isResolved = true;
+    const statusCount = harness.statuses.length;
+    const secondResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+      env: {
+        FAILED_FINDINGS_RECOVERY_MODE_INPUT: "fresh",
+        FAILED_FINDINGS_RECOVERY_MODE: "head",
+      },
+    });
+
+    assert.equal(secondResult.code, 0, secondResult.stderr);
+    assert.equal(harness.statuses.length, statusCount);
+  });
+});
+
+test("issue_comment clean completion recovery requires completion after failed findings close time", async () => {
   await withHarness(async (harness) => {
     harness.seedFailedFindingsState({ id: 2000, closedAt: "2026-05-14T10:00:00Z" });
     const comment = codexCleanComment(2001, "2026-05-14T10:00:00Z");

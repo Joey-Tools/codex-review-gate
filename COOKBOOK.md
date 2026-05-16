@@ -20,8 +20,8 @@ Use this path when `codex/review-gate` is `failure` with `failed_findings`.
 
 1. Address the finding in code or decide that the finding is not actionable.
 2. Resolve the Codex review thread in GitHub.
-3. Request a fresh Codex review, for example by posting `@codex review`.
-4. When Codex later posts a top-level clean completion comment, the `issue_comment` workflow wakes the gate.
+3. Request or wait for a same-head Codex clean result. Posting `@codex review` is the clearest way to create a fresh signal.
+4. When Codex posts a top-level clean completion comment, the `issue_comment` workflow wakes the gate.
 5. If `failed-findings-recovery` is enabled and the PR has no unresolved or not-outdated current-head Codex findings, the gate writes `success`.
 
 This recovery path is event-driven. It does not add polling or scheduled runner minutes.
@@ -33,13 +33,21 @@ This recovery path is event-driven. It does not add polling or scheduled runner 
 ```yaml
 with:
   failed-findings-recovery: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY }}
+  failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
 Set `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY=false` as a repository or organisation variable to disable it before the action starts. Runtime environments may also set `FAILED_FINDINGS_RECOVERY=false`; the action input takes precedence when both are set.
 
+`failed-findings-recovery-mode` controls whether a same-head clean signal can be re-evaluated after a blocked recovery attempt:
+
+- `head` is the default. If the latest branch head has a Codex clean completion comment and all current-head Codex findings are now resolved or outdated, a rerun of that same comment event may recover the status.
+- `fresh` records a clean completion comment that was rejected because findings still existed. Rerunning that old event will not pass later; after resolving the findings, request a new Codex review and wait for a new clean completion comment.
+
+Use `head` when you want the gate to model the latest head-level Codex result. Use `fresh` when you want every resolved-findings recovery to be tied to a clean comment that arrived after the blocked recovery attempt.
+
 ## Manual Recovery
 
-Use `workflow_dispatch` when event-driven recovery is disabled, when no fresh Codex clean completion comment arrives, or when an operator wants to re-evaluate one PR explicitly.
+Use `workflow_dispatch` when event-driven recovery is disabled, when no usable Codex clean completion comment arrives, or when an operator wants to re-evaluate one PR explicitly.
 
 1. Open the `Codex Review Gate` workflow.
 2. Run it manually with the PR number.

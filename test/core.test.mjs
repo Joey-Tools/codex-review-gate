@@ -32,6 +32,7 @@ import {
   markerTimeoutOutcome,
   NonJsonResponseError,
   normalizeEventMode,
+  normalizeFailedFindingsRecoveryMode,
   normalizeMarkerAckTimeoutSeconds,
   parseJsonResponseText,
   parseStateCommentBody,
@@ -94,6 +95,16 @@ test("treats only explicit false as failed findings recovery disabled", () => {
   assert.equal(failedFindingsRecoveryEnabled(" FALSE "), false);
   assert.equal(failedFindingsRecoveryEnabled(""), true);
   assert.equal(failedFindingsRecoveryEnabled("0"), true);
+});
+
+test("normalizes failed findings recovery mode configuration", () => {
+  assert.equal(normalizeFailedFindingsRecoveryMode(""), "head");
+  assert.equal(normalizeFailedFindingsRecoveryMode("head"), "head");
+  assert.equal(normalizeFailedFindingsRecoveryMode(" fresh "), "fresh");
+  assert.throws(
+    () => normalizeFailedFindingsRecoveryMode("strict"),
+    /exactly head or fresh/,
+  );
 });
 
 test("reads status context and hidden marker names from process environment at import time", () => {

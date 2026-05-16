@@ -117,6 +117,7 @@ jobs:
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
           completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
           failed-findings-recovery: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY }}
+          failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
 ## 本仓库的自托管 Gate
@@ -141,6 +142,7 @@ jobs:
 | `marker-ack-timeout-max-seconds` | `1800` | 未 ack marker 指数退避等待上限。 |
 | `completion-signal-buffer-seconds` | `30` | Marker 创建后至少等待多少秒，才接受 Codex top-level clean completion comment。设为 `0` 可关闭额外 buffer；同一秒的 comment 仍会被拒绝。 |
 | `failed-findings-recovery` | empty | Codex findings 被 resolved 后，是否允许后续 Codex clean completion comment 从 `failed_findings` 恢复。留空默认启用；设为 `false` 可关闭。可通过 `vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY` 传入，或用 runtime `FAILED_FINDINGS_RECOVERY` environment variable 配置；input 优先生效。 |
+| `failed-findings-recovery-mode` | empty | 已启用 `failed_findings` recovery path 的恢复模式。留空默认 `head`；设为 `fresh` 时，如果一次恢复尝试仍看到 current-head findings，则后续必须等新的 Codex clean completion comment。可通过 `vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE` 传入，或用 runtime `FAILED_FINDINGS_RECOVERY_MODE` environment variable 配置；input 优先生效。 |
 | `event-mode` | empty | Event mode override：精确小写 `standard`、`comment-only` 或 `full`。留空时使用 `CODEX_REVIEW_GATE_EVENT_MODE` 或 `standard`。 |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input。Event-driven runs 不轮询。 |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input。Event-driven runs 会直接创建 controlled marker。 |
@@ -168,5 +170,5 @@ Workflow 合入 default branch 并至少运行一次后，把 `codex/review-gate
 - 为了让信号最干净，建议关闭 Codex automatic review-on-push，只让 gate marker comment 触发 current-head review。
 - Runner 同时使用 REST pull request comments 和 GraphQL `reviewThreads` metadata，避免把已 resolved 或 outdated 的 Codex inline threads 当成当前 findings。
 - Review-body findings 没有可 resolve 的 review threads，所以 runner 通过 `PullRequestReview.commit_id` 和 current-head blob links 匹配它们。
-- 如果 gate 因 `failed_findings` 失败，先 resolve Codex review threads，再请求或等待新的 Codex top-level clean completion comment。默认情况下，该 comment 会触发 event-driven recovery check，不需要 polling。
+- 如果 gate 因 `failed_findings` 失败，先 resolve Codex review threads，再请求或等待 Codex top-level clean completion comment。默认 `head` 恢复模式可以在 findings resolve 后重新评估同一 head 的 clean comment；`fresh` 模式下，如果较早的恢复尝试仍看到 findings，则必须等新的 clean comment。
 - 当前默认 timeout 是 overall 2 小时、首次 marker ack 5 分钟、ack 退避上限 30 分钟且不超过 marker result timeout、每个 marker result 1 小时。推荐 schedule 示例每 2 小时检查一次 retry deadlines。

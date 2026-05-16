@@ -117,6 +117,7 @@ jobs:
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
           completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
           failed-findings-recovery: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY }}
+          failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
 ## Self-Gating This Repository
@@ -141,6 +142,7 @@ As with any first rollout, the PR that introduces the workflow cannot fully exer
 | `marker-ack-timeout-max-seconds` | `1800` | Maximum exponential backoff wait for unacknowledged markers. |
 | `completion-signal-buffer-seconds` | `30` | Minimum seconds after a marker before accepting a Codex top-level clean completion comment. Set to `0` to disable the extra buffer; same-second comments are still rejected. |
 | `failed-findings-recovery` | empty | Whether a later Codex clean completion comment can recover `failed_findings` after Codex findings are resolved. Empty defaults to enabled; set to `false` to disable. Can be supplied with `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY` via `vars` or with the runtime `FAILED_FINDINGS_RECOVERY` environment variable; the input takes precedence. |
+| `failed-findings-recovery-mode` | empty | Recovery mode for the enabled `failed_findings` recovery path. Empty defaults to `head`; set to `fresh` to require a new Codex clean completion comment after any failed recovery attempt that still saw current-head findings. Can be supplied with `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE` via `vars` or with the runtime `FAILED_FINDINGS_RECOVERY_MODE` environment variable; the input takes precedence. |
 | `event-mode` | empty | Event mode override: exactly `standard`, `comment-only`, or `full`. Empty falls back to `CODEX_REVIEW_GATE_EVENT_MODE` or `standard`. |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input. Event-driven runs do not poll. |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input. Event-driven runs create controlled markers directly. |
@@ -168,5 +170,5 @@ Do not require `codex/review-gate` before the workflow exists on the protected d
 - For the cleanest signal, disable Codex automatic review-on-push and let the gate marker comment trigger the current-head review.
 - The runner uses REST pull request comments plus GraphQL `reviewThreads` metadata to avoid treating resolved or outdated Codex inline threads as current findings.
 - Review-body findings do not have resolvable review threads, so the runner matches them by `PullRequestReview.commit_id` and current-head blob links.
-- If the gate fails with `failed_findings`, resolve the Codex review threads, then request or wait for a new Codex top-level clean completion comment. By default that comment triggers the event-driven recovery check without polling.
+- If the gate fails with `failed_findings`, resolve the Codex review threads, then request or wait for a Codex top-level clean completion comment. The default `head` recovery mode can re-evaluate a same-head clean comment after findings are resolved; `fresh` mode requires a new clean comment if the earlier recovery attempt still saw findings.
 - Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff capped by the marker result timeout, and 1 hour per marker result. The recommended schedule example checks retry deadlines every 2 hours.
