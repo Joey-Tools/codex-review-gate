@@ -109,7 +109,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15
     steps:
-      - uses: JoeyTeng/codex-review-gate@v1
+      - uses: JoeyTeng/codex-review-gate-action@v1.2
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
@@ -151,6 +151,8 @@ jobs:
 | `trusted-comment-logins` | `github-actions[bot]` | 可信 gate state 和 marker comments 的 GitHub logins，逗号分隔。 |
 
 ## 仓库设置
+
+目标仓库请使用 Marketplace 发布包 `JoeyTeng/codex-review-gate-action`。本仓库是该 action 的源码和开发仓库。
 
 Workflow 合入 default branch 并至少运行一次后，把 `codex/review-gate` 加到仓库 ruleset 的 required status check。Source 选择 GitHub Actions，因为 status 由 workflow 的 `GITHUB_TOKEN` 写入。
 
