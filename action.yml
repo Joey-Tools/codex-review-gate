@@ -1,5 +1,6 @@
 name: Codex Review Gate
 description: Gate a pull request on a controlled Codex review signal.
+author: JoeyTeng
 
 inputs:
   github-token:
