@@ -70,6 +70,21 @@ Buffer 只适用于 Codex top-level clean completion comments，因为这些 com
 
 `eyes` reactions 是 liveness signals。Gate 会检查 PR-body reactions 和 active marker comment 上的 reactions。它们会把 `WaitingAck` 推进到 `WaitingResult`，但不会让 gate 通过。
 
+### `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`
+
+`CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY` 可以作为 repository 或 organization variable 提供，并通过 `failed-findings-recovery` 传给 action。Runtime `FAILED_FINDINGS_RECOVERY` environment variable 也被支持。如果两者都存在，action input 优先生效。留空或未设置时默认启用；把任一值设为 `false` 可关闭该恢复路径。
+
+启用后，在维护者 resolve Codex review threads 之后，一个 Codex top-level clean completion comment 可以恢复同一个 head 上的 `failed_findings` status。这个恢复路径不创建 marker，也不轮询。它复用 Codex clean completion comment 已经触发的 `issue_comment` wakeup，重新加载 PR，确认当前 head 没有 unresolved 或 not-outdated Codex findings，然后写入 `success`。
+
+### `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`
+
+`CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE` 可以作为 repository 或 organization variable 提供，并通过 `failed-findings-recovery-mode` 传给 action。Runtime `FAILED_FINDINGS_RECOVERY_MODE` environment variable 也被支持。如果两者都存在，action input 优先生效。留空或未设置时默认 `head`。
+
+支持的模式：
+
+- `head`：默认值。把 latest same-head Codex clean completion comment 视为可复用的 head-level evidence。如果较早的 recovery run 看到 unresolved findings，那么在 findings resolved 后，rerun 同一个 clean comment event 也可以恢复。
+- `fresh`：记录因 current-head findings 仍存在而被拒绝的 recovery attempt 时间。早于或等于该 rejected attempt 的 clean completion comments 之后都不能恢复，即使它们是不同 comments。维护者必须在 resolve findings 之后请求或等待更新的 Codex clean completion comment。
+
 ## GHA 成本模型 (cost model)
 
 Happy path 通常使用两个短 job：
@@ -78,6 +93,10 @@ Happy path 通常使用两个短 job：
 2. 一个 Codex top-level completion comment 或 `APPROVED` review 唤醒 triage。Gate 重新加载 PR，确认 head 未变化，确认没有 current-head Codex findings，写入 `success`，并关闭 marker。
 
 Finding paths 取决于 event mode。在 `standard` mode 中，Codex submitted review 可以唤醒 triage 并写入 `failure`。在 `comment-only` mode 中，status 可能保持 `pending`，直到 scheduled 或 manual scan 观察到 findings。
+
+Resolved-findings recovery path 不新增 scheduled job，也不引入 polling loop。`failed_findings` 之后，维护者 resolve Codex review threads，Codex top-level clean completion comment 会唤醒本来就处理 pass signals 的同一个 `issue_comment` workflow。这个短 job 会做一次常规 snapshot load，并在写入 `success` 前做一次 final validation reload。相比 manual `workflow_dispatch` recovery，常见 clean recovery 场景通常少一次额外手动 job。
+
+`failed-findings-recovery-mode=head` 是成本最低的恢复语义：如果 latest same-head Codex result 是 clean，那么 resolve threads 后，rerun 已经创建的 clean comment event 就可能 pass。`failed-findings-recovery-mode=fresh` 在较早 recovery attempt 被拒绝时，可能需要 resolve threads 后再触发一次额外 Codex review。两种模式都不新增 polling 或 scheduled runner minutes。
 
 默认 schedule 示例：
 
@@ -116,6 +135,7 @@ State 记录：
 - marker deadlines: `ackDeadlineAt`、`resultDeadlineAt`、`nextRetryAt`、`headStartedAt` 和 `maxWaitDeadlineAt`
 - marker state: `waiting_ack`、`waiting_result`、`passed`、`failed_findings`、`missed_ack`、`stalled`、`timed_out`、`obsolete_head` 或 `state_lost`
 - 用于 retry backoff 和 recovery 的 bounded marker history
+- 在 `fresh` failed-findings recovery mode 中，failed marker history entry 会记录 latest rejected recovery attempt time 和 bounded rejected completion identities
 
 State comments 和 marker comments 只信任配置的 trusted authors。默认 trusted author 是 `github-actions[bot]`，匹配 repository workflow 的 `GITHUB_TOKEN` 路径。
 
@@ -147,6 +167,10 @@ flowchart TD
 
   passed -->|New commit| pending
   failed -->|New commit| pending
+  failed -->|Codex clean completion after failed marker| validateRecovery["Validate recovery mode, head, history, and findings"]
+  validateRecovery -->|No findings remain| passed
+  validateRecovery -->|Findings remain| failed
+  validateRecovery -->|fresh mode and completion is not newer than rejection cutoff| failed
   waitingAck -->|Head changed| obsolete["Close marker as obsolete_head"]
   waitingResult -->|Head changed| obsolete
   obsolete --> pending
@@ -210,6 +234,19 @@ AnyState
     write pending for latest ready head
     create marker for latest ready head
     -> WaitingAck
+
+FailedFindings
+  on Codex top-level clean completion comment:
+    require failed-findings recovery to be enabled
+    require latest same-head marker outcome to be failed_findings
+    require completion comment to be newer than failed marker close time
+    require the triggering comment to still be visible and still match the Codex clean-completion predicate after final reload
+    in head mode, allow the same same-head completion comment to be re-evaluated
+    in fresh mode, reject completion comments created at or before the latest rejected recovery attempt
+    validate current head and current-head findings
+    -> Passed if no findings remain
+    -> FailedFindings if findings remain
+    in fresh mode, record the rejected completion identity and rejection cutoff when findings remain
 ```
 
 ## Signal Rules
@@ -228,6 +265,10 @@ Codex terminal pass signals 是：
 当 findings 通过 pull request review metadata、inline review comments 或 review-body links 关联到当前 head 时，它们是 current-head findings。Inline findings 应尽可能使用 GraphQL review-thread state，避免把已 resolved 或 outdated threads 当成 active findings。
 
 如果仍启用了 PR-open automatic Codex review，其输出本身不被信任为 pass。只有 active controlled marker 之后的 terminal signals 才能通过 gate，并且仍必须经过最终 current-head finding check。
+
+`failed_findings` 有一个 recovery exception：如果 `failed-findings-recovery` 已启用、latest same-head marker outcome 是 `failed_findings`，并且触发 workflow 的 issue comment 是在该 marker 关闭之后创建的 Codex top-level clean completion comment，那么 gate 可以在 final current-head finding check 通过后，在没有 active marker 的情况下写入 `success`。Final reload 必须仍能看到该 triggering comment，并且当前 comment body 和 author 仍要匹配 Codex clean-completion predicate。人类 `@codex review` comments、已删除或被编辑成非 clean 的 comments，以及早于或等于 failed marker close time 创建的 clean comments，不能恢复 gate。
+
+`failed-findings-recovery-mode` 控制 same-head clean completions 在 blocked recovery attempt 之后如何处理。在 `head` 模式中，同一个 completion comment 仍然是 latest head 的有效 evidence，维护者 resolve findings 后可以通过。在 `fresh` 模式中，被拒绝的 recovery attempt 会在 failed marker history entry 上记录 cutoff time；早于或等于该 cutoff 的 clean completion comments 都会被忽略，只有之后新的 clean completion comment 可以恢复。
 
 ## Fork 和 Dependabot PRs
 
@@ -253,6 +294,8 @@ Scheduled runs 处理 retry deadlines。它们应扫描 open PRs，只为 candid
 如果 scheduled 或 manual scan 在处理某个具体 PR 时失败，gate 会先向该 PR head 写入 `error` status，再报告 aggregate scan failure。这避免上一次 `success` status 在 inconclusive recovery run 后继续存活。
 
 同一个 head 上连续的 `missed_ack` outcomes 使用 exponential backoff。Head change 或任何非 `missed_ack` outcome 都会为新 marker 重置 ack backoff history。
+
+`failed_findings` 之后，维护者可以 resolve Codex review threads，再请求或等待同一 head 的 Codex clean result。Codex clean completion comment 会触发 `issue_comment`，并可在 `failed-findings-recovery` 启用时恢复 status。在 `head` 模式中，same-head clean completion comment 可以在 threads resolved 后被重新评估。在 `fresh` 模式中，如果某次 recovery run 在 findings 仍存在时被拒绝，维护者需要一个创建时间晚于该 rejected attempt 的 clean completion comment。如果这个 event-driven recovery 被关闭或无法得出结论，`workflow_dispatch` 仍是手动恢复路径。
 
 ## Branch Protection
 

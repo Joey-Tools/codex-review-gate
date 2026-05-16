@@ -18,6 +18,7 @@ import {
   createInitialState,
   eventMayHaveReadOnlyDependabotToken,
   eventModeHandlesEvent,
+  failedFindingsRecoveryEnabled,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
   hasNewCompletionComment,
@@ -26,12 +27,15 @@ import {
   isoNow,
   hasTrustedGateStateOrMarker,
   isCodexBot,
+  isCodexCompletionComment,
   isRetryableHttpStatus,
+  issueCommentIdentity,
   markerAckTimeoutSecondsForHistory,
   markerCanAcceptAckSignal,
   markerFromComment,
   markerTimeoutOutcome,
   normalizeEventMode,
+  normalizeFailedFindingsRecoveryMode,
   normalizeState,
   normalizeMarkerAckTimeoutSeconds,
   parseLoginSet,
@@ -188,8 +192,11 @@ function readTrigger() {
       return { kind: "skip", reason: "Issue comment was not posted by a configured Codex bot." };
     }
     const number = Number(event.issue?.number || "");
+    const completionComment = isCodexCompletionComment(event.comment, config.codexBotLogins)
+      ? issueCommentIdentity(event.comment)
+      : null;
     return number > 0
-      ? { kind: "single", prNumber: number, allowCreateMarker: false }
+      ? { kind: "single", prNumber: number, allowCreateMarker: false, completionComment }
       : { kind: "skip", reason: "issue_comment event did not include a PR number." };
   }
 
@@ -384,6 +391,11 @@ async function processPullRequest(prNumber, trigger) {
     headChanged,
     stateNeedsFreshMarker,
   });
+
+  if (await recoverFailedFindingsFromCompletion(state, savedStateComment, trigger)) {
+    return;
+  }
+
   if (
     shouldFailFindingsBeforeMarker({
       findingsCount: snapshot.findings.count,
@@ -626,6 +638,163 @@ async function passGate(state, stateComment, snapshot, observed) {
   console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
 }
 
+async function recoverFailedFindingsFromCompletion(state, stateComment, trigger) {
+  const failedMarker = failedFindingsRecoveryMarker(state, trigger);
+  if (!failedMarker) {
+    return false;
+  }
+
+  await failIfPullRequestHeadChanged("before recovering failed Codex findings");
+  const finalSnapshot = await loadSnapshot();
+  const currentCompletionComment = currentTriggerCompletionComment(
+    finalSnapshot.comments,
+    trigger.completionComment,
+  );
+  if (!currentCompletionComment) {
+    if (finalSnapshot.findings.count > 0) {
+      await failFromFindings(finalSnapshot.findings, state, stateComment);
+    } else {
+      console.log("Skipping failed-findings recovery because the triggering Codex completion is no longer current.");
+    }
+    return true;
+  }
+  if (finalSnapshot.findings.count > 0) {
+    const rejectedState = config.failedFindingsRecoveryMode === "fresh"
+      ? recordRejectedRecoveryCompletion(state, failedMarker, currentCompletionComment)
+      : state;
+    await failFromFindings(finalSnapshot.findings, rejectedState, stateComment);
+    return true;
+  }
+
+  const recoveredState = updateStateForStatus(state, {
+    now: isoNow(),
+    statusHead: statusSha,
+    runUrl,
+    status: "success",
+  });
+  await setCommitStatus("success", "Codex completion observed after resolved findings");
+  await saveState(recoveredState, stateComment);
+  console.log(`${STATUS_CONTEXT} recovered for ${statusSha} after failed marker ${failedMarker.id}.`);
+  return true;
+}
+
+function failedFindingsRecoveryMarker(state, trigger) {
+  if (!config.failedFindingsRecovery) {
+    return null;
+  }
+  if (!trigger.completionComment || state?.activeMarker) {
+    return null;
+  }
+  if (!statusSha || state?.statusHead !== statusSha) {
+    return null;
+  }
+
+  const latestForHead = [...(state.history || [])]
+    .reverse()
+    .find((marker) => marker.headSha === statusSha);
+  if ((latestForHead?.outcome || latestForHead?.state) !== "failed_findings") {
+    return null;
+  }
+  if (!latestForHead.closedAt) {
+    return null;
+  }
+
+  const completionCreatedAt = parseTimestamp(
+    trigger.completionComment.createdAt,
+    "Codex completion comment creation time",
+  );
+  const failedClosedAt = parseTimestamp(latestForHead.closedAt, "failed findings marker close time");
+  if (
+    config.failedFindingsRecoveryMode === "fresh" &&
+    recoveryCompletionWasBlockedByFreshMode(latestForHead, trigger.completionComment)
+  ) {
+    return null;
+  }
+  return completionCreatedAt > failedClosedAt ? latestForHead : null;
+}
+
+function currentTriggerCompletionComment(comments, completionComment) {
+  const currentComment = (comments || []).find((comment) =>
+    String(comment.id || "") === String(completionComment.id || ""),
+  );
+  if (!currentComment || !isCodexCompletionComment(currentComment, config.codexBotLogins)) {
+    return null;
+  }
+
+  const currentIdentity = issueCommentIdentity(currentComment);
+  return currentIdentity.createdAt === completionComment.createdAt ? currentIdentity : null;
+}
+
+function recoveryCompletionWasBlockedByFreshMode(marker, completionComment) {
+  if (recoveryCompletionWasRejected(marker, completionComment)) {
+    return true;
+  }
+  const latestRejectedRecoveryAt = latestRejectedRecoveryCutoff(marker);
+  if (!latestRejectedRecoveryAt) {
+    return false;
+  }
+
+  const completionCreatedAt = parseTimestamp(
+    completionComment.createdAt,
+    "Codex completion comment creation time",
+  );
+  const rejectedAt = parseTimestamp(latestRejectedRecoveryAt, "latest rejected recovery time");
+  return completionCreatedAt <= rejectedAt;
+}
+
+function latestRejectedRecoveryCutoff(marker, fallback = null) {
+  const candidates = [
+    marker.latestRejectedRecoveryAt,
+    ...(marker.rejectedRecoveryCompletions || []).map((rejected) => rejected.rejectedAt),
+    fallback,
+  ].filter(Boolean);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  return candidates.sort((left, right) =>
+    parseTimestamp(right, "rejected recovery time") -
+      parseTimestamp(left, "rejected recovery time"),
+  )[0];
+}
+
+function recoveryCompletionWasRejected(marker, completionComment) {
+  return (marker.rejectedRecoveryCompletions || []).some((rejected) =>
+    String(rejected.id) === String(completionComment.id) &&
+      rejected.createdAt === completionComment.createdAt,
+  );
+}
+
+function recordRejectedRecoveryCompletion(state, failedMarker, completionComment) {
+  const rejected = {
+    id: String(completionComment.id),
+    createdAt: completionComment.createdAt,
+    rejectedAt: isoNow(),
+  };
+  return normalizeState({
+    ...state,
+    updatedAt: rejected.rejectedAt,
+    history: (state.history || []).map((marker) => {
+      if (String(marker.id || "") !== String(failedMarker.id || "")) {
+        return marker;
+      }
+      const existing = marker.rejectedRecoveryCompletions || [];
+      const latestRejectedRecoveryAt = latestRejectedRecoveryCutoff(marker, rejected.rejectedAt);
+      if (recoveryCompletionWasRejected(marker, completionComment)) {
+        return {
+          ...marker,
+          latestRejectedRecoveryAt,
+        };
+      }
+      return {
+        ...marker,
+        latestRejectedRecoveryAt,
+        rejectedRecoveryCompletions: [...existing, rejected].slice(-20),
+      };
+    }),
+  });
+}
+
 async function failFromFindings(findings, state, stateComment) {
   const sample = findings.samples[0];
   const suffix = sample ? ` First finding: ${sample}` : "";
@@ -834,6 +1003,14 @@ function readConfig() {
     completionSignalBufferSeconds: secondsEnv("COMPLETION_SIGNAL_BUFFER_SECONDS", 30, {
       allowZero: true,
     }),
+    failedFindingsRecovery: failedFindingsRecoveryEnabled(
+      process.env.FAILED_FINDINGS_RECOVERY_INPUT || process.env.FAILED_FINDINGS_RECOVERY || "",
+    ),
+    failedFindingsRecoveryMode: normalizeFailedFindingsRecoveryMode(
+      process.env.FAILED_FINDINGS_RECOVERY_MODE_INPUT ||
+        process.env.FAILED_FINDINGS_RECOVERY_MODE ||
+        "",
+    ),
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
     bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),
     eventMode: normalizeEventMode(process.env.EVENT_MODE_INPUT || process.env.CODEX_REVIEW_GATE_EVENT_MODE || ""),

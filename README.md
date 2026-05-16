@@ -18,6 +18,7 @@ The runner implements an event-driven serialized marker flow:
 - Treats Codex reactions as diagnostic signals only; `eyes` reactions on the active marker comment count as liveness, not pass.
 - Uses scheduled or manual resume runs to retry unacknowledged or stalled markers.
 - Passes only after a Codex top-level clean completion comment or `APPROVED` review appears after the active marker and the current head has no Codex findings. Top-level completion comments must also satisfy the configured completion signal buffer.
+- Recovers from `failed_findings` after maintainers resolve Codex findings and a later Codex clean completion comment confirms the current head is clean.
 - Ignores PR-open automatic review output unless it appears after the active controlled marker and passes final current-head validation.
 
 ## Files
@@ -26,10 +27,11 @@ The runner implements an event-driven serialized marker flow:
 - `src/gate.mjs`: GitHub Actions runner script.
 - `src/core.mjs`: testable state and signal helpers.
 - `DESIGN.md`: target signal model, state machine, and GHA cost model.
+- `COOKBOOK.md`: normal operating path and failure recovery recipes.
 
 ## Advanced Operation
 
-For the event-driven review-gate design, state machine, automatic retry controls, **GHA cost model**, and manual recovery behaviour, see [DESIGN.md](DESIGN.md).
+For the event-driven review-gate design, state machine, automatic retry controls, **GHA cost model**, and recovery behaviour, see [DESIGN.md](DESIGN.md). For operator recipes, see [COOKBOOK.md](COOKBOOK.md).
 
 The advanced design uses repository or organisation variables for controls that must take effect before a runner is allocated. For example, `CODEX_REVIEW_GATE_AUTO_RETRY=false` can skip scheduled retry jobs at the job `if` layer. Runtime `env` values are still useful for action behaviour after a job has started, but they cannot prevent GitHub Actions from assigning a runner.
 
@@ -114,6 +116,8 @@ jobs:
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
           completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
+          failed-findings-recovery: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY }}
+          failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
 ## Self-Gating This Repository
@@ -137,6 +141,8 @@ As with any first rollout, the PR that introduces the workflow cannot fully exer
 | `marker-ack-timeout-seconds` | `300` | Initial time to wait for Codex to acknowledge a marker before retrying. |
 | `marker-ack-timeout-max-seconds` | `1800` | Maximum exponential backoff wait for unacknowledged markers. |
 | `completion-signal-buffer-seconds` | `30` | Minimum seconds after a marker before accepting a Codex top-level clean completion comment. Set to `0` to disable the extra buffer; same-second comments are still rejected. |
+| `failed-findings-recovery` | empty | Whether a later Codex clean completion comment can recover `failed_findings` after Codex findings are resolved. Empty defaults to enabled; set to `false` to disable. Can be supplied with `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY` via `vars` or with the runtime `FAILED_FINDINGS_RECOVERY` environment variable; the input takes precedence. |
+| `failed-findings-recovery-mode` | empty | Recovery mode for the enabled `failed_findings` recovery path. Empty defaults to `head`; set to `fresh` to require a clean completion comment created after any rejected recovery attempt that still saw current-head findings. Can be supplied with `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE` via `vars` or with the runtime `FAILED_FINDINGS_RECOVERY_MODE` environment variable; the input takes precedence. |
 | `event-mode` | empty | Event mode override: exactly `standard`, `comment-only`, or `full`. Empty falls back to `CODEX_REVIEW_GATE_EVENT_MODE` or `standard`. |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input. Event-driven runs do not poll. |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input. Event-driven runs create controlled markers directly. |
@@ -164,4 +170,5 @@ Do not require `codex/review-gate` before the workflow exists on the protected d
 - For the cleanest signal, disable Codex automatic review-on-push and let the gate marker comment trigger the current-head review.
 - The runner uses REST pull request comments plus GraphQL `reviewThreads` metadata to avoid treating resolved or outdated Codex inline threads as current findings.
 - Review-body findings do not have resolvable review threads, so the runner matches them by `PullRequestReview.commit_id` and current-head blob links.
+- If the gate fails with `failed_findings`, resolve the Codex review threads, then request or wait for a Codex top-level clean completion comment. The default `head` recovery mode can re-evaluate a same-head clean comment after findings are resolved; `fresh` mode requires a clean comment created after any rejected recovery attempt that still saw findings.
 - Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff capped by the marker result timeout, and 1 hour per marker result. The recommended schedule example checks retry deadlines every 2 hours.
