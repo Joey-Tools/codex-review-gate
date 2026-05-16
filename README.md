@@ -108,7 +108,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15
     steps:
-      - uses: JoeyTeng/codex-review-gate@v1
+      - uses: JoeyTeng/codex-review-gate-action@v1.2
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
@@ -150,6 +150,8 @@ As with any first rollout, the PR that introduces the workflow cannot fully exer
 | `trusted-comment-logins` | `github-actions[bot]` | Comma-separated GitHub logins trusted for gate state and marker comments. |
 
 ## Repository Setup
+
+Use the Marketplace package `JoeyTeng/codex-review-gate-action` in target repositories. This repository is the source and development repository for the action.
 
 After the workflow is merged into the default branch and has run at least once, add `codex/review-gate` to the repository ruleset as a required status check. Use GitHub Actions as the source because the workflow writes the status with `GITHUB_TOKEN`.
 

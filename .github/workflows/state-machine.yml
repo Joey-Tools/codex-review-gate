@@ -12,12 +12,20 @@ permissions:
 
 jobs:
   state-machine:
-    name: Review gate state machine
+    name: ${{ matrix.check-name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node-version: "20"
+            check-name: Review gate state machine
+          - node-version: "24"
+            check-name: Review gate state machine Node.js 24
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: ${{ matrix.node-version }}
       - run: npm run check:state-machine
       - run: npm run test:state-machine
