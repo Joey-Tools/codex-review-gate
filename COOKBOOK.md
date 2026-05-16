@@ -41,9 +41,9 @@ Set `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY=false` as a repository or organi
 `failed-findings-recovery-mode` controls whether a same-head clean signal can be re-evaluated after a blocked recovery attempt:
 
 - `head` is the default. If the latest branch head has a Codex clean completion comment and all current-head Codex findings are now resolved or outdated, a rerun of that same comment event may recover the status.
-- `fresh` records a clean completion comment that was rejected because findings still existed. Rerunning that old event will not pass later; after resolving the findings, request a new Codex review and wait for a new clean completion comment.
+- `fresh` records the time of a recovery attempt that was rejected because findings still existed. Any clean completion comment created at or before that rejected attempt will not pass later; after resolving the findings, request a new Codex review and wait for a newer clean completion comment.
 
-Use `head` when you want the gate to model the latest head-level Codex result. Use `fresh` when you want every resolved-findings recovery to be tied to a clean comment that arrived after the blocked recovery attempt.
+Use `head` when you want the gate to model the latest head-level Codex result. Use `fresh` when you want every resolved-findings recovery to be tied to a clean comment created after the blocked recovery attempt.
 
 ## Manual Recovery
 

@@ -646,9 +646,21 @@ async function recoverFailedFindingsFromCompletion(state, stateComment, trigger)
 
   await failIfPullRequestHeadChanged("before recovering failed Codex findings");
   const finalSnapshot = await loadSnapshot();
+  const currentCompletionComment = currentTriggerCompletionComment(
+    finalSnapshot.comments,
+    trigger.completionComment,
+  );
+  if (!currentCompletionComment) {
+    if (finalSnapshot.findings.count > 0) {
+      await failFromFindings(finalSnapshot.findings, state, stateComment);
+    } else {
+      console.log("Skipping failed-findings recovery because the triggering Codex completion is no longer current.");
+    }
+    return true;
+  }
   if (finalSnapshot.findings.count > 0) {
     const rejectedState = config.failedFindingsRecoveryMode === "fresh"
-      ? recordRejectedRecoveryCompletion(state, failedMarker, trigger.completionComment)
+      ? recordRejectedRecoveryCompletion(state, failedMarker, currentCompletionComment)
       : state;
     await failFromFindings(finalSnapshot.findings, rejectedState, stateComment);
     return true;
@@ -694,11 +706,56 @@ function failedFindingsRecoveryMarker(state, trigger) {
   const failedClosedAt = parseTimestamp(latestForHead.closedAt, "failed findings marker close time");
   if (
     config.failedFindingsRecoveryMode === "fresh" &&
-    recoveryCompletionWasRejected(latestForHead, trigger.completionComment)
+    recoveryCompletionWasBlockedByFreshMode(latestForHead, trigger.completionComment)
   ) {
     return null;
   }
   return completionCreatedAt > failedClosedAt ? latestForHead : null;
+}
+
+function currentTriggerCompletionComment(comments, completionComment) {
+  const currentComment = (comments || []).find((comment) =>
+    String(comment.id || "") === String(completionComment.id || ""),
+  );
+  if (!currentComment || !isCodexCompletionComment(currentComment, config.codexBotLogins)) {
+    return null;
+  }
+
+  const currentIdentity = issueCommentIdentity(currentComment);
+  return currentIdentity.createdAt === completionComment.createdAt ? currentIdentity : null;
+}
+
+function recoveryCompletionWasBlockedByFreshMode(marker, completionComment) {
+  if (recoveryCompletionWasRejected(marker, completionComment)) {
+    return true;
+  }
+  const latestRejectedRecoveryAt = latestRejectedRecoveryCutoff(marker);
+  if (!latestRejectedRecoveryAt) {
+    return false;
+  }
+
+  const completionCreatedAt = parseTimestamp(
+    completionComment.createdAt,
+    "Codex completion comment creation time",
+  );
+  const rejectedAt = parseTimestamp(latestRejectedRecoveryAt, "latest rejected recovery time");
+  return completionCreatedAt <= rejectedAt;
+}
+
+function latestRejectedRecoveryCutoff(marker, fallback = null) {
+  const candidates = [
+    marker.latestRejectedRecoveryAt,
+    ...(marker.rejectedRecoveryCompletions || []).map((rejected) => rejected.rejectedAt),
+    fallback,
+  ].filter(Boolean);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  return candidates.sort((left, right) =>
+    parseTimestamp(right, "rejected recovery time") -
+      parseTimestamp(left, "rejected recovery time"),
+  )[0];
 }
 
 function recoveryCompletionWasRejected(marker, completionComment) {
@@ -722,11 +779,16 @@ function recordRejectedRecoveryCompletion(state, failedMarker, completionComment
         return marker;
       }
       const existing = marker.rejectedRecoveryCompletions || [];
+      const latestRejectedRecoveryAt = latestRejectedRecoveryCutoff(marker, rejected.rejectedAt);
       if (recoveryCompletionWasRejected(marker, completionComment)) {
-        return marker;
+        return {
+          ...marker,
+          latestRejectedRecoveryAt,
+        };
       }
       return {
         ...marker,
+        latestRejectedRecoveryAt,
         rejectedRecoveryCompletions: [...existing, rejected].slice(-20),
       };
     }),

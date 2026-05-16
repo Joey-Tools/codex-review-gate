@@ -41,9 +41,9 @@ with:
 `failed-findings-recovery-mode` 控制一个 same-head clean signal 能否在 blocked recovery attempt 之后被重新评估：
 
 - `head` 是默认值。如果最新 branch head 有 Codex clean completion comment，且全部 current-head Codex findings 现在都已 resolved 或 outdated，那么 rerun 同一个 comment event 也可以恢复 status。
-- `fresh` 会记录一次因 findings 仍存在而被拒绝的 clean completion comment。之后 rerun 这个旧 event 不会通过；resolve findings 后，需要请求新的 Codex review，并等待新的 clean completion comment。
+- `fresh` 会记录一次因 findings 仍存在而被拒绝的 recovery attempt 时间。早于或等于该 rejected attempt 创建的 clean completion comments 之后都不能通过；resolve findings 后，需要请求新的 Codex review，并等待更新的 clean completion comment。
 
-如果希望 gate 表达“最新 head 的 Codex review result 已经 clean”，使用 `head`。如果希望每次 resolved-findings recovery 都绑定到 blocked recovery attempt 之后出现的新 clean comment，使用 `fresh`。
+如果希望 gate 表达“最新 head 的 Codex review result 已经 clean”，使用 `head`。如果希望每次 resolved-findings recovery 都绑定到 blocked recovery attempt 之后创建的新 clean comment，使用 `fresh`。
 
 ## 手动恢复
 

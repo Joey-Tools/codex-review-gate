@@ -366,6 +366,7 @@ test("issue_comment clean completion recovery in fresh mode rejects a previously
         rejectedAt: "2026-05-14T10:01:00.000Z",
       },
     ]);
+    assert.equal(state.history.at(-1).latestRejectedRecoveryAt, "2026-05-14T10:01:00.000Z");
 
     harness.reviewThreads[0].isResolved = true;
     const statusCount = harness.statuses.length;
@@ -382,6 +383,80 @@ test("issue_comment clean completion recovery in fresh mode rejects a previously
     assert.equal(harness.statuses.length, statusCount);
     state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.lastStatus.state, "failure");
+  });
+});
+
+test("issue_comment clean completion recovery in fresh mode rejects older clean signals after a blocked attempt", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push({
+      id: "thread-3001",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: [{ databaseId: 3001 }] },
+    });
+    const earlierComment = codexCleanComment(2001, "2026-05-14T09:59:00Z");
+    const blockedComment = codexCleanComment(2002, "2026-05-14T10:00:00Z");
+    harness.issueComments.push(earlierComment, blockedComment);
+
+    const firstResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: blockedComment,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(firstResult.code, 0, firstResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-1).latestRejectedRecoveryAt, "2026-05-14T10:01:00.000Z");
+
+    harness.reviewThreads[0].isResolved = true;
+    const statusCount = harness.statuses.length;
+    const secondResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: earlierComment,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(secondResult.code, 0, secondResult.stderr);
+    assert.equal(harness.statuses.length, statusCount);
+  });
+});
+
+test("issue_comment fresh recovery cutoff is derived from legacy rejected completions", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({
+      id: 2000,
+      rejectedRecoveryCompletions: [
+        {
+          id: "2002",
+          createdAt: "2026-05-14T10:00:00Z",
+          rejectedAt: "2026-05-14T10:01:00.000Z",
+        },
+      ],
+    });
+    const earlierComment = codexCleanComment(2001, "2026-05-14T09:59:00Z");
+    harness.issueComments.push(earlierComment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: earlierComment,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(parseStateCommentBody(harness.findStateComment().body).lastStatus.state, "failure");
   });
 });
 
@@ -424,6 +499,46 @@ test("issue_comment clean completion recovery in fresh mode accepts a new clean 
 
     assert.equal(secondResult.code, 0, secondResult.stderr);
     assert.equal(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
+test("issue_comment clean completion recovery requires the trigger comment to remain clean and visible", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    const eventComment = codexCleanComment(2001);
+
+    const deletedResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: eventComment,
+      },
+    });
+
+    assert.equal(deletedResult.code, 0, deletedResult.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(parseStateCommentBody(harness.findStateComment().body).lastStatus.state, "failure");
+  });
+
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({ id: 2000 });
+    const eventComment = codexCleanComment(2001);
+    harness.issueComments.push({
+      ...eventComment,
+      body: "Codex Review in progress",
+    });
+
+    const editedResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: eventComment,
+      },
+    });
+
+    assert.equal(editedResult.code, 0, editedResult.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(parseStateCommentBody(harness.findStateComment().body).lastStatus.state, "failure");
   });
 });
 
@@ -1103,6 +1218,8 @@ class GateHarness {
     stateHead = headSha,
     pullHead = headSha,
     currentHeadFindingIds = ["3001"],
+    rejectedRecoveryCompletions = [],
+    latestRejectedRecoveryAt = null,
   }) {
     this.pullRequest = this.pullRequestForHead(pullHead);
     const failedMarker = {
@@ -1127,6 +1244,8 @@ class GateHarness {
       createdAt: "2026-05-14T09:55:00Z",
       closedAt,
       currentHeadFindingIds,
+      ...(rejectedRecoveryCompletions.length > 0 ? { rejectedRecoveryCompletions } : {}),
+      ...(latestRejectedRecoveryAt ? { latestRejectedRecoveryAt } : {}),
     };
     const stateValue = {
       version: 1,
