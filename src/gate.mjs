@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 
 import {
   DEFAULT_CODEX_BOT_LOGINS,
@@ -891,8 +891,35 @@ async function createGateMarker(reactionBaseline, state) {
   created.ackDeadlineAt = addSeconds(created.createdAt, ackTimeoutSeconds);
   created.resultDeadlineAt = addSeconds(created.createdAt, Math.round(config.markerTimeoutMs / 1000));
   created.nextRetryAt = created.ackDeadlineAt;
+  writeAiReviewDisclosureSummary(created);
   console.log(`Created controlled Codex marker ${created.url || `#${created.id}`} for ${statusSha}.`);
   return created;
+}
+
+function writeAiReviewDisclosureSummary(marker) {
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (!summaryPath) {
+    return;
+  }
+
+  const markerReference = marker.url ? `[controlled marker](${marker.url})` : "controlled marker";
+  const body = [
+    "## Codex Review Gate",
+    "",
+    `This workflow requested a Codex generative AI review by posting a ${markerReference}.`,
+    "",
+    "Codex may post AI-generated comments or reviews on this pull request.",
+    "Review and verify AI-generated output before relying on it for security, correctness, or merge decisions.",
+    "",
+    `Requested head: \`${marker.headSha || statusSha || "unknown"}\``,
+    "",
+  ].join("\n");
+
+  try {
+    appendFileSync(summaryPath, body, "utf8");
+  } catch (error) {
+    console.warn(`failed to write Codex review disclosure step summary: ${error.message}`);
+  }
 }
 
 function headStartedAtForState(state, fallback) {

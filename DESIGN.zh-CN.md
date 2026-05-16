@@ -8,7 +8,7 @@
 
 ## 生成式 AI 提示
 
-受控 marker comment 包含可见提示，说明 workflow 正在请求 Codex 生成式 AI review，且 Codex 可能在 PR 中发布 AI 生成的 comments 或 reviews。Gate 会把这些 comments 和 reviews 当作 review signals 处理，但维护者在把 AI 生成输出用于安全性、正确性或 merge 决策前，应先进行人工核验。
+受控 marker comment 会刻意保持为最小的 `@codex review` command 加 hidden gate metadata，以便 Codex GitHub integration 可靠解析。Workflow 发布受控 marker 时，会改在 GitHub Actions step summary 中写出可见提示：workflow 正在请求 Codex 生成式 AI review，Codex 可能在 PR 中发布 AI 生成的 comments 或 reviews，维护者在把这些输出用于安全性、正确性或 merge 决策前，应先进行人工核验。
 
 Gate 是 event-driven 的。Workflow runs 会创建 markers、triage Codex signals、恢复已存储状态，或处理 retry deadlines。它们不需要在 Codex review PR 时一直占用 runner。
 

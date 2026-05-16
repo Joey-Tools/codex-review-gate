@@ -46,7 +46,9 @@ test("pull_request_target creates current-head state, marker, and pending status
 
     const markerComment = harness.findMarkerComments().at(-1);
     assert.equal(markerComment.body.startsWith("@codex review"), true);
-    assert.match(markerComment.body, /This workflow is requesting a Codex generative AI review\./);
+    assert.equal(markerComment.body.includes("[!NOTE]"), false);
+    assert.equal(markerComment.body.includes("generative AI review"), false);
+    assert.match(result.stepSummary, /This workflow requested a Codex generative AI review/);
     const marker = parseMarkerCommentBody(markerComment.body);
     assert.equal(marker.headSha, "head-1");
     assert.equal(marker.state, "waiting_ack");
@@ -1066,6 +1068,7 @@ class GateHarness {
     const workDir = await mkdtemp(join(tmpdir(), "codex-review-gate-test-"));
     const eventPath = join(workDir, "event.json");
     const statePath = join(workDir, "fake-github-state.json");
+    const stepSummaryPath = join(workDir, "step-summary.md");
     await writeFile(eventPath, JSON.stringify(event), "utf8");
     await this.writeState(statePath);
 
@@ -1081,6 +1084,7 @@ class GateHarness {
           GITHUB_RUN_ATTEMPT: "1",
           GITHUB_SERVER_URL: "https://github.example",
           GITHUB_API_URL: "https://api.github.test",
+          GITHUB_STEP_SUMMARY: stepSummaryPath,
           GITHUB_EVENT_NAME: eventName,
           GITHUB_EVENT_PATH: eventPath,
           MARKER_ACK_TIMEOUT_SECONDS: "300",
@@ -1092,6 +1096,7 @@ class GateHarness {
         },
       });
       await this.readState(statePath);
+      result.stepSummary = await readFile(stepSummaryPath, "utf8").catch(() => "");
       return result;
     } finally {
       await rm(workDir, { recursive: true, force: true });
