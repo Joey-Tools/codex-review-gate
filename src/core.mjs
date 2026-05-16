@@ -771,16 +771,7 @@ export function buildMarkerCommentBody(marker) {
     }
   }
 
-  return [
-    "@codex review",
-    "",
-    "> [!NOTE]",
-    "> This workflow is requesting a Codex generative AI review.",
-    "> Codex may post AI-generated comments or reviews on this pull request.",
-    "> Review and verify AI-generated output before relying on it for security, correctness, or merge decisions.",
-    "",
-    buildHiddenJson(MARKER_COMMENT, hidden),
-  ].join("\n");
+  return ["@codex review", "", buildHiddenJson(MARKER_COMMENT, hidden)].join("\n");
 }
 
 export function parseMarkerCommentBody(body) {

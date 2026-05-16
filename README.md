@@ -15,6 +15,7 @@ The runner implements an event-driven serialized marker flow:
 - Fails when current-head Codex inline review threads or review-body findings are unresolved and not outdated.
 - Keeps a trusted sticky PR state comment with hidden metadata.
 - Serializes controlled `@codex review` marker comments.
+- Keeps controlled marker comments minimal and writes the generative AI review disclosure to the GitHub Actions step summary.
 - Treats Codex reactions as diagnostic signals only; `eyes` reactions on the active marker comment count as liveness, not pass.
 - Uses scheduled or manual resume runs to retry unacknowledged or stalled markers.
 - Passes only after a Codex top-level clean completion comment or `APPROVED` review appears after the active marker and the current head has no Codex findings. Top-level completion comments must also satisfy the configured completion signal buffer.

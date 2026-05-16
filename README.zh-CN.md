@@ -15,6 +15,7 @@ Runner 实现了 event-driven serialized marker flow：
 - 当 current-head Codex inline review threads 或 review-body findings 未 resolved 且未 outdated 时失败。
 - 用 hidden metadata 维护一个可信 sticky PR state comment。
 - 串行维护受控 `@codex review` marker comments。
+- 保持受控 marker comments 最小化，并把生成式 AI review 提示写入 GitHub Actions step summary。
 - 把 Codex reactions 只作为诊断信号。
 - 用 scheduled 或 manual resume runs 重试未 ack 或 stalled 的 markers。
 - 只有在 active marker 之后出现 Codex top-level completion comment 或 `APPROVED` review，且当前 head 没有 Codex findings 时才通过。

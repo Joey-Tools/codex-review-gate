@@ -8,7 +8,7 @@ Languages: [British English (en-GB)](DESIGN.md) | [简体中文 (zh-CN)](DESIGN.
 
 ## Generative AI Disclosure
 
-The controlled marker comment includes a visible notice that the workflow is requesting a Codex generative AI review and that Codex may post AI-generated comments or reviews. The gate treats those comments and reviews as review signals, but maintainers should verify AI-generated output before relying on it for security, correctness, or merge decisions.
+The controlled marker comment intentionally remains a minimal `@codex review` command plus hidden gate metadata so the Codex GitHub integration can parse it reliably. When the workflow posts a controlled marker, it writes the visible disclosure to the GitHub Actions step summary instead: the workflow is requesting a Codex generative AI review, Codex may post AI-generated comments or reviews, and maintainers should verify that output before relying on it for security, correctness, or merge decisions.
 
 The gate is event-driven. Workflow runs create markers, triage Codex signals, resume stored state, or process retry deadlines. They do not need to keep a runner active while Codex reviews the PR.
 
