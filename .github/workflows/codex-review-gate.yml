@@ -73,7 +73,7 @@ jobs:
           persist-credentials: false
 
       - name: Run Codex review gate
-        uses: ./
+        uses: ./packages/action
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}

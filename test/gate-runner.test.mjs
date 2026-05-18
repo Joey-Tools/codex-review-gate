@@ -11,7 +11,7 @@ import {
   STATE_MARKER,
   parseMarkerCommentBody,
   parseStateCommentBody,
-} from "../src/core.mjs";
+} from "../packages/action/src/core.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const fakeFetchPath = join(repoRoot, "test/support/fake-github-fetch.mjs");
@@ -1073,7 +1073,7 @@ class GateHarness {
     await this.writeState(statePath);
 
     try {
-      const result = await runNode(["--import", fakeFetchPath, join(repoRoot, "src/gate.mjs")], {
+      const result = await runNode(["--import", fakeFetchPath, join(repoRoot, "packages/action/src/gate.mjs")], {
         cwd: repoRoot,
         env: {
           ...cleanProcessEnv(),
