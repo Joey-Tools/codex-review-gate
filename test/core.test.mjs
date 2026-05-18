@@ -50,7 +50,7 @@ import {
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
   summarizeCodexSignalReactions,
-} from "../src/core.mjs";
+} from "../packages/action/src/core.mjs";
 
 test("normalizes event mode configuration", () => {
   assert.equal(normalizeEventMode(""), "standard");
@@ -113,7 +113,7 @@ test("reads status context and hidden marker names from process environment at i
     [
       "--input-type=module",
       "-e",
-      "import { STATUS_CONTEXT, STATE_MARKER, MARKER_COMMENT } from './src/core.mjs'; console.log(JSON.stringify({ STATUS_CONTEXT, STATE_MARKER, MARKER_COMMENT }));",
+      "import { STATUS_CONTEXT, STATE_MARKER, MARKER_COMMENT } from './packages/action/src/core.mjs'; console.log(JSON.stringify({ STATUS_CONTEXT, STATE_MARKER, MARKER_COMMENT }));",
     ],
     {
       cwd: new URL("..", import.meta.url),
