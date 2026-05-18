@@ -134,14 +134,6 @@ jobs:
           failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
-## Source Repository Self-Gating
-
-The source repository also enables `codex/review-gate` for its own pull requests in `.github/workflows/codex-review-gate.yml`. Because that workflow is privileged `pull_request_target` automation, it checks out `github.event.repository.default_branch` and invokes the trusted source package with `uses: ./packages/action`; it does not run PR-supplied action code or depend on a movable release tag.
-
-The Marketplace repository is produced from the source repository's `packages/action` subtree, where this package becomes the repository root.
-
-As with any first rollout, the PR that introduces the workflow cannot fully exercise the `pull_request_target` path until the workflow exists on the default branch.
-
 ## Inputs
 
 | Input | Default | Description |
@@ -167,8 +159,6 @@ As with any first rollout, the PR that introduces the workflow cannot fully exer
 
 ## Repository Setup
 
-Use the Marketplace package `JoeyTeng/codex-review-gate-action` in target repositories. This repository is the source and development repository for the action.
-
 After the workflow is merged into the default branch and has run at least once, add `codex/review-gate` to the repository ruleset as a required status check. Use GitHub Actions as the source because the workflow writes the status with `GITHUB_TOKEN`.
 
 Recommended rollout:
@@ -190,3 +180,11 @@ Do not require `codex/review-gate` before the workflow exists on the protected d
 - Review-body findings do not have resolvable review threads, so the runner matches them by `PullRequestReview.commit_id` and current-head blob links.
 - If the gate fails with `failed_findings`, resolve the Codex review threads, then request or wait for a Codex top-level clean completion comment. The default `head` recovery mode can re-evaluate a same-head clean comment after findings are resolved; `fresh` mode requires a clean comment created after any rejected recovery attempt that still saw findings.
 - Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff capped by the marker result timeout, and 1 hour per marker result. The recommended schedule example checks retry deadlines every 2 hours.
+
+## Feedback and Reporting
+
+Use [GitHub issues](https://github.com/JoeyTeng/codex-review-gate-action/issues) to report action bugs, bad gate behaviour, documentation gaps, or Marketplace listing issues. If a pull request receives problematic AI-generated review content, use GitHub's normal reporting and feedback tools for that specific comment or review, and include a link in an issue when it is relevant to this action's gate behaviour.
+
+## Source and Development
+
+This repository is the Marketplace release package. Development, CI, and self-gating workflows are maintained in [JoeyTeng/codex-review-gate](https://github.com/JoeyTeng/codex-review-gate).

@@ -1,3 +1,3 @@
 # Project TODO
 
-- [pending] Use the subtree release flow for the next Marketplace action release, then tag the action repository after validating the split commit.
+- [pending] For the next Marketplace release, validate the synced action repository commit, then create or move release tags deliberately.

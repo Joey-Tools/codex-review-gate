@@ -6,13 +6,22 @@ The Marketplace repository is a subtree split of `packages/action`. Keep every f
 
 - The source repository is on the release commit.
 - `packages/action/package.json` contains the release version.
-- The action remote is configured, for example:
+- The action repository has a write-enabled deploy key, and the source repository stores the private key as an `ACTION_REPO_DEPLOY_KEY` secret. The sync workflow also accepts the legacy `ACTION_REPO_PUSH_TOKEN` secret name for this private key while existing repo configuration catches up.
+- For local manual publishing, the action remote is configured, for example:
 
 ```bash
 git remote add action git@github.com:JoeyTeng/codex-review-gate-action.git
 ```
 
-## Validate and Split
+## Automatic Default-Branch Sync
+
+`.github/workflows/sync-action-subtree.yml` runs on pushes to `master` that touch `packages/action/**`, the sync workflow, or the release split script. It checks out full history, runs `scripts/release-action-subtree.sh --remote action --branch master --push --force-if-equivalent-parent`, and pushes only the computed subtree split commit to `JoeyTeng/codex-review-gate-action:master`.
+
+The workflow does not create GitHub Releases and does not create or move tags. It normally uses a fast-forward push. It uses `--force-with-lease` only when the action repository branch is not an ancestor of the computed split commit and its tree exactly matches either the split commit tree or the split commit's parent tree, which covers equivalent subtree histories created by source-repository squash merges. If no deploy-key secret is configured, the action repository rejects direct pushes, or the action repository branch has diverged in content, the workflow fails instead of forcing an unsafe update.
+
+Manual workflow dispatch validates the split by default. Set `push_to_action_repo=true` only when you intentionally want the workflow to push the split commit.
+
+## Manual Validate and Split
 
 From the source repository root:
 
