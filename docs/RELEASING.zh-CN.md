@@ -6,7 +6,7 @@ Marketplace 仓库是 `packages/action` 的 subtree split。任何需要出现�
 
 - 源码仓库位于要发布的 commit。
 - `packages/action/package.json` 已包含发布版本。
-- 如果要让 GitHub Actions 自动推送 split commit，源码仓库需要配置 `ACTION_REPO_PUSH_TOKEN` secret。建议使用 fine-grained token，token actor 需要对 `JoeyTeng/codex-review-gate-action` 有写权限；如果 action 仓库要求 `master` 必须走 PR，token actor 还需要被允许 bypass 该规则，以便执行直接 release sync push。
+- action 仓库已配置 write-enabled deploy key，且源码仓库把 private key 存为 `ACTION_REPO_DEPLOY_KEY` secret。同步 workflow 也兼容既有 `ACTION_REPO_PUSH_TOKEN` secret 名称，可在当前 repo 配置迁移完成前继续用它保存 private key。
 - 如果要本地手动发布，action remote 已配置，例如：
 
 ```bash
@@ -17,7 +17,7 @@ git remote add action git@github.com:JoeyTeng/codex-review-gate-action.git
 
 `.github/workflows/sync-action-subtree.yml` 会在 `master` push 且变更触及 `packages/action/**`、同步 workflow 或 release split 脚本时运行。它会 checkout 完整历史，执行 `scripts/release-action-subtree.sh --remote action --branch master --push --force-if-equivalent-parent`，只把计算出的 subtree split commit 推到 `JoeyTeng/codex-review-gate-action:master`。
 
-该 workflow 不创建 GitHub Releases，也不创建或移动 tags。它通常使用 fast-forward push；只有当 action 仓库分支不是 computed split commit 的祖先、且该分支 tree 和 split commit tree 或 split commit 的 parent tree 完全一致时，才会使用 `--force-with-lease`，用于处理源码仓 squash merge 造成的等价 subtree histories。如果缺少 `ACTION_REPO_PUSH_TOKEN`、action 仓库拒绝 direct push，或 action 仓库分支内容已经偏离，workflow 会失败而不是执行不安全的强制更新。
+该 workflow 不创建 GitHub Releases，也不创建或移动 tags。它通常使用 fast-forward push；只有当 action 仓库分支不是 computed split commit 的祖先、且该分支 tree 和 split commit tree 或 split commit 的 parent tree 完全一致时，才会使用 `--force-with-lease`，用于处理源码仓 squash merge 造成的等价 subtree histories。如果缺少 deploy-key secret、action 仓库拒绝 direct push，或 action 仓库分支内容已经偏离，workflow 会失败而不是执行不安全的强制更新。
 
 Manual workflow dispatch 默认只校验 split。只有明确设置 `push_to_action_repo=true` 时，才会让 workflow 推送 split commit。
 

@@ -20,11 +20,10 @@ superseded_by:
 ## Current State
 - `.github/workflows/sync-action-subtree.yml` runs on `master` pushes that touch the action package, the sync workflow, or the release split script.
 - Manual workflow dispatch validates the split by default; setting `push_to_action_repo=true` pushes the split commit.
-- The workflow expects an `ACTION_REPO_PUSH_TOKEN` secret whose actor can write to `JoeyTeng/codex-review-gate-action` and bypass any direct-push rule on `master`.
+- The workflow pushes with the action repository deploy key over SSH. It prefers an `ACTION_REPO_DEPLOY_KEY` source-repository secret and also accepts the existing `ACTION_REPO_PUSH_TOKEN` secret name as a compatibility fallback for the private key.
 - `scripts/release-action-subtree.sh` remains the local and CI entrypoint for checks, tests, subtree splitting, and publishing. Publishing is normally non-forced; the CI workflow passes `--force-if-equivalent-parent` so it may use `--force-with-lease` only when the remote branch tree exactly matches the computed split commit or its parent tree.
 
 ## Next Steps
-- Configure `ACTION_REPO_PUSH_TOKEN` before relying on automatic default-branch sync.
 - After this workflow lands, verify the first `Sync Action Subtree` run updates the action repository `master` to the new split commit.
 - For an actual Marketplace release, validate the synced commit before creating or moving action repository release tags.
 

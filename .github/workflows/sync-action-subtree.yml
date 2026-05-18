@@ -52,12 +52,19 @@ jobs:
       - name: Push subtree split
         if: ${{ github.event_name == 'push' || inputs.push_to_action_repo }}
         env:
-          ACTION_REPO_PUSH_TOKEN: ${{ secrets.ACTION_REPO_PUSH_TOKEN }}
+          ACTION_REPO_DEPLOY_KEY: ${{ secrets.ACTION_REPO_DEPLOY_KEY || secrets.ACTION_REPO_PUSH_TOKEN }}
         run: |
-          if [ -z "${ACTION_REPO_PUSH_TOKEN}" ]; then
-            echo "ACTION_REPO_PUSH_TOKEN is required to push the action subtree." >&2
+          if [ -z "${ACTION_REPO_DEPLOY_KEY}" ]; then
+            echo "ACTION_REPO_DEPLOY_KEY is required to push the action subtree." >&2
             exit 1
           fi
 
-          git remote add action "https://x-access-token:${ACTION_REPO_PUSH_TOKEN}@github.com/JoeyTeng/codex-review-gate-action.git"
-          scripts/release-action-subtree.sh --remote action --branch master --push --force-if-equivalent-parent
+          install -d -m 700 "${HOME}/.ssh"
+          key_path="${HOME}/.ssh/action_repo_deploy_key"
+          printf '%s\n' "${ACTION_REPO_DEPLOY_KEY}" > "${key_path}"
+          chmod 600 "${key_path}"
+          ssh-keyscan github.com >> "${HOME}/.ssh/known_hosts"
+
+          git remote add action git@github.com:JoeyTeng/codex-review-gate-action.git
+          GIT_SSH_COMMAND="ssh -i ${key_path} -o IdentitiesOnly=yes" \
+            scripts/release-action-subtree.sh --remote action --branch master --push --force-if-equivalent-parent
