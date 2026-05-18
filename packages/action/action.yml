@@ -1,6 +1,9 @@
 name: Codex Review Gate
-description: Gate a pull request on a controlled Codex review signal.
+description: Gate a pull request on a controlled Codex generative AI review signal.
 author: JoeyTeng
+branding:
+  icon: shield
+  color: blue
 
 inputs:
   github-token:

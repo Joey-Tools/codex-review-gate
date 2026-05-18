@@ -1,0 +1,63 @@
+name: Sync Action Subtree
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/sync-action-subtree.yml
+      - packages/action/**
+      - scripts/release-action-subtree.sh
+  workflow_dispatch:
+    inputs:
+      push_to_action_repo:
+        description: Push the computed split commit to the action repository.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-action-subtree
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync packages/action to action repo
+    if: ${{ github.repository == 'JoeyTeng/codex-review-gate' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate subtree split
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.push_to_action_repo }}
+        run: npm run release:split
+
+      - name: Push subtree split
+        if: ${{ github.event_name == 'push' || inputs.push_to_action_repo }}
+        env:
+          ACTION_REPO_PUSH_TOKEN: ${{ secrets.ACTION_REPO_PUSH_TOKEN }}
+        run: |
+          if [ -z "${ACTION_REPO_PUSH_TOKEN}" ]; then
+            echo "ACTION_REPO_PUSH_TOKEN is required to push the action subtree." >&2
+            exit 1
+          fi
+
+          git remote add action "https://x-access-token:${ACTION_REPO_PUSH_TOKEN}@github.com/JoeyTeng/codex-review-gate-action.git"
+          scripts/release-action-subtree.sh --remote action --branch master --push --force-if-equivalent-parent
