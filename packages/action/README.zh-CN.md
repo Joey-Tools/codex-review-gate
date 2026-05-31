@@ -161,6 +161,16 @@ jobs:
 
 Workflow 合入 default branch 并至少运行一次后，把 `codex/review-gate` 加到仓库 ruleset 的 required status check。Source 选择 GitHub Actions，因为 status 由 workflow 的 `GITHUB_TOKEN` 写入。
 
+新仓库如果希望预装 gate workflow，可以直接从语言无关 GitHub template repository
+`Joey-Tools/codex-gated-repo-template` 开始。源码仓库
+`JoeyTeng/codex-review-gate` 也提供 `templates/codex-gated-repo` 和默认 dry-run
+的 bootstrap helper，用于创建或更新 required repository ruleset：
+
+```bash
+node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
+node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
+```
+
 推荐启用顺序：
 
 1. 先把 workflow 合入 repository default branch。
