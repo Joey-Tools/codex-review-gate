@@ -47,8 +47,9 @@ npm run test:bootstrap
 
 For new repositories, start from the language-neutral template source in
 `templates/codex-gated-repo` or the GitHub template repository
-`Joey-Tools/codex-gated-repo-template`. The template keeps only the gate workflow
-and basic repository scaffolding; add project-specific CI separately.
+[`Joey-Tools/codex-gated-repo-template`](https://github.com/Joey-Tools/codex-gated-repo-template).
+The template keeps only the gate workflow and basic repository scaffolding; add
+project-specific CI separately.
 
 After the workflow exists on the target repository default branch, run the
 bootstrap helper from this source repository. It defaults to dry-run, verifies
