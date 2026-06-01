@@ -161,6 +161,18 @@ jobs:
 
 After the workflow is merged into the default branch and has run at least once, add `codex/review-gate` to the repository ruleset as a required status check. Use GitHub Actions as the source because the workflow writes the status with `GITHUB_TOKEN`.
 
+For new repositories, start from the language-neutral GitHub template repository
+`Joey-Tools/codex-gated-repo-template` when you want the gate workflow
+preinstalled. The source repository
+`JoeyTeng/codex-review-gate` also ships `templates/codex-gated-repo` and a
+dry-run bootstrap helper for creating or updating the required repository
+ruleset:
+
+```bash
+node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
+node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
+```
+
 Recommended rollout:
 
 1. Merge the workflow into the repository default branch.
