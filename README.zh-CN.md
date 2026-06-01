@@ -42,7 +42,8 @@ npm run test:bootstrap
 ## Gated Repository Bootstrap
 
 新仓库可以从 `templates/codex-gated-repo` 的语言无关 template source 开始，
-或直接使用 GitHub template repository `Joey-Tools/codex-gated-repo-template`。
+或直接使用 GitHub template repository
+[`Joey-Tools/codex-gated-repo-template`](https://github.com/Joey-Tools/codex-gated-repo-template)。
 Template 只保留 gate workflow 和基础仓库脚手架；项目自己的 CI 需要单独添加。
 
 目标仓库 default branch 上已有 workflow 后，从本源码仓库运行 bootstrap helper。
