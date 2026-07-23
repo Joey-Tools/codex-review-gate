@@ -2103,13 +2103,17 @@ test("scheduled scan does not initialize stateless PRs from existing Codex evide
       assert.equal(harness.statuses.length, 0);
       assert.equal(harness.findStateComment(), undefined);
       assert.equal(harness.findMarkerComments().length, 0);
+      assert.equal(statusReads(harness), 1);
       assert.equal(
         harness.requestLog.some((entry) =>
           entry.path === "/graphql" ||
             entry.path.endsWith(`/issues/${harness.prNumber}/reactions`) ||
             entry.path.endsWith(`/pulls/${harness.prNumber}/comments`) ||
             entry.path.endsWith(`/pulls/${harness.prNumber}/reviews`) ||
-            entry.path.includes("/commits/"),
+            (
+              entry.path.includes("/commits/") &&
+              !entry.path.endsWith(`/commits/${HEAD_SHA}/statuses`)
+            ),
         ),
         false,
       );
@@ -2160,6 +2164,148 @@ test("scheduled stateless preflight skips PR detail failures without writes", as
         entry.method === "GET" && entry.path === pullPath),
       false,
     );
+  });
+});
+
+test("scheduled preflight failure demotes a trusted prior gate status", async () => {
+  await withHarness(async (harness) => {
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "success",
+      creator: { login: "github-actions[bot]", type: "Bot" },
+    });
+    const commentsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`;
+    harness.routeFaults[`GET ${commentsPath}`] = Array.from(
+      { length: 4 },
+      () => ({
+        status: 503,
+        body: { message: "scheduled comments unavailable" },
+        headers: { "Retry-After": "0" },
+      }),
+    );
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /scheduled comments unavailable/);
+    assert.equal(harness.statuses.at(-1).sha, HEAD_SHA);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    const statusReadIndex = harness.requestLog.findIndex((entry) =>
+      entry.method === "GET" &&
+        entry.path.endsWith(`/commits/${HEAD_SHA}/statuses`));
+    const commentsReadIndex = harness.requestLog.findIndex((entry) =>
+      entry.method === "GET" && entry.path === commentsPath);
+    assert.equal(statusReadIndex >= 0, true);
+    assert.equal(commentsReadIndex > statusReadIndex, true);
+  });
+});
+
+test("scheduled deterministic preflight failure errors a trusted prior gate status", async () => {
+  await withHarness(async (harness) => {
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "success",
+      creator: { login: "github-actions[bot]", type: "Bot" },
+    });
+    const commentsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`;
+    harness.routeFaults[`GET ${commentsPath}`] = [{
+      status: 422,
+      body: { message: "invalid scheduled comments response" },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /invalid scheduled comments response/);
+    assert.equal(harness.statuses.at(-1).sha, HEAD_SHA);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+  });
+});
+
+test("scheduled preflight failure does not trust an external gate status", async () => {
+  await withHarness(async (harness) => {
+    harness.commitStatuses.push(
+      {
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "success",
+        creator: { login: "external-integration[bot]", type: "Bot" },
+      },
+      {
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "success",
+        creator: { login: "github-actions[bot]", type: "Bot" },
+      },
+    );
+    const commentsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`;
+    harness.routeFaults[`GET ${commentsPath}`] = Array.from(
+      { length: 4 },
+      () => ({
+        status: 503,
+        body: { message: "scheduled comments unavailable" },
+        headers: { "Retry-After": "0" },
+      }),
+    );
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /scheduled comments unavailable/);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+  });
+});
+
+test("scheduled preflight failure does not write when status eligibility is unavailable", async () => {
+  await withHarness(async (harness) => {
+    const statusesPath =
+      `/repos/${harness.owner}/${harness.repo}/commits/${HEAD_SHA}/statuses`;
+    harness.routeFaults[`GET ${statusesPath}`] = Array.from(
+      { length: 4 },
+      () => ({
+        status: 503,
+        body: { message: "status history unavailable" },
+        headers: { "Retry-After": "0" },
+      }),
+    );
+    const commentsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`;
+    harness.routeFaults[`GET ${commentsPath}`] = Array.from(
+      { length: 4 },
+      () => ({
+        status: 503,
+        body: { message: "scheduled comments unavailable" },
+        headers: { "Retry-After": "0" },
+      }),
+    );
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /scheduled comments unavailable/);
+    assert.equal(statusReads(harness), 4);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
   });
 });
 

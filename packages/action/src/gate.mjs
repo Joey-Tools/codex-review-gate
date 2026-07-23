@@ -361,6 +361,15 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     !trigger.allowCreateMarker &&
     !dependabotScheduleRecovery
   ) {
+    if (scanCandidate?.head?.sha) {
+      statusSha = scanCandidate.head.sha;
+      const liveStatus = await loadLatestGateStatus();
+      statusReady = Boolean(
+        !liveStatus.readFailed &&
+          liveStatus.producerMatches &&
+          liveStatus.latest,
+      );
+    }
     initialSnapshotBudget = createEvidenceSnapshotBudget();
     initialComments = await paginate(
       `${repoPath}/issues/${activePrNumber}/comments`,
@@ -376,6 +385,8 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
       console.log(
         `PR #${activePrNumber} has no trusted gate state or marker; skipping scheduled scan.`,
       );
+      statusSha = "";
+      statusReady = false;
       return;
     }
   }
