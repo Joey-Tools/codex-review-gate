@@ -3587,6 +3587,121 @@ test("partial-snapshot provider precedence uses complete provider-channel orderi
     });
   });
 
+  await t.test("a reconciled inline child suppresses its parent wrapper before a budget failure", async () => {
+    await withHarness(async (harness) => {
+      const reactionsPath =
+        `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/reactions`;
+      harness.reviews.push({
+        id: 9100,
+        state: "COMMENTED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-05-14T10:00:01Z",
+        body: codexInlineParentReviewBody(),
+        user: codexBotUser(),
+      });
+      harness.reviewComments.push({
+        ...currentHeadInlineFinding(3001),
+        pull_request_review_id: 9100,
+      });
+      harness.reviewThreads.push(unresolvedThread(3001, { resolved: true }));
+      harness.routeFaults[`GET ${reactionsPath}`] = [{
+        delayMs: 25,
+        status: 200,
+        body: [],
+        headers: { "Content-Length": String(8 * 1024 * 1024 + 1) },
+      }];
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: { inputs: { pull_request: "1" } },
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 1);
+      assert.equal(successStatusWrites(harness), 0);
+      assert.equal(harness.statuses.at(-1).body.state, "pending");
+      assert.match(result.stderr, /response-byte budget exceeded/);
+      assert.doesNotMatch(
+        result.stderr,
+        /Codex finding must contain only exact full-SHA github\.com blob links/,
+      );
+    });
+  });
+
+  await t.test("a childless parent wrapper remains invalid when another channel exceeds its budget", async () => {
+    await withHarness(async (harness) => {
+      const reactionsPath =
+        `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/reactions`;
+      harness.reviews.push({
+        id: 9100,
+        state: "COMMENTED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-05-14T10:00:01Z",
+        body: codexInlineParentReviewBody(),
+        user: codexBotUser(),
+      });
+      harness.routeFaults[`GET ${reactionsPath}`] = [{
+        delayMs: 25,
+        status: 200,
+        body: [],
+        headers: { "Content-Length": String(8 * 1024 * 1024 + 1) },
+      }];
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: { inputs: { pull_request: "1" } },
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 1);
+      assert.equal(successStatusWrites(harness), 0);
+      assert.equal(harness.statuses.at(-1).body.state, "error");
+      assert.match(
+        result.stderr,
+        /Codex finding must contain only exact full-SHA github\.com blob links/,
+      );
+      assert.doesNotMatch(result.stderr, /response-byte budget exceeded/);
+    });
+  });
+
+  await t.test("an unavailable inline-comment channel keeps a possible parent wrapper pending", async () => {
+    await withHarness(async (harness) => {
+      const reviewCommentsPath =
+        `/repos/${harness.owner}/${harness.repo}/pulls/${harness.prNumber}/comments`;
+      harness.reviews.push({
+        id: 9100,
+        state: "COMMENTED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-05-14T10:00:01Z",
+        body: codexInlineParentReviewBody(),
+        user: codexBotUser(),
+      });
+      harness.routeFaults[`GET ${reviewCommentsPath}`] = Array.from(
+        { length: 4 },
+        () => ({
+          status: 503,
+          body: { message: "temporary inline-comment-channel failure" },
+          headers: { "Retry-After": "0" },
+        }),
+      );
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: { inputs: { pull_request: "1" } },
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 1);
+      assert.equal(successStatusWrites(harness), 0);
+      assert.equal(harness.statuses.at(-1).body.state, "pending");
+      assert.match(result.stderr, /exhausted its retry budget/);
+      assert.doesNotMatch(
+        result.stderr,
+        /Codex finding must contain only exact full-SHA github\.com blob links/,
+      );
+    });
+  });
+
   await t.test("an incomplete provider channel preserves pending", async () => {
     await withHarness(async (harness) => {
       const reviewsPath =
