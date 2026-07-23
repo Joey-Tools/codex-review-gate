@@ -374,7 +374,36 @@ async function processPullRequest(prNumber, trigger) {
     !trigger.allowCreateMarker &&
     pullRequestIsDependabot(pullRequest);
 
-  const snapshot = await loadSnapshot();
+  let initialComments = null;
+  let initialSnapshotBudget = null;
+  if (
+    trigger.kind === "scan" &&
+    !trigger.allowCreateMarker &&
+    !dependabotScheduleRecovery
+  ) {
+    initialSnapshotBudget = createEvidenceSnapshotBudget();
+    initialComments = await paginate(
+      `${repoPath}/issues/${activePrNumber}/comments`,
+      { per_page: "100" },
+      { evidenceBudget: initialSnapshotBudget },
+    );
+    if (
+      !hasTrustedGateStateOrMarker(
+        initialComments,
+        config.trustedCommentLogins,
+      )
+    ) {
+      console.log(
+        `PR #${activePrNumber} has no trusted gate state or marker; skipping scheduled scan.`,
+      );
+      return;
+    }
+  }
+
+  const snapshot = await loadSnapshot({
+    initialComments,
+    initialSnapshotBudget,
+  });
   const scheduledWithoutTrustedState =
     trigger.kind === "scan" &&
     !trigger.allowCreateMarker &&
@@ -1867,11 +1896,21 @@ function createEvidenceSnapshotBudget() {
   return evidenceWorkBudget.newSnapshot();
 }
 
-async function loadSnapshot() {
+async function loadSnapshot({
+  initialComments = null,
+  initialSnapshotBudget = null,
+} = {}) {
   for (let attempt = 1; attempt <= MAX_WHOLE_SNAPSHOT_ATTEMPTS; attempt += 1) {
+    const reuseInitialComments =
+      attempt === 1 &&
+      Array.isArray(initialComments) &&
+      initialSnapshotBudget !== null;
     const snapshot = await loadSnapshotOnce({
       allowMissingReviewChildTransient: attempt < MAX_WHOLE_SNAPSHOT_ATTEMPTS,
-      evidenceBudget: createEvidenceSnapshotBudget(),
+      evidenceBudget: reuseInitialComments
+        ? initialSnapshotBudget
+        : createEvidenceSnapshotBudget(),
+      preloadedComments: reuseInitialComments ? initialComments : null,
     });
     if (
       snapshot.providerResult.kind === "malformed" ||
@@ -1903,14 +1942,17 @@ async function loadSnapshot() {
 async function loadSnapshotOnce({
   allowMissingReviewChildTransient = false,
   evidenceBudget,
+  preloadedComments = null,
 } = {}) {
   const [comments, issueReactions, reviewComments, reviews, reviewThreads] =
     await settleEvidenceLoads([
-      paginate(
-        `${repoPath}/issues/${activePrNumber}/comments`,
-        { per_page: "100" },
-        { evidenceBudget },
-      ),
+      Array.isArray(preloadedComments)
+        ? Promise.resolve(preloadedComments)
+        : paginate(
+            `${repoPath}/issues/${activePrNumber}/comments`,
+            { per_page: "100" },
+            { evidenceBudget },
+          ),
       paginate(
         `${repoPath}/issues/${activePrNumber}/reactions`,
         { per_page: "100" },

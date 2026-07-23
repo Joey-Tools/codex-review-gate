@@ -1249,6 +1249,13 @@ test("eyes reaction acknowledges marker and moves WaitingAck to WaitingResult", 
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.activeMarker.state, "waiting_result");
     assert.equal(state.activeMarker.observedEyes.id, "5001");
+    assert.equal(
+      harness.requestLog.filter((entry) =>
+        entry.method === "GET" &&
+          entry.path.endsWith(`/issues/${harness.prNumber}/comments`),
+      ).length,
+      1,
+    );
   });
 });
 
@@ -2096,8 +2103,84 @@ test("scheduled scan does not initialize stateless PRs from existing Codex evide
       assert.equal(harness.statuses.length, 0);
       assert.equal(harness.findStateComment(), undefined);
       assert.equal(harness.findMarkerComments().length, 0);
+      assert.equal(
+        harness.requestLog.some((entry) =>
+          entry.path === "/graphql" ||
+            entry.path.endsWith(`/issues/${harness.prNumber}/reactions`) ||
+            entry.path.endsWith(`/pulls/${harness.prNumber}/comments`) ||
+            entry.path.endsWith(`/pulls/${harness.prNumber}/reviews`) ||
+            entry.path.includes("/commits/"),
+        ),
+        false,
+      );
     });
   }
+});
+
+test("scheduled stateless preflight skips unrelated evidence failures without writes", async () => {
+  await withHarness(async (harness) => {
+    harness.failNextReviewThreads = true;
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+    assert.equal(
+      harness.requestLog.some((entry) => entry.path === "/graphql"),
+      false,
+    );
+  });
+});
+
+test("scheduled preflight paginates to trusted state and reuses those comments", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T10:00:00Z",
+      ackDeadlineAt: "2026-05-14T10:05:00Z",
+      nextRetryAt: "2026-05-14T10:05:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    const trustedComments = [...harness.issueComments];
+    harness.issueComments = [
+      ...Array.from({ length: 100 }, (_, index) => ({
+        id: 3000 + index,
+        body: `Untrusted comment ${index}`,
+        created_at: "2026-05-14T09:00:00Z",
+        user: { login: "octocat", type: "User" },
+      })),
+      ...trustedComments,
+    ];
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.notEqual(harness.findStateComment(), undefined);
+    assert.deepEqual(
+      harness.requestLog
+        .filter((entry) =>
+          entry.method === "GET" &&
+            entry.path.endsWith(`/issues/${harness.prNumber}/comments`),
+        )
+        .map((entry) => entry.query.page),
+      ["1", "2"],
+    );
+  });
 });
 
 test("scheduled scan may initialize a stateless Dependabot PR", async () => {
