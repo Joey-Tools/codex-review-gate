@@ -3,6 +3,8 @@ export const STATE_MARKER = process.env.STATE_MARKER || "codex-review-gate-state
 export const MARKER_COMMENT = process.env.MARKER_COMMENT || "codex-review-gate-marker";
 export const STATE_VERSION = 1;
 export const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
+export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
 
 export const DEFAULT_CODEX_BOT_LOGINS = new Set([
   "chatgpt-codex-connector",
@@ -168,6 +170,266 @@ export function retryAfterDelayMs(retryAfter, fallbackMs) {
 
 export function isCodexBot(login, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   return botLogins.has(login || "");
+}
+
+export function isFullCommitSha(value) {
+  return /^[0-9a-f]{40}$/i.test(String(value || ""));
+}
+
+export function isTrustedCodexRestUser(user, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
+  return isCodexBot(user?.login, botLogins) && user?.type === "Bot";
+}
+
+export function parseCodexIssueCommentArtifact(
+  comment,
+  {
+    owner = "",
+    repo = "",
+    botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  } = {},
+) {
+  const body = String(comment?.body || "").trim();
+  const terminalLooking =
+    /^Codex Review\s*:/i.test(body) || /^### 💡 Codex Review/i.test(body);
+  if (!terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
+    return null;
+  }
+
+  const base = providerArtifactIdentity(comment, "issue-comment");
+  if (!isTrustedCodexRestUser(comment.user, botLogins)) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "configured Codex issue-comment author is not a Bot",
+    };
+  }
+
+  if (
+    DEFAULT_CODEX_BOT_LOGINS.has(comment.user.login) &&
+    comment.performed_via_github_app?.slug !== OFFICIAL_CODEX_APP_SLUG
+  ) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: `official Codex issue comment is not bound to ${OFFICIAL_CODEX_APP_SLUG}`,
+    };
+  }
+
+  if (body.startsWith(CODEX_CLEAN_COMMENT_LEAD)) {
+    const markerLabels = body.match(/\*\*Reviewed commit:\*\*/gi) || [];
+    const matches = [
+      ...body.matchAll(/\*\*Reviewed commit:\*\*\s*`([0-9a-f]{10}|[0-9a-f]{40})`/gi),
+    ];
+    if (markerLabels.length !== 1 || matches.length !== 1) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "clean Codex issue comment must contain exactly one Reviewed commit marker",
+      };
+    }
+    return {
+      ...base,
+      kind: "clean",
+      commitRef: matches[0][1].toLowerCase(),
+    };
+  }
+
+  if (body.startsWith("### 💡 Codex Review")) {
+    const parsed = parseExactRepositoryBlobFindings(body, owner, repo);
+    if (parsed.error) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: parsed.error,
+      };
+    }
+    return {
+      ...base,
+      kind: "finding",
+      headSha: parsed.headSha,
+      samples: parsed.samples,
+    };
+  }
+
+  return {
+    ...base,
+    kind: "malformed",
+    reason: "unrecognized Codex terminal issue-comment format",
+  };
+}
+
+export function parseCodexReviewArtifact(
+  review,
+  {
+    owner = "",
+    repo = "",
+    botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  } = {},
+) {
+  const body = String(review?.body || "").trim();
+  const terminalLooking =
+    new Set(["APPROVED", "COMMENTED", "CHANGES_REQUESTED"]).has(review?.state) ||
+    body.startsWith("### 💡 Codex Review");
+  if (!terminalLooking || !isCodexBot(review?.user?.login, botLogins)) {
+    return null;
+  }
+
+  const base = providerArtifactIdentity(
+    {
+      ...review,
+      created_at: review.submitted_at || review.created_at,
+      html_url: review.html_url,
+    },
+    "pull-request-review",
+  );
+  if (!isTrustedCodexRestUser(review.user, botLogins)) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "configured Codex review author is not a Bot",
+    };
+  }
+  if (!isFullCommitSha(review.commit_id)) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "Codex review is not bound to a full commit SHA",
+    };
+  }
+
+  if (review.state === "APPROVED" && body.startsWith("### 💡 Codex Review")) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "Codex review state conflicts with its finding-formatted body",
+    };
+  }
+
+  if (review.state === "APPROVED") {
+    return {
+      ...base,
+      kind: "clean",
+      headSha: review.commit_id.toLowerCase(),
+    };
+  }
+
+  if (!body.startsWith("### 💡 Codex Review")) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "unrecognized Codex terminal pull-request-review format",
+    };
+  }
+
+  const parsed = parseExactRepositoryBlobFindings(body, owner, repo);
+  if (parsed.error) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: parsed.error,
+    };
+  }
+  if (parsed.headSha !== review.commit_id.toLowerCase()) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "Codex review finding links conflict with the parent review commit",
+    };
+  }
+  return {
+    ...base,
+    kind: "finding",
+    headSha: parsed.headSha,
+    samples: parsed.samples,
+  };
+}
+
+export function sortCodexArtifactsNewestFirst(artifacts) {
+  return [...(artifacts || [])].sort((left, right) => {
+    const byCreatedAt =
+      parseTimestamp(right.createdAt, "Codex artifact creation time") -
+      parseTimestamp(left.createdAt, "Codex artifact creation time");
+    if (byCreatedAt !== 0) {
+      return byCreatedAt;
+    }
+    if (left.source !== right.source) {
+      return 0;
+    }
+    return compareProviderArtifactIds(right.id, left.id);
+  });
+}
+
+export function collectUnresolvedCodexThreadFindings(
+  reviewComments,
+  reviews,
+  reviewThreads,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  headSha = "",
+) {
+  const reviewById = new Map((reviews || []).map((review) => [String(review.id), review]));
+  const threadByCommentId = buildReviewThreadIndex(reviewThreads);
+  const findingByThreadId = new Map();
+  const errors = [];
+
+  for (const comment of reviewComments || []) {
+    if (!isCodexBot(comment?.user?.login, botLogins)) {
+      continue;
+    }
+
+    const thread = threadByCommentId.get(String(comment.id));
+    if (thread?.isResolved) {
+      continue;
+    }
+    if (!thread) {
+      errors.push(`review comment ${comment.id} has no loaded review thread`);
+      continue;
+    }
+
+    const threadId = String(thread.id || `comment:${comment.id}`);
+    if (!findingByThreadId.has(threadId)) {
+      const location = [
+        thread.path || comment.path,
+        thread.line || comment.line || comment.original_line,
+      ].filter((part) => part !== null && part !== undefined).join(":");
+      findingByThreadId.set(threadId, {
+        id: `thread:${threadId}`,
+        sample: location || `review comment ${comment.id}`,
+      });
+    }
+
+    if (!isTrustedCodexRestUser(comment.user, botLogins)) {
+      errors.push(`review comment ${comment.id} author is not a Bot`);
+      continue;
+    }
+
+    const reviewId = comment.pull_request_review_id;
+    const parentReview = reviewById.get(String(reviewId ?? ""));
+    if (!parentReview) {
+      errors.push(`review comment ${comment.id} has no loaded parent review`);
+      continue;
+    }
+    if (!isTrustedCodexRestUser(parentReview.user, botLogins)) {
+      errors.push(`review comment ${comment.id} parent review author is not a configured Bot`);
+      continue;
+    }
+    if (!isFullCommitSha(parentReview.commit_id) || !isFullCommitSha(comment.original_commit_id)) {
+      errors.push(`review comment ${comment.id} is not bound through full commit SHAs`);
+      continue;
+    }
+    if (parentReview.commit_id.toLowerCase() !== comment.original_commit_id.toLowerCase()) {
+      errors.push(`review comment ${comment.id} original commit conflicts with its parent review`);
+      continue;
+    }
+
+  }
+
+  const findings = [...findingByThreadId.values()];
+  return {
+    count: findings.length,
+    ids: findings.map((finding) => finding.id),
+    samples: findings.map((finding) => finding.sample).slice(0, 3),
+    errors,
+  };
 }
 
 export function isTrustedCommentAuthor(login, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
@@ -509,7 +771,7 @@ export function isCurrentHeadCodexInlineFinding(
   }
 
   const thread = reviewThreadByCommentId.get(String(comment.id));
-  if (thread?.isResolved || thread?.isOutdated) {
+  if (thread?.isResolved) {
     return false;
   }
 
@@ -555,6 +817,57 @@ function safeDecodeURIComponent(value) {
   } catch {
     return value;
   }
+}
+
+function providerArtifactIdentity(value, source) {
+  return {
+    source,
+    id: String(value?.id ?? ""),
+    createdAt: value?.created_at || "",
+    url: value?.html_url || null,
+  };
+}
+
+function compareProviderArtifactIds(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  if (Number.isSafeInteger(leftNumber) && Number.isSafeInteger(rightNumber)) {
+    return leftNumber - rightNumber;
+  }
+  return String(left).localeCompare(String(right));
+}
+
+function parseExactRepositoryBlobFindings(body, owner, repo) {
+  if (!owner || !repo) {
+    return { error: "repository identity is required for Codex finding links" };
+  }
+
+  const genericBlobUrls =
+    body.match(/https:\/\/[^/\s)]+\/[^/\s)]+\/[^/\s)]+\/blob\/[^\s)]+/g) || [];
+  const exactPattern =
+    /https:\/\/github\.com\/([^/\s)]+)\/([^/\s)]+)\/blob\/([0-9a-f]{40})\/([^\s)#]+)#L(\d+)(?:-L\d+)?(?=$|[\s)])/gi;
+  const matches = [...body.matchAll(exactPattern)];
+  if (genericBlobUrls.length === 0 || matches.length !== genericBlobUrls.length) {
+    return { error: "Codex finding must contain only exact full-SHA github.com blob links" };
+  }
+
+  const headShas = new Set();
+  const samples = [];
+  for (const match of matches) {
+    if (match[1] !== owner || match[2] !== repo) {
+      return { error: "Codex finding link targets a different repository" };
+    }
+    headShas.add(match[3].toLowerCase());
+    samples.push(`${safeDecodeURIComponent(match[4])}:${match[5]}`);
+  }
+  if (headShas.size !== 1) {
+    return { error: "Codex finding links target conflicting commits" };
+  }
+
+  return {
+    headSha: [...headShas][0],
+    samples: samples.slice(0, 3),
+  };
 }
 
 export function createInitialState({ now, statusHead, runUrl, reactions, findings }) {

@@ -14,7 +14,7 @@ import {
   buildMarkerCommentBody,
   buildStateCommentBody,
   closeActiveMarker,
-  collectCurrentHeadCodexFindings,
+  collectUnresolvedCodexThreadFindings,
   createInitialState,
   eventMayHaveReadOnlyDependabotToken,
   eventModeHandlesEvent,
@@ -38,6 +38,8 @@ import {
   normalizeFailedFindingsRecoveryMode,
   normalizeState,
   normalizeMarkerAckTimeoutSeconds,
+  parseCodexIssueCommentArtifact,
+  parseCodexReviewArtifact,
   parseLoginSet,
   parseJsonResponseText,
   parseStateCommentBody,
@@ -53,6 +55,7 @@ import {
   stateNeedsFreshMarkerAfterMissingMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
+  sortCodexArtifactsNewestFirst,
   summarizeCodexSignalReactions,
   truncate,
   updateStateForStatus,
@@ -284,10 +287,14 @@ async function failClosedScannedPullRequest(pullRequest, error) {
   }
 
   try {
-    await setCommitStatus("error", `Codex review gate errored while scanning PR #${activePrNumber}`);
+    const state = error instanceof GateFailure ? error.state : "error";
+    const description = error instanceof GateFailure
+      ? error.description
+      : `Codex review gate errored while scanning PR #${activePrNumber}`;
+    await setCommitStatus(state, description);
   } catch (statusError) {
     console.error(
-      `failed to set ${STATUS_CONTEXT}=error for PR #${activePrNumber} ` +
+      `failed to set ${STATUS_CONTEXT} after scan error for PR #${activePrNumber} ` +
         `after ${error.name || "Error"}: ${statusError.message}`,
     );
   } finally {
@@ -336,40 +343,57 @@ async function processPullRequest(prNumber, trigger) {
     !trigger.allowCreateMarker &&
     pullRequestIsDependabot(pullRequest);
 
-  if (trigger.kind === "scan" && !trigger.allowCreateMarker && !dependabotScheduleRecovery) {
-    const comments = await paginate(`${repoPath}/issues/${activePrNumber}/comments`, { per_page: "100" });
-    if (!hasTrustedGateStateOrMarker(comments, config.trustedCommentLogins)) {
-      console.log(`PR #${activePrNumber} has no gate state; skipping scheduled scan.`);
+  const snapshot = await loadSnapshot();
+  const scheduledNoStatePending =
+    trigger.kind === "scan" &&
+    !trigger.allowCreateMarker &&
+    !dependabotScheduleRecovery &&
+    !hasTrustedGateStateOrMarker(snapshot.comments, config.trustedCommentLogins) &&
+    snapshot.findings.count === 0 &&
+    snapshot.evidenceErrors.length === 0 &&
+    snapshot.providerResult.kind === "pending";
+  if (scheduledNoStatePending) {
+    const liveStatus = await loadLatestGateStatus();
+    if (!liveStatus.readFailed && liveStatus.latest === null) {
+      console.log(`PR #${activePrNumber} has no gate state or Codex result; skipping scheduled scan.`);
       return;
     }
   }
-
-  const snapshot = await loadSnapshot();
 
   let {
     state,
     stateComment: savedStateComment,
     needsFreshMarker: stateNeedsFreshMarker,
-  } = await ensureState(snapshot, null, null);
+    needsSave: stateNeedsSave,
+  } = await ensureState(snapshot, null, null, { persist: false });
   state = migrateStateForEventDrivenDeadlines(state);
   stateNeedsFreshMarker = stateNeedsFreshMarker ||
     stateNeedsFreshMarkerAfterRecovery(state) ||
     stateNeedsFreshMarkerAfterMissingMarker(state, statusSha);
   const headChanged = state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha);
 
-  if (shouldSkipScheduledScanWithoutMarker({
-    triggerKind: trigger.kind,
-    allowCreateMarker: trigger.allowCreateMarker,
-    dependabotScheduleRecovery,
-    hasActiveMarker: Boolean(state.activeMarker),
-    headChanged,
-    stateNeedsFreshMarker,
-  })) {
-    console.log(`PR #${activePrNumber} has no active marker; skipping scheduled scan.`);
+  let allowCreateMarker = trigger.allowCreateMarker || stateNeedsFreshMarker;
+
+  if (
+    await reconcileCurrentReviewEvidence(
+      snapshot,
+      state,
+      savedStateComment,
+      { headChanged },
+    )
+  ) {
     return;
   }
 
-  let allowCreateMarker = trigger.allowCreateMarker || stateNeedsFreshMarker;
+  if (stateNeedsSave) {
+    try {
+      savedStateComment = await saveState(state, savedStateComment);
+    } catch (error) {
+      console.warn(`failed to save initial audit state: ${error.message}`);
+    }
+    stateNeedsSave = false;
+  }
+
   if (headChanged) {
     if (state.activeMarker) {
       state = closeActiveMarker(state, "obsolete_head", isoNow(), { currentHeadSha: statusSha });
@@ -392,7 +416,30 @@ async function processPullRequest(prNumber, trigger) {
     stateNeedsFreshMarker,
   });
 
-  if (await recoverFailedFindingsFromCompletion(state, savedStateComment, trigger)) {
+  if (snapshot.findings.count === 0) {
+    await setCommitStatusIfNeeded("pending", "Waiting for a complete current-head Codex review result");
+    state = updateStateForStatus(state, {
+      now: isoNow(),
+      statusHead: statusSha,
+      runUrl,
+      status: "pending",
+    });
+    try {
+      savedStateComment = await saveState(state, savedStateComment);
+    } catch (error) {
+      console.warn(`failed to save audit state after ${STATUS_CONTEXT}=pending: ${error.message}`);
+    }
+  }
+
+  if (shouldSkipScheduledScanWithoutMarker({
+    triggerKind: trigger.kind,
+    allowCreateMarker: trigger.allowCreateMarker,
+    dependabotScheduleRecovery,
+    hasActiveMarker: Boolean(state.activeMarker),
+    headChanged,
+    stateNeedsFreshMarker,
+  })) {
+    console.log(`PR #${activePrNumber} has no active marker; skipping scheduled scan.`);
     return;
   }
 
@@ -403,15 +450,6 @@ async function processPullRequest(prNumber, trigger) {
     })
   ) {
     await failFromFindings(snapshot.findings, state, savedStateComment);
-    return;
-  }
-
-  if (
-    !state.activeMarker &&
-    state.lastStatus?.headSha === statusSha &&
-    state.lastStatus?.state === "success"
-  ) {
-    console.log(`PR #${activePrNumber} already has a successful ${STATUS_CONTEXT} for ${statusSha}.`);
     return;
   }
 
@@ -426,9 +464,14 @@ async function processPullRequest(prNumber, trigger) {
   }
 }
 
-async function ensureState(snapshot, previousState, previousComment) {
+async function ensureState(snapshot, previousState, previousComment, { persist = true } = {}) {
   if (previousState && previousComment) {
-    return { state: previousState, stateComment: previousComment, needsFreshMarker: false };
+    return {
+      state: previousState,
+      stateComment: previousComment,
+      needsFreshMarker: false,
+      needsSave: false,
+    };
   }
 
   const stateComment = findLatestTrustedStateComment(snapshot.comments, config.trustedCommentLogins);
@@ -439,7 +482,7 @@ async function ensureState(snapshot, previousState, previousComment) {
       markerComment,
       isoNow(),
     );
-    const reconciledStateComment = reconciled.changed
+    const reconciledStateComment = reconciled.changed && persist
       ? await saveState(reconciled.state, stateComment)
       : stateComment;
 
@@ -447,6 +490,7 @@ async function ensureState(snapshot, previousState, previousComment) {
       state: reconciled.state,
       stateComment: reconciledStateComment,
       needsFreshMarker: false,
+      needsSave: reconciled.changed && !persist,
     };
   }
 
@@ -477,8 +521,13 @@ async function ensureState(snapshot, previousState, previousComment) {
     closeReason: state.bootstrap?.closeReason || "event_driven",
   };
 
-  const createdStateComment = await saveState(state, null);
-  return { state, stateComment: createdStateComment, needsFreshMarker: true };
+  const createdStateComment = persist ? await saveState(state, null) : null;
+  return {
+    state,
+    stateComment: createdStateComment,
+    needsFreshMarker: true,
+    needsSave: !persist,
+  };
 }
 
 async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) {
@@ -498,7 +547,7 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
         activeMarker: marker,
       });
       stateComment = await saveState(state, stateComment);
-      await setCommitStatus("pending", "Waiting for Codex review on controlled marker");
+      await setCommitStatusIfNeeded("pending", "Waiting for Codex review on controlled marker");
       console.log(`PR #${activePrNumber} is waiting for Codex review marker ${marker.id}.`);
       return { kind: "done", state, stateComment };
     }
@@ -617,182 +666,136 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
   throw new Error(`PR #${activePrNumber} exceeded event-driven transition budget`);
 }
 
-async function passGate(state, stateComment, snapshot, observed) {
+async function reconcileCurrentReviewEvidence(
+  snapshot,
+  state,
+  stateComment,
+  { headChanged = false } = {},
+) {
+  failIfSnapshotEvidenceIsInvalid(snapshot);
+  if (snapshot.findings.count > 0) {
+    await failFromFindings(snapshot.findings, state, stateComment);
+    return true;
+  }
+  if (snapshot.providerResult.kind !== "clean") {
+    return false;
+  }
+  if (!providerResultCanSatisfyActiveMarker(snapshot.providerResult, state, { headChanged })) {
+    return false;
+  }
+
+  await passGateFromCurrentEvidence(state, stateComment);
+  return true;
+}
+
+function providerResultCanSatisfyActiveMarker(providerResult, state, { headChanged }) {
+  const marker = state?.activeMarker;
+  if (!marker || headChanged || activeMarkerIsObsolete(marker, statusSha)) {
+    return true;
+  }
+
+  const baselineId = providerResult.source === "issue-comment"
+    ? marker.baseline?.completionComment
+    : marker.baseline?.approvedReview;
+  if (providerResult.source === "issue-comment") {
+    return hasNewCompletionComment(
+      baselineId,
+      {
+        id: String(providerResult.id),
+        createdAt: providerResult.createdAt,
+      },
+      marker.createdAt,
+      { bufferSeconds: config.completionSignalBufferSeconds },
+    );
+  }
+  if (providerResult.source === "pull-request-review") {
+    return hasNewReviewTransition(
+      baselineId,
+      {
+        id: String(providerResult.id),
+        submittedAt: providerResult.createdAt,
+      },
+      marker.createdAt,
+    );
+  }
+
+  return false;
+}
+
+function failIfSnapshotEvidenceIsInvalid(snapshot) {
+  const errors = snapshot.evidenceErrors || [];
+  if (errors.length === 0 && snapshot.providerResult.kind !== "malformed") {
+    return;
+  }
+
+  const reason = errors[0] || snapshot.providerResult.reason || "unknown provider evidence conflict";
+  throw new GateFailure(
+    "error",
+    "Codex review evidence is invalid",
+    `Cannot reconcile Codex review evidence for ${statusSha}: ${reason}`,
+  );
+}
+
+async function passGateFromCurrentEvidence(state, stateComment) {
   await failIfPullRequestHeadChanged("before passing Codex review gate");
   const finalSnapshot = await loadSnapshot();
+  failIfSnapshotEvidenceIsInvalid(finalSnapshot);
   if (finalSnapshot.findings.count > 0) {
     await failFromFindings(finalSnapshot.findings, state, stateComment);
     return;
   }
-  const passedState = updateStateForStatus(closeActiveMarker(state, "passed", isoNow(), {
-    observedCompletionComment: observed.observedCompletionComment || snapshot.completionComment,
-    observedApprovedReview: observed.observedApprovedReview || null,
-  }), {
-    now: isoNow(),
-    statusHead: statusSha,
-    runUrl,
-    status: "success",
-  });
-  await setCommitStatus("success", "Codex completion observed and current head has no Codex findings");
-  await saveState(passedState, stateComment);
-  console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
-}
-
-async function recoverFailedFindingsFromCompletion(state, stateComment, trigger) {
-  const failedMarker = failedFindingsRecoveryMarker(state, trigger);
-  if (!failedMarker) {
-    return false;
+  if (finalSnapshot.providerResult.kind !== "clean") {
+    throw new GateFailure(
+      "error",
+      "Codex clean result changed during final validation",
+      `The current-head Codex clean result for ${statusSha} was not stable across final validation.`,
+    );
+  }
+  if (!providerResultCanSatisfyActiveMarker(finalSnapshot.providerResult, state, {
+    headChanged: false,
+  })) {
+    throw new GateFailure(
+      "pending",
+      "Codex clean result predates the active review request",
+      `The current-head Codex clean result for ${statusSha} is not newer than the active marker.`,
+    );
   }
 
-  await failIfPullRequestHeadChanged("before recovering failed Codex findings");
-  const finalSnapshot = await loadSnapshot();
-  const currentCompletionComment = currentTriggerCompletionComment(
-    finalSnapshot.comments,
-    trigger.completionComment,
+  const passedState = updateStateForStatus(
+    state.activeMarker
+      ? closeActiveMarker(state, "passed", isoNow(), {
+          observedProviderResult: finalSnapshot.providerResult,
+        })
+      : state,
+    {
+      now: isoNow(),
+      statusHead: statusSha,
+      runUrl,
+      status: "success",
+    },
   );
-  if (!currentCompletionComment) {
-    if (finalSnapshot.findings.count > 0) {
-      await failFromFindings(finalSnapshot.findings, state, stateComment);
-    } else {
-      console.log("Skipping failed-findings recovery because the triggering Codex completion is no longer current.");
-    }
-    return true;
-  }
-  if (finalSnapshot.findings.count > 0) {
-    const rejectedState = config.failedFindingsRecoveryMode === "fresh"
-      ? recordRejectedRecoveryCompletion(state, failedMarker, currentCompletionComment)
-      : state;
-    await failFromFindings(finalSnapshot.findings, rejectedState, stateComment);
-    return true;
-  }
-
-  const recoveredState = updateStateForStatus(state, {
-    now: isoNow(),
-    statusHead: statusSha,
-    runUrl,
-    status: "success",
-  });
-  await setCommitStatus("success", "Codex completion observed after resolved findings");
-  await saveState(recoveredState, stateComment);
-  console.log(`${STATUS_CONTEXT} recovered for ${statusSha} after failed marker ${failedMarker.id}.`);
-  return true;
-}
-
-function failedFindingsRecoveryMarker(state, trigger) {
-  if (!config.failedFindingsRecovery) {
-    return null;
-  }
-  if (!trigger.completionComment || state?.activeMarker) {
-    return null;
-  }
-  if (!statusSha || state?.statusHead !== statusSha) {
-    return null;
-  }
-
-  const latestForHead = [...(state.history || [])]
-    .reverse()
-    .find((marker) => marker.headSha === statusSha);
-  if ((latestForHead?.outcome || latestForHead?.state) !== "failed_findings") {
-    return null;
-  }
-  if (!latestForHead.closedAt) {
-    return null;
-  }
-
-  const completionCreatedAt = parseTimestamp(
-    trigger.completionComment.createdAt,
-    "Codex completion comment creation time",
+  const liveStatus = await loadLatestGateStatus();
+  await failIfPullRequestHeadChanged("immediately before final Codex gate status");
+  await setCommitStatusIfNeeded(
+    "success",
+    "Latest Codex review is clean and all findings are resolved",
+    { liveStatus },
   );
-  const failedClosedAt = parseTimestamp(latestForHead.closedAt, "failed findings marker close time");
-  if (
-    config.failedFindingsRecoveryMode === "fresh" &&
-    recoveryCompletionWasBlockedByFreshMode(latestForHead, trigger.completionComment)
-  ) {
-    return null;
+  try {
+    await saveState(passedState, stateComment);
+  } catch (error) {
+    console.warn(`failed to save audit state after ${STATUS_CONTEXT}=success: ${error.message}`);
   }
-  return completionCreatedAt > failedClosedAt ? latestForHead : null;
-}
-
-function currentTriggerCompletionComment(comments, completionComment) {
-  const currentComment = (comments || []).find((comment) =>
-    String(comment.id || "") === String(completionComment.id || ""),
-  );
-  if (!currentComment || !isCodexCompletionComment(currentComment, config.codexBotLogins)) {
-    return null;
-  }
-
-  const currentIdentity = issueCommentIdentity(currentComment);
-  return currentIdentity.createdAt === completionComment.createdAt ? currentIdentity : null;
-}
-
-function recoveryCompletionWasBlockedByFreshMode(marker, completionComment) {
-  if (recoveryCompletionWasRejected(marker, completionComment)) {
-    return true;
-  }
-  const latestRejectedRecoveryAt = latestRejectedRecoveryCutoff(marker);
-  if (!latestRejectedRecoveryAt) {
-    return false;
-  }
-
-  const completionCreatedAt = parseTimestamp(
-    completionComment.createdAt,
-    "Codex completion comment creation time",
-  );
-  const rejectedAt = parseTimestamp(latestRejectedRecoveryAt, "latest rejected recovery time");
-  return completionCreatedAt <= rejectedAt;
-}
-
-function latestRejectedRecoveryCutoff(marker, fallback = null) {
-  const candidates = [
-    marker.latestRejectedRecoveryAt,
-    ...(marker.rejectedRecoveryCompletions || []).map((rejected) => rejected.rejectedAt),
-    fallback,
-  ].filter(Boolean);
-  if (candidates.length === 0) {
-    return null;
-  }
-
-  return candidates.sort((left, right) =>
-    parseTimestamp(right, "rejected recovery time") -
-      parseTimestamp(left, "rejected recovery time"),
-  )[0];
-}
-
-function recoveryCompletionWasRejected(marker, completionComment) {
-  return (marker.rejectedRecoveryCompletions || []).some((rejected) =>
-    String(rejected.id) === String(completionComment.id) &&
-      rejected.createdAt === completionComment.createdAt,
+  console.log(
+    `${STATUS_CONTEXT} passed for ${statusSha} from ` +
+      `${finalSnapshot.providerResult.source} ${finalSnapshot.providerResult.id}.`,
   );
 }
 
-function recordRejectedRecoveryCompletion(state, failedMarker, completionComment) {
-  const rejected = {
-    id: String(completionComment.id),
-    createdAt: completionComment.createdAt,
-    rejectedAt: isoNow(),
-  };
-  return normalizeState({
-    ...state,
-    updatedAt: rejected.rejectedAt,
-    history: (state.history || []).map((marker) => {
-      if (String(marker.id || "") !== String(failedMarker.id || "")) {
-        return marker;
-      }
-      const existing = marker.rejectedRecoveryCompletions || [];
-      const latestRejectedRecoveryAt = latestRejectedRecoveryCutoff(marker, rejected.rejectedAt);
-      if (recoveryCompletionWasRejected(marker, completionComment)) {
-        return {
-          ...marker,
-          latestRejectedRecoveryAt,
-        };
-      }
-      return {
-        ...marker,
-        latestRejectedRecoveryAt,
-        rejectedRecoveryCompletions: [...existing, rejected].slice(-20),
-      };
-    }),
-  });
+async function passGate(state, stateComment, snapshot, observed) {
+  void snapshot;
+  void observed;
+  await passGateFromCurrentEvidence(state, stateComment, null);
 }
 
 async function failFromFindings(findings, state, stateComment) {
@@ -810,7 +813,11 @@ async function failFromFindings(findings, state, stateComment) {
     status: "failure",
   });
   await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
-  await saveState(statusState, stateComment);
+  try {
+    await saveState(statusState, stateComment);
+  } catch (error) {
+    console.warn(`failed to save audit state after ${STATUS_CONTEXT}=failure: ${error.message}`);
+  }
   console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
 }
 
@@ -954,13 +961,12 @@ async function loadSnapshot() {
     ? await paginate(`${repoPath}/issues/comments/${markerComment.id}/reactions`, { per_page: "100" })
     : [];
 
-  const findings = collectCurrentHeadCodexFindings(
+  const evidence = await buildCurrentReviewEvidence({
+    comments,
     reviewComments,
     reviews,
-    statusSha,
-    config.codexBotLogins,
     reviewThreads,
-  );
+  });
   const reactions = summarizeCodexSignalReactions(
     issueReactions,
     markerCommentReactions,
@@ -987,8 +993,284 @@ async function loadSnapshot() {
       approvedReview,
       submittedReview,
     },
-    findings,
+    findings: evidence.findings,
+    providerResult: evidence.providerResult,
+    evidenceErrors: evidence.errors,
   };
+}
+
+async function buildCurrentReviewEvidence({ comments, reviewComments, reviews, reviewThreads }) {
+  const inlineParentReviewIds = new Set(
+    reviewComments
+      .map((comment) => comment.pull_request_review_id)
+      .filter((reviewId) => reviewId !== null && reviewId !== undefined)
+      .map(String),
+  );
+  const threadFindings = collectUnresolvedCodexThreadFindings(
+    reviewComments,
+    reviews,
+    reviewThreads,
+    config.codexBotLogins,
+    statusSha,
+  );
+  const artifacts = [
+    ...comments.map((comment) =>
+      parseCodexIssueCommentArtifact(comment, {
+        owner: repo.owner,
+        repo: repo.name,
+        botLogins: config.codexBotLogins,
+      }),
+    ),
+    ...reviews.map((review) => {
+      if (
+        review.state === "COMMENTED" &&
+        inlineParentReviewIds.has(String(review.id)) &&
+        !String(review.body || "").trim().startsWith("### 💡 Codex Review")
+      ) {
+        return null;
+      }
+      return parseCodexReviewArtifact(review, {
+        owner: repo.owner,
+        repo: repo.name,
+        botLogins: config.codexBotLogins,
+      });
+    }),
+  ].filter(Boolean);
+  const providerResult = await selectCurrentHeadProviderResult(artifacts);
+  const providerFindings = providerResult.kind === "finding"
+    ? {
+        count: 1,
+        ids: [`${providerResult.source}:${providerResult.id}`],
+        samples: providerResult.samples || [],
+      }
+    : { count: 0, ids: [], samples: [] };
+
+  return {
+    providerResult,
+    errors: threadFindings.errors,
+    findings: {
+      count: threadFindings.count + providerFindings.count,
+      ids: [...threadFindings.ids, ...providerFindings.ids],
+      samples: [...threadFindings.samples, ...providerFindings.samples].slice(0, 3),
+    },
+  };
+}
+
+async function selectCurrentHeadProviderResult(artifacts) {
+  let ordered;
+  try {
+    ordered = sortCodexArtifactsNewestFirst(artifacts);
+  } catch (error) {
+    return {
+      kind: "malformed",
+      source: "provider-artifact-set",
+      id: "unknown",
+      reason: error.message,
+    };
+  }
+
+  const resolutionCache = new Map();
+  const ancestryCache = new Map();
+  for (let index = 0; index < ordered.length;) {
+    const createdAt = ordered[index].createdAt;
+    const createdAtMs = parseTimestamp(createdAt, "Codex artifact creation time");
+    const group = [];
+    while (
+      index < ordered.length &&
+      parseTimestamp(ordered[index].createdAt, "Codex artifact creation time") === createdAtMs
+    ) {
+      group.push(ordered[index]);
+      index += 1;
+    }
+
+    if (new Set(group.map((artifact) => artifact.source)).size > 1) {
+      return {
+        kind: "malformed",
+        source: "provider-artifact-set",
+        id: group.map((artifact) => `${artifact.source}:${artifact.id}`).join(","),
+        reason: "cross-channel Codex terminal artifacts share an ambiguous server timestamp",
+      };
+    }
+
+    for (let groupIndex = 0; groupIndex < group.length; groupIndex += 1) {
+      const artifact = group[groupIndex];
+      if (artifact.kind === "malformed") {
+        return artifact;
+      }
+      if (artifact.kind === "finding") {
+        return artifact;
+      }
+      if (artifact.kind !== "clean") {
+        continue;
+      }
+
+      let resolvedSha = artifact.headSha || "";
+      if (artifact.commitRef) {
+        resolvedSha = await resolveReviewedCommit(artifact.commitRef, resolutionCache);
+      }
+      if (resolvedSha === statusSha.toLowerCase()) {
+        const unsupersededFinding = await firstUnsupersededOlderFinding(
+          resolvedSha,
+          [...group.slice(groupIndex + 1), ...ordered.slice(index)],
+          ancestryCache,
+          resolutionCache,
+        );
+        if (unsupersededFinding) {
+          return unsupersededFinding;
+        }
+        return {
+          ...artifact,
+          headSha: resolvedSha,
+        };
+      }
+      return {
+        ...artifact,
+        kind: "malformed",
+        reason:
+          `latest Codex clean result resolved to ${resolvedSha}, ` +
+          `not current head ${statusSha.toLowerCase()}`,
+      };
+    }
+  }
+
+  return { kind: "pending", source: "provider-artifact-set", id: "none" };
+}
+
+async function firstUnsupersededOlderFinding(
+  cleanHeadSha,
+  olderArtifacts,
+  ancestryCache,
+  resolutionCache,
+) {
+  const newerCleanHeads = [cleanHeadSha];
+  for (const artifact of olderArtifacts) {
+    if (artifact.kind === "clean") {
+      try {
+        const resolvedSha = artifact.commitRef
+          ? await resolveReviewedCommit(artifact.commitRef, resolutionCache)
+          : artifact.headSha;
+        if (/^[0-9a-f]{40}$/.test(resolvedSha || "")) {
+          newerCleanHeads.push(resolvedSha);
+        }
+      } catch {
+        // Older incomplete evidence cannot override a later valid current-head clean.
+      }
+      continue;
+    }
+    if (artifact.kind !== "finding") {
+      continue;
+    }
+    let superseded = false;
+    for (const newerCleanHead of newerCleanHeads) {
+      if (
+        artifact.headSha === newerCleanHead ||
+        await commitIsAncestor(artifact.headSha, newerCleanHead, ancestryCache)
+      ) {
+        superseded = true;
+        break;
+      }
+    }
+    if (!superseded) {
+      return artifact;
+    }
+  }
+  return null;
+}
+
+async function commitIsAncestor(baseSha, headSha, cache) {
+  const cacheKey = `${baseSha}...${headSha}`;
+  if (cache.has(cacheKey)) {
+    return cache.get(cacheKey);
+  }
+
+  let data;
+  try {
+    ({ data } = await request(
+      "GET",
+      `${repoPath}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
+    ));
+  } catch (error) {
+    if (error instanceof GateFailure && error.state === "pending") {
+      throw error;
+    }
+    throw new GateFailure(
+      "error",
+      "Codex finding ancestry could not be verified",
+      `Cannot compare finding commit ${baseSha} with clean commit ${headSha}: ${error.message}`,
+    );
+  }
+
+  const baseCommitSha = String(data?.base_commit?.sha || "").toLowerCase();
+  const mergeBaseSha = String(data?.merge_base_commit?.sha || "").toLowerCase();
+  const status = data?.status;
+  if (
+    !/^[0-9a-f]{40}$/.test(baseCommitSha) ||
+    !/^[0-9a-f]{40}$/.test(mergeBaseSha) ||
+    !new Set(["ahead", "behind", "diverged", "identical"]).has(status)
+  ) {
+    throw new GateFailure(
+      "error",
+      "Codex finding ancestry response is invalid",
+      `Compare response for ${cacheKey} did not contain a closed commit relationship.`,
+    );
+  }
+  if (baseCommitSha !== baseSha) {
+    throw new GateFailure(
+      "error",
+      "Codex finding ancestry response conflicts with the requested commit",
+      `Compare response base ${baseCommitSha} does not match finding commit ${baseSha}.`,
+    );
+  }
+
+  const isAncestor =
+    status === "identical"
+      ? baseSha === headSha
+      : status === "ahead" && mergeBaseSha === baseSha;
+  cache.set(cacheKey, isAncestor);
+  return isAncestor;
+}
+
+async function resolveReviewedCommit(commitRef, cache) {
+  if (/^[0-9a-f]{40}$/.test(commitRef)) {
+    return commitRef;
+  }
+  if (cache.has(commitRef)) {
+    return cache.get(commitRef);
+  }
+
+  let data;
+  try {
+    ({ data } = await request(
+      "GET",
+      `${repoPath}/commits/${encodeURIComponent(commitRef)}`,
+    ));
+  } catch (error) {
+    if (error instanceof GateFailure && error.state === "pending") {
+      throw error;
+    }
+    throw new GateFailure(
+      "error",
+      "Codex reviewed commit could not be resolved",
+      `Cannot uniquely resolve Reviewed commit ${commitRef}: ${error.message}`,
+    );
+  }
+  const resolvedSha = String(data?.sha || "").toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(resolvedSha)) {
+    throw new GateFailure(
+      "error",
+      "Codex reviewed commit response is invalid",
+      `Reviewed commit ${commitRef} did not resolve to one full commit SHA.`,
+    );
+  }
+  if (!resolvedSha.startsWith(commitRef)) {
+    throw new GateFailure(
+      "error",
+      "Codex reviewed commit response conflicts with its short SHA",
+      `Reviewed commit ${commitRef} resolved to non-matching commit ${resolvedSha}.`,
+    );
+  }
+  cache.set(commitRef, resolvedSha);
+  return resolvedSha;
 }
 
 function readConfig() {
@@ -1098,6 +1380,24 @@ async function failIfPullRequestHeadChanged(phase = "while waiting for Codex") {
 }
 
 function failIfLoadedPullRequestHeadChanged(pullRequest, phase) {
+  if (
+    pullRequest.state !== "open" ||
+    pullRequest.merged === true ||
+    pullRequest.merged_at
+  ) {
+    throw new GateFailure(
+      "error",
+      `PR lifecycle changed ${phase}`,
+      `PR #${activePrNumber} is no longer an open, unmerged pull request.`,
+    );
+  }
+  if (pullRequest.draft) {
+    throw new GateFailure(
+      "pending",
+      `PR became draft ${phase}`,
+      `PR #${activePrNumber} became draft before the Codex review gate could pass.`,
+    );
+  }
   if (pullRequest.head.sha === statusSha) {
     return;
   }
@@ -1175,6 +1475,39 @@ async function setCommitStatus(state, description) {
   console.log(`Set ${STATUS_CONTEXT}=${state}: ${description}`);
 }
 
+async function setCommitStatusIfNeeded(
+  state,
+  description,
+  { beforeDecision = null, liveStatus = null } = {},
+) {
+  const observed = liveStatus || await loadLatestGateStatus();
+
+  if (beforeDecision) {
+    await beforeDecision();
+  }
+  if (!observed.readFailed && observed.latest?.state === state) {
+    console.log(`Latest live ${STATUS_CONTEXT} already equals ${state} for ${statusSha}.`);
+    return;
+  }
+  await setCommitStatus(state, description);
+}
+
+async function loadLatestGateStatus() {
+  try {
+    const statuses = await paginate(
+      `${repoPath}/commits/${encodeURIComponent(statusSha)}/statuses`,
+      { per_page: "100" },
+    );
+    return {
+      latest: statuses.find((status) => status.context === STATUS_CONTEXT) || null,
+      readFailed: false,
+    };
+  } catch (error) {
+    console.warn(`failed to read current ${STATUS_CONTEXT} status: ${error.message}`);
+    return { latest: null, readFailed: true };
+  }
+}
+
 async function paginate(path, query) {
   const results = [];
   let page = 1;
@@ -1207,21 +1540,48 @@ async function loadReviewThreads() {
     if (!connection) {
       throw new Error("GraphQL reviewThreads query did not return a connection");
     }
+    if (!Array.isArray(connection.nodes)) {
+      throw new Error("GraphQL reviewThreads connection did not return a nodes array");
+    }
+    if (
+      !connection.pageInfo ||
+      typeof connection.pageInfo.hasNextPage !== "boolean"
+    ) {
+      throw new Error("GraphQL reviewThreads connection did not return complete pageInfo");
+    }
 
-    threads.push(...(connection.nodes || []));
-    if (!connection.pageInfo?.hasNextPage) {
+    threads.push(...connection.nodes);
+    if (!connection.pageInfo.hasNextPage) {
       return Promise.all(threads.map((thread) => loadAllReviewThreadComments(thread)));
+    }
+    if (!connection.pageInfo.endCursor) {
+      throw new Error("GraphQL reviewThreads connection omitted an end cursor");
     }
     after = connection.pageInfo.endCursor;
   }
 }
 
 async function loadAllReviewThreadComments(thread) {
-  let connection = thread.comments || { nodes: [] };
+  let connection = thread.comments;
+  if (!connection) {
+    throw new Error(`GraphQL comments query did not return a connection for thread ${thread.id}`);
+  }
+  if (!Array.isArray(connection.nodes)) {
+    throw new Error(`GraphQL comments connection did not return nodes for thread ${thread.id}`);
+  }
+  if (
+    !connection.pageInfo ||
+    typeof connection.pageInfo.hasNextPage !== "boolean"
+  ) {
+    throw new Error(`GraphQL comments connection did not return complete pageInfo for thread ${thread.id}`);
+  }
   const nodes = [...(connection.nodes || [])];
-  let after = connection.pageInfo?.endCursor || null;
+  let after = connection.pageInfo.endCursor || null;
 
-  while (connection.pageInfo?.hasNextPage) {
+  while (connection.pageInfo.hasNextPage) {
+    if (!after) {
+      throw new Error(`GraphQL comments connection omitted an end cursor for thread ${thread.id}`);
+    }
     const { data } = await graphqlRequest(REVIEW_THREAD_COMMENTS_QUERY, {
       threadId: thread.id,
       after,
@@ -1230,9 +1590,21 @@ async function loadAllReviewThreadComments(thread) {
     if (!connection) {
       throw new Error(`GraphQL comments query did not return a connection for thread ${thread.id}`);
     }
+    if (!Array.isArray(connection.nodes)) {
+      throw new Error(`GraphQL comments connection did not return nodes for thread ${thread.id}`);
+    }
+    if (
+      !connection.pageInfo ||
+      typeof connection.pageInfo.hasNextPage !== "boolean"
+    ) {
+      throw new Error(`GraphQL comments connection did not return complete pageInfo for thread ${thread.id}`);
+    }
 
     nodes.push(...(connection.nodes || []));
-    after = connection.pageInfo?.endCursor || null;
+    if (connection.pageInfo.hasNextPage && !connection.pageInfo.endCursor) {
+      throw new Error(`GraphQL comments connection omitted an end cursor for thread ${thread.id}`);
+    }
+    after = connection.pageInfo.endCursor || null;
   }
 
   return {
@@ -1278,10 +1650,18 @@ async function request(method, path, bodyOrQuery) {
         await sleepBeforeRetry(`retrying ${method} ${url.pathname} after fetch error: ${error.message}`, attempt);
         continue;
       }
+      if (method === "GET") {
+        throw new GateFailure(
+          "pending",
+          "Codex review evidence is temporarily incomplete",
+          `${method} ${url.pathname} exhausted its retry budget: ${error.message}`,
+        );
+      }
       throw error;
     }
 
     const text = await response.text();
+    const explicitRateLimit = responseIsExplicitRateLimit(response);
     let data;
     try {
       data = parseJsonResponseText(text, `${method} ${url.pathname} (${response.status})`);
@@ -1290,7 +1670,10 @@ async function request(method, path, bodyOrQuery) {
         error instanceof NonJsonResponseError &&
         !response.ok &&
         attempt < MAX_REQUEST_ATTEMPTS &&
-        restRequestRetryAllowed(method, path, response.status)
+        (
+          restRequestRetryAllowed(method, path, response.status) ||
+          (method === "GET" && explicitRateLimit)
+        )
       ) {
         await sleepBeforeRetry(
           `retrying ${method} ${url.pathname} after ${response.status}: ${error.preview}`,
@@ -1299,6 +1682,18 @@ async function request(method, path, bodyOrQuery) {
         );
         continue;
       }
+      if (
+        error instanceof NonJsonResponseError &&
+        !response.ok &&
+        (isRetryableHttpStatus(response.status) || explicitRateLimit) &&
+        method === "GET"
+      ) {
+        throw new GateFailure(
+          "pending",
+          "Codex review evidence is temporarily incomplete",
+          `${method} ${url.pathname} exhausted its retry budget: ${error.message}`,
+        );
+      }
       throw error;
     }
 
@@ -1306,7 +1701,10 @@ async function request(method, path, bodyOrQuery) {
       const message = data?.message || response.statusText;
       if (
         attempt < MAX_REQUEST_ATTEMPTS &&
-        restRequestRetryAllowed(method, path, response.status)
+        (
+          restRequestRetryAllowed(method, path, response.status) ||
+          (method === "GET" && explicitRateLimit)
+        )
       ) {
         await sleepBeforeRetry(
           `retrying ${method} ${url.pathname} after ${response.status}: ${message}`,
@@ -1314,6 +1712,16 @@ async function request(method, path, bodyOrQuery) {
           response.headers.get("retry-after"),
         );
         continue;
+      }
+      if (
+        method === "GET" &&
+        (isRetryableHttpStatus(response.status) || explicitRateLimit)
+      ) {
+        throw new GateFailure(
+          "pending",
+          "Codex review evidence is temporarily incomplete",
+          `${method} ${url.pathname} exhausted its retry budget after ${response.status}: ${message}`,
+        );
       }
       throw new Error(`${method} ${url.pathname} failed with ${response.status}: ${message}`);
     }
@@ -1344,10 +1752,15 @@ async function graphqlRequest(query, variables) {
         await sleepBeforeRetry(`retrying GraphQL request after fetch error: ${error.message}`, attempt);
         continue;
       }
-      throw error;
+      throw new GateFailure(
+        "pending",
+        "Codex review evidence is temporarily incomplete",
+        `GraphQL request exhausted its retry budget: ${error.message}`,
+      );
     }
 
     const text = await response.text();
+    const explicitRateLimit = responseIsExplicitRateLimit(response);
     let payload;
     try {
       payload = parseJsonResponseText(
@@ -1355,7 +1768,12 @@ async function graphqlRequest(query, variables) {
         `POST ${new URL(config.graphqlUrl).pathname} (${response.status})`,
       );
     } catch (error) {
-      if (error instanceof NonJsonResponseError && !response.ok && attempt < MAX_REQUEST_ATTEMPTS) {
+      if (
+        error instanceof NonJsonResponseError &&
+        !response.ok &&
+        attempt < MAX_REQUEST_ATTEMPTS &&
+        (isRetryableHttpStatus(response.status) || explicitRateLimit)
+      ) {
         await sleepBeforeRetry(
           `retrying GraphQL request after ${response.status}: ${error.preview}`,
           attempt,
@@ -1363,12 +1781,26 @@ async function graphqlRequest(query, variables) {
         );
         continue;
       }
+      if (
+        error instanceof NonJsonResponseError &&
+        !response.ok &&
+        (isRetryableHttpStatus(response.status) || explicitRateLimit)
+      ) {
+        throw new GateFailure(
+          "pending",
+          "Codex review evidence is temporarily incomplete",
+          `GraphQL request exhausted its retry budget: ${error.message}`,
+        );
+      }
       throw error;
     }
 
     if (!response.ok) {
       const message = payload?.message || response.statusText;
-      if (attempt < MAX_REQUEST_ATTEMPTS && isRetryableHttpStatus(response.status)) {
+      if (
+        attempt < MAX_REQUEST_ATTEMPTS &&
+        (isRetryableHttpStatus(response.status) || explicitRateLimit)
+      ) {
         await sleepBeforeRetry(
           `retrying GraphQL request after ${response.status}: ${message}`,
           attempt,
@@ -1376,10 +1808,32 @@ async function graphqlRequest(query, variables) {
         );
         continue;
       }
+      if (isRetryableHttpStatus(response.status) || explicitRateLimit) {
+        throw new GateFailure(
+          "pending",
+          "Codex review evidence is temporarily incomplete",
+          `GraphQL request exhausted its retry budget after ${response.status}: ${message}`,
+        );
+      }
       throw new Error(`POST ${new URL(config.graphqlUrl).pathname} failed with ${response.status}: ${message}`);
     }
     if (payload?.errors?.length) {
       const message = payload.errors.map((error) => error.message).join("; ");
+      if (graphqlErrorsAreExplicitRateLimit(payload.errors)) {
+        if (attempt < MAX_REQUEST_ATTEMPTS) {
+          await sleepBeforeRetry(
+            `retrying GraphQL request after rate limit: ${message}`,
+            attempt,
+            response.headers.get("retry-after"),
+          );
+          continue;
+        }
+        throw new GateFailure(
+          "pending",
+          "Codex review evidence is temporarily incomplete",
+          `GraphQL request exhausted its retry budget after rate limit: ${message}`,
+        );
+      }
       throw new Error(`GraphQL reviewThreads query failed: ${message}`);
     }
 
@@ -1387,6 +1841,24 @@ async function graphqlRequest(query, variables) {
   }
 
   throw new Error("GraphQL request exceeded retry budget");
+}
+
+function responseIsExplicitRateLimit(response) {
+  if (response.status !== 403 && response.status !== 429) {
+    return false;
+  }
+  return response.status === 429 ||
+    response.headers.get("retry-after") !== null ||
+    response.headers.get("x-ratelimit-remaining") === "0";
+}
+
+function graphqlErrorsAreExplicitRateLimit(errors) {
+  return errors.some((error) =>
+    error?.type === "RATE_LIMITED" ||
+    error?.extensions?.type === "RATE_LIMITED" ||
+    error?.extensions?.code === "RATE_LIMITED" ||
+    /\brate[ -]?limit(?:ed| exceeded)?\b/i.test(String(error?.message || "")),
+  );
 }
 
 function graphqlEndpoint(apiUrl, serverUrl) {

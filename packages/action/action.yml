@@ -46,15 +46,15 @@ inputs:
     required: false
     default: "1800"
   completion-signal-buffer-seconds:
-    description: Minimum seconds after a marker before accepting a Codex top-level clean completion comment.
+    description: Deprecated compatibility input. Commit-bound terminal evidence uses exact head binding instead of a time buffer.
     required: false
     default: "30"
   failed-findings-recovery:
-    description: Allow a later Codex clean completion comment to recover from resolved failed findings.
+    description: Legacy compatibility switch for history-based recovery. It does not disable authoritative commit-bound reconciliation.
     required: false
     default: ""
   failed-findings-recovery-mode:
-    description: "Failed findings recovery mode. Use head or fresh."
+    description: "Deprecated compatibility input. Commit-bound clean evidence is reconciled from current evidence after findings are resolved."
     required: false
     default: ""
   poll-interval-seconds:

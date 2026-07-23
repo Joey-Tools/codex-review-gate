@@ -72,4 +72,8 @@ source repository root. Instead, `packages/action` is the stable subtree
 boundary. Use `scripts/release-action-subtree.sh` to validate the source tree
 and compute the split commit for the action repository.
 
+Consumers should use `JoeyTeng/codex-review-gate-action@v1`. The signed
+floating major tag receives compatible v1 updates automatically; immutable
+release tags such as `v1.3.0` remain available for audits and rollbacks.
+
 See [docs/RELEASING.md](docs/RELEASING.md) for the full release flow.
