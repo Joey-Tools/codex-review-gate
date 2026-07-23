@@ -424,16 +424,22 @@ function postedCommitStatusesFor(sha) {
 }
 
 function normalizeCommitStatus(entry, sha, id) {
+  const defaultCreator = {
+    login: "github-actions[bot]",
+    type: "Bot",
+  };
   if (entry?.body && typeof entry.body === "object") {
     return {
       id: entry.id ?? id,
       sha: entry.sha ?? sha,
+      creator: defaultCreator,
       ...entry.body,
     };
   }
   return {
     id: entry?.id ?? id,
     sha: entry?.sha ?? sha,
+    creator: defaultCreator,
     ...(entry || {}),
   };
 }

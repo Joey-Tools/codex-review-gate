@@ -235,11 +235,11 @@ test("failed-findings-recovery=false disables no-marker recovery", async () => {
     });
 
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
 
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.activeMarker, null);
-    assert.equal(state.lastStatus.state, "failure");
+    assert.equal(state.lastStatus.state, "pending");
   });
 
   await withHarness(async (harness) => {
@@ -260,10 +260,10 @@ test("failed-findings-recovery=false disables no-marker recovery", async () => {
     });
 
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
     assert.equal(
       parseStateCommentBody(harness.findStateComment().body).lastStatus.state,
-      "failure",
+      "pending",
     );
   });
 });
@@ -696,8 +696,8 @@ test("fresh recovery requires a clean newer than the rejected cutoff", async () 
     });
 
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(harness.statuses.length, 0);
-    assert.equal(parseStateCommentBody(harness.findStateComment().body).lastStatus.state, "failure");
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(parseStateCommentBody(harness.findStateComment().body).lastStatus.state, "pending");
   });
 });
 
@@ -909,10 +909,10 @@ test("failed-findings recovery requires a clean strictly newer than marker close
     });
 
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
 
     const state = parseStateCommentBody(harness.findStateComment().body);
-    assert.equal(state.lastStatus.state, "failure");
+    assert.equal(state.lastStatus.state, "pending");
   });
 });
 
@@ -951,10 +951,10 @@ test("no-marker clean cannot recover non-failed-findings history", async () => {
     });
 
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
     assert.equal(
       parseStateCommentBody(harness.findStateComment().body).lastStatus.state,
-      "failure",
+      "pending",
     );
   });
 });
@@ -2669,6 +2669,94 @@ test("a parent review appearing on whole-snapshot reload recovers a transient in
   });
 });
 
+test("a child comment appearing on reload recovers the symmetric parent-first race", async () => {
+  await withHarness(async (harness) => {
+    const parentReview = {
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T09:59:00Z",
+      body: "Parent review whose inline child is not visible yet.",
+      user: codexBotUser(),
+    };
+    harness.reviews.push(parentReview);
+    harness.afterSnapshotLoad(2, {
+      action: "pushReviewComment",
+      value: {
+        ...currentHeadInlineFinding(3001),
+        pull_request_review_id: parentReview.id,
+      },
+    });
+    harness.afterSnapshotLoad(2, {
+      action: "pushReviewThread",
+      value: unresolvedThread(3001),
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.snapshotLoads, 2);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(
+      parseStateCommentBody(harness.findStateComment().body).history.at(-1).outcome,
+      "failed_findings",
+    );
+  });
+});
+
+test("a persistent newest COMMENTED parent without children is malformed after one reload", async () => {
+  await withHarness(async (harness) => {
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:00Z",
+      body: "Parent review whose inline child never became visible.",
+      user: codexBotUser(),
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.snapshotLoads, 2);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /unrecognized Codex terminal pull-request-review format/);
+  });
+});
+
+test("a newer clean supersedes an older persistent COMMENTED parent without children", async () => {
+  await withHarness(async (harness) => {
+    harness.seedSuccessfulState({ providerId: 2001 });
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T09:59:00Z",
+      body: "Older parent review whose inline child never became visible.",
+      user: codexBotUser(),
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.snapshotLoads, 4);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
 test("a persistently missing parent review leaves the complete snapshot pending", async () => {
   await withHarness(async (harness) => {
     harness.reviewComments.push({
@@ -2890,6 +2978,59 @@ test("final success reuses its cached live-status read for dedupe and repair", a
     assert.equal(statusReads(harness), 4);
     assert.equal(successStatusWrites(harness), 1);
     assert.equal(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
+test("success dedupe ignores same-context statuses from external or missing producers", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "success",
+      creator: {
+        login: "external-integration[bot]",
+        type: "Bot",
+      },
+    });
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: codexCleanComment(2001),
+      },
+      env: {
+        TRUSTED_COMMENT_LOGINS:
+          "github-actions[bot],external-integration[bot]",
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(statusReads(harness), 1);
+    assert.equal(successStatusWrites(harness), 1);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+  });
+
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "success",
+      creator: null,
+    });
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: codexCleanComment(2001),
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 1);
   });
 });
 
@@ -3138,6 +3279,50 @@ test("an unauthorized clean actively demotes a live success to pending", async (
     assert.equal(result.code, 0, result.stderr);
     assert.equal(successStatusWrites(harness), 0);
     assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(parseStateCommentBody(harness.findStateComment().body).lastStatus.state, "pending");
+  });
+});
+
+test("unauthorized clean demotion ignores a newer external pending status", async () => {
+  await withHarness(async (harness) => {
+    harness.seedSuccessfulState();
+    harness.issueComments = harness.issueComments.filter((comment) => comment.id !== 1999);
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.commitStatuses.push(
+      {
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "pending",
+        creator: {
+          login: "external-integration[bot]",
+          type: "Bot",
+        },
+      },
+      {
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "success",
+        creator: {
+          login: "github-actions[bot]",
+          type: "Bot",
+        },
+      },
+    );
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+      env: {
+        TRUSTED_COMMENT_LOGINS:
+          "github-actions[bot],external-integration[bot]",
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(
+      harness.statuses.map((status) => status.body.state),
+      ["pending"],
+    );
     assert.equal(parseStateCommentBody(harness.findStateComment().body).lastStatus.state, "pending");
   });
 });

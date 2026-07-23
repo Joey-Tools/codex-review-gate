@@ -1324,7 +1324,11 @@ async function recoverAuthorizationPersistenceFence(state, stateComment, snapsho
 
 async function demoteUnauthorizedCleanIfNeeded(state, stateComment) {
   const liveStatus = await loadLatestGateStatus();
-  if (!liveStatus.readFailed && liveStatus.latest?.state !== "success") {
+  if (
+    !liveStatus.readFailed &&
+    liveStatus.latest &&
+    liveStatus.latest.state !== "success"
+  ) {
     return { state, stateComment };
   }
 
@@ -1481,7 +1485,9 @@ async function saveState(state, stateComment) {
 
 async function loadSnapshot() {
   for (let attempt = 1; attempt <= MAX_WHOLE_SNAPSHOT_ATTEMPTS; attempt += 1) {
-    const snapshot = await loadSnapshotOnce();
+    const snapshot = await loadSnapshotOnce({
+      allowMissingReviewChildTransient: attempt < MAX_WHOLE_SNAPSHOT_ATTEMPTS,
+    });
     if (
       snapshot.providerResult.kind === "malformed" ||
       snapshot.evidenceErrors.length > 0 ||
@@ -1509,7 +1515,7 @@ async function loadSnapshot() {
   throw new Error("whole-snapshot reconciliation exceeded its retry budget");
 }
 
-async function loadSnapshotOnce() {
+async function loadSnapshotOnce({ allowMissingReviewChildTransient = false } = {}) {
   const [comments, issueReactions, reviewComments, reviews, reviewThreads] = await Promise.all([
     paginate(`${repoPath}/issues/${activePrNumber}/comments`, { per_page: "100" }),
     paginate(`${repoPath}/issues/${activePrNumber}/reactions`, { per_page: "100" }),
@@ -1527,6 +1533,7 @@ async function loadSnapshotOnce() {
     reviewComments,
     reviews,
     reviewThreads,
+    allowMissingReviewChildTransient,
   });
   const reactions = summarizeCodexSignalReactions(
     issueReactions,
@@ -1561,7 +1568,13 @@ async function loadSnapshotOnce() {
   };
 }
 
-async function buildCurrentReviewEvidence({ comments, reviewComments, reviews, reviewThreads }) {
+async function buildCurrentReviewEvidence({
+  comments,
+  reviewComments,
+  reviews,
+  reviewThreads,
+  allowMissingReviewChildTransient = false,
+}) {
   const inlineParentReviewIds = new Set(
     reviewComments
       .map((comment) => comment.pull_request_review_id)
@@ -1575,6 +1588,7 @@ async function buildCurrentReviewEvidence({ comments, reviewComments, reviews, r
     config.codexBotLogins,
     statusSha,
   );
+  const parentReviewTransientErrors = [];
   const artifacts = [
     ...comments.map((comment) =>
       parseCodexIssueCommentArtifact(comment, {
@@ -1591,11 +1605,24 @@ async function buildCurrentReviewEvidence({ comments, reviewComments, reviews, r
       ) {
         return null;
       }
-      return parseCodexReviewArtifact(review, {
+      const artifact = parseCodexReviewArtifact(review, {
         owner: repo.owner,
         repo: repo.name,
         botLogins: config.codexBotLogins,
       });
+      if (
+        allowMissingReviewChildTransient &&
+        review.state === "COMMENTED" &&
+        !inlineParentReviewIds.has(String(review.id)) &&
+        artifact?.kind === "malformed" &&
+        artifact.reason === "unrecognized Codex terminal pull-request-review format"
+      ) {
+        parentReviewTransientErrors.push(
+          `COMMENTED review ${review.id} has no loaded child review comment`,
+        );
+        return null;
+      }
+      return artifact;
     }),
   ].filter(Boolean);
   const providerResult = await selectCurrentHeadProviderResult(artifacts);
@@ -1610,7 +1637,10 @@ async function buildCurrentReviewEvidence({ comments, reviewComments, reviews, r
   return {
     providerResult,
     errors: threadFindings.errors,
-    transientErrors: threadFindings.transientErrors,
+    transientErrors: [
+      ...threadFindings.transientErrors,
+      ...parentReviewTransientErrors,
+    ],
     findings: {
       count: threadFindings.count + providerFindings.count,
       ids: [...threadFindings.ids, ...providerFindings.ids],
@@ -2093,7 +2123,12 @@ async function loadLatestGateStatus() {
       { per_page: "100" },
     );
     return {
-      latest: statuses.find((status) => status.context === STATUS_CONTEXT) || null,
+      latest:
+        statuses.find((status) =>
+          status.context === STATUS_CONTEXT &&
+          status.creator?.type === "Bot" &&
+          status.creator?.login === "github-actions[bot]",
+        ) || null,
       readFailed: false,
     };
   } catch (error) {
