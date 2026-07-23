@@ -498,6 +498,42 @@ export function parseCodexReviewArtifact(
   };
 }
 
+export function codexInlineParentReviewBodyHasClosedGrammar(review) {
+  if (review?.state !== "COMMENTED" || !isFullCommitSha(review?.commit_id)) {
+    return false;
+  }
+
+  const body = normalizeCodexCommentBody(review.body);
+  if (!body || body.length > 5_000) {
+    return false;
+  }
+  const lines = body
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (
+    lines[0] !== "### 💡 Codex Review" ||
+    lines[1] !== "Here are some automated review suggestions for this pull request."
+  ) {
+    return false;
+  }
+
+  const reviewedCommit = /^\*\*Reviewed commit:\*\* `([0-9a-f]{10}|[0-9a-f]{40})`$/i.exec(
+    lines[2] || "",
+  )?.[1]?.toLowerCase();
+  const parentCommit = review.commit_id.toLowerCase();
+  if (
+    !reviewedCommit ||
+    (reviewedCommit.length === 40
+      ? reviewedCommit !== parentCommit
+      : !parentCommit.startsWith(reviewedCommit))
+  ) {
+    return false;
+  }
+
+  return officialCodexDisclosureHasClosedGrammar(lines.slice(3).join("\n"));
+}
+
 export function sortCodexArtifactsNewestFirst(artifacts) {
   return [...(artifacts || [])].sort((left, right) => {
     const byCreatedAt =

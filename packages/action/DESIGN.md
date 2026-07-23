@@ -505,6 +505,11 @@ Accepted provider evidence is channel-specific:
 - A pull request review binds through its full `commit_id`. An inline comment
   binds through its parent review and `original_commit_id`; the mutable
   relocated inline `commit_id` is not provenance.
+- A validated `COMMENTED` review whose body matches the closed official
+  inline-parent wrapper delegates its findings to the reconciled inline
+  comments. Its reviewed-commit marker must match the parent `commit_id`, but
+  the wrapper itself is not a standalone finding and does not require blob
+  links.
 - A top-level clean result must match the supported clean format and carry a
   reviewed-commit marker. A short marker is resolved through the repository
   commit API and must resolve uniquely to the full current-head SHA.

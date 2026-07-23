@@ -17,6 +17,7 @@ import {
   buildMarkerCommentBody,
   buildStateCommentBody,
   closeActiveMarker,
+  codexInlineParentReviewBodyHasClosedGrammar,
   collectCodexThreadEvidence,
   createInitialState,
   eventMayHaveReadOnlyDependabotToken,
@@ -2080,6 +2081,8 @@ async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
   const reviewCommentsResult = settled[2];
   const reviewsResult = settled[3];
   const reviewThreadsResult = settled[4];
+  let inlineParentEvidenceComplete = false;
+  let validatedCodexInlineParentReviewIds = new Set();
   if (
     reviewCommentsResult?.status === "fulfilled" &&
     reviewsResult?.status === "fulfilled" &&
@@ -2095,6 +2098,10 @@ async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
     if (threadEvidence.errors.length > 0) {
       return invalidProviderEvidenceFailure(threadEvidence.errors[0]);
     }
+    inlineParentEvidenceComplete = threadEvidence.transientErrors.length === 0;
+    validatedCodexInlineParentReviewIds = new Set(
+      threadEvidence.validatedCodexInlineParentReviewIds,
+    );
   }
 
   if (reviewsResult?.status === "fulfilled") {
@@ -2140,7 +2147,13 @@ async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
         repo: repo.name,
         botLogins: config.codexBotLogins,
       });
-      return commentedReviewMayBeEmptyInlineParent(review, artifact)
+      if (!commentedReviewMayBeInlineParent(review, artifact)) {
+        return artifact;
+      }
+      if (!inlineParentEvidenceComplete) {
+        return null;
+      }
+      return validatedCodexInlineParentReviewIds.has(String(review.id))
         ? null
         : artifact;
     }),
@@ -2163,11 +2176,16 @@ function invalidProviderEvidenceFailure(reason) {
   );
 }
 
-function commentedReviewMayBeEmptyInlineParent(review, artifact) {
+function commentedReviewMayBeInlineParent(review, artifact) {
+  if (review.state !== "COMMENTED") {
+    return false;
+  }
+  if (String(review.body || "").trim() === "") {
+    return artifact?.reason === "unrecognized Codex terminal pull-request-review format";
+  }
   return (
-    review.state === "COMMENTED" &&
-    String(review.body || "").trim() === "" &&
-    artifact?.reason === "unrecognized Codex terminal pull-request-review format"
+    artifact?.reason === "Codex finding must contain only exact full-SHA github.com blob links" &&
+    codexInlineParentReviewBodyHasClosedGrammar(review)
   );
 }
 
@@ -2206,14 +2224,20 @@ async function buildCurrentReviewEvidence({
       });
       if (
         validatedCodexInlineParentReviewIds.has(String(review.id)) &&
-        commentedReviewMayBeEmptyInlineParent(review, artifact)
+        commentedReviewMayBeInlineParent(review, artifact)
+      ) {
+        return null;
+      }
+      if (
+        threadFindings.transientErrors.length > 0 &&
+        commentedReviewMayBeInlineParent(review, artifact)
       ) {
         return null;
       }
       if (
         allowMissingReviewChildTransient &&
         !validatedCodexInlineParentReviewIds.has(String(review.id)) &&
-        commentedReviewMayBeEmptyInlineParent(review, artifact)
+        commentedReviewMayBeInlineParent(review, artifact)
       ) {
         parentReviewTransientErrors.push(
           `COMMENTED review ${review.id} has no loaded child review comment`,

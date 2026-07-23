@@ -15,6 +15,7 @@ import {
   codexAutoReviewLooksOngoing,
   collectCurrentHeadCodexFindings,
   collectUnresolvedCodexThreadFindings,
+  codexInlineParentReviewBodyHasClosedGrammar,
   decideBootstrapProgress,
   eventMayHaveReadOnlyDependabotToken,
   eventModeHandlesEvent,
@@ -125,6 +126,19 @@ function officialCodexDisclosure() {
     "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
     "",
     "</details>",
+  ].join("\n");
+}
+
+function officialInlineParentReviewBody(commitRef = FULL_SHA_A.slice(0, 10)) {
+  return [
+    "### 💡 Codex Review",
+    "",
+    "Here are some automated review suggestions for this pull request.",
+    "",
+    `**Reviewed commit:** \`${commitRef}\``,
+    "    ",
+    "",
+    officialCodexDisclosure(),
   ].join("\n");
 }
 
@@ -1483,6 +1497,43 @@ test("accepts a Bot-authored clean review bound to a full parent commit", () => 
       kind: "clean",
       headSha: FULL_SHA_A,
     },
+  );
+});
+
+test("recognizes only the closed official inline-parent review wrapper", () => {
+  const review = liveCodexReview({
+    state: "COMMENTED",
+    body: officialInlineParentReviewBody(),
+  });
+
+  assert.equal(codexInlineParentReviewBodyHasClosedGrammar(review), true);
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar({
+      ...review,
+      body: officialInlineParentReviewBody(FULL_SHA_B.slice(0, 10)),
+    }),
+    false,
+  );
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar({
+      ...review,
+      body: `${review.body}\nUnexpected terminal content`,
+    }),
+    false,
+  );
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar({
+      ...review,
+      body: "Unknown nonempty parent review body.",
+    }),
+    false,
+  );
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar({
+      ...review,
+      body: "### 💡 Codex Review",
+    }),
+    false,
   );
 });
 
