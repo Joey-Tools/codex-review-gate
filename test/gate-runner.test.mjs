@@ -2137,6 +2137,70 @@ test("scheduled stateless preflight skips unrelated evidence failures without wr
   });
 });
 
+test("scheduled stateless preflight skips PR detail failures without writes", async () => {
+  await withHarness(async (harness) => {
+    const pullPath =
+      `/repos/${harness.owner}/${harness.repo}/pulls/${harness.prNumber}`;
+    harness.routeFaults[`GET ${pullPath}`] = [{
+      status: 422,
+      body: { message: "PR detail should not be requested" },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+    assert.equal(
+      harness.requestLog.some((entry) =>
+        entry.method === "GET" && entry.path === pullPath),
+      false,
+    );
+  });
+});
+
+test("scheduled stateful preflight fails closed when PR detail loading fails", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:55:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    const pullPath =
+      `/repos/${harness.owner}/${harness.repo}/pulls/${harness.prNumber}`;
+    harness.routeFaults[`GET ${pullPath}`] = [{
+      status: 422,
+      body: { message: "deterministic PR detail failure" },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /deterministic PR detail failure/);
+    assert.equal(harness.statuses.at(-1).sha, HEAD_SHA);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.equal(
+      harness.requestLog.some((entry) =>
+        entry.method === "GET" && entry.path === pullPath),
+      true,
+    );
+  });
+});
+
 test("scheduled preflight paginates to trusted state and reuses those comments", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({

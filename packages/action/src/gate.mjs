@@ -289,11 +289,15 @@ async function scanOpenPullRequests(trigger) {
 
   for (const pullRequest of pullRequests) {
     try {
-      await processPullRequest(pullRequest.number, {
-        ...trigger,
-        allowCreateMarker: trigger.allowCreateMarker === true,
-        scan: true,
-      });
+      await processPullRequest(
+        pullRequest.number,
+        {
+          ...trigger,
+          allowCreateMarker: trigger.allowCreateMarker === true,
+          scan: true,
+        },
+        pullRequest,
+      );
     } catch (error) {
       failures += 1;
       console.error(`failed to process PR #${pullRequest.number}: ${error.stack || error.message}`);
@@ -308,6 +312,14 @@ async function scanOpenPullRequests(trigger) {
 }
 
 async function failClosedScannedPullRequest(pullRequest, error) {
+  if (!statusReady) {
+    console.error(
+      `skipping ${STATUS_CONTEXT} failure write for PR #${pullRequest.number}; ` +
+        "scheduled write eligibility was not established",
+    );
+    return;
+  }
+
   activePrNumber = pullRequest.number;
   statusSha = statusSha || pullRequest.head?.sha || "";
   statusReady = false;
@@ -332,11 +344,46 @@ async function failClosedScannedPullRequest(pullRequest, error) {
   }
 }
 
-async function processPullRequest(prNumber, trigger) {
+async function processPullRequest(prNumber, trigger, scanCandidate = null) {
   activePrNumber = prNumber;
   statusSha = "";
   statusReady = false;
   evidenceWorkBudget = createEvidenceWorkBudget();
+
+  const dependabotScheduleRecovery = trigger.kind === "scan" &&
+    !trigger.allowCreateMarker &&
+    pullRequestIsDependabot(scanCandidate);
+
+  let initialComments = null;
+  let initialSnapshotBudget = null;
+  if (
+    trigger.kind === "scan" &&
+    !trigger.allowCreateMarker &&
+    !dependabotScheduleRecovery
+  ) {
+    initialSnapshotBudget = createEvidenceSnapshotBudget();
+    initialComments = await paginate(
+      `${repoPath}/issues/${activePrNumber}/comments`,
+      { per_page: "100" },
+      { evidenceBudget: initialSnapshotBudget },
+    );
+    if (
+      !hasTrustedGateStateOrMarker(
+        initialComments,
+        config.trustedCommentLogins,
+      )
+    ) {
+      console.log(
+        `PR #${activePrNumber} has no trusted gate state or marker; skipping scheduled scan.`,
+      );
+      return;
+    }
+  }
+
+  if (trigger.kind === "scan" && scanCandidate?.head?.sha) {
+    statusSha = scanCandidate.head.sha;
+    statusReady = true;
+  }
 
   const pullRequest = await loadPullRequest();
   statusSha = pullRequest.head.sha;
@@ -368,36 +415,6 @@ async function processPullRequest(prNumber, trigger) {
     await setCommitStatus("pending", "Draft PR is waiting for Codex review gate");
     console.log(`PR #${activePrNumber} is draft; leaving ${STATUS_CONTEXT} pending.`);
     return;
-  }
-
-  const dependabotScheduleRecovery = trigger.kind === "scan" &&
-    !trigger.allowCreateMarker &&
-    pullRequestIsDependabot(pullRequest);
-
-  let initialComments = null;
-  let initialSnapshotBudget = null;
-  if (
-    trigger.kind === "scan" &&
-    !trigger.allowCreateMarker &&
-    !dependabotScheduleRecovery
-  ) {
-    initialSnapshotBudget = createEvidenceSnapshotBudget();
-    initialComments = await paginate(
-      `${repoPath}/issues/${activePrNumber}/comments`,
-      { per_page: "100" },
-      { evidenceBudget: initialSnapshotBudget },
-    );
-    if (
-      !hasTrustedGateStateOrMarker(
-        initialComments,
-        config.trustedCommentLogins,
-      )
-    ) {
-      console.log(
-        `PR #${activePrNumber} has no trusted gate state or marker; skipping scheduled scan.`,
-      );
-      return;
-    }
   }
 
   const snapshot = await loadSnapshot({
