@@ -11,9 +11,10 @@ tests, release workflows, and licensing after creating a repository from it.
 - this README
 
 The workflow writes the `codex/review-gate` status check and requests a controlled
-Codex review marker for each ready pull request head. It pins
-`JoeyTeng/codex-review-gate-action` to the v1.2.1 commit SHA so privileged
-`pull_request_target` runs do not depend on a movable tag.
+Codex review marker for each ready pull request head. Because the repository owner
+also maintains `JoeyTeng/codex-review-gate-action`, it uses the floating major
+`@v1` to receive compatible automatic upgrades. This is the explicitly accepted
+policy for this privileged `pull_request_target` workflow.
 
 ## After Creating a Repository
 
