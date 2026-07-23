@@ -679,6 +679,14 @@ test("does not retry marker comment creation requests", () => {
 test("honors Retry-After response delays", () => {
   assert.equal(retryAfterDelayMs("2", 100), 2000);
   assert.equal(retryAfterDelayMs("invalid", 100), 100);
+  assert.equal(retryAfterDelayMs(" ", 100), 100);
+  assert.equal(retryAfterDelayMs("-1", 100), 100);
+  assert.equal(retryAfterDelayMs("1.5", 100), 100);
+  assert.equal(retryAfterDelayMs("1e2", 100), 100);
+  assert.equal(
+    retryAfterDelayMs("Wed, 21 Oct 2015 07:28:00 GMT", 100),
+    0,
+  );
 });
 
 test("parses JSON response text and accepts empty response bodies", () => {
@@ -860,6 +868,34 @@ test("accepts a live-style clean Codex issue-comment artifact with a 10-characte
     kind: "clean",
     commitRef: "abcdef1234",
   });
+});
+
+test("requires canonical positive integer IDs for provider terminal artifacts", () => {
+  const invalidIds = [
+    undefined,
+    null,
+    0,
+    -1,
+    1.5,
+    "101",
+    Number.MAX_SAFE_INTEGER + 1,
+  ];
+
+  for (const id of invalidIds) {
+    const comment = liveCodexIssueComment([
+      "Codex Review: Didn't find any major issues.",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+    ].join("\n"), { id });
+    const review = liveCodexReview({ id });
+    for (const artifact of [
+      parseCodexIssueCommentArtifact(comment, { owner: "owner", repo: "repo" }),
+      parseCodexReviewArtifact(review, { owner: "owner", repo: "repo" }),
+    ]) {
+      assert.equal(artifact.kind, "malformed", String(id));
+      assert.match(artifact.reason, /valid positive integer id/);
+    }
+  }
 });
 
 test("accepts observed clean taglines and the exact official disclosure", () => {
@@ -1426,7 +1462,79 @@ test("matches unresolved Codex threads with review-comment IDs above signed 32-b
   });
 });
 
-test("skips resolved historical threads before validating stale or missing identities", () => {
+test("rejects duplicate REST parent review IDs instead of applying last-wins mapping", () => {
+  const result = collectUnresolvedCodexThreadFindings(
+    [{
+      id: 930,
+      node_id: reviewCommentNodeId(930),
+      path: "src/duplicate-parent.mjs",
+      line: 8,
+      original_commit_id: FULL_SHA_A,
+      pull_request_review_id: 430,
+      user: {
+        login: "chatgpt-codex-connector[bot]",
+        type: "Bot",
+      },
+    }],
+    [
+      liveCodexReview({
+        id: 430,
+        state: "COMMENTED",
+        commit_id: FULL_SHA_A,
+      }),
+      liveCodexReview({
+        id: 430,
+        state: "COMMENTED",
+        commit_id: FULL_SHA_B,
+      }),
+    ],
+    [{
+      id: "duplicate-parent-thread",
+      isResolved: false,
+      comments: { nodes: [graphqlReviewComment(930)] },
+    }],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.equal(result.count, 1);
+  assert.deepEqual(result.errors, [
+    "REST review snapshot contains duplicate numeric id 430",
+  ]);
+});
+
+test("requires canonical string GraphQL fullDatabaseId values even for resolved threads", () => {
+  for (const fullDatabaseId of [930, "0930", "-1", "1.5"]) {
+    const result = collectUnresolvedCodexThreadFindings(
+      [{
+        id: 930,
+        node_id: reviewCommentNodeId(930),
+        user: { login: "octocat", type: "User" },
+      }],
+      [],
+      [{
+        id: "resolved-id-schema-thread",
+        isResolved: true,
+        comments: {
+          nodes: [{
+            id: reviewCommentNodeId(930),
+            fullDatabaseId,
+          }],
+        },
+      }],
+      undefined,
+      FULL_SHA_A,
+    );
+
+    assert.equal(result.count, 0, String(fullDatabaseId));
+    assert.deepEqual(result.errors, [
+      `resolved review thread resolved-id-schema-thread contains GraphQL comment ` +
+        `${reviewCommentNodeId(930)} without a valid fullDatabaseId`,
+    ]);
+  }
+});
+
+test("resolved historical threads still require complete trusted identities", () => {
   const result = collectUnresolvedCodexThreadFindings(
     [
       {
@@ -1456,7 +1564,7 @@ test("skips resolved historical threads before validating stale or missing ident
     count: 0,
     ids: [],
     samples: [],
-    errors: [],
+    errors: ["review comment 302 author is not a Bot"],
     transientErrors: [],
   });
 });
@@ -1908,6 +2016,9 @@ test("rejects duplicate and conflicting GraphQL opaque and full identities", () 
       `GraphQL review comment opaque id ${reviewCommentNodeId(920)} ` +
         "appears in multiple review threads",
       "GraphQL review comment fullDatabaseId 920 appears in multiple review threads",
+      `resolved review thread thread-b maps GraphQL fullDatabaseId 920 to opaque id ` +
+        `${reviewCommentNodeId(922)}, but REST maps it to conflicting node_id ` +
+        `${reviewCommentNodeId(920)}`,
     ],
     transientErrors: [],
   });

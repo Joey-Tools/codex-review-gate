@@ -166,16 +166,20 @@ export function restRequestRetryAllowed(method, path, status) {
 }
 
 export function retryAfterDelayMs(retryAfter, fallbackMs) {
-  if (!retryAfter) {
+  if (typeof retryAfter !== "string" || retryAfter.length === 0) {
     return fallbackMs;
   }
 
-  const retryAfterSeconds = Number(retryAfter);
-  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
-    return retryAfterSeconds * 1000;
+  if (/^[0-9]+$/.test(retryAfter)) {
+    const retryAfterSeconds = Number(retryAfter);
+    return Number.isSafeInteger(retryAfterSeconds)
+      ? retryAfterSeconds * 1000
+      : Number.MAX_SAFE_INTEGER;
   }
 
-  const retryAt = Date.parse(retryAfter);
+  const retryAt = /^[A-Za-z]{3}, .+ GMT$/.test(retryAfter)
+    ? Date.parse(retryAfter)
+    : Number.NaN;
   if (!Number.isNaN(retryAt)) {
     return Math.max(0, retryAt - Date.now());
   }
@@ -215,6 +219,9 @@ export function parseCodexIssueCommentArtifact(
   }
 
   const base = providerArtifactIdentity(comment, "issue-comment");
+  if (base.kind === "malformed") {
+    return base;
+  }
   if (!isTrustedCodexRestUser(comment.user, botLogins)) {
     return {
       ...base,
@@ -317,6 +324,9 @@ export function parseCodexReviewArtifact(
     },
     "pull-request-review",
   );
+  if (base.kind === "malformed") {
+    return base;
+  }
   if (!isTrustedCodexRestUser(review.user, botLogins)) {
     return {
       ...base,
@@ -404,19 +414,31 @@ export function collectUnresolvedCodexThreadFindings(
   headSha = "",
 ) {
   const reviewCommentsList = reviewComments || [];
-  const reviewById = new Map((reviews || []).map((review) => [String(review.id), review]));
+  const errors = [];
+  const transientErrors = [];
+  const reviewById = new Map();
   const restCommentByNodeId = new Map();
   const restCommentByDatabaseId = new Map();
   const threadByNodeId = new Map();
   const graphqlCommentByDatabaseId = new Map();
   const reviewThreadIds = new Set();
+  const verifiedRestCommentNodeIds = new Set();
   const findingByThreadId = new Map();
-  const errors = [];
-  const transientErrors = [];
+
+  for (const review of reviews || []) {
+    const reviewId = normalizeRestDatabaseId(review?.id);
+    if (!reviewId) {
+      errors.push("REST review snapshot contains a review without a valid numeric id");
+    } else if (reviewById.has(reviewId)) {
+      errors.push(`REST review snapshot contains duplicate numeric id ${reviewId}`);
+    } else {
+      reviewById.set(reviewId, review);
+    }
+  }
 
   for (const comment of reviewCommentsList) {
-    const databaseId = normalizeReviewCommentDatabaseId(comment?.id);
-    const nodeId = normalizeReviewCommentNodeId(comment?.node_id);
+    const databaseId = normalizeRestDatabaseId(comment?.id);
+    const nodeId = normalizeOpaqueNodeId(comment?.node_id);
     if (!databaseId) {
       errors.push("REST review-comment snapshot contains a comment without a valid numeric id");
     } else if (restCommentByDatabaseId.has(databaseId)) {
@@ -436,7 +458,7 @@ export function collectUnresolvedCodexThreadFindings(
   }
 
   for (const thread of reviewThreads || []) {
-    const threadId = normalizeReviewCommentNodeId(thread?.id);
+    const threadId = normalizeOpaqueNodeId(thread?.id);
     if (!threadId) {
       errors.push(
         "GraphQL review-thread snapshot contains a thread without a valid opaque id",
@@ -453,56 +475,50 @@ export function collectUnresolvedCodexThreadFindings(
 
     const comments = thread?.comments?.nodes || [];
     const unresolved = thread?.isResolved !== true;
+    const threadLabel = unresolved
+      ? "unresolved review thread"
+      : "resolved review thread";
     if (unresolved && comments.length === 0) {
       transientErrors.push(
         `unresolved review thread ${threadId} has no loaded GraphQL comments`,
       );
     }
     for (const graphqlComment of comments) {
-      const nodeId = normalizeReviewCommentNodeId(graphqlComment?.id);
-      const databaseId = normalizeReviewCommentDatabaseId(
+      const nodeId = normalizeOpaqueNodeId(graphqlComment?.id);
+      const databaseId = normalizeGraphqlDatabaseId(
         graphqlComment?.fullDatabaseId,
       );
       if (!nodeId) {
-        if (unresolved) {
-          errors.push(
-            `unresolved review thread ${threadId} contains a GraphQL comment ` +
-              "without a valid opaque id",
-          );
-        }
+        errors.push(
+          `${threadLabel} ${threadId} contains a GraphQL comment without a valid opaque id`,
+        );
         continue;
       }
 
       const priorNode = threadByNodeId.get(nodeId);
       if (priorNode) {
-        if (unresolved || priorNode.unresolved) {
-          const priorThreadId = String(priorNode.thread.id || "unknown");
-          errors.push(priorThreadId === threadId
-            ? `GraphQL review comment opaque id ${nodeId} appears more than once in thread ${threadId}`
-            : `GraphQL review comment opaque id ${nodeId} appears in multiple review threads`);
-        }
+        const priorThreadId = String(priorNode.thread.id || "unknown");
+        errors.push(priorThreadId === threadId
+          ? `GraphQL review comment opaque id ${nodeId} appears more than once in thread ${threadId}`
+          : `GraphQL review comment opaque id ${nodeId} appears in multiple review threads`);
         continue;
       }
       threadByNodeId.set(nodeId, { thread, unresolved });
 
       if (!databaseId) {
-        if (unresolved) {
-          errors.push(
-            `unresolved review thread ${threadId} contains GraphQL comment ${nodeId} ` +
-              "without a valid fullDatabaseId",
-          );
-        }
+        errors.push(
+          `${threadLabel} ${threadId} contains GraphQL comment ${nodeId} ` +
+            "without a valid fullDatabaseId",
+        );
         continue;
       }
 
       const priorDatabaseId = graphqlCommentByDatabaseId.get(databaseId);
       if (priorDatabaseId) {
-        if (unresolved || priorDatabaseId.unresolved) {
-          const priorThreadId = String(priorDatabaseId.thread.id || "unknown");
-          errors.push(priorThreadId === threadId
-            ? `GraphQL review comment fullDatabaseId ${databaseId} appears more than once in thread ${threadId}`
-            : `GraphQL review comment fullDatabaseId ${databaseId} appears in multiple review threads`);
-        }
+        const priorThreadId = String(priorDatabaseId.thread.id || "unknown");
+        errors.push(priorThreadId === threadId
+          ? `GraphQL review comment fullDatabaseId ${databaseId} appears more than once in thread ${threadId}`
+          : `GraphQL review comment fullDatabaseId ${databaseId} appears in multiple review threads`);
       } else {
         graphqlCommentByDatabaseId.set(databaseId, {
           thread,
@@ -511,34 +527,33 @@ export function collectUnresolvedCodexThreadFindings(
         });
       }
 
-      if (!unresolved) {
-        continue;
-      }
       const restComment = restCommentByNodeId.get(nodeId);
       if (!restComment) {
         const conflictingRestComment = restCommentByDatabaseId.get(databaseId);
         if (conflictingRestComment) {
           errors.push(
-            `unresolved review thread ${threadId} maps GraphQL fullDatabaseId ` +
+            `${threadLabel} ${threadId} maps GraphQL fullDatabaseId ` +
               `${databaseId} to opaque id ${nodeId}, but REST maps it to conflicting ` +
-              `node_id ${normalizeReviewCommentNodeId(conflictingRestComment.node_id) || "<invalid>"}`,
+              `node_id ${normalizeOpaqueNodeId(conflictingRestComment.node_id) || "<invalid>"}`,
           );
           continue;
         }
         transientErrors.push(
-          `unresolved review thread ${threadId} contains GraphQL comment ${nodeId} ` +
+          `${threadLabel} ${threadId} contains GraphQL comment ${nodeId} ` +
             "missing from the complete REST review-comment snapshot",
         );
         continue;
       }
-      const restDatabaseId = normalizeReviewCommentDatabaseId(restComment.id);
+      const restDatabaseId = normalizeRestDatabaseId(restComment.id);
       if (restDatabaseId !== databaseId) {
         errors.push(
-          `unresolved review thread ${threadId} maps GraphQL comment ${nodeId} ` +
+          `${threadLabel} ${threadId} maps GraphQL comment ${nodeId} ` +
             `fullDatabaseId ${databaseId} to conflicting REST numeric id ` +
             `${restDatabaseId || "<invalid>"}`,
         );
+        continue;
       }
+      verifiedRestCommentNodeIds.add(nodeId);
     }
   }
 
@@ -547,21 +562,21 @@ export function collectUnresolvedCodexThreadFindings(
       continue;
     }
 
-    const nodeId = normalizeReviewCommentNodeId(comment.node_id);
+    const nodeId = normalizeOpaqueNodeId(comment.node_id);
     if (!nodeId) {
       continue;
     }
     const thread = threadByNodeId.get(nodeId)?.thread;
-    if (thread?.isResolved) {
-      continue;
-    }
     if (!thread) {
       transientErrors.push(`review comment ${comment.id} has no loaded review thread`);
       continue;
     }
+    if (!verifiedRestCommentNodeIds.has(nodeId)) {
+      continue;
+    }
 
     const threadId = String(thread.id || `comment:${comment.id}`);
-    if (!findingByThreadId.has(threadId)) {
+    if (!thread.isResolved && !findingByThreadId.has(threadId)) {
       const location = [
         thread.path || comment.path,
         thread.line || comment.line || comment.original_line,
@@ -578,7 +593,7 @@ export function collectUnresolvedCodexThreadFindings(
     }
 
     const reviewId = comment.pull_request_review_id;
-    const normalizedReviewId = normalizeReviewCommentDatabaseId(reviewId);
+    const normalizedReviewId = normalizeRestDatabaseId(reviewId);
     if (!normalizedReviewId) {
       errors.push(`review comment ${comment.id} has no valid parent review id`);
       continue;
@@ -601,6 +616,9 @@ export function collectUnresolvedCodexThreadFindings(
       continue;
     }
 
+    if (thread.isResolved) {
+      continue;
+    }
   }
 
   const findings = [...findingByThreadId.values()];
@@ -613,24 +631,27 @@ export function collectUnresolvedCodexThreadFindings(
   };
 }
 
-function normalizeReviewCommentNodeId(value) {
-  if (typeof value !== "string" || value.length === 0 || value.trim() !== value) {
+function normalizeOpaqueNodeId(value) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    /\s/.test(value)
+  ) {
     return null;
   }
   return value;
 }
 
-function normalizeReviewCommentDatabaseId(value) {
-  if (typeof value === "bigint") {
-    return value > 0n ? value.toString() : null;
-  }
-  if (typeof value === "number") {
-    return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
-  }
-  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) {
-    return null;
-  }
-  return BigInt(value).toString();
+function normalizeRestDatabaseId(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? String(value)
+    : null;
+}
+
+function normalizeGraphqlDatabaseId(value) {
+  return typeof value === "string" && /^[1-9][0-9]*$/.test(value)
+    ? value
+    : null;
 }
 
 export function isTrustedCommentAuthor(login, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
@@ -949,7 +970,7 @@ export function buildReviewThreadIndex(reviewThreads = []) {
   for (const thread of reviewThreads || []) {
     const comments = thread.comments?.nodes || [];
     for (const comment of comments) {
-      const databaseId = normalizeReviewCommentDatabaseId(comment.fullDatabaseId);
+      const databaseId = normalizeGraphqlDatabaseId(comment.fullDatabaseId);
       if (databaseId) {
         byCommentId.set(databaseId, thread);
       }
@@ -1021,21 +1042,33 @@ function safeDecodeURIComponent(value) {
 }
 
 function providerArtifactIdentity(value, source) {
+  const id = normalizeRestDatabaseId(value?.id);
+  if (!id) {
+    return {
+      source,
+      id: "invalid",
+      createdAt: value?.created_at || "",
+      url: value?.html_url || null,
+      kind: "malformed",
+      reason: `Codex ${source} does not have a valid positive integer id`,
+    };
+  }
   return {
     source,
-    id: String(value?.id ?? ""),
+    id,
     createdAt: value?.created_at || "",
     url: value?.html_url || null,
   };
 }
 
 function compareProviderArtifactIds(left, right) {
-  const leftNumber = Number(left);
-  const rightNumber = Number(right);
-  if (Number.isSafeInteger(leftNumber) && Number.isSafeInteger(rightNumber)) {
-    return leftNumber - rightNumber;
+  if (
+    !/^[1-9][0-9]*$/.test(String(left)) ||
+    !/^[1-9][0-9]*$/.test(String(right))
+  ) {
+    throw new Error("Codex provider artifacts cannot be ordered without canonical numeric ids");
   }
-  return String(left).localeCompare(String(right));
+  return Number(left) - Number(right);
 }
 
 function parseExactRepositoryBlobFindings(body, owner, repo) {

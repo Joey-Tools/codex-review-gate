@@ -51,6 +51,7 @@ import {
   reconcileStateWithMarkerComment,
   restRequestRetryAllowed,
   retryAfterDelayMs,
+  sameIssueCommentIdentity,
   selectLatestCodexCompletionComment,
   shouldCreateFreshHeadMarker,
   shouldSkipScheduledScanWithoutMarker,
@@ -147,7 +148,7 @@ const MAX_REQUEST_ATTEMPTS = 4;
 const MAX_WHOLE_SNAPSHOT_ATTEMPTS = 2;
 const MAX_REST_PAGES = 1_000;
 const MAX_GRAPHQL_PAGES = 1_000;
-const MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS = 10_000;
+const MAX_IN_PROCESS_RETRY_WAIT_MS = 10_000;
 const AUTHORIZATION_PERSISTENCE_FENCE_DESCRIPTION =
   "Authorization state persistence failed; fresh marker required";
 
@@ -418,6 +419,22 @@ async function processPullRequest(prNumber, trigger) {
   if (fenceRecovery.recovered) {
     stateNeedsSave = false;
   }
+  const legacyPassedMigration = migrateLegacyPassedState(
+    state,
+    snapshot,
+    isoNow(),
+  );
+  state = legacyPassedMigration.state;
+  stateNeedsFreshMarker =
+    stateNeedsFreshMarker || legacyPassedMigration.needsFreshMarker;
+  if (legacyPassedMigration.changed) {
+    savedStateComment = await saveAuthorizationCriticalState(
+      state,
+      savedStateComment,
+      "legacy passed-marker authorization lineage",
+    );
+    stateNeedsSave = false;
+  }
   state = migrateStateForEventDrivenDeadlines(state);
   stateNeedsFreshMarker = stateNeedsFreshMarker ||
     stateNeedsFreshMarkerAfterRecovery(state) ||
@@ -673,6 +690,107 @@ function migrateLegacyFailureState(
     }),
     changed: true,
     needsFreshMarker: true,
+  };
+}
+
+function migrateLegacyPassedState(state, snapshot, now) {
+  if (
+    state?.activeMarker ||
+    state?.statusHead !== statusSha
+  ) {
+    return { state, changed: false, needsFreshMarker: false };
+  }
+
+  const history = state.history || [];
+  const markerIndex = history.findLastIndex((marker) => marker.headSha === statusSha);
+  const marker = markerIndex >= 0 ? history[markerIndex] : null;
+  if (
+    !marker ||
+    (marker.outcome || marker.state) !== "passed" ||
+    marker.observedProviderResult
+  ) {
+    return { state, changed: false, needsFreshMarker: false };
+  }
+
+  const requireFreshMarker = () => ({
+    state,
+    changed: false,
+    needsFreshMarker: true,
+  });
+  if (
+    state?.lastStatus?.headSha !== statusSha ||
+    state?.lastStatus?.state !== "success"
+  ) {
+    return requireFreshMarker();
+  }
+  const providerResult = snapshot?.providerResult;
+  if (
+    snapshot?.findings?.count !== 0 ||
+    providerResult?.kind !== "clean" ||
+    providerResult.headSha !== statusSha.toLowerCase() ||
+    !trustedLiveMarkerMatches(marker, snapshot)
+  ) {
+    return requireFreshMarker();
+  }
+
+  let lineageMatches = false;
+  try {
+    if (marker.observedApprovedReview) {
+      const legacyReview = marker.observedApprovedReview;
+      lineageMatches =
+        providerResult.source === "pull-request-review" &&
+        String(providerResult.id) === String(legacyReview.id) &&
+        providerResult.createdAt === legacyReview.submittedAt &&
+        legacyReview.state === "APPROVED" &&
+        String(legacyReview.commitId || "").toLowerCase() === statusSha.toLowerCase() &&
+        hasNewReviewTransition(
+          marker.baseline?.approvedReview,
+          {
+            id: String(providerResult.id),
+            submittedAt: providerResult.createdAt,
+          },
+          marker.createdAt,
+        );
+    } else if (marker.observedCompletionComment) {
+      const legacyComment = marker.observedCompletionComment;
+      const currentComment = {
+        id: String(providerResult.id),
+        createdAt: providerResult.createdAt,
+      };
+      lineageMatches =
+        providerResult.source === "issue-comment" &&
+        sameIssueCommentIdentity(legacyComment, currentComment) &&
+        hasNewCompletionComment(
+          marker.baseline?.completionComment,
+          currentComment,
+          marker.createdAt,
+          { bufferSeconds: config.completionSignalBufferSeconds },
+        );
+    }
+  } catch {
+    return requireFreshMarker();
+  }
+
+  if (!lineageMatches) {
+    return requireFreshMarker();
+  }
+
+  return {
+    state: normalizeState({
+      ...state,
+      updatedAt: now,
+      history: history.map((candidate, index) =>
+        index === markerIndex
+          ? {
+              ...candidate,
+              observedProviderResult: providerResult,
+              authorizationLineageMigratedAt: now,
+            }
+          : candidate,
+      ),
+    }),
+    changed: true,
+    needsFreshMarker: false,
   };
 }
 
@@ -1734,6 +1852,23 @@ async function buildCurrentReviewEvidence({
 }
 
 async function selectCurrentHeadProviderResult(artifacts, evidenceBudget) {
+  const artifactIdentities = new Set();
+  for (const artifact of artifacts) {
+    if (!/^[1-9][0-9]*$/.test(String(artifact.id || ""))) {
+      continue;
+    }
+    const identity = `${artifact.source}:${artifact.id}`;
+    if (artifactIdentities.has(identity)) {
+      return {
+        kind: "malformed",
+        source: "provider-artifact-set",
+        id: identity,
+        reason: `Codex provider artifact identity ${identity} appears more than once`,
+      };
+    }
+    artifactIdentities.add(identity);
+  }
+
   let ordered;
   try {
     ordered = sortCodexArtifactsNewestFirst(artifacts);
@@ -2432,6 +2567,13 @@ async function loadReviewThreads(evidenceBudget) {
 }
 
 async function loadAllReviewThreadComments(thread, evidenceBudget) {
+  if (
+    typeof thread?.id !== "string" ||
+    thread.id.length === 0 ||
+    /\s/.test(thread.id)
+  ) {
+    throw new Error("GraphQL review thread does not have a valid opaque id");
+  }
   let connection = thread.comments;
   if (!connection) {
     throw new Error(`GraphQL comments query did not return a connection for thread ${thread.id}`);
@@ -2584,9 +2726,19 @@ async function request(
     }
 
     let explicitRateLimit = responseIsExplicitRateLimit(response);
-    let rateLimitRetryAfter = explicitRateLimit
-      ? boundedRateLimitRetryAfter(response)
-      : null;
+    let retryPlan = retryTransient && !response.ok
+      ? restResponseRetryPlan({
+          method,
+          path,
+          response,
+          explicitRateLimit,
+        })
+      : { kind: "unavailable" };
+    failIfRetryPlanExceedsBound(
+      retryPlan,
+      `${method} ${url.pathname}`,
+      { readOnly: method === "GET" },
+    );
     let data;
     try {
       data = parseJsonResponseText(text, `${method} ${url.pathname} (${response.status})`);
@@ -2596,18 +2748,12 @@ async function request(
         !response.ok &&
         retryTransient &&
         attempt < MAX_REQUEST_ATTEMPTS &&
-        restResponseRetryAllowed({
-          method,
-          path,
-          status: response.status,
-          explicitRateLimit,
-          rateLimitRetryAfter,
-        })
+        retryPlanAllowsRetry(retryPlan)
       ) {
         await sleepBeforeRetry(
           `retrying ${method} ${url.pathname} after ${response.status}: ${error.preview}`,
           attempt,
-          rateLimitRetryAfter,
+          retryPlan.kind === "delay" ? retryPlan.delayMs : null,
         );
         continue;
       }
@@ -2626,27 +2772,31 @@ async function request(
       throw error;
     }
     explicitRateLimit = responseIsExplicitRateLimit(response, data);
-    rateLimitRetryAfter = explicitRateLimit
-      ? boundedRateLimitRetryAfter(response)
-      : null;
+    retryPlan = retryTransient && !response.ok
+      ? restResponseRetryPlan({
+          method,
+          path,
+          response,
+          explicitRateLimit,
+        })
+      : { kind: "unavailable" };
+    failIfRetryPlanExceedsBound(
+      retryPlan,
+      `${method} ${url.pathname}`,
+      { readOnly: method === "GET" },
+    );
 
     if (!response.ok) {
       const message = data?.message || response.statusText;
       if (
         retryTransient &&
         attempt < MAX_REQUEST_ATTEMPTS &&
-        restResponseRetryAllowed({
-          method,
-          path,
-          status: response.status,
-          explicitRateLimit,
-          rateLimitRetryAfter,
-        })
+        retryPlanAllowsRetry(retryPlan)
       ) {
         await sleepBeforeRetry(
           `retrying ${method} ${url.pathname} after ${response.status}: ${message}`,
           attempt,
-          rateLimitRetryAfter,
+          retryPlan.kind === "delay" ? retryPlan.delayMs : null,
         );
         continue;
       }
@@ -2708,9 +2858,13 @@ async function graphqlRequest(
     }
 
     let explicitRateLimit = responseIsExplicitRateLimit(response);
-    let rateLimitRetryAfter = explicitRateLimit
-      ? boundedRateLimitRetryAfter(response)
-      : null;
+    let retryPlan = !response.ok &&
+      (isRetryableHttpStatus(response.status) || explicitRateLimit)
+      ? responseRetryPlan(response, { explicitRateLimit })
+      : { kind: "unavailable" };
+    failIfRetryPlanExceedsBound(retryPlan, "GraphQL request", {
+      readOnly: true,
+    });
     let payload;
     try {
       payload = parseJsonResponseText(
@@ -2722,18 +2876,12 @@ async function graphqlRequest(
         error instanceof NonJsonResponseError &&
         !response.ok &&
         attempt < MAX_REQUEST_ATTEMPTS &&
-        (
-          (
-            isRetryableHttpStatus(response.status) &&
-            !explicitRateLimit
-          ) ||
-          (explicitRateLimit && rateLimitRetryAfter !== null)
-        )
+        retryPlanAllowsRetry(retryPlan)
       ) {
         await sleepBeforeRetry(
           `retrying GraphQL request after ${response.status}: ${error.preview}`,
           attempt,
-          rateLimitRetryAfter,
+          retryPlan.kind === "delay" ? retryPlan.delayMs : null,
         );
         continue;
       }
@@ -2753,26 +2901,27 @@ async function graphqlRequest(
     explicitRateLimit =
       responseIsExplicitRateLimit(response, payload) ||
       graphqlErrorsAreExplicitRateLimit(payload?.errors || []);
-    rateLimitRetryAfter = explicitRateLimit
-      ? boundedRateLimitRetryAfter(response)
-      : null;
+    retryPlan =
+      (
+        (!response.ok && isRetryableHttpStatus(response.status)) ||
+        explicitRateLimit
+      )
+      ? responseRetryPlan(response, { explicitRateLimit })
+      : { kind: "unavailable" };
+    failIfRetryPlanExceedsBound(retryPlan, "GraphQL request", {
+      readOnly: true,
+    });
 
     if (!response.ok) {
       const message = payload?.message || response.statusText;
       if (
         attempt < MAX_REQUEST_ATTEMPTS &&
-        (
-          (
-            isRetryableHttpStatus(response.status) &&
-            !explicitRateLimit
-          ) ||
-          (explicitRateLimit && rateLimitRetryAfter !== null)
-        )
+        retryPlanAllowsRetry(retryPlan)
       ) {
         await sleepBeforeRetry(
           `retrying GraphQL request after ${response.status}: ${message}`,
           attempt,
-          rateLimitRetryAfter,
+          retryPlan.kind === "delay" ? retryPlan.delayMs : null,
         );
         continue;
       }
@@ -2788,15 +2937,20 @@ async function graphqlRequest(
     if (payload?.errors?.length) {
       const message = payload.errors.map((error) => error.message).join("; ");
       if (graphqlErrorsAreExplicitRateLimit(payload.errors)) {
-        rateLimitRetryAfter = boundedRateLimitRetryAfter(response);
+        retryPlan = responseRetryPlan(response, {
+          explicitRateLimit: true,
+        });
+        failIfRetryPlanExceedsBound(retryPlan, "GraphQL rate limit", {
+          readOnly: true,
+        });
         if (
           attempt < MAX_REQUEST_ATTEMPTS &&
-          rateLimitRetryAfter !== null
+          retryPlanAllowsRetry(retryPlan)
         ) {
           await sleepBeforeRetry(
             `retrying GraphQL request after rate limit: ${message}`,
             attempt,
-            rateLimitRetryAfter,
+            retryPlan.kind === "delay" ? retryPlan.delayMs : null,
           );
           continue;
         }
@@ -2833,42 +2987,70 @@ function responseIsExplicitRateLimit(response, payload = null) {
     /rate-limits?/i.test(documentationUrl);
 }
 
-function boundedRateLimitRetryAfter(response) {
+function responseRetryPlan(response, { explicitRateLimit = false } = {}) {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter !== null) {
-    return retryAfterDelayMs(retryAfter, MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS + 1) <=
-      MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS
-      ? retryAfter
-      : null;
+    const delayMs = retryAfterDelayMs(retryAfter, null);
+    if (delayMs === null) {
+      return isRetryableHttpStatus(response.status)
+        ? { kind: "fallback" }
+        : { kind: "unavailable" };
+    }
+    return delayMs <= MAX_IN_PROCESS_RETRY_WAIT_MS
+      ? { kind: "delay", delayMs }
+      : { kind: "over-cap", delayMs };
   }
 
-  const resetHeader = response.headers.get("x-ratelimit-reset");
-  if (resetHeader === null || resetHeader.trim() === "") {
-    return null;
+  if (explicitRateLimit) {
+    const resetHeader = response.headers.get("x-ratelimit-reset");
+    if (resetHeader !== null && /^[0-9]+$/.test(resetHeader)) {
+      const reset = Number(resetHeader);
+      const delayMs = Number.isSafeInteger(reset)
+        ? Math.max(0, reset * 1000 - Date.now())
+        : Number.MAX_SAFE_INTEGER;
+      return delayMs <= MAX_IN_PROCESS_RETRY_WAIT_MS
+        ? { kind: "delay", delayMs }
+        : { kind: "over-cap", delayMs };
+    }
   }
-  const reset = Number(resetHeader);
-  if (!Number.isFinite(reset) || reset < 0) {
-    return null;
-  }
-  const delayMs = Math.max(0, reset * 1000 - Date.now());
-  if (delayMs > MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS) {
-    return null;
-  }
-  return String(Math.ceil(delayMs / 1000));
+
+  return isRetryableHttpStatus(response.status)
+    ? { kind: "fallback" }
+    : { kind: "unavailable" };
 }
 
-function restResponseRetryAllowed({
+function retryPlanAllowsRetry(plan) {
+  return plan.kind === "delay" || plan.kind === "fallback";
+}
+
+function failIfRetryPlanExceedsBound(plan, label, { readOnly = false } = {}) {
+  if (plan.kind !== "over-cap") {
+    return;
+  }
+  const message =
+    `${label} requested a retry delay above the ` +
+    `${MAX_IN_PROCESS_RETRY_WAIT_MS / 1000}s in-process limit`;
+  if (readOnly) {
+    throw new GateFailure(
+      "pending",
+      "Codex review evidence is temporarily incomplete",
+      message,
+    );
+  }
+  throw new Error(message);
+}
+
+function restResponseRetryPlan({
   method,
   path,
-  status,
+  response,
   explicitRateLimit,
-  rateLimitRetryAfter,
 }) {
-  if (!explicitRateLimit) {
-    return restRequestRetryAllowed(method, path, status);
+  const retryStatus = explicitRateLimit ? 429 : response.status;
+  if (!restRequestRetryAllowed(method, path, retryStatus)) {
+    return { kind: "unavailable" };
   }
-  return rateLimitRetryAfter !== null &&
-    restRequestRetryAllowed(method, path, 429);
+  return responseRetryPlan(response, { explicitRateLimit });
 }
 
 function graphqlErrorsAreExplicitRateLimit(errors) {
@@ -2997,9 +3179,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function sleepBeforeRetry(message, attempt, retryAfter = null) {
+async function sleepBeforeRetry(message, attempt, delayMs = null) {
   const fallbackMs = Math.min(1000 * 2 ** (attempt - 1), 10_000);
-  const delayMs = retryAfterDelayMs(retryAfter, fallbackMs);
-  console.warn(`${message}; retrying in ${Math.round(delayMs / 1000)}s`);
-  await sleep(delayMs);
+  const effectiveDelayMs = delayMs ?? fallbackMs;
+  if (effectiveDelayMs > MAX_IN_PROCESS_RETRY_WAIT_MS) {
+    throw new Error("retry delay exceeded the in-process safety limit");
+  }
+  console.warn(`${message}; retrying in ${Math.round(effectiveDelayMs / 1000)}s`);
+  await sleep(effectiveDelayMs);
 }

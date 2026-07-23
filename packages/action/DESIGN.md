@@ -73,7 +73,15 @@ the review evidence incomplete or change its result. The action simply skips
 deduplication and POSTs the status it already computed.
 
 Every GitHub request attempt has a 60-second default deadline that covers both
-the fetch and response-body read. The final `success` POST is never blindly retried. If that
+the fetch and response-body read. For an otherwise retryable response, a valid
+`Retry-After` of at most 10 seconds is honoured on REST and GraphQL alike. A
+longer valid delay stops immediately: evidence reads become transient
+`pending`, while writes fail. A missing or malformed `Retry-After` uses the
+normal bounded exponential fallback for retryable statuses; an explicit
+403 rate limit still requires a usable bounded server delay. The header never
+makes an otherwise non-retryable method or status retryable.
+
+The final `success` POST is never blindly retried. If that
 POST fails or times out after GitHub may have persisted it, the workflow
 attempts a compensating `error` status and exits non-zero. If the compensating
 write also fails, the run still fails but the remote latest status may remain
@@ -310,7 +318,14 @@ when the same head also has a trusted live marker and same-head failure
 evidence. Missing event-driven deadline fields on an otherwise valid marker are
 derived from its recorded times and current timeout controls. Any other
 ambiguous or incomplete legacy state remains `pending` and requires a fresh
-marker; migration never synthesises a passed marker or observed clean result.
+marker. A v1.2 `passed` record that predates `observedProviderResult` is upgraded
+only when its exact legacy issue-comment or approved-review identity matches
+the currently selected strict clean artifact, the trusted live marker still
+matches, and the original marker baseline and time window independently admit
+that artifact. The gate persists the canonical live artifact as
+`observedProviderResult` before it can reassert success. If any proof is
+missing, it creates a fresh marker instead; migration never synthesises a
+passed marker or clean result from sticky state alone.
 
 ## State Machine
 
@@ -459,6 +474,11 @@ Accepted provider evidence is channel-specific:
   Official top-level issue comments must also have
   `performed_via_github_app.slug == "chatgpt-codex-connector"` under the
   default identity policy.
+- REST provider, review, and inline-comment database IDs must be positive safe
+  JSON integers. GraphQL opaque IDs must be non-empty whitespace-free strings,
+  and `fullDatabaseId` must be a canonical positive decimal string. Duplicate
+  IDs within one REST or GraphQL namespace, or duplicate provider artifact
+  identities within the same channel, are deterministic evidence errors.
 - A pull request review binds through its full `commit_id`. An inline comment
   binds through its parent review and `original_commit_id`; the mutable
   relocated inline `commit_id` is not provenance.
@@ -530,7 +550,9 @@ pages, or conflicting payload fields make the current run incomplete rather
 than clean. A REST `rel="next"` link is authoritative even when the returned
 page is shorter than the requested page size. REST and GraphQL pagination have
 finite page budgets, and GraphQL cursors must advance on every non-terminal
-page.
+page. REST/GraphQL comment identity pairs and parent-review commit bindings are
+validated for resolved threads as well as unresolved ones; `isResolved` only
+removes the finding from the blocking count.
 
 Thread-backed findings are historical admission evidence. A thread stops
 blocking only when `isResolved` is true; `isOutdated` alone has no resolving

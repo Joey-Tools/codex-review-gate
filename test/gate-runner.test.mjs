@@ -1823,6 +1823,112 @@ test("a newer malformed terminal artifact invalidates an earlier clean result", 
   });
 });
 
+test("a provider terminal artifact without a canonical ID fails closed", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 1900,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:55:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    const invalid = codexCleanComment(2001);
+    delete invalid.id;
+    harness.issueComments.push(invalid);
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /valid positive integer id/);
+  });
+});
+
+test("duplicate provider artifact IDs are deterministic evidence errors", async () => {
+  await withHarness(async (harness) => {
+    harness.issueComments.push(
+      codexCleanComment(2001, "2026-05-14T10:00:00Z"),
+      codexThreadlessFinding(2001, HEAD_SHA, "2026-05-14T09:59:00Z"),
+    );
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /artifact identity issue-comment:2001 appears more than once/);
+  });
+});
+
+test("a final reload rejects a newly visible invalid provider identity", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    const invalid = codexCleanComment(2002, "2026-05-14T10:01:00Z");
+    invalid.id = "2002";
+    harness.afterSnapshotLoad(2, {
+      action: "pushIssueComment",
+      value: invalid,
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /valid positive integer id/);
+  });
+});
+
+test("a newer valid clean can supersede an older malformed provider identity", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 1900,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:55:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    const olderInvalid = codexCleanComment(1998, "2026-05-14T09:56:00Z");
+    delete olderInvalid.id;
+    harness.issueComments.push(
+      olderInvalid,
+      codexCleanComment(2001, "2026-05-14T10:00:00Z"),
+    );
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
 test("a newer noncanonical terminal prefix invalidates an earlier clean result", async () => {
   await withHarness(async (harness) => {
     harness.issueComments.push(
@@ -2849,6 +2955,126 @@ test("a message-only GraphQL 403 rate limit without a server delay is pending im
   });
 });
 
+test("oversized Retry-After fails fast for REST and GraphQL evidence reads", async () => {
+  await withHarness(async (harness) => {
+    const commentsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`;
+    harness.routeFaults[`GET ${commentsPath}`] = [{
+      status: 503,
+      body: { message: "service unavailable" },
+      headers: { "Retry-After": "11" },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(
+      harness.requestLog.filter((entry) =>
+        entry.method === "GET" && entry.path === commentsPath,
+      ).length,
+      1,
+    );
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.match(result.stderr, /above the 10s in-process limit/);
+  });
+
+  await withHarness(async (harness) => {
+    harness.routeFaults["POST /graphql"] = [{
+      status: 503,
+      rawText: "<html>temporarily unavailable</html>",
+      headers: { "Retry-After": "11" },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(
+      harness.requestLog.filter((entry) => entry.path === "/graphql").length,
+      1,
+    );
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.match(result.stderr, /above the 10s in-process limit/);
+  });
+});
+
+test("malformed Retry-After falls back to bounded retries", async () => {
+  await withHarness(async (harness) => {
+    const commentsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`;
+    harness.routeFaults[`GET ${commentsPath}`] = [{
+      status: 429,
+      body: { message: "too many requests" },
+      headers: { "Retry-After": "not-a-delay" },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(
+      harness.requestLog.filter((entry) =>
+        entry.method === "GET" && entry.path === commentsPath,
+      ).length,
+      2,
+    );
+  });
+
+  await withHarness(async (harness) => {
+    harness.routeFaults["POST /graphql"] = [{
+      status: 503,
+      body: { message: "service unavailable" },
+      headers: { "Retry-After": "1.5" },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(
+      harness.requestLog.filter((entry) => entry.path === "/graphql").length,
+      2,
+    );
+  });
+});
+
+test("Retry-After does not make a non-retryable GraphQL status retryable", async () => {
+  await withHarness(async (harness) => {
+    harness.routeFaults["POST /graphql"] = [{
+      status: 422,
+      body: { message: "unprocessable query" },
+      headers: { "Retry-After": "11" },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(
+      harness.requestLog.filter((entry) => entry.path === "/graphql").length,
+      1,
+    );
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /failed with 422/);
+  });
+});
+
 test("Retry-After preserves safe PATCH and commit-status POST retries", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
@@ -3576,6 +3802,164 @@ test("head change creates a current-head marker before historical findings fail 
     assert.equal(state.history.at(-2).outcome, "obsolete_head");
     assert.equal(state.history.at(-1).outcome, "failed_findings");
     assert.equal(state.history.at(-1).headSha, NEW_HEAD_SHA);
+  });
+});
+
+test("scheduled reconciliation safely migrates a legacy passed issue-comment lineage", async () => {
+  await withHarness(async (harness) => {
+    harness.seedLegacySuccessfulState({
+      providerSource: "issue-comment",
+      providerId: 2001,
+    });
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "error",
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.findMarkerComments().length, 1);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-1).observedProviderResult.source, "issue-comment");
+    assert.equal(state.history.at(-1).observedProviderResult.id, "2001");
+    assert.equal(
+      state.history.at(-1).authorizationLineageMigratedAt,
+      "2026-05-14T10:01:00.000Z",
+    );
+  });
+});
+
+test("scheduled reconciliation safely migrates a legacy passed review lineage", async () => {
+  await withHarness(async (harness) => {
+    harness.seedLegacySuccessfulState({
+      providerSource: "pull-request-review",
+      providerId: 4001,
+      providerCreatedAt: "2026-05-14T10:00:00Z",
+    });
+    harness.reviews.push({
+      id: 4001,
+      state: "APPROVED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:00Z",
+      body: "Looks good.",
+      user: codexBotUser(),
+    });
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "error",
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.findMarkerComments().length, 1);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(
+      state.history.at(-1).observedProviderResult.source,
+      "pull-request-review",
+    );
+    assert.equal(state.history.at(-1).observedProviderResult.id, "4001");
+  });
+});
+
+test("legacy passed lineage mismatch requires a fresh marker instead of reasserting success", async () => {
+  await withHarness(async (harness) => {
+    harness.seedLegacySuccessfulState({
+      providerSource: "issue-comment",
+      providerId: 2002,
+    });
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "error",
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(harness.findMarkerComments().length, 2);
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker.state, "waiting_ack");
+    assert.equal(state.activeMarker.baseline.completionComment.id, "2001");
+  });
+});
+
+test("legacy passed lineage with incomplete last-status audit requires a fresh marker", async () => {
+  await withHarness(async (harness) => {
+    harness.seedLegacySuccessfulState({
+      providerSource: "issue-comment",
+      providerId: 2001,
+    });
+    const stateComment = harness.findStateComment();
+    const state = parseStateCommentBody(stateComment.body);
+    state.lastStatus.state = "pending";
+    stateComment.body = stateCommentBody(state);
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "pending",
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(
+      parseStateCommentBody(harness.findStateComment().body).activeMarker.state,
+      "waiting_ack",
+    );
+  });
+});
+
+test("legacy passed migration fails closed when the final provider artifact changes", async () => {
+  await withHarness(async (harness) => {
+    harness.seedLegacySuccessfulState({
+      providerSource: "issue-comment",
+      providerId: 2001,
+    });
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.afterSnapshotLoad(2, {
+      action: "pushIssueComment",
+      value: codexCleanComment(2002, "2026-05-14T10:01:01Z"),
+    });
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "error",
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.match(result.stderr, /not authorized by passed-marker-reassert/);
   });
 });
 
@@ -4308,6 +4692,77 @@ class GateHarness {
         headSha: HEAD_SHA,
         state: "success",
         updatedAt: "2026-05-14T09:59:00Z",
+        runUrl: "https://github.example/owner/repo/actions/runs/999",
+      },
+    };
+    this.issueComments.push({
+      id: 1000,
+      body: stateCommentBody(stateValue),
+      created_at: "2026-05-14T09:50:00Z",
+      html_url: "https://github.example/owner/repo/pull/1#issuecomment-1000",
+      user: { login: "github-actions[bot]" },
+    });
+    this.issueComments.push(markerCommentFor(passedMarker));
+  }
+
+  seedLegacySuccessfulState({
+    providerSource,
+    providerId,
+    providerCreatedAt = "2026-05-14T10:00:00Z",
+  }) {
+    const passedMarker = {
+      version: 1,
+      id: "1999",
+      url: "https://github.example/owner/repo/pull/1#issuecomment-1999",
+      headSha: HEAD_SHA,
+      runUrl: "https://github.example/owner/repo/actions/runs/999",
+      runId: "999",
+      runAttempt: "1",
+      attempt: 1,
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+      state: "passed",
+      outcome: "passed",
+      createdAt: "2026-05-14T09:55:00Z",
+      closedAt: "2026-05-14T10:00:01Z",
+      observedCompletionComment:
+        providerSource === "issue-comment"
+          ? {
+              id: String(providerId),
+              createdAt: providerCreatedAt,
+              user: "chatgpt-codex-connector[bot]",
+              url:
+                `https://github.example/owner/repo/pull/1#issuecomment-${providerId}`,
+            }
+          : null,
+      observedApprovedReview:
+        providerSource === "pull-request-review"
+          ? {
+              id: String(providerId),
+              state: "APPROVED",
+              commitId: HEAD_SHA,
+              submittedAt: providerCreatedAt,
+              user: "chatgpt-codex-connector[bot]",
+            }
+          : null,
+    };
+    const stateValue = {
+      version: 1,
+      createdAt: "2026-05-14T09:50:00Z",
+      updatedAt: "2026-05-14T10:00:01Z",
+      statusHead: HEAD_SHA,
+      bootstrap: { status: "closed" },
+      activeMarker: null,
+      history: [passedMarker],
+      lastStatus: {
+        headSha: HEAD_SHA,
+        state: "success",
+        updatedAt: "2026-05-14T10:00:01Z",
         runUrl: "https://github.example/owner/repo/actions/runs/999",
       },
     };

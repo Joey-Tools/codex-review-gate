@@ -87,6 +87,13 @@ clean result 必须晚于有效的 active current-head marker 及其 baseline。
 no-active-marker 路径：以精确 marker、baseline 和 observed-result lineage 重新声明
 已经 `passed` 的结果；以及下文所述的 legacy same-head `failed_findings` recovery。
 
+每次 GitHub request attempt 的默认 deadline 是 60 秒，覆盖 fetch 和 response-body
+读取。对于原本允许 retry 的 response，REST 和 GraphQL 都会遵守不超过 10 秒的合法
+`Retry-After`。更长的合法 delay 会立即停止：evidence read 记为 transient
+`pending`，write 则失败。缺失或 malformed 的 `Retry-After` 对 retryable status 使用
+正常的有界 exponential fallback；显式 403 rate limit 仍要求可用且有界的 server
+delay。该 header 不会让原本不可 retry 的 method 或 status 获得 retry 资格。
+
 ## 生成式 AI 提示
 
 受控 marker comment 会刻意保持为最小的 `@codex review` command 加 hidden gate metadata，以便 Codex GitHub integration 可靠解析。Workflow 发布受控 marker 时，会改在 GitHub Actions step summary 中写出可见提示：workflow 正在请求 Codex 生成式 AI review，Codex 可能在 PR 中发布 AI 生成的 comments 或 reviews，维护者在把这些输出用于安全性、正确性或 merge 决策前，应先进行人工核验。
@@ -261,7 +268,12 @@ Legacy state migration 不会凭空创建 pass authority。只有
 三者同时存在时，才把 legacy entry 迁移为可验证的 `failed_findings` lineage。对于其他
 方面有效的 marker，如果缺少 event-driven deadline fields，则根据其已记录时间和当前
 timeout controls 补齐。其他 ambiguous 或 incomplete legacy state 保持 `pending`，并
-要求 fresh marker；migration 绝不会合成 passed marker 或 observed clean result。
+要求 fresh marker。对于早于 `observedProviderResult` 的 v1.2 `passed` record，只有
+legacy issue-comment 或 approved-review identity 与当前选中的 strict clean artifact
+精确匹配、trusted live marker 仍匹配，且原 marker baseline/time window 也独立接受该
+artifact 时，才会升级；gate 必须先把 canonical live artifact 持久化为
+`observedProviderResult`，之后才能重新声明 success。任一证明缺失都会要求 fresh
+marker；migration 不会只凭 sticky state 合成 passed marker 或 clean result。
 
 ## 状态机
 
@@ -408,6 +420,11 @@ Accepted provider evidence 按 channel 校验：
 - REST artifacts 必须来自 accepted login，且 `user.type == "Bot"`。使用默认 identity
   policy 时，官方 top-level issue comments 还必须满足
   `performed_via_github_app.slug == "chatgpt-codex-connector"`。
+- REST provider、review 和 inline-comment database IDs 必须是 positive safe JSON
+  integers。GraphQL opaque IDs 必须是非空且不含 whitespace 的 strings；
+  `fullDatabaseId` 必须是 canonical positive decimal string。同一 REST/GraphQL
+  namespace 中的 duplicate ID，或同一 channel 中 duplicate provider artifact
+  identity，均属于 deterministic evidence error。
 - Pull request review 通过完整 `commit_id` 绑定。Inline comment 通过 parent review 和
   `original_commit_id` 绑定；可变的 relocated inline `commit_id` 不是 provenance。
 - Top-level clean result 必须匹配受支持的 clean format，并包含 reviewed-commit marker。
@@ -421,6 +438,8 @@ threads 和 thread comments。Parent reviews、thread mappings、分页或 paylo
 任一缺失时，当前运行会判为 incomplete，而不是 clean。即使返回页短于请求的 page
 size，REST `rel="next"` link 仍是继续分页的 authoritative signal。REST 和 GraphQL
 分页都有有限 page budget，且 GraphQL cursor 必须在每个非终态页继续前进。
+Resolved 和 unresolved threads 都会校验 REST/GraphQL comment identity pair 及
+parent-review commit binding；`isResolved` 只会把 finding 从 blocking count 中移除。
 
 Thread-backed findings 属于历史 admission evidence。只有 `isResolved` 为 true 时，该
 thread 才不再阻塞；`isOutdated` 本身没有 resolving effect。没有 thread 的 findings
