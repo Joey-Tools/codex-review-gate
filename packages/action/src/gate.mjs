@@ -375,27 +375,18 @@ async function processPullRequest(prNumber, trigger) {
     pullRequestIsDependabot(pullRequest);
 
   const snapshot = await loadSnapshot();
-  failIfSnapshotEvidenceIsInvalid(snapshot);
   const scheduledWithoutTrustedState =
     trigger.kind === "scan" &&
     !trigger.allowCreateMarker &&
     !dependabotScheduleRecovery &&
     !hasTrustedGateStateOrMarker(snapshot.comments, config.trustedCommentLogins);
   if (scheduledWithoutTrustedState) {
-    const liveStatus = await loadLatestGateStatus();
-    if (
-      liveStatus.readFailed ||
-      liveStatus.latest === null ||
-      !liveStatus.producerMatches
-    ) {
-      console.log(
-        `PR #${activePrNumber} has no trusted gate state or marker` +
-          (liveStatus.readFailed ? " and its live gate status could not be read" : "") +
-          "; skipping scheduled scan.",
-      );
-      return;
-    }
+    console.log(
+      `PR #${activePrNumber} has no trusted gate state or marker; skipping scheduled scan.`,
+    );
+    return;
   }
+  failIfSnapshotEvidenceIsInvalid(snapshot);
 
   let {
     state,

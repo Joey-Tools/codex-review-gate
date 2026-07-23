@@ -2070,6 +2070,17 @@ test("scheduled scan does not initialize stateless PRs from existing Codex evide
     (harness) => {
       harness.issueComments.push(codexCleanComment(2001));
     },
+    (harness) => {
+      harness.issueComments.push(codexMalformedTerminal(2001));
+    },
+    (harness) => {
+      harness.commitStatuses.push({
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "pending",
+        creator: { login: "github-actions[bot]", type: "Bot" },
+      });
+    },
   ];
 
   for (const seedEvidence of evidenceCases) {
@@ -2089,15 +2100,9 @@ test("scheduled scan does not initialize stateless PRs from existing Codex evide
   }
 });
 
-test("scheduled scan does not recover stateless PRs from an untrusted live gate status", async () => {
+test("scheduled scan may initialize a stateless Dependabot PR", async () => {
   await withHarness(async (harness) => {
-    harness.issueComments.push(codexCleanComment(2001));
-    harness.commitStatuses.push({
-      sha: HEAD_SHA,
-      context: "codex/review-gate",
-      state: "success",
-      creator: { login: "octocat", type: "User" },
-    });
+    harness.pullRequest.user = { login: "dependabot[bot]", type: "Bot" };
 
     const result = await harness.runGate({
       eventName: "schedule",
@@ -2105,28 +2110,6 @@ test("scheduled scan does not recover stateless PRs from an untrusted live gate 
     });
 
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(harness.statuses.length, 0);
-    assert.equal(harness.findStateComment(), undefined);
-    assert.equal(harness.findMarkerComments().length, 0);
-  });
-});
-
-test("scheduled scan may recover missing state when a live gate status proves prior initialization", async () => {
-  await withHarness(async (harness) => {
-    harness.commitStatuses.push({
-      sha: HEAD_SHA,
-      context: "codex/review-gate",
-      state: "pending",
-      creator: { login: "github-actions[bot]", type: "Bot" },
-    });
-
-    const result = await harness.runGate({
-      eventName: "schedule",
-      event: {},
-    });
-
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(harness.statuses.length, 0);
     assert.notEqual(harness.findStateComment(), undefined);
     assert.equal(harness.findMarkerComments().length, 1);
   });
