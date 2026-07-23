@@ -2098,7 +2098,7 @@ async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
     if (threadEvidence.errors.length > 0) {
       return invalidProviderEvidenceFailure(threadEvidence.errors[0]);
     }
-    inlineParentEvidenceComplete = true;
+    inlineParentEvidenceComplete = threadEvidence.transientErrors.length === 0;
     validatedCodexInlineParentReviewIds = new Set(
       threadEvidence.validatedCodexInlineParentReviewIds,
     );
