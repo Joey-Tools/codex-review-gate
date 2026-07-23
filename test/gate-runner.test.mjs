@@ -1025,6 +1025,91 @@ test("unknown COMMENTED Codex review fails closed instead of acknowledging a mar
   });
 });
 
+test("only validated Codex Bot inline children can identify a COMMENTED parent", async () => {
+  const invalidAuthors = [
+    [
+      "human",
+      { login: "octocat", type: "User" },
+      /unrecognized Codex terminal pull-request-review format/,
+    ],
+    [
+      "unrelated Bot",
+      { login: "dependabot[bot]", type: "Bot" },
+      /unrecognized Codex terminal pull-request-review format/,
+    ],
+    [
+      "configured Codex login without Bot type",
+      { login: "chatgpt-codex-connector[bot]", type: "User" },
+      /review comment 3001 author is not a Bot/,
+    ],
+  ];
+
+  for (const [authorLabel, user, expectedError] of invalidAuthors) {
+    await withHarness(async (harness) => {
+      seedCleanActiveMarker(harness);
+      harness.reviews.push({
+        id: 9100,
+        state: "COMMENTED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-05-14T10:00:01Z",
+        body: "Discussion without a Codex terminal review body.",
+        user: codexBotUser(),
+      });
+      harness.reviewComments.push({
+        ...currentHeadInlineFinding(3001),
+        pull_request_review_id: 9100,
+        user,
+      });
+      harness.reviewThreads.push(unresolvedThread(3001));
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: { inputs: { pull_request: "1" } },
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 1, `${authorLabel}: ${result.stderr}`);
+      assert.equal(successStatusWrites(harness), 0, authorLabel);
+      assert.equal(harness.statuses.at(-1).body.state, "error", authorLabel);
+      assert.match(result.stderr, expectedError, authorLabel);
+    });
+  }
+});
+
+test("a fully reconciled Codex inline child identifies its COMMENTED parent", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:01Z",
+      body: "Parent review for a validated inline Codex finding.",
+      user: codexBotUser(),
+    });
+    harness.reviewComments.push({
+      ...currentHeadInlineFinding(3001),
+      pull_request_review_id: 9100,
+    });
+    harness.reviewThreads.push(unresolvedThread(3001));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.snapshotLoads, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(
+      parseStateCommentBody(harness.findStateComment().body).history.at(-1).outcome,
+      "failed_findings",
+    );
+  });
+});
+
 test("eyes reaction acknowledges marker and moves WaitingAck to WaitingResult", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
@@ -3630,11 +3715,20 @@ test("final success reuses its cached live-status read for dedupe and repair", a
 
   await withHarness(async (harness) => {
     seedCleanActiveMarker(harness);
-    harness.commitStatuses.push({
-      sha: HEAD_SHA,
-      context: "codex/review-gate",
-      state: "success",
-    });
+    harness.commitStatuses.push(
+      {
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "success",
+        creator: { login: "github-actions[bot]", type: "Bot" },
+      },
+      {
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "error",
+        creator: { login: "external-integration[bot]", type: "Bot" },
+      },
+    );
 
     const result = await harness.runGate({
       eventName: "issue_comment",
@@ -3676,56 +3770,52 @@ test("final success reuses its cached live-status read for dedupe and repair", a
 });
 
 test("success dedupe ignores same-context statuses from external or missing producers", async () => {
-  await withHarness(async (harness) => {
-    seedCleanActiveMarker(harness);
-    harness.commitStatuses.push({
-      sha: HEAD_SHA,
-      context: "codex/review-gate",
-      state: "success",
-      creator: {
-        login: "external-integration[bot]",
-        type: "Bot",
-      },
-    });
+  const producers = [
+    [
+      "external",
+      { login: "external-integration[bot]", type: "Bot" },
+    ],
+    ["missing", null],
+  ];
 
-    const result = await harness.runGate({
-      eventName: "issue_comment",
-      event: {
-        issue: { number: 1, pull_request: {} },
-        comment: codexCleanComment(2001),
-      },
-      env: {
-        TRUSTED_COMMENT_LOGINS:
-          "github-actions[bot],external-integration[bot]",
-      },
-    });
+  for (const [producerLabel, creator] of producers) {
+    for (const liveState of ["error", "pending"]) {
+      await withHarness(async (harness) => {
+        seedCleanActiveMarker(harness);
+        harness.commitStatuses.push(
+          {
+            sha: HEAD_SHA,
+            context: "codex/review-gate",
+            state: liveState,
+            creator,
+          },
+          {
+            sha: HEAD_SHA,
+            context: "codex/review-gate",
+            state: "success",
+            creator: {
+              login: "github-actions[bot]",
+              type: "Bot",
+            },
+          },
+        );
 
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(statusReads(harness), 1);
-    assert.equal(successStatusWrites(harness), 1);
-    assert.equal(harness.statuses.at(-1).body.state, "success");
-  });
+        const result = await harness.runGate({
+          eventName: "issue_comment",
+          event: {
+            issue: { number: 1, pull_request: {} },
+            comment: codexCleanComment(2001),
+          },
+        });
 
-  await withHarness(async (harness) => {
-    seedCleanActiveMarker(harness);
-    harness.commitStatuses.push({
-      sha: HEAD_SHA,
-      context: "codex/review-gate",
-      state: "success",
-      creator: null,
-    });
-
-    const result = await harness.runGate({
-      eventName: "issue_comment",
-      event: {
-        issue: { number: 1, pull_request: {} },
-        comment: codexCleanComment(2001),
-      },
-    });
-
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(successStatusWrites(harness), 1);
-  });
+        const scenario = `${producerLabel} ${liveState}`;
+        assert.equal(result.code, 0, `${scenario}: ${result.stderr}`);
+        assert.equal(statusReads(harness), 1, scenario);
+        assert.equal(successStatusWrites(harness), 1, scenario);
+        assert.equal(harness.statuses.at(-1).body.state, "success", scenario);
+      });
+    }
+  }
 });
 
 test("a final success status write is not retried after an explicit rate-limit response", async () => {

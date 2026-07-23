@@ -49,7 +49,8 @@ completion transition 必须精确匹配当前选中的 current-head clean provi
 
 写入 `success` 前，action 严格按以下顺序执行：
 
-1. Best-effort 读取并缓存 latest live gate status。
+1. Best-effort 读取并缓存同一 context 的 newest live gate status，同时保留其 producer
+   identity。
 2. 重新读取 PR lifecycle 和精确 head。
 3. 加载 final fully paginated evidence snapshot。如果 GraphQL thread comments 与 REST
    review comments 暴露可能的 cross-channel orphan（包括 inline comment 已可见但其
@@ -57,8 +58,10 @@ completion transition 必须精确匹配当前选中的 current-head clean provi
    仍存在时，当前运行 evidence incomplete，因此降为 `pending`。
 4. 重新验证 findings、terminal-result identity 与 commit binding，以及 marker 或
    recovery authorisation。
-5. 只基于缓存的 status 做 write deduplication，中间不再进行 network read。只有缓存的
-   latest status 已是 `success` 才跳过；否则立即发出一次不重试的 `success` POST。
+5. 只基于缓存的 status 做 write deduplication，中间不再进行 network read。只有同一
+   context 的 newest status 已是 `success`，且 producer exact 为
+   `github-actions[bot]` / `Bot` 时才跳过。External 或缺失 producer 不能让 action
+   回退采用更旧的 trusted status；其他情况都立即发出一次不重试的 `success` POST。
 
 如果最初的 status read 失败，action 仍会在 final snapshot 后发布重新计算的 status。
 如果一个看似 accepted 的 clean result 缺少 active-marker、精确 passed-marker
@@ -75,7 +78,7 @@ availability limitation，必须由后续一次完整 gate run 修复后才能�
 sequenceDiagram
   participant Gate
   participant GitHub
-  Gate->>GitHub: GET latest gate status (cache result)
+  Gate->>GitHub: GET newest same-context gate status (cache result + producer)
   Gate->>GitHub: GET PR lifecycle and exact head
   Gate->>GitHub: GET final fully paginated evidence snapshot
   opt Possible cross-channel orphan
@@ -83,9 +86,9 @@ sequenceDiagram
   end
   Note over Gate: Validate completeness, findings, result, and lineage
   Note over Gate: Deduplicate from cached status; no network read
-  alt Cached latest status is success
+  alt Cached newest status is expected-producer success
     Note over Gate: Skip duplicate write
-  else Read failed, absent, or not success
+  else Read failed, absent, external, missing producer, or not success
     Gate->>GitHub: POST success immediately (no blind retry)
   end
 ```
@@ -463,8 +466,9 @@ thread 才不再阻塞；`isOutdated` 本身没有 resolving effect。没有 thr
 
 Final `success` path 使用 Evidence Reconciliation 中规定的顺序：cached status GET、PR
 lifecycle/head GET、final complete snapshot（需要时包含一次有界 whole-snapshot orphan
-reload）、no-network deduplication，然后在 cached latest status 尚非 `success` 时立即
-POST status。
+reload）、no-network deduplication。只有 cached newest same-context status 已是
+`success`，且来自 exact `github-actions[bot]` / `Bot` 时才跳过 POST；external 或缺失
+producer 不能让更旧的 trusted status 成为 deduplication candidate。
 
 未知的未来 provider format 会使当前运行 fail closed。后续运行一旦能解析完整且更新的
 current-head clean result，较早的 format error 或 incomplete API attempt 不会继续

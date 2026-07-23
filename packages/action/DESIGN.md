@@ -58,7 +58,8 @@ match the exact provider artifact selected as the current-head clean result.
 
 Before writing `success`, the action follows one fixed order:
 
-1. Read and cache the latest live gate status on a best-effort basis.
+1. Read and cache the newest same-context live gate status on a best-effort
+   basis, preserving its producer identity.
 2. Re-read PR lifecycle and the exact head.
 3. Load the final fully paginated evidence snapshot. If its GraphQL thread
    comments and REST review comments expose a possible cross-channel orphan,
@@ -68,8 +69,10 @@ Before writing `success`, the action follows one fixed order:
 4. Revalidate findings, terminal-result identity and commit binding, and marker
    or recovery authorisation.
 5. Decide status-write deduplication from the cached status without another
-   network read. Skip only when that cached latest status is already `success`;
-   otherwise immediately issue the single non-retried `success` POST.
+   network read. Skip only when that newest same-context status is already
+   `success` and its producer is exact `github-actions[bot]` / `Bot`; an
+   external or missing producer never permits fallback to an older trusted
+   status. Otherwise immediately issue the single non-retried `success` POST.
 
 If the initial status read fails, the action still posts the freshly computed
 status after the final snapshot. An accepted-looking clean result that lacks
@@ -121,7 +124,7 @@ over a budget or other transient `pending` failure.
 sequenceDiagram
   participant Gate
   participant GitHub
-  Gate->>GitHub: GET latest gate status (cache result)
+  Gate->>GitHub: GET newest same-context gate status (cache result + producer)
   Gate->>GitHub: GET PR lifecycle and exact head
   Gate->>GitHub: GET final fully paginated evidence snapshot
   opt Possible cross-channel orphan
@@ -129,9 +132,9 @@ sequenceDiagram
   end
   Note over Gate: Validate completeness, findings, result, and lineage
   Note over Gate: Deduplicate from cached status; no network read
-  alt Cached latest status is success
+  alt Cached newest status is expected-producer success
     Note over Gate: Skip duplicate write
-  else Read failed, absent, or not success
+  else Read failed, absent, external, missing producer, or not success
     Gate->>GitHub: POST success immediately (no blind retry)
   end
 ```
@@ -587,8 +590,10 @@ active older unthreaded finding.
 The final `success` path uses the ordered sequence defined under Evidence
 Reconciliation: cached status GET, PR lifecycle/head GET, final complete
 snapshot (including the bounded whole-snapshot orphan reload when needed),
-no-network deduplication, then an immediate status POST if the cached latest
-status was not already `success`.
+no-network deduplication, then an immediate status POST unless the cached
+newest same-context status is already `success` from exact
+`github-actions[bot]` / `Bot`. An external or missing producer cannot expose
+an older trusted status as the deduplication candidate.
 
 Unknown future provider formats fail the current run closed. Once a later run
 can parse a complete newer current-head clean result, an older format error or

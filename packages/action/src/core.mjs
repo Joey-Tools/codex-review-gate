@@ -513,7 +513,7 @@ export function sortCodexArtifactsNewestFirst(artifacts) {
   });
 }
 
-export function collectUnresolvedCodexThreadFindings(
+export function collectCodexThreadEvidence(
   reviewComments,
   reviews,
   reviewThreads,
@@ -530,6 +530,7 @@ export function collectUnresolvedCodexThreadFindings(
   const graphqlCommentByDatabaseId = new Map();
   const reviewThreadIds = new Set();
   const verifiedRestCommentNodeIds = new Set();
+  const validatedCodexInlineParentReviewIds = new Set();
   const findingByThreadId = new Map();
 
   for (const review of reviews || []) {
@@ -723,6 +724,8 @@ export function collectUnresolvedCodexThreadFindings(
       continue;
     }
 
+    validatedCodexInlineParentReviewIds.add(normalizedReviewId);
+
     if (thread.isResolved) {
       continue;
     }
@@ -735,6 +738,30 @@ export function collectUnresolvedCodexThreadFindings(
     samples: findings.map((finding) => finding.sample).slice(0, 3),
     errors,
     transientErrors,
+    validatedCodexInlineParentReviewIds: [...validatedCodexInlineParentReviewIds],
+  };
+}
+
+export function collectUnresolvedCodexThreadFindings(
+  reviewComments,
+  reviews,
+  reviewThreads,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  headSha = "",
+) {
+  const evidence = collectCodexThreadEvidence(
+    reviewComments,
+    reviews,
+    reviewThreads,
+    botLogins,
+    headSha,
+  );
+  return {
+    count: evidence.count,
+    ids: evidence.ids,
+    samples: evidence.samples,
+    errors: evidence.errors,
+    transientErrors: evidence.transientErrors,
   };
 }
 

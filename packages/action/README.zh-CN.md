@@ -40,8 +40,8 @@ Runner 实现了 event-driven serialized marker flow：
 - 用 scheduled 或 manual resume runs 重试未 ack 或 stalled 的 markers。
 - 当前 reconciliation 无法完整加载或校验所需 evidence 时 fail closed。暂时性读取重试耗尽写入 `pending`；确定性的 provider identity、schema 或 commit 冲突写入 `error`；两者都会使 workflow 失败。
 - 如果 otherwise clean 的 current-head result 缺少 active-marker、精确 passed-marker reassertion 或 failed-findings recovery lineage 授权，则主动降为 `pending`。
-- 写入 success 前，先缓存 live status，再验证 PR lifecycle 和 head，加载 final complete snapshot，并在需要时执行有界 whole-snapshot orphan reload；之后不再读取 status，只做 deduplication，并在需要时立即 POST success。
-- 如果 latest live commit status 和重新计算的结果不同，即使 sticky state comment 记录了较早的 success，也会重新写入计算结果。
+- 写入 success 前，先缓存同一 context 的 newest live status 及其 producer，再验证 PR lifecycle 和 head，加载 final complete snapshot，并在需要时执行有界 whole-snapshot orphan reload；之后不再读取 status，只做 deduplication，并在需要时立即 POST success。
+- 只有同一 context 的 newest record 已是目标 state，且 producer exact 为 `github-actions[bot]` / `Bot` 时才去重；external 或缺失 producer 不能让 gate 回退采用更旧的 trusted status。
 - 只有 v1.2 passed marker 的 exact legacy result identity、trusted live marker、baseline 与当前 strict clean artifact 全部匹配时才安全升级；否则要求 fresh marker。
 - 提供狭窄的 legacy `failed_findings` recovery：维护者 resolve 所有 thread-backed Codex findings 后，只有与 selected same-head clean result 精确匹配的 `issue_comment` event 才可使用；compatibility inputs 决定能否复用同一个 clean，或必须等待更新结果。
 - 如果误开 PR-open automatic review，也只有 active controlled marker 之后的输出能通过最终 current-head validation。
@@ -205,7 +205,7 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 - Review-body 和没有 thread 的 top-level findings 必须使用 exact `github.com`、被 gate 的 owner/repository 和 full commit SHA links。当前格式未知或冲突时 fail closed。
 - 期待 success 前，应 resolve 所有 thread-backed Codex findings；仅 `isOutdated` 不表示 resolved。同一 head 上更晚的 accepted clean result 可以 supersede 没有 thread 的 top-level finding。
 - Sticky state 和 status history 只用于 orchestration、审计和幂等。Rerun 会重建当前 evidence，并可在更晚但 stale 的 `pending` 或 `error` status 之后重新写入 `success`。
-- Optional status-deduplication GET 使用独立的 best-effort 上限：每页 100 statuses、最多 10 页或 1,000 items、每个 response 1 MiB、总计 4 MiB、16 次 fetch attempts。失败或超限只记为 `readFailed`，不污染 review evidence，并使 action 直接 POST 已计算的 status。
+- Optional status-deduplication GET 使用独立的 best-effort 上限：每页 100 statuses、最多 10 页或 1,000 items、每个 response 1 MiB、总计 4 MiB、16 次 fetch attempts。它会先选择同一 context 的第一条（newest）record，再校验 producer identity；失败或超限只记为 `readFailed`，不污染 review evidence，并使 action 直接 POST 已计算的 status。
 - Review-evidence budget failure 会广播 abort active evidence requests。并发 loads 出现不同 failure 时，确定性的 non-`pending` error（包括 schema 或 identity conflict）优先于 budget 或 transient `pending`。
 - Retryable REST/GraphQL response 会遵守不超过 10 秒的合法 `Retry-After`。更长 delay 立即停止，缺失或 malformed value 使用有界 fallback retries；该 header 不会扩展现有 retry-safe method/status 集合。
 - 旧 short-SHA clean result 只在判定旧 unthreaded finding 是否被 supersede 时惰性解析。

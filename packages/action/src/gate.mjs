@@ -17,7 +17,7 @@ import {
   buildMarkerCommentBody,
   buildStateCommentBody,
   closeActiveMarker,
-  collectUnresolvedCodexThreadFindings,
+  collectCodexThreadEvidence,
   createInitialState,
   eventMayHaveReadOnlyDependabotToken,
   eventModeHandlesEvent,
@@ -1465,6 +1465,7 @@ async function demoteUnauthorizedCleanIfNeeded(state, stateComment) {
   const liveStatus = await loadLatestGateStatus();
   if (
     !liveStatus.readFailed &&
+    liveStatus.producerMatches &&
     liveStatus.latest &&
     liveStatus.latest.state !== "success"
   ) {
@@ -1778,18 +1779,15 @@ async function buildCurrentReviewEvidence({
   allowMissingReviewChildTransient = false,
   evidenceBudget,
 }) {
-  const inlineParentReviewIds = new Set(
-    reviewComments
-      .map((comment) => comment.pull_request_review_id)
-      .filter((reviewId) => reviewId !== null && reviewId !== undefined)
-      .map(String),
-  );
-  const threadFindings = collectUnresolvedCodexThreadFindings(
+  const threadFindings = collectCodexThreadEvidence(
     reviewComments,
     reviews,
     reviewThreads,
     config.codexBotLogins,
     statusSha,
+  );
+  const validatedCodexInlineParentReviewIds = new Set(
+    threadFindings.validatedCodexInlineParentReviewIds,
   );
   const parentReviewTransientErrors = [];
   const artifacts = [
@@ -1803,7 +1801,7 @@ async function buildCurrentReviewEvidence({
     ...reviews.map((review) => {
       if (
         review.state === "COMMENTED" &&
-        inlineParentReviewIds.has(String(review.id)) &&
+        validatedCodexInlineParentReviewIds.has(String(review.id)) &&
         !String(review.body || "").trim().startsWith("### 💡 Codex Review")
       ) {
         return null;
@@ -1816,7 +1814,7 @@ async function buildCurrentReviewEvidence({
       if (
         allowMissingReviewChildTransient &&
         review.state === "COMMENTED" &&
-        !inlineParentReviewIds.has(String(review.id)) &&
+        !validatedCodexInlineParentReviewIds.has(String(review.id)) &&
         artifact?.kind === "malformed" &&
         artifact.reason === "unrecognized Codex terminal pull-request-review format"
       ) {
@@ -2388,7 +2386,11 @@ async function setCommitStatusIfNeeded(
   if (beforeDecision) {
     await beforeDecision();
   }
-  if (!observed.readFailed && observed.latest?.state === state) {
+  if (
+    !observed.readFailed &&
+    observed.producerMatches &&
+    observed.latest?.state === state
+  ) {
     console.log(`Latest live ${STATUS_CONTEXT} already equals ${state} for ${statusSha}.`);
     return;
   }
@@ -2431,25 +2433,35 @@ async function loadLatestGateStatus() {
         data.length,
         "commit-status history",
       );
-      const latest = data.find((status) =>
-        status.context === STATUS_CONTEXT &&
-        status.creator?.type === "Bot" &&
-        status.creator?.login === "github-actions[bot]");
+      // GitHub returns commit statuses newest-first, so the first matching
+      // context is authoritative even when its producer is not trusted.
+      const latest = data.find((status) => status.context === STATUS_CONTEXT);
       if (latest) {
-        return { latest, readFailed: false };
+        return {
+          latest,
+          producerMatches: gateStatusHasExpectedProducer(latest),
+          readFailed: false,
+        };
       }
       if (
         !linkHeaderHasNext(headers.get("link")) &&
         data.length < STATUS_READ_PAGE_SIZE
       ) {
-        return { latest: null, readFailed: false };
+        return { latest: null, producerMatches: false, readFailed: false };
       }
       page += 1;
     }
   } catch (error) {
     console.warn(`failed to read current ${STATUS_CONTEXT} status: ${error.message}`);
-    return { latest: null, readFailed: true };
+    return { latest: null, producerMatches: false, readFailed: true };
   }
+}
+
+function gateStatusHasExpectedProducer(status) {
+  return (
+    status?.creator?.type === "Bot" &&
+    status.creator.login === "github-actions[bot]"
+  );
 }
 
 async function paginate(path, query, { evidenceBudget = null } = {}) {
