@@ -1185,6 +1185,70 @@ test("a fully reconciled Codex inline child identifies its COMMENTED parent", as
   });
 });
 
+test("the official COMMENTED wrapper delegates findings to reconciled inline children", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:01Z",
+      body: codexInlineParentReviewBody(),
+      user: codexBotUser(),
+    });
+    harness.reviewComments.push({
+      ...currentHeadInlineFinding(3001),
+      pull_request_review_id: 9100,
+      body: "Finding without a GitHub blob link.",
+    });
+    harness.reviewThreads.push(unresolvedThread(3001));
+
+    const result = await harness.runGate({
+      eventName: "pull_request_review",
+      event: {
+        pull_request: { number: 1 },
+        review: { user: { login: "chatgpt-codex-connector[bot]" } },
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(
+      parseStateCommentBody(harness.findStateComment().body).history.at(-1).outcome,
+      "failed_findings",
+    );
+  });
+});
+
+test("a resolved inline child lets an earlier clean coexist with its official parent wrapper", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:01Z",
+      body: codexInlineParentReviewBody(),
+      user: codexBotUser(),
+    });
+    harness.reviewComments.push({
+      ...currentHeadInlineFinding(3001),
+      pull_request_review_id: 9100,
+      body: "Resolved finding without a GitHub blob link.",
+    });
+    harness.reviewThreads.push(unresolvedThread(3001, { resolved: true }));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
 test("a resolved inline child does not hide a newer unknown nonempty COMMENTED body", async () => {
   await withHarness(async (harness) => {
     seedCleanActiveMarker(harness);
@@ -1212,6 +1276,34 @@ test("a resolved inline child does not hide a newer unknown nonempty COMMENTED b
     assert.equal(successStatusWrites(harness), 0);
     assert.equal(harness.statuses.at(-1).body.state, "error");
     assert.match(result.stderr, /unrecognized Codex terminal pull-request-review format/);
+  });
+});
+
+test("an official COMMENTED wrapper without an inline child reloads once then fails closed", async () => {
+  await withHarness(async (harness) => {
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:01Z",
+      body: codexInlineParentReviewBody(),
+      user: codexBotUser(),
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.snapshotLoads, 2);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(
+      result.stderr,
+      /Codex finding must contain only exact full-SHA github\.com blob links/,
+    );
   });
 });
 
@@ -5532,6 +5624,31 @@ function codexThreadlessFinding(id, headSha, createdAt) {
     user: codexBotUser(),
     performed_via_github_app: { slug: "chatgpt-codex-connector" },
   };
+}
+
+function codexInlineParentReviewBody(commitRef = HEAD_SHORT_SHA) {
+  return [
+    "### 💡 Codex Review",
+    "",
+    "Here are some automated review suggestions for this pull request.",
+    "",
+    `**Reviewed commit:** \`${commitRef}\``,
+    "    ",
+    "",
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "",
+    "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    '- Comment "@codex review".',
+    "",
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    "",
+    "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
+    "",
+    "</details>",
+  ].join("\n");
 }
 
 function codexMalformedTerminal(id, createdAt) {
