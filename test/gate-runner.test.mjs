@@ -1239,6 +1239,7 @@ test("scheduled scan retries missed acknowledgement with same-head backoff", asy
       createdAt: "2026-05-14T09:50:00Z",
       ackDeadlineAt: "2026-05-14T09:55:00Z",
       nextRetryAt: "2026-05-14T09:55:00Z",
+      maxWaitDeadlineAt: "2026-05-14T11:50:00Z",
       baseline: {
         plusOne: null,
         eyes: null,
@@ -1276,7 +1277,7 @@ test("scheduled scan retries missed acknowledgement with same-head backoff", asy
     assert.equal(state.activeMarker.id, String(markerComments.at(-1).id));
     assert.equal(state.activeMarker.ackTimeoutSeconds, 1200);
     assert.equal(state.activeMarker.headStartedAt, "2026-05-14T09:50:00Z");
-    assert.equal(state.activeMarker.maxWaitDeadlineAt, "2026-05-14T11:50:00.000Z");
+    assert.equal(state.activeMarker.maxWaitDeadlineAt, "2026-05-14T11:50:00Z");
   });
 });
 
@@ -1289,6 +1290,7 @@ test("scheduled scan retries stalled WaitingResult markers", async () => {
       createdAt: "2026-05-14T08:50:00Z",
       resultDeadlineAt: "2026-05-14T09:50:00Z",
       nextRetryAt: "2026-05-14T09:50:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:50:00Z",
       baseline: {
         plusOne: null,
         eyes: null,
@@ -1309,9 +1311,102 @@ test("scheduled scan retries stalled WaitingResult markers", async () => {
     assert.equal(state.history.at(-1).outcome, "stalled");
     assert.equal(state.activeMarker.state, "waiting_ack");
     assert.equal(state.activeMarker.headStartedAt, "2026-05-14T08:50:00Z");
-    assert.equal(state.activeMarker.maxWaitDeadlineAt, "2026-05-14T10:50:00.000Z");
+    assert.equal(state.activeMarker.maxWaitDeadlineAt, "2026-05-14T10:50:00Z");
     assert.equal(harness.statuses.at(-1).body.state, "pending");
   });
+});
+
+test("history-only retries at the max-wait deadline fail closed without another marker", async (t) => {
+  for (const outcome of ["missed_ack", "stalled"]) {
+    await t.test(outcome, async () => {
+      await withHarness(async (harness) => {
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome,
+          headStartedAt: "2026-05-14T08:01:00Z",
+          maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+        });
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(harness.findMarkerComments().length, 1);
+        assert.equal(markerCommentWrites(harness), 0);
+        assert.equal(harness.statuses.at(-1).body.state, "failure");
+
+        let state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.activeMarker, null);
+        assert.equal(state.lastStatus.state, "failure");
+        assert.equal(state.history.at(-2).outcome, outcome);
+        assert.equal(state.history.at(-1).outcome, "timed_out");
+        assert.equal(state.history.at(-1).headStartedAt, "2026-05-14T08:01:00Z");
+        assert.equal(state.history.at(-1).maxWaitDeadlineAt, "2026-05-14T10:01:00Z");
+        assert.equal(state.history.at(-1).timedOutAfterSeconds, 7200);
+
+        const timedOutEntries = state.history.filter(
+          (marker) => marker.headSha === HEAD_SHA && marker.outcome === "timed_out",
+        ).length;
+        const secondResult = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(secondResult.code, 0, secondResult.stderr);
+        assert.equal(harness.findMarkerComments().length, 1);
+        assert.equal(markerCommentWrites(harness), 0);
+        state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.lastStatus.state, "failure");
+        assert.equal(
+          state.history.filter(
+            (marker) => marker.headSha === HEAD_SHA && marker.outcome === "timed_out",
+          ).length,
+          timedOutEntries,
+        );
+      });
+    });
+  }
+});
+
+test("history-only retries inherit the exact wait deadline across config changes", async (t) => {
+  for (const scenario of [
+    { name: "increase", maxWaitSeconds: "14400" },
+    { name: "decrease", maxWaitSeconds: "1800" },
+  ]) {
+    await t.test(scenario.name, async () => {
+      await withHarness(async (harness) => {
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome: "missed_ack",
+          headStartedAt: "2026-05-14T09:01:00Z",
+          maxWaitDeadlineAt: "2026-05-14T11:01:00Z",
+          trailingHistory: [{
+            id: "old-head-marker",
+            headSha: OLD_HEAD_SHA,
+            state: "passed",
+            outcome: "passed",
+            headStartedAt: "2026-05-14T09:30:00Z",
+            maxWaitDeadlineAt: "2026-05-14T13:30:00Z",
+          }],
+        });
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+          env: { MAX_WAIT_SECONDS: scenario.maxWaitSeconds },
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(harness.findMarkerComments().length, 2);
+        assert.equal(harness.statuses.at(-1).body.state, "pending");
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.activeMarker.headStartedAt, "2026-05-14T09:01:00Z");
+        assert.equal(state.activeMarker.maxWaitDeadlineAt, "2026-05-14T11:01:00Z");
+      });
+    });
+  }
 });
 
 test("scheduled scan fails a marker that exceeds the max wait deadline", async () => {
@@ -1371,7 +1466,7 @@ test("manual retry after failed findings preserves the same-head max-wait budget
     assert.equal(state.activeMarker.headStartedAt, "2026-05-14T09:00:00Z");
     assert.equal(
       state.activeMarker.maxWaitDeadlineAt,
-      "2026-05-14T11:00:00.000Z",
+      "2026-05-14T11:00:00Z",
     );
   });
 });
@@ -4706,6 +4801,14 @@ function successStatusWrites(harness) {
   ).length;
 }
 
+function markerCommentWrites(harness) {
+  return harness.requestLog.filter((entry) =>
+    entry.method === "POST" &&
+      entry.path.endsWith(`/issues/${harness.prNumber}/comments`) &&
+      entry.body?.body?.includes(MARKER_COMMENT),
+  ).length;
+}
+
 class GateHarness {
   constructor() {
     this.now = Date.parse("2026-05-14T10:01:00Z");
@@ -4871,6 +4974,7 @@ class GateHarness {
     resultDeadlineAt = "2026-05-14T10:55:00Z",
     nextRetryAt = "2026-05-14T10:00:00Z",
     maxWaitDeadlineAt = "2026-05-14T11:55:00Z",
+    headStartedAt = createdAt,
     history = [],
     stateHead = headSha,
     pullHead = headSha,
@@ -4892,7 +4996,7 @@ class GateHarness {
       ackDeadlineAt,
       resultDeadlineAt,
       nextRetryAt,
-      headStartedAt: createdAt,
+      headStartedAt,
       maxWaitDeadlineAt,
     };
     const stateValue = {
@@ -4919,6 +5023,50 @@ class GateHarness {
     });
     this.issueComments.push(markerCommentFor(activeMarker));
     this.nextCommentId = Math.max(this.nextCommentId, id + 1);
+  }
+
+  seedHistoryOnlyRetryState({
+    id,
+    outcome,
+    headStartedAt,
+    maxWaitDeadlineAt,
+    closedAt = "2026-05-14T10:00:00Z",
+    trailingHistory = [],
+  }) {
+    this.seedActiveMarker({
+      id,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:55:00Z",
+      headStartedAt,
+      maxWaitDeadlineAt,
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+
+    const stateComment = this.findStateComment();
+    const state = parseStateCommentBody(stateComment.body);
+    const closedMarker = {
+      ...state.activeMarker,
+      state: outcome,
+      outcome,
+      closedAt,
+    };
+    stateComment.body = stateCommentBody({
+      ...state,
+      updatedAt: closedAt,
+      activeMarker: null,
+      history: [closedMarker, ...trailingHistory],
+      lastStatus: {
+        ...state.lastStatus,
+        state: "pending",
+        updatedAt: closedAt,
+      },
+    });
   }
 
   seedFailedFindingsState({

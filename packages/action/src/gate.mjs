@@ -486,6 +486,9 @@ async function processPullRequest(prNumber, trigger) {
     );
     state = markerResult.state;
     savedStateComment = markerResult.stateComment;
+    if (markerResult.kind === "terminal") {
+      return;
+    }
     headChanged = false;
     stateNeedsFreshMarker = false;
     freshHeadMarkerAllowed = false;
@@ -520,7 +523,8 @@ async function processPullRequest(prNumber, trigger) {
 
   if (
     snapshot.findings.count === 0 &&
-    (snapshot.providerResult.kind === "pending" || Boolean(state.activeMarker))
+    (snapshot.providerResult.kind === "pending" || Boolean(state.activeMarker)) &&
+    !currentHeadWaitCycleTimedOut(state)
   ) {
     await setCommitStatusIfNeeded("pending", "Waiting for a complete current-head Codex review result");
     state = updateStateForStatus(state, {
@@ -808,7 +812,26 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
         return { kind: "done", state, stateComment };
       }
 
-      const marker = await createGateMarker(snapshot.baseline, state);
+      const nowMs = Date.now();
+      const now = isoNow(nowMs);
+      const waitCycle = waitCycleForState(state, now);
+      if (
+        !waitCycle.newCycle &&
+        nowMs >= parseTimestamp(waitCycle.maxWaitDeadlineAt, "max wait deadline")
+      ) {
+        state = recordHistoryOnlyWaitCycleTimeout(state, waitCycle, now);
+        state = updateStateForStatus(state, {
+          now,
+          statusHead: statusSha,
+          runUrl,
+          status: "failure",
+        });
+        await setCommitStatus("failure", "Timed out waiting for Codex review signal");
+        stateComment = await saveState(state, stateComment);
+        return { kind: "terminal", state, stateComment };
+      }
+
+      const marker = await createGateMarker(snapshot.baseline, state, waitCycle);
       state = normalizeState({
         ...state,
         updatedAt: isoNow(),
@@ -1598,10 +1621,8 @@ function migrateStateForEventDrivenDeadlines(state) {
   });
 }
 
-async function createGateMarker(reactionBaseline, state) {
+async function createGateMarker(reactionBaseline, state, waitCycle) {
   const attempt = (state.history || []).length + 1;
-  const createdAtFallback = isoNow();
-  const headStartedAt = headStartedAtForState(state, createdAtFallback);
   const ackTimeoutSeconds = markerAckTimeoutSecondsForHistory(
     state.history,
     statusSha,
@@ -1618,8 +1639,8 @@ async function createGateMarker(reactionBaseline, state) {
     baseline: reactionBaseline,
     state: "waiting_ack",
     ackTimeoutSeconds,
-    headStartedAt,
-    maxWaitDeadlineAt: addSeconds(headStartedAt, Math.round(config.maxWaitMs / 1000)),
+    headStartedAt: waitCycle.headStartedAt,
+    maxWaitDeadlineAt: waitCycle.maxWaitDeadlineAt,
   };
 
   const { data } = await request("POST", `${repoPath}/issues/${activePrNumber}/comments`, {
@@ -1666,19 +1687,78 @@ function writeAiReviewDisclosureSummary(marker) {
   }
 }
 
-function headStartedAtForState(state, fallback) {
-  const latestForHead = [...(state.history || [])]
+function latestMarkerForCurrentHead(state) {
+  return [...(state.history || [])]
     .reverse()
-    .find((marker) => marker.headSha === statusSha);
+    .find((marker) => marker.headSha === statusSha) || null;
+}
+
+function waitCycleForState(state, fallback) {
+  const latestForHead = latestMarkerForCurrentHead(state);
   const latestOutcome = latestForHead?.outcome || latestForHead?.state;
-  if (latestOutcome === "passed" || latestOutcome === "state_lost") {
-    return fallback;
+  const newCycle =
+    !latestForHead ||
+    latestOutcome === "passed" ||
+    latestOutcome === "state_lost";
+  const headStartedAt = newCycle
+    ? fallback
+    : latestForHead.headStartedAt || fallback;
+  const maxWaitDeadlineAt =
+    !newCycle && latestForHead.maxWaitDeadlineAt
+      ? latestForHead.maxWaitDeadlineAt
+      : addSeconds(headStartedAt, Math.round(config.maxWaitMs / 1000));
+
+  return {
+    latestForHead,
+    latestOutcome,
+    newCycle,
+    headStartedAt,
+    maxWaitDeadlineAt,
+  };
+}
+
+function currentHeadWaitCycleTimedOut(state) {
+  if (state.activeMarker) {
+    return false;
   }
-  return (
-    latestForHead?.headStartedAt ||
-    state.activeMarker?.headStartedAt ||
-    fallback
+  const latestForHead = latestMarkerForCurrentHead(state);
+  return (latestForHead?.outcome || latestForHead?.state) === "timed_out";
+}
+
+function recordHistoryOnlyWaitCycleTimeout(state, waitCycle, now) {
+  if (waitCycle.latestOutcome === "timed_out") {
+    return normalizeState({
+      ...state,
+      updatedAt: now,
+      activeMarker: null,
+    });
+  }
+
+  const timedOutAfterSeconds = Math.max(
+    0,
+    Math.round(
+      (
+        parseTimestamp(waitCycle.maxWaitDeadlineAt, "max wait deadline") -
+        parseTimestamp(waitCycle.headStartedAt, "wait cycle start time")
+      ) / 1000,
+    ),
   );
+  const timedOutMarker = {
+    ...waitCycle.latestForHead,
+    state: "timed_out",
+    outcome: "timed_out",
+    closedAt: now,
+    headStartedAt: waitCycle.headStartedAt,
+    maxWaitDeadlineAt: waitCycle.maxWaitDeadlineAt,
+    timedOutAfterSeconds,
+  };
+
+  return normalizeState({
+    ...state,
+    updatedAt: now,
+    activeMarker: null,
+    history: [...(state.history || []), timedOutMarker],
+  });
 }
 
 async function saveState(state, stateComment) {
