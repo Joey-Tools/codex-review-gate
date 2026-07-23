@@ -17,30 +17,27 @@ if (statePath) {
     state.requestLog.push({ method, path, query, body });
 
     const fault = consumeRouteFault(method, path, url.search);
-    if (fault) {
+    if (fault && !fault.afterMutation) {
       save();
-      if (fault.throwFetch) {
-        const message =
-          typeof fault.throwFetch === "string" ? fault.throwFetch : "fake route fetch failure";
-        throw new TypeError(message);
-      }
-      return response(fault.body, fault.status ?? 500, {
-        headers: fault.headers,
-        rawText: fault.rawText,
-      });
+      return routeFaultResponse(fault, options.signal);
     }
 
+    let result;
     try {
-      const result = handle({ method, path, query, body });
+      result = handle({ method, path, query, body });
       save();
-      return response(result.body, result.status ?? 200, {
-        headers: result.headers,
-        rawText: result.rawText,
-      });
     } catch (error) {
       save();
       return response({ message: error.stack || error.message }, 500);
     }
+
+    if (fault) {
+      return routeFaultResponse(fault, options.signal);
+    }
+    return response(result.body, result.status ?? 200, {
+      headers: result.headers,
+      rawText: result.rawText,
+    });
   };
 
   process.on("exit", save);
@@ -58,6 +55,7 @@ function handle({ method, path, query, body }) {
   if (method === "GET" && path === `${repoBase}/pulls/${prNumber}`) {
     state.pullLoads ||= 0;
     state.pullLoads += 1;
+    applyPullHooks();
     return { body: state.pullRequest };
   }
 
@@ -165,6 +163,16 @@ function handle({ method, path, query, body }) {
   }
 
   if (method === "POST" && path === "/graphql") {
+    if (/\bdatabaseId\b/.test(String(body?.query || ""))) {
+      return {
+        body: {
+          errors: [{
+            message:
+              "PullRequestReviewComment.databaseId is deprecated and unavailable for large IDs",
+          }],
+        },
+      };
+    }
     if (state.failNextReviewThreads) {
       state.failNextReviewThreads = false;
       return {
@@ -185,7 +193,7 @@ function handle({ method, path, query, body }) {
         body: {
           data: {
             node: {
-              comments: connection,
+              comments: selectReviewCommentConnection(connection),
             },
           },
         },
@@ -223,31 +231,49 @@ function applySnapshotHooks() {
       continue;
     }
     hook.used = true;
-    switch (hook.action) {
-      case "pushIssueComment":
-        state.issueComments ||= [];
-        state.issueComments.push(hook.value);
-        break;
-      case "removeIssueComment":
-        removeIssueComment(hook);
-        break;
-      case "replaceIssueComment":
-        replaceIssueComment(hook);
-        break;
-      case "pushReviewComment":
-        state.reviewComments ||= [];
-        state.reviewComments.push(hook.value);
-        break;
-      case "setPullHead":
-        setPullHead(hook);
-        break;
-      case "setThreadResolved":
-        setThreadResolved(hook);
-        break;
-      case "routeFault":
-        enqueueRouteFault(hook);
-        break;
+    applyHookAction(hook);
+  }
+}
+
+function applyPullHooks() {
+  for (const hook of state.pullHooks || []) {
+    if (hook.used || hook.count !== state.pullLoads) {
+      continue;
     }
+    hook.used = true;
+    applyHookAction(hook);
+  }
+}
+
+function applyHookAction(hook) {
+  switch (hook.action) {
+    case "pushIssueComment":
+      state.issueComments ||= [];
+      state.issueComments.push(hook.value);
+      break;
+    case "removeIssueComment":
+      removeIssueComment(hook);
+      break;
+    case "replaceIssueComment":
+      replaceIssueComment(hook);
+      break;
+    case "pushReviewComment":
+      state.reviewComments ||= [];
+      state.reviewComments.push(hook.value);
+      break;
+    case "pushReviewThread":
+      state.reviewThreads ||= [];
+      state.reviewThreads.push(hook.value);
+      break;
+    case "setPullHead":
+      setPullHead(hook);
+      break;
+    case "setThreadResolved":
+      setThreadResolved(hook);
+      break;
+    case "routeFault":
+      enqueueRouteFault(hook);
+      break;
   }
 }
 
@@ -280,6 +306,44 @@ function response(value, status = 200, { headers = {}, rawText } = {}) {
       return value === undefined ? "" : JSON.stringify(value);
     },
   };
+}
+
+function routeFaultResponse(fault, signal) {
+  if (fault.throwFetch) {
+    const message =
+      typeof fault.throwFetch === "string" ? fault.throwFetch : "fake route fetch failure";
+    throw new TypeError(message);
+  }
+  if (fault.hangUntilAbort || fault.hangBodyUntilAbort) {
+    const waitForAbort = () => new Promise((resolve, reject) => {
+      if (!signal) {
+        reject(new TypeError("fake hanging route expected an AbortSignal"));
+        return;
+      }
+      if (signal.aborted) {
+        reject(signal.reason || new DOMException("Aborted", "AbortError"));
+        return;
+      }
+      signal.addEventListener(
+        "abort",
+        () => reject(signal.reason || new DOMException("Aborted", "AbortError")),
+        { once: true },
+      );
+    });
+    if (fault.hangUntilAbort) {
+      return waitForAbort();
+    }
+    const hangingResponse = response(fault.body, fault.status ?? 200, {
+      headers: fault.headers,
+      rawText: fault.rawText,
+    });
+    hangingResponse.text = waitForAbort;
+    return hangingResponse;
+  }
+  return response(fault.body, fault.status ?? 500, {
+    headers: fault.headers,
+    rawText: fault.rawText,
+  });
 }
 
 function save() {
@@ -449,18 +513,19 @@ function threadCommentPagesFor(threadId) {
 
 function withInitialThreadComments(thread) {
   const pages = threadCommentPagesFor(String(thread.id));
+  const comments = pages
+    ? selectConnectionPage(pages, null, `thread-${thread.id}-comments`)
+    : {
+        ...(thread.comments || {}),
+        pageInfo: thread.comments?.pageInfo || {
+          hasNextPage: false,
+          endCursor: null,
+        },
+        nodes: thread.comments?.nodes || [],
+      };
   return {
     ...thread,
-    comments: pages
-      ? selectConnectionPage(pages, null, `thread-${thread.id}-comments`)
-      : {
-          ...(thread.comments || {}),
-          pageInfo: thread.comments?.pageInfo || {
-            hasNextPage: false,
-            endCursor: null,
-          },
-          nodes: thread.comments?.nodes || [],
-        },
+    comments: selectReviewCommentConnection(comments),
   };
 }
 
@@ -476,6 +541,16 @@ function fallbackThreadComments(threadId) {
       nodes: thread?.comments?.nodes || [],
     }
   );
+}
+
+function selectReviewCommentConnection(connection) {
+  return {
+    ...(connection || {}),
+    nodes: (connection?.nodes || []).map((comment) => ({
+      id: comment?.id ?? null,
+      fullDatabaseId: comment?.fullDatabaseId ?? null,
+    })),
+  };
 }
 
 function allReviewThreads() {

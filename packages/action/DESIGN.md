@@ -4,7 +4,7 @@ Languages: [British English (en-GB)](DESIGN.md) | [简体中文 (zh-CN)](DESIGN.
 
 ## Goal
 
-`codex/review-gate` turns a controlled `@codex review` request into a deterministic commit status that can be required by branch protection. The gate passes only when the latest accepted Codex terminal result is clean and bound to the current PR head, and every historical thread-backed Codex finding is resolved.
+`codex/review-gate` turns a controlled `@codex review` request into a deterministic commit status that can be required by branch protection. The gate passes only when the latest accepted Codex terminal result is clean, bound to the current PR head, authorised by trusted marker or recovery lineage, and every historical thread-backed Codex finding is resolved.
 
 ## Evidence Reconciliation
 
@@ -20,7 +20,8 @@ The result precedence is:
 2. If any historical thread-backed Codex finding is unresolved, write
    `failure`. `isOutdated` never substitutes for `isResolved`.
 3. If all thread-backed findings are resolved and the latest accepted terminal
-   result for the current head is clean, write `success`.
+   result for the current head is clean and authorised by trusted marker or
+   recovery lineage, write `success`.
 4. If no accepted clean result is available for the current head, keep the
    status `pending` while the marker workflow continues.
 
@@ -35,11 +36,60 @@ Unthreaded top-level issue-comment findings have no GitHub resolution flag.
 They remain active until a later accepted clean result for the same or a newer
 head supersedes them.
 
-Before writing `success`, the action re-reads PR lifecycle and head, the
-selected terminal artifact, and the fully paginated findings snapshot. The
-latest live status is read only to avoid duplicate writes. If that read fails,
-the action still posts the freshly computed status; if the live status differs
-from the computed status, the action reasserts the computed status.
+Before writing `success`, the action follows one fixed order:
+
+1. Read and cache the latest live gate status on a best-effort basis.
+2. Re-read PR lifecycle and the exact head.
+3. Load the final fully paginated evidence snapshot. If its GraphQL thread
+   comments and REST review comments expose a possible cross-channel orphan,
+   perform one bounded whole-snapshot reload; a persistent orphan makes the run
+   incomplete and therefore `pending`.
+4. Revalidate findings, terminal-result identity and commit binding, and marker
+   or recovery authorisation.
+5. Decide status-write deduplication from the cached status without another
+   network read. Skip only when that cached latest status is already `success`;
+   otherwise immediately issue the single non-retried `success` POST.
+
+If the initial status read fails, the action still posts the freshly computed
+status after the final snapshot. An accepted-looking clean result that lacks
+active-marker, exact passed-marker reassertion, or failed-findings recovery
+lineage is demoted to `pending`; it is not accepted merely because it is clean
+and current-head.
+
+Every GitHub request attempt has a 60-second default deadline that covers both
+the fetch and response-body read. The final `success` POST is never blindly retried. If that
+POST fails or times out after GitHub may have persisted it, the workflow
+attempts a compensating `error` status and exits non-zero. If the compensating
+write also fails, the run still fails but the remote latest status may remain
+the ambiguous `success`; this is an explicit availability limitation, and a
+later complete gate run must repair the status before it is relied upon.
+
+```mermaid
+sequenceDiagram
+  participant Gate
+  participant GitHub
+  Gate->>GitHub: GET latest gate status (cache result)
+  Gate->>GitHub: GET PR lifecycle and exact head
+  Gate->>GitHub: GET final fully paginated evidence snapshot
+  opt Possible cross-channel orphan
+    Gate->>GitHub: Bounded whole-snapshot reload
+  end
+  Note over Gate: Validate completeness, findings, result, and lineage
+  Note over Gate: Deduplicate from cached status; no network read
+  alt Cached latest status is success
+    Note over Gate: Skip duplicate write
+  else Read failed, absent, or not success
+    Gate->>GitHub: POST success immediately (no blind retry)
+  end
+```
+
+The sticky state comment and status history are not review evidence, but the
+trusted marker comment and its recorded immutable lineage authorise which
+provider result may satisfy the gate. Normally the clean result must be newer
+than a valid active current-head marker and its baseline. Two narrow
+no-active-marker paths exist: reasserting a prior `passed` result with exact marker,
+baseline, and observed-result lineage; and the legacy same-head
+`failed_findings` recovery described below.
 
 ## Generative AI Disclosure
 
@@ -99,8 +149,11 @@ These values are exact lower-case strings so workflow-level routing and action r
 
 `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS` and the
 `completion-signal-buffer-seconds` action input are deprecated compatibility
-controls. They remain accepted in v1, but v1.3 commit-bound terminal evidence
-uses exact head binding instead of a timing buffer.
+controls. They remain operational in v1: for a top-level clean issue comment
+to satisfy an active marker, it must be newer than both the marker baseline and
+the marker creation time plus this buffer. Exact commit binding is required in
+addition to this timing check. Pull-request-review results use their submitted
+time and do not use this buffer.
 
 `+1` reactions are diagnostic in this design. They are recorded when useful, but they are not the primary pass signal because reactions do not provide a reliable workflow wake event.
 
@@ -115,20 +168,23 @@ variable is also accepted. If both are present, the action input takes
 precedence. Empty or unset values default to enabled; set either value to
 `false` to disable the legacy recovery branch.
 
-This switch controls only the legacy history-based recovery branch. It does not
-disable authoritative commit-bound reconciliation: the latest accepted
-current-head clean result plus resolution of every historical thread-backed
-finding still produces `success`, even when this compatibility switch is
-`false`.
+This switch controls the narrow no-active-marker recovery from a same-head
+`failed_findings` history entry. That recovery requires an exact current
+`issue_comment` trigger matching the selected strict current-head clean result,
+and the clean result must be newer than the failed marker's close time. Setting
+the switch to `false` disables this path. It does not affect an active-marker
+result or exact reassertion of an already passed marker.
 
 ### `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`
 
 `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`,
 `failed-findings-recovery-mode`, and `FAILED_FINDINGS_RECOVERY_MODE` are
-deprecated compatibility controls. `head` and `fresh` remain accepted, but
-commit-bound v1.3 reconciliation evaluates the current complete evidence
-snapshot and does not require a fresh provider result solely because an
-earlier reconciliation saw unresolved findings.
+deprecated compatibility controls, but remain operational in v1. `head` is the
+default and may reuse the same qualifying clean comment after all findings are
+resolved. `fresh` records a qualifying recovery comment that was rejected while
+findings remained unresolved; that comment and any clean comment created no
+later than the recorded rejection cutoff cannot recover the gate. A newer
+qualifying clean comment is then required.
 
 ## GHA Cost Model
 
@@ -144,11 +200,14 @@ Finding paths depend on event mode. In `standard` mode, a Codex submitted review
 
 The resolved-findings recovery path does not add a scheduled job or polling
 loop. After a `failed_findings` status, maintainers resolve every Codex review
-thread and rerun the gate through an ordinary provider event, schedule, or
-`workflow_dispatch`. The short job rebuilds the normal snapshot and performs a
-final validation reload before writing `success`. A previously accepted
-current-head clean result remains usable; a historical incomplete run does not
-force another Codex review.
+thread. The narrow no-marker recovery runs only from the exact top-level
+`issue_comment` event for the selected same-head clean result. In `head` mode,
+rerunning that event may reuse the same qualifying comment; in `fresh` mode, a
+rejected recovery attempt requires a newer clean comment. A schedule or
+`workflow_dispatch` cannot directly apply this no-marker exception. A targeted
+`workflow_dispatch` can instead create a new controlled marker; scheduled runs
+only advance marker state that is eligible for retry. Historical incomplete
+runs remain audit-only once a later run has complete evidence.
 
 The default schedule example is:
 
@@ -198,6 +257,14 @@ The state records:
 
 State comments and marker comments are trusted only from configured trusted authors. The default trusted author is `github-actions[bot]`, matching the repository workflow's `GITHUB_TOKEN` path.
 
+Legacy state is migrated without inventing pass authority. A legacy
+`lastStatus=failure` entry becomes verifiable `failed_findings` lineage only
+when the same head also has a trusted live marker and same-head failure
+evidence. Missing event-driven deadline fields on an otherwise valid marker are
+derived from its recorded times and current timeout controls. Any other
+ambiguous or incomplete legacy state remains `pending` and requires a fresh
+marker; migration never synthesises a passed marker or observed clean result.
+
 ## State Machine
 
 The reconciliation decision precedes marker orchestration:
@@ -209,8 +276,13 @@ flowchart TD
   complete -->|No, deterministic conflict| hardError["Write error; fail workflow"]
   complete -->|Yes| threads{"Any unresolved historical thread finding?"}
   threads -->|Yes| failed["Write failure"]
-  threads -->|No| clean{"Latest accepted current-head result clean?"}
-  clean -->|Yes| passed["Write or reassert success"]
+  threads -->|No| clean{"Latest validated current-head result clean?"}
+  clean -->|Yes| authorised{"Trusted marker or recovery lineage?"}
+  authorised -->|No| demoted["Demote to pending; continue marker flow"]
+  authorised -->|Yes| final["Run ordered final validation"]
+  final -->|Complete and still authorised| passed["Skip cached duplicate or POST success"]
+  final -->|Persistent orphan or other transient gap| pendingError
+  final -->|Deterministic conflict| hardError
   clean -->|No| pending["Keep pending and continue marker flow"]
 ```
 
@@ -226,8 +298,9 @@ flowchart TD
 
   waitingAck -->|Codex APPROVED review| validatePass["Reconcile complete current evidence"]
   waitingAck -->|Codex top-level clean completion comment| validatePass
-  validatePass -->|Current-head clean and all threads resolved| passed["Passed"]
-  validatePass -->|Unresolved finding or stale head| failed["FailedFindings"]
+  validatePass -->|Authorised clean and all threads resolved| passed["Passed"]
+  validatePass -->|Unresolved finding| failed["FailedFindings"]
+  validatePass -->|Unauthorised, stale, or incomplete| pending
 
   waitingAck -->|Codex submitted review| validateReview["Reconcile complete evidence"]
   validateReview -->|Findings exist| failed
@@ -244,10 +317,12 @@ flowchart TD
 
   passed -->|New commit| pending
   failed -->|New commit| pending
-  failed -->|Provider event, schedule, or manual rerun| validateRecovery["Reconcile complete current evidence"]
-  validateRecovery -->|Current-head clean and all threads resolved| passed
+  failed -->|Exact matching clean issue_comment event| validateRecovery["Validate failed-findings recovery lineage"]
+  validateRecovery -->|Authorised clean and all threads resolved| passed
   validateRecovery -->|Unresolved thread finding remains| failed
-  validateRecovery -->|Evidence incomplete| pending
+  validateRecovery -->|Unauthorised or incomplete| pending
+  failed -->|Schedule or manual rerun| resume["Resume or create controlled marker"]
+  resume --> marker
   waitingAck -->|Head changed| obsolete["Close marker as obsolete_head"]
   waitingResult -->|Head changed| obsolete
   obsolete --> pending
@@ -269,11 +344,11 @@ NoState / Passed / FailedFindings
 WaitingAck
   on Codex APPROVED review after marker for the same head:
     reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed or FailedFindings
+    -> Passed, FailedFindings, or Pending
 
   on Codex top-level completion comment after marker:
     reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed or FailedFindings
+    -> Passed, FailedFindings, or Pending
 
   on Codex submitted review after marker for the same head:
     reconcile the complete evidence snapshot
@@ -289,7 +364,7 @@ WaitingAck
 WaitingResult
   on Codex APPROVED review or top-level completion comment after marker:
     reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed or FailedFindings
+    -> Passed, FailedFindings, or Pending
 
   on an unresolved Codex finding:
     write failure
@@ -313,14 +388,20 @@ AnyState
     -> WaitingAck
 
 FailedFindings
-  on a provider event, schedule, rerun, or manual dispatch:
+  on the exact issue_comment event matching the selected same-head clean result:
     rebuild the complete evidence snapshot
     require every historical thread-backed finding to be resolved
-    require the latest accepted terminal result to be clean and bound to the current head
-    revalidate head, terminal evidence, and findings before writing
+    require failed_findings history lineage for this head and a result newer than its close time
+    apply the configured head or fresh recovery rule
+    run the ordered final validation before writing
     -> Passed if all requirements remain satisfied
     -> FailedFindings if an unresolved thread-backed finding remains
-    -> Pending or Error if current evidence is incomplete
+    -> Pending or Error if authorisation or current evidence is incomplete
+
+  on schedule, rerun, or manual dispatch:
+    do not directly apply the no-active-marker recovery exception
+    resume eligible retry state or create a fresh controlled marker
+    -> WaitingAck or remain Pending
 ```
 
 ## Signal Rules
@@ -351,11 +432,11 @@ blocking only when `isResolved` is true; `isOutdated` alone has no resolving
 effect. Unthreaded findings remain active until a later accepted clean result
 for the same or a newer head supersedes them.
 
-Before writing `success`, the action reloads:
-
-- PR lifecycle and the exact current head
-- the selected latest terminal provider artifact
-- the complete findings snapshot and thread resolution state
+The final `success` path uses the ordered sequence defined under Evidence
+Reconciliation: cached status GET, PR lifecycle/head GET, final complete
+snapshot (including the bounded whole-snapshot orphan reload when needed),
+no-network deduplication, then an immediate status POST if the cached latest
+status was not already `success`.
 
 Unknown future provider formats fail the current run closed. Once a later run
 can parse a complete newer current-head clean result, an older format error or
@@ -390,13 +471,16 @@ they do not prevent a later complete reconciliation from writing `success`.
 
 Consecutive `missed_ack` outcomes on the same head use exponential backoff. A head change or any non-`missed_ack` outcome resets that ack backoff history for the new marker.
 
-After `failed_findings`, maintainers resolve every Codex review thread and
-rerun through an ordinary provider event, schedule, or `workflow_dispatch`.
-A previously accepted current-head clean result can be reconciled again after
-the threads are resolved, regardless of the legacy recovery switch. An earlier
-incomplete run does not require a new Codex review. If the current
-reconciliation is still incomplete, it remains non-success until a complete
-run succeeds.
+After `failed_findings`, maintainers resolve every Codex review thread. With
+legacy recovery enabled, the exact matching same-head clean
+`issue_comment` event may recover without an active marker when it is newer
+than the failed marker close time. `head` may reuse that qualifying clean after
+resolution; `fresh` requires a clean newer than any recorded rejected recovery
+cutoff. Setting recovery to `false` disables this no-marker path. Scheduled and
+manual runs do not directly invoke the exception; a targeted manual run may
+instead create a new controlled marker, while scheduled runs only process
+eligible retry state. An earlier incomplete run remains audit-only, but a
+current incomplete snapshot still prevents success.
 
 ## Branch Protection
 

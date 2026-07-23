@@ -4,7 +4,7 @@
 
 ## 目标
 
-`codex/review-gate` 把受控 `@codex review` 请求转换成 deterministic commit status，并可被 branch protection 要求。只有 latest accepted Codex terminal result 为 clean、明确绑定当前 PR head，且历史上所有 thread-backed Codex findings 均已 resolved 时，gate 才会通过。
+`codex/review-gate` 把受控 `@codex review` 请求转换成 deterministic commit status，并可被 branch protection 要求。只有 latest accepted Codex terminal result 为 clean、明确绑定当前 PR head、由 trusted marker 或 recovery lineage 授权，且历史上所有 thread-backed Codex findings 均已 resolved 时，gate 才会通过。
 
 ## Evidence Reconciliation
 
@@ -19,7 +19,7 @@ commit-status history 当作判定来源。
 2. 历史上任一 thread-backed Codex finding 仍 unresolved 时，写入 `failure`。
    `isOutdated` 绝不能代替 `isResolved`。
 3. 所有 thread-backed findings 均已 resolved，且当前 head 的 latest accepted terminal
-   result 为 clean 时，写入 `success`。
+   result 为 clean、并由 trusted marker 或 recovery lineage 授权时，写入 `success`。
 4. 当前 head 没有 accepted clean result 时，在 marker workflow 继续运行期间保持
    `pending`。
 
@@ -32,10 +32,54 @@ commit-status history 当作判定来源。
 没有 thread 的 top-level issue-comment findings 不具备 GitHub resolution flag。它们会
 保持 active，直到同一或更新 head 上更晚的 accepted clean result supersede 它们。
 
-写入 `success` 前，action 会重新读取 PR lifecycle 和 head、选中的 terminal artifact，
-以及完整分页的 findings snapshot。Latest live status 只用于避免重复写入；如果该读取
-失败，action 仍会发布重新计算的 status；如果 live status 和计算结果不同，action 会
-重新写入计算结果。
+写入 `success` 前，action 严格按以下顺序执行：
+
+1. Best-effort 读取并缓存 latest live gate status。
+2. 重新读取 PR lifecycle 和精确 head。
+3. 加载 final fully paginated evidence snapshot。如果 GraphQL thread comments 与 REST
+   review comments 暴露可能的 cross-channel orphan，则执行一次有界的 whole-snapshot
+   reload；reload 后 orphan 仍存在时，当前运行 evidence incomplete，因此降为
+   `pending`。
+4. 重新验证 findings、terminal-result identity 与 commit binding，以及 marker 或
+   recovery authorisation。
+5. 只基于缓存的 status 做 write deduplication，中间不再进行 network read。只有缓存的
+   latest status 已是 `success` 才跳过；否则立即发出一次不重试的 `success` POST。
+
+如果最初的 status read 失败，action 仍会在 final snapshot 后发布重新计算的 status。
+如果一个看似 accepted 的 clean result 缺少 active-marker、精确 passed-marker
+reassertion 或 failed-findings recovery lineage，则主动降为 `pending`；不能仅因它
+clean 且绑定 current head 就接受。
+
+每次 GitHub 请求 attempt 都有默认 60 秒、覆盖 fetch 和 response body 读取的 deadline。最终
+`success` POST 不会盲目重试。如果该 POST 失败或超时，而 GitHub 可能已经将其落盘，
+workflow 会尝试写入补偿性的 `error` status，并以非零状态退出。如果补偿写入也失败，
+本次 run 仍会失败，但远端 latest status 可能暂时保留为有歧义的 `success`；这是明确的
+availability limitation，必须由后续一次完整 gate run 修复后才能依赖该 status。
+
+```mermaid
+sequenceDiagram
+  participant Gate
+  participant GitHub
+  Gate->>GitHub: GET latest gate status (cache result)
+  Gate->>GitHub: GET PR lifecycle and exact head
+  Gate->>GitHub: GET final fully paginated evidence snapshot
+  opt Possible cross-channel orphan
+    Gate->>GitHub: Bounded whole-snapshot reload
+  end
+  Note over Gate: Validate completeness, findings, result, and lineage
+  Note over Gate: Deduplicate from cached status; no network read
+  alt Cached latest status is success
+    Note over Gate: Skip duplicate write
+  else Read failed, absent, or not success
+    Gate->>GitHub: POST success immediately (no blind retry)
+  end
+```
+
+Sticky state comment 和 status history 不是 review evidence，但 trusted marker comment
+及 state 中记录的 immutable lineage 会授权哪些 provider result 可以满足 gate。通常
+clean result 必须晚于有效的 active current-head marker 及其 baseline。只有两条狭窄的
+no-active-marker 路径：以精确 marker、baseline 和 observed-result lineage 重新声明
+已经 `passed` 的结果；以及下文所述的 legacy same-head `failed_findings` recovery。
 
 ## 生成式 AI 提示
 
@@ -95,8 +139,10 @@ jobs:
 
 `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS` 和
 `completion-signal-buffer-seconds` action input 是 deprecated compatibility
-controls。v1 仍接受它们，但 v1.3 commit-bound terminal evidence 使用 exact head
-binding，而不依赖 timing buffer。
+controls，但在 v1 仍然生效：top-level clean issue comment 要满足 active marker，
+必须同时晚于 marker baseline，以及 marker creation time 加上该 buffer。除此之外仍
+必须满足 exact commit binding。Pull-request-review result 使用 submitted time，不使用
+该 buffer。
 
 `+1` reactions 在这个设计中是 diagnostic signals。它们在有用时会被记录，但不是主要 pass signal，因为 reactions 没有可靠的 workflow wake event。
 
@@ -110,18 +156,21 @@ variable 提供，并通过 `failed-findings-recovery` 传给 action。Runtime
 input 优先生效。留空或未设置时默认启用；把任一值设为 `false` 可关闭 legacy recovery
 branch。
 
-这个 switch 只控制 legacy history-based recovery branch，不能关闭 authoritative
-commit-bound reconciliation：即使这个 compatibility switch 是 `false`，latest
-accepted current-head clean result 加上历史所有 thread-backed findings 已 resolved，
-仍会产生 `success`。
+这个 switch 控制从 same-head `failed_findings` history entry 进入的狭窄
+no-active-marker recovery。该路径要求当前运行由精确匹配 selected strict
+current-head clean result 的 `issue_comment` event 触发，而且 clean result 必须晚于
+failed marker 的 close time。设为 `false` 会关闭这条路径，但不影响 active-marker
+result 或对已经 passed marker 的 exact reassertion。
 
 ### `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`
 
 `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`、
 `failed-findings-recovery-mode` 和 `FAILED_FINDINGS_RECOVERY_MODE` 是 deprecated
-compatibility controls。仍接受 `head` 和 `fresh`，但 commit-bound v1.3
-reconciliation 会评估当前完整 evidence snapshot；仅因为较早 reconciliation 看到
-unresolved findings，不会要求新的 provider result。
+compatibility controls，但在 v1 仍然生效。`head` 是默认值；所有 findings resolved
+后，可以复用同一个 qualifying clean comment。`fresh` 会记录 findings 仍 unresolved
+时被拒绝的 qualifying recovery comment；该 comment 以及 created time 不晚于 rejection
+cutoff 的其他 clean comments 都不能恢复 gate，之后必须出现更新的 qualifying clean
+comment。
 
 ## GHA 成本模型 (cost model)
 
@@ -135,10 +184,14 @@ Happy path 通常使用两个短 job：
 Finding paths 取决于 event mode。在 `standard` mode 中，Codex submitted review 可以唤醒 triage 并写入 `failure`。在 `comment-only` mode 中，status 可能保持 `pending`，直到 scheduled 或 manual scan 观察到 findings。
 
 Resolved-findings recovery path 不新增 scheduled job，也不引入 polling loop。
-`failed_findings` 之后，维护者 resolve 所有 Codex review threads，再通过普通 provider
-event、schedule 或 `workflow_dispatch` rerun gate。这个短 job 会重建常规 snapshot，
-并在写入 `success` 前做 final validation reload。此前已接受的 current-head clean
-result 仍可使用；历史上的 incomplete run 不会强制再次发起 Codex review。
+`failed_findings` 之后，维护者 resolve 所有 Codex review threads。狭窄的 no-marker
+recovery 只会从与 selected same-head clean result 精确匹配的 top-level
+`issue_comment` event 运行：`head` mode 可以 rerun 同一个 qualifying comment；
+`fresh` mode 在一次 rejected recovery 后要求更新的 clean comment。Schedule 和
+`workflow_dispatch` 都不能直接使用这条 no-marker exception；targeted
+`workflow_dispatch` 可以改为创建新的 controlled marker，scheduled runs 只推进符合
+retry 条件的 marker state。后续运行 evidence 完整时，历史 incomplete run 仍只作审计
+记录。
 
 默认 schedule 示例：
 
@@ -186,6 +239,13 @@ State 记录：
 
 State comments 和 marker comments 只信任配置的 trusted authors。默认 trusted author 是 `github-actions[bot]`，匹配 repository workflow 的 `GITHUB_TOKEN` 路径。
 
+Legacy state migration 不会凭空创建 pass authority。只有
+`lastStatus=failure`、同一 head 的 trusted live marker、同一 head 的 failure evidence
+三者同时存在时，才把 legacy entry 迁移为可验证的 `failed_findings` lineage。对于其他
+方面有效的 marker，如果缺少 event-driven deadline fields，则根据其已记录时间和当前
+timeout controls 补齐。其他 ambiguous 或 incomplete legacy state 保持 `pending`，并
+要求 fresh marker；migration 绝不会合成 passed marker 或 observed clean result。
+
 ## 状态机
 
 Evidence reconciliation 的判定先于 marker orchestration：
@@ -197,8 +257,13 @@ flowchart TD
   complete -->|No, deterministic conflict| hardError["Write error; fail workflow"]
   complete -->|Yes| threads{"Any unresolved historical thread finding?"}
   threads -->|Yes| failed["Write failure"]
-  threads -->|No| clean{"Latest accepted current-head result clean?"}
-  clean -->|Yes| passed["Write or reassert success"]
+  threads -->|No| clean{"Latest validated current-head result clean?"}
+  clean -->|Yes| authorised{"Trusted marker or recovery lineage?"}
+  authorised -->|No| demoted["Demote to pending; continue marker flow"]
+  authorised -->|Yes| final["Run ordered final validation"]
+  final -->|Complete and still authorised| passed["Skip cached duplicate or POST success"]
+  final -->|Persistent orphan or other transient gap| pendingError
+  final -->|Deterministic conflict| hardError
   clean -->|No| pending["Keep pending and continue marker flow"]
 ```
 
@@ -213,8 +278,9 @@ flowchart TD
 
   waitingAck -->|Codex APPROVED review| validatePass["Reconcile complete current evidence"]
   waitingAck -->|Codex top-level clean completion comment| validatePass
-  validatePass -->|Current-head clean and all threads resolved| passed["Passed"]
-  validatePass -->|Unresolved finding or stale head| failed["FailedFindings"]
+  validatePass -->|Authorised clean and all threads resolved| passed["Passed"]
+  validatePass -->|Unresolved finding| failed["FailedFindings"]
+  validatePass -->|Unauthorised, stale, or incomplete| pending
 
   waitingAck -->|Codex submitted review| validateReview["Reconcile complete evidence"]
   validateReview -->|Findings exist| failed
@@ -231,10 +297,12 @@ flowchart TD
 
   passed -->|New commit| pending
   failed -->|New commit| pending
-  failed -->|Provider event, schedule, or manual rerun| validateRecovery["Reconcile complete current evidence"]
-  validateRecovery -->|Current-head clean and all threads resolved| passed
+  failed -->|Exact matching clean issue_comment event| validateRecovery["Validate failed-findings recovery lineage"]
+  validateRecovery -->|Authorised clean and all threads resolved| passed
   validateRecovery -->|Unresolved thread finding remains| failed
-  validateRecovery -->|Evidence incomplete| pending
+  validateRecovery -->|Unauthorised or incomplete| pending
+  failed -->|Schedule or manual rerun| resume["Resume or create controlled marker"]
+  resume --> marker
   waitingAck -->|Head changed| obsolete["Close marker as obsolete_head"]
   waitingResult -->|Head changed| obsolete
   obsolete --> pending
@@ -256,11 +324,11 @@ NoState / Passed / FailedFindings
 WaitingAck
   on Codex APPROVED review after marker for the same head:
     reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed or FailedFindings
+    -> Passed, FailedFindings, or Pending
 
   on Codex top-level completion comment after marker:
     reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed or FailedFindings
+    -> Passed, FailedFindings, or Pending
 
   on Codex submitted review after marker for the same head:
     reconcile the complete evidence snapshot
@@ -276,7 +344,7 @@ WaitingAck
 WaitingResult
   on Codex APPROVED review or top-level completion comment after marker:
     reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed or FailedFindings
+    -> Passed, FailedFindings, or Pending
 
   on an unresolved Codex finding:
     write failure
@@ -300,14 +368,20 @@ AnyState
     -> WaitingAck
 
 FailedFindings
-  on a provider event, schedule, rerun, or manual dispatch:
+  on the exact issue_comment event matching the selected same-head clean result:
     rebuild the complete evidence snapshot
     require every historical thread-backed finding to be resolved
-    require the latest accepted terminal result to be clean and bound to the current head
-    revalidate head, terminal evidence, and findings before writing
+    require failed_findings history lineage for this head and a result newer than its close time
+    apply the configured head or fresh recovery rule
+    run the ordered final validation before writing
     -> Passed if all requirements remain satisfied
     -> FailedFindings if an unresolved thread-backed finding remains
-    -> Pending or Error if current evidence is incomplete
+    -> Pending or Error if authorisation or current evidence is incomplete
+
+  on schedule, rerun, or manual dispatch:
+    do not directly apply the no-active-marker recovery exception
+    resume eligible retry state or create a fresh controlled marker
+    -> WaitingAck or remain Pending
 ```
 
 ## Signal Rules
@@ -333,11 +407,10 @@ Thread-backed findings 属于历史 admission evidence。只有 `isResolved` 为
 thread 才不再阻塞；`isOutdated` 本身没有 resolving effect。没有 thread 的 findings
 保持 active，直到同一或更新 head 上更晚的 accepted clean result supersede 它们。
 
-写入 `success` 前，action 会重新加载：
-
-- PR lifecycle 和精确 current head
-- 选中的 latest terminal provider artifact
-- 完整 findings snapshot 和 thread resolution state
+Final `success` path 使用 Evidence Reconciliation 中规定的顺序：cached status GET、PR
+lifecycle/head GET、final complete snapshot（需要时包含一次有界 whole-snapshot orphan
+reload）、no-network deduplication，然后在 cached latest status 尚非 `success` 时立即
+POST status。
 
 未知的未来 provider format 会使当前运行 fail closed。后续运行一旦能解析完整且更新的
 current-head clean result，较早的 format error 或 incomplete API attempt 不会继续
@@ -371,11 +444,14 @@ Scheduled runs 处理 retry deadlines。它们应扫描 open PRs，只为 candid
 
 同一个 head 上连续的 `missed_ack` outcomes 使用 exponential backoff。Head change 或任何非 `missed_ack` outcome 都会为新 marker 重置 ack backoff history。
 
-`failed_findings` 之后，维护者 resolve 所有 Codex review threads，再通过普通 provider
-event、schedule 或 `workflow_dispatch` rerun。无论 legacy recovery switch 如何设置，
-此前已接受的 current-head clean result 都可以在 threads resolved 后再次
-reconciliation。较早的 incomplete run 不要求新发起 Codex review；如果当前
-reconciliation 仍不完整，则保持 non-success，直到一次完整运行成功。
+`failed_findings` 之后，维护者 resolve 所有 Codex review threads。Legacy recovery
+启用时，与 selected same-head clean result 精确匹配的 `issue_comment` event 可以在
+没有 active marker 的情况下恢复，但 clean result 必须晚于 failed marker close time。
+`head` 可以在 resolve 后复用该 qualifying clean；`fresh` 要求 clean 晚于所有已记录的
+rejected recovery cutoff。把 recovery 设为 `false` 会关闭这条 no-marker path。
+Scheduled 和 manual runs 都不会直接使用该 exception；targeted manual run 可以改为
+创建新的 controlled marker，而 scheduled runs 只处理符合条件的 retry state。较早的
+incomplete run 只作审计记录，但当前 snapshot 不完整时仍不能成功。
 
 ## Branch Protection
 

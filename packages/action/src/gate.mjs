@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFileSync, readFileSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   DEFAULT_CODEX_BOT_LOGINS,
@@ -8,6 +9,7 @@ import {
   GateFailure,
   NonJsonResponseError,
   STATUS_CONTEXT,
+  STATE_VERSION,
   activeMarkerIsObsolete,
   addSeconds,
   autoRetryEnabled,
@@ -50,7 +52,6 @@ import {
   retryAfterDelayMs,
   selectLatestCodexCompletionComment,
   shouldCreateFreshHeadMarker,
-  shouldFailFindingsBeforeMarker,
   shouldSkipScheduledScanWithoutMarker,
   stateNeedsFreshMarkerAfterMissingMarker,
   stateNeedsFreshMarkerAfterRecovery,
@@ -91,7 +92,8 @@ const REVIEW_THREADS_QUERY = `
                 endCursor
               }
               nodes {
-                databaseId
+                id
+                fullDatabaseId
               }
             }
           }
@@ -110,7 +112,8 @@ const REVIEW_THREAD_COMMENTS_QUERY = `
             endCursor
           }
           nodes {
-            databaseId
+            id
+            fullDatabaseId
           }
         }
       }
@@ -122,6 +125,8 @@ let activePrNumber = config.prNumber;
 let statusSha = config.headSha;
 let statusReady = false;
 const MAX_REQUEST_ATTEMPTS = 4;
+const MAX_WHOLE_SNAPSHOT_ATTEMPTS = 2;
+const MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS = 10_000;
 
 main().catch(async (error) => {
   const gateError =
@@ -344,6 +349,7 @@ async function processPullRequest(prNumber, trigger) {
     pullRequestIsDependabot(pullRequest);
 
   const snapshot = await loadSnapshot();
+  failIfSnapshotEvidenceIsInvalid(snapshot);
   const scheduledNoStatePending =
     trigger.kind === "scan" &&
     !trigger.allowCreateMarker &&
@@ -365,25 +371,26 @@ async function processPullRequest(prNumber, trigger) {
     stateComment: savedStateComment,
     needsFreshMarker: stateNeedsFreshMarker,
     needsSave: stateNeedsSave,
+    legacyFailureCandidate,
   } = await ensureState(snapshot, null, null, { persist: false });
+  const legacyMigration = migrateLegacyFailureState(
+    state,
+    snapshot,
+    isoNow(),
+    { legacyFailureCandidate },
+  );
+  state = legacyMigration.state;
+  stateNeedsFreshMarker = stateNeedsFreshMarker || legacyMigration.needsFreshMarker;
+  stateNeedsSave = stateNeedsSave || legacyMigration.changed;
   state = migrateStateForEventDrivenDeadlines(state);
   stateNeedsFreshMarker = stateNeedsFreshMarker ||
     stateNeedsFreshMarkerAfterRecovery(state) ||
     stateNeedsFreshMarkerAfterMissingMarker(state, statusSha);
-  const headChanged = state.statusHead !== statusSha || activeMarkerIsObsolete(state.activeMarker, statusSha);
+  let headChanged =
+    state.statusHead !== statusSha ||
+    activeMarkerIsObsolete(state.activeMarker, statusSha);
 
   let allowCreateMarker = trigger.allowCreateMarker || stateNeedsFreshMarker;
-
-  if (
-    await reconcileCurrentReviewEvidence(
-      snapshot,
-      state,
-      savedStateComment,
-      { headChanged },
-    )
-  ) {
-    return;
-  }
 
   if (stateNeedsSave) {
     try {
@@ -409,14 +416,55 @@ async function processPullRequest(prNumber, trigger) {
     });
   }
 
-  const freshHeadMarkerAllowed = shouldCreateFreshHeadMarker({
+  let freshHeadMarkerAllowed = shouldCreateFreshHeadMarker({
     allowCreateMarker,
     hasActiveMarker: Boolean(state.activeMarker),
     headChanged,
     stateNeedsFreshMarker,
   });
 
-  if (snapshot.findings.count === 0) {
+  if (freshHeadMarkerAllowed) {
+    const markerResult = await advanceEventDrivenMarker(
+      state,
+      savedStateComment,
+      snapshot,
+      { ...trigger, allowCreateMarker: true },
+    );
+    state = markerResult.state;
+    savedStateComment = markerResult.stateComment;
+    headChanged = false;
+    stateNeedsFreshMarker = false;
+    freshHeadMarkerAllowed = false;
+  }
+
+  if (
+    await reconcileCurrentReviewEvidence(
+      snapshot,
+      state,
+      savedStateComment,
+      { trigger },
+    )
+  ) {
+    return;
+  }
+
+  if (
+    snapshot.findings.count === 0 &&
+    snapshot.providerResult.kind === "clean" &&
+    !state.activeMarker
+  ) {
+    const demotion = await demoteUnauthorizedCleanIfNeeded(
+      state,
+      savedStateComment,
+    );
+    state = demotion.state;
+    savedStateComment = demotion.stateComment;
+  }
+
+  if (
+    snapshot.findings.count === 0 &&
+    (snapshot.providerResult.kind === "pending" || Boolean(state.activeMarker))
+  ) {
     await setCommitStatusIfNeeded("pending", "Waiting for a complete current-head Codex review result");
     state = updateStateForStatus(state, {
       now: isoNow(),
@@ -443,16 +491,6 @@ async function processPullRequest(prNumber, trigger) {
     return;
   }
 
-  if (
-    shouldFailFindingsBeforeMarker({
-      findingsCount: snapshot.findings.count,
-      freshHeadMarkerAllowed,
-    })
-  ) {
-    await failFromFindings(snapshot.findings, state, savedStateComment);
-    return;
-  }
-
   const result = await advanceEventDrivenMarker(
     state,
     savedStateComment,
@@ -471,14 +509,16 @@ async function ensureState(snapshot, previousState, previousComment, { persist =
       stateComment: previousComment,
       needsFreshMarker: false,
       needsSave: false,
+      legacyFailureCandidate: false,
     };
   }
 
   const stateComment = findLatestTrustedStateComment(snapshot.comments, config.trustedCommentLogins);
   if (stateComment) {
     const markerComment = findLatestTrustedMarkerComment(snapshot.comments, config.trustedCommentLogins);
+    const parsedState = parseStateCommentBody(stateComment.body || "");
     const reconciled = reconcileStateWithMarkerComment(
-      parseStateCommentBody(stateComment.body || ""),
+      parsedState,
       markerComment,
       isoNow(),
     );
@@ -491,6 +531,10 @@ async function ensureState(snapshot, previousState, previousComment, { persist =
       stateComment: reconciledStateComment,
       needsFreshMarker: false,
       needsSave: reconciled.changed && !persist,
+      legacyFailureCandidate:
+        !parsedState.activeMarker &&
+        (parsedState.history || []).length === 0 &&
+        parsedState.lastStatus?.state === "failure",
     };
   }
 
@@ -527,6 +571,72 @@ async function ensureState(snapshot, previousState, previousComment, { persist =
     stateComment: createdStateComment,
     needsFreshMarker: true,
     needsSave: !persist,
+    legacyFailureCandidate: false,
+  };
+}
+
+function migrateLegacyFailureState(
+  state,
+  snapshot,
+  now,
+  { legacyFailureCandidate = false } = {},
+) {
+  const history = state?.history || [];
+  const marker = state?.activeMarker;
+  const lastStatus = state?.lastStatus;
+  const matchesLegacyFailureState =
+    legacyFailureCandidate &&
+    history.length === 0 &&
+    state.statusHead === statusSha &&
+    lastStatus?.headSha === statusSha &&
+    lastStatus?.state === "failure";
+  if (!matchesLegacyFailureState) {
+    return { state, changed: false, needsFreshMarker: false };
+  }
+  if (!marker || marker.headSha !== statusSha) {
+    return { state, changed: false, needsFreshMarker: true };
+  }
+
+  let markerPredatesFailure;
+  try {
+    markerPredatesFailure =
+      parseTimestamp(marker.createdAt, "legacy marker creation time") <=
+      parseTimestamp(lastStatus.updatedAt, "legacy failure status time");
+  } catch {
+    return {
+      state: closeActiveMarker(state, "state_lost", now, {
+        recoveryReason: "legacy_failure_lineage_unknown",
+      }),
+      changed: true,
+      needsFreshMarker: true,
+    };
+  }
+  if (!markerPredatesFailure) {
+    return { state, changed: false, needsFreshMarker: false };
+  }
+
+  if (snapshot.findings.count > 0) {
+    return {
+      state: closeActiveMarker(
+        state,
+        "failed_findings",
+        lastStatus.updatedAt,
+        {
+          currentHeadFindingIds: snapshot.findings.ids,
+          recoveryReason: "legacy_failure_evidence_recovery",
+        },
+      ),
+      changed: true,
+      needsFreshMarker: false,
+    };
+  }
+
+  return {
+    state: closeActiveMarker(state, "state_lost", now, {
+      recoveryReason: "legacy_failure_lineage_unknown",
+    }),
+    changed: true,
+    needsFreshMarker: true,
   };
 }
 
@@ -670,56 +780,262 @@ async function reconcileCurrentReviewEvidence(
   snapshot,
   state,
   stateComment,
-  { headChanged = false } = {},
+  { trigger = null } = {},
 ) {
   failIfSnapshotEvidenceIsInvalid(snapshot);
   if (snapshot.findings.count > 0) {
-    await failFromFindings(snapshot.findings, state, stateComment);
+    const rejectedState = recordRejectedFreshRecoveryAttempt(
+      snapshot.providerResult,
+      state,
+      trigger,
+      snapshot,
+    );
+    await failFromFindings(snapshot.findings, rejectedState, stateComment);
     return true;
   }
   if (snapshot.providerResult.kind !== "clean") {
     return false;
   }
-  if (!providerResultCanSatisfyActiveMarker(snapshot.providerResult, state, { headChanged })) {
+  const authorization = providerResultAuthorization(
+    snapshot.providerResult,
+    state,
+    trigger,
+    snapshot,
+  );
+  if (!authorization) {
     return false;
   }
 
-  await passGateFromCurrentEvidence(state, stateComment);
+  await passGateFromCurrentEvidence(state, stateComment, {
+    trigger,
+    authorizationKind: authorization.kind,
+  });
   return true;
 }
 
-function providerResultCanSatisfyActiveMarker(providerResult, state, { headChanged }) {
+function providerResultAuthorization(providerResult, state, trigger, snapshot) {
   const marker = state?.activeMarker;
-  if (!marker || headChanged || activeMarkerIsObsolete(marker, statusSha)) {
-    return true;
+  if (!marker) {
+    return (
+      passedMarkerReassertAuthorization(providerResult, state, snapshot) ||
+      failedFindingsRecoveryAuthorization(providerResult, state, trigger, snapshot)
+    );
+  }
+  if (activeMarkerIsObsolete(marker, statusSha)) {
+    return null;
+  }
+  if (!trustedLiveMarkerMatches(marker, snapshot)) {
+    return null;
   }
 
-  const baselineId = providerResult.source === "issue-comment"
+  const baselineArtifact = providerResult.source === "issue-comment"
     ? marker.baseline?.completionComment
     : marker.baseline?.approvedReview;
   if (providerResult.source === "issue-comment") {
     return hasNewCompletionComment(
-      baselineId,
+      baselineArtifact,
       {
         id: String(providerResult.id),
         createdAt: providerResult.createdAt,
       },
       marker.createdAt,
       { bufferSeconds: config.completionSignalBufferSeconds },
-    );
+    )
+      ? { kind: "active-marker", marker }
+      : null;
   }
   if (providerResult.source === "pull-request-review") {
     return hasNewReviewTransition(
-      baselineId,
+      baselineArtifact,
       {
         id: String(providerResult.id),
         submittedAt: providerResult.createdAt,
       },
       marker.createdAt,
-    );
+    )
+      ? { kind: "active-marker", marker }
+      : null;
   }
 
-  return false;
+  return null;
+}
+
+function passedMarkerReassertAuthorization(providerResult, state, snapshot) {
+  if (state?.activeMarker || state?.statusHead !== statusSha) {
+    return null;
+  }
+  const passedMarker = [...(state?.history || [])]
+    .reverse()
+    .find((marker) => marker.headSha === statusSha);
+  if (
+    !passedMarker ||
+    (passedMarker.outcome || passedMarker.state) !== "passed" ||
+    !passedMarker.observedProviderResult
+  ) {
+    return null;
+  }
+
+  if (!trustedLiveMarkerMatches(passedMarker, snapshot)) {
+    return null;
+  }
+
+  const observed = passedMarker.observedProviderResult;
+  if (!isDeepStrictEqual(observed, providerResult)) {
+    return null;
+  }
+  return { kind: "passed-marker-reassert", marker: passedMarker };
+}
+
+function trustedLiveMarkerMatches(recordedMarker, snapshot) {
+  const markerComment = findLatestTrustedMarkerComment(
+    snapshot?.comments || [],
+    config.trustedCommentLogins,
+  );
+  const liveMarker = markerComment ? markerFromComment(markerComment) : null;
+  if (!liveMarker) {
+    return false;
+  }
+  if (
+    liveMarker.version !== STATE_VERSION ||
+    recordedMarker?.version !== STATE_VERSION
+  ) {
+    return false;
+  }
+
+  const immutableFields = [
+    "version",
+    "id",
+    "headSha",
+    "runUrl",
+    "runId",
+    "runAttempt",
+    "attempt",
+    "createdAt",
+  ];
+  return immutableFields.every((field) =>
+    String(liveMarker[field] ?? "") === String(recordedMarker[field] ?? ""),
+  ) && isDeepStrictEqual(liveMarker.baseline || {}, recordedMarker.baseline || {});
+}
+
+function failedFindingsRecoveryAuthorization(providerResult, state, trigger, snapshot) {
+  if (
+    !config.failedFindingsRecovery ||
+    state?.activeMarker ||
+    state?.statusHead !== statusSha ||
+    providerResult.source !== "issue-comment" ||
+    !trigger?.completionComment ||
+    String(trigger.completionComment.id) !== String(providerResult.id) ||
+    trigger.completionComment.createdAt !== providerResult.createdAt
+  ) {
+    return null;
+  }
+
+  const failedMarker = [...(state?.history || [])]
+    .reverse()
+    .find((marker) => marker.headSha === statusSha);
+  if (
+    !failedMarker ||
+    (failedMarker.outcome || failedMarker.state) !== "failed_findings" ||
+    !failedMarker.closedAt ||
+    !trustedLiveMarkerMatches(failedMarker, snapshot)
+  ) {
+    return null;
+  }
+
+  const resultCreatedAt = parseTimestamp(
+    providerResult.createdAt,
+    "Codex provider result creation time",
+  );
+  const findingsClosedAt = parseTimestamp(
+    failedMarker.closedAt,
+    "failed findings marker close time",
+  );
+  if (resultCreatedAt <= findingsClosedAt) {
+    return null;
+  }
+
+  if (
+    config.failedFindingsRecoveryMode === "fresh" &&
+    recoveryCompletionWasRejected(failedMarker, providerResult)
+  ) {
+    return null;
+  }
+  if (config.failedFindingsRecoveryMode === "fresh") {
+    const cutoff = latestRejectedRecoveryCutoff(failedMarker);
+    if (
+      cutoff &&
+      resultCreatedAt <= parseTimestamp(cutoff, "latest rejected recovery time")
+    ) {
+      return null;
+    }
+  }
+
+  return { kind: "failed-findings-recovery", marker: failedMarker };
+}
+
+function recordRejectedFreshRecoveryAttempt(providerResult, state, trigger, snapshot) {
+  if (
+    config.failedFindingsRecoveryMode !== "fresh" ||
+    !failedFindingsRecoveryAuthorization(providerResult, state, trigger, snapshot)
+  ) {
+    return state;
+  }
+
+  const rejected = {
+    id: String(providerResult.id),
+    createdAt: providerResult.createdAt,
+    rejectedAt: isoNow(),
+  };
+  const history = state.history || [];
+  const failedMarkerIndex = history.findLastIndex((marker) =>
+    marker.headSha === statusSha &&
+    (marker.outcome || marker.state) === "failed_findings",
+  );
+  return normalizeState({
+    ...state,
+    updatedAt: rejected.rejectedAt,
+    history: history.map((marker, index) => {
+      if (index !== failedMarkerIndex) {
+        return marker;
+      }
+      if (recoveryCompletionWasRejected(marker, providerResult)) {
+        return marker;
+      }
+      return {
+        ...marker,
+        latestRejectedRecoveryAt: latestRejectedRecoveryCutoff(
+          marker,
+          rejected.rejectedAt,
+        ),
+        rejectedRecoveryCompletions: [
+          ...(marker.rejectedRecoveryCompletions || []),
+          rejected,
+        ].slice(-20),
+      };
+    }),
+  });
+}
+
+function recoveryCompletionWasRejected(marker, providerResult) {
+  return (marker.rejectedRecoveryCompletions || []).some((rejected) =>
+    String(rejected.id) === String(providerResult.id) &&
+    rejected.createdAt === providerResult.createdAt,
+  );
+}
+
+function latestRejectedRecoveryCutoff(marker, fallback = null) {
+  const candidates = [
+    marker.latestRejectedRecoveryAt,
+    ...(marker.rejectedRecoveryCompletions || []).map((rejected) => rejected.rejectedAt),
+    fallback,
+  ].filter(Boolean);
+  if (candidates.length === 0) {
+    return null;
+  }
+  return candidates.sort((left, right) =>
+    parseTimestamp(right, "rejected recovery time") -
+      parseTimestamp(left, "rejected recovery time"),
+  )[0];
 }
 
 function failIfSnapshotEvidenceIsInvalid(snapshot) {
@@ -736,12 +1052,23 @@ function failIfSnapshotEvidenceIsInvalid(snapshot) {
   );
 }
 
-async function passGateFromCurrentEvidence(state, stateComment) {
-  await failIfPullRequestHeadChanged("before passing Codex review gate");
+async function passGateFromCurrentEvidence(
+  state,
+  stateComment,
+  { trigger = null, authorizationKind = "active-marker" } = {},
+) {
+  const liveStatus = await loadLatestGateStatus();
+  await failIfPullRequestHeadChanged("before final Codex review evidence snapshot");
   const finalSnapshot = await loadSnapshot();
   failIfSnapshotEvidenceIsInvalid(finalSnapshot);
   if (finalSnapshot.findings.count > 0) {
-    await failFromFindings(finalSnapshot.findings, state, stateComment);
+    const rejectedState = recordRejectedFreshRecoveryAttempt(
+      finalSnapshot.providerResult,
+      state,
+      trigger,
+      finalSnapshot,
+    );
+    await failFromFindings(finalSnapshot.findings, rejectedState, stateComment);
     return;
   }
   if (finalSnapshot.providerResult.kind !== "clean") {
@@ -751,13 +1078,18 @@ async function passGateFromCurrentEvidence(state, stateComment) {
       `The current-head Codex clean result for ${statusSha} was not stable across final validation.`,
     );
   }
-  if (!providerResultCanSatisfyActiveMarker(finalSnapshot.providerResult, state, {
-    headChanged: false,
-  })) {
+  const finalAuthorization = providerResultAuthorization(
+    finalSnapshot.providerResult,
+    state,
+    trigger,
+    finalSnapshot,
+  );
+  if (!finalAuthorization || finalAuthorization.kind !== authorizationKind) {
     throw new GateFailure(
       "pending",
-      "Codex clean result predates the active review request",
-      `The current-head Codex clean result for ${statusSha} is not newer than the active marker.`,
+      "Codex clean result is not authorized by the current review state",
+      `The current-head Codex clean result for ${statusSha} is not authorized by ` +
+        `${authorizationKind}.`,
     );
   }
 
@@ -774,13 +1106,18 @@ async function passGateFromCurrentEvidence(state, stateComment) {
       status: "success",
     },
   );
-  const liveStatus = await loadLatestGateStatus();
-  await failIfPullRequestHeadChanged("immediately before final Codex gate status");
-  await setCommitStatusIfNeeded(
-    "success",
-    "Latest Codex review is clean and all findings are resolved",
-    { liveStatus },
-  );
+  try {
+    await setCommitStatusIfNeeded(
+      "success",
+      "Latest Codex review is clean and all findings are resolved",
+      { liveStatus, retryTransient: false },
+    );
+  } catch (error) {
+    throw new Error(
+      `${STATUS_CONTEXT}=success may have persisted despite an unsuccessful response; ` +
+        `the workflow must publish a compensating non-success status: ${error.message}`,
+    );
+  }
   try {
     await saveState(passedState, stateComment);
   } catch (error) {
@@ -795,7 +1132,7 @@ async function passGateFromCurrentEvidence(state, stateComment) {
 async function passGate(state, stateComment, snapshot, observed) {
   void snapshot;
   void observed;
-  await passGateFromCurrentEvidence(state, stateComment, null);
+  await passGateFromCurrentEvidence(state, stateComment);
 }
 
 async function failFromFindings(findings, state, stateComment) {
@@ -819,6 +1156,36 @@ async function failFromFindings(findings, state, stateComment) {
     console.warn(`failed to save audit state after ${STATUS_CONTEXT}=failure: ${error.message}`);
   }
   console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
+}
+
+async function demoteUnauthorizedCleanIfNeeded(state, stateComment) {
+  const liveStatus = await loadLatestGateStatus();
+  if (!liveStatus.readFailed && liveStatus.latest?.state !== "success") {
+    return { state, stateComment };
+  }
+
+  await setCommitStatusIfNeeded(
+    "pending",
+    "Current-head Codex clean result is not authorized by trusted marker lineage",
+    { liveStatus },
+  );
+  const pendingState = updateStateForStatus(state, {
+    now: isoNow(),
+    statusHead: statusSha,
+    runUrl,
+    status: "pending",
+  });
+  try {
+    return {
+      state: pendingState,
+      stateComment: await saveState(pendingState, stateComment),
+    };
+  } catch (error) {
+    console.warn(
+      `failed to save audit state after unauthorized clean demotion: ${error.message}`,
+    );
+    return { state: pendingState, stateComment };
+  }
 }
 
 function migrateStateForEventDrivenDeadlines(state) {
@@ -949,6 +1316,36 @@ async function saveState(state, stateComment) {
 }
 
 async function loadSnapshot() {
+  for (let attempt = 1; attempt <= MAX_WHOLE_SNAPSHOT_ATTEMPTS; attempt += 1) {
+    const snapshot = await loadSnapshotOnce();
+    if (
+      snapshot.providerResult.kind === "malformed" ||
+      snapshot.evidenceErrors.length > 0 ||
+      (
+        snapshot.evidenceTransientErrors.length === 0
+      )
+    ) {
+      return snapshot;
+    }
+    if (attempt < MAX_WHOLE_SNAPSHOT_ATTEMPTS) {
+      await sleepBeforeRetry(
+        "review evidence was inconsistent; reloading the whole snapshot",
+        attempt,
+      );
+      continue;
+    }
+    throw new GateFailure(
+      "pending",
+      "Codex review evidence is temporarily incomplete",
+      `Cross-channel review evidence remained incomplete after a bounded whole-snapshot ` +
+        `reload: ${snapshot.evidenceTransientErrors[0]}`,
+    );
+  }
+
+  throw new Error("whole-snapshot reconciliation exceeded its retry budget");
+}
+
+async function loadSnapshotOnce() {
   const [comments, issueReactions, reviewComments, reviews, reviewThreads] = await Promise.all([
     paginate(`${repoPath}/issues/${activePrNumber}/comments`, { per_page: "100" }),
     paginate(`${repoPath}/issues/${activePrNumber}/reactions`, { per_page: "100" }),
@@ -996,6 +1393,7 @@ async function loadSnapshot() {
     findings: evidence.findings,
     providerResult: evidence.providerResult,
     evidenceErrors: evidence.errors,
+    evidenceTransientErrors: evidence.transientErrors,
   };
 }
 
@@ -1048,6 +1446,7 @@ async function buildCurrentReviewEvidence({ comments, reviewComments, reviews, r
   return {
     providerResult,
     errors: threadFindings.errors,
+    transientErrors: threadFindings.transientErrors,
     findings: {
       count: threadFindings.count + providerFindings.count,
       ids: [...threadFindings.ids, ...providerFindings.ids],
@@ -1306,6 +1705,10 @@ function readConfig() {
     runId: requiredEnv("GITHUB_RUN_ID"),
     runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
     maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 7200, { allowZero: false }) * 1000,
+    requestTimeoutMs:
+      secondsEnv("CODEX_REVIEW_GATE_REQUEST_TIMEOUT_SECONDS", 60, {
+        allowZero: false,
+      }) * 1000,
     markerTimeoutMs: markerTimeoutSeconds * 1000,
     markerAckTimeoutSeconds: markerAckTimeoutConfig.markerAckTimeoutSeconds,
     markerAckTimeoutMaxSeconds: markerAckTimeoutConfig.markerAckTimeoutMaxSeconds,
@@ -1465,20 +1868,28 @@ function selectLatestCodexReview(reviews, botLogins, predicate) {
   return matches[0] || null;
 }
 
-async function setCommitStatus(state, description) {
+async function setCommitStatus(
+  state,
+  description,
+  { retryTransient = true } = {},
+) {
   await request("POST", `${repoPath}/statuses/${statusSha}`, {
     state,
     context: STATUS_CONTEXT,
     description: truncate(description, 140),
     target_url: runUrl,
-  });
+  }, { retryTransient });
   console.log(`Set ${STATUS_CONTEXT}=${state}: ${description}`);
 }
 
 async function setCommitStatusIfNeeded(
   state,
   description,
-  { beforeDecision = null, liveStatus = null } = {},
+  {
+    beforeDecision = null,
+    liveStatus = null,
+    retryTransient = true,
+  } = {},
 ) {
   const observed = liveStatus || await loadLatestGateStatus();
 
@@ -1489,7 +1900,7 @@ async function setCommitStatusIfNeeded(
     console.log(`Latest live ${STATUS_CONTEXT} already equals ${state} for ${statusSha}.`);
     return;
   }
-  await setCommitStatus(state, description);
+  await setCommitStatus(state, description, { retryTransient });
 }
 
 async function loadLatestGateStatus() {
@@ -1620,7 +2031,12 @@ async function loadAllReviewThreadComments(thread) {
   };
 }
 
-async function request(method, path, bodyOrQuery) {
+async function request(
+  method,
+  path,
+  bodyOrQuery,
+  { retryTransient = true } = {},
+) {
   for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
     const url = new URL(`${config.apiUrl}${path}`);
     const options = {
@@ -1643,11 +2059,19 @@ async function request(method, path, bodyOrQuery) {
     }
 
     let response;
+    let text;
     try {
-      response = await fetch(url, options);
+      ({ response, text } = await fetchWithDeadline(url, options));
     } catch (error) {
-      if (attempt < MAX_REQUEST_ATTEMPTS && restRequestRetryAllowed(method, path, 503)) {
-        await sleepBeforeRetry(`retrying ${method} ${url.pathname} after fetch error: ${error.message}`, attempt);
+      if (
+        retryTransient &&
+        attempt < MAX_REQUEST_ATTEMPTS &&
+        restRequestRetryAllowed(method, path, 503)
+      ) {
+        await sleepBeforeRetry(
+          `retrying ${method} ${url.pathname} after transport error: ${error.message}`,
+          attempt,
+        );
         continue;
       }
       if (method === "GET") {
@@ -1660,8 +2084,10 @@ async function request(method, path, bodyOrQuery) {
       throw error;
     }
 
-    const text = await response.text();
-    const explicitRateLimit = responseIsExplicitRateLimit(response);
+    let explicitRateLimit = responseIsExplicitRateLimit(response);
+    let rateLimitRetryAfter = explicitRateLimit
+      ? boundedRateLimitRetryAfter(response)
+      : null;
     let data;
     try {
       data = parseJsonResponseText(text, `${method} ${url.pathname} (${response.status})`);
@@ -1669,16 +2095,20 @@ async function request(method, path, bodyOrQuery) {
       if (
         error instanceof NonJsonResponseError &&
         !response.ok &&
+        retryTransient &&
         attempt < MAX_REQUEST_ATTEMPTS &&
-        (
-          restRequestRetryAllowed(method, path, response.status) ||
-          (method === "GET" && explicitRateLimit)
-        )
+        restResponseRetryAllowed({
+          method,
+          path,
+          status: response.status,
+          explicitRateLimit,
+          rateLimitRetryAfter,
+        })
       ) {
         await sleepBeforeRetry(
           `retrying ${method} ${url.pathname} after ${response.status}: ${error.preview}`,
           attempt,
-          response.headers.get("retry-after"),
+          rateLimitRetryAfter,
         );
         continue;
       }
@@ -1696,20 +2126,28 @@ async function request(method, path, bodyOrQuery) {
       }
       throw error;
     }
+    explicitRateLimit = responseIsExplicitRateLimit(response, data);
+    rateLimitRetryAfter = explicitRateLimit
+      ? boundedRateLimitRetryAfter(response)
+      : null;
 
     if (!response.ok) {
       const message = data?.message || response.statusText;
       if (
+        retryTransient &&
         attempt < MAX_REQUEST_ATTEMPTS &&
-        (
-          restRequestRetryAllowed(method, path, response.status) ||
-          (method === "GET" && explicitRateLimit)
-        )
+        restResponseRetryAllowed({
+          method,
+          path,
+          status: response.status,
+          explicitRateLimit,
+          rateLimitRetryAfter,
+        })
       ) {
         await sleepBeforeRetry(
           `retrying ${method} ${url.pathname} after ${response.status}: ${message}`,
           attempt,
-          response.headers.get("retry-after"),
+          rateLimitRetryAfter,
         );
         continue;
       }
@@ -1735,8 +2173,9 @@ async function request(method, path, bodyOrQuery) {
 async function graphqlRequest(query, variables) {
   for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
     let response;
+    let text;
     try {
-      response = await fetch(config.graphqlUrl, {
+      ({ response, text } = await fetchWithDeadline(config.graphqlUrl, {
         method: "POST",
         headers: {
           Accept: "application/vnd.github+json",
@@ -1746,10 +2185,13 @@ async function graphqlRequest(query, variables) {
           "X-GitHub-Api-Version": "2022-11-28",
         },
         body: JSON.stringify({ query, variables }),
-      });
+      }));
     } catch (error) {
       if (attempt < MAX_REQUEST_ATTEMPTS) {
-        await sleepBeforeRetry(`retrying GraphQL request after fetch error: ${error.message}`, attempt);
+        await sleepBeforeRetry(
+          `retrying GraphQL request after transport error: ${error.message}`,
+          attempt,
+        );
         continue;
       }
       throw new GateFailure(
@@ -1759,8 +2201,10 @@ async function graphqlRequest(query, variables) {
       );
     }
 
-    const text = await response.text();
-    const explicitRateLimit = responseIsExplicitRateLimit(response);
+    let explicitRateLimit = responseIsExplicitRateLimit(response);
+    let rateLimitRetryAfter = explicitRateLimit
+      ? boundedRateLimitRetryAfter(response)
+      : null;
     let payload;
     try {
       payload = parseJsonResponseText(
@@ -1772,12 +2216,18 @@ async function graphqlRequest(query, variables) {
         error instanceof NonJsonResponseError &&
         !response.ok &&
         attempt < MAX_REQUEST_ATTEMPTS &&
-        (isRetryableHttpStatus(response.status) || explicitRateLimit)
+        (
+          (
+            isRetryableHttpStatus(response.status) &&
+            !explicitRateLimit
+          ) ||
+          (explicitRateLimit && rateLimitRetryAfter !== null)
+        )
       ) {
         await sleepBeforeRetry(
           `retrying GraphQL request after ${response.status}: ${error.preview}`,
           attempt,
-          response.headers.get("retry-after"),
+          rateLimitRetryAfter,
         );
         continue;
       }
@@ -1794,17 +2244,29 @@ async function graphqlRequest(query, variables) {
       }
       throw error;
     }
+    explicitRateLimit =
+      responseIsExplicitRateLimit(response, payload) ||
+      graphqlErrorsAreExplicitRateLimit(payload?.errors || []);
+    rateLimitRetryAfter = explicitRateLimit
+      ? boundedRateLimitRetryAfter(response)
+      : null;
 
     if (!response.ok) {
       const message = payload?.message || response.statusText;
       if (
         attempt < MAX_REQUEST_ATTEMPTS &&
-        (isRetryableHttpStatus(response.status) || explicitRateLimit)
+        (
+          (
+            isRetryableHttpStatus(response.status) &&
+            !explicitRateLimit
+          ) ||
+          (explicitRateLimit && rateLimitRetryAfter !== null)
+        )
       ) {
         await sleepBeforeRetry(
           `retrying GraphQL request after ${response.status}: ${message}`,
           attempt,
-          response.headers.get("retry-after"),
+          rateLimitRetryAfter,
         );
         continue;
       }
@@ -1820,11 +2282,15 @@ async function graphqlRequest(query, variables) {
     if (payload?.errors?.length) {
       const message = payload.errors.map((error) => error.message).join("; ");
       if (graphqlErrorsAreExplicitRateLimit(payload.errors)) {
-        if (attempt < MAX_REQUEST_ATTEMPTS) {
+        rateLimitRetryAfter = boundedRateLimitRetryAfter(response);
+        if (
+          attempt < MAX_REQUEST_ATTEMPTS &&
+          rateLimitRetryAfter !== null
+        ) {
           await sleepBeforeRetry(
             `retrying GraphQL request after rate limit: ${message}`,
             attempt,
-            response.headers.get("retry-after"),
+            rateLimitRetryAfter,
           );
           continue;
         }
@@ -1843,13 +2309,60 @@ async function graphqlRequest(query, variables) {
   throw new Error("GraphQL request exceeded retry budget");
 }
 
-function responseIsExplicitRateLimit(response) {
+function responseIsExplicitRateLimit(response, payload = null) {
   if (response.status !== 403 && response.status !== 429) {
     return false;
   }
-  return response.status === 429 ||
+  if (
+    response.status === 429 ||
     response.headers.get("retry-after") !== null ||
-    response.headers.get("x-ratelimit-remaining") === "0";
+    response.headers.get("x-ratelimit-remaining") === "0"
+  ) {
+    return true;
+  }
+
+  const message = String(payload?.message || "");
+  const documentationUrl = String(payload?.documentation_url || "");
+  return /\brate[ -]?limit(?:ed| exceeded)?\b|secondary rate limit|abuse detection/i.test(message) ||
+    /rate-limits?/i.test(documentationUrl);
+}
+
+function boundedRateLimitRetryAfter(response) {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter !== null) {
+    return retryAfterDelayMs(retryAfter, MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS + 1) <=
+      MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS
+      ? retryAfter
+      : null;
+  }
+
+  const resetHeader = response.headers.get("x-ratelimit-reset");
+  if (resetHeader === null || resetHeader.trim() === "") {
+    return null;
+  }
+  const reset = Number(resetHeader);
+  if (!Number.isFinite(reset) || reset < 0) {
+    return null;
+  }
+  const delayMs = Math.max(0, reset * 1000 - Date.now());
+  if (delayMs > MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS) {
+    return null;
+  }
+  return String(Math.ceil(delayMs / 1000));
+}
+
+function restResponseRetryAllowed({
+  method,
+  path,
+  status,
+  explicitRateLimit,
+  rateLimitRetryAfter,
+}) {
+  if (!explicitRateLimit) {
+    return restRequestRetryAllowed(method, path, status);
+  }
+  return rateLimitRetryAfter !== null &&
+    restRequestRetryAllowed(method, path, 429);
 }
 
 function graphqlErrorsAreExplicitRateLimit(errors) {
@@ -1866,6 +2379,28 @@ function graphqlEndpoint(apiUrl, serverUrl) {
     return `${serverUrl}/api/graphql`;
   }
   return `${apiUrl}/graphql`;
+}
+
+async function fetchWithDeadline(input, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort(
+      new Error(
+        `GitHub request exceeded the ${Math.round(config.requestTimeoutMs / 1000)}s attempt deadline`,
+      ),
+    );
+  }, config.requestTimeoutMs);
+
+  try {
+    const response = await fetch(input, {
+      ...options,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    return { response, text };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function sleep(ms) {

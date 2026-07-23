@@ -25,7 +25,7 @@ The runner implements an event-driven serialized marker flow:
 
 - Runs under `pull_request_target` from the repository default branch.
 - Writes the configured commit status, `codex/review-gate` by default, to the PR head SHA.
-- Passes only when the latest accepted Codex terminal result is bound to the current head, is clean, and every historical thread-backed Codex finding is resolved.
+- Passes only when the latest accepted Codex terminal result is bound to the current head, is clean, is authorised by trusted marker or recovery lineage, and every historical thread-backed Codex finding is resolved.
 - Treats `isOutdated` and `isResolved` independently. An outdated but unresolved thread still blocks the gate.
 - Recognises unthreaded top-level finding comments from exact repository and full-SHA blob links; a later accepted clean result for the same or newer head supersedes those findings.
 - Validates official provider identity and binds reviews, inline comments, and top-level results to their reviewed commit.
@@ -36,8 +36,10 @@ The runner implements an event-driven serialized marker flow:
 - Treats Codex reactions as diagnostic signals only; `eyes` reactions on the active marker comment count as liveness, not pass.
 - Uses scheduled or manual resume runs to retry unacknowledged or stalled markers.
 - Fails closed when the current reconciliation cannot load or validate all required evidence. Transient exhaustion produces `pending`; deterministic provider identity, schema, or commit conflicts produce `error`. Both fail the workflow.
+- Demotes an otherwise clean current-head result to `pending` when active-marker, exact passed-marker reassertion, or failed-findings recovery lineage does not authorise it.
+- Before success, caches the live status, revalidates PR lifecycle and head, loads the final complete snapshot with a bounded whole-snapshot orphan reload when needed, then deduplicates without another read and immediately posts success if required.
 - Reasserts the computed status when the latest live commit status differs, even if the sticky state comment records an older success.
-- Recovers from `failed_findings` after maintainers resolve every thread-backed Codex finding and the latest accepted current-head result is clean.
+- Supports a narrow legacy `failed_findings` recovery from the exact matching same-head clean `issue_comment` event after every thread-backed Codex finding is resolved; the compatibility inputs control whether the same clean may be reused or a newer one is required.
 - Ignores PR-open automatic review output unless it appears after the active controlled marker and passes final current-head validation.
 
 ## Files
@@ -134,6 +136,7 @@ jobs:
           head-sha: ${{ github.event.pull_request.head.sha || '' }}
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
+          completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
 ```
 
 ## Inputs
@@ -150,9 +153,9 @@ jobs:
 | `marker-timeout-seconds` | `3600` | Time to wait for an acknowledged marker result before retrying. |
 | `marker-ack-timeout-seconds` | `300` | Initial time to wait for Codex to acknowledge a marker before retrying. |
 | `marker-ack-timeout-max-seconds` | `1800` | Maximum exponential backoff wait for unacknowledged markers. |
-| `completion-signal-buffer-seconds` | `30` | Deprecated compatibility input. Commit-bound terminal evidence uses exact head binding rather than a timing buffer. |
-| `failed-findings-recovery` | empty | Compatibility switch for the legacy history-based recovery branch. Empty defaults to enabled; `false` disables only that branch and cannot disable authoritative commit-bound reconciliation. |
-| `failed-findings-recovery-mode` | empty | Deprecated compatibility input. `head` and `fresh` remain accepted, but commit-bound v1.3 reconciliation evaluates the current evidence snapshot and does not depend on this mode. |
+| `completion-signal-buffer-seconds` | `30` | Deprecated but operational v1 compatibility input. An issue-comment clean result must be newer than the active marker by this buffer as well as exactly commit-bound. |
+| `failed-findings-recovery` | empty | Deprecated but operational switch for narrow same-head, no-active-marker recovery from `failed_findings`. Empty defaults to enabled; `false` disables this path. |
+| `failed-findings-recovery-mode` | empty | Deprecated but operational v1 input. `head` may reuse the same qualifying clean after findings resolve; `fresh` requires a clean newer than a recorded rejected recovery attempt. |
 | `event-mode` | empty | Event mode override: exactly `standard`, `comment-only`, or `full`. Empty falls back to `CODEX_REVIEW_GATE_EVENT_MODE` or `standard`. |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input. Event-driven runs do not poll. |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input. Event-driven runs create controlled markers directly. |

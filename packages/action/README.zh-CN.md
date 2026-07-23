@@ -25,7 +25,7 @@ Runner 实现了 event-driven serialized marker flow：
 
 - 通过 repository default branch 上的 `pull_request_target` 运行。
 - 把配置的 commit status 写到 PR head SHA；默认是 `codex/review-gate`。
-- 只有 latest accepted Codex terminal result 明确绑定 current head、结果为 clean，且历史上所有 thread-backed Codex findings 均已 resolved 时才通过。
+- 只有 latest accepted Codex terminal result 明确绑定 current head、结果为 clean、由 trusted marker 或 recovery lineage 授权，且历史上所有 thread-backed Codex findings 均已 resolved 时才通过。
 - 分开处理 `isOutdated` 和 `isResolved`。Outdated 但 unresolved 的 thread 仍会阻塞 gate。
 - 通过精确 repository 和 full-SHA blob links 识别没有 thread 的 top-level finding comments；同一或更新 head 上更晚的 accepted clean result 会 supersede 这些 findings。
 - 验证官方 provider identity，并把 reviews、inline comments 和 top-level results 绑定到其 reviewed commit。
@@ -36,8 +36,10 @@ Runner 实现了 event-driven serialized marker flow：
 - 把 Codex reactions 只作为诊断信号。
 - 用 scheduled 或 manual resume runs 重试未 ack 或 stalled 的 markers。
 - 当前 reconciliation 无法完整加载或校验所需 evidence 时 fail closed。暂时性读取重试耗尽写入 `pending`；确定性的 provider identity、schema 或 commit 冲突写入 `error`；两者都会使 workflow 失败。
+- 如果 otherwise clean 的 current-head result 缺少 active-marker、精确 passed-marker reassertion 或 failed-findings recovery lineage 授权，则主动降为 `pending`。
+- 写入 success 前，先缓存 live status，再验证 PR lifecycle 和 head，加载 final complete snapshot，并在需要时执行有界 whole-snapshot orphan reload；之后不再读取 status，只做 deduplication，并在需要时立即 POST success。
 - 如果 latest live commit status 和重新计算的结果不同，即使 sticky state comment 记录了较早的 success，也会重新写入计算结果。
-- 在维护者 resolve 所有 thread-backed Codex findings 后，如果 latest accepted current-head result 为 clean，可从 `failed_findings` 恢复。
+- 提供狭窄的 legacy `failed_findings` recovery：维护者 resolve 所有 thread-backed Codex findings 后，只有与 selected same-head clean result 精确匹配的 `issue_comment` event 才可使用；compatibility inputs 决定能否复用同一个 clean，或必须等待更新结果。
 - 如果误开 PR-open automatic review，也只有 active controlled marker 之后的输出能通过最终 current-head validation。
 
 ## 文件
@@ -134,6 +136,7 @@ jobs:
           head-sha: ${{ github.event.pull_request.head.sha || '' }}
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
+          completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
 ```
 
 ## Inputs
@@ -150,9 +153,9 @@ jobs:
 | `marker-timeout-seconds` | `3600` | 已 ack marker 等待结果的时间，超时后重试。 |
 | `marker-ack-timeout-seconds` | `300` | Codex ack marker 前的初始等待时间。 |
 | `marker-ack-timeout-max-seconds` | `1800` | 未 ack marker 指数退避等待上限。 |
-| `completion-signal-buffer-seconds` | `30` | Deprecated compatibility input。Commit-bound terminal evidence 使用 exact head binding，而不依赖 timing buffer。 |
-| `failed-findings-recovery` | empty | Legacy history-based recovery branch 的 compatibility switch。留空默认启用；`false` 只关闭该 legacy branch，不能关闭 authoritative commit-bound reconciliation。 |
-| `failed-findings-recovery-mode` | empty | Deprecated compatibility input。仍接受 `head` 和 `fresh`，但 commit-bound v1.3 reconciliation 会评估当前 evidence snapshot，不依赖这个 mode。 |
+| `completion-signal-buffer-seconds` | `30` | Deprecated 但在 v1 仍生效的 compatibility input。Issue-comment clean result 除了 exact commit binding，还必须比 active marker 晚该 buffer。 |
+| `failed-findings-recovery` | empty | Deprecated 但在 v1 仍生效的 switch，用于从 `failed_findings` 进入狭窄的 same-head、no-active-marker recovery。留空默认启用；`false` 关闭该路径。 |
+| `failed-findings-recovery-mode` | empty | Deprecated 但在 v1 仍生效。`head` 可在 findings resolved 后复用同一个 qualifying clean；`fresh` 要求 clean 晚于已记录的 rejected recovery attempt。 |
 | `event-mode` | empty | Event mode override：精确小写 `standard`、`comment-only` 或 `full`。留空时使用 `CODEX_REVIEW_GATE_EVENT_MODE` 或 `standard`。 |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input。Event-driven runs 不轮询。 |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input。Event-driven runs 会直接创建 controlled marker。 |

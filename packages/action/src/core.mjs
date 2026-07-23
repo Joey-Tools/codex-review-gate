@@ -366,22 +366,160 @@ export function collectUnresolvedCodexThreadFindings(
   botLogins = DEFAULT_CODEX_BOT_LOGINS,
   headSha = "",
 ) {
+  const reviewCommentsList = reviewComments || [];
   const reviewById = new Map((reviews || []).map((review) => [String(review.id), review]));
-  const threadByCommentId = buildReviewThreadIndex(reviewThreads);
+  const restCommentByNodeId = new Map();
+  const restCommentByDatabaseId = new Map();
+  const threadByNodeId = new Map();
+  const graphqlCommentByDatabaseId = new Map();
+  const reviewThreadIds = new Set();
   const findingByThreadId = new Map();
   const errors = [];
+  const transientErrors = [];
 
-  for (const comment of reviewComments || []) {
+  for (const comment of reviewCommentsList) {
+    const databaseId = normalizeReviewCommentDatabaseId(comment?.id);
+    const nodeId = normalizeReviewCommentNodeId(comment?.node_id);
+    if (!databaseId) {
+      errors.push("REST review-comment snapshot contains a comment without a valid numeric id");
+    } else if (restCommentByDatabaseId.has(databaseId)) {
+      errors.push(`REST review-comment snapshot contains duplicate numeric id ${databaseId}`);
+    } else {
+      restCommentByDatabaseId.set(databaseId, comment);
+    }
+    if (!nodeId) {
+      errors.push(
+        `REST review-comment ${databaseId || "<unknown>"} is missing a valid opaque node_id`,
+      );
+    } else if (restCommentByNodeId.has(nodeId)) {
+      errors.push(`REST review-comment snapshot contains duplicate node_id ${nodeId}`);
+    } else {
+      restCommentByNodeId.set(nodeId, comment);
+    }
+  }
+
+  for (const thread of reviewThreads || []) {
+    const threadId = normalizeReviewCommentNodeId(thread?.id);
+    if (!threadId) {
+      errors.push(
+        "GraphQL review-thread snapshot contains a thread without a valid opaque id",
+      );
+      continue;
+    }
+    if (reviewThreadIds.has(threadId)) {
+      errors.push(
+        `GraphQL review-thread snapshot contains duplicate or conflicting thread id ${threadId}`,
+      );
+      continue;
+    }
+    reviewThreadIds.add(threadId);
+
+    const comments = thread?.comments?.nodes || [];
+    const unresolved = thread?.isResolved !== true;
+    if (unresolved && comments.length === 0) {
+      transientErrors.push(
+        `unresolved review thread ${threadId} has no loaded GraphQL comments`,
+      );
+    }
+    for (const graphqlComment of comments) {
+      const nodeId = normalizeReviewCommentNodeId(graphqlComment?.id);
+      const databaseId = normalizeReviewCommentDatabaseId(
+        graphqlComment?.fullDatabaseId,
+      );
+      if (!nodeId) {
+        if (unresolved) {
+          errors.push(
+            `unresolved review thread ${threadId} contains a GraphQL comment ` +
+              "without a valid opaque id",
+          );
+        }
+        continue;
+      }
+
+      const priorNode = threadByNodeId.get(nodeId);
+      if (priorNode) {
+        if (unresolved || priorNode.unresolved) {
+          const priorThreadId = String(priorNode.thread.id || "unknown");
+          errors.push(priorThreadId === threadId
+            ? `GraphQL review comment opaque id ${nodeId} appears more than once in thread ${threadId}`
+            : `GraphQL review comment opaque id ${nodeId} appears in multiple review threads`);
+        }
+        continue;
+      }
+      threadByNodeId.set(nodeId, { thread, unresolved });
+
+      if (!databaseId) {
+        if (unresolved) {
+          errors.push(
+            `unresolved review thread ${threadId} contains GraphQL comment ${nodeId} ` +
+              "without a valid fullDatabaseId",
+          );
+        }
+        continue;
+      }
+
+      const priorDatabaseId = graphqlCommentByDatabaseId.get(databaseId);
+      if (priorDatabaseId) {
+        if (unresolved || priorDatabaseId.unresolved) {
+          const priorThreadId = String(priorDatabaseId.thread.id || "unknown");
+          errors.push(priorThreadId === threadId
+            ? `GraphQL review comment fullDatabaseId ${databaseId} appears more than once in thread ${threadId}`
+            : `GraphQL review comment fullDatabaseId ${databaseId} appears in multiple review threads`);
+        }
+      } else {
+        graphqlCommentByDatabaseId.set(databaseId, {
+          thread,
+          unresolved,
+          nodeId,
+        });
+      }
+
+      if (!unresolved) {
+        continue;
+      }
+      const restComment = restCommentByNodeId.get(nodeId);
+      if (!restComment) {
+        const conflictingRestComment = restCommentByDatabaseId.get(databaseId);
+        if (conflictingRestComment) {
+          errors.push(
+            `unresolved review thread ${threadId} maps GraphQL fullDatabaseId ` +
+              `${databaseId} to opaque id ${nodeId}, but REST maps it to conflicting ` +
+              `node_id ${normalizeReviewCommentNodeId(conflictingRestComment.node_id) || "<invalid>"}`,
+          );
+          continue;
+        }
+        transientErrors.push(
+          `unresolved review thread ${threadId} contains GraphQL comment ${nodeId} ` +
+            "missing from the complete REST review-comment snapshot",
+        );
+        continue;
+      }
+      const restDatabaseId = normalizeReviewCommentDatabaseId(restComment.id);
+      if (restDatabaseId !== databaseId) {
+        errors.push(
+          `unresolved review thread ${threadId} maps GraphQL comment ${nodeId} ` +
+            `fullDatabaseId ${databaseId} to conflicting REST numeric id ` +
+            `${restDatabaseId || "<invalid>"}`,
+        );
+      }
+    }
+  }
+
+  for (const comment of reviewCommentsList) {
     if (!isCodexBot(comment?.user?.login, botLogins)) {
       continue;
     }
 
-    const thread = threadByCommentId.get(String(comment.id));
+    const nodeId = normalizeReviewCommentNodeId(comment.node_id);
+    if (!nodeId) {
+      continue;
+    }
+    const thread = threadByNodeId.get(nodeId)?.thread;
     if (thread?.isResolved) {
       continue;
     }
     if (!thread) {
-      errors.push(`review comment ${comment.id} has no loaded review thread`);
+      transientErrors.push(`review comment ${comment.id} has no loaded review thread`);
       continue;
     }
 
@@ -429,7 +567,28 @@ export function collectUnresolvedCodexThreadFindings(
     ids: findings.map((finding) => finding.id),
     samples: findings.map((finding) => finding.sample).slice(0, 3),
     errors,
+    transientErrors,
   };
+}
+
+function normalizeReviewCommentNodeId(value) {
+  if (typeof value !== "string" || value.length === 0 || value.trim() !== value) {
+    return null;
+  }
+  return value;
+}
+
+function normalizeReviewCommentDatabaseId(value) {
+  if (typeof value === "bigint") {
+    return value > 0n ? value.toString() : null;
+  }
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+  }
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) {
+    return null;
+  }
+  return BigInt(value).toString();
 }
 
 export function isTrustedCommentAuthor(login, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
@@ -748,9 +907,9 @@ export function buildReviewThreadIndex(reviewThreads = []) {
   for (const thread of reviewThreads || []) {
     const comments = thread.comments?.nodes || [];
     for (const comment of comments) {
-      const id = comment.databaseId ?? comment.id;
-      if (id !== null && id !== undefined) {
-        byCommentId.set(String(id), thread);
+      const databaseId = normalizeReviewCommentDatabaseId(comment.fullDatabaseId);
+      if (databaseId) {
+        byCommentId.set(databaseId, thread);
       }
     }
   }
@@ -1089,13 +1248,10 @@ export function buildMarkerCommentBody(marker) {
 
 export function parseMarkerCommentBody(body) {
   const parsed = parseHiddenJson(body, MARKER_COMMENT);
-  if (!parsed) {
+  if (!parsed || parsed.version !== STATE_VERSION) {
     return null;
   }
-  return {
-    ...parsed,
-    version: STATE_VERSION,
-  };
+  return parsed;
 }
 
 export function findLatestTrustedStateComment(comments, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
@@ -1108,12 +1264,16 @@ export function findLatestTrustedStateComment(comments, trustedLogins = DEFAULT_
 }
 
 export function findLatestTrustedMarkerComment(comments, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
-  return [...comments]
+  const latestMarkerShapedComment = [...comments]
     .reverse()
     .find((comment) =>
       isTrustedCommentAuthor(comment.user?.login, trustedLogins) &&
-      Boolean(parseMarkerCommentBody(comment.body || "")),
+      markerCommentBodyHasControlEnvelope(comment.body || ""),
     ) || null;
+  return latestMarkerShapedComment &&
+    parseMarkerCommentBody(latestMarkerShapedComment.body || "")
+    ? latestMarkerShapedComment
+    : null;
 }
 
 export function markerFromComment(comment) {
@@ -1140,6 +1300,13 @@ export function parseHiddenJson(body, marker) {
     return null;
   }
   return JSON.parse(match[1]);
+}
+
+function markerCommentBodyHasControlEnvelope(body) {
+  const pattern = new RegExp(
+    `<!--\\s*${escapeRegExp(MARKER_COMMENT)}(?:\\s|$)`,
+  );
+  return pattern.test(String(body || ""));
 }
 
 export function parseTimestamp(value, description) {

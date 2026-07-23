@@ -38,6 +38,7 @@ import {
   parseCodexIssueCommentArtifact,
   parseCodexReviewArtifact,
   parseJsonResponseText,
+  parseMarkerCommentBody,
   parseStateCommentBody,
   pullRequestIsDependabot,
   reconcileStateWithMarkerComment,
@@ -58,6 +59,19 @@ import {
 
 const FULL_SHA_A = "a".repeat(40);
 const FULL_SHA_B = "b".repeat(40);
+const LARGE_REVIEW_COMMENT_ID = 3634927460;
+const LARGE_REVIEW_COMMENT_NODE_ID = "PRRC_kwDOReviewGate3634927460";
+
+function reviewCommentNodeId(numericId) {
+  return `PRRC_kwDOReviewGate${numericId}`;
+}
+
+function graphqlReviewComment(numericId, nodeId = reviewCommentNodeId(numericId)) {
+  return {
+    id: nodeId,
+    fullDatabaseId: String(numericId),
+  };
+}
 
 function liveCodexIssueComment(body, overrides = {}) {
   return {
@@ -749,6 +763,42 @@ test("finds the latest trusted marker comment", () => {
   });
 });
 
+test("rejects a marker comment with a missing or conflicting schema version", () => {
+  const markerBody = buildMarkerCommentBody({
+    headSha: "abc123",
+    runUrl: "https://example.invalid/runs/1",
+    runId: "1",
+    runAttempt: "1",
+    attempt: 1,
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+  });
+
+  assert.equal(
+    parseMarkerCommentBody(markerBody.replace('"version": 1', '"version": 2')),
+    null,
+  );
+  assert.equal(
+    parseMarkerCommentBody(markerBody.replace('  "version": 1,\n', "")),
+    null,
+  );
+
+  const olderValid = {
+    id: 1,
+    body: markerBody,
+    user: { login: "github-actions[bot]" },
+  };
+  const newerIncompatible = {
+    id: 2,
+    body: markerBody.replace('"version": 1', '"version": 2'),
+    user: { login: "github-actions[bot]" },
+  };
+  assert.equal(
+    findLatestTrustedMarkerComment([olderValid, newerIncompatible]),
+    null,
+  );
+});
+
 test("persists marker recovery fields when present", () => {
   const markerBody = buildMarkerCommentBody({
     headSha: "abc123",
@@ -1065,6 +1115,7 @@ test("retains historical unresolved Codex threads even when they are outdated", 
     [
       {
         id: 301,
+        node_id: reviewCommentNodeId(301),
         path: "src/history.mjs",
         original_line: 7,
         original_commit_id: FULL_SHA_B,
@@ -1089,7 +1140,7 @@ test("retains historical unresolved Codex threads even when they are outdated", 
         isOutdated: true,
         path: "src/history.mjs",
         line: 7,
-        comments: { nodes: [{ databaseId: 301 }] },
+        comments: { nodes: [graphqlReviewComment(301)] },
       },
     ],
     undefined,
@@ -1101,6 +1152,54 @@ test("retains historical unresolved Codex threads even when they are outdated", 
     ids: ["thread:historical-thread"],
     samples: ["src/history.mjs:7"],
     errors: [],
+    transientErrors: [],
+  });
+});
+
+test("matches unresolved Codex threads with review-comment IDs above signed 32-bit range", () => {
+  const result = collectUnresolvedCodexThreadFindings(
+    [
+      {
+        id: LARGE_REVIEW_COMMENT_ID,
+        node_id: LARGE_REVIEW_COMMENT_NODE_ID,
+        path: "src/large-id.mjs",
+        line: 8,
+        original_commit_id: FULL_SHA_A,
+        pull_request_review_id: 402,
+        user: {
+          login: "chatgpt-codex-connector[bot]",
+          type: "Bot",
+        },
+      },
+    ],
+    [
+      liveCodexReview({
+        id: 402,
+        state: "COMMENTED",
+      }),
+    ],
+    [
+      {
+        id: "large-id-thread",
+        isResolved: false,
+        comments: {
+          nodes: [{
+            id: LARGE_REVIEW_COMMENT_NODE_ID,
+            fullDatabaseId: String(LARGE_REVIEW_COMMENT_ID),
+          }],
+        },
+      },
+    ],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 1,
+    ids: ["thread:large-id-thread"],
+    samples: ["src/large-id.mjs:8"],
+    errors: [],
+    transientErrors: [],
   });
 });
 
@@ -1109,6 +1208,7 @@ test("skips resolved historical threads before validating stale or missing ident
     [
       {
         id: 302,
+        node_id: reviewCommentNodeId(302),
         path: "src/resolved.mjs",
         original_line: 8,
         original_commit_id: "old",
@@ -1122,7 +1222,7 @@ test("skips resolved historical threads before validating stale or missing ident
         id: "resolved-historical-thread",
         isResolved: true,
         isOutdated: true,
-        comments: { nodes: [{ databaseId: 302 }] },
+        comments: { nodes: [graphqlReviewComment(302)] },
       },
     ],
     undefined,
@@ -1134,6 +1234,7 @@ test("skips resolved historical threads before validating stale or missing ident
     ids: [],
     samples: [],
     errors: [],
+    transientErrors: [],
   });
 });
 
@@ -1142,6 +1243,7 @@ test("requires unresolved inline findings to bind through full parent and origin
     [
       {
         id: 303,
+        node_id: reviewCommentNodeId(303),
         path: "src/valid.mjs",
         line: 9,
         original_commit_id: FULL_SHA_A,
@@ -1153,6 +1255,7 @@ test("requires unresolved inline findings to bind through full parent and origin
       },
       {
         id: 304,
+        node_id: reviewCommentNodeId(304),
         path: "src/short.mjs",
         line: 10,
         original_commit_id: "abcdef1234",
@@ -1171,12 +1274,12 @@ test("requires unresolved inline findings to bind through full parent and origin
       {
         id: "valid-binding",
         isResolved: false,
-        comments: { nodes: [{ databaseId: 303 }] },
+        comments: { nodes: [graphqlReviewComment(303)] },
       },
       {
         id: "short-binding",
         isResolved: false,
-        comments: { nodes: [{ databaseId: 304 }] },
+        comments: { nodes: [graphqlReviewComment(304)] },
       },
     ],
     undefined,
@@ -1188,6 +1291,7 @@ test("requires unresolved inline findings to bind through full parent and origin
     ids: ["thread:valid-binding", "thread:short-binding"],
     samples: ["src/valid.mjs:9", "src/short.mjs:10"],
     errors: ["review comment 304 is not bound through full commit SHAs"],
+    transientErrors: [],
   });
 });
 
@@ -1200,12 +1304,14 @@ test("reports missing current threads, missing parents, and conflicting inline c
     [
       {
         id: 305,
+        node_id: reviewCommentNodeId(305),
         original_commit_id: FULL_SHA_A,
         pull_request_review_id: 405,
         user: codexUser,
       },
       {
         id: 306,
+        node_id: reviewCommentNodeId(306),
         path: "src/missing-parent.mjs",
         line: 11,
         original_commit_id: FULL_SHA_B,
@@ -1214,6 +1320,7 @@ test("reports missing current threads, missing parents, and conflicting inline c
       },
       {
         id: 307,
+        node_id: reviewCommentNodeId(307),
         path: "src/conflict.mjs",
         line: 12,
         original_commit_id: FULL_SHA_A,
@@ -1222,6 +1329,7 @@ test("reports missing current threads, missing parents, and conflicting inline c
       },
       {
         id: 308,
+        node_id: reviewCommentNodeId(308),
         original_commit_id: FULL_SHA_B,
         pull_request_review_id: 408,
         user: codexUser,
@@ -1237,12 +1345,12 @@ test("reports missing current threads, missing parents, and conflicting inline c
       {
         id: "missing-parent",
         isResolved: false,
-        comments: { nodes: [{ databaseId: 306 }] },
+        comments: { nodes: [graphqlReviewComment(306)] },
       },
       {
         id: "commit-conflict",
         isResolved: false,
-        comments: { nodes: [{ databaseId: 307 }] },
+        comments: { nodes: [graphqlReviewComment(307)] },
       },
     ],
     undefined,
@@ -1254,11 +1362,340 @@ test("reports missing current threads, missing parents, and conflicting inline c
     ids: ["thread:missing-parent", "thread:commit-conflict"],
     samples: ["src/missing-parent.mjs:11", "src/conflict.mjs:12"],
     errors: [
-      "review comment 305 has no loaded review thread",
       "review comment 306 has no loaded parent review",
       "review comment 307 original commit conflicts with its parent review",
+    ],
+    transientErrors: [
+      "review comment 305 has no loaded review thread",
       "review comment 308 has no loaded review thread",
     ],
+  });
+});
+
+test("rejects unresolved GraphQL comments missing from the complete REST snapshot", () => {
+  const result = collectUnresolvedCodexThreadFindings(
+    [],
+    [],
+    [{
+      id: "orphan-thread",
+      isResolved: false,
+      comments: { nodes: [graphqlReviewComment(901)] },
+    }],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 0,
+    ids: [],
+    samples: [],
+    errors: [],
+    transientErrors: [
+      `unresolved review thread orphan-thread contains GraphQL comment ` +
+        `${reviewCommentNodeId(901)} ` +
+        "missing from the complete REST review-comment snapshot",
+    ],
+  });
+});
+
+test("rejects conflicting opaque identities for the same REST and GraphQL full ID", () => {
+  const restNodeId = reviewCommentNodeId(904);
+  const graphqlNodeId = `${restNodeId}Conflict`;
+  const result = collectUnresolvedCodexThreadFindings(
+    [{
+      id: 904,
+      node_id: restNodeId,
+      user: { login: "octocat", type: "User" },
+    }],
+    [],
+    [{
+      id: "opaque-conflict-thread",
+      isResolved: false,
+      comments: {
+        nodes: [{
+          id: graphqlNodeId,
+          fullDatabaseId: "904",
+        }],
+      },
+    }],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 0,
+    ids: [],
+    samples: [],
+    errors: [
+      `unresolved review thread opaque-conflict-thread maps GraphQL fullDatabaseId ` +
+        `904 to opaque id ${graphqlNodeId}, but REST maps it to conflicting ` +
+        `node_id ${restNodeId}`,
+    ],
+    transientErrors: [],
+  });
+});
+
+test("rejects missing, duplicate, and conflicting GraphQL review-thread identities", () => {
+  const duplicateThreadId = "PRRT_kwDOReviewGateDuplicate";
+  const conflictingThreadId = "PRRT_kwDOReviewGateConflict";
+  const result = collectUnresolvedCodexThreadFindings(
+    [],
+    [],
+    [
+      {
+        id: null,
+        isResolved: true,
+        comments: { nodes: [] },
+      },
+      {
+        id: duplicateThreadId,
+        isResolved: true,
+        comments: { nodes: [] },
+      },
+      {
+        id: duplicateThreadId,
+        isResolved: true,
+        comments: { nodes: [] },
+      },
+      {
+        id: conflictingThreadId,
+        isResolved: true,
+        isOutdated: false,
+        comments: { nodes: [] },
+      },
+      {
+        id: conflictingThreadId,
+        isResolved: false,
+        isOutdated: true,
+        comments: { nodes: [] },
+      },
+    ],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 0,
+    ids: [],
+    samples: [],
+    errors: [
+      "GraphQL review-thread snapshot contains a thread without a valid opaque id",
+      `GraphQL review-thread snapshot contains duplicate or conflicting thread id ` +
+        duplicateThreadId,
+      `GraphQL review-thread snapshot contains duplicate or conflicting thread id ` +
+        conflictingThreadId,
+    ],
+    transientErrors: [],
+  });
+});
+
+test("rejects REST review comments missing an opaque node identity", () => {
+  const result = collectUnresolvedCodexThreadFindings(
+    [{
+      id: 901,
+      user: { login: "octocat", type: "User" },
+    }],
+    [],
+    [],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 0,
+    ids: [],
+    samples: [],
+    errors: ["REST review-comment 901 is missing a valid opaque node_id"],
+    transientErrors: [],
+  });
+});
+
+test("rejects unresolved GraphQL comments missing opaque or full database identities", () => {
+  const human = { login: "octocat", type: "User" };
+  const result = collectUnresolvedCodexThreadFindings(
+    [
+      {
+        id: 902,
+        node_id: reviewCommentNodeId(902),
+        user: human,
+      },
+      {
+        id: 903,
+        node_id: reviewCommentNodeId(903),
+        user: human,
+      },
+    ],
+    [],
+    [{
+      id: "missing-identities",
+      isResolved: false,
+      comments: {
+        nodes: [
+          {
+            id: null,
+            fullDatabaseId: "902",
+          },
+          {
+            id: reviewCommentNodeId(903),
+            fullDatabaseId: null,
+          },
+        ],
+      },
+    }],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 0,
+    ids: [],
+    samples: [],
+    errors: [
+      "unresolved review thread missing-identities contains a GraphQL comment " +
+        "without a valid opaque id",
+      `unresolved review thread missing-identities contains GraphQL comment ` +
+        `${reviewCommentNodeId(903)} without a valid fullDatabaseId`,
+    ],
+    transientErrors: [],
+  });
+});
+
+test("rejects duplicate REST numeric and opaque review-comment identities", () => {
+  const human = { login: "octocat", type: "User" };
+  const result = collectUnresolvedCodexThreadFindings(
+    [
+      {
+        id: 910,
+        node_id: reviewCommentNodeId(910),
+        user: human,
+      },
+      {
+        id: 910,
+        node_id: reviewCommentNodeId(911),
+        user: human,
+      },
+      {
+        id: 912,
+        node_id: reviewCommentNodeId(910),
+        user: human,
+      },
+    ],
+    [],
+    [],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 0,
+    ids: [],
+    samples: [],
+    errors: [
+      "REST review-comment snapshot contains duplicate numeric id 910",
+      `REST review-comment snapshot contains duplicate node_id ${reviewCommentNodeId(910)}`,
+    ],
+    transientErrors: [],
+  });
+});
+
+test("rejects duplicate and conflicting GraphQL opaque and full identities", () => {
+  const human = { login: "octocat", type: "User" };
+  const result = collectUnresolvedCodexThreadFindings(
+    [
+      {
+        id: 920,
+        node_id: reviewCommentNodeId(920),
+        user: human,
+      },
+      {
+        id: 921,
+        node_id: reviewCommentNodeId(921),
+        user: human,
+      },
+    ],
+    [],
+    [
+      {
+        id: "thread-a",
+        isResolved: false,
+        comments: {
+          nodes: [
+            graphqlReviewComment(920),
+            {
+              id: reviewCommentNodeId(920),
+              fullDatabaseId: "921",
+            },
+            {
+              id: reviewCommentNodeId(921),
+              fullDatabaseId: "920",
+            },
+          ],
+        },
+      },
+      {
+        id: "thread-b",
+        isResolved: true,
+        comments: {
+          nodes: [
+            {
+              id: reviewCommentNodeId(920),
+              fullDatabaseId: "922",
+            },
+            {
+              id: reviewCommentNodeId(922),
+              fullDatabaseId: "920",
+            },
+          ],
+        },
+      },
+    ],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 0,
+    ids: [],
+    samples: [],
+    errors: [
+      `GraphQL review comment opaque id ${reviewCommentNodeId(920)} ` +
+        "appears more than once in thread thread-a",
+      "GraphQL review comment fullDatabaseId 920 appears more than once in thread thread-a",
+      `unresolved review thread thread-a maps GraphQL comment ${reviewCommentNodeId(921)} ` +
+        "fullDatabaseId 920 to conflicting REST numeric id 921",
+      `GraphQL review comment opaque id ${reviewCommentNodeId(920)} ` +
+        "appears in multiple review threads",
+      "GraphQL review comment fullDatabaseId 920 appears in multiple review threads",
+    ],
+    transientErrors: [],
+  });
+});
+
+test("keeps fully mapped pure-human unresolved threads out of Codex findings", () => {
+  const result = collectUnresolvedCodexThreadFindings(
+    [{
+      id: 903,
+      node_id: reviewCommentNodeId(903),
+      path: "src/human.mjs",
+      line: 9,
+      user: { login: "octocat", type: "User" },
+    }],
+    [],
+    [{
+      id: "human-thread",
+      isResolved: false,
+      comments: { nodes: [graphqlReviewComment(903)] },
+    }],
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.deepEqual(result, {
+    count: 0,
+    ids: [],
+    samples: [],
+    errors: [],
+    transientErrors: [],
   });
 });
 
@@ -1298,6 +1735,7 @@ test("ignores resolved but retains outdated unresolved current-head Codex inline
   const comments = [
     {
       id: 10,
+      node_id: reviewCommentNodeId(10),
       path: "src/resolved.rs",
       line: null,
       original_line: 7,
@@ -1307,6 +1745,7 @@ test("ignores resolved but retains outdated unresolved current-head Codex inline
     },
     {
       id: 11,
+      node_id: reviewCommentNodeId(11),
       path: "src/outdated.rs",
       line: null,
       original_line: 8,
@@ -1316,6 +1755,7 @@ test("ignores resolved but retains outdated unresolved current-head Codex inline
     },
     {
       id: 12,
+      node_id: reviewCommentNodeId(12),
       path: "src/active.rs",
       line: 9,
       commit_id: "head",
@@ -1328,19 +1768,19 @@ test("ignores resolved but retains outdated unresolved current-head Codex inline
       id: "resolved-thread",
       isResolved: true,
       isOutdated: true,
-      comments: { nodes: [{ databaseId: 10 }] },
+      comments: { nodes: [graphqlReviewComment(10)] },
     },
     {
       id: "outdated-thread",
       isResolved: false,
       isOutdated: true,
-      comments: { nodes: [{ databaseId: 11 }] },
+      comments: { nodes: [graphqlReviewComment(11)] },
     },
     {
       id: "active-thread",
       isResolved: false,
       isOutdated: false,
-      comments: { nodes: [{ databaseId: 12 }] },
+      comments: { nodes: [graphqlReviewComment(12)] },
     },
   ];
 
