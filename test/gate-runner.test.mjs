@@ -4178,6 +4178,23 @@ test("legacy passed migration fails closed when the final provider artifact chan
     assert.equal(successStatusWrites(harness), 0);
     assert.equal(harness.statuses.at(-1).body.state, "pending");
     assert.match(result.stderr, /not authorized by passed-marker-reassert/);
+
+    const recoveryResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.findMarkerComments().length, 2);
+    const recoveredState = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(recoveredState.history.at(-1).outcome, "state_lost");
+    assert.equal(
+      recoveredState.history.at(-1).recoveryReason,
+      "unauthorized_passed_result_lineage",
+    );
+    assert.equal(recoveredState.activeMarker.state, "waiting_ack");
+    assert.equal(recoveredState.activeMarker.baseline.completionComment.id, "2002");
   });
 });
 
@@ -4202,11 +4219,10 @@ test("passed-marker reassertion fails closed when the trusted marker lineage is 
   });
 });
 
-test("an unauthorized clean actively demotes a live success to pending", async () => {
+test("an unauthorized passed clean starts and preserves a fresh marker across scheduled runs", async () => {
   await withHarness(async (harness) => {
     harness.seedSuccessfulState();
-    harness.issueComments = harness.issueComments.filter((comment) => comment.id !== 1999);
-    harness.issueComments.push(codexCleanComment(2001));
+    harness.issueComments.push(codexCleanComment(2002, "2026-05-14T10:01:01Z"));
     harness.commitStatuses.push({
       sha: HEAD_SHA,
       context: "codex/review-gate",
@@ -4221,7 +4237,91 @@ test("an unauthorized clean actively demotes a live success to pending", async (
     assert.equal(result.code, 0, result.stderr);
     assert.equal(successStatusWrites(harness), 0);
     assert.equal(harness.statuses.at(-1).body.state, "pending");
-    assert.equal(parseStateCommentBody(harness.findStateComment().body).lastStatus.state, "pending");
+    assert.equal(harness.findMarkerComments().length, 2);
+    let state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-1).outcome, "state_lost");
+    assert.equal(
+      state.history.at(-1).recoveryReason,
+      "unauthorized_passed_result_lineage",
+    );
+    assert.equal(state.activeMarker.state, "waiting_ack");
+    assert.equal(state.activeMarker.baseline.completionComment.id, "2002");
+
+    const secondResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(secondResult.code, 0, secondResult.stderr);
+    assert.doesNotMatch(
+      secondResult.stdout,
+      /has no active marker; skipping scheduled scan/,
+    );
+    assert.equal(harness.findMarkerComments().length, 2);
+    state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker.state, "waiting_ack");
+    assert.equal(state.activeMarker.baseline.completionComment.id, "2002");
+  });
+});
+
+test("unauthorized passed clean invalidation fences failed state persistence before recovery", async () => {
+  await withHarness(async (harness) => {
+    harness.seedSuccessfulState();
+    harness.issueComments.push(codexCleanComment(2002, "2026-05-14T10:01:01Z"));
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "success",
+    });
+    harness.routeFaults[
+      `PATCH /repos/${harness.owner}/${harness.repo}/issues/comments/1000`
+    ] = Array.from({ length: 4 }, () => ({
+      status: 503,
+      body: { message: "definite state update failure" },
+      headers: { "Retry-After": "0" },
+    }));
+    harness.routeFaults[
+      `POST /repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`
+    ] = [{
+      status: 503,
+      body: { message: "definite replacement state failure" },
+      headers: { "Retry-After": "0" },
+    }];
+
+    const firstResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(firstResult.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.deepEqual(
+      harness.statuses.map((status) => status.body.state),
+      ["pending", "error"],
+    );
+    assert.match(firstResult.stderr, /published a durable marker-lineage fence/);
+    assert.equal(
+      parseMarkerCommentBody(harness.findMarkerComments().at(-1).body)
+        .baseline.authorizationFence.reason,
+      "unauthorized passed-result lineage invalidation",
+    );
+
+    const recoveryResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.findMarkerComments().length, 2);
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-1).outcome, "state_lost");
+    assert.equal(
+      state.history.at(-1).recoveryReason,
+      "authorization_state_persistence_fence",
+    );
+    assert.equal(state.activeMarker.state, "waiting_ack");
+    assert.equal(state.activeMarker.baseline.completionComment.id, "2002");
   });
 });
 

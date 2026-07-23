@@ -513,6 +513,9 @@ async function processPullRequest(prNumber, trigger) {
     );
     state = demotion.state;
     savedStateComment = demotion.stateComment;
+    stateNeedsFreshMarker =
+      stateNeedsFreshMarker || demotion.needsFreshMarker;
+    allowCreateMarker = allowCreateMarker || demotion.needsFreshMarker;
   }
 
   if (
@@ -1463,13 +1466,40 @@ async function recoverAuthorizationPersistenceFence(state, stateComment, snapsho
 
 async function demoteUnauthorizedCleanIfNeeded(state, stateComment) {
   const liveStatus = await loadLatestGateStatus();
+  const now = isoNow();
+  const invalidation = invalidatePassedAuthorizationLineage(state, now);
   if (
+    !invalidation.changed &&
     !liveStatus.readFailed &&
     liveStatus.producerMatches &&
     liveStatus.latest &&
     liveStatus.latest.state !== "success"
   ) {
-    return { state, stateComment };
+    return { state, stateComment, needsFreshMarker: false };
+  }
+
+  const pendingState = updateStateForStatus(invalidation.state, {
+    now,
+    statusHead: statusSha,
+    runUrl,
+    status: "pending",
+  });
+  if (invalidation.changed) {
+    await setCommitStatusIfNeeded(
+      "pending",
+      "Current-head Codex clean result is not authorized by trusted marker lineage",
+      { liveStatus },
+    );
+    const persistedStateComment = await saveAuthorizationCriticalState(
+      pendingState,
+      stateComment,
+      "unauthorized passed-result lineage invalidation",
+    );
+    return {
+      state: pendingState,
+      stateComment: persistedStateComment,
+      needsFreshMarker: true,
+    };
   }
 
   await setCommitStatusIfNeeded(
@@ -1477,23 +1507,55 @@ async function demoteUnauthorizedCleanIfNeeded(state, stateComment) {
     "Current-head Codex clean result is not authorized by trusted marker lineage",
     { liveStatus },
   );
-  const pendingState = updateStateForStatus(state, {
-    now: isoNow(),
-    statusHead: statusSha,
-    runUrl,
-    status: "pending",
-  });
   try {
     return {
       state: pendingState,
       stateComment: await saveState(pendingState, stateComment),
+      needsFreshMarker: false,
     };
   } catch (error) {
     console.warn(
       `failed to save audit state after unauthorized clean demotion: ${error.message}`,
     );
-    return { state: pendingState, stateComment };
+    return {
+      state: pendingState,
+      stateComment,
+      needsFreshMarker: false,
+    };
   }
+}
+
+function invalidatePassedAuthorizationLineage(state, now) {
+  const history = state?.history || [];
+  const latestForHead = [...history]
+    .reverse()
+    .find((marker) => marker.headSha === statusSha);
+  if (
+    !latestForHead ||
+    (latestForHead.outcome || latestForHead.state) !== "passed"
+  ) {
+    return { state, changed: false };
+  }
+
+  return {
+    changed: true,
+    state: normalizeState({
+      ...state,
+      updatedAt: now,
+      history: [
+        ...history,
+        {
+          ...latestForHead,
+          version: STATE_VERSION,
+          state: "state_lost",
+          outcome: "state_lost",
+          closedAt: now,
+          recoveryReason: "unauthorized_passed_result_lineage",
+          authorizationLineageInvalidatedAt: now,
+        },
+      ],
+    }),
+  };
 }
 
 function migrateStateForEventDrivenDeadlines(state) {
