@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import test from "node:test";
 
 import {
+  MAX_FINDING_ID_SAMPLES,
+  MAX_STATE_COMMENT_BYTES,
   activeMarkerAckTimedOut,
   activeMarkerIsObsolete,
   autoRetryEnabled,
@@ -36,6 +39,7 @@ import {
   normalizeFailedFindingsRecoveryMode,
   normalizeMarkerAckTimeoutSeconds,
   parseCodexIssueCommentArtifact,
+  parseCodexIssueCommentTerminalHeading,
   parseCodexReviewArtifact,
   parseJsonResponseText,
   parseMarkerCommentBody,
@@ -53,6 +57,7 @@ import {
   stateNeedsFreshMarkerAfterMissingMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
+  summarizeFindingsForState,
   summarizeCodexReactions,
   summarizeCodexSignalReactions,
 } from "../packages/action/src/core.mjs";
@@ -721,6 +726,80 @@ test("round-trips hidden state metadata", () => {
   assert.deepEqual(parseStateCommentBody(buildStateCommentBody(state)), state);
 });
 
+test("normalizes legacy finding ID arrays into a bounded deterministic audit summary", () => {
+  const findingIds = Array.from(
+    { length: 5_000 },
+    (_, index) => `thread:thread-${String(index).padStart(5, "0")}`,
+  );
+  const state = {
+    version: 1,
+    createdAt: "2026-04-26T10:00:00Z",
+    updatedAt: "2026-04-26T10:01:00Z",
+    statusHead: "abc123",
+    bootstrap: {
+      status: "closed",
+      currentHeadFindingIds: [...findingIds].reverse(),
+    },
+    activeMarker: null,
+    history: [{
+      id: "1",
+      outcome: "failed_findings",
+      currentHeadFindingIds: findingIds,
+    }],
+  };
+
+  const body = buildStateCommentBody(state);
+  const parsed = parseStateCommentBody(body);
+  const expectedSummary = summarizeFindingsForState({ ids: findingIds });
+
+  assert.equal(Buffer.byteLength(body, "utf8") <= MAX_STATE_COMMENT_BYTES, true);
+  assert.equal("currentHeadFindingIds" in parsed.bootstrap, false);
+  assert.equal("currentHeadFindingIds" in parsed.history[0], false);
+  assert.deepEqual(parsed.bootstrap.currentHeadFindings, expectedSummary);
+  assert.deepEqual(parsed.history[0].currentHeadFindings, expectedSummary);
+  assert.equal(parsed.history[0].currentHeadFindings.count, findingIds.length);
+  assert.equal(
+    parsed.history[0].currentHeadFindings.sampleIds.length,
+    MAX_FINDING_ID_SAMPLES,
+  );
+  assert.match(
+    parsed.history[0].currentHeadFindings.idDigest,
+    /^sha256:[0-9a-f]{64}$/,
+  );
+});
+
+test("finding audit digests are independent of evidence ordering", () => {
+  const forward = summarizeFindingsForState({
+    ids: ["thread:charlie", "thread:alpha", "thread:bravo"],
+  });
+  const reverse = summarizeFindingsForState({
+    ids: ["thread:bravo", "thread:alpha", "thread:charlie"],
+  });
+
+  assert.deepEqual(forward, reverse);
+  assert.deepEqual(forward.sampleIds, [
+    "thread:alpha",
+    "thread:bravo",
+    "thread:charlie",
+  ]);
+});
+
+test("rejects state comments above the explicit serialized byte bound", () => {
+  assert.throws(
+    () => buildStateCommentBody({
+      version: 1,
+      createdAt: "2026-04-26T10:00:00Z",
+      updatedAt: "2026-04-26T10:01:00Z",
+      statusHead: "abc123",
+      bootstrap: { status: "closed" },
+      activeMarker: null,
+      history: [],
+      auditPadding: "x".repeat(MAX_STATE_COMMENT_BYTES),
+    }),
+    new RegExp(`maximum is ${MAX_STATE_COMMENT_BYTES}`),
+  );
+});
+
 test("ignores untrusted state comments", () => {
   const trustedBody = buildStateCommentBody({
     version: 1,
@@ -1126,6 +1205,181 @@ test("classifies noncanonical Codex terminal prefixes as malformed", () => {
       artifact.reason,
       "unrecognized Codex terminal issue-comment format",
       body,
+    );
+  }
+});
+
+test("recognizes complete leading emoji graphemes in Codex terminal headings", () => {
+  const variants = [
+    ["skin-tone modifier", "👍🏽"],
+    ["regional-indicator flag", "🇺🇸"],
+    ["tag flag", "🏴󠁧󠁢󠁥󠁮󠁧󠁿"],
+    ["keycap", "1️⃣"],
+    ["variation selector 16", "☀️"],
+    ["variation selector 15", "☀︎"],
+    ["ZWJ sequence", "👩🏽‍💻"],
+  ];
+
+  for (const [name, emoji] of variants) {
+    const body = `### ${emoji} Codex Review outcome: unsupported terminal format`;
+    assert.deepEqual(
+      parseCodexIssueCommentTerminalHeading(body),
+      {
+        terminalLooking: true,
+        progress: false,
+      },
+      name,
+    );
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed", name);
+    assert.equal(
+      artifact.reason,
+      "unrecognized Codex terminal issue-comment format",
+      name,
+    );
+  }
+});
+
+test("recognizes progress headings after complete leading emoji graphemes", () => {
+  for (const emoji of [
+    "👍🏽",
+    "🇺🇸",
+    "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+    "1️⃣",
+    "☀️",
+    "☀︎",
+    "👩🏽‍💻",
+  ]) {
+    assert.deepEqual(
+      parseCodexIssueCommentTerminalHeading(
+        `### ${emoji} Codex Review still in progress: run=123`,
+      ),
+      {
+        terminalLooking: true,
+        progress: true,
+      },
+      emoji,
+    );
+  }
+});
+
+test("does not treat a progress first line with a terminal body tail as progress", () => {
+  const body = [
+    "### 👍🏽 Codex Review in progress",
+    "### 💡 Codex Review",
+    `https://github.com/owner/repo/blob/${FULL_SHA_A}/src/core.mjs#L12`,
+  ].join("\n");
+
+  assert.deepEqual(
+    parseCodexIssueCommentTerminalHeading(body),
+    {
+      terminalLooking: true,
+      progress: false,
+    },
+  );
+  const artifact = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(body),
+    { owner: "owner", repo: "repo" },
+  );
+  assert.equal(artifact.kind, "malformed");
+});
+
+test("does not let alternate line terminators hide a terminal body tail as progress", () => {
+  for (const separator of [
+    "\r",
+    "\u000B",
+    "\u000C",
+    "\u0085",
+    "\u2028",
+    "\u2029",
+  ]) {
+    const body = [
+      "Codex Review in progress: queued",
+      "### 💡 Codex Review",
+      `https://github.com/owner/repo/blob/${FULL_SHA_A}/src/core.mjs#L12`,
+    ].join(separator);
+    assert.deepEqual(
+      parseCodexIssueCommentTerminalHeading(body),
+      {
+        terminalLooking: true,
+        progress: false,
+      },
+      JSON.stringify(separator),
+    );
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed", JSON.stringify(separator));
+  }
+});
+
+test("fails closed when an emoji-prefixed terminal heading exceeds parser caps", () => {
+  for (const body of [
+    `### ${"💡".repeat(80)} Codex Review outcome: unsupported`,
+    `### ${"👩🏽‍💻".repeat(80)} Codex Review outcome: unsupported`,
+    `### ${"🏴󠁧󠁢󠁥󠁮󠁧󠁿".repeat(80)} Codex Review outcome: unsupported`,
+  ]) {
+    assert.deepEqual(
+      parseCodexIssueCommentTerminalHeading(body),
+      {
+        terminalLooking: true,
+        progress: false,
+      },
+    );
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed");
+  }
+});
+
+test("fails closed when Markdown heading whitespace exhausts the parser window", () => {
+  const body =
+    `### ${" ".repeat(510)}💡 Codex Review outcome: unsupported terminal format`;
+
+  assert.deepEqual(
+    parseCodexIssueCommentTerminalHeading(body),
+    {
+      terminalLooking: true,
+      progress: false,
+    },
+  );
+  const artifact = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(body),
+    { owner: "owner", repo: "repo" },
+  );
+  assert.equal(artifact.kind, "malformed");
+});
+
+test("treats an unknown single heading decorator as terminal-looking malformed", () => {
+  for (const decorator of [
+    "⟦future-decorator⟧",
+    "x".repeat(64),
+    "x".repeat(65),
+  ]) {
+    const body =
+      `### ${decorator} Codex Review outcome: unsupported terminal format`;
+    assert.deepEqual(
+      parseCodexIssueCommentTerminalHeading(body),
+      {
+        terminalLooking: true,
+        progress: false,
+      },
+      `decorator length ${decorator.length}`,
+    );
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed");
+    assert.equal(
+      artifact.reason,
+      "unrecognized Codex terminal issue-comment format",
     );
   }
 });
@@ -2412,7 +2666,10 @@ test("does not reactivate a marker when the sticky state comment is missing", ()
   assert.equal(state.history[0].outcome, "state_lost");
   assert.equal(stateNeedsFreshMarkerAfterRecovery(state), true);
   assert.equal(state.bootstrap.baseline.plusOne.id, "99");
-  assert.deepEqual(state.bootstrap.currentHeadFindingIds, ["finding-1"]);
+  assert.deepEqual(
+    state.bootstrap.currentHeadFindings,
+    summarizeFindingsForState({ ids: ["finding-1"] }),
+  );
 });
 
 test("requires a fresh recovery marker only after state-loss recovery", () => {

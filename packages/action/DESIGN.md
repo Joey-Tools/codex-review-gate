@@ -32,6 +32,18 @@ newer terminal-looking provider artifact whose identity, schema, or commit
 binding cannot be validated makes the current run inconclusive even if an
 older accepted clean result exists.
 
+Issue-comment terminal-heading detection strips complete leading emoji
+graphemes after an optional Markdown heading marker before looking for
+`Codex Review`. This includes modifier, regional-indicator and tag flags,
+keycaps, variation selectors, and ZWJ sequences. The parser has fixed
+code-unit and grapheme budgets; an emoji-shaped heading that exhausts either
+budget is terminal-looking malformed evidence rather than being ignored.
+An unknown single decorator token immediately before `Codex Review` is also
+terminal-looking malformed evidence; it does not broaden the accepted clean
+or finding grammars.
+Progress is ignored only when the complete normalised body is the supported
+single-line progress grammar.
+
 Unthreaded top-level issue-comment findings have no GitHub resolution flag.
 They remain active until a later accepted clean result for the same or a newer
 head supersedes them.
@@ -294,7 +306,15 @@ The state records:
 - marker deadlines: `ackDeadlineAt`, `resultDeadlineAt`, `nextRetryAt`, `headStartedAt`, and `maxWaitDeadlineAt`
 - marker state: `waiting_ack`, `waiting_result`, `passed`, `failed_findings`, `missed_ack`, `stalled`, `timed_out`, `obsolete_head`, or `state_lost`
 - bounded marker history for retry backoff and recovery
+- a finding audit summary containing the exact count, at most four sampled
+  IDs, and an order-independent SHA-256 digest instead of the complete ID list
 - legacy failed-findings recovery fields retained for v1 compatibility
+
+State-comment serialisation is capped at 60 KiB, below GitHub's issue-comment
+limit. Normalisation converts legacy `currentHeadFindingIds` arrays into the
+bounded audit summary before the state is written, while preserving marker
+lineage and other authorisation-critical fields. This keeps large finding sets
+durably representable without changing their `failure` outcome.
 
 State comments and marker comments are trusted only from configured trusted authors. The default trusted author is `github-actions[bot]`, matching the repository workflow's `GITHUB_TOKEN` path.
 

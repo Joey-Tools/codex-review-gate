@@ -1,14 +1,29 @@
+import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
+
 export const STATUS_CONTEXT = process.env.STATUS_CONTEXT || "codex/review-gate";
 export const STATE_MARKER = process.env.STATE_MARKER || "codex-review-gate-state";
 export const MARKER_COMMENT = process.env.MARKER_COMMENT || "codex-review-gate-marker";
 export const STATE_VERSION = 1;
+export const MAX_STATE_COMMENT_BYTES = 60 * 1024;
+export const MAX_FINDING_ID_SAMPLES = 4;
 export const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
 export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
-const CODEX_ISSUE_COMMENT_TERMINAL_LEAD =
-  /^(?:#{1,6}[ \t]+)?(?:[\p{Extended_Pictographic}\uFE0F\u200D]+[ \t]+)?Codex Review\b/iu;
+const MAX_CODEX_TERMINAL_HEADING_CODE_UNITS = 512;
+const MAX_CODEX_TERMINAL_HEADING_GRAPHEMES = 64;
+const MAX_FINDING_ID_SAMPLE_CODE_UNITS = 96;
+const EMOJI_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+const EMOJI_KEYCAP_GRAPHEME = /^[#*0-9]\uFE0F?\u20E3$/u;
+const EMOJI_FLAG_GRAPHEME = /^\p{Regional_Indicator}{2}$/u;
+const EMOJI_PRESENTATION_SIGNAL = /[\p{Extended_Pictographic}\p{Emoji_Presentation}]/u;
+const EMOJI_WITH_VARIATION_SELECTOR = /^(?=[\s\S]*\p{Emoji})(?=[\s\S]*\uFE0F)/u;
+const UNKNOWN_TERMINAL_DECORATOR =
+  /^[^\s]+[ \t]+Codex Review\b/iu;
 const CODEX_ISSUE_COMMENT_PROGRESS =
-  /^(?:#{1,6}[ \t]+)?(?:[\p{Extended_Pictographic}\uFE0F\u200D]+[ \t]+)?Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
+  /^Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
 const CODEX_CLEAN_COMMENT_TAGLINES = new Set([
   "",
   "Nice work!",
@@ -199,6 +214,100 @@ export function isTrustedCodexRestUser(user, botLogins = DEFAULT_CODEX_BOT_LOGIN
   return isCodexBot(user?.login, botLogins) && user?.type === "Bot";
 }
 
+export function parseCodexIssueCommentTerminalHeading(body) {
+  const normalized = normalizeCodexCommentBody(body);
+  const headingWindow = normalized.slice(0, MAX_CODEX_TERMINAL_HEADING_CODE_UNITS + 1);
+  const newlineIndex = headingWindow.indexOf("\n");
+  const lineWasTruncated =
+    newlineIndex < 0 && headingWindow.length > MAX_CODEX_TERMINAL_HEADING_CODE_UNITS;
+  const firstLine = headingWindow.slice(
+    0,
+    newlineIndex >= 0
+      ? newlineIndex
+      : MAX_CODEX_TERMINAL_HEADING_CODE_UNITS,
+  );
+  const markdownHeading = /^(?:#{1,6})[ \t]+/u.exec(firstLine);
+  const withoutMarkdownHeading = markdownHeading
+    ? firstLine.slice(markdownHeading[0].length)
+    : firstLine;
+  const emojiPrefix = stripLeadingEmojiGraphemes(withoutMarkdownHeading);
+  const heading = emojiPrefix.remainder;
+  if (!/^Codex Review\b/iu.test(heading)) {
+    return {
+      terminalLooking:
+        emojiPrefix.overflow ||
+        (lineWasTruncated && emojiPrefix.sawEmoji) ||
+        (lineWasTruncated && Boolean(markdownHeading)) ||
+        UNKNOWN_TERMINAL_DECORATOR.test(withoutMarkdownHeading),
+      progress: false,
+    };
+  }
+
+  return {
+    terminalLooking: true,
+    progress:
+      !lineWasTruncated &&
+      newlineIndex < 0 &&
+      CODEX_ISSUE_COMMENT_PROGRESS.test(heading),
+  };
+}
+
+function normalizeCodexCommentBody(body) {
+  return String(body || "")
+    .trim()
+    .replace(/\r\n?|[\u000B\u000C\u0085\u2028\u2029]/g, "\n");
+}
+
+function stripLeadingEmojiGraphemes(value) {
+  let cursor = 0;
+  let graphemeCount = 0;
+  let sawEmoji = false;
+  let sawSeparatorAfterEmoji = false;
+  let overflow = false;
+
+  for (const { segment, index } of EMOJI_GRAPHEME_SEGMENTER.segment(value)) {
+    if (index !== cursor) {
+      break;
+    }
+    if (graphemeCount >= MAX_CODEX_TERMINAL_HEADING_GRAPHEMES) {
+      overflow = sawEmoji;
+      break;
+    }
+    graphemeCount += 1;
+
+    if (isEmojiGrapheme(segment)) {
+      sawEmoji = true;
+      sawSeparatorAfterEmoji = false;
+      cursor += segment.length;
+      continue;
+    }
+    if (sawEmoji && /^[ \t]+$/u.test(segment)) {
+      sawSeparatorAfterEmoji = true;
+      cursor += segment.length;
+      continue;
+    }
+    break;
+  }
+
+  return {
+    remainder:
+      sawEmoji && sawSeparatorAfterEmoji
+        ? value.slice(cursor)
+        : value,
+    sawEmoji,
+    overflow,
+  };
+}
+
+function isEmojiGrapheme(value) {
+  return (
+    EMOJI_KEYCAP_GRAPHEME.test(value) ||
+    EMOJI_FLAG_GRAPHEME.test(value) ||
+    EMOJI_PRESENTATION_SIGNAL.test(value) ||
+    EMOJI_WITH_VARIATION_SELECTOR.test(value)
+  );
+}
+
 export function parseCodexIssueCommentArtifact(
   comment,
   {
@@ -207,14 +316,12 @@ export function parseCodexIssueCommentArtifact(
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
   } = {},
 ) {
-  const body = String(comment?.body || "")
-    .trim()
-    .replace(/\r\n?/g, "\n");
-  const terminalLooking = CODEX_ISSUE_COMMENT_TERMINAL_LEAD.test(body);
-  if (!terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
+  const body = normalizeCodexCommentBody(comment?.body);
+  const terminalHeading = parseCodexIssueCommentTerminalHeading(body);
+  if (!terminalHeading.terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
     return null;
   }
-  if (CODEX_ISSUE_COMMENT_PROGRESS.test(body)) {
+  if (terminalHeading.progress) {
     return null;
   }
 
@@ -1217,6 +1324,28 @@ function coverageTargetContainsFindingLexeme(target) {
   );
 }
 
+export function summarizeFindingsForState(findings = {}) {
+  const ids = Array.isArray(findings?.ids)
+    ? findings.ids.map((id) => String(id))
+    : [];
+  const sortedIds = [...ids].sort();
+  const digest = createHash("sha256");
+  digest.update("codex-review-gate-finding-ids-v1\0");
+  for (const id of sortedIds) {
+    digest.update(`${Buffer.byteLength(id, "utf8")}:`);
+    digest.update(id);
+    digest.update("\0");
+  }
+
+  return {
+    count: ids.length,
+    sampleIds: sortedIds
+      .slice(0, MAX_FINDING_ID_SAMPLES)
+      .map((id) => truncate(id, MAX_FINDING_ID_SAMPLE_CODE_UNITS)),
+    idDigest: `sha256:${digest.digest("hex")}`,
+  };
+}
+
 export function createInitialState({ now, statusHead, runUrl, reactions, findings }) {
   return normalizeState({
     version: STATE_VERSION,
@@ -1227,7 +1356,7 @@ export function createInitialState({ now, statusHead, runUrl, reactions, finding
       status: "open",
       startedAt: now,
       baseline: reactions,
-      currentHeadFindingIds: findings.ids,
+      currentHeadFindings: summarizeFindingsForState(findings),
     },
     activeMarker: null,
     history: [],
@@ -1271,7 +1400,7 @@ export function stateFromRecoveredMarkerComment({
       closedAt: now,
       closeReason: "state_lost_recovery",
       baseline: reactions || { plusOne: null, eyes: null },
-      currentHeadFindingIds: findings?.ids || [],
+      currentHeadFindings: summarizeFindingsForState(findings),
     },
     activeMarker: null,
     history: [recoveredMarker],
@@ -1313,10 +1442,67 @@ export function stateNeedsFreshMarkerAfterMissingMarker(state, statusHead) {
 }
 
 export function normalizeState(state) {
+  const history = (state.history || [])
+    .slice(-20)
+    .map(normalizeFindingAuditContainer);
   return {
     ...state,
     version: STATE_VERSION,
-    history: (state.history || []).slice(-20),
+    bootstrap: normalizeFindingAuditContainer(state.bootstrap),
+    activeMarker: normalizeFindingAuditContainer(state.activeMarker),
+    history,
+  };
+}
+
+function normalizeFindingAuditContainer(container) {
+  if (!container || typeof container !== "object" || Array.isArray(container)) {
+    return container;
+  }
+
+  const normalized = { ...container };
+  let findingSummary = null;
+  if (Array.isArray(container.currentHeadFindingIds)) {
+    findingSummary = summarizeFindingsForState({
+      count: container.currentHeadFindingIds.length,
+      ids: container.currentHeadFindingIds,
+    });
+  } else if (container.currentHeadFindings) {
+    findingSummary = normalizePersistedFindingSummary(container.currentHeadFindings);
+  }
+  delete normalized.currentHeadFindingIds;
+  if (findingSummary) {
+    normalized.currentHeadFindings = findingSummary;
+  } else {
+    delete normalized.currentHeadFindings;
+  }
+  if (Array.isArray(normalized.rejectedRecoveryCompletions)) {
+    normalized.rejectedRecoveryCompletions =
+      normalized.rejectedRecoveryCompletions.slice(-20);
+  }
+  return normalized;
+}
+
+function normalizePersistedFindingSummary(summary) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
+    return null;
+  }
+  const count = Number(summary.count);
+  if (!Number.isSafeInteger(count) || count < 0) {
+    return null;
+  }
+  const sampleIds = Array.isArray(summary.sampleIds)
+    ? summary.sampleIds
+        .slice(0, MAX_FINDING_ID_SAMPLES)
+        .map((id) => truncate(String(id), MAX_FINDING_ID_SAMPLE_CODE_UNITS))
+    : [];
+  const idDigest = /^sha256:[0-9a-f]{64}$/i.test(String(summary.idDigest || ""))
+    ? String(summary.idDigest).toLowerCase()
+    : null;
+
+  return {
+    count,
+    sampleIds,
+    idDigest,
   };
 }
 
@@ -1393,6 +1579,7 @@ export function updateStateForStatus(state, { now, statusHead, runUrl, status })
 }
 
 export function buildStateCommentBody(state) {
+  const normalizedState = normalizeState(state);
   const active = state.activeMarker;
   const summary = [
     "codex/review-gate state",
@@ -1402,7 +1589,16 @@ export function buildStateCommentBody(state) {
     `- updated: \`${state.updatedAt || "unknown"}\``,
   ];
 
-  return `${summary.join("\n")}\n\n${buildHiddenJson(STATE_MARKER, normalizeState(state))}`;
+  const body =
+    `${summary.join("\n")}\n\n${buildHiddenJson(STATE_MARKER, normalizedState)}`;
+  const byteLength = Buffer.byteLength(body, "utf8");
+  if (byteLength > MAX_STATE_COMMENT_BYTES) {
+    throw new Error(
+      `codex/review-gate state comment is ${byteLength} bytes; ` +
+        `the maximum is ${MAX_STATE_COMMENT_BYTES}`,
+    );
+  }
+  return body;
 }
 
 export function parseStateCommentBody(body) {

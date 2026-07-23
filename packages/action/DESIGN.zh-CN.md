@@ -29,6 +29,15 @@ commit-status history 当作判定来源。
 通过身份、schema 或 commit binding 校验，即使存在较早的 clean result，当前运行仍
 无法得出结论。
 
+Issue-comment terminal heading detection 会先移除可选 Markdown heading marker 后的完整
+leading emoji grapheme，再识别 `Codex Review`。覆盖 modifier、regional-indicator flag、
+tag flag、keycap、variation selector 和 ZWJ sequence。Parser 使用固定的 code-unit 与
+grapheme budgets；emoji-shaped heading 耗尽任一预算时，会被视为 terminal-looking
+malformed evidence，而不是被忽略。`Codex Review` 前出现未知的单一 decorator token
+时，同样视为 terminal-looking malformed evidence；不会因此放宽 accepted clean 或
+finding grammar。只有完整 normalized body 严格符合受支持的单行 progress grammar
+时，才会忽略为 progress。
+
 没有 thread 的 top-level issue-comment findings 不具备 GitHub resolution flag。它们会
 保持 active，直到同一或更新 head 上更晚的 accepted clean result supersede 它们。
 
@@ -248,7 +257,14 @@ State 记录：
 - marker deadlines: `ackDeadlineAt`、`resultDeadlineAt`、`nextRetryAt`、`headStartedAt` 和 `maxWaitDeadlineAt`
 - marker state: `waiting_ack`、`waiting_result`、`passed`、`failed_findings`、`missed_ack`、`stalled`、`timed_out`、`obsolete_head` 或 `state_lost`
 - 用于 retry backoff 和 recovery 的 bounded marker history
+- finding audit summary：精确 count、最多四个 sampled IDs，以及与顺序无关的 SHA-256
+  digest；不会持久化完整 ID 列表
 - 为 v1 兼容而保留的 legacy failed-findings recovery fields
+
+State comment serialization 上限为 60 KiB，低于 GitHub issue-comment limit。
+Normalization 会在写入前把 legacy `currentHeadFindingIds` arrays 转换成 bounded audit
+summary，同时保留 marker lineage 及其他 authorisation-critical fields。因此，即使
+findings 数量很大，也能持久记录 `failure`，而不会因 state 体积触发错误。
 
 State comments 和 marker comments 只信任配置的 trusted authors。默认 trusted author 是 `github-actions[bot]`，匹配 repository workflow 的 `GITHUB_TOKEN` 路径。
 

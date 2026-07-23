@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +8,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  MAX_FINDING_ID_SAMPLES,
+  MAX_STATE_COMMENT_BYTES,
   MARKER_COMMENT,
   STATE_MARKER,
   parseMarkerCommentBody,
@@ -178,7 +181,11 @@ test("issue_comment completion fails closed when final reload sees current-head 
     assert.equal(state.activeMarker, null);
     assert.equal(state.lastStatus.state, "failure");
     assert.equal(state.history.at(-1).outcome, "failed_findings");
-    assert.deepEqual(state.history.at(-1).currentHeadFindingIds, ["thread:thread-3001"]);
+    assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
+    assert.deepEqual(
+      state.history.at(-1).currentHeadFindings.sampleIds,
+      ["thread:thread-3001"],
+    );
   });
 });
 
@@ -1091,6 +1098,54 @@ test("current-head Codex findings close the active marker as failed_findings", a
   });
 });
 
+test("thousands of findings persist bounded audit state and a durable failure", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:55:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    const findingCount = 4_000;
+    for (let index = 0; index < findingCount; index += 1) {
+      const id = 10_000 + index;
+      harness.reviewComments.push(currentHeadInlineFinding(id));
+      harness.reviewThreads.push(unresolvedThread(id));
+    }
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(harness.findMarkerComments().length, 1);
+    const stateComment = harness.findStateComment();
+    assert.equal(
+      Buffer.byteLength(stateComment.body, "utf8") <= MAX_STATE_COMMENT_BYTES,
+      true,
+    );
+    assert.equal(stateComment.body.includes('"currentHeadFindingIds"'), false);
+
+    const state = parseStateCommentBody(stateComment.body);
+    const findingSummary = state.history.at(-1).currentHeadFindings;
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.lastStatus.state, "failure");
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
+    assert.equal(findingSummary.count, findingCount);
+    assert.equal(findingSummary.sampleIds.length, MAX_FINDING_ID_SAMPLES);
+    assert.match(findingSummary.idDigest, /^sha256:[0-9a-f]{64}$/);
+  });
+});
+
 test("scheduled scan retries missed acknowledgement with same-head backoff", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
@@ -1446,7 +1501,11 @@ test("legacy failure state migrates a live marker using same-head unresolved fin
     assert.equal(state.history.at(-1).id, "2000");
     assert.equal(state.history.at(-1).outcome, "failed_findings");
     assert.equal(state.history.at(-1).closedAt, "2026-05-14T09:58:00Z");
-    assert.deepEqual(state.history.at(-1).currentHeadFindingIds, ["thread:thread-3001"]);
+    assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
+    assert.deepEqual(
+      state.history.at(-1).currentHeadFindings.sampleIds,
+      ["thread:thread-3001"],
+    );
   });
 });
 
@@ -1949,6 +2008,75 @@ test("a newer noncanonical terminal prefix invalidates an earlier clean result",
     assert.equal(harness.statuses.some((status) => status.body.state === "success"), false);
     assert.equal(harness.statuses.at(-1).body.state, "error");
     assert.match(result.stderr, /unrecognized Codex terminal issue-comment format/);
+  });
+});
+
+test("newer unclassifiable decorated headings invalidate an earlier clean result", async () => {
+  for (const decorator of [
+    "👍🏽",
+    "🇺🇸",
+    "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+    "1️⃣",
+    "☀️",
+    "☀︎",
+    "👩🏽‍💻",
+    "⟦future-decorator⟧",
+  ]) {
+    await withHarness(async (harness) => {
+      harness.issueComments.push(
+        codexCleanComment(2001, "2026-05-14T09:57:00Z"),
+        {
+          ...codexCleanComment(2002, "2026-05-14T10:00:00Z"),
+          body:
+            `### ${decorator} Codex Review outcome: unsupported terminal format`,
+        },
+      );
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: { inputs: { pull_request: "1" } },
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 1, `${decorator}: ${result.stderr}`);
+      assert.equal(successStatusWrites(harness), 0, decorator);
+      assert.equal(harness.statuses.at(-1).body.state, "error", decorator);
+      assert.match(
+        result.stderr,
+        /unrecognized Codex terminal issue-comment format/,
+        decorator,
+      );
+    });
+  }
+});
+
+test("a newer progress heading with an alternate-line terminal tail invalidates older clean", async () => {
+  await withHarness(async (harness) => {
+    harness.issueComments.push(
+      codexCleanComment(2001, "2026-05-14T09:57:00Z"),
+      {
+        ...codexCleanComment(2002, "2026-05-14T10:00:00Z"),
+        body: [
+          "Codex Review in progress: queued",
+          "### 💡 Codex Review",
+          `https://github.com/owner/repo/blob/${HEAD_SHA}/src/gate.mjs#L42-L44`,
+        ].join("\u2028"),
+      },
+    );
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(
+      result.stderr,
+      /unrecognized Codex terminal issue-comment format/,
+    );
   });
 });
 

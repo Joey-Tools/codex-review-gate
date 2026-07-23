@@ -58,6 +58,7 @@ import {
   stateNeedsFreshMarkerAfterMissingMarker,
   stateNeedsFreshMarkerAfterRecovery,
   stateFromRecoveredMarkerComment,
+  summarizeFindingsForState,
   sortCodexArtifactsNewestFirst,
   summarizeCodexSignalReactions,
   truncate,
@@ -675,7 +676,7 @@ function migrateLegacyFailureState(
         "failed_findings",
         lastStatus.updatedAt,
         {
-          currentHeadFindingIds: snapshot.findings.ids,
+          currentHeadFindings: summarizeFindingsForState(snapshot.findings),
           recoveryReason: "legacy_failure_evidence_recovery",
         },
       ),
@@ -1297,7 +1298,7 @@ async function failFromFindings(findings, state, stateComment) {
   const suffix = sample ? ` First finding: ${sample}` : "";
   const failedState = state.activeMarker
     ? closeActiveMarker(state, "failed_findings", isoNow(), {
-        currentHeadFindingIds: findings.ids,
+        currentHeadFindings: summarizeFindingsForState(findings),
       })
     : state;
   const statusState = updateStateForStatus(failedState, {
