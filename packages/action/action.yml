@@ -46,15 +46,15 @@ inputs:
     required: false
     default: "1800"
   completion-signal-buffer-seconds:
-    description: Minimum seconds after a marker before accepting a Codex top-level clean completion comment.
+    description: Deprecated but operational v1 input. Issue-comment clean evidence must be newer than the active marker by this buffer.
     required: false
     default: "30"
   failed-findings-recovery:
-    description: Allow a later Codex clean completion comment to recover from resolved failed findings.
+    description: Deprecated but operational v1 switch for narrow same-head no-active-marker recovery from failed_findings.
     required: false
     default: ""
   failed-findings-recovery-mode:
-    description: "Failed findings recovery mode. Use head or fresh."
+    description: "Deprecated but operational v1 input. head may reuse a qualifying clean; fresh requires a clean newer than a rejected recovery attempt."
     required: false
     default: ""
   poll-interval-seconds:

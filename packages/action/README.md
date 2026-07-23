@@ -5,7 +5,7 @@ Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.
 ## QuickStart
 
 1. Copy the workflow in [Workflow Usage](#workflow-usage) to `.github/workflows/codex-review-gate.yml`.
-2. Use `JoeyTeng/codex-review-gate-action@v1.2`, merge it to the default branch, then open a follow-up test PR.
+2. Use `JoeyTeng/codex-review-gate-action@v1`, merge it to the default branch, then open a follow-up test PR.
 3. After `codex/review-gate` behaves as expected, add it as a required status check. For recovery recipes, see the [cookbook](COOKBOOK.md).
 
 `codex-review-gate` is a reusable GitHub Action that owns a deterministic `codex/review-gate` status check. It is designed for repositories that want a required status to stay pending or failing until Codex review output for the current PR head is clean.
@@ -25,14 +25,25 @@ The runner implements an event-driven serialized marker flow:
 
 - Runs under `pull_request_target` from the repository default branch.
 - Writes the configured commit status, `codex/review-gate` by default, to the PR head SHA.
-- Fails when current-head Codex inline review threads or review-body findings are unresolved and not outdated.
+- Passes only when the latest accepted Codex terminal result is bound to the current head, is clean, is authorised by trusted marker or recovery lineage, and every historical thread-backed Codex finding is resolved.
+- Treats `isOutdated` and `isResolved` independently. An outdated but unresolved thread still blocks the gate.
+- Recognises unthreaded top-level finding comments from exact repository and full-SHA blob links; a later accepted clean result for the same or newer head supersedes those findings.
+- Validates official provider identity and binds reviews, inline comments, and top-level results to their reviewed commit.
+- Accepts clean results only through a closed provider grammar; finding-shaped content takes precedence over a clean-looking lead or `APPROVED` state.
+- Treats a configured provider's `Codex Review` comment, with an optional Markdown heading and emoji, as a broad terminal candidate. Exact one-line `in progress` / `still in progress` messages are ignored, with an optional period or colon plus one to 160 metadata characters; a newer unknown candidate such as `completed` is malformed and fail-closed rather than silently ignored.
+- Rebuilds a complete evidence snapshot on every reconciliation. Historical `pending` or `error` states and earlier incomplete API, pagination, identity, or commit parsing attempts are audit data, not sticky blockers.
+- Bounds each PR's evidence work to 64 MiB and 1,024 fetch attempts shared across snapshots and retries, with an 8 MiB streaming cap per response, 20,000 items per snapshot, and concurrency of four for HTTP and review-thread completion.
 - Keeps a trusted sticky PR state comment with hidden metadata.
 - Serializes controlled `@codex review` marker comments.
 - Keeps controlled marker comments minimal and writes the generative AI review disclosure to the GitHub Actions step summary.
 - Treats Codex reactions as diagnostic signals only; `eyes` reactions on the active marker comment count as liveness, not pass.
 - Uses scheduled or manual resume runs to retry unacknowledged or stalled markers.
-- Passes only after a Codex top-level clean completion comment or `APPROVED` review appears after the active marker and the current head has no Codex findings. Top-level completion comments must also satisfy the configured completion signal buffer.
-- Recovers from `failed_findings` after maintainers resolve Codex findings and a later Codex clean completion comment confirms the current head is clean.
+- Fails closed when the current reconciliation cannot load or validate all required evidence. Transient exhaustion produces `pending`; deterministic provider identity, schema, or commit conflicts produce `error`. Both fail the workflow.
+- Demotes an otherwise clean current-head result to `pending` when active-marker, exact passed-marker reassertion, or failed-findings recovery lineage does not authorise it.
+- Before success, caches the newest same-context live status and its producer, revalidates PR lifecycle and head, loads the final complete snapshot with a bounded whole-snapshot orphan reload when needed, then deduplicates without another read and immediately posts success if required.
+- Reasserts the computed status unless that newest same-context record already has the desired state and comes from exact `github-actions[bot]` / `Bot`. An external or missing producer cannot expose an older trusted status as the deduplication candidate.
+- Safely upgrades a v1.2 passed marker only when its exact legacy result identity, trusted live marker, baseline, and current strict clean artifact all match; otherwise it requires a fresh marker.
+- Supports a narrow legacy `failed_findings` recovery from the exact matching same-head clean `issue_comment` event after every thread-backed Codex finding is resolved; the compatibility inputs control whether the same clean may be reused or a newer one is required.
 - Ignores PR-open automatic review output unless it appears after the active controlled marker and passes final current-head validation.
 
 ## Files
@@ -122,7 +133,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15
     steps:
-      - uses: JoeyTeng/codex-review-gate-action@v1.2
+      - uses: JoeyTeng/codex-review-gate-action@v1
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
@@ -130,8 +141,6 @@ jobs:
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
           completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
-          failed-findings-recovery: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY }}
-          failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
 ## Inputs
@@ -148,12 +157,13 @@ jobs:
 | `marker-timeout-seconds` | `3600` | Time to wait for an acknowledged marker result before retrying. |
 | `marker-ack-timeout-seconds` | `300` | Initial time to wait for Codex to acknowledge a marker before retrying. |
 | `marker-ack-timeout-max-seconds` | `1800` | Maximum exponential backoff wait for unacknowledged markers. |
-| `completion-signal-buffer-seconds` | `30` | Minimum seconds after a marker before accepting a Codex top-level clean completion comment. Set to `0` to disable the extra buffer; same-second comments are still rejected. |
-| `failed-findings-recovery` | empty | Whether a later Codex clean completion comment can recover `failed_findings` after Codex findings are resolved. Empty defaults to enabled; set to `false` to disable. Can be supplied with `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY` via `vars` or with the runtime `FAILED_FINDINGS_RECOVERY` environment variable; the input takes precedence. |
-| `failed-findings-recovery-mode` | empty | Recovery mode for the enabled `failed_findings` recovery path. Empty defaults to `head`; set to `fresh` to require a clean completion comment created after any rejected recovery attempt that still saw current-head findings. Can be supplied with `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE` via `vars` or with the runtime `FAILED_FINDINGS_RECOVERY_MODE` environment variable; the input takes precedence. |
+| `completion-signal-buffer-seconds` | `30` | Deprecated but operational v1 compatibility input. An issue-comment clean result must be newer than the active marker by this buffer as well as exactly commit-bound. |
+| `failed-findings-recovery` | empty | Deprecated but operational switch for narrow same-head, no-active-marker recovery from `failed_findings`. Empty defaults to enabled; `false` disables this path. |
+| `failed-findings-recovery-mode` | empty | Deprecated but operational v1 input. `head` may reuse the same qualifying clean after findings resolve; `fresh` requires a clean newer than a recorded rejected recovery attempt. |
 | `event-mode` | empty | Event mode override: exactly `standard`, `comment-only`, or `full`. Empty falls back to `CODEX_REVIEW_GATE_EVENT_MODE` or `standard`. |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input. Event-driven runs do not poll. |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input. Event-driven runs create controlled markers directly. |
+| `bootstrap-timeout-seconds` | `3600` | Deprecated compatibility input. Bootstrap now closes after the grace period and starts a controlled marker. |
 | `codex-bot-logins` | `chatgpt-codex-connector,chatgpt-codex-connector[bot]` | Comma-separated GitHub logins accepted as Codex bot identities. |
 | `trusted-comment-logins` | `github-actions[bot]` | Comma-separated GitHub logins trusted for gate state and marker comments. |
 
@@ -188,9 +198,20 @@ Do not require `codex/review-gate` before the workflow exists on the protected d
 - The workflow does not execute PR code.
 - The workflow should have both `issues: write` and `pull-requests: write` so it can create PR conversation comments.
 - For the cleanest signal, disable Codex automatic review-on-push and let the gate marker comment trigger the current-head review.
-- The runner uses REST pull request comments plus GraphQL `reviewThreads` metadata to avoid treating resolved or outdated Codex inline threads as current findings.
-- Review-body findings do not have resolvable review threads, so the runner matches them by `PullRequestReview.commit_id` and current-head blob links.
-- If the gate fails with `failed_findings`, resolve the Codex review threads, then request or wait for a Codex top-level clean completion comment. The default `head` recovery mode can re-evaluate a same-head clean comment after findings are resolved; `fresh` mode requires a clean comment created after any rejected recovery attempt that still saw findings.
+- The runner fully paginates REST comments, reviews, inline comments, and GraphQL review threads before it can pass.
+- Official REST evidence must come from an accepted Bot identity. Top-level issue comments also require the official `chatgpt-codex-connector` GitHub App by default.
+- REST evidence IDs must be positive safe integers; GraphQL opaque and `fullDatabaseId` fields must use their canonical string forms. Duplicate provider, review, inline-comment, or thread identities fail closed, including on resolved threads.
+- Reviews bind through the full `PullRequestReview.commit_id`. Inline comments bind through their parent review and `original_commit_id`, not GitHub's mutable relocated `commit_id`.
+- Top-level clean comments bind through their reviewed-commit marker. A short marker must resolve uniquely through the repository commit API to the full current-head SHA.
+- The closed clean grammar accepts the exact issue-comment lead plus only these observed provider taglines: none, `Nice work!`, `Chef's kiss.`, `What shall we delve into next?`, `Already looking forward to the next diff.`, `Keep them coming.`, `:rocket:`, `:tada:`, or `Swish.` It then requires exactly one reviewed-commit line and either no suffix or the exact official disclosure. An `APPROVED` review must be empty, exact `Looks good.`, or have a unique exact final `No findings.` optionally after one summary of at most 240 characters. That summary must begin with exact `Coverage:` or `Review coverage:` and continue with a comma/`and`-separated list of backtick-wrapped identifier or path tokens matching `[A-Za-z0-9_./:@+-]+`, with only an optional final period; verb-led and other prose are rejected. A whole normalized target equal to `P0`–`P3`, `S0`–`S3`, `critical`, `high`, `medium`, `low`, `finding`, `findings`, `blocker`, `blocking`, `found`, `detected`, `data-loss`, or `auth-bypass` is rejected, but those words inside a real path or identifier are not blanket-rejected. Finding signals always win.
+- Review-body and unthreaded top-level findings must use exact `github.com` links for the gated owner and repository with a full commit SHA. Unknown or conflicting current formats fail closed.
+- Resolve every thread-backed Codex finding before expecting success. `isOutdated` alone is not resolution. A later accepted current-head clean result may supersede an unthreaded top-level finding.
+- Sticky state and status history support orchestration, audit, and idempotency only. A rerun reconstructs current evidence and can reassert `success` over a later stale `pending` or `error` status.
+- The optional status-deduplication GET is independent best-effort work: 100 statuses per page, at most 10 pages or 1,000 items, 1 MiB per response, 4 MiB total, and 16 fetch attempts. It selects the first (newest) same-context record before checking producer identity. Failure or exhaustion becomes `readFailed`, does not taint review evidence, and causes the action to POST its computed status directly.
+- A review-evidence budget failure aborts active evidence requests. When concurrent loads fail differently, a deterministic non-`pending` error, including a schema or identity conflict, wins over budget or transient `pending`.
+- Retryable REST and GraphQL responses honour valid `Retry-After` delays up to 10 seconds. Longer delays stop immediately, while missing or malformed values use bounded fallback retries; the header never expands the existing retry-safe method/status set.
+- Older short-SHA clean results are resolved lazily only when an older unthreaded finding's supersession depends on them.
+- Evidence-budget exhaustion is transient: the action writes `pending` and exits non-zero. Deterministic provider schema, identity, or commit-binding conflicts write `error` and also exit non-zero.
 - Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff capped by the marker result timeout, and 1 hour per marker result. The recommended schedule example checks retry deadlines every 2 hours.
 
 ## Feedback and Reporting

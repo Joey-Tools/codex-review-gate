@@ -64,4 +64,7 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 subtree 边界。使用 `scripts/release-action-subtree.sh` 校验源码树，并计算发布到 action
 仓库的 split commit。
 
+消费者应使用 `JoeyTeng/codex-review-gate-action@v1`。签名的 floating major tag 会
+自动接收兼容的 v1 更新；`v1.3.0` 等 immutable release tags 仍可用于审计和回滚。
+
 完整流程见 [docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。

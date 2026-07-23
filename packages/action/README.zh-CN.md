@@ -5,7 +5,7 @@
 ## 快速开始
 
 1. 把 [Workflow 用法](#workflow-用法) 中的 workflow 复制到 `.github/workflows/codex-review-gate.yml`。
-2. 使用 `JoeyTeng/codex-review-gate-action@v1.2`，合入 default branch 后再开一个后续测试 PR。
+2. 使用 `JoeyTeng/codex-review-gate-action@v1`，合入 default branch 后再开一个后续测试 PR。
 3. 确认 `codex/review-gate` 行为符合预期后，把它加入 required status checks。恢复和排障 recipes 见 [cookbook](COOKBOOK.zh-CN.md)。
 
 `codex-review-gate` 是一个可复用 GitHub Action，负责提供 deterministic `codex/review-gate` status check。它适用于希望把 required status 保持为 pending 或 failing，直到当前 PR head 的 Codex review output 干净为止的仓库。
@@ -25,14 +25,25 @@ Runner 实现了 event-driven serialized marker flow：
 
 - 通过 repository default branch 上的 `pull_request_target` 运行。
 - 把配置的 commit status 写到 PR head SHA；默认是 `codex/review-gate`。
-- 当 current-head Codex inline review threads 或 review-body findings 未 resolved 且未 outdated 时失败。
+- 只有 latest accepted Codex terminal result 明确绑定 current head、结果为 clean、由 trusted marker 或 recovery lineage 授权，且历史上所有 thread-backed Codex findings 均已 resolved 时才通过。
+- 分开处理 `isOutdated` 和 `isResolved`。Outdated 但 unresolved 的 thread 仍会阻塞 gate。
+- 通过精确 repository 和 full-SHA blob links 识别没有 thread 的 top-level finding comments；同一或更新 head 上更晚的 accepted clean result 会 supersede 这些 findings。
+- 验证官方 provider identity，并把 reviews、inline comments 和 top-level results 绑定到其 reviewed commit。
+- 只通过封闭的 provider grammar 接受 clean result；finding-shaped content 的优先级高于看似 clean 的 lead 或 `APPROVED` state。
+- 对 configured provider 以 `Codex Review` 开头且可带 optional Markdown heading 和 emoji 的 comment，先作为宽泛 terminal candidate。Exact one-line `in progress` / `still in progress` message 会被忽略，末尾可以是句点，或冒号加 1–160 个 metadata 字符；较新的未知 candidate（例如 `completed`）则按 malformed/fail-closed 处理，而不会静默忽略。
+- 每次 reconciliation 都重新构建完整 evidence snapshot。历史 `pending`、`error`，以及更早的 API、分页、身份或 commit 解析不完整结果只作审计，不会成为 sticky blockers。
+- 把每个 PR 的 evidence work 限制为跨 snapshots 和 retries 共享的 64 MiB 与 1,024 次 fetch attempts；同时限制每个 response 流式读取最多 8 MiB、每个 snapshot 最多 20,000 items，以及 HTTP 和 review-thread 补全各最多四路并发。
 - 用 hidden metadata 维护一个可信 sticky PR state comment。
 - 串行维护受控 `@codex review` marker comments。
 - 保持受控 marker comments 最小化，并把生成式 AI review 提示写入 GitHub Actions step summary。
 - 把 Codex reactions 只作为诊断信号。
 - 用 scheduled 或 manual resume runs 重试未 ack 或 stalled 的 markers。
-- 只有在 active marker 之后出现 Codex top-level completion comment 或 `APPROVED` review，且当前 head 没有 Codex findings 时才通过。
-- 在维护者 resolve Codex findings 后，如果后续 Codex clean completion comment 证明当前 head 干净，可从 `failed_findings` 恢复。
+- 当前 reconciliation 无法完整加载或校验所需 evidence 时 fail closed。暂时性读取重试耗尽写入 `pending`；确定性的 provider identity、schema 或 commit 冲突写入 `error`；两者都会使 workflow 失败。
+- 如果 otherwise clean 的 current-head result 缺少 active-marker、精确 passed-marker reassertion 或 failed-findings recovery lineage 授权，则主动降为 `pending`。
+- 写入 success 前，先缓存同一 context 的 newest live status 及其 producer，再验证 PR lifecycle 和 head，加载 final complete snapshot，并在需要时执行有界 whole-snapshot orphan reload；之后不再读取 status，只做 deduplication，并在需要时立即 POST success。
+- 只有同一 context 的 newest record 已是目标 state，且 producer exact 为 `github-actions[bot]` / `Bot` 时才去重；external 或缺失 producer 不能让 gate 回退采用更旧的 trusted status。
+- 只有 v1.2 passed marker 的 exact legacy result identity、trusted live marker、baseline 与当前 strict clean artifact 全部匹配时才安全升级；否则要求 fresh marker。
+- 提供狭窄的 legacy `failed_findings` recovery：维护者 resolve 所有 thread-backed Codex findings 后，只有与 selected same-head clean result 精确匹配的 `issue_comment` event 才可使用；compatibility inputs 决定能否复用同一个 clean，或必须等待更新结果。
 - 如果误开 PR-open automatic review，也只有 active controlled marker 之后的输出能通过最终 current-head validation。
 
 ## 文件
@@ -122,7 +133,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15
     steps:
-      - uses: JoeyTeng/codex-review-gate-action@v1.2
+      - uses: JoeyTeng/codex-review-gate-action@v1
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
@@ -130,8 +141,6 @@ jobs:
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
           completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
-          failed-findings-recovery: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY }}
-          failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
 ## Inputs
@@ -148,12 +157,13 @@ jobs:
 | `marker-timeout-seconds` | `3600` | 已 ack marker 等待结果的时间，超时后重试。 |
 | `marker-ack-timeout-seconds` | `300` | Codex ack marker 前的初始等待时间。 |
 | `marker-ack-timeout-max-seconds` | `1800` | 未 ack marker 指数退避等待上限。 |
-| `completion-signal-buffer-seconds` | `30` | Marker 创建后至少等待多少秒，才接受 Codex top-level clean completion comment。设为 `0` 可关闭额外 buffer；同一秒的 comment 仍会被拒绝。 |
-| `failed-findings-recovery` | empty | Codex findings 被 resolved 后，是否允许后续 Codex clean completion comment 从 `failed_findings` 恢复。留空默认启用；设为 `false` 可关闭。可通过 `vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY` 传入，或用 runtime `FAILED_FINDINGS_RECOVERY` environment variable 配置；input 优先生效。 |
-| `failed-findings-recovery-mode` | empty | 已启用 `failed_findings` recovery path 的恢复模式。留空默认 `head`；设为 `fresh` 时，如果一次 recovery attempt 仍看到 current-head findings，则后续必须等创建时间晚于该 rejected attempt 的 Codex clean completion comment。可通过 `vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE` 传入，或用 runtime `FAILED_FINDINGS_RECOVERY_MODE` environment variable 配置；input 优先生效。 |
+| `completion-signal-buffer-seconds` | `30` | Deprecated 但在 v1 仍生效的 compatibility input。Issue-comment clean result 除了 exact commit binding，还必须比 active marker 晚该 buffer。 |
+| `failed-findings-recovery` | empty | Deprecated 但在 v1 仍生效的 switch，用于从 `failed_findings` 进入狭窄的 same-head、no-active-marker recovery。留空默认启用；`false` 关闭该路径。 |
+| `failed-findings-recovery-mode` | empty | Deprecated 但在 v1 仍生效。`head` 可在 findings resolved 后复用同一个 qualifying clean；`fresh` 要求 clean 晚于已记录的 rejected recovery attempt。 |
 | `event-mode` | empty | Event mode override：精确小写 `standard`、`comment-only` 或 `full`。留空时使用 `CODEX_REVIEW_GATE_EVENT_MODE` 或 `standard`。 |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input。Event-driven runs 不轮询。 |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input。Event-driven runs 会直接创建 controlled marker。 |
+| `bootstrap-timeout-seconds` | `3600` | Deprecated compatibility input。Bootstrap 会在 grace period 后关闭，并启动 controlled marker。 |
 | `codex-bot-logins` | `chatgpt-codex-connector,chatgpt-codex-connector[bot]` | 视为 Codex bot identities 的 GitHub logins，逗号分隔。 |
 | `trusted-comment-logins` | `github-actions[bot]` | 可信 gate state 和 marker comments 的 GitHub logins，逗号分隔。 |
 
@@ -186,9 +196,20 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 - Workflow 不执行 PR 代码。
 - Workflow token 应同时具备 `issues: write` 和 `pull-requests: write`，这样才能创建 PR conversation comments。
 - 为了让信号最干净，建议关闭 Codex automatic review-on-push，只让 gate marker comment 触发 current-head review。
-- Runner 同时使用 REST pull request comments 和 GraphQL `reviewThreads` metadata，避免把已 resolved 或 outdated 的 Codex inline threads 当成当前 findings。
-- Review-body findings 没有可 resolve 的 review threads，所以 runner 通过 `PullRequestReview.commit_id` 和 current-head blob links 匹配它们。
-- 如果 gate 因 `failed_findings` 失败，先 resolve Codex review threads，再请求或等待 Codex top-level clean completion comment。默认 `head` 恢复模式可以在 findings resolve 后重新评估同一 head 的 clean comment；`fresh` 模式下，如果某次 recovery attempt 仍看到 findings，则必须等创建时间晚于该 rejected attempt 的 clean comment。
+- Runner 必须完整分页读取 REST comments、reviews、inline comments 和 GraphQL review threads，之后才可能通过。
+- 官方 REST evidence 必须来自 accepted Bot identity。Top-level issue comments 默认还必须来自官方 `chatgpt-codex-connector` GitHub App。
+- REST evidence IDs 必须是 positive safe integers；GraphQL opaque ID 与 `fullDatabaseId` 必须使用 canonical string form。Duplicate provider、review、inline-comment 或 thread identities 都会 fail closed，包括 resolved threads。
+- Reviews 通过完整 `PullRequestReview.commit_id` 绑定。Inline comments 通过 parent review 和 `original_commit_id` 绑定，不使用 GitHub 重定位后会变化的 `commit_id`。
+- Top-level clean comments 通过 reviewed-commit marker 绑定。短 marker 必须经 repository commit API 唯一解析为完整 current-head SHA。
+- 封闭的 clean grammar 接受 exact issue-comment lead，并只允许以下 observed provider taglines：无 tagline、`Nice work!`、`Chef's kiss.`、`What shall we delve into next?`、`Already looking forward to the next diff.`、`Keep them coming.`、`:rocket:`、`:tada:` 或 `Swish.`；之后必须有且仅有一行 reviewed-commit，并且只能没有 suffix 或带 exact official disclosure。`APPROVED` review 必须为空、exact `Looks good.`，或有唯一的 exact final `No findings.`，其前面可以有至多一行、最多 240 个字符的 summary。该 summary 必须以 exact `Coverage:` 或 `Review coverage:` 开头，后接以逗号和/或 `and` 分隔的 backtick-wrapped identifier/path tokens；token 只能匹配 `[A-Za-z0-9_./:@+-]+`，末尾只可选一个句点。整个 normalized target 若 exact 等于 `P0`–`P3`、`S0`–`S3`、`critical`、`high`、`medium`、`low`、`finding`、`findings`、`blocker`、`blocking`、`found`、`detected`、`data-loss` 或 `auth-bypass`，则拒绝；这些词出现在真实 path 或 identifier segment 中时不会被 blanket 拒绝。Verb-led 和其他 prose 均不接受。Finding signals 始终优先。
+- Review-body 和没有 thread 的 top-level findings 必须使用 exact `github.com`、被 gate 的 owner/repository 和 full commit SHA links。当前格式未知或冲突时 fail closed。
+- 期待 success 前，应 resolve 所有 thread-backed Codex findings；仅 `isOutdated` 不表示 resolved。同一 head 上更晚的 accepted clean result 可以 supersede 没有 thread 的 top-level finding。
+- Sticky state 和 status history 只用于 orchestration、审计和幂等。Rerun 会重建当前 evidence，并可在更晚但 stale 的 `pending` 或 `error` status 之后重新写入 `success`。
+- Optional status-deduplication GET 使用独立的 best-effort 上限：每页 100 statuses、最多 10 页或 1,000 items、每个 response 1 MiB、总计 4 MiB、16 次 fetch attempts。它会先选择同一 context 的第一条（newest）record，再校验 producer identity；失败或超限只记为 `readFailed`，不污染 review evidence，并使 action 直接 POST 已计算的 status。
+- Review-evidence budget failure 会广播 abort active evidence requests。并发 loads 出现不同 failure 时，确定性的 non-`pending` error（包括 schema 或 identity conflict）优先于 budget 或 transient `pending`。
+- Retryable REST/GraphQL response 会遵守不超过 10 秒的合法 `Retry-After`。更长 delay 立即停止，缺失或 malformed value 使用有界 fallback retries；该 header 不会扩展现有 retry-safe method/status 集合。
+- 旧 short-SHA clean result 只在判定旧 unthreaded finding 是否被 supersede 时惰性解析。
+- Evidence-budget exhaustion 属于暂时性不完整：action 写入 `pending` 并以非零状态退出。确定性的 provider schema、identity 或 commit-binding 冲突写入 `error`，也以非零状态退出。
 - 当前默认 timeout 是 overall 2 小时、首次 marker ack 5 分钟、ack 退避上限 30 分钟且不超过 marker result timeout、每个 marker result 1 小时。推荐 schedule 示例每 2 小时检查一次 retry deadlines。
 
 ## 反馈和报告

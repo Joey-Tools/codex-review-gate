@@ -1,8 +1,40 @@
+import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
+
 export const STATUS_CONTEXT = process.env.STATUS_CONTEXT || "codex/review-gate";
 export const STATE_MARKER = process.env.STATE_MARKER || "codex-review-gate-state";
 export const MARKER_COMMENT = process.env.MARKER_COMMENT || "codex-review-gate-marker";
 export const STATE_VERSION = 1;
+export const MAX_STATE_COMMENT_BYTES = 60 * 1024;
+export const MAX_FINDING_ID_SAMPLES = 4;
 export const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
+export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
+const MAX_CODEX_TERMINAL_HEADING_CODE_UNITS = 512;
+const MAX_CODEX_TERMINAL_HEADING_GRAPHEMES = 64;
+const MAX_FINDING_ID_SAMPLE_CODE_UNITS = 96;
+const EMOJI_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+const EMOJI_KEYCAP_GRAPHEME = /^[#*0-9]\uFE0F?\u20E3$/u;
+const EMOJI_FLAG_GRAPHEME = /^\p{Regional_Indicator}{2}$/u;
+const EMOJI_PRESENTATION_SIGNAL = /[\p{Extended_Pictographic}\p{Emoji_Presentation}]/u;
+const EMOJI_WITH_VARIATION_SELECTOR = /^(?=[\s\S]*\p{Emoji})(?=[\s\S]*\uFE0F)/u;
+const UNKNOWN_TERMINAL_DECORATOR =
+  /^[^\s]+[ \t]+Codex Review\b/iu;
+const CODEX_ISSUE_COMMENT_PROGRESS =
+  /^Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
+const CODEX_CLEAN_COMMENT_TAGLINES = new Set([
+  "",
+  "Nice work!",
+  "Chef's kiss.",
+  "What shall we delve into next?",
+  "Already looking forward to the next diff.",
+  "Keep them coming.",
+  ":rocket:",
+  ":tada:",
+  "Swish.",
+]);
 
 export const DEFAULT_CODEX_BOT_LOGINS = new Set([
   "chatgpt-codex-connector",
@@ -149,16 +181,20 @@ export function restRequestRetryAllowed(method, path, status) {
 }
 
 export function retryAfterDelayMs(retryAfter, fallbackMs) {
-  if (!retryAfter) {
+  if (typeof retryAfter !== "string" || retryAfter.length === 0) {
     return fallbackMs;
   }
 
-  const retryAfterSeconds = Number(retryAfter);
-  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
-    return retryAfterSeconds * 1000;
+  if (/^[0-9]+$/.test(retryAfter)) {
+    const retryAfterSeconds = Number(retryAfter);
+    return Number.isSafeInteger(retryAfterSeconds)
+      ? retryAfterSeconds * 1000
+      : Number.MAX_SAFE_INTEGER;
   }
 
-  const retryAt = Date.parse(retryAfter);
+  const retryAt = /^[A-Za-z]{3}, .+ GMT$/.test(retryAfter)
+    ? Date.parse(retryAfter)
+    : Number.NaN;
   if (!Number.isNaN(retryAt)) {
     return Math.max(0, retryAt - Date.now());
   }
@@ -168,6 +204,595 @@ export function retryAfterDelayMs(retryAfter, fallbackMs) {
 
 export function isCodexBot(login, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   return botLogins.has(login || "");
+}
+
+export function isFullCommitSha(value) {
+  return /^[0-9a-f]{40}$/i.test(String(value || ""));
+}
+
+export function isTrustedCodexRestUser(user, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
+  return isCodexBot(user?.login, botLogins) && user?.type === "Bot";
+}
+
+export function parseCodexIssueCommentTerminalHeading(body) {
+  const normalized = normalizeCodexCommentBody(body);
+  const headingWindow = normalized.slice(0, MAX_CODEX_TERMINAL_HEADING_CODE_UNITS + 1);
+  const newlineIndex = headingWindow.indexOf("\n");
+  const lineWasTruncated =
+    newlineIndex < 0 && headingWindow.length > MAX_CODEX_TERMINAL_HEADING_CODE_UNITS;
+  const firstLine = headingWindow.slice(
+    0,
+    newlineIndex >= 0
+      ? newlineIndex
+      : MAX_CODEX_TERMINAL_HEADING_CODE_UNITS,
+  );
+  const markdownHeading = /^(?:#{1,6})[ \t]+/u.exec(firstLine);
+  const withoutMarkdownHeading = markdownHeading
+    ? firstLine.slice(markdownHeading[0].length)
+    : firstLine;
+  const emojiPrefix = stripLeadingEmojiGraphemes(withoutMarkdownHeading);
+  const heading = emojiPrefix.remainder;
+  if (!/^Codex Review\b/iu.test(heading)) {
+    return {
+      terminalLooking:
+        emojiPrefix.overflow ||
+        (lineWasTruncated && emojiPrefix.sawEmoji) ||
+        (lineWasTruncated && Boolean(markdownHeading)) ||
+        UNKNOWN_TERMINAL_DECORATOR.test(withoutMarkdownHeading),
+      progress: false,
+    };
+  }
+
+  return {
+    terminalLooking: true,
+    progress:
+      !lineWasTruncated &&
+      newlineIndex < 0 &&
+      CODEX_ISSUE_COMMENT_PROGRESS.test(heading),
+  };
+}
+
+function normalizeCodexCommentBody(body) {
+  return String(body || "")
+    .trim()
+    .replace(/\r\n?|[\u000B\u000C\u0085\u2028\u2029]/g, "\n");
+}
+
+function stripLeadingEmojiGraphemes(value) {
+  let cursor = 0;
+  let graphemeCount = 0;
+  let sawEmoji = false;
+  let sawSeparatorAfterEmoji = false;
+  let overflow = false;
+
+  for (const { segment, index } of EMOJI_GRAPHEME_SEGMENTER.segment(value)) {
+    if (index !== cursor) {
+      break;
+    }
+    if (graphemeCount >= MAX_CODEX_TERMINAL_HEADING_GRAPHEMES) {
+      overflow = sawEmoji;
+      break;
+    }
+    graphemeCount += 1;
+
+    if (isEmojiGrapheme(segment)) {
+      sawEmoji = true;
+      sawSeparatorAfterEmoji = false;
+      cursor += segment.length;
+      continue;
+    }
+    if (sawEmoji && /^[ \t]+$/u.test(segment)) {
+      sawSeparatorAfterEmoji = true;
+      cursor += segment.length;
+      continue;
+    }
+    break;
+  }
+
+  return {
+    remainder:
+      sawEmoji && sawSeparatorAfterEmoji
+        ? value.slice(cursor)
+        : value,
+    sawEmoji,
+    overflow,
+  };
+}
+
+function isEmojiGrapheme(value) {
+  return (
+    EMOJI_KEYCAP_GRAPHEME.test(value) ||
+    EMOJI_FLAG_GRAPHEME.test(value) ||
+    EMOJI_PRESENTATION_SIGNAL.test(value) ||
+    EMOJI_WITH_VARIATION_SELECTOR.test(value)
+  );
+}
+
+export function parseCodexIssueCommentArtifact(
+  comment,
+  {
+    owner = "",
+    repo = "",
+    botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  } = {},
+) {
+  const body = normalizeCodexCommentBody(comment?.body);
+  const terminalHeading = parseCodexIssueCommentTerminalHeading(body);
+  if (!terminalHeading.terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
+    return null;
+  }
+  if (terminalHeading.progress) {
+    return null;
+  }
+
+  const base = providerArtifactIdentity(comment, "issue-comment");
+  if (base.kind === "malformed") {
+    return base;
+  }
+  if (!isTrustedCodexRestUser(comment.user, botLogins)) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "configured Codex issue-comment author is not a Bot",
+    };
+  }
+
+  if (
+    DEFAULT_CODEX_BOT_LOGINS.has(comment.user.login) &&
+    comment.performed_via_github_app?.slug !== OFFICIAL_CODEX_APP_SLUG
+  ) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: `official Codex issue comment is not bound to ${OFFICIAL_CODEX_APP_SLUG}`,
+    };
+  }
+
+  if (body.startsWith(CODEX_CLEAN_COMMENT_LEAD)) {
+    if (cleanBodyContainsFindingSignals(body)) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "clean Codex issue comment contains finding-formatted content",
+      };
+    }
+    const markerLabels = body.match(/\*\*Reviewed commit:\*\*/gi) || [];
+    const matches = [
+      ...body.matchAll(
+        /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{10}|[0-9a-f]{40})`[ \t]*\r?$/gm,
+      ),
+    ];
+    if (markerLabels.length !== 1 || matches.length !== 1) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "clean Codex issue comment must contain exactly one Reviewed commit marker",
+      };
+    }
+    if (!issueCommentCleanBodyHasClosedGrammar(body, matches[0][0])) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "clean Codex issue comment does not match the closed clean-result grammar",
+      };
+    }
+    return {
+      ...base,
+      kind: "clean",
+      commitRef: matches[0][1].toLowerCase(),
+    };
+  }
+
+  if (body.startsWith("### 💡 Codex Review")) {
+    const parsed = parseExactRepositoryBlobFindings(body, owner, repo);
+    if (parsed.error) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: parsed.error,
+      };
+    }
+    return {
+      ...base,
+      kind: "finding",
+      headSha: parsed.headSha,
+      samples: parsed.samples,
+    };
+  }
+
+  return {
+    ...base,
+    kind: "malformed",
+    reason: "unrecognized Codex terminal issue-comment format",
+  };
+}
+
+export function parseCodexReviewArtifact(
+  review,
+  {
+    owner = "",
+    repo = "",
+    botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  } = {},
+) {
+  const body = String(review?.body || "").trim();
+  const terminalLooking =
+    new Set(["APPROVED", "COMMENTED", "CHANGES_REQUESTED"]).has(review?.state) ||
+    body.startsWith("### 💡 Codex Review");
+  if (!terminalLooking || !isCodexBot(review?.user?.login, botLogins)) {
+    return null;
+  }
+
+  const base = providerArtifactIdentity(
+    {
+      ...review,
+      created_at: review.submitted_at || review.created_at,
+      html_url: review.html_url,
+    },
+    "pull-request-review",
+  );
+  if (base.kind === "malformed") {
+    return base;
+  }
+  if (!isTrustedCodexRestUser(review.user, botLogins)) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "configured Codex review author is not a Bot",
+    };
+  }
+  if (!isFullCommitSha(review.commit_id)) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "Codex review is not bound to a full commit SHA",
+    };
+  }
+
+  if (review.state === "APPROVED") {
+    if (
+      cleanBodyContainsFindingSignals(body) ||
+      !approvedReviewCleanBodyHasClosedGrammar(body)
+    ) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "Codex review state conflicts with its non-clean body",
+      };
+    }
+    return {
+      ...base,
+      kind: "clean",
+      headSha: review.commit_id.toLowerCase(),
+    };
+  }
+
+  if (!body.startsWith("### 💡 Codex Review")) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "unrecognized Codex terminal pull-request-review format",
+    };
+  }
+
+  const parsed = parseExactRepositoryBlobFindings(body, owner, repo);
+  if (parsed.error) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: parsed.error,
+    };
+  }
+  if (parsed.headSha !== review.commit_id.toLowerCase()) {
+    return {
+      ...base,
+      kind: "malformed",
+      reason: "Codex review finding links conflict with the parent review commit",
+    };
+  }
+  return {
+    ...base,
+    kind: "finding",
+    headSha: parsed.headSha,
+    samples: parsed.samples,
+  };
+}
+
+export function sortCodexArtifactsNewestFirst(artifacts) {
+  return [...(artifacts || [])].sort((left, right) => {
+    const byCreatedAt =
+      parseTimestamp(right.createdAt, "Codex artifact creation time") -
+      parseTimestamp(left.createdAt, "Codex artifact creation time");
+    if (byCreatedAt !== 0) {
+      return byCreatedAt;
+    }
+    if (left.source !== right.source) {
+      return 0;
+    }
+    return compareProviderArtifactIds(right.id, left.id);
+  });
+}
+
+export function collectCodexThreadEvidence(
+  reviewComments,
+  reviews,
+  reviewThreads,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  headSha = "",
+) {
+  const reviewCommentsList = reviewComments || [];
+  const errors = [];
+  const transientErrors = [];
+  const reviewById = new Map();
+  const restCommentByNodeId = new Map();
+  const restCommentByDatabaseId = new Map();
+  const threadByNodeId = new Map();
+  const graphqlCommentByDatabaseId = new Map();
+  const reviewThreadIds = new Set();
+  const verifiedRestCommentNodeIds = new Set();
+  const validatedCodexInlineParentReviewIds = new Set();
+  const findingByThreadId = new Map();
+
+  for (const review of reviews || []) {
+    const reviewId = normalizeRestDatabaseId(review?.id);
+    if (!reviewId) {
+      errors.push("REST review snapshot contains a review without a valid numeric id");
+    } else if (reviewById.has(reviewId)) {
+      errors.push(`REST review snapshot contains duplicate numeric id ${reviewId}`);
+    } else {
+      reviewById.set(reviewId, review);
+    }
+  }
+
+  for (const comment of reviewCommentsList) {
+    const databaseId = normalizeRestDatabaseId(comment?.id);
+    const nodeId = normalizeOpaqueNodeId(comment?.node_id);
+    if (!databaseId) {
+      errors.push("REST review-comment snapshot contains a comment without a valid numeric id");
+    } else if (restCommentByDatabaseId.has(databaseId)) {
+      errors.push(`REST review-comment snapshot contains duplicate numeric id ${databaseId}`);
+    } else {
+      restCommentByDatabaseId.set(databaseId, comment);
+    }
+    if (!nodeId) {
+      errors.push(
+        `REST review-comment ${databaseId || "<unknown>"} is missing a valid opaque node_id`,
+      );
+    } else if (restCommentByNodeId.has(nodeId)) {
+      errors.push(`REST review-comment snapshot contains duplicate node_id ${nodeId}`);
+    } else {
+      restCommentByNodeId.set(nodeId, comment);
+    }
+  }
+
+  for (const thread of reviewThreads || []) {
+    const threadId = normalizeOpaqueNodeId(thread?.id);
+    if (!threadId) {
+      errors.push(
+        "GraphQL review-thread snapshot contains a thread without a valid opaque id",
+      );
+      continue;
+    }
+    if (reviewThreadIds.has(threadId)) {
+      errors.push(
+        `GraphQL review-thread snapshot contains duplicate or conflicting thread id ${threadId}`,
+      );
+      continue;
+    }
+    reviewThreadIds.add(threadId);
+
+    if (typeof thread?.isResolved !== "boolean") {
+      errors.push(
+        `GraphQL review thread ${threadId} has a non-boolean isResolved value`,
+      );
+      continue;
+    }
+    const comments = thread?.comments?.nodes || [];
+    const unresolved = !thread.isResolved;
+    const threadLabel = unresolved
+      ? "unresolved review thread"
+      : "resolved review thread";
+    if (unresolved && comments.length === 0) {
+      transientErrors.push(
+        `unresolved review thread ${threadId} has no loaded GraphQL comments`,
+      );
+    }
+    for (const graphqlComment of comments) {
+      const nodeId = normalizeOpaqueNodeId(graphqlComment?.id);
+      const databaseId = normalizeGraphqlDatabaseId(
+        graphqlComment?.fullDatabaseId,
+      );
+      if (!nodeId) {
+        errors.push(
+          `${threadLabel} ${threadId} contains a GraphQL comment without a valid opaque id`,
+        );
+        continue;
+      }
+
+      const priorNode = threadByNodeId.get(nodeId);
+      if (priorNode) {
+        const priorThreadId = String(priorNode.thread.id || "unknown");
+        errors.push(priorThreadId === threadId
+          ? `GraphQL review comment opaque id ${nodeId} appears more than once in thread ${threadId}`
+          : `GraphQL review comment opaque id ${nodeId} appears in multiple review threads`);
+        continue;
+      }
+      threadByNodeId.set(nodeId, { thread, unresolved });
+
+      if (!databaseId) {
+        errors.push(
+          `${threadLabel} ${threadId} contains GraphQL comment ${nodeId} ` +
+            "without a valid fullDatabaseId",
+        );
+        continue;
+      }
+
+      const priorDatabaseId = graphqlCommentByDatabaseId.get(databaseId);
+      if (priorDatabaseId) {
+        const priorThreadId = String(priorDatabaseId.thread.id || "unknown");
+        errors.push(priorThreadId === threadId
+          ? `GraphQL review comment fullDatabaseId ${databaseId} appears more than once in thread ${threadId}`
+          : `GraphQL review comment fullDatabaseId ${databaseId} appears in multiple review threads`);
+      } else {
+        graphqlCommentByDatabaseId.set(databaseId, {
+          thread,
+          unresolved,
+          nodeId,
+        });
+      }
+
+      const restComment = restCommentByNodeId.get(nodeId);
+      if (!restComment) {
+        const conflictingRestComment = restCommentByDatabaseId.get(databaseId);
+        if (conflictingRestComment) {
+          errors.push(
+            `${threadLabel} ${threadId} maps GraphQL fullDatabaseId ` +
+              `${databaseId} to opaque id ${nodeId}, but REST maps it to conflicting ` +
+              `node_id ${normalizeOpaqueNodeId(conflictingRestComment.node_id) || "<invalid>"}`,
+          );
+          continue;
+        }
+        transientErrors.push(
+          `${threadLabel} ${threadId} contains GraphQL comment ${nodeId} ` +
+            "missing from the complete REST review-comment snapshot",
+        );
+        continue;
+      }
+      const restDatabaseId = normalizeRestDatabaseId(restComment.id);
+      if (restDatabaseId !== databaseId) {
+        errors.push(
+          `${threadLabel} ${threadId} maps GraphQL comment ${nodeId} ` +
+            `fullDatabaseId ${databaseId} to conflicting REST numeric id ` +
+            `${restDatabaseId || "<invalid>"}`,
+        );
+        continue;
+      }
+      verifiedRestCommentNodeIds.add(nodeId);
+    }
+  }
+
+  for (const comment of reviewCommentsList) {
+    if (!isCodexBot(comment?.user?.login, botLogins)) {
+      continue;
+    }
+
+    const nodeId = normalizeOpaqueNodeId(comment.node_id);
+    if (!nodeId) {
+      continue;
+    }
+    const threadRecord = threadByNodeId.get(nodeId);
+    if (!threadRecord) {
+      transientErrors.push(`review comment ${comment.id} has no loaded review thread`);
+      continue;
+    }
+    const { thread, unresolved } = threadRecord;
+    if (!verifiedRestCommentNodeIds.has(nodeId)) {
+      continue;
+    }
+
+    const threadId = String(thread.id || `comment:${comment.id}`);
+    if (unresolved && !findingByThreadId.has(threadId)) {
+      const location = [
+        thread.path || comment.path,
+        thread.line || comment.line || comment.original_line,
+      ].filter((part) => part !== null && part !== undefined).join(":");
+      findingByThreadId.set(threadId, {
+        id: `thread:${threadId}`,
+        sample: location || `review comment ${comment.id}`,
+      });
+    }
+
+    if (!isTrustedCodexRestUser(comment.user, botLogins)) {
+      errors.push(`review comment ${comment.id} author is not a Bot`);
+      continue;
+    }
+
+    const reviewId = comment.pull_request_review_id;
+    const normalizedReviewId = normalizeRestDatabaseId(reviewId);
+    if (!normalizedReviewId) {
+      errors.push(`review comment ${comment.id} has no valid parent review id`);
+      continue;
+    }
+    const parentReview = reviewById.get(normalizedReviewId);
+    if (!parentReview) {
+      transientErrors.push(`review comment ${comment.id} has no loaded parent review`);
+      continue;
+    }
+    if (!isTrustedCodexRestUser(parentReview.user, botLogins)) {
+      errors.push(`review comment ${comment.id} parent review author is not a configured Bot`);
+      continue;
+    }
+    if (!isFullCommitSha(parentReview.commit_id) || !isFullCommitSha(comment.original_commit_id)) {
+      errors.push(`review comment ${comment.id} is not bound through full commit SHAs`);
+      continue;
+    }
+    if (parentReview.commit_id.toLowerCase() !== comment.original_commit_id.toLowerCase()) {
+      errors.push(`review comment ${comment.id} original commit conflicts with its parent review`);
+      continue;
+    }
+
+    validatedCodexInlineParentReviewIds.add(normalizedReviewId);
+
+    if (!unresolved) {
+      continue;
+    }
+  }
+
+  const findings = [...findingByThreadId.values()];
+  return {
+    count: findings.length,
+    ids: findings.map((finding) => finding.id),
+    samples: findings.map((finding) => finding.sample).slice(0, 3),
+    errors,
+    transientErrors,
+    validatedCodexInlineParentReviewIds: [...validatedCodexInlineParentReviewIds],
+  };
+}
+
+export function collectUnresolvedCodexThreadFindings(
+  reviewComments,
+  reviews,
+  reviewThreads,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  headSha = "",
+) {
+  const evidence = collectCodexThreadEvidence(
+    reviewComments,
+    reviews,
+    reviewThreads,
+    botLogins,
+    headSha,
+  );
+  return {
+    count: evidence.count,
+    ids: evidence.ids,
+    samples: evidence.samples,
+    errors: evidence.errors,
+    transientErrors: evidence.transientErrors,
+  };
+}
+
+function normalizeOpaqueNodeId(value) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    /\s/.test(value)
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function normalizeRestDatabaseId(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? String(value)
+    : null;
+}
+
+function normalizeGraphqlDatabaseId(value) {
+  return typeof value === "string" && /^[1-9][0-9]*$/.test(value)
+    ? value
+    : null;
 }
 
 export function isTrustedCommentAuthor(login, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
@@ -486,9 +1111,9 @@ export function buildReviewThreadIndex(reviewThreads = []) {
   for (const thread of reviewThreads || []) {
     const comments = thread.comments?.nodes || [];
     for (const comment of comments) {
-      const id = comment.databaseId ?? comment.id;
-      if (id !== null && id !== undefined) {
-        byCommentId.set(String(id), thread);
+      const databaseId = normalizeGraphqlDatabaseId(comment.fullDatabaseId);
+      if (databaseId) {
+        byCommentId.set(databaseId, thread);
       }
     }
   }
@@ -509,7 +1134,7 @@ export function isCurrentHeadCodexInlineFinding(
   }
 
   const thread = reviewThreadByCommentId.get(String(comment.id));
-  if (thread?.isResolved || thread?.isOutdated) {
+  if (thread?.isResolved) {
     return false;
   }
 
@@ -557,6 +1182,204 @@ function safeDecodeURIComponent(value) {
   }
 }
 
+function providerArtifactIdentity(value, source) {
+  const id = normalizeRestDatabaseId(value?.id);
+  if (!id) {
+    return {
+      source,
+      id: "invalid",
+      createdAt: value?.created_at || "",
+      url: value?.html_url || null,
+      kind: "malformed",
+      reason: `Codex ${source} does not have a valid positive integer id`,
+    };
+  }
+  return {
+    source,
+    id,
+    createdAt: value?.created_at || "",
+    url: value?.html_url || null,
+  };
+}
+
+function compareProviderArtifactIds(left, right) {
+  if (
+    !/^[1-9][0-9]*$/.test(String(left)) ||
+    !/^[1-9][0-9]*$/.test(String(right))
+  ) {
+    throw new Error("Codex provider artifacts cannot be ordered without canonical numeric ids");
+  }
+  return Number(left) - Number(right);
+}
+
+function parseExactRepositoryBlobFindings(body, owner, repo) {
+  if (!owner || !repo) {
+    return { error: "repository identity is required for Codex finding links" };
+  }
+
+  const genericBlobUrls =
+    body.match(/https:\/\/[^/\s)]+\/[^/\s)]+\/[^/\s)]+\/blob\/[^\s)]+/g) || [];
+  const exactPattern =
+    /https:\/\/github\.com\/([^/\s)]+)\/([^/\s)]+)\/blob\/([0-9a-f]{40})\/([^\s)#]+)#L(\d+)(?:-L\d+)?(?=$|[\s)])/gi;
+  const matches = [...body.matchAll(exactPattern)];
+  if (genericBlobUrls.length === 0 || matches.length !== genericBlobUrls.length) {
+    return { error: "Codex finding must contain only exact full-SHA github.com blob links" };
+  }
+
+  const headShas = new Set();
+  const samples = [];
+  for (const match of matches) {
+    if (match[1] !== owner || match[2] !== repo) {
+      return { error: "Codex finding link targets a different repository" };
+    }
+    headShas.add(match[3].toLowerCase());
+    samples.push(`${safeDecodeURIComponent(match[4])}:${match[5]}`);
+  }
+  if (headShas.size !== 1) {
+    return { error: "Codex finding links target conflicting commits" };
+  }
+
+  return {
+    headSha: [...headShas][0],
+    samples: samples.slice(0, 3),
+  };
+}
+
+function cleanBodyContainsFindingSignals(body) {
+  return (
+    /###\s*💡\s*Codex Review/i.test(body) ||
+    /https:\/\/github\.com\/[^/\s)]+\/[^/\s)]+\/blob\/[^\s)]+/i.test(body) ||
+    /!\[(?:P[0-3]|S[0-3])(?:\s+Badge)?\]\(https:\/\/img\.shields\.io\/badge\/[^)]+\)/i.test(body) ||
+    /(?:^|\n)\s*(?:[-*]\s*)?\[(?:P[0-3]|S[0-3])\]\s+/i.test(body)
+  );
+}
+
+function issueCommentCleanBodyHasClosedGrammar(body, markerText) {
+  const normalizedBody = body.replace(/\r\n?/g, "\n");
+  const normalizedMarker = markerText.replace(/\r\n?/g, "\n");
+  const markerIndex = normalizedBody.indexOf(normalizedMarker);
+  if (markerIndex < 0) {
+    return false;
+  }
+
+  const prefixBlock = normalizedBody.slice(0, markerIndex);
+  if (!prefixBlock.endsWith("\n\n")) {
+    return false;
+  }
+  const prefix = prefixBlock.slice(0, -2);
+  if (prefix.includes("\n") || !prefix.startsWith(CODEX_CLEAN_COMMENT_LEAD)) {
+    return false;
+  }
+  const tagline = prefix.slice(CODEX_CLEAN_COMMENT_LEAD.length);
+  const normalizedTagline = tagline ? tagline.replace(/^ /, "") : "";
+  if (
+    (tagline && !tagline.startsWith(" ")) ||
+    !CODEX_CLEAN_COMMENT_TAGLINES.has(normalizedTagline)
+  ) {
+    return false;
+  }
+  const suffixBlock = normalizedBody.slice(markerIndex + normalizedMarker.length);
+  if (!suffixBlock) {
+    return true;
+  }
+
+  return (
+    suffixBlock.startsWith("\n\n") &&
+    officialCodexDisclosureHasClosedGrammar(suffixBlock.slice(2))
+  );
+}
+
+function officialCodexDisclosureHasClosedGrammar(value) {
+  const normalized = value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+  return normalized === [
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    '- Comment "@codex review".',
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
+    "</details>",
+  ].join("\n");
+}
+
+function approvedReviewCleanBodyHasClosedGrammar(body) {
+  if (!body || body === "Looks good.") {
+    return true;
+  }
+  if (body.length > 2_000 || /https?:\/\/|```|<!--|-->|<\/?[a-z][^>]*>/i.test(body)) {
+    return false;
+  }
+
+  const lines = body
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (
+    lines.length === 0 ||
+    lines.length > 2 ||
+    lines.at(-1) !== "No findings." ||
+    lines.filter((line) => line === "No findings.").length !== 1
+  ) {
+    return false;
+  }
+
+  const target = "`[A-Za-z0-9_./:@+-]+`";
+  const targetList = `${target}(?:, ${target})*(?:,? and ${target})?`;
+  const structuredSummary = new RegExp(
+    `^(?:Review coverage|Coverage): (${targetList})\\.?$`,
+  );
+  return lines.slice(0, -1).every((line) => {
+    if (line.length > 240) {
+      return false;
+    }
+    const match = structuredSummary.exec(line);
+    if (!match) {
+      return false;
+    }
+    const targets = [...match[1].matchAll(/`([^`]+)`/g)].map(
+      (targetMatch) => targetMatch[1],
+    );
+    return targets.every((coverageTarget) => !coverageTargetContainsFindingLexeme(coverageTarget));
+  });
+}
+
+function coverageTargetContainsFindingLexeme(target) {
+  const normalized = target.trim().toLowerCase();
+  return /^(?:p[0-3]|s[0-3]|critical|high|medium|low|findings?|blocker|blocking|found|detected|data-loss|auth-bypass)$/.test(
+    normalized,
+  );
+}
+
+export function summarizeFindingsForState(findings = {}) {
+  const ids = Array.isArray(findings?.ids)
+    ? findings.ids.map((id) => String(id))
+    : [];
+  const sortedIds = [...ids].sort();
+  const digest = createHash("sha256");
+  digest.update("codex-review-gate-finding-ids-v1\0");
+  for (const id of sortedIds) {
+    digest.update(`${Buffer.byteLength(id, "utf8")}:`);
+    digest.update(id);
+    digest.update("\0");
+  }
+
+  return {
+    count: ids.length,
+    sampleIds: sortedIds
+      .slice(0, MAX_FINDING_ID_SAMPLES)
+      .map((id) => truncate(id, MAX_FINDING_ID_SAMPLE_CODE_UNITS)),
+    idDigest: `sha256:${digest.digest("hex")}`,
+  };
+}
+
 export function createInitialState({ now, statusHead, runUrl, reactions, findings }) {
   return normalizeState({
     version: STATE_VERSION,
@@ -567,7 +1390,7 @@ export function createInitialState({ now, statusHead, runUrl, reactions, finding
       status: "open",
       startedAt: now,
       baseline: reactions,
-      currentHeadFindingIds: findings.ids,
+      currentHeadFindings: summarizeFindingsForState(findings),
     },
     activeMarker: null,
     history: [],
@@ -611,7 +1434,7 @@ export function stateFromRecoveredMarkerComment({
       closedAt: now,
       closeReason: "state_lost_recovery",
       baseline: reactions || { plusOne: null, eyes: null },
-      currentHeadFindingIds: findings?.ids || [],
+      currentHeadFindings: summarizeFindingsForState(findings),
     },
     activeMarker: null,
     history: [recoveredMarker],
@@ -653,10 +1476,67 @@ export function stateNeedsFreshMarkerAfterMissingMarker(state, statusHead) {
 }
 
 export function normalizeState(state) {
+  const history = (state.history || [])
+    .slice(-20)
+    .map(normalizeFindingAuditContainer);
   return {
     ...state,
     version: STATE_VERSION,
-    history: (state.history || []).slice(-20),
+    bootstrap: normalizeFindingAuditContainer(state.bootstrap),
+    activeMarker: normalizeFindingAuditContainer(state.activeMarker),
+    history,
+  };
+}
+
+function normalizeFindingAuditContainer(container) {
+  if (!container || typeof container !== "object" || Array.isArray(container)) {
+    return container;
+  }
+
+  const normalized = { ...container };
+  let findingSummary = null;
+  if (Array.isArray(container.currentHeadFindingIds)) {
+    findingSummary = summarizeFindingsForState({
+      count: container.currentHeadFindingIds.length,
+      ids: container.currentHeadFindingIds,
+    });
+  } else if (container.currentHeadFindings) {
+    findingSummary = normalizePersistedFindingSummary(container.currentHeadFindings);
+  }
+  delete normalized.currentHeadFindingIds;
+  if (findingSummary) {
+    normalized.currentHeadFindings = findingSummary;
+  } else {
+    delete normalized.currentHeadFindings;
+  }
+  if (Array.isArray(normalized.rejectedRecoveryCompletions)) {
+    normalized.rejectedRecoveryCompletions =
+      normalized.rejectedRecoveryCompletions.slice(-20);
+  }
+  return normalized;
+}
+
+function normalizePersistedFindingSummary(summary) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
+    return null;
+  }
+  const count = Number(summary.count);
+  if (!Number.isSafeInteger(count) || count < 0) {
+    return null;
+  }
+  const sampleIds = Array.isArray(summary.sampleIds)
+    ? summary.sampleIds
+        .slice(0, MAX_FINDING_ID_SAMPLES)
+        .map((id) => truncate(String(id), MAX_FINDING_ID_SAMPLE_CODE_UNITS))
+    : [];
+  const idDigest = /^sha256:[0-9a-f]{64}$/i.test(String(summary.idDigest || ""))
+    ? String(summary.idDigest).toLowerCase()
+    : null;
+
+  return {
+    count,
+    sampleIds,
+    idDigest,
   };
 }
 
@@ -733,6 +1613,7 @@ export function updateStateForStatus(state, { now, statusHead, runUrl, status })
 }
 
 export function buildStateCommentBody(state) {
+  const normalizedState = normalizeState(state);
   const active = state.activeMarker;
   const summary = [
     "codex/review-gate state",
@@ -742,7 +1623,16 @@ export function buildStateCommentBody(state) {
     `- updated: \`${state.updatedAt || "unknown"}\``,
   ];
 
-  return `${summary.join("\n")}\n\n${buildHiddenJson(STATE_MARKER, normalizeState(state))}`;
+  const body =
+    `${summary.join("\n")}\n\n${buildHiddenJson(STATE_MARKER, normalizedState)}`;
+  const byteLength = Buffer.byteLength(body, "utf8");
+  if (byteLength > MAX_STATE_COMMENT_BYTES) {
+    throw new Error(
+      `codex/review-gate state comment is ${byteLength} bytes; ` +
+        `the maximum is ${MAX_STATE_COMMENT_BYTES}`,
+    );
+  }
+  return body;
 }
 
 export function parseStateCommentBody(body) {
@@ -776,13 +1666,10 @@ export function buildMarkerCommentBody(marker) {
 
 export function parseMarkerCommentBody(body) {
   const parsed = parseHiddenJson(body, MARKER_COMMENT);
-  if (!parsed) {
+  if (!parsed || parsed.version !== STATE_VERSION) {
     return null;
   }
-  return {
-    ...parsed,
-    version: STATE_VERSION,
-  };
+  return parsed;
 }
 
 export function findLatestTrustedStateComment(comments, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
@@ -795,12 +1682,16 @@ export function findLatestTrustedStateComment(comments, trustedLogins = DEFAULT_
 }
 
 export function findLatestTrustedMarkerComment(comments, trustedLogins = DEFAULT_TRUSTED_COMMENT_LOGINS) {
-  return [...comments]
+  const latestMarkerShapedComment = [...comments]
     .reverse()
     .find((comment) =>
       isTrustedCommentAuthor(comment.user?.login, trustedLogins) &&
-      Boolean(parseMarkerCommentBody(comment.body || "")),
+      markerCommentBodyHasControlEnvelope(comment.body || ""),
     ) || null;
+  return latestMarkerShapedComment &&
+    parseMarkerCommentBody(latestMarkerShapedComment.body || "")
+    ? latestMarkerShapedComment
+    : null;
 }
 
 export function markerFromComment(comment) {
@@ -827,6 +1718,13 @@ export function parseHiddenJson(body, marker) {
     return null;
   }
   return JSON.parse(match[1]);
+}
+
+function markerCommentBodyHasControlEnvelope(body) {
+  const pattern = new RegExp(
+    `<!--\\s*${escapeRegExp(MARKER_COMMENT)}(?:\\s|$)`,
+  );
+  return pattern.test(String(body || ""));
 }
 
 export function parseTimestamp(value, description) {
