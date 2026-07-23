@@ -494,6 +494,14 @@ async function processPullRequest(prNumber, trigger) {
     freshHeadMarkerAllowed = false;
   }
 
+  const reconciliationTimeout = await timeOutCurrentHeadWaitCycleIfNeeded(
+    state,
+    savedStateComment,
+  );
+  if (reconciliationTimeout.timedOut) {
+    return;
+  }
+
   if (
     await reconcileCurrentReviewEvidence(
       snapshot,
@@ -807,29 +815,21 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
 
   for (let iteration = 0; iteration < 4; iteration += 1) {
     if (!state.activeMarker) {
+      const timeout = await timeOutCurrentHeadWaitCycleIfNeeded(state, stateComment);
+      if (timeout.timedOut) {
+        return {
+          kind: "terminal",
+          state: timeout.state,
+          stateComment: timeout.stateComment,
+        };
+      }
+
       if (!allowCreateMarker) {
         console.log(`PR #${activePrNumber} has no active marker; skipping ${trigger.kind} trigger.`);
         return { kind: "done", state, stateComment };
       }
 
-      const nowMs = Date.now();
-      const now = isoNow(nowMs);
-      const waitCycle = waitCycleForState(state, now);
-      if (
-        !waitCycle.newCycle &&
-        nowMs >= parseTimestamp(waitCycle.maxWaitDeadlineAt, "max wait deadline")
-      ) {
-        state = recordHistoryOnlyWaitCycleTimeout(state, waitCycle, now);
-        state = updateStateForStatus(state, {
-          now,
-          statusHead: statusSha,
-          runUrl,
-          status: "failure",
-        });
-        await setCommitStatus("failure", "Timed out waiting for Codex review signal");
-        stateComment = await saveState(state, stateComment);
-        return { kind: "terminal", state, stateComment };
-      }
+      const waitCycle = waitCycleForState(state, isoNow());
 
       const marker = await createGateMarker(snapshot.baseline, state, waitCycle);
       state = normalizeState({
@@ -856,18 +856,12 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
 
     const timeoutOutcome = markerTimeoutOutcome(activeMarker);
     if (timeoutOutcome === "max_wait") {
-      state = closeActiveMarker(state, "timed_out", isoNow(), {
-        timedOutAfterSeconds: Math.round(config.maxWaitMs / 1000),
-      });
-      state = updateStateForStatus(state, {
-        now: isoNow(),
-        statusHead: statusSha,
-        runUrl,
-        status: "failure",
-      });
-      await setCommitStatus("failure", "Timed out waiting for Codex review signal");
-      stateComment = await saveState(state, stateComment);
-      return { kind: "done", state, stateComment };
+      const timeout = await timeOutCurrentHeadWaitCycleIfNeeded(state, stateComment);
+      return {
+        kind: "terminal",
+        state: timeout.state,
+        stateComment: timeout.stateComment,
+      };
     }
 
     const approvedReview = selectLatestCodexApprovedReview(snapshot.reviews, config.codexBotLogins);
@@ -1245,6 +1239,13 @@ async function passGateFromCurrentEvidence(
   await failIfPullRequestHeadChanged("before final Codex review evidence snapshot");
   const finalSnapshot = await loadSnapshot();
   failIfSnapshotEvidenceIsInvalid(finalSnapshot);
+  const finalSnapshotTimeout = await timeOutCurrentHeadWaitCycleIfNeeded(
+    state,
+    stateComment,
+  );
+  if (finalSnapshotTimeout.timedOut) {
+    return;
+  }
   if (finalSnapshot.findings.count > 0) {
     const rejectedState = recordRejectedFreshRecoveryAttempt(
       finalSnapshot.providerResult,
@@ -1508,15 +1509,20 @@ async function demoteUnauthorizedCleanIfNeeded(state, stateComment) {
     status: "pending",
   });
   if (invalidation.changed) {
+    let persistedStateComment = stateComment;
     await setCommitStatusIfNeeded(
       "pending",
       "Current-head Codex clean result is not authorized by trusted marker lineage",
-      { liveStatus },
-    );
-    const persistedStateComment = await saveAuthorizationCriticalState(
-      pendingState,
-      stateComment,
-      "unauthorized passed-result lineage invalidation",
+      {
+        liveStatus,
+        beforeDecision: async () => {
+          persistedStateComment = await saveAuthorizationCriticalState(
+            pendingState,
+            stateComment,
+            "unauthorized passed-result lineage invalidation",
+          );
+        },
+      },
     );
     return {
       state: pendingState,
@@ -1761,6 +1767,70 @@ function recordHistoryOnlyWaitCycleTimeout(state, waitCycle, now) {
   });
 }
 
+async function timeOutCurrentHeadWaitCycleIfNeeded(state, stateComment) {
+  const nowMs = Date.now();
+  const now = isoNow(nowMs);
+  let timedOutState = null;
+
+  if (state.activeMarker) {
+    if (markerTimeoutOutcome(state.activeMarker, nowMs) !== "max_wait") {
+      return { timedOut: false, state, stateComment };
+    }
+    const headStartedAt =
+      state.activeMarker.headStartedAt ||
+      state.activeMarker.createdAt ||
+      state.createdAt ||
+      now;
+    const maxWaitDeadlineAt = state.activeMarker.maxWaitDeadlineAt;
+    const timedOutAfterSeconds = Math.max(
+      0,
+      Math.round(
+        (
+          parseTimestamp(maxWaitDeadlineAt, "max wait deadline") -
+          parseTimestamp(headStartedAt, "wait cycle start time")
+        ) / 1000,
+      ),
+    );
+    timedOutState = closeActiveMarker(state, "timed_out", now, {
+      timedOutAfterSeconds,
+    });
+  } else {
+    const waitCycle = waitCycleForState(state, now);
+    if (
+      waitCycle.newCycle ||
+      nowMs < parseTimestamp(waitCycle.maxWaitDeadlineAt, "max wait deadline")
+    ) {
+      return { timedOut: false, state, stateComment };
+    }
+    if (waitCycle.latestOutcome === "timed_out") {
+      await setCommitStatusIfNeeded(
+        "failure",
+        "Timed out waiting for Codex review signal",
+      );
+      return { timedOut: true, state, stateComment };
+    }
+    timedOutState = recordHistoryOnlyWaitCycleTimeout(state, waitCycle, now);
+  }
+
+  const statusState = updateStateForStatus(timedOutState, {
+    now,
+    statusHead: statusSha,
+    runUrl,
+    status: "failure",
+  });
+  const persistedStateComment = await saveAuthorizationCriticalState(
+    statusState,
+    stateComment,
+    "max-wait timeout state",
+  );
+  await setCommitStatus("failure", "Timed out waiting for Codex review signal");
+  return {
+    timedOut: true,
+    state: statusState,
+    stateComment: persistedStateComment,
+  };
+}
+
 async function saveState(state, stateComment) {
   const body = buildStateCommentBody(state);
   if (stateComment?.id) {
@@ -1913,12 +1983,139 @@ async function settleEvidenceLoads(loads) {
     if (deterministic) {
       throw deterministic;
     }
+    const fulfilledEvidenceError = validateFulfilledProviderEvidence(settled);
+    if (fulfilledEvidenceError) {
+      throw fulfilledEvidenceError;
+    }
     if (evidenceWorkBudget?.failure) {
       throw evidenceWorkBudget.failure;
     }
     throw rejections[0];
   }
   return settled.map((result) => result.value);
+}
+
+function validateFulfilledProviderEvidence(settled) {
+  const providerArtifactIdentities = new Set();
+  const reviewCommentsResult = settled[2];
+  const reviewsResult = settled[3];
+  const reviewThreadsResult = settled[4];
+  if (
+    reviewCommentsResult?.status === "fulfilled" &&
+    reviewsResult?.status === "fulfilled" &&
+    reviewThreadsResult?.status === "fulfilled"
+  ) {
+    const threadEvidence = collectCodexThreadEvidence(
+      reviewCommentsResult.value,
+      reviewsResult.value,
+      reviewThreadsResult.value,
+      config.codexBotLogins,
+      statusSha,
+    );
+    if (threadEvidence.errors.length > 0) {
+      return invalidProviderEvidenceFailure(threadEvidence.errors[0]);
+    }
+  }
+
+  const commentsResult = settled[0];
+  if (commentsResult?.status === "fulfilled") {
+    for (const comment of commentsResult.value) {
+      const artifact = parseCodexIssueCommentArtifact(comment, {
+        owner: repo.owner,
+        repo: repo.name,
+        botLogins: config.codexBotLogins,
+      });
+      const identityError = fulfilledProviderArtifactIdentityError(
+        artifact,
+        providerArtifactIdentities,
+      );
+      if (identityError) {
+        return identityError;
+      }
+      if (artifact?.kind === "malformed") {
+        return invalidProviderEvidenceFailure(artifact.reason);
+      }
+    }
+  }
+
+  if (reviewsResult?.status !== "fulfilled") {
+    return null;
+  }
+
+  const reviewIds = new Set();
+  for (const review of reviewsResult.value) {
+    if (
+      typeof review?.id !== "number" ||
+      !Number.isSafeInteger(review.id) ||
+      review.id <= 0
+    ) {
+      return invalidProviderEvidenceFailure(
+        "REST review snapshot contains a review without a valid numeric id",
+      );
+    }
+    const reviewId = String(review.id);
+    if (reviewIds.has(reviewId)) {
+      return invalidProviderEvidenceFailure(
+        `REST review snapshot contains duplicate numeric id ${reviewId}`,
+      );
+    }
+    reviewIds.add(reviewId);
+
+    const artifact = parseCodexReviewArtifact(review, {
+      owner: repo.owner,
+      repo: repo.name,
+      botLogins: config.codexBotLogins,
+    });
+    const identityError = fulfilledProviderArtifactIdentityError(
+      artifact,
+      providerArtifactIdentities,
+    );
+    if (identityError) {
+      return identityError;
+    }
+    if (
+      artifact?.kind === "malformed" &&
+      !commentedReviewMayBeEmptyInlineParent(review, artifact)
+    ) {
+      return invalidProviderEvidenceFailure(artifact.reason);
+    }
+  }
+  return null;
+}
+
+function fulfilledProviderArtifactIdentityError(artifact, identities) {
+  if (!artifact || !/^[1-9][0-9]*$/.test(String(artifact.id || ""))) {
+    return null;
+  }
+  try {
+    parseTimestamp(artifact.createdAt, "Codex artifact creation time");
+  } catch (error) {
+    return invalidProviderEvidenceFailure(error.message);
+  }
+  const identity = `${artifact.source}:${artifact.id}`;
+  if (identities.has(identity)) {
+    return invalidProviderEvidenceFailure(
+      `Codex provider artifact identity ${identity} appears more than once`,
+    );
+  }
+  identities.add(identity);
+  return null;
+}
+
+function invalidProviderEvidenceFailure(reason) {
+  return new GateFailure(
+    "error",
+    "Codex review evidence is invalid",
+    `Cannot reconcile Codex review evidence for ${statusSha}: ${reason}`,
+  );
+}
+
+function commentedReviewMayBeEmptyInlineParent(review, artifact) {
+  return (
+    review.state === "COMMENTED" &&
+    String(review.body || "").trim() === "" &&
+    artifact?.reason === "unrecognized Codex terminal pull-request-review format"
+  );
 }
 
 async function buildCurrentReviewEvidence({
@@ -1949,24 +2146,21 @@ async function buildCurrentReviewEvidence({
       }),
     ),
     ...reviews.map((review) => {
-      if (
-        review.state === "COMMENTED" &&
-        validatedCodexInlineParentReviewIds.has(String(review.id)) &&
-        !String(review.body || "").trim().startsWith("### 💡 Codex Review")
-      ) {
-        return null;
-      }
       const artifact = parseCodexReviewArtifact(review, {
         owner: repo.owner,
         repo: repo.name,
         botLogins: config.codexBotLogins,
       });
       if (
+        validatedCodexInlineParentReviewIds.has(String(review.id)) &&
+        commentedReviewMayBeEmptyInlineParent(review, artifact)
+      ) {
+        return null;
+      }
+      if (
         allowMissingReviewChildTransient &&
-        review.state === "COMMENTED" &&
         !validatedCodexInlineParentReviewIds.has(String(review.id)) &&
-        artifact?.kind === "malformed" &&
-        artifact.reason === "unrecognized Codex terminal pull-request-review format"
+        commentedReviewMayBeEmptyInlineParent(review, artifact)
       ) {
         parentReviewTransientErrors.push(
           `COMMENTED review ${review.id} has no loaded child review comment`,

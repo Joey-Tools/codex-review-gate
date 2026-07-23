@@ -1084,7 +1084,7 @@ test("a fully reconciled Codex inline child identifies its COMMENTED parent", as
       state: "COMMENTED",
       commit_id: HEAD_SHA,
       submitted_at: "2026-05-14T10:00:01Z",
-      body: "Parent review for a validated inline Codex finding.",
+      body: " \n\t ",
       user: codexBotUser(),
     });
     harness.reviewComments.push({
@@ -1107,6 +1107,36 @@ test("a fully reconciled Codex inline child identifies its COMMENTED parent", as
       parseStateCommentBody(harness.findStateComment().body).history.at(-1).outcome,
       "failed_findings",
     );
+  });
+});
+
+test("a resolved inline child does not hide a newer unknown nonempty COMMENTED body", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:01Z",
+      body: "Unknown nonempty parent review body.",
+      user: codexBotUser(),
+    });
+    harness.reviewComments.push({
+      ...currentHeadInlineFinding(3001),
+      pull_request_review_id: 9100,
+    });
+    harness.reviewThreads.push(unresolvedThread(3001, { resolved: true }));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /unrecognized Codex terminal pull-request-review format/);
   });
 });
 
@@ -1409,7 +1439,7 @@ test("history-only retries inherit the exact wait deadline across config changes
   }
 });
 
-test("scheduled scan fails a marker that exceeds the max wait deadline", async () => {
+test("max wait wins over clean evidence at the exact active-marker deadline", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
       id: 2000,
@@ -1417,7 +1447,7 @@ test("scheduled scan fails a marker that exceeds the max wait deadline", async (
       createdAt: "2026-05-14T09:30:00Z",
       ackDeadlineAt: "2026-05-14T10:30:00Z",
       nextRetryAt: "2026-05-14T10:30:00Z",
-      maxWaitDeadlineAt: "2026-05-14T10:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
       baseline: {
         plusOne: null,
         eyes: null,
@@ -1426,6 +1456,7 @@ test("scheduled scan fails a marker that exceeds the max wait deadline", async (
         submittedReview: null,
       },
     });
+    harness.issueComments.push(codexCleanComment(2001));
 
     const result = await harness.runGate({
       eventName: "schedule",
@@ -1433,6 +1464,7 @@ test("scheduled scan fails a marker that exceeds the max wait deadline", async (
     });
 
     assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
     assert.equal(harness.statuses.at(-1).body.state, "failure");
     assert.equal(harness.findMarkerComments().length, 1);
 
@@ -1440,6 +1472,81 @@ test("scheduled scan fails a marker that exceeds the max wait deadline", async (
     assert.equal(state.activeMarker, null);
     assert.equal(state.lastStatus.state, "failure");
     assert.equal(state.history.at(-1).outcome, "timed_out");
+    const timeoutStateWriteIndex = harness.requestLog.findIndex((entry) =>
+      entry.method === "PATCH" &&
+      entry.path.endsWith("/issues/comments/1000") &&
+      entry.body?.body?.includes('"outcome": "timed_out"'));
+    const failureStatusWriteIndex = harness.requestLog.findIndex((entry) =>
+      entry.method === "POST" &&
+      entry.path.endsWith(`/statuses/${HEAD_SHA}`) &&
+      entry.body?.state === "failure");
+    assert.ok(timeoutStateWriteIndex >= 0);
+    assert.ok(failureStatusWriteIndex > timeoutStateWriteIndex);
+  });
+});
+
+test("clean active-marker evidence still passes immediately before max wait", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:30:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:01:01Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    harness.issueComments.push(codexCleanComment(2001));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    assert.equal(successStatusWrites(harness), 1);
+  });
+});
+
+test("max wait is rechecked after the final evidence snapshot crosses the deadline", async () => {
+  await withHarness(async (harness) => {
+    const deadline = Date.parse("2026-05-14T10:01:01Z");
+    harness.now = deadline - 1_000;
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:30:00Z",
+      maxWaitDeadlineAt: new Date(deadline).toISOString(),
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.advanceClockAfterSnapshotLoad(2, deadline);
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.history.at(-1).outcome, "timed_out");
+    assert.equal(state.history.at(-1).closedAt, "2026-05-14T10:01:01.000Z");
   });
 });
 
@@ -1863,7 +1970,10 @@ test("targeted workflow_dispatch fails closed when snapshot loading errors after
 
 test("live PR evidence reasserts success over a newer live error without a new review request", async () => {
   await withHarness(async (harness) => {
-    harness.seedSuccessfulState({ providerId: 5004259807 });
+    harness.seedSuccessfulState({
+      providerId: 5004259807,
+      maxWaitDeadlineAt: "2026-05-14T10:00:00Z",
+    });
     harness.commitStatuses.push({
       sha: HEAD_SHA,
       context: "codex/review-gate",
@@ -1900,6 +2010,12 @@ test("live PR evidence reasserts success over a newer live error without a new r
       true,
     );
     assert.equal(harness.findMarkerComments().length, 1);
+    assert.equal(
+      parseStateCommentBody(harness.findStateComment().body).history.some(
+        (marker) => marker.outcome === "timed_out",
+      ),
+      false,
+    );
   });
 });
 
@@ -2773,6 +2889,69 @@ test("deterministic evidence parse failure outranks a concurrent budget failure"
   });
 });
 
+test("fulfilled invalid provider evidence outranks a concurrent response-byte budget failure", async (t) => {
+  const scenarios = [
+    {
+      name: "malformed issue comment",
+      arrange(harness) {
+        harness.issueComments.push(codexMalformedTerminal(2001));
+      },
+      expected: /exactly one Reviewed commit marker/,
+    },
+    {
+      name: "malformed review",
+      arrange(harness) {
+        harness.reviews.push({
+          id: 9100,
+          state: "COMMENTED",
+          commit_id: HEAD_SHA,
+          submitted_at: "2026-05-14T10:00:00Z",
+          body: "Unknown nonempty review body.",
+          user: codexBotUser(),
+        });
+      },
+      expected: /unrecognized Codex terminal pull-request-review format/,
+    },
+    {
+      name: "duplicate numeric review id",
+      arrange(harness) {
+        harness.reviews.push({
+          ...harness.reviews[0],
+          body: "Duplicate review identity.",
+        });
+      },
+      expected: /duplicate numeric id 9000/,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      await withHarness(async (harness) => {
+        const reactionsPath =
+          `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/reactions`;
+        scenario.arrange(harness);
+        harness.routeFaults[`GET ${reactionsPath}`] = [{
+          delayMs: 25,
+          status: 200,
+          body: [],
+          headers: { "Content-Length": String(8 * 1024 * 1024 + 1) },
+        }];
+
+        const result = await harness.runGate({
+          eventName: "workflow_dispatch",
+          event: { inputs: { pull_request: "1" } },
+          env: { PR_NUMBER: "1" },
+        });
+
+        assert.equal(result.code, 1);
+        assert.equal(harness.statuses.at(-1).body.state, "error");
+        assert.match(result.stderr, scenario.expected);
+        assert.doesNotMatch(result.stderr, /response-byte budget exceeded/);
+      });
+    });
+  }
+});
+
 test("review-thread comment pagination uses the bounded production worker pool", async () => {
   await withHarness(async (harness) => {
     harness.threadCommentDelayMs = 25;
@@ -2820,7 +2999,7 @@ test("GraphQL opaque identity preserves a paginated unresolved finding above 32-
       state: "COMMENTED",
       commit_id: OLD_HEAD_SHA,
       submitted_at: "2026-05-14T09:30:00Z",
-      body: "Historical parent review.",
+      body: "",
       user: codexBotUser(),
     });
     harness.reviewComments.push({
@@ -3559,7 +3738,7 @@ test("a parent review appearing on whole-snapshot reload recovers a transient in
       state: "COMMENTED",
       commit_id: HEAD_SHA,
       submitted_at: "2026-05-14T09:59:00Z",
-      body: "Parent review for a concurrently visible inline finding.",
+      body: "",
       user: codexBotUser(),
     };
     harness.reviewComments.push({
@@ -3595,7 +3774,7 @@ test("a child comment appearing on reload recovers the symmetric parent-first ra
       state: "COMMENTED",
       commit_id: HEAD_SHA,
       submitted_at: "2026-05-14T09:59:00Z",
-      body: "Parent review whose inline child is not visible yet.",
+      body: "",
       user: codexBotUser(),
     };
     harness.reviews.push(parentReview);
@@ -3627,7 +3806,7 @@ test("a child comment appearing on reload recovers the symmetric parent-first ra
   });
 });
 
-test("a persistent newest COMMENTED parent without children is malformed after one reload", async () => {
+test("a nonempty unknown COMMENTED parent is deterministically malformed without reload", async () => {
   await withHarness(async (harness) => {
     harness.reviews.push({
       id: 9100,
@@ -3645,7 +3824,7 @@ test("a persistent newest COMMENTED parent without children is malformed after o
     });
 
     assert.equal(result.code, 1);
-    assert.equal(harness.snapshotLoads, 2);
+    assert.equal(harness.snapshotLoads, 1);
     assert.equal(harness.statuses.at(-1).body.state, "error");
     assert.match(result.stderr, /unrecognized Codex terminal pull-request-review format/);
   });
@@ -3671,7 +3850,7 @@ test("a newer clean supersedes an older persistent COMMENTED parent without chil
     });
 
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(harness.snapshotLoads, 4);
+    assert.equal(harness.snapshotLoads, 2);
     assert.equal(harness.statuses.at(-1).body.state, "success");
   });
 });
@@ -4466,7 +4645,7 @@ test("unauthorized passed clean invalidation fences failed state persistence bef
     assert.equal(successStatusWrites(harness), 0);
     assert.deepEqual(
       harness.statuses.map((status) => status.body.state),
-      ["pending", "error"],
+      ["error"],
     );
     assert.match(firstResult.stderr, /published a durable marker-lineage fence/);
     assert.equal(
@@ -4492,6 +4671,77 @@ test("unauthorized passed clean invalidation fences failed state persistence bef
     assert.equal(state.activeMarker.state, "waiting_ack");
     assert.equal(state.activeMarker.baseline.completionComment.id, "2002");
   });
+});
+
+test("failed or ambiguous pending demotion cannot replay formerly authorized clean evidence", async (t) => {
+  for (const [name, afterMutation] of [
+    ["failed", false],
+    ["ambiguous", true],
+  ]) {
+    await t.test(name, async () => {
+      await withHarness(async (harness) => {
+        harness.seedSuccessfulState({ providerId: 2001 });
+        harness.issueComments.push(
+          codexCleanComment(2001),
+          codexCleanComment(2002, "2026-05-14T10:01:01Z"),
+        );
+        harness.commitStatuses.push({
+          sha: HEAD_SHA,
+          context: "codex/review-gate",
+          state: "success",
+        });
+        harness.routeFaults[
+          `POST /repos/${harness.owner}/${harness.repo}/statuses/${HEAD_SHA}`
+        ] = Array.from({ length: 4 }, () => ({
+          ...(afterMutation ? { afterMutation: true } : {}),
+          status: 503,
+          body: { message: `${name} pending status response` },
+          headers: { "Retry-After": "0" },
+        }));
+
+        const firstResult = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(firstResult.code, 1);
+        assert.equal(successStatusWrites(harness), 0);
+        const persistedState = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(persistedState.history.at(-1).outcome, "state_lost");
+        assert.equal(
+          persistedState.history.at(-1).recoveryReason,
+          "unauthorized_passed_result_lineage",
+        );
+        const invalidationWriteIndex = harness.requestLog.findIndex((entry) =>
+          entry.method === "PATCH" &&
+          entry.path.endsWith("/issues/comments/1000") &&
+          entry.body?.body?.includes('"outcome": "state_lost"'));
+        const pendingWriteIndex = harness.requestLog.findIndex((entry) =>
+          entry.method === "POST" &&
+          entry.path.endsWith(`/statuses/${HEAD_SHA}`) &&
+          entry.body?.state === "pending");
+        assert.ok(invalidationWriteIndex >= 0);
+        if (pendingWriteIndex >= 0) {
+          assert.ok(invalidationWriteIndex < pendingWriteIndex);
+        }
+
+        harness.issueComments = harness.issueComments.filter(
+          (comment) => String(comment.id) !== "2002",
+        );
+        const replayResult = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(replayResult.code, 0, replayResult.stderr);
+        assert.equal(successStatusWrites(harness), 0);
+        const recoveredState = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(recoveredState.history.at(-1).outcome, "state_lost");
+        assert.equal(recoveredState.activeMarker.state, "waiting_ack");
+        assert.equal(recoveredState.activeMarker.baseline.completionComment.id, "2001");
+      });
+    });
+  }
 });
 
 test("unauthorized clean demotion ignores a newer external pending status", async () => {
@@ -4820,6 +5070,7 @@ class GateHarness {
     this.snapshotLoads = 0;
     this.snapshotHooks = [];
     this.pullHooks = [];
+    this.clockSnapshotHooks = [];
     this.statuses = [];
     this.commitStatuses = [];
     this.commitResolutions = { [HEAD_SHORT_SHA]: HEAD_SHA };
@@ -4861,11 +5112,25 @@ class GateHarness {
     const eventPath = join(workDir, "event.json");
     const statePath = join(workDir, "fake-github-state.json");
     const stepSummaryPath = join(workDir, "step-summary.md");
+    const clockControllerPath = join(workDir, "clock-controller.mjs");
     await writeFile(eventPath, JSON.stringify(event), "utf8");
     await this.writeState(statePath);
+    const nodeArgs = ["--import", fakeFetchPath];
+    if (this.clockSnapshotHooks.length > 0) {
+      await writeFile(
+        clockControllerPath,
+        buildClockControllerSource(
+          this.clockSnapshotHooks,
+          `/repos/${this.owner}/${this.repo}/issues/${this.prNumber}/comments`,
+        ),
+        "utf8",
+      );
+      nodeArgs.push("--import", clockControllerPath);
+    }
+    nodeArgs.push(join(repoRoot, "packages/action/src/gate.mjs"));
 
     try {
-      const result = await runNode(["--import", fakeFetchPath, join(repoRoot, "packages/action/src/gate.mjs")], {
+      const result = await runNode(nodeArgs, {
         cwd: repoRoot,
         env: {
           ...cleanProcessEnv(),
@@ -4901,6 +5166,10 @@ class GateHarness {
 
   afterPullLoad(count, action) {
     this.pullHooks.push({ count, ...action });
+  }
+
+  advanceClockAfterSnapshotLoad(count, now) {
+    this.clockSnapshotHooks.push({ count, now });
   }
 
   async writeState(statePath) {
@@ -5363,6 +5632,33 @@ class GateHarness {
     return this.issueComments.filter((comment) => comment.body.includes(MARKER_COMMENT));
   }
 
+}
+
+function buildClockControllerSource(hooks, commentsPath) {
+  return `
+const clockHooks = ${JSON.stringify(hooks)};
+const commentsPath = ${JSON.stringify(commentsPath)};
+const originalFetch = globalThis.fetch;
+let snapshotLoads = 0;
+
+globalThis.fetch = async function clockControlledFetch(input, options = {}) {
+  const response = await originalFetch(input, options);
+  const url = new URL(String(input));
+  const method = String(options.method || "GET").toUpperCase();
+  if (
+    method === "GET" &&
+    url.pathname === commentsPath &&
+    url.searchParams.get("page") === "1"
+  ) {
+    snapshotLoads += 1;
+    const hook = clockHooks.find((candidate) => candidate.count === snapshotLoads);
+    if (hook) {
+      Date.now = () => hook.now;
+    }
+  }
+  return response;
+};
+`;
 }
 
 function cleanProcessEnv() {
