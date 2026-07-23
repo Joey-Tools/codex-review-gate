@@ -36,13 +36,22 @@ Unthreaded top-level issue-comment findings have no GitHub resolution flag.
 They remain active until a later accepted clean result for the same or a newer
 head supersedes them.
 
+A clean result bound to a commit that is strictly proven to be an ancestor of
+the current head is stale audit evidence, not malformed evidence. It leaves the
+current head pending and is included in the baseline of any newly created
+marker. A clean bound to an unrelated, divergent, or otherwise unverified
+commit remains a deterministic error. A delayed stale issue-comment clean also
+cannot wake an existing current-head marker: a completion transition must
+match the exact provider artifact selected as the current-head clean result.
+
 Before writing `success`, the action follows one fixed order:
 
 1. Read and cache the latest live gate status on a best-effort basis.
 2. Re-read PR lifecycle and the exact head.
 3. Load the final fully paginated evidence snapshot. If its GraphQL thread
    comments and REST review comments expose a possible cross-channel orphan,
-   perform one bounded whole-snapshot reload; a persistent orphan makes the run
+   including an inline comment whose parent review is not yet visible, perform
+   one bounded whole-snapshot reload; a persistent orphan makes the run
    incomplete and therefore `pending`.
 4. Revalidate findings, terminal-result identity and commit binding, and marker
    or recovery authorisation.
@@ -257,6 +266,20 @@ The state records:
 
 State comments and marker comments are trusted only from configured trusted authors. The default trusted author is `github-actions[bot]`, matching the repository workflow's `GITHUB_TOKEN` path.
 
+Closing an active marker as `failed_findings` and recording a rejected
+`fresh`-recovery result are authorisation-critical transitions. The gate
+persists them before writing the finding status. If updating the sticky state
+comment fails, it creates a replacement state comment. If both state writes
+fail, it attempts to change the trusted marker baseline to a durable lineage
+fence and exits non-zero. The marker fence is not pass authority: the next
+complete run records `state_lost` and creates a fresh marker before it can
+pass. If the replacement state write and marker update both fail, the
+non-success commit status records only the current run failure; status history
+is never consumed as future review authority. No machine-readable cross-run
+revocation can be guaranteed during that total issue-comment write outage.
+After write access is restored, operators must explicitly repair the state or
+create a fresh marker before trusting the old clean result.
+
 Legacy state is migrated without inventing pass authority. A legacy
 `lastStatus=failure` entry becomes verifiable `failed_findings` lineage only
 when the same head also has a trusted live marker and same-head failure
@@ -425,7 +448,10 @@ Accepted provider evidence is channel-specific:
 The action fully paginates issue comments, reviews, inline comments, GraphQL
 review threads, and thread comments. Missing parent reviews, thread mappings,
 pages, or conflicting payload fields make the current run incomplete rather
-than clean.
+than clean. A REST `rel="next"` link is authoritative even when the returned
+page is shorter than the requested page size. REST and GraphQL pagination have
+finite page budgets, and GraphQL cursors must advance on every non-terminal
+page.
 
 Thread-backed findings are historical admission evidence. A thread stops
 blocking only when `isResolved` is true; `isOutdated` alone has no resolving

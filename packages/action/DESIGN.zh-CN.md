@@ -32,14 +32,20 @@ commit-status history 当作判定来源。
 没有 thread 的 top-level issue-comment findings 不具备 GitHub resolution flag。它们会
 保持 active，直到同一或更新 head 上更晚的 accepted clean result supersede 它们。
 
+如果 clean result 绑定的 commit 被严格证明是当前 head 的 ancestor，它属于 stale audit
+evidence，而不是 malformed evidence。当前 head 会保持 `pending`，并把该结果纳入新建
+marker 的 baseline。绑定到无关、diverged 或无法验证 commit 的 clean 仍属于确定性
+`error`。延迟到达的 stale issue-comment clean 也不能唤醒现有 current-head marker：
+completion transition 必须精确匹配当前选中的 current-head clean provider artifact。
+
 写入 `success` 前，action 严格按以下顺序执行：
 
 1. Best-effort 读取并缓存 latest live gate status。
 2. 重新读取 PR lifecycle 和精确 head。
 3. 加载 final fully paginated evidence snapshot。如果 GraphQL thread comments 与 REST
-   review comments 暴露可能的 cross-channel orphan，则执行一次有界的 whole-snapshot
-   reload；reload 后 orphan 仍存在时，当前运行 evidence incomplete，因此降为
-   `pending`。
+   review comments 暴露可能的 cross-channel orphan（包括 inline comment 已可见但其
+   parent review 尚不可见），则执行一次有界的 whole-snapshot reload；reload 后 orphan
+   仍存在时，当前运行 evidence incomplete，因此降为 `pending`。
 4. 重新验证 findings、terminal-result identity 与 commit binding，以及 marker 或
    recovery authorisation。
 5. 只基于缓存的 status 做 write deduplication，中间不再进行 network read。只有缓存的
@@ -239,6 +245,17 @@ State 记录：
 
 State comments 和 marker comments 只信任配置的 trusted authors。默认 trusted author 是 `github-actions[bot]`，匹配 repository workflow 的 `GITHUB_TOKEN` 路径。
 
+把 active marker 关闭为 `failed_findings`，以及记录被拒绝的 `fresh` recovery result，
+都属于 authorisation-critical transitions。Gate 会先持久化这些转换，再写 finding
+status。更新 sticky state comment 失败时，会创建 replacement state comment；两次 state
+写入都失败时，会尝试修改 trusted marker baseline，留下 durable lineage fence，并以
+非零状态退出。Marker fence 不具备 pass authority；下一次完整运行必须先记录
+`state_lost` 并创建 fresh marker，之后才可能通过。如果 replacement state 和 marker
+更新都失败，non-success commit status 只记录本次 run 的失败；后续判定绝不会把 status
+history 当作 review authority。在这种 issue-comment 写入全部失败的 outage 中，系统
+无法保证存在 machine-readable 的跨运行撤销。恢复写权限后，operator 必须显式修复
+state 或创建 fresh marker，之后才能信任旧 clean result。
+
 Legacy state migration 不会凭空创建 pass authority。只有
 `lastStatus=failure`、同一 head 的 trusted live marker、同一 head 的 failure evidence
 三者同时存在时，才把 legacy entry 迁移为可验证的 `failed_findings` lineage。对于其他
@@ -401,7 +418,9 @@ Accepted provider evidence 按 channel 校验：
 
 Action 会完整分页读取 issue comments、reviews、inline comments、GraphQL review
 threads 和 thread comments。Parent reviews、thread mappings、分页或 payload 冲突字段有
-任一缺失时，当前运行会判为 incomplete，而不是 clean。
+任一缺失时，当前运行会判为 incomplete，而不是 clean。即使返回页短于请求的 page
+size，REST `rel="next"` link 仍是继续分页的 authoritative signal。REST 和 GraphQL
+分页都有有限 page budget，且 GraphQL cursor 必须在每个非终态页继续前进。
 
 Thread-backed findings 属于历史 admission evidence。只有 `isResolved` 为 true 时，该
 thread 才不再阻塞；`isOutdated` 本身没有 resolving effect。没有 thread 的 findings

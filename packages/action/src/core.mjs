@@ -541,9 +541,14 @@ export function collectUnresolvedCodexThreadFindings(
     }
 
     const reviewId = comment.pull_request_review_id;
-    const parentReview = reviewById.get(String(reviewId ?? ""));
+    const normalizedReviewId = normalizeReviewCommentDatabaseId(reviewId);
+    if (!normalizedReviewId) {
+      errors.push(`review comment ${comment.id} has no valid parent review id`);
+      continue;
+    }
+    const parentReview = reviewById.get(normalizedReviewId);
     if (!parentReview) {
-      errors.push(`review comment ${comment.id} has no loaded parent review`);
+      transientErrors.push(`review comment ${comment.id} has no loaded parent review`);
       continue;
     }
     if (!isTrustedCodexRestUser(parentReview.user, botLogins)) {

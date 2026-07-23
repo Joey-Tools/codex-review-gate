@@ -90,6 +90,13 @@ function handle({ method, path, query, body }) {
   }
 
   if (method === "POST" && path === `${repoBase}/issues/${prNumber}/comments`) {
+    while (
+      (state.issueComments || []).some(
+        (comment) => String(comment.id) === String(state.nextCommentId),
+      )
+    ) {
+      state.nextCommentId += 1;
+    }
     const id = state.nextCommentId;
     state.nextCommentId += 1;
     const comment = {
@@ -260,6 +267,10 @@ function applyHookAction(hook) {
     case "pushReviewComment":
       state.reviewComments ||= [];
       state.reviewComments.push(hook.value);
+      break;
+    case "pushReview":
+      state.reviews ||= [];
+      state.reviews.push(hook.value);
       break;
     case "pushReviewThread":
       state.reviewThreads ||= [];

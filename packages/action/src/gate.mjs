@@ -126,7 +126,11 @@ let statusSha = config.headSha;
 let statusReady = false;
 const MAX_REQUEST_ATTEMPTS = 4;
 const MAX_WHOLE_SNAPSHOT_ATTEMPTS = 2;
+const MAX_REST_PAGES = 1_000;
+const MAX_GRAPHQL_PAGES = 1_000;
 const MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS = 10_000;
+const AUTHORIZATION_PERSISTENCE_FENCE_DESCRIPTION =
+  "Authorization state persistence failed; fresh marker required";
 
 main().catch(async (error) => {
   const gateError =
@@ -382,6 +386,18 @@ async function processPullRequest(prNumber, trigger) {
   state = legacyMigration.state;
   stateNeedsFreshMarker = stateNeedsFreshMarker || legacyMigration.needsFreshMarker;
   stateNeedsSave = stateNeedsSave || legacyMigration.changed;
+  const fenceRecovery = await recoverAuthorizationPersistenceFence(
+    state,
+    savedStateComment,
+    snapshot,
+  );
+  state = fenceRecovery.state;
+  savedStateComment = fenceRecovery.stateComment;
+  stateNeedsFreshMarker =
+    stateNeedsFreshMarker || fenceRecovery.needsFreshMarker;
+  if (fenceRecovery.recovered) {
+    stateNeedsSave = false;
+  }
   state = migrateStateForEventDrivenDeadlines(state);
   stateNeedsFreshMarker = stateNeedsFreshMarker ||
     stateNeedsFreshMarkerAfterRecovery(state) ||
@@ -698,6 +714,9 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
     }
 
     if (
+      snapshot.providerResult.kind === "clean" &&
+      snapshot.providerResult.source === "issue-comment" &&
+      String(snapshot.providerResult.id) === String(snapshot.completionComment?.id) &&
       hasNewCompletionComment(
         activeMarker.baseline?.completionComment,
         snapshot.completionComment,
@@ -1149,13 +1168,158 @@ async function failFromFindings(findings, state, stateComment) {
     runUrl,
     status: "failure",
   });
+  await saveAuthorizationCriticalState(
+    statusState,
+    stateComment,
+    "failed findings state",
+  );
   await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
-  try {
-    await saveState(statusState, stateComment);
-  } catch (error) {
-    console.warn(`failed to save audit state after ${STATUS_CONTEXT}=failure: ${error.message}`);
-  }
   console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
+}
+
+async function saveAuthorizationCriticalState(state, stateComment, description) {
+  try {
+    return await saveState(state, stateComment);
+  } catch (updateError) {
+    let replacementError = null;
+    if (stateComment?.id) {
+      console.warn(
+        `failed to update authorization-critical ${description}; ` +
+          `creating a replacement state comment: ${updateError.message}`,
+      );
+      try {
+        return await saveState(state, null);
+      } catch (error) {
+        replacementError = error;
+      }
+    }
+
+    let fenceError = null;
+    try {
+      await publishAuthorizationFence(state, description);
+    } catch (error) {
+      fenceError = error;
+    }
+    if (!fenceError) {
+      throw new GateFailure(
+        "error",
+        AUTHORIZATION_PERSISTENCE_FENCE_DESCRIPTION,
+        `failed to persist authorization-critical ${description}; ` +
+          `published a durable marker-lineage fence and stopped this run`,
+      );
+    }
+    const replacementDetail = replacementError
+      ? `; replacement state creation failed (${replacementError.message})`
+      : "";
+    throw new GateFailure(
+      "error",
+      AUTHORIZATION_PERSISTENCE_FENCE_DESCRIPTION,
+      `failed to persist authorization-critical ${description}; ` +
+        `state write failed (${updateError.message})${replacementDetail}; ` +
+        `durable marker-lineage fence failed (${fenceError.message})`,
+    );
+  }
+}
+
+async function publishAuthorizationFence(state, description) {
+  const marker = state.activeMarker?.headSha === statusSha
+    ? state.activeMarker
+    : [...(state.history || [])]
+        .reverse()
+        .find((candidate) => candidate.headSha === statusSha && candidate.id);
+  if (!marker?.id) {
+    throw new Error(`no controlled marker is available for ${statusSha}`);
+  }
+
+  const fencedMarker = {
+    ...marker,
+    baseline: {
+      ...(marker.baseline || {}),
+      authorizationFence: {
+        reason: description,
+        runUrl,
+        runId: config.runId,
+        runAttempt: config.runAttempt,
+        createdAt: isoNow(),
+      },
+    },
+  };
+  await request("PATCH", `${repoPath}/issues/comments/${marker.id}`, {
+    body: buildMarkerCommentBody(fencedMarker),
+  });
+  console.warn(
+    `published a durable authorization fence on controlled marker ${marker.id} for ${statusSha}`,
+  );
+}
+
+async function recoverAuthorizationPersistenceFence(state, stateComment, snapshot) {
+  const markerComment = findLatestTrustedMarkerComment(
+    snapshot.comments || [],
+    config.trustedCommentLogins,
+  );
+  const liveMarker = markerComment ? markerFromComment(markerComment) : null;
+  const markerFence =
+    liveMarker?.headSha === statusSha &&
+    liveMarker.baseline?.authorizationFence;
+
+  if (!markerFence) {
+    return { state, stateComment, needsFreshMarker: false, recovered: false };
+  }
+
+  const now = isoNow();
+  let recoveredState;
+  if (state.activeMarker) {
+    recoveredState = closeActiveMarker(state, "state_lost", now, {
+      recoveryReason: "authorization_state_persistence_fence",
+    });
+  } else {
+    const previousMarker = [...(state.history || [])]
+      .reverse()
+      .find((candidate) => candidate.headSha === statusSha);
+    recoveredState = normalizeState({
+      ...state,
+      updatedAt: now,
+      history: [
+        ...(state.history || []),
+        {
+          ...(previousMarker || {}),
+          version: STATE_VERSION,
+          id:
+            liveMarker?.id ||
+            previousMarker?.id ||
+            `authorization-fence-${config.runId}-${config.runAttempt}`,
+          url: markerComment?.html_url || previousMarker?.url || null,
+          headSha: statusSha,
+          baseline: liveMarker?.baseline || previousMarker?.baseline || {},
+          state: "state_lost",
+          outcome: "state_lost",
+          closedAt: now,
+          recoveryReason: "authorization_state_persistence_fence",
+        },
+      ],
+    });
+  }
+  recoveredState = updateStateForStatus(recoveredState, {
+    now,
+    statusHead: statusSha,
+    runUrl,
+    status: "pending",
+  });
+  const recoveredStateComment = await saveAuthorizationCriticalState(
+    recoveredState,
+    stateComment,
+    "authorization persistence fence recovery",
+  );
+  await setCommitStatus(
+    "pending",
+    "Fresh Codex review required after state persistence failure",
+  );
+  return {
+    state: recoveredState,
+    stateComment: recoveredStateComment,
+    needsFreshMarker: true,
+    recovered: true,
+  };
 }
 
 async function demoteUnauthorizedCleanIfNeeded(state, stateComment) {
@@ -1522,6 +1686,25 @@ async function selectCurrentHeadProviderResult(artifacts) {
           headSha: resolvedSha,
         };
       }
+      if (await commitIsAncestor(resolvedSha, statusSha.toLowerCase(), ancestryCache)) {
+        const unsupersededFinding = await firstUnsupersededOlderFinding(
+          resolvedSha,
+          [...group.slice(groupIndex + 1), ...ordered.slice(index)],
+          ancestryCache,
+          resolutionCache,
+        );
+        if (unsupersededFinding) {
+          return unsupersededFinding;
+        }
+        return {
+          ...artifact,
+          kind: "pending",
+          headSha: resolvedSha,
+          reason:
+            `latest Codex clean result is bound to prior head ${resolvedSha}; ` +
+            `waiting for a complete clean result on current head ${statusSha.toLowerCase()}`,
+        };
+      }
       return {
         ...artifact,
         kind: "malformed",
@@ -1594,8 +1777,8 @@ async function commitIsAncestor(baseSha, headSha, cache) {
     }
     throw new GateFailure(
       "error",
-      "Codex finding ancestry could not be verified",
-      `Cannot compare finding commit ${baseSha} with clean commit ${headSha}: ${error.message}`,
+      "Codex artifact ancestry could not be verified",
+      `Cannot compare provider commit ${baseSha} with commit ${headSha}: ${error.message}`,
     );
   }
 
@@ -1609,15 +1792,15 @@ async function commitIsAncestor(baseSha, headSha, cache) {
   ) {
     throw new GateFailure(
       "error",
-      "Codex finding ancestry response is invalid",
+      "Codex artifact ancestry response is invalid",
       `Compare response for ${cacheKey} did not contain a closed commit relationship.`,
     );
   }
   if (baseCommitSha !== baseSha) {
     throw new GateFailure(
       "error",
-      "Codex finding ancestry response conflicts with the requested commit",
-      `Compare response base ${baseCommitSha} does not match finding commit ${baseSha}.`,
+      "Codex artifact ancestry response conflicts with the requested commit",
+      `Compare response base ${baseCommitSha} does not match provider commit ${baseSha}.`,
     );
   }
 
@@ -1922,31 +2105,64 @@ async function loadLatestGateStatus() {
 async function paginate(path, query) {
   const results = [];
   let page = 1;
+  const perPage = Number(query.per_page || 100);
 
   while (true) {
-    const { data } = await request("GET", path, { ...query, page: String(page) });
+    if (page > MAX_REST_PAGES) {
+      throw new GateFailure(
+        "pending",
+        "Codex review evidence is temporarily incomplete",
+        `REST pagination exceeded ${MAX_REST_PAGES} pages for ${path}`,
+      );
+    }
+    const { data, headers } = await request(
+      "GET",
+      path,
+      { ...query, page: String(page) },
+    );
     if (!Array.isArray(data)) {
       throw new Error(`paginated endpoint did not return an array: ${path}`);
     }
     results.push(...data);
-    if (data.length < Number(query.per_page || 100)) {
+    if (!linkHeaderHasNext(headers.get("link")) && data.length < perPage) {
       return results;
     }
     page += 1;
   }
 }
 
+function linkHeaderHasNext(linkHeader) {
+  return String(linkHeader || "")
+    .split(",")
+    .some((entry) =>
+      entry
+        .split(";")
+        .slice(1)
+        .some((parameter) => /^\s*rel\s*=\s*"?next"?\s*$/i.test(parameter)),
+    );
+}
+
 async function loadReviewThreads() {
   const threads = [];
+  const seenCursors = new Set();
   let after = null;
+  let pageCount = 0;
 
   while (true) {
+    if (pageCount >= MAX_GRAPHQL_PAGES) {
+      throw new GateFailure(
+        "pending",
+        "Codex review evidence is temporarily incomplete",
+        `GraphQL reviewThreads pagination exceeded ${MAX_GRAPHQL_PAGES} pages`,
+      );
+    }
     const { data } = await graphqlRequest(REVIEW_THREADS_QUERY, {
       owner: repo.owner,
       repo: repo.name,
       number: activePrNumber,
       after,
     });
+    pageCount += 1;
     const connection = data?.repository?.pullRequest?.reviewThreads;
     if (!connection) {
       throw new Error("GraphQL reviewThreads query did not return a connection");
@@ -1965,10 +2181,15 @@ async function loadReviewThreads() {
     if (!connection.pageInfo.hasNextPage) {
       return Promise.all(threads.map((thread) => loadAllReviewThreadComments(thread)));
     }
-    if (!connection.pageInfo.endCursor) {
+    const endCursor = connection.pageInfo.endCursor;
+    if (typeof endCursor !== "string" || endCursor.length === 0) {
       throw new Error("GraphQL reviewThreads connection omitted an end cursor");
     }
-    after = connection.pageInfo.endCursor;
+    if (seenCursors.has(endCursor)) {
+      throw new Error("GraphQL reviewThreads pagination cursor did not advance");
+    }
+    seenCursors.add(endCursor);
+    after = endCursor;
   }
 }
 
@@ -1987,16 +2208,32 @@ async function loadAllReviewThreadComments(thread) {
     throw new Error(`GraphQL comments connection did not return complete pageInfo for thread ${thread.id}`);
   }
   const nodes = [...(connection.nodes || [])];
+  const seenCursors = new Set();
+  let pageCount = 1;
   let after = connection.pageInfo.endCursor || null;
 
   while (connection.pageInfo.hasNextPage) {
-    if (!after) {
+    if (typeof after !== "string" || after.length === 0) {
       throw new Error(`GraphQL comments connection omitted an end cursor for thread ${thread.id}`);
+    }
+    if (seenCursors.has(after)) {
+      throw new Error(
+        `GraphQL comments pagination cursor did not advance for thread ${thread.id}`,
+      );
+    }
+    seenCursors.add(after);
+    if (pageCount >= MAX_GRAPHQL_PAGES) {
+      throw new GateFailure(
+        "pending",
+        "Codex review evidence is temporarily incomplete",
+        `GraphQL comments pagination exceeded ${MAX_GRAPHQL_PAGES} pages for thread ${thread.id}`,
+      );
     }
     const { data } = await graphqlRequest(REVIEW_THREAD_COMMENTS_QUERY, {
       threadId: thread.id,
       after,
     });
+    pageCount += 1;
     connection = data?.node?.comments;
     if (!connection) {
       throw new Error(`GraphQL comments query did not return a connection for thread ${thread.id}`);
@@ -2012,7 +2249,13 @@ async function loadAllReviewThreadComments(thread) {
     }
 
     nodes.push(...(connection.nodes || []));
-    if (connection.pageInfo.hasNextPage && !connection.pageInfo.endCursor) {
+    if (
+      connection.pageInfo.hasNextPage &&
+      (
+        typeof connection.pageInfo.endCursor !== "string" ||
+        connection.pageInfo.endCursor.length === 0
+      )
+    ) {
       throw new Error(`GraphQL comments connection omitted an end cursor for thread ${thread.id}`);
     }
     after = connection.pageInfo.endCursor || null;

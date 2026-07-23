@@ -1334,6 +1334,15 @@ test("reports missing current threads, missing parents, and conflicting inline c
         pull_request_review_id: 408,
         user: codexUser,
       },
+      {
+        id: 309,
+        node_id: reviewCommentNodeId(309),
+        path: "src/invalid-parent.mjs",
+        line: 13,
+        original_commit_id: FULL_SHA_A,
+        pull_request_review_id: null,
+        user: codexUser,
+      },
     ],
     [
       liveCodexReview({
@@ -1352,21 +1361,31 @@ test("reports missing current threads, missing parents, and conflicting inline c
         isResolved: false,
         comments: { nodes: [graphqlReviewComment(307)] },
       },
+      {
+        id: "invalid-parent",
+        isResolved: false,
+        comments: { nodes: [graphqlReviewComment(309)] },
+      },
     ],
     undefined,
     FULL_SHA_A,
   );
 
   assert.deepEqual(result, {
-    count: 2,
-    ids: ["thread:missing-parent", "thread:commit-conflict"],
-    samples: ["src/missing-parent.mjs:11", "src/conflict.mjs:12"],
+    count: 3,
+    ids: ["thread:missing-parent", "thread:commit-conflict", "thread:invalid-parent"],
+    samples: [
+      "src/missing-parent.mjs:11",
+      "src/conflict.mjs:12",
+      "src/invalid-parent.mjs:13",
+    ],
     errors: [
-      "review comment 306 has no loaded parent review",
       "review comment 307 original commit conflicts with its parent review",
+      "review comment 309 has no valid parent review id",
     ],
     transientErrors: [
       "review comment 305 has no loaded review thread",
+      "review comment 306 has no loaded parent review",
       "review comment 308 has no loaded review thread",
     ],
   });
