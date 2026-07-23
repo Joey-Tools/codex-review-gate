@@ -376,18 +376,23 @@ async function processPullRequest(prNumber, trigger) {
 
   const snapshot = await loadSnapshot();
   failIfSnapshotEvidenceIsInvalid(snapshot);
-  const scheduledNoStatePending =
+  const scheduledWithoutTrustedState =
     trigger.kind === "scan" &&
     !trigger.allowCreateMarker &&
     !dependabotScheduleRecovery &&
-    !hasTrustedGateStateOrMarker(snapshot.comments, config.trustedCommentLogins) &&
-    snapshot.findings.count === 0 &&
-    snapshot.evidenceErrors.length === 0 &&
-    snapshot.providerResult.kind === "pending";
-  if (scheduledNoStatePending) {
+    !hasTrustedGateStateOrMarker(snapshot.comments, config.trustedCommentLogins);
+  if (scheduledWithoutTrustedState) {
     const liveStatus = await loadLatestGateStatus();
-    if (!liveStatus.readFailed && liveStatus.latest === null) {
-      console.log(`PR #${activePrNumber} has no gate state or Codex result; skipping scheduled scan.`);
+    if (
+      liveStatus.readFailed ||
+      liveStatus.latest === null ||
+      !liveStatus.producerMatches
+    ) {
+      console.log(
+        `PR #${activePrNumber} has no trusted gate state or marker` +
+          (liveStatus.readFailed ? " and its live gate status could not be read" : "") +
+          "; skipping scheduled scan.",
+      );
       return;
     }
   }

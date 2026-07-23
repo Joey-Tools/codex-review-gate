@@ -2061,6 +2061,77 @@ test("scheduled scan skips PRs with no trusted gate state or marker", async () =
   });
 });
 
+test("scheduled scan does not initialize stateless PRs from existing Codex evidence", async () => {
+  const evidenceCases = [
+    (harness) => {
+      harness.reviewComments.push(currentHeadInlineFinding(3001));
+      harness.reviewThreads.push(unresolvedThread(3001));
+    },
+    (harness) => {
+      harness.issueComments.push(codexCleanComment(2001));
+    },
+  ];
+
+  for (const seedEvidence of evidenceCases) {
+    await withHarness(async (harness) => {
+      seedEvidence(harness);
+
+      const result = await harness.runGate({
+        eventName: "schedule",
+        event: {},
+      });
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(harness.statuses.length, 0);
+      assert.equal(harness.findStateComment(), undefined);
+      assert.equal(harness.findMarkerComments().length, 0);
+    });
+  }
+});
+
+test("scheduled scan does not recover stateless PRs from an untrusted live gate status", async () => {
+  await withHarness(async (harness) => {
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "success",
+      creator: { login: "octocat", type: "User" },
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+  });
+});
+
+test("scheduled scan may recover missing state when a live gate status proves prior initialization", async () => {
+  await withHarness(async (harness) => {
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "pending",
+      creator: { login: "github-actions[bot]", type: "Bot" },
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.notEqual(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 1);
+  });
+});
+
 test("targeted workflow_dispatch fails closed when snapshot loading errors after status readiness", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
