@@ -865,7 +865,18 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
     }
 
     const approvedReview = selectLatestCodexApprovedReview(snapshot.reviews, config.codexBotLogins);
-    if (hasNewReviewTransition(activeMarker.baseline?.approvedReview, approvedReview, activeMarker.createdAt)) {
+    if (
+      snapshot.providerResult.kind === "clean" &&
+      snapshot.providerResult.source === "pull-request-review" &&
+      String(snapshot.providerResult.id) === String(approvedReview?.id) &&
+      snapshot.providerResult.createdAt === approvedReview?.submittedAt &&
+      snapshot.providerResult.headSha === statusSha.toLowerCase() &&
+      hasNewReviewTransition(
+        activeMarker.baseline?.approvedReview,
+        approvedReview,
+        activeMarker.createdAt,
+      )
+    ) {
       await passGate(state, stateComment, snapshot, {
         observedApprovedReview: approvedReview,
       });
@@ -1920,7 +1931,7 @@ async function loadSnapshotOnce({
         { evidenceBudget },
       ),
       loadReviewThreads(evidenceBudget),
-    ]);
+    ], evidenceBudget);
   const markerComment = findLatestTrustedMarkerComment(comments, config.trustedCommentLogins);
   const markerCommentReactions = markerComment?.id
     ? await paginate(
@@ -1971,7 +1982,7 @@ async function loadSnapshotOnce({
   };
 }
 
-async function settleEvidenceLoads(loads) {
+async function settleEvidenceLoads(loads, evidenceBudget) {
   const settled = await Promise.allSettled(loads);
   const rejections = settled
     .filter((result) => result.status === "rejected")
@@ -1983,7 +1994,10 @@ async function settleEvidenceLoads(loads) {
     if (deterministic) {
       throw deterministic;
     }
-    const fulfilledEvidenceError = validateFulfilledProviderEvidence(settled);
+    const fulfilledEvidenceError = await validateFulfilledProviderEvidence(
+      settled,
+      evidenceBudget,
+    );
     if (fulfilledEvidenceError) {
       throw fulfilledEvidenceError;
     }
@@ -1995,8 +2009,8 @@ async function settleEvidenceLoads(loads) {
   return settled.map((result) => result.value);
 }
 
-function validateFulfilledProviderEvidence(settled) {
-  const providerArtifactIdentities = new Set();
+async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
+  const commentsResult = settled[0];
   const reviewCommentsResult = settled[2];
   const reviewsResult = settled[3];
   const reviewThreadsResult = settled[4];
@@ -2017,88 +2031,61 @@ function validateFulfilledProviderEvidence(settled) {
     }
   }
 
-  const commentsResult = settled[0];
-  if (commentsResult?.status === "fulfilled") {
-    for (const comment of commentsResult.value) {
-      const artifact = parseCodexIssueCommentArtifact(comment, {
+  if (reviewsResult?.status === "fulfilled") {
+    const reviewIds = new Set();
+    for (const review of reviewsResult.value) {
+      if (
+        typeof review?.id !== "number" ||
+        !Number.isSafeInteger(review.id) ||
+        review.id <= 0
+      ) {
+        return invalidProviderEvidenceFailure(
+          "REST review snapshot contains a review without a valid numeric id",
+        );
+      }
+      const reviewId = String(review.id);
+      if (reviewIds.has(reviewId)) {
+        return invalidProviderEvidenceFailure(
+          `REST review snapshot contains duplicate numeric id ${reviewId}`,
+        );
+      }
+      reviewIds.add(reviewId);
+    }
+  }
+
+  if (
+    commentsResult?.status !== "fulfilled" ||
+    reviewsResult?.status !== "fulfilled"
+  ) {
+    return null;
+  }
+
+  const artifacts = [
+    ...commentsResult.value.map((comment) =>
+      parseCodexIssueCommentArtifact(comment, {
+        owner: repo.owner,
+        repo: repo.name,
+        botLogins: config.codexBotLogins,
+      }),
+    ),
+    ...reviewsResult.value.map((review) => {
+      const artifact = parseCodexReviewArtifact(review, {
         owner: repo.owner,
         repo: repo.name,
         botLogins: config.codexBotLogins,
       });
-      const identityError = fulfilledProviderArtifactIdentityError(
-        artifact,
-        providerArtifactIdentities,
-      );
-      if (identityError) {
-        return identityError;
-      }
-      if (artifact?.kind === "malformed") {
-        return invalidProviderEvidenceFailure(artifact.reason);
-      }
-    }
+      return commentedReviewMayBeEmptyInlineParent(review, artifact)
+        ? null
+        : artifact;
+    }),
+  ].filter(Boolean);
+  const providerResult = await selectCurrentHeadProviderResult(
+    artifacts,
+    evidenceBudget,
+  );
+  if (providerResult.kind === "malformed") {
+    return invalidProviderEvidenceFailure(providerResult.reason);
   }
-
-  if (reviewsResult?.status !== "fulfilled") {
-    return null;
-  }
-
-  const reviewIds = new Set();
-  for (const review of reviewsResult.value) {
-    if (
-      typeof review?.id !== "number" ||
-      !Number.isSafeInteger(review.id) ||
-      review.id <= 0
-    ) {
-      return invalidProviderEvidenceFailure(
-        "REST review snapshot contains a review without a valid numeric id",
-      );
-    }
-    const reviewId = String(review.id);
-    if (reviewIds.has(reviewId)) {
-      return invalidProviderEvidenceFailure(
-        `REST review snapshot contains duplicate numeric id ${reviewId}`,
-      );
-    }
-    reviewIds.add(reviewId);
-
-    const artifact = parseCodexReviewArtifact(review, {
-      owner: repo.owner,
-      repo: repo.name,
-      botLogins: config.codexBotLogins,
-    });
-    const identityError = fulfilledProviderArtifactIdentityError(
-      artifact,
-      providerArtifactIdentities,
-    );
-    if (identityError) {
-      return identityError;
-    }
-    if (
-      artifact?.kind === "malformed" &&
-      !commentedReviewMayBeEmptyInlineParent(review, artifact)
-    ) {
-      return invalidProviderEvidenceFailure(artifact.reason);
-    }
-  }
-  return null;
-}
-
-function fulfilledProviderArtifactIdentityError(artifact, identities) {
-  if (!artifact || !/^[1-9][0-9]*$/.test(String(artifact.id || ""))) {
-    return null;
-  }
-  try {
-    parseTimestamp(artifact.createdAt, "Codex artifact creation time");
-  } catch (error) {
-    return invalidProviderEvidenceFailure(error.message);
-  }
-  const identity = `${artifact.source}:${artifact.id}`;
-  if (identities.has(identity)) {
-    return invalidProviderEvidenceFailure(
-      `Codex provider artifact identity ${identity} appears more than once`,
-    );
-  }
-  identities.add(identity);
   return null;
 }
 
@@ -2432,10 +2419,12 @@ async function commitIsAncestor(baseSha, headSha, cache, evidenceBudget) {
   }
 
   const baseCommitSha = String(data?.base_commit?.sha || "").toLowerCase();
+  const headCommitSha = String(data?.head_commit?.sha || "").toLowerCase();
   const mergeBaseSha = String(data?.merge_base_commit?.sha || "").toLowerCase();
   const status = data?.status;
   if (
     !/^[0-9a-f]{40}$/.test(baseCommitSha) ||
+    !/^[0-9a-f]{40}$/.test(headCommitSha) ||
     !/^[0-9a-f]{40}$/.test(mergeBaseSha) ||
     !new Set(["ahead", "behind", "diverged", "identical"]).has(status)
   ) {
@@ -2450,6 +2439,13 @@ async function commitIsAncestor(baseSha, headSha, cache, evidenceBudget) {
       "error",
       "Codex artifact ancestry response conflicts with the requested commit",
       `Compare response base ${baseCommitSha} does not match provider commit ${baseSha}.`,
+    );
+  }
+  if (headCommitSha !== headSha) {
+    throw new GateFailure(
+      "error",
+      "Codex artifact ancestry response conflicts with the requested commit",
+      `Compare response head ${headCommitSha} does not match current commit ${headSha}.`,
     );
   }
 

@@ -581,8 +581,14 @@ export function collectCodexThreadEvidence(
     }
     reviewThreadIds.add(threadId);
 
+    if (typeof thread?.isResolved !== "boolean") {
+      errors.push(
+        `GraphQL review thread ${threadId} has a non-boolean isResolved value`,
+      );
+      continue;
+    }
     const comments = thread?.comments?.nodes || [];
-    const unresolved = thread?.isResolved !== true;
+    const unresolved = !thread.isResolved;
     const threadLabel = unresolved
       ? "unresolved review thread"
       : "resolved review thread";
@@ -674,17 +680,18 @@ export function collectCodexThreadEvidence(
     if (!nodeId) {
       continue;
     }
-    const thread = threadByNodeId.get(nodeId)?.thread;
-    if (!thread) {
+    const threadRecord = threadByNodeId.get(nodeId);
+    if (!threadRecord) {
       transientErrors.push(`review comment ${comment.id} has no loaded review thread`);
       continue;
     }
+    const { thread, unresolved } = threadRecord;
     if (!verifiedRestCommentNodeIds.has(nodeId)) {
       continue;
     }
 
     const threadId = String(thread.id || `comment:${comment.id}`);
-    if (!thread.isResolved && !findingByThreadId.has(threadId)) {
+    if (unresolved && !findingByThreadId.has(threadId)) {
       const location = [
         thread.path || comment.path,
         thread.line || comment.line || comment.original_line,
@@ -726,7 +733,7 @@ export function collectCodexThreadEvidence(
 
     validatedCodexInlineParentReviewIds.add(normalizedReviewId);
 
-    if (thread.isResolved) {
+    if (!unresolved) {
       continue;
     }
   }

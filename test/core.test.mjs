@@ -2002,6 +2002,34 @@ test("rejects unresolved GraphQL comments missing from the complete REST snapsho
   });
 });
 
+test("requires GraphQL review-thread isResolved to be exactly boolean", () => {
+  const invalidValues = [undefined, null, 0, 1, "false", {}];
+  const reviewThreads = invalidValues.map((isResolved, index) => ({
+    id: `invalid-resolution-${index}`,
+    ...(isResolved === undefined ? {} : { isResolved }),
+    comments: { nodes: [] },
+  }));
+
+  const result = collectUnresolvedCodexThreadFindings(
+    [],
+    [],
+    reviewThreads,
+    undefined,
+    FULL_SHA_A,
+  );
+
+  assert.equal(result.count, 0);
+  assert.deepEqual(result.transientErrors, []);
+  assert.deepEqual(
+    result.errors,
+    invalidValues.map(
+      (_, index) =>
+        `GraphQL review thread invalid-resolution-${index} ` +
+        "has a non-boolean isResolved value",
+    ),
+  );
+});
+
 test("rejects conflicting opaque identities for the same REST and GraphQL full ID", () => {
   const restNodeId = reviewCommentNodeId(904);
   const graphqlNodeId = `${restNodeId}Conflict`;

@@ -142,6 +142,59 @@ test("approved Codex review passes the active marker after the final finding che
   });
 });
 
+test("an older approval cannot bypass a newer selected prior-head clean", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:55:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+      ackDeadlineAt: "2026-05-14T10:30:00Z",
+      nextRetryAt: "2026-05-14T10:30:00Z",
+    });
+    harness.commitResolutions[OLD_HEAD_SHA.slice(0, 10)] = OLD_HEAD_SHA;
+    harness.reviews.push({
+      id: 4001,
+      state: "APPROVED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T09:58:00Z",
+      body: "Looks good.",
+      user: codexBotUser(),
+    });
+    const newerPriorHeadClean = codexCleanCommentForHead(
+      2001,
+      OLD_HEAD_SHA,
+      "2026-05-14T10:00:00Z",
+    );
+    harness.issueComments.push(newerPriorHeadClean);
+    harness.afterSnapshotLoad(2, {
+      action: "removeIssueComment",
+      value: newerPriorHeadClean.id,
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.snapshotLoads, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(
+      parseStateCommentBody(harness.findStateComment().body).activeMarker.id,
+      "2000",
+    );
+  });
+});
+
 test("issue_comment completion fails closed when final reload sees current-head findings", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
@@ -223,6 +276,28 @@ test("issue_comment clean completion recovers resolved failed findings", async (
     assert.equal(state.activeMarker, null);
     assert.equal(state.lastStatus.state, "success");
     assert.equal(state.history.at(-1).outcome, "failed_findings");
+  });
+});
+
+test("a non-boolean isResolved value cannot suppress an inline finding", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push({
+      ...unresolvedThread(3001),
+      isResolved: "false",
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /non-boolean isResolved value/);
   });
 });
 
@@ -1619,6 +1694,7 @@ test("a prior-head issue-comment clean is stale evidence and a head change creat
     harness.compareResults[`${HEAD_SHA}...${NEW_HEAD_SHA}`] = {
       status: "ahead",
       base_commit: { sha: HEAD_SHA },
+      head_commit: { sha: NEW_HEAD_SHA },
       merge_base_commit: { sha: HEAD_SHA },
     };
     const oldClean = codexCleanComment(2001);
@@ -1660,6 +1736,7 @@ test("a prior-head review clean is stale evidence and a head change creates a fr
     harness.compareResults[`${OLD_HEAD_SHA}...${NEW_HEAD_SHA}`] = {
       status: "ahead",
       base_commit: { sha: OLD_HEAD_SHA },
+      head_commit: { sha: NEW_HEAD_SHA },
       merge_base_commit: { sha: OLD_HEAD_SHA },
     };
     harness.reviews.push({
@@ -1702,6 +1779,7 @@ test("a clean bound to a non-ancestor commit remains deterministic invalid evide
     harness.compareResults[`${OLD_HEAD_SHA}...${NEW_HEAD_SHA}`] = {
       status: "diverged",
       base_commit: { sha: OLD_HEAD_SHA },
+      head_commit: { sha: NEW_HEAD_SHA },
       merge_base_commit: { sha: HEAD_SHA },
     };
     harness.issueComments.push(codexCleanCommentForHead(2001, OLD_HEAD_SHA));
@@ -1717,6 +1795,49 @@ test("a clean bound to a non-ancestor commit remains deterministic invalid evide
     assert.match(result.stderr, /not current head/);
     assert.equal(harness.findMarkerComments().length, 0);
   });
+});
+
+test("compare responses must bind the requested head endpoint", async (t) => {
+  for (const scenario of [
+    {
+      name: "missing head",
+      headCommit: null,
+      expected: /did not contain a closed commit relationship/,
+    },
+    {
+      name: "conflicting head",
+      headCommit: NEW_HEAD_SHA,
+      expected: /does not match current commit/,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      await withHarness(async (harness) => {
+        harness.commitResolutions[OLD_HEAD_SHA.slice(0, 10)] = OLD_HEAD_SHA;
+        harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
+          status: "ahead",
+          base_commit: { sha: OLD_HEAD_SHA },
+          ...(scenario.headCommit
+            ? { head_commit: { sha: scenario.headCommit } }
+            : {}),
+          merge_base_commit: { sha: OLD_HEAD_SHA },
+        };
+        harness.issueComments.push(
+          codexCleanCommentForHead(2001, OLD_HEAD_SHA),
+        );
+
+        const result = await harness.runGate({
+          eventName: "workflow_dispatch",
+          event: { inputs: { pull_request: "1" } },
+          env: { PR_NUMBER: "1" },
+        });
+
+        assert.equal(result.code, 1);
+        assert.equal(successStatusWrites(harness), 0);
+        assert.equal(harness.statuses.at(-1).body.state, "error");
+        assert.match(result.stderr, scenario.expected);
+      });
+    });
+  }
 });
 
 test("a delayed prior-head clean cannot turn a current-head active marker into an error", async () => {
@@ -2101,6 +2222,7 @@ test("an older finding makes an unresolved short-SHA clean decision fail closed"
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
       status: "diverged",
       base_commit: { sha: OLD_HEAD_SHA },
+      head_commit: { sha: HEAD_SHA },
       merge_base_commit: { sha: NEW_HEAD_SHA },
     };
     harness.routeFaults[
@@ -2141,6 +2263,7 @@ test("a deterministically invalid older short-SHA clean cannot suppress its find
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
       status: "diverged",
       base_commit: { sha: OLD_HEAD_SHA },
+      head_commit: { sha: HEAD_SHA },
       merge_base_commit: { sha: NEW_HEAD_SHA },
     };
     harness.issueComments.push(
@@ -2172,6 +2295,7 @@ test("a clean result does not supersede a finding from a non-ancestor commit", a
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
       status: "diverged",
       base_commit: { sha: OLD_HEAD_SHA },
+      head_commit: { sha: HEAD_SHA },
       merge_base_commit: { sha: NEW_HEAD_SHA },
     };
     harness.issueComments.push(
@@ -2952,6 +3076,107 @@ test("fulfilled invalid provider evidence outranks a concurrent response-byte bu
   }
 });
 
+test("partial-snapshot provider precedence uses complete provider-channel ordering", async (t) => {
+  await t.test("newer clean supersedes an old malformed artifact before a budget failure", async () => {
+    await withHarness(async (harness) => {
+      const reactionsPath =
+        `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/reactions`;
+      harness.issueComments.push(
+        codexMalformedTerminal(2001, "2026-05-14T09:59:00Z"),
+      );
+      harness.reviews.push({
+        id: 4001,
+        state: "APPROVED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-05-14T10:00:00Z",
+        body: "Looks good.",
+        user: codexBotUser(),
+      });
+      harness.routeFaults[`GET ${reactionsPath}`] = [{
+        delayMs: 25,
+        status: 200,
+        body: [],
+        headers: { "Content-Length": String(8 * 1024 * 1024 + 1) },
+      }];
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: { inputs: { pull_request: "1" } },
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 1);
+      assert.equal(successStatusWrites(harness), 0);
+      assert.equal(harness.statuses.at(-1).body.state, "pending");
+      assert.match(result.stderr, /response-byte budget exceeded/);
+      assert.doesNotMatch(result.stderr, /exactly one Reviewed commit marker/);
+    });
+  });
+
+  await t.test("newer malformed artifact outranks an older clean and budget failure", async () => {
+    await withHarness(async (harness) => {
+      const reactionsPath =
+        `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/reactions`;
+      harness.reviews.push({
+        id: 4001,
+        state: "APPROVED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-05-14T09:59:00Z",
+        body: "Looks good.",
+        user: codexBotUser(),
+      });
+      harness.issueComments.push(
+        codexMalformedTerminal(2001, "2026-05-14T10:00:00Z"),
+      );
+      harness.routeFaults[`GET ${reactionsPath}`] = [{
+        delayMs: 25,
+        status: 200,
+        body: [],
+        headers: { "Content-Length": String(8 * 1024 * 1024 + 1) },
+      }];
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: { inputs: { pull_request: "1" } },
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 1);
+      assert.equal(harness.statuses.at(-1).body.state, "error");
+      assert.match(result.stderr, /exactly one Reviewed commit marker/);
+      assert.doesNotMatch(result.stderr, /response-byte budget exceeded/);
+    });
+  });
+
+  await t.test("an incomplete provider channel preserves pending", async () => {
+    await withHarness(async (harness) => {
+      const reviewsPath =
+        `/repos/${harness.owner}/${harness.repo}/pulls/${harness.prNumber}/reviews`;
+      harness.issueComments.push(codexMalformedTerminal(2001));
+      harness.routeFaults[`GET ${reviewsPath}`] = Array.from(
+        { length: 4 },
+        () => ({
+          status: 503,
+          body: { message: "temporary review-channel failure" },
+          headers: { "Retry-After": "0" },
+        }),
+      );
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: { inputs: { pull_request: "1" } },
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 1);
+      assert.equal(successStatusWrites(harness), 0);
+      assert.equal(harness.statuses.at(-1).body.state, "pending");
+      assert.match(result.stderr, /exhausted its retry budget/);
+      assert.doesNotMatch(result.stderr, /exactly one Reviewed commit marker/);
+    });
+  });
+});
+
 test("review-thread comment pagination uses the bounded production worker pool", async () => {
   await withHarness(async (harness) => {
     harness.threadCommentDelayMs = 25;
@@ -3242,6 +3467,7 @@ test("an intermediate clean supersedes its finding before a later divergent-head
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
       status: "diverged",
       base_commit: { sha: OLD_HEAD_SHA },
+      head_commit: { sha: HEAD_SHA },
       merge_base_commit: { sha: NEW_HEAD_SHA },
     };
     harness.issueComments.push(
@@ -5078,6 +5304,7 @@ class GateHarness {
       [`${OLD_HEAD_SHA}...${HEAD_SHA}`]: {
         status: "ahead",
         base_commit: { sha: OLD_HEAD_SHA },
+        head_commit: { sha: HEAD_SHA },
         merge_base_commit: { sha: OLD_HEAD_SHA },
       },
     };
