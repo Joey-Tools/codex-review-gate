@@ -2229,6 +2229,12 @@ async function buildCurrentReviewEvidence({
         return null;
       }
       if (
+        threadFindings.transientErrors.length > 0 &&
+        commentedReviewMayBeInlineParent(review, artifact)
+      ) {
+        return null;
+      }
+      if (
         allowMissingReviewChildTransient &&
         !validatedCodexInlineParentReviewIds.has(String(review.id)) &&
         commentedReviewMayBeInlineParent(review, artifact)

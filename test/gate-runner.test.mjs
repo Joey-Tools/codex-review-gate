@@ -1307,6 +1307,69 @@ test("an official COMMENTED wrapper without an inline child reloads once then fa
   });
 });
 
+test("a persistent REST-only child keeps its official parent wrapper pending", async () => {
+  await withHarness(async (harness) => {
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:01Z",
+      body: codexInlineParentReviewBody(),
+      user: codexBotUser(),
+    });
+    harness.reviewComments.push({
+      ...currentHeadInlineFinding(3001),
+      pull_request_review_id: 9100,
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.snapshotLoads, 2);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.match(result.stderr, /remained incomplete after a bounded whole-snapshot reload/);
+    assert.doesNotMatch(
+      result.stderr,
+      /Codex finding must contain only exact full-SHA github\.com blob links/,
+    );
+  });
+});
+
+test("a persistent GraphQL-only child keeps its official parent wrapper pending", async () => {
+  await withHarness(async (harness) => {
+    harness.reviews.push({
+      id: 9100,
+      state: "COMMENTED",
+      commit_id: HEAD_SHA,
+      submitted_at: "2026-05-14T10:00:01Z",
+      body: codexInlineParentReviewBody(),
+      user: codexBotUser(),
+    });
+    harness.reviewThreads.push(unresolvedThread(3001));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.snapshotLoads, 2);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.match(result.stderr, /remained incomplete after a bounded whole-snapshot reload/);
+    assert.doesNotMatch(
+      result.stderr,
+      /Codex finding must contain only exact full-SHA github\.com blob links/,
+    );
+  });
+});
+
 test("eyes reaction acknowledges marker and moves WaitingAck to WaitingResult", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
