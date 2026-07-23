@@ -65,6 +65,13 @@ active-marker, exact passed-marker reassertion, or failed-findings recovery
 lineage is demoted to `pending`; it is not accepted merely because it is clean
 and current-head.
 
+The optional commit-status deduplication GET has its own best-effort budget,
+separate from review evidence: 100 statuses per page, at most 10 pages or 1,000
+items, 1 MiB per response, 4 MiB in total, and 16 actual fetch attempts. An
+API, payload, pagination, or budget failure sets `readFailed`; it does not make
+the review evidence incomplete or change its result. The action simply skips
+deduplication and POSTs the status it already computed.
+
 Every GitHub request attempt has a 60-second default deadline that covers both
 the fetch and response-body read. The final `success` POST is never blindly retried. If that
 POST fails or times out after GitHub may have persisted it, the workflow
@@ -72,6 +79,23 @@ attempts a compensating `error` status and exits non-zero. If the compensating
 write also fails, the run still fails but the remote latest status may remain
 the ambiguous `success`; this is an explicit availability limitation, and a
 later complete gate run must repair the status before it is relied upon.
+
+Evidence collection is also bounded per PR. One work budget is shared by every
+initial snapshot, final snapshot, bounded whole-snapshot reload, and retry for
+that PR: at most 64 MiB of streamed response bytes and 1,024 actual fetch
+attempts. Each individual response is capped at 8 MiB while it is streamed
+(with an earlier rejection when a trustworthy `Content-Length` already
+exceeds the cap), and each snapshot may contain at most 20,000 evidence items.
+The action permits at most four concurrent HTTP requests and uses at most four
+concurrent workers when completing review-thread comments. Exhausting a byte,
+item, or attempt budget makes the current evidence incomplete, writes
+`pending`, and exits non-zero. A deterministic provider schema, identity, or
+commit-binding conflict instead writes `error` and exits non-zero. A budget
+failure is sticky for that PR reconciliation and broadcasts an abort to every
+active evidence request so concurrent work does not continue consuming
+resources. If concurrent evidence loads expose mixed failures, a deterministic
+non-`pending` failure, including a schema or identity error, takes precedence
+over a budget or other transient `pending` failure.
 
 ```mermaid
 sequenceDiagram
@@ -444,6 +468,61 @@ Accepted provider evidence is channel-specific:
 - Review-body and unthreaded top-level findings bind through exact
   `https://github.com/<owner>/<repository>/blob/<40-hex>/...` links. Mixed
   repositories, commits, or unsupported current formats are not accepted.
+- A comment from a configured Codex provider whose body begins with
+  `Codex Review` is terminal-looking even when that text is preceded by an
+  optional Markdown heading and emoji. The only non-terminal exception is a
+  one-line progress message: `Codex Review in progress` or
+  `Codex Review still in progress`, optionally followed by a period or by a
+  colon and one to 160 characters of one-line metadata. That progress message
+  is ignored. A newer broad candidate outside this exact exception, such as
+  `Codex Review completed`, is classified as malformed and fails closed when
+  it does not match a known clean or finding grammar; it is never silently
+  ignored.
+
+Clean provider artifacts use a closed grammar rather than an open-ended prose
+heuristic:
+
+- A clean issue comment starts with exact
+  `Codex Review: Didn't find any major issues.` and may append only one known
+  observed provider tagline: no tagline, `Nice work!`, `Chef's kiss.`,
+  `What shall we delve into next?`,
+  `Already looking forward to the next diff.`, `Keep them coming.`,
+  `:rocket:`, `:tada:`, or `Swish.` It contains exactly one
+  `**Reviewed commit:**` line with a 10- or 40-hex commit reference. After that
+  line, it contains either nothing or the exact known official
+  `ℹ️ About Codex in GitHub` disclosure block; arbitrary trailing prose is not
+  accepted. After CRLF normalisation, per-line trimming, and removal of blank
+  lines, that disclosure is exactly:
+
+  ```text
+  <details> <summary>ℹ️ About Codex in GitHub</summary>
+  <br/>
+  Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you
+  - Open a pull request for review
+  - Mark a draft as ready
+  - Comment "@codex review".
+  If Codex has suggestions, it will comment; otherwise it will react with 👍.
+  When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like "@codex address that feedback".
+  </details>
+  ```
+
+- A clean `APPROVED` review has an empty body, exact `Looks good.`, or a unique
+  exact final `No findings.` optionally preceded by one structured summary of
+  at most 240 characters. The summary is not arbitrary prose. It is either
+  `Review coverage:` or `Coverage:` followed by a target list. Each target is
+  a backtick-wrapped identifier or path whose inner characters match only
+  `[A-Za-z0-9_./:@+-]+`; multiple targets use comma and/or `and` separators,
+  with an optional Oxford comma. After lowercasing the whole target, an exact
+  standalone `P0`–`P3`, `S0`–`S3`, `critical`, `high`, `medium`, `low`,
+  `finding`, `findings`, `blocker`, `blocking`, `found`, `detected`,
+  `data-loss`, or `auth-bypass` is rejected. This is an exact whole-target
+  check: those words may still appear as genuine identifier or path segments.
+  The summary may end in one period. Links, code fences, markup, verb-led
+  summaries, and every other prose shape are rejected.
+- Finding-shaped signals take precedence over a clean-looking wrapper. A
+  finding heading, GitHub blob link, priority/severity badge or list marker, or
+  contradictory finding language makes the artifact non-clean even when the
+  issue-comment lead or review state otherwise looks clean.
 
 The action fully paginates issue comments, reviews, inline comments, GraphQL
 review threads, and thread comments. Missing parent reviews, thread mappings,
@@ -457,6 +536,11 @@ Thread-backed findings are historical admission evidence. A thread stops
 blocking only when `isResolved` is true; `isOutdated` alone has no resolving
 effect. Unthreaded findings remain active until a later accepted clean result
 for the same or a newer head supersedes them.
+
+An older clean issue comment with a 10-hex reviewed-commit reference is not
+resolved eagerly merely to populate audit history. The action resolves that
+short SHA only when deciding whether the older clean supersedes an otherwise
+active older unthreaded finding.
 
 The final `success` path uses the ordered sequence defined under Evidence
 Reconciliation: cached status GET, PR lifecycle/head GET, final complete

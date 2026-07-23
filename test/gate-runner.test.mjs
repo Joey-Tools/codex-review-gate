@@ -1650,6 +1650,123 @@ test("a later current-head clean supersedes an earlier exact threadless finding"
   });
 });
 
+test("a newer current-head clean does not resolve an unused older short-SHA clean", async () => {
+  await withHarness(async (harness) => {
+    const oldShortSha = OLD_HEAD_SHA.slice(0, 10);
+    harness.seedActiveMarker({
+      id: 1900,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:45:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    harness.routeFaults[
+      `GET /repos/${harness.owner}/${harness.repo}/commits/${oldShortSha}`
+    ] = Array.from({ length: 4 }, () => ({
+      status: 429,
+      body: { message: "unused older clean resolution fault" },
+      headers: { "Retry-After": "0" },
+    }));
+    harness.issueComments.push(
+      codexCleanCommentForHead(2001, OLD_HEAD_SHA, "2026-05-14T09:55:00Z"),
+      codexCleanComment(2002, "2026-05-14T10:00:00Z"),
+    );
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    assert.equal(
+      harness.requestLog.some((entry) =>
+        entry.method === "GET" &&
+          entry.path.endsWith(`/commits/${oldShortSha}`),
+      ),
+      false,
+    );
+  });
+});
+
+test("an older finding makes an unresolved short-SHA clean decision fail closed", async () => {
+  await withHarness(async (harness) => {
+    const oldShortSha = OLD_HEAD_SHA.slice(0, 10);
+    harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
+      status: "diverged",
+      base_commit: { sha: OLD_HEAD_SHA },
+      merge_base_commit: { sha: NEW_HEAD_SHA },
+    };
+    harness.routeFaults[
+      `GET /repos/${harness.owner}/${harness.repo}/commits/${oldShortSha}`
+    ] = Array.from({ length: 4 }, () => ({
+      status: 429,
+      body: { message: "required older clean resolution fault" },
+      headers: { "Retry-After": "0" },
+    }));
+    harness.issueComments.push(
+      codexThreadlessFinding(2001, OLD_HEAD_SHA, "2026-05-14T09:50:00Z"),
+      codexCleanCommentForHead(2002, OLD_HEAD_SHA, "2026-05-14T09:55:00Z"),
+      codexCleanComment(2003, "2026-05-14T10:00:00Z"),
+    );
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.match(result.stderr, /exhausted its retry budget/);
+    assert.equal(
+      harness.requestLog.some((entry) =>
+        entry.method === "GET" &&
+          entry.path.endsWith(`/commits/${oldShortSha}`),
+      ),
+      true,
+    );
+  });
+});
+
+test("a deterministically invalid older short-SHA clean cannot suppress its finding", async () => {
+  await withHarness(async (harness) => {
+    const oldShortSha = OLD_HEAD_SHA.slice(0, 10);
+    harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
+      status: "diverged",
+      base_commit: { sha: OLD_HEAD_SHA },
+      merge_base_commit: { sha: NEW_HEAD_SHA },
+    };
+    harness.issueComments.push(
+      codexThreadlessFinding(2001, OLD_HEAD_SHA, "2026-05-14T09:50:00Z"),
+      codexCleanCommentForHead(2002, OLD_HEAD_SHA, "2026-05-14T09:55:00Z"),
+      codexCleanComment(2003, "2026-05-14T10:00:00Z"),
+    );
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(
+      harness.requestLog.some((entry) =>
+        entry.method === "GET" &&
+          entry.path.endsWith(`/commits/${oldShortSha}`),
+      ),
+      true,
+    );
+  });
+});
+
 test("a clean result does not supersede a finding from a non-ancestor commit", async () => {
   await withHarness(async (harness) => {
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
@@ -1712,7 +1829,7 @@ test("a newer noncanonical terminal prefix invalidates an earlier clean result",
       codexCleanComment(2001, "2026-05-14T09:57:00Z"),
       {
         ...codexCleanComment(2002, "2026-05-14T10:00:00Z"),
-        body: "codex review : unsupported terminal format",
+        body: "Codex Review result: unsupported terminal format",
       },
     );
 
@@ -1750,6 +1867,91 @@ test("cross-channel terminal artifacts at the same server timestamp are inconclu
     assert.equal(result.code, 1);
     assert.equal(harness.statuses.at(-1).body.state, "error");
     assert.match(result.stderr, /ambiguous server timestamp/);
+  });
+});
+
+test("status dedupe stops on the first trusted newest-first page", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.commitStatuses = [
+      {
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "error",
+        creator: { login: "github-actions[bot]", type: "Bot" },
+      },
+      ...Array.from({ length: 149 }, (_, index) => ({
+        sha: HEAD_SHA,
+        context: `other/status-${index}`,
+        state: "success",
+      })),
+    ];
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    const reads = harness.requestLog.filter((entry) =>
+      entry.method === "GET" &&
+      entry.path.endsWith(`/commits/${HEAD_SHA}/statuses`));
+    assert.deepEqual(reads.map((entry) => entry.query.page), ["1"]);
+  });
+});
+
+test("status-read page-budget exhaustion does not replace computed success", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.commitStatuses = Array.from({ length: 1_001 }, (_, index) => ({
+      sha: HEAD_SHA,
+      context: `other/status-${index}`,
+      state: "success",
+    }));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    assert.match(result.stderr, /Commit-status read page budget exhausted/);
+    assert.equal(statusReads(harness), 10);
+    assert.equal(
+      harness.requestLog.some((entry) =>
+        entry.path.endsWith(`/commits/${HEAD_SHA}/statuses`) &&
+        entry.query.page === "11"),
+      false,
+    );
+  });
+});
+
+test("oversized streamed status history does not replace computed success", async () => {
+  await withHarness(async (harness) => {
+    seedCleanActiveMarker(harness);
+    harness.streamResponseBodies = true;
+    harness.streamChunkSize = 64 * 1024;
+    harness.commitStatuses = Array.from({ length: 100 }, (_, index) => ({
+      sha: HEAD_SHA,
+      context: `other/status-${index}`,
+      state: "success",
+      description: "x".repeat(12 * 1024),
+    }));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    assert.match(result.stderr, /Evidence response-byte budget exceeded/);
+    assert.equal(statusReads(harness), 1);
   });
 });
 
@@ -1998,6 +2200,144 @@ test("REST pagination follows a next link even when the current page is short", 
         entry.path === commentsPath && entry.query.page === "2",
       ),
       true,
+    );
+  });
+});
+
+test("an oversized streamed evidence response is pending and never writes success", async () => {
+  await withHarness(async (harness) => {
+    harness.streamResponseBodies = true;
+    harness.streamChunkSize = 256 * 1024;
+    harness.issueComments.push({
+      id: 7001,
+      body: "x".repeat(8 * 1024 * 1024 + 1),
+      created_at: "2026-05-14T09:00:00Z",
+      user: { login: "octocat", type: "User" },
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(harness.statuses.some((status) => status.body.state === "success"), false);
+    assert.match(result.stderr, /response-byte budget exceeded/);
+    assert.equal(
+      harness.requestLog.filter((entry) =>
+        entry.method === "GET" &&
+        entry.path.endsWith("/issues/1/comments"),
+      ).length,
+      1,
+    );
+  });
+});
+
+test("an evidence budget failure aborts a concurrent hanging request", async () => {
+  await withHarness(async (harness) => {
+    const commentsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`;
+    const reactionsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/reactions`;
+    harness.routeFaults[`GET ${commentsPath}`] = [{
+      delayMs: 25,
+      status: 200,
+      body: [],
+      headers: { "Content-Length": String(8 * 1024 * 1024 + 1) },
+    }];
+    harness.routeFaults[`GET ${reactionsPath}`] = [{
+      hangUntilAbort: true,
+    }];
+
+    const startedAt = Date.now();
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: {
+        PR_NUMBER: "1",
+        CODEX_REVIEW_GATE_REQUEST_TIMEOUT_SECONDS: "5",
+      },
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.match(result.stderr, /declared .* > 8388608/);
+    assert.equal(
+      harness.requestLog.filter((entry) =>
+        entry.method === "GET" && entry.path === commentsPath,
+      ).length,
+      1,
+    );
+    assert.equal(
+      harness.requestLog.filter((entry) =>
+        entry.method === "GET" && entry.path === reactionsPath,
+      ).length,
+      1,
+    );
+    assert.ok(
+      elapsedMs < 4_000,
+      `budget broadcast should beat the 5s request deadline; elapsed ${elapsedMs}ms`,
+    );
+  });
+});
+
+test("deterministic evidence parse failure outranks a concurrent budget failure", async () => {
+  await withHarness(async (harness) => {
+    const commentsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/comments`;
+    const reactionsPath =
+      `/repos/${harness.owner}/${harness.repo}/issues/${harness.prNumber}/reactions`;
+    harness.routeFaults[`GET ${commentsPath}`] = [{
+      status: 200,
+      rawText: "<not-json>",
+    }];
+    harness.routeFaults[`GET ${reactionsPath}`] = [{
+      delayMs: 25,
+      status: 200,
+      body: [],
+      headers: { "Content-Length": String(8 * 1024 * 1024 + 1) },
+    }];
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /returned a non-JSON response/);
+    assert.doesNotMatch(result.stderr, /response-byte budget exceeded/);
+  });
+});
+
+test("review-thread comment pagination uses the bounded production worker pool", async () => {
+  await withHarness(async (harness) => {
+    harness.threadCommentDelayMs = 25;
+    harness.reviewThreads = Array.from({ length: 8 }, (_, index) =>
+      unresolvedThread(8000 + index, { resolved: true }));
+    harness.threadCommentPages = Object.fromEntries(
+      harness.reviewThreads.map((thread) => [thread.id, [[], []]]),
+    );
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.activeThreadCommentRequests, 0);
+    assert.equal(harness.maxActiveThreadCommentRequests, 4);
+    assert.equal(
+      harness.requestLog.filter((entry) =>
+        entry.path === "/graphql" &&
+        entry.body?.variables?.threadId !== undefined,
+      ).length,
+      8,
     );
   });
 });
@@ -3628,6 +3968,11 @@ class GateHarness {
     this.reviewThreads = [];
     this.reviewThreadPages = null;
     this.threadCommentPages = null;
+    this.threadCommentDelayMs = 0;
+    this.activeThreadCommentRequests = 0;
+    this.maxActiveThreadCommentRequests = 0;
+    this.streamResponseBodies = false;
+    this.streamChunkSize = 64 * 1024;
     this.failNextReviewThreads = false;
     this.pullRequest = this.pullRequestForHead(HEAD_SHA);
   }
@@ -3714,6 +4059,11 @@ class GateHarness {
       reviewThreads: this.reviewThreads,
       reviewThreadPages: this.reviewThreadPages,
       threadCommentPages: this.threadCommentPages,
+      threadCommentDelayMs: this.threadCommentDelayMs,
+      activeThreadCommentRequests: this.activeThreadCommentRequests,
+      maxActiveThreadCommentRequests: this.maxActiveThreadCommentRequests,
+      streamResponseBodies: this.streamResponseBodies,
+      streamChunkSize: this.streamChunkSize,
       failNextReviewThreads: this.failNextReviewThreads,
       pullRequest: this.pullRequest,
     };

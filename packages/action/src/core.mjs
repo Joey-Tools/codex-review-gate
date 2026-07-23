@@ -5,6 +5,21 @@ export const STATE_VERSION = 1;
 export const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
 export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
+const CODEX_ISSUE_COMMENT_TERMINAL_LEAD =
+  /^(?:#{1,6}[ \t]+)?(?:[\p{Extended_Pictographic}\uFE0F\u200D]+[ \t]+)?Codex Review\b/iu;
+const CODEX_ISSUE_COMMENT_PROGRESS =
+  /^(?:#{1,6}[ \t]+)?(?:[\p{Extended_Pictographic}\uFE0F\u200D]+[ \t]+)?Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
+const CODEX_CLEAN_COMMENT_TAGLINES = new Set([
+  "",
+  "Nice work!",
+  "Chef's kiss.",
+  "What shall we delve into next?",
+  "Already looking forward to the next diff.",
+  "Keep them coming.",
+  ":rocket:",
+  ":tada:",
+  "Swish.",
+]);
 
 export const DEFAULT_CODEX_BOT_LOGINS = new Set([
   "chatgpt-codex-connector",
@@ -188,10 +203,14 @@ export function parseCodexIssueCommentArtifact(
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
   } = {},
 ) {
-  const body = String(comment?.body || "").trim();
-  const terminalLooking =
-    /^Codex Review\s*:/i.test(body) || /^### 💡 Codex Review/i.test(body);
+  const body = String(comment?.body || "")
+    .trim()
+    .replace(/\r\n?/g, "\n");
+  const terminalLooking = CODEX_ISSUE_COMMENT_TERMINAL_LEAD.test(body);
   if (!terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
+    return null;
+  }
+  if (CODEX_ISSUE_COMMENT_PROGRESS.test(body)) {
     return null;
   }
 
@@ -216,15 +235,31 @@ export function parseCodexIssueCommentArtifact(
   }
 
   if (body.startsWith(CODEX_CLEAN_COMMENT_LEAD)) {
+    if (cleanBodyContainsFindingSignals(body)) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "clean Codex issue comment contains finding-formatted content",
+      };
+    }
     const markerLabels = body.match(/\*\*Reviewed commit:\*\*/gi) || [];
     const matches = [
-      ...body.matchAll(/\*\*Reviewed commit:\*\*\s*`([0-9a-f]{10}|[0-9a-f]{40})`/gi),
+      ...body.matchAll(
+        /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{10}|[0-9a-f]{40})`[ \t]*\r?$/gm,
+      ),
     ];
     if (markerLabels.length !== 1 || matches.length !== 1) {
       return {
         ...base,
         kind: "malformed",
         reason: "clean Codex issue comment must contain exactly one Reviewed commit marker",
+      };
+    }
+    if (!issueCommentCleanBodyHasClosedGrammar(body, matches[0][0])) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "clean Codex issue comment does not match the closed clean-result grammar",
       };
     }
     return {
@@ -297,15 +332,17 @@ export function parseCodexReviewArtifact(
     };
   }
 
-  if (review.state === "APPROVED" && body.startsWith("### 💡 Codex Review")) {
-    return {
-      ...base,
-      kind: "malformed",
-      reason: "Codex review state conflicts with its finding-formatted body",
-    };
-  }
-
   if (review.state === "APPROVED") {
+    if (
+      cleanBodyContainsFindingSignals(body) ||
+      !approvedReviewCleanBodyHasClosedGrammar(body)
+    ) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "Codex review state conflicts with its non-clean body",
+      };
+    }
     return {
       ...base,
       kind: "clean",
@@ -1032,6 +1069,119 @@ function parseExactRepositoryBlobFindings(body, owner, repo) {
     headSha: [...headShas][0],
     samples: samples.slice(0, 3),
   };
+}
+
+function cleanBodyContainsFindingSignals(body) {
+  return (
+    /###\s*💡\s*Codex Review/i.test(body) ||
+    /https:\/\/github\.com\/[^/\s)]+\/[^/\s)]+\/blob\/[^\s)]+/i.test(body) ||
+    /!\[(?:P[0-3]|S[0-3])(?:\s+Badge)?\]\(https:\/\/img\.shields\.io\/badge\/[^)]+\)/i.test(body) ||
+    /(?:^|\n)\s*(?:[-*]\s*)?\[(?:P[0-3]|S[0-3])\]\s+/i.test(body)
+  );
+}
+
+function issueCommentCleanBodyHasClosedGrammar(body, markerText) {
+  const normalizedBody = body.replace(/\r\n?/g, "\n");
+  const normalizedMarker = markerText.replace(/\r\n?/g, "\n");
+  const markerIndex = normalizedBody.indexOf(normalizedMarker);
+  if (markerIndex < 0) {
+    return false;
+  }
+
+  const prefixBlock = normalizedBody.slice(0, markerIndex);
+  if (!prefixBlock.endsWith("\n\n")) {
+    return false;
+  }
+  const prefix = prefixBlock.slice(0, -2);
+  if (prefix.includes("\n") || !prefix.startsWith(CODEX_CLEAN_COMMENT_LEAD)) {
+    return false;
+  }
+  const tagline = prefix.slice(CODEX_CLEAN_COMMENT_LEAD.length);
+  const normalizedTagline = tagline ? tagline.replace(/^ /, "") : "";
+  if (
+    (tagline && !tagline.startsWith(" ")) ||
+    !CODEX_CLEAN_COMMENT_TAGLINES.has(normalizedTagline)
+  ) {
+    return false;
+  }
+  const suffixBlock = normalizedBody.slice(markerIndex + normalizedMarker.length);
+  if (!suffixBlock) {
+    return true;
+  }
+
+  return (
+    suffixBlock.startsWith("\n\n") &&
+    officialCodexDisclosureHasClosedGrammar(suffixBlock.slice(2))
+  );
+}
+
+function officialCodexDisclosureHasClosedGrammar(value) {
+  const normalized = value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+  return normalized === [
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    '- Comment "@codex review".',
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
+    "</details>",
+  ].join("\n");
+}
+
+function approvedReviewCleanBodyHasClosedGrammar(body) {
+  if (!body || body === "Looks good.") {
+    return true;
+  }
+  if (body.length > 2_000 || /https?:\/\/|```|<!--|-->|<\/?[a-z][^>]*>/i.test(body)) {
+    return false;
+  }
+
+  const lines = body
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (
+    lines.length === 0 ||
+    lines.length > 2 ||
+    lines.at(-1) !== "No findings." ||
+    lines.filter((line) => line === "No findings.").length !== 1
+  ) {
+    return false;
+  }
+
+  const target = "`[A-Za-z0-9_./:@+-]+`";
+  const targetList = `${target}(?:, ${target})*(?:,? and ${target})?`;
+  const structuredSummary = new RegExp(
+    `^(?:Review coverage|Coverage): (${targetList})\\.?$`,
+  );
+  return lines.slice(0, -1).every((line) => {
+    if (line.length > 240) {
+      return false;
+    }
+    const match = structuredSummary.exec(line);
+    if (!match) {
+      return false;
+    }
+    const targets = [...match[1].matchAll(/`([^`]+)`/g)].map(
+      (targetMatch) => targetMatch[1],
+    );
+    return targets.every((coverageTarget) => !coverageTargetContainsFindingLexeme(coverageTarget));
+  });
+}
+
+function coverageTargetContainsFindingLexeme(target) {
+  const normalized = target.trim().toLowerCase();
+  return /^(?:p[0-3]|s[0-3]|critical|high|medium|low|findings?|blocker|blocking|found|detected|data-loss|auth-bypass)$/.test(
+    normalized,
+  );
 }
 
 export function createInitialState({ now, statusHead, runUrl, reactions, findings }) {

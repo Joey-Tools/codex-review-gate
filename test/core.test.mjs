@@ -105,6 +105,24 @@ function liveCodexReview(overrides = {}) {
   };
 }
 
+function officialCodexDisclosure() {
+  return [
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "",
+    "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    '- Comment "@codex review".',
+    "",
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    "",
+    "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
+    "",
+    "</details>",
+  ].join("\n");
+}
+
 test("normalizes event mode configuration", () => {
   assert.equal(normalizeEventMode(""), "standard");
   assert.equal(normalizeEventMode("full"), "full");
@@ -844,6 +862,86 @@ test("accepts a live-style clean Codex issue-comment artifact with a 10-characte
   });
 });
 
+test("accepts observed clean taglines and the exact official disclosure", () => {
+  for (const tagline of [
+    "Nice work!",
+    "Chef's kiss.",
+    "What shall we delve into next?",
+    "Already looking forward to the next diff.",
+    "Keep them coming.",
+    ":rocket:",
+    ":tada:",
+    "Swish.",
+  ]) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment([
+        `Codex Review: Didn't find any major issues. ${tagline}`,
+        "",
+        "**Reviewed commit:** `abcdef1234`",
+        "",
+        officialCodexDisclosure(),
+      ].join("\n")),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "clean", tagline);
+  }
+});
+
+test("accepts a CRLF clean issue comment with the official disclosure", () => {
+  const artifact = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment([
+      "Codex Review: Didn't find any major issues. Nice work!",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+      "",
+      officialCodexDisclosure(),
+    ].join("\n").replace(/\n/g, "\r\n")),
+    { owner: "owner", repo: "repo" },
+  );
+
+  assert.equal(artifact.kind, "clean");
+  assert.equal(artifact.commitRef, "abcdef1234");
+});
+
+test("rejects contradictory or schema-drift content embedded in clean issue comments", () => {
+  const cases = [
+    [
+      "Codex Review: Didn't find any major issues. Nice work!",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+      "",
+      "### 💡 Codex Review",
+    ].join("\n"),
+    [
+      "Codex Review: Didn't find any major issues. Nice work!",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+      "",
+      `https://github.com/owner/repo/blob/${FULL_SHA_A}/src/core.mjs`,
+    ].join("\n"),
+    [
+      "Codex Review: Didn't find any major issues. Please fix the parser.",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+    ].join("\n"),
+    [
+      "Codex Review: Didn't find any major issues. Chef's kiss.",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+      "",
+      officialCodexDisclosure().replace("</details>", "Please fix this.\n</details>"),
+    ].join("\n"),
+  ];
+
+  for (const body of cases) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed");
+  }
+});
+
 test("rejects official Codex issue comments with missing or wrong REST identity fields", () => {
   const body = [
     "Codex Review: Didn't find any major issues.",
@@ -943,11 +1041,79 @@ test("rejects clean issue comments with missing or conflicting commit markers", 
       "clean Codex issue comment must contain exactly one Reviewed commit marker",
     );
   }
+
+  const splitAcrossLines = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment([
+      "Codex Review: Didn't find any major issues.",
+      "",
+      "**Reviewed commit:**",
+      "`abcdef1234`",
+    ].join("\n")),
+    { owner: "owner", repo: "repo" },
+  );
+  assert.equal(splitAcrossLines.kind, "malformed");
+
+  const inlineTail = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment([
+      "Codex Review: Didn't find any major issues.",
+      "",
+      "**Reviewed commit:** `abcdef1234` please fix this",
+    ].join("\n")),
+    { owner: "owner", repo: "repo" },
+  );
+  assert.equal(inlineTail.kind, "malformed");
+
+  const missingBlankLine = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment([
+      "Codex Review: Didn't find any major issues.",
+      "**Reviewed commit:** `abcdef1234`",
+    ].join("\n")),
+    { owner: "owner", repo: "repo" },
+  );
+  assert.equal(missingBlankLine.kind, "malformed");
 });
 
 test("classifies noncanonical Codex terminal prefixes as malformed", () => {
+  for (const body of [
+    "codex review : unsupported terminal format",
+    "Codex Review result: unsupported terminal format",
+    "### 🤖 Codex Review outcome: unsupported terminal format",
+    "Codex Review completed",
+  ]) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body),
+      { owner: "owner", repo: "repo" },
+    );
+
+    assert.equal(artifact.kind, "malformed", body);
+    assert.equal(
+      artifact.reason,
+      "unrecognized Codex terminal issue-comment format",
+      body,
+    );
+  }
+});
+
+test("ignores Codex progress prose that is not terminal-looking", () => {
+  for (const body of [
+    "Codex Review in progress",
+    "Codex review still in progress.",
+    "### 🤖 Codex Review in progress: run=123 status=queued",
+  ]) {
+    assert.equal(
+      parseCodexIssueCommentArtifact(
+        liveCodexIssueComment(body),
+        { owner: "owner", repo: "repo" },
+      ),
+      null,
+      body,
+    );
+  }
+});
+
+test("does not ignore unbounded Codex progress metadata", () => {
   const artifact = parseCodexIssueCommentArtifact(
-    liveCodexIssueComment("codex review : unsupported terminal format"),
+    liveCodexIssueComment(`Codex Review in progress: ${"x".repeat(161)}`),
     { owner: "owner", repo: "repo" },
   );
 
@@ -1030,6 +1196,63 @@ test("accepts a Bot-authored clean review bound to a full parent commit", () => 
   );
 });
 
+test("accepts only closed legacy or extended-clean APPROVED review bodies", () => {
+  for (const body of [
+    "Looks good.",
+    "Coverage: `parseCodexIssueCommentArtifact`, `test/core.test.mjs`.\n\nNo findings.",
+    "Review coverage: `error-paths` and `focused-tests`.\n\nNo findings.",
+    "Coverage: `docs/high-level-design.md`, `test/findings.test.mjs`, and `src/low-level-api.mjs`.\n\nNo findings.",
+    "Coverage: `critical_path`, `findingParser`, and `authenticator`.\n\nNo findings.",
+  ]) {
+    const artifact = parseCodexReviewArtifact(
+      liveCodexReview({ body }),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "clean", body);
+  }
+});
+
+test("rejects contradictory content anywhere in APPROVED review bodies", () => {
+  const cases = [
+    `Reviewed the parser.\n### 💡 Codex Review\nNo findings.`,
+    `Coverage: https://github.com/owner/repo/blob/${FULL_SHA_A}/src/core.mjs.\nNo findings.`,
+    "Reviewed a race that drops writes.\nNo findings.",
+    ...[
+      "P0",
+      "P1",
+      "P2",
+      "P3",
+      "S0",
+      "S1",
+      "S2",
+      "S3",
+      "critical",
+      "high",
+      "medium",
+      "low",
+      "finding",
+      "findings",
+      "blocker",
+      "blocking",
+      "found",
+      "detected",
+      "data-loss",
+      "auth-bypass",
+    ].map((target) => `Coverage: \`${target}\`.\n\nNo findings.`),
+    "![P2 Badge](https://img.shields.io/badge/P2-finding-yellow)\nNo findings.",
+    "No findings.\nReviewed the parser.",
+    "No findings.\nNo findings.",
+  ];
+
+  for (const body of cases) {
+    const artifact = parseCodexReviewArtifact(
+      liveCodexReview({ body }),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed", body);
+  }
+});
+
 test("rejects clean Codex reviews with a wrong user type or short parent commit", () => {
   const wrongType = parseCodexReviewArtifact(
     liveCodexReview({
@@ -1064,7 +1287,7 @@ test("rejects an APPROVED review whose body is finding-formatted", () => {
   assert.equal(artifact.kind, "malformed");
   assert.equal(
     artifact.reason,
-    "Codex review state conflicts with its finding-formatted body",
+    "Codex review state conflicts with its non-clean body",
   );
 });
 

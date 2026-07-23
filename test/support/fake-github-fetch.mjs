@@ -22,13 +22,35 @@ if (statePath) {
       return routeFaultResponse(fault, options.signal);
     }
 
+    const tracksThreadCommentRequest =
+      method === "POST" &&
+      path === "/graphql" &&
+      body?.variables?.threadId !== undefined &&
+      body?.variables?.threadId !== null;
+    if (tracksThreadCommentRequest) {
+      state.activeThreadCommentRequests ||= 0;
+      state.maxActiveThreadCommentRequests ||= 0;
+      state.activeThreadCommentRequests += 1;
+      state.maxActiveThreadCommentRequests = Math.max(
+        state.maxActiveThreadCommentRequests,
+        state.activeThreadCommentRequests,
+      );
+      save();
+    }
+
     let result;
     try {
+      if (tracksThreadCommentRequest && state.threadCommentDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, state.threadCommentDelayMs));
+      }
       result = handle({ method, path, query, body });
-      save();
     } catch (error) {
-      save();
       return response({ message: error.stack || error.message }, 500);
+    } finally {
+      if (tracksThreadCommentRequest) {
+        state.activeThreadCommentRequests -= 1;
+      }
+      save();
     }
 
     if (fault) {
@@ -301,7 +323,13 @@ function response(value, status = 200, { headers = {}, rawText } = {}) {
       String(headerValue),
     ]),
   );
-  return {
+  const textValue =
+    rawText !== undefined
+      ? String(rawText)
+      : value === undefined
+        ? ""
+        : JSON.stringify(value);
+  const result = {
     ok: status >= 200 && status < 300,
     status,
     statusText: statusText(status),
@@ -311,15 +339,42 @@ function response(value, status = 200, { headers = {}, rawText } = {}) {
       },
     },
     async text() {
-      if (rawText !== undefined) {
-        return String(rawText);
-      }
-      return value === undefined ? "" : JSON.stringify(value);
+      return textValue;
     },
   };
+  if (state?.streamResponseBodies) {
+    const bytes = new TextEncoder().encode(textValue);
+    const chunkSize = positiveInteger(state.streamChunkSize, 64 * 1024);
+    let offset = 0;
+    result.body = {
+      getReader() {
+        return {
+          async read() {
+            if (offset >= bytes.byteLength) {
+              return { done: true, value: undefined };
+            }
+            const nextOffset = Math.min(offset + chunkSize, bytes.byteLength);
+            const value = bytes.subarray(offset, nextOffset);
+            offset = nextOffset;
+            return { done: false, value };
+          },
+          async cancel() {
+            offset = bytes.byteLength;
+          },
+        };
+      },
+    };
+  }
+  return result;
 }
 
-function routeFaultResponse(fault, signal) {
+async function routeFaultResponse(fault, signal) {
+  if (Number.isFinite(fault.delayMs) && fault.delayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, fault.delayMs));
+    if (signal?.aborted) {
+      throw signal.reason || new DOMException("Aborted", "AbortError");
+    }
+  }
   if (fault.throwFetch) {
     const message =
       typeof fault.throwFetch === "string" ? fault.throwFetch : "fake route fetch failure";

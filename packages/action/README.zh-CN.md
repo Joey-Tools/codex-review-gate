@@ -29,7 +29,10 @@ Runner 实现了 event-driven serialized marker flow：
 - 分开处理 `isOutdated` 和 `isResolved`。Outdated 但 unresolved 的 thread 仍会阻塞 gate。
 - 通过精确 repository 和 full-SHA blob links 识别没有 thread 的 top-level finding comments；同一或更新 head 上更晚的 accepted clean result 会 supersede 这些 findings。
 - 验证官方 provider identity，并把 reviews、inline comments 和 top-level results 绑定到其 reviewed commit。
+- 只通过封闭的 provider grammar 接受 clean result；finding-shaped content 的优先级高于看似 clean 的 lead 或 `APPROVED` state。
+- 对 configured provider 以 `Codex Review` 开头且可带 optional Markdown heading 和 emoji 的 comment，先作为宽泛 terminal candidate。Exact one-line `in progress` / `still in progress` message 会被忽略，末尾可以是句点，或冒号加 1–160 个 metadata 字符；较新的未知 candidate（例如 `completed`）则按 malformed/fail-closed 处理，而不会静默忽略。
 - 每次 reconciliation 都重新构建完整 evidence snapshot。历史 `pending`、`error`，以及更早的 API、分页、身份或 commit 解析不完整结果只作审计，不会成为 sticky blockers。
+- 把每个 PR 的 evidence work 限制为跨 snapshots 和 retries 共享的 64 MiB 与 1,024 次 fetch attempts；同时限制每个 response 流式读取最多 8 MiB、每个 snapshot 最多 20,000 items，以及 HTTP 和 review-thread 补全各最多四路并发。
 - 用 hidden metadata 维护一个可信 sticky PR state comment。
 - 串行维护受控 `@codex review` marker comments。
 - 保持受控 marker comments 最小化，并把生成式 AI review 提示写入 GitHub Actions step summary。
@@ -196,9 +199,14 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 - 官方 REST evidence 必须来自 accepted Bot identity。Top-level issue comments 默认还必须来自官方 `chatgpt-codex-connector` GitHub App。
 - Reviews 通过完整 `PullRequestReview.commit_id` 绑定。Inline comments 通过 parent review 和 `original_commit_id` 绑定，不使用 GitHub 重定位后会变化的 `commit_id`。
 - Top-level clean comments 通过 reviewed-commit marker 绑定。短 marker 必须经 repository commit API 唯一解析为完整 current-head SHA。
+- 封闭的 clean grammar 接受 exact issue-comment lead，并只允许以下 observed provider taglines：无 tagline、`Nice work!`、`Chef's kiss.`、`What shall we delve into next?`、`Already looking forward to the next diff.`、`Keep them coming.`、`:rocket:`、`:tada:` 或 `Swish.`；之后必须有且仅有一行 reviewed-commit，并且只能没有 suffix 或带 exact official disclosure。`APPROVED` review 必须为空、exact `Looks good.`，或有唯一的 exact final `No findings.`，其前面可以有至多一行、最多 240 个字符的 summary。该 summary 必须以 exact `Coverage:` 或 `Review coverage:` 开头，后接以逗号和/或 `and` 分隔的 backtick-wrapped identifier/path tokens；token 只能匹配 `[A-Za-z0-9_./:@+-]+`，末尾只可选一个句点。整个 normalized target 若 exact 等于 `P0`–`P3`、`S0`–`S3`、`critical`、`high`、`medium`、`low`、`finding`、`findings`、`blocker`、`blocking`、`found`、`detected`、`data-loss` 或 `auth-bypass`，则拒绝；这些词出现在真实 path 或 identifier segment 中时不会被 blanket 拒绝。Verb-led 和其他 prose 均不接受。Finding signals 始终优先。
 - Review-body 和没有 thread 的 top-level findings 必须使用 exact `github.com`、被 gate 的 owner/repository 和 full commit SHA links。当前格式未知或冲突时 fail closed。
 - 期待 success 前，应 resolve 所有 thread-backed Codex findings；仅 `isOutdated` 不表示 resolved。同一 head 上更晚的 accepted clean result 可以 supersede 没有 thread 的 top-level finding。
 - Sticky state 和 status history 只用于 orchestration、审计和幂等。Rerun 会重建当前 evidence，并可在更晚但 stale 的 `pending` 或 `error` status 之后重新写入 `success`。
+- Optional status-deduplication GET 使用独立的 best-effort 上限：每页 100 statuses、最多 10 页或 1,000 items、每个 response 1 MiB、总计 4 MiB、16 次 fetch attempts。失败或超限只记为 `readFailed`，不污染 review evidence，并使 action 直接 POST 已计算的 status。
+- Review-evidence budget failure 会广播 abort active evidence requests。并发 loads 出现不同 failure 时，确定性的 non-`pending` error（包括 schema 或 identity conflict）优先于 budget 或 transient `pending`。
+- 旧 short-SHA clean result 只在判定旧 unthreaded finding 是否被 supersede 时惰性解析。
+- Evidence-budget exhaustion 属于暂时性不完整：action 写入 `pending` 并以非零状态退出。确定性的 provider schema、identity 或 commit-binding 冲突写入 `error`，也以非零状态退出。
 - 当前默认 timeout 是 overall 2 小时、首次 marker ack 5 分钟、ack 退避上限 30 分钟且不超过 marker result timeout、每个 marker result 1 小时。推荐 schedule 示例每 2 小时检查一次 retry deadlines。
 
 ## 反馈和报告

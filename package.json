@@ -5,7 +5,7 @@
   "description": "Source workspace for the Codex Review Gate action.",
   "type": "module",
   "scripts": {
-    "check": "npm run check:action && npm run check:bootstrap && node --check test/core.test.mjs && node --check test/gate-runner.test.mjs && node --check test/support/fake-github-fetch.mjs",
+    "check": "npm run check:action && npm run check:bootstrap && node --check test/core.test.mjs && node --check test/evidence-budget.test.mjs && node --check test/gate-runner.test.mjs && node --check test/support/fake-github-fetch.mjs",
     "check:action": "npm --prefix packages/action run check",
     "check:bootstrap": "node --check src/bootstrap.mjs && node --check scripts/bootstrap-codex-review-gate.mjs && node --check test/bootstrap.test.mjs",
     "check:state-machine": "npm run check:action && node --check test/gate-runner.test.mjs && node --check test/support/fake-github-fetch.mjs",

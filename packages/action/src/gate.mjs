@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
+import { Buffer } from "node:buffer";
 import { appendFileSync, readFileSync } from "node:fs";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, TextDecoder } from "node:util";
 
 import {
   DEFAULT_CODEX_BOT_LOGINS,
@@ -61,6 +62,23 @@ import {
   truncate,
   updateStateForStatus,
 } from "./core.mjs";
+import {
+  EvidenceWorkBudget,
+  mapWithConcurrency,
+} from "./evidence-budget.mjs";
+
+const MAX_EVIDENCE_ITEMS_PER_SNAPSHOT = 20_000;
+const MAX_EVIDENCE_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN = 64 * 1024 * 1024;
+const MAX_EVIDENCE_REQUEST_ATTEMPTS_PER_RUN = 1_024;
+const MAX_EVIDENCE_HTTP_CONCURRENCY = 4;
+const MAX_REVIEW_THREAD_COMMENT_CONCURRENCY = 4;
+const STATUS_READ_PAGE_SIZE = 100;
+const MAX_STATUS_READ_PAGES = 10;
+const MAX_STATUS_READ_ITEMS = 1_000;
+const MAX_STATUS_READ_RESPONSE_BYTES = 1024 * 1024;
+const MAX_STATUS_READ_BYTES = 4 * 1024 * 1024;
+const MAX_STATUS_READ_REQUEST_ATTEMPTS = 16;
 
 const config = readConfig();
 const repo = parseRepo(config.repository);
@@ -124,6 +142,7 @@ const REVIEW_THREAD_COMMENTS_QUERY = `
 let activePrNumber = config.prNumber;
 let statusSha = config.headSha;
 let statusReady = false;
+let evidenceWorkBudget = null;
 const MAX_REQUEST_ATTEMPTS = 4;
 const MAX_WHOLE_SNAPSHOT_ATTEMPTS = 2;
 const MAX_REST_PAGES = 1_000;
@@ -315,6 +334,7 @@ async function processPullRequest(prNumber, trigger) {
   activePrNumber = prNumber;
   statusSha = "";
   statusReady = false;
+  evidenceWorkBudget = createEvidenceWorkBudget();
 
   const pullRequest = await loadPullRequest();
   statusSha = pullRequest.head.sha;
@@ -1483,10 +1503,28 @@ async function saveState(state, stateComment) {
   return data;
 }
 
+function createEvidenceWorkBudget() {
+  return new EvidenceWorkBudget({
+    maxItemsPerSnapshot: MAX_EVIDENCE_ITEMS_PER_SNAPSHOT,
+    maxResponseBytes: MAX_EVIDENCE_RESPONSE_BYTES,
+    maxResponseBytesPerWork: MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN,
+    maxRequestAttemptsPerWork: MAX_EVIDENCE_REQUEST_ATTEMPTS_PER_RUN,
+    maxConcurrency: MAX_EVIDENCE_HTTP_CONCURRENCY,
+  });
+}
+
+function createEvidenceSnapshotBudget() {
+  if (!evidenceWorkBudget) {
+    throw new Error("evidence work budget was not initialized");
+  }
+  return evidenceWorkBudget.newSnapshot();
+}
+
 async function loadSnapshot() {
   for (let attempt = 1; attempt <= MAX_WHOLE_SNAPSHOT_ATTEMPTS; attempt += 1) {
     const snapshot = await loadSnapshotOnce({
       allowMissingReviewChildTransient: attempt < MAX_WHOLE_SNAPSHOT_ATTEMPTS,
+      evidenceBudget: createEvidenceSnapshotBudget(),
     });
     if (
       snapshot.providerResult.kind === "malformed" ||
@@ -1515,17 +1553,41 @@ async function loadSnapshot() {
   throw new Error("whole-snapshot reconciliation exceeded its retry budget");
 }
 
-async function loadSnapshotOnce({ allowMissingReviewChildTransient = false } = {}) {
-  const [comments, issueReactions, reviewComments, reviews, reviewThreads] = await Promise.all([
-    paginate(`${repoPath}/issues/${activePrNumber}/comments`, { per_page: "100" }),
-    paginate(`${repoPath}/issues/${activePrNumber}/reactions`, { per_page: "100" }),
-    paginate(`${repoPath}/pulls/${activePrNumber}/comments`, { per_page: "100" }),
-    paginate(`${repoPath}/pulls/${activePrNumber}/reviews`, { per_page: "100" }),
-    loadReviewThreads(),
-  ]);
+async function loadSnapshotOnce({
+  allowMissingReviewChildTransient = false,
+  evidenceBudget,
+} = {}) {
+  const [comments, issueReactions, reviewComments, reviews, reviewThreads] =
+    await settleEvidenceLoads([
+      paginate(
+        `${repoPath}/issues/${activePrNumber}/comments`,
+        { per_page: "100" },
+        { evidenceBudget },
+      ),
+      paginate(
+        `${repoPath}/issues/${activePrNumber}/reactions`,
+        { per_page: "100" },
+        { evidenceBudget },
+      ),
+      paginate(
+        `${repoPath}/pulls/${activePrNumber}/comments`,
+        { per_page: "100" },
+        { evidenceBudget },
+      ),
+      paginate(
+        `${repoPath}/pulls/${activePrNumber}/reviews`,
+        { per_page: "100" },
+        { evidenceBudget },
+      ),
+      loadReviewThreads(evidenceBudget),
+    ]);
   const markerComment = findLatestTrustedMarkerComment(comments, config.trustedCommentLogins);
   const markerCommentReactions = markerComment?.id
-    ? await paginate(`${repoPath}/issues/comments/${markerComment.id}/reactions`, { per_page: "100" })
+    ? await paginate(
+        `${repoPath}/issues/comments/${markerComment.id}/reactions`,
+        { per_page: "100" },
+        { evidenceBudget },
+      )
     : [];
 
   const evidence = await buildCurrentReviewEvidence({
@@ -1534,6 +1596,7 @@ async function loadSnapshotOnce({ allowMissingReviewChildTransient = false } = {
     reviews,
     reviewThreads,
     allowMissingReviewChildTransient,
+    evidenceBudget,
   });
   const reactions = summarizeCodexSignalReactions(
     issueReactions,
@@ -1568,12 +1631,33 @@ async function loadSnapshotOnce({ allowMissingReviewChildTransient = false } = {
   };
 }
 
+async function settleEvidenceLoads(loads) {
+  const settled = await Promise.allSettled(loads);
+  const rejections = settled
+    .filter((result) => result.status === "rejected")
+    .map((result) => result.reason);
+  if (rejections.length > 0) {
+    const deterministic = rejections.find(
+      (error) => !(error instanceof GateFailure) || error.state !== "pending",
+    );
+    if (deterministic) {
+      throw deterministic;
+    }
+    if (evidenceWorkBudget?.failure) {
+      throw evidenceWorkBudget.failure;
+    }
+    throw rejections[0];
+  }
+  return settled.map((result) => result.value);
+}
+
 async function buildCurrentReviewEvidence({
   comments,
   reviewComments,
   reviews,
   reviewThreads,
   allowMissingReviewChildTransient = false,
+  evidenceBudget,
 }) {
   const inlineParentReviewIds = new Set(
     reviewComments
@@ -1625,7 +1709,7 @@ async function buildCurrentReviewEvidence({
       return artifact;
     }),
   ].filter(Boolean);
-  const providerResult = await selectCurrentHeadProviderResult(artifacts);
+  const providerResult = await selectCurrentHeadProviderResult(artifacts, evidenceBudget);
   const providerFindings = providerResult.kind === "finding"
     ? {
         count: 1,
@@ -1649,7 +1733,7 @@ async function buildCurrentReviewEvidence({
   };
 }
 
-async function selectCurrentHeadProviderResult(artifacts) {
+async function selectCurrentHeadProviderResult(artifacts, evidenceBudget) {
   let ordered;
   try {
     ordered = sortCodexArtifactsNewestFirst(artifacts);
@@ -1699,7 +1783,11 @@ async function selectCurrentHeadProviderResult(artifacts) {
 
       let resolvedSha = artifact.headSha || "";
       if (artifact.commitRef) {
-        resolvedSha = await resolveReviewedCommit(artifact.commitRef, resolutionCache);
+        resolvedSha = await resolveReviewedCommit(
+          artifact.commitRef,
+          resolutionCache,
+          evidenceBudget,
+        );
       }
       if (resolvedSha === statusSha.toLowerCase()) {
         const unsupersededFinding = await firstUnsupersededOlderFinding(
@@ -1707,6 +1795,7 @@ async function selectCurrentHeadProviderResult(artifacts) {
           [...group.slice(groupIndex + 1), ...ordered.slice(index)],
           ancestryCache,
           resolutionCache,
+          evidenceBudget,
         );
         if (unsupersededFinding) {
           return unsupersededFinding;
@@ -1716,12 +1805,20 @@ async function selectCurrentHeadProviderResult(artifacts) {
           headSha: resolvedSha,
         };
       }
-      if (await commitIsAncestor(resolvedSha, statusSha.toLowerCase(), ancestryCache)) {
+      if (
+        await commitIsAncestor(
+          resolvedSha,
+          statusSha.toLowerCase(),
+          ancestryCache,
+          evidenceBudget,
+        )
+      ) {
         const unsupersededFinding = await firstUnsupersededOlderFinding(
           resolvedSha,
           [...group.slice(groupIndex + 1), ...ordered.slice(index)],
           ancestryCache,
           resolutionCache,
+          evidenceBudget,
         );
         if (unsupersededFinding) {
           return unsupersededFinding;
@@ -1753,34 +1850,54 @@ async function firstUnsupersededOlderFinding(
   olderArtifacts,
   ancestryCache,
   resolutionCache,
+  evidenceBudget,
 ) {
   const newerCleanHeads = [cleanHeadSha];
+  const unresolvedCleanArtifacts = [];
   for (const artifact of olderArtifacts) {
     if (artifact.kind === "clean") {
-      try {
-        const resolvedSha = artifact.commitRef
-          ? await resolveReviewedCommit(artifact.commitRef, resolutionCache)
-          : artifact.headSha;
-        if (/^[0-9a-f]{40}$/.test(resolvedSha || "")) {
-          newerCleanHeads.push(resolvedSha);
-        }
-      } catch {
-        // Older incomplete evidence cannot override a later valid current-head clean.
+      const declaredHead = artifact.headSha ||
+        (/^[0-9a-f]{40}$/.test(artifact.commitRef || "") ? artifact.commitRef : "");
+      if (declaredHead) {
+        newerCleanHeads.push(declaredHead);
+      } else if (artifact.commitRef) {
+        unresolvedCleanArtifacts.push(artifact);
       }
       continue;
     }
     if (artifact.kind !== "finding") {
       continue;
     }
-    let superseded = false;
-    for (const newerCleanHead of newerCleanHeads) {
-      if (
-        artifact.headSha === newerCleanHead ||
-        await commitIsAncestor(artifact.headSha, newerCleanHead, ancestryCache)
-      ) {
-        superseded = true;
-        break;
+
+    let superseded = await findingIsSupersededByCleanHeads(
+      artifact,
+      newerCleanHeads,
+      ancestryCache,
+      evidenceBudget,
+    );
+    while (!superseded && unresolvedCleanArtifacts.length > 0) {
+      const unresolvedClean = unresolvedCleanArtifacts.shift();
+      let resolvedSha;
+      try {
+        resolvedSha = await resolveReviewedCommit(
+          unresolvedClean.commitRef,
+          resolutionCache,
+          evidenceBudget,
+        );
+      } catch (error) {
+        if (error instanceof GateFailure && error.state === "pending") {
+          throw error;
+        }
+        // Deterministically invalid older evidence remains audit history only.
+        continue;
       }
+      newerCleanHeads.push(resolvedSha);
+      superseded = await findingIsSupersededByCleanHeads(
+        artifact,
+        [resolvedSha],
+        ancestryCache,
+        evidenceBudget,
+      );
     }
     if (!superseded) {
       return artifact;
@@ -1789,7 +1906,29 @@ async function firstUnsupersededOlderFinding(
   return null;
 }
 
-async function commitIsAncestor(baseSha, headSha, cache) {
+async function findingIsSupersededByCleanHeads(
+  finding,
+  cleanHeads,
+  ancestryCache,
+  evidenceBudget,
+) {
+  for (const cleanHead of cleanHeads) {
+    if (
+      finding.headSha === cleanHead ||
+      await commitIsAncestor(
+        finding.headSha,
+        cleanHead,
+        ancestryCache,
+        evidenceBudget,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function commitIsAncestor(baseSha, headSha, cache, evidenceBudget) {
   const cacheKey = `${baseSha}...${headSha}`;
   if (cache.has(cacheKey)) {
     return cache.get(cacheKey);
@@ -1800,6 +1939,8 @@ async function commitIsAncestor(baseSha, headSha, cache) {
     ({ data } = await request(
       "GET",
       `${repoPath}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
+      undefined,
+      { evidenceBudget },
     ));
   } catch (error) {
     if (error instanceof GateFailure && error.state === "pending") {
@@ -1842,7 +1983,7 @@ async function commitIsAncestor(baseSha, headSha, cache) {
   return isAncestor;
 }
 
-async function resolveReviewedCommit(commitRef, cache) {
+async function resolveReviewedCommit(commitRef, cache, evidenceBudget) {
   if (/^[0-9a-f]{40}$/.test(commitRef)) {
     return commitRef;
   }
@@ -1855,6 +1996,8 @@ async function resolveReviewedCommit(commitRef, cache) {
     ({ data } = await request(
       "GET",
       `${repoPath}/commits/${encodeURIComponent(commitRef)}`,
+      undefined,
+      { evidenceBudget },
     ));
   } catch (error) {
     if (error instanceof GateFailure && error.state === "pending") {
@@ -2117,27 +2260,63 @@ async function setCommitStatusIfNeeded(
 }
 
 async function loadLatestGateStatus() {
+  const statusReadBudget = new EvidenceWorkBudget({
+    maxItemsPerSnapshot: MAX_STATUS_READ_ITEMS,
+    maxResponseBytes: MAX_STATUS_READ_RESPONSE_BYTES,
+    maxResponseBytesPerWork: MAX_STATUS_READ_BYTES,
+    maxRequestAttemptsPerWork: MAX_STATUS_READ_REQUEST_ATTEMPTS,
+    maxConcurrency: 1,
+  });
+  const statusReadSnapshot = statusReadBudget.newSnapshot();
+  const path = `${repoPath}/commits/${encodeURIComponent(statusSha)}/statuses`;
+  let page = 1;
+
   try {
-    const statuses = await paginate(
-      `${repoPath}/commits/${encodeURIComponent(statusSha)}/statuses`,
-      { per_page: "100" },
-    );
-    return {
-      latest:
-        statuses.find((status) =>
-          status.context === STATUS_CONTEXT &&
-          status.creator?.type === "Bot" &&
-          status.creator?.login === "github-actions[bot]",
-        ) || null,
-      readFailed: false,
-    };
+    while (true) {
+      if (page > MAX_STATUS_READ_PAGES) {
+        statusReadBudget.fail(
+          `Commit-status read page budget exhausted after ${MAX_STATUS_READ_PAGES} pages.`,
+        );
+      }
+      const { data, headers } = await request(
+        "GET",
+        path,
+        {
+          per_page: String(STATUS_READ_PAGE_SIZE),
+          page: String(page),
+        },
+        { evidenceBudget: statusReadSnapshot },
+      );
+      if (!Array.isArray(data)) {
+        throw new Error("commit-status endpoint did not return an array");
+      }
+      statusReadBudget.consumeItems(
+        statusReadSnapshot,
+        data.length,
+        "commit-status history",
+      );
+      const latest = data.find((status) =>
+        status.context === STATUS_CONTEXT &&
+        status.creator?.type === "Bot" &&
+        status.creator?.login === "github-actions[bot]");
+      if (latest) {
+        return { latest, readFailed: false };
+      }
+      if (
+        !linkHeaderHasNext(headers.get("link")) &&
+        data.length < STATUS_READ_PAGE_SIZE
+      ) {
+        return { latest: null, readFailed: false };
+      }
+      page += 1;
+    }
   } catch (error) {
     console.warn(`failed to read current ${STATUS_CONTEXT} status: ${error.message}`);
     return { latest: null, readFailed: true };
   }
 }
 
-async function paginate(path, query) {
+async function paginate(path, query, { evidenceBudget = null } = {}) {
   const results = [];
   let page = 1;
   const perPage = Number(query.per_page || 100);
@@ -2154,10 +2333,12 @@ async function paginate(path, query) {
       "GET",
       path,
       { ...query, page: String(page) },
+      { evidenceBudget },
     );
     if (!Array.isArray(data)) {
       throw new Error(`paginated endpoint did not return an array: ${path}`);
     }
+    evidenceBudget?.work.consumeItems(evidenceBudget, data.length, path);
     results.push(...data);
     if (!linkHeaderHasNext(headers.get("link")) && data.length < perPage) {
       return results;
@@ -2177,7 +2358,7 @@ function linkHeaderHasNext(linkHeader) {
     );
 }
 
-async function loadReviewThreads() {
+async function loadReviewThreads(evidenceBudget) {
   const threads = [];
   const seenCursors = new Set();
   let after = null;
@@ -2191,12 +2372,16 @@ async function loadReviewThreads() {
         `GraphQL reviewThreads pagination exceeded ${MAX_GRAPHQL_PAGES} pages`,
       );
     }
-    const { data } = await graphqlRequest(REVIEW_THREADS_QUERY, {
-      owner: repo.owner,
-      repo: repo.name,
-      number: activePrNumber,
-      after,
-    });
+    const { data } = await graphqlRequest(
+      REVIEW_THREADS_QUERY,
+      {
+        owner: repo.owner,
+        repo: repo.name,
+        number: activePrNumber,
+        after,
+      },
+      { evidenceBudget, label: "GraphQL review threads" },
+    );
     pageCount += 1;
     const connection = data?.repository?.pullRequest?.reviewThreads;
     if (!connection) {
@@ -2212,9 +2397,27 @@ async function loadReviewThreads() {
       throw new Error("GraphQL reviewThreads connection did not return complete pageInfo");
     }
 
+    let embeddedCommentCount = 0;
+    for (const thread of connection.nodes) {
+      if (!Array.isArray(thread?.comments?.nodes)) {
+        throw new Error(
+          `GraphQL comments connection did not return nodes for thread ${thread?.id}`,
+        );
+      }
+      embeddedCommentCount += thread.comments.nodes.length;
+    }
+    evidenceBudget?.work.consumeItems(
+      evidenceBudget,
+      connection.nodes.length + embeddedCommentCount,
+      "GraphQL review threads and embedded comments",
+    );
     threads.push(...connection.nodes);
     if (!connection.pageInfo.hasNextPage) {
-      return Promise.all(threads.map((thread) => loadAllReviewThreadComments(thread)));
+      return mapWithConcurrency(
+        threads,
+        MAX_REVIEW_THREAD_COMMENT_CONCURRENCY,
+        (thread) => loadAllReviewThreadComments(thread, evidenceBudget),
+      );
     }
     const endCursor = connection.pageInfo.endCursor;
     if (typeof endCursor !== "string" || endCursor.length === 0) {
@@ -2228,7 +2431,7 @@ async function loadReviewThreads() {
   }
 }
 
-async function loadAllReviewThreadComments(thread) {
+async function loadAllReviewThreadComments(thread, evidenceBudget) {
   let connection = thread.comments;
   if (!connection) {
     throw new Error(`GraphQL comments query did not return a connection for thread ${thread.id}`);
@@ -2264,10 +2467,17 @@ async function loadAllReviewThreadComments(thread) {
         `GraphQL comments pagination exceeded ${MAX_GRAPHQL_PAGES} pages for thread ${thread.id}`,
       );
     }
-    const { data } = await graphqlRequest(REVIEW_THREAD_COMMENTS_QUERY, {
-      threadId: thread.id,
-      after,
-    });
+    const { data } = await graphqlRequest(
+      REVIEW_THREAD_COMMENTS_QUERY,
+      {
+        threadId: thread.id,
+        after,
+      },
+      {
+        evidenceBudget,
+        label: `GraphQL comments for review thread ${thread.id}`,
+      },
+    );
     pageCount += 1;
     connection = data?.node?.comments;
     if (!connection) {
@@ -2283,7 +2493,12 @@ async function loadAllReviewThreadComments(thread) {
       throw new Error(`GraphQL comments connection did not return complete pageInfo for thread ${thread.id}`);
     }
 
-    nodes.push(...(connection.nodes || []));
+    evidenceBudget?.work.consumeItems(
+      evidenceBudget,
+      connection.nodes.length,
+      `GraphQL comments for review thread ${thread.id}`,
+    );
+    nodes.push(...connection.nodes);
     if (
       connection.pageInfo.hasNextPage &&
       (
@@ -2313,7 +2528,7 @@ async function request(
   method,
   path,
   bodyOrQuery,
-  { retryTransient = true } = {},
+  { retryTransient = true, evidenceBudget = null } = {},
 ) {
   for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
     const url = new URL(`${config.apiUrl}${path}`);
@@ -2339,8 +2554,14 @@ async function request(
     let response;
     let text;
     try {
-      ({ response, text } = await fetchWithDeadline(url, options));
+      ({ response, text } = await fetchWithDeadline(url, options, {
+        evidenceBudget,
+        label: `${method} ${url.pathname}`,
+      }));
     } catch (error) {
+      if (error instanceof GateFailure) {
+        throw error;
+      }
       if (
         retryTransient &&
         attempt < MAX_REQUEST_ATTEMPTS &&
@@ -2448,7 +2669,11 @@ async function request(
   throw new Error(`${method} ${path} exceeded retry budget`);
 }
 
-async function graphqlRequest(query, variables) {
+async function graphqlRequest(
+  query,
+  variables,
+  { evidenceBudget = null, label = "GraphQL review evidence" } = {},
+) {
   for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
     let response;
     let text;
@@ -2463,8 +2688,11 @@ async function graphqlRequest(query, variables) {
           "X-GitHub-Api-Version": "2022-11-28",
         },
         body: JSON.stringify({ query, variables }),
-      }));
+      }, { evidenceBudget, label }));
     } catch (error) {
+      if (error instanceof GateFailure) {
+        throw error;
+      }
       if (attempt < MAX_REQUEST_ATTEMPTS) {
         await sleepBeforeRetry(
           `retrying GraphQL request after transport error: ${error.message}`,
@@ -2659,25 +2887,109 @@ function graphqlEndpoint(apiUrl, serverUrl) {
   return `${apiUrl}/graphql`;
 }
 
-async function fetchWithDeadline(input, options) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => {
-    controller.abort(
-      new Error(
-        `GitHub request exceeded the ${Math.round(config.requestTimeoutMs / 1000)}s attempt deadline`,
-      ),
-    );
-  }, config.requestTimeoutMs);
+async function fetchWithDeadline(
+  input,
+  options,
+  { evidenceBudget = null, label = "GitHub evidence response" } = {},
+) {
+  let controller = null;
+  let timeout = null;
+  let releaseRequestSlot = () => {};
+  let unregisterAbortController = () => {};
 
   try {
+    if (evidenceBudget) {
+      releaseRequestSlot = await evidenceBudget.work.acquireRequest(label);
+    }
+    controller = new AbortController();
+    if (evidenceBudget) {
+      unregisterAbortController =
+        evidenceBudget.work.registerAbortController(controller);
+    }
+    timeout = setTimeout(() => {
+      controller.abort(
+        new Error(
+          `GitHub request exceeded the ${Math.round(config.requestTimeoutMs / 1000)}s attempt deadline`,
+        ),
+      );
+    }, config.requestTimeoutMs);
     const response = await fetch(input, {
       ...options,
       signal: controller.signal,
     });
-    const text = await response.text();
+    const contentLengthHeader = response.headers.get("content-length");
+    const contentEncoding = response.headers.get("content-encoding");
+    if (
+      evidenceBudget &&
+      (!contentEncoding || contentEncoding.trim().toLowerCase() === "identity") &&
+      /^\d+$/.test(String(contentLengthHeader || ""))
+    ) {
+      evidenceBudget.work.rejectOversizedContentLength(
+        Number(contentLengthHeader),
+        label,
+      );
+    }
+    const text = await readResponseText(
+      response,
+      evidenceBudget,
+      label,
+      controller,
+    );
     return { response, text };
+  } catch (error) {
+    if (evidenceBudget?.work.failure) {
+      throw evidenceBudget.work.failure;
+    }
+    if (error instanceof GateFailure && controller && !controller.signal.aborted) {
+      controller.abort(error);
+    }
+    throw error;
   } finally {
-    clearTimeout(timeout);
+    unregisterAbortController();
+    releaseRequestSlot();
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+async function readResponseText(response, evidenceBudget, label, controller) {
+  if (!evidenceBudget || !response.body?.getReader) {
+    const text = await response.text();
+    if (evidenceBudget) {
+      const byteCount = Buffer.byteLength(text, "utf8");
+      evidenceBudget.work.consumeResponseBytes(byteCount, byteCount, label);
+    }
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let responseByteCount = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      const byteCount = value?.byteLength || 0;
+      responseByteCount += byteCount;
+      evidenceBudget.work.consumeResponseBytes(
+        byteCount,
+        responseByteCount,
+        label,
+      );
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    if (!controller.signal.aborted) {
+      controller.abort(error);
+    }
+    throw error;
   }
 }
 
