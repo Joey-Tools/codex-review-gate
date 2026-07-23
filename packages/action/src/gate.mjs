@@ -1667,10 +1667,18 @@ function writeAiReviewDisclosureSummary(marker) {
 }
 
 function headStartedAtForState(state, fallback) {
-  const sameHead = [...(state.history || [])]
+  const latestForHead = [...(state.history || [])]
     .reverse()
-    .find((marker) => marker.headSha === statusSha && marker.headStartedAt);
-  return sameHead?.headStartedAt || state.activeMarker?.headStartedAt || fallback;
+    .find((marker) => marker.headSha === statusSha);
+  const latestOutcome = latestForHead?.outcome || latestForHead?.state;
+  if (latestOutcome === "passed" || latestOutcome === "state_lost") {
+    return fallback;
+  }
+  return (
+    latestForHead?.headStartedAt ||
+    state.activeMarker?.headStartedAt ||
+    fallback
+  );
 }
 
 async function saveState(state, stateComment) {

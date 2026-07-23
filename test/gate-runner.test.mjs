@@ -1275,6 +1275,8 @@ test("scheduled scan retries missed acknowledgement with same-head backoff", asy
     assert.equal(state.history.at(-1).outcome, "missed_ack");
     assert.equal(state.activeMarker.id, String(markerComments.at(-1).id));
     assert.equal(state.activeMarker.ackTimeoutSeconds, 1200);
+    assert.equal(state.activeMarker.headStartedAt, "2026-05-14T09:50:00Z");
+    assert.equal(state.activeMarker.maxWaitDeadlineAt, "2026-05-14T11:50:00.000Z");
   });
 });
 
@@ -1306,6 +1308,8 @@ test("scheduled scan retries stalled WaitingResult markers", async () => {
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.history.at(-1).outcome, "stalled");
     assert.equal(state.activeMarker.state, "waiting_ack");
+    assert.equal(state.activeMarker.headStartedAt, "2026-05-14T08:50:00Z");
+    assert.equal(state.activeMarker.maxWaitDeadlineAt, "2026-05-14T10:50:00.000Z");
     assert.equal(harness.statuses.at(-1).body.state, "pending");
   });
 });
@@ -1341,6 +1345,34 @@ test("scheduled scan fails a marker that exceeds the max wait deadline", async (
     assert.equal(state.activeMarker, null);
     assert.equal(state.lastStatus.state, "failure");
     assert.equal(state.history.at(-1).outcome, "timed_out");
+  });
+});
+
+test("manual retry after failed findings preserves the same-head max-wait budget", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({
+      id: 2000,
+      currentHeadFindingIds: [],
+      headStartedAt: "2026-05-14T09:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(harness.findMarkerComments().length, 2);
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker.state, "waiting_ack");
+    assert.equal(state.activeMarker.headStartedAt, "2026-05-14T09:00:00Z");
+    assert.equal(
+      state.activeMarker.maxWaitDeadlineAt,
+      "2026-05-14T11:00:00.000Z",
+    );
   });
 });
 
@@ -1533,6 +1565,8 @@ test("state-loss recovery records old marker and creates a fresh marker without 
       id: 2000,
       headSha: HEAD_SHA,
       createdAt: "2026-05-14T09:55:00Z",
+      headStartedAt: "2026-05-14T07:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T09:00:00Z",
       baseline: {
         plusOne: null,
         eyes: null,
@@ -1562,8 +1596,19 @@ test("state-loss recovery records old marker and creates a fresh marker without 
 
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.history.at(-1).outcome, "state_lost");
+    assert.equal(state.history.at(-1).headStartedAt, "2026-05-14T07:00:00Z");
     assert.equal(state.activeMarker.state, "waiting_ack");
     assert.equal(state.activeMarker.baseline.completionComment, null);
+    assert.equal(
+      Date.parse(state.activeMarker.headStartedAt) >
+        Date.parse("2026-05-14T09:00:00Z"),
+      true,
+    );
+    assert.equal(
+      Date.parse(state.activeMarker.maxWaitDeadlineAt) -
+        Date.parse(state.activeMarker.headStartedAt),
+      7_200_000,
+    );
   });
 });
 
@@ -4219,9 +4264,15 @@ test("passed-marker reassertion fails closed when the trusted marker lineage is 
   });
 });
 
-test("an unauthorized passed clean starts and preserves a fresh marker across scheduled runs", async () => {
+test("authorization recovery starts a new max-wait cycle and processes the next ack", async () => {
   await withHarness(async (harness) => {
-    harness.seedSuccessfulState();
+    const recoveryStartedAt = new Date(harness.now).toISOString();
+    const recoveryMaxWaitDeadlineAt =
+      new Date(harness.now + 7_200_000).toISOString();
+    harness.seedSuccessfulState({
+      headStartedAt: "2026-05-14T07:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T09:00:00Z",
+    });
     harness.issueComments.push(codexCleanComment(2002, "2026-05-14T10:01:01Z"));
     harness.commitStatuses.push({
       sha: HEAD_SHA,
@@ -4246,6 +4297,19 @@ test("an unauthorized passed clean starts and preserves a fresh marker across sc
     );
     assert.equal(state.activeMarker.state, "waiting_ack");
     assert.equal(state.activeMarker.baseline.completionComment.id, "2002");
+    assert.equal(state.history.at(-1).headStartedAt, "2026-05-14T07:00:00Z");
+    assert.equal(state.activeMarker.headStartedAt, recoveryStartedAt);
+    assert.equal(
+      state.activeMarker.maxWaitDeadlineAt,
+      recoveryMaxWaitDeadlineAt,
+    );
+    const freshMarkerId = state.activeMarker.id;
+    harness.commentReactions.set(freshMarkerId, [{
+      id: 5001,
+      content: "eyes",
+      created_at: "2026-05-14T10:01:02Z",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    }]);
 
     const secondResult = await harness.runGate({
       eventName: "schedule",
@@ -4259,8 +4323,18 @@ test("an unauthorized passed clean starts and preserves a fresh marker across sc
     );
     assert.equal(harness.findMarkerComments().length, 2);
     state = parseStateCommentBody(harness.findStateComment().body);
-    assert.equal(state.activeMarker.state, "waiting_ack");
+    assert.equal(state.activeMarker.state, "waiting_result");
+    assert.equal(state.activeMarker.observedEyes.id, "5001");
+    assert.equal(state.activeMarker.headStartedAt, recoveryStartedAt);
+    assert.equal(
+      state.activeMarker.maxWaitDeadlineAt,
+      recoveryMaxWaitDeadlineAt,
+    );
     assert.equal(state.activeMarker.baseline.completionComment.id, "2002");
+    assert.equal(
+      state.history.some((marker) => marker.outcome === "timed_out"),
+      false,
+    );
   });
 });
 
@@ -4857,6 +4931,8 @@ class GateHarness {
     currentHeadFindingIds = ["3001"],
     rejectedRecoveryCompletions = [],
     latestRejectedRecoveryAt = null,
+    headStartedAt = "2026-05-14T09:55:00Z",
+    maxWaitDeadlineAt = "2026-05-14T11:55:00Z",
   }) {
     this.pullRequest = this.pullRequestForHead(pullHead);
     const failedMarker = {
@@ -4880,6 +4956,8 @@ class GateHarness {
       ackTimeoutSeconds: 300,
       createdAt: "2026-05-14T09:55:00Z",
       closedAt,
+      headStartedAt,
+      maxWaitDeadlineAt,
       currentHeadFindingIds,
       ...(rejectedRecoveryCompletions.length > 0 ? { rejectedRecoveryCompletions } : {}),
       ...(latestRejectedRecoveryAt ? { latestRejectedRecoveryAt } : {}),
@@ -4966,6 +5044,8 @@ class GateHarness {
   seedSuccessfulState({
     providerId = 2001,
     providerCreatedAt = "2026-05-14T10:00:00Z",
+    headStartedAt = "2026-05-14T09:55:00Z",
+    maxWaitDeadlineAt = "2026-05-14T11:55:00Z",
   } = {}) {
     const passedMarker = {
       version: 1,
@@ -4987,6 +5067,8 @@ class GateHarness {
       outcome: "passed",
       createdAt: "2026-05-14T09:55:00Z",
       closedAt: "2026-05-14T10:00:01Z",
+      headStartedAt,
+      maxWaitDeadlineAt,
       observedProviderResult: {
         source: "issue-comment",
         id: String(providerId),
@@ -5027,6 +5109,8 @@ class GateHarness {
     providerSource,
     providerId,
     providerCreatedAt = "2026-05-14T10:00:00Z",
+    headStartedAt = "2026-05-14T09:55:00Z",
+    maxWaitDeadlineAt = "2026-05-14T11:55:00Z",
   }) {
     const passedMarker = {
       version: 1,
@@ -5048,6 +5132,8 @@ class GateHarness {
       outcome: "passed",
       createdAt: "2026-05-14T09:55:00Z",
       closedAt: "2026-05-14T10:00:01Z",
+      headStartedAt,
+      maxWaitDeadlineAt,
       observedCompletionComment:
         providerSource === "issue-comment"
           ? {
@@ -5094,7 +5180,14 @@ class GateHarness {
     this.issueComments.push(markerCommentFor(passedMarker));
   }
 
-  seedMarkerOnly({ id, headSha, createdAt, baseline }) {
+  seedMarkerOnly({
+    id,
+    headSha,
+    createdAt,
+    baseline,
+    headStartedAt = createdAt,
+    maxWaitDeadlineAt = "2026-05-14T11:55:00Z",
+  }) {
     this.issueComments.push(markerCommentFor({
       version: 1,
       id: String(id),
@@ -5108,6 +5201,8 @@ class GateHarness {
       state: "waiting_ack",
       ackTimeoutSeconds: 300,
       createdAt,
+      headStartedAt,
+      maxWaitDeadlineAt,
     }));
     this.nextCommentId = Math.max(this.nextCommentId, id + 1);
   }
