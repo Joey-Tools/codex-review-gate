@@ -30,5 +30,6 @@ superseded_by:
 ## Evidence
 - Hagemony workflow run `30112606266` loaded action commit `11d400902175edd773340dc9ec00f8dd421feff7`, selected the official current-head clean comment, but wrote `Timed out waiting for Codex review signal` before reconciliation.
 - The affected head is `3722827ead17cab8bfe97763b87674acc5806570`; official clean issue comment `5072022127` is newer than its trusted request marker and binds the reviewed short SHA to that exact head.
+- Bootstrap PR #23 added the exact observed `Keep them coming!` variant to the trusted v1.3.2 finite grammar and was squash-merged as `2a3c65bf2c99c055cce78f2459a3feccd526384b`; its synchronized action subtree is `f2b53c53145bff3a43baf6f53388dba2feea937c`.
 - The final v1.3.3 worktree passes `npm run check`, the complete `npm test -- --test-reporter=dot` suite, `git diff --check`, and project-journal validation.
 - The structural tagline update passes focused `core` and `gate-runner` tests, `npm run check`, and `git diff --check`; the gate-runner clean fixture uses the supported punctuation variant `Keep them coming!`.
