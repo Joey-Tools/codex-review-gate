@@ -2293,13 +2293,78 @@ test("pending provider findings synthesize failed lineage for every closed wait 
 
         assert.equal(result.code, 0, result.stderr);
         assert.equal(harness.statuses.at(-1).body.state, "failure");
+        assert.equal(markerCommentWrites(harness), 0);
         const state = parseStateCommentBody(harness.findStateComment().body);
         assert.equal(state.history.at(-2).outcome, outcome);
         assert.equal(state.history.at(-1).outcome, "failed_findings");
+        assert.equal(state.history.at(-1).id, "2000");
         assert.equal(state.history.at(-1).reconciledFromOutcome, outcome);
         assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
       });
     });
+  }
+});
+
+test("unrecoverable retry markers create a fresh marker before failed findings", async (t) => {
+  for (const outcome of ["missed_ack", "stalled"]) {
+    for (const mutation of ["missing", "lineage", "baseline"]) {
+      await t.test(`${outcome} ${mutation}`, async () => {
+        await withHarness(async (harness) => {
+          harness.seedHistoryOnlyRetryState({
+            id: 2000,
+            outcome,
+            headStartedAt: "2026-05-14T09:00:00Z",
+            maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+          });
+          const liveComment = harness.findMarkerComments()[0];
+          if (mutation === "missing") {
+            harness.issueComments = harness.issueComments.filter(
+              (comment) => comment.id !== liveComment.id,
+            );
+          } else {
+            const liveMarker = parseMarkerCommentBody(liveComment.body);
+            Object.assign(liveComment, markerCommentFor({
+              ...liveMarker,
+              id: String(liveComment.id),
+              url: liveComment.html_url,
+              createdAt: liveComment.created_at,
+              ...(mutation === "lineage" ? { runId: "forged-run" } : {}),
+              ...(mutation === "baseline"
+                ? {
+                    baseline: {
+                      ...liveMarker.baseline,
+                      completionComment: {
+                        id: "1999",
+                        createdAt: "2026-05-14T09:54:00Z",
+                      },
+                    },
+                  }
+                : {}),
+            }));
+          }
+          harness.reviewComments.push(currentHeadInlineFinding(3001));
+          harness.reviewThreads.push(unresolvedThread(3001));
+
+          const result = await harness.runGate({
+            eventName: "schedule",
+            event: {},
+          });
+
+          assert.equal(result.code, 0, result.stderr);
+          assert.equal(harness.statuses.at(-1).body.state, "failure");
+          assert.equal(markerCommentWrites(harness), 1);
+          const freshMarkerComment = harness.findMarkerComments().at(-1);
+          const state = parseStateCommentBody(harness.findStateComment().body);
+          assert.equal(state.activeMarker, null);
+          assert.equal(state.history.at(-2).outcome, outcome);
+          assert.equal(state.history.at(-1).outcome, "failed_findings");
+          assert.equal(state.history.at(-1).id, String(freshMarkerComment.id));
+          assert.notEqual(state.history.at(-1).id, "2000");
+          assert.equal(state.history.at(-1).reconciledFromOutcome, undefined);
+          assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
+        });
+      });
+    }
   }
 });
 

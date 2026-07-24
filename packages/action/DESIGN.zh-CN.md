@@ -471,16 +471,19 @@ Accepted provider evidence 按 channel 校验：
 - Clean issue comment 使用封闭的结构 grammar：首行以 exact
   `Codex Review: Didn't find any major issues.` 开始，之后可以直接结束，也可以用
   恰好一个 ASCII space 分隔一个 nonempty、trimmed、同首行 tagline。Tagline 只是
-  presentation field，不是 evidence field；它最多 160 个 UTF-16 code units 和 80 个
-  grapheme clusters，内部 whitespace 只能是 ASCII space。Control 与 private-use
-  characters、unpaired surrogate code units、bidi controls 与不可见 formatting
-  均拒绝。Default-ignorable code point 只有在整个 grapheme 都是 RGI emoji 时才
-  接受；format scalars 中唯一例外是 RGI emoji ZWJ grapheme 内的 ZWJ。
-  Markdown/HTML markup、URL、backtick、`@codex`、
-  clean-result schema labels，以及保守识别出的明显 actionable 或 contradictory prose
-  也会拒绝。未知但 benign 的 presentation prose、标点、`:rocket:` / `:+1:` shortcode
-  和符合上述 format 约束的 RGI emoji grapheme 可以通过；这些 lexical guards 不声称
-  可以完整理解或证明自然语言语义。
+  presentation field，不是 evidence field；它最多 160 个 UTF-16 code units，并且必须
+  exact 匹配以下一种封闭 template：
+  - 一个已知 benign stem 加恰好一个结尾 `.`、`!` 或 `?`。Stem 只能是
+    `Nice work`、`Chef's kiss`、`What shall we delve into next`、
+    `Already looking forward to the next diff`、`Keep them coming`、`Swish`、
+    `Another round soon, please`、`Breezy`、`Can't wait for the next one`、
+    `More of your lovely PRs please`、`Bravo`、`Keep it up`、`Delightful`、
+    `Hooray` 或 `You're on a roll`；
+  - exact `:rocket:`、`:tada:` 或 `:+1:`；或
+  - 一到八个 exact RGI emoji graphemes；它们可以相邻，或用一个 ASCII space 分隔。
+  所有未知 prose 都 fail closed，包括未知 positive prose、actionable language 和
+  contradictory language。Parser 不尝试证明自然语言语义；tagline 只用于
+  presentation，不能提供 clean/finding evidence。
 - 首行之后必须有且仅有一个 10 或 40 hex 的 `**Reviewed commit:**` marker，并且只能
   没有 suffix，或带 exact official disclosure；任意 trailing prose 均拒绝。Finding
   signals 始终优先，tagline 不能提供 clean/finding evidence，也不能覆盖这些 signals。

@@ -537,13 +537,10 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     headChanged,
     stateNeedsFreshMarker,
   });
-  const latestCurrentHeadMarker = latestMarkerForCurrentHead(state);
-  const latestCurrentHeadOutcome =
-    latestCurrentHeadMarker?.outcome || latestCurrentHeadMarker?.state;
   const reconcileFindingsAfterFreshHeadMarker =
     freshHeadMarkerAllowed &&
     snapshot.findings.count > 0 &&
-    !RECOVERABLE_CLOSED_WAIT_OUTCOMES.has(latestCurrentHeadOutcome);
+    !recoverableClosedWaitMarker(state, snapshot);
 
   if (
     !reconcileFindingsAfterFreshHeadMarker &&

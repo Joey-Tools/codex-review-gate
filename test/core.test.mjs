@@ -1013,44 +1013,54 @@ test("requires canonical positive integer IDs for provider terminal artifacts", 
   }
 });
 
-test("accepts observed and unknown benign clean taglines as presentation text", () => {
+test("accepts known benign clean tagline stems with one final punctuation mark", () => {
+  const stems = [
+    "Nice work",
+    "Chef's kiss",
+    "What shall we delve into next",
+    "Already looking forward to the next diff",
+    "Keep them coming",
+    "Swish",
+    "Another round soon, please",
+    "Breezy",
+    "Can't wait for the next one",
+    "More of your lovely PRs please",
+    "Bravo",
+    "Keep it up",
+    "Delightful",
+    "Hooray",
+    "You're on a roll",
+  ];
+
+  for (const stem of stems) {
+    for (const punctuation of [".", "!", "?"]) {
+      const tagline = `${stem}${punctuation}`;
+      const artifact = parseCleanTagline(tagline, { disclosure: true });
+      assert.equal(artifact.kind, "clean", tagline);
+    }
+  }
+
   for (const tagline of [
-    "Nice work!",
-    "Chef's kiss.",
-    "What shall we delve into next?",
-    "Already looking forward to the next diff.",
-    "Keep them coming.",
-    ":rocket:",
-    ":tada:",
-    "Swish.",
-    "Another round soon, please!",
-    "Breezy!",
-    "Can't wait for the next one!",
-    "More of your lovely PRs please.",
-    "Bravo.",
-    "Swish!",
-    "Keep it up!",
-    "Delightful!",
-    "Hooray!",
-    "You're on a roll.",
-    ":+1:",
     "Keep them coming!",
     "Another round soon, please.",
-    "Excellent—what's next?",
-    "Ship-shape?",
-    "Consider me impressed!",
-    "Great work but the update is complete!",
-    "Update complete!",
-    "Change looks excellent!",
-    "Fix landed—great work!",
-    "太棒了！",
-    "👩🏽‍💻 Ready for another round!",
-    "🏳️‍🌈 Wonderful!",
-    "👨‍❤️‍💋‍👨 Delightful!",
-    "Cafe\u0301, ❤️ 1️⃣ ❤️‍🔥",
   ]) {
-    const artifact = parseCleanTagline(tagline, { disclosure: true });
-    assert.equal(artifact.kind, "clean", tagline);
+    assert.equal(parseCleanTagline(tagline).kind, "clean", tagline);
+  }
+});
+
+test("accepts exact shortcodes and bounded RGI emoji presentation", () => {
+  for (const tagline of [
+    ":rocket:",
+    ":tada:",
+    ":+1:",
+    "🚀",
+    "🚀🎉",
+    "🚀 🎉",
+    "👩🏽‍💻 🏳️‍🌈 ❤️‍🔥 1️⃣",
+    "🚀".repeat(8),
+    Array(8).fill("🚀").join(" "),
+  ]) {
+    assert.equal(parseCleanTagline(tagline).kind, "clean", tagline);
   }
 });
 
@@ -1075,36 +1085,22 @@ test("enforces clean tagline separator, trimming, and one-line structure", () =>
   }
 });
 
-test("enforces clean tagline UTF-16 and grapheme budgets", () => {
-  const exactCodeUnitAndGraphemeLimit = `${"🚀".repeat(79)}a\u0301`;
-  assert.equal(exactCodeUnitAndGraphemeLimit.length, 160);
-  assert.equal(parseCleanTagline(exactCodeUnitAndGraphemeLimit).kind, "clean");
-
-  const overCodeUnitLimit = `${exactCodeUnitAndGraphemeLimit}\u0301`;
-  assert.equal(overCodeUnitLimit.length, 161);
-  assert.equal(parseCleanTagline(overCodeUnitLimit).kind, "malformed");
-
-  assert.equal(parseCleanTagline("a".repeat(80)).kind, "clean");
-  assert.equal(parseCleanTagline("a".repeat(81)).kind, "malformed");
+test("rejects oversized and over-budget clean taglines", () => {
+  const oversized = "a".repeat(161);
+  assert.equal(oversized.length, 161);
+  assert.equal(parseCleanTagline(oversized).kind, "malformed");
+  assert.equal(parseCleanTagline("🚀".repeat(9)).kind, "malformed");
 });
 
-test("rejects unsafe Unicode scalars and format controls in clean taglines", () => {
+test("rejects non-RGI or noncanonical emoji presentation", () => {
   for (const tagline of [
-    "Nice\u0000work!",
-    "Nice\uE000work!",
-    "Nice\uD800work!",
-    "Nice\uDC00work!",
-    "Nice\u202Ework!",
-    "Nice\u2060work!",
-    "Nice\u200Bwork!",
-    "Nice\u200Dwork!",
-    "😀‍😀 Nice work!",
-    "❤︎‍🔥 Nice work!",
-    "a\u034Fb",
-    "\u3164",
-    "\uFE0F",
-    "\u0301",
-    "\u0378",
+    "🚀  🎉",
+    "🚀\u00A0🎉",
+    "😀‍😀",
+    "❤︎‍🔥",
+    "🚀 Great work!",
+    ":rocket:!",
+    ":smile:",
   ]) {
     assert.equal(
       parseCleanTagline(tagline).kind,
@@ -1112,15 +1108,22 @@ test("rejects unsafe Unicode scalars and format controls in clean taglines", () 
       JSON.stringify(tagline),
     );
   }
-
-  assert.equal(
-    parseCleanTagline("👩🏽‍💻 Ready for another round!").kind,
-    "clean",
-  );
 });
 
-test("rejects markup, URLs, commands, and schema tokens in clean taglines", () => {
+test("rejects unknown prose and non-template presentation content", () => {
   for (const tagline of [
+    "Investigate parser.",
+    "Critical vulnerability exists!",
+    "Fantastic work!",
+    "Update complete!",
+    "Excellent—what's next?",
+    "太棒了！",
+    "Nice work",
+    "Nice work!!",
+    "nice work!",
+    "Keep them coming…",
+    "Please fix the parser.",
+    "One issue remains.",
     "**Nice work!**",
     "<strong>Nice work!</strong>",
     "[Nice work!](https://example.com)",
@@ -1131,21 +1134,6 @@ test("rejects markup, URLs, commands, and schema tokens in clean taglines", () =
     "Coverage: `parser`.",
     "Reviewed commit: abcdef1234.",
     "No findings.",
-  ]) {
-    assert.equal(parseCleanTagline(tagline).kind, "malformed", tagline);
-  }
-});
-
-test("rejects clearly actionable or contradictory clean taglines", () => {
-  for (const tagline of [
-    "Please fix the parser.",
-    "Fix the parser.",
-    "Update this parser.",
-    "Verify it.",
-    "Consider adding a regression test.",
-    "The parser should be updated.",
-    "One issue remains.",
-    "Great work but please verify the fallback.",
   ]) {
     assert.equal(parseCleanTagline(tagline).kind, "malformed", tagline);
   }

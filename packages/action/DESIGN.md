@@ -550,24 +550,30 @@ Accepted provider evidence is channel-specific:
   ignored.
 
 Clean provider artifacts use a closed structural grammar. The optional tagline
-is a bounded presentation field, not an evidence field or a claim that arbitrary
-natural-language meaning can be proved:
+is a bounded presentation field, never an open natural-language field or an
+evidence field:
 
 - A clean issue comment starts with exact
   `Codex Review: Didn't find any major issues.`. It may end there or append one
   nonempty, trimmed tagline on the same first line, separated by exactly one
-  ASCII space. The tagline is limited to 160 UTF-16 code units and 80 grapheme
-  clusters. Whitespace inside it must be ASCII space. Control and private-use
-  characters, unpaired surrogate code units, bidi controls, and invisible
-  formatting are rejected. A default-ignorable code point is accepted only
-  when its whole grapheme is RGI emoji; among format scalars, only ZWJ is
-  accepted, and only inside an RGI emoji ZWJ grapheme. Markdown or HTML markup,
-  URLs, backticks, `@codex`, clean-result
-  schema labels, and conservatively recognised actionable or contradictory
-  prose are also rejected. Unknown benign presentation prose, punctuation,
-  emoji shortcodes such as `:rocket:` and `:+1:`, and RGI emoji graphemes
-  compatible with these format constraints remain admissible. These lexical
-  guards intentionally do not claim complete natural-language understanding.
+  ASCII space. The tagline is limited to 160 UTF-16 code units and must match
+  exactly one of these closed presentation templates:
+
+  - one known benign stem followed by exactly one final `.`, `!`, or `?`; the
+    stems are `Nice work`, `Chef's kiss`,
+    `What shall we delve into next`,
+    `Already looking forward to the next diff`, `Keep them coming`, `Swish`,
+    `Another round soon, please`, `Breezy`,
+    `Can't wait for the next one`, `More of your lovely PRs please`, `Bravo`,
+    `Keep it up`, `Delightful`, `Hooray`, and `You're on a roll`;
+  - exact `:rocket:`, `:tada:`, or `:+1:`; or
+  - one to eight exact RGI emoji graphemes, adjacent or separated by one ASCII
+    space.
+
+  All unknown prose fails closed, including unknown positive prose and
+  actionable or contradictory language. The parser does not attempt to prove
+  natural-language meaning. The tagline is presentation only and cannot supply
+  clean or finding evidence.
 
   After the first line, the comment contains exactly one
   `**Reviewed commit:**` line with a 10- or 40-hex commit reference. It then
