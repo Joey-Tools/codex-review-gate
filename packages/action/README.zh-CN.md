@@ -31,7 +31,7 @@ Runner 实现了 event-driven serialized marker flow：
 - 验证官方 provider identity，并把 reviews、inline comments 和 top-level results 绑定到其 reviewed commit。
 - 只通过封闭的 provider grammar 接受 clean result；finding-shaped content 的优先级高于看似 clean 的 lead 或 `APPROVED` state。
 - 对 configured provider 以 `Codex Review` 开头且可带 optional Markdown heading 和 emoji 的 comment，先作为宽泛 terminal candidate。Exact one-line `in progress` / `still in progress` message 会被忽略，末尾可以是句点，或冒号加 1–160 个 metadata 字符；较新的未知 candidate（例如 `completed`）则按 malformed/fail-closed 处理，而不会静默忽略。
-- 每次 reconciliation 都重新构建完整 evidence snapshot。历史 `pending`、`error`，以及更早的 API、分页、身份或 commit 解析不完整结果只作审计，不会成为 sticky blockers。
+- 每次 reconciliation 都重新构建完整 evidence snapshot。历史 `pending`、`error`、已关闭的等待结果，以及更早的 API、分页、身份或 commit 解析不完整结果只作审计，不会成为 sticky blockers。
 - 把每个 PR 的 evidence work 限制为跨 snapshots 和 retries 共享的 64 MiB 与 1,024 次 fetch attempts；同时限制每个 response 流式读取最多 8 MiB、每个 snapshot 最多 20,000 items，以及 HTTP 和 review-thread 补全各最多四路并发。
 - 用 hidden metadata 维护一个可信 sticky PR state comment。
 - 串行维护受控 `@codex review` marker comments。
@@ -39,7 +39,10 @@ Runner 实现了 event-driven serialized marker flow：
 - 把 Codex reactions 只作为诊断信号。
 - 用 scheduled 或 manual resume runs 重试未 ack 或 stalled 的 markers。
 - 当前 reconciliation 无法完整加载或校验所需 evidence 时 fail closed。暂时性读取重试耗尽写入 `pending`；确定性的 provider identity、schema 或 commit 冲突写入 `error`；两者都会使 workflow 失败。
-- 如果 otherwise clean 的 current-head result 缺少 active-marker、精确 passed-marker reassertion 或 failed-findings recovery lineage 授权，则主动降为 `pending`。
+- 在应用 marker 等待 deadline 前先 reconcile 完整 review evidence。即使 active marker 在 reconciliation 期间到达 deadline，只要 clean result 稳定且已授权，仍由 clean result 胜出。
+- `missed_ack`、`stalled` 或 `timed_out` 等待结束后观察到的 clean result，只有在 latest same-head historical marker 仍精确匹配 trusted live marker，且该 result 相对 marker 创建时间与 baseline 是新 transition 时才可恢复；这个恢复不会再发送 review 请求。
+- 保留 timeout 来源，避免把 `failed_findings` 重新标记为 closed wait 后旁路其 recovery switch、event 或 cutoff 规则。
+- 如果 otherwise clean 的 current-head result 缺少 active-marker、closed-wait-marker、精确 passed-marker reassertion 或 failed-findings recovery lineage 授权，则主动降为 `pending`。
 - 写入 success 前，先缓存同一 context 的 newest live status 及其 producer，再验证 PR lifecycle 和 head，加载 final complete snapshot，并在需要时执行有界 whole-snapshot orphan reload；之后不再读取 status，只做 deduplication，并在需要时立即 POST success。
 - 只有同一 context 的 newest record 已是目标 state，且 producer exact 为 `github-actions[bot]` / `Bot` 时才去重；external 或缺失 producer 不能让 gate 回退采用更旧的 trusted status。
 - 只有 v1.2 passed marker 的 exact legacy result identity、trusted live marker、baseline 与当前 strict clean artifact 全部匹配时才安全升级；否则要求 fresh marker。

@@ -31,7 +31,7 @@ The runner implements an event-driven serialized marker flow:
 - Validates official provider identity and binds reviews, inline comments, and top-level results to their reviewed commit.
 - Accepts clean results only through a closed provider grammar; finding-shaped content takes precedence over a clean-looking lead or `APPROVED` state.
 - Treats a configured provider's `Codex Review` comment, with an optional Markdown heading and emoji, as a broad terminal candidate. Exact one-line `in progress` / `still in progress` messages are ignored, with an optional period or colon plus one to 160 metadata characters; a newer unknown candidate such as `completed` is malformed and fail-closed rather than silently ignored.
-- Rebuilds a complete evidence snapshot on every reconciliation. Historical `pending` or `error` states and earlier incomplete API, pagination, identity, or commit parsing attempts are audit data, not sticky blockers.
+- Rebuilds a complete evidence snapshot on every reconciliation. Historical `pending` or `error` states, closed wait outcomes, and earlier incomplete API, pagination, identity, or commit parsing attempts are audit data, not sticky blockers.
 - Bounds each PR's evidence work to 64 MiB and 1,024 fetch attempts shared across snapshots and retries, with an 8 MiB streaming cap per response, 20,000 items per snapshot, and concurrency of four for HTTP and review-thread completion.
 - Keeps a trusted sticky PR state comment with hidden metadata.
 - Serializes controlled `@codex review` marker comments.
@@ -39,7 +39,10 @@ The runner implements an event-driven serialized marker flow:
 - Treats Codex reactions as diagnostic signals only; `eyes` reactions on the active marker comment count as liveness, not pass.
 - Uses scheduled or manual resume runs to retry unacknowledged or stalled markers.
 - Fails closed when the current reconciliation cannot load or validate all required evidence. Transient exhaustion produces `pending`; deterministic provider identity, schema, or commit conflicts produce `error`. Both fail the workflow.
-- Demotes an otherwise clean current-head result to `pending` when active-marker, exact passed-marker reassertion, or failed-findings recovery lineage does not authorise it.
+- Reconciles complete review evidence before applying marker wait deadlines. A stable authorised clean result wins even when its active marker reaches the deadline during reconciliation.
+- Allows a clean result observed after a `missed_ack`, `stalled`, or `timed_out` wait closure only when the latest same-head historical marker still matches the exact trusted live marker and the result is a new transition relative to that marker's creation time and baseline. This recovery does not post another review request.
+- Preserves timeout provenance so `failed_findings` cannot be relabelled as a closed wait to bypass its recovery switch, event, or cutoff rules.
+- Demotes an otherwise clean current-head result to `pending` when active-marker, closed-wait-marker, exact passed-marker reassertion, or failed-findings recovery lineage does not authorise it.
 - Before success, caches the newest same-context live status and its producer, revalidates PR lifecycle and head, loads the final complete snapshot with a bounded whole-snapshot orphan reload when needed, then deduplicates without another read and immediately posts success if required.
 - Reasserts the computed status unless that newest same-context record already has the desired state and comes from exact `github-actions[bot]` / `Bot`. An external or missing producer cannot expose an older trusted status as the deduplication candidate.
 - Safely upgrades a v1.2 passed marker only when its exact legacy result identity, trusted live marker, baseline, and current strict clean artifact all match; otherwise it requires a fresh marker.

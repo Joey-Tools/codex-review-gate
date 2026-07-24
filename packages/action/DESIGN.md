@@ -26,11 +26,17 @@ The result precedence is:
    status `pending` while the marker workflow continues.
 
 An older incomplete API read, pagination failure, unrecognised identity, commit
-parse failure, `pending` status, or `error` status is audit history only. It
-does not override a newer, complete current-head clean result. Conversely, a
-newer terminal-looking provider artifact whose identity, schema, or commit
-binding cannot be validated makes the current run inconclusive even if an
-older accepted clean result exists.
+parse failure, `pending` status, `error` status, or closed marker-wait outcome
+is audit history only. It does not override a newer, complete current-head
+clean result. Conversely, a newer terminal-looking provider artifact whose
+identity, schema, or commit binding cannot be validated makes the current run
+inconclusive even if an older accepted clean result exists.
+
+Evidence reconciliation precedes wait-deadline orchestration. If an active
+marker has already produced an authorised clean result and the final snapshot
+keeps that result stable, reaching `maxWaitDeadlineAt` before or during the
+reconciliation does not invalidate the result. The deadline ends a wait only
+when no acceptable terminal result is available.
 
 Issue-comment terminal-heading detection strips complete leading emoji
 graphemes after an optional Markdown heading marker before looking for
@@ -76,9 +82,9 @@ Before writing `success`, the action follows one fixed order:
 
 If the initial status read fails, the action still posts the freshly computed
 status after the final snapshot. An accepted-looking clean result that lacks
-active-marker, exact passed-marker reassertion, or failed-findings recovery
-lineage is demoted to `pending`; it is not accepted merely because it is clean
-and current-head.
+active-marker, closed-wait-marker, exact passed-marker reassertion, or
+failed-findings recovery lineage is demoted to `pending`; it is not accepted
+merely because it is clean and current-head.
 
 The optional commit-status deduplication GET has its own best-effort budget,
 separate from review evidence: 100 statuses per page, at most 10 pages or 1,000
@@ -142,10 +148,21 @@ sequenceDiagram
 The sticky state comment and status history are not review evidence, but the
 trusted marker comment and its recorded immutable lineage authorise which
 provider result may satisfy the gate. Normally the clean result must be newer
-than a valid active current-head marker and its baseline. Two narrow
-no-active-marker paths exist: reasserting a prior `passed` result with exact marker,
-baseline, and observed-result lineage; and the legacy same-head
-`failed_findings` recovery described below.
+than a valid active current-head marker and its baseline. Three narrow
+no-active-marker paths exist: accepting a result newly observed after the
+latest same-head `missed_ack`, `stalled`, or `timed_out` marker when that
+historical marker still exactly matches the trusted live marker; reasserting a
+prior `passed` result with exact marker, baseline, and observed-result lineage;
+and the legacy same-head `failed_findings` recovery described below.
+
+Closed-wait recovery uses the original marker creation time and baseline, not
+the recorded close time. The close outcome is orchestration audit data and
+cannot invalidate a provider result that was already new relative to the
+request marker but became visible only in a later complete snapshot. This path
+never accepts `failed_findings`, `state_lost`, or `obsolete_head`, and never
+posts another `@codex review`. A wait timeout derived from `failed_findings`
+retains that origin and remains subject to the existing failed-findings
+recovery switch, event, and cutoff rules.
 
 ## Generative AI Disclosure
 
@@ -394,11 +411,16 @@ flowchart TD
   waitingAck -->|ackDeadlineAt elapsed| missedAck["Close marker as missed_ack"]
   missedAck --> backoff["Apply same-head backoff"]
   backoff --> marker
+  missedAck -->|Later observed authorised clean| validatePass
 
   waitingResult -->|APPROVED review or completion comment| validatePass
   waitingResult -->|Current-head findings| failed
   waitingResult -->|resultDeadlineAt elapsed| stalled["Close marker as stalled"]
   stalled --> marker
+  stalled -->|Later observed authorised clean| validatePass
+  waitingAck -->|maxWaitDeadlineAt elapsed without clean| timedOut["Close wait as timed_out"]
+  waitingResult -->|maxWaitDeadlineAt elapsed without clean| timedOut
+  timedOut -->|Later observed authorised clean| validatePass
 
   passed -->|New commit| pending
   failed -->|New commit| pending

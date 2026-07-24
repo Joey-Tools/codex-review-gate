@@ -23,11 +23,17 @@ commit-status history 当作判定来源。
 4. 当前 head 没有 accepted clean result 时，在 marker workflow 继续运行期间保持
    `pending`。
 
-更早的 API 读取不完整、分页失败、无法识别的身份、commit 解析失败、`pending` status
-或 `error` status 都只属于审计历史，不会覆盖更新且完整的 current-head clean result。
+更早的 API 读取不完整、分页失败、无法识别的身份、commit 解析失败、`pending`、
+`error` status 或已关闭的 marker 等待结果都只属于审计历史，不会覆盖更新且完整的
+current-head clean result。
 反过来，如果比 accepted clean result 更晚的 terminal-looking provider artifact 无法
 通过身份、schema 或 commit binding 校验，即使存在较早的 clean result，当前运行仍
 无法得出结论。
+
+Evidence reconciliation 先于等待 deadline orchestration。如果 active marker 已产生
+authorised clean result，且 final snapshot 仍保持该结果稳定，那么在 reconciliation
+之前或期间到达 `maxWaitDeadlineAt` 不会使该结果失效。只有在不存在可接受 terminal
+result 时，deadline 才会结束等待。
 
 Issue-comment terminal heading detection 会先移除可选 Markdown heading marker 后的完整
 leading emoji grapheme，再识别 `Codex Review`。覆盖 modifier、regional-indicator flag、
@@ -64,9 +70,9 @@ completion transition 必须精确匹配当前选中的 current-head clean provi
    回退采用更旧的 trusted status；其他情况都立即发出一次不重试的 `success` POST。
 
 如果最初的 status read 失败，action 仍会在 final snapshot 后发布重新计算的 status。
-如果一个看似 accepted 的 clean result 缺少 active-marker、精确 passed-marker
-reassertion 或 failed-findings recovery lineage，则主动降为 `pending`；不能仅因它
-clean 且绑定 current head 就接受。
+如果一个看似 accepted 的 clean result 缺少 active-marker、closed-wait-marker、精确
+passed-marker reassertion 或 failed-findings recovery lineage，则主动降为
+`pending`；不能仅因它 clean 且绑定 current head 就接受。
 
 每次 GitHub 请求 attempt 都有默认 60 秒、覆盖 fetch 和 response body 读取的 deadline。最终
 `success` POST 不会盲目重试。如果该 POST 失败或超时，而 GitHub 可能已经将其落盘，
@@ -95,9 +101,18 @@ sequenceDiagram
 
 Sticky state comment 和 status history 不是 review evidence，但 trusted marker comment
 及 state 中记录的 immutable lineage 会授权哪些 provider result 可以满足 gate。通常
-clean result 必须晚于有效的 active current-head marker 及其 baseline。只有两条狭窄的
-no-active-marker 路径：以精确 marker、baseline 和 observed-result lineage 重新声明
-已经 `passed` 的结果；以及下文所述的 legacy same-head `failed_findings` recovery。
+clean result 必须晚于有效的 active current-head marker 及其 baseline。无 active marker
+时只有三条狭窄路径：latest same-head `missed_ack`、`stalled` 或 `timed_out`
+historical marker 仍精确匹配 trusted live marker 时，接受后来观察到的新 result；以
+精确 marker、baseline 和 observed-result lineage 重新声明已经 `passed` 的结果；以及
+下文所述的 legacy same-head `failed_findings` recovery。
+
+Closed-wait recovery 使用原 marker 的创建时间和 baseline，而不是记录的关闭时间。
+关闭结果只是 orchestration audit，不能使一个原本相对 request marker 已经是新的、
+但直到后续完整 snapshot 才可见的 provider result 失效。此路径绝不接受
+`failed_findings`、`state_lost` 或 `obsolete_head`，也不会再发送 `@codex review`。
+由 `failed_findings` 演变出的等待 timeout 会保留该来源，并继续遵守既有的
+failed-findings recovery switch、event 与 cutoff 规则。
 
 每次 GitHub request attempt 的默认 deadline 是 60 秒，覆盖 fetch 和 response-body
 读取。对于原本允许 retry 的 response，REST 和 GraphQL 都会遵守不超过 10 秒的合法
@@ -337,11 +352,16 @@ flowchart TD
   waitingAck -->|ackDeadlineAt elapsed| missedAck["Close marker as missed_ack"]
   missedAck --> backoff["Apply same-head backoff"]
   backoff --> marker
+  missedAck -->|Later observed authorised clean| validatePass
 
   waitingResult -->|APPROVED review or completion comment| validatePass
   waitingResult -->|Current-head findings| failed
   waitingResult -->|resultDeadlineAt elapsed| stalled["Close marker as stalled"]
   stalled --> marker
+  stalled -->|Later observed authorised clean| validatePass
+  waitingAck -->|maxWaitDeadlineAt elapsed without clean| timedOut["Close wait as timed_out"]
+  waitingResult -->|maxWaitDeadlineAt elapsed without clean| timedOut
+  timedOut -->|Later observed authorised clean| validatePass
 
   passed -->|New commit| pending
   failed -->|New commit| pending

@@ -998,7 +998,7 @@ test("failed-findings recovery requires a clean strictly newer than marker close
   });
 });
 
-test("no-marker clean cannot recover non-failed-findings history", async () => {
+test("no-marker clean cannot recover disallowed history", async () => {
   await withHarness(async (harness) => {
     harness.seedFailedFindingsState({ id: 2000 });
     const nonCompletion = {
@@ -1020,7 +1020,7 @@ test("no-marker clean cannot recover non-failed-findings history", async () => {
   });
 
   await withHarness(async (harness) => {
-    harness.seedFailedFindingsState({ id: 2000, outcome: "missed_ack" });
+    harness.seedFailedFindingsState({ id: 2000, outcome: "state_lost" });
     const comment = codexCleanComment(2001);
     harness.issueComments.push(comment);
 
@@ -1637,6 +1637,758 @@ test("history-only retries at the max-wait deadline fail closed without another 
   }
 });
 
+test("late clean from each closed wait outcome passes for issue comments and reviews", async (t) => {
+  for (const outcome of ["timed_out", "missed_ack", "stalled"]) {
+    for (const source of ["issue-comment", "pull-request-review"]) {
+      await t.test(`${outcome} ${source}`, async () => {
+        await withHarness(async (harness) => {
+          harness.seedHistoryOnlyRetryState({
+            id: 2000,
+            outcome,
+            closedAt: "2026-05-14T10:00:30Z",
+            headStartedAt: "2026-05-14T08:01:00Z",
+            maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+          });
+          if (source === "issue-comment") {
+            harness.issueComments.push(
+              codexCleanComment(2001, "2026-05-14T10:00:00Z"),
+            );
+          } else {
+            harness.reviews.push(
+              codexApprovedReview(4001, "2026-05-14T10:00:00Z"),
+            );
+          }
+
+          const result = await harness.runGate({
+            eventName: "schedule",
+            event: {},
+          });
+
+          assert.equal(result.code, 0, result.stderr);
+          assert.equal(successStatusWrites(harness), 1);
+          assert.equal(markerCommentWrites(harness), 0);
+          assert.equal(harness.findMarkerComments().length, 1);
+          const state = parseStateCommentBody(harness.findStateComment().body);
+          assert.equal(state.activeMarker, null);
+          assert.equal(state.lastStatus.state, "success");
+          assert.equal(state.history.at(-2).outcome, outcome);
+          assert.equal(state.history.at(-1).outcome, "passed");
+          assert.equal(state.history.at(-1).reconciledFromOutcome, outcome);
+          assert.equal(
+            state.history.at(-1).observedProviderResult.source,
+            source,
+          );
+        });
+      });
+    }
+  }
+});
+
+test("a late clean recovers a timeout persisted by the previous run", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:30:00Z",
+      ackDeadlineAt: "2026-05-14T10:30:00Z",
+      nextRetryAt: "2026-05-14T10:30:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+
+    const timeoutResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+    assert.equal(timeoutResult.code, 0, timeoutResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(
+      parseStateCommentBody(harness.findStateComment().body).history.at(-1).outcome,
+      "timed_out",
+    );
+
+    harness.issueComments.push(
+      codexCleanComment(2001, "2026-05-14T10:00:00Z"),
+    );
+    const recoveryResult = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+    assert.equal(successStatusWrites(harness), 1);
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(harness.findMarkerComments().length, 1);
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.lastStatus.state, "success");
+    assert.equal(state.history.at(-2).outcome, "timed_out");
+    assert.equal(state.history.at(-1).outcome, "passed");
+    assert.equal(state.history.at(-1).reconciledFromOutcome, "timed_out");
+    assert.equal(state.history.at(-1).observedProviderResult.id, "2001");
+  });
+});
+
+test("closed-wait late clean reasserts from canonical passed history", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "timed_out",
+      closedAt: "2026-05-14T10:00:30Z",
+      headStartedAt: "2026-05-14T08:01:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+    });
+    harness.issueComments.push(
+      codexCleanComment(2001, "2026-05-14T10:00:00Z"),
+    );
+
+    const firstResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+    assert.equal(firstResult.code, 0, firstResult.stderr);
+    const firstState = parseStateCommentBody(harness.findStateComment().body);
+    const firstHistoryLength = firstState.history.length;
+    assert.equal(firstState.history.at(-2).outcome, "timed_out");
+    assert.equal(firstState.history.at(-1).outcome, "passed");
+    assert.equal(firstState.history.at(-1).observedProviderResult.id, "2001");
+
+    harness.commitStatuses = {
+      [HEAD_SHA]: [{
+        sha: HEAD_SHA,
+        context: "codex/review-gate",
+        state: "error",
+        description: "Newer live error requires exact evidence reassertion",
+      }],
+    };
+    const snapshotLoadsBeforeReassert = harness.snapshotLoads;
+    const successWritesBeforeReassert = successStatusWrites(harness);
+    const secondResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(secondResult.code, 0, secondResult.stderr);
+    assert.equal(harness.snapshotLoads - snapshotLoadsBeforeReassert, 2);
+    assert.equal(
+      successStatusWrites(harness),
+      successWritesBeforeReassert + 1,
+    );
+    assert.equal(markerCommentWrites(harness), 0);
+    const secondState = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(secondState.history.length, firstHistoryLength);
+    assert.equal(secondState.history.at(-2).outcome, "timed_out");
+    assert.equal(secondState.history.at(-1).outcome, "passed");
+    assert.equal(secondState.lastStatus.state, "success");
+  });
+});
+
+test("closed-wait authorization requires the exact trusted live marker", async (t) => {
+  for (const mutation of ["missing", "lineage", "baseline"]) {
+    await t.test(mutation, async () => {
+      await withHarness(async (harness) => {
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome: "timed_out",
+          headStartedAt: "2026-05-14T09:00:00Z",
+          maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+        });
+        const liveComment = harness.findMarkerComments()[0];
+        if (mutation === "missing") {
+          harness.issueComments = harness.issueComments.filter(
+            (comment) => comment.id !== liveComment.id,
+          );
+        } else {
+          const liveMarker = parseMarkerCommentBody(liveComment.body);
+          const mutatedMarker = {
+            ...liveMarker,
+            id: String(liveComment.id),
+            url: liveComment.html_url,
+            createdAt: liveComment.created_at,
+            ...(mutation === "lineage" ? { runId: "forged-run" } : {}),
+            ...(mutation === "baseline"
+              ? {
+                  baseline: {
+                    ...liveMarker.baseline,
+                    completionComment: {
+                      id: "1999",
+                      createdAt: "2026-05-14T09:54:00Z",
+                    },
+                  },
+                }
+              : {}),
+          };
+          Object.assign(liveComment, markerCommentFor(mutatedMarker));
+        }
+        harness.issueComments.push(codexCleanComment(2001));
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(successStatusWrites(harness), 0);
+        assert.equal(markerCommentWrites(harness), 0);
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.notEqual(state.lastStatus.state, "success");
+        assert.equal(state.history.at(-1).outcome, "timed_out");
+      });
+    });
+  }
+});
+
+test("closed-wait authorization rejects baseline provider replays", async (t) => {
+  for (const source of ["issue-comment", "pull-request-review"]) {
+    await t.test(source, async () => {
+      await withHarness(async (harness) => {
+        const issueComment = codexCleanComment(1999, "2026-05-14T09:54:00Z");
+        const approvedReview = codexApprovedReview(3999, "2026-05-14T09:54:00Z");
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome: "timed_out",
+          headStartedAt: "2026-05-14T09:00:00Z",
+          maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+          baseline: {
+            plusOne: null,
+            eyes: null,
+            completionComment:
+              source === "issue-comment"
+                ? {
+                    id: String(issueComment.id),
+                    createdAt: issueComment.created_at,
+                    user: issueComment.user.login,
+                    url: issueComment.html_url,
+                  }
+                : null,
+            approvedReview:
+              source === "pull-request-review"
+                ? {
+                    id: String(approvedReview.id),
+                    state: approvedReview.state,
+                    commitId: approvedReview.commit_id,
+                    submittedAt: approvedReview.submitted_at,
+                    user: approvedReview.user.login,
+                  }
+                : null,
+            submittedReview: null,
+          },
+        });
+        if (source === "issue-comment") {
+          harness.issueComments.push(issueComment);
+        } else {
+          harness.reviews.push(approvedReview);
+        }
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(successStatusWrites(harness), 0);
+        assert.equal(markerCommentWrites(harness), 0);
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.notEqual(state.lastStatus.state, "success");
+        assert.equal(state.history.at(-1).outcome, "timed_out");
+      });
+    });
+  }
+});
+
+test("closed-wait authorization does not bypass non-wait outcomes", async (t) => {
+  for (const outcome of ["passed", "failed_findings", "state_lost", "obsolete_head"]) {
+    await t.test(outcome, async () => {
+      await withHarness(async (harness) => {
+        harness.seedFailedFindingsState({ id: 2000, outcome });
+        harness.reviews.push(codexApprovedReview(4001));
+
+        const result = await harness.runGate({
+          eventName: "workflow_dispatch",
+          event: { inputs: { pull_request: "1" } },
+          env: { PR_NUMBER: "1" },
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(successStatusWrites(harness), 0);
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.notEqual(state.lastStatus.state, "success");
+        assert.equal(
+          state.history.some((marker) =>
+            (marker.outcome || marker.state) === outcome
+          ),
+          true,
+        );
+      });
+    });
+  }
+});
+
+test("failed-findings lineage cannot become closed-wait authorization through timeout", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({
+      id: 2000,
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+    });
+
+    const timeoutResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+      env: { FAILED_FINDINGS_RECOVERY: "false" },
+    });
+    assert.equal(timeoutResult.code, 0, timeoutResult.stderr);
+    let state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-2).outcome, "failed_findings");
+    assert.equal(state.history.at(-1).outcome, "timed_out");
+    assert.equal(state.history.at(-1).timedOutFromOutcome, "failed_findings");
+
+    harness.issueComments.push(codexCleanComment(2001));
+    const recoveryResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+      env: { FAILED_FINDINGS_RECOVERY: "false" },
+    });
+
+    assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(markerCommentWrites(harness), 0);
+    state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.lastStatus.state, "failure");
+    assert.equal(state.history.at(-2).outcome, "failed_findings");
+    assert.equal(state.history.at(-1).outcome, "timed_out");
+  });
+});
+
+test("legacy failed-findings timeout audit cannot authorize late clean", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "timed_out",
+      headStartedAt: "2026-05-14T09:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+    });
+    const stateComment = harness.findStateComment();
+    const state = parseStateCommentBody(stateComment.body);
+    state.history.at(-1).currentHeadFindingIds = ["3001"];
+    stateComment.body = stateCommentBody(state);
+    harness.issueComments.push(codexCleanComment(2001));
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+      env: { FAILED_FINDINGS_RECOVERY: "false" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(markerCommentWrites(harness), 0);
+    const finalState = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(finalState.lastStatus.state, "pending");
+    assert.equal(finalState.history.at(-1).outcome, "timed_out");
+  });
+});
+
+test("failed-findings recovery unwraps only exact timeout lineage", async (t) => {
+  for (const lineage of ["explicit-provenance", "legacy-history"]) {
+    await t.test(lineage, async () => {
+      await withHarness(async (harness) => {
+        harness.seedFailedFindingsState({
+          id: 2000,
+          maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+        });
+
+        const timeoutResult = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+        assert.equal(timeoutResult.code, 0, timeoutResult.stderr);
+
+        const stateComment = harness.findStateComment();
+        const timedOutState = parseStateCommentBody(stateComment.body);
+        assert.equal(timedOutState.history.at(-2).outcome, "failed_findings");
+        assert.equal(timedOutState.history.at(-1).outcome, "timed_out");
+        if (lineage === "explicit-provenance") {
+          timedOutState.history = [timedOutState.history.at(-1)];
+        } else {
+          delete timedOutState.history.at(-1).timedOutFromOutcome;
+          delete timedOutState.history.at(-1).timedOutFromMarker;
+        }
+        stateComment.body = stateCommentBody(timedOutState);
+
+        const clean = codexCleanComment(2001, "2026-05-14T10:02:00Z");
+        harness.issueComments.push(clean);
+        const recoveryResult = await harness.runGate({
+          eventName: "issue_comment",
+          event: {
+            issue: { number: 1, pull_request: {} },
+            comment: clean,
+          },
+        });
+
+        assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+        assert.equal(successStatusWrites(harness), 1);
+        assert.equal(
+          parseStateCommentBody(harness.findStateComment().body).lastStatus.state,
+          "success",
+        );
+      });
+    });
+  }
+});
+
+test("fresh rejection persists on explicit timeout lineage after history truncation", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({
+      id: 2000,
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+    });
+
+    const timeoutResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+    assert.equal(timeoutResult.code, 0, timeoutResult.stderr);
+
+    const stateComment = harness.findStateComment();
+    const timedOutState = parseStateCommentBody(stateComment.body);
+    timedOutState.history = [timedOutState.history.at(-1)];
+    stateComment.body = stateCommentBody(timedOutState);
+
+    const clean = codexCleanComment(2001, "2026-05-14T10:02:00Z");
+    harness.issueComments.push(clean);
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push(unresolvedThread(3001));
+    const firstResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: clean,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(firstResult.code, 0, firstResult.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    let state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.length, 1);
+    assert.equal(state.history[0].outcome, "timed_out");
+    assert.equal(state.history[0].rejectedRecoveryCompletions.at(-1).id, "2001");
+    assert.equal(
+      state.history[0].latestRejectedRecoveryAt,
+      "2026-05-14T10:01:00.000Z",
+    );
+
+    harness.reviewThreads[0].isResolved = true;
+    const statusCount = harness.statuses.length;
+    const replayResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: clean,
+      },
+      env: { FAILED_FINDINGS_RECOVERY_MODE: "fresh" },
+    });
+
+    assert.equal(replayResult.code, 0, replayResult.stderr);
+    assert.equal(harness.statuses.length, statusCount);
+    assert.equal(successStatusWrites(harness), 0);
+    state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.lastStatus.state, "failure");
+  });
+});
+
+test("failed-findings timeout recovery never crosses marker identity", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({
+      id: 2000,
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+    });
+
+    const timeoutResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+    assert.equal(timeoutResult.code, 0, timeoutResult.stderr);
+
+    const stateComment = harness.findStateComment();
+    const state = parseStateCommentBody(stateComment.body);
+    state.history.at(-1).id = "2001";
+    stateComment.body = stateCommentBody(state);
+    const clean = codexCleanComment(2002, "2026-05-14T10:02:00Z");
+    harness.issueComments.push(clean);
+
+    const recoveryResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: clean,
+      },
+    });
+
+    assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.notEqual(
+      parseStateCommentBody(harness.findStateComment().body).lastStatus.state,
+      "success",
+    );
+  });
+});
+
+test("legacy obsolete-head timeout audit cannot authorize late clean", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "timed_out",
+      headStartedAt: "2026-05-14T09:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+    });
+    const stateComment = harness.findStateComment();
+    const state = parseStateCommentBody(stateComment.body);
+    state.history.at(-1).currentHeadSha = NEW_HEAD_SHA;
+    stateComment.body = stateCommentBody(state);
+    harness.issueComments.push(codexCleanComment(2001));
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.notEqual(
+      parseStateCommentBody(harness.findStateComment().body).lastStatus.state,
+      "success",
+    );
+  });
+});
+
+test("closed-wait findings remain blocked when recovery is disabled", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "timed_out",
+      headStartedAt: "2026-05-14T09:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+    });
+    const clean = codexCleanComment(2001);
+    harness.issueComments.push(clean);
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push(unresolvedThread(3001));
+
+    const failedResult = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+      env: { FAILED_FINDINGS_RECOVERY: "false" },
+    });
+
+    assert.equal(failedResult.code, 0, failedResult.stderr);
+    let state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-2).outcome, "timed_out");
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
+    assert.equal(state.history.at(-1).reconciledFromOutcome, "timed_out");
+    assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
+
+    harness.reviewThreads[0].isResolved = true;
+    const replayResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: clean,
+      },
+      env: { FAILED_FINDINGS_RECOVERY: "false" },
+    });
+
+    assert.equal(replayResult.code, 0, replayResult.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    state = parseStateCommentBody(harness.findStateComment().body);
+    assert.notEqual(state.lastStatus.state, "success");
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
+  });
+});
+
+test("closed-wait findings recovery keeps existing head and fresh semantics", async (t) => {
+  for (const mode of ["head", "fresh"]) {
+    await t.test(mode, async () => {
+      await withHarness(async (harness) => {
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome: "stalled",
+          headStartedAt: "2026-05-14T09:00:00Z",
+          maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+        });
+        harness.issueComments.push(codexCleanComment(2001));
+        harness.reviewComments.push(currentHeadInlineFinding(3001));
+        harness.reviewThreads.push(unresolvedThread(3001));
+
+        const failedResult = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+          env: { FAILED_FINDINGS_RECOVERY_MODE: mode },
+        });
+        assert.equal(failedResult.code, 0, failedResult.stderr);
+        assert.equal(
+          parseStateCommentBody(harness.findStateComment().body).history.at(-1).outcome,
+          "failed_findings",
+        );
+
+        harness.reviewThreads[0].isResolved = true;
+        const newerClean = codexCleanComment(2002, "2026-05-14T10:02:00Z");
+        harness.issueComments.push(newerClean);
+        const noTriggerResult = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+          env: { FAILED_FINDINGS_RECOVERY_MODE: mode },
+        });
+        assert.equal(noTriggerResult.code, 0, noTriggerResult.stderr);
+        assert.equal(successStatusWrites(harness), 0);
+        assert.equal(markerCommentWrites(harness), 0);
+
+        const recoveryResult = await harness.runGate({
+          eventName: "issue_comment",
+          event: {
+            issue: { number: 1, pull_request: {} },
+            comment: newerClean,
+          },
+          env: { FAILED_FINDINGS_RECOVERY_MODE: mode },
+        });
+
+        assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+        assert.equal(successStatusWrites(harness), 1);
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.lastStatus.state, "success");
+        assert.equal(state.history.at(-2).outcome, "stalled");
+        assert.equal(state.history.at(-1).outcome, "failed_findings");
+      });
+    });
+  }
+});
+
+test("pending provider findings synthesize failed lineage for every closed wait outcome", async (t) => {
+  for (const outcome of ["timed_out", "missed_ack", "stalled"]) {
+    await t.test(outcome, async () => {
+      await withHarness(async (harness) => {
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome,
+          headStartedAt: "2026-05-14T09:00:00Z",
+          maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+        });
+        harness.reviewComments.push(currentHeadInlineFinding(3001));
+        harness.reviewThreads.push(unresolvedThread(3001));
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(harness.statuses.at(-1).body.state, "failure");
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.history.at(-2).outcome, outcome);
+        assert.equal(state.history.at(-1).outcome, "failed_findings");
+        assert.equal(state.history.at(-1).reconciledFromOutcome, outcome);
+        assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
+      });
+    });
+  }
+});
+
+test("untrusted closed marker cannot synthesize failed-findings lineage", async (t) => {
+  for (const mutation of ["missing", "lineage", "baseline"]) {
+    await t.test(mutation, async () => {
+      await withHarness(async (harness) => {
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome: "timed_out",
+          headStartedAt: "2026-05-14T09:00:00Z",
+          maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+        });
+        const liveComment = harness.findMarkerComments()[0];
+        if (mutation === "missing") {
+          harness.issueComments = harness.issueComments.filter(
+            (comment) => comment.id !== liveComment.id,
+          );
+        } else {
+          const liveMarker = parseMarkerCommentBody(liveComment.body);
+          Object.assign(liveComment, markerCommentFor({
+            ...liveMarker,
+            id: String(liveComment.id),
+            url: liveComment.html_url,
+            createdAt: liveComment.created_at,
+            ...(mutation === "lineage" ? { runId: "forged-run" } : {}),
+            ...(mutation === "baseline"
+              ? {
+                  baseline: {
+                    ...liveMarker.baseline,
+                    completionComment: {
+                      id: "1999",
+                      createdAt: "2026-05-14T09:54:00Z",
+                    },
+                  },
+                }
+              : {}),
+          }));
+        }
+        harness.reviewComments.push(currentHeadInlineFinding(3001));
+        harness.reviewThreads.push(unresolvedThread(3001));
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(harness.statuses.at(-1).body.state, "failure");
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(
+          state.history.some((marker) => marker.outcome === "failed_findings"),
+          false,
+        );
+        assert.equal(state.history.at(-1).outcome, "timed_out");
+      });
+    });
+  }
+});
+
+test("closed-wait success rejects a clean artifact swap on final reload", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "stalled",
+      headStartedAt: "2026-05-14T09:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+    });
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.afterSnapshotLoad(2, {
+      action: "pushIssueComment",
+      value: codexCleanComment(2002, "2026-05-14T10:00:30Z"),
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /not stable across final validation/);
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-1).outcome, "stalled");
+  });
+});
+
 test("history-only retries inherit the exact wait deadline across config changes", async (t) => {
   for (const scenario of [
     { name: "increase", maxWaitSeconds: "14400" },
@@ -1676,7 +2428,7 @@ test("history-only retries inherit the exact wait deadline across config changes
   }
 });
 
-test("max wait wins over clean evidence at the exact active-marker deadline", async () => {
+test("stable active-marker clean wins at the exact max-wait deadline", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
       id: 2000,
@@ -1701,24 +2453,18 @@ test("max wait wins over clean evidence at the exact active-marker deadline", as
     });
 
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(successStatusWrites(harness), 0);
-    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(successStatusWrites(harness), 1);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
     assert.equal(harness.findMarkerComments().length, 1);
 
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.activeMarker, null);
-    assert.equal(state.lastStatus.state, "failure");
-    assert.equal(state.history.at(-1).outcome, "timed_out");
-    const timeoutStateWriteIndex = harness.requestLog.findIndex((entry) =>
-      entry.method === "PATCH" &&
-      entry.path.endsWith("/issues/comments/1000") &&
-      entry.body?.body?.includes('"outcome": "timed_out"'));
-    const failureStatusWriteIndex = harness.requestLog.findIndex((entry) =>
-      entry.method === "POST" &&
-      entry.path.endsWith(`/statuses/${HEAD_SHA}`) &&
-      entry.body?.state === "failure");
-    assert.ok(timeoutStateWriteIndex >= 0);
-    assert.ok(failureStatusWriteIndex > timeoutStateWriteIndex);
+    assert.equal(state.lastStatus.state, "success");
+    assert.equal(state.history.at(-1).outcome, "passed");
+    assert.equal(
+      state.history.some((marker) => marker.outcome === "timed_out"),
+      false,
+    );
   });
 });
 
@@ -1751,7 +2497,7 @@ test("clean active-marker evidence still passes immediately before max wait", as
   });
 });
 
-test("max wait is rechecked after the final evidence snapshot crosses the deadline", async () => {
+test("stable active-marker clean wins when final validation crosses max wait", async () => {
   await withHarness(async (harness) => {
     const deadline = Date.parse("2026-05-14T10:01:01Z");
     harness.now = deadline - 1_000;
@@ -1778,12 +2524,45 @@ test("max wait is rechecked after the final evidence snapshot crosses the deadli
     });
 
     assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 1);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.history.at(-1).outcome, "passed");
+    assert.equal(state.history.at(-1).closedAt, "2026-05-14T10:01:01.000Z");
+  });
+});
+
+test("active marker with no clean still times out at max wait", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:30:00Z",
+      ackDeadlineAt: "2026-05-14T10:30:00Z",
+      nextRetryAt: "2026-05-14T10:30:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
     assert.equal(successStatusWrites(harness), 0);
     assert.equal(harness.statuses.at(-1).body.state, "failure");
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.activeMarker, null);
+    assert.equal(state.lastStatus.state, "failure");
     assert.equal(state.history.at(-1).outcome, "timed_out");
-    assert.equal(state.history.at(-1).closedAt, "2026-05-14T10:01:01.000Z");
   });
 });
 
@@ -4072,7 +4851,9 @@ test("a finding writes failure even when its audit-state comment cannot be creat
     assert.equal(harness.statuses.at(-1).body.state, "failure");
     assert.match(result.stderr, /failed to save initial audit state/);
     const state = parseStateCommentBody(harness.findStateComment().body);
-    assert.equal(state.history.at(-1).outcome, "failed_findings");
+    assert.equal(state.lastStatus.state, "failure");
+    assert.deepEqual(state.history, []);
+    assert.equal(markerCommentWrites(harness), 0);
   });
 });
 
@@ -4681,10 +5462,10 @@ test("a parent review appearing on whole-snapshot reload recovers a transient in
     assert.equal(result.code, 0, result.stderr);
     assert.equal(harness.snapshotLoads, 2);
     assert.equal(harness.statuses.at(-1).body.state, "failure");
-    assert.equal(
-      parseStateCommentBody(harness.findStateComment().body).history.at(-1).outcome,
-      "failed_findings",
-    );
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.lastStatus.state, "failure");
+    assert.deepEqual(state.history, []);
+    assert.equal(markerCommentWrites(harness), 0);
   });
 });
 
@@ -4720,10 +5501,10 @@ test("a child comment appearing on reload recovers the symmetric parent-first ra
     assert.equal(result.code, 0, result.stderr);
     assert.equal(harness.snapshotLoads, 2);
     assert.equal(harness.statuses.at(-1).body.state, "failure");
-    assert.equal(
-      parseStateCommentBody(harness.findStateComment().body).history.at(-1).outcome,
-      "failed_findings",
-    );
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.lastStatus.state, "failure");
+    assert.deepEqual(state.history, []);
+    assert.equal(markerCommentWrites(harness), 0);
   });
 });
 
@@ -5227,7 +6008,7 @@ test("an ambiguous persisted success remains explicit when compensation also fai
   });
 });
 
-test("head change creates a current-head marker before historical findings fail it", async () => {
+test("head-change findings fail before current-head marker orchestration", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
       id: 1900,
@@ -5255,11 +6036,13 @@ test("head change creates a current-head marker before historical findings fail 
 
     assert.equal(result.code, 0, result.stderr);
     assert.equal(harness.statuses.at(-1).body.state, "failure");
-    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(harness.findMarkerComments().length, 1);
+    assert.equal(markerCommentWrites(harness), 0);
     const state = parseStateCommentBody(harness.findStateComment().body);
-    assert.equal(state.history.at(-2).outcome, "obsolete_head");
-    assert.equal(state.history.at(-1).outcome, "failed_findings");
-    assert.equal(state.history.at(-1).headSha, NEW_HEAD_SHA);
+    assert.equal(state.history.at(-1).outcome, "obsolete_head");
+    assert.equal(state.history.at(-1).headSha, OLD_HEAD_SHA);
+    assert.equal(state.lastStatus.headSha, NEW_HEAD_SHA);
+    assert.equal(state.lastStatus.state, "failure");
   });
 });
 
@@ -5852,6 +6635,17 @@ function codexCleanComment(id, createdAt = "2026-05-14T10:00:00Z") {
   return codexCleanCommentForHead(id, HEAD_SHA, createdAt);
 }
 
+function codexApprovedReview(id, submittedAt = "2026-05-14T10:00:00Z") {
+  return {
+    id,
+    state: "APPROVED",
+    commit_id: HEAD_SHA,
+    submitted_at: submittedAt,
+    body: "Looks good.",
+    user: codexBotUser(),
+  };
+}
+
 function codexCleanCommentForHead(id, headSha, createdAt = "2026-05-14T10:00:00Z") {
   return {
     id,
@@ -6248,6 +7042,13 @@ class GateHarness {
     maxWaitDeadlineAt,
     closedAt = "2026-05-14T10:00:00Z",
     trailingHistory = [],
+    baseline = {
+      plusOne: null,
+      eyes: null,
+      completionComment: null,
+      approvedReview: null,
+      submittedReview: null,
+    },
   }) {
     this.seedActiveMarker({
       id,
@@ -6255,13 +7056,7 @@ class GateHarness {
       createdAt: "2026-05-14T09:55:00Z",
       headStartedAt,
       maxWaitDeadlineAt,
-      baseline: {
-        plusOne: null,
-        eyes: null,
-        completionComment: null,
-        approvedReview: null,
-        submittedReview: null,
-      },
+      baseline,
     });
 
     const stateComment = this.findStateComment();
