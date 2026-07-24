@@ -2509,40 +2509,78 @@ async function commitIsAncestor(baseSha, headSha, cache, evidenceBudget) {
   }
 
   const baseCommitSha = String(data?.base_commit?.sha || "").toLowerCase();
-  const headCommitSha = String(data?.head_commit?.sha || "").toLowerCase();
   const mergeBaseSha = String(data?.merge_base_commit?.sha || "").toLowerCase();
   const status = data?.status;
+  const aheadBy = data?.ahead_by;
+  const behindBy = data?.behind_by;
+  const totalCommits = data?.total_commits;
+  const invalidResponse = (detail) => new GateFailure(
+    "error",
+    "Codex artifact ancestry response is invalid",
+    `Compare response for ${cacheKey} ${detail}.`,
+  );
   if (
     !/^[0-9a-f]{40}$/.test(baseCommitSha) ||
-    !/^[0-9a-f]{40}$/.test(headCommitSha) ||
     !/^[0-9a-f]{40}$/.test(mergeBaseSha) ||
-    !new Set(["ahead", "behind", "diverged", "identical"]).has(status)
+    !new Set(["ahead", "behind", "diverged", "identical"]).has(status) ||
+    !Number.isSafeInteger(aheadBy) ||
+    aheadBy < 0 ||
+    !Number.isSafeInteger(behindBy) ||
+    behindBy < 0 ||
+    !Number.isSafeInteger(totalCommits) ||
+    totalCommits < 0 ||
+    !Array.isArray(data?.commits)
   ) {
-    throw new GateFailure(
-      "error",
-      "Codex artifact ancestry response is invalid",
-      `Compare response for ${cacheKey} did not contain a closed commit relationship.`,
-    );
+    throw invalidResponse("did not contain the documented commit-comparison fields");
   }
   if (baseCommitSha !== baseSha) {
-    throw new GateFailure(
-      "error",
-      "Codex artifact ancestry response conflicts with the requested commit",
-      `Compare response base ${baseCommitSha} does not match provider commit ${baseSha}.`,
+    throw invalidResponse(
+      `bound base ${baseCommitSha} instead of requested provider commit ${baseSha}`,
     );
   }
-  if (headCommitSha !== headSha) {
-    throw new GateFailure(
-      "error",
-      "Codex artifact ancestry response conflicts with the requested commit",
-      `Compare response head ${headCommitSha} does not match current commit ${headSha}.`,
+  if (totalCommits !== aheadBy) {
+    throw invalidResponse(
+      `reported total_commits ${totalCommits} but ahead_by ${aheadBy}`,
     );
   }
 
-  const isAncestor =
-    status === "identical"
-      ? baseSha === headSha
-      : status === "ahead" && mergeBaseSha === baseSha;
+  let isAncestor;
+  if (
+    status === "ahead" &&
+    aheadBy > 0 &&
+    behindBy === 0 &&
+    mergeBaseSha === baseSha
+  ) {
+    isAncestor = true;
+  } else if (
+    status === "identical" &&
+    baseSha === headSha &&
+    aheadBy === 0 &&
+    behindBy === 0 &&
+    mergeBaseSha === baseSha
+  ) {
+    isAncestor = true;
+  } else if (
+    status === "behind" &&
+    aheadBy === 0 &&
+    behindBy > 0 &&
+    mergeBaseSha === headSha
+  ) {
+    isAncestor = false;
+  } else if (
+    status === "diverged" &&
+    aheadBy > 0 &&
+    behindBy > 0 &&
+    mergeBaseSha !== baseSha &&
+    mergeBaseSha !== headSha
+  ) {
+    isAncestor = false;
+  } else {
+    throw invalidResponse(
+      `contradicted its ${String(status)} relationship and commit counts`,
+    );
+  }
+
   cache.set(cacheKey, isAncestor);
   return isAncestor;
 }

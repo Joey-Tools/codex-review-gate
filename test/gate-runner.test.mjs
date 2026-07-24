@@ -1855,9 +1855,12 @@ test("a prior-head issue-comment clean is stale evidence and a head change creat
     harness.pullRequest = harness.pullRequestForHead(NEW_HEAD_SHA);
     harness.compareResults[`${HEAD_SHA}...${NEW_HEAD_SHA}`] = {
       status: "ahead",
+      ahead_by: 1,
+      behind_by: 0,
+      total_commits: 1,
       base_commit: { sha: HEAD_SHA },
-      head_commit: { sha: NEW_HEAD_SHA },
       merge_base_commit: { sha: HEAD_SHA },
+      commits: [{ sha: NEW_HEAD_SHA }],
     };
     const oldClean = codexCleanComment(2001);
     harness.issueComments.push(oldClean);
@@ -1897,9 +1900,12 @@ test("a prior-head review clean is stale evidence and a head change creates a fr
     });
     harness.compareResults[`${OLD_HEAD_SHA}...${NEW_HEAD_SHA}`] = {
       status: "ahead",
+      ahead_by: 1,
+      behind_by: 0,
+      total_commits: 1,
       base_commit: { sha: OLD_HEAD_SHA },
-      head_commit: { sha: NEW_HEAD_SHA },
       merge_base_commit: { sha: OLD_HEAD_SHA },
+      commits: [{ sha: NEW_HEAD_SHA }],
     };
     harness.reviews.push({
       id: 4001,
@@ -1940,9 +1946,12 @@ test("a clean bound to a non-ancestor commit remains deterministic invalid evide
     harness.commitResolutions[OLD_HEAD_SHA.slice(0, 10)] = OLD_HEAD_SHA;
     harness.compareResults[`${OLD_HEAD_SHA}...${NEW_HEAD_SHA}`] = {
       status: "diverged",
+      ahead_by: 1,
+      behind_by: 1,
+      total_commits: 1,
       base_commit: { sha: OLD_HEAD_SHA },
-      head_commit: { sha: NEW_HEAD_SHA },
       merge_base_commit: { sha: HEAD_SHA },
+      commits: [{ sha: NEW_HEAD_SHA }],
     };
     harness.issueComments.push(codexCleanCommentForHead(2001, OLD_HEAD_SHA));
 
@@ -1959,30 +1968,163 @@ test("a clean bound to a non-ancestor commit remains deterministic invalid evide
   });
 });
 
-test("compare responses must bind the requested head endpoint", async (t) => {
+test("a documented behind response is valid non-ancestor evidence", async () => {
+  await withHarness(async (harness) => {
+    harness.pullRequest = harness.pullRequestForHead(HEAD_SHA);
+    harness.commitResolutions[OLD_HEAD_SHA.slice(0, 10)] = OLD_HEAD_SHA;
+    harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
+      status: "behind",
+      ahead_by: 0,
+      behind_by: 1,
+      total_commits: 0,
+      base_commit: { sha: OLD_HEAD_SHA },
+      merge_base_commit: { sha: HEAD_SHA },
+      commits: [],
+    };
+    harness.issueComments.push(codexCleanCommentForHead(2001, OLD_HEAD_SHA));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /not current head/);
+    assert.doesNotMatch(result.stderr, /ancestry response is invalid/);
+  });
+});
+
+test("a live-shaped compare response binds its exact requested endpoints without head_commit", async () => {
+  await withHarness(async (harness) => {
+    const oldShortSha = OLD_HEAD_SHA.slice(0, 10);
+    harness.commitResolutions[oldShortSha] = OLD_HEAD_SHA;
+    harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
+      status: "ahead",
+      ahead_by: 1,
+      behind_by: 0,
+      total_commits: 1,
+      base_commit: { sha: OLD_HEAD_SHA },
+      merge_base_commit: { sha: OLD_HEAD_SHA },
+      commits: [{ sha: HEAD_SHA }],
+    };
+    harness.issueComments.push(codexCleanCommentForHead(2001, OLD_HEAD_SHA));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(
+      harness.requestLog.filter((entry) =>
+        entry.method === "GET" &&
+          entry.path.endsWith(`/compare/${OLD_HEAD_SHA}...${HEAD_SHA}`),
+      ).length,
+      1,
+    );
+    assert.equal(
+      harness.requestLog.some((entry) =>
+        entry.method === "GET" &&
+          entry.path.endsWith(`/commits/${HEAD_SHA}`),
+      ),
+      false,
+    );
+  });
+});
+
+test("compare relationship and count contradictions fail closed", async (t) => {
+  const validAhead = {
+    status: "ahead",
+    ahead_by: 1,
+    behind_by: 0,
+    total_commits: 1,
+    base_commit: { sha: OLD_HEAD_SHA },
+    merge_base_commit: { sha: OLD_HEAD_SHA },
+    commits: [{ sha: HEAD_SHA }],
+  };
   for (const scenario of [
     {
-      name: "missing head",
-      headCommit: null,
-      expected: /did not contain a closed commit relationship/,
+      name: "base does not match the requested base",
+      response: {
+        ...validAhead,
+        base_commit: { sha: NEW_HEAD_SHA },
+      },
+      expected: /instead of requested provider commit/,
     },
     {
-      name: "conflicting head",
-      headCommit: NEW_HEAD_SHA,
-      expected: /does not match current commit/,
+      name: "total commits do not equal ahead count",
+      response: {
+        ...validAhead,
+        total_commits: 2,
+      },
+      expected: /reported total_commits 2 but ahead_by 1/,
+    },
+    {
+      name: "ahead reports a behind count",
+      response: {
+        ...validAhead,
+        behind_by: 1,
+      },
+      expected: /contradicted its ahead relationship and commit counts/,
+    },
+    {
+      name: "identical uses distinct requested endpoints",
+      response: {
+        ...validAhead,
+        status: "identical",
+        ahead_by: 0,
+        total_commits: 0,
+        commits: [],
+      },
+      expected: /contradicted its identical relationship and commit counts/,
+    },
+    {
+      name: "behind does not use the requested head as merge base",
+      response: {
+        ...validAhead,
+        status: "behind",
+        ahead_by: 0,
+        behind_by: 1,
+        total_commits: 0,
+        commits: [],
+      },
+      expected: /contradicted its behind relationship and commit counts/,
+    },
+    {
+      name: "diverged reuses an endpoint as merge base",
+      response: {
+        ...validAhead,
+        status: "diverged",
+        behind_by: 1,
+      },
+      expected: /contradicted its diverged relationship and commit counts/,
+    },
+    {
+      name: "counts must be nonnegative safe integers",
+      response: {
+        ...validAhead,
+        behind_by: -1,
+      },
+      expected: /did not contain the documented commit-comparison fields/,
+    },
+    {
+      name: "commits must be present",
+      response: {
+        ...validAhead,
+        commits: undefined,
+      },
+      expected: /did not contain the documented commit-comparison fields/,
     },
   ]) {
     await t.test(scenario.name, async () => {
       await withHarness(async (harness) => {
         harness.commitResolutions[OLD_HEAD_SHA.slice(0, 10)] = OLD_HEAD_SHA;
-        harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
-          status: "ahead",
-          base_commit: { sha: OLD_HEAD_SHA },
-          ...(scenario.headCommit
-            ? { head_commit: { sha: scenario.headCommit } }
-            : {}),
-          merge_base_commit: { sha: OLD_HEAD_SHA },
-        };
+        harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] =
+          scenario.response;
         harness.issueComments.push(
           codexCleanCommentForHead(2001, OLD_HEAD_SHA),
         );
@@ -2723,9 +2865,12 @@ test("an older finding makes an unresolved short-SHA clean decision fail closed"
     const oldShortSha = OLD_HEAD_SHA.slice(0, 10);
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
       status: "diverged",
+      ahead_by: 1,
+      behind_by: 1,
+      total_commits: 1,
       base_commit: { sha: OLD_HEAD_SHA },
-      head_commit: { sha: HEAD_SHA },
       merge_base_commit: { sha: NEW_HEAD_SHA },
+      commits: [{ sha: HEAD_SHA }],
     };
     harness.routeFaults[
       `GET /repos/${harness.owner}/${harness.repo}/commits/${oldShortSha}`
@@ -2764,9 +2909,12 @@ test("a deterministically invalid older short-SHA clean cannot suppress its find
     const oldShortSha = OLD_HEAD_SHA.slice(0, 10);
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
       status: "diverged",
+      ahead_by: 1,
+      behind_by: 1,
+      total_commits: 1,
       base_commit: { sha: OLD_HEAD_SHA },
-      head_commit: { sha: HEAD_SHA },
       merge_base_commit: { sha: NEW_HEAD_SHA },
+      commits: [{ sha: HEAD_SHA }],
     };
     harness.issueComments.push(
       codexThreadlessFinding(2001, OLD_HEAD_SHA, "2026-05-14T09:50:00Z"),
@@ -2796,9 +2944,12 @@ test("a clean result does not supersede a finding from a non-ancestor commit", a
   await withHarness(async (harness) => {
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
       status: "diverged",
+      ahead_by: 1,
+      behind_by: 1,
+      total_commits: 1,
       base_commit: { sha: OLD_HEAD_SHA },
-      head_commit: { sha: HEAD_SHA },
       merge_base_commit: { sha: NEW_HEAD_SHA },
+      commits: [{ sha: HEAD_SHA }],
     };
     harness.issueComments.push(
       codexThreadlessFinding(2001, OLD_HEAD_SHA, "2026-05-14T09:57:00Z"),
@@ -4161,9 +4312,12 @@ test("an intermediate clean supersedes its finding before a later divergent-head
     });
     harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
       status: "diverged",
+      ahead_by: 1,
+      behind_by: 1,
+      total_commits: 1,
       base_commit: { sha: OLD_HEAD_SHA },
-      head_commit: { sha: HEAD_SHA },
       merge_base_commit: { sha: NEW_HEAD_SHA },
+      commits: [{ sha: HEAD_SHA }],
     };
     harness.issueComments.push(
       codexThreadlessFinding(2001, OLD_HEAD_SHA, "2026-05-14T09:50:00Z"),
@@ -6023,9 +6177,12 @@ class GateHarness {
     this.compareResults = {
       [`${OLD_HEAD_SHA}...${HEAD_SHA}`]: {
         status: "ahead",
+        ahead_by: 1,
+        behind_by: 0,
+        total_commits: 1,
         base_commit: { sha: OLD_HEAD_SHA },
-        head_commit: { sha: HEAD_SHA },
         merge_base_commit: { sha: OLD_HEAD_SHA },
+        commits: [{ sha: HEAD_SHA }],
       },
     };
     this.requestLog = [];
