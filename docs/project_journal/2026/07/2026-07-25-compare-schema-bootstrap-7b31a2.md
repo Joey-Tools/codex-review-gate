@@ -14,12 +14,12 @@ superseded_by:
 
 ## Summary
 - The REST 2022-11-28 commit-comparison schema does not document `head_commit`, so requiring that field made valid live responses fail closed.
-- Ancestry validation now binds the exact 40-hex `base...head` request, validates the documented response fields and counts, binds the unpaginated commit list's final entry to the requested head, and applies a closed `ahead` / `identical` / `behind` / `diverged` relationship matrix.
+- Ancestry validation now binds the exact 40-hex `base...head` request, validates the documented response fields and counts, validates every unpaginated commit-list entry before binding the final entry to the requested head, and applies a closed `ahead` / `identical` / `behind` / `diverged` relationship matrix.
 - Undocumented `head_commit` data is ignored and no extra head-commit request is introduced.
 
 ## Current State
 - Compare fixtures use documented counts and `commits` arrays without depending on `head_commit`.
-- Runner regressions cover live-shaped valid `ahead`, valid non-ancestor `behind` and `diverged`, plus deterministic schema, count, terminal-head, merge-base, and relationship contradictions.
+- Runner regressions cover live-shaped valid `ahead`, valid non-ancestor `behind` and `diverged`, plus deterministic schema, count, commit-entry, terminal-head, merge-base, and relationship contradictions.
 - English and Chinese action README and design documents record the fail-closed contract, and the complete local validation set passes.
 
 ## Next Steps

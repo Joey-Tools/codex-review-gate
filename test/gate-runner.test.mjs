@@ -2081,6 +2081,36 @@ test("compare relationship and count contradictions fail closed", async (t) => {
       expected: /returned 1 commits.*requires 2/,
     },
     {
+      name: "intermediate commit SHA is malformed",
+      response: {
+        ...validAhead,
+        ahead_by: 2,
+        total_commits: 2,
+        commits: [{ sha: "malformed" }, { sha: HEAD_SHA }],
+      },
+      expected: /invalid commit SHA at index 0/,
+    },
+    {
+      name: "commit list contains a duplicate",
+      response: {
+        ...validAhead,
+        ahead_by: 2,
+        total_commits: 2,
+        commits: [{ sha: HEAD_SHA }, { sha: HEAD_SHA }],
+      },
+      expected: /duplicate commit/,
+    },
+    {
+      name: "commit list includes the excluded base",
+      response: {
+        ...validAhead,
+        ahead_by: 2,
+        total_commits: 2,
+        commits: [{ sha: OLD_HEAD_SHA }, { sha: HEAD_SHA }],
+      },
+      expected: /included excluded base-side commit/,
+    },
+    {
       name: "ahead reports a behind count",
       response: {
         ...validAhead,

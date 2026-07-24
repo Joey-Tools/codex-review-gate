@@ -52,8 +52,8 @@ commit-comparison endpoint。Response 必须包含 documented `base_commit`、
 `merge_base_commit`、`status`、`ahead_by`、`behind_by`、`total_commits` 和
 `commits` fields。Counts 必须是 nonnegative safe integers，`total_commits` 必须等于
 `ahead_by`，且 closed relationship 必须与 counts 和 merge base 一致。Unpaginated
-commit list 必须含有 `min(ahead_by, 250)` 个 entries；非空时，其 documented final
-entry 必须绑定 requested head SHA。`ahead` 证明
+commit list 必须含有 `min(ahead_by, 250)` 个 unique full-SHA entries，排除 base 和
+merge-base commits；非空时，其 documented final entry 必须绑定 requested head SHA。`ahead` 证明
 ancestor，`identical` 证明相等，合法的 `behind` 和 `diverged` 则证明不是 ancestor。
 任何矛盾都作为 deterministic invalid response fail closed。Action 不依赖 undocumented
 `head_commit` field，也不会额外 GET head commit。

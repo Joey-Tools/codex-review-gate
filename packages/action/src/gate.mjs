@@ -2549,16 +2549,33 @@ async function commitIsAncestor(baseSha, headSha, cache, evidenceBudget) {
       `returned ${data.commits.length} commits but the unpaginated response requires ${expectedCommitCount}`,
     );
   }
-  if (expectedCommitCount > 0) {
-    const terminalCommitSha = String(
-      data.commits.at(-1)?.sha || "",
-    ).toLowerCase();
-    if (
-      !/^[0-9a-f]{40}$/.test(terminalCommitSha) ||
-      terminalCommitSha !== headSha
-    ) {
+  const commitShas = [];
+  const seenCommitShas = new Set();
+  for (const [index, commit] of data.commits.entries()) {
+    const commitSha = String(commit?.sha || "").toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(commitSha)) {
       throw invalidResponse(
-        `bound terminal commit ${terminalCommitSha || "<missing>"} instead of requested head ${headSha}`,
+        `returned an invalid commit SHA at index ${index}`,
+      );
+    }
+    if (seenCommitShas.has(commitSha)) {
+      throw invalidResponse(
+        `returned duplicate commit ${commitSha}`,
+      );
+    }
+    if (commitSha === baseSha || commitSha === mergeBaseSha) {
+      throw invalidResponse(
+        `included excluded base-side commit ${commitSha}`,
+      );
+    }
+    seenCommitShas.add(commitSha);
+    commitShas.push(commitSha);
+  }
+  if (expectedCommitCount > 0) {
+    const terminalCommitSha = commitShas.at(-1);
+    if (terminalCommitSha !== headSha) {
+      throw invalidResponse(
+        `bound terminal commit ${terminalCommitSha} instead of requested head ${headSha}`,
       );
     }
   }
