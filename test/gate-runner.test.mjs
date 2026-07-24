@@ -4829,7 +4829,7 @@ test("deterministic evidence errors take precedence over simultaneous findings",
   });
 });
 
-test("a finding writes failure even when its audit-state comment cannot be created", async () => {
+test("a finding records controlled failed lineage after initial audit-state creation fails", async () => {
   await withHarness(async (harness) => {
     harness.reviewComments.push(currentHeadInlineFinding(3001));
     harness.reviewThreads.push(unresolvedThread(3001));
@@ -4852,8 +4852,10 @@ test("a finding writes failure even when its audit-state comment cannot be creat
     assert.match(result.stderr, /failed to save initial audit state/);
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.lastStatus.state, "failure");
-    assert.deepEqual(state.history, []);
-    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
+    assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
+    assert.equal(markerCommentWrites(harness), 1);
   });
 });
 
@@ -5464,8 +5466,10 @@ test("a parent review appearing on whole-snapshot reload recovers a transient in
     assert.equal(harness.statuses.at(-1).body.state, "failure");
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.lastStatus.state, "failure");
-    assert.deepEqual(state.history, []);
-    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
+    assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
+    assert.equal(markerCommentWrites(harness), 1);
   });
 });
 
@@ -5503,8 +5507,10 @@ test("a child comment appearing on reload recovers the symmetric parent-first ra
     assert.equal(harness.statuses.at(-1).body.state, "failure");
     const state = parseStateCommentBody(harness.findStateComment().body);
     assert.equal(state.lastStatus.state, "failure");
-    assert.deepEqual(state.history, []);
-    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
+    assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
+    assert.equal(markerCommentWrites(harness), 1);
   });
 });
 
@@ -6008,7 +6014,7 @@ test("an ambiguous persisted success remains explicit when compensation also fai
   });
 });
 
-test("head-change findings fail before current-head marker orchestration", async () => {
+test("head-change findings close a controlled marker and recover on the normal signal path", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
       id: 1900,
@@ -6036,13 +6042,43 @@ test("head-change findings fail before current-head marker orchestration", async
 
     assert.equal(result.code, 0, result.stderr);
     assert.equal(harness.statuses.at(-1).body.state, "failure");
-    assert.equal(harness.findMarkerComments().length, 1);
-    assert.equal(markerCommentWrites(harness), 0);
-    const state = parseStateCommentBody(harness.findStateComment().body);
-    assert.equal(state.history.at(-1).outcome, "obsolete_head");
-    assert.equal(state.history.at(-1).headSha, OLD_HEAD_SHA);
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(markerCommentWrites(harness), 1);
+    let state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.history.at(-2).outcome, "obsolete_head");
+    assert.equal(state.history.at(-2).headSha, OLD_HEAD_SHA);
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
+    assert.equal(state.history.at(-1).headSha, NEW_HEAD_SHA);
+    assert.equal(state.history.at(-1).currentHeadFindings.count, 1);
     assert.equal(state.lastStatus.headSha, NEW_HEAD_SHA);
     assert.equal(state.lastStatus.state, "failure");
+
+    harness.reviewThreads[0].isResolved = true;
+    const clean = codexCleanCommentForHead(
+      2001,
+      NEW_HEAD_SHA,
+      "2026-05-14T10:02:00Z",
+    );
+    harness.commitResolutions[NEW_HEAD_SHA.slice(0, 10)] = NEW_HEAD_SHA;
+    harness.issueComments.push(clean);
+    const recoveryResult = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: clean,
+      },
+    });
+
+    assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+    state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(harness.statuses.at(-1).sha, NEW_HEAD_SHA);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    assert.equal(markerCommentWrites(harness), 1);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.lastStatus.headSha, NEW_HEAD_SHA);
+    assert.equal(state.lastStatus.state, "success");
+    assert.equal(state.history.at(-1).outcome, "failed_findings");
   });
 });
 

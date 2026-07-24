@@ -22,6 +22,7 @@ superseded_by:
 - Closed-wait recovery requires the latest same-head historical marker to match the exact trusted live marker and requires a provider transition newer than the marker baseline and creation time.
 - Historical wait outcomes remain audit records. `failed_findings`, `state_lost`, and `obsolete_head` are not accepted through this recovery path.
 - Timeout records preserve their source outcome so a `failed_findings` lineage cannot bypass its recovery switch, event, or cutoff requirements.
+- A fresh head with unresolved findings still creates its controlled marker before recording canonical `failed_findings`; resolving the thread can then continue through the ordinary provider signal path without a manual dispatch.
 - Final validation reloads the complete evidence snapshot and revalidates the same authorisation kind before writing success.
 
 ## Evidence
