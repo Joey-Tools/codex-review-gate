@@ -448,6 +448,15 @@ Accepted provider evidence 按 channel 校验：
   `original_commit_id` 绑定；可变的 relocated inline `commit_id` 不是 provenance。
 - Top-level clean result 必须匹配受支持的 clean format，并包含 reviewed-commit marker。
   短 marker 必须经 repository commit API 解析，并唯一对应完整 current-head SHA。
+- Clean issue comment 使用封闭 grammar：exact
+  `Codex Review: Didn't find any major issues.` lead 后只允许无 tagline，或以下已观察到的
+  exact provider tagline：`Nice work!`、`Chef's kiss.`、
+  `What shall we delve into next?`、`Already looking forward to the next diff.`、
+  `Keep them coming.`、`:rocket:`、`:tada:`、`Swish.`、
+  `Another round soon, please!`、`Breezy!`、`Can't wait for the next one!`、
+  `More of your lovely PRs please.`、`Bravo.`、`Swish!`、`Keep it up!`、
+  `Delightful!`、`Hooray!`、`You're on a roll.` 或 `:+1:`。未知 prose 或近似
+  punctuation 仍 fail closed，finding signals 始终优先。
 - Review-body 和没有 thread 的 top-level findings 通过精确
   `https://github.com/<owner>/<repository>/blob/<40-hex>/...` links 绑定。混合
   repositories、commits 或不受支持的当前格式都不会被接受。
