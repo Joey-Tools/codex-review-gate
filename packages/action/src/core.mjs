@@ -42,7 +42,8 @@ const CODEX_CLEAN_TAGLINE_URL =
 const CODEX_CLEAN_TAGLINE_SCHEMA =
   /@codex\b|\b(?:Codex Review|Reviewed commit|Review coverage|No findings)\b|\bCoverage\s*:/iu;
 const CODEX_CLEAN_TAGLINE_ACTIONABLE_OR_CONTRADICTORY = [
-  /^(?:please\s+)?(?:fix|address|add|change|check|correct|investigate|remove|resolve|rewrite|update|verify)\b/iu,
+  /^please\s+(?:fix|address|add|change|check|correct|investigate|remove|resolve|rewrite|update|verify)\b/iu,
+  /^(?:fix|address|add|change|check|correct|investigate|remove|resolve|rewrite|update|verify)\s+(?:the|this|that|these|those|a|an|our|your|its|it)\b/iu,
   /^(?:please\s+)?consider\s+(?:adding|addressing|changing|checking|correcting|fixing|investigating|removing|resolving|rewriting|updating|verifying)\b/iu,
   /\b(?:should|must|needs? to|ought to)\s+(?:be\s+)?(?:fixed|addressed|added|changed|checked|corrected|investigated|removed|resolved|rewritten|updated|verified)\b/iu,
   /\b(?:but|however|though|yet)\b[^.!?]{0,80}\bplease\s+(?:fix|address|add|change|check|correct|investigate|remove|resolve|rewrite|update|verify)\b/iu,
