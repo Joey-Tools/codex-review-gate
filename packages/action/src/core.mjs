@@ -34,6 +34,17 @@ const CODEX_CLEAN_COMMENT_TAGLINES = new Set([
   ":rocket:",
   ":tada:",
   "Swish.",
+  "Another round soon, please!",
+  "Breezy!",
+  "Can't wait for the next one!",
+  "More of your lovely PRs please.",
+  "Bravo.",
+  "Swish!",
+  "Keep it up!",
+  "Delightful!",
+  "Hooray!",
+  "You're on a roll.",
+  ":+1:",
 ]);
 
 export const DEFAULT_CODEX_BOT_LOGINS = new Set([

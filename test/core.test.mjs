@@ -946,7 +946,7 @@ test("persists marker recovery fields when present", () => {
 test("accepts a live-style clean Codex issue-comment artifact with a 10-character commit", () => {
   const artifact = parseCodexIssueCommentArtifact(
     liveCodexIssueComment([
-      "Codex Review: Didn't find any major issues.",
+      "Codex Review: Didn't find any major issues. Another round soon, please!",
       "",
       "**Reviewed commit:** `abcdef1234`",
     ].join("\n")),
@@ -1001,6 +1001,17 @@ test("accepts observed clean taglines and the exact official disclosure", () => 
     ":rocket:",
     ":tada:",
     "Swish.",
+    "Another round soon, please!",
+    "Breezy!",
+    "Can't wait for the next one!",
+    "More of your lovely PRs please.",
+    "Bravo.",
+    "Swish!",
+    "Keep it up!",
+    "Delightful!",
+    "Hooray!",
+    "You're on a roll.",
+    ":+1:",
   ]) {
     const artifact = parseCodexIssueCommentArtifact(
       liveCodexIssueComment([
@@ -1035,14 +1046,14 @@ test("accepts a CRLF clean issue comment with the official disclosure", () => {
 test("rejects contradictory or schema-drift content embedded in clean issue comments", () => {
   const cases = [
     [
-      "Codex Review: Didn't find any major issues. Nice work!",
+      "Codex Review: Didn't find any major issues. Another round soon, please!",
       "",
       "**Reviewed commit:** `abcdef1234`",
       "",
       "### 💡 Codex Review",
     ].join("\n"),
     [
-      "Codex Review: Didn't find any major issues. Nice work!",
+      "Codex Review: Didn't find any major issues. Breezy!",
       "",
       "**Reviewed commit:** `abcdef1234`",
       "",
@@ -1060,6 +1071,11 @@ test("rejects contradictory or schema-drift content embedded in clean issue comm
       "",
       officialCodexDisclosure().replace("</details>", "Please fix this.\n</details>"),
     ].join("\n"),
+    [
+      "Codex Review: Didn't find any major issues. Another round soon, please.",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+    ].join("\n"),
   ];
 
   for (const body of cases) {
@@ -1069,6 +1085,15 @@ test("rejects contradictory or schema-drift content embedded in clean issue comm
     );
     assert.equal(artifact.kind, "malformed");
   }
+
+  const findingPriority = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(cases[0]),
+    { owner: "owner", repo: "repo" },
+  );
+  assert.equal(
+    findingPriority.reason,
+    "clean Codex issue comment contains finding-formatted content",
+  );
 });
 
 test("rejects official Codex issue comments with missing or wrong REST identity fields", () => {

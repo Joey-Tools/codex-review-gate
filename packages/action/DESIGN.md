@@ -535,7 +535,10 @@ heuristic:
   observed provider tagline: no tagline, `Nice work!`, `Chef's kiss.`,
   `What shall we delve into next?`,
   `Already looking forward to the next diff.`, `Keep them coming.`,
-  `:rocket:`, `:tada:`, or `Swish.` It contains exactly one
+  `:rocket:`, `:tada:`, `Swish.`, `Another round soon, please!`, `Breezy!`,
+  `Can't wait for the next one!`, `More of your lovely PRs please.`, `Bravo.`,
+  `Swish!`, `Keep it up!`, `Delightful!`, `Hooray!`, `You're on a roll.`, or
+  `:+1:`. It contains exactly one
   `**Reviewed commit:**` line with a 10- or 40-hex commit reference. After that
   line, it contains either nothing or the exact known official
   `ℹ️ About Codex in GitHub` disclosure block; arbitrary trailing prose is not
