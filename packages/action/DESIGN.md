@@ -534,7 +534,7 @@ heuristic:
   `Codex Review: Didn't find any major issues.` and may append only one known
   observed provider tagline: no tagline, `Nice work!`, `Chef's kiss.`,
   `What shall we delve into next?`,
-  `Already looking forward to the next diff.`, `Keep them coming.`,
+  `Already looking forward to the next diff.`, `Keep them coming.`, `Keep them coming!`,
   `:rocket:`, `:tada:`, `Swish.`, `Another round soon, please!`, `Breezy!`,
   `Can't wait for the next one!`, `More of your lovely PRs please.`, `Bravo.`,
   `Swish!`, `Keep it up!`, `Delightful!`, `Hooray!`, `You're on a roll.`, or

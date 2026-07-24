@@ -452,7 +452,7 @@ Accepted provider evidence 按 channel 校验：
   `Codex Review: Didn't find any major issues.` lead 后只允许无 tagline，或以下已观察到的
   exact provider tagline：`Nice work!`、`Chef's kiss.`、
   `What shall we delve into next?`、`Already looking forward to the next diff.`、
-  `Keep them coming.`、`:rocket:`、`:tada:`、`Swish.`、
+  `Keep them coming.`、`Keep them coming!`、`:rocket:`、`:tada:`、`Swish.`、
   `Another round soon, please!`、`Breezy!`、`Can't wait for the next one!`、
   `More of your lovely PRs please.`、`Bravo.`、`Swish!`、`Keep it up!`、
   `Delightful!`、`Hooray!`、`You're on a roll.` 或 `:+1:`。未知 prose 或近似

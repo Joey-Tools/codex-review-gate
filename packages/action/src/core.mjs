@@ -31,6 +31,7 @@ const CODEX_CLEAN_COMMENT_TAGLINES = new Set([
   "What shall we delve into next?",
   "Already looking forward to the next diff.",
   "Keep them coming.",
+  "Keep them coming!",
   ":rocket:",
   ":tada:",
   "Swish.",
