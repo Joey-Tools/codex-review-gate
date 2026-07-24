@@ -53,6 +53,19 @@ marker 的 baseline。绑定到无关、diverged 或无法验证 commit 的 clea
 `error`。延迟到达的 stale issue-comment clean 也不能唤醒现有 current-head marker：
 completion transition 必须精确匹配当前选中的 current-head clean provider artifact。
 
+Ancestry 使用 exact 40-hex `base...head` request endpoints 调用 REST
+commit-comparison endpoint。Response 必须包含 documented `base_commit`、
+`merge_base_commit`、`status`、`ahead_by`、`behind_by`、`total_commits` 和
+`commits` fields。Counts 必须是 nonnegative safe integers，`total_commits` 必须等于
+`ahead_by`，且 closed relationship 必须与 counts 和 merge base 一致。Unpaginated
+commit list 必须含有 `min(ahead_by, 250)` 个 unique full-SHA entries，排除 base 和
+merge-base commits；非空时，其 documented final entry 必须绑定 requested head SHA。`ahead` 证明
+ancestor，`identical` 证明相等，合法的 `behind` 和 `diverged` 则证明不是 ancestor。
+任何矛盾都作为 deterministic invalid response fail closed。只要 non-linear comparison
+的两个 counts 都为正，其 status 就必须是 `diverged`，不因哪个 count 较大而改判为
+`ahead` 或 `behind`。Action 不依赖 undocumented
+`head_commit` field，也不会额外 GET head commit。
+
 写入 `success` 前，action 严格按以下顺序执行：
 
 1. Best-effort 读取并缓存同一 context 的 newest live gate status，同时保留其 producer
