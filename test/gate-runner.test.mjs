@@ -6686,7 +6686,7 @@ function codexCleanCommentForHead(id, headSha, createdAt = "2026-05-14T10:00:00Z
   return {
     id,
     body: [
-      "Codex Review: Didn't find any major issues. Another round soon, please!",
+      "Codex Review: Didn't find any major issues. Keep them coming!",
       "",
       `**Reviewed commit:** \`${headSha.slice(0, 10)}\``,
     ].join("\n"),

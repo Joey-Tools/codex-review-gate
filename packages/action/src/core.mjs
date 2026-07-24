@@ -12,6 +12,8 @@ export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
 export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
 const MAX_CODEX_TERMINAL_HEADING_CODE_UNITS = 512;
 const MAX_CODEX_TERMINAL_HEADING_GRAPHEMES = 64;
+const MAX_CODEX_CLEAN_TAGLINE_CODE_UNITS = 160;
+const MAX_CODEX_CLEAN_TAGLINE_GRAPHEMES = 80;
 const MAX_FINDING_ID_SAMPLE_CODE_UNITS = 96;
 const EMOJI_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
@@ -20,32 +22,32 @@ const EMOJI_KEYCAP_GRAPHEME = /^[#*0-9]\uFE0F?\u20E3$/u;
 const EMOJI_FLAG_GRAPHEME = /^\p{Regional_Indicator}{2}$/u;
 const EMOJI_PRESENTATION_SIGNAL = /[\p{Extended_Pictographic}\p{Emoji_Presentation}]/u;
 const EMOJI_WITH_VARIATION_SELECTOR = /^(?=[\s\S]*\p{Emoji})(?=[\s\S]*\uFE0F)/u;
+const EMOJI_RGI_GRAPHEME = /^\p{RGI_Emoji}$/v;
+const EMOJI_ZWJ_GRAPHEME = /^\p{RGI_Emoji_ZWJ_Sequence}$/v;
+const CODEX_CLEAN_TAGLINE_DISPLAY_GRAPHEME =
+  /^(?=[\p{L}\p{M}\p{N}\p{P}\p{S}]+$)(?=[\s\S]*[\p{L}\p{N}\p{P}\p{S}])/u;
+const CODEX_CLEAN_TAGLINE_DEFAULT_IGNORABLE =
+  /\p{Default_Ignorable_Code_Point}/u;
 const UNKNOWN_TERMINAL_DECORATOR =
   /^[^\s]+[ \t]+Codex Review\b/iu;
 const CODEX_ISSUE_COMMENT_PROGRESS =
   /^Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
-const CODEX_CLEAN_COMMENT_TAGLINES = new Set([
-  "",
-  "Nice work!",
-  "Chef's kiss.",
-  "What shall we delve into next?",
-  "Already looking forward to the next diff.",
-  "Keep them coming.",
-  ":rocket:",
-  ":tada:",
-  "Swish.",
-  "Another round soon, please!",
-  "Breezy!",
-  "Can't wait for the next one!",
-  "More of your lovely PRs please.",
-  "Bravo.",
-  "Swish!",
-  "Keep it up!",
-  "Delightful!",
-  "Hooray!",
-  "You're on a roll.",
-  ":+1:",
-]);
+const CODEX_CLEAN_TAGLINE_DISALLOWED_SCALAR = /[\p{Cc}\p{Co}\p{Cs}]/u;
+const CODEX_CLEAN_TAGLINE_FORMAT_SCALAR = /\p{Cf}/u;
+const CODEX_CLEAN_TAGLINE_WHITESPACE_SCALAR = /\p{White_Space}/u;
+const CODEX_CLEAN_TAGLINE_MARKUP =
+  /[`<>\[\]{}#*_~]|(?:^|\s)>\s|^(?:[-+]|\d+[.)])\s|&(?:#\d+|#x[\da-f]+|[a-z][a-z\d]+);/iu;
+const CODEX_CLEAN_TAGLINE_URL =
+  /(?:\b[a-z][a-z\d+.-]*:\/\/|\bmailto:|\bwww\.|\b[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?)*\.[a-z]{2,63}(?:[/:?#][^\s]*)?)/iu;
+const CODEX_CLEAN_TAGLINE_SCHEMA =
+  /@codex\b|\b(?:Codex Review|Reviewed commit|Review coverage|No findings)\b|\bCoverage\s*:/iu;
+const CODEX_CLEAN_TAGLINE_ACTIONABLE_OR_CONTRADICTORY = [
+  /^(?:please\s+)?(?:fix|address|add|change|check|correct|investigate|remove|resolve|rewrite|update|verify)\b/iu,
+  /^(?:please\s+)?consider\s+(?:adding|addressing|changing|checking|correcting|fixing|investigating|removing|resolving|rewriting|updating|verifying)\b/iu,
+  /\b(?:should|must|needs? to|ought to)\s+(?:be\s+)?(?:fixed|addressed|added|changed|checked|corrected|investigated|removed|resolved|rewritten|updated|verified)\b/iu,
+  /\b(?:but|however|though|yet)\b[^.!?]{0,80}\bplease\s+(?:fix|address|add|change|check|correct|investigate|remove|resolve|rewrite|update|verify)\b/iu,
+  /\b(?:one|an?|some|another|\d+)\s+(?:issue|problem|bug|finding|blocker|concern|risk)s?\s+remain(?:s|ed)?\b/iu,
+];
 
 export const DEFAULT_CODEX_BOT_LOGINS = new Set([
   "chatgpt-codex-connector",
@@ -1317,13 +1319,14 @@ function issueCommentCleanBodyHasClosedGrammar(body, markerText) {
   if (prefix.includes("\n") || !prefix.startsWith(CODEX_CLEAN_COMMENT_LEAD)) {
     return false;
   }
-  const tagline = prefix.slice(CODEX_CLEAN_COMMENT_LEAD.length);
-  const normalizedTagline = tagline ? tagline.replace(/^ /, "") : "";
-  if (
-    (tagline && !tagline.startsWith(" ")) ||
-    !CODEX_CLEAN_COMMENT_TAGLINES.has(normalizedTagline)
-  ) {
-    return false;
+  if (prefix !== CODEX_CLEAN_COMMENT_LEAD) {
+    const taglinePrefix = `${CODEX_CLEAN_COMMENT_LEAD} `;
+    if (
+      !prefix.startsWith(taglinePrefix) ||
+      !cleanTaglineHasPresentationGrammar(prefix.slice(taglinePrefix.length))
+    ) {
+      return false;
+    }
   }
   const suffixBlock = normalizedBody.slice(markerIndex + normalizedMarker.length);
   if (!suffixBlock) {
@@ -1334,6 +1337,58 @@ function issueCommentCleanBodyHasClosedGrammar(body, markerText) {
     suffixBlock.startsWith("\n\n") &&
     officialCodexDisclosureHasClosedGrammar(suffixBlock.slice(2))
   );
+}
+
+function cleanTaglineHasPresentationGrammar(value) {
+  if (
+    !value ||
+    value.length > MAX_CODEX_CLEAN_TAGLINE_CODE_UNITS ||
+    value !== value.trim() ||
+    CODEX_CLEAN_TAGLINE_MARKUP.test(value) ||
+    CODEX_CLEAN_TAGLINE_URL.test(value) ||
+    CODEX_CLEAN_TAGLINE_SCHEMA.test(value) ||
+    CODEX_CLEAN_TAGLINE_ACTIONABLE_OR_CONTRADICTORY.some((pattern) =>
+      pattern.test(value))
+  ) {
+    return false;
+  }
+
+  let graphemeCount = 0;
+  for (const { segment } of EMOJI_GRAPHEME_SEGMENTER.segment(value)) {
+    graphemeCount += 1;
+    if (graphemeCount > MAX_CODEX_CLEAN_TAGLINE_GRAPHEMES) {
+      return false;
+    }
+    if (segment === " ") {
+      continue;
+    }
+    if (segment.includes("\u200D")) {
+      if (!EMOJI_ZWJ_GRAPHEME.test(segment)) {
+        return false;
+      }
+      continue;
+    }
+    if (
+      !CODEX_CLEAN_TAGLINE_DISPLAY_GRAPHEME.test(segment) ||
+      (
+        CODEX_CLEAN_TAGLINE_DEFAULT_IGNORABLE.test(segment) &&
+        !EMOJI_RGI_GRAPHEME.test(segment)
+      )
+    ) {
+      return false;
+    }
+  }
+
+  for (const scalar of value) {
+    if (
+      CODEX_CLEAN_TAGLINE_DISALLOWED_SCALAR.test(scalar) ||
+      (CODEX_CLEAN_TAGLINE_WHITESPACE_SCALAR.test(scalar) && scalar !== " ") ||
+      (CODEX_CLEAN_TAGLINE_FORMAT_SCALAR.test(scalar) && scalar !== "\u200D")
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function officialCodexDisclosureHasClosedGrammar(value) {

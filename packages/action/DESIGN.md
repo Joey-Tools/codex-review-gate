@@ -549,20 +549,29 @@ Accepted provider evidence is channel-specific:
   it does not match a known clean or finding grammar; it is never silently
   ignored.
 
-Clean provider artifacts use a closed grammar rather than an open-ended prose
-heuristic:
+Clean provider artifacts use a closed structural grammar. The optional tagline
+is a bounded presentation field, not an evidence field or a claim that arbitrary
+natural-language meaning can be proved:
 
 - A clean issue comment starts with exact
-  `Codex Review: Didn't find any major issues.` and may append only one known
-  observed provider tagline: no tagline, `Nice work!`, `Chef's kiss.`,
-  `What shall we delve into next?`,
-  `Already looking forward to the next diff.`, `Keep them coming.`,
-  `:rocket:`, `:tada:`, `Swish.`, `Another round soon, please!`, `Breezy!`,
-  `Can't wait for the next one!`, `More of your lovely PRs please.`, `Bravo.`,
-  `Swish!`, `Keep it up!`, `Delightful!`, `Hooray!`, `You're on a roll.`, or
-  `:+1:`. It contains exactly one
-  `**Reviewed commit:**` line with a 10- or 40-hex commit reference. After that
-  line, it contains either nothing or the exact known official
+  `Codex Review: Didn't find any major issues.`. It may end there or append one
+  nonempty, trimmed tagline on the same first line, separated by exactly one
+  ASCII space. The tagline is limited to 160 UTF-16 code units and 80 grapheme
+  clusters. Whitespace inside it must be ASCII space. Control and private-use
+  characters, unpaired surrogate code units, bidi controls, and invisible
+  formatting are rejected. A default-ignorable code point is accepted only
+  when its whole grapheme is RGI emoji; among format scalars, only ZWJ is
+  accepted, and only inside an RGI emoji ZWJ grapheme. Markdown or HTML markup,
+  URLs, backticks, `@codex`, clean-result
+  schema labels, and conservatively recognised actionable or contradictory
+  prose are also rejected. Unknown benign presentation prose, punctuation,
+  emoji shortcodes such as `:rocket:` and `:+1:`, and RGI emoji graphemes
+  compatible with these format constraints remain admissible. These lexical
+  guards intentionally do not claim complete natural-language understanding.
+
+  After the first line, the comment contains exactly one
+  `**Reviewed commit:**` line with a 10- or 40-hex commit reference. It then
+  contains either nothing or the exact known official
   `ℹ️ About Codex in GitHub` disclosure block; arbitrary trailing prose is not
   accepted. After CRLF normalisation, per-line trimming, and removal of blank
   lines, that disclosure is exactly:
@@ -595,7 +604,8 @@ heuristic:
 - Finding-shaped signals take precedence over a clean-looking wrapper. A
   finding heading, GitHub blob link, priority/severity badge or list marker, or
   contradictory finding language makes the artifact non-clean even when the
-  issue-comment lead or review state otherwise looks clean.
+  issue-comment lead or review state otherwise looks clean. A tagline is never
+  used as clean or finding evidence and cannot override these signals.
 
 The action fully paginates issue comments, reviews, inline comments, GraphQL
 review threads, and thread comments. Missing parent reviews, thread mappings,
@@ -625,9 +635,9 @@ newest same-context status is already `success` from exact
 `github-actions[bot]` / `Bot`. An external or missing producer cannot expose
 an older trusted status as the deduplication candidate.
 
-Unknown future provider formats fail the current run closed. Once a later run
-can parse a complete newer current-head clean result, an older format error or
-incomplete API attempt does not remain sticky.
+Structurally unsupported or malformed future provider formats fail the current
+run closed. Once a later run can parse a complete newer current-head clean
+result, an older format error or incomplete API attempt does not remain sticky.
 
 ## Fork and Dependabot PRs
 

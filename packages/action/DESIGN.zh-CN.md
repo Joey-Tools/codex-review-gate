@@ -468,15 +468,22 @@ Accepted provider evidence 按 channel 校验：
   `original_commit_id` 绑定；可变的 relocated inline `commit_id` 不是 provenance。
 - Top-level clean result 必须匹配受支持的 clean format，并包含 reviewed-commit marker。
   短 marker 必须经 repository commit API 解析，并唯一对应完整 current-head SHA。
-- Clean issue comment 使用封闭 grammar：exact
-  `Codex Review: Didn't find any major issues.` lead 后只允许无 tagline，或以下已观察到的
-  exact provider tagline：`Nice work!`、`Chef's kiss.`、
-  `What shall we delve into next?`、`Already looking forward to the next diff.`、
-  `Keep them coming.`、`:rocket:`、`:tada:`、`Swish.`、
-  `Another round soon, please!`、`Breezy!`、`Can't wait for the next one!`、
-  `More of your lovely PRs please.`、`Bravo.`、`Swish!`、`Keep it up!`、
-  `Delightful!`、`Hooray!`、`You're on a roll.` 或 `:+1:`。未知 prose 或近似
-  punctuation 仍 fail closed，finding signals 始终优先。
+- Clean issue comment 使用封闭的结构 grammar：首行以 exact
+  `Codex Review: Didn't find any major issues.` 开始，之后可以直接结束，也可以用
+  恰好一个 ASCII space 分隔一个 nonempty、trimmed、同首行 tagline。Tagline 只是
+  presentation field，不是 evidence field；它最多 160 个 UTF-16 code units 和 80 个
+  grapheme clusters，内部 whitespace 只能是 ASCII space。Control 与 private-use
+  characters、unpaired surrogate code units、bidi controls 与不可见 formatting
+  均拒绝。Default-ignorable code point 只有在整个 grapheme 都是 RGI emoji 时才
+  接受；format scalars 中唯一例外是 RGI emoji ZWJ grapheme 内的 ZWJ。
+  Markdown/HTML markup、URL、backtick、`@codex`、
+  clean-result schema labels，以及保守识别出的明显 actionable 或 contradictory prose
+  也会拒绝。未知但 benign 的 presentation prose、标点、`:rocket:` / `:+1:` shortcode
+  和符合上述 format 约束的 RGI emoji grapheme 可以通过；这些 lexical guards 不声称
+  可以完整理解或证明自然语言语义。
+- 首行之后必须有且仅有一个 10 或 40 hex 的 `**Reviewed commit:**` marker，并且只能
+  没有 suffix，或带 exact official disclosure；任意 trailing prose 均拒绝。Finding
+  signals 始终优先，tagline 不能提供 clean/finding evidence，也不能覆盖这些 signals。
 - Review-body 和没有 thread 的 top-level findings 通过精确
   `https://github.com/<owner>/<repository>/blob/<40-hex>/...` links 绑定。混合
   repositories、commits 或不受支持的当前格式都不会被接受。
@@ -499,9 +506,9 @@ reload）、no-network deduplication。只有 cached newest same-context status 
 `success`，且来自 exact `github-actions[bot]` / `Bot` 时才跳过 POST；external 或缺失
 producer 不能让更旧的 trusted status 成为 deduplication candidate。
 
-未知的未来 provider format 会使当前运行 fail closed。后续运行一旦能解析完整且更新的
-current-head clean result，较早的 format error 或 incomplete API attempt 不会继续
-sticky。
+不满足受支持结构 grammar 或 malformed 的未来 provider format 会使当前运行 fail
+closed。后续运行一旦能解析完整且更新的 current-head clean result，较早的 format
+error 或 incomplete API attempt 不会继续 sticky。
 
 ## Fork 和 Dependabot PRs
 

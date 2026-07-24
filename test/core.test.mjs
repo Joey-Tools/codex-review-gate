@@ -129,6 +129,28 @@ function officialCodexDisclosure() {
   ].join("\n");
 }
 
+function parseCleanIssueCommentFirstLine(firstLine, { disclosure = false } = {}) {
+  const lines = [
+    firstLine,
+    "",
+    "**Reviewed commit:** `abcdef1234`",
+  ];
+  if (disclosure) {
+    lines.push("", officialCodexDisclosure());
+  }
+  return parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(lines.join("\n")),
+    { owner: "owner", repo: "repo" },
+  );
+}
+
+function parseCleanTagline(tagline, options) {
+  return parseCleanIssueCommentFirstLine(
+    `Codex Review: Didn't find any major issues. ${tagline}`,
+    options,
+  );
+}
+
 function officialInlineParentReviewBody(commitRef = FULL_SHA_A.slice(0, 10)) {
   return [
     "### 💡 Codex Review",
@@ -991,7 +1013,7 @@ test("requires canonical positive integer IDs for provider terminal artifacts", 
   }
 });
 
-test("accepts observed clean taglines and the exact official disclosure", () => {
+test("accepts observed and unknown benign clean taglines as presentation text", () => {
   for (const tagline of [
     "Nice work!",
     "Chef's kiss.",
@@ -1012,18 +1034,114 @@ test("accepts observed clean taglines and the exact official disclosure", () => 
     "Hooray!",
     "You're on a roll.",
     ":+1:",
+    "Keep them coming!",
+    "Another round soon, please.",
+    "Excellent—what's next?",
+    "Ship-shape?",
+    "Consider me impressed!",
+    "Great work but the update is complete!",
+    "太棒了！",
+    "👩🏽‍💻 Ready for another round!",
+    "🏳️‍🌈 Wonderful!",
+    "👨‍❤️‍💋‍👨 Delightful!",
+    "Cafe\u0301, ❤️ 1️⃣ ❤️‍🔥",
   ]) {
-    const artifact = parseCodexIssueCommentArtifact(
-      liveCodexIssueComment([
-        `Codex Review: Didn't find any major issues. ${tagline}`,
-        "",
-        "**Reviewed commit:** `abcdef1234`",
-        "",
-        officialCodexDisclosure(),
-      ].join("\n")),
-      { owner: "owner", repo: "repo" },
-    );
+    const artifact = parseCleanTagline(tagline, { disclosure: true });
     assert.equal(artifact.kind, "clean", tagline);
+  }
+});
+
+test("enforces clean tagline separator, trimming, and one-line structure", () => {
+  const invalidFirstLines = [
+    "Codex Review: Didn't find any major issues. ",
+    "Codex Review: Didn't find any major issues.  Nice work!",
+    "Codex Review: Didn't find any major issues.\tNice work!",
+    "Codex Review: Didn't find any major issues.\u00A0Nice work!",
+    "Codex Review: Didn't find any major issues. Nice work! ",
+    "Codex Review: Didn't find any major issues. Nice\u00A0work!",
+    "Codex Review: Didn't find any major issues. Nice\u2003work!",
+    "Codex Review: Didn't find any major issues. Nice work!\nSecond line",
+  ];
+
+  for (const firstLine of invalidFirstLines) {
+    assert.equal(
+      parseCleanIssueCommentFirstLine(firstLine).kind,
+      "malformed",
+      JSON.stringify(firstLine),
+    );
+  }
+});
+
+test("enforces clean tagline UTF-16 and grapheme budgets", () => {
+  const exactCodeUnitAndGraphemeLimit = `${"🚀".repeat(79)}a\u0301`;
+  assert.equal(exactCodeUnitAndGraphemeLimit.length, 160);
+  assert.equal(parseCleanTagline(exactCodeUnitAndGraphemeLimit).kind, "clean");
+
+  const overCodeUnitLimit = `${exactCodeUnitAndGraphemeLimit}\u0301`;
+  assert.equal(overCodeUnitLimit.length, 161);
+  assert.equal(parseCleanTagline(overCodeUnitLimit).kind, "malformed");
+
+  assert.equal(parseCleanTagline("a".repeat(80)).kind, "clean");
+  assert.equal(parseCleanTagline("a".repeat(81)).kind, "malformed");
+});
+
+test("rejects unsafe Unicode scalars and format controls in clean taglines", () => {
+  for (const tagline of [
+    "Nice\u0000work!",
+    "Nice\uE000work!",
+    "Nice\uD800work!",
+    "Nice\uDC00work!",
+    "Nice\u202Ework!",
+    "Nice\u2060work!",
+    "Nice\u200Bwork!",
+    "Nice\u200Dwork!",
+    "😀‍😀 Nice work!",
+    "❤︎‍🔥 Nice work!",
+    "a\u034Fb",
+    "\u3164",
+    "\uFE0F",
+    "\u0301",
+    "\u0378",
+  ]) {
+    assert.equal(
+      parseCleanTagline(tagline).kind,
+      "malformed",
+      JSON.stringify(tagline),
+    );
+  }
+
+  assert.equal(
+    parseCleanTagline("👩🏽‍💻 Ready for another round!").kind,
+    "clean",
+  );
+});
+
+test("rejects markup, URLs, commands, and schema tokens in clean taglines", () => {
+  for (const tagline of [
+    "**Nice work!**",
+    "<strong>Nice work!</strong>",
+    "[Nice work!](https://example.com)",
+    "See https://example.com.",
+    "See example.com/docs.",
+    "`Nice work!`",
+    "@codex review",
+    "Coverage: `parser`.",
+    "Reviewed commit: abcdef1234.",
+    "No findings.",
+  ]) {
+    assert.equal(parseCleanTagline(tagline).kind, "malformed", tagline);
+  }
+});
+
+test("rejects clearly actionable or contradictory clean taglines", () => {
+  for (const tagline of [
+    "Please fix the parser.",
+    "Consider adding a regression test.",
+    "The parser should be updated.",
+    "One issue remains.",
+    "Great work but please verify the fallback.",
+  ]) {
+    assert.equal(parseCleanTagline(tagline).kind, "malformed", tagline);
   }
 });
 
@@ -1070,11 +1188,6 @@ test("rejects contradictory or schema-drift content embedded in clean issue comm
       "**Reviewed commit:** `abcdef1234`",
       "",
       officialCodexDisclosure().replace("</details>", "Please fix this.\n</details>"),
-    ].join("\n"),
-    [
-      "Codex Review: Didn't find any major issues. Another round soon, please.",
-      "",
-      "**Reviewed commit:** `abcdef1234`",
     ].join("\n"),
   ];
 
