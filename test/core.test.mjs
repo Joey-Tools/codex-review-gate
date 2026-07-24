@@ -998,6 +998,7 @@ test("accepts observed clean taglines and the exact official disclosure", () => 
     "What shall we delve into next?",
     "Already looking forward to the next diff.",
     "Keep them coming.",
+    "Keep them coming!",
     ":rocket:",
     ":tada:",
     "Swish.",
