@@ -55,7 +55,9 @@ commit-comparison endpoint。Response 必须包含 documented `base_commit`、
 commit list 必须含有 `min(ahead_by, 250)` 个 unique full-SHA entries，排除 base 和
 merge-base commits；非空时，其 documented final entry 必须绑定 requested head SHA。`ahead` 证明
 ancestor，`identical` 证明相等，合法的 `behind` 和 `diverged` 则证明不是 ancestor。
-任何矛盾都作为 deterministic invalid response fail closed。Action 不依赖 undocumented
+任何矛盾都作为 deterministic invalid response fail closed。只要 non-linear comparison
+的两个 counts 都为正，其 status 就必须是 `diverged`，不因哪个 count 较大而改判为
+`ahead` 或 `behind`。Action 不依赖 undocumented
 `head_commit` field，也不会额外 GET head commit。
 
 写入 `success` 前，action 严格按以下顺序执行：

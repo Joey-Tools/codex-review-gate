@@ -28,7 +28,8 @@ superseded_by:
 ## Evidence
 - Frozen implementation base: `2a3c65bf2c99c055cce78f2459a3feccd526384b`.
 - Node.js `v24.15.0` and npm `11.12.1` supplied the local validation runtime.
+- Live REST comparisons over asymmetric divergent histories returned `diverged` for `ahead_by / behind_by` pairs `3 / 6`, `3 / 2`, and `2 / 1`; count magnitude did not reclassify either direction as `ahead` or `behind`.
 - `npm run check` passed.
 - Focused gate-runner compare and ancestry tests passed.
-- `npm test -- --test-reporter=dot` passed the full 307-test suite.
+- `npm test -- --test-reporter=dot` passed the full 313-test suite.
 - `git diff --check` and the bundled project-journal validator passed.

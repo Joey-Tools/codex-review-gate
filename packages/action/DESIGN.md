@@ -67,7 +67,9 @@ merge-base commits, and bind a nonempty list's documented final entry to the
 requested head SHA. `ahead` proves ancestry,
 `identical` proves equality, while valid `behind` and `diverged` responses
 prove non-ancestry. Contradictions fail closed as deterministic invalid
-responses. The action neither depends on the undocumented `head_commit` field
+responses. A non-linear comparison with both counts positive is `diverged`
+regardless of which count is larger; count magnitude never reclassifies it as
+`ahead` or `behind`. The action neither depends on the undocumented `head_commit` field
 nor performs a separate head-commit GET.
 
 Before writing `success`, the action follows one fixed order:

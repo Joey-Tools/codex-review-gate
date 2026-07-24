@@ -1996,6 +1996,37 @@ test("a documented behind response is valid non-ancestor evidence", async () => 
   });
 });
 
+test("an asymmetric diverged response is valid non-ancestor evidence", async () => {
+  await withHarness(async (harness) => {
+    harness.commitResolutions[OLD_HEAD_SHA.slice(0, 10)] = OLD_HEAD_SHA;
+    harness.compareResults[`${OLD_HEAD_SHA}...${HEAD_SHA}`] = {
+      status: "diverged",
+      ahead_by: 3,
+      behind_by: 6,
+      total_commits: 3,
+      base_commit: { sha: OLD_HEAD_SHA },
+      merge_base_commit: { sha: NEW_HEAD_SHA },
+      commits: [
+        { sha: "1".repeat(40) },
+        { sha: "2".repeat(40) },
+        { sha: HEAD_SHA },
+      ],
+    };
+    harness.issueComments.push(codexCleanCommentForHead(2001, OLD_HEAD_SHA));
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.match(result.stderr, /not current head/);
+    assert.doesNotMatch(result.stderr, /ancestry response is invalid/);
+  });
+});
+
 test("a live-shaped compare response binds its exact requested endpoints without head_commit", async () => {
   await withHarness(async (harness) => {
     const oldShortSha = OLD_HEAD_SHA.slice(0, 10);
