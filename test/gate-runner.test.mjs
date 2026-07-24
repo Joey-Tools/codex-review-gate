@@ -2216,6 +2216,77 @@ test("closed-wait findings remain blocked when recovery is disabled", async () =
   });
 });
 
+test("closed-wait findings keep close-time blocking and fresh rejection semantics", async (t) => {
+  for (const mode of ["head", "fresh"]) {
+    await t.test(mode, async () => {
+      await withHarness(async (harness) => {
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome: "stalled",
+          headStartedAt: "2026-05-14T09:00:00Z",
+          maxWaitDeadlineAt: "2026-05-14T11:00:00Z",
+        });
+        const clean = codexCleanComment(2001);
+        harness.issueComments.push(clean);
+        harness.reviewComments.push(currentHeadInlineFinding(3001));
+        harness.reviewThreads.push(unresolvedThread(3001));
+
+        const failedResult = await harness.runGate({
+          eventName: "issue_comment",
+          event: {
+            issue: { number: 1, pull_request: {} },
+            comment: clean,
+          },
+          env: { FAILED_FINDINGS_RECOVERY_MODE: mode },
+        });
+
+        assert.equal(failedResult.code, 0, failedResult.stderr);
+        assert.equal(harness.statuses.at(-1).body.state, "failure");
+        let state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.history.at(-2).outcome, "stalled");
+        assert.equal(state.history.at(-1).outcome, "failed_findings");
+        assert.equal(state.history.at(-1).reconciledFromOutcome, "stalled");
+        assert.equal(state.history.at(-1).closedAt, "2026-05-14T10:01:00.000Z");
+        if (mode === "fresh") {
+          assert.equal(
+            state.history.at(-1).rejectedRecoveryCompletions.at(-1).id,
+            "2001",
+          );
+          assert.equal(
+            state.history.at(-1).rejectedRecoveryCompletions.at(-1).createdAt,
+            "2026-05-14T10:00:00Z",
+          );
+          assert.equal(
+            state.history.at(-1).latestRejectedRecoveryAt,
+            "2026-05-14T10:01:00.000Z",
+          );
+        } else {
+          assert.equal(state.history.at(-1).rejectedRecoveryCompletions, undefined);
+          assert.equal(state.history.at(-1).latestRejectedRecoveryAt, undefined);
+        }
+
+        harness.reviewThreads[0].isResolved = true;
+        const statusCount = harness.statuses.length;
+        const replayResult = await harness.runGate({
+          eventName: "issue_comment",
+          event: {
+            issue: { number: 1, pull_request: {} },
+            comment: clean,
+          },
+          env: { FAILED_FINDINGS_RECOVERY_MODE: mode },
+        });
+
+        assert.equal(replayResult.code, 0, replayResult.stderr);
+        state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(harness.statuses.length, statusCount);
+        assert.equal(successStatusWrites(harness), 0);
+        assert.equal(state.lastStatus.state, "failure");
+        assert.equal(state.history.at(-1).outcome, "failed_findings");
+      });
+    });
+  }
+});
+
 test("closed-wait findings recovery keeps existing head and fresh semantics", async (t) => {
   for (const mode of ["head", "fresh"]) {
     await t.test(mode, async () => {

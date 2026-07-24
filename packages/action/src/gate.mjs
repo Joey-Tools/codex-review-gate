@@ -1054,6 +1054,7 @@ async function reconcileCurrentReviewEvidence(
     const failedLineageState = recordClosedWaitFindingsLineage(
       snapshot.findings,
       state,
+      trigger,
       snapshot,
     );
     const rejectedState = recordRejectedFreshRecoveryAttempt(
@@ -1253,13 +1254,20 @@ function closedWaitMarkerHasRecoverableProvenance(marker, state) {
   );
 }
 
-function recordClosedWaitFindingsLineage(findings, state, snapshot) {
+function recordClosedWaitFindingsLineage(findings, state, trigger, snapshot) {
   const marker = recoverableClosedWaitMarker(state, snapshot);
   if (!marker) {
     return state;
   }
 
   const failedAt = isoNow();
+  const rejectedRecovery = closedWaitRejectedFreshRecovery(
+    snapshot.providerResult,
+    state,
+    trigger,
+    snapshot,
+    failedAt,
+  );
   return normalizeState({
     ...state,
     updatedAt: failedAt,
@@ -1272,9 +1280,48 @@ function recordClosedWaitFindingsLineage(findings, state, snapshot) {
         closedAt: failedAt,
         reconciledFromOutcome: marker.outcome || marker.state,
         currentHeadFindings: summarizeFindingsForState(findings),
+        ...(rejectedRecovery
+          ? {
+              latestRejectedRecoveryAt: latestRejectedRecoveryCutoff(
+                marker,
+                rejectedRecovery.rejectedAt,
+              ),
+              rejectedRecoveryCompletions: [
+                ...(marker.rejectedRecoveryCompletions || []),
+                rejectedRecovery,
+              ].slice(-20),
+            }
+          : {}),
       },
     ],
   });
+}
+
+function closedWaitRejectedFreshRecovery(
+  providerResult,
+  state,
+  trigger,
+  snapshot,
+  rejectedAt,
+) {
+  if (
+    !config.failedFindingsRecovery ||
+    config.failedFindingsRecoveryMode !== "fresh" ||
+    providerResult?.kind !== "clean" ||
+    providerResult.source !== "issue-comment" ||
+    !trigger?.completionComment ||
+    String(trigger.completionComment.id) !== String(providerResult.id) ||
+    trigger.completionComment.createdAt !== providerResult.createdAt ||
+    !closedWaitMarkerAuthorization(providerResult, state, snapshot)
+  ) {
+    return null;
+  }
+
+  return {
+    id: String(providerResult.id),
+    createdAt: providerResult.createdAt,
+    rejectedAt,
+  };
 }
 
 function trustedLiveMarkerMatches(recordedMarker, snapshot) {
@@ -1515,6 +1562,7 @@ async function passGateFromCurrentEvidence(
     const failedLineageState = recordClosedWaitFindingsLineage(
       finalSnapshot.findings,
       state,
+      trigger,
       finalSnapshot,
     );
     const rejectedState = recordRejectedFreshRecoveryAttempt(

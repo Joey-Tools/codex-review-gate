@@ -41,6 +41,7 @@ Runner 实现了 event-driven serialized marker flow：
 - 当前 reconciliation 无法完整加载或校验所需 evidence 时 fail closed。暂时性读取重试耗尽写入 `pending`；确定性的 provider identity、schema 或 commit 冲突写入 `error`；两者都会使 workflow 失败。
 - 在应用 marker 等待 deadline 前先 reconcile 完整 review evidence。即使 active marker 在 reconciliation 期间到达 deadline，只要 clean result 稳定且已授权，仍由 clean result 胜出。
 - `missed_ack`、`stalled` 或 `timed_out` 等待结束后观察到的 clean result，只有在 latest same-head historical marker 仍精确匹配 trusted live marker，且该 result 相对 marker 创建时间与 baseline 是新 transition 时才可恢复；这个恢复不会再发送 review 请求。
+- 在可恢复的 closed-wait lineage 上观察到 unresolved findings 时，将其转换为 `failed_findings`，因此 recovery-disabled 以及普通 failed-findings event 与 close-time 规则继续生效；`fresh` 会先记录精确的 rejected closed-wait clean 与 cutoff，再阻止后续重放。
 - 保留 timeout 来源，避免把 `failed_findings` 重新标记为 closed wait 后旁路其 recovery switch、event 或 cutoff 规则。
 - 如果 otherwise clean 的 current-head result 缺少 active-marker、closed-wait-marker、精确 passed-marker reassertion 或 failed-findings recovery lineage 授权，则主动降为 `pending`。
 - 写入 success 前，先缓存同一 context 的 newest live status 及其 producer，再验证 PR lifecycle 和 head，加载 final complete snapshot，并在需要时执行有界 whole-snapshot orphan reload；之后不再读取 status，只做 deduplication，并在需要时立即 POST success。

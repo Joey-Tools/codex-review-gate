@@ -22,6 +22,7 @@ superseded_by:
 - Both package manifests identify the patch as v1.3.3.
 - Closed-wait recovery requires the latest same-head historical marker to match the exact trusted live marker and requires a provider transition newer than the marker baseline and creation time.
 - Historical wait outcomes remain audit records. `failed_findings`, `state_lost`, and `obsolete_head` are not accepted through this recovery path.
+- Unresolved findings on a recoverable closed-wait lineage persist an exact `failed_findings` descendant before failure. Recovery-disabled and ordinary failed-findings event and close-time rules then apply; `fresh` records the exact rejected closed-wait clean and cutoff before any later replay.
 - Timeout records preserve their source outcome so a `failed_findings` lineage cannot bypass its recovery switch, event, or cutoff requirements.
 - A fresh head with unresolved findings still creates its controlled marker before recording canonical `failed_findings`; resolving the thread can then continue through the ordinary provider signal path without a manual dispatch.
 - Final validation reloads the complete evidence snapshot and revalidates the same authorisation kind before writing success.
@@ -33,3 +34,4 @@ superseded_by:
 - Bootstrap PR #23 added the exact observed `Keep them coming!` variant to the trusted v1.3.2 finite grammar and was squash-merged as `2a3c65bf2c99c055cce78f2459a3feccd526384b`; its synchronized action subtree is `f2b53c53145bff3a43baf6f53388dba2feea937c`.
 - The final v1.3.3 worktree passes `npm run check`, the complete `npm test -- --test-reporter=dot` suite, `git diff --check`, and project-journal validation.
 - The structural tagline update passes focused `core` and `gate-runner` tests, `npm run check`, and `git diff --check`; the gate-runner clean fixture uses the supported punctuation variant `Keep them coming!`.
+- The closed-wait findings-lineage regressions cover recovery-disabled and normal-timestamp `head`/`fresh` behavior: both modes retain the ordinary close-time block, while `fresh` also records the exact triggering clean and rejection cutoff. The 31-test focused gate slice, `npm run check`, `git diff --check`, and project-journal validation pass with Node v24.15.0 and npm 11.12.1.

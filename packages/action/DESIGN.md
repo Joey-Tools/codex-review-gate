@@ -180,6 +180,14 @@ posts another `@codex review`. A wait timeout derived from `failed_findings`
 retains that origin and remains subject to the existing failed-findings
 recovery switch, event, and cutoff rules.
 
+If unresolved findings are observed against a recoverable closed-wait marker,
+the gate first persists a `failed_findings` descendant of that exact trusted
+lineage. Recovery-disabled and the ordinary failed-findings event and close-time
+rules then apply. In `fresh` mode, an exact triggering clean that qualified for
+the closed-wait lineage is recorded with its rejection cutoff even when its
+provider timestamp precedes the synthesized failure close time, so that result
+cannot be replayed after resolution.
+
 ## Generative AI Disclosure
 
 The controlled marker comment intentionally remains a minimal `@codex review` command plus hidden gate metadata so the Codex GitHub integration can parse it reliably. When the workflow posts a controlled marker, it writes the visible disclosure to the GitHub Actions step summary instead: the workflow is requesting a Codex generative AI review, Codex may post AI-generated comments or reviews, and maintainers should verify that output before relying on it for security, correctness, or merge decisions.

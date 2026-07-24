@@ -127,6 +127,12 @@ Closed-wait recovery 使用原 marker 的创建时间和 baseline，而不是记
 由 `failed_findings` 演变出的等待 timeout 会保留该来源，并继续遵守既有的
 failed-findings recovery switch、event 与 cutoff 规则。
 
+如果在可恢复的 closed-wait marker 上观察到 unresolved findings，gate 会先持久化该
+精确信任 lineage 的 `failed_findings` 后继记录。之后应用 recovery-disabled 以及普通
+failed-findings event 与 close-time 规则。在 `fresh` 模式下，即使精确触发且满足
+closed-wait lineage 的 clean，其 provider timestamp 早于合成的 failure close time，
+也会记录该 rejection 与 cutoff，因此 findings resolved 后不能重放这个结果。
+
 每次 GitHub request attempt 的默认 deadline 是 60 秒，覆盖 fetch 和 response-body
 读取。对于原本允许 retry 的 response，REST 和 GraphQL 都会遵守不超过 10 秒的合法
 `Retry-After`。更长的合法 delay 会立即停止：evidence read 记为 transient
