@@ -56,6 +56,22 @@ commit remains a deterministic error. A delayed stale issue-comment clean also
 cannot wake an existing current-head marker: a completion transition must
 match the exact provider artifact selected as the current-head clean result.
 
+Ancestry uses the REST commit-comparison endpoint with exact 40-hex
+`base...head` request endpoints. The response must contain documented
+`base_commit`, `merge_base_commit`, `status`, `ahead_by`, `behind_by`,
+`total_commits`, and `commits` fields. Counts must be nonnegative safe
+integers, `total_commits` must equal `ahead_by`, and the closed relationship
+must agree with its counts and merge base. The unpaginated commit list must
+contain `min(ahead_by, 250)` unique full-SHA entries, exclude the base and
+merge-base commits, and bind a nonempty list's documented final entry to the
+requested head SHA. `ahead` proves ancestry,
+`identical` proves equality, while valid `behind` and `diverged` responses
+prove non-ancestry. Contradictions fail closed as deterministic invalid
+responses. A non-linear comparison with both counts positive is `diverged`
+regardless of which count is larger; count magnitude never reclassifies it as
+`ahead` or `behind`. The action neither depends on the undocumented `head_commit` field
+nor performs a separate head-commit GET.
+
 Before writing `success`, the action follows one fixed order:
 
 1. Read and cache the newest same-context live gate status on a best-effort
