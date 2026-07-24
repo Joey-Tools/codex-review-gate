@@ -61,7 +61,9 @@ Ancestry uses the REST commit-comparison endpoint with exact 40-hex
 `base_commit`, `merge_base_commit`, `status`, `ahead_by`, `behind_by`,
 `total_commits`, and `commits` fields. Counts must be nonnegative safe
 integers, `total_commits` must equal `ahead_by`, and the closed relationship
-must agree with its counts and merge base: `ahead` proves ancestry,
+must agree with its counts and merge base. The unpaginated commit list must
+contain `min(ahead_by, 250)` entries, and a nonempty list's documented final
+entry must bind the requested head SHA. `ahead` proves ancestry,
 `identical` proves equality, while valid `behind` and `diverged` responses
 prove non-ancestry. Contradictions fail closed as deterministic invalid
 responses. The action neither depends on the undocumented `head_commit` field

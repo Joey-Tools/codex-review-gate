@@ -2543,6 +2543,25 @@ async function commitIsAncestor(baseSha, headSha, cache, evidenceBudget) {
       `reported total_commits ${totalCommits} but ahead_by ${aheadBy}`,
     );
   }
+  const expectedCommitCount = Math.min(aheadBy, 250);
+  if (data.commits.length !== expectedCommitCount) {
+    throw invalidResponse(
+      `returned ${data.commits.length} commits but the unpaginated response requires ${expectedCommitCount}`,
+    );
+  }
+  if (expectedCommitCount > 0) {
+    const terminalCommitSha = String(
+      data.commits.at(-1)?.sha || "",
+    ).toLowerCase();
+    if (
+      !/^[0-9a-f]{40}$/.test(terminalCommitSha) ||
+      terminalCommitSha !== headSha
+    ) {
+      throw invalidResponse(
+        `bound terminal commit ${terminalCommitSha || "<missing>"} instead of requested head ${headSha}`,
+      );
+    }
+  }
 
   let isAncestor;
   if (

@@ -2064,6 +2064,23 @@ test("compare relationship and count contradictions fail closed", async (t) => {
       expected: /reported total_commits 2 but ahead_by 1/,
     },
     {
+      name: "commit list does not end at the requested head",
+      response: {
+        ...validAhead,
+        commits: [{ sha: NEW_HEAD_SHA }],
+      },
+      expected: /instead of requested head/,
+    },
+    {
+      name: "unpaginated commit list has the wrong length",
+      response: {
+        ...validAhead,
+        ahead_by: 2,
+        total_commits: 2,
+      },
+      expected: /returned 1 commits.*requires 2/,
+    },
+    {
       name: "ahead reports a behind count",
       response: {
         ...validAhead,
