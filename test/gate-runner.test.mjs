@@ -1850,6 +1850,136 @@ test("closed-wait artifacts created after max wait cannot pass", async (t) => {
   }
 });
 
+test("legacy pre-creation deadlines use a bounded live-marker window", async (t) => {
+  for (const scenario of [
+    {
+      name: "issue comment within derived window",
+      source: "issue-comment",
+      artifactCreatedAt: "2026-05-14T10:04:00Z",
+      expectedStatus: "success",
+    },
+    {
+      name: "review within derived window",
+      source: "pull-request-review",
+      artifactCreatedAt: "2026-05-14T10:04:00Z",
+      expectedStatus: "success",
+    },
+    {
+      name: "issue comment at derived deadline",
+      source: "issue-comment",
+      artifactCreatedAt: "2026-05-14T10:05:00Z",
+      expectedStatus: "success",
+    },
+    {
+      name: "issue comment after derived window",
+      source: "issue-comment",
+      artifactCreatedAt: "2026-05-14T10:06:00Z",
+      expectedStatus: "failure",
+    },
+    {
+      name: "review after derived window",
+      source: "pull-request-review",
+      artifactCreatedAt: "2026-05-14T10:06:00Z",
+      expectedStatus: "failure",
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      await withHarness(async (harness) => {
+        harness.now = Date.parse("2026-05-14T10:07:00Z");
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome: "timed_out",
+          closedAt: "2026-05-14T10:06:30Z",
+          headStartedAt: "2026-05-14T08:00:00Z",
+          maxWaitDeadlineAt: "2026-05-14T09:54:00Z",
+        });
+        if (scenario.source === "issue-comment") {
+          harness.issueComments.push(
+            codexCleanComment(2001, scenario.artifactCreatedAt),
+          );
+        } else {
+          harness.reviews.push(
+            codexApprovedReview(4001, scenario.artifactCreatedAt),
+          );
+        }
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+          env: { MAX_WAIT_SECONDS: "600" },
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(harness.statuses.at(-1).body.state, scenario.expectedStatus);
+        assert.equal(
+          successStatusWrites(harness),
+          scenario.expectedStatus === "success" ? 1 : 0,
+        );
+        assert.equal(markerCommentWrites(harness), 0);
+        assert.equal(harness.findMarkerComments().length, 1);
+      });
+    });
+  }
+});
+
+test("a deadline equal to live marker creation remains authoritative", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "timed_out",
+      closedAt: "2026-05-14T10:00:30Z",
+      headStartedAt: "2026-05-14T08:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T09:55:00Z",
+    });
+    harness.issueComments.push(
+      codexCleanComment(2001, "2026-05-14T09:56:00Z"),
+    );
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+      env: { MAX_WAIT_SECONDS: "600" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(harness.findMarkerComments().length, 1);
+  });
+});
+
+test("a state-only pre-creation legacy deadline still narrows the window", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "timed_out",
+      closedAt: "2026-05-14T10:00:30Z",
+      headStartedAt: "2026-05-14T08:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T09:54:00Z",
+    });
+    removePersistedMaxWaitDeadline(harness, {
+      removeLiveHeadStartedAt: true,
+      removeStateDeadline: false,
+    });
+    harness.issueComments.push(
+      codexCleanComment(2001, "2026-05-14T09:56:00Z"),
+    );
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+      env: { MAX_WAIT_SECONDS: "600" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(harness.findMarkerComments().length, 1);
+  });
+});
+
 test("closed-wait authorization rejects state deadline drift", async () => {
   await withHarness(async (harness) => {
     harness.seedHistoryOnlyRetryState({

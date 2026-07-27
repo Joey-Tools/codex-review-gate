@@ -1168,9 +1168,23 @@ function authorizationWithinMaxWaitDeadline(
     return null;
   }
   const liveHasPersistedDeadline = liveMarker.maxWaitDeadlineAt != null;
-  const liveDeadlineAt = liveHasPersistedDeadline
-    ? liveMarker.maxWaitDeadlineAt
-    : addSeconds(headStartedAt, Math.round(config.maxWaitMs / 1000));
+  const liveMarkerCreatedMs = parseTimestamp(
+    liveMarker.createdAt,
+    "live marker creation time",
+  );
+  const persistedLiveDeadlineMs = liveHasPersistedDeadline
+    ? parseTimestamp(liveMarker.maxWaitDeadlineAt, "max wait deadline")
+    : null;
+  const persistedDeadlinePredatesMarker =
+    persistedLiveDeadlineMs != null &&
+    persistedLiveDeadlineMs < liveMarkerCreatedMs;
+  const liveDeadlineAt =
+    !liveHasPersistedDeadline || persistedDeadlinePredatesMarker
+      ? addSeconds(
+          persistedDeadlinePredatesMarker ? liveMarker.createdAt : headStartedAt,
+          Math.round(config.maxWaitMs / 1000),
+        )
+      : liveMarker.maxWaitDeadlineAt;
   const liveDeadlineMs = parseTimestamp(liveDeadlineAt, "max wait deadline");
   const recordedDeadlineAt = authorization.marker?.maxWaitDeadlineAt;
   const maxWaitDeadlineMs =
