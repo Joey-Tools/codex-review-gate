@@ -127,6 +127,14 @@ Closed-wait recovery 使用原 marker 的创建时间和 baseline，而不是记
 由 `failed_findings` 演变出的等待 timeout 会保留该来源，并继续遵守既有的
 failed-findings recovery switch、event 与 cutoff 规则。
 
+所有 authorization kind 也会把选中的 provider artifact 绑定到该 marker 的整体等待预算。
+已持久化的 `maxWaitDeadlineAt` 是权威值；legacy marker 缺少该字段时，根据
+`headStartedAt`（若没有则用 `createdAt`）与当前 maximum-wait control 推导 deadline。
+只要 clean comment 或 review 的创建时间不晚于该 deadline，即使 reconciliation 或
+final validation 在 deadline 当时或之后运行，它仍可胜出；deadline 之后才创建的
+artifact 不能授权 active-marker success、closed-wait recovery、failed-findings recovery
+或 passed-history reassertion。
+
 如果在可恢复的 closed-wait marker 上观察到 unresolved findings，gate 会先持久化该
 精确信任 lineage 的 `failed_findings` 后继记录。之后应用 recovery-disabled 以及普通
 failed-findings event 与 close-time 规则。在 `fresh` 模式下，即使精确触发且满足

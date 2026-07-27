@@ -21,6 +21,7 @@ superseded_by:
 ## Current State
 - Both package manifests identify the patch as v1.3.3.
 - Closed-wait recovery requires the latest same-head historical marker to match the exact trusted live marker and requires a provider transition newer than the marker baseline and creation time.
+- Active, closed-wait, failed-findings, and passed-history authorization all require the selected clean artifact to be created no later than the originating marker's persisted `maxWaitDeadlineAt`, or a legacy deadline derived from `headStartedAt`/`createdAt` and the current maximum wait; a pre-deadline artifact may still finish reconciliation after that deadline.
 - Historical wait outcomes remain audit records. `failed_findings`, `state_lost`, and `obsolete_head` are not accepted through this recovery path.
 - Unresolved findings on a recoverable closed-wait lineage persist an exact `failed_findings` descendant before failure. Recovery-disabled and ordinary failed-findings event and close-time rules then apply; `fresh` records the exact rejected closed-wait clean and cutoff before any later replay.
 - Timeout records preserve their source outcome so a `failed_findings` lineage cannot bypass its recovery switch, event, or cutoff requirements.
@@ -35,3 +36,4 @@ superseded_by:
 - The final v1.3.3 worktree passes `npm run check`, the complete `npm test -- --test-reporter=dot` suite, `git diff --check`, and project-journal validation.
 - The structural tagline update passes focused `core` and `gate-runner` tests, `npm run check`, and `git diff --check`; the gate-runner clean fixture uses the supported punctuation variant `Keep them coming!`.
 - The closed-wait findings-lineage regressions cover recovery-disabled and normal-timestamp `head`/`fresh` behavior: both modes retain the ordinary close-time block, while `fresh` also records the exact triggering clean and rejection cutoff. The 31-test focused gate slice, `npm run check`, `git diff --check`, and project-journal validation pass with Node v24.15.0 and npm 11.12.1.
+- The provider-deadline regressions cover issue-comment and pull-request-review artifacts for active and closed waits, failed-findings recovery, exact-deadline acceptance, and passed-history reassertion.

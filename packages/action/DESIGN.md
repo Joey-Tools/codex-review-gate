@@ -180,6 +180,15 @@ posts another `@codex review`. A wait timeout derived from `failed_findings`
 retains that origin and remains subject to the existing failed-findings
 recovery switch, event, and cutoff rules.
 
+Every authorization kind also binds the selected provider artifact to the
+marker's overall wait budget. The persisted `maxWaitDeadlineAt` is authoritative;
+for a legacy marker without that field, the deadline is derived from
+`headStartedAt` (or `createdAt`) and the current maximum-wait control. A clean
+comment or review created no later than that deadline may still win when
+reconciliation or final validation runs at or after the deadline. An artifact
+created after it cannot authorize active-marker success, closed-wait recovery,
+failed-findings recovery, or passed-history reassertion.
+
 If unresolved findings are observed against a recoverable closed-wait marker,
 the gate first persists a `failed_findings` descendant of that exact trusted
 lineage. Recovery-disabled and the ordinary failed-findings event and close-time

@@ -1089,11 +1089,11 @@ async function reconcileCurrentReviewEvidence(
 function providerResultAuthorization(providerResult, state, trigger, snapshot) {
   const marker = state?.activeMarker;
   if (!marker) {
-    return (
+    const authorization =
       passedMarkerReassertAuthorization(providerResult, state, snapshot) ||
       failedFindingsRecoveryAuthorization(providerResult, state, trigger, snapshot) ||
-      closedWaitMarkerAuthorization(providerResult, state, snapshot)
-    );
+      closedWaitMarkerAuthorization(providerResult, state, snapshot);
+    return authorizationWithinMaxWaitDeadline(providerResult, authorization);
   }
   if (activeMarkerIsObsolete(marker, statusSha)) {
     return null;
@@ -1106,7 +1106,7 @@ function providerResultAuthorization(providerResult, state, trigger, snapshot) {
     ? marker.baseline?.completionComment
     : marker.baseline?.approvedReview;
   if (providerResult.source === "issue-comment") {
-    return hasNewCompletionComment(
+    const authorization = hasNewCompletionComment(
       baselineArtifact,
       {
         id: String(providerResult.id),
@@ -1117,9 +1117,10 @@ function providerResultAuthorization(providerResult, state, trigger, snapshot) {
     )
       ? { kind: "active-marker", marker }
       : null;
+    return authorizationWithinMaxWaitDeadline(providerResult, authorization);
   }
   if (providerResult.source === "pull-request-review") {
-    return hasNewReviewTransition(
+    const authorization = hasNewReviewTransition(
       baselineArtifact,
       {
         id: String(providerResult.id),
@@ -1129,9 +1130,33 @@ function providerResultAuthorization(providerResult, state, trigger, snapshot) {
     )
       ? { kind: "active-marker", marker }
       : null;
+    return authorizationWithinMaxWaitDeadline(providerResult, authorization);
   }
 
   return null;
+}
+
+function authorizationWithinMaxWaitDeadline(providerResult, authorization) {
+  if (!authorization) {
+    return null;
+  }
+  const marker = authorization.marker;
+  if (!marker) {
+    return null;
+  }
+  const headStartedAt = marker.headStartedAt || marker.createdAt;
+  if (!headStartedAt) {
+    return null;
+  }
+  const maxWaitDeadlineAt =
+    marker.maxWaitDeadlineAt ||
+    addSeconds(headStartedAt, Math.round(config.maxWaitMs / 1000));
+  return parseTimestamp(
+    providerResult.createdAt,
+    "Codex provider result creation time",
+  ) <= parseTimestamp(maxWaitDeadlineAt, "max wait deadline")
+    ? authorization
+    : null;
 }
 
 function passedMarkerReassertAuthorization(providerResult, state, snapshot) {
@@ -1312,7 +1337,10 @@ function closedWaitRejectedFreshRecovery(
     !trigger?.completionComment ||
     String(trigger.completionComment.id) !== String(providerResult.id) ||
     trigger.completionComment.createdAt !== providerResult.createdAt ||
-    !closedWaitMarkerAuthorization(providerResult, state, snapshot)
+    !authorizationWithinMaxWaitDeadline(
+      providerResult,
+      closedWaitMarkerAuthorization(providerResult, state, snapshot),
+    )
   ) {
     return null;
   }
@@ -1470,11 +1498,14 @@ function failedFindingsRecoveryAuthorization(providerResult, state, trigger, sna
 }
 
 function recordRejectedFreshRecoveryAttempt(providerResult, state, trigger, snapshot) {
-  const authorization = failedFindingsRecoveryAuthorization(
+  const authorization = authorizationWithinMaxWaitDeadline(
     providerResult,
-    state,
-    trigger,
-    snapshot,
+    failedFindingsRecoveryAuthorization(
+      providerResult,
+      state,
+      trigger,
+      snapshot,
+    ),
   );
   if (config.failedFindingsRecoveryMode !== "fresh" || !authorization) {
     return state;

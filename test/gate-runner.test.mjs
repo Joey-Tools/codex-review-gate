@@ -998,6 +998,81 @@ test("failed-findings recovery requires a clean strictly newer than marker close
   });
 });
 
+test("failed-findings recovery rejects a clean created after max wait", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({
+      id: 2000,
+      closedAt: "2026-05-14T09:58:00Z",
+      headStartedAt: "2026-05-14T09:30:00Z",
+      maxWaitDeadlineAt: "2026-05-14T09:59:00Z",
+    });
+    const comment = codexCleanComment(2001);
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.activeMarker, null);
+    assert.equal(state.history.at(-2).outcome, "failed_findings");
+    assert.equal(state.history.at(-1).outcome, "timed_out");
+  });
+});
+
+test("failed-findings recovery derives a missing legacy max-wait deadline", async (t) => {
+  for (const scenario of [
+    {
+      name: "artifact-before-derived-deadline",
+      headStartedAt: "2026-05-14T08:30:00Z",
+      expectedStatus: "success",
+    },
+    {
+      name: "artifact-after-derived-deadline",
+      headStartedAt: "2026-05-14T07:30:00Z",
+      expectedStatus: "failure",
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      await withHarness(async (harness) => {
+        harness.seedFailedFindingsState({
+          id: 2000,
+          closedAt: "2026-05-14T09:58:00Z",
+          headStartedAt: scenario.headStartedAt,
+        });
+        removePersistedMaxWaitDeadline(harness);
+        const comment = codexCleanComment(2001);
+        harness.issueComments.push(comment);
+
+        const result = await harness.runGate({
+          eventName: "issue_comment",
+          event: {
+            issue: { number: 1, pull_request: {} },
+            comment,
+          },
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(
+          harness.statuses.at(-1).body.state,
+          scenario.expectedStatus,
+        );
+        assert.equal(
+          successStatusWrites(harness),
+          scenario.expectedStatus === "success" ? 1 : 0,
+        );
+      });
+    });
+  }
+});
+
 test("no-marker clean cannot recover disallowed history", async () => {
   await withHarness(async (harness) => {
     harness.seedFailedFindingsState({ id: 2000 });
@@ -1684,6 +1759,40 @@ test("late clean from each closed wait outcome passes for issue comments and rev
   }
 });
 
+test("closed-wait artifacts created after max wait cannot pass", async (t) => {
+  for (const source of ["issue-comment", "pull-request-review"]) {
+    await t.test(source, async () => {
+      await withHarness(async (harness) => {
+        harness.seedHistoryOnlyRetryState({
+          id: 2000,
+          outcome: "timed_out",
+          closedAt: "2026-05-14T10:00:30Z",
+          headStartedAt: "2026-05-14T08:01:00Z",
+          maxWaitDeadlineAt: "2026-05-14T09:59:00Z",
+        });
+        if (source === "issue-comment") {
+          harness.issueComments.push(codexCleanComment(2001));
+        } else {
+          harness.reviews.push(codexApprovedReview(4001));
+        }
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(successStatusWrites(harness), 0);
+        assert.equal(markerCommentWrites(harness), 0);
+        assert.equal(harness.statuses.at(-1).body.state, "failure");
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.activeMarker, null);
+        assert.equal(state.history.at(-1).outcome, "timed_out");
+      });
+    });
+  }
+});
+
 test("a late clean recovers a timeout persisted by the previous run", async () => {
   await withHarness(async (harness) => {
     harness.seedActiveMarker({
@@ -2024,7 +2133,7 @@ test("failed-findings recovery unwraps only exact timeout lineage", async (t) =>
         }
         stateComment.body = stateCommentBody(timedOutState);
 
-        const clean = codexCleanComment(2001, "2026-05-14T10:02:00Z");
+        const clean = codexCleanComment(2001, "2026-05-14T10:00:00Z");
         harness.issueComments.push(clean);
         const recoveryResult = await harness.runGate({
           eventName: "issue_comment",
@@ -2039,6 +2148,54 @@ test("failed-findings recovery unwraps only exact timeout lineage", async (t) =>
         assert.equal(
           parseStateCommentBody(harness.findStateComment().body).lastStatus.state,
           "success",
+        );
+      });
+    });
+  }
+});
+
+test("timed-out failed-findings lineage rejects post-deadline recovery", async (t) => {
+  for (const mode of ["head", "fresh"]) {
+    await t.test(mode, async () => {
+      await withHarness(async (harness) => {
+        harness.seedFailedFindingsState({
+          id: 2000,
+          maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+        });
+
+        const timeoutResult = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+          env: { FAILED_FINDINGS_RECOVERY_MODE: mode },
+        });
+        assert.equal(timeoutResult.code, 0, timeoutResult.stderr);
+
+        const clean = codexCleanComment(2001, "2026-05-14T10:02:00Z");
+        harness.issueComments.push(clean);
+        harness.reviewComments.push(currentHeadInlineFinding(3001));
+        harness.reviewThreads.push(unresolvedThread(3001));
+        const recoveryResult = await harness.runGate({
+          eventName: "issue_comment",
+          event: {
+            issue: { number: 1, pull_request: {} },
+            comment: clean,
+          },
+          env: { FAILED_FINDINGS_RECOVERY_MODE: mode },
+        });
+
+        assert.equal(recoveryResult.code, 0, recoveryResult.stderr);
+        assert.equal(successStatusWrites(harness), 0);
+        assert.equal(harness.statuses.at(-1).body.state, "failure");
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.history.at(-2).outcome, "failed_findings");
+        assert.equal(state.history.at(-1).outcome, "timed_out");
+        assert.equal(
+          state.history.some((marker) =>
+            marker.rejectedRecoveryCompletions?.some(
+              (candidate) => candidate.id === "2001",
+            )
+          ),
+          false,
         );
       });
     });
@@ -2063,7 +2220,7 @@ test("fresh rejection persists on explicit timeout lineage after history truncat
     timedOutState.history = [timedOutState.history.at(-1)];
     stateComment.body = stateCommentBody(timedOutState);
 
-    const clean = codexCleanComment(2001, "2026-05-14T10:02:00Z");
+    const clean = codexCleanComment(2001, "2026-05-14T10:00:00Z");
     harness.issueComments.push(clean);
     harness.reviewComments.push(currentHeadInlineFinding(3001));
     harness.reviewThreads.push(unresolvedThread(3001));
@@ -2123,7 +2280,7 @@ test("failed-findings timeout recovery never crosses marker identity", async () 
     const state = parseStateCommentBody(stateComment.body);
     state.history.at(-1).id = "2001";
     stateComment.body = stateCommentBody(state);
-    const clean = codexCleanComment(2002, "2026-05-14T10:02:00Z");
+    const clean = codexCleanComment(2002, "2026-05-14T10:00:00Z");
     harness.issueComments.push(clean);
 
     const recoveryResult = await harness.runGate({
@@ -2564,44 +2721,97 @@ test("history-only retries inherit the exact wait deadline across config changes
   }
 });
 
-test("stable active-marker clean wins at the exact max-wait deadline", async () => {
-  await withHarness(async (harness) => {
-    harness.seedActiveMarker({
-      id: 2000,
-      headSha: HEAD_SHA,
-      createdAt: "2026-05-14T09:30:00Z",
-      ackDeadlineAt: "2026-05-14T10:30:00Z",
-      nextRetryAt: "2026-05-14T10:30:00Z",
-      maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
-      baseline: {
-        plusOne: null,
-        eyes: null,
-        completionComment: null,
-        approvedReview: null,
-        submittedReview: null,
-      },
+test("stable active-marker artifacts created at max wait can pass", async (t) => {
+  for (const source of ["issue-comment", "pull-request-review"]) {
+    await t.test(source, async () => {
+      await withHarness(async (harness) => {
+        harness.seedActiveMarker({
+          id: 2000,
+          headSha: HEAD_SHA,
+          createdAt: "2026-05-14T09:30:00Z",
+          ackDeadlineAt: "2026-05-14T10:30:00Z",
+          nextRetryAt: "2026-05-14T10:30:00Z",
+          maxWaitDeadlineAt: "2026-05-14T10:01:00Z",
+          baseline: {
+            plusOne: null,
+            eyes: null,
+            completionComment: null,
+            approvedReview: null,
+            submittedReview: null,
+          },
+        });
+        if (source === "issue-comment") {
+          harness.issueComments.push(
+            codexCleanComment(2001, "2026-05-14T10:01:00Z"),
+          );
+        } else {
+          harness.reviews.push(
+            codexApprovedReview(4001, "2026-05-14T10:01:00Z"),
+          );
+        }
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(successStatusWrites(harness), 1);
+        assert.equal(harness.statuses.at(-1).body.state, "success");
+        assert.equal(harness.findMarkerComments().length, 1);
+
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.activeMarker, null);
+        assert.equal(state.lastStatus.state, "success");
+        assert.equal(state.history.at(-1).outcome, "passed");
+        assert.equal(
+          state.history.some((marker) => marker.outcome === "timed_out"),
+          false,
+        );
+      });
     });
-    harness.issueComments.push(codexCleanComment(2001));
+  }
+});
 
-    const result = await harness.runGate({
-      eventName: "schedule",
-      event: {},
+test("active-marker artifacts created after max wait cannot pass", async (t) => {
+  for (const source of ["issue-comment", "pull-request-review"]) {
+    await t.test(source, async () => {
+      await withHarness(async (harness) => {
+        harness.seedActiveMarker({
+          id: 2000,
+          headSha: HEAD_SHA,
+          createdAt: "2026-05-14T09:30:00Z",
+          ackDeadlineAt: "2026-05-14T10:30:00Z",
+          nextRetryAt: "2026-05-14T10:30:00Z",
+          maxWaitDeadlineAt: "2026-05-14T09:59:00Z",
+          baseline: {
+            plusOne: null,
+            eyes: null,
+            completionComment: null,
+            approvedReview: null,
+            submittedReview: null,
+          },
+        });
+        if (source === "issue-comment") {
+          harness.issueComments.push(codexCleanComment(2001));
+        } else {
+          harness.reviews.push(codexApprovedReview(4001));
+        }
+
+        const result = await harness.runGate({
+          eventName: "schedule",
+          event: {},
+        });
+
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(successStatusWrites(harness), 0);
+        assert.equal(harness.statuses.at(-1).body.state, "failure");
+        const state = parseStateCommentBody(harness.findStateComment().body);
+        assert.equal(state.activeMarker, null);
+        assert.equal(state.history.at(-1).outcome, "timed_out");
+      });
     });
-
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(successStatusWrites(harness), 1);
-    assert.equal(harness.statuses.at(-1).body.state, "success");
-    assert.equal(harness.findMarkerComments().length, 1);
-
-    const state = parseStateCommentBody(harness.findStateComment().body);
-    assert.equal(state.activeMarker, null);
-    assert.equal(state.lastStatus.state, "success");
-    assert.equal(state.history.at(-1).outcome, "passed");
-    assert.equal(
-      state.history.some((marker) => marker.outcome === "timed_out"),
-      false,
-    );
-  });
+  }
 });
 
 test("clean active-marker evidence still passes immediately before max wait", async () => {
@@ -3774,6 +3984,77 @@ test("live PR evidence reasserts success over a newer live error without a new r
       ),
       false,
     );
+  });
+});
+
+test("passed history cannot reassert an artifact created after max wait", async () => {
+  await withHarness(async (harness) => {
+    harness.seedSuccessfulState({
+      providerId: 2001,
+      providerCreatedAt: "2026-05-14T10:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T09:59:00Z",
+    });
+    harness.issueComments.push(codexCleanComment(2001));
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "error",
+      description: "A post-deadline result cannot reassert success",
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(harness.findMarkerComments().length, 2);
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-1).outcome, "state_lost");
+    assert.equal(
+      state.history.at(-1).recoveryReason,
+      "unauthorized_passed_result_lineage",
+    );
+    assert.equal(state.activeMarker.state, "waiting_ack");
+  });
+});
+
+test("legacy passed review cannot reassert an artifact created after max wait", async () => {
+  await withHarness(async (harness) => {
+    harness.seedLegacySuccessfulState({
+      providerSource: "pull-request-review",
+      providerId: 4001,
+      providerCreatedAt: "2026-05-14T10:00:00Z",
+      maxWaitDeadlineAt: "2026-05-14T09:59:00Z",
+    });
+    harness.reviews.push(
+      codexApprovedReview(4001, "2026-05-14T10:00:00Z"),
+    );
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "error",
+      description: "A post-deadline review cannot reassert success",
+    });
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(harness.findMarkerComments().length, 2);
+    const state = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(state.history.at(-1).outcome, "state_lost");
+    assert.equal(
+      state.history.at(-1).recoveryReason,
+      "unauthorized_passed_result_lineage",
+    );
+    assert.equal(state.activeMarker.state, "waiting_ack");
   });
 });
 
@@ -7858,6 +8139,23 @@ function markerCommentFor(marker) {
     html_url: marker.url,
     user: { login: "github-actions[bot]" },
   };
+}
+
+function removePersistedMaxWaitDeadline(harness) {
+  const stateComment = harness.findStateComment();
+  const state = parseStateCommentBody(stateComment.body);
+  delete state.history.at(-1).maxWaitDeadlineAt;
+  stateComment.body = stateCommentBody(state);
+
+  const liveComment = harness.findMarkerComments()[0];
+  const liveMarker = parseMarkerCommentBody(liveComment.body);
+  delete liveMarker.maxWaitDeadlineAt;
+  Object.assign(liveComment, markerCommentFor({
+    ...liveMarker,
+    id: String(liveComment.id),
+    url: liveComment.html_url,
+    createdAt: liveComment.created_at,
+  }));
 }
 
 function runNode(args, { cwd, env }) {
