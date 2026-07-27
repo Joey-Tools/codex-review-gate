@@ -1093,7 +1093,11 @@ function providerResultAuthorization(providerResult, state, trigger, snapshot) {
       passedMarkerReassertAuthorization(providerResult, state, snapshot) ||
       failedFindingsRecoveryAuthorization(providerResult, state, trigger, snapshot) ||
       closedWaitMarkerAuthorization(providerResult, state, snapshot);
-    return authorizationWithinMaxWaitDeadline(providerResult, authorization);
+    return authorizationWithinMaxWaitDeadline(
+      providerResult,
+      authorization,
+      snapshot,
+    );
   }
   if (activeMarkerIsObsolete(marker, statusSha)) {
     return null;
@@ -1117,7 +1121,11 @@ function providerResultAuthorization(providerResult, state, trigger, snapshot) {
     )
       ? { kind: "active-marker", marker }
       : null;
-    return authorizationWithinMaxWaitDeadline(providerResult, authorization);
+    return authorizationWithinMaxWaitDeadline(
+      providerResult,
+      authorization,
+      snapshot,
+    );
   }
   if (providerResult.source === "pull-request-review") {
     const authorization = hasNewReviewTransition(
@@ -1130,31 +1138,52 @@ function providerResultAuthorization(providerResult, state, trigger, snapshot) {
     )
       ? { kind: "active-marker", marker }
       : null;
-    return authorizationWithinMaxWaitDeadline(providerResult, authorization);
+    return authorizationWithinMaxWaitDeadline(
+      providerResult,
+      authorization,
+      snapshot,
+    );
   }
 
   return null;
 }
 
-function authorizationWithinMaxWaitDeadline(providerResult, authorization) {
+function authorizationWithinMaxWaitDeadline(
+  providerResult,
+  authorization,
+  snapshot,
+) {
   if (!authorization) {
     return null;
   }
-  const marker = authorization.marker;
-  if (!marker) {
+  const liveMarker = matchingTrustedLiveMarker(
+    authorization.marker,
+    snapshot,
+  );
+  if (!liveMarker) {
     return null;
   }
-  const headStartedAt = marker.headStartedAt || marker.createdAt;
+  const headStartedAt = liveMarker.headStartedAt || liveMarker.createdAt;
   if (!headStartedAt) {
     return null;
   }
-  const maxWaitDeadlineAt =
-    marker.maxWaitDeadlineAt ||
-    addSeconds(headStartedAt, Math.round(config.maxWaitMs / 1000));
+  const liveHasPersistedDeadline = liveMarker.maxWaitDeadlineAt != null;
+  const liveDeadlineAt = liveHasPersistedDeadline
+    ? liveMarker.maxWaitDeadlineAt
+    : addSeconds(headStartedAt, Math.round(config.maxWaitMs / 1000));
+  const liveDeadlineMs = parseTimestamp(liveDeadlineAt, "max wait deadline");
+  const recordedDeadlineAt = authorization.marker?.maxWaitDeadlineAt;
+  const maxWaitDeadlineMs =
+    !liveHasPersistedDeadline && recordedDeadlineAt != null
+      ? Math.min(
+          liveDeadlineMs,
+          parseTimestamp(recordedDeadlineAt, "recorded max wait deadline"),
+        )
+      : liveDeadlineMs;
   return parseTimestamp(
     providerResult.createdAt,
     "Codex provider result creation time",
-  ) <= parseTimestamp(maxWaitDeadlineAt, "max wait deadline")
+  ) <= maxWaitDeadlineMs
     ? authorization
     : null;
 }
@@ -1340,6 +1369,7 @@ function closedWaitRejectedFreshRecovery(
     !authorizationWithinMaxWaitDeadline(
       providerResult,
       closedWaitMarkerAuthorization(providerResult, state, snapshot),
+      snapshot,
     )
   ) {
     return null;
@@ -1352,20 +1382,20 @@ function closedWaitRejectedFreshRecovery(
   };
 }
 
-function trustedLiveMarkerMatches(recordedMarker, snapshot) {
+function matchingTrustedLiveMarker(recordedMarker, snapshot) {
   const markerComment = findLatestTrustedMarkerComment(
     snapshot?.comments || [],
     config.trustedCommentLogins,
   );
   const liveMarker = markerComment ? markerFromComment(markerComment) : null;
   if (!liveMarker) {
-    return false;
+    return null;
   }
   if (
     liveMarker.version !== STATE_VERSION ||
     recordedMarker?.version !== STATE_VERSION
   ) {
-    return false;
+    return null;
   }
 
   const immutableFields = [
@@ -1378,9 +1408,24 @@ function trustedLiveMarkerMatches(recordedMarker, snapshot) {
     "attempt",
     "createdAt",
   ];
-  return immutableFields.every((field) =>
-    String(liveMarker[field] ?? "") === String(recordedMarker[field] ?? ""),
-  ) && isDeepStrictEqual(liveMarker.baseline || {}, recordedMarker.baseline || {});
+  const waitBudgetFields = ["headStartedAt", "maxWaitDeadlineAt"];
+  if (
+    !immutableFields.every((field) =>
+      String(liveMarker[field] ?? "") === String(recordedMarker[field] ?? "")
+    ) ||
+    !waitBudgetFields.every((field) =>
+      liveMarker[field] == null ||
+      String(liveMarker[field]) === String(recordedMarker[field] ?? "")
+    ) ||
+    !isDeepStrictEqual(liveMarker.baseline || {}, recordedMarker.baseline || {})
+  ) {
+    return null;
+  }
+  return liveMarker;
+}
+
+function trustedLiveMarkerMatches(recordedMarker, snapshot) {
+  return Boolean(matchingTrustedLiveMarker(recordedMarker, snapshot));
 }
 
 function failedFindingsRecoveryLineage(state) {
@@ -1506,6 +1551,7 @@ function recordRejectedFreshRecoveryAttempt(providerResult, state, trigger, snap
       trigger,
       snapshot,
     ),
+    snapshot,
   );
   if (config.failedFindingsRecoveryMode !== "fresh" || !authorization) {
     return state;

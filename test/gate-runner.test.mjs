@@ -1073,6 +1073,63 @@ test("failed-findings recovery derives a missing legacy max-wait deadline", asyn
   }
 });
 
+test("legacy authorization derives its deadline from the live marker", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({
+      id: 2000,
+      closedAt: "2026-05-14T09:58:00Z",
+      headStartedAt: "2026-05-14T10:30:00Z",
+    });
+    removePersistedMaxWaitDeadline(harness, {
+      removeLiveHeadStartedAt: true,
+    });
+    const comment = codexCleanComment(2001, "2026-05-14T10:01:00Z");
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+      env: { MAX_WAIT_SECONDS: "300" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.notEqual(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
+test("legacy authorization cannot extend a recorded state deadline", async () => {
+  await withHarness(async (harness) => {
+    harness.seedFailedFindingsState({
+      id: 2000,
+      closedAt: "2026-05-14T09:58:00Z",
+      headStartedAt: "2026-05-14T09:55:00Z",
+      maxWaitDeadlineAt: "2026-05-14T10:00:00Z",
+    });
+    removePersistedMaxWaitDeadline(harness, {
+      removeStateDeadline: false,
+    });
+    const comment = codexCleanComment(2001, "2026-05-14T10:01:00Z");
+    harness.issueComments.push(comment);
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment,
+      },
+      env: { MAX_WAIT_SECONDS: "7200" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.notEqual(harness.statuses.at(-1).body.state, "success");
+  });
+});
+
 test("no-marker clean cannot recover disallowed history", async () => {
   await withHarness(async (harness) => {
     harness.seedFailedFindingsState({ id: 2000 });
@@ -1791,6 +1848,36 @@ test("closed-wait artifacts created after max wait cannot pass", async (t) => {
       });
     });
   }
+});
+
+test("closed-wait authorization rejects state deadline drift", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "timed_out",
+      closedAt: "2026-05-14T10:00:30Z",
+      headStartedAt: "2026-05-14T08:01:00Z",
+      maxWaitDeadlineAt: "2026-05-14T09:59:00Z",
+    });
+    const stateComment = harness.findStateComment();
+    const state = parseStateCommentBody(stateComment.body);
+    state.history.at(-1).maxWaitDeadlineAt = "2026-05-14T11:00:00Z";
+    stateComment.body = stateCommentBody(state);
+    harness.issueComments.push(codexCleanComment(2001));
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(successStatusWrites(harness), 0);
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.notEqual(
+      parseStateCommentBody(harness.findStateComment().body).lastStatus.state,
+      "success",
+    );
+  });
 });
 
 test("a late clean recovers a timeout persisted by the previous run", async () => {
@@ -8141,15 +8228,26 @@ function markerCommentFor(marker) {
   };
 }
 
-function removePersistedMaxWaitDeadline(harness) {
+function removePersistedMaxWaitDeadline(
+  harness,
+  {
+    removeLiveHeadStartedAt = false,
+    removeStateDeadline = true,
+  } = {},
+) {
   const stateComment = harness.findStateComment();
   const state = parseStateCommentBody(stateComment.body);
-  delete state.history.at(-1).maxWaitDeadlineAt;
+  if (removeStateDeadline) {
+    delete state.history.at(-1).maxWaitDeadlineAt;
+  }
   stateComment.body = stateCommentBody(state);
 
   const liveComment = harness.findMarkerComments()[0];
   const liveMarker = parseMarkerCommentBody(liveComment.body);
   delete liveMarker.maxWaitDeadlineAt;
+  if (removeLiveHeadStartedAt) {
+    delete liveMarker.headStartedAt;
+  }
   Object.assign(liveComment, markerCommentFor({
     ...liveMarker,
     id: String(liveComment.id),

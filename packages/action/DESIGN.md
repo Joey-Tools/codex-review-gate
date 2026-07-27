@@ -187,7 +187,12 @@ for a legacy marker without that field, the deadline is derived from
 comment or review created no later than that deadline may still win when
 reconciliation or final validation runs at or after the deadline. An artifact
 created after it cannot authorize active-marker success, closed-wait recovery,
-failed-findings recovery, or passed-history reassertion.
+failed-findings recovery, or passed-history reassertion. Persisted
+`headStartedAt` and `maxWaitDeadlineAt` values must match the trusted live marker
+exactly. When the live legacy marker lacks a deadline but sticky state already
+records one, the earlier of that recorded deadline and the live-derived current
+deadline applies. Legacy sticky state may therefore narrow a window but cannot
+extend it.
 
 If unresolved findings are observed against a recoverable closed-wait marker,
 the gate first persists a `failed_findings` descendant of that exact trusted

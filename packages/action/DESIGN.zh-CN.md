@@ -133,7 +133,10 @@ failed-findings recovery switch、event 与 cutoff 规则。
 只要 clean comment 或 review 的创建时间不晚于该 deadline，即使 reconciliation 或
 final validation 在 deadline 当时或之后运行，它仍可胜出；deadline 之后才创建的
 artifact 不能授权 active-marker success、closed-wait recovery、failed-findings recovery
-或 passed-history reassertion。
+或 passed-history reassertion。已持久化的 `headStartedAt` 与 `maxWaitDeadlineAt` 必须和
+trusted live marker 精确一致。若 legacy live marker 缺 deadline，但 sticky state 已记录
+deadline，则取该记录值与 live-derived current deadline 中较早者；legacy sticky state
+只能收窄窗口，不能延长窗口。
 
 如果在可恢复的 closed-wait marker 上观察到 unresolved findings，gate 会先持久化该
 精确信任 lineage 的 `failed_findings` 后继记录。之后应用 recovery-disabled 以及普通

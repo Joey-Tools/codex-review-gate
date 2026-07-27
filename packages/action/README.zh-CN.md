@@ -40,7 +40,7 @@ Runner 实现了 event-driven serialized marker flow：
 - 用 scheduled 或 manual resume runs 重试未 ack 或 stalled 的 markers。
 - 当前 reconciliation 无法完整加载或校验所需 evidence 时 fail closed。暂时性读取重试耗尽写入 `pending`；确定性的 provider identity、schema 或 commit 冲突写入 `error`；两者都会使 workflow 失败。
 - 在应用 marker 等待 deadline 前先 reconcile 完整 review evidence。即使 active marker 在 reconciliation 期间到达 deadline，只要 clean result 稳定且已授权，仍由 clean result 胜出。
-- 要求每个新授权的 clean artifact 都必须在其来源 marker 已持久化的 `maxWaitDeadlineAt` 当时或之前创建；legacy marker 缺失该字段时，根据 `headStartedAt`/`createdAt` 与当前 maximum wait 推导 deadline。reconciliation 可以在 deadline 后完成，但 deadline 后才产生的 artifact 不能让 gate pass 或重新断言 success。
+- 要求每个新授权的 clean artifact 都必须在其来源 trusted live marker 已持久化的 `maxWaitDeadlineAt` 当时或之前创建；legacy marker 缺失该字段时，根据 live marker 的 `headStartedAt`/`createdAt` 与当前 maximum wait 推导 deadline。live marker 已持久化的 wait-budget 字段必须与 sticky state 精确一致，而 sticky state 已记录的 legacy deadline 只能收窄推导窗口。reconciliation 可以在 deadline 后完成，但 deadline 后才产生的 artifact 不能让 gate pass 或重新断言 success。
 - `missed_ack`、`stalled` 或 `timed_out` 等待结束后观察到的 clean result，只有在 latest same-head historical marker 仍精确匹配 trusted live marker，且该 result 相对 marker 创建时间与 baseline 是新 transition 时才可恢复；这个恢复不会再发送 review 请求。
 - 在可恢复的 closed-wait lineage 上观察到 unresolved findings 时，将其转换为 `failed_findings`，因此 recovery-disabled 以及普通 failed-findings event 与 close-time 规则继续生效；`fresh` 会先记录精确的 rejected closed-wait clean 与 cutoff，再阻止后续重放。
 - 保留 timeout 来源，避免把 `failed_findings` 重新标记为 closed wait 后旁路其 recovery switch、event 或 cutoff 规则。
