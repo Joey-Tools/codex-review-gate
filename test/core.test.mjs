@@ -129,6 +129,28 @@ function officialCodexDisclosure() {
   ].join("\n");
 }
 
+function parseCleanIssueCommentFirstLine(firstLine, { disclosure = false } = {}) {
+  const lines = [
+    firstLine,
+    "",
+    "**Reviewed commit:** `abcdef1234`",
+  ];
+  if (disclosure) {
+    lines.push("", officialCodexDisclosure());
+  }
+  return parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(lines.join("\n")),
+    { owner: "owner", repo: "repo" },
+  );
+}
+
+function parseCleanTagline(tagline, options) {
+  return parseCleanIssueCommentFirstLine(
+    `Codex Review: Didn't find any major issues. ${tagline}`,
+    options,
+  );
+}
+
 function officialInlineParentReviewBody(commitRef = FULL_SHA_A.slice(0, 10)) {
   return [
     "### 💡 Codex Review",
@@ -991,40 +1013,129 @@ test("requires canonical positive integer IDs for provider terminal artifacts", 
   }
 });
 
-test("accepts observed clean taglines and the exact official disclosure", () => {
+test("accepts known benign clean tagline stems with one final punctuation mark", () => {
+  const stems = [
+    "Nice work",
+    "Chef's kiss",
+    "What shall we delve into next",
+    "Already looking forward to the next diff",
+    "Keep them coming",
+    "Swish",
+    "Another round soon, please",
+    "Breezy",
+    "Can't wait for the next one",
+    "More of your lovely PRs please",
+    "Bravo",
+    "Keep it up",
+    "Delightful",
+    "Hooray",
+    "You're on a roll",
+  ];
+
+  for (const stem of stems) {
+    for (const punctuation of [".", "!", "?"]) {
+      const tagline = `${stem}${punctuation}`;
+      const artifact = parseCleanTagline(tagline, { disclosure: true });
+      assert.equal(artifact.kind, "clean", tagline);
+    }
+  }
+
   for (const tagline of [
-    "Nice work!",
-    "Chef's kiss.",
-    "What shall we delve into next?",
-    "Already looking forward to the next diff.",
-    "Keep them coming.",
     "Keep them coming!",
+    "Another round soon, please.",
+  ]) {
+    assert.equal(parseCleanTagline(tagline).kind, "clean", tagline);
+  }
+});
+
+test("accepts exact shortcodes and bounded RGI emoji presentation", () => {
+  for (const tagline of [
     ":rocket:",
     ":tada:",
-    "Swish.",
-    "Another round soon, please!",
-    "Breezy!",
-    "Can't wait for the next one!",
-    "More of your lovely PRs please.",
-    "Bravo.",
-    "Swish!",
-    "Keep it up!",
-    "Delightful!",
-    "Hooray!",
-    "You're on a roll.",
     ":+1:",
+    "🚀",
+    "🚀🎉",
+    "🚀 🎉",
+    "👩🏽‍💻 🏳️‍🌈 ❤️‍🔥 1️⃣",
+    "🚀".repeat(8),
+    Array(8).fill("🚀").join(" "),
   ]) {
-    const artifact = parseCodexIssueCommentArtifact(
-      liveCodexIssueComment([
-        `Codex Review: Didn't find any major issues. ${tagline}`,
-        "",
-        "**Reviewed commit:** `abcdef1234`",
-        "",
-        officialCodexDisclosure(),
-      ].join("\n")),
-      { owner: "owner", repo: "repo" },
+    assert.equal(parseCleanTagline(tagline).kind, "clean", tagline);
+  }
+});
+
+test("enforces clean tagline separator, trimming, and one-line structure", () => {
+  const invalidFirstLines = [
+    "Codex Review: Didn't find any major issues. ",
+    "Codex Review: Didn't find any major issues.  Nice work!",
+    "Codex Review: Didn't find any major issues.\tNice work!",
+    "Codex Review: Didn't find any major issues.\u00A0Nice work!",
+    "Codex Review: Didn't find any major issues. Nice work! ",
+    "Codex Review: Didn't find any major issues. Nice\u00A0work!",
+    "Codex Review: Didn't find any major issues. Nice\u2003work!",
+    "Codex Review: Didn't find any major issues. Nice work!\nSecond line",
+  ];
+
+  for (const firstLine of invalidFirstLines) {
+    assert.equal(
+      parseCleanIssueCommentFirstLine(firstLine).kind,
+      "malformed",
+      JSON.stringify(firstLine),
     );
-    assert.equal(artifact.kind, "clean", tagline);
+  }
+});
+
+test("rejects oversized and over-budget clean taglines", () => {
+  const oversized = "a".repeat(161);
+  assert.equal(oversized.length, 161);
+  assert.equal(parseCleanTagline(oversized).kind, "malformed");
+  assert.equal(parseCleanTagline("🚀".repeat(9)).kind, "malformed");
+});
+
+test("rejects non-RGI or noncanonical emoji presentation", () => {
+  for (const tagline of [
+    "🚀  🎉",
+    "🚀\u00A0🎉",
+    "😀‍😀",
+    "❤︎‍🔥",
+    "🚀 Great work!",
+    ":rocket:!",
+    ":smile:",
+  ]) {
+    assert.equal(
+      parseCleanTagline(tagline).kind,
+      "malformed",
+      JSON.stringify(tagline),
+    );
+  }
+});
+
+test("rejects unknown prose and non-template presentation content", () => {
+  for (const tagline of [
+    "Investigate parser.",
+    "Critical vulnerability exists!",
+    "Fantastic work!",
+    "Update complete!",
+    "Excellent—what's next?",
+    "太棒了！",
+    "Nice work",
+    "Nice work!!",
+    "nice work!",
+    "Keep them coming…",
+    "Please fix the parser.",
+    "One issue remains.",
+    "**Nice work!**",
+    "<strong>Nice work!</strong>",
+    "[Nice work!](https://example.com)",
+    "See https://example.com.",
+    "See example.com/docs.",
+    "`Nice work!`",
+    "@codex review",
+    "Coverage: `parser`.",
+    "Reviewed commit: abcdef1234.",
+    "No findings.",
+  ]) {
+    assert.equal(parseCleanTagline(tagline).kind, "malformed", tagline);
   }
 });
 
@@ -1071,11 +1182,6 @@ test("rejects contradictory or schema-drift content embedded in clean issue comm
       "**Reviewed commit:** `abcdef1234`",
       "",
       officialCodexDisclosure().replace("</details>", "Please fix this.\n</details>"),
-    ].join("\n"),
-    [
-      "Codex Review: Didn't find any major issues. Another round soon, please.",
-      "",
-      "**Reviewed commit:** `abcdef1234`",
     ].join("\n"),
   ];
 

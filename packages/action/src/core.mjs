@@ -12,6 +12,8 @@ export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
 export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
 const MAX_CODEX_TERMINAL_HEADING_CODE_UNITS = 512;
 const MAX_CODEX_TERMINAL_HEADING_GRAPHEMES = 64;
+const MAX_CODEX_CLEAN_TAGLINE_CODE_UNITS = 160;
+const MAX_CODEX_CLEAN_EMOJI_TAGLINE_GRAPHEMES = 8;
 const MAX_FINDING_ID_SAMPLE_CODE_UNITS = 96;
 const EMOJI_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
@@ -20,31 +22,31 @@ const EMOJI_KEYCAP_GRAPHEME = /^[#*0-9]\uFE0F?\u20E3$/u;
 const EMOJI_FLAG_GRAPHEME = /^\p{Regional_Indicator}{2}$/u;
 const EMOJI_PRESENTATION_SIGNAL = /[\p{Extended_Pictographic}\p{Emoji_Presentation}]/u;
 const EMOJI_WITH_VARIATION_SELECTOR = /^(?=[\s\S]*\p{Emoji})(?=[\s\S]*\uFE0F)/u;
+const EMOJI_RGI_GRAPHEME = /^\p{RGI_Emoji}$/v;
 const UNKNOWN_TERMINAL_DECORATOR =
   /^[^\s]+[ \t]+Codex Review\b/iu;
 const CODEX_ISSUE_COMMENT_PROGRESS =
   /^Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
-const CODEX_CLEAN_COMMENT_TAGLINES = new Set([
-  "",
-  "Nice work!",
-  "Chef's kiss.",
-  "What shall we delve into next?",
-  "Already looking forward to the next diff.",
-  "Keep them coming.",
-  "Keep them coming!",
+const CODEX_CLEAN_TAGLINE_STEMS = new Set([
+  "Nice work",
+  "Chef's kiss",
+  "What shall we delve into next",
+  "Already looking forward to the next diff",
+  "Keep them coming",
+  "Swish",
+  "Another round soon, please",
+  "Breezy",
+  "Can't wait for the next one",
+  "More of your lovely PRs please",
+  "Bravo",
+  "Keep it up",
+  "Delightful",
+  "Hooray",
+  "You're on a roll",
+]);
+const CODEX_CLEAN_TAGLINE_SHORTCODES = new Set([
   ":rocket:",
   ":tada:",
-  "Swish.",
-  "Another round soon, please!",
-  "Breezy!",
-  "Can't wait for the next one!",
-  "More of your lovely PRs please.",
-  "Bravo.",
-  "Swish!",
-  "Keep it up!",
-  "Delightful!",
-  "Hooray!",
-  "You're on a roll.",
   ":+1:",
 ]);
 
@@ -1318,13 +1320,14 @@ function issueCommentCleanBodyHasClosedGrammar(body, markerText) {
   if (prefix.includes("\n") || !prefix.startsWith(CODEX_CLEAN_COMMENT_LEAD)) {
     return false;
   }
-  const tagline = prefix.slice(CODEX_CLEAN_COMMENT_LEAD.length);
-  const normalizedTagline = tagline ? tagline.replace(/^ /, "") : "";
-  if (
-    (tagline && !tagline.startsWith(" ")) ||
-    !CODEX_CLEAN_COMMENT_TAGLINES.has(normalizedTagline)
-  ) {
-    return false;
+  if (prefix !== CODEX_CLEAN_COMMENT_LEAD) {
+    const taglinePrefix = `${CODEX_CLEAN_COMMENT_LEAD} `;
+    if (
+      !prefix.startsWith(taglinePrefix) ||
+      !cleanTaglineHasPresentationGrammar(prefix.slice(taglinePrefix.length))
+    ) {
+      return false;
+    }
   }
   const suffixBlock = normalizedBody.slice(markerIndex + normalizedMarker.length);
   if (!suffixBlock) {
@@ -1335,6 +1338,49 @@ function issueCommentCleanBodyHasClosedGrammar(body, markerText) {
     suffixBlock.startsWith("\n\n") &&
     officialCodexDisclosureHasClosedGrammar(suffixBlock.slice(2))
   );
+}
+
+function cleanTaglineHasPresentationGrammar(value) {
+  if (
+    !value ||
+    value.length > MAX_CODEX_CLEAN_TAGLINE_CODE_UNITS ||
+    value !== value.trim()
+  ) {
+    return false;
+  }
+
+  if (CODEX_CLEAN_TAGLINE_SHORTCODES.has(value)) {
+    return true;
+  }
+
+  const punctuation = value.at(-1);
+  if (
+    (punctuation === "." || punctuation === "!" || punctuation === "?") &&
+    CODEX_CLEAN_TAGLINE_STEMS.has(value.slice(0, -1))
+  ) {
+    return true;
+  }
+
+  let emojiCount = 0;
+  let previousWasSpace = false;
+  for (const { segment } of EMOJI_GRAPHEME_SEGMENTER.segment(value)) {
+    if (segment === " ") {
+      if (emojiCount === 0 || previousWasSpace) {
+        return false;
+      }
+      previousWasSpace = true;
+      continue;
+    }
+    if (!EMOJI_RGI_GRAPHEME.test(segment)) {
+      return false;
+    }
+    emojiCount += 1;
+    if (emojiCount > MAX_CODEX_CLEAN_EMOJI_TAGLINE_GRAPHEMES) {
+      return false;
+    }
+    previousWasSpace = false;
+  }
+  return emojiCount > 0 && !previousWasSpace;
 }
 
 function officialCodexDisclosureHasClosedGrammar(value) {

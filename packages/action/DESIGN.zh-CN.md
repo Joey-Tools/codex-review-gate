@@ -23,11 +23,17 @@ commit-status history 当作判定来源。
 4. 当前 head 没有 accepted clean result 时，在 marker workflow 继续运行期间保持
    `pending`。
 
-更早的 API 读取不完整、分页失败、无法识别的身份、commit 解析失败、`pending` status
-或 `error` status 都只属于审计历史，不会覆盖更新且完整的 current-head clean result。
+更早的 API 读取不完整、分页失败、无法识别的身份、commit 解析失败、`pending`、
+`error` status 或已关闭的 marker 等待结果都只属于审计历史，不会覆盖更新且完整的
+current-head clean result。
 反过来，如果比 accepted clean result 更晚的 terminal-looking provider artifact 无法
 通过身份、schema 或 commit binding 校验，即使存在较早的 clean result，当前运行仍
 无法得出结论。
+
+Evidence reconciliation 先于等待 deadline orchestration。如果 active marker 已产生
+authorised clean result，且 final snapshot 仍保持该结果稳定，那么在 reconciliation
+之前或期间到达 `maxWaitDeadlineAt` 不会使该结果失效。只有在不存在可接受 terminal
+result 时，deadline 才会结束等待。
 
 Issue-comment terminal heading detection 会先移除可选 Markdown heading marker 后的完整
 leading emoji grapheme，再识别 `Codex Review`。覆盖 modifier、regional-indicator flag、
@@ -77,9 +83,9 @@ ancestor，`identical` 证明相等，合法的 `behind` 和 `diverged` 则证�
    回退采用更旧的 trusted status；其他情况都立即发出一次不重试的 `success` POST。
 
 如果最初的 status read 失败，action 仍会在 final snapshot 后发布重新计算的 status。
-如果一个看似 accepted 的 clean result 缺少 active-marker、精确 passed-marker
-reassertion 或 failed-findings recovery lineage，则主动降为 `pending`；不能仅因它
-clean 且绑定 current head 就接受。
+如果一个看似 accepted 的 clean result 缺少 active-marker、closed-wait-marker、精确
+passed-marker reassertion 或 failed-findings recovery lineage，则主动降为
+`pending`；不能仅因它 clean 且绑定 current head 就接受。
 
 每次 GitHub 请求 attempt 都有默认 60 秒、覆盖 fetch 和 response body 读取的 deadline。最终
 `success` POST 不会盲目重试。如果该 POST 失败或超时，而 GitHub 可能已经将其落盘，
@@ -108,9 +114,35 @@ sequenceDiagram
 
 Sticky state comment 和 status history 不是 review evidence，但 trusted marker comment
 及 state 中记录的 immutable lineage 会授权哪些 provider result 可以满足 gate。通常
-clean result 必须晚于有效的 active current-head marker 及其 baseline。只有两条狭窄的
-no-active-marker 路径：以精确 marker、baseline 和 observed-result lineage 重新声明
-已经 `passed` 的结果；以及下文所述的 legacy same-head `failed_findings` recovery。
+clean result 必须晚于有效的 active current-head marker 及其 baseline。无 active marker
+时只有三条狭窄路径：latest same-head `missed_ack`、`stalled` 或 `timed_out`
+historical marker 仍精确匹配 trusted live marker 时，接受后来观察到的新 result；以
+精确 marker、baseline 和 observed-result lineage 重新声明已经 `passed` 的结果；以及
+下文所述的 legacy same-head `failed_findings` recovery。
+
+Closed-wait recovery 使用原 marker 的创建时间和 baseline，而不是记录的关闭时间。
+关闭结果只是 orchestration audit，不能使一个原本相对 request marker 已经是新的、
+但直到后续完整 snapshot 才可见的 provider result 失效。此路径绝不接受
+`failed_findings`、`state_lost` 或 `obsolete_head`，也不会再发送 `@codex review`。
+由 `failed_findings` 演变出的等待 timeout 会保留该来源，并继续遵守既有的
+failed-findings recovery switch、event 与 cutoff 规则。
+
+所有 authorization kind 也会把选中的 provider artifact 绑定到该 marker 的整体等待预算。
+已持久化的 `maxWaitDeadlineAt` 是权威值；legacy marker 缺少该字段时，根据
+`headStartedAt`（若没有则用 `createdAt`）与当前 maximum-wait control 推导 deadline。
+只要 clean comment 或 review 的创建时间不晚于该 deadline，即使 reconciliation 或
+final validation 在 deadline 当时或之后运行，它仍可胜出；deadline 之后才创建的
+artifact 不能授权 active-marker success、closed-wait recovery、failed-findings recovery
+或 passed-history reassertion。已持久化的 `headStartedAt` 与 `maxWaitDeadlineAt` 必须和
+trusted live marker 精确一致。若 legacy live marker 缺 deadline，但 sticky state 已记录
+deadline，则取该记录值与 live-derived current deadline 中较早者；legacy sticky state
+只能收窄窗口，不能延长窗口。
+
+如果在可恢复的 closed-wait marker 上观察到 unresolved findings，gate 会先持久化该
+精确信任 lineage 的 `failed_findings` 后继记录。之后应用 recovery-disabled 以及普通
+failed-findings event 与 close-time 规则。在 `fresh` 模式下，即使精确触发且满足
+closed-wait lineage 的 clean，其 provider timestamp 早于合成的 failure close time，
+也会记录该 rejection 与 cutoff，因此 findings resolved 后不能重放这个结果。
 
 每次 GitHub request attempt 的默认 deadline 是 60 秒，覆盖 fetch 和 response-body
 读取。对于原本允许 retry 的 response，REST 和 GraphQL 都会遵守不超过 10 秒的合法
@@ -350,11 +382,16 @@ flowchart TD
   waitingAck -->|ackDeadlineAt elapsed| missedAck["Close marker as missed_ack"]
   missedAck --> backoff["Apply same-head backoff"]
   backoff --> marker
+  missedAck -->|Later observed authorised clean| validatePass
 
   waitingResult -->|APPROVED review or completion comment| validatePass
   waitingResult -->|Current-head findings| failed
   waitingResult -->|resultDeadlineAt elapsed| stalled["Close marker as stalled"]
   stalled --> marker
+  stalled -->|Later observed authorised clean| validatePass
+  waitingAck -->|maxWaitDeadlineAt elapsed without clean| timedOut["Close wait as timed_out"]
+  waitingResult -->|maxWaitDeadlineAt elapsed without clean| timedOut
+  timedOut -->|Later observed authorised clean| validatePass
 
   passed -->|New commit| pending
   failed -->|New commit| pending
@@ -461,15 +498,25 @@ Accepted provider evidence 按 channel 校验：
   `original_commit_id` 绑定；可变的 relocated inline `commit_id` 不是 provenance。
 - Top-level clean result 必须匹配受支持的 clean format，并包含 reviewed-commit marker。
   短 marker 必须经 repository commit API 解析，并唯一对应完整 current-head SHA。
-- Clean issue comment 使用封闭 grammar：exact
-  `Codex Review: Didn't find any major issues.` lead 后只允许无 tagline，或以下已观察到的
-  exact provider tagline：`Nice work!`、`Chef's kiss.`、
-  `What shall we delve into next?`、`Already looking forward to the next diff.`、
-  `Keep them coming.`、`Keep them coming!`、`:rocket:`、`:tada:`、`Swish.`、
-  `Another round soon, please!`、`Breezy!`、`Can't wait for the next one!`、
-  `More of your lovely PRs please.`、`Bravo.`、`Swish!`、`Keep it up!`、
-  `Delightful!`、`Hooray!`、`You're on a roll.` 或 `:+1:`。未知 prose 或近似
-  punctuation 仍 fail closed，finding signals 始终优先。
+- Clean issue comment 使用封闭的结构 grammar：首行以 exact
+  `Codex Review: Didn't find any major issues.` 开始，之后可以直接结束，也可以用
+  恰好一个 ASCII space 分隔一个 nonempty、trimmed、同首行 tagline。Tagline 只是
+  presentation field，不是 evidence field；它最多 160 个 UTF-16 code units，并且必须
+  exact 匹配以下一种封闭 template：
+  - 一个已知 benign stem 加恰好一个结尾 `.`、`!` 或 `?`。Stem 只能是
+    `Nice work`、`Chef's kiss`、`What shall we delve into next`、
+    `Already looking forward to the next diff`、`Keep them coming`、`Swish`、
+    `Another round soon, please`、`Breezy`、`Can't wait for the next one`、
+    `More of your lovely PRs please`、`Bravo`、`Keep it up`、`Delightful`、
+    `Hooray` 或 `You're on a roll`；
+  - exact `:rocket:`、`:tada:` 或 `:+1:`；或
+  - 一到八个 exact RGI emoji graphemes；它们可以相邻，或用一个 ASCII space 分隔。
+  所有未知 prose 都 fail closed，包括未知 positive prose、actionable language 和
+  contradictory language。Parser 不尝试证明自然语言语义；tagline 只用于
+  presentation，不能提供 clean/finding evidence。
+- 首行之后必须有且仅有一个 10 或 40 hex 的 `**Reviewed commit:**` marker，并且只能
+  没有 suffix，或带 exact official disclosure；任意 trailing prose 均拒绝。Finding
+  signals 始终优先，tagline 不能提供 clean/finding evidence，也不能覆盖这些 signals。
 - Review-body 和没有 thread 的 top-level findings 通过精确
   `https://github.com/<owner>/<repository>/blob/<40-hex>/...` links 绑定。混合
   repositories、commits 或不受支持的当前格式都不会被接受。
@@ -492,9 +539,9 @@ reload）、no-network deduplication。只有 cached newest same-context status 
 `success`，且来自 exact `github-actions[bot]` / `Bot` 时才跳过 POST；external 或缺失
 producer 不能让更旧的 trusted status 成为 deduplication candidate。
 
-未知的未来 provider format 会使当前运行 fail closed。后续运行一旦能解析完整且更新的
-current-head clean result，较早的 format error 或 incomplete API attempt 不会继续
-sticky。
+不满足受支持结构 grammar 或 malformed 的未来 provider format 会使当前运行 fail
+closed。后续运行一旦能解析完整且更新的 current-head clean result，较早的 format
+error 或 incomplete API attempt 不会继续 sticky。
 
 ## Fork 和 Dependabot PRs
 

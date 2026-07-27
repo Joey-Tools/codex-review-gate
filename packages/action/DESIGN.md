@@ -26,11 +26,17 @@ The result precedence is:
    status `pending` while the marker workflow continues.
 
 An older incomplete API read, pagination failure, unrecognised identity, commit
-parse failure, `pending` status, or `error` status is audit history only. It
-does not override a newer, complete current-head clean result. Conversely, a
-newer terminal-looking provider artifact whose identity, schema, or commit
-binding cannot be validated makes the current run inconclusive even if an
-older accepted clean result exists.
+parse failure, `pending` status, `error` status, or closed marker-wait outcome
+is audit history only. It does not override a newer, complete current-head
+clean result. Conversely, a newer terminal-looking provider artifact whose
+identity, schema, or commit binding cannot be validated makes the current run
+inconclusive even if an older accepted clean result exists.
+
+Evidence reconciliation precedes wait-deadline orchestration. If an active
+marker has already produced an authorised clean result and the final snapshot
+keeps that result stable, reaching `maxWaitDeadlineAt` before or during the
+reconciliation does not invalidate the result. The deadline ends a wait only
+when no acceptable terminal result is available.
 
 Issue-comment terminal-heading detection strips complete leading emoji
 graphemes after an optional Markdown heading marker before looking for
@@ -92,9 +98,9 @@ Before writing `success`, the action follows one fixed order:
 
 If the initial status read fails, the action still posts the freshly computed
 status after the final snapshot. An accepted-looking clean result that lacks
-active-marker, exact passed-marker reassertion, or failed-findings recovery
-lineage is demoted to `pending`; it is not accepted merely because it is clean
-and current-head.
+active-marker, closed-wait-marker, exact passed-marker reassertion, or
+failed-findings recovery lineage is demoted to `pending`; it is not accepted
+merely because it is clean and current-head.
 
 The optional commit-status deduplication GET has its own best-effort budget,
 separate from review evidence: 100 statuses per page, at most 10 pages or 1,000
@@ -158,10 +164,43 @@ sequenceDiagram
 The sticky state comment and status history are not review evidence, but the
 trusted marker comment and its recorded immutable lineage authorise which
 provider result may satisfy the gate. Normally the clean result must be newer
-than a valid active current-head marker and its baseline. Two narrow
-no-active-marker paths exist: reasserting a prior `passed` result with exact marker,
-baseline, and observed-result lineage; and the legacy same-head
-`failed_findings` recovery described below.
+than a valid active current-head marker and its baseline. Three narrow
+no-active-marker paths exist: accepting a result newly observed after the
+latest same-head `missed_ack`, `stalled`, or `timed_out` marker when that
+historical marker still exactly matches the trusted live marker; reasserting a
+prior `passed` result with exact marker, baseline, and observed-result lineage;
+and the legacy same-head `failed_findings` recovery described below.
+
+Closed-wait recovery uses the original marker creation time and baseline, not
+the recorded close time. The close outcome is orchestration audit data and
+cannot invalidate a provider result that was already new relative to the
+request marker but became visible only in a later complete snapshot. This path
+never accepts `failed_findings`, `state_lost`, or `obsolete_head`, and never
+posts another `@codex review`. A wait timeout derived from `failed_findings`
+retains that origin and remains subject to the existing failed-findings
+recovery switch, event, and cutoff rules.
+
+Every authorization kind also binds the selected provider artifact to the
+marker's overall wait budget. The persisted `maxWaitDeadlineAt` is authoritative;
+for a legacy marker without that field, the deadline is derived from
+`headStartedAt` (or `createdAt`) and the current maximum-wait control. A clean
+comment or review created no later than that deadline may still win when
+reconciliation or final validation runs at or after the deadline. An artifact
+created after it cannot authorize active-marker success, closed-wait recovery,
+failed-findings recovery, or passed-history reassertion. Persisted
+`headStartedAt` and `maxWaitDeadlineAt` values must match the trusted live marker
+exactly. When the live legacy marker lacks a deadline but sticky state already
+records one, the earlier of that recorded deadline and the live-derived current
+deadline applies. Legacy sticky state may therefore narrow a window but cannot
+extend it.
+
+If unresolved findings are observed against a recoverable closed-wait marker,
+the gate first persists a `failed_findings` descendant of that exact trusted
+lineage. Recovery-disabled and the ordinary failed-findings event and close-time
+rules then apply. In `fresh` mode, an exact triggering clean that qualified for
+the closed-wait lineage is recorded with its rejection cutoff even when its
+provider timestamp precedes the synthesized failure close time, so that result
+cannot be replayed after resolution.
 
 ## Generative AI Disclosure
 
@@ -410,11 +449,16 @@ flowchart TD
   waitingAck -->|ackDeadlineAt elapsed| missedAck["Close marker as missed_ack"]
   missedAck --> backoff["Apply same-head backoff"]
   backoff --> marker
+  missedAck -->|Later observed authorised clean| validatePass
 
   waitingResult -->|APPROVED review or completion comment| validatePass
   waitingResult -->|Current-head findings| failed
   waitingResult -->|resultDeadlineAt elapsed| stalled["Close marker as stalled"]
   stalled --> marker
+  stalled -->|Later observed authorised clean| validatePass
+  waitingAck -->|maxWaitDeadlineAt elapsed without clean| timedOut["Close wait as timed_out"]
+  waitingResult -->|maxWaitDeadlineAt elapsed without clean| timedOut
+  timedOut -->|Later observed authorised clean| validatePass
 
   passed -->|New commit| pending
   failed -->|New commit| pending
@@ -543,20 +587,35 @@ Accepted provider evidence is channel-specific:
   it does not match a known clean or finding grammar; it is never silently
   ignored.
 
-Clean provider artifacts use a closed grammar rather than an open-ended prose
-heuristic:
+Clean provider artifacts use a closed structural grammar. The optional tagline
+is a bounded presentation field, never an open natural-language field or an
+evidence field:
 
 - A clean issue comment starts with exact
-  `Codex Review: Didn't find any major issues.` and may append only one known
-  observed provider tagline: no tagline, `Nice work!`, `Chef's kiss.`,
-  `What shall we delve into next?`,
-  `Already looking forward to the next diff.`, `Keep them coming.`, `Keep them coming!`,
-  `:rocket:`, `:tada:`, `Swish.`, `Another round soon, please!`, `Breezy!`,
-  `Can't wait for the next one!`, `More of your lovely PRs please.`, `Bravo.`,
-  `Swish!`, `Keep it up!`, `Delightful!`, `Hooray!`, `You're on a roll.`, or
-  `:+1:`. It contains exactly one
-  `**Reviewed commit:**` line with a 10- or 40-hex commit reference. After that
-  line, it contains either nothing or the exact known official
+  `Codex Review: Didn't find any major issues.`. It may end there or append one
+  nonempty, trimmed tagline on the same first line, separated by exactly one
+  ASCII space. The tagline is limited to 160 UTF-16 code units and must match
+  exactly one of these closed presentation templates:
+
+  - one known benign stem followed by exactly one final `.`, `!`, or `?`; the
+    stems are `Nice work`, `Chef's kiss`,
+    `What shall we delve into next`,
+    `Already looking forward to the next diff`, `Keep them coming`, `Swish`,
+    `Another round soon, please`, `Breezy`,
+    `Can't wait for the next one`, `More of your lovely PRs please`, `Bravo`,
+    `Keep it up`, `Delightful`, `Hooray`, and `You're on a roll`;
+  - exact `:rocket:`, `:tada:`, or `:+1:`; or
+  - one to eight exact RGI emoji graphemes, adjacent or separated by one ASCII
+    space.
+
+  All unknown prose fails closed, including unknown positive prose and
+  actionable or contradictory language. The parser does not attempt to prove
+  natural-language meaning. The tagline is presentation only and cannot supply
+  clean or finding evidence.
+
+  After the first line, the comment contains exactly one
+  `**Reviewed commit:**` line with a 10- or 40-hex commit reference. It then
+  contains either nothing or the exact known official
   `ℹ️ About Codex in GitHub` disclosure block; arbitrary trailing prose is not
   accepted. After CRLF normalisation, per-line trimming, and removal of blank
   lines, that disclosure is exactly:
@@ -589,7 +648,8 @@ heuristic:
 - Finding-shaped signals take precedence over a clean-looking wrapper. A
   finding heading, GitHub blob link, priority/severity badge or list marker, or
   contradictory finding language makes the artifact non-clean even when the
-  issue-comment lead or review state otherwise looks clean.
+  issue-comment lead or review state otherwise looks clean. A tagline is never
+  used as clean or finding evidence and cannot override these signals.
 
 The action fully paginates issue comments, reviews, inline comments, GraphQL
 review threads, and thread comments. Missing parent reviews, thread mappings,
@@ -619,9 +679,9 @@ newest same-context status is already `success` from exact
 `github-actions[bot]` / `Bot`. An external or missing producer cannot expose
 an older trusted status as the deduplication candidate.
 
-Unknown future provider formats fail the current run closed. Once a later run
-can parse a complete newer current-head clean result, an older format error or
-incomplete API attempt does not remain sticky.
+Structurally unsupported or malformed future provider formats fail the current
+run closed. Once a later run can parse a complete newer current-head clean
+result, an older format error or incomplete API attempt does not remain sticky.
 
 ## Fork and Dependabot PRs
 
