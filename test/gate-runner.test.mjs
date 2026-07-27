@@ -232,6 +232,27 @@ test("conflicting trusted markers block orchestration when provider evidence is 
   });
 });
 
+test("conflicting trusted markers preserve findings without starting another review", async () => {
+  await withHarness(async (harness) => {
+    seedConflictingMarkers(harness);
+    harness.reviewComments.push(currentHeadInlineFinding(3001));
+    harness.reviewThreads.push(unresolvedThread(3001));
+    const stateBefore = harness.findStateComment().body;
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(harness.findStateComment().body, stateBefore);
+  });
+});
+
 test("deprecated recovery inputs are accepted but do not change live evidence", async (t) => {
   const cases = [
     {

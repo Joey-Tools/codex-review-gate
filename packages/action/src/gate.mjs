@@ -452,20 +452,24 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     needsFreshMarker: stateNeedsFreshMarker,
     needsSave: stateNeedsSave,
     legacyFailureCandidate,
+    reviewOrchestrationBlocked = false,
   } = await loadAuditState(snapshot);
 
   if (snapshot.findings.count > 0) {
-    const findingOrchestration = await prepareFindingReviewOrchestration(
-      snapshot,
-      state,
-      savedStateComment,
-      trigger,
-      stateNeedsFreshMarker,
-    );
+    const findingOrchestration = reviewOrchestrationBlocked
+      ? { state, stateComment: savedStateComment }
+      : await prepareFindingReviewOrchestration(
+          snapshot,
+          state,
+          savedStateComment,
+          trigger,
+          stateNeedsFreshMarker,
+        );
     await failFromFindings(
       snapshot.findings,
       findingOrchestration.state,
       findingOrchestration.stateComment,
+      { preserveAuditState: reviewOrchestrationBlocked },
     );
     return;
   }
@@ -649,6 +653,7 @@ async function loadAuditState(snapshot) {
       needsFreshMarker: true,
       needsSave: true,
       legacyFailureCandidate: false,
+      reviewOrchestrationBlocked: true,
     };
   }
 }
@@ -1291,9 +1296,22 @@ async function passGate(state, stateComment, snapshot, observed) {
   await passGateFromCurrentEvidence(state, stateComment, snapshot);
 }
 
-async function failFromFindings(findings, state, stateComment) {
+async function failFromFindings(
+  findings,
+  state,
+  stateComment,
+  { preserveAuditState = false } = {},
+) {
   const sample = findings.samples[0];
   const suffix = sample ? ` First finding: ${sample}` : "";
+  if (preserveAuditState) {
+    await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
+    console.warn(
+      "left conflicting marker audit state unchanged while recording authoritative findings",
+    );
+    console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
+    return;
+  }
   const failedState = state.activeMarker
     ? closeActiveMarker(state, "failed_findings", isoNow(), {
         currentHeadFindings: summarizeFindingsForState(findings),

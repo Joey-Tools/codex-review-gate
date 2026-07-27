@@ -837,6 +837,8 @@ test("validates persisted marker scheduling fields without requiring legacy defa
   );
 
   const invalidOverrides = [
+    { createdAt: "1" },
+    { createdAt: "2026-02-30T10:00:00Z" },
     { ackDeadlineAt: "corrupt" },
     { resultDeadlineAt: "corrupt" },
     { nextRetryAt: "corrupt" },
@@ -880,6 +882,18 @@ test("validates persisted marker scheduling fields without requiring legacy defa
     maxWaitDeadlineAt: "corrupt",
   });
   assert.equal(parseMarkerCommentBody(malformedMarkerComment), null);
+
+  const validMarkerComment = buildMarkerCommentBody(markerBase);
+  for (const createdAt of ["1", "2026-02-30T10:00:00Z"]) {
+    assert.equal(
+      markerFromComment({
+        id: 1,
+        body: validMarkerComment,
+        created_at: createdAt,
+      }),
+      null,
+    );
+  }
 });
 
 test("normalizes legacy finding ID arrays into a bounded deterministic audit summary", () => {

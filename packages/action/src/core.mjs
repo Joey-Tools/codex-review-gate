@@ -29,6 +29,8 @@ const UNKNOWN_TERMINAL_DECORATOR =
   /^[^\s]+[ \t]+Codex Review\b/iu;
 const CODEX_ISSUE_COMMENT_PROGRESS =
   /^Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
+const STRICT_UTC_TIMESTAMP =
+  /^(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?:\.(\d{1,3}))?Z$/;
 const CODEX_CLEAN_TAGLINE_STEMS = new Set([
   "Nice work",
   "Chef's kiss",
@@ -1893,7 +1895,19 @@ function isNonEmptyString(value) {
 }
 
 function isValidTimestampString(value) {
-  return isNonEmptyString(value) && !Number.isNaN(Date.parse(value));
+  if (!isNonEmptyString(value)) {
+    return false;
+  }
+  const match = STRICT_UTC_TIMESTAMP.exec(value);
+  if (!match) {
+    return false;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    return false;
+  }
+  const canonical = `${match[1]}.${(match[2] || "").padEnd(3, "0")}Z`;
+  return new Date(parsed).toISOString() === canonical;
 }
 
 export function buildMarkerCommentBody(marker) {
