@@ -1047,6 +1047,14 @@ test("scheduled scan retries missed acknowledgement with same-head backoff", asy
         {
           id: "1999",
           headSha: HEAD_SHA,
+          createdAt: "2026-05-14T09:35:00Z",
+          baseline: {
+            plusOne: null,
+            eyes: null,
+            completionComment: null,
+            approvedReview: null,
+            submittedReview: null,
+          },
           outcome: "missed_ack",
           state: "missed_ack",
           closedAt: "2026-05-14T09:40:00Z",
@@ -1208,8 +1216,16 @@ test("history-only retries inherit the exact wait deadline across config changes
           headStartedAt: "2026-05-14T09:01:00Z",
           maxWaitDeadlineAt: "2026-05-14T11:01:00Z",
           trailingHistory: [{
-            id: "old-head-marker",
+            id: "1800",
             headSha: OLD_HEAD_SHA,
+            createdAt: "2026-05-14T09:25:00Z",
+            baseline: {
+              plusOne: null,
+              eyes: null,
+              completionComment: null,
+              approvedReview: null,
+              submittedReview: null,
+            },
             state: "passed",
             outcome: "passed",
             headStartedAt: "2026-05-14T09:30:00Z",
@@ -1893,6 +1909,45 @@ test("scheduled scan treats schema-malformed audit state as absent", async () =>
     assert.equal(harness.statuses.length, 0);
     assert.equal(statusReads(harness), 1);
     assert.equal(harness.pullLoads, 0);
+  });
+});
+
+test("schema-malformed active marker cannot suppress a fresh review request", async () => {
+  await withHarness(async (harness) => {
+    harness.issueComments.push({
+      id: 1000,
+      body: stateCommentBody({
+        version: 1,
+        createdAt: "2026-05-14T09:50:00Z",
+        updatedAt: "2026-05-14T09:55:00Z",
+        statusHead: HEAD_SHA,
+        bootstrap: { status: "closed" },
+        activeMarker: {},
+        history: [],
+        lastStatus: {
+          headSha: HEAD_SHA,
+          state: "pending",
+          updatedAt: "2026-05-14T09:55:00Z",
+          runUrl: "https://github.example/owner/repo/actions/runs/999",
+        },
+      }),
+      created_at: "2026-05-14T09:50:00Z",
+      html_url: "https://github.example/owner/repo/pull/1#issuecomment-1000",
+      user: { login: "github-actions[bot]" },
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(markerCommentWrites(harness), 1);
+    const latestState = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(latestState.activeMarker.headSha, HEAD_SHA);
+    assert.equal(latestState.activeMarker.state, "waiting_ack");
   });
 });
 

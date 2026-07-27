@@ -1731,7 +1731,7 @@ export function buildStateCommentBody(state) {
 
 export function parseStateCommentBody(body) {
   const parsed = parseHiddenJson(body, STATE_MARKER);
-  if (!parsed) {
+  if (!persistedAuditStateHasValidShape(parsed)) {
     return null;
   }
   try {
@@ -1739,6 +1739,92 @@ export function parseStateCommentBody(body) {
   } catch {
     return null;
   }
+}
+
+function persistedAuditStateHasValidShape(state) {
+  if (
+    !isPlainRecord(state) ||
+    state.version !== STATE_VERSION ||
+    !isValidTimestampString(state.createdAt) ||
+    !isValidTimestampString(state.updatedAt) ||
+    !isNonEmptyString(state.statusHead) ||
+    !Array.isArray(state.history) ||
+    !state.history.every(persistedClosedMarkerHasValidShape) ||
+    !Object.hasOwn(state, "activeMarker")
+  ) {
+    return false;
+  }
+  if (
+    state.bootstrap !== undefined &&
+    state.bootstrap !== null &&
+    (
+      !isPlainRecord(state.bootstrap) ||
+      !isNonEmptyString(state.bootstrap.status)
+    )
+  ) {
+    return false;
+  }
+  if (
+    state.lastStatus !== undefined &&
+    state.lastStatus !== null &&
+    !persistedLastStatusHasValidShape(state.lastStatus)
+  ) {
+    return false;
+  }
+  return (
+    state.activeMarker === null ||
+    persistedActiveMarkerHasValidShape(state.activeMarker)
+  );
+}
+
+function persistedActiveMarkerHasValidShape(marker) {
+  return Boolean(
+    isPlainRecord(marker) &&
+      persistedMarkerIdentityHasValidShape(marker) &&
+      isNonEmptyString(marker.headSha) &&
+      isValidTimestampString(marker.createdAt) &&
+      isPlainRecord(marker.baseline) &&
+      (marker.state === "waiting_ack" || marker.state === "waiting_result"),
+  );
+}
+
+function persistedClosedMarkerHasValidShape(marker) {
+  return Boolean(
+    isPlainRecord(marker) &&
+      persistedMarkerIdentityHasValidShape(marker) &&
+      isNonEmptyString(marker.headSha) &&
+      isValidTimestampString(marker.createdAt) &&
+      isPlainRecord(marker.baseline) &&
+      isNonEmptyString(marker.outcome || marker.state),
+  );
+}
+
+function persistedMarkerIdentityHasValidShape(marker) {
+  return (
+    (typeof marker?.id === "string" && marker.id.trim().length > 0) ||
+    (Number.isSafeInteger(marker?.id) && marker.id > 0)
+  );
+}
+
+function persistedLastStatusHasValidShape(lastStatus) {
+  return Boolean(
+    isPlainRecord(lastStatus) &&
+      isNonEmptyString(lastStatus.headSha) &&
+      isNonEmptyString(lastStatus.state) &&
+      isValidTimestampString(lastStatus.updatedAt),
+  );
+}
+
+function isPlainRecord(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isValidTimestampString(value) {
+  return isNonEmptyString(value) && !Number.isNaN(Date.parse(value));
 }
 
 export function buildMarkerCommentBody(marker) {

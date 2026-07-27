@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   MAX_FINDING_ID_SAMPLES,
   MAX_STATE_COMMENT_BYTES,
+  STATE_MARKER,
   activeMarkerAckTimedOut,
   activeMarkerIsObsolete,
   autoRetryEnabled,
@@ -763,7 +764,7 @@ test("round-trips hidden state metadata", () => {
 });
 
 test("ignores malformed hidden state and marker JSON or schema", () => {
-  const stateBody = buildStateCommentBody({
+  const validStateBody = buildStateCommentBody({
     version: 1,
     createdAt: "2026-04-26T10:00:00Z",
     updatedAt: "2026-04-26T10:01:00Z",
@@ -771,7 +772,8 @@ test("ignores malformed hidden state and marker JSON or schema", () => {
     bootstrap: { status: "closed" },
     activeMarker: null,
     history: [],
-  }).replace('"version": 1', '"version":');
+  });
+  const stateBody = validStateBody.replace('"version": 1', '"version":');
   const markerBody = buildMarkerCommentBody({
     headSha: "abc123",
     runUrl: "https://example.invalid/runs/1",
@@ -781,29 +783,29 @@ test("ignores malformed hidden state and marker JSON or schema", () => {
     baseline: { plusOne: null, eyes: null },
     state: "waiting_ack",
   }).replace('"version": 1', '"version":');
-  const schemaMalformedStateBody = buildStateCommentBody({
-    version: 1,
-    createdAt: "2026-04-26T10:00:00Z",
-    updatedAt: "2026-04-26T10:01:00Z",
-    statusHead: "abc123",
-    bootstrap: { status: "closed" },
-    activeMarker: null,
-    history: [],
-  }).replace('"history": []', '"history": {}');
+  const schemaMalformedStateBodies = [
+    validStateBody.replace('"history": []', '"history": {}'),
+    validStateBody.replace('"history": []', '"history": [{}]'),
+    validStateBody.replace('"activeMarker": null', '"activeMarker": {}'),
+    validStateBody.replace('"activeMarker": null', '"activeMarker": []'),
+    `<!-- ${STATE_MARKER}\n[]\n-->`,
+  ];
 
   assert.equal(parseStateCommentBody(stateBody), null);
   assert.equal(parseMarkerCommentBody(markerBody), null);
-  assert.equal(parseStateCommentBody(schemaMalformedStateBody), null);
-  assert.equal(
-    findLatestTrustedStateComment([
-      {
-        id: 1,
-        body: schemaMalformedStateBody,
-        user: { login: "github-actions[bot]" },
-      },
-    ]),
-    null,
-  );
+  for (const schemaMalformedStateBody of schemaMalformedStateBodies) {
+    assert.equal(parseStateCommentBody(schemaMalformedStateBody), null);
+    assert.equal(
+      findLatestTrustedStateComment([
+        {
+          id: 1,
+          body: schemaMalformedStateBody,
+          user: { login: "github-actions[bot]" },
+        },
+      ]),
+      null,
+    );
+  }
 });
 
 test("normalizes legacy finding ID arrays into a bounded deterministic audit summary", () => {
@@ -823,6 +825,10 @@ test("normalizes legacy finding ID arrays into a bounded deterministic audit sum
     activeMarker: null,
     history: [{
       id: "1",
+      headSha: "abc123",
+      createdAt: "2026-04-26T09:55:00Z",
+      baseline: { plusOne: null, eyes: null },
+      state: "failed_findings",
       outcome: "failed_findings",
       currentHeadFindingIds: findingIds,
     }],
