@@ -471,6 +471,36 @@ test("issue_comment completion fails closed when final reload sees current-head 
   });
 });
 
+test("final findings preserve a pre-existing marker conflict", async () => {
+  await withHarness(async (harness) => {
+    seedConflictingMarkers(harness);
+    harness.issueComments.push(codexCleanComment(2001, "2026-05-14T09:57:00Z"));
+    const stateBefore = harness.findStateComment().body;
+    harness.afterPullLoad(2, {
+      action: "pushReviewComment",
+      value: currentHeadInlineFinding(3001),
+    });
+    harness.afterPullLoad(2, {
+      action: "pushReviewThread",
+      value: unresolvedThread(3001),
+    });
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: { user: { login: "chatgpt-codex-connector[bot]" } },
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "failure");
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(harness.findStateComment().body, stateBefore);
+  });
+});
+
 test("issue_comment clean completion recovers resolved failed findings", async () => {
   await withHarness(async (harness) => {
     harness.seedFailedFindingsState({ id: 2000 });

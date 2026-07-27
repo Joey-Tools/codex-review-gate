@@ -479,6 +479,7 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
       snapshot,
       state,
       savedStateComment,
+      { reviewOrchestrationBlocked },
     )
   ) {
     return;
@@ -1132,6 +1133,7 @@ async function reconcileCurrentReviewEvidence(
   snapshot,
   state,
   stateComment,
+  { reviewOrchestrationBlocked = false } = {},
 ) {
   failIfSnapshotEvidenceIsInvalid(snapshot);
   if (snapshot.providerResult.kind !== "clean") {
@@ -1145,7 +1147,12 @@ async function reconcileCurrentReviewEvidence(
     );
   }
 
-  await passGateFromCurrentEvidence(state, stateComment, snapshot);
+  await passGateFromCurrentEvidence(
+    state,
+    stateComment,
+    snapshot,
+    { reviewOrchestrationBlocked },
+  );
   return true;
 }
 
@@ -1221,13 +1228,19 @@ async function passGateFromCurrentEvidence(
   state,
   stateComment,
   snapshot,
+  { reviewOrchestrationBlocked = false } = {},
 ) {
   const liveStatus = await loadLatestGateStatus();
   await failIfPullRequestHeadChanged("before final Codex review evidence snapshot");
   const finalSnapshot = await loadSnapshot();
   failIfSnapshotEvidenceIsInvalid(finalSnapshot);
   if (finalSnapshot.findings.count > 0) {
-    await failFromFindings(finalSnapshot.findings, state, stateComment);
+    await failFromFindings(
+      finalSnapshot.findings,
+      state,
+      stateComment,
+      { preserveAuditState: reviewOrchestrationBlocked },
+    );
     return;
   }
   if (!providerResultIsCurrentHeadClean(finalSnapshot.providerResult)) {
