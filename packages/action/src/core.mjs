@@ -31,6 +31,22 @@ const CODEX_ISSUE_COMMENT_PROGRESS =
   /^Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
 const STRICT_UTC_TIMESTAMP =
   /^(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?:\.(\d{1,3}))?Z$/;
+const AUDIT_BOOTSTRAP_STATES = new Set(["open", "closed"]);
+const AUDIT_STATUS_STATES = new Set(["pending", "success", "failure"]);
+const ACTIVE_MARKER_STATES = new Set(["waiting_ack", "waiting_result"]);
+const CLOSED_MARKER_OUTCOMES = new Set([
+  "failed_findings",
+  "missed_ack",
+  "obsolete_head",
+  "passed",
+  "stalled",
+  "state_lost",
+  "timed_out",
+]);
+const MARKER_COMMENT_STATES = new Set([
+  ...ACTIVE_MARKER_STATES,
+  ...CLOSED_MARKER_OUTCOMES,
+]);
 const CODEX_CLEAN_TAGLINE_STEMS = new Set([
   "Nice work",
   "Chef's kiss",
@@ -1763,7 +1779,7 @@ function persistedAuditStateHasValidShape(state) {
     state.bootstrap !== null &&
     (
       !isPlainRecord(state.bootstrap) ||
-      !isNonEmptyString(state.bootstrap.status)
+      !AUDIT_BOOTSTRAP_STATES.has(state.bootstrap.status)
     )
   ) {
     return false;
@@ -1796,7 +1812,8 @@ function persistedActiveMarkerHasValidShape(marker) {
       isValidTimestampString(marker.createdAt) &&
       isPlainRecord(marker.baseline) &&
       persistedMarkerSchedulingFieldsHaveValidShape(marker) &&
-      (marker.state === "waiting_ack" || marker.state === "waiting_result"),
+      ACTIVE_MARKER_STATES.has(marker.state) &&
+      (marker.outcome === undefined || marker.outcome === null),
   );
 }
 
@@ -1808,7 +1825,8 @@ function persistedClosedMarkerHasValidShape(marker) {
       isValidTimestampString(marker.createdAt) &&
       isPlainRecord(marker.baseline) &&
       persistedMarkerSchedulingFieldsHaveValidShape(marker) &&
-      isNonEmptyString(marker.outcome || marker.state),
+      CLOSED_MARKER_OUTCOMES.has(marker.outcome) &&
+      marker.state === marker.outcome,
   );
 }
 
@@ -1881,7 +1899,7 @@ function persistedLastStatusHasValidShape(lastStatus) {
   return Boolean(
     isPlainRecord(lastStatus) &&
       isNonEmptyString(lastStatus.headSha) &&
-      isNonEmptyString(lastStatus.state) &&
+      AUDIT_STATUS_STATES.has(lastStatus.state) &&
       isValidTimestampString(lastStatus.updatedAt),
   );
 }
@@ -1941,7 +1959,7 @@ export function parseMarkerCommentBody(body) {
     parsed.version !== STATE_VERSION ||
     !isNonEmptyString(parsed.headSha) ||
     !isPlainRecord(parsed.baseline) ||
-    !isNonEmptyString(parsed.state) ||
+    !MARKER_COMMENT_STATES.has(parsed.state) ||
     !persistedMarkerSchedulingFieldsHaveValidShape(parsed)
   ) {
     return null;

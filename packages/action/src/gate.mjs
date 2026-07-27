@@ -1164,6 +1164,21 @@ function providerResultIsCurrentHeadClean(providerResult) {
   );
 }
 
+async function markerStateConflictBlocksReviewOrchestration(snapshot) {
+  try {
+    await ensureState(snapshot, null, null, { persist: false });
+    return false;
+  } catch (error) {
+    if (
+      error instanceof GateFailure &&
+      error.description === MARKER_STATE_CONFLICT_DESCRIPTION
+    ) {
+      return true;
+    }
+    throw error;
+  }
+}
+
 function matchingTrustedLiveMarker(recordedMarker, snapshot) {
   const markerComment = findLatestTrustedMarkerComment(
     snapshot?.comments || [],
@@ -1234,12 +1249,21 @@ async function passGateFromCurrentEvidence(
   await failIfPullRequestHeadChanged("before final Codex review evidence snapshot");
   const finalSnapshot = await loadSnapshot();
   failIfSnapshotEvidenceIsInvalid(finalSnapshot);
+  const finalReviewOrchestrationBlocked =
+    reviewOrchestrationBlocked ||
+    await markerStateConflictBlocksReviewOrchestration(finalSnapshot);
+  if (finalReviewOrchestrationBlocked && !reviewOrchestrationBlocked) {
+    console.warn(
+      "detected conflicting marker audit during final provider evidence reload; " +
+        "sticky state writes remain blocked",
+    );
+  }
   if (finalSnapshot.findings.count > 0) {
     await failFromFindings(
       finalSnapshot.findings,
       state,
       stateComment,
-      { preserveAuditState: reviewOrchestrationBlocked },
+      { preserveAuditState: finalReviewOrchestrationBlocked },
     );
     return;
   }
@@ -1293,10 +1317,16 @@ async function passGateFromCurrentEvidence(
         `the workflow must publish a compensating non-success status: ${error.message}`,
     );
   }
-  try {
-    await saveState(passedState, stateComment);
-  } catch (error) {
-    console.warn(`failed to save audit state after ${STATUS_CONTEXT}=success: ${error.message}`);
+  if (finalReviewOrchestrationBlocked) {
+    console.warn(
+      "left conflicting marker audit state unchanged while recording authoritative clean evidence",
+    );
+  } else {
+    try {
+      await saveState(passedState, stateComment);
+    } catch (error) {
+      console.warn(`failed to save audit state after ${STATUS_CONTEXT}=success: ${error.message}`);
+    }
   }
   console.log(
     `${STATUS_CONTEXT} passed for ${statusSha} from ` +

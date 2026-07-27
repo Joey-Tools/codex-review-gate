@@ -835,10 +835,27 @@ test("validates persisted marker scheduling fields without requiring legacy defa
     ),
     null,
   );
+  assert.notEqual(
+    parseStateCommentBody(
+      buildStateCommentBody({
+        ...stateBase,
+        activeMarker: null,
+        history: [{
+          ...markerBase,
+          state: "missed_ack",
+          outcome: "missed_ack",
+          closedAt: "2026-04-26T10:01:00Z",
+        }],
+      }),
+    ),
+    null,
+  );
 
   const invalidOverrides = [
     { createdAt: "1" },
     { createdAt: "2026-02-30T10:00:00Z" },
+    { state: "typo" },
+    { outcome: "typo" },
     { ackDeadlineAt: "corrupt" },
     { resultDeadlineAt: "corrupt" },
     { nextRetryAt: "corrupt" },
@@ -882,6 +899,39 @@ test("validates persisted marker scheduling fields without requiring legacy defa
     maxWaitDeadlineAt: "corrupt",
   });
   assert.equal(parseMarkerCommentBody(malformedMarkerComment), null);
+  assert.equal(
+    parseMarkerCommentBody(buildMarkerCommentBody({ ...markerBase, state: "typo" })),
+    null,
+  );
+  assert.notEqual(
+    parseMarkerCommentBody(buildMarkerCommentBody({ ...markerBase, state: "state_lost" })),
+    null,
+  );
+
+  assert.equal(
+    parseStateCommentBody(
+      buildStateCommentBody({
+        ...stateBase,
+        bootstrap: { status: "typo" },
+        activeMarker: null,
+      }),
+    ),
+    null,
+  );
+  assert.equal(
+    parseStateCommentBody(
+      buildStateCommentBody({
+        ...stateBase,
+        activeMarker: null,
+        lastStatus: {
+          headSha: "abc123",
+          state: "typo",
+          updatedAt: "2026-04-26T10:01:00Z",
+        },
+      }),
+    ),
+    null,
+  );
 
   const validMarkerComment = buildMarkerCommentBody(markerBase);
   for (const createdAt of ["1", "2026-02-30T10:00:00Z"]) {

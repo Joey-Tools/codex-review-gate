@@ -232,6 +232,27 @@ test("conflicting trusted markers block orchestration when provider evidence is 
   });
 });
 
+test("stable clean leaves conflicting marker audit state untouched", async () => {
+  await withHarness(async (harness) => {
+    seedConflictingMarkers(harness);
+    harness.issueComments.push(codexCleanComment(2001));
+    const stateBefore = harness.findStateComment().body;
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(stateCommentWrites(harness), 0);
+    assert.equal(harness.findStateComment().body, stateBefore);
+  });
+});
+
 test("conflicting trusted markers preserve findings without starting another review", async () => {
   await withHarness(async (harness) => {
     seedConflictingMarkers(harness);
@@ -249,6 +270,7 @@ test("conflicting trusted markers preserve findings without starting another rev
     assert.equal(harness.statuses.at(-1).body.state, "failure");
     assert.equal(harness.findMarkerComments().length, 2);
     assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(stateCommentWrites(harness), 0);
     assert.equal(harness.findStateComment().body, stateBefore);
   });
 });
@@ -497,6 +519,45 @@ test("final findings preserve a pre-existing marker conflict", async () => {
     assert.equal(harness.statuses.at(-1).body.state, "failure");
     assert.equal(harness.findMarkerComments().length, 2);
     assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(stateCommentWrites(harness), 0);
+    assert.equal(harness.findStateComment().body, stateBefore);
+  });
+});
+
+test("a marker conflict introduced during final reload blocks sticky state writes", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 1900,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:55:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    harness.issueComments.push(codexCleanComment(2001, "2026-05-14T09:57:00Z"));
+    const stateBefore = harness.findStateComment().body;
+    harness.afterPullLoad(2, {
+      action: "pushIssueComment",
+      value: conflictingMarkerComment(),
+    });
+
+    const result = await harness.runGate({
+      eventName: "issue_comment",
+      event: {
+        issue: { number: 1, pull_request: {} },
+        comment: { user: { login: "chatgpt-codex-connector[bot]" } },
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "success");
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(stateCommentWrites(harness), 0);
     assert.equal(harness.findStateComment().body, stateBefore);
   });
 });
@@ -1192,6 +1253,36 @@ test("scheduled scan retries stalled WaitingResult markers", async () => {
     assert.equal(state.activeMarker.headStartedAt, "2026-05-14T08:50:00Z");
     assert.equal(state.activeMarker.maxWaitDeadlineAt, "2026-05-14T10:50:00Z");
     assert.equal(harness.statuses.at(-1).body.state, "pending");
+  });
+});
+
+test("unknown persisted lifecycle values cannot suppress scheduled recovery", async () => {
+  await withHarness(async (harness) => {
+    harness.seedHistoryOnlyRetryState({
+      id: 2000,
+      outcome: "missed_ack",
+      headStartedAt: "2026-05-14T09:01:00Z",
+      maxWaitDeadlineAt: "2026-05-14T11:01:00Z",
+    });
+    const malformedStateComment = harness.findStateComment();
+    const malformedState = parseStateCommentBody(malformedStateComment.body);
+    malformedState.history.at(-1).state = "typo";
+    malformedState.history.at(-1).outcome = "typo";
+    malformedState.lastStatus.state = "typo";
+    malformedStateComment.body = stateCommentBody(malformedState);
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(markerCommentWrites(harness), 1);
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    const recoveredState = parseStateCommentBody(harness.findStateComment().body);
+    assert.equal(recoveredState.history.at(-1).outcome, "state_lost");
+    assert.equal(recoveredState.activeMarker.state, "waiting_ack");
   });
 });
 
@@ -5165,7 +5256,11 @@ function seedConflictingMarkers(harness) {
       submittedReview: null,
     },
   });
-  harness.issueComments.push(markerCommentFor({
+  harness.issueComments.push(conflictingMarkerComment());
+}
+
+function conflictingMarkerComment() {
+  return markerCommentFor({
     version: 1,
     id: "1950",
     url: "https://github.example/owner/repo/pull/1#issuecomment-1950",
@@ -5189,7 +5284,7 @@ function seedConflictingMarkers(harness) {
     nextRetryAt: "2026-05-14T10:01:00Z",
     headStartedAt: "2026-05-14T09:55:00Z",
     maxWaitDeadlineAt: "2026-05-14T11:55:00Z",
-  }));
+  });
 }
 
 function statusReads(harness) {
@@ -5212,6 +5307,13 @@ function markerCommentWrites(harness) {
     entry.method === "POST" &&
       entry.path.endsWith(`/issues/${harness.prNumber}/comments`) &&
       entry.body?.body?.includes(MARKER_COMMENT),
+  ).length;
+}
+
+function stateCommentWrites(harness) {
+  return harness.requestLog.filter((entry) =>
+    (entry.method === "POST" || entry.method === "PATCH") &&
+      entry.body?.body?.includes(STATE_MARKER),
   ).length;
 }
 
