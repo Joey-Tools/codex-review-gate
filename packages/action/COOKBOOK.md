@@ -9,10 +9,15 @@ Use this path after the workflow is merged to the repository default branch and 
 1. Open or update a ready PR.
 2. The workflow writes `codex/review-gate = pending` and posts a controlled `@codex review` marker.
 3. Wait for Codex to respond.
-4. If Codex posts an authorised current-head clean result and every historical thread-backed Codex finding is resolved, the gate writes `success`.
+4. On the next complete run, the gate writes `success` when the latest official,
+   trusted provider artifact matches the closed clean grammar, binds to the
+   current head, and every historical thread-backed Codex finding is resolved.
 5. If any historical thread-backed finding remains unresolved, the gate writes `failure` or stays pending until the finding path is evaluated. `isOutdated` alone does not resolve it.
 
-For the cleanest signal, disable Codex automatic review-on-push and let the controlled marker request the review for the current head.
+For the clearest request flow, repositories may disable Codex automatic
+review-on-push to reduce duplicate reviews. Automatic and controlled-marker
+results are evaluated by the same provider-evidence rules; the marker does not
+authorise either result.
 
 ## Failed Findings Recovery
 
@@ -20,15 +25,24 @@ Use this path when `codex/review-gate` is `failure` with `failed_findings`.
 
 1. Address the finding in code or decide that the finding is not actionable.
 2. Resolve the Codex review thread in GitHub.
-3. Request or wait for a same-head Codex clean top-level issue comment. Posting `@codex review` is the clearest way to create a fresh signal.
-4. When Codex posts a top-level clean completion comment, the `issue_comment` workflow wakes the gate.
-5. If `failed-findings-recovery` is enabled, the exact current `issue_comment` trigger matches the selected clean result, that result is newer than the failed marker close time, and every historical thread-backed finding is resolved, the gate writes `success`.
+3. Make sure an official clean artifact exists for the current head. If none
+   exists, posting `@codex review` is the clearest way to request one.
+4. Let a Codex comment or review event wake the gate, or run the workflow
+   manually for the PR.
+5. The gate rebuilds the complete evidence snapshot. It writes `success` when
+   the latest official, trusted closed-grammar clean artifact is bound to the
+   current head and every historical thread-backed finding is resolved.
 
 This recovery path is event-driven. It does not add polling or scheduled runner minutes.
 
-## Recovery Controls
+A marker deadline, closed marker state, baseline, or recovery cutoff cannot
+reject an otherwise valid provider artifact. A clean artifact that arrives
+after a marker deadline can pass on a later complete run.
 
-`failed-findings-recovery` is enabled by default. Disable it when a repository does not want the narrow same-head, no-active-marker issue-comment recovery path. Active controlled-marker results and exact reassertion of a previously passed marker are unaffected.
+## Deprecated Recovery Controls
+
+The v1 inputs remain available so existing workflows and stored state continue
+to load:
 
 ```yaml
 with:
@@ -36,21 +50,26 @@ with:
   failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}
 ```
 
-Set `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY=false` as a repository or organisation variable to disable it before the action starts. Runtime environments may also set `FAILED_FINDINGS_RECOVERY=false`; the action input takes precedence when both are set.
-
-`failed-findings-recovery-mode` controls whether a same-head clean signal can be re-evaluated after a blocked recovery attempt:
-
-- `head` is the default. If every historical thread-backed Codex finding is now resolved, rerunning the exact qualifying clean comment event may recover the status.
-- `fresh` records the time of a recovery attempt that was rejected because findings still existed. Any clean completion comment created at or before that rejected attempt will not pass later; after resolving the findings, request a new Codex review and wait for a newer clean completion comment.
-
-Use `head` when you want the gate to model the latest head-level Codex result. Use `fresh` when you want every resolved-findings recovery to be tied to a clean comment created after the blocked recovery attempt.
+`failed-findings-recovery`, `failed-findings-recovery-mode`, and their
+repository-variable or environment equivalents are deprecated compatibility
+controls. The action continues to accept and validate their v1 values, but
+those values no longer change gate decisions or request orchestration. Legacy
+fields already present in sticky state remain audit data. In particular,
+`head`, `fresh`, a disabled recovery switch, and a recorded recovery cutoff
+cannot make the latest valid current-head clean result pass or fail.
 
 ## Manual Recovery
 
-Use `workflow_dispatch` when event-driven recovery is disabled, when no usable Codex clean completion comment arrives, or when an operator wants to re-evaluate one PR explicitly.
+Use `workflow_dispatch` when no provider event wakes the workflow or when an
+operator wants to re-evaluate one PR explicitly.
 
 1. Open the `Codex Review Gate` workflow.
 2. Run it manually with the PR number.
-3. The gate reloads current GitHub evidence and advances the state machine from the stored sticky state.
+3. The gate reloads current GitHub evidence and computes the result from the
+   complete snapshot. Stored sticky state is used only to resume request
+   orchestration.
 
-Manual recovery remains fail-closed: if any historical thread-backed Codex finding remains unresolved, the status stays or becomes `failure`. A manual run may resume marker state, but it does not directly invoke the no-active-marker issue-comment recovery exception.
+Manual recovery remains fail-closed: an incomplete snapshot cannot pass, and
+if any historical thread-backed Codex finding remains unresolved, the status
+stays or becomes `failure`. Marker or recovery history does not veto a valid
+latest current-head clean artifact.

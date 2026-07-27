@@ -1,5 +1,5 @@
 name: Codex Review Gate
-description: Gate a pull request on a controlled Codex generative AI review signal.
+description: Gate a pull request on complete, trusted current-head Codex review evidence.
 author: JoeyTeng
 branding:
   icon: shield
@@ -30,7 +30,7 @@ inputs:
     required: false
     default: "codex-review-gate-marker"
   max-wait-seconds:
-    description: Overall maximum wait time before failing closed.
+    description: Overall marker wait budget used for retry and liveness orchestration.
     required: false
     default: "7200"
   marker-timeout-seconds:
@@ -46,15 +46,15 @@ inputs:
     required: false
     default: "1800"
   completion-signal-buffer-seconds:
-    description: Deprecated but operational v1 input. Issue-comment clean evidence must be newer than the active marker by this buffer.
+    description: Deprecated v1 interface-compatibility input; accepted values no longer change gate decisions or request orchestration.
     required: false
     default: "30"
   failed-findings-recovery:
-    description: Deprecated but operational v1 switch for narrow same-head no-active-marker recovery from failed_findings.
+    description: Deprecated v1 interface-compatibility switch; accepted values no longer change gate decisions or request orchestration.
     required: false
     default: ""
   failed-findings-recovery-mode:
-    description: "Deprecated but operational v1 input. head may reuse a qualifying clean; fresh requires a clean newer than a rejected recovery attempt."
+    description: "Deprecated v1 interface-compatibility input; head and fresh no longer change gate decisions or request orchestration."
     required: false
     default: ""
   poll-interval-seconds:

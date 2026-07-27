@@ -1811,7 +1811,11 @@ export function parseHiddenJson(body, marker) {
   if (!match) {
     return null;
   }
-  return JSON.parse(match[1]);
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
 }
 
 function markerCommentBodyHasControlEnvelope(body) {

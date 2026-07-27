@@ -8,7 +8,10 @@
 2. 使用 `JoeyTeng/codex-review-gate-action@v1`，合入 default branch 后再开一个后续测试 PR。
 3. 确认 `codex/review-gate` 行为符合预期后，把它加入 required status checks。恢复和排障 recipes 见 [cookbook](COOKBOOK.zh-CN.md)。
 
-`codex-review-gate` 是一个可复用 GitHub Action，负责提供 deterministic `codex/review-gate` status check。它适用于希望把 required status 保持为 pending 或 failing，直到当前 PR head 的 Codex review output 干净为止的仓库。
+`codex-review-gate` 是一个可复用 GitHub Action，负责提供 deterministic
+`codex/review-gate` status check。只有完整 evidence snapshot 中 latest official trusted
+provider artifact 符合封闭 clean grammar、绑定 current PR head，且所有 thread-backed
+Codex findings 均已 resolved 时，gate 才会通过。
 
 目标仓库只需要在 `.github/workflows/codex-review-gate.yml` 保留一个薄 workflow；review state machine 位于这个 action 内。
 
@@ -21,13 +24,18 @@
 
 ## 它检查什么
 
-Runner 实现了 event-driven serialized marker flow：
+Runner 会执行 event-driven evidence reconciliation；serialized marker flow 只负责请求
+review：
 
 - 通过 repository default branch 上的 `pull_request_target` 运行。
 - 把配置的 commit status 写到 PR head SHA；默认是 `codex/review-gate`。
-- 只有 latest accepted Codex terminal result 明确绑定 current head、结果为 clean、由 trusted marker 或 recovery lineage 授权，且历史上所有 thread-backed Codex findings 均已 resolved 时才通过。
+- 只有完整 evidence snapshot 中 latest official trusted provider artifact 符合封闭
+  clean grammar、明确绑定 current head，且历史上所有 thread-backed Codex findings 均已
+  resolved 时才通过。
 - 分开处理 `isOutdated` 和 `isResolved`。Outdated 但 unresolved 的 thread 仍会阻塞 gate。
-- 通过精确 repository 和 full-SHA blob links 识别没有 thread 的 top-level finding comments；同一或更新 head 上更晚的 accepted clean result 会 supersede 这些 findings。
+- 通过精确 repository 和 full-SHA blob links 识别没有 thread 的 top-level finding
+  comments；绑定 current head 的 latest official trusted closed-grammar clean artifact
+  可以 supersede 这些 findings。
 - 验证官方 provider identity，并把 reviews、inline comments 和 top-level results 绑定到其 reviewed commit。
 - 只通过封闭的 provider grammar 接受 clean result；finding-shaped content 的优先级高于看似 clean 的 lead 或 `APPROVED` state。
 - 对 configured provider 以 `Codex Review` 开头且可带 optional Markdown heading 和 emoji 的 comment，先作为宽泛 terminal candidate。Exact one-line `in progress` / `still in progress` message 会被忽略，末尾可以是句点，或冒号加 1–160 个 metadata 字符；较新的未知 candidate（例如 `completed`）则按 malformed/fail-closed 处理，而不会静默忽略。
@@ -39,17 +47,20 @@ Runner 实现了 event-driven serialized marker flow：
 - 把 Codex reactions 只作为诊断信号。
 - 用 scheduled 或 manual resume runs 重试未 ack 或 stalled 的 markers。
 - 当前 reconciliation 无法完整加载或校验所需 evidence 时 fail closed。暂时性读取重试耗尽写入 `pending`；确定性的 provider identity、schema 或 commit 冲突写入 `error`；两者都会使 workflow 失败。
-- 在应用 marker 等待 deadline 前先 reconcile 完整 review evidence。即使 active marker 在 reconciliation 期间到达 deadline，只要 clean result 稳定且已授权，仍由 clean result 胜出。
-- 要求每个新授权的 clean artifact 都必须在其来源 trusted live marker 已持久化的 `maxWaitDeadlineAt` 当时或之前创建；legacy marker 缺失该字段时，根据 live marker 的 `headStartedAt`/`createdAt` 与当前 maximum wait 推导 deadline。若 legacy persisted deadline 早于 live marker 自身的 GitHub server creation time，它不可能描述该 marker；只有这一种不可能形状会得到从 marker creation time 与当前 maximum wait 推导出的有界替代窗口。live marker 已持久化的 wait-budget 字段仍必须与 sticky state 精确一致；只有匹配的、不可能的 pre-creation deadline 不再充当替代窗口的 bound，而当 live legacy marker 未持久化 deadline 时，sticky state 已记录的 deadline 仍只能收窄推导窗口。reconciliation 可以在 deadline 后完成，但适用窗口后才产生的 artifact 不能让 gate pass 或重新断言 success。
-- `missed_ack`、`stalled` 或 `timed_out` 等待结束后观察到的 clean result，只有在 latest same-head historical marker 仍精确匹配 trusted live marker，且该 result 相对 marker 创建时间与 baseline 是新 transition 时才可恢复；这个恢复不会再发送 review 请求。
-- 在可恢复的 closed-wait lineage 上观察到 unresolved findings 时，将其转换为 `failed_findings`，因此 recovery-disabled 以及普通 failed-findings event 与 close-time 规则继续生效；`fresh` 会先记录精确的 rejected closed-wait clean 与 cutoff，再阻止后续重放。
-- 保留 timeout 来源，避免把 `failed_findings` 重新标记为 closed wait 后旁路其 recovery switch、event 或 cutoff 规则。
-- 如果 otherwise clean 的 current-head result 缺少 active-marker、closed-wait-marker、精确 passed-marker reassertion 或 failed-findings recovery lineage 授权，则主动降为 `pending`。
+- 在应用 marker 等待 deadline 前先 reconcile 完整 review evidence。Marker deadline
+  只负责结束或重试等待，不会为 provider artifact 设置 acceptance window。即使 valid
+  current-head clean artifact 在 marker deadline 后才创建，后续完整运行仍可通过。
+- Sticky state、controlled markers、baselines、deadlines、recovery mode 和 status
+  history 只用于 request orchestration、retry、liveness、审计和幂等；它们都不能授权或
+  拒绝 provider evidence。
 - 写入 success 前，先缓存同一 context 的 newest live status 及其 producer，再验证 PR lifecycle 和 head，加载 final complete snapshot，并在需要时执行有界 whole-snapshot orphan reload；之后不再读取 status，只做 deduplication，并在需要时立即 POST success。
 - 只有同一 context 的 newest record 已是目标 state，且 producer exact 为 `github-actions[bot]` / `Bot` 时才去重；external 或缺失 producer 不能让 gate 回退采用更旧的 trusted status。
-- 只有 v1.2 passed marker 的 exact legacy result identity、trusted live marker、baseline 与当前 strict clean artifact 全部匹配时才安全升级；否则要求 fresh marker。
-- 提供狭窄的 legacy `failed_findings` recovery：维护者 resolve 所有 thread-backed Codex findings 后，只有与 selected same-head clean result 精确匹配的 `issue_comment` event 才可使用；compatibility inputs 决定能否复用同一个 clean，或必须等待更新结果。
-- 如果误开 PR-open automatic review，也只有 active controlled marker 之后的输出能通过最终 current-head validation。
+- 迁移 legacy marker 和 recovery fields 只为保持 orchestration 连续性，不会把这些
+  fields 当作 provider-evidence authority。
+- 为保持 v1 interface compatibility，继续接受 deprecated failed-findings
+  recovery inputs；其取值不再改变 gate decision 或 request orchestration。
+- 对 official automatic-review output 与 controlled-request output 使用相同的 identity、
+  封闭 grammar、current-head 和 complete-snapshot 规则。
 
 ## 文件
 
@@ -158,13 +169,13 @@ jobs:
 | `status-context` | `codex/review-gate` | Gate 写入的 commit status context。 |
 | `state-marker` | `codex-review-gate-state` | Sticky state comment 使用的 hidden HTML marker。 |
 | `marker-comment-marker` | `codex-review-gate-marker` | Controlled Codex request comments 使用的 hidden HTML marker。 |
-| `max-wait-seconds` | `7200` | Fail closed 前的整体最大等待时间。 |
+| `max-wait-seconds` | `7200` | 用于 retry 和 liveness orchestration 的整体 marker 等待预算。 |
 | `marker-timeout-seconds` | `3600` | 已 ack marker 等待结果的时间，超时后重试。 |
 | `marker-ack-timeout-seconds` | `300` | Codex ack marker 前的初始等待时间。 |
 | `marker-ack-timeout-max-seconds` | `1800` | 未 ack marker 指数退避等待上限。 |
-| `completion-signal-buffer-seconds` | `30` | Deprecated 但在 v1 仍生效的 compatibility input。Issue-comment clean result 除了 exact commit binding，还必须比 active marker 晚该 buffer。 |
-| `failed-findings-recovery` | empty | Deprecated 但在 v1 仍生效的 switch，用于从 `failed_findings` 进入狭窄的 same-head、no-active-marker recovery。留空默认启用；`false` 关闭该路径。 |
-| `failed-findings-recovery-mode` | empty | Deprecated 但在 v1 仍生效。`head` 可在 findings resolved 后复用同一个 qualifying clean；`fresh` 要求 clean 晚于已记录的 rejected recovery attempt。 |
+| `completion-signal-buffer-seconds` | `30` | Deprecated v1 interface-compatibility input；其取值不再改变 gate decision 或 request orchestration。 |
+| `failed-findings-recovery` | empty | Deprecated v1 interface-compatibility switch；其取值不再改变 gate decision 或 request orchestration。 |
+| `failed-findings-recovery-mode` | empty | Deprecated v1 interface-compatibility input；`head` 和 `fresh` 不再改变 gate decision 或 request orchestration。 |
 | `event-mode` | empty | Event mode override：精确小写 `standard`、`comment-only` 或 `full`。留空时使用 `CODEX_REVIEW_GATE_EVENT_MODE` 或 `standard`。 |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input。Event-driven runs 不轮询。 |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input。Event-driven runs 会直接创建 controlled marker。 |
@@ -200,7 +211,9 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 
 - Workflow 不执行 PR 代码。
 - Workflow token 应同时具备 `issues: write` 和 `pull-requests: write`，这样才能创建 PR conversation comments。
-- 为了让信号最干净，建议关闭 Codex automatic review-on-push，只让 gate marker comment 触发 current-head review。
+- 为了让 request flow 更清晰，仓库可以关闭 Codex automatic review-on-push，以减少重复
+  reviews。Automatic 和 controlled-marker results 使用相同的 provider-evidence 规则；
+  marker 不会授权其中任一结果。
 - Runner 必须完整分页读取 REST comments、reviews、inline comments 和 GraphQL review threads，之后才可能通过。
 - 官方 REST evidence 必须来自 accepted Bot identity。Top-level issue comments 默认还必须来自官方 `chatgpt-codex-connector` GitHub App。
 - REST evidence IDs 必须是 positive safe integers；GraphQL opaque ID 与 `fullDatabaseId` 必须使用 canonical string form。Duplicate provider、review、inline-comment 或 thread identities 都会 fail closed，包括 resolved threads。
@@ -209,15 +222,24 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 - Top-level clean comments 通过 reviewed-commit marker 绑定。短 marker 必须经 repository commit API 唯一解析为完整 current-head SHA。
 - 封闭的 clean 结构要求 exact issue-comment lead；之后只能没有 tagline，或用恰好一个 ASCII space 分隔一个 nonempty、trimmed、同首行且最多 160 个 UTF-16 code units 的 presentation tagline。Tagline 必须是以下一种：已知 stem（`Nice work`、`Chef's kiss`、`What shall we delve into next`、`Already looking forward to the next diff`、`Keep them coming`、`Swish`、`Another round soon, please`、`Breezy`、`Can't wait for the next one`、`More of your lovely PRs please`、`Bravo`、`Keep it up`、`Delightful`、`Hooray` 或 `You're on a roll`）加恰好一个结尾 `.`、`!` 或 `?`；exact `:rocket:`、`:tada:` 或 `:+1:`；或一到八个 exact RGI emoji graphemes（相邻或以一个 ASCII space 分隔）。所有未知 prose 都 fail closed，无论是 positive、actionable 还是 contradictory。Tagline 只用于 presentation，绝不提供 clean 或 finding evidence。Comment 仍必须有且仅有一行 10 或 40 hex 的 reviewed-commit，并且只能没有 suffix 或带 exact official disclosure。`APPROVED` review 必须为空、exact `Looks good.`，或有唯一的 exact final `No findings.`，其前面可以有至多一行、最多 240 个字符的 summary。该 summary 必须以 exact `Coverage:` 或 `Review coverage:` 开头，后接以逗号和/或 `and` 分隔的 backtick-wrapped identifier/path tokens；token 只能匹配 `[A-Za-z0-9_./:@+-]+`，末尾只可选一个句点。整个 normalized target 若 exact 等于 `P0`–`P3`、`S0`–`S3`、`critical`、`high`、`medium`、`low`、`finding`、`findings`、`blocker`、`blocking`、`found`、`detected`、`data-loss` 或 `auth-bypass`，则拒绝；这些词出现在真实 path 或 identifier segment 中时不会被 blanket 拒绝。Verb-led 和其他 prose 均不接受。Finding signals 始终优先。
 - Review-body 和没有 thread 的 top-level findings 必须使用 exact `github.com`、被 gate 的 owner/repository 和 full commit SHA links。当前格式未知或冲突时 fail closed。
-- 期待 success 前，应 resolve 所有 thread-backed Codex findings；仅 `isOutdated` 不表示 resolved。同一 head 上更晚的 accepted clean result 可以 supersede 没有 thread 的 top-level finding。
+- 期待 success 前，应 resolve 所有 thread-backed Codex findings；仅 `isOutdated` 不表示
+  resolved。绑定 current head 的 latest official trusted closed-grammar clean artifact
+  可以 supersede 没有 thread 的 top-level finding。
 - Ancestor checks 会对照 exact 40-hex `base...head` request，校验 documented REST commit-comparison fields 及其 closed relationship/count matrix。Unpaginated `commits` list 必须含有 `min(ahead_by, 250)` 个 unique full-SHA entries，排除 base 和 merge-base commits，且非空时 final entry 必须绑定 requested head。Checks 会忽略 undocumented `head_commit`，不会额外 GET head commit，并对任何 schema 或 relationship 矛盾 fail closed。
-- Sticky state 和 status history 只用于 orchestration、审计和幂等。Rerun 会重建当前 evidence，并可在更晚但 stale 的 `pending` 或 `error` status 之后重新写入 `success`。
+- Sticky state、controlled markers、baselines、deadlines、recovery mode 和 status
+  history 只用于 request orchestration、retry、liveness、审计和幂等；它们不会授权或
+  拒绝 provider evidence。Rerun 会重建当前 evidence，并可在更晚但 stale 的 `pending`
+  或 `error` status 之后重新写入 `success`，包括采用早先 marker deadline 后才创建的
+  valid clean artifact。
 - Optional status-deduplication GET 使用独立的 best-effort 上限：每页 100 statuses、最多 10 页或 1,000 items、每个 response 1 MiB、总计 4 MiB、16 次 fetch attempts。它会先选择同一 context 的第一条（newest）record，再校验 producer identity；失败或超限只记为 `readFailed`，不污染 review evidence，并使 action 直接 POST 已计算的 status。
 - Review-evidence budget failure 会广播 abort active evidence requests。并发 loads 出现不同 failure 时，确定性的 non-`pending` error（包括 schema 或 identity conflict）优先于 budget 或 transient `pending`。
 - Retryable REST/GraphQL response 会遵守不超过 10 秒的合法 `Retry-After`。更长 delay 立即停止，缺失或 malformed value 使用有界 fallback retries；该 header 不会扩展现有 retry-safe method/status 集合。
 - 旧 short-SHA clean result 只在判定旧 unthreaded finding 是否被 supersede 时惰性解析。
 - Evidence-budget exhaustion 属于暂时性不完整：action 写入 `pending` 并以非零状态退出。确定性的 provider schema、identity 或 commit-binding 冲突写入 `error`，也以非零状态退出。
-- 当前默认 timeout 是 overall 2 小时、首次 marker ack 5 分钟、ack 退避上限 30 分钟且不超过 marker result timeout、每个 marker result 1 小时。推荐 schedule 示例每 2 小时检查一次 retry deadlines。
+- 当前默认 retry/liveness windows 是 overall 2 小时、首次 marker ack 5 分钟、ack
+  退避上限 30 分钟且不超过 marker timeout，以及 acknowledged marker 被视为 stalled
+  前 1 小时。推荐 schedule 示例每 2 小时检查一次 retry deadlines。这些 windows 不会
+  限制 provider-artifact validity。
 
 ## 反馈和报告
 

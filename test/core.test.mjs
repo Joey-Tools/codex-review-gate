@@ -762,6 +762,30 @@ test("round-trips hidden state metadata", () => {
   assert.deepEqual(parseStateCommentBody(buildStateCommentBody(state)), state);
 });
 
+test("ignores malformed hidden state and marker JSON", () => {
+  const stateBody = buildStateCommentBody({
+    version: 1,
+    createdAt: "2026-04-26T10:00:00Z",
+    updatedAt: "2026-04-26T10:01:00Z",
+    statusHead: "abc123",
+    bootstrap: { status: "closed" },
+    activeMarker: null,
+    history: [],
+  }).replace('"version": 1', '"version":');
+  const markerBody = buildMarkerCommentBody({
+    headSha: "abc123",
+    runUrl: "https://example.invalid/runs/1",
+    runId: "1",
+    runAttempt: "1",
+    attempt: 1,
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+  }).replace('"version": 1', '"version":');
+
+  assert.equal(parseStateCommentBody(stateBody), null);
+  assert.equal(parseMarkerCommentBody(markerBody), null);
+});
+
 test("normalizes legacy finding ID arrays into a bounded deterministic audit summary", () => {
   const findingIds = Array.from(
     { length: 5_000 },
