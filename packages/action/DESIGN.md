@@ -192,7 +192,14 @@ failed-findings recovery, or passed-history reassertion. Persisted
 exactly. When the live legacy marker lacks a deadline but sticky state already
 records one, the earlier of that recorded deadline and the live-derived current
 deadline applies. Legacy sticky state may therefore narrow a window but cannot
-extend it.
+extend it. One older producer could persist a deadline inherited from an earlier
+wait cycle even though the new trusted marker comment was created after that
+deadline. Such a value cannot describe the marker that carries it. Only when the
+trusted live deadline strictly predates the marker's GitHub server creation time
+does the gate replace that unusable value with a bounded window from the marker
+creation time plus the current maximum-wait control; the matching unusable sticky
+copy does not narrow that replacement. Every other persisted deadline remains
+authoritative.
 
 If unresolved findings are observed against a recoverable closed-wait marker,
 the gate first persists a `failed_findings` descendant of that exact trusted

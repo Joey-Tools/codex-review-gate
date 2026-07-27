@@ -136,7 +136,12 @@ artifact 不能授权 active-marker success、closed-wait recovery、failed-find
 或 passed-history reassertion。已持久化的 `headStartedAt` 与 `maxWaitDeadlineAt` 必须和
 trusted live marker 精确一致。若 legacy live marker 缺 deadline，但 sticky state 已记录
 deadline，则取该记录值与 live-derived current deadline 中较早者；legacy sticky state
-只能收窄窗口，不能延长窗口。
+只能收窄窗口，不能延长窗口。较旧的 producer 可能把前一次 wait cycle 继承来的 deadline
+写入一个更晚才创建的 trusted marker comment；这种值不可能描述承载它的 marker。只有当
+trusted live deadline 严格早于该 marker 的 GitHub server creation time 时，gate 才会把
+这个不可用值替换为从 marker creation time 加当前 maximum-wait control 得到的有界窗口，
+同时不让 sticky state 中与其匹配的不可用副本收窄该替代窗口。其他所有 persisted deadline
+仍然保持权威。
 
 如果在可恢复的 closed-wait marker 上观察到 unresolved findings，gate 会先持久化该
 精确信任 lineage 的 `failed_findings` 后继记录。之后应用 recovery-disabled 以及普通
