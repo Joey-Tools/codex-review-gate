@@ -545,9 +545,11 @@ Scheduled runs 处理 retry deadlines。它们应扫描 open PRs，只为 candid
 event、scheduled run、rerun 或 targeted manual run 都可以重建完整 snapshot。当 latest
 official trusted closed-grammar clean artifact 绑定 current head，且历史上所有
 thread-backed findings 均已 resolved 时，无论 active-marker state、failed-marker close
-time、recovery switch、`head`/`fresh` mode 或 recorded recovery cutoff 如何，gate 都可以
-通过。这些 legacy values 只影响 request orchestration 与审计。较早的 incomplete run
-只作审计记录，但当前 snapshot 不完整时仍不能成功。
+time 或任何保留的 legacy recovery input 如何，gate 都可以通过。Marker lifecycle、
+deadline、baseline 和 retry fields 仍用于 request orchestration 与审计；deprecated
+recovery switch、`head`/`fresh` mode 和 recorded recovery cutoff 只是 inert
+compatibility data，既不影响 gate decision，也不影响 request orchestration。较早的
+incomplete run 只作审计记录，但当前 snapshot 不完整时仍不能成功。
 
 ## Branch Protection
 

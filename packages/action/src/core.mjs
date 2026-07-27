@@ -1731,7 +1731,14 @@ export function buildStateCommentBody(state) {
 
 export function parseStateCommentBody(body) {
   const parsed = parseHiddenJson(body, STATE_MARKER);
-  return parsed ? normalizeState(parsed) : null;
+  if (!parsed) {
+    return null;
+  }
+  try {
+    return normalizeState(parsed);
+  } catch {
+    return null;
+  }
 }
 
 export function buildMarkerCommentBody(marker) {

@@ -679,11 +679,13 @@ After `failed_findings`, maintainers resolve every Codex review thread. Any
 later provider event, scheduled run, rerun, or targeted manual run may rebuild
 the complete snapshot. If the latest official, trusted closed-grammar clean
 artifact is bound to the current head, it may pass regardless of active-marker
-state, failed-marker close time, recovery switch, `head`/`fresh` mode, or a
-recorded recovery cutoff, provided every historical thread-backed finding is
-resolved. Those legacy values affect only request
-orchestration and audit. An earlier incomplete run remains audit-only, but a
-current incomplete snapshot still prevents success.
+state, failed-marker close time, or any retained legacy recovery input,
+provided every historical thread-backed finding is resolved. Marker lifecycle,
+deadline, baseline, and retry fields still drive request orchestration and
+audit. The deprecated recovery switch, `head`/`fresh` mode, and recorded
+recovery cutoff are inert compatibility data: they affect neither the gate
+decision nor request orchestration. An earlier incomplete run remains
+audit-only, but a current incomplete snapshot still prevents success.
 
 ## Branch Protection
 

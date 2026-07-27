@@ -762,7 +762,7 @@ test("round-trips hidden state metadata", () => {
   assert.deepEqual(parseStateCommentBody(buildStateCommentBody(state)), state);
 });
 
-test("ignores malformed hidden state and marker JSON", () => {
+test("ignores malformed hidden state and marker JSON or schema", () => {
   const stateBody = buildStateCommentBody({
     version: 1,
     createdAt: "2026-04-26T10:00:00Z",
@@ -781,9 +781,29 @@ test("ignores malformed hidden state and marker JSON", () => {
     baseline: { plusOne: null, eyes: null },
     state: "waiting_ack",
   }).replace('"version": 1', '"version":');
+  const schemaMalformedStateBody = buildStateCommentBody({
+    version: 1,
+    createdAt: "2026-04-26T10:00:00Z",
+    updatedAt: "2026-04-26T10:01:00Z",
+    statusHead: "abc123",
+    bootstrap: { status: "closed" },
+    activeMarker: null,
+    history: [],
+  }).replace('"history": []', '"history": {}');
 
   assert.equal(parseStateCommentBody(stateBody), null);
   assert.equal(parseMarkerCommentBody(markerBody), null);
+  assert.equal(parseStateCommentBody(schemaMalformedStateBody), null);
+  assert.equal(
+    findLatestTrustedStateComment([
+      {
+        id: 1,
+        body: schemaMalformedStateBody,
+        user: { login: "github-actions[bot]" },
+      },
+    ]),
+    null,
+  );
 });
 
 test("normalizes legacy finding ID arrays into a bounded deterministic audit summary", () => {

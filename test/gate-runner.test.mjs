@@ -1853,6 +1853,49 @@ test("scheduled scan skips PRs with no trusted gate state or marker", async () =
   });
 });
 
+test("scheduled scan treats schema-malformed audit state as absent", async () => {
+  await withHarness(async (harness) => {
+    harness.commitStatuses.push({
+      sha: HEAD_SHA,
+      context: "codex/review-gate",
+      state: "success",
+      creator: { login: "github-actions[bot]", type: "Bot" },
+    });
+    harness.issueComments.push({
+      id: 1000,
+      body: stateCommentBody({
+        version: 1,
+        createdAt: "2026-05-14T09:50:00Z",
+        updatedAt: "2026-05-14T09:55:00Z",
+        statusHead: HEAD_SHA,
+        bootstrap: { status: "closed" },
+        activeMarker: null,
+        history: {},
+        lastStatus: {
+          headSha: HEAD_SHA,
+          state: "success",
+          updatedAt: "2026-05-14T09:55:00Z",
+          runUrl: "https://github.example/owner/repo/actions/runs/999",
+        },
+      }),
+      created_at: "2026-05-14T09:50:00Z",
+      html_url: "https://github.example/owner/repo/pull/1#issuecomment-1000",
+      user: { login: "github-actions[bot]" },
+    });
+    harness.issueComments.push(codexCleanComment(2001));
+
+    const result = await harness.runGate({
+      eventName: "schedule",
+      event: {},
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(statusReads(harness), 1);
+    assert.equal(harness.pullLoads, 0);
+  });
+});
+
 test("scheduled scan does not initialize stateless PRs from existing Codex evidence", async () => {
   const evidenceCases = [
     (harness) => {
