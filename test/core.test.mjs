@@ -808,6 +808,80 @@ test("ignores malformed hidden state and marker JSON or schema", () => {
   }
 });
 
+test("validates persisted marker scheduling fields without requiring legacy defaults", () => {
+  const stateBase = {
+    version: 1,
+    createdAt: "2026-04-26T10:00:00Z",
+    updatedAt: "2026-04-26T10:01:00Z",
+    statusHead: "abc123",
+    bootstrap: { status: "closed" },
+    history: [],
+  };
+  const markerBase = {
+    version: 1,
+    id: "1",
+    headSha: "abc123",
+    createdAt: "2026-04-26T10:00:30Z",
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+  };
+
+  assert.notEqual(
+    parseStateCommentBody(
+      buildStateCommentBody({
+        ...stateBase,
+        activeMarker: markerBase,
+      }),
+    ),
+    null,
+  );
+
+  const invalidOverrides = [
+    { ackDeadlineAt: "corrupt" },
+    { resultDeadlineAt: "corrupt" },
+    { nextRetryAt: "corrupt" },
+    { headStartedAt: "corrupt" },
+    { maxWaitDeadlineAt: "corrupt" },
+    { closedAt: "corrupt" },
+    { ackTimeoutSeconds: 0 },
+    { ackTimeoutSeconds: "300" },
+    { attempt: 0 },
+    { timedOutAfterSeconds: -1 },
+  ];
+  for (const override of invalidOverrides) {
+    assert.equal(
+      parseStateCommentBody(
+        buildStateCommentBody({
+          ...stateBase,
+          activeMarker: { ...markerBase, ...override },
+        }),
+      ),
+      null,
+    );
+    assert.equal(
+      parseStateCommentBody(
+        buildStateCommentBody({
+          ...stateBase,
+          activeMarker: null,
+          history: [{
+            ...markerBase,
+            state: "missed_ack",
+            outcome: "missed_ack",
+            ...override,
+          }],
+        }),
+      ),
+      null,
+    );
+  }
+
+  const malformedMarkerComment = buildMarkerCommentBody({
+    ...markerBase,
+    maxWaitDeadlineAt: "corrupt",
+  });
+  assert.equal(parseMarkerCommentBody(malformedMarkerComment), null);
+});
+
 test("normalizes legacy finding ID arrays into a bounded deterministic audit summary", () => {
   const findingIds = Array.from(
     { length: 5_000 },
@@ -3016,7 +3090,12 @@ test("scheduled scans continue when either trusted state or marker exists", () =
   );
   assert.equal(
     hasTrustedGateStateOrMarker(
-      [{ id: 2, body: markerBody, user: { login: "github-actions[bot]" } }],
+      [{
+        id: 2,
+        body: markerBody,
+        created_at: "2026-04-26T10:00:00Z",
+        user: { login: "github-actions[bot]" },
+      }],
       new Set(["github-actions[bot]"]),
     ),
     true,

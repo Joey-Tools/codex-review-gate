@@ -174,6 +174,12 @@ test("marker and audit history cannot reject stable current-head clean", async (
       },
     },
     {
+      name: "conflicting trusted markers",
+      seed(harness) {
+        seedConflictingMarkers(harness);
+      },
+    },
+    {
       name: "legacy failed audit",
       seed(harness) {
         harness.seedFailedFindingsState({ id: 1900 });
@@ -206,6 +212,24 @@ test("marker and audit history cannot reject stable current-head clean", async (
       });
     });
   }
+});
+
+test("conflicting trusted markers block orchestration when provider evidence is pending", async () => {
+  await withHarness(async (harness) => {
+    seedConflictingMarkers(harness);
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: { inputs: { pull_request: "1" } },
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /already tracks marker 1900/);
+    assert.equal(harness.statuses.at(-1).body.state, "error");
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(markerCommentWrites(harness), 0);
+  });
 });
 
 test("deprecated recovery inputs are accepted but do not change live evidence", async (t) => {
@@ -5075,6 +5099,46 @@ function seedCleanActiveMarker(harness) {
     },
   });
   harness.issueComments.push(codexCleanComment(2001));
+}
+
+function seedConflictingMarkers(harness) {
+  harness.seedActiveMarker({
+    id: 1900,
+    headSha: HEAD_SHA,
+    createdAt: "2026-05-14T09:55:00Z",
+    baseline: {
+      plusOne: null,
+      eyes: null,
+      completionComment: null,
+      approvedReview: null,
+      submittedReview: null,
+    },
+  });
+  harness.issueComments.push(markerCommentFor({
+    version: 1,
+    id: "1950",
+    url: "https://github.example/owner/repo/pull/1#issuecomment-1950",
+    headSha: HEAD_SHA,
+    runUrl: "https://github.example/owner/repo/actions/runs/1000",
+    runId: "1000",
+    runAttempt: "1",
+    attempt: 2,
+    baseline: {
+      plusOne: null,
+      eyes: null,
+      completionComment: null,
+      approvedReview: null,
+      submittedReview: null,
+    },
+    state: "waiting_ack",
+    ackTimeoutSeconds: 300,
+    createdAt: "2026-05-14T09:56:00Z",
+    ackDeadlineAt: "2026-05-14T10:01:00Z",
+    resultDeadlineAt: "2026-05-14T10:56:00Z",
+    nextRetryAt: "2026-05-14T10:01:00Z",
+    headStartedAt: "2026-05-14T09:55:00Z",
+    maxWaitDeadlineAt: "2026-05-14T11:55:00Z",
+  }));
 }
 
 function statusReads(harness) {

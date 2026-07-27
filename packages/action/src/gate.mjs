@@ -8,6 +8,7 @@ import {
   DEFAULT_CODEX_BOT_LOGINS,
   DEFAULT_TRUSTED_COMMENT_LOGINS,
   GateFailure,
+  MARKER_STATE_CONFLICT_DESCRIPTION,
   NonJsonResponseError,
   STATUS_CONTEXT,
   STATE_VERSION,
@@ -628,8 +629,18 @@ async function loadAuditState(snapshot) {
   try {
     return await ensureState(snapshot, null, null, { persist: false });
   } catch (error) {
+    const providerOutcomeIsAuthoritative =
+      snapshot.findings.count > 0 ||
+      providerResultIsCurrentHeadClean(snapshot.providerResult);
+    if (
+      !(error instanceof GateFailure) ||
+      error.description !== MARKER_STATE_CONFLICT_DESCRIPTION ||
+      !providerOutcomeIsAuthoritative
+    ) {
+      throw error;
+    }
     console.warn(
-      `ignored unusable sticky audit state while reconciling live review evidence: ` +
+      `ignored conflicting marker audit while applying authoritative live review evidence: ` +
         `${error.message}`,
     );
     return {
@@ -1421,6 +1432,10 @@ async function recoverOrchestrationPersistenceFence(state, stateComment, snapsho
             `orchestration-fence-${config.runId}-${config.runAttempt}`,
           url: markerComment?.html_url || previousMarker?.url || null,
           headSha: statusSha,
+          createdAt:
+            liveMarker?.createdAt ||
+            previousMarker?.createdAt ||
+            now,
           baseline: liveMarker?.baseline || previousMarker?.baseline || {},
           state: "state_lost",
           outcome: "state_lost",
