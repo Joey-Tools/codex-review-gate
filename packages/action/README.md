@@ -8,7 +8,11 @@ Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.
 2. Use `JoeyTeng/codex-review-gate-action@v1`, merge it to the default branch, then open a follow-up test PR.
 3. After `codex/review-gate` behaves as expected, add it as a required status check. For recovery recipes, see the [cookbook](COOKBOOK.md).
 
-`codex-review-gate` is a reusable GitHub Action that owns a deterministic `codex/review-gate` status check. It is designed for repositories that want a required status to stay pending or failing until Codex review output for the current PR head is clean.
+`codex-review-gate` is a reusable GitHub Action that owns a deterministic
+`codex/review-gate` status check. It passes only from a complete evidence
+snapshot when the latest official, trusted provider artifact is a
+closed-grammar clean result bound to the current PR head and every
+thread-backed Codex finding is resolved.
 
 Target repositories keep a thin workflow at `.github/workflows/codex-review-gate.yml`; the review state machine lives in this action.
 
@@ -21,13 +25,19 @@ Target repositories keep a thin workflow at `.github/workflows/codex-review-gate
 
 ## What It Checks
 
-The runner implements an event-driven serialized marker flow:
+The runner implements event-driven evidence reconciliation with a serialized
+marker flow for requesting reviews:
 
 - Runs under `pull_request_target` from the repository default branch.
 - Writes the configured commit status, `codex/review-gate` by default, to the PR head SHA.
-- Passes only when the latest accepted Codex terminal result is bound to the current head, is clean, is authorised by trusted marker or recovery lineage, and every historical thread-backed Codex finding is resolved.
+- Passes only from a complete evidence snapshot when the latest official,
+  trusted provider artifact that matches the closed clean grammar is bound to
+  the current head and every historical thread-backed Codex finding is
+  resolved.
 - Treats `isOutdated` and `isResolved` independently. An outdated but unresolved thread still blocks the gate.
-- Recognises unthreaded top-level finding comments from exact repository and full-SHA blob links; a later accepted clean result for the same or newer head supersedes those findings.
+- Recognises unthreaded top-level finding comments from exact repository and
+  full-SHA blob links; the latest official, trusted closed-grammar clean
+  artifact bound to the current head can supersede those findings.
 - Validates official provider identity and binds reviews, inline comments, and top-level results to their reviewed commit.
 - Accepts clean results only through a closed provider grammar; finding-shaped content takes precedence over a clean-looking lead or `APPROVED` state.
 - Treats a configured provider's `Codex Review` comment, with an optional Markdown heading and emoji, as a broad terminal candidate. Exact one-line `in progress` / `still in progress` messages are ignored, with an optional period or colon plus one to 160 metadata characters; a newer unknown candidate such as `completed` is malformed and fail-closed rather than silently ignored.
@@ -39,17 +49,22 @@ The runner implements an event-driven serialized marker flow:
 - Treats Codex reactions as diagnostic signals only; `eyes` reactions on the active marker comment count as liveness, not pass.
 - Uses scheduled or manual resume runs to retry unacknowledged or stalled markers.
 - Fails closed when the current reconciliation cannot load or validate all required evidence. Transient exhaustion produces `pending`; deterministic provider identity, schema, or commit conflicts produce `error`. Both fail the workflow.
-- Reconciles complete review evidence before applying marker wait deadlines. A stable authorised clean result wins even when its active marker reaches the deadline during reconciliation.
-- Requires every newly authorised clean artifact to have been created no later than the originating trusted live marker's persisted `maxWaitDeadlineAt`, or its legacy deadline derived from the live marker's `headStartedAt`/`createdAt` and the current maximum wait. A legacy persisted deadline that predates the live marker's own server creation time cannot describe that marker, so only that impossible shape receives a bounded replacement window derived from the marker creation time and the current maximum wait. Persisted live wait-budget fields must still match sticky state exactly; only a matching impossible pre-creation deadline is ignored as the replacement window's bound, while an already-recorded deadline for a live legacy marker with no persisted deadline may only narrow the derived window. Reconciliation may finish after the deadline, but an artifact first created after the applicable window cannot pass or reassert the gate.
-- Allows a clean result observed after a `missed_ack`, `stalled`, or `timed_out` wait closure only when the latest same-head historical marker still matches the exact trusted live marker and the result is a new transition relative to that marker's creation time and baseline. This recovery does not post another review request.
-- Converts a recoverable closed-wait lineage to `failed_findings` when unresolved findings are observed, so recovery-disabled and ordinary failed-findings event and close-time rules apply; `fresh` records the exact rejected closed-wait clean and cutoff before any later replay.
-- Preserves timeout provenance so `failed_findings` cannot be relabelled as a closed wait to bypass its recovery switch, event, or cutoff rules.
-- Demotes an otherwise clean current-head result to `pending` when active-marker, closed-wait-marker, exact passed-marker reassertion, or failed-findings recovery lineage does not authorise it.
+- Reconciles complete review evidence before applying marker wait deadlines.
+  Marker deadlines close or retry waits; they do not set an acceptance window
+  for provider artifacts. A valid current-head clean artifact created after a
+  marker deadline can pass on a later complete run.
+- Uses sticky state, controlled markers, baselines, deadlines, recovery mode,
+  and status history only for request orchestration, retry, liveness, audit,
+  and idempotency. None of them authorises or rejects provider evidence.
 - Before success, caches the newest same-context live status and its producer, revalidates PR lifecycle and head, loads the final complete snapshot with a bounded whole-snapshot orphan reload when needed, then deduplicates without another read and immediately posts success if required.
 - Reasserts the computed status unless that newest same-context record already has the desired state and comes from exact `github-actions[bot]` / `Bot`. An external or missing producer cannot expose an older trusted status as the deduplication candidate.
-- Safely upgrades a v1.2 passed marker only when its exact legacy result identity, trusted live marker, baseline, and current strict clean artifact all match; otherwise it requires a fresh marker.
-- Supports a narrow legacy `failed_findings` recovery from the exact matching same-head clean `issue_comment` event after every thread-backed Codex finding is resolved; the compatibility inputs control whether the same clean may be reused or a newer one is required.
-- Ignores PR-open automatic review output unless it appears after the active controlled marker and passes final current-head validation.
+- Migrates legacy marker and recovery fields for orchestration continuity
+  without using them as provider-evidence authority.
+- Accepts deprecated failed-findings recovery inputs for v1 interface
+  compatibility; their values no longer change gate decisions or request
+  orchestration.
+- Evaluates official automatic-review and controlled-request output under the
+  same identity, closed-grammar, current-head, and complete-snapshot rules.
 
 ## Files
 
@@ -158,13 +173,13 @@ jobs:
 | `status-context` | `codex/review-gate` | Commit status context written by the gate. |
 | `state-marker` | `codex-review-gate-state` | Hidden HTML marker used for the sticky state comment. |
 | `marker-comment-marker` | `codex-review-gate-marker` | Hidden HTML marker used for controlled Codex request comments. |
-| `max-wait-seconds` | `7200` | Overall maximum wait time before failing closed. |
+| `max-wait-seconds` | `7200` | Overall marker wait budget used for retry and liveness orchestration. |
 | `marker-timeout-seconds` | `3600` | Time to wait for an acknowledged marker result before retrying. |
 | `marker-ack-timeout-seconds` | `300` | Initial time to wait for Codex to acknowledge a marker before retrying. |
 | `marker-ack-timeout-max-seconds` | `1800` | Maximum exponential backoff wait for unacknowledged markers. |
-| `completion-signal-buffer-seconds` | `30` | Deprecated but operational v1 compatibility input. An issue-comment clean result must be newer than the active marker by this buffer as well as exactly commit-bound. |
-| `failed-findings-recovery` | empty | Deprecated but operational switch for narrow same-head, no-active-marker recovery from `failed_findings`. Empty defaults to enabled; `false` disables this path. |
-| `failed-findings-recovery-mode` | empty | Deprecated but operational v1 input. `head` may reuse the same qualifying clean after findings resolve; `fresh` requires a clean newer than a recorded rejected recovery attempt. |
+| `completion-signal-buffer-seconds` | `30` | Deprecated v1 interface-compatibility input. Accepted values no longer change gate decisions or request orchestration. |
+| `failed-findings-recovery` | empty | Deprecated v1 interface-compatibility switch. Accepted values no longer change gate decisions or request orchestration. |
+| `failed-findings-recovery-mode` | empty | Deprecated v1 interface-compatibility input. `head` and `fresh` no longer change gate decisions or request orchestration. |
 | `event-mode` | empty | Event mode override: exactly `standard`, `comment-only`, or `full`. Empty falls back to `CODEX_REVIEW_GATE_EVENT_MODE` or `standard`. |
 | `poll-interval-seconds` | `30` | Deprecated compatibility input. Event-driven runs do not poll. |
 | `bootstrap-grace-seconds` | `60` | Deprecated compatibility input. Event-driven runs create controlled markers directly. |
@@ -202,7 +217,10 @@ Do not require `codex/review-gate` before the workflow exists on the protected d
 
 - The workflow does not execute PR code.
 - The workflow should have both `issues: write` and `pull-requests: write` so it can create PR conversation comments.
-- For the cleanest signal, disable Codex automatic review-on-push and let the gate marker comment trigger the current-head review.
+- For the clearest request flow, repositories may disable Codex automatic
+  review-on-push to reduce duplicate reviews. Automatic and controlled-marker
+  results are evaluated by the same provider-evidence rules; the marker does
+  not authorise either result.
 - The runner fully paginates REST comments, reviews, inline comments, and GraphQL review threads before it can pass.
 - Official REST evidence must come from an accepted Bot identity. Top-level issue comments also require the official `chatgpt-codex-connector` GitHub App by default.
 - REST evidence IDs must be positive safe integers; GraphQL opaque and `fullDatabaseId` fields must use their canonical string forms. Duplicate provider, review, inline-comment, or thread identities fail closed, including on resolved threads.
@@ -211,15 +229,28 @@ Do not require `codex/review-gate` before the workflow exists on the protected d
 - Top-level clean comments bind through their reviewed-commit marker. A short marker must resolve uniquely through the repository commit API to the full current-head SHA.
 - The closed clean structure requires the exact issue-comment lead and then permits either no tagline or one nonempty, trimmed, same-line presentation tagline separated by exactly one ASCII space and bounded to 160 UTF-16 code units. A tagline must be one known stem—`Nice work`, `Chef's kiss`, `What shall we delve into next`, `Already looking forward to the next diff`, `Keep them coming`, `Swish`, `Another round soon, please`, `Breezy`, `Can't wait for the next one`, `More of your lovely PRs please`, `Bravo`, `Keep it up`, `Delightful`, `Hooray`, or `You're on a roll`—plus exactly one final `.`, `!`, or `?`; exact `:rocket:`, `:tada:`, or `:+1:`; or one to eight exact RGI emoji graphemes, adjacent or separated by one ASCII space. Every unknown prose tagline fails closed, whether positive, actionable, or contradictory. The tagline is presentation only and never supplies clean or finding evidence. The comment still requires exactly one 10- or 40-hex reviewed-commit line and either no suffix or the exact official disclosure. An `APPROVED` review must be empty, exact `Looks good.`, or have a unique exact final `No findings.` optionally after one summary of at most 240 characters. That summary must begin with exact `Coverage:` or `Review coverage:` and continue with a comma/`and`-separated list of backtick-wrapped identifier or path tokens matching `[A-Za-z0-9_./:@+-]+`, with only an optional final period; verb-led and other prose are rejected. A whole normalized target equal to `P0`–`P3`, `S0`–`S3`, `critical`, `high`, `medium`, `low`, `finding`, `findings`, `blocker`, `blocking`, `found`, `detected`, `data-loss`, or `auth-bypass` is rejected, but those words inside a real path or identifier are not blanket-rejected. Finding signals always win.
 - Review-body and unthreaded top-level findings must use exact `github.com` links for the gated owner and repository with a full commit SHA. Unknown or conflicting current formats fail closed.
-- Resolve every thread-backed Codex finding before expecting success. `isOutdated` alone is not resolution. A later accepted current-head clean result may supersede an unthreaded top-level finding.
+- Resolve every thread-backed Codex finding before expecting success.
+  `isOutdated` alone is not resolution. The latest official, trusted
+  closed-grammar clean artifact bound to the current head can supersede an
+  unthreaded top-level finding.
 - Ancestor checks validate the documented REST commit-comparison fields and their closed relationship/count matrix against the exact 40-hex `base...head` request. The unpaginated `commits` list must have `min(ahead_by, 250)` unique full-SHA entries, exclude the base and merge-base commits, and bind its nonempty final entry to the requested head. Checks ignore undocumented `head_commit`, perform no extra head-commit GET, and fail closed on any schema or relationship contradiction.
-- Sticky state and status history support orchestration, audit, and idempotency only. A rerun reconstructs current evidence and can reassert `success` over a later stale `pending` or `error` status.
+- Sticky state, controlled markers, baselines, deadlines, recovery mode, and
+  status history support request orchestration, retry, liveness, audit, and
+  idempotency only. They neither authorise nor reject provider evidence. A
+  rerun reconstructs current evidence and can reassert `success` over a later
+  stale `pending` or `error` status, including from a valid clean artifact
+  created after an earlier marker deadline.
 - The optional status-deduplication GET is independent best-effort work: 100 statuses per page, at most 10 pages or 1,000 items, 1 MiB per response, 4 MiB total, and 16 fetch attempts. It selects the first (newest) same-context record before checking producer identity. Failure or exhaustion becomes `readFailed`, does not taint review evidence, and causes the action to POST its computed status directly.
 - A review-evidence budget failure aborts active evidence requests. When concurrent loads fail differently, a deterministic non-`pending` error, including a schema or identity conflict, wins over budget or transient `pending`.
 - Retryable REST and GraphQL responses honour valid `Retry-After` delays up to 10 seconds. Longer delays stop immediately, while missing or malformed values use bounded fallback retries; the header never expands the existing retry-safe method/status set.
 - Older short-SHA clean results are resolved lazily only when an older unthreaded finding's supersession depends on them.
 - Evidence-budget exhaustion is transient: the action writes `pending` and exits non-zero. Deterministic provider schema, identity, or commit-binding conflicts write `error` and also exit non-zero.
-- Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff capped by the marker result timeout, and 1 hour per marker result. The recommended schedule example checks retry deadlines every 2 hours.
+- Default retry and liveness windows are currently 2 hours overall, 5 minutes
+  for the first marker acknowledgement, 30 minutes maximum acknowledgement
+  backoff capped by the marker timeout, and 1 hour before an acknowledged
+  marker is treated as stalled. The recommended schedule example checks retry
+  deadlines every 2 hours. These windows do not limit provider-artifact
+  validity.
 
 ## Feedback and Reporting
 

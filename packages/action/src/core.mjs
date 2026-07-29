@@ -5,6 +5,8 @@ export const STATUS_CONTEXT = process.env.STATUS_CONTEXT || "codex/review-gate";
 export const STATE_MARKER = process.env.STATE_MARKER || "codex-review-gate-state";
 export const MARKER_COMMENT = process.env.MARKER_COMMENT || "codex-review-gate-marker";
 export const STATE_VERSION = 1;
+export const MARKER_STATE_CONFLICT_DESCRIPTION =
+  "Multiple controlled Codex markers need manual recovery";
 export const MAX_STATE_COMMENT_BYTES = 60 * 1024;
 export const MAX_FINDING_ID_SAMPLES = 4;
 export const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
@@ -27,6 +29,24 @@ const UNKNOWN_TERMINAL_DECORATOR =
   /^[^\s]+[ \t]+Codex Review\b/iu;
 const CODEX_ISSUE_COMMENT_PROGRESS =
   /^Codex Review[ \t]+(?:still[ \t]+)?in[ \t]+progress(?:\.|:[ \t]*[^\r\n]{1,160})?$/iu;
+const STRICT_UTC_TIMESTAMP =
+  /^(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?:\.(\d{1,3}))?Z$/;
+const AUDIT_BOOTSTRAP_STATES = new Set(["open", "closed"]);
+const AUDIT_STATUS_STATES = new Set(["pending", "success", "failure"]);
+const ACTIVE_MARKER_STATES = new Set(["waiting_ack", "waiting_result"]);
+const CLOSED_MARKER_OUTCOMES = new Set([
+  "failed_findings",
+  "missed_ack",
+  "obsolete_head",
+  "passed",
+  "stalled",
+  "state_lost",
+  "timed_out",
+]);
+const MARKER_COMMENT_STATES = new Set([
+  ...ACTIVE_MARKER_STATES,
+  ...CLOSED_MARKER_OUTCOMES,
+]);
 const CODEX_CLEAN_TAGLINE_STEMS = new Set([
   "Nice work",
   "Chef's kiss",
@@ -1664,7 +1684,7 @@ export function reconcileStateWithMarkerComment(state, markerComment, now) {
   if (state.activeMarker) {
     throw new GateFailure(
       "error",
-      "Multiple controlled Codex markers need manual recovery",
+      MARKER_STATE_CONFLICT_DESCRIPTION,
       `Found trusted marker ${marker.id}, but state already tracks marker ${state.activeMarker.id}.`,
     );
   }
@@ -1731,7 +1751,181 @@ export function buildStateCommentBody(state) {
 
 export function parseStateCommentBody(body) {
   const parsed = parseHiddenJson(body, STATE_MARKER);
-  return parsed ? normalizeState(parsed) : null;
+  if (!persistedAuditStateHasValidShape(parsed)) {
+    return null;
+  }
+  try {
+    return normalizeState(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function persistedAuditStateHasValidShape(state) {
+  if (
+    !isPlainRecord(state) ||
+    state.version !== STATE_VERSION ||
+    !isValidTimestampString(state.createdAt) ||
+    !isValidTimestampString(state.updatedAt) ||
+    !isNonEmptyString(state.statusHead) ||
+    !Array.isArray(state.history) ||
+    !state.history.every(persistedClosedMarkerHasValidShape) ||
+    !Object.hasOwn(state, "activeMarker")
+  ) {
+    return false;
+  }
+  if (
+    state.bootstrap !== undefined &&
+    state.bootstrap !== null &&
+    (
+      !isPlainRecord(state.bootstrap) ||
+      !AUDIT_BOOTSTRAP_STATES.has(state.bootstrap.status)
+    )
+  ) {
+    return false;
+  }
+  if (
+    state.lastStatus !== undefined &&
+    state.lastStatus !== null &&
+    !persistedLastStatusHasValidShape(state.lastStatus)
+  ) {
+    return false;
+  }
+  if (
+    state.headStartedAt !== undefined &&
+    state.headStartedAt !== null &&
+    !isValidTimestampString(state.headStartedAt)
+  ) {
+    return false;
+  }
+  return (
+    state.activeMarker === null ||
+    persistedActiveMarkerHasValidShape(state.activeMarker)
+  );
+}
+
+function persistedActiveMarkerHasValidShape(marker) {
+  return Boolean(
+    isPlainRecord(marker) &&
+      persistedMarkerIdentityHasValidShape(marker) &&
+      isNonEmptyString(marker.headSha) &&
+      isValidTimestampString(marker.createdAt) &&
+      isPlainRecord(marker.baseline) &&
+      persistedMarkerSchedulingFieldsHaveValidShape(marker) &&
+      ACTIVE_MARKER_STATES.has(marker.state) &&
+      (marker.outcome === undefined || marker.outcome === null),
+  );
+}
+
+function persistedClosedMarkerHasValidShape(marker) {
+  return Boolean(
+    isPlainRecord(marker) &&
+      persistedMarkerIdentityHasValidShape(marker) &&
+      isNonEmptyString(marker.headSha) &&
+      isValidTimestampString(marker.createdAt) &&
+      isPlainRecord(marker.baseline) &&
+      persistedMarkerSchedulingFieldsHaveValidShape(marker) &&
+      CLOSED_MARKER_OUTCOMES.has(marker.outcome) &&
+      marker.state === marker.outcome,
+  );
+}
+
+function persistedMarkerSchedulingFieldsHaveValidShape(marker) {
+  const timestampFields = [
+    "ackDeadlineAt",
+    "resultDeadlineAt",
+    "nextRetryAt",
+    "headStartedAt",
+    "maxWaitDeadlineAt",
+    "closedAt",
+  ];
+  if (
+    !timestampFields.every(
+      (field) =>
+        marker[field] === undefined ||
+        marker[field] === null ||
+        isValidTimestampString(marker[field]),
+    )
+  ) {
+    return false;
+  }
+  if (
+    marker.version !== undefined &&
+    marker.version !== null &&
+    marker.version !== STATE_VERSION
+  ) {
+    return false;
+  }
+  if (
+    marker.attempt !== undefined &&
+    marker.attempt !== null &&
+    (!Number.isSafeInteger(marker.attempt) || marker.attempt <= 0)
+  ) {
+    return false;
+  }
+  if (
+    marker.ackTimeoutSeconds !== undefined &&
+    marker.ackTimeoutSeconds !== null &&
+    (
+      !Number.isFinite(marker.ackTimeoutSeconds) ||
+      marker.ackTimeoutSeconds <= 0 ||
+      marker.ackTimeoutSeconds > Number.MAX_SAFE_INTEGER / 1000
+    )
+  ) {
+    return false;
+  }
+  if (
+    marker.timedOutAfterSeconds !== undefined &&
+    marker.timedOutAfterSeconds !== null &&
+    (
+      !Number.isFinite(marker.timedOutAfterSeconds) ||
+      marker.timedOutAfterSeconds < 0 ||
+      marker.timedOutAfterSeconds > Number.MAX_SAFE_INTEGER / 1000
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function persistedMarkerIdentityHasValidShape(marker) {
+  return (
+    (typeof marker?.id === "string" && marker.id.trim().length > 0) ||
+    (Number.isSafeInteger(marker?.id) && marker.id > 0)
+  );
+}
+
+function persistedLastStatusHasValidShape(lastStatus) {
+  return Boolean(
+    isPlainRecord(lastStatus) &&
+      isNonEmptyString(lastStatus.headSha) &&
+      AUDIT_STATUS_STATES.has(lastStatus.state) &&
+      isValidTimestampString(lastStatus.updatedAt),
+  );
+}
+
+function isPlainRecord(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isValidTimestampString(value) {
+  if (!isNonEmptyString(value)) {
+    return false;
+  }
+  const match = STRICT_UTC_TIMESTAMP.exec(value);
+  if (!match) {
+    return false;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    return false;
+  }
+  const canonical = `${match[1]}.${(match[2] || "").padEnd(3, "0")}Z`;
+  return new Date(parsed).toISOString() === canonical;
 }
 
 export function buildMarkerCommentBody(marker) {
@@ -1760,7 +1954,14 @@ export function buildMarkerCommentBody(marker) {
 
 export function parseMarkerCommentBody(body) {
   const parsed = parseHiddenJson(body, MARKER_COMMENT);
-  if (!parsed || parsed.version !== STATE_VERSION) {
+  if (
+    !isPlainRecord(parsed) ||
+    parsed.version !== STATE_VERSION ||
+    !isNonEmptyString(parsed.headSha) ||
+    !isPlainRecord(parsed.baseline) ||
+    !MARKER_COMMENT_STATES.has(parsed.state) ||
+    !persistedMarkerSchedulingFieldsHaveValidShape(parsed)
+  ) {
     return null;
   }
   return parsed;
@@ -1783,14 +1984,18 @@ export function findLatestTrustedMarkerComment(comments, trustedLogins = DEFAULT
       markerCommentBodyHasControlEnvelope(comment.body || ""),
     ) || null;
   return latestMarkerShapedComment &&
-    parseMarkerCommentBody(latestMarkerShapedComment.body || "")
+    markerFromComment(latestMarkerShapedComment)
     ? latestMarkerShapedComment
     : null;
 }
 
 export function markerFromComment(comment) {
   const marker = parseMarkerCommentBody(comment.body || "");
-  if (!marker) {
+  if (
+    !marker ||
+    !persistedMarkerIdentityHasValidShape(comment) ||
+    !isValidTimestampString(comment.created_at)
+  ) {
     return null;
   }
   return {
@@ -1811,7 +2016,11 @@ export function parseHiddenJson(body, marker) {
   if (!match) {
     return null;
   }
-  return JSON.parse(match[1]);
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
 }
 
 function markerCommentBodyHasControlEnvelope(body) {

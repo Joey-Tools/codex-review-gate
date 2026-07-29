@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   MAX_FINDING_ID_SAMPLES,
   MAX_STATE_COMMENT_BYTES,
+  STATE_MARKER,
   activeMarkerAckTimedOut,
   activeMarkerIsObsolete,
   autoRetryEnabled,
@@ -762,6 +763,189 @@ test("round-trips hidden state metadata", () => {
   assert.deepEqual(parseStateCommentBody(buildStateCommentBody(state)), state);
 });
 
+test("ignores malformed hidden state and marker JSON or schema", () => {
+  const validStateBody = buildStateCommentBody({
+    version: 1,
+    createdAt: "2026-04-26T10:00:00Z",
+    updatedAt: "2026-04-26T10:01:00Z",
+    statusHead: "abc123",
+    bootstrap: { status: "closed" },
+    activeMarker: null,
+    history: [],
+  });
+  const stateBody = validStateBody.replace('"version": 1', '"version":');
+  const markerBody = buildMarkerCommentBody({
+    headSha: "abc123",
+    runUrl: "https://example.invalid/runs/1",
+    runId: "1",
+    runAttempt: "1",
+    attempt: 1,
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+  }).replace('"version": 1', '"version":');
+  const schemaMalformedStateBodies = [
+    validStateBody.replace('"history": []', '"history": {}'),
+    validStateBody.replace('"history": []', '"history": [{}]'),
+    validStateBody.replace('"activeMarker": null', '"activeMarker": {}'),
+    validStateBody.replace('"activeMarker": null', '"activeMarker": []'),
+    `<!-- ${STATE_MARKER}\n[]\n-->`,
+  ];
+
+  assert.equal(parseStateCommentBody(stateBody), null);
+  assert.equal(parseMarkerCommentBody(markerBody), null);
+  for (const schemaMalformedStateBody of schemaMalformedStateBodies) {
+    assert.equal(parseStateCommentBody(schemaMalformedStateBody), null);
+    assert.equal(
+      findLatestTrustedStateComment([
+        {
+          id: 1,
+          body: schemaMalformedStateBody,
+          user: { login: "github-actions[bot]" },
+        },
+      ]),
+      null,
+    );
+  }
+});
+
+test("validates persisted marker scheduling fields without requiring legacy defaults", () => {
+  const stateBase = {
+    version: 1,
+    createdAt: "2026-04-26T10:00:00Z",
+    updatedAt: "2026-04-26T10:01:00Z",
+    statusHead: "abc123",
+    bootstrap: { status: "closed" },
+    history: [],
+  };
+  const markerBase = {
+    version: 1,
+    id: "1",
+    headSha: "abc123",
+    createdAt: "2026-04-26T10:00:30Z",
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+  };
+
+  assert.notEqual(
+    parseStateCommentBody(
+      buildStateCommentBody({
+        ...stateBase,
+        activeMarker: markerBase,
+      }),
+    ),
+    null,
+  );
+  assert.notEqual(
+    parseStateCommentBody(
+      buildStateCommentBody({
+        ...stateBase,
+        activeMarker: null,
+        history: [{
+          ...markerBase,
+          state: "missed_ack",
+          outcome: "missed_ack",
+          closedAt: "2026-04-26T10:01:00Z",
+        }],
+      }),
+    ),
+    null,
+  );
+
+  const invalidOverrides = [
+    { createdAt: "1" },
+    { createdAt: "2026-02-30T10:00:00Z" },
+    { state: "typo" },
+    { outcome: "typo" },
+    { ackDeadlineAt: "corrupt" },
+    { resultDeadlineAt: "corrupt" },
+    { nextRetryAt: "corrupt" },
+    { headStartedAt: "corrupt" },
+    { maxWaitDeadlineAt: "corrupt" },
+    { closedAt: "corrupt" },
+    { ackTimeoutSeconds: 0 },
+    { ackTimeoutSeconds: "300" },
+    { attempt: 0 },
+    { timedOutAfterSeconds: -1 },
+  ];
+  for (const override of invalidOverrides) {
+    assert.equal(
+      parseStateCommentBody(
+        buildStateCommentBody({
+          ...stateBase,
+          activeMarker: { ...markerBase, ...override },
+        }),
+      ),
+      null,
+    );
+    assert.equal(
+      parseStateCommentBody(
+        buildStateCommentBody({
+          ...stateBase,
+          activeMarker: null,
+          history: [{
+            ...markerBase,
+            state: "missed_ack",
+            outcome: "missed_ack",
+            ...override,
+          }],
+        }),
+      ),
+      null,
+    );
+  }
+
+  const malformedMarkerComment = buildMarkerCommentBody({
+    ...markerBase,
+    maxWaitDeadlineAt: "corrupt",
+  });
+  assert.equal(parseMarkerCommentBody(malformedMarkerComment), null);
+  assert.equal(
+    parseMarkerCommentBody(buildMarkerCommentBody({ ...markerBase, state: "typo" })),
+    null,
+  );
+  assert.notEqual(
+    parseMarkerCommentBody(buildMarkerCommentBody({ ...markerBase, state: "state_lost" })),
+    null,
+  );
+
+  assert.equal(
+    parseStateCommentBody(
+      buildStateCommentBody({
+        ...stateBase,
+        bootstrap: { status: "typo" },
+        activeMarker: null,
+      }),
+    ),
+    null,
+  );
+  assert.equal(
+    parseStateCommentBody(
+      buildStateCommentBody({
+        ...stateBase,
+        activeMarker: null,
+        lastStatus: {
+          headSha: "abc123",
+          state: "typo",
+          updatedAt: "2026-04-26T10:01:00Z",
+        },
+      }),
+    ),
+    null,
+  );
+
+  const validMarkerComment = buildMarkerCommentBody(markerBase);
+  for (const createdAt of ["1", "2026-02-30T10:00:00Z"]) {
+    assert.equal(
+      markerFromComment({
+        id: 1,
+        body: validMarkerComment,
+        created_at: createdAt,
+      }),
+      null,
+    );
+  }
+});
+
 test("normalizes legacy finding ID arrays into a bounded deterministic audit summary", () => {
   const findingIds = Array.from(
     { length: 5_000 },
@@ -779,6 +963,10 @@ test("normalizes legacy finding ID arrays into a bounded deterministic audit sum
     activeMarker: null,
     history: [{
       id: "1",
+      headSha: "abc123",
+      createdAt: "2026-04-26T09:55:00Z",
+      baseline: { plusOne: null, eyes: null },
+      state: "failed_findings",
       outcome: "failed_findings",
       currentHeadFindingIds: findingIds,
     }],
@@ -2966,7 +3154,12 @@ test("scheduled scans continue when either trusted state or marker exists", () =
   );
   assert.equal(
     hasTrustedGateStateOrMarker(
-      [{ id: 2, body: markerBody, user: { login: "github-actions[bot]" } }],
+      [{
+        id: 2,
+        body: markerBody,
+        created_at: "2026-04-26T10:00:00Z",
+        user: { login: "github-actions[bot]" },
+      }],
       new Set(["github-actions[bot]"]),
     ),
     true,

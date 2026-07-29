@@ -8,6 +8,7 @@ import {
   DEFAULT_CODEX_BOT_LOGINS,
   DEFAULT_TRUSTED_COMMENT_LOGINS,
   GateFailure,
+  MARKER_STATE_CONFLICT_DESCRIPTION,
   NonJsonResponseError,
   STATUS_CONTEXT,
   STATE_VERSION,
@@ -151,16 +152,8 @@ const MAX_WHOLE_SNAPSHOT_ATTEMPTS = 2;
 const MAX_REST_PAGES = 1_000;
 const MAX_GRAPHQL_PAGES = 1_000;
 const MAX_IN_PROCESS_RETRY_WAIT_MS = 10_000;
-const AUTHORIZATION_PERSISTENCE_FENCE_DESCRIPTION =
-  "Authorization state persistence failed; fresh marker required";
-const RECOVERABLE_CLOSED_WAIT_OUTCOMES = new Set(["timed_out", "missed_ack", "stalled"]);
-const RECOVERABLE_TIMEOUT_ORIGINS = new Set([
-  "waiting_ack",
-  "waiting_result",
-  "missed_ack",
-  "stalled",
-]);
-
+const ORCHESTRATION_PERSISTENCE_FENCE_DESCRIPTION =
+  "Review orchestration state persistence failed; fresh marker required";
 main().catch(async (error) => {
   const gateError =
     error instanceof GateFailure
@@ -459,7 +452,39 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     needsFreshMarker: stateNeedsFreshMarker,
     needsSave: stateNeedsSave,
     legacyFailureCandidate,
-  } = await ensureState(snapshot, null, null, { persist: false });
+    reviewOrchestrationBlocked = false,
+  } = await loadAuditState(snapshot);
+
+  if (snapshot.findings.count > 0) {
+    const findingOrchestration = reviewOrchestrationBlocked
+      ? { state, stateComment: savedStateComment }
+      : await prepareFindingReviewOrchestration(
+          snapshot,
+          state,
+          savedStateComment,
+          trigger,
+          stateNeedsFreshMarker,
+        );
+    await failFromFindings(
+      snapshot.findings,
+      findingOrchestration.state,
+      findingOrchestration.stateComment,
+      { preserveAuditState: reviewOrchestrationBlocked },
+    );
+    return;
+  }
+
+  if (
+    await reconcileCurrentReviewEvidence(
+      snapshot,
+      state,
+      savedStateComment,
+      { reviewOrchestrationBlocked },
+    )
+  ) {
+    return;
+  }
+
   const legacyMigration = migrateLegacyFailureState(
     state,
     snapshot,
@@ -469,7 +494,7 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
   state = legacyMigration.state;
   stateNeedsFreshMarker = stateNeedsFreshMarker || legacyMigration.needsFreshMarker;
   stateNeedsSave = stateNeedsSave || legacyMigration.changed;
-  const fenceRecovery = await recoverAuthorizationPersistenceFence(
+  const fenceRecovery = await recoverOrchestrationPersistenceFence(
     state,
     savedStateComment,
     snapshot,
@@ -490,17 +515,18 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
   stateNeedsFreshMarker =
     stateNeedsFreshMarker || legacyPassedMigration.needsFreshMarker;
   if (legacyPassedMigration.changed) {
-    savedStateComment = await saveAuthorizationCriticalState(
+    savedStateComment = await saveOrchestrationCriticalState(
       state,
       savedStateComment,
-      "legacy passed-marker authorization lineage",
+      "legacy passed-marker audit migration",
     );
     stateNeedsSave = false;
   }
   state = migrateStateForEventDrivenDeadlines(state);
   stateNeedsFreshMarker = stateNeedsFreshMarker ||
     stateNeedsFreshMarkerAfterRecovery(state) ||
-    stateNeedsFreshMarkerAfterMissingMarker(state, statusSha);
+    stateNeedsFreshMarkerAfterMissingMarker(state, statusSha) ||
+    stateNeedsFreshMarkerAfterLiveEvidenceLoss(state, snapshot);
   let headChanged =
     state.statusHead !== statusSha ||
     activeMarkerIsObsolete(state.activeMarker, statusSha);
@@ -537,23 +563,6 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     headChanged,
     stateNeedsFreshMarker,
   });
-  const reconcileFindingsAfterFreshHeadMarker =
-    freshHeadMarkerAllowed &&
-    snapshot.findings.count > 0 &&
-    !recoverableClosedWaitMarker(state, snapshot);
-
-  if (
-    !reconcileFindingsAfterFreshHeadMarker &&
-    await reconcileCurrentReviewEvidence(
-      snapshot,
-      state,
-      savedStateComment,
-      { trigger },
-    )
-  ) {
-    return;
-  }
-
   if (freshHeadMarkerAllowed) {
     const markerResult = await advanceEventDrivenMarker(
       state,
@@ -571,40 +580,12 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     freshHeadMarkerAllowed = false;
   }
 
-  if (
-    reconcileFindingsAfterFreshHeadMarker &&
-    await reconcileCurrentReviewEvidence(
-      snapshot,
-      state,
-      savedStateComment,
-      { trigger },
-    )
-  ) {
-    return;
-  }
-
   const reconciliationTimeout = await timeOutCurrentHeadWaitCycleIfNeeded(
     state,
     savedStateComment,
   );
   if (reconciliationTimeout.timedOut) {
     return;
-  }
-
-  if (
-    snapshot.findings.count === 0 &&
-    snapshot.providerResult.kind === "clean" &&
-    !state.activeMarker
-  ) {
-    const demotion = await demoteUnauthorizedCleanIfNeeded(
-      state,
-      savedStateComment,
-    );
-    state = demotion.state;
-    savedStateComment = demotion.stateComment;
-    stateNeedsFreshMarker =
-      stateNeedsFreshMarker || demotion.needsFreshMarker;
-    allowCreateMarker = allowCreateMarker || demotion.needsFreshMarker;
   }
 
   if (
@@ -646,6 +627,89 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
   );
   if (result.kind === "save") {
     await saveState(result.state, result.stateComment);
+  }
+}
+
+async function loadAuditState(snapshot) {
+  try {
+    return await ensureState(snapshot, null, null, { persist: false });
+  } catch (error) {
+    const providerOutcomeIsAuthoritative =
+      snapshot.findings.count > 0 ||
+      providerResultIsCurrentHeadClean(snapshot.providerResult);
+    if (
+      !(error instanceof GateFailure) ||
+      error.description !== MARKER_STATE_CONFLICT_DESCRIPTION ||
+      !providerOutcomeIsAuthoritative
+    ) {
+      throw error;
+    }
+    console.warn(
+      `ignored conflicting marker audit while applying authoritative live review evidence: ` +
+        `${error.message}`,
+    );
+    return {
+      state: createInitialAuditState(snapshot),
+      stateComment: null,
+      needsFreshMarker: true,
+      needsSave: true,
+      legacyFailureCandidate: false,
+      reviewOrchestrationBlocked: true,
+    };
+  }
+}
+
+async function prepareFindingReviewOrchestration(
+  snapshot,
+  state,
+  stateComment,
+  trigger,
+  stateNeedsFreshMarker,
+) {
+  let preparedState = state;
+  const headChanged =
+    preparedState.statusHead !== statusSha ||
+    activeMarkerIsObsolete(preparedState.activeMarker, statusSha);
+  if (activeMarkerIsObsolete(preparedState.activeMarker, statusSha)) {
+    preparedState = closeActiveMarker(
+      preparedState,
+      "obsolete_head",
+      isoNow(),
+      { currentHeadSha: statusSha },
+    );
+  }
+
+  const allowCreateMarker =
+    trigger.allowCreateMarker ||
+    stateNeedsFreshMarker ||
+    headChanged;
+  const freshHeadMarkerAllowed = shouldCreateFreshHeadMarker({
+    allowCreateMarker,
+    hasActiveMarker: Boolean(preparedState.activeMarker),
+    headChanged,
+    stateNeedsFreshMarker,
+  });
+  if (!freshHeadMarkerAllowed) {
+    return { state: preparedState, stateComment };
+  }
+
+  try {
+    const result = await advanceEventDrivenMarker(
+      preparedState,
+      stateComment,
+      snapshot,
+      { ...trigger, allowCreateMarker: true },
+    );
+    return {
+      state: result.state,
+      stateComment: result.stateComment,
+    };
+  } catch (error) {
+    console.warn(
+      `failed to prepare current-head review orchestration before recording findings: ` +
+        `${error.message}`,
+    );
+    return { state: preparedState, stateComment };
   }
 }
 
@@ -697,20 +761,16 @@ async function ensureState(snapshot, previousState, previousComment, { persist =
         reactions: snapshot.baseline,
         findings: snapshot.findings,
       })
-    : createInitialState({
-        now,
-        statusHead: statusSha,
-        runUrl,
-        reactions: snapshot.baseline,
-        findings: snapshot.findings,
-      });
+    : createInitialAuditState(snapshot, now);
 
-  state.bootstrap = {
-    ...(state.bootstrap || {}),
-    status: "closed",
-    closedAt: state.bootstrap?.closedAt || now,
-    closeReason: state.bootstrap?.closeReason || "event_driven",
-  };
+  if (markerComment) {
+    state.bootstrap = {
+      ...(state.bootstrap || {}),
+      status: "closed",
+      closedAt: state.bootstrap?.closedAt || now,
+      closeReason: state.bootstrap?.closeReason || "event_driven",
+    };
+  }
 
   const createdStateComment = persist ? await saveState(state, null) : null;
   return {
@@ -720,6 +780,32 @@ async function ensureState(snapshot, previousState, previousComment, { persist =
     needsSave: !persist,
     legacyFailureCandidate: false,
   };
+}
+
+function createInitialAuditState(snapshot, now = isoNow()) {
+  const state = createInitialState({
+    now,
+    statusHead: statusSha,
+    runUrl,
+    reactions: snapshot.baseline,
+    findings: snapshot.findings,
+  });
+  state.bootstrap = {
+    ...(state.bootstrap || {}),
+    status: "closed",
+    closedAt: state.bootstrap?.closedAt || now,
+    closeReason: state.bootstrap?.closeReason || "event_driven",
+  };
+  return state;
+}
+
+function stateNeedsFreshMarkerAfterLiveEvidenceLoss(state, snapshot) {
+  return (
+    !state?.activeMarker &&
+    state?.lastStatus?.headSha === statusSha &&
+    state?.lastStatus?.state === "success" &&
+    snapshot?.providerResult?.kind === "pending"
+  );
 }
 
 function migrateLegacyFailureState(
@@ -878,7 +964,7 @@ function migrateLegacyPassedState(state, snapshot, now) {
           ? {
               ...candidate,
               observedProviderResult: providerResult,
-              authorizationLineageMigratedAt: now,
+              auditLineageMigratedAt: now,
             }
           : candidate,
       ),
@@ -1047,353 +1133,50 @@ async function reconcileCurrentReviewEvidence(
   snapshot,
   state,
   stateComment,
-  { trigger = null } = {},
+  { reviewOrchestrationBlocked = false } = {},
 ) {
   failIfSnapshotEvidenceIsInvalid(snapshot);
-  if (snapshot.findings.count > 0) {
-    const failedLineageState = recordClosedWaitFindingsLineage(
-      snapshot.findings,
-      state,
-      trigger,
-      snapshot,
-    );
-    const rejectedState = recordRejectedFreshRecoveryAttempt(
-      snapshot.providerResult,
-      failedLineageState,
-      trigger,
-      snapshot,
-    );
-    await failFromFindings(snapshot.findings, rejectedState, stateComment);
-    return true;
-  }
   if (snapshot.providerResult.kind !== "clean") {
     return false;
   }
-  const authorization = providerResultAuthorization(
-    snapshot.providerResult,
-    state,
-    trigger,
-    snapshot,
-  );
-  if (!authorization) {
-    return false;
+  if (!providerResultIsCurrentHeadClean(snapshot.providerResult)) {
+    throw new GateFailure(
+      "error",
+      "Codex clean result is not bound to the current head",
+      `The selected Codex clean result is not bound to ${statusSha}.`,
+    );
   }
 
-  await passGateFromCurrentEvidence(state, stateComment, snapshot, {
-    trigger,
-    authorizationKind: authorization.kind,
-  });
+  await passGateFromCurrentEvidence(
+    state,
+    stateComment,
+    snapshot,
+    { reviewOrchestrationBlocked },
+  );
   return true;
 }
 
-function providerResultAuthorization(providerResult, state, trigger, snapshot) {
-  const marker = state?.activeMarker;
-  if (!marker) {
-    const authorization =
-      passedMarkerReassertAuthorization(providerResult, state, snapshot) ||
-      failedFindingsRecoveryAuthorization(providerResult, state, trigger, snapshot) ||
-      closedWaitMarkerAuthorization(providerResult, state, snapshot);
-    return authorizationWithinMaxWaitDeadline(
-      providerResult,
-      authorization,
-      snapshot,
-    );
-  }
-  if (activeMarkerIsObsolete(marker, statusSha)) {
-    return null;
-  }
-  if (!trustedLiveMarkerMatches(marker, snapshot)) {
-    return null;
-  }
-
-  const baselineArtifact = providerResult.source === "issue-comment"
-    ? marker.baseline?.completionComment
-    : marker.baseline?.approvedReview;
-  if (providerResult.source === "issue-comment") {
-    const authorization = hasNewCompletionComment(
-      baselineArtifact,
-      {
-        id: String(providerResult.id),
-        createdAt: providerResult.createdAt,
-      },
-      marker.createdAt,
-      { bufferSeconds: config.completionSignalBufferSeconds },
-    )
-      ? { kind: "active-marker", marker }
-      : null;
-    return authorizationWithinMaxWaitDeadline(
-      providerResult,
-      authorization,
-      snapshot,
-    );
-  }
-  if (providerResult.source === "pull-request-review") {
-    const authorization = hasNewReviewTransition(
-      baselineArtifact,
-      {
-        id: String(providerResult.id),
-        submittedAt: providerResult.createdAt,
-      },
-      marker.createdAt,
-    )
-      ? { kind: "active-marker", marker }
-      : null;
-    return authorizationWithinMaxWaitDeadline(
-      providerResult,
-      authorization,
-      snapshot,
-    );
-  }
-
-  return null;
-}
-
-function authorizationWithinMaxWaitDeadline(
-  providerResult,
-  authorization,
-  snapshot,
-) {
-  if (!authorization) {
-    return null;
-  }
-  const liveMarker = matchingTrustedLiveMarker(
-    authorization.marker,
-    snapshot,
+function providerResultIsCurrentHeadClean(providerResult) {
+  return (
+    providerResult?.kind === "clean" &&
+    new Set(["issue-comment", "pull-request-review"]).has(providerResult.source) &&
+    providerResult.headSha === statusSha.toLowerCase()
   );
-  if (!liveMarker) {
-    return null;
-  }
-  const headStartedAt = liveMarker.headStartedAt || liveMarker.createdAt;
-  if (!headStartedAt) {
-    return null;
-  }
-  const liveHasPersistedDeadline = liveMarker.maxWaitDeadlineAt != null;
-  const liveMarkerCreatedMs = parseTimestamp(
-    liveMarker.createdAt,
-    "live marker creation time",
-  );
-  const persistedLiveDeadlineMs = liveHasPersistedDeadline
-    ? parseTimestamp(liveMarker.maxWaitDeadlineAt, "max wait deadline")
-    : null;
-  const persistedDeadlinePredatesMarker =
-    persistedLiveDeadlineMs != null &&
-    persistedLiveDeadlineMs < liveMarkerCreatedMs;
-  const liveDeadlineAt =
-    !liveHasPersistedDeadline || persistedDeadlinePredatesMarker
-      ? addSeconds(
-          persistedDeadlinePredatesMarker ? liveMarker.createdAt : headStartedAt,
-          Math.round(config.maxWaitMs / 1000),
-        )
-      : liveMarker.maxWaitDeadlineAt;
-  const liveDeadlineMs = parseTimestamp(liveDeadlineAt, "max wait deadline");
-  const recordedDeadlineAt = authorization.marker?.maxWaitDeadlineAt;
-  const maxWaitDeadlineMs =
-    !liveHasPersistedDeadline && recordedDeadlineAt != null
-      ? Math.min(
-          liveDeadlineMs,
-          parseTimestamp(recordedDeadlineAt, "recorded max wait deadline"),
-        )
-      : liveDeadlineMs;
-  return parseTimestamp(
-    providerResult.createdAt,
-    "Codex provider result creation time",
-  ) <= maxWaitDeadlineMs
-    ? authorization
-    : null;
 }
 
-function passedMarkerReassertAuthorization(providerResult, state, snapshot) {
-  if (state?.activeMarker || state?.statusHead !== statusSha) {
-    return null;
-  }
-  const passedMarker = [...(state?.history || [])]
-    .reverse()
-    .find((marker) => marker.headSha === statusSha);
-  if (
-    !passedMarker ||
-    (passedMarker.outcome || passedMarker.state) !== "passed" ||
-    !passedMarker.observedProviderResult
-  ) {
-    return null;
-  }
-
-  if (!trustedLiveMarkerMatches(passedMarker, snapshot)) {
-    return null;
-  }
-
-  const observed = passedMarker.observedProviderResult;
-  if (!isDeepStrictEqual(observed, providerResult)) {
-    return null;
-  }
-  return { kind: "passed-marker-reassert", marker: passedMarker };
-}
-
-function closedWaitMarkerAuthorization(providerResult, state, snapshot) {
-  const marker = recoverableClosedWaitMarker(state, snapshot);
-  if (!marker) {
-    return null;
-  }
-
-  if (providerResult.source === "issue-comment") {
-    return hasNewCompletionComment(
-      marker.baseline?.completionComment,
-      {
-        id: String(providerResult.id),
-        createdAt: providerResult.createdAt,
-      },
-      marker.createdAt,
-      { bufferSeconds: config.completionSignalBufferSeconds },
-    )
-      ? { kind: "closed-wait-marker", marker }
-      : null;
-  }
-  if (providerResult.source === "pull-request-review") {
-    return hasNewReviewTransition(
-      marker.baseline?.approvedReview,
-      {
-        id: String(providerResult.id),
-        submittedAt: providerResult.createdAt,
-      },
-      marker.createdAt,
-    )
-      ? { kind: "closed-wait-marker", marker }
-      : null;
-  }
-
-  return null;
-}
-
-function recoverableClosedWaitMarker(state, snapshot) {
-  if (state?.activeMarker || state?.statusHead !== statusSha) {
-    return null;
-  }
-
-  const marker = [...(state?.history || [])]
-    .reverse()
-    .find((candidate) => candidate.headSha === statusSha);
-  const outcome = marker?.outcome || marker?.state;
-  if (
-    !marker ||
-    !RECOVERABLE_CLOSED_WAIT_OUTCOMES.has(outcome) ||
-    !closedWaitMarkerHasRecoverableProvenance(marker, state) ||
-    !trustedLiveMarkerMatches(marker, snapshot)
-  ) {
-    return null;
-  }
-  return marker;
-}
-
-function closedWaitMarkerHasRecoverableProvenance(marker, state) {
-  const outcome = marker?.outcome || marker?.state;
-  if (outcome !== "timed_out") {
-    return true;
-  }
-
-  if (marker.timedOutFromOutcome) {
-    return RECOVERABLE_TIMEOUT_ORIGINS.has(marker.timedOutFromOutcome);
-  }
-  if (
-    Object.hasOwn(marker, "currentHeadFindingIds") ||
-    Object.hasOwn(marker, "currentHeadFindings") ||
-    Object.hasOwn(marker, "currentHeadSha") ||
-    Object.hasOwn(marker, "rejectedRecoveryCompletions") ||
-    Object.hasOwn(marker, "latestRejectedRecoveryAt") ||
-    Object.hasOwn(marker, "recoveryReason")
-  ) {
+async function markerStateConflictBlocksReviewOrchestration(snapshot) {
+  try {
+    await ensureState(snapshot, null, null, { persist: false });
     return false;
+  } catch (error) {
+    if (
+      error instanceof GateFailure &&
+      error.description === MARKER_STATE_CONFLICT_DESCRIPTION
+    ) {
+      return true;
+    }
+    throw error;
   }
-
-  const history = state?.history || [];
-  const markerIndex = history.lastIndexOf(marker);
-  const previousLineage = markerIndex > 0
-    ? history
-        .slice(0, markerIndex)
-        .reverse()
-        .find((candidate) =>
-          candidate.headSha === marker.headSha &&
-          String(candidate.id || "") === String(marker.id || "")
-        )
-    : null;
-  if (!previousLineage) {
-    return true;
-  }
-  return RECOVERABLE_TIMEOUT_ORIGINS.has(
-    previousLineage.outcome || previousLineage.state,
-  );
-}
-
-function recordClosedWaitFindingsLineage(findings, state, trigger, snapshot) {
-  const marker = recoverableClosedWaitMarker(state, snapshot);
-  if (!marker) {
-    return state;
-  }
-
-  const failedAt = isoNow();
-  const rejectedRecovery = closedWaitRejectedFreshRecovery(
-    snapshot.providerResult,
-    state,
-    trigger,
-    snapshot,
-    failedAt,
-  );
-  return normalizeState({
-    ...state,
-    updatedAt: failedAt,
-    history: [
-      ...(state.history || []),
-      {
-        ...marker,
-        state: "failed_findings",
-        outcome: "failed_findings",
-        closedAt: failedAt,
-        reconciledFromOutcome: marker.outcome || marker.state,
-        currentHeadFindings: summarizeFindingsForState(findings),
-        ...(rejectedRecovery
-          ? {
-              latestRejectedRecoveryAt: latestRejectedRecoveryCutoff(
-                marker,
-                rejectedRecovery.rejectedAt,
-              ),
-              rejectedRecoveryCompletions: [
-                ...(marker.rejectedRecoveryCompletions || []),
-                rejectedRecovery,
-              ].slice(-20),
-            }
-          : {}),
-      },
-    ],
-  });
-}
-
-function closedWaitRejectedFreshRecovery(
-  providerResult,
-  state,
-  trigger,
-  snapshot,
-  rejectedAt,
-) {
-  if (
-    !config.failedFindingsRecovery ||
-    config.failedFindingsRecoveryMode !== "fresh" ||
-    providerResult?.kind !== "clean" ||
-    providerResult.source !== "issue-comment" ||
-    !trigger?.completionComment ||
-    String(trigger.completionComment.id) !== String(providerResult.id) ||
-    trigger.completionComment.createdAt !== providerResult.createdAt ||
-    !authorizationWithinMaxWaitDeadline(
-      providerResult,
-      closedWaitMarkerAuthorization(providerResult, state, snapshot),
-      snapshot,
-    )
-  ) {
-    return null;
-  }
-
-  return {
-    id: String(providerResult.id),
-    createdAt: providerResult.createdAt,
-    rejectedAt,
-  };
 }
 
 function matchingTrustedLiveMarker(recordedMarker, snapshot) {
@@ -1442,189 +1225,6 @@ function trustedLiveMarkerMatches(recordedMarker, snapshot) {
   return Boolean(matchingTrustedLiveMarker(recordedMarker, snapshot));
 }
 
-function failedFindingsRecoveryLineage(state) {
-  const history = state?.history || [];
-  const latestIndex = history.findLastIndex(
-    (marker) => marker.headSha === statusSha,
-  );
-  if (latestIndex < 0) {
-    return null;
-  }
-
-  const latestMarker = history[latestIndex];
-  const latestOutcome = latestMarker.outcome || latestMarker.state;
-  if (latestOutcome === "failed_findings") {
-    return { marker: latestMarker, historyIndex: latestIndex };
-  }
-  if (latestOutcome !== "timed_out") {
-    return null;
-  }
-
-  const previousLineageIndex = history.findLastIndex((marker, index) =>
-    index < latestIndex &&
-    marker.headSha === latestMarker.headSha &&
-    String(marker.id || "") === String(latestMarker.id || "")
-  );
-  const previousLineage = history[previousLineageIndex];
-  if (
-    previousLineage &&
-    (previousLineage.outcome || previousLineage.state) === "failed_findings"
-  ) {
-    return {
-      marker: previousLineage,
-      historyIndex: previousLineageIndex,
-    };
-  }
-
-  const provenance = latestMarker.timedOutFromMarker;
-  if (
-    latestMarker.timedOutFromOutcome !== "failed_findings" ||
-    provenance?.outcome !== "failed_findings" ||
-    String(provenance.id || "") !== String(latestMarker.id || "") ||
-    provenance.headSha !== latestMarker.headSha ||
-    !provenance.closedAt
-  ) {
-    return null;
-  }
-
-  return {
-    marker: {
-      ...latestMarker,
-      state: "failed_findings",
-      outcome: "failed_findings",
-      closedAt: provenance.closedAt,
-    },
-    historyIndex: latestIndex,
-  };
-}
-
-function failedFindingsRecoveryAuthorization(providerResult, state, trigger, snapshot) {
-  if (
-    !config.failedFindingsRecovery ||
-    state?.activeMarker ||
-    state?.statusHead !== statusSha ||
-    providerResult.source !== "issue-comment" ||
-    !trigger?.completionComment ||
-    String(trigger.completionComment.id) !== String(providerResult.id) ||
-    trigger.completionComment.createdAt !== providerResult.createdAt
-  ) {
-    return null;
-  }
-
-  const recoveryLineage = failedFindingsRecoveryLineage(state);
-  const failedMarker = recoveryLineage?.marker;
-  if (
-    !failedMarker ||
-    !failedMarker.closedAt ||
-    !trustedLiveMarkerMatches(failedMarker, snapshot)
-  ) {
-    return null;
-  }
-
-  const resultCreatedAt = parseTimestamp(
-    providerResult.createdAt,
-    "Codex provider result creation time",
-  );
-  const findingsClosedAt = parseTimestamp(
-    failedMarker.closedAt,
-    "failed findings marker close time",
-  );
-  if (resultCreatedAt <= findingsClosedAt) {
-    return null;
-  }
-
-  if (
-    config.failedFindingsRecoveryMode === "fresh" &&
-    recoveryCompletionWasRejected(failedMarker, providerResult)
-  ) {
-    return null;
-  }
-  if (config.failedFindingsRecoveryMode === "fresh") {
-    const cutoff = latestRejectedRecoveryCutoff(failedMarker);
-    if (
-      cutoff &&
-      resultCreatedAt <= parseTimestamp(cutoff, "latest rejected recovery time")
-    ) {
-      return null;
-    }
-  }
-
-  return {
-    kind: "failed-findings-recovery",
-    marker: failedMarker,
-    historyIndex: recoveryLineage.historyIndex,
-  };
-}
-
-function recordRejectedFreshRecoveryAttempt(providerResult, state, trigger, snapshot) {
-  const authorization = authorizationWithinMaxWaitDeadline(
-    providerResult,
-    failedFindingsRecoveryAuthorization(
-      providerResult,
-      state,
-      trigger,
-      snapshot,
-    ),
-    snapshot,
-  );
-  if (config.failedFindingsRecoveryMode !== "fresh" || !authorization) {
-    return state;
-  }
-
-  const rejected = {
-    id: String(providerResult.id),
-    createdAt: providerResult.createdAt,
-    rejectedAt: isoNow(),
-  };
-  const history = state.history || [];
-  const failedMarkerIndex = authorization.historyIndex;
-  return normalizeState({
-    ...state,
-    updatedAt: rejected.rejectedAt,
-    history: history.map((marker, index) => {
-      if (index !== failedMarkerIndex) {
-        return marker;
-      }
-      if (recoveryCompletionWasRejected(marker, providerResult)) {
-        return marker;
-      }
-      return {
-        ...marker,
-        latestRejectedRecoveryAt: latestRejectedRecoveryCutoff(
-          marker,
-          rejected.rejectedAt,
-        ),
-        rejectedRecoveryCompletions: [
-          ...(marker.rejectedRecoveryCompletions || []),
-          rejected,
-        ].slice(-20),
-      };
-    }),
-  });
-}
-
-function recoveryCompletionWasRejected(marker, providerResult) {
-  return (marker.rejectedRecoveryCompletions || []).some((rejected) =>
-    String(rejected.id) === String(providerResult.id) &&
-    rejected.createdAt === providerResult.createdAt,
-  );
-}
-
-function latestRejectedRecoveryCutoff(marker, fallback = null) {
-  const candidates = [
-    marker.latestRejectedRecoveryAt,
-    ...(marker.rejectedRecoveryCompletions || []).map((rejected) => rejected.rejectedAt),
-    fallback,
-  ].filter(Boolean);
-  if (candidates.length === 0) {
-    return null;
-  }
-  return candidates.sort((left, right) =>
-    parseTimestamp(right, "rejected recovery time") -
-      parseTimestamp(left, "rejected recovery time"),
-  )[0];
-}
-
 function failIfSnapshotEvidenceIsInvalid(snapshot) {
   const errors = snapshot.evidenceErrors || [];
   if (errors.length === 0 && snapshot.providerResult.kind !== "malformed") {
@@ -1643,47 +1243,35 @@ async function passGateFromCurrentEvidence(
   state,
   stateComment,
   snapshot,
-  { trigger = null, authorizationKind = "active-marker" } = {},
+  { reviewOrchestrationBlocked = false } = {},
 ) {
   const liveStatus = await loadLatestGateStatus();
   await failIfPullRequestHeadChanged("before final Codex review evidence snapshot");
   const finalSnapshot = await loadSnapshot();
   failIfSnapshotEvidenceIsInvalid(finalSnapshot);
+  const finalReviewOrchestrationBlocked =
+    reviewOrchestrationBlocked ||
+    await markerStateConflictBlocksReviewOrchestration(finalSnapshot);
+  if (finalReviewOrchestrationBlocked && !reviewOrchestrationBlocked) {
+    console.warn(
+      "detected conflicting marker audit during final provider evidence reload; " +
+        "sticky state writes remain blocked",
+    );
+  }
   if (finalSnapshot.findings.count > 0) {
-    const failedLineageState = recordClosedWaitFindingsLineage(
+    await failFromFindings(
       finalSnapshot.findings,
       state,
-      trigger,
-      finalSnapshot,
+      stateComment,
+      { preserveAuditState: finalReviewOrchestrationBlocked },
     );
-    const rejectedState = recordRejectedFreshRecoveryAttempt(
-      finalSnapshot.providerResult,
-      failedLineageState,
-      trigger,
-      finalSnapshot,
-    );
-    await failFromFindings(finalSnapshot.findings, rejectedState, stateComment);
     return;
   }
-  if (finalSnapshot.providerResult.kind !== "clean") {
+  if (!providerResultIsCurrentHeadClean(finalSnapshot.providerResult)) {
     throw new GateFailure(
       "error",
       "Codex clean result changed during final validation",
       `The current-head Codex clean result for ${statusSha} was not stable across final validation.`,
-    );
-  }
-  const finalAuthorization = providerResultAuthorization(
-    finalSnapshot.providerResult,
-    state,
-    trigger,
-    finalSnapshot,
-  );
-  if (!finalAuthorization || finalAuthorization.kind !== authorizationKind) {
-    throw new GateFailure(
-      "pending",
-      "Codex clean result is not authorized by the current review state",
-      `The current-head Codex clean result for ${statusSha} is not authorized by ` +
-        `${authorizationKind}.`,
     );
   }
   if (!isDeepStrictEqual(finalSnapshot.providerResult, snapshot.providerResult)) {
@@ -1695,32 +1283,21 @@ async function passGateFromCurrentEvidence(
   }
 
   const passedAt = isoNow();
-  let authorizedState = state;
+  let auditedState = state;
   if (state.activeMarker) {
-    authorizedState = closeActiveMarker(state, "passed", passedAt, {
-      observedProviderResult: finalSnapshot.providerResult,
-    });
-  } else if (finalAuthorization.kind === "closed-wait-marker") {
-    authorizedState = normalizeState({
-      ...state,
-      updatedAt: passedAt,
-      history: [
-        ...(state.history || []),
-        {
-          ...finalAuthorization.marker,
-          state: "passed",
-          outcome: "passed",
-          closedAt: passedAt,
-          reconciledFromOutcome:
-            finalAuthorization.marker.outcome || finalAuthorization.marker.state,
+    auditedState = activeMarkerIsObsolete(state.activeMarker, statusSha)
+      ? closeActiveMarker(state, "obsolete_head", passedAt, {
+          currentHeadSha: statusSha,
+          resolutionSource: "live-provider-evidence",
+        })
+      : closeActiveMarker(state, "passed", passedAt, {
           observedProviderResult: finalSnapshot.providerResult,
-        },
-      ],
-    });
+          resolutionSource: "live-provider-evidence",
+        });
   }
 
   const passedState = updateStateForStatus(
-    authorizedState,
+    auditedState,
     {
       now: passedAt,
       statusHead: statusSha,
@@ -1740,10 +1317,16 @@ async function passGateFromCurrentEvidence(
         `the workflow must publish a compensating non-success status: ${error.message}`,
     );
   }
-  try {
-    await saveState(passedState, stateComment);
-  } catch (error) {
-    console.warn(`failed to save audit state after ${STATUS_CONTEXT}=success: ${error.message}`);
+  if (finalReviewOrchestrationBlocked) {
+    console.warn(
+      "left conflicting marker audit state unchanged while recording authoritative clean evidence",
+    );
+  } else {
+    try {
+      await saveState(passedState, stateComment);
+    } catch (error) {
+      console.warn(`failed to save audit state after ${STATUS_CONTEXT}=success: ${error.message}`);
+    }
   }
   console.log(
     `${STATUS_CONTEXT} passed for ${statusSha} from ` +
@@ -1756,9 +1339,22 @@ async function passGate(state, stateComment, snapshot, observed) {
   await passGateFromCurrentEvidence(state, stateComment, snapshot);
 }
 
-async function failFromFindings(findings, state, stateComment) {
+async function failFromFindings(
+  findings,
+  state,
+  stateComment,
+  { preserveAuditState = false } = {},
+) {
   const sample = findings.samples[0];
   const suffix = sample ? ` First finding: ${sample}` : "";
+  if (preserveAuditState) {
+    await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
+    console.warn(
+      "left conflicting marker audit state unchanged while recording authoritative findings",
+    );
+    console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
+    return;
+  }
   const failedState = state.activeMarker
     ? closeActiveMarker(state, "failed_findings", isoNow(), {
         currentHeadFindings: summarizeFindingsForState(findings),
@@ -1770,23 +1366,25 @@ async function failFromFindings(findings, state, stateComment) {
     runUrl,
     status: "failure",
   });
-  await saveAuthorizationCriticalState(
-    statusState,
-    stateComment,
-    "failed findings state",
-  );
   await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
+  try {
+    await saveState(statusState, stateComment);
+  } catch (error) {
+    console.warn(
+      `failed to save audit state after ${STATUS_CONTEXT}=failure: ${error.message}`,
+    );
+  }
   console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
 }
 
-async function saveAuthorizationCriticalState(state, stateComment, description) {
+async function saveOrchestrationCriticalState(state, stateComment, description) {
   try {
     return await saveState(state, stateComment);
   } catch (updateError) {
     let replacementError = null;
     if (stateComment?.id) {
       console.warn(
-        `failed to update authorization-critical ${description}; ` +
+        `failed to update orchestration-critical ${description}; ` +
           `creating a replacement state comment: ${updateError.message}`,
       );
       try {
@@ -1798,16 +1396,16 @@ async function saveAuthorizationCriticalState(state, stateComment, description) 
 
     let fenceError = null;
     try {
-      await publishAuthorizationFence(state, description);
+      await publishOrchestrationFence(state, description);
     } catch (error) {
       fenceError = error;
     }
     if (!fenceError) {
       throw new GateFailure(
         "error",
-        AUTHORIZATION_PERSISTENCE_FENCE_DESCRIPTION,
-        `failed to persist authorization-critical ${description}; ` +
-          `published a durable marker-lineage fence and stopped this run`,
+        ORCHESTRATION_PERSISTENCE_FENCE_DESCRIPTION,
+        `failed to persist orchestration-critical ${description}; ` +
+          `published a durable marker-orchestration fence and stopped this run`,
       );
     }
     const replacementDetail = replacementError
@@ -1815,15 +1413,15 @@ async function saveAuthorizationCriticalState(state, stateComment, description) 
       : "";
     throw new GateFailure(
       "error",
-      AUTHORIZATION_PERSISTENCE_FENCE_DESCRIPTION,
-      `failed to persist authorization-critical ${description}; ` +
+      ORCHESTRATION_PERSISTENCE_FENCE_DESCRIPTION,
+      `failed to persist orchestration-critical ${description}; ` +
         `state write failed (${updateError.message})${replacementDetail}; ` +
-        `durable marker-lineage fence failed (${fenceError.message})`,
+        `durable marker-orchestration fence failed (${fenceError.message})`,
     );
   }
 }
 
-async function publishAuthorizationFence(state, description) {
+async function publishOrchestrationFence(state, description) {
   const marker = state.activeMarker?.headSha === statusSha
     ? state.activeMarker
     : [...(state.history || [])]
@@ -1837,7 +1435,7 @@ async function publishAuthorizationFence(state, description) {
     ...marker,
     baseline: {
       ...(marker.baseline || {}),
-      authorizationFence: {
+      orchestrationFence: {
         reason: description,
         runUrl,
         runId: config.runId,
@@ -1850,11 +1448,11 @@ async function publishAuthorizationFence(state, description) {
     body: buildMarkerCommentBody(fencedMarker),
   });
   console.warn(
-    `published a durable authorization fence on controlled marker ${marker.id} for ${statusSha}`,
+    `published a durable orchestration fence on controlled marker ${marker.id} for ${statusSha}`,
   );
 }
 
-async function recoverAuthorizationPersistenceFence(state, stateComment, snapshot) {
+async function recoverOrchestrationPersistenceFence(state, stateComment, snapshot) {
   const markerComment = findLatestTrustedMarkerComment(
     snapshot.comments || [],
     config.trustedCommentLogins,
@@ -1862,7 +1460,10 @@ async function recoverAuthorizationPersistenceFence(state, stateComment, snapsho
   const liveMarker = markerComment ? markerFromComment(markerComment) : null;
   const markerFence =
     liveMarker?.headSha === statusSha &&
-    liveMarker.baseline?.authorizationFence;
+    (
+      liveMarker.baseline?.orchestrationFence ||
+      liveMarker.baseline?.authorizationFence
+    );
 
   if (!markerFence) {
     return { state, stateComment, needsFreshMarker: false, recovered: false };
@@ -1872,7 +1473,7 @@ async function recoverAuthorizationPersistenceFence(state, stateComment, snapsho
   let recoveredState;
   if (state.activeMarker) {
     recoveredState = closeActiveMarker(state, "state_lost", now, {
-      recoveryReason: "authorization_state_persistence_fence",
+      recoveryReason: "orchestration_state_persistence_fence",
     });
   } else {
     const previousMarker = [...(state.history || [])]
@@ -1889,14 +1490,18 @@ async function recoverAuthorizationPersistenceFence(state, stateComment, snapsho
           id:
             liveMarker?.id ||
             previousMarker?.id ||
-            `authorization-fence-${config.runId}-${config.runAttempt}`,
+            `orchestration-fence-${config.runId}-${config.runAttempt}`,
           url: markerComment?.html_url || previousMarker?.url || null,
           headSha: statusSha,
+          createdAt:
+            liveMarker?.createdAt ||
+            previousMarker?.createdAt ||
+            now,
           baseline: liveMarker?.baseline || previousMarker?.baseline || {},
           state: "state_lost",
           outcome: "state_lost",
           closedAt: now,
-          recoveryReason: "authorization_state_persistence_fence",
+          recoveryReason: "orchestration_state_persistence_fence",
         },
       ],
     });
@@ -1907,10 +1512,10 @@ async function recoverAuthorizationPersistenceFence(state, stateComment, snapsho
     runUrl,
     status: "pending",
   });
-  const recoveredStateComment = await saveAuthorizationCriticalState(
+  const recoveredStateComment = await saveOrchestrationCriticalState(
     recoveredState,
     stateComment,
-    "authorization persistence fence recovery",
+    "orchestration persistence fence recovery",
   );
   await setCommitStatus(
     "pending",
@@ -1921,105 +1526,6 @@ async function recoverAuthorizationPersistenceFence(state, stateComment, snapsho
     stateComment: recoveredStateComment,
     needsFreshMarker: true,
     recovered: true,
-  };
-}
-
-async function demoteUnauthorizedCleanIfNeeded(state, stateComment) {
-  const liveStatus = await loadLatestGateStatus();
-  const now = isoNow();
-  const invalidation = invalidatePassedAuthorizationLineage(state, now);
-  if (
-    !invalidation.changed &&
-    !liveStatus.readFailed &&
-    liveStatus.producerMatches &&
-    liveStatus.latest &&
-    liveStatus.latest.state !== "success"
-  ) {
-    return { state, stateComment, needsFreshMarker: false };
-  }
-
-  const pendingState = updateStateForStatus(invalidation.state, {
-    now,
-    statusHead: statusSha,
-    runUrl,
-    status: "pending",
-  });
-  if (invalidation.changed) {
-    let persistedStateComment = stateComment;
-    await setCommitStatusIfNeeded(
-      "pending",
-      "Current-head Codex clean result is not authorized by trusted marker lineage",
-      {
-        liveStatus,
-        beforeDecision: async () => {
-          persistedStateComment = await saveAuthorizationCriticalState(
-            pendingState,
-            stateComment,
-            "unauthorized passed-result lineage invalidation",
-          );
-        },
-      },
-    );
-    return {
-      state: pendingState,
-      stateComment: persistedStateComment,
-      needsFreshMarker: true,
-    };
-  }
-
-  await setCommitStatusIfNeeded(
-    "pending",
-    "Current-head Codex clean result is not authorized by trusted marker lineage",
-    { liveStatus },
-  );
-  try {
-    return {
-      state: pendingState,
-      stateComment: await saveState(pendingState, stateComment),
-      needsFreshMarker: false,
-    };
-  } catch (error) {
-    console.warn(
-      `failed to save audit state after unauthorized clean demotion: ${error.message}`,
-    );
-    return {
-      state: pendingState,
-      stateComment,
-      needsFreshMarker: false,
-    };
-  }
-}
-
-function invalidatePassedAuthorizationLineage(state, now) {
-  const history = state?.history || [];
-  const latestForHead = [...history]
-    .reverse()
-    .find((marker) => marker.headSha === statusSha);
-  if (
-    !latestForHead ||
-    (latestForHead.outcome || latestForHead.state) !== "passed"
-  ) {
-    return { state, changed: false };
-  }
-
-  return {
-    changed: true,
-    state: normalizeState({
-      ...state,
-      updatedAt: now,
-      history: [
-        ...history,
-        {
-          ...latestForHead,
-          version: STATE_VERSION,
-          state: "state_lost",
-          outcome: "state_lost",
-          closedAt: now,
-          recoveryReason: "unauthorized_passed_result_lineage",
-          authorizationLineageInvalidatedAt: now,
-        },
-      ],
-    }),
   };
 }
 
@@ -2262,7 +1768,7 @@ async function timeOutCurrentHeadWaitCycleIfNeeded(state, stateComment) {
     runUrl,
     status: "failure",
   });
-  const persistedStateComment = await saveAuthorizationCriticalState(
+  const persistedStateComment = await saveOrchestrationCriticalState(
     statusState,
     stateComment,
     "max-wait timeout state",
