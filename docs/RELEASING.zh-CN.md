@@ -304,12 +304,16 @@ runtime：
    `gh release verify v1.5.0 --repo JoeyTeng/codex-review-gate-action` 与
    `gh release verify-asset v1.5.0 v1.5.0-release-provenance.json --repo JoeyTeng/codex-review-gate-action`，并独立重新下载和
    digest-check asset。
-5. 只有上述检查成功后，才 atomic publish `v1.5` 并把 `v1` 移到已 admitted 的 signed
-   tag objects。对事先观察到的 remote `v1` tag-object OID 使用 exact
-   `--force-with-lease`。必须要求 atomic push support；任一 ref 被拒绝时两个 aliases
-   都保持不变。
-6. 重读两个 remote alias tag-object OIDs 与 peeled commits。把 generator rerun 到
-   verification file，并要求其 bytes 与已发布 provenance asset 完全相同。
+5. 只有上述检查成功后，才从 freshly downloaded、且与 generated asset 逐字节相同的
+   provenance asset 中读取 exact `v1.5` 与 `v1` tag-object OIDs。要求两个 manifest
+   entries 都描述已 admitted 的 signed annotated tags，且 peel 到 manifest 的
+   `action.commit_oid`；随后重新验证这些 exact local objects。一次 atomic push 必须直接
+   使用这些 OIDs，而不是 mutable local tag refs。对事先观察到的 remote `v1`
+   tag-object OID 使用 exact `--force-with-lease`。必须要求 atomic push support；任一
+   ref 被拒绝时两个 aliases 都保持不变。
+6. 重读两个 remote alias tag-object OIDs 与 peeled commits，并要求分别 exact 等于
+   manifest-bound OIDs 与 action commit。把 generator rerun 到 verification file，并
+   要求其 bytes 与已发布 provenance asset 完全相同。
 
 Immutable tag 与 draft-to-published release 步骤如下：
 
@@ -346,18 +350,135 @@ gh release verify-asset \
   v1.5.0 \
   v1.5.0-release-provenance.json \
   --repo JoeyTeng/codex-review-gate-action
+
+published_provenance_path="v1.5.0-published-release-provenance.json"
+test ! -e "$published_provenance_path"
+gh release download v1.5.0 \
+  --repo JoeyTeng/codex-review-gate-action \
+  --pattern v1.5.0-release-provenance.json \
+  --output "$published_provenance_path"
+cmp -s v1.5.0-release-provenance.json "$published_provenance_path"
 ```
 
 Alias push 刻意与 immutable tag/release 分开：
+
+`TRUSTED_RELEASE_PRIMARY_FINGERPRINT` 只能来自 independently controlled signer
+policy，禁止从任一 provenance file 复制。Freshly downloaded asset 是 alias tag-object
+OIDs 的 authority；generated asset 必须与它保持逐字节相同。Shell 会先验证这个独立
+提供的 fingerprint 是 40 或 64 位 hexadecimal，再 canonicalize 为 generator 使用的
+lower-case representation。
 
 ```bash
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
+generated_provenance_path="v1.5.0-release-provenance.json"
+published_provenance_path="v1.5.0-published-release-provenance.json"
 release_evidence_path="v1.5.0-expected-remote-v1-tag-object.txt"
+trusted_primary_fingerprint_input="${TRUSTED_RELEASE_PRIMARY_FINGERPRINT:?}"
+release_gpg_path="$(realpath "$(command -v gpg)")"
+test -x "$release_gpg_path"
+test -f "$generated_provenance_path"
+test -f "$published_provenance_path"
+cmp -s "$generated_provenance_path" "$published_provenance_path"
+[[ "$trusted_primary_fingerprint_input" =~ \
+  ^[0-9A-Fa-f]{40}([0-9A-Fa-f]{24})?$ ]]
+trusted_primary_fingerprint="$(
+  printf '%s' "$trusted_primary_fingerprint_input" |
+    tr '[:upper:]' '[:lower:]'
+)"
+
+manifest_alias_binding="$(
+  jq -er \
+    --arg trusted_primary_fingerprint "$trusted_primary_fingerprint" '
+        def oid:
+          type == "string" and test("^[0-9a-f]{40}$");
+        def fingerprint:
+          type == "string" and
+          test("^[0-9a-f]{40}([0-9a-f]{24})?$");
+        def admitted_tag($name; $commit_oid; $primary_fingerprint):
+          .ref == ("refs/tags/" + $name) and
+          .annotated == true and
+          (.tag_object_oid | oid) and
+          .peeled_commit_oid == $commit_oid and
+          (.peeled_commit_oid | oid) and
+          .signature.verified == true and
+          .signature.method == "git-verify-tag-openpgp-raw" and
+          (.signature.signing_key_fingerprint | fingerprint) and
+          .signature.primary_key_fingerprint == $primary_fingerprint and
+          (.signature.primary_key_fingerprint | fingerprint);
+        . as $manifest
+        | ($manifest.action.commit_oid) as $commit_oid
+        | select(
+            $manifest.schema ==
+              "urn:joeyteng:codex-review-gate:release-provenance:2" and
+            $manifest.schema_version == 2 and
+            $manifest.release == "1.5.0" and
+            ($commit_oid | oid) and
+            ($manifest.tags["v1.5.0"] |
+              admitted_tag(
+                "v1.5.0";
+                $commit_oid;
+                $trusted_primary_fingerprint
+              )) and
+            ($manifest.tags["v1.5"] |
+              admitted_tag(
+                "v1.5";
+                $commit_oid;
+                $trusted_primary_fingerprint
+              )) and
+            ($manifest.tags.v1 |
+              admitted_tag(
+                "v1";
+                $commit_oid;
+                $trusted_primary_fingerprint
+              ))
+          )
+        | [
+            $commit_oid,
+            $manifest.tags["v1.5"].tag_object_oid,
+            $manifest.tags.v1.tag_object_oid
+          ]
+      | @tsv
+    ' "$published_provenance_path"
+)"
+IFS=$'\t' read -r \
+  expected_action_release_commit \
+  expected_v1_5_tag_object_oid \
+  expected_v1_tag_object_oid <<< "$manifest_alias_binding"
+test "$manifest_alias_binding" = \
+  "$expected_action_release_commit"$'\t'\
+"$expected_v1_5_tag_object_oid"$'\t'"$expected_v1_tag_object_oid"
+test "$expected_v1_5_tag_object_oid" != "$expected_v1_tag_object_oid"
+
+verify_manifest_tag_object() {
+  local tag_object_oid="$1"
+  local peeled_commit_oid
+
+  test "$(
+    git -C "$action_repo_path" cat-file -t "$tag_object_oid"
+  )" = tag
+  peeled_commit_oid="$(
+    git -C "$action_repo_path" rev-parse --verify "${tag_object_oid}^{commit}"
+  )"
+  test "$peeled_commit_oid" = "$expected_action_release_commit"
+  git -C "$action_repo_path" \
+    -c gpg.format=openpgp \
+    -c "gpg.program=$release_gpg_path" \
+    -c "gpg.openpgp.program=$release_gpg_path" \
+    verify-tag --raw "$tag_object_oid"
+}
+
+verify_manifest_tag_object "$expected_v1_5_tag_object_oid"
+verify_manifest_tag_object "$expected_v1_tag_object_oid"
+
 expected_remote_v1_tag_object_oid="$(sed -n '1p' "$release_evidence_path")"
 test "${#expected_remote_v1_tag_object_oid}" -eq 40
 [[ "$expected_remote_v1_tag_object_oid" != *[!0-9a-f]* ]]
+current_remote_v1_5_record="$(
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5
+)"
+test -z "$current_remote_v1_5_record"
 current_remote_v1_record="$(
   git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1
 )"
@@ -367,13 +488,35 @@ test "$current_remote_v1_record" = \
 git -C "$action_repo_path" push --atomic \
   --force-with-lease="refs/tags/v1:$expected_remote_v1_tag_object_oid" \
   origin \
-  refs/tags/v1.5:refs/tags/v1.5 \
-  refs/tags/v1:refs/tags/v1
+  "$expected_v1_5_tag_object_oid:refs/tags/v1.5" \
+  "$expected_v1_tag_object_oid:refs/tags/v1"
+
+verify_remote_alias() {
+  local alias_ref="$1"
+  local expected_tag_object_oid="$2"
+  local remote_tag_record
+  local remote_peeled_record
+
+  remote_tag_record="$(
+    git -C "$action_repo_path" ls-remote --tags origin "$alias_ref"
+  )"
+  test "$remote_tag_record" = \
+    "$expected_tag_object_oid"$'\t'"$alias_ref"
+  remote_peeled_record="$(
+    git -C "$action_repo_path" ls-remote --tags origin "${alias_ref}^{}"
+  )"
+  test "$remote_peeled_record" = \
+    "$expected_action_release_commit"$'\t'"${alias_ref}^{}"
+}
+
+verify_remote_alias refs/tags/v1.5 "$expected_v1_5_tag_object_oid"
+verify_remote_alias refs/tags/v1 "$expected_v1_tag_object_oid"
 ```
 
 Atomic update 失败时禁止改用 separate alias pushes。重读 remote state、解决冲突，并重跑
 完整 admission proof。把持久化的 pre-release `v1` tag-object OID 与其他 release
-evidence 一并保留。
+evidence 一并保留。禁止用 local alias ref 替换任一 manifest-bound source OID，也禁止在
+validation 后重新解析这些 OIDs。
 
 ## Live Canary 与 Activation
 

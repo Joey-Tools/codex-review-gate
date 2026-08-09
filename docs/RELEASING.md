@@ -332,13 +332,18 @@ its immutable release authority is available:
    `gh release verify v1.5.0 --repo JoeyTeng/codex-review-gate-action` and
    `gh release verify-asset v1.5.0 v1.5.0-release-provenance.json --repo JoeyTeng/codex-review-gate-action`, and
    independently re-download and digest-check the asset.
-5. Only after those checks succeed, atomically publish `v1.5` and move `v1` to
-   their admitted signed tag objects. Use an exact `--force-with-lease` for the
-   previously observed remote `v1` tag-object OID. Require atomic push support;
-   a rejected ref leaves both aliases unchanged.
-6. Re-read both remote alias tag-object OIDs and peeled commits. Rerun the
-   generator to a verification file and require byte-for-byte equality with
-   the already published provenance asset.
+5. Only after those checks succeed, read the exact `v1.5` and `v1` tag-object
+   OIDs from a freshly downloaded provenance asset that is byte-for-byte equal
+   to the generated asset. Require both manifest entries to describe admitted
+   signed annotated tags that peel to the manifest's `action.commit_oid`, and
+   reverify those exact local objects. Use the OIDs themselves—not mutable local
+   tag refs—as the sources of one atomic push. Use an exact
+   `--force-with-lease` for the previously observed remote `v1` tag-object OID.
+   Require atomic push support; a rejected ref leaves both aliases unchanged.
+6. Re-read both remote alias tag-object OIDs and peeled commits and require exact
+   equality with the manifest-bound OIDs and action commit. Rerun the generator
+   to a verification file and require byte-for-byte equality with the already
+   published provenance asset.
 
 The immutable tag and draft-to-published release steps have this shape:
 
@@ -375,18 +380,136 @@ gh release verify-asset \
   v1.5.0 \
   v1.5.0-release-provenance.json \
   --repo JoeyTeng/codex-review-gate-action
+
+published_provenance_path="v1.5.0-published-release-provenance.json"
+test ! -e "$published_provenance_path"
+gh release download v1.5.0 \
+  --repo JoeyTeng/codex-review-gate-action \
+  --pattern v1.5.0-release-provenance.json \
+  --output "$published_provenance_path"
+cmp -s v1.5.0-release-provenance.json "$published_provenance_path"
 ```
 
 The alias push shape is deliberately separate from the immutable tag/release:
+
+Set `TRUSTED_RELEASE_PRIMARY_FINGERPRINT` only from the independently
+controlled signer policy. Do not copy it from either provenance file. The
+freshly downloaded asset is the authority for the alias tag-object OIDs; the
+generated asset must remain byte-for-byte identical to it. The shell validates
+the independently supplied 40- or 64-hex fingerprint before canonicalising it
+to the lower-case representation used by the generator.
 
 ```bash
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
+generated_provenance_path="v1.5.0-release-provenance.json"
+published_provenance_path="v1.5.0-published-release-provenance.json"
 release_evidence_path="v1.5.0-expected-remote-v1-tag-object.txt"
+trusted_primary_fingerprint_input="${TRUSTED_RELEASE_PRIMARY_FINGERPRINT:?}"
+release_gpg_path="$(realpath "$(command -v gpg)")"
+test -x "$release_gpg_path"
+test -f "$generated_provenance_path"
+test -f "$published_provenance_path"
+cmp -s "$generated_provenance_path" "$published_provenance_path"
+[[ "$trusted_primary_fingerprint_input" =~ \
+  ^[0-9A-Fa-f]{40}([0-9A-Fa-f]{24})?$ ]]
+trusted_primary_fingerprint="$(
+  printf '%s' "$trusted_primary_fingerprint_input" |
+    tr '[:upper:]' '[:lower:]'
+)"
+
+manifest_alias_binding="$(
+  jq -er \
+    --arg trusted_primary_fingerprint "$trusted_primary_fingerprint" '
+        def oid:
+          type == "string" and test("^[0-9a-f]{40}$");
+        def fingerprint:
+          type == "string" and
+          test("^[0-9a-f]{40}([0-9a-f]{24})?$");
+        def admitted_tag($name; $commit_oid; $primary_fingerprint):
+          .ref == ("refs/tags/" + $name) and
+          .annotated == true and
+          (.tag_object_oid | oid) and
+          .peeled_commit_oid == $commit_oid and
+          (.peeled_commit_oid | oid) and
+          .signature.verified == true and
+          .signature.method == "git-verify-tag-openpgp-raw" and
+          (.signature.signing_key_fingerprint | fingerprint) and
+          .signature.primary_key_fingerprint == $primary_fingerprint and
+          (.signature.primary_key_fingerprint | fingerprint);
+        . as $manifest
+        | ($manifest.action.commit_oid) as $commit_oid
+        | select(
+            $manifest.schema ==
+              "urn:joeyteng:codex-review-gate:release-provenance:2" and
+            $manifest.schema_version == 2 and
+            $manifest.release == "1.5.0" and
+            ($commit_oid | oid) and
+            ($manifest.tags["v1.5.0"] |
+              admitted_tag(
+                "v1.5.0";
+                $commit_oid;
+                $trusted_primary_fingerprint
+              )) and
+            ($manifest.tags["v1.5"] |
+              admitted_tag(
+                "v1.5";
+                $commit_oid;
+                $trusted_primary_fingerprint
+              )) and
+            ($manifest.tags.v1 |
+              admitted_tag(
+                "v1";
+                $commit_oid;
+                $trusted_primary_fingerprint
+              ))
+          )
+        | [
+            $commit_oid,
+            $manifest.tags["v1.5"].tag_object_oid,
+            $manifest.tags.v1.tag_object_oid
+          ]
+      | @tsv
+    ' "$published_provenance_path"
+)"
+IFS=$'\t' read -r \
+  expected_action_release_commit \
+  expected_v1_5_tag_object_oid \
+  expected_v1_tag_object_oid <<< "$manifest_alias_binding"
+test "$manifest_alias_binding" = \
+  "$expected_action_release_commit"$'\t'\
+"$expected_v1_5_tag_object_oid"$'\t'"$expected_v1_tag_object_oid"
+test "$expected_v1_5_tag_object_oid" != "$expected_v1_tag_object_oid"
+
+verify_manifest_tag_object() {
+  local tag_object_oid="$1"
+  local peeled_commit_oid
+
+  test "$(
+    git -C "$action_repo_path" cat-file -t "$tag_object_oid"
+  )" = tag
+  peeled_commit_oid="$(
+    git -C "$action_repo_path" rev-parse --verify "${tag_object_oid}^{commit}"
+  )"
+  test "$peeled_commit_oid" = "$expected_action_release_commit"
+  git -C "$action_repo_path" \
+    -c gpg.format=openpgp \
+    -c "gpg.program=$release_gpg_path" \
+    -c "gpg.openpgp.program=$release_gpg_path" \
+    verify-tag --raw "$tag_object_oid"
+}
+
+verify_manifest_tag_object "$expected_v1_5_tag_object_oid"
+verify_manifest_tag_object "$expected_v1_tag_object_oid"
+
 expected_remote_v1_tag_object_oid="$(sed -n '1p' "$release_evidence_path")"
 test "${#expected_remote_v1_tag_object_oid}" -eq 40
 [[ "$expected_remote_v1_tag_object_oid" != *[!0-9a-f]* ]]
+current_remote_v1_5_record="$(
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5
+)"
+test -z "$current_remote_v1_5_record"
 current_remote_v1_record="$(
   git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1
 )"
@@ -396,13 +519,36 @@ test "$current_remote_v1_record" = \
 git -C "$action_repo_path" push --atomic \
   --force-with-lease="refs/tags/v1:$expected_remote_v1_tag_object_oid" \
   origin \
-  refs/tags/v1.5:refs/tags/v1.5 \
-  refs/tags/v1:refs/tags/v1
+  "$expected_v1_5_tag_object_oid:refs/tags/v1.5" \
+  "$expected_v1_tag_object_oid:refs/tags/v1"
+
+verify_remote_alias() {
+  local alias_ref="$1"
+  local expected_tag_object_oid="$2"
+  local remote_tag_record
+  local remote_peeled_record
+
+  remote_tag_record="$(
+    git -C "$action_repo_path" ls-remote --tags origin "$alias_ref"
+  )"
+  test "$remote_tag_record" = \
+    "$expected_tag_object_oid"$'\t'"$alias_ref"
+  remote_peeled_record="$(
+    git -C "$action_repo_path" ls-remote --tags origin "${alias_ref}^{}"
+  )"
+  test "$remote_peeled_record" = \
+    "$expected_action_release_commit"$'\t'"${alias_ref}^{}"
+}
+
+verify_remote_alias refs/tags/v1.5 "$expected_v1_5_tag_object_oid"
+verify_remote_alias refs/tags/v1 "$expected_v1_tag_object_oid"
 ```
 
 Do not fall back to separate alias pushes if the atomic update fails. Re-read
 remote state, resolve the conflict, and rerun the full admission proof. Retain
 the persisted pre-release `v1` tag-object OID with the other release evidence.
+Do not replace either manifest-bound source OID with a local alias ref or
+re-resolve it after validation.
 
 ## Live Canary and Activation
 
