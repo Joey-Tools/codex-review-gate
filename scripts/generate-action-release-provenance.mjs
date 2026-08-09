@@ -1862,7 +1862,7 @@ async function assertReleaseRefsStillStable(options, manifest) {
 export async function writeManifest(
   outputPath,
   manifest,
-  { beforePublish, finalPrePublish } = {},
+  { beforePublish, afterStagingValidation, finalPrePublish } = {},
 ) {
   const absoluteOutput = resolve(outputPath);
   await mkdir(dirname(absoluteOutput), { recursive: true });
@@ -1890,9 +1890,6 @@ export async function writeManifest(
     if (beforePublish) {
       await beforePublish();
     }
-    if (finalPrePublish) {
-      await finalPrePublish();
-    }
     const handleIdentity = await temporaryHandle.stat({ bigint: true });
     const pathIdentity = await lstat(temporary, { bigint: true });
     const stagedBytes = await readFile(temporary);
@@ -1911,6 +1908,12 @@ export async function writeManifest(
       throw new Error(
         "manifest staging object identity, access policy, or content changed",
       );
+    }
+    if (afterStagingValidation) {
+      await afterStagingValidation();
+    }
+    if (finalPrePublish) {
+      await finalPrePublish();
     }
     // The output path is a create-only publication boundary. Linking commits
     // the verified object from this invocation's owner-private staging directory

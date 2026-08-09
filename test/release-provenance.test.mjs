@@ -959,6 +959,7 @@ test("final pre-publication ref-race failure publishes no manifest", async (t) =
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const output = join(root, "release-provenance.json");
   const phases = [];
+  let refsStable = true;
 
   await assert.rejects(
     writeManifest(
@@ -969,16 +970,26 @@ test("final pre-publication ref-race failure publishes no manifest", async (t) =
           phases.push("before-publication");
           assert.equal(existsSync(output), false);
         },
+        afterStagingValidation: () => {
+          phases.push("after-staging-validation");
+          refsStable = false;
+        },
         finalPrePublish: () => {
           phases.push("final-pre-publication");
           assert.equal(existsSync(output), false);
-          throw new Error("simulated final pre-publication ref drift");
+          if (!refsStable) {
+            throw new Error("simulated final pre-publication ref drift");
+          }
         },
       },
     ),
     /simulated final pre-publication ref drift/,
   );
-  assert.deepEqual(phases, ["before-publication", "final-pre-publication"]);
+  assert.deepEqual(phases, [
+    "before-publication",
+    "after-staging-validation",
+    "final-pre-publication",
+  ]);
   assert.equal(existsSync(output), false);
 });
 
