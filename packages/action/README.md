@@ -12,11 +12,14 @@ Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.
 3. After `codex/review-gate` behaves as expected, add it as a required status check. For recovery recipes, see the [cookbook](COOKBOOK.md).
 
 > [!IMPORTANT]
-> The reusable caller is staged for the v1.5 rollout. Do not activate it in the
-> source repository or template until the immutable v1.5.0 release and
-> provenance asset exist, the `v1.5` and `v1` aliases are verified, and the live
-> canary passes. That activation belongs in a separate follow-up PR; until then,
-> the existing source and template callers remain unchanged.
+> The reusable caller is staged for the v1.5 rollout. The immutable v1.5.0
+> release exists, but its live canary exposed an incorrect commit-versus-tag
+> object admission contract. Consumers must fail closed on v1.5.0; there is no
+> digest-keyed erratum. Do not activate the source repository or template
+> caller until the compatible v1.5.1 repair and provenance asset are published,
+> the `v1.5` and `v1` aliases are verified, and a new live canary passes. That
+> activation belongs in a separate follow-up PR; until then, the existing source
+> and template callers remain unchanged.
 
 `codex-review-gate` is a reusable GitHub workflow backed by a composite Action.
 It owns a deterministic
@@ -141,7 +144,10 @@ For the event-driven review-gate design, state machine, automatic retry controls
 
 The advanced design uses repository or organisation variables for controls that must take effect before a runner is allocated. For example, `CODEX_REVIEW_GATE_AUTO_RETRY=false` can skip scheduled retry jobs at the job `if` layer. Runtime `env` values are still useful for action behaviour after a job has started, but they cannot prevent GitHub Actions from assigning a runner.
 
-The workflow example defaults to `ubuntu-slim`. Set `CODEX_REVIEW_GATE_RUNNER_LABELS` to a JSON array such as `["self-hosted","linux","x64","codex-review-gate"]` to run the gate on a self-hosted runner.
+The current source-root direct workflow defaults to `ubuntu-slim`. Direct
+composite callers may set `CODEX_REVIEW_GATE_RUNNER_LABELS` to a JSON array such
+as `["self-hosted","linux","x64","codex-review-gate"]`; the canonical reusable
+workflow below deliberately ignores that variable and stays on `ubuntu-slim`.
 
 ## Workflow Usage
 
@@ -194,11 +200,33 @@ cannot elevate them, so no `secrets: inherit` is needed. The four read/write
 permissions above are the supported ceiling. The called workflow never checks
 out the pull request or executes its code.
 
+Reusable mode fixes `runs-on: ubuntu-slim`. Caller repository variables cannot
+select a self-hosted or otherwise different runner, so the GitHub-hosted runner
+is part of the trusted boundary for checkout output, worktree, and receipt
+production. Direct composite mode remains caller-owned and may keep its
+existing runner configuration. The GitHub-hosted boundary still is not a
+cryptographic signature, OIDC attestation, or content-addressed storage proof.
+
+Reusable receipt attribution also assumes that the caller workflow revision
+and its complete job graph are independently trusted. A same-run malicious
+sibling job can race to create the attempt-named artifact and write a matching
+status before the called job completes. Exact-attempt `referenced_workflows` is
+run-level corroboration and does not bind one job, callsite, or receipt.
+Therefore the validated chain supplies causal consistency only inside the
+trusted-caller plus fixed-hosted-runner boundary; it is not job-scoped
+cryptographic attribution.
+
 Floating `@v1` is the intentional, centralised pre-execution trust boundary:
 release policy permits moving it only to a compatible v1.x release. It is not
-post-run immutable provenance. Consumers dynamically verify the exact resolved
-`job.workflow_sha` against its signed immutable v1.x.y release; they do not pin
-a v1.5 SHA in this caller or in a consuming Skill.
+post-run immutable provenance. Let `W` be the exact selected workflow object in
+`job.workflow_sha`, the matching exact-attempt `referenced_workflows[].sha`, and
+receipt `producer.action.ref`; let `C` be the checkout output commit, receipt
+`producer.action.commit_sha`, and provenance `action.commit_oid`; and let `T` be
+the independently signed `tags.v1.tag_object_oid`. The v1.5.0 live canary
+observed `W == T`, but the closed contract also admits a future `W == C` shape.
+Consumers require exactly one of those two candidates, always verify that `T`
+peels directly to `C`, and do not pin a v1.5 SHA in this caller or in a consuming
+Skill.
 
 ## Inputs
 
@@ -273,17 +301,25 @@ After the rollout gate above, the canonical GitHub.com caller uses
 `JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`.
 This floating major alias is the intentional centralised pre-execution trust
 boundary: moving it upgrades all callers to a compatible v1.x release. It is
-not post-run immutable provenance. Post-run admission instead resolves and
-verifies the exact `job.workflow_sha` dynamically; neither the caller nor a
-consuming Skill pins the v1.5 SHA.
+not post-run immutable provenance. In the current live shape, post-run
+admission verifies the exact signed `v1` tag-object OID selected in
+`job.workflow_sha` and its peel to the admitted action commit. The closed
+resolution contract below also admits a future exact-action-commit shape;
+neither the caller nor a consuming Skill pins the v1.5 SHA.
 
 Inside the called job, `github.workflow_ref` and `github.workflow_sha` still
 identify the caller workflow. The called implementation is identified by the
 GitHub.com-only `job.workflow_repository`, `job.workflow_file_path`,
-`job.workflow_ref`, and `job.workflow_sha` fields. The reusable workflow checks
-out its own exact implementation with a full-SHA-pinned `actions/checkout`,
+`job.workflow_ref`, and `job.workflow_sha` fields. The SHA field identifies the
+selected workflow object. The v1.5.0 canary observed the annotated `v1` tag
+object; the closed contract also admits the peeled action commit when GitHub
+reports that exact object instead. The reusable workflow checks out the exact
+selected object with a full-SHA-pinned `actions/checkout`,
 `repository: ${{ job.workflow_repository }}`, and
-`ref: ${{ job.workflow_sha }}`. A bare checkout would select the caller
+`ref: ${{ job.workflow_sha }}`. The `checkout` step's official `commit` output
+is the peeled action commit and reaches the local composite only as
+`CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ steps.checkout.outputs.commit }}`,
+never a `workflow_call` or caller input. A bare checkout would select the caller
 repository, so the trusted workflow never performs one and never checks out or
 executes pull-request code.
 
@@ -310,14 +346,19 @@ the selected current PR.
 On GitHub.com, both supported forms emit producer receipt v1 under
 [`producer-receipt.schema.json`](producer-receipt.schema.json). For the
 canonical reusable tuple—exact action repository, workflow file, `refs/tags/v1`
-job ref, and lower-case 40-hex `job.workflow_sha`—the producer maps that job SHA
-to `producer.action.ref` and `producer.action.commit_sha` with
-`immutable: true`; that canonical job tuple is authoritative even if a nested
-action context is also present. Only when the reusable tuple is non-canonical
-does direct composite use retain the existing mapping from an exact lower-case
-40-SHA action ref. A near-canonical reusable tuple never upgrades identity or
-supplies a fallback. Without an independently exact direct action ref,
-floating, near-canonical, or local invocations produce unusable
+job ref, and lower-case 40-hex `job.workflow_sha`—the producer maps that exact
+selected workflow object OID to `producer.action.ref`. It independently maps the
+full-SHA-pinned checkout step's official `commit` output to
+`producer.action.commit_sha` and sets `immutable: true`; the checkout commit
+must be the admitted action commit. The called workflow controls that
+environment binding and exposes no caller input for it. Native action context
+has structural priority: if either `github.action_repository` or
+`github.action_ref` is present, the producer records that direct context and
+ignores the reusable checkout-commit environment. Such a direct identity is
+immutable only when its action ref is an exact lower-case 40-SHA. The reusable
+W/C mapping is considered only when both native fields are absent and the job
+tuple is exact canonical. A near-canonical tuple never upgrades identity or
+supplies a fallback; with no native context it produces unusable
 `immutable: false` action identity.
 
 Receipt mode uses the attempt-specific
@@ -336,7 +377,7 @@ equal that attempt URL.
 
 Any consuming review or readiness Skill must preserve four separate SHA
 domains: the caller workflow definition (`github.workflow_sha`), the exact API
-run-attempt head (`head_sha`), the called implementation
+run-attempt head (`head_sha`), the called workflow's selected object identity
 (`job.workflow_sha`), and the current pull-request/status head. None may be
 substituted for another. Specifically, do not require the exact run-attempt
 `head_sha` or Artifact API `workflow_run.head_sha` to equal the selected
@@ -360,31 +401,44 @@ is `producer_receipt_boundary` in
    `execution.result == completed`; a `failed` receipt remains audit evidence
    only. Also require the current repository, exact run/attempt/target, caller
    workflow fields, and one explicitly selected structural mode. Reusable mode
-   requires the exact canonical job tuple and its mapped action repository and
-   `job.workflow_sha` with `immutable: true`; direct mode requires the expected
-   action repository and exact lower-case 40-SHA with `immutable: true`.
+   requires the exact canonical job tuple, action repository,
+   `producer.action.ref == job.workflow_sha`, the independently bound checkout
+   commit in `producer.action.commit_sha`, and `immutable: true`; direct mode
+   requires the expected action repository and exact lower-case 40-SHA with
+   action ref and commit SHA equal and `immutable: true`.
 3. Fetch the attempt through
    `GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}`; do not
    require its response `url` or `html_url` to be attempt-specific. Require the
    Artifact API record's `workflow_run.id` and `workflow_run.head_sha` to equal
    that response's `id` and `head_sha`. In reusable mode, require the optional,
    nullable `referenced_workflows` array to be present and contain exactly one
-   entry matching the canonical repository/workflow path and v1 call. Its
-   required `sha` must equal `job.workflow_sha`, the receipt's mapped action
-   commit, and the admitted release-provenance `action.commit_oid`; its `ref`
-   must be present and equal `refs/tags/v1`. This is
+   entry matching the canonical repository/workflow path and v1 call. Let its
+   required `sha`, `job.workflow_sha`, and receipt `producer.action.ref` be
+   `W`; its `ref` must be present and equal `refs/tags/v1`. Require `W` to equal
+   exactly one declared value in
+   `runtime_closure.called_workflow.workflow_sha_resolution.candidates`, with
+   each candidate value equal to its declared provenance field. The only
+   admitted branches are current-live `W == T`, where `T ==
+   tags.v1.tag_object_oid`, and future `W == C`, where `C ==
+   action.commit_oid`. In both branches require the independently signed `T` to
+   peel directly to `C`, and require `tags.v1.peeled_commit_oid ==
+   action.commit_oid == producer.action.commit_sha`. Other object types, nested
+   tag peels, and zero or multiple candidate matches fail closed. This is
    run-attempt-level corroboration only: GitHub exposes no entry-to-job or
    entry-to-receipt mapping and no cryptographic binding. Missing, null,
    malformed, or non-unique evidence fails closed.
-4. In reusable mode, dynamically admit that called SHA through a signed
-   annotated immutable `v1.x.y` tag which peels directly to it, a corresponding
-   GitHub Release whose REST record has `immutable: true`, and the complete
-   release-provenance schema-v2 asset. Require the repository immutable-release
-   setting to be enabled. Verify the tag with a
-   trusted primary signer fingerprint, the manifest's commit/tree/critical-file
-   bindings, receipt schema v1, and a compatible policy with
-   `policy_major == 1`. Never infer a historical run from the current `v1`
-   target. Canonical reusable callers accept compatible v1.x Action-only
+4. In reusable mode, enumerate release candidates through the fully paginated GitHub Releases
+   API and require exactly one published, immutable, non-draft,
+   non-prerelease `v1.x.y` release whose trusted-signer tag peels to `C`, whose
+   single provenance asset has the compatible closed schema/majors and
+   `action.commit_oid == C`, and whose workflow-SHA candidate set contains `W`
+   exactly once. Zero or multiple matching releases or assets fail closed.
+   Require the independently signed annotated `v1` tag object `T` to peel
+   directly to the same `C`, even in the future `W == C` branch. Verify both
+   tags with a trusted primary signer fingerprint, plus the manifest's action
+   root tree and critical-file bindings, receipt schema v1, and a compatible
+   policy with `policy_major == 1`. Never infer a historical run from the
+   current `v1` target. Canonical reusable callers accept compatible v1.x Action-only
    upgrades without a caller or Skill edit; direct callers must update their
    exact pin. A protocol or policy major change requires a coordinated Skill
    update.

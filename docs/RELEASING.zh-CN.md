@@ -8,12 +8,15 @@ Marketplace repository 是 `packages/action` 的 subtree split。发布到
 
 ## 两阶段 Rollout Boundary
 
-本流程用于准备未来的 v1.5.0 release；完成源码修改不表示 release 已发生。
+本流程用于准备兼容修复 v1.5.1。Immutable v1.5.0 release 已存在，但其 live
+GitHub.com canary 证明 annotated `@v1` call 会在 `job.workflow_sha` 与
+`referenced_workflows[].sha` 中返回 selected `v1` tag-object OID，而不是 peeled action
+commit。完成源码修改不表示 v1.5.1 release 已发生。
 
 Release PR 只在 `packages/action` 中 stage reusable workflow。它不得激活 source-root
-caller、repository template 或对应 root 文档。只有 immutable v1.5.0 release 与
-provenance 已发布、`v1.5` 和 `v1` aliases 已验证且 live `@v1` canary 通过后，才由独立
-activation PR 修改 caller/template。
+caller、repository template 或对应 root 文档。只有 immutable v1.5.1 repair 与
+provenance 已发布、更新后的 `v1.5` 和 `v1` aliases 已验证且 replacement live `@v1`
+canary 通过后，才由独立 activation PR 修改 caller/template。
 
 该顺序保证 active source/template caller 不会在 immutable post-run authority 就绪前，
 把 pre-execution trust 委托给 `@v1`。
@@ -21,24 +24,35 @@ activation PR 修改 caller/template。
 ## Preconditions
 
 - Source release commit 已 merge，且是 exact `master` tip。
-- Root `package.json` 与 `packages/action/package.json` 都声明 `1.5.0`。
+- Root `package.json` 与 `packages/action/package.json` 都声明 `1.5.1`。
 - `packages/action/decision-table.json` 声明 `schema_version: 1`、
   `policy_major: 1` 与 `policy_version: 1.4.0`；reviewed frozen raw SHA-256 为
-  `3f0032df69e2015c1dfe198c20a141652b2dcaba520e8749a5d049d31ffd7ad3`。
+  `6c04ccf20e5033639c2ba88931ea10ba7b6577189f91f6eaeea9b2792892b8a7`。
 - Producer protocol major 1 与 producer receipt schema v1 保持兼容。
+- Receipt structural selection 保持 native-action precedence：native action
+  repository/ref 任一 field 存在就选择 direct identity，并忽略 reusable checkout-commit
+  environment；只有两个 native fields 都缺失且 called job tuple exact canonical 时，
+  才能采用 reusable W/C binding。
 - `packages/action/.github/workflows/codex-review-gate.yml` 已存在。其 runtime closure
   只有 full-SHA-pinned
   `actions/checkout@11d5960a326750d5838078e36cf38b85af677262`、
   `actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02`，以及 local
   `./.codex-review-gate-action` use。
+- Reusable job literal 使用 `runs-on: ubuntu-slim`，不读取
+  `vars.CODEX_REVIEW_GATE_RUNNER_LABELS` 或任何 caller-controlled runner selector。
+  GitHub-hosted runner 是 checkout output、worktree 与 receipt production 的 runtime
+  trust root；direct composite caller 保留现有 caller-owned runner 配置。
 - Called workflow checkout 精确使用
   `repository: ${{ job.workflow_repository }}`、
   `ref: ${{ job.workflow_sha }}`、path `.codex-review-gate-action` 与
-  `persist-credentials: false`，不存在 bare checkout 或 PR checkout。
+  `persist-credentials: false`。Step ID 是 `checkout`；official `commit` output 只能通过
+  `CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ steps.checkout.outputs.commit }}`
+  传入 local composite，绝不能来自 workflow-call/caller input。不存在 bare checkout 或
+  PR checkout。
 - 其他 reviewed frozen raw SHA-256 与 generator constants 一致：`action.yml` 为
   `3b73835ec0e8dfb2305f0801ebaa7b3f9ea04e02c72392e822aabcd25d2093be`，
   reusable workflow 为
-  `91720b868b972d947a65fa3cc408d8c866d83cf4d75032f6bfb597b014752bce`，
+  `41477ae365de28e360ddb7dd51f5a79196bdf7408bf3b1073353a69d06414301`，
   `producer-receipt.schema.json` 为
   `89decfcabeeab817a975b1118498375c4eafe730b35e2cb9aa5c4abde6637b77`。
 - Source checks、package checks、tests 与 release split validation 全部通过。
@@ -118,11 +132,12 @@ scripts/release-action-subtree.sh --remote action --branch master --push
 在 action repository 中创建三个 direct signed annotated tags，并要求全部 peel 到同一个
 verified action commit：
 
-1. immutable release tag `v1.5.0`；
+1. immutable release tag `v1.5.1`；
 2. minor compatibility alias `v1.5`；
 3. major compatibility alias `v1`。
 
-绝不移动 `v1.5.0`，也不修改既有 immutable/older compatibility tags。禁止通用
+绝不移动 `v1.5.0` 或 `v1.5.1`。v1.5.1 release 只推进两个 compatibility
+aliases，不修改任何 immutable 或 older release tag。禁止通用
 `git push -f --tags`。
 
 Generator 会解析 absolute GnuPG executable、清除 inherited `GIT_*` 与 global/system Git
@@ -134,11 +149,12 @@ configuration，并且只在 `git verify-tag --raw` 产生恰好一个 identity-
 predeclared trusted primary fingerprint。Signing subkey fingerprint 可以不同，因此
 primary fingerprint 才是 trust anchor。
 
-本 release session 开始时、替换 local `v1` alias 前，先 fresh probe remote，要求
-`refs/tags/v1.5.0` 与 `refs/tags/v1.5` 的输出都严格为空，并要求两个 local refs 也不
-存在。任一 ref 已存在时必须停下审计，绝不覆盖 immutable 或 minor release ref。随后只
-读取一次 remote `v1` tag-object OID，并把它持久化为 release evidence。后续 exact
-lease 必须使用这个事先观察到的值，不能把 alias push 前才首次读取的新值当作可信基准。
+本 release session 开始时、替换两个 local aliases 前，先 fresh probe remote，要求
+`refs/tags/v1.5.1` 的输出严格为空，并要求该 local ref 不存在。它已存在时
+必须停下审计，绝不覆盖 immutable release ref。分别只读取一次已存在的 remote
+`v1.5` 与 `v1` tag-object OIDs，并持久化为 release evidence。后续 exact leases
+必须使用这两个事先观察到的值，不能把 alias push 前才首次读取的新值
+当作可信基准。
 
 三个 local tags 必须使用同一个 resolved GnuPG executable 与保持不变的 keyring：
 
@@ -146,23 +162,26 @@ lease 必须使用这个事先观察到的值，不能把 alias push 前才首�
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-release_evidence_path="v1.5.0-expected-remote-v1-tag-object.txt"
+release_evidence_path="v1.5.1-expected-remote-alias-tag-objects.tsv"
 test ! -e "$release_evidence_path"
 remote_immutable_record="$(
-  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5.0
-)"
-remote_minor_record="$(
-  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5.1
 )"
 test -z "$remote_immutable_record"
-test -z "$remote_minor_record"
-for release_ref in refs/tags/v1.5.0 refs/tags/v1.5; do
-  if git -C "$action_repo_path" show-ref --verify --quiet "$release_ref"; then
-    exit 1
-  else
-    test "$?" -eq 1
-  fi
-done
+if git -C "$action_repo_path" \
+  show-ref --verify --quiet refs/tags/v1.5.1; then
+  exit 1
+else
+  test "$?" -eq 1
+fi
+remote_v1_5_record="$(
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5
+)"
+expected_remote_v1_5_tag_object_oid="${remote_v1_5_record%%$'\t'*}"
+test "$remote_v1_5_record" = \
+  "$expected_remote_v1_5_tag_object_oid"$'\trefs/tags/v1.5'
+test "${#expected_remote_v1_5_tag_object_oid}" -eq 40
+[[ "$expected_remote_v1_5_tag_object_oid" != *[!0-9a-f]* ]]
 remote_v1_record="$(
   git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1
 )"
@@ -171,7 +190,9 @@ test "$remote_v1_record" = \
   "$expected_remote_v1_tag_object_oid"$'\trefs/tags/v1'
 test "${#expected_remote_v1_tag_object_oid}" -eq 40
 [[ "$expected_remote_v1_tag_object_oid" != *[!0-9a-f]* ]]
-printf '%s\n' "$expected_remote_v1_tag_object_oid" > "$release_evidence_path"
+printf '%s\t%s\n' \
+  "$expected_remote_v1_5_tag_object_oid" \
+  "$expected_remote_v1_tag_object_oid" > "$release_evidence_path"
 
 action_release_commit="$(
   git -C "$action_repo_path" rev-parse 'refs/heads/master^{commit}'
@@ -183,13 +204,13 @@ git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
   -c "gpg.openpgp.program=$release_gpg_path" \
-  tag -s -a v1.5.0 "$action_release_commit" \
-  -m "codex-review-gate-action v1.5.0"
+  tag -s -a v1.5.1 "$action_release_commit" \
+  -m "codex-review-gate-action v1.5.1"
 git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
   -c "gpg.openpgp.program=$release_gpg_path" \
-  tag -s -a v1.5 "$action_release_commit" \
+  tag -f -s -a v1.5 "$action_release_commit" \
   -m "codex-review-gate-action v1.5"
 git -C "$action_repo_path" \
   -c gpg.format=openpgp \
@@ -222,24 +243,30 @@ npm run release:provenance -- \
   --action-repository JoeyTeng/codex-review-gate-action \
   --action-commit "$action_release_commit" \
   --action-default-ref refs/heads/master \
-  --immutable-tag-ref refs/tags/v1.5.0 \
+  --immutable-tag-ref refs/tags/v1.5.1 \
   --minor-tag-ref refs/tags/v1.5 \
   --major-tag-ref refs/tags/v1 \
-  --output v1.5.0-release-provenance.json
+  --output v1.5.1-release-provenance.json
 ```
 
-Generator 会在 create-only output 发布前检查两次 source/action default refs 与三个 local tag
-refs，第二次紧邻 final atomic hard link；它绝不覆盖或删除既有 output path。结合 generation 内部的 ref
-checks，这只会缩小本地 TOCTOU window，不会为 source/action 两个 repositories 或多个
-refs 建立 atomic snapshot。Remote publication 前后仍必须使用下文的 exact lease/CAS
-boundary，并重新读取 remote ref、tag-object 与 peeled-commit values。
+Generator 会在 create-only publication 前检查 source/action default refs 与三个 local tag
+refs，包括紧邻 atomic hard link 前的检查，并在 publication 后做 final revalidation。它绝不
+覆盖既有 output path。如果 post-publication revalidation 失败，failure handler 既不
+修改也不 unlink final path，CLI 以 nonzero 退出。如果 path 仍存在，对它做
+audit/quarantine；concurrent actor 可能已经移走或替换它，因此该失败不保证 path 仍存在，
+也不保证 content identity。禁止上传该 output。Audit 后只能使用新的 absent output
+path 重试，禁止覆盖旧 path。
+结合 generation 内部的 ref checks，这只会缩小本地 TOCTOU window，不会为
+source/action 两个 repositories 或多个 refs 建立 atomic snapshot。Remote publication 前后仍必须
+使用下文的 exact lease/CAS boundary，并重新读取 remote ref、tag-object 与
+peeled-commit values。
 
 Production 中禁止 `--test-only-skip-signature-verification`；它只允许在同时满足两个显式
 test guards 的 hermetic tests 中使用。
 
 Deterministic asset 的 schema 是
 `urn:joeyteng:codex-review-gate:release-provenance:2`，`schema_version: 2`，
-`release: 1.5.0`。除这些 identity fields 外，exact top-level map 为
+`release: 1.5.1`。除这些 identity fields 外，exact top-level map 为
 `compatibility`、`source`、`action`、`runtime_closure`、`tags`、`proofs`、
 `released_tree`、`critical_files` 与 `contracts`。
 
@@ -263,8 +290,14 @@ Deterministic asset 的 schema 是
   `immutable_reference` 绑定 exact action SHA；还要有 exact `source_checkout`、exact
   local action use 与 closed two-entry external action list；
   `contracts.producer_receipt.source_checkout` 必须复制同一个 checkout object；
-- exact-attempt `referenced_workflows` selection，以及其 selected SHA 和 receipt
-  `job.workflow_sha` 到 `release-provenance.action.commit_oid` 的 cross-bind；
+- exact-attempt `referenced_workflows` selection 与 cross-bind，定义 `W ==
+  referenced_workflows[].sha == receipt job.workflow_sha == producer.action.ref`；`W` 必须
+  恰好等于 `runtime_closure.called_workflow.workflow_sha_resolution.candidates` 中一个
+  declared value：current-live `W == T == tags.v1.tag_object_oid`，或 future `W == C ==
+  action.commit_oid`。两个分支都要求 independently signed `T` direct peel 到 `C ==
+  tags.v1.peeled_commit_oid == action.commit_oid`；full-SHA-pinned checkout output commit 与
+  receipt `producer.action.commit_sha` 也必须等于 `C`。其他 object type、nested tag、零个或
+  多个 candidate match 都 fail closed；
 - exact 四项 SHA-domain 禁令：不得要求 exact run-attempt `head_sha` 或 Artifact API
   `workflow_run.head_sha` 等于 selected receipt status head；不得要求 exact run-attempt
   `head_sha` 等于 `GITHUB_WORKFLOW_SHA`；也不得要求 `GITHUB_WORKFLOW_SHA` 等于
@@ -278,13 +311,17 @@ Point-in-time verification 仍不证明 historical/future revocation freshness�
 
 ## 按安全顺序发布
 
-先准备不含任何 SHA placeholder 的 `v1.5.0-release-notes.md`。内容必须说明：
+先准备不含任何 SHA placeholder 的 `v1.5.1-release-notes.md`。内容必须说明：
 
 - post-activation canonical caller：
   `jobs.<job>.uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`；
-- floating `@v1` 是集中式 pre-execution trust boundary；post-run authority 来自 exact
-  `job.workflow_sha`、exact-attempt `referenced_workflows` 与 trusted-signer immutable
-  release/provenance；
+- floating `@v1` 是集中式 pre-execution trust boundary；`job.workflow_sha`、
+  exact-attempt `referenced_workflows[].sha` 与 receipt `producer.action.ref` 定义 `W`。说明
+  当前 live shape 是 `W == T == tags.v1.tag_object_oid`，闭合的第二 candidate 是 future
+  `W == C == action.commit_oid`；两个分支都验证 independently signed `T`、其到 `C` 的
+  direct peel，以及 called-workflow-controlled
+  checkout output commit、receipt `producer.action.commit_sha`、trusted-signer immutable
+  release/provenance action commit 与 root tree 的 equality；
 - 用于 audit 与 direct composite/GHES compatibility 的 actual lower-case action commit；
 - producer protocol major 1、receipt schema v1、decision `policy_major: 1` 与
   `policy_version: 1.4.0`；
@@ -294,22 +331,27 @@ Point-in-time verification 仍不证明 historical/future revocation freshness�
 严格按以下顺序发布，避免 `@v1` consumer 在 immutable release authority 就绪前看到新
 runtime：
 
-1. 只 push `refs/tags/v1.5.0`，禁止 force；随后验证 remote tag-object OID 与 peeled
+1. 只 push `refs/tags/v1.5.1`，禁止 force；随后验证 remote tag-object OID 与 peeled
    action commit。
-2. 为 `v1.5.0` 创建 draft GitHub Release，在 draft 状态附上 final notes 与
-   `v1.5.0-release-provenance.json`。
-3. 重查 immutable-release repository setting、draft tag、asset name、asset SHA-256 与
+2. 为 `v1.5.1` 创建 draft GitHub Release，在 draft 状态附上 final notes 与
+   `v1.5.1-release-provenance.json`。
+3. 重查 immutable-release repository setting，要求 draft release 的 `tag_name`/`tagName`
+   exact 为 `v1.5.1`；紧邻 publish 前重读 remote direct tag-object OID 与 peeled commit，
+   并要求两者分别等于 generated manifest 的
+   `tags["v1.5.1"].tag_object_oid/peeled_commit_oid`。同时重查 asset name、asset SHA-256 与
    notes，然后 publish draft。
-4. 要求 release REST object exact 报告 `immutable: true`。运行
-   `gh release verify v1.5.0 --repo JoeyTeng/codex-review-gate-action` 与
-   `gh release verify-asset v1.5.0 v1.5.0-release-provenance.json --repo JoeyTeng/codex-review-gate-action`，并独立重新下载和
-   digest-check asset。
+4. Publish 后要求 release REST object 报告 exact tag name `v1.5.1`、`draft: false`、
+   `prerelease: false` 与 `immutable: true`。运行下列命令前后，都要重读 remote
+   direct tag-object OID/peeled commit 并与同一 manifest fields 比较：
+   `gh release verify v1.5.1 --repo JoeyTeng/codex-review-gate-action` 与
+   `gh release verify-asset v1.5.1 v1.5.1-release-provenance.json --repo JoeyTeng/codex-review-gate-action`，并独立重新下载和
+   digest-check asset。任何 mismatch 都必须在 compatibility aliases 移动前 fail closed。
 5. 只有上述检查成功后，才从 freshly downloaded、且与 generated asset 逐字节相同的
    provenance asset 中读取 exact `v1.5` 与 `v1` tag-object OIDs。要求两个 manifest
    entries 都描述已 admitted 的 signed annotated tags，且 peel 到 manifest 的
    `action.commit_oid`；随后重新验证这些 exact local objects。一次 atomic push 必须直接
-   使用这些 OIDs，而不是 mutable local tag refs。对事先观察到的 remote `v1`
-   tag-object OID 使用 exact `--force-with-lease`。必须要求 atomic push support；任一
+   使用这些 OIDs，而不是 mutable local tag refs。对事先观察到的 remote `v1.5` 与 `v1`
+   tag-object OIDs 分别使用 exact `--force-with-lease`。必须要求 atomic push support；任一
    ref 被拒绝时两个 aliases 都保持不变。
 6. 重读两个 remote alias tag-object OIDs 与 peeled commits，并要求分别 exact 等于
    manifest-bound OIDs 与 action commit。把 generator rerun 到 verification file，并
@@ -321,43 +363,99 @@ Immutable tag 与 draft-to-published release 步骤如下：
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-git -C "$action_repo_path" push origin \
-  refs/tags/v1.5.0:refs/tags/v1.5.0
+generated_provenance_path="v1.5.1-release-provenance.json"
+manifest_immutable_tag_binding="$(
+  jq -er '
+      def oid:
+        type == "string" and test("^[0-9a-f]{40}$");
+      . as $manifest
+      | ($manifest.tags["v1.5.1"]) as $tag
+      | select(
+          $manifest.release == "1.5.1" and
+          ($manifest.action.commit_oid | oid) and
+          $tag.ref == "refs/tags/v1.5.1" and
+          $tag.annotated == true and
+          ($tag.tag_object_oid | oid) and
+          ($tag.peeled_commit_oid | oid) and
+          $tag.peeled_commit_oid == $manifest.action.commit_oid
+        )
+      | [$tag.tag_object_oid, $tag.peeled_commit_oid]
+      | @tsv
+    ' "$generated_provenance_path"
+)"
+IFS=$'\t' read -r \
+  expected_immutable_tag_object_oid \
+  expected_action_release_commit <<< "$manifest_immutable_tag_binding"
+test "$manifest_immutable_tag_binding" = \
+  "$expected_immutable_tag_object_oid"$'\t'"$expected_action_release_commit"
 
-gh release create v1.5.0 \
+verify_remote_immutable_tag() {
+  local remote_tag_record
+  local remote_peeled_record
+
+  remote_tag_record="$(
+    git -C "$action_repo_path" ls-remote --tags \
+      origin refs/tags/v1.5.1
+  )"
+  test "$remote_tag_record" = \
+    "$expected_immutable_tag_object_oid"$'\trefs/tags/v1.5.1'
+  remote_peeled_record="$(
+    git -C "$action_repo_path" ls-remote --tags \
+      origin 'refs/tags/v1.5.1^{}'
+  )"
+  test "$remote_peeled_record" = \
+    "$expected_action_release_commit"$'\trefs/tags/v1.5.1^{}'
+}
+
+git -C "$action_repo_path" push origin \
+  refs/tags/v1.5.1:refs/tags/v1.5.1
+
+gh release create v1.5.1 \
   --repo JoeyTeng/codex-review-gate-action \
   --draft \
   --verify-tag \
-  --title "codex-review-gate-action v1.5.0" \
-  --notes-file v1.5.0-release-notes.md \
-  v1.5.0-release-provenance.json
+  --title "codex-review-gate-action v1.5.1" \
+  --notes-file v1.5.1-release-notes.md \
+  v1.5.1-release-provenance.json
 
-gh release edit v1.5.0 \
+draft_release_binding="$(
+  gh release view v1.5.1 \
+    --repo JoeyTeng/codex-review-gate-action \
+    --json tagName,isDraft \
+    --jq '[.tagName, .isDraft] | @tsv'
+)"
+test "$draft_release_binding" = $'v1.5.1\ttrue'
+verify_remote_immutable_tag
+
+gh release edit v1.5.1 \
   --repo JoeyTeng/codex-review-gate-action \
   --draft=false
 
-test "$(
+published_release_binding="$(
   gh api \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2026-03-10' \
-    repos/JoeyTeng/codex-review-gate-action/releases/tags/v1.5.0 \
-    --jq '.immutable'
-)" = true
+    repos/JoeyTeng/codex-review-gate-action/releases/tags/v1.5.1 \
+    --jq '[.tag_name, .draft, .prerelease, .immutable] | @tsv'
+)"
+test "$published_release_binding" = $'v1.5.1\tfalse\tfalse\ttrue'
+verify_remote_immutable_tag
 
-gh release verify v1.5.0 \
+gh release verify v1.5.1 \
   --repo JoeyTeng/codex-review-gate-action
 gh release verify-asset \
-  v1.5.0 \
-  v1.5.0-release-provenance.json \
+  v1.5.1 \
+  v1.5.1-release-provenance.json \
   --repo JoeyTeng/codex-review-gate-action
 
-published_provenance_path="v1.5.0-published-release-provenance.json"
+published_provenance_path="v1.5.1-published-release-provenance.json"
 test ! -e "$published_provenance_path"
-gh release download v1.5.0 \
+gh release download v1.5.1 \
   --repo JoeyTeng/codex-review-gate-action \
-  --pattern v1.5.0-release-provenance.json \
+  --pattern v1.5.1-release-provenance.json \
   --output "$published_provenance_path"
-cmp -s v1.5.0-release-provenance.json "$published_provenance_path"
+cmp -s v1.5.1-release-provenance.json "$published_provenance_path"
+verify_remote_immutable_tag
 ```
 
 Alias push 刻意与 immutable tag/release 分开：
@@ -372,9 +470,9 @@ lower-case representation。
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-generated_provenance_path="v1.5.0-release-provenance.json"
-published_provenance_path="v1.5.0-published-release-provenance.json"
-release_evidence_path="v1.5.0-expected-remote-v1-tag-object.txt"
+generated_provenance_path="v1.5.1-release-provenance.json"
+published_provenance_path="v1.5.1-published-release-provenance.json"
+release_evidence_path="v1.5.1-expected-remote-alias-tag-objects.tsv"
 trusted_primary_fingerprint_input="${TRUSTED_RELEASE_PRIMARY_FINGERPRINT:?}"
 release_gpg_path="$(realpath "$(command -v gpg)")"
 test -x "$release_gpg_path"
@@ -413,11 +511,11 @@ manifest_alias_binding="$(
             $manifest.schema ==
               "urn:joeyteng:codex-review-gate:release-provenance:2" and
             $manifest.schema_version == 2 and
-            $manifest.release == "1.5.0" and
+            $manifest.release == "1.5.1" and
             ($commit_oid | oid) and
-            ($manifest.tags["v1.5.0"] |
+            ($manifest.tags["v1.5.1"] |
               admitted_tag(
-                "v1.5.0";
+                "v1.5.1";
                 $commit_oid;
                 $trusted_primary_fingerprint
               )) and
@@ -472,13 +570,18 @@ verify_manifest_tag_object() {
 verify_manifest_tag_object "$expected_v1_5_tag_object_oid"
 verify_manifest_tag_object "$expected_v1_tag_object_oid"
 
-expected_remote_v1_tag_object_oid="$(sed -n '1p' "$release_evidence_path")"
+IFS=$'\t' read -r \
+  expected_remote_v1_5_tag_object_oid \
+  expected_remote_v1_tag_object_oid < "$release_evidence_path"
+test "${#expected_remote_v1_5_tag_object_oid}" -eq 40
 test "${#expected_remote_v1_tag_object_oid}" -eq 40
+[[ "$expected_remote_v1_5_tag_object_oid" != *[!0-9a-f]* ]]
 [[ "$expected_remote_v1_tag_object_oid" != *[!0-9a-f]* ]]
 current_remote_v1_5_record="$(
   git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5
 )"
-test -z "$current_remote_v1_5_record"
+test "$current_remote_v1_5_record" = \
+  "$expected_remote_v1_5_tag_object_oid"$'\trefs/tags/v1.5'
 current_remote_v1_record="$(
   git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1
 )"
@@ -486,6 +589,7 @@ test "$current_remote_v1_record" = \
   "$expected_remote_v1_tag_object_oid"$'\trefs/tags/v1'
 
 git -C "$action_repo_path" push --atomic \
+  --force-with-lease="refs/tags/v1.5:$expected_remote_v1_5_tag_object_oid" \
   --force-with-lease="refs/tags/v1:$expected_remote_v1_tag_object_oid" \
   origin \
   "$expected_v1_5_tag_object_oid:refs/tags/v1.5" \
@@ -514,21 +618,38 @@ verify_remote_alias refs/tags/v1 "$expected_v1_tag_object_oid"
 ```
 
 Atomic update 失败时禁止改用 separate alias pushes。重读 remote state、解决冲突，并重跑
-完整 admission proof。把持久化的 pre-release `v1` tag-object OID 与其他 release
+完整 admission proof。把持久化的两个 pre-release alias tag-object OIDs 与其他 release
 evidence 一并保留。禁止用 local alias ref 替换任一 manifest-bound source OID，也禁止在
 validation 后重新解析这些 OIDs。
 
 ## Live Canary 与 Activation
 
-使用已发布 canonical caller `@v1` 运行 GitHub.com canary。Activation 前必须证明：
+把 v1.5.0 canary 视为 fail-closed compatibility finding，而不是 erratum：其 immutable
+provenance contract 错把 GitHub selected annotated `v1` tag-object OID 当成 peeled action
+commit。禁止用 digest-keyed exception admit v1.5.0，也禁止修改其 immutable release。
+发布 v1.5.1 并推进两个 aliases 后，使用 canonical caller 选择 `@v1` 重新运行
+GitHub.com canary。Activation 前必须证明：
 
-- called job 的 `job.workflow_repository/file_path/ref/sha` 是 canonical tuple 与 exact
-  v1.5.0 action commit；
-- receipt 把该 job repository/SHA 映射为 `producer.action` with `immutable: true`；
+- called job 的 `job.workflow_repository/file_path/ref/sha` 是 canonical tuple，且 SHA `W` 恰好
+  等于一个 declared workflow-SHA resolution candidate：current-live signed annotated `v1` tag
+  object `T`，或 future exact action commit `C`；
+- receipt 把该 job repository/selected-object SHA 映射为 `producer.action.ref` with
+  `immutable: true`；full-SHA-pinned checkout 的 `steps.checkout.outputs.commit` 只能经
+  called-workflow-controlled `CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA` environment
+  binding 传入 local composite，且 receipt `producer.action.commit_sha` 等于该 peeled
+  action commit，不能来自 workflow-call/caller input；
 - exact run-attempt response 恰好含有一个 canonical `referenced_workflows` member，
-  其 SHA 匹配 receipt 与 release provenance；
+  其 SHA 匹配 `W == job.workflow_sha == producer.action.ref` 与 selected manifest candidate；
+- independently signed exact `v1` tag object `T` 在 trusted primary signer 下验签通过，
+  并 direct peel 到 `C == release-provenance.action.commit_oid`，即使是 future `W == C`
+  分支也一样；signed immutable `v1.5.1` tag peel 到同一
+  commit，checkout output、receipt `producer.action.commit_sha`、action root tree 与
+  critical files 都匹配 provenance asset；
 - receipt artifact、status membership、GraphQL status re-read 与独立归约的 provider
   evidence 都通过 stable checks；
+- reusable job 在 literal `ubuntu-slim` 上运行，且没有 caller repository variable 选择
+  self-hosted runner；这是 runtime trust boundary，不是 cryptographic 或 OIDC
+  attestation；
 - canary 未 checkout 或执行 PR code。
 
 只有这时才能创建独立 activation PR，把 source-root caller、template caller 与

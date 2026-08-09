@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const RELEASE = "1.5.0";
+const RELEASE = "1.5.1";
 const PROVENANCE_SCHEMA_VERSION = 2;
 const PRODUCER_PROTOCOL_MAJOR = 1;
 const RECEIPT_SCHEMA_VERSION = 1;
@@ -38,6 +38,10 @@ const REUSABLE_WORKFLOW_REF = "refs/tags/v1";
 const REUSABLE_WORKFLOW_CHECKOUT_PATH = ".codex-review-gate-action";
 const REUSABLE_WORKFLOW_LOCAL_ACTION_USE =
   `./${REUSABLE_WORKFLOW_CHECKOUT_PATH}`;
+const CHECKED_OUT_ACTION_COMMIT_ENVIRONMENT =
+  "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA";
+const CHECKOUT_COMMIT_OUTPUT_EXPRESSION =
+  "${{ steps.checkout.outputs.commit }}";
 const REUSABLE_WORKFLOW_CANONICAL_REFERENCE =
   `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${REUSABLE_WORKFLOW_SELECTOR}`;
 const DEFAULT_STATUS_CONTEXT = "codex/review-gate";
@@ -50,9 +54,9 @@ const DECISION_TABLE_SCHEMA_ID =
 const FROZEN_ACTION_DEFINITION_SHA256 =
   "3b73835ec0e8dfb2305f0801ebaa7b3f9ea04e02c72392e822aabcd25d2093be";
 const FROZEN_REUSABLE_WORKFLOW_SHA256 =
-  "91720b868b972d947a65fa3cc408d8c866d83cf4d75032f6bfb597b014752bce";
+  "41477ae365de28e360ddb7dd51f5a79196bdf7408bf3b1073353a69d06414301";
 const FROZEN_DECISION_TABLE_SHA256 =
-  "3f0032df69e2015c1dfe198c20a141652b2dcaba520e8749a5d049d31ffd7ad3";
+  "6c04ccf20e5033639c2ba88931ea10ba7b6577189f91f6eaeea9b2792892b8a7";
 const PROVENANCE_SCHEMA_ID =
   "urn:joeyteng:codex-review-gate:release-provenance:2";
 const CHECKOUT_SHA =
@@ -64,11 +68,34 @@ const RUN_ATTEMPT_REQUIRED_EQUALITIES = Object.freeze([
   "run_attempt-equals-receipt-producer-run-attempt",
   "repository-full_name-equals-receipt-producer-repository",
 ]);
+const WORKFLOW_SHA_RESOLUTION_POLICY = Object.freeze({
+  manifest_candidates_field:
+    "runtime_closure.called_workflow.workflow_sha_resolution.candidates",
+  selection:
+    "selected-sha-equals-exactly-one-validated-release-provenance-candidate",
+  candidate_values_must_equal_declared_fields: true,
+  candidate_kinds: Object.freeze([
+    Object.freeze({
+      kind: "signed-major-tag-object",
+      workflow_sha_field: "tags.v1.tag_object_oid",
+      action_commit_field: "tags.v1.peeled_commit_oid",
+    }),
+    Object.freeze({
+      kind: "exact-action-commit",
+      workflow_sha_field: "action.commit_oid",
+      action_commit_field: "action.commit_oid",
+    }),
+  ]),
+  common_required_equality:
+    "tags.v1.peeled_commit_oid-equals-action.commit_oid",
+});
 const REFERENCED_WORKFLOW_REQUIRED_EQUALITIES = Object.freeze([
   `selected-path-equals-${REUSABLE_WORKFLOW_CANONICAL_REFERENCE}`,
   `selected-ref-equals-${REUSABLE_WORKFLOW_REF}`,
   "selected-sha-equals-receipt-producer-job-workflow_sha",
-  "selected-sha-equals-validated-release-provenance-action-commit_oid",
+  "selected-sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
+  "each-workflow-sha-resolution-candidate-value-equals-its-declared-validated-release-provenance-field",
+  "validated-release-provenance-tags-v1-peeled_commit_oid-equals-validated-release-provenance-action-commit_oid",
   "selected-path-repository-and-file-equal-receipt-producer-job-workflow_repository-and-workflow_file_path",
 ]);
 const CALLED_WORKFLOW_REQUIRED_EQUALITIES = Object.freeze([
@@ -76,10 +103,15 @@ const CALLED_WORKFLOW_REQUIRED_EQUALITIES = Object.freeze([
   `receipt-producer-job-workflow_file_path-equals-${REUSABLE_WORKFLOW_PATH}`,
   `receipt-producer-job-workflow_ref-equals-${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${REUSABLE_WORKFLOW_REF}`,
   "receipt-producer-job-workflow_sha-is-lower-case-40-hex",
-  "receipt-producer-job-workflow_sha-equals-validated-release-provenance-action-commit_oid",
+  "receipt-producer-job-workflow_sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
+  "each-workflow-sha-resolution-candidate-value-equals-its-declared-validated-release-provenance-field",
+  "validated-release-provenance-tags-v1-peeled_commit_oid-equals-validated-release-provenance-action-commit_oid",
   "receipt-producer-action-repository-equals-receipt-producer-job-workflow_repository",
   "receipt-producer-action-ref-equals-receipt-producer-job-workflow_sha",
-  "receipt-producer-action-commit_sha-equals-receipt-producer-job-workflow_sha",
+  "reusable-workflow-source-checkout-id-equals-checkout",
+  "reusable-workflow-gate-checked-out-action-commit-env-equals-steps-checkout-outputs-commit",
+  "receipt-producer-action-commit_sha-equals-reusable-workflow-gate-checked-out-action-commit-env",
+  "receipt-producer-action-commit_sha-equals-validated-release-provenance-action-commit_oid",
   "receipt-producer-action-immutable-is-true",
 ]);
 const ARTIFACT_RUN_REQUIRED_EQUALITIES = Object.freeze([
@@ -109,6 +141,30 @@ const POSITIVE_CONSUMER_REQUIREMENT = Object.freeze({
     receipt_member_state: "success",
   }),
 });
+const RELEASE_PROVENANCE_ADMISSION = Object.freeze({
+  first_admitted_reusable_release: "1.5.1",
+  v1_5_0_complete_asset: Object.freeze({
+    admission: "fail-closed-not-admitted",
+    digest_erratum_supported: false,
+  }),
+});
+const SOURCE_CHECKOUT_BINDINGS = Object.freeze({
+  step_id: "checkout",
+  uses: `actions/checkout@${CHECKOUT_SHA}`,
+  repository: "${{ job.workflow_repository }}",
+  ref: "${{ job.workflow_sha }}",
+  path: REUSABLE_WORKFLOW_CHECKOUT_PATH,
+  persist_credentials: false,
+  commit_output: CHECKOUT_COMMIT_OUTPUT_EXPRESSION,
+  local_action: Object.freeze({
+    step_id: "gate",
+    uses: REUSABLE_WORKFLOW_LOCAL_ACTION_USE,
+    checked_out_action_commit_environment: Object.freeze({
+      name: CHECKED_OUT_ACTION_COMMIT_ENVIRONMENT,
+      value: CHECKOUT_COMMIT_OUTPUT_EXPRESSION,
+    }),
+  }),
+});
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MAX_SMALL_OBJECT_BYTES = 16 * 1024 * 1024;
 const MAX_TREE_ENTRIES = 100_000;
@@ -118,7 +174,7 @@ const SAFE_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const PLACEHOLDER_PATTERN = /<[^<>]+>/;
 
 const EXPECTED_TAGS = Object.freeze({
-  immutable: "v1.5.0",
+  immutable: "v1.5.1",
   minor: "v1.5",
   major: "v1",
 });
@@ -161,7 +217,7 @@ function usage() {
   --source-commit <40-sha> --source-default-ref refs/heads/master \\
   --action-repo <path> --action-repository ${ACTION_REPOSITORY} \\
   --action-commit <40-sha> --action-default-ref refs/heads/master \\
-  --immutable-tag-ref refs/tags/v1.5.0 \\
+  --immutable-tag-ref refs/tags/v1.5.1 \\
   --minor-tag-ref refs/tags/v1.5 --major-tag-ref refs/tags/v1 \\
   --output <path>
 
@@ -826,6 +882,16 @@ function validateReusableWorkflowCheckoutBindings(reusableWorkflow) {
   }
   const checkoutIndex = checkoutIndexes[0];
   const indentation = /^\s*/.exec(lines[checkoutIndex])[0].length;
+  const checkoutIdLine = lines[checkoutIndex - 1];
+  if (
+    checkoutIdLine === undefined ||
+    /^\s*/.exec(checkoutIdLine)[0].length !== indentation ||
+    checkoutIdLine.trim() !== "id: checkout"
+  ) {
+    throw new Error(
+      "reusable workflow source checkout step ID contradicts the closed release contract",
+    );
+  }
   const expectedFollowingLines = [
     { indentation, text: "with:" },
     {
@@ -855,13 +921,52 @@ function validateReusableWorkflowCheckoutBindings(reusableWorkflow) {
       );
     }
   }
-  return {
-    uses: `actions/checkout@${CHECKOUT_SHA}`,
-    repository: "${{ job.workflow_repository }}",
-    ref: "${{ job.workflow_sha }}",
-    path: REUSABLE_WORKFLOW_CHECKOUT_PATH,
-    persist_credentials: false,
-  };
+
+  const localActionUse = `uses: ${REUSABLE_WORKFLOW_LOCAL_ACTION_USE}`;
+  const localActionIndexes = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].trim().replace(/\s+#.*$/, "") === localActionUse) {
+      localActionIndexes.push(index);
+    }
+  }
+  if (localActionIndexes.length !== 1) {
+    throw new Error(
+      "reusable workflow must contain exactly one exact local action step",
+    );
+  }
+  const localActionIndex = localActionIndexes[0];
+  const localActionIndentation = /^\s*/.exec(lines[localActionIndex])[0].length;
+  const expectedLocalActionLines = [
+    {
+      index: localActionIndex - 1,
+      indentation: localActionIndentation,
+      text: "id: gate",
+    },
+    {
+      index: localActionIndex + 1,
+      indentation: localActionIndentation,
+      text: "env:",
+    },
+    {
+      index: localActionIndex + 2,
+      indentation: localActionIndentation + 2,
+      text:
+        `${CHECKED_OUT_ACTION_COMMIT_ENVIRONMENT}: ${CHECKOUT_COMMIT_OUTPUT_EXPRESSION}`,
+    },
+  ];
+  for (const expectedLine of expectedLocalActionLines) {
+    const actualLine = lines[expectedLine.index];
+    if (
+      actualLine === undefined ||
+      /^\s*/.exec(actualLine)[0].length !== expectedLine.indentation ||
+      actualLine.trim() !== expectedLine.text
+    ) {
+      throw new Error(
+        "reusable workflow checkout output binding contradicts the closed release contract",
+      );
+    }
+  }
+  return SOURCE_CHECKOUT_BINDINGS;
 }
 
 function decisionRow(table, id) {
@@ -901,6 +1006,96 @@ function exactJsonEqual(actual, expected) {
     );
   }
   return actual === expected;
+}
+
+export function selectWorkflowShaResolutionCandidate(workflowSha, resolution) {
+  assertExactSha(workflowSha, "called workflow SHA");
+  const expectedKeys = ["action_commit_oid", "candidates", "selection"];
+  if (
+    resolution === null ||
+    typeof resolution !== "object" ||
+    Array.isArray(resolution) ||
+    JSON.stringify(Object.keys(resolution).sort()) !==
+      JSON.stringify(expectedKeys) ||
+    resolution.selection !==
+      "selected-sha-equals-exactly-one-candidate" ||
+    !FULL_SHA_PATTERN.test(resolution.action_commit_oid) ||
+    !Array.isArray(resolution.candidates) ||
+    resolution.candidates.length !==
+      WORKFLOW_SHA_RESOLUTION_POLICY.candidate_kinds.length
+  ) {
+    throw new Error("called workflow SHA resolution is not the closed contract");
+  }
+
+  const candidates = resolution.candidates;
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const descriptor = WORKFLOW_SHA_RESOLUTION_POLICY.candidate_kinds[index];
+    if (
+      candidate === null ||
+      typeof candidate !== "object" ||
+      Array.isArray(candidate) ||
+      JSON.stringify(Object.keys(candidate).sort()) !==
+        JSON.stringify([
+          "action_commit_field",
+          "action_commit_oid",
+          "kind",
+          "workflow_sha",
+          "workflow_sha_field",
+        ]) ||
+      candidate.kind !== descriptor.kind ||
+      candidate.workflow_sha_field !== descriptor.workflow_sha_field ||
+      candidate.action_commit_field !== descriptor.action_commit_field ||
+      !FULL_SHA_PATTERN.test(candidate.workflow_sha) ||
+      candidate.action_commit_oid !== resolution.action_commit_oid
+    ) {
+      throw new Error("called workflow SHA candidate is not the closed contract");
+    }
+  }
+
+  const matches = candidates.filter(
+    (candidate) => candidate.workflow_sha === workflowSha,
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      "called workflow SHA must equal exactly one release provenance candidate",
+    );
+  }
+  return matches[0];
+}
+
+function buildWorkflowShaResolution(tags, actionCommit) {
+  const resolution = {
+    selection: "selected-sha-equals-exactly-one-candidate",
+    action_commit_oid: actionCommit,
+    candidates: [
+      {
+        kind: "signed-major-tag-object",
+        workflow_sha_field: "tags.v1.tag_object_oid",
+        workflow_sha: tags.v1.tag_object_oid,
+        action_commit_field: "tags.v1.peeled_commit_oid",
+        action_commit_oid: tags.v1.peeled_commit_oid,
+      },
+      {
+        kind: "exact-action-commit",
+        workflow_sha_field: "action.commit_oid",
+        workflow_sha: actionCommit,
+        action_commit_field: "action.commit_oid",
+        action_commit_oid: actionCommit,
+      },
+    ],
+  };
+  if (
+    selectWorkflowShaResolutionCandidate(
+      tags.v1.tag_object_oid,
+      resolution,
+    ).kind !== "signed-major-tag-object" ||
+    selectWorkflowShaResolutionCandidate(actionCommit, resolution).kind !==
+      "exact-action-commit"
+  ) {
+    throw new Error("called workflow SHA candidates are not uniquely selectable");
+  }
+  return resolution;
 }
 
 function validateDecisionTable(table) {
@@ -996,7 +1191,15 @@ function validateDecisionTable(table) {
     table.producer_receipt_boundary?.canonical_reusable_workflow_reference !==
       REUSABLE_WORKFLOW_CANONICAL_REFERENCE ||
     table.producer_receipt_boundary?.caller_selector !==
-      REUSABLE_WORKFLOW_SELECTOR
+      REUSABLE_WORKFLOW_SELECTOR ||
+    !exactJsonEqual(
+      table.producer_receipt_boundary?.release_provenance_admission,
+      RELEASE_PROVENANCE_ADMISSION,
+    ) ||
+    !exactJsonEqual(
+      table.producer_receipt_boundary?.source_checkout,
+      SOURCE_CHECKOUT_BINDINGS,
+    )
   ) {
     throw new Error("decision table status or receipt contract contradicts release policy");
   }
@@ -1048,11 +1251,12 @@ function validateDecisionTable(table) {
         selection: "exactly-one-exact-called-workflow-member",
         expected_path: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
         expected_ref: REUSABLE_WORKFLOW_REF,
+        workflow_sha_resolution: WORKFLOW_SHA_RESOLUTION_POLICY,
         required_equalities: [...REFERENCED_WORKFLOW_REQUIRED_EQUALITIES],
         rerun_resolution:
           "Validate referenced_workflows from the exact receipt run attempt; never substitute the current v1 target or evidence from another attempt.",
         tag_drift:
-          "A later v1 move does not change the exact called-workflow SHA recorded for an earlier run attempt.",
+          "A later v1 move does not change the exact workflow SHA recorded for an earlier run attempt or its selection from the release provenance candidate set.",
         authority:
           "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding",
       },
@@ -1074,7 +1278,7 @@ function validateDecisionTable(table) {
         caller_identity_role:
           "producer.environment.GITHUB_WORKFLOW_REF/SHA-identifies-caller-workflow-file",
         called_job_identity_role:
-          "producer.job.workflow_ref/SHA/repository/file_path-identifies-workflow-file-defining-current-job",
+          "producer.job.workflow_ref/repository/file_path-identifies-workflow-file-defining-current-job-and-workflow_sha-identifies-selected-workflow-object-under-the-closed-resolution-policy",
         required_equalities: [...CALLED_WORKFLOW_REQUIRED_EQUALITIES],
         caller_called_sha_domain_separation:
           "GITHUB_WORKFLOW_SHA identifies the caller workflow file and must not be required to equal producer.job.workflow_sha for a reusable invocation.",
@@ -1502,6 +1706,10 @@ async function generateProvenance(options) {
   if (sourcePackageJson?.version !== RELEASE) {
     throw new Error(`source package version must be ${RELEASE}`);
   }
+  const workflowShaResolution = buildWorkflowShaResolution(
+    tags,
+    actionCommit,
+  );
 
   const manifest = {
     schema: PROVENANCE_SCHEMA_ID,
@@ -1556,7 +1764,9 @@ async function generateProvenance(options) {
         caller_reference: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
         immutable_reference:
           `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${actionCommit}`,
+        workflow_sha_resolution: workflowShaResolution,
         resolved_commit_oid: actionCommit,
+        peeled_action_commit_oid: actionCommit,
         release_path: reusableWorkflow.release_path,
         source_path: reusableWorkflow.source_path,
         blob_oid: reusableWorkflow.blob_oid,
@@ -1573,8 +1783,13 @@ async function generateProvenance(options) {
       source_subtree_equals_action_root: true,
       source_subtree_tree_oid: sourceActionTree,
       action_root_tree_oid: actionTree,
+      critical_files_action_commit_oid: actionCommit,
       all_tags_annotated: true,
       all_tags_peel_to_action_commit: true,
+      workflow_sha_resolution_candidates_unique: true,
+      major_tag_object_is_workflow_sha_candidate: true,
+      action_commit_is_workflow_sha_candidate: true,
+      major_tag_peels_to_action_commit: true,
       all_tag_signatures_verified: !options.testOnlySkipSignatureVerification,
       production_signature_verification_required: true,
       revocation_freshness_checked: false,
@@ -1582,6 +1797,7 @@ async function generateProvenance(options) {
       release_asset_is_signed_attestation: false,
     },
     released_tree: {
+      action_commit_oid: actionCommit,
       command: ["git", ...lsTreeArguments],
       raw_record_fields: ["mode", "type", "object_oid", "path"],
       raw_record_separators: ["SP", "SP", "TAB", "NUL"],
@@ -1615,6 +1831,7 @@ async function generateProvenance(options) {
         caller_reference: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
         immutable_reference:
           `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${actionCommit}`,
+        action_commit_oid: actionCommit,
       },
       producer_receipt_schema: {
         release_path: receiptSchema.release_path,
@@ -1687,6 +1904,7 @@ async function generateProvenance(options) {
         schema_id: RECEIPT_SCHEMA_ID,
         schema_version: RECEIPT_SCHEMA_VERSION,
         producer_protocol_major: PRODUCER_PROTOCOL_MAJOR,
+        release_provenance_admission: RELEASE_PROVENANCE_ADMISSION,
         github_cloud_only: true,
         exact_called_workflow_sha_required: true,
         called_workflow_authority: {
@@ -1697,12 +1915,15 @@ async function generateProvenance(options) {
           caller_reference: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
           immutable_reference:
             `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${actionCommit}`,
+          workflow_sha_resolution: workflowShaResolution,
+          workflow_sha_resolution_policy: WORKFLOW_SHA_RESOLUTION_POLICY,
           accepted_resolved_sha: actionCommit,
+          peeled_action_commit_oid: actionCommit,
           required_equalities: [...CALLED_WORKFLOW_REQUIRED_EQUALITIES],
           caller_identity_role:
             "producer.environment.GITHUB_WORKFLOW_REF/SHA-identifies-caller-workflow-file",
           called_job_identity_role:
-            "producer.job.workflow_ref/SHA/repository/file_path-identifies-workflow-file-defining-current-job",
+            "producer.job.workflow_ref/repository/file_path-identifies-workflow-file-defining-current-job-and-workflow_sha-identifies-selected-workflow-object-under-the-closed-resolution-policy",
         },
         run_attempt_api: {
           method: "GET",
@@ -1717,12 +1938,13 @@ async function generateProvenance(options) {
             selection: "exactly-one-exact-called-workflow-member",
             expected_path: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
             expected_ref: REUSABLE_WORKFLOW_REF,
-            expected_sha: actionCommit,
+            workflow_sha_resolution: workflowShaResolution,
+            workflow_sha_resolution_policy: WORKFLOW_SHA_RESOLUTION_POLICY,
             required_equalities: [...REFERENCED_WORKFLOW_REQUIRED_EQUALITIES],
             rerun_resolution:
               "exact-receipt-run-attempt-only-no-current-selector-substitution",
             tag_drift:
-              "later-v1-movement-does-not-change-historical-attempt-sha",
+              "later-v1-movement-does-not-change-historical-attempt-workflow-sha-or-candidate-selection",
             authority:
               "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding",
           },
@@ -1783,7 +2005,8 @@ async function generateProvenance(options) {
         exact_action_bindings: [
           "producer.action.repository-equals-producer.job.workflow_repository",
           "producer.action.ref-equals-producer.job.workflow_sha",
-          "producer.action.commit_sha-equals-producer.job.workflow_sha",
+          "producer.action.commit_sha-equals-CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA",
+          "producer.action.commit_sha-equals-release-provenance.action.commit_oid",
           "producer.action.immutable-is-true"
         ],
         receipt_statuses: {
@@ -1827,7 +2050,7 @@ async function generateProvenance(options) {
       sourceCommit ||
     resolveRefObject(actionRepo, options.actionDefaultRef, "action default ref") !==
       actionCommit ||
-    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.0 tag ref") !==
+    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.1 tag ref") !==
       tags[EXPECTED_TAGS.immutable].tag_object_oid ||
     resolveRefObject(actionRepo, options.minorTagRef, "v1.5 tag ref") !==
       tags[EXPECTED_TAGS.minor].tag_object_oid ||
@@ -1848,7 +2071,7 @@ async function assertReleaseRefsStillStable(options, manifest) {
       manifest.source.commit_oid ||
     resolveRefObject(actionRepo, options.actionDefaultRef, "action default ref") !==
       manifest.action.commit_oid ||
-    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.0 tag ref") !==
+    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.1 tag ref") !==
       manifest.tags[EXPECTED_TAGS.immutable].tag_object_oid ||
     resolveRefObject(actionRepo, options.minorTagRef, "v1.5 tag ref") !==
       manifest.tags[EXPECTED_TAGS.minor].tag_object_oid ||
@@ -1859,17 +2082,40 @@ async function assertReleaseRefsStillStable(options, manifest) {
   }
 }
 
+function isSameStablePublication(identity, expectedIdentity, intendedSize) {
+  return (
+    identity.isFile() &&
+    identity.dev === expectedIdentity.dev &&
+    identity.ino === expectedIdentity.ino &&
+    identity.mode === expectedIdentity.mode &&
+    identity.uid === expectedIdentity.uid &&
+    identity.gid === expectedIdentity.gid &&
+    identity.size === intendedSize
+  );
+}
+
 export async function writeManifest(
   outputPath,
   manifest,
-  { beforePublish, afterStagingValidation, finalPrePublish } = {},
+  {
+    beforePublish,
+    afterStagingValidation,
+    finalPrePublish,
+    afterLink,
+    afterPublish,
+  } = {},
 ) {
   const absoluteOutput = resolve(outputPath);
   await mkdir(dirname(absoluteOutput), { recursive: true });
   const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  const intendedSha256 = sha256(bytes);
+  const intendedSize = BigInt(bytes.length);
   const stagingDirectory = await mkdtemp(`${absoluteOutput}.tmp-`);
   const temporary = join(stagingDirectory, "manifest");
   let temporaryHandle;
+  let publicationLinked = false;
+  let stagedIdentity;
+  let operationError = null;
   try {
     const stagingIdentity = await lstat(stagingDirectory, { bigint: true });
     if (
@@ -1890,19 +2136,19 @@ export async function writeManifest(
     if (beforePublish) {
       await beforePublish();
     }
-    const handleIdentity = await temporaryHandle.stat({ bigint: true });
+    stagedIdentity = await temporaryHandle.stat({ bigint: true });
     const pathIdentity = await lstat(temporary, { bigint: true });
     const stagedBytes = await readFile(temporary);
     if (
-      !handleIdentity.isFile() ||
+      !stagedIdentity.isFile() ||
       !pathIdentity.isFile() ||
-      handleIdentity.dev !== pathIdentity.dev ||
-      handleIdentity.ino !== pathIdentity.ino ||
-      handleIdentity.mode !== pathIdentity.mode ||
-      handleIdentity.uid !== pathIdentity.uid ||
-      handleIdentity.gid !== pathIdentity.gid ||
-      (handleIdentity.mode & 0o777n) !== 0o600n ||
-      handleIdentity.size !== BigInt(bytes.length) ||
+      stagedIdentity.dev !== pathIdentity.dev ||
+      stagedIdentity.ino !== pathIdentity.ino ||
+      stagedIdentity.mode !== pathIdentity.mode ||
+      stagedIdentity.uid !== pathIdentity.uid ||
+      stagedIdentity.gid !== pathIdentity.gid ||
+      (stagedIdentity.mode & 0o777n) !== 0o600n ||
+      stagedIdentity.size !== intendedSize ||
       !stagedBytes.equals(bytes)
     ) {
       throw new Error(
@@ -1921,6 +2167,7 @@ export async function writeManifest(
     // same OS account remains outside this local publication boundary.
     try {
       await link(temporary, absoluteOutput);
+      publicationLinked = true;
     } catch (error) {
       if (error?.code === "EEXIST") {
         throw new Error(
@@ -1930,13 +2177,82 @@ export async function writeManifest(
       }
       throw error;
     }
+    if (afterLink) {
+      await afterLink();
+    }
+    const publishedIdentity = await lstat(absoluteOutput, { bigint: true });
+    if (
+      !isSameStablePublication(
+        publishedIdentity,
+        stagedIdentity,
+        intendedSize,
+      )
+    ) {
+      throw new Error(
+        "published manifest identity or access policy differs from verified staging object",
+      );
+    }
+    if (afterPublish) {
+      await afterPublish();
+    }
   } catch (error) {
-    throw error;
-  } finally {
-    await temporaryHandle?.close();
-    await rm(stagingDirectory, { recursive: true, force: true });
+    operationError = error;
   }
-  return { absoluteOutput, digest: sha256(bytes) };
+
+  const stagingCleanupErrors = [];
+  try {
+    await temporaryHandle?.close();
+  } catch (error) {
+    stagingCleanupErrors.push(error);
+  }
+  try {
+    await rm(stagingDirectory, { recursive: true, force: true });
+  } catch (error) {
+    stagingCleanupErrors.push(error);
+  }
+
+  if (publicationLinked && (operationError || stagingCleanupErrors.length > 0)) {
+    // Once the create-only hard link succeeds, failure handling must not
+    // mutate or unlink the final path. Linking does not prove that another
+    // actor left that path present or unchanged, so the caller must verify it
+    // and isolate any retained object before retrying with a new output path.
+    const primaryDetail = operationError
+      ? `manifest publication failed after linking output (${operationError.message})`
+      : "manifest staging cleanup failed after linking output";
+    const cleanupDetail = stagingCleanupErrors.length > 0
+      ? `; staging cleanup also failed (${stagingCleanupErrors
+          .map((error) => error.message)
+          .join("; ")})`
+      : "";
+    throw new AggregateError(
+      [
+        ...(operationError ? [operationError] : []),
+        ...stagingCleanupErrors,
+      ],
+      `${primaryDetail}${cleanupDetail}; leaving the final output path untouched. ` +
+        `Verify whether ${absoluteOutput} exists, isolate any retained object, ` +
+        "and use a new output path for retry",
+    );
+  }
+  if (operationError && stagingCleanupErrors.length > 0) {
+    throw new AggregateError(
+      [operationError, ...stagingCleanupErrors],
+      `manifest generation failed (${operationError.message}); staging cleanup also failed ` +
+        `(${stagingCleanupErrors.map((error) => error.message).join("; ")})`,
+    );
+  }
+  if (operationError) {
+    throw operationError;
+  }
+  if (stagingCleanupErrors.length > 0) {
+    throw new AggregateError(
+      stagingCleanupErrors,
+      `manifest staging cleanup failed (${stagingCleanupErrors
+        .map((error) => error.message)
+        .join("; ")})`,
+    );
+  }
+  return { absoluteOutput, digest: intendedSha256 };
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -1952,6 +2268,7 @@ async function main(argv = process.argv.slice(2)) {
     {
       beforePublish: () => assertReleaseRefsStillStable(options, manifest),
       finalPrePublish: () => assertReleaseRefsStillStable(options, manifest),
+      afterPublish: () => assertReleaseRefsStillStable(options, manifest),
     },
   );
   process.stdout.write(`${absoluteOutput}\nsha256:${digest}\n`);

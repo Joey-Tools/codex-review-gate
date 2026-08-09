@@ -19,6 +19,8 @@ const HEAD_SHA = "01c3f9da03e7adfdcd4176cb927dc450436da8f4";
 const ACTION_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKFLOW_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const JOB_WORKFLOW_SHA = "cccccccccccccccccccccccccccccccccccccccc";
+const PEELED_RELEASE_COMMIT_SHA =
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const OTHER_WORKFLOW_SHA = "dddddddddddddddddddddddddddddddddddddddd";
 const RUN_ID = "24680";
 const RUN_ATTEMPT = "7";
@@ -185,10 +187,43 @@ test("a floating action ref remains explicit and non-immutable", async () => {
   assert.deepEqual(receipt.statuses, []);
 });
 
-test("the canonical v1 reusable workflow maps its resolved job SHA to the action identity", async () => {
+test("a direct job preserves its exact action commit independently", async () => {
+  const { result, receipt, output } = await runReceiptGate({
+    actionRepository: ACTION_REPOSITORY,
+    actionRef: ACTION_SHA,
+    jobWorkflowRef: WORKFLOW_REF,
+    jobWorkflowSha: WORKFLOW_SHA,
+    jobWorkflowRepository: "owner/repo",
+    jobWorkflowFilePath: ".github/workflows/review.yml",
+    eventName: "push",
+    event: {},
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(output, "producer-receipt-finalized=true\n");
+  assert.equal(
+    receipt.producer.job.workflow_ref,
+    receipt.producer.environment.GITHUB_WORKFLOW_REF,
+  );
+  assert.equal(
+    receipt.producer.job.workflow_sha,
+    receipt.producer.environment.GITHUB_WORKFLOW_SHA,
+  );
+  assert.deepEqual(receipt.producer.action, {
+    repository: ACTION_REPOSITORY,
+    ref: ACTION_SHA,
+    commit_sha: ACTION_SHA,
+    immutable: true,
+  });
+  assert.notEqual(receipt.producer.action.commit_sha, WORKFLOW_SHA);
+  assert.notEqual(receipt.producer.action.commit_sha, JOB_WORKFLOW_SHA);
+});
+
+test("the canonical v1 reusable workflow binds the tag object and peeled checkout commit separately", async () => {
   const { result, receipt, output } = await runReceiptGate({
     actionRepository: "",
     actionRef: "",
+    checkedOutActionCommitSha: PEELED_RELEASE_COMMIT_SHA,
     jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
     jobWorkflowSha: JOB_WORKFLOW_SHA,
     jobWorkflowRepository: ACTION_REPOSITORY,
@@ -213,9 +248,71 @@ test("the canonical v1 reusable workflow maps its resolved job SHA to the action
   assert.deepEqual(receipt.producer.action, {
     repository: ACTION_REPOSITORY,
     ref: JOB_WORKFLOW_SHA,
-    commit_sha: JOB_WORKFLOW_SHA,
+    commit_sha: PEELED_RELEASE_COMMIT_SHA,
     immutable: true,
   });
+  assert.notEqual(
+    receipt.producer.action.ref,
+    receipt.producer.action.commit_sha,
+  );
+});
+
+test("a future canonical workflow commit SHA remains compatible when W equals C", async () => {
+  const { result, receipt, output } = await runReceiptGate({
+    actionRepository: "",
+    actionRef: "",
+    checkedOutActionCommitSha: PEELED_RELEASE_COMMIT_SHA,
+    jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
+    jobWorkflowSha: PEELED_RELEASE_COMMIT_SHA,
+    jobWorkflowRepository: ACTION_REPOSITORY,
+    jobWorkflowFilePath: CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+    eventName: "push",
+    event: {},
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(output, "producer-receipt-finalized=true\n");
+  assert.deepEqual(receipt.producer.action, {
+    repository: ACTION_REPOSITORY,
+    ref: PEELED_RELEASE_COMMIT_SHA,
+    commit_sha: PEELED_RELEASE_COMMIT_SHA,
+    immutable: true,
+  });
+});
+
+test("a rerun receipt rebinds the attempt while retaining W and C", async () => {
+  const rerunAttempt = "8";
+  const { result, receipt, output } = await runReceiptGate({
+    actionRepository: "",
+    actionRef: "",
+    checkedOutActionCommitSha: PEELED_RELEASE_COMMIT_SHA,
+    jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
+    jobWorkflowSha: JOB_WORKFLOW_SHA,
+    jobWorkflowRepository: ACTION_REPOSITORY,
+    jobWorkflowFilePath: CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+    runAttempt: rerunAttempt,
+    eventName: "push",
+    event: {},
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(output, "producer-receipt-finalized=true\n");
+  assert.deepEqual(receipt.artifact, {
+    name: `codex-review-gate-producer-receipt-${RUN_ID}-${rerunAttempt}`,
+    file: "codex-review-gate-producer-receipt.json",
+  });
+  assert.deepEqual(receipt.producer.run, {
+    id: RUN_ID,
+    attempt: rerunAttempt,
+    target_url:
+      `https://github.com/owner/repo/actions/runs/${RUN_ID}/attempts/${rerunAttempt}`,
+  });
+  assert.equal(receipt.producer.job.workflow_sha, JOB_WORKFLOW_SHA);
+  assert.equal(receipt.producer.action.ref, JOB_WORKFLOW_SHA);
+  assert.equal(
+    receipt.producer.action.commit_sha,
+    PEELED_RELEASE_COMMIT_SHA,
+  );
 });
 
 test("near-canonical reusable workflow tuples remain non-immutable", async (t) => {
@@ -263,6 +360,7 @@ test("near-canonical reusable workflow tuples remain non-immutable", async (t) =
       const { result, receipt, output } = await runReceiptGate({
         actionRepository: "",
         actionRef: "",
+        checkedOutActionCommitSha: PEELED_RELEASE_COMMIT_SHA,
         jobWorkflowRef:
           scenario.jobWorkflowRef || CANONICAL_REUSABLE_WORKFLOW_REF,
         jobWorkflowSha: JOB_WORKFLOW_SHA,
@@ -309,7 +407,7 @@ test("canonical reusable workflow identity rejects malformed job SHAs", async (t
       assert.notEqual(result.code, 0);
       assert.match(
         result.stderr,
-        /CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA must be one lowercase full commit SHA/,
+        /CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA must be one lowercase full Git object ID/,
       );
       assert.equal(receiptRaw, null);
       assert.equal(output, "");
@@ -317,27 +415,102 @@ test("canonical reusable workflow identity rejects malformed job SHAs", async (t
   }
 });
 
-test("the canonical reusable workflow identity cannot be replaced by action context", async (t) => {
+test("canonical reusable workflow identity requires a lower-case checkout commit", async (t) => {
+  const scenarios = [
+    [
+      "missing",
+      null,
+      /CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA is required/,
+    ],
+    [
+      "empty",
+      "",
+      /CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA is required/,
+    ],
+    [
+      "upper-case",
+      PEELED_RELEASE_COMMIT_SHA.toUpperCase(),
+      /CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA must be one lowercase full commit SHA/,
+    ],
+    [
+      "short",
+      PEELED_RELEASE_COMMIT_SHA.slice(0, -1),
+      /CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA must be one lowercase full commit SHA/,
+    ],
+    [
+      "padded",
+      ` ${PEELED_RELEASE_COMMIT_SHA}`,
+      /CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA must be one lowercase full commit SHA/,
+    ],
+  ];
+
+  for (const [name, checkedOutActionCommitSha, error] of scenarios) {
+    await t.test(name, async () => {
+      const { result, receiptRaw, output } = await runReceiptGate({
+        actionRepository: "",
+        actionRef: "",
+        checkedOutActionCommitSha,
+        jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
+        jobWorkflowSha: JOB_WORKFLOW_SHA,
+        jobWorkflowRepository: ACTION_REPOSITORY,
+        jobWorkflowFilePath: CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+        eventName: "push",
+        event: {},
+      });
+
+      assert.notEqual(result.code, 0);
+      assert.match(result.stderr, error);
+      assert.equal(receiptRaw, null);
+      assert.equal(output, "");
+    });
+  }
+});
+
+test("native action context takes precedence over a reusable-only checkout commit", async (t) => {
   const scenarios = [
     {
       name: "exact remote action",
       actionRepository: ACTION_REPOSITORY,
       actionRef: ACTION_SHA,
+      expected: {
+        repository: ACTION_REPOSITORY,
+        ref: ACTION_SHA,
+        commit_sha: ACTION_SHA,
+        immutable: true,
+      },
     },
     {
       name: "floating remote action",
       actionRepository: ACTION_REPOSITORY,
       actionRef: "v1",
+      expected: {
+        repository: ACTION_REPOSITORY,
+        ref: "v1",
+        commit_sha: null,
+        immutable: false,
+      },
     },
     {
       name: "repository-only partial action context",
       actionRepository: ACTION_REPOSITORY,
       actionRef: "",
+      expected: {
+        repository: ACTION_REPOSITORY,
+        ref: null,
+        commit_sha: null,
+        immutable: false,
+      },
     },
     {
       name: "exact-ref-only partial action context",
       actionRepository: "",
       actionRef: ACTION_SHA,
+      expected: {
+        repository: null,
+        ref: ACTION_SHA,
+        commit_sha: ACTION_SHA,
+        immutable: true,
+      },
     },
   ];
 
@@ -346,6 +519,7 @@ test("the canonical reusable workflow identity cannot be replaced by action cont
       const { result, receipt } = await runReceiptGate({
         actionRepository: scenario.actionRepository,
         actionRef: scenario.actionRef,
+        checkedOutActionCommitSha: PEELED_RELEASE_COMMIT_SHA,
         jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
         jobWorkflowSha: JOB_WORKFLOW_SHA,
         jobWorkflowRepository: ACTION_REPOSITORY,
@@ -355,12 +529,7 @@ test("the canonical reusable workflow identity cannot be replaced by action cont
       });
 
       assert.equal(result.code, 0, result.stderr);
-      assert.deepEqual(receipt.producer.action, {
-        repository: ACTION_REPOSITORY,
-        ref: JOB_WORKFLOW_SHA,
-        commit_sha: JOB_WORKFLOW_SHA,
-        immutable: true,
-      });
+      assert.deepEqual(receipt.producer.action, scenario.expected);
     });
   }
 });
@@ -659,10 +828,13 @@ test("job workflow identity is mandatory before a receipt can be finalized", asy
 async function runReceiptGate({
   actionRepository = ACTION_REPOSITORY,
   actionRef = ACTION_SHA,
+  checkedOutActionCommitSha = null,
   jobWorkflowRef = JOB_WORKFLOW_REF,
   jobWorkflowSha = JOB_WORKFLOW_SHA,
   jobWorkflowRepository = JOB_WORKFLOW_REPOSITORY,
   jobWorkflowFilePath = JOB_WORKFLOW_FILE_PATH,
+  runId = RUN_ID,
+  runAttempt = RUN_ATTEMPT,
   eventName = "pull_request_target",
   event = {
     pull_request: { number: 1, head: { sha: HEAD_SHA } },
@@ -690,8 +862,8 @@ async function runReceiptGate({
     FAKE_GITHUB_STATE_PATH: statePath,
     GITHUB_TOKEN: "fake-token",
     GITHUB_REPOSITORY: "owner/repo",
-    GITHUB_RUN_ID: RUN_ID,
-    GITHUB_RUN_ATTEMPT: RUN_ATTEMPT,
+    GITHUB_RUN_ID: runId,
+    GITHUB_RUN_ATTEMPT: runAttempt,
     GITHUB_SERVER_URL: serverUrl,
     GITHUB_API_URL: "https://api.github.test",
     GITHUB_STEP_SUMMARY: summaryPath,
@@ -716,6 +888,10 @@ async function runReceiptGate({
     MAX_WAIT_SECONDS: "7200",
     COMPLETION_SIGNAL_BUFFER_SECONDS: "60",
   };
+  if (checkedOutActionCommitSha !== null) {
+    childEnv.CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA =
+      checkedOutActionCommitSha;
+  }
   for (const [name, value] of Object.entries(env)) {
     if (value === undefined) {
       delete childEnv[name];

@@ -3403,6 +3403,8 @@ function createProducerReceipt() {
   const action = producerActionIdentity({
     actionRepository: process.env.CODEX_REVIEW_GATE_ACTION_REPOSITORY || null,
     actionRef: process.env.CODEX_REVIEW_GATE_ACTION_REF || null,
+    checkedOutActionCommitSha:
+      process.env.CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA || null,
     jobWorkflow,
   });
   const runId = decimalEnv("GITHUB_RUN_ID");
@@ -3445,20 +3447,12 @@ function createProducerReceipt() {
   };
 }
 
-function producerActionIdentity({ actionRepository, actionRef, jobWorkflow }) {
-  const canonicalReusableWorkflow =
-    jobWorkflow.workflow_repository === CANONICAL_ACTION_REPOSITORY &&
-    jobWorkflow.workflow_file_path === CANONICAL_REUSABLE_WORKFLOW_FILE_PATH &&
-    jobWorkflow.workflow_ref === CANONICAL_REUSABLE_WORKFLOW_REF;
-  if (canonicalReusableWorkflow) {
-    return {
-      repository: jobWorkflow.workflow_repository,
-      ref: jobWorkflow.workflow_sha,
-      commit_sha: jobWorkflow.workflow_sha,
-      immutable: true,
-    };
-  }
-
+function producerActionIdentity({
+  actionRepository,
+  actionRef,
+  checkedOutActionCommitSha,
+  jobWorkflow,
+}) {
   const actionCommitSha = actionRef && /^[0-9a-f]{40}$/.test(actionRef)
     ? actionRef
     : null;
@@ -3468,6 +3462,29 @@ function producerActionIdentity({ actionRepository, actionRef, jobWorkflow }) {
       ref: actionRef,
       commit_sha: actionCommitSha,
       immutable: actionCommitSha !== null,
+    };
+  }
+
+  const canonicalReusableWorkflow =
+    jobWorkflow.workflow_repository === CANONICAL_ACTION_REPOSITORY &&
+    jobWorkflow.workflow_file_path === CANONICAL_REUSABLE_WORKFLOW_FILE_PATH &&
+    jobWorkflow.workflow_ref === CANONICAL_REUSABLE_WORKFLOW_REF;
+  if (canonicalReusableWorkflow) {
+    if (checkedOutActionCommitSha === null) {
+      throw new Error(
+        "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA is required",
+      );
+    }
+    if (!/^[0-9a-f]{40}$/.test(checkedOutActionCommitSha)) {
+      throw new Error(
+        "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA must be one lowercase full commit SHA",
+      );
+    }
+    return {
+      repository: jobWorkflow.workflow_repository,
+      ref: jobWorkflow.workflow_sha,
+      commit_sha: checkedOutActionCommitSha,
+      immutable: true,
     };
   }
 
@@ -3567,7 +3584,7 @@ function statusResponseId(value) {
 function fullShaEnv(name) {
   const value = requiredEnv(name);
   if (!/^[0-9a-f]{40}$/.test(value)) {
-    throw new Error(`${name} must be one lowercase full commit SHA`);
+    throw new Error(`${name} must be one lowercase full Git object ID`);
   }
   return value;
 }

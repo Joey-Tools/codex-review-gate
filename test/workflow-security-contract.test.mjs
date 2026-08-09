@@ -42,7 +42,14 @@ const RECEIPT_OUTPUTS = {
 };
 
 const CALLER_WORKFLOW_SHA = "1111111111111111111111111111111111111111";
-const CALLED_WORKFLOW_SHA = "2222222222222222222222222222222222222222";
+const REUSABLE_V1_TAG_OBJECT_SHA =
+  "2222222222222222222222222222222222222222";
+const PEELED_V1_RELEASE_COMMIT_SHA =
+  "6666666666666666666666666666666666666666";
+const NEWER_REUSABLE_V1_TAG_OBJECT_SHA =
+  "5555555555555555555555555555555555555555";
+const NEWER_PEELED_V1_RELEASE_COMMIT_SHA =
+  "7777777777777777777777777777777777777777";
 const CURRENT_PR_HEAD_SHA = "3333333333333333333333333333333333333333";
 const RUN_EVENT_HEAD_SHA = "4444444444444444444444444444444444444444";
 
@@ -164,6 +171,17 @@ test("the published workflow source is workflow_call-only and preserves receipt 
     "steps",
   ]);
   assert.doesNotMatch(blockText(job), /^\s+(?:permissions|secrets):/m);
+  const runner = directScalar(job, "runs-on");
+  assert.equal(
+    runner,
+    "ubuntu-slim",
+    "the reusable producer must run on the GitHub-hosted canary runner",
+  );
+  assert.doesNotMatch(
+    runner,
+    /\$\{\{|\b(?:vars|inputs|matrix)\./u,
+    "caller-controlled contexts must not select the reusable producer runner",
+  );
 
   const jobOutputs = childBlock(job, "outputs");
   assert.deepEqual(directKeys(jobOutputs), Object.keys(RECEIPT_OUTPUTS));
@@ -197,7 +215,8 @@ test("the called workflow checks out only its exact resolved release and runs it
   const items = listItemBlocks(steps);
 
   assert.equal(items.length, 2);
-  assert.deepEqual(itemKeys(items[0]), ["name", "uses", "with"]);
+  assert.deepEqual(itemKeys(items[0]), ["name", "id", "uses", "with"]);
+  assert.equal(itemScalar(items[0], "id"), "checkout");
   assert.equal(itemScalar(items[0], "uses"), CHECKOUT_TARGET);
   assert.deepEqual(scalarMapping(childBlock(items[0], "with")), {
     repository: "${{ job.workflow_repository }}",
@@ -206,9 +225,16 @@ test("the called workflow checks out only its exact resolved release and runs it
     "persist-credentials": "false",
   });
 
-  assert.deepEqual(itemKeys(items[1]), ["name", "id", "uses", "with"]);
+  assert.deepEqual(
+    itemKeys(items[1]),
+    ["name", "id", "uses", "env", "with"],
+  );
   assert.equal(itemScalar(items[1], "id"), "gate");
   assert.equal(itemScalar(items[1], "uses"), LOCAL_ACTION);
+  assert.deepEqual(scalarMapping(childBlock(items[1], "env")), {
+    CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA:
+      "${{ steps.checkout.outputs.commit }}",
+  });
   assert.equal(
     scalarMapping(childBlock(items[1], "with"))["github-token"],
     "${{ github.token }}",
@@ -397,6 +423,56 @@ test("the composite captures caller and called workflow identities from distinct
     env.CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH,
     "${{ job.workflow_file_path }}",
   );
+  assert.equal(
+    Object.hasOwn(
+      env,
+      "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA",
+    ),
+    false,
+    "the composite must receive the checkout commit only from the called workflow step",
+  );
+});
+
+test("the canonical v1 canary binds W to the tag object and C to the peeled checkout commit", () => {
+  const fixture = canonicalProvenanceFixture();
+  const selected = validateReferencedWorkflow(
+    fixture.receipt.producer.job,
+    fixture.runAttempt,
+  );
+
+  assert.equal(
+    fixture.receipt.producer.job.workflow_ref,
+    CANONICAL_JOB_WORKFLOW_REF,
+  );
+  assert.equal(selected.path, CANONICAL_CALL);
+  assert.equal(selected.ref, "refs/tags/v1");
+  assert.equal(
+    fixture.receipt.producer.job.workflow_sha,
+    REUSABLE_V1_TAG_OBJECT_SHA,
+  );
+  assert.equal(selected.sha, REUSABLE_V1_TAG_OBJECT_SHA);
+  assert.equal(fixture.receipt.producer.action.ref, REUSABLE_V1_TAG_OBJECT_SHA);
+  assert.equal(
+    fixture.receipt.producer.action.commit_sha,
+    PEELED_V1_RELEASE_COMMIT_SHA,
+  );
+  assert.notEqual(
+    fixture.receipt.producer.action.ref,
+    fixture.receipt.producer.action.commit_sha,
+  );
+});
+
+test("a future canonical workflow remains valid when GitHub reports W equal to C", () => {
+  const fixture = canonicalProvenanceFixture({
+    workflowSha: PEELED_V1_RELEASE_COMMIT_SHA,
+    actionCommitSha: PEELED_V1_RELEASE_COMMIT_SHA,
+  });
+
+  assert.doesNotThrow(() => validateProvenanceShaDomains(fixture));
+  assert.equal(
+    fixture.receipt.producer.action.ref,
+    fixture.receipt.producer.action.commit_sha,
+  );
 });
 
 test("referenced_workflows selects exactly one canonical called-workflow entry", async (t) => {
@@ -467,7 +543,7 @@ test("referenced_workflows selects exactly one canonical called-workflow entry",
       name: "malformed called-workflow SHA",
       mutate(candidate) {
         candidate.receipt.producer.job.workflow_sha =
-          CALLED_WORKFLOW_SHA.slice(0, -1);
+          REUSABLE_V1_TAG_OBJECT_SHA.slice(0, -1);
       },
     },
   ];
@@ -539,7 +615,8 @@ test("caller workflow, called workflow, run head, and PR status SHA roles stay s
     fixture.receipt.producer.job.workflow_sha,
     fixture.runAttempt.head_sha,
     fixture.currentPullRequest.head.sha,
-  ]).size, 4);
+    PEELED_V1_RELEASE_COMMIT_SHA,
+  ]).size, 5);
 
   assert.doesNotThrow(() => validateProvenanceShaDomains(fixture));
   assert.equal(
@@ -548,7 +625,11 @@ test("caller workflow, called workflow, run head, and PR status SHA roles stay s
   );
   assert.equal(
     fixture.runAttempt.referenced_workflows[0].sha,
-    CALLED_WORKFLOW_SHA,
+    REUSABLE_V1_TAG_OBJECT_SHA,
+  );
+  assert.equal(
+    fixture.receipt.producer.action.commit_sha,
+    PEELED_V1_RELEASE_COMMIT_SHA,
   );
   assert.equal(fixture.receipt.statuses[0].head_sha, CURRENT_PR_HEAD_SHA);
   assert.equal(fixture.runAttempt.head_sha, RUN_EVENT_HEAD_SHA);
@@ -601,6 +682,86 @@ test("rerun validation uses the receipt's exact run attempt", async (t) => {
       const fixture = canonicalProvenanceFixture();
       scenario.mutate(fixture);
       assert.throws(() => validateProvenanceShaDomains(fixture));
+    });
+  }
+});
+
+test("reruns accept only attempt-local all-field rebinding of the v1 tag object", async (t) => {
+  const scenarios = [
+    {
+      name: "specific-job rerun retains the prior resolved tag object",
+      tagObjectSha: REUSABLE_V1_TAG_OBJECT_SHA,
+      releaseCommitSha: PEELED_V1_RELEASE_COMMIT_SHA,
+    },
+    {
+      name: "full rerun resolves the floating tag to a newer tag object",
+      tagObjectSha: NEWER_REUSABLE_V1_TAG_OBJECT_SHA,
+      releaseCommitSha: NEWER_PEELED_V1_RELEASE_COMMIT_SHA,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, () => {
+      const fixture = canonicalProvenanceFixture();
+      fixture.receipt.producer.run.attempt = "4";
+      fixture.runAttempt.run_attempt = 4;
+      fixture.receipt.producer.job.workflow_sha = scenario.tagObjectSha;
+      fixture.receipt.producer.action.ref = scenario.tagObjectSha;
+      fixture.receipt.producer.action.commit_sha = scenario.releaseCommitSha;
+      fixture.expectedActionCommitSha = scenario.releaseCommitSha;
+      fixture.runAttempt.referenced_workflows[0].sha = scenario.tagObjectSha;
+
+      assert.doesNotThrow(() => validateProvenanceShaDomains(fixture));
+      assert.equal(
+        fixture.receipt.producer.action.commit_sha,
+        scenario.releaseCommitSha,
+      );
+    });
+  }
+});
+
+test("canonical receipt action identity cannot cross-bind a different tag or release object", async (t) => {
+  const scenarios = [
+    {
+      name: "wrong action repository",
+      mutate(action) {
+        action.repository = "attacker/codex-review-gate-action";
+      },
+    },
+    {
+      name: "newer tag object cross-paired with the old release commit",
+      mutate(action) {
+        action.ref = NEWER_REUSABLE_V1_TAG_OBJECT_SHA;
+      },
+    },
+    {
+      name: "older tag object cross-paired with the newer release commit",
+      mutate(action) {
+        action.commit_sha = NEWER_PEELED_V1_RELEASE_COMMIT_SHA;
+      },
+    },
+    {
+      name: "tag object substituted for the peeled release commit",
+      mutate(action) {
+        action.commit_sha = REUSABLE_V1_TAG_OBJECT_SHA;
+      },
+    },
+    {
+      name: "immutable flag cleared",
+      mutate(action) {
+        action.immutable = false;
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, () => {
+      const fixture = canonicalProvenanceFixture();
+      scenario.mutate(fixture.receipt.producer.action);
+      assert.throws(
+        () => validateProvenanceShaDomains(fixture),
+        /action identity/,
+      );
     });
   }
 });
@@ -659,8 +820,12 @@ test("run-level referenced_workflows corroboration does not claim a job binding"
   );
 });
 
-function canonicalProvenanceFixture() {
+function canonicalProvenanceFixture({
+  workflowSha = REUSABLE_V1_TAG_OBJECT_SHA,
+  actionCommitSha = PEELED_V1_RELEASE_COMMIT_SHA,
+} = {}) {
   return {
+    expectedActionCommitSha: actionCommitSha,
     receipt: {
       producer: {
         repository: "owner/consumer",
@@ -672,9 +837,15 @@ function canonicalProvenanceFixture() {
         },
         job: {
           workflow_ref: CANONICAL_JOB_WORKFLOW_REF,
-          workflow_sha: CALLED_WORKFLOW_SHA,
+          workflow_sha: workflowSha,
           workflow_repository: CANONICAL_ACTION_REPOSITORY,
           workflow_file_path: CANONICAL_WORKFLOW_FILE_PATH,
+        },
+        action: {
+          repository: CANONICAL_ACTION_REPOSITORY,
+          ref: workflowSha,
+          commit_sha: actionCommitSha,
+          immutable: true,
         },
       },
       statuses: [
@@ -691,7 +862,7 @@ function canonicalProvenanceFixture() {
       run_attempt: 3,
       head_sha: RUN_EVENT_HEAD_SHA,
       repository: { full_name: "owner/consumer" },
-      referenced_workflows: [canonicalReferencedWorkflow()],
+      referenced_workflows: [canonicalReferencedWorkflow(workflowSha)],
     },
     currentPullRequest: {
       number: 17,
@@ -775,10 +946,12 @@ function assertCallerEnvelope(lines, message) {
   }, message);
 }
 
-function canonicalReferencedWorkflow() {
+function canonicalReferencedWorkflow(
+  workflowSha = REUSABLE_V1_TAG_OBJECT_SHA,
+) {
   return {
     path: CANONICAL_CALL,
-    sha: CALLED_WORKFLOW_SHA,
+    sha: workflowSha,
     ref: "refs/tags/v1",
   };
 }
@@ -844,7 +1017,20 @@ function validateProvenanceShaDomains(fixture) {
     receipt.producer.environment.GITHUB_WORKFLOW_SHA,
     /^[0-9a-f]{40}$/u,
   );
-  validateReferencedWorkflow(receipt.producer.job, runAttempt);
+  const referencedWorkflow = validateReferencedWorkflow(
+    receipt.producer.job,
+    runAttempt,
+  );
+  assert.deepEqual(
+    receipt.producer.action,
+    {
+      repository: CANONICAL_ACTION_REPOSITORY,
+      ref: referencedWorkflow.sha,
+      commit_sha: fixture.expectedActionCommitSha,
+      immutable: true,
+    },
+    "canonical reusable receipt action identity must bind W and C independently",
+  );
 
   const statusMembers = receipt.statuses.filter(
     (status) =>
