@@ -12,10 +12,12 @@
 3. 确认 `codex/review-gate` 行为符合预期后，把它加入 required status checks。恢复和排障 recipes 见 [cookbook](COOKBOOK.zh-CN.md)。
 
 > [!IMPORTANT]
-> Reusable caller 目前只是为 v1.5 rollout staged。在 immutable v1.5.0 release 与
-> provenance asset 已存在、`v1.5` 和 `v1` aliases 已验证且 live canary 通过前，不得在
-> source repository 或 template 中激活。Activation 必须放在独立的后续 PR；此前继续使用
-> source 与 template 的现有 callers，不做修改。
+> Reusable caller 目前只是为 v1.5 rollout staged。Immutable v1.5.0 release 已存在，
+> 但 live canary 证明其 commit-versus-tag-object admission contract 有误。Consumer
+> 必须对 v1.5.0 fail closed，不存在 digest-keyed erratum。在兼容修复
+> v1.5.1 与 provenance asset 发布、`v1.5` 和 `v1` aliases 验证且新 live canary 通过前，
+> 不得在 source repository 或 template 中激活。Activation 必须放在独立的后续 PR；
+> 此前继续使用 source 与 template 的现有 callers，不做修改。
 
 `codex-review-gate` 是由 composite Action 支撑的 reusable GitHub workflow，负责提供
 deterministic
@@ -124,7 +126,10 @@ Event-driven review gate 的状态机、自动重试开关、**GHA 成本模型 
 
 高级设计中，需要在 runner 分配前生效的控制项应使用 repository 或 organization variables。例如，`CODEX_REVIEW_GATE_AUTO_RETRY=false` 可以在 job `if` 层跳过 scheduled retry job。Runtime `env` 仍可用于 job 启动后的 action 行为兼容，但不能阻止 GitHub Actions 分配 runner。
 
-Workflow 示例默认使用 `ubuntu-slim`。如果要使用 self-hosted runner，把 `CODEX_REVIEW_GATE_RUNNER_LABELS` 设成 JSON array，例如 `["self-hosted","linux","x64","codex-review-gate"]`。
+当前 source-root direct workflow 默认使用 `ubuntu-slim`。Direct composite caller 可以把
+`CODEX_REVIEW_GATE_RUNNER_LABELS` 设成 JSON array，例如
+`["self-hosted","linux","x64","codex-review-gate"]`；下面的 canonical reusable
+workflow 刻意忽略该 variable，并固定使用 `ubuntu-slim`。
 
 ## Workflow 用法
 
@@ -175,10 +180,28 @@ Called workflow 取得 caller 的 `GITHUB_TOKEN` permissions，且不能提升�
 `secrets: inherit`。上面的四项 read/write permissions 是支持的 ceiling。Called
 workflow 绝不 checkout pull request，也不执行其代码。
 
+Reusable mode 固定使用 `runs-on: ubuntu-slim`。Caller repository variables 不能选择
+self-hosted 或其他 runner，因此 GitHub-hosted runner 是 checkout output、worktree 与
+receipt production 的 trust boundary 一部分。Direct composite mode 仍由 caller 控制，
+可以保留现有 runner 配置。该 GitHub-hosted boundary 仍不是 cryptographic signature、
+OIDC attestation 或 content-addressed storage proof。
+
+Reusable receipt attribution 还假设 caller workflow revision 及其完整 job graph 已被独立
+信任。同一 run 中的 malicious sibling job 可在 called job 完成前抢先创建
+attempt-named artifact，并写入 matching status。Exact-attempt `referenced_workflows` 只是
+run-level corroboration，不绑定某个 job、callsite 或 receipt。因此已验证链只在
+trusted-caller 加 fixed-hosted-runner boundary 内提供 causal consistency，不是 job-scoped
+cryptographic attribution。
+
 Floating `@v1` 是刻意设置的集中式 pre-execution trust boundary：action repository
 的 release policy 只允许把它移动到兼容的 v1.x release。它不是 post-run immutable
-provenance。Consumer 会针对 signed immutable v1.x.y release 动态校验 exact resolved
-`job.workflow_sha`，不会在 caller 或消费 Skill 中 pin v1.5 SHA。
+provenance。以 `W` 表示 `job.workflow_sha`、matching exact-attempt
+`referenced_workflows[].sha` 与 receipt `producer.action.ref` 中的 exact selected workflow
+object；以 `C` 表示 checkout output commit、receipt `producer.action.commit_sha` 与
+provenance `action.commit_oid`；以 `T` 表示 independently signed
+`tags.v1.tag_object_oid`。v1.5.0 live canary 观察到 `W == T`，但封闭合同也接受
+future `W == C` shape。Consumer 必须要求这两个 candidates 中恰好一个命中，
+总是验证 `T` direct peel 到 `C`，且不在 caller 或消费 Skill 中 pin v1.5 SHA。
 
 ## Inputs
 
@@ -250,15 +273,23 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 `JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`。
 这个 floating major alias 是刻意设置的集中式 pre-execution trust boundary：移动它会把
 所有 callers 升级到兼容的 v1.x release。它不是 post-run immutable provenance。
-Post-run admission 会动态解析并验证 exact `job.workflow_sha`；caller 与消费 Skill 都不
-pin v1.5 SHA。
+当前 live shape 中，post-run admission 会动态校验 `job.workflow_sha` 选中的 exact
+signed `v1` tag-object OID 与其到 admitted action commit 的 peel。下文封闭 resolution
+contract 也接受 future exact-action-commit shape；caller 与消费 Skill 都不 pin v1.5
+SHA。
 
 在 called job 内，`github.workflow_ref` 与 `github.workflow_sha` 仍标识 caller
 workflow。Called implementation 由仅 GitHub.com 提供的 `job.workflow_repository`、
-`job.workflow_file_path`、`job.workflow_ref` 与 `job.workflow_sha` 标识。Reusable
-workflow 使用 full-SHA-pinned `actions/checkout`，并指定
+`job.workflow_file_path`、`job.workflow_ref` 与 `job.workflow_sha` 标识。Caller 使用
+`@v1` 时，SHA field 标识 selected workflow object。v1.5.0 canary 观察到 annotated
+`v1` tag object；若 GitHub 以后报告 exact peeled action commit，封闭合同也接受该
+object。Reusable workflow 使用 full-SHA-pinned `actions/checkout`，并指定
 `repository: ${{ job.workflow_repository }}` 与 `ref: ${{ job.workflow_sha }}`，以 checkout
-自身 exact implementation。Bare checkout 会选择 caller repository，因此可信 workflow
+自身 exact implementation。`checkout` step 的 official `commit` output 是 peeled action
+commit，只能通过
+`CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ steps.checkout.outputs.commit }}`
+传入 local composite，绝不能来自 `workflow_call` 或 caller input。Bare checkout 会选择
+caller repository，因此可信 workflow
 绝不使用 bare checkout，也绝不 checkout 或执行 pull-request code。
 
 Direct composite form 继续兼容，但必须使用
@@ -281,13 +312,17 @@ evidence 都必须匹配 selected current PR。
 在 GitHub.com 上，两种 supported form 都会按
 [`producer-receipt.schema.json`](producer-receipt.schema.json) 生成 producer receipt v1。
 对于 canonical reusable tuple——exact action repository、workflow file、
-`refs/tags/v1` job ref 与 lower-case 40-hex `job.workflow_sha`——producer 会把该 job SHA
-映射为 `producer.action.ref` 与 `producer.action.commit_sha`，并设
-`immutable: true`；即使 nested action context 同时存在，该 canonical job tuple 仍具
-authority。只有 reusable tuple 非 canonical 时，direct composite 才会沿用 exact
-lower-case 40-SHA action ref 的既有 mapping。Near-canonical reusable tuple 绝不升级
-identity，也不提供 fallback。若不存在 independently exact direct action ref，floating、
-near-canonical 或 local invocation 只会产生不可用的 `immutable: false` action identity。
+`refs/tags/v1` job ref 与 lower-case 40-hex `job.workflow_sha`——producer 会把该 exact
+selected workflow object OID 映射为 `producer.action.ref`，并把 full-SHA-pinned checkout step 的
+official `commit` output 独立映射为 `producer.action.commit_sha`，同时设
+`immutable: true`。Checkout commit 必须是 admitted action commit。这个
+environment binding 受 called workflow 控制，不暴露 caller input。Native action context
+具有 structural priority：只要 `github.action_repository` 或 `github.action_ref` 任一存在，
+producer 就记录该 direct context，并忽略 reusable checkout-commit environment。只有
+action ref 是 exact lower-case 40-SHA 时，该 direct identity 才 immutable。只有两个 native
+fields 都缺失且 job tuple exact canonical 时，才考虑 reusable W/C mapping。
+Near-canonical tuple 绝不升级 identity，也不提供 fallback；没有 native context 时只会
+产生不可用的 `immutable: false` action identity。
 
 Receipt mode 使用 attempt-specific
 `/actions/runs/<run_id>/attempts/<attempt>` target URL。每次 receipt-enabled
@@ -303,7 +338,7 @@ attempt URL 相等。
 
 任何消费它的 review 或 readiness Skill 都必须保留四个独立 SHA domain：caller
 workflow definition（`github.workflow_sha`）、exact API run-attempt head
-（`head_sha`）、called implementation（`job.workflow_sha`）以及 current
+（`head_sha`）、called workflow selected object identity（`job.workflow_sha`）以及 current
 pull-request/status head。任何 domain 都不能替代另一个。尤其禁止要求 run-attempt
 `head_sha` 或 Artifact API `workflow_run.head_sha` 等于 selected receipt status head；
 禁止要求 run-attempt `head_sha` 等于 `GITHUB_WORKFLOW_SHA`；也禁止要求
@@ -321,24 +356,33 @@ SHA 标识 caller workflow revision。它们的机器可读权威合同是
    readiness decision 必须要求 `execution.result == completed`；`failed` receipt 只能作为
    audit evidence。还要要求 current repository、exact run/attempt/target、caller
    workflow fields 与一个显式选定的 structural mode。Reusable mode 要求 exact canonical
-   job tuple，以及映射后的 action repository 与 `job.workflow_sha` with
-   `immutable: true`；direct mode 要求 expected action repository 与 exact lower-case
-   40-SHA with `immutable: true`。
+   job tuple、action repository、`producer.action.ref == job.workflow_sha`、独立绑定的
+   checkout commit in `producer.action.commit_sha`，以及 `immutable: true`；direct mode
+   要求 expected action repository 与 exact lower-case 40-SHA，其 action ref 与 commit SHA
+   相等，并且 `immutable: true`。
 3. 通过 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}` 取得
    attempt；不要求 response `url` 或 `html_url` 为 attempt-specific。Artifact API record
    的 `workflow_run.id` 与 `workflow_run.head_sha` 必须分别等于该 response 的 `id` 与
    `head_sha`。Reusable mode 还必须要求 optional、nullable `referenced_workflows` array
    实际存在，并恰好包含一个 matching canonical repository/workflow path 与 v1 call 的
-   entry。其 required `sha` 必须同时等于 `job.workflow_sha`、receipt 映射后的 action
-   commit 与已 admitted release-provenance `action.commit_oid`；其 `ref` 必须存在且等于
-   `refs/tags/v1`。这只是 run-attempt-level
+   entry。将其 required `sha`、`job.workflow_sha` 与 receipt `producer.action.ref`
+   定义为 `W`；其 `ref` 必须存在且等于 `refs/tags/v1`。要求 `W` 恰好等于
+   `runtime_closure.called_workflow.workflow_sha_resolution.candidates` 中一个 declared
+   value，每个 candidate value 必须等于它声明的 provenance field。只接受两个分支：
+   current-live `W == T`，其中 `T == tags.v1.tag_object_oid`；或 future `W == C`，
+   其中 `C == action.commit_oid`。两个分支都必须要求 independently signed `T`
+   direct peel 到 `C`，并要求 `tags.v1.peeled_commit_oid == action.commit_oid ==
+   producer.action.commit_sha`。其他 object type、nested tag peel、零个或多个 candidate
+   match 都 fail closed。这只是 run-attempt-level
    corroboration：GitHub 没有提供 entry-to-job、entry-to-receipt mapping 或 cryptographic
    binding。Evidence 缺失、为 null、malformed 或不唯一时 fail closed。
-4. Reusable mode 通过以下证据动态 admit 该 called SHA：直接 peel 到它且由 trusted
-   primary signer 签名的 annotated immutable `v1.x.y` tag、REST record
-   `immutable: true` 的对应 GitHub Release，以及完整 release-provenance schema-v2
-   asset；repository immutable-release setting 也必须 enabled。校验 tag signer
-   fingerprint、manifest 的 commit/tree/critical-file
+4. Reusable mode 通过 fully paginated GitHub Releases API 枚举 release candidates，并要求恰好一个
+   published、immutable、non-draft、non-prerelease `v1.x.y` release：其 trusted-signer tag
+   peel 到 `C`，恰好一个 provenance asset 具有兼容的 closed schema/majors 与
+   `action.commit_oid == C`，且 workflow-SHA candidate set 中恰好一次出现 `W`。零个或
+   多个 matching releases/assets 都 fail closed。即使在 future `W == C` 分支，也要求
+   independently signed annotated `v1` tag object `T` direct peel 到同一 `C`。校验两个
+   tags 的 trusted primary signer fingerprint、manifest action root tree 与 critical-file
    bindings、receipt schema v1，以及 `policy_major == 1` 的兼容 policy。禁止通过当前
    `v1` target 反推历史 run。Canonical reusable caller 接受兼容的 v1.x Action-only
    upgrade 时无需修改 caller 或 Skill；direct caller 必须更新 exact pin。Protocol 或

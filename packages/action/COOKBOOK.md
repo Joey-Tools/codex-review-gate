@@ -7,9 +7,11 @@ Languages: [British English (en-GB)](COOKBOOK.md) | [简体中文 (zh-CN)](COOKB
 Use this path after the workflow is merged to the repository default branch and `codex/review-gate` is required by the ruleset.
 
 For the v1.5 rollout, do not activate the reusable caller in the source root or
-template until the immutable v1.5.0 release/provenance asset exists, the `v1.5`
-and `v1` aliases are verified, and a live canary passes. Activation is a
-separate follow-up PR; the release PR leaves both existing callers unchanged.
+template. The immutable v1.5.0 release exists, but its live canary exposed an
+incorrect commit-versus-tag-object admission contract. Consumers fail closed on
+v1.5.0; there is no digest-keyed erratum. Activation remains a
+separate follow-up PR after the compatible v1.5.1 repair/provenance asset, both
+`v1.5` and `v1` aliases, and a replacement live canary are verified.
 
 1. Open or update a ready PR.
 2. The workflow writes `codex/review-gate = pending` and posts a controlled `@codex review` marker.
@@ -39,10 +41,15 @@ itself cannot prove PR isolation.
 
 ## Verify Action Provenance
 
-Use this path when a review or readiness Skill needs to rely on the gate. Keep
-four SHA domains separate: caller workflow definition
-(`github.workflow_sha`), exact API run-attempt head (`head_sha`), called
-implementation (`job.workflow_sha`), and current PR/status head. Never require
+Use this path when a review or readiness Skill needs to rely on the gate. Let
+`W` be `job.workflow_sha`, the matching exact-attempt
+`referenced_workflows[].sha`, and receipt `producer.action.ref`; let `C` be the
+checkout output commit, receipt `producer.action.commit_sha`, and provenance
+`action.commit_oid`; and let `T` be the independently signed
+`tags.v1.tag_object_oid`. Keep four SHA domains separate: caller workflow
+definition (`github.workflow_sha`), exact API run-attempt head (`head_sha`),
+called workflow selected object identity (`job.workflow_sha`), and current
+PR/status head. Never require
 the run-attempt `head_sha` or Artifact API `workflow_run.head_sha` to equal the
 selected receipt status head; the run-attempt head to equal
 `GITHUB_WORKFLOW_SHA`; or `GITHUB_WORKFLOW_SHA` to equal `job.workflow_sha`.
@@ -53,11 +60,28 @@ authoritative machine-readable contract is `producer_receipt_boundary` in
 1. Select the structural mode before validation. After activation, canonical
    GitHub.com reusable mode requires
    `jobs.<job>.uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`.
+   Its called job fixes `runs-on: ubuntu-slim`; caller repository variables
+   cannot substitute a self-hosted runner. Treat that GitHub-hosted runner as a
+   runtime trust root for checkout/worktree/receipt production, not a
+   cryptographic attestation. Direct composite mode retains caller-owned runner
+   configuration.
+   Reusable receipt attribution also requires an independently trusted caller
+   workflow revision and complete job graph. A same-run malicious sibling can
+   race to create the attempt-named artifact and write a matching status.
+   Exact-attempt `referenced_workflows` is run-level only and binds no job,
+   callsite, or receipt. Causal consistency therefore holds only inside the
+   trusted-caller plus fixed-hosted-runner boundary, not as job-scoped
+   cryptographic attribution.
    Floating `@v1` is the intentional centralised pre-execution trust boundary,
    not post-run immutable provenance. Direct mode instead requires
    `JoeyTeng/codex-review-gate-action@<exact-lower-case-40-sha>` and is the
    GitHub Enterprise Server fallback. Never downgrade failed reusable evidence
    to direct mode.
+   Runtime mode selection gives native action context structural priority: if
+   either native action repository/ref field is present, direct identity is
+   recorded and the reusable checkout-commit binding is ignored. Reusable W/C
+   binding applies only when both native fields are absent and the job tuple is
+   exact canonical.
    This receipt-backed positive verification path is GitHub.com-only. GHES
    direct fallback can run the gate, but it cannot supply that admission
    decision.
@@ -75,7 +99,7 @@ authoritative machine-readable contract is `producer_receipt_boundary` in
    64-hex output digest. Download the artifact, verify its digest, and require
    exactly one file named `codex-review-gate-producer-receipt.json`. Validate
    it against `producer-receipt.schema.json` at the root of the dynamically
-   admitted called commit or directly pinned action commit; its path in this
+   admitted peeled action commit or directly pinned action commit; its path in this
    source repository is
    `packages/action/producer-receipt.schema.json`. Although the schema permits
    finalized `completed` and `failed` receipts, this positive path requires
@@ -84,9 +108,12 @@ authoritative machine-readable contract is `producer_receipt_boundary` in
 4. Require GitHub.com, exact run/attempt/attempt-specific target URL, current
    repository, all expected caller/workflow/job fields, and
    `execution.result == completed`. Reusable mode requires the exact canonical
-   `job.workflow_*` tuple and its mapped action repository and
-   `job.workflow_sha` with `immutable: true`; direct mode requires the expected
-   action repository and lower-case 40-SHA with `immutable: true`.
+   `job.workflow_*` tuple and action repository,
+   `producer.action.ref == job.workflow_sha`, the checkout commit bound through
+   `CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA` in
+   `producer.action.commit_sha`, and `immutable: true`; direct mode
+   requires the expected action repository and lower-case 40-SHA with action
+   ref and commit SHA equal and `immutable: true`.
 5. Fetch the attempt with
    `GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}`. Its
    response `url` and `html_url` remain base-run resource URLs. Match the
@@ -94,17 +121,27 @@ authoritative machine-readable contract is `producer_receipt_boundary` in
    `id/head_sha`. In reusable mode, require the optional, nullable
    `referenced_workflows` array to exist and contain exactly one matching
    canonical repository/workflow-path and v1-call entry. Require its `sha` to
-   equal `job.workflow_sha`, the receipt action commit, and the admitted
-   release-provenance `action.commit_oid`; require its `ref` to exist and equal
-   `refs/tags/v1`. This is run-level corroboration only,
+   equal `W` and its `ref` to equal `refs/tags/v1`. Require `W` to equal exactly
+   one declared value in
+   `runtime_closure.called_workflow.workflow_sha_resolution.candidates`, with
+   each candidate equal to its declared field. Admit only current-live `W == T`
+   (`T == tags.v1.tag_object_oid`) or future `W == C` (`C ==
+   action.commit_oid`). In both branches require independently signed `T` to
+   peel directly to `C`, and require `tags.v1.peeled_commit_oid ==
+   action.commit_oid == producer.action.commit_sha`. Other object types, nested
+   tag peels, and zero or multiple candidate matches fail closed. This is run-level corroboration only,
    not a job/receipt mapping or cryptographic binding.
-6. In reusable mode, dynamically admit that called SHA with a
-   trusted-primary-signer-signed annotated immutable `v1.x.y` tag that peels
-   directly to it, the matching GitHub Release whose REST record has
-   `immutable: true`, and the complete release-provenance schema-v2 asset.
-   Require the repository immutable-release setting to be enabled. Verify
-   the trusted signer fingerprint, commit/tree/critical-file bindings, receipt
-   schema v1, and compatible `policy_major == 1`. Never infer a historical run
+6. In reusable mode, enumerate release candidates through the fully paginated GitHub Releases
+   API and require exactly one published, immutable, non-draft,
+   non-prerelease `v1.x.y` release whose trusted-signer tag peels to `C`, whose
+   single complete schema-v2 provenance asset has compatible closed
+   schema/majors and `action.commit_oid == C`, and whose candidate set contains
+   `W` exactly once. Zero or multiple matching releases/assets fail closed.
+   Require independently signed annotated `v1` tag object `T` to peel directly
+   to `C`, including for future `W == C`. Require the repository
+   immutable-release setting to be enabled. Verify both tag signatures and the
+   trusted signer fingerprint, action root tree and critical-file bindings,
+   receipt schema v1, and compatible `policy_major == 1`. Never infer a historical run
    from the current `v1` target.
 7. Within the current-PR/status head domain, REST-list all Commit Status
    records with the request `ref` equal to the exact current PR head; the

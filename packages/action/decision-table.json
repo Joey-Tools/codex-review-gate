@@ -310,10 +310,34 @@
     "producer_protocol_major": 1,
     "canonical_reusable_workflow_reference": "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
     "caller_selector": "v1",
-    "selector_authority": "The permanent v1 caller selector is not authority by itself; consumers must resolve and validate the exact called-workflow commit from the producer receipt and exact run-attempt referenced_workflows evidence.",
+    "selector_authority": "The permanent v1 caller selector is not authority by itself; consumers must bind the receipt and exact run-attempt referenced_workflows evidence to exactly one release provenance workflow SHA candidate, then validate the signed annotated v1 tag and peeled action commit.",
+    "release_provenance_admission": {
+      "first_admitted_reusable_release": "1.5.1",
+      "v1_5_0_complete_asset": {
+        "admission": "fail-closed-not-admitted",
+        "digest_erratum_supported": false
+      }
+    },
     "availability": "GitHub.com only; GitHub Enterprise Server runs do not emit producer receipt artifacts.",
     "artifact_name": "codex-review-gate-producer-receipt-{run_id}-{run_attempt}",
     "artifact_file": "codex-review-gate-producer-receipt.json",
+    "source_checkout": {
+      "step_id": "checkout",
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+      "repository": "${{ job.workflow_repository }}",
+      "ref": "${{ job.workflow_sha }}",
+      "path": ".codex-review-gate-action",
+      "persist_credentials": false,
+      "commit_output": "${{ steps.checkout.outputs.commit }}",
+      "local_action": {
+        "step_id": "gate",
+        "uses": "./.codex-review-gate-action",
+        "checked_out_action_commit_environment": {
+          "name": "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA",
+          "value": "${{ steps.checkout.outputs.commit }}"
+        }
+      }
+    },
     "run_attempt_api": "GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}",
     "artifact_inventory_api": "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
     "artifact_download_api": "GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip",
@@ -339,15 +363,35 @@
         "selection": "exactly-one-exact-called-workflow-member",
         "expected_path": "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
         "expected_ref": "refs/tags/v1",
+        "workflow_sha_resolution": {
+          "manifest_candidates_field": "runtime_closure.called_workflow.workflow_sha_resolution.candidates",
+          "selection": "selected-sha-equals-exactly-one-validated-release-provenance-candidate",
+          "candidate_values_must_equal_declared_fields": true,
+          "candidate_kinds": [
+            {
+              "kind": "signed-major-tag-object",
+              "workflow_sha_field": "tags.v1.tag_object_oid",
+              "action_commit_field": "tags.v1.peeled_commit_oid"
+            },
+            {
+              "kind": "exact-action-commit",
+              "workflow_sha_field": "action.commit_oid",
+              "action_commit_field": "action.commit_oid"
+            }
+          ],
+          "common_required_equality": "tags.v1.peeled_commit_oid-equals-action.commit_oid"
+        },
         "required_equalities": [
           "selected-path-equals-JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
           "selected-ref-equals-refs/tags/v1",
           "selected-sha-equals-receipt-producer-job-workflow_sha",
-          "selected-sha-equals-validated-release-provenance-action-commit_oid",
+          "selected-sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
+          "each-workflow-sha-resolution-candidate-value-equals-its-declared-validated-release-provenance-field",
+          "validated-release-provenance-tags-v1-peeled_commit_oid-equals-validated-release-provenance-action-commit_oid",
           "selected-path-repository-and-file-equal-receipt-producer-job-workflow_repository-and-workflow_file_path"
         ],
         "rerun_resolution": "Validate referenced_workflows from the exact receipt run attempt; never substitute the current v1 target or evidence from another attempt.",
-        "tag_drift": "A later v1 move does not change the exact called-workflow SHA recorded for an earlier run attempt.",
+        "tag_drift": "A later v1 move does not change the exact workflow SHA recorded for an earlier run attempt or its selection from the release provenance candidate set.",
         "authority": "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding"
       }
     },
@@ -358,16 +402,21 @@
       "caller_selector": "v1",
       "caller_ref": "refs/tags/v1",
       "caller_identity_role": "producer.environment.GITHUB_WORKFLOW_REF/SHA-identifies-caller-workflow-file",
-      "called_job_identity_role": "producer.job.workflow_ref/SHA/repository/file_path-identifies-workflow-file-defining-current-job",
+      "called_job_identity_role": "producer.job.workflow_ref/repository/file_path-identifies-workflow-file-defining-current-job-and-workflow_sha-identifies-selected-workflow-object-under-the-closed-resolution-policy",
       "required_equalities": [
         "receipt-producer-job-workflow_repository-equals-JoeyTeng/codex-review-gate-action",
         "receipt-producer-job-workflow_file_path-equals-.github/workflows/codex-review-gate.yml",
         "receipt-producer-job-workflow_ref-equals-JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@refs/tags/v1",
         "receipt-producer-job-workflow_sha-is-lower-case-40-hex",
-        "receipt-producer-job-workflow_sha-equals-validated-release-provenance-action-commit_oid",
+        "receipt-producer-job-workflow_sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
+        "each-workflow-sha-resolution-candidate-value-equals-its-declared-validated-release-provenance-field",
+        "validated-release-provenance-tags-v1-peeled_commit_oid-equals-validated-release-provenance-action-commit_oid",
         "receipt-producer-action-repository-equals-receipt-producer-job-workflow_repository",
         "receipt-producer-action-ref-equals-receipt-producer-job-workflow_sha",
-        "receipt-producer-action-commit_sha-equals-receipt-producer-job-workflow_sha",
+        "reusable-workflow-source-checkout-id-equals-checkout",
+        "reusable-workflow-gate-checked-out-action-commit-env-equals-steps-checkout-outputs-commit",
+        "receipt-producer-action-commit_sha-equals-reusable-workflow-gate-checked-out-action-commit-env",
+        "receipt-producer-action-commit_sha-equals-validated-release-provenance-action-commit_oid",
         "receipt-producer-action-immutable-is-true"
       ],
       "caller_called_sha_domain_separation": "GITHUB_WORKFLOW_SHA identifies the caller workflow file and must not be required to equal producer.job.workflow_sha for a reusable invocation."

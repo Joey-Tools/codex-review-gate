@@ -274,19 +274,45 @@ that token. The caller should own one repository-wide concurrency group with
 must not run concurrently with PR-specific Codex signal runs. Do not duplicate
 the same repository-wide group inside the called workflow.
 
-This caller is staged, not active in the source root or template during the
-release PR. Activation requires the immutable v1.5.0 release and provenance
-asset, verified `v1.5` and `v1` aliases, and a passing live canary, followed by a
-separate activation PR.
+Reusable mode literally fixes `runs-on: ubuntu-slim`. It does not consume a
+caller repository variable for runner selection, preventing a caller-selected
+self-hosted runner from modifying checkout output, the checked-out worktree, or
+receipt production. The GitHub-hosted runner is therefore an explicit runtime
+trust root for reusable admission. Direct composite mode remains caller-owned
+and retains its existing configurable runner boundary. Neither form turns the
+receipt into a cryptographic signature, OIDC attestation, or content-addressed
+storage guarantee.
+
+Reusable receipt attribution additionally assumes an independently trusted
+caller workflow revision and complete caller job graph. A malicious sibling in
+the same run can race to create the attempt-named artifact and write a matching
+status before the called job finishes. Exact-attempt `referenced_workflows`
+corroborates only the run and supplies no job, callsite, or receipt binding.
+The receipt/run chain therefore supplies causal consistency only inside the
+trusted-caller plus fixed-hosted-runner boundary, not job-scoped cryptographic
+attribution.
+
+This caller remains staged, not active in the source root or template. The
+immutable v1.5.0 release exists, but its live canary exposed an incorrect
+commit-versus-tag-object admission contract. Consumers fail closed on v1.5.0;
+there is no digest-keyed erratum. Activation requires the compatible
+v1.5.1 repair and provenance asset, verified `v1.5` and `v1` aliases, and a
+passing replacement live canary, followed by a separate activation PR.
 
 ## Invocation Provenance Boundary
 
 After activation, the canonical GitHub.com workflow calls
 `JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`.
 The floating major alias is an intentional centralised pre-execution trust
-boundary, not post-run immutable provenance. Post-run consumers dynamically
-admit the exact `job.workflow_sha` through the receipt, exact-attempt API
-evidence, and a trusted-primary-signer-signed immutable v1.x.y release and
+boundary, not post-run immutable provenance. Let `W` be the exact selected
+workflow object in `job.workflow_sha`, the matching exact-attempt
+`referenced_workflows[].sha`, and receipt `producer.action.ref`; let `C` be the
+checkout output commit, receipt `producer.action.commit_sha`, and provenance
+`action.commit_oid`; and let `T` be the independently signed
+`tags.v1.tag_object_oid`. The v1.5.0 live canary observed `W == T`, while the
+closed contract also admits a future `W == C` shape. Post-run consumers require
+exactly one of those two candidates and always verify that `T` peels directly
+to `C` through a trusted-primary-signer-signed immutable v1.x.y release and
 provenance asset. No v1.5 SHA is fixed in the caller or consuming Skill.
 
 Direct composite use remains compatible only with an exact lower-case 40-SHA
@@ -321,14 +347,21 @@ On GitHub.com, the composite Action produces the v1 receipt defined by
 contexts and this producer-receipt contract are GitHub.com-only.
 
 For the canonical reusable tuple, the exact repository, workflow file,
-`refs/tags/v1` job ref, and lower-case 40-SHA `job.workflow_sha` map that SHA to
-`producer.action.ref` and `producer.action.commit_sha` with `immutable: true`.
-That canonical job tuple takes priority even when a nested action context is
-also present. Only for a non-canonical reusable tuple does direct mode retain
-the existing mapping from an independently exact lower-case 40-SHA
-`github.action_ref`. A near-canonical reusable tuple never upgrades identity or
-supplies a fallback. Without that exact direct ref, a floating, near-canonical,
-or local invocation produces `immutable: false` and is unusable as provenance.
+`refs/tags/v1` job ref, and lower-case 40-SHA `job.workflow_sha` map that exact
+selected workflow object OID to `producer.action.ref`. The full-SHA-pinned checkout step's
+official `commit` output independently maps to `producer.action.commit_sha`,
+and the producer sets `immutable: true`; that commit must be the admitted
+action commit. Only
+`CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ steps.checkout.outputs.commit }}`
+carries that output into the local composite; no workflow-call/caller input can
+supply it. Native action context has structural priority: if either
+`github.action_repository` or `github.action_ref` is present, the producer
+records that direct context and ignores the reusable checkout-commit
+environment. Such a direct identity is immutable only when its action ref is an
+exact lower-case 40-SHA. The reusable W/C mapping is considered only when both
+native fields are absent and the job tuple is exact canonical. A near-canonical
+tuple never upgrades identity or supplies a fallback; without native context it
+produces `immutable: false` and is unusable as provenance.
 The receipt's run target is exactly
 `https://github.com/<owner>/<repository>/actions/runs/<run_id>/attempts/<attempt>`.
 That attempt path is also the Workflow Run request endpoint. The response
@@ -336,10 +369,14 @@ That attempt path is also the Workflow Run request endpoint. The response
 equal the attempt-specific target.
 
 In a called workflow, `github.workflow_ref` and `github.workflow_sha` retain
-caller identity. The called job's implementation identity is instead supplied
-by `job.workflow_repository`, `job.workflow_file_path`, `job.workflow_ref`, and
-`job.workflow_sha`. The exact self-checkout must use the job repository/SHA
-pair; a bare checkout would materialise the caller repository.
+caller identity. The called job's selected workflow identity is instead
+supplied by `job.workflow_repository`, `job.workflow_file_path`,
+`job.workflow_ref`, and `job.workflow_sha`. That SHA identifies the selected
+workflow object: the current live shape reports the annotated tag object,
+while the closed contract also admits the exact action commit. The
+exact self-checkout must use the job repository/SHA pair; its official `commit`
+output supplies the separately bound peeled commit. A bare checkout would
+materialise the caller repository.
 
 While a receipt is enabled, every `setCommitStatusIfNeeded` decision forces a
 POST from the current run attempt instead of reusing an older matching status.
@@ -364,7 +401,7 @@ requires exactly one artifact.
 
 A review or readiness Skill must keep four SHA domains separate: caller
 workflow definition (`github.workflow_sha`), exact API run-attempt head
-(`head_sha`), called implementation (`job.workflow_sha`), and current
+(`head_sha`), called workflow selected object identity (`job.workflow_sha`), and current
 PR/status head. It must not require the run-attempt `head_sha` or Artifact API
 `workflow_run.head_sha` to equal the selected receipt status head; the
 run-attempt head to equal `GITHUB_WORKFLOW_SHA`; or `GITHUB_WORKFLOW_SHA` to
@@ -383,7 +420,7 @@ authoritative machine-readable contract is `producer_receipt_boundary` in
    64-hex SHA-256 and REST `.digest` to equal `sha256:<raw-output-digest>`.
    Download the artifact, verify its digest, and require exactly one expected
    file. Validate its JSON against `producer-receipt.schema.json` at the root
-   of the dynamically admitted called commit or directly pinned action commit;
+   of the dynamically admitted peeled action commit or directly pinned action commit;
    the same schema's path in this
    source repository is `packages/action/producer-receipt.schema.json`.
 2. The receipt schema permits finalized `execution.result` values of
@@ -392,9 +429,11 @@ authoritative machine-readable contract is `producer_receipt_boundary` in
    evidence and cannot support a positive decision. Also require the exact run
    ID/attempt/name/target URL, `https://github.com`, the current repository,
    and every expected caller/workflow/job field. Select one structural mode:
-   reusable requires the exact canonical job tuple and its mapped action
-   repository and job SHA with `immutable: true`; direct requires the expected
-   action repository and exact lower-case 40-SHA with `immutable: true`.
+   reusable requires the exact canonical job tuple and action repository,
+   `producer.action.ref == job.workflow_sha`, the independently bound checkout
+   commit in `producer.action.commit_sha`, and `immutable: true`; direct
+   requires the expected action repository and exact lower-case 40-SHA with
+   action ref and commit SHA equal and `immutable: true`.
 3. Fetch the run attempt through
    `GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}`; do not
    require response `url` or `html_url` to be attempt-specific. Require the
@@ -402,19 +441,31 @@ authoritative machine-readable contract is `producer_receipt_boundary` in
    the exact attempt response's `id` and `head_sha`. In reusable mode,
    `referenced_workflows` is optional and nullable in the API schema, but
    positive admission requires it to exist and contain exactly one matching
-   canonical repository/workflow-path and v1-call entry. Its required `sha`
-   must equal `job.workflow_sha`, the receipt action commit, and the admitted
-   release-provenance `action.commit_oid`; require its `ref` to exist and equal
-   `refs/tags/v1`. This array is run-level
+   canonical repository/workflow-path and v1-call entry. Let its required
+   `sha`, `job.workflow_sha`, and receipt `producer.action.ref` be `W`; require
+   its `ref` to exist and equal `refs/tags/v1`. Require `W` to equal exactly one
+   declared value in
+   `runtime_closure.called_workflow.workflow_sha_resolution.candidates`, with
+   every candidate value equal to its declared provenance field. The only
+   admitted branches are current-live `W == T`, where `T ==
+   tags.v1.tag_object_oid`, and future `W == C`, where `C ==
+   action.commit_oid`. In both branches require independently signed `T` to
+   peel directly to `C`, and require `tags.v1.peeled_commit_oid ==
+   action.commit_oid == producer.action.commit_sha`. Other object types, nested
+   tag peels, and zero or multiple candidate matches fail closed. This array is run-level
    corroboration only: GitHub defines no entry-to-job or entry-to-receipt map
    and no cryptographic binding.
-4. In reusable mode, admit the called SHA only through a
-   trusted-primary-signer-signed annotated immutable `v1.x.y` tag that peels
-   directly to it, the corresponding GitHub Release whose REST record has
-   `immutable: true`, and a complete release-provenance schema-v2 asset. Require
-   the repository immutable-release setting to be enabled. Verify the
-   trusted signer fingerprint, commit/tree/critical-file bindings, receipt
-   schema v1, and compatible `policy_major == 1`. Resolve historical authority
+4. In reusable mode, enumerate release candidates through the fully paginated GitHub Releases
+   API and require exactly one published, immutable, non-draft,
+   non-prerelease `v1.x.y` release whose trusted-signer tag peels to `C`, whose
+   single complete schema-v2 provenance asset has compatible closed
+   schema/majors and `action.commit_oid == C`, and whose workflow-SHA candidate
+   set contains `W` exactly once. Zero or multiple matching releases or assets
+   fail closed. Require the independently signed annotated `v1` tag object `T`
+   to peel directly to the same `C`, including in the future `W == C` branch.
+   Require the repository immutable-release setting to be enabled. Verify both
+   tags' trusted signer fingerprint, action root tree and critical-file
+   bindings, receipt schema v1, and compatible `policy_major == 1`. Resolve historical authority
    from these immutable records, never from the current target of `v1`.
 5. Within the current-PR/status head domain, REST-list all Commit Status
    records with the request `ref` equal to the exact current PR head; the
