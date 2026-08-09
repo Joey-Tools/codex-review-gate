@@ -82,10 +82,22 @@ inputs:
     required: false
     default: ""
 
+outputs:
+  producer-receipt-artifact-id:
+    description: GitHub artifact ID for the run-attempt producer receipt.
+    value: ${{ steps.upload-producer-receipt.outputs.artifact-id }}
+  producer-receipt-artifact-url:
+    description: GitHub URL for the run-attempt producer receipt artifact.
+    value: ${{ steps.upload-producer-receipt.outputs.artifact-url }}
+  producer-receipt-artifact-digest:
+    description: SHA-256 digest reported for the producer receipt artifact.
+    value: ${{ steps.upload-producer-receipt.outputs.artifact-digest }}
+
 runs:
   using: composite
   steps:
     - name: Run Codex review gate
+      id: gate
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -94,6 +106,15 @@ runs:
         GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         GITHUB_SERVER_URL: ${{ github.server_url }}
         GITHUB_API_URL: ${{ github.api_url }}
+        CODEX_REVIEW_GATE_RECEIPT_PATH: ${{ github.server_url == 'https://github.com' && format('{0}/codex-review-gate-producer-receipt.json', runner.temp) || '' }}
+        CODEX_REVIEW_GATE_ACTION_REPOSITORY: ${{ github.action_repository }}
+        CODEX_REVIEW_GATE_ACTION_REF: ${{ github.action_ref }}
+        CODEX_REVIEW_GATE_WORKFLOW_REF: ${{ github.workflow_ref }}
+        CODEX_REVIEW_GATE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        CODEX_REVIEW_GATE_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+        CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
         PR_NUMBER: ${{ inputs.pull-request }}
         HEAD_SHA: ${{ inputs.head-sha }}
         STATUS_CONTEXT: ${{ inputs.status-context }}
@@ -113,3 +134,14 @@ runs:
         CODEX_BOT_LOGINS: ${{ inputs.codex-bot-logins }}
         TRUSTED_COMMENT_LOGINS: ${{ inputs.trusted-comment-logins }}
       run: node "$GITHUB_ACTION_PATH/src/gate.mjs"
+    - name: Upload producer receipt
+      id: upload-producer-receipt
+      if: ${{ always() && steps.gate.outputs.producer-receipt-finalized == 'true' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: codex-review-gate-producer-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/codex-review-gate-producer-receipt.json
+        if-no-files-found: error
+        compression-level: 0
+        overwrite: false
+        include-hidden-files: false

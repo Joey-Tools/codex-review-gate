@@ -1,0 +1,371 @@
+{
+  "schema": "urn:joeyteng:codex-review-gate:decision-table:1",
+  "schema_version": 1,
+  "policy_version": "1.4.0",
+  "pass_scope": "A pass means only that the required commit status for the current commit is success; it does not attest triple-review completion or pull-request merge readiness.",
+  "status_precedence": [
+    {
+      "rank": 1,
+      "state": "failure",
+      "when": "one or more current-head or proven-ancestor findings remain applicable",
+      "mixed_input_summary": "Report the confirmed finding and also name any concurrent deterministic or exhausted transient evidence error."
+    },
+    {
+      "rank": 2,
+      "state": "error",
+      "when": "no applicable finding remains and deterministic invalid evidence or an exhausted transient acquisition/reconciliation error is present",
+      "mixed_input_summary": "Do not hide the evidence error behind an older clean artifact or an unknown ancestry claim."
+    },
+    {
+      "rank": 3,
+      "state": "success",
+      "when": "a carrier-valid selected clean artifact binds strongly to the current head, no applicable finding or evidence error remains, and the final PR/head/complete-evidence reread is stable",
+      "mixed_input_summary": "Success is forbidden until final stability and the absence of applicable unresolved findings are re-established."
+    },
+    {
+      "rank": 4,
+      "state": "pending",
+      "when": "the remaining current-scope evidence is valid progress, a bounded recoverable acquisition/reconciliation wait, or no acceptable terminal artifact",
+      "mixed_input_summary": "Pending follows the existing marker and deadline orchestration and does not itself authorize a replacement review request."
+    }
+  ],
+  "commit_binding": {
+    "issue_comment_clean": "Exactly one syntactically valid Reviewed commit marker is required and must resolve uniquely to the current full commit SHA.",
+    "pull_request_review_clean": "The native REST full commit_id is authoritative; every reviewed-commit hash present in the body must agree with it.",
+    "finding": "The provider identity and exact repository/full-commit binding must be validated before a commit relation can be classified.",
+    "request_watermark": "A request watermark is orchestration history only and never substitutes for artifact commit binding."
+  },
+  "evidence_rows": [
+    {
+      "id": "clean-current",
+      "evidence": "clean",
+      "relation": "current",
+      "precondition": "carrier-valid strong commit binding",
+      "reducer_effect": "select-success-candidate",
+      "controlling_state": "success-after-final-stability"
+    },
+    {
+      "id": "clean-ancestor",
+      "evidence": "clean",
+      "relation": "ancestor",
+      "precondition": "carrier-valid and parent-proved ancestry",
+      "reducer_effect": "audit-stale",
+      "controlling_state": "pending"
+    },
+    {
+      "id": "clean-nonancestor",
+      "evidence": "clean",
+      "relation": "nonancestor",
+      "precondition": "carrier-valid identity and parent-proved non-ancestry",
+      "reducer_effect": "audit-ignore-and-reduce-remaining",
+      "controlling_state": "none"
+    },
+    {
+      "id": "clean-unknown-retryable",
+      "evidence": "clean",
+      "relation": "unknown",
+      "precondition": "identity and commit are known; ancestry acquisition is explicitly recoverable and within budget",
+      "reducer_effect": "retry-ancestry-only",
+      "controlling_state": "pending"
+    },
+    {
+      "id": "clean-unknown-exhausted",
+      "evidence": "clean",
+      "relation": "unknown",
+      "precondition": "ancestry acquisition is unrecoverable or its bounded budget is exhausted",
+      "reducer_effect": "evidence-error",
+      "controlling_state": "error:ancestry-unverified"
+    },
+    {
+      "id": "clean-binding-invalid",
+      "evidence": "clean",
+      "relation": "invalid",
+      "precondition": "provider identity, carrier grammar, commit identity, or commit agreement is invalid",
+      "reducer_effect": "deterministic-evidence-error",
+      "controlling_state": "error"
+    },
+    {
+      "id": "finding-threadless-current",
+      "evidence": "threadless-finding",
+      "relation": "current",
+      "precondition": "carrier-valid exact identity and commit binding",
+      "reducer_effect": "blocking-unless-strictly-later-current-clean",
+      "controlling_state": "failure"
+    },
+    {
+      "id": "finding-threadless-ancestor",
+      "evidence": "threadless-finding",
+      "relation": "ancestor",
+      "precondition": "carrier-valid exact identity and parent-proved ancestry",
+      "reducer_effect": "blocking-unless-strictly-later-current-clean",
+      "controlling_state": "failure"
+    },
+    {
+      "id": "finding-threadless-nonancestor",
+      "evidence": "threadless-finding",
+      "relation": "nonancestor",
+      "precondition": "exact identity and commit plus parent-proved non-ancestry",
+      "reducer_effect": "audit-ignore-and-reduce-remaining",
+      "controlling_state": "none"
+    },
+    {
+      "id": "finding-threadless-unknown-retryable",
+      "evidence": "threadless-finding",
+      "relation": "unknown",
+      "precondition": "identity and commit are known; ancestry acquisition is explicitly recoverable and within budget",
+      "reducer_effect": "retry-ancestry-only",
+      "controlling_state": "pending"
+    },
+    {
+      "id": "finding-threadless-unknown-exhausted",
+      "evidence": "threadless-finding",
+      "relation": "unknown",
+      "precondition": "ancestry acquisition is unrecoverable or its bounded budget is exhausted",
+      "reducer_effect": "evidence-error-not-confirmed-finding",
+      "controlling_state": "error:ancestry-unverified"
+    },
+    {
+      "id": "finding-threadless-binding-invalid",
+      "evidence": "threadless-finding",
+      "relation": "invalid",
+      "precondition": "identity or commit binding cannot be established",
+      "reducer_effect": "deterministic-evidence-error-not-nonancestor",
+      "controlling_state": "error"
+    },
+    {
+      "id": "finding-thread-current-unresolved",
+      "evidence": "joined-thread-finding",
+      "relation": "current",
+      "precondition": "authoritative exact-thread isResolved is exactly false",
+      "reducer_effect": "blocking",
+      "controlling_state": "failure"
+    },
+    {
+      "id": "finding-thread-ancestor-unresolved",
+      "evidence": "joined-thread-finding",
+      "relation": "ancestor",
+      "precondition": "authoritative exact-thread isResolved is exactly false",
+      "reducer_effect": "blocking",
+      "controlling_state": "failure"
+    },
+    {
+      "id": "finding-thread-current-resolved",
+      "evidence": "joined-thread-finding",
+      "relation": "current",
+      "precondition": "authoritative exact-thread isResolved is exactly true",
+      "reducer_effect": "closed-by-exact-thread-authority",
+      "controlling_state": "none"
+    },
+    {
+      "id": "finding-thread-ancestor-resolved",
+      "evidence": "joined-thread-finding",
+      "relation": "ancestor",
+      "precondition": "authoritative exact-thread isResolved is exactly true",
+      "reducer_effect": "closed-by-exact-thread-authority",
+      "controlling_state": "none"
+    },
+    {
+      "id": "finding-thread-nonancestor",
+      "evidence": "joined-thread-finding",
+      "relation": "nonancestor",
+      "precondition": "exact identity and commit plus parent-proved non-ancestry",
+      "reducer_effect": "audit-ignore-and-reduce-remaining",
+      "controlling_state": "none"
+    },
+    {
+      "id": "finding-thread-unknown-retryable",
+      "evidence": "joined-thread-finding",
+      "relation": "unknown",
+      "precondition": "identity and commit are known; ancestry acquisition is explicitly recoverable and within budget",
+      "reducer_effect": "retry-ancestry-only",
+      "controlling_state": "pending"
+    },
+    {
+      "id": "finding-thread-unknown-exhausted",
+      "evidence": "joined-thread-finding",
+      "relation": "unknown",
+      "precondition": "ancestry acquisition is unrecoverable or its bounded budget is exhausted",
+      "reducer_effect": "evidence-error-not-confirmed-finding",
+      "controlling_state": "error:ancestry-unverified"
+    },
+    {
+      "id": "finding-thread-binding-invalid",
+      "evidence": "joined-thread-finding",
+      "relation": "invalid",
+      "precondition": "thread identity, provider identity, commit binding, or authoritative resolution-state schema cannot be established",
+      "reducer_effect": "deterministic-evidence-error-not-nonancestor",
+      "controlling_state": "error"
+    },
+    {
+      "id": "progress-current-scope",
+      "evidence": "progress",
+      "relation": "current-scope",
+      "precondition": "valid provider identity and closed progress grammar",
+      "reducer_effect": "pending-when-no-higher-precedence-result",
+      "controlling_state": "pending"
+    },
+    {
+      "id": "malformed-deterministic",
+      "evidence": "malformed",
+      "relation": "not-applicable",
+      "precondition": "provider identity, schema, grammar, or commit binding is deterministically invalid",
+      "reducer_effect": "deterministic-evidence-error-no-review-post",
+      "controlling_state": "error"
+    },
+    {
+      "id": "transient-incomplete-retryable",
+      "evidence": "transient-incomplete",
+      "relation": "not-yet-known",
+      "precondition": "pagination, API, ancestry, or reconciliation acquisition is explicitly recoverable and within budget",
+      "reducer_effect": "bounded-acquisition-or-reconciliation-retry-no-review-post",
+      "controlling_state": "pending"
+    },
+    {
+      "id": "transient-incomplete-exhausted",
+      "evidence": "transient-incomplete",
+      "relation": "not-yet-known",
+      "precondition": "the bounded acquisition/reconciliation budget is exhausted",
+      "reducer_effect": "evidence-error-no-review-post",
+      "controlling_state": "error"
+    },
+    {
+      "id": "plus-one",
+      "evidence": "+1",
+      "relation": "not-applicable",
+      "precondition": "any reaction source or timing",
+      "reducer_effect": "audit-only",
+      "controlling_state": "none"
+    },
+    {
+      "id": "eyes",
+      "evidence": "eyes",
+      "relation": "not-applicable",
+      "precondition": "trusted acknowledgement reaction",
+      "reducer_effect": "waiting-ack-to-waiting-result-only",
+      "controlling_state": "none"
+    },
+    {
+      "id": "nonancestor-only",
+      "evidence": "proved-nonancestor-only-set",
+      "relation": "nonancestor",
+      "precondition": "all otherwise valid evidence is proved non-ancestor",
+      "reducer_effect": "audit-ignore-all-and-reduce-to-no-terminal-result",
+      "controlling_state": "pending"
+    },
+    {
+      "id": "final-reread-instability",
+      "evidence": "final-reread-race",
+      "relation": "not-applicable",
+      "precondition": "the final PR lifecycle, head, complete snapshot, selected clean, blocking set, or decision certificate differs from the initial stable reduction",
+      "reducer_effect": "refuse-success-and-fail-closed",
+      "controlling_state": "error"
+    },
+    {
+      "id": "overall-max-wait-expired",
+      "evidence": "marker-deadline",
+      "relation": "not-applicable",
+      "precondition": "no acceptable current-head terminal result exists when the fixed overall max-wait deadline expires",
+      "reducer_effect": "close-wait-and-fail",
+      "controlling_state": "failure"
+    }
+  ],
+  "finding_closure": {
+    "joined_thread": "Only authoritative isResolved === true for the exact joined thread closes the finding; isOutdated and later clean artifacts have no closing authority.",
+    "threadless": "An older same-head or proven-ancestor threadless finding is superseded only by the selected carrier-valid current-head clean artifact when it is strictly later.",
+    "strictly_later": "Issue comments order by validated updated_at revision time; equal revision seconds are always ambiguous and issue-comment IDs never break that tie because created_at equal to updated_at cannot prove that no same-second edit occurred. Pull-request reviews order by validated submitted_at, where a larger canonical numeric ID breaks an equal-time tie only within that review channel. Equal-time cross-channel pairs are ambiguous evidence errors.",
+    "nonancestor": "Non-ancestor removal is scope exclusion, never finding closure.",
+    "unknown": "Unknown ancestry never authorises supersession or non-ancestor exclusion."
+  },
+  "orchestration": {
+    "initial_ack_seconds": 300,
+    "ack_retry": "exponential-backoff",
+    "ack_retry_cap_seconds": 1800,
+    "result_deadline_seconds": 3600,
+    "result_deadline_origin": "request-or-marker creation",
+    "overall_max_wait_seconds": 7200,
+    "eyes_effect": "Move waiting_ack to waiting_result without resetting or extending result deadline.",
+    "plus_one_effect": "No pass, acknowledgement, timeout reset, or deadline extension.",
+    "progress_effect": "Keep pending under the existing marker/deadline; do not acknowledge, reset, extend, or immediately repost a review request.",
+    "malformed_effect": "Write deterministic error without automatically posting a review request.",
+    "transient_effect": "Retry only bounded acquisition/reconciliation; never blind-POST a review request."
+  },
+  "final_success_stability": {
+    "required_order": [
+      "best-effort newest logical-context status read",
+      "PR lifecycle and exact-head reread",
+      "final fully paginated provider/thread snapshot reread with bounded orphan reconciliation",
+      "stable provider identity, commit relation, finding set, selected clean, and decision-certificate re-reduction",
+      "status POST for the exact current run attempt when receipt mode is enabled"
+    ],
+    "must_confirm": [
+      "current PR is open and non-draft",
+      "head SHA is unchanged",
+      "selected clean is carrier-valid and strongly bound to current head",
+      "no applicable unresolved finding remains",
+      "no deterministic or exhausted transient evidence error remains"
+    ]
+  },
+  "producer_receipt_boundary": {
+    "canonical_action_reference_format": "JoeyTeng/codex-review-gate-action@ followed by the exact lower-case 40-hex action commit",
+    "floating_tags": "v1 and v1.4 are convenience aliases only and never canonical provenance pins.",
+    "availability": "GitHub.com only; GitHub Enterprise Server runs do not emit producer receipt artifacts.",
+    "artifact_name": "codex-review-gate-producer-receipt-{run_id}-{run_attempt}",
+    "artifact_file": "codex-review-gate-producer-receipt.json",
+    "run_attempt_api": "GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}",
+    "artifact_inventory_api": "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+    "artifact_download_api": "GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip",
+    "status_context": "codex/review-gate",
+    "status_context_selection": "Select the newest logical context case-insensitively, then require exact context spelling on the selected status.",
+    "status_create_api": "POST /repos/{owner}/{repo}/statuses/{sha}",
+    "status_list_api": "GET /repos/{owner}/{repo}/commits/{ref}/statuses",
+    "status_get_by_id_api": null,
+    "status_target_url": "https://github.com/{owner}/{repo}/actions/runs/{run_id}/attempts/{run_attempt}",
+    "status_post_response": "Retain the exact REST id and node_id plus echoed context/state/description/target_url and creator identity.",
+    "status_graphql_reread": "POST https://api.github.com/graphql node(id: $node_id) as StatusContext and compare id, context, state, description, targetUrl, createdAt, creator, and commit.oid.",
+    "deduplication": "Receipt mode always reasserts the current attempt status. Outside receipt mode, deduplicate only an exact current-attempt target_url, exact context spelling, exact state, and github-actions[bot]/Bot producer.",
+    "run_attempt_identity": {
+      "head_role": "caller-workflow-event-commit",
+      "required_equalities": [
+        "id-equals-receipt-producer-run-id",
+        "run_attempt-equals-receipt-producer-run-attempt",
+        "repository-full_name-equals-receipt-producer-repository",
+        "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA"
+      ]
+    },
+    "artifact_run_association": {
+      "required_equalities": [
+        "artifact-api-workflow_run-id-equals-exact-run-attempt-id",
+        "artifact-api-workflow_run-head_sha-equals-exact-run-attempt-head_sha"
+      ]
+    },
+    "status_head_identity": {
+      "head_role": "current-pull-request-head",
+      "required_equalities": [
+        "selected-receipt-status-head_sha-equals-current-pull-request-head_sha",
+        "rest-status-list-request-ref-equals-current-pull-request-head_sha",
+        "selected-graphql-status-context-commit-oid-equals-current-pull-request-head_sha",
+        "selected-receipt-status-head_sha-equals-selected-graphql-status-context-commit-oid"
+      ]
+    },
+    "head_domain_separation": {
+      "workflow_run_head_may_differ_from_status_and_pull_request_head": true,
+      "consumer_must_not_require": [
+        "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
+        "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha"
+      ]
+    },
+    "positive_consumer_requirement": {
+      "operator": "all-of",
+      "execution": {
+        "result": "completed"
+      },
+      "selected_status": {
+        "membership": "unique-rest-record-and-receipt-status-member",
+        "rest_record_state": "success",
+        "receipt_member_state": "success"
+      }
+    },
+    "provenance_strength": "A validated run-bound artifact is causal producer evidence, not a signature, OIDC attestation, cryptographic provenance proof, or content-addressed storage guarantee.",
+    "consumer_requirement": "Consumers must validate the exact run-attempt API response, run-level artifact inventory, attempt-specific artifact name, artifact metadata/run association/id/url/digest and receipt bytes, REST status membership, GraphQL StatusContext membership, exact workflow/action bindings, and independently re-reduce provider evidence."
+  }
+}

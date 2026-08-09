@@ -355,9 +355,6 @@ export function parseCodexIssueCommentArtifact(
   if (!terminalHeading.terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
     return null;
   }
-  if (terminalHeading.progress) {
-    return null;
-  }
 
   const base = providerArtifactIdentity(comment, "issue-comment");
   if (base.kind === "malformed") {
@@ -379,6 +376,23 @@ export function parseCodexIssueCommentArtifact(
       ...base,
       kind: "malformed",
       reason: `official Codex issue comment is not bound to ${OFFICIAL_CODEX_APP_SLUG}`,
+    };
+  }
+
+  if (terminalHeading.progress) {
+    if (base.orderingError) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: base.orderingError,
+      };
+    }
+    return {
+      ...base,
+      kind: "pending",
+      pendingKind: "progress",
+      auditOnly: true,
+      reason: "Codex review is in progress",
     };
   }
 
@@ -484,14 +498,21 @@ export function parseCodexReviewArtifact(
   }
 
   if (review.state === "APPROVED") {
+    const bodyCommitReferencesAgree = approvedReviewBodyCommitReferencesAgree(
+      body,
+      review.commit_id,
+    );
     if (
       cleanBodyContainsFindingSignals(body) ||
+      !bodyCommitReferencesAgree ||
       !approvedReviewCleanBodyHasClosedGrammar(body)
     ) {
       return {
         ...base,
         kind: "malformed",
-        reason: "Codex review state conflicts with its non-clean body",
+        reason: bodyCommitReferencesAgree
+          ? "Codex review state conflicts with its non-clean body"
+          : "Codex approved review body commit reference conflicts with native review commit",
       };
     }
     return {
@@ -593,6 +614,12 @@ export function collectCodexThreadEvidence(
   const reviewCommentsList = reviewComments || [];
   const errors = [];
   const transientErrors = [];
+  const normalizedHeadSha = isFullCommitSha(headSha)
+    ? String(headSha).toLowerCase()
+    : "";
+  if (!normalizedHeadSha) {
+    errors.push("current head is not a full commit SHA");
+  }
   const reviewById = new Map();
   const restCommentByNodeId = new Map();
   const restCommentByDatabaseId = new Map();
@@ -602,6 +629,7 @@ export function collectCodexThreadEvidence(
   const verifiedRestCommentNodeIds = new Set();
   const validatedCodexInlineParentReviewIds = new Set();
   const findingByThreadId = new Map();
+  const conflictingThreadBindings = new Set();
 
   for (const review of reviews || []) {
     const reviewId = normalizeRestDatabaseId(review?.id);
@@ -760,18 +788,6 @@ export function collectCodexThreadEvidence(
       continue;
     }
 
-    const threadId = String(thread.id || `comment:${comment.id}`);
-    if (unresolved && !findingByThreadId.has(threadId)) {
-      const location = [
-        thread.path || comment.path,
-        thread.line || comment.line || comment.original_line,
-      ].filter((part) => part !== null && part !== undefined).join(":");
-      findingByThreadId.set(threadId, {
-        id: `thread:${threadId}`,
-        sample: location || `review comment ${comment.id}`,
-      });
-    }
-
     if (!isTrustedCodexRestUser(comment.user, botLogins)) {
       errors.push(`review comment ${comment.id} author is not a Bot`);
       continue;
@@ -803,12 +819,49 @@ export function collectCodexThreadEvidence(
 
     validatedCodexInlineParentReviewIds.add(normalizedReviewId);
 
-    if (!unresolved) {
-      continue;
+    if (unresolved) {
+      const threadId = String(thread.id || `comment:${comment.id}`);
+      const location = [
+        thread.path || comment.path,
+        thread.line || comment.line || comment.original_line,
+      ].filter((part) => part !== null && part !== undefined).join(":");
+      const sample = location || `review comment ${comment.id}`;
+      const parentHeadSha = parentReview.commit_id.toLowerCase();
+      const existing = findingByThreadId.get(threadId);
+      if (!existing) {
+        findingByThreadId.set(threadId, {
+          id: `thread:${threadId}`,
+          samples: new Set([sample]),
+          headShas: new Set([parentHeadSha]),
+        });
+      } else {
+        existing.samples.add(sample);
+        existing.headShas.add(parentHeadSha);
+      }
+      if (
+        existing &&
+        existing.headShas.size > 1 &&
+        !conflictingThreadBindings.has(threadId)
+      ) {
+        conflictingThreadBindings.add(threadId);
+        errors.push(
+          `unresolved review thread ${threadId} contains Codex findings bound to conflicting parent commits`,
+        );
+      }
     }
   }
 
-  const findings = [...findingByThreadId.values()];
+  const findings = [...findingByThreadId.values()].map((finding) => {
+    const headShas = [...finding.headShas].sort();
+    const samples = [...finding.samples].sort();
+    return {
+      id: finding.id,
+      sample: samples[0],
+      headSha: headShas[0],
+      currentHead: headShas.includes(normalizedHeadSha),
+      ...(headShas.length > 1 ? { headShas } : {}),
+    };
+  });
   return {
     count: findings.length,
     ids: findings.map((finding) => finding.id),
@@ -816,6 +869,7 @@ export function collectCodexThreadEvidence(
     errors,
     transientErrors,
     validatedCodexInlineParentReviewIds: [...validatedCodexInlineParentReviewIds],
+    findings,
   };
 }
 
@@ -889,7 +943,9 @@ export function issueCommentIdentity(comment) {
 
   return {
     id: String(comment.id),
-    createdAt: comment.created_at,
+    createdAt: comment.updated_at || comment.created_at,
+    carrierCreatedAt: comment.created_at || "",
+    carrierUpdatedAt: comment.updated_at || "",
     user: comment.user?.login || "",
     url: comment.html_url || null,
   };
@@ -897,7 +953,7 @@ export function issueCommentIdentity(comment) {
 
 export function summarizeCodexReactions(reactions, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   return {
-    plusOne: selectLatestCodexReaction(reactions, "+1", botLogins),
+    plusOne: selectLatestCodexAuditReaction(reactions, botLogins),
     eyes: selectLatestCodexReaction(reactions, "eyes", botLogins),
   };
 }
@@ -907,10 +963,14 @@ export function summarizeCodexSignalReactions(
   markerCommentReactions,
   botLogins = DEFAULT_CODEX_BOT_LOGINS,
 ) {
-  return summarizeCodexReactions(
+  const reactions = summarizeCodexReactions(
     [...(issueReactions || []), ...(markerCommentReactions || [])],
     botLogins,
   );
+  return {
+    plusOne: null,
+    eyes: reactions.eyes,
+  };
 }
 
 export function selectLatestCodexReaction(reactions, content, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
@@ -930,14 +990,50 @@ export function selectLatestCodexReaction(reactions, content, botLogins = DEFAUL
   return matches[0] || null;
 }
 
+function selectLatestCodexAuditReaction(reactions, botLogins) {
+  const matches = reactions
+    .filter((reaction) =>
+      reaction?.content === "+1" && isCodexBot(reaction.user?.login, botLogins),
+    )
+    .map((reaction) => {
+      const id = normalizeRestDatabaseId(reaction.id);
+      if (!id || !isValidTimestampString(reaction.created_at)) {
+        return null;
+      }
+      return {
+        ...reactionIdentity(reaction),
+        id,
+      };
+    })
+    .filter(Boolean);
+
+  matches.sort((left, right) => {
+    const byCreatedAt = Date.parse(right.createdAt) - Date.parse(left.createdAt);
+    if (byCreatedAt !== 0) {
+      return byCreatedAt;
+    }
+    const leftId = BigInt(left.id);
+    const rightId = BigInt(right.id);
+    return rightId > leftId ? 1 : rightId < leftId ? -1 : 0;
+  });
+
+  return matches[0] || null;
+}
+
 export function selectLatestCodexCompletionComment(comments, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   const matches = comments
     .filter((comment) => isCodexCompletionComment(comment, botLogins))
-    .map(issueCommentIdentity);
+    .map(issueCommentIdentity)
+    .filter((identity) =>
+      isValidTimestampString(identity.carrierCreatedAt) &&
+      isValidTimestampString(identity.carrierUpdatedAt) &&
+      parseTimestamp(identity.carrierUpdatedAt, "Codex issue comment revision time") >=
+        parseTimestamp(identity.carrierCreatedAt, "Codex issue comment creation time"),
+    );
 
   matches.sort((left, right) => {
-    const byCreatedAt = parseTimestamp(right.createdAt, "Codex issue comment creation time") -
-      parseTimestamp(left.createdAt, "Codex issue comment creation time");
+    const byCreatedAt = parseTimestamp(right.createdAt, "Codex issue comment revision time") -
+      parseTimestamp(left.createdAt, "Codex issue comment revision time");
     if (byCreatedAt !== 0) {
       return byCreatedAt;
     }
@@ -1097,17 +1193,7 @@ export function markerTimeoutOutcome(activeMarker, nowMs = Date.now()) {
 }
 
 export function codexAutoReviewLooksOngoing(reactions) {
-  if (!reactions.eyes) {
-    return false;
-  }
-  if (!reactions.plusOne) {
-    return true;
-  }
-
-  return (
-    parseTimestamp(reactions.eyes.createdAt, "Codex eyes reaction creation time") >
-    parseTimestamp(reactions.plusOne.createdAt, "Codex +1 reaction creation time")
-  );
+  return Boolean(reactions.eyes);
 }
 
 export function decideBootstrapProgress({ startedAt, nowMs, graceSeconds, reactions }) {
@@ -1254,22 +1340,64 @@ function safeDecodeURIComponent(value) {
 
 function providerArtifactIdentity(value, source) {
   const id = normalizeRestDatabaseId(value?.id);
+  const carrierCreatedAt = value?.created_at || "";
+  const carrierUpdatedAt = source === "issue-comment"
+    ? value?.updated_at || ""
+    : carrierCreatedAt;
+  const revisionAt = carrierUpdatedAt || carrierCreatedAt;
   if (!id) {
     return {
       source,
       id: "invalid",
-      createdAt: value?.created_at || "",
+      createdAt: revisionAt,
+      carrierCreatedAt,
+      carrierUpdatedAt,
+      revisionAt,
       url: value?.html_url || null,
       kind: "malformed",
       reason: `Codex ${source} does not have a valid positive integer id`,
     };
   }
-  return {
+  const identity = {
     source,
     id,
-    createdAt: value?.created_at || "",
+    createdAt: revisionAt,
+    carrierCreatedAt,
+    carrierUpdatedAt,
+    revisionAt,
+    edited: source === "issue-comment" && carrierUpdatedAt !== carrierCreatedAt,
     url: value?.html_url || null,
   };
+  let createdAtMs;
+  let updatedAtMs;
+  try {
+    if (!isValidTimestampString(carrierCreatedAt)) {
+      throw new Error(`invalid Codex ${source} creation time: ${carrierCreatedAt}`);
+    }
+    if (!isValidTimestampString(carrierUpdatedAt)) {
+      throw new Error(`invalid Codex ${source} revision time: ${carrierUpdatedAt}`);
+    }
+    createdAtMs = parseTimestamp(
+      carrierCreatedAt,
+      `Codex ${source} creation time`,
+    );
+    updatedAtMs = parseTimestamp(
+      carrierUpdatedAt,
+      `Codex ${source} revision time`,
+    );
+  } catch (error) {
+    return {
+      ...identity,
+      orderingError: error.message,
+    };
+  }
+  if (updatedAtMs < createdAtMs) {
+    return {
+      ...identity,
+      orderingError: `Codex ${source} revision time precedes its creation time`,
+    };
+  }
+  return identity;
 }
 
 function compareProviderArtifactIds(left, right) {
@@ -1421,6 +1549,23 @@ function officialCodexDisclosureHasClosedGrammar(value) {
     "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
     "</details>",
   ].join("\n");
+}
+
+function approvedReviewBodyCommitReferencesAgree(body, nativeCommitId) {
+  const commitId = String(nativeCommitId || "").toLowerCase();
+  if (!isFullCommitSha(commitId)) {
+    return false;
+  }
+
+  const references = [
+    ...String(body || "").matchAll(/`([0-9a-f]{40}|[0-9a-f]{10})`/gi),
+  ];
+  return references.every((reference) => {
+    const normalized = reference[1].toLowerCase();
+    return normalized.length === 40
+      ? normalized === commitId
+      : commitId.startsWith(normalized);
+  });
 }
 
 function approvedReviewCleanBodyHasClosedGrammar(body) {

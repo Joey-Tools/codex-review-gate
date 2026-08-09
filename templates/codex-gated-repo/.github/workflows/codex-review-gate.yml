@@ -67,14 +67,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Gate on Codex review
-        # Owner-approved floating major; automatic upgrades are intentional.
-        uses: JoeyTeng/codex-review-gate-action@v1
+        # Replace this release placeholder with the exact 40-SHA published in
+        # the v1.4.0 release notes before enabling this workflow.
+        uses: JoeyTeng/codex-review-gate-action@<v1.4.0-action-commit-sha>
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
           head-sha: ${{ github.event.pull_request.head.sha || '' }}
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
-          completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
-          failed-findings-recovery: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY }}
-          failed-findings-recovery-mode: ${{ vars.CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE }}

@@ -64,7 +64,24 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 subtree 边界。使用 `scripts/release-action-subtree.sh` 校验源码树，并计算发布到 action
 仓库的 split commit。
 
-消费者应使用 `JoeyTeng/codex-review-gate-action@v1`。签名的 floating major tag 会
-自动接收兼容的 v1 更新；`v1.3.0` 等 immutable release tags 仍可用于审计和回滚。
+Canonical workflow 必须 pin action release 仓库中的 exact 40-hex commit。在 1.4.0
+subtree split 生成前，源码文档使用显式 placeholder：
+
+```yaml
+- uses: JoeyTeng/codex-review-gate-action@<v1.4.0-action-commit-sha>
+```
+
+源码 merge 且 action 仓库同步完成后，v1.4.0 release notes 和 release provenance
+manifest 会发布应替换进去的 exact value。Floating `@v1.4` 与 `@v1` 只用于 convenience；
+它们绝不是 canonical 或可承载 provenance 的 reference。
+
+`codex/review-gate` 只报告本 action 的 required commit-status 结果；它不证明 named
+triple review 已完成，也不证明 PR 整体 merge-ready。完整约束见
+[action 语义](packages/action/README.zh-CN.md#它检查什么)和
+[evidence reconciliation 设计](packages/action/DESIGN.zh-CN.md#evidence-reconciliation)。
+v1 producer receipt 为 exact pinned invocation 提供 causal producer evidence，但
+consumer 必须校验其 run-attempt artifact，并继续独立归约 provider evidence；见
+[invocation provenance](packages/action/README.zh-CN.md#invocation-provenance)。
+`v1.4.0` 等 immutable tags 与既有 `v1.3.x` releases 都会保留，供审计和回滚使用。
 
 完整流程见 [docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。
