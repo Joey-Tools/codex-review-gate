@@ -30,7 +30,10 @@ Commit Status 按 repository SHA/context 建立，不按 PR 隔离。多个 open
 
 ## 校验 Action Provenance
 
-Review 或 readiness skill 需要依赖 gate 时，使用以下路径：
+Review 或 readiness skill 需要依赖 gate 时，使用以下路径。必须把 run-attempt
+head domain 与 current-PR/status head domain 分开校验；它们的机器可读权威合同是
+[`decision-table.json`](decision-table.json) 中的
+`producer_receipt_boundary`：
 
 1. 确认 repository workflow 使用 release notes/provenance manifest 发布的值，pin
    `JoeyTeng/codex-review-gate-action@<exact-action-repository-40-sha>`。Floating
@@ -53,19 +56,28 @@ Review 或 readiness skill 需要依赖 gate 时，使用以下路径：
    exact expected action repository 和 40-SHA with `immutable: true`，以及所有
    expected environment/workflow/job fields。`job.workflow_*` fields 仅适用于 GitHub.com。
    通过 attempt-specific Workflow Run request endpoint 取得 attempt；response `url` 与
-   `html_url` 仍是 base-run resource URLs，不必等于 attempt-specific status target。
-5. 通过 REST 列出 exact current PR head 的所有 Commit Status records。选择
-   case-insensitive logical context 的 latest record；随后要求 configured expected
+   `html_url` 仍是 base-run resource URLs，不必等于 attempt-specific status target。在
+   run-attempt head domain 中，exact run-attempt response `head_sha` 必须等于
+   `receipt.producer.environment.GITHUB_WORKFLOW_SHA`；Artifact API record 的
+   `workflow_run.id` 与 `workflow_run.head_sha` 必须分别等于 exact run-attempt
+   response 的 `id` 与 `head_sha`。
+5. 在 current-PR/status head domain 中，通过 REST 列出所有 Commit Status records
+   时，request `ref` 必须等于 exact current PR head；selected status 必须来自该
+   exact-head response。选择 case-insensitive logical context 的 latest record；随后要求 configured expected
    context 的 exact spelling（默认为 `codex/review-gate`），并要求 creator 精确为
    `github-actions[bot]` 且 type 为 `Bot`。为 current PR 选择唯一 matching receipt
-   `statuses[]` member；它不一定是最后一个 member。其 PR number、ID、node ID、head、
-   context、state、target URL 与 creator 必须全部相同。Positive decision 要求 selected
+   `statuses[]` member；它不一定是最后一个 member。其 `head_sha` 必须等于
+   exact current PR head；PR number、ID、node ID、context、state、target URL 与 creator
+   必须全部相同。Positive decision 要求 selected
    REST record 与 receipt member 都满足 exact `status.state == success`，且 selected
    member 的 creator 也必须独立为 exact `github-actions[bot]` / `Bot`。Membership 缺失或
    不唯一时 fail closed。
 6. 通过 GraphQL 把该 node 重读为 `StatusContext`，并独立确认相同的 exact context、
-   state、target URL 与 head。GraphQL creator 还必须独立精确为
+   state 与 target URL。`StatusContext.commit.oid` 必须等于 exact current PR head，
+   因此也必须等于 selected receipt status `head_sha`。GraphQL creator 还必须独立精确为
    `github-actions[bot]` 且 type 为 `Bot`；仅 creator 彼此一致并不充分。
+   Exact run-attempt/artifact `head_sha` 可以合法地与这个 current PR/status head 不同；
+   禁止要求两个 head domain 相等。
 7. 为 selected receipt member 指定的同一个 PR，独立重新加载并归约 official provider
    evidence。Receipt v1 只是 causal producer evidence；它不证明 clean evidence，也不
    替代 provider reduction。

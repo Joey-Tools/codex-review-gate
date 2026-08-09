@@ -244,7 +244,10 @@ creation；consumer 的 final inventory check 要求 artifact 恰好一个。
 
 ### Consumer validation
 
-Review 或 readiness skill 只有全部完成以下检查才可继续，否则必须 fail closed：
+Review 或 readiness skill 必须把 run-attempt head domain 与 current-PR/status head
+domain 分开校验；只有全部检查通过才可继续，否则必须 fail closed。机器可读的
+权威合同是 [`decision-table.json`](decision-table.json) 中的
+`producer_receipt_boundary`：
 
 1. 使用 Artifact API 查询 exact repository、run 和 attempt-specific artifact name，并
    要求 `total_count == 1`。Action outputs 可用时，把 REST artifact ID 与 output ID
@@ -262,22 +265,32 @@ Review 或 readiness skill 只有全部完成以下检查才可继续，否则�
    ID/attempt/name/target URL 完全一致，server 为 `https://github.com`，repository 为当前
    目标，所有预期 workflow/job fields 一致；同时要求 exact expected action repository 和
    40-SHA，且 `immutable: true`。通过 attempt-specific request endpoint 取得 run attempt；
-   不要求 response `url` 或 `html_url` 为 attempt-specific。
-3. 通过 REST 列出 exact current PR head 的全部 Commit Status records。使用
-   case-insensitive context comparison 选择该 logical context 的 latest record；随后要求
+   不要求 response `url` 或 `html_url` 为 attempt-specific。在这个 run-attempt head
+   domain 中，exact run-attempt response `head_sha` 必须等于
+   `receipt.producer.environment.GITHUB_WORKFLOW_SHA`；Artifact API record 的
+   `workflow_run.id` 与 `workflow_run.head_sha` 必须分别等于 exact run-attempt
+   response 的 `id` 与 `head_sha`。
+3. 在 current-PR/status head domain 中，通过 REST 列出全部 Commit Status
+   records 时，request `ref` 必须等于 exact current PR head；selected status 必须
+   来自该 exact-head response。使用 case-insensitive context comparison 选择该
+   logical context 的 latest record；随后要求
    selected record 使用 configured expected context 的 exact spelling（默认为
    `codex/review-gate`），creator 精确为 `github-actions[bot]` 且 type 为 `Bot`，再把其
-   `id`、`node_id` 和 head 与 current PR 唯一 matching receipt `statuses[]` member 精确
-   比对；它不一定是最后一个 member。Positive decision 还要求 selected REST record 与
-   receipt member 都满足 exact `status.state == success`。该 selected member 的 `creator`
+   `id`、`node_id`、context、state 和 target URL 与 current PR 唯一 matching receipt
+   `statuses[]` member 精确比对；它不一定是最后一个 member。该 member 的
+   `head_sha` 必须等于 exact current PR head。Positive decision 还要求 selected REST
+   record 与 receipt member 都满足 exact `status.state == success`。该 selected member 的 `creator`
    也必须独立精确为
    `github-actions[bot]` 且 type 为 `Bot`，其 `pull_request_number` 必须等于 selected
    current PR；membership 缺失或不唯一时 fail closed，且 receipt 没有 top-level creator。
-4. 通过 GraphQL 把该 node 重新读取为 `StatusContext`。在 receipt、REST 与 GraphQL node
-   之间，要求 exact context、state、target URL 与 head 一致，并保留 receipt/run/current
-   state 中 action SHA 与 workflow/job bindings。GraphQL creator 还必须独立精确为
+4. 通过 GraphQL 把该 node 重新读取为 `StatusContext`。在 selected receipt status、
+   REST record 与 GraphQL node 之间，要求 exact context、state 与 target URL 一致。
+   `StatusContext.commit.oid` 必须等于 exact current PR head，因此也必须等于
+   selected receipt status `head_sha`；同时保留 receipt/run/current state 中 action SHA 与
+   workflow/job bindings。GraphQL creator 还必须独立精确为
    `github-actions[bot]` 且 type 为 `Bot`；仅 creator 彼此一致并不充分。
-   `StatusContext` 不提供 PR isolation。
+   `StatusContext` 不提供 PR isolation。Exact run-attempt/artifact `head_sha` 可以合法地与这个
+   current PR/status head 不同；consumer 禁止要求两个 head domain 相等。
 5. 按本设计为 selected receipt member 指定的同一个 PR，独立重新加载并归约 official
    provider evidence。Valid receipt 既不证明 clean evidence，也不证明 merge readiness。
 6. Readiness 消费结果前，最后一次通过 REST 重列 exact-head statuses。Case-insensitive

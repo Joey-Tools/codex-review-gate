@@ -313,7 +313,10 @@ requires exactly one artifact.
 
 ### Consumer validation
 
-A review or readiness skill must fail closed unless all of these checks pass:
+A review or readiness skill must keep the run-attempt head domain separate
+from the current-PR/status head domain and fail closed unless all checks pass.
+The authoritative machine-readable contract is `producer_receipt_boundary` in
+[`decision-table.json`](decision-table.json):
 
 1. Query the Artifact API for the exact repository, run, attempt-specific
    artifact name, and require `total_count == 1`. When action outputs are
@@ -335,26 +338,37 @@ A review or readiness skill must fail closed unless all of these checks pass:
    and every expected workflow/job field. Require the exact expected action
    repository and 40-SHA with `immutable: true`. Fetch the run attempt through
    its attempt-specific request endpoint; do not require the response `url` or
-   `html_url` to be attempt-specific.
-3. REST-list all Commit Status records for the exact current PR head. Select
-   the latest record for the logical context using a case-insensitive context
-   comparison. Then require the selected record's context to use the exact
+   `html_url` to be attempt-specific. Within this run-attempt head domain,
+   require the exact run-attempt response `head_sha` to equal
+   `receipt.producer.environment.GITHUB_WORKFLOW_SHA`. Require the Artifact API
+   record's `workflow_run.id` and `workflow_run.head_sha` to equal the exact
+   run-attempt response `id` and `head_sha`, respectively.
+3. Within the current-PR/status head domain, REST-list all Commit Status
+   records with the request `ref` equal to the exact current PR head; the
+   selected status must come from that exact-head response. Select the latest
+   record for the logical context using a case-insensitive context comparison.
+   Then require the selected record's context to use the exact
    configured spelling (`codex/review-gate` by default), require its creator to
    be exactly `github-actions[bot]` with type `Bot`, and match its `id`,
-   `node_id`, and head to the unique matching receipt `statuses[]` member for
-   the current PR, which need not be the last member. A positive decision also
-   requires exact `status.state == success` for the selected REST record and
-   receipt member.
+   `node_id`, context, state, and target URL to the unique matching receipt
+   `statuses[]` member for the current PR, which need not be the last member.
+   Require that member's `head_sha` to equal the exact current PR head. A
+   positive decision also requires exact `status.state == success` for the
+   selected REST record and receipt member.
    That selected member's `creator` must independently be exactly
    `github-actions[bot]` with type `Bot`, and its `pull_request_number` must
    equal the selected current PR; missing or non-unique membership fails
    closed, and there is no top-level receipt creator.
 4. Re-read that node as a GraphQL `StatusContext`. Require exact context,
-   state, target URL, and head across the receipt, REST, and GraphQL node, while
+   state, and target URL across the selected receipt status, REST record, and
+   GraphQL node. Require `StatusContext.commit.oid` to equal the exact current
+   PR head and therefore the selected receipt status `head_sha`, while
    retaining the receipt/run/current-state action SHA and workflow/job
    bindings. Its creator must independently be exactly `github-actions[bot]`
    with type `Bot`; creator agreement alone is insufficient. A
-   `StatusContext` does not supply PR isolation.
+   `StatusContext` does not supply PR isolation. The exact run-attempt/artifact
+   `head_sha` may legitimately differ from this current PR/status head; a
+   consumer must never require equality between the two head domains.
 5. Independently reload and reduce official provider evidence for the same PR
    named by the selected receipt member. A valid receipt proves neither clean
    evidence nor merge readiness.
