@@ -11,16 +11,18 @@ tests, release workflows, and licensing after creating a repository from it.
 - this README
 
 The workflow writes the `codex/review-gate` status check and requests a controlled
-Codex review marker for each ready pull request head. Before enabling the workflow,
-replace `<v1.4.0-action-commit-sha>` with the exact 40-character action-repository
-commit published in the v1.4.0 release notes. Floating `@v1.4` and `@v1` aliases
-are convenience-only and are not canonical pins for this privileged
-`pull_request_target` workflow.
+Codex review marker for each ready pull request head. It calls the centrally
+deployed reusable workflow at
+`JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`.
+That floating selector is the intentional pre-execution trust boundary; post-run
+consumers must bind the server-resolved called workflow to a trusted-signer,
+immutable compatible v1.x.y release and its provenance-v2 tree.
 
 ## After Creating a Repository
 
 1. Add the project source, CI workflow, tests, and license.
-2. Replace the action release placeholder with the published exact 40-SHA.
+2. Review the workflow's privileged event and permission boundary; do not add
+   caller or pull-request checkout steps to the reusable calling job.
 3. Confirm `.github/workflows/codex-review-gate.yml` is present on the default
    branch before requiring the status check.
 4. Enable the required status check with the bootstrap helper from
@@ -36,14 +38,16 @@ the workflow exists on the repository default branch.
 
 ## Optional Repository Variables
 
-- `CODEX_REVIEW_GATE_RUNNER_LABELS`: JSON runner label array. Defaults to
-  `["ubuntu-slim"]`; use `["ubuntu-latest"]` when `ubuntu-slim` is unavailable.
 - `CODEX_REVIEW_GATE_AUTO_RETRY=false`: disables scheduled retry jobs before a
   runner is allocated.
 - `CODEX_REVIEW_GATE_EVENT_MODE`: `standard`, `comment-only`, or `full`.
 - `CODEX_REVIEW_GATE_BOT_LOGINS`: comma-separated additional Codex bot logins.
 
-Action v1.4 still accepts the legacy `completion-signal-buffer-seconds`,
+Action v1 still accepts the legacy `completion-signal-buffer-seconds`,
 `failed-findings-recovery`, and `failed-findings-recovery-mode` inputs for
 schema compatibility, but they are inert. Do not expose repository variables
 for them or rely on them to change verdict, timeout, or request orchestration.
+
+The reusable job runs on the fixed GitHub-hosted `ubuntu-slim` runner. The
+caller cannot select a self-hosted runner or override the called workflow's
+repository, ref, checkout path, or runtime tree.

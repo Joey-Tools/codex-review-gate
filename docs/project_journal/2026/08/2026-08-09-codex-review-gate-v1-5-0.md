@@ -1,10 +1,10 @@
 ---
 id: 20260809-codex-review-gate-v1-5-0
 title: Codex Review Gate v1.5 rollout
-status: active
+status: completed
 created: 2026-08-09
 updated: 2026-08-09
-branch: wip/codex-review-gate-1.5.1
+branch: codex/activate-v1-reusable
 pr:
 supersedes: []
 superseded_by:
@@ -14,8 +14,8 @@ superseded_by:
 
 ## Summary
 - Version 1.5.0 packaged a reusable workflow in the canonical action subtree while retaining the existing direct composite Action interface and the complete 1.4 decision semantics. Its immutable release was published, but the live canary proved that its provenance contract incorrectly equated an annotated `@v1` selector's tag-object SHA with the peeled action commit, so consumers must fail closed rather than admit v1.5.0 through an erratum.
-- Version 1.5.1 is the compatible repair. Producer protocol major 1, receipt schema v1, and decision policy 1.4 remain unchanged; caller/template activation has not occurred.
-- Consumers will call `JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`; the floating major selector is the centralized pre-execution trust boundary, while post-run admission resolves the GitHub-selected called-workflow object through the closed tag-object/action-commit candidate set and signed immutable release provenance.
+- Version 1.5.1 is the compatible repair. Producer protocol major 1, receipt schema v1, and decision policy 1.4 remain unchanged. The canonical source caller and copyable template now call `JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1` after the immutable release and replacement canary completed.
+- The floating major selector is the centralized pre-execution trust boundary, while post-run admission resolves the GitHub-selected called-workflow object through the closed tag-object/action-commit candidate set and signed immutable release provenance.
 - The source repository remains canonical. The action repository remains a strict `packages/action` subtree release, so compatible future v1.x upgrades require only source and release changes rather than caller or Skill edits.
 
 ## Reusable Workflow Authority
@@ -46,15 +46,16 @@ superseded_by:
 - The release split gate remains responsible for source checks, the full test suite, action package checks, whitespace validation, and deterministic subtree split generation.
 
 ## Release Workflow
-- The repair's intended immutable release is the signed annotated `v1.5.1` tag. After that immutable release/provenance is verified, signed `v1.5` and `v1` compatibility aliases advance together through one atomic push with independent exact leases for both previous tag-object OIDs.
-- Rollout remains deliberately two-phase. The immutable v1.5.0 release did not satisfy the live canary and therefore did not activate the source caller or copyable template. Only after the v1.5.1 immutable release, updated compatibility aliases, and replacement live `@v1` canary are verified may a separate activation PR change those callers.
-- Release evidence will record source and release commits and trees, the complete path/mode/blob manifest and digest, critical Git blob and raw SHA-256 digests, signed tag objects and peels, and the release provenance asset URL and digest.
-- No pull request, merge, tag, alias movement, or GitHub Release is recorded as complete in this active journal entry until that operation has actually succeeded and its evidence has been captured.
+- Source repair PR #30 merged as signed source commit `e9a4a79866518ba07e9b0bf9df68dffdb02bfeef`, root tree `a1ad784d0262ba3767151f0ec8f63bbfd6319911`. Sync run `31334245087` published Action split commit `59eeda2af2a7baab3f3f15a59fbbaee015fa6c01`; source `packages/action` and Action root both have tree `8d909dd441b28b6915c46f60e8a144e64fd5268b`.
+- The signed annotated immutable `v1.5.1` tag object is `f9201d016b0abd21403550c3bf8030eb0beb76b4`. Signed aliases `v1.5` (`ab610036500f2eacb483abd3a6c272fd86ce5dec`) and `v1` (`9e9f2377342805156afcb0724f501509ef4e444c`) advanced together through one atomic push with independent exact leases; all three directly peel to the Action commit and verify under trusted primary fingerprint `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`.
+- The immutable [v1.5.1 release](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v1.5.1) contains exactly one provenance-v2 asset. Its SHA-256 is `db00a0b88be3cbff8956e6082544c418d7878f6b2a6405a0773af4eea5004fc8`; the complete 18-entry NUL-delimited release-tree manifest digest is `be4e780d1cf3b6874d246d2c4edd1451f7ca10442781dd99f8d37385d229dd46`.
+- Replacement canary run `31335089862` completed successfully. Exact-attempt `referenced_workflows` and receipt both bound `W` to signed `v1` tag object `9e9f2377342805156afcb0724f501509ef4e444c`; checkout output and receipt bound `C` to Action commit `59eeda2af2a7baab3f3f15a59fbbaee015fa6c01`. Receipt artifact `9044075043` and status `51915533651` matched test PR #29 head and attempt URL. The unmerged test PR and both temporary canary branches were removed after evidence capture.
+- Rollout remained two-phase: release and live canary completed before this separate source caller/template activation change.
 
-## Next Steps
-- Complete and test the v1.5.1 tag-object/peeled-commit correction without changing receipt protocol or decision policy.
-- Complete the local delivery gate and fixed-range fresh-context review, then deliver the source repair PR and resolve CI/current-head review findings.
-- After source merge, publish the proven action subtree, sign and verify `v1.5.1`, generate and attach corrected provenance, atomically advance both compatibility aliases with exact leases, run the replacement live canary, and only then open the caller/template activation pull request.
+## Completed Outcome
+- The Action source/release boundary, reusable runtime, receipt identity, provenance v2 admission, immutable v1.5.1 release, alias transaction, and replacement canary are closed with exact evidence.
+- The source self-gate and copyable template use the canonical reusable `@v1` caller without changing the event, permission, or repository-wide concurrency envelope.
+- Compatible future v1.x Action-only releases may upgrade centrally under the same producer/receipt/policy majors and trusted-signer admission; breaking protocol or decision-policy changes still require coordinated caller and Skill work.
 
 ## Evidence
 - Reusable workflow: `packages/action/.github/workflows/codex-review-gate.yml`
@@ -64,6 +65,8 @@ superseded_by:
 - Decision contract: `packages/action/decision-table.json`, `test/core.test.mjs`, `test/gate-runner.test.mjs`
 - Provenance tooling: `scripts/generate-action-release-provenance.mjs`, `test/release-provenance.test.mjs`
 - Published but non-admissible reusable contract: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v1.5.0`
+- First admitted reusable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v1.5.1`
+- Replacement live canary: `https://github.com/JoeyTeng/codex-review-gate/actions/runs/31335089862`
 - Release procedure: `scripts/release-action-subtree.sh`, `.github/workflows/sync-action-subtree.yml`, `docs/RELEASING.md`, `docs/RELEASING.zh-CN.md`
 
 ## Generative AI Disclosure

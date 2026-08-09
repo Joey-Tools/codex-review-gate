@@ -72,28 +72,40 @@ source repository root. Instead, `packages/action` is the stable subtree
 boundary. Use `scripts/release-action-subtree.sh` to validate the source tree
 and compute the split commit for the action repository.
 
-The canonical workflow pins the exact 40-hex commit in the action release
-repository. Until the 1.4.0 subtree split exists, source documentation uses an
-explicit placeholder:
+The canonical GitHub.com workflow delegates the privileged job to the
+centrally deployed reusable workflow through the compatible v1 selector:
 
 ```yaml
-- uses: JoeyTeng/codex-review-gate-action@<v1.4.0-action-commit-sha>
+jobs:
+  codex-review-gate:
+    name: codex/review-gate runner
+    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1
 ```
 
-The v1.4.0 release notes and release provenance manifest publish the exact
-replacement after source merge and action-repository sync. Floating `@v1.4`
-and `@v1` are convenience aliases only; they are never the canonical or
-provenance-bearing reference.
+Floating `@v1` is the intentional centralised pre-execution trust boundary. It
+is not post-run immutable provenance. Consumers resolve the server-selected
+called-workflow object from the exact run attempt and admit it only through a
+trusted-signer, immutable compatible v1.x.y release and its complete
+provenance-v2 tree and protocol bindings. This lets compatible v1.x Action
+releases upgrade centrally without changing the caller or consuming Skill.
+
+The direct composite interface remains available for GitHub Enterprise Server
+and immutable audits. Pin it to the exact v1.5.1 Action release commit:
+
+```yaml
+- uses: JoeyTeng/codex-review-gate-action@59eeda2af2a7baab3f3f15a59fbbaee015fa6c01
+```
 
 `codex/review-gate` reports only this action's required commit-status result;
 it does not attest a named triple review or overall merge readiness. See the
 [action semantics](packages/action/README.md#what-it-checks) and
 [evidence-reconciliation design](packages/action/DESIGN.md#evidence-reconciliation).
-The v1 producer receipt supplies causal producer evidence for an exact pinned
-invocation, but consumers must validate its run-attempt artifact and still
-reduce provider evidence independently; see
+The v1 producer receipt supplies causal producer evidence for an exact direct
+or reusable invocation, but consumers must validate its run-attempt artifact,
+the called-workflow W/C mapping, and signed immutable release provenance, then
+still reduce provider evidence independently; see
 [invocation provenance](packages/action/README.md#invocation-provenance).
-Immutable tags such as `v1.4.0` and the existing `v1.3.x` releases remain
+Immutable tags such as `v1.5.1`, `v1.4.0`, and the existing `v1.3.x` releases remain
 available for audits and rollbacks.
 
 See [docs/RELEASING.md](docs/RELEASING.md) for the full release flow.

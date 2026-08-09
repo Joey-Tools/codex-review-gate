@@ -28,12 +28,43 @@ const CANONICAL_CALL =
 const CANONICAL_JOB_WORKFLOW_REF =
   `${CANONICAL_ACTION_REPOSITORY}/${CANONICAL_WORKFLOW_FILE_PATH}` +
   "@refs/tags/v1";
+const EXPECTED_CALLED_JOB_IF = `
+\${{
+  (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
+  (github.event_name != 'pull_request_target' ||
+    github.event.pull_request.user.login != 'dependabot[bot]') &&
+  (github.event_name != 'issue_comment' ||
+    github.event.issue.user.login != 'dependabot[bot]') &&
+  (github.event_name != 'pull_request_review' ||
+    github.event.pull_request.user.login != 'dependabot[bot]') &&
+  (github.event_name != 'pull_request_review_comment' ||
+    github.event.pull_request.user.login != 'dependabot[bot]') &&
+  (github.event_name != 'issue_comment' ||
+    (github.event.issue.pull_request &&
+      (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+        vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)) ||
+       contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+        vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.comment.user.login))))) &&
+  (github.event_name != 'pull_request_review' ||
+    (vars.CODEX_REVIEW_GATE_EVENT_MODE != 'comment-only' &&
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+      (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+        vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.review.user.login)) ||
+       contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+        vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.review.user.login))))) &&
+  (github.event_name != 'pull_request_review_comment' ||
+    (vars.CODEX_REVIEW_GATE_EVENT_MODE == 'full' &&
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+      (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+        vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)) ||
+       contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+        vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.comment.user.login)))))
+}}
+`.trim().replace(/\s+/gu, " ");
 const CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262";
 const CHECKOUT_TARGET = `actions/checkout@${CHECKOUT_SHA}`;
 const CHECKOUT_PATH = ".codex-review-gate-action";
 const LOCAL_ACTION = `./${CHECKOUT_PATH}`;
-const INACTIVE_TEMPLATE_ACTION =
-  "JoeyTeng/codex-review-gate-action@<v1.4.0-action-commit-sha>";
 
 const RECEIPT_OUTPUTS = {
   "producer-receipt-artifact-id": "artifact-id",
@@ -92,8 +123,8 @@ jobs:
 test("caller workflows preserve the exact event, permission, and concurrency contract", () => {
   const fixtures = [
     ["canonical caller", yamlLines(CANONICAL_CALLER_FIXTURE)],
-    ["release-stage source caller", readYamlLines(rootCallerWorkflowPath)],
-    ["inactive template caller", readYamlLines(templateWorkflowPath)],
+    ["activated source caller", readYamlLines(rootCallerWorkflowPath)],
+    ["activated template caller", readYamlLines(templateWorkflowPath)],
   ];
 
   for (const [name, lines] of fixtures) {
@@ -114,32 +145,18 @@ test("the canonical caller fixture contains only one non-escalating v1 reusable-
   assert.doesNotMatch(CANONICAL_CALLER_FIXTURE, /secrets:\s*inherit/);
 });
 
-test("the release-stage rollout does not activate either repository caller", () => {
-  const rootCaller = readYamlLines(rootCallerWorkflowPath);
-  const rootJob = childBlock(
-    childBlock(rootBlock(rootCaller), "jobs"),
-    "codex-review-gate",
-  );
-  const rootSteps = listItemBlocks(childBlock(rootJob, "steps"));
-  const rootUses = rootSteps.map((step) => itemScalar(step, "uses"));
-  assert.deepEqual(rootUses, [CHECKOUT_TARGET, "./packages/action"]);
-  assert.deepEqual(scalarMapping(childBlock(rootSteps[0], "with")), {
-    ref: "${{ github.event.repository.default_branch }}",
-    "persist-credentials": "false",
-  });
+test("the activated source and template callers contain only the canonical reusable job", () => {
+  for (const path of [rootCallerWorkflowPath, templateWorkflowPath]) {
+    const caller = readYamlLines(path);
+    const jobs = childBlock(rootBlock(caller), "jobs");
+    assert.deepEqual(directKeys(jobs), ["codex-review-gate"]);
 
-  const template = readYamlLines(templateWorkflowPath);
-  const templateJob = childBlock(
-    childBlock(rootBlock(template), "jobs"),
-    "codex-review-gate",
-  );
-  const templateUses = listItemBlocks(childBlock(templateJob, "steps")).map(
-    (step) => itemScalar(step, "uses"),
-  );
-  assert.deepEqual(templateUses, [INACTIVE_TEMPLATE_ACTION]);
-
-  assert.equal(rootUses.includes(CANONICAL_CALL), false);
-  assert.equal(templateUses.includes(CANONICAL_CALL), false);
+    const job = childBlock(jobs, "codex-review-gate");
+    assert.deepEqual(directKeys(job), ["name", "uses"]);
+    assert.equal(directScalar(job, "name"), "codex/review-gate runner");
+    assert.equal(directScalar(job, "uses"), CANONICAL_CALL);
+    assert.doesNotMatch(blockText(job), /\b(?:runs-on|steps|secrets|with):/u);
+  }
 });
 
 test("the published workflow source is workflow_call-only and preserves receipt outputs", () => {
@@ -170,6 +187,7 @@ test("the published workflow source is workflow_call-only and preserves receipt 
     "outputs",
     "steps",
   ]);
+  assert.equal(directFoldedScalar(job, "if"), EXPECTED_CALLED_JOB_IF);
   assert.doesNotMatch(blockText(job), /^\s+(?:permissions|secrets):/m);
   const runner = directScalar(job, "runs-on");
   assert.equal(
@@ -264,6 +282,7 @@ test("every external source action is pinned to one literal lower-case full SHA"
     templateWorkflowPath,
   ];
   let externalUseCount = 0;
+  let canonicalCallerUseCount = 0;
 
   for (const path of [...new Set(files)]) {
     const label = relative(repoRoot, path);
@@ -272,7 +291,11 @@ test("every external source action is pinned to one literal lower-case full SHA"
       if (target.startsWith("./")) {
         continue;
       }
-      if (path === templateWorkflowPath && target === INACTIVE_TEMPLATE_ACTION) {
+      if (
+        (path === rootCallerWorkflowPath || path === templateWorkflowPath) &&
+        target === CANONICAL_CALL
+      ) {
+        canonicalCallerUseCount += 1;
         continue;
       }
 
@@ -289,6 +312,11 @@ test("every external source action is pinned to one literal lower-case full SHA"
   }
 
   assert.ok(externalUseCount > 0, "the pin scan must exercise external actions");
+  assert.equal(
+    canonicalCallerUseCount,
+    2,
+    "only the source and template callers may use the canonical floating selector",
+  );
 });
 
 test("the source action scanner rejects non-canonical YAML uses forms", async (t) => {
@@ -1138,6 +1166,37 @@ function directScalar(block, key) {
   assert.ok(match, `missing scalar ${key}`);
   assert.notEqual(match[1], "", `${key} must be a scalar`);
   return match[1];
+}
+
+function directFoldedScalar(block, key) {
+  const index = findDirectKeyIndex(block, key);
+  const expectedIndent = block.headerIndent + 2;
+  assert.match(
+    block.lines[index],
+    new RegExp(`^ {${expectedIndent}}${escapeRegExp(key)}:\\s*>-\\s*$`, "u"),
+  );
+
+  let end = block.end;
+  const nextKeyPattern = new RegExp(
+    `^ {${expectedIndent}}[A-Za-z0-9_-]+:(?:\\s|$)`,
+    "u",
+  );
+  for (let cursor = index + 1; cursor < block.end; cursor += 1) {
+    if (nextKeyPattern.test(block.lines[cursor])) {
+      end = cursor;
+      break;
+    }
+  }
+
+  const valueLines = block.lines.slice(index + 1, end);
+  assert.ok(valueLines.length > 0, `${key} must have a folded scalar body`);
+  for (const line of valueLines) {
+    assert.ok(
+      line.trim() === "" || line.startsWith(" ".repeat(expectedIndent + 2)),
+      `${key} folded scalar must remain nested under its direct key`,
+    );
+  }
+  return valueLines.join("\n").trim().replace(/\s+/gu, " ");
 }
 
 function scalarMapping(block) {
