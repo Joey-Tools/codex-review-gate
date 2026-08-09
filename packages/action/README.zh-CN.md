@@ -196,7 +196,6 @@ jobs:
           head-sha: ${{ github.event.pull_request.head.sha || '' }}
           event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
           codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
-          completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS }}
 ```
 
 源码文档中的 placeholder 是刻意保留的，因为 exact action-repository split commit 只有

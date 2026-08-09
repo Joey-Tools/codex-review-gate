@@ -42,7 +42,8 @@ the workflow exists on the repository default branch.
   runner is allocated.
 - `CODEX_REVIEW_GATE_EVENT_MODE`: `standard`, `comment-only`, or `full`.
 - `CODEX_REVIEW_GATE_BOT_LOGINS`: comma-separated additional Codex bot logins.
-- `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS`: clean completion buffer.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`: set to `false` to disable
-  same-head recovery after resolved Codex findings.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`: `head` or `fresh`.
+
+Action v1.4 still accepts the legacy `completion-signal-buffer-seconds`,
+`failed-findings-recovery`, and `failed-findings-recovery-mode` inputs for
+schema compatibility, but they are inert. Do not expose repository variables
+for them or rely on them to change verdict, timeout, or request orchestration.

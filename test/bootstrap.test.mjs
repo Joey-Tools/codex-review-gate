@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -750,4 +751,28 @@ test("normalizes workflow paths to repository workflow files", () => {
     /Workflow path/,
   );
   assert.throws(() => normalizeWorkflowPath("codex-review-gate.yml"), /Workflow path/);
+});
+
+test("canonical template omits inert v1 compatibility controls", () => {
+  const workflow = readFileSync(
+    new URL(
+      "../templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const readme = readFileSync(
+    new URL("../templates/codex-gated-repo/README.md", import.meta.url),
+    "utf8",
+  );
+
+  for (const input of [
+    "completion-signal-buffer-seconds",
+    "failed-findings-recovery",
+    "failed-findings-recovery-mode",
+  ]) {
+    assert.doesNotMatch(workflow, new RegExp(`^\\s+${input}:`, "m"));
+  }
+  assert.match(readme, /legacy `completion-signal-buffer-seconds`/);
+  assert.match(readme, /they are inert/);
 });
