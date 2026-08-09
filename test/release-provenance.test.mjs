@@ -82,6 +82,7 @@ function writeActionFixture(
     duplicateStatusContext = false,
     nonUtf8Path = false,
     placeholder = false,
+    conflateRunAndPullRequestHeads = false,
     weakenDecisionPolicy = false,
     weakenPositiveConsumerRequirement = false,
   } = {},
@@ -116,7 +117,12 @@ runs:
       schema_version: { const: 1 },
     },
   });
-  if (placeholder || weakenDecisionPolicy || weakenPositiveConsumerRequirement) {
+  if (
+    placeholder ||
+    conflateRunAndPullRequestHeads ||
+    weakenDecisionPolicy ||
+    weakenPositiveConsumerRequirement
+  ) {
     const table = JSON.parse(readFileSync(decisionTablePath, "utf8"));
     if (placeholder) {
       table["<unresolved-release-placeholder>"] = "test-only-bad-key";
@@ -124,6 +130,14 @@ runs:
     if (weakenDecisionPolicy) {
       table.evidence_rows.find(({ id }) => id === "clean-current").precondition =
         "weakened-test-only-precondition";
+    }
+    if (conflateRunAndPullRequestHeads) {
+      table.producer_receipt_boundary.run_attempt_identity.required_equalities = [
+        "id-equals-receipt-producer-run-id",
+        "run_attempt-equals-receipt-producer-run-attempt",
+        "repository-full_name-equals-receipt-producer-repository",
+        "head_sha-equals-selected-receipt-status-head_sha",
+      ];
     }
     if (weakenPositiveConsumerRequirement) {
       table.producer_receipt_boundary.positive_consumer_requirement
@@ -286,6 +300,23 @@ test("decision table freezes the release-1.4 verdict and receipt boundary", () =
   );
   assert.equal(table.producer_receipt_boundary.status_get_by_id_api, null);
   assert.deepEqual(
+    table.producer_receipt_boundary.run_attempt_identity,
+    {
+      head_role: "caller-workflow-event-commit",
+      required_equalities: [
+        "id-equals-receipt-producer-run-id",
+        "run_attempt-equals-receipt-producer-run-attempt",
+        "repository-full_name-equals-receipt-producer-repository",
+        "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
+      ],
+    },
+  );
+  assert.equal(
+    table.producer_receipt_boundary.head_domain_separation
+      .workflow_run_head_may_differ_from_status_and_pull_request_head,
+    true,
+  );
+  assert.deepEqual(
     table.producer_receipt_boundary.positive_consumer_requirement,
     {
       operator: "all-of",
@@ -300,6 +331,37 @@ test("decision table freezes the release-1.4 verdict and receipt boundary", () =
     },
   );
   assert.doesNotMatch(raw.toString("utf8"), /<[^<>]+>/);
+});
+
+test("head binding contract permits workflow-run head to differ from PR status head", () => {
+  const table = JSON.parse(readFileSync(decisionTablePath, "utf8"));
+  const workflowRunHead = "1".repeat(40);
+  const currentPullRequestHead = "2".repeat(40);
+  const receipt = {
+    producer: {
+      environment: { GITHUB_WORKFLOW_SHA: workflowRunHead },
+    },
+    statuses: [{ head_sha: currentPullRequestHead }],
+  };
+  const exactRunAttempt = { head_sha: workflowRunHead };
+  const artifact = { workflow_run: { head_sha: workflowRunHead } };
+  const restStatusListRequest = { ref: currentPullRequestHead };
+  const graphQlStatusContext = { commit: { oid: currentPullRequestHead } };
+
+  assert.equal(
+    exactRunAttempt.head_sha,
+    receipt.producer.environment.GITHUB_WORKFLOW_SHA,
+  );
+  assert.equal(artifact.workflow_run.head_sha, exactRunAttempt.head_sha);
+  assert.equal(receipt.statuses[0].head_sha, currentPullRequestHead);
+  assert.equal(restStatusListRequest.ref, currentPullRequestHead);
+  assert.equal(graphQlStatusContext.commit.oid, currentPullRequestHead);
+  assert.notEqual(exactRunAttempt.head_sha, receipt.statuses[0].head_sha);
+  assert.equal(
+    table.producer_receipt_boundary.head_domain_separation
+      .workflow_run_head_may_differ_from_status_and_pull_request_head,
+    true,
+  );
 });
 
 test("generator emits deterministic complete post-merge provenance", (t) => {
@@ -389,6 +451,15 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
     manifest.contracts.producer_receipt.run_attempt_api.route,
     "/repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}",
   );
+  assert.deepEqual(
+    manifest.contracts.producer_receipt.run_attempt_api.required_equalities,
+    [
+      "id-equals-receipt-producer-run-id",
+      "run_attempt-equals-receipt-producer-run-attempt",
+      "repository-full_name-equals-receipt-producer-repository",
+      "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
+    ],
+  );
   assert.equal(
     manifest.contracts.producer_receipt.artifact_inventory_api.route,
     "/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
@@ -435,6 +506,30 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
   assert.ok(
     manifest.contracts.producer_receipt.artifact_inventory_api.required_equalities.includes(
       "producer-receipt-artifact-id-equals-artifact-api-id",
+    ),
+  );
+  assert.ok(
+    manifest.contracts.producer_receipt.artifact_inventory_api.required_equalities.includes(
+      "artifact-api-workflow_run-head_sha-equals-exact-run-attempt-head_sha",
+    ),
+  );
+  assert.deepEqual(
+    manifest.contracts.producer_receipt.receipt_statuses.required_head_equalities,
+    [
+      "selected-receipt-status-head_sha-equals-current-pull-request-head_sha",
+      "rest-status-list-request-ref-equals-current-pull-request-head_sha",
+      "selected-graphql-status-context-commit-oid-equals-current-pull-request-head_sha",
+      "selected-receipt-status-head_sha-equals-selected-graphql-status-context-commit-oid",
+    ],
+  );
+  assert.equal(
+    manifest.contracts.producer_receipt.head_domain_separation
+      .workflow_run_head_may_differ_from_status_and_pull_request_head,
+    true,
+  );
+  assert.ok(
+    !manifest.contracts.producer_receipt.run_attempt_api.required_equalities.includes(
+      "head_sha-equals-selected-receipt-status-head_sha",
     ),
   );
   assert.equal(manifest.contracts.status.rest.get_by_id_available, false);
@@ -497,6 +592,20 @@ test("generation rejects a weakened positive consumer status requirement", (t) =
   const result = runGenerator(generatorArguments(fixture, output));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /positive consumer contract contradicts release policy/);
+  assert.equal(existsSync(output), false);
+});
+
+test("generation rejects a consumer contract that conflates workflow-run and PR heads", (t) => {
+  const fixture = createFixture(t, {
+    conflateRunAndPullRequestHeads: true,
+  });
+  const output = join(fixture.root, "conflated-run-pr-heads.json");
+  const result = runGenerator(generatorArguments(fixture, output));
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /workflow-run and pull-request head binding contract contradicts release policy/,
+  );
   assert.equal(existsSync(output), false);
 });
 

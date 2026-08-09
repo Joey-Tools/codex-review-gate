@@ -23,11 +23,31 @@ const RECEIPT_SCHEMA_ID =
 const DECISION_TABLE_SCHEMA_ID =
   "urn:joeyteng:codex-review-gate:decision-table:1";
 const FROZEN_DECISION_TABLE_SHA256 =
-  "3e77588f6a65b4ac5490637684227628427f0af833c3fc4cb55e117d34a3c448";
+  "11b2fbc6e5b2bd5c923ecbfb7c56b00a5189108291999f1aaefdb27b7b1f8196";
 const PROVENANCE_SCHEMA_ID =
   "urn:joeyteng:codex-review-gate:release-provenance:1";
 const UPLOAD_ARTIFACT_SHA =
   "ea165f8d65b6e75b540449e92b4886f43607fa02";
+const RUN_ATTEMPT_REQUIRED_EQUALITIES = Object.freeze([
+  "id-equals-receipt-producer-run-id",
+  "run_attempt-equals-receipt-producer-run-attempt",
+  "repository-full_name-equals-receipt-producer-repository",
+  "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
+]);
+const ARTIFACT_RUN_REQUIRED_EQUALITIES = Object.freeze([
+  "artifact-api-workflow_run-id-equals-exact-run-attempt-id",
+  "artifact-api-workflow_run-head_sha-equals-exact-run-attempt-head_sha",
+]);
+const STATUS_HEAD_REQUIRED_EQUALITIES = Object.freeze([
+  "selected-receipt-status-head_sha-equals-current-pull-request-head_sha",
+  "rest-status-list-request-ref-equals-current-pull-request-head_sha",
+  "selected-graphql-status-context-commit-oid-equals-current-pull-request-head_sha",
+  "selected-receipt-status-head_sha-equals-selected-graphql-status-context-commit-oid",
+]);
+const DISALLOWED_RUN_STATUS_HEAD_REQUIREMENTS = Object.freeze([
+  "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
+  "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha",
+]);
 const POSITIVE_CONSUMER_REQUIREMENT = Object.freeze({
   operator: "all-of",
   execution: Object.freeze({
@@ -771,6 +791,36 @@ function validateDecisionTable(table) {
     );
   }
   if (
+    table.producer_receipt_boundary?.run_attempt_identity?.head_role !==
+      "caller-workflow-event-commit" ||
+    !exactJsonEqual(
+      table.producer_receipt_boundary?.run_attempt_identity?.required_equalities,
+      RUN_ATTEMPT_REQUIRED_EQUALITIES,
+    ) ||
+    !exactJsonEqual(
+      table.producer_receipt_boundary?.artifact_run_association
+        ?.required_equalities,
+      ARTIFACT_RUN_REQUIRED_EQUALITIES,
+    ) ||
+    table.producer_receipt_boundary?.status_head_identity?.head_role !==
+      "current-pull-request-head" ||
+    !exactJsonEqual(
+      table.producer_receipt_boundary?.status_head_identity?.required_equalities,
+      STATUS_HEAD_REQUIRED_EQUALITIES,
+    ) ||
+    table.producer_receipt_boundary?.head_domain_separation
+      ?.workflow_run_head_may_differ_from_status_and_pull_request_head !== true ||
+    !exactJsonEqual(
+      table.producer_receipt_boundary?.head_domain_separation
+        ?.consumer_must_not_require,
+      DISALLOWED_RUN_STATUS_HEAD_REQUIREMENTS,
+    )
+  ) {
+    throw new Error(
+      "decision table workflow-run and pull-request head binding contract contradicts release policy",
+    );
+  }
+  if (
     !table.finding_closure?.strictly_later?.includes("validated updated_at") ||
     !table.finding_closure?.strictly_later?.includes(
       "issue-comment IDs never break that tie",
@@ -1278,12 +1328,8 @@ async function generateProvenance(options) {
           method: "GET",
           route:
             "/repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}",
-          required_equalities: [
-            "id-equals-receipt-producer-run-id",
-            "run_attempt-equals-receipt-producer-run-attempt",
-            "repository-full_name-equals-receipt-producer-repository",
-            "head_sha-equals-selected-receipt-status-head_sha"
-          ],
+          head_role: "caller-workflow-event-commit",
+          required_equalities: [...RUN_ATTEMPT_REQUIRED_EQUALITIES],
         },
         artifact_inventory_api: {
           method: "GET",
@@ -1314,7 +1360,7 @@ async function generateProvenance(options) {
             "producer-receipt-artifact-id-equals-artifact-api-id",
             "producer-receipt-artifact-digest-equals-artifact-api-digest",
             "producer-receipt-artifact-url-equals-https://github.com/{owner}/{repo}/actions/runs/{run_id}/artifacts/{artifact_id}",
-            "artifact-api-workflow_run-id-equals-exact-run-attempt-id",
+            ...ARTIFACT_RUN_REQUIRED_EQUALITIES,
             "artifact-api-name-equals-receipt-artifact-name",
             "artifact-api-expired-is-false"
           ],
@@ -1346,6 +1392,8 @@ async function generateProvenance(options) {
         ],
         receipt_statuses: {
           scope: "run-level-ordered-multi-pull-request",
+          head_role: "current-pull-request-head",
+          required_head_equalities: [...STATUS_HEAD_REQUIRED_EQUALITIES],
           sequence: "contiguous-from-one",
           status_count: "equals-statuses-length",
           consumer_selection: [
@@ -1354,6 +1402,12 @@ async function generateProvenance(options) {
             "latest-case-insensitive-logical-context",
             "exact-context-spelling",
             "exact-current-run-attempt-target-url"
+          ],
+        },
+        head_domain_separation: {
+          workflow_run_head_may_differ_from_status_and_pull_request_head: true,
+          consumer_must_not_require: [
+            ...DISALLOWED_RUN_STATUS_HEAD_REQUIREMENTS,
           ],
         },
         uploader: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,

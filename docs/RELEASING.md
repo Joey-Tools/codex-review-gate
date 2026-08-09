@@ -94,12 +94,14 @@ Run the following fail-fast sequence from the final source checkout. Keep
 `PATH` and the GnuPG keyring unchanged for the whole sequence. It creates all
 three local signed annotated tags first, captures the current remote `v1` tag
 object for an exact lease, and runs the complete provenance generator before
-any tag is pushed. Only a successful generator exit admits the three pushes.
-`v1.4.0` and `v1.4` are pushed normally; only `v1` uses the exact lease. Never
-move `v1.4.0`, and leave the existing `v1.3` compatibility tag and every
-`v1.3.x` immutable tag unchanged.
+any tag is pushed. Only a successful generator exit admits one atomic push of
+all three refs. Within that transaction, `v1.4.0` and `v1.4` are ordinary
+updates while only `v1` is authorized by the exact lease. A rejected ref or a
+remote without atomic-push support must fail the whole transaction without
+publishing any of the three tags. Never move `v1.4.0`, and leave the existing
+`v1.3` compatibility tag and every `v1.3.x` immutable tag unchanged.
 
-After all pushes, the same sequence proves every remote tag-object OID and
+After the atomic push, the same sequence proves every remote tag-object OID and
 peeled commit against the admitted local values, then reruns the generator to
 produce the final release asset. The pre-push output is admission evidence,
 not the release asset. `gh release create --verify-tag` checks that a remote
@@ -195,11 +197,12 @@ generate_release_provenance() {
 prepush_provenance_path="v1.4.0-release-provenance.pre-push.json"
 generate_release_provenance "$prepush_provenance_path"
 
-git -C "$action_repo_path" push "$action_remote" refs/tags/v1.4.0
-git -C "$action_repo_path" push "$action_remote" refs/tags/v1.4
-git -C "$action_repo_path" push \
+git -C "$action_repo_path" push --atomic \
   --force-with-lease="refs/tags/v1:$expected_remote_v1_tag_object_oid" \
-  "$action_remote" refs/tags/v1
+  "$action_remote" \
+  refs/tags/v1.4.0:refs/tags/v1.4.0 \
+  refs/tags/v1.4:refs/tags/v1.4 \
+  refs/tags/v1:refs/tags/v1
 
 test "$(
   git -C "$action_repo_path" ls-remote --tags \
@@ -233,7 +236,9 @@ rm -f -- "$prepush_provenance_path"
 Do not use a generic forced tag push. The exact lease must fail if another
 publisher moved `v1` after the remote OID was recorded. If any pre-push
 generator check fails, publish no tag; correct the local release state and run
-the complete admission sequence again.
+the complete admission sequence again. If any ref update or the exact lease is
+rejected, `--atomic` must leave all three remote refs unchanged; do not retry
+them as separate pushes.
 
 Prepare `v1.4.0-release-notes.md` before creating the release. After the source
 release is merged, the action split is synchronized, and all three action tags

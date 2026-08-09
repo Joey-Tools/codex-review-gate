@@ -87,13 +87,15 @@ admission gate。
 从 final source checkout 运行下面的 fail-fast sequence，并在整个 sequence 中保持 `PATH`
 和 GnuPG keyring 不变。它先创建全部三个 local signed annotated tags，记录当前 remote
 `v1` tag object 以建立 exact lease，然后在任何 tag push 之前运行完整 provenance
-generator。只有 generator 成功退出，三个 pushes 才获准执行。`v1.4.0` 与 `v1.4` 正常
-push；只有 `v1` 使用 exact lease。`v1.4.0` 永远不得移动，既有 `v1.3` compatibility tag
-与所有 `v1.3.x` immutable tags 保持不变。
+generator。只有 generator 成功退出，包含三个 refs 的单次 atomic push 才获准执行。在该
+transaction 内，`v1.4.0` 与 `v1.4` 是普通更新，只有 `v1` 由 exact lease 授权。任一 ref
+被拒绝或远端不支持 atomic push 时，整个 transaction 必须失败且不得发布三个 tags 中的
+任何一个。`v1.4.0` 永远不得移动，既有 `v1.3` compatibility tag 与所有 `v1.3.x`
+immutable tags 保持不变。
 
-全部 push 后，同一个 sequence 会把每个 remote tag-object OID 及 peeled commit 与获准的
-local values 精确比较，然后重跑 generator 来生成 final release asset。Pre-push output
-只是 admission evidence，不是 release asset。`gh release create --verify-tag` 只确认
+Atomic push 完成后，同一个 sequence 会把每个 remote tag-object OID 及 peeled commit
+与获准的 local values 精确比较，然后重跑 generator 来生成 final release asset。
+Pre-push output 只是 admission evidence，不是 release asset。`gh release create --verify-tag` 只确认
 remote tag 存在，不能替代任一 generator run 或 remote OID proofs。
 
 ```bash
@@ -186,11 +188,12 @@ generate_release_provenance() {
 prepush_provenance_path="v1.4.0-release-provenance.pre-push.json"
 generate_release_provenance "$prepush_provenance_path"
 
-git -C "$action_repo_path" push "$action_remote" refs/tags/v1.4.0
-git -C "$action_repo_path" push "$action_remote" refs/tags/v1.4
-git -C "$action_repo_path" push \
+git -C "$action_repo_path" push --atomic \
   --force-with-lease="refs/tags/v1:$expected_remote_v1_tag_object_oid" \
-  "$action_remote" refs/tags/v1
+  "$action_remote" \
+  refs/tags/v1.4.0:refs/tags/v1.4.0 \
+  refs/tags/v1.4:refs/tags/v1.4 \
+  refs/tags/v1:refs/tags/v1
 
 test "$(
   git -C "$action_repo_path" ls-remote --tags \
@@ -223,7 +226,8 @@ rm -f -- "$prepush_provenance_path"
 
 不得使用 generic forced tag push。如果记录 OID 后其他发布者移动了 `v1`，exact lease
 必须使本次推送失败。如果任何 pre-push generator check 失败，则不得发布任何 tag；修正
-local release state 后，重新运行完整 admission sequence。
+local release state 后，重新运行完整 admission sequence。如果任一 ref update 或 exact
+lease 被拒绝，`--atomic` 必须让三个 remote refs 全部保持不变；不得改成分别重试各 tag。
 
 创建 release 前先准备 `v1.4.0-release-notes.md`。只有 source release 已 merge、action
 split 已同步，且三个 action tags 都已创建并校验后，才把该文件中的 documentation

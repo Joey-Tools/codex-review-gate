@@ -323,6 +323,37 @@
     "status_post_response": "Retain the exact REST id and node_id plus echoed context/state/description/target_url and creator identity.",
     "status_graphql_reread": "POST https://api.github.com/graphql node(id: $node_id) as StatusContext and compare id, context, state, description, targetUrl, createdAt, creator, and commit.oid.",
     "deduplication": "Receipt mode always reasserts the current attempt status. Outside receipt mode, deduplicate only an exact current-attempt target_url, exact context spelling, exact state, and github-actions[bot]/Bot producer.",
+    "run_attempt_identity": {
+      "head_role": "caller-workflow-event-commit",
+      "required_equalities": [
+        "id-equals-receipt-producer-run-id",
+        "run_attempt-equals-receipt-producer-run-attempt",
+        "repository-full_name-equals-receipt-producer-repository",
+        "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA"
+      ]
+    },
+    "artifact_run_association": {
+      "required_equalities": [
+        "artifact-api-workflow_run-id-equals-exact-run-attempt-id",
+        "artifact-api-workflow_run-head_sha-equals-exact-run-attempt-head_sha"
+      ]
+    },
+    "status_head_identity": {
+      "head_role": "current-pull-request-head",
+      "required_equalities": [
+        "selected-receipt-status-head_sha-equals-current-pull-request-head_sha",
+        "rest-status-list-request-ref-equals-current-pull-request-head_sha",
+        "selected-graphql-status-context-commit-oid-equals-current-pull-request-head_sha",
+        "selected-receipt-status-head_sha-equals-selected-graphql-status-context-commit-oid"
+      ]
+    },
+    "head_domain_separation": {
+      "workflow_run_head_may_differ_from_status_and_pull_request_head": true,
+      "consumer_must_not_require": [
+        "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
+        "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha"
+      ]
+    },
     "positive_consumer_requirement": {
       "operator": "all-of",
       "execution": {
