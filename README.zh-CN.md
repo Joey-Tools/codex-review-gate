@@ -64,24 +64,37 @@ node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 subtree 边界。使用 `scripts/release-action-subtree.sh` 校验源码树，并计算发布到 action
 仓库的 split commit。
 
-Canonical workflow 必须 pin action release 仓库中的 exact 40-hex commit。在 1.4.0
-subtree split 生成前，源码文档使用显式 placeholder：
+Canonical GitHub.com workflow 通过兼容的 v1 selector，把 privileged job 委派给
+集中部署的 reusable workflow：
 
 ```yaml
-- uses: JoeyTeng/codex-review-gate-action@<v1.4.0-action-commit-sha>
+jobs:
+  codex-review-gate:
+    name: codex/review-gate runner
+    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1
 ```
 
-源码 merge 且 action 仓库同步完成后，v1.4.0 release notes 和 release provenance
-manifest 会发布应替换进去的 exact value。Floating `@v1.4` 与 `@v1` 只用于 convenience；
-它们绝不是 canonical 或可承载 provenance 的 reference。
+Floating `@v1` 是刻意设计的集中式执行前信任边界，并不是运行后的 immutable
+provenance。Consumer 从 exact run attempt 解析 GitHub server 选中的 called-workflow
+object，并且只有在受信 signer 签名的 compatible v1.x.y immutable release 及其完整
+provenance-v2 tree/protocol bindings 全部通过后才接纳。这样 compatible v1.x Action
+release 可以集中升级，不需要修改 caller 或 consuming Skill。
+
+Direct composite interface 继续用于 GitHub Enterprise Server 和 immutable audit；应 pin
+到 exact v1.5.1 Action release commit：
+
+```yaml
+- uses: JoeyTeng/codex-review-gate-action@59eeda2af2a7baab3f3f15a59fbbaee015fa6c01
+```
 
 `codex/review-gate` 只报告本 action 的 required commit-status 结果；它不证明 named
 triple review 已完成，也不证明 PR 整体 merge-ready。完整约束见
 [action 语义](packages/action/README.zh-CN.md#它检查什么)和
 [evidence reconciliation 设计](packages/action/DESIGN.zh-CN.md#evidence-reconciliation)。
-v1 producer receipt 为 exact pinned invocation 提供 causal producer evidence，但
-consumer 必须校验其 run-attempt artifact，并继续独立归约 provider evidence；见
+v1 producer receipt 为 exact direct 或 reusable invocation 提供 causal producer
+evidence，但 consumer 必须校验 run-attempt artifact、called-workflow W/C mapping 与
+signed immutable release provenance，然后继续独立归约 provider evidence；见
 [invocation provenance](packages/action/README.zh-CN.md#invocation-provenance)。
-`v1.4.0` 等 immutable tags 与既有 `v1.3.x` releases 都会保留，供审计和回滚使用。
+`v1.5.1`、`v1.4.0` 等 immutable tags 与既有 `v1.3.x` releases 都会保留，供审计和回滚使用。
 
 完整流程见 [docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。
