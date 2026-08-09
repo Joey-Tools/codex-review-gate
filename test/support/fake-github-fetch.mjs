@@ -184,11 +184,27 @@ function handle({ method, path, query, body }) {
   const statusMatch = path.match(new RegExp(`^${escapeRegExp(repoBase)}/statuses/(.+)$`));
   if (method === "POST" && statusMatch) {
     state.statuses ||= [];
+    const id = state.statuses.length + 1;
+    const nodeId = `SC_kwDOCommitStatus${id}`;
+    const creator = {
+      login: "github-actions[bot]",
+      type: "Bot",
+    };
     state.statuses.push({
       sha: decodePathComponent(statusMatch[1]),
       body,
+      id,
+      node_id: nodeId,
     });
-    return { body: { id: state.statuses.length }, status: 201 };
+    return {
+      body: {
+        id,
+        node_id: nodeId,
+        ...body,
+        creator,
+      },
+      status: 201,
+    };
   }
 
   if (method === "POST" && path === "/graphql") {
@@ -214,6 +230,42 @@ function handle({ method, path, query, body }) {
     const variables = body?.variables || {};
     if (variables.threadId !== undefined && variables.threadId !== null) {
       const threadId = String(variables.threadId);
+      const thread = allReviewThreads().find(
+        (candidate) => String(candidate?.id) === threadId,
+      );
+      if (/\bCodexReviewGateReviewThreadState\b/.test(String(body?.query || ""))) {
+        state.threadStateLoads = (state.threadStateLoads || 0) + 1;
+        state.threadStateLoadsByThread ||= {};
+        state.threadStateLoadsByThread[threadId] =
+          (state.threadStateLoadsByThread[threadId] || 0) + 1;
+        const configuredQueue = state.threadStateResponses?.[threadId];
+        const queued = Array.isArray(configuredQueue) && configuredQueue.length > 0
+          ? configuredQueue.shift()
+          : null;
+        const override = typeof queued === "boolean"
+          ? { isResolved: queued }
+          : queued;
+        if (thread && override?.persist === true) {
+          if (override.id !== undefined) {
+            thread.id = override.id;
+          }
+          if (override.isResolved !== undefined) {
+            thread.isResolved = override.isResolved;
+          }
+        }
+        return {
+          body: {
+            data: {
+              node: thread
+                ? {
+                    id: override?.id ?? String(thread.id),
+                    isResolved: override?.isResolved ?? thread.isResolved,
+                  }
+                : null,
+            },
+          },
+        };
+      }
       const pages = threadCommentPagesFor(threadId);
       const connection = pages
         ? selectConnectionPage(pages, variables.after, `thread-${threadId}-comments`)
@@ -221,12 +273,50 @@ function handle({ method, path, query, body }) {
       return {
         body: {
           data: {
-            node: {
-              comments: selectReviewCommentConnection(connection),
-            },
+            node: thread
+              ? {
+                  id: String(thread.id),
+                  isResolved: thread.isResolved,
+                  comments: selectReviewCommentConnection(connection),
+                }
+              : null,
           },
         },
       };
+    }
+
+    const closingThreadStates = /\bCodexReviewGateReviewThreadStates\b/.test(
+      String(body?.query || ""),
+    );
+    if (closingThreadStates) {
+      state.threadStatePageLoads = (state.threadStatePageLoads || 0) + 1;
+      if (variables.after === undefined || variables.after === null) {
+        state.threadStateLoads = (state.threadStateLoads || 0) + 1;
+        state.activeThreadStateOverrides = {};
+        for (const [threadId, configuredQueue] of Object.entries(
+          state.threadStateResponses || {},
+        )) {
+          if (!Array.isArray(configuredQueue) || configuredQueue.length === 0) {
+            continue;
+          }
+          const queued = configuredQueue.shift();
+          const override = typeof queued === "boolean"
+            ? { isResolved: queued }
+            : queued;
+          if (!override || typeof override !== "object") {
+            continue;
+          }
+          const thread = allReviewThreads().find(
+            (candidate) => String(candidate?.id) === threadId,
+          );
+          if (thread && override.persist === true) {
+            if (override.isResolved !== undefined) {
+              thread.isResolved = override.isResolved;
+            }
+          }
+          state.activeThreadStateOverrides[threadId] = override;
+        }
+      }
     }
 
     const pages = state.reviewThreadPages;
@@ -236,7 +326,24 @@ function handle({ method, path, query, body }) {
           pageInfo: { hasNextPage: false, endCursor: null },
           nodes: state.reviewThreads || [],
         };
-    connection.nodes = connection.nodes.map(withInitialThreadComments);
+    if (closingThreadStates) {
+      state.threadStateLoadsByThread ||= {};
+      connection.nodes = connection.nodes.map((thread) => {
+        const threadId = String(thread?.id || "");
+        state.threadStateLoadsByThread[threadId] =
+          (state.threadStateLoadsByThread[threadId] || 0) + 1;
+        const override = state.activeThreadStateOverrides?.[threadId];
+        return {
+          id: override?.id ?? thread?.id,
+          isResolved: override?.isResolved ?? thread?.isResolved,
+        };
+      });
+      if (!connection.pageInfo.hasNextPage) {
+        delete state.activeThreadStateOverrides;
+      }
+    } else {
+      connection.nodes = connection.nodes.map(withInitialThreadComments);
+    }
 
     return {
       body: {
@@ -486,6 +593,7 @@ function normalizeCommitStatus(entry, sha, id) {
   if (entry?.body && typeof entry.body === "object") {
     return {
       id: entry.id ?? id,
+      node_id: entry.node_id,
       sha: entry.sha ?? sha,
       creator: defaultCreator,
       ...entry.body,

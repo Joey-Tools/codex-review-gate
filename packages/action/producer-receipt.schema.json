@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:joeyteng:codex-review-gate:producer-receipt:1",
+  "title": "Codex Review Gate producer receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "artifact",
+    "producer",
+    "execution",
+    "statuses"
+  ],
+  "properties": {
+    "schema": {
+      "const": "urn:joeyteng:codex-review-gate:producer-receipt:1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "file"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^codex-review-gate-producer-receipt-[1-9][0-9]*-[1-9][0-9]*$"
+        },
+        "file": {
+          "const": "codex-review-gate-producer-receipt.json"
+        }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "server_url",
+        "run",
+        "environment",
+        "job",
+        "action"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[^/]+/[^/]+$"
+        },
+        "server_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "run": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "attempt", "target_url"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            },
+            "attempt": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            },
+            "target_url": {
+              "type": "string",
+              "format": "uri"
+            }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA"],
+          "properties": {
+            "GITHUB_WORKFLOW_REF": {
+              "type": "string",
+              "minLength": 1
+            },
+            "GITHUB_WORKFLOW_SHA": {
+              "$ref": "#/$defs/fullSha"
+            }
+          }
+        },
+        "job": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "workflow_ref",
+            "workflow_sha",
+            "workflow_repository",
+            "workflow_file_path"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workflow_ref": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workflow_sha": {
+              "$ref": "#/$defs/fullSha"
+            },
+            "workflow_repository": {
+              "type": "string",
+              "pattern": "^[^/]+/[^/]+$"
+            },
+            "workflow_file_path": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "action": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "ref", "commit_sha", "immutable"],
+          "properties": {
+            "repository": {
+              "type": ["string", "null"],
+              "pattern": "^[^/]+/[^/]+$"
+            },
+            "ref": {
+              "type": ["string", "null"],
+              "minLength": 1
+            },
+            "commit_sha": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/fullSha"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "immutable": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "status_count"],
+      "properties": {
+        "result": {
+          "enum": ["running", "completed", "failed"]
+        },
+        "status_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "statuses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sequence",
+          "id",
+          "node_id",
+          "pull_request_number",
+          "head_sha",
+          "context",
+          "state",
+          "description",
+          "target_url",
+          "creator"
+        ],
+        "properties": {
+          "sequence": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$"
+          },
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "pull_request_number": {
+            "type": ["integer", "null"],
+            "minimum": 1
+          },
+          "head_sha": {
+            "$ref": "#/$defs/fullSha"
+          },
+          "context": {
+            "type": "string",
+            "minLength": 1
+          },
+          "state": {
+            "enum": ["error", "failure", "pending", "success"]
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 140
+          },
+          "target_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "creator": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["login", "type"],
+            "properties": {
+              "login": {
+                "type": "string",
+                "minLength": 1
+              },
+              "type": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "fullSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    }
+  }
+}

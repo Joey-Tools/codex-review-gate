@@ -72,8 +72,28 @@ source repository root. Instead, `packages/action` is the stable subtree
 boundary. Use `scripts/release-action-subtree.sh` to validate the source tree
 and compute the split commit for the action repository.
 
-Consumers should use `JoeyTeng/codex-review-gate-action@v1`. The signed
-floating major tag receives compatible v1 updates automatically; immutable
-release tags such as `v1.3.0` remain available for audits and rollbacks.
+The canonical workflow pins the exact 40-hex commit in the action release
+repository. Until the 1.4.0 subtree split exists, source documentation uses an
+explicit placeholder:
+
+```yaml
+- uses: JoeyTeng/codex-review-gate-action@<v1.4.0-action-commit-sha>
+```
+
+The v1.4.0 release notes and release provenance manifest publish the exact
+replacement after source merge and action-repository sync. Floating `@v1.4`
+and `@v1` are convenience aliases only; they are never the canonical or
+provenance-bearing reference.
+
+`codex/review-gate` reports only this action's required commit-status result;
+it does not attest a named triple review or overall merge readiness. See the
+[action semantics](packages/action/README.md#what-it-checks) and
+[evidence-reconciliation design](packages/action/DESIGN.md#evidence-reconciliation).
+The v1 producer receipt supplies causal producer evidence for an exact pinned
+invocation, but consumers must validate its run-attempt artifact and still
+reduce provider evidence independently; see
+[invocation provenance](packages/action/README.md#invocation-provenance).
+Immutable tags such as `v1.4.0` and the existing `v1.3.x` releases remain
+available for audits and rollbacks.
 
 See [docs/RELEASING.md](docs/RELEASING.md) for the full release flow.

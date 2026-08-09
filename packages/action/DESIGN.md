@@ -6,9 +6,11 @@ Languages: [British English (en-GB)](DESIGN.md) | [简体中文 (zh-CN)](DESIGN.
 
 `codex/review-gate` turns Codex review evidence into a deterministic commit
 status that can be required by branch protection. The gate passes only from a
-complete evidence snapshot when the latest official, trusted provider artifact
-that matches the closed clean grammar is bound to the current PR head and
-every historical thread-backed Codex finding is resolved. Controlled
+complete, stable evidence reduction when the selected official trusted clean
+artifact matches the closed grammar, binds strongly to the current PR head,
+and no current-head or ancestor Codex finding remains blocking. Pass means only
+that this required commit status is `success`; it never attests a named triple
+review or overall merge readiness. Controlled
 `@codex review` requests help obtain that evidence; they are not evidence
 authority.
 
@@ -16,28 +18,40 @@ authority.
 
 Every run reconstructs the required GitHub evidence instead of treating the
 sticky state comment or commit-status history as the decision source.
+The machine-readable authority for the closed reducer policy is
+[`decision-table.json`](decision-table.json), currently
+`policy_version: 1.4.0`.
 
 The result precedence is:
 
-1. If the current evidence snapshot is incomplete after bounded retries, do not
-   pass. Transient API or pagination exhaustion writes `pending`; deterministic
-   provider identity, schema, or commit conflicts write `error`. Both outcomes
-   fail the workflow.
-2. If any historical thread-backed Codex finding is unresolved, write
-   `failure`. `isOutdated` never substitutes for `isResolved`.
-3. If all thread-backed findings are resolved and the latest official, trusted
-   provider artifact that matches the closed clean grammar is bound to the
-   current head, write `success`.
-4. If no valid official, trusted closed-grammar clean artifact is available for
-   the current head, keep the
-   status `pending` while the marker workflow continues.
+1. Classify every commit-bound finding against the current head. Current-head
+   and proven-ancestor findings remain in the reduction. A proved
+   non-ancestor finding is retained for audit, removed from the blocking set,
+   and the evidence is reduced again. An unknown relationship receives bounded
+   retry and then becomes the stable evidence error `ancestry-unverified`.
+2. If a confirmed current-head or ancestor finding remains blocking, write
+   `failure`. An exact joined thread remains blocking until its authoritative
+   `isResolved` value is exactly `true`; `isOutdated` and a later clean result
+   cannot close it. If another evidence error is present, keep `failure` and
+   mention the evidence issue in the failure summary.
+3. With no confirmed blocking finding, transient acquisition or reconciliation
+   faults receive bounded retries and then write stable `error`. Deterministic
+   malformed, provider-identity, schema, commit-binding, and ancestry errors
+   also write `error`.
+4. If the complete reduction is stable, the selected official trusted clean
+   artifact matches the closed grammar and binds strongly to the current head,
+   and no finding blocks, write `success`.
+5. If valid progress is present, or no acceptable terminal artifact is yet
+   available, keep `pending` under the existing marker and deadline.
 
-An older incomplete API read, pagination failure, unrecognised identity, commit
-parse failure, `pending` status, `error` status, or closed marker-wait outcome
-is audit history only. It does not override a newer, complete current-head
-clean artifact. Conversely, a newer terminal-looking provider artifact whose
-identity, schema, or commit binding cannot be validated makes the current run
-inconclusive even if an older valid clean artifact exists.
+Persisted `pending` or `error` statuses and closed marker-wait outcomes from
+older runs are audit history only. A transient incomplete API or pagination
+attempt stops blocking only when a successful bounded retry or later run
+reconstructs a complete current snapshot; bounded retry exhaustion writes
+stable `error`. Every malformed or unrecognised provider artifact,
+identity failure, schema failure, or commit-parse/binding failure still present
+in that complete snapshot is a global evidence error; a newer clean artifact
+does not supersede it.
 
 Evidence reconciliation precedes wait-deadline orchestration. Marker deadlines
 end or retry waits when no acceptable terminal result is available; they do
@@ -54,20 +68,36 @@ budget is terminal-looking malformed evidence rather than being ignored.
 An unknown single decorator token immediately before `Codex Review` is also
 terminal-looking malformed evidence; it does not broaden the accepted clean
 or finding grammars.
-Progress is ignored only when the complete normalised body is the supported
-single-line progress grammar.
+Progress is valid only when the complete normalised body matches the supported
+single-line progress grammar. It produces a pending evidence result under the
+existing marker and deadline; it does not acknowledge the marker, reset or
+extend a deadline, or cause a replacement marker to be posted. A
+terminal-looking body outside that exact grammar is deterministically
+malformed and writes `error` when no confirmed finding controls the result.
 
-Unthreaded top-level issue-comment findings have no GitHub resolution flag.
-They remain active until a later valid official, trusted closed-grammar clean
-artifact for the same or a newer head supersedes them.
+Unthreaded top-level issue-comment findings have no GitHub resolution flag. An
+older same-head or proven-ancestor finding remains active unless the selected
+valid official trusted clean artifact is bound to the current head and is
+strictly later than that finding. A proved non-ancestor finding is audit-only;
+it is removed before re-reduction. Issue-comment `created_at` and `updated_at`
+must both be canonical, with `updated_at >= created_at`; `updated_at` is the
+artifact revision time. REST issue-comment timestamps have one-second
+granularity, so two issue-comment artifacts in the same revision second are
+always ambiguous: even `created_at == updated_at` cannot prove that no
+same-second edit occurred, and numeric IDs never break that tie. Pull-request
+reviews at the same validated `submitted_at` may use the larger canonical ID
+only within the review channel; equal-time cross-channel evidence is ambiguous.
 
 A clean result bound to a commit that is strictly proven to be an ancestor of
 the current head is stale audit evidence, not malformed evidence. It leaves the
 current head pending and is included in the baseline of any newly created
-marker. A clean bound to an unrelated, divergent, or otherwise unverified
-commit remains a deterministic error. A delayed stale issue-comment clean also
-cannot wake an existing current-head marker: a completion transition must
-match the exact provider artifact selected as the current-head clean result.
+marker. A clean bound to a commit proved to be a non-ancestor, including a
+valid `behind` or `diverged` comparison, is audit-only and is removed before
+the evidence is reduced again. Only a relationship that remains unknown after
+bounded retries becomes stable `error` with `ancestry-unverified`. A delayed
+stale issue-comment clean also cannot wake an existing current-head marker: a
+completion transition must match the exact provider artifact selected as the
+current-head clean result.
 
 Ancestry uses the REST commit-comparison endpoint with exact 40-hex
 `base...head` request endpoints. The response must contain documented
@@ -83,25 +113,32 @@ prove non-ancestry. Contradictions fail closed as deterministic invalid
 responses. A non-linear comparison with both counts positive is `diverged`
 regardless of which count is larger; count magnitude never reclassifies it as
 `ahead` or `behind`. The action neither depends on the undocumented `head_commit` field
-nor performs a separate head-commit GET.
+nor performs a separate head-commit GET. A relationship that remains unknown
+after bounded retries produces stable `error` with reason
+`ancestry-unverified`; it is never guessed.
 
 Before writing `success`, the action follows one fixed order:
 
 1. Read and cache the newest same-context live gate status on a best-effort
    basis, preserving its producer identity.
 2. Re-read PR lifecycle and the exact head.
-3. Load the final fully paginated evidence snapshot. If its GraphQL thread
+3. Re-read the final fully paginated evidence snapshot. If its GraphQL thread
    comments and REST review comments expose a possible cross-channel orphan,
    including an inline comment whose parent review is not yet visible, perform
-   one bounded whole-snapshot reload; a persistent orphan makes the run
-   incomplete and therefore `pending`.
-4. Revalidate findings, provider identity, the closed terminal-result grammar,
-   and commit binding.
-5. Decide status-write deduplication from the cached status without another
-   network read. Skip only when that newest same-context status is already
-   `success` and its producer is exact `github-actions[bot]` / `Bot`; an
-   external or missing producer never permits fallback to an older trusted
-   status. Otherwise immediately issue the single non-retried `success` POST.
+   one bounded whole-snapshot reload; a persistent orphan becomes an evidence
+   error after bounded reconciliation.
+4. Revalidate and reduce findings, provider identity, the closed
+   terminal-result grammar, and commit binding. The re-read PR lifecycle, head,
+   complete evidence, blocking set, and selected result must remain stable
+   against the prior complete reduction; otherwise the action refuses success.
+   The reduction certificate binds each selected or applicable issue-comment
+   carrier's `created_at`, `updated_at`, and carrier digest, so an edit cannot
+   pass final validation as unchanged evidence.
+5. Without another network read, POST `success` from the current run attempt
+   whenever receipt mode is enabled, even when the cached status already
+   matches. Outside receipt mode, skip only when that newest same-context
+   status is already `success` and its producer is exact
+   `github-actions[bot]` / `Bot`; otherwise issue the single non-retried POST.
 
 If the initial status read fails, the action still posts the freshly computed
 status after the final snapshot. Missing marker, baseline, deadline, recovery,
@@ -112,14 +149,16 @@ The optional commit-status deduplication GET has its own best-effort budget,
 separate from review evidence: 100 statuses per page, at most 10 pages or 1,000
 items, 1 MiB per response, 4 MiB in total, and 16 actual fetch attempts. An
 API, payload, pagination, or budget failure sets `readFailed`; it does not make
-the review evidence incomplete or change its result. The action simply skips
-deduplication and POSTs the status it already computed.
+the review evidence incomplete or change its result. Receipt mode always POSTs
+the current attempt's status. Outside receipt mode, `readFailed` skips
+deduplication and POSTs the status already computed.
 
 Every GitHub request attempt has a 60-second default deadline that covers both
 the fetch and response-body read. For an otherwise retryable response, a valid
 `Retry-After` of at most 10 seconds is honoured on REST and GraphQL alike. A
-longer valid delay stops immediately: evidence reads become transient
-`pending`, while writes fail. A missing or malformed `Retry-After` uses the
+longer valid delay stops that attempt immediately: the evidence acquisition
+remains retryable within its bound and becomes `error` if the bound is
+exhausted, while writes fail. A missing or malformed `Retry-After` uses the
 normal bounded exponential fallback for retryable statuses; an explicit
 403 rate limit still requires a usable bounded server delay. The header never
 makes an otherwise non-retryable method or status retryable.
@@ -139,14 +178,15 @@ attempts. Each individual response is capped at 8 MiB while it is streamed
 exceeds the cap), and each snapshot may contain at most 20,000 evidence items.
 The action permits at most four concurrent HTTP requests and uses at most four
 concurrent workers when completing review-thread comments. Exhausting a byte,
-item, or attempt budget makes the current evidence incomplete, writes
-`pending`, and exits non-zero. A deterministic provider schema, identity, or
-commit-binding conflict instead writes `error` and exits non-zero. A budget
+item, or attempt budget aborts acquisition and becomes `error` after bounded
+retry. A deterministic provider schema, identity, or commit-binding conflict
+also writes `error` and exits non-zero when no confirmed finding controls a
+mixed result. A budget
 failure is sticky for that PR reconciliation and broadcasts an abort to every
 active evidence request so concurrent work does not continue consuming
-resources. If concurrent evidence loads expose mixed failures, a deterministic
-non-`pending` failure, including a schema or identity error, takes precedence
-over a budget or other transient `pending` failure.
+resources. If evidence loads expose both an evidence issue and a confirmed
+blocking finding, the gate writes `failure` and mentions the evidence issue in
+the summary. Without a confirmed finding, the evidence issue writes `error`.
 
 ```mermaid
 sequenceDiagram
@@ -158,10 +198,12 @@ sequenceDiagram
   opt Possible cross-channel orphan
     Gate->>GitHub: Bounded whole-snapshot reload
   end
-  Note over Gate: Validate completeness, findings, provider identity, grammar, and head binding
+  Note over Gate: Re-reduce; require stable PR, head, complete evidence, findings, grammar, and head binding
   Note over Gate: Deduplicate from cached status; no network read
-  alt Cached newest status is expected-producer success
-    Note over Gate: Skip duplicate write
+  alt Receipt mode enabled
+    Gate->>GitHub: POST success for this attempt (no blind retry)
+  else Cached newest status is expected-producer success
+    Note over Gate: Skip duplicate write outside receipt mode
   else Read failed, absent, external, missing producer, or not success
     Gate->>GitHub: POST success immediately (no blind retry)
   end
@@ -209,6 +251,135 @@ The workflow must run trusted default-branch action code. It must not check out 
 
 The workflow should use one repository-wide concurrency group with `cancel-in-progress: false`. Scheduled scans can modify any open PR, so they must not run concurrently with PR-specific Codex signal runs.
 
+## Invocation Provenance Boundary
+
+The canonical workflow pins the exact 40-hex commit in the action release
+repository. Source documentation uses
+`JoeyTeng/codex-review-gate-action@<v1.4.0-action-commit-sha>` until the subtree
+split exists; the v1.4.0 release notes and release provenance manifest publish
+the exact replacement. Floating `@v1.4` and `@v1` aliases are convenience-only
+and never carry canonical invocation provenance.
+
+Commit Status fields are not an attestation of which action code ran. The
+status head SHA, `context`, `creator`, and `target_url` are useful consistency
+checks, but a workflow holding `statuses: write` can reproduce that context and
+URL and may write through the same generic `github-actions[bot]` identity. The
+Workflow Run API binds a run to workflow metadata; it does not prove the exact
+action commit resolved behind a floating `uses` reference.
+
+Commit Status is keyed by repository commit SHA and context, not by pull
+request. If several open PRs share one head SHA, they inherently share that
+status and branch-protection signal. The status cannot prove PR isolation: the
+selected receipt `statuses[]` entry's PR number and the skill's independently
+reduced provider evidence must both match the selected current PR.
+
+### Producer receipt v1
+
+On GitHub.com, the composite action produces the v1 receipt defined by
+`producer-receipt.schema.json` with schema ID
+`urn:joeyteng:codex-review-gate:producer-receipt:1`. Receipt creation captures
+`GITHUB_WORKFLOW_REF`, `GITHUB_WORKFLOW_SHA`, `job.workflow_ref`,
+`job.workflow_sha`, `job.workflow_repository`, `job.workflow_file_path`,
+`github.action_repository`, and `github.action_ref`. The `job.workflow_*`
+contexts and this producer-receipt contract are GitHub.com-only.
+
+Only an exact lower-case 40-SHA `github.action_ref` is authoritative. It is
+copied to `producer.action.commit_sha` with `immutable: true`. A floating tag,
+branch, or local action invocation produces `immutable: false` and is unusable
+as provenance. The receipt's run target is exactly
+`https://github.com/<owner>/<repository>/actions/runs/<run_id>/attempts/<attempt>`.
+That attempt path is also the Workflow Run request endpoint. The response
+`url` and `html_url` remain base-run resource URLs and are not required to
+equal the attempt-specific target.
+
+While a receipt is enabled, every `setCommitStatusIfNeeded` decision forces a
+POST from the current run attempt instead of reusing an older matching status.
+For each POST, the producer requires the REST response to supply a positive
+`id`, nonempty `node_id`, exact echoes of state, context, description, and
+target URL, plus creator login/type. It records those values with the full head
+SHA and PR number. One receipt may contain multiple ordered status entries,
+including a scan that handles several PRs.
+
+Only a receipt finalized as `completed` or `failed` is eligible for upload.
+Each finalized run attempt makes one action-level, `overwrite: false` upload
+attempt for the attempt-named artifact through
+`actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02`
+(`v4.6.2`), containing exactly one file,
+`codex-review-gate-producer-receipt.json`. The composite exposes
+`producer-receipt-artifact-id`, `producer-receipt-artifact-url`, and
+`producer-receipt-artifact-digest` from that upload. The producer does not
+claim exactly-once artifact creation; the consumer's final inventory check
+requires exactly one artifact.
+
+### Consumer validation
+
+A review or readiness skill must fail closed unless all of these checks pass:
+
+1. Query the Artifact API for the exact repository, run, attempt-specific
+   artifact name, and require `total_count == 1`. When action outputs are
+   available, match the REST artifact ID to the output ID. Construct the
+   expected output web URL as
+   `<server>/<repository>/actions/runs/<run_id>/artifacts/<artifact_id>` and
+   compare it to the upload output; REST artifact `.url` is an API URL and must
+   not be compared directly. Require the upload output digest to be a raw
+   64-hex SHA-256 and REST `.digest` to equal `sha256:<raw-output-digest>`.
+   Download the artifact, verify its digest, and require exactly one expected
+   file. Validate its JSON against `producer-receipt.schema.json` at the root
+   of the exact pinned published action commit; the same schema's path in this
+   source repository is `packages/action/producer-receipt.schema.json`.
+2. The receipt schema permits finalized `execution.result` values of
+   `completed` or `failed`, but a positive review or readiness decision must
+   require `execution.result == completed`; a `failed` receipt remains audit
+   evidence and cannot support a positive decision. Also require the exact run
+   ID/attempt/name/target URL, `https://github.com`, the current repository,
+   and every expected workflow/job field. Require the exact expected action
+   repository and 40-SHA with `immutable: true`. Fetch the run attempt through
+   its attempt-specific request endpoint; do not require the response `url` or
+   `html_url` to be attempt-specific.
+3. REST-list all Commit Status records for the exact current PR head. Select
+   the latest record for the logical context using a case-insensitive context
+   comparison. Then require the selected record's context to use the exact
+   configured spelling (`codex/review-gate` by default), require its creator to
+   be exactly `github-actions[bot]` with type `Bot`, and match its `id`,
+   `node_id`, and head to the unique matching receipt `statuses[]` member for
+   the current PR, which need not be the last member. A positive decision also
+   requires exact `status.state == success` for the selected REST record and
+   receipt member.
+   That selected member's `creator` must independently be exactly
+   `github-actions[bot]` with type `Bot`, and its `pull_request_number` must
+   equal the selected current PR; missing or non-unique membership fails
+   closed, and there is no top-level receipt creator.
+4. Re-read that node as a GraphQL `StatusContext`. Require exact context,
+   state, target URL, and head across the receipt, REST, and GraphQL node, while
+   retaining the receipt/run/current-state action SHA and workflow/job
+   bindings. Its creator must independently be exactly `github-actions[bot]`
+   with type `Bot`; creator agreement alone is insufficient. A
+   `StatusContext` does not supply PR isolation.
+5. Independently reload and reduce official provider evidence for the same PR
+   named by the selected receipt member. A valid receipt proves neither clean
+   evidence nor merge readiness.
+6. Immediately before readiness consumes the result, REST-list the exact-head
+   statuses again. The case-insensitive logical latest must still have the same
+   REST ID and node ID and the exact expected context. Stably re-read PR head
+   and lifecycle, exact run-attempt metadata, and the run-level artifact
+   inventory queried with the attempt-specific name, which must still contain
+   exactly one artifact; require the
+   independently reduced provider snapshot and every prior binding to remain
+   stable. A change receives bounded retry and then fails closed.
+
+Status creation and artifact upload are not atomic, and an uploaded artifact
+may later expire or be deleted. Upload failure, Artifact API absence or
+`total_count != 1`, unfinished execution, no matching status, or any invalid
+receipt field therefore fails closed even when a status exists. Receipt v1 is
+causal producer evidence only, and provider evidence must still be revalidated
+independently. The receipt and artifact digest are structured
+consistency/integrity evidence; they are not a cryptographic signature, OIDC
+attestation, or content-addressed storage guarantee. The exact creator checks
+remain spoofable by a workflow with `statuses: write`; only the validated
+receipt/run chain adds causal consistency, not an unforgeable identity.
+These final re-reads are point-in-time consistency checks; they neither remove
+all TOCTOU windows nor make a per-SHA/context status prove a PR-specific fact.
+
 ## Configuration Controls
 
 Repository and organization variables are the preferred control surface for options that should affect workflow routing before a runner starts. Runtime environment variables are accepted as compatibility input once a runner is already running.
@@ -249,9 +420,15 @@ controls retained so existing workflows continue to load. Their values are
 accepted and validated but no longer change gate decisions or request
 orchestration.
 
-`+1` reactions are diagnostic in this design. They are recorded when useful, but they are not the primary pass signal because reactions do not provide a reliable workflow wake event.
+`+1` reactions are audit-only in this design. They may be recorded, but they
+have no clean, finding, pass, failure, or error verdict authority.
 
 `eyes` reactions are liveness signals. The gate checks both PR-body reactions and reactions on the active marker comment. They move `WaitingAck` to `WaitingResult`, but they do not pass the gate.
+They preserve the existing deadline and never reset or extend it.
+
+The v1.4 timeout contract is unchanged: 300 seconds for initial marker
+acknowledgement, 1,800 seconds for maximum acknowledgement backoff, 3,600
+seconds for an acknowledged result, and 7,200 seconds overall.
 
 ### `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`
 
@@ -279,13 +456,14 @@ The happy path normally uses two short jobs:
 1. A PR event creates or refreshes state, writes `pending`, and posts a controlled `@codex review` marker for the current head.
 2. A Codex top-level completion comment or `APPROVED` review wakes triage.
    The gate reloads complete evidence, verifies that the head is unchanged,
-   requires every historical thread-backed finding to be resolved, and writes
-   the computed status.
+   re-reduces it, requires the final PR/head/evidence result to be stable, and
+   writes the computed status.
 
 Finding paths depend on event mode. In `standard` mode, a Codex submitted review can wake triage and write `failure`. In `comment-only` mode, the status may stay `pending` until a scheduled or manual scan observes the findings.
 
 Resolved-findings recovery does not add a polling loop. After a
-`failed_findings` status, maintainers resolve every Codex review thread. A
+`failed_findings` status, maintainers resolve each exact joined blocking Codex
+review thread. A
 provider event, schedule, rerun, or targeted `workflow_dispatch` can then cause
 another complete reconciliation; a manual run may also resume or create a
 controlled request marker. Historical incomplete runs and legacy recovery
@@ -374,17 +552,15 @@ The reconciliation decision precedes marker orchestration:
 
 ```mermaid
 flowchart TD
-  load["Load complete current evidence"] --> complete{"Snapshot complete?"}
-  complete -->|No, transient exhaustion| pendingError["Write pending; fail workflow"]
-  complete -->|No, deterministic conflict| hardError["Write error; fail workflow"]
-  complete -->|Yes| threads{"Any unresolved historical thread finding?"}
-  threads -->|Yes| failed["Write failure"]
-  threads -->|No| clean{"Latest official trusted closed-grammar current-head clean?"}
+  load["Acquire and reduce current evidence"] --> findings{"Confirmed blocking current-head or ancestor finding?"}
+  findings -->|Yes, with or without evidence issue| failed["Write failure; mention any evidence issue"]
+  findings -->|No| evidence{"Acquisition and reconciliation valid after bounded retry?"}
+  evidence -->|No| hardError["Write stable error"]
+  evidence -->|Yes| clean{"Selected strongly bound current-head clean?"}
   clean -->|Yes| final["Run ordered final validation"]
-  final -->|Complete and still valid| passed["Skip cached duplicate or POST success"]
-  final -->|Persistent orphan or other transient gap| pendingError
-  final -->|Deterministic conflict| hardError
-  clean -->|No| pending["Keep pending and continue marker flow"]
+  final -->|PR, head, complete evidence, and reduction stable| passed["Receipt: POST current attempt; otherwise deduplicate or POST"]
+  final -->|Unstable or invalid| hardError
+  clean -->|Valid progress or no terminal result| pending["Keep existing marker and deadline pending"]
 ```
 
 The following state machine coordinates request markers and retry deadlines. A
@@ -399,15 +575,17 @@ flowchart TD
 
   waitingAck -->|Codex APPROVED review| validatePass["Reconcile complete current evidence"]
   waitingAck -->|Codex top-level clean completion comment| validatePass
-  validatePass -->|Latest official trusted closed-grammar current-head clean; all threads resolved| passed["Passed"]
-  validatePass -->|Unresolved finding| failed["FailedFindings"]
+  validatePass -->|Strongly bound current-head clean; stable reduction; no blockers| passed["Passed"]
+  validatePass -->|Confirmed current-head or ancestor finding| failed["FailedFindings"]
   validatePass -->|No current-head clean or only stale evidence| pending
-  validatePass -->|Incomplete or transient| incomplete["Write pending; fail workflow"]
-  validatePass -->|Malformed or deterministic conflict| invalid["Write error; fail workflow"]
+  validatePass -->|Acquisition or reconciliation fault after bounded retry| invalid["Write error; fail workflow"]
+  validatePass -->|Malformed or deterministic conflict| invalid
 
   waitingAck -->|Codex submitted review| validateReview["Reconcile complete evidence"]
   validateReview -->|Findings exist| failed
   validateReview -->|No findings yet| waitingResult["WaitingResult"]
+  waitingAck -->|Valid progress| progress["Keep pending; same marker and deadlines"]
+  waitingAck -->|eyes| waitingResult
 
   waitingAck -->|ackDeadlineAt elapsed| missedAck["Close marker as missed_ack"]
   missedAck --> backoff["Apply same-head backoff"]
@@ -426,10 +604,10 @@ flowchart TD
   passed -->|New commit| pending
   failed -->|New commit| pending
   failed -->|Provider event, rerun, schedule, or manual run| validateRecovery["Reconcile complete current evidence"]
-  validateRecovery -->|Latest official trusted closed-grammar current-head clean; all threads resolved| passed
-  validateRecovery -->|Unresolved thread finding remains| failed
+  validateRecovery -->|Strongly bound current-head clean; stable reduction; no blockers| passed
+  validateRecovery -->|Confirmed current-head or ancestor finding remains| failed
   validateRecovery -->|No current-head clean or only stale evidence| pending
-  validateRecovery -->|Incomplete or transient| incomplete
+  validateRecovery -->|Acquisition or reconciliation fault after bounded retry| invalid
   validateRecovery -->|Malformed or deterministic conflict| invalid
   failed -->|Request orchestration needs another review| resume["Resume or create controlled marker"]
   resume --> marker
@@ -447,18 +625,25 @@ NoState / Passed / FailedFindings
     create or refresh sticky state
     close obsolete active marker if present
     create @codex review marker for current head
-    create the fresh-head marker even when an older unresolved finding already blocks pass
+    create the fresh-head marker even when an ancestor finding already blocks pass
     set ackDeadlineAt, resultDeadlineAt, nextRetryAt, headStartedAt
     -> WaitingAck
 
 WaitingAck
   on a Codex APPROVED review event:
-    reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed, FailedFindings, or Pending
+    reconcile current head, latest terminal result, and reduced current/ancestor findings
+    -> Passed, FailedFindings, Pending, or Error
 
   on a Codex top-level completion comment event:
-    reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed, FailedFindings, or Pending
+    reconcile current head, latest terminal result, and reduced current/ancestor findings
+    -> Passed, FailedFindings, Pending, or Error
+
+  on valid progress:
+    keep pending under the existing marker and deadlines
+    do not acknowledge, reset, extend, or repost
+
+  on eyes:
+    -> WaitingResult with the existing deadline unchanged
 
   on a Codex submitted review event:
     reconcile the complete evidence snapshot
@@ -473,10 +658,10 @@ WaitingAck
 
 WaitingResult
   on a Codex APPROVED review or top-level completion comment event:
-    reconcile current head, latest terminal result, and all historical thread findings
-    -> Passed, FailedFindings, or Pending
+    reconcile current head, latest terminal result, and reduced current/ancestor findings
+    -> Passed, FailedFindings, Pending, or Error
 
-  on an unresolved Codex finding:
+  on a confirmed current-head or ancestor Codex finding:
     write failure
     close active marker as failed_findings
     -> FailedFindings
@@ -500,13 +685,15 @@ AnyState
 FailedFindings
   on a provider event, schedule, rerun, or manual dispatch:
     rebuild the complete evidence snapshot
-    require every historical thread-backed finding to be resolved
+    classify finding ancestry; audit-ignore proved non-ancestors and re-reduce
+    require authoritative isResolved=true for each exact joined blocking thread
     validate the latest official trusted provider artifact through the closed grammar
     require the selected clean result to bind the current head
-    run the ordered final validation before writing
+    require PR, head, complete evidence, and the final reduction to remain stable
     -> Passed if all requirements remain satisfied
-    -> FailedFindings if an unresolved thread-backed finding remains
-    -> Pending or Error if no valid clean exists or current evidence is incomplete
+    -> FailedFindings if a confirmed blocking finding remains, mentioning any evidence issue
+    -> Pending for valid progress or no terminal result
+    -> Error for malformed evidence or acquisition/reconciliation failure after bounded retry
     resume eligible retry state or create a fresh controlled marker only when
        request orchestration still needs one
 ```
@@ -524,17 +711,19 @@ Accepted provider evidence is channel-specific:
   and `fullDatabaseId` must be a canonical positive decimal string. Duplicate
   IDs within one REST or GraphQL namespace, or duplicate provider artifact
   identities within the same channel, are deterministic evidence errors.
-- A pull request review binds through its full `commit_id`. An inline comment
-  binds through its parent review and `original_commit_id`; the mutable
-  relocated inline `commit_id` is not provenance.
+- A pull request review binds through its native full `commit_id`. Any
+  reviewed-commit hash present in the review body must agree with that value.
+  An inline comment binds through its parent review and `original_commit_id`;
+  the mutable relocated inline `commit_id` is not provenance.
 - A validated `COMMENTED` review whose body matches the closed official
   inline-parent wrapper delegates its findings to the reconciled inline
   comments. Its reviewed-commit marker must match the parent `commit_id`, but
   the wrapper itself is not a standalone finding and does not require blob
   links.
-- A top-level clean result must match the supported clean format and carry a
-  reviewed-commit marker. A short marker is resolved through the repository
-  commit API and must resolve uniquely to the full current-head SHA.
+- A top-level clean result must match the supported clean format and carry
+  exactly one reviewed-commit marker. A short marker is resolved through the
+  repository commit API and must resolve uniquely to the full current-head
+  SHA.
 - Review-body and unthreaded top-level findings bind through exact
   `https://github.com/<owner>/<repository>/blob/<40-hex>/...` links. Mixed
   repositories, commits, or unsupported current formats are not accepted.
@@ -543,11 +732,12 @@ Accepted provider evidence is channel-specific:
   optional Markdown heading and emoji. The only non-terminal exception is a
   one-line progress message: `Codex Review in progress` or
   `Codex Review still in progress`, optionally followed by a period or by a
-  colon and one to 160 characters of one-line metadata. That progress message
-  is ignored. A newer broad candidate outside this exact exception, such as
-  `Codex Review completed`, is classified as malformed and fails closed when
-  it does not match a known clean or finding grammar; it is never silently
-  ignored.
+  colon and one to 160 characters of one-line metadata. That valid progress
+  artifact keeps `pending` under the existing marker and deadline without
+  acknowledgement, reset, extension, or repost. A broad candidate outside
+  this exact exception, such as `Codex Review completed`, is deterministically
+  malformed and writes `error` when no confirmed finding controls the result;
+  it is never silently ignored.
 
 Clean provider artifacts use a closed structural grammar. The optional tagline
 is a bounded presentation field, never an open natural-language field or an
@@ -615,18 +805,29 @@ evidence field:
 
 The action fully paginates issue comments, reviews, inline comments, GraphQL
 review threads, and thread comments. Missing parent reviews, thread mappings,
-pages, or conflicting payload fields make the current run incomplete rather
-than clean. A REST `rel="next"` link is authoritative even when the returned
+pages, or conflicting payload fields prevent clean and become an evidence
+error after bounded acquisition/reconciliation retries. A REST `rel="next"`
+link is authoritative even when the returned
 page is shorter than the requested page size. REST and GraphQL pagination have
 finite page budgets, and GraphQL cursors must advance on every non-terminal
 page. REST/GraphQL comment identity pairs and parent-review commit bindings are
 validated for resolved threads as well as unresolved ones; `isResolved` only
 removes the finding from the blocking count.
 
-Thread-backed findings are historical admission evidence. A thread stops
-blocking only when `isResolved` is true; `isOutdated` alone has no resolving
-effect. Unthreaded findings remain active until a later valid official, trusted
-closed-grammar clean artifact for the same or a newer head supersedes them.
+Only current-head and proven-ancestor findings enter the blocking reduction. A
+proved non-ancestor finding remains audit evidence but is removed before the
+reduction is recomputed; an unknown relationship receives bounded retry and
+then stable `error` with `ancestry-unverified`. For an exact joined thread,
+only authoritative `isResolved === true` stops blocking; `isOutdated` and a
+later clean result have no resolving effect. An older threadless same-head or
+ancestor finding remains active unless the strictly later selected
+current-head clean artifact supersedes it. For issue comments, canonical
+`created_at` and `updated_at` are both required and `updated_at` is the revision
+time. Two issue-comment artifacts in one revision second are always ambiguous;
+`created_at == updated_at` cannot prove the absence of a same-second edit, so
+IDs never break that tie. Same-time pull-request reviews may use the larger
+canonical ID only within that review channel; cross-channel ties remain
+ambiguous.
 
 An older clean issue comment with a 10-hex reviewed-commit reference is not
 resolved eagerly merely to populate audit history. The action resolves that
@@ -634,16 +835,21 @@ short SHA only when deciding whether the older clean supersedes an otherwise
 active older unthreaded finding.
 
 The final `success` path uses the ordered sequence defined under Evidence
-Reconciliation: cached status GET, PR lifecycle/head GET, final complete
-snapshot (including the bounded whole-snapshot orphan reload when needed),
-no-network deduplication, then an immediate status POST unless the cached
-newest same-context status is already `success` from exact
-`github-actions[bot]` / `Bot`. An external or missing producer cannot expose
-an older trusted status as the deduplication candidate.
+Reconciliation: cached status GET, PR lifecycle/head re-read, final complete
+evidence re-read (including the bounded whole-snapshot orphan reload when
+needed), and stable re-reduction whose certificate includes both carrier
+timestamps and the carrier digest. Receipt mode then POSTs immediately from
+the current attempt so the response enters the receipt. Outside receipt mode,
+the action may skip only when the cached newest same-context status is already
+`success` from exact `github-actions[bot]` / `Bot`; an external or missing
+producer cannot expose an older trusted status as the deduplication candidate.
 
-Structurally unsupported or malformed future provider formats fail the current
-run closed. Once a later run can parse a complete newer current-head clean
-result, an older format error or incomplete API attempt does not remain sticky.
+Structurally unsupported or malformed provider artifacts in the complete
+current snapshot remain global evidence errors when no confirmed finding
+controls the result; a later clean does not erase them. A transient incomplete
+API attempt is not sticky only after bounded acquisition/reconciliation
+successfully replaces it with a complete snapshot that contains no such
+malformed artifact.
 
 ## Fork and Dependabot PRs
 
@@ -667,20 +873,26 @@ If the sticky state comment exists but marker creation failed before a marker co
 
 Scheduled runs process retry deadlines. They should scan open PRs, load state only for candidate PRs, and advance markers whose `nextRetryAt`, `ackDeadlineAt`, or `resultDeadlineAt` has elapsed.
 
-If a current reconciliation exhausts bounded retries for a transient API or
-pagination failure, the gate writes `pending` to that PR head and fails the
-workflow. A deterministic provider identity, schema, or commit conflict writes
-`error` and fails the workflow. These states describe the current run only;
-they do not prevent a later complete reconciliation from writing `success`.
+If a current reconciliation exhausts bounded retries for a transient API,
+pagination, acquisition, or reconciliation failure, the gate writes stable
+`error` to that PR head and fails the workflow. A deterministic malformed,
+provider identity, schema, commit-binding, or `ancestry-unverified` conflict
+also writes `error` when no confirmed finding controls the result. If a
+confirmed blocking finding coexists with an evidence issue, the gate writes
+`failure` and mentions the evidence issue in its summary. These states describe
+the current run only; they do not prevent a later complete stable
+reconciliation from writing `success`.
 
 Consecutive `missed_ack` outcomes on the same head use exponential backoff. A head change or any non-`missed_ack` outcome resets that ack backoff history for the new marker.
 
-After `failed_findings`, maintainers resolve every Codex review thread. Any
+After `failed_findings`, maintainers resolve every exact joined blocking Codex
+review thread. Any
 later provider event, scheduled run, rerun, or targeted manual run may rebuild
-the complete snapshot. If the latest official, trusted closed-grammar clean
-artifact is bound to the current head, it may pass regardless of active-marker
-state, failed-marker close time, or any retained legacy recovery input,
-provided every historical thread-backed finding is resolved. Marker lifecycle,
+the complete snapshot. If the selected official trusted closed-grammar clean
+artifact is strongly bound to the current head, it may pass regardless of
+active-marker state, failed-marker close time, or any retained legacy recovery
+input, provided finding ancestry is reduced, exact joined blocking threads are
+authoritatively resolved, and the final PR/head/evidence reduction is stable. Marker lifecycle,
 deadline, baseline, and retry fields still drive request orchestration and
 audit. The deprecated recovery switch, `head`/`fresh` mode, and recorded
 recovery cutoff are inert compatibility data: they affect neither the gate
@@ -694,8 +906,9 @@ Repository rulesets should require:
 - the `codex/review-gate` status check
 - GitHub's native conversation-resolution protection, when the repository wants unresolved inline conversations to block merges
 
-The status check requires a complete evidence snapshot whose latest official,
-trusted provider artifact matches the closed clean grammar and binds the
-current head, plus resolution of every historical thread-backed Codex finding.
-Native conversation resolution remains useful as an independent UI and
-branch-protection signal.
+The status check requires a complete stable evidence reduction whose selected
+official trusted provider artifact matches the closed clean grammar, binds
+strongly to the current head, and leaves no blocking current-head or ancestor
+finding. Native conversation resolution remains useful as an independent UI
+and branch-protection signal. This status does not attest triple review or
+overall merge readiness.

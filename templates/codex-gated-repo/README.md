@@ -11,17 +11,19 @@ tests, release workflows, and licensing after creating a repository from it.
 - this README
 
 The workflow writes the `codex/review-gate` status check and requests a controlled
-Codex review marker for each ready pull request head. Because the repository owner
-also maintains `JoeyTeng/codex-review-gate-action`, it uses the floating major
-`@v1` to receive compatible automatic upgrades. This is the explicitly accepted
-policy for this privileged `pull_request_target` workflow.
+Codex review marker for each ready pull request head. Before enabling the workflow,
+replace `<v1.4.0-action-commit-sha>` with the exact 40-character action-repository
+commit published in the v1.4.0 release notes. Floating `@v1.4` and `@v1` aliases
+are convenience-only and are not canonical pins for this privileged
+`pull_request_target` workflow.
 
 ## After Creating a Repository
 
 1. Add the project source, CI workflow, tests, and license.
-2. Confirm `.github/workflows/codex-review-gate.yml` is present on the default
+2. Replace the action release placeholder with the published exact 40-SHA.
+3. Confirm `.github/workflows/codex-review-gate.yml` is present on the default
    branch before requiring the status check.
-3. Enable the required status check with the bootstrap helper from
+4. Enable the required status check with the bootstrap helper from
    `JoeyTeng/codex-review-gate`:
 
 ```bash

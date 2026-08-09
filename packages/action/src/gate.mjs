@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { Buffer } from "node:buffer";
-import { appendFileSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { isDeepStrictEqual, TextDecoder } from "node:util";
 
 import {
@@ -83,11 +84,16 @@ const MAX_STATUS_READ_ITEMS = 1_000;
 const MAX_STATUS_READ_RESPONSE_BYTES = 1024 * 1024;
 const MAX_STATUS_READ_BYTES = 4 * 1024 * 1024;
 const MAX_STATUS_READ_REQUEST_ATTEMPTS = 16;
+const PRODUCER_RECEIPT_SCHEMA =
+  "urn:joeyteng:codex-review-gate:producer-receipt:1";
 
 const config = readConfig();
 const repo = parseRepo(config.repository);
 const repoPath = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
-const runUrl = `${config.serverUrl}/${repo.owner}/${repo.name}/actions/runs/${config.runId}`;
+const runUrl =
+  `${config.serverUrl}/${repo.owner}/${repo.name}/actions/runs/${config.runId}` +
+  `/attempts/${config.runAttempt}`;
+const producerReceipt = createProducerReceipt();
 const REVIEW_THREADS_QUERY = `
   query CodexReviewGateReviewThreads(
     $owner: String!
@@ -128,6 +134,8 @@ const REVIEW_THREAD_COMMENTS_QUERY = `
   query CodexReviewGateReviewThreadComments($threadId: ID!, $after: String) {
     node(id: $threadId) {
       ... on PullRequestReviewThread {
+        id
+        isResolved
         comments(first: 100, after: $after) {
           pageInfo {
             hasNextPage
@@ -136,6 +144,29 @@ const REVIEW_THREAD_COMMENTS_QUERY = `
           nodes {
             id
             fullDatabaseId
+          }
+        }
+      }
+    }
+  }
+`;
+const REVIEW_THREAD_STATES_QUERY = `
+  query CodexReviewGateReviewThreadStates(
+    $owner: String!
+    $repo: String!
+    $number: Int!
+    $after: String
+  ) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        reviewThreads(first: 100, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            id
+            isResolved
           }
         }
       }
@@ -154,7 +185,9 @@ const MAX_GRAPHQL_PAGES = 1_000;
 const MAX_IN_PROCESS_RETRY_WAIT_MS = 10_000;
 const ORCHESTRATION_PERSISTENCE_FENCE_DESCRIPTION =
   "Review orchestration state persistence failed; fresh marker required";
-main().catch(async (error) => {
+main().then(() => {
+  finishProducerReceipt("completed");
+}).catch(async (error) => {
   const gateError =
     error instanceof GateFailure
       ? error
@@ -169,6 +202,11 @@ main().catch(async (error) => {
   }
 
   console.error(error.stack || error.message);
+  try {
+    finishProducerReceipt("failed");
+  } catch (receiptError) {
+    console.error(`failed to finalize producer receipt: ${receiptError.message}`);
+  }
   process.exitCode = 1;
 });
 
@@ -437,6 +475,7 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     trigger.kind === "scan" &&
     !trigger.allowCreateMarker &&
     !dependabotScheduleRecovery &&
+    snapshot.findings.count === 0 &&
     !hasTrustedGateStateOrMarker(snapshot.comments, config.trustedCommentLogins);
   if (scheduledWithoutTrustedState) {
     console.log(
@@ -444,7 +483,6 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     );
     return;
   }
-  failIfSnapshotEvidenceIsInvalid(snapshot);
 
   let {
     state,
@@ -456,7 +494,11 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
   } = await loadAuditState(snapshot);
 
   if (snapshot.findings.count > 0) {
-    const findingOrchestration = reviewOrchestrationBlocked
+    const evidenceIssue = snapshotEvidenceIssue(snapshot);
+    const findingOrchestration =
+      reviewOrchestrationBlocked ||
+      snapshot.providerSnapshotIncomplete ||
+      Boolean(evidenceIssue)
       ? { state, stateComment: savedStateComment }
       : await prepareFindingReviewOrchestration(
           snapshot,
@@ -469,10 +511,16 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
       snapshot.findings,
       findingOrchestration.state,
       findingOrchestration.stateComment,
-      { preserveAuditState: reviewOrchestrationBlocked },
+      {
+        preserveAuditState:
+          reviewOrchestrationBlocked || snapshot.providerSnapshotIncomplete,
+        evidenceIssue,
+      },
     );
     return;
   }
+
+  failIfSnapshotEvidenceIsInvalid(snapshot);
 
   if (
     await reconcileCurrentReviewEvidence(
@@ -484,6 +532,9 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
   ) {
     return;
   }
+  const providerProgressIsPending =
+    snapshot.progressObserved === true &&
+    snapshot.providerResult.kind === "pending";
 
   const legacyMigration = migrateLegacyFailureState(
     state,
@@ -557,6 +608,15 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     });
   }
 
+  const progressSuppressesFreshMarker =
+    providerProgressIsPending &&
+    !headChanged &&
+    !state.activeMarker &&
+    !latestMarkerForCurrentHead(state);
+  if (progressSuppressesFreshMarker) {
+    allowCreateMarker = false;
+  }
+
   let freshHeadMarkerAllowed = shouldCreateFreshHeadMarker({
     allowCreateMarker,
     hasActiveMarker: Boolean(state.activeMarker),
@@ -568,7 +628,11 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
       state,
       savedStateComment,
       snapshot,
-      { ...trigger, allowCreateMarker: true },
+      {
+        ...trigger,
+        allowCreateMarker: true,
+        suppressFreshMarker: progressSuppressesFreshMarker,
+      },
     );
     state = markerResult.state;
     savedStateComment = markerResult.stateComment;
@@ -623,7 +687,11 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
     state,
     savedStateComment,
     snapshot,
-    { ...trigger, allowCreateMarker },
+    {
+      ...trigger,
+      allowCreateMarker,
+      suppressFreshMarker: progressSuppressesFreshMarker,
+    },
   );
   if (result.kind === "save") {
     await saveState(result.state, result.stateComment);
@@ -975,7 +1043,9 @@ function migrateLegacyPassedState(state, snapshot, now) {
 }
 
 async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) {
-  let allowCreateMarker = trigger.allowCreateMarker || stateNeedsFreshMarkerAfterRecovery(state);
+  let allowCreateMarker =
+    !trigger.suppressFreshMarker &&
+    (trigger.allowCreateMarker || stateNeedsFreshMarkerAfterRecovery(state));
 
   for (let iteration = 0; iteration < 4; iteration += 1) {
     if (!state.activeMarker) {
@@ -988,7 +1058,7 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
         };
       }
 
-      if (!allowCreateMarker) {
+      if (!allowCreateMarker || trigger.suppressFreshMarker) {
         console.log(`PR #${activePrNumber} has no active marker; skipping ${trigger.kind} trigger.`);
         return { kind: "done", state, stateComment };
       }
@@ -1014,7 +1084,7 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
       state = closeActiveMarker(state, "obsolete_head", isoNow(), { currentHeadSha: statusSha });
       stateComment = await saveState(state, stateComment);
       await setCommitStatus("pending", "Previous Codex marker was for an obsolete head");
-      allowCreateMarker = true;
+      allowCreateMarker = !trigger.suppressFreshMarker;
       continue;
     }
 
@@ -1107,7 +1177,7 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
         lastObservedCompletionComment: snapshot.completionComment,
       });
       stateComment = await saveState(state, stateComment);
-      allowCreateMarker = true;
+      allowCreateMarker = !trigger.suppressFreshMarker;
       continue;
     }
 
@@ -1118,7 +1188,7 @@ async function advanceEventDrivenMarker(state, stateComment, snapshot, trigger) 
         lastObservedCompletionComment: snapshot.completionComment,
       });
       stateComment = await saveState(state, stateComment);
-      allowCreateMarker = true;
+      allowCreateMarker = !trigger.suppressFreshMarker;
       continue;
     }
 
@@ -1226,17 +1296,26 @@ function trustedLiveMarkerMatches(recordedMarker, snapshot) {
 }
 
 function failIfSnapshotEvidenceIsInvalid(snapshot) {
-  const errors = snapshot.evidenceErrors || [];
-  if (errors.length === 0 && snapshot.providerResult.kind !== "malformed") {
+  const reason = snapshotEvidenceIssue(snapshot);
+  if (!reason) {
     return;
   }
 
-  const reason = errors[0] || snapshot.providerResult.reason || "unknown provider evidence conflict";
   throw new GateFailure(
     "error",
-    "Codex review evidence is invalid",
+    evidenceIssueStatusDescription(reason),
     `Cannot reconcile Codex review evidence for ${statusSha}: ${reason}`,
   );
+}
+
+function snapshotEvidenceIssue(snapshot) {
+  const errors = snapshot?.evidenceErrors || [];
+  if (errors.length > 0) {
+    return errors[0];
+  }
+  return snapshot?.providerResult?.kind === "malformed"
+    ? snapshot.providerResult.reason || "unknown provider evidence conflict"
+    : null;
 }
 
 async function passGateFromCurrentEvidence(
@@ -1248,7 +1327,6 @@ async function passGateFromCurrentEvidence(
   const liveStatus = await loadLatestGateStatus();
   await failIfPullRequestHeadChanged("before final Codex review evidence snapshot");
   const finalSnapshot = await loadSnapshot();
-  failIfSnapshotEvidenceIsInvalid(finalSnapshot);
   const finalReviewOrchestrationBlocked =
     reviewOrchestrationBlocked ||
     await markerStateConflictBlocksReviewOrchestration(finalSnapshot);
@@ -1263,10 +1341,14 @@ async function passGateFromCurrentEvidence(
       finalSnapshot.findings,
       state,
       stateComment,
-      { preserveAuditState: finalReviewOrchestrationBlocked },
+      {
+        preserveAuditState: finalReviewOrchestrationBlocked,
+        evidenceIssue: snapshotEvidenceIssue(finalSnapshot),
+      },
     );
     return;
   }
+  failIfSnapshotEvidenceIsInvalid(finalSnapshot);
   if (!providerResultIsCurrentHeadClean(finalSnapshot.providerResult)) {
     throw new GateFailure(
       "error",
@@ -1279,6 +1361,16 @@ async function passGateFromCurrentEvidence(
       "error",
       "Codex clean result changed during final validation",
       `The current-head Codex clean result for ${statusSha} was not stable across final validation.`,
+    );
+  }
+  if (!isDeepStrictEqual(finalSnapshot.decisionCertificate, snapshot.decisionCertificate)) {
+    throw new GateFailure(
+      "error",
+      "Codex review evidence reduction changed during final validation",
+      describeDecisionCertificateChange(
+        snapshot.decisionCertificate,
+        finalSnapshot.decisionCertificate,
+      ),
     );
   }
 
@@ -1343,12 +1435,25 @@ async function failFromFindings(
   findings,
   state,
   stateComment,
-  { preserveAuditState = false } = {},
+  {
+    preserveAuditState = false,
+    evidenceIssue = null,
+  } = {},
 ) {
   const sample = findings.samples[0];
   const suffix = sample ? ` First finding: ${sample}` : "";
+  const description = evidenceIssue
+    ? `Codex posted ${findings.count} finding(s); evidence issue also present`
+    : `Codex posted ${findings.count} finding(s) (applicable)`;
+  if (evidenceIssue) {
+    console.warn(
+      `Codex review has a confirmed finding and an evidence issue for ${statusSha}: ` +
+        `${evidenceIssue}`,
+    );
+    writeEvidenceIssueSummary(findings, evidenceIssue);
+  }
   if (preserveAuditState) {
-    await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
+    await setCommitStatus("failure", description);
     console.warn(
       "left conflicting marker audit state unchanged while recording authoritative findings",
     );
@@ -1366,7 +1471,7 @@ async function failFromFindings(
     runUrl,
     status: "failure",
   });
-  await setCommitStatus("failure", `Codex posted ${findings.count} finding(s) on current head`);
+  await setCommitStatus("failure", description);
   try {
     await saveState(statusState, stateComment);
   } catch (error) {
@@ -1375,6 +1480,27 @@ async function failFromFindings(
     );
   }
   console.log(`Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`);
+}
+
+function writeEvidenceIssueSummary(findings, evidenceIssue) {
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (!summaryPath) {
+    return;
+  }
+  const body = [
+    "## Codex Review Gate Evidence Issue",
+    "",
+    `The gate confirmed ${findings.count} blocking finding(s), so the required status is ` +
+      "`failure`.",
+    "",
+    `A separate evidence issue was also present: ${evidenceIssue}`,
+    "",
+  ].join("\n");
+  try {
+    appendFileSync(summaryPath, body, "utf8");
+  } catch (error) {
+    console.warn(`failed to write Codex evidence issue step summary: ${error.message}`);
+  }
 }
 
 async function saveOrchestrationCriticalState(state, stateComment, description) {
@@ -1819,13 +1945,44 @@ async function loadSnapshot({
       attempt === 1 &&
       Array.isArray(initialComments) &&
       initialSnapshotBudget !== null;
-    const snapshot = await loadSnapshotOnce({
-      allowMissingReviewChildTransient: attempt < MAX_WHOLE_SNAPSHOT_ATTEMPTS,
-      evidenceBudget: reuseInitialComments
-        ? initialSnapshotBudget
-        : createEvidenceSnapshotBudget(),
-      preloadedComments: reuseInitialComments ? initialComments : null,
-    });
+    let snapshot;
+    try {
+      snapshot = await loadSnapshotOnce({
+        allowMissingReviewChildTransient: attempt < MAX_WHOLE_SNAPSHOT_ATTEMPTS,
+        finalSnapshotAttempt: attempt === MAX_WHOLE_SNAPSHOT_ATTEMPTS,
+        evidenceBudget: reuseInitialComments
+          ? initialSnapshotBudget
+          : createEvidenceSnapshotBudget(),
+        preloadedComments: reuseInitialComments ? initialComments : null,
+      });
+    } catch (error) {
+      if (!(error instanceof GateFailure) || error.state !== "pending") {
+        throw error;
+      }
+      if (attempt < MAX_WHOLE_SNAPSHOT_ATTEMPTS) {
+        await sleepBeforeRetry(
+          `review evidence acquisition was incomplete (${error.message}); ` +
+            "reloading the whole snapshot",
+          attempt,
+        );
+        continue;
+      }
+      throw exhaustedSnapshotFailure(error.message);
+    }
+    if (
+      snapshot.evidenceTransientErrors.length > 0 &&
+      evidenceWorkBudget?.failure
+    ) {
+      const exhaustedReason = exhaustedSnapshotReason([
+        ...snapshot.evidenceTransientErrors,
+        evidenceWorkBudget.failure.message,
+      ]);
+      return {
+        ...snapshot,
+        evidenceErrors: [...snapshot.evidenceErrors, exhaustedReason],
+        evidenceTransientErrors: [],
+      };
+    }
     if (
       snapshot.providerResult.kind === "malformed" ||
       snapshot.evidenceErrors.length > 0 ||
@@ -1842,24 +1999,55 @@ async function loadSnapshot({
       );
       continue;
     }
-    throw new GateFailure(
-      "pending",
-      "Codex review evidence is temporarily incomplete",
-      `Cross-channel review evidence remained incomplete after a bounded whole-snapshot ` +
-        `reload: ${snapshot.evidenceTransientErrors[0]}`,
+    const exhaustedReason = exhaustedSnapshotReason(
+      snapshot.evidenceTransientErrors,
     );
+    return {
+      ...snapshot,
+      evidenceErrors: [...snapshot.evidenceErrors, exhaustedReason],
+      evidenceTransientErrors: [],
+    };
   }
 
   throw new Error("whole-snapshot reconciliation exceeded its retry budget");
 }
 
+function exhaustedSnapshotFailure(detail) {
+  const reason = exhaustedSnapshotReason([detail]);
+  return new GateFailure(
+    "error",
+    evidenceIssueStatusDescription(reason),
+    reason,
+  );
+}
+
+function exhaustedSnapshotReason(transientErrors) {
+  const detail = transientErrors.find((error) =>
+    String(error).includes("ancestry-unverified"),
+  ) || transientErrors[0] || "review evidence remained incomplete";
+  const category = String(detail).includes("ancestry-unverified")
+    ? "ancestry-unverified"
+    : "evidence-unavailable";
+  return `${category}: bounded whole-snapshot reconciliation exhausted: ${detail}`;
+}
+
+function evidenceIssueStatusDescription(reason) {
+  if (String(reason).includes("ancestry-unverified")) {
+    return "Codex ancestry unverified (ancestry-unverified)";
+  }
+  if (String(reason).includes("evidence-unavailable")) {
+    return "Codex evidence unavailable (evidence-unavailable)";
+  }
+  return "Codex review evidence is invalid";
+}
+
 async function loadSnapshotOnce({
   allowMissingReviewChildTransient = false,
+  finalSnapshotAttempt = false,
   evidenceBudget,
   preloadedComments = null,
 } = {}) {
-  const [comments, issueReactions, reviewComments, reviews, reviewThreads] =
-    await settleEvidenceLoads([
+  const loadedEvidence = await settleEvidenceLoads([
       Array.isArray(preloadedComments)
         ? Promise.resolve(preloadedComments)
         : paginate(
@@ -1883,16 +2071,11 @@ async function loadSnapshotOnce({
         { evidenceBudget },
       ),
       loadReviewThreads(evidenceBudget),
-    ], evidenceBudget);
-  const markerComment = findLatestTrustedMarkerComment(comments, config.trustedCommentLogins);
-  const markerCommentReactions = markerComment?.id
-    ? await paginate(
-        `${repoPath}/issues/comments/${markerComment.id}/reactions`,
-        { per_page: "100" },
-        { evidenceBudget },
-      )
-    : [];
-
+    ], evidenceBudget, { finalSnapshotAttempt });
+  if (!Array.isArray(loadedEvidence)) {
+    return partialSnapshotFromFulfilledEvidence(loadedEvidence);
+  }
+  const [comments, issueReactions, reviewComments, reviews, reviewThreads] = loadedEvidence;
   const evidence = await buildCurrentReviewEvidence({
     comments,
     reviewComments,
@@ -1901,14 +2084,98 @@ async function loadSnapshotOnce({
     allowMissingReviewChildTransient,
     evidenceBudget,
   });
-  const reactions = summarizeCodexSignalReactions(
-    issueReactions,
-    markerCommentReactions,
-    config.codexBotLogins,
-  );
-  const completionComment = selectLatestCodexCompletionComment(comments, config.codexBotLogins);
-  const approvedReview = selectLatestCodexApprovedReview(reviews, config.codexBotLogins);
-  const submittedReview = selectLatestCodexSubmittedReview(reviews, config.codexBotLogins);
+  const markerComment = findLatestTrustedMarkerComment(comments, config.trustedCommentLogins);
+  let markerCommentReactions = [];
+  if (markerComment?.id) {
+    try {
+      markerCommentReactions = await paginate(
+        `${repoPath}/issues/comments/${markerComment.id}/reactions`,
+        { per_page: "100" },
+        { evidenceBudget },
+      );
+    } catch (error) {
+      const deterministic =
+        !(error instanceof GateFailure) || error.state !== "pending";
+      const canPreserveConfirmedFinding = evidence.findings.count > 0;
+      if (
+        canPreserveConfirmedFinding &&
+        (
+          deterministic ||
+          evidence.errors.length > 0 ||
+          evidenceWorkBudget?.failure ||
+          finalSnapshotAttempt
+        )
+      ) {
+        const exhaustionReason = deterministic
+          ? error?.message || String(error)
+          : evidence.errors[0] || exhaustedSnapshotReason([
+              ...evidence.transientErrors,
+              error?.message || String(error),
+              evidenceWorkBudget?.failure?.message,
+            ]);
+        return partialSnapshotFromFulfilledEvidence({
+          comments,
+          issueReactions,
+          reviewComments,
+          reviews,
+          reviewThreads,
+          providerResult: evidence.providerResult,
+          errors: evidence.errors,
+          transientErrors: evidence.transientErrors,
+          findings: evidence.findings,
+          decisionCertificate: evidence.decisionCertificate,
+          progressObserved: evidence.progressObserved,
+          exhaustionReason,
+        });
+      }
+      throw error;
+    }
+  }
+  let reactions;
+  let completionComment;
+  let approvedReview;
+  let submittedReview;
+  try {
+    validateCodexEyesReactions(
+      [...issueReactions, ...markerCommentReactions],
+      config.codexBotLogins,
+    );
+    reactions = summarizeCodexSignalReactions(
+      issueReactions,
+      markerCommentReactions,
+      config.codexBotLogins,
+    );
+    completionComment = selectLatestCodexCompletionComment(
+      comments,
+      config.codexBotLogins,
+    );
+    approvedReview = selectLatestCodexApprovedReview(
+      reviews,
+      config.codexBotLogins,
+    );
+    submittedReview = selectLatestCodexSubmittedReview(
+      reviews,
+      config.codexBotLogins,
+    );
+  } catch (error) {
+    if (evidence.findings.count === 0) {
+      throw error;
+    }
+    return partialSnapshotFromFulfilledEvidence({
+      comments,
+      issueReactions,
+      reviewComments,
+      reviews,
+      reviewThreads,
+      providerResult: evidence.providerResult,
+      errors: evidence.errors,
+      transientErrors: evidence.transientErrors,
+      findings: evidence.findings,
+      decisionCertificate: evidence.decisionCertificate,
+      progressObserved: evidence.progressObserved,
+      exhaustionReason: error?.message || String(error),
+    });
+  }
 
   return {
     comments,
@@ -1929,12 +2196,18 @@ async function loadSnapshotOnce({
     },
     findings: evidence.findings,
     providerResult: evidence.providerResult,
+    progressObserved: evidence.progressObserved,
     evidenceErrors: evidence.errors,
     evidenceTransientErrors: evidence.transientErrors,
+    decisionCertificate: evidence.decisionCertificate,
   };
 }
 
-async function settleEvidenceLoads(loads, evidenceBudget) {
+async function settleEvidenceLoads(
+  loads,
+  evidenceBudget,
+  { finalSnapshotAttempt = false } = {},
+) {
   const settled = await Promise.allSettled(loads);
   const rejections = settled
     .filter((result) => result.status === "rejected")
@@ -1943,15 +2216,52 @@ async function settleEvidenceLoads(loads, evidenceBudget) {
     const deterministic = rejections.find(
       (error) => !(error instanceof GateFailure) || error.state !== "pending",
     );
-    if (deterministic) {
-      throw deterministic;
-    }
-    const fulfilledEvidenceError = await validateFulfilledProviderEvidence(
+    const fulfilledEvidence = await buildFulfilledProviderEvidence(
       settled,
       evidenceBudget,
     );
-    if (fulfilledEvidenceError) {
-      throw fulfilledEvidenceError;
+    const canPreserveConfirmedFinding =
+      (
+        fulfilledEvidence.providerChannelsComplete &&
+        fulfilledEvidence.providerFindingCount > 0
+      ) ||
+      (
+        fulfilledEvidence.threadChannelsComplete &&
+        fulfilledEvidence.threadFindingCount > 0
+      );
+    if (deterministic) {
+      if (canPreserveConfirmedFinding) {
+        return {
+          ...fulfilledEvidence,
+          exhaustionReason: deterministic?.message || String(deterministic),
+        };
+      }
+      throw deterministic;
+    }
+    if (
+      canPreserveConfirmedFinding &&
+      fulfilledEvidence.errors.length > 0
+    ) {
+      return {
+        ...fulfilledEvidence,
+        exhaustionReason: fulfilledEvidence.errors[0],
+      };
+    }
+    if (
+      canPreserveConfirmedFinding &&
+      (evidenceWorkBudget?.failure || finalSnapshotAttempt)
+    ) {
+      return {
+        ...fulfilledEvidence,
+        exhaustionReason: exhaustedSnapshotReason([
+          ...fulfilledEvidence.transientErrors,
+          ...rejections.map((error) => error?.message || String(error)),
+          evidenceWorkBudget?.failure?.message,
+        ]),
+      };
+    }
+    if (fulfilledEvidence.errors.length > 0) {
+      throw invalidProviderEvidenceFailure(fulfilledEvidence.errors[0]);
     }
     if (evidenceWorkBudget?.failure) {
       throw evidenceWorkBudget.failure;
@@ -1961,29 +2271,51 @@ async function settleEvidenceLoads(loads, evidenceBudget) {
   return settled.map((result) => result.value);
 }
 
-async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
+async function buildFulfilledProviderEvidence(settled, evidenceBudget) {
   const commentsResult = settled[0];
+  const issueReactionsResult = settled[1];
   const reviewCommentsResult = settled[2];
   const reviewsResult = settled[3];
   const reviewThreadsResult = settled[4];
-  let inlineParentEvidenceComplete = false;
-  let validatedCodexInlineParentReviewIds = new Set();
-  if (
+  const comments = commentsResult?.status === "fulfilled" ? commentsResult.value : [];
+  const issueReactions = issueReactionsResult?.status === "fulfilled"
+    ? issueReactionsResult.value
+    : [];
+  const reviewComments = reviewCommentsResult?.status === "fulfilled"
+    ? reviewCommentsResult.value
+    : [];
+  const reviews = reviewsResult?.status === "fulfilled" ? reviewsResult.value : [];
+  const reviewThreads = reviewThreadsResult?.status === "fulfilled"
+    ? reviewThreadsResult.value
+    : [];
+  const errors = [];
+  const relationCaches = createRelationCaches();
+  const threadEvidenceComplete =
     reviewCommentsResult?.status === "fulfilled" &&
     reviewsResult?.status === "fulfilled" &&
-    reviewThreadsResult?.status === "fulfilled"
-  ) {
-    const threadEvidence = collectCodexThreadEvidence(
-      reviewCommentsResult.value,
-      reviewsResult.value,
-      reviewThreadsResult.value,
+    reviewThreadsResult?.status === "fulfilled";
+  const providerEvidenceComplete =
+    commentsResult?.status === "fulfilled" &&
+    reviewsResult?.status === "fulfilled";
+  let threadEvidence = {
+    findings: [],
+    errors: [],
+    transientErrors: [],
+    validatedCodexInlineParentReviewIds: [],
+  };
+  let inlineParentEvidenceComplete = false;
+  let validatedCodexInlineParentReviewIds = new Set();
+  if (threadEvidenceComplete) {
+    threadEvidence = collectCodexThreadEvidence(
+      reviewComments,
+      reviews,
+      reviewThreads,
       config.codexBotLogins,
       statusSha,
     );
-    if (threadEvidence.errors.length > 0) {
-      return invalidProviderEvidenceFailure(threadEvidence.errors[0]);
-    }
-    inlineParentEvidenceComplete = threadEvidence.transientErrors.length === 0;
+    inlineParentEvidenceComplete =
+      threadEvidence.errors.length === 0 &&
+      threadEvidence.transientErrors.length === 0;
     validatedCodexInlineParentReviewIds = new Set(
       threadEvidence.validatedCodexInlineParentReviewIds,
     );
@@ -1991,19 +2323,20 @@ async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
 
   if (reviewsResult?.status === "fulfilled") {
     const reviewIds = new Set();
-    for (const review of reviewsResult.value) {
+    for (const review of reviews) {
       if (
         typeof review?.id !== "number" ||
         !Number.isSafeInteger(review.id) ||
         review.id <= 0
       ) {
-        return invalidProviderEvidenceFailure(
+        errors.push(
           "REST review snapshot contains a review without a valid numeric id",
         );
+        continue;
       }
       const reviewId = String(review.id);
       if (reviewIds.has(reviewId)) {
-        return invalidProviderEvidenceFailure(
+        errors.push(
           `REST review snapshot contains duplicate numeric id ${reviewId}`,
         );
       }
@@ -2011,22 +2344,15 @@ async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
     }
   }
 
-  if (
-    commentsResult?.status !== "fulfilled" ||
-    reviewsResult?.status !== "fulfilled"
-  ) {
-    return null;
-  }
-
-  const artifacts = [
-    ...commentsResult.value.map((comment) =>
+  const artifacts = providerEvidenceComplete ? [
+    ...comments.map((comment) =>
       parseCodexIssueCommentArtifact(comment, {
         owner: repo.owner,
         repo: repo.name,
         botLogins: config.codexBotLogins,
       }),
     ),
-    ...reviewsResult.value.map((review) => {
+    ...reviews.map((review) => {
       const artifact = parseCodexReviewArtifact(review, {
         owner: repo.owner,
         repo: repo.name,
@@ -2042,15 +2368,113 @@ async function validateFulfilledProviderEvidence(settled, evidenceBudget) {
         ? null
         : artifact;
     }),
-  ].filter(Boolean);
-  const providerResult = await selectCurrentHeadProviderResult(
+  ].filter(Boolean) : [];
+  const providerReduction = await reduceProviderArtifacts(
     artifacts,
+    relationCaches,
     evidenceBudget,
   );
-  if (providerResult.kind === "malformed") {
-    return invalidProviderEvidenceFailure(providerResult.reason);
-  }
-  return null;
+  const threadReduction = threadEvidenceComplete
+    ? await reduceThreadFindings(
+        threadEvidence.findings,
+        relationCaches,
+        evidenceBudget,
+      )
+    : {
+        findings: [],
+        errors: [],
+        transientErrors: [],
+        certificateRelations: [],
+      };
+  const findings = [
+    ...threadReduction.findings,
+    ...providerReduction.findings,
+  ];
+  return {
+    providerChannelsComplete: providerEvidenceComplete,
+    providerFindingCount: providerReduction.findings.length,
+    threadChannelsComplete: threadEvidenceComplete,
+    threadFindingCount: threadReduction.findings.length,
+    comments,
+    issueReactions,
+    reviewComments,
+    reviews,
+    reviewThreads,
+    providerResult: providerReduction.result,
+    progressObserved: providerReduction.progressObserved,
+    errors: uniqueStrings([
+      ...errors,
+      ...threadEvidence.errors,
+      ...threadReduction.errors,
+      ...providerReduction.errors,
+    ]),
+    transientErrors: uniqueStrings([
+      ...threadEvidence.transientErrors,
+      ...threadReduction.transientErrors,
+      ...providerReduction.transientErrors,
+    ]),
+    findings: {
+      count: findings.length,
+      ids: findings.map((finding) => finding.id),
+      samples: findings.map((finding) => finding.sample).filter(Boolean).slice(0, 3),
+    },
+    decisionCertificate: {
+      selected: providerReduction.certificate.selected
+        ? {
+            ...providerReduction.certificate.selected,
+            carrierDigest: selectedProviderCarrierDigest(
+              providerReduction.result,
+              comments,
+              reviews,
+            ),
+          }
+        : null,
+      relations: [
+        ...providerReduction.certificate.relations.map((relation) => ({
+          ...relation,
+          carrierDigest: providerCertificateCarrierDigest(
+            relation.id,
+            comments,
+            reviews,
+          ),
+        })),
+        ...threadReduction.certificateRelations,
+      ].sort(compareCertificateRelations),
+      applicableFindingIds: findings.map((finding) => finding.id).sort(),
+    },
+  };
+}
+
+function partialSnapshotFromFulfilledEvidence(evidence) {
+  const reactions = { plusOne: null, eyes: null };
+  return {
+    providerSnapshotIncomplete: true,
+    comments: evidence.comments,
+    issueReactions: evidence.issueReactions,
+    markerCommentReactions: [],
+    reviewComments: evidence.reviewComments,
+    reviews: evidence.reviews,
+    reviewThreads: evidence.reviewThreads,
+    reactions,
+    completionComment: null,
+    approvedReview: null,
+    submittedReview: null,
+    baseline: {
+      ...reactions,
+      completionComment: null,
+      approvedReview: null,
+      submittedReview: null,
+    },
+    findings: evidence.findings,
+    providerResult: evidence.providerResult,
+    progressObserved: Boolean(evidence.progressObserved),
+    evidenceErrors: uniqueStrings([
+      evidence.exhaustionReason,
+      ...evidence.errors,
+    ]),
+    evidenceTransientErrors: [],
+    decisionCertificate: evidence.decisionCertificate,
+  };
 }
 
 function invalidProviderEvidenceFailure(reason) {
@@ -2132,240 +2556,624 @@ async function buildCurrentReviewEvidence({
       return artifact;
     }),
   ].filter(Boolean);
-  const providerResult = await selectCurrentHeadProviderResult(artifacts, evidenceBudget);
-  const providerFindings = providerResult.kind === "finding"
-    ? {
-        count: 1,
-        ids: [`${providerResult.source}:${providerResult.id}`],
-        samples: providerResult.samples || [],
-      }
-    : { count: 0, ids: [], samples: [] };
+  const relationCaches = createRelationCaches();
+  const providerReduction = await reduceProviderArtifacts(
+    artifacts,
+    relationCaches,
+    evidenceBudget,
+  );
+  const threadReduction = await reduceThreadFindings(
+    threadFindings.findings,
+    relationCaches,
+    evidenceBudget,
+  );
+  const findings = [
+    ...threadReduction.findings,
+    ...providerReduction.findings,
+  ];
 
   return {
-    providerResult,
-    errors: threadFindings.errors,
+    providerResult: providerReduction.result,
+    progressObserved: providerReduction.progressObserved,
+    errors: [
+      ...threadFindings.errors,
+      ...threadReduction.errors,
+      ...providerReduction.errors,
+    ],
     transientErrors: [
       ...threadFindings.transientErrors,
       ...parentReviewTransientErrors,
+      ...threadReduction.transientErrors,
+      ...providerReduction.transientErrors,
     ],
     findings: {
-      count: threadFindings.count + providerFindings.count,
-      ids: [...threadFindings.ids, ...providerFindings.ids],
-      samples: [...threadFindings.samples, ...providerFindings.samples].slice(0, 3),
+      count: findings.length,
+      ids: findings.map((finding) => finding.id),
+      samples: findings.map((finding) => finding.sample).filter(Boolean).slice(0, 3),
+    },
+    decisionCertificate: {
+      selected: providerReduction.certificate.selected
+        ? {
+            ...providerReduction.certificate.selected,
+            carrierDigest: selectedProviderCarrierDigest(
+              providerReduction.result,
+              comments,
+              reviews,
+            ),
+          }
+        : null,
+      relations: [
+        ...providerReduction.certificate.relations.map((relation) => ({
+          ...relation,
+          carrierDigest: providerCertificateCarrierDigest(
+            relation.id,
+            comments,
+            reviews,
+          ),
+        })),
+        ...threadReduction.certificateRelations,
+      ].sort(compareCertificateRelations),
+      applicableFindingIds: findings.map((finding) => finding.id).sort(),
     },
   };
 }
 
-async function selectCurrentHeadProviderResult(artifacts, evidenceBudget) {
+function createRelationCaches() {
+  return {
+    classifications: new Map(),
+    ancestry: new Map(),
+    resolutions: new Map(),
+  };
+}
+
+function selectedProviderCarrierDigest(providerResult, comments, reviews) {
+  const id = String(providerResult?.id || "");
+  let carrier;
+  if (providerResult?.source === "issue-comment") {
+    const comment = comments.find((candidate) => String(candidate?.id || "") === id);
+    carrier = comment && {
+      id,
+      body: String(comment.body || ""),
+      createdAt: comment.created_at || null,
+      updatedAt: comment.updated_at || null,
+      url: comment.html_url || null,
+      user: {
+        login: comment.user?.login || null,
+        type: comment.user?.type || null,
+      },
+      appSlug: comment.performed_via_github_app?.slug || null,
+    };
+  } else if (providerResult?.source === "pull-request-review") {
+    const review = reviews.find((candidate) => String(candidate?.id || "") === id);
+    carrier = review && {
+      id,
+      body: String(review.body || ""),
+      state: review.state || null,
+      commitId: review.commit_id || null,
+      submittedAt: review.submitted_at || review.created_at || null,
+      url: review.html_url || null,
+      user: {
+        login: review.user?.login || null,
+        type: review.user?.type || null,
+      },
+    };
+  }
+  if (!carrier) {
+    return null;
+  }
+  return `sha256:${createHash("sha256").update(JSON.stringify(carrier)).digest("hex")}`;
+}
+
+function providerCertificateCarrierDigest(identity, comments, reviews) {
+  const separator = String(identity || "").indexOf(":");
+  if (separator < 1) {
+    return null;
+  }
+  return selectedProviderCarrierDigest(
+    {
+      source: identity.slice(0, separator),
+      id: identity.slice(separator + 1),
+    },
+    comments,
+    reviews,
+  );
+}
+
+async function reduceProviderArtifacts(artifacts, caches, evidenceBudget) {
+  const progressObserved = artifacts.some((artifact) =>
+    artifact?.auditOnly === true &&
+    artifact?.kind === "pending" &&
+    artifact?.pendingKind === "progress",
+  );
   const artifactIdentities = new Set();
+  const errors = [];
+  const transientErrors = [];
   for (const artifact of artifacts) {
     if (!/^[1-9][0-9]*$/.test(String(artifact.id || ""))) {
       continue;
     }
     const identity = `${artifact.source}:${artifact.id}`;
     if (artifactIdentities.has(identity)) {
-      return {
-        kind: "malformed",
-        source: "provider-artifact-set",
-        id: identity,
-        reason: `Codex provider artifact identity ${identity} appears more than once`,
-      };
+      errors.push(`Codex provider artifact identity ${identity} appears more than once`);
     }
     artifactIdentities.add(identity);
   }
 
-  let ordered;
-  try {
-    ordered = sortCodexArtifactsNewestFirst(artifacts);
-  } catch (error) {
-    return {
-      kind: "malformed",
-      source: "provider-artifact-set",
-      id: "unknown",
-      reason: error.message,
-    };
+  for (const artifact of artifacts) {
+    if (artifact.kind === "malformed") {
+      errors.push(artifact.reason || `Codex provider artifact ${artifact.source}:${artifact.id} is malformed`);
+    }
   }
 
-  const resolutionCache = new Map();
-  const ancestryCache = new Map();
-  for (let index = 0; index < ordered.length;) {
-    const createdAt = ordered[index].createdAt;
-    const createdAtMs = parseTimestamp(createdAt, "Codex artifact creation time");
-    const group = [];
-    while (
-      index < ordered.length &&
-      parseTimestamp(ordered[index].createdAt, "Codex artifact creation time") === createdAtMs
+  const orderableTerminalArtifacts = [];
+  const terminalFindingArtifacts = [];
+  const terminalCleanArtifacts = [];
+  const terminalOrderingErrors = new Map();
+  for (const artifact of artifacts) {
+    if (
+      artifact.auditOnly ||
+      artifact.kind === "pending" ||
+      artifact.kind === "malformed"
     ) {
-      group.push(ordered[index]);
-      index += 1;
+      continue;
     }
-
-    if (new Set(group.map((artifact) => artifact.source)).size > 1) {
-      return {
-        kind: "malformed",
-        source: "provider-artifact-set",
-        id: group.map((artifact) => `${artifact.source}:${artifact.id}`).join(","),
-        reason: "cross-channel Codex terminal artifacts share an ambiguous server timestamp",
-      };
+    if (!/^[1-9][0-9]*$/.test(String(artifact.id || ""))) {
+      errors.push(
+        `Codex provider artifact ${artifact.source}:${artifact.id || "<missing>"} ` +
+          "cannot be ordered without a canonical numeric id",
+      );
+      continue;
     }
-
-    for (let groupIndex = 0; groupIndex < group.length; groupIndex += 1) {
-      const artifact = group[groupIndex];
-      if (artifact.kind === "malformed") {
-        return artifact;
-      }
-      if (artifact.kind === "finding") {
-        return artifact;
-      }
-      if (artifact.kind !== "clean") {
-        continue;
-      }
-
-      let resolvedSha = artifact.headSha || "";
-      if (artifact.commitRef) {
-        resolvedSha = await resolveReviewedCommit(
-          artifact.commitRef,
-          resolutionCache,
-          evidenceBudget,
-        );
-      }
-      if (resolvedSha === statusSha.toLowerCase()) {
-        const unsupersededFinding = await firstUnsupersededOlderFinding(
-          resolvedSha,
-          [...group.slice(groupIndex + 1), ...ordered.slice(index)],
-          ancestryCache,
-          resolutionCache,
-          evidenceBudget,
-        );
-        if (unsupersededFinding) {
-          return unsupersededFinding;
-        }
-        return {
-          ...artifact,
-          headSha: resolvedSha,
-        };
-      }
-      if (
-        await commitIsAncestor(
-          resolvedSha,
-          statusSha.toLowerCase(),
-          ancestryCache,
-          evidenceBudget,
-        )
-      ) {
-        const unsupersededFinding = await firstUnsupersededOlderFinding(
-          resolvedSha,
-          [...group.slice(groupIndex + 1), ...ordered.slice(index)],
-          ancestryCache,
-          resolutionCache,
-          evidenceBudget,
-        );
-        if (unsupersededFinding) {
-          return unsupersededFinding;
-        }
-        return {
-          ...artifact,
-          kind: "pending",
-          headSha: resolvedSha,
-          reason:
-            `latest Codex clean result is bound to prior head ${resolvedSha}; ` +
-            `waiting for a complete clean result on current head ${statusSha.toLowerCase()}`,
-        };
-      }
-      return {
-        ...artifact,
-        kind: "malformed",
-        reason:
-          `latest Codex clean result resolved to ${resolvedSha}, ` +
-          `not current head ${statusSha.toLowerCase()}`,
-      };
+    if (artifact.kind === "finding") {
+      terminalFindingArtifacts.push(artifact);
+    } else if (artifact.kind === "clean") {
+      terminalCleanArtifacts.push(artifact);
     }
+    if (artifact.orderingError) {
+      terminalOrderingErrors.set(artifact, artifact.orderingError);
+      continue;
+    }
+    try {
+      parseTimestamp(artifact.createdAt, "Codex artifact revision time");
+    } catch (error) {
+      terminalOrderingErrors.set(artifact, error.message);
+      continue;
+    }
+    orderableTerminalArtifacts.push(artifact);
   }
-
-  return { kind: "pending", source: "provider-artifact-set", id: "none" };
-}
-
-async function firstUnsupersededOlderFinding(
-  cleanHeadSha,
-  olderArtifacts,
-  ancestryCache,
-  resolutionCache,
-  evidenceBudget,
-) {
-  const newerCleanHeads = [cleanHeadSha];
-  const unresolvedCleanArtifacts = [];
-  for (const artifact of olderArtifacts) {
-    if (artifact.kind === "clean") {
-      const declaredHead = artifact.headSha ||
-        (/^[0-9a-f]{40}$/.test(artifact.commitRef || "") ? artifact.commitRef : "");
-      if (declaredHead) {
-        newerCleanHeads.push(declaredHead);
-      } else if (artifact.commitRef) {
-        unresolvedCleanArtifacts.push(artifact);
-      }
-      continue;
-    }
-    if (artifact.kind !== "finding") {
-      continue;
-    }
-
-    let superseded = await findingIsSupersededByCleanHeads(
-      artifact,
-      newerCleanHeads,
-      ancestryCache,
+  const terminalArtifacts = sortCodexArtifactsNewestFirst(
+    orderableTerminalArtifacts,
+  );
+  const findingRecords = [];
+  for (const artifact of terminalFindingArtifacts) {
+    const classification = await classifyCommitRelation(
+      artifact.headSha,
+      caches,
       evidenceBudget,
     );
-    while (!superseded && unresolvedCleanArtifacts.length > 0) {
-      const unresolvedClean = unresolvedCleanArtifacts.shift();
-      let resolvedSha;
-      try {
-        resolvedSha = await resolveReviewedCommit(
-          unresolvedClean.commitRef,
-          resolutionCache,
-          evidenceBudget,
-        );
-      } catch (error) {
-        if (error instanceof GateFailure && error.state === "pending") {
-          throw error;
-        }
-        // Deterministically invalid older evidence remains audit history only.
+    recordClassificationProblem(classification, errors, transientErrors);
+    if (
+      relationRetainsOrderingError(classification.relation) &&
+      terminalOrderingErrors.has(artifact)
+    ) {
+      errors.push(terminalOrderingErrors.get(artifact));
+    }
+    findingRecords.push({
+      artifact,
+      orderable: orderableTerminalArtifacts.includes(artifact),
+      ...classification,
+    });
+  }
+
+  let selectedClean = null;
+  const classifiedCleanRecords = [];
+  const classifiedCleanArtifacts = new Set();
+  const cleanArtifacts = terminalArtifacts.filter((artifact) => artifact.kind === "clean");
+  for (const artifact of cleanArtifacts) {
+    const record = await classifyCleanArtifact(
+      artifact,
+      caches,
+      evidenceBudget,
+    );
+    recordClassificationProblem(record, errors, transientErrors);
+    classifiedCleanRecords.push(record);
+    classifiedCleanArtifacts.add(artifact);
+    if (record.relation === "current" || record.relation === "ancestor") {
+      selectedClean = record;
+      break;
+    }
+  }
+
+  if (selectedClean) {
+    const selectedTime = parseTimestamp(
+      selectedClean.artifact.createdAt,
+      "Codex artifact revision time",
+    );
+    for (const artifact of cleanArtifacts) {
+      if (
+        artifact === selectedClean.artifact ||
+        parseTimestamp(artifact.createdAt, "Codex artifact revision time") !== selectedTime ||
+        classifiedCleanArtifacts.has(artifact)
+      ) {
         continue;
       }
-      newerCleanHeads.push(resolvedSha);
-      superseded = await findingIsSupersededByCleanHeads(
+      const record = await classifyCleanArtifact(
         artifact,
-        [resolvedSha],
-        ancestryCache,
+        caches,
         evidenceBudget,
       );
-    }
-    if (!superseded) {
-      return artifact;
+      recordClassificationProblem(record, errors, transientErrors);
+      classifiedCleanRecords.push(record);
+      classifiedCleanArtifacts.add(artifact);
     }
   }
-  return null;
+
+  for (const artifact of terminalCleanArtifacts) {
+    if (
+      classifiedCleanArtifacts.has(artifact) ||
+      !terminalOrderingErrors.has(artifact)
+    ) {
+      continue;
+    }
+    const record = await classifyCleanArtifact(
+      artifact,
+      caches,
+      evidenceBudget,
+    );
+    recordClassificationProblem(record, errors, transientErrors);
+    classifiedCleanRecords.push(record);
+    classifiedCleanArtifacts.add(artifact);
+    if (
+      relationRetainsOrderingError(record.relation) &&
+      terminalOrderingErrors.has(artifact)
+    ) {
+      errors.push(terminalOrderingErrors.get(artifact));
+    }
+  }
+
+  const inScopeFindings = findingRecords.filter((record) =>
+    record.relation === "current" || record.relation === "ancestor",
+  );
+  const findings = [];
+  for (const record of inScopeFindings) {
+    const superseded = Boolean(
+      selectedClean?.relation === "current" &&
+      artifactIsStrictlyLater(selectedClean.artifact, record.artifact),
+    );
+    record.disposition = superseded ? "finding-superseded" : "finding-blocking";
+    if (!superseded) {
+      findings.push({
+        id: `${record.artifact.source}:${record.artifact.id}`,
+        sample: record.artifact.samples?.[0] || null,
+        headSha: record.headSha,
+        artifact: record.artifact,
+        orderable: record.orderable,
+      });
+    }
+  }
+
+  const relevantAtTimestamp = [
+    ...inScopeFindings.map((record) => ({ artifact: record.artifact })),
+    ...classifiedCleanRecords
+      .filter((record) =>
+        record.relation === "current" || record.relation === "ancestor",
+      )
+      .map((record) => ({ artifact: record.artifact })),
+  ];
+  const byTimestamp = new Map();
+  for (const record of relevantAtTimestamp) {
+    if (terminalOrderingErrors.has(record.artifact)) {
+      continue;
+    }
+    const timestamp = parseTimestamp(
+      record.artifact.createdAt,
+      "Codex artifact revision time",
+    );
+    const group = byTimestamp.get(timestamp) || [];
+    group.push(record.artifact);
+    byTimestamp.set(timestamp, group);
+  }
+  for (const group of byTimestamp.values()) {
+    if (new Set(group.map((artifact) => artifact.source)).size > 1) {
+      errors.push(
+        "cross-channel Codex terminal artifacts share an ambiguous server timestamp",
+      );
+    } else if (
+      group.length > 1 &&
+      group[0]?.source === "issue-comment"
+    ) {
+      errors.push(
+        "edited Codex issue-comment artifacts share an ambiguous revision timestamp",
+      );
+    }
+  }
+
+  const uniqueErrors = uniqueStrings(errors);
+  const uniqueTransientErrors = uniqueStrings(transientErrors);
+  let result;
+  if (findings.length > 0) {
+    const orderableFindings = findings.filter((finding) => finding.orderable);
+    const newestFinding = orderableFindings.length > 0
+      ? sortCodexArtifactsNewestFirst(
+          orderableFindings.map((finding) => finding.artifact),
+        )[0]
+      : [...findings]
+          .sort((left, right) =>
+            `${left.artifact.source}:${left.artifact.id}`.localeCompare(
+              `${right.artifact.source}:${right.artifact.id}`,
+            ),
+          )[0].artifact;
+    result = {
+      ...newestFinding,
+      headSha: findings.find((finding) => finding.artifact === newestFinding).headSha,
+    };
+  } else if (uniqueErrors.length > 0) {
+    result = malformedProviderResult(uniqueErrors[0]);
+  } else if (uniqueTransientErrors.length > 0) {
+    result = {
+      kind: "pending",
+      source: "provider-artifact-set",
+      id: "transient",
+      reason: uniqueTransientErrors[0],
+    };
+  } else if (selectedClean?.relation === "current") {
+    result = {
+      ...selectedClean.artifact,
+      headSha: selectedClean.headSha,
+    };
+  } else if (selectedClean?.relation === "ancestor") {
+    result = {
+      ...selectedClean.artifact,
+      kind: "pending",
+      headSha: selectedClean.headSha,
+      reason:
+        `latest Codex clean result is bound to prior head ${selectedClean.headSha}; ` +
+        `waiting for a complete clean result on current head ${statusSha.toLowerCase()}`,
+    };
+  } else {
+    result = { kind: "pending", source: "provider-artifact-set", id: "none" };
+  }
+
+  const relations = [
+    ...inScopeFindings.map((record) => ({
+      id: `${record.artifact.source}:${record.artifact.id}`,
+      headSha: record.headSha,
+      relation: record.relation,
+      disposition: record.disposition,
+      carrierCreatedAt: record.artifact.carrierCreatedAt || null,
+      carrierUpdatedAt: record.artifact.carrierUpdatedAt || null,
+    })),
+    ...(selectedClean
+      ? [{
+          id: `${selectedClean.artifact.source}:${selectedClean.artifact.id}`,
+          headSha: selectedClean.headSha,
+          relation: selectedClean.relation,
+          disposition: "clean-selected",
+          carrierCreatedAt: selectedClean.artifact.carrierCreatedAt || null,
+          carrierUpdatedAt: selectedClean.artifact.carrierUpdatedAt || null,
+        }]
+      : []),
+  ].sort(compareCertificateRelations);
+
+  return {
+    result,
+    progressObserved,
+    findings: findings.map(({ artifact, orderable, ...finding }) => finding),
+    errors: uniqueErrors,
+    transientErrors: uniqueTransientErrors,
+    certificate: {
+      selected: selectedClean
+        ? {
+            id: `${selectedClean.artifact.source}:${selectedClean.artifact.id}`,
+            headSha: selectedClean.headSha,
+            relation: selectedClean.relation,
+            carrierCreatedAt: selectedClean.artifact.carrierCreatedAt || null,
+            carrierUpdatedAt: selectedClean.artifact.carrierUpdatedAt || null,
+          }
+        : null,
+      relations,
+    },
+  };
 }
 
-async function findingIsSupersededByCleanHeads(
-  finding,
-  cleanHeads,
-  ancestryCache,
-  evidenceBudget,
-) {
-  for (const cleanHead of cleanHeads) {
-    if (
-      finding.headSha === cleanHead ||
-      await commitIsAncestor(
-        finding.headSha,
-        cleanHead,
-        ancestryCache,
+function relationRetainsOrderingError(relation) {
+  return relation === "current" || relation === "ancestor" || relation === "invalid";
+}
+
+function malformedProviderResult(reason) {
+  return {
+    kind: "malformed",
+    source: "provider-artifact-set",
+    id: "invalid",
+    reason,
+  };
+}
+
+async function classifyCleanArtifact(artifact, caches, evidenceBudget) {
+  let headSha = artifact.headSha || "";
+  if (artifact.commitRef) {
+    try {
+      headSha = await resolveReviewedCommit(
+        artifact.commitRef,
+        caches.resolutions,
         evidenceBudget,
-      )
-    ) {
-      return true;
+      );
+    } catch (error) {
+      return {
+        artifact,
+        ...classificationFromError(
+          artifact.commitRef,
+          statusSha.toLowerCase(),
+          error,
+        ),
+      };
     }
   }
-  return false;
+  return {
+    artifact,
+    ...(await classifyCommitRelation(headSha, caches, evidenceBudget)),
+  };
+}
+
+async function classifyCommitRelation(headSha, caches, evidenceBudget) {
+  const normalizedHeadSha = String(headSha || "").toLowerCase();
+  const currentHeadSha = statusSha.toLowerCase();
+  const cacheKey = `${normalizedHeadSha}->${currentHeadSha}`;
+  if (caches.classifications.has(cacheKey)) {
+    return caches.classifications.get(cacheKey);
+  }
+  let classification;
+  if (!/^[0-9a-f]{40}$/.test(normalizedHeadSha)) {
+    classification = {
+      headSha: normalizedHeadSha,
+      relation: "invalid",
+      error: `provider commit ${normalizedHeadSha || "<missing>"} is not a full commit SHA`,
+    };
+  } else if (normalizedHeadSha === currentHeadSha) {
+    classification = { headSha: normalizedHeadSha, relation: "current" };
+  } else {
+    try {
+      classification = {
+        headSha: normalizedHeadSha,
+        relation: await commitIsAncestor(
+          normalizedHeadSha,
+          currentHeadSha,
+          caches.ancestry,
+          evidenceBudget,
+        ) ? "ancestor" : "nonancestor",
+      };
+    } catch (error) {
+      classification = classificationFromError(
+        normalizedHeadSha,
+        currentHeadSha,
+        error,
+      );
+    }
+  }
+  caches.classifications.set(cacheKey, classification);
+  return classification;
+}
+
+function classificationFromError(headSha, currentHeadSha, error) {
+  if (error instanceof GateFailure && error.state === "pending") {
+    return {
+      headSha: String(headSha || "").toLowerCase(),
+      relation: "unknown",
+      transientError:
+        `ancestry-unverified: ${String(headSha || "").toLowerCase()} -> ${currentHeadSha}: ` +
+        `${error.message}`,
+    };
+  }
+  return {
+    headSha: String(headSha || "").toLowerCase(),
+    relation: "invalid",
+    error: error?.message || String(error),
+  };
+}
+
+function recordClassificationProblem(classification, errors, transientErrors) {
+  if (classification.error) {
+    errors.push(classification.error);
+  }
+  if (classification.transientError) {
+    transientErrors.push(classification.transientError);
+  }
+}
+
+async function reduceThreadFindings(findings, caches, evidenceBudget) {
+  const applicableFindings = [];
+  const errors = [];
+  const transientErrors = [];
+  const certificateRelations = [];
+  for (const finding of findings || []) {
+    const headShas = finding.headShas || [finding.headSha];
+    const classifications = [];
+    for (const headSha of [...headShas].sort()) {
+      const classification = await classifyCommitRelation(
+        headSha,
+        caches,
+        evidenceBudget,
+      );
+      recordClassificationProblem(classification, errors, transientErrors);
+      classifications.push(classification);
+    }
+    const inScope = classifications.filter((classification) =>
+      classification.relation === "current" || classification.relation === "ancestor",
+    );
+    if (inScope.length === 0) {
+      continue;
+    }
+    applicableFindings.push({
+      id: finding.id,
+      sample: finding.sample || null,
+    });
+    for (const classification of inScope) {
+      certificateRelations.push({
+        id: finding.id,
+        headSha: classification.headSha,
+        relation: classification.relation,
+        disposition: "thread-blocking",
+      });
+    }
+  }
+  return {
+    findings: applicableFindings,
+    errors: uniqueStrings(errors),
+    transientErrors: uniqueStrings(transientErrors),
+    certificateRelations: certificateRelations.sort(compareCertificateRelations),
+  };
+}
+
+function artifactIsStrictlyLater(candidate, reference) {
+  if (candidate.orderingError || reference.orderingError) {
+    return false;
+  }
+  const candidateTime = parseTimestamp(candidate.createdAt, "Codex artifact revision time");
+  const referenceTime = parseTimestamp(reference.createdAt, "Codex artifact revision time");
+  if (candidateTime !== referenceTime) {
+    return candidateTime > referenceTime;
+  }
+  if (
+    candidate.source === "issue-comment" ||
+    reference.source === "issue-comment"
+  ) {
+    return false;
+  }
+  return candidate.source === reference.source &&
+    BigInt(String(candidate.id)) > BigInt(String(reference.id));
+}
+
+function compareCertificateRelations(left, right) {
+  return certificateRelationKey(left).localeCompare(certificateRelationKey(right));
+}
+
+function certificateRelationKey(relation) {
+  return [
+    relation.id,
+    relation.headSha,
+    relation.relation,
+    relation.disposition,
+    relation.carrierCreatedAt || "",
+    relation.carrierUpdatedAt || "",
+    relation.carrierDigest || "",
+  ].join("\0");
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter(Boolean).map(String))];
+}
+
+function describeDecisionCertificateChange(initialCertificate, finalCertificate) {
+  const initialRelations = initialCertificate?.relations || [];
+  const finalRelations = finalCertificate?.relations || [];
+  const finalKeys = new Set(finalRelations.map(certificateRelationKey));
+  const changed = initialRelations.find((relation) =>
+    !finalKeys.has(certificateRelationKey(relation)),
+  ) || finalRelations[0] || initialRelations[0];
+  const relationDetail = changed?.headSha
+    ? ` for ${changed.headSha} -> ${statusSha.toLowerCase()}`
+    : "";
+  return `Codex review evidence reduction changed during final validation${relationDetail}.`;
 }
 
 async function commitIsAncestor(baseSha, headSha, cache, evidenceBudget) {
@@ -2511,7 +3319,11 @@ async function resolveReviewedCommit(commitRef, cache, evidenceBudget) {
     return commitRef;
   }
   if (cache.has(commitRef)) {
-    return cache.get(commitRef);
+    const cached = cache.get(commitRef);
+    if (cached.error) {
+      throw cached.error;
+    }
+    return cached.value;
   }
 
   let data;
@@ -2523,32 +3335,211 @@ async function resolveReviewedCommit(commitRef, cache, evidenceBudget) {
       { evidenceBudget },
     ));
   } catch (error) {
-    if (error instanceof GateFailure && error.state === "pending") {
-      throw error;
-    }
-    throw new GateFailure(
-      "error",
-      "Codex reviewed commit could not be resolved",
-      `Cannot uniquely resolve Reviewed commit ${commitRef}: ${error.message}`,
-    );
+    const failure = error instanceof GateFailure && error.state === "pending"
+      ? error
+      : new GateFailure(
+          "error",
+          "Codex reviewed commit could not be resolved",
+          `Cannot uniquely resolve Reviewed commit ${commitRef}: ${error.message}`,
+        );
+    cache.set(commitRef, { error: failure });
+    throw failure;
   }
   const resolvedSha = String(data?.sha || "").toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(resolvedSha)) {
-    throw new GateFailure(
+    const failure = new GateFailure(
       "error",
       "Codex reviewed commit response is invalid",
       `Reviewed commit ${commitRef} did not resolve to one full commit SHA.`,
     );
+    cache.set(commitRef, { error: failure });
+    throw failure;
   }
   if (!resolvedSha.startsWith(commitRef)) {
-    throw new GateFailure(
+    const failure = new GateFailure(
       "error",
       "Codex reviewed commit response conflicts with its short SHA",
       `Reviewed commit ${commitRef} resolved to non-matching commit ${resolvedSha}.`,
     );
+    cache.set(commitRef, { error: failure });
+    throw failure;
   }
-  cache.set(commitRef, resolvedSha);
+  cache.set(commitRef, { value: resolvedSha });
   return resolvedSha;
+}
+
+function createProducerReceipt() {
+  const path = (process.env.CODEX_REVIEW_GATE_RECEIPT_PATH || "").trim();
+  if (!path) {
+    return null;
+  }
+
+  const workflowRef = requiredEnv("GITHUB_WORKFLOW_REF");
+  const workflowSha = fullShaEnv("GITHUB_WORKFLOW_SHA");
+  const boundWorkflowRef = requiredEnv("CODEX_REVIEW_GATE_WORKFLOW_REF");
+  const boundWorkflowSha = fullShaEnv("CODEX_REVIEW_GATE_WORKFLOW_SHA");
+  if (workflowRef !== boundWorkflowRef || workflowSha !== boundWorkflowSha) {
+    throw new Error(
+      "producer receipt workflow context did not match GITHUB_WORKFLOW_REF/SHA",
+    );
+  }
+
+  const actionRef = process.env.CODEX_REVIEW_GATE_ACTION_REF || null;
+  const actionRepository = process.env.CODEX_REVIEW_GATE_ACTION_REPOSITORY || null;
+  const actionCommitSha = actionRef && /^[0-9a-f]{40}$/.test(actionRef)
+    ? actionRef
+    : null;
+  const runId = decimalEnv("GITHUB_RUN_ID");
+  const runAttempt = decimalEnv("GITHUB_RUN_ATTEMPT");
+  const artifactName = `codex-review-gate-producer-receipt-${runId}-${runAttempt}`;
+
+  return {
+    path,
+    value: {
+      schema: PRODUCER_RECEIPT_SCHEMA,
+      schema_version: 1,
+      artifact: {
+        name: artifactName,
+        file: "codex-review-gate-producer-receipt.json",
+      },
+      producer: {
+        repository: config.repository,
+        server_url: config.serverUrl,
+        run: {
+          id: runId,
+          attempt: runAttempt,
+          target_url: runUrl,
+        },
+        environment: {
+          GITHUB_WORKFLOW_REF: workflowRef,
+          GITHUB_WORKFLOW_SHA: workflowSha,
+        },
+        job: {
+          id: requiredEnv("GITHUB_JOB"),
+          workflow_ref: requiredEnv("CODEX_REVIEW_GATE_JOB_WORKFLOW_REF"),
+          workflow_sha: fullShaEnv("CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA"),
+          workflow_repository: requiredEnv(
+            "CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY",
+          ),
+          workflow_file_path: requiredEnv(
+            "CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH",
+          ),
+        },
+        action: {
+          repository: actionRepository,
+          ref: actionRef,
+          commit_sha: actionCommitSha,
+          immutable: actionCommitSha !== null,
+        },
+      },
+      execution: {
+        result: "running",
+        status_count: 0,
+      },
+      statuses: [],
+    },
+  };
+}
+
+function recordProducerStatus(response, requestBody) {
+  if (!producerReceipt) {
+    return;
+  }
+  const id = statusResponseId(response?.id);
+  const nodeId = response?.node_id;
+  if (typeof nodeId !== "string" || nodeId.trim().length === 0) {
+    throw new Error("commit-status POST response omitted node_id");
+  }
+  if (!/^[0-9a-f]{40}$/.test(statusSha)) {
+    throw new Error("producer receipt cannot bind a non-full commit status head");
+  }
+  if (
+    response?.state !== requestBody.state ||
+    response?.context !== requestBody.context ||
+    response?.description !== requestBody.description ||
+    response?.target_url !== requestBody.targetUrl
+  ) {
+    throw new Error("commit-status POST response did not echo the requested status fields");
+  }
+  const creatorLogin = response?.creator?.login;
+  const creatorType = response?.creator?.type;
+  if (
+    typeof creatorLogin !== "string" ||
+    creatorLogin.trim().length === 0 ||
+    typeof creatorType !== "string" ||
+    creatorType.trim().length === 0
+  ) {
+    throw new Error("commit-status POST response omitted creator identity");
+  }
+
+  producerReceipt.value.statuses.push({
+    sequence: producerReceipt.value.statuses.length + 1,
+    id,
+    node_id: nodeId,
+    pull_request_number: Number.isInteger(activePrNumber) ? activePrNumber : null,
+    head_sha: statusSha,
+    context: requestBody.context,
+    state: requestBody.state,
+    description: requestBody.description,
+    target_url: requestBody.targetUrl,
+    creator: {
+      login: creatorLogin,
+      type: creatorType,
+    },
+  });
+}
+
+function finishProducerReceipt(result) {
+  if (!producerReceipt) {
+    return;
+  }
+  producerReceipt.value.execution.result = result;
+  writeProducerReceipt();
+  const outputPath = process.env.GITHUB_OUTPUT;
+  if (!outputPath) {
+    throw new Error("GITHUB_OUTPUT is required to finalize a producer receipt");
+  }
+  appendFileSync(outputPath, "producer-receipt-finalized=true\n", "utf8");
+}
+
+function writeProducerReceipt() {
+  if (!producerReceipt) {
+    return;
+  }
+  producerReceipt.value.execution.status_count = producerReceipt.value.statuses.length;
+  const temporaryPath = `${producerReceipt.path}.tmp-${process.pid}`;
+  writeFileSync(
+    temporaryPath,
+    `${JSON.stringify(producerReceipt.value, null, 2)}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+  renameSync(temporaryPath, producerReceipt.path);
+}
+
+function statusResponseId(value) {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
+    return String(value);
+  }
+  if (typeof value === "string" && /^[1-9][0-9]*$/.test(value)) {
+    return value;
+  }
+  throw new Error("commit-status POST response omitted a safe positive id");
+}
+
+function fullShaEnv(name) {
+  const value = requiredEnv(name);
+  if (!/^[0-9a-f]{40}$/.test(value)) {
+    throw new Error(`${name} must be one lowercase full commit SHA`);
+  }
+  return value;
+}
+
+function decimalEnv(name) {
+  const value = requiredEnv(name);
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error(`${name} must be one positive decimal integer`);
+  }
+  return value;
 }
 
 function readConfig() {
@@ -2709,13 +3700,74 @@ function reviewIdentity(review) {
   if (!review) {
     return null;
   }
+  if (
+    typeof review.id !== "number" ||
+    !Number.isSafeInteger(review.id) ||
+    review.id <= 0
+  ) {
+    return null;
+  }
+  const submittedAt = review.submitted_at || review.created_at || "";
+  if (!isCanonicalUtcTimestamp(submittedAt)) {
+    return null;
+  }
   return {
     id: String(review.id),
     state: review.state,
     commitId: review.commit_id || "",
-    submittedAt: review.submitted_at || review.created_at || "",
+    submittedAt,
     user: review.user?.login || "",
   };
+}
+
+function validateCodexEyesReactions(
+  reactions,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+) {
+  const ids = new Set();
+  for (const reaction of reactions) {
+    if (
+      reaction?.content !== "eyes" ||
+      !isCodexBot(reaction.user?.login, botLogins)
+    ) {
+      continue;
+    }
+    if (
+      typeof reaction.id !== "number" ||
+      !Number.isSafeInteger(reaction.id) ||
+      reaction.id <= 0
+    ) {
+      throw new Error("Codex eyes reaction does not have a valid positive integer id");
+    }
+    if (!isCanonicalUtcTimestamp(reaction.created_at)) {
+      throw new Error(
+        `invalid Codex eyes reaction creation time: ${reaction.created_at || "<missing>"}`,
+      );
+    }
+    const id = String(reaction.id);
+    if (ids.has(id)) {
+      throw new Error(`Codex eyes reaction identity ${id} appears more than once`);
+    }
+    ids.add(id);
+  }
+}
+
+function isCanonicalUtcTimestamp(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    return false;
+  }
+  const match = /^(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?:\.(\d{1,3}))?Z$/.exec(
+    value,
+  );
+  if (!match) {
+    return false;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    return false;
+  }
+  const canonical = `${match[1]}.${(match[2] || "").padEnd(3, "0")}Z`;
+  return new Date(parsed).toISOString() === canonical;
 }
 
 function selectLatestCodexApprovedReview(reviews, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
@@ -2733,7 +3785,8 @@ function selectLatestCodexReview(reviews, botLogins, predicate) {
       review.commit_id === statusSha &&
       predicate(review),
     )
-    .map(reviewIdentity);
+    .map(reviewIdentity)
+    .filter(Boolean);
 
   matches.sort((left, right) => {
     const bySubmittedAt = parseTimestamp(right.submittedAt, "Codex review submission time") -
@@ -2741,7 +3794,9 @@ function selectLatestCodexReview(reviews, botLogins, predicate) {
     if (bySubmittedAt !== 0) {
       return bySubmittedAt;
     }
-    return Number(right.id) - Number(left.id);
+    const leftId = BigInt(left.id);
+    const rightId = BigInt(right.id);
+    return rightId > leftId ? 1 : rightId < leftId ? -1 : 0;
   });
 
   return matches[0] || null;
@@ -2752,12 +3807,19 @@ async function setCommitStatus(
   description,
   { retryTransient = true } = {},
 ) {
-  await request("POST", `${repoPath}/statuses/${statusSha}`, {
+  const statusDescription = truncate(description, 140);
+  const { data } = await request("POST", `${repoPath}/statuses/${statusSha}`, {
     state,
     context: STATUS_CONTEXT,
-    description: truncate(description, 140),
+    description: statusDescription,
     target_url: runUrl,
   }, { retryTransient });
+  recordProducerStatus(data, {
+    state,
+    context: STATUS_CONTEXT,
+    description: statusDescription,
+    targetUrl: runUrl,
+  });
   console.log(`Set ${STATUS_CONTEXT}=${state}: ${description}`);
 }
 
@@ -2770,6 +3832,14 @@ async function setCommitStatusIfNeeded(
     retryTransient = true,
   } = {},
 ) {
+  if (producerReceipt) {
+    if (beforeDecision) {
+      await beforeDecision();
+    }
+    await setCommitStatus(state, description, { retryTransient });
+    return;
+  }
+
   const observed = liveStatus || await loadLatestGateStatus();
 
   if (beforeDecision) {
@@ -2824,7 +3894,10 @@ async function loadLatestGateStatus() {
       );
       // GitHub returns commit statuses newest-first, so the first matching
       // context is authoritative even when its producer is not trusted.
-      const latest = data.find((status) => status.context === STATUS_CONTEXT);
+      const latest = data.find((status) =>
+        typeof status?.context === "string" &&
+        status.context.toLowerCase() === STATUS_CONTEXT.toLowerCase(),
+      );
       if (latest) {
         return {
           latest,
@@ -2848,8 +3921,10 @@ async function loadLatestGateStatus() {
 
 function gateStatusHasExpectedProducer(status) {
   return (
+    status?.context === STATUS_CONTEXT &&
     status?.creator?.type === "Bot" &&
-    status.creator.login === "github-actions[bot]"
+    status.creator.login === "github-actions[bot]" &&
+    status.target_url === runUrl
   );
 }
 
@@ -2950,11 +4025,13 @@ async function loadReviewThreads(evidenceBudget) {
     );
     threads.push(...connection.nodes);
     if (!connection.pageInfo.hasNextPage) {
-      return mapWithConcurrency(
+      const loadedThreads = await mapWithConcurrency(
         threads,
         MAX_REVIEW_THREAD_COMMENT_CONCURRENCY,
         (thread) => loadAllReviewThreadComments(thread, evidenceBudget),
       );
+      await validateClosingReviewThreadStates(loadedThreads, evidenceBudget);
+      return loadedThreads;
     }
     const endCursor = connection.pageInfo.endCursor;
     if (typeof endCursor !== "string" || endCursor.length === 0) {
@@ -2968,6 +4045,97 @@ async function loadReviewThreads(evidenceBudget) {
   }
 }
 
+async function validateClosingReviewThreadStates(initialThreads, evidenceBudget) {
+  const initialStates = new Map();
+  for (const thread of initialThreads) {
+    if (
+      typeof thread?.id !== "string" ||
+      thread.id.length === 0 ||
+      typeof thread.isResolved !== "boolean"
+    ) {
+      throw new Error("initial GraphQL review-thread state is not canonical");
+    }
+    if (initialStates.has(thread.id)) {
+      throw new Error(`initial GraphQL review-thread snapshot repeats id ${thread.id}`);
+    }
+    initialStates.set(thread.id, thread.isResolved);
+  }
+
+  const closingStates = new Map();
+  const seenCursors = new Set();
+  let after = null;
+  let pageCount = 0;
+  while (true) {
+    if (pageCount >= MAX_GRAPHQL_PAGES) {
+      throw new GateFailure(
+        "pending",
+        "Codex review evidence is temporarily incomplete",
+        `closing GraphQL review-thread state pagination exceeded ${MAX_GRAPHQL_PAGES} pages`,
+      );
+    }
+    const { data } = await graphqlRequest(
+      REVIEW_THREAD_STATES_QUERY,
+      {
+        owner: repo.owner,
+        repo: repo.name,
+        number: activePrNumber,
+        after,
+      },
+      { evidenceBudget, label: "closing GraphQL review-thread states" },
+    );
+    pageCount += 1;
+    const connection = data?.repository?.pullRequest?.reviewThreads;
+    if (
+      !connection ||
+      !Array.isArray(connection.nodes) ||
+      !connection.pageInfo ||
+      typeof connection.pageInfo.hasNextPage !== "boolean"
+    ) {
+      throw new Error("closing GraphQL review-thread states are incomplete");
+    }
+    evidenceBudget?.work.consumeItems(
+      evidenceBudget,
+      connection.nodes.length,
+      "closing GraphQL review-thread states",
+    );
+    for (const thread of connection.nodes) {
+      if (
+        typeof thread?.id !== "string" ||
+        thread.id.length === 0 ||
+        typeof thread.isResolved !== "boolean"
+      ) {
+        throw new Error("closing GraphQL review-thread state is not canonical");
+      }
+      if (closingStates.has(thread.id)) {
+        throw new Error(`closing GraphQL review-thread states repeat id ${thread.id}`);
+      }
+      closingStates.set(thread.id, thread.isResolved);
+    }
+    if (!connection.pageInfo.hasNextPage) {
+      break;
+    }
+    const endCursor = connection.pageInfo.endCursor;
+    if (typeof endCursor !== "string" || endCursor.length === 0) {
+      throw new Error("closing GraphQL review-thread states omitted an end cursor");
+    }
+    if (seenCursors.has(endCursor)) {
+      throw new Error("closing GraphQL review-thread state cursor did not advance");
+    }
+    seenCursors.add(endCursor);
+    after = endCursor;
+  }
+
+  const drifted = initialStates.size !== closingStates.size ||
+    [...initialStates].some(([id, isResolved]) => closingStates.get(id) !== isResolved);
+  if (drifted) {
+    throw new GateFailure(
+      "pending",
+      "Codex review evidence is temporarily incomplete",
+      "closing GraphQL review-thread state drifted from the initial snapshot",
+    );
+  }
+}
+
 async function loadAllReviewThreadComments(thread, evidenceBudget) {
   if (
     typeof thread?.id !== "string" ||
@@ -2975,6 +4143,9 @@ async function loadAllReviewThreadComments(thread, evidenceBudget) {
     /\s/.test(thread.id)
   ) {
     throw new Error("GraphQL review thread does not have a valid opaque id");
+  }
+  if (typeof thread.isResolved !== "boolean") {
+    throw new Error(`GraphQL review thread ${thread.id} has a non-boolean isResolved value`);
   }
   let connection = thread.comments;
   if (!connection) {
@@ -3023,7 +4194,12 @@ async function loadAllReviewThreadComments(thread, evidenceBudget) {
       },
     );
     pageCount += 1;
-    connection = data?.node?.comments;
+    validateReviewThreadStateSnapshot(
+      data?.node,
+      thread,
+      `GraphQL comments page ${pageCount}`,
+    );
+    connection = data.node.comments;
     if (!connection) {
       throw new Error(`GraphQL comments query did not return a connection for thread ${thread.id}`);
     }
@@ -3066,6 +4242,31 @@ async function loadAllReviewThreadComments(thread, evidenceBudget) {
       },
     },
   };
+}
+
+function validateReviewThreadStateSnapshot(node, initialThread, phase) {
+  if (
+    !node ||
+    typeof node.id !== "string" ||
+    node.id.length === 0 ||
+    typeof node.isResolved !== "boolean"
+  ) {
+    throw new Error(
+      `${phase} did not return canonical id/isResolved metadata for thread ${initialThread.id}`,
+    );
+  }
+  if (
+    node.id !== initialThread.id ||
+    node.isResolved !== initialThread.isResolved
+  ) {
+    throw new GateFailure(
+      "pending",
+      "Codex review evidence is temporarily incomplete",
+      `${phase} drifted for review thread ${initialThread.id}: ` +
+        `observed id=${node.id} isResolved=${node.isResolved}, ` +
+        `initial isResolved=${initialThread.isResolved}`,
+    );
+  }
 }
 
 async function request(

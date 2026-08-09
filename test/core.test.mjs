@@ -14,6 +14,7 @@ import {
   buildStateCommentBody,
   codexReviewBodyFindingSample,
   codexAutoReviewLooksOngoing,
+  collectCodexThreadEvidence,
   collectCurrentHeadCodexFindings,
   collectUnresolvedCodexThreadFindings,
   codexInlineParentReviewBodyHasClosedGrammar,
@@ -85,6 +86,7 @@ function liveCodexIssueComment(body, overrides = {}) {
     id: 101,
     body,
     created_at: "2026-07-23T08:00:00Z",
+    updated_at: "2026-07-23T08:00:00Z",
     html_url: "https://github.com/owner/repo/issues/1#issuecomment-101",
     user: {
       login: "chatgpt-codex-connector[bot]",
@@ -671,9 +673,84 @@ test("summarizes only Codex bot signal reactions", () => {
     eyes: reactionIdentity(markerCommentReactions[0]),
   });
   assert.deepEqual(summarizeCodexSignalReactions(issueReactions, markerCommentReactions), {
-    plusOne: reactionIdentity(issueReactions[1]),
+    plusOne: null,
     eyes: reactionIdentity(markerCommentReactions[0]),
   });
+});
+
+test("filters malformed +1 audit identities without changing eyes signals", () => {
+  const validPlusOne = {
+    id: 2,
+    content: "+1",
+    created_at: "2026-04-26T10:01:00Z",
+    user: { login: "chatgpt-codex-connector[bot]" },
+  };
+  const eyes = {
+    id: 3,
+    content: "eyes",
+    created_at: "2026-04-26T10:02:00Z",
+    user: { login: "chatgpt-codex-connector[bot]" },
+  };
+  const malformedPlusOnes = [
+    ["missing id", { id: undefined }],
+    ["null id", { id: null }],
+    ["zero id", { id: 0 }],
+    ["negative id", { id: -1 }],
+    ["fractional id", { id: 4.5 }],
+    ["string id", { id: "4" }],
+    ["unsafe id", { id: Number.MAX_SAFE_INTEGER + 1 }],
+    ["missing timestamp", { created_at: undefined }],
+    ["invalid timestamp", { created_at: "not-a-timestamp" }],
+    ["noncanonical timestamp", { created_at: "2026-04-26T10:03:00+00:00" }],
+  ].map(([name, overrides]) => ({
+    name,
+    reaction: {
+      id: 4,
+      content: "+1",
+      created_at: "2026-04-26T10:03:00Z",
+      user: { login: "chatgpt-codex-connector[bot]" },
+      ...overrides,
+    },
+  }));
+
+  for (const { name, reaction } of malformedPlusOnes) {
+    let auditSummary;
+    assert.doesNotThrow(() => {
+      auditSummary = summarizeCodexReactions([validPlusOne, reaction, eyes]);
+    }, name);
+    assert.deepEqual(
+      auditSummary,
+      {
+        plusOne: reactionIdentity(validPlusOne),
+        eyes: reactionIdentity(eyes),
+      },
+      name,
+    );
+    assert.deepEqual(
+      summarizeCodexReactions([reaction, eyes]),
+      {
+        plusOne: null,
+        eyes: reactionIdentity(eyes),
+      },
+      name,
+    );
+    assert.deepEqual(
+      summarizeCodexSignalReactions([validPlusOne, reaction], [eyes]),
+      {
+        plusOne: null,
+        eyes: reactionIdentity(eyes),
+      },
+      name,
+    );
+  }
+
+  assert.equal(
+    codexAutoReviewLooksOngoing({
+      plusOne: reactionIdentity(validPlusOne),
+      eyes: null,
+    }),
+    false,
+  );
 });
 
 test("selects only Codex bot top-level completion comments", () => {
@@ -681,6 +758,7 @@ test("selects only Codex bot top-level completion comments", () => {
     {
       id: 1,
       created_at: "2026-04-26T10:00:00Z",
+      updated_at: "2026-04-26T10:00:00Z",
       html_url: "https://example.invalid/comments/1",
       body: "Codex Review: Didn't find any major issues.",
       user: { login: "octocat" },
@@ -688,6 +766,7 @@ test("selects only Codex bot top-level completion comments", () => {
     {
       id: 2,
       created_at: "2026-04-26T10:01:00Z",
+      updated_at: "2026-04-26T10:01:00Z",
       html_url: "https://example.invalid/comments/2",
       body: "To use Codex here, create a Codex account and connect to github.",
       user: { login: "chatgpt-codex-connector[bot]" },
@@ -695,6 +774,7 @@ test("selects only Codex bot top-level completion comments", () => {
     {
       id: 3,
       created_at: "2026-04-26T10:02:00Z",
+      updated_at: "2026-04-26T10:02:00Z",
       html_url: "https://example.invalid/comments/3",
       body: "Codex Review: Didn't find any major issues. Chef's kiss.",
       user: { login: "chatgpt-codex-connector[bot]" },
@@ -1167,10 +1247,125 @@ test("accepts a live-style clean Codex issue-comment artifact with a 10-characte
     source: "issue-comment",
     id: "101",
     createdAt: "2026-07-23T08:00:00Z",
+    carrierCreatedAt: "2026-07-23T08:00:00Z",
+    carrierUpdatedAt: "2026-07-23T08:00:00Z",
+    revisionAt: "2026-07-23T08:00:00Z",
+    edited: false,
     url: "https://github.com/owner/repo/issues/1#issuecomment-101",
     kind: "clean",
     commitRef: "abcdef1234",
   });
+});
+
+test("binds both issue-comment carrier timestamps and orders the artifact by updated_at", () => {
+  const body = [
+    "Codex Review: Didn't find any major issues.",
+    "",
+    "**Reviewed commit:** `abcdef1234`",
+  ].join("\n");
+  const edited = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(body, {
+      id: 101,
+      created_at: "2026-07-23T08:00:00Z",
+      updated_at: "2026-07-23T08:10:00Z",
+    }),
+    { owner: "owner", repo: "repo" },
+  );
+  const laterCreatedButEarlierRevision = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(body, {
+      id: 102,
+      created_at: "2026-07-23T08:05:00Z",
+      updated_at: "2026-07-23T08:05:00Z",
+    }),
+    { owner: "owner", repo: "repo" },
+  );
+
+  assert.deepEqual(edited, {
+    source: "issue-comment",
+    id: "101",
+    createdAt: "2026-07-23T08:10:00Z",
+    carrierCreatedAt: "2026-07-23T08:00:00Z",
+    carrierUpdatedAt: "2026-07-23T08:10:00Z",
+    revisionAt: "2026-07-23T08:10:00Z",
+    edited: true,
+    url: "https://github.com/owner/repo/issues/1#issuecomment-101",
+    kind: "clean",
+    commitRef: "abcdef1234",
+  });
+  assert.deepEqual(
+    sortCodexArtifactsNewestFirst([laterCreatedButEarlierRevision, edited])
+      .map((artifact) => artifact.id),
+    ["101", "102"],
+  );
+});
+
+test("fails closed on invalid issue-comment carrier revision timestamps", () => {
+  const body = [
+    "Codex Review: Didn't find any major issues.",
+    "",
+    "**Reviewed commit:** `abcdef1234`",
+  ].join("\n");
+  const cases = [
+    {
+      name: "missing created_at",
+      overrides: { created_at: undefined },
+      expectedError: "invalid Codex issue-comment creation time: ",
+    },
+    {
+      name: "noncanonical created_at",
+      overrides: { created_at: "1" },
+      expectedError: "invalid Codex issue-comment creation time: 1",
+    },
+    {
+      name: "impossible created_at",
+      overrides: { created_at: "2026-02-30T10:00:00Z" },
+      expectedError:
+        "invalid Codex issue-comment creation time: 2026-02-30T10:00:00Z",
+    },
+    {
+      name: "missing updated_at",
+      overrides: { updated_at: undefined },
+      expectedError: "invalid Codex issue-comment revision time: ",
+    },
+    {
+      name: "noncanonical updated_at",
+      overrides: { updated_at: "1" },
+      expectedError: "invalid Codex issue-comment revision time: 1",
+    },
+    {
+      name: "impossible updated_at",
+      overrides: { updated_at: "2026-02-30T10:00:00Z" },
+      expectedError:
+        "invalid Codex issue-comment revision time: 2026-02-30T10:00:00Z",
+    },
+    {
+      name: "updated_at precedes created_at",
+      overrides: {
+        created_at: "2026-07-23T08:01:00Z",
+        updated_at: "2026-07-23T08:00:00Z",
+      },
+      expectedError:
+        "Codex issue-comment revision time precedes its creation time",
+    },
+  ];
+
+  for (const { name, overrides, expectedError } of cases) {
+    const carrier = liveCodexIssueComment(body, overrides);
+    const artifact = parseCodexIssueCommentArtifact(
+      carrier,
+      { owner: "owner", repo: "repo" },
+    );
+
+    assert.equal(artifact.kind, "clean", name);
+    assert.equal(artifact.orderingError, expectedError, name);
+    assert.equal(artifact.carrierCreatedAt, carrier.created_at || "", name);
+    assert.equal(artifact.carrierUpdatedAt, carrier.updated_at || "", name);
+    assert.equal(
+      artifact.revisionAt,
+      (carrier.updated_at || carrier.created_at || ""),
+      name,
+    );
+  }
 });
 
 test("requires canonical positive integer IDs for provider terminal artifacts", () => {
@@ -1462,6 +1657,10 @@ test("accepts only exact 10- or 40-character clean issue-comment commit markers"
     source: "issue-comment",
     id: "101",
     createdAt: "2026-07-23T08:00:00Z",
+    carrierCreatedAt: "2026-07-23T08:00:00Z",
+    carrierUpdatedAt: "2026-07-23T08:00:00Z",
+    revisionAt: "2026-07-23T08:00:00Z",
+    edited: false,
     url: "https://github.com/owner/repo/issues/1#issuecomment-101",
     kind: "clean",
     commitRef: FULL_SHA_A,
@@ -1718,20 +1917,124 @@ test("treats an unknown single heading decorator as terminal-looking malformed",
   }
 });
 
-test("ignores Codex progress prose that is not terminal-looking", () => {
+test("classifies exact official Codex progress as pending audit evidence", () => {
   for (const body of [
     "Codex Review in progress",
     "Codex review still in progress.",
     "### 🤖 Codex Review in progress: run=123 status=queued",
   ]) {
-    assert.equal(
+    assert.deepEqual(
       parseCodexIssueCommentArtifact(
         liveCodexIssueComment(body),
         { owner: "owner", repo: "repo" },
       ),
-      null,
+      {
+        source: "issue-comment",
+        id: "101",
+        createdAt: "2026-07-23T08:00:00Z",
+        carrierCreatedAt: "2026-07-23T08:00:00Z",
+        carrierUpdatedAt: "2026-07-23T08:00:00Z",
+        revisionAt: "2026-07-23T08:00:00Z",
+        edited: false,
+        url: "https://github.com/owner/repo/issues/1#issuecomment-101",
+        kind: "pending",
+        pendingKind: "progress",
+        auditOnly: true,
+        reason: "Codex review is in progress",
+      },
       body,
     );
+  }
+});
+
+test("validates exact Bot and App identity before classifying Codex progress", () => {
+  const cases = [
+    {
+      name: "missing Bot type",
+      overrides: {
+        user: { login: "chatgpt-codex-connector[bot]" },
+      },
+      reason: "configured Codex issue-comment author is not a Bot",
+    },
+    {
+      name: "wrong Bot type",
+      overrides: {
+        user: { login: "chatgpt-codex-connector[bot]", type: "User" },
+      },
+      reason: "configured Codex issue-comment author is not a Bot",
+    },
+    {
+      name: "missing GitHub App",
+      overrides: {
+        performed_via_github_app: undefined,
+      },
+      reason: "official Codex issue comment is not bound to chatgpt-codex-connector",
+    },
+    {
+      name: "wrong GitHub App",
+      overrides: {
+        performed_via_github_app: { slug: "other-app" },
+      },
+      reason: "official Codex issue comment is not bound to chatgpt-codex-connector",
+    },
+  ];
+
+  for (const { name, overrides, reason } of cases) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment("Codex Review in progress", overrides),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed", name);
+    assert.equal(artifact.reason, reason, name);
+  }
+});
+
+test("validates the provider ID before classifying Codex progress", () => {
+  for (const id of [undefined, null, 0, "101"]) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment("Codex Review in progress", { id }),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed", String(id));
+    assert.equal(
+      artifact.reason,
+      "Codex issue-comment does not have a valid positive integer id",
+      String(id),
+    );
+  }
+});
+
+test("rejects Codex progress with a malformed carrier revision time", () => {
+  const cases = [
+    {
+      name: "missing creation time",
+      overrides: { created_at: undefined },
+      reason: "invalid Codex issue-comment creation time: ",
+    },
+    {
+      name: "missing revision time",
+      overrides: { updated_at: undefined },
+      reason: "invalid Codex issue-comment revision time: ",
+    },
+    {
+      name: "invalid revision time",
+      overrides: { updated_at: "not-a-timestamp" },
+      reason: "invalid Codex issue-comment revision time: not-a-timestamp",
+    },
+    {
+      name: "revision before creation",
+      overrides: { updated_at: "2026-07-23T07:59:59Z" },
+      reason: "Codex issue-comment revision time precedes its creation time",
+    },
+  ];
+
+  for (const { name, overrides, reason } of cases) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment("Codex Review in progress", overrides),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed", name);
+    assert.equal(artifact.reason, reason, name);
   }
 });
 
@@ -1759,6 +2062,10 @@ test("accepts an exact-repository full-SHA Codex issue-comment finding", () => {
     source: "issue-comment",
     id: "101",
     createdAt: "2026-07-23T08:00:00Z",
+    carrierCreatedAt: "2026-07-23T08:00:00Z",
+    carrierUpdatedAt: "2026-07-23T08:00:00Z",
+    revisionAt: "2026-07-23T08:00:00Z",
+    edited: false,
     url: "https://github.com/owner/repo/issues/1#issuecomment-101",
     kind: "finding",
     headSha: FULL_SHA_A,
@@ -1813,6 +2120,10 @@ test("accepts a Bot-authored clean review bound to a full parent commit", () => 
       source: "pull-request-review",
       id: "201",
       createdAt: "2026-07-23T08:01:00Z",
+      carrierCreatedAt: "2026-07-23T08:01:00Z",
+      carrierUpdatedAt: "2026-07-23T08:01:00Z",
+      revisionAt: "2026-07-23T08:01:00Z",
+      edited: false,
       url: "https://github.com/owner/repo/pull/1#pullrequestreview-201",
       kind: "clean",
       headSha: FULL_SHA_A,
@@ -1857,19 +2168,43 @@ test("recognizes only the closed official inline-parent review wrapper", () => {
   );
 });
 
-test("accepts only closed legacy or extended-clean APPROVED review bodies", () => {
+test("accepts only closed APPROVED bodies whose 10/40-hex refs agree with commit_id", () => {
   for (const body of [
+    undefined,
+    "",
     "Looks good.",
     "Coverage: `parseCodexIssueCommentArtifact`, `test/core.test.mjs`.\n\nNo findings.",
     "Review coverage: `error-paths` and `focused-tests`.\n\nNo findings.",
     "Coverage: `docs/high-level-design.md`, `test/findings.test.mjs`, and `src/low-level-api.mjs`.\n\nNo findings.",
     "Coverage: `critical_path`, `findingParser`, and `authenticator`.\n\nNo findings.",
+    `Coverage: \`${FULL_SHA_A.slice(0, 10)}\`.\n\nNo findings.`,
+    `Coverage: \`${FULL_SHA_A}\`.\n\nNo findings.`,
+    `Coverage: \`${FULL_SHA_A.slice(0, 10)}\` and \`${FULL_SHA_A}\`.\n\nNo findings.`,
   ]) {
     const artifact = parseCodexReviewArtifact(
       liveCodexReview({ body }),
       { owner: "owner", repo: "repo" },
     );
     assert.equal(artifact.kind, "clean", body);
+  }
+});
+
+test("rejects any 10/40-hex APPROVED body ref that conflicts with native commit_id", () => {
+  for (const body of [
+    `Coverage: \`${FULL_SHA_B.slice(0, 10)}\`.\n\nNo findings.`,
+    `Coverage: \`${FULL_SHA_B}\`.\n\nNo findings.`,
+    `Coverage: \`${FULL_SHA_A.slice(0, 10)}\` and \`${FULL_SHA_B}\`.\n\nNo findings.`,
+  ]) {
+    const artifact = parseCodexReviewArtifact(
+      liveCodexReview({ body }),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed", body);
+    assert.equal(
+      artifact.reason,
+      "Codex approved review body commit reference conflicts with native review commit",
+      body,
+    );
   }
 });
 
@@ -1922,7 +2257,10 @@ test("rejects clean Codex reviews with a wrong user type or short parent commit"
     { owner: "owner", repo: "repo" },
   );
   const shortCommit = parseCodexReviewArtifact(
-    liveCodexReview({ commit_id: "abcdef1234" }),
+    liveCodexReview({
+      commit_id: "abcdef1234",
+      body: "Coverage: `abcdef1234`.\n\nNo findings.",
+    }),
     { owner: "owner", repo: "repo" },
   );
 
@@ -1994,16 +2332,28 @@ test("sorts same-channel Codex artifacts by provider ID when timestamps tie", ()
   assert.deepEqual(sorted.map((artifact) => artifact.id), ["1", "10", "9"]);
 });
 
-test("retains historical unresolved Codex threads even when they are outdated", () => {
-  const result = collectUnresolvedCodexThreadFindings(
+test("annotates current and historical unresolved Codex threads from exact parent commits", () => {
+  const result = collectCodexThreadEvidence(
     [
       {
         id: 301,
         node_id: reviewCommentNodeId(301),
-        path: "src/history.mjs",
+        path: "src/current.mjs",
         original_line: 7,
-        original_commit_id: FULL_SHA_B,
+        original_commit_id: FULL_SHA_A,
         pull_request_review_id: 401,
+        user: {
+          login: "chatgpt-codex-connector[bot]",
+          type: "Bot",
+        },
+      },
+      {
+        id: 302,
+        node_id: reviewCommentNodeId(302),
+        path: "src/history.mjs",
+        original_line: 8,
+        original_commit_id: FULL_SHA_B,
+        pull_request_review_id: 402,
         user: {
           login: "chatgpt-codex-connector[bot]",
           type: "Bot",
@@ -2014,17 +2364,30 @@ test("retains historical unresolved Codex threads even when they are outdated", 
       liveCodexReview({
         id: 401,
         state: "COMMENTED",
+        commit_id: FULL_SHA_A,
+      }),
+      liveCodexReview({
+        id: 402,
+        state: "COMMENTED",
         commit_id: FULL_SHA_B,
       }),
     ],
     [
+      {
+        id: "current-thread",
+        isResolved: false,
+        isOutdated: false,
+        path: "src/current.mjs",
+        line: 7,
+        comments: { nodes: [graphqlReviewComment(301)] },
+      },
       {
         id: "historical-thread",
         isResolved: false,
         isOutdated: true,
         path: "src/history.mjs",
         line: 7,
-        comments: { nodes: [graphqlReviewComment(301)] },
+        comments: { nodes: [graphqlReviewComment(302)] },
       },
     ],
     undefined,
@@ -2032,12 +2395,46 @@ test("retains historical unresolved Codex threads even when they are outdated", 
   );
 
   assert.deepEqual(result, {
-    count: 1,
-    ids: ["thread:historical-thread"],
-    samples: ["src/history.mjs:7"],
+    count: 2,
+    ids: ["thread:current-thread", "thread:historical-thread"],
+    samples: ["src/current.mjs:7", "src/history.mjs:7"],
     errors: [],
     transientErrors: [],
+    validatedCodexInlineParentReviewIds: ["401", "402"],
+    findings: [
+      {
+        id: "thread:current-thread",
+        sample: "src/current.mjs:7",
+        headSha: FULL_SHA_A,
+        currentHead: true,
+      },
+      {
+        id: "thread:historical-thread",
+        sample: "src/history.mjs:7",
+        headSha: FULL_SHA_B,
+        currentHead: false,
+      },
+    ],
   });
+});
+
+test("requires a full current-head SHA before annotating Codex thread evidence", () => {
+  for (const headSha of [undefined, "", "abcdef1234", `${FULL_SHA_A}0`]) {
+    const result = collectCodexThreadEvidence([], [], [], undefined, headSha);
+    assert.deepEqual(
+      result,
+      {
+        count: 0,
+        ids: [],
+        samples: [],
+        errors: ["current head is not a full commit SHA"],
+        transientErrors: [],
+        validatedCodexInlineParentReviewIds: [],
+        findings: [],
+      },
+      String(headSha),
+    );
+  }
 });
 
 test("matches unresolved Codex threads with review-comment IDs above signed 32-bit range", () => {
@@ -2194,61 +2591,212 @@ test("resolved historical threads still require complete trusted identities", ()
   });
 });
 
-test("requires unresolved inline findings to bind through full parent and original commits", () => {
-  const result = collectUnresolvedCodexThreadFindings(
-    [
-      {
+test("counts unresolved inline findings only after exact Bot and commit binding", () => {
+  const exactBot = {
+    login: "chatgpt-codex-connector[bot]",
+    type: "Bot",
+  };
+  const cases = [
+    {
+      name: "exact binding",
+      comment: {},
+      review: {},
+      expectedCount: 1,
+      expectedError: null,
+    },
+    {
+      name: "comment author is not an exact Bot",
+      comment: {
+        user: { login: "chatgpt-codex-connector[bot]", type: "User" },
+      },
+      review: {},
+      expectedCount: 0,
+      expectedError: "review comment 303 author is not a Bot",
+    },
+    {
+      name: "parent author is not an exact Bot",
+      comment: {},
+      review: {
+        user: { login: "chatgpt-codex-connector[bot]", type: "User" },
+      },
+      expectedCount: 0,
+      expectedError: "review comment 303 parent review author is not a configured Bot",
+    },
+    {
+      name: "short original commit",
+      comment: { original_commit_id: "abcdef1234" },
+      review: {},
+      expectedCount: 0,
+      expectedError: "review comment 303 is not bound through full commit SHAs",
+    },
+    {
+      name: "short parent commit",
+      comment: {},
+      review: { commit_id: "abcdef1234" },
+      expectedCount: 0,
+      expectedError: "review comment 303 is not bound through full commit SHAs",
+    },
+    {
+      name: "conflicting full commits",
+      comment: { original_commit_id: FULL_SHA_B },
+      review: {},
+      expectedCount: 0,
+      expectedError: "review comment 303 original commit conflicts with its parent review",
+    },
+  ];
+
+  for (const { name, comment, review, expectedCount, expectedError } of cases) {
+    const result = collectUnresolvedCodexThreadFindings(
+      [{
         id: 303,
         node_id: reviewCommentNodeId(303),
-        path: "src/valid.mjs",
+        path: "src/binding.mjs",
         line: 9,
         original_commit_id: FULL_SHA_A,
         pull_request_review_id: 403,
-        user: {
-          login: "chatgpt-codex-connector[bot]",
-          type: "Bot",
-        },
-      },
-      {
-        id: 304,
-        node_id: reviewCommentNodeId(304),
-        path: "src/short.mjs",
-        line: 10,
-        original_commit_id: "abcdef1234",
-        pull_request_review_id: 404,
-        user: {
-          login: "chatgpt-codex-connector[bot]",
-          type: "Bot",
-        },
-      },
-    ],
-    [
-      liveCodexReview({ id: 403 }),
-      liveCodexReview({ id: 404 }),
-    ],
-    [
-      {
-        id: "valid-binding",
+        user: exactBot,
+        ...comment,
+      }],
+      [liveCodexReview({ id: 403, state: "COMMENTED", ...review })],
+      [{
+        id: "exact-binding",
         isResolved: false,
         comments: { nodes: [graphqlReviewComment(303)] },
+      }],
+      undefined,
+      FULL_SHA_A,
+    );
+
+    assert.equal(result.count, expectedCount, name);
+    assert.deepEqual(
+      result.ids,
+      expectedCount === 1 ? ["thread:exact-binding"] : [],
+      name,
+    );
+    assert.deepEqual(
+      result.samples,
+      expectedCount === 1 ? ["src/binding.mjs:9"] : [],
+      name,
+    );
+    assert.deepEqual(result.errors, expectedError ? [expectedError] : [], name);
+    assert.deepEqual(result.transientErrors, [], name);
+  }
+});
+
+test("uses exact GraphQL resolution as the sole closure for bound Codex threads", () => {
+  const cases = [
+    {
+      name: "active unresolved",
+      isResolved: false,
+      isOutdated: false,
+      expectedCount: 1,
+    },
+    {
+      name: "outdated unresolved",
+      isResolved: false,
+      isOutdated: true,
+      expectedCount: 1,
+    },
+    {
+      name: "exactly resolved",
+      isResolved: true,
+      isOutdated: true,
+      expectedCount: 0,
+    },
+  ];
+
+  for (const { name, isResolved, isOutdated, expectedCount } of cases) {
+    const evidence = collectCodexThreadEvidence(
+      [{
+        id: 310,
+        node_id: reviewCommentNodeId(310),
+        path: "src/closure.mjs",
+        line: 14,
+        original_commit_id: FULL_SHA_A,
+        pull_request_review_id: 410,
+        user: {
+          login: "chatgpt-codex-connector[bot]",
+          type: "Bot",
+        },
+      }],
+      [liveCodexReview({ id: 410, state: "COMMENTED" })],
+      [{
+        id: "closure-thread",
+        isResolved,
+        isOutdated,
+        comments: { nodes: [graphqlReviewComment(310)] },
+      }],
+      undefined,
+      FULL_SHA_A,
+    );
+
+    assert.equal(evidence.count, expectedCount, name);
+    assert.deepEqual(evidence.errors, [], name);
+    assert.deepEqual(evidence.transientErrors, [], name);
+    assert.deepEqual(evidence.validatedCodexInlineParentReviewIds, ["410"], name);
+    assert.deepEqual(
+      evidence.findings,
+      expectedCount === 1
+        ? [{
+            id: "thread:closure-thread",
+            sample: "src/closure.mjs:14",
+            headSha: FULL_SHA_A,
+            currentHead: true,
+          }]
+        : [],
+      name,
+    );
+  }
+});
+
+test("does not close an unresolved historical thread with an unrelated later clean review", () => {
+  const evidence = collectCodexThreadEvidence(
+    [{
+      id: 311,
+      node_id: reviewCommentNodeId(311),
+      path: "src/historical-open.mjs",
+      line: 15,
+      original_commit_id: FULL_SHA_B,
+      pull_request_review_id: 411,
+      user: {
+        login: "chatgpt-codex-connector[bot]",
+        type: "Bot",
       },
-      {
-        id: "short-binding",
-        isResolved: false,
-        comments: { nodes: [graphqlReviewComment(304)] },
-      },
+    }],
+    [
+      liveCodexReview({
+        id: 411,
+        state: "COMMENTED",
+        commit_id: FULL_SHA_B,
+        submitted_at: "2026-07-23T08:00:00Z",
+      }),
+      liveCodexReview({
+        id: 412,
+        state: "APPROVED",
+        commit_id: FULL_SHA_A,
+        body: "Looks good.",
+        submitted_at: "2026-07-23T08:05:00Z",
+      }),
     ],
+    [{
+      id: "historical-open-thread",
+      isResolved: false,
+      isOutdated: true,
+      comments: { nodes: [graphqlReviewComment(311)] },
+    }],
     undefined,
     FULL_SHA_A,
   );
 
-  assert.deepEqual(result, {
-    count: 2,
-    ids: ["thread:valid-binding", "thread:short-binding"],
-    samples: ["src/valid.mjs:9", "src/short.mjs:10"],
-    errors: ["review comment 304 is not bound through full commit SHAs"],
-    transientErrors: [],
-  });
+  assert.deepEqual(evidence.findings, [{
+    id: "thread:historical-open-thread",
+    sample: "src/historical-open.mjs:15",
+    headSha: FULL_SHA_B,
+    currentHead: false,
+  }]);
+  assert.equal(evidence.count, 1);
+  assert.deepEqual(evidence.errors, []);
+  assert.deepEqual(evidence.transientErrors, []);
 });
 
 test("reports missing current threads, missing parents, and conflicting inline commits", () => {
@@ -2328,13 +2876,9 @@ test("reports missing current threads, missing parents, and conflicting inline c
   );
 
   assert.deepEqual(result, {
-    count: 3,
-    ids: ["thread:missing-parent", "thread:commit-conflict", "thread:invalid-parent"],
-    samples: [
-      "src/missing-parent.mjs:11",
-      "src/conflict.mjs:12",
-      "src/invalid-parent.mjs:13",
-    ],
+    count: 0,
+    ids: [],
+    samples: [],
     errors: [
       "review comment 307 original commit conflicts with its parent review",
       "review comment 309 has no valid parent review id",
@@ -2908,7 +3452,7 @@ test("treats eyes newer than an old +1 as ongoing bootstrap activity", () => {
   );
 });
 
-test("treats +1 newer than eyes as closed bootstrap activity", () => {
+test("keeps eyes liveness active when a newer +1 remains audit-only", () => {
   assert.equal(
     codexAutoReviewLooksOngoing({
       plusOne: {
@@ -2924,7 +3468,7 @@ test("treats +1 newer than eyes as closed bootstrap activity", () => {
         user: "chatgpt-codex-connector[bot]",
       },
     }),
-    false,
+    true,
   );
 });
 
