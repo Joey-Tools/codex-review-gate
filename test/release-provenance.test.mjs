@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -15,6 +16,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+import {
+  parseVerifiedOpenPgpStatus,
+  writeManifest,
+} from "../scripts/generate-action-release-provenance.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const generatorPath = join(
@@ -28,10 +34,41 @@ const decisionTablePath = join(
   "action",
   "decision-table.json",
 );
+const receiptSchemaPath = join(
+  repositoryRoot,
+  "packages",
+  "action",
+  "producer-receipt.schema.json",
+);
+const actionDefinitionPath = join(
+  repositoryRoot,
+  "packages",
+  "action",
+  "action.yml",
+);
 const SOURCE_REPOSITORY = "JoeyTeng/codex-review-gate";
 const ACTION_REPOSITORY = "JoeyTeng/codex-review-gate-action";
+const RELEASE = "1.5.0";
+const PROVENANCE_SCHEMA_ID =
+  "urn:joeyteng:codex-review-gate:release-provenance:2";
 const RECEIPT_SCHEMA_ID =
   "urn:joeyteng:codex-review-gate:producer-receipt:1";
+const DECISION_TABLE_SCHEMA_ID =
+  "urn:joeyteng:codex-review-gate:decision-table:1";
+const REUSABLE_WORKFLOW_PATH = ".github/workflows/codex-review-gate.yml";
+const reusableWorkflowPath = join(
+  repositoryRoot,
+  "packages",
+  "action",
+  REUSABLE_WORKFLOW_PATH,
+);
+const REUSABLE_WORKFLOW_REFERENCE =
+  `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@v1`;
+const REUSABLE_WORKFLOW_CHECKOUT_PATH = ".codex-review-gate-action";
+const REUSABLE_WORKFLOW_LOCAL_ACTION_USE =
+  `./${REUSABLE_WORKFLOW_CHECKOUT_PATH}`;
+const CHECKOUT_SHA =
+  "11d5960a326750d5838078e36cf38b85af677262";
 const UPLOAD_ARTIFACT_SHA =
   "ea165f8d65b6e75b540449e92b4886f43607fa02";
 const testEnvironment = {
@@ -76,6 +113,11 @@ function writeText(path, value) {
   writeFileSync(path, value);
 }
 
+function replaceRequired(text, expected, replacement, label) {
+  assert.notEqual(text.indexOf(expected), -1, `${label} fixture target is missing`);
+  return text.replace(expected, replacement);
+}
+
 function writeActionFixture(
   destination,
   {
@@ -83,43 +125,138 @@ function writeActionFixture(
     nonUtf8Path = false,
     placeholder = false,
     conflateRunAndPullRequestHeads = false,
+    anchorCheckoutAlias = false,
+    extraExternalAction = false,
+    flowExternalUse = false,
+    floatingCheckout = false,
+    mutateReceiptSchema = false,
+    mutatePolicyMajor = false,
+    mutateRerunContract = false,
+    mutateTagDriftContract = false,
+    wrongCalledPath = false,
+    wrongCalledRef = false,
+    wrongCalledRepository = false,
+    wrongCalledShaBinding = false,
+    wrongCheckoutPath = false,
+    wrongCheckoutRef = false,
+    wrongCheckoutRepository = false,
+    wrongLocalActionUse = false,
+    persistCheckoutCredentials = false,
+    quotedExternalUse = false,
     weakenDecisionPolicy = false,
     weakenPositiveConsumerRequirement = false,
   } = {},
 ) {
-  const statusContextBlock = duplicateStatusContext
-    ? `  status-context:\n    default: "codex/review-gate"\n  status-context:\n    default: "codex/review-gate"`
-    : `  status-context:\n    default: "codex/review-gate"`;
+  let actionDefinition = readFileSync(actionDefinitionPath, "utf8");
+  if (duplicateStatusContext) {
+    actionDefinition = replaceRequired(
+      actionDefinition,
+      "  status-context:\n",
+      "  status-context:\n  status-context:\n",
+      "duplicate status-context",
+    );
+  }
   writeText(
     join(destination, "action.yml"),
-    `name: Release fixture
-inputs:
-${statusContextBlock}
-runs:
-  using: composite
-  steps:
-    - name: Upload fixture
-      uses: actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}
-`,
+    actionDefinition,
   );
+  let reusableWorkflow = readFileSync(reusableWorkflowPath, "utf8");
+  const replacements = [
+    [
+      floatingCheckout,
+      `actions/checkout@${CHECKOUT_SHA}`,
+      "actions/checkout@v4",
+      "floating checkout",
+    ],
+    [
+      wrongCheckoutRepository,
+      "repository: ${{ job.workflow_repository }}",
+      "repository: ${{ github.repository }}",
+      "checkout repository",
+    ],
+    [
+      wrongCheckoutRef,
+      "ref: ${{ job.workflow_sha }}",
+      "ref: ${{ github.sha }}",
+      "checkout ref",
+    ],
+    [
+      wrongCheckoutPath,
+      `path: ${REUSABLE_WORKFLOW_CHECKOUT_PATH}`,
+      "path: .wrong-action-path",
+      "checkout path",
+    ],
+    [
+      persistCheckoutCredentials,
+      "persist-credentials: false",
+      "persist-credentials: true",
+      "checkout credentials",
+    ],
+    [
+      wrongLocalActionUse,
+      `uses: ${REUSABLE_WORKFLOW_LOCAL_ACTION_USE}`,
+      "uses: ./evil",
+      "local action path",
+    ],
+  ];
+  for (const [enabled, expected, replacement, label] of replacements) {
+    if (enabled) {
+      reusableWorkflow = replaceRequired(
+        reusableWorkflow,
+        expected,
+        replacement,
+        label,
+      );
+    }
+  }
+  if (anchorCheckoutAlias) {
+    reusableWorkflow = replaceRequired(
+      reusableWorkflow,
+      "      - name: Check out exact called-workflow release\n",
+      "      - &checkout-step\n        name: Check out exact called-workflow release\n",
+      "checkout anchor",
+    );
+    reusableWorkflow += "      - *checkout-step\n";
+  }
+  if (extraExternalAction) {
+    reusableWorkflow += `      - name: Unexpected external runtime dependency
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+`;
+  }
+  if (flowExternalUse) {
+    reusableWorkflow +=
+      "      - { uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 }\n";
+  }
+  if (quotedExternalUse) {
+    reusableWorkflow +=
+      "      - 'uses': actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020\n";
+  }
+  writeText(join(destination, REUSABLE_WORKFLOW_PATH), reusableWorkflow);
   writeJson(join(destination, "package.json"), {
     name: "codex-review-gate-action",
-    version: "1.4.0",
+    version: RELEASE,
     private: true,
   });
-  writeJson(join(destination, "producer-receipt.schema.json"), {
-    $schema: "https://json-schema.org/draft/2020-12/schema",
-    $id: RECEIPT_SCHEMA_ID,
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      schema: { const: RECEIPT_SCHEMA_ID },
-      schema_version: { const: 1 },
-    },
-  });
+  if (mutateReceiptSchema) {
+    const schema = JSON.parse(readFileSync(receiptSchemaPath, "utf8"));
+    schema.additionalProperties = true;
+    writeJson(join(destination, "producer-receipt.schema.json"), schema);
+  } else {
+    copyFileSync(
+      receiptSchemaPath,
+      join(destination, "producer-receipt.schema.json"),
+    );
+  }
   if (
     placeholder ||
     conflateRunAndPullRequestHeads ||
+    mutatePolicyMajor ||
+    mutateRerunContract ||
+    mutateTagDriftContract ||
+    wrongCalledPath ||
+    wrongCalledRef ||
+    wrongCalledRepository ||
+    wrongCalledShaBinding ||
     weakenDecisionPolicy ||
     weakenPositiveConsumerRequirement
   ) {
@@ -142,6 +279,33 @@ runs:
     if (weakenPositiveConsumerRequirement) {
       table.producer_receipt_boundary.positive_consumer_requirement
         .selected_status.receipt_member_state = "pending";
+    }
+    if (mutatePolicyMajor) {
+      table.policy_major = 2;
+    }
+    if (mutateRerunContract) {
+      table.producer_receipt_boundary.run_attempt_identity.referenced_workflows
+        .rerun_resolution = "allow-current-v1-substitution";
+    }
+    if (mutateTagDriftContract) {
+      table.producer_receipt_boundary.run_attempt_identity.referenced_workflows
+        .tag_drift = "follow-current-v1-target";
+    }
+    if (wrongCalledRepository) {
+      table.producer_receipt_boundary.called_workflow_authority.repository =
+        "Mallory/codex-review-gate-action";
+    }
+    if (wrongCalledPath) {
+      table.producer_receipt_boundary.called_workflow_authority
+        .workflow_file_path = ".github/workflows/wrong.yml";
+    }
+    if (wrongCalledRef) {
+      table.producer_receipt_boundary.run_attempt_identity.referenced_workflows
+        .expected_ref = "refs/heads/v1";
+    }
+    if (wrongCalledShaBinding) {
+      table.producer_receipt_boundary.run_attempt_identity.referenced_workflows
+        .required_equalities[2] = "selected-sha-follows-current-v1-target";
     }
     writeJson(join(destination, "decision-table.json"), table);
   } else {
@@ -195,7 +359,7 @@ function createFixture(t, options = {}) {
 
   writeJson(join(sourceRepo, "package.json"), {
     name: "codex-review-gate-source",
-    version: "1.4.0",
+    version: RELEASE,
     private: true,
   });
   writeActionFixture(join(sourceRepo, "packages", "action"), options);
@@ -207,7 +371,7 @@ function createFixture(t, options = {}) {
   const actionCommit = commitAll(actionRepo, "action split", {
     nonUtf8Prefix: options.nonUtf8Path ? "" : null,
   });
-  for (const name of ["v1.4.0", "v1.4", "v1"]) {
+  for (const name of ["v1.5.0", "v1.5", "v1"]) {
     git(actionRepo, ["tag", "-a", name, actionCommit, "-m", `fixture ${name}`]);
   }
 
@@ -234,9 +398,9 @@ function generatorArguments(fixture, output, { testOnlySkip = true } = {}) {
     "--action-default-ref",
     "refs/heads/master",
     "--immutable-tag-ref",
-    "refs/tags/v1.4.0",
+    "refs/tags/v1.5.0",
     "--minor-tag-ref",
-    "refs/tags/v1.4",
+    "refs/tags/v1.5",
     "--major-tag-ref",
     "refs/tags/v1",
     "--output",
@@ -260,11 +424,12 @@ function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-test("decision table freezes the release-1.4 verdict and receipt boundary", () => {
+test("decision table freezes the 1.4 verdict and 1.5 producer boundary", () => {
   const raw = readFileSync(decisionTablePath);
   const table = JSON.parse(raw.toString("utf8"));
-  assert.equal(table.schema, "urn:joeyteng:codex-review-gate:decision-table:1");
+  assert.equal(table.schema, DECISION_TABLE_SCHEMA_ID);
   assert.equal(table.schema_version, 1);
+  assert.equal(table.policy_major, 1);
   assert.equal(table.policy_version, "1.4.0");
   assert.deepEqual(
     table.status_precedence.map(({ state }) => state),
@@ -299,6 +464,12 @@ test("decision table freezes the release-1.4 verdict and receipt boundary", () =
     "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
   );
   assert.equal(table.producer_receipt_boundary.status_get_by_id_api, null);
+  assert.equal(table.producer_receipt_boundary.producer_protocol_major, 1);
+  assert.equal(
+    table.producer_receipt_boundary.canonical_reusable_workflow_reference,
+    REUSABLE_WORKFLOW_REFERENCE,
+  );
+  assert.equal(table.producer_receipt_boundary.caller_selector, "v1");
   assert.deepEqual(
     table.producer_receipt_boundary.run_attempt_identity,
     {
@@ -307,14 +478,71 @@ test("decision table freezes the release-1.4 verdict and receipt boundary", () =
         "id-equals-receipt-producer-run-id",
         "run_attempt-equals-receipt-producer-run-attempt",
         "repository-full_name-equals-receipt-producer-repository",
-        "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
       ],
+      referenced_workflows: {
+        field: "referenced_workflows",
+        availability:
+          "optional-nullable-upstream-but-required-non-null-for-this-reusable-workflow-contract",
+        selection: "exactly-one-exact-called-workflow-member",
+        expected_path: REUSABLE_WORKFLOW_REFERENCE,
+        expected_ref: "refs/tags/v1",
+        required_equalities: [
+          `selected-path-equals-${REUSABLE_WORKFLOW_REFERENCE}`,
+          "selected-ref-equals-refs/tags/v1",
+          "selected-sha-equals-receipt-producer-job-workflow_sha",
+          "selected-sha-equals-validated-release-provenance-action-commit_oid",
+          "selected-path-repository-and-file-equal-receipt-producer-job-workflow_repository-and-workflow_file_path",
+        ],
+        rerun_resolution:
+          "Validate referenced_workflows from the exact receipt run attempt; never substitute the current v1 target or evidence from another attempt.",
+        tag_drift:
+          "A later v1 move does not change the exact called-workflow SHA recorded for an earlier run attempt.",
+        authority:
+          "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding",
+      },
+    },
+  );
+  assert.deepEqual(
+    table.producer_receipt_boundary.called_workflow_authority,
+    {
+      availability: "github.com-only-job-context",
+      repository: ACTION_REPOSITORY,
+      workflow_file_path: REUSABLE_WORKFLOW_PATH,
+      caller_selector: "v1",
+      caller_ref: "refs/tags/v1",
+      caller_identity_role:
+        "producer.environment.GITHUB_WORKFLOW_REF/SHA-identifies-caller-workflow-file",
+      called_job_identity_role:
+        "producer.job.workflow_ref/SHA/repository/file_path-identifies-workflow-file-defining-current-job",
+      required_equalities: [
+        `receipt-producer-job-workflow_repository-equals-${ACTION_REPOSITORY}`,
+        `receipt-producer-job-workflow_file_path-equals-${REUSABLE_WORKFLOW_PATH}`,
+        `receipt-producer-job-workflow_ref-equals-${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@refs/tags/v1`,
+        "receipt-producer-job-workflow_sha-is-lower-case-40-hex",
+        "receipt-producer-job-workflow_sha-equals-validated-release-provenance-action-commit_oid",
+        "receipt-producer-action-repository-equals-receipt-producer-job-workflow_repository",
+        "receipt-producer-action-ref-equals-receipt-producer-job-workflow_sha",
+        "receipt-producer-action-commit_sha-equals-receipt-producer-job-workflow_sha",
+        "receipt-producer-action-immutable-is-true",
+      ],
+      caller_called_sha_domain_separation:
+        "GITHUB_WORKFLOW_SHA identifies the caller workflow file and must not be required to equal producer.job.workflow_sha for a reusable invocation.",
     },
   );
   assert.equal(
     table.producer_receipt_boundary.head_domain_separation
       .workflow_run_head_may_differ_from_status_and_pull_request_head,
     true,
+  );
+  assert.deepEqual(
+    table.producer_receipt_boundary.head_domain_separation
+      .consumer_must_not_require,
+    [
+      "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
+      "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha",
+      "exact-run-attempt-head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
+      "receipt-producer-environment-GITHUB_WORKFLOW_SHA-equals-receipt-producer-job-workflow_sha",
+    ],
   );
   assert.deepEqual(
     table.producer_receipt_boundary.positive_consumer_requirement,
@@ -333,24 +561,32 @@ test("decision table freezes the release-1.4 verdict and receipt boundary", () =
   assert.doesNotMatch(raw.toString("utf8"), /<[^<>]+>/);
 });
 
-test("head binding contract permits workflow-run head to differ from PR status head", () => {
+test("head domains separate run, caller, called workflow, and PR status", () => {
   const table = JSON.parse(readFileSync(decisionTablePath, "utf8"));
   const workflowRunHead = "1".repeat(40);
   const currentPullRequestHead = "2".repeat(40);
+  const callerWorkflowSha = "3".repeat(40);
+  const calledWorkflowSha = "4".repeat(40);
   const receipt = {
     producer: {
-      environment: { GITHUB_WORKFLOW_SHA: workflowRunHead },
+      environment: { GITHUB_WORKFLOW_SHA: callerWorkflowSha },
+      job: { workflow_sha: calledWorkflowSha },
     },
     statuses: [{ head_sha: currentPullRequestHead }],
   };
-  const exactRunAttempt = { head_sha: workflowRunHead };
+  const exactRunAttempt = {
+    head_sha: workflowRunHead,
+    referenced_workflows: [{ sha: calledWorkflowSha }],
+  };
   const artifact = { workflow_run: { head_sha: workflowRunHead } };
   const restStatusListRequest = { ref: currentPullRequestHead };
   const graphQlStatusContext = { commit: { oid: currentPullRequestHead } };
 
+  assert.notEqual(exactRunAttempt.head_sha, callerWorkflowSha);
+  assert.notEqual(callerWorkflowSha, calledWorkflowSha);
   assert.equal(
-    exactRunAttempt.head_sha,
-    receipt.producer.environment.GITHUB_WORKFLOW_SHA,
+    exactRunAttempt.referenced_workflows[0].sha,
+    receipt.producer.job.workflow_sha,
   );
   assert.equal(artifact.workflow_run.head_sha, exactRunAttempt.head_sha);
   assert.equal(receipt.statuses[0].head_sha, currentPullRequestHead);
@@ -366,13 +602,35 @@ test("head binding contract permits workflow-run head to differ from PR status h
 
 test("generator emits deterministic complete post-merge provenance", (t) => {
   const fixture = createFixture(t);
-  const firstOutput = join(fixture.root, "v1.4.0-release-provenance.json");
+  const firstOutput = join(fixture.root, "v1.5.0-release-provenance.json");
   const first = runGenerator(generatorArguments(fixture, firstOutput));
   assert.equal(first.status, 0, first.stderr);
 
   const firstBytes = readFileSync(firstOutput);
   assert.match(first.stdout, new RegExp(`sha256:${digest(firstBytes)}`));
   const manifest = JSON.parse(firstBytes.toString("utf8"));
+  assert.equal(manifest.schema, PROVENANCE_SCHEMA_ID);
+  assert.equal(manifest.schema_version, 2);
+  assert.equal(manifest.release, RELEASE);
+  assert.deepEqual(manifest.compatibility, {
+    producer_protocol_major: 1,
+    github_immutable_release_required: true,
+    receipt_schema: {
+      schema_id: RECEIPT_SCHEMA_ID,
+      schema_version: 1,
+    },
+    decision_table: {
+      schema_id: DECISION_TABLE_SCHEMA_ID,
+      schema_version: 1,
+      policy_major: 1,
+      policy_version: "1.4.0",
+    },
+    called_workflow: {
+      repository: ACTION_REPOSITORY,
+      path: REUSABLE_WORKFLOW_PATH,
+      caller_selector: "v1",
+    },
+  });
   const sourceActionTree = gitText(fixture.sourceRepo, [
     "rev-parse",
     `${fixture.sourceCommit}:packages/action`,
@@ -389,6 +647,8 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
   assert.equal(manifest.proofs.source_subtree_equals_action_root, true);
   assert.equal(manifest.proofs.all_tag_signatures_verified, false);
   assert.equal(manifest.proofs.production_signature_verification_required, true);
+  assert.equal(manifest.proofs.revocation_freshness_checked, false);
+  assert.equal(manifest.proofs.runtime_external_action_set_closed, true);
   assert.equal(manifest.proofs.release_asset_is_signed_attestation, false);
   assert.equal(
     manifest.action.canonical_uses,
@@ -400,9 +660,58 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
   );
   assert.ok(
     Object.values(manifest.tags).every(
-      (entry) => entry.annotated && entry.signature.method === "test-only-skip",
+      (entry) =>
+        entry.annotated &&
+        entry.signature.method === "test-only-skip" &&
+        entry.signature.signing_key_fingerprint === null &&
+        entry.signature.primary_key_fingerprint === null,
     ),
   );
+  assert.deepEqual(Object.keys(manifest.tags), ["v1.5.0", "v1.5", "v1"]);
+  const expectedSourceCheckout = {
+    uses: `actions/checkout@${CHECKOUT_SHA}`,
+    repository: "${{ job.workflow_repository }}",
+    ref: "${{ job.workflow_sha }}",
+    path: REUSABLE_WORKFLOW_CHECKOUT_PATH,
+    persist_credentials: false,
+  };
+  assert.deepEqual(
+    manifest.runtime_closure.source_checkout,
+    expectedSourceCheckout,
+  );
+  assert.deepEqual(manifest.runtime_closure.local_action_use, {
+    release_path: REUSABLE_WORKFLOW_PATH,
+    source_path: `packages/action/${REUSABLE_WORKFLOW_PATH}`,
+    uses: REUSABLE_WORKFLOW_LOCAL_ACTION_USE,
+  });
+  assert.deepEqual(manifest.runtime_closure.external_actions, [
+    {
+      release_path: REUSABLE_WORKFLOW_PATH,
+      source_path: `packages/action/${REUSABLE_WORKFLOW_PATH}`,
+      uses: `actions/checkout@${CHECKOUT_SHA}`,
+      repository: "actions/checkout",
+      commit_sha: CHECKOUT_SHA,
+    },
+    {
+      release_path: "action.yml",
+      source_path: "packages/action/action.yml",
+      uses: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
+      repository: "actions/upload-artifact",
+      commit_sha: UPLOAD_ARTIFACT_SHA,
+    },
+  ]);
+  assert.deepEqual(manifest.runtime_closure.called_workflow, {
+    repository: ACTION_REPOSITORY,
+    caller_selector: "v1",
+    caller_reference: REUSABLE_WORKFLOW_REFERENCE,
+    immutable_reference:
+      `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${fixture.actionCommit}`,
+    resolved_commit_oid: fixture.actionCommit,
+    release_path: REUSABLE_WORKFLOW_PATH,
+    source_path: `packages/action/${REUSABLE_WORKFLOW_PATH}`,
+    blob_oid: manifest.critical_files.reusable_workflow.blob_oid,
+    raw_sha256: manifest.critical_files.reusable_workflow.raw_sha256,
+  });
 
   const rawTree = git(
     fixture.actionRepo,
@@ -443,9 +752,22 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
     manifest.critical_files.decision_table.policy_version,
     "1.4.0",
   );
+  assert.equal(manifest.critical_files.decision_table.policy_major, 1);
   assert.equal(
     manifest.critical_files.decision_table.frozen_admission_sha256,
     digest(readFileSync(decisionTablePath)),
+  );
+  assert.equal(
+    manifest.critical_files.producer_receipt_schema.frozen_admission_sha256,
+    digest(readFileSync(receiptSchemaPath)),
+  );
+  assert.equal(
+    manifest.critical_files.action_definition.frozen_admission_sha256,
+    digest(readFileSync(actionDefinitionPath)),
+  );
+  assert.equal(
+    manifest.critical_files.reusable_workflow.frozen_admission_sha256,
+    digest(readFileSync(reusableWorkflowPath)),
   );
   assert.equal(
     manifest.contracts.producer_receipt.run_attempt_api.route,
@@ -457,8 +779,49 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
       "id-equals-receipt-producer-run-id",
       "run_attempt-equals-receipt-producer-run-attempt",
       "repository-full_name-equals-receipt-producer-repository",
-      "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
     ],
+  );
+  assert.deepEqual(
+    manifest.contracts.producer_receipt.run_attempt_api.referenced_workflows,
+    {
+      field: "referenced_workflows",
+      availability:
+        "optional-nullable-upstream-but-required-non-null-for-this-reusable-workflow-contract",
+      selection: "exactly-one-exact-called-workflow-member",
+      expected_path: REUSABLE_WORKFLOW_REFERENCE,
+      expected_ref: "refs/tags/v1",
+      expected_sha: fixture.actionCommit,
+      required_equalities: [
+        `selected-path-equals-${REUSABLE_WORKFLOW_REFERENCE}`,
+        "selected-ref-equals-refs/tags/v1",
+        "selected-sha-equals-receipt-producer-job-workflow_sha",
+        "selected-sha-equals-validated-release-provenance-action-commit_oid",
+        "selected-path-repository-and-file-equal-receipt-producer-job-workflow_repository-and-workflow_file_path",
+      ],
+      rerun_resolution:
+        "exact-receipt-run-attempt-only-no-current-selector-substitution",
+      tag_drift:
+        "later-v1-movement-does-not-change-historical-attempt-sha",
+      authority:
+        "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding",
+    },
+  );
+  assert.equal(
+    manifest.contracts.producer_receipt.called_workflow_authority.accepted_resolved_sha,
+    fixture.actionCommit,
+  );
+  assert.deepEqual(
+    manifest.contracts.producer_receipt.exact_action_bindings,
+    [
+      "producer.action.repository-equals-producer.job.workflow_repository",
+      "producer.action.ref-equals-producer.job.workflow_sha",
+      "producer.action.commit_sha-equals-producer.job.workflow_sha",
+      "producer.action.immutable-is-true",
+    ],
+  );
+  assert.deepEqual(
+    manifest.contracts.producer_receipt.source_checkout,
+    expectedSourceCheckout,
   );
   assert.equal(
     manifest.contracts.producer_receipt.artifact_inventory_api.route,
@@ -529,8 +892,23 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
   );
   assert.ok(
     !manifest.contracts.producer_receipt.run_attempt_api.required_equalities.includes(
-      "head_sha-equals-selected-receipt-status-head_sha",
+      "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
     ),
+  );
+  assert.equal(
+    manifest.contracts.producer_receipt.head_domain_separation
+      .caller_workflow_sha_may_differ_from_called_workflow_sha,
+    true,
+  );
+  assert.deepEqual(
+    manifest.contracts.producer_receipt.head_domain_separation
+      .consumer_must_not_require,
+    [
+      "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
+      "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha",
+      "exact-run-attempt-head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
+      "receipt-producer-environment-GITHUB_WORKFLOW_SHA-equals-receipt-producer-job-workflow_sha",
+    ],
   );
   assert.equal(manifest.contracts.status.rest.get_by_id_available, false);
 
@@ -538,6 +916,146 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
   const second = runGenerator(generatorArguments(fixture, secondOutput));
   assert.equal(second.status, 0, second.stderr);
   assert.deepEqual(readFileSync(secondOutput), firstBytes);
+});
+
+test("GnuPG status parser records distinct signing and primary fingerprints", () => {
+  const signingKeyFingerprint = "1".repeat(40);
+  const primaryKeyFingerprint = "2".repeat(40);
+  const result = {
+    stdout: Buffer.from(
+      `[GNUPG:] GOODSIG ${signingKeyFingerprint} Release Signing Subkey\n` +
+        `[GNUPG:] VALIDSIG ${signingKeyFingerprint} 2026-08-09 0 0 0 0 0 0 00 ${primaryKeyFingerprint}\n`,
+      "utf8",
+    ),
+    stderr: Buffer.alloc(0),
+  };
+  assert.deepEqual(parseVerifiedOpenPgpStatus(result, "v1.5.0"), {
+    signingKeyFingerprint,
+    primaryKeyFingerprint,
+  });
+
+  for (const invalidLength of [41, 63]) {
+    const invalidFingerprint = "3".repeat(invalidLength);
+    assert.throws(
+      () =>
+        parseVerifiedOpenPgpStatus(
+          {
+            stdout: Buffer.from(
+              "[GNUPG:] GOODSIG 3333333333333333 Invalid Length\n" +
+                `[GNUPG:] VALIDSIG ${invalidFingerprint} 2026-08-09 0 0 0 0 0 0 00 ${primaryKeyFingerprint}\n`,
+              "utf8",
+            ),
+            stderr: Buffer.alloc(0),
+          },
+          "invalid tag",
+        ),
+      /inconsistent GOODSIG\/VALIDSIG identity/,
+    );
+  }
+});
+
+test("final pre-publication ref-race failure publishes no manifest", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-publish-race-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "release-provenance.json");
+  const phases = [];
+
+  await assert.rejects(
+    writeManifest(
+      output,
+      { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 },
+      {
+        beforePublish: () => {
+          phases.push("before-publication");
+          assert.equal(existsSync(output), false);
+        },
+        finalPrePublish: () => {
+          phases.push("final-pre-publication");
+          assert.equal(existsSync(output), false);
+          throw new Error("simulated final pre-publication ref drift");
+        },
+      },
+    ),
+    /simulated final pre-publication ref drift/,
+  );
+  assert.deepEqual(phases, ["before-publication", "final-pre-publication"]);
+  assert.equal(existsSync(output), false);
+});
+
+test("manifest publication never overwrites an existing output", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-existing-output-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "release-provenance.json");
+  const existing = Buffer.from("known-good-existing-manifest\n", "utf8");
+  writeFileSync(output, existing, { mode: 0o600 });
+
+  await assert.rejects(
+    writeManifest(output, {
+      schema: PROVENANCE_SCHEMA_ID,
+      schema_version: 2,
+    }),
+    /output already exists; refusing to replace/,
+  );
+  assert.deepEqual(readFileSync(output), existing);
+});
+
+test("concurrent output creation is preserved instead of overwritten", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-concurrent-output-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "release-provenance.json");
+  const replacement = Buffer.from("concurrent-publisher-manifest\n", "utf8");
+
+  await assert.rejects(
+    writeManifest(
+      output,
+      { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 },
+      {
+        finalPrePublish: () => {
+          writeFileSync(output, replacement, { flag: "wx", mode: 0o600 });
+        },
+      },
+    ),
+    /output already exists; refusing to replace/,
+  );
+  assert.deepEqual(readFileSync(output), replacement);
+});
+
+test("same-process concurrent invocations cannot collide on private staging", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-concurrent-stage-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "release-provenance.json");
+  let releaseFirst;
+  let reportFirstReady;
+  const firstReady = new Promise((resolveReady) => {
+    reportFirstReady = resolveReady;
+  });
+  const firstMayPublish = new Promise((resolvePublish) => {
+    releaseFirst = resolvePublish;
+  });
+
+  const first = assert.rejects(
+    writeManifest(
+      output,
+      { invocation: "first" },
+      {
+        finalPrePublish: async () => {
+          reportFirstReady();
+          await firstMayPublish;
+        },
+      },
+    ),
+    /output already exists; refusing to replace/,
+  );
+  await firstReady;
+
+  const secondManifest = { invocation: "second" };
+  await writeManifest(output, secondManifest);
+  releaseFirst();
+  await first;
+  assert.deepEqual(
+    JSON.parse(readFileSync(output, "utf8")),
+    secondManifest,
+  );
 });
 
 test("production generation rejects unsigned annotated tags", (t) => {
@@ -595,6 +1113,127 @@ test("generation rejects a weakened positive consumer status requirement", (t) =
   assert.equal(existsSync(output), false);
 });
 
+test("generation rejects a mutated receipt v1 schema", (t) => {
+  const fixture = createFixture(t, { mutateReceiptSchema: true });
+  const output = join(fixture.root, "mutated-receipt-schema.json");
+  const result = runGenerator(generatorArguments(fixture, output));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reviewed frozen receipt v1 schema/);
+  assert.equal(existsSync(output), false);
+});
+
+test("generation rejects reusable workflow authority mutations", async (t) => {
+  const cases = [
+    {
+      name: "policy major",
+      options: { mutatePolicyMajor: true },
+      pattern: /decision table identity contradicts compatibility policy/,
+    },
+    {
+      name: "called repository",
+      options: { wrongCalledRepository: true },
+      pattern: /called workflow authority contradicts release policy/,
+    },
+    {
+      name: "called path",
+      options: { wrongCalledPath: true },
+      pattern: /called workflow authority contradicts release policy/,
+    },
+    {
+      name: "called ref",
+      options: { wrongCalledRef: true },
+      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
+    },
+    {
+      name: "called sha binding",
+      options: { wrongCalledShaBinding: true },
+      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
+    },
+    {
+      name: "tag drift",
+      options: { mutateTagDriftContract: true },
+      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
+    },
+    {
+      name: "rerun substitution",
+      options: { mutateRerunContract: true },
+      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
+    },
+  ];
+  for (const testCase of cases) {
+    await t.test(testCase.name, () => {
+      const fixture = createFixture(t, testCase.options);
+      const output = join(fixture.root, `${testCase.name.replaceAll(" ", "-")}.json`);
+      const result = runGenerator(generatorArguments(fixture, output));
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, testCase.pattern);
+      assert.equal(existsSync(output), false);
+    });
+  }
+});
+
+test("generation rejects an open or mutated runtime closure", async (t) => {
+  await t.test("floating external action", () => {
+    const fixture = createFixture(t, { floatingCheckout: true });
+    const output = join(fixture.root, "floating-runtime-action.json");
+    const result = runGenerator(generatorArguments(fixture, output));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
+    assert.equal(existsSync(output), false);
+  });
+
+  await t.test("extra pinned external action", () => {
+    const fixture = createFixture(t, { extraExternalAction: true });
+    const output = join(fixture.root, "extra-runtime-action.json");
+    const result = runGenerator(generatorArguments(fixture, output));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
+    assert.equal(existsSync(output), false);
+  });
+
+  const bindingMutations = [
+    ["wrong checkout repository", { wrongCheckoutRepository: true }],
+    ["wrong checkout ref", { wrongCheckoutRef: true }],
+    ["wrong checkout path", { wrongCheckoutPath: true }],
+    ["persisted checkout credentials", { persistCheckoutCredentials: true }],
+  ];
+  for (const [name, options] of bindingMutations) {
+    await t.test(name, () => {
+      const fixture = createFixture(t, options);
+      const output = join(fixture.root, `${name.replaceAll(" ", "-")}.json`);
+      const result = runGenerator(generatorArguments(fixture, output));
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
+      assert.equal(existsSync(output), false);
+    });
+  }
+
+  await t.test("wrong local action path", () => {
+    const fixture = createFixture(t, { wrongLocalActionUse: true });
+    const output = join(fixture.root, "wrong-local-action-path.json");
+    const result = runGenerator(generatorArguments(fixture, output));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
+    assert.equal(existsSync(output), false);
+  });
+
+  const nonCanonicalYamlCases = [
+    ["flow-style uses mapping", { flowExternalUse: true }],
+    ["quoted uses mapping", { quotedExternalUse: true }],
+    ["anchor alias step", { anchorCheckoutAlias: true }],
+  ];
+  for (const [name, options] of nonCanonicalYamlCases) {
+    await t.test(name, () => {
+      const fixture = createFixture(t, options);
+      const output = join(fixture.root, `${name.replaceAll(" ", "-")}.json`);
+      const result = runGenerator(generatorArguments(fixture, output));
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
+      assert.equal(existsSync(output), false);
+    });
+  }
+});
+
 test("generation rejects a consumer contract that conflates workflow-run and PR heads", (t) => {
   const fixture = createFixture(t, {
     conflateRunAndPullRequestHeads: true,
@@ -627,7 +1266,7 @@ test("generation rejects nested tags and unresolved placeholders", async (t) => 
     git(fixture.actionRepo, [
       "tag",
       "-a",
-      "v1.4.0-inner",
+      "v1.5.0-inner",
       fixture.actionCommit,
       "-m",
       "inner fixture",
@@ -636,8 +1275,8 @@ test("generation rejects nested tags and unresolved placeholders", async (t) => 
       "tag",
       "-f",
       "-a",
-      "v1.4.0",
-      "refs/tags/v1.4.0-inner",
+      "v1.5.0",
+      "refs/tags/v1.5.0-inner",
       "-m",
       "nested fixture",
     ]);
@@ -665,7 +1304,7 @@ test("generation rejects duplicate YAML keys and non-UTF8 release paths", async 
       generatorArguments(fixture, join(fixture.root, "duplicate-yaml.json")),
     );
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /exactly one inputs block and one inputs\.status-context/);
+    assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
   });
 
   await t.test("non-UTF8 path", () => {

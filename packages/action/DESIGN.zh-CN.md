@@ -17,7 +17,8 @@ authority。
 每次运行都会重新构建所需 GitHub evidence，而不会把 sticky state comment 或
 commit-status history 当作判定来源。
 封闭 reducer policy 的机器可读权威表是
-[`decision-table.json`](decision-table.json)，当前为 `policy_version: 1.4.0`。
+[`decision-table.json`](decision-table.json)，当前为 `policy_major: 1`、
+`policy_version: 1.4.0`。
 
 结果优先级如下：
 
@@ -181,22 +182,53 @@ Gate 是 event-driven 的。Workflow runs 会创建 markers、triage Codex signa
 - `pull_request_target` 的 `opened`、`reopened`、`ready_for_review` 和 `synchronize`
 - `issue_comment` 的 `created`
 - `pull_request_review` 的 `submitted`
+- `pull_request_review_comment` 的 `created`
 - `schedule` 用于自动 retry scans
 - `workflow_dispatch` 用于手动恢复
 
-`pull_request_review_comment` 是可选项。它属于 `full` event mode，适合希望最快 triage inline findings，并接受一个有大量 inline comments 的 PR 可能触发更多 workflow runs 的仓库。
+Reusable workflow 的 job filter 只在 `full` event mode 下 admit
+`pull_request_review_comment`。薄 caller 始终保留该 event，使未来 mode 切换无需复制可信
+filter logic。
 
-Workflow 必须运行可信 default branch 上的 action code。它不能在 `pull_request_target` events 中 checkout 或执行 PR 提供的代码。
+Canonical GitHub.com caller 只包含 events、caller permission ceiling、repository-wide
+concurrency 与下面这个 calling job：
 
-Workflow 应使用一个 repository-wide concurrency group，并设置 `cancel-in-progress: false`。Scheduled scans 可以修改任何 open PR，所以它们不能和 PR-specific Codex signal runs 并发运行。
+```yaml
+jobs:
+  codex-review-gate:
+    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1
+```
+
+Floating `@v1` alias 是集中式 pre-execution trust delegation。Called workflow 负责可信
+job filters、runner selection 与 steps。它用 full-SHA-pinned checkout，指定
+`repository: ${{ job.workflow_repository }}` 与 `ref: ${{ job.workflow_sha }}`，只 materialise
+resolved called release；绝不使用 bare checkout、checkout PR code，或在
+`pull_request_target` event 中执行 PR 提供的代码。
+
+Caller 只应授权 `contents: read`、`issues: write`、`pull-requests: write` 与
+`statuses: write`；called workflow 不能提升 token 权限。Caller 应负责唯一的
+repository-wide concurrency group，并设置 `cancel-in-progress: false`。Scheduled scans
+可以修改任何 open PR，所以不能和 PR-specific Codex signal runs 并发运行。禁止在
+called workflow 内重复相同 repository-wide group。
+
+Release PR 期间该 caller 只是 staged，不会在 source root 或 template 中激活。必须先完成
+immutable v1.5.0 release 与 provenance asset、验证 `v1.5` 和 `v1` aliases、通过 live
+canary，再由独立 activation PR 启用。
 
 ## Invocation Provenance Boundary
 
-Canonical workflow 必须 pin action release 仓库中的 exact 40-hex commit。在 subtree
-split 生成前，源码文档使用
-`JoeyTeng/codex-review-gate-action@<v1.4.0-action-commit-sha>`；v1.4.0 release notes 与
-release provenance manifest 会发布 exact replacement。Floating `@v1.4` 与 `@v1`
-aliases 只用于 convenience，绝不承载 canonical invocation provenance。
+Activation 后，canonical GitHub.com workflow 调用
+`JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`。
+Floating major alias 是刻意设置的集中式 pre-execution trust boundary，不是 post-run
+immutable provenance。Post-run consumer 通过 receipt、exact-attempt API evidence，以及
+trusted primary signer 签名的 immutable v1.x.y release 与 provenance asset，动态 admit
+exact `job.workflow_sha`。Caller 与消费 Skill 都不固定 v1.5 SHA。
+
+Direct composite 继续兼容，但 action ref 必须是 exact lower-case 40-SHA。GitHub
+Enterprise Server 不提供 `job.workflow_*` called-workflow identity，因此该方式是其
+fallback。Structural mode 在 validation 前选定；reusable mode validation 失败绝不授权
+downgrade 到 direct mode。Receipt-backed positive provenance path 同样仅适用于
+GitHub.com；GHES fallback 保留 direct gate operation，不提供该 admission claim。
 
 Commit Status fields 不能证明实际运行的是哪一份 action code。Status head SHA、
 `context`、`creator` 和 `target_url` 可用作 consistency checks，但持有
@@ -211,20 +243,30 @@ open PR 共享同一 head SHA 时，会天然共享该 status 与 branch-protect
 
 ### Producer receipt v1
 
-在 GitHub.com 上，composite action 会生成由 `producer-receipt.schema.json` 定义、schema
+在 GitHub.com 上，composite Action 会生成由 `producer-receipt.schema.json` 定义、schema
 ID 为 `urn:joeyteng:codex-review-gate:producer-receipt:1` 的 v1 receipt。Receipt 会捕获
 `GITHUB_WORKFLOW_REF`、`GITHUB_WORKFLOW_SHA`、`job.workflow_ref`、
 `job.workflow_sha`、`job.workflow_repository`、`job.workflow_file_path`、
 `github.action_repository` 和 `github.action_ref`。`job.workflow_*` contexts 与本
 producer-receipt contract 仅适用于 GitHub.com。
 
-只有 lower-case exact 40-SHA `github.action_ref` 具备 authority。它会复制到
-`producer.action.commit_sha`，并设置 `immutable: true`。Floating tag、branch 或 local
-action invocation 会得到 `immutable: false`，不能用作 provenance。Receipt 的 run target
-必须精确为
+对于 canonical reusable tuple，exact repository、workflow file、`refs/tags/v1` job ref
+与 lower-case 40-SHA `job.workflow_sha` 会把该 SHA 映射为 `producer.action.ref` 与
+`producer.action.commit_sha`，并设置 `immutable: true`。即使 nested action context 同时
+存在，该 canonical job tuple 仍优先。只有 reusable tuple 非 canonical 时，direct mode
+才沿用 independently exact lower-case 40-SHA `github.action_ref` 的既有 immutable
+mapping。Near-canonical reusable tuple 绝不升级 identity，也不提供 fallback。若没有该
+exact direct ref，floating、near-canonical 或 local invocation 会得到
+`immutable: false`，不能用作 provenance。Receipt 的 run target 必须精确为
 `https://github.com/<owner>/<repository>/actions/runs/<run_id>/attempts/<attempt>`。
 该 attempt path 也是 Workflow Run request endpoint。Response `url` 与 `html_url` 仍是
 base-run resource URLs，不要求等于 attempt-specific target。
+
+在 called workflow 内，`github.workflow_ref` 与 `github.workflow_sha` 保留 caller
+identity。Called job implementation identity 改由 `job.workflow_repository`、
+`job.workflow_file_path`、`job.workflow_ref` 与 `job.workflow_sha` 提供。Exact
+self-checkout 必须使用 job repository/SHA pair；bare checkout 会 materialise caller
+repository。
 
 Receipt enabled 时，每次 `setCommitStatusIfNeeded` decision 都会强制从当前 run attempt
 执行 POST，而不会复用较早的 matching status。Producer 要求每次 POST 的 REST response
@@ -244,9 +286,14 @@ creation；consumer 的 final inventory check 要求 artifact 恰好一个。
 
 ### Consumer validation
 
-Review 或 readiness skill 必须把 run-attempt head domain 与 current-PR/status head
-domain 分开校验；只有全部检查通过才可继续，否则必须 fail closed。机器可读的
-权威合同是 [`decision-table.json`](decision-table.json) 中的
+Review 或 readiness Skill 必须分开保留四个 SHA domain：caller workflow definition
+（`github.workflow_sha`）、exact API run-attempt head（`head_sha`）、called
+implementation（`job.workflow_sha`）与 current PR/status head。禁止要求 run-attempt
+`head_sha` 或 Artifact API `workflow_run.head_sha` 等于 selected receipt status head；
+禁止要求 run-attempt head 等于 `GITHUB_WORKFLOW_SHA`；也禁止要求
+`GITHUB_WORKFLOW_SHA` 等于 `job.workflow_sha`。Caller workflow SHA 标识 caller
+workflow revision。只有全部检查通过才可继续，否则必须 fail closed。机器可读的权威合同是
+[`decision-table.json`](decision-table.json) 中的
 `producer_receipt_boundary`：
 
 1. 使用 Artifact API 查询 exact repository、run 和 attempt-specific artifact name，并
@@ -256,21 +303,35 @@ domain 分开校验；只有全部检查通过才可继续，否则必须 fail c
    output web URL 后再与 upload output 比对。REST artifact `.url` 是 API URL，不能直接
    与它相等比较。Upload output digest 必须是 raw 64-hex SHA-256，REST `.digest` 必须
    精确等于 `sha256:<raw-output-digest>`。下载 artifact、校验 digest，并要求其中恰好一个
-   expected file。使用 exact pinned published action commit root 的
-   `producer-receipt.schema.json` 校验 JSON；同一 schema 在本 source repository 中的路径是
+   expected file。使用 dynamically admitted called commit 或 directly pinned action
+   commit root 的 `producer-receipt.schema.json` 校验 JSON；同一 schema 在本 source repository 中的路径是
    `packages/action/producer-receipt.schema.json`。
 2. Receipt schema 允许 finalized `execution.result` 为 `completed` 或 `failed`，但
    positive review 或 readiness decision 必须要求 `execution.result == completed`；
    `failed` receipt 仍可作为 audit evidence，但不能支持 positive decision。还要要求 run
    ID/attempt/name/target URL 完全一致，server 为 `https://github.com`，repository 为当前
-   目标，所有预期 workflow/job fields 一致；同时要求 exact expected action repository 和
-   40-SHA，且 `immutable: true`。通过 attempt-specific request endpoint 取得 run attempt；
-   不要求 response `url` 或 `html_url` 为 attempt-specific。在这个 run-attempt head
-   domain 中，exact run-attempt response `head_sha` 必须等于
-   `receipt.producer.environment.GITHUB_WORKFLOW_SHA`；Artifact API record 的
-   `workflow_run.id` 与 `workflow_run.head_sha` 必须分别等于 exact run-attempt
-   response 的 `id` 与 `head_sha`。
-3. 在 current-PR/status head domain 中，通过 REST 列出全部 Commit Status
+   目标，所有预期 caller/workflow/job fields 一致。显式选择一个 structural mode：reusable
+   要求 exact canonical job tuple，以及映射后的 action repository 与 job SHA with
+   `immutable: true`；direct 要求 expected action repository 与 exact lower-case 40-SHA
+   with `immutable: true`。
+3. 通过 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}` 取得 run
+   attempt；不要求 response `url` 或 `html_url` 为 attempt-specific。Artifact API record
+   的 `workflow_run.id` 与 `workflow_run.head_sha` 必须分别等于 exact attempt response 的
+   `id` 与 `head_sha`。API schema 中的 `referenced_workflows` optional 且 nullable；但在
+   reusable mode 的 positive admission 中，必须要求它存在，并恰好含有一个 matching
+   canonical repository/workflow-path 与 v1-call entry。其 required `sha` 必须等于
+   `job.workflow_sha`、receipt action commit 与已 admitted release-provenance
+   `action.commit_oid`；其 `ref` 必须存在且等于 `refs/tags/v1`。该 array 只是 run-level
+   corroboration：GitHub 没有定义
+   entry-to-job、entry-to-receipt map 或 cryptographic binding。
+4. Reusable mode 只有下列证据齐备才能 admit called SHA：trusted primary signer 签名且
+   直接 peel 到该 SHA 的 annotated immutable `v1.x.y` tag、REST record
+   `immutable: true` 的对应 GitHub Release，以及完整 release-provenance schema-v2
+   asset；repository immutable-release setting 也必须 enabled。校验 trusted signer fingerprint、
+   commit/tree/critical-file bindings、receipt schema v1 与兼容的
+   `policy_major == 1`。历史 authority 必须来自这些 immutable records，禁止从当前 `v1`
+   target 推断。
+5. 在 current-PR/status head domain 中，通过 REST 列出全部 Commit Status
    records 时，request `ref` 必须等于 exact current PR head；selected status 必须
    来自该 exact-head response。使用 case-insensitive context comparison 选择该
    logical context 的 latest record；随后要求
@@ -283,21 +344,27 @@ domain 分开校验；只有全部检查通过才可继续，否则必须 fail c
    也必须独立精确为
    `github-actions[bot]` 且 type 为 `Bot`，其 `pull_request_number` 必须等于 selected
    current PR；membership 缺失或不唯一时 fail closed，且 receipt 没有 top-level creator。
-4. 通过 GraphQL 把该 node 重新读取为 `StatusContext`。在 selected receipt status、
+6. 通过 GraphQL 把该 node 重新读取为 `StatusContext`。在 selected receipt status、
    REST record 与 GraphQL node 之间，要求 exact context、state 与 target URL 一致。
    `StatusContext.commit.oid` 必须等于 exact current PR head，因此也必须等于
-   selected receipt status `head_sha`；同时保留 receipt/run/current state 中 action SHA 与
+   selected receipt status `head_sha`；同时保留 receipt/run/current state 中 called SHA 与
    workflow/job bindings。GraphQL creator 还必须独立精确为
    `github-actions[bot]` 且 type 为 `Bot`；仅 creator 彼此一致并不充分。
-   `StatusContext` 不提供 PR isolation。Exact run-attempt/artifact `head_sha` 可以合法地与这个
-   current PR/status head 不同；consumer 禁止要求两个 head domain 相等。
-5. 按本设计为 selected receipt member 指定的同一个 PR，独立重新加载并归约 official
+   `StatusContext` 不提供 PR isolation。四个 SHA domains 都可以合法地不同；consumer
+   禁止臆造它们之间的 equality。
+7. 按本设计为 selected receipt member 指定的同一个 PR，独立重新加载并归约 official
    provider evidence。Valid receipt 既不证明 clean evidence，也不证明 merge readiness。
-6. Readiness 消费结果前，最后一次通过 REST 重列 exact-head statuses。Case-insensitive
+8. Readiness 消费结果前，最后一次通过 REST 重列 exact-head statuses。Case-insensitive
    logical latest 必须仍有相同 REST ID 与 node ID，并保留 exact expected context；同时
    stable re-read PR head/lifecycle、exact run-attempt metadata 与使用 attempt-specific
    name 查询的 run-level artifact inventory，且 inventory 仍须恰好一个 artifact。独立归约的 provider snapshot
    与此前所有 bindings 都必须保持 stable；发生变化时做有界重试，随后 fail closed。
+
+Canonical reusable caller 接受兼容的 v1.x Action-only release 时无需修改 caller 或
+Skill；direct caller 必须更新 exact pin。Protocol 或 policy major 变化必须协调升级
+Skill。Point-in-time verification 不保证 signer、key、tag、signature
+或 release 的 historical/future revocation freshness；需要此类 guarantee 的 consumer
+必须执行独立 revocation/freshness policy。
 
 Status creation 与 artifact upload 不是 atomic，已上传 artifact 之后也可能过期或被
 删除。Upload failure、Artifact API absence 或 `total_count != 1`、unfinished execution、
@@ -355,7 +422,7 @@ pass、failure 或 error verdict authority。
 `eyes` reactions 是 liveness signals。Gate 会检查 PR-body reactions 和 active marker comment 上的 reactions。它们会把 `WaitingAck` 推进到 `WaitingResult`，但不会让 gate 通过。
 它们保留现有 deadline，绝不 reset 或延长。
 
-v1.4 timeout contract 保持不变：initial marker acknowledgement 300 秒、maximum
+v1 timeout contract 保持不变：initial marker acknowledgement 300 秒、maximum
 acknowledgement backoff 1,800 秒、acknowledged result 3,600 秒、overall 7,200 秒。
 
 ### `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`

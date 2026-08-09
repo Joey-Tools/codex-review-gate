@@ -1,37 +1,97 @@
 # Releasing the Action Package
 
-The Marketplace repository is a subtree split of `packages/action`. Keep every file that must appear at the root of `JoeyTeng/codex-review-gate-action` inside that directory.
+Languages: [British English (en-GB)](RELEASING.md) | [简体中文 (zh-CN)](RELEASING.zh-CN.md)
+
+The Marketplace repository is a subtree split of `packages/action`. Everything
+needed at the root of `JoeyTeng/codex-review-gate-action`, including the
+reusable workflow, must live inside that directory.
+
+## Two-Phase Rollout Boundary
+
+This procedure prepares a future v1.5.0 release; completing source changes does
+not mean that the release has occurred.
+
+The release PR stages the reusable workflow only in `packages/action`. It must
+not activate the source-root caller, the repository template, or their root
+documentation. After the immutable v1.5.0 release and provenance are published,
+the `v1.5` and `v1` aliases are verified, and a live `@v1` canary passes, use a
+separate activation PR for those caller/template changes.
+
+This order ensures that no active source or template caller delegates
+pre-execution trust to `@v1` before immutable post-run authority exists.
 
 ## Preconditions
 
-- The source repository is on the release commit.
-- Both `package.json` and `packages/action/package.json` contain the same
-  release version.
-- `packages/action/producer-receipt.schema.json` and the machine-readable
-  [decision table](../packages/action/decision-table.json) are present; the
-  latter declares `policy_version: 1.4.0`. `packages/action/action.yml`
-  exact-pins `actions/upload-artifact` at
-  `ea165f8d65b6e75b540449e92b4886f43607fa02` (`v4.6.2`).
-- The action repository has a write-enabled deploy key, and the source repository stores the private key as an `ACTION_REPO_DEPLOY_KEY` secret. The sync workflow also accepts the legacy `ACTION_REPO_PUSH_TOKEN` secret name for this private key while existing repo configuration catches up.
-- For local manual publishing, the action remote is configured, for example:
+- The source release commit is merged to the exact `master` tip.
+- Root `package.json` and `packages/action/package.json` both declare `1.5.0`.
+- `packages/action/decision-table.json` declares `schema_version: 1`,
+  `policy_major: 1`, and `policy_version: 1.4.0`; its reviewed frozen raw
+  SHA-256 is
+  `3f0032df69e2015c1dfe198c20a141652b2dcaba520e8749a5d049d31ffd7ad3`.
+- Producer protocol major 1 and producer receipt schema v1 remain compatible.
+- `packages/action/.github/workflows/codex-review-gate.yml` exists. Its runtime
+  closure contains only full-SHA-pinned
+  `actions/checkout@11d5960a326750d5838078e36cf38b85af677262` and
+  `actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02`,
+  plus the local `./.codex-review-gate-action` use.
+- The called workflow checkout uses exact
+  `repository: ${{ job.workflow_repository }}`,
+  `ref: ${{ job.workflow_sha }}`, path `.codex-review-gate-action`, and
+  `persist-credentials: false`. It contains no bare or PR checkout.
+- The other reviewed frozen raw SHA-256 values match the generator constants:
+  `action.yml` is
+  `3b73835ec0e8dfb2305f0801ebaa7b3f9ea04e02c72392e822aabcd25d2093be`,
+  the reusable workflow is
+  `91720b868b972d947a65fa3cc408d8c866d83cf4d75032f6bfb597b014752bce`,
+  and `producer-receipt.schema.json` is
+  `89decfcabeeab817a975b1118498375c4eafe730b35e2cb9aa5c4abde6637b77`.
+- Source checks, package checks, tests, and the release split validation pass.
+- The action repository default branch can receive the verified subtree split.
+- The release operator has the trusted OpenPGP key available and has obtained
+  its expected primary-key fingerprint from the independently controlled
+  signer policy. Do not derive trust from a fingerprint first seen in the
+  candidate manifest.
+- The release operator's GitHub credential can read repository Administration
+  state for the immutable-release preflight.
+
+The action repository must have immutable releases enabled before any release
+ref is published. With GitHub REST API version `2026-03-10`, require HTTP 200
+and exact top-level `enabled: true` from
+`GET /repos/JoeyTeng/codex-review-gate-action/immutable-releases`; 404 or any
+other value fails closed. `enforced_by_owner` may be recorded but does not
+change admission. See GitHub's
+[repository endpoint](https://docs.github.com/en/rest/repos/repos?apiVersion=2026-03-10#check-if-immutable-releases-are-enabled-for-a-repository)
+and [immutable-release guidance](https://docs.github.com/en/enterprise-cloud@latest/code-security/concepts/supply-chain-security/immutable-releases).
 
 ```bash
 set -euo pipefail
 
-git remote add action git@github.com:JoeyTeng/codex-review-gate-action.git
+test "$(
+  gh api \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2026-03-10' \
+    repos/JoeyTeng/codex-review-gate-action/immutable-releases \
+    --jq '.enabled'
+)" = true
 ```
 
-## Automatic Default-Branch Sync
+The provenance generator records signature verification and fingerprints, but
+it does not decide which primary signer is trusted and it does not perform a
+revocation-freshness service check. Those are consumer/operator policy inputs.
 
-`.github/workflows/sync-action-subtree.yml` runs on pushes to `master` that touch `packages/action/**`, the sync workflow, or the release split script. It checks out full history, runs `scripts/release-action-subtree.sh --remote action --branch master --push --force-if-equivalent-parent`, and pushes only the computed subtree split commit to `JoeyTeng/codex-review-gate-action:master`.
+## Synchronise and Prove the Subtree
 
-The workflow does not create GitHub Releases and does not create or move tags. It normally uses a fast-forward push. It uses `--force-with-lease` only when the action repository branch is not an ancestor of the computed split commit and its tree exactly matches either the split commit tree or the split commit's parent tree, which covers equivalent subtree histories created by source-repository squash merges. If no deploy-key secret is configured, the action repository rejects direct pushes, or the action repository branch has diverged in content, the workflow fails instead of forcing an unsafe update.
+The canonical path is the automatic sync workflow. After the source release
+commit merges, select the exact `sync-action-subtree.yml` push run whose
+`headSha` equals that source commit, watch it to terminal `success`, and retain
+the run ID/URL/head SHA as release evidence. The workflow pushes only the
+computed `packages/action` split to
+`JoeyTeng/codex-review-gate-action:master`; it does not create releases or move
+tags. It normally fast-forwards and uses its guarded equivalent-parent lease
+path only for the documented squash-merge case.
 
-Manual workflow dispatch validates the split by default. Set `push_to_action_repo=true` only when you intentionally want the workflow to push the split commit.
-
-## Manual Validate and Split
-
-From the source repository root:
+Independently, in a fresh full-history checkout of the exact source commit,
+run the split validation and record the computed split commit:
 
 ```bash
 set -euo pipefail
@@ -39,277 +99,338 @@ set -euo pipefail
 npm run release:split
 ```
 
-The script runs the source checks, action package checks, tests, and whitespace validation, then prints the subtree split commit.
+Then use a fresh full checkout of the action repository to require
+`master` to equal that recorded computed split commit and prove tree equality.
+Do not perform a second manual push after the automatic sync succeeds.
 
-To also push the split commit to the action repository default branch:
+Manual publication is an explicit fallback only when the automatic workflow
+cannot be used. It requires a separately verified `action` remote and the same
+fresh/full source checkout and split proof:
 
 ```bash
 set -euo pipefail
 
+git remote get-url action
 scripts/release-action-subtree.sh --remote action --branch master --push
 ```
 
-## Publish the Canonical Action Pin
+After sync, require all of the following:
 
-The canonical consumer reference is the exact 40-hex commit in the action
-repository, not the source commit and not a tag. Source documentation uses
-`<v1.4.0-action-commit-sha>` because that action-repository commit does not
-exist until the source release is merged and the subtree is synchronised.
+- source `master` is the intended source release commit;
+- the selected sync run has that exact `headSha` and terminal `success`;
+- action `master` is the intended split commit;
+- the source commit's `packages/action` tree OID exactly equals the action
+  commit's root tree OID; and
+- neither default ref changes during tag/provenance preparation.
 
-After sync, require the action repository default-branch SHA to equal the
-verified split commit. Publish that exact value in both the v1.4.0 release notes
-and release provenance manifest in this form:
+## Create and Verify Local Release Tags
 
-```yaml
-- uses: JoeyTeng/codex-review-gate-action@<exact-action-repository-40-sha>
-```
+Create three direct signed annotated tags in the action repository, all peeling
+to the same verified action commit:
 
-Consumers may use `@v1.4` or `@v1` for convenience, but those floating aliases
-are never canonical and cannot establish invocation provenance.
+1. immutable release tag `v1.5.0`;
+2. minor compatibility alias `v1.5`; and
+3. major compatibility alias `v1`.
 
-Release notes must also identify producer receipt schema v1 and its
-`producer-receipt-artifact-id`, `producer-receipt-artifact-url`, and
-`producer-receipt-artifact-digest` outputs. State that the receipt is
-GitHub.com-only causal producer evidence, artifacts can expire or be deleted,
-and consumers must still independently reduce provider evidence. Do not
-describe the receipt or digest as a signature, OIDC attestation, or
-content-addressed storage guarantee.
+Never move `v1.5.0`. Leave all existing immutable and older compatibility tags
+untouched. A generic `git push -f --tags` is prohibited.
 
-## Minor Release Tags and GitHub Release
+The generator resolves an absolute GnuPG executable, clears inherited `GIT_*`
+and global/system Git configuration, and accepts each tag only when
+`git verify-tag --raw` yields exactly one identity-consistent `GOODSIG` and
+`VALIDSIG` with no rejecting status. It records both
+`signing_key_fingerprint` and `primary_key_fingerprint` for each tag.
 
-Action consumer tags must point at commits in the action repository history, not source-repository commits. After validating the pushed action repository commit, create or update release tags in the action repository deliberately.
+Before publication, require every tag's recorded
+`primary_key_fingerprint` to equal the independently predeclared trusted
+primary fingerprint. A signing subkey fingerprint may differ; that is why the
+primary fingerprint is the trust anchor.
 
-For the 1.4 minor release, first confirm that the action repository default
-branch is the verified subtree split commit and that the split checks passed.
-The provenance generator resolves an executable GnuPG from an absolute `PATH`
-entry, clears inherited `GIT_*` variables and global/system Git configuration,
-forces OpenPGP through
-`gpg.format`, `gpg.program`, and `gpg.openpgp.program`, and accepts each tag
-only when `verify-tag --raw` emits its closed status contract: exactly one
-`GOODSIG`, exactly one identity-consistent `VALIDSIG`, and no rejecting GnuPG
-status. A standalone `git verify-tag` is useful diagnostics, but it is not the
-release admission gate.
+At the start of this release session, before replacing the local `v1` alias,
+freshly probe the remote and require strictly empty output for both
+`refs/tags/v1.5.0` and `refs/tags/v1.5`; require both local refs to be absent as
+well. If any exists, stop and audit it—never overwrite an immutable or minor
+release ref. Then read the remote `v1` tag-object OID once and persist it as
+release evidence. That previously observed value—not a fresh value first seen
+immediately before the alias push—is the exact lease expectation used later.
 
-Run the following fail-fast sequence from the final source checkout. Keep
-`PATH` and the GnuPG keyring unchanged for the whole sequence. It creates all
-three local signed annotated tags first, captures the current remote `v1` tag
-object for an exact lease, and runs the complete provenance generator before
-any tag is pushed. Only a successful generator exit admits one atomic push of
-all three refs. Within that transaction, `v1.4.0` and `v1.4` are ordinary
-updates while only `v1` is authorized by the exact lease. A rejected ref or a
-remote without atomic-push support must fail the whole transaction without
-publishing any of the three tags. Never move `v1.4.0`, and leave the existing
-`v1.3` compatibility tag and every `v1.3.x` immutable tag unchanged.
-
-After the atomic push, the same sequence proves every remote tag-object OID and
-peeled commit against the admitted local values, then reruns the generator to
-produce the final release asset. The pre-push output is admission evidence,
-not the release asset. `gh release create --verify-tag` checks that a remote
-tag exists; it does not replace either generator run or the remote OID proofs.
+Use the same resolved GnuPG executable and unchanged keyring for all three
+local tags:
 
 ```bash
 set -euo pipefail
 
-source_repo_path="$(pwd -P)"
 action_repo_path="../codex-review-gate-action"
-action_remote="origin"
-source_release_commit="$(git rev-parse refs/heads/master^{commit})"
-action_release_commit="$(
-  git -C "$action_repo_path" rev-parse refs/heads/master^{commit}
+release_evidence_path="v1.5.0-expected-remote-v1-tag-object.txt"
+test ! -e "$release_evidence_path"
+remote_immutable_record="$(
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5.0
 )"
-split_commit="$action_release_commit"
-
-release_gpg_path="$(command -v gpg)"
-test -n "$release_gpg_path"
-release_gpg_path="$(realpath "$release_gpg_path")"
-test -x "$release_gpg_path"
-"$release_gpg_path" --version
-release_path_snapshot="$PATH"
-
+remote_minor_record="$(
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5
+)"
+test -z "$remote_immutable_record"
+test -z "$remote_minor_record"
+for release_ref in refs/tags/v1.5.0 refs/tags/v1.5; do
+  if git -C "$action_repo_path" show-ref --verify --quiet "$release_ref"; then
+    exit 1
+  else
+    test "$?" -eq 1
+  fi
+done
 remote_v1_record="$(
-  git -C "$action_repo_path" ls-remote --tags \
-    "$action_remote" refs/tags/v1
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1
 )"
 expected_remote_v1_tag_object_oid="${remote_v1_record%%$'\t'*}"
 test "$remote_v1_record" = \
   "$expected_remote_v1_tag_object_oid"$'\trefs/tags/v1'
 test "${#expected_remote_v1_tag_object_oid}" -eq 40
 [[ "$expected_remote_v1_tag_object_oid" != *[!0-9a-f]* ]]
+printf '%s\n' "$expected_remote_v1_tag_object_oid" > "$release_evidence_path"
+
+action_release_commit="$(
+  git -C "$action_repo_path" rev-parse 'refs/heads/master^{commit}'
+)"
+release_gpg_path="$(realpath "$(command -v gpg)")"
+test -x "$release_gpg_path"
 
 git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
   -c "gpg.openpgp.program=$release_gpg_path" \
-  tag -s -a v1.4.0 "$split_commit" -m "codex-review-gate-action v1.4.0"
+  tag -s -a v1.5.0 "$action_release_commit" \
+  -m "codex-review-gate-action v1.5.0"
 git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
   -c "gpg.openpgp.program=$release_gpg_path" \
-  tag -s -a v1.4 "$split_commit" -m "codex-review-gate-action v1.4"
+  tag -s -a v1.5 "$action_release_commit" \
+  -m "codex-review-gate-action v1.5"
 git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
   -c "gpg.openpgp.program=$release_gpg_path" \
-  tag -f -s -a v1 "$split_commit" -m "codex-review-gate-action v1"
-
-immutable_tag_object_oid="$(
-  git -C "$action_repo_path" rev-parse refs/tags/v1.4.0
-)"
-minor_tag_object_oid="$(
-  git -C "$action_repo_path" rev-parse refs/tags/v1.4
-)"
-v1_tag_object_oid="$(
-  git -C "$action_repo_path" rev-parse refs/tags/v1
-)"
-test "$immutable_tag_object_oid" = "$(
-  git -C "$action_repo_path" rev-parse v1.4.0^{tag}
-)"
-test "$minor_tag_object_oid" = "$(
-  git -C "$action_repo_path" rev-parse v1.4^{tag}
-)"
-test "$v1_tag_object_oid" = "$(
-  git -C "$action_repo_path" rev-parse v1^{tag}
-)"
-test "$(git -C "$action_repo_path" cat-file -t "$immutable_tag_object_oid")" = tag
-test "$(git -C "$action_repo_path" cat-file -t "$minor_tag_object_oid")" = tag
-test "$(git -C "$action_repo_path" cat-file -t "$v1_tag_object_oid")" = tag
-test "$(git -C "$action_repo_path" rev-parse v1.4.0^{commit})" = "$split_commit"
-test "$(git -C "$action_repo_path" rev-parse v1.4^{commit})" = "$split_commit"
-test "$(git -C "$action_repo_path" rev-parse v1^{commit})" = "$split_commit"
-test "$PATH" = "$release_path_snapshot"
-
-generate_release_provenance() {
-  npm run release:provenance -- \
-    --source-repo "$source_repo_path" \
-    --source-repository JoeyTeng/codex-review-gate \
-    --source-commit "$source_release_commit" \
-    --source-default-ref refs/heads/master \
-    --action-repo "$action_repo_path" \
-    --action-repository JoeyTeng/codex-review-gate-action \
-    --action-commit "$action_release_commit" \
-    --action-default-ref refs/heads/master \
-    --immutable-tag-ref refs/tags/v1.4.0 \
-    --minor-tag-ref refs/tags/v1.4 \
-    --major-tag-ref refs/tags/v1 \
-    --output "$1"
-}
-
-prepush_provenance_path="v1.4.0-release-provenance.pre-push.json"
-generate_release_provenance "$prepush_provenance_path"
-
-git -C "$action_repo_path" push --atomic \
-  --force-with-lease="refs/tags/v1:$expected_remote_v1_tag_object_oid" \
-  "$action_remote" \
-  refs/tags/v1.4.0:refs/tags/v1.4.0 \
-  refs/tags/v1.4:refs/tags/v1.4 \
-  refs/tags/v1:refs/tags/v1
-
-test "$(
-  git -C "$action_repo_path" ls-remote --tags \
-    "$action_remote" refs/tags/v1.4.0
-)" = "$immutable_tag_object_oid"$'\trefs/tags/v1.4.0'
-test "$(
-  git -C "$action_repo_path" ls-remote --tags \
-    "$action_remote" 'refs/tags/v1.4.0^{}'
-)" = "$split_commit"$'\trefs/tags/v1.4.0^{}'
-test "$(
-  git -C "$action_repo_path" ls-remote --tags \
-    "$action_remote" refs/tags/v1.4
-)" = "$minor_tag_object_oid"$'\trefs/tags/v1.4'
-test "$(
-  git -C "$action_repo_path" ls-remote --tags \
-    "$action_remote" 'refs/tags/v1.4^{}'
-)" = "$split_commit"$'\trefs/tags/v1.4^{}'
-test "$(
-  git -C "$action_repo_path" ls-remote --tags \
-    "$action_remote" refs/tags/v1
-)" = "$v1_tag_object_oid"$'\trefs/tags/v1'
-test "$(
-  git -C "$action_repo_path" ls-remote --tags \
-    "$action_remote" 'refs/tags/v1^{}'
-)" = "$split_commit"$'\trefs/tags/v1^{}'
-
-generate_release_provenance v1.4.0-release-provenance.json
-rm -f -- "$prepush_provenance_path"
+  tag -f -s -a v1 "$action_release_commit" \
+  -m "codex-review-gate-action v1"
 ```
 
-Do not use a generic forced tag push. The exact lease must fail if another
-publisher moved `v1` after the remote OID was recorded. If any pre-push
-generator check fails, publish no tag; correct the local release state and run
-the complete admission sequence again. If any ref update or the exact lease is
-rejected, `--atomic` must leave all three remote refs unchanged; do not retry
-them as separate pushes.
+## Generate Provenance Schema v2
 
-Prepare `v1.4.0-release-notes.md` before creating the release. After the source
-release is merged, the action split is synchronized, and all three action tags
-are created and verified, replace the documentation placeholder in that file
-with the exact action-repository 40-SHA. The final notes must contain no
-`<v1.4.0-action-commit-sha>` or `<exact-action-repository-40-sha>` placeholder
-or any other angle-bracket SHA placeholder, and must carry the canonical pin
-and receipt contract described above.
-
-The post-push generator rerun in the fail-fast sequence above creates the
-canonical `v1.4.0-release-provenance.json` asset only after all remote proofs
-succeed. Its complete 12-option invocation derives both exact default-branch
-tips rather than accepting placeholder SHAs and repeats the strict OpenPGP
-verification for all three local tag objects.
-
-The generated asset must contain at least:
-
-- the exact source release commit OID and its root tree OID;
-- the `packages/action` tree OID at that exact source commit;
-- the exact action release commit OID and its root tree OID, plus the proof
-  that this root tree OID exactly equals the source commit's `packages/action`
-  tree OID;
-- the signed annotated tag-object OIDs for `v1.4.0`, `v1.4`, and the moved
-  `v1`, plus successful generator-compatible OpenPGP `verify-tag --raw`
-  evidence and proof that the immutable tag peels to the exact action release
-  commit;
-- a complete recursive action-tree manifest with exact `path`, `mode`, `type`,
-  and `blob_oid` for every published path, plus the SHA-256 of the deterministic
-  NUL-delimited bytes from
-  `git ls-tree -rz --full-tree <action-release-commit>`;
-- the exact expected status context (`codex/review-gate` by default), the
-  Commit Status REST create/list API routes, and the GraphQL `StatusContext`
-  node re-read contract;
-- source path `packages/action/action.yml`, published path `action.yml`, and
-  that published blob's Git OID and raw-file SHA-256;
-- receipt schema source path `packages/action/producer-receipt.schema.json`,
-  published path `producer-receipt.schema.json`, schema ID, published blob Git
-  OID, and raw-file SHA-256, plus exact uploader commit
-  `actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02`;
-- decision-table source path
-  [`packages/action/decision-table.json`](../packages/action/decision-table.json),
-  published path `decision-table.json`, `policy_version: 1.4.0`, published blob
-  Git OID, raw-file SHA-256, and immutable consumer link
-  `https://github.com/JoeyTeng/codex-review-gate-action/blob/<exact-action-repository-40-sha>/decision-table.json`.
-
-Every raw-file SHA-256 is computed over the exact blob bytes in the final
-action release commit. The final release notes and handoff must report these
-commit/tree/tag/blob identities, digests, equality and signature-verification
-results, and the concrete canonical workflow line with an actual lower-case
-40-hex action commit—not a placeholder:
-
-```yaml
-- uses: JoeyTeng/codex-review-gate-action@<actual-lower-case-40-hex-action-commit>
-```
-
-Do not generate or claim this manifest before the source merge and action
-split: the action commit, tree, and tag-object OIDs do not exist yet. Verify the
-generated manifest against the final action repository and tags, then create
-the GitHub Release explicitly from the immutable tag with both prepared files:
+Run the complete generator against the frozen default refs and all three local
+tag refs:
 
 ```bash
 set -euo pipefail
 
-gh release create v1.4.0 \
-  --repo JoeyTeng/codex-review-gate-action \
-  --verify-tag \
-  --title "codex-review-gate-action v1.4.0" \
-  --notes-file v1.4.0-release-notes.md \
-  v1.4.0-release-provenance.json
+source_repo_path="$(pwd -P)"
+action_repo_path="../codex-review-gate-action"
+source_release_commit="$(git rev-parse 'refs/heads/master^{commit}')"
+action_release_commit="$(
+  git -C "$action_repo_path" rev-parse 'refs/heads/master^{commit}'
+)"
+
+npm run release:provenance -- \
+  --source-repo "$source_repo_path" \
+  --source-repository JoeyTeng/codex-review-gate \
+  --source-commit "$source_release_commit" \
+  --source-default-ref refs/heads/master \
+  --action-repo "$action_repo_path" \
+  --action-repository JoeyTeng/codex-review-gate-action \
+  --action-commit "$action_release_commit" \
+  --action-default-ref refs/heads/master \
+  --immutable-tag-ref refs/tags/v1.5.0 \
+  --minor-tag-ref refs/tags/v1.5 \
+  --major-tag-ref refs/tags/v1 \
+  --output v1.5.0-release-provenance.json
 ```
+
+The generator checks the source/action default refs and all three local tag
+refs twice before create-only output publication, with the second check
+immediately before the final atomic hard link. It never overwrites or removes
+an existing output path. Together with its
+in-generation ref checks, this narrows the local TOCTOU window only; it does
+not create an atomic snapshot across the source and action repositories or
+across multiple refs. Remote publication must still use the exact leases/CAS
+boundaries below and re-read remote ref, tag-object, and peeled-commit values
+both before and after mutation.
+
+`--test-only-skip-signature-verification` is forbidden in production. It is
+accepted only by hermetic tests under both explicit test guards.
+
+The deterministic asset has schema
+`urn:joeyteng:codex-review-gate:release-provenance:2`, `schema_version: 2`, and
+`release: 1.5.0`. Its exact top-level map is `compatibility`, `source`,
+`action`, `runtime_closure`, `tags`, `proofs`, `released_tree`,
+`critical_files`, and `contracts` in addition to those identity fields.
+
+Verify at least this complete evidence:
+
+- `compatibility.producer_protocol_major == 1` and
+  `compatibility.github_immutable_release_required == true`;
+- receipt schema ID/version 1 and decision table schema 1,
+  `policy_major: 1`, `policy_version: 1.4.0`;
+- called workflow repository/path and caller selector `v1`;
+- exact source/action commit and tree OIDs, with source subtree tree equal to
+  action root tree;
+- all three direct annotated tag-object OIDs, their common peeled action
+  commit, verified signatures, signing-key fingerprints, and trusted primary
+  fingerprints;
+- the complete NUL-delimited released-tree inventory and digest;
+- critical file blob OIDs/raw SHA-256 values for `package.json`, `action.yml`,
+  `.github/workflows/codex-review-gate.yml`,
+  `producer-receipt.schema.json`, and `decision-table.json`;
+- the frozen admission digest for `action.yml`, the reusable workflow, the
+  receipt schema, and the decision table, plus the decision table's immutable
+  action-SHA URL;
+- `runtime_closure.called_workflow.caller_reference` binding canonical `@v1`
+  and its `immutable_reference` binding the exact action SHA; exact
+  `source_checkout`, exact local action use, and the closed two-entry external
+  action list; `contracts.producer_receipt.source_checkout` must copy the same
+  checkout object;
+- `referenced_workflows` exact-attempt selection and the cross-bind from its
+  selected SHA and receipt `job.workflow_sha` to
+  `release-provenance.action.commit_oid`;
+- the exact four-item SHA-domain prohibition: neither exact run-attempt
+  `head_sha` nor Artifact API `workflow_run.head_sha` may be required to equal
+  the selected receipt status head; exact run-attempt `head_sha` may not be
+  required to equal `GITHUB_WORKFLOW_SHA`; and `GITHUB_WORKFLOW_SHA` may not be
+  required to equal `job.workflow_sha`; and
+- `proofs.revocation_freshness_checked == false` and
+  `proofs.release_asset_is_signed_attestation == false`.
+
+The signed tags authenticate their tag objects; the JSON asset is not itself a
+signature, OIDC attestation, or signed attestation. Immutable-release controls
+protect the published tag and assets after publication. Point-in-time
+verification still does not prove historical or future revocation freshness.
+
+## Publish in the Safe Order
+
+Prepare `v1.5.0-release-notes.md` with no SHA placeholders. It must state:
+
+- canonical post-activation caller
+  `jobs.<job>.uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`;
+- floating `@v1` is the centralised pre-execution trust boundary, while
+  post-run authority comes from exact `job.workflow_sha`, exact-attempt
+  `referenced_workflows`, and the trusted-signer immutable release/provenance;
+- the actual lower-case action commit for audit and direct composite/GHES
+  compatibility;
+- producer protocol major 1, receipt schema v1, decision `policy_major: 1` and
+  `policy_version: 1.4.0`;
+- receipt output names and their causal/integrity-only limitations; and
+- the separate post-release activation gate.
+
+Publish in this order so an `@v1` consumer never sees new runtime code before
+its immutable release authority is available:
+
+1. Push only `refs/tags/v1.5.0`, without force, then verify its remote tag-object
+   OID and peeled action commit.
+2. Create a draft GitHub Release for `v1.5.0`; attach the final notes and
+   `v1.5.0-release-provenance.json` while it is still draft.
+3. Recheck the immutable-release repository setting, draft tag, asset name,
+   asset SHA-256, and notes; then publish the draft.
+4. Require the release REST object to report exact `immutable: true`. Run
+   `gh release verify v1.5.0 --repo JoeyTeng/codex-review-gate-action` and
+   `gh release verify-asset v1.5.0 v1.5.0-release-provenance.json --repo JoeyTeng/codex-review-gate-action`, and
+   independently re-download and digest-check the asset.
+5. Only after those checks succeed, atomically publish `v1.5` and move `v1` to
+   their admitted signed tag objects. Use an exact `--force-with-lease` for the
+   previously observed remote `v1` tag-object OID. Require atomic push support;
+   a rejected ref leaves both aliases unchanged.
+6. Re-read both remote alias tag-object OIDs and peeled commits. Rerun the
+   generator to a verification file and require byte-for-byte equality with
+   the already published provenance asset.
+
+The immutable tag and draft-to-published release steps have this shape:
+
+```bash
+set -euo pipefail
+
+action_repo_path="../codex-review-gate-action"
+git -C "$action_repo_path" push origin \
+  refs/tags/v1.5.0:refs/tags/v1.5.0
+
+gh release create v1.5.0 \
+  --repo JoeyTeng/codex-review-gate-action \
+  --draft \
+  --verify-tag \
+  --title "codex-review-gate-action v1.5.0" \
+  --notes-file v1.5.0-release-notes.md \
+  v1.5.0-release-provenance.json
+
+gh release edit v1.5.0 \
+  --repo JoeyTeng/codex-review-gate-action \
+  --draft=false
+
+test "$(
+  gh api \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2026-03-10' \
+    repos/JoeyTeng/codex-review-gate-action/releases/tags/v1.5.0 \
+    --jq '.immutable'
+)" = true
+
+gh release verify v1.5.0 \
+  --repo JoeyTeng/codex-review-gate-action
+gh release verify-asset \
+  v1.5.0 \
+  v1.5.0-release-provenance.json \
+  --repo JoeyTeng/codex-review-gate-action
+```
+
+The alias push shape is deliberately separate from the immutable tag/release:
+
+```bash
+set -euo pipefail
+
+action_repo_path="../codex-review-gate-action"
+release_evidence_path="v1.5.0-expected-remote-v1-tag-object.txt"
+expected_remote_v1_tag_object_oid="$(sed -n '1p' "$release_evidence_path")"
+test "${#expected_remote_v1_tag_object_oid}" -eq 40
+[[ "$expected_remote_v1_tag_object_oid" != *[!0-9a-f]* ]]
+current_remote_v1_record="$(
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1
+)"
+test "$current_remote_v1_record" = \
+  "$expected_remote_v1_tag_object_oid"$'\trefs/tags/v1'
+
+git -C "$action_repo_path" push --atomic \
+  --force-with-lease="refs/tags/v1:$expected_remote_v1_tag_object_oid" \
+  origin \
+  refs/tags/v1.5:refs/tags/v1.5 \
+  refs/tags/v1:refs/tags/v1
+```
+
+Do not fall back to separate alias pushes if the atomic update fails. Re-read
+remote state, resolve the conflict, and rerun the full admission proof. Retain
+the persisted pre-release `v1` tag-object OID with the other release evidence.
+
+## Live Canary and Activation
+
+Run a GitHub.com canary through the published canonical caller at `@v1`. Require
+all of the following before activation:
+
+- the called job's `job.workflow_repository/file_path/ref/sha` is the canonical
+  tuple and exact v1.5.0 action commit;
+- the receipt maps that job repository/SHA to `producer.action` with
+  `immutable: true`;
+- the exact run-attempt response contains exactly one canonical
+  `referenced_workflows` member whose SHA matches the receipt and release
+  provenance;
+- the receipt artifact, status membership, GraphQL status re-read, and
+  independently reduced provider evidence all pass their stable checks; and
+- the canary did not checkout or execute PR code.
+
+Only then open the separate activation PR that changes the source-root caller,
+template caller, and root/template consumer documentation to `@v1`.
+
+Future compatible v1.x Action-only releases can advance `v1` without changing
+the caller or Skill, provided the same dynamic admission accepts their signed
+immutable release/provenance and `policy_major: 1`. A producer protocol or
+policy major change is breaking and requires a coordinated Skill/caller plan.
 
 ## Why Subtree
 
-`packages/action` is a stable package boundary whose contents are complete as a repository root. That makes `git subtree split --prefix=packages/action` a direct release operation. Tests, CI workflows, and source-repository coordination stay outside the published action package.
+`packages/action` is a stable package boundary whose contents are complete as
+a repository root. `git subtree split --prefix=packages/action` is therefore a
+direct release operation; source-only tests, CI, and rollout coordination stay
+outside the published package.

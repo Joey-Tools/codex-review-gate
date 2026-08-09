@@ -8,31 +8,79 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdtemp,
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  rm,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const RELEASE = "1.4.0";
+const RELEASE = "1.5.0";
+const PROVENANCE_SCHEMA_VERSION = 2;
+const PRODUCER_PROTOCOL_MAJOR = 1;
+const RECEIPT_SCHEMA_VERSION = 1;
+const DECISION_TABLE_SCHEMA_VERSION = 1;
+const DECISION_POLICY_MAJOR = 1;
+const DECISION_POLICY_VERSION = "1.4.0";
 const SOURCE_REPOSITORY = "JoeyTeng/codex-review-gate";
 const ACTION_REPOSITORY = "JoeyTeng/codex-review-gate-action";
 const SOURCE_SUBTREE = "packages/action";
+const REUSABLE_WORKFLOW_PATH = ".github/workflows/codex-review-gate.yml";
+const REUSABLE_WORKFLOW_SELECTOR = "v1";
+const REUSABLE_WORKFLOW_REF = "refs/tags/v1";
+const REUSABLE_WORKFLOW_CHECKOUT_PATH = ".codex-review-gate-action";
+const REUSABLE_WORKFLOW_LOCAL_ACTION_USE =
+  `./${REUSABLE_WORKFLOW_CHECKOUT_PATH}`;
+const REUSABLE_WORKFLOW_CANONICAL_REFERENCE =
+  `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${REUSABLE_WORKFLOW_SELECTOR}`;
 const DEFAULT_STATUS_CONTEXT = "codex/review-gate";
 const RECEIPT_SCHEMA_ID =
   "urn:joeyteng:codex-review-gate:producer-receipt:1";
+const FROZEN_RECEIPT_SCHEMA_SHA256 =
+  "89decfcabeeab817a975b1118498375c4eafe730b35e2cb9aa5c4abde6637b77";
 const DECISION_TABLE_SCHEMA_ID =
   "urn:joeyteng:codex-review-gate:decision-table:1";
+const FROZEN_ACTION_DEFINITION_SHA256 =
+  "3b73835ec0e8dfb2305f0801ebaa7b3f9ea04e02c72392e822aabcd25d2093be";
+const FROZEN_REUSABLE_WORKFLOW_SHA256 =
+  "91720b868b972d947a65fa3cc408d8c866d83cf4d75032f6bfb597b014752bce";
 const FROZEN_DECISION_TABLE_SHA256 =
-  "11b2fbc6e5b2bd5c923ecbfb7c56b00a5189108291999f1aaefdb27b7b1f8196";
+  "3f0032df69e2015c1dfe198c20a141652b2dcaba520e8749a5d049d31ffd7ad3";
 const PROVENANCE_SCHEMA_ID =
-  "urn:joeyteng:codex-review-gate:release-provenance:1";
+  "urn:joeyteng:codex-review-gate:release-provenance:2";
+const CHECKOUT_SHA =
+  "11d5960a326750d5838078e36cf38b85af677262";
 const UPLOAD_ARTIFACT_SHA =
   "ea165f8d65b6e75b540449e92b4886f43607fa02";
 const RUN_ATTEMPT_REQUIRED_EQUALITIES = Object.freeze([
   "id-equals-receipt-producer-run-id",
   "run_attempt-equals-receipt-producer-run-attempt",
   "repository-full_name-equals-receipt-producer-repository",
-  "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
+]);
+const REFERENCED_WORKFLOW_REQUIRED_EQUALITIES = Object.freeze([
+  `selected-path-equals-${REUSABLE_WORKFLOW_CANONICAL_REFERENCE}`,
+  `selected-ref-equals-${REUSABLE_WORKFLOW_REF}`,
+  "selected-sha-equals-receipt-producer-job-workflow_sha",
+  "selected-sha-equals-validated-release-provenance-action-commit_oid",
+  "selected-path-repository-and-file-equal-receipt-producer-job-workflow_repository-and-workflow_file_path",
+]);
+const CALLED_WORKFLOW_REQUIRED_EQUALITIES = Object.freeze([
+  `receipt-producer-job-workflow_repository-equals-${ACTION_REPOSITORY}`,
+  `receipt-producer-job-workflow_file_path-equals-${REUSABLE_WORKFLOW_PATH}`,
+  `receipt-producer-job-workflow_ref-equals-${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${REUSABLE_WORKFLOW_REF}`,
+  "receipt-producer-job-workflow_sha-is-lower-case-40-hex",
+  "receipt-producer-job-workflow_sha-equals-validated-release-provenance-action-commit_oid",
+  "receipt-producer-action-repository-equals-receipt-producer-job-workflow_repository",
+  "receipt-producer-action-ref-equals-receipt-producer-job-workflow_sha",
+  "receipt-producer-action-commit_sha-equals-receipt-producer-job-workflow_sha",
+  "receipt-producer-action-immutable-is-true",
 ]);
 const ARTIFACT_RUN_REQUIRED_EQUALITIES = Object.freeze([
   "artifact-api-workflow_run-id-equals-exact-run-attempt-id",
@@ -47,6 +95,8 @@ const STATUS_HEAD_REQUIRED_EQUALITIES = Object.freeze([
 const DISALLOWED_RUN_STATUS_HEAD_REQUIREMENTS = Object.freeze([
   "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
   "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha",
+  "exact-run-attempt-head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
+  "receipt-producer-environment-GITHUB_WORKFLOW_SHA-equals-receipt-producer-job-workflow_sha",
 ]);
 const POSITIVE_CONSUMER_REQUIREMENT = Object.freeze({
   operator: "all-of",
@@ -68,8 +118,8 @@ const SAFE_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const PLACEHOLDER_PATTERN = /<[^<>]+>/;
 
 const EXPECTED_TAGS = Object.freeze({
-  immutable: "v1.4.0",
-  minor: "v1.4",
+  immutable: "v1.5.0",
+  minor: "v1.5",
   major: "v1",
 });
 
@@ -111,8 +161,8 @@ function usage() {
   --source-commit <40-sha> --source-default-ref refs/heads/master \\
   --action-repo <path> --action-repository ${ACTION_REPOSITORY} \\
   --action-commit <40-sha> --action-default-ref refs/heads/master \\
-  --immutable-tag-ref refs/tags/v1.4.0 \\
-  --minor-tag-ref refs/tags/v1.4 --major-tag-ref refs/tags/v1 \\
+  --immutable-tag-ref refs/tags/v1.5.0 \\
+  --minor-tag-ref refs/tags/v1.5 --major-tag-ref refs/tags/v1 \\
   --output <path>
 
 The source and action commits must be the exact tips of the supplied default
@@ -650,6 +700,170 @@ function extractUploaderSha(actionDefinition) {
   return matches[0][1];
 }
 
+function validateRuntimeExternalActionClosure(runtimeFiles) {
+  const externalActions = [];
+  const localActions = [];
+  for (const runtimeFile of runtimeFiles) {
+    const text = decodeUtf8(runtimeFile.raw, runtimeFile.release_path);
+    for (const line of text.split(/\r?\n/)) {
+      if (
+        /(?:^|[\s:[{,])(?:&|\*)[A-Za-z0-9_-]+/.test(line) ||
+        /(?:^|\s)<<\s*:/.test(line)
+      ) {
+        throw new Error(
+          `${runtimeFile.release_path} contains a forbidden YAML anchor, alias, or merge key`,
+        );
+      }
+      if (/^\s*\?/.test(line)) {
+        throw new Error(
+          `${runtimeFile.release_path} contains a forbidden complex YAML mapping key`,
+        );
+      }
+      if (
+        /(?:^|[,{]|-\s+)\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:/.test(
+          line,
+        )
+      ) {
+        throw new Error(
+          `${runtimeFile.release_path} contains a forbidden quoted YAML mapping key`,
+        );
+      }
+      const canonicalUsesKey = /^\s*(?:-\s*)?uses\s*:/.test(line);
+      const anyBareUsesKey = /(?:^|[,{]|-\s+)\s*uses\s*:/.test(line);
+      if (anyBareUsesKey && !canonicalUsesKey) {
+        throw new Error(
+          `${runtimeFile.release_path} contains a non-canonical runtime uses mapping`,
+        );
+      }
+      if (!canonicalUsesKey) {
+        continue;
+      }
+      const match = /^\s*(?:-\s*)?uses:\s*([^\s#]+)(?:\s+#.*)?$/.exec(line);
+      if (!match) {
+        throw new Error(
+          `${runtimeFile.release_path} contains a malformed runtime uses declaration`,
+        );
+      }
+      const uses = match[1];
+      if (uses.startsWith("./")) {
+        localActions.push({
+          release_path: runtimeFile.release_path,
+          source_path: runtimeFile.source_path,
+          uses,
+        });
+        continue;
+      }
+      const externalMatch = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)@([0-9a-f]{40})$/.exec(
+        uses,
+      );
+      if (!externalMatch) {
+        throw new Error(
+          `${runtimeFile.release_path} contains a floating or unsupported external runtime uses: ${uses}`,
+        );
+      }
+      externalActions.push({
+        release_path: runtimeFile.release_path,
+        source_path: runtimeFile.source_path,
+        uses,
+        repository: externalMatch[1],
+        commit_sha: externalMatch[2],
+      });
+    }
+  }
+
+  const expected = [
+    {
+      release_path: REUSABLE_WORKFLOW_PATH,
+      source_path: `${SOURCE_SUBTREE}/${REUSABLE_WORKFLOW_PATH}`,
+      uses: `actions/checkout@${CHECKOUT_SHA}`,
+      repository: "actions/checkout",
+      commit_sha: CHECKOUT_SHA,
+    },
+    {
+      release_path: "action.yml",
+      source_path: `${SOURCE_SUBTREE}/action.yml`,
+      uses: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
+      repository: "actions/upload-artifact",
+      commit_sha: UPLOAD_ARTIFACT_SHA,
+    },
+  ];
+  if (!exactJsonEqual(externalActions, expected)) {
+    throw new Error(
+      "published runtime external actions do not equal the closed release closure",
+    );
+  }
+  const expectedLocalActions = [
+    {
+      release_path: REUSABLE_WORKFLOW_PATH,
+      source_path: `${SOURCE_SUBTREE}/${REUSABLE_WORKFLOW_PATH}`,
+      uses: REUSABLE_WORKFLOW_LOCAL_ACTION_USE,
+    },
+  ];
+  if (!exactJsonEqual(localActions, expectedLocalActions)) {
+    throw new Error(
+      "published runtime local action use does not equal the closed release binding",
+    );
+  }
+  return { externalActions, localActions };
+}
+
+function validateReusableWorkflowCheckoutBindings(reusableWorkflow) {
+  const lines = decodeUtf8(
+    reusableWorkflow.raw,
+    reusableWorkflow.release_path,
+  ).split(/\r?\n/);
+  const checkoutUse = `uses: actions/checkout@${CHECKOUT_SHA}`;
+  const checkoutIndexes = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].trim().replace(/\s+#.*$/, "") === checkoutUse) {
+      checkoutIndexes.push(index);
+    }
+  }
+  if (checkoutIndexes.length !== 1) {
+    throw new Error(
+      "reusable workflow must contain exactly one exact source checkout step",
+    );
+  }
+  const checkoutIndex = checkoutIndexes[0];
+  const indentation = /^\s*/.exec(lines[checkoutIndex])[0].length;
+  const expectedFollowingLines = [
+    { indentation, text: "with:" },
+    {
+      indentation: indentation + 2,
+      text: "repository: ${{ job.workflow_repository }}",
+    },
+    {
+      indentation: indentation + 2,
+      text: "ref: ${{ job.workflow_sha }}",
+    },
+    {
+      indentation: indentation + 2,
+      text: `path: ${REUSABLE_WORKFLOW_CHECKOUT_PATH}`,
+    },
+    { indentation: indentation + 2, text: "persist-credentials: false" },
+  ];
+  for (let offset = 0; offset < expectedFollowingLines.length; offset += 1) {
+    const actualLine = lines[checkoutIndex + offset + 1];
+    const expectedLine = expectedFollowingLines[offset];
+    if (
+      actualLine === undefined ||
+      /^\s*/.exec(actualLine)[0].length !== expectedLine.indentation ||
+      actualLine.trim() !== expectedLine.text
+    ) {
+      throw new Error(
+        "reusable workflow source checkout bindings contradict the closed release contract",
+      );
+    }
+  }
+  return {
+    uses: `actions/checkout@${CHECKOUT_SHA}`,
+    repository: "${{ job.workflow_repository }}",
+    ref: "${{ job.workflow_sha }}",
+    path: REUSABLE_WORKFLOW_CHECKOUT_PATH,
+    persist_credentials: false,
+  };
+}
+
 function decisionRow(table, id) {
   const rows = table.evidence_rows.filter((row) => row?.id === id);
   if (rows.length !== 1) {
@@ -692,10 +906,11 @@ function exactJsonEqual(actual, expected) {
 function validateDecisionTable(table) {
   if (
     table?.schema !== DECISION_TABLE_SCHEMA_ID ||
-    table?.schema_version !== 1 ||
-    table?.policy_version !== RELEASE
+    table?.schema_version !== DECISION_TABLE_SCHEMA_VERSION ||
+    table?.policy_major !== DECISION_POLICY_MAJOR ||
+    table?.policy_version !== DECISION_POLICY_VERSION
   ) {
-    throw new Error("decision table identity contradicts release 1.4.0");
+    throw new Error("decision table identity contradicts compatibility policy 1.4.0");
   }
   if (!Array.isArray(table.evidence_rows)) {
     throw new Error("decision table is missing evidence_rows");
@@ -776,10 +991,12 @@ function validateDecisionTable(table) {
       "GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}" ||
     table.producer_receipt_boundary?.artifact_inventory_api !==
       "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts" ||
-    !table.producer_receipt_boundary?.floating_tags?.includes("never canonical") ||
-    !table.producer_receipt_boundary?.canonical_action_reference_format?.includes(
-      "exact lower-case 40-hex",
-    )
+    table.producer_receipt_boundary?.producer_protocol_major !==
+      PRODUCER_PROTOCOL_MAJOR ||
+    table.producer_receipt_boundary?.canonical_reusable_workflow_reference !==
+      REUSABLE_WORKFLOW_CANONICAL_REFERENCE ||
+    table.producer_receipt_boundary?.caller_selector !==
+      REUSABLE_WORKFLOW_SELECTOR
   ) {
     throw new Error("decision table status or receipt contract contradicts release policy");
   }
@@ -818,6 +1035,54 @@ function validateDecisionTable(table) {
   ) {
     throw new Error(
       "decision table workflow-run and pull-request head binding contract contradicts release policy",
+    );
+  }
+  if (
+    !exactJsonEqual(
+      table.producer_receipt_boundary?.run_attempt_identity
+        ?.referenced_workflows,
+      {
+        field: "referenced_workflows",
+        availability:
+          "optional-nullable-upstream-but-required-non-null-for-this-reusable-workflow-contract",
+        selection: "exactly-one-exact-called-workflow-member",
+        expected_path: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
+        expected_ref: REUSABLE_WORKFLOW_REF,
+        required_equalities: [...REFERENCED_WORKFLOW_REQUIRED_EQUALITIES],
+        rerun_resolution:
+          "Validate referenced_workflows from the exact receipt run attempt; never substitute the current v1 target or evidence from another attempt.",
+        tag_drift:
+          "A later v1 move does not change the exact called-workflow SHA recorded for an earlier run attempt.",
+        authority:
+          "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding",
+      },
+    )
+  ) {
+    throw new Error(
+      "decision table exact-attempt referenced workflow contract contradicts release policy",
+    );
+  }
+  if (
+    !exactJsonEqual(
+      table.producer_receipt_boundary?.called_workflow_authority,
+      {
+        availability: "github.com-only-job-context",
+        repository: ACTION_REPOSITORY,
+        workflow_file_path: REUSABLE_WORKFLOW_PATH,
+        caller_selector: REUSABLE_WORKFLOW_SELECTOR,
+        caller_ref: REUSABLE_WORKFLOW_REF,
+        caller_identity_role:
+          "producer.environment.GITHUB_WORKFLOW_REF/SHA-identifies-caller-workflow-file",
+        called_job_identity_role:
+          "producer.job.workflow_ref/SHA/repository/file_path-identifies-workflow-file-defining-current-job",
+        required_equalities: [...CALLED_WORKFLOW_REQUIRED_EQUALITIES],
+        caller_called_sha_domain_separation:
+          "GITHUB_WORKFLOW_SHA identifies the caller workflow file and must not be required to equal producer.job.workflow_sha for a reusable invocation.",
+      },
+    )
+  ) {
+    throw new Error(
+      "decision table called workflow authority contradicts release policy",
     );
   }
   if (
@@ -864,7 +1129,7 @@ function parseDirectTagHeader(raw, expectedName, actionCommit) {
   }
 }
 
-function parseVerifiedOpenPgpStatus(result, expectedName) {
+export function parseVerifiedOpenPgpStatus(result, expectedName) {
   const statusText = `${result.stdout.toString("utf8")}\n${result.stderr.toString("utf8")}`;
   const statusLines = statusText
     .split(/\r?\n/)
@@ -895,15 +1160,30 @@ function parseVerifiedOpenPgpStatus(result, expectedName) {
     );
   }
   const keyId = goodSignatures[0].payload.split(" ", 1)[0].toUpperCase();
-  const fingerprint = validSignatures[0].payload.split(" ", 1)[0].toUpperCase();
+  const validSignatureFields = validSignatures[0].payload
+    .trim()
+    .split(/\s+/);
+  const signingKeyFingerprint = validSignatureFields[0]?.toUpperCase();
+  const primaryKeyFingerprint = validSignatureFields[9]?.toUpperCase();
+  const keyIdOrFingerprintPattern = /^(?:[0-9A-F]{16}|[0-9A-F]{40}|[0-9A-F]{64})$/;
+  const fingerprintPattern = /^(?:[0-9A-F]{40}|[0-9A-F]{64})$/;
+  const goodSignatureIdentityMatches =
+    keyId.length === 16
+      ? signingKeyFingerprint?.endsWith(keyId)
+      : signingKeyFingerprint === keyId;
   if (
-    !/^[0-9A-F]{16}$/.test(keyId) ||
-    !/^[0-9A-F]{40,64}$/.test(fingerprint) ||
-    !fingerprint.endsWith(keyId)
+    !keyIdOrFingerprintPattern.test(keyId) ||
+    validSignatureFields.length !== 10 ||
+    !fingerprintPattern.test(signingKeyFingerprint) ||
+    !fingerprintPattern.test(primaryKeyFingerprint) ||
+    !goodSignatureIdentityMatches
   ) {
     throw new Error(`${expectedName} emitted inconsistent GOODSIG/VALIDSIG identity`);
   }
-  return fingerprint.toLowerCase();
+  return {
+    signingKeyFingerprint: signingKeyFingerprint.toLowerCase(),
+    primaryKeyFingerprint: primaryKeyFingerprint.toLowerCase(),
+  };
 }
 
 function verifyTag(
@@ -941,7 +1221,8 @@ function verifyTag(
     signature = {
       verified: false,
       method: "test-only-skip",
-      signer_fingerprint: null,
+      signing_key_fingerprint: null,
+      primary_key_fingerprint: null,
     };
   } else {
     const gpgExecutable = resolveTrustedGpgExecutable();
@@ -963,14 +1244,15 @@ function verifyTag(
       const detail = boundedText(verification.stderr) || `exit ${verification.status}`;
       throw new Error(`${expectedName} signature verification failed: ${detail}`);
     }
-    const signerFingerprint = parseVerifiedOpenPgpStatus(
+    const fingerprints = parseVerifiedOpenPgpStatus(
       verification,
       expectedName,
     );
     signature = {
       verified: true,
       method: "git-verify-tag-openpgp-raw",
-      signer_fingerprint: signerFingerprint,
+      signing_key_fingerprint: fingerprints.signingKeyFingerprint,
+      primary_key_fingerprint: fingerprints.primaryKeyFingerprint,
     };
   }
 
@@ -1107,14 +1389,14 @@ async function generateProvenance(options) {
   }
 
   const tags = {
-    "v1.4.0": verifyTag(
+    [EXPECTED_TAGS.immutable]: verifyTag(
       actionRepo,
       options.immutableTagRef,
       EXPECTED_TAGS.immutable,
       actionCommit,
       options.testOnlySkipSignatureVerification,
     ),
-    "v1.4": verifyTag(
+    [EXPECTED_TAGS.minor]: verifyTag(
       actionRepo,
       options.minorTagRef,
       EXPECTED_TAGS.minor,
@@ -1129,7 +1411,6 @@ async function generateProvenance(options) {
       options.testOnlySkipSignatureVerification,
     ),
   };
-
   const lsTreeArguments = ["ls-tree", "-r", "-z", "--full-tree", actionCommit];
   const rawLsTree = git(actionRepo, lsTreeArguments).stdout;
   const entries = parseLsTree(rawLsTree);
@@ -1138,6 +1419,11 @@ async function generateProvenance(options) {
   }
 
   const actionDefinition = criticalFile(actionRepo, entries, "action.yml");
+  const reusableWorkflow = criticalFile(
+    actionRepo,
+    entries,
+    REUSABLE_WORKFLOW_PATH,
+  );
   const receiptSchema = criticalFile(
     actionRepo,
     entries,
@@ -1145,6 +1431,16 @@ async function generateProvenance(options) {
   );
   const decisionTable = criticalFile(actionRepo, entries, "decision-table.json");
   const actionPackage = criticalFile(actionRepo, entries, "package.json");
+  if (actionDefinition.raw_sha256 !== FROZEN_ACTION_DEFINITION_SHA256) {
+    throw new Error(
+      "action.yml raw SHA-256 does not match the reviewed frozen runtime entrypoint",
+    );
+  }
+  if (reusableWorkflow.raw_sha256 !== FROZEN_REUSABLE_WORKFLOW_SHA256) {
+    throw new Error(
+      "reusable workflow raw SHA-256 does not match the reviewed frozen runtime entrypoint",
+    );
+  }
   const sourcePackage = committedFile(
     sourceRepo,
     sourceCommit,
@@ -1158,6 +1454,12 @@ async function generateProvenance(options) {
   );
   const statusContext = extractStatusContext(actionDefinitionText);
   const uploaderSha = extractUploaderSha(actionDefinitionText);
+  const runtimeUses = validateRuntimeExternalActionClosure([
+    reusableWorkflow,
+    actionDefinition,
+  ]);
+  const sourceCheckoutBindings =
+    validateReusableWorkflowCheckoutBindings(reusableWorkflow);
   if (statusContext !== DEFAULT_STATUS_CONTEXT) {
     throw new Error(`action.yml status context must be ${DEFAULT_STATUS_CONTEXT}`);
   }
@@ -1172,9 +1474,15 @@ async function generateProvenance(options) {
   if (
     receiptSchemaJson?.$id !== RECEIPT_SCHEMA_ID ||
     receiptSchemaJson?.properties?.schema?.const !== RECEIPT_SCHEMA_ID ||
-    receiptSchemaJson?.properties?.schema_version?.const !== 1
+    receiptSchemaJson?.properties?.schema_version?.const !==
+      RECEIPT_SCHEMA_VERSION
   ) {
     throw new Error("producer receipt schema identity contradicts receipt v1");
+  }
+  if (receiptSchema.raw_sha256 !== FROZEN_RECEIPT_SCHEMA_SHA256) {
+    throw new Error(
+      "producer-receipt.schema.json raw SHA-256 does not match the reviewed frozen receipt v1 schema",
+    );
   }
   const decisionTableJson = parseJson(decisionTable.raw, "decision-table.json");
   validateDecisionTable(decisionTableJson);
@@ -1197,8 +1505,27 @@ async function generateProvenance(options) {
 
   const manifest = {
     schema: PROVENANCE_SCHEMA_ID,
-    schema_version: 1,
+    schema_version: PROVENANCE_SCHEMA_VERSION,
     release: RELEASE,
+    compatibility: {
+      producer_protocol_major: PRODUCER_PROTOCOL_MAJOR,
+      github_immutable_release_required: true,
+      receipt_schema: {
+        schema_id: RECEIPT_SCHEMA_ID,
+        schema_version: RECEIPT_SCHEMA_VERSION,
+      },
+      decision_table: {
+        schema_id: DECISION_TABLE_SCHEMA_ID,
+        schema_version: DECISION_TABLE_SCHEMA_VERSION,
+        policy_major: DECISION_POLICY_MAJOR,
+        policy_version: DECISION_POLICY_VERSION,
+      },
+      called_workflow: {
+        repository: ACTION_REPOSITORY,
+        path: REUSABLE_WORKFLOW_PATH,
+        caller_selector: REUSABLE_WORKFLOW_SELECTOR,
+      },
+    },
     source: {
       repository: SOURCE_REPOSITORY,
       default_ref: options.sourceDefaultRef,
@@ -1222,6 +1549,25 @@ async function generateProvenance(options) {
       tree_oid: actionTree,
       canonical_uses: `${ACTION_REPOSITORY}@${actionCommit}`,
     },
+    runtime_closure: {
+      called_workflow: {
+        repository: ACTION_REPOSITORY,
+        caller_selector: REUSABLE_WORKFLOW_SELECTOR,
+        caller_reference: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
+        immutable_reference:
+          `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${actionCommit}`,
+        resolved_commit_oid: actionCommit,
+        release_path: reusableWorkflow.release_path,
+        source_path: reusableWorkflow.source_path,
+        blob_oid: reusableWorkflow.blob_oid,
+        raw_sha256: reusableWorkflow.raw_sha256,
+      },
+      source_checkout: sourceCheckoutBindings,
+      local_action_use: runtimeUses.localActions[0],
+      external_actions: runtimeUses.externalActions,
+      external_action_set: "closed-exactly-two",
+      floating_or_extra_external_uses_allowed: false,
+    },
     tags,
     proofs: {
       source_subtree_equals_action_root: true,
@@ -1231,6 +1577,8 @@ async function generateProvenance(options) {
       all_tags_peel_to_action_commit: true,
       all_tag_signatures_verified: !options.testOnlySkipSignatureVerification,
       production_signature_verification_required: true,
+      revocation_freshness_checked: false,
+      runtime_external_action_set_closed: true,
       release_asset_is_signed_attestation: false,
     },
     released_tree: {
@@ -1254,14 +1602,28 @@ async function generateProvenance(options) {
         source_path: actionDefinition.source_path,
         blob_oid: actionDefinition.blob_oid,
         raw_sha256: actionDefinition.raw_sha256,
+        frozen_admission_sha256: FROZEN_ACTION_DEFINITION_SHA256,
+      },
+      reusable_workflow: {
+        release_path: reusableWorkflow.release_path,
+        source_path: reusableWorkflow.source_path,
+        blob_oid: reusableWorkflow.blob_oid,
+        raw_sha256: reusableWorkflow.raw_sha256,
+        frozen_admission_sha256: FROZEN_REUSABLE_WORKFLOW_SHA256,
+        repository: ACTION_REPOSITORY,
+        caller_selector: REUSABLE_WORKFLOW_SELECTOR,
+        caller_reference: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
+        immutable_reference:
+          `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${actionCommit}`,
       },
       producer_receipt_schema: {
         release_path: receiptSchema.release_path,
         source_path: receiptSchema.source_path,
         blob_oid: receiptSchema.blob_oid,
         raw_sha256: receiptSchema.raw_sha256,
+        frozen_admission_sha256: FROZEN_RECEIPT_SCHEMA_SHA256,
         schema_id: RECEIPT_SCHEMA_ID,
-        schema_version: 1,
+        schema_version: RECEIPT_SCHEMA_VERSION,
       },
       decision_table: {
         release_path: decisionTable.release_path,
@@ -1272,8 +1634,9 @@ async function generateProvenance(options) {
         immutable_url:
           `https://github.com/${ACTION_REPOSITORY}/blob/${actionCommit}/decision-table.json`,
         schema_id: DECISION_TABLE_SCHEMA_ID,
-        schema_version: 1,
-        policy_version: RELEASE,
+        schema_version: DECISION_TABLE_SCHEMA_VERSION,
+        policy_major: DECISION_POLICY_MAJOR,
+        policy_version: DECISION_POLICY_VERSION,
       },
     },
     contracts: {
@@ -1322,14 +1685,47 @@ async function generateProvenance(options) {
       },
       producer_receipt: {
         schema_id: RECEIPT_SCHEMA_ID,
+        schema_version: RECEIPT_SCHEMA_VERSION,
+        producer_protocol_major: PRODUCER_PROTOCOL_MAJOR,
         github_cloud_only: true,
-        exact_action_sha_required: true,
+        exact_called_workflow_sha_required: true,
+        called_workflow_authority: {
+          repository: ACTION_REPOSITORY,
+          workflow_file_path: REUSABLE_WORKFLOW_PATH,
+          caller_selector: REUSABLE_WORKFLOW_SELECTOR,
+          caller_ref: REUSABLE_WORKFLOW_REF,
+          caller_reference: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
+          immutable_reference:
+            `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${actionCommit}`,
+          accepted_resolved_sha: actionCommit,
+          required_equalities: [...CALLED_WORKFLOW_REQUIRED_EQUALITIES],
+          caller_identity_role:
+            "producer.environment.GITHUB_WORKFLOW_REF/SHA-identifies-caller-workflow-file",
+          called_job_identity_role:
+            "producer.job.workflow_ref/SHA/repository/file_path-identifies-workflow-file-defining-current-job",
+        },
         run_attempt_api: {
           method: "GET",
           route:
             "/repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}",
           head_role: "caller-workflow-event-commit",
           required_equalities: [...RUN_ATTEMPT_REQUIRED_EQUALITIES],
+          referenced_workflows: {
+            field: "referenced_workflows",
+            availability:
+              "optional-nullable-upstream-but-required-non-null-for-this-reusable-workflow-contract",
+            selection: "exactly-one-exact-called-workflow-member",
+            expected_path: REUSABLE_WORKFLOW_CANONICAL_REFERENCE,
+            expected_ref: REUSABLE_WORKFLOW_REF,
+            expected_sha: actionCommit,
+            required_equalities: [...REFERENCED_WORKFLOW_REQUIRED_EQUALITIES],
+            rerun_resolution:
+              "exact-receipt-run-attempt-only-no-current-selector-substitution",
+            tag_drift:
+              "later-v1-movement-does-not-change-historical-attempt-sha",
+            authority:
+              "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding",
+          },
         },
         artifact_inventory_api: {
           method: "GET",
@@ -1385,10 +1781,10 @@ async function generateProvenance(options) {
           "job.workflow_file_path"
         ],
         exact_action_bindings: [
-          "producer.action.repository",
-          "producer.action.ref",
-          "producer.action.commit_sha",
-          "producer.action.immutable-true"
+          "producer.action.repository-equals-producer.job.workflow_repository",
+          "producer.action.ref-equals-producer.job.workflow_sha",
+          "producer.action.commit_sha-equals-producer.job.workflow_sha",
+          "producer.action.immutable-is-true"
         ],
         receipt_statuses: {
           scope: "run-level-ordered-multi-pull-request",
@@ -1406,10 +1802,12 @@ async function generateProvenance(options) {
         },
         head_domain_separation: {
           workflow_run_head_may_differ_from_status_and_pull_request_head: true,
+          caller_workflow_sha_may_differ_from_called_workflow_sha: true,
           consumer_must_not_require: [
             ...DISALLOWED_RUN_STATUS_HEAD_REQUIREMENTS,
           ],
         },
+        source_checkout: sourceCheckoutBindings,
         uploader: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
         authority: "run-bound-causal-consistency-evidence",
         provider_evidence_must_be_independently_revalidated: true,
@@ -1417,8 +1815,9 @@ async function generateProvenance(options) {
       },
       decision_table: {
         schema_id: DECISION_TABLE_SCHEMA_ID,
-        schema_version: 1,
-        policy_version: RELEASE,
+        schema_version: DECISION_TABLE_SCHEMA_VERSION,
+        policy_major: DECISION_POLICY_MAJOR,
+        policy_version: DECISION_POLICY_VERSION,
         raw_sha256: decisionTable.raw_sha256,
       },
     },
@@ -1428,10 +1827,10 @@ async function generateProvenance(options) {
       sourceCommit ||
     resolveRefObject(actionRepo, options.actionDefaultRef, "action default ref") !==
       actionCommit ||
-    resolveRefObject(actionRepo, options.immutableTagRef, "v1.4.0 tag ref") !==
-      tags["v1.4.0"].tag_object_oid ||
-    resolveRefObject(actionRepo, options.minorTagRef, "v1.4 tag ref") !==
-      tags["v1.4"].tag_object_oid ||
+    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.0 tag ref") !==
+      tags[EXPECTED_TAGS.immutable].tag_object_oid ||
+    resolveRefObject(actionRepo, options.minorTagRef, "v1.5 tag ref") !==
+      tags[EXPECTED_TAGS.minor].tag_object_oid ||
     resolveRefObject(actionRepo, options.majorTagRef, "v1 tag ref") !==
       tags.v1.tag_object_oid
   ) {
@@ -1449,31 +1848,90 @@ async function assertReleaseRefsStillStable(options, manifest) {
       manifest.source.commit_oid ||
     resolveRefObject(actionRepo, options.actionDefaultRef, "action default ref") !==
       manifest.action.commit_oid ||
-    resolveRefObject(actionRepo, options.immutableTagRef, "v1.4.0 tag ref") !==
-      manifest.tags["v1.4.0"].tag_object_oid ||
-    resolveRefObject(actionRepo, options.minorTagRef, "v1.4 tag ref") !==
-      manifest.tags["v1.4"].tag_object_oid ||
+    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.0 tag ref") !==
+      manifest.tags[EXPECTED_TAGS.immutable].tag_object_oid ||
+    resolveRefObject(actionRepo, options.minorTagRef, "v1.5 tag ref") !==
+      manifest.tags[EXPECTED_TAGS.minor].tag_object_oid ||
     resolveRefObject(actionRepo, options.majorTagRef, "v1 tag ref") !==
       manifest.tags.v1.tag_object_oid
   ) {
-    throw new Error("a release branch or tag ref changed before manifest publication");
+    throw new Error("a release branch or tag ref changed during manifest publication");
   }
 }
 
-async function writeManifest(outputPath, manifest, { beforePublish } = {}) {
+export async function writeManifest(
+  outputPath,
+  manifest,
+  { beforePublish, finalPrePublish } = {},
+) {
   const absoluteOutput = resolve(outputPath);
   await mkdir(dirname(absoluteOutput), { recursive: true });
   const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  const temporary = `${absoluteOutput}.tmp-${process.pid}`;
+  const stagingDirectory = await mkdtemp(`${absoluteOutput}.tmp-`);
+  const temporary = join(stagingDirectory, "manifest");
+  let temporaryHandle;
   try {
-    await writeFile(temporary, bytes, { flag: "wx", mode: 0o600 });
+    const stagingIdentity = await lstat(stagingDirectory, { bigint: true });
+    if (
+      typeof process.getuid !== "function" ||
+      typeof process.getgid !== "function" ||
+      !stagingIdentity.isDirectory() ||
+      (stagingIdentity.mode & 0o777n) !== 0o700n ||
+      stagingIdentity.uid !== BigInt(process.getuid()) ||
+      stagingIdentity.gid !== BigInt(process.getgid())
+    ) {
+      throw new Error(
+        "manifest staging directory is not an owner-private POSIX directory",
+      );
+    }
+    temporaryHandle = await open(temporary, "wx", 0o600);
+    await temporaryHandle.writeFile(bytes);
+    await temporaryHandle.sync();
     if (beforePublish) {
       await beforePublish();
     }
-    await rename(temporary, absoluteOutput);
+    if (finalPrePublish) {
+      await finalPrePublish();
+    }
+    const handleIdentity = await temporaryHandle.stat({ bigint: true });
+    const pathIdentity = await lstat(temporary, { bigint: true });
+    const stagedBytes = await readFile(temporary);
+    if (
+      !handleIdentity.isFile() ||
+      !pathIdentity.isFile() ||
+      handleIdentity.dev !== pathIdentity.dev ||
+      handleIdentity.ino !== pathIdentity.ino ||
+      handleIdentity.mode !== pathIdentity.mode ||
+      handleIdentity.uid !== pathIdentity.uid ||
+      handleIdentity.gid !== pathIdentity.gid ||
+      (handleIdentity.mode & 0o777n) !== 0o600n ||
+      handleIdentity.size !== BigInt(bytes.length) ||
+      !stagedBytes.equals(bytes)
+    ) {
+      throw new Error(
+        "manifest staging object identity, access policy, or content changed",
+      );
+    }
+    // The output path is a create-only publication boundary. Linking commits
+    // the verified object from this invocation's owner-private staging directory
+    // without replacing any existing path. Hostile code already running as the
+    // same OS account remains outside this local publication boundary.
+    try {
+      await link(temporary, absoluteOutput);
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        throw new Error(
+          `output already exists; refusing to replace ${absoluteOutput}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
   } catch (error) {
-    await rm(temporary, { force: true });
     throw error;
+  } finally {
+    await temporaryHandle?.close();
+    await rm(stagingDirectory, { recursive: true, force: true });
   }
   return { absoluteOutput, digest: sha256(bytes) };
 }
@@ -1490,6 +1948,7 @@ async function main(argv = process.argv.slice(2)) {
     manifest,
     {
       beforePublish: () => assertReleaseRefsStillStable(options, manifest),
+      finalPrePublish: () => assertReleaseRefsStillStable(options, manifest),
     },
   );
   process.stdout.write(`${absoluteOutput}\nsha256:${digest}\n`);

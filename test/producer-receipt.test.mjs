@@ -19,6 +19,7 @@ const HEAD_SHA = "01c3f9da03e7adfdcd4176cb927dc450436da8f4";
 const ACTION_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKFLOW_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const JOB_WORKFLOW_SHA = "cccccccccccccccccccccccccccccccccccccccc";
+const OTHER_WORKFLOW_SHA = "dddddddddddddddddddddddddddddddddddddddd";
 const RUN_ID = "24680";
 const RUN_ATTEMPT = "7";
 const RUN_URL =
@@ -30,6 +31,10 @@ const JOB_WORKFLOW_REF =
 const JOB_WORKFLOW_REPOSITORY = "owner/workflows";
 const JOB_WORKFLOW_FILE_PATH = ".github/workflows/codex-review.yml";
 const ACTION_REPOSITORY = "JoeyTeng/codex-review-gate-action";
+const CANONICAL_REUSABLE_WORKFLOW_FILE_PATH =
+  ".github/workflows/codex-review-gate.yml";
+const CANONICAL_REUSABLE_WORKFLOW_REF =
+  `${ACTION_REPOSITORY}/${CANONICAL_REUSABLE_WORKFLOW_FILE_PATH}@refs/tags/v1`;
 const STATUS_CONTEXT = "codex/review-gate";
 
 test("receipt records the immutable producer and forced current-head status POST", async () => {
@@ -178,6 +183,256 @@ test("a floating action ref remains explicit and non-immutable", async () => {
     status_count: 0,
   });
   assert.deepEqual(receipt.statuses, []);
+});
+
+test("the canonical v1 reusable workflow maps its resolved job SHA to the action identity", async () => {
+  const { result, receipt, output } = await runReceiptGate({
+    actionRepository: "",
+    actionRef: "",
+    jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
+    jobWorkflowSha: JOB_WORKFLOW_SHA,
+    jobWorkflowRepository: ACTION_REPOSITORY,
+    jobWorkflowFilePath: CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+    eventName: "push",
+    event: {},
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(output, "producer-receipt-finalized=true\n");
+  assert.deepEqual(receipt.producer.environment, {
+    GITHUB_WORKFLOW_REF: WORKFLOW_REF,
+    GITHUB_WORKFLOW_SHA: WORKFLOW_SHA,
+  });
+  assert.deepEqual(receipt.producer.job, {
+    id: "review-gate",
+    workflow_ref: CANONICAL_REUSABLE_WORKFLOW_REF,
+    workflow_sha: JOB_WORKFLOW_SHA,
+    workflow_repository: ACTION_REPOSITORY,
+    workflow_file_path: CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+  });
+  assert.deepEqual(receipt.producer.action, {
+    repository: ACTION_REPOSITORY,
+    ref: JOB_WORKFLOW_SHA,
+    commit_sha: JOB_WORKFLOW_SHA,
+    immutable: true,
+  });
+});
+
+test("near-canonical reusable workflow tuples remain non-immutable", async (t) => {
+  const scenarios = [
+    {
+      name: "repository case differs",
+      jobWorkflowRepository: "joeyteng/codex-review-gate-action",
+    },
+    {
+      name: "repository has trailing whitespace",
+      jobWorkflowRepository: `${ACTION_REPOSITORY} `,
+    },
+    {
+      name: "workflow path differs",
+      jobWorkflowFilePath: ".github/workflows/review-gate.yml",
+    },
+    {
+      name: "workflow path case differs",
+      jobWorkflowFilePath: ".github/workflows/Codex-review-gate.yml",
+    },
+    {
+      name: "workflow ref uses the shorthand tag",
+      jobWorkflowRef:
+        `${ACTION_REPOSITORY}/${CANONICAL_REUSABLE_WORKFLOW_FILE_PATH}@v1`,
+    },
+    {
+      name: "workflow ref uses a branch",
+      jobWorkflowRef:
+        `${ACTION_REPOSITORY}/${CANONICAL_REUSABLE_WORKFLOW_FILE_PATH}@refs/heads/v1`,
+    },
+    {
+      name: "workflow ref uses a minor tag",
+      jobWorkflowRef:
+        `${ACTION_REPOSITORY}/${CANONICAL_REUSABLE_WORKFLOW_FILE_PATH}@refs/tags/v1.4`,
+    },
+    {
+      name: "workflow ref tag case differs",
+      jobWorkflowRef:
+        `${ACTION_REPOSITORY}/${CANONICAL_REUSABLE_WORKFLOW_FILE_PATH}@refs/tags/V1`,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const { result, receipt, output } = await runReceiptGate({
+        actionRepository: "",
+        actionRef: "",
+        jobWorkflowRef:
+          scenario.jobWorkflowRef || CANONICAL_REUSABLE_WORKFLOW_REF,
+        jobWorkflowSha: JOB_WORKFLOW_SHA,
+        jobWorkflowRepository:
+          scenario.jobWorkflowRepository || ACTION_REPOSITORY,
+        jobWorkflowFilePath:
+          scenario.jobWorkflowFilePath || CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+        eventName: "push",
+        event: {},
+      });
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(output, "producer-receipt-finalized=true\n");
+      assert.deepEqual(receipt.producer.action, {
+        repository: null,
+        ref: null,
+        commit_sha: null,
+        immutable: false,
+      });
+    });
+  }
+});
+
+test("canonical reusable workflow identity rejects malformed job SHAs", async (t) => {
+  const scenarios = [
+    ["upper-case", JOB_WORKFLOW_SHA.toUpperCase()],
+    ["short", JOB_WORKFLOW_SHA.slice(0, -1)],
+    ["padded", ` ${JOB_WORKFLOW_SHA}`],
+  ];
+
+  for (const [name, jobWorkflowSha] of scenarios) {
+    await t.test(name, async () => {
+      const { result, receiptRaw, output } = await runReceiptGate({
+        actionRepository: "",
+        actionRef: "",
+        jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
+        jobWorkflowSha,
+        jobWorkflowRepository: ACTION_REPOSITORY,
+        jobWorkflowFilePath: CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+        eventName: "push",
+        event: {},
+      });
+
+      assert.notEqual(result.code, 0);
+      assert.match(
+        result.stderr,
+        /CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA must be one lowercase full commit SHA/,
+      );
+      assert.equal(receiptRaw, null);
+      assert.equal(output, "");
+    });
+  }
+});
+
+test("the canonical reusable workflow identity cannot be replaced by action context", async (t) => {
+  const scenarios = [
+    {
+      name: "exact remote action",
+      actionRepository: ACTION_REPOSITORY,
+      actionRef: ACTION_SHA,
+    },
+    {
+      name: "floating remote action",
+      actionRepository: ACTION_REPOSITORY,
+      actionRef: "v1",
+    },
+    {
+      name: "repository-only partial action context",
+      actionRepository: ACTION_REPOSITORY,
+      actionRef: "",
+    },
+    {
+      name: "exact-ref-only partial action context",
+      actionRepository: "",
+      actionRef: ACTION_SHA,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const { result, receipt } = await runReceiptGate({
+        actionRepository: scenario.actionRepository,
+        actionRef: scenario.actionRef,
+        jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
+        jobWorkflowSha: JOB_WORKFLOW_SHA,
+        jobWorkflowRepository: ACTION_REPOSITORY,
+        jobWorkflowFilePath: CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+        eventName: "push",
+        event: {},
+      });
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.deepEqual(receipt.producer.action, {
+        repository: ACTION_REPOSITORY,
+        ref: JOB_WORKFLOW_SHA,
+        commit_sha: JOB_WORKFLOW_SHA,
+        immutable: true,
+      });
+    });
+  }
+});
+
+test("an ordinary local action does not inherit its job workflow identity", async () => {
+  const { result, receipt } = await runReceiptGate({
+    actionRepository: "",
+    actionRef: "",
+    eventName: "push",
+    event: {},
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(receipt.producer.action, {
+    repository: null,
+    ref: null,
+    commit_sha: null,
+    immutable: false,
+  });
+});
+
+test("canonical reusable identity keeps the caller workflow binding independent", async (t) => {
+  const scenarios = [
+    ["ref mismatch", { CODEX_REVIEW_GATE_WORKFLOW_REF: `${WORKFLOW_REF}-other` }],
+    ["SHA mismatch", { CODEX_REVIEW_GATE_WORKFLOW_SHA: OTHER_WORKFLOW_SHA }],
+  ];
+
+  for (const [name, env] of scenarios) {
+    await t.test(name, async () => {
+      const { result, receiptRaw, output } = await runReceiptGate({
+        actionRepository: "",
+        actionRef: "",
+        jobWorkflowRef: CANONICAL_REUSABLE_WORKFLOW_REF,
+        jobWorkflowSha: JOB_WORKFLOW_SHA,
+        jobWorkflowRepository: ACTION_REPOSITORY,
+        jobWorkflowFilePath: CANONICAL_REUSABLE_WORKFLOW_FILE_PATH,
+        eventName: "push",
+        event: {},
+        env,
+      });
+
+      assert.notEqual(result.code, 0);
+      assert.match(
+        result.stderr,
+        /producer receipt workflow context did not match GITHUB_WORKFLOW_REF\/SHA/,
+      );
+      assert.equal(receiptRaw, null);
+      assert.equal(output, "");
+    });
+  }
+});
+
+test("receipt provenance variables stay bound to GitHub server contexts", async () => {
+  const actionDefinition = await readFile(actionDefinitionPath, "utf8");
+  const expectedBindings = [
+    "CODEX_REVIEW_GATE_ACTION_REPOSITORY: ${{ github.action_repository }}",
+    "CODEX_REVIEW_GATE_ACTION_REF: ${{ github.action_ref }}",
+    "CODEX_REVIEW_GATE_WORKFLOW_REF: ${{ github.workflow_ref }}",
+    "CODEX_REVIEW_GATE_WORKFLOW_SHA: ${{ github.workflow_sha }}",
+    "CODEX_REVIEW_GATE_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}",
+    "CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}",
+    "CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}",
+    "CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}",
+  ];
+
+  for (const binding of expectedBindings) {
+    assert.equal(
+      actionDefinition.split("\n").some((line) => line.trim() === binding),
+      true,
+      `action.yml must bind ${binding}`,
+    );
+  }
 });
 
 test("the action disables producer receipts outside GitHub.com", async () => {
@@ -402,7 +657,12 @@ test("job workflow identity is mandatory before a receipt can be finalized", asy
 });
 
 async function runReceiptGate({
+  actionRepository = ACTION_REPOSITORY,
   actionRef = ACTION_SHA,
+  jobWorkflowRef = JOB_WORKFLOW_REF,
+  jobWorkflowSha = JOB_WORKFLOW_SHA,
+  jobWorkflowRepository = JOB_WORKFLOW_REPOSITORY,
+  jobWorkflowFilePath = JOB_WORKFLOW_FILE_PATH,
   eventName = "pull_request_target",
   event = {
     pull_request: { number: 1, head: { sha: HEAD_SHA } },
@@ -442,14 +702,14 @@ async function runReceiptGate({
     GITHUB_WORKFLOW_SHA: WORKFLOW_SHA,
     GITHUB_JOB: "review-gate",
     CODEX_REVIEW_GATE_RECEIPT_PATH: receiptEnabled ? receiptPath : "",
-    CODEX_REVIEW_GATE_ACTION_REPOSITORY: ACTION_REPOSITORY,
+    CODEX_REVIEW_GATE_ACTION_REPOSITORY: actionRepository,
     CODEX_REVIEW_GATE_ACTION_REF: actionRef,
     CODEX_REVIEW_GATE_WORKFLOW_REF: WORKFLOW_REF,
     CODEX_REVIEW_GATE_WORKFLOW_SHA: WORKFLOW_SHA,
-    CODEX_REVIEW_GATE_JOB_WORKFLOW_REF: JOB_WORKFLOW_REF,
-    CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA: JOB_WORKFLOW_SHA,
-    CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY: JOB_WORKFLOW_REPOSITORY,
-    CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH: JOB_WORKFLOW_FILE_PATH,
+    CODEX_REVIEW_GATE_JOB_WORKFLOW_REF: jobWorkflowRef,
+    CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA: jobWorkflowSha,
+    CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY: jobWorkflowRepository,
+    CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH: jobWorkflowFilePath,
     MARKER_ACK_TIMEOUT_SECONDS: "300",
     MARKER_ACK_TIMEOUT_MAX_SECONDS: "1800",
     MARKER_TIMEOUT_SECONDS: "3600",
