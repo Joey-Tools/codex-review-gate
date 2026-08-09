@@ -86,6 +86,12 @@ const MAX_STATUS_READ_BYTES = 4 * 1024 * 1024;
 const MAX_STATUS_READ_REQUEST_ATTEMPTS = 16;
 const PRODUCER_RECEIPT_SCHEMA =
   "urn:joeyteng:codex-review-gate:producer-receipt:1";
+const CANONICAL_ACTION_REPOSITORY = "JoeyTeng/codex-review-gate-action";
+const CANONICAL_REUSABLE_WORKFLOW_FILE_PATH =
+  ".github/workflows/codex-review-gate.yml";
+const CANONICAL_REUSABLE_WORKFLOW_REF =
+  `${CANONICAL_ACTION_REPOSITORY}/${CANONICAL_REUSABLE_WORKFLOW_FILE_PATH}` +
+  "@refs/tags/v1";
 
 const config = readConfig();
 const repo = parseRepo(config.repository);
@@ -3384,11 +3390,21 @@ function createProducerReceipt() {
     );
   }
 
-  const actionRef = process.env.CODEX_REVIEW_GATE_ACTION_REF || null;
-  const actionRepository = process.env.CODEX_REVIEW_GATE_ACTION_REPOSITORY || null;
-  const actionCommitSha = actionRef && /^[0-9a-f]{40}$/.test(actionRef)
-    ? actionRef
-    : null;
+  const jobWorkflow = {
+    workflow_ref: requiredEnv("CODEX_REVIEW_GATE_JOB_WORKFLOW_REF"),
+    workflow_sha: fullShaEnv("CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA"),
+    workflow_repository: requiredEnv(
+      "CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY",
+    ),
+    workflow_file_path: requiredEnv(
+      "CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH",
+    ),
+  };
+  const action = producerActionIdentity({
+    actionRepository: process.env.CODEX_REVIEW_GATE_ACTION_REPOSITORY || null,
+    actionRef: process.env.CODEX_REVIEW_GATE_ACTION_REF || null,
+    jobWorkflow,
+  });
   const runId = decimalEnv("GITHUB_RUN_ID");
   const runAttempt = decimalEnv("GITHUB_RUN_ATTEMPT");
   const artifactName = `codex-review-gate-producer-receipt-${runId}-${runAttempt}`;
@@ -3416,21 +3432,9 @@ function createProducerReceipt() {
         },
         job: {
           id: requiredEnv("GITHUB_JOB"),
-          workflow_ref: requiredEnv("CODEX_REVIEW_GATE_JOB_WORKFLOW_REF"),
-          workflow_sha: fullShaEnv("CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA"),
-          workflow_repository: requiredEnv(
-            "CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY",
-          ),
-          workflow_file_path: requiredEnv(
-            "CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH",
-          ),
+          ...jobWorkflow,
         },
-        action: {
-          repository: actionRepository,
-          ref: actionRef,
-          commit_sha: actionCommitSha,
-          immutable: actionCommitSha !== null,
-        },
+        action,
       },
       execution: {
         result: "running",
@@ -3438,6 +3442,40 @@ function createProducerReceipt() {
       },
       statuses: [],
     },
+  };
+}
+
+function producerActionIdentity({ actionRepository, actionRef, jobWorkflow }) {
+  const canonicalReusableWorkflow =
+    jobWorkflow.workflow_repository === CANONICAL_ACTION_REPOSITORY &&
+    jobWorkflow.workflow_file_path === CANONICAL_REUSABLE_WORKFLOW_FILE_PATH &&
+    jobWorkflow.workflow_ref === CANONICAL_REUSABLE_WORKFLOW_REF;
+  if (canonicalReusableWorkflow) {
+    return {
+      repository: jobWorkflow.workflow_repository,
+      ref: jobWorkflow.workflow_sha,
+      commit_sha: jobWorkflow.workflow_sha,
+      immutable: true,
+    };
+  }
+
+  const actionCommitSha = actionRef && /^[0-9a-f]{40}$/.test(actionRef)
+    ? actionRef
+    : null;
+  if (actionRepository !== null || actionRef !== null) {
+    return {
+      repository: actionRepository,
+      ref: actionRef,
+      commit_sha: actionCommitSha,
+      immutable: actionCommitSha !== null,
+    };
+  }
+
+  return {
+    repository: null,
+    ref: null,
+    commit_sha: null,
+    immutable: false,
   };
 }
 

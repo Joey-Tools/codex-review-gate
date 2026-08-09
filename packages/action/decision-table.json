@@ -1,6 +1,7 @@
 {
   "schema": "urn:joeyteng:codex-review-gate:decision-table:1",
   "schema_version": 1,
+  "policy_major": 1,
   "policy_version": "1.4.0",
   "pass_scope": "A pass means only that the required commit status for the current commit is success; it does not attest triple-review completion or pull-request merge readiness.",
   "status_precedence": [
@@ -306,8 +307,10 @@
     ]
   },
   "producer_receipt_boundary": {
-    "canonical_action_reference_format": "JoeyTeng/codex-review-gate-action@ followed by the exact lower-case 40-hex action commit",
-    "floating_tags": "v1 and v1.4 are convenience aliases only and never canonical provenance pins.",
+    "producer_protocol_major": 1,
+    "canonical_reusable_workflow_reference": "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+    "caller_selector": "v1",
+    "selector_authority": "The permanent v1 caller selector is not authority by itself; consumers must resolve and validate the exact called-workflow commit from the producer receipt and exact run-attempt referenced_workflows evidence.",
     "availability": "GitHub.com only; GitHub Enterprise Server runs do not emit producer receipt artifacts.",
     "artifact_name": "codex-review-gate-producer-receipt-{run_id}-{run_attempt}",
     "artifact_file": "codex-review-gate-producer-receipt.json",
@@ -328,9 +331,46 @@
       "required_equalities": [
         "id-equals-receipt-producer-run-id",
         "run_attempt-equals-receipt-producer-run-attempt",
-        "repository-full_name-equals-receipt-producer-repository",
-        "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA"
-      ]
+        "repository-full_name-equals-receipt-producer-repository"
+      ],
+      "referenced_workflows": {
+        "field": "referenced_workflows",
+        "availability": "optional-nullable-upstream-but-required-non-null-for-this-reusable-workflow-contract",
+        "selection": "exactly-one-exact-called-workflow-member",
+        "expected_path": "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+        "expected_ref": "refs/tags/v1",
+        "required_equalities": [
+          "selected-path-equals-JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+          "selected-ref-equals-refs/tags/v1",
+          "selected-sha-equals-receipt-producer-job-workflow_sha",
+          "selected-sha-equals-validated-release-provenance-action-commit_oid",
+          "selected-path-repository-and-file-equal-receipt-producer-job-workflow_repository-and-workflow_file_path"
+        ],
+        "rerun_resolution": "Validate referenced_workflows from the exact receipt run attempt; never substitute the current v1 target or evidence from another attempt.",
+        "tag_drift": "A later v1 move does not change the exact called-workflow SHA recorded for an earlier run attempt.",
+        "authority": "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding"
+      }
+    },
+    "called_workflow_authority": {
+      "availability": "github.com-only-job-context",
+      "repository": "JoeyTeng/codex-review-gate-action",
+      "workflow_file_path": ".github/workflows/codex-review-gate.yml",
+      "caller_selector": "v1",
+      "caller_ref": "refs/tags/v1",
+      "caller_identity_role": "producer.environment.GITHUB_WORKFLOW_REF/SHA-identifies-caller-workflow-file",
+      "called_job_identity_role": "producer.job.workflow_ref/SHA/repository/file_path-identifies-workflow-file-defining-current-job",
+      "required_equalities": [
+        "receipt-producer-job-workflow_repository-equals-JoeyTeng/codex-review-gate-action",
+        "receipt-producer-job-workflow_file_path-equals-.github/workflows/codex-review-gate.yml",
+        "receipt-producer-job-workflow_ref-equals-JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@refs/tags/v1",
+        "receipt-producer-job-workflow_sha-is-lower-case-40-hex",
+        "receipt-producer-job-workflow_sha-equals-validated-release-provenance-action-commit_oid",
+        "receipt-producer-action-repository-equals-receipt-producer-job-workflow_repository",
+        "receipt-producer-action-ref-equals-receipt-producer-job-workflow_sha",
+        "receipt-producer-action-commit_sha-equals-receipt-producer-job-workflow_sha",
+        "receipt-producer-action-immutable-is-true"
+      ],
+      "caller_called_sha_domain_separation": "GITHUB_WORKFLOW_SHA identifies the caller workflow file and must not be required to equal producer.job.workflow_sha for a reusable invocation."
     },
     "artifact_run_association": {
       "required_equalities": [
@@ -351,7 +391,9 @@
       "workflow_run_head_may_differ_from_status_and_pull_request_head": true,
       "consumer_must_not_require": [
         "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
-        "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha"
+        "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha",
+        "exact-run-attempt-head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
+        "receipt-producer-environment-GITHUB_WORKFLOW_SHA-equals-receipt-producer-job-workflow_sha"
       ]
     },
     "positive_consumer_requirement": {
@@ -366,6 +408,6 @@
       }
     },
     "provenance_strength": "A validated run-bound artifact is causal producer evidence, not a signature, OIDC attestation, cryptographic provenance proof, or content-addressed storage guarantee.",
-    "consumer_requirement": "Consumers must validate the exact run-attempt API response, run-level artifact inventory, attempt-specific artifact name, artifact metadata/run association/id/url/digest and receipt bytes, REST status membership, GraphQL StatusContext membership, exact workflow/action bindings, and independently re-reduce provider evidence."
+    "consumer_requirement": "Consumers must validate the exact run-attempt API response and its exactly selected referenced-workflow member, resolved called-workflow release provenance, run-level artifact inventory, attempt-specific artifact name, artifact metadata/run association/id/url/digest and receipt bytes, REST status membership, GraphQL StatusContext membership, exact workflow/action bindings, and independently re-reduce provider evidence."
   }
 }

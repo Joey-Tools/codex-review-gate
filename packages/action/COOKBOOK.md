@@ -6,6 +6,11 @@ Languages: [British English (en-GB)](COOKBOOK.md) | [简体中文 (zh-CN)](COOKB
 
 Use this path after the workflow is merged to the repository default branch and `codex/review-gate` is required by the ruleset.
 
+For the v1.5 rollout, do not activate the reusable caller in the source root or
+template until the immutable v1.5.0 release/provenance asset exists, the `v1.5`
+and `v1` aliases are verified, and a live canary passes. Activation is a
+separate follow-up PR; the release PR leaves both existing callers unchanged.
+
 1. Open or update a ready PR.
 2. The workflow writes `codex/review-gate = pending` and posts a controlled `@codex review` marker.
 3. Wait for Codex to respond.
@@ -25,7 +30,8 @@ authorise either result.
 `success` means only that this required commit status passed. It does not
 attest a named triple review or the PR's overall merge readiness.
 The authoritative machine-readable reducer policy is
-[`decision-table.json`](decision-table.json), `policy_version: 1.4.0`.
+[`decision-table.json`](decision-table.json), `policy_major: 1` and
+`policy_version: 1.4.0`.
 
 Commit Status is per repository SHA/context, not per PR. Multiple open PRs
 with the same head share the status and branch-protection signal, so the status
@@ -33,15 +39,28 @@ itself cannot prove PR isolation.
 
 ## Verify Action Provenance
 
-Use this path when a review or readiness skill needs to rely on the gate. Keep
-the run-attempt head domain separate from the current-PR/status head domain;
-their authoritative machine-readable contract is `producer_receipt_boundary`
-in [`decision-table.json`](decision-table.json):
+Use this path when a review or readiness Skill needs to rely on the gate. Keep
+four SHA domains separate: caller workflow definition
+(`github.workflow_sha`), exact API run-attempt head (`head_sha`), called
+implementation (`job.workflow_sha`), and current PR/status head. Never require
+the run-attempt `head_sha` or Artifact API `workflow_run.head_sha` to equal the
+selected receipt status head; the run-attempt head to equal
+`GITHUB_WORKFLOW_SHA`; or `GITHUB_WORKFLOW_SHA` to equal `job.workflow_sha`.
+The caller workflow SHA identifies the caller workflow revision. The
+authoritative machine-readable contract is `producer_receipt_boundary` in
+[`decision-table.json`](decision-table.json):
 
-1. Confirm the repository workflow pins
-   `JoeyTeng/codex-review-gate-action@<exact-action-repository-40-sha>` using
-   the value published in the release notes/provenance manifest. Reject
-   floating `@v1.4` or `@v1` as provenance; they are convenience aliases.
+1. Select the structural mode before validation. After activation, canonical
+   GitHub.com reusable mode requires
+   `jobs.<job>.uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`.
+   Floating `@v1` is the intentional centralised pre-execution trust boundary,
+   not post-run immutable provenance. Direct mode instead requires
+   `JoeyTeng/codex-review-gate-action@<exact-lower-case-40-sha>` and is the
+   GitHub Enterprise Server fallback. Never downgrade failed reusable evidence
+   to direct mode.
+   This receipt-backed positive verification path is GitHub.com-only. GHES
+   direct fallback can run the gate, but it cannot supply that admission
+   decision.
 2. For the exact run and attempt-specific name
    `codex-review-gate-producer-receipt-<run_id>-<attempt>`, query the Artifact
    API and require `total_count == 1`. A missing, expired, deleted, duplicate,
@@ -55,24 +74,39 @@ in [`decision-table.json`](decision-table.json):
    which is an API URL. Require REST `.digest` to equal `sha256:` plus the raw
    64-hex output digest. Download the artifact, verify its digest, and require
    exactly one file named `codex-review-gate-producer-receipt.json`. Validate
-   it against `producer-receipt.schema.json` at the root of the exact pinned
-   published action commit; its path in this source repository is
+   it against `producer-receipt.schema.json` at the root of the dynamically
+   admitted called commit or directly pinned action commit; its path in this
+   source repository is
    `packages/action/producer-receipt.schema.json`. Although the schema permits
    finalized `completed` and `failed` receipts, this positive path requires
    `execution.result == completed`; a `failed` receipt is audit-only for a
    positive decision.
 4. Require GitHub.com, exact run/attempt/attempt-specific target URL, current
-   repository, exact expected action repository and 40-SHA with
-   `immutable: true`, and all expected environment/workflow/job fields. The
-   `job.workflow_*` fields are GitHub.com-only. Fetch the attempt through the
-   attempt-specific Workflow Run request endpoint; its response `url` and
-   `html_url` remain base-run resource URLs and need not equal the
-   attempt-specific status target. Within the run-attempt head domain, require
-   the exact run-attempt response `head_sha` to equal
-   `receipt.producer.environment.GITHUB_WORKFLOW_SHA`. Require the Artifact API
-   record's `workflow_run.id` and `workflow_run.head_sha` to equal the exact
-   run-attempt response `id` and `head_sha`, respectively.
-5. Within the current-PR/status head domain, REST-list all Commit Status
+   repository, all expected caller/workflow/job fields, and
+   `execution.result == completed`. Reusable mode requires the exact canonical
+   `job.workflow_*` tuple and its mapped action repository and
+   `job.workflow_sha` with `immutable: true`; direct mode requires the expected
+   action repository and lower-case 40-SHA with `immutable: true`.
+5. Fetch the attempt with
+   `GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}`. Its
+   response `url` and `html_url` remain base-run resource URLs. Match the
+   Artifact API `workflow_run.id/head_sha` to the exact attempt response's
+   `id/head_sha`. In reusable mode, require the optional, nullable
+   `referenced_workflows` array to exist and contain exactly one matching
+   canonical repository/workflow-path and v1-call entry. Require its `sha` to
+   equal `job.workflow_sha`, the receipt action commit, and the admitted
+   release-provenance `action.commit_oid`; require its `ref` to exist and equal
+   `refs/tags/v1`. This is run-level corroboration only,
+   not a job/receipt mapping or cryptographic binding.
+6. In reusable mode, dynamically admit that called SHA with a
+   trusted-primary-signer-signed annotated immutable `v1.x.y` tag that peels
+   directly to it, the matching GitHub Release whose REST record has
+   `immutable: true`, and the complete release-provenance schema-v2 asset.
+   Require the repository immutable-release setting to be enabled. Verify
+   the trusted signer fingerprint, commit/tree/critical-file bindings, receipt
+   schema v1, and compatible `policy_major == 1`. Never infer a historical run
+   from the current `v1` target.
+7. Within the current-PR/status head domain, REST-list all Commit Status
    records with the request `ref` equal to the exact current PR head; the
    selected status must come from that exact-head response. Select the
    case-insensitive logical context's latest record, then require the exact
@@ -86,18 +120,17 @@ in [`decision-table.json`](decision-table.json):
    The selected member's creator must independently be exact
    `github-actions[bot]` with type `Bot`. Missing or non-unique membership
    fails closed.
-6. Re-read that node as a GraphQL `StatusContext` and independently confirm the
+8. Re-read that node as a GraphQL `StatusContext` and independently confirm the
    same exact context, state, and target URL. Require
    `StatusContext.commit.oid` to equal the exact current PR head and therefore
    the selected receipt status `head_sha`. Its creator must independently be
    exactly `github-actions[bot]` with type `Bot`; creator agreement alone is
-   insufficient. The exact run-attempt/artifact `head_sha` may legitimately
-   differ from this current PR/status head; never require equality between the
-   two head domains.
-7. Independently reload and reduce official provider evidence for the same PR
+   insufficient. All four SHA domains may legitimately differ; never invent
+   equality between them.
+9. Independently reload and reduce official provider evidence for the same PR
    named by the selected receipt member. Receipt v1 is causal producer evidence
    only; it does not prove clean evidence or replace provider reduction.
-8. Immediately before readiness consumes the result, final-REST-list the
+10. Immediately before readiness consumes the result, final-REST-list the
    exact-head statuses. The case-insensitive logical latest must remain the
    same REST ID/node ID with the exact context. Stably re-read PR
    head/lifecycle, exact run-attempt metadata, and the run-level artifact
@@ -105,6 +138,13 @@ in [`decision-table.json`](decision-table.json):
    exactly one artifact; every
    binding and the independent provider reduction must remain stable. Changes
    receive bounded retry and then fail closed.
+
+Canonical reusable callers accept compatible v1.x Action-only upgrades without
+a caller or Skill change; direct callers must update their exact pin. A
+protocol or policy major change requires a coordinated Skill update. Signature
+and release checks are point-in-time evidence, not a guarantee of historical or
+future revocation freshness; enforce a separate policy when that guarantee is
+required.
 
 The status POST and artifact upload are not atomic, and artifacts can expire or
 be deleted. Receipt v1 and its digest are not a cryptographic signature, OIDC
