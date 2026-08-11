@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const RELEASE = "1.5.1";
+const RELEASE = "1.5.2";
 const PROVENANCE_SCHEMA_VERSION = 2;
 const PRODUCER_PROTOCOL_MAJOR = 1;
 const RECEIPT_SCHEMA_VERSION = 1;
@@ -54,7 +54,7 @@ const DECISION_TABLE_SCHEMA_ID =
 const FROZEN_ACTION_DEFINITION_SHA256 =
   "3b73835ec0e8dfb2305f0801ebaa7b3f9ea04e02c72392e822aabcd25d2093be";
 const FROZEN_REUSABLE_WORKFLOW_SHA256 =
-  "41477ae365de28e360ddb7dd51f5a79196bdf7408bf3b1073353a69d06414301";
+  "c4b5c4eb61c8ae586357b44fffc951e751e7478685b56d299cb45ad391c659fb";
 const FROZEN_DECISION_TABLE_SHA256 =
   "6c04ccf20e5033639c2ba88931ea10ba7b6577189f91f6eaeea9b2792892b8a7";
 const PROVENANCE_SCHEMA_ID =
@@ -174,7 +174,7 @@ const SAFE_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const PLACEHOLDER_PATTERN = /<[^<>]+>/;
 
 const EXPECTED_TAGS = Object.freeze({
-  immutable: "v1.5.1",
+  immutable: "v1.5.2",
   minor: "v1.5",
   major: "v1",
 });
@@ -217,7 +217,7 @@ function usage() {
   --source-commit <40-sha> --source-default-ref refs/heads/master \\
   --action-repo <path> --action-repository ${ACTION_REPOSITORY} \\
   --action-commit <40-sha> --action-default-ref refs/heads/master \\
-  --immutable-tag-ref refs/tags/v1.5.1 \\
+  --immutable-tag-ref refs/tags/v1.5.2 \\
   --minor-tag-ref refs/tags/v1.5 --major-tag-ref refs/tags/v1 \\
   --output <path>
 
@@ -2050,7 +2050,7 @@ async function generateProvenance(options) {
       sourceCommit ||
     resolveRefObject(actionRepo, options.actionDefaultRef, "action default ref") !==
       actionCommit ||
-    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.1 tag ref") !==
+    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.2 tag ref") !==
       tags[EXPECTED_TAGS.immutable].tag_object_oid ||
     resolveRefObject(actionRepo, options.minorTagRef, "v1.5 tag ref") !==
       tags[EXPECTED_TAGS.minor].tag_object_oid ||
@@ -2071,7 +2071,7 @@ async function assertReleaseRefsStillStable(options, manifest) {
       manifest.source.commit_oid ||
     resolveRefObject(actionRepo, options.actionDefaultRef, "action default ref") !==
       manifest.action.commit_oid ||
-    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.1 tag ref") !==
+    resolveRefObject(actionRepo, options.immutableTagRef, "v1.5.2 tag ref") !==
       manifest.tags[EXPECTED_TAGS.immutable].tag_object_oid ||
     resolveRefObject(actionRepo, options.minorTagRef, "v1.5 tag ref") !==
       manifest.tags[EXPECTED_TAGS.minor].tag_object_oid ||

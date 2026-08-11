@@ -6,27 +6,33 @@ The Marketplace repository is a subtree split of `packages/action`. Everything
 needed at the root of `JoeyTeng/codex-review-gate-action`, including the
 reusable workflow, must live inside that directory.
 
-## Two-Phase Rollout Boundary
+## Compatible v1.x Rollout Boundary
 
-This procedure prepares the compatible v1.5.1 repair. The immutable v1.5.0
-release exists, but its live GitHub.com canary proved that an annotated `@v1`
-call reports the selected `v1` tag-object OID—not the peeled action commit—in
-both `job.workflow_sha` and `referenced_workflows[].sha`. Completing source
-changes does not mean that v1.5.1 has been released.
+This procedure prepares the compatible v1.5.2 targeted-schedule release.
+The immutable v1.5.1 release is the first admitted reusable-workflow baseline,
+and the source-root caller and repository template already select `@v1`.
+Completing source changes does not mean that v1.5.2 has been released.
 
-The release PR stages the reusable workflow only in `packages/action`. It must
-not activate the source-root caller, the repository template, or their root
-documentation. After the immutable v1.5.1 repair and provenance are published,
-the updated `v1.5` and `v1` aliases are verified, and a replacement live `@v1`
-canary passes, use a separate activation PR for those caller/template changes.
+The release PR changes the packaged reusable workflow in `packages/action`
+without changing producer protocol major 1, receipt schema v1, or decision
+policy 1.4. The packaged workflow recognises the closed
+`workflow_dispatch` marker `codex_review_gate_trigger=scheduled-target-v1` as
+schedule-equivalent for auto-retry gating and forwards
+`CODEX_REVIEW_GATE_AUTO_RETRY` to the composite Action. The marker remains
+caller event-payload protocol, not a new Action input.
 
-This order ensures that no active source or template caller delegates
-pre-execution trust to `@v1` before immutable post-run authority exists.
+Publish and verify the immutable v1.5.2 release and provenance before moving
+the signed `v1.5` and `v1` aliases together. Because active callers already
+select `@v1`, the alias transaction is the live activation boundary. Immediately
+afterwards, run an ordinary live `@v1` canary from the existing source-root
+caller. The source-root workflow does not expose the targeted dispatch marker;
+a downstream consumer branch must add that marker and pass its own targeted-
+dispatch canary before enabling per-PR scheduling.
 
 ## Preconditions
 
 - The source release commit is merged to the exact `master` tip.
-- Root `package.json` and `packages/action/package.json` both declare `1.5.1`.
+- Root `package.json` and `packages/action/package.json` both declare `1.5.2`.
 - `packages/action/decision-table.json` declares `schema_version: 1`,
   `policy_major: 1`, and `policy_version: 1.4.0`; its reviewed frozen raw
   SHA-256 is
@@ -53,11 +59,17 @@ pre-execution trust to `@v1` before immutable post-run authority exists.
   `commit` output is bound to the local composite only as
   `CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ steps.checkout.outputs.commit }}`,
   never a workflow-call/caller input. It contains no bare or PR checkout.
+- The reusable workflow treats only caller `workflow_dispatch` payloads with
+  exact `codex_review_gate_trigger: scheduled-target-v1` as targeted scheduled
+  scans. It forwards `vars.CODEX_REVIEW_GATE_AUTO_RETRY` through the fixed
+  `CODEX_REVIEW_GATE_AUTO_RETRY` environment binding, so `false` disables both
+  broad schedules and targeted scheduled dispatches. Neither value is exposed
+  as a caller-controlled Action input.
 - The other reviewed frozen raw SHA-256 values match the generator constants:
   `action.yml` is
   `3b73835ec0e8dfb2305f0801ebaa7b3f9ea04e02c72392e822aabcd25d2093be`,
   the reusable workflow is
-  `41477ae365de28e360ddb7dd51f5a79196bdf7408bf3b1073353a69d06414301`,
+  `c4b5c4eb61c8ae586357b44fffc951e751e7478685b56d299cb45ad391c659fb`,
   and `producer-receipt.schema.json` is
   `89decfcabeeab817a975b1118498375c4eafe730b35e2cb9aa5c4abde6637b77`.
 - Source checks, package checks, tests, and the release split validation pass.
@@ -143,12 +155,12 @@ After sync, require all of the following:
 Create three direct signed annotated tags in the action repository, all peeling
 to the same verified action commit:
 
-1. immutable release tag `v1.5.1`;
+1. immutable release tag `v1.5.2`;
 2. minor compatibility alias `v1.5`; and
 3. major compatibility alias `v1`.
 
-Never move either `v1.5.0` or `v1.5.1`. The v1.5.1 release advances the two
-compatibility aliases only; leave every immutable and older release tag
+Never move `v1.5.0`, `v1.5.1`, or `v1.5.2`. The v1.5.2 release advances the
+two compatibility aliases only; leave every immutable and older release tag
 untouched. A generic `git push -f --tags` is prohibited.
 
 The generator resolves an absolute GnuPG executable, clears inherited `GIT_*`
@@ -164,7 +176,7 @@ primary fingerprint is the trust anchor.
 
 At the start of this release session, before replacing either local alias,
 freshly probe the remote and require strictly empty output for
-`refs/tags/v1.5.1`; require that local ref to be absent as well. If it exists,
+`refs/tags/v1.5.2`; require that local ref to be absent as well. If it exists,
 stop and audit it—never overwrite an immutable release ref. Read both existing
 remote `v1.5` and `v1` tag-object OIDs once and persist them as release
 evidence. Those previously observed values—not fresh values first seen
@@ -177,14 +189,14 @@ local tags:
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-release_evidence_path="v1.5.1-expected-remote-alias-tag-objects.tsv"
+release_evidence_path="v1.5.2-expected-remote-alias-tag-objects.tsv"
 test ! -e "$release_evidence_path"
 remote_immutable_record="$(
-  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5.1
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5.2
 )"
 test -z "$remote_immutable_record"
 if git -C "$action_repo_path" \
-  show-ref --verify --quiet refs/tags/v1.5.1; then
+  show-ref --verify --quiet refs/tags/v1.5.2; then
   exit 1
 else
   test "$?" -eq 1
@@ -219,8 +231,8 @@ git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
   -c "gpg.openpgp.program=$release_gpg_path" \
-  tag -s -a v1.5.1 "$action_release_commit" \
-  -m "codex-review-gate-action v1.5.1"
+  tag -s -a v1.5.2 "$action_release_commit" \
+  -m "codex-review-gate-action v1.5.2"
 git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
@@ -259,10 +271,10 @@ npm run release:provenance -- \
   --action-repository JoeyTeng/codex-review-gate-action \
   --action-commit "$action_release_commit" \
   --action-default-ref refs/heads/master \
-  --immutable-tag-ref refs/tags/v1.5.1 \
+  --immutable-tag-ref refs/tags/v1.5.2 \
   --minor-tag-ref refs/tags/v1.5 \
   --major-tag-ref refs/tags/v1 \
-  --output v1.5.1-release-provenance.json
+  --output v1.5.2-release-provenance.json
 ```
 
 The generator checks the source/action default refs and all three local tag
@@ -285,7 +297,7 @@ accepted only by hermetic tests under both explicit test guards.
 
 The deterministic asset has schema
 `urn:joeyteng:codex-review-gate:release-provenance:2`, `schema_version: 2`, and
-`release: 1.5.1`. Its exact top-level map is `compatibility`, `source`,
+`release: 1.5.2`. Its exact top-level map is `compatibility`, `source`,
 `action`, `runtime_closure`, `tags`, `proofs`, `released_tree`,
 `critical_files`, and `contracts` in addition to those identity fields.
 
@@ -338,9 +350,9 @@ verification still does not prove historical or future revocation freshness.
 
 ## Publish in the Safe Order
 
-Prepare `v1.5.1-release-notes.md` with no SHA placeholders. It must state:
+Prepare `v1.5.2-release-notes.md` with no SHA placeholders. It must state:
 
-- canonical post-activation caller
+- canonical live caller
   `jobs.<job>.uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`;
 - floating `@v1` is the centralised pre-execution trust boundary, while
   `job.workflow_sha`, exact-attempt `referenced_workflows[].sha`, and receipt
@@ -355,27 +367,33 @@ Prepare `v1.5.1-release-notes.md` with no SHA placeholders. It must state:
   compatibility;
 - producer protocol major 1, receipt schema v1, decision `policy_major: 1` and
   `policy_version: 1.4.0`;
+- the targeted scheduled-dispatch marker
+  `codex_review_gate_trigger=scheduled-target-v1`, the fixed
+  `CODEX_REVIEW_GATE_AUTO_RETRY` forwarding boundary, and that this transport
+  adds no composite Action input;
 - receipt output names and their causal/integrity-only limitations; and
-- the separate post-release activation gate.
+- the immediate post-alias ordinary live `@v1` canary gate, followed by a
+  targeted-dispatch canary from the downstream consumer branch before that
+  consumer enables per-PR scheduling.
 
 Publish in this order so an `@v1` consumer never sees new runtime code before
 its immutable release authority is available:
 
-1. Push only `refs/tags/v1.5.1`, without force, then verify its remote tag-object
+1. Push only `refs/tags/v1.5.2`, without force, then verify its remote tag-object
    OID and peeled action commit.
-2. Create a draft GitHub Release for `v1.5.1`; attach the final notes and
-   `v1.5.1-release-provenance.json` while it is still draft.
+2. Create a draft GitHub Release for `v1.5.2`; attach the final notes and
+   `v1.5.2-release-provenance.json` while it is still draft.
 3. Recheck the immutable-release repository setting, require the draft release
-   `tag_name`/`tagName` to be exact `v1.5.1`, and immediately before publish
+   `tag_name`/`tagName` to be exact `v1.5.2`, and immediately before publish
    re-read the remote direct tag-object OID and peeled commit. Both must equal
-   `tags["v1.5.1"].tag_object_oid/peeled_commit_oid` in the generated manifest;
+   `tags["v1.5.2"].tag_object_oid/peeled_commit_oid` in the generated manifest;
    also recheck the asset name, asset SHA-256, and notes, then publish the draft.
 4. After publish, require the release REST object to report exact tag name
-   `v1.5.1`, `draft: false`, `prerelease: false`, and `immutable: true`. Re-read
+   `v1.5.2`, `draft: false`, `prerelease: false`, and `immutable: true`. Re-read
    the remote direct tag-object OID and peeled commit against the same manifest
    fields before and after running
-   `gh release verify v1.5.1 --repo JoeyTeng/codex-review-gate-action` and
-   `gh release verify-asset v1.5.1 v1.5.1-release-provenance.json --repo JoeyTeng/codex-review-gate-action`, and
+   `gh release verify v1.5.2 --repo JoeyTeng/codex-review-gate-action` and
+   `gh release verify-asset v1.5.2 v1.5.2-release-provenance.json --repo JoeyTeng/codex-review-gate-action`, and
    independently re-downloading and digest-checking the asset. Any mismatch
    fails closed before the compatibility aliases move.
 5. Only after those checks succeed, read the exact `v1.5` and `v1` tag-object
@@ -398,17 +416,17 @@ The immutable tag and draft-to-published release steps have this shape:
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-generated_provenance_path="v1.5.1-release-provenance.json"
+generated_provenance_path="v1.5.2-release-provenance.json"
 manifest_immutable_tag_binding="$(
   jq -er '
       def oid:
         type == "string" and test("^[0-9a-f]{40}$");
       . as $manifest
-      | ($manifest.tags["v1.5.1"]) as $tag
+      | ($manifest.tags["v1.5.2"]) as $tag
       | select(
-          $manifest.release == "1.5.1" and
+          $manifest.release == "1.5.2" and
           ($manifest.action.commit_oid | oid) and
-          $tag.ref == "refs/tags/v1.5.1" and
+          $tag.ref == "refs/tags/v1.5.2" and
           $tag.annotated == true and
           ($tag.tag_object_oid | oid) and
           ($tag.peeled_commit_oid | oid) and
@@ -430,39 +448,39 @@ verify_remote_immutable_tag() {
 
   remote_tag_record="$(
     git -C "$action_repo_path" ls-remote --tags \
-      origin refs/tags/v1.5.1
+      origin refs/tags/v1.5.2
   )"
   test "$remote_tag_record" = \
-    "$expected_immutable_tag_object_oid"$'\trefs/tags/v1.5.1'
+    "$expected_immutable_tag_object_oid"$'\trefs/tags/v1.5.2'
   remote_peeled_record="$(
     git -C "$action_repo_path" ls-remote --tags \
-      origin 'refs/tags/v1.5.1^{}'
+      origin 'refs/tags/v1.5.2^{}'
   )"
   test "$remote_peeled_record" = \
-    "$expected_action_release_commit"$'\trefs/tags/v1.5.1^{}'
+    "$expected_action_release_commit"$'\trefs/tags/v1.5.2^{}'
 }
 
 git -C "$action_repo_path" push origin \
-  refs/tags/v1.5.1:refs/tags/v1.5.1
+  refs/tags/v1.5.2:refs/tags/v1.5.2
 
-gh release create v1.5.1 \
+gh release create v1.5.2 \
   --repo JoeyTeng/codex-review-gate-action \
   --draft \
   --verify-tag \
-  --title "codex-review-gate-action v1.5.1" \
-  --notes-file v1.5.1-release-notes.md \
-  v1.5.1-release-provenance.json
+  --title "codex-review-gate-action v1.5.2" \
+  --notes-file v1.5.2-release-notes.md \
+  v1.5.2-release-provenance.json
 
 draft_release_binding="$(
-  gh release view v1.5.1 \
+  gh release view v1.5.2 \
     --repo JoeyTeng/codex-review-gate-action \
     --json tagName,isDraft \
     --jq '[.tagName, .isDraft] | @tsv'
 )"
-test "$draft_release_binding" = $'v1.5.1\ttrue'
+test "$draft_release_binding" = $'v1.5.2\ttrue'
 verify_remote_immutable_tag
 
-gh release edit v1.5.1 \
+gh release edit v1.5.2 \
   --repo JoeyTeng/codex-review-gate-action \
   --draft=false
 
@@ -470,26 +488,26 @@ published_release_binding="$(
   gh api \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2026-03-10' \
-    repos/JoeyTeng/codex-review-gate-action/releases/tags/v1.5.1 \
+    repos/JoeyTeng/codex-review-gate-action/releases/tags/v1.5.2 \
     --jq '[.tag_name, .draft, .prerelease, .immutable] | @tsv'
 )"
-test "$published_release_binding" = $'v1.5.1\tfalse\tfalse\ttrue'
+test "$published_release_binding" = $'v1.5.2\tfalse\tfalse\ttrue'
 verify_remote_immutable_tag
 
-gh release verify v1.5.1 \
+gh release verify v1.5.2 \
   --repo JoeyTeng/codex-review-gate-action
 gh release verify-asset \
-  v1.5.1 \
-  v1.5.1-release-provenance.json \
+  v1.5.2 \
+  v1.5.2-release-provenance.json \
   --repo JoeyTeng/codex-review-gate-action
 
-published_provenance_path="v1.5.1-published-release-provenance.json"
+published_provenance_path="v1.5.2-published-release-provenance.json"
 test ! -e "$published_provenance_path"
-gh release download v1.5.1 \
+gh release download v1.5.2 \
   --repo JoeyTeng/codex-review-gate-action \
-  --pattern v1.5.1-release-provenance.json \
+  --pattern v1.5.2-release-provenance.json \
   --output "$published_provenance_path"
-cmp -s v1.5.1-release-provenance.json "$published_provenance_path"
+cmp -s v1.5.2-release-provenance.json "$published_provenance_path"
 verify_remote_immutable_tag
 ```
 
@@ -506,9 +524,9 @@ to the lower-case representation used by the generator.
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-generated_provenance_path="v1.5.1-release-provenance.json"
-published_provenance_path="v1.5.1-published-release-provenance.json"
-release_evidence_path="v1.5.1-expected-remote-alias-tag-objects.tsv"
+generated_provenance_path="v1.5.2-release-provenance.json"
+published_provenance_path="v1.5.2-published-release-provenance.json"
+release_evidence_path="v1.5.2-expected-remote-alias-tag-objects.tsv"
 trusted_primary_fingerprint_input="${TRUSTED_RELEASE_PRIMARY_FINGERPRINT:?}"
 release_gpg_path="$(realpath "$(command -v gpg)")"
 test -x "$release_gpg_path"
@@ -547,11 +565,11 @@ manifest_alias_binding="$(
             $manifest.schema ==
               "urn:joeyteng:codex-review-gate:release-provenance:2" and
             $manifest.schema_version == 2 and
-            $manifest.release == "1.5.1" and
+            $manifest.release == "1.5.2" and
             ($commit_oid | oid) and
-            ($manifest.tags["v1.5.1"] |
+            ($manifest.tags["v1.5.2"] |
               admitted_tag(
-                "v1.5.1";
+                "v1.5.2";
                 $commit_oid;
                 $trusted_primary_fingerprint
               )) and
@@ -659,15 +677,16 @@ both persisted pre-release alias tag-object OIDs with the other release evidence
 Do not replace either manifest-bound source OID with a local alias ref or
 re-resolve it after validation.
 
-## Live Canary and Activation
+## Live Canaries and Completion
 
 Treat the v1.5.0 canary as a fail-closed compatibility finding, not an erratum:
 its immutable provenance contract incorrectly treated GitHub's selected
 annotated `v1` tag-object OID as the peeled action commit. Do not admit v1.5.0
 through a digest-keyed exception and do not mutate its immutable release. After
-v1.5.1 is published and both aliases advance, run a replacement GitHub.com
-canary with the canonical caller selecting `@v1`. Require all of the following
-before activation:
+v1.5.2 is published and both aliases advance, immediately run a replacement
+ordinary GitHub.com canary with the existing source-root caller selecting
+`@v1`. Require all of the following before declaring the source release
+transaction complete:
 
 - the called job's `job.workflow_repository/file_path/ref/sha` is the canonical
   tuple and its SHA `W` equals exactly one declared workflow-SHA resolution
@@ -685,7 +704,7 @@ before activation:
   producer.action.ref` and the selected manifest candidate;
 - the independently signed exact `v1` tag object `T` verifies under the trusted
   primary signer and peels directly to `C == release-provenance.action.commit_oid`,
-  including in the future `W == C` branch; the signed immutable `v1.5.1` tag
+  including in the future `W == C` branch; the signed immutable `v1.5.2` tag
   peels to that same commit; the checkout output, receipt
   `producer.action.commit_sha`, action root tree, and critical files all match
   the provenance asset;
@@ -696,8 +715,16 @@ before activation:
   cryptographic or OIDC attestation; and
 - the canary did not checkout or execute PR code.
 
-Only then open the separate activation PR that changes the source-root caller,
-template caller, and root/template consumer documentation to `@v1`.
+The source-root workflow exposes only its existing pull-request input and native
+global schedule. Do not pre-activate the new marker there: v1.5.1 would
+misinterpret that dispatch while the floating alias still selects it. After the
+ordinary canary passes, use the downstream consumer branch that adds
+`codex_review_gate_trigger=scheduled-target-v1` to run a targeted-dispatch
+canary against one exact pull request. Require the same admission checks, the
+exact marker, and the intended auto-retry policy before that consumer enables
+or schedules per-PR dispatches. A targeted canary failure blocks only that
+consumer rollout; it does not justify mutating the immutable release or moving
+the aliases back without a separately reviewed recovery transaction.
 
 Future compatible v1.x Action-only releases can advance `v1` without changing
 the caller or Skill, provided the same dynamic admission accepts their signed

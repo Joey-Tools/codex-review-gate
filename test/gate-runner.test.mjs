@@ -25,6 +25,7 @@ const NEW_HEAD_SHA = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
 const LARGE_INLINE_COMMENT_ID = 3634927460;
 const CURRENT_RUN_URL =
   "https://github.example/owner/repo/actions/runs/12345/attempts/1";
+const TARGETED_SCHEDULED_SCAN_TRIGGER = "scheduled-target-v1";
 
 test("pull_request_target creates current-head state, marker, and pending status", async () => {
   await withHarness(async (harness) => {
@@ -2589,6 +2590,278 @@ test("scheduled scan skips PRs with no trusted gate state or marker", async () =
   });
 });
 
+test("targeted scheduled scan preserves stateful scheduled recovery without a global scan", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:50:00Z",
+      ackDeadlineAt: "2026-05-14T09:55:00Z",
+      nextRetryAt: "2026-05-14T09:55:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.at(-1).body.state, "pending");
+    assert.equal(harness.findMarkerComments().length, 2);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan skips a stateless ordinary PR without writes", async () => {
+  await withHarness(async (harness) => {
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+    assert.equal(harness.pullLoads, 1);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan preserves stateless Dependabot recovery", async () => {
+  await withHarness(async (harness) => {
+    harness.pullRequest.user = { login: "dependabot[bot]", type: "Bot" };
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.notEqual(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 1);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan skips a PR that is no longer open", async () => {
+  await withHarness(async (harness) => {
+    harness.pullRequest.state = "closed";
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /not open and unmerged; skipping targeted scheduled scan/);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+    assert.equal(harness.pullLoads, 1);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan skips an inconsistent open merged PR", async () => {
+  await withHarness(async (harness) => {
+    harness.pullRequest.merged = true;
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /not open and unmerged; skipping targeted scheduled scan/);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+    assert.equal(harness.pullLoads, 1);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan skips an open PR with a merged_at timestamp", async () => {
+  await withHarness(async (harness) => {
+    harness.pullRequest.merged_at = "2026-05-14T10:00:00Z";
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /not open and unmerged; skipping targeted scheduled scan/);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+    assert.equal(harness.pullLoads, 1);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan rejects a non-boolean merged flag before writes", async () => {
+  await withHarness(async (harness) => {
+    harness.pullRequest.merged = "false";
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /returned an invalid merged flag/);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+    assert.equal(harness.pullLoads, 1);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan rejects an invalid merged_at type before writes", async () => {
+  await withHarness(async (harness) => {
+    harness.pullRequest.merged_at = 1;
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /returned an invalid merged_at/);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(harness.findStateComment(), undefined);
+    assert.equal(harness.findMarkerComments().length, 0);
+    assert.equal(harness.pullLoads, 1);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan rechecks lifecycle after the candidate read", async () => {
+  await withHarness(async (harness) => {
+    harness.seedActiveMarker({
+      id: 2000,
+      headSha: HEAD_SHA,
+      createdAt: "2026-05-14T09:55:00Z",
+      baseline: {
+        plusOne: null,
+        eyes: null,
+        completionComment: null,
+        approvedReview: null,
+        submittedReview: null,
+      },
+    });
+    const pullPath =
+      `/repos/${harness.owner}/${harness.repo}/pulls/${harness.prNumber}`;
+    harness.afterPullLoad(1, {
+      action: "routeFault",
+      method: "GET",
+      path: pullPath,
+      fault: {
+        status: 200,
+        body: {
+          ...harness.pullRequest,
+          state: "closed",
+          merged: true,
+          merged_at: "2026-05-14T10:00:00Z",
+        },
+      },
+    });
+
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: { PR_NUMBER: "1" },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /no longer open and unmerged; skipping scheduled scan/);
+    assert.equal(harness.statuses.length, 0);
+    assert.equal(stateCommentWrites(harness), 0);
+    assert.equal(markerCommentWrites(harness), 0);
+    assert.equal(openPullRequestScanReads(harness), 0);
+  });
+});
+
+test("targeted scheduled scan honours disabled automatic retry before GitHub reads", async () => {
+  await withHarness(async (harness) => {
+    const result = await harness.runGate({
+      eventName: "workflow_dispatch",
+      event: targetedScheduledScanEvent(),
+      env: {
+        PR_NUMBER: "1",
+        CODEX_REVIEW_GATE_AUTO_RETRY: "false",
+      },
+    });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /Scheduled retry is disabled/);
+    assert.equal(harness.requestLog.length, 0);
+    assert.equal(harness.statuses.length, 0);
+  });
+});
+
+test("targeted scheduled scan rejects malformed dispatch metadata before GitHub writes", async () => {
+  const scenarios = [
+    {
+      name: "unknown trigger",
+      event: targetedScheduledScanEvent("1", "scheduled-target-v2"),
+      env: { PR_NUMBER: "1" },
+      error: /codex_review_gate_trigger must be exactly scheduled-target-v1/,
+    },
+    {
+      name: "missing pull request",
+      event: targetedScheduledScanEvent(""),
+      env: { PR_NUMBER: "1" },
+      error: /pull_request must be a positive integer/,
+    },
+    {
+      name: "mismatched pull request",
+      event: targetedScheduledScanEvent("2"),
+      env: { PR_NUMBER: "1" },
+      error: /pull_request must match PR_NUMBER/,
+    },
+    {
+      name: "missing action input",
+      event: targetedScheduledScanEvent(),
+      env: {},
+      error: /pull_request must match PR_NUMBER/,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await withHarness(async (harness) => {
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: scenario.event,
+        env: scenario.env,
+      });
+
+      assert.equal(result.code, 1, scenario.name);
+      assert.match(result.stderr, scenario.error, scenario.name);
+      assert.equal(harness.requestLog.length, 0, scenario.name);
+      assert.equal(harness.statuses.length, 0, scenario.name);
+    });
+  }
+});
+
 test("scheduled scan treats schema-malformed audit state as absent", async () => {
   await withHarness(async (harness) => {
     harness.commitStatuses.push({
@@ -3035,7 +3308,7 @@ test("targeted workflow_dispatch fails closed when snapshot loading errors after
 
     const result = await harness.runGate({
       eventName: "workflow_dispatch",
-      event: { inputs: { pull_request: "1" } },
+      event: targetedScheduledScanEvent(),
       env: { PR_NUMBER: "1" },
     });
 
@@ -7485,6 +7758,25 @@ function statusReads(harness) {
   ).length;
 }
 
+function targetedScheduledScanEvent(
+  pullRequest = "1",
+  trigger = TARGETED_SCHEDULED_SCAN_TRIGGER,
+) {
+  return {
+    inputs: {
+      pull_request: pullRequest,
+      codex_review_gate_trigger: trigger,
+    },
+  };
+}
+
+function openPullRequestScanReads(harness) {
+  return harness.requestLog.filter((entry) =>
+    entry.method === "GET" &&
+      entry.path === `/repos/${harness.owner}/${harness.repo}/pulls`,
+  ).length;
+}
+
 function successStatusWrites(harness) {
   return harness.requestLog.filter((entry) =>
     entry.method === "POST" &&
@@ -7682,6 +7974,8 @@ class GateHarness {
     return {
       number: this.prNumber,
       state: "open",
+      merged: false,
+      merged_at: null,
       draft: false,
       user: { login: "octocat" },
       head: {

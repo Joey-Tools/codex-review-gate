@@ -126,6 +126,14 @@ Event-driven review gate 的状态机、自动重试开关、**GHA 成本模型 
 
 高级设计中，需要在 runner 分配前生效的控制项应使用 repository 或 organization variables。例如，`CODEX_REVIEW_GATE_AUTO_RETRY=false` 可以在 job `if` 层跳过 scheduled retry job。Runtime `env` 仍可用于 job 启动后的 action 行为兼容，但不能阻止 GitHub Actions 分配 runner。
 
+Scheduler 可以通过 `workflow_dispatch` 逐个 PR fan out：同时传入正整数
+`pull_request` 与保留 event input
+`codex_review_gate_trigger: scheduled-target-v1`。这会为该 PR 选择更严格的
+scheduled-scan 语义（`allowCreateMarker: false`），并让所有 status writers 共享同一个
+per-PR concurrency group。该保留值不是来源认证或 provenance；手工 caller 也能填写它，
+但它只会相对普通 manual recovery 路径移除能力。不要把它加到 `action.yml`；runtime
+直接从 GitHub 已认证的 event payload 读取它。
+
 当前 source-root direct workflow 默认使用 `ubuntu-slim`。Direct composite caller 可以把
 `CODEX_REVIEW_GATE_RUNNER_LABELS` 设成 JSON array，例如
 `["self-hosted","linux","x64","codex-review-gate"]`；下面的 canonical reusable
@@ -145,12 +153,14 @@ on:
     types: [submitted]
   pull_request_review_comment:
     types: [created]
-  schedule:
-    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       pull_request:
-        description: Optional pull request number to gate
+        description: Pull request number to gate
+        required: true
+        type: string
+      codex_review_gate_trigger:
+        description: Reserved for scheduled per-PR dispatch
         required: false
         type: string
 
@@ -161,7 +171,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: codex-review-gate-${{ github.repository }}
+  group: codex-review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
   cancel-in-progress: false
 
 jobs:
@@ -170,10 +180,12 @@ jobs:
     uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1
 ```
 
-Caller 刻意保留完整 event set、permission ceiling 与 repository-wide concurrency group。
-Reusable workflow 负责可信 job filters、runner selection、timeout、exact called-repository
-checkout 与 composite step。调用 reusable workflow 的 job 不能再包含 `runs-on` 或
-`steps`。不要在 called workflow 里重复 caller 的 repository-wide concurrency group；
+Main caller 刻意保留 per-PR event set、permission ceiling 与 per-PR concurrency group。
+周期扫描应放到独立的 schedule-only dispatcher 中，由它使用保留值逐 PR 调用这个
+workflow；不得让 repository-global scan 与这个 per-PR caller 并发写 status。Reusable
+workflow 负责可信 job filters、runner selection、timeout、exact called-repository checkout
+与 composite step。调用 reusable workflow 的 job 不能再包含 `runs-on` 或 `steps`。不要
+在 called workflow 里重复 caller 的 concurrency group；
 cross-run serialisation boundary 应留在 caller 一侧。
 
 Called workflow 取得 caller 的 `GITHUB_TOKEN` permissions，且不能提升权限，因此无需

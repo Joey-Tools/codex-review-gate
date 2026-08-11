@@ -6,25 +6,28 @@ Marketplace repository 是 `packages/action` 的 subtree split。发布到
 `JoeyTeng/codex-review-gate-action` root 的所有内容，包括 reusable workflow，都必须
 位于该目录内。
 
-## 两阶段 Rollout Boundary
+## 兼容 v1.x Rollout Boundary
 
-本流程用于准备兼容修复 v1.5.1。Immutable v1.5.0 release 已存在，但其 live
-GitHub.com canary 证明 annotated `@v1` call 会在 `job.workflow_sha` 与
-`referenced_workflows[].sha` 中返回 selected `v1` tag-object OID，而不是 peeled action
-commit。完成源码修改不表示 v1.5.1 release 已发生。
+本流程用于准备兼容的 v1.5.2 targeted-schedule release。Immutable v1.5.1 release 是
+首个 admitted reusable-workflow baseline，source-root caller 与 repository template
+已经选择 `@v1`。完成源码修改不表示 v1.5.2 release 已发生。
 
-Release PR 只在 `packages/action` 中 stage reusable workflow。它不得激活 source-root
-caller、repository template 或对应 root 文档。只有 immutable v1.5.1 repair 与
-provenance 已发布、更新后的 `v1.5` 和 `v1` aliases 已验证且 replacement live `@v1`
-canary 通过后，才由独立 activation PR 修改 caller/template。
+Release PR 修改 `packages/action` 中 packaged reusable workflow，但不改变 producer
+protocol major 1、receipt schema v1 或 decision policy 1.4。Packaged workflow 把闭合的
+`workflow_dispatch` marker `codex_review_gate_trigger=scheduled-target-v1` 识别为
+auto-retry gating 的 schedule-equivalent，并把 `CODEX_REVIEW_GATE_AUTO_RETRY` 传入
+composite Action。该 marker 仍是 caller event-payload protocol，不是新 Action input。
 
-该顺序保证 active source/template caller 不会在 immutable post-run authority 就绪前，
-把 pre-execution trust 委托给 `@v1`。
+先发布并验证 immutable v1.5.2 release 与 provenance，再一起移动 signed `v1.5` 和
+`v1` aliases。Active callers 已选择 `@v1`，因此 alias transaction 是 live activation
+boundary。紧接着从现有 source-root caller 运行普通 live `@v1` canary。Source-root
+workflow 不暴露 targeted dispatch marker；downstream consumer branch 必须新增 marker，
+并在启用 per-PR scheduling 前通过自己的 targeted-dispatch canary。
 
 ## Preconditions
 
 - Source release commit 已 merge，且是 exact `master` tip。
-- Root `package.json` 与 `packages/action/package.json` 都声明 `1.5.1`。
+- Root `package.json` 与 `packages/action/package.json` 都声明 `1.5.2`。
 - `packages/action/decision-table.json` 声明 `schema_version: 1`、
   `policy_major: 1` 与 `policy_version: 1.4.0`；reviewed frozen raw SHA-256 为
   `6c04ccf20e5033639c2ba88931ea10ba7b6577189f91f6eaeea9b2792892b8a7`。
@@ -49,10 +52,15 @@ canary 通过后，才由独立 activation PR 修改 caller/template。
   `CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ steps.checkout.outputs.commit }}`
   传入 local composite，绝不能来自 workflow-call/caller input。不存在 bare checkout 或
   PR checkout。
+- Reusable workflow 只把 caller `workflow_dispatch` payload 中 exact
+  `codex_review_gate_trigger: scheduled-target-v1` 视为 targeted scheduled scan。它通过
+  fixed `CODEX_REVIEW_GATE_AUTO_RETRY` environment binding 转发
+  `vars.CODEX_REVIEW_GATE_AUTO_RETRY`，所以 `false` 会同时禁用 broad schedule 与
+  targeted scheduled dispatch。两者都不作为 caller-controlled Action input 暴露。
 - 其他 reviewed frozen raw SHA-256 与 generator constants 一致：`action.yml` 为
   `3b73835ec0e8dfb2305f0801ebaa7b3f9ea04e02c72392e822aabcd25d2093be`，
   reusable workflow 为
-  `41477ae365de28e360ddb7dd51f5a79196bdf7408bf3b1073353a69d06414301`，
+  `c4b5c4eb61c8ae586357b44fffc951e751e7478685b56d299cb45ad391c659fb`，
   `producer-receipt.schema.json` 为
   `89decfcabeeab817a975b1118498375c4eafe730b35e2cb9aa5c4abde6637b77`。
 - Source checks、package checks、tests 与 release split validation 全部通过。
@@ -132,11 +140,11 @@ scripts/release-action-subtree.sh --remote action --branch master --push
 在 action repository 中创建三个 direct signed annotated tags，并要求全部 peel 到同一个
 verified action commit：
 
-1. immutable release tag `v1.5.1`；
+1. immutable release tag `v1.5.2`；
 2. minor compatibility alias `v1.5`；
 3. major compatibility alias `v1`。
 
-绝不移动 `v1.5.0` 或 `v1.5.1`。v1.5.1 release 只推进两个 compatibility
+绝不移动 `v1.5.0`、`v1.5.1` 或 `v1.5.2`。v1.5.2 release 只推进两个 compatibility
 aliases，不修改任何 immutable 或 older release tag。禁止通用
 `git push -f --tags`。
 
@@ -150,7 +158,7 @@ predeclared trusted primary fingerprint。Signing subkey fingerprint 可以不�
 primary fingerprint 才是 trust anchor。
 
 本 release session 开始时、替换两个 local aliases 前，先 fresh probe remote，要求
-`refs/tags/v1.5.1` 的输出严格为空，并要求该 local ref 不存在。它已存在时
+`refs/tags/v1.5.2` 的输出严格为空，并要求该 local ref 不存在。它已存在时
 必须停下审计，绝不覆盖 immutable release ref。分别只读取一次已存在的 remote
 `v1.5` 与 `v1` tag-object OIDs，并持久化为 release evidence。后续 exact leases
 必须使用这两个事先观察到的值，不能把 alias push 前才首次读取的新值
@@ -162,14 +170,14 @@ primary fingerprint 才是 trust anchor。
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-release_evidence_path="v1.5.1-expected-remote-alias-tag-objects.tsv"
+release_evidence_path="v1.5.2-expected-remote-alias-tag-objects.tsv"
 test ! -e "$release_evidence_path"
 remote_immutable_record="$(
-  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5.1
+  git -C "$action_repo_path" ls-remote --tags origin refs/tags/v1.5.2
 )"
 test -z "$remote_immutable_record"
 if git -C "$action_repo_path" \
-  show-ref --verify --quiet refs/tags/v1.5.1; then
+  show-ref --verify --quiet refs/tags/v1.5.2; then
   exit 1
 else
   test "$?" -eq 1
@@ -204,8 +212,8 @@ git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
   -c "gpg.openpgp.program=$release_gpg_path" \
-  tag -s -a v1.5.1 "$action_release_commit" \
-  -m "codex-review-gate-action v1.5.1"
+  tag -s -a v1.5.2 "$action_release_commit" \
+  -m "codex-review-gate-action v1.5.2"
 git -C "$action_repo_path" \
   -c gpg.format=openpgp \
   -c "gpg.program=$release_gpg_path" \
@@ -243,10 +251,10 @@ npm run release:provenance -- \
   --action-repository JoeyTeng/codex-review-gate-action \
   --action-commit "$action_release_commit" \
   --action-default-ref refs/heads/master \
-  --immutable-tag-ref refs/tags/v1.5.1 \
+  --immutable-tag-ref refs/tags/v1.5.2 \
   --minor-tag-ref refs/tags/v1.5 \
   --major-tag-ref refs/tags/v1 \
-  --output v1.5.1-release-provenance.json
+  --output v1.5.2-release-provenance.json
 ```
 
 Generator 会在 create-only publication 前检查 source/action default refs 与三个 local tag
@@ -266,7 +274,7 @@ test guards 的 hermetic tests 中使用。
 
 Deterministic asset 的 schema 是
 `urn:joeyteng:codex-review-gate:release-provenance:2`，`schema_version: 2`，
-`release: 1.5.1`。除这些 identity fields 外，exact top-level map 为
+`release: 1.5.2`。除这些 identity fields 外，exact top-level map 为
 `compatibility`、`source`、`action`、`runtime_closure`、`tags`、`proofs`、
 `released_tree`、`critical_files` 与 `contracts`。
 
@@ -311,9 +319,9 @@ Point-in-time verification 仍不证明 historical/future revocation freshness�
 
 ## 按安全顺序发布
 
-先准备不含任何 SHA placeholder 的 `v1.5.1-release-notes.md`。内容必须说明：
+先准备不含任何 SHA placeholder 的 `v1.5.2-release-notes.md`。内容必须说明：
 
-- post-activation canonical caller：
+- canonical live caller：
   `jobs.<job>.uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1`；
 - floating `@v1` 是集中式 pre-execution trust boundary；`job.workflow_sha`、
   exact-attempt `referenced_workflows[].sha` 与 receipt `producer.action.ref` 定义 `W`。说明
@@ -325,26 +333,31 @@ Point-in-time verification 仍不证明 historical/future revocation freshness�
 - 用于 audit 与 direct composite/GHES compatibility 的 actual lower-case action commit；
 - producer protocol major 1、receipt schema v1、decision `policy_major: 1` 与
   `policy_version: 1.4.0`；
+- targeted scheduled-dispatch marker
+  `codex_review_gate_trigger=scheduled-target-v1`、fixed
+  `CODEX_REVIEW_GATE_AUTO_RETRY` forwarding boundary，以及该 transport 不新增
+  composite Action input；
 - receipt output names 与 causal/integrity-only limitations；
-- 独立的 post-release activation gate。
+- alias 移动后立即执行的普通 live `@v1` canary gate；随后由 downstream consumer
+  branch 执行 targeted-dispatch canary，consumer 通过后才能启用 per-PR scheduling。
 
 严格按以下顺序发布，避免 `@v1` consumer 在 immutable release authority 就绪前看到新
 runtime：
 
-1. 只 push `refs/tags/v1.5.1`，禁止 force；随后验证 remote tag-object OID 与 peeled
+1. 只 push `refs/tags/v1.5.2`，禁止 force；随后验证 remote tag-object OID 与 peeled
    action commit。
-2. 为 `v1.5.1` 创建 draft GitHub Release，在 draft 状态附上 final notes 与
-   `v1.5.1-release-provenance.json`。
+2. 为 `v1.5.2` 创建 draft GitHub Release，在 draft 状态附上 final notes 与
+   `v1.5.2-release-provenance.json`。
 3. 重查 immutable-release repository setting，要求 draft release 的 `tag_name`/`tagName`
-   exact 为 `v1.5.1`；紧邻 publish 前重读 remote direct tag-object OID 与 peeled commit，
+   exact 为 `v1.5.2`；紧邻 publish 前重读 remote direct tag-object OID 与 peeled commit，
    并要求两者分别等于 generated manifest 的
-   `tags["v1.5.1"].tag_object_oid/peeled_commit_oid`。同时重查 asset name、asset SHA-256 与
+   `tags["v1.5.2"].tag_object_oid/peeled_commit_oid`。同时重查 asset name、asset SHA-256 与
    notes，然后 publish draft。
-4. Publish 后要求 release REST object 报告 exact tag name `v1.5.1`、`draft: false`、
+4. Publish 后要求 release REST object 报告 exact tag name `v1.5.2`、`draft: false`、
    `prerelease: false` 与 `immutable: true`。运行下列命令前后，都要重读 remote
    direct tag-object OID/peeled commit 并与同一 manifest fields 比较：
-   `gh release verify v1.5.1 --repo JoeyTeng/codex-review-gate-action` 与
-   `gh release verify-asset v1.5.1 v1.5.1-release-provenance.json --repo JoeyTeng/codex-review-gate-action`，并独立重新下载和
+   `gh release verify v1.5.2 --repo JoeyTeng/codex-review-gate-action` 与
+   `gh release verify-asset v1.5.2 v1.5.2-release-provenance.json --repo JoeyTeng/codex-review-gate-action`，并独立重新下载和
    digest-check asset。任何 mismatch 都必须在 compatibility aliases 移动前 fail closed。
 5. 只有上述检查成功后，才从 freshly downloaded、且与 generated asset 逐字节相同的
    provenance asset 中读取 exact `v1.5` 与 `v1` tag-object OIDs。要求两个 manifest
@@ -363,17 +376,17 @@ Immutable tag 与 draft-to-published release 步骤如下：
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-generated_provenance_path="v1.5.1-release-provenance.json"
+generated_provenance_path="v1.5.2-release-provenance.json"
 manifest_immutable_tag_binding="$(
   jq -er '
       def oid:
         type == "string" and test("^[0-9a-f]{40}$");
       . as $manifest
-      | ($manifest.tags["v1.5.1"]) as $tag
+      | ($manifest.tags["v1.5.2"]) as $tag
       | select(
-          $manifest.release == "1.5.1" and
+          $manifest.release == "1.5.2" and
           ($manifest.action.commit_oid | oid) and
-          $tag.ref == "refs/tags/v1.5.1" and
+          $tag.ref == "refs/tags/v1.5.2" and
           $tag.annotated == true and
           ($tag.tag_object_oid | oid) and
           ($tag.peeled_commit_oid | oid) and
@@ -395,39 +408,39 @@ verify_remote_immutable_tag() {
 
   remote_tag_record="$(
     git -C "$action_repo_path" ls-remote --tags \
-      origin refs/tags/v1.5.1
+      origin refs/tags/v1.5.2
   )"
   test "$remote_tag_record" = \
-    "$expected_immutable_tag_object_oid"$'\trefs/tags/v1.5.1'
+    "$expected_immutable_tag_object_oid"$'\trefs/tags/v1.5.2'
   remote_peeled_record="$(
     git -C "$action_repo_path" ls-remote --tags \
-      origin 'refs/tags/v1.5.1^{}'
+      origin 'refs/tags/v1.5.2^{}'
   )"
   test "$remote_peeled_record" = \
-    "$expected_action_release_commit"$'\trefs/tags/v1.5.1^{}'
+    "$expected_action_release_commit"$'\trefs/tags/v1.5.2^{}'
 }
 
 git -C "$action_repo_path" push origin \
-  refs/tags/v1.5.1:refs/tags/v1.5.1
+  refs/tags/v1.5.2:refs/tags/v1.5.2
 
-gh release create v1.5.1 \
+gh release create v1.5.2 \
   --repo JoeyTeng/codex-review-gate-action \
   --draft \
   --verify-tag \
-  --title "codex-review-gate-action v1.5.1" \
-  --notes-file v1.5.1-release-notes.md \
-  v1.5.1-release-provenance.json
+  --title "codex-review-gate-action v1.5.2" \
+  --notes-file v1.5.2-release-notes.md \
+  v1.5.2-release-provenance.json
 
 draft_release_binding="$(
-  gh release view v1.5.1 \
+  gh release view v1.5.2 \
     --repo JoeyTeng/codex-review-gate-action \
     --json tagName,isDraft \
     --jq '[.tagName, .isDraft] | @tsv'
 )"
-test "$draft_release_binding" = $'v1.5.1\ttrue'
+test "$draft_release_binding" = $'v1.5.2\ttrue'
 verify_remote_immutable_tag
 
-gh release edit v1.5.1 \
+gh release edit v1.5.2 \
   --repo JoeyTeng/codex-review-gate-action \
   --draft=false
 
@@ -435,26 +448,26 @@ published_release_binding="$(
   gh api \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2026-03-10' \
-    repos/JoeyTeng/codex-review-gate-action/releases/tags/v1.5.1 \
+    repos/JoeyTeng/codex-review-gate-action/releases/tags/v1.5.2 \
     --jq '[.tag_name, .draft, .prerelease, .immutable] | @tsv'
 )"
-test "$published_release_binding" = $'v1.5.1\tfalse\tfalse\ttrue'
+test "$published_release_binding" = $'v1.5.2\tfalse\tfalse\ttrue'
 verify_remote_immutable_tag
 
-gh release verify v1.5.1 \
+gh release verify v1.5.2 \
   --repo JoeyTeng/codex-review-gate-action
 gh release verify-asset \
-  v1.5.1 \
-  v1.5.1-release-provenance.json \
+  v1.5.2 \
+  v1.5.2-release-provenance.json \
   --repo JoeyTeng/codex-review-gate-action
 
-published_provenance_path="v1.5.1-published-release-provenance.json"
+published_provenance_path="v1.5.2-published-release-provenance.json"
 test ! -e "$published_provenance_path"
-gh release download v1.5.1 \
+gh release download v1.5.2 \
   --repo JoeyTeng/codex-review-gate-action \
-  --pattern v1.5.1-release-provenance.json \
+  --pattern v1.5.2-release-provenance.json \
   --output "$published_provenance_path"
-cmp -s v1.5.1-release-provenance.json "$published_provenance_path"
+cmp -s v1.5.2-release-provenance.json "$published_provenance_path"
 verify_remote_immutable_tag
 ```
 
@@ -470,9 +483,9 @@ lower-case representation。
 set -euo pipefail
 
 action_repo_path="../codex-review-gate-action"
-generated_provenance_path="v1.5.1-release-provenance.json"
-published_provenance_path="v1.5.1-published-release-provenance.json"
-release_evidence_path="v1.5.1-expected-remote-alias-tag-objects.tsv"
+generated_provenance_path="v1.5.2-release-provenance.json"
+published_provenance_path="v1.5.2-published-release-provenance.json"
+release_evidence_path="v1.5.2-expected-remote-alias-tag-objects.tsv"
 trusted_primary_fingerprint_input="${TRUSTED_RELEASE_PRIMARY_FINGERPRINT:?}"
 release_gpg_path="$(realpath "$(command -v gpg)")"
 test -x "$release_gpg_path"
@@ -511,11 +524,11 @@ manifest_alias_binding="$(
             $manifest.schema ==
               "urn:joeyteng:codex-review-gate:release-provenance:2" and
             $manifest.schema_version == 2 and
-            $manifest.release == "1.5.1" and
+            $manifest.release == "1.5.2" and
             ($commit_oid | oid) and
-            ($manifest.tags["v1.5.1"] |
+            ($manifest.tags["v1.5.2"] |
               admitted_tag(
-                "v1.5.1";
+                "v1.5.2";
                 $commit_oid;
                 $trusted_primary_fingerprint
               )) and
@@ -622,13 +635,13 @@ Atomic update 失败时禁止改用 separate alias pushes。重读 remote state�
 evidence 一并保留。禁止用 local alias ref 替换任一 manifest-bound source OID，也禁止在
 validation 后重新解析这些 OIDs。
 
-## Live Canary 与 Activation
+## Live Canaries 与完成边界
 
 把 v1.5.0 canary 视为 fail-closed compatibility finding，而不是 erratum：其 immutable
 provenance contract 错把 GitHub selected annotated `v1` tag-object OID 当成 peeled action
 commit。禁止用 digest-keyed exception admit v1.5.0，也禁止修改其 immutable release。
-发布 v1.5.1 并推进两个 aliases 后，使用 canonical caller 选择 `@v1` 重新运行
-GitHub.com canary。Activation 前必须证明：
+发布 v1.5.2 并推进两个 aliases 后，立即使用现有 source-root caller 选择 `@v1` 重新运行
+普通 GitHub.com canary。声明 source release transaction 完成前必须证明：
 
 - called job 的 `job.workflow_repository/file_path/ref/sha` 是 canonical tuple，且 SHA `W` 恰好
   等于一个 declared workflow-SHA resolution candidate：current-live signed annotated `v1` tag
@@ -642,7 +655,7 @@ GitHub.com canary。Activation 前必须证明：
   其 SHA 匹配 `W == job.workflow_sha == producer.action.ref` 与 selected manifest candidate；
 - independently signed exact `v1` tag object `T` 在 trusted primary signer 下验签通过，
   并 direct peel 到 `C == release-provenance.action.commit_oid`，即使是 future `W == C`
-  分支也一样；signed immutable `v1.5.1` tag peel 到同一
+  分支也一样；signed immutable `v1.5.2` tag peel 到同一
   commit，checkout output、receipt `producer.action.commit_sha`、action root tree 与
   critical files 都匹配 provenance asset；
 - receipt artifact、status membership、GraphQL status re-read 与独立归约的 provider
@@ -652,8 +665,13 @@ GitHub.com canary。Activation 前必须证明：
   attestation；
 - canary 未 checkout 或执行 PR code。
 
-只有这时才能创建独立 activation PR，把 source-root caller、template caller 与
-root/template consumer documentation 改为 `@v1`。
+Source-root workflow 只暴露既有 pull-request input 与 native global schedule。禁止在这里
+预先激活新 marker：floating alias 仍选择 v1.5.1 时，它会误解该 dispatch。普通 canary
+通过后，使用新增 `codex_review_gate_trigger=scheduled-target-v1` 的 downstream consumer
+branch，针对一个 exact pull request 运行 targeted-dispatch canary。该 consumer 启用或
+调度 per-PR dispatch 前，必须通过同一 admission checks，并证明 exact marker 与预期
+auto-retry policy。Targeted canary 失败只阻断该 consumer rollout；它不授权修改 immutable
+release，也不授权在没有另行 review 的 recovery transaction 时回移 aliases。
 
 未来兼容的 v1.x Action-only releases 可以移动 `v1`，无需修改 caller 或 Skill；前提是
 同一 dynamic admission 接受 signed immutable release/provenance 与

@@ -50,7 +50,7 @@ const actionDefinitionPath = join(
 );
 const SOURCE_REPOSITORY = "JoeyTeng/codex-review-gate";
 const ACTION_REPOSITORY = "JoeyTeng/codex-review-gate-action";
-const RELEASE = "1.5.1";
+const RELEASE = "1.5.2";
 const PROVENANCE_SCHEMA_ID =
   "urn:joeyteng:codex-review-gate:release-provenance:2";
 const RECEIPT_SCHEMA_ID =
@@ -454,7 +454,7 @@ function createFixture(t, options = {}) {
   const actionCommit = commitAll(actionRepo, "action split", {
     nonUtf8Prefix: options.nonUtf8Path ? "" : null,
   });
-  for (const name of ["v1.5.1", "v1.5", "v1"]) {
+  for (const name of ["v1.5.2", "v1.5", "v1"]) {
     git(actionRepo, ["tag", "-a", name, actionCommit, "-m", `fixture ${name}`]);
   }
 
@@ -481,7 +481,7 @@ function generatorArguments(fixture, output, { testOnlySkip = true } = {}) {
     "--action-default-ref",
     "refs/heads/master",
     "--immutable-tag-ref",
-    "refs/tags/v1.5.1",
+    "refs/tags/v1.5.2",
     "--minor-tag-ref",
     "refs/tags/v1.5",
     "--major-tag-ref",
@@ -705,7 +705,7 @@ test("head domains separate run, caller, called workflow, and PR status", () => 
 
 test("generator emits deterministic complete post-merge provenance", (t) => {
   const fixture = createFixture(t);
-  const firstOutput = join(fixture.root, "v1.5.1-release-provenance.json");
+  const firstOutput = join(fixture.root, "v1.5.2-release-provenance.json");
   const first = runGenerator(generatorArguments(fixture, firstOutput));
   assert.equal(first.status, 0, first.stderr);
 
@@ -782,7 +782,7 @@ test("generator emits deterministic complete post-merge provenance", (t) => {
         entry.signature.primary_key_fingerprint === null,
     ),
   );
-  assert.deepEqual(Object.keys(manifest.tags), ["v1.5.1", "v1.5", "v1"]);
+  assert.deepEqual(Object.keys(manifest.tags), ["v1.5.2", "v1.5", "v1"]);
   const majorTagObjectOid = manifest.tags.v1.tag_object_oid;
   const workflowShaResolution = {
     selection: "selected-sha-equals-exactly-one-candidate",
@@ -1168,7 +1168,7 @@ test("GnuPG status parser records distinct signing and primary fingerprints", ()
     ),
     stderr: Buffer.alloc(0),
   };
-  assert.deepEqual(parseVerifiedOpenPgpStatus(result, "v1.5.1"), {
+  assert.deepEqual(parseVerifiedOpenPgpStatus(result, "v1.5.2"), {
     signingKeyFingerprint,
     primaryKeyFingerprint,
   });
@@ -1702,7 +1702,7 @@ test("generation rejects nested tags and unresolved placeholders", async (t) => 
     git(fixture.actionRepo, [
       "tag",
       "-a",
-      "v1.5.1-inner",
+      "v1.5.2-inner",
       fixture.actionCommit,
       "-m",
       "inner fixture",
@@ -1711,8 +1711,8 @@ test("generation rejects nested tags and unresolved placeholders", async (t) => 
       "tag",
       "-f",
       "-a",
-      "v1.5.1",
-      "refs/tags/v1.5.1-inner",
+      "v1.5.2",
+      "refs/tags/v1.5.2-inner",
       "-m",
       "nested fixture",
     ]);

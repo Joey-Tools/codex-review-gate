@@ -18,7 +18,10 @@ jobs:
     name: codex/review-gate runner
     if: >-
       ${{
-        (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
+        ((github.event_name != 'schedule' &&
+          (github.event_name != 'workflow_dispatch' ||
+            github.event.inputs.codex_review_gate_trigger != 'scheduled-target-v1')) ||
+          vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
         (github.event_name != 'pull_request_target' ||
           github.event.pull_request.user.login != 'dependabot[bot]') &&
         (github.event_name != 'issue_comment' ||
@@ -69,6 +72,7 @@ jobs:
         uses: ./.codex-review-gate-action
         env:
           CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ steps.checkout.outputs.commit }}
+          CODEX_REVIEW_GATE_AUTO_RETRY: ${{ vars.CODEX_REVIEW_GATE_AUTO_RETRY }}
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}

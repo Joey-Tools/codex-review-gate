@@ -177,20 +177,31 @@ Gate 是 event-driven 的。Workflow runs 会创建 markers、triage Codex signa
 
 ## Workflow 形状
 
-推荐 workflow 监听：
+推荐的 main workflow 监听：
 
 - `pull_request_target` 的 `opened`、`reopened`、`ready_for_review` 和 `synchronize`
 - `issue_comment` 的 `created`
 - `pull_request_review` 的 `submitted`
 - `pull_request_review_comment` 的 `created`
-- `schedule` 用于自动 retry scans
-- `workflow_dispatch` 用于手动恢复
+- `workflow_dispatch` 用于手动恢复；同时带有 `pull_request` 与
+  `codex_review_gate_trigger: scheduled-target-v1` 时，也可表示保留的 per-PR
+  scheduled dispatch
+
+可选的独立 dispatcher 只监听 `schedule`，枚举 open PR，并使用保留值逐 PR 调用 main
+workflow。Action 为兼容性继续接受 native `schedule`，但双 workflow 形状会让所有 status
+writers 留在同一个 per-PR concurrency domain。
+
+该保留值只是语义降级，并不是 scheduler 来源认证。它选择
+`kind: scan` 与 `allowCreateMarker: false`，把具名且仍 open/unmerged 的 PR 重新
+加载为 scan candidate，然后遵循与 native schedule 相同的 draft、trusted-state、marker
+和 stateless Dependabot 规则。Dispatcher 必须 target repository default branch，但保留值本身
+不认证或绑定该 ref。未带保留值的 dispatch 继续采用已有 manual recovery 语义。
 
 Reusable workflow 的 job filter 只在 `full` event mode 下 admit
 `pull_request_review_comment`。薄 caller 始终保留该 event，使未来 mode 切换无需复制可信
 filter logic。
 
-Canonical GitHub.com caller 只包含 events、caller permission ceiling、repository-wide
+Canonical GitHub.com main caller 只包含 per-PR events、caller permission ceiling、per-PR
 concurrency 与下面这个 calling job：
 
 ```yaml
@@ -429,7 +440,13 @@ Repository 和 organization variables 是需要在 runner 启动前影响 workfl
 ```yaml
 jobs:
   codex-review-gate:
-    if: ${{ github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false' }}
+    if: >-
+      ${{
+        ((github.event_name != 'schedule' &&
+          (github.event_name != 'workflow_dispatch' ||
+            github.event.inputs.codex_review_gate_trigger != 'scheduled-target-v1')) ||
+          vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false')
+      }}
 ```
 
 如果目标是避免为 scheduled retries 分配 runner，这必须是 `vars` 值。普通 workflow 或 job `env` 可以被 action 在 job 启动后读取，但不能阻止 scheduled job 被发送到 runner。
@@ -512,6 +529,12 @@ on:
 retry 尚未到期的 PR。已存储的 success 或 failure 并不能单独证明当前 readiness；
 选中一个 PR 做 reconciliation 时，action 会重新构建其当前 evidence。Open PR 数量会
 影响 API calls 和 wall-clock time，但不应为每个 PR 创建一个 job。
+
+如果 repository 的 event runs 使用 per-PR concurrency，可以用独立的 schedule-only
+dispatcher 枚举 open PR，并用 `scheduled-target-v1` 为每个 PR 调用一次 main caller。
+Dispatcher 不拥有 status permissions；main caller 仍是唯一 status writer。Native
+schedule 继续受支持，但在没有另一个 monotonic write fence 时，repository-global 的
+scheduled writer 不得与同一 PR 的 per-PR writer 重叠。
 
 近似 scheduled runner minutes：
 
@@ -805,7 +828,11 @@ Fork PR review events 是 opportunistic 的：如果当前 PR head 来自 fork�
 
 ## Retry 和 Recovery
 
-`workflow_dispatch` 可以 target 一个 PR，也可以 scan open PRs。Rerun 应像 resume operation 一样工作：从 GitHub 重新加载当前 PR state，忽略 stale event head assumptions，并只根据当前 evidence 推进 state machine。
+`workflow_dispatch` 可以 target 一个 PR，也可以 scan open PRs。保留的
+`scheduled-target-v1` dispatch 必须 target 唯一正整数 PR，并使用 scheduled 语义；未知的
+非空保留值必须在任何 write 前失败。Rerun 应像 resume operation 一样工作：从 GitHub
+重新加载当前 PR state，忽略 stale event head assumptions，并只根据当前 evidence 推进
+state machine。
 
 如果 sticky state comment 丢失但存在 trusted marker comment，gate 必须安全恢复：
 

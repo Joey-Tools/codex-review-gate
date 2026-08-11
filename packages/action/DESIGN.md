@@ -237,21 +237,37 @@ The gate is event-driven. Workflow runs create markers, triage Codex signals, re
 
 ## Workflow Shape
 
-The recommended workflow listens for:
+The recommended main workflow listens for:
 
 - `pull_request_target` on `opened`, `reopened`, `ready_for_review`, and `synchronize`
 - `issue_comment` on `created`
 - `pull_request_review` on `submitted`
 - `pull_request_review_comment` on `created`
-- `schedule` for automatic retry scans
-- `workflow_dispatch` for manual recovery
+- `workflow_dispatch` for manual recovery, or for a reserved per-PR scheduled
+  dispatch when both `pull_request` and
+  `codex_review_gate_trigger: scheduled-target-v1` are present
+
+An optional separate dispatcher listens only for `schedule`, enumerates open
+PRs, and invokes the main workflow once per PR with the reserved dispatch
+value. The Action still accepts native `schedule` for compatibility, but the
+two-workflow shape keeps every status writer in the same per-PR concurrency
+domain.
+
+The reserved dispatch value is a semantic downgrade, not an authenticated
+claim that a scheduler created the run. It selects `kind: scan` with
+`allowCreateMarker: false`, reloads the named open and unmerged PR as the scan
+candidate, and then follows the same draft, trusted-state, marker, and
+stateless Dependabot rules as a native scheduled scan. The dispatcher must
+target the repository default branch, but the reserved value itself does not
+authenticate or bind that ref. A dispatch without the reserved value retains
+the existing manual recovery semantics.
 
 The reusable workflow's job filter admits `pull_request_review_comment` only in
 `full` event mode. Keeping the event in the thin caller preserves future mode
 changes without duplicating trusted filter logic.
 
-The canonical GitHub.com caller contains only events, the caller permission
-ceiling, repository-wide concurrency, and this calling job:
+The canonical GitHub.com main caller contains only per-PR events, the caller
+permission ceiling, per-PR concurrency, and this calling job:
 
 ```yaml
 jobs:
@@ -535,7 +551,13 @@ Set this repository or organization variable to `false` to disable scheduled ret
 ```yaml
 jobs:
   codex-review-gate:
-    if: ${{ github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false' }}
+    if: >-
+      ${{
+        ((github.event_name != 'schedule' &&
+          (github.event_name != 'workflow_dispatch' ||
+            github.event.inputs.codex_review_gate_trigger != 'scheduled-target-v1')) ||
+          vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false')
+      }}
 ```
 
 This must be a `vars` value if the intent is to avoid allocating a runner for scheduled retries. A normal workflow or job `env` value can be read by the action after the job starts, but it cannot prevent the scheduled job from being sent to a runner.
@@ -626,6 +648,14 @@ draft, missing gate state, or not due for retry. A stored success or failure is
 not independent proof of current readiness: when a PR is selected for
 reconciliation, the action rebuilds its current evidence. Open PR count affects
 API calls and wall-clock time, but it should not create one job per PR.
+
+For repositories whose event runs use per-PR concurrency, a separate
+schedule-only dispatcher may enumerate open PRs and invoke the main caller once
+per PR with `scheduled-target-v1`. The dispatcher owns no status permissions;
+the main caller remains the only status writer. Native schedule remains
+supported, but a repository-global scheduled writer must not overlap a
+different per-PR writer for the same PR unless another monotonic write fence
+exists.
 
 Approximate scheduled runner minutes:
 
@@ -1003,7 +1033,12 @@ Fork PR review events are opportunistic: if the current PR head is from a fork, 
 
 ## Retry and Recovery
 
-`workflow_dispatch` may target one PR or scan open PRs. A rerun should behave like a resume operation: reload the current PR state from GitHub, ignore stale event head assumptions, and advance the state machine only from current evidence.
+`workflow_dispatch` may target one PR or scan open PRs. A reserved
+`scheduled-target-v1` dispatch must target exactly one positive PR number and
+uses scheduled semantics; an unknown nonempty reserved value fails before any
+write. A rerun should behave like a resume operation: reload the current PR
+state from GitHub, ignore stale event head assumptions, and advance the state
+machine only from current evidence.
 
 If the sticky state comment is missing but a trusted marker comment exists, the gate must recover safely:
 

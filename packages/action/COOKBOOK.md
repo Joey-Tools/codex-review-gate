@@ -279,3 +279,14 @@ pass. A confirmed current-head or ancestor finding remains `failure`; absent a
 confirmed finding, evidence that cannot be acquired or reconciled after
 bounded retries becomes `error`. Marker or recovery history does not veto an
 otherwise valid stable current-head clean artifact.
+
+## Per-PR Scheduled Recovery
+
+A schedule-only dispatcher can invoke the main workflow once per open PR with
+`pull_request: <number>` and
+`codex_review_gate_trigger: scheduled-target-v1`. Keep that dispatcher
+read-only except for `actions: write`; the main workflow remains the sole status
+writer and uses a per-PR concurrency group. The reserved value selects the
+native schedule rules for that one PR, including `allowCreateMarker: false` and
+the stateless Dependabot exception. It is not scheduler authentication, and an
+unknown nonempty value fails before any write.

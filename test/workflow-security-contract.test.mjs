@@ -30,7 +30,10 @@ const CANONICAL_JOB_WORKFLOW_REF =
   "@refs/tags/v1";
 const EXPECTED_CALLED_JOB_IF = `
 \${{
-  (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
+  ((github.event_name != 'schedule' &&
+    (github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.codex_review_gate_trigger != 'scheduled-target-v1')) ||
+    vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
   (github.event_name != 'pull_request_target' ||
     github.event.pull_request.user.login != 'dependabot[bot]') &&
   (github.event_name != 'issue_comment' ||
@@ -71,6 +74,27 @@ const RECEIPT_OUTPUTS = {
   "producer-receipt-artifact-url": "artifact-url",
   "producer-receipt-artifact-digest": "artifact-digest",
 };
+const ACTION_INPUT_KEYS = [
+  "github-token",
+  "pull-request",
+  "head-sha",
+  "status-context",
+  "state-marker",
+  "marker-comment-marker",
+  "max-wait-seconds",
+  "marker-timeout-seconds",
+  "marker-ack-timeout-seconds",
+  "marker-ack-timeout-max-seconds",
+  "completion-signal-buffer-seconds",
+  "failed-findings-recovery",
+  "failed-findings-recovery-mode",
+  "poll-interval-seconds",
+  "bootstrap-grace-seconds",
+  "bootstrap-timeout-seconds",
+  "codex-bot-logins",
+  "trusted-comment-logins",
+  "event-mode",
+];
 
 const CALLER_WORKFLOW_SHA = "1111111111111111111111111111111111111111";
 const REUSABLE_V1_TAG_OBJECT_SHA =
@@ -204,6 +228,11 @@ test("the published workflow source is workflow_call-only and preserves receipt 
   const jobOutputs = childBlock(job, "outputs");
   assert.deepEqual(directKeys(jobOutputs), Object.keys(RECEIPT_OUTPUTS));
   const action = readYamlLines(actionDefinitionPath);
+  assert.deepEqual(
+    directKeys(childBlock(rootBlock(action), "inputs")),
+    ACTION_INPUT_KEYS,
+    "targeted scheduling is event-payload protocol, not a new action input",
+  );
   const actionOutputs = childBlock(rootBlock(action), "outputs");
   assert.deepEqual(directKeys(actionOutputs), Object.keys(RECEIPT_OUTPUTS));
 
@@ -252,6 +281,8 @@ test("the called workflow checks out only its exact resolved release and runs it
   assert.deepEqual(scalarMapping(childBlock(items[1], "env")), {
     CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA:
       "${{ steps.checkout.outputs.commit }}",
+    CODEX_REVIEW_GATE_AUTO_RETRY:
+      "${{ vars.CODEX_REVIEW_GATE_AUTO_RETRY }}",
   });
   assert.equal(
     scalarMapping(childBlock(items[1], "with"))["github-token"],

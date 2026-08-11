@@ -189,6 +189,7 @@ const MAX_WHOLE_SNAPSHOT_ATTEMPTS = 2;
 const MAX_REST_PAGES = 1_000;
 const MAX_GRAPHQL_PAGES = 1_000;
 const MAX_IN_PROCESS_RETRY_WAIT_MS = 10_000;
+const TARGETED_SCHEDULED_SCAN_TRIGGER = "scheduled-target-v1";
 const ORCHESTRATION_PERSISTENCE_FENCE_DESCRIPTION =
   "Review orchestration state persistence failed; fresh marker required";
 main().then(() => {
@@ -228,12 +229,21 @@ async function main() {
     return;
   }
 
+  if (trigger.kind === "targeted-scan") {
+    await scanTargetedPullRequest(trigger);
+    return;
+  }
+
   await processPullRequest(trigger.prNumber, trigger);
 }
 
 function readTrigger() {
   const eventName = process.env.GITHUB_EVENT_NAME || "";
   const event = readEventPayload();
+  const targetedScheduledScan = readTargetedScheduledScanTrigger(eventName, event);
+  if (targetedScheduledScan) {
+    return targetedScheduledScan;
+  }
   if (config.prNumber && (!eventName || eventName === "workflow_dispatch")) {
     return { kind: "single", prNumber: config.prNumber, allowCreateMarker: true };
   }
@@ -304,6 +314,39 @@ function readTrigger() {
   return { kind: "skip", reason: `Unsupported event ${eventName || "<unknown>"}.` };
 }
 
+function readTargetedScheduledScanTrigger(eventName, event) {
+  if (eventName !== "workflow_dispatch") {
+    return null;
+  }
+
+  const dispatchTrigger = event.inputs?.codex_review_gate_trigger;
+  if (dispatchTrigger === undefined || dispatchTrigger === "") {
+    return null;
+  }
+  if (dispatchTrigger !== TARGETED_SCHEDULED_SCAN_TRIGGER) {
+    throw new Error(
+      `workflow_dispatch codex_review_gate_trigger must be exactly ${TARGETED_SCHEDULED_SCAN_TRIGGER}`,
+    );
+  }
+
+  const eventPrNumber = Number(String(event.inputs?.pull_request ?? "").trim());
+  if (!Number.isInteger(eventPrNumber) || eventPrNumber <= 0) {
+    throw new Error("targeted scheduled scan pull_request must be a positive integer");
+  }
+  if (config.prNumber !== eventPrNumber) {
+    throw new Error("targeted scheduled scan pull_request must match PR_NUMBER");
+  }
+  if (!autoRetryEnabled(config.autoRetry)) {
+    return { kind: "skip", reason: "Scheduled retry is disabled." };
+  }
+
+  return {
+    kind: "targeted-scan",
+    prNumber: eventPrNumber,
+    allowCreateMarker: false,
+  };
+}
+
 function readEventPayload() {
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) {
@@ -328,31 +371,87 @@ function pullRequestIsFromFork(pullRequest) {
   return Boolean(headRepo && baseRepo && headRepo !== baseRepo);
 }
 
+function pullRequestIsOpenAndUnmerged(pullRequest) {
+  return Boolean(
+    pullRequest?.state === "open" &&
+      pullRequest.merged === false &&
+      pullRequest.merged_at === null,
+  );
+}
+
 async function scanOpenPullRequests(trigger) {
   const pullRequests = await paginate(repoPath + "/pulls", { state: "open", per_page: "100" });
   let failures = 0;
 
   for (const pullRequest of pullRequests) {
-    try {
-      await processPullRequest(
-        pullRequest.number,
-        {
-          ...trigger,
-          allowCreateMarker: trigger.allowCreateMarker === true,
-          scan: true,
-        },
-        pullRequest,
-      );
-    } catch (error) {
+    const processed = await processScannedPullRequest(pullRequest, trigger);
+    if (!processed) {
       failures += 1;
-      console.error(`failed to process PR #${pullRequest.number}: ${error.stack || error.message}`);
-      await failClosedScannedPullRequest(pullRequest, error);
     }
   }
 
   if (failures > 0) {
     statusReady = false;
     throw new Error(`failed to process ${failures} pull request(s)`);
+  }
+}
+
+async function scanTargetedPullRequest(trigger) {
+  const pullRequest = await loadTargetedScanCandidate(trigger.prNumber);
+  if (!pullRequestIsOpenAndUnmerged(pullRequest)) {
+    console.log(
+      `PR #${trigger.prNumber} is not open and unmerged; skipping targeted scheduled scan.`,
+    );
+    return;
+  }
+
+  const processed = await processScannedPullRequest(pullRequest, trigger);
+  if (!processed) {
+    statusReady = false;
+    throw new Error(`failed to process PR #${trigger.prNumber}`);
+  }
+}
+
+async function loadTargetedScanCandidate(prNumber) {
+  const { data } = await request("GET", `${repoPath}/pulls/${prNumber}`);
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error(`targeted scheduled scan PR #${prNumber} returned an invalid response`);
+  }
+  if (data.number !== prNumber) {
+    throw new Error(`targeted scheduled scan PR #${prNumber} returned a mismatched number`);
+  }
+  if (data.state !== "open" && data.state !== "closed") {
+    throw new Error(`targeted scheduled scan PR #${prNumber} returned an invalid state`);
+  }
+  if (typeof data.merged !== "boolean") {
+    throw new Error(`targeted scheduled scan PR #${prNumber} returned an invalid merged flag`);
+  }
+  if (data.merged_at !== null && typeof data.merged_at !== "string") {
+    throw new Error(`targeted scheduled scan PR #${prNumber} returned an invalid merged_at`);
+  }
+  if (typeof data.head?.sha !== "string" || !data.head.sha) {
+    throw new Error(`targeted scheduled scan PR #${prNumber} returned an invalid head SHA`);
+  }
+  return data;
+}
+
+async function processScannedPullRequest(pullRequest, trigger) {
+  try {
+    await processPullRequest(
+      pullRequest.number,
+      {
+        ...trigger,
+        kind: "scan",
+        allowCreateMarker: trigger.allowCreateMarker === true,
+        scan: true,
+      },
+      pullRequest,
+    );
+    return true;
+  } catch (error) {
+    console.error(`failed to process PR #${pullRequest.number}: ${error.stack || error.message}`);
+    await failClosedScannedPullRequest(pullRequest, error);
+    return false;
   }
 }
 
@@ -444,6 +543,13 @@ async function processPullRequest(prNumber, trigger, scanCandidate = null) {
   const pullRequest = await loadPullRequest();
   statusSha = pullRequest.head.sha;
   statusReady = true;
+  if (trigger.kind === "scan" && !pullRequestIsOpenAndUnmerged(pullRequest)) {
+    statusReady = false;
+    console.log(
+      `PR #${activePrNumber} is no longer open and unmerged; skipping scheduled scan.`,
+    );
+    return;
+  }
   if (
     eventMayHaveReadOnlyDependabotToken(process.env.GITHUB_EVENT_NAME) &&
     pullRequestIsDependabot(pullRequest)
@@ -3708,11 +3814,7 @@ async function failIfPullRequestHeadChanged(phase = "while waiting for Codex") {
 }
 
 function failIfLoadedPullRequestHeadChanged(pullRequest, phase) {
-  if (
-    pullRequest.state !== "open" ||
-    pullRequest.merged === true ||
-    pullRequest.merged_at
-  ) {
+  if (!pullRequestIsOpenAndUnmerged(pullRequest)) {
     throw new GateFailure(
       "error",
       `PR lifecycle changed ${phase}`,

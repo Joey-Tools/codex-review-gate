@@ -144,6 +144,16 @@ For the event-driven review-gate design, state machine, automatic retry controls
 
 The advanced design uses repository or organisation variables for controls that must take effect before a runner is allocated. For example, `CODEX_REVIEW_GATE_AUTO_RETRY=false` can skip scheduled retry jobs at the job `if` layer. Runtime `env` values are still useful for action behaviour after a job has started, but they cannot prevent GitHub Actions from assigning a runner.
 
+A scheduler may fan out one PR at a time through `workflow_dispatch` by passing a
+positive `pull_request` input together with the reserved
+`codex_review_gate_trigger: scheduled-target-v1` event input. This selects the
+stricter scheduled-scan semantics (`allowCreateMarker: false`) for that PR and
+lets all status writers share a per-PR concurrency group. The reserved value is
+not source authentication or provenance: a manual caller can supply it, but it
+only removes capabilities compared with the ordinary manual recovery path.
+Do not add it to `action.yml`; the runtime reads it from the authenticated
+GitHub event payload.
+
 The current source-root direct workflow defaults to `ubuntu-slim`. Direct
 composite callers may set `CODEX_REVIEW_GATE_RUNNER_LABELS` to a JSON array such
 as `["self-hosted","linux","x64","codex-review-gate"]`; the canonical reusable
@@ -163,12 +173,14 @@ on:
     types: [submitted]
   pull_request_review_comment:
     types: [created]
-  schedule:
-    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       pull_request:
-        description: Optional pull request number to gate
+        description: Pull request number to gate
+        required: true
+        type: string
+      codex_review_gate_trigger:
+        description: Reserved for scheduled per-PR dispatch
         required: false
         type: string
 
@@ -179,7 +191,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: codex-review-gate-${{ github.repository }}
+  group: codex-review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
   cancel-in-progress: false
 
 jobs:
@@ -188,11 +200,14 @@ jobs:
     uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1
 ```
 
-The caller deliberately keeps the complete event set, permission ceiling, and
-repository-wide concurrency group. The reusable workflow owns the trusted job
-filters, runner selection, timeout, exact called-repository checkout, and
-composite step. A reusable-workflow calling job cannot contain `runs-on` or
-`steps`. Do not duplicate the caller's repository-wide concurrency group in
+The main caller deliberately keeps the per-PR event set, permission ceiling,
+and per-PR concurrency group. Put a periodic scan in a separate schedule-only
+dispatcher that invokes this workflow once per PR with the reserved value;
+never let a repository-global scan write statuses concurrently with this
+per-PR caller. The reusable workflow owns the trusted job filters, runner
+selection, timeout, exact called-repository checkout, and composite step. A
+reusable-workflow calling job cannot contain `runs-on` or `steps`. Do not
+duplicate the caller's concurrency group in
 the called workflow; keep that cross-run serialisation boundary caller-side.
 
 The called workflow receives the caller's `GITHUB_TOKEN` permissions and

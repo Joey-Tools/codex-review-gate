@@ -234,3 +234,13 @@ current-head clean result 通过或失败。
 current-head 或 ancestor finding 保持 `failure`；没有 confirmed finding 时，经过有界
 重试仍无法取得或 reconcile 的 evidence 会变成 `error`。Marker 或 recovery history
 不会 veto 其他方面 valid 且 stable 的 current-head clean artifact。
+
+## Per-PR Scheduled Recovery
+
+Schedule-only dispatcher 可以为每个 open PR 调用一次 main workflow，并传入
+`pull_request: <number>` 与
+`codex_review_gate_trigger: scheduled-target-v1`。Dispatcher 除
+`actions: write` 外保持只读；main workflow 仍是唯一 status writer，并使用 per-PR
+concurrency group。该保留值为这一个 PR 选择 native schedule 规则，包括
+`allowCreateMarker: false` 与 stateless Dependabot 例外。它不是 scheduler 认证；未知的
+非空值会在任何 write 前失败。
