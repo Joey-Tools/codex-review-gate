@@ -15,7 +15,7 @@ superseded_by:
 ## Summary
 - Version 1.5.2 is a compatible v1.x release that lets the packaged reusable workflow recognise the closed `workflow_dispatch` marker `codex_review_gate_trigger=scheduled-target-v1` as schedule-equivalent for auto-retry gating.
 - The reusable workflow forwards `vars.CODEX_REVIEW_GATE_AUTO_RETRY` through the fixed `CODEX_REVIEW_GATE_AUTO_RETRY` environment binding. The marker remains caller event-payload protocol; neither value becomes a composite Action input.
-- An exact `scheduled-target-v1` dispatch admits only an identical event-input/`PR_NUMBER` pair in canonical safe positive decimal form, so the caller's per-PR concurrency key and the runtime target cannot name the same PR through different strings. Ordinary manual, direct-composite, and GHES recovery retain the existing canonical `PR_NUMBER`-only route.
+- An exact `scheduled-target-v1` dispatch admits only an identical event-input/`PR_NUMBER` pair in canonical safe positive decimal form, so the caller's per-PR concurrency key and the runtime target cannot name the same PR through different strings. Ordinary manual, direct-composite, and GHES recovery retain the existing trim-and-numeric `PR_NUMBER` route for v1.x compatibility.
 - Producer protocol major 1, receipt schema v1, decision policy 1.4, and release provenance schema v2 remain unchanged. Version 1.5.1 remains the first admitted reusable-workflow release.
 
 ## Frozen Release Boundary
@@ -40,7 +40,7 @@ superseded_by:
 
 ## Local Validation
 - `npm run check` and the complete `npm test -- --test-reporter=dot` suite pass after the canonical PR-number repair.
-- Focused targeted-dispatch regressions reject leading-zero, signed, exponent, whitespace, unsafe-integer, non-string, and event/environment-mismatch inputs before any GitHub access; ordinary manual regressions preserve the canonical `PR_NUMBER` fallback.
+- Focused targeted-dispatch regressions reject leading-zero, signed, exponent, whitespace, unsafe-integer, non-string, and event/environment-mismatch inputs before any GitHub access; ordinary manual regressions preserve both the `PR_NUMBER`-only fallback and legacy numeric spellings.
 - `node --check scripts/generate-action-release-provenance.mjs` and `node --check test/release-provenance.test.mjs` pass.
 - `npm run test:release-provenance` passes all 51 tests.
 - Project-journal validation and repository-wide `git diff --check` pass.

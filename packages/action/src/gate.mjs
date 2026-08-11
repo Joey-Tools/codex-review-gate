@@ -3708,10 +3708,13 @@ function readConfig() {
   const token = requiredEnv("GITHUB_TOKEN");
   const repository = requiredEnv("GITHUB_REPOSITORY");
   const prNumberRaw = process.env.PR_NUMBER ?? "";
-  const prNumber = prNumberRaw
-    ? canonicalSafePositiveDecimal(prNumberRaw, "PR_NUMBER")
-    : null;
+  const normalizedPrNumber = prNumberRaw.trim();
+  const prNumber = normalizedPrNumber ? Number(normalizedPrNumber) : null;
   const headSha = (process.env.HEAD_SHA || "").trim();
+
+  if (prNumber !== null && (!Number.isInteger(prNumber) || prNumber <= 0)) {
+    throw new Error("PR_NUMBER must be a positive integer");
+  }
 
   const apiUrl = stripTrailingSlash(process.env.GITHUB_API_URL || "https://api.github.com");
   const serverUrl = stripTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com");

@@ -2862,13 +2862,33 @@ test("targeted scheduled scan rejects malformed dispatch metadata before GitHub 
   }
 });
 
-test("manual workflow_dispatch preserves the canonical PR_NUMBER fallback", async () => {
+test("manual workflow_dispatch preserves legacy PR_NUMBER parsing and fallback", async () => {
   const scenarios = [
     { name: "missing inputs object", event: {} },
     { name: "different input name", event: { inputs: { pr_number: "2" } } },
     { name: "empty pull_request", event: { inputs: { pull_request: "" } } },
     { name: "non-canonical pull_request", event: { inputs: { pull_request: "01" } } },
     { name: "different pull_request", event: { inputs: { pull_request: "2" } } },
+    {
+      name: "same-source leading zero",
+      event: { inputs: { pull_request: "01" } },
+      envPrNumber: "01",
+    },
+    {
+      name: "same-source surrounding whitespace",
+      event: { inputs: { pull_request: " 1 " } },
+      envPrNumber: " 1 ",
+    },
+    {
+      name: "same-source leading plus",
+      event: { inputs: { pull_request: "+1" } },
+      envPrNumber: "+1",
+    },
+    {
+      name: "same-source exponent notation",
+      event: { inputs: { pull_request: "1e0" } },
+      envPrNumber: "1e0",
+    },
   ];
 
   for (const scenario of scenarios) {
@@ -2878,7 +2898,7 @@ test("manual workflow_dispatch preserves the canonical PR_NUMBER fallback", asyn
       const result = await harness.runGate({
         eventName: "workflow_dispatch",
         event: scenario.event,
-        env: { PR_NUMBER: "1" },
+        env: { PR_NUMBER: scenario.envPrNumber ?? "1" },
       });
 
       assert.equal(result.code, 0, `${scenario.name}: ${result.stderr}`);
@@ -2946,10 +2966,10 @@ test("targeted workflow_dispatch rejects non-canonical or mismatched PR inputs b
       error: /targeted scheduled scan pull_request must exactly match PR_NUMBER/,
     },
     {
-      name: "non-canonical PR_NUMBER",
+      name: "raw PR_NUMBER mismatch",
       eventPrNumber: "1",
       envPrNumber: "01",
-      error: /PR_NUMBER must be a canonical safe positive decimal integer/,
+      error: /targeted scheduled scan pull_request must exactly match PR_NUMBER/,
     },
   ];
 
