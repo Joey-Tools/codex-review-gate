@@ -12,11 +12,14 @@ run. Supplying it does not grant permissions or expand the Action input
 surface. Repositories should keep the schedule-only dispatcher minimally
 privileged and keep all commit-status writes in the per-PR main workflow.
 
-Every manual or targeted `workflow_dispatch` that names a PR has an additional
-identity boundary: caller event input `pull_request` and `PR_NUMBER` must be
+An exact `scheduled-target-v1` targeted dispatch has an additional identity
+boundary: caller event input `pull_request` and `PR_NUMBER` must be
 byte-for-byte identical canonical safe positive decimal ASCII strings matching
 `[1-9][0-9]*`, with a value that is a positive JavaScript safe integer. Leading
 zeros, signs, exponent notation, and whitespace are invalid. This prevents
 alternate spellings from separating the caller's per-PR concurrency key from
 the runtime target. A missing counterpart, mismatch, or non-canonical value
-fails before any GitHub API read or write.
+fails before any GitHub API read or write. Ordinary manual, direct-composite,
+and GHES routing may instead supply only the Action `pull-request` input, which
+becomes `PR_NUMBER`; the canonical reusable caller's same-input derivation is
+an explicit caller shape, not a universal manual-dispatch requirement.

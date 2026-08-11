@@ -240,19 +240,11 @@ async function main() {
 function readTrigger() {
   const eventName = process.env.GITHUB_EVENT_NAME || "";
   const event = readEventPayload();
-  const dispatchPrNumber = readWorkflowDispatchPullRequest(eventName, event);
-  const targetedScheduledScan = readTargetedScheduledScanTrigger(
-    eventName,
-    event,
-    dispatchPrNumber,
-  );
+  const targetedScheduledScan = readTargetedScheduledScanTrigger(eventName, event);
   if (targetedScheduledScan) {
     return targetedScheduledScan;
   }
-  if (eventName === "workflow_dispatch" && dispatchPrNumber !== null) {
-    return { kind: "single", prNumber: dispatchPrNumber, allowCreateMarker: true };
-  }
-  if (config.prNumber && !eventName) {
+  if (config.prNumber && (!eventName || eventName === "workflow_dispatch")) {
     return { kind: "single", prNumber: config.prNumber, allowCreateMarker: true };
   }
   if (!eventModeHandlesEvent(eventName, config.eventMode)) {
@@ -322,29 +314,7 @@ function readTrigger() {
   return { kind: "skip", reason: `Unsupported event ${eventName || "<unknown>"}.` };
 }
 
-function readWorkflowDispatchPullRequest(eventName, event) {
-  if (eventName !== "workflow_dispatch") {
-    return null;
-  }
-
-  const eventPrNumberRaw = event.inputs?.pull_request;
-  const eventHasPrNumber = eventPrNumberRaw !== undefined && eventPrNumberRaw !== "";
-  const envHasPrNumber = config.prNumberRaw !== "";
-  if (!eventHasPrNumber && !envHasPrNumber) {
-    return null;
-  }
-
-  const eventPrNumber = canonicalSafePositiveDecimal(
-    eventPrNumberRaw,
-    "workflow_dispatch pull_request",
-  );
-  if (eventPrNumberRaw !== config.prNumberRaw) {
-    throw new Error("workflow_dispatch pull_request must exactly match PR_NUMBER");
-  }
-  return eventPrNumber;
-}
-
-function readTargetedScheduledScanTrigger(eventName, event, dispatchPrNumber) {
+function readTargetedScheduledScanTrigger(eventName, event) {
   if (eventName !== "workflow_dispatch") {
     return null;
   }
@@ -359,8 +329,13 @@ function readTargetedScheduledScanTrigger(eventName, event, dispatchPrNumber) {
     );
   }
 
-  if (dispatchPrNumber === null) {
-    throw new Error("targeted scheduled scan pull_request must be a positive integer");
+  const eventPrNumberRaw = event.inputs?.pull_request;
+  const eventPrNumber = canonicalSafePositiveDecimal(
+    eventPrNumberRaw,
+    "targeted scheduled scan pull_request",
+  );
+  if (eventPrNumberRaw !== config.prNumberRaw) {
+    throw new Error("targeted scheduled scan pull_request must exactly match PR_NUMBER");
   }
   if (!autoRetryEnabled(config.autoRetry)) {
     return { kind: "skip", reason: "Scheduled retry is disabled." };
@@ -368,7 +343,7 @@ function readTargetedScheduledScanTrigger(eventName, event, dispatchPrNumber) {
 
   return {
     kind: "targeted-scan",
-    prNumber: dispatchPrNumber,
+    prNumber: eventPrNumber,
     allowCreateMarker: false,
   };
 }

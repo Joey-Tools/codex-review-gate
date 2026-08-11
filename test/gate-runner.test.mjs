@@ -2862,49 +2862,88 @@ test("targeted scheduled scan rejects malformed dispatch metadata before GitHub 
   }
 });
 
-test("workflow_dispatch rejects non-canonical or mismatched PR inputs before GitHub writes", async () => {
+test("manual workflow_dispatch preserves the canonical PR_NUMBER fallback", async () => {
+  const scenarios = [
+    { name: "missing inputs object", event: {} },
+    { name: "different input name", event: { inputs: { pr_number: "2" } } },
+    { name: "empty pull_request", event: { inputs: { pull_request: "" } } },
+    { name: "non-canonical pull_request", event: { inputs: { pull_request: "01" } } },
+    { name: "different pull_request", event: { inputs: { pull_request: "2" } } },
+  ];
+
+  for (const scenario of scenarios) {
+    await withHarness(async (harness) => {
+      harness.issueComments.push(codexCleanComment(2001));
+
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: scenario.event,
+        env: { PR_NUMBER: "1" },
+      });
+
+      assert.equal(result.code, 0, `${scenario.name}: ${result.stderr}`);
+      assert.equal(harness.statuses.at(-1).body.state, "success", scenario.name);
+      assert.equal(
+        harness.requestLog.some((entry) =>
+          entry.method === "GET" &&
+            entry.path === `/repos/${harness.owner}/${harness.repo}/pulls/1`,
+        ),
+        true,
+        scenario.name,
+      );
+      assert.equal(
+        harness.requestLog.some((entry) => entry.path.includes("/pulls/2")),
+        false,
+        scenario.name,
+      );
+      assert.equal(openPullRequestScanReads(harness), 0, scenario.name);
+    });
+  }
+});
+
+test("targeted workflow_dispatch rejects non-canonical or mismatched PR inputs before GitHub writes", async () => {
   const scenarios = [
     {
       name: "leading zero",
       eventPrNumber: "01",
       envPrNumber: "1",
-      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+      error: /targeted scheduled scan pull_request must be a canonical safe positive decimal integer/,
     },
     {
       name: "exponent notation",
       eventPrNumber: "1e0",
       envPrNumber: "1",
-      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+      error: /targeted scheduled scan pull_request must be a canonical safe positive decimal integer/,
     },
     {
       name: "leading plus",
       eventPrNumber: "+1",
       envPrNumber: "1",
-      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+      error: /targeted scheduled scan pull_request must be a canonical safe positive decimal integer/,
     },
     {
       name: "surrounding whitespace",
       eventPrNumber: " 1 ",
       envPrNumber: "1",
-      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+      error: /targeted scheduled scan pull_request must be a canonical safe positive decimal integer/,
     },
     {
       name: "unsafe integer",
       eventPrNumber: "9007199254740992",
       envPrNumber: "1",
-      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+      error: /targeted scheduled scan pull_request must be a canonical safe positive decimal integer/,
     },
     {
       name: "numeric JSON value",
       eventPrNumber: 1,
       envPrNumber: "1",
-      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+      error: /targeted scheduled scan pull_request must be a canonical safe positive decimal integer/,
     },
     {
       name: "canonical mismatch",
       eventPrNumber: "2",
       envPrNumber: "1",
-      error: /workflow_dispatch pull_request must exactly match PR_NUMBER/,
+      error: /targeted scheduled scan pull_request must exactly match PR_NUMBER/,
     },
     {
       name: "non-canonical PR_NUMBER",
@@ -2914,27 +2953,21 @@ test("workflow_dispatch rejects non-canonical or mismatched PR inputs before Git
     },
   ];
 
-  for (const targeted of [false, true]) {
-    for (const scenario of scenarios) {
-      await withHarness(async (harness) => {
-        const event = targeted
-          ? targetedScheduledScanEvent(scenario.eventPrNumber)
-          : { inputs: { pull_request: scenario.eventPrNumber } };
-        const result = await harness.runGate({
-          eventName: "workflow_dispatch",
-          event,
-          env: { PR_NUMBER: scenario.envPrNumber },
-        });
-
-        const label = `${targeted ? "targeted" : "manual"}: ${scenario.name}`;
-        assert.equal(result.code, 1, label);
-        assert.match(result.stderr, scenario.error, label);
-        assert.equal(harness.requestLog.length, 0, label);
-        assert.equal(harness.statuses.length, 0, label);
-        assert.equal(harness.findStateComment(), undefined, label);
-        assert.equal(harness.findMarkerComments().length, 0, label);
+  for (const scenario of scenarios) {
+    await withHarness(async (harness) => {
+      const result = await harness.runGate({
+        eventName: "workflow_dispatch",
+        event: targetedScheduledScanEvent(scenario.eventPrNumber),
+        env: { PR_NUMBER: scenario.envPrNumber },
       });
-    }
+
+      assert.equal(result.code, 1, scenario.name);
+      assert.match(result.stderr, scenario.error, scenario.name);
+      assert.equal(harness.requestLog.length, 0, scenario.name);
+      assert.equal(harness.statuses.length, 0, scenario.name);
+      assert.equal(harness.findStateComment(), undefined, scenario.name);
+      assert.equal(harness.findMarkerComments().length, 0, scenario.name);
+    });
   }
 });
 
