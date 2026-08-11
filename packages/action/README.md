@@ -12,14 +12,13 @@ Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.
 3. After `codex/review-gate` behaves as expected, add it as a required status check. For recovery recipes, see the [cookbook](COOKBOOK.md).
 
 > [!IMPORTANT]
-> The reusable caller is staged for the v1.5 rollout. The immutable v1.5.0
-> release exists, but its live canary exposed an incorrect commit-versus-tag
-> object admission contract. Consumers must fail closed on v1.5.0; there is no
-> digest-keyed erratum. Do not activate the source repository or template
-> caller until the compatible v1.5.1 repair and provenance asset are published,
-> the `v1.5` and `v1` aliases are verified, and a new live canary passes. That
-> activation belongs in a separate follow-up PR; until then, the existing source
-> and template callers remain unchanged.
+> v1.5.1 is the first admitted v1.5 baseline. v1.5.2 adds the targeted
+> scheduled-scan semantic downgrade selected by
+> `codex_review_gate_trigger: scheduled-target-v1`. Downstream repositories must
+> not enable the sentinel scheduler until the immutable v1.5.2 release and
+> provenance asset are published, the `v1.5` and `v1` aliases are verified, and
+> a live canary passes. The sentinel only selects a capability-reducing route;
+> it is not source authentication or provenance.
 
 `codex-review-gate` is a reusable GitHub workflow backed by a composite Action.
 It owns a deterministic

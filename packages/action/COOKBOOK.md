@@ -274,6 +274,15 @@ operator wants to re-evaluate one PR explicitly.
    complete snapshot. Stored sticky state is used only to resume request
    orchestration.
 
+For this manual single-PR path and the reserved targeted scheduled path, the
+caller event input `pull_request` and `PR_NUMBER` must be byte-for-byte
+identical canonical safe positive decimal ASCII strings matching
+`[1-9][0-9]*`, with a value that is a positive JavaScript safe integer. Leading
+zeros, signs, exponent notation, and whitespace are invalid. This makes the
+per-PR concurrency key and runtime target identify the same PR. A missing
+counterpart, mismatch, or non-canonical value fails before any GitHub API read
+or write.
+
 Manual recovery remains fail-closed: unstable or incomplete evidence cannot
 pass. A confirmed current-head or ancestor finding remains `failure`; absent a
 confirmed finding, evidence that cannot be acquired or reconciled after

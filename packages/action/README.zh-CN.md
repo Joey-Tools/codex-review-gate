@@ -12,12 +12,11 @@
 3. 确认 `codex/review-gate` 行为符合预期后，把它加入 required status checks。恢复和排障 recipes 见 [cookbook](COOKBOOK.zh-CN.md)。
 
 > [!IMPORTANT]
-> Reusable caller 目前只是为 v1.5 rollout staged。Immutable v1.5.0 release 已存在，
-> 但 live canary 证明其 commit-versus-tag-object admission contract 有误。Consumer
-> 必须对 v1.5.0 fail closed，不存在 digest-keyed erratum。在兼容修复
-> v1.5.1 与 provenance asset 发布、`v1.5` 和 `v1` aliases 验证且新 live canary 通过前，
-> 不得在 source repository 或 template 中激活。Activation 必须放在独立的后续 PR；
-> 此前继续使用 source 与 template 的现有 callers，不做修改。
+> v1.5.1 是首个通过 admission 的 v1.5 baseline。v1.5.2 引入由
+> `codex_review_gate_trigger: scheduled-target-v1` 选择的 targeted scheduled-scan
+> 语义降级。下游仓库必须等 immutable v1.5.2 release 和 provenance asset 发布、
+> `v1.5` 与 `v1` aliases 验证且 live canary 通过后，才能启用 sentinel scheduler。
+> 该 sentinel 只选择一个减少能力的执行路径；它不是来源认证或 provenance。
 
 `codex-review-gate` 是由 composite Action 支撑的 reusable GitHub workflow，负责提供
 deterministic

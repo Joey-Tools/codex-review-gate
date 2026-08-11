@@ -1033,12 +1033,18 @@ Fork PR review events are opportunistic: if the current PR head is from a fork, 
 
 ## Retry and Recovery
 
-`workflow_dispatch` may target one PR or scan open PRs. A reserved
-`scheduled-target-v1` dispatch must target exactly one positive PR number and
-uses scheduled semantics; an unknown nonempty reserved value fails before any
-write. A rerun should behave like a resume operation: reload the current PR
-state from GitHub, ignore stale event head assumptions, and advance the state
-machine only from current evidence.
+`workflow_dispatch` may target one PR or scan open PRs. Whenever a manual or
+reserved targeted dispatch names one PR, the caller event input `pull_request`
+and `PR_NUMBER` must be byte-for-byte identical canonical safe positive decimal
+ASCII strings matching `[1-9][0-9]*`, with a value that is a positive JavaScript
+safe integer. Leading zeros, signs, exponent notation, and whitespace are
+invalid. This keeps the caller's per-PR concurrency key and the runtime target
+in the same domain; any missing counterpart, mismatch, or non-canonical value
+fails before any GitHub API read or write. A reserved `scheduled-target-v1`
+dispatch uses scheduled semantics, and an unknown nonempty reserved value also
+fails before any GitHub API read or write. A rerun should behave like a resume
+operation: reload the current PR state from GitHub, ignore stale event head
+assumptions, and advance the state machine only from current evidence.
 
 If the sticky state comment is missing but a trusted marker comment exists, the gate must recover safely:
 

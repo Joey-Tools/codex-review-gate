@@ -828,11 +828,16 @@ Fork PR review events 是 opportunistic 的：如果当前 PR head 来自 fork�
 
 ## Retry 和 Recovery
 
-`workflow_dispatch` 可以 target 一个 PR，也可以 scan open PRs。保留的
-`scheduled-target-v1` dispatch 必须 target 唯一正整数 PR，并使用 scheduled 语义；未知的
-非空保留值必须在任何 write 前失败。Rerun 应像 resume operation 一样工作：从 GitHub
-重新加载当前 PR state，忽略 stale event head assumptions，并只根据当前 evidence 推进
-state machine。
+`workflow_dispatch` 可以 target 一个 PR，也可以 scan open PRs。每当 manual 或保留的
+targeted dispatch 指定一个 PR 时，caller event input `pull_request` 与 `PR_NUMBER` 必须是
+逐字节完全相同、匹配 `[1-9][0-9]*` 的 canonical safe positive decimal ASCII string，
+其数值还必须是 positive JavaScript safe integer。前导零、正负号、指数表示法与任意
+whitespace 都不合法。这样 caller 的 per-PR concurrency key 与 runtime target 会处于
+同一个 domain；缺少任一对应字段、两者不一致或值不 canonical 时，都会在任何 GitHub
+API read 或 write 前失败。保留的 `scheduled-target-v1` dispatch 使用 scheduled 语义；
+未知的非空保留值同样在任何 GitHub API read 或 write 前失败。Rerun 应像 resume
+operation 一样工作：从 GitHub 重新加载 current PR state，忽略 stale event head
+assumptions，并只根据当前 evidence 推进 state machine。
 
 如果 sticky state comment 丢失但存在 trusted marker comment，gate 必须安全恢复：
 

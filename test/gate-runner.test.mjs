@@ -2830,19 +2830,19 @@ test("targeted scheduled scan rejects malformed dispatch metadata before GitHub 
       name: "missing pull request",
       event: targetedScheduledScanEvent(""),
       env: { PR_NUMBER: "1" },
-      error: /pull_request must be a positive integer/,
+      error: /pull_request must be a canonical safe positive decimal integer/,
     },
     {
       name: "mismatched pull request",
       event: targetedScheduledScanEvent("2"),
       env: { PR_NUMBER: "1" },
-      error: /pull_request must match PR_NUMBER/,
+      error: /pull_request must exactly match PR_NUMBER/,
     },
     {
       name: "missing action input",
       event: targetedScheduledScanEvent(),
       env: {},
-      error: /pull_request must match PR_NUMBER/,
+      error: /pull_request must exactly match PR_NUMBER/,
     },
   ];
 
@@ -2859,6 +2859,82 @@ test("targeted scheduled scan rejects malformed dispatch metadata before GitHub 
       assert.equal(harness.requestLog.length, 0, scenario.name);
       assert.equal(harness.statuses.length, 0, scenario.name);
     });
+  }
+});
+
+test("workflow_dispatch rejects non-canonical or mismatched PR inputs before GitHub writes", async () => {
+  const scenarios = [
+    {
+      name: "leading zero",
+      eventPrNumber: "01",
+      envPrNumber: "1",
+      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+    },
+    {
+      name: "exponent notation",
+      eventPrNumber: "1e0",
+      envPrNumber: "1",
+      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+    },
+    {
+      name: "leading plus",
+      eventPrNumber: "+1",
+      envPrNumber: "1",
+      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+    },
+    {
+      name: "surrounding whitespace",
+      eventPrNumber: " 1 ",
+      envPrNumber: "1",
+      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+    },
+    {
+      name: "unsafe integer",
+      eventPrNumber: "9007199254740992",
+      envPrNumber: "1",
+      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+    },
+    {
+      name: "numeric JSON value",
+      eventPrNumber: 1,
+      envPrNumber: "1",
+      error: /workflow_dispatch pull_request must be a canonical safe positive decimal integer/,
+    },
+    {
+      name: "canonical mismatch",
+      eventPrNumber: "2",
+      envPrNumber: "1",
+      error: /workflow_dispatch pull_request must exactly match PR_NUMBER/,
+    },
+    {
+      name: "non-canonical PR_NUMBER",
+      eventPrNumber: "1",
+      envPrNumber: "01",
+      error: /PR_NUMBER must be a canonical safe positive decimal integer/,
+    },
+  ];
+
+  for (const targeted of [false, true]) {
+    for (const scenario of scenarios) {
+      await withHarness(async (harness) => {
+        const event = targeted
+          ? targetedScheduledScanEvent(scenario.eventPrNumber)
+          : { inputs: { pull_request: scenario.eventPrNumber } };
+        const result = await harness.runGate({
+          eventName: "workflow_dispatch",
+          event,
+          env: { PR_NUMBER: scenario.envPrNumber },
+        });
+
+        const label = `${targeted ? "targeted" : "manual"}: ${scenario.name}`;
+        assert.equal(result.code, 1, label);
+        assert.match(result.stderr, scenario.error, label);
+        assert.equal(harness.requestLog.length, 0, label);
+        assert.equal(harness.statuses.length, 0, label);
+        assert.equal(harness.findStateComment(), undefined, label);
+        assert.equal(harness.findMarkerComments().length, 0, label);
+      });
+    }
   }
 });
 

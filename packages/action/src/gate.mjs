@@ -240,11 +240,19 @@ async function main() {
 function readTrigger() {
   const eventName = process.env.GITHUB_EVENT_NAME || "";
   const event = readEventPayload();
-  const targetedScheduledScan = readTargetedScheduledScanTrigger(eventName, event);
+  const dispatchPrNumber = readWorkflowDispatchPullRequest(eventName, event);
+  const targetedScheduledScan = readTargetedScheduledScanTrigger(
+    eventName,
+    event,
+    dispatchPrNumber,
+  );
   if (targetedScheduledScan) {
     return targetedScheduledScan;
   }
-  if (config.prNumber && (!eventName || eventName === "workflow_dispatch")) {
+  if (eventName === "workflow_dispatch" && dispatchPrNumber !== null) {
+    return { kind: "single", prNumber: dispatchPrNumber, allowCreateMarker: true };
+  }
+  if (config.prNumber && !eventName) {
     return { kind: "single", prNumber: config.prNumber, allowCreateMarker: true };
   }
   if (!eventModeHandlesEvent(eventName, config.eventMode)) {
@@ -314,7 +322,29 @@ function readTrigger() {
   return { kind: "skip", reason: `Unsupported event ${eventName || "<unknown>"}.` };
 }
 
-function readTargetedScheduledScanTrigger(eventName, event) {
+function readWorkflowDispatchPullRequest(eventName, event) {
+  if (eventName !== "workflow_dispatch") {
+    return null;
+  }
+
+  const eventPrNumberRaw = event.inputs?.pull_request;
+  const eventHasPrNumber = eventPrNumberRaw !== undefined && eventPrNumberRaw !== "";
+  const envHasPrNumber = config.prNumberRaw !== "";
+  if (!eventHasPrNumber && !envHasPrNumber) {
+    return null;
+  }
+
+  const eventPrNumber = canonicalSafePositiveDecimal(
+    eventPrNumberRaw,
+    "workflow_dispatch pull_request",
+  );
+  if (eventPrNumberRaw !== config.prNumberRaw) {
+    throw new Error("workflow_dispatch pull_request must exactly match PR_NUMBER");
+  }
+  return eventPrNumber;
+}
+
+function readTargetedScheduledScanTrigger(eventName, event, dispatchPrNumber) {
   if (eventName !== "workflow_dispatch") {
     return null;
   }
@@ -329,12 +359,8 @@ function readTargetedScheduledScanTrigger(eventName, event) {
     );
   }
 
-  const eventPrNumber = Number(String(event.inputs?.pull_request ?? "").trim());
-  if (!Number.isInteger(eventPrNumber) || eventPrNumber <= 0) {
+  if (dispatchPrNumber === null) {
     throw new Error("targeted scheduled scan pull_request must be a positive integer");
-  }
-  if (config.prNumber !== eventPrNumber) {
-    throw new Error("targeted scheduled scan pull_request must match PR_NUMBER");
   }
   if (!autoRetryEnabled(config.autoRetry)) {
     return { kind: "skip", reason: "Scheduled retry is disabled." };
@@ -342,7 +368,7 @@ function readTargetedScheduledScanTrigger(eventName, event) {
 
   return {
     kind: "targeted-scan",
-    prNumber: eventPrNumber,
+    prNumber: dispatchPrNumber,
     allowCreateMarker: false,
   };
 }
@@ -3706,13 +3732,11 @@ function decimalEnv(name) {
 function readConfig() {
   const token = requiredEnv("GITHUB_TOKEN");
   const repository = requiredEnv("GITHUB_REPOSITORY");
-  const prNumberRaw = (process.env.PR_NUMBER || "").trim();
-  const prNumber = prNumberRaw ? Number(prNumberRaw) : null;
+  const prNumberRaw = process.env.PR_NUMBER ?? "";
+  const prNumber = prNumberRaw
+    ? canonicalSafePositiveDecimal(prNumberRaw, "PR_NUMBER")
+    : null;
   const headSha = (process.env.HEAD_SHA || "").trim();
-
-  if (prNumber !== null && (!Number.isInteger(prNumber) || prNumber <= 0)) {
-    throw new Error("PR_NUMBER must be a positive integer");
-  }
 
   const apiUrl = stripTrailingSlash(process.env.GITHUB_API_URL || "https://api.github.com");
   const serverUrl = stripTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com");
@@ -3729,6 +3753,7 @@ function readConfig() {
     token,
     repository,
     prNumber,
+    prNumberRaw,
     headSha,
     apiUrl,
     serverUrl,
@@ -3764,6 +3789,17 @@ function readConfig() {
       DEFAULT_TRUSTED_COMMENT_LOGINS,
     ),
   };
+}
+
+function canonicalSafePositiveDecimal(value, name) {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) {
+    throw new Error(`${name} must be a canonical safe positive decimal integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a canonical safe positive decimal integer`);
+  }
+  return parsed;
 }
 
 function requiredEnv(name) {

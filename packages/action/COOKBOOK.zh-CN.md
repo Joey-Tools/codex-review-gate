@@ -230,6 +230,13 @@ current-head clean result 通过或失败。
 3. Gate 会重新加载当前 GitHub evidence，并从完整 snapshot 计算结果；stored sticky
    state 只用于恢复 request orchestration。
 
+对于这个 manual single-PR 路径和保留的 targeted scheduled 路径，caller event input
+`pull_request` 与 `PR_NUMBER` 必须是逐字节完全相同、匹配 `[1-9][0-9]*` 的 canonical
+safe positive decimal ASCII string，其数值还必须是 positive JavaScript safe integer。
+前导零、正负号、指数表示法与任意 whitespace 都不合法。这样 per-PR concurrency key
+与 runtime target 会指向同一个 PR。缺少任一对应字段、两者不一致或值不 canonical 时，
+都会在任何 GitHub API read 或 write 前失败。
+
 手动恢复仍然 fail-closed：unstable 或 incomplete evidence 不能通过。Confirmed
 current-head 或 ancestor finding 保持 `failure`；没有 confirmed finding 时，经过有界
 重试仍无法取得或 reconcile 的 evidence 会变成 `error`。Marker 或 recovery history
