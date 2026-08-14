@@ -115,6 +115,90 @@ test("audit validation accepts only the exact protected status response binding"
   }
 });
 
+test("serialized aggregate artifact projection preserves canonical binding order and provenance",
+  () => {
+    const receipt = structuredClone(serializedAuditReceipt());
+    receipt.derived.artifact_bindings = [
+      artifactBindingAudit({
+        selector: { kind: "pull_request_review", id: "202" },
+      }),
+      artifactBindingAudit({
+        selector: { kind: "inline_comment", id: "203" },
+      }),
+    ];
+    resealAuditReceipt(receipt);
+
+    assert.equal(validateV2ControlPlaneReceipt(receipt), receipt);
+    assert.deepEqual(
+      receipt.derived.artifact_bindings.map((binding) =>
+        binding.artifact_selector),
+      [
+        { kind: "pull_request_review", id: "202" },
+        { kind: "inline_comment", id: "203" },
+      ],
+    );
+    assert.deepEqual(
+      receipt.derived.artifact_bindings.map((binding) => binding.record_oid),
+      [SHA("7"), SHA("7")],
+    );
+    assert.deepEqual(
+      receipt.derived.artifact_bindings.map((binding) =>
+        binding.payload_digest),
+      [DIGEST("aggregate-artifact-payload"),
+        DIGEST("aggregate-artifact-payload")],
+    );
+  });
+
+test("serialized artifact projection rejects duplicate and order tampering", () => {
+  const receipt = structuredClone(serializedAuditReceipt());
+  receipt.derived.artifact_bindings = [
+    artifactBindingAudit({
+      selector: { kind: "pull_request_review", id: "202" },
+    }),
+    artifactBindingAudit({
+      selector: { kind: "inline_comment", id: "203" },
+    }),
+  ];
+  resealAuditReceipt(receipt);
+
+  const reordered = structuredClone(receipt);
+  reordered.derived.artifact_bindings.reverse();
+  assert.throws(
+    () => validateV2ControlPlaneReceipt(reordered),
+    (error) => error?.code === "DERIVED_DIGEST_MISMATCH",
+  );
+
+  const duplicated = structuredClone(receipt);
+  duplicated.derived.artifact_bindings[1] = structuredClone(
+    duplicated.derived.artifact_bindings[0],
+  );
+  assert.throws(
+    () => validateV2ControlPlaneReceipt(duplicated),
+    (error) => error?.code === "DERIVED_DIGEST_MISMATCH",
+  );
+});
+
+test("serialized artifact projection rejects closed-shape and digest violations",
+  () => {
+    const extraKey = structuredClone(serializedAuditReceipt());
+    extraKey.derived.artifact_bindings = [artifactBindingAudit()];
+    extraKey.derived.artifact_bindings[0].untrusted = true;
+    resealAuditReceipt(extraKey);
+    assert.throws(
+      () => validateV2ControlPlaneReceipt(extraKey),
+      /derived artifact binding must use the closed key set/u,
+    );
+
+    const invalidDigest = structuredClone(serializedAuditReceipt());
+    invalidDigest.derived.artifact_bindings = [artifactBindingAudit()];
+    invalidDigest.derived.artifact_bindings[0].payload_digest = "sha256:invalid";
+    resealAuditReceipt(invalidDigest);
+    assert.throws(
+      () => validateV2ControlPlaneReceipt(invalidDigest),
+      /artifact binding\.payload_digest must be a canonical SHA-256 digest/u,
+    );
+  });
+
 function serializedAuditReceipt() {
   const derivedInput = {
     budget: {
@@ -268,6 +352,38 @@ function statusBindingAudit({ state = "pending" } = {}) {
       },
     ),
     refetch_pages: [page],
+  };
+}
+
+function artifactBindingAudit({
+  selector = { kind: "pull_request_review", id: "202" },
+} = {}) {
+  return {
+    record_oid: SHA("7"),
+    payload_digest: DIGEST("aggregate-artifact-payload"),
+    generation_id: "automatic:1",
+    request_binding_record_oid: SHA("8"),
+    request_id: "71",
+    request_node_id: "IC_71",
+    artifact_selector: structuredClone(selector),
+    artifact_node_id: `ARTIFACT_${selector.id}`,
+    artifact_url:
+      `https://github.com/owner/repo/pull/42#artifact-${selector.id}`,
+    artifact_type: selector.kind,
+    artifact_created_at: "2026-08-13T12:00:00.000Z",
+    server_time: "2026-08-13T12:00:01.000Z",
+    raw_body_sha256: DIGEST(`artifact-${selector.id}`),
+    actor: {
+      id: "199175422",
+      node_id: "BOT_codex",
+      login: "chatgpt-codex-connector[bot]",
+      type: "Bot",
+    },
+    app: {
+      id: "1144995",
+      node_id: "APP_codex",
+      slug: "chatgpt-codex-connector",
+    },
   };
 }
 

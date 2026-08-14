@@ -15,6 +15,9 @@ import {
   V2_GIT_LEDGER_BOOTSTRAP_INPUT_SCHEMA,
   V2_GIT_LEDGER_HTTP_LIMITS,
   MAX_V2_GIT_LEDGER_COMMITS,
+  MAX_V2_GIT_LEDGER_BLOB_BYTES,
+  MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_ACTION_BYTES,
+  MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_RECEIPT_BYTES,
   MAX_V2_SCHEDULED_CANDIDATE_LEDGER_RECORDS,
   V2_GIT_LEDGER_OIDC_AUDIENCE,
   V2_GIT_LEDGER_OIDC_CLAIMS,
@@ -75,6 +78,14 @@ import {
   planV2Actions,
 } from "../packages/action/src/v2/scheduler.mjs";
 import {
+  V2_RUNNER_SCHEMA,
+  buildV2StatusPlan,
+  getV2AutomaticRecoveryArtifactBindingCandidateHandle,
+  getV2AutomaticRequestRecoveryHandle,
+  runV2Operation,
+} from "../packages/action/src/v2/runner.mjs";
+import { reduceV2Snapshot } from "../packages/action/src/v2/reducer.mjs";
+import {
   acquireV2LeaseThenLoadDiscovery,
   loadV2MinimalLiveScope,
 } from "../packages/action/src/v2/workflow-controller.mjs";
@@ -115,6 +126,17 @@ const ACTOR = {
   node_id: "U_actions",
   login: "github-actions[bot]",
   type: "Bot",
+};
+const HUMAN_ACTOR = {
+  id: "42",
+  node_id: "USER_reviewer",
+  login: "reviewer",
+  type: "User",
+};
+const GITHUB_ACTIONS_APP = {
+  id: "15368",
+  node_id: "A_github_actions",
+  slug: "github-actions",
 };
 const CODEX_ACTOR = {
   id: "199175422",
@@ -1481,6 +1503,199 @@ test("status-only builder rejects multi-write and stale scheduler authorities", 
   assert.equal(fixture.writeCalls, writesBefore);
 });
 
+test("status transaction appends two writes in canonical order", async () => {
+  const fixture = githubGitFixture();
+  const context = await createProtectedInitialRunnerContext(fixture);
+  const plan = schedulerObservationRecord({
+    predecessor: context.lease.acquire_commit_sha,
+    lease: context.lease,
+    priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+    initialAuthority: context.initialAuthority,
+    decision: "findings",
+  }).payload.action;
+  const statusPlan = buildV2StatusPlan({
+    decision: "findings",
+    status_target_mode: "test-merge-with-head-sentinel",
+    status_context: "codex/github-review-gate",
+    target: {
+      mode: "test-merge-with-head-sentinel",
+      validated: true,
+      terminal_sha: POTENTIAL,
+      head_sentinel_sha: HEAD,
+      head_sentinel_receipt: null,
+    },
+    snapshot_fingerprint: plan.scheduler_evaluation.snapshot_fingerprint,
+  });
+  const schedulerAppend = await context.ledger
+    .appendInitialSchedulerObservation({
+      initial_runner_state_authority: context.initialAuthority,
+      scheduler_evaluation: plan.scheduler_evaluation,
+      status_plan: statusPlan,
+    });
+
+  const first = await context.ledger.loadNextStatusWriteIntent({
+    scheduler_append: schedulerAppend,
+  });
+  assert.equal(first.status_write_index, 0);
+  assert.equal(first.status_write_count, 2);
+  assert.equal(first.transport.role, "primary-terminal");
+  await context.ledger.appendStatusWriteResponse({
+    status_intent_handle: first.status_intent_handle,
+    intent_append_receipt: first.intent_append_receipt,
+    receipt: statusWriteResponseReceipt(
+      first.transport,
+      first.intent_append_receipt.ref_reread.server_time,
+    ),
+  });
+
+  const second = await context.ledger.loadNextStatusWriteIntent({
+    scheduler_append: schedulerAppend,
+  });
+  assert.equal(second.status_write_index, 1);
+  assert.equal(second.status_write_count, 2);
+  assert.equal(second.transport.role, "head-sentinel");
+  await context.ledger.appendStatusWriteResponse({
+    status_intent_handle: second.status_intent_handle,
+    intent_append_receipt: second.intent_append_receipt,
+    receipt: statusWriteResponseReceipt(
+      second.transport,
+      second.intent_append_receipt.ref_reread.server_time,
+    ),
+  });
+  assert.equal(await context.ledger.loadNextStatusWriteIntent({
+    scheduler_append: schedulerAppend,
+  }), null);
+});
+
+test("status transaction rehydrates its bound prefix across scheduler observations",
+  async (t) => {
+    const prepare = async ({ boundCount, statusContext = "codex/github-review-gate" }) => {
+      const fixture = githubGitFixture();
+      const runIdentity = { ...OWNER };
+      const context = await createProtectedInitialRunnerContext(fixture, {
+        runIdentity,
+      });
+      const plan = schedulerObservationRecord({
+        predecessor: context.lease.acquire_commit_sha,
+        lease: context.lease,
+        priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+        initialAuthority: context.initialAuthority,
+        decision: "findings",
+      }).payload.action;
+      const statusPlan = buildV2StatusPlan({
+        decision: "findings",
+        status_target_mode: "test-merge-with-head-sentinel",
+        status_context: "codex/github-review-gate",
+        target: {
+          mode: "test-merge-with-head-sentinel",
+          validated: true,
+          terminal_sha: POTENTIAL,
+          head_sentinel_sha: HEAD,
+          head_sentinel_receipt: null,
+        },
+        snapshot_fingerprint: plan.scheduler_evaluation.snapshot_fingerprint,
+      });
+      const initialAppend = await context.ledger
+        .appendInitialSchedulerObservation({
+          initial_runner_state_authority: context.initialAuthority,
+          scheduler_evaluation: plan.scheduler_evaluation,
+          status_plan: statusPlan,
+        });
+      const first = await context.ledger.loadNextStatusWriteIntent({
+        scheduler_append: initialAppend,
+      });
+      if (boundCount >= 1) {
+        await context.ledger.appendStatusWriteResponse({
+          status_intent_handle: first.status_intent_handle,
+          intent_append_receipt: first.intent_append_receipt,
+          receipt: statusWriteResponseReceipt(
+            first.transport,
+            first.intent_append_receipt.ref_reread.server_time,
+          ),
+        });
+      }
+      if (boundCount >= 2) {
+        const second = await context.ledger.loadNextStatusWriteIntent({
+          scheduler_append: initialAppend,
+        });
+        await context.ledger.appendStatusWriteResponse({
+          status_intent_handle: second.status_intent_handle,
+          intent_append_receipt: second.intent_append_receipt,
+          receipt: statusWriteResponseReceipt(
+            second.transport,
+            second.intent_append_receipt.ref_reread.server_time,
+          ),
+        });
+      }
+      await releaseFixtureDiscoveryLease(context.ledger, context.discovery);
+      runIdentity.run_attempt = 2;
+      const resumed = await acquireEstablishedRunnerContext({
+        ledger: context.ledger,
+        runIdentity,
+        observationBoundary: "public-initial-wait-complete",
+        transportStartSecond: 3600,
+        minimalServerTime: "2026-08-13T14:00:00.000Z",
+      });
+      const established = await context.ledger
+        .loadEstablishedRunnerStateAuthority({
+          control_plane_authority: resumed.controlPlaneAuthority,
+          evaluated_scope_receipt: resumed.evaluatedScopeReceipt,
+          workflow_command_handle: resumed.workflowCommandHandle,
+        });
+      const inputs = schedulerInputsForEstablishedAuthority(established, {
+        snapshotId: boundCount > 0
+          ? "snapshot-status-bound-prefix"
+          : "snapshot-status-ambiguous-prefix",
+        decision: "findings",
+      });
+      const establishedStatusPlan = buildV2StatusPlan({
+        decision: "findings",
+        status_target_mode: "test-merge-with-head-sentinel",
+        status_context: statusContext,
+        target: {
+          mode: "test-merge-with-head-sentinel",
+          validated: true,
+          terminal_sha: POTENTIAL,
+          head_sentinel_sha: HEAD,
+          head_sentinel_receipt: null,
+        },
+        snapshot_fingerprint: inputs.scheduler_evaluation.snapshot_fingerprint,
+      });
+      const schedulerAppend = await context.ledger
+        .appendEstablishedSchedulerObservation({
+          established_runner_state_authority: established,
+          scheduler_evaluation: inputs.scheduler_evaluation,
+          status_plan: establishedStatusPlan,
+        });
+      return { context, fixture, schedulerAppend };
+    };
+
+    await t.test("a response-bound first slot advances to the second slot", async () => {
+      const { context, schedulerAppend } = await prepare({ boundCount: 1 });
+      const next = await context.ledger.loadNextStatusWriteIntent({
+        scheduler_append: schedulerAppend,
+      });
+      assert.equal(next.status_write_index, 1);
+      assert.equal(next.status_write_count, 2);
+      assert.equal(next.transport.role, "head-sentinel");
+    });
+
+    await t.test("an unanswered first intent is consumed and never reminted", async () => {
+      const { context, fixture, schedulerAppend } = await prepare({
+        boundCount: 0,
+      });
+      const writesBefore = fixture.writeCalls;
+      await assert.rejects(
+        context.ledger.loadNextStatusWriteIntent({
+          scheduler_append: schedulerAppend,
+        }),
+        (error) => error.code === "status-write-intent-ambiguous-consumed",
+      );
+      assert.equal(fixture.writeCalls, writesBefore);
+    });
+
+  });
+
 test("automatic reservation and its nonrequired status bind one protected scheduler action", async () => {
   const fixture = githubGitFixture();
   const context = await createProtectedInitialRunnerContext(fixture);
@@ -1893,6 +2108,76 @@ test("automatic request intent durably records one retry-zero attempt before POS
   });
 });
 
+test("automatic request restart resumes one durable reservation without minting another", async () => {
+  const fixture = githubGitFixture();
+  const runIdentity = { ...OWNER };
+  const context = await createProtectedInitialRunnerContext(fixture, {
+    runIdentity,
+  });
+  const plan = schedulerObservationRecord({
+    predecessor: context.lease.acquire_commit_sha,
+    lease: context.lease,
+    priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+    initialAuthority: context.initialAuthority,
+  }).payload.action;
+  const initialAppend = await context.ledger
+    .appendInitialSchedulerObservation({
+      initial_runner_state_authority: context.initialAuthority,
+      scheduler_evaluation: plan.scheduler_evaluation,
+      status_plan: plan.status_plan,
+    });
+  const { automatic } = await appendAutomaticReservationStatus(
+    context.ledger,
+    initialAppend,
+  );
+  await releaseFixtureDiscoveryLease(context.ledger, context.discovery);
+
+  runIdentity.run_attempt = 2;
+  const resumed = await acquireEstablishedRunnerContext({
+    ledger: context.ledger,
+    runIdentity,
+    observationBoundary: "public-initial-wait-complete",
+    transportStartSecond: 3600,
+    minimalServerTime: "2026-08-13T14:00:00.000Z",
+  });
+  const established = await context.ledger
+    .loadEstablishedRunnerStateAuthority({
+      control_plane_authority: resumed.controlPlaneAuthority,
+      evaluated_scope_receipt: resumed.evaluatedScopeReceipt,
+      workflow_command_handle: resumed.workflowCommandHandle,
+    });
+  const inputs = schedulerInputsForEstablishedAuthority(established, {
+    snapshotId: "snapshot-resume-automatic-request",
+  });
+  const schedulerAppend = await context.ledger
+    .appendEstablishedSchedulerObservation({
+      established_runner_state_authority: established,
+      ...inputs,
+    });
+  const recovered = await context.ledger
+    .appendRecoveredAutomaticReviewRequestIntent({
+      scheduler_append: schedulerAppend,
+    });
+  assert.equal(recovered.transport.generation_id, "automatic:1");
+  assert.equal(
+    recovered.transport.reservation_digest,
+    automatic.reservation.reservation_digest,
+  );
+  const loaded = await context.ledger.load();
+  assert.equal(
+    loaded.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "automatic-request-reservation").length,
+    1,
+  );
+  assert.equal(
+    loaded.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "effect-attempt").length,
+    1,
+  );
+});
+
 test("automatic review request binding is exact, controller-owned, and resumable", async (t) => {
   const prepare = async (fixture) => {
     const context = await createProtectedInitialRunnerContext(fixture);
@@ -2156,6 +2441,1597 @@ test("reservation status binding is required before the retry-zero request attem
   );
   assert.deepEqual(authority.runner_state.effect_attempts, []);
 });
+
+test("automatic recovery transition persists one opaque generation advance", async () => {
+  const setup = await createAutomaticRecoveryTransitionContext();
+  const writesBefore = setup.fixture.writeCalls;
+  const transition = await setup.ledger
+    .appendAutomaticRequestRecoveryTransition({
+      scheduler_append: setup.schedulerAppend,
+      recovery_handle: setup.recoveryHandle,
+    });
+  assert.equal(transition.prior_generation_id, "automatic:1");
+  assert.equal(transition.next_generation_id, "automatic:2");
+  assert.match(transition.intent_recovery_authority_digest, /^sha256:/u);
+  assert.match(transition.completion_recovery_authority_digest, /^sha256:/u);
+  assert.notEqual(
+    transition.intent_record_receipt.commit_sha,
+    transition.response_record_receipt.commit_sha,
+  );
+  assert.ok(setup.fixture.writeCalls > writesBefore);
+  const loaded = await setup.ledger.loadControlPlaneAuthority(
+    setup.context.evaluatedScopeReceipt.scope,
+  );
+  assert.equal(
+    loaded.scoped_authority.runner_state.scheduling.epoch.automatic_request
+      .state,
+    "available",
+  );
+  assert.equal(
+    loaded.scoped_authority.runner_state.scheduling.epoch.automatic_request
+      .generation_index,
+    2,
+  );
+  const nextGeneration = await createFreshAutomaticRecoveryContinuation(
+    setup,
+    {
+      expectRecoveryHandle: false,
+      expectArtifactBindingCandidateHandle: false,
+      requireArtifactBinding: true,
+    },
+  );
+  assert.equal(nextGeneration.recovery.recoveryHandle, null);
+  assert.equal(
+    nextGeneration.recovery.artifactBindingCandidateHandle,
+    null,
+  );
+});
+
+test("automatic recovery findings mint an opaque artifact-binding candidate before recovery",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    assert.equal(setup.recoveryHandle, null);
+    assert.notEqual(setup.artifactBindingCandidateHandle, null);
+    assert.deepEqual(
+      Object.keys(setup.artifactBindingCandidateHandle).sort(),
+      ["authority_digest", "schema", "schema_version"],
+    );
+    assert.equal(
+      Object.hasOwn(setup.runnerResult, "artifact_binding_candidate_handle"),
+      false,
+    );
+    assert.throws(
+      () => getV2AutomaticRecoveryArtifactBindingCandidateHandle(
+        structuredClone(setup.runnerResult),
+      ),
+      /exact runner result object/u,
+    );
+  });
+
+test("automatic recovery artifact bindings commit one exact aggregate transaction",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+      additionalFindingIds: ["203"],
+    });
+    const writesBeforeIntent = setup.fixture.writeCalls;
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          structuredClone(setup.artifactBindingCandidateHandle),
+      }),
+      /opaque candidate handle/u,
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeIntent);
+
+    const intent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    assert.equal(intent.transport.operation,
+      "loadV2ProviderPreScopeArtifacts");
+    assert.equal(intent.transport.expected_count, 2);
+    assert.deepEqual(
+      intent.transport.requests.map((request) => request.selector.id),
+      ["202", "203"],
+    );
+    assert.match(intent.transport.candidate_set_digest, /^sha256:/u);
+    assert.equal(
+      intent.latest_append_receipt.commit_sha,
+      intent.ready_confirmation_append_receipt.commit_sha,
+    );
+    const handles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: setup.ledger,
+      fixture: setup.fixture,
+      transport: intent.transport,
+      snapshots: setup.snapshots,
+    });
+    const writesBeforeResponse = setup.fixture.writeCalls;
+    const editedSnapshots = structuredClone(setup.snapshots);
+    editedSnapshots.providerArtifacts.find((artifact) =>
+      String(artifact.id) === "202").body += "\nEdited after the durable intent.";
+    const editedHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: intent.transport,
+        snapshots: editedSnapshots,
+      });
+    await assert.rejects(
+      setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: editedHandles,
+      }),
+      (error) => error.code ===
+        "automatic-artifact-binding-point-read-mismatch",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeResponse);
+    await assert.rejects(
+      setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: [...handles].reverse(),
+      }),
+      (error) => error.code ===
+        "automatic-artifact-binding-point-read-mismatch",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeResponse);
+
+    const bound = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: handles,
+      });
+    assert.equal(bound.bindings.length, 2);
+    assert.deepEqual(
+      bound.bindings.map((binding) => binding.artifact_selector.id),
+      ["202", "203"],
+    );
+    assert.equal(
+      new Set(bound.bindings.map((binding) => binding.record_oid)).size,
+      1,
+    );
+    assert.equal(
+      new Set(bound.bindings.map((binding) => binding.receipt_digest)).size,
+      2,
+    );
+    const writesAfterResponse = setup.fixture.writeCalls;
+    const replay = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: handles,
+      });
+    assert.deepEqual(replay, bound);
+    assert.equal(setup.fixture.writeCalls, writesAfterResponse);
+
+    const control = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await setup.ledger.loadControlPlaneAuthority(
+        setup.context.evaluatedScopeReceipt.scope,
+      ),
+    );
+    assert.deepEqual(
+      control.derived.artifact_bindings.map((binding) =>
+        binding.artifact_selector.id),
+      ["202", "203"],
+    );
+
+    setup.fixture.rewriteTipEnvelope((envelope) => {
+      const payload = structuredClone(envelope.payload);
+      const receipt = payload.receipt;
+      const binding = receipt.bindings[0];
+      binding.raw_body_sha256 = `sha256:${"0".repeat(64)}`;
+      const { receipt_digest: _bindingDigest, ...bindingWithoutDigest } =
+        binding;
+      binding.receipt_digest = digestCanonical(
+        "codex-review-gate-v2-artifact-binding-receipt",
+        bindingWithoutDigest,
+      );
+      receipt.bindings_digest = digestCanonical(
+        "codex-review-gate-v2-aggregate-artifact-binding-receipts",
+        receipt.bindings,
+      );
+      resealFixtureProductionEnvelopePayload(envelope, payload);
+    });
+    const restarted = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      setup.context.verifier,
+      setup.context.preflight,
+    );
+    await assert.rejects(
+      restarted.load(),
+      /differs from its exact candidate authority/u,
+    );
+  });
+
+test("automatic recovery aggregate closes the exact 255-item blob boundary",
+  async () => {
+    const additionalFindingIds = Array.from(
+      { length: 254 },
+      (_, index) => String(1000 + index),
+    );
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+      additionalFindingIds,
+      includeAddresses: false,
+    });
+    const intent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    assert.equal(intent.transport.expected_count, 255);
+    let loaded = await setup.ledger.load();
+    const intentEnvelope = loaded.records.find((entry) =>
+      entry.commit_sha === intent.intent_append_receipt.commit_sha).envelope;
+    assert.ok(Buffer.byteLength(
+      canonicalJson(intentEnvelope.payload.action),
+      "utf8",
+    ) < MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_ACTION_BYTES);
+    assert.ok(Buffer.byteLength(
+      `${canonicalJson(intentEnvelope)}\n`,
+      "utf8",
+    ) <= MAX_V2_GIT_LEDGER_BLOB_BYTES);
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: intent.transport,
+        snapshots: setup.snapshots,
+      });
+    assert.equal(providerArtifactHandles.length, 255);
+    const response = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    assert.equal(response.bindings.length, 255);
+    loaded = await setup.ledger.load();
+    const responseEnvelope = loaded.records.find((entry) =>
+      entry.commit_sha === response.response_append_receipt.commit_sha).envelope;
+    assert.ok(Buffer.byteLength(
+      canonicalJson(responseEnvelope.payload.receipt),
+      "utf8",
+    ) < MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_RECEIPT_BYTES);
+    assert.ok(Buffer.byteLength(
+      `${canonicalJson(responseEnvelope)}\n`,
+      "utf8",
+    ) <= MAX_V2_GIT_LEDGER_BLOB_BYTES);
+    const control = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await setup.ledger.loadControlPlaneAuthority(
+        setup.context.evaluatedScopeReceipt.scope,
+      ),
+    );
+    assert.equal(control.derived.artifact_bindings.length, 255);
+    assert.deepEqual(
+      control.derived.artifact_bindings.map((binding) =>
+        binding.artifact_selector.id),
+      response.bindings.map((binding) => binding.artifact_selector.id),
+    );
+    assert.deepEqual(
+      response.bindings.map((binding) => binding.artifact_selector.id),
+      intent.transport.requests.map((request) => request.selector.id),
+    );
+  });
+
+test("automatic recovery aggregate rejects the 256th item before observation writes",
+  async () => {
+    let boundary = null;
+    await assert.rejects(
+      createAutomaticRecoveryTransitionContext({
+        bindArtifact: false,
+        additionalFindingIds: Array.from(
+          { length: 255 },
+          (_, index) => String(2000 + index),
+        ),
+        includeAddresses: false,
+        beforeRecoveryObservation(value) {
+          boundary = {
+            fixture: value.fixture,
+            writes: value.fixture.writeCalls,
+            objects: value.fixture.blobs.size + value.fixture.trees.size +
+              value.fixture.commits.size,
+            tip: value.fixture.refTarget,
+          };
+        },
+      }),
+      (error) => error.code === "SELECTOR_LIMIT_EXCEEDED",
+    );
+    assert.notEqual(boundary, null);
+    assert.equal(boundary.fixture.writeCalls, boundary.writes);
+    assert.equal(
+      boundary.fixture.blobs.size + boundary.fixture.trees.size +
+        boundary.fixture.commits.size,
+      boundary.objects,
+    );
+    assert.equal(boundary.fixture.refTarget, boundary.tip);
+  });
+
+test("automatic recovery aggregate rejects a self-sealed 256-item authority before write and on restart",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    const intent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    const loaded = await setup.ledger.load();
+    const intentEntry = loaded.records.find((entry) =>
+      entry.commit_sha === intent.intent_append_receipt.commit_sha);
+    assert.notEqual(intentEntry, undefined);
+    const forgeCandidateCount = (payloadValue) => {
+      const payload = structuredClone(payloadValue);
+      const authority = payload.action.candidate_authority;
+      authority.candidates = Array.from(
+        { length: 256 },
+        () => structuredClone(authority.candidates[0]),
+      );
+      return payload;
+    };
+
+    const forgedRecord = structuredClone(
+      recordFromFixtureEnvelope(intentEntry.envelope),
+    );
+    forgedRecord.payload = forgeCandidateCount(forgedRecord.payload);
+    forgedRecord.payload_digest = digestV2GitLedgerPayload(
+      forgedRecord.payload,
+    );
+    const { record_digest: _recordDigest, ...recordWithoutDigest } =
+      forgedRecord;
+    forgedRecord.record_digest = digestCanonical(
+      "codex-review-gate-v2-git-ledger-record",
+      recordWithoutDigest,
+    );
+    const writesBefore = setup.fixture.writeCalls;
+    const tipBefore = setup.fixture.refTarget;
+    await assert.rejects(
+      setup.ledger.appendRecord(forgedRecord, {
+        evaluated_scope_receipt: setup.context.evaluatedScopeReceipt,
+      }),
+      (error) => error.code ===
+        "automatic-artifact-binding-candidate-count",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBefore);
+    assert.equal(setup.fixture.refTarget, tipBefore);
+
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: intent.transport,
+        snapshots: setup.snapshots,
+      });
+    await setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+      artifact_binding_intent_handle:
+        intent.artifact_binding_intent_handle,
+      intent_append_receipt: intent.intent_append_receipt,
+      provider_artifact_handles: providerArtifactHandles,
+    });
+
+    setup.fixture.rewriteTipEnvelope((envelope) => {
+      resealFixtureProductionEnvelopePayload(
+        envelope,
+        forgeCandidateCount(envelope.payload),
+      );
+    });
+    const restarted = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      setup.context.verifier,
+      setup.context.preflight,
+    );
+    await assert.rejects(
+      restarted.load(),
+      (error) => error.code ===
+        "automatic-artifact-binding-candidate-count",
+    );
+  });
+
+test("automatic recovery aggregate intent resumes on one fresh ordinary lease",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+      additionalFindingIds: ["203"],
+    });
+    const originalIntent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    await releaseFixtureDiscoveryLease(
+      setup.ledger,
+      setup.context.discovery,
+    );
+    setup.fixture.advanceServerTime(7200);
+    setup.runIdentity.run_id = "9002";
+    setup.runIdentity.run_attempt = 1;
+    const restarted = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      setup.context.verifier,
+      setup.context.preflight,
+    );
+    const nextRun = await acquireEstablishedRunnerContext({
+      ledger: restarted,
+      runIdentity: setup.runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 9000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+    });
+    const nextObservation = await appendAutomaticRecoveryObservation({
+      ledger: restarted,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: nextRun.evaluatedScopeReceipt,
+      workflowCommandHandle: nextRun.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      additionalFindingIds: ["203"],
+      expectRecoveryHandle: false,
+    });
+    const writesBeforeRehydrate = setup.fixture.writeCalls;
+    const recoveredIntent = await restarted
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: nextObservation.schedulerAppend,
+        artifact_binding_candidate_handle:
+          nextObservation.artifactBindingCandidateHandle,
+      });
+    assert.equal(
+      recoveredIntent.intent_append_receipt.commit_sha,
+      originalIntent.intent_append_receipt.commit_sha,
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeRehydrate);
+    const handles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: restarted,
+      fixture: setup.fixture,
+      transport: recoveredIntent.transport,
+      snapshots: nextObservation.snapshots,
+    });
+    const response = await restarted
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          recoveredIntent.artifact_binding_intent_handle,
+        intent_append_receipt: recoveredIntent.intent_append_receipt,
+        provider_artifact_handles: handles,
+      });
+    assert.equal(response.bindings.length, 2);
+    const loaded = await restarted.load();
+    const intents = loaded.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding");
+    const responses = loaded.records.filter((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "artifact-binding");
+    assert.equal(intents.length, 1);
+    assert.equal(responses.length, 1);
+    assert.equal(
+      responses[0].envelope.payload.intent_commit_sha,
+      intents[0].commit_sha,
+    );
+    assert.notEqual(
+      responses[0].envelope.predecessor_commit_sha,
+      intents[0].commit_sha,
+    );
+  });
+
+test("automatic recovery aggregate resumes each durable pre-GET marker",
+  async (t) => {
+    for (const failure of [
+      {
+        label: "intent",
+        kind: "artifact-binding",
+        occurrence: 1,
+        readyIntents: 0,
+        readyResponses: 0,
+      },
+      {
+        label: "ready-intent",
+        kind: "artifact-binding-ready",
+        occurrence: 1,
+        readyIntents: 1,
+        readyResponses: 0,
+      },
+      {
+        label: "ready-confirmation",
+        kind: "artifact-binding-ready",
+        occurrence: 2,
+        readyIntents: 1,
+        readyResponses: 1,
+      },
+    ]) {
+      await t.test(failure.label, async () => {
+        const setup = await createAutomaticRecoveryTransitionContext({
+          bindArtifact: false,
+        });
+        setup.fixture.failRereadAfterEffectUpdate(
+          failure.kind,
+          failure.occurrence,
+        );
+        await assert.rejects(
+          setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: setup.schedulerAppend,
+            artifact_binding_candidate_handle:
+              setup.artifactBindingCandidateHandle,
+          }),
+          (error) => error.code === "unexpected-http-status",
+        );
+        const partial = await setup.ledger.load();
+        assert.equal(partial.records.filter((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "artifact-binding").length, 1);
+        assert.equal(partial.records.filter((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "artifact-binding-ready").length,
+        failure.readyIntents);
+        assert.equal(partial.records.filter((entry) =>
+          entry.envelope.record_type === "effect-response" &&
+          entry.envelope.kind === "artifact-binding-ready").length,
+        failure.readyResponses);
+
+        const continuation = await createFreshAutomaticRecoveryContinuation(
+          setup,
+          {
+            additionalFindingIds: ["203"],
+            expectRecoveryHandle: false,
+            requireArtifactBinding: false,
+          },
+        );
+        const expanded = continuation.recovery;
+        const continuationLedger = continuation.ledger;
+        const recovered = await continuationLedger
+          .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: expanded.schedulerAppend,
+            artifact_binding_candidate_handle:
+              expanded.artifactBindingCandidateHandle,
+          });
+        assert.equal(recovered.transport.operation,
+          "loadV2ProviderPreScopeArtifacts");
+        assert.equal(recovered.transport.expected_count, 1);
+        assert.deepEqual(
+          recovered.transport.requests.map((request) => request.selector.id),
+          ["202"],
+        );
+        const stable = await continuationLedger.load();
+        const bindingIntents = stable.records.filter((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "artifact-binding");
+        assert.equal(bindingIntents.length, 2);
+        assert.deepEqual(
+          bindingIntents.map((entry) =>
+            entry.envelope.payload.action.candidate_authority.candidates
+              .map((candidate) => candidate.selector.id)),
+          [["202"], ["203"]],
+        );
+        assert.equal(stable.records.filter((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "artifact-binding-ready").length, 1);
+        assert.equal(stable.records.filter((entry) =>
+          entry.envelope.record_type === "effect-response" &&
+          entry.envelope.kind === "artifact-binding-ready").length, 1);
+        assert.equal(
+          recovered.ready_append_receipt.commit_sha,
+          stable.records.find((entry) =>
+            entry.envelope.record_type === "effect-intent" &&
+            entry.envelope.kind === "artifact-binding-ready").commit_sha,
+        );
+        assert.equal(
+          recovered.ready_confirmation_append_receipt.commit_sha,
+          stable.records.find((entry) =>
+            entry.envelope.record_type === "effect-response" &&
+            entry.envelope.kind === "artifact-binding-ready").commit_sha,
+        );
+      });
+    }
+  });
+
+test("automatic recovery aggregate resumes its frozen durable prefix when current evidence appends candidates",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    setup.fixture.failRereadAfterEffectUpdate(
+      "artifact-binding-ready",
+      2,
+    );
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+
+    setup.fixture.advanceServerTime(60);
+    const expanded = await appendAutomaticRecoveryObservation({
+      ledger: setup.ledger,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: setup.context.evaluatedScopeReceipt,
+      workflowCommandHandle: setup.context.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      additionalFindingIds: ["203"],
+      expectRecoveryHandle: false,
+      requireArtifactBinding: false,
+    });
+    setup.fixture.failRereadAfterEffectUpdate("artifact-binding", 1);
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: expanded.schedulerAppend,
+        artifact_binding_candidate_handle:
+          expanded.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+    const queuedAfterReturnLoss = await setup.ledger.load();
+    assert.deepEqual(
+      queuedAfterReturnLoss.records.filter((entry) =>
+        entry.envelope.record_type === "effect-intent" &&
+        entry.envelope.kind === "artifact-binding").map((entry) =>
+        entry.envelope.payload.action.candidate_authority.candidates
+          .map((candidate) => candidate.selector.id)),
+      [["202"], ["203"]],
+    );
+    const recovered = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: expanded.schedulerAppend,
+        artifact_binding_candidate_handle:
+          expanded.artifactBindingCandidateHandle,
+      });
+    assert.equal(recovered.transport.expected_count, 1);
+    assert.deepEqual(
+      recovered.transport.requests.map((request) => request.selector.id),
+      ["202"],
+    );
+    const durableQueuedIntent = queuedAfterReturnLoss.records.find((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding" &&
+      entry.envelope.payload.action
+        .queued_after_artifact_binding_intent_record_oid !== null);
+    assert.notEqual(durableQueuedIntent, undefined);
+    assert.equal(
+      recovered.latest_append_receipt.commit_sha,
+      durableQueuedIntent.commit_sha,
+    );
+    const firstHandles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: setup.ledger,
+      fixture: setup.fixture,
+      transport: recovered.transport,
+      snapshots: expanded.snapshots,
+    });
+    const firstResponse = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          recovered.artifact_binding_intent_handle,
+        intent_append_receipt: recovered.intent_append_receipt,
+        provider_artifact_handles: firstHandles,
+      });
+    assert.deepEqual(
+      firstResponse.bindings.map((binding) => binding.artifact_selector.id),
+      ["202"],
+    );
+
+    setup.fixture.advanceServerTime(60);
+    const temporarilyShrunk = await appendAutomaticRecoveryObservation({
+      ledger: setup.ledger,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: setup.context.evaluatedScopeReceipt,
+      workflowCommandHandle: setup.context.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      expectRecoveryHandle: true,
+      requireArtifactBinding: true,
+    });
+    const writesBeforeShrunkTransition = setup.fixture.writeCalls;
+    await assert.rejects(
+      setup.ledger.appendAutomaticRequestRecoveryTransition({
+        scheduler_append: temporarilyShrunk.schedulerAppend,
+        recovery_handle: temporarilyShrunk.recoveryHandle,
+      }),
+      (error) => error.code ===
+        "automatic-recovery-artifact-binding-incomplete",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeShrunkTransition);
+
+    const remainingContinuation =
+      await createFreshAutomaticRecoveryContinuation(setup, {
+        additionalFindingIds: ["203"],
+        expectRecoveryHandle: false,
+        requireArtifactBinding: true,
+      });
+    const continuationLedger = remainingContinuation.ledger;
+    const remaining = remainingContinuation.recovery;
+    const second = await continuationLedger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: remaining.schedulerAppend,
+        artifact_binding_candidate_handle:
+          remaining.artifactBindingCandidateHandle,
+      });
+    assert.equal(second.transport.expected_count, 1);
+    assert.deepEqual(
+      second.transport.requests.map((request) => request.selector.id),
+      ["203"],
+    );
+    const secondHandles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: continuationLedger,
+      fixture: setup.fixture,
+      transport: second.transport,
+      snapshots: remaining.snapshots,
+    });
+    const secondResponse = await continuationLedger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          second.artifact_binding_intent_handle,
+        intent_append_receipt: second.intent_append_receipt,
+        provider_artifact_handles: secondHandles,
+      });
+    assert.deepEqual(
+      secondResponse.bindings.map((binding) => binding.artifact_selector.id),
+      ["203"],
+    );
+
+    setup.fixture.advanceServerTime(60);
+    const complete = await appendAutomaticRecoveryObservation({
+      ledger: continuationLedger,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt:
+        remainingContinuation.nextRun.evaluatedScopeReceipt,
+      workflowCommandHandle:
+        remainingContinuation.nextRun.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      additionalFindingIds: ["203"],
+      expectRecoveryHandle: true,
+      requireArtifactBinding: true,
+    });
+    assert.equal(complete.artifactBindingCandidateHandle, null);
+    const transition = await continuationLedger
+      .appendAutomaticRequestRecoveryTransition({
+        scheduler_append: complete.schedulerAppend,
+        recovery_handle: complete.recoveryHandle,
+      });
+    assert.equal(transition.prior_generation_id, "automatic:1");
+    assert.equal(transition.next_generation_id, "automatic:2");
+  });
+
+test("automatic recovery aggregate rejects deletion, drift, or insertion before its frozen prefix",
+  async (t) => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    setup.fixture.failRereadAfterEffectUpdate(
+      "artifact-binding-ready",
+      2,
+    );
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+
+    for (const mutation of [
+      {
+        label: "delete-frozen-candidate",
+        options: {
+          includePrimaryFinding: false,
+          additionalFindingIds: ["203"],
+        },
+      },
+      {
+        label: "change-frozen-identity",
+        options: {
+          findingLine: 2,
+          additionalFindingIds: ["203"],
+        },
+      },
+      {
+        label: "insert-before-and-reorder-frozen-candidate",
+        options: {
+          precedingFindingIds: ["201"],
+        },
+      },
+    ]) {
+      await t.test(mutation.label, async () => {
+        setup.fixture.advanceServerTime(60);
+        const current = await appendAutomaticRecoveryObservation({
+          ledger: setup.ledger,
+          preflight: setup.context.preflight,
+          evaluatedScopeReceipt: setup.context.evaluatedScopeReceipt,
+          workflowCommandHandle: setup.context.workflowCommandHandle,
+          requestCreatedAt: setup.requestCreatedAt,
+          findingCreatedAt: setup.findingCreatedAt,
+          expectRecoveryHandle: false,
+          requireArtifactBinding: false,
+          ...mutation.options,
+        });
+        const writesBefore = setup.fixture.writeCalls;
+        await assert.rejects(
+          setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: current.schedulerAppend,
+            artifact_binding_candidate_handle:
+              current.artifactBindingCandidateHandle,
+          }),
+          (error) => error.code ===
+            "automatic-artifact-binding-candidate-drift",
+        );
+        assert.equal(setup.fixture.writeCalls, writesBefore);
+      });
+    }
+
+    const stable = await setup.ledger.load();
+    assert.equal(stable.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding").length, 1);
+    assert.equal(stable.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding-ready").length, 1);
+    assert.equal(stable.records.filter((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "artifact-binding-ready").length, 1);
+  });
+
+test("automatic recovery aggregate rejects a third durable candidate transaction",
+  async () => {
+    const { setup } =
+      await createAutomaticRecoveryQueuedArtifactBindingContext();
+    setup.fixture.advanceServerTime(60);
+    const third = await appendAutomaticRecoveryObservation({
+      ledger: setup.ledger,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: setup.context.evaluatedScopeReceipt,
+      workflowCommandHandle: setup.context.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      additionalFindingIds: ["203", "204"],
+      expectRecoveryHandle: false,
+      requireArtifactBinding: false,
+    });
+    const writesBefore = setup.fixture.writeCalls;
+    const tipBefore = setup.fixture.refTarget;
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: third.schedulerAppend,
+        artifact_binding_candidate_handle:
+          third.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code ===
+        "automatic-artifact-binding-queue-capacity",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBefore);
+    assert.equal(setup.fixture.refTarget, tipBefore);
+  });
+
+test("automatic recovery aggregate history rejects self-sealed queue lineage drift",
+  async (t) => {
+    for (const mutation of [
+      {
+        label: "missing-parent",
+        additionalFindingIds: ["203"],
+        mutate(payload) {
+          payload.action
+            .queued_after_artifact_binding_intent_record_oid = null;
+        },
+      },
+      {
+        label: "wrong-parent",
+        additionalFindingIds: ["203"],
+        mutate(payload) {
+          payload.action
+            .queued_after_artifact_binding_intent_record_oid =
+              "f".repeat(40);
+        },
+      },
+      {
+        label: "duplicate-parent-candidate",
+        additionalFindingIds: ["203"],
+        mutate(payload, parentEntry) {
+          const parentCandidate = parentEntry.envelope.payload.action
+            .candidate_authority.candidates[0];
+          payload.action.candidate_authority =
+            resealFixtureAutomaticRecoveryCandidateAuthority(
+              payload.action.candidate_authority,
+              [parentCandidate],
+            );
+          payload.action.candidate_set_digest =
+            fixtureAutomaticRecoveryCandidateSetDigest(
+              payload.action.candidate_authority,
+            );
+        },
+      },
+      {
+        label: "reordered-queued-suffix",
+        additionalFindingIds: ["203", "204"],
+        mutate(payload) {
+          payload.action.candidate_authority =
+            resealFixtureAutomaticRecoveryCandidateAuthority(
+              payload.action.candidate_authority,
+              [...payload.action.candidate_authority.candidates].reverse(),
+            );
+          payload.action.candidate_set_digest =
+            fixtureAutomaticRecoveryCandidateSetDigest(
+              payload.action.candidate_authority,
+            );
+        },
+      },
+    ]) {
+      await t.test(mutation.label, async () => {
+        const { setup, parentEntry } =
+          await createAutomaticRecoveryQueuedArtifactBindingContext({
+            additionalFindingIds: mutation.additionalFindingIds,
+          });
+        setup.fixture.rewriteTipEnvelope((envelope) => {
+          assert.equal(envelope.record_type, "effect-intent");
+          assert.equal(envelope.kind, "artifact-binding");
+          const payload = structuredClone(envelope.payload);
+          mutation.mutate(payload, parentEntry);
+          resealFixtureProductionEnvelopePayload(envelope, payload);
+        });
+        const writesBefore = setup.fixture.writeCalls;
+        const tipBefore = setup.fixture.refTarget;
+        const restarted = makeLedger(
+          setup.fixture,
+          setup.context.capability,
+          setup.context.verifier,
+          setup.context.preflight,
+        );
+        await assert.rejects(
+          restarted.load(),
+          (error) => error.code ===
+            "automatic-artifact-binding-queue-lineage",
+        );
+        assert.equal(setup.fixture.writeCalls, writesBefore);
+        assert.equal(setup.fixture.refTarget, tipBefore);
+      });
+    }
+  });
+
+test("automatic recovery aggregate accepts point reads only after its durable ready confirmation",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    const beforeIntentBoundary = (await setup.ledger.load()).post_ref.server_time;
+    const preIntentHandle = await loadAutomaticRecoveryProviderArtifactHandle({
+      request: {
+        owner: REPOSITORY.owner,
+        repo: REPOSITORY.name,
+        pullNumber: PR.number,
+        headSha: HEAD,
+        selector: { kind: "issue_comment", id: "202" },
+        expectedActor: CODEX_ACTOR,
+        expectedApp: CODEX_APP,
+      },
+      snapshots: setup.snapshots,
+      server_time: beforeIntentBoundary,
+    });
+    const intent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    const loaded = await setup.ledger.load();
+    const ready = loaded.records.find((entry) =>
+      entry.commit_sha === intent.ready_append_receipt.commit_sha);
+    const readyConfirmation = loaded.records.find((entry) =>
+      entry.commit_sha ===
+        intent.ready_confirmation_append_receipt.commit_sha);
+    assert.notEqual(ready, undefined);
+    assert.notEqual(readyConfirmation, undefined);
+    const readyBoundary = readyConfirmation.envelope.payload.receipt
+      .ready_reachability_boundary.ref_receipt.server_time;
+    const equalTimeHandle = await loadAutomaticRecoveryProviderArtifactHandle({
+      request: intent.transport.requests[0],
+      snapshots: setup.snapshots,
+      server_time: readyBoundary,
+    });
+    const writesBefore = setup.fixture.writeCalls;
+    const tipBefore = setup.fixture.refTarget;
+    for (const providerHandle of [preIntentHandle, equalTimeHandle]) {
+      await assert.rejects(
+        setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+          artifact_binding_intent_handle:
+            intent.artifact_binding_intent_handle,
+          intent_append_receipt: intent.intent_append_receipt,
+          provider_artifact_handles: [providerHandle],
+        }),
+        (error) => error.code ===
+          "automatic-artifact-binding-point-read-too-early",
+      );
+      assert.equal(setup.fixture.writeCalls, writesBefore);
+      assert.equal(setup.fixture.refTarget, tipBefore);
+    }
+
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: intent.transport,
+        snapshots: setup.snapshots,
+      });
+    const bound = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    assert.equal(bound.bindings.length, 1);
+  });
+
+test("automatic recovery aggregate point reads follow the post-ready stable ref boundary",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    setup.fixture.resumeServerTime();
+    const intent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    assert.notEqual(intent.ready_confirmation_append_receipt, undefined);
+    const loaded = await setup.ledger.load();
+    const ready = loaded.records.find((entry) =>
+      entry.commit_sha === intent.ready_append_receipt.commit_sha);
+    const readyConfirmation = loaded.records.find((entry) =>
+      entry.commit_sha ===
+        intent.ready_confirmation_append_receipt.commit_sha);
+    assert.notEqual(ready, undefined);
+    assert.notEqual(readyConfirmation, undefined);
+    const preReadyBoundary = ready.envelope.payload.action
+      .intent_reachability_boundary.ref_receipt.server_time;
+    const postReadyBoundary = readyConfirmation.envelope.payload.receipt
+      .ready_reachability_boundary.ref_receipt.server_time;
+    const betweenTime = new Date(
+      Date.parse(preReadyBoundary) + 1000,
+    ).toISOString();
+    assert.ok(Date.parse(preReadyBoundary) < Date.parse(betweenTime));
+    assert.ok(Date.parse(betweenTime) < Date.parse(postReadyBoundary));
+    const pointRead = await loadAutomaticRecoveryProviderArtifactHandle({
+      request: intent.transport.requests[0],
+      snapshots: setup.snapshots,
+      server_time: betweenTime,
+    });
+    const writesBefore = setup.fixture.writeCalls;
+    const tipBefore = setup.fixture.refTarget;
+    await assert.rejects(
+      setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: [pointRead],
+      }),
+      (error) => error.code ===
+        "automatic-artifact-binding-point-read-too-early",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBefore);
+    assert.equal(setup.fixture.refTarget, tipBefore);
+  });
+
+test("automatic recovery aggregate ready intent exact-binds its stable ref time on restart",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    setup.fixture.resumeServerTime();
+    setup.fixture.failRereadAfterEffectUpdate("artifact-binding-ready", 1);
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+    const loaded = await setup.ledger.load();
+    const intentEntry = loaded.records.find((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding");
+    const readyEntry = loaded.records.find((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding-ready");
+    assert.notEqual(intentEntry, undefined);
+    assert.notEqual(readyEntry, undefined);
+    assert.notEqual(
+      readyEntry.envelope.payload.action.intent_reachability_boundary
+        .ref_receipt.server_time,
+      intentEntry.envelope.server_observed_at,
+    );
+    setup.fixture.rewriteTipEnvelope((envelope) => {
+      const payload = structuredClone(envelope.payload);
+      const boundary = payload.action.intent_reachability_boundary;
+      boundary.ref_receipt.server_time =
+        intentEntry.envelope.server_observed_at;
+      const { boundary_digest: _digest, ...withoutDigest } = boundary;
+      boundary.boundary_digest = digestCanonical(
+        "codex-review-gate-v2-automatic-recovery-artifact-reachability",
+        withoutDigest,
+      );
+      resealFixtureProductionEnvelopePayload(envelope, payload);
+    });
+    const restarted = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      setup.context.verifier,
+      setup.context.preflight,
+    );
+    await assert.rejects(
+      restarted.load(),
+      (error) => error.code === "automatic-artifact-binding-ready-lineage",
+    );
+  });
+
+test("automatic recovery aggregate history rejects a skipped ready marker and downshifted point read",
+  async (t) => {
+    for (const mutation of [
+      "resealed-ready-boundary",
+      "downshift-ready-confirmation-boundary-time",
+      "skip-ready",
+      "equal-ready-time",
+    ]) {
+      await t.test(mutation, async () => {
+        const setup = await createAutomaticRecoveryTransitionContext({
+          bindArtifact: false,
+        });
+        if (mutation === "downshift-ready-confirmation-boundary-time") {
+          setup.fixture.resumeServerTime();
+        }
+        const intent = await setup.ledger
+          .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: setup.schedulerAppend,
+            artifact_binding_candidate_handle:
+              setup.artifactBindingCandidateHandle,
+          });
+        if (new Set([
+          "resealed-ready-boundary",
+          "downshift-ready-confirmation-boundary-time",
+        ]).has(mutation)) {
+          const beforeMutation = await setup.ledger.load();
+          const readyEntry = beforeMutation.records.find((entry) =>
+            entry.commit_sha === intent.ready_append_receipt.commit_sha);
+          assert.notEqual(readyEntry, undefined);
+          setup.fixture.rewriteTipEnvelope((envelope) => {
+            const payload = structuredClone(envelope.payload);
+            const boundary = payload.receipt.ready_reachability_boundary;
+            if (mutation === "resealed-ready-boundary") {
+              boundary.boundary_tip_record_oid =
+                boundary.continuation_scheduler_observation_record_oid;
+              boundary.ref_receipt.target_commit_sha =
+                boundary.continuation_scheduler_observation_record_oid;
+            } else {
+              assert.notEqual(
+                boundary.ref_receipt.server_time,
+                readyEntry.envelope.server_observed_at,
+              );
+              boundary.ref_receipt.server_time =
+                readyEntry.envelope.server_observed_at;
+            }
+            const { boundary_digest: _digest, ...withoutDigest } = boundary;
+            boundary.boundary_digest = digestCanonical(
+              "codex-review-gate-v2-automatic-recovery-artifact-ready-reachability",
+              withoutDigest,
+            );
+            resealFixtureProductionEnvelopePayload(envelope, payload);
+          });
+          const restarted = makeLedger(
+            setup.fixture,
+            setup.context.capability,
+            setup.context.verifier,
+            setup.context.preflight,
+          );
+          await assert.rejects(
+            restarted.load(),
+            (error) => error.code ===
+              "automatic-artifact-binding-ready-confirmation-lineage",
+          );
+          return;
+        }
+        const providerArtifactHandles =
+          await loadAutomaticRecoveryProviderArtifactHandles({
+            ledger: setup.ledger,
+            fixture: setup.fixture,
+            transport: intent.transport,
+            snapshots: setup.snapshots,
+          });
+        await setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+          artifact_binding_intent_handle:
+            intent.artifact_binding_intent_handle,
+          intent_append_receipt: intent.intent_append_receipt,
+          provider_artifact_handles: providerArtifactHandles,
+        });
+        const loaded = await setup.ledger.load();
+        const intentEntry = loaded.records.find((entry) =>
+          entry.commit_sha === intent.intent_append_receipt.commit_sha);
+        const readyEntry = loaded.records.find((entry) =>
+          entry.commit_sha === intent.ready_append_receipt.commit_sha);
+        const readyConfirmationEntry = loaded.records.find((entry) =>
+          entry.commit_sha ===
+            intent.ready_confirmation_append_receipt.commit_sha);
+        assert.notEqual(intentEntry, undefined);
+        assert.notEqual(readyEntry, undefined);
+        assert.notEqual(readyConfirmationEntry, undefined);
+        setup.fixture.rewriteTipEnvelope((envelope) => {
+          const payload = structuredClone(envelope.payload);
+          if (mutation === "skip-ready") {
+            payload.receipt
+              .artifact_binding_ready_confirmation_record_oid =
+                readyEntry.commit_sha;
+            payload.receipt
+              .artifact_binding_ready_confirmation_payload_digest =
+                readyEntry.envelope.payload_digest;
+          } else {
+            const boundaryTime = readyConfirmationEntry.envelope.payload
+              .receipt.ready_reachability_boundary.ref_receipt.server_time;
+            const binding = payload.receipt.bindings[0];
+            binding.server_time = boundaryTime;
+            const { receipt_digest: _digest, ...withoutDigest } = binding;
+            binding.receipt_digest = digestCanonical(
+              "codex-review-gate-v2-artifact-binding-receipt",
+              withoutDigest,
+            );
+            payload.receipt.bindings_digest = digestCanonical(
+              "codex-review-gate-v2-aggregate-artifact-binding-receipts",
+              payload.receipt.bindings,
+            );
+          }
+          resealFixtureProductionEnvelopePayload(envelope, payload);
+        });
+        const restarted = makeLedger(
+          setup.fixture,
+          setup.context.capability,
+          setup.context.verifier,
+          setup.context.preflight,
+        );
+        await assert.rejects(
+          restarted.load(),
+          (error) => error.code ===
+            "automatic-artifact-binding-reachability-lineage",
+        );
+      });
+    }
+  });
+
+test("automatic recovery aggregate returns one durable response without another GET or write",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    const intent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    let providerReads = 0;
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: intent.transport,
+        snapshots: setup.snapshots,
+        on_read() { providerReads += 1; },
+      });
+    assert.equal(providerReads, intent.transport.expected_count);
+    setup.fixture.failRereadAfterEffectUpdate("artifact-binding", 1);
+    await assert.rejects(
+      setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+    const durable = await setup.ledger.load();
+    assert.equal(durable.records.filter((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "artifact-binding").length, 1);
+    const writesBefore = setup.fixture.writeCalls;
+    const response = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    assert.equal(response.bindings.length, intent.transport.expected_count);
+    assert.equal(setup.fixture.writeCalls, writesBefore);
+    assert.equal(providerReads, intent.transport.expected_count);
+  });
+
+test("automatic recovery aggregate intent rejects fresh same-ID body drift",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    await setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+      scheduler_append: setup.schedulerAppend,
+      artifact_binding_candidate_handle:
+        setup.artifactBindingCandidateHandle,
+    });
+    await releaseFixtureDiscoveryLease(
+      setup.ledger,
+      setup.context.discovery,
+    );
+    setup.fixture.advanceServerTime(7200);
+    setup.runIdentity.run_id = "9002";
+    setup.runIdentity.run_attempt = 1;
+    const restarted = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      setup.context.verifier,
+      setup.context.preflight,
+    );
+    const nextRun = await acquireEstablishedRunnerContext({
+      ledger: restarted,
+      runIdentity: setup.runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 9000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+    });
+    const changed = await appendAutomaticRecoveryObservation({
+      ledger: restarted,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: nextRun.evaluatedScopeReceipt,
+      workflowCommandHandle: nextRun.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      findingLine: 2,
+      expectRecoveryHandle: false,
+    });
+    const writesBefore = setup.fixture.writeCalls;
+    const tipBefore = setup.fixture.refTarget;
+    await assert.rejects(
+      restarted.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: changed.schedulerAppend,
+        artifact_binding_candidate_handle:
+          changed.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code ===
+        "automatic-artifact-binding-candidate-drift",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBefore);
+    assert.equal(setup.fixture.refTarget, tipBefore);
+  });
+
+test("automatic recovery transition resumes durable partial writes without replay",
+  async (t) => {
+    await t.test("an intent ref update resumes with one response", async () => {
+      const setup = await createAutomaticRecoveryTransitionContext();
+      setup.fixture.failRereadAfterEffectUpdate("scheduler-state", 1);
+      await assert.rejects(
+        setup.ledger.appendAutomaticRequestRecoveryTransition({
+          scheduler_append: setup.schedulerAppend,
+          recovery_handle: setup.recoveryHandle,
+        }),
+        (error) => error.code === "unexpected-http-status",
+      );
+      let loaded = await setup.ledger.load();
+      assert.equal(loaded.records.filter((entry) =>
+        entry.envelope.kind === "scheduler-state" &&
+        entry.envelope.record_type === "effect-intent").length, 1);
+      assert.equal(loaded.records.filter((entry) =>
+        entry.envelope.kind === "scheduler-state" &&
+        entry.envelope.record_type === "effect-response").length, 0);
+      const recovered = await setup.ledger
+        .appendAutomaticRequestRecoveryTransition({
+          scheduler_append: setup.schedulerAppend,
+          recovery_handle: setup.recoveryHandle,
+        });
+      assert.equal(recovered.next_generation_id, "automatic:2");
+      loaded = await setup.ledger.load();
+      assert.equal(loaded.records.filter((entry) =>
+        entry.envelope.kind === "scheduler-state" &&
+        entry.envelope.record_type === "effect-intent").length, 1);
+      assert.equal(loaded.records.filter((entry) =>
+        entry.envelope.kind === "scheduler-state" &&
+        entry.envelope.record_type === "effect-response").length, 1);
+    });
+
+    await t.test("a durable response returns by zero-write reread", async () => {
+      const setup = await createAutomaticRecoveryTransitionContext();
+      setup.fixture.failRereadAfterEffectUpdate("scheduler-state", 2);
+      await assert.rejects(
+        setup.ledger.appendAutomaticRequestRecoveryTransition({
+          scheduler_append: setup.schedulerAppend,
+          recovery_handle: setup.recoveryHandle,
+        }),
+        (error) => error.code === "unexpected-http-status",
+      );
+      const partial = await setup.ledger.load();
+      assert.equal(partial.records.filter((entry) =>
+        entry.envelope.kind === "scheduler-state" &&
+        entry.envelope.record_type === "effect-response").length, 1);
+      const writesBefore = setup.fixture.writeCalls;
+      const recovered = await setup.ledger
+        .appendAutomaticRequestRecoveryTransition({
+          scheduler_append: setup.schedulerAppend,
+          recovery_handle: setup.recoveryHandle,
+        });
+      assert.equal(recovered.next_generation_id, "automatic:2");
+      assert.equal(setup.fixture.writeCalls, writesBefore);
+    });
+
+    await t.test(
+      "a fresh factory and proof complete one durable intent without replay",
+      async () => {
+        const setup = await createAutomaticRecoveryTransitionContext();
+        setup.fixture.failRereadAfterEffectUpdate("scheduler-state", 1);
+        await assert.rejects(
+          setup.ledger.appendAutomaticRequestRecoveryTransition({
+            scheduler_append: setup.schedulerAppend,
+            recovery_handle: setup.recoveryHandle,
+          }),
+          (error) => error.code === "unexpected-http-status",
+        );
+        const partial = await setup.ledger.load();
+        const durableIntent = partial.records.find((entry) =>
+          entry.envelope.kind === "scheduler-state" &&
+          entry.envelope.record_type === "effect-intent");
+        assert.notEqual(durableIntent, undefined);
+        const intentAuthorityDigest = durableIntent.envelope.payload.action
+          .recovery_authority.authority_digest;
+        const { ledger: restarted, recovery: nextRecovery } =
+          await createFreshAutomaticRecoveryContinuation(setup);
+        const writesBefore = setup.fixture.writeCalls;
+        const recovered = await restarted
+          .appendAutomaticRequestRecoveryTransition({
+            scheduler_append: nextRecovery.schedulerAppend,
+            recovery_handle: nextRecovery.recoveryHandle,
+          });
+        assert.equal(recovered.next_generation_id, "automatic:2");
+        assert.equal(
+          recovered.intent_recovery_authority_digest,
+          intentAuthorityDigest,
+        );
+        assert.notEqual(
+          recovered.completion_recovery_authority_digest,
+          intentAuthorityDigest,
+          "the completion binds the independently verified fresh proof",
+        );
+        const loaded = await restarted.load();
+        const intents = loaded.records.filter((entry) =>
+          entry.envelope.kind === "scheduler-state" &&
+          entry.envelope.record_type === "effect-intent");
+        const responses = loaded.records.filter((entry) =>
+          entry.envelope.kind === "scheduler-state" &&
+          entry.envelope.record_type === "effect-response");
+        assert.equal(intents.length, 1);
+        assert.equal(responses.length, 1);
+        const oldClosure = intents[0].envelope.payload.action
+          .recovery_authority.closure_records[0];
+        const freshClosure = responses[0].envelope.payload.receipt
+          .completion_recovery_authority.closure_records[0];
+        const semanticClosure = (record) => {
+          const {
+            closure_authority_digest: _authorityDigest,
+            ...semantic
+          } = record;
+          return semantic;
+        };
+        assert.deepEqual(
+          semanticClosure(freshClosure),
+          semanticClosure(oldClosure),
+        );
+        assert.notEqual(
+          freshClosure.closure_authority_digest,
+          oldClosure.closure_authority_digest,
+          "a fresh exact permission/snapshot proof may renew its audit digest",
+        );
+        assert.ok(setup.fixture.writeCalls > writesBefore);
+      },
+    );
+
+    await t.test(
+      "a fresh proof cannot delete or rewrite one durable semantic closure",
+      async () => {
+        const setup = await createAutomaticRecoveryTransitionContext();
+        setup.fixture.failRereadAfterEffectUpdate("scheduler-state", 1);
+        await assert.rejects(
+          setup.ledger.appendAutomaticRequestRecoveryTransition({
+            scheduler_append: setup.schedulerAppend,
+            recovery_handle: setup.recoveryHandle,
+          }),
+          (error) => error.code === "unexpected-http-status",
+        );
+        const { ledger: restarted, recovery: changedRecovery } =
+          await createFreshAutomaticRecoveryContinuation(setup, {
+            addressId: "304",
+          });
+        const writesBefore = setup.fixture.writeCalls;
+        await assert.rejects(
+          restarted.appendAutomaticRequestRecoveryTransition({
+            scheduler_append: changedRecovery.schedulerAppend,
+            recovery_handle: changedRecovery.recoveryHandle,
+          }),
+          (error) =>
+            error.code === "automatic-recovery-completion-proof-regressed",
+        );
+        assert.equal(setup.fixture.writeCalls, writesBefore);
+        const loaded = await restarted.load();
+        assert.equal(loaded.records.filter((entry) =>
+          entry.envelope.kind === "scheduler-state" &&
+          entry.envelope.record_type === "effect-intent").length, 1);
+        assert.equal(loaded.records.filter((entry) =>
+          entry.envelope.kind === "scheduler-state" &&
+          entry.envelope.record_type === "effect-response").length, 0);
+      },
+    );
+
+    await t.test("clone and consumed-handle replay are zero-write", async () => {
+      const setup = await createAutomaticRecoveryTransitionContext();
+      let writesBefore = setup.fixture.writeCalls;
+      await assert.rejects(
+        setup.ledger.appendAutomaticRequestRecoveryTransition({
+          scheduler_append: setup.schedulerAppend,
+          recovery_handle: structuredClone(setup.recoveryHandle),
+        }),
+        /opaque recovery handle/u,
+      );
+      assert.equal(setup.fixture.writeCalls, writesBefore);
+      const resealed = Object.freeze({
+        ...structuredClone(setup.recoveryHandle),
+        authority_digest: `sha256:${"0".repeat(64)}`,
+      });
+      await assert.rejects(
+        setup.ledger.appendAutomaticRequestRecoveryTransition({
+          scheduler_append: setup.schedulerAppend,
+          recovery_handle: resealed,
+        }),
+        /opaque recovery handle/u,
+      );
+      assert.equal(setup.fixture.writeCalls, writesBefore);
+      const foreignFactory = createV2GitHubGitLedger({
+        ...factoryInput(setup.fixture, setup.context.capability),
+        preflightHandle: setup.context.preflight,
+        verifyWorkflowProvenance: setup.context.verifier,
+      });
+      await assert.rejects(
+        foreignFactory.appendAutomaticRequestRecoveryTransition({
+          scheduler_append: setup.schedulerAppend,
+          recovery_handle: setup.recoveryHandle,
+        }),
+        (error) => error.code === "UNTRUSTED_SCHEDULER_APPEND_HANDLE",
+      );
+      assert.equal(setup.fixture.writeCalls, writesBefore);
+      await setup.ledger.appendAutomaticRequestRecoveryTransition({
+        scheduler_append: setup.schedulerAppend,
+        recovery_handle: setup.recoveryHandle,
+      });
+      writesBefore = setup.fixture.writeCalls;
+      await assert.rejects(
+        setup.ledger.appendAutomaticRequestRecoveryTransition({
+          scheduler_append: setup.schedulerAppend,
+          recovery_handle: setup.recoveryHandle,
+        }),
+        (error) => error.code === "automatic-recovery-handle-replayed",
+      );
+      assert.equal(setup.fixture.writeCalls, writesBefore);
+    });
+  });
 
 test("initial runner authority rejects a pre-lease control boundary", async () => {
   const fixture = githubGitFixture();
@@ -3122,191 +4998,108 @@ test("closure-bound control-plane receipt derives an empty effect authority", as
   assert.match(receipt.receipt_digest, /^sha256:/u);
 });
 
-test("artifact binding requires prior request authority and strictly later exact provider evidence", async () => {
-  const fixture = githubGitFixture();
-  const context = await createProtectedInitialRunnerContext(fixture);
-  const { ledger, lease } = context;
-  const generation = automaticGeneration(1);
-
-  const missingLineage = artifactBindingIntent({
-    predecessor: lease.acquire_commit_sha,
-    lease,
-    generation,
-    requestBindingRecordOid: "9".repeat(40),
+test("artifact binding response requires one opaque aggregate admission", async () => {
+  const setup = await createAutomaticRecoveryTransitionContext({
+    bindArtifact: false,
   });
-  const writesBeforeMissingLineage = fixture.writeCalls;
-  await assert.rejects(
-    ledger.appendRecord(missingLineage),
-    (error) => error.code === "artifact-request-binding-required",
-  );
-  assert.equal(fixture.writeCalls, writesBeforeMissingLineage);
-
-  const prefix = await appendProtectedRequestPrefix(ledger, lease, context);
-  let boundAt = prefix.observationRecord.payload.action.snapshot_server_time;
-  const requestIntentRecord = reviewRequestRecord({
-    predecessor: prefix.attemptReceipt.commit_sha,
-    lease,
-    effectId: "artifact-review-request",
-    idempotencyKey: "artifact-review-request-key",
-    at: TIME,
-    generation,
-    schedulerObservationRecordOid: prefix.observationReceipt.commit_sha,
-    reservationRecordOid: prefix.reservationReceipt.commit_sha,
-    attemptRecordOid: prefix.attemptReceipt.commit_sha,
-    schedulerActionKey: prefix.schedulerActionKey,
-  });
-  const requestIntent = await ledger.appendRecord(requestIntentRecord);
-  const requestResponseReceipt =
-    await automaticReviewRequestBindingReceipt({
-      action: requestIntentRecord.payload.action,
-      observedAt: requestIntent.ref_reread.server_time,
+  const intent = await setup.ledger
+    .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+      scheduler_append: setup.schedulerAppend,
+      artifact_binding_candidate_handle:
+        setup.artifactBindingCandidateHandle,
     });
-  boundAt = requestResponseReceipt.created_at;
-  const requestResponseRecord = createV2GitLedgerRecord({
-    ...recordPlan(requestIntentRecord),
-    record_type: "effect-response",
-    predecessor_commit_sha: requestIntent.commit_sha,
-    server_observed_at:
-      requestResponseReceipt.request_scope_receipt.post_scope.observed_at,
-    payload: effectPayload({
-      phase: "response",
-      kind: "review-request",
-      predecessor: requestIntent.commit_sha,
-      generation,
-      intentCommitSha: requestIntent.commit_sha,
-      action: requestIntentRecord.payload.action,
-      receipt: requestResponseReceipt,
-    }),
-  });
-  const requestResponse = await ledger.appendRecord(requestResponseRecord);
-
-  const bindingIntentRecord = createV2GitLedgerRecord({
-    ...recordPlan(requestIntentRecord),
-    predecessor_commit_sha: requestResponse.commit_sha,
-    kind: "request-binding",
-    effect_id: "artifact-request-binding",
-    idempotency_key: "artifact-request-binding-key",
-    payload: effectPayload({
-      phase: "intent",
-      kind: "request-binding",
-      predecessor: requestResponse.commit_sha,
-      generation,
-      action: {
-        generation_id: "automatic:1",
-        request_id: "71",
-        reservation_record_oid: prefix.reservationReceipt.commit_sha,
-        attempt_record_oid: prefix.attemptReceipt.commit_sha,
-      },
-    }),
-  });
-  const bindingIntent = await ledger.appendRecord(bindingIntentRecord);
-  const bindingResponseRecord = createV2GitLedgerRecord({
-    ...recordPlan(bindingIntentRecord),
-    record_type: "effect-response",
-    predecessor_commit_sha: bindingIntent.commit_sha,
-    server_observed_at: boundAt,
-    payload: effectPayload({
-      phase: "response",
-      kind: "request-binding",
-      predecessor: bindingIntent.commit_sha,
-      generation,
-      intentCommitSha: bindingIntent.commit_sha,
-      action: bindingIntentRecord.payload.action,
-      receipt: {
-        request_id: "71",
-        request_node_id: "IC_71",
-        request_url:
-          "https://github.com/owner/repo/pull/7#issuecomment-71",
-        body_sha256: requestResponseReceipt.body_sha256,
-        created_at: boundAt,
-        updated_at: boundAt,
-        raw_body_sha256: requestResponseReceipt.refetch_raw_body_sha256,
-        actor: ACTOR,
-        controlled: true,
-      },
-    }),
-  });
-  const bindingResponse = await ledger.appendRecord(bindingResponseRecord);
-
-  const artifactIntentRecord = artifactBindingIntent({
-    predecessor: bindingResponse.commit_sha,
-    lease,
-    generation,
-    requestBindingRecordOid: bindingResponse.commit_sha,
-  });
-  assert.throws(
-    () => createV2GitLedgerRecord({
-      ...recordPlan(artifactIntentRecord),
-      effect_id: "artifact-wrong-provider",
-      idempotency_key: "artifact-wrong-provider-key",
-      payload: effectPayload({
-        phase: "intent",
-        kind: "artifact-binding",
-        predecessor: bindingResponse.commit_sha,
-        generation,
-        action: {
-          ...artifactIntentRecord.payload.action,
-          expected_actor: ACTOR,
-        },
-      }),
-    }),
-    /exact GitHub Codex provider/u,
-  );
-  const artifactIntent = await ledger.appendRecord(artifactIntentRecord);
-  const tooEarlyResponse = artifactBindingResponse({
-    intentRecord: artifactIntentRecord,
-    intentCommitSha: artifactIntent.commit_sha,
-    artifactCreatedAt: boundAt,
-  });
-  const writesBeforeTooEarly = fixture.writeCalls;
+  const loaded = await setup.ledger.load();
+  const intentEntry = loaded.records.find((entry) =>
+    entry.commit_sha === intent.intent_append_receipt.commit_sha);
+  const readyEntry = loaded.records.find((entry) =>
+    entry.commit_sha === intent.ready_append_receipt.commit_sha);
+  const readyConfirmationEntry = loaded.records.find((entry) =>
+    entry.commit_sha === intent.ready_confirmation_append_receipt.commit_sha);
+  assert.notEqual(intentEntry, undefined);
+  assert.notEqual(readyEntry, undefined);
+  assert.notEqual(readyConfirmationEntry, undefined);
+  const readyRecord = recordFromFixtureEnvelope(readyEntry.envelope);
+  const writesBeforeReady = setup.fixture.writeCalls;
+  const tipBeforeReady = setup.fixture.refTarget;
   await assert.rejects(
-    ledger.appendRecord(tooEarlyResponse),
-    (error) => error.code === "artifact-time-order",
+    setup.ledger.appendRecord(readyRecord, {
+      evaluated_scope_receipt: setup.context.evaluatedScopeReceipt,
+    }),
+    (error) => error.code ===
+      "UNTRUSTED_AUTOMATIC_ARTIFACT_BINDING_APPEND_ADMISSION",
   );
-  assert.equal(fixture.writeCalls, writesBeforeTooEarly);
-
-  const artifactResponseRecord = artifactBindingResponse({
-    intentRecord: artifactIntentRecord,
-    intentCommitSha: artifactIntent.commit_sha,
-    artifactCreatedAt: new Date(
-      Date.parse(boundAt) + 1000,
-    ).toISOString(),
+  assert.equal(setup.fixture.writeCalls, writesBeforeReady);
+  assert.equal(setup.fixture.refTarget, tipBeforeReady);
+  const intentRecord = recordFromFixtureEnvelope(intentEntry.envelope);
+  const authority = intentRecord.payload.action.candidate_authority;
+  const bindings = authority.candidates.map((candidate, index) => {
+    const withoutDigest = {
+      index,
+      count: authority.candidates.length,
+      generation_id: authority.generation_id,
+      request_binding_record_oid: authority.request_binding_record_oid,
+      request_id: authority.request_id,
+      request_node_id: authority.request_node_id,
+      artifact_selector: structuredClone(candidate.selector),
+      artifact_node_id: candidate.artifact_node_id,
+      artifact_url: candidate.artifact_url,
+      artifact_type: candidate.artifact_type,
+      artifact_created_at: candidate.artifact_created_at,
+      server_time: candidate.evidence_response_server_time,
+      raw_body_sha256: candidate.evidence_raw_body_sha256,
+      actor: structuredClone(authority.expected_actor),
+      app: structuredClone(authority.expected_app),
+    };
+    return {
+      ...withoutDigest,
+      receipt_digest: digestCanonical(
+        "codex-review-gate-v2-artifact-binding-receipt",
+        withoutDigest,
+      ),
+    };
   });
-  const artifactResponse = await ledger.appendRecord(artifactResponseRecord);
-  const loaded = await ledger.load();
-  const artifactFact = loaded.authority_projection.authority_facts.find((item) =>
-    item.record_oid === artifactResponse.commit_sha);
-  assert.equal(artifactFact.kind, "artifact-binding");
-  assert.equal(artifactFact.payload.receipt.request_binding_record_oid,
-    bindingResponse.commit_sha);
-  assert.equal(loaded.projection.selectors.artifact_bindings.length, 1);
-  const controlPlane = await ledger.loadControlPlaneReceipt({
-    pull_request: PR,
-    head_ref_oid: HEAD,
-    base_ref_oid: BASE,
-    potential_merge_commit_oid: POTENTIAL,
+  const receipt = {
+    http_status: 200,
+    candidate_set_digest: intentRecord.payload.action.candidate_set_digest,
+    artifact_binding_ready_confirmation_record_oid:
+      readyConfirmationEntry.commit_sha,
+    artifact_binding_ready_confirmation_payload_digest:
+      readyConfirmationEntry.envelope.payload_digest,
+    continuation_scheduler_observation_record_oid:
+      readyConfirmationEntry.envelope.payload.receipt
+        .ready_reachability_boundary
+        .continuation_scheduler_observation_record_oid,
+    continuation_full_scope_receipt_digest:
+      readyConfirmationEntry.envelope.payload.receipt
+        .ready_reachability_boundary.continuation_full_scope_receipt_digest,
+    continuation_lease_acquire_commit_sha:
+      readyConfirmationEntry.envelope.payload.receipt
+        .ready_reachability_boundary.continuation_lease_acquire_commit_sha,
+    binding_count: bindings.length,
+    bindings,
+    bindings_digest: digestCanonical(
+      "codex-review-gate-v2-aggregate-artifact-binding-receipts",
+      bindings,
+    ),
+  };
+  const forgedResponse = createV2GitLedgerEffectResponseRecord({
+    intent_record: intentRecord,
+    intent_commit_sha: intentEntry.commit_sha,
+    server_observed_at: loaded.post_ref.server_time,
+    receipt,
   });
-  assert.equal(controlPlane.derived.budget.automatic_reservations_on_head, 1);
-  assert.equal(controlPlane.derived.budget.automatic_requests_on_head, 1);
-  assert.equal(controlPlane.derived.generations.length, 1);
-  const generationAudit = controlPlane.derived.generations[0];
-  assert.equal(generationAudit.generation_id, "automatic:1");
-  assert.equal(generationAudit.request_effect_record_oid,
-    requestResponse.commit_sha);
-  assert.equal(generationAudit.request_binding_record_oid,
-    bindingResponse.commit_sha);
-  assert.equal(generationAudit.request_id, "71");
-  assert.equal(controlPlane.derived.artifact_bindings.length, 1);
-  assert.equal(controlPlane.derived.artifact_bindings[0].record_oid,
-    artifactResponse.commit_sha);
-  assert.equal(
-    controlPlane.derived.artifact_bindings[0].request_binding_record_oid,
-    bindingResponse.commit_sha,
+  const writesBefore = setup.fixture.writeCalls;
+  const tipBefore = setup.fixture.refTarget;
+  await assert.rejects(
+    setup.ledger.appendRecord(forgedResponse, {
+      evaluated_scope_receipt: setup.context.evaluatedScopeReceipt,
+    }),
+    (error) => error.code ===
+      "UNTRUSTED_AUTOMATIC_ARTIFACT_BINDING_APPEND_ADMISSION",
   );
-  assert.match(controlPlane.source_binding_digest, /^sha256:/u);
-  assert.match(controlPlane.source_authority_digest, /^sha256:/u);
+  assert.equal(setup.fixture.writeCalls, writesBefore);
+  assert.equal(setup.fixture.refTarget, tipBefore);
 });
-
 test("protected candidate inventory is a sharded durable repository superset", async () => {
   const fixture = githubGitFixture();
   const capability = scheduleCapabilityReceipt();
@@ -3325,7 +5118,7 @@ test("protected candidate inventory is a sharded durable repository superset", a
     verifyWorkflowProvenance: verifier,
   });
   const { ledger } = await restricted.bootstrapCapability();
-  const transportFixture = candidateTransportFixture(257);
+  const transportFixture = candidateTransportFixture(512);
   const transport = createV2GitHubCandidateInventory({
     fetch: transportFixture.fetch,
     token: SYNTHETIC_BEARER,
@@ -3348,7 +5141,7 @@ test("protected candidate inventory is a sharded durable repository superset", a
   assert.equal(
     loaded.authority_projection.candidate_inventory.open_pr_discovery
       .candidates.length,
-    257,
+    512,
   );
   assert.equal(
     loaded.authority_projection.candidate_inventory.open_pr_discovery
@@ -3373,10 +5166,12 @@ test("protected candidate inventory is a sharded durable repository superset", a
     loaded = await ledger.load();
   }
   const finalInventory = await transport.scan({ prior_inventory: initial });
+  const finalShards = await readCandidateShardRound(transport, finalInventory);
   const cycleReceipt = finalizeV2CandidateInventoryCycle({
     initial_inventory: initial,
     shard_receipts: shards,
     final_inventory: finalInventory,
+    final_shard_receipts: finalShards,
   });
   await appendCandidateInventoryPhase({
     ledger,
@@ -3389,8 +5184,8 @@ test("protected candidate inventory is a sharded durable repository superset", a
   loaded = await ledger.load();
   const authority = loaded.authority_projection.candidate_inventory;
   assert.equal(authority.open_pr_discovery.bootstrap_complete, true);
-  assert.equal(authority.open_pr_discovery.candidates.length, 257);
-  assert.equal(authority.open_pr_discovery.current_open_pull_requests.length, 257);
+  assert.equal(authority.open_pr_discovery.candidates.length, 512);
+  assert.equal(authority.open_pr_discovery.current_open_pull_requests.length, 512);
   assert.equal(authority.completed_cycle.shard_record_oids.length, 2);
   assert.equal(
     loaded.projection.selectors.candidate_inventory_observations.length,
@@ -3403,6 +5198,90 @@ test("protected candidate inventory is a sharded durable repository superset", a
     ),
     authority,
   );
+  const completionBlob = fixture.blobs.get(loaded.records.at(-1).blob_sha);
+  assert.notEqual(completionBlob, undefined);
+  assert.ok(
+    Buffer.byteLength(completionBlob.content, "utf8") <=
+      MAX_V2_GIT_LEDGER_BLOB_BYTES,
+    "the full 512-candidate cycle-complete envelope fits the ledger blob cap",
+  );
+});
+
+test("candidate inventory rejects 513 open PRs before its completion write", async () => {
+  const fixture = githubGitFixture();
+  const capability = scheduleCapabilityReceipt();
+  const verifier = provenanceVerifier({
+    eventName: "schedule",
+    ref: "refs/heads/main",
+    shaValue: BASE,
+  });
+  const ledger = makeLedger(fixture, capability, verifier);
+  await ledger.bootstrapCapability();
+  const transportFixture = candidateTransportFixture(513);
+  const transport = createV2GitHubCandidateInventory({
+    fetch: transportFixture.fetch,
+    token: SYNTHETIC_BEARER,
+    repository: candidateRepository(),
+    restBaseUrl: "https://github.example.test",
+  });
+  const initial = await transport.scan();
+  let loaded = await ledger.load();
+  await appendCandidateInventoryPhase({
+    ledger,
+    loaded,
+    phase: "cycle-start",
+    initial,
+  });
+  loaded = await ledger.load();
+  const shards = [];
+  for (let index = 0; index < initial.shards.length; index += 1) {
+    const shard = await transport.readShard({
+      inventory: initial,
+      shard_index: index,
+    });
+    shards.push(shard);
+    await appendCandidateInventoryPhase({
+      ledger,
+      loaded,
+      phase: "shard",
+      initial,
+      shard,
+    });
+    loaded = await ledger.load();
+  }
+  const finalInventory = await transport.scan({ prior_inventory: initial });
+  const finalShards = await readCandidateShardRound(transport, finalInventory);
+  const cycleReceipt = finalizeV2CandidateInventoryCycle({
+    initial_inventory: initial,
+    shard_receipts: shards,
+    final_inventory: finalInventory,
+    final_shard_receipts: finalShards,
+  });
+  const writesBefore = fixture.writeCalls;
+  const objectsBefore = {
+    blobs: fixture.blobs.size,
+    trees: fixture.trees.size,
+    commits: fixture.commits.size,
+  };
+  const tipBefore = fixture.refTarget;
+  await assert.rejects(
+    appendCandidateInventoryPhase({
+      ledger,
+      loaded,
+      phase: "cycle-complete",
+      initial,
+      finalInventory,
+      cycleReceipt,
+    }),
+    (error) => error.code === "candidate-inventory-dispatch-cycle-size",
+  );
+  assert.equal(fixture.writeCalls, writesBefore);
+  assert.deepEqual({
+    blobs: fixture.blobs.size,
+    trees: fixture.trees.size,
+    commits: fixture.commits.size,
+  }, objectsBefore);
+  assert.equal(fixture.refTarget, tipBefore);
 });
 
 test("candidate inventory fails closed on missing shards, wrong trigger, and shrink", async () => {
@@ -3457,10 +5336,12 @@ test("candidate inventory fails closed on missing shards, wrong trigger, and shr
   loaded = await ledger.load();
   const shard = await transport.readShard({ inventory: initial, shard_index: 0 });
   const finalInventory = await transport.scan({ prior_inventory: initial });
+  const finalShards = await readCandidateShardRound(transport, finalInventory);
   const cycleReceipt = finalizeV2CandidateInventoryCycle({
     initial_inventory: initial,
     shard_receipts: [shard],
     final_inventory: finalInventory,
+    final_shard_receipts: finalShards,
   });
   const writesBeforeMissingShard = fixture.writeCalls;
   await assert.rejects(
@@ -3765,13 +5646,13 @@ test("candidate dispatch proves the complete scheduled record budget before rese
     batch_count: 5,
     reachable_record_count: before.commit_count,
   });
-  assert.equal(MAX_V2_SCHEDULED_CANDIDATE_LEDGER_RECORDS, 14);
+  assert.equal(MAX_V2_SCHEDULED_CANDIDATE_LEDGER_RECORDS, 16);
   assert.equal(budget.dispatch_commit_budget_required, 304);
   assert.equal(
     budget.candidate_execution_commit_budget_required,
-    293 * 13,
+    293 * 15,
   );
-  assert.equal(budget.total_commit_budget_required, 293 * 14 + 11);
+  assert.equal(budget.total_commit_budget_required, 293 * 16 + 11);
   assert.equal(
     budget.remaining_ledger_commit_capacity_after_dispatch,
     MAX_V2_GIT_LEDGER_COMMITS - before.commit_count -
@@ -3804,6 +5685,80 @@ test("candidate dispatch proves the complete scheduled record budget before rese
   assert.equal(after.authority_projection.candidate_dispatch.active_reservation,
     null);
 });
+
+test("candidate dispatch rejects request-binding stages that skip scheduler authority",
+  async () => {
+    const attempt = await createScheduledCandidateDispatchAttempt();
+    const loaded = await attempt.ledger.load();
+    const lease = attempt.discovery.lease_receipt;
+    const scope = attempt.discovery.effect_evaluated_scope_receipt.scope;
+    const generation = automaticGeneration(1);
+    const action = {
+      generation_id: generation.generation_id,
+      request_id: "71",
+      reservation_record_oid: "a".repeat(40),
+      attempt_record_oid: "b".repeat(40),
+    };
+    const skippedIntent = createV2GitLedgerEffectIntentRecord({
+      predecessor_commit_sha: loaded.tip_commit_sha,
+      scope,
+      kind: "request-binding",
+      effect_id: "forged-stage-14",
+      idempotency_key: "forged-stage-14",
+      server_observed_at: loaded.post_ref.server_time,
+      generation,
+      action,
+      control_comment_binding: loaded.control_comment_binding,
+      lease_receipt: lease,
+    });
+    const skippedResponse = createV2GitLedgerRecord({
+      record_type: "effect-response",
+      predecessor_commit_sha: loaded.tip_commit_sha,
+      pull_request: scope.pull_request,
+      head_ref_oid: scope.head_ref_oid,
+      base_ref_oid: scope.base_ref_oid,
+      potential_merge_commit_oid: scope.potential_merge_commit_oid,
+      kind: "request-binding",
+      effect_id: "forged-stage-15",
+      idempotency_key: "forged-stage-15",
+      server_observed_at: loaded.post_ref.server_time,
+      payload: effectPayload({
+        phase: "response",
+        kind: "request-binding",
+        predecessor: loaded.tip_commit_sha,
+        generation,
+        intentCommitSha: "c".repeat(40),
+        action,
+        receipt: {
+          request_id: "71",
+          request_node_id: "IC_71",
+          request_url:
+            "https://github.com/owner/repo/pull/7#issuecomment-71",
+          body_sha256: rawDigest("@codex review"),
+          created_at: loaded.post_ref.server_time,
+          updated_at: loaded.post_ref.server_time,
+          raw_body_sha256: `sha256:${"d".repeat(64)}`,
+          actor: ACTOR,
+          controlled: true,
+        },
+      }),
+      control_comment_binding: loaded.control_comment_binding,
+      lease: leaseBinding(lease),
+    });
+    for (const record of [skippedIntent, skippedResponse]) {
+      const writesBefore = attempt.fixture.writeCalls;
+      const tipBefore = attempt.fixture.refTarget;
+      await assert.rejects(
+        attempt.ledger.appendRecord(record, {
+          evaluated_scope_receipt:
+            attempt.discovery.effect_evaluated_scope_receipt,
+        }),
+        (error) => error.code === "candidate-dispatch-attempt-order",
+      );
+      assert.equal(attempt.fixture.writeCalls, writesBefore);
+      assert.equal(attempt.fixture.refTarget, tipBefore);
+    }
+  });
 
 test("candidate dispatch binds one released scheduled terminal result before ack", async () => {
   const fixture = githubGitFixture();
@@ -4107,6 +6062,916 @@ test("candidate dispatch binds one released scheduled terminal result before ack
   );
 });
 
+for (const recoveryKind of ["artifact-binding", "scheduler-state"]) {
+  const title = recoveryKind === "artifact-binding"
+    ? "candidate dispatch closes two status writes with aggregate artifact binding before ack"
+    : "candidate dispatch reuses one bound two-status transaction before scheduler recovery ack";
+  test(title,
+    async () => {
+      const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+        bindArtifactBeforeDispatch: recoveryKind === "scheduler-state",
+      });
+      const { recovery } = attempt;
+      let recoveryIntent = null;
+      let recoveryResponse = null;
+      if (recoveryKind === "artifact-binding") {
+        assert.equal(recovery.runnerResult.status_plan.writes.length, 2);
+        assert.equal(recovery.statusIntents.length, 2);
+        assert.equal(recovery.statusResponses.length, 2);
+        recoveryIntent = await attempt.ledger
+          .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: recovery.schedulerAppend,
+            artifact_binding_candidate_handle:
+              recovery.artifactBindingCandidateHandle,
+          });
+        const providerArtifactHandles =
+          await loadAutomaticRecoveryProviderArtifactHandles({
+            ledger: attempt.ledger,
+            fixture: attempt.fixture,
+            transport: recoveryIntent.transport,
+            snapshots: recovery.snapshots,
+          });
+        recoveryResponse = await attempt.ledger
+          .appendAutomaticRecoveryArtifactBindingResponse({
+            artifact_binding_intent_handle:
+              recoveryIntent.artifact_binding_intent_handle,
+            intent_append_receipt: recoveryIntent.intent_append_receipt,
+            provider_artifact_handles: providerArtifactHandles,
+          });
+        assert.equal(
+          recoveryResponse.bindings.length,
+          recoveryIntent.transport.expected_count,
+        );
+      } else {
+        assert.equal(attempt.priorObservation.statusIntents.length, 2);
+        assert.equal(attempt.priorObservation.statusResponses.length, 2);
+        assert.equal(recovery.runnerResult.status_plan.writes.length, 2);
+        assert.deepEqual(recovery.statusIntents, []);
+        assert.deepEqual(recovery.statusResponses, []);
+        const statusIntentsBefore = (await attempt.ledger.load()).records
+          .filter((entry) => entry.envelope.record_type === "effect-intent" &&
+            entry.envelope.kind === "status-write").length;
+        const transition = await attempt.ledger
+          .appendAutomaticRequestRecoveryTransition({
+            scheduler_append: recovery.schedulerAppend,
+            recovery_handle: recovery.recoveryHandle,
+          });
+        assert.equal(transition.prior_generation_id, "automatic:1");
+        assert.equal(transition.next_generation_id, "automatic:2");
+        assert.equal((await attempt.ledger.load()).records.filter((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "status-write").length, statusIntentsBefore);
+      }
+      const releaseReceipt = await releaseFixtureDiscoveryLease(
+        attempt.ledger,
+        attempt.discovery,
+      );
+      const controlPlaneReceipt =
+        createV2ControlPlaneReceiptFromGitLedgerAuthority(
+          recovery.controlPlaneAuthority,
+        );
+      const terminalResult = candidateDispatchTerminalResult({
+        decision: recovery.runnerResult.scheduler_evaluation.decision,
+        schedulerAppend: recovery.schedulerAppend,
+        leaseReleaseReceipt: releaseReceipt,
+        preflight: attempt.preflight,
+        continuityAuthority: attempt.discovery.continuity_authority,
+        controlPlaneReceipt,
+        initialAuthority: null,
+        establishedAuthority: recovery.establishedAuthority,
+        runnerAuthority: recovery.productionAuthority,
+        statusIntents: recovery.statusIntents,
+        statusResponses: recovery.statusResponses,
+        statusAlreadyBound: recoveryKind === "scheduler-state",
+      });
+      const resultAuthority = await attempt.ledger
+        .createCandidateDispatchResultAuthority({
+          candidate_dispatch_handle:
+            attempt.scheduled.candidate_dispatch_handle,
+          scheduler_append: recovery.schedulerAppend,
+          production_runner_authority: recovery.productionAuthority,
+          lease_release_receipt: releaseReceipt,
+          terminal_result: terminalResult,
+        });
+      assert.equal(
+        resultAuthority.result.public_effects_performed,
+        recoveryKind === "artifact-binding" ? 2 : 0,
+      );
+      const ack = await attempt.ledger.ackCandidateDispatch({
+        candidate_dispatch_handle:
+          attempt.scheduled.candidate_dispatch_handle,
+        reservation_receipt: attempt.scheduled.reservation_receipt,
+        full_scope_receipt:
+          attempt.discovery.effect_evaluated_scope_receipt,
+        candidate_dispatch_result_handle:
+          resultAuthority.candidate_dispatch_result_handle,
+      });
+      assert.equal(ack.result_digest, resultAuthority.result.result_digest);
+      assert.notEqual(ack.ack_append_receipt, null);
+      assert.equal((await attempt.ledger.load()).active_lease, null);
+  });
+}
+
+for (const [priorPhase, expectedCurrentStages] of [
+  [null, ["artifact-binding:intent", "artifact-binding-ready:intent",
+    "artifact-binding-ready:response", "artifact-binding:response"]],
+  ["intent", ["artifact-binding-ready:intent",
+    "artifact-binding-ready:response", "artifact-binding:response"]],
+  ["ready-intent", ["artifact-binding-ready:response",
+    "artifact-binding:response"]],
+  ["ready-confirmation", ["artifact-binding:response"]],
+]) {
+  test(`candidate dispatch closes the ${priorPhase ?? "empty"} ordinary aggregate prefix under the current scheduled lease`,
+    async () => {
+    const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+      bindArtifactBeforeDispatch: false,
+      durableArtifactPrefixPhaseBeforeDispatch: priorPhase,
+    });
+    const recoveryIntent = await attempt.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: attempt.recovery.schedulerAppend,
+        artifact_binding_candidate_handle:
+          attempt.recovery.artifactBindingCandidateHandle,
+      });
+    if (priorPhase !== null) {
+      assert.equal(
+        recoveryIntent.intent_append_receipt.commit_sha,
+        attempt.priorArtifactBindingIntentRecordOid,
+      );
+    }
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: attempt.ledger,
+        fixture: attempt.fixture,
+        transport: recoveryIntent.transport,
+        snapshots: attempt.recovery.snapshots,
+      });
+    const recoveryResponse = await attempt.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          recoveryIntent.artifact_binding_intent_handle,
+        intent_append_receipt: recoveryIntent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    assert.equal(recoveryResponse.bindings.length,
+      recoveryIntent.transport.expected_count);
+    const beforeRelease = await attempt.ledger.load();
+    const observationIndex = beforeRelease.records.findIndex((entry) =>
+      entry.commit_sha === attempt.recovery.schedulerAppend.append_receipt
+        .commit_sha);
+    assert.notEqual(observationIndex, -1);
+    assert.deepEqual(
+      beforeRelease.records.slice(observationIndex + 1)
+        .filter((entry) => new Set([
+          "artifact-binding", "artifact-binding-ready",
+        ]).has(entry.envelope.kind))
+        .map((entry) =>
+          `${entry.envelope.kind}:${entry.envelope.record_type === "effect-intent" ? "intent" : "response"}`),
+      expectedCurrentStages,
+    );
+    const releaseReceipt = await releaseFixtureDiscoveryLease(
+      attempt.ledger,
+      attempt.discovery,
+    );
+    const terminalResult = candidateDispatchTerminalResult({
+      decision: attempt.recovery.runnerResult.scheduler_evaluation.decision,
+      schedulerAppend: attempt.recovery.schedulerAppend,
+      leaseReleaseReceipt: releaseReceipt,
+      preflight: attempt.preflight,
+      continuityAuthority: attempt.discovery.continuity_authority,
+      controlPlaneReceipt:
+        createV2ControlPlaneReceiptFromGitLedgerAuthority(
+          attempt.recovery.controlPlaneAuthority,
+        ),
+      initialAuthority: null,
+      establishedAuthority: attempt.recovery.establishedAuthority,
+      runnerAuthority: attempt.recovery.productionAuthority,
+      statusIntents: attempt.recovery.statusIntents,
+      statusResponses: attempt.recovery.statusResponses,
+      statusAlreadyBound: true,
+    });
+    const resultAuthority = await attempt.ledger
+      .createCandidateDispatchResultAuthority({
+        candidate_dispatch_handle:
+          attempt.scheduled.candidate_dispatch_handle,
+        scheduler_append: attempt.recovery.schedulerAppend,
+        production_runner_authority: attempt.recovery.productionAuthority,
+        lease_release_receipt: releaseReceipt,
+        terminal_result: terminalResult,
+      });
+    const ack = await attempt.ledger.ackCandidateDispatch({
+      candidate_dispatch_handle:
+        attempt.scheduled.candidate_dispatch_handle,
+      reservation_receipt: attempt.scheduled.reservation_receipt,
+      full_scope_receipt: attempt.discovery.effect_evaluated_scope_receipt,
+      candidate_dispatch_result_handle:
+        resultAuthority.candidate_dispatch_result_handle,
+    });
+    assert.notEqual(ack.ack_append_receipt, null);
+    const final = await attempt.ledger.load();
+    assert.equal(final.active_lease, null);
+    if (priorPhase !== null) {
+      const writesBeforeProjection = attempt.fixture.writeCalls;
+      const withoutPriorLeaseRelease = final.records.filter((entry) =>
+        entry.commit_sha !==
+          attempt.priorLeaseReleaseReceipt.commit_sha);
+      assert.throws(
+        () => deriveV2GitLedgerCandidateDispatchAuthority(
+          withoutPriorLeaseRelease,
+          REPOSITORY,
+        ),
+        /closed production chain/u,
+      );
+      assert.equal(attempt.fixture.writeCalls, writesBeforeProjection);
+    }
+    });
+}
+
+test("candidate dispatch closes a frozen artifact prefix and one durable queued suffix before ack",
+  async () => {
+    const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+      bindArtifactBeforeDispatch: false,
+      durableArtifactPrefixPhaseBeforeDispatch: "ready-confirmation",
+      additionalFindingIdsDuringDispatch: ["203"],
+    });
+    const first = await attempt.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: attempt.recovery.schedulerAppend,
+        artifact_binding_candidate_handle:
+          attempt.recovery.artifactBindingCandidateHandle,
+      });
+    assert.deepEqual(
+      first.transport.requests.map((request) => request.selector.id),
+      ["202"],
+    );
+    assert.notEqual(
+      first.latest_append_receipt.commit_sha,
+      first.ready_confirmation_append_receipt.commit_sha,
+    );
+    const firstHandles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: attempt.ledger,
+      fixture: attempt.fixture,
+      transport: first.transport,
+      snapshots: attempt.recovery.snapshots,
+    });
+    await attempt.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+      artifact_binding_intent_handle:
+        first.artifact_binding_intent_handle,
+      intent_append_receipt: first.intent_append_receipt,
+      provider_artifact_handles: firstHandles,
+    });
+    const second = await attempt.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: attempt.recovery.schedulerAppend,
+        artifact_binding_candidate_handle:
+          attempt.recovery.artifactBindingCandidateHandle,
+      });
+    assert.deepEqual(
+      second.transport.requests.map((request) => request.selector.id),
+      ["203"],
+    );
+    assert.equal(
+      second.latest_append_receipt.commit_sha,
+      second.ready_confirmation_append_receipt.commit_sha,
+    );
+    const secondHandles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: attempt.ledger,
+      fixture: attempt.fixture,
+      transport: second.transport,
+      snapshots: attempt.recovery.snapshots,
+    });
+    await attempt.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+      artifact_binding_intent_handle:
+        second.artifact_binding_intent_handle,
+      intent_append_receipt: second.intent_append_receipt,
+      provider_artifact_handles: secondHandles,
+    });
+    const beforeRelease = await attempt.ledger.load();
+    const observationIndex = beforeRelease.records.findIndex((entry) =>
+      entry.commit_sha ===
+        attempt.recovery.schedulerAppend.append_receipt.commit_sha);
+    assert.deepEqual(
+      beforeRelease.records.slice(observationIndex + 1)
+        .filter((entry) => new Set([
+          "artifact-binding", "artifact-binding-ready",
+        ]).has(entry.envelope.kind))
+        .map((entry) =>
+          `${entry.envelope.kind}:${entry.envelope.record_type === "effect-intent" ? "intent" : "response"}`),
+      [
+        "artifact-binding:intent",
+        "artifact-binding:response",
+        "artifact-binding-ready:intent",
+        "artifact-binding-ready:response",
+        "artifact-binding:response",
+      ],
+    );
+    const releaseReceipt = await releaseFixtureDiscoveryLease(
+      attempt.ledger,
+      attempt.discovery,
+    );
+    const terminalResult = candidateDispatchTerminalResult({
+      decision: attempt.recovery.runnerResult.scheduler_evaluation.decision,
+      schedulerAppend: attempt.recovery.schedulerAppend,
+      leaseReleaseReceipt: releaseReceipt,
+      preflight: attempt.preflight,
+      continuityAuthority: attempt.discovery.continuity_authority,
+      controlPlaneReceipt:
+        createV2ControlPlaneReceiptFromGitLedgerAuthority(
+          attempt.recovery.controlPlaneAuthority,
+        ),
+      initialAuthority: null,
+      establishedAuthority: attempt.recovery.establishedAuthority,
+      runnerAuthority: attempt.recovery.productionAuthority,
+      statusIntents: attempt.recovery.statusIntents,
+      statusResponses: attempt.recovery.statusResponses,
+      statusAlreadyBound: true,
+    });
+    const resultAuthority = await attempt.ledger
+      .createCandidateDispatchResultAuthority({
+        candidate_dispatch_handle:
+          attempt.scheduled.candidate_dispatch_handle,
+        scheduler_append: attempt.recovery.schedulerAppend,
+        production_runner_authority: attempt.recovery.productionAuthority,
+        lease_release_receipt: releaseReceipt,
+        terminal_result: terminalResult,
+      });
+    const ack = await attempt.ledger.ackCandidateDispatch({
+      candidate_dispatch_handle:
+        attempt.scheduled.candidate_dispatch_handle,
+      reservation_receipt: attempt.scheduled.reservation_receipt,
+      full_scope_receipt: attempt.discovery.effect_evaluated_scope_receipt,
+      candidate_dispatch_result_handle:
+        resultAuthority.candidate_dispatch_result_handle,
+    });
+    assert.notEqual(ack.ack_append_receipt, null);
+    assert.equal((await attempt.ledger.load()).active_lease, null);
+  });
+
+test("candidate dispatch closes a queued-only artifact suffix after its completed durable parent",
+  async () => {
+    const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+      bindArtifactBeforeDispatch: true,
+      additionalFindingIdsDuringDispatch: ["203"],
+    });
+    assert.notEqual(attempt.priorArtifactBinding, null);
+    assert.equal(attempt.recovery.recoveryHandle, null);
+    const queued = await attempt.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: attempt.recovery.schedulerAppend,
+        artifact_binding_candidate_handle:
+          attempt.recovery.artifactBindingCandidateHandle,
+      });
+    assert.deepEqual(
+      queued.transport.requests.map((request) => request.selector.id),
+      ["203"],
+    );
+    const loaded = await attempt.ledger.load();
+    const queuedIntent = loaded.records.find((entry) =>
+      entry.commit_sha === queued.intent_append_receipt.commit_sha);
+    assert.notEqual(queuedIntent, undefined);
+    assert.equal(
+      queuedIntent.envelope.payload.action
+        .queued_after_artifact_binding_intent_record_oid,
+      attempt.priorArtifactBindingIntentRecordOid,
+    );
+    const handles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: attempt.ledger,
+      fixture: attempt.fixture,
+      transport: queued.transport,
+      snapshots: attempt.recovery.snapshots,
+    });
+    await attempt.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+      artifact_binding_intent_handle:
+        queued.artifact_binding_intent_handle,
+      intent_append_receipt: queued.intent_append_receipt,
+      provider_artifact_handles: handles,
+    });
+    const beforeRelease = await attempt.ledger.load();
+    const observationIndex = beforeRelease.records.findIndex((entry) =>
+      entry.commit_sha ===
+        attempt.recovery.schedulerAppend.append_receipt.commit_sha);
+    assert.deepEqual(
+      beforeRelease.records.slice(observationIndex + 1)
+        .filter((entry) => new Set([
+          "artifact-binding", "artifact-binding-ready",
+        ]).has(entry.envelope.kind))
+        .map((entry) =>
+          `${entry.envelope.kind}:${entry.envelope.record_type === "effect-intent" ? "intent" : "response"}`),
+      [
+        "artifact-binding:intent",
+        "artifact-binding-ready:intent",
+        "artifact-binding-ready:response",
+        "artifact-binding:response",
+      ],
+    );
+    const releaseReceipt = await releaseFixtureDiscoveryLease(
+      attempt.ledger,
+      attempt.discovery,
+    );
+    const terminalResult = candidateDispatchTerminalResult({
+      decision: attempt.recovery.runnerResult.scheduler_evaluation.decision,
+      schedulerAppend: attempt.recovery.schedulerAppend,
+      leaseReleaseReceipt: releaseReceipt,
+      preflight: attempt.preflight,
+      continuityAuthority: attempt.discovery.continuity_authority,
+      controlPlaneReceipt:
+        createV2ControlPlaneReceiptFromGitLedgerAuthority(
+          attempt.recovery.controlPlaneAuthority,
+        ),
+      initialAuthority: null,
+      establishedAuthority: attempt.recovery.establishedAuthority,
+      runnerAuthority: attempt.recovery.productionAuthority,
+      statusIntents: attempt.recovery.statusIntents,
+      statusResponses: attempt.recovery.statusResponses,
+      statusAlreadyBound: true,
+    });
+    const resultAuthority = await attempt.ledger
+      .createCandidateDispatchResultAuthority({
+        candidate_dispatch_handle:
+          attempt.scheduled.candidate_dispatch_handle,
+        scheduler_append: attempt.recovery.schedulerAppend,
+        production_runner_authority: attempt.recovery.productionAuthority,
+        lease_release_receipt: releaseReceipt,
+        terminal_result: terminalResult,
+      });
+    const ack = await attempt.ledger.ackCandidateDispatch({
+      candidate_dispatch_handle:
+        attempt.scheduled.candidate_dispatch_handle,
+      reservation_receipt: attempt.scheduled.reservation_receipt,
+      full_scope_receipt: attempt.discovery.effect_evaluated_scope_receipt,
+      candidate_dispatch_result_handle:
+        resultAuthority.candidate_dispatch_result_handle,
+    });
+    assert.notEqual(ack.ack_append_receipt, null);
+    assert.equal((await attempt.ledger.load()).active_lease, null);
+  });
+
+test("candidate dispatch terminal rejects a completed prefix with its durable queued suffix incomplete",
+  async () => {
+    const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+      bindArtifactBeforeDispatch: false,
+      durableArtifactPrefixPhaseBeforeDispatch: "ready-confirmation",
+      additionalFindingIdsBeforeDispatch: ["203"],
+      additionalFindingIdsDuringDispatch: ["203"],
+    });
+    const first = await attempt.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: attempt.recovery.schedulerAppend,
+        artifact_binding_candidate_handle:
+          attempt.recovery.artifactBindingCandidateHandle,
+      });
+    const firstHandles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: attempt.ledger,
+      fixture: attempt.fixture,
+      transport: first.transport,
+      snapshots: attempt.recovery.snapshots,
+    });
+    await attempt.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+      artifact_binding_intent_handle:
+        first.artifact_binding_intent_handle,
+      intent_append_receipt: first.intent_append_receipt,
+      provider_artifact_handles: firstHandles,
+    });
+    const incomplete = await attempt.ledger.load();
+    assert.equal(incomplete.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding" &&
+      entry.envelope.payload.action
+        .queued_after_artifact_binding_intent_record_oid !== null).length, 1);
+    assert.equal(incomplete.records.filter((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "artifact-binding").length, 1);
+    const releaseReceipt = await releaseFixtureDiscoveryLease(
+      attempt.ledger,
+      attempt.discovery,
+    );
+    const terminalResult = candidateDispatchTerminalResult({
+      decision: attempt.recovery.runnerResult.scheduler_evaluation.decision,
+      schedulerAppend: attempt.recovery.schedulerAppend,
+      leaseReleaseReceipt: releaseReceipt,
+      preflight: attempt.preflight,
+      continuityAuthority: attempt.discovery.continuity_authority,
+      controlPlaneReceipt:
+        createV2ControlPlaneReceiptFromGitLedgerAuthority(
+          attempt.recovery.controlPlaneAuthority,
+        ),
+      initialAuthority: null,
+      establishedAuthority: attempt.recovery.establishedAuthority,
+      runnerAuthority: attempt.recovery.productionAuthority,
+      statusIntents: attempt.recovery.statusIntents,
+      statusResponses: attempt.recovery.statusResponses,
+      statusAlreadyBound: true,
+    });
+    const writesBefore = attempt.fixture.writeCalls;
+    const tipBefore = attempt.fixture.refTarget;
+    await assert.rejects(
+      attempt.ledger.createCandidateDispatchResultAuthority({
+        candidate_dispatch_handle:
+          attempt.scheduled.candidate_dispatch_handle,
+        scheduler_append: attempt.recovery.schedulerAppend,
+        production_runner_authority: attempt.recovery.productionAuthority,
+        lease_release_receipt: releaseReceipt,
+        terminal_result: terminalResult,
+      }),
+      /closed production chain/u,
+    );
+    assert.equal(attempt.fixture.writeCalls, writesBefore);
+    assert.equal(attempt.fixture.refTarget, tipBefore);
+  });
+
+test("candidate dispatch terminal rejects an omitted durable aggregate queue",
+  async () => {
+    const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+      bindArtifactBeforeDispatch: false,
+      durableArtifactPrefixPhaseBeforeDispatch: "ready-confirmation",
+      additionalFindingIdsBeforeDispatch: ["203"],
+      additionalFindingIdsDuringDispatch: ["203"],
+    });
+    assert.notEqual(
+      attempt.recovery.artifactBindingCandidateHandle,
+      null,
+    );
+    const incomplete = await attempt.ledger.load();
+    assert.equal(incomplete.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding").length, 2);
+    assert.equal(incomplete.records.filter((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "artifact-binding").length, 0);
+    const releaseReceipt = await releaseFixtureDiscoveryLease(
+      attempt.ledger,
+      attempt.discovery,
+    );
+    const terminalResult = candidateDispatchTerminalResult({
+      decision: attempt.recovery.runnerResult.scheduler_evaluation.decision,
+      schedulerAppend: attempt.recovery.schedulerAppend,
+      leaseReleaseReceipt: releaseReceipt,
+      preflight: attempt.preflight,
+      continuityAuthority: attempt.discovery.continuity_authority,
+      controlPlaneReceipt:
+        createV2ControlPlaneReceiptFromGitLedgerAuthority(
+          attempt.recovery.controlPlaneAuthority,
+        ),
+      initialAuthority: null,
+      establishedAuthority: attempt.recovery.establishedAuthority,
+      runnerAuthority: attempt.recovery.productionAuthority,
+      statusIntents: attempt.recovery.statusIntents,
+      statusResponses: attempt.recovery.statusResponses,
+      statusAlreadyBound: true,
+    });
+    const writesBefore = attempt.fixture.writeCalls;
+    const tipBefore = attempt.fixture.refTarget;
+    await assert.rejects(
+      attempt.ledger.createCandidateDispatchResultAuthority({
+        candidate_dispatch_handle:
+          attempt.scheduled.candidate_dispatch_handle,
+        scheduler_append: attempt.recovery.schedulerAppend,
+        production_runner_authority: attempt.recovery.productionAuthority,
+        lease_release_receipt: releaseReceipt,
+        terminal_result: terminalResult,
+      }),
+      /closed production chain/u,
+    );
+    assert.equal(attempt.fixture.writeCalls, writesBefore);
+    assert.equal(attempt.fixture.refTarget, tipBefore);
+  });
+
+test("aggregate stage9 rejects an unreleased stage8 continuation lease before write",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    setup.fixture.failRereadAfterEffectUpdate("artifact-binding", 1);
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+    await releaseFixtureDiscoveryLease(
+      setup.ledger,
+      setup.context.discovery,
+    );
+    setup.fixture.advanceServerTime(120);
+    setup.runIdentity.run_id = "9201";
+    const second = await acquireEstablishedRunnerContext({
+      ledger: setup.ledger,
+      runIdentity: setup.runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 10_000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+    });
+    const secondObservation = await appendAutomaticRecoveryObservation({
+      ledger: setup.ledger,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: second.evaluatedScopeReceipt,
+      workflowCommandHandle: second.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      expectRecoveryHandle: false,
+    });
+    await setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+      scheduler_append: secondObservation.schedulerAppend,
+      artifact_binding_candidate_handle:
+        secondObservation.artifactBindingCandidateHandle,
+    });
+    setup.fixture.advanceServerTime(1000);
+    setup.runIdentity.run_id = "9202";
+    const third = await acquireEstablishedRunnerContext({
+      ledger: setup.ledger,
+      runIdentity: setup.runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 12_000,
+      minimalServerTime: "2026-08-13T16:00:00.000Z",
+    });
+    const thirdObservation = await appendAutomaticRecoveryObservation({
+      ledger: setup.ledger,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: third.evaluatedScopeReceipt,
+      workflowCommandHandle: third.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      expectRecoveryHandle: false,
+    });
+    const intent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: thirdObservation.schedulerAppend,
+        artifact_binding_candidate_handle:
+          thirdObservation.artifactBindingCandidateHandle,
+      });
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: intent.transport,
+        snapshots: thirdObservation.snapshots,
+      });
+    const before = await setup.ledger.load();
+    const writesBefore = setup.fixture.writeCalls;
+    await assert.rejects(
+      setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      }),
+      (error) => error.code ===
+        "automatic-artifact-binding-reachability-lineage",
+    );
+    const after = await setup.ledger.load();
+    assert.equal(setup.fixture.writeCalls, writesBefore);
+    assert.equal(after.tip_commit_sha, before.tip_commit_sha);
+    assert.equal(after.records.filter((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "artifact-binding").length, 0);
+  });
+
+test("candidate dispatch rejects incomplete internal recovery pairs as terminal",
+  async (t) => {
+    for (const recovery of [
+      { label: "artifact-intent", kind: "artifact-binding", occurrence: 1 },
+      {
+        label: "artifact-ready-intent",
+        kind: "artifact-binding-ready",
+        occurrence: 1,
+      },
+      {
+        label: "artifact-ready-confirmation",
+        kind: "artifact-binding-ready",
+        occurrence: 2,
+      },
+      { label: "scheduler-state-intent", kind: "scheduler-state", occurrence: 1 },
+    ]) {
+      await t.test(recovery.label, async () => {
+        const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+          bindArtifactBeforeDispatch: recovery.kind === "scheduler-state",
+        });
+        attempt.fixture.failRereadAfterEffectUpdate(
+          recovery.kind,
+          recovery.occurrence,
+        );
+        if (recovery.kind.startsWith("artifact-binding")) {
+          await assert.rejects(
+            attempt.ledger
+              .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+                scheduler_append: attempt.recovery.schedulerAppend,
+                artifact_binding_candidate_handle:
+                  attempt.recovery.artifactBindingCandidateHandle,
+              }),
+            (error) => error.code === "unexpected-http-status",
+          );
+        } else {
+          await assert.rejects(
+            attempt.ledger.appendAutomaticRequestRecoveryTransition({
+              scheduler_append: attempt.recovery.schedulerAppend,
+              recovery_handle: attempt.recovery.recoveryHandle,
+            }),
+            (error) => error.code === "unexpected-http-status",
+          );
+        }
+        const releaseReceipt = await releaseFixtureDiscoveryLease(
+          attempt.ledger,
+          attempt.discovery,
+        );
+        const terminalResult = candidateDispatchTerminalResult({
+          decision:
+            attempt.recovery.runnerResult.scheduler_evaluation.decision,
+          schedulerAppend: attempt.recovery.schedulerAppend,
+          leaseReleaseReceipt: releaseReceipt,
+          preflight: attempt.preflight,
+          continuityAuthority: attempt.discovery.continuity_authority,
+          controlPlaneReceipt:
+            createV2ControlPlaneReceiptFromGitLedgerAuthority(
+              attempt.recovery.controlPlaneAuthority,
+            ),
+          initialAuthority: null,
+          establishedAuthority: attempt.recovery.establishedAuthority,
+          runnerAuthority: attempt.recovery.productionAuthority,
+          statusIntents: attempt.recovery.statusIntents,
+          statusResponses: attempt.recovery.statusResponses,
+          statusAlreadyBound: recovery.kind === "scheduler-state",
+        });
+        const before = await attempt.ledger.load();
+        const writesBefore = attempt.fixture.writeCalls;
+        await assert.rejects(
+          attempt.ledger.createCandidateDispatchResultAuthority({
+            candidate_dispatch_handle:
+              attempt.scheduled.candidate_dispatch_handle,
+            scheduler_append: attempt.recovery.schedulerAppend,
+            production_runner_authority:
+              attempt.recovery.productionAuthority,
+            lease_release_receipt: releaseReceipt,
+            terminal_result: terminalResult,
+          }),
+          /closed production chain/u,
+        );
+        const after = await attempt.ledger.load();
+        assert.equal(attempt.fixture.writeCalls, writesBefore);
+        assert.equal(after.tip_commit_sha, before.tip_commit_sha);
+        assert.equal(after.records.filter((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          entry.envelope.payload.phase === "candidate-ack").length, 0);
+      });
+    }
+  });
+
+for (const durableArtifactPhase of [
+  "intent", "ready-intent", "ready-confirmation", "response",
+]) {
+  test(`candidate dispatch recovers a durable aggregate artifact ${durableArtifactPhase} without a second attempt`,
+    async () => {
+      const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+        bindArtifactBeforeDispatch: false,
+      });
+      const partialFailure = durableArtifactPhase === "intent"
+        ? { kind: "artifact-binding", occurrence: 1 }
+        : durableArtifactPhase === "ready-intent"
+          ? { kind: "artifact-binding-ready", occurrence: 1 }
+          : durableArtifactPhase === "ready-confirmation"
+            ? { kind: "artifact-binding-ready", occurrence: 2 }
+            : null;
+      if (partialFailure !== null) {
+        attempt.fixture.failRereadAfterEffectUpdate(
+          partialFailure.kind,
+          partialFailure.occurrence,
+        );
+      }
+      let bindingIntent = null;
+      const appendBindingIntent = attempt.ledger
+        .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+          scheduler_append: attempt.recovery.schedulerAppend,
+          artifact_binding_candidate_handle:
+            attempt.recovery.artifactBindingCandidateHandle,
+        });
+      if (partialFailure !== null) {
+        await assert.rejects(
+          appendBindingIntent,
+          (error) => error.code === "unexpected-http-status",
+        );
+      } else {
+        bindingIntent = await appendBindingIntent;
+      }
+      if (durableArtifactPhase === "response") {
+        const providerArtifactHandles =
+          await loadAutomaticRecoveryProviderArtifactHandles({
+            ledger: attempt.ledger,
+            fixture: attempt.fixture,
+            transport: bindingIntent.transport,
+            snapshots: attempt.recovery.snapshots,
+          });
+        await attempt.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+          artifact_binding_intent_handle:
+            bindingIntent.artifact_binding_intent_handle,
+          intent_append_receipt: bindingIntent.intent_append_receipt,
+          provider_artifact_handles: providerArtifactHandles,
+        });
+      }
+      await releaseFixtureDiscoveryLease(attempt.ledger, attempt.discovery);
+      const before = await attempt.ledger.load();
+      const artifactIntentsBefore = before.records.filter((entry) =>
+        entry.envelope.record_type === "effect-intent" &&
+        entry.envelope.kind === "artifact-binding").length;
+      const artifactResponsesBefore = before.records.filter((entry) =>
+        entry.envelope.record_type === "effect-response" &&
+        entry.envelope.kind === "artifact-binding").length;
+      const artifactReadyBefore = before.records.filter((entry) =>
+        entry.envelope.record_type === "effect-intent" &&
+        entry.envelope.kind === "artifact-binding-ready").length;
+      const artifactReadyConfirmationsBefore = before.records.filter((entry) =>
+        entry.envelope.record_type === "effect-response" &&
+        entry.envelope.kind === "artifact-binding-ready").length;
+      const recovered = await attempt.ledger.recoverCandidateDispatchFailure({
+        workflow_command_handle: attempt.scheduledCommand,
+        trigger_identity: attempt.triggerIdentity,
+        repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+        expected_dispatch_binding: attempt.reserved.plan.items[0],
+      });
+      assert.equal(
+        recovered.prefix_phase,
+        durableArtifactPhase === "intent"
+          ? "automatic-recovery-intent"
+          : durableArtifactPhase === "ready-intent"
+            ? "automatic-recovery-ready"
+            : durableArtifactPhase === "ready-confirmation"
+              ? "automatic-recovery-ready-confirmed"
+              : "automatic-recovery-response",
+      );
+      assert.equal(
+        recovered.result.failure_code,
+        durableArtifactPhase !== "response"
+          ? "CANDIDATE_ATTEMPT_RECOVERED_DURING_AUTOMATIC_RECOVERY"
+          : "CANDIDATE_ATTEMPT_RECOVERED_AFTER_AUTOMATIC_RECOVERY",
+      );
+      assert.equal(recovered.result.public_effects_performed, 2);
+      assert.equal(recovered.cycle_complete, true);
+      const final = await attempt.ledger.load();
+      assert.equal(final.records.filter((entry) =>
+        entry.envelope.record_type === "lease-acquire" &&
+        entry.envelope.workflow_provenance.operation_binding
+          .evaluated_scope_receipt.relation === "scheduled-pull-request"
+      ).length, 1);
+      assert.equal(final.records.filter((entry) =>
+        entry.envelope.record_type === "effect-intent" &&
+        entry.envelope.kind === "artifact-binding").length,
+      artifactIntentsBefore);
+      assert.equal(final.records.filter((entry) =>
+        entry.envelope.record_type === "effect-response" &&
+        entry.envelope.kind === "artifact-binding").length,
+      artifactResponsesBefore);
+      assert.equal(final.records.filter((entry) =>
+        entry.envelope.record_type === "effect-intent" &&
+        entry.envelope.kind === "artifact-binding-ready").length,
+      artifactReadyBefore);
+      assert.equal(final.records.filter((entry) =>
+        entry.envelope.record_type === "effect-response" &&
+        entry.envelope.kind === "artifact-binding-ready").length,
+      artifactReadyConfirmationsBefore);
+      assert.equal(final.records.filter((entry) =>
+        entry.envelope.record_type === "candidate-dispatch-observation" &&
+        entry.envelope.payload.phase === "candidate-ack").length, 1);
+  });
+}
+
+test("candidate dispatch recovery classifies a durable queued aggregate intent",
+  async () => {
+    const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+      bindArtifactBeforeDispatch: false,
+      durableArtifactPrefixPhaseBeforeDispatch: "ready-confirmation",
+      additionalFindingIdsDuringDispatch: ["203"],
+    });
+    const first = await attempt.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: attempt.recovery.schedulerAppend,
+        artifact_binding_candidate_handle:
+          attempt.recovery.artifactBindingCandidateHandle,
+      });
+    assert.notEqual(
+      first.latest_append_receipt.commit_sha,
+      first.ready_confirmation_append_receipt.commit_sha,
+    );
+    await releaseFixtureDiscoveryLease(attempt.ledger, attempt.discovery);
+    const recovered = await attempt.ledger.recoverCandidateDispatchFailure({
+      workflow_command_handle: attempt.scheduledCommand,
+      trigger_identity: attempt.triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+      expected_dispatch_binding: attempt.reserved.plan.items[0],
+    });
+    assert.equal(recovered.prefix_phase, "automatic-recovery-intent");
+    assert.equal(
+      recovered.result.failure_code,
+      "CANDIDATE_ATTEMPT_RECOVERED_DURING_AUTOMATIC_RECOVERY",
+    );
+    assert.deepEqual(attempt.recovery.statusIntents, []);
+    assert.equal(recovered.result.public_effects_performed, 0);
+    assert.equal(recovered.result.outcome, "failed");
+    const final = await attempt.ledger.load();
+    assert.equal(final.records.filter((entry) =>
+      entry.envelope.record_type === "candidate-dispatch-observation" &&
+      entry.envelope.payload.phase === "candidate-ack").length, 1);
+  });
+
 test("candidate dispatch recovers one released same-run scheduled attempt", async () => {
   const attempt = await createScheduledCandidateDispatchAttempt();
   const releaseReceipt = await releaseFixtureDiscoveryLease(
@@ -4307,36 +7172,36 @@ test("candidate dispatch recovery classifies every durable protocol prefix", asy
     [3, statusResponse.response_append_receipt.commit_sha,
       "status-response", "CANDIDATE_ATTEMPT_RECOVERED_AFTER_STATUS", 1,
       "bound", "not-required", "not-required"],
-    [4, automatic.reservation_append_receipt.commit_sha,
+    [8, automatic.reservation_append_receipt.commit_sha,
       "automatic-reservation",
       "CANDIDATE_ATTEMPT_RECOVERED_AFTER_RESERVATION", 1,
       "bound", "not-required", "not-required"],
-    [5, reservationIntent.intent_append_receipt.commit_sha,
+    [9, reservationIntent.intent_append_receipt.commit_sha,
       "reservation-status-intent",
       "CANDIDATE_RESERVATION_STATUS_EFFECT_AMBIGUOUS", 2,
       "bound", "ambiguous", "not-required"],
-    [6, reservationResponse.response_append_receipt.commit_sha,
+    [10, reservationResponse.response_append_receipt.commit_sha,
       "reservation-status-response",
       "CANDIDATE_ATTEMPT_RECOVERED_AFTER_RESERVATION_STATUS", 2,
       "bound", "bound", "not-required"],
-    [7, requestIntent.attempt_append_receipt.commit_sha,
+    [11, requestIntent.attempt_append_receipt.commit_sha,
       "request-attempt",
       "CANDIDATE_ATTEMPT_RECOVERED_AFTER_REQUEST_ATTEMPT", 2,
       "bound", "bound", "not-required"],
-    [8, requestIntent.intent_append_receipt.commit_sha,
+    [12, requestIntent.intent_append_receipt.commit_sha,
       "review-request-intent", "CANDIDATE_REQUEST_EFFECT_AMBIGUOUS", 3,
       "bound", "bound", "ambiguous"],
-    [9, binding.review_response_append_receipt.commit_sha,
+    [13, binding.review_response_append_receipt.commit_sha,
       "review-request-response", "CANDIDATE_REQUEST_EFFECT_AMBIGUOUS", 3,
       "bound", "bound", "ambiguous"],
-    [10, binding.request_binding_intent_append_receipt.commit_sha,
+    [14, binding.request_binding_intent_append_receipt.commit_sha,
       "request-binding-intent", "CANDIDATE_REQUEST_EFFECT_AMBIGUOUS", 3,
       "bound", "bound", "ambiguous"],
-    [11, binding.request_binding_response_append_receipt.commit_sha,
+    [15, binding.request_binding_response_append_receipt.commit_sha,
       "request-binding-response",
       "CANDIDATE_ATTEMPT_RECOVERED_AFTER_BINDING_RESPONSE", 3,
       "bound", "bound", "bound"],
-    [12, release.commit_sha, "request-binding-response",
+    [16, release.commit_sha, "request-binding-response",
       "CANDIDATE_ATTEMPT_RECOVERED_AFTER_BINDING_RESPONSE", 3,
       "bound", "bound", "bound"],
   ];
@@ -4384,7 +7249,90 @@ test("candidate dispatch recovery classifies every durable protocol prefix", asy
     );
     assert.equal(
       projection.lease_release_record_oid,
-      stage === 12 ? release.commit_sha : null,
+      stage === 16 ? release.commit_sha : null,
+      `stage ${stage}`,
+    );
+  }
+
+  // Stages 4-9 are the mutually exclusive two-status recovery branch, so
+  // they require their own real scheduled attempt rather than synthetic
+  // records spliced into the automatic-request branch above.
+  const recoveryAttempt =
+    await createScheduledAutomaticRecoveryBranchAttempt({
+      bindArtifactBeforeDispatch: false,
+    });
+  const recoveryIntent = await recoveryAttempt.ledger
+    .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+      scheduler_append: recoveryAttempt.recovery.schedulerAppend,
+      artifact_binding_candidate_handle:
+        recoveryAttempt.recovery.artifactBindingCandidateHandle,
+    });
+  const recoveryHandles = await loadAutomaticRecoveryProviderArtifactHandles({
+    ledger: recoveryAttempt.ledger,
+    fixture: recoveryAttempt.fixture,
+    transport: recoveryIntent.transport,
+    snapshots: recoveryAttempt.recovery.snapshots,
+  });
+  const recoveryResponse = await recoveryAttempt.ledger
+    .appendAutomaticRecoveryArtifactBindingResponse({
+      artifact_binding_intent_handle:
+        recoveryIntent.artifact_binding_intent_handle,
+      intent_append_receipt: recoveryIntent.intent_append_receipt,
+      provider_artifact_handles: recoveryHandles,
+    });
+  const recoveryRecords = (await recoveryAttempt.ledger.load()).records;
+  const recoveryStages = [
+    [4,
+      recoveryAttempt.recovery.statusIntents[1]
+        .intent_append_receipt.commit_sha,
+      "status-intent", "CANDIDATE_STATUS_EFFECT_AMBIGUOUS", "ambiguous"],
+    [5,
+      recoveryAttempt.recovery.statusResponses[1]
+        .response_append_receipt.commit_sha,
+      "status-response", "CANDIDATE_ATTEMPT_RECOVERED_AFTER_STATUS", "bound"],
+    [6, recoveryIntent.intent_append_receipt.commit_sha,
+      "automatic-recovery-intent",
+      "CANDIDATE_ATTEMPT_RECOVERED_DURING_AUTOMATIC_RECOVERY", "bound"],
+    [7, recoveryIntent.ready_append_receipt.commit_sha,
+      "automatic-recovery-ready",
+      "CANDIDATE_ATTEMPT_RECOVERED_DURING_AUTOMATIC_RECOVERY", "bound"],
+    [8, recoveryIntent.ready_confirmation_append_receipt.commit_sha,
+      "automatic-recovery-ready-confirmed",
+      "CANDIDATE_ATTEMPT_RECOVERED_DURING_AUTOMATIC_RECOVERY", "bound"],
+    [9, recoveryResponse.response_append_receipt.commit_sha,
+      "automatic-recovery-response",
+      "CANDIDATE_ATTEMPT_RECOVERED_AFTER_AUTOMATIC_RECOVERY", "bound"],
+  ];
+  for (const [
+    stage,
+    commitSha,
+    prefixPhase,
+    failureCode,
+    statusOutcome,
+  ] of recoveryStages) {
+    const recordIndex = recoveryRecords.findIndex((entry) =>
+      entry.commit_sha === commitSha);
+    assert.notEqual(recordIndex, -1, `stage ${stage} record is reachable`);
+    const projection = classifyV2GitLedgerCandidateDispatchRecoveryPrefix({
+      records: recoveryRecords.slice(0, recordIndex + 1),
+      scheduled_scope_receipt:
+        recoveryAttempt.discovery.effect_evaluated_scope_receipt,
+    });
+    assert.equal(projection.prefix_phase, prefixPhase, `stage ${stage}`);
+    assert.equal(projection.failure_code, failureCode, `stage ${stage}`);
+    assert.equal(
+      projection.terminal_projection.public_effects_performed,
+      2,
+      `stage ${stage}`,
+    );
+    assert.equal(
+      projection.terminal_projection.status_effect_outcome,
+      statusOutcome,
+      `stage ${stage}`,
+    );
+    assert.equal(
+      projection.terminal_projection.automatic_request_effect_outcome,
+      "not-required",
       `stage ${stage}`,
     );
   }
@@ -4460,6 +7408,93 @@ test("candidate dispatch rejects a self-sealed forged ack before write and on re
     /terminal|public effects|reachable history/u,
   );
 });
+
+test("candidate dispatch rejects a self-sealed intent-only terminal before write and on restart",
+  async () => {
+    const createIntentOnlyAttempt = async () => {
+      const attempt = await createScheduledAutomaticRecoveryBranchAttempt({
+        bindArtifactBeforeDispatch: false,
+      });
+      attempt.fixture.failRereadAfterEffectUpdate("artifact-binding", 1);
+      await assert.rejects(
+        attempt.ledger
+          .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: attempt.recovery.schedulerAppend,
+            artifact_binding_candidate_handle:
+              attempt.recovery.artifactBindingCandidateHandle,
+          }),
+        (error) => error.code === "unexpected-http-status",
+      );
+      await releaseFixtureDiscoveryLease(attempt.ledger, attempt.discovery);
+      return attempt;
+    };
+
+    const source = await createIntentOnlyAttempt();
+    source.fixture.failNextCandidateDispatchUpdate("batch-complete");
+    await assert.rejects(
+      source.ledger.recoverCandidateDispatchFailure({
+        workflow_command_handle: source.scheduledCommand,
+        trigger_identity: source.triggerIdentity,
+        repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+        expected_dispatch_binding: source.reserved.plan.items[0],
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+    const sourceLoaded = await source.ledger.load();
+    const sourceAck = sourceLoaded.records.at(-1);
+    assert.equal(sourceAck.envelope.payload.phase, "candidate-ack");
+    assert.equal(
+      sourceAck.envelope.payload.candidate_ack.terminal_authority.kind,
+      "durable-prefix-recovery",
+    );
+    const forgedPayload = forgeCandidateDispatchAckAsControllerTerminal(
+      sourceAck.envelope.payload,
+    );
+
+    const target = await createIntentOnlyAttempt();
+    const targetLoaded = await target.ledger.load();
+    assert.equal(
+      targetLoaded.tip_commit_sha,
+      sourceAck.envelope.predecessor_commit_sha,
+      "the target must expose the same deterministic intent-only history",
+    );
+    const forgedRecord = createV2GitLedgerCandidateDispatchRecord({
+      predecessor_commit_sha: targetLoaded.tip_commit_sha,
+      server_observed_at: targetLoaded.post_ref.server_time,
+      payload: forgedPayload,
+    });
+    const forgedEvaluated =
+      createV2GitLedgerCandidateDispatchEvaluatedScopeReceipt({
+        repository: REPOSITORY,
+        payload: forgedPayload,
+        trigger_identity: target.triggerIdentity,
+        repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+      });
+    const writesBefore = target.fixture.writeCalls;
+    const tipBefore = target.fixture.refTarget;
+    await assert.rejects(
+      target.ledger.appendRecord(forgedRecord, {
+        evaluated_scope_receipt: forgedEvaluated,
+      }),
+      /closed production chain/u,
+    );
+    assert.equal(target.fixture.writeCalls, writesBefore);
+    assert.equal(target.fixture.refTarget, tipBefore);
+
+    source.fixture.rewriteTipEnvelope((envelope) => {
+      resealFixtureEnvelopePayload(
+        envelope,
+        forgeCandidateDispatchAckAsControllerTerminal(envelope.payload),
+      );
+    });
+    const restarted = makeLedger(
+      source.fixture,
+      source.capability,
+      source.verifier,
+      source.preflight,
+    );
+    await assert.rejects(restarted.load(), /closed production chain/u);
+  });
 
 test("candidate dispatch restart completes a partial final batch without redispatch", async () => {
   const attempt = await createScheduledCandidateDispatchAttempt();
@@ -5378,8 +8413,19 @@ function candidateDispatchTerminalResult({
   runnerAuthority,
   statusIntent = null,
   statusResponse = null,
+  statusIntents = null,
+  statusResponses = null,
+  statusAlreadyBound = false,
 }) {
-  const statusBound = statusIntent !== null && statusResponse !== null;
+  const boundStatusIntents = statusIntents ??
+    (statusIntent === null ? [] : [statusIntent]);
+  const boundStatusResponses = statusResponses ??
+    (statusResponse === null ? [] : [statusResponse]);
+  const currentStatusBound = boundStatusIntents.length > 0 &&
+    boundStatusResponses.length === boundStatusIntents.length;
+  const statusBound = currentStatusBound || statusAlreadyBound;
+  const finalStatusIntent = boundStatusIntents.at(-1) ?? null;
+  const finalStatusResponse = boundStatusResponses.at(-1) ?? null;
   return {
     schema: "codex-review-gate-production-assembly-v2",
     schema_version: 1,
@@ -5390,17 +8436,19 @@ function candidateDispatchTerminalResult({
     status_plan: null,
     request_plan: null,
     comment_plan: null,
-    writes_performed: statusBound,
-    public_effects_performed: statusBound ? 1 : 0,
+    writes_performed: currentStatusBound,
+    public_effects_performed: currentStatusBound
+      ? boundStatusIntents.length
+      : 0,
     effect_barrier: statusBound
       ? "STATUS_EFFECT_BOUND"
       : "NO_STATUS_EFFECT_REQUIRED",
     status_effect_outcome: statusBound ? "bound" : "not-required",
     status_ambiguity_code: null,
     status_intent_digest:
-      statusIntent?.status_intent_handle.intent_digest ?? null,
+      finalStatusIntent?.status_intent_handle.intent_digest ?? null,
     status_response_runner_state_digest:
-      statusResponse?.runner_state_digest ?? null,
+      finalStatusResponse?.runner_state_digest ?? null,
     reservation_status_effect_outcome: "not-required",
     reservation_status_ambiguity_code: null,
     automatic_reservation_digest: null,
@@ -5451,6 +8499,52 @@ function forgeCandidateDispatchAckPayload(payloadValue) {
     ack.terminal_authority.terminal_projection_digest;
   ack.result.public_effects_performed =
     ack.terminal_authority.terminal_projection.public_effects_performed;
+  const { result_digest: _resultDigest, ...resultWithoutDigest } = ack.result;
+  ack.result.result_digest = digestCanonical(
+    "codex-review-gate-v2-candidate-dispatch-result",
+    resultWithoutDigest,
+  );
+  const { ack_digest: _ackDigest, ...ackWithoutDigest } = ack;
+  ack.ack_digest = digestCanonical(
+    "codex-review-gate-v2-candidate-dispatch-ack",
+    ackWithoutDigest,
+  );
+  return payload;
+}
+
+function forgeCandidateDispatchAckAsControllerTerminal(payloadValue) {
+  const payload = structuredClone(payloadValue);
+  const ack = payload.candidate_ack;
+  const terminal = ack.terminal_authority;
+  terminal.kind = "controller-terminal";
+  terminal.recovery = null;
+  const {
+    authority_digest: _terminalDigest,
+    ...terminalWithoutDigest
+  } = terminal;
+  terminal.authority_digest = digestCanonical(
+    "codex-review-gate-v2-candidate-dispatch-terminal-authority",
+    terminalWithoutDigest,
+  );
+  const projection = terminal.terminal_projection;
+  const ambiguityCode = projection.automatic_request_ambiguity_code ??
+    projection.reservation_status_ambiguity_code ??
+    projection.status_ambiguity_code;
+  const ambiguous = [
+    projection.status_effect_outcome,
+    projection.reservation_status_effect_outcome,
+    projection.automatic_request_effect_outcome,
+  ].includes("ambiguous");
+  const blocked = new Set([
+    "not-selected", "blocked-configuration", "blocked-input",
+  ]).has(projection.decision);
+  ack.result.controller_authority_digest = terminal.authority_digest;
+  ack.result.controller_result_digest = terminal.terminal_projection_digest;
+  ack.result.decision = projection.decision;
+  ack.result.public_effects_performed =
+    projection.public_effects_performed;
+  ack.result.outcome = ambiguous ? "failed" : blocked ? "blocked" : "success";
+  ack.result.failure_code = ambiguous ? ambiguityCode : null;
   const { result_digest: _resultDigest, ...resultWithoutDigest } = ack.result;
   ack.result.result_digest = digestCanonical(
     "codex-review-gate-v2-candidate-dispatch-result",
@@ -5525,6 +8619,66 @@ function resealFixtureEnvelopePayload(envelope, payload) {
   );
 }
 
+function resealFixtureProductionEnvelopePayload(envelope, payload) {
+  envelope.payload = structuredClone(payload);
+  envelope.payload_digest = digestV2GitLedgerPayload(envelope.payload);
+  envelope.workflow_provenance.operation_binding.record_identity
+    .payload_digest = envelope.payload_digest;
+  resealProvenance(envelope.workflow_provenance);
+  resealEnvelope(envelope);
+}
+
+function resealFixtureAutomaticRecoveryCandidateAuthority(
+  authorityValue,
+  candidatesValue,
+) {
+  const authority = structuredClone(authorityValue);
+  authority.candidates = candidatesValue.map((candidateValue, index) => {
+    const candidate = structuredClone(candidateValue);
+    candidate.index = index;
+    candidate.count = candidatesValue.length;
+    delete candidate.candidate_digest;
+    candidate.candidate_digest = runnerDigestCanonical(
+      "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate",
+      candidate,
+    );
+    return candidate;
+  });
+  delete authority.authority_digest;
+  authority.authority_digest = runnerDigestCanonical(
+    "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate-authority",
+    authority,
+  );
+  return authority;
+}
+
+function fixtureAutomaticRecoveryCandidateSetDigest(authority) {
+  return digestCanonical(
+    "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate-set",
+    {
+      review_epoch_id: authority.review_epoch_id,
+      generation_id: authority.generation_id,
+      request_id: authority.request_id,
+      request_node_id: authority.request_node_id,
+      request_bound_at: authority.request_bound_at,
+      request_binding_record_oid: authority.request_binding_record_oid,
+      request_binding_receipt_digest:
+        authority.request_binding_receipt_digest,
+      expected_actor: structuredClone(authority.expected_actor),
+      expected_app: structuredClone(authority.expected_app),
+      scope: structuredClone(authority.scope),
+      candidates: authority.candidates.map((candidate) => ({
+        selector: structuredClone(candidate.selector),
+        artifact_node_id: candidate.artifact_node_id,
+        artifact_url: candidate.artifact_url,
+        artifact_type: candidate.artifact_type,
+        artifact_created_at: candidate.artifact_created_at,
+        evidence_raw_body_sha256: candidate.evidence_raw_body_sha256,
+      })),
+    },
+  );
+}
+
 async function appendCompletedCandidateInventory({
   ledger,
   transportFixture,
@@ -5564,10 +8718,12 @@ async function appendCompletedCandidateInventory({
   }
   loaded = await ledger.load();
   const finalInventory = await transport.scan({ prior_inventory: initial });
+  const finalShards = await readCandidateShardRound(transport, finalInventory);
   const cycleReceipt = finalizeV2CandidateInventoryCycle({
     initial_inventory: initial,
     shard_receipts: shards,
     final_inventory: finalInventory,
+    final_shard_receipts: finalShards,
   });
   await appendCandidateInventoryPhase({
     ledger,
@@ -5578,6 +8734,17 @@ async function appendCompletedCandidateInventory({
     cycleReceipt,
   });
   return ledger.load();
+}
+
+async function readCandidateShardRound(transport, inventory) {
+  const receipts = [];
+  for (let index = 0; index < inventory.shards.length; index += 1) {
+    receipts.push(await transport.readShard({
+      inventory,
+      shard_index: index,
+    }));
+  }
+  return receipts;
 }
 
 async function createScheduledCandidateDispatchAttempt({
@@ -5653,6 +8820,251 @@ async function createScheduledCandidateDispatchAttempt({
     scheduled,
     preScopeReceipt,
     discovery,
+  };
+}
+
+async function createScheduledAutomaticRecoveryBranchAttempt({
+  bindArtifactBeforeDispatch,
+  durableArtifactPrefixPhaseBeforeDispatch = null,
+  additionalFindingIdsBeforeDispatch = [],
+  additionalFindingIdsDuringDispatch = [],
+}) {
+  const fixture = githubGitFixture();
+  const runIdentity = { ...OWNER };
+  const capability = scheduleCapabilityReceipt({
+    allowedEventNames: ["pull_request_target", "schedule"],
+  });
+  const verifier = provenanceVerifier({
+    eventName: "pull_request_target",
+    ref: "refs/heads/main",
+    shaValue: BASE,
+    runIdentity,
+    deriveTriggerFromRequest: true,
+  });
+  const preflight = await loadFixtureProviderPreflight();
+  const ordinary = await createProtectedInitialRunnerContext(fixture, {
+    runIdentity,
+    capability,
+    verifier,
+    preflight,
+  });
+  fixture.freezeServerTime();
+  const seed = schedulerObservationRecord({
+    predecessor: ordinary.lease.acquire_commit_sha,
+    lease: ordinary.lease,
+    priorAuthorityDigest: ordinary.initialAuthority.prior_authority_digest,
+    initialAuthority: ordinary.initialAuthority,
+  }).payload.action;
+  const initialSchedulerAppend = await ordinary.ledger
+    .appendInitialSchedulerObservation({
+      initial_runner_state_authority: ordinary.initialAuthority,
+      scheduler_evaluation: seed.scheduler_evaluation,
+      status_plan: seed.status_plan,
+    });
+  const { automatic, response: reservationStatusResponse } =
+    await appendAutomaticReservationStatus(
+      ordinary.ledger,
+      initialSchedulerAppend,
+    );
+  const requestIntent = await ordinary.ledger
+    .appendAutomaticReviewRequestIntent({
+      automatic_reservation_handle: automatic.automatic_reservation_handle,
+      reservation_append_receipt: automatic.reservation_append_receipt,
+      reservation_status_response_append: reservationStatusResponse,
+    });
+  const requestReceipt = await automaticReviewRequestBindingReceipt({
+    action: {
+      method: "POST",
+      request_body_sha256: rawDigest("@codex review"),
+    },
+    observedAt: requestIntent.intent_append_receipt.ref_reread.server_time,
+  });
+  await ordinary.ledger.appendAutomaticReviewRequestBinding({
+    automatic_request_intent_handle:
+      requestIntent.automatic_request_intent_handle,
+    intent_append_receipt: requestIntent.intent_append_receipt,
+    receipt: requestReceipt,
+  });
+  const findingCreatedAt = new Date(
+    Date.parse(requestReceipt.created_at) + 1000,
+  ).toISOString();
+  let priorArtifactBinding = null;
+  let priorArtifactBindingIntent = null;
+  let priorArtifactBindingIntentRecordOid = null;
+  let priorObservation = null;
+  if (bindArtifactBeforeDispatch ||
+      durableArtifactPrefixPhaseBeforeDispatch !== null) {
+    fixture.advanceServerTime(10);
+    priorObservation = await appendAutomaticRecoveryObservation({
+      ledger: ordinary.ledger,
+      preflight,
+      evaluatedScopeReceipt: ordinary.evaluatedScopeReceipt,
+      workflowCommandHandle: ordinary.workflowCommandHandle,
+      requestCreatedAt: requestReceipt.created_at,
+      findingCreatedAt,
+      expectRecoveryHandle: false,
+    });
+    assert.equal(priorObservation.statusIntents.length, 2);
+    const partialFailure = durableArtifactPrefixPhaseBeforeDispatch === "intent"
+      ? { kind: "artifact-binding", occurrence: 1 }
+      : durableArtifactPrefixPhaseBeforeDispatch === "ready-intent"
+        ? { kind: "artifact-binding-ready", occurrence: 1 }
+        : null;
+    if (partialFailure !== null) {
+      fixture.failRereadAfterEffectUpdate(
+        partialFailure.kind,
+        partialFailure.occurrence,
+      );
+    }
+    const priorIntentPromise = ordinary.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: priorObservation.schedulerAppend,
+        artifact_binding_candidate_handle:
+          priorObservation.artifactBindingCandidateHandle,
+      });
+    if (partialFailure === null) {
+      priorArtifactBindingIntent = await priorIntentPromise;
+    } else {
+      await assert.rejects(
+        priorIntentPromise,
+        (error) => error.code === "unexpected-http-status",
+      );
+    }
+    const priorLoaded = await ordinary.ledger.load();
+    priorArtifactBindingIntentRecordOid = priorLoaded.records.find((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding")?.commit_sha ?? null;
+    assert.notEqual(priorArtifactBindingIntentRecordOid, null);
+    if (bindArtifactBeforeDispatch) {
+      const providerArtifactHandles =
+        await loadAutomaticRecoveryProviderArtifactHandles({
+          ledger: ordinary.ledger,
+          fixture,
+          transport: priorArtifactBindingIntent.transport,
+          snapshots: priorObservation.snapshots,
+        });
+      priorArtifactBinding = await ordinary.ledger
+        .appendAutomaticRecoveryArtifactBindingResponse({
+          artifact_binding_intent_handle:
+            priorArtifactBindingIntent.artifact_binding_intent_handle,
+          intent_append_receipt:
+            priorArtifactBindingIntent.intent_append_receipt,
+          provider_artifact_handles: providerArtifactHandles,
+        });
+    }
+    if (additionalFindingIdsBeforeDispatch.length !== 0) {
+      assert.equal(
+        durableArtifactPrefixPhaseBeforeDispatch,
+        "ready-confirmation",
+      );
+      fixture.advanceServerTime(60);
+      const expandedPriorObservation =
+        await appendAutomaticRecoveryObservation({
+          ledger: ordinary.ledger,
+          preflight,
+          evaluatedScopeReceipt: ordinary.evaluatedScopeReceipt,
+          workflowCommandHandle: ordinary.workflowCommandHandle,
+          requestCreatedAt: requestReceipt.created_at,
+          findingCreatedAt,
+          additionalFindingIds: additionalFindingIdsBeforeDispatch,
+          expectRecoveryHandle: false,
+          requireArtifactBinding: false,
+        });
+      await ordinary.ledger
+        .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+          scheduler_append: expandedPriorObservation.schedulerAppend,
+          artifact_binding_candidate_handle:
+            expandedPriorObservation.artifactBindingCandidateHandle,
+        });
+    }
+  }
+  const priorLeaseReleaseReceipt = await releaseFixtureDiscoveryLease(
+    ordinary.ledger,
+    ordinary.discovery,
+  );
+  fixture.advanceServerTime(120);
+
+  const ledger = makeLedger(fixture, capability, verifier, preflight);
+  await ledger.bootstrapCapability();
+  const candidateFixture = candidateTransportFixture(0, {
+    exactScopeCandidateNumber: PR.number,
+  });
+  candidateFixture.setListedNumbers([PR.number]);
+  await appendCompletedCandidateInventory({
+    ledger,
+    transportFixture: candidateFixture,
+  });
+  const triggerIdentity = scheduleTriggerIdentity();
+  const scanCommand = await createScheduleWorkflowCommandHandle({
+    runIdentity,
+  });
+  const reserved = await ledger.loadOrReserveCandidateDispatch({
+    workflow_command_handle: scanCommand,
+    trigger_identity: triggerIdentity,
+    repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+  });
+  runIdentity.run_id = "9101";
+  runIdentity.run_attempt = 1;
+  const scheduledCommand = await createScheduleWorkflowCommandHandle({
+    pullRequestNumber: PR.number,
+    dispatchBinding: reserved.plan.items[0],
+    runIdentity,
+  });
+  const minimal = await loadFixtureMinimalScope();
+  const scheduled = await ledger.loadCandidateDispatchForScheduledPullRequest({
+    workflow_command_handle: scheduledCommand,
+    minimal_scope_handle: minimal,
+    trigger_identity: triggerIdentity,
+    expected_dispatch_binding: reserved.plan.items[0],
+  });
+  const preScopeReceipt = await ledger
+    .loadScheduledPullRequestEvaluatedScopeReceipt({
+      candidate_dispatch_handle: scheduled.candidate_dispatch_handle,
+      minimal_scope_handle: minimal,
+      trigger_identity: triggerIdentity,
+    });
+  const discovery = await acquireFixtureLeasedDiscovery({
+    ledger,
+    command: scheduledCommand,
+    preScopeReceipt,
+    minimalPre: minimal,
+    leaseTtlSeconds: 900,
+  });
+  fixture.advanceServerTime(60);
+  const recovery = await appendAutomaticRecoveryObservation({
+    ledger,
+    preflight,
+    evaluatedScopeReceipt: discovery.effect_evaluated_scope_receipt,
+    workflowCommandHandle: scheduledCommand,
+    requestCreatedAt: requestReceipt.created_at,
+    findingCreatedAt,
+    additionalFindingIds: additionalFindingIdsDuringDispatch,
+    expectRecoveryHandle: bindArtifactBeforeDispatch &&
+      additionalFindingIdsDuringDispatch.length === 0,
+    requireArtifactBinding: bindArtifactBeforeDispatch,
+  });
+  return {
+    fixture,
+    ledger,
+    capability,
+    verifier,
+    preflight,
+    runIdentity,
+    triggerIdentity,
+    reserved,
+    scheduled,
+    scheduledCommand,
+    minimal,
+    preScopeReceipt,
+    discovery,
+    requestReceipt,
+    findingCreatedAt,
+    priorArtifactBinding,
+    priorArtifactBindingIntent,
+    priorArtifactBindingIntentRecordOid,
+    priorObservation,
+    priorLeaseReleaseReceipt,
+    recovery,
   };
 }
 
@@ -5911,6 +9323,8 @@ function makeLedger(
       production.appendEstablishedSchedulerObservation(...args),
     appendStatusWriteIntent: (...args) =>
       production.appendStatusWriteIntent(...args),
+    loadNextStatusWriteIntent: (...args) =>
+      production.loadNextStatusWriteIntent(...args),
     appendStatusWriteResponse: (...args) =>
       production.appendStatusWriteResponse(...args),
     appendAutomaticRequestReservation: (...args) =>
@@ -5921,6 +9335,14 @@ function makeLedger(
       production.appendReservationStatusWriteResponse(...args),
     appendAutomaticReviewRequestIntent: (...args) =>
       production.appendAutomaticReviewRequestIntent(...args),
+    appendRecoveredAutomaticReviewRequestIntent: (...args) =>
+      production.appendRecoveredAutomaticReviewRequestIntent(...args),
+    loadOrAppendAutomaticRecoveryArtifactBindingIntent: (...args) =>
+      production.loadOrAppendAutomaticRecoveryArtifactBindingIntent(...args),
+    appendAutomaticRecoveryArtifactBindingResponse: (...args) =>
+      production.appendAutomaticRecoveryArtifactBindingResponse(...args),
+    appendAutomaticRequestRecoveryTransition: (...args) =>
+      production.appendAutomaticRequestRecoveryTransition(...args),
     appendAutomaticReviewRequestBinding: (...args) =>
       production.appendAutomaticReviewRequestBinding(...args),
     append: async (record, authority = null) => production.append(
@@ -5986,19 +9408,24 @@ function makeLedger(
 
 async function createProtectedInitialRunnerContext(
   fixture,
-  { runIdentity = OWNER } = {},
+  {
+    runIdentity = OWNER,
+    capability: capabilityOverride = null,
+    verifier: verifierOverride = null,
+    preflight: preflightOverride = null,
+  } = {},
 ) {
-  const preflight = await loadFixtureProviderPreflight();
-  const capability = capabilityReceiptForTrigger(
+  const preflight = preflightOverride ?? await loadFixtureProviderPreflight();
+  const capability = capabilityOverride ?? capabilityReceiptForTrigger(
     "pull_request_target",
     "refs/heads/main",
   );
-  const verifier = provenanceVerifier({
-    eventName: "pull_request_target",
-    ref: "refs/heads/main",
-    shaValue: BASE,
-    runIdentity,
-  });
+  const verifier = verifierOverride ?? provenanceVerifier({
+      eventName: "pull_request_target",
+      ref: "refs/heads/main",
+      shaValue: BASE,
+      runIdentity,
+    });
   const ledger = makeLedger(fixture, capability, verifier, preflight);
   await ledger.bootstrapCapability();
   const minimalScopeHandle = await loadFixtureMinimalScope();
@@ -6412,9 +9839,11 @@ function provenanceVerifier({
   shaValue = null,
   claimsSupported = V2_GIT_LEDGER_OIDC_CLAIMS,
   runIdentity = OWNER,
+  deriveTriggerFromRequest = false,
 } = {}) {
   let ordinal = 0;
   const runIdentityByTokenOrdinal = new Map();
+  const triggerByTokenOrdinal = new Map();
   return async (verifierRequest) => {
     const request = verifierRequest.provenance_request;
     let tokenOrdinal;
@@ -6425,6 +9854,21 @@ function provenanceVerifier({
       tokenOrdinal = ordinal;
       jti = omitJti ? null : fixedJti ?? `${jtiPrefix}-${tokenOrdinal}`;
       runIdentityByTokenOrdinal.set(tokenOrdinal, structuredClone(runIdentity));
+      const evaluated = request.evaluated_scope_receipt;
+      triggerByTokenOrdinal.set(tokenOrdinal, {
+        event_name: deriveTriggerFromRequest && evaluated !== null &&
+            evaluated !== undefined
+          ? evaluated.trigger_event_name
+          : eventName,
+        ref: deriveTriggerFromRequest && evaluated !== null &&
+            evaluated !== undefined
+          ? evaluated.trigger_ref
+          : ref,
+        sha: deriveTriggerFromRequest && evaluated !== null &&
+            evaluated !== undefined
+          ? evaluated.trigger_sha
+          : shaValue,
+      });
       compactJwt = fixtureJwt({
         ordinal: tokenOrdinal,
         jti,
@@ -6441,24 +9885,30 @@ function provenanceVerifier({
     }
     const tokenRunIdentity = runIdentityByTokenOrdinal.get(tokenOrdinal) ??
       runIdentity;
+    const tokenTrigger = triggerByTokenOrdinal.get(tokenOrdinal) ?? {
+      event_name: eventName,
+      ref,
+      sha: shaValue,
+    };
     const epoch = Math.floor(Date.parse(request.github_server_time) / 1000);
     const effectScope = request.effect_scope;
     const claims = {
       aud: request.audience,
-      event_name: eventName,
+      event_name: tokenTrigger.event_name,
       exp: epoch + 300,
       iat: epoch - 1,
       iss: "https://token.actions.githubusercontent.com",
       job_workflow_ref: request.source_workflow.job_workflow_ref,
       job_workflow_sha: request.source_workflow.job_workflow_sha,
       nbf: epoch - 1,
-      ref,
+      ref: tokenTrigger.ref,
       repository: `${REPOSITORY.owner}/${REPOSITORY.name}`,
       repository_id: REPOSITORY.id,
       repository_owner_id: "88",
       run_attempt: String(tokenRunIdentity.run_attempt),
       run_id: tokenRunIdentity.run_id,
-      sha: shaValue ?? effectScope?.potential_merge_commit_oid ?? POTENTIAL,
+      sha: tokenTrigger.sha ?? effectScope?.potential_merge_commit_oid ??
+        POTENTIAL,
       sub: "repo:owner/repo:pull_request",
       workflow_ref: request.source_workflow.workflow_ref,
       workflow_sha: request.source_workflow.workflow_sha,
@@ -6623,6 +10073,8 @@ function initialScheduling({
       controlled_request: null,
       automatic_request: {
         state: "available",
+        generation_index: 1,
+        recovery_authority: null,
         intent_id: null,
         intent_persisted_at: null,
         effect_attempted_at: null,
@@ -6721,6 +10173,10 @@ function schedulerObservationRecord({
       "codex-review-gate-v2-status-plan",
       statusPlan,
     ),
+    evaluated_scope_receipt_digest: initialAuthority === null
+      ? `sha256:${"a".repeat(64)}`
+      : initialAuthority.evaluated_scope_authority
+        .record_evaluated_scope_receipt_digest,
     snapshot_server_time: snapshotTime,
     initial_runner_state_authority: initialAuthority === null
       ? null
@@ -7094,6 +10550,773 @@ async function appendAutomaticReservationStatus(ledger, schedulerAppend) {
     ),
   });
   return { automatic, intent, response };
+}
+
+async function createAutomaticRecoveryTransitionContext({
+  bindArtifact = true,
+  additionalFindingIds = [],
+  includeAddresses = true,
+  beforeRecoveryObservation = null,
+} = {}) {
+  const fixture = githubGitFixture();
+  const runIdentity = { ...OWNER };
+  const context = await createProtectedInitialRunnerContext(fixture, {
+    runIdentity,
+  });
+  fixture.freezeServerTime();
+  const seed = schedulerObservationRecord({
+    predecessor: context.lease.acquire_commit_sha,
+    lease: context.lease,
+    priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+    initialAuthority: context.initialAuthority,
+  }).payload.action;
+  const firstSchedulerAppend = await context.ledger
+    .appendInitialSchedulerObservation({
+      initial_runner_state_authority: context.initialAuthority,
+      scheduler_evaluation: seed.scheduler_evaluation,
+      status_plan: seed.status_plan,
+    });
+  const { automatic, response } = await appendAutomaticReservationStatus(
+    context.ledger,
+    firstSchedulerAppend,
+  );
+  const requestIntent = await context.ledger
+    .appendAutomaticReviewRequestIntent({
+      automatic_reservation_handle: automatic.automatic_reservation_handle,
+      reservation_append_receipt: automatic.reservation_append_receipt,
+      reservation_status_response_append: response,
+    });
+  const requestReceipt = await automaticReviewRequestBindingReceipt({
+    action: {
+      method: "POST",
+      request_body_sha256: rawDigest("@codex review"),
+    },
+    observedAt: requestIntent.intent_append_receipt.ref_reread.server_time,
+  });
+  const requestBinding = await context.ledger
+    .appendAutomaticReviewRequestBinding({
+      automatic_request_intent_handle:
+        requestIntent.automatic_request_intent_handle,
+      intent_append_receipt: requestIntent.intent_append_receipt,
+      receipt: requestReceipt,
+    });
+  const findingCreatedAt = new Date(
+    Date.parse(requestReceipt.created_at) + 1000,
+  ).toISOString();
+  fixture.advanceServerTime(Math.max(
+    10,
+    additionalFindingIds.length * 2 + 10,
+  ));
+  if (beforeRecoveryObservation !== null) {
+    beforeRecoveryObservation({ fixture, context });
+  }
+  const candidateObservation = await appendAutomaticRecoveryObservation({
+    ledger: context.ledger,
+    preflight: context.preflight,
+    evaluatedScopeReceipt: context.evaluatedScopeReceipt,
+    workflowCommandHandle: context.workflowCommandHandle,
+    requestCreatedAt: requestReceipt.created_at,
+    findingCreatedAt,
+    additionalFindingIds,
+    includeAddresses,
+    expectRecoveryHandle: false,
+  });
+  let recovery = candidateObservation;
+  if (bindArtifact) {
+    const intent = await context.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: candidateObservation.schedulerAppend,
+        artifact_binding_candidate_handle:
+          candidateObservation.artifactBindingCandidateHandle,
+      });
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: context.ledger,
+        fixture,
+        transport: intent.transport,
+        snapshots: candidateObservation.snapshots,
+      });
+    const response = await context.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    assert.equal(response.bindings.length, intent.transport.expected_count);
+    fixture.advanceServerTime(60);
+    recovery = await appendAutomaticRecoveryObservation({
+      ledger: context.ledger,
+      preflight: context.preflight,
+      evaluatedScopeReceipt: context.evaluatedScopeReceipt,
+      workflowCommandHandle: context.workflowCommandHandle,
+      requestCreatedAt: requestReceipt.created_at,
+      findingCreatedAt,
+      additionalFindingIds,
+      expectRecoveryHandle: true,
+    });
+  }
+  return {
+    fixture,
+    context,
+    ledger: context.ledger,
+    requestCreatedAt: requestReceipt.created_at,
+    findingCreatedAt,
+    runIdentity,
+    ...recovery,
+  };
+}
+
+async function createAutomaticRecoveryQueuedArtifactBindingContext({
+  additionalFindingIds = ["203"],
+} = {}) {
+  const setup = await createAutomaticRecoveryTransitionContext({
+    bindArtifact: false,
+  });
+  const first = await setup.ledger
+    .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+      scheduler_append: setup.schedulerAppend,
+      artifact_binding_candidate_handle:
+        setup.artifactBindingCandidateHandle,
+    });
+  setup.fixture.advanceServerTime(60);
+  const expanded = await appendAutomaticRecoveryObservation({
+    ledger: setup.ledger,
+    preflight: setup.context.preflight,
+    evaluatedScopeReceipt: setup.context.evaluatedScopeReceipt,
+    workflowCommandHandle: setup.context.workflowCommandHandle,
+    requestCreatedAt: setup.requestCreatedAt,
+    findingCreatedAt: setup.findingCreatedAt,
+    additionalFindingIds,
+    expectRecoveryHandle: false,
+    requireArtifactBinding: false,
+  });
+  const resumed = await setup.ledger
+    .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+      scheduler_append: expanded.schedulerAppend,
+      artifact_binding_candidate_handle:
+        expanded.artifactBindingCandidateHandle,
+    });
+  const loaded = await setup.ledger.load();
+  const parentEntry = loaded.records.find((entry) =>
+    entry.commit_sha === first.intent_append_receipt.commit_sha);
+  const queuedEntry = loaded.records.find((entry) =>
+    entry.commit_sha === resumed.latest_append_receipt.commit_sha);
+  assert.notEqual(parentEntry, undefined);
+  assert.notEqual(queuedEntry, undefined);
+  assert.equal(queuedEntry.envelope.record_type, "effect-intent");
+  assert.equal(queuedEntry.envelope.kind, "artifact-binding");
+  assert.equal(
+    queuedEntry.envelope.payload.action
+      .queued_after_artifact_binding_intent_record_oid,
+    parentEntry.commit_sha,
+  );
+  return { setup, first, expanded, resumed, parentEntry, queuedEntry };
+}
+
+async function appendAutomaticRecoveryObservation({
+  ledger,
+  preflight,
+  evaluatedScopeReceipt,
+  workflowCommandHandle,
+  requestCreatedAt,
+  findingCreatedAt,
+  findingLine = 1,
+  addressId = "303",
+  precedingFindingIds = [],
+  additionalFindingIds = [],
+  includePrimaryFinding = true,
+  includeAddresses = true,
+  expectRecoveryHandle = true,
+  expectArtifactBindingCandidateHandle = !expectRecoveryHandle,
+  requireArtifactBinding = expectRecoveryHandle,
+}) {
+  const controlPlaneAuthority = await ledger
+    .loadControlPlaneAuthority(evaluatedScopeReceipt.scope);
+  const establishedAuthority = await ledger
+    .loadEstablishedRunnerStateAuthority({
+      control_plane_authority: controlPlaneAuthority,
+      evaluated_scope_receipt: evaluatedScopeReceipt,
+      workflow_command_handle: workflowCommandHandle,
+    });
+  const controlPlaneReceipt =
+    createV2ControlPlaneReceiptFromGitLedgerAuthority(controlPlaneAuthority);
+  const productionAuthority = createV2ProductionRunnerAuthority({
+    preflight_handle: preflight,
+    control_plane_receipt: controlPlaneReceipt,
+    established_runner_state_authority: establishedAuthority,
+    expected_scope: establishedAuthority.scope,
+  });
+  const snapshots = automaticRecoverySnapshotFixture({
+    requestCreatedAt,
+    findingCreatedAt,
+    controller: productionAuthority.projector_controller,
+    finalServerTime:
+      establishedAuthority.source_authority.post_ref_receipt.server_time,
+    addressId,
+    precedingFindingIds,
+    additionalFindingIds,
+    includePrimaryFinding,
+    includeAddresses,
+    findingLine,
+    requireArtifactBinding,
+  });
+  const runnerResult = await runV2Operation({
+    schema: V2_RUNNER_SCHEMA,
+    schema_version: 1,
+    operation: "prepare-request",
+    status_target_mode: productionAuthority.scheduling.status_target_mode,
+    status_context: "codex/github-review-gate",
+    snapshot_request: {
+      owner: REPOSITORY.owner,
+      repo: REPOSITORY.name,
+      pull_number: PR.number,
+    },
+    controller: productionAuthority.projector_controller,
+    public_report_authority: productionAuthority.public_report_authority,
+    scheduling: productionAuthority.scheduling,
+    head_ledger: productionAuthority.head_ledger,
+    reservation: null,
+    post_response: null,
+  }, {
+    transport: sequentialRecoveryTransport(
+      snapshots.discovery,
+      snapshots.evidence,
+    ),
+    reduceSnapshot: reduceV2Snapshot,
+  });
+  const recoveryHandle = getV2AutomaticRequestRecoveryHandle(runnerResult);
+  assert.equal(recoveryHandle === null, !expectRecoveryHandle);
+  const artifactBindingCandidateHandle =
+    getV2AutomaticRecoveryArtifactBindingCandidateHandle(runnerResult);
+  assert.equal(
+    artifactBindingCandidateHandle === null,
+    !expectArtifactBindingCandidateHandle,
+  );
+  const schedulerAppend = await ledger
+    .appendEstablishedSchedulerObservation({
+      established_runner_state_authority: establishedAuthority,
+      scheduler_evaluation: runnerResult.scheduler_evaluation,
+      status_plan: runnerResult.status_plan,
+    });
+  const statusIntents = [];
+  const statusResponses = [];
+  while (true) {
+    const statusIntent = await ledger.loadNextStatusWriteIntent({
+      scheduler_append: schedulerAppend,
+    });
+    if (statusIntent === null) break;
+    statusIntents.push(statusIntent);
+    statusResponses.push(await ledger.appendStatusWriteResponse({
+      status_intent_handle: statusIntent.status_intent_handle,
+      intent_append_receipt: statusIntent.intent_append_receipt,
+      receipt: statusWriteResponseReceipt(
+        statusIntent.transport,
+        statusIntent.intent_append_receipt.ref_reread.server_time,
+      ),
+    }));
+  }
+  return {
+    schedulerAppend,
+    statusIntents,
+    statusResponses,
+    recoveryHandle,
+    artifactBindingCandidateHandle,
+    runnerResult,
+    snapshots,
+    controlPlaneAuthority,
+    establishedAuthority,
+    productionAuthority,
+  };
+}
+
+async function createFreshAutomaticRecoveryContinuation(
+  setup,
+  {
+    addressId = "303",
+    findingLine = 1,
+    precedingFindingIds = [],
+    additionalFindingIds = [],
+    includePrimaryFinding = true,
+    expectRecoveryHandle = true,
+    expectArtifactBindingCandidateHandle = !expectRecoveryHandle,
+    requireArtifactBinding = expectRecoveryHandle,
+  } = {},
+) {
+  await releaseFixtureDiscoveryLease(
+    setup.ledger,
+    setup.context.discovery,
+  );
+  setup.fixture.advanceServerTime(7200);
+  setup.runIdentity.run_id = "9002";
+  setup.runIdentity.run_attempt = 1;
+  const ledger = createV2GitHubGitLedger({
+    ...factoryInput(setup.fixture, setup.context.capability),
+    preflightHandle: setup.context.preflight,
+    verifyWorkflowProvenance: setup.context.verifier,
+  });
+  const nextRun = await acquireEstablishedRunnerContext({
+    ledger,
+    runIdentity: setup.runIdentity,
+    observationBoundary: "public-post-request-wait-complete",
+    transportStartSecond: 9000,
+    minimalServerTime: "2026-08-13T15:00:00.000Z",
+  });
+  const recovery = await appendAutomaticRecoveryObservation({
+    ledger,
+    preflight: setup.context.preflight,
+    evaluatedScopeReceipt: nextRun.evaluatedScopeReceipt,
+    workflowCommandHandle: nextRun.workflowCommandHandle,
+    requestCreatedAt: setup.requestCreatedAt,
+    findingCreatedAt: setup.findingCreatedAt,
+    addressId,
+    findingLine,
+    precedingFindingIds,
+    additionalFindingIds,
+    includePrimaryFinding,
+    expectRecoveryHandle,
+    expectArtifactBindingCandidateHandle,
+    requireArtifactBinding,
+  });
+  return { ledger, nextRun, recovery };
+}
+
+function automaticRecoverySnapshotFixture({
+  requestCreatedAt,
+  findingCreatedAt,
+  controller,
+  finalServerTime,
+  addressId = "303",
+  precedingFindingIds = [],
+  additionalFindingIds = [],
+  includePrimaryFinding = true,
+  includeAddresses = true,
+  findingLine = 1,
+  requireArtifactBinding = true,
+}) {
+  const addressCreatedAt = new Date(
+    Date.parse(findingCreatedAt) + 1000,
+  ).toISOString();
+  const request = automaticRecoveryIssueComment("71", {
+    body: "@codex review",
+    author: ACTOR,
+    app: GITHUB_ACTIONS_APP,
+    created_at: requestCreatedAt,
+    updated_at: requestCreatedAt,
+  });
+  const finding = automaticRecoveryIssueComment("202", {
+    body:
+      "### 💡 Codex Review\n\n" +
+      `- [P1] Fix the current-head issue https://github.com/owner/repo/blob/${HEAD}/src/a.js#L${findingLine}`,
+    author: CODEX_ACTOR,
+    app: CODEX_APP,
+    created_at: findingCreatedAt,
+    updated_at: findingCreatedAt,
+  });
+  const precedingFindings = precedingFindingIds.map((id, index) => {
+    const createdAt = new Date(
+      Date.parse(findingCreatedAt) -
+        ((precedingFindingIds.length - index) * 250),
+    ).toISOString();
+    return automaticRecoveryIssueComment(String(id), {
+      body:
+        "### 💡 Codex Review\n\n" +
+        `- [P1] Fix an earlier current-head issue https://github.com/owner/repo/blob/${HEAD}/src/pre.js#L${index + 1}`,
+      author: CODEX_ACTOR,
+      app: CODEX_APP,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+  });
+  const additionalFindings = additionalFindingIds.map((id, index) => {
+    const createdAt = new Date(
+      Date.parse(findingCreatedAt) + ((index + 1) * 1000),
+    ).toISOString();
+    return automaticRecoveryIssueComment(String(id), {
+      body:
+        "### 💡 Codex Review\n\n" +
+        `- [P1] Fix another current-head issue https://github.com/owner/repo/blob/${HEAD}/src/b.js#L${index + 2}`,
+      author: CODEX_ACTOR,
+      app: CODEX_APP,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+  });
+  const findings = [
+    ...precedingFindings,
+    ...(includePrimaryFinding ? [finding] : []),
+    ...additionalFindings,
+  ];
+  const addresses = includeAddresses ? findings.map((artifact, index) => {
+    const createdAt = new Date(
+      Date.parse(addressCreatedAt) + (additionalFindingIds.length * 1000) +
+        (index * 1000),
+    ).toISOString();
+    return automaticRecoveryIssueComment(
+      index === 0 ? addressId : String(Number(addressId) + index),
+      {
+        body: `/codex-gate addressed ${artifact.html_url}`,
+        author: HUMAN_ACTOR,
+        created_at: createdAt,
+        updated_at: createdAt,
+      },
+    );
+  }) : [];
+  const address = addresses[0] ?? null;
+  const issueComments = [request, ...findings, ...addresses];
+  const providerArtifacts = issueComments.map((artifact) =>
+    providerIssueComment({
+      id: Number(artifact.id),
+      node_id: artifact.node_id,
+      url: artifact.url,
+      html_url: artifact.html_url,
+      issue_url: artifact.issue_url,
+      body: artifact.body,
+      created_at: artifact.created_at,
+      updated_at: artifact.updated_at,
+      user: {
+        id: Number(artifact.author.id),
+        node_id: artifact.author.node_id,
+        login: artifact.author.login,
+        type: artifact.author.type,
+      },
+      performed_via_github_app: artifact.app === null ? null : {
+        id: Number(artifact.app.id),
+        node_id: artifact.app.node_id,
+        slug: artifact.app.slug,
+      },
+    }));
+  const discoveryServerTime = new Date(
+    Date.parse(finalServerTime) - 1000,
+  ).toISOString();
+  const discovery = automaticRecoverySnapshot({
+    issueComments,
+    serverTime: discoveryServerTime,
+  });
+  const evidence = automaticRecoverySnapshot({
+    issueComments,
+    exactArtifacts: issueComments.map((artifact, index) =>
+      automaticRecoveryExactArtifact(
+        artifact,
+        finalServerTime,
+        rawDigest(JSON.stringify(providerArtifacts[index])),
+      )),
+    actorPermissions: addresses.map((item) =>
+      automaticRecoveryActorPermission(item, finalServerTime)),
+    serverTime: finalServerTime,
+  });
+  assert.ok(controller.request_bindings.some((binding) =>
+    binding.id === request.id && binding.controlled === true));
+  if (includePrimaryFinding) {
+    assert.equal(
+      controller.artifact_bindings.some((binding) =>
+        binding.id === finding.id && binding.request_id === request.id),
+      requireArtifactBinding,
+    );
+  }
+  return {
+    request,
+    finding,
+    findings,
+    address,
+    providerArtifacts,
+    discovery,
+    evidence,
+  };
+}
+
+function automaticRecoverySnapshot({
+  issueComments,
+  exactArtifacts = [],
+  actorPermissions = [],
+  serverTime,
+}) {
+  const reactions = {
+    issue: [],
+    issue_comments: issueComments.map((comment) => ({
+      subject_id: comment.id,
+      reactions: [],
+    })),
+    reviews: [],
+    inline_comments: [],
+  };
+  const scope = {
+    base_ref_name: "main",
+    base_ref_tip: BASE,
+    head_ref_name: "feature",
+    head_ref_oid: HEAD,
+    merge_base_sha: BASE,
+    potential_merge_oid: POTENTIAL,
+    potential_merge_tree: "e".repeat(40),
+    ordered_parent_oids: [BASE, HEAD],
+    merge_ref_oid: POTENTIAL,
+    mergeable: "MERGEABLE",
+  };
+  const scopeReceipt = {
+    repository_owner: REPOSITORY.owner,
+    repository_name: REPOSITORY.name,
+    repository_node_id: REPOSITORY.node_id,
+    pull_request_number: PR.number,
+    pull_request_node_id: PR.node_id,
+    pull_request_state: "OPEN",
+    pull_request_merged: false,
+    pull_request_merged_at: null,
+    pull_request_is_draft: false,
+    ...scope,
+    server_time: serverTime,
+  };
+  const serviceStart = automaticRecoveryServiceStart(serverTime);
+  return {
+    schema_version: 2,
+    repository: {
+      owner: REPOSITORY.owner,
+      name: REPOSITORY.name,
+      node_id: REPOSITORY.node_id,
+    },
+    pull_request: {
+      number: PR.number,
+      node_id: PR.node_id,
+      state: "OPEN",
+      merged: false,
+      merged_at: null,
+      is_draft: false,
+    },
+    server_time: serverTime,
+    scope,
+    pages: {
+      issue_comments: structuredClone(issueComments),
+      reviews: [],
+      inline_comments: [],
+      threads: [],
+      reactions,
+      exact_artifacts: structuredClone(exactArtifacts),
+    },
+    permissions: {
+      transport_capabilities: {
+        stable: true,
+        pre: automaticRecoveryTransportCapability(serverTime),
+        post: automaticRecoveryTransportCapability(serverTime),
+      },
+      actor_permissions: structuredClone(actorPermissions),
+    },
+    service_start_observations: serviceStart,
+    scope_receipts: {
+      pre: automaticRecoveryScopeReceipt({
+        ...scopeReceipt,
+        server_time: new Date(
+          Date.parse(serverTime) - 1000,
+        ).toISOString(),
+      }),
+      post: automaticRecoveryScopeReceipt(scopeReceipt),
+    },
+    completeness: {
+      all_pages_loaded: true,
+      issue_comments: true,
+      reviews: true,
+      inline_comments: true,
+      threads: true,
+      reactions: true,
+      permissions: true,
+      exact_artifacts: true,
+      service_start_observations: true,
+      request_count: 1,
+      item_count: issueComments.length + exactArtifacts.length,
+      response_bytes: 1,
+      server_date_headers: 1,
+    },
+    stability: {
+      scope_stable: true,
+      service_start_observations_stable: true,
+      server_time_monotonic: true,
+    },
+  };
+}
+
+function automaticRecoveryScopeReceipt(receipt) {
+  const repoPath = `/repos/${REPOSITORY.owner}/${REPOSITORY.name}`;
+  const endpoint = (method, path, status = 200) => ({
+    method,
+    path,
+    status,
+    server_time: receipt.server_time,
+    raw_body_sha256: `sha256:${"f".repeat(64)}`,
+  });
+  return {
+    ...structuredClone(receipt),
+    endpoint_receipts: {
+      pull_request: endpoint("GET", `${repoPath}/pulls/${PR.number}`),
+      graphql: endpoint("POST", "/graphql"),
+      compare: endpoint("GET", `${repoPath}/compare/${BASE}...${HEAD}`),
+      merge_ref: endpoint(
+        "GET",
+        `${repoPath}/git/ref/pull/${PR.number}/merge`,
+      ),
+    },
+  };
+}
+
+function automaticRecoveryTransportCapability(serverTime) {
+  return {
+    capability_kind: "authenticated-transport-token",
+    admin: false,
+    maintain: false,
+    push: true,
+    triage: true,
+    pull: true,
+    role_name: "write",
+    endpoint: "https://api.github.test/repos/owner/repo",
+    http_status: 200,
+    response_server_time: serverTime,
+    raw_body_sha256: `sha256:${"f".repeat(64)}`,
+  };
+}
+
+function automaticRecoveryServiceStart(serverTime) {
+  const receipt = {
+    server_time: serverTime,
+    page_count: 1,
+    total_check_runs: 0,
+    matching_app_ids: [],
+    check_runs: [],
+    page_receipts: [{
+      page: 1,
+      item_count: 0,
+      total_count: 0,
+      response_server_time: serverTime,
+      raw_body_sha256: `sha256:${"f".repeat(64)}`,
+    }],
+  };
+  return {
+    provider_app_slug: CODEX_APP.slug,
+    head_sha: HEAD,
+    pre: structuredClone(receipt),
+    post: structuredClone(receipt),
+    stable: true,
+  };
+}
+
+function automaticRecoveryIssueComment(id, overrides = {}) {
+  return {
+    id,
+    node_id: `IC_${id}`,
+    url: `https://api.github.test/repos/owner/repo/issues/comments/${id}`,
+    html_url: `https://github.com/owner/repo/pull/7#issuecomment-${id}`,
+    issue_url: "https://api.github.test/repos/owner/repo/issues/7",
+    author: HUMAN_ACTOR,
+    app: null,
+    author_association: "MEMBER",
+    body: "ordinary comment",
+    created_at: TIME,
+    updated_at: TIME,
+    ...overrides,
+  };
+}
+
+function automaticRecoveryExactArtifact(
+  artifact,
+  serverTime,
+  rawBodySha256 = `sha256:${"f".repeat(64)}`,
+) {
+  return {
+    selector: { kind: "issue_comment", id: artifact.id },
+    artifact: structuredClone(artifact),
+    response_server_time: serverTime,
+    raw_body_sha256: rawBodySha256,
+  };
+}
+
+async function loadAutomaticRecoveryProviderArtifactHandle({
+  request,
+  snapshots,
+  server_time: serverTime,
+  on_read: onRead = () => {},
+}) {
+  const rawArtifact = snapshots.providerArtifacts.find((artifact) =>
+    String(artifact.id) === request.selector.id);
+  assert.notEqual(rawArtifact, undefined);
+  return loadV2ProviderPreScopeArtifact({
+    fetch: async () => {
+      onRead();
+      return response(
+        200,
+        rawArtifact,
+        new Date(serverTime).toUTCString(),
+      );
+    },
+    token: SYNTHETIC_BEARER,
+    restBaseUrl: "https://api.github.test",
+    ...request,
+  });
+}
+
+async function loadAutomaticRecoveryProviderArtifactHandles({
+  ledger,
+  fixture,
+  transport,
+  snapshots,
+  server_time: serverTime = null,
+  on_read: onRead = () => {},
+}) {
+  assert.equal(transport.operation, "loadV2ProviderPreScopeArtifacts");
+  assert.equal(transport.requests.length, transport.expected_count);
+  const readBoundary = (await ledger.load()).post_ref.server_time;
+  if (serverTime === null) fixture.advanceServerTime(1);
+  const pointReadTime = serverTime ?? new Date(
+    Date.parse(readBoundary) + 1000,
+  ).toISOString();
+  return Promise.all(transport.requests.map((request) =>
+    loadAutomaticRecoveryProviderArtifactHandle({
+      request,
+      snapshots,
+      server_time: pointReadTime,
+      on_read: onRead,
+    })));
+}
+
+function automaticRecoveryActorPermission(comment, serverTime) {
+  const receipt = {
+    subject: { kind: "issue_comment", id: comment.id },
+    actor: structuredClone(comment.author),
+    effective_permission: "write",
+    role_name: "write",
+    permissions: {
+      admin: false,
+      maintain: false,
+      push: true,
+      triage: true,
+      pull: true,
+    },
+    mapping_source: "user.permissions",
+    permission_assurance: "point-in-time-only",
+    request_time_permission: "unproven",
+    permission_aba_excluded: false,
+    endpoint:
+      "https://api.github.test/repos/owner/repo/collaborators/reviewer/permission",
+    http_status: 200,
+    response_server_time: serverTime,
+    raw_body_sha256: `sha256:${"f".repeat(64)}`,
+  };
+  return {
+    subject: structuredClone(receipt.subject),
+    actor: structuredClone(comment.author),
+    assurance: "point-in-time-only",
+    request_time_permission: "unproven",
+    permission_aba_excluded: false,
+    stable: true,
+    pre: structuredClone(receipt),
+    post: structuredClone(receipt),
+  };
+}
+
+function sequentialRecoveryTransport(discovery, evidence) {
+  const snapshots = [discovery, evidence];
+  return {
+    async loadSnapshot() {
+      const next = snapshots.shift();
+      if (next === undefined) throw new Error("unexpected recovery reread");
+      return structuredClone(next);
+    },
+  };
 }
 
 function effectAttemptRecord({
@@ -7482,7 +11705,12 @@ function artifactBindingIntent({
   lease,
   generation,
   requestBindingRecordOid,
+  requestId = "71",
+  requestNodeId = "IC_71",
+  artifactSelector = { kind: "pull_request_review", id: "9001" },
+  observedAt = TIME,
 }) {
+  const identity = `${artifactSelector.kind}-${artifactSelector.id}`;
   return createV2GitLedgerRecord({
     record_type: "effect-intent",
     predecessor_commit_sha: predecessor,
@@ -7491,9 +11719,11 @@ function artifactBindingIntent({
     base_ref_oid: BASE,
     potential_merge_commit_oid: POTENTIAL,
     kind: "artifact-binding",
-    effect_id: `artifact-binding-${requestBindingRecordOid.slice(0, 12)}`,
-    idempotency_key: `artifact-binding-key-${requestBindingRecordOid.slice(0, 12)}`,
-    server_observed_at: TIME,
+    effect_id:
+      `artifact-binding-${identity}-${requestBindingRecordOid.slice(0, 12)}`,
+    idempotency_key:
+      `artifact-binding-key-${identity}-${requestBindingRecordOid.slice(0, 12)}`,
+    server_observed_at: observedAt,
     payload: effectPayload({
       phase: "intent",
       kind: "artifact-binding",
@@ -7502,11 +11732,21 @@ function artifactBindingIntent({
       action: {
         generation_id: generation.generation_id,
         request_binding_record_oid: requestBindingRecordOid,
-        request_id: "71",
-        request_node_id: "IC_71",
-        artifact_selector: { kind: "pull_request_review", id: "9001" },
+        request_id: requestId,
+        request_node_id: requestNodeId,
+        artifact_selector: structuredClone(artifactSelector),
         expected_actor: CODEX_ACTOR,
         expected_app: CODEX_APP,
+        scheduler_observation_record_oid: "8".repeat(40),
+        full_scope_receipt_digest: digest("8"),
+        candidate_authority: automaticRecoveryArtifactCandidateItemAuthority({
+          generation,
+          requestBindingRecordOid,
+          requestId,
+          requestNodeId,
+          artifactSelector,
+          observedAt,
+        }),
       },
     }),
     control_comment_binding: null,
@@ -7518,6 +11758,9 @@ function artifactBindingResponse({
   intentRecord,
   intentCommitSha,
   artifactCreatedAt,
+  artifactNodeId = "PRR_9001",
+  artifactUrl =
+    "https://github.com/owner/repo/pull/7#pullrequestreview-9001",
 }) {
   const providerServerTime = new Date(
     Date.parse(artifactCreatedAt) + 1000,
@@ -7538,16 +11781,18 @@ function artifactBindingResponse({
       intentCommitSha,
       action: intentRecord.payload.action,
       receipt: {
-        generation_id: "automatic:1",
+        http_status: 200,
+        generation_id: intentRecord.payload.generation.generation_id,
         request_binding_record_oid:
           intentRecord.payload.action.request_binding_record_oid,
-        request_id: "71",
-        request_node_id: "IC_71",
-        artifact_selector: { kind: "pull_request_review", id: "9001" },
-        artifact_node_id: "PRR_9001",
-        artifact_url:
-          "https://github.com/owner/repo/pull/7#pullrequestreview-9001",
-        artifact_type: "pull_request_review",
+        request_id: intentRecord.payload.action.request_id,
+        request_node_id: intentRecord.payload.action.request_node_id,
+        artifact_selector: structuredClone(
+          intentRecord.payload.action.artifact_selector,
+        ),
+        artifact_node_id: artifactNodeId,
+        artifact_url: artifactUrl,
+        artifact_type: intentRecord.payload.action.artifact_selector.kind,
         artifact_created_at: artifactCreatedAt,
         server_time: providerServerTime,
         raw_body_sha256: `sha256:${"7".repeat(64)}`,
@@ -8345,6 +12590,51 @@ function recordPlan(record) {
   return structuredClone(plan);
 }
 
+function recordFromFixtureEnvelope(envelope) {
+  return createV2GitLedgerRecord({
+    record_type: envelope.record_type,
+    predecessor_commit_sha: envelope.predecessor_commit_sha,
+    pull_request: structuredClone(envelope.pull_request),
+    head_ref_oid: envelope.head_ref_oid,
+    base_ref_oid: envelope.base_ref_oid,
+    potential_merge_commit_oid: envelope.potential_merge_commit_oid,
+    kind: envelope.kind,
+    effect_id: envelope.effect_id,
+    idempotency_key: envelope.idempotency_key,
+    server_observed_at: envelope.server_observed_at,
+    payload: structuredClone(envelope.payload),
+    control_comment_binding:
+      structuredClone(envelope.control_comment_binding),
+    lease: structuredClone(envelope.lease),
+  });
+}
+
+function fixtureAutomaticRecoveryArtifactReachabilityBoundary({
+  intentRecord,
+  intentRecordOid,
+  boundaryTipRecordOid,
+  refReceipt: refReceiptValue,
+}) {
+  const withoutDigest = {
+    schema:
+      "codex-review-gate-git-ledger-automatic-recovery-artifact-reachability-v2",
+    schema_version: 1,
+    intent_record_oid: intentRecordOid,
+    scheduler_observation_record_oid:
+      intentRecord.payload.action.scheduler_observation_record_oid,
+    lease_acquire_commit_sha: intentRecord.lease.acquire_commit_sha,
+    boundary_tip_record_oid: boundaryTipRecordOid,
+    ref_receipt: structuredClone(refReceiptValue),
+  };
+  return {
+    ...withoutDigest,
+    boundary_digest: digestCanonical(
+      "codex-review-gate-v2-automatic-recovery-artifact-reachability",
+      withoutDigest,
+    ),
+  };
+}
+
 function githubGitFixture() {
   const calls = [];
   const blobs = new Map();
@@ -8356,6 +12646,8 @@ function githubGitFixture() {
   let refRereadOverride = null;
   let failAttestationUpdate = false;
   let failEffectUpdateKind = null;
+  let failRereadAfterEffectUpdate = null;
+  let failRefReadOnce = false;
   let failCandidateDispatchPhase = null;
   let moveRefOnCommitRead = false;
   let serverTimeFrozen = false;
@@ -8372,11 +12664,15 @@ function githubGitFixture() {
     mismatchNextRefReread() { mismatchReread = true; },
     failNextAttestationUpdate() { failAttestationUpdate = true; },
     failNextEffectUpdate(kind) { failEffectUpdateKind = kind; },
+    failRereadAfterEffectUpdate(kind, occurrence = 1) {
+      failRereadAfterEffectUpdate = { kind, remaining: occurrence };
+    },
     failNextCandidateDispatchUpdate(phase) {
       failCandidateDispatchPhase = phase;
     },
     advanceServerTime(seconds) { second += seconds; },
     freezeServerTime() { serverTimeFrozen = true; },
+    resumeServerTime() { serverTimeFrozen = false; },
     moveRefToParentOnNextCommitRead() { moveRefOnCommitRead = true; },
     tipRecordType() { return recordType(refTarget); },
     rewriteTipText(mutator) {
@@ -8514,6 +12810,16 @@ function githubGitFixture() {
         }
         const old = refTarget;
         refTarget = body.sha;
+        if (
+          failRereadAfterEffectUpdate !== null &&
+          recordEnvelope(body.sha).kind === failRereadAfterEffectUpdate.kind
+        ) {
+          failRereadAfterEffectUpdate.remaining -= 1;
+          if (failRereadAfterEffectUpdate.remaining === 0) {
+            failRereadAfterEffectUpdate = null;
+            failRefReadOnce = true;
+          }
+        }
         if (mismatchReread) {
           refRereadOverride = old;
           mismatchReread = false;
@@ -8521,6 +12827,14 @@ function githubGitFixture() {
         return response(200, refBody(refTarget), date);
       }
       if (init.method === "GET" && path === "/git/ref/heads/codex-review-gate-ledger-v2") {
+        if (failRefReadOnce) {
+          failRefReadOnce = false;
+          return response(500, {
+            message: "Internal Server Error",
+            documentation_url: "https://docs.github.com/rest",
+            status: "500",
+          }, date);
+        }
         if (refTarget === null) {
           return response(404, {
             message: "Not Found",

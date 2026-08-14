@@ -19,6 +19,23 @@ const TREE = sha("d");
 const FINGERPRINT = digest("a");
 const SERVER_TIME = "2026-08-13T12:00:00.000Z";
 
+function schedulerPostAction(generationIndex = 1, overrides = {}) {
+  const generationId = `automatic:${generationIndex}`;
+  return {
+    kind: "post_review_request",
+    idempotency_key: `post-review-request:${generationId}:${digest("a")}`,
+    intent_id: `auto-request:${generationId}:${digest("b")}`,
+    generation_id: generationId,
+    generation_index: generationIndex,
+    recovery_authority: null,
+    depends_on_idempotency_key:
+      `persist-auto-request-intent:${generationId}:${digest("c")}`,
+    retry_limit: 0,
+    record_attempt_before_effect: true,
+    ...overrides,
+  };
+}
+
 test("test-merge status planning writes pending only to head and terminal only to merge", () => {
   const target = {
     mode: "test-merge-with-head-sentinel",
@@ -172,17 +189,12 @@ test("prepare creates a consumed retry-zero reservation without posting", () => 
   const reservation = prepareV2Request({
     snapshot,
     head_ledger: makeLedger(snapshot),
-    scheduler_post_action: {
-      kind: "post_review_request",
-      intent_id: "scheduler-intent",
-      retry_limit: 0,
-      record_attempt_before_effect: true,
-    },
+    scheduler_post_action: schedulerPostAction(),
   });
 
   assert.equal(reservation.body, V2_REQUEST_BODY);
   assert.equal(reservation.ordinal, 1);
-  assert.equal(reservation.scheduler_intent_id, "scheduler-intent");
+  assert.equal(reservation.scheduler_intent_id, schedulerPostAction().intent_id);
   assert.match(reservation.attempt_id, /^v2-attempt:[0-9a-f]{64}$/u);
   assert.equal(reservation.automatic, true);
   assert.equal(reservation.consumed, true);
@@ -195,12 +207,7 @@ test("prepare creates a consumed retry-zero reservation without posting", () => 
     () => prepareV2Request({
       snapshot,
       head_ledger: makeLedger(snapshot, { automatic_request_count: 3 }),
-      scheduler_post_action: {
-        kind: "post_review_request",
-        intent_id: "scheduler-intent",
-        retry_limit: 0,
-        record_attempt_before_effect: true,
-      },
+      scheduler_post_action: schedulerPostAction(),
     }),
     /consumed 3 automatic reservations/u,
   );
@@ -208,12 +215,7 @@ test("prepare creates a consumed retry-zero reservation without posting", () => 
     () => prepareV2Request({
       snapshot,
       head_ledger: makeLedger(snapshot),
-      scheduler_post_action: {
-        kind: "post_review_request",
-        intent_id: "scheduler-intent",
-        retry_limit: 1,
-        record_attempt_before_effect: true,
-      },
+      scheduler_post_action: schedulerPostAction(1, { retry_limit: 1 }),
     }),
     /retry-zero/u,
   );
@@ -222,12 +224,7 @@ test("prepare creates a consumed retry-zero reservation without posting", () => 
 test("automatic generation two requires a prior-generation recovery authority", () => {
   const snapshot = makeSnapshot();
   const ledger = makeLedger(snapshot, { automatic_request_count: 1 });
-  const action = {
-    kind: "post_review_request",
-    intent_id: "scheduler-intent-2",
-    retry_limit: 0,
-    record_attempt_before_effect: true,
-  };
+  const action = schedulerPostAction(2);
   assert.throws(
     () => prepareV2Request({ snapshot, head_ledger: ledger, scheduler_post_action: action }),
     /recovery_authority/u,
@@ -235,15 +232,14 @@ test("automatic generation two requires a prior-generation recovery authority", 
   const reservation = prepareV2Request({
     snapshot,
     head_ledger: ledger,
-    scheduler_post_action: {
-      ...action,
+    scheduler_post_action: schedulerPostAction(2, {
       recovery_authority: {
         prior_generation_id: "automatic:1",
         finding_ids: ["finding-1"],
         closure_ids: ["closure-1"],
         closure_observed_at: "2026-08-13T11:59:59.000Z",
       },
-    },
+    }),
   });
   assert.equal(reservation.generation_id, "automatic:2");
   assert.equal(reservation.generation_index, 2);
@@ -255,12 +251,7 @@ test("bind requires exact 201, exact request body, stable scope, and exact refet
   const reservation = prepareV2Request({
     snapshot,
     head_ledger: makeLedger(snapshot),
-    scheduler_post_action: {
-      kind: "post_review_request",
-      intent_id: "scheduler-intent",
-      retry_limit: 0,
-      record_attempt_before_effect: true,
-    },
+    scheduler_post_action: schedulerPostAction(),
   });
   const postResponse = makePostResponse(reservation);
   const artifact = normalizedCreatedComment();
@@ -345,12 +336,7 @@ test("bind rejects replay, missing attempt authority, and post-hoc causal orderi
   const reservation = prepareV2Request({
     snapshot,
     head_ledger: makeLedger(snapshot),
-    scheduler_post_action: {
-      kind: "post_review_request",
-      intent_id: "scheduler-intent",
-      retry_limit: 0,
-      record_attempt_before_effect: true,
-    },
+    scheduler_post_action: schedulerPostAction(),
   });
   const postResponse = makePostResponse(reservation);
   const exactArtifact = {
@@ -381,6 +367,8 @@ test("bind rejects replay, missing attempt authority, and post-hoc causal orderi
       snapshot,
       scheduler_automatic_request: {
         state: "intent-persisted",
+        generation_index: reservation.generation_index,
+        recovery_authority: reservation.recovery_authority,
         intent_id: reservation.scheduler_intent_id,
         intent_persisted_at: reservation.created_at,
         effect_attempted_at: null,
@@ -478,6 +466,40 @@ test("prepare can publish an automatic decision without inventing a request", as
     [{ sha: MERGE, state: "success" }],
   );
   assert.equal(output.scheduler_evaluation.decision, "clean");
+});
+
+test("prepare preserves one durable intent for the ledger recovery builder", async () => {
+  const snapshot = makeSnapshot();
+  const postAction = schedulerPostAction(1);
+  const input = makeRunnerInput({ operation: "prepare-request", snapshot });
+  input.head_ledger = makeLedger(snapshot, { automatic_request_count: 1 });
+  input.scheduling.epoch.automatic_request = {
+    state: "intent-persisted",
+    generation_index: 1,
+    recovery_authority: null,
+    intent_id: postAction.intent_id,
+    intent_persisted_at: "2026-08-13T11:59:59.000Z",
+    effect_attempted_at: null,
+  };
+  const dependencies = {
+    transport: { async loadSnapshot() { return snapshot; } },
+    reduceSnapshot: () => makeReducerReport(snapshot, "pending"),
+    ...fakeProjectionDependencies(),
+    planActions: () => ({ actions: [postAction] }),
+  };
+  const output = await runV2Operation(input, dependencies);
+  assert.deepEqual(output.scheduler_plan.actions, [postAction]);
+  assert.equal(output.reservation, null);
+  assert.equal(output.post_intent, null);
+  assert.equal(output.writes_performed, false);
+
+  await assert.rejects(
+    runV2Operation(input, {
+      ...dependencies,
+      planActions: () => ({ actions: [schedulerPostAction(2)] }),
+    }),
+    (error) => error.code === "SCHEDULER_GENERATION_MISMATCH",
+  );
 });
 
 test("scheduler suppression and reducer epoch binding remain authoritative", async () => {
@@ -603,6 +625,8 @@ function makeRunnerInput({ operation, snapshot }) {
         controlled_request: null,
         automatic_request: {
           state: "available",
+          generation_index: 1,
+          recovery_authority: null,
           intent_id: null,
           intent_persisted_at: null,
           effect_attempted_at: null,
@@ -881,6 +905,8 @@ function makePostResponse(reservation) {
 function attemptedSchedulerState(reservation) {
   return {
     state: "effect-attempted",
+    generation_index: reservation.generation_index,
+    recovery_authority: reservation.recovery_authority,
     intent_id: reservation.scheduler_intent_id,
     intent_persisted_at: reservation.created_at,
     effect_attempted_at: reservation.created_at,

@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+
+import {
+  isExactV2CodexProviderIdentity,
+} from "../core.mjs";
 
 import {
   V2_SCHEDULER_SCHEMA,
@@ -18,9 +23,11 @@ import {
   validateStatusTarget,
 } from "./transport.mjs";
 import {
+  projectV2AutomaticRequestRecoveryAuthority,
   projectV2PublicReport,
   validateV2PublicReportSelectionAuthority,
 } from "./public-report-projector.mjs";
+import { reduceV2Snapshot } from "./reducer.mjs";
 
 export const V2_RUNNER_SCHEMA = "codex-review-gate-runner-v2";
 export const V2_RUNNER_SCHEMA_VERSION = 1;
@@ -31,8 +38,15 @@ export const V2_REQUEST_BINDING_SCHEMA =
 export const V2_REQUEST_ATTEMPT_SCHEMA =
   "codex-review-gate-request-attempt-v2";
 export const V2_HEAD_LEDGER_SCHEMA = "codex-review-gate-head-ledger-v2";
+export const V2_AUTOMATIC_REQUEST_RECOVERY_HANDLE_SCHEMA =
+  "codex-review-gate-runner-automatic-request-recovery-handle-v2";
+export const V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLE_SCHEMA =
+  "codex-review-gate-runner-automatic-recovery-artifact-binding-candidate-handle-v2";
 export const V2_REQUEST_BODY = "@codex review";
 export const MAX_AUTOMATIC_REQUESTS_PER_HEAD = 3;
+// The exact-evidence selector cap is 256; one controlled request selector is
+// always present, leaving at most 255 distinct recovery artifact carriers.
+export const MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATES = 255;
 
 export const V2_OPERATIONS = Object.freeze([
   "prepare-request",
@@ -182,6 +196,10 @@ const STRICT_UTC_TIMESTAMP =
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const DECIMAL_ID_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
+const AUTOMATIC_REQUEST_RECOVERY_HANDLES = new WeakMap();
+const RUNNER_RESULT_RECOVERY_HANDLES = new WeakMap();
+const AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLES = new WeakMap();
+const RUNNER_RESULT_ARTIFACT_BINDING_CANDIDATE_HANDLES = new WeakMap();
 
 /**
  * Run one v2 operation. This function performs only read transport calls.
@@ -302,12 +320,21 @@ export async function runV2Operation(rawInput, rawDependencies) {
     const postAction = schedulerPlan.actions.find((action) =>
       action.kind === "post_review_request");
     if (postAction !== undefined) {
-      reservation = prepareV2Request({
-        snapshot: evidenceSnapshot,
-        head_ledger: input.head_ledger,
-        scheduler_post_action: postAction,
-      });
-      postIntent = buildPostIntent(reservation);
+      if (input.scheduling.epoch.automatic_request.state === "intent-persisted") {
+        validateRecoveredV2PostAction({
+          snapshot: evidenceSnapshot,
+          head_ledger: input.head_ledger,
+          scheduler_post_action: postAction,
+          automatic_request: input.scheduling.epoch.automatic_request,
+        });
+      } else {
+        reservation = prepareV2Request({
+          snapshot: evidenceSnapshot,
+          head_ledger: input.head_ledger,
+          scheduler_post_action: postAction,
+        });
+        postIntent = buildPostIntent(reservation);
+      }
     }
   } else if (input.operation === "bind-request") {
     const exactArtifact = dependencies.getExactArtifact(evidenceSnapshot, {
@@ -335,7 +362,7 @@ export async function runV2Operation(rawInput, rawDependencies) {
     );
   }
 
-  return deepFreeze({
+  const result = deepFreeze({
     schema: V2_RUNNER_SCHEMA,
     schema_version: V2_RUNNER_SCHEMA_VERSION,
     operation: input.operation,
@@ -350,6 +377,390 @@ export async function runV2Operation(rawInput, rawDependencies) {
     binding_receipt: bindingReceipt,
     writes_performed: false,
     freshness_assurance: "point-in-time",
+  });
+  const currentAutomaticGenerationIndex =
+    input.scheduling.epoch.automatic_request.generation_index;
+  const selectedAutomaticRequestIsCurrent =
+    input.scheduling.epoch.controlled_request !== null &&
+    reducerReport.request_policy.status === "compliant" &&
+    reducerReport.request_policy.generation_kind === "automatic" &&
+    reducerReport.request_policy.generation_id ===
+      `automatic:${currentAutomaticGenerationIndex}` &&
+    reducerReport.request_policy.generation_index ===
+      currentAutomaticGenerationIndex;
+  const recoveryAuthority =
+    reducerReport.decision === "findings" &&
+    selectedAutomaticRequestIsCurrent
+      ? projectV2AutomaticRequestRecoveryAuthority({
+          compact_report: reducerReport,
+          reducer_input: projectedSnapshot,
+          discovery_snapshot: discoverySnapshot,
+          evidence_snapshot: evidenceSnapshot,
+          controller: projectionController,
+          controlled_request: input.scheduling.epoch.controlled_request,
+        })
+      : null;
+  const recoveryHandle = recoveryAuthority === null
+    ? null
+    : deepFreeze({
+        schema: V2_AUTOMATIC_REQUEST_RECOVERY_HANDLE_SCHEMA,
+        schema_version: V2_RUNNER_SCHEMA_VERSION,
+        authority_digest: recoveryAuthority.authority_digest,
+      });
+  if (recoveryHandle !== null) {
+    AUTOMATIC_REQUEST_RECOVERY_HANDLES.set(recoveryHandle, {
+      runner_result: result,
+      evidence_snapshot: evidenceSnapshot,
+      reducer_input: projectedSnapshot,
+      authority: recoveryAuthority,
+    });
+  }
+  RUNNER_RESULT_RECOVERY_HANDLES.set(result, recoveryHandle);
+  const artifactBindingCandidateAuthority =
+    selectedAutomaticRequestIsCurrent
+      ? projectAutomaticRecoveryArtifactBindingCandidateAuthority({
+          compact_report: reducerReport,
+          reducer_input: projectedSnapshot,
+          discovery_snapshot: discoverySnapshot,
+          evidence_snapshot: evidenceSnapshot,
+          controller: projectionController,
+          controlled_request: input.scheduling.epoch.controlled_request,
+          scheduler_evaluation: schedulerInput.evaluation,
+        })
+      : null;
+  const artifactBindingCandidateHandle =
+    artifactBindingCandidateAuthority === null
+      ? null
+      : deepFreeze({
+          schema:
+            V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLE_SCHEMA,
+          schema_version: V2_RUNNER_SCHEMA_VERSION,
+          authority_digest: artifactBindingCandidateAuthority.authority_digest,
+        });
+  if (artifactBindingCandidateHandle !== null) {
+    AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLES.set(
+      artifactBindingCandidateHandle,
+      {
+        runner_result: result,
+        authority: artifactBindingCandidateAuthority,
+      },
+    );
+  }
+  RUNNER_RESULT_ARTIFACT_BINDING_CANDIDATE_HANDLES.set(
+    result,
+    artifactBindingCandidateHandle,
+  );
+  return result;
+}
+
+export function getV2AutomaticRequestRecoveryHandle(runnerResult) {
+  if (!RUNNER_RESULT_RECOVERY_HANDLES.has(runnerResult)) {
+    throw new TypeError(
+      "automatic request recovery requires the exact runner result object",
+    );
+  }
+  return RUNNER_RESULT_RECOVERY_HANDLES.get(runnerResult);
+}
+
+export function assertV2AutomaticRequestRecoveryHandle(
+  handle,
+  { runner_result: runnerResult } = {},
+) {
+  const binding = AUTOMATIC_REQUEST_RECOVERY_HANDLES.get(handle);
+  if (binding === undefined) {
+    throw new TypeError(
+      "automatic request recovery requires an opaque recovery handle",
+    );
+  }
+  assertRecord(handle, "automatic_request_recovery_handle");
+  assertClosedRecord(handle, [
+    "schema",
+    "schema_version",
+    "authority_digest",
+  ], "automatic_request_recovery_handle");
+  if (
+    handle.schema !== V2_AUTOMATIC_REQUEST_RECOVERY_HANDLE_SCHEMA ||
+    handle.schema_version !== V2_RUNNER_SCHEMA_VERSION ||
+    handle.authority_digest !== binding.authority.authority_digest
+  ) {
+    throw new TypeError(
+      "automatic request recovery opaque handle is structurally invalid",
+    );
+  }
+  if (runnerResult !== undefined && binding.runner_result !== runnerResult) {
+    throw new TypeError(
+      "automatic request recovery handle differs from its exact runner result",
+    );
+  }
+  return handle;
+}
+
+export function projectV2AutomaticRequestRecoveryForGitLedger(handle) {
+  const binding = AUTOMATIC_REQUEST_RECOVERY_HANDLES.get(
+    assertV2AutomaticRequestRecoveryHandle(handle),
+  );
+  return deepFreeze(structuredClone(binding.authority));
+}
+
+export function getV2AutomaticRecoveryArtifactBindingCandidateHandle(
+  runnerResult,
+) {
+  if (!RUNNER_RESULT_ARTIFACT_BINDING_CANDIDATE_HANDLES.has(runnerResult)) {
+    throw new TypeError(
+      "automatic recovery artifact binding requires the exact runner result object",
+    );
+  }
+  return RUNNER_RESULT_ARTIFACT_BINDING_CANDIDATE_HANDLES.get(runnerResult);
+}
+
+export function assertV2AutomaticRecoveryArtifactBindingCandidateHandle(
+  handle,
+  { runner_result: runnerResult } = {},
+) {
+  const binding =
+    AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLES.get(handle);
+  if (binding === undefined) {
+    throw new TypeError(
+      "automatic recovery artifact binding requires an opaque candidate handle",
+    );
+  }
+  assertRecord(handle, "automatic_recovery_artifact_binding_candidate_handle");
+  assertClosedRecord(handle, [
+    "schema",
+    "schema_version",
+    "authority_digest",
+  ], "automatic_recovery_artifact_binding_candidate_handle");
+  if (
+    handle.schema !==
+      V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLE_SCHEMA ||
+    handle.schema_version !== V2_RUNNER_SCHEMA_VERSION ||
+    handle.authority_digest !== binding.authority.authority_digest
+  ) {
+    throw new TypeError(
+      "automatic recovery artifact binding candidate handle is structurally invalid",
+    );
+  }
+  if (runnerResult !== undefined && binding.runner_result !== runnerResult) {
+    throw new TypeError(
+      "automatic recovery artifact binding candidate differs from its exact runner result",
+    );
+  }
+  return handle;
+}
+
+export function projectV2AutomaticRecoveryArtifactBindingCandidateForGitLedger(
+  handle,
+) {
+  const binding = AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLES.get(
+    assertV2AutomaticRecoveryArtifactBindingCandidateHandle(handle),
+  );
+  return deepFreeze(structuredClone(binding.authority));
+}
+
+function projectAutomaticRecoveryArtifactBindingCandidateAuthority({
+  compact_report: compactReport,
+  reducer_input: reducerInput,
+  discovery_snapshot: discoverySnapshot,
+  evidence_snapshot: evidenceSnapshot,
+  controller,
+  controlled_request: controlledRequest,
+  scheduler_evaluation: schedulerEvaluation,
+}) {
+  if (
+    compactReport.decision !== "findings" ||
+    compactReport.evidence_basis?.kind !== "terminal-findings" ||
+    controlledRequest === null
+  ) {
+    return null;
+  }
+  const canonicalInput = projectV2TransportSnapshots({
+    discovery_snapshot: discoverySnapshot,
+    evidence_snapshot: evidenceSnapshot,
+    controller,
+  });
+  if (!isDeepStrictEqual(canonicalInput, reducerInput)) return null;
+  const canonicalReport = reduceV2Snapshot(canonicalInput, {
+    status_target_mode: compactReport.status_target.mode,
+    status_context: compactReport.status_target.context,
+  });
+  if (!isDeepStrictEqual(canonicalReport, compactReport)) return null;
+  const selectedRequest = canonicalInput.requests.find((request) =>
+    request.id === controlledRequest.request_id);
+  if (
+    selectedRequest === undefined ||
+    compactReport.request_policy.status !== "compliant" ||
+    compactReport.request_policy.selected_request_id !== selectedRequest.id ||
+    selectedRequest.kind !== "automatic" ||
+    selectedRequest.controlled !== true ||
+    selectedRequest.stable !== true ||
+    selectedRequest.body !== V2_REQUEST_BODY ||
+    selectedRequest.created_at !== selectedRequest.updated_at ||
+    selectedRequest.created_at !== controlledRequest.bound_at ||
+    selectedRequest.head_oid !== canonicalInput.review_epoch.head_oid ||
+    selectedRequest.generation_kind !== "automatic" ||
+    selectedRequest.generation_id !==
+      `automatic:${selectedRequest.generation_index}` ||
+    selectedRequest.generation_index < 1 ||
+    selectedRequest.generation_index >= MAX_AUTOMATIC_REQUESTS_PER_HEAD
+  ) {
+    return null;
+  }
+  const exactRequest = evidenceSnapshot.pages.exact_artifacts.find((entry) =>
+    entry.selector.kind === "issue_comment" &&
+    entry.selector.id === selectedRequest.id);
+  const rawRequest = evidenceSnapshot.pages.issue_comments.find((entry) =>
+    entry.id === selectedRequest.id);
+  if (
+    exactRequest === undefined || rawRequest === undefined ||
+    !isDeepStrictEqual(exactRequest.artifact, rawRequest) ||
+    rawRequest.node_id.length === 0 ||
+    rawRequest.html_url !== selectedRequest.url ||
+    rawRequest.body !== V2_REQUEST_BODY ||
+    rawRequest.created_at !== rawRequest.updated_at ||
+    rawRequest.created_at !== selectedRequest.created_at
+  ) {
+    return null;
+  }
+  const postRequestFindings = canonicalInput.artifacts
+    .filter((artifact) =>
+      artifact.kind === "terminal-findings" &&
+      artifact.commit_oid === canonicalInput.review_epoch.head_oid &&
+      Date.parse(artifact.created_at) > Date.parse(selectedRequest.created_at))
+    .sort((left, right) =>
+      Date.parse(left.created_at) - Date.parse(right.created_at) ||
+      (BigInt(left.id) < BigInt(right.id)
+        ? -1
+        : BigInt(left.id) > BigInt(right.id) ? 1 : 0));
+  if (
+    postRequestFindings.length === 0 ||
+    !postRequestFindings.some((artifact) =>
+      artifact.id === compactReport.evidence_basis.artifact_id) ||
+    postRequestFindings.some((artifact) =>
+      artifact.stable !== true ||
+      (artifact.request_id !== null &&
+        artifact.request_id !== selectedRequest.id))
+  ) {
+    return null;
+  }
+  const unboundFindings = postRequestFindings.filter((artifact) =>
+    artifact.request_id === null);
+  if (unboundFindings.length === 0) return null;
+  if (unboundFindings.length >
+      MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATES) {
+    throw runnerError(
+      "AUTOMATIC_RECOVERY_ARTIFACT_CANDIDATE_LIMIT_EXCEEDED",
+      "automatic recovery artifact candidates exceed the exact-selector budget",
+    );
+  }
+  let expectedActor = null;
+  let expectedApp = null;
+  const candidates = unboundFindings.map((artifact, index) => {
+    const selectorKind = artifact.channel === "issue-comment"
+      ? "issue_comment"
+      : artifact.channel === "pull-request-review"
+        ? "pull_request_review"
+        : null;
+    if (selectorKind === null) {
+      throw runnerError(
+        "AUTOMATIC_RECOVERY_ARTIFACT_CARRIER_UNSUPPORTED",
+        `finding artifact ${artifact.id} uses an unsupported carrier channel`,
+      );
+    }
+    const collection = selectorKind === "issue_comment"
+      ? evidenceSnapshot.pages.issue_comments
+      : evidenceSnapshot.pages.reviews;
+    const carrier = collection.find((item) => item.id === artifact.id);
+    const exactArtifact = evidenceSnapshot.pages.exact_artifacts.find((entry) =>
+      entry.selector.kind === selectorKind && entry.selector.id === artifact.id);
+    const carrierCreatedAt = selectorKind === "issue_comment"
+      ? carrier?.created_at
+      : carrier?.submitted_at;
+    if (
+      carrier === undefined || exactArtifact === undefined ||
+      !isDeepStrictEqual(exactArtifact.artifact, carrier) ||
+      carrier.node_id.length === 0 ||
+      carrier.html_url !== artifact.url ||
+      carrierCreatedAt !== artifact.created_at ||
+      !isExactV2CodexProviderIdentity(carrier.author, carrier.app) ||
+      Date.parse(exactArtifact.response_server_time) >
+        Date.parse(evidenceSnapshot.server_time)
+    ) {
+      throw runnerError(
+        "AUTOMATIC_RECOVERY_ARTIFACT_CANDIDATE_UNBOUND",
+        `finding artifact ${artifact.id} lacks one exact provider evidence receipt`,
+      );
+    }
+    if (expectedActor === null) {
+      expectedActor = structuredClone(carrier.author);
+      expectedApp = structuredClone(carrier.app);
+    } else if (
+      !isDeepStrictEqual(expectedActor, carrier.author) ||
+      !isDeepStrictEqual(expectedApp, carrier.app)
+    ) {
+      throw runnerError(
+        "AUTOMATIC_RECOVERY_ARTIFACT_PROVIDER_DRIFT",
+        "recovery artifacts do not share one exact provider identity",
+      );
+    }
+    const withoutDigest = {
+      index,
+      count: unboundFindings.length,
+      selector: { kind: selectorKind, id: artifact.id },
+      artifact_node_id: carrier.node_id,
+      artifact_url: carrier.html_url,
+      artifact_type: selectorKind,
+      artifact_created_at: artifact.created_at,
+      evidence_response_server_time: exactArtifact.response_server_time,
+      evidence_raw_body_sha256: exactArtifact.raw_body_sha256,
+    };
+    return {
+      ...withoutDigest,
+      candidate_digest: digestCanonical(
+        "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate",
+        withoutDigest,
+      ),
+    };
+  });
+  const scope = {
+    repository: {
+      owner: evidenceSnapshot.repository.owner,
+      name: evidenceSnapshot.repository.name,
+      node_id: evidenceSnapshot.repository.node_id,
+    },
+    pull_request: {
+      number: evidenceSnapshot.pull_request.number,
+      node_id: evidenceSnapshot.pull_request.node_id,
+    },
+    base_oid: canonicalInput.review_epoch.base_oid,
+    head_oid: canonicalInput.review_epoch.head_oid,
+    merge_base_oid: canonicalInput.review_epoch.merge_base_oid,
+  };
+  const withoutDigest = {
+    schema:
+      "codex-review-gate-runner-automatic-recovery-artifact-binding-candidate-authority-v2",
+    schema_version: V2_RUNNER_SCHEMA_VERSION,
+    decision: "findings",
+    snapshot_fingerprint: compactReport.snapshot_fingerprint,
+    review_epoch_id: schedulerEvaluation.epoch_id,
+    observed_at: evidenceSnapshot.server_time,
+    generation_id: selectedRequest.generation_id,
+    generation_index: selectedRequest.generation_index,
+    request_id: selectedRequest.id,
+    request_node_id: rawRequest.node_id,
+    request_bound_at: controlledRequest.bound_at,
+    request_binding_record_oid: controlledRequest.binding_record_oid,
+    request_binding_receipt_digest: controlledRequest.binding_receipt_digest,
+    expected_actor: expectedActor,
+    expected_app: expectedApp,
+    scope,
+    candidates,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    authority_digest: digestCanonical(
+      "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate-authority",
+      withoutDigest,
+    ),
   });
 }
 
@@ -393,17 +804,7 @@ export function buildV2AttemptReceipt({ reservation, recorded_at }) {
 export function prepareV2Request({ snapshot, head_ledger, scheduler_post_action }) {
   validateSnapshotIdentity(snapshot);
   const ledger = validateHeadLedger(head_ledger, snapshot);
-  assertRecord(scheduler_post_action, "scheduler_post_action");
-  if (
-    scheduler_post_action.kind !== "post_review_request" ||
-    scheduler_post_action.retry_limit !== 0 ||
-    scheduler_post_action.record_attempt_before_effect !== true
-  ) {
-    throw runnerError(
-      "UNSAFE_POST_ACTION",
-      "scheduler post action must be retry-zero and recorded before its effect",
-    );
-  }
+  validateSchedulerPostActionShape(scheduler_post_action);
   if (ledger.automatic_request_count >= MAX_AUTOMATIC_REQUESTS_PER_HEAD) {
     throw runnerError(
       "REQUEST_RESERVATION_EXHAUSTED",
@@ -411,8 +812,29 @@ export function prepareV2Request({ snapshot, head_ledger, scheduler_post_action 
     );
   }
   const ordinal = ledger.automatic_request_count + 1;
+  if (
+    scheduler_post_action.generation_id !== `automatic:${ordinal}` ||
+    scheduler_post_action.generation_index !== ordinal ||
+    !scheduler_post_action.intent_id.includes(`automatic:${ordinal}`) ||
+    !scheduler_post_action.idempotency_key.includes(`automatic:${ordinal}`) ||
+    !scheduler_post_action.depends_on_idempotency_key.includes(
+      `automatic:${ordinal}`,
+    )
+  ) {
+    throw runnerError(
+      "SCHEDULER_GENERATION_MISMATCH",
+      "scheduler post action does not bind the immediate automatic generation",
+    );
+  }
   const recoveryAuthority = ordinal === 1
-    ? null
+    ? scheduler_post_action.recovery_authority === null
+      ? null
+      : (() => {
+          throw runnerError(
+            "INITIAL_RECOVERY_AUTHORITY_FORBIDDEN",
+            "automatic generation 1 cannot carry recovery authority",
+          );
+        })()
     : validateRecoveryAuthority(scheduler_post_action.recovery_authority, ordinal, snapshot);
   const preScopeDigest = digestCanonical("codex-review-gate-v2-scope", scopeBinding(snapshot));
   const ledgerDigest = digestCanonical("codex-review-gate-v2-head-ledger", ledger);
@@ -484,6 +906,62 @@ export function prepareV2Request({ snapshot, head_ledger, scheduler_post_action 
       withoutDigest,
     ),
   });
+}
+
+function validateSchedulerPostActionShape(scheduler_post_action) {
+  assertClosedRecord(scheduler_post_action, [
+    "kind",
+    "idempotency_key",
+    "intent_id",
+    "generation_id",
+    "generation_index",
+    "recovery_authority",
+    "depends_on_idempotency_key",
+    "retry_limit",
+    "record_attempt_before_effect",
+  ], "scheduler_post_action");
+  if (
+    scheduler_post_action.kind !== "post_review_request" ||
+    scheduler_post_action.retry_limit !== 0 ||
+    scheduler_post_action.record_attempt_before_effect !== true
+  ) {
+    throw runnerError(
+      "UNSAFE_POST_ACTION",
+      "scheduler post action must be retry-zero and recorded before its effect",
+    );
+  }
+  return scheduler_post_action;
+}
+
+function validateRecoveredV2PostAction({
+  snapshot,
+  head_ledger,
+  scheduler_post_action,
+  automatic_request,
+}) {
+  validateSnapshotIdentity(snapshot);
+  const ledger = validateHeadLedger(head_ledger, snapshot);
+  validateSchedulerPostActionShape(scheduler_post_action);
+  const generationIndex = automatic_request.generation_index;
+  const generationId = `automatic:${generationIndex}`;
+  if (
+    automatic_request.state !== "intent-persisted" ||
+    ledger.automatic_request_count !== generationIndex ||
+    scheduler_post_action.generation_id !== generationId ||
+    scheduler_post_action.generation_index !== generationIndex ||
+    scheduler_post_action.intent_id !== automatic_request.intent_id ||
+    !scheduler_post_action.idempotency_key.includes(generationId) ||
+    !scheduler_post_action.depends_on_idempotency_key.includes(generationId) ||
+    !isDeepEqual(
+      scheduler_post_action.recovery_authority,
+      automatic_request.recovery_authority,
+    )
+  ) {
+    throw runnerError(
+      "SCHEDULER_GENERATION_MISMATCH",
+      "recovered scheduler post action differs from its durable request intent",
+    );
+  }
 }
 
 /**
@@ -1186,6 +1664,11 @@ function validateAttemptReceipt(value, reservation, schedulerRequest) {
   assertRecord(schedulerRequest, "scheduler automatic request");
   if (
     schedulerRequest.state !== "effect-attempted" ||
+    schedulerRequest.generation_index !== reservation.generation_index ||
+    !isDeepEqual(
+      schedulerRequest.recovery_authority,
+      reservation.recovery_authority,
+    ) ||
     schedulerRequest.intent_id !== reservation.scheduler_intent_id ||
     schedulerRequest.intent_persisted_at !== reservation.created_at ||
     schedulerRequest.effect_attempted_at !== value.recorded_at

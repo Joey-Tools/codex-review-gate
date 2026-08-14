@@ -29,6 +29,8 @@ import {
   V2_WORKFLOW_COMMAND_SCHEMA,
 } from "./workflow-command.mjs";
 import {
+  getV2AutomaticRecoveryArtifactBindingCandidateHandle,
+  getV2AutomaticRequestRecoveryHandle,
   runV2Operation,
   V2_RUNNER_SCHEMA,
   V2_RUNNER_SCHEMA_VERSION,
@@ -75,6 +77,7 @@ import {
 import {
   createV2GitHubCandidateInventory,
   finalizeV2CandidateInventoryCycle,
+  MAX_V2_CANDIDATE_SCAN_PASSES,
 } from "./candidate-inventory.mjs";
 import {
   assertV2ProductionRunnerAuthorityHandle,
@@ -3656,64 +3659,98 @@ async function refreshV2CandidateInventory({
   trigger_identity: triggerIdentity,
   repository_endpoint_receipt: repositoryEndpointReceipt,
 }) {
-  const candidateAuthority = loaded.authority_projection?.candidate_inventory;
-  assertObject(candidateAuthority, "candidate inventory authority");
-  const priorInventory = candidateAuthority.incomplete_cycle
-    ?.initial_inventory ??
-    candidateAuthority.completed_cycle?.final_inventory ??
-    null;
   const transport = createV2GitHubCandidateInventory({
     fetch,
     token,
     repository: candidateRepository,
     restBaseUrl,
   });
-  const initialInventory = await transport.scan({
-    prior_inventory: priorInventory,
-  });
-  await appendV2CandidateInventoryPhase({
-    command,
-    ledger,
-    phase: "cycle-start",
-    initial_inventory: initialInventory,
-    trigger_identity: triggerIdentity,
-    repository_endpoint_receipt: repositoryEndpointReceipt,
-  });
-  const shardReceipts = [];
-  for (let index = 0; index < initialInventory.shards.length; index += 1) {
-    const shardReceipt = await transport.readShard({
-      inventory: initialInventory,
-      shard_index: index,
-    });
-    shardReceipts.push(shardReceipt);
-    await appendV2CandidateInventoryPhase({
-      command,
-      ledger,
-      phase: "shard",
-      initial_inventory: initialInventory,
-      shard_receipt: shardReceipt,
-      trigger_identity: triggerIdentity,
-      repository_endpoint_receipt: repositoryEndpointReceipt,
-    });
+  const retryableDrift = new Set([
+    "CANDIDATE_INVENTORY_DRIFT",
+    "CANDIDATE_LIFECYCLE_DRIFT",
+  ]);
+  let attemptLoaded = loaded;
+  let nextInitialInventory = null;
+  for (let attempt = 1; attempt <= MAX_V2_CANDIDATE_SCAN_PASSES; attempt += 1) {
+    try {
+      const candidateAuthority =
+        attemptLoaded.authority_projection?.candidate_inventory;
+      assertObject(candidateAuthority, "candidate inventory authority");
+      const priorInventory = candidateAuthority.incomplete_cycle
+        ?.initial_inventory ??
+        candidateAuthority.completed_cycle?.final_inventory ??
+        null;
+      const initialInventory = nextInitialInventory ??
+        await transport.scan({ prior_inventory: priorInventory });
+      nextInitialInventory = null;
+      await appendV2CandidateInventoryPhase({
+        command,
+        ledger,
+        phase: "cycle-start",
+        initial_inventory: initialInventory,
+        trigger_identity: triggerIdentity,
+        repository_endpoint_receipt: repositoryEndpointReceipt,
+      });
+      const shardReceipts = [];
+      for (let index = 0; index < initialInventory.shards.length; index += 1) {
+        const shardReceipt = await transport.readShard({
+          inventory: initialInventory,
+          shard_index: index,
+        });
+        shardReceipts.push(shardReceipt);
+        await appendV2CandidateInventoryPhase({
+          command,
+          ledger,
+          phase: "shard",
+          initial_inventory: initialInventory,
+          shard_receipt: shardReceipt,
+          trigger_identity: triggerIdentity,
+          repository_endpoint_receipt: repositoryEndpointReceipt,
+        });
+      }
+      const finalInventory = await transport.scan({
+        prior_inventory: initialInventory,
+      });
+      nextInitialInventory = finalInventory;
+      const finalShardReceipts = [];
+      for (let index = 0; index < finalInventory.shards.length; index += 1) {
+        finalShardReceipts.push(await transport.readShard({
+          inventory: finalInventory,
+          shard_index: index,
+        }));
+      }
+      const cycleReceipt = finalizeV2CandidateInventoryCycle({
+        initial_inventory: initialInventory,
+        shard_receipts: shardReceipts,
+        final_inventory: finalInventory,
+        final_shard_receipts: finalShardReceipts,
+      });
+      await appendV2CandidateInventoryPhase({
+        command,
+        ledger,
+        phase: "cycle-complete",
+        initial_inventory: initialInventory,
+        final_inventory: finalInventory,
+        cycle_receipt: cycleReceipt,
+        trigger_identity: triggerIdentity,
+        repository_endpoint_receipt: repositoryEndpointReceipt,
+      });
+      return;
+    } catch (error) {
+      if (!retryableDrift.has(error?.code)) throw error;
+      if (attempt === MAX_V2_CANDIDATE_SCAN_PASSES) {
+        throw controllerFailure(
+          "CANDIDATE_INVENTORY_STABILITY_EXHAUSTED",
+          "candidate identity and lifecycle did not stabilize within the bounded scan cycle",
+          {
+            attempts: attempt,
+            last_drift_code: error.code,
+          },
+        );
+      }
+      attemptLoaded = await ledger.load();
+    }
   }
-  const finalInventory = await transport.scan({
-    prior_inventory: initialInventory,
-  });
-  const cycleReceipt = finalizeV2CandidateInventoryCycle({
-    initial_inventory: initialInventory,
-    shard_receipts: shardReceipts,
-    final_inventory: finalInventory,
-  });
-  await appendV2CandidateInventoryPhase({
-    command,
-    ledger,
-    phase: "cycle-complete",
-    initial_inventory: initialInventory,
-    final_inventory: finalInventory,
-    cycle_receipt: cycleReceipt,
-    trigger_identity: triggerIdentity,
-    repository_endpoint_receipt: repositoryEndpointReceipt,
-  });
 }
 
 async function appendV2CandidateInventoryPhase({
@@ -4019,6 +4056,29 @@ async function activateV2ProductionLedgerAuthority({
   });
 }
 
+export function assertV2InitialProductionLedgerApi(ledger) {
+  for (const [name, callback] of [
+    ["loadControlPlaneAuthority", ledger?.loadControlPlaneAuthority],
+    ["loadInitialRunnerStateAuthority", ledger?.loadInitialRunnerStateAuthority],
+    ["loadEstablishedRunnerStateAuthority",
+      ledger?.loadEstablishedRunnerStateAuthority],
+    ["appendInitialSchedulerObservation",
+      ledger?.appendInitialSchedulerObservation],
+    ["appendEstablishedSchedulerObservation",
+      ledger?.appendEstablishedSchedulerObservation],
+    ["loadNextStatusWriteIntent", ledger?.loadNextStatusWriteIntent],
+  ]) {
+    if (typeof callback !== "function") {
+      throw controllerFailure(
+        "INITIAL_RUNNER_AUTHORITY_REQUIRED",
+        `production ledger requires ${name}`,
+        { public_effects_performed: 0 },
+      );
+    }
+  }
+  return ledger;
+}
+
 async function assembleV2InitialProductionObservation({
   command,
   environment,
@@ -4029,6 +4089,7 @@ async function assembleV2InitialProductionObservation({
   preflight_handle: preflightHandle,
   handoff,
 }) {
+  assertV2InitialProductionLedgerApi(ledger);
   const graphqlUrl = defaultControllerGraphqlUrl(
     normalizeRestBase(restBaseUrl),
   );
@@ -4099,23 +4160,6 @@ async function assembleV2InitialProductionObservation({
     evaluatedScopeReceipt,
     "production full-discovery evaluated scope receipt",
   );
-  for (const [name, callback] of [
-    ["loadControlPlaneAuthority", ledger.loadControlPlaneAuthority],
-    ["loadInitialRunnerStateAuthority", ledger.loadInitialRunnerStateAuthority],
-    ["loadEstablishedRunnerStateAuthority",
-      ledger.loadEstablishedRunnerStateAuthority],
-    ["appendInitialSchedulerObservation", ledger.appendInitialSchedulerObservation],
-    ["appendEstablishedSchedulerObservation",
-      ledger.appendEstablishedSchedulerObservation],
-  ]) {
-    if (typeof callback !== "function") {
-      throw controllerFailure(
-        "INITIAL_RUNNER_AUTHORITY_REQUIRED",
-        `production ledger requires ${name}`,
-        { public_effects_performed: 0 },
-      );
-    }
-  }
   try {
     const controlPlaneAuthority = await ledger.loadControlPlaneAuthority(
       evaluatedScopeReceipt.scope,
@@ -4179,6 +4223,10 @@ async function assembleV2InitialProductionObservation({
       }),
       reduceSnapshot: reduceV2Snapshot,
     });
+    const automaticRecoveryHandle =
+      getV2AutomaticRequestRecoveryHandle(internalResult);
+    const automaticRecoveryArtifactBindingCandidateHandle =
+      getV2AutomaticRecoveryArtifactBindingCandidateHandle(internalResult);
     const schedulerAppend = establishedHistory
       ? await ledger.appendEstablishedSchedulerObservation({
           established_runner_state_authority: establishedRunnerStateAuthority,
@@ -4193,55 +4241,75 @@ async function assembleV2InitialProductionObservation({
     failurePhase = "scheduler-observation";
     lastReachableReceiptDigest = schedulerAppend.append_receipt.receipt_digest;
     const statusWriteCount = internalResult.status_plan.writes.length;
-    if (statusWriteCount > 1) {
-      throw controllerFailure(
-        "STATUS_WRITE_TRANSACTION_REQUIRED",
-        "the first production status slice accepts at most one planned write",
-        {
-          planned_status_writes: statusWriteCount,
-          public_effects_performed: 0,
-        },
-      );
-    }
-
-    let statusIntentAppend = null;
-    let statusResponseAppend = null;
-    let statusReceipt = null;
-    let statusOutcome = "not-required";
+    const statusIntentAppends = [];
+    const statusResponseAppends = [];
+    const statusReceipts = [];
+    let statusOutcome = statusWriteCount === 0 ? "not-required" : "bound";
     let ambiguityCode = null;
-    if (statusWriteCount === 1) {
-      failurePhase = "status-intent";
-      statusIntentAppend = await ledger.appendStatusWriteIntent({
-        scheduler_append: schedulerAppend,
-        status_write_index: 0,
-      });
-      lastReachableReceiptDigest =
-        statusIntentAppend.intent_append_receipt.receipt_digest;
+    if (statusWriteCount > 0) {
       const statusTransport = createV2GitHubProductionStatusTransport({
         fetch,
         token,
         restBaseUrl,
         repository: command.repository,
       });
-      failurePhase = "status-post-refetch";
-      publicEffectsPerformed = 1;
-      try {
-        statusReceipt = await statusTransport.performStatusWrite({
-          status_intent_handle: statusIntentAppend.status_intent_handle,
+      let lastStatusWriteIndex = -1;
+      for (let turn = 0; turn <= statusWriteCount; turn += 1) {
+        failurePhase = "status-intent";
+        const statusIntentAppend = await ledger.loadNextStatusWriteIntent({
+          scheduler_append: schedulerAppend,
         });
-      } catch (error) {
-        statusOutcome = "ambiguous";
-        ambiguityCode = typeof error?.code === "string"
-          ? error.code
-          : "STATUS_EFFECT_AMBIGUOUS";
-      }
-      if (statusReceipt !== null) {
+        if (statusIntentAppend === null) break;
+        if (
+          !Number.isSafeInteger(statusIntentAppend.status_write_index) ||
+          statusIntentAppend.status_write_index < 0 ||
+          statusIntentAppend.status_write_index >= statusWriteCount ||
+          statusIntentAppend.status_write_count !== statusWriteCount ||
+          statusIntentAppend.status_write_index <= lastStatusWriteIndex
+        ) {
+          throw controllerFailure(
+            "STATUS_WRITE_SEQUENCE_INVALID",
+            "the public ledger returned a non-canonical status write sequence",
+            {
+              planned_status_writes: statusWriteCount,
+              public_effects_performed: publicEffectsPerformed,
+            },
+          );
+        }
+        lastStatusWriteIndex = statusIntentAppend.status_write_index;
+        statusIntentAppends.push(statusIntentAppend);
+        lastReachableReceiptDigest =
+          statusIntentAppend.intent_append_receipt.receipt_digest;
+        failurePhase = "status-post-refetch";
+        publicEffectsPerformed += 1;
+        let statusReceipt = null;
+        try {
+          statusReceipt = await statusTransport.performStatusWrite({
+            status_intent_handle: statusIntentAppend.status_intent_handle,
+          });
+        } catch (error) {
+          statusOutcome = "ambiguous";
+          ambiguityCode = typeof error?.code === "string"
+            ? error.code
+            : "STATUS_EFFECT_AMBIGUOUS";
+        }
+        if (statusReceipt === null) {
+          await requireV2ProductionLedgerTip({
+            ledger,
+            expected_tip_commit_sha:
+              statusIntentAppend.intent_append_receipt.commit_sha,
+            phase: "status-ambiguous",
+          });
+          break;
+        }
+        statusReceipts.push(statusReceipt);
         failurePhase = "status-response";
-        statusResponseAppend = await ledger.appendStatusWriteResponse({
+        const statusResponseAppend = await ledger.appendStatusWriteResponse({
           status_intent_handle: statusIntentAppend.status_intent_handle,
           intent_append_receipt: statusIntentAppend.intent_append_receipt,
           receipt: statusReceipt,
         });
+        statusResponseAppends.push(statusResponseAppend);
         lastReachableReceiptDigest =
           statusResponseAppend.response_append_receipt.receipt_digest;
         await requireV2ProductionLedgerTip({
@@ -4250,14 +4318,16 @@ async function assembleV2InitialProductionObservation({
             statusResponseAppend.response_append_receipt.commit_sha,
           phase: "status-response",
         });
-        statusOutcome = "bound";
-      } else {
-        await requireV2ProductionLedgerTip({
-          ledger,
-          expected_tip_commit_sha:
-            statusIntentAppend.intent_append_receipt.commit_sha,
-          phase: "status-ambiguous",
-        });
+        if (turn === statusWriteCount) {
+          throw controllerFailure(
+            "STATUS_WRITE_SEQUENCE_OVERFLOW",
+            "the public ledger did not terminate the bounded status transaction",
+            {
+              planned_status_writes: statusWriteCount,
+              public_effects_performed: publicEffectsPerformed,
+            },
+          );
+        }
       }
     }
 
@@ -4266,6 +4336,117 @@ async function assembleV2InitialProductionObservation({
     const automaticRequestPlanned =
       schedulerActionKinds.includes("persist_auto_request_intent") ||
       schedulerActionKinds.includes("post_review_request");
+    const automaticRequestState =
+      runnerAuthority.scheduling.epoch.automatic_request.state;
+    const recoveredAutomaticRequestPlanned =
+      automaticRequestPlanned && automaticRequestState === "intent-persisted";
+    if (
+      recoveredAutomaticRequestPlanned &&
+      (internalResult.reservation !== null ||
+        internalResult.post_intent !== null ||
+        schedulerActionKinds.filter((kind) =>
+          kind === "post_review_request").length !== 1 ||
+        schedulerActionKinds.includes("persist_auto_request_intent"))
+    ) {
+      throw controllerFailure(
+        "RECOVERED_AUTOMATIC_REQUEST_PLAN_INVALID",
+        "intent-persisted recovery must retain one post-only scheduler action",
+        { public_effects_performed: publicEffectsPerformed },
+      );
+    }
+    let automaticRecoveryTransition = null;
+    let automaticRecoveryArtifactBindingResponse = null;
+    if (
+      automaticRecoveryHandle !== null &&
+      statusOutcome !== "ambiguous"
+    ) {
+      if (typeof ledger.appendAutomaticRequestRecoveryTransition !==
+          "function") {
+        throw controllerFailure(
+          "AUTOMATIC_RECOVERY_TRANSITION_API_REQUIRED",
+          "proved automatic recovery requires the protected-ledger transition API",
+          { public_effects_performed: publicEffectsPerformed },
+        );
+      }
+      failurePhase = "automatic-recovery-transition";
+      automaticRecoveryTransition =
+        await ledger.appendAutomaticRequestRecoveryTransition({
+          scheduler_append: schedulerAppend,
+          recovery_handle: automaticRecoveryHandle,
+        });
+      assertObject(
+        automaticRecoveryTransition,
+        "automatic request recovery transition",
+      );
+      assertObject(
+        automaticRecoveryTransition.response_record_receipt,
+        "automatic request recovery response receipt",
+      );
+      lastReachableReceiptDigest =
+        automaticRecoveryTransition.response_record_receipt.receipt_digest;
+      await requireV2ProductionLedgerTip({
+        ledger,
+        expected_tip_commit_sha:
+          automaticRecoveryTransition.response_record_receipt.commit_sha,
+        phase: "automatic-recovery-transition",
+      });
+    } else if (
+      automaticRecoveryArtifactBindingCandidateHandle !== null &&
+      statusOutcome !== "ambiguous"
+    ) {
+      if (
+        typeof ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent !==
+          "function" ||
+        typeof ledger.appendAutomaticRecoveryArtifactBindingResponse !==
+          "function"
+      ) {
+        throw controllerFailure(
+          "AUTOMATIC_RECOVERY_ARTIFACT_BINDING_API_REQUIRED",
+          "proved automatic recovery evidence requires the protected-ledger artifact-binding APIs",
+          { public_effects_performed: publicEffectsPerformed },
+        );
+      }
+      for (let transactionOrdinal = 0; transactionOrdinal < 2;
+        transactionOrdinal += 1) {
+        failurePhase = "automatic-recovery-artifact-binding-intent";
+        const artifactBindingIntent =
+          await ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: schedulerAppend,
+            artifact_binding_candidate_handle:
+              automaticRecoveryArtifactBindingCandidateHandle,
+          });
+        if (artifactBindingIntent === null) break;
+        assertObject(
+          artifactBindingIntent.ready_confirmation_append_receipt,
+          "automatic recovery artifact binding ready confirmation receipt",
+        );
+        assertObject(
+          artifactBindingIntent.latest_append_receipt,
+          "automatic recovery artifact binding latest append receipt",
+        );
+        lastReachableReceiptDigest =
+          artifactBindingIntent.latest_append_receipt.receipt_digest;
+        failurePhase = "automatic-recovery-artifact-binding-point-read";
+        automaticRecoveryArtifactBindingResponse =
+          await appendV2AutomaticRecoveryArtifactBindingToCompletion({
+            ledger,
+            artifact_binding_intent: artifactBindingIntent,
+            fetch,
+            token,
+            rest_base_url: restBaseUrl,
+          });
+        lastReachableReceiptDigest =
+          automaticRecoveryArtifactBindingResponse.response_append_receipt
+            .receipt_digest;
+        await requireV2ProductionLedgerTip({
+          ledger,
+          expected_tip_commit_sha:
+            automaticRecoveryArtifactBindingResponse.response_append_receipt
+              .commit_sha,
+          phase: "automatic-recovery-artifact-binding-response",
+        });
+      }
+    }
     let automaticReservationAppend = null;
     let reservationStatusIntentAppend = null;
     let reservationStatusResponseAppend = null;
@@ -4277,88 +4458,8 @@ async function assembleV2InitialProductionObservation({
     let automaticRequestBindingReceipt = null;
     let automaticRequestOutcome = "not-required";
     let automaticRequestAmbiguityCode = null;
-    if (automaticRequestPlanned && statusOutcome !== "ambiguous") {
-      failurePhase = "automatic-reservation";
-      automaticReservationAppend =
-        await ledger.appendAutomaticRequestReservation({
-          scheduler_append: schedulerAppend,
-        });
-      lastReachableReceiptDigest =
-        automaticReservationAppend.reservation_append_receipt.receipt_digest;
-
-      failurePhase = "reservation-status-intent";
-      reservationStatusIntentAppend =
-        await ledger.appendReservationStatusWriteIntent({
-          automatic_reservation_handle:
-            automaticReservationAppend.automatic_reservation_handle,
-          reservation_append_receipt:
-            automaticReservationAppend.reservation_append_receipt,
-        });
-      lastReachableReceiptDigest =
-        reservationStatusIntentAppend.intent_append_receipt.receipt_digest;
-      const reservationStatusTransport =
-        createV2GitHubProductionReservationStatusTransport({
-          fetch,
-          token,
-          restBaseUrl,
-          repository: command.repository,
-        });
-      failurePhase = "reservation-status-post-refetch";
-      publicEffectsPerformed += 1;
-      try {
-        reservationStatusReceipt =
-          await reservationStatusTransport.performReservationStatusWrite({
-            reservation_status_intent_handle:
-              reservationStatusIntentAppend.reservation_status_intent_handle,
-          });
-      } catch (error) {
-        reservationStatusOutcome = "ambiguous";
-        reservationStatusAmbiguityCode = typeof error?.code === "string"
-          ? error.code
-          : "RESERVATION_STATUS_EFFECT_AMBIGUOUS";
-      }
-      if (reservationStatusReceipt !== null) {
-        failurePhase = "reservation-status-response";
-        reservationStatusResponseAppend =
-          await ledger.appendReservationStatusWriteResponse({
-            reservation_status_intent_handle:
-              reservationStatusIntentAppend.reservation_status_intent_handle,
-            intent_append_receipt:
-              reservationStatusIntentAppend.intent_append_receipt,
-            receipt: reservationStatusReceipt,
-          });
-        lastReachableReceiptDigest =
-          reservationStatusResponseAppend.response_append_receipt
-            .receipt_digest;
-        await requireV2ProductionLedgerTip({
-          ledger,
-          expected_tip_commit_sha:
-            reservationStatusResponseAppend.response_append_receipt.commit_sha,
-          phase: "reservation-status-response",
-        });
-        reservationStatusOutcome = "bound";
-      } else {
-        await requireV2ProductionLedgerTip({
-          ledger,
-          expected_tip_commit_sha:
-            reservationStatusIntentAppend.intent_append_receipt.commit_sha,
-          phase: "reservation-status-ambiguous",
-        });
-      }
-
-      if (reservationStatusOutcome === "bound") {
-        failurePhase = "automatic-request-intent";
-        automaticRequestIntentAppend =
-          await ledger.appendAutomaticReviewRequestIntent({
-            automatic_reservation_handle:
-              automaticReservationAppend.automatic_reservation_handle,
-            reservation_append_receipt:
-              automaticReservationAppend.reservation_append_receipt,
-            reservation_status_response_append:
-              reservationStatusResponseAppend,
-          });
-        lastReachableReceiptDigest =
-          automaticRequestIntentAppend.intent_append_receipt.receipt_digest;
+    let automaticRequestIntentSource = "none";
+    const completeAutomaticRequestEffect = async () => {
         const requestTransport =
           createV2GitHubProductionAutomaticReviewRequestTransport({
             fetch,
@@ -4462,10 +4563,124 @@ async function assembleV2InitialProductionObservation({
             automaticRequestOutcome = "bound";
           }
         }
+    };
+    if (
+      automaticRequestPlanned && automaticRecoveryHandle === null &&
+      automaticRecoveryArtifactBindingCandidateHandle === null &&
+      statusOutcome !== "ambiguous"
+    ) {
+      if (recoveredAutomaticRequestPlanned) {
+        if (typeof ledger.appendRecoveredAutomaticReviewRequestIntent !==
+            "function") {
+          throw controllerFailure(
+            "RECOVERED_AUTOMATIC_REQUEST_API_REQUIRED",
+            "intent-persisted recovery requires the protected-ledger recovery API",
+            { public_effects_performed: publicEffectsPerformed },
+          );
+        }
+        failurePhase = "automatic-request-recovered-intent";
+        automaticRequestIntentAppend =
+          await ledger.appendRecoveredAutomaticReviewRequestIntent({
+            scheduler_append: schedulerAppend,
+          });
+        automaticRequestIntentSource = "recovered-reservation";
+        lastReachableReceiptDigest =
+          automaticRequestIntentAppend.intent_append_receipt.receipt_digest;
+        await completeAutomaticRequestEffect();
+      } else {
+        failurePhase = "automatic-reservation";
+        automaticReservationAppend =
+          await ledger.appendAutomaticRequestReservation({
+            scheduler_append: schedulerAppend,
+          });
+        lastReachableReceiptDigest =
+          automaticReservationAppend.reservation_append_receipt.receipt_digest;
+
+        failurePhase = "reservation-status-intent";
+        reservationStatusIntentAppend =
+          await ledger.appendReservationStatusWriteIntent({
+            automatic_reservation_handle:
+              automaticReservationAppend.automatic_reservation_handle,
+            reservation_append_receipt:
+              automaticReservationAppend.reservation_append_receipt,
+          });
+        lastReachableReceiptDigest =
+          reservationStatusIntentAppend.intent_append_receipt.receipt_digest;
+        const reservationStatusTransport =
+          createV2GitHubProductionReservationStatusTransport({
+            fetch,
+            token,
+            restBaseUrl,
+            repository: command.repository,
+          });
+        failurePhase = "reservation-status-post-refetch";
+        publicEffectsPerformed += 1;
+        try {
+          reservationStatusReceipt =
+            await reservationStatusTransport.performReservationStatusWrite({
+              reservation_status_intent_handle:
+                reservationStatusIntentAppend.reservation_status_intent_handle,
+            });
+        } catch (error) {
+          reservationStatusOutcome = "ambiguous";
+          reservationStatusAmbiguityCode = typeof error?.code === "string"
+            ? error.code
+            : "RESERVATION_STATUS_EFFECT_AMBIGUOUS";
+        }
+        if (reservationStatusReceipt !== null) {
+          failurePhase = "reservation-status-response";
+          reservationStatusResponseAppend =
+            await ledger.appendReservationStatusWriteResponse({
+              reservation_status_intent_handle:
+                reservationStatusIntentAppend.reservation_status_intent_handle,
+              intent_append_receipt:
+                reservationStatusIntentAppend.intent_append_receipt,
+              receipt: reservationStatusReceipt,
+            });
+          lastReachableReceiptDigest =
+            reservationStatusResponseAppend.response_append_receipt
+              .receipt_digest;
+          await requireV2ProductionLedgerTip({
+            ledger,
+            expected_tip_commit_sha:
+              reservationStatusResponseAppend.response_append_receipt
+                .commit_sha,
+            phase: "reservation-status-response",
+          });
+          reservationStatusOutcome = "bound";
+        } else {
+          await requireV2ProductionLedgerTip({
+            ledger,
+            expected_tip_commit_sha:
+              reservationStatusIntentAppend.intent_append_receipt.commit_sha,
+            phase: "reservation-status-ambiguous",
+          });
+        }
+
+        if (reservationStatusOutcome === "bound") {
+          failurePhase = "automatic-request-intent";
+          automaticRequestIntentAppend =
+            await ledger.appendAutomaticReviewRequestIntent({
+              automatic_reservation_handle:
+                automaticReservationAppend.automatic_reservation_handle,
+              reservation_append_receipt:
+                automaticReservationAppend.reservation_append_receipt,
+              reservation_status_response_append:
+                reservationStatusResponseAppend,
+            });
+          automaticRequestIntentSource = "new-reservation";
+          lastReachableReceiptDigest =
+            automaticRequestIntentAppend.intent_append_receipt.receipt_digest;
+          await completeAutomaticRequestEffect();
+        }
       }
     }
 
-    failurePhase = automaticRequestOutcome === "bound"
+    failurePhase = automaticRecoveryTransition !== null
+      ? "automatic-recovery-transition-bound-release"
+      : automaticRecoveryArtifactBindingResponse !== null
+        ? "automatic-recovery-artifact-binding-bound-release"
+      : automaticRequestOutcome === "bound"
       ? "automatic-request-bound-release"
       : automaticRequestOutcome === "ambiguous"
         ? "automatic-request-ambiguous-release"
@@ -4487,9 +4702,9 @@ async function assembleV2InitialProductionObservation({
     const cycle = createV2ProductionInitialCycle({
       internal_result: internalResult,
       scheduler_append: schedulerAppend,
-      status_intent_append: statusIntentAppend,
-      status_response_append: statusResponseAppend,
-      status_receipt: statusReceipt,
+      status_intent_appends: statusIntentAppends,
+      status_response_appends: statusResponseAppends,
+      status_receipts: statusReceipts,
       status_outcome: statusOutcome,
       ambiguity_code: ambiguityCode,
       automatic_reservation_append: automaticReservationAppend,
@@ -4503,6 +4718,7 @@ async function assembleV2InitialProductionObservation({
       automatic_request_binding_receipt: automaticRequestBindingReceipt,
       automatic_request_outcome: automaticRequestOutcome,
       automatic_request_ambiguity_code: automaticRequestAmbiguityCode,
+      automatic_request_intent_source: automaticRequestIntentSource,
       public_effects_performed: publicEffectsPerformed,
       lease_release_receipt: leaseReleaseReceipt,
       runner_authority: runnerAuthority,
@@ -4642,9 +4858,9 @@ async function recoverV2ScheduledCandidateAfterRelease({
 function createV2ProductionInitialCycle({
   internal_result: internalResult,
   scheduler_append: schedulerAppend,
-  status_intent_append: statusIntentAppend,
-  status_response_append: statusResponseAppend,
-  status_receipt: statusReceipt,
+  status_intent_appends: statusIntentAppends,
+  status_response_appends: statusResponseAppends,
+  status_receipts: statusReceipts,
   status_outcome: statusOutcome,
   ambiguity_code: ambiguityCode,
   automatic_reservation_append: automaticReservationAppend,
@@ -4658,6 +4874,7 @@ function createV2ProductionInitialCycle({
   automatic_request_binding_receipt: automaticRequestBindingReceipt,
   automatic_request_outcome: automaticRequestOutcome,
   automatic_request_ambiguity_code: automaticRequestAmbiguityCode,
+  automatic_request_intent_source: automaticRequestIntentSource,
   public_effects_performed: publicEffectsPerformed,
   lease_release_receipt: leaseReleaseReceipt,
   runner_authority: runnerAuthority,
@@ -4682,23 +4899,46 @@ function createV2ProductionInitialCycle({
   if (dueAt !== null) timestamp(dueAt, "initial scheduler due_at");
   const wakeupHints = workflowWakeupHint(internalResult);
   const continuityReceipt = continuityAuthority.continuity_receipt;
-  const requiredStatusEffects = statusIntentAppend === null ? 0 : 1;
+  if (
+    !Array.isArray(statusIntentAppends) ||
+    !Array.isArray(statusResponseAppends) ||
+    !Array.isArray(statusReceipts)
+  ) {
+    throw new TypeError("production status transaction evidence must be arrays");
+  }
+  const statusIntentAppend = statusIntentAppends.at(-1) ?? null;
+  const statusResponseAppend =
+    statusResponseAppends.length === statusIntentAppends.length
+      ? statusResponseAppends.at(-1) ?? null
+      : null;
+  const requiredStatusEffects = statusIntentAppends.length;
+  const plannedStatusEffects = internalResult.status_plan.writes.length;
   const reservationStatusEffects = reservationStatusIntentAppend === null
     ? 0
     : 1;
   const minimumRequestEffects =
     requiredStatusEffects + reservationStatusEffects;
+  if (!new Set([
+    "none",
+    "new-reservation",
+    "recovered-reservation",
+  ]).has(automaticRequestIntentSource)) {
+    throw new TypeError("production automatic request intent source is closed");
+  }
   if (
     !new Set(["not-required", "bound", "ambiguous"]).has(statusOutcome) ||
     (statusOutcome === "not-required" &&
-      (statusIntentAppend !== null || statusResponseAppend !== null ||
-        statusReceipt !== null)) ||
+      (plannedStatusEffects !== 0 || requiredStatusEffects !== 0 ||
+        statusResponseAppends.length !== 0 || statusReceipts.length !== 0)) ||
     (statusOutcome === "bound" &&
-      (statusIntentAppend === null || statusResponseAppend === null ||
-        statusReceipt === null)) ||
+      (plannedStatusEffects === 0 ||
+        statusResponseAppends.length !== requiredStatusEffects ||
+        statusReceipts.length !== requiredStatusEffects)) ||
     (statusOutcome === "ambiguous" &&
-      (statusIntentAppend === null || statusResponseAppend !== null ||
-        statusReceipt !== null || publicEffectsPerformed !== 1))
+      (requiredStatusEffects === 0 ||
+        statusResponseAppends.length !== requiredStatusEffects - 1 ||
+        statusReceipts.length !== requiredStatusEffects - 1 ||
+        publicEffectsPerformed !== requiredStatusEffects))
   ) {
     throw new TypeError("production status outcome is internally inconsistent");
   }
@@ -4730,20 +4970,29 @@ function createV2ProductionInitialCycle({
     !new Set(["not-required", "bound", "ambiguous"])
       .has(automaticRequestOutcome) ||
     (automaticRequestOutcome === "not-required" &&
-      (automaticRequestIntentAppend !== null ||
+      (automaticRequestIntentSource !== "none" ||
+        automaticRequestIntentAppend !== null ||
         automaticRequestBindingAppend !== null ||
         automaticRequestBindingReceipt !== null)) ||
     (automaticRequestOutcome === "bound" &&
-      (reservationStatusOutcome !== "bound" ||
+      (automaticRequestIntentSource === "none" ||
         automaticRequestIntentAppend === null ||
         automaticRequestBindingAppend === null ||
         automaticRequestBindingReceipt === null ||
-        publicEffectsPerformed !== minimumRequestEffects + 1)) ||
+        publicEffectsPerformed !== minimumRequestEffects + 1 ||
+        (automaticRequestIntentSource === "new-reservation" &&
+          reservationStatusOutcome !== "bound") ||
+        (automaticRequestIntentSource === "recovered-reservation" &&
+          reservationStatusOutcome !== "not-required"))) ||
     (automaticRequestOutcome === "ambiguous" &&
-      (reservationStatusOutcome !== "bound" ||
+      (automaticRequestIntentSource === "none" ||
         automaticRequestIntentAppend === null ||
         automaticRequestBindingAppend !== null ||
         automaticRequestBindingReceipt !== null ||
+        (automaticRequestIntentSource === "new-reservation" &&
+          reservationStatusOutcome !== "bound") ||
+        (automaticRequestIntentSource === "recovered-reservation" &&
+          reservationStatusOutcome !== "not-required") ||
         !new Set([minimumRequestEffects, minimumRequestEffects + 1])
           .has(publicEffectsPerformed)))
   ) {
@@ -4751,7 +5000,7 @@ function createV2ProductionInitialCycle({
       "production automatic request outcome is internally inconsistent",
     );
   }
-  if (publicEffectsPerformed < 0 || publicEffectsPerformed > 3) {
+  if (publicEffectsPerformed < 0 || publicEffectsPerformed > 4) {
     throw new TypeError("production public effect count is out of range");
   }
   const effectBarrier = automaticRequestOutcome === "bound"
@@ -4787,7 +5036,8 @@ function createV2ProductionInitialCycle({
     reservation_status_effect_outcome: reservationStatusOutcome,
     reservation_status_ambiguity_code: reservationStatusAmbiguityCode,
     automatic_reservation_digest:
-      automaticReservationAppend?.reservation?.reservation_digest ?? null,
+      automaticReservationAppend?.reservation?.reservation_digest ??
+        automaticRequestIntentAppend?.transport?.reservation_digest ?? null,
     reservation_status_intent_digest:
       reservationStatusIntentAppend?.reservation_status_intent_handle
         .intent_digest ?? null,
@@ -4827,9 +5077,8 @@ function createV2ProductionInitialCycle({
       ? null
       : structuredClone(automaticRequestBindingReceipt),
     sticky_receipt: null,
-    status_receipts: statusReceipt === null
-      ? []
-      : [structuredClone(statusReceipt)],
+    status_receipts: statusReceipts.map((receipt) =>
+      structuredClone(receipt)),
     ledger: deepFreeze({
       scheduler_append_receipt:
         structuredClone(schedulerAppend.append_receipt),
@@ -4945,6 +5194,64 @@ async function appendV2AutomaticRequestBindingToCompletion({
     { public_effect_retry_performed: false },
     lastError,
   );
+}
+
+async function appendV2AutomaticRecoveryArtifactBindingToCompletion({
+  ledger,
+  artifact_binding_intent: artifactBindingIntent,
+  fetch,
+  token,
+  rest_base_url: restBaseUrl,
+}) {
+  assertObject(
+    artifactBindingIntent,
+    "automatic recovery artifact binding intent",
+  );
+  assertObject(
+    artifactBindingIntent.transport,
+    "automatic recovery artifact binding transport",
+  );
+  const transport = artifactBindingIntent.transport;
+  if (
+    transport.operation !== "loadV2ProviderPreScopeArtifacts" ||
+    transport.retry_policy !== "safe-idempotent" ||
+    !Number.isSafeInteger(transport.expected_count) ||
+    transport.expected_count < 1 ||
+    !Array.isArray(transport.requests) ||
+    transport.requests.length !== transport.expected_count
+  ) {
+    throw controllerFailure(
+      "AUTOMATIC_RECOVERY_ARTIFACT_BINDING_TRANSPORT_INVALID",
+      "protected-ledger artifact binding did not return one exact safe GET batch",
+    );
+  }
+  let lastTooEarlyError = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const providerArtifactHandles = [];
+    for (const request of transport.requests) {
+      providerArtifactHandles.push(await loadV2ProviderPreScopeArtifact({
+        fetch,
+        token,
+        restBaseUrl,
+        ...request,
+      }));
+    }
+    try {
+      return await ledger.appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          artifactBindingIntent.artifact_binding_intent_handle,
+        intent_append_receipt: artifactBindingIntent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    } catch (error) {
+      if (error?.code !==
+          "automatic-artifact-binding-point-read-too-early") {
+        throw error;
+      }
+      lastTooEarlyError = error;
+    }
+  }
+  throw lastTooEarlyError;
 }
 
 async function requireV2ProductionLedgerTip({

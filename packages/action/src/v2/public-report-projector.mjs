@@ -2,11 +2,20 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import {
+  codexInlineParentReviewBodyHasClosedGrammar,
   isExactV2CodexProviderIdentity,
+  parseCodexIssueCommentArtifact,
+  parseCodexReviewArtifact,
 } from "../core.mjs";
 import {
   assertV2PublicReport,
 } from "./public-report.mjs";
+import {
+  projectV2TransportSnapshots,
+} from "./projector.mjs";
+import {
+  reduceV2Snapshot,
+} from "./reducer.mjs";
 import {
   V2_STATUS_CONTEXT,
   assertV2ReducerInput,
@@ -153,6 +162,241 @@ export function projectV2PublicReport({
     );
   }
   return deepFreeze(publicReport);
+}
+
+export function projectV2AutomaticRequestRecoveryAuthority({
+  compact_report,
+  reducer_input,
+  discovery_snapshot,
+  evidence_snapshot,
+  controller,
+  controlled_request,
+}) {
+  assertV2ReducerOutput(compact_report);
+  assertV2ReducerInput(reducer_input);
+  assertV2Snapshot(discovery_snapshot);
+  assertV2Snapshot(evidence_snapshot);
+  const canonicalReducerInput = projectV2TransportSnapshots({
+    discovery_snapshot,
+    evidence_snapshot,
+    controller,
+  });
+  if (!isDeepStrictEqual(canonicalReducerInput, reducer_input)) return null;
+  const canonicalReport = reduceV2Snapshot(canonicalReducerInput, {
+    status_target_mode: compact_report.status_target.mode,
+    status_context: compact_report.status_target.context,
+  });
+  if (!isDeepStrictEqual(canonicalReport, compact_report)) return null;
+  bindCompactReport(compact_report, reducer_input, evidence_snapshot);
+  bindAutomaticRecoverySnapshot(reducer_input, evidence_snapshot);
+  if (
+    compact_report.decision !== "findings" ||
+    compact_report.evidence_basis?.kind !== "terminal-findings" ||
+    compact_report.request_policy.status !== "compliant" ||
+    controlled_request === null ||
+    reducer_input.complete !== true ||
+    !Object.values(reducer_input.inventories).every((value) => value === true) ||
+    reducer_input.scope_stable !== true ||
+    evidence_snapshot.stability.scope_stable !== true ||
+    evidence_snapshot.stability.server_time_monotonic !== true
+  ) {
+    return null;
+  }
+  record(controlled_request, "controlled_request");
+  exactKeys(controlled_request, [
+    "request_id", "bound_at", "binding_record_oid", "binding_receipt_digest",
+  ], "controlled_request");
+  decimal(controlled_request.request_id, "controlled_request.request_id");
+  timestamp(controlled_request.bound_at, "controlled_request.bound_at");
+  sha(controlled_request.binding_record_oid,
+    "controlled_request.binding_record_oid");
+  digest(controlled_request.binding_receipt_digest,
+    "controlled_request.binding_receipt_digest");
+  const selectedRequest = selectedRequestFromReducer(
+    compact_report,
+    reducer_input,
+  );
+  if (
+    selectedRequest === null ||
+    selectedRequest.kind !== "automatic" ||
+    selectedRequest.controlled !== true ||
+    selectedRequest.stable !== true ||
+    selectedRequest.body !== "@codex review" ||
+    selectedRequest.created_at !== selectedRequest.updated_at ||
+    selectedRequest.id !== controlled_request.request_id ||
+    selectedRequest.created_at !== controlled_request.bound_at ||
+    selectedRequest.head_oid !== reducer_input.review_epoch.head_oid
+  ) {
+    throw projectionFailure(
+      "AUTOMATIC_RECOVERY_CONTROLLED_REQUEST_MISMATCH",
+      "automatic recovery differs from its bound controlled request and review epoch",
+    );
+  }
+  if (
+    selectedRequest.generation_kind !== "automatic" ||
+    selectedRequest.generation_id !==
+      `automatic:${selectedRequest.generation_index}` ||
+    selectedRequest.generation_index < 1 ||
+    selectedRequest.generation_index >= 3
+  ) {
+    return null;
+  }
+  if (!automaticRecoveryRequestInventoryIsClosed({
+    selectedRequest,
+    reducerInput: reducer_input,
+    evidenceSnapshot: evidence_snapshot,
+  })) {
+    return null;
+  }
+  const rawRequest = evidence_snapshot.pages.issue_comments.find((item) =>
+    item.id === selectedRequest.id);
+  if (
+    rawRequest === undefined ||
+    rawRequest.html_url !== selectedRequest.url ||
+    rawRequest.body !== "@codex review" ||
+    rawRequest.created_at !== rawRequest.updated_at ||
+    rawRequest.created_at !== selectedRequest.created_at ||
+    !hasExactArtifact(
+      evidence_snapshot,
+      "issue_comment",
+      rawRequest.id,
+      rawRequest,
+    )
+  ) {
+    throw projectionFailure(
+      "AUTOMATIC_RECOVERY_REQUEST_TRANSPORT_MISMATCH",
+      "automatic recovery request is absent from the final exact transport snapshot",
+    );
+  }
+  const postRequestFindingArtifacts = reducer_input.artifacts
+    .filter((artifact) =>
+      artifact.kind === "terminal-findings" &&
+      artifact.commit_oid === reducer_input.review_epoch.head_oid &&
+      Date.parse(artifact.created_at) > Date.parse(selectedRequest.created_at));
+  if (postRequestFindingArtifacts.some((artifact) =>
+    artifact.stable !== true || artifact.request_id !== selectedRequest.id)) {
+    return null;
+  }
+  const findingArtifacts = postRequestFindingArtifacts
+    .sort((left, right) =>
+      Date.parse(left.created_at) - Date.parse(right.created_at) ||
+      compareDecimal(left.id, right.id));
+  if (
+    findingArtifacts.length === 0 ||
+    !findingArtifacts.some((artifact) =>
+      artifact.id === compact_report.evidence_basis.artifact_id)
+  ) {
+    return null;
+  }
+  if (!automaticRecoveryTerminalInventoryIsClosed({
+    selectedArtifactId: compact_report.evidence_basis.artifact_id,
+    reducerInput: reducer_input,
+    evidenceSnapshot: evidence_snapshot,
+  })) {
+    return null;
+  }
+  const closureRecords = [];
+  for (const artifact of findingArtifacts) {
+    if (
+      !automaticRecoveryFindingCarrierIsExact(artifact, evidence_snapshot) ||
+      !automaticRecoveryArtifactTimingIsExact(artifact, reducer_input)
+    ) {
+      throw projectionFailure(
+        "AUTOMATIC_RECOVERY_FINDING_TRANSPORT_MISMATCH",
+        `automatic recovery finding ${artifact.id} lacks its final exact provider carrier`,
+      );
+    }
+    for (const findingId of artifact.finding_ids) {
+      const closure = automaticRecoveryClosureRecord({
+        artifact,
+        findingId,
+        reducerInput: reducer_input,
+        evidenceSnapshot: evidence_snapshot,
+      });
+      if (closure === null) return null;
+      closureRecords.push(closure);
+    }
+  }
+  if (closureRecords.length === 0) return null;
+  const findingIds = closureRecords.map((item) => item.finding_id);
+  const closureIds = closureRecords.map((item) => item.closure_id);
+  if (
+    new Set(findingIds).size !== findingIds.length ||
+    new Set(closureIds).size !== closureIds.length
+  ) {
+    throw projectionFailure(
+      "AUTOMATIC_RECOVERY_CLOSURE_CONFLICT",
+      "automatic recovery repeats a finding or closure authority",
+    );
+  }
+  const scope = {
+    repository_node_id: evidence_snapshot.repository.node_id,
+    pull_request_node_id: evidence_snapshot.pull_request.node_id,
+    pull_request_number: evidence_snapshot.pull_request.number,
+    base_oid: reducer_input.review_epoch.base_oid,
+    head_oid: reducer_input.review_epoch.head_oid,
+    merge_base_oid: reducer_input.review_epoch.merge_base_oid,
+  };
+  const withoutDigest = {
+    schema: "codex-review-gate-automatic-request-recovery-authority-v2",
+    schema_version: 1,
+    decision: "findings",
+    snapshot_fingerprint: compact_report.snapshot_fingerprint,
+    review_epoch_id: automaticRecoveryEpochId({
+      repository_node_id: evidence_snapshot.repository.node_id,
+      pull_request_node_id: evidence_snapshot.pull_request.node_id,
+      head_ref_oid: reducer_input.review_epoch.head_oid,
+    }),
+    prior_generation_id: selectedRequest.generation_id,
+    prior_generation_index: selectedRequest.generation_index,
+    next_generation_id: `automatic:${selectedRequest.generation_index + 1}`,
+    next_generation_index: selectedRequest.generation_index + 1,
+    prior_request_id: selectedRequest.id,
+    prior_request_binding_record_oid: controlled_request.binding_record_oid,
+    prior_request_binding_receipt_digest:
+      controlled_request.binding_receipt_digest,
+    scope,
+    scope_digest: projectionDigest(
+      "codex-review-gate-v2-automatic-recovery-scope",
+      scope,
+    ),
+    finding_ids: findingIds,
+    closure_ids: closureIds,
+    closure_records: closureRecords,
+    finding_observed_at: closureRecords.reduce((latest, item) =>
+      Date.parse(item.finding_server_time) > Date.parse(latest)
+        ? item.finding_server_time
+        : latest,
+    closureRecords[0].finding_server_time),
+    closure_observed_at: closureRecords.reduce((latest, item) =>
+      Date.parse(item.closure_server_time) > Date.parse(latest)
+        ? item.closure_server_time
+        : latest,
+    closureRecords[0].closure_server_time),
+    final_snapshot_server_time: evidence_snapshot.server_time,
+    pagination_sha256: reducer_input.evidence_authority.pagination_sha256,
+    final_reread_sha256: reducer_input.evidence_authority.final_reread_sha256,
+    evidence_snapshot_digest: projectionDigest(
+      "codex-review-gate-v2-automatic-recovery-evidence-snapshot",
+      evidence_snapshot,
+    ),
+    reducer_input_digest: projectionDigest(
+      "codex-review-gate-v2-automatic-recovery-reducer-input",
+      reducer_input,
+    ),
+    reducer_report_digest: projectionDigest(
+      "codex-review-gate-v2-automatic-recovery-reducer-report",
+      compact_report,
+    ),
+    same_review_epoch: true,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    authority_digest: projectionDigest(
+      "codex-review-gate-v2-automatic-request-recovery-authority",
+      withoutDigest,
+    ),
+  });
 }
 
 function isPreEpochBlocker(compactReport, evidenceSnapshot) {
@@ -831,6 +1075,622 @@ function recoveryClosureRecord({ findingId, closureId, reducerInput, evidenceSna
   };
 }
 
+function bindAutomaticRecoverySnapshot(reducerInput, evidenceSnapshot) {
+  if (reducerInput.observed_at !== evidenceSnapshot.server_time) {
+    throw projectionFailure(
+      "AUTOMATIC_RECOVERY_SNAPSHOT_TIME_MISMATCH",
+      "automatic recovery reducer input is not the final transport point-read",
+    );
+  }
+  const paginationDigest = projectionDigest(
+    "codex-review-gate-v2-pagination-authority",
+    {
+      pages: evidenceSnapshot.pages,
+      permissions: evidenceSnapshot.permissions,
+      service_start_observations:
+        evidenceSnapshot.service_start_observations,
+    },
+  );
+  if (paginationDigest !== reducerInput.evidence_authority.pagination_sha256) {
+    throw projectionFailure(
+      "AUTOMATIC_RECOVERY_SNAPSHOT_AUTHORITY_MISMATCH",
+      "automatic recovery final raw evidence differs from its reducer authority",
+    );
+  }
+}
+
+function automaticRecoveryRequestInventoryIsClosed({
+  selectedRequest,
+  reducerInput,
+  evidenceSnapshot,
+}) {
+  const currentRequests = reducerInput.requests.filter((request) =>
+    request.head_oid === reducerInput.review_epoch.head_oid);
+  if (currentRequests.some((request) =>
+    compareRecoveryEvidence(request, selectedRequest) > 0)) {
+    return false;
+  }
+  const automaticRequests = currentRequests
+    .filter((request) => request.kind === "automatic")
+    .sort((left, right) =>
+      left.generation_index - right.generation_index ||
+      compareRecoveryEvidence(left, right));
+  if (automaticRequests.length !== selectedRequest.generation_index) {
+    return false;
+  }
+  if (
+    reducerInput.budget.automatic_requests_on_head !==
+      selectedRequest.generation_index ||
+    reducerInput.budget.automatic_reservations_on_head !==
+      selectedRequest.generation_index
+  ) {
+    return false;
+  }
+  for (let index = 0; index < automaticRequests.length; index += 1) {
+    const request = automaticRequests[index];
+    const generationIndex = index + 1;
+    const rawRequest = evidenceSnapshot.pages.issue_comments.find((item) =>
+      item.id === request.id);
+    if (
+      request.generation_kind !== "automatic" ||
+      request.generation_index !== generationIndex ||
+      request.generation_id !== `automatic:${generationIndex}` ||
+      request.controlled !== true ||
+      request.stable !== true ||
+      request.body !== "@codex review" ||
+      request.created_at !== request.updated_at ||
+      rawRequest === undefined ||
+      rawRequest.html_url !== request.url ||
+      rawRequest.body !== request.body ||
+      rawRequest.created_at !== request.created_at ||
+      rawRequest.updated_at !== request.updated_at ||
+      !hasExactArtifact(
+        evidenceSnapshot,
+        "issue_comment",
+        rawRequest.id,
+        rawRequest,
+      ) ||
+      (index > 0 &&
+        compareRecoveryEvidence(automaticRequests[index - 1], request) >= 0)
+    ) {
+      return false;
+    }
+    if (index > 0 && !automaticRecoveryGenerationPredecessorIsClosed({
+      priorRequest: automaticRequests[index - 1],
+      nextRequest: request,
+      reducerInput,
+      evidenceSnapshot,
+    })) {
+      return false;
+    }
+  }
+  if (automaticRequests.at(-1)?.id !== selectedRequest.id) return false;
+
+  const reducerRequestsById = new Map(
+    reducerInput.requests.map((request) => [request.id, request]),
+  );
+  for (const rawRequest of evidenceSnapshot.pages.issue_comments.filter(
+    (comment) => comment.body === "@codex review",
+  )) {
+    const projected = reducerRequestsById.get(rawRequest.id);
+    if (
+      projected === undefined ||
+      projected.url !== rawRequest.html_url ||
+      projected.created_at !== rawRequest.created_at ||
+      projected.updated_at !== rawRequest.updated_at ||
+      !hasExactArtifact(
+        evidenceSnapshot,
+        "issue_comment",
+        rawRequest.id,
+        rawRequest,
+      )
+    ) {
+      return false;
+    }
+    if (
+      compareRecoveryEvidence(
+        { id: rawRequest.id, created_at: rawRequest.created_at },
+        selectedRequest,
+      ) > 0
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function automaticRecoveryGenerationPredecessorIsClosed({
+  priorRequest,
+  nextRequest,
+  reducerInput,
+  evidenceSnapshot,
+}) {
+  const selectedPredecessor = selectAutomaticRecoveryTerminalArtifact(
+    reducerInput.artifacts.filter((artifact) =>
+      artifact.commit_oid === reducerInput.review_epoch.head_oid &&
+      ["terminal-clean", "terminal-findings", "malformed"]
+        .includes(artifact.kind) &&
+      Date.parse(artifact.created_at) > Date.parse(priorRequest.created_at) &&
+      Date.parse(artifact.created_at) <= Date.parse(nextRequest.created_at)),
+  );
+  if (
+    selectedPredecessor === null ||
+    selectedPredecessor.stable !== true ||
+    selectedPredecessor.kind !== "terminal-findings" ||
+    selectedPredecessor.request_id !== priorRequest.id
+  ) {
+    return false;
+  }
+  const findings = reducerInput.artifacts.filter((artifact) =>
+    artifact.kind === "terminal-findings" &&
+    artifact.commit_oid === reducerInput.review_epoch.head_oid &&
+    Date.parse(artifact.created_at) > Date.parse(priorRequest.created_at) &&
+    Date.parse(artifact.created_at) <= Date.parse(nextRequest.created_at));
+  if (
+    findings.length === 0 ||
+    findings.some((artifact) =>
+      artifact.stable !== true || artifact.request_id !== priorRequest.id) ||
+    reducerInput.artifacts.some((artifact) =>
+      artifact.kind === "terminal-findings" &&
+      artifact.commit_oid === reducerInput.review_epoch.head_oid &&
+      artifact.request_id === priorRequest.id &&
+      (Date.parse(artifact.created_at) <= Date.parse(priorRequest.created_at) ||
+       Date.parse(artifact.created_at) >= Date.parse(nextRequest.created_at)))
+  ) {
+    return false;
+  }
+  for (const artifact of findings) {
+    if (
+      Date.parse(artifact.created_at) <= Date.parse(priorRequest.created_at) ||
+      Date.parse(artifact.created_at) >= Date.parse(nextRequest.created_at) ||
+      !automaticRecoveryFindingCarrierIsExact(artifact, evidenceSnapshot) ||
+      !automaticRecoveryArtifactTimingIsExact(artifact, reducerInput)
+    ) {
+      return false;
+    }
+    for (const findingId of artifact.finding_ids) {
+      const closure = automaticRecoveryClosureRecord({
+        artifact,
+        findingId,
+        reducerInput,
+        evidenceSnapshot,
+      });
+      if (
+        closure === null ||
+        Date.parse(closure.closure_server_time) >=
+          Date.parse(nextRequest.created_at)
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function automaticRecoveryFindingCarrierIsExact(artifact, evidenceSnapshot) {
+  if (artifact.channel === "issue-comment") {
+    const carrier = evidenceSnapshot.pages.issue_comments.find((item) =>
+      item.id === artifact.id);
+    if (!(carrier !== undefined &&
+      carrier.html_url === artifact.url &&
+      carrier.created_at === artifact.created_at &&
+      isExactV2CodexProviderIdentity(carrier.author, carrier.app) &&
+      hasExactArtifact(
+        evidenceSnapshot,
+        "issue_comment",
+        carrier.id,
+        carrier,
+      ))) return false;
+    const parsed = parseAutomaticRecoveryIssueCarrier(
+      carrier,
+      evidenceSnapshot,
+    );
+    return parsed?.kind === "finding" &&
+      parsed.headSha === artifact.commit_oid;
+  }
+  if (artifact.channel === "pull-request-review") {
+    const carrier = evidenceSnapshot.pages.reviews.find((item) =>
+      item.id === artifact.id);
+    if (!(carrier !== undefined &&
+      carrier.html_url === artifact.url &&
+      carrier.commit_id === artifact.commit_oid &&
+      isExactV2CodexProviderIdentity(carrier.author, carrier.app) &&
+      hasExactArtifact(
+        evidenceSnapshot,
+        "pull_request_review",
+        carrier.id,
+        carrier,
+      ))) return false;
+    const native = automaticRecoveryCoreCarrier(carrier, "review");
+    if (native === null) return false;
+    if (codexInlineParentReviewBodyHasClosedGrammar(native)) return true;
+    const parsed = parseCodexReviewArtifact(native, {
+      owner: evidenceSnapshot.repository.owner,
+      repo: evidenceSnapshot.repository.name,
+    });
+    return parsed?.kind === "finding" &&
+      parsed.headSha === artifact.commit_oid;
+  }
+  return false;
+}
+
+function automaticRecoveryTerminalInventoryIsClosed({
+  selectedArtifactId,
+  reducerInput,
+  evidenceSnapshot,
+}) {
+  const reducerArtifacts = new Map(
+    reducerInput.artifacts.map((artifact) => [artifact.id, artifact]),
+  );
+  const rawTerminal = [];
+  for (const carrier of evidenceSnapshot.pages.issue_comments) {
+    if (!isExactV2CodexProviderIdentity(carrier.author, carrier.app)) continue;
+    const parsed = parseAutomaticRecoveryIssueCarrier(carrier, evidenceSnapshot);
+    if (parsed === null || parsed.kind === "pending") continue;
+    const commitOid = parsed.kind === "finding"
+      ? parsed.headSha
+      : parsed.kind === "clean" && parsed.commitRef?.length === 40
+        ? parsed.commitRef
+        : parsed.kind === "malformed"
+          ? reducerInput.review_epoch.head_oid
+          : null;
+    if (commitOid !== reducerInput.review_epoch.head_oid) continue;
+    rawTerminal.push({
+      id: carrier.id,
+      kind: parsed.kind === "finding"
+        ? "terminal-findings"
+        : parsed.kind === "clean"
+          ? "terminal-clean"
+          : "malformed",
+      created_at: parsed.createdAt,
+      channel: "issue-comment",
+      exact: hasExactArtifact(
+        evidenceSnapshot,
+        "issue_comment",
+        carrier.id,
+        carrier,
+      ),
+    });
+  }
+  for (const carrier of evidenceSnapshot.pages.reviews) {
+    if (!isExactV2CodexProviderIdentity(carrier.author, carrier.app)) continue;
+    const native = automaticRecoveryCoreCarrier(carrier, "review");
+    if (native === null) return false;
+    if (
+      codexInlineParentReviewBodyHasClosedGrammar(native) &&
+      automaticRecoveryReviewIsProjectedInlineCarrier(
+        carrier,
+        reducerArtifacts,
+        reducerInput,
+      )
+    ) {
+      continue;
+    }
+    const parsed = parseCodexReviewArtifact(native, {
+      owner: evidenceSnapshot.repository.owner,
+      repo: evidenceSnapshot.repository.name,
+    });
+    const commitOid = parsed?.kind === "malformed"
+      ? carrier.commit_id
+      : parsed?.headSha ?? null;
+    if (parsed === null || commitOid !== reducerInput.review_epoch.head_oid) {
+      continue;
+    }
+    rawTerminal.push({
+      id: carrier.id,
+      kind: parsed.kind === "finding"
+        ? "terminal-findings"
+        : parsed.kind === "clean"
+          ? "terminal-clean"
+          : "malformed",
+      created_at: parsed.createdAt,
+      channel: "pull-request-review",
+      exact: hasExactArtifact(
+        evidenceSnapshot,
+        "pull_request_review",
+        carrier.id,
+        carrier,
+      ),
+    });
+  }
+  for (const raw of rawTerminal) {
+    const projected = reducerArtifacts.get(raw.id);
+    if (
+      !raw.exact ||
+      projected === undefined ||
+      projected.kind !== raw.kind ||
+      projected.channel !== raw.channel ||
+      projected.created_at !== raw.created_at ||
+      projected.commit_oid !== reducerInput.review_epoch.head_oid
+    ) {
+      return false;
+    }
+  }
+  const selected = selectAutomaticRecoveryTerminalArtifact(
+    reducerInput.artifacts.filter((artifact) =>
+      artifact.commit_oid === reducerInput.review_epoch.head_oid &&
+      ["terminal-clean", "terminal-findings", "malformed"]
+        .includes(artifact.kind)),
+  );
+  return selected !== null &&
+    selected.stable === true &&
+    selected.kind === "terminal-findings" &&
+    selected.id === selectedArtifactId;
+}
+
+function automaticRecoveryReviewIsProjectedInlineCarrier(
+  carrier,
+  reducerArtifacts,
+  reducerInput,
+) {
+  const artifact = reducerArtifacts.get(carrier.id);
+  return artifact !== undefined &&
+    artifact.kind === "terminal-findings" &&
+    artifact.channel === "pull-request-review" &&
+    artifact.commit_oid === carrier.commit_id &&
+    artifact.finding_ids.length > 0 &&
+    artifact.finding_ids.every((findingId) => {
+      const thread = reducerInput.threads.find((item) =>
+        item.finding_id === findingId);
+      return thread !== undefined &&
+        thread.kind === "inline" &&
+        findingId === `thread:${thread.id}`;
+    });
+}
+
+function selectAutomaticRecoveryTerminalArtifact(artifacts) {
+  if (artifacts.length === 0) return null;
+  const latestTime = artifacts.reduce((latest, artifact) =>
+    Date.parse(artifact.created_at) > Date.parse(latest)
+      ? artifact.created_at
+      : latest,
+  artifacts[0].created_at);
+  const latest = artifacts.filter((artifact) =>
+    artifact.created_at === latestTime);
+  if (new Set(latest.map((artifact) => artifact.channel)).size > 1) {
+    return null;
+  }
+  const precedence = new Map([
+    ["terminal-clean", 0],
+    ["terminal-findings", 1],
+    ["malformed", 2],
+  ]);
+  const selectedPrecedence = Math.max(
+    ...latest.map((artifact) => precedence.get(artifact.kind)),
+  );
+  return latest
+    .filter((artifact) => precedence.get(artifact.kind) === selectedPrecedence)
+    .sort((left, right) => compareDecimal(left.id, right.id))
+    .at(-1) ?? null;
+}
+
+function automaticRecoveryArtifactTimingIsExact(artifact, reducerInput) {
+  const threads = artifact.finding_ids.map((findingId) =>
+    reducerInput.threads.find((thread) => thread.finding_id === findingId));
+  if (threads.some((thread) => thread === undefined)) return false;
+  const earliest = threads.reduce((value, thread) =>
+    Date.parse(thread.created_at) < Date.parse(value)
+      ? thread.created_at
+      : value,
+  threads[0].created_at);
+  return earliest === artifact.created_at;
+}
+
+function parseAutomaticRecoveryIssueCarrier(carrier, evidenceSnapshot) {
+  const native = automaticRecoveryCoreCarrier(carrier, "issue-comment");
+  return native === null
+    ? null
+    : parseCodexIssueCommentArtifact(native, {
+        owner: evidenceSnapshot.repository.owner,
+        repo: evidenceSnapshot.repository.name,
+      });
+}
+
+function automaticRecoveryCoreCarrier(carrier, kind) {
+  const id = Number(carrier.id);
+  const actorId = Number(carrier.author?.id);
+  if (
+    !Number.isSafeInteger(id) || id <= 0 ||
+    !Number.isSafeInteger(actorId) || actorId <= 0
+  ) {
+    return null;
+  }
+  const native = {
+    ...carrier,
+    id,
+    user: {
+      id: actorId,
+      login: carrier.author.login,
+      type: carrier.author.type,
+    },
+  };
+  if (kind === "issue-comment") {
+    native.performed_via_github_app = carrier.app === null
+      ? null
+      : { slug: carrier.app.slug };
+  } else {
+    native.created_at = carrier.submitted_at;
+  }
+  return native;
+}
+
+function automaticRecoveryClosureRecord({
+  artifact,
+  findingId,
+  reducerInput,
+  evidenceSnapshot,
+}) {
+  const thread = reducerInput.threads.find((item) =>
+    item.finding_id === findingId);
+  if (thread === undefined || thread.stable !== true) return null;
+  if (thread.kind === "inline") {
+    if (
+      findingId !== `thread:${thread.id}` ||
+      thread.is_resolved !== true ||
+      thread.resolution_observed_at === null ||
+      Date.parse(thread.resolution_observed_at) <= Date.parse(thread.created_at) ||
+      Date.parse(thread.resolution_observed_at) >
+        Date.parse(evidenceSnapshot.server_time)
+    ) {
+      return null;
+    }
+    const rawThread = evidenceSnapshot.pages.threads.find((item) =>
+      item.id === thread.id);
+    if (rawThread === undefined || rawThread.is_resolved !== true) return null;
+    const commentsById = new Map(
+      evidenceSnapshot.pages.inline_comments.map((item) => [item.id, item]),
+    );
+    const joinedComments = rawThread.comments.map((item) =>
+      commentsById.get(item.database_id));
+    if (joinedComments.some((item) => item === undefined)) return null;
+    const providerComments = joinedComments.filter((item) =>
+      isExactV2CodexProviderIdentity(item.author, item.app));
+    if (
+      providerComments.length === 0 ||
+      providerComments.some((item) =>
+        item.pull_request_review_id !== artifact.id ||
+        item.commit_id !== reducerInput.review_epoch.head_oid ||
+        item.original_commit_id !== reducerInput.review_epoch.head_oid ||
+        item.in_reply_to_id !== null ||
+        !hasExactArtifact(
+          evidenceSnapshot,
+          "inline_comment",
+          item.id,
+          item,
+        )) ||
+      providerComments.reduce((earliest, item) =>
+        Date.parse(item.created_at) < Date.parse(earliest)
+          ? item.created_at
+          : earliest,
+      providerComments[0].created_at) !== thread.created_at
+    ) {
+      return null;
+    }
+    return {
+      finding_id: findingId,
+      finding_kind: "inline",
+      finding_artifact_id: artifact.id,
+      finding_server_time: thread.created_at,
+      closure_id: thread.id,
+      closure_server_time: thread.resolution_observed_at,
+      closure_authority_digest: projectionDigest(
+        "codex-review-gate-v2-automatic-recovery-inline-closure",
+        {
+          thread: rawThread,
+          provider_comments: providerComments,
+          final_snapshot_server_time: evidenceSnapshot.server_time,
+        },
+      ),
+    };
+  }
+  if (
+    thread.kind !== "top-level" ||
+    thread.id !== `top-level:${artifact.id}:0` ||
+    thread.created_at !== artifact.created_at ||
+    !automaticRecoveryTopLevelFindingIdIsExact(
+      artifact,
+      findingId,
+      evidenceSnapshot,
+    )
+  ) {
+    return null;
+  }
+  const acknowledgement = reducerInput.acknowledgements
+    .filter((item) =>
+      item.finding_id === findingId &&
+      item.kind === "addressed" &&
+      item.stable &&
+      !item.exact_provider &&
+      item.commit_oid === reducerInput.review_epoch.head_oid &&
+      Date.parse(item.created_at) > Date.parse(artifact.created_at))
+    .sort((left, right) =>
+      Date.parse(left.created_at) - Date.parse(right.created_at) ||
+      compareDecimal(left.id, right.id))
+    .at(-1);
+  if (acknowledgement === undefined) return null;
+  const comment = evidenceSnapshot.pages.issue_comments.find((item) =>
+    item.id === acknowledgement.id);
+  const permission = evidenceSnapshot.permissions.actor_permissions.find(
+    (item) =>
+      item.subject.kind === "issue_comment" &&
+      item.subject.id === acknowledgement.id,
+  );
+  if (
+    comment === undefined ||
+    permission === undefined ||
+    comment.author?.type !== "User" ||
+    isExactV2CodexProviderIdentity(comment.author, comment.app) ||
+    comment.body !== `/codex-gate addressed ${artifact.url}` ||
+    comment.created_at !== comment.updated_at ||
+    comment.created_at !== acknowledgement.created_at ||
+    Date.parse(comment.created_at) > Date.parse(evidenceSnapshot.server_time) ||
+    !hasExactArtifact(
+      evidenceSnapshot,
+      "issue_comment",
+      comment.id,
+      comment,
+    ) ||
+    !permission.stable ||
+    !isDeepStrictEqual(permission.actor, comment.author) ||
+    !permission.pre.permissions.push ||
+    !permission.post.permissions.push
+  ) {
+    return null;
+  }
+  permissionLevel(permission.post);
+  return {
+    finding_id: findingId,
+    finding_kind: "top-level",
+    finding_artifact_id: artifact.id,
+    finding_server_time: artifact.created_at,
+    closure_id: acknowledgement.id,
+    closure_server_time: acknowledgement.created_at,
+    closure_authority_digest: projectionDigest(
+      "codex-review-gate-v2-automatic-recovery-top-level-closure",
+      {
+        comment,
+        permission,
+        final_snapshot_server_time: evidenceSnapshot.server_time,
+      },
+    ),
+  };
+}
+
+function automaticRecoveryTopLevelFindingIdIsExact(
+  artifact,
+  findingId,
+  evidenceSnapshot,
+) {
+  let parsed;
+  if (artifact.channel === "issue-comment") {
+    const carrier = evidenceSnapshot.pages.issue_comments.find((item) =>
+      item.id === artifact.id);
+    if (carrier === undefined) return false;
+    parsed = parseAutomaticRecoveryIssueCarrier(carrier, evidenceSnapshot);
+  } else {
+    const carrier = evidenceSnapshot.pages.reviews.find((item) =>
+      item.id === artifact.id);
+    if (carrier === undefined) return false;
+    const native = automaticRecoveryCoreCarrier(carrier, "review");
+    if (native === null) return false;
+    parsed = parseCodexReviewArtifact(native, {
+      owner: evidenceSnapshot.repository.owner,
+      repo: evidenceSnapshot.repository.name,
+    });
+  }
+  if (parsed?.kind !== "finding") return false;
+  const expected = `finding:${artifact.id}:0:${createHash("sha256")
+    .update(parsed.samples.join("\n"), "utf8")
+    .digest("hex")
+    .slice(0, 24)}`;
+  return findingId === expected;
+}
+
+function compareRecoveryEvidence(left, right) {
+  return Date.parse(left.created_at) - Date.parse(right.created_at) ||
+    compareDecimal(left.id, right.id);
+}
+
 function inlineFindingUrl(snapshot, thread) {
   const rawThread = snapshot.pages.threads.find((item) => item.id === thread.id);
   if (rawThread === undefined) {
@@ -991,6 +1851,26 @@ function canonicalJson(value) {
       `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function projectionDigest(domain, value) {
+  return `sha256:${createHash("sha256")
+    .update(`${domain}\0`, "utf8")
+    .update(canonicalJson(value), "utf8")
+    .digest("hex")}`;
+}
+
+function automaticRecoveryEpochId(scope) {
+  const domain = "codex-review-gate-v2-head-epoch";
+  const domainBytes = Buffer.from(domain, "utf8");
+  const valueBytes = Buffer.from(canonicalJson(scope), "utf8");
+  const hash = createHash("sha256");
+  hash.update(`${domainBytes.length}:`);
+  hash.update(domainBytes);
+  hash.update("\0");
+  hash.update(`${valueBytes.length}:`);
+  hash.update(valueBytes);
+  return `v2-head:${hash.digest("hex")}`;
 }
 
 function snapshotLifecycle(value) {

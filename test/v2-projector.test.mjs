@@ -8,11 +8,19 @@ import {
   deriveV2SelectionProjection,
   projectV2TransportSnapshots,
 } from "../packages/action/src/v2/projector.mjs";
+import {
+  V2PublicReportProjectionError,
+  projectV2AutomaticRequestRecoveryAuthority,
+} from "../packages/action/src/v2/public-report-projector.mjs";
 import { reduceV2Snapshot } from "../packages/action/src/v2/reducer.mjs";
 import { V2_NO_START_BODIES } from "../packages/action/src/v2/schema.mjs";
 import {
   V2_RUNNER_SCHEMA,
+  assertV2AutomaticRequestRecoveryHandle,
   deriveV2EpochId,
+  getV2AutomaticRecoveryArtifactBindingCandidateHandle,
+  getV2AutomaticRequestRecoveryHandle,
+  projectV2AutomaticRequestRecoveryForGitLedger,
   runV2Operation,
 } from "../packages/action/src/v2/runner.mjs";
 
@@ -945,6 +953,930 @@ test("final resolved-thread observation is a conservative recovery barrier", () 
   assert.equal(report.decision, "findings");
 });
 
+test("runner mints an opaque recovery handle only for exact closed prior findings",
+  async () => {
+    const request = issueComment("301", {
+      body: "@codex review",
+      author: HUMAN,
+      created_at: "2026-08-13T11:59:00.000Z",
+      updated_at: "2026-08-13T11:59:00.000Z",
+    });
+    const parent = inlineParentReview("201");
+    const inline = inlineFindingComment("310", parent.id);
+    inline.created_at = parent.submitted_at;
+    inline.updated_at = parent.submitted_at;
+    const resolved = reviewThread("THREAD_310", inline, true);
+    const controller = makeController({
+      requestBindings: [{
+        id: request.id,
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        controlled: true,
+      }],
+      artifactBindings: [{ id: parent.id, request_id: request.id }],
+      budget: {
+        automatic_requests_on_head: 1,
+        automatic_reservations_on_head: 1,
+        manual_requests_in_epoch: 0,
+      },
+    });
+    const discovery = snapshot({
+      issueComments: [request],
+      reviews: [parent],
+      inlineComments: [inline],
+      threads: [resolved],
+      serverTime: "2026-08-13T12:05:00.000Z",
+    });
+    const evidence = snapshot({
+      issueComments: [request],
+      reviews: [parent],
+      inlineComments: [inline],
+      threads: [resolved],
+      exactArtifacts: [
+        exact("issue_comment", request),
+        exact("pull_request_review", parent),
+        exact("inline_comment", inline),
+      ],
+      serverTime: "2026-08-13T12:20:00.000Z",
+    });
+    const input = runnerInput(evidence, controller);
+    input.scheduling.epoch.controlled_request = {
+      request_id: request.id,
+      bound_at: request.created_at,
+      binding_record_oid: "1".repeat(40),
+      binding_receipt_digest: DIGEST,
+    };
+    input.scheduling.epoch.automatic_request = {
+      state: "effect-attempted",
+      generation_index: 1,
+      recovery_authority: null,
+      intent_id: "automatic:1:fixture",
+      intent_persisted_at: request.created_at,
+      effect_attempted_at: request.created_at,
+    };
+    const result = await runV2Operation(input, {
+      transport: sequentialTransport(discovery, evidence),
+      reduceSnapshot: reduceV2Snapshot,
+    });
+    assert.equal(result.decision, "findings");
+    const handle = getV2AutomaticRequestRecoveryHandle(result);
+    assert.equal(
+      assertV2AutomaticRequestRecoveryHandle(handle, {
+        runner_result: result,
+      }),
+      handle,
+    );
+    const proof = projectV2AutomaticRequestRecoveryForGitLedger(handle);
+    assert.equal(proof.prior_generation_id, "automatic:1");
+    assert.equal(proof.next_generation_id, "automatic:2");
+    assert.equal(proof.prior_request_id, request.id);
+    assert.equal(proof.finding_ids.length, 1);
+    assert.deepEqual(proof.closure_ids, [resolved.id]);
+    assert.equal(proof.same_review_epoch, true);
+    const advancedInput = runnerInput(evidence, controller);
+    advancedInput.scheduling.epoch.controlled_request = structuredClone(
+      input.scheduling.epoch.controlled_request,
+    );
+    advancedInput.scheduling.epoch.automatic_request = {
+      state: "available",
+      generation_index: 2,
+      recovery_authority: {
+        prior_generation_id: proof.prior_generation_id,
+        finding_ids: [...proof.finding_ids],
+        closure_ids: [...proof.closure_ids],
+        closure_observed_at: proof.closure_observed_at,
+      },
+      intent_id: null,
+      intent_persisted_at: null,
+      effect_attempted_at: null,
+    };
+    const advanced = await runV2Operation(advancedInput, {
+      transport: sequentialTransport(discovery, evidence),
+      reduceSnapshot: reduceV2Snapshot,
+    });
+    assert.equal(getV2AutomaticRequestRecoveryHandle(advanced), null);
+    assert.equal(
+      getV2AutomaticRecoveryArtifactBindingCandidateHandle(advanced),
+      null,
+    );
+    assert.equal(
+      JSON.stringify(result).includes(
+        "codex-review-gate-runner-automatic-request-recovery-handle-v2",
+      ),
+      false,
+    );
+    assert.equal(JSON.stringify(result).includes("closure_ids"), false);
+    assert.throws(
+      () => getV2AutomaticRequestRecoveryHandle(structuredClone(result)),
+      /exact runner result/u,
+    );
+    assert.throws(
+      () => assertV2AutomaticRequestRecoveryHandle(structuredClone(handle)),
+      /opaque recovery handle/u,
+    );
+  });
+
+test("automatic recovery accepts one exact addressed top-level finding and emits a safe proof",
+  async () => {
+    const fixture = topLevelAutomaticRecoveryFixture();
+    const result = await runAutomaticRecoveryFixture(fixture);
+    const handle = getV2AutomaticRequestRecoveryHandle(result);
+    const proof = projectV2AutomaticRequestRecoveryForGitLedger(handle);
+
+    assert.equal(result.decision, "findings");
+    assert.equal(proof.decision, "findings");
+    assert.equal(proof.snapshot_fingerprint, result.reducer_report.snapshot_fingerprint);
+    assert.equal(proof.review_epoch_id, deriveV2EpochId(fixture.evidence));
+    assert.equal(proof.prior_generation_id, "automatic:1");
+    assert.equal(proof.next_generation_id, "automatic:2");
+    assert.equal(proof.finding_ids.length, 1);
+    assert.equal(proof.closure_records[0].finding_id, proof.finding_ids[0]);
+    assert.deepEqual(proof.closure_ids, [fixture.address.id]);
+    assert.equal(proof.closure_records[0].finding_kind, "top-level");
+    assert.equal(proof.same_review_epoch, true);
+    assertSafeAutomaticRecoveryProof(proof);
+  });
+
+test("automatic recovery advances an exactly admitted second generation to generation three",
+  async () => {
+    const firstRequest = issueComment("301", {
+      body: "@codex review",
+      author: HUMAN,
+      created_at: "2026-08-13T11:40:00.000Z",
+      updated_at: "2026-08-13T11:40:00.000Z",
+    });
+    const firstFinding = issueComment("201", {
+      body:
+        "### 💡 Codex Review\n\n" +
+        `- [P1] First generation https://github.com/owner/repo/blob/${HEAD}/src/a.js#L1`,
+      author: BOT,
+      app: codexApp(),
+      created_at: "2026-08-13T11:45:00.000Z",
+      updated_at: "2026-08-13T11:45:00.000Z",
+    });
+    const firstAddress = issueComment("401", {
+      body: `/codex-gate addressed ${firstFinding.html_url}`,
+      author: HUMAN,
+      created_at: "2026-08-13T11:50:00.000Z",
+      updated_at: "2026-08-13T11:50:00.000Z",
+    });
+    const secondRequest = issueComment("302", {
+      body: "@codex review",
+      author: HUMAN,
+      created_at: "2026-08-13T11:55:00.000Z",
+      updated_at: "2026-08-13T11:55:00.000Z",
+    });
+    const secondFinding = issueComment("202", {
+      body:
+        "### 💡 Codex Review\n\n" +
+        `- [P1] Second generation https://github.com/owner/repo/blob/${HEAD}/src/b.js#L2`,
+      author: BOT,
+      app: codexApp(),
+      created_at: "2026-08-13T12:00:10.000Z",
+      updated_at: "2026-08-13T12:00:10.000Z",
+    });
+    const secondAddress = issueComment("402", {
+      body: `/codex-gate addressed ${secondFinding.html_url}`,
+      author: HUMAN,
+      created_at: "2026-08-13T12:00:30.000Z",
+      updated_at: "2026-08-13T12:00:30.000Z",
+    });
+    const issueComments = [
+      firstFinding,
+      secondFinding,
+      firstRequest,
+      secondRequest,
+      firstAddress,
+      secondAddress,
+    ];
+    const controller = makeController({
+      requestBindings: [{
+        id: firstRequest.id,
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        controlled: true,
+        generation_id: "automatic:1",
+        generation_kind: "automatic",
+        generation_index: 1,
+      }, {
+        id: secondRequest.id,
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        controlled: true,
+        generation_id: "automatic:2",
+        generation_kind: "automatic",
+        generation_index: 2,
+      }],
+      artifactBindings: [{
+        id: firstFinding.id,
+        request_id: firstRequest.id,
+      }, {
+        id: secondFinding.id,
+        request_id: secondRequest.id,
+      }],
+      budget: {
+        automatic_requests_on_head: 2,
+        automatic_reservations_on_head: 2,
+        manual_requests_in_epoch: 0,
+      },
+    });
+    const discovery = snapshot({
+      issueComments,
+      serverTime: "2026-08-13T12:05:00.000Z",
+    });
+    const evidence = snapshot({
+      issueComments,
+      exactArtifacts: issueComments.map((item) =>
+        exact("issue_comment", item)),
+      actorPermissions: [
+        actorPermission(firstAddress.id, firstAddress.author),
+        actorPermission(secondAddress.id, secondAddress.author),
+      ],
+      serverTime: "2026-08-13T12:20:00.000Z",
+    });
+    const projected = projectV2TransportSnapshots({
+      discovery_snapshot: discovery,
+      evidence_snapshot: evidence,
+      controller,
+    });
+    const report = reduceV2Snapshot(projected, {
+      status_target_mode: "test-merge-with-head-sentinel",
+      status_context: "codex/github-review-gate",
+    });
+    const proof = projectV2AutomaticRequestRecoveryAuthority({
+      compact_report: report,
+      reducer_input: projected,
+      discovery_snapshot: discovery,
+      evidence_snapshot: evidence,
+      controller,
+      controlled_request: {
+        request_id: secondRequest.id,
+        bound_at: secondRequest.created_at,
+        binding_record_oid: "2".repeat(40),
+        binding_receipt_digest: DIGEST,
+      },
+    });
+
+    assert.equal(report.request_policy.status, "compliant");
+    assert.equal(proof.prior_generation_id, "automatic:2");
+    assert.equal(proof.next_generation_id, "automatic:3");
+    assert.deepEqual(proof.closure_ids, [secondAddress.id]);
+    assertSafeAutomaticRecoveryProof(proof);
+    const secondGenerationInput = runnerInput(evidence, controller);
+    secondGenerationInput.scheduling.epoch.controlled_request = {
+      request_id: secondRequest.id,
+      bound_at: secondRequest.created_at,
+      binding_record_oid: "2".repeat(40),
+      binding_receipt_digest: DIGEST,
+    };
+    secondGenerationInput.scheduling.epoch.automatic_request = {
+      state: "effect-attempted",
+      generation_index: 2,
+      recovery_authority: {
+        prior_generation_id: "automatic:1",
+        finding_ids: [firstFinding.id],
+        closure_ids: [firstAddress.id],
+        closure_observed_at: firstAddress.created_at,
+      },
+      intent_id: "automatic:2:fixture",
+      intent_persisted_at: secondRequest.created_at,
+      effect_attempted_at: secondRequest.created_at,
+    };
+    const secondGenerationResult = await runV2Operation(
+      secondGenerationInput,
+      {
+        transport: sequentialTransport(discovery, evidence),
+        reduceSnapshot: reduceV2Snapshot,
+        planActions: () => ({ actions: [] }),
+      },
+    );
+    const secondGenerationHandle =
+      getV2AutomaticRequestRecoveryHandle(secondGenerationResult);
+    assert.notEqual(secondGenerationHandle, null);
+    assert.equal(
+      projectV2AutomaticRequestRecoveryForGitLedger(secondGenerationHandle)
+        .prior_generation_id,
+      "automatic:2",
+    );
+
+    const projectWithBetweenGenerationArtifact = (artifact) => {
+      const poisonedComments = [...issueComments, artifact];
+      const poisonedDiscovery = snapshot({
+        issueComments: poisonedComments,
+        serverTime: "2026-08-13T12:05:00.000Z",
+      });
+      const poisonedEvidence = snapshot({
+        issueComments: poisonedComments,
+        exactArtifacts: poisonedComments.map((item) =>
+          exact("issue_comment", item)),
+        actorPermissions: [
+          actorPermission(firstAddress.id, firstAddress.author),
+          actorPermission(secondAddress.id, secondAddress.author),
+        ],
+        serverTime: "2026-08-13T12:20:00.000Z",
+      });
+      const poisonedProjected = projectV2TransportSnapshots({
+        discovery_snapshot: poisonedDiscovery,
+        evidence_snapshot: poisonedEvidence,
+        controller,
+      });
+      const poisonedReport = reduceV2Snapshot(poisonedProjected, {
+        status_target_mode: "test-merge-with-head-sentinel",
+        status_context: "codex/github-review-gate",
+      });
+      assert.equal(poisonedReport.decision, "findings");
+      return projectV2AutomaticRequestRecoveryAuthority({
+        compact_report: poisonedReport,
+        reducer_input: poisonedProjected,
+        discovery_snapshot: poisonedDiscovery,
+        evidence_snapshot: poisonedEvidence,
+        controller,
+        controlled_request: {
+          request_id: secondRequest.id,
+          bound_at: secondRequest.created_at,
+          binding_record_oid: "2".repeat(40),
+          binding_receipt_digest: DIGEST,
+        },
+      });
+    };
+    const betweenGenerationMalformed = issueComment("450", {
+      body: "### 💡 Codex Review\n\nnot a closed finding",
+      author: BOT,
+      app: codexApp(),
+      created_at: "2026-08-13T11:52:00.000Z",
+      updated_at: "2026-08-13T11:52:00.000Z",
+    });
+    assert.equal(
+      projectWithBetweenGenerationArtifact(betweenGenerationMalformed),
+      null,
+    );
+    const unboundEarlierFinding = issueComment("451", {
+      body:
+        "### 💡 Codex Review\n\n" +
+        `- [P1] Unbound predecessor finding https://github.com/owner/repo/blob/${HEAD}/src/c.js#L3`,
+      author: BOT,
+      app: codexApp(),
+      created_at: "2026-08-13T11:43:00.000Z",
+      updated_at: "2026-08-13T11:43:00.000Z",
+    });
+    assert.equal(
+      projectWithBetweenGenerationArtifact(unboundEarlierFinding),
+      null,
+    );
+  });
+
+test("generation three findings do not mint a useless artifact-binding candidate",
+  async () => {
+    const requests = ["301", "302", "303"].map((id, index) =>
+      issueComment(id, {
+        body: "@codex review",
+        author: HUMAN,
+        created_at: `2026-08-13T11:${30 + index * 10}:00.000Z`,
+        updated_at: `2026-08-13T11:${30 + index * 10}:00.000Z`,
+      }));
+    const findings = ["201", "202", "203"].map((id, index) =>
+      issueComment(id, {
+        body:
+          "### 💡 Codex Review\n\n" +
+          `- [P1] Generation ${index + 1} https://github.com/owner/repo/blob/${HEAD}/src/a.js#L${index + 1}`,
+        author: BOT,
+        app: codexApp(),
+        created_at: `2026-08-13T11:${32 + index * 10}:00.000Z`,
+        updated_at: `2026-08-13T11:${32 + index * 10}:00.000Z`,
+      }));
+    const addresses = ["401", "402"].map((id, index) =>
+      issueComment(id, {
+        body: `/codex-gate addressed ${findings[index].html_url}`,
+        author: HUMAN,
+        created_at: `2026-08-13T11:${34 + index * 10}:00.000Z`,
+        updated_at: `2026-08-13T11:${34 + index * 10}:00.000Z`,
+      }));
+    const issueComments = [
+      findings[0], addresses[0], requests[0], findings[1], addresses[1],
+      requests[1], requests[2], findings[2],
+    ];
+    const controller = makeController({
+      requestBindings: requests.map((request, index) => ({
+        id: request.id,
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        controlled: true,
+        generation_id: `automatic:${index + 1}`,
+        generation_kind: "automatic",
+        generation_index: index + 1,
+      })),
+      artifactBindings: findings.slice(0, 2).map((finding, index) => ({
+        id: finding.id,
+        request_id: requests[index].id,
+      })),
+      budget: {
+        automatic_requests_on_head: 3,
+        automatic_reservations_on_head: 3,
+        manual_requests_in_epoch: 0,
+      },
+    });
+    const discovery = snapshot({
+      issueComments,
+      serverTime: "2026-08-13T12:05:00.000Z",
+    });
+    const evidence = snapshot({
+      issueComments,
+      exactArtifacts: issueComments.map((item) =>
+        exact("issue_comment", item)),
+      actorPermissions: addresses.map((address) =>
+        actorPermission(address.id, address.author)),
+      serverTime: "2026-08-13T12:20:00.000Z",
+    });
+    const input = automaticRecoveryRunnerInput(
+      evidence,
+      controller,
+      requests[2],
+    );
+    input.scheduling.epoch.automatic_request = {
+      ...input.scheduling.epoch.automatic_request,
+      generation_index: 3,
+      intent_id: "automatic:3:fixture",
+      recovery_authority: {
+        prior_generation_id: "automatic:2",
+        finding_ids: [findings[1].id],
+        closure_ids: [addresses[1].id],
+        closure_observed_at: addresses[1].created_at,
+      },
+    };
+    const result = await runV2Operation(input, {
+      transport: sequentialTransport(discovery, evidence),
+      reduceSnapshot: reduceV2Snapshot,
+    });
+    assert.equal(result.decision, "findings");
+    assert.equal(
+      getV2AutomaticRecoveryArtifactBindingCandidateHandle(result),
+      null,
+    );
+    assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+  });
+
+test("automatic recovery requires the final raw inline thread to be resolved",
+  async () => {
+    const fixture = inlineAutomaticRecoveryFixture({ resolved: false });
+    const result = await runAutomaticRecoveryFixture(fixture);
+    assert.equal(result.decision, "findings");
+    assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+
+    const projected = projectV2TransportSnapshots({
+      discovery_snapshot: fixture.discovery,
+      evidence_snapshot: fixture.evidence,
+      controller: fixture.controller,
+    });
+    const forged = structuredClone(projected);
+    forged.threads[0].is_resolved = true;
+    forged.threads[0].resolution_observed_at = fixture.evidence.server_time;
+    const forgedReport = reduceV2Snapshot(forged, {
+      status_target_mode: "test-merge-with-head-sentinel",
+      status_context: "codex/github-review-gate",
+    });
+    assert.equal(forgedReport.evidence_basis.kind, "terminal-findings");
+    assert.equal(projectV2AutomaticRequestRecoveryAuthority({
+      compact_report: forgedReport,
+      reducer_input: forged,
+      discovery_snapshot: fixture.discovery,
+      evidence_snapshot: fixture.evidence,
+      controller: fixture.controller,
+      controlled_request: automaticRecoveryRunnerInput(
+        fixture.evidence,
+        fixture.controller,
+        fixture.request,
+      ).scheduling.epoch.controlled_request,
+    }), null);
+  });
+
+test("automatic top-level recovery rejects incomplete or unstable raw authority",
+  async (context) => {
+    await context.test("missing exact finding artifact", async () => {
+      const fixture = topLevelAutomaticRecoveryFixture();
+      fixture.evidence.pages.exact_artifacts =
+        fixture.evidence.pages.exact_artifacts.filter((receipt) =>
+          receipt.selector.id !== fixture.finding.id);
+      fixture.evidence.completeness.item_count -= 1;
+      await assert.rejects(
+        runAutomaticRecoveryFixture(fixture),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "MISSING_EXACT_ARTIFACT",
+      );
+    });
+
+    await context.test("edited address body", async () => {
+      const fixture = topLevelAutomaticRecoveryFixture({
+        addressOverrides: { updated_at: "2026-08-13T12:00:31.000Z" },
+      });
+      await assert.rejects(
+        runAutomaticRecoveryFixture(fixture),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "ADDRESS_COMMAND_EDITED",
+      );
+    });
+
+    await context.test("Bot address actor", async () => {
+      const fixture = topLevelAutomaticRecoveryFixture({
+        addressOverrides: { author: BOT, app: codexApp() },
+      });
+      await assert.rejects(
+        runAutomaticRecoveryFixture(fixture),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "ADDRESS_COMMAND_ACTOR_INVALID",
+      );
+    });
+
+    await context.test("permission drift", async () => {
+      const fixture = topLevelAutomaticRecoveryFixture({
+        permissionMutator(permission) {
+          permission.stable = false;
+        },
+      });
+      await assert.rejects(
+        runAutomaticRecoveryFixture(fixture),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "PERMISSION_UNSTABLE",
+      );
+    });
+
+    await context.test("missing permission receipt", async () => {
+      const fixture = topLevelAutomaticRecoveryFixture();
+      fixture.evidence.permissions.actor_permissions = [];
+      await assert.rejects(
+        runAutomaticRecoveryFixture(fixture),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "MISSING_ACTOR_PERMISSION",
+      );
+    });
+
+    await context.test("closure does not strictly follow finding", async () => {
+      const fixture = topLevelAutomaticRecoveryFixture({
+        addressOverrides: {
+          created_at: "2026-08-13T12:00:10.000Z",
+          updated_at: "2026-08-13T12:00:10.000Z",
+        },
+      });
+      await assert.rejects(
+        runAutomaticRecoveryFixture(fixture),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "ADDRESS_COMMAND_NOT_LATER",
+      );
+    });
+  });
+
+test("automatic recovery rejects partial multi-finding closure and misbound findings",
+  async (context) => {
+    await context.test("one of two inline findings remains unresolved", async () => {
+      const fixture = inlineAutomaticRecoveryFixture({
+        resolved: true,
+        secondResolved: false,
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(result.decision, "findings");
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("finding has null request_id", async () => {
+      const fixture = inlineAutomaticRecoveryFixture({ artifactRequestId: null });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(result.decision, "findings");
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("forged reducer request binding is not authority", () => {
+      const fixture = inlineAutomaticRecoveryFixture({ artifactRequestId: null });
+      const projected = projectV2TransportSnapshots({
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+      });
+      const forged = structuredClone(projected);
+      const artifact = forged.artifacts.find((item) =>
+        item.kind === "terminal-findings");
+      assert.ok(artifact);
+      artifact.request_id = fixture.request.id;
+      const forgedReport = reduceV2Snapshot(forged, {
+        status_target_mode: "test-merge-with-head-sentinel",
+        status_context: "codex/github-review-gate",
+      });
+      assert.equal(forgedReport.decision, "findings");
+      assert.equal(projectV2AutomaticRequestRecoveryAuthority({
+        compact_report: forgedReport,
+        reducer_input: forged,
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+        controlled_request: automaticRecoveryRunnerInput(
+          fixture.evidence,
+          fixture.controller,
+          fixture.request,
+        ).scheduling.epoch.controlled_request,
+      }), null);
+    });
+
+    await context.test("forged reducer cannot omit an unresolved provider sibling", () => {
+      const fixture = inlineAutomaticRecoveryFixture({
+        resolved: true,
+        secondResolved: false,
+      });
+      const projected = projectV2TransportSnapshots({
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+      });
+      const forged = structuredClone(projected);
+      const omittedFindingId = "thread:THREAD_311";
+      const artifact = forged.artifacts.find((item) =>
+        item.kind === "terminal-findings");
+      assert.ok(artifact);
+      artifact.finding_ids = artifact.finding_ids.filter((findingId) =>
+        findingId !== omittedFindingId);
+      forged.threads = forged.threads.filter((thread) =>
+        thread.finding_id !== omittedFindingId);
+      const forgedReport = reduceV2Snapshot(forged, {
+        status_target_mode: "test-merge-with-head-sentinel",
+        status_context: "codex/github-review-gate",
+      });
+      assert.equal(forgedReport.decision, "findings");
+      assert.equal(projectV2AutomaticRequestRecoveryAuthority({
+        compact_report: forgedReport,
+        reducer_input: forged,
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+        controlled_request: automaticRecoveryRunnerInput(
+          fixture.evidence,
+          fixture.controller,
+          fixture.request,
+        ).scheduling.epoch.controlled_request,
+      }), null);
+    });
+
+    await context.test("finding is bound to a different request", async () => {
+      const manual = issueComment("300", {
+        body: "@codex review",
+        author: HUMAN,
+        created_at: "2026-08-13T11:58:00.000Z",
+        updated_at: "2026-08-13T11:58:00.000Z",
+      });
+      const fixture = inlineAutomaticRecoveryFixture({
+        extraRequests: [manual],
+        extraRequestBindings: [{
+          id: manual.id,
+          kind: "manual",
+          base_oid: BASE,
+          head_oid: HEAD,
+          controlled: false,
+          generation_id: "manual:1",
+          generation_kind: "manual",
+          generation_index: 1,
+        }],
+        actorPermissions: [actorPermission(manual.id, manual.author)],
+        artifactRequestId: manual.id,
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(result.decision, "findings");
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("a later unbound terminal clean remains visible", async () => {
+      const clean = issueComment("500", {
+        body: CLEAN_BODY,
+        author: BOT,
+        app: codexApp(),
+        created_at: "2026-08-13T12:10:00.000Z",
+        updated_at: "2026-08-13T12:10:00.000Z",
+      });
+      const fixture = inlineAutomaticRecoveryFixture({
+        extraRequests: [clean],
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(result.decision, "findings");
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("equal-time malformed terminal outranks findings", async () => {
+      const malformed = issueComment("199", {
+        body: "### 💡 Codex Review\n\nnot a closed finding",
+        author: BOT,
+        app: codexApp(),
+        created_at: "2026-08-13T12:00:10.000Z",
+        updated_at: "2026-08-13T12:00:10.000Z",
+      });
+      const fixture = topLevelAutomaticRecoveryFixture({
+        extraIssueComments: [malformed],
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("equal-time cross-channel findings are ambiguous", async () => {
+      const topLevel = issueComment("202", {
+        body:
+          "### 💡 Codex Review\n\n" +
+          `- [P1] Cross-channel https://github.com/owner/repo/blob/${HEAD}/src/a.js#L1`,
+        author: BOT,
+        app: codexApp(),
+        created_at: "2026-08-13T12:00:00.000Z",
+        updated_at: "2026-08-13T12:00:00.000Z",
+      });
+      const fixture = inlineAutomaticRecoveryFixture({
+        extraRequests: [topLevel],
+        extraArtifactBindings: [{
+          id: topLevel.id,
+          request_id: "301",
+        }],
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+  });
+
+test("automatic recovery rejects ineligible controlled request generations",
+  async (context) => {
+    await context.test("uncontrolled request", async () => {
+      const fixture = inlineAutomaticRecoveryFixture({
+        requestBindingOverrides: { controlled: false },
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("edited request", async () => {
+      const fixture = inlineAutomaticRecoveryFixture({
+        requestOverrides: { updated_at: "2026-08-13T11:59:01.000Z" },
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("forged compliant request policy is not authority", () => {
+      const editedManual = issueComment("300", {
+        body: "@codex review",
+        author: HUMAN,
+        created_at: "2026-08-13T11:50:00.000Z",
+        updated_at: "2026-08-13T11:50:01.000Z",
+      });
+      const fixture = topLevelAutomaticRecoveryFixture({
+        extraIssueComments: [editedManual],
+        extraRequestBindings: [{
+          id: editedManual.id,
+          kind: "manual",
+          base_oid: BASE,
+          head_oid: HEAD,
+          controlled: false,
+          generation_id: "manual:1",
+          generation_kind: "manual",
+          generation_index: 1,
+        }],
+        extraActorPermissions: [
+          actorPermission(editedManual.id, editedManual.author),
+        ],
+      });
+      const projected = projectV2TransportSnapshots({
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+      });
+      const report = reduceV2Snapshot(projected, {
+        status_target_mode: "test-merge-with-head-sentinel",
+        status_context: "codex/github-review-gate",
+      });
+      assert.equal(report.decision, "findings");
+      assert.equal(report.request_policy.status, "unknown");
+      const forgedReport = structuredClone(report);
+      forgedReport.request_policy.status = "compliant";
+      assert.equal(projectV2AutomaticRequestRecoveryAuthority({
+        compact_report: forgedReport,
+        reducer_input: projected,
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+        controlled_request: automaticRecoveryRunnerInput(
+          fixture.evidence,
+          fixture.controller,
+          fixture.request,
+        ).scheduling.epoch.controlled_request,
+      }), null);
+    });
+
+    await context.test("generation two without admitted generation one", async () => {
+      const fixture = inlineAutomaticRecoveryFixture({
+        requestBindingOverrides: {
+          generation_id: "automatic:2",
+          generation_kind: "automatic",
+          generation_index: 2,
+        },
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("visible later unadmitted request", async () => {
+      const later = issueComment("302", {
+        body: "@codex review",
+        author: HUMAN,
+        created_at: "2026-08-13T12:04:00.000Z",
+        updated_at: "2026-08-13T12:04:00.000Z",
+      });
+      const fixture = inlineAutomaticRecoveryFixture({
+        extraRequests: [later],
+        extraRequestBindings: [{
+          id: later.id,
+          kind: "automatic",
+          base_oid: BASE,
+          head_oid: HEAD,
+          controlled: true,
+          generation_id: "automatic:2",
+          generation_kind: "automatic",
+          generation_index: 2,
+        }],
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(result.decision, "findings");
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+
+    await context.test("request budget does not admit the visible generation", async () => {
+      const fixture = inlineAutomaticRecoveryFixture({
+        budget: {
+          automatic_requests_on_head: 0,
+          automatic_reservations_on_head: 0,
+          manual_requests_in_epoch: 0,
+        },
+      });
+      await assert.rejects(
+        runAutomaticRecoveryFixture(fixture),
+        (error) => error instanceof V2PublicReportProjectionError &&
+          error.code === "PUBLIC_REPORT_UNREPRESENTABLE",
+      );
+    });
+
+    await context.test("duplicate generation identity", async () => {
+      const duplicate = issueComment("302", {
+        body: "@codex review",
+        author: HUMAN,
+        created_at: "2026-08-13T12:04:00.000Z",
+        updated_at: "2026-08-13T12:04:00.000Z",
+      });
+      const fixture = inlineAutomaticRecoveryFixture({
+        extraRequests: [duplicate],
+        extraRequestBindings: [{
+          id: duplicate.id,
+          kind: "automatic",
+          base_oid: BASE,
+          head_oid: HEAD,
+          controlled: true,
+          generation_id: "automatic:1",
+          generation_kind: "automatic",
+          generation_index: 1,
+        }],
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+    });
+  });
+
+test("automatic recovery review epoch follows repository, PR, and head across base retarget",
+  async () => {
+    const retargetedBase = "9".repeat(40);
+    const retargetedMergeBase = "8".repeat(40);
+    const fixture = inlineAutomaticRecoveryFixture({
+      scopeOverrides: {
+        base_ref_tip: retargetedBase,
+        merge_base_sha: retargetedMergeBase,
+        ordered_parent_oids: [retargetedBase, HEAD],
+      },
+    });
+    const result = await runAutomaticRecoveryFixture(fixture);
+    const proof = projectV2AutomaticRequestRecoveryForGitLedger(
+      getV2AutomaticRequestRecoveryHandle(result),
+    );
+    assert.equal(fixture.controller.request_bindings[0].base_oid, BASE);
+    assert.equal(proof.scope.base_oid, retargetedBase);
+    assert.equal(proof.review_epoch_id, deriveV2EpochId(fixture.evidence));
+    assert.equal(proof.same_review_epoch, true);
+  });
+
+test("automatic recovery does not cross a head epoch", async () => {
+  const differentHead = "7".repeat(40);
+  const fixture = inlineAutomaticRecoveryFixture({
+    scopeOverrides: {
+      head_ref_oid: differentHead,
+      ordered_parent_oids: [BASE, differentHead],
+    },
+  });
+  await assert.rejects(
+    runAutomaticRecoveryFixture(fixture),
+    (error) => error instanceof V2ProjectorError &&
+      error.code === "ARTIFACT_GENERATION_BINDING_INVALID",
+  );
+});
+
 test("inline evidence requires exact provider identity on its parent review", () => {
   const parent = inlineParentReview("201");
   parent.app = { id: "42", slug: "other-app", node_id: "APP_other" };
@@ -1342,6 +2274,8 @@ function runnerInput(snapshotValue, controller) {
         controlled_request: null,
         automatic_request: {
           state: "available",
+          generation_index: 1,
+          recovery_authority: null,
           intent_id: null,
           intent_persisted_at: null,
           effect_attempted_at: null,
@@ -1366,6 +2300,275 @@ function runnerInput(snapshotValue, controller) {
     reservation: null,
     post_response: null,
   };
+}
+
+function automaticRecoveryRunnerInput(evidence, controller, request) {
+  const input = runnerInput(evidence, controller);
+  input.scheduling.epoch.controlled_request = {
+    request_id: request.id,
+    bound_at: request.created_at,
+    binding_record_oid: "1".repeat(40),
+    binding_receipt_digest: DIGEST,
+  };
+  input.scheduling.epoch.automatic_request = {
+    state: "effect-attempted",
+    generation_index: 1,
+    recovery_authority: null,
+    intent_id: "automatic:1:fixture",
+    intent_persisted_at: request.created_at,
+    effect_attempted_at: request.created_at,
+  };
+  return input;
+}
+
+async function runAutomaticRecoveryFixture(fixture) {
+  return runV2Operation(
+    automaticRecoveryRunnerInput(
+      fixture.evidence,
+      fixture.controller,
+      fixture.request,
+    ),
+    {
+      transport: sequentialTransport(fixture.discovery, fixture.evidence),
+      reduceSnapshot: reduceV2Snapshot,
+    },
+  );
+}
+
+function inlineAutomaticRecoveryFixture({
+  resolved = true,
+  secondResolved = null,
+  requestOverrides = {},
+  requestBindingOverrides = {},
+  extraRequests = [],
+  extraRequestBindings = [],
+  actorPermissions = [],
+  artifactRequestId = "301",
+  extraArtifactBindings = [],
+  budget = null,
+  scopeOverrides = {},
+} = {}) {
+  const request = issueComment("301", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T11:59:00.000Z",
+    updated_at: "2026-08-13T11:59:00.000Z",
+    ...requestOverrides,
+  });
+  const parent = inlineParentReview("201");
+  const inline = inlineFindingComment("310", parent.id);
+  inline.created_at = "2026-08-13T12:00:00.000Z";
+  inline.updated_at = inline.created_at;
+  const threads = [reviewThread("THREAD_310", inline, resolved)];
+  const inlineComments = [inline];
+  if (secondResolved !== null) {
+    const secondInline = inlineFindingComment("311", parent.id);
+    secondInline.created_at = "2026-08-13T12:00:00.000Z";
+    secondInline.updated_at = secondInline.created_at;
+    inlineComments.push(secondInline);
+    threads.push(reviewThread("THREAD_311", secondInline, secondResolved));
+  }
+  const issueComments = [request, ...extraRequests];
+  const controller = makeController({
+    requestBindings: [{
+      id: request.id,
+      kind: "automatic",
+      base_oid: BASE,
+      head_oid: HEAD,
+      controlled: true,
+      generation_id: "automatic:1",
+      generation_kind: "automatic",
+      generation_index: 1,
+      ...requestBindingOverrides,
+    }, ...extraRequestBindings],
+    artifactBindings: [
+      ...(artifactRequestId === null
+        ? []
+        : [{ id: parent.id, request_id: artifactRequestId }]),
+      ...extraArtifactBindings,
+    ],
+    budget: budget ?? {
+      automatic_requests_on_head: 1 + extraRequestBindings.filter(
+        (binding) => binding.kind === "automatic",
+      ).length,
+      automatic_reservations_on_head: 1 + extraRequestBindings.filter(
+        (binding) => binding.kind === "automatic",
+      ).length,
+      manual_requests_in_epoch: extraRequestBindings.filter(
+        (binding) => binding.kind === "manual",
+      ).length,
+    },
+  });
+  const snapshotInput = {
+    issueComments,
+    reviews: [parent],
+    inlineComments,
+    threads,
+    scopeOverrides,
+  };
+  const discovery = snapshot({
+    ...snapshotInput,
+    serverTime: "2026-08-13T12:05:00.000Z",
+  });
+  const evidence = snapshot({
+    ...snapshotInput,
+    exactArtifacts: [
+      ...issueComments.map((item) => exact("issue_comment", item)),
+      exact("pull_request_review", parent),
+      ...inlineComments.map((item) => exact("inline_comment", item)),
+    ],
+    actorPermissions,
+    serverTime: "2026-08-13T12:20:00.000Z",
+  });
+  for (const value of [discovery, evidence]) {
+    value.service_start_observations.head_sha = value.scope.head_ref_oid;
+  }
+  return {
+    request,
+    parent,
+    inlineComments,
+    threads,
+    controller,
+    discovery,
+    evidence,
+  };
+}
+
+function topLevelAutomaticRecoveryFixture({
+  addressOverrides = {},
+  permissionMutator = null,
+  scopeOverrides = {},
+  extraIssueComments = [],
+  extraRequestBindings = [],
+  extraActorPermissions = [],
+  budget = null,
+} = {}) {
+  const request = issueComment("301", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T11:59:00.000Z",
+    updated_at: "2026-08-13T11:59:00.000Z",
+  });
+  const finding = issueComment("202", {
+    body:
+      "### 💡 Codex Review\n\n" +
+      `- [P1] Fix the current-head issue https://github.com/owner/repo/blob/${HEAD}/src/a.js#L1`,
+    author: BOT,
+    app: codexApp(),
+    created_at: "2026-08-13T12:00:10.000Z",
+    updated_at: "2026-08-13T12:00:10.000Z",
+  });
+  const address = issueComment("303", {
+    body: `/codex-gate addressed ${finding.html_url}`,
+    author: HUMAN,
+    created_at: "2026-08-13T12:00:30.000Z",
+    updated_at: "2026-08-13T12:00:30.000Z",
+    ...addressOverrides,
+  });
+  const permission = actorPermission(address.id, address.author);
+  if (permissionMutator !== null) permissionMutator(permission);
+  const controller = makeController({
+    requestBindings: [{
+      id: request.id,
+      kind: "automatic",
+      base_oid: BASE,
+      head_oid: HEAD,
+      controlled: true,
+    }, ...extraRequestBindings],
+    artifactBindings: [{ id: finding.id, request_id: request.id }],
+    budget: budget ?? {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 1,
+      manual_requests_in_epoch: extraRequestBindings.filter(
+        (binding) => binding.kind === "manual",
+      ).length,
+    },
+  });
+  const snapshotInput = {
+    issueComments: [request, finding, address, ...extraIssueComments],
+    scopeOverrides,
+  };
+  const discovery = snapshot({
+    ...snapshotInput,
+    serverTime: "2026-08-13T12:05:00.000Z",
+  });
+  const evidence = snapshot({
+    ...snapshotInput,
+    exactArtifacts: [
+      exact("issue_comment", request),
+      exact("issue_comment", finding),
+      exact("issue_comment", address),
+      ...extraIssueComments.map((item) => exact("issue_comment", item)),
+    ],
+    actorPermissions: [permission, ...extraActorPermissions],
+    serverTime: "2026-08-13T12:20:00.000Z",
+  });
+  return {
+    request,
+    finding,
+    address,
+    permission,
+    controller,
+    discovery,
+    evidence,
+  };
+}
+
+function assertSafeAutomaticRecoveryProof(proof) {
+  assert.equal(Object.isFrozen(proof), true);
+  assert.equal(Object.isFrozen(proof.scope), true);
+  assert.equal(Object.isFrozen(proof.closure_records), true);
+  assert.deepEqual(Object.keys(proof).sort(), [
+    "authority_digest",
+    "closure_ids",
+    "closure_observed_at",
+    "closure_records",
+    "decision",
+    "evidence_snapshot_digest",
+    "final_reread_sha256",
+    "final_snapshot_server_time",
+    "finding_ids",
+    "finding_observed_at",
+    "next_generation_id",
+    "next_generation_index",
+    "pagination_sha256",
+    "prior_generation_id",
+    "prior_generation_index",
+    "prior_request_binding_receipt_digest",
+    "prior_request_binding_record_oid",
+    "prior_request_id",
+    "reducer_input_digest",
+    "reducer_report_digest",
+    "review_epoch_id",
+    "same_review_epoch",
+    "schema",
+    "schema_version",
+    "scope",
+    "scope_digest",
+    "snapshot_fingerprint",
+  ].sort());
+  for (const record of proof.closure_records) {
+    assert.equal(Object.isFrozen(record), true);
+    assert.deepEqual(Object.keys(record).sort(), [
+      "closure_authority_digest",
+      "closure_id",
+      "closure_server_time",
+      "finding_artifact_id",
+      "finding_id",
+      "finding_kind",
+      "finding_server_time",
+    ].sort());
+  }
+  const serialized = JSON.stringify(proof);
+  for (const forbidden of [
+    "@codex review",
+    "raw_body",
+    "pages",
+    "token",
+    "authorization",
+  ]) {
+    assert.equal(serialized.includes(forbidden), false, forbidden);
+  }
 }
 
 function sequentialTransport(discovery, evidence) {

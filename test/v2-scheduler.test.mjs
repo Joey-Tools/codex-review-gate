@@ -42,12 +42,87 @@ function snapshot(overrides = {}) {
 function automaticRequest(overrides = {}) {
   return {
     state: "available",
+    generation_index: 1,
+    recovery_authority: null,
     intent_id: null,
     intent_persisted_at: null,
     effect_attempted_at: null,
     ...overrides,
   };
 }
+
+function recoveryAuthority(priorGenerationIndex = 1) {
+  return {
+    prior_generation_id: `automatic:${priorGenerationIndex}`,
+    finding_ids: ["finding-1"],
+    closure_ids: ["closure-1"],
+    closure_observed_at: at(PUBLIC_INITIAL_WAIT_MS - 1),
+  };
+}
+
+test("a proved prior findings generation schedules only the immediate next generation", () => {
+  const plan = planV2Actions(input({
+    now: at(PUBLIC_INITIAL_WAIT_MS),
+    evaluation: snapshot({
+      decision: "findings",
+      observed_at: at(PUBLIC_INITIAL_WAIT_MS),
+    }),
+    epoch: {
+      controlled_request: controlledRequest(at(PUBLIC_INITIAL_WAIT_MS - 2)),
+      automatic_request: automaticRequest({
+        generation_index: 2,
+        recovery_authority: recoveryAuthority(1),
+      }),
+    },
+  }));
+
+  assert.deepEqual(plan.actions.map((action) => action.kind), [
+    "publish_status",
+    "persist_auto_request_intent",
+    "post_review_request",
+  ]);
+  const persist = actionsOfKind(plan, "persist_auto_request_intent")[0];
+  const post = actionsOfKind(plan, "post_review_request")[0];
+  assert.match(persist.intent_id, /automatic:2/u);
+  assert.match(persist.idempotency_key, /automatic:2/u);
+  assert.match(post.idempotency_key, /automatic:2/u);
+
+  assert.throws(
+    () => planV2Actions(input({
+      epoch: {
+        controlled_request: null,
+        automatic_request: automaticRequest({
+          generation_index: 4,
+          recovery_authority: recoveryAuthority(3),
+        }),
+      },
+    })),
+    /generation_index/u,
+  );
+  for (const closureObservedAt of [
+    new Date(Date.parse(START) - 1).toISOString(),
+    at(PUBLIC_INITIAL_WAIT_MS + 1),
+  ]) {
+    assert.throws(
+      () => planV2Actions(input({
+        now: at(PUBLIC_INITIAL_WAIT_MS),
+        epoch: {
+          controlled_request: controlledRequest(
+            at(PUBLIC_INITIAL_WAIT_MS - 2),
+          ),
+          automatic_request: automaticRequest({
+            generation_index: 2,
+            recovery_authority: {
+              ...recoveryAuthority(1),
+              closure_observed_at: closureObservedAt,
+            },
+          }),
+        },
+      })),
+      /within the current review epoch/u,
+    );
+  }
+});
 
 function controlledRequest(boundAt, overrides = {}) {
   return {

@@ -20,6 +20,7 @@ import test from "node:test";
 import {
   assembleV2ProductionControllerCycle,
   acquireV2LeaseThenLoadDiscovery,
+  assertV2InitialProductionLedgerApi,
   assertV2LeasedDiscoveryContinuityHandle,
   assertV2MinimalLiveScopeHandle,
   assertV2MinimalScopeMatchesFullDiscovery,
@@ -55,6 +56,9 @@ import {
   createV2GitHubTransport,
 } from "../packages/action/src/v2/transport.mjs";
 import {
+  MAX_V2_CANDIDATE_SCAN_PASSES,
+} from "../packages/action/src/v2/candidate-inventory.mjs";
+import {
   V2_GIT_LEDGER_BLOB_PATH,
   V2_GIT_LEDGER_OIDC_AUDIENCE,
   V2_GIT_LEDGER_OIDC_CLAIMS,
@@ -84,6 +88,15 @@ const ARTIFACT_URL =
   "https://github.com/owner/repo/pull/7#issuecomment-2001";
 const NO_START_URL =
   "https://github.com/owner/repo/pull/7#issuecomment-2002";
+const PROTECTED_AUTOMATIC_RECOVERY_INTERNAL = new RegExp([
+  "recovery_handle",
+  "artifact_binding_candidate_handle",
+  "artifact_binding_intent_handle",
+  "provider_artifact_handles",
+  "ready_reachability_boundary",
+  "closure_records",
+  "evidence_snapshot",
+].join("|"), "u");
 const CONTROLLER_PATH = fileURLToPath(new URL(
   "../packages/action/src/v2/workflow-controller.mjs",
   import.meta.url,
@@ -2657,6 +2670,333 @@ test("production initial route binds the full branded automatic request chain", 
   });
 });
 
+test("production ledger API preflight precedes lease acquisition", async () => {
+  const source = await readFile(CONTROLLER_PATH, "utf8");
+  const observationStart = source.indexOf(
+    "async function assembleV2InitialProductionObservation",
+  );
+  const apiPreflight = source.indexOf(
+    "assertV2InitialProductionLedgerApi(ledger);",
+    observationStart,
+  );
+  const leaseAcquire = source.indexOf(
+    "const discovery = await acquireV2LeaseThenLoadDiscovery",
+    observationStart,
+  );
+  assert.ok(observationStart >= 0);
+  assert.ok(apiPreflight >= 0);
+  assert.ok(leaseAcquire >= 0);
+  assert.ok(
+    apiPreflight < leaseAcquire,
+    "every production ledger API must be checked before lease acquisition",
+  );
+});
+
+test("production ledger API preflight rejects invalid status intent without effects",
+  () => {
+    for (const [variant, invalid] of [
+      ["missing", undefined],
+      ["nonfunction", { invalid: true }],
+    ]) {
+      const calls = [];
+      const ledger = {
+        loadControlPlaneAuthority() { calls.push("control-plane"); },
+        loadInitialRunnerStateAuthority() { calls.push("initial-runner"); },
+        loadEstablishedRunnerStateAuthority() {
+          calls.push("established-runner");
+        },
+        appendInitialSchedulerObservation() {
+          calls.push("initial-scheduler-write");
+        },
+        appendEstablishedSchedulerObservation() {
+          calls.push("established-scheduler-write");
+        },
+        loadNextStatusWriteIntent() { calls.push("status-intent"); },
+        acquireLease() { calls.push("lease-acquire"); },
+      };
+      if (variant === "missing") {
+        delete ledger.loadNextStatusWriteIntent;
+      } else {
+        ledger.loadNextStatusWriteIntent = invalid;
+      }
+
+      assert.throws(
+        () => assertV2InitialProductionLedgerApi(ledger),
+        (error) => {
+          assert.equal(error?.code, "INITIAL_RUNNER_AUTHORITY_REQUIRED");
+          assert.equal(error.details.public_effects_performed, 0);
+          assert.match(error.message, /loadNextStatusWriteIntent/u);
+          return true;
+        },
+      );
+      assert.deepEqual(calls, [], `${variant} API must fail before effects`);
+    }
+  });
+
+test("production binds a terminal primary status before its head sentinel", async () => {
+  await withWorkflowCliFixture({
+    eventName: "pull_request_target",
+    event: { pull_request: { number: 7 } },
+    route: "ordinary",
+    pullRequest: "7",
+  }, async ({ environment }) => {
+    const command = await prepareV2WorkflowCommand(environment);
+    const liveTime = new Date().toISOString();
+    const oidc = productionOidcFixture(command, liveTime);
+    const github = productionControllerGitHubFixture(command, oidc, liveTime, {
+      snapshotIssueComments: [productionTerminalFindingIssueComment()],
+    });
+
+    const result = await runV2WorkflowControllerCli({
+      ...environment,
+      ...oidc.environment,
+      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+      GITHUB_API_URL: "https://api.github.test",
+    }, { fetch: github.fetch });
+
+    assert.equal(result.cycle.terminal_result.decision, "findings");
+    assert.equal(result.cycle.terminal_result.status_effect_outcome, "bound");
+    assert.equal(result.cycle.terminal_result.public_effects_performed, 2);
+    assert.deepEqual(
+      result.cycle.status_receipts.map((receipt) => receipt.target_sha),
+      [MERGE, HEAD],
+    );
+    assert.deepEqual(github.externalWrites, [
+      `POST /repos/owner/repo/statuses/${MERGE}`,
+      `POST /repos/owner/repo/statuses/${HEAD}`,
+    ]);
+    assert.equal(github.statusPostCount(), 2);
+    assert.equal(github.statusRefetchCount(), 2);
+    assert.deepEqual(github.effectRecordKinds().slice(-7), [
+      "lease-acquire:",
+      "effect-intent:scheduler-observation",
+      "effect-intent:status-write",
+      "effect-response:status-write",
+      "effect-intent:status-write",
+      "effect-response:status-write",
+      "lease-release:",
+    ]);
+    assertNoProtectedProductionInternals(result.cycle);
+  });
+});
+
+for (const failedIntentOrdinal of [1, 2]) {
+  test(`status transaction resumes a ${failedIntentOrdinal - 1}-write bound prefix`,
+    async () => {
+      await withWorkflowCliFixture({
+        eventName: "pull_request_target",
+        event: { pull_request: { number: 7 } },
+        route: "ordinary",
+        pullRequest: "7",
+      }, async ({ environment, runnerTemp }) => {
+        const command = await prepareV2WorkflowCommand(environment);
+        const liveTime = new Date().toISOString();
+        const oidc = productionOidcFixture(command, liveTime);
+        const github = productionControllerGitHubFixture(command, oidc, liveTime, {
+          snapshotIssueComments: [productionTerminalFindingIssueComment()],
+        });
+        github.failRecordUpdateAt(
+          "effect-intent:status-write",
+          failedIntentOrdinal,
+        );
+        const firstEnvironment = {
+          ...environment,
+          ...oidc.environment,
+          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+          GITHUB_API_URL: "https://api.github.test",
+        };
+
+        await assert.rejects(
+          runV2WorkflowControllerCli(firstEnvironment, { fetch: github.fetch }),
+          (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+        );
+        assert.equal(github.statusPostCount(), failedIntentOrdinal - 1);
+        assert.equal(github.statusRefetchCount(), failedIntentOrdinal - 1);
+
+        const restartEnvironment = await makeWorkflowLegEnvironment({
+          environment: firstEnvironment,
+          runnerTemp,
+          name: `status-prefix-${failedIntentOrdinal}`,
+          runId: `12345${failedIntentOrdinal + 6}`,
+          route: "ordinary",
+          pullRequest: "7",
+        });
+        const restartCommand = await prepareV2WorkflowCommand(
+          restartEnvironment,
+        );
+        oidc.bindCommand(restartCommand);
+        const restarted = await runV2WorkflowControllerCli(
+          restartEnvironment,
+          { fetch: github.fetch },
+        );
+
+        assert.equal(restarted.cycle.terminal_result.decision, "findings");
+        assert.equal(
+          restarted.cycle.terminal_result.status_effect_outcome,
+          "bound",
+        );
+        assert.equal(
+          restarted.cycle.terminal_result.public_effects_performed,
+          3 - failedIntentOrdinal,
+        );
+        assert.deepEqual(
+          restarted.cycle.status_receipts.map((receipt) => receipt.target_sha),
+          failedIntentOrdinal === 1 ? [MERGE, HEAD] : [HEAD],
+        );
+        assert.deepEqual(github.externalWrites, [
+          `POST /repos/owner/repo/statuses/${MERGE}`,
+          `POST /repos/owner/repo/statuses/${HEAD}`,
+        ]);
+        assert.equal(github.statusPostCount(), 2);
+        assert.equal(github.statusRefetchCount(), 2);
+        assert.equal(
+          github.effectRecordKinds().filter((kind) =>
+            kind === "effect-intent:status-write").length,
+          2,
+        );
+        assert.equal(
+          github.effectRecordKinds().filter((kind) =>
+            kind === "effect-response:status-write").length,
+          2,
+        );
+        assert.equal(github.requestPostCount(), 0);
+        assertNoProtectedProductionInternals(restarted.cycle);
+      });
+    });
+}
+
+for (const failedResponseOrdinal of [1, 2]) {
+  test(`status response ${failedResponseOrdinal} crash never replays its public write`,
+    async () => {
+      await withWorkflowCliFixture({
+        eventName: "pull_request_target",
+        event: { pull_request: { number: 7 } },
+        route: "ordinary",
+        pullRequest: "7",
+      }, async ({ environment, runnerTemp }) => {
+        const command = await prepareV2WorkflowCommand(environment);
+        const liveTime = new Date().toISOString();
+        const oidc = productionOidcFixture(command, liveTime);
+        const github = productionControllerGitHubFixture(command, oidc, liveTime, {
+          snapshotIssueComments: [productionTerminalFindingIssueComment()],
+        });
+        github.failRecordUpdateAt(
+          "effect-response:status-write",
+          failedResponseOrdinal,
+        );
+        const firstEnvironment = {
+          ...environment,
+          ...oidc.environment,
+          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+          GITHUB_API_URL: "https://api.github.test",
+        };
+
+        await assert.rejects(
+          runV2WorkflowControllerCli(firstEnvironment, { fetch: github.fetch }),
+          (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+        );
+        assert.equal(github.statusPostCount(), failedResponseOrdinal);
+        assert.equal(github.statusRefetchCount(), failedResponseOrdinal);
+
+        const restartEnvironment = await makeWorkflowLegEnvironment({
+          environment: firstEnvironment,
+          runnerTemp,
+          name: `status-response-crash-${failedResponseOrdinal}`,
+          runId: `12346${failedResponseOrdinal}`,
+          route: "ordinary",
+          pullRequest: "7",
+        });
+        const restartCommand = await prepareV2WorkflowCommand(
+          restartEnvironment,
+        );
+        oidc.bindCommand(restartCommand);
+        await assert.rejects(
+          runV2WorkflowControllerCli(restartEnvironment, { fetch: github.fetch }),
+          (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+        );
+
+        assert.equal(github.statusPostCount(), failedResponseOrdinal);
+        assert.equal(github.statusRefetchCount(), failedResponseOrdinal);
+        assert.equal(
+          github.effectRecordKinds().filter((kind) =>
+            kind === "effect-intent:status-write").length,
+          failedResponseOrdinal,
+        );
+        assert.equal(
+          github.effectRecordKinds().filter((kind) =>
+            kind === "effect-response:status-write").length,
+          failedResponseOrdinal - 1,
+        );
+        assert.equal(github.requestPostCount(), 0);
+      });
+    });
+}
+
+test("second terminal status ambiguity consumes its suffix without retry", async () => {
+  await withWorkflowCliFixture({
+    eventName: "pull_request_target",
+    event: { pull_request: { number: 7 } },
+    route: "ordinary",
+    pullRequest: "7",
+  }, async ({ environment, runnerTemp }) => {
+    const command = await prepareV2WorkflowCommand(environment);
+    const liveTime = new Date().toISOString();
+    const oidc = productionOidcFixture(command, liveTime);
+    const github = productionControllerGitHubFixture(command, oidc, liveTime, {
+      snapshotIssueComments: [productionTerminalFindingIssueComment()],
+    });
+    github.setStatusRefetchModeAt(2, "missing");
+    const firstEnvironment = {
+      ...environment,
+      ...oidc.environment,
+      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+      GITHUB_API_URL: "https://api.github.test",
+    };
+    const first = await runV2WorkflowControllerCli(firstEnvironment, {
+      fetch: github.fetch,
+    });
+
+    assert.equal(first.cycle.terminal_result.status_effect_outcome, "ambiguous");
+    assert.equal(first.cycle.terminal_result.public_effects_performed, 2);
+    assert.deepEqual(
+      first.cycle.status_receipts.map((receipt) => receipt.target_sha),
+      [MERGE],
+    );
+    assert.equal(first.cycle.ledger.status_response_append_receipt, null);
+    assert.deepEqual(github.externalWrites, [
+      `POST /repos/owner/repo/statuses/${MERGE}`,
+      `POST /repos/owner/repo/statuses/${HEAD}`,
+    ]);
+
+    const restartEnvironment = await makeWorkflowLegEnvironment({
+      environment: firstEnvironment,
+      runnerTemp,
+      name: "ambiguous-status-suffix",
+      runId: "123459",
+      route: "ordinary",
+      pullRequest: "7",
+    });
+    const restartCommand = await prepareV2WorkflowCommand(restartEnvironment);
+    oidc.bindCommand(restartCommand);
+    await assert.rejects(
+      runV2WorkflowControllerCli(restartEnvironment, { fetch: github.fetch }),
+      (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+    );
+    assert.equal(github.statusPostCount(), 2);
+    assert.equal(github.statusRefetchCount(), 2);
+    assert.equal(
+      github.effectRecordKinds().filter((kind) =>
+        kind === "effect-intent:status-write").length,
+      2,
+    );
+    assert.equal(
+      github.effectRecordKinds().filter((kind) =>
+        kind === "effect-response:status-write").length,
+      1,
+    );
+  });
+});
+
 for (const refetchMode of ["missing", "drift", "duplicate", "error"]) {
   test(`status ${refetchMode} refetch consumes one intent without retry`, async () => {
     await withWorkflowCliFixture({
@@ -2858,6 +3198,640 @@ test("automatic request binding resumes internal ledger appends without a second
       assertNoProtectedProductionInternals(result.cycle);
     });
   });
+
+test("intent-persisted restart consumes the existing automatic request attempt",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "pull_request_target",
+      event: { pull_request: { number: 7 } },
+      route: "ordinary",
+      pullRequest: "7",
+    }, async ({ environment, runnerTemp }) => {
+      const command = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(command, liveTime);
+      const github = productionControllerGitHubFixture(command, oidc, liveTime);
+      github.failNextRecordUpdates("effect-intent:effect-attempt");
+      const firstEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.test",
+      };
+
+      await assert.rejects(
+        runV2WorkflowControllerCli(firstEnvironment, { fetch: github.fetch }),
+        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+      );
+      assert.equal(github.requestPostCount(), 0);
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:automatic-request-reservation").length,
+        1,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:effect-attempt").length,
+        0,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:review-request").length,
+        0,
+      );
+
+      const restartEnvironment = await makeWorkflowLegEnvironment({
+        environment: firstEnvironment,
+        runnerTemp,
+        name: "intent-persisted-restart",
+        runId: "123457",
+        route: "ordinary",
+        pullRequest: "7",
+      });
+      const restartCommand = await prepareV2WorkflowCommand(restartEnvironment);
+      oidc.bindCommand(restartCommand);
+      const restarted = await runV2WorkflowControllerCli(restartEnvironment, {
+        fetch: github.fetch,
+      });
+
+      assert.equal(
+        restarted.cycle.terminal_result.automatic_request_effect_outcome,
+        "bound",
+      );
+      assert.equal(restarted.cycle.terminal_result.public_effects_performed, 1);
+      assert.equal(github.requestPostCount(), 1);
+      assert.equal(github.requestRefetchCount(), 1);
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:automatic-request-reservation").length,
+        1,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:effect-attempt").length,
+        1,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:review-request").length,
+        1,
+      );
+      assertNoProtectedProductionInternals(restarted.cycle);
+    });
+  });
+
+test("production advances addressed findings through three automatic generations",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "pull_request_target",
+      event: { pull_request: { number: 7 } },
+      route: "ordinary",
+      pullRequest: "7",
+    }, async ({ environment, runnerTemp }) => {
+      const command = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(command, liveTime);
+      const github = productionControllerGitHubFixture(command, oidc, liveTime, {
+        serverTimeStepMilliseconds: 500,
+      });
+      const firstEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.test",
+      };
+      const runLeg = async (name, runId) => {
+        const legEnvironment = await makeWorkflowLegEnvironment({
+          environment: firstEnvironment,
+          runnerTemp,
+          name,
+          runId,
+          route: "ordinary",
+          pullRequest: "7",
+        });
+        const legCommand = await prepareV2WorkflowCommand(legEnvironment);
+        oidc.bindCommand(legCommand);
+        return runV2WorkflowControllerCli(legEnvironment, {
+          fetch: github.fetch,
+        });
+      };
+      const addressLatestRequest = (ordinal) => {
+        const request = github.requestComments().at(-1);
+        assert.ok(request, `automatic generation ${ordinal} request exists`);
+        const finding = productionAutomaticRecoveryFinding({
+          id: 2_000 + ordinal * 10,
+          request,
+        });
+        const address = productionAutomaticRecoveryAddress({
+          id: 2_000 + ordinal * 10 + 1,
+          finding,
+        });
+        github.addSnapshotIssueComments(finding, address);
+      };
+
+      await runV2WorkflowControllerCli(firstEnvironment, {
+        fetch: github.fetch,
+      });
+      assert.equal(github.requestPostCount(), 1);
+      addressLatestRequest(1);
+
+      const firstRecovery = await runLeg("automatic-recovery-1", "123461");
+      assert.equal(firstRecovery.cycle.terminal_result.decision, "findings");
+      assert.equal(firstRecovery.cycle.terminal_result.public_effects_performed, 2);
+      assert.equal(github.requestPostCount(), 1);
+      assertNoProtectedProductionInternals(firstRecovery.cycle);
+      assert.doesNotMatch(
+        JSON.stringify(firstRecovery.cycle),
+        PROTECTED_AUTOMATIC_RECOVERY_INTERNAL,
+      );
+
+      const firstTransition = await runLeg(
+        "automatic-transition-1",
+        "123462",
+      );
+      assert.equal(firstTransition.cycle.terminal_result.decision, "findings");
+      assert.equal(github.requestPostCount(), 1);
+      assert.equal(
+        firstTransition.cycle.terminal_result.public_effects_performed,
+        0,
+      );
+      const secondGeneration = await runLeg(
+        "automatic-generation-2",
+        "123463",
+      );
+      assert.equal(secondGeneration.cycle.terminal_result.decision, "findings");
+      assert.equal(github.requestPostCount(), 2);
+      assert.equal(
+        secondGeneration.cycle.terminal_result.public_effects_performed,
+        2,
+      );
+      addressLatestRequest(2);
+
+      await runLeg("automatic-recovery-2", "123464");
+      assert.equal(github.requestPostCount(), 2);
+      const secondTransition = await runLeg(
+        "automatic-transition-2",
+        "123465",
+      );
+      assert.equal(secondTransition.cycle.terminal_result.decision, "findings");
+      assert.equal(github.requestPostCount(), 2);
+      assert.equal(
+        secondTransition.cycle.terminal_result.public_effects_performed,
+        0,
+      );
+      const thirdGeneration = await runLeg(
+        "automatic-generation-3",
+        "123466",
+      );
+      assert.equal(github.requestPostCount(), 3);
+      assert.equal(
+        thirdGeneration.cycle.terminal_result.public_effects_performed,
+        2,
+      );
+      addressLatestRequest(3);
+
+      const terminalThird = await runLeg(
+        "automatic-generation-3-terminal",
+        "123467",
+      );
+      const noFourth = await runLeg("automatic-no-generation-4", "123468");
+      assert.equal(terminalThird.cycle.terminal_result.decision, "findings");
+      assert.equal(noFourth.cycle.terminal_result.decision, "findings");
+      assert.equal(github.requestPostCount(), 3);
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:automatic-request-reservation").length,
+        3,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:scheduler-state").length,
+        2,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-response:scheduler-state").length,
+        2,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:artifact-binding").length,
+        2,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:artifact-binding-ready").length,
+        2,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-response:artifact-binding-ready").length,
+        2,
+      );
+      assert.equal(
+        github.effectRecordKinds().filter((kind) =>
+          kind === "effect-response:artifact-binding").length,
+        2,
+      );
+      assert.equal(github.artifactBindingPointReadRequests().length, 2);
+      const postGenerations = github.schedulerObservationActions()
+        .flatMap((observation) => observation.scheduler_plan.actions)
+        .filter((action) => action.kind === "post_review_request")
+        .map((action) => action.generation_id);
+      assert.deepEqual(postGenerations, [
+        "automatic:1",
+        "automatic:2",
+        "automatic:3",
+      ]);
+      assert.equal(github.activeLease(), false);
+      assertNoProtectedProductionInternals(noFourth.cycle);
+      assertFixtureServerClockWithinOidcSkew(github);
+    });
+  });
+
+test("aggregate recovery point reads retry one complete ordered batch", async () => {
+  await withProductionAutomaticRecoveryScenario(async ({
+    github,
+    runLeg,
+    addFindings,
+  }) => {
+    addFindings([3010, 3020]);
+    github.setArtifactBindingEqualDateReads(2);
+
+    const bound = await runLeg("aggregate-ordered-retry");
+
+    assert.equal(bound.cycle.terminal_result.decision, "findings");
+    assert.equal(bound.cycle.terminal_result.public_effects_performed, 2);
+    assert.deepEqual(
+      github.artifactBindingPointReadRequests(),
+      [3010, 3020, 3010, 3020].map((id) =>
+        `/repos/owner/repo/issues/comments/${id}`),
+    );
+    const kinds = github.effectRecordKinds();
+    assert.equal(kinds.filter((kind) =>
+      kind === "effect-intent:artifact-binding").length, 1);
+    assert.equal(kinds.filter((kind) =>
+      kind === "effect-intent:artifact-binding-ready").length, 1);
+    assert.equal(kinds.filter((kind) =>
+      kind === "effect-response:artifact-binding-ready").length, 1);
+    assert.equal(kinds.filter((kind) =>
+      kind === "effect-response:artifact-binding").length, 1);
+    assert.equal(github.requestPostCount(), 1);
+    assert.equal(github.activeLease(), false);
+    assertNoProtectedProductionInternals(bound.cycle);
+    assert.doesNotMatch(
+      JSON.stringify(bound.cycle),
+      PROTECTED_AUTOMATIC_RECOVERY_INTERNAL,
+    );
+    assertFixtureServerClockWithinOidcSkew(github);
+  });
+});
+
+test("aggregate recovery exhausts equal-Date reads without weakening stage 9",
+  async () => {
+    await withProductionAutomaticRecoveryScenario(async ({
+      github,
+      runLeg,
+      addFindings,
+    }) => {
+      addFindings([3030]);
+      github.setArtifactBindingEqualDateAlways();
+
+      await assert.rejects(
+        runLeg("aggregate-equal-date-exhausted"),
+        (error) =>
+          error?.code === "INITIAL_OBSERVATION_ABORTED" &&
+          error?.details?.upstream_code ===
+            "automatic-artifact-binding-point-read-too-early",
+      );
+      assert.deepEqual(
+        github.artifactBindingPointReadRequests(),
+        Array(4).fill("/repos/owner/repo/issues/comments/3030"),
+      );
+      let kinds = github.effectRecordKinds();
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-intent:artifact-binding").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-intent:artifact-binding-ready").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding-ready").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding").length, 0);
+      assert.equal(github.activeLease(), false);
+
+      github.setArtifactBindingEqualDateAlways(false);
+      const resumed = await runLeg("aggregate-equal-date-resumed");
+      kinds = github.effectRecordKinds();
+      assert.equal(
+        github.artifactBindingPointReadRequests().length,
+        5,
+      );
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-intent:artifact-binding").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-intent:artifact-binding-ready").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding-ready").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding").length, 1);
+      assert.equal(resumed.cycle.terminal_result.public_effects_performed, 0);
+      assertNoProtectedProductionInternals(resumed.cycle);
+      assert.equal(github.activeLease(), false);
+      assertFixtureServerClockWithinOidcSkew(github);
+    });
+  });
+
+for (const durablePrefixKind of [
+  "effect-intent:artifact-binding",
+  "effect-intent:artifact-binding-ready",
+  "effect-response:artifact-binding-ready",
+]) {
+  test(`aggregate recovery resumes durable ${durablePrefixKind} without replay`,
+    async () => {
+      await withProductionAutomaticRecoveryScenario(async ({
+        github,
+        runLeg,
+        addFindings,
+      }) => {
+        addFindings([3040]);
+        github.failNextDurableRecordUpdates(durablePrefixKind);
+
+        await assert.rejects(
+          runLeg(`durable-prefix-${durablePrefixKind.replaceAll(":", "-")}`),
+          (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+        );
+        const resumed = await runLeg(
+          `durable-prefix-resume-${durablePrefixKind.replaceAll(":", "-")}`,
+        );
+
+        const kinds = github.effectRecordKinds();
+        assert.equal(kinds.filter((kind) =>
+          kind === "effect-intent:artifact-binding").length, 1);
+        assert.equal(kinds.filter((kind) =>
+          kind === "effect-intent:artifact-binding-ready").length, 1);
+        assert.equal(kinds.filter((kind) =>
+          kind === "effect-response:artifact-binding-ready").length, 1);
+        assert.equal(kinds.filter((kind) =>
+          kind === "effect-response:artifact-binding").length, 1);
+        assert.equal(github.artifactBindingPointReadRequests().length, 1);
+        assert.equal(github.requestPostCount(), 1);
+        assert.equal(github.activeLease(), false);
+        assertNoProtectedProductionInternals(resumed.cycle);
+        assertFixtureServerClockWithinOidcSkew(github);
+      });
+    });
+}
+
+test("durable stage 9 return loss transitions without a second point read",
+  async () => {
+    await withProductionAutomaticRecoveryScenario(async ({
+      github,
+      runLeg,
+      addFindings,
+    }) => {
+      addFindings([3050]);
+      github.failNextDurableRecordUpdates(
+        "effect-response:artifact-binding",
+      );
+
+      await assert.rejects(
+        runLeg("durable-stage-9-return-loss"),
+        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+      );
+      assert.equal(github.artifactBindingPointReadRequests().length, 1);
+      let kinds = github.effectRecordKinds();
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding").length, 1);
+
+      const transitioned = await runLeg("durable-stage-9-transition");
+      kinds = github.effectRecordKinds();
+      assert.equal(github.artifactBindingPointReadRequests().length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-intent:scheduler-state").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:scheduler-state").length, 1);
+      assert.equal(
+        transitioned.cycle.terminal_result.public_effects_performed,
+        0,
+      );
+      assert.equal(github.requestPostCount(), 1);
+      assert.equal(github.activeLease(), false);
+      assertNoProtectedProductionInternals(transitioned.cycle);
+      assertFixtureServerClockWithinOidcSkew(github);
+    });
+  });
+
+test("queued artifact suffix survives a point-read abort in exact chain order",
+  async () => {
+    await withProductionAutomaticRecoveryScenario(async ({
+      github,
+      runLeg,
+      addFindings,
+    }) => {
+      addFindings([3100]);
+      github.failNextDurableRecordUpdates(
+        "effect-response:artifact-binding-ready",
+      );
+      await assert.rejects(
+        runLeg("queued-prefix-stage-8-return-loss"),
+        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+      );
+
+      addFindings([3120]);
+      github.failArtifactBindingPointReadAt(1);
+      await assert.rejects(
+        runLeg("queued-prefix-point-read-abort"),
+        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+      );
+      assert.equal(github.activeLease(), false);
+
+      const suffixBound = await runLeg(
+        "queued-prefix-parent-and-suffix-response",
+      );
+
+      assert.deepEqual(
+        github.artifactBindingPointReadRequests(),
+        [3100, 3100, 3120].map((id) =>
+          `/repos/owner/repo/issues/comments/${id}`),
+      );
+      assert.deepEqual(
+        github.effectRecordKinds().filter((kind) =>
+          kind.includes("artifact-binding")),
+        [
+          "effect-intent:artifact-binding",
+          "effect-intent:artifact-binding-ready",
+          "effect-response:artifact-binding-ready",
+          "effect-intent:artifact-binding",
+          "effect-response:artifact-binding",
+          "effect-intent:artifact-binding-ready",
+          "effect-response:artifact-binding-ready",
+          "effect-response:artifact-binding",
+        ],
+      );
+      assert.equal(github.activeLease(), false);
+      assertNoProtectedProductionInternals(suffixBound.cycle);
+      assertFixtureServerClockWithinOidcSkew(github);
+    });
+  });
+
+test("queued artifact release failure reports the latest reachable append",
+  async () => {
+    await withProductionAutomaticRecoveryScenario(async ({
+      github,
+      runLeg,
+      addFindings,
+    }) => {
+      addFindings([3140]);
+      github.failNextDurableRecordUpdates(
+        "effect-response:artifact-binding-ready",
+      );
+      await assert.rejects(
+        runLeg("queued-release-stage-8-return-loss"),
+        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+      );
+      const [staleReadyReceiptDigest] =
+        github.artifactBindingReadyConfirmationRecoveryReceiptDigests();
+      assert.match(staleReadyReceiptDigest, /^sha256:[0-9a-f]{64}$/u);
+
+      addFindings([3160]);
+      github.failArtifactBindingPointReadAt(1);
+      github.failNextRelease();
+      await assert.rejects(
+        runLeg("queued-release-point-read-failure"),
+        (error) => {
+          assert.equal(error?.code, "PRODUCTION_LEASE_RELEASE_FAILED");
+          assert.equal(
+            error.details.phase,
+            "abort:automatic-recovery-artifact-binding-point-read",
+          );
+          assert.equal(error.details.budget_refunded, false);
+          assert.equal(error.details.public_effects_performed, 0);
+          assert.match(
+            error.details.last_reachable_receipt_digest,
+            /^sha256:[0-9a-f]{64}$/u,
+          );
+          assert.notEqual(
+            error.details.last_reachable_receipt_digest,
+            staleReadyReceiptDigest,
+          );
+          return true;
+        },
+      );
+      assert.deepEqual(
+        github.artifactBindingPointReadRequests(),
+        ["/repos/owner/repo/issues/comments/3140"],
+      );
+      assert.equal(github.activeLease(), true);
+      assertFixtureServerClockWithinOidcSkew(github);
+    });
+  });
+
+test("partial aggregate point-read failure restarts the whole ordered batch",
+  async () => {
+    await withProductionAutomaticRecoveryScenario(async ({
+      github,
+      runLeg,
+      addFindings,
+    }) => {
+      addFindings([3070, 3080]);
+      github.failArtifactBindingPointReadAt(2);
+
+      await assert.rejects(
+        runLeg("aggregate-partial-point-read-failure"),
+        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+      );
+      assert.deepEqual(
+        github.artifactBindingPointReadRequests(),
+        [3070, 3080].map((id) =>
+          `/repos/owner/repo/issues/comments/${id}`),
+      );
+      let kinds = github.effectRecordKinds();
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding").length, 0);
+      assert.equal(github.activeLease(), false);
+
+      const resumed = await runLeg("aggregate-partial-point-read-resume");
+      assert.deepEqual(
+        github.artifactBindingPointReadRequests(),
+        [3070, 3080, 3070, 3080].map((id) =>
+          `/repos/owner/repo/issues/comments/${id}`),
+      );
+      kinds = github.effectRecordKinds();
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-intent:artifact-binding").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-intent:artifact-binding-ready").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding-ready").length, 1);
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding").length, 1);
+      assert.equal(resumed.cycle.terminal_result.public_effects_performed, 0);
+      assert.equal(github.requestPostCount(), 1);
+      assert.equal(github.activeLease(), false);
+      assertNoProtectedProductionInternals(resumed.cycle);
+      assertFixtureServerClockWithinOidcSkew(github);
+    });
+  });
+
+test("aggregate binding release failure retains its exact no-refund phase",
+  async () => {
+    await withProductionAutomaticRecoveryScenario(async ({
+      github,
+      runLeg,
+      addFindings,
+    }) => {
+      addFindings([3090]);
+      github.failNextRelease();
+
+      await assert.rejects(
+        runLeg("aggregate-binding-release-failure"),
+        (error) =>
+          error?.code === "PRODUCTION_LEASE_RELEASE_FAILED" &&
+          error?.details?.phase ===
+            "automatic-recovery-artifact-binding-bound-release" &&
+          error?.details?.budget_refunded === false,
+      );
+      const kinds = github.effectRecordKinds();
+      assert.equal(kinds.filter((kind) =>
+        kind === "effect-response:artifact-binding").length, 1);
+      assert.equal(github.artifactBindingPointReadRequests().length, 1);
+      assert.equal(github.requestPostCount(), 1);
+      assert.equal(github.activeLease(), true);
+      assertFixtureServerClockWithinOidcSkew(github);
+    }, { serverTimeStepMilliseconds: 1_000 });
+  });
+
+test("status ambiguity blocks both recovery authorities", async () => {
+  await withProductionAutomaticRecoveryScenario(async ({
+    github,
+    runLeg,
+    addFindings,
+  }) => {
+    addFindings([3060]);
+    github.setStatusRefetchModeAt(github.statusPostCount() + 1, "missing");
+
+    const ambiguous = await runLeg("status-ambiguous-recovery");
+
+    assert.equal(
+      ambiguous.cycle.terminal_result.status_effect_outcome,
+      "ambiguous",
+    );
+    assert.equal(
+      ambiguous.cycle.terminal_result.public_effects_performed,
+      1,
+    );
+    assert.equal(github.artifactBindingPointReadRequests().length, 0);
+    const kinds = github.effectRecordKinds();
+    assert.equal(kinds.some((kind) => kind.includes("artifact-binding")), false);
+    assert.equal(kinds.some((kind) => kind.endsWith(":scheduler-state")), false);
+    assert.equal(github.requestPostCount(), 1);
+    assert.equal(github.activeLease(), false);
+    assertNoProtectedProductionInternals(ambiguous.cycle);
+    assertFixtureServerClockWithinOidcSkew(github);
+  });
+});
 
 test("bound automatic request fails closed when its no-refund lease release fails", async () => {
   await withWorkflowCliFixture({
@@ -3373,6 +4347,7 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
     ]);
     assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
     assert.equal(github.candidateInventoryRequests().length, 4);
+    assert.equal(github.candidateLifecycleRequests().length, 2);
     assert.equal(
       github.candidateInventoryRequests().every((path) =>
         path.includes("state=all") && !path.includes("state=open")),
@@ -3475,9 +4450,169 @@ test("schedule-dispatch supersedes an incomplete inventory cycle on restart", as
     ]);
     assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
     assert.equal(github.candidateInventoryRequests().length, 6);
+    assert.equal(github.candidateLifecycleRequests().length, 3);
     assertNoDispatchAuthorityInternals(restarted);
   });
 });
+
+test("schedule-dispatch supersedes close/reopen drift within one bounded run",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ environment }) => {
+      const command = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(command, liveTime);
+      const sharedEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
+      const github = productionControllerGitHubFixture(
+        command,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: [7],
+          candidateLifecycleStates: ["open", "closed", "open", "open"],
+          apiOrigin: "https://api.github.com",
+        },
+      );
+
+      const result = await runV2ScheduleDispatchCli(sharedEnvironment, {
+        fetch: github.fetch,
+      });
+
+      assert.equal(result.matrix.include[0].enabled, true);
+      assert.equal(result.matrix.include[0].pull_request, 7);
+      assert.deepEqual(github.candidateInventoryPhases(), [
+        "cycle-start",
+        "shard",
+        "cycle-start",
+        "shard",
+        "cycle-complete",
+      ]);
+      assert.deepEqual(github.candidateLifecycleRequests(), [
+        "/repos/owner/repo/pulls/7:open",
+        "/repos/owner/repo/pulls/7:closed",
+        "/repos/owner/repo/pulls/7:open",
+        "/repos/owner/repo/pulls/7:open",
+      ]);
+      assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
+      assertNoDispatchAuthorityInternals(result);
+    });
+  });
+
+test("schedule-dispatch retains a candidate first observed by a drifting pass",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ environment }) => {
+      const command = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(command, liveTime);
+      const github = productionControllerGitHubFixture(
+        command,
+        oidc,
+        liveTime,
+        {
+          candidateInventorySnapshots: [
+            [7], [7],
+            [7, 8], [7, 8],
+            [7], [7],
+            [7], [7],
+          ],
+          apiOrigin: "https://api.github.com",
+        },
+      );
+
+      const result = await runV2ScheduleDispatchCli({
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      }, { fetch: github.fetch });
+
+      assert.deepEqual(
+        result.matrix.include.map(({ pull_request: pullRequest }) =>
+          pullRequest),
+        [7, 8],
+      );
+      assert.deepEqual(github.candidateInventoryPhases(), [
+        "cycle-start", "shard",
+        "cycle-start", "shard", "cycle-complete",
+      ]);
+      assert.equal(github.candidateInventoryRequests().length, 6);
+      assert.equal(github.candidateLifecycleRequests().length, 7);
+      assertNoDispatchAuthorityInternals(result);
+    });
+  });
+
+test("schedule-dispatch fails typed after bounded lifecycle drift exhaustion",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ environment }) => {
+      const command = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(command, liveTime);
+      const github = productionControllerGitHubFixture(
+        command,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: [7],
+          candidateLifecycleStates: Array.from(
+            { length: MAX_V2_CANDIDATE_SCAN_PASSES },
+            () => ["open", "closed"],
+          ).flat(),
+          apiOrigin: "https://api.github.com",
+        },
+      );
+
+      await assert.rejects(
+        runV2ScheduleDispatchCli({
+          ...environment,
+          ...oidc.environment,
+          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+          GITHUB_API_URL: "https://api.github.com",
+        }, { fetch: github.fetch }),
+        (error) => {
+          assert.equal(
+            error?.code,
+            "CANDIDATE_INVENTORY_STABILITY_EXHAUSTED",
+          );
+          assert.deepEqual(error.details, {
+            attempts: MAX_V2_CANDIDATE_SCAN_PASSES,
+            last_drift_code: "CANDIDATE_LIFECYCLE_DRIFT",
+          });
+          return true;
+        },
+      );
+      assert.deepEqual(
+        github.candidateInventoryPhases(),
+        Array.from(
+          { length: MAX_V2_CANDIDATE_SCAN_PASSES },
+          () => ["cycle-start", "shard"],
+        ).flat(),
+      );
+      assert.equal(
+        github.candidateLifecycleRequests().length,
+        MAX_V2_CANDIDATE_SCAN_PASSES * 2,
+      );
+      assert.deepEqual(github.candidateDispatchPhases(), []);
+    });
+  });
 
 test("schedule-dispatch reuses a completed inventory when reservation restarts", async () => {
   await withWorkflowCliFixture({
@@ -3698,6 +4833,159 @@ test("scheduled production run acknowledges its exact matrix binding through cyc
     assertFixtureServerClockWithinOidcSkew(github);
   });
 });
+
+test("scheduled recovery closes a queued artifact suffix before candidate ack",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ environment, runnerTemp }) => {
+      const scanCommand = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(scanCommand, liveTime);
+      const sharedEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
+      const github = productionControllerGitHubFixture(
+        scanCommand,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: [7],
+          apiOrigin: "https://api.github.com",
+          serverTimeStepMilliseconds: 500,
+        },
+      );
+      const firstDispatch = await runV2ScheduleDispatchCli(
+        sharedEnvironment,
+        { fetch: github.fetch },
+      );
+      const firstScheduledEnvironment = await makeWorkflowLegEnvironment({
+        environment: sharedEnvironment,
+        runnerTemp,
+        name: "scheduled-queue-initial-request",
+        runId: "123471",
+        route: "ordinary",
+        pullRequest: "7",
+        dispatchBinding:
+          firstDispatch.matrix.include[0].dispatch_binding,
+      });
+      const firstScheduledCommand = await prepareV2WorkflowCommand(
+        firstScheduledEnvironment,
+      );
+      oidc.bindCommand(firstScheduledCommand);
+      await runV2WorkflowControllerCli(firstScheduledEnvironment, {
+        fetch: github.fetch,
+      });
+      const request = github.requestComments().at(-1);
+      assert.ok(request, "scheduled automatic request exists");
+      const addFinding = (id) => {
+        const finding = productionAutomaticRecoveryFinding({ id, request });
+        const address = productionAutomaticRecoveryAddress({
+          id: id + 1,
+          finding,
+        });
+        github.addSnapshotIssueComments(finding, address);
+      };
+
+      addFinding(3180);
+      github.failNextDurableRecordUpdates(
+        "effect-response:artifact-binding-ready",
+      );
+      const ordinaryEventPath = join(
+        runnerTemp,
+        "scheduled-queue-ordinary-event.json",
+      );
+      await writeFile(ordinaryEventPath, JSON.stringify({
+        pull_request: { number: 7 },
+      }), { mode: 0o600 });
+      const prefixEnvironment = await makeWorkflowLegEnvironment({
+        environment: sharedEnvironment,
+        runnerTemp,
+        name: "scheduled-queue-prefix",
+        runId: "123472",
+        route: "ordinary",
+        pullRequest: "7",
+      });
+      prefixEnvironment.GITHUB_EVENT_NAME = "pull_request_target";
+      prefixEnvironment.V2_CONTROLLER_EVENT_PATH = ordinaryEventPath;
+      const prefixCommand = await prepareV2WorkflowCommand(prefixEnvironment);
+      oidc.bindCommand(prefixCommand);
+      await assert.rejects(
+        runV2WorkflowControllerCli(prefixEnvironment, {
+          fetch: github.fetch,
+        }),
+        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
+      );
+      addFinding(3200);
+
+      const secondScanEnvironment = await makeWorkflowLegEnvironment({
+        environment: sharedEnvironment,
+        runnerTemp,
+        name: "scheduled-queue-second-scan",
+        runId: "123473",
+        route: "scan-all-open",
+        pullRequest: "",
+      });
+      const secondScanCommand = await prepareV2WorkflowCommand(
+        secondScanEnvironment,
+      );
+      oidc.bindCommand(secondScanCommand);
+      const secondDispatch = await runV2ScheduleDispatchCli(
+        secondScanEnvironment,
+        { fetch: github.fetch },
+      );
+      const secondScheduledEnvironment = await makeWorkflowLegEnvironment({
+        environment: secondScanEnvironment,
+        runnerTemp,
+        name: "scheduled-queue-close",
+        runId: "123474",
+        route: "ordinary",
+        pullRequest: "7",
+        dispatchBinding:
+          secondDispatch.matrix.include[0].dispatch_binding,
+      });
+      const secondScheduledCommand = await prepareV2WorkflowCommand(
+        secondScheduledEnvironment,
+      );
+      oidc.bindCommand(secondScheduledCommand);
+      const result = await runV2WorkflowControllerCli(
+        secondScheduledEnvironment,
+        { fetch: github.fetch },
+      );
+
+      assert.deepEqual(
+        github.effectRecordKinds().filter((kind) =>
+          kind.includes("artifact-binding")),
+        [
+          "effect-intent:artifact-binding",
+          "effect-intent:artifact-binding-ready",
+          "effect-response:artifact-binding-ready",
+          "effect-intent:artifact-binding",
+          "effect-response:artifact-binding",
+          "effect-intent:artifact-binding-ready",
+          "effect-response:artifact-binding-ready",
+          "effect-response:artifact-binding",
+        ],
+      );
+      assert.deepEqual(
+        github.artifactBindingPointReadRequests(),
+        [3180, 3200].map((id) =>
+          `/repos/owner/repo/issues/comments/${id}`),
+      );
+      assert.deepEqual(github.candidateDispatchPhases().slice(-4), [
+        "reserve", "candidate-ack", "batch-complete", "cycle-complete",
+      ]);
+      assert.equal(github.activeLease(), false);
+      assertNoProtectedProductionInternals(result.cycle);
+      assertFixtureServerClockWithinOidcSkew(github);
+    });
+  });
 
 test("every scheduled dispatch binding field rejects tampering before lease or effect", async () => {
   await withWorkflowCliFixture({
@@ -4448,14 +5736,21 @@ function productionControllerGitHubFixture(
   baseTime,
   {
     candidateNumbers = null,
+    candidateInventorySnapshots = null,
+    candidateLifecycleStates = null,
     apiOrigin = "https://api.github.test",
+    snapshotIssueComments = [],
+    serverTimeStepMilliseconds = 1_000,
   } = {},
 ) {
   const preflight = productionPreflightFetchFixture(command, {
     ledgerBranchPresent: false,
     apiOrigin,
   });
-  const transportFetch = completeSnapshotFetch({ apiOrigin });
+  const transportFetch = completeSnapshotFetch({
+    apiOrigin,
+    issueComments: snapshotIssueComments,
+  });
   const blobs = new Map();
   const trees = new Map();
   const commits = new Map();
@@ -4463,7 +5758,7 @@ function productionControllerGitHubFixture(
   const statuses = new Map();
   const requests = new Map();
   let refTarget = null;
-  let second = 0;
+  let serverTimeOffsetMilliseconds = 0;
   let activeLease = false;
   let failRelease = false;
   let failReleaseMode = "next";
@@ -4479,7 +5774,20 @@ function productionControllerGitHubFixture(
   let requestRefetchMode = "exact";
   let requestScopeMode = "exact";
   const failedRecordUpdates = new Map();
+  const durableFailedRecordUpdates = new Map();
+  const failedRecordUpdateOrdinals = new Map();
+  const recordUpdateCounts = new Map();
+  const artifactBindingPointReadRequests = [];
+  const failedArtifactBindingPointReadOrdinals = new Set();
+  let artifactBindingEqualDateReadsRemaining = 0;
+  let artifactBindingEqualDateAlways = false;
   const candidateInventoryRequests = [];
+  const candidateLifecycleRequests = [];
+  const candidateInventoryUniverse = candidateInventorySnapshots === null
+    ? candidateNumbers
+    : [...new Set(candidateInventorySnapshots.flat())];
+  let candidateInventorySnapshotReadCount = 0;
+  let candidateLifecycleReadCount = 0;
   let maxServerTimestamp = Date.parse(baseTime);
 
   const fetch = async (input, init = {}) => {
@@ -4510,26 +5818,44 @@ function productionControllerGitHubFixture(
       return ledgerFetch(ledgerPath, method, init);
     }
     if (
-      candidateNumbers !== null && method === "GET" &&
+      candidateInventoryUniverse !== null && method === "GET" &&
       path === "/repos/owner/repo/pulls" &&
       url.searchParams.get("state") === "all"
     ) {
       candidateInventoryRequests.push(`${path}${url.search}`);
       const page = Number(url.searchParams.get("page"));
-      const selected = page === 1 ? candidateNumbers : [];
+      const selected = page === 1
+        ? candidateInventorySnapshots === null
+          ? candidateNumbers
+          : candidateInventorySnapshots[Math.min(
+              candidateInventorySnapshotReadCount++,
+              candidateInventorySnapshots.length - 1,
+            )]
+        : [];
       return redated(jsonResponse(JSON.stringify(
         selected.map(candidateInventoryListPull),
       )));
     }
-    const candidatePullMatch = candidateNumbers === null
+    const candidatePullMatch = candidateInventoryUniverse === null
       ? null
       : path.match(/^\/repos\/owner\/repo\/pulls\/([1-9][0-9]*)$/u);
     if (
       method === "GET" && candidatePullMatch !== null &&
-      candidateNumbers.includes(Number(candidatePullMatch[1]))
+      candidateInventoryUniverse.includes(Number(candidatePullMatch[1]))
     ) {
+      const lifecycleState = candidateLifecycleStates === null
+        ? "open"
+        : candidateLifecycleStates[Math.min(
+            candidateLifecycleReadCount,
+            candidateLifecycleStates.length - 1,
+          )];
+      candidateLifecycleReadCount += 1;
+      candidateLifecycleRequests.push(`${path}:${lifecycleState}`);
       return redated(jsonResponse(JSON.stringify(
-        candidateInventoryExactPull(Number(candidatePullMatch[1])),
+        candidateInventoryExactPull(
+          Number(candidatePullMatch[1]),
+          lifecycleState,
+        ),
       )));
     }
     if (
@@ -4627,7 +5953,10 @@ function productionControllerGitHubFixture(
     const requestGet = path.match(
       /^\/repos\/owner\/repo\/issues\/comments\/([1-9][0-9]*)$/u,
     );
-    if (method === "GET" && requestGet !== null) {
+    if (
+      method === "GET" && requestGet !== null &&
+      requests.has(requestGet[1])
+    ) {
       requestRefetchCount += 1;
       if (requestRefetchMode === "error") {
         return redated(jsonResponse(JSON.stringify({
@@ -4647,7 +5976,7 @@ function productionControllerGitHubFixture(
       method === "GET" && path === "/repos/owner/repo/issues/7/comments" &&
       requests.size > 0
     ) {
-      return redated(jsonResponse(JSON.stringify([...requests.values()])));
+      return redated(jsonResponse(JSON.stringify(allIssueComments())));
     }
     if (
       method === "GET" &&
@@ -4681,13 +6010,42 @@ function productionControllerGitHubFixture(
       })));
     }
     try {
-      return redated(await preflight.fetch(input, init));
+      return redated(await preflight.fetch(input, init), { advance: false });
     } catch (error) {
       if (!String(error?.message).startsWith(
         "unexpected production preflight request",
       )) throw error;
     }
-    const response = await redated(await transportFetch(input, init));
+    const artifactBindingPointRead =
+      method === "GET" && isExactProviderArtifactPath(path) &&
+      hasReadyAutomaticArtifactBinding();
+    let failArtifactBindingPointRead = false;
+    if (artifactBindingPointRead) {
+      artifactBindingPointReadRequests.push(path);
+      const pointReadOrdinal = artifactBindingPointReadRequests.length;
+      failArtifactBindingPointRead =
+        failedArtifactBindingPointReadOrdinals.delete(pointReadOrdinal);
+    }
+    const forceEqualArtifactBindingDate = artifactBindingPointRead &&
+      (artifactBindingEqualDateAlways ||
+        artifactBindingEqualDateReadsRemaining > 0);
+    if (
+      forceEqualArtifactBindingDate &&
+      artifactBindingEqualDateReadsRemaining > 0
+    ) {
+      artifactBindingEqualDateReadsRemaining -= 1;
+    }
+    if (artifactBindingPointRead && !forceEqualArtifactBindingDate) {
+      advancePastCurrentServerSecond();
+    }
+    if (failArtifactBindingPointRead) {
+      return redated(jsonResponse(JSON.stringify({
+        message: "Internal Server Error",
+      }), 500), { advance: false });
+    }
+    const response = await redated(await transportFetch(input, init), {
+      advance: !artifactBindingPointRead,
+    });
     if (response.status !== 404 || path === `${repoPrefix}/git/ref/pull/7/merge`) {
       return response;
     }
@@ -4713,10 +6071,16 @@ function productionControllerGitHubFixture(
     statusRefetchCount: () => statusRefetchCount,
     requestPostCount: () => requestPostCount,
     requestRefetchCount: () => requestRefetchCount,
+    requestComments: () => structuredClone([...requests.values()]),
+    addSnapshotIssueComments(...comments) {
+      snapshotIssueComments.push(...structuredClone(comments));
+    },
     maxServerWallOffsetMilliseconds: () =>
       Math.abs(maxServerTimestamp - Date.now()),
     candidateInventoryRequests: () =>
       structuredClone(candidateInventoryRequests),
+    candidateLifecycleRequests: () =>
+      structuredClone(candidateLifecycleRequests),
     ledgerRecordCount: () => reachableRecords().length,
     candidateInventoryPhases: () => reachableRecords()
       .filter((record) =>
@@ -4749,6 +6113,47 @@ function productionControllerGitHubFixture(
       for (const kind of recordKinds) {
         failedRecordUpdates.set(kind, (failedRecordUpdates.get(kind) ?? 0) + 1);
       }
+    },
+    failNextDurableRecordUpdates(...recordKinds) {
+      for (const kind of recordKinds) {
+        durableFailedRecordUpdates.set(
+          kind,
+          (durableFailedRecordUpdates.get(kind) ?? 0) + 1,
+        );
+      }
+    },
+    setArtifactBindingEqualDateReads(count) {
+      artifactBindingEqualDateAlways = false;
+      artifactBindingEqualDateReadsRemaining = count;
+    },
+    setArtifactBindingEqualDateAlways(value = true) {
+      artifactBindingEqualDateAlways = value;
+      artifactBindingEqualDateReadsRemaining = 0;
+    },
+    artifactBindingPointReadRequests: () =>
+      structuredClone(artifactBindingPointReadRequests),
+    artifactBindingReadyConfirmationRecoveryReceiptDigests: () =>
+      reachableRecordEntries()
+        .filter(({ record }) =>
+          record.record_type === "effect-response" &&
+          record.kind === "artifact-binding-ready")
+        .map(({ commit_sha: commitSha, record }) =>
+          gitLedgerDigestDomain(
+            "codex-review-gate-v2-git-ledger-recovered-private-append",
+            {
+              label:
+                "automatic-recovery-artifact-binding-ready-confirmation",
+              commit_sha: commitSha,
+              envelope_digest: record.envelope_digest,
+            },
+          )),
+    failArtifactBindingPointReadAt(ordinal) {
+      failedArtifactBindingPointReadOrdinals.add(ordinal);
+    },
+    failRecordUpdateAt(recordKind, ordinal) {
+      const ordinals = failedRecordUpdateOrdinals.get(recordKind) ?? new Set();
+      ordinals.add(ordinal);
+      failedRecordUpdateOrdinals.set(recordKind, ordinals);
     },
     failNextCandidatePhase(recordType, phase) {
       const key = `phase:${recordType}:${phase}`;
@@ -4853,6 +6258,10 @@ function productionControllerGitHubFixture(
       const candidateRecord = recordForCommit(body.sha);
       const candidateKind =
         `${candidateRecord.record_type}:${candidateRecord.kind ?? ""}`;
+      const updateOrdinal = (recordUpdateCounts.get(candidateKind) ?? 0) + 1;
+      recordUpdateCounts.set(candidateKind, updateOrdinal);
+      const ordinalFailures = failedRecordUpdateOrdinals.get(candidateKind);
+      const ordinalFailure = ordinalFailures?.delete(updateOrdinal) === true;
       const phaseKind = typeof candidateRecord.payload?.phase === "string"
         ? `phase:${candidateRecord.record_type}:${candidateRecord.payload.phase}`
         : null;
@@ -4861,8 +6270,25 @@ function productionControllerGitHubFixture(
         ? phaseKind
         : candidateKind;
       const failuresRemaining = failedRecordUpdates.get(failureKey) ?? 0;
-      if (failuresRemaining > 0) {
+      if (ordinalFailure || failuresRemaining > 0) {
         failedRecordUpdates.set(failureKey, failuresRemaining - 1);
+        return ledgerResponse(500, {
+          message: "Internal Server Error",
+          documentation_url: "https://docs.github.com/rest",
+          status: "500",
+        }, date);
+      }
+      const durableFailuresRemaining =
+        durableFailedRecordUpdates.get(candidateKind) ?? 0;
+      if (durableFailuresRemaining > 0) {
+        durableFailedRecordUpdates.set(
+          candidateKind,
+          durableFailuresRemaining - 1,
+        );
+        refTarget = body.sha;
+        const type = recordType(refTarget);
+        if (type === "lease-acquire") activeLease = true;
+        if (type === "lease-release") activeLease = false;
         return ledgerResponse(500, {
           message: "Internal Server Error",
           documentation_url: "https://docs.github.com/rest",
@@ -4931,13 +6357,20 @@ function productionControllerGitHubFixture(
   }
 
   function nextDate() {
-    second += 1;
+    serverTimeOffsetMilliseconds += serverTimeStepMilliseconds;
     return currentDate();
+  }
+
+  function advancePastCurrentServerSecond() {
+    const currentServerSecond = currentDate();
+    do {
+      serverTimeOffsetMilliseconds += serverTimeStepMilliseconds;
+    } while (currentDate() === currentServerSecond);
   }
 
   function currentDate() {
     const rendered = new Date(
-      Date.parse(baseTime) + second * 1_000,
+      Date.parse(baseTime) + serverTimeOffsetMilliseconds,
     ).toUTCString();
     maxServerTimestamp = Math.max(maxServerTimestamp, Date.parse(rendered));
     return rendered;
@@ -4969,13 +6402,59 @@ function productionControllerGitHubFixture(
       .map((record) => `${record.record_type}:${record.kind ?? ""}`);
   }
 
+  function hasReadyAutomaticArtifactBinding() {
+    const records = reachableRecords();
+    const latestAcquireIndex = records.findLastIndex((record) =>
+      record.record_type === "lease-acquire");
+    const currentRunHasSchedulerObservation = records
+      .slice(latestAcquireIndex + 1)
+      .some((record) =>
+        record.record_type === "effect-intent" &&
+        record.kind === "scheduler-observation");
+    if (!currentRunHasSchedulerObservation) return false;
+    return records.some((intent) =>
+      intent.record_type === "effect-intent" &&
+      intent.kind === "artifact-binding" &&
+      !records.some((response) =>
+        response.record_type === "effect-response" &&
+        response.kind === "artifact-binding" &&
+        response.effect_id === intent.effect_id) &&
+      records.some((ready) =>
+        ready.record_type === "effect-response" &&
+        ready.kind === "artifact-binding-ready" &&
+        ready.effect_id === `${intent.effect_id}:ready`));
+  }
+
+  function isExactProviderArtifactPath(path) {
+    return /^\/repos\/owner\/repo\/issues\/comments\/[1-9][0-9]*$/u
+      .test(path) ||
+      /^\/repos\/owner\/repo\/pulls\/7\/reviews\/[1-9][0-9]*$/u
+        .test(path);
+  }
+
+  function allIssueComments() {
+    return [
+      ...snapshotIssueComments,
+      ...requests.values(),
+    ].map((comment) => structuredClone(comment)).sort((left, right) =>
+      Date.parse(left.created_at) - Date.parse(right.created_at) ||
+      Number(left.id) - Number(right.id));
+  }
+
   function reachableRecords() {
+    return reachableRecordEntries().map(({ record }) => record);
+  }
+
+  function reachableRecordEntries() {
     const reachable = [];
     let cursor = refTarget;
     while (cursor !== null) {
       const commit = commits.get(cursor);
       if (commit === undefined) break;
-      reachable.push(recordForCommit(cursor));
+      reachable.push({
+        commit_sha: cursor,
+        record: recordForCommit(cursor),
+      });
       cursor = commit.parents[0]?.sha ?? null;
     }
     return reachable.reverse();
@@ -5000,10 +6479,10 @@ function productionControllerGitHubFixture(
     };
   }
 
-  function candidateInventoryExactPull(number) {
+  function candidateInventoryExactPull(number, lifecycleState = "open") {
     return {
       ...candidateInventoryListPull(number),
-      state: "open",
+      state: lifecycleState,
       merged: false,
       merged_at: null,
       updated_at: TIME,
@@ -5512,6 +6991,7 @@ function leasedDiscoveryCommand() {
 
 function completeSnapshotFetch({
   apiOrigin = "https://api.github.test",
+  issueComments = [],
 } = {}) {
   return async (input, options = {}) => {
     const url = new URL(String(input));
@@ -5607,13 +7087,45 @@ function completeSnapshotFetch({
     if (url.pathname === `${repoPath}/commits/${HEAD}/check-runs`) {
       return jsonResponse(JSON.stringify({ total_count: 0, check_runs: [] }));
     }
+    if (url.pathname === `${repoPath}/issues/7/comments`) {
+      return jsonResponse(JSON.stringify(issueComments));
+    }
+    const issueCommentMatch = url.pathname.match(
+      /^\/repos\/owner\/repo\/issues\/comments\/([1-9][0-9]*)$/u,
+    );
+    if (issueCommentMatch !== null) {
+      const comment = issueComments.find((candidate) =>
+        String(candidate.id) === issueCommentMatch[1]);
+      return comment === undefined
+        ? jsonResponse(JSON.stringify({ message: "Not Found" }), 404)
+        : jsonResponse(JSON.stringify(comment));
+    }
     if (new Set([
-      `${repoPath}/issues/7/comments`,
       `${repoPath}/pulls/7/reviews`,
       `${repoPath}/pulls/7/comments`,
       `${repoPath}/issues/7/reactions`,
     ]).has(url.pathname)) {
       return jsonResponse("[]");
+    }
+    if (url.pathname === `${repoPath}/collaborators/maintainer/permission`) {
+      return jsonResponse(JSON.stringify({
+        permission: "write",
+        role_name: "write",
+        user: {
+          id: 7001,
+          node_id: "U_maintainer",
+          login: "maintainer",
+          type: "User",
+          site_admin: false,
+          permissions: {
+            admin: false,
+            maintain: false,
+            push: true,
+            triage: true,
+            pull: true,
+          },
+        },
+      }));
     }
     if (url.pathname === repoPath) {
       return jsonResponse(JSON.stringify({
@@ -5632,6 +7144,158 @@ function completeSnapshotFetch({
     return jsonResponse(JSON.stringify({
       message: `unexpected complete snapshot route ${method} ${url.pathname}`,
     }), 404);
+  };
+}
+
+function productionTerminalFindingIssueComment() {
+  return {
+    id: 202,
+    node_id: "IC_202",
+    url: "https://api.github.test/repos/owner/repo/issues/comments/202",
+    html_url: "https://github.com/owner/repo/pull/7#issuecomment-202",
+    issue_url: "https://api.github.test/repos/owner/repo/issues/7",
+    author_association: "NONE",
+    body:
+      "### 💡 Codex Review\n\n" +
+      `- [P1] Fix this finding https://github.com/owner/repo/blob/${HEAD}/` +
+      "src/example.mjs#L10",
+    created_at: "2026-08-13T12:00:10.000Z",
+    updated_at: "2026-08-13T12:00:10.000Z",
+    user: {
+      id: 9001,
+      node_id: "BOT_codex",
+      login: "chatgpt-codex-connector[bot]",
+      type: "Bot",
+    },
+    performed_via_github_app: {
+      id: 15368,
+      node_id: "APP_codex",
+      slug: "chatgpt-codex-connector",
+    },
+  };
+}
+
+async function withProductionAutomaticRecoveryScenario(callback, {
+  serverTimeStepMilliseconds = 500,
+} = {}) {
+  return withWorkflowCliFixture({
+    eventName: "pull_request_target",
+    event: { pull_request: { number: 7 } },
+    route: "ordinary",
+    pullRequest: "7",
+  }, async ({ environment, runnerTemp }) => {
+    const command = await prepareV2WorkflowCommand(environment);
+    const liveTime = new Date().toISOString();
+    const oidc = productionOidcFixture(command, liveTime);
+    const github = productionControllerGitHubFixture(command, oidc, liveTime, {
+      serverTimeStepMilliseconds,
+    });
+    const firstEnvironment = {
+      ...environment,
+      ...oidc.environment,
+      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+      GITHUB_API_URL: "https://api.github.test",
+    };
+    const initial = await runV2WorkflowControllerCli(firstEnvironment, {
+      fetch: github.fetch,
+    });
+    let runOrdinal = 0;
+    const runLeg = async (name) => {
+      runOrdinal += 1;
+      const legEnvironment = await makeWorkflowLegEnvironment({
+        environment: firstEnvironment,
+        runnerTemp,
+        name,
+        runId: String(200_000 + runOrdinal),
+        route: "ordinary",
+        pullRequest: "7",
+      });
+      const legCommand = await prepareV2WorkflowCommand(legEnvironment);
+      oidc.bindCommand(legCommand);
+      return runV2WorkflowControllerCli(legEnvironment, {
+        fetch: github.fetch,
+      });
+    };
+    const addFindings = (ids) => {
+      const request = github.requestComments().at(-1);
+      assert.ok(request, "automatic recovery request exists");
+      ids.forEach((id, index) => {
+        const finding = productionAutomaticRecoveryFinding({ id, request });
+        const createdAt = new Date(
+          Date.parse(finding.created_at) + index * 1_000,
+        ).toISOString();
+        finding.created_at = createdAt;
+        finding.updated_at = createdAt;
+        const address = productionAutomaticRecoveryAddress({
+          id: id + 1,
+          finding,
+        });
+        github.addSnapshotIssueComments(finding, address);
+      });
+    };
+    await callback({
+      github,
+      initial,
+      runLeg,
+      addFindings,
+    });
+  });
+}
+
+function productionAutomaticRecoveryFinding({ id, request }) {
+  const apiOrigin = new URL(request.url).origin;
+  const createdAt = new Date(
+    Date.parse(request.created_at) + 1_000,
+  ).toISOString();
+  return {
+    id,
+    node_id: `IC_${id}`,
+    url: `${apiOrigin}/repos/owner/repo/issues/comments/${id}`,
+    html_url: `https://github.com/owner/repo/pull/7#issuecomment-${id}`,
+    issue_url: `${apiOrigin}/repos/owner/repo/issues/7`,
+    author_association: "NONE",
+    body:
+      "### 💡 Codex Review\n\n" +
+      `- [P1] Fix generation finding https://github.com/owner/repo/blob/${HEAD}/` +
+      `src/generation-${id}.mjs#L10`,
+    created_at: createdAt,
+    updated_at: createdAt,
+    user: {
+      id: 199175422,
+      node_id: "BOT_kgDOC98s_g",
+      login: "chatgpt-codex-connector[bot]",
+      type: "Bot",
+    },
+    performed_via_github_app: {
+      id: 1144995,
+      node_id: "A_kwHOAOQ6Gs4AEXij",
+      slug: "chatgpt-codex-connector",
+    },
+  };
+}
+
+function productionAutomaticRecoveryAddress({ id, finding }) {
+  const apiOrigin = new URL(finding.url).origin;
+  const createdAt = new Date(
+    Date.parse(finding.created_at) + 1_000,
+  ).toISOString();
+  return {
+    id,
+    node_id: `IC_${id}`,
+    url: `${apiOrigin}/repos/owner/repo/issues/comments/${id}`,
+    html_url: `https://github.com/owner/repo/pull/7#issuecomment-${id}`,
+    issue_url: `${apiOrigin}/repos/owner/repo/issues/7`,
+    author_association: "MEMBER",
+    body: `/codex-gate addressed ${finding.html_url}`,
+    created_at: createdAt,
+    updated_at: createdAt,
+    user: {
+      id: 7001,
+      node_id: "U_maintainer",
+      login: "maintainer",
+      type: "User",
+    },
+    performed_via_github_app: null,
   };
 }
 
@@ -5771,10 +7435,17 @@ function assertNoProtectedProductionInternals(value, path = "production-cycle") 
   if (value === null || typeof value !== "object") return;
   const forbidden = new Set([
     "compact_jwt",
+    "artifact_binding_candidate_handle",
+    "artifact_binding_intent_handle",
+    "closure_records",
     "envelope",
+    "evidence_snapshot",
     "full_snapshot",
     "payload",
+    "provider_artifact_handles",
+    "ready_reachability_boundary",
     "record",
+    "recovery_handle",
     "reducer_report",
     "scheduler_evaluation",
     "scheduler_plan",

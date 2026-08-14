@@ -57,9 +57,17 @@ const CONTROLLED_REQUEST_KEYS = Object.freeze([
 ]);
 const AUTOMATIC_REQUEST_KEYS = Object.freeze([
   "state",
+  "generation_index",
+  "recovery_authority",
   "intent_id",
   "intent_persisted_at",
   "effect_attempted_at",
+]);
+const RECOVERY_AUTHORITY_KEYS = Object.freeze([
+  "prior_generation_id",
+  "finding_ids",
+  "closure_ids",
+  "closure_observed_at",
 ]);
 const SNAPSHOT_KEYS = Object.freeze([
   "epoch_id",
@@ -190,6 +198,13 @@ export function planV2Actions(rawInput) {
     return output({ actions, dueAtMs: null, automaticRetryStopped: true });
   }
 
+  if (
+    evaluation.decision === "findings" &&
+    input.epoch.automatic_request.generation_index > 1
+  ) {
+    return planRecoveredFindings(input, nowMs, applied);
+  }
+
   if (evaluation.decision !== "pending" &&
       evaluation.decision !== "inconclusive") {
     appendStatusOrCapLedger(actions, input, evaluation.decision, evaluation, applied);
@@ -207,6 +222,37 @@ export function planV2Actions(rawInput) {
   }
 
   return planPrivatePending(input, nowMs, epochStartMs, applied);
+}
+
+function planRecoveredFindings(input, nowMs, applied) {
+  const actions = [];
+  const requiredSlots = requiredStatusWriteSlots(
+    "findings",
+    input.status_target_mode,
+  );
+  if (remainingStatusSlots(input) < requiredSlots) {
+    appendCapLedger(actions, input, applied, requiredSlots);
+    return output({ actions, dueAtMs: null, automaticRetryStopped: true });
+  }
+  appendStatusOrCapLedger(
+    actions,
+    input,
+    "findings",
+    input.evaluation,
+    applied,
+  );
+  if (input.epoch.automatic_request.state === "available") {
+    appendAutomaticRequestActions(actions, input, applied);
+  } else if (input.epoch.automatic_request.state === "intent-persisted") {
+    appendAction(actions, postRequestAction(input), applied);
+  }
+  return output({
+    actions,
+    dueAtMs: input.public_wait_supported
+      ? nowMs + PUBLIC_POST_REQUEST_WAIT_MS
+      : nowMs + PRIVATE_RECONCILIATION_INTERVAL_MS,
+    automaticRetryStopped: true,
+  });
 }
 
 function planPublicPending(input, nowMs, epochStartMs, applied) {
@@ -449,18 +495,32 @@ function planNoStartConfirmation(input, nowMs, epochStartMs, applied) {
 }
 
 function appendAutomaticRequestActions(actions, input, applied) {
-  const intentId = automaticIntentId(input.epoch.id);
-  const persistKey = `persist-auto-request-intent:${digest(intentId)}`;
+  const generationIndex = input.epoch.automatic_request.generation_index;
+  const generationId = `automatic:${generationIndex}`;
+  const intentId = automaticIntentId(input.epoch.id, generationIndex);
+  const persistKey =
+    `persist-auto-request-intent:${generationId}:${digest(intentId)}`;
   appendAction(actions, {
     kind: "persist_auto_request_intent",
     idempotency_key: persistKey,
     intent_id: intentId,
+    generation_id: generationId,
+    generation_index: generationIndex,
+    recovery_authority: structuredClone(
+      input.epoch.automatic_request.recovery_authority,
+    ),
     consumes_automatic_reservation: true,
   }, applied);
   appendAction(actions, {
     kind: "post_review_request",
-    idempotency_key: `post-review-request:${digest(intentId)}`,
+    idempotency_key:
+      `post-review-request:${generationId}:${digest(intentId)}`,
     intent_id: intentId,
+    generation_id: generationId,
+    generation_index: generationIndex,
+    recovery_authority: structuredClone(
+      input.epoch.automatic_request.recovery_authority,
+    ),
     depends_on_idempotency_key: persistKey,
     retry_limit: 0,
     record_attempt_before_effect: true,
@@ -468,12 +528,21 @@ function appendAutomaticRequestActions(actions, input, applied) {
 }
 
 function postRequestAction(input) {
+  const generationIndex = input.epoch.automatic_request.generation_index;
+  const generationId = `automatic:${generationIndex}`;
   const intentId = input.epoch.automatic_request.intent_id;
   return {
     kind: "post_review_request",
-    idempotency_key: `post-review-request:${digest(intentId)}`,
+    idempotency_key:
+      `post-review-request:${generationId}:${digest(intentId)}`,
     intent_id: intentId,
-    depends_on_idempotency_key: `persist-auto-request-intent:${digest(intentId)}`,
+    generation_id: generationId,
+    generation_index: generationIndex,
+    recovery_authority: structuredClone(
+      input.epoch.automatic_request.recovery_authority,
+    ),
+    depends_on_idempotency_key:
+      `persist-auto-request-intent:${generationId}:${digest(intentId)}`,
     retry_limit: 0,
     record_attempt_before_effect: true,
   };
@@ -666,8 +735,10 @@ function evaluationReasonForTrigger(trigger) {
   }
 }
 
-function automaticIntentId(epochId) {
-  return `auto-request:${digest(epochId)}`;
+function automaticIntentId(epochId, generationIndex) {
+  return `auto-request:automatic:${generationIndex}:${digest(
+    `${epochId}\0automatic:${generationIndex}`,
+  )}`;
 }
 
 function digest(value) {
@@ -758,6 +829,18 @@ function validateAutomaticRequest(request, epochStartMs, nowMs) {
   if (!AUTOMATIC_REQUEST_STATES.has(request.state)) {
     throw new TypeError("epoch.automatic_request.state is not closed");
   }
+  if (!Number.isSafeInteger(request.generation_index) ||
+      request.generation_index < 1 || request.generation_index > 3) {
+    throw new TypeError(
+      "epoch.automatic_request.generation_index must be an integer from 1 to 3",
+    );
+  }
+  validateAutomaticRecoveryAuthority(
+    request.recovery_authority,
+    request.generation_index,
+    epochStartMs,
+    nowMs,
+  );
   optionalString(request.intent_id, "epoch.automatic_request.intent_id");
   optionalTimestamp(request.intent_persisted_at, "epoch.automatic_request.intent_persisted_at");
   optionalTimestamp(request.effect_attempted_at, "epoch.automatic_request.effect_attempted_at");
@@ -793,6 +876,59 @@ function validateAutomaticRequest(request, epochStartMs, nowMs) {
     if (attemptedMs < persistedMs || attemptedMs > nowMs) {
       throw new TypeError("effect_attempted_at must be between intent persistence and now");
     }
+  }
+}
+
+function validateAutomaticRecoveryAuthority(
+  value,
+  generationIndex,
+  epochStartMs,
+  nowMs,
+) {
+  if (generationIndex === 1) {
+    if (value !== null) {
+      throw new TypeError(
+        "automatic generation 1 cannot carry recovery authority",
+      );
+    }
+    return;
+  }
+  assertRecord(value, "epoch.automatic_request.recovery_authority");
+  assertClosedKeys(
+    value,
+    RECOVERY_AUTHORITY_KEYS,
+    "epoch.automatic_request.recovery_authority",
+  );
+  if (value.prior_generation_id !== `automatic:${generationIndex - 1}`) {
+    throw new TypeError(
+      "automatic recovery authority must bind the immediate prior generation",
+    );
+  }
+  for (const [key, values] of [
+    ["finding_ids", value.finding_ids],
+    ["closure_ids", value.closure_ids],
+  ]) {
+    if (!Array.isArray(values) || values.length === 0 ||
+        values.some((item) => typeof item !== "string" || item.length === 0) ||
+        new Set(values).size !== values.length) {
+      throw new TypeError(
+        `epoch.automatic_request.recovery_authority.${key} must be a non-empty unique string array`,
+      );
+    }
+  }
+  if (value.finding_ids.length !== value.closure_ids.length) {
+    throw new TypeError(
+      "automatic recovery authority findings and closures must have equal cardinality",
+    );
+  }
+  const closureMs = timestampMs(
+    value.closure_observed_at,
+    "epoch.automatic_request.recovery_authority.closure_observed_at",
+  );
+  if (closureMs < epochStartMs || closureMs > nowMs) {
+    throw new TypeError(
+      "automatic recovery closure must be within the current review epoch and observation boundary",
+    );
   }
 }
 

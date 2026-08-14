@@ -38,15 +38,64 @@ test("state=all inventory closes the 150-item close/reopen page boundary", async
 
   const shard = await transport.readShard({ inventory: initial, shard_index: 0 });
   const final = await transport.scan({ prior_inventory: initial });
+  const finalShard = await transport.readShard({
+    inventory: final,
+    shard_index: 0,
+  });
   const cycle = finalizeV2CandidateInventoryCycle({
     initial_inventory: initial,
     shard_receipts: [shard],
     final_inventory: final,
+    final_shard_receipts: [finalShard],
   });
   assert.deepEqual(validateV2CandidateCycleReceipt(cycle), cycle);
   assert.equal(cycle.open_pull_requests.length, 149);
+  assert.equal(cycle.completeness, "bounded-stable-all-open-pull-requests");
+  assert.equal(cycle.observed_at, finalShard.observed_at);
   assert.ok(cycle.open_pull_requests.some(({ number }) => number === 101));
   assert.ok(!cycle.open_pull_requests.some(({ number }) => number === 50));
+});
+
+test("final cycle rejects close and reopen drift after the identity scan", async () => {
+  for (const [before, after] of [
+    ["open", "closed"],
+    ["closed", "open"],
+  ]) {
+    let exactRead = 0;
+    const fake = fakeGitHub({
+      datasets: () => candidateRange(1, 1),
+      lifecycle: () => {
+        exactRead += 1;
+        return exactRead === 1 ? before : after;
+      },
+    });
+    const transport = createTransport(fake.fetch);
+    const initial = await transport.scan();
+    const shard = await transport.readShard({
+      inventory: initial,
+      shard_index: 0,
+    });
+    const final = await transport.scan({ prior_inventory: initial });
+    const finalShard = await transport.readShard({
+      inventory: final,
+      shard_index: 0,
+    });
+
+    assert.throws(
+      () => finalizeV2CandidateInventoryCycle({
+        initial_inventory: initial,
+        shard_receipts: [shard],
+        final_inventory: final,
+        final_shard_receipts: [finalShard],
+      }),
+      (error) => {
+        assert.ok(error instanceof V2CandidateInventoryError);
+        assert.equal(error.code, "CANDIDATE_LIFECYCLE_DRIFT");
+        return true;
+      },
+      `${before} -> ${after} must not close a stable cycle`,
+    );
+  }
 });
 
 test("a PR created after the first pass extends the high watermark before stability", async () => {
@@ -99,6 +148,47 @@ test("more than 256 candidates produce canonical continuation shards", async () 
   });
   assert.equal(first.observations.length, 256);
   assert.equal(second.observations.length, 44);
+});
+
+test("a multi-shard cycle closes only after the complete final lifecycle round", async () => {
+  const fake = fakeGitHub({ datasets: () => candidateRange(1, 300) });
+  const transport = createTransport(fake.fetch);
+  const initial = await transport.scan();
+  const firstRound = [];
+  for (let index = 0; index < initial.shards.length; index += 1) {
+    firstRound.push(await transport.readShard({
+      inventory: initial,
+      shard_index: index,
+    }));
+  }
+  const final = await transport.scan({ prior_inventory: initial });
+  const finalRound = [];
+  for (let index = 0; index < final.shards.length; index += 1) {
+    finalRound.push(await transport.readShard({
+      inventory: final,
+      shard_index: index,
+    }));
+  }
+
+  const cycle = finalizeV2CandidateInventoryCycle({
+    initial_inventory: initial,
+    shard_receipts: firstRound,
+    final_inventory: final,
+    final_shard_receipts: finalRound,
+  });
+  assert.deepEqual(validateV2CandidateCycleReceipt(cycle), cycle);
+  assert.deepEqual(
+    cycle.final_shard_receipts.map(({ shard_index }) => shard_index),
+    [0, 1],
+  );
+  assert.equal(cycle.open_pull_requests.length, 300);
+
+  const reversed = structuredClone(cycle);
+  reversed.final_shard_receipts.reverse();
+  assert.throws(
+    () => validateV2CandidateCycleReceipt(reversed),
+    /missing or out of order/u,
+  );
 });
 
 test("a full page without an exact next Link fails closed", async () => {

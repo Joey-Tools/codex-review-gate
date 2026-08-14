@@ -796,23 +796,25 @@ function deriveControllerFacts(handle) {
       });
     } else if (envelope.kind === "artifact-binding") {
       const receipt = payload.receipt;
-      artifactBindings.push({
-        record_oid: record.commit_sha,
-        payload_digest: envelope.payload_digest,
-        generation_id: generation.generation_id,
-        request_binding_record_oid: receipt.request_binding_record_oid,
-        request_id: receipt.request_id,
-        request_node_id: receipt.request_node_id,
-        artifact_selector: structuredClone(receipt.artifact_selector),
-        artifact_node_id: receipt.artifact_node_id,
-        artifact_url: receipt.artifact_url,
-        artifact_type: receipt.artifact_type,
-        artifact_created_at: receipt.artifact_created_at,
-        server_time: receipt.server_time,
-        raw_body_sha256: receipt.raw_body_sha256,
-        actor: structuredClone(receipt.actor),
-        app: structuredClone(receipt.app),
-      });
+      for (const binding of receipt.bindings) {
+        artifactBindings.push({
+          record_oid: record.commit_sha,
+          payload_digest: envelope.payload_digest,
+          generation_id: generation.generation_id,
+          request_binding_record_oid: binding.request_binding_record_oid,
+          request_id: binding.request_id,
+          request_node_id: binding.request_node_id,
+          artifact_selector: structuredClone(binding.artifact_selector),
+          artifact_node_id: binding.artifact_node_id,
+          artifact_url: binding.artifact_url,
+          artifact_type: binding.artifact_type,
+          artifact_created_at: binding.artifact_created_at,
+          server_time: binding.server_time,
+          raw_body_sha256: binding.raw_body_sha256,
+          actor: structuredClone(binding.actor),
+          app: structuredClone(binding.app),
+        });
+      }
     } else if (envelope.kind === "scheduler-state") {
       recoveryBindings.push({
         record_oid: record.commit_sha,

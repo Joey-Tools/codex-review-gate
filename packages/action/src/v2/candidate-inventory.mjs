@@ -32,10 +32,11 @@ export class V2CandidateInventoryError extends Error {
 /**
  * Build the read-only private-schedule inventory transport.
  *
- * The protected property is candidate-set completeness at the final point
- * reads. Candidate identity uses immutable PR id/node/number/created_at fields;
- * mutable lifecycle metadata is deliberately exact-refetched per shard. A
- * close/reopen transition therefore cannot remove or reorder a candidate.
+ * The protected property is candidate-set completeness plus bounded lifecycle
+ * stability. Candidate identity uses immutable PR id/node/number/created_at
+ * fields; mutable lifecycle metadata is exact-refetched per shard both before
+ * and after the final identity scan. A completed cycle therefore requires two
+ * equal lifecycle projections around that final scan.
  */
 export function createV2GitHubCandidateInventory({
   fetch: fetchImpl,
@@ -195,13 +196,14 @@ export function createV2GitHubCandidateInventory({
 }
 
 /**
- * Close one point-in-time scan cycle after every deterministic shard has been
- * exact-refetched and a final stable state=all scan retained the same superset.
+ * Close one bounded-stable scan cycle after every deterministic shard has been
+ * exact-refetched on both sides of a final stable state=all identity scan.
  */
 export function finalizeV2CandidateInventoryCycle({
   initial_inventory,
   shard_receipts,
   final_inventory,
+  final_shard_receipts,
 }) {
   const initial = validateV2CandidateInventory(initial_inventory);
   const final = validateV2CandidateInventory(
@@ -218,43 +220,45 @@ export function finalizeV2CandidateInventoryCycle({
       "candidate superset changed during exact lifecycle reads",
     );
   }
-  if (!Array.isArray(shard_receipts) ||
-      shard_receipts.length !== initial.shards.length) {
-    throw inventoryError(
-      "CANDIDATE_SHARDS_INCOMPLETE",
-      "every candidate shard must have one exact lifecycle receipt",
-    );
-  }
-  const byIndex = new Map();
-  for (const value of shard_receipts) {
-    const receipt = validateV2CandidateShardReceipt(value, initial);
-    if (byIndex.has(receipt.shard_index)) {
-      throw inventoryError(
-        "CANDIDATE_SHARD_DUPLICATE",
-        "candidate shard receipt index is duplicated",
-      );
-    }
-    byIndex.set(receipt.shard_index, receipt);
-  }
-  const ordered = initial.shards.map((_, index) => {
-    const receipt = byIndex.get(index);
-    if (receipt === undefined) {
-      throw inventoryError(
-        "CANDIDATE_SHARDS_INCOMPLETE",
-        "candidate shard receipt is missing",
-        { shard_index: index },
-      );
-    }
-    return receipt;
-  });
+  const ordered = orderCycleShardReceipts(shard_receipts, initial);
+  const finalOrdered = orderCycleShardReceipts(
+    final_shard_receipts,
+    final,
+    "final candidate shard",
+  );
   const observations = ordered.flatMap((receipt) => receipt.observations);
-  if (observations.length !== initial.candidates.length) {
+  const finalObservations = finalOrdered.flatMap(
+    (receipt) => receipt.observations,
+  );
+  if (
+    observations.length !== initial.candidates.length ||
+    finalObservations.length !== final.candidates.length
+  ) {
     throw inventoryError(
       "CANDIDATE_SHARDS_INCOMPLETE",
       "candidate shard observations do not cover the full superset",
     );
   }
-  const openPullRequests = observations
+  const lifecycleProjection = projectCandidateLifecycle(observations);
+  const finalLifecycleProjection = projectCandidateLifecycle(
+    finalObservations,
+  );
+  if (canonicalJson(lifecycleProjection) !==
+      canonicalJson(finalLifecycleProjection)) {
+    throw inventoryError(
+      "CANDIDATE_LIFECYCLE_DRIFT",
+      "candidate lifecycle changed across the final identity scan",
+    );
+  }
+  for (const receipt of finalOrdered) {
+    if (Date.parse(receipt.observed_at) < Date.parse(final.observed_at)) {
+      throw inventoryError(
+        "CANDIDATE_LIFECYCLE_TIME",
+        "final lifecycle verification predates the final identity scan",
+      );
+    }
+  }
+  const openPullRequests = finalObservations
     .filter((observation) =>
       observation.state === "open" &&
       observation.merged === false &&
@@ -268,10 +272,17 @@ export function finalizeV2CandidateInventoryCycle({
     final_inventory_receipt_digest: final.receipt_digest,
     candidate_digest: initial.candidate_digest,
     shard_receipt_digests: ordered.map(({ receipt_digest }) => receipt_digest),
+    final_inventory_observed_at: final.observed_at,
+    final_shard_receipts: finalOrdered.map((receipt) =>
+      structuredClone(receipt)),
+    lifecycle_projection_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-lifecycle-projection",
+      finalLifecycleProjection,
+    ),
     open_pull_requests: openPullRequests,
-    observed_at: final.observed_at,
+    observed_at: finalOrdered.at(-1)?.observed_at ?? final.observed_at,
     stable: true,
-    completeness: "point-in-time-all-open-pull-requests",
+    completeness: "bounded-stable-all-open-pull-requests",
   };
   return deepFreeze({
     ...withoutDigest,
@@ -287,13 +298,15 @@ export function validateV2CandidateCycleReceipt(value) {
   exactKeys(value, [
     "schema", "schema_version", "repository",
     "initial_inventory_receipt_digest", "final_inventory_receipt_digest",
-    "candidate_digest", "shard_receipt_digests", "open_pull_requests",
-    "observed_at", "stable", "completeness", "receipt_digest",
+    "candidate_digest", "shard_receipt_digests",
+    "final_inventory_observed_at", "final_shard_receipts",
+    "lifecycle_projection_digest", "open_pull_requests", "observed_at",
+    "stable", "completeness", "receipt_digest",
   ], "candidate cycle receipt");
   if (
     value.schema !== V2_CANDIDATE_CYCLE_RECEIPT_SCHEMA ||
     value.schema_version !== 1 || value.stable !== true ||
-    value.completeness !== "point-in-time-all-open-pull-requests"
+    value.completeness !== "bounded-stable-all-open-pull-requests"
   ) {
     throw new TypeError("candidate cycle receipt schema or assurance is invalid");
   }
@@ -311,6 +324,42 @@ export function validateV2CandidateCycleReceipt(value) {
   if (new Set(value.shard_receipt_digests).size !==
       value.shard_receipt_digests.length) {
     throw new TypeError("candidate cycle shard receipt digests must be unique");
+  }
+  timestamp(value.final_inventory_observed_at,
+    "candidate cycle final inventory observed_at");
+  const finalShardReceipts = normalizeEmbeddedFinalShardReceipts(
+    value.final_shard_receipts,
+    repository,
+    value.final_inventory_receipt_digest,
+  );
+  if (value.shard_receipt_digests.length !== finalShardReceipts.length) {
+    throw new Error("candidate cycle lifecycle rounds cover different shards");
+  }
+  for (const receipt of finalShardReceipts) {
+    if (Date.parse(receipt.observed_at) <
+        Date.parse(value.final_inventory_observed_at)) {
+      throw new Error(
+        "candidate cycle final lifecycle read predates its identity scan",
+      );
+    }
+  }
+  const finalObservations = finalShardReceipts.flatMap(
+    (receipt) => receipt.observations,
+  );
+  if (digestCanonical(
+    "codex-review-gate-v2-candidate-identities",
+    finalShardReceipts.flatMap((receipt) => receipt.candidates),
+  ) !== value.candidate_digest) {
+    throw new Error("candidate cycle final shard identities are incomplete");
+  }
+  const lifecycleProjection = projectCandidateLifecycle(finalObservations);
+  digest(value.lifecycle_projection_digest,
+    "candidate cycle lifecycle projection digest");
+  if (value.lifecycle_projection_digest !== digestCanonical(
+    "codex-review-gate-v2-candidate-lifecycle-projection",
+    lifecycleProjection,
+  )) {
+    throw new Error("candidate cycle lifecycle projection digest is invalid");
   }
   if (!Array.isArray(value.open_pull_requests)) {
     throw new TypeError("candidate cycle open pull requests must be an array");
@@ -338,14 +387,33 @@ export function validateV2CandidateCycleReceipt(value) {
       throw new Error("candidate cycle open PRs must retain canonical candidate order");
     }
   }
+  const expectedOpenPullRequests = finalObservations.filter((observation) =>
+    observation.state === "open" && observation.merged === false &&
+    observation.merged_at === null);
+  if (canonicalJson(openPullRequests) !==
+      canonicalJson(expectedOpenPullRequests)) {
+    throw new Error("candidate cycle open PRs differ from final lifecycle reads");
+  }
   timestamp(value.observed_at, "candidate cycle observed_at");
+  const expectedObservedAt = finalShardReceipts.at(-1)?.observed_at ??
+    value.final_inventory_observed_at;
+  if (value.observed_at !== expectedObservedAt ||
+      Date.parse(value.observed_at) <
+        Date.parse(value.final_inventory_observed_at)) {
+    throw new Error("candidate cycle time is not the final lifecycle boundary");
+  }
   digest(value.receipt_digest, "candidate cycle receipt digest");
   const { receipt_digest: _receiptDigest, ...withoutDigest } = value;
   if (value.receipt_digest !== digestCanonical(
     "codex-review-gate-v2-candidate-cycle", withoutDigest)) {
     throw new Error("candidate cycle receipt digest is invalid");
   }
-  return deepFreeze({ ...structuredClone(value), repository, open_pull_requests: openPullRequests });
+  return deepFreeze({
+    ...structuredClone(value),
+    repository,
+    final_shard_receipts: finalShardReceipts,
+    open_pull_requests: openPullRequests,
+  });
 }
 
 export function validateV2CandidateInventory(value, expectedRepository = null) {
@@ -497,6 +565,143 @@ export function validateV2CandidateShardReceipt(value, inventory) {
     throw new Error("candidate shard receipt digest is invalid");
   }
   return deepFreeze({ ...structuredClone(value), candidates, observations });
+}
+
+function orderCycleShardReceipts(
+  receipts,
+  inventory,
+  label = "candidate shard",
+) {
+  if (!Array.isArray(receipts) || receipts.length !== inventory.shards.length) {
+    throw inventoryError(
+      "CANDIDATE_SHARDS_INCOMPLETE",
+      `every ${label} must have one exact lifecycle receipt`,
+    );
+  }
+  const byIndex = new Map();
+  for (const value of receipts) {
+    const receipt = validateV2CandidateShardReceipt(value, inventory);
+    if (byIndex.has(receipt.shard_index)) {
+      throw inventoryError(
+        "CANDIDATE_SHARD_DUPLICATE",
+        `${label} receipt index is duplicated`,
+      );
+    }
+    byIndex.set(receipt.shard_index, receipt);
+  }
+  return inventory.shards.map((_, index) => {
+    const receipt = byIndex.get(index);
+    if (receipt === undefined) {
+      throw inventoryError(
+        "CANDIDATE_SHARDS_INCOMPLETE",
+        `${label} receipt is missing`,
+        { shard_index: index },
+      );
+    }
+    return receipt;
+  });
+}
+
+function normalizeEmbeddedFinalShardReceipts(
+  values,
+  repository,
+  finalInventoryReceiptDigest,
+) {
+  if (!Array.isArray(values)) {
+    throw new TypeError("candidate cycle final shard receipts must be an array");
+  }
+  const receipts = values.map((value, index) => {
+    const label = `candidate cycle final shard receipt ${index}`;
+    assertObject(value, label);
+    exactKeys(value, [
+      "schema", "schema_version", "repository", "inventory_receipt_digest",
+      "shard_index", "shard_digest", "candidates", "observations",
+      "observed_at", "stable", "receipt_digest",
+    ], label);
+    if (
+      value.schema !== V2_CANDIDATE_SHARD_RECEIPT_SCHEMA ||
+      value.schema_version !== 1 || value.stable !== true ||
+      canonicalJson(normalizeRepository(value.repository)) !==
+        canonicalJson(repository) ||
+      value.inventory_receipt_digest !== finalInventoryReceiptDigest ||
+      !Number.isSafeInteger(value.shard_index) || value.shard_index < 0
+    ) {
+      throw new TypeError(`${label} identity is invalid`);
+    }
+    const candidates = normalizeCandidates(value.candidates);
+    digest(value.shard_digest, `${label} shard digest`);
+    if (!Array.isArray(value.observations) ||
+        value.observations.length !== candidates.length) {
+      throw new TypeError(`${label} observations are incomplete`);
+    }
+    const observations = value.observations.map((observation, itemIndex) =>
+      normalizeStoredPullObservation(observation, {
+        candidate: candidates[itemIndex],
+        repository,
+      }));
+    for (let itemIndex = 1; itemIndex < observations.length; itemIndex += 1) {
+      if (Date.parse(observations[itemIndex].endpoint_receipt.server_time) <
+          Date.parse(observations[itemIndex - 1]
+            .endpoint_receipt.server_time)) {
+        throw new Error(`${label} endpoint time regressed`);
+      }
+    }
+    timestamp(value.observed_at, `${label} observed_at`);
+    const expectedObservedAt = observations.at(-1)
+      ?.endpoint_receipt.server_time;
+    if (expectedObservedAt !== undefined &&
+        value.observed_at !== expectedObservedAt) {
+      throw new Error(`${label} observed_at is not its final exact read`);
+    }
+    digest(value.receipt_digest, `${label} receipt digest`);
+    const { receipt_digest: _receiptDigest, ...withoutDigest } = value;
+    if (value.receipt_digest !== digestCanonical(
+      "codex-review-gate-v2-candidate-shard",
+      withoutDigest,
+    )) {
+      throw new Error(`${label} receipt digest is invalid`);
+    }
+    return deepFreeze({
+      ...structuredClone(value),
+      repository: structuredClone(repository),
+      candidates,
+      observations,
+    });
+  });
+  for (let index = 0; index < receipts.length; index += 1) {
+    if (receipts[index].shard_index !== index) {
+      throw new Error(
+        "candidate cycle final shard receipts are missing or out of order",
+      );
+    }
+    if (index > 0 && Date.parse(receipts[index].observed_at) <
+        Date.parse(receipts[index - 1].observed_at)) {
+      throw new Error("candidate cycle final shard time regressed");
+    }
+  }
+  const expectedShards = buildShards(
+    receipts.flatMap((receipt) => receipt.candidates),
+  );
+  if (expectedShards.length !== receipts.length) {
+    throw new Error("candidate cycle final shard partition is incomplete");
+  }
+  for (let index = 0; index < expectedShards.length; index += 1) {
+    if (
+      receipts[index].shard_digest !== expectedShards[index].shard_digest ||
+      canonicalJson(receipts[index].candidates) !==
+        canonicalJson(expectedShards[index].candidates)
+    ) {
+      throw new Error("candidate cycle final shard partition is not canonical");
+    }
+  }
+  return deepFreeze(receipts);
+}
+
+function projectCandidateLifecycle(observations) {
+  return observations.map((observation) => {
+    const { endpoint_receipt: _endpointReceipt, ...projection } = observation;
+    return structuredClone(projection);
+  });
 }
 
 async function scanOnePass({
