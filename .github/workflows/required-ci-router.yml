@@ -1,0 +1,93 @@
+name: Required CI Router
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  repository-allowlist:
+    name: Required CI repository allowlist
+    runs-on: ubuntu-slim
+    steps:
+      - name: Reject unknown repositories
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          case "$REPOSITORY" in
+            "Joey-Tools/codex-review-gate" | \
+            "Joey-Tools/codex-apple-notes-toolkit" | \
+            "Joey-Tools/codex-debug-triage" | \
+            "Joey-Tools/codex-personal-sync" | \
+            "Joey-Tools/codex-project-journal" | \
+            "Joey-Tools/codex-private-workflows" | \
+            "Joey-Tools/codex-review-workflows" | \
+            "Joey-Tools/codex-rollout-backup" | \
+            "Joey-Tools/codex-toolbox" | \
+            "Joey-Tools/codex-waited-delivery" | \
+            "Joey-Tools/codex-workflow-hygiene")
+              ;;
+            *)
+              printf 'Required CI is not configured for %s.\n' "$REPOSITORY" >&2
+              exit 1
+              ;;
+          esac
+
+  codex-review-gate:
+    name: Required CI - codex-review-gate
+    if: ${{ github.repository == 'Joey-Tools/codex-review-gate' }}
+    uses: Joey-Tools/codex-review-gate/.github/workflows/required-ci.yml@master
+
+  codex-apple-notes-toolkit:
+    name: Required CI - codex-apple-notes-toolkit
+    if: ${{ github.repository == 'Joey-Tools/codex-apple-notes-toolkit' }}
+    uses: Joey-Tools/codex-apple-notes-toolkit/.github/workflows/required-ci.yml@master
+
+  codex-debug-triage:
+    name: Required CI - codex-debug-triage
+    if: ${{ github.repository == 'Joey-Tools/codex-debug-triage' }}
+    uses: Joey-Tools/codex-debug-triage/.github/workflows/required-ci.yml@master
+
+  codex-personal-sync:
+    name: Required CI - codex-personal-sync
+    if: ${{ github.repository == 'Joey-Tools/codex-personal-sync' }}
+    uses: Joey-Tools/codex-personal-sync/.github/workflows/required-ci.yml@master
+
+  codex-project-journal:
+    name: Required CI - codex-project-journal
+    if: ${{ github.repository == 'Joey-Tools/codex-project-journal' }}
+    uses: Joey-Tools/codex-project-journal/.github/workflows/required-ci.yml@master
+    with:
+      run_fatal_signal_tests: "1"
+
+  codex-private-workflows:
+    name: Required CI - codex-private-workflows
+    if: ${{ github.repository == 'Joey-Tools/codex-private-workflows' }}
+    uses: Joey-Tools/codex-private-workflows/.github/workflows/required-ci.yml@master
+
+  codex-review-workflows:
+    name: Required CI - codex-review-workflows
+    if: ${{ github.repository == 'Joey-Tools/codex-review-workflows' }}
+    uses: Joey-Tools/codex-review-workflows/.github/workflows/required-ci.yml@master
+
+  codex-rollout-backup:
+    name: Required CI - codex-rollout-backup
+    if: ${{ github.repository == 'Joey-Tools/codex-rollout-backup' }}
+    uses: Joey-Tools/codex-rollout-backup/.github/workflows/required-ci.yml@master
+
+  codex-toolbox:
+    name: Required CI - codex-toolbox
+    if: ${{ github.repository == 'Joey-Tools/codex-toolbox' }}
+    uses: Joey-Tools/codex-toolbox/.github/workflows/required-ci.yml@master
+
+  codex-waited-delivery:
+    name: Required CI - codex-waited-delivery
+    if: ${{ github.repository == 'Joey-Tools/codex-waited-delivery' }}
+    uses: Joey-Tools/codex-waited-delivery/.github/workflows/required-ci.yml@master
+
+  codex-workflow-hygiene:
+    name: Required CI - codex-workflow-hygiene
+    if: ${{ github.repository == 'Joey-Tools/codex-workflow-hygiene' }}
+    uses: Joey-Tools/codex-workflow-hygiene/.github/workflows/required-ci.yml@master

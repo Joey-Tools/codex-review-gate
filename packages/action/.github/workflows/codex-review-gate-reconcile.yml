@@ -1,0 +1,145 @@
+name: Codex Review Gate v2 Reconcile
+
+# Activation contract: each named public wait environment below must have an
+# exact 15-minute wait_timer protection rule. The environment name does not
+# configure that rule. A trusted Environment API preflight and live canary must
+# prove all three rules before activation; missing, unreadable, or non-15-minute
+# evidence is a fail-closed rollout blocker. The controller also validates the
+# server-time observation boundary, so an early environment release cannot
+# authorize a request or terminal effect.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      pull-request:
+        description: Pull request number to evaluate without posting a review request.
+        required: false
+        type: string
+
+permissions: {}
+
+# This source-owned workflow is a tested installation template, not a central
+# router. A production consumer installs the equivalent jobs in its own
+# repository and pins every reusable call to one immutable v2 release SHA.
+
+concurrency:
+  # Repository-wide serialization is defense in depth. The protected Git
+  # ledger ref remains the authoritative atomic conflict boundary.
+  group: codex-review-gate-v2-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  initial:
+    name: Initial trusted controller observation
+    permissions:
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+      statuses: write
+    uses: ./.github/workflows/codex-review-gate.yml
+    with:
+      pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
+      selection-policy: joey-default
+      controller-mode: ${{ github.event_name == 'workflow_dispatch' && 'evaluate-only' || github.event_name == 'schedule' && 'scan-all-open' || (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment') && 'provider-event-hint' || 'ordinary' }}
+      observation-boundary: initial
+
+  public-initial-wait:
+    name: Public initial 15-minute environment wait
+    needs: initial
+    if: ${{ needs.initial.outputs.wakeup-hints == 'public-initial-wait' }}
+    permissions: {}
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    environment:
+      name: codex-review-gate-public-initial-15m
+      deployment: false
+    steps:
+      - name: Release the environment wait boundary
+        run: ":"
+
+  after-public-initial:
+    name: Observe after public initial wait
+    needs: public-initial-wait
+    permissions:
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+      statuses: write
+    uses: ./.github/workflows/codex-review-gate.yml
+    with:
+      pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
+      selection-policy: joey-default
+      controller-mode: ordinary
+      observation-boundary: public-initial-wait-complete
+
+  public-post-request-wait:
+    name: Public post-request 15-minute environment wait
+    needs: after-public-initial
+    if: ${{ needs.after-public-initial.outputs.wakeup-hints == 'public-post-request-wait' }}
+    permissions: {}
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    environment:
+      name: codex-review-gate-public-post-request-15m
+      deployment: false
+    steps:
+      - name: Release the environment wait boundary
+        run: ":"
+
+  after-public-post-request:
+    name: Observe after public post-request wait
+    needs: public-post-request-wait
+    permissions:
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+      statuses: write
+    uses: ./.github/workflows/codex-review-gate.yml
+    with:
+      pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
+      selection-policy: joey-default
+      controller-mode: ordinary
+      observation-boundary: public-post-request-wait-complete
+
+  public-no-start-wait:
+    name: Public no-start confirmation 15-minute environment wait
+    needs: after-public-post-request
+    if: ${{ needs.after-public-post-request.outputs.wakeup-hints == 'public-no-start-wait' }}
+    permissions: {}
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    environment:
+      name: codex-review-gate-public-no-start-15m
+      deployment: false
+    steps:
+      - name: Release the environment wait boundary
+        run: ":"
+
+  after-public-no-start:
+    name: Observe after public no-start confirmation
+    needs: public-no-start-wait
+    permissions:
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+      statuses: write
+    uses: ./.github/workflows/codex-review-gate.yml
+    with:
+      pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
+      selection-policy: joey-default
+      controller-mode: ordinary
+      observation-boundary: public-no-start-wait-complete

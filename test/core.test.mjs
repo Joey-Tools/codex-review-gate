@@ -29,6 +29,9 @@ import {
   hasNewEyesTransition,
   hasNewPlusOneTransition,
   hasNewReviewTransition,
+  isExactV2CodexProviderApp,
+  isExactV2CodexProviderIdentity,
+  isTrustedCodexRestUser,
   isCodexCompletionComment,
   isCurrentHeadCodexReviewBodyFinding,
   isRetryableHttpStatus,
@@ -63,6 +66,7 @@ import {
   summarizeFindingsForState,
   summarizeCodexReactions,
   summarizeCodexSignalReactions,
+  V2_OFFICIAL_CODEX_BOT_LOGIN,
 } from "../packages/action/src/core.mjs";
 
 const FULL_SHA_A = "a".repeat(40);
@@ -113,6 +117,49 @@ function liveCodexReview(overrides = {}) {
     ...overrides,
   };
 }
+
+test("v2 provider identity requires the exact REST Bot and relevant App", () => {
+  const exactUser = { login: V2_OFFICIAL_CODEX_BOT_LOGIN, type: "Bot" };
+  const exactApp = { slug: "chatgpt-codex-connector" };
+  assert.equal(
+    isExactV2CodexProviderIdentity(exactUser),
+    true,
+    "exact reaction actor",
+  );
+  const cases = [
+    ["exact artifact actor and App", exactUser, exactApp, true],
+    ["omitted relevant App value", exactUser, undefined, false],
+    ["missing relevant App", exactUser, null, false],
+    ["wrong relevant App", exactUser, { slug: "other-app" }, false],
+    [
+      "unbracketed login",
+      { login: "chatgpt-codex-connector", type: "Bot" },
+      exactApp,
+      false,
+    ],
+    [
+      "wrong user type",
+      { login: V2_OFFICIAL_CODEX_BOT_LOGIN, type: "User" },
+      exactApp,
+      false,
+    ],
+    ["generic Bot", { login: "generic[bot]", type: "Bot" }, exactApp, false],
+    ["correct App with wrong user", { login: "human", type: "User" }, exactApp, false],
+  ];
+
+  for (const [name, user, app, expected] of cases) {
+    assert.equal(isExactV2CodexProviderIdentity(user, app), expected, name);
+  }
+  assert.equal(isExactV2CodexProviderApp(exactApp), true);
+  assert.equal(isExactV2CodexProviderApp({ slug: "other-app" }), false);
+
+  // The legacy v1 predicate remains configurable and accepts its frozen
+  // unbracketed default login; v2 does not inherit that behavior.
+  assert.equal(isTrustedCodexRestUser({
+    login: "chatgpt-codex-connector",
+    type: "Bot",
+  }), true);
+});
 
 function officialCodexDisclosure() {
   return [
