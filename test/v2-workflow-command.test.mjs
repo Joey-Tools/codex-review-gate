@@ -41,6 +41,10 @@ const CONTROLLER_PATH = new URL(
   "../packages/action/src/v2/workflow-controller.mjs",
   import.meta.url,
 );
+const RECONCILE_WORKFLOW_PATH = new URL(
+  "../packages/action/.github/workflows/codex-review-gate-reconcile.yml",
+  import.meta.url,
+);
 
 function scheduledDispatchBinding(overrides = {}) {
   const candidate = {
@@ -229,6 +233,45 @@ test("closed controller routes map to exact operations and triggers", async (t) 
       });
     });
   }
+});
+
+test("manual dispatch requires the pull-request selector accepted by evaluate-only", async () => {
+  const reconcile = await readFile(RECONCILE_WORKFLOW_PATH, "utf8");
+  assert.match(
+    reconcile,
+    /^      pull-request:\n        description: [^\n]+\n        required: true\n        type: string$/mu,
+  );
+  assert.doesNotMatch(
+    reconcile,
+    /^      pull-request:\n(?:        [^\n]+\n)*        default:/mu,
+  );
+
+  await withFixture({
+    eventName: "workflow_dispatch",
+    event: { inputs: {} },
+    route: "evaluate-only",
+    pullRequest: "",
+  }, async ({ environment }) => {
+    await assert.rejects(
+      prepareV2WorkflowCommand(environment),
+      /evaluate-only requires .* one explicit pull request/u,
+    );
+  });
+
+  await withFixture({
+    eventName: "workflow_dispatch",
+    event: { inputs: { "pull-request": "7" } },
+    route: "evaluate-only",
+    pullRequest: "7",
+  }, async ({ environment }) => {
+    const command = await prepareV2WorkflowCommand(environment);
+    assert.equal(command.pull_request.number, 7);
+    assert.deepEqual(command.route, {
+      operation: "evaluate-only",
+      trigger: "manual",
+      observation_boundary: "initial",
+    });
+  });
 });
 
 test("scheduled dispatch binding rejects missing, spurious, and selector-mismatched input", async (t) => {

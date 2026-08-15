@@ -23,7 +23,7 @@ on:
     inputs:
       pull-request:
         description: Pull request number to evaluate without posting a review request.
-        required: false
+        required: true
         type: string
 
 permissions: {}

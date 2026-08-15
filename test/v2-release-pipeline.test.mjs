@@ -536,7 +536,7 @@ function assertProductionConsumerActivationContract({
   assert.match(consumer, /^  cancel-in-progress: false$/mu);
   assert.match(
     consumer,
-    /^      pull-request:\n        description: [^\n]+\n        required: false\n        type: string$/mu,
+    /^      pull-request:\n        description: [^\n]+\n        required: true\n        type: string$/mu,
   );
 
   const exactControllerPermissions = [

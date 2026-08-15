@@ -115,6 +115,13 @@ export class V2ControlPlaneReceiptError extends Error {
 export function createV2ControlPlaneReceiptFromGitLedgerAuthority(authority) {
   const handle = assertV2GitLedgerControlPlaneAuthorityHandle(authority);
   const load = handle.load;
+  const queryRecordCount = handle.scoped_authority.ordered_records.length;
+  if (queryRecordCount !== load.records.length) {
+    throw new V2ControlPlaneReceiptError(
+      "CONTROL_PLANE_QUERY_CARDINALITY_MISMATCH",
+      "control plane authority query rows differ from its load manifest",
+    );
+  }
   const derivedInput = deriveControllerFacts(handle);
   const derived = {
     ...derivedInput,
@@ -137,7 +144,7 @@ export function createV2ControlPlaneReceiptFromGitLedgerAuthority(authority) {
     ruleset_receipt: structuredClone(load.ruleset_receipt),
     protection_receipt: structuredClone(load.protection_receipt),
     capability_attestation: structuredClone(load.capability_attestation),
-    record_count: load.commit_count,
+    record_count: queryRecordCount,
     fully_reachable_record_manifest_digest:
       load.fully_reachable_record_manifest_digest,
     two_pass_reads: structuredClone(load.two_pass_reads),

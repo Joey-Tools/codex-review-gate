@@ -32,6 +32,7 @@ import {
   createV2GitHubLedgerStore,
   createV2GitHubReservationLedger,
   createV2EffectLedger,
+  createV2ProductionInitialCycle,
   executeV2ControllerCycle,
   executeV2EffectOnce,
   listAllOpenPullRequests,
@@ -66,6 +67,8 @@ import {
   V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
   V2_GIT_LEDGER_PROVENANCE_VERIFIER_RESULT_SCHEMA,
   V2_GIT_LEDGER_REF,
+  projectV2GitLedgerCandidateDispatchBinding,
+  V2_GIT_LEDGER_CANDIDATE_DISPATCH_PLAN_SCHEMA,
   validateV2GitLedgerProvenanceReceipt,
 } from "../packages/action/src/v2/git-ledger.mjs";
 import {
@@ -74,6 +77,14 @@ import {
   V2_STATUS_TARGET_MODE,
   V2_WORKFLOW_PATH,
 } from "../packages/action/src/v2/workflow-command.mjs";
+import {
+  PUBLIC_INITIAL_WAIT_MS,
+  PUBLIC_NO_START_CONFIRMATION_MS,
+  PUBLIC_POST_REQUEST_WAIT_MS,
+  V2_SCHEDULER_SCHEMA,
+  V2_SCHEDULER_SCHEMA_VERSION,
+  planV2Actions,
+} from "../packages/action/src/v2/scheduler.mjs";
 
 const HEAD = "a".repeat(40);
 const MERGE = "b".repeat(40);
@@ -3000,10 +3011,10 @@ test("second terminal status ambiguity consumes its suffix without retry", async
 for (const refetchMode of ["missing", "drift", "duplicate", "error"]) {
   test(`status ${refetchMode} refetch consumes one intent without retry`, async () => {
     await withWorkflowCliFixture({
-      eventName: "pull_request_target",
-      event: { pull_request: { number: 7 } },
-      route: "ordinary",
-      pullRequest: "7",
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
     }, async ({ environment }) => {
       const command = await prepareV2WorkflowCommand(environment);
       const liveTime = new Date().toISOString();
@@ -4317,11 +4328,37 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
       oidc,
       liveTime,
       {
-        candidateNumbers: [7],
+        candidateNumbers: [],
         apiOrigin: "https://api.github.com",
       },
     );
-    const first = await runV2ScheduleDispatchCli(firstEnvironment, {
+    await runV2ScheduleDispatchCli(firstEnvironment, {
+      fetch: github.fetch,
+    });
+    github.setCandidateNumbers([7]);
+    const currentOpenRequestsBefore =
+      github.currentOpenCandidateRequests().length;
+    const inventoryRequestsBefore = github.candidateInventoryRequests().length;
+    const lifecycleRequestsBefore = github.candidateLifecycleRequests().length;
+    const inventoryPhasesBefore = github.candidateInventoryPhases().length;
+    const dispatchPhasesBefore = github.candidateDispatchPhases().length;
+    const ledgerWritesBefore = github.ledgerWriteRequests().length;
+    const firstOutput = join(root, "github-output-first-nonempty");
+    await writeFile(firstOutput, "", { mode: 0o600 });
+    const nonemptyEnvironment = await makeWorkflowLegEnvironment({
+      environment: firstEnvironment,
+      runnerTemp,
+      name: "first-nonempty",
+      runId: "123457",
+      route: "scan-all-open",
+      pullRequest: "",
+      githubOutput: firstOutput,
+    });
+    const nonemptyCommand = await prepareV2WorkflowCommand(
+      nonemptyEnvironment,
+    );
+    oidc.bindCommand(nonemptyCommand);
+    const first = await runV2ScheduleDispatchCli(nonemptyEnvironment, {
       fetch: github.fetch,
     });
     assert.deepEqual(Object.keys(first), ["matrix", "rendered"]);
@@ -4333,21 +4370,52 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
     ]);
     assert.equal(row.enabled, true);
     assert.equal(row.pull_request, 7);
-    assert.deepEqual(JSON.parse(row.dispatch_binding).candidate.number, 7);
+    const rowBinding = JSON.parse(row.dispatch_binding);
+    assert.equal(rowBinding.candidate.number, 7);
+    assert.deepEqual(Object.keys(rowBinding).sort(), [
+      "batch_count",
+      "batch_index",
+      "candidate",
+      "cycle_id",
+      "dispatch_digest",
+      "generation_id",
+      "inventory_digest",
+    ]);
     assert.equal(
       first.rendered,
       `${canonicalJson(first.matrix)}\n`,
     );
     assert.equal(
-      await readFile(githubOutput, "utf8"),
+      await readFile(firstOutput, "utf8"),
       `matrix=${canonicalJson(first.matrix)}\n`,
     );
-    assert.deepEqual(github.candidateInventoryPhases(), [
-      "cycle-start", "shard", "cycle-complete",
+    assert.deepEqual(github.candidateInventoryPhases().slice(
+      inventoryPhasesBefore,
+    ), [
+      "cycle-start", "attempt", "cycle-complete",
     ]);
-    assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-    assert.equal(github.candidateInventoryRequests().length, 4);
-    assert.equal(github.candidateLifecycleRequests().length, 2);
+    assert.deepEqual(github.candidateDispatchPhases().slice(
+      dispatchPhasesBefore,
+    ), ["reserve"]);
+    assert.equal(
+      github.ledgerWriteRequests().slice(ledgerWritesBefore)
+        .filter((request) => request.startsWith("PATCH /git/refs/"))
+        .length,
+      1,
+      "atomic publication must update the protected ref exactly once",
+    );
+    assert.equal(
+      github.currentOpenCandidateRequests().length - currentOpenRequestsBefore,
+      4,
+    );
+    assert.equal(
+      github.candidateInventoryRequests().length - inventoryRequestsBefore,
+      4,
+    );
+    assert.equal(
+      github.candidateLifecycleRequests().length - lifecycleRequestsBefore,
+      2,
+    );
     assert.equal(
       github.candidateInventoryRequests().every((path) =>
         path.includes("state=all") && !path.includes("state=open")),
@@ -4358,28 +4426,42 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
     const restartOutput = join(root, "github-output-restart");
     await writeFile(restartOutput, "", { mode: 0o600 });
     const restartEnvironment = await makeWorkflowLegEnvironment({
-      environment: firstEnvironment,
+      environment: nonemptyEnvironment,
       runnerTemp,
       name: "restart",
-      runId: "123457",
+      runId: "123458",
       route: "scan-all-open",
       pullRequest: "",
       githubOutput: restartOutput,
     });
     const restartCommand = await prepareV2WorkflowCommand(restartEnvironment);
     oidc.bindCommand(restartCommand);
-    const inventoryRequestsBefore = github.candidateInventoryRequests().length;
+    const restartInventoryRequestsBefore =
+      github.candidateInventoryRequests().length;
+    const restartCurrentOpenRequestsBefore =
+      github.currentOpenCandidateRequests().length;
     const recordsBefore = github.ledgerRecordCount();
+    const restartLedgerWritesBefore = github.ledgerWriteRequests().length;
     const restarted = await runV2ScheduleDispatchCli(restartEnvironment, {
       fetch: github.fetch,
     });
     assert.deepEqual(restarted.matrix, first.matrix);
     assert.equal(
       github.candidateInventoryRequests().length,
-      inventoryRequestsBefore,
+      restartInventoryRequestsBefore,
       "active reservation restart must not rescan candidates",
     );
+    assert.equal(
+      github.currentOpenCandidateRequests().length,
+      restartCurrentOpenRequestsBefore,
+      "active reservation restart must not resample current-open candidates",
+    );
     assert.equal(github.ledgerRecordCount(), recordsBefore);
+    assert.equal(
+      github.ledgerWriteRequests().length,
+      restartLedgerWritesBefore,
+      "reservation restart must perform no Git write",
+    );
     assert.equal(
       await readFile(restartOutput, "utf8"),
       `matrix=${canonicalJson(first.matrix)}\n`,
@@ -4387,6 +4469,452 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
     assertNoDispatchAuthorityInternals(restarted);
   });
 });
+
+test("schedule-dispatch reconciles one durable atomic publication response loss",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ environment, runnerTemp }) => {
+      const scanCommand = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(scanCommand, liveTime);
+      const sharedEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
+      const github = productionControllerGitHubFixture(
+        scanCommand,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: [],
+          apiOrigin: "https://api.github.com",
+        },
+      );
+      await runV2ScheduleDispatchCli(sharedEnvironment, {
+        fetch: github.fetch,
+      });
+      github.setCandidateNumbers([7]);
+      const currentOpenRequestsBeforePublication =
+        github.currentOpenCandidateRequests().length;
+      const candidateInventoryRequestsBeforePublication =
+        github.candidateInventoryRequests().length;
+      const inventoryPhasesBefore = github.candidateInventoryPhases().length;
+      const dispatchPhasesBefore = github.candidateDispatchPhases().length;
+      const ledgerWritesBeforePublication =
+        github.ledgerWriteRequests().length;
+      github.failNextDurableRecordUpdates(
+        "candidate-dispatch-observation:",
+      );
+      const publicationEnvironment = await makeWorkflowLegEnvironment({
+        environment: sharedEnvironment,
+        runnerTemp,
+        name: "atomic-publication-response-loss",
+        runId: "123457",
+        route: "scan-all-open",
+        pullRequest: "",
+      });
+      const publicationCommand = await prepareV2WorkflowCommand(
+        publicationEnvironment,
+      );
+      oidc.bindCommand(publicationCommand);
+      const first = await runV2ScheduleDispatchCli(publicationEnvironment, {
+        fetch: github.fetch,
+      });
+
+      assert.equal(first.matrix.include.length, 1);
+      assert.equal(first.matrix.include[0].pull_request, 7);
+      assert.equal(
+        github.currentOpenCandidateRequests().length -
+          currentOpenRequestsBeforePublication,
+        4,
+      );
+      assert.equal(
+        github.candidateInventoryRequests().length -
+          candidateInventoryRequestsBeforePublication,
+        4,
+      );
+      assert.deepEqual(github.candidateInventoryPhases().slice(
+        inventoryPhasesBefore,
+      ), [
+        "cycle-start", "attempt", "cycle-complete",
+      ]);
+      assert.deepEqual(github.candidateDispatchPhases().slice(
+        dispatchPhasesBefore,
+      ), ["reserve"]);
+      assert.equal(
+        github.ledgerWriteRequests().slice(ledgerWritesBeforePublication)
+          .filter((request) => request.startsWith("PATCH /git/refs/"))
+          .length,
+        1,
+        "response-lost atomic publication must issue one ref update",
+      );
+      const currentOpenRequestsBefore =
+        github.currentOpenCandidateRequests().length;
+      const candidateInventoryRequestsBefore =
+        github.candidateInventoryRequests().length;
+      const externalWritesBefore = github.externalWriteRequests().length;
+      const recordsBefore = github.ledgerRecordCount();
+      const restartLedgerWritesBefore = github.ledgerWriteRequests().length;
+      const restartEnvironment = await makeWorkflowLegEnvironment({
+        environment: publicationEnvironment,
+        runnerTemp,
+        name: "atomic-publication-response-loss-restart",
+        runId: "123458",
+        route: "scan-all-open",
+        pullRequest: "",
+      });
+      const restartCommand = await prepareV2WorkflowCommand(
+        restartEnvironment,
+      );
+      oidc.bindCommand(restartCommand);
+      const restarted = await runV2ScheduleDispatchCli(restartEnvironment, {
+        fetch: github.fetch,
+      });
+
+      assert.deepEqual(restarted.matrix, first.matrix);
+      assert.equal(github.ledgerRecordCount(), recordsBefore);
+      assert.equal(
+        github.ledgerWriteRequests().length,
+        restartLedgerWritesBefore,
+      );
+      assert.equal(
+        github.currentOpenCandidateRequests().length -
+          currentOpenRequestsBefore,
+        0,
+      );
+      assert.equal(
+        github.candidateInventoryRequests().length -
+          candidateInventoryRequestsBefore,
+        0,
+      );
+      assert.equal(
+        github.externalWriteRequests().length - externalWritesBefore,
+        0,
+      );
+      assertNoDispatchAuthorityInternals(restarted);
+    });
+  });
+
+test("schedule-dispatch expands every compact batch item into a workflow binding",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ environment, runnerTemp }) => {
+      const scanCommand = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(scanCommand, liveTime);
+      const sharedEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
+      const candidateNumbers = Array.from({ length: 64 }, (_, index) =>
+        index + 1);
+      const github = productionControllerGitHubFixture(
+        scanCommand,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers,
+          apiOrigin: "https://api.github.com",
+        },
+      );
+      const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
+        fetch: github.fetch,
+      });
+
+      assert.equal(dispatch.matrix.include.length, candidateNumbers.length);
+      const matrixBindings = [];
+      for (const [index, row] of dispatch.matrix.include.entries()) {
+        assert.equal(row.enabled, true);
+        assert.equal(row.pull_request, candidateNumbers[index]);
+        const legEnvironment = await makeWorkflowLegEnvironment({
+          environment: sharedEnvironment,
+          runnerTemp,
+          name: `compact-binding-${index}`,
+          runId: String(123_457 + index),
+          route: "ordinary",
+          pullRequest: String(candidateNumbers[index]),
+          dispatchBinding: row.dispatch_binding,
+        });
+        const legCommand = await prepareV2WorkflowCommand(legEnvironment);
+        matrixBindings.push(legCommand.dispatch_binding);
+        assert.deepEqual(
+          legCommand.dispatch_binding,
+          JSON.parse(row.dispatch_binding),
+        );
+        assert.deepEqual(Object.keys(legCommand.dispatch_binding).sort(), [
+          "batch_count",
+          "batch_index",
+          "candidate",
+          "cycle_id",
+          "dispatch_digest",
+          "generation_id",
+          "inventory_digest",
+        ]);
+      }
+      const firstBinding = matrixBindings[0];
+      const planWithoutDigest = {
+        schema: V2_GIT_LEDGER_CANDIDATE_DISPATCH_PLAN_SCHEMA,
+        schema_version: 2,
+        repository: {
+          owner: "owner",
+          name: "repo",
+          id: "42",
+          node_id: "R_repo",
+          owner_id: "88",
+        },
+        generation_id: firstBinding.generation_id,
+        cycle_id: firstBinding.cycle_id,
+        inventory_digest: firstBinding.inventory_digest,
+        batch_index: firstBinding.batch_index,
+        batch_count: firstBinding.batch_count,
+        dispatch_digest: firstBinding.dispatch_digest,
+        items: matrixBindings.map((binding, candidateIndex) => ({
+          candidate_index: candidateIndex,
+          candidate: binding.candidate,
+        })),
+        remaining_count: matrixBindings.length,
+        dispatch_commit_budget_required: 67,
+        candidate_execution_commit_budget_required: 960,
+        total_commit_budget_required: 1_027,
+        remaining_ledger_commit_capacity_after_dispatch: 1_000,
+      };
+      const compactPlan = {
+        ...planWithoutDigest,
+        plan_digest: ledgerDigestDomain(
+          "codex-review-gate-v2-candidate-dispatch-plan",
+          planWithoutDigest,
+        ),
+      };
+      for (const [index, binding] of matrixBindings.entries()) {
+        assert.deepEqual(
+          projectV2GitLedgerCandidateDispatchBinding(compactPlan, index),
+          binding,
+        );
+      }
+      const publicWrites = github.externalWrites.length;
+      const forgedPlan = {
+        ...compactPlan,
+        plan_digest: `sha256:${"0".repeat(64)}`,
+      };
+      assert.throws(
+        () => projectV2GitLedgerCandidateDispatchBinding(forgedPlan, 0),
+        (error) => error?.code === "CANDIDATE_DISPATCH_PLAN_INVALID",
+      );
+      for (const invalidIndex of [-1, 64, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        assert.throws(
+          () => projectV2GitLedgerCandidateDispatchBinding(
+            compactPlan,
+            invalidIndex,
+          ),
+          (error) =>
+            error?.code === "CANDIDATE_DISPATCH_PLAN_ITEM_INDEX_INVALID",
+        );
+      }
+      assert.equal(github.externalWrites.length, publicWrites);
+      assertNoDispatchAuthorityInternals(dispatch);
+    });
+  });
+
+test("schedule-dispatch hard-fails the 512-candidate capacity boundary without writes",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ environment, runnerTemp }) => {
+      const initialCommand = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(initialCommand, liveTime);
+      const sharedEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
+      const github = productionControllerGitHubFixture(
+        initialCommand,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: [],
+          apiOrigin: "https://api.github.com",
+          serverTimeStepMilliseconds: 250,
+        },
+      );
+      await runV2ScheduleDispatchCli(sharedEnvironment, {
+        fetch: github.fetch,
+      });
+      github.setCandidateNumbers(Array.from(
+        { length: 512 },
+        (_, index) => index + 1,
+      ));
+      const externalWritesBefore = github.externalWriteRequests().length;
+      const ledgerWritesBefore = github.ledgerWriteRequests().length;
+      const recordsBefore = github.ledgerRecordCount();
+      const currentOpenRequestsBefore =
+        github.currentOpenCandidateRequests().length;
+      const candidateInventoryRequestsBefore =
+        github.candidateInventoryRequests().length;
+      const candidateLifecycleRequestsBefore =
+        github.candidateLifecycleRequests().length;
+      const inventoryPhasesBefore = github.candidateInventoryPhases();
+      const dispatchPhasesBefore = github.candidateDispatchPhases();
+      const scheduleEnvironment = await makeWorkflowLegEnvironment({
+        environment: sharedEnvironment,
+        runnerTemp,
+        name: "capacity-schedule",
+        runId: "223457",
+        route: "scan-all-open",
+        pullRequest: "",
+      });
+      const scheduleCommand = await prepareV2WorkflowCommand(
+        scheduleEnvironment,
+      );
+      oidc.bindCommand(scheduleCommand);
+
+      await assert.rejects(
+        runV2ScheduleDispatchCli(scheduleEnvironment, {
+          fetch: github.fetch,
+        }),
+        (error) =>
+          error?.code === "candidate-inventory-cycle-commit-capacity",
+      );
+
+      assert.equal(
+        github.currentOpenCandidateRequests().length -
+          currentOpenRequestsBefore,
+        14,
+      );
+      assert.equal(
+        github.candidateInventoryRequests().length -
+          candidateInventoryRequestsBefore,
+        24,
+      );
+      assert.equal(
+        github.candidateLifecycleRequests().length -
+          candidateLifecycleRequestsBefore,
+        1_024,
+      );
+      assert.equal(github.ledgerRecordCount(), recordsBefore);
+      assert.equal(
+        github.externalWriteRequests().length - externalWritesBefore,
+        0,
+      );
+      assert.equal(
+        github.ledgerWriteRequests().length - ledgerWritesBefore,
+        0,
+      );
+      assert.deepEqual(github.candidateInventoryPhases(), inventoryPhasesBefore);
+      assert.deepEqual(github.candidateDispatchPhases(), dispatchPhasesBefore);
+    });
+  });
+
+test("schedule-dispatch rejects 513 current-open candidates before full refresh",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ environment, runnerTemp }) => {
+      const initialCommand = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(initialCommand, liveTime);
+      const sharedEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
+      const github = productionControllerGitHubFixture(
+        initialCommand,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: [],
+          apiOrigin: "https://api.github.com",
+          serverTimeStepMilliseconds: 250,
+        },
+      );
+      await runV2ScheduleDispatchCli(sharedEnvironment, {
+        fetch: github.fetch,
+      });
+      github.setCandidateNumbers(Array.from(
+        { length: 513 },
+        (_, index) => index + 1,
+      ));
+      const externalWritesBefore = github.externalWriteRequests().length;
+      const ledgerWritesBefore = github.ledgerWriteRequests().length;
+      const recordsBefore = github.ledgerRecordCount();
+      const currentOpenRequestsBefore =
+        github.currentOpenCandidateRequests().length;
+      const candidateInventoryRequestsBefore =
+        github.candidateInventoryRequests().length;
+      const candidateLifecycleRequestsBefore =
+        github.candidateLifecycleRequests().length;
+      const inventoryPhasesBefore = github.candidateInventoryPhases();
+      const dispatchPhasesBefore = github.candidateDispatchPhases();
+      const scheduleEnvironment = await makeWorkflowLegEnvironment({
+        environment: sharedEnvironment,
+        runnerTemp,
+        name: "candidate-cap-schedule",
+        runId: "223458",
+        route: "scan-all-open",
+        pullRequest: "",
+      });
+      const scheduleCommand = await prepareV2WorkflowCommand(
+        scheduleEnvironment,
+      );
+      oidc.bindCommand(scheduleCommand);
+
+      await assert.rejects(
+        runV2ScheduleDispatchCli(scheduleEnvironment, {
+          fetch: github.fetch,
+        }),
+        (error) => error?.code === "CANDIDATE_OPEN_SET_CAP",
+      );
+
+      assert.equal(
+        github.currentOpenCandidateRequests().length -
+          currentOpenRequestsBefore,
+        6,
+      );
+      assert.equal(
+        github.candidateInventoryRequests().length -
+          candidateInventoryRequestsBefore,
+        0,
+      );
+      assert.equal(
+        github.candidateLifecycleRequests().length -
+          candidateLifecycleRequestsBefore,
+        0,
+      );
+      assert.equal(github.ledgerRecordCount(), recordsBefore);
+      assert.equal(
+        github.externalWriteRequests().length - externalWritesBefore,
+        0,
+      );
+      assert.equal(
+        github.ledgerWriteRequests().length - ledgerWritesBefore,
+        0,
+      );
+      assert.deepEqual(github.candidateInventoryPhases(), inventoryPhasesBefore);
+      assert.deepEqual(github.candidateDispatchPhases(), dispatchPhasesBefore);
+    });
+  });
 
 test("schedule-dispatch supersedes an incomplete inventory cycle on restart", async () => {
   await withWorkflowCliFixture({
@@ -4693,7 +5221,7 @@ test("schedule-dispatch publishes the exact one-row disabled sentinel for an emp
     event: {},
     route: "scan-all-open",
     pullRequest: "",
-  }, async ({ root, environment }) => {
+  }, async ({ root, runnerTemp, environment }) => {
     const githubOutput = join(root, "github-output-empty");
     await writeFile(githubOutput, "", { mode: 0o600 });
     const command = await prepareV2WorkflowCommand(environment);
@@ -4715,7 +5243,35 @@ test("schedule-dispatch publishes the exact one-row disabled sentinel for an emp
         apiOrigin: "https://api.github.com",
       },
     );
-    const result = await runV2ScheduleDispatchCli(selectedEnvironment, {
+    await runV2ScheduleDispatchCli(selectedEnvironment, {
+      fetch: github.fetch,
+    });
+    const currentOpenRequestsBefore =
+      github.currentOpenCandidateRequests().length;
+    const candidateInventoryRequestsBefore =
+      github.candidateInventoryRequests().length;
+    const externalWritesBefore = github.externalWriteRequests().length;
+    const ledgerWritesBefore = github.ledgerWriteRequests().length;
+    const inventoryPhasesBefore = github.candidateInventoryPhases();
+    const dispatchPhasesBefore = github.candidateDispatchPhases();
+    assert.deepEqual(inventoryPhasesBefore, [
+      "cycle-start", "attempt", "cycle-complete",
+    ]);
+    assert.deepEqual(dispatchPhasesBefore, ["cycle-complete"]);
+    const restartOutput = join(root, "github-output-empty-restart");
+    await writeFile(restartOutput, "", { mode: 0o600 });
+    const restartEnvironment = await makeWorkflowLegEnvironment({
+      environment: selectedEnvironment,
+      runnerTemp,
+      name: "empty-restart",
+      runId: "123457",
+      route: "scan-all-open",
+      pullRequest: "",
+      githubOutput: restartOutput,
+    });
+    const restartCommand = await prepareV2WorkflowCommand(restartEnvironment);
+    oidc.bindCommand(restartCommand);
+    const result = await runV2ScheduleDispatchCli(restartEnvironment, {
       fetch: github.fetch,
     });
     assert.deepEqual(result.matrix, {
@@ -4727,13 +5283,30 @@ test("schedule-dispatch publishes the exact one-row disabled sentinel for an emp
     });
     const expected = canonicalJson(result.matrix);
     assert.equal(result.rendered, `${expected}\n`);
-    assert.equal(await readFile(githubOutput, "utf8"), `matrix=${expected}\n`);
-    assert.equal((await readFile(githubOutput, "utf8")).split("\n").length, 2);
-    assert.deepEqual(github.candidateInventoryPhases(), [
-      "cycle-start", "cycle-complete",
-    ]);
-    assert.deepEqual(github.candidateDispatchPhases(), ["cycle-complete"]);
-    assert.equal(github.candidateInventoryRequests().length, 4);
+    assert.equal(await readFile(restartOutput, "utf8"), `matrix=${expected}\n`);
+    assert.equal((await readFile(restartOutput, "utf8")).split("\n").length, 2);
+    assert.deepEqual(
+      github.candidateInventoryPhases(),
+      inventoryPhasesBefore,
+    );
+    assert.deepEqual(github.candidateDispatchPhases(), dispatchPhasesBefore);
+    assert.equal(
+      github.currentOpenCandidateRequests().length - currentOpenRequestsBefore,
+      4,
+    );
+    assert.equal(
+      github.candidateInventoryRequests().length -
+        candidateInventoryRequestsBefore,
+      0,
+    );
+    assert.equal(
+      github.externalWriteRequests().length - externalWritesBefore,
+      0,
+    );
+    assert.equal(
+      github.ledgerWriteRequests().length - ledgerWritesBefore,
+      0,
+    );
     assertNoDispatchAuthorityInternals(result);
   });
 });
@@ -5401,6 +5974,331 @@ test("workflow output writer publishes exactly ten outputs and canonical artifac
   }
 });
 
+test("real scheduler public waits reach all three closed workflow outputs",
+  async () => {
+    const start = "2026-08-13T08:00:00.000Z";
+    const epochId = "owner/repo:7:base:head:merge";
+    const at = (milliseconds) =>
+      new Date(Date.parse(start) + milliseconds).toISOString();
+    const automaticRequest = (overrides = {}) => ({
+      state: "available",
+      generation_index: 1,
+      recovery_authority: null,
+      intent_id: null,
+      intent_persisted_at: null,
+      effect_attempted_at: null,
+      ...overrides,
+    });
+    const controlledRequest = (boundAt) => ({
+      request_id: "1001",
+      bound_at: boundAt,
+      binding_record_oid: "b".repeat(40),
+      binding_receipt_digest: `sha256:${"a".repeat(64)}`,
+    });
+    const snapshot = (overrides = {}) => ({
+      epoch_id: epochId,
+      decision: "pending",
+      complete: true,
+      snapshot_id: "snapshot-1",
+      snapshot_fingerprint: "snapshot-fingerprint-1",
+      observed_at: start,
+      provider_activity_fingerprint: "provider-activity-1",
+      no_start_candidate: null,
+      run_id: "1001",
+      run_attempt: 1,
+      ...overrides,
+    });
+    const schedulerInput = (overrides = {}) => {
+      const base = {
+        schema: V2_SCHEDULER_SCHEMA,
+        schema_version: V2_SCHEDULER_SCHEMA_VERSION,
+        trigger: "initial",
+        now: start,
+        public_wait_supported: true,
+        status_target_mode: "test-merge-with-head-sentinel",
+        epoch: {
+          id: epochId,
+          started_at: start,
+          controlled_request: null,
+          automatic_request: automaticRequest(),
+        },
+        evaluation: snapshot(),
+        complete_snapshots: [],
+        status: {
+          exact_sha_context_count: 0,
+          latest_idempotency_key: null,
+        },
+        applied_action_keys: [],
+      };
+      return {
+        ...base,
+        ...overrides,
+        epoch: { ...base.epoch, ...(overrides.epoch ?? {}) },
+        status: { ...base.status, ...(overrides.status ?? {}) },
+      };
+    };
+    const requestAt = at(PUBLIC_INITIAL_WAIT_MS);
+    const attemptedRequestEpoch = {
+      controlled_request: controlledRequest(requestAt),
+      automatic_request: automaticRequest({
+        state: "effect-attempted",
+        intent_id: "automatic-request:intent-1",
+        intent_persisted_at: requestAt,
+        effect_attempted_at: requestAt,
+      }),
+    };
+    const postRequestSnapshot = snapshot({
+      snapshot_id: "snapshot-post-request",
+      snapshot_fingerprint: "snapshot-post-request-fingerprint",
+      observed_at: requestAt,
+    });
+    const noStartObservedAt = at(
+      PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS,
+    );
+    const noStartSnapshot = snapshot({
+      decision: "skipped-unavailable",
+      snapshot_id: "snapshot-no-start",
+      snapshot_fingerprint: "snapshot-no-start-fingerprint",
+      observed_at: noStartObservedAt,
+      provider_activity_fingerprint: "no-provider-activity",
+      no_start_candidate: {
+        artifact_id: "issue-comment-2002",
+        artifact_digest: PUBLIC_DIGEST,
+        scope_fingerprint: "scope-fingerprint-1",
+        lifecycle_fingerprint: "open-unmerged-base-head-merge",
+        first_seen_at: at(PUBLIC_INITIAL_WAIT_MS + 1),
+      },
+    });
+    const phases = [
+      {
+        name: "initial",
+        hint: "public-initial-wait",
+        completionReason: "public-initial-wait-complete",
+        waiting: schedulerInput(),
+        complete: schedulerInput({ now: at(PUBLIC_INITIAL_WAIT_MS) }),
+      },
+      {
+        name: "post-request",
+        hint: "public-post-request-wait",
+        completionReason: "public-post-request-wait-complete",
+        waiting: schedulerInput({
+          now: requestAt,
+          evaluation: postRequestSnapshot,
+        }),
+        complete: schedulerInput({
+          now: at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
+          epoch: attemptedRequestEpoch,
+          evaluation: postRequestSnapshot,
+        }),
+      },
+      {
+        name: "no-start",
+        hint: "public-no-start-wait",
+        completionReason: "public-no-start-confirmation",
+        waiting: schedulerInput({
+          now: noStartObservedAt,
+          epoch: attemptedRequestEpoch,
+          evaluation: noStartSnapshot,
+        }),
+        complete: schedulerInput({
+          now: at(
+            PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS +
+              PUBLIC_NO_START_CONFIRMATION_MS,
+          ),
+          epoch: attemptedRequestEpoch,
+          evaluation: noStartSnapshot,
+        }),
+      },
+    ];
+    const productionCycle = (
+      scheduling,
+      schedulerPlan,
+      evaluation = scheduling.evaluation,
+    ) => createV2ProductionInitialCycle({
+      internal_result: {
+        decision: evaluation.decision,
+        report: publicReport({ decision: evaluation.decision }),
+        scheduler_plan: schedulerPlan,
+        scheduler_evaluation: evaluation,
+        status_plan: { writes: [] },
+      },
+      scheduler_append: {
+        append_receipt: {
+          commit_sha: "1".repeat(40),
+          receipt_digest: PUBLIC_DIGEST,
+        },
+      },
+      status_intent_appends: [],
+      status_response_appends: [],
+      status_receipts: [],
+      status_outcome: "not-required",
+      ambiguity_code: null,
+      automatic_reservation_append: null,
+      reservation_status_intent_append: null,
+      reservation_status_response_append: null,
+      reservation_status_receipt: null,
+      reservation_status_outcome: "not-required",
+      reservation_status_ambiguity_code: null,
+      automatic_request_intent_append: null,
+      automatic_request_binding_append: null,
+      automatic_request_binding_receipt: null,
+      automatic_request_outcome: "not-required",
+      automatic_request_ambiguity_code: null,
+      automatic_request_intent_source: "none",
+      public_effects_performed: 0,
+      lease_release_receipt: {
+        commit_sha: "2".repeat(40),
+        receipt_digest: PUBLIC_DIGEST,
+      },
+      runner_authority: {
+        scheduling,
+        authority_digest: PUBLIC_DIGEST,
+      },
+      initial_runner_state_authority: {
+        authority_digest: PUBLIC_DIGEST,
+      },
+      established_runner_state_authority: null,
+      control_plane_receipt: { receipt_digest: PUBLIC_DIGEST },
+      continuity_authority: {
+        continuity_receipt: {
+          continuity_receipt_digest: PUBLIC_DIGEST,
+        },
+      },
+      handoff: {
+        preflight_receipt_digest: PUBLIC_DIGEST,
+        handoff_digest: PUBLIC_DIGEST,
+      },
+    });
+    const actual = [];
+    for (const phase of phases) {
+      for (const state of ["waiting", "complete"]) {
+        const scheduling = phase[state];
+        const schedulerPlan = planV2Actions(scheduling);
+        const evaluateActions = schedulerPlan.actions.filter((action) =>
+          action.kind === "evaluate_snapshot");
+        if (state === "waiting") {
+          assert.notEqual(schedulerPlan.due_at, null);
+          assert.deepEqual(evaluateActions, []);
+        } else {
+          assert.equal(schedulerPlan.due_at, null);
+          assert.equal(evaluateActions.length, 1);
+          assert.equal(evaluateActions[0].reason, phase.completionReason);
+        }
+        const cycle = productionCycle(scheduling, schedulerPlan);
+        const root = await mkdtemp(
+          join(tmpdir(), `codex-review-gate-v2-${phase.name}-${state}-`),
+        );
+        try {
+          const summary = await writeV2WorkflowOutputs({
+            result: cycle,
+            environment: {
+              RUNNER_TEMP: root,
+              V2_CONTROLLER_OUTPUT_PATH: join(root, "summary.json"),
+            },
+          });
+          actual.push([
+            phase.name,
+            state,
+            summary.outputs["due-at"],
+            summary.outputs["wakeup-hints"],
+          ]);
+          assert.equal(Object.keys(summary.outputs).length, 10);
+          assert.doesNotMatch(
+            JSON.stringify(summary),
+            /scheduler_plan|scheduler_evaluation|evaluate_snapshot|epoch/u,
+          );
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    }
+    assert.deepEqual(actual, phases.flatMap((phase) => [
+      [phase.name, "waiting", planV2Actions(phase.waiting).due_at, phase.hint],
+      [phase.name, "complete", "", ""],
+    ]));
+    assert.deepEqual(
+      planV2Actions(phases[1].waiting).actions.map((action) => action.kind),
+      [
+        "publish_status",
+        "persist_auto_request_intent",
+        "post_review_request",
+      ],
+    );
+    const postRequestVariants = [
+      schedulerInput({
+        now: requestAt,
+        evaluation: postRequestSnapshot,
+        epoch: {
+          automatic_request: automaticRequest({
+            state: "intent-persisted",
+            intent_id: "automatic-request:intent-1",
+            intent_persisted_at: requestAt,
+          }),
+        },
+      }),
+      schedulerInput({
+        now: at(PUBLIC_INITIAL_WAIT_MS + 5 * 60 * 1000),
+        evaluation: postRequestSnapshot,
+        epoch: {
+          controlled_request: controlledRequest(requestAt),
+        },
+      }),
+      schedulerInput({
+        now: at(PUBLIC_INITIAL_WAIT_MS + 5 * 60 * 1000),
+        evaluation: postRequestSnapshot,
+        epoch: {
+          automatic_request: automaticRequest({
+            state: "effect-attempted",
+            intent_id: "automatic-request:intent-1",
+            intent_persisted_at: requestAt,
+            effect_attempted_at: requestAt,
+          }),
+        },
+      }),
+    ];
+    for (const scheduling of postRequestVariants) {
+      const schedulerPlan = planV2Actions(scheduling);
+      assert.notEqual(schedulerPlan.due_at, null);
+      assert.equal(
+        productionCycle(scheduling, schedulerPlan).terminal_result.wakeup_hints,
+        "public-post-request-wait",
+      );
+    }
+    const privateScheduling = schedulerInput({
+      public_wait_supported: false,
+    });
+    const privatePlan = planV2Actions(privateScheduling);
+    assert.notEqual(privatePlan.due_at, null);
+    assert.equal(
+      productionCycle(privateScheduling, privatePlan)
+        .terminal_result.wakeup_hints,
+      "private-reconcile",
+    );
+    const postRequestWaiting = phases[1].waiting;
+    assert.throws(
+      () => productionCycle(
+        postRequestWaiting,
+        planV2Actions(postRequestWaiting),
+        { ...postRequestWaiting.evaluation, decision: "clean" },
+      ),
+      (error) => error?.code === "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
+    );
+    const forgedAutomaticState = schedulerInput({
+      now: requestAt,
+      evaluation: postRequestSnapshot,
+      epoch: {
+        automatic_request: automaticRequest({ state: "forged" }),
+      },
+    });
+    assert.throws(
+      () => productionCycle(
+        forgedAutomaticState,
+        planV2Actions(postRequestWaiting),
+      ),
+      (error) => error?.code === "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
+    );
+  });
+
 function productionPreflightBoundaryFixture(command) {
   const repository = {
     owner: "owner",
@@ -5738,6 +6636,7 @@ function productionControllerGitHubFixture(
     candidateNumbers = null,
     candidateInventorySnapshots = null,
     candidateLifecycleStates = null,
+    currentOpenCandidateSnapshots = null,
     apiOrigin = "https://api.github.test",
     snapshotIssueComments = [],
     serverTimeStepMilliseconds = 1_000,
@@ -5754,6 +6653,7 @@ function productionControllerGitHubFixture(
   const blobs = new Map();
   const trees = new Map();
   const commits = new Map();
+  const ledgerWriteRequests = [];
   const externalWrites = [];
   const statuses = new Map();
   const requests = new Map();
@@ -5783,11 +6683,15 @@ function productionControllerGitHubFixture(
   let artifactBindingEqualDateAlways = false;
   const candidateInventoryRequests = [];
   const candidateLifecycleRequests = [];
-  const candidateInventoryUniverse = candidateInventorySnapshots === null
-    ? candidateNumbers
+  const currentOpenCandidateRequests = [];
+  let configuredCandidateNumbers = candidateNumbers;
+  let candidateInventoryUniverse = candidateInventorySnapshots === null
+    ? configuredCandidateNumbers
     : [...new Set(candidateInventorySnapshots.flat())];
   let candidateInventorySnapshotReadCount = 0;
   let candidateLifecycleReadCount = 0;
+  let currentOpenPass = 0;
+  let currentOpenActive = null;
   let maxServerTimestamp = Date.parse(baseTime);
 
   const fetch = async (input, init = {}) => {
@@ -5817,6 +6721,92 @@ function productionControllerGitHubFixture(
     if (ledgerPath !== null && isLedgerGitPath(ledgerPath)) {
       return ledgerFetch(ledgerPath, method, init);
     }
+    if (method === "POST" && path === "/graphql") {
+      const request = JSON.parse(String(init.body));
+      if (String(request.query).includes(
+        "CodexReviewGateCurrentOpenPullRequests",
+      )) {
+        const after = request.variables?.after ?? null;
+        let kind;
+        let start;
+        if (after === null && currentOpenActive?.awaiting_fence === true) {
+          kind = "fence";
+          start = 0;
+        } else if (after === null && currentOpenActive === null) {
+          currentOpenPass += 1;
+          const snapshots = currentOpenCandidateSnapshots ?? [
+            configuredCandidateNumbers ?? [],
+          ];
+          currentOpenActive = {
+            candidates: snapshots[Math.min(
+              currentOpenPass - 1,
+              snapshots.length - 1,
+            )],
+            expected_cursor: null,
+            next_offset: 0,
+            awaiting_fence: false,
+          };
+          kind = "page";
+          start = 0;
+        } else if (
+          typeof after === "string" && currentOpenActive !== null &&
+          currentOpenActive.awaiting_fence === false &&
+          after === currentOpenActive.expected_cursor
+        ) {
+          kind = "page";
+          start = currentOpenActive.next_offset;
+        } else {
+          throw new Error("unexpected current-open GraphQL cursor");
+        }
+        const end = Math.min(
+          start + 100,
+          currentOpenActive.candidates.length,
+        );
+        const selected = currentOpenActive.candidates.slice(start, end);
+        const pageInfo = {
+          hasNextPage: end < currentOpenActive.candidates.length,
+          endCursor: selected.length === 0
+            ? null
+            : `current-open:${currentOpenPass}:${end}`,
+        };
+        currentOpenCandidateRequests.push({
+          after,
+          kind,
+          pass: currentOpenPass,
+        });
+        if (kind === "fence") {
+          currentOpenActive = null;
+        } else if (pageInfo.hasNextPage) {
+          currentOpenActive.expected_cursor = pageInfo.endCursor;
+          currentOpenActive.next_offset = end;
+        } else {
+          currentOpenActive.awaiting_fence = true;
+        }
+        const raw = JSON.stringify({
+          data: {
+            repository: {
+              id: "R_repo",
+              databaseId: 42,
+              nameWithOwner: "owner/repo",
+              pullRequests: {
+                nodes: selected.map(candidateCurrentOpenGraphqlPull),
+                pageInfo,
+              },
+            },
+          },
+        });
+        const response = new Response(raw, {
+          status: 200,
+          headers: {
+            "content-length": String(Buffer.byteLength(raw)),
+            "content-type": "application/json",
+            "x-github-request-id":
+              `CURRENT-OPEN:${currentOpenCandidateRequests.length}`,
+          },
+        });
+        return redated(response);
+      }
+    }
     if (
       candidateInventoryUniverse !== null && method === "GET" &&
       path === "/repos/owner/repo/pulls" &&
@@ -5824,17 +6814,26 @@ function productionControllerGitHubFixture(
     ) {
       candidateInventoryRequests.push(`${path}${url.search}`);
       const page = Number(url.searchParams.get("page"));
-      const selected = page === 1
-        ? candidateInventorySnapshots === null
-          ? candidateNumbers
-          : candidateInventorySnapshots[Math.min(
-              candidateInventorySnapshotReadCount++,
-              candidateInventorySnapshots.length - 1,
-            )]
-        : [];
-      return redated(jsonResponse(JSON.stringify(
-        selected.map(candidateInventoryListPull),
-      )));
+      if (page === 1) candidateInventorySnapshotReadCount += 1;
+      const inventory = candidateInventorySnapshots === null
+        ? configuredCandidateNumbers
+        : candidateInventorySnapshots[Math.min(
+            candidateInventorySnapshotReadCount - 1,
+            candidateInventorySnapshots.length - 1,
+          )];
+      const start = (page - 1) * 100;
+      const selected = inventory.slice(start, start + 100);
+      const raw = JSON.stringify(selected.map(candidateInventoryListPull));
+      const headers = {
+        "content-length": String(Buffer.byteLength(raw)),
+        "content-type": "application/json",
+      };
+      if (selected.length === 100) {
+        const next = new URL(url.href);
+        next.searchParams.set("page", String(page + 1));
+        headers.link = `<${next.href}>; rel="next"`;
+      }
+      return redated(new Response(raw, { status: 200, headers }));
     }
     const candidatePullMatch = candidateInventoryUniverse === null
       ? null
@@ -6055,6 +7054,8 @@ function productionControllerGitHubFixture(
   return {
     fetch,
     externalWrites,
+    externalWriteRequests: () => structuredClone(externalWrites),
+    ledgerWriteRequests: () => structuredClone(ledgerWriteRequests),
     activeLease: () => activeLease,
     failNextRelease(mode = "next") {
       failRelease = true;
@@ -6081,6 +7082,21 @@ function productionControllerGitHubFixture(
       structuredClone(candidateInventoryRequests),
     candidateLifecycleRequests: () =>
       structuredClone(candidateLifecycleRequests),
+    currentOpenCandidateRequests: () =>
+      structuredClone(currentOpenCandidateRequests),
+    setCandidateNumbers(numbers) {
+      if (
+        candidateInventorySnapshots !== null ||
+        currentOpenCandidateSnapshots !== null ||
+        !Array.isArray(numbers)
+      ) {
+        throw new TypeError(
+          "mutable candidate numbers require the default inventory fixtures",
+        );
+      }
+      configuredCandidateNumbers = structuredClone(numbers);
+      candidateInventoryUniverse = configuredCandidateNumbers;
+    },
     ledgerRecordCount: () => reachableRecords().length,
     candidateInventoryPhases: () => reachableRecords()
       .filter((record) =>
@@ -6162,7 +7178,13 @@ function productionControllerGitHubFixture(
     effectRecordKinds,
     schedulerObservationActions() {
       return [...blobs.values()]
-        .map(({ content }) => JSON.parse(content))
+        .flatMap(({ content }) => {
+          try {
+            return [JSON.parse(content)];
+          } catch {
+            return [];
+          }
+        })
         .filter((record) =>
           record.record_type === "effect-intent" &&
           record.kind === "scheduler-observation")
@@ -6184,6 +7206,9 @@ function productionControllerGitHubFixture(
 
   async function ledgerFetch(path, method, init) {
     const date = currentDate();
+    if (new Set(["POST", "PATCH", "DELETE"]).has(method)) {
+      ledgerWriteRequests.push(`${method} ${path}`);
+    }
     if (method === "GET" && path === "/branches/codex-review-gate-ledger-v2") {
       if (refTarget === null) return ledgerResponse(404, { message: "Not Found" }, date);
       return ledgerResponse(200, {
@@ -6204,13 +7229,20 @@ function productionControllerGitHubFixture(
     }
     if (method === "POST" && path === "/git/blobs") {
       const body = JSON.parse(init.body);
-      const sha = gitObjectSha("blob", Buffer.from(body.content, "utf8"));
-      blobs.set(sha, { sha, content: body.content });
+      const bytes = body.encoding === "base64"
+        ? Buffer.from(body.content, "base64")
+        : Buffer.from(body.content, "utf8");
+      const sha = gitObjectSha("blob", bytes);
+      blobs.set(sha, {
+        sha,
+        bytes,
+        content: bytes.toString("utf8"),
+      });
       return ledgerResponse(201, { sha, url: `${apiOrigin}/blob/${sha}` }, date);
     }
     if (method === "POST" && path === "/git/trees") {
       const body = JSON.parse(init.body);
-      const sha = canonicalTreeSha(body.tree[0].sha);
+      const sha = canonicalTreeSha(body.tree);
       trees.set(sha, { sha, tree: structuredClone(body.tree) });
       return ledgerResponse(201, { sha, tree: body.tree }, date);
     }
@@ -6246,8 +7278,7 @@ function productionControllerGitHubFixture(
     if (method === "PATCH" &&
         path === "/git/refs/heads/codex-review-gate-ledger-v2") {
       const body = JSON.parse(init.body);
-      const candidate = commits.get(body.sha);
-      if (candidate?.parents?.[0]?.sha !== refTarget) {
+      if (!isFastForwardCommit(body.sha, refTarget)) {
         return ledgerResponse(422, {
           message: "Update is not a fast forward",
           documentation_url:
@@ -6339,7 +7370,7 @@ function productionControllerGitHubFixture(
       return ledgerResponse(200, {
         sha: blob.sha,
         encoding: "base64",
-        content: Buffer.from(blob.content, "utf8").toString("base64"),
+        content: Buffer.from(blob.bytes).toString("base64"),
       }, date);
     }
     if (new Set(["POST", "PATCH", "DELETE"]).has(method)) {
@@ -6374,6 +7405,15 @@ function productionControllerGitHubFixture(
     ).toUTCString();
     maxServerTimestamp = Math.max(maxServerTimestamp, Date.parse(rendered));
     return rendered;
+  }
+
+  function isFastForwardCommit(candidateSha, currentSha) {
+    let cursor = candidateSha;
+    while (cursor !== null) {
+      if (cursor === currentSha) return true;
+      cursor = commits.get(cursor)?.parents?.[0]?.sha ?? null;
+    }
+    return false;
   }
 
   function refBody(sha) {
@@ -6509,6 +7549,29 @@ function productionControllerGitHubFixture(
       },
     };
   }
+
+  function candidateCurrentOpenGraphqlPull(number) {
+    const repository = {
+      id: "R_repo",
+      databaseId: 42,
+      nameWithOwner: "owner/repo",
+    };
+    return {
+      id: `PR_${number}`,
+      fullDatabaseId: String(1000 + number),
+      number,
+      state: "OPEN",
+      isDraft: false,
+      createdAt: candidateInventoryListPull(number).created_at,
+      updatedAt: TIME,
+      headRefOid: number.toString(16).padStart(40, "0"),
+      headRefName: `feature-${number}`,
+      baseRefOid: BASE,
+      baseRefName: "main",
+      headRepository: repository,
+      baseRepository: repository,
+    };
+  }
 }
 
 function productionOidcFixture(command, liveTime) {
@@ -6558,11 +7621,17 @@ function gitObjectSha(type, bytes) {
     .digest("hex");
 }
 
-function canonicalTreeSha(blobSha) {
-  return gitObjectSha("tree", Buffer.concat([
-    Buffer.from(`100644 ${V2_GIT_LEDGER_BLOB_PATH}\0`, "utf8"),
-    Buffer.from(blobSha, "hex"),
-  ]));
+function canonicalTreeSha(entries) {
+  const ordered = structuredClone(entries).sort((left, right) =>
+    Buffer.compare(
+      Buffer.from(`${left.path}${left.type === "tree" ? "/" : ""}`, "utf8"),
+      Buffer.from(`${right.path}${right.type === "tree" ? "/" : ""}`, "utf8"),
+    ));
+  return gitObjectSha("tree", Buffer.concat(ordered.map((entry) =>
+    Buffer.concat([
+      Buffer.from(`${entry.mode} ${entry.path}\0`, "utf8"),
+      Buffer.from(entry.sha, "hex"),
+    ]))));
 }
 
 function oidcFixture({

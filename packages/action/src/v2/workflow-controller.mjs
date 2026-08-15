@@ -20,6 +20,7 @@ import { TextDecoder } from "node:util";
 import { V2_STATUS_CONTEXT } from "./projection.mjs";
 import { assertV2PublicReport } from "./public-report.mjs";
 import { reduceV2Snapshot } from "./reducer.mjs";
+import { PUBLIC_INITIAL_WAIT_MS } from "./scheduler.mjs";
 import {
   MAX_V2_WORKFLOW_COMMAND_BYTES,
   MAX_V2_WORKFLOW_EVENT_BYTES,
@@ -54,11 +55,15 @@ import {
   createV2GitHubGitLedger,
   createV2GitHubGitLedgerBootstrap,
   createV2GitLedgerDiscoveryContinuityReceipt,
+  projectV2GitLedgerCandidateDispatchBinding,
   projectV2GitLedgerCandidateDispatchPlan,
   projectV2GitLedgerAutomaticReviewRequestTransport,
   projectV2GitLedgerReservationStatusTransport,
   projectV2GitLedgerStatusWriteTransport,
-  V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA,
+  V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_REQUEST_SCHEMA,
+  V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_RESULT_SCHEMA,
+  V2_GIT_LEDGER_CANDIDATE_REFRESH_ADAPTER_SCHEMA,
+  V2_GIT_LEDGER_CANDIDATE_REFRESH_RECONCILIATION_SCHEMA,
   V2_GIT_LEDGER_AUTOMATIC_REVIEW_REQUEST_BINDING_RECEIPT_SCHEMA,
   V2_GIT_LEDGER_AUTOMATIC_REVIEW_REQUEST_SCOPE_RECEIPT_SCHEMA,
   V2_GIT_LEDGER_OIDC_AUDIENCE,
@@ -76,8 +81,13 @@ import {
 } from "./git-ledger.mjs";
 import {
   createV2GitHubCandidateInventory,
-  finalizeV2CandidateInventoryCycle,
+  createV2GitHubCurrentOpenCandidateInventory,
+  MAX_V2_CANDIDATE_PAGES,
+  MAX_V2_CURRENT_OPEN_CANDIDATES,
+  MAX_V2_CURRENT_OPEN_CANDIDATE_PAGES,
   MAX_V2_CANDIDATE_SCAN_PASSES,
+  V2_CANDIDATE_HTTP_TIMEOUT_MS,
+  V2_CURRENT_OPEN_PULL_REQUESTS_QUERY,
 } from "./candidate-inventory.mjs";
 import {
   assertV2ProductionRunnerAuthorityHandle,
@@ -184,6 +194,19 @@ const STATUS_PLAN_DECISIONS = new Set([
 const HEAD_MODE_SUPPRESSED_DECISIONS = new Set([
   "clean",
   "skipped-unavailable",
+]);
+const PUBLIC_WAIT_NO_START_DECISIONS = new Set([
+  "skipped-unavailable",
+  "blocked-configuration",
+]);
+const PUBLIC_WAIT_PENDING_DECISIONS = new Set([
+  "pending",
+  "inconclusive",
+]);
+const PUBLIC_WAIT_AUTOMATIC_REQUEST_STATES = new Set([
+  "available",
+  "intent-persisted",
+  "effect-attempted",
 ]);
 const SHA = /^[0-9a-f]{40}$/u;
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
@@ -3354,7 +3377,7 @@ export async function writeV2WorkflowOutputs({
   outputs["due-at"] = result.terminal_result.due_at ??
     result.terminal_result.scheduler_plan?.due_at ?? "";
   outputs["wakeup-hints"] = result.terminal_result.wakeup_hints ??
-    workflowWakeupHint(result.terminal_result);
+    projectV2WorkflowWakeupHint(result.terminal_result);
   exactKeys(outputs, WORKFLOW_OUTPUT_NAMES, "workflow outputs");
   const summary = {
     schema: V2_WORKFLOW_OUTPUT_SCHEMA,
@@ -3393,15 +3416,55 @@ function assertNoCompactReducerReport(value, label, depth = 0) {
   }
 }
 
-function workflowWakeupHint(result) {
+function projectV2WorkflowWakeupHint(result, scheduling = null) {
   const due = result.scheduler_plan?.due_at;
   if (due === null || due === undefined) return "";
-  const actions = result.scheduler_plan?.actions ?? [];
-  const reason = actions.find((action) => action.kind === "evaluate_snapshot")?.reason ?? "";
-  if (reason === "public-initial-wait-complete") return "public-initial-wait";
-  if (reason === "public-post-request-wait-complete") return "public-post-request-wait";
-  if (reason === "public-no-start-confirmation") return "public-no-start-wait";
-  return "private-reconcile";
+  if (scheduling?.public_wait_supported !== true) return "private-reconcile";
+  const evaluation = result.scheduler_evaluation;
+  assertObject(evaluation, "public wait scheduler evaluation");
+  assertObject(scheduling.epoch, "public wait scheduler epoch");
+  assertObject(
+    scheduling.epoch.automatic_request,
+    "public wait automatic request state",
+  );
+  if (!PUBLIC_WAIT_AUTOMATIC_REQUEST_STATES.has(
+    scheduling.epoch.automatic_request.state,
+  )) {
+    throw controllerFailure(
+      "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
+      "a public scheduler due_at carried an unknown automatic request state",
+    );
+  }
+  if (
+    PUBLIC_WAIT_NO_START_DECISIONS.has(evaluation.decision) &&
+    evaluation.no_start_candidate !== null
+  ) {
+    return "public-no-start-wait";
+  }
+  if (
+    evaluation.decision === "findings" &&
+    scheduling.epoch.automatic_request.generation_index > 1
+  ) {
+    return "public-post-request-wait";
+  }
+  const observedAt = Date.parse(timestamp(
+    evaluation.observed_at,
+    "public wait scheduler evaluation observed_at",
+  ));
+  const epochStartedAt = Date.parse(timestamp(
+    scheduling.epoch.started_at,
+    "public wait scheduler epoch started_at",
+  ));
+  if (observedAt < epochStartedAt + PUBLIC_INITIAL_WAIT_MS) {
+    return "public-initial-wait";
+  }
+  if (PUBLIC_WAIT_PENDING_DECISIONS.has(evaluation.decision)) {
+    return "public-post-request-wait";
+  }
+  throw controllerFailure(
+    "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
+    "a public scheduler due_at did not match a closed wait phase",
+  );
 }
 
 async function writeExclusiveCanonical(path, value) {
@@ -3492,16 +3555,7 @@ export async function runV2ScheduleDispatchCli(
   const rows = await loadV2ScheduleDispatchMatrixRows({
     command,
     environment,
-    fetch: fetchImpl,
-    token: activation.token,
-    rest_base_url: activation.rest_base_url,
     ledger: activation.ledger,
-    candidate_repository: {
-      owner: activation.preflight_handle.repository.owner,
-      name: activation.preflight_handle.repository.name,
-      id: activation.preflight_handle.repository.id,
-      node_id: activation.preflight_handle.repository.node_id,
-    },
     repository_endpoint_receipt:
       activation.preflight_handle.repository_endpoint_receipt,
   });
@@ -3526,16 +3580,13 @@ export async function runV2ScheduleDispatchCli(
 async function loadV2ScheduleDispatchMatrixRows({
   command,
   environment,
-  fetch,
-  token,
-  rest_base_url: restBaseUrl,
   ledger,
-  candidate_repository: candidateRepository,
   repository_endpoint_receipt: repositoryEndpointReceipt,
 }) {
   for (const [name, callback] of [
     ["load", ledger?.load],
-    ["appendCandidateInventory", ledger?.appendCandidateInventory],
+    ["reconcileCandidateInventoryRefreshAtomically",
+      ledger?.reconcileCandidateInventoryRefreshAtomically],
     ["loadOrReserveCandidateDispatch", ledger?.loadOrReserveCandidateDispatch],
   ]) {
     if (typeof callback !== "function") {
@@ -3562,21 +3613,42 @@ async function loadV2ScheduleDispatchMatrixRows({
       completedInventory.complete_record_oid &&
     currentDispatch.inventory_digest ===
       completedInventory.cycle_receipt.receipt_digest;
+  let refreshPersisted = false;
   if (
     completedInventory === null || candidateAuthority.incomplete_cycle !== null ||
     completedInventoryAlreadyDispatched
   ) {
-    await refreshV2CandidateInventory({
-      command,
-      fetch,
-      token,
-      rest_base_url: restBaseUrl,
-      ledger,
-      candidate_repository: candidateRepository,
-      loaded,
-      trigger_identity: triggerIdentity,
-      repository_endpoint_receipt: repositoryEndpointReceipt,
-    });
+    const reconciliation = validateV2CandidateRefreshReconciliation(
+      await ledger.reconcileCandidateInventoryRefreshAtomically({
+        workflow_command_handle: command,
+        trigger_identity: triggerIdentity,
+        repository_endpoint_receipt: repositoryEndpointReceipt,
+      }),
+    );
+    if (reconciliation.state === "suppressed") {
+      if (reconciliation.publication_result !== null) {
+        throw controllerFailure(
+          "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+          "suppressed candidate refresh unexpectedly returned a publication",
+        );
+      }
+      return disabledV2CandidateDispatchRows();
+    }
+    if (
+      reconciliation.state !== "persisted" ||
+      reconciliation.publication_result?.state !== "persisted"
+    ) {
+      throw controllerFailure(
+        "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+        "candidate refresh did not return one durable atomic publication",
+        {
+          state: typeof reconciliation.state === "string"
+            ? reconciliation.state
+            : null,
+        },
+      );
+    }
+    refreshPersisted = true;
   }
   let dispatch = await ledger.loadOrReserveCandidateDispatch({
     workflow_command_handle: command,
@@ -3584,17 +3656,22 @@ async function loadV2ScheduleDispatchMatrixRows({
     repository_endpoint_receipt: repositoryEndpointReceipt,
   });
   assertObject(dispatch, "candidate dispatch load result");
+  if (
+    refreshPersisted && dispatch.state === "dispatch" &&
+    dispatch.restarted !== true
+  ) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_ATOMIC_RESERVATION_MISSING",
+      "atomic candidate refresh did not publish its first dispatch reservation",
+    );
+  }
   if (dispatch.state === "recovery-required") {
     assertObject(
       dispatch.recovery_required,
       "candidate dispatch recovery requirement",
     );
     if (dispatch.recovery_required.ready !== true) {
-      return deepFreeze([{
-        enabled: false,
-        pull_request: 0,
-        dispatch_binding: "null",
-      }]);
+      return disabledV2CandidateDispatchRows();
     }
     if (typeof ledger.recoverCandidateDispatchFailure !== "function") {
       throw controllerFailure(
@@ -3617,11 +3694,7 @@ async function loadV2ScheduleDispatchMatrixRows({
     assertObject(dispatch, "candidate dispatch post-recovery load result");
   }
   if (dispatch.state === "complete") {
-    return deepFreeze([{
-      enabled: false,
-      pull_request: 0,
-      dispatch_binding: "null",
-    }]);
+    return disabledV2CandidateDispatchRows();
   }
   if (dispatch.state !== "dispatch") {
     throw new Error("candidate dispatch returned an unsupported state");
@@ -3638,166 +3711,201 @@ async function loadV2ScheduleDispatchMatrixRows({
   if (plan.items.length === 0) {
     throw new Error("dispatch state requires at least one remaining candidate");
   }
-  return deepFreeze(plan.items.map((item) => ({
-    enabled: true,
-    pull_request: positiveInteger(
-      item.candidate.number,
-      "candidate dispatch matrix pull_request",
-    ),
-    dispatch_binding: canonicalJson(item),
-  })));
+  return deepFreeze(plan.items.map((_item, itemIndex) => {
+    const binding = projectV2GitLedgerCandidateDispatchBinding(
+      plan,
+      itemIndex,
+    );
+    return {
+      enabled: true,
+      pull_request: positiveInteger(
+        binding.candidate.number,
+        "candidate dispatch matrix pull_request",
+      ),
+      dispatch_binding: canonicalJson(binding),
+    };
+  }));
 }
 
-async function refreshV2CandidateInventory({
-  command,
+function validateV2CandidateRefreshReconciliation(value) {
+  assertObject(value, "candidate inventory reconciliation result");
+  exactKeys(value, [
+    "schema", "schema_version", "state", "reason", "repository",
+    "ledger_ref", "adapter_configuration_digest", "persistence_mode",
+    "suppression_result", "publication_result", "result_digest",
+  ], "candidate inventory reconciliation result");
+  if (
+    value.schema !== V2_GIT_LEDGER_CANDIDATE_REFRESH_RECONCILIATION_SCHEMA ||
+    value.schema_version !== 1 ||
+    typeof value.reason !== "string" ||
+    typeof value.ledger_ref !== "string" ||
+    !DIGEST.test(value.adapter_configuration_digest) ||
+    !DIGEST.test(value.result_digest)
+  ) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+      "candidate refresh returned an invalid public reconciliation receipt",
+    );
+  }
+  assertObject(value.repository, "candidate refresh repository");
+  assertObject(value.suppression_result, "candidate suppression result");
+  if (value.state === "suppressed") {
+    if (
+      value.persistence_mode !== null ||
+      value.publication_result !== null ||
+      value.suppression_result.state !== "suppressed"
+    ) {
+      throw controllerFailure(
+        "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+        "suppressed candidate refresh returned inconsistent authority",
+      );
+    }
+    return value;
+  }
+  if (
+    value.state !== "persisted" ||
+    value.persistence_mode !== "private-must-persist" ||
+    value.suppression_result.state !== "persist-required"
+  ) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+      "candidate refresh returned an unsupported reconciliation state",
+    );
+  }
+  assertObject(value.publication_result, "candidate refresh publication");
+  if (value.publication_result.state !== "persisted") {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+      "candidate refresh did not return one durable atomic publication",
+    );
+  }
+  return value;
+}
+
+function disabledV2CandidateDispatchRows() {
+  return deepFreeze([{
+    enabled: false,
+    pull_request: 0,
+    dispatch_binding: "null",
+  }]);
+}
+
+function createV2CandidateInventoryRefreshAdapter({
   fetch,
   token,
+  repository,
   rest_base_url: restBaseUrl,
-  ledger,
-  candidate_repository: candidateRepository,
-  loaded,
-  trigger_identity: triggerIdentity,
-  repository_endpoint_receipt: repositoryEndpointReceipt,
+  controller_release: controllerRelease,
 }) {
+  const candidateRepository = {
+    owner: repository.owner,
+    name: repository.name,
+    id: repository.id,
+    node_id: repository.node_id,
+  };
+  const normalizedRestBase = normalizeRestBase(restBaseUrl);
+  const graphqlUrl = defaultControllerGraphqlUrl(normalizedRestBase);
+  const currentOpen = createV2GitHubCurrentOpenCandidateInventory({
+    fetch,
+    token,
+    repository: candidateRepository,
+    graphqlUrl,
+  });
   const transport = createV2GitHubCandidateInventory({
     fetch,
     token,
     repository: candidateRepository,
-    restBaseUrl,
+    restBaseUrl: normalizedRestBase,
   });
-  const retryableDrift = new Set([
-    "CANDIDATE_INVENTORY_DRIFT",
-    "CANDIDATE_LIFECYCLE_DRIFT",
-  ]);
-  let attemptLoaded = loaded;
-  let nextInitialInventory = null;
-  for (let attempt = 1; attempt <= MAX_V2_CANDIDATE_SCAN_PASSES; attempt += 1) {
-    try {
-      const candidateAuthority =
-        attemptLoaded.authority_projection?.candidate_inventory;
-      assertObject(candidateAuthority, "candidate inventory authority");
-      const priorInventory = candidateAuthority.incomplete_cycle
-        ?.initial_inventory ??
-        candidateAuthority.completed_cycle?.final_inventory ??
-        null;
-      const initialInventory = nextInitialInventory ??
-        await transport.scan({ prior_inventory: priorInventory });
-      nextInitialInventory = null;
-      await appendV2CandidateInventoryPhase({
-        command,
-        ledger,
-        phase: "cycle-start",
-        initial_inventory: initialInventory,
-        trigger_identity: triggerIdentity,
-        repository_endpoint_receipt: repositoryEndpointReceipt,
+  const configurationDigest = gitLedgerDigestCanonical(
+    "codex-review-gate-v2-candidate-refresh-adapter-configuration",
+    {
+      repository: candidateRepository,
+      rest_base_url: normalizedRestBase,
+      graphql_url: graphqlUrl,
+      current_open_query_sha256:
+        rawDigest(V2_CURRENT_OPEN_PULL_REQUESTS_QUERY),
+      current_open_max_candidates: MAX_V2_CURRENT_OPEN_CANDIDATES,
+      current_open_max_pages: MAX_V2_CURRENT_OPEN_CANDIDATE_PAGES,
+      candidate_max_pages: MAX_V2_CANDIDATE_PAGES,
+      max_scan_passes: MAX_V2_CANDIDATE_SCAN_PASSES,
+      timeout_ms: V2_CANDIDATE_HTTP_TIMEOUT_MS,
+      controller_release_digest: gitLedgerDigestCanonical(
+        "codex-review-gate-v2-candidate-refresh-controller-release",
+        controllerRelease,
+      ),
+    },
+  );
+  return deepFreeze({
+    schema: V2_GIT_LEDGER_CANDIDATE_REFRESH_ADAPTER_SCHEMA,
+    schema_version: 1,
+    configuration_digest: configurationDigest,
+    async collectCurrentOpenProjection() {
+      const receipt = await currentOpen.scan();
+      return currentOpen.projectForGitLedger(receipt);
+    },
+    async collectCandidateInventoryAttempt(request) {
+      return collectV2CandidateInventoryAttempt({
+        request,
+        transport,
+        repository: candidateRepository,
       });
-      const shardReceipts = [];
-      for (let index = 0; index < initialInventory.shards.length; index += 1) {
-        const shardReceipt = await transport.readShard({
-          inventory: initialInventory,
-          shard_index: index,
-        });
-        shardReceipts.push(shardReceipt);
-        await appendV2CandidateInventoryPhase({
-          command,
-          ledger,
-          phase: "shard",
-          initial_inventory: initialInventory,
-          shard_receipt: shardReceipt,
-          trigger_identity: triggerIdentity,
-          repository_endpoint_receipt: repositoryEndpointReceipt,
-        });
-      }
-      const finalInventory = await transport.scan({
-        prior_inventory: initialInventory,
-      });
-      nextInitialInventory = finalInventory;
-      const finalShardReceipts = [];
-      for (let index = 0; index < finalInventory.shards.length; index += 1) {
-        finalShardReceipts.push(await transport.readShard({
-          inventory: finalInventory,
-          shard_index: index,
-        }));
-      }
-      const cycleReceipt = finalizeV2CandidateInventoryCycle({
-        initial_inventory: initialInventory,
-        shard_receipts: shardReceipts,
-        final_inventory: finalInventory,
-        final_shard_receipts: finalShardReceipts,
-      });
-      await appendV2CandidateInventoryPhase({
-        command,
-        ledger,
-        phase: "cycle-complete",
-        initial_inventory: initialInventory,
-        final_inventory: finalInventory,
-        cycle_receipt: cycleReceipt,
-        trigger_identity: triggerIdentity,
-        repository_endpoint_receipt: repositoryEndpointReceipt,
-      });
-      return;
-    } catch (error) {
-      if (!retryableDrift.has(error?.code)) throw error;
-      if (attempt === MAX_V2_CANDIDATE_SCAN_PASSES) {
-        throw controllerFailure(
-          "CANDIDATE_INVENTORY_STABILITY_EXHAUSTED",
-          "candidate identity and lifecycle did not stabilize within the bounded scan cycle",
-          {
-            attempts: attempt,
-            last_drift_code: error.code,
-          },
-        );
-      }
-      attemptLoaded = await ledger.load();
-    }
-  }
+    },
+  });
 }
 
-async function appendV2CandidateInventoryPhase({
-  command,
-  ledger,
-  phase,
-  initial_inventory: initialInventory,
-  shard_receipt: shardReceipt = null,
-  final_inventory: finalInventory = null,
-  cycle_receipt: cycleReceipt = null,
-  trigger_identity: triggerIdentity,
-  repository_endpoint_receipt: repositoryEndpointReceipt,
+async function collectV2CandidateInventoryAttempt({
+  request,
+  transport,
+  repository,
 }) {
-  // Each durable append is based on a fresh exact protected-ref load. A stale
-  // scan can therefore fail closed, but can never overwrite a concurrent tip.
-  const loaded = await ledger.load();
-  const authority = loaded.authority_projection?.candidate_inventory;
-  assertObject(authority, "fresh candidate inventory authority");
-  const owner = {
-    run_id: command.invocation.run_id,
-    run_attempt: command.invocation.run_attempt,
-    actor_id: command.invocation.actor_id,
-  };
-  const payload = {
-    schema: V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA,
+  assertObject(request, "candidate full refresh request");
+  exactKeys(request, [
+    "schema", "schema_version", "request_handle", "attempt_index",
+    "repository", "prior_inventory", "initial_inventory", "max_scan_passes",
+  ], "candidate full refresh request");
+  if (
+    request.schema !== V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_REQUEST_SCHEMA ||
+    request.schema_version !== 1 ||
+    !Number.isSafeInteger(request.attempt_index) ||
+    request.attempt_index < 0 ||
+    request.attempt_index >= MAX_V2_CANDIDATE_SCAN_PASSES ||
+    request.max_scan_passes !== MAX_V2_CANDIDATE_SCAN_PASSES ||
+    canonicalJson(request.repository) !== canonicalJson(repository)
+  ) {
+    throw controllerFailure(
+      "CANDIDATE_REFRESH_REQUEST_INVALID",
+      "protected ledger requested an invalid candidate inventory attempt",
+    );
+  }
+  const initialInventory = request.initial_inventory ??
+    await transport.scan({ prior_inventory: request.prior_inventory });
+  const shardReceipts = [];
+  for (let index = 0; index < initialInventory.shards.length; index += 1) {
+    shardReceipts.push(await transport.readShard({
+      inventory: initialInventory,
+      shard_index: index,
+    }));
+  }
+  const finalInventory = await transport.scan({
+    prior_inventory: initialInventory,
+  });
+  const finalShardReceipts = [];
+  for (let index = 0; index < finalInventory.shards.length; index += 1) {
+    finalShardReceipts.push(await transport.readShard({
+      inventory: finalInventory,
+      shard_index: index,
+    }));
+  }
+  return deepFreeze({
+    schema: V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_RESULT_SCHEMA,
     schema_version: 1,
-    phase,
-    cycle_id:
-      `candidate-cycle:${initialInventory.receipt_digest.slice("sha256:".length)}`,
-    owner,
-    prior_candidate_authority_digest: authority.authority_digest,
-    supersedes_incomplete_cycle_id: phase === "cycle-start"
-      ? authority.incomplete_cycle?.cycle_id ?? null
-      : null,
-    initial_inventory_receipt_digest: initialInventory.receipt_digest,
-    initial_inventory: phase === "cycle-start" ? initialInventory : null,
-    shard_receipt: phase === "shard" ? shardReceipt : null,
-    final_inventory: phase === "cycle-complete" ? finalInventory : null,
-    cycle_receipt: phase === "cycle-complete" ? cycleReceipt : null,
-  };
-  return ledger.appendCandidateInventory({
-    predecessor_commit_sha: loaded.tip_commit_sha,
-    owner,
-    server_observed_at: loaded.post_ref.server_time,
-    payload,
-    trigger_identity: triggerIdentity,
-    repository_endpoint_receipt: repositoryEndpointReceipt,
+    request_handle: request.request_handle,
+    attempt_index: request.attempt_index,
+    initial_inventory: initialInventory,
+    shard_receipts: shardReceipts,
+    final_inventory: finalInventory,
+    final_shard_receipts: finalShardReceipts,
   });
 }
 
@@ -3978,6 +4086,41 @@ async function activateV2ProductionLedgerAuthority({
       },
     );
   }
+  if (handoff.state !== "bootstrap" && handoff.state !== "active") {
+    throw controllerFailure(
+      "LEDGER_HANDOFF_STATE_UNSUPPORTED",
+      "protected-ledger handoff returned an unsupported state",
+      { state: handoff.state, public_effects_performed: 0 },
+    );
+  }
+  let candidateInventoryRefreshAdapter;
+  try {
+    const controllerRelease = handoff.state === "bootstrap"
+      ? handoff.bootstrap_input?.controller_release
+      : handoff.capability_receipt?.controller_release;
+    assertObject(controllerRelease, "candidate refresh controller release");
+    candidateInventoryRefreshAdapter =
+      createV2CandidateInventoryRefreshAdapter({
+        fetch: fetchImpl,
+        token,
+        repository: handoff.repository,
+        rest_base_url: restBaseUrl,
+        controller_release: controllerRelease,
+      });
+  } catch (error) {
+    throw controllerFailure(
+      "CANDIDATE_REFRESH_ADAPTER_INITIALIZATION_FAILED",
+      "candidate inventory refresh adapter could not be constructed",
+      {
+        assembly_schema: V2_PRODUCTION_ASSEMBLY_SCHEMA,
+        handoff_digest: handoff.handoff_digest,
+        preflight_receipt_digest: handoff.preflight_receipt_digest,
+        upstream_code: typeof error?.code === "string" ? error.code : null,
+        public_effects_performed: 0,
+      },
+      error,
+    );
+  }
   let ledger;
   if (handoff.state === "bootstrap") {
     try {
@@ -3990,6 +4133,7 @@ async function activateV2ProductionLedgerAuthority({
         bootstrapCapabilityInput: handoff.bootstrap_input,
         preflightHandle,
         verifyWorkflowProvenance: verifier.verifyWorkflowProvenance,
+        candidateInventoryRefreshAdapter,
       }).bootstrapCapability();
       ledger = activated.ledger;
     } catch (error) {
@@ -4017,6 +4161,7 @@ async function activateV2ProductionLedgerAuthority({
         capabilityReceipt: handoff.capability_receipt,
         preflightHandle,
         verifyWorkflowProvenance: verifier.verifyWorkflowProvenance,
+        candidateInventoryRefreshAdapter,
       });
     } catch (error) {
       throw controllerFailure(
@@ -4032,12 +4177,6 @@ async function activateV2ProductionLedgerAuthority({
         error,
       );
     }
-  } else {
-    throw controllerFailure(
-      "LEDGER_HANDOFF_STATE_UNSUPPORTED",
-      "protected-ledger handoff returned an unsupported state",
-      { state: handoff.state, public_effects_performed: 0 },
-    );
   }
   if (typeof ledger?.load !== "function") {
     throw controllerFailure(
@@ -4855,7 +4994,7 @@ async function recoverV2ScheduledCandidateAfterRelease({
   });
 }
 
-function createV2ProductionInitialCycle({
+export function createV2ProductionInitialCycle({
   internal_result: internalResult,
   scheduler_append: schedulerAppend,
   status_intent_appends: statusIntentAppends,
@@ -4897,7 +5036,10 @@ function createV2ProductionInitialCycle({
   const report = assertV2PublicReport(internalResult.report);
   const dueAt = internalResult.scheduler_plan?.due_at ?? null;
   if (dueAt !== null) timestamp(dueAt, "initial scheduler due_at");
-  const wakeupHints = workflowWakeupHint(internalResult);
+  const wakeupHints = projectV2WorkflowWakeupHint(
+    internalResult,
+    runnerAuthority.scheduling,
+  );
   const continuityReceipt = continuityAuthority.continuity_receipt;
   if (
     !Array.isArray(statusIntentAppends) ||

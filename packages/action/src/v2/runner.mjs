@@ -20,6 +20,7 @@ import {
 } from "./projector.mjs";
 import {
   getExactArtifact,
+  projectV2TransportSnapshotForGitLedger,
   validateStatusTarget,
 } from "./transport.mjs";
 import {
@@ -42,6 +43,8 @@ export const V2_AUTOMATIC_REQUEST_RECOVERY_HANDLE_SCHEMA =
   "codex-review-gate-runner-automatic-request-recovery-handle-v2";
 export const V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLE_SCHEMA =
   "codex-review-gate-runner-automatic-recovery-artifact-binding-candidate-handle-v2";
+export const V2_RUNNER_CANDIDATE_SUPPRESSION_EVIDENCE_SCHEMA =
+  "codex-review-gate-runner-candidate-suppression-evidence-v2";
 export const V2_REQUEST_BODY = "@codex review";
 export const MAX_AUTOMATIC_REQUESTS_PER_HEAD = 3;
 // The exact-evidence selector cap is 256; one controlled request selector is
@@ -196,10 +199,19 @@ const STRICT_UTC_TIMESTAMP =
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const DECIMAL_ID_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
+const SafeWeakMap = WeakMap;
+const reflectApply = Reflect.apply;
+const safeObjectFreeze = Object.freeze;
+const safeObjectIsFrozen = Object.isFrozen;
+const safeObjectValues = Object.values;
+const safeStructuredClone = structuredClone;
+const weakMapGetIntrinsic = SafeWeakMap.prototype.get;
+const weakMapSetIntrinsic = SafeWeakMap.prototype.set;
 const AUTOMATIC_REQUEST_RECOVERY_HANDLES = new WeakMap();
 const RUNNER_RESULT_RECOVERY_HANDLES = new WeakMap();
 const AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_HANDLES = new WeakMap();
 const RUNNER_RESULT_ARTIFACT_BINDING_CANDIDATE_HANDLES = new WeakMap();
+const RUNNER_CANDIDATE_SUPPRESSION_RESULT_BINDINGS = new SafeWeakMap();
 
 /**
  * Run one v2 operation. This function performs only read transport calls.
@@ -208,6 +220,7 @@ const RUNNER_RESULT_ARTIFACT_BINDING_CANDIDATE_HANDLES = new WeakMap();
  */
 export async function runV2Operation(rawInput, rawDependencies) {
   const input = validateRunnerInput(rawInput);
+  const candidateSuppressionInput = deepFreeze(safeStructuredClone(input));
   const dependencies = validateDependencies(rawDependencies);
   const responseArtifact = input.operation === "bind-request"
     ? parsePostResponse(input.post_response, input.reservation)
@@ -450,7 +463,190 @@ export async function runV2Operation(rawInput, rawDependencies) {
     result,
     artifactBindingCandidateHandle,
   );
+  safeWeakMapSet(
+    RUNNER_CANDIDATE_SUPPRESSION_RESULT_BINDINGS,
+    result,
+    safeObjectFreeze({
+      input: candidateSuppressionInput,
+      discovery_snapshot: discoverySnapshot,
+      evidence_snapshot: evidenceSnapshot,
+    }),
+  );
   return result;
+}
+
+/**
+ * Project one exact, successful prepare-request evaluation into closed
+ * candidate-suppression evidence. The result identity and both transport
+ * snapshot identities are live in-process capabilities: structural clones and
+ * caller-built snapshots cannot regain this authority. This projection alone
+ * is not durable suppression admission: the generic runner has injectable
+ * reducer, projector, and scheduler dependencies. A production adapter must
+ * exact-bind their canonical implementations before upgrading this evidence.
+ */
+export function projectV2RunnerCandidateSuppressionEvidence(runnerResult) {
+  const binding = safeWeakMapGet(
+    RUNNER_CANDIDATE_SUPPRESSION_RESULT_BINDINGS,
+    runnerResult,
+  );
+  if (binding === undefined) {
+    throw runnerError(
+      "UNTRUSTED_RUNNER_CANDIDATE_SUPPRESSION_RESULT",
+      "candidate suppression evidence requires the exact successful runner result",
+    );
+  }
+  const input = binding.input;
+  if (
+    input.operation !== "prepare-request" ||
+    runnerResult.operation !== "prepare-request"
+  ) {
+    throw runnerError(
+      "RUNNER_CANDIDATE_SUPPRESSION_OPERATION_REQUIRED",
+      "candidate suppression evidence requires prepare-request",
+    );
+  }
+  if (runnerResult.writes_performed !== false) {
+    throw runnerError(
+      "RUNNER_CANDIDATE_SUPPRESSION_WRITE_FREE_REQUIRED",
+      "candidate suppression evidence requires a zero-write runner result",
+    );
+  }
+  if (input.head_ledger === null) {
+    throw runnerError(
+      "RUNNER_CANDIDATE_SUPPRESSION_HEAD_LEDGER_REQUIRED",
+      "candidate suppression evidence requires the prepare-request head ledger",
+    );
+  }
+  if (
+    runnerResult.decision !== runnerResult.scheduler_evaluation.decision ||
+    runnerResult.scheduler_evaluation.snapshot_fingerprint !==
+      runnerResult.reducer_report.snapshot_fingerprint
+  ) {
+    throw runnerError(
+      "RUNNER_CANDIDATE_SUPPRESSION_RESULT_MISMATCH",
+      "candidate suppression result and reducer/scheduler evidence disagree",
+    );
+  }
+  if (runnerResult.scheduler_evaluation.complete !== true) {
+    throw runnerError(
+      "RUNNER_CANDIDATE_SUPPRESSION_COMPLETE_EVIDENCE_REQUIRED",
+      "candidate suppression evidence requires a complete scheduler evaluation",
+    );
+  }
+
+  const evidenceSnapshot = binding.evidence_snapshot;
+  const expectedTransportBinding = {
+    repository: {
+      owner: evidenceSnapshot.repository.owner,
+      name: evidenceSnapshot.repository.name,
+    },
+    scope: {
+      pull_request: {
+        number: evidenceSnapshot.pull_request.number,
+        node_id: evidenceSnapshot.pull_request.node_id,
+      },
+      head_ref_oid: evidenceSnapshot.scope.head_ref_oid,
+      base_ref_oid: evidenceSnapshot.scope.base_ref_tip,
+      potential_merge_commit_oid: evidenceSnapshot.scope.potential_merge_oid,
+    },
+  };
+  const discoveryTransport = projectV2TransportSnapshotForGitLedger(
+    binding.discovery_snapshot,
+    expectedTransportBinding,
+  );
+  const evidenceTransport = projectV2TransportSnapshotForGitLedger(
+    evidenceSnapshot,
+    expectedTransportBinding,
+  );
+  const discoverySnapshot = discoveryTransport.snapshot;
+  const continuityProjection = (snapshot) => ({
+    repository_node_id: snapshot.repository.node_id,
+    pull_request_node_id: snapshot.pull_request.node_id,
+    lifecycle: {
+      state: snapshot.pull_request.state,
+      merged: snapshot.pull_request.merged,
+      merged_at: snapshot.pull_request.merged_at,
+      is_draft: snapshot.pull_request.is_draft,
+    },
+  });
+  if (!isDeepStrictEqual(
+    continuityProjection(discoverySnapshot),
+    continuityProjection(evidenceSnapshot),
+  )) {
+    throw runnerError(
+      "RUNNER_CANDIDATE_SUPPRESSION_SCOPE_DRIFT",
+      "candidate suppression discovery and evidence lifecycle scopes differ",
+    );
+  }
+
+  const projectSnapshot = (kind, authority) => ({
+    observed_at: authority.snapshot.server_time,
+    snapshot_digest: digestCanonical(
+      `codex-review-gate-v2-runner-candidate-suppression-${kind}-snapshot`,
+      authority.snapshot,
+    ),
+    effective_limits: safeStructuredClone(authority.effective_limits),
+    completeness: {
+      request_count: authority.snapshot.completeness.request_count,
+      item_count: authority.snapshot.completeness.item_count,
+      response_bytes: authority.snapshot.completeness.response_bytes,
+      server_date_headers:
+        authority.snapshot.completeness.server_date_headers,
+    },
+  });
+  const withoutDigest = {
+    schema: V2_RUNNER_CANDIDATE_SUPPRESSION_EVIDENCE_SCHEMA,
+    schema_version: V2_RUNNER_SCHEMA_VERSION,
+    repository: {
+      owner: evidenceSnapshot.repository.owner,
+      name: evidenceSnapshot.repository.name,
+      node_id: evidenceSnapshot.repository.node_id,
+    },
+    pull_request: {
+      number: evidenceSnapshot.pull_request.number,
+      node_id: evidenceSnapshot.pull_request.node_id,
+    },
+    scope: {
+      head_ref_oid: evidenceSnapshot.scope.head_ref_oid,
+      base_ref_oid: evidenceSnapshot.scope.base_ref_tip,
+      potential_merge_commit_oid: evidenceSnapshot.scope.potential_merge_oid,
+      lifecycle: {
+        state: evidenceSnapshot.pull_request.state,
+        merged: evidenceSnapshot.pull_request.merged,
+        merged_at: evidenceSnapshot.pull_request.merged_at,
+        is_draft: evidenceSnapshot.pull_request.is_draft,
+      },
+    },
+    input_scheduling: safeStructuredClone(input.scheduling),
+    input_head_ledger: safeStructuredClone(input.head_ledger),
+    controller_digest: digestCanonical(
+      "codex-review-gate-v2-runner-candidate-suppression-controller",
+      input.controller,
+    ),
+    public_report_authority_digest: digestCanonical(
+      "codex-review-gate-v2-runner-candidate-suppression-public-report-authority",
+      input.public_report_authority,
+    ),
+    discovery: projectSnapshot("discovery", discoveryTransport),
+    evidence: projectSnapshot("evidence", evidenceTransport),
+    result: {
+      decision: runnerResult.decision,
+      snapshot_fingerprint:
+        runnerResult.scheduler_evaluation.snapshot_fingerprint,
+      provider_activity_fingerprint:
+        runnerResult.scheduler_evaluation.provider_activity_fingerprint,
+      scheduler_evaluation: safeStructuredClone(runnerResult.scheduler_evaluation),
+      scheduler_plan: safeStructuredClone(runnerResult.scheduler_plan),
+      status_plan: safeStructuredClone(runnerResult.status_plan),
+    },
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    projection_digest: digestCanonical(
+      "codex-review-gate-v2-runner-candidate-suppression-evidence",
+      withoutDigest,
+    ),
+  });
 }
 
 export function getV2AutomaticRequestRecoveryHandle(runnerResult) {
@@ -2222,12 +2418,20 @@ function canonicalJson(value) {
   return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
 }
 
+function safeWeakMapGet(map, key) {
+  return reflectApply(weakMapGetIntrinsic, map, [key]);
+}
+
+function safeWeakMapSet(map, key, value) {
+  return reflectApply(weakMapSetIntrinsic, map, [key, value]);
+}
+
 function deepFreeze(value) {
-  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
-    for (const child of Object.values(value)) {
+  if (value !== null && typeof value === "object" && !safeObjectIsFrozen(value)) {
+    for (const child of safeObjectValues(value)) {
       deepFreeze(child);
     }
-    Object.freeze(value);
+    safeObjectFreeze(value);
   }
   return value;
 }

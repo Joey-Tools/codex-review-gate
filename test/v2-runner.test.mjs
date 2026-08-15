@@ -10,8 +10,12 @@ import {
   buildV2AttemptReceipt,
   deriveV2EpochId,
   prepareV2Request,
+  projectV2RunnerCandidateSuppressionEvidence,
   runV2Operation,
 } from "../packages/action/src/v2/runner.mjs";
+import {
+  createV2GitHubTransport,
+} from "../packages/action/src/v2/transport.mjs";
 
 const HEAD = sha("b");
 const MERGE = sha("c");
@@ -468,6 +472,318 @@ test("prepare can publish an automatic decision without inventing a request", as
   assert.equal(output.scheduler_evaluation.decision, "clean");
 });
 
+test("candidate suppression evidence requires an exact prepare result and live transport snapshots", async () => {
+  const fixture = makeSnapshot();
+  const input = makeRunnerInput({ operation: "prepare-request", snapshot: fixture });
+  input.head_ledger = makeLedger(fixture);
+  const expectedScheduling = structuredClone(input.scheduling);
+  const expectedHeadLedger = structuredClone(input.head_ledger);
+  const liveTransport = createRunnerLiveTransport();
+  const liveSnapshots = [];
+  const output = await runV2Operation(input, {
+    transport: {
+      async loadSnapshot(request) {
+        const snapshot = await liveTransport.loadSnapshot(request);
+        liveSnapshots.push(snapshot);
+        return snapshot;
+      },
+    },
+    reduceSnapshot: (snapshot) => makeReducerReport(snapshot, "clean"),
+    ...fakeProjectionDependencies(),
+    planActions: () => {
+      input.scheduling.run_identity.run_attempt = 98;
+      return { actions: [] };
+    },
+  });
+
+  assert.equal(liveSnapshots.length, 2);
+  input.scheduling.run_identity.run_attempt = 99;
+  input.head_ledger.automatic_request_count = 3;
+  const projection = projectV2RunnerCandidateSuppressionEvidence(output);
+  assert.deepEqual(Object.keys(projection), [
+    "schema",
+    "schema_version",
+    "repository",
+    "pull_request",
+    "scope",
+    "input_scheduling",
+    "input_head_ledger",
+    "controller_digest",
+    "public_report_authority_digest",
+    "discovery",
+    "evidence",
+    "result",
+    "projection_digest",
+  ]);
+  assert.equal(
+    projection.schema,
+    "codex-review-gate-runner-candidate-suppression-evidence-v2",
+  );
+  assert.equal(projection.schema_version, 1);
+  assert.deepEqual(projection.repository, {
+    owner: "owner",
+    name: "repo",
+    node_id: "R_repo",
+  });
+  assert.deepEqual(projection.pull_request, {
+    number: 42,
+    node_id: "PR_node",
+  });
+  assert.deepEqual(projection.scope, {
+    head_ref_oid: HEAD,
+    base_ref_oid: sha("a"),
+    potential_merge_commit_oid: MERGE,
+    lifecycle: {
+      state: "OPEN",
+      merged: false,
+      merged_at: null,
+      is_draft: false,
+    },
+  });
+  assert.deepEqual(projection.input_scheduling, expectedScheduling);
+  assert.deepEqual(projection.input_head_ledger, expectedHeadLedger);
+  assert.match(projection.controller_digest, /^sha256:[0-9a-f]{64}$/u);
+  assert.match(
+    projection.public_report_authority_digest,
+    /^sha256:[0-9a-f]{64}$/u,
+  );
+  for (const [index, snapshotProjection] of
+    [projection.discovery, projection.evidence].entries()) {
+    assert.equal(snapshotProjection.observed_at, SERVER_TIME);
+    assert.match(snapshotProjection.snapshot_digest, /^sha256:[0-9a-f]{64}$/u);
+    assert.deepEqual(snapshotProjection.completeness, {
+      request_count: liveSnapshots[index].completeness.request_count,
+      item_count: liveSnapshots[index].completeness.item_count,
+      response_bytes: liveSnapshots[index].completeness.response_bytes,
+      server_date_headers:
+        liveSnapshots[index].completeness.server_date_headers,
+    });
+    assert.equal(snapshotProjection.effective_limits.max_items, 20_000);
+    assert.equal(snapshotProjection.effective_limits.max_requests, 2_048);
+  }
+  assert.deepEqual(projection.result.scheduler_evaluation,
+    output.scheduler_evaluation);
+  assert.deepEqual(projection.result.scheduler_plan, output.scheduler_plan);
+  assert.deepEqual(projection.result.status_plan, output.status_plan);
+  assert.equal(projection.result.decision, output.decision);
+  assert.equal(
+    projection.result.snapshot_fingerprint,
+    output.reducer_report.snapshot_fingerprint,
+  );
+  assert.equal(
+    projection.result.provider_activity_fingerprint,
+    output.scheduler_evaluation.provider_activity_fingerprint,
+  );
+  assert.match(projection.projection_digest, /^sha256:[0-9a-f]{64}$/u);
+  assert.equal(Object.isFrozen(projection), true);
+
+  assert.throws(
+    () => projectV2RunnerCandidateSuppressionEvidence(
+      structuredClone(output),
+    ),
+    (error) =>
+      error.code === "UNTRUSTED_RUNNER_CANDIDATE_SUPPRESSION_RESULT",
+  );
+
+  const plainInput = makeRunnerInput({
+    operation: "prepare-request",
+    snapshot: fixture,
+  });
+  plainInput.head_ledger = makeLedger(fixture);
+  const plainOutput = await runV2Operation(plainInput, {
+    transport: { async loadSnapshot() { return fixture; } },
+    reduceSnapshot: (snapshot) => makeReducerReport(snapshot, "clean"),
+    ...fakeProjectionDependencies(),
+    planActions: () => ({ actions: [] }),
+  });
+  assert.throws(
+    () => projectV2RunnerCandidateSuppressionEvidence(plainOutput),
+    (error) => error.code === "UNTRUSTED_TRANSPORT_SNAPSHOT_HANDLE",
+  );
+
+  const evaluateInput = makeRunnerInput({
+    operation: "evaluate-only",
+    snapshot: fixture,
+  });
+  const evaluateOutput = await runV2Operation(evaluateInput, {
+    transport: { async loadSnapshot() { return fixture; } },
+    reduceSnapshot: (snapshot) => makeReducerReport(snapshot, "clean"),
+    ...fakeProjectionDependencies(),
+    planActions: () => ({ actions: [] }),
+  });
+  assert.throws(
+    () => projectV2RunnerCandidateSuppressionEvidence(evaluateOutput),
+    (error) => error.code === "RUNNER_CANDIDATE_SUPPRESSION_OPERATION_REQUIRED",
+  );
+});
+
+test("candidate suppression exact-result brand never crosses mutable authority intrinsics", async () => {
+  const fixture = makeSnapshot();
+  const input = makeRunnerInput({
+    operation: "prepare-request",
+    snapshot: fixture,
+  });
+  input.head_ledger = makeLedger(fixture);
+  const setDescriptor = Object.getOwnPropertyDescriptor(
+    WeakMap.prototype,
+    "set",
+  );
+  const freezeDescriptor = Object.getOwnPropertyDescriptor(Object, "freeze");
+  const cloneDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "structuredClone",
+  );
+  const originalSet = setDescriptor.value;
+  const originalFreeze = freezeDescriptor.value;
+  const originalClone = cloneDescriptor.value;
+  let capturedSet = null;
+  let capturedFreezeBinding = null;
+  let capturedInputClone = false;
+  Object.defineProperty(WeakMap.prototype, "set", {
+    ...setDescriptor,
+    value(key, value) {
+      if (value !== null && typeof value === "object" &&
+          Object.hasOwn(value, "input") &&
+          Object.hasOwn(value, "discovery_snapshot") &&
+          Object.hasOwn(value, "evidence_snapshot")) {
+        capturedSet = { map: this, binding: value };
+      }
+      return Reflect.apply(originalSet, this, [key, value]);
+    },
+  });
+  Object.defineProperty(Object, "freeze", {
+    ...freezeDescriptor,
+    value(value) {
+      if (value !== null && typeof value === "object" &&
+          Object.hasOwn(value, "input") &&
+          Object.hasOwn(value, "discovery_snapshot") &&
+          Object.hasOwn(value, "evidence_snapshot")) {
+        capturedFreezeBinding = value;
+        return value;
+      }
+      return Reflect.apply(originalFreeze, Object, [value]);
+    },
+  });
+  Object.defineProperty(globalThis, "structuredClone", {
+    ...cloneDescriptor,
+    value(value, options) {
+      const clone = Reflect.apply(originalClone, globalThis, [value, options]);
+      if (value === input) {
+        capturedInputClone = true;
+        clone.scheduling.run_identity.run_attempt = 999;
+      }
+      return clone;
+    },
+  });
+  let output;
+  try {
+    output = await runV2Operation(input, {
+      transport: createRunnerLiveTransport(),
+      reduceSnapshot: (snapshot) => makeReducerReport(snapshot, "clean"),
+      ...fakeProjectionDependencies(),
+      planActions: () => ({ actions: [] }),
+    });
+  } finally {
+    Object.defineProperty(WeakMap.prototype, "set", setDescriptor);
+    Object.defineProperty(Object, "freeze", freezeDescriptor);
+    Object.defineProperty(globalThis, "structuredClone", cloneDescriptor);
+  }
+
+  const clone = structuredClone(output);
+  if (capturedSet !== null) {
+    Reflect.apply(originalSet, capturedSet.map, [clone, capturedSet.binding]);
+  }
+  assert.throws(
+    () => projectV2RunnerCandidateSuppressionEvidence(clone),
+    (error) =>
+      error.code === "UNTRUSTED_RUNNER_CANDIDATE_SUPPRESSION_RESULT",
+  );
+  assert.equal(capturedSet, null, "private binding set must stay lexical");
+  assert.equal(
+    capturedFreezeBinding,
+    null,
+    "private binding freeze must stay lexical",
+  );
+  assert.equal(capturedInputClone, false, "private input clone must stay lexical");
+
+  const getDescriptor = Object.getOwnPropertyDescriptor(
+    WeakMap.prototype,
+    "get",
+  );
+  const originalGet = getDescriptor.value;
+  let capturedGetMap = null;
+  Object.defineProperty(WeakMap.prototype, "get", {
+    ...getDescriptor,
+    value(key) {
+      if (key === output) {
+        capturedGetMap = this;
+      }
+      return Reflect.apply(originalGet, this, [key]);
+    },
+  });
+  try {
+    projectV2RunnerCandidateSuppressionEvidence(output);
+  } finally {
+    Object.defineProperty(WeakMap.prototype, "get", getDescriptor);
+  }
+  assert.equal(capturedGetMap, null, "private binding get must stay lexical");
+});
+
+test("candidate suppression evidence rejects inconsistent results and relaxed transport limits", async () => {
+  const fixture = makeSnapshot();
+  for (const scenario of [
+    {
+      mutate(evaluation) { evaluation.decision = "pending"; },
+      code: "RUNNER_CANDIDATE_SUPPRESSION_RESULT_MISMATCH",
+    },
+    {
+      mutate(evaluation) {
+        evaluation.snapshot_fingerprint = digest("e");
+      },
+      code: "RUNNER_CANDIDATE_SUPPRESSION_RESULT_MISMATCH",
+    },
+    {
+      mutate(evaluation) { evaluation.complete = false; },
+      code: "RUNNER_CANDIDATE_SUPPRESSION_COMPLETE_EVIDENCE_REQUIRED",
+    },
+  ]) {
+    const input = makeRunnerInput({
+      operation: "prepare-request",
+      snapshot: fixture,
+    });
+    input.head_ledger = makeLedger(fixture);
+    const output = await runV2Operation(input, {
+      transport: { async loadSnapshot() { return fixture; } },
+      reduceSnapshot: (snapshot) => makeReducerReport(snapshot, "clean"),
+      ...fakeProjectionDependencies(),
+      planActions(schedulerInput) {
+        scenario.mutate(schedulerInput.evaluation);
+        return { actions: [] };
+      },
+    });
+    assert.throws(
+      () => projectV2RunnerCandidateSuppressionEvidence(output),
+      (error) => error.code === scenario.code,
+    );
+  }
+
+  const relaxedInput = makeRunnerInput({
+    operation: "prepare-request",
+    snapshot: fixture,
+  });
+  relaxedInput.head_ledger = makeLedger(fixture);
+  const relaxedOutput = await runV2Operation(relaxedInput, {
+    transport: createRunnerLiveTransport({ max_items: 20_001 }),
+    reduceSnapshot: (snapshot) => makeReducerReport(snapshot, "clean"),
+    ...fakeProjectionDependencies(),
+    planActions: () => ({ actions: [] }),
+  });
+  assert.throws(
+    () => projectV2RunnerCandidateSuppressionEvidence(relaxedOutput),
+    (error) => error.code === "TRANSPORT_LIMITS_RELAXED",
+  );
+});
+
 test("prepare preserves one durable intent for the ledger recovery builder", async () => {
   const snapshot = makeSnapshot();
   const postAction = schedulerPostAction(1);
@@ -589,6 +905,148 @@ test("head mode evaluates but never publishes a terminal success to head", async
   );
   assert.equal(invalidFindingPlan.terminal_cutover, false);
 });
+
+function createRunnerLiveTransport(limits = undefined) {
+  return createV2GitHubTransport({
+    fetch: createRunnerTransportFetch(),
+    // review helper synthetic-token pool joey-private-v3: bearer-b
+    token: "JoeyPrivateV3BearerSlotB7Q9M3X5",
+    restBaseUrl: "https://api.github.test",
+    graphqlUrl: "https://api.github.test/graphql",
+    ...(limits === undefined ? {} : { limits }),
+  });
+}
+
+function createRunnerTransportFetch() {
+  const repoPath = "/repos/owner/repo";
+  const responseHeaders = {
+    Date: "Thu, 13 Aug 2026 12:00:00 GMT",
+    "Content-Type": "application/json",
+  };
+  const respond = (body, status = 200) => new Response(JSON.stringify(body), {
+    status,
+    headers: responseHeaders,
+  });
+  return async (input, options = {}) => {
+    const url = new URL(String(input));
+    const body = options.body === undefined
+      ? null
+      : JSON.parse(String(options.body));
+    if (url.pathname === "/graphql") {
+      const query = String(body?.query ?? "");
+      if (query.includes("CodexReviewGateV2Scope")) {
+        return respond({
+          data: {
+            repository: {
+              id: "R_repo",
+              name: "repo",
+              owner: { login: "owner" },
+              pullRequest: {
+                id: "PR_node",
+                number: 42,
+                state: "OPEN",
+                merged: false,
+                mergedAt: null,
+                isDraft: false,
+                mergeable: "MERGEABLE",
+                baseRefName: "main",
+                baseRefOid: sha("a"),
+                baseRef: { name: "main", target: { oid: sha("a") } },
+                headRefName: "feature",
+                headRefOid: HEAD,
+                headRef: { name: "feature", target: { oid: HEAD } },
+                potentialMergeCommit: {
+                  oid: MERGE,
+                  tree: { oid: TREE },
+                  parents: {
+                    totalCount: 2,
+                    pageInfo: {
+                      hasNextPage: false,
+                      endCursor: "parent-2",
+                    },
+                    nodes: [{ oid: sha("a") }, { oid: HEAD }],
+                  },
+                },
+              },
+            },
+          },
+        });
+      }
+      if (query.includes("CodexReviewGateV2ReviewThreads")) {
+        return respond({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          },
+        });
+      }
+      return respond({ errors: [{ message: "unexpected query" }] });
+    }
+    if (url.pathname === `${repoPath}/pulls/42`) {
+      return respond({
+        number: 42,
+        node_id: "PR_node",
+        url: `https://api.github.test${repoPath}/pulls/42`,
+        state: "open",
+        merged: false,
+        merged_at: null,
+        mergeable: true,
+        merge_commit_sha: MERGE,
+        base: { ref: "main", sha: sha("a") },
+        head: { ref: "feature", sha: HEAD },
+      });
+    }
+    if (url.pathname === `${repoPath}/compare/${sha("a")}...${HEAD}`) {
+      return respond({
+        base_commit: { sha: sha("a") },
+        merge_base_commit: { sha: sha("a") },
+      });
+    }
+    if (url.pathname === `${repoPath}/git/ref/pull/42/merge`) {
+      return respond({
+        ref: "refs/pull/42/merge",
+        url: `https://api.github.test${repoPath}/git/refs/pull/42/merge`,
+        object: {
+          type: "commit",
+          sha: MERGE,
+          url: `https://api.github.test${repoPath}/git/commits/${MERGE}`,
+        },
+      });
+    }
+    if ([
+      `${repoPath}/issues/42/comments`,
+      `${repoPath}/pulls/42/reviews`,
+      `${repoPath}/pulls/42/comments`,
+      `${repoPath}/issues/42/reactions`,
+    ].includes(url.pathname)) {
+      return respond([]);
+    }
+    if (url.pathname === `${repoPath}/commits/${HEAD}/check-runs`) {
+      return respond({ total_count: 0, check_runs: [] });
+    }
+    if (url.pathname === repoPath) {
+      return respond({
+        full_name: "owner/repo",
+        url: `https://api.github.test${repoPath}`,
+        role_name: "admin",
+        permissions: {
+          admin: true,
+          maintain: true,
+          push: true,
+          triage: true,
+          pull: true,
+        },
+      });
+    }
+    return respond({ message: `unexpected route ${url.pathname}` }, 404);
+  };
+}
 
 function makeRunnerInput({ operation, snapshot }) {
   return {

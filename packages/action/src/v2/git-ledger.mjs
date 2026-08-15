@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 import {
   planV2Actions,
@@ -7,12 +8,16 @@ import {
   V2_SCHEDULER_SCHEMA_VERSION,
 } from "./scheduler.mjs";
 import {
+  assertV2CurrentOpenCandidateInventoryProjectionAfterFence,
+  createV2CurrentOpenCandidateInventoryCollectionFence,
   finalizeV2CandidateInventoryCycle,
+  MAX_V2_CANDIDATE_SCAN_PASSES,
   V2_CANDIDATE_CYCLE_RECEIPT_SCHEMA,
   V2_CANDIDATE_SHARD_RECEIPT_SCHEMA,
   validateV2CandidateCycleReceipt,
   validateV2CandidateInventory,
   validateV2CandidateShardReceipt,
+  validateV2CurrentOpenCandidateInventoryGitLedgerProjection,
 } from "./candidate-inventory.mjs";
 import {
   assertV2ProviderPreScopeArtifactEqualsSnapshot,
@@ -26,11 +31,21 @@ import {
   MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATES,
   prepareV2Request,
 } from "./runner.mjs";
+import {
+  createV2PersistentMerkleMap,
+  MAX_V2_PERSISTENT_FRONTIER_NODE_BYTES,
+  MAX_V2_PERSISTENT_FRONTIER_OPERATION_BYTES,
+  MAX_V2_PERSISTENT_FRONTIER_OPERATION_OBJECTS,
+} from "./persistent-frontier.mjs";
 
 export const V2_GIT_LEDGER_REF =
   "refs/heads/codex-review-gate-ledger-v2";
 export const V2_GIT_LEDGER_BLOB_PATH =
   "codex-review-gate-ledger-v2.json";
+export const V2_GIT_LEDGER_CHECKPOINT_STATE_PATH = "checkpoint-state-v2";
+export const V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH = "state-v2.json";
+export const V2_GIT_LEDGER_CHECKPOINT_FRONTIER_NODES_PATH =
+  "frontier-nodes-v2";
 export const V2_GIT_LEDGER_CAPABILITY_SCHEMA =
   "codex-review-gate-git-ledger-capability-v2";
 export const V2_GIT_LEDGER_ENVELOPE_SCHEMA =
@@ -97,6 +112,62 @@ export const V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA =
   "codex-review-gate-git-ledger-candidate-inventory-record-v2";
 export const V2_GIT_LEDGER_CANDIDATE_INVENTORY_AUTHORITY_SCHEMA =
   "codex-review-gate-git-ledger-candidate-inventory-authority-v2";
+export const V2_GIT_LEDGER_CANDIDATE_INVENTORY_CYCLE_APPEND_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-inventory-cycle-append-v2";
+export const V2_GIT_LEDGER_CANDIDATE_REFRESH_SOURCE_HANDLE_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-refresh-source-handle-v2";
+export const V2_GIT_LEDGER_CANDIDATE_REFRESH_EVIDENCE_HANDLE_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-refresh-evidence-handle-v2";
+export const V2_GIT_LEDGER_CANDIDATE_REFRESH_CLASSIFICATION_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-refresh-classification-v2";
+export const V2_GIT_LEDGER_CANDIDATE_SUPPRESSION_CLASSIFICATION_HANDLE_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-suppression-classification-handle-v2";
+export const V2_GIT_LEDGER_CANDIDATE_SUPPRESSION_ATTEMPT_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-suppression-attempt-v2";
+export const V2_GIT_LEDGER_CANDIDATE_SUPPRESSION_EVIDENCE_ADAPTER_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-suppression-evidence-adapter-v2";
+export const V2_GIT_LEDGER_CANDIDATE_REFRESH_ADAPTER_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-refresh-adapter-v2";
+export const V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_REQUEST_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-full-refresh-request-v2";
+export const V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_RESULT_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-full-refresh-result-v2";
+export const V2_GIT_LEDGER_CANDIDATE_REFRESH_RECONCILIATION_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-refresh-reconciliation-v2";
+export const V2_GIT_LEDGER_CHECKPOINT_SOURCE_LOAD_HANDLE_SCHEMA =
+  "codex-review-gate-git-ledger-checkpoint-source-load-handle-v2";
+export const V2_GIT_LEDGER_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE_SCHEMA =
+  "codex-review-gate-git-ledger-checkpoint-next-unit-admission-handle-v2";
+export const V2_GIT_LEDGER_CHECKPOINT_REQUIRED_RESULT_SCHEMA =
+  "codex-review-gate-git-ledger-checkpoint-required-result-v2";
+export const V2_GIT_LEDGER_CHECKPOINT_ADMISSION_INSPECTION_SCHEMA =
+  "codex-review-gate-git-ledger-checkpoint-admission-inspection-v2";
+export const V2_GIT_LEDGER_CHECKPOINT_PREPARATION_DIAGNOSTIC_SCHEMA =
+  "codex-review-gate-git-ledger-checkpoint-preparation-diagnostic-v2";
+export const V2_GIT_LEDGER_CHECKPOINT_VALIDATION_DIAGNOSTIC_SCHEMA =
+  "codex-review-gate-git-ledger-checkpoint-validation-diagnostic-v2";
+const V2_GIT_LEDGER_CHECKPOINT_CARRIER_SCHEMA =
+  "codex-review-gate-git-ledger-checkpoint-carrier-v2";
+const V2_GIT_LEDGER_CHECKPOINT_STATE_SCHEMA =
+  "codex-review-gate-git-ledger-checkpoint-state-v2";
+const CHECKPOINT_PROFILE = "bootstrap-only-quiescent-v1";
+const CHECKPOINT_PREFIX_FRONTIER_DOMAIN =
+  "git-ledger-checkpoint-bootstrap-prefix-v1";
+const CHECKPOINT_EMPTY_FRONTIER_DOMAINS = Object.freeze({
+  candidate_cycle_identities:
+    "git-ledger-checkpoint-candidate-cycle-identities-v1",
+  effect_identities: "git-ledger-checkpoint-effect-identities-v1",
+  idempotency_identities:
+    "git-ledger-checkpoint-idempotency-identities-v1",
+  lease_identities: "git-ledger-checkpoint-lease-identities-v1",
+  provider_authorities: "git-ledger-checkpoint-provider-authorities-v1",
+  runner_index: "git-ledger-checkpoint-runner-index-v1",
+});
+const MAX_V2_GIT_LEDGER_CHECKPOINT_TRANSACTION_MS = 5 * 60 * 1000;
+const MAX_V2_GIT_LEDGER_CHECKPOINT_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_V2_GIT_LEDGER_CHECKPOINT_TOTAL_REQUEST_BODY_BYTES = 256 * 1024 * 1024;
+export const V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_MANIFEST_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-inventory-attachment-manifest-v2";
 export const V2_GIT_LEDGER_CANDIDATE_DISPATCH_RECORD_SCHEMA =
   "codex-review-gate-git-ledger-candidate-dispatch-record-v2";
 export const V2_GIT_LEDGER_CANDIDATE_DISPATCH_AUTHORITY_SCHEMA =
@@ -147,11 +218,22 @@ export const V2_GIT_LEDGER_OIDC_AUDIENCE =
   "codex-review-gate-git-ledger-v2";
 export const MAX_V2_GIT_LEDGER_COMMITS = 4_096;
 export const MAX_V2_GIT_LEDGER_BLOB_BYTES = 1024 * 1024;
+export const V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_PATH =
+  "candidate-inventory-attachments-v2";
+export const MAX_V2_GIT_LEDGER_ATTACHMENT_CHUNK_BYTES = 768 * 1024;
+export const MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_SHARDS = 100;
+export const MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_ARTIFACTS = 202;
+export const MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_CHUNKS = 2_048;
+export const MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_ENCODED_BYTES =
+  128 * 1024 * 1024;
+export const MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_DECODED_BYTES =
+  192 * 1024 * 1024;
 export const MAX_V2_GIT_LEDGER_HTTP_REQUESTS =
   MAX_V2_GIT_LEDGER_COMMITS * 3 + 64;
 export const MAX_V2_GIT_LEDGER_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024;
 export const MAX_V2_GIT_LEDGER_HTTP_TOTAL_BYTES = 256 * 1024 * 1024;
 export const V2_GIT_LEDGER_HTTP_TIMEOUT_MS = 15_000;
+const MAX_V2_GIT_LEDGER_HTTP_BODY_CHUNKS = 4_096;
 export const V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS = 15_000;
 export const V2_GIT_LEDGER_APPEND_SAFETY_WINDOW_MS =
   V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS + (5 * V2_GIT_LEDGER_HTTP_TIMEOUT_MS);
@@ -222,6 +304,7 @@ const INTERNAL_RECORD_TYPES = new Set([
 const ALL_RECORD_TYPES = new Set([...RECORD_TYPES, ...INTERNAL_RECORD_TYPES]);
 const PROVENANCE_OPERATIONS = new Set([
   "load",
+  "checkpoint-rotate",
   "bootstrap-genesis",
   "bootstrap-race",
   "bootstrap-race-alpha",
@@ -229,6 +312,15 @@ const PROVENANCE_OPERATIONS = new Set([
   ...RECORD_TYPES,
 ]);
 const BOOTSTRAP_AUTHORITY = Symbol("v2-git-ledger-bootstrap-authority");
+const safeReflectApply = Reflect.apply;
+const safeReflectOwnKeys = Reflect.ownKeys;
+const safeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const SafeWeakMap = WeakMap;
+const SafeWeakSet = WeakSet;
+const safeWeakMapGet = SafeWeakMap.prototype.get;
+const safeWeakMapSet = SafeWeakMap.prototype.set;
+const safeWeakSetAdd = SafeWeakSet.prototype.add;
+const safeWeakSetHas = SafeWeakSet.prototype.has;
 const CONTROL_PLANE_AUTHORITY_HANDLES = new WeakSet();
 const INITIAL_RUNNER_STATE_AUTHORITY_HANDLES = new WeakMap();
 const ESTABLISHED_RUNNER_STATE_AUTHORITY_HANDLES = new WeakMap();
@@ -239,6 +331,7 @@ const AUTOMATIC_REQUEST_INTENT_HANDLES = new WeakMap();
 const AUTOMATIC_RECOVERY_ARTIFACT_BINDING_INTENT_HANDLES = new WeakMap();
 const CANDIDATE_DISPATCH_HANDLES = new WeakMap();
 const CANDIDATE_DISPATCH_RESULT_HANDLES = new WeakMap();
+const CHECKPOINT_DIAGNOSTIC_FACTORIES = new WeakMap();
 const EFFECT_KINDS = new Set(V2_GIT_LEDGER_EFFECT_KINDS);
 const CONFLICT_PROFILES = new Map([
   [409, Object.freeze({
@@ -272,6 +365,8 @@ export function createV2GitHubGitLedger({
   verifyWorkflowProvenance,
   httpLimits = V2_GIT_LEDGER_HTTP_LIMITS,
   provenanceTimeoutMs = V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS,
+  candidateSuppressionEvidenceAdapter = null,
+  candidateInventoryRefreshAdapter = null,
   _bootstrapAuthority = null,
   _bootstrapInput = null,
 }) {
@@ -310,12 +405,41 @@ export function createV2GitHubGitLedger({
     throw new TypeError("Git ledger requires verifyWorkflowProvenance");
   }
   const base = normalizeRestBase(restBaseUrl);
+  const legacyCandidateSuppressionAdapter =
+    normalizeCandidateSuppressionEvidenceAdapter(
+      candidateSuppressionEvidenceAdapter,
+    );
+  const candidateRefreshAdapter = normalizeCandidateInventoryRefreshAdapter(
+    candidateInventoryRefreshAdapter,
+  );
+  if (
+    legacyCandidateSuppressionAdapter !== null &&
+    candidateRefreshAdapter !== null
+  ) {
+    throw new TypeError(
+      "Git ledger accepts one candidate refresh evidence adapter",
+    );
+  }
+  const candidateSuppressionAdapter = candidateRefreshAdapter ??
+    legacyCandidateSuppressionAdapter;
   const repoPath = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
   const refSuffix = ref.slice("refs/".length);
   const createRequestBudget = () => createHttpRequestBudget(httpLimits);
   const createVerifierBudget = () => createProvenanceBudget(
     provenanceTimeoutMs,
   );
+  const createCheckpointRequestBudget = () => createHttpRequestBudget(
+    httpLimits,
+    {
+      deadline_at_ms:
+        performance.now() + MAX_V2_GIT_LEDGER_CHECKPOINT_TRANSACTION_MS,
+      request_body_bytes: MAX_V2_GIT_LEDGER_CHECKPOINT_REQUEST_BODY_BYTES,
+      total_request_body_bytes:
+        MAX_V2_GIT_LEDGER_CHECKPOINT_TOTAL_REQUEST_BODY_BYTES,
+    },
+  );
+  const createCheckpointVerifierBudget = (deadlineAtMs) =>
+    createProvenanceBudget(provenanceTimeoutMs, deadlineAtMs);
   const providerPreScopeReceipts = new WeakMap();
   const fullScopeReceipts = new WeakMap();
   const providerFullScopeReceipts = new WeakSet();
@@ -348,6 +472,26 @@ export function createV2GitHubGitLedger({
   const candidateDispatchScheduledReceipts = new WeakMap();
   const candidateDispatchHandlesByPreScopeReceipt = new WeakMap();
   const leaseReleaseReceipts = new WeakMap();
+  const checkpointSourceLoadHandles = new WeakMap();
+  const checkpointNextUnitAdmissionHandles = new WeakMap();
+  const checkpointPreparationPromises = new WeakMap();
+  const checkpointPreparedDiagnostics = new WeakMap();
+  const candidateRefreshSourceHandles = new WeakMap();
+  const candidateRefreshEvidenceHandles = new WeakMap();
+  const candidateRefreshCollectionOrdinals = new WeakMap();
+  const candidateSuppressionClassificationHandles = new WeakMap();
+  const consumedCandidateSuppressionClassifications = new WeakSet();
+  const consumedCandidateFullRefreshRequestHandles = new WeakSet();
+  const candidateInventoryMustPersistClaims = new SafeWeakMap();
+  const consumedCandidateInventoryMustPersistClaims = new SafeWeakSet();
+  let checkpointAdmissionOrdinal = 0;
+  let candidateRefreshOrdinal = 0;
+  let candidateRefreshCollectionOrdinal = 0;
+  // This is a private lifetime fence, not a serialized ledger value. BigInt
+  // preserves strict monotonic identity for a long-lived factory without the
+  // Number.MAX_SAFE_INTEGER aliasing boundary.
+  let candidateRefreshReconciliationOrdinal = 0n;
+  let candidateRefreshReconciliationActive = false;
   let authorityMintOrdinal = 0;
 
   const sealSchedulerAppend = ({
@@ -460,6 +604,1049 @@ export function createV2GitHubGitLedger({
     });
   };
 
+  // Phase A records exact in-memory admission facts only. These handles are
+  // not accepted by any object-staging or ref-publication path.
+  const mintCheckpointSourceLoadHandle = (loaded) => {
+    const inventory = loaded.authority_projection.candidate_inventory;
+    const dispatch = loaded.authority_projection.candidate_dispatch;
+    const currentDispatch = dispatch.current_cycle;
+    const boundaryFacts = {
+      active_lease: loaded.active_lease !== null,
+      inventory_transition_active:
+        inventory.incomplete_cycle !== null || inventory.atomic_cycle !== null,
+      dispatch_transition_active:
+        currentDispatch !== null && currentDispatch.cycle_complete !== true,
+      dispatch_reservation_active: dispatch.active_reservation !== null,
+      effect_intent_count: loaded.effect_intent_count,
+      effect_response_count: loaded.effect_response_count,
+    };
+    const withoutDigest = {
+      schema: V2_GIT_LEDGER_CHECKPOINT_SOURCE_LOAD_HANDLE_SCHEMA,
+      schema_version: 1,
+      repository: structuredClone(repo),
+      ledger_ref: ref,
+      source_tip_commit_sha: loaded.tip_commit_sha,
+      source_commit_count: loaded.commit_count,
+      source_inventory_digest: loaded.inventory_digest,
+      capability_attestation_commit_sha:
+        loaded.capability.attestation_commit_sha,
+      controller_release_digest:
+        loaded.capability_attestation.controller_release_digest,
+      candidate_inventory_authority_digest: inventory.authority_digest,
+      candidate_dispatch_authority_digest: dispatch.authority_digest,
+      boundary_facts: boundaryFacts,
+    };
+    const handle = deepFreeze({
+      ...withoutDigest,
+      source_load_digest: digestCanonical(
+        "codex-review-gate-v2-checkpoint-source-load",
+        withoutDigest,
+      ),
+    });
+    checkpointSourceLoadHandles.set(handle, deepFreeze({
+      loaded,
+      created_ordinal: ++checkpointAdmissionOrdinal,
+    }));
+    return handle;
+  };
+
+  const mintCheckpointNextUnitAdmissionHandle = ({
+    sourceLoadHandle,
+    commandAuthority,
+    triggerIdentity,
+    repositoryEndpointReceipt,
+    driftAttempts,
+    cycle,
+    projection,
+    currentEpochBudget,
+    freshEpochBudget,
+  }) => {
+    const sourcePrivate = checkpointSourceLoadHandles.get(sourceLoadHandle);
+    if (sourcePrivate === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CHECKPOINT_SOURCE_LOAD_HANDLE",
+        "checkpoint admission requires its exact same-factory source handle",
+      );
+    }
+    const withoutDigest = {
+      schema: V2_GIT_LEDGER_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE_SCHEMA,
+      schema_version: 1,
+      repository: structuredClone(repo),
+      ledger_ref: ref,
+      source_load_digest: sourceLoadHandle.source_load_digest,
+      next_unit_kind: "candidate-inventory-cycle",
+      cycle_id: candidateInventoryCycleId(cycle.initial_inventory),
+      stable_cycle_receipt_digest: cycle.cycle_receipt.receipt_digest,
+      stable_command_authority_digest: digestCanonical(
+        "codex-review-gate-v2-checkpoint-stable-command-authority",
+        candidateDispatchStableCommandAuthority(commandAuthority),
+      ),
+      trigger_identity_digest: digestCanonical(
+        "codex-review-gate-v2-checkpoint-trigger-identity",
+        normalizeCandidateDispatchTriggerIdentity(triggerIdentity),
+      ),
+      projection_digest: projection.projection_digest,
+      total_commit_budget_required:
+        currentEpochBudget.total_commit_budget_required,
+      current_epoch_remaining_commit_capacity:
+        currentEpochBudget.remaining_ledger_commit_capacity_after_dispatch,
+      fresh_epoch_remaining_commit_capacity:
+        freshEpochBudget.remaining_ledger_commit_capacity_after_dispatch,
+    };
+    const handle = deepFreeze({
+      ...withoutDigest,
+      next_unit_admission_digest: digestCanonical(
+        "codex-review-gate-v2-checkpoint-next-unit-admission",
+        withoutDigest,
+      ),
+    });
+    checkpointNextUnitAdmissionHandles.set(handle, deepFreeze({
+      source_load_handle: sourceLoadHandle,
+      next_unit_admission_handle: handle,
+      command_authority: structuredClone(commandAuthority),
+      trigger_identity: structuredClone(triggerIdentity),
+      repository_endpoint_receipt:
+        structuredClone(repositoryEndpointReceipt),
+      drift_attempts: structuredClone(driftAttempts),
+      cycle: structuredClone(cycle),
+      projection: structuredClone(projection),
+      current_epoch_budget: structuredClone(currentEpochBudget),
+      fresh_epoch_budget: structuredClone(freshEpochBudget),
+      created_ordinal: sourcePrivate.created_ordinal,
+    }));
+    return handle;
+  };
+
+  const checkpointAdmissionPair = ({
+    source_load_handle: sourceLoadHandle,
+    next_unit_admission_handle: nextUnitAdmissionHandle,
+  }) => {
+    const sourcePrivate = checkpointSourceLoadHandles.get(sourceLoadHandle);
+    if (sourcePrivate === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CHECKPOINT_SOURCE_LOAD_HANDLE",
+        "checkpoint preparation requires this factory's exact source load handle",
+      );
+    }
+    const admissionPrivate = checkpointNextUnitAdmissionHandles.get(
+      nextUnitAdmissionHandle,
+    );
+    if (admissionPrivate === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE",
+        "checkpoint preparation requires this factory's exact next-unit handle",
+      );
+    }
+    if (admissionPrivate.source_load_handle !== sourceLoadHandle) {
+      throw ledgerError(
+        "CHECKPOINT_SOURCE_ADMISSION_MISMATCH",
+        "checkpoint source and next-unit admission were not minted together",
+      );
+    }
+    if (admissionPrivate.created_ordinal !== checkpointAdmissionOrdinal) {
+      throw ledgerError(
+        "STALE_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE",
+        "checkpoint preparation requires the latest same-factory admission",
+      );
+    }
+    validateBootstrapOnlyCheckpointBoundary(sourcePrivate.loaded);
+    return { sourcePrivate, admissionPrivate, nextUnitAdmissionHandle };
+  };
+
+  const assertCheckpointAdmissionCurrent = (admissionPrivate) => {
+    if (admissionPrivate.created_ordinal !== checkpointAdmissionOrdinal) {
+      throw ledgerError(
+        "STALE_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE",
+        "checkpoint transaction requires the latest same-factory admission",
+      );
+    }
+  };
+
+  const prepareCheckpointCandidateTransaction = async (input) => {
+    const pair = checkpointAdmissionPair(input);
+    const existing = checkpointPreparationPromises.get(
+      pair.nextUnitAdmissionHandle,
+    );
+    if (existing !== undefined) return existing;
+    const requestBudget = createCheckpointRequestBudget();
+    const provenanceBudget = createCheckpointVerifierBudget(
+      requestBudget.deadline_at_ms,
+    );
+    const preparation = Promise.resolve().then(async () => {
+      const prepared = await prepareBootstrapCheckpointCandidateTransaction({
+        fetchImpl,
+        authorization,
+        base,
+        repoPath,
+        ref,
+        refSuffix,
+        repo,
+        capability,
+        preflightHandle,
+        verifyWorkflowProvenance,
+        requestBudget,
+        provenanceBudget,
+        sourcePrivate: pair.sourcePrivate,
+        admissionPrivate: pair.admissionPrivate,
+        assertAdmissionCurrent: () =>
+          assertCheckpointAdmissionCurrent(pair.admissionPrivate),
+      });
+      assertCheckpointAdmissionCurrent(pair.admissionPrivate);
+      checkpointPreparedDiagnostics.set(
+        prepared.result,
+        prepared.private_binding,
+      );
+      return prepared.result;
+    });
+    checkpointPreparationPromises.set(
+      pair.nextUnitAdmissionHandle,
+      preparation,
+    );
+    try {
+      return await preparation;
+    } catch (error) {
+      if (
+        checkpointPreparationPromises.get(pair.nextUnitAdmissionHandle) ===
+          preparation
+      ) {
+        checkpointPreparationPromises.delete(pair.nextUnitAdmissionHandle);
+      }
+      throw error;
+    }
+  };
+
+  const loadPreparedCheckpointTransaction = async (result) => {
+    const prepared = checkpointPreparedDiagnostics.get(result);
+    if (prepared === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CHECKPOINT_PREPARATION_DIAGNOSTIC",
+        "checkpoint loader requires this factory's exact prepared diagnostic",
+      );
+    }
+    if (
+      prepared.admission_private.created_ordinal !==
+        checkpointAdmissionOrdinal
+    ) {
+      throw ledgerError(
+        "STALE_CHECKPOINT_PREPARATION_DIAGNOSTIC",
+        "checkpoint loader rejects a prepared result from an older admission epoch",
+      );
+    }
+    const requestBudget = createCheckpointRequestBudget();
+    const provenanceBudget = createCheckpointVerifierBudget(
+      requestBudget.deadline_at_ms,
+    );
+    const validation = await loadBootstrapCheckpointCandidateTransaction({
+      fetchImpl,
+      authorization,
+      base,
+      repoPath,
+      ref,
+      repo,
+      capability,
+      verifyWorkflowProvenance,
+      requestBudget,
+      provenanceBudget,
+      prepared,
+      assertAdmissionCurrent: () =>
+        assertCheckpointAdmissionCurrent(prepared.admission_private),
+    });
+    assertCheckpointAdmissionCurrent(prepared.admission_private);
+    return validation;
+  };
+
+  const candidateRefreshClassificationResult = ({
+    phase,
+    state,
+    reason,
+    sourceHandle = null,
+    evidenceHandle = null,
+    classificationHandle = null,
+    sourceLoaded = null,
+    authoritativeObservedAt = null,
+    observationBoundary = null,
+  }) => {
+    const withoutDigest = {
+      schema: V2_GIT_LEDGER_CANDIDATE_REFRESH_CLASSIFICATION_SCHEMA,
+      schema_version: 1,
+      phase,
+      state,
+      reason,
+      repository: structuredClone(repo),
+      ledger_ref: ref,
+      source_handle: sourceHandle,
+      evidence_handle: evidenceHandle,
+      suppression_classification_handle: classificationHandle,
+      source_tip_commit_sha: sourceLoaded?.tip_commit_sha ?? null,
+      source_commit_count: sourceLoaded?.commit_count ?? null,
+      authoritative_observed_at: authoritativeObservedAt,
+      observation_boundary: observationBoundary,
+      writes_performed: false,
+    };
+    return deepFreeze({
+      ...withoutDigest,
+      classification_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-refresh-classification",
+        withoutDigest,
+      ),
+    });
+  };
+
+  const candidateSuppressionAttemptResult = ({
+    phase,
+    state,
+    reason,
+    sourceLoaded = null,
+    authoritativeObservedAt = null,
+    observationBoundary = null,
+  }) => {
+    const withoutDigest = {
+      schema: V2_GIT_LEDGER_CANDIDATE_SUPPRESSION_ATTEMPT_SCHEMA,
+      schema_version: 1,
+      phase,
+      state,
+      reason,
+      repository: structuredClone(repo),
+      ledger_ref: ref,
+      assurance: state === "suppressed"
+        ? "bounded-sampled-empty-at-observation-boundary"
+        : null,
+      github_atomic_snapshot: false,
+      github_ref_fence: null,
+      source_tip_commit_sha: sourceLoaded?.tip_commit_sha ?? null,
+      source_commit_count: sourceLoaded?.commit_count ?? null,
+      authoritative_observed_at: authoritativeObservedAt,
+      observation_boundary: observationBoundary,
+      writes_performed: false,
+    };
+    return deepFreeze({
+      ...withoutDigest,
+      result_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-suppression-attempt",
+        withoutDigest,
+      ),
+    });
+  };
+
+  const candidateSuppressionAttemptFromClassification = (result) =>
+    candidateSuppressionAttemptResult({
+      phase: result.phase,
+      state: "persist-required",
+      reason: result.reason,
+      sourceLoaded: result.source_tip_commit_sha === null
+        ? null
+        : {
+            tip_commit_sha: result.source_tip_commit_sha,
+            commit_count: result.source_commit_count,
+          },
+      authoritativeObservedAt: result.authoritative_observed_at,
+      observationBoundary: result.observation_boundary,
+    });
+
+  const candidateRefreshReconciliationResult = ({
+    suppressionResult,
+    publicationResult = null,
+  }) => {
+    const persisted = publicationResult !== null;
+    const withoutDigest = {
+      schema: V2_GIT_LEDGER_CANDIDATE_REFRESH_RECONCILIATION_SCHEMA,
+      schema_version: 1,
+      state: persisted ? "persisted" : "suppressed",
+      reason: suppressionResult.reason,
+      repository: structuredClone(repo),
+      ledger_ref: ref,
+      adapter_configuration_digest:
+        candidateRefreshAdapter.configuration_digest,
+      persistence_mode: persisted ? "private-must-persist" : null,
+      suppression_result: structuredClone(suppressionResult),
+      publication_result: publicationResult === null
+        ? null
+        : structuredClone(publicationResult),
+    };
+    return deepFreeze({
+      ...withoutDigest,
+      result_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-refresh-reconciliation",
+        withoutDigest,
+      ),
+    });
+  };
+
+  const collectCandidateFullRefreshEvidence = async (loaded) => {
+    if (candidateRefreshAdapter === null) {
+      throw ledgerError(
+        "CANDIDATE_REFRESH_ADAPTER_UNAVAILABLE",
+        "atomic candidate refresh requires one construction-time full refresh adapter",
+      );
+    }
+    const inventory = loaded.authority_projection.candidate_inventory;
+    const priorInventory = inventory.incomplete_cycle?.initial_inventory ??
+      inventory.completed_cycle?.final_inventory ?? null;
+    const driftAttempts = [];
+    let expectedInitialInventory = null;
+    for (
+      let attemptIndex = 0;
+      attemptIndex < MAX_V2_CANDIDATE_SCAN_PASSES;
+      attemptIndex += 1
+    ) {
+      const requestHandle = deepFreeze({});
+      const request = deepFreeze({
+        schema: V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_REQUEST_SCHEMA,
+        schema_version: 1,
+        request_handle: requestHandle,
+        attempt_index: attemptIndex,
+        repository: structuredClone(candidateRepository(repo)),
+        prior_inventory: priorInventory,
+        initial_inventory: expectedInitialInventory,
+        max_scan_passes: MAX_V2_CANDIDATE_SCAN_PASSES,
+      });
+      const rawResult = await candidateRefreshAdapter
+        .collect_candidate_inventory_attempt(request);
+      if (safeReflectApply(
+        safeWeakSetHas,
+        consumedCandidateFullRefreshRequestHandles,
+        [requestHandle],
+      )) {
+        throw ledgerError(
+          "CONSUMED_CANDIDATE_FULL_REFRESH_REQUEST_HANDLE",
+          "candidate full refresh request was already consumed",
+        );
+      }
+      const evidence = normalizeCandidateFullRefreshResult(rawResult, {
+        repository: repo,
+        requestHandle,
+        attemptIndex,
+        expectedInitialInventory,
+      });
+      safeReflectApply(
+        safeWeakSetAdd,
+        consumedCandidateFullRefreshRequestHandles,
+        [requestHandle],
+      );
+      let cycleReceipt = null;
+      let driftCode = null;
+      try {
+        cycleReceipt = finalizeV2CandidateInventoryCycle({
+          initial_inventory: evidence.initial_inventory,
+          shard_receipts: evidence.shard_receipts,
+          final_inventory: evidence.final_inventory,
+          final_shard_receipts: evidence.final_shard_receipts,
+        });
+      } catch (error) {
+        if (!new Set([
+          "CANDIDATE_INVENTORY_DRIFT",
+          "CANDIDATE_LIFECYCLE_DRIFT",
+        ]).has(error?.code)) {
+          throw error;
+        }
+        driftCode = error.code;
+      }
+      if (driftCode !== null) {
+        driftAttempts.push(deepFreeze({
+          ...structuredClone(evidence),
+          cycle_receipt: null,
+          drift_code: driftCode,
+        }));
+        if (attemptIndex + 1 === MAX_V2_CANDIDATE_SCAN_PASSES) {
+          throw ledgerError(
+            "CANDIDATE_INVENTORY_STABILITY_EXHAUSTED",
+            "candidate inventory did not stabilize within its bounded scan profile",
+          );
+        }
+        expectedInitialInventory = evidence.final_inventory;
+        continue;
+      }
+      if (
+        cycleReceipt.open_pull_requests.length >
+          MAX_V2_CANDIDATE_DISPATCH_CYCLE_ITEMS
+      ) {
+        throw ledgerError(
+          "candidate-inventory-dispatch-cycle-size",
+          "candidate inventory completion exceeds the bounded dispatch cycle",
+        );
+      }
+      const cycle = deepFreeze({
+        ...structuredClone(evidence),
+        cycle_receipt: structuredClone(cycleReceipt),
+        drift_code: null,
+      });
+      validateCandidateInventoryAttemptChain(driftAttempts, cycle);
+      return deepFreeze({
+        drift_attempts: driftAttempts,
+        initial_inventory: cycle.initial_inventory,
+        shard_receipts: cycle.shard_receipts,
+        final_inventory: cycle.final_inventory,
+        final_shard_receipts: cycle.final_shard_receipts,
+      });
+    }
+    throw new Error("candidate full refresh loop exhausted unexpectedly");
+  };
+
+  const candidateRefreshInputBinding = (input) => ({
+    workflow_command_handle: input.workflow_command_handle,
+    trigger_identity_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-refresh-trigger",
+      normalizeCandidateDispatchTriggerIdentity(input.trigger_identity),
+    ),
+    repository_endpoint_receipt_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-refresh-repository-endpoint",
+      normalizeRepositoryEndpointReceipt(
+        input.repository_endpoint_receipt,
+        repo,
+      ),
+    ),
+  });
+
+  const mintCandidateInventoryMustPersistClaim = ({
+    input,
+    sourceLoaded,
+    suppressionResult,
+    fullRefresh,
+    reconciliationOrdinal,
+  }) => {
+    const receiver = {};
+    const privateClaim = deepFreeze({
+      reconciliation_ordinal: reconciliationOrdinal,
+      adapter_configuration_digest:
+        candidateRefreshAdapter.configuration_digest,
+      suppression_result_digest: suppressionResult.result_digest,
+      source_binding: candidateRefreshDurableBinding(sourceLoaded),
+      input_binding: candidateRefreshInputBinding(input),
+      full_refresh_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-full-refresh-evidence",
+        fullRefresh,
+      ),
+    });
+    safeReflectApply(safeWeakMapSet, candidateInventoryMustPersistClaims, [
+      receiver,
+      privateClaim,
+    ]);
+    return receiver;
+  };
+
+  const consumeCandidateInventoryMustPersistClaim = (receiver, input) => {
+    if (safeReflectApply(
+      safeWeakSetHas,
+      consumedCandidateInventoryMustPersistClaims,
+      [receiver],
+    )) {
+      throw ledgerError(
+        "CONSUMED_CANDIDATE_INVENTORY_MUST_PERSIST_CLAIM",
+        "candidate inventory must-persist authority is one-shot",
+      );
+    }
+    const privateClaim = safeReflectApply(
+      safeWeakMapGet,
+      candidateInventoryMustPersistClaims,
+      [receiver],
+    );
+    if (privateClaim === undefined) return null;
+    safeReflectApply(
+      safeWeakSetAdd,
+      consumedCandidateInventoryMustPersistClaims,
+      [receiver],
+    );
+    const inputBinding = candidateRefreshInputBinding(input);
+    if (
+      inputBinding.workflow_command_handle !==
+        privateClaim.input_binding.workflow_command_handle ||
+      inputBinding.trigger_identity_digest !==
+        privateClaim.input_binding.trigger_identity_digest ||
+      inputBinding.repository_endpoint_receipt_digest !==
+        privateClaim.input_binding.repository_endpoint_receipt_digest ||
+      privateClaim.reconciliation_ordinal !==
+        candidateRefreshReconciliationOrdinal ||
+      privateClaim.adapter_configuration_digest !==
+        candidateRefreshAdapter?.configuration_digest
+    ) {
+      throw ledgerError(
+        "CANDIDATE_INVENTORY_MUST_PERSIST_CLAIM_MISMATCH",
+        "candidate inventory append differs from its private persistence authority",
+      );
+    }
+    return privateClaim;
+  };
+
+  const assertCandidateInventoryMustPersistClaimEvidence = ({
+    privateClaim,
+    driftAttempts,
+    cycle,
+  }) => {
+    if (privateClaim === null) return;
+    const fullRefresh = {
+      drift_attempts: driftAttempts,
+      initial_inventory: cycle.initial_inventory,
+      shard_receipts: cycle.shard_receipts,
+      final_inventory: cycle.final_inventory,
+      final_shard_receipts: cycle.final_shard_receipts,
+    };
+    if (
+      digestCanonical(
+        "codex-review-gate-v2-candidate-full-refresh-evidence",
+        fullRefresh,
+      ) !== privateClaim.full_refresh_digest
+    ) {
+      throw ledgerError(
+        "CANDIDATE_INVENTORY_MUST_PERSIST_CLAIM_MISMATCH",
+        "candidate inventory evidence differs from its private persistence authority",
+      );
+    }
+  };
+
+  const assertCandidateInventoryMustPersistClaimSource = (
+    privateClaim,
+    loaded,
+  ) => {
+    if (
+      privateClaim !== null &&
+      canonicalJson(candidateRefreshDurableBinding(loaded)) !==
+        canonicalJson(privateClaim.source_binding)
+    ) {
+      throw ledgerError(
+        "STALE_CANDIDATE_INVENTORY_MUST_PERSIST_CLAIM",
+        "candidate inventory source changed after its persistence decision",
+      );
+    }
+  };
+
+  const candidateRefreshDurableBinding = (loaded) => {
+    const inventory = loaded.authority_projection.candidate_inventory;
+    const dispatch = loaded.authority_projection.candidate_dispatch;
+    return deepFreeze({
+      source_tip_commit_sha: loaded.tip_commit_sha,
+      source_commit_count: loaded.commit_count,
+      candidate_inventory_authority_digest: inventory.authority_digest,
+      candidate_dispatch_authority_digest: dispatch.authority_digest,
+      completed_cycle_record_oid:
+        inventory.completed_cycle?.complete_record_oid ?? null,
+      completed_cycle_receipt_digest:
+        inventory.completed_cycle?.cycle_receipt.receipt_digest ?? null,
+      dispatch_generation_id: dispatch.current_cycle?.generation_id ?? null,
+      controller_release_digest:
+        loaded.capability_attestation.controller_release_digest,
+    });
+  };
+
+  const assertCandidateRefreshSourceCurrent = (privateSource) => {
+    if (privateSource.created_ordinal !== candidateRefreshOrdinal) {
+      throw ledgerError(
+        "STALE_CANDIDATE_REFRESH_SOURCE_HANDLE",
+        "candidate refresh requires the latest same-factory source handle",
+      );
+    }
+  };
+
+  const candidateRefreshSourcePrivate = (sourceHandle) => {
+    const privateSource = candidateRefreshSourceHandles.get(sourceHandle);
+    if (privateSource === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CANDIDATE_REFRESH_SOURCE_HANDLE",
+        "candidate refresh requires this factory's exact source handle",
+      );
+    }
+    assertCandidateRefreshSourceCurrent(privateSource);
+    return privateSource;
+  };
+
+  const candidateRefreshEvidencePair = (sourceHandle, evidenceHandle) => {
+    const privateSource = candidateRefreshSourcePrivate(sourceHandle);
+    const privateEvidence = candidateRefreshEvidenceHandles.get(
+      evidenceHandle,
+    );
+    if (privateEvidence === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CANDIDATE_REFRESH_EVIDENCE_HANDLE",
+        "candidate refresh requires this factory's exact evidence handle",
+      );
+    }
+    if (privateEvidence.source_handle !== sourceHandle) {
+      throw ledgerError(
+        "CANDIDATE_REFRESH_SOURCE_EVIDENCE_MISMATCH",
+        "candidate refresh source and evidence were not minted together",
+      );
+    }
+    if (privateEvidence.created_ordinal !== candidateRefreshOrdinal) {
+      throw ledgerError(
+        "STALE_CANDIDATE_REFRESH_EVIDENCE_HANDLE",
+        "candidate refresh evidence belongs to an older classification epoch",
+      );
+    }
+    if (
+      candidateRefreshCollectionOrdinals.get(sourceHandle) !==
+        privateEvidence.collection_ordinal
+    ) {
+      throw ledgerError(
+        "STALE_CANDIDATE_REFRESH_EVIDENCE_HANDLE",
+        "candidate refresh evidence was superseded by a later current-open collection",
+      );
+    }
+    return { privateSource, privateEvidence };
+  };
+
+  const assertCandidateRefreshCollectionCurrent = (
+    sourceHandle,
+    collectionOrdinal,
+  ) => {
+    if (
+      candidateRefreshCollectionOrdinals.get(sourceHandle) !==
+        collectionOrdinal
+    ) {
+      throw ledgerError(
+        "STALE_CANDIDATE_REFRESH_EVIDENCE_HANDLE",
+        "candidate refresh collection was superseded before it completed",
+      );
+    }
+  };
+
+  const assertCandidateRefreshLoadedUnchanged = (privateSource, loaded) => {
+    const current = candidateRefreshDurableBinding(loaded);
+    if (canonicalJson(current) !== canonicalJson(privateSource.binding)) {
+      throw ledgerError(
+        "STALE_CANDIDATE_REFRESH_SOURCE_HANDLE",
+        "candidate refresh durable authority changed after evidence collection began",
+      );
+    }
+  };
+
+  const candidateRefreshDurableDecision = ({
+    loaded,
+    commandAuthority,
+    triggerIdentity,
+  }) => {
+    const inventory = loaded.authority_projection.candidate_inventory;
+    const dispatch = loaded.authority_projection.candidate_dispatch;
+    const completed = inventory.completed_cycle;
+    const current = dispatch.current_cycle;
+    const unavailable = (reason) => deepFreeze({
+      eligible: false,
+      reason,
+      authoritative_observed_at: loaded.post_ref.server_time,
+    });
+    if (loaded.active_lease !== null) {
+      return unavailable("candidate-dispatch-unsettled");
+    }
+    if (inventory.incomplete_cycle !== null || inventory.atomic_cycle !== null) {
+      return unavailable("candidate-inventory-recovery-required");
+    }
+    if (completed === null) {
+      return unavailable("candidate-inventory-bootstrap");
+    }
+    if (
+      current === null ||
+      current.cycle_complete !== true ||
+      current.active_reservation !== null ||
+      current.dispatch_command_authority === null ||
+      current.trigger_identity === null
+    ) {
+      return unavailable("candidate-dispatch-unsettled");
+    }
+    if (
+      canonicalJson(candidateDispatchStableCommandAuthority(
+        commandAuthority,
+      )) !== canonicalJson(candidateDispatchStableCommandAuthority(
+        current.dispatch_command_authority,
+      )) ||
+      canonicalJson(normalizeCandidateDispatchTriggerIdentity(
+        triggerIdentity,
+      )) !== canonicalJson(current.trigger_identity)
+    ) {
+      return unavailable("candidate-dispatch-authority-changed");
+    }
+    const suppression = candidateInventoryCycleSuppressionAuthority({
+      loaded,
+      commandAuthority,
+      cycleReceipt: completed.cycle_receipt,
+      previousCycleReceipt: completed.cycle_receipt,
+    });
+    if (suppression.reason !== "candidate-full-evidence-authority-required") {
+      return deepFreeze({
+        eligible: false,
+        reason: suppression.reason,
+        authoritative_observed_at: suppression.authoritative_observed_at,
+      });
+    }
+    const finalInventory = completed.final_inventory;
+    const durableEmpty =
+      completed.cycle_receipt.open_pull_requests.length === 0 &&
+      finalInventory.candidates.length === 0 &&
+      finalInventory.retained_prior_candidate_ids.length === 0 &&
+      current.candidate_count === 0 &&
+      current.candidates.length === 0 &&
+      current.completed_batches.length === 0;
+    if (
+      !durableEmpty ||
+      loaded.effect_intent_count !== 0 ||
+      loaded.effect_response_count !== 0 ||
+      loaded.control_comment_binding !== null
+    ) {
+      return unavailable("candidate-full-evidence-dirty-epoch-required");
+    }
+    return deepFreeze({
+      eligible: true,
+      reason: "candidate-full-evidence-authority-required",
+      authoritative_observed_at: suppression.authoritative_observed_at,
+    });
+  };
+
+  const mintCandidateRefreshSourceHandle = ({
+    loaded,
+    command,
+    triggerIdentity,
+    repositoryEndpointReceipt,
+    ordinal,
+  }) => {
+    const binding = candidateRefreshDurableBinding(loaded);
+    const withoutDigest = {
+      schema: V2_GIT_LEDGER_CANDIDATE_REFRESH_SOURCE_HANDLE_SCHEMA,
+      schema_version: 1,
+      repository: structuredClone(repo),
+      ledger_ref: ref,
+      source_tip_commit_sha: binding.source_tip_commit_sha,
+      source_commit_count: binding.source_commit_count,
+      candidate_inventory_authority_digest:
+        binding.candidate_inventory_authority_digest,
+      candidate_dispatch_authority_digest:
+        binding.candidate_dispatch_authority_digest,
+      dispatch_generation_id: binding.dispatch_generation_id,
+      command_authority_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-refresh-command-authority",
+        candidateDispatchStableCommandAuthority(command.authority),
+      ),
+      trigger_identity_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-refresh-trigger-identity",
+        normalizeCandidateDispatchTriggerIdentity(triggerIdentity),
+      ),
+      repository_endpoint_receipt_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-refresh-repository-endpoint",
+        repositoryEndpointReceipt,
+      ),
+      controller_release_digest: binding.controller_release_digest,
+      configuration_digest:
+        candidateSuppressionAdapter.configuration_digest,
+      created_ordinal: ordinal,
+    };
+    const handle = deepFreeze({
+      ...withoutDigest,
+      source_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-refresh-source",
+        withoutDigest,
+      ),
+    });
+    candidateRefreshSourceHandles.set(handle, deepFreeze({
+      created_ordinal: ordinal,
+      loaded,
+      binding,
+      command_authority: structuredClone(command.authority),
+      trigger_identity: structuredClone(triggerIdentity),
+      repository_endpoint_receipt:
+        structuredClone(repositoryEndpointReceipt),
+      source_handle: handle,
+    }));
+    return handle;
+  };
+
+  const mintCandidateRefreshEvidenceHandle = ({
+    sourceHandle,
+    privateSource,
+    projection,
+    loaded,
+    collectionOrdinal,
+  }) => {
+    const receipt = projection.receipt;
+    const observationBoundary = deepFreeze({
+      assurance: "bounded-sampled-empty-at-observation-boundary",
+      github_atomic_snapshot: false,
+      github_ref_fence: null,
+      github_ref_fence_assurance: receipt.ref_fence_assurance,
+      github_observation_window:
+        structuredClone(receipt.observation_window),
+      ledger_pre_ref: structuredClone(loaded.pre_ref),
+      ledger_post_ref: structuredClone(loaded.post_ref),
+    });
+    const projectionDigest = digestCanonical(
+      "codex-review-gate-v2-candidate-refresh-current-open-projection",
+      projection,
+    );
+    const withoutDigest = {
+      schema: V2_GIT_LEDGER_CANDIDATE_REFRESH_EVIDENCE_HANDLE_SCHEMA,
+      schema_version: 1,
+      repository: structuredClone(repo),
+      ledger_ref: ref,
+      source_digest: sourceHandle.source_digest,
+      current_open_receipt_digest: receipt.receipt_digest,
+      current_open_semantic_digest:
+        receipt.current_open_semantic_digest,
+      current_open_projection_digest: projectionDigest,
+      current_open_candidate_count: 0,
+      configuration_digest:
+        candidateSuppressionAdapter.configuration_digest,
+      controller_release_digest: sourceHandle.controller_release_digest,
+      observation_boundary: observationBoundary,
+      created_ordinal: privateSource.created_ordinal,
+      collection_ordinal: collectionOrdinal,
+    };
+    const handle = deepFreeze({
+      ...withoutDigest,
+      evidence_digest: digestCanonical(
+        "codex-review-gate-v2-candidate-refresh-evidence",
+        withoutDigest,
+      ),
+    });
+    candidateRefreshEvidenceHandles.set(handle, deepFreeze({
+      source_handle: sourceHandle,
+      created_ordinal: privateSource.created_ordinal,
+      collection_ordinal: collectionOrdinal,
+      projection,
+      observation_boundary: observationBoundary,
+      final_loaded: loaded,
+      evidence_handle: handle,
+    }));
+    return handle;
+  };
+
+  const consumeCandidateSuppressionClassification = async ({
+    sourceHandle,
+    evidenceHandle,
+    classificationHandle,
+  }) => {
+    const privateClassification = candidateSuppressionClassificationHandles.get(
+      classificationHandle,
+    );
+    if (privateClassification === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CANDIDATE_SUPPRESSION_CLASSIFICATION_HANDLE",
+        "candidate suppression requires this factory's exact classification",
+      );
+    }
+    if (consumedCandidateSuppressionClassifications.has(classificationHandle)) {
+      throw ledgerError(
+        "CONSUMED_CANDIDATE_SUPPRESSION_CLASSIFICATION_HANDLE",
+        "candidate suppression classification is one-shot",
+      );
+    }
+    const { privateSource, privateEvidence } = candidateRefreshEvidencePair(
+      sourceHandle,
+      evidenceHandle,
+    );
+    if (
+      privateClassification.source_handle !== sourceHandle ||
+      privateClassification.evidence_handle !== evidenceHandle ||
+      privateClassification.created_ordinal !== privateSource.created_ordinal ||
+      privateClassification.collection_ordinal !==
+        privateEvidence.collection_ordinal ||
+      sourceHandle.configuration_digest !==
+        candidateSuppressionAdapter.configuration_digest ||
+      evidenceHandle.configuration_digest !==
+        candidateSuppressionAdapter.configuration_digest ||
+      classificationHandle.configuration_digest !==
+        candidateSuppressionAdapter.configuration_digest ||
+      evidenceHandle.controller_release_digest !==
+        sourceHandle.controller_release_digest ||
+      classificationHandle.controller_release_digest !==
+        sourceHandle.controller_release_digest
+    ) {
+      throw ledgerError(
+        "CANDIDATE_SUPPRESSION_CLASSIFICATION_MISMATCH",
+        "candidate suppression classification changed its source evidence",
+      );
+    }
+    consumedCandidateSuppressionClassifications.add(classificationHandle);
+
+    const loaded = await api.load();
+    assertCandidateRefreshSourceCurrent(privateSource);
+    assertCandidateRefreshCollectionCurrent(
+      sourceHandle,
+      privateEvidence.collection_ordinal,
+    );
+    assertCandidateRefreshLoadedUnchanged(privateSource, loaded);
+    if (
+      candidateRefreshDurableBinding(loaded).controller_release_digest !==
+        sourceHandle.controller_release_digest
+    ) {
+      throw ledgerError(
+        "STALE_CANDIDATE_REFRESH_SOURCE_HANDLE",
+        "candidate suppression controller release changed before consumption",
+      );
+    }
+    assertCandidateRefreshObservationBeforeLedgerFence(
+      privateEvidence.projection,
+      loaded,
+    );
+    const durable = candidateRefreshDurableDecision({
+      loaded,
+      commandAuthority: privateSource.command_authority,
+      triggerIdentity: privateSource.trigger_identity,
+    });
+    if (!durable.eligible) {
+      return candidateSuppressionAttemptResult({
+        phase: "consume",
+        state: "persist-required",
+        reason: durable.reason,
+        sourceLoaded: loaded,
+        authoritativeObservedAt: durable.authoritative_observed_at,
+        observationBoundary: privateEvidence.observation_boundary,
+      });
+    }
+    return candidateSuppressionAttemptResult({
+      phase: "consume",
+      state: "suppressed",
+      reason: "semantic-unchanged-not-due",
+      sourceLoaded: loaded,
+      authoritativeObservedAt: durable.authoritative_observed_at,
+      observationBoundary: privateEvidence.observation_boundary,
+    });
+  };
+
+  const candidateSuppressionPersistReasonForError = (error) => {
+    if (new Set([
+      "STALE_CANDIDATE_REFRESH_SOURCE_HANDLE",
+      "STALE_CANDIDATE_REFRESH_EVIDENCE_HANDLE",
+      "CONSUMED_CANDIDATE_SUPPRESSION_CLASSIFICATION_HANDLE",
+    ]).has(error?.code)) {
+      return "candidate-refresh-authority-stale";
+    }
+    if (new Set([
+      "STALE_CANDIDATE_REFRESH_PROJECTION_HANDLE",
+      "STALE_CURRENT_OPEN_INVENTORY_PROJECTION_HANDLE",
+      "CONSUMED_CURRENT_OPEN_COLLECTION_FENCE",
+    ]).has(error?.code)) {
+      return "candidate-current-open-evidence-reused";
+    }
+    if (error?.code === "CANDIDATE_REFRESH_EVIDENCE_HISTORY_CAP") {
+      return "candidate-current-open-evidence-history-cap";
+    }
+    if (error?.code === "candidate-refresh-observation-after-ledger-fence") {
+      return "candidate-refresh-boundary-drift";
+    }
+    if (new Set(["unstable-ref", "unstable-ref-time"]).has(error?.code)) {
+      return "candidate-refresh-ledger-fence-drift";
+    }
+    if (new Set([
+      "CANDIDATE_OPEN_SCAN_SUPERSEDED",
+      "CANDIDATE_HTTP_REPLAYED",
+      "CANDIDATE_IDENTITY_CONFLICT",
+      "CANDIDATE_OPEN_SET_DRIFT",
+      "CANDIDATE_OPEN_SET_LIFECYCLE",
+      "CANDIDATE_OPEN_SET_UNSTABLE",
+      "CANDIDATE_IDENTITY_MISMATCH",
+      "CANDIDATE_ORDER_INVALID",
+      "CANDIDATE_HTTP_TIMEOUT",
+      "CANDIDATE_HTTP_UNREADABLE",
+      "CANDIDATE_INACCESSIBLE",
+      "CANDIDATE_PAGE_MALFORMED",
+      "CANDIDATE_PAGINATION_INCOMPLETE",
+      "CANDIDATE_PAGINATION_INVALID",
+      "CANDIDATE_REQUEST_CAP_EXCEEDED",
+      "CANDIDATE_REQUEST_TOO_LARGE",
+      "CANDIDATE_RESPONSE_FRAGMENTED",
+      "CANDIDATE_RESPONSE_TOO_LARGE",
+      "CANDIDATE_TOTAL_BYTES_EXCEEDED",
+    ]).has(error?.code)) {
+      return "candidate-current-open-evidence-incomplete";
+    }
+    return null;
+  };
+
   const api = Object.freeze({
     async load() {
       if (capability === null) {
@@ -468,8 +1655,10 @@ export function createV2GitHubGitLedger({
           "production load is unavailable before bootstrap seals capability",
         );
       }
-      const requestBudget = createRequestBudget();
-      const provenanceBudget = createVerifierBudget();
+      const requestBudget = createCheckpointRequestBudget();
+      const provenanceBudget = createCheckpointVerifierBudget(
+        requestBudget.deadline_at_ms,
+      );
       const loaded = await loadStableChain({
         fetchImpl,
         authorization,
@@ -481,13 +1670,17 @@ export function createV2GitHubGitLedger({
         verifyWorkflowProvenance,
         provenanceBudget,
         requestBudget,
+        allowBootstrapCheckpoint: true,
+        capability,
       });
+      assertHttpDeadlineOpen(requestBudget);
       await validateStoredProviderIdentityAuthorities(
         loaded.records,
         capability.provider_identity_policy,
         preflightHandle,
         repo,
       );
+      assertHttpDeadlineOpen(requestBudget);
       const authority = requireCurrentCapability(loaded, capability);
       const provenance = await obtainWorkflowProvenance({
         verifyWorkflowProvenance,
@@ -504,18 +1697,473 @@ export function createV2GitHubGitLedger({
         policy: capability.workflow_provenance_policy,
         provenanceBudget,
       });
+      assertHttpDeadlineOpen(requestBudget);
       assertUnusedProvenanceJti(
-        new Set(loaded.records.map((entry) =>
-          provenanceReplayIdentity(entry.envelope.workflow_provenance))),
+        new Set(loaded.consumed_provenance_identities ?? loaded.records.map(
+          (entry) => provenanceReplayIdentity(
+            entry.envelope.workflow_provenance,
+          ),
+        )),
         provenance.receipt,
       );
-      return sealLoadedLedger(
+      const sealed = sealLoadedLedger(
         loaded,
         capability,
         authority,
         loaded.observed_at,
         provenance.receipt,
       );
+      assertHttpDeadlineOpen(requestBudget);
+      return sealed;
+    },
+
+    /**
+     * Read-only classification scaffold for a construction-time trusted
+     * current-open adapter. These methods mint factory-local diagnostic facts
+     * only; no mutation API consumes their handles, and the production
+     * controller does not currently inject the adapter.
+     */
+    async beginCandidateInventoryRefreshClassification({
+      workflow_command_handle,
+      trigger_identity,
+      repository_endpoint_receipt,
+    }) {
+      const command = await candidateRefreshWorkflowCommandAuthority({
+        workflow_command_handle,
+        repository: repo,
+        trigger_identity,
+      });
+      const repositoryEndpointReceipt = normalizeRepositoryEndpointReceipt(
+        repository_endpoint_receipt,
+        repo,
+      );
+      const ordinal = ++candidateRefreshOrdinal;
+      if (command.suppression_eligible !== true) {
+        return candidateRefreshClassificationResult({
+          phase: "begin",
+          state: "persist-required",
+          reason: command.reason,
+        });
+      }
+      if (candidateSuppressionAdapter === null) {
+        return candidateRefreshClassificationResult({
+          phase: "begin",
+          state: "persist-required",
+          reason: "candidate-full-evidence-adapter-unavailable",
+        });
+      }
+      const loaded = await api.load();
+      const durable = candidateRefreshDurableDecision({
+        loaded,
+        commandAuthority: command.authority,
+        triggerIdentity: trigger_identity,
+      });
+      if (!durable.eligible) {
+        return candidateRefreshClassificationResult({
+          phase: "begin",
+          state: "persist-required",
+          reason: durable.reason,
+          sourceLoaded: loaded,
+          authoritativeObservedAt: durable.authoritative_observed_at,
+        });
+      }
+      const sourceHandle = mintCandidateRefreshSourceHandle({
+        loaded,
+        command,
+        triggerIdentity: trigger_identity,
+        repositoryEndpointReceipt,
+        ordinal,
+      });
+      return candidateRefreshClassificationResult({
+        phase: "begin",
+        state: "evidence-required",
+        reason: "candidate-empty-current-open-evidence-required",
+        sourceHandle,
+        sourceLoaded: loaded,
+        authoritativeObservedAt: durable.authoritative_observed_at,
+      });
+    },
+
+    async collectCandidateInventoryRefreshEvidence({ source_handle }) {
+      const privateSource = candidateRefreshSourcePrivate(source_handle);
+      const collectionOrdinal = ++candidateRefreshCollectionOrdinal;
+      candidateRefreshCollectionOrdinals.set(
+        source_handle,
+        collectionOrdinal,
+      );
+      if (candidateSuppressionAdapter === null) {
+        throw ledgerError(
+          "UNTRUSTED_CANDIDATE_SUPPRESSION_EVIDENCE_ADAPTER",
+          "candidate refresh source has no trusted evidence adapter",
+        );
+      }
+      const collectionFence =
+        createV2CurrentOpenCandidateInventoryCollectionFence();
+      const exactProjection = await candidateSuppressionAdapter
+        .collect_current_open_projection();
+      assertCandidateRefreshSourceCurrent(privateSource);
+      assertCandidateRefreshCollectionCurrent(
+        source_handle,
+        collectionOrdinal,
+      );
+      assertV2CurrentOpenCandidateInventoryProjectionAfterFence(
+        exactProjection,
+        collectionFence,
+      );
+      const projection =
+        validateV2CurrentOpenCandidateInventoryGitLedgerProjection(
+          exactProjection,
+          candidateRepository(repo),
+        );
+      assertCandidateRefreshSourceCurrent(privateSource);
+      assertCandidateRefreshCollectionCurrent(
+        source_handle,
+        collectionOrdinal,
+      );
+      const currentOpenCount = projection.semantic_projection.length;
+      if (currentOpenCount !== 0) {
+        return candidateRefreshClassificationResult({
+          phase: "collect",
+          state: "persist-required",
+          reason: "candidate-full-evidence-dirty-epoch-required",
+          sourceLoaded: privateSource.loaded,
+          authoritativeObservedAt:
+            privateSource.loaded.post_ref.server_time,
+          observationBoundary: deepFreeze({
+            assurance: "bounded-sampled-nonempty-at-observation-boundary",
+            github_atomic_snapshot: false,
+            github_ref_fence: null,
+            github_ref_fence_assurance:
+              projection.receipt.ref_fence_assurance,
+            github_observation_window: structuredClone(
+              projection.receipt.observation_window,
+            ),
+            current_open_candidate_count: currentOpenCount,
+          }),
+        });
+      }
+      const loaded = await api.load();
+      assertCandidateRefreshSourceCurrent(privateSource);
+      assertCandidateRefreshCollectionCurrent(
+        source_handle,
+        collectionOrdinal,
+      );
+      assertCandidateRefreshLoadedUnchanged(privateSource, loaded);
+      assertCandidateRefreshObservationBeforeLedgerFence(projection, loaded);
+      const durable = candidateRefreshDurableDecision({
+        loaded,
+        commandAuthority: privateSource.command_authority,
+        triggerIdentity: privateSource.trigger_identity,
+      });
+      if (!durable.eligible) {
+        return candidateRefreshClassificationResult({
+          phase: "collect",
+          state: "persist-required",
+          reason: durable.reason,
+          sourceLoaded: loaded,
+          authoritativeObservedAt: durable.authoritative_observed_at,
+        });
+      }
+      const evidenceHandle = mintCandidateRefreshEvidenceHandle({
+        sourceHandle: source_handle,
+        privateSource,
+        projection,
+        loaded,
+        collectionOrdinal,
+      });
+      return candidateRefreshClassificationResult({
+        phase: "collect",
+        state: "classification-required",
+        reason: "candidate-empty-current-open-evidence-collected",
+        sourceHandle: source_handle,
+        evidenceHandle,
+        sourceLoaded: loaded,
+        authoritativeObservedAt: durable.authoritative_observed_at,
+        observationBoundary: evidenceHandle.observation_boundary,
+      });
+    },
+
+    async classifyCandidateInventoryRefresh({
+      source_handle,
+      evidence_handle,
+    }) {
+      const { privateSource, privateEvidence } =
+        candidateRefreshEvidencePair(source_handle, evidence_handle);
+      const loaded = await api.load();
+      assertCandidateRefreshSourceCurrent(privateSource);
+      assertCandidateRefreshCollectionCurrent(
+        source_handle,
+        privateEvidence.collection_ordinal,
+      );
+      assertCandidateRefreshLoadedUnchanged(privateSource, loaded);
+      assertCandidateRefreshObservationBeforeLedgerFence(
+        privateEvidence.projection,
+        loaded,
+      );
+      const durable = candidateRefreshDurableDecision({
+        loaded,
+        commandAuthority: privateSource.command_authority,
+        triggerIdentity: privateSource.trigger_identity,
+      });
+      if (!durable.eligible) {
+        return candidateRefreshClassificationResult({
+          phase: "classify",
+          state: "persist-required",
+          reason: durable.reason,
+          sourceLoaded: loaded,
+          authoritativeObservedAt: durable.authoritative_observed_at,
+          observationBoundary: privateEvidence.observation_boundary,
+        });
+      }
+      const withoutDigest = {
+        schema:
+          V2_GIT_LEDGER_CANDIDATE_SUPPRESSION_CLASSIFICATION_HANDLE_SCHEMA,
+        schema_version: 1,
+        repository: structuredClone(repo),
+        ledger_ref: ref,
+        source_digest: source_handle.source_digest,
+        evidence_digest: evidence_handle.evidence_digest,
+        decision: "suppress-empty-current-open",
+        reason: "semantic-unchanged-not-due",
+        assurance: "bounded-sampled-empty-at-observation-boundary",
+        github_atomic_snapshot: false,
+        github_ref_fence: null,
+        source_tip_commit_sha: loaded.tip_commit_sha,
+        source_commit_count: loaded.commit_count,
+        authoritative_observed_at: durable.authoritative_observed_at,
+        configuration_digest:
+          candidateSuppressionAdapter.configuration_digest,
+        controller_release_digest: source_handle.controller_release_digest,
+        created_ordinal: privateSource.created_ordinal,
+      };
+      const classificationHandle = deepFreeze({
+        ...withoutDigest,
+        suppression_classification_digest: digestCanonical(
+          "codex-review-gate-v2-candidate-suppression-classification",
+          withoutDigest,
+        ),
+      });
+      candidateSuppressionClassificationHandles.set(
+        classificationHandle,
+        deepFreeze({
+          source_handle,
+          evidence_handle,
+          created_ordinal: privateSource.created_ordinal,
+          collection_ordinal: privateEvidence.collection_ordinal,
+          loaded,
+        }),
+      );
+      return candidateRefreshClassificationResult({
+        phase: "classify",
+        state: "suppress-authorized",
+        reason: "semantic-unchanged-not-due",
+        sourceHandle: source_handle,
+        evidenceHandle: evidence_handle,
+        classificationHandle,
+        sourceLoaded: loaded,
+        authoritativeObservedAt: durable.authoritative_observed_at,
+        observationBoundary: privateEvidence.observation_boundary,
+      });
+    },
+
+    /**
+     * Run the complete read-only sampled-empty suppression flow without
+     * exposing any factory-local source, evidence, or classification handle.
+     * The returned decision never acknowledges provider state or advances a
+     * durable cursor.
+     */
+    async trySuppressCandidateInventoryRefresh(input) {
+      assertObject(input, "candidate suppression attempt");
+      exactKeys(input, [
+        "workflow_command_handle",
+        "trigger_identity",
+        "repository_endpoint_receipt",
+      ], "candidate suppression attempt");
+      try {
+        const begun = await api.beginCandidateInventoryRefreshClassification(
+          input,
+        );
+        if (begun.state !== "evidence-required") {
+          return candidateSuppressionAttemptFromClassification(begun);
+        }
+        const collected = await api.collectCandidateInventoryRefreshEvidence({
+          source_handle: begun.source_handle,
+        });
+        if (collected.state !== "classification-required") {
+          return candidateSuppressionAttemptFromClassification(collected);
+        }
+        const classified = await api.classifyCandidateInventoryRefresh({
+          source_handle: begun.source_handle,
+          evidence_handle: collected.evidence_handle,
+        });
+        if (classified.state !== "suppress-authorized") {
+          return candidateSuppressionAttemptFromClassification(classified);
+        }
+        return await consumeCandidateSuppressionClassification({
+          sourceHandle: begun.source_handle,
+          evidenceHandle: collected.evidence_handle,
+          classificationHandle:
+            classified.suppression_classification_handle,
+        });
+      } catch (error) {
+        const reason = candidateSuppressionPersistReasonForError(error);
+        if (reason === null) throw error;
+        return candidateSuppressionAttemptResult({
+          phase: "try-suppress",
+          state: "persist-required",
+          reason,
+        });
+      }
+    },
+
+    /**
+     * Reconcile one repository inventory refresh through a construction-time
+     * trusted read adapter. The lexical receiver used for the atomic append is
+     * not returned or accepted by any public method, so a persist decision
+     * cannot be downgraded by a later suppression reclassification.
+     *
+     * The full-refresh callback is a trusted adapter boundary. This method
+     * revalidates its complete evidence chain but does not claim to prove the
+    * callback's underlying HTTP collector identity.
+     */
+    async reconcileCandidateInventoryRefreshAtomically(input) {
+      const reconciliationInput = normalizeCandidateRefreshReconciliationInput(
+        input,
+        repo,
+      );
+      if (candidateRefreshReconciliationActive) {
+        throw ledgerError(
+          "CANDIDATE_REFRESH_RECONCILIATION_ACTIVE",
+          "candidate inventory refresh reconciliation is already active",
+        );
+      }
+      candidateRefreshReconciliationActive = true;
+      const reconciliationOrdinal = ++candidateRefreshReconciliationOrdinal;
+      try {
+        if (candidateRefreshAdapter === null) {
+          throw ledgerError(
+            "CANDIDATE_REFRESH_ADAPTER_UNAVAILABLE",
+            "atomic candidate refresh requires one construction-time refresh adapter",
+          );
+        }
+        const suppressionResult =
+          await api.trySuppressCandidateInventoryRefresh(reconciliationInput);
+        if (suppressionResult.state === "suppressed") {
+          return candidateRefreshReconciliationResult({
+            suppressionResult,
+          });
+        }
+        if (suppressionResult.state !== "persist-required") {
+          throw ledgerError(
+            "CANDIDATE_REFRESH_RECONCILIATION_INVARIANT",
+            "candidate suppression returned an unsupported reconciliation state",
+          );
+        }
+        const sourceLoaded = await api.load();
+        rejectBootstrapCheckpointMutation(
+          sourceLoaded,
+          "candidate inventory refresh reconciliation",
+        );
+        validateCandidateInventoryCycleAdmissionState(sourceLoaded);
+        const fullRefresh = await collectCandidateFullRefreshEvidence(
+          sourceLoaded,
+        );
+        const mustPersistReceiver = mintCandidateInventoryMustPersistClaim({
+          input: reconciliationInput,
+          sourceLoaded,
+          suppressionResult,
+          fullRefresh,
+          reconciliationOrdinal,
+        });
+        const publicationResult = await safeReflectApply(
+          api.appendCandidateInventoryCycleIfRequired,
+          mustPersistReceiver,
+          [{
+            workflow_command_handle:
+              reconciliationInput.workflow_command_handle,
+            trigger_identity: reconciliationInput.trigger_identity,
+            repository_endpoint_receipt:
+              reconciliationInput.repository_endpoint_receipt,
+            ...fullRefresh,
+          }],
+        );
+        if (publicationResult.state === "checkpoint-required") {
+          throw ledgerError(
+            "CANDIDATE_INVENTORY_CHECKPOINT_REQUIRED",
+            "candidate inventory refresh requires a production checkpoint transaction",
+          );
+        }
+        if (publicationResult.state !== "persisted") {
+          throw ledgerError(
+            "CANDIDATE_REFRESH_RECONCILIATION_INVARIANT",
+            "private candidate refresh persistence did not publish durable authority",
+          );
+        }
+        return candidateRefreshReconciliationResult({
+          suppressionResult,
+          publicationResult,
+        });
+      } finally {
+        candidateRefreshReconciliationActive = false;
+      }
+    },
+
+    // Diagnostic-only identity check. It performs no Git I/O and grants no
+    // prepare or publish capability.
+    inspectCheckpointTransactionAdmission({
+      source_load_handle,
+      next_unit_admission_handle,
+    }) {
+      const sourcePrivate = checkpointSourceLoadHandles.get(
+        source_load_handle,
+      );
+      if (sourcePrivate === undefined) {
+        throw ledgerError(
+          "UNTRUSTED_CHECKPOINT_SOURCE_LOAD_HANDLE",
+          "checkpoint admission requires this factory's exact source load handle",
+        );
+      }
+      const admissionPrivate = checkpointNextUnitAdmissionHandles.get(
+        next_unit_admission_handle,
+      );
+      if (admissionPrivate === undefined) {
+        throw ledgerError(
+          "UNTRUSTED_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE",
+          "checkpoint admission requires this factory's exact next-unit handle",
+        );
+      }
+      if (admissionPrivate.source_load_handle !== source_load_handle) {
+        throw ledgerError(
+          "CHECKPOINT_SOURCE_ADMISSION_MISMATCH",
+          "checkpoint source and next-unit admission were not minted together",
+        );
+      }
+      const withoutDigest = {
+        schema: V2_GIT_LEDGER_CHECKPOINT_ADMISSION_INSPECTION_SCHEMA,
+        schema_version: 1,
+        state: "checkpoint-required",
+        source_load_digest: source_load_handle.source_load_digest,
+        next_unit_admission_digest:
+          next_unit_admission_handle.next_unit_admission_digest,
+        source_tip_commit_sha: sourcePrivate.loaded.tip_commit_sha,
+        source_commit_count: sourcePrivate.loaded.commit_count,
+        next_unit_kind: next_unit_admission_handle.next_unit_kind,
+        total_commit_budget_required:
+          admissionPrivate.current_epoch_budget.total_commit_budget_required,
+        current_epoch_remaining_commit_capacity:
+          admissionPrivate.current_epoch_budget
+            .remaining_ledger_commit_capacity_after_dispatch,
+        fresh_epoch_remaining_commit_capacity:
+          admissionPrivate.fresh_epoch_budget
+            .remaining_ledger_commit_capacity_after_dispatch,
+      };
+      return deepFreeze({
+        ...withoutDigest,
+        inspection_digest: digestCanonical(
+          "codex-review-gate-v2-checkpoint-admission-inspection",
+          withoutDigest,
+        ),
+      });
     },
 
     async loadControlPlaneAuthority(expectedScope) {
@@ -4659,13 +6307,25 @@ export function createV2GitHubGitLedger({
           sealed_capability_receipt: capability,
         });
       }
+      const candidateDispatchCycle = chain.authority_projection
+        .candidate_dispatch.current_cycle;
       if (
-        chain.authority_projection.candidate_dispatch.active_reservation !==
-          null
+        candidateDispatchCycle !== null &&
+        candidateDispatchCycle.cycle_complete === false
       ) {
         throw ledgerError(
           "candidate-dispatch-capability-drift",
-          "active candidate dispatch forbids capability replacement",
+          "an incomplete candidate dispatch forbids capability replacement",
+        );
+      }
+      if (
+        chain.authority_projection.candidate_inventory.incomplete_cycle !==
+          null ||
+        chain.authority_projection.candidate_inventory.atomic_cycle !== null
+      ) {
+        throw ledgerError(
+          "candidate-inventory-write-window",
+          "an active candidate inventory transition forbids capability replacement",
         );
       }
       if (chain.active_lease !== null) {
@@ -4951,6 +6611,15 @@ export function createV2GitHubGitLedger({
         );
       }
       const normalized = validateV2GitLedgerRecord(record);
+      if (
+        normalized.record_type === "candidate-inventory-observation" &&
+        normalized.payload.schema_version === 2
+      ) {
+        throw ledgerError(
+          "UNTRUSTED_COMPACT_CANDIDATE_INVENTORY_APPEND",
+          "compact candidate inventory records require the private atomic cycle seam",
+        );
+      }
       const recoveryAdmission = automaticRecoveryAppendAdmissions.get(
         automatic_recovery_append_admission,
       );
@@ -5020,6 +6689,10 @@ export function createV2GitHubGitLedger({
         evaluatedScopeReceipt,
       );
       const loaded = await api.load();
+      rejectBootstrapCheckpointMutation(
+        loaded,
+        "production append",
+      );
       const requestBudget = createRequestBudget();
       const provenanceBudget = createVerifierBudget();
       if (normalized.predecessor_commit_sha !== loaded.tip_commit_sha) {
@@ -5029,7 +6702,7 @@ export function createV2GitHubGitLedger({
         );
       }
       validateEvaluatedScopeAuthorityForAppend(
-        loaded.records,
+        loaded,
         normalized,
         evaluatedScopeReceipt,
         repo,
@@ -5226,6 +6899,724 @@ export function createV2GitHubGitLedger({
       );
     },
 
+    async appendCandidateInventoryCycleIfRequired(input) {
+      assertObject(input, "candidate inventory atomic append");
+      const privateMustPersistClaim =
+        consumeCandidateInventoryMustPersistClaim(this, input);
+      const mustPersist = privateMustPersistClaim !== null;
+      const {
+        workflow_command_handle,
+        trigger_identity,
+        repository_endpoint_receipt,
+        drift_attempts = [],
+        initial_inventory,
+        shard_receipts,
+        final_inventory,
+        final_shard_receipts,
+      } = input;
+      const command = await scheduledWorkflowCommandAuthority({
+        workflow_command_handle,
+        repository: repo,
+        trigger_identity,
+        pull_request_number: null,
+      });
+      const repositoryEndpointReceipt = normalizeRepositoryEndpointReceipt(
+        repository_endpoint_receipt,
+        repo,
+      );
+      const driftAttempts = normalizeCandidateInventoryDriftAttempts({
+        repository: repo,
+        attempts: drift_attempts,
+      });
+      const cycle = normalizeCandidateInventoryCycleAdmission({
+        repository: repo,
+        initial_inventory,
+        shard_receipts,
+        final_inventory,
+        final_shard_receipts,
+      });
+      validateCandidateInventoryAttemptChain(driftAttempts, cycle);
+      assertCandidateInventoryMustPersistClaimEvidence({
+        privateClaim: privateMustPersistClaim,
+        driftAttempts,
+        cycle,
+      });
+      const owner = candidateDispatchOwner(command.authority);
+      let loaded = await api.load();
+      rejectBootstrapCheckpointMutation(
+        loaded,
+        "candidate inventory append",
+      );
+      const alreadyPublished = candidateInventoryCycleAlreadyPublished(
+        loaded,
+        command.authority,
+        trigger_identity,
+        driftAttempts,
+        cycle,
+      );
+      if (alreadyPublished !== null) {
+        assertCandidateInventoryMustPersistClaimSource(
+          privateMustPersistClaim,
+          alreadyPublished.source_loaded,
+        );
+        const semanticChange = candidateInventoryCycleSemanticChanged(
+          alreadyPublished.previous_cycle_receipt,
+          cycle.cycle_receipt,
+        );
+        const suppression = candidateInventoryCycleSuppressionAuthority({
+          loaded: alreadyPublished.source_loaded,
+          commandAuthority: command.authority,
+          cycleReceipt: cycle.cycle_receipt,
+          previousCycleReceipt: alreadyPublished.previous_cycle_receipt,
+        });
+        const sourceLoaded = alreadyPublished.source_loaded;
+        const budget = candidateInventoryCycleCommitBudget({
+          state: "persist-required",
+          loaded: sourceLoaded,
+          driftAttempts,
+          cycle,
+        });
+        const projection = candidateInventoryCycleClassificationProjection({
+          state: "persist-required",
+          reason: alreadyPublished.current_publication
+            ? "candidate-inventory-already-current"
+            : "candidate-inventory-already-published-superseded",
+          semanticChange,
+          suppression,
+          budget,
+          driftAttempts,
+          cycle,
+          loaded: sourceLoaded,
+        });
+        return candidateInventoryCycleAppendResult({
+          appendReceipts: [],
+          publishedRecordCommitShas:
+            alreadyPublished.published_record_commit_shas,
+          loaded,
+          projection,
+        });
+      }
+      assertCandidateInventoryMustPersistClaimSource(
+        privateMustPersistClaim,
+        loaded,
+      );
+      validateCandidateInventoryCycleObservationBoundary(
+        [...driftAttempts, cycle],
+        loaded,
+      );
+      validateCandidateInventoryCycleAdmissionState(loaded);
+      const authority = loaded.authority_projection.candidate_inventory;
+      validateCandidateInventoryAdmissionPrior(
+        authority,
+        driftAttempts[0]?.initial_inventory ?? cycle.initial_inventory,
+      );
+      const previousCompletedReceipt = authority.completed_cycle
+        ?.cycle_receipt ?? null;
+      if (
+        previousCompletedReceipt !== null &&
+        Date.parse(cycle.cycle_receipt.observed_at) <
+          Date.parse(previousCompletedReceipt.observed_at)
+      ) {
+        throw ledgerError(
+          "candidate-inventory-cycle-time-regression",
+          "candidate inventory cycle boundary regressed behind durable authority",
+        );
+      }
+      const semanticChange = candidateInventoryCycleSemanticChanged(
+        previousCompletedReceipt,
+        cycle.cycle_receipt,
+      );
+      const suppression = candidateInventoryCycleSuppressionAuthority({
+        loaded,
+        commandAuthority: command.authority,
+        cycleReceipt: cycle.cycle_receipt,
+        previousCycleReceipt: previousCompletedReceipt,
+      });
+      const state = !mustPersist && driftAttempts.length === 0 &&
+          !semanticChange &&
+          suppression.safe_to_suppress
+        ? "suppress"
+        : "persist-required";
+      const budget = candidateInventoryCycleCommitBudget({
+        state,
+        loaded,
+        driftAttempts,
+        cycle,
+      });
+      const projection = candidateInventoryCycleClassificationProjection({
+        state,
+        reason: state === "suppress"
+          ? "semantic-unchanged-not-due"
+          : driftAttempts.length > 0
+            ? "candidate-inventory-drift"
+          : semanticChange
+            ? "semantic-change"
+            : suppression.reason,
+        semanticChange,
+        suppression,
+        budget,
+        driftAttempts,
+        cycle,
+        loaded,
+      });
+      if (state === "suppress") {
+        return candidateInventoryCycleAppendResult({
+          appendReceipts: [],
+          publishedRecordCommitShas: [],
+          loaded,
+          projection,
+        });
+      }
+      if (budget.remaining_ledger_commit_capacity_after_dispatch < 1) {
+        const freshEpochBudget =
+          candidateInventoryCycleCommitBudgetAtRecordCount({
+            state: "persist-required",
+            reachableRecordCount: 1,
+            driftAttempts,
+            cycle,
+          });
+        if (
+          freshEpochBudget.remaining_ledger_commit_capacity_after_dispatch < 1
+        ) {
+          throw ledgerError(
+            "candidate-inventory-cycle-commit-capacity",
+            "candidate inventory unit cannot fit one fresh checkpoint epoch",
+          );
+        }
+        const checkpointProjection =
+          candidateInventoryCycleClassificationProjection({
+            state: "checkpoint-required",
+            reason: "candidate-inventory-checkpoint-required",
+            semanticChange,
+            suppression,
+            budget,
+            driftAttempts,
+            cycle,
+            loaded,
+          });
+        const sourceLoadHandle = mintCheckpointSourceLoadHandle(loaded);
+        const nextUnitAdmissionHandle =
+          mintCheckpointNextUnitAdmissionHandle({
+            sourceLoadHandle,
+            commandAuthority: command.authority,
+            triggerIdentity: trigger_identity,
+            repositoryEndpointReceipt,
+            driftAttempts,
+            cycle,
+            projection: checkpointProjection,
+            currentEpochBudget: budget,
+            freshEpochBudget,
+          });
+        return candidateInventoryCheckpointRequiredResult({
+          sourceLoadHandle,
+          nextUnitAdmissionHandle,
+          projection: checkpointProjection,
+        });
+      }
+      const requestBudget = createRequestBudget();
+      const writeFence = await readRef({
+        fetchImpl,
+        authorization,
+        base,
+        repoPath,
+        ref,
+        refSuffix,
+        requestBudget,
+      });
+      if (writeFence.target_commit_sha !== loaded.tip_commit_sha) {
+        throw ledgerError(
+          "candidate-inventory-cycle-stale",
+          "candidate inventory source tip changed before object staging",
+        );
+      }
+      if (
+        Date.parse(cycle.cycle_receipt.observed_at) >
+          Date.parse(writeFence.server_time)
+      ) {
+        throw ledgerError(
+          "candidate-inventory-cycle-ref-boundary",
+          "candidate inventory cycle follows its final pre-staging ref fence",
+        );
+      }
+      const stagedRecords = [];
+      const stagedObjects = [];
+      const consumedJtis = new Set(loaded.records.map((entry) =>
+        provenanceReplayIdentity(entry.envelope.workflow_provenance)));
+      let predecessorCommitSha = loaded.tip_commit_sha;
+      const stageRecord = async (
+        record,
+        evaluatedScopeReceipt,
+        validateTransition,
+        candidateInventoryAttachment = null,
+      ) => {
+        const recordFence = await readRef({
+          fetchImpl,
+          authorization,
+          base,
+          repoPath,
+          ref,
+          refSuffix,
+          requestBudget,
+        });
+        const priorRecordTime = stagedRecords.at(-1)?.envelope
+          .server_observed_at ?? writeFence.server_time;
+        if (recordFence.target_commit_sha !== loaded.tip_commit_sha) {
+          throw ledgerError(
+            "candidate-inventory-cycle-stale",
+            "candidate inventory source tip changed during object staging",
+          );
+        }
+        if (
+          Date.parse(recordFence.server_time) < Date.parse(priorRecordTime)
+        ) {
+          throw ledgerError(
+            "candidate-inventory-cycle-ref-boundary",
+            "candidate inventory staging ref time regressed",
+          );
+        }
+        const authoritativeRecord = authoritativeRecordTime(
+          record,
+          recordFence.server_time,
+        );
+        const authoritativeTransitionRecord =
+          candidateInventoryAttachment === null
+            ? authoritativeRecord
+            : {
+              ...authoritativeRecord,
+              candidate_inventory_attachment_evidence:
+                structuredClone(candidateInventoryAttachment.evidence),
+            };
+        validateTransition(authoritativeTransitionRecord);
+        const provenance = await obtainWorkflowProvenance({
+          verifyWorkflowProvenance,
+          operation: authoritativeRecord.record_type,
+          repository: repo,
+          ledgerRef: ref,
+          predecessorCommitSha,
+          protectionReceiptDigest:
+            capability.protection.live_ruleset_receipt_digest,
+          source: sourceWorkflow(capability.controller_release),
+          effectScope: null,
+          evaluatedScopeReceipt,
+          recordIdentity: productionRecordIdentity(authoritativeRecord),
+          serverTime: authoritativeRecord.server_observed_at,
+          policy: capability.workflow_provenance_policy,
+          provenanceBudget: createVerifierBudget(),
+        });
+        assertUnusedProvenanceJti(consumedJtis, provenance.receipt);
+        const envelope = sealEnvelope({
+          repository: repo,
+          ledger_ref: ref,
+          record_type: authoritativeRecord.record_type,
+          sequence: loaded.records.length + stagedRecords.length,
+          pull_request: authoritativeRecord.pull_request,
+          head_ref_oid: authoritativeRecord.head_ref_oid,
+          base_ref_oid: authoritativeRecord.base_ref_oid,
+          potential_merge_commit_oid:
+            authoritativeRecord.potential_merge_commit_oid,
+          kind: authoritativeRecord.kind,
+          effect_id: authoritativeRecord.effect_id,
+          idempotency_key: authoritativeRecord.idempotency_key,
+          predecessor_commit_sha: predecessorCommitSha,
+          server_observed_at: authoritativeRecord.server_observed_at,
+          payload: authoritativeRecord.payload,
+          control_comment_binding: authoritativeRecord.control_comment_binding,
+          lease: authoritativeRecord.lease,
+          source_workflow: sourceWorkflow(capability.controller_release),
+          workflow_provenance: provenance.receipt,
+          workflow_provenance_jwt: provenance.compact_jwt,
+        });
+        const objects = await createCommitObjects({
+          fetchImpl,
+          authorization,
+          base,
+          repoPath,
+          envelope,
+          parents: [predecessorCommitSha],
+          requestBudget,
+          candidateInventoryAttachment,
+        });
+        stagedObjects.push(objects);
+        stagedRecords.push(deepFreeze({
+          commit_sha: objects.commit_sha,
+          parents: [predecessorCommitSha],
+          tree_sha: objects.tree_sha,
+          blob_sha: objects.blob_sha,
+          candidate_inventory_attachment_tree_sha:
+            candidateInventoryAttachment?.manifest.attachment_tree_sha ?? null,
+          envelope,
+          evidence: stagedCandidateInventoryObjectEvidence(objects),
+          ...(candidateInventoryAttachment === null ? {} : {
+            candidate_inventory_attachment_evidence:
+              structuredClone(candidateInventoryAttachment.evidence),
+          }),
+        }));
+        predecessorCommitSha = objects.commit_sha;
+      };
+      const publication = prepareCompactCandidateInventoryPublication({
+        authority: loaded.authority_projection.candidate_inventory,
+        commandAuthority: command.authority,
+        driftAttempts,
+        cycle,
+      });
+      const stagedInventoryState = candidateInventoryStateFromAuthority(
+        loaded.authority_projection.candidate_inventory,
+      );
+      const stageCandidateInventoryPhase = async ({
+        phase,
+        bundle = null,
+        priorAttempt = null,
+        attemptRecords = null,
+      }) => {
+        const stagedAuthority = buildCandidateInventoryAuthority(
+          repo,
+          stagedInventoryState,
+        );
+        const payload = compactCandidateInventoryPhasePayload({
+          authority: stagedAuthority,
+          owner,
+          publication,
+          phase,
+          bundle,
+          priorAttempt,
+          attemptRecords,
+        });
+        const record = createV2GitLedgerCandidateInventoryRecord({
+          predecessor_commit_sha: predecessorCommitSha,
+          owner,
+          server_observed_at: writeFence.server_time,
+          payload,
+        });
+        const evaluatedScopeReceipt =
+          createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
+            repository: repo,
+            payload,
+            trigger_identity,
+            repository_endpoint_receipt: repositoryEndpointReceipt,
+          });
+        await stageRecord(record, evaluatedScopeReceipt, (authoritative) => {
+          validateCandidateInventoryTransition(
+            [...loaded.records, ...stagedRecords],
+            authoritative,
+            repo,
+            { currentAuthority: stagedAuthority },
+          );
+        }, bundle);
+        const entry = stagedRecords.at(-1);
+        const normalizedPayload = validateV2GitLedgerCandidateInventoryPayload(
+          entry.envelope.payload,
+          { repository: repo },
+        );
+        validateAndApplyCandidateInventoryTransition({
+          payload: normalizedPayload,
+          repository: repo,
+          state: stagedInventoryState,
+          recordOid: entry.commit_sha,
+          recordServerTime: entry.envelope.server_observed_at,
+          attachmentEvidence:
+            entry.candidate_inventory_attachment_evidence ?? null,
+          apply: true,
+        });
+        stagedInventoryState.source_records.push(
+          candidateInventorySourceRecord(entry),
+        );
+        return entry;
+      };
+      await stageCandidateInventoryPhase({ phase: "cycle-start" });
+      const attemptRecords = [];
+      for (const bundle of publication.bundles) {
+        const entry = await stageCandidateInventoryPhase({
+          phase: "attempt",
+          bundle,
+          priorAttempt: attemptRecords.at(-1) ?? null,
+        });
+        attemptRecords.push({
+          record_oid: entry.commit_sha,
+          attempt_evidence_digest: bundle.manifest.attempt_evidence_digest,
+          attachment_manifest_digest: bundle.manifest.manifest_digest,
+          outcome: bundle.manifest.outcome,
+        });
+      }
+      await stageCandidateInventoryPhase({
+        phase: "cycle-complete",
+        attemptRecords,
+      });
+      const inventoryRecordCount = stagedRecords.length;
+      const inventoryChain = [...loaded.records, ...stagedRecords];
+      const inventoryBoundaryTime = stagedRecords.at(-1).envelope
+        .server_observed_at;
+      validateReachableChain(inventoryChain, inventoryBoundaryTime);
+      const inventoryState = projectChainState(
+        inventoryChain,
+        inventoryBoundaryTime,
+      );
+      const stagedCompleted = inventoryState.authority_projection
+        .candidate_inventory.completed_cycle;
+      if (
+        inventoryRecordCount !== budget.inventory_commit_budget_required ||
+        stagedCompleted?.cycle_id !== candidateInventoryCycleId(
+          cycle.initial_inventory,
+        ) ||
+        stagedCompleted.cycle_receipt.receipt_digest !==
+          cycle.cycle_receipt.receipt_digest ||
+        inventoryState.authority_projection.candidate_inventory
+          .incomplete_cycle !== null
+      ) {
+        throw ledgerError(
+          "candidate-inventory-cycle-staging-mismatch",
+          "staged candidate inventory is not one complete projected cycle",
+        );
+      }
+      const stagedCandidateAuthority = inventoryState.authority_projection
+        .candidate_inventory;
+      const stagedDispatchAuthority = inventoryState.authority_projection
+        .candidate_dispatch;
+      const reservation = createCandidateDispatchReservation({
+        repository: repo,
+        candidateAuthority: stagedCandidateAuthority,
+        dispatchAuthority: stagedDispatchAuthority,
+        sourceTipCommitSha: predecessorCommitSha,
+        reachableRecordCount: inventoryChain.length,
+        commandAuthority: command.authority,
+        triggerIdentity: trigger_identity,
+      });
+      let dispatchPayload;
+      if (reservation === null) {
+        const emptyCycle = newCandidateDispatchCycle({
+          repository: repo,
+          candidateAuthority: stagedCandidateAuthority,
+          completed: stagedCompleted,
+          candidates: [],
+          batchCount: 0,
+        });
+        dispatchPayload = createCandidateDispatchPayload({
+          phase: "cycle-complete",
+          dispatchAuthority: stagedDispatchAuthority,
+          candidateAuthority: stagedCandidateAuthority,
+          commandAuthority: command.authority,
+          triggerIdentity: trigger_identity,
+          cycleCompletion: createCandidateDispatchCycleCompletion(emptyCycle),
+        });
+      } else {
+        createCandidateDispatchPlan({
+          reservation,
+          acknowledgements: [],
+        });
+        dispatchPayload = createCandidateDispatchPayload({
+          phase: "reserve",
+          dispatchAuthority: stagedDispatchAuthority,
+          candidateAuthority: stagedCandidateAuthority,
+          commandAuthority: command.authority,
+          triggerIdentity: trigger_identity,
+          reservation,
+        });
+      }
+      const dispatchRecord = createV2GitLedgerCandidateDispatchRecord({
+        predecessor_commit_sha: predecessorCommitSha,
+        server_observed_at: writeFence.server_time,
+        payload: dispatchPayload,
+      });
+      await stageRecord(
+        dispatchRecord,
+        createV2GitLedgerCandidateDispatchEvaluatedScopeReceipt({
+          repository: repo,
+          payload: dispatchPayload,
+          trigger_identity,
+          repository_endpoint_receipt: repositoryEndpointReceipt,
+        }),
+        (authoritative) => {
+          validateCandidateDispatchTransition(
+            inventoryChain,
+            authoritative,
+            repo,
+          );
+        },
+      );
+      const candidateChain = [...loaded.records, ...stagedRecords];
+      const candidateBoundaryTime = stagedRecords.at(-1).envelope
+        .server_observed_at;
+      validateReachableChain(candidateChain, candidateBoundaryTime);
+      const stagedState = projectChainState(
+        candidateChain,
+        candidateBoundaryTime,
+      );
+      const stagedDispatch = stagedState.authority_projection
+        .candidate_dispatch.current_cycle;
+      if (
+        stagedRecords.length !== inventoryRecordCount + 1 ||
+        stagedDispatch?.generation_id !== candidateDispatchGenerationId(
+          repo,
+          stagedCompleted,
+        ) ||
+        (reservation === null
+          ? stagedDispatch.cycle_complete !== true
+          : stagedDispatch.active_reservation?.reservation
+            .reservation_digest !== reservation.reservation_digest)
+      ) {
+        throw ledgerError(
+          "candidate-inventory-cycle-staging-mismatch",
+          "staged inventory does not include its first dispatch authority",
+        );
+      }
+      const publicationFence = await readRef({
+        fetchImpl,
+        authorization,
+        base,
+        repoPath,
+        ref,
+        refSuffix,
+        requestBudget,
+      });
+      if (
+        publicationFence.target_commit_sha !== loaded.tip_commit_sha ||
+        Date.parse(publicationFence.server_time) < Date.parse(
+          stagedRecords.at(-1).envelope.server_observed_at,
+        )
+      ) {
+        throw ledgerError(
+          "candidate-inventory-cycle-stale",
+          "candidate inventory source changed before atomic publication",
+        );
+      }
+      let refUpdate = null;
+      let exact = null;
+      let publicationError = null;
+      try {
+        refUpdate = await updateRefStrict({
+          fetchImpl,
+          authorization,
+          base,
+          repoPath,
+          ref,
+          refSuffix,
+          shaValue: predecessorCommitSha,
+          requestBudget,
+        });
+      } catch (error) {
+        publicationError = error;
+      }
+      try {
+        exact = await readRef({
+          fetchImpl,
+          authorization,
+          base,
+          repoPath,
+          ref,
+          refSuffix,
+          requestBudget,
+        });
+      } catch (error) {
+        publicationError ??= error;
+      }
+      let reconciled;
+      try {
+        reconciled = await api.load();
+      } catch (error) {
+        if (publicationError !== null) throw publicationError;
+        throw error;
+      }
+      const stagedRecordCommitShas = stagedRecords.map(
+        ({ commit_sha: commitSha }) => commitSha,
+      );
+      const exactStagedPublication = refUpdate !== null && exact !== null &&
+        exact.target_commit_sha === predecessorCommitSha;
+      let published;
+      if (exactStagedPublication) {
+        const stagedStartIndex = reconciled.records.findIndex(
+          ({ commit_sha: commitSha }) =>
+            commitSha === stagedRecordCommitShas[0],
+        );
+        if (
+          stagedStartIndex < 0 ||
+          canonicalJson(reconciled.records
+            .slice(stagedStartIndex, stagedStartIndex + stagedRecords.length)
+            .map(({ commit_sha: commitSha }) => commitSha)) !==
+            canonicalJson(stagedRecordCommitShas)
+        ) {
+          throw ledgerError(
+            "candidate-inventory-cycle-reread-mismatch",
+            "successful candidate inventory update is absent from stable authority",
+          );
+        }
+        published = {
+          published_record_commit_shas: stagedRecordCommitShas,
+        };
+      } else {
+        published = candidateInventoryCycleAlreadyPublished(
+          reconciled,
+          command.authority,
+          trigger_identity,
+          driftAttempts,
+          cycle,
+        );
+      }
+      if (published === null) {
+        if (publicationError !== null) throw publicationError;
+        throw ledgerError(
+          "candidate-inventory-cycle-reread-mismatch",
+          "candidate inventory publication is absent from stable authority",
+        );
+      }
+      if (
+        refUpdate !== null &&
+        canonicalJson(published.published_record_commit_shas) !==
+          canonicalJson(stagedRecordCommitShas)
+      ) {
+        throw ledgerError(
+          "candidate-inventory-cycle-reread-mismatch",
+          "candidate inventory publication differs from the successful staged update",
+        );
+      }
+      loaded = reconciled;
+      const publishedTipIndex = loaded.records.findIndex(
+        ({ commit_sha: commitSha }) => commitSha ===
+          published.published_record_commit_shas.at(-1),
+      );
+      const rereadTipIndex = exact === null
+        ? -1
+        : loaded.records.findIndex(({ commit_sha: commitSha }) =>
+          commitSha === exact.target_commit_sha);
+      if (
+        publicationError !== null || refUpdate === null || exact === null ||
+        publishedTipIndex < 0 || rereadTipIndex !== publishedTipIndex
+      ) {
+        return candidateInventoryCycleAppendResult({
+          appendReceipts: [],
+          publishedRecordCommitShas:
+            published.published_record_commit_shas,
+          loaded,
+          projection,
+        });
+      }
+      const finalObjects = stagedObjects.at(-1);
+      const finalEnvelope = stagedRecords.at(-1).envelope;
+      const appendReceipt = sealAppendReceipt({
+        repository: repo,
+        ledger_ref: ref,
+        record_type: finalEnvelope.record_type,
+        sequence: finalEnvelope.sequence,
+        predecessor_commit_sha: finalEnvelope.predecessor_commit_sha,
+        commit_sha: finalObjects.commit_sha,
+        tree_sha: finalObjects.tree_sha,
+        blob_sha: finalObjects.blob_sha,
+        server_observed_at: finalEnvelope.server_observed_at,
+        payload_digest: finalEnvelope.payload_digest,
+        ref_update: captureReceipt(refUpdate),
+        ref_reread: refReceipt(exact),
+        capability_attestation_commit_sha:
+          loaded.capability.attestation_commit_sha,
+        protection_receipt_digest:
+          capability.protection.live_ruleset_receipt_digest,
+        stable: true,
+      });
+      return candidateInventoryCycleAppendResult({
+        appendReceipts: [appendReceipt],
+        publishedRecordCommitShas: stagedRecordCommitShas,
+        loaded,
+        projection,
+      });
+    },
+
     async appendCandidateInventory({
       predecessor_commit_sha,
       owner,
@@ -5361,7 +7752,222 @@ export function createV2GitHubGitLedger({
     bootstrapCapability: _bootstrapCapability,
     ...productionApi
   } = api;
-  return Object.freeze(productionApi);
+  const frozenProductionApi = Object.freeze(productionApi);
+  CHECKPOINT_DIAGNOSTIC_FACTORIES.set(frozenProductionApi, Object.freeze({
+    prepareCheckpointCandidateTransaction,
+    loadPreparedCheckpointTransaction,
+  }));
+  return frozenProductionApi;
+}
+
+function snapshotExactOwnDataProperties(value, expectedKeys, label) {
+  const actualKeys = safeReflectOwnKeys(value);
+  if (actualKeys.length !== expectedKeys.length) {
+    throw new TypeError(`${label} keys are invalid`);
+  }
+  for (let actualIndex = 0; actualIndex < actualKeys.length; actualIndex += 1) {
+    const actualKey = actualKeys[actualIndex];
+    if (typeof actualKey !== "string") {
+      throw new TypeError(`${label} keys are invalid`);
+    }
+    let matched = false;
+    for (
+      let expectedIndex = 0;
+      expectedIndex < expectedKeys.length;
+      expectedIndex += 1
+    ) {
+      if (actualKey === expectedKeys[expectedIndex]) {
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) throw new TypeError(`${label} keys are invalid`);
+  }
+  const snapshot = {};
+  for (let index = 0; index < expectedKeys.length; index += 1) {
+    const key = expectedKeys[index];
+    const descriptor = safeGetOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined || !("value" in descriptor) ||
+      descriptor.enumerable !== true
+    ) {
+      throw new TypeError(
+        `${label} requires own data properties that are enumerable`,
+      );
+    }
+    snapshot[key] = descriptor.value;
+  }
+  return snapshot;
+}
+
+function normalizeCandidateSuppressionEvidenceAdapter(value) {
+  if (value === null) return null;
+  assertObject(value, "candidateSuppressionEvidenceAdapter");
+  const snapshot = snapshotExactOwnDataProperties(value, [
+    "schema", "schema_version", "configuration_digest",
+    "collectCurrentOpenProjection",
+  ], "candidate suppression evidence adapter");
+  if (
+    snapshot.schema !==
+      V2_GIT_LEDGER_CANDIDATE_SUPPRESSION_EVIDENCE_ADAPTER_SCHEMA ||
+    snapshot.schema_version !== 1 ||
+    typeof snapshot.collectCurrentOpenProjection !== "function"
+  ) {
+    throw new TypeError(
+      "candidate suppression evidence adapter is invalid",
+    );
+  }
+  digest(
+    snapshot.configuration_digest,
+    "candidate suppression evidence adapter configuration digest",
+  );
+  const collectCurrentOpenProjection = snapshot.collectCurrentOpenProjection;
+  return Object.freeze({
+    configuration_digest: snapshot.configuration_digest,
+    collect_current_open_projection: () => collectCurrentOpenProjection(),
+  });
+}
+
+function normalizeCandidateInventoryRefreshAdapter(value) {
+  if (value === null) return null;
+  assertObject(value, "candidateInventoryRefreshAdapter");
+  const snapshot = snapshotExactOwnDataProperties(value, [
+    "schema", "schema_version", "configuration_digest",
+    "collectCurrentOpenProjection", "collectCandidateInventoryAttempt",
+  ], "candidate inventory refresh adapter");
+  if (
+    snapshot.schema !== V2_GIT_LEDGER_CANDIDATE_REFRESH_ADAPTER_SCHEMA ||
+    snapshot.schema_version !== 1 ||
+    typeof snapshot.collectCurrentOpenProjection !== "function" ||
+    typeof snapshot.collectCandidateInventoryAttempt !== "function"
+  ) {
+    throw new TypeError("candidate inventory refresh adapter is invalid");
+  }
+  digest(
+    snapshot.configuration_digest,
+    "candidate inventory refresh adapter configuration digest",
+  );
+  const collectCurrentOpenProjection = snapshot.collectCurrentOpenProjection;
+  const collectCandidateInventoryAttempt =
+    snapshot.collectCandidateInventoryAttempt;
+  return Object.freeze({
+    configuration_digest: snapshot.configuration_digest,
+    collect_current_open_projection: () => safeReflectApply(
+      collectCurrentOpenProjection,
+      undefined,
+      [],
+    ),
+    collect_candidate_inventory_attempt: (request) => safeReflectApply(
+      collectCandidateInventoryAttempt,
+      undefined,
+      [request],
+    ),
+  });
+}
+
+function normalizeCandidateRefreshReconciliationInput(value, repository) {
+  assertObject(value, "candidate refresh reconciliation input");
+  const expectedKeys = [
+    "workflow_command_handle",
+    "trigger_identity",
+    "repository_endpoint_receipt",
+  ];
+  const snapshot = snapshotExactOwnDataProperties(
+    value,
+    expectedKeys,
+    "candidate refresh reconciliation input",
+  );
+  return deepFreeze({
+    workflow_command_handle: snapshot.workflow_command_handle,
+    trigger_identity: normalizeCandidateDispatchTriggerIdentity(
+      snapshot.trigger_identity,
+    ),
+    repository_endpoint_receipt: normalizeRepositoryEndpointReceipt(
+      snapshot.repository_endpoint_receipt,
+      repository,
+    ),
+  });
+}
+
+function normalizeCandidateFullRefreshResult(value, {
+  repository,
+  requestHandle,
+  attemptIndex,
+  expectedInitialInventory,
+}) {
+  assertObject(value, "candidate full refresh result");
+  const expectedKeys = [
+    "schema", "schema_version", "request_handle", "attempt_index",
+    "initial_inventory", "shard_receipts", "final_inventory",
+    "final_shard_receipts",
+  ];
+  const snapshot = snapshotExactOwnDataProperties(
+    value,
+    expectedKeys,
+    "candidate full refresh result",
+  );
+  if (
+    snapshot.schema !== V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_RESULT_SCHEMA ||
+    snapshot.schema_version !== 1 ||
+    snapshot.request_handle !== requestHandle ||
+    snapshot.attempt_index !== attemptIndex
+  ) {
+    throw ledgerError(
+      "UNTRUSTED_CANDIDATE_FULL_REFRESH_RESULT",
+      "candidate full refresh must return this invocation's exact request handle",
+    );
+  }
+  const evidence = normalizeCandidateInventoryCycleEvidence({
+    repository,
+    initial_inventory: snapshot.initial_inventory,
+    shard_receipts: snapshot.shard_receipts,
+    final_inventory: snapshot.final_inventory,
+    final_shard_receipts: snapshot.final_shard_receipts,
+  });
+  if (
+    expectedInitialInventory !== null &&
+    canonicalJson(evidence.initial_inventory) !==
+      canonicalJson(expectedInitialInventory)
+  ) {
+    throw ledgerError(
+      "candidate-inventory-drift-continuation",
+      "candidate full refresh attempt did not retain the prior final scan",
+    );
+  }
+  return evidence;
+}
+
+function assertCandidateRefreshObservationBeforeLedgerFence(
+  projection,
+  loaded,
+) {
+  const completedAt = projection.receipt.observation_window.completed_at;
+  if (Date.parse(completedAt) > Date.parse(loaded.pre_ref.server_time)) {
+    throw ledgerError(
+      "candidate-refresh-observation-after-ledger-fence",
+      "current-open observation completed after its durable ledger pre-read boundary",
+    );
+  }
+}
+
+/**
+ * Diagnostic-only Phase B+C adapter. It is not part of the production ledger
+ * API and cannot publish a prepared transaction or update the protected ref.
+ */
+export function createV2GitLedgerCheckpointDiagnosticAdapter(productionApi) {
+  const binding = CHECKPOINT_DIAGNOSTIC_FACTORIES.get(productionApi);
+  if (binding === undefined) {
+    throw ledgerError(
+      "UNTRUSTED_CHECKPOINT_DIAGNOSTIC_SOURCE",
+      "checkpoint diagnostics require one exact production ledger factory",
+    );
+  }
+  return Object.freeze({
+    prepareCheckpointCandidateTransaction: (input) =>
+      binding.prepareCheckpointCandidateTransaction(input),
+    loadPreparedCheckpointTransaction: (result) =>
+      binding.loadPreparedCheckpointTransaction(result),
+  });
 }
 
 /**
@@ -5380,6 +7986,8 @@ export function createV2GitHubGitLedgerBootstrap({
   verifyWorkflowProvenance,
   httpLimits = V2_GIT_LEDGER_HTTP_LIMITS,
   provenanceTimeoutMs = V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS,
+  candidateSuppressionEvidenceAdapter = null,
+  candidateInventoryRefreshAdapter = null,
 }) {
   const repo = normalizeRepository(repository);
   const ref = normalizeLedgerRef(ledgerRef);
@@ -5390,6 +7998,48 @@ export function createV2GitHubGitLedgerBootstrap({
   if (typeof verifyWorkflowProvenance !== "function") {
     throw new TypeError("Git ledger bootstrap requires verifyWorkflowProvenance");
   }
+  const capturedLegacyCandidateSuppressionAdapter =
+    normalizeCandidateSuppressionEvidenceAdapter(
+      candidateSuppressionEvidenceAdapter,
+    );
+  const capturedCandidateRefreshAdapter =
+    normalizeCandidateInventoryRefreshAdapter(
+      candidateInventoryRefreshAdapter,
+    );
+  if (
+    capturedLegacyCandidateSuppressionAdapter !== null &&
+    capturedCandidateRefreshAdapter !== null
+  ) {
+    throw new TypeError(
+      "Git ledger accepts one candidate refresh evidence adapter",
+    );
+  }
+  const sealedLegacyCandidateSuppressionAdapter =
+    capturedLegacyCandidateSuppressionAdapter === null
+      ? null
+      : Object.freeze({
+        schema:
+          V2_GIT_LEDGER_CANDIDATE_SUPPRESSION_EVIDENCE_ADAPTER_SCHEMA,
+        schema_version: 1,
+        configuration_digest:
+          capturedLegacyCandidateSuppressionAdapter.configuration_digest,
+        collectCurrentOpenProjection:
+          capturedLegacyCandidateSuppressionAdapter
+            .collect_current_open_projection,
+      });
+  const sealedCandidateRefreshAdapter =
+    capturedCandidateRefreshAdapter === null
+      ? null
+      : Object.freeze({
+        schema: V2_GIT_LEDGER_CANDIDATE_REFRESH_ADAPTER_SCHEMA,
+        schema_version: 1,
+        configuration_digest:
+          capturedCandidateRefreshAdapter.configuration_digest,
+        collectCurrentOpenProjection:
+          capturedCandidateRefreshAdapter.collect_current_open_projection,
+        collectCandidateInventoryAttempt:
+          capturedCandidateRefreshAdapter.collect_candidate_inventory_attempt,
+      });
   return deepFreeze({
     async bootstrapCapability() {
       const ledger = createV2GitHubGitLedger({
@@ -5429,6 +8079,9 @@ export function createV2GitHubGitLedgerBootstrap({
         verifyWorkflowProvenance,
         httpLimits,
         provenanceTimeoutMs,
+        candidateSuppressionEvidenceAdapter:
+          sealedLegacyCandidateSuppressionAdapter,
+        candidateInventoryRefreshAdapter: sealedCandidateRefreshAdapter,
       });
       return deepFreeze({
         bootstrap_receipt: bootstrapReceipt,
@@ -7477,6 +10130,43 @@ async function scheduledWorkflowCommandAuthority({
   });
 }
 
+async function candidateRefreshWorkflowCommandAuthority({
+  workflow_command_handle: workflowCommandHandle,
+  repository,
+  trigger_identity: triggerIdentity,
+}) {
+  const module = await import("./workflow-command.mjs");
+  if (typeof module.assertV2WorkflowCommandHandle !== "function") {
+    throw ledgerError(
+      "workflow-command-authority-unavailable",
+      "candidate refresh requires the protected workflow-command adapter",
+    );
+  }
+  const command = module.assertV2WorkflowCommandHandle(workflowCommandHandle);
+  const scheduled = await scheduledWorkflowCommandAuthority({
+    workflow_command_handle: workflowCommandHandle,
+    repository,
+    trigger_identity: triggerIdentity,
+    pull_request_number: command.pull_request.number,
+    expected_dispatch_binding: command.dispatch_binding,
+  });
+  if (
+    command.pull_request.number !== null ||
+    command.dispatch_binding !== null
+  ) {
+    return deepFreeze({
+      ...scheduled,
+      suppression_eligible: false,
+      reason: "candidate-refresh-trigger-in-scope",
+    });
+  }
+  return deepFreeze({
+    ...scheduled,
+    suppression_eligible: true,
+    reason: null,
+  });
+}
+
 async function scheduledRecoveryWorkflowCommandAuthority({
   workflow_command_handle: workflowCommandHandle,
   repository,
@@ -8436,11 +11126,21 @@ export function createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
     payloadValue,
     { repository },
   );
-  const evidence = payload.phase === "cycle-start"
-    ? payload.initial_inventory
-    : payload.phase === "shard"
-      ? payload.shard_receipt
-      : payload.cycle_receipt;
+  const compact = payload.schema_version === 2;
+  const evidence = compact
+    ? {
+      receipt_digest: payload.phase === "cycle-start"
+        ? payload.refresh_id
+        : payload.phase === "attempt"
+          ? payload.attempt_evidence_digest
+          : payload.stable_cycle_receipt_digest,
+      observed_at: payload.observed_at,
+    }
+    : payload.phase === "cycle-start"
+      ? payload.initial_inventory
+      : payload.phase === "shard"
+        ? payload.shard_receipt
+        : payload.cycle_receipt;
   return createV2GitLedgerEvaluatedScopeReceipt({
     relation: "scheduled-repository-inventory",
     repository,
@@ -8450,11 +11150,14 @@ export function createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
     inventory_receipt: {
       phase: payload.phase,
       cycle_id: payload.cycle_id,
-      initial_inventory_receipt_digest:
-        payload.initial_inventory_receipt_digest,
-      shard_index: payload.phase === "shard"
-        ? payload.shard_receipt.shard_index
-        : null,
+      initial_inventory_receipt_digest: compact
+        ? payload.first_initial_inventory_receipt_digest
+        : payload.initial_inventory_receipt_digest,
+      shard_index: compact && payload.phase === "attempt"
+        ? payload.attempt_index
+        : payload.phase === "shard"
+          ? payload.shard_receipt.shard_index
+          : null,
       evidence_receipt_digest: evidence.receipt_digest,
       observed_at: evidence.observed_at,
     },
@@ -8575,15 +11278,44 @@ function scheduledPullRequestInventoryReceipt(
       "scheduled PR scope is not one current open candidate exact GET",
     );
   }
-  const candidate = authority.open_pr_discovery.candidates.find((item) =>
+  const observedCandidate = normalizeCandidateInventoryIdentity({
+    id: observation.id,
+    node_id: observation.node_id,
+    number: observation.number,
+    created_at: observation.created_at,
+  });
+  const durableCandidate = authority.open_pr_discovery.candidates.find((item) =>
     item.number === scope.pull_request.number &&
     item.node_id === scope.pull_request.node_id);
-  if (candidate === undefined) {
+  const completed = authority.completed_cycle;
+  const finalInventory = completed.final_inventory;
+  const compactSummaryOnly =
+    completed.compact_publication !== undefined &&
+    completed.compact_publication !== null &&
+    canonicalJson(finalInventory) === canonicalJson({
+      receipt_digest:
+        completed.cycle_receipt.final_inventory_receipt_digest,
+    });
+  if (
+    durableCandidate === undefined && !compactSummaryOnly ||
+    durableCandidate !== undefined &&
+      canonicalJson(durableCandidate) !== canonicalJson(observedCandidate)
+  ) {
     throw ledgerError(
       "candidate-inventory-scope-mismatch",
       "scheduled PR scope is absent from the durable candidate superset",
     );
   }
+  if (
+    finalInventory.candidate_digest !== undefined &&
+    finalInventory.candidate_digest !== completed.cycle_receipt.candidate_digest
+  ) {
+    throw ledgerError(
+      "candidate-inventory-scope-mismatch",
+      "scheduled PR scope changed its durable candidate inventory digest",
+    );
+  }
+  const candidate = durableCandidate ?? observedCandidate;
   assertObject(dispatchAuthority, "candidate dispatch authority");
   if (
     dispatchAuthority.schema !==
@@ -8642,26 +11374,19 @@ function scheduledPullRequestInventoryReceipt(
     selected_observation_raw_body_sha256:
       observation.endpoint_receipt.raw_body_sha256,
     server_time: observation.endpoint_receipt.server_time,
-    inventory_digest:
-      authority.completed_cycle.final_inventory.candidate_digest,
+    inventory_digest: completed.cycle_receipt.candidate_digest,
   };
 }
 
 function validateEvaluatedScopeAuthorityForAppend(
-  records,
+  loaded,
   record,
   receipt,
   repository,
 ) {
   if (receipt.relation === "scheduled-pull-request") {
-    const authority = deriveV2GitLedgerCandidateInventoryAuthority(
-      records,
-      repository,
-    );
-    const dispatchAuthority = deriveV2GitLedgerCandidateDispatchAuthority(
-      records,
-      repository,
-    );
+    const authority = loaded.authority_projection.candidate_inventory;
+    const dispatchAuthority = loaded.authority_projection.candidate_dispatch;
     validateScheduledPullRequestInventoryBinding(
       authority,
       dispatchAuthority,
@@ -8670,7 +11395,7 @@ function validateEvaluatedScopeAuthorityForAppend(
       repository,
     );
   }
-  const activeLease = projectedActiveLease(records);
+  const activeLease = projectedActiveLease(loaded.records);
   validateEvaluatedScopeLeaseLineage(record, receipt, activeLease);
 }
 
@@ -8908,6 +11633,12 @@ export function validateV2GitLedgerCandidateInventoryPayload(
   expected = null,
 ) {
   assertObject(value, "candidate inventory ledger payload");
+  if (value.schema_version === 2) {
+    return validateV2GitLedgerCompactCandidateInventoryPayload(
+      value,
+      expected,
+    );
+  }
   exactKeys(value, [
     "schema", "schema_version", "phase", "cycle_id", "owner",
     "prior_candidate_authority_digest", "supersedes_incomplete_cycle_id",
@@ -9009,30 +11740,255 @@ export function validateV2GitLedgerCandidateInventoryPayload(
   return deepFreeze(structuredClone(value));
 }
 
+function candidateInventoryCycleSummary(cycleReceiptValue) {
+  const cycleReceipt = validateV2CandidateCycleReceipt(cycleReceiptValue);
+  const withoutDigest = {
+    schema: "codex-review-gate-git-ledger-candidate-inventory-cycle-summary-v2",
+    schema_version: 1,
+    repository: structuredClone(cycleReceipt.repository),
+    initial_inventory_receipt_digest:
+      cycleReceipt.initial_inventory_receipt_digest,
+    final_inventory_receipt_digest:
+      cycleReceipt.final_inventory_receipt_digest,
+    candidate_digest: cycleReceipt.candidate_digest,
+    lifecycle_projection_digest: cycleReceipt.lifecycle_projection_digest,
+    observed_at: cycleReceipt.observed_at,
+    open_pull_requests: structuredClone(cycleReceipt.open_pull_requests),
+    receipt_digest: cycleReceipt.receipt_digest,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    summary_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-cycle-summary",
+      withoutDigest,
+    ),
+  });
+}
+
+function validateCandidateInventoryCycleSummary(value, repositoryValue) {
+  assertObject(value, "candidate inventory cycle summary");
+  exactKeys(value, [
+    "schema", "schema_version", "repository",
+    "initial_inventory_receipt_digest", "final_inventory_receipt_digest",
+    "candidate_digest", "lifecycle_projection_digest", "observed_at",
+    "open_pull_requests", "receipt_digest", "summary_digest",
+  ], "candidate inventory cycle summary");
+  if (
+    value.schema !==
+      "codex-review-gate-git-ledger-candidate-inventory-cycle-summary-v2" ||
+    value.schema_version !== 1 ||
+    canonicalJson(normalizeCandidateRepository(value.repository)) !==
+      canonicalJson(Object.hasOwn(repositoryValue, "owner_id")
+        ? candidateRepository(repositoryValue)
+        : normalizeCandidateRepository(repositoryValue))
+  ) {
+    throw new Error("candidate inventory cycle summary schema/scope is invalid");
+  }
+  for (const field of [
+    "initial_inventory_receipt_digest", "final_inventory_receipt_digest",
+    "candidate_digest", "lifecycle_projection_digest", "receipt_digest",
+  ]) {
+    digest(value[field], `candidate inventory cycle summary.${field}`);
+  }
+  timestamp(value.observed_at, "candidate inventory cycle summary.observed_at");
+  if (!Array.isArray(value.open_pull_requests) ||
+      value.open_pull_requests.length > MAX_V2_CANDIDATE_DISPATCH_CYCLE_ITEMS) {
+    throw new Error("candidate inventory cycle summary open candidates are not bounded");
+  }
+  const numbers = new Set();
+  for (const [index, candidate] of value.open_pull_requests.entries()) {
+    assertObject(candidate, `candidate inventory cycle summary candidate ${index}`);
+    // The canonical candidate-cycle validator is the authority for this shape;
+    // the summary keeps the exact values and independently enforces uniqueness.
+    const number = positiveInteger(
+      candidate.number,
+      `candidate inventory cycle summary candidate ${index}.number`,
+    );
+    if (numbers.has(number)) {
+      throw new Error("candidate inventory cycle summary duplicates one PR");
+    }
+    numbers.add(number);
+  }
+  const { summary_digest: _summaryDigest, ...withoutDigest } = value;
+  if (value.summary_digest !== digestCanonical(
+    "codex-review-gate-v2-candidate-inventory-cycle-summary",
+    withoutDigest,
+  )) {
+    throw new Error("candidate inventory cycle summary digest is invalid");
+  }
+  return deepFreeze(structuredClone(value));
+}
+
+function validateV2GitLedgerCompactCandidateInventoryPayload(
+  value,
+  expected,
+) {
+  exactKeys(value, [
+    "schema", "schema_version", "phase", "refresh_id", "cycle_id", "owner",
+    "prior_candidate_authority_digest", "supersedes_incomplete_cycle_id",
+    "evaluation_command_authority", "attempt_count",
+    "expected_attempt_evidence_digests",
+    "first_initial_inventory_receipt_digest", "stable_cycle_receipt_digest",
+    "observed_at",
+    "attempt_index", "outcome", "prior_attempt_record_oid",
+    "prior_attempt_evidence_digest", "prior_attempt_manifest_digest",
+    "attempt_evidence_digest", "attachment_manifest", "attempt_records",
+    "stable_cycle_summary",
+  ], "compact candidate inventory ledger payload");
+  if (
+    value.schema !== V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA ||
+    value.schema_version !== 2 ||
+    !new Set(["cycle-start", "attempt", "cycle-complete"])
+      .has(value.phase) ||
+    !CANDIDATE_CYCLE_ID.test(value.cycle_id)
+  ) {
+    throw new Error("compact candidate inventory payload schema is unsupported");
+  }
+  digest(value.refresh_id, "compact candidate inventory refresh_id");
+  normalizeLeaseOwner(value.owner);
+  digest(value.prior_candidate_authority_digest,
+    "compact candidate inventory prior authority digest");
+  if (value.supersedes_incomplete_cycle_id !== null &&
+      !CANDIDATE_CYCLE_ID.test(value.supersedes_incomplete_cycle_id)) {
+    throw new Error("compact candidate inventory superseded cycle id is invalid");
+  }
+  const evaluationCommand = normalizeCandidateDispatchEvaluationAuthority(
+    value.evaluation_command_authority,
+  );
+  const attemptCount = positiveInteger(
+    value.attempt_count,
+    "compact candidate inventory attempt_count",
+  );
+  if (attemptCount > MAX_V2_CANDIDATE_SCAN_PASSES ||
+      !Array.isArray(value.expected_attempt_evidence_digests) ||
+      value.expected_attempt_evidence_digests.length !== attemptCount) {
+    throw new Error("compact candidate inventory attempt set is not closed");
+  }
+  value.expected_attempt_evidence_digests.forEach((entry, index) =>
+    digest(entry, `compact candidate inventory expected attempt ${index}`));
+  digest(value.first_initial_inventory_receipt_digest,
+    "compact candidate inventory first initial receipt digest");
+  digest(value.stable_cycle_receipt_digest,
+    "compact candidate inventory stable cycle receipt digest");
+  timestamp(value.observed_at, "compact candidate inventory observed_at");
+  let repository = normalizeCandidateRepository(
+    expected?.repository === undefined
+      ? evaluationCommand.repository
+      : candidateRepository(expected.repository),
+  );
+  if (value.phase === "cycle-start") {
+    if (
+      value.attempt_index !== null || value.outcome !== null ||
+      value.prior_attempt_record_oid !== null ||
+      value.prior_attempt_evidence_digest !== null ||
+      value.prior_attempt_manifest_digest !== null ||
+      value.attempt_evidence_digest !== null ||
+      value.attachment_manifest !== null || value.attempt_records !== null ||
+      value.stable_cycle_summary !== null
+    ) {
+      throw new Error("compact candidate inventory start fields are not closed");
+    }
+  } else if (value.phase === "attempt") {
+    const manifest = validateCandidateInventoryAttachmentManifest(
+      value.attachment_manifest,
+    );
+    repository = manifest.repository;
+    if (
+      value.supersedes_incomplete_cycle_id !== null ||
+      value.attempt_index !== manifest.attempt_index ||
+      value.attempt_count !== manifest.attempt_count ||
+      value.outcome !== manifest.outcome ||
+      value.attempt_evidence_digest !== manifest.attempt_evidence_digest ||
+      value.observed_at !== manifest.artifacts.at(-1).observed_at ||
+      value.expected_attempt_evidence_digests[value.attempt_index] !==
+        value.attempt_evidence_digest ||
+      value.attempt_records !== null || value.stable_cycle_summary !== null ||
+      (value.attempt_index === 0) !==
+        (value.prior_attempt_record_oid === null &&
+          value.prior_attempt_evidence_digest === null &&
+          value.prior_attempt_manifest_digest === null)
+    ) {
+      throw new Error("compact candidate inventory attempt fields are not closed");
+    }
+    if (value.attempt_index > 0) {
+      sha(value.prior_attempt_record_oid,
+        "compact candidate inventory prior attempt record oid");
+      digest(value.prior_attempt_evidence_digest,
+        "compact candidate inventory prior attempt evidence digest");
+      digest(value.prior_attempt_manifest_digest,
+        "compact candidate inventory prior attempt manifest digest");
+    }
+  } else {
+    if (
+      value.supersedes_incomplete_cycle_id !== null ||
+      value.attempt_index !== null || value.outcome !== null ||
+      value.prior_attempt_record_oid !== null ||
+      value.prior_attempt_evidence_digest !== null ||
+      value.prior_attempt_manifest_digest !== null ||
+      value.attempt_evidence_digest !== null ||
+      value.attachment_manifest !== null ||
+      !Array.isArray(value.attempt_records) ||
+      value.attempt_records.length !== attemptCount ||
+      value.stable_cycle_summary === null
+    ) {
+      throw new Error("compact candidate inventory completion fields are not closed");
+    }
+    value.attempt_records.forEach((entry, index) => {
+      assertObject(entry, `compact candidate inventory attempt record ${index}`);
+      exactKeys(entry, [
+        "record_oid", "attempt_evidence_digest", "attachment_manifest_digest",
+        "outcome",
+      ], `compact candidate inventory attempt record ${index}`);
+      sha(entry.record_oid,
+        `compact candidate inventory attempt record ${index}.record_oid`);
+      digest(entry.attempt_evidence_digest,
+        `compact candidate inventory attempt record ${index}.evidence_digest`);
+      digest(entry.attachment_manifest_digest,
+        `compact candidate inventory attempt record ${index}.manifest_digest`);
+      if (entry.attempt_evidence_digest !==
+          value.expected_attempt_evidence_digests[index] ||
+          (index === attemptCount - 1) !== (entry.outcome === "stable")) {
+        throw new Error("compact candidate inventory attempt record order is invalid");
+      }
+    });
+    const summary = validateCandidateInventoryCycleSummary(
+      value.stable_cycle_summary,
+      repository,
+    );
+    repository = summary.repository;
+    if (
+      summary.receipt_digest !== value.stable_cycle_receipt_digest ||
+      value.observed_at !== summary.observed_at ||
+      value.cycle_id !== `candidate-cycle:${
+        summary.initial_inventory_receipt_digest.slice("sha256:".length)}`
+    ) {
+      throw new Error("compact candidate inventory completion summary is inconsistent");
+    }
+  }
+  if (canonicalJson(normalizeCandidateRepository(repository)) !==
+      canonicalJson(expected?.repository === undefined
+        ? normalizeCandidateRepository(repository)
+        : candidateRepository(expected.repository))) {
+    throw new Error("compact candidate inventory payload belongs to another repository");
+  }
+  return deepFreeze(structuredClone(value));
+}
+
 function validateCandidateEvaluatedScopeBinding(record, receipt) {
   if (record.record_type !== "candidate-inventory-observation") return;
   const payload = validateV2GitLedgerCandidateInventoryPayload(record.payload);
-  const evidence = payload.phase === "cycle-start"
-    ? payload.initial_inventory
-    : payload.phase === "shard"
-      ? payload.shard_receipt
-      : payload.cycle_receipt;
-  const expectedInventoryReceipt = {
-    phase: payload.phase,
-    cycle_id: payload.cycle_id,
-    initial_inventory_receipt_digest:
-      payload.initial_inventory_receipt_digest,
-    shard_index: payload.phase === "shard"
-      ? payload.shard_receipt.shard_index
-      : null,
-    evidence_receipt_digest: evidence.receipt_digest,
-    observed_at: evidence.observed_at,
-  };
+  const expected = createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
+    repository: receipt.repository,
+    payload,
+    trigger_identity: {
+      event_name: receipt.trigger_event_name,
+      ref: receipt.trigger_ref,
+      sha: receipt.trigger_sha,
+    },
+    repository_endpoint_receipt: receipt.scope_endpoint_receipt,
+  });
   if (
-    receipt.relation !== "scheduled-repository-inventory" ||
-    receipt.scope !== null || receipt.selector !== null ||
-    canonicalJson(receipt.inventory_receipt) !==
-      canonicalJson(expectedInventoryReceipt)
+    canonicalJson(receipt) !== canonicalJson(expected)
   ) {
     throw new Error(
       "candidate inventory record differs from its evaluated repository evidence",
@@ -9060,6 +12016,1059 @@ function validateCandidateDispatchEvaluatedScopeBinding(record, receipt) {
   }
 }
 
+function normalizeCandidateInventoryCycleAdmission({
+  repository,
+  initial_inventory: initialInventoryValue,
+  shard_receipts: shardReceiptValues,
+  final_inventory: finalInventoryValue,
+  final_shard_receipts: finalShardReceiptValues,
+}) {
+  const evidence = normalizeCandidateInventoryCycleEvidence({
+    repository,
+    initial_inventory: initialInventoryValue,
+    shard_receipts: shardReceiptValues,
+    final_inventory: finalInventoryValue,
+    final_shard_receipts: finalShardReceiptValues,
+  });
+  const cycleReceipt = finalizeV2CandidateInventoryCycle({
+    initial_inventory: evidence.initial_inventory,
+    shard_receipts: evidence.shard_receipts,
+    final_inventory: evidence.final_inventory,
+    final_shard_receipts: evidence.final_shard_receipts,
+  });
+  if (
+    cycleReceipt.open_pull_requests.length >
+      MAX_V2_CANDIDATE_DISPATCH_CYCLE_ITEMS
+  ) {
+    throw ledgerError(
+      "candidate-inventory-dispatch-cycle-size",
+      "candidate inventory completion exceeds the bounded dispatch cycle",
+    );
+  }
+  return deepFreeze({
+    ...structuredClone(evidence),
+    cycle_receipt: structuredClone(cycleReceipt),
+    drift_code: null,
+  });
+}
+
+function normalizeCandidateInventoryCycleEvidence({
+  repository,
+  initial_inventory: initialInventoryValue,
+  shard_receipts: shardReceiptValues,
+  final_inventory: finalInventoryValue,
+  final_shard_receipts: finalShardReceiptValues,
+}) {
+  const expectedRepository = candidateRepository(repository);
+  const initialInventory = validateV2CandidateInventory(
+    initialInventoryValue,
+    expectedRepository,
+  );
+  const finalInventory = validateV2CandidateInventory(
+    finalInventoryValue,
+    expectedRepository,
+  );
+  if (!Array.isArray(shardReceiptValues) ||
+      shardReceiptValues.length !== initialInventory.shards.length ||
+      !Array.isArray(finalShardReceiptValues) ||
+      finalShardReceiptValues.length !== finalInventory.shards.length) {
+    throw ledgerError(
+      "candidate-inventory-cycle-shards",
+      "candidate inventory cycle requires every ordered shard receipt",
+    );
+  }
+  const shardReceipts = shardReceiptValues.map((value, index) => {
+    const receipt = validateV2CandidateShardReceipt(value, initialInventory);
+    if (receipt.shard_index !== index) {
+      throw ledgerError(
+        "candidate-inventory-cycle-shards",
+        "candidate inventory initial shard receipts are not canonical",
+      );
+    }
+    return receipt;
+  });
+  const finalShardReceipts = finalShardReceiptValues.map((value, index) => {
+    const receipt = validateV2CandidateShardReceipt(value, finalInventory);
+    if (receipt.shard_index !== index) {
+      throw ledgerError(
+        "candidate-inventory-cycle-shards",
+        "candidate inventory final shard receipts are not canonical",
+      );
+    }
+    return receipt;
+  });
+  return deepFreeze({
+    initial_inventory: structuredClone(initialInventory),
+    shard_receipts: structuredClone(shardReceipts),
+    final_inventory: structuredClone(finalInventory),
+    final_shard_receipts: structuredClone(finalShardReceipts),
+  });
+}
+
+function normalizeCandidateInventoryDriftAttempts({ repository, attempts }) {
+  if (!Array.isArray(attempts) ||
+      attempts.length >= MAX_V2_CANDIDATE_SCAN_PASSES) {
+    throw ledgerError(
+      "candidate-inventory-drift-attempts",
+      "candidate inventory drift attempts exceed the bounded scan profile",
+    );
+  }
+  return deepFreeze(attempts.map((attempt, index) => {
+    const evidence = normalizeCandidateInventoryCycleEvidence({
+      repository,
+      ...attempt,
+    });
+    let driftCode = null;
+    try {
+      finalizeV2CandidateInventoryCycle({
+        initial_inventory: evidence.initial_inventory,
+        shard_receipts: evidence.shard_receipts,
+        final_inventory: evidence.final_inventory,
+        final_shard_receipts: evidence.final_shard_receipts,
+      });
+    } catch (error) {
+      if (!new Set([
+        "CANDIDATE_INVENTORY_DRIFT",
+        "CANDIDATE_LIFECYCLE_DRIFT",
+      ]).has(error?.code)) {
+        throw error;
+      }
+      driftCode = error.code;
+    }
+    if (driftCode === null) {
+      throw ledgerError(
+        "candidate-inventory-drift-attempt-stable",
+        `candidate inventory drift attempt ${index} is already stable`,
+      );
+    }
+    return {
+      ...structuredClone(evidence),
+      cycle_receipt: null,
+      drift_code: driftCode,
+    };
+  }));
+}
+
+function validateCandidateInventoryAttemptChain(driftAttempts, finalCycle) {
+  let expectedInitial = null;
+  for (const [index, attempt] of driftAttempts.entries()) {
+    if (
+      expectedInitial !== null &&
+      canonicalJson(attempt.initial_inventory) !==
+        canonicalJson(expectedInitial)
+    ) {
+      throw ledgerError(
+        "candidate-inventory-drift-continuation",
+        `candidate inventory drift attempt ${index} does not retain its prior final scan`,
+      );
+    }
+    expectedInitial = attempt.final_inventory;
+  }
+  if (
+    expectedInitial !== null &&
+    canonicalJson(finalCycle.initial_inventory) !==
+      canonicalJson(expectedInitial)
+  ) {
+    throw ledgerError(
+      "candidate-inventory-drift-continuation",
+      "stable candidate inventory does not retain the final drift observation",
+    );
+  }
+}
+
+function candidateInventoryCycleId(initialInventory) {
+  return `candidate-cycle:${initialInventory.receipt_digest.slice(
+    "sha256:".length,
+  )}`;
+}
+
+function candidateInventoryCycleAlreadyPublished(
+  loaded,
+  commandAuthority,
+  triggerIdentity,
+  driftAttempts,
+  cycle,
+) {
+  const inventory = loaded.authority_projection.candidate_inventory;
+  const cycleId = candidateInventoryCycleId(cycle.initial_inventory);
+  const matchingStartIndexes = [];
+  for (const [recordIndex, entry] of loaded.records.entries()) {
+    const payload = entry.envelope.payload;
+    if (
+      entry.envelope.record_type === "candidate-inventory-observation" &&
+      payload?.schema_version === 2 && payload.phase === "cycle-start" &&
+      payload.cycle_id === cycleId &&
+      payload.stable_cycle_receipt_digest === cycle.cycle_receipt.receipt_digest
+    ) {
+      matchingStartIndexes.push(recordIndex);
+    }
+  }
+  if (matchingStartIndexes.length === 0) return null;
+  if (matchingStartIndexes.length !== 1) {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "candidate inventory publication start is not unique in reachable history",
+    );
+  }
+  const startIndex = matchingStartIndexes[0];
+  const attemptCount = driftAttempts.length + 1;
+  const completeIndex = startIndex + attemptCount + 1;
+  const sourceRecords = loaded.records.slice(0, startIndex);
+  const sourceAuthority = deriveV2GitLedgerCandidateInventoryAuthority(
+    sourceRecords,
+    inventory.repository,
+  );
+  const publication = prepareCompactCandidateInventoryPublication({
+    authority: sourceAuthority,
+    commandAuthority,
+    driftAttempts,
+    cycle,
+  });
+  const startEntry = loaded.records[startIndex];
+  const startPayload = startEntry?.envelope?.payload;
+  if (
+    startEntry?.envelope?.record_type !== "candidate-inventory-observation" ||
+    startPayload?.schema_version !== 2 ||
+    startPayload.phase !== "cycle-start"
+  ) {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "current compact candidate inventory start has the wrong record shape",
+    );
+  }
+  const expectedStartPayload = compactCandidateInventoryPhasePayload({
+    authority: sourceAuthority,
+    owner: startPayload.owner,
+    publication,
+    phase: "cycle-start",
+  });
+  if (canonicalJson(startPayload) !== canonicalJson(expectedStartPayload)) {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "candidate inventory retry changed its compact publication start",
+    );
+  }
+  const expectedAttemptRecords = [];
+  for (let attemptIndex = 0; attemptIndex < attemptCount; attemptIndex += 1) {
+    const recordIndex = startIndex + attemptIndex + 1;
+    const entry = loaded.records[recordIndex];
+    const attemptAuthority = deriveV2GitLedgerCandidateInventoryAuthority(
+      loaded.records.slice(0, recordIndex),
+      inventory.repository,
+    );
+    const expectedPayload = compactCandidateInventoryPhasePayload({
+      authority: attemptAuthority,
+      owner: startPayload.owner,
+      publication,
+      phase: "attempt",
+      bundle: publication.bundles[attemptIndex],
+      priorAttempt: expectedAttemptRecords.at(-1) ?? null,
+    });
+    if (
+      entry?.envelope?.record_type !== "candidate-inventory-observation" ||
+      canonicalJson(entry.envelope.payload) !== canonicalJson(expectedPayload)
+    ) {
+      throw ledgerError(
+        "candidate-inventory-cycle-replay-mismatch",
+        "current compact candidate inventory attempt set changed",
+      );
+    }
+    expectedAttemptRecords.push({
+      record_oid: entry.commit_sha,
+      attempt_evidence_digest:
+        publication.bundles[attemptIndex].manifest.attempt_evidence_digest,
+      attachment_manifest_digest:
+        publication.bundles[attemptIndex].manifest.manifest_digest,
+      outcome: publication.bundles[attemptIndex].manifest.outcome,
+    });
+  }
+  const completeEntry = loaded.records[completeIndex];
+  const completeAuthority = deriveV2GitLedgerCandidateInventoryAuthority(
+    loaded.records.slice(0, completeIndex),
+    inventory.repository,
+  );
+  const expectedCompletePayload = compactCandidateInventoryPhasePayload({
+    authority: completeAuthority,
+    owner: startPayload.owner,
+    publication,
+    phase: "cycle-complete",
+    attemptRecords: expectedAttemptRecords,
+  });
+  if (
+    completeEntry?.envelope?.record_type !==
+      "candidate-inventory-observation" ||
+    canonicalJson(completeEntry.envelope.payload) !==
+      canonicalJson(expectedCompletePayload)
+  ) {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "current compact candidate inventory completion changed publication",
+    );
+  }
+  const publishedInventory = deriveV2GitLedgerCandidateInventoryAuthority(
+    loaded.records.slice(0, completeIndex + 1),
+    inventory.repository,
+  );
+  const publishedCompleted = publishedInventory.completed_cycle;
+  if (
+    publishedCompleted === null ||
+    publishedCompleted.compact_publication === undefined ||
+    publishedCompleted.compact_publication === null ||
+    publishedCompleted.cycle_id !== cycleId ||
+    publishedCompleted.start_record_oid !== startEntry.commit_sha ||
+    publishedCompleted.complete_record_oid !== completeEntry.commit_sha ||
+    canonicalJson(publishedCompleted.attempt_record_oids) !==
+      canonicalJson(expectedAttemptRecords.map(({ record_oid: recordOid }) =>
+        recordOid)) ||
+    publishedCompleted.compact_publication.refresh_id !==
+      publication.refresh_id ||
+    canonicalJson(publishedCompleted.compact_publication.attempt_records) !==
+      canonicalJson(expectedAttemptRecords) ||
+    canonicalJson(publishedCompleted.compact_publication.summary) !==
+      canonicalJson(publication.stable_cycle_summary)
+  ) {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "candidate inventory publication projection changed",
+    );
+  }
+  const dispatchBefore = deriveV2GitLedgerCandidateDispatchAuthority(
+    loaded.records.slice(0, completeIndex + 1),
+    inventory.repository,
+  );
+  const dispatchIndex = completeIndex + 1;
+  const dispatchEntry = loaded.records[dispatchIndex];
+  if (dispatchEntry?.envelope?.record_type !==
+      "candidate-dispatch-observation") {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "candidate inventory publication lost its first dispatch record",
+    );
+  }
+  const durableDispatchPayload = validateV2GitLedgerCandidateDispatchPayload(
+    dispatchEntry.envelope.payload,
+    { repository: inventory.repository },
+  );
+  if (canonicalJson(candidateDispatchStableCommandAuthority(
+    durableDispatchPayload.command_authority,
+  )) !== canonicalJson(candidateDispatchStableCommandAuthority(
+    commandAuthority,
+  )) || canonicalJson(durableDispatchPayload.trigger_identity) !==
+      canonicalJson(normalizeCandidateDispatchTriggerIdentity(
+        triggerIdentity,
+      ))) {
+    throw ledgerError(
+      "candidate-inventory-cycle-retry-authority-mismatch",
+      "candidate inventory retry differs from its durable schedule authority",
+    );
+  }
+  const durableCommandAuthority = durableDispatchPayload.command_authority;
+  const durableTriggerIdentity = durableDispatchPayload.trigger_identity;
+  const expectedReservation = createCandidateDispatchReservation({
+    repository: inventory.repository,
+    candidateAuthority: publishedInventory,
+    dispatchAuthority: dispatchBefore,
+    sourceTipCommitSha: completeEntry.commit_sha,
+    reachableRecordCount: completeIndex + 1,
+    commandAuthority: durableCommandAuthority,
+    triggerIdentity: durableTriggerIdentity,
+  });
+  let expectedDispatchPayload;
+  if (expectedReservation === null) {
+    const emptyCycle = newCandidateDispatchCycle({
+      repository: inventory.repository,
+      candidateAuthority: publishedInventory,
+      completed: publishedCompleted,
+      candidates: [],
+      batchCount: 0,
+    });
+    expectedDispatchPayload = createCandidateDispatchPayload({
+      phase: "cycle-complete",
+      dispatchAuthority: dispatchBefore,
+      candidateAuthority: publishedInventory,
+      commandAuthority: durableCommandAuthority,
+      triggerIdentity: durableTriggerIdentity,
+      cycleCompletion: createCandidateDispatchCycleCompletion(emptyCycle),
+    });
+  } else {
+    expectedDispatchPayload = createCandidateDispatchPayload({
+      phase: "reserve",
+      dispatchAuthority: dispatchBefore,
+      candidateAuthority: publishedInventory,
+      commandAuthority: durableCommandAuthority,
+      triggerIdentity: durableTriggerIdentity,
+      reservation: expectedReservation,
+    });
+  }
+  if (canonicalJson(durableDispatchPayload) !==
+      canonicalJson(expectedDispatchPayload)) {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "candidate inventory publication changed its first dispatch record",
+    );
+  }
+  const expectedGeneration = candidateDispatchGenerationId(
+    inventory.repository,
+    publishedCompleted,
+  );
+  const currentDispatch = loaded.authority_projection.candidate_dispatch
+    .current_cycle;
+  const isCurrentPublication = inventory.completed_cycle?.complete_record_oid ===
+    completeEntry.commit_sha;
+  if (
+    isCurrentPublication &&
+    currentDispatch?.generation_id !== expectedGeneration
+  ) {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "candidate inventory publication no longer owns its dispatch generation",
+    );
+  }
+  const sourceObservedAt = startEntry.envelope.server_observed_at;
+  const sourceState = projectChainState(sourceRecords, sourceObservedAt);
+  const sourceLoaded = {
+    ...loaded,
+    ...sourceState,
+    records: sourceRecords,
+    tip_commit_sha: startEntry.envelope.predecessor_commit_sha,
+    commit_count: startIndex,
+    observed_at: sourceObservedAt,
+    pre_ref: {
+      ...loaded.pre_ref,
+      target_commit_sha: startEntry.envelope.predecessor_commit_sha,
+      server_time: sourceObservedAt,
+    },
+    post_ref: {
+      ...loaded.post_ref,
+      target_commit_sha: startEntry.envelope.predecessor_commit_sha,
+      server_time: sourceObservedAt,
+    },
+  };
+  return deepFreeze({
+    current_publication: isCurrentPublication,
+    source_tip_commit_sha: startEntry.envelope.predecessor_commit_sha,
+    source_commit_count: startIndex,
+    source_loaded: sourceLoaded,
+    previous_cycle_receipt: structuredClone(
+      sourceAuthority.completed_cycle?.cycle_receipt ?? null,
+    ),
+    published_record_commit_shas: loaded.records
+      .slice(startIndex, dispatchIndex + 1)
+      .map(({ commit_sha: commitSha }) => commitSha),
+  });
+}
+
+function validateCandidateInventoryAdmissionPrior(authority, initialValue) {
+  const state = candidateInventoryStateFromAuthority(authority);
+  validateCandidateInventoryStartIdentity({
+    state,
+    cycleId: candidateInventoryCycleId(initialValue),
+    initialValue,
+  });
+}
+
+function validateCandidateInventoryCycleAdmissionState(loaded) {
+  if (loaded.active_lease !== null) {
+    throw ledgerError(
+      "candidate-inventory-cycle-lease-active",
+      "candidate inventory cycle cannot begin while a PR lease is active",
+    );
+  }
+  const inventory = loaded.authority_projection.candidate_inventory;
+  const dispatch = loaded.authority_projection.candidate_dispatch;
+  let dispatchInventory = inventory;
+  if (inventory.incomplete_cycle !== null) {
+    const incompleteIndex = loaded.records.findIndex(
+      ({ commit_sha: commitSha }) =>
+        commitSha === inventory.incomplete_cycle.start_record_oid,
+    );
+    if (incompleteIndex < 0) {
+      throw ledgerError(
+        "candidate-inventory-cycle-dispatch-unsettled",
+        "candidate inventory incomplete source is absent from history",
+      );
+    }
+    dispatchInventory = deriveV2GitLedgerCandidateInventoryAuthority(
+      loaded.records.slice(0, incompleteIndex),
+      inventory.repository,
+    );
+  }
+  const completed = dispatchInventory.completed_cycle;
+  const current = dispatch.current_cycle;
+  if (completed === null) {
+    if (current !== null) {
+      throw ledgerError(
+        "candidate-inventory-cycle-dispatch-unsettled",
+        "candidate inventory bootstrap found an unexpected dispatch cycle",
+      );
+    }
+    return;
+  }
+  const expectedGeneration = candidateDispatchGenerationId(
+    inventory.repository,
+    completed,
+  );
+  if (
+    current === null || current.generation_id !== expectedGeneration ||
+    current.cycle_id !== completed.cycle_id ||
+    current.candidate_inventory_authority_digest !==
+      dispatchInventory.authority_digest ||
+    current.inventory_digest !== completed.cycle_receipt.receipt_digest ||
+    current.completed_cycle_record_oid !== completed.complete_record_oid ||
+    canonicalJson(current.candidates) !==
+      canonicalJson(candidateDispatchSelections(completed)) ||
+    current.cycle_complete !== true || current.active_reservation !== null
+  ) {
+    throw ledgerError(
+      "candidate-inventory-cycle-dispatch-unsettled",
+      "candidate inventory refresh requires the prior dispatch to be complete",
+    );
+  }
+}
+
+function validateCandidateInventoryCycleObservationBoundary(attempts, loaded) {
+  const preRefTime = Date.parse(loaded.pre_ref.server_time);
+  const postRefTime = Date.parse(loaded.post_ref.server_time);
+  const inventory = loaded.authority_projection.candidate_inventory;
+  const durableBoundary = inventory.incomplete_cycle?.shard_receipts.at(-1)
+    ?.observed_at ??
+    inventory.incomplete_cycle?.initial_inventory.observed_at ??
+    inventory.completed_cycle?.cycle_receipt.observed_at ?? null;
+  let priorAttemptEnd = durableBoundary === null
+    ? null
+    : Date.parse(durableBoundary);
+  for (const [attemptIndex, attempt] of attempts.entries()) {
+    const initialTime = Date.parse(attempt.initial_inventory.observed_at);
+    let evidenceTime = initialTime;
+    let invalid = attemptIndex === 0 && priorAttemptEnd !== null &&
+      initialTime < priorAttemptEnd;
+    for (const receipt of attempt.shard_receipts) {
+      const receiptTime = Date.parse(receipt.observed_at);
+      if (receiptTime < evidenceTime ||
+          priorAttemptEnd !== null && receiptTime < priorAttemptEnd) {
+        invalid = true;
+      }
+      evidenceTime = Math.max(evidenceTime, receiptTime);
+    }
+    const finalInventoryTime = Date.parse(
+      attempt.final_inventory.observed_at,
+    );
+    if (finalInventoryTime < evidenceTime ||
+        priorAttemptEnd !== null && finalInventoryTime < priorAttemptEnd) {
+      invalid = true;
+    }
+    evidenceTime = Math.max(evidenceTime, finalInventoryTime);
+    for (const receipt of attempt.final_shard_receipts) {
+      const receiptTime = Date.parse(receipt.observed_at);
+      if (receiptTime < evidenceTime) invalid = true;
+      evidenceTime = Math.max(evidenceTime, receiptTime);
+    }
+    if (invalid || evidenceTime > preRefTime) {
+      throw ledgerError(
+        "candidate-inventory-cycle-ref-boundary",
+        "candidate inventory attempts are not ordered before one stable ref boundary",
+      );
+    }
+    priorAttemptEnd = evidenceTime;
+  }
+  if (preRefTime > postRefTime) {
+    throw ledgerError(
+      "candidate-inventory-cycle-ref-boundary",
+      "candidate inventory cycle is not before one stable ledger ref boundary",
+    );
+  }
+}
+
+function candidateInventoryCycleSemanticDigest(cycleReceipt) {
+  return digestCanonical(
+    "codex-review-gate-v2-candidate-inventory-semantic",
+    {
+      repository: structuredClone(cycleReceipt.repository),
+      candidate_digest: cycleReceipt.candidate_digest,
+      lifecycle_projection_digest:
+        cycleReceipt.lifecycle_projection_digest,
+    },
+  );
+}
+
+function candidateInventoryCycleSemanticChanged(previous, current) {
+  return previous === null ||
+    candidateInventoryCycleSemanticDigest(previous) !==
+      candidateInventoryCycleSemanticDigest(current);
+}
+
+function candidateInventoryCycleSuppressionAuthority({
+  loaded,
+  commandAuthority,
+  cycleReceipt,
+  previousCycleReceipt,
+}) {
+  const authoritativeObservedAt = loaded.post_ref.server_time;
+  const inventory = loaded.authority_projection.candidate_inventory;
+  const current = loaded.authority_projection.candidate_dispatch.current_cycle;
+  const unavailable = (reason, extra = {}) => deepFreeze({
+    safe_to_suppress: false,
+    reason,
+    authoritative_observed_at: authoritativeObservedAt,
+    due_candidate_count: 0,
+    earliest_due_at: null,
+    ...extra,
+  });
+  if (previousCycleReceipt === null || inventory.completed_cycle === null) {
+    return unavailable("candidate-inventory-bootstrap");
+  }
+  if (inventory.incomplete_cycle !== null) {
+    return unavailable("candidate-inventory-recovery-required");
+  }
+  if (
+    current === null || current.cycle_complete !== true ||
+    current.active_reservation !== null ||
+    current.generation_id !== candidateDispatchGenerationId(
+      inventory.repository,
+      inventory.completed_cycle,
+    )
+  ) {
+    return unavailable("candidate-dispatch-unsettled");
+  }
+  if (current.dispatch_command_authority === null ||
+      current.trigger_identity === null) {
+    return unavailable("candidate-dispatch-authority-changed");
+  }
+  if (
+    canonicalJson(candidateDispatchEvaluationCommandAuthority(
+      commandAuthority,
+    )) !== canonicalJson(candidateDispatchEvaluationCommandAuthority(
+      current.dispatch_command_authority,
+    ))
+  ) {
+    return unavailable("candidate-dispatch-authority-changed");
+  }
+  const currentSourceWorkflow = sourceWorkflow(
+    loaded.capability.controller_release,
+  );
+  const ackRecordOids = current.completed_batches.flatMap(
+    ({ ack_record_oids: recordOids }) => recordOids,
+  );
+  if (
+    ackRecordOids.length !== current.candidate_count ||
+    new Set(ackRecordOids).size !== ackRecordOids.length ||
+    current.candidate_count !== current.candidates.length ||
+    current.candidate_count !== cycleReceipt.open_pull_requests.length
+  ) {
+    return unavailable("candidate-dispatch-terminal-incomplete");
+  }
+  const recordsByOid = new Map(loaded.records.map((entry, index) => [
+    entry.commit_sha,
+    { entry, index },
+  ]));
+  const dueAtValues = [];
+  for (const [candidateIndex, candidate] of current.candidates.entries()) {
+    const ackRow = recordsByOid.get(ackRecordOids[candidateIndex]);
+    if (ackRow === undefined ||
+        ackRow.entry.envelope.record_type !==
+          "candidate-dispatch-observation") {
+      return unavailable("candidate-dispatch-terminal-unreachable");
+    }
+    const payload = validateV2GitLedgerCandidateDispatchPayload(
+      ackRow.entry.envelope.payload,
+      { repository: inventory.repository },
+    );
+    const ack = payload.candidate_ack;
+    const terminal = ack?.terminal_authority ?? null;
+    if (
+      payload.phase !== "candidate-ack" || ack === null ||
+      canonicalJson(ack.candidate) !== canonicalJson(candidate) ||
+      terminal.kind !== "controller-terminal" ||
+      ack.result.failure_code !== null || ack.result.outcome === "failed" ||
+      [
+        terminal.terminal_projection.status_effect_outcome,
+        terminal.terminal_projection.reservation_status_effect_outcome,
+        terminal.terminal_projection.automatic_request_effect_outcome,
+      ].includes("ambiguous") ||
+      [
+        terminal.terminal_projection.status_ambiguity_code,
+        terminal.terminal_projection.reservation_status_ambiguity_code,
+        terminal.terminal_projection.automatic_request_ambiguity_code,
+      ].some((code) => code !== null)
+    ) {
+      return unavailable("candidate-dispatch-terminal-recovery");
+    }
+    validateCandidateDispatchAckTerminalAuthority({
+      prior_records: loaded.records.slice(0, ackRow.index),
+      predecessor_commit_sha: ackRow.entry.envelope.predecessor_commit_sha,
+      ack,
+      owner: payload.owner,
+      record_server_time: ackRow.entry.envelope.server_observed_at,
+    });
+    const observationRow = recordsByOid.get(
+      terminal.scheduler_observation_record_oid,
+    );
+    const releaseRow = recordsByOid.get(terminal.lease_release_record_oid);
+    const observation = observationRow?.entry;
+    const observationScope = observation === undefined
+      ? null
+      : envelopeScope(observation.envelope);
+    if (
+      observation === undefined || releaseRow === undefined ||
+      observationRow.index >= releaseRow.index ||
+      releaseRow.index >= ackRow.index ||
+      observation.envelope.record_type !== "effect-intent" ||
+      observation.envelope.kind !== "scheduler-observation" ||
+      observation.envelope.payload_digest !==
+        terminal.scheduler_observation_payload_digest ||
+      canonicalJson(observation.envelope.source_workflow) !==
+        canonicalJson(currentSourceWorkflow) ||
+      canonicalJson(releaseRow.entry.envelope.source_workflow) !==
+        canonicalJson(currentSourceWorkflow) ||
+      canonicalJson(ackRow.entry.envelope.source_workflow) !==
+        canonicalJson(currentSourceWorkflow) ||
+      observationScope === null ||
+      observationScope.pull_request.number !== candidate.number ||
+      observationScope.pull_request.node_id !== candidate.node_id ||
+      observationScope.head_ref_oid !== candidate.head_ref_oid ||
+      observationScope.base_ref_oid !== candidate.base_ref_oid ||
+      releaseRow.entry.envelope.record_type !== "lease-release"
+    ) {
+      return unavailable("candidate-dispatch-terminal-unreachable");
+    }
+    const schedulerObservation = validateV2GitLedgerSchedulerObservation(
+      observation.envelope.payload.action,
+    );
+    const actionKinds = new Set(
+      schedulerObservation.scheduler_plan.actions.map(({ kind }) => kind),
+    );
+    if (
+      actionKinds.has("evaluate_snapshot") ||
+      actionKinds.has("publish_status") &&
+        terminal.terminal_projection.status_effect_outcome !== "bound" ||
+      (actionKinds.has("persist_auto_request_intent") ||
+        actionKinds.has("post_review_request")) &&
+        terminal.terminal_projection.automatic_request_effect_outcome !==
+          "bound"
+    ) {
+      return unavailable("candidate-dispatch-action-unsettled");
+    }
+    const dueAt = schedulerObservation.scheduler_plan.due_at;
+    if (dueAt !== null) dueAtValues.push(dueAt);
+  }
+  dueAtValues.sort((left, right) => Date.parse(left) - Date.parse(right));
+  const dueCandidateCount = dueAtValues.filter((dueAt) =>
+    Date.parse(dueAt) <= Date.parse(authoritativeObservedAt)).length;
+  return deepFreeze({
+    safe_to_suppress: false,
+    reason: dueCandidateCount > 0
+      ? "candidate-dispatch-due"
+      : "candidate-full-evidence-authority-required",
+    authoritative_observed_at: authoritativeObservedAt,
+    due_candidate_count: dueCandidateCount,
+    earliest_due_at: dueAtValues[0] ?? null,
+  });
+}
+
+function candidateInventoryCycleCommitBudget({
+  state,
+  loaded,
+  driftAttempts,
+  cycle,
+}) {
+  return candidateInventoryCycleCommitBudgetAtRecordCount({
+    state,
+    reachableRecordCount: loaded.commit_count,
+    driftAttempts,
+    cycle,
+  });
+}
+
+function candidateInventoryCycleCommitBudgetAtRecordCount({
+  state,
+  reachableRecordCount,
+  driftAttempts,
+  cycle,
+}) {
+  if (state === "suppress") {
+    return deepFreeze({
+      inventory_commit_budget_required: 0,
+      dispatch_commit_budget_required: 0,
+      candidate_execution_commit_budget_required: 0,
+      total_commit_budget_required: 0,
+      remaining_ledger_commit_capacity_after_dispatch:
+        MAX_V2_GIT_LEDGER_COMMITS - reachableRecordCount,
+    });
+  }
+  const candidateCount = cycle.cycle_receipt.open_pull_requests.length;
+  return calculateV2GitLedgerCandidateInventoryCycleCommitBudget({
+    shard_count: cycle.shard_receipts.length,
+    drift_shard_counts: driftAttempts.map(
+      ({ shard_receipts: shardReceipts }) => shardReceipts.length,
+    ),
+    candidate_count: candidateCount,
+    reachable_record_count: reachableRecordCount,
+  });
+}
+
+function candidateInventoryCycleClassificationProjection({
+  state,
+  reason,
+  semanticChange,
+  suppression,
+  budget,
+  driftAttempts,
+  cycle,
+  loaded,
+}) {
+  const withoutDigest = {
+    state,
+    reason,
+    source_tip_commit_sha: loaded.tip_commit_sha,
+    source_commit_count: loaded.commit_count,
+    semantic_inventory_digest:
+      candidateInventoryCycleSemanticDigest(cycle.cycle_receipt),
+    semantic_change: semanticChange,
+    drift_attempt_count: driftAttempts.length,
+    drift_codes: driftAttempts.map(({ drift_code: driftCode }) => driftCode),
+    authoritative_observed_at: suppression.authoritative_observed_at,
+    candidate_count: cycle.cycle_receipt.open_pull_requests.length,
+    due_candidate_count: suppression.due_candidate_count,
+    earliest_due_at: suppression.earliest_due_at,
+    inventory_commit_budget_required:
+      budget.inventory_commit_budget_required,
+    dispatch_commit_budget_required:
+      budget.dispatch_commit_budget_required,
+    candidate_execution_commit_budget_required:
+      budget.candidate_execution_commit_budget_required,
+    total_commit_budget_required: budget.total_commit_budget_required,
+    remaining_ledger_commit_capacity_after_dispatch:
+      budget.remaining_ledger_commit_capacity_after_dispatch,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    projection_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-cycle-classification",
+      withoutDigest,
+    ),
+  });
+}
+
+function candidateInventoryCyclePhasePayload({
+  authority,
+  owner,
+  phase,
+  cycle,
+  shardIndex,
+}) {
+  return validateV2GitLedgerCandidateInventoryPayload({
+    schema: V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA,
+    schema_version: 1,
+    phase,
+    cycle_id: candidateInventoryCycleId(cycle.initial_inventory),
+    owner: structuredClone(owner),
+    prior_candidate_authority_digest: authority.authority_digest,
+    supersedes_incomplete_cycle_id: phase === "cycle-start"
+      ? authority.incomplete_cycle?.cycle_id ?? null
+      : null,
+    initial_inventory_receipt_digest:
+      cycle.initial_inventory.receipt_digest,
+    initial_inventory: phase === "cycle-start"
+      ? structuredClone(cycle.initial_inventory)
+      : null,
+    shard_receipt: phase === "shard"
+      ? structuredClone(cycle.shard_receipts[shardIndex])
+      : null,
+    final_inventory: phase === "cycle-complete"
+      ? structuredClone(cycle.final_inventory)
+      : null,
+    cycle_receipt: phase === "cycle-complete"
+      ? structuredClone(cycle.cycle_receipt)
+      : null,
+  });
+}
+
+function prepareCompactCandidateInventoryPublication({
+  authority,
+  commandAuthority,
+  driftAttempts,
+  cycle,
+}) {
+  const attempts = [...driftAttempts, cycle];
+  const attemptCount = attempts.length;
+  const bundles = attempts.map((attempt, index) =>
+    prepareCandidateInventoryAttemptAttachment({
+      cycle: attempt,
+      attemptIndex: index,
+      attemptCount,
+      outcome: index === attemptCount - 1
+        ? "stable"
+        : attempt.drift_code,
+    }));
+  const evaluationCommandAuthority =
+    candidateDispatchEvaluationCommandAuthority(commandAuthority);
+  const expectedAttemptEvidenceDigests = bundles.map(({ manifest }) =>
+    manifest.attempt_evidence_digest);
+  const binding = {
+    repository: structuredClone(authority.repository),
+    source_candidate_authority_digest: authority.authority_digest,
+    source_completed_cycle_record_oid:
+      authority.completed_cycle?.complete_record_oid ?? null,
+    source_incomplete_cycle_id: authority.incomplete_cycle?.cycle_id ?? null,
+    evaluation_command_authority: structuredClone(evaluationCommandAuthority),
+    attempt_count: attemptCount,
+    expected_attempt_evidence_digests: expectedAttemptEvidenceDigests,
+    first_initial_inventory_receipt_digest:
+      attempts[0].initial_inventory.receipt_digest,
+    stable_cycle_id: candidateInventoryCycleId(cycle.initial_inventory),
+    stable_cycle_receipt_digest: cycle.cycle_receipt.receipt_digest,
+  };
+  return {
+    refresh_id: digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-refresh",
+      binding,
+    ),
+    cycle_id: binding.stable_cycle_id,
+    evaluation_command_authority: evaluationCommandAuthority,
+    attempt_count: attemptCount,
+    expected_attempt_evidence_digests: expectedAttemptEvidenceDigests,
+    first_initial_inventory_receipt_digest:
+      binding.first_initial_inventory_receipt_digest,
+    stable_cycle_receipt_digest: binding.stable_cycle_receipt_digest,
+    stable_cycle_summary: candidateInventoryCycleSummary(cycle.cycle_receipt),
+    bundles,
+  };
+}
+
+function compactCandidateInventoryPhasePayload({
+  authority,
+  owner,
+  publication,
+  phase,
+  bundle = null,
+  priorAttempt = null,
+  attemptRecords = null,
+}) {
+  const attempt = phase === "attempt";
+  const complete = phase === "cycle-complete";
+  const start = phase === "cycle-start";
+  const payload = {
+    schema: V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA,
+    schema_version: 2,
+    phase,
+    refresh_id: publication.refresh_id,
+    cycle_id: publication.cycle_id,
+    owner: structuredClone(owner),
+    prior_candidate_authority_digest: authority.authority_digest,
+    supersedes_incomplete_cycle_id: start
+      ? authority.incomplete_cycle?.cycle_id ?? null
+      : null,
+    evaluation_command_authority:
+      structuredClone(publication.evaluation_command_authority),
+    attempt_count: publication.attempt_count,
+    expected_attempt_evidence_digests:
+      structuredClone(publication.expected_attempt_evidence_digests),
+    first_initial_inventory_receipt_digest:
+      publication.first_initial_inventory_receipt_digest,
+    stable_cycle_receipt_digest: publication.stable_cycle_receipt_digest,
+    observed_at: start
+      ? publication.bundles[0].manifest.artifacts[0].observed_at
+      : attempt
+        ? bundle.manifest.artifacts.at(-1).observed_at
+        : publication.stable_cycle_summary.observed_at,
+    attempt_index: attempt ? bundle.manifest.attempt_index : null,
+    outcome: attempt ? bundle.manifest.outcome : null,
+    prior_attempt_record_oid: attempt && priorAttempt !== null
+      ? priorAttempt.record_oid
+      : null,
+    prior_attempt_evidence_digest: attempt && priorAttempt !== null
+      ? priorAttempt.attempt_evidence_digest
+      : null,
+    prior_attempt_manifest_digest: attempt && priorAttempt !== null
+      ? priorAttempt.attachment_manifest_digest
+      : null,
+    attempt_evidence_digest: attempt
+      ? bundle.manifest.attempt_evidence_digest
+      : null,
+    attachment_manifest: attempt
+      ? structuredClone(bundle.manifest)
+      : null,
+    attempt_records: complete ? structuredClone(attemptRecords) : null,
+    stable_cycle_summary: complete
+      ? structuredClone(publication.stable_cycle_summary)
+      : null,
+  };
+  return validateV2GitLedgerCandidateInventoryPayload(payload, {
+    repository: authority.repository,
+  });
+}
+
+function stagedCandidateInventoryObjectEvidence(objects) {
+  const receipts = objects.object_write_receipts;
+  return {
+    commit_raw_body_sha256: receipts.commit.raw_body_sha256,
+    tree_raw_body_sha256: receipts.tree.raw_body_sha256,
+    blob_raw_body_sha256: receipts.blob.raw_body_sha256,
+    commit_server_time: receipts.commit.server_time,
+    tree_server_time: receipts.tree.server_time,
+    blob_server_time: receipts.blob.server_time,
+  };
+}
+
+function candidateInventoryCycleAppendResult({
+  appendReceipts,
+  publishedRecordCommitShas,
+  loaded,
+  projection,
+}) {
+  const state = projection.state === "suppress" ? "suppressed" : "persisted";
+  const withoutDigest = {
+    schema: V2_GIT_LEDGER_CANDIDATE_INVENTORY_CYCLE_APPEND_SCHEMA,
+    schema_version: 1,
+    state,
+    reason: projection.reason,
+    projection: structuredClone(projection),
+    published_record_commit_shas:
+      structuredClone(publishedRecordCommitShas),
+    append_receipts: structuredClone(appendReceipts),
+    latest_append_receipt: appendReceipts.length === 0
+      ? null
+      : structuredClone(appendReceipts.at(-1)),
+    final_tip_commit_sha: loaded.tip_commit_sha,
+    final_commit_count: loaded.commit_count,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    result_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-cycle-append",
+      withoutDigest,
+    ),
+  });
+}
+
+function candidateInventoryCheckpointRequiredResult({
+  sourceLoadHandle,
+  nextUnitAdmissionHandle,
+  projection,
+}) {
+  const withoutDigest = {
+    schema: V2_GIT_LEDGER_CHECKPOINT_REQUIRED_RESULT_SCHEMA,
+    schema_version: 1,
+    state: "checkpoint-required",
+    reason: "candidate-inventory-checkpoint-required",
+    projection: structuredClone(projection),
+    source_load_handle: sourceLoadHandle,
+    next_unit_admission_handle: nextUnitAdmissionHandle,
+    published_record_commit_shas: [],
+    append_receipts: [],
+    latest_append_receipt: null,
+    final_tip_commit_sha: sourceLoadHandle.source_tip_commit_sha,
+    final_commit_count: sourceLoadHandle.source_commit_count,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    result_digest: digestCanonical(
+      "codex-review-gate-v2-checkpoint-required-result",
+      withoutDigest,
+    ),
+  });
+}
+
 export function deriveV2GitLedgerCandidateInventoryAuthority(
   records,
   repositoryValue = null,
@@ -9077,6 +13086,7 @@ export function deriveV2GitLedgerCandidateInventoryAuthority(
     seen_cycle_ids: new Set(),
     completed: null,
     incomplete: null,
+    atomic: null,
   };
   for (const [recordIndex, entry] of records.entries()) {
     assertObject(entry, "candidate inventory authority record");
@@ -9108,6 +13118,8 @@ export function deriveV2GitLedgerCandidateInventoryAuthority(
       state,
       recordOid: row.record_oid,
       recordServerTime: entry.envelope.server_observed_at,
+      attachmentEvidence:
+        entry.candidate_inventory_attachment_evidence ?? null,
       apply: true,
     });
     state.source_records.push(row);
@@ -9115,11 +13127,14 @@ export function deriveV2GitLedgerCandidateInventoryAuthority(
   return buildCandidateInventoryAuthority(repository, state);
 }
 
-function validateCandidateInventoryTransition(records, record, repository) {
-  const authority = deriveV2GitLedgerCandidateInventoryAuthority(
-    records,
-    repository,
-  );
+function validateCandidateInventoryTransition(
+  records,
+  record,
+  repository,
+  { currentAuthority = null } = {},
+) {
+  const authority = currentAuthority ??
+    deriveV2GitLedgerCandidateInventoryAuthority(records, repository);
   const state = candidateInventoryStateFromAuthority(authority);
   const payload = validateV2GitLedgerCandidateInventoryPayload(
     record.payload,
@@ -9137,6 +13152,8 @@ function validateCandidateInventoryTransition(records, record, repository) {
     state,
     recordOid: null,
     recordServerTime: record.server_observed_at,
+    attachmentEvidence:
+      record.candidate_inventory_attachment_evidence ?? null,
     apply: false,
   });
 }
@@ -9157,7 +13174,52 @@ function candidateInventoryStateFromAuthority(authority) {
     seen_cycle_ids: seen,
     completed,
     incomplete,
+    atomic: authority.atomic_cycle === null
+      ? null
+      : structuredClone(authority.atomic_cycle),
   };
+}
+
+function validateCandidateInventoryStartIdentity({
+  state,
+  cycleId,
+  initialValue,
+}) {
+  if (state.seen_cycle_ids.has(cycleId)) {
+    throw ledgerError(
+      "candidate-inventory-cycle-duplicate",
+      "candidate inventory cycle identity is already reachable",
+    );
+  }
+  const initial = validateV2CandidateInventory(initialValue);
+  const priorInventory = state.incomplete?.initial_inventory ??
+    state.completed?.final_inventory ?? null;
+  if (
+    initial.prior_inventory_digest !==
+      (priorInventory?.receipt_digest ?? null)
+  ) {
+    throw ledgerError(
+      "candidate-inventory-prior",
+      "candidate inventory start does not bind the last completed superset",
+    );
+  }
+  requireCandidateSuperset(priorInventory?.candidates ?? [], initial.candidates);
+  const stableIds = new Set(initial.passes.at(-1).candidates.map(({ id }) => id));
+  const expectedRetained = (priorInventory?.candidates ?? [])
+    .filter(({ id }) => !stableIds.has(id))
+    .map(({ id }) => id)
+    .sort((left, right) =>
+      BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0);
+  if (
+    canonicalJson(expectedRetained) !==
+      canonicalJson(initial.retained_prior_candidate_ids)
+  ) {
+    throw ledgerError(
+      "candidate-inventory-retention",
+      "candidate inventory does not enumerate every retained prior candidate",
+    );
+  }
+  return initial;
 }
 
 function validateAndApplyCandidateInventoryTransition({
@@ -9166,8 +13228,20 @@ function validateAndApplyCandidateInventoryTransition({
   state,
   recordOid,
   recordServerTime,
+  attachmentEvidence = null,
   apply,
 }) {
+  if (payload.schema_version === 2) {
+    return validateAndApplyCompactCandidateInventoryTransition({
+      payload,
+      repository,
+      state,
+      recordOid,
+      recordServerTime,
+      attachmentEvidence,
+      apply,
+    });
+  }
   const evidence = payload.phase === "cycle-start"
     ? payload.initial_inventory
     : payload.phase === "shard"
@@ -9180,12 +13254,6 @@ function validateAndApplyCandidateInventoryTransition({
     );
   }
   if (payload.phase === "cycle-start") {
-    if (state.seen_cycle_ids.has(payload.cycle_id)) {
-      throw ledgerError(
-        "candidate-inventory-cycle-duplicate",
-        "candidate inventory cycle identity is already reachable",
-      );
-    }
     const expectedSuperseded = state.incomplete?.cycle_id ?? null;
     if (payload.supersedes_incomplete_cycle_id !== expectedSuperseded) {
       throw ledgerError(
@@ -9193,37 +13261,14 @@ function validateAndApplyCandidateInventoryTransition({
         "candidate inventory start does not exactly supersede the incomplete cycle",
       );
     }
-    const initial = validateV2CandidateInventory(
-      payload.initial_inventory,
-      candidateRepository(repository),
-    );
-    const priorInventory = state.incomplete?.initial_inventory ??
-      state.completed?.final_inventory ?? null;
-    if (
-      initial.prior_inventory_digest !==
-        (priorInventory?.receipt_digest ?? null)
-    ) {
-      throw ledgerError(
-        "candidate-inventory-prior",
-        "candidate inventory start does not bind the last completed superset",
-      );
-    }
-    requireCandidateSuperset(priorInventory?.candidates ?? [], initial.candidates);
-    const stableIds = new Set(initial.passes.at(-1).candidates.map(({ id }) => id));
-    const expectedRetained = (priorInventory?.candidates ?? [])
-      .filter(({ id }) => !stableIds.has(id))
-      .map(({ id }) => id)
-      .sort((left, right) =>
-        BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0);
-    if (
-      canonicalJson(expectedRetained) !==
-        canonicalJson(initial.retained_prior_candidate_ids)
-    ) {
-      throw ledgerError(
-        "candidate-inventory-retention",
-        "candidate inventory does not enumerate every retained prior candidate",
-      );
-    }
+    const initial = validateCandidateInventoryStartIdentity({
+      state,
+      cycleId: payload.cycle_id,
+      initialValue: validateV2CandidateInventory(
+        payload.initial_inventory,
+        candidateRepository(repository),
+      ),
+    });
     if (apply) {
       state.seen_cycle_ids.add(payload.cycle_id);
       state.incomplete = {
@@ -9330,6 +13375,333 @@ function validateAndApplyCandidateInventoryTransition({
   }
 }
 
+function compactCandidateInventoryPayloadMatchesAtomic(payload, atomic) {
+  return payload.refresh_id === atomic.refresh_id &&
+    payload.cycle_id === atomic.cycle_id &&
+    payload.attempt_count === atomic.attempt_count &&
+    payload.first_initial_inventory_receipt_digest ===
+      atomic.first_initial_inventory_receipt_digest &&
+    payload.stable_cycle_receipt_digest ===
+      atomic.stable_cycle_receipt_digest &&
+    canonicalJson(payload.expected_attempt_evidence_digests) ===
+      canonicalJson(atomic.expected_attempt_evidence_digests) &&
+    canonicalJson(payload.evaluation_command_authority) ===
+      canonicalJson(atomic.evaluation_command_authority);
+}
+
+function validateHydratedCandidateInventoryAttempt({
+  evidence: evidenceValue,
+  manifest,
+  repository,
+}) {
+  if (evidenceValue === null) return null;
+  const evidence = normalizeCandidateInventoryCycleEvidence({
+    repository,
+    initial_inventory: evidenceValue.initial_inventory,
+    shard_receipts: evidenceValue.shard_receipts,
+    final_inventory: evidenceValue.final_inventory,
+    final_shard_receipts: evidenceValue.final_shard_receipts,
+  });
+  const artifacts = candidateInventoryAttemptArtifacts(evidence);
+  if (artifacts.length !== manifest.artifacts.length) {
+    throw ledgerError(
+      "candidate-inventory-attachment-evidence",
+      "hydrated candidate inventory attachment count changed",
+    );
+  }
+  const semanticArtifacts = artifacts.map((artifact, index) => {
+    const manifestArtifact = manifest.artifacts[index];
+    const decoded = Buffer.from(canonicalJson(artifact.value), "utf8");
+    const semantic = {
+      role: artifact.role,
+      shard_index: artifact.shard_index,
+      receipt_digest: artifact.value.receipt_digest,
+      observed_at: artifact.value.observed_at,
+      decoded_byte_length: decoded.byteLength,
+      decoded_sha256: rawDigest(decoded),
+    };
+    if (canonicalJson(semantic) !== canonicalJson({
+      role: manifestArtifact.role,
+      shard_index: manifestArtifact.shard_index,
+      receipt_digest: manifestArtifact.receipt_digest,
+      observed_at: manifestArtifact.observed_at,
+      decoded_byte_length: manifestArtifact.decoded_byte_length,
+      decoded_sha256: manifestArtifact.decoded_sha256,
+    })) {
+      throw ledgerError(
+        "candidate-inventory-attachment-evidence",
+        "hydrated candidate inventory attachment semantic changed",
+      );
+    }
+    return semantic;
+  });
+  if (manifest.attempt_evidence_digest !== digestCanonical(
+    "codex-review-gate-v2-candidate-inventory-attempt-evidence",
+    {
+      repository: candidateRepository(repository),
+      attempt_index: manifest.attempt_index,
+      attempt_count: manifest.attempt_count,
+      outcome: manifest.outcome,
+      artifacts: semanticArtifacts,
+    },
+  )) {
+    throw ledgerError(
+      "candidate-inventory-attachment-evidence",
+      "hydrated candidate inventory evidence digest changed",
+    );
+  }
+  let cycleReceipt = null;
+  let observedOutcome = null;
+  try {
+    cycleReceipt = finalizeV2CandidateInventoryCycle({
+      initial_inventory: evidence.initial_inventory,
+      shard_receipts: evidence.shard_receipts,
+      final_inventory: evidence.final_inventory,
+      final_shard_receipts: evidence.final_shard_receipts,
+    });
+    observedOutcome = "stable";
+  } catch (error) {
+    if (!new Set([
+      "CANDIDATE_INVENTORY_DRIFT",
+      "CANDIDATE_LIFECYCLE_DRIFT",
+    ]).has(error?.code)) {
+      throw error;
+    }
+    observedOutcome = error.code;
+  }
+  if (observedOutcome !== manifest.outcome) {
+    throw ledgerError(
+      "candidate-inventory-attachment-outcome",
+      "hydrated candidate inventory attempt outcome changed",
+    );
+  }
+  return {
+    ...structuredClone(evidence),
+    cycle_receipt: cycleReceipt === null
+      ? null
+      : structuredClone(cycleReceipt),
+    drift_code: observedOutcome === "stable" ? null : observedOutcome,
+  };
+}
+
+function validateAndApplyCompactCandidateInventoryTransition({
+  payload,
+  repository,
+  state,
+  recordOid,
+  recordServerTime,
+  attachmentEvidence,
+  apply,
+}) {
+  if (Date.parse(payload.observed_at) > Date.parse(recordServerTime)) {
+    throw ledgerError(
+      "candidate-inventory-time",
+      "compact candidate inventory evidence is after its record boundary",
+    );
+  }
+  if (payload.phase === "cycle-start") {
+    if (state.atomic !== null) {
+      throw ledgerError(
+        "candidate-inventory-atomic-active",
+        "compact candidate inventory transaction is already active",
+      );
+    }
+    const expectedSuperseded = state.incomplete?.cycle_id ?? null;
+    if (payload.supersedes_incomplete_cycle_id !== expectedSuperseded ||
+        state.seen_cycle_ids.has(payload.cycle_id)) {
+      throw ledgerError(
+        "candidate-inventory-recovery",
+        "compact candidate inventory start does not bind its durable predecessor",
+      );
+    }
+    if (apply) {
+      state.seen_cycle_ids.add(payload.cycle_id);
+      state.atomic = {
+        refresh_id: payload.refresh_id,
+        cycle_id: payload.cycle_id,
+        start_record_oid: sha(
+          recordOid,
+          "compact candidate inventory start record oid",
+        ),
+        start_owner: structuredClone(payload.owner),
+        supersedes_incomplete_cycle_id:
+          payload.supersedes_incomplete_cycle_id,
+        evaluation_command_authority:
+          structuredClone(payload.evaluation_command_authority),
+        attempt_count: payload.attempt_count,
+        expected_attempt_evidence_digests:
+          structuredClone(payload.expected_attempt_evidence_digests),
+        first_initial_inventory_receipt_digest:
+          payload.first_initial_inventory_receipt_digest,
+        stable_cycle_receipt_digest: payload.stable_cycle_receipt_digest,
+        attempts: [],
+      };
+    }
+    return;
+  }
+  const atomic = state.atomic;
+  if (atomic === null ||
+      !compactCandidateInventoryPayloadMatchesAtomic(payload, atomic)) {
+    throw ledgerError(
+      "candidate-inventory-atomic-lineage",
+      "compact candidate inventory continuation lacks its exact start",
+    );
+  }
+  if (payload.phase === "attempt") {
+    const expectedIndex = atomic.attempts.length;
+    const prior = atomic.attempts.at(-1) ?? null;
+    if (
+      payload.attempt_index !== expectedIndex ||
+      payload.attempt_evidence_digest !==
+        atomic.expected_attempt_evidence_digests[expectedIndex] ||
+      (prior === null
+        ? payload.prior_attempt_record_oid !== null ||
+          payload.prior_attempt_evidence_digest !== null ||
+          payload.prior_attempt_manifest_digest !== null
+        : payload.prior_attempt_record_oid !== prior.record_oid ||
+          payload.prior_attempt_evidence_digest !==
+            prior.attempt_evidence_digest ||
+          payload.prior_attempt_manifest_digest !==
+            prior.attachment_manifest_digest)
+    ) {
+      throw ledgerError(
+        "candidate-inventory-atomic-lineage",
+        "compact candidate inventory attempt is missing, reordered, or detached",
+      );
+    }
+    const manifest = validateCandidateInventoryAttachmentManifest(
+      payload.attachment_manifest,
+    );
+    const evidence = validateHydratedCandidateInventoryAttempt({
+      evidence: attachmentEvidence,
+      manifest,
+      repository,
+    });
+    if (evidence !== null) {
+      const priorInventory = state.incomplete?.initial_inventory ??
+        state.completed?.final_inventory ?? null;
+      if (expectedIndex === 0) {
+        if (evidence.initial_inventory.prior_inventory_digest !==
+            (priorInventory?.receipt_digest ??
+              state.completed?.cycle_receipt?.final_inventory_receipt_digest ??
+              null) ||
+            evidence.initial_inventory.receipt_digest !==
+              atomic.first_initial_inventory_receipt_digest) {
+          throw ledgerError(
+            "candidate-inventory-prior",
+            "compact candidate inventory first attempt changed durable prior",
+          );
+        }
+        if (Array.isArray(priorInventory?.candidates)) {
+          requireCandidateSuperset(
+            priorInventory.candidates,
+            evidence.initial_inventory.candidates,
+          );
+        }
+      } else if (
+        prior.evidence !== null &&
+        canonicalJson(evidence.initial_inventory) !==
+          canonicalJson(prior.evidence.final_inventory)
+      ) {
+        throw ledgerError(
+          "candidate-inventory-drift-continuation",
+          "compact candidate inventory attempt changed its prior final scan",
+        );
+      }
+    }
+    if (apply) {
+      atomic.attempts.push({
+        record_oid: sha(recordOid,
+          "compact candidate inventory attempt record oid"),
+        attempt_evidence_digest: manifest.attempt_evidence_digest,
+        attachment_manifest_digest: manifest.manifest_digest,
+        outcome: manifest.outcome,
+        evidence: evidence === null ? null : structuredClone(evidence),
+      });
+    }
+    return;
+  }
+  if (atomic.attempts.length !== atomic.attempt_count ||
+      canonicalJson(payload.attempt_records) !== canonicalJson(
+        atomic.attempts.map((attempt) => ({
+          record_oid: attempt.record_oid,
+          attempt_evidence_digest: attempt.attempt_evidence_digest,
+          attachment_manifest_digest: attempt.attachment_manifest_digest,
+          outcome: attempt.outcome,
+        })),
+      ) || atomic.attempts.at(-1)?.outcome !== "stable") {
+    throw ledgerError(
+      "candidate-inventory-cycle-replay-mismatch",
+      "compact candidate inventory completion changed its ordered attempts",
+    );
+  }
+  const stableEvidence = atomic.attempts.at(-1).evidence;
+  let stableSummary = null;
+  if (stableEvidence !== null) {
+    stableSummary = candidateInventoryCycleSummary(
+      stableEvidence.cycle_receipt,
+    );
+    if (canonicalJson(stableSummary) !==
+        canonicalJson(payload.stable_cycle_summary)) {
+      throw ledgerError(
+        "candidate-inventory-cycle-receipt",
+        "compact candidate inventory summary changed its hydrated stable cycle",
+      );
+    }
+  }
+  if (!apply) return;
+  let completed;
+  if (stableEvidence !== null) {
+    completed = {
+      cycle_id: atomic.cycle_id,
+      start_record_oid: atomic.start_record_oid,
+      start_owner: structuredClone(atomic.start_owner),
+      shard_record_oids: [],
+      attempt_record_oids: atomic.attempts.map(({ record_oid: oid }) => oid),
+      complete_record_oid: sha(
+        recordOid,
+        "compact candidate inventory completion record oid",
+      ),
+      initial_inventory: structuredClone(stableEvidence.initial_inventory),
+      shard_receipts: structuredClone(stableEvidence.shard_receipts),
+      final_inventory: structuredClone(stableEvidence.final_inventory),
+      cycle_receipt: structuredClone(stableEvidence.cycle_receipt),
+      compact_publication: {
+        refresh_id: atomic.refresh_id,
+        attempt_records: structuredClone(payload.attempt_records),
+        summary: structuredClone(payload.stable_cycle_summary),
+      },
+    };
+  } else {
+    completed = {
+      cycle_id: atomic.cycle_id,
+      start_record_oid: atomic.start_record_oid,
+      start_owner: structuredClone(atomic.start_owner),
+      shard_record_oids: [],
+      attempt_record_oids: atomic.attempts.map(({ record_oid: oid }) => oid),
+      complete_record_oid: sha(
+        recordOid,
+        "compact candidate inventory completion record oid",
+      ),
+      initial_inventory: null,
+      shard_receipts: [],
+      final_inventory: {
+        receipt_digest:
+          payload.stable_cycle_summary.final_inventory_receipt_digest,
+      },
+      cycle_receipt: structuredClone(payload.stable_cycle_summary),
+      compact_publication: {
+        refresh_id: atomic.refresh_id,
+        attempt_records: structuredClone(payload.attempt_records),
+        summary: structuredClone(payload.stable_cycle_summary),
+      },
+    };
+  }
+  state.completed = completed;
+  state.incomplete = null;
+  state.atomic = null;
+}
+
 function requireCandidateSuperset(priorCandidates, currentCandidates) {
   const current = new Map(currentCandidates.map((candidate) => [
     candidate.id,
@@ -9391,6 +13763,9 @@ function buildCandidateInventoryAuthority(repository, state) {
   const incomplete = state.incomplete === null
     ? null
     : structuredClone(state.incomplete);
+  const atomic = state.atomic === null
+    ? null
+    : structuredClone(state.atomic);
   const durableInventory = incomplete?.initial_inventory ??
     completed?.final_inventory ?? null;
   const discovery = {
@@ -9414,6 +13789,9 @@ function buildCandidateInventoryAuthority(repository, state) {
     incomplete_cycle_id: incomplete?.cycle_id ?? null,
     incomplete_start_record_oid: incomplete?.start_record_oid ?? null,
     incomplete_next_shard_index: incomplete?.next_shard_index ?? null,
+    atomic_refresh_id: atomic?.refresh_id ?? null,
+    atomic_start_record_oid: atomic?.start_record_oid ?? null,
+    atomic_next_attempt_index: atomic?.attempts.length ?? null,
   };
   return deepFreeze({
     schema: V2_GIT_LEDGER_CANDIDATE_INVENTORY_AUTHORITY_SCHEMA,
@@ -9423,6 +13801,7 @@ function buildCandidateInventoryAuthority(repository, state) {
     source_record_digest: sourceRecordDigest,
     completed_cycle: completed,
     incomplete_cycle: incomplete,
+    atomic_cycle: atomic,
     open_pr_discovery: discovery,
     authority_binding: authorityBinding,
     authority_digest: digestCanonical(
@@ -9723,7 +14102,7 @@ export function validateV2GitLedgerCandidateDispatchPlan(value) {
   ], "candidate dispatch plan");
   if (
     value.schema !== V2_GIT_LEDGER_CANDIDATE_DISPATCH_PLAN_SCHEMA ||
-    value.schema_version !== 1 ||
+    !new Set([1, 2]).has(value.schema_version) ||
     !CANDIDATE_DISPATCH_GENERATION_ID.test(value.generation_id) ||
     !CANDIDATE_CYCLE_ID.test(value.cycle_id)
   ) {
@@ -9743,25 +14122,46 @@ export function validateV2GitLedgerCandidateDispatchPlan(value) {
       value.items.length > MAX_V2_CANDIDATE_DISPATCH_ITEMS) {
     throw new Error("candidate dispatch plan items exceed the hard cap");
   }
-  const items = value.items.map((item, index) =>
-    normalizeCandidateDispatchPlanItem(
-      item,
-      `candidate dispatch plan item ${index}`,
-    ));
-  for (const item of items) {
-    if (
-      item.generation_id !== value.generation_id ||
-      item.cycle_id !== value.cycle_id ||
-      item.inventory_digest !== value.inventory_digest ||
-      item.batch_index !== batchIndex ||
-      item.batch_count !== batchCount ||
-      item.dispatch_digest !== value.dispatch_digest
-    ) {
-      throw new Error("candidate dispatch plan item changes its batch binding");
+  const items = value.schema_version === 1
+    ? value.items.map((item, index) =>
+        normalizeCandidateDispatchPlanItem(
+          item,
+          `candidate dispatch plan item ${index}`,
+        ))
+    : value.items.map((item, index) =>
+        normalizeCandidateDispatchCompactPlanItem(
+          item,
+          `candidate dispatch compact plan item ${index}`,
+        ));
+  if (value.schema_version === 1) {
+    for (const item of items) {
+      if (
+        item.generation_id !== value.generation_id ||
+        item.cycle_id !== value.cycle_id ||
+        item.inventory_digest !== value.inventory_digest ||
+        item.batch_index !== batchIndex ||
+        item.batch_count !== batchCount ||
+        item.dispatch_digest !== value.dispatch_digest
+      ) {
+        throw new Error(
+          "candidate dispatch plan item changes its batch binding",
+        );
+      }
+    }
+  } else {
+    let priorCandidateIndex = -1;
+    for (const item of items) {
+      if (item.candidate_index <= priorCandidateIndex) {
+        throw new Error(
+          "candidate dispatch compact plan item order is invalid",
+        );
+      }
+      priorCandidateIndex = item.candidate_index;
     }
   }
-  requireUniqueCandidateDispatchSelections(items.map(({ candidate }) =>
-    candidate));
+  requireUniqueCandidateDispatchSelections(
+    items.map(({ candidate }) => candidate),
+  );
   const remainingCount = nonnegativeInteger(value.remaining_count,
     "candidate dispatch plan remaining_count");
   if (remainingCount !== items.length) {
@@ -9795,6 +14195,42 @@ export function validateV2GitLedgerCandidateDispatchPlan(value) {
     );
   }
   return deepFreeze({ ...structuredClone(value), repository, items });
+}
+
+export function projectV2GitLedgerCandidateDispatchBinding(
+  planValue,
+  itemIndexValue,
+) {
+  let plan;
+  try {
+    plan = validateV2GitLedgerCandidateDispatchPlan(planValue);
+  } catch (error) {
+    throw ledgerError(
+      "CANDIDATE_DISPATCH_PLAN_INVALID",
+      "candidate dispatch binding requires one valid public plan",
+      error,
+    );
+  }
+  if (
+    !Number.isSafeInteger(itemIndexValue) || itemIndexValue < 0 ||
+    itemIndexValue >= plan.items.length
+  ) {
+    throw ledgerError(
+      "CANDIDATE_DISPATCH_PLAN_ITEM_INDEX_INVALID",
+      "candidate dispatch binding item index is outside the public plan",
+    );
+  }
+  const item = plan.items[itemIndexValue];
+  if (plan.schema_version === 1) return item;
+  return normalizeCandidateDispatchPlanItem({
+    generation_id: plan.generation_id,
+    cycle_id: plan.cycle_id,
+    inventory_digest: plan.inventory_digest,
+    batch_index: plan.batch_index,
+    batch_count: plan.batch_count,
+    dispatch_digest: plan.dispatch_digest,
+    candidate: item.candidate,
+  }, "candidate dispatch projected binding");
 }
 
 export function validateV2GitLedgerCandidateDispatchResult(value) {
@@ -11744,6 +16180,25 @@ function normalizeCandidateDispatchPlanItem(value, label) {
   });
 }
 
+function normalizeCandidateDispatchCompactPlanItem(value, label) {
+  assertObject(value, label);
+  exactKeys(value, ["candidate_index", "candidate"], label);
+  const candidateIndex = nonnegativeInteger(
+    value.candidate_index,
+    `${label}.candidate_index`,
+  );
+  if (candidateIndex >= MAX_V2_CANDIDATE_DISPATCH_ITEMS) {
+    throw new Error(`${label}.candidate_index exceeds the hard cap`);
+  }
+  return deepFreeze({
+    candidate_index: candidateIndex,
+    candidate: normalizeCandidateDispatchSelection(
+      value.candidate,
+      `${label}.candidate`,
+    ),
+  });
+}
+
 function normalizeCandidateDispatchSelection(value, label) {
   assertObject(value, label);
   exactKeys(value, [
@@ -11860,6 +16315,49 @@ function candidateDispatchStableCommandAuthority(value) {
   };
 }
 
+function candidateDispatchEvaluationCommandAuthority(value) {
+  const command = normalizeCandidateDispatchCommandAuthority(value);
+  return normalizeCandidateDispatchEvaluationAuthority({
+    repository: structuredClone(command.repository),
+    selection_policy: command.selection_policy,
+    route: structuredClone(command.route),
+    workflow_receipt_digest: command.workflow_receipt_digest,
+  });
+}
+
+function normalizeCandidateDispatchEvaluationAuthority(value) {
+  assertObject(value, "candidate dispatch evaluation authority");
+  exactKeys(value, [
+    "repository", "selection_policy", "route", "workflow_receipt_digest",
+  ], "candidate dispatch evaluation authority");
+  const repository = normalizeCandidateRepository(value.repository);
+  const selectionPolicy = boundedString(
+    value.selection_policy,
+    "candidate dispatch evaluation authority selection policy",
+    128,
+  );
+  assertObject(value.route, "candidate dispatch evaluation authority route");
+  exactKeys(value.route, ["operation", "trigger", "observation_boundary"],
+    "candidate dispatch evaluation authority route");
+  if (canonicalJson(value.route) !== canonicalJson({
+    operation: "ordinary",
+    trigger: "schedule",
+    observation_boundary: "initial",
+  })) {
+    throw new Error("candidate dispatch evaluation authority route is unsupported");
+  }
+  const workflowReceiptDigest = digest(
+    value.workflow_receipt_digest,
+    "candidate dispatch evaluation authority workflow receipt digest",
+  );
+  return deepFreeze({
+    repository,
+    selection_policy: selectionPolicy,
+    route: structuredClone(value.route),
+    workflow_receipt_digest: workflowReceiptDigest,
+  });
+}
+
 function candidateDispatchCompletionCommandMatches(current, prior) {
   const currentCommand = normalizeCandidateDispatchCommandAuthority(current);
   const priorCommand = normalizeCandidateDispatchCommandAuthority(prior);
@@ -11902,6 +16400,7 @@ export function deriveV2GitLedgerCandidateDispatchAuthority(
     seen_cycle_ids: new Set(),
     completed: null,
     incomplete: null,
+    atomic: null,
   };
   const dispatchState = {
     source_records: [],
@@ -11931,6 +16430,8 @@ export function deriveV2GitLedgerCandidateDispatchAuthority(
         state: inventoryState,
         recordOid: inventoryRow.record_oid,
         recordServerTime: envelope.server_observed_at,
+        attachmentEvidence:
+          entry.candidate_inventory_attachment_evidence ?? null,
         apply: true,
       });
       inventoryState.source_records.push(inventoryRow);
@@ -11982,7 +16483,12 @@ export function deriveV2GitLedgerCandidateDispatchAuthority(
   return buildCandidateDispatchAuthority(repository, dispatchState);
 }
 
-function validateCandidateDispatchTransition(records, record, repository) {
+function validateCandidateDispatchTransition(
+  records,
+  record,
+  repository,
+  { reachableRecordCount = records.length } = {},
+) {
   const authority = deriveV2GitLedgerCandidateDispatchAuthority(
     records,
     repository,
@@ -12010,7 +16516,7 @@ function validateCandidateDispatchTransition(records, record, repository) {
     recordOid: null,
     predecessorCommitSha: record.predecessor_commit_sha,
     recordServerTime: record.server_observed_at,
-    reachableRecordCount: records.length,
+    reachableRecordCount,
     priorRecords: records,
     apply: false,
   });
@@ -12199,7 +16705,7 @@ function validateAndApplyCandidateDispatchTransition({
   if (cycle === null || cycle.generation_id !== expectedGeneration ||
       cycle.cycle_complete) {
     if (payload.phase === "cycle-complete" && candidates.length === 0 &&
-        cycle === null) {
+        (cycle === null || cycle.generation_id !== expectedGeneration)) {
       const completion = payload.cycle_completion;
       if (
         completion.batch_count !== 0 || completion.candidate_count !== 0 ||
@@ -12440,6 +16946,78 @@ function candidateDispatchGenerationId(repository, completed) {
   return `candidate-dispatch:${value.slice("sha256:".length)}`;
 }
 
+export function calculateV2GitLedgerCandidateInventoryCycleCommitBudget({
+  shard_count,
+  drift_shard_counts = [],
+  candidate_count,
+  reachable_record_count,
+}) {
+  const shardCount = nonnegativeInteger(
+    shard_count,
+    "candidate inventory budget shard_count",
+  );
+  if (!Array.isArray(drift_shard_counts) ||
+      drift_shard_counts.length >= MAX_V2_CANDIDATE_SCAN_PASSES) {
+    throw ledgerError(
+      "candidate-inventory-cycle-commit-capacity",
+      "candidate inventory budget drift attempts exceed the scan profile",
+    );
+  }
+  const driftShardCounts = drift_shard_counts.map((value, index) =>
+    nonnegativeInteger(
+      value,
+      `candidate inventory budget drift_shard_counts[${index}]`,
+    ));
+  const candidateCount = nonnegativeInteger(
+    candidate_count,
+    "candidate inventory budget candidate_count",
+  );
+  const reachableRecordCount = nonnegativeInteger(
+    reachable_record_count,
+    "candidate inventory budget reachable_record_count",
+  );
+  if (
+    shardCount > MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_SHARDS ||
+    driftShardCounts.some((count) =>
+      count > MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_SHARDS) ||
+    candidateCount > MAX_V2_CANDIDATE_DISPATCH_CYCLE_ITEMS ||
+    reachableRecordCount > MAX_V2_GIT_LEDGER_COMMITS
+  ) {
+    throw ledgerError(
+      "candidate-inventory-cycle-commit-capacity",
+      "candidate inventory budget input exceeds the closed production profile",
+    );
+  }
+  const batchCount = candidateCount === 0
+    ? 0
+    : Math.ceil(candidateCount / MAX_V2_CANDIDATE_DISPATCH_ITEMS);
+  // Compact v2 persists one small start, one attachment manifest per
+  // attempted scan (drift attempts plus the stable attempt), and one small
+  // completion. Shards are attachment blobs, not provenance-bearing records.
+  const inventoryCommitBudgetRequired = driftShardCounts.length + 3;
+  const dispatchBudget = calculateV2GitLedgerCandidateDispatchCommitBudget({
+    candidate_count: candidateCount,
+    batch_count: batchCount,
+    reachable_record_count: Math.min(
+      MAX_V2_GIT_LEDGER_COMMITS,
+      reachableRecordCount + inventoryCommitBudgetRequired,
+    ),
+  });
+  const totalCommitBudgetRequired = inventoryCommitBudgetRequired +
+    dispatchBudget.total_commit_budget_required;
+  return deepFreeze({
+    inventory_commit_budget_required: inventoryCommitBudgetRequired,
+    dispatch_commit_budget_required:
+      dispatchBudget.dispatch_commit_budget_required,
+    candidate_execution_commit_budget_required:
+      dispatchBudget.candidate_execution_commit_budget_required,
+    total_commit_budget_required: totalCommitBudgetRequired,
+    remaining_ledger_commit_capacity_after_dispatch:
+      MAX_V2_GIT_LEDGER_COMMITS - reachableRecordCount -
+      totalCommitBudgetRequired,
+  });
+}
+
 export function calculateV2GitLedgerCandidateDispatchCommitBudget({
   candidate_count,
   batch_count,
@@ -12503,6 +17081,65 @@ export function calculateV2GitLedgerCandidateDispatchCommitBudget({
   });
 }
 
+export function calculateV2GitLedgerCandidateDispatchReservedCommitBudget({
+  dispatch_commit_budget_required,
+  candidate_execution_commit_budget_required,
+  total_commit_budget_required,
+  remaining_ledger_commit_capacity_after_dispatch,
+  reachable_record_count,
+}) {
+  const dispatchCommitBudgetRequired = nonnegativeInteger(
+    dispatch_commit_budget_required,
+    "reserved candidate dispatch commit budget",
+  );
+  const candidateExecutionCommitBudgetRequired = nonnegativeInteger(
+    candidate_execution_commit_budget_required,
+    "reserved candidate execution commit budget",
+  );
+  const totalCommitBudgetRequired = nonnegativeInteger(
+    total_commit_budget_required,
+    "reserved candidate total commit budget",
+  );
+  const remainingCapacity = integerBetween(
+    remaining_ledger_commit_capacity_after_dispatch,
+    0,
+    MAX_V2_GIT_LEDGER_COMMITS,
+    "reserved candidate remaining ledger capacity",
+  );
+  const reachableRecordCount = nonnegativeInteger(
+    reachable_record_count,
+    "reserved candidate reachable_record_count",
+  );
+  const sourceRecordCount = MAX_V2_GIT_LEDGER_COMMITS -
+    totalCommitBudgetRequired - remainingCapacity;
+  const reservedRecordCeiling = MAX_V2_GIT_LEDGER_COMMITS -
+    remainingCapacity;
+  if (
+    dispatchCommitBudgetRequired + candidateExecutionCommitBudgetRequired !==
+      totalCommitBudgetRequired ||
+    sourceRecordCount < 0 ||
+    reachableRecordCount <= sourceRecordCount ||
+    reachableRecordCount > reservedRecordCeiling
+  ) {
+    throw ledgerError(
+      "candidate-dispatch-commit-capacity",
+      "candidate dispatch durable prefix exceeds its immutable reservation",
+    );
+  }
+  return deepFreeze({
+    dispatch_commit_budget_required: dispatchCommitBudgetRequired,
+    candidate_execution_commit_budget_required:
+      candidateExecutionCommitBudgetRequired,
+    total_commit_budget_required: totalCommitBudgetRequired,
+    remaining_ledger_commit_capacity_after_dispatch: remainingCapacity,
+    source_record_count: sourceRecordCount,
+    reachable_record_count: reachableRecordCount,
+    consumed_reserved_record_count:
+      reachableRecordCount - sourceRecordCount,
+    reserved_record_ceiling: reservedRecordCeiling,
+  });
+}
+
 function calculateActiveCandidateDispatchCommitBudget(
   cycle,
   reachableRecordCount,
@@ -12514,20 +17151,16 @@ function calculateActiveCandidateDispatchCommitBudget(
       "candidate dispatch capacity requires one active reservation",
     );
   }
-  const completedCandidateCount = cycle.completed_batches.reduce(
-    (total, batch) => total + batch.candidate_count,
-    0,
-  );
-  const remainingCandidateCount = cycle.candidate_count -
-    completedCandidateCount -
-    cycle.active_reservation.acknowledgements.length;
-  const remainingBatchCount = cycle.batch_count -
-    cycle.completed_batches.length;
-  return calculateV2GitLedgerCandidateDispatchCommitBudget({
-    candidate_count: remainingCandidateCount,
-    batch_count: remainingBatchCount,
+  const reservation = cycle.active_reservation.reservation;
+  return calculateV2GitLedgerCandidateDispatchReservedCommitBudget({
+    dispatch_commit_budget_required:
+      reservation.dispatch_commit_budget_required,
+    candidate_execution_commit_budget_required:
+      reservation.candidate_execution_commit_budget_required,
+    total_commit_budget_required: reservation.total_commit_budget_required,
+    remaining_ledger_commit_capacity_after_dispatch:
+      reservation.remaining_ledger_commit_capacity_after_dispatch,
     reachable_record_count: reachableRecordCount,
-    reservation_persisted: true,
   });
 }
 
@@ -12739,9 +17372,10 @@ function createCandidateDispatchPlan(active) {
   const acknowledged = new Set(
     active.acknowledgements.map(({ candidate_index: index }) => index),
   );
-  const remaining = active.reservation.candidates.filter((_, index) =>
-    !acknowledged.has(index));
-  const items = remaining.map((candidate) => ({
+  const remaining = active.reservation.candidates
+    .map((candidate, candidateIndex) => ({ candidate, candidateIndex }))
+    .filter(({ candidateIndex }) => !acknowledged.has(candidateIndex));
+  const legacyItems = remaining.map(({ candidate }) => ({
     generation_id: active.reservation.generation_id,
     cycle_id: active.reservation.cycle_id,
     inventory_digest: active.reservation.inventory_digest,
@@ -12750,9 +17384,9 @@ function createCandidateDispatchPlan(active) {
     dispatch_digest: active.reservation.dispatch_digest,
     candidate: structuredClone(candidate),
   }));
-  const withoutDigest = {
+  const planWithoutDigest = (schemaVersion, items) => ({
     schema: V2_GIT_LEDGER_CANDIDATE_DISPATCH_PLAN_SCHEMA,
-    schema_version: 1,
+    schema_version: schemaVersion,
     repository: structuredClone(active.reservation.repository),
     generation_id: active.reservation.generation_id,
     cycle_id: active.reservation.cycle_id,
@@ -12770,14 +17404,26 @@ function createCandidateDispatchPlan(active) {
       active.reservation.total_commit_budget_required,
     remaining_ledger_commit_capacity_after_dispatch:
       active.reservation.remaining_ledger_commit_capacity_after_dispatch,
-  };
-  return validateV2GitLedgerCandidateDispatchPlan({
+  });
+  const sealPlan = (withoutDigest) => ({
     ...withoutDigest,
     plan_digest: digestCanonical(
       "codex-review-gate-v2-candidate-dispatch-plan",
       withoutDigest,
     ),
   });
+  const legacyPlan = sealPlan(planWithoutDigest(1, legacyItems));
+  if (Buffer.byteLength(canonicalJson(legacyPlan), "utf8") <=
+      MAX_V2_CANDIDATE_DISPATCH_PLAN_BYTES) {
+    return validateV2GitLedgerCandidateDispatchPlan(legacyPlan);
+  }
+  const compactItems = remaining.map(({ candidate, candidateIndex }) => ({
+    candidate_index: candidateIndex,
+    candidate: structuredClone(candidate),
+  }));
+  return validateV2GitLedgerCandidateDispatchPlan(
+    sealPlan(planWithoutDigest(2, compactItems)),
+  );
 }
 
 function candidateDispatchPlanItem(reservation, candidate) {
@@ -16790,7 +21436,11 @@ async function loadStableChain({
   verifyWorkflowProvenance,
   provenanceBudget,
   requestBudget,
+  assertOperationCurrent = () => {},
+  allowBootstrapCheckpoint = false,
+  capability = null,
 }) {
+  assertOperationCurrent();
   const preRef = await readRef({
     fetchImpl,
     authorization,
@@ -16799,7 +21449,9 @@ async function loadStableChain({
     ref,
     refSuffix,
     requestBudget,
+    assertOperationCurrent,
   });
+  assertOperationCurrent();
   const readBoundary = preRef.server_time;
   const reverse = [];
   const visited = new Set();
@@ -16809,6 +21461,7 @@ async function loadStableChain({
       throw ledgerError("commit-cycle", "Git ledger commit graph contains a cycle");
     }
     visited.add(cursor);
+    assertOperationCurrent();
     const record = await fetchCommitEnvelope({
       fetchImpl,
       authorization,
@@ -16818,7 +21471,36 @@ async function loadStableChain({
       repo,
       ref,
       requestBudget,
+      assertOperationCurrent,
+      allowCheckpointRoot: allowBootstrapCheckpoint,
     });
+    assertOperationCurrent();
+    if (record.checkpoint_root === true) {
+      if (!allowBootstrapCheckpoint || reverse.length === 0) {
+        throw ledgerError(
+          "CHECKPOINT_SUFFIX_REQUIRED",
+          "bootstrap checkpoint root requires one complete bounded suffix",
+        );
+      }
+      return loadStableBootstrapCheckpointChain({
+        fetchImpl,
+        authorization,
+        base,
+        repoPath,
+        ref,
+        refSuffix,
+        repo,
+        verifyWorkflowProvenance,
+        provenanceBudget,
+        requestBudget,
+        preRef,
+        readBoundary,
+        reverseSuffixRecords: reverse,
+        checkpointRoot: record,
+        capability,
+        assertOperationCurrent,
+      });
+    }
     reverse.push(record);
     if (record.parents.length === 0) break;
     cursor = record.parents[0];
@@ -16826,15 +21508,28 @@ async function loadStableChain({
       throw ledgerError("commit-cap", "Git ledger exceeds the bounded commit cap");
     }
   }
-  const records = reverse.reverse();
+  const records = await hydrateCurrentCandidateInventoryAttachments({
+    records: reverse.reverse(),
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    repository: repo,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
   validateReachableChain(records, readBoundary);
+  assertOperationCurrent();
   const provenanceReverification = await reverifyReachableWorkflowProvenance({
     records,
     repository: repo,
     ledgerRef: ref,
     verifyWorkflowProvenance,
     provenanceBudget,
+    assertOperationCurrent,
   });
+  assertOperationCurrent();
   const postRef = await readRef({
     fetchImpl,
     authorization,
@@ -16843,13 +21538,10 @@ async function loadStableChain({
     ref,
     refSuffix,
     requestBudget,
+    assertOperationCurrent,
   });
-  if (preRef.target_commit_sha !== postRef.target_commit_sha) {
-    throw ledgerError(
-      "unstable-ref",
-      "Git ledger ref changed across the two-pass stable read",
-    );
-  }
+  assertOperationCurrent();
+  assertStableRefBoundary(preRef, postRef, "Git ledger");
   const state = projectChainState(records, readBoundary);
   return deepFreeze({
     tip_commit_sha: preRef.target_commit_sha,
@@ -16863,6 +21555,673 @@ async function loadStableChain({
   });
 }
 
+function assertStableRefBoundary(preRef, postRef, label) {
+  if (preRef.target_commit_sha !== postRef.target_commit_sha) {
+    throw ledgerError(
+      "unstable-ref",
+      `${label} ref changed across the two-pass stable read`,
+    );
+  }
+  if (Date.parse(postRef.server_time) < Date.parse(preRef.server_time)) {
+    throw ledgerError(
+      "unstable-ref-time",
+      `${label} post-ref server time regressed across the stable read`,
+    );
+  }
+}
+
+function checkpointProvenanceEvidence(recordOid, envelope, liveReceipt) {
+  const withoutDigest = {
+    record_oid: recordOid,
+    stored_receipt_digest: envelope.workflow_provenance.receipt_digest,
+    live_receipt_digest: liveReceipt.receipt_digest,
+    token_sha256: liveReceipt.token_sha256,
+    key_id: liveReceipt.key_id,
+    verified_at_server_time: liveReceipt.verified_at_server_time,
+    discovery: structuredClone(liveReceipt.discovery),
+    jwks: structuredClone(liveReceipt.jwks),
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    evidence_digest: digestCanonical(
+      "codex-review-gate-v2-git-ledger-provenance-reverification",
+      withoutDigest,
+    ),
+  });
+}
+
+async function loadStableBootstrapCheckpointChain({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  ref,
+  refSuffix,
+  repo,
+  verifyWorkflowProvenance,
+  provenanceBudget,
+  requestBudget,
+  preRef,
+  readBoundary,
+  reverseSuffixRecords,
+  checkpointRoot,
+  capability,
+  assertOperationCurrent,
+}) {
+  if (capability === null) {
+    throw ledgerError(
+      "capability-attestation-required",
+      "checkpoint load requires this factory's exact capability authority",
+    );
+  }
+  assertOperationCurrent();
+  let suffixRecords = [...reverseSuffixRecords].reverse();
+  const suffixCount = suffixRecords.length;
+  if (
+    suffixCount < 4 ||
+    suffixCount > MAX_V2_CANDIDATE_SCAN_PASSES + 3 ||
+    suffixRecords.at(-1).envelope.sequence !== suffixCount ||
+    checkpointRoot.parents.length !== 1
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_SUFFIX_CAP",
+      "protected ref does not end in one complete bounded checkpoint suffix",
+    );
+  }
+  for (let index = 0; index < suffixRecords.length; index += 1) {
+    const entry = suffixRecords[index];
+    const expectedParent = index === 0
+      ? checkpointRoot.commit_sha
+      : suffixRecords[index - 1].commit_sha;
+    if (
+      entry.envelope.sequence !== index + 1 ||
+      entry.parents.length !== 1 ||
+      entry.parents[0] !== expectedParent ||
+      entry.envelope.predecessor_commit_sha !== expectedParent
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_SUFFIX_SEQUENCE",
+        "checkpoint suffix sequence or predecessor is not contiguous",
+      );
+    }
+  }
+
+  assertOperationCurrent();
+  const carrierBytes = await fetchExactGitBlobBytes({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    objectOid: checkpointRoot.carrier_blob_sha,
+    maximumBytes: MAX_V2_GIT_LEDGER_BLOB_BYTES,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const carrierValue = parseCanonicalCheckpointJson(
+    carrierBytes,
+    "checkpoint carrier",
+  );
+  const stateTreeEntries = await fetchExactGitTree({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    treeSha: checkpointRoot.checkpoint_state_tree_sha,
+    maximumEntries: 2,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const stateBlobEntry = stateTreeEntries.find((entry) =>
+    entry.path === V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH) ?? null;
+  const frontierTreeEntry = stateTreeEntries.find((entry) =>
+    entry.path === V2_GIT_LEDGER_CHECKPOINT_FRONTIER_NODES_PATH) ?? null;
+  if (
+    stateTreeEntries.length !== 2 ||
+    stateBlobEntry?.mode !== "100644" || stateBlobEntry.type !== "blob" ||
+    frontierTreeEntry?.mode !== "040000" || frontierTreeEntry.type !== "tree"
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_STATE_TREE_MISMATCH",
+      "checkpoint state tree lacks its exact state blob and frontier tree",
+    );
+  }
+  const stateBytes = await fetchExactGitBlobBytes({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    objectOid: stateBlobEntry.sha,
+    maximumBytes: MAX_V2_GIT_LEDGER_BLOB_BYTES,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const checkpointState = validateBootstrapCheckpointState(
+    parseCanonicalCheckpointJson(stateBytes, "checkpoint state"),
+  );
+  const latestCapabilitySeed = validateCheckpointCapabilityAgainstFactory(
+    checkpointState,
+    capability,
+  );
+  if (
+    canonicalJson(checkpointState.repository) !== canonicalJson(repo) ||
+    checkpointState.ledger_ref !== ref ||
+    checkpointState.source.tip_commit_sha !== checkpointRoot.parents[0] ||
+    checkpointState.prefix_frontier.tree_sha !== frontierTreeEntry.sha ||
+    checkpointState.next_unit.semantic_record_count !== suffixCount
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_STATE_BINDING",
+      "checkpoint state differs from its protected ref root and suffix",
+    );
+  }
+  const carrier = validateCheckpointCarrier(carrierValue, {
+    repository: repo,
+    ledgerRef: ref,
+    sourceTipCommitSha: checkpointRoot.parents[0],
+    checkpointState,
+    stateTreeSha: checkpointRoot.checkpoint_state_tree_sha,
+    capability,
+  });
+  validateExactCheckpointCommitValue(checkpointRoot.commit, {
+    commitSha: checkpointRoot.commit_sha,
+    expectedTreeSha: checkpointRoot.tree_sha,
+    expectedParentSha: checkpointRoot.parents[0],
+    expectedServerTime: carrier.server_observed_at,
+  });
+
+  const frontierTreeEntries = await fetchExactGitTree({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    treeSha: frontierTreeEntry.sha,
+    maximumEntries: MAX_V2_PERSISTENT_FRONTIER_OPERATION_OBJECTS,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const frontier = await loadCheckpointPrefixFrontier({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    checkpointState,
+    treeEntries: frontierTreeEntries,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const boundaryTime = Date.parse(readBoundary);
+  if (
+    Date.parse(frontier.tip_server_observed_at) >
+      Date.parse(checkpointState.source.observed_at) ||
+    Date.parse(checkpointState.source.observed_at) >
+      Date.parse(carrier.server_observed_at) ||
+    Date.parse(carrier.server_observed_at) > boundaryTime
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_TIME_REGRESSION",
+      "checkpoint source, carrier, and read boundary are not monotonic",
+    );
+  }
+  let priorServerTime = carrier.server_observed_at;
+  for (const entry of suffixRecords) {
+    if (
+      Date.parse(entry.envelope.server_observed_at) <
+        Date.parse(priorServerTime) ||
+      Date.parse(entry.envelope.server_observed_at) > boundaryTime
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_TIME_REGRESSION",
+        "checkpoint suffix time is outside its authenticated read boundary",
+      );
+    }
+    priorServerTime = entry.envelope.server_observed_at;
+  }
+
+  const consumedJtis = new Set(frontier.provenance_identities);
+  const liveProvenance = [];
+  const checkpointLiveReceipt = await reverifyStoredWorkflowProvenance({
+    verifyWorkflowProvenance,
+    envelope: carrier,
+    policy: capability.workflow_provenance_policy,
+    provenanceBudget,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  assertUnusedProvenanceJti(consumedJtis, checkpointLiveReceipt);
+  liveProvenance.push(checkpointProvenanceEvidence(
+    checkpointRoot.commit_sha,
+    carrier,
+    checkpointLiveReceipt,
+  ));
+
+  suffixRecords = await hydrateCurrentCandidateInventoryAttachments({
+    records: suffixRecords,
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    repository: repo,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  for (const entry of suffixRecords) {
+    validateV2GitLedgerEnvelope(entry.envelope, {
+      repository: repo,
+      ledger_ref: ref,
+      source_workflow: sourceWorkflow(capability.controller_release),
+      provenance_policy: provenanceExpected(capability),
+    });
+    const liveReceipt = await reverifyStoredWorkflowProvenance({
+      verifyWorkflowProvenance,
+      envelope: entry.envelope,
+      policy: capability.workflow_provenance_policy,
+      provenanceBudget,
+    });
+    assertOperationCurrent();
+    assertHttpDeadlineOpen(requestBudget);
+    assertUnusedProvenanceJti(consumedJtis, liveReceipt);
+    liveProvenance.push(checkpointProvenanceEvidence(
+      entry.commit_sha,
+      entry.envelope,
+      liveReceipt,
+    ));
+  }
+
+  const suffixState = projectChainState(
+    suffixRecords,
+    suffixRecords.at(-1).envelope.server_observed_at,
+    { epochRecordOffset: 1, latestCapabilitySeed },
+  );
+  const candidateAuthority =
+    suffixState.authority_projection.candidate_inventory;
+  const dispatchAuthority =
+    suffixState.authority_projection.candidate_dispatch;
+  const activeReservation = dispatchAuthority.active_reservation;
+  if (
+    candidateAuthority.incomplete_cycle !== null ||
+    candidateAuthority.completed_cycle?.cycle_id !==
+      checkpointState.next_unit.cycle_id ||
+    candidateAuthority.completed_cycle?.cycle_receipt.receipt_digest !==
+      checkpointState.next_unit.stable_cycle_receipt_digest ||
+    activeReservation === null ||
+    digestCanonical(
+      "codex-review-gate-v2-checkpoint-stable-command-authority",
+      candidateDispatchStableCommandAuthority(
+        activeReservation.scan_command_authority,
+      ),
+    ) !== checkpointState.next_unit.stable_command_authority_digest ||
+    digestCanonical(
+      "codex-review-gate-v2-checkpoint-trigger-identity",
+      normalizeCandidateDispatchTriggerIdentity(
+        activeReservation.reservation.trigger_identity,
+      ),
+    ) !== checkpointState.next_unit.trigger_identity_digest
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_SUFFIX_AUTHORITY",
+      "checkpoint suffix does not reconstruct its authenticated next unit",
+    );
+  }
+  const classification = checkpointState.next_unit.classification_projection;
+  const attemptCount = suffixRecords.filter((entry) =>
+    entry.envelope.record_type === "candidate-inventory-observation" &&
+    entry.envelope.payload.phase === "attempt").length;
+  if (
+    classification.semantic_inventory_digest !==
+      candidateInventoryCycleSemanticDigest(
+        candidateAuthority.completed_cycle.cycle_receipt,
+      ) ||
+    classification.candidate_count !==
+      candidateAuthority.completed_cycle.cycle_receipt.open_pull_requests.length ||
+    classification.drift_attempt_count !== attemptCount - 1
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_NEXT_UNIT_PROJECTION",
+      "checkpoint classification differs from its durable suffix evidence",
+    );
+  }
+  const firstPlan = createCandidateDispatchPlan(activeReservation);
+  if (
+    firstPlan.schema_version !== 2 ||
+    Buffer.byteLength(canonicalJson(firstPlan), "utf8") >
+      MAX_V2_CANDIDATE_DISPATCH_PLAN_BYTES
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_DISPATCH_PLAN_UNREPRESENTABLE",
+      "checkpoint suffix cannot reconstruct one bounded compact dispatch plan",
+    );
+  }
+
+  const queryRecords = [
+    ...checkpointState.source.query_records.map((entry) =>
+      deepFreeze(structuredClone(entry))),
+    ...suffixRecords,
+  ];
+  const queryState = {
+    ...suffixState,
+    projection: projectV2GitLedgerRecords(queryRecords),
+    authority_projection: deriveV2GitLedgerAuthority(queryRecords),
+  };
+  const futureState = bootstrapCheckpointFutureState({
+    checkpointCommitSha: checkpointRoot.commit_sha,
+    checkpointState,
+    suffixRecords,
+    projectedState: queryState,
+    firstDispatchPlan: firstPlan,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const postRef = await readRef({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    ref,
+    refSuffix,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  assertStableRefBoundary(preRef, postRef, "checkpoint ledger");
+  const provenanceReverification = [
+    ...checkpointState.source.provenance_reverification.map((entry) =>
+      deepFreeze(structuredClone(entry))),
+    ...liveProvenance,
+  ];
+  return deepFreeze({
+    tip_commit_sha: preRef.target_commit_sha,
+    genesis_commit_sha: checkpointState.source.genesis_commit_sha,
+    records: queryRecords,
+    epoch_records: suffixRecords,
+    epoch_record_offset: futureState.epoch_record_offset,
+    epoch_commit_count: futureState.epoch_commit_count,
+    next_sequence: futureState.next_sequence,
+    logical_record_count: futureState.logical_record_count,
+    pre_ref: preRef,
+    post_ref: postRef,
+    observed_at: readBoundary,
+    provenance_reverification: provenanceReverification,
+    consumed_provenance_identities: [...consumedJtis],
+    checkpoint_epoch: {
+      profile: CHECKPOINT_PROFILE,
+      epoch_id: checkpointState.epoch_id,
+      epoch_root_commit_sha: checkpointRoot.commit_sha,
+      source_tip_commit_sha: checkpointState.source.tip_commit_sha,
+      source_record_count: checkpointState.source.commit_count,
+      checkpoint_state_digest: checkpointState.checkpoint_state_digest,
+      query_seed_digest: futureState.query_seed_digest,
+      future_state_digest: futureState.future_state_digest,
+      source_projection_digest: futureState.source_projection_digest,
+      authority_projection_digest:
+        futureState.authority_projection_digest,
+      candidate_inventory_authority_digest:
+        futureState.candidate_inventory_authority_digest,
+      candidate_dispatch_authority_digest:
+        futureState.candidate_dispatch_authority_digest,
+      first_dispatch_plan_digest:
+        futureState.first_dispatch_plan_digest,
+      prefix_frontier_tree_sha: checkpointState.prefix_frontier.tree_sha,
+      prefix_frontier_entry_count: frontier.entry_count,
+      prefix_frontier_node_count: frontier.node_count,
+    },
+    ...queryState,
+  });
+}
+
+async function hydrateCurrentCandidateInventoryAttachments({
+  records,
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  repository,
+  requestBudget,
+  assertOperationCurrent = () => {},
+}) {
+  assertOperationCurrent();
+  let startIndex = -1;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const envelope = records[index].envelope;
+    if (envelope.record_type === "candidate-inventory-observation" &&
+        envelope.payload.schema_version === 2 &&
+        envelope.payload.phase === "cycle-start") {
+      startIndex = index;
+      break;
+    }
+  }
+  if (startIndex < 0) return records;
+  const hydrated = [...records];
+  for (let index = startIndex + 1; index < records.length; index += 1) {
+    const entry = records[index];
+    const payload = entry.envelope.payload;
+    if (entry.envelope.record_type !== "candidate-inventory-observation") {
+      continue;
+    }
+    if (payload.schema_version !== 2) {
+      throw ledgerError(
+        "candidate-inventory-atomic-lineage",
+        "compact candidate inventory transaction contains a legacy phase",
+      );
+    }
+    if (payload.phase === "cycle-complete") break;
+    if (payload.phase !== "attempt") continue;
+    assertOperationCurrent();
+    const evidence = await fetchCandidateInventoryAttachmentEvidence({
+      fetchImpl,
+      authorization,
+      base,
+      repoPath,
+      attachmentTreeSha: entry.candidate_inventory_attachment_tree_sha,
+      manifest: payload.attachment_manifest,
+      repository,
+      requestBudget,
+      assertOperationCurrent,
+    });
+    assertOperationCurrent();
+    hydrated[index] = deepFreeze({
+      ...entry,
+      candidate_inventory_attachment_evidence: evidence,
+    });
+  }
+  return hydrated;
+}
+
+async function fetchCandidateInventoryAttachmentEvidence({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  attachmentTreeSha,
+  manifest: manifestValue,
+  repository,
+  requestBudget,
+  assertOperationCurrent = () => {},
+}) {
+  assertOperationCurrent();
+  const manifest = validateCandidateInventoryAttachmentManifest(manifestValue);
+  if (manifest.attachment_tree_sha !== attachmentTreeSha ||
+      canonicalJson(manifest.repository) !==
+        canonicalJson(candidateRepository(repository))) {
+    throw ledgerError(
+      "candidate-inventory-attachment-binding",
+      "candidate inventory attachment tree belongs to another attempt",
+    );
+  }
+  assertOperationCurrent();
+  const treeCapture = await request({
+    fetchImpl,
+    authorization,
+    base,
+    method: "GET",
+    path: `${repoPath}/git/trees/${attachmentTreeSha}`,
+    expectedStatus: 200,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  assertOperationCurrent();
+  const tree = treeCapture.data;
+  assertObject(tree, "candidate inventory attachment tree");
+  const expectedEntries = manifest.artifacts.flatMap((artifact) =>
+    artifact.chunks.map((chunk) => ({
+      path: chunk.path,
+      mode: "100644",
+      type: "blob",
+      sha: chunk.blob_sha,
+    })));
+  const actualEntries = Array.isArray(tree.tree)
+    ? tree.tree.map((entry, index) => {
+      assertObject(entry, `candidate inventory attachment tree entry ${index}`);
+      return {
+        path: entry.path,
+        mode: entry.mode,
+        type: entry.type,
+        sha: entry.sha,
+      };
+    })
+    : null;
+  if (
+    tree.sha !== attachmentTreeSha || actualEntries === null ||
+    tree.truncated === true ||
+    canonicalJson([...actualEntries].sort((left, right) =>
+      left.path.localeCompare(right.path))) !==
+      canonicalJson([...expectedEntries].sort((left, right) =>
+        left.path.localeCompare(right.path))) ||
+    canonicalGitTreeSha(expectedEntries) !== attachmentTreeSha
+  ) {
+    throw ledgerError(
+      "candidate-inventory-attachment-tree-identity",
+      "candidate inventory attachment tree shape or identity changed",
+    );
+  }
+  const artifactValues = [];
+  for (const [artifactIndex, artifact] of manifest.artifacts.entries()) {
+    const encodedParts = [];
+    for (const [chunkIndex, chunk] of artifact.chunks.entries()) {
+      assertOperationCurrent();
+      const blobCapture = await request({
+        fetchImpl,
+        authorization,
+        base,
+        method: "GET",
+        path: `${repoPath}/git/blobs/${chunk.blob_sha}`,
+        expectedStatus: 200,
+        requestBudget,
+        assertOperationCurrent,
+      });
+      assertOperationCurrent();
+      const blob = blobCapture.data;
+      assertObject(blob,
+        `candidate inventory attachment blob ${artifactIndex}:${chunkIndex}`);
+      if (blob.sha !== chunk.blob_sha || blob.encoding !== "base64" ||
+          typeof blob.content !== "string") {
+        throw ledgerError(
+          "candidate-inventory-attachment-blob-identity",
+          "candidate inventory attachment blob response is not canonical",
+        );
+      }
+      const compactBase64 = blob.content.replace(/\n/gu, "");
+      const bytes = Buffer.from(compactBase64, "base64");
+      if (
+        bytes.toString("base64") !== compactBase64 ||
+        bytes.byteLength !== chunk.byte_length ||
+        bytes.byteLength > MAX_V2_GIT_LEDGER_ATTACHMENT_CHUNK_BYTES ||
+        gitObjectSha("blob", bytes) !== chunk.blob_sha ||
+        rawDigest(bytes) !== chunk.sha256
+      ) {
+        throw ledgerError(
+          "candidate-inventory-attachment-blob-identity",
+          "candidate inventory attachment blob bytes changed",
+        );
+      }
+      encodedParts.push(bytes);
+    }
+    const encoded = Buffer.concat(encodedParts);
+    if (encoded.byteLength !== artifact.encoded_byte_length ||
+        rawDigest(encoded) !== artifact.encoded_sha256) {
+      throw ledgerError(
+        "candidate-inventory-attachment-encoded-identity",
+        "candidate inventory encoded artifact changed",
+      );
+    }
+    let decoded;
+    try {
+      decoded = inflateRawSync(encoded, {
+        maxOutputLength: artifact.decoded_byte_length + 1,
+      });
+    } catch (error) {
+      throw ledgerError(
+        "candidate-inventory-attachment-inflate",
+        "candidate inventory attachment cannot be boundedly decompressed",
+        error,
+      );
+    }
+    if (decoded.byteLength !== artifact.decoded_byte_length ||
+        rawDigest(decoded) !== artifact.decoded_sha256) {
+      throw ledgerError(
+        "candidate-inventory-attachment-decoded-identity",
+        "candidate inventory decoded artifact changed",
+      );
+    }
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+    } catch (error) {
+      throw ledgerError(
+        "candidate-inventory-attachment-utf8",
+        "candidate inventory decoded artifact is not UTF-8",
+        error,
+      );
+    }
+    let value;
+    try {
+      value = JSON.parse(text);
+    } catch (error) {
+      throw ledgerError(
+        "candidate-inventory-attachment-json",
+        "candidate inventory decoded artifact is not JSON",
+        error,
+      );
+    }
+    if (canonicalJson(value) !== text ||
+        value.receipt_digest !== artifact.receipt_digest ||
+        value.observed_at !== artifact.observed_at) {
+      throw ledgerError(
+        "candidate-inventory-attachment-json",
+        "candidate inventory decoded artifact is not canonical evidence",
+      );
+    }
+    artifactValues.push({
+      role: artifact.role,
+      shard_index: artifact.shard_index,
+      value,
+    });
+  }
+  const initialInventory = artifactValues[0].value;
+  const finalInventoryIndex = artifactValues.findIndex(({ role }) =>
+    role === "final-inventory");
+  return deepFreeze({
+    initial_inventory: initialInventory,
+    shard_receipts: artifactValues.slice(1, finalInventoryIndex)
+      .map(({ value }) => value),
+    final_inventory: artifactValues[finalInventoryIndex].value,
+    final_shard_receipts: artifactValues.slice(finalInventoryIndex + 1)
+      .map(({ value }) => value),
+  });
+}
+
 async function fetchCommitEnvelope({
   fetchImpl,
   authorization,
@@ -16872,7 +22231,10 @@ async function fetchCommitEnvelope({
   repo,
   ref,
   requestBudget,
+  assertOperationCurrent = () => {},
+  allowCheckpointRoot = false,
 }) {
+  assertOperationCurrent();
   const commitCapture = await request({
     fetchImpl,
     authorization,
@@ -16881,7 +22243,9 @@ async function fetchCommitEnvelope({
     path: `${repoPath}/git/commits/${commitSha}`,
     expectedStatus: 200,
     requestBudget,
+    assertOperationCurrent,
   });
+  assertOperationCurrent();
   const commit = commitCapture.data;
   assertObject(commit, "Git ledger commit");
   if (sha(commit.sha, "Git ledger commit.sha") !== commitSha) {
@@ -16896,6 +22260,7 @@ async function fetchCommitEnvelope({
   });
   assertObject(commit.tree, "Git ledger commit tree");
   const treeSha = sha(commit.tree.sha, "Git ledger commit.tree.sha");
+  assertOperationCurrent();
   const treeCapture = await request({
     fetchImpl,
     authorization,
@@ -16904,16 +22269,22 @@ async function fetchCommitEnvelope({
     path: `${repoPath}/git/trees/${treeSha}`,
     expectedStatus: 200,
     requestBudget,
+    assertOperationCurrent,
   });
+  assertOperationCurrent();
   const tree = treeCapture.data;
   assertObject(tree, "Git ledger tree");
   if (
     sha(tree.sha, "Git ledger tree.sha") !== treeSha ||
-    !Array.isArray(tree.tree) || tree.tree.length !== 1
+    !Array.isArray(tree.tree) ||
+    !new Set([1, 2]).has(tree.tree.length)
   ) {
-    throw ledgerError("tree-shape", "Git ledger tree must contain exactly one entry");
+    throw ledgerError(
+      "tree-shape",
+      "Git ledger tree must contain one envelope and at most one attachment tree",
+    );
   }
-  const entry = tree.tree[0];
+  const entry = tree.tree.find((item) => item?.path === V2_GIT_LEDGER_BLOB_PATH);
   assertObject(entry, "Git ledger tree entry");
   if (
     entry.path !== V2_GIT_LEDGER_BLOB_PATH || entry.mode !== "100644" ||
@@ -16921,13 +22292,89 @@ async function fetchCommitEnvelope({
   ) {
     throw ledgerError("tree-shape", "Git ledger tree entry is not the canonical blob");
   }
+  const attachmentEntry = tree.tree.find((item) =>
+    item?.path === V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_PATH) ?? null;
+  const checkpointStateEntry = tree.tree.find((item) =>
+    item?.path === V2_GIT_LEDGER_CHECKPOINT_STATE_PATH) ?? null;
+  if (
+    allowCheckpointRoot && tree.tree.length === 2 &&
+    attachmentEntry === null && checkpointStateEntry !== null &&
+    checkpointStateEntry.mode === "040000" &&
+    checkpointStateEntry.type === "tree"
+  ) {
+    const carrierBlobSha = sha(
+      entry.sha,
+      "checkpoint carrier blob SHA",
+    );
+    const checkpointStateTreeSha = sha(
+      checkpointStateEntry.sha,
+      "checkpoint state tree SHA",
+    );
+    const checkpointEntries = [{
+      path: V2_GIT_LEDGER_BLOB_PATH,
+      mode: "100644",
+      type: "blob",
+      sha: carrierBlobSha,
+    }, {
+      path: V2_GIT_LEDGER_CHECKPOINT_STATE_PATH,
+      mode: "040000",
+      type: "tree",
+      sha: checkpointStateTreeSha,
+    }];
+    if (
+      parents.length !== 1 ||
+      canonicalGitTreeSha(checkpointEntries) !== treeSha
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_ROOT_TREE_MISMATCH",
+        "checkpoint root commit does not bind one exact canonical state tree",
+      );
+    }
+    return deepFreeze({
+      checkpoint_root: true,
+      commit_sha: commitSha,
+      parents,
+      tree_sha: treeSha,
+      carrier_blob_sha: carrierBlobSha,
+      checkpoint_state_tree_sha: checkpointStateTreeSha,
+      commit: structuredClone(commit),
+      evidence: {
+        commit_raw_body_sha256: rawDigest(commitCapture.raw_body),
+        tree_raw_body_sha256: rawDigest(treeCapture.raw_body),
+        commit_server_time: commitCapture.server_time,
+        tree_server_time: treeCapture.server_time,
+      },
+    });
+  }
+  if (
+    tree.tree.length === 2 &&
+    (attachmentEntry === null || attachmentEntry.mode !== "040000" ||
+      attachmentEntry.type !== "tree")
+  ) {
+    throw ledgerError(
+      "tree-shape",
+      "Git ledger attachment entry is not the canonical child tree",
+    );
+  }
   const blobSha = sha(entry.sha, "Git ledger tree entry.sha");
-  if (canonicalTreeSha(blobSha) !== treeSha) {
+  const canonicalEntries = [{
+    path: V2_GIT_LEDGER_BLOB_PATH,
+    mode: "100644",
+    type: "blob",
+    sha: blobSha,
+  }, ...(attachmentEntry === null ? [] : [{
+    path: V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_PATH,
+    mode: "040000",
+    type: "tree",
+    sha: sha(attachmentEntry.sha, "Git ledger attachment tree SHA"),
+  }])];
+  if (canonicalGitTreeSha(canonicalEntries) !== treeSha) {
     throw ledgerError(
       "tree-identity",
       "Git ledger tree bytes do not match their exact Git object identity",
     );
   }
+  assertOperationCurrent();
   const blobCapture = await request({
     fetchImpl,
     authorization,
@@ -16936,7 +22383,9 @@ async function fetchCommitEnvelope({
     path: `${repoPath}/git/blobs/${blobSha}`,
     expectedStatus: 200,
     requestBudget,
+    assertOperationCurrent,
   });
+  assertOperationCurrent();
   const blob = blobCapture.data;
   assertObject(blob, "Git ledger blob");
   if (
@@ -16978,6 +22427,24 @@ async function fetchCommitEnvelope({
     throw ledgerError("noncanonical-blob", "Git ledger blob bytes are not canonical JSON");
   }
   validateV2GitLedgerEnvelope(envelope);
+  const attachmentTreeSha = attachmentEntry === null
+    ? null
+    : sha(attachmentEntry.sha, "Git ledger attachment tree SHA");
+  const compactAttempt =
+    envelope.record_type === "candidate-inventory-observation" &&
+    envelope.payload.schema_version === 2 &&
+    envelope.payload.phase === "attempt";
+  if (
+    compactAttempt !== (attachmentTreeSha !== null) ||
+    compactAttempt &&
+      envelope.payload.attachment_manifest.attachment_tree_sha !==
+        attachmentTreeSha
+  ) {
+    throw ledgerError(
+      "candidate-inventory-attachment-binding",
+      "Git ledger attachment tree differs from its compact attempt envelope",
+    );
+  }
   if (
     canonicalJson(envelope.repository) !== canonicalJson(repo) ||
     envelope.ledger_ref !== ref
@@ -17003,6 +22470,7 @@ async function fetchCommitEnvelope({
     parents,
     tree_sha: treeSha,
     blob_sha: blobSha,
+    candidate_inventory_attachment_tree_sha: attachmentTreeSha,
     envelope,
     evidence: {
       commit_raw_body_sha256: rawDigest(commitCapture.raw_body),
@@ -17097,15 +22565,79 @@ function validateCapabilityPairs(records) {
       );
     }
     const payload = next.envelope.payload;
+    const canaryPayload = record.envelope.payload;
     if (
       payload.winner_commit_sha !== record.commit_sha ||
       payload.race_parent_commit_sha !== record.parents[0] ||
       payload.genesis_commit_sha !== records[0].commit_sha ||
+      canaryPayload.race_parent_commit_sha !== record.parents[0] ||
+      canaryPayload.genesis_commit_sha !== records[0].commit_sha ||
       payload.bootstrap_candidate_digest !==
-        record.envelope.payload.bootstrap_candidate_digest ||
+        canaryPayload.bootstrap_candidate_digest ||
       payload.race_final_ref_reread.target_commit_sha !== record.commit_sha
     ) {
       throw ledgerError("attestation-binding", "capability attestation does not bind its race");
+    }
+    const writeObservation = validateWriteObservationReceipt(
+      payload.write_observation_receipt,
+    );
+    const bootstrapCandidate = validateEmbeddedBootstrapCandidate(
+      canaryPayload,
+      record.envelope.repository,
+      record.envelope.ledger_ref,
+    );
+    const attestedCapability = validateEmbeddedCapability(
+      payload,
+      next.envelope.repository,
+      next.envelope.ledger_ref,
+    );
+    const expectedCapability = validateV2GitLedgerCapabilityReceipt(
+      sealCapabilityFromBootstrap(bootstrapCandidate, writeObservation),
+      {
+        repository: record.envelope.repository,
+        ledger_ref: record.envelope.ledger_ref,
+      },
+    );
+    const writtenContender = writeObservation.contenders.find((item) =>
+      item.label === canaryPayload.contender) ?? null;
+    const raceResult = writeObservation.race_results.find((item) =>
+      item.label === canaryPayload.contender) ?? null;
+    const genesisObservation = writeObservation.genesis;
+    if (
+      stableCapabilityBindingDigest(attestedCapability) !==
+        stableCapabilityBindingDigest(expectedCapability) ||
+      writeObservation.bootstrap_candidate_digest !==
+        bootstrapCandidate.input_digest ||
+      writeObservation.race_parent_commit_sha !== record.parents[0] ||
+      writeObservation.winner_commit_sha !== record.commit_sha ||
+      canonicalJson(writeObservation.race_final_ref_reread) !==
+        canonicalJson(payload.race_final_ref_reread) ||
+      payload.race_final_ref_reread.ref !== next.envelope.ledger_ref ||
+      payload.race_final_ref_reread.server_time !==
+        next.envelope.server_observed_at ||
+      payload.race_final_ref_reread.server_time !==
+        next.envelope.workflow_provenance.operation_binding
+          .github_server_time ||
+      writeObservation.race_results.some((item) =>
+        Date.parse(item.server_time) >
+          Date.parse(writeObservation.race_final_ref_reread.server_time)) ||
+      canonicalJson(writeObservation.race_results) !==
+        canonicalJson(payload.contenders) ||
+      writtenContender?.commit_sha !== record.commit_sha ||
+      writtenContender.tree_sha !== record.tree_sha ||
+      writtenContender.blob_sha !== record.blob_sha ||
+      raceResult?.commit_sha !== record.commit_sha ||
+      raceResult.outcome !== "winner" ||
+      (genesisObservation !== null && (
+        genesisObservation.commit_sha !== records[0].commit_sha ||
+        genesisObservation.tree_sha !== records[0].tree_sha ||
+        genesisObservation.blob_sha !== records[0].blob_sha
+      ))
+    ) {
+      throw ledgerError(
+        "capability-transition-mismatch",
+        "capability attestation differs from its exact canary authority and race",
+      );
     }
     const winners = payload.contenders.filter((item) => item.outcome === "winner");
     const losers = payload.contenders.filter((item) => item.outcome === "non-fast-forward");
@@ -17145,19 +22677,29 @@ function collectTrailingCanaries(records) {
   return commits;
 }
 
-function projectChainState(records, observedAt) {
+function projectChainState(records, observedAt, {
+  epochRecordOffset = 0,
+  latestCapabilitySeed = null,
+} = {}) {
+  const recordOffset = nonnegativeInteger(
+    epochRecordOffset,
+    "Git ledger projection epoch record offset",
+  );
   const intentByEffect = new Map();
   const effectByIdempotency = new Map();
   const responseByEffect = new Set();
   const leaseIds = new Set();
   let activeLease = null;
-  let latestCapability = null;
+  let latestCapability = latestCapabilitySeed === null
+    ? null
+    : structuredClone(latestCapabilitySeed);
   let currentControlComment = null;
   const candidateInventoryState = {
     source_records: [],
     seen_cycle_ids: new Set(),
     completed: null,
     incomplete: null,
+    atomic: null,
   };
   const candidateDispatchState = {
     source_records: [],
@@ -17165,10 +22707,31 @@ function projectChainState(records, observedAt) {
   };
   for (const [recordIndex, record] of records.entries()) {
     const envelope = record.envelope;
+    if (
+      (candidateInventoryState.incomplete !== null ||
+        candidateInventoryState.atomic !== null) &&
+      envelope.record_type !== "candidate-inventory-observation"
+    ) {
+      throw ledgerError(
+        "candidate-inventory-write-window",
+        "an incomplete candidate inventory rejects unrelated ledger writes",
+      );
+    }
     const dispatchBefore = buildCandidateDispatchAuthority(
       envelope.repository,
       candidateDispatchState,
     );
+    if (
+      dispatchBefore.current_cycle !== null &&
+      dispatchBefore.current_cycle.cycle_complete === false &&
+      dispatchBefore.current_cycle.active_reservation === null &&
+      envelope.record_type !== "candidate-dispatch-observation"
+    ) {
+      throw ledgerError(
+        "candidate-dispatch-write-window",
+        "an incomplete candidate dispatch rejects unrelated ledger writes",
+      );
+    }
     if (dispatchBefore.active_reservation !== null &&
         envelope.record_type === "capability-attestation") {
       throw ledgerError(
@@ -17218,6 +22781,8 @@ function projectChainState(records, observedAt) {
         state: candidateInventoryState,
         recordOid: row.record_oid,
         recordServerTime: envelope.server_observed_at,
+        attachmentEvidence:
+          record.candidate_inventory_attachment_evidence ?? null,
         apply: true,
       });
       candidateInventoryState.source_records.push(row);
@@ -17272,7 +22837,7 @@ function projectChainState(records, observedAt) {
         recordOid: row.record_oid,
         predecessorCommitSha: envelope.predecessor_commit_sha,
         recordServerTime: envelope.server_observed_at,
-        reachableRecordCount: recordIndex,
+        reachableRecordCount: recordOffset + recordIndex,
         priorRecords: records.slice(0, recordIndex),
         apply: true,
       });
@@ -17716,11 +23281,31 @@ function validateProductionTransition(
   repository,
   evaluatedScopeReceipt,
 ) {
-  if (record.record_type === "candidate-inventory-observation") {
-    const dispatch = deriveV2GitLedgerCandidateDispatchAuthority(
-      loaded.records,
-      repository,
+  if (
+    (loaded.authority_projection.candidate_inventory.incomplete_cycle !== null ||
+      loaded.authority_projection.candidate_inventory.atomic_cycle !== null) &&
+    record.record_type !== "candidate-inventory-observation"
+  ) {
+    throw ledgerError(
+      "candidate-inventory-write-window",
+      "an active candidate inventory transition rejects unrelated ledger writes",
     );
+  }
+  const currentDispatch = loaded.authority_projection.candidate_dispatch
+    .current_cycle;
+  if (
+    currentDispatch !== null &&
+    currentDispatch.cycle_complete === false &&
+    currentDispatch.active_reservation === null &&
+    record.record_type !== "candidate-dispatch-observation"
+  ) {
+    throw ledgerError(
+      "candidate-dispatch-write-window",
+      "an incomplete candidate dispatch rejects unrelated ledger writes",
+    );
+  }
+  if (record.record_type === "candidate-inventory-observation") {
+    const dispatch = loaded.authority_projection.candidate_dispatch;
     if (
       record.payload.phase === "cycle-start" &&
       dispatch.current_cycle !== null &&
@@ -17731,7 +23316,15 @@ function validateProductionTransition(
         "a new candidate inventory cannot start before dispatch completes",
       );
     }
-    validateCandidateInventoryTransition(loaded.records, record, repository);
+    validateCandidateInventoryTransition(
+      loaded.records,
+      record,
+      repository,
+      {
+        currentAuthority:
+          loaded.authority_projection.candidate_inventory,
+      },
+    );
     return;
   }
   if (record.record_type === "candidate-dispatch-observation") {
@@ -21628,6 +27221,15 @@ function requireCommitCapacity(currentCount, required, operation) {
   }
 }
 
+function rejectBootstrapCheckpointMutation(loaded, operation) {
+  if (loaded.checkpoint !== undefined) {
+    throw ledgerError(
+      "CHECKPOINT_EPOCH_READ_ONLY",
+      `${operation} is unavailable until checkpoint suffix writes are enabled`,
+    );
+  }
+}
+
 function findCurrentCapability(loaded, capability) {
   const latest = loaded.latest_capability;
   if (latest === null) return null;
@@ -21811,6 +27413,8 @@ function sealLoadedLedger(
   observedAt,
   provenance,
 ) {
+  const checkpointEpoch = loaded.checkpoint_epoch ?? null;
+  const isBootstrapCheckpoint = checkpointEpoch !== null;
   const tip = loaded.records.at(-1);
   const publicRecords = loaded.records.map(redactRecordEntry);
   const recordManifest = loaded.records.map((entry) => ({
@@ -21843,7 +27447,7 @@ function sealLoadedLedger(
   }
   const withoutDigest = {
     schema: "codex-review-gate-git-ledger-load-v2",
-    schema_version: 1,
+    schema_version: isBootstrapCheckpoint ? 2 : 1,
     repository: capability.repository,
     repository_endpoint_receipt: capability.repository_endpoint_receipt,
     ledger_ref: capability.ledger_ref,
@@ -21854,7 +27458,24 @@ function sealLoadedLedger(
       { tree_oid: tip.tree_sha, blob_oid: tip.blob_sha },
     ),
     genesis_commit_sha: loaded.genesis_commit_sha,
-    commit_count: loaded.records.length,
+    commit_count: isBootstrapCheckpoint
+      ? loaded.epoch_commit_count
+      : loaded.records.length,
+    ...(isBootstrapCheckpoint ? {
+      record_scope: "bootstrap-checkpoint-query",
+      epoch_root_commit_sha: checkpointEpoch.epoch_root_commit_sha,
+      epoch_record_offset: loaded.epoch_record_offset,
+      epoch_commit_count: loaded.epoch_commit_count,
+      next_sequence: loaded.next_sequence,
+      logical_record_count: loaded.logical_record_count,
+      checkpoint: {
+        ...structuredClone(checkpointEpoch),
+        epoch_record_offset: loaded.epoch_record_offset,
+        epoch_commit_count: loaded.epoch_commit_count,
+        next_sequence: loaded.next_sequence,
+        logical_record_count: loaded.logical_record_count,
+      },
+    } : {}),
     observed_at: observedAt,
     capability: {
       attestation_commit_sha: authority.attestation_commit_sha,
@@ -21936,6 +27557,3583 @@ function sealLoadedLedger(
   });
 }
 
+function candidateInventoryAttemptArtifacts(cycle) {
+  return [
+    {
+      role: "initial-inventory",
+      shard_index: null,
+      value: cycle.initial_inventory,
+    },
+    ...cycle.shard_receipts.map((value, shardIndex) => ({
+      role: "initial-shard",
+      shard_index: shardIndex,
+      value,
+    })),
+    {
+      role: "final-inventory",
+      shard_index: null,
+      value: cycle.final_inventory,
+    },
+    ...cycle.final_shard_receipts.map((value, shardIndex) => ({
+      role: "final-shard",
+      shard_index: shardIndex,
+      value,
+    })),
+  ];
+}
+
+function prepareCandidateInventoryAttemptAttachment({
+  cycle,
+  attemptIndex,
+  attemptCount,
+  outcome,
+}) {
+  const index = nonnegativeInteger(
+    attemptIndex,
+    "candidate inventory attachment attempt index",
+  );
+  const count = positiveInteger(
+    attemptCount,
+    "candidate inventory attachment attempt count",
+  );
+  if (index >= count || count > MAX_V2_CANDIDATE_SCAN_PASSES) {
+    throw ledgerError(
+      "candidate-inventory-attachment-attempt",
+      "candidate inventory attachment attempt is outside its closed pass count",
+    );
+  }
+  if (!new Set([
+    "stable",
+    "CANDIDATE_INVENTORY_DRIFT",
+    "CANDIDATE_LIFECYCLE_DRIFT",
+  ]).has(outcome)) {
+    throw ledgerError(
+      "candidate-inventory-attachment-outcome",
+      "candidate inventory attachment outcome is unsupported",
+    );
+  }
+  const artifacts = candidateInventoryAttemptArtifacts(cycle);
+  if (
+    artifacts.length >
+      MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_ARTIFACTS ||
+    cycle.shard_receipts.length >
+      MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_SHARDS ||
+    cycle.final_shard_receipts.length >
+      MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_SHARDS
+  ) {
+    throw ledgerError(
+      "candidate-inventory-attachment-capacity",
+      "candidate inventory attempt exceeds its bounded attachment domain",
+    );
+  }
+  const chunks = [];
+  const manifestArtifacts = [];
+  let totalDecodedBytes = 0;
+  let totalEncodedBytes = 0;
+  for (const [artifactIndex, artifact] of artifacts.entries()) {
+    const decoded = Buffer.from(canonicalJson(artifact.value), "utf8");
+    const encoded = deflateRawSync(decoded, { level: 9 });
+    totalDecodedBytes += decoded.byteLength;
+    totalEncodedBytes += encoded.byteLength;
+    const artifactChunks = [];
+    for (
+      let offset = 0, chunkIndex = 0;
+      offset < encoded.byteLength;
+      offset += MAX_V2_GIT_LEDGER_ATTACHMENT_CHUNK_BYTES, chunkIndex += 1
+    ) {
+      const bytes = encoded.subarray(
+        offset,
+        Math.min(
+          encoded.byteLength,
+          offset + MAX_V2_GIT_LEDGER_ATTACHMENT_CHUNK_BYTES,
+        ),
+      );
+      const path = `a${String(artifactIndex).padStart(3, "0")}-c${
+        String(chunkIndex).padStart(4, "0")}.bin`;
+      const chunk = {
+        path,
+        chunk_index: chunkIndex,
+        byte_length: bytes.byteLength,
+        blob_sha: gitObjectSha("blob", bytes),
+        sha256: rawDigest(bytes),
+      };
+      chunks.push({ ...chunk, bytes: Buffer.from(bytes) });
+      artifactChunks.push(chunk);
+    }
+    manifestArtifacts.push({
+      role: artifact.role,
+      shard_index: artifact.shard_index,
+      receipt_digest: digest(
+        artifact.value.receipt_digest,
+        `candidate inventory attachment ${artifact.role} receipt digest`,
+      ),
+      observed_at: timestamp(
+        artifact.value.observed_at,
+        `candidate inventory attachment ${artifact.role} observed_at`,
+      ),
+      decoded_byte_length: decoded.byteLength,
+      decoded_sha256: rawDigest(decoded),
+      encoding: "deflate-raw",
+      encoded_byte_length: encoded.byteLength,
+      encoded_sha256: rawDigest(encoded),
+      chunk_count: artifactChunks.length,
+      chunks: artifactChunks,
+    });
+  }
+  if (
+    chunks.length === 0 ||
+    chunks.length >
+      MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_CHUNKS ||
+    totalDecodedBytes >
+      MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_DECODED_BYTES ||
+    totalEncodedBytes >
+      MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_ENCODED_BYTES
+  ) {
+    throw ledgerError(
+      "candidate-inventory-attachment-capacity",
+      "candidate inventory attempt attachment bytes exceed the closed profile",
+    );
+  }
+  const treeEntries = chunks.map(({ path, blob_sha: blobSha }) => ({
+    path,
+    mode: "100644",
+    type: "blob",
+    sha: blobSha,
+  }));
+  const treeBytes = canonicalGitTreeBytes(treeEntries);
+  const semanticArtifacts = manifestArtifacts.map((artifact) => ({
+    role: artifact.role,
+    shard_index: artifact.shard_index,
+    receipt_digest: artifact.receipt_digest,
+    observed_at: artifact.observed_at,
+    decoded_byte_length: artifact.decoded_byte_length,
+    decoded_sha256: artifact.decoded_sha256,
+  }));
+  const attemptEvidenceWithoutDigest = {
+    repository: structuredClone(cycle.initial_inventory.repository),
+    attempt_index: index,
+    attempt_count: count,
+    outcome,
+    artifacts: semanticArtifacts,
+  };
+  const attemptEvidenceDigest = digestCanonical(
+    "codex-review-gate-v2-candidate-inventory-attempt-evidence",
+    attemptEvidenceWithoutDigest,
+  );
+  const withoutDigest = {
+    schema: V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_MANIFEST_SCHEMA,
+    schema_version: 1,
+    repository: structuredClone(cycle.initial_inventory.repository),
+    attempt_index: index,
+    attempt_count: count,
+    outcome,
+    attempt_evidence_digest: attemptEvidenceDigest,
+    artifact_count: manifestArtifacts.length,
+    artifacts: manifestArtifacts,
+    chunk_count: chunks.length,
+    total_encoded_bytes: totalEncodedBytes,
+    total_decoded_bytes: totalDecodedBytes,
+    attachment_tree_sha: gitObjectSha("tree", treeBytes),
+    attachment_tree_sha256: rawDigest(treeBytes),
+  };
+  const manifest = validateCandidateInventoryAttachmentManifest({
+    ...withoutDigest,
+    manifest_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-attachment-manifest",
+      withoutDigest,
+    ),
+  });
+  return {
+    manifest,
+    chunks,
+    tree_entries: treeEntries,
+    evidence: structuredClone(cycle),
+  };
+}
+
+function validateCandidateInventoryAttachmentManifest(value) {
+  assertObject(value, "candidate inventory attachment manifest");
+  exactKeys(value, [
+    "schema", "schema_version", "repository", "attempt_index",
+    "attempt_count", "outcome", "attempt_evidence_digest",
+    "artifact_count", "artifacts", "chunk_count", "total_encoded_bytes",
+    "total_decoded_bytes", "attachment_tree_sha",
+    "attachment_tree_sha256", "manifest_digest",
+  ], "candidate inventory attachment manifest");
+  if (
+    value.schema !==
+      V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_MANIFEST_SCHEMA ||
+    value.schema_version !== 1
+  ) {
+    throw new Error("candidate inventory attachment manifest schema is unsupported");
+  }
+  const repository = normalizeCandidateRepository(value.repository);
+  const attemptIndex = nonnegativeInteger(
+    value.attempt_index,
+    "candidate inventory attachment attempt_index",
+  );
+  const attemptCount = positiveInteger(
+    value.attempt_count,
+    "candidate inventory attachment attempt_count",
+  );
+  if (attemptIndex >= attemptCount || attemptCount > MAX_V2_CANDIDATE_SCAN_PASSES) {
+    throw new Error("candidate inventory attachment attempt position is invalid");
+  }
+  if (!new Set([
+    "stable",
+    "CANDIDATE_INVENTORY_DRIFT",
+    "CANDIDATE_LIFECYCLE_DRIFT",
+  ]).has(value.outcome)) {
+    throw new Error("candidate inventory attachment outcome is unsupported");
+  }
+  digest(value.attempt_evidence_digest,
+    "candidate inventory attachment attempt_evidence_digest");
+  const artifactCount = positiveInteger(
+    value.artifact_count,
+    "candidate inventory attachment artifact_count",
+  );
+  if (!Array.isArray(value.artifacts) ||
+      artifactCount !== value.artifacts.length ||
+      artifactCount >
+        MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_ARTIFACTS) {
+    throw new Error("candidate inventory attachment artifacts are not bounded");
+  }
+  const paths = new Set();
+  const semanticArtifacts = [];
+  let initialShardIndex = 0;
+  let finalShardIndex = 0;
+  let finalInventorySeen = false;
+  let chunkCount = 0;
+  let totalEncodedBytes = 0;
+  let totalDecodedBytes = 0;
+  for (const [artifactIndex, artifact] of value.artifacts.entries()) {
+    assertObject(artifact,
+      `candidate inventory attachment artifact ${artifactIndex}`);
+    exactKeys(artifact, [
+      "role", "shard_index", "receipt_digest", "observed_at",
+      "decoded_byte_length", "decoded_sha256", "encoding",
+      "encoded_byte_length", "encoded_sha256", "chunk_count", "chunks",
+    ], `candidate inventory attachment artifact ${artifactIndex}`);
+    const validPosition = artifactIndex === 0
+      ? artifact.role === "initial-inventory" && artifact.shard_index === null
+      : !finalInventorySeen && artifact.role === "initial-shard" &&
+          artifact.shard_index === initialShardIndex
+        ? (initialShardIndex += 1, true)
+        : !finalInventorySeen && artifact.role === "final-inventory" &&
+            artifact.shard_index === null
+          ? (finalInventorySeen = true, true)
+          : finalInventorySeen && artifact.role === "final-shard" &&
+              artifact.shard_index === finalShardIndex
+            ? (finalShardIndex += 1, true)
+            : false;
+    if (!validPosition) {
+      throw new Error("candidate inventory attachment artifact order is invalid");
+    }
+    digest(artifact.receipt_digest,
+      `candidate inventory attachment artifact ${artifactIndex}.receipt_digest`);
+    timestamp(artifact.observed_at,
+      `candidate inventory attachment artifact ${artifactIndex}.observed_at`);
+    const decodedBytes = positiveInteger(
+      artifact.decoded_byte_length,
+      `candidate inventory attachment artifact ${artifactIndex}.decoded_byte_length`,
+    );
+    const encodedBytes = positiveInteger(
+      artifact.encoded_byte_length,
+      `candidate inventory attachment artifact ${artifactIndex}.encoded_byte_length`,
+    );
+    digest(artifact.decoded_sha256,
+      `candidate inventory attachment artifact ${artifactIndex}.decoded_sha256`);
+    digest(artifact.encoded_sha256,
+      `candidate inventory attachment artifact ${artifactIndex}.encoded_sha256`);
+    if (artifact.encoding !== "deflate-raw" ||
+        !Array.isArray(artifact.chunks) || artifact.chunks.length === 0 ||
+        artifact.chunk_count !== artifact.chunks.length) {
+      throw new Error("candidate inventory attachment chunks are invalid");
+    }
+    let artifactEncodedBytes = 0;
+    for (const [chunkIndex, chunk] of artifact.chunks.entries()) {
+      assertObject(chunk,
+        `candidate inventory attachment chunk ${artifactIndex}:${chunkIndex}`);
+      exactKeys(chunk, [
+        "path", "chunk_index", "byte_length", "blob_sha", "sha256",
+      ], `candidate inventory attachment chunk ${artifactIndex}:${chunkIndex}`);
+      const expectedPath = `a${String(artifactIndex).padStart(3, "0")}-c${
+        String(chunkIndex).padStart(4, "0")}.bin`;
+      const byteLength = positiveInteger(
+        chunk.byte_length,
+        `candidate inventory attachment chunk ${artifactIndex}:${chunkIndex}.byte_length`,
+      );
+      if (
+        chunk.path !== expectedPath || chunk.chunk_index !== chunkIndex ||
+        paths.has(chunk.path) ||
+        byteLength > MAX_V2_GIT_LEDGER_ATTACHMENT_CHUNK_BYTES
+      ) {
+        throw new Error("candidate inventory attachment chunk order is invalid");
+      }
+      paths.add(chunk.path);
+      sha(chunk.blob_sha,
+        `candidate inventory attachment chunk ${artifactIndex}:${chunkIndex}.blob_sha`);
+      digest(chunk.sha256,
+        `candidate inventory attachment chunk ${artifactIndex}:${chunkIndex}.sha256`);
+      artifactEncodedBytes += byteLength;
+    }
+    if (artifactEncodedBytes !== encodedBytes) {
+      throw new Error("candidate inventory attachment encoded length is inconsistent");
+    }
+    semanticArtifacts.push({
+      role: artifact.role,
+      shard_index: artifact.shard_index,
+      receipt_digest: artifact.receipt_digest,
+      observed_at: artifact.observed_at,
+      decoded_byte_length: decodedBytes,
+      decoded_sha256: artifact.decoded_sha256,
+    });
+    chunkCount += artifact.chunks.length;
+    totalEncodedBytes += encodedBytes;
+    totalDecodedBytes += decodedBytes;
+  }
+  if (
+    !finalInventorySeen ||
+    initialShardIndex > MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_SHARDS ||
+    finalShardIndex > MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_SHARDS ||
+    chunkCount !== value.chunk_count ||
+    totalEncodedBytes !== value.total_encoded_bytes ||
+    totalDecodedBytes !== value.total_decoded_bytes ||
+    chunkCount > MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_CHUNKS ||
+    totalEncodedBytes >
+      MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_ENCODED_BYTES ||
+    totalDecodedBytes >
+      MAX_V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_DECODED_BYTES
+  ) {
+    throw new Error("candidate inventory attachment aggregate bounds are invalid");
+  }
+  if (value.attempt_evidence_digest !== digestCanonical(
+    "codex-review-gate-v2-candidate-inventory-attempt-evidence",
+    {
+      repository: structuredClone(repository),
+      attempt_index: attemptIndex,
+      attempt_count: attemptCount,
+      outcome: value.outcome,
+      artifacts: semanticArtifacts,
+    },
+  )) {
+    throw new Error("candidate inventory attachment evidence digest is invalid");
+  }
+  const treeEntries = value.artifacts.flatMap((artifact) =>
+    artifact.chunks.map((chunk) => ({
+      path: chunk.path,
+      mode: "100644",
+      type: "blob",
+      sha: chunk.blob_sha,
+    })));
+  const treeBytes = canonicalGitTreeBytes(treeEntries);
+  if (
+    sha(value.attachment_tree_sha,
+      "candidate inventory attachment_tree_sha") !==
+      gitObjectSha("tree", treeBytes) ||
+    digest(value.attachment_tree_sha256,
+      "candidate inventory attachment_tree_sha256") !== rawDigest(treeBytes)
+  ) {
+    throw ledgerError(
+      "candidate-inventory-attachment-tree-identity",
+      "candidate inventory attachment tree identity is invalid",
+    );
+  }
+  const { manifest_digest: _manifestDigest, ...withoutDigest } = value;
+  if (value.manifest_digest !== digestCanonical(
+    "codex-review-gate-v2-candidate-inventory-attachment-manifest",
+    withoutDigest,
+  )) {
+    throw new Error("candidate inventory attachment manifest digest is invalid");
+  }
+  return deepFreeze(structuredClone(value));
+}
+
+function checkpointBoundaryError(message) {
+  return ledgerError("CHECKPOINT_SOURCE_BOUNDARY_UNSUPPORTED", message);
+}
+
+function validateBootstrapOnlyCheckpointBoundary(loaded) {
+  if (loaded === null || typeof loaded !== "object") {
+    throw checkpointBoundaryError(
+      "checkpoint source must be one fully loaded bootstrap authority",
+    );
+  }
+  const records = loaded.records;
+  const inventory = loaded.authority_projection?.candidate_inventory;
+  const dispatch = loaded.authority_projection?.candidate_dispatch;
+  const expectedTypes = [
+    "genesis",
+    "capability-canary",
+    "capability-attestation",
+  ];
+  if (
+    !Array.isArray(records) || records.length !== 3 ||
+    records.some((entry, index) =>
+      entry?.envelope?.record_type !== expectedTypes[index] ||
+      entry.envelope.sequence !== index ||
+      canonicalJson(entry.parents) !== canonicalJson(
+        index === 0 ? [] : [records[index - 1].commit_sha],
+      )) ||
+    loaded.tip_commit_sha !== records[2].commit_sha ||
+    loaded.genesis_commit_sha !== records[0].commit_sha ||
+    (loaded.commit_count ?? records.length) !== 3 ||
+    loaded.active_lease !== null ||
+    loaded.control_comment_binding !== null ||
+    loaded.effect_intent_count !== 0 ||
+    loaded.effect_response_count !== 0 ||
+    inventory === null || inventory === undefined ||
+    !Array.isArray(inventory.source_records) ||
+    inventory.source_records.length !== 0 ||
+    inventory.completed_cycle !== null ||
+    inventory.incomplete_cycle !== null ||
+    inventory.atomic_cycle !== null ||
+    dispatch === null || dispatch === undefined ||
+    !Array.isArray(dispatch.source_records) ||
+    dispatch.source_records.length !== 0 ||
+    !Array.isArray(dispatch.cycles) || dispatch.cycles.length !== 0 ||
+    dispatch.current_cycle !== null ||
+    dispatch.active_reservation !== null
+  ) {
+    throw checkpointBoundaryError(
+      "checkpoint diagnostics currently support only the exact three-record bootstrap boundary",
+    );
+  }
+  return loaded;
+}
+
+function checkpointRecordManifest(records) {
+  return records.map((entry) => ({
+    record_oid: entry.commit_sha,
+    parent_oid: entry.parents[0] ?? null,
+    tree_oid: entry.tree_sha,
+    envelope_digest: entry.envelope.envelope_digest,
+    record_type: entry.envelope.record_type,
+    kind: entry.envelope.kind,
+    effect_id: entry.envelope.effect_id,
+    idempotency_key: entry.envelope.idempotency_key,
+    payload_digest: entry.envelope.payload_digest,
+    workflow_provenance_receipt_digest:
+      entry.envelope.workflow_provenance.receipt_digest,
+    workflow_provenance_jti:
+      provenanceReplayIdentity(entry.envelope.workflow_provenance),
+    server_observed_at: entry.envelope.server_observed_at,
+  }));
+}
+
+function checkpointRollingAuditRoot(records) {
+  let rolling = digestCanonical(
+    "codex-review-gate-v2-checkpoint-audit-root-empty",
+    { record_count: 0 },
+  );
+  for (const [ordinal, entry] of records.entries()) {
+    rolling = digestCanonical(
+      "codex-review-gate-v2-checkpoint-audit-root-step",
+      {
+        prior_root: rolling,
+        ordinal,
+        record_oid: entry.commit_sha,
+        parent_oid: entry.parents[0] ?? null,
+        envelope_digest: entry.envelope.envelope_digest,
+        record_type: entry.envelope.record_type,
+        server_observed_at: entry.envelope.server_observed_at,
+      },
+    );
+  }
+  return rolling;
+}
+
+function checkpointPrefixRecordFact(entry, ordinal) {
+  return {
+    ordinal,
+    record_oid: entry.commit_sha,
+    parent_oid: entry.parents[0] ?? null,
+    tree_oid: entry.tree_sha,
+    blob_oid: entry.blob_sha,
+    record_type: entry.envelope.record_type,
+    sequence: entry.envelope.sequence,
+    envelope_digest: entry.envelope.envelope_digest,
+    payload_digest: entry.envelope.payload_digest,
+    server_observed_at: entry.envelope.server_observed_at,
+    provenance_identity:
+      provenanceReplayIdentity(entry.envelope.workflow_provenance),
+    provenance_receipt_digest:
+      entry.envelope.workflow_provenance.receipt_digest,
+    provenance_token_sha256:
+      entry.envelope.workflow_provenance.token_sha256,
+  };
+}
+
+async function buildBootstrapCheckpointPrefixFrontier({ records, epochId }) {
+  const nodeBytes = new Map();
+  const frontier = createV2PersistentMerkleMap({
+    domain: CHECKPOINT_PREFIX_FRONTIER_DOMAIN,
+    epoch_id: epochId,
+    readBlob: async (objectOid) => {
+      const bytes = nodeBytes.get(objectOid);
+      return bytes === undefined ? null : new Uint8Array(bytes);
+    },
+    writeBlob: async (bytes, { expected_object_oid: expectedObjectOid }) => {
+      const snapshot = Buffer.from(bytes);
+      if (gitObjectSha("blob", snapshot) !== expectedObjectOid) {
+        throw ledgerError(
+          "CHECKPOINT_FRONTIER_OBJECT_MISMATCH",
+          "checkpoint frontier writer received bytes for another object",
+        );
+      }
+      const prior = nodeBytes.get(expectedObjectOid);
+      if (prior !== undefined && !prior.equals(snapshot)) {
+        throw ledgerError(
+          "CHECKPOINT_FRONTIER_OBJECT_MISMATCH",
+          "checkpoint frontier object identity mapped to different bytes",
+        );
+      }
+      nodeBytes.set(expectedObjectOid, snapshot);
+      return expectedObjectOid;
+    },
+  });
+  const updates = [];
+  for (const [ordinal, entry] of records.entries()) {
+    const fact = checkpointPrefixRecordFact(entry, ordinal);
+    updates.push(
+      {
+        key: { kind: "ordinal", ordinal },
+        value: fact,
+      },
+      {
+        key: { kind: "record-oid", record_oid: entry.commit_sha },
+        value: fact,
+      },
+      {
+        key: {
+          kind: "provenance-identity",
+          identity: fact.provenance_identity,
+        },
+        value: {
+          ordinal,
+          record_oid: entry.commit_sha,
+          provenance_receipt_digest: fact.provenance_receipt_digest,
+          provenance_token_sha256: fact.provenance_token_sha256,
+        },
+      },
+    );
+  }
+  const applied = await frontier.apply({
+    root: frontier.emptyRoot(),
+    updates,
+    mode: "insert-only",
+  });
+  const created = applied.created_objects;
+  if (
+    applied.root.count !== updates.length ||
+    created.length !== 2 * updates.length - 1 ||
+    nodeBytes.size !== created.length
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_CLOSURE_MISMATCH",
+      "checkpoint prefix frontier is not one closed Patricia tree",
+    );
+  }
+  const treeEntries = created.map((descriptor) => {
+    const bytes = nodeBytes.get(descriptor.object_oid);
+    if (
+      bytes === undefined || bytes.byteLength !== descriptor.object_bytes ||
+      rawDigest(bytes) !== descriptor.object_sha256 ||
+      bytes.byteLength > MAX_V2_PERSISTENT_FRONTIER_NODE_BYTES
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_FRONTIER_OBJECT_MISMATCH",
+        "checkpoint frontier descriptor differs from its prepared bytes",
+      );
+    }
+    return {
+      path: `n-${descriptor.object_oid}.json`,
+      mode: "100644",
+      type: "blob",
+      sha: descriptor.object_oid,
+    };
+  }).sort((left, right) => left.path.localeCompare(right.path));
+  const rawBytes = [...nodeBytes.values()].reduce(
+    (total, bytes) => total + bytes.byteLength,
+    0,
+  );
+  if (
+    created.length > MAX_V2_PERSISTENT_FRONTIER_OPERATION_OBJECTS ||
+    rawBytes > MAX_V2_PERSISTENT_FRONTIER_OPERATION_BYTES
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_CAP",
+      "checkpoint prefix frontier exceeds its object or raw byte cap",
+    );
+  }
+  const treeSha = canonicalGitTreeSha(treeEntries);
+  const manifest = deepFreeze({
+    domain: CHECKPOINT_PREFIX_FRONTIER_DOMAIN,
+    root: structuredClone(applied.root),
+    tree_sha: treeSha,
+    tree_entry_count: treeEntries.length,
+    node_count: created.length,
+    raw_node_bytes: rawBytes,
+    oid_set_digest: digestCanonical(
+      "codex-review-gate-v2-checkpoint-frontier-oids",
+      treeEntries.map(({ sha: objectOid }) => objectOid).sort(),
+    ),
+  });
+  return {
+    frontier,
+    root: applied.root,
+    node_bytes: nodeBytes,
+    tree_entries: treeEntries,
+    manifest,
+  };
+}
+
+function bootstrapCheckpointEmptyFrontiers(epochId) {
+  const roots = {};
+  for (const [name, domain] of Object.entries(
+    CHECKPOINT_EMPTY_FRONTIER_DOMAINS,
+  )) {
+    const frontier = createV2PersistentMerkleMap({
+      domain,
+      epoch_id: epochId,
+      readBlob: async () => null,
+      writeBlob: async () => {
+        throw ledgerError(
+          "CHECKPOINT_EMPTY_FRONTIER_WRITE",
+          "empty checkpoint frontier unexpectedly attempted a write",
+        );
+      },
+    });
+    roots[name] = frontier.emptyRoot();
+  }
+  return deepFreeze(roots);
+}
+
+function canonicalGitCommitBytes({ treeSha, parents, message, serverTime }) {
+  const at = timestamp(serverTime, "Git commit timestamp");
+  const lines = [
+    `tree ${sha(treeSha, "Git commit tree SHA")}`,
+    ...parents.map((parent) => `parent ${sha(parent, "Git commit parent SHA")}`),
+    `author ${COMMIT_AUTHOR.name} <${COMMIT_AUTHOR.email}> ${gitTimestamp(at)}`,
+    `committer ${COMMIT_AUTHOR.name} <${COMMIT_AUTHOR.email}> ${gitTimestamp(at)}`,
+    "",
+    boundedString(message, "Git commit message", 512),
+  ];
+  return Buffer.from(lines.join("\n"), "utf8");
+}
+
+function planGitLedgerCommitObjects({
+  envelope,
+  parents,
+  candidateInventoryAttachment = null,
+}) {
+  let attachmentTreeSha = null;
+  const attachmentRequests = [];
+  if (candidateInventoryAttachment !== null) {
+    const manifest = validateCandidateInventoryAttachmentManifest(
+      candidateInventoryAttachment.manifest,
+    );
+    if (
+      envelope.record_type !== "candidate-inventory-observation" ||
+      envelope.payload.schema_version !== 2 ||
+      envelope.payload.phase !== "attempt" ||
+      envelope.payload.attachment_manifest.manifest_digest !==
+        manifest.manifest_digest
+    ) {
+      throw ledgerError(
+        "candidate-inventory-attachment-binding",
+        "candidate inventory attachment is not bound by one attempt envelope",
+      );
+    }
+    for (const [index, chunk] of
+      candidateInventoryAttachment.chunks.entries()) {
+      const expected = manifest.artifacts.flatMap((artifact) =>
+        artifact.chunks)[index];
+      const bytes = Buffer.from(chunk.bytes);
+      if (
+        expected === undefined || chunk.path !== expected.path ||
+        bytes.byteLength !== expected.byte_length ||
+        gitObjectSha("blob", bytes) !== expected.blob_sha ||
+        rawDigest(bytes) !== expected.sha256
+      ) {
+        throw ledgerError(
+          "candidate-inventory-attachment-binding",
+          "candidate inventory attachment bytes differ from their manifest",
+        );
+      }
+      attachmentRequests.push({
+        kind: "blob",
+        expected_sha: expected.blob_sha,
+        body: { content: bytes.toString("base64"), encoding: "base64" },
+      });
+    }
+    attachmentTreeSha = manifest.attachment_tree_sha;
+    if (
+      canonicalGitTreeSha(candidateInventoryAttachment.tree_entries) !==
+        attachmentTreeSha
+    ) {
+      throw ledgerError(
+        "candidate-inventory-attachment-tree-identity",
+        "candidate inventory attachment tree changed identity",
+      );
+    }
+    attachmentRequests.push({
+      kind: "tree",
+      expected_sha: attachmentTreeSha,
+      body: {
+        tree: structuredClone(candidateInventoryAttachment.tree_entries),
+      },
+    });
+  }
+  const envelopeBytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
+  if (envelopeBytes.byteLength > MAX_V2_GIT_LEDGER_BLOB_BYTES) {
+    throw ledgerError("blob-size", "Git ledger envelope exceeds its blob cap");
+  }
+  const blobSha = gitObjectSha("blob", envelopeBytes);
+  const rootEntries = [{
+    path: V2_GIT_LEDGER_BLOB_PATH,
+    mode: "100644",
+    type: "blob",
+    sha: blobSha,
+  }, ...(attachmentTreeSha === null ? [] : [{
+    path: V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_PATH,
+    mode: "040000",
+    type: "tree",
+    sha: attachmentTreeSha,
+  }])];
+  const treeSha = canonicalGitTreeSha(rootEntries);
+  const message = commitMessage(envelope);
+  const commitBody = {
+    message,
+    tree: treeSha,
+    parents: structuredClone(parents),
+    author: { ...COMMIT_AUTHOR, date: envelope.server_observed_at },
+    committer: { ...COMMIT_AUTHOR, date: envelope.server_observed_at },
+  };
+  const commitSha = gitObjectSha("commit", canonicalGitCommitBytes({
+    treeSha,
+    parents,
+    message,
+    serverTime: envelope.server_observed_at,
+  }));
+  return deepFreeze({
+    blob_sha: blobSha,
+    tree_sha: treeSha,
+    commit_sha: commitSha,
+    attachment_tree_sha: attachmentTreeSha,
+    root_entries: rootEntries,
+    requests: [
+      ...attachmentRequests,
+      {
+        kind: "blob",
+        expected_sha: blobSha,
+        body: { content: envelopeBytes.toString("utf8"), encoding: "utf-8" },
+      },
+      {
+        kind: "tree",
+        expected_sha: treeSha,
+        body: { tree: rootEntries },
+      },
+      { kind: "commit", expected_sha: commitSha, body: commitBody },
+    ],
+  });
+}
+
+function buildBootstrapCheckpointState({
+  repository,
+  ledgerRef,
+  epochId,
+  rawSource,
+  sourceLoadHandle,
+  admissionHandle,
+  admissionPrivate,
+  capability,
+  prefixFrontier,
+}) {
+  const sourceManifest = checkpointRecordManifest(rawSource.records);
+  const sourceAttestation = rawSource.records.find((entry) =>
+    entry.commit_sha === sourceLoadHandle.capability_attestation_commit_sha);
+  if (
+    sourceAttestation?.envelope.record_type !== "capability-attestation" ||
+    rawSource.latest_capability === null
+  ) {
+    throw checkpointBoundaryError(
+      "checkpoint source lacks its exact bootstrap capability activation",
+    );
+  }
+  const capabilityActivation = {
+    attestation_commit_sha:
+      rawSource.latest_capability.attestation_commit_sha,
+    capability_input_digest:
+      rawSource.latest_capability.capability_input_digest,
+    capability_stable_digest:
+      rawSource.latest_capability.capability_stable_digest,
+    capability_receipt:
+      structuredClone(rawSource.latest_capability.capability_receipt),
+    protection_receipt_digest:
+      rawSource.latest_capability.protection_receipt_digest,
+    controller_release:
+      structuredClone(rawSource.latest_capability.controller_release),
+    oidc_attestation_digest:
+      sourceAttestation.envelope.workflow_provenance.receipt_digest,
+  };
+  const withoutDigest = {
+    schema: V2_GIT_LEDGER_CHECKPOINT_STATE_SCHEMA,
+    schema_version: 1,
+    profile: CHECKPOINT_PROFILE,
+    repository: structuredClone(repository),
+    ledger_ref: ledgerRef,
+    epoch_id: epochId,
+    epoch_sequence: 0,
+    source: {
+      tip_commit_sha: rawSource.tip_commit_sha,
+      genesis_commit_sha: rawSource.genesis_commit_sha,
+      commit_count: rawSource.records.length,
+      source_load_digest: sourceLoadHandle.source_load_digest,
+      record_manifest_digest: digestCanonical(
+        "codex-review-gate-v2-fully-reachable-record-manifest",
+        sourceManifest,
+      ),
+      rolling_audit_root: checkpointRollingAuditRoot(rawSource.records),
+      provenance_reverification_digest: digestCanonical(
+        "codex-review-gate-v2-git-ledger-provenance-reverification-inventory",
+        rawSource.provenance_reverification,
+      ),
+      capability_attestation_commit_sha:
+        sourceLoadHandle.capability_attestation_commit_sha,
+      stable_capability_digest:
+        digestV2GitLedgerStableCapabilityAuthorization(capability),
+      capability_activation: capabilityActivation,
+      query_records: rawSource.records.map(redactRecordEntry),
+      provenance_reverification:
+        structuredClone(rawSource.provenance_reverification),
+      observed_at: rawSource.observed_at,
+    },
+    next_unit: {
+      kind: admissionHandle.next_unit_kind,
+      admission_digest: admissionHandle.next_unit_admission_digest,
+      cycle_id: admissionHandle.cycle_id,
+      stable_cycle_receipt_digest:
+        admissionHandle.stable_cycle_receipt_digest,
+      stable_command_authority_digest:
+        admissionHandle.stable_command_authority_digest,
+      trigger_identity_digest: admissionHandle.trigger_identity_digest,
+      projection_digest: admissionHandle.projection_digest,
+      classification_projection:
+        structuredClone(admissionPrivate.projection),
+      semantic_record_count: admissionPrivate.drift_attempts.length + 4,
+      total_commit_budget_required:
+        admissionHandle.total_commit_budget_required,
+      current_epoch_remaining_commit_capacity:
+        admissionHandle.current_epoch_remaining_commit_capacity,
+      fresh_epoch_remaining_commit_capacity:
+        admissionHandle.fresh_epoch_remaining_commit_capacity,
+    },
+    prefix_frontier: structuredClone(prefixFrontier.manifest),
+    empty_frontiers: bootstrapCheckpointEmptyFrontiers(epochId),
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    checkpoint_state_digest: digestCanonical(
+      "codex-review-gate-v2-checkpoint-state",
+      withoutDigest,
+    ),
+  });
+}
+
+function validateBootstrapCheckpointSourceProvenanceEvidence(
+  value,
+  record,
+  capability,
+  index,
+) {
+  const label = `checkpoint source provenance evidence ${index}`;
+  try {
+    assertObject(value, label);
+    exactKeys(value, [
+      "record_oid", "stored_receipt_digest", "live_receipt_digest",
+      "token_sha256", "key_id", "verified_at_server_time",
+      "discovery", "jwks", "evidence_digest",
+    ], label);
+    sha(value.record_oid, `${label}.record_oid`);
+    for (const field of [
+      "stored_receipt_digest", "live_receipt_digest", "token_sha256",
+      "evidence_digest",
+    ]) digest(value[field], `${label}.${field}`);
+    boundedString(value.key_id, `${label}.key_id`, 512);
+    timestamp(value.verified_at_server_time,
+      `${label}.verified_at_server_time`);
+    const storedReceipt = record.envelope.workflow_provenance;
+    const reconstructedLiveReceipt = {
+      ...structuredClone(storedReceipt),
+      discovery: structuredClone(value.discovery),
+      jwks: structuredClone(value.jwks),
+      receipt_digest: value.live_receipt_digest,
+    };
+    const provenanceRequest = validateProvenanceRequest({
+      schema: V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
+      schema_version: 1,
+      ...structuredClone(storedReceipt.operation_binding),
+    });
+    validateV2GitLedgerProvenanceReceipt(reconstructedLiveReceipt, {
+      request: provenanceRequest,
+      policy: capability.workflow_provenance_policy,
+    });
+    validateReverifiedProvenanceStableFields(
+      storedReceipt,
+      reconstructedLiveReceipt,
+    );
+    validateReverifiedProvenanceAgainstPolicy(
+      reconstructedLiveReceipt,
+      capability.workflow_provenance_policy,
+    );
+    const { evidence_digest: _evidenceDigest, ...withoutDigest } = value;
+    if (
+      value.record_oid !== record.commit_sha ||
+      value.stored_receipt_digest !== storedReceipt.receipt_digest ||
+      value.token_sha256 !== storedReceipt.token_sha256 ||
+      value.key_id !== storedReceipt.key_id ||
+      value.verified_at_server_time !==
+        storedReceipt.verified_at_server_time ||
+      digestCanonical(
+        "codex-review-gate-v2-git-ledger-provenance-reverification",
+        withoutDigest,
+      ) !== value.evidence_digest
+    ) {
+      throw new Error(`${label} differs from its query record`);
+    }
+  } catch (error) {
+    if (error?.code === "CHECKPOINT_SOURCE_PROVENANCE_EVIDENCE") throw error;
+    throw ledgerError(
+      "CHECKPOINT_SOURCE_PROVENANCE_EVIDENCE",
+      `${label} is not exact stored-to-live verification evidence`,
+      error,
+    );
+  }
+}
+
+function validateBootstrapCheckpointSourceQuery({
+  records,
+  provenanceReverification,
+  repository,
+  ledgerRef,
+  observedAt,
+}) {
+  validateReachableChain(records, observedAt);
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    const envelope = record.envelope;
+    const capability = envelope.record_type === "capability-attestation"
+      ? validateEmbeddedCapability(envelope.payload, repository, ledgerRef)
+      : validateEmbeddedBootstrapCandidate(
+        envelope.payload,
+        repository,
+        ledgerRef,
+      );
+    if (
+      canonicalJson(envelope.repository) !== canonicalJson(repository) ||
+      envelope.ledger_ref !== ledgerRef ||
+      canonicalJson(envelope.source_workflow) !==
+        canonicalJson(sourceWorkflow(capability.controller_release)) ||
+      !provenanceMatchesExpected(envelope.workflow_provenance, {
+        repository,
+        ledger_ref: ledgerRef,
+        source_workflow: sourceWorkflow(capability.controller_release),
+        provenance_policy: provenanceExpected(capability),
+      })
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_SOURCE_PROVENANCE_BINDING",
+        "checkpoint query record differs from its embedded source authority",
+      );
+    }
+    if (
+      envelope.record_type === "capability-attestation" &&
+      (
+        envelope.payload.protection_receipt_digest !==
+          capability.protection.live_ruleset_receipt_digest ||
+        canonicalJson(envelope.payload.controller_release) !==
+          canonicalJson(capability.controller_release)
+      )
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_SOURCE_CAPABILITY_BINDING",
+        "checkpoint attestation does not activate its embedded capability",
+      );
+    }
+    validateBootstrapCheckpointSourceProvenanceEvidence(
+      provenanceReverification[index],
+      record,
+      capability,
+      index,
+    );
+  }
+}
+
+function validateBootstrapCheckpointState(value) {
+  assertObject(value, "checkpoint state");
+  exactKeys(value, [
+    "schema", "schema_version", "profile", "repository", "ledger_ref",
+    "epoch_id", "epoch_sequence", "source", "next_unit",
+    "prefix_frontier", "empty_frontiers", "checkpoint_state_digest",
+  ], "checkpoint state");
+  if (
+    value.schema !== V2_GIT_LEDGER_CHECKPOINT_STATE_SCHEMA ||
+    value.schema_version !== 1 || value.profile !== CHECKPOINT_PROFILE ||
+    value.epoch_sequence !== 0
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_STATE_SCHEMA",
+      "checkpoint state schema or profile is unsupported",
+    );
+  }
+  normalizeRepository(value.repository);
+  normalizeLedgerRef(value.ledger_ref);
+  digest(value.epoch_id, "checkpoint state epoch_id");
+  assertObject(value.source, "checkpoint state source");
+  exactKeys(value.source, [
+    "tip_commit_sha", "genesis_commit_sha", "commit_count",
+    "source_load_digest", "record_manifest_digest", "rolling_audit_root",
+    "provenance_reverification_digest", "capability_attestation_commit_sha",
+    "stable_capability_digest", "capability_activation", "query_records",
+    "provenance_reverification", "observed_at",
+  ], "checkpoint state source");
+  sha(value.source.tip_commit_sha, "checkpoint source tip");
+  sha(value.source.genesis_commit_sha, "checkpoint source genesis");
+  if (value.source.commit_count !== 3) {
+    throw checkpointBoundaryError(
+      "checkpoint state does not represent the exact bootstrap prefix",
+    );
+  }
+  for (const field of [
+    "source_load_digest", "record_manifest_digest", "rolling_audit_root",
+    "provenance_reverification_digest", "stable_capability_digest",
+  ]) digest(value.source[field], `checkpoint source ${field}`);
+  sha(
+    value.source.capability_attestation_commit_sha,
+    "checkpoint source capability attestation",
+  );
+  assertObject(
+    value.source.capability_activation,
+    "checkpoint source capability activation",
+  );
+  exactKeys(value.source.capability_activation, [
+    "attestation_commit_sha", "capability_input_digest",
+    "capability_stable_digest", "capability_receipt",
+    "protection_receipt_digest", "controller_release",
+    "oidc_attestation_digest",
+  ], "checkpoint source capability activation");
+  const activation = value.source.capability_activation;
+  sha(
+    activation.attestation_commit_sha,
+    "checkpoint capability activation attestation",
+  );
+  for (const field of [
+    "capability_input_digest", "capability_stable_digest",
+    "protection_receipt_digest", "oidc_attestation_digest",
+  ]) {
+    digest(activation[field], `checkpoint capability activation ${field}`);
+  }
+  const embeddedCapability = validateV2GitLedgerCapabilityReceipt(
+    activation.capability_receipt,
+    { repository: value.repository, ledger_ref: value.ledger_ref },
+  );
+  const embeddedRelease = normalizeControllerRelease(
+    activation.controller_release,
+  );
+  if (
+    activation.attestation_commit_sha !==
+      value.source.capability_attestation_commit_sha ||
+    activation.capability_stable_digest !==
+      value.source.stable_capability_digest ||
+    activation.capability_stable_digest !==
+      digestV2GitLedgerStableCapabilityAuthorization(embeddedCapability) ||
+    activation.capability_input_digest !==
+      capabilityBindingDigest(embeddedCapability) ||
+    activation.protection_receipt_digest !==
+      embeddedCapability.protection.live_ruleset_receipt_digest ||
+    canonicalJson(embeddedRelease) !==
+      canonicalJson(embeddedCapability.controller_release)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_CAPABILITY_ACTIVATION",
+      "checkpoint capability activation differs from its authenticated source",
+    );
+  }
+  if (
+    !Array.isArray(value.source.query_records) ||
+    value.source.query_records.length !== 3 ||
+    !Array.isArray(value.source.provenance_reverification) ||
+    value.source.provenance_reverification.length !== 3
+  ) {
+    throw checkpointBoundaryError(
+      "checkpoint query seed is not the exact bounded bootstrap prefix",
+    );
+  }
+  const queryRecords = value.source.query_records;
+  const sourceObservedAt = timestamp(
+    value.source.observed_at,
+    "checkpoint source observed_at",
+  );
+  const queryTypes = ["genesis", "capability-canary", "capability-attestation"];
+  for (let index = 0; index < queryRecords.length; index += 1) {
+    const entry = queryRecords[index];
+    assertObject(entry, `checkpoint query record ${index}`);
+    exactKeys(entry, [
+      "commit_sha", "parents", "tree_sha", "blob_sha", "envelope",
+      "evidence",
+    ], `checkpoint query record ${index}`);
+    sha(entry.commit_sha, `checkpoint query record ${index} commit`);
+    sha(entry.tree_sha, `checkpoint query record ${index} tree`);
+    sha(entry.blob_sha, `checkpoint query record ${index} blob`);
+    validateV2GitLedgerPublicEnvelope(entry.envelope);
+    validateCanonicalJsonValue(
+      entry.evidence,
+      `checkpoint query record ${index} evidence`,
+    );
+    if (
+      entry.envelope.record_type !== queryTypes[index] ||
+      entry.envelope.sequence !== index ||
+      canonicalJson(entry.envelope.repository) !==
+        canonicalJson(value.repository) ||
+      entry.envelope.ledger_ref !== value.ledger_ref ||
+      canonicalJson(entry.parents) !== canonicalJson(
+        index === 0 ? [] : [queryRecords[index - 1].commit_sha],
+      ) ||
+      entry.envelope.predecessor_commit_sha !==
+        (index === 0 ? null : queryRecords[index - 1].commit_sha)
+    ) {
+      throw checkpointBoundaryError(
+        "checkpoint query records are not one exact bootstrap chain",
+      );
+    }
+  }
+  if (
+    queryRecords[0].commit_sha !== value.source.genesis_commit_sha ||
+    queryRecords[2].commit_sha !== value.source.tip_commit_sha ||
+    digestCanonical(
+      "codex-review-gate-v2-fully-reachable-record-manifest",
+      checkpointRecordManifest(queryRecords),
+    ) !== value.source.record_manifest_digest ||
+    checkpointRollingAuditRoot(queryRecords) !==
+      value.source.rolling_audit_root ||
+    digestCanonical(
+      "codex-review-gate-v2-git-ledger-provenance-reverification-inventory",
+      value.source.provenance_reverification,
+    ) !== value.source.provenance_reverification_digest ||
+    queryRecords[2].envelope.workflow_provenance.receipt_digest !==
+      activation.oidc_attestation_digest ||
+    queryRecords[2].envelope.payload.capability_input_digest !==
+      activation.capability_input_digest ||
+    queryRecords[2].envelope.payload.capability_stable_digest !==
+      activation.capability_stable_digest ||
+    canonicalJson(queryRecords[2].envelope.payload.capability_receipt) !==
+      canonicalJson(activation.capability_receipt)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_QUERY_SEED",
+      "checkpoint query seed differs from its authenticated source facts",
+    );
+  }
+  validateBootstrapCheckpointSourceQuery({
+    records: queryRecords,
+    provenanceReverification: value.source.provenance_reverification,
+    repository: value.repository,
+    ledgerRef: value.ledger_ref,
+    observedAt: sourceObservedAt,
+  });
+  assertObject(value.next_unit, "checkpoint next unit");
+  exactKeys(value.next_unit, [
+    "kind", "admission_digest", "cycle_id",
+    "stable_cycle_receipt_digest", "stable_command_authority_digest",
+    "trigger_identity_digest", "projection_digest",
+    "classification_projection", "semantic_record_count",
+    "total_commit_budget_required",
+    "current_epoch_remaining_commit_capacity",
+    "fresh_epoch_remaining_commit_capacity",
+  ], "checkpoint next unit");
+  if (
+    value.next_unit.kind !== "candidate-inventory-cycle" ||
+    value.next_unit.semantic_record_count < 4 ||
+    value.next_unit.semantic_record_count > MAX_V2_CANDIDATE_SCAN_PASSES + 3
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_NEXT_UNIT_SCHEMA",
+      "checkpoint next unit is outside the closed candidate-cycle profile",
+    );
+  }
+  boundedString(value.next_unit.cycle_id, "checkpoint next unit cycle_id", 128);
+  for (const field of [
+    "admission_digest", "stable_cycle_receipt_digest",
+    "stable_command_authority_digest", "trigger_identity_digest",
+    "projection_digest",
+  ]) digest(value.next_unit[field], `checkpoint next unit ${field}`);
+  positiveInteger(
+    value.next_unit.total_commit_budget_required,
+    "checkpoint next unit total commit budget",
+  );
+  integerBetween(
+    value.next_unit.current_epoch_remaining_commit_capacity,
+    -MAX_V2_GIT_LEDGER_COMMITS,
+    MAX_V2_GIT_LEDGER_COMMITS,
+    "checkpoint next unit current epoch remaining capacity",
+  );
+  integerBetween(
+    value.next_unit.fresh_epoch_remaining_commit_capacity,
+    -MAX_V2_GIT_LEDGER_COMMITS,
+    MAX_V2_GIT_LEDGER_COMMITS,
+    "checkpoint next unit fresh epoch remaining capacity",
+  );
+  assertObject(
+    value.next_unit.classification_projection,
+    "checkpoint next unit classification projection",
+  );
+  const classification = value.next_unit.classification_projection;
+  const { projection_digest: classificationDigest, ...classificationFacts } =
+    classification;
+  if (
+    digest(classificationDigest, "checkpoint classification projection") !==
+      value.next_unit.projection_digest ||
+    classificationDigest !== digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-cycle-classification",
+      classificationFacts,
+    ) ||
+    classification.state !== "checkpoint-required" ||
+    classification.source_tip_commit_sha !== value.source.tip_commit_sha ||
+    classification.source_commit_count !== value.source.commit_count ||
+    classification.total_commit_budget_required !==
+      value.next_unit.total_commit_budget_required ||
+    classification.remaining_ledger_commit_capacity_after_dispatch !==
+      value.next_unit.current_epoch_remaining_commit_capacity
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_NEXT_UNIT_PROJECTION",
+      "checkpoint next-unit classification is not its authenticated admission",
+    );
+  }
+  const admissionFacts = {
+    schema: V2_GIT_LEDGER_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE_SCHEMA,
+    schema_version: 1,
+    repository: structuredClone(value.repository),
+    ledger_ref: value.ledger_ref,
+    source_load_digest: value.source.source_load_digest,
+    next_unit_kind: value.next_unit.kind,
+    cycle_id: value.next_unit.cycle_id,
+    stable_cycle_receipt_digest:
+      value.next_unit.stable_cycle_receipt_digest,
+    stable_command_authority_digest:
+      value.next_unit.stable_command_authority_digest,
+    trigger_identity_digest: value.next_unit.trigger_identity_digest,
+    projection_digest: value.next_unit.projection_digest,
+    total_commit_budget_required:
+      value.next_unit.total_commit_budget_required,
+    current_epoch_remaining_commit_capacity:
+      value.next_unit.current_epoch_remaining_commit_capacity,
+    fresh_epoch_remaining_commit_capacity:
+      value.next_unit.fresh_epoch_remaining_commit_capacity,
+  };
+  if (value.next_unit.admission_digest !== digestCanonical(
+    "codex-review-gate-v2-checkpoint-next-unit-admission",
+    admissionFacts,
+  )) {
+    throw ledgerError(
+      "CHECKPOINT_NEXT_UNIT_ADMISSION",
+      "checkpoint next-unit admission digest cannot be independently replayed",
+    );
+  }
+  validateCheckpointPrefixFrontierManifest(value.prefix_frontier);
+  assertObject(value.empty_frontiers, "checkpoint empty frontiers");
+  exactKeys(
+    value.empty_frontiers,
+    Object.keys(CHECKPOINT_EMPTY_FRONTIER_DOMAINS),
+    "checkpoint empty frontiers",
+  );
+  for (const [name, domain] of Object.entries(
+    CHECKPOINT_EMPTY_FRONTIER_DOMAINS,
+  )) {
+    const expected = createV2PersistentMerkleMap({
+      domain,
+      epoch_id: value.epoch_id,
+      readBlob: async () => null,
+      writeBlob: async () => null,
+    }).emptyRoot();
+    if (canonicalJson(value.empty_frontiers[name]) !== canonicalJson(expected)) {
+      throw ledgerError(
+        "CHECKPOINT_EMPTY_FRONTIER_MISMATCH",
+        "checkpoint empty frontier root is not canonical",
+      );
+    }
+  }
+  digest(value.checkpoint_state_digest, "checkpoint state digest");
+  const { checkpoint_state_digest: _digest, ...withoutDigest } = value;
+  if (value.checkpoint_state_digest !== digestCanonical(
+    "codex-review-gate-v2-checkpoint-state",
+    withoutDigest,
+  )) {
+    throw ledgerError(
+      "CHECKPOINT_STATE_DIGEST",
+      "checkpoint state digest is invalid",
+    );
+  }
+  return deepFreeze(structuredClone(value));
+}
+
+function bootstrapCheckpointQuerySeedDigest(checkpointState) {
+  return digestCanonical(
+    "codex-review-gate-v2-bootstrap-checkpoint-query-seed",
+    {
+      profile: checkpointState.profile,
+      repository: checkpointState.repository,
+      ledger_ref: checkpointState.ledger_ref,
+      epoch_id: checkpointState.epoch_id,
+      source: checkpointState.source,
+      prefix_frontier: checkpointState.prefix_frontier,
+      empty_frontiers: checkpointState.empty_frontiers,
+    },
+  );
+}
+
+function checkpointLatestCapabilitySeed(checkpointState) {
+  const activation = checkpointState.source.capability_activation;
+  return deepFreeze({
+    attestation_commit_sha: activation.attestation_commit_sha,
+    capability_input_digest: activation.capability_input_digest,
+    capability_stable_digest: activation.capability_stable_digest,
+    capability_receipt: structuredClone(activation.capability_receipt),
+    protection_receipt_digest: activation.protection_receipt_digest,
+    controller_release: structuredClone(activation.controller_release),
+    payload: null,
+  });
+}
+
+function validateCheckpointCapabilityAgainstFactory(
+  checkpointState,
+  capability,
+) {
+  const activation = checkpointState.source.capability_activation;
+  if (
+    checkpointState.source.stable_capability_digest !==
+      digestV2GitLedgerStableCapabilityAuthorization(capability) ||
+    activation.capability_stable_digest !==
+      digestV2GitLedgerStableCapabilityAuthorization(capability) ||
+    activation.protection_receipt_digest !==
+      capability.protection.live_ruleset_receipt_digest ||
+    canonicalJson(activation.controller_release) !==
+      canonicalJson(capability.controller_release)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_CAPABILITY_MISMATCH",
+      "checkpoint capability seed differs from this factory authority",
+    );
+  }
+  return checkpointLatestCapabilitySeed(checkpointState);
+}
+
+function bootstrapCheckpointAuthorityDigest(authority) {
+  const stableOrderedRecords = authority.ordered_records.map((entry) => {
+    const { evidence: _readEvidence, ...stableEntry } = entry;
+    return stableEntry;
+  });
+  return digestCanonical(
+    "codex-review-gate-v2-bootstrap-checkpoint-future-authority",
+    {
+      schema: authority.schema,
+      schema_version: authority.schema_version,
+      scope: authority.scope,
+      ordered_records: stableOrderedRecords,
+      authority_facts: authority.authority_facts,
+      scope_counters: authority.scope_counters,
+      control_comment_binding: authority.control_comment_binding,
+      candidate_inventory: authority.candidate_inventory,
+      candidate_dispatch: authority.candidate_dispatch,
+      runner_state: authority.runner_state,
+      source_projection_digest: authority.source_projection_digest,
+    },
+  );
+}
+
+function bootstrapCheckpointFutureState({
+  checkpointCommitSha,
+  checkpointState,
+  suffixRecords,
+  projectedState,
+  firstDispatchPlan,
+}) {
+  const epochRecordOffset = 1;
+  const epochCommitCount = epochRecordOffset + suffixRecords.length;
+  const nextSequence = suffixRecords.at(-1).envelope.sequence + 1;
+  if (nextSequence !== epochCommitCount) {
+    throw ledgerError(
+      "CHECKPOINT_SUFFIX_SEQUENCE",
+      "checkpoint future state sequence differs from its epoch commit count",
+    );
+  }
+  const querySeedDigest = bootstrapCheckpointQuerySeedDigest(checkpointState);
+  const withoutDigest = {
+    profile: CHECKPOINT_PROFILE,
+    epoch_id: checkpointState.epoch_id,
+    epoch_root_commit_sha: checkpointCommitSha,
+    epoch_record_offset: epochRecordOffset,
+    epoch_commit_count: epochCommitCount,
+    next_sequence: nextSequence,
+    logical_record_count:
+      checkpointState.source.commit_count + epochCommitCount,
+    checkpoint_state_digest: checkpointState.checkpoint_state_digest,
+    query_seed_digest: querySeedDigest,
+    suffix_tip_commit_sha: suffixRecords.at(-1).commit_sha,
+    source_projection_digest: projectedState.projection.projection_digest,
+    authority_projection_digest:
+      bootstrapCheckpointAuthorityDigest(
+        projectedState.authority_projection,
+      ),
+    candidate_inventory_authority_digest:
+      projectedState.authority_projection.candidate_inventory.authority_digest,
+    candidate_dispatch_authority_digest:
+      projectedState.authority_projection.candidate_dispatch.authority_digest,
+    first_dispatch_plan_digest: firstDispatchPlan?.plan_digest ?? null,
+    active_lease: projectedState.active_lease,
+    control_comment_binding: projectedState.control_comment_binding,
+    effect_intent_count: projectedState.effect_intent_count,
+    effect_response_count: projectedState.effect_response_count,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    future_state_digest: digestCanonical(
+      "codex-review-gate-v2-bootstrap-checkpoint-future-state",
+      withoutDigest,
+    ),
+  });
+}
+
+function validateCheckpointPrefixFrontierManifest(value) {
+  assertObject(value, "checkpoint prefix frontier manifest");
+  exactKeys(value, [
+    "domain", "root", "tree_sha", "tree_entry_count", "node_count",
+    "raw_node_bytes", "oid_set_digest",
+  ], "checkpoint prefix frontier manifest");
+  if (value.domain !== CHECKPOINT_PREFIX_FRONTIER_DOMAIN) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_DOMAIN",
+      "checkpoint prefix frontier domain is invalid",
+    );
+  }
+  sha(value.tree_sha, "checkpoint prefix frontier tree SHA");
+  const entryCount = positiveInteger(
+    value.tree_entry_count,
+    "checkpoint prefix frontier tree entry count",
+  );
+  const nodeCount = positiveInteger(
+    value.node_count,
+    "checkpoint prefix frontier node count",
+  );
+  const rawBytes = positiveInteger(
+    value.raw_node_bytes,
+    "checkpoint prefix frontier raw bytes",
+  );
+  digest(value.oid_set_digest, "checkpoint prefix frontier OID set digest");
+  if (
+    entryCount !== nodeCount ||
+    nodeCount > MAX_V2_PERSISTENT_FRONTIER_OPERATION_OBJECTS ||
+    rawBytes > MAX_V2_PERSISTENT_FRONTIER_OPERATION_BYTES ||
+    value.root?.count !== 9 || nodeCount !== 2 * value.root.count - 1
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_CAP",
+      "checkpoint prefix frontier manifest exceeds its closed profile",
+    );
+  }
+  return value;
+}
+
+function checkpointCarrierPayload({
+  repository,
+  ledgerRef,
+  epochId,
+  sourceTipCommitSha,
+  checkpointState,
+  stateTreeSha,
+}) {
+  const withoutDigest = {
+    profile: CHECKPOINT_PROFILE,
+    repository: structuredClone(repository),
+    ledger_ref: ledgerRef,
+    epoch_id: epochId,
+    epoch_sequence: 0,
+    source_parent_commit_sha: sourceTipCommitSha,
+    source_commit_count: 3,
+    checkpoint_state_tree_sha: stateTreeSha,
+    checkpoint_state_digest: checkpointState.checkpoint_state_digest,
+    prefix_frontier_tree_sha: checkpointState.prefix_frontier.tree_sha,
+    next_unit_admission_digest:
+      checkpointState.next_unit.admission_digest,
+    semantic_record_count: checkpointState.next_unit.semantic_record_count,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    payload_digest: digestCanonical(
+      "codex-review-gate-v2-checkpoint-carrier-payload",
+      withoutDigest,
+    ),
+  });
+}
+
+function sealCheckpointCarrier({
+  payload,
+  serverTime,
+  sourceWorkflowValue,
+  workflowProvenance,
+  workflowProvenanceJwt,
+}) {
+  const base = {
+    schema: V2_GIT_LEDGER_CHECKPOINT_CARRIER_SCHEMA,
+    schema_version: 1,
+    record_type: "epoch-checkpoint",
+    server_observed_at: serverTime,
+    payload: structuredClone(payload),
+    payload_digest: payload.payload_digest,
+    source_workflow: structuredClone(sourceWorkflowValue),
+    workflow_provenance: structuredClone(workflowProvenance),
+    workflow_provenance_jwt: workflowProvenanceJwt,
+  };
+  return deepFreeze({
+    ...base,
+    carrier_digest: digestCanonical(
+      "codex-review-gate-v2-checkpoint-carrier",
+      base,
+    ),
+  });
+}
+
+function validateCheckpointCarrier(value, {
+  repository,
+  ledgerRef,
+  sourceTipCommitSha,
+  checkpointState,
+  stateTreeSha,
+  capability,
+}) {
+  assertObject(value, "checkpoint carrier");
+  exactKeys(value, [
+    "schema", "schema_version", "record_type", "server_observed_at",
+    "payload", "payload_digest", "source_workflow",
+    "workflow_provenance", "workflow_provenance_jwt", "carrier_digest",
+  ], "checkpoint carrier");
+  if (
+    value.schema !== V2_GIT_LEDGER_CHECKPOINT_CARRIER_SCHEMA ||
+    value.schema_version !== 1 || value.record_type !== "epoch-checkpoint"
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_CARRIER_SCHEMA",
+      "checkpoint carrier schema is unsupported",
+    );
+  }
+  const expectedPayload = checkpointCarrierPayload({
+    repository,
+    ledgerRef,
+    epochId: checkpointState.epoch_id,
+    sourceTipCommitSha,
+    checkpointState,
+    stateTreeSha,
+  });
+  if (
+    canonicalJson(value.payload) !== canonicalJson(expectedPayload) ||
+    value.payload_digest !== expectedPayload.payload_digest ||
+    canonicalJson(value.source_workflow) !== canonicalJson(
+      sourceWorkflow(capability.controller_release),
+    )
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_CARRIER_BINDING",
+      "checkpoint carrier differs from its source and state binding",
+    );
+  }
+  timestamp(value.server_observed_at, "checkpoint carrier server time");
+  compactOidcJwt(value.workflow_provenance_jwt);
+  const identity = {
+    record_type: "epoch-checkpoint",
+    kind: null,
+    effect_id: null,
+    idempotency_key: null,
+    payload_digest: value.payload_digest,
+  };
+  const binding = value.workflow_provenance?.operation_binding;
+  if (
+    binding?.operation !== "checkpoint-rotate" ||
+    canonicalJson(binding.repository) !== canonicalJson(repository) ||
+    binding.ledger_ref !== ledgerRef ||
+    binding.predecessor_commit_sha !== sourceTipCommitSha ||
+    binding.protection_receipt_digest !==
+      capability.protection.live_ruleset_receipt_digest ||
+    binding.github_server_time !== value.server_observed_at ||
+    canonicalJson(binding.source_workflow) !== canonicalJson(
+      sourceWorkflow(capability.controller_release),
+    ) ||
+    binding.effect_scope !== null ||
+    binding.evaluated_scope_receipt !== null ||
+    canonicalJson(binding.record_identity) !== canonicalJson(identity)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_PROVENANCE_BINDING",
+      "checkpoint provenance does not bind its exact carrier payload",
+    );
+  }
+  digest(value.carrier_digest, "checkpoint carrier digest");
+  const { carrier_digest: _digest, ...withoutDigest } = value;
+  if (value.carrier_digest !== digestCanonical(
+    "codex-review-gate-v2-checkpoint-carrier",
+    withoutDigest,
+  )) {
+    throw ledgerError(
+      "CHECKPOINT_CARRIER_DIGEST",
+      "checkpoint carrier digest is invalid",
+    );
+  }
+  return deepFreeze(structuredClone(value));
+}
+
+function checkpointStateTreeLayout(checkpointState) {
+  const stateBytes = Buffer.from(`${canonicalJson(checkpointState)}\n`, "utf8");
+  if (stateBytes.byteLength > MAX_V2_GIT_LEDGER_BLOB_BYTES) {
+    throw ledgerError(
+      "CHECKPOINT_STATE_SIZE",
+      "checkpoint state exceeds its Git blob cap",
+    );
+  }
+  const stateBlobSha = gitObjectSha("blob", stateBytes);
+  const entries = [{
+    path: V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH,
+    mode: "100644",
+    type: "blob",
+    sha: stateBlobSha,
+  }, {
+    path: V2_GIT_LEDGER_CHECKPOINT_FRONTIER_NODES_PATH,
+    mode: "040000",
+    type: "tree",
+    sha: checkpointState.prefix_frontier.tree_sha,
+  }];
+  return {
+    state_bytes: stateBytes,
+    state_blob_sha: stateBlobSha,
+    entries,
+    tree_sha: canonicalGitTreeSha(entries),
+  };
+}
+
+function planBootstrapCheckpointObjects({
+  checkpointState,
+  prefixFrontier,
+  carrier,
+  sourceTipCommitSha,
+}) {
+  validateBootstrapCheckpointState(checkpointState);
+  const frontierRequests = prefixFrontier.tree_entries.map((entry) => {
+    const bytes = prefixFrontier.node_bytes.get(entry.sha);
+    return {
+      kind: "blob",
+      expected_sha: entry.sha,
+      body: { content: bytes.toString("base64"), encoding: "base64" },
+    };
+  });
+  const frontierTreeRequest = {
+    kind: "tree",
+    expected_sha: checkpointState.prefix_frontier.tree_sha,
+    body: { tree: structuredClone(prefixFrontier.tree_entries) },
+  };
+  const stateLayout = checkpointStateTreeLayout(checkpointState);
+  const stateBytes = stateLayout.state_bytes;
+  const stateBlobSha = stateLayout.state_blob_sha;
+  const stateTreeEntries = stateLayout.entries;
+  const stateTreeSha = stateLayout.tree_sha;
+  if (carrier.payload.checkpoint_state_tree_sha !== stateTreeSha) {
+    throw ledgerError(
+      "CHECKPOINT_STATE_TREE_BINDING",
+      "checkpoint carrier does not bind its exact state tree",
+    );
+  }
+  const carrierBytes = Buffer.from(`${canonicalJson(carrier)}\n`, "utf8");
+  if (carrierBytes.byteLength > MAX_V2_GIT_LEDGER_BLOB_BYTES) {
+    throw ledgerError(
+      "CHECKPOINT_CARRIER_SIZE",
+      "checkpoint carrier exceeds its Git blob cap",
+    );
+  }
+  const carrierBlobSha = gitObjectSha("blob", carrierBytes);
+  const rootEntries = [{
+    path: V2_GIT_LEDGER_BLOB_PATH,
+    mode: "100644",
+    type: "blob",
+    sha: carrierBlobSha,
+  }, {
+    path: V2_GIT_LEDGER_CHECKPOINT_STATE_PATH,
+    mode: "040000",
+    type: "tree",
+    sha: stateTreeSha,
+  }];
+  const rootTreeSha = canonicalGitTreeSha(rootEntries);
+  const message = "Codex Review Gate v2: epoch-checkpoint #0";
+  const commitBody = {
+    message,
+    tree: rootTreeSha,
+    parents: [sourceTipCommitSha],
+    author: { ...COMMIT_AUTHOR, date: carrier.server_observed_at },
+    committer: { ...COMMIT_AUTHOR, date: carrier.server_observed_at },
+  };
+  const commitSha = gitObjectSha("commit", canonicalGitCommitBytes({
+    treeSha: rootTreeSha,
+    parents: [sourceTipCommitSha],
+    message,
+    serverTime: carrier.server_observed_at,
+  }));
+  return deepFreeze({
+    commit_sha: commitSha,
+    tree_sha: rootTreeSha,
+    carrier_blob_sha: carrierBlobSha,
+    state_tree_sha: stateTreeSha,
+    state_blob_sha: stateBlobSha,
+    frontier_tree_sha: checkpointState.prefix_frontier.tree_sha,
+    requests: [
+      ...frontierRequests,
+      frontierTreeRequest,
+      {
+        kind: "blob",
+        expected_sha: stateBlobSha,
+        body: { content: stateBytes.toString("utf8"), encoding: "utf-8" },
+      },
+      {
+        kind: "tree",
+        expected_sha: stateTreeSha,
+        body: { tree: stateTreeEntries },
+      },
+      {
+        kind: "blob",
+        expected_sha: carrierBlobSha,
+        body: { content: carrierBytes.toString("utf8"), encoding: "utf-8" },
+      },
+      {
+        kind: "tree",
+        expected_sha: rootTreeSha,
+        body: { tree: rootEntries },
+      },
+      { kind: "commit", expected_sha: commitSha, body: commitBody },
+    ],
+  });
+}
+
+async function planBootstrapCheckpointCandidateSuffix({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  ref,
+  refSuffix,
+  repository,
+  capability,
+  verifyWorkflowProvenance,
+  requestBudget,
+  provenanceBudget,
+  sourceTipCommitSha,
+  checkpointCommitSha,
+  checkpointServerTime,
+  prefixProvenanceIdentities,
+  admissionPrivate,
+  assertAdmissionCurrent,
+}) {
+  assertAdmissionCurrent();
+  const commandAuthority = admissionPrivate.command_authority;
+  const triggerIdentity = admissionPrivate.trigger_identity;
+  const repositoryEndpointReceipt =
+    admissionPrivate.repository_endpoint_receipt;
+  const driftAttempts = admissionPrivate.drift_attempts;
+  const cycle = admissionPrivate.cycle;
+  const owner = candidateDispatchOwner(commandAuthority);
+  const stagedRecords = [];
+  const stagedPlans = [];
+  const stagedAttachments = [];
+  const consumedJtis = new Set(prefixProvenanceIdentities);
+  let predecessorCommitSha = checkpointCommitSha;
+  let priorServerTime = timestamp(
+    checkpointServerTime,
+    "checkpoint carrier server time",
+  );
+  const stageRecord = async ({
+    record,
+    evaluatedScopeReceipt,
+    validateTransition,
+    candidateInventoryAttachment = null,
+  }) => {
+    assertAdmissionCurrent();
+    const recordFence = await readRef({
+      fetchImpl,
+      authorization,
+      base,
+      repoPath,
+      ref,
+      refSuffix,
+      requestBudget,
+      assertOperationCurrent: assertAdmissionCurrent,
+    });
+    assertAdmissionCurrent();
+    assertHttpDeadlineOpen(requestBudget);
+    if (recordFence.target_commit_sha !== sourceTipCommitSha) {
+      throw ledgerError(
+        "CHECKPOINT_SOURCE_STALE",
+        "checkpoint source ref changed during off-ref transaction planning",
+      );
+    }
+    if (
+      priorServerTime !== null &&
+      Date.parse(recordFence.server_time) < Date.parse(priorServerTime)
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_TIME_REGRESSION",
+        "checkpoint suffix ref observation time regressed",
+      );
+    }
+    const authoritativeRecord = authoritativeRecordTime(
+      record,
+      recordFence.server_time,
+    );
+    const transitionRecord = candidateInventoryAttachment === null
+      ? authoritativeRecord
+      : {
+        ...authoritativeRecord,
+        candidate_inventory_attachment_evidence:
+          structuredClone(candidateInventoryAttachment.evidence),
+      };
+    validateTransition(transitionRecord);
+    assertAdmissionCurrent();
+    const provenance = await obtainWorkflowProvenance({
+      verifyWorkflowProvenance,
+      operation: authoritativeRecord.record_type,
+      repository,
+      ledgerRef: ref,
+      predecessorCommitSha,
+      protectionReceiptDigest:
+        capability.protection.live_ruleset_receipt_digest,
+      source: sourceWorkflow(capability.controller_release),
+      effectScope: null,
+      evaluatedScopeReceipt,
+      recordIdentity: productionRecordIdentity(authoritativeRecord),
+      serverTime: authoritativeRecord.server_observed_at,
+      policy: capability.workflow_provenance_policy,
+      provenanceBudget,
+    });
+    assertAdmissionCurrent();
+    assertHttpDeadlineOpen(requestBudget);
+    assertUnusedProvenanceJti(consumedJtis, provenance.receipt);
+    const envelope = sealEnvelope({
+      repository,
+      ledger_ref: ref,
+      record_type: authoritativeRecord.record_type,
+      sequence: stagedRecords.length + 1,
+      pull_request: authoritativeRecord.pull_request,
+      head_ref_oid: authoritativeRecord.head_ref_oid,
+      base_ref_oid: authoritativeRecord.base_ref_oid,
+      potential_merge_commit_oid:
+        authoritativeRecord.potential_merge_commit_oid,
+      kind: authoritativeRecord.kind,
+      effect_id: authoritativeRecord.effect_id,
+      idempotency_key: authoritativeRecord.idempotency_key,
+      predecessor_commit_sha: predecessorCommitSha,
+      server_observed_at: authoritativeRecord.server_observed_at,
+      payload: authoritativeRecord.payload,
+      control_comment_binding: authoritativeRecord.control_comment_binding,
+      lease: authoritativeRecord.lease,
+      source_workflow: sourceWorkflow(capability.controller_release),
+      workflow_provenance: provenance.receipt,
+      workflow_provenance_jwt: provenance.compact_jwt,
+    });
+    const plan = planGitLedgerCommitObjects({
+      envelope,
+      parents: [predecessorCommitSha],
+      candidateInventoryAttachment,
+    });
+    const entry = deepFreeze({
+      commit_sha: plan.commit_sha,
+      parents: [predecessorCommitSha],
+      tree_sha: plan.tree_sha,
+      blob_sha: plan.blob_sha,
+      candidate_inventory_attachment_tree_sha:
+        candidateInventoryAttachment?.manifest.attachment_tree_sha ?? null,
+      envelope,
+      ...(candidateInventoryAttachment === null ? {} : {
+        candidate_inventory_attachment_evidence:
+          structuredClone(candidateInventoryAttachment.evidence),
+      }),
+    });
+    stagedRecords.push(entry);
+    stagedPlans.push(plan);
+    stagedAttachments.push(candidateInventoryAttachment);
+    predecessorCommitSha = plan.commit_sha;
+    priorServerTime = authoritativeRecord.server_observed_at;
+    return entry;
+  };
+
+  const emptyInventoryAuthority =
+    deriveV2GitLedgerCandidateInventoryAuthority([], repository);
+  const publication = prepareCompactCandidateInventoryPublication({
+    authority: emptyInventoryAuthority,
+    commandAuthority,
+    driftAttempts,
+    cycle,
+  });
+  const stageInventoryPhase = async ({
+    phase,
+    bundle = null,
+    priorAttempt = null,
+    attemptRecords = null,
+  }) => {
+    const authority = deriveV2GitLedgerCandidateInventoryAuthority(
+      stagedRecords,
+      repository,
+    );
+    const payload = compactCandidateInventoryPhasePayload({
+      authority,
+      owner,
+      publication,
+      phase,
+      bundle,
+      priorAttempt,
+      attemptRecords,
+    });
+    const record = createV2GitLedgerCandidateInventoryRecord({
+      predecessor_commit_sha: predecessorCommitSha,
+      owner,
+      server_observed_at:
+        priorServerTime ?? cycle.cycle_receipt.observed_at,
+      payload,
+    });
+    await stageRecord({
+      record,
+      evaluatedScopeReceipt:
+        createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
+          repository,
+          payload,
+          trigger_identity: triggerIdentity,
+          repository_endpoint_receipt: repositoryEndpointReceipt,
+        }),
+      validateTransition: (authoritative) =>
+        validateCandidateInventoryTransition(
+          stagedRecords,
+          authoritative,
+          repository,
+        ),
+      candidateInventoryAttachment: bundle,
+    });
+    return stagedRecords.at(-1);
+  };
+  await stageInventoryPhase({ phase: "cycle-start" });
+  const attemptRecords = [];
+  for (const bundle of publication.bundles) {
+    const entry = await stageInventoryPhase({
+      phase: "attempt",
+      bundle,
+      priorAttempt: attemptRecords.at(-1) ?? null,
+    });
+    attemptRecords.push({
+      record_oid: entry.commit_sha,
+      attempt_evidence_digest: bundle.manifest.attempt_evidence_digest,
+      attachment_manifest_digest: bundle.manifest.manifest_digest,
+      outcome: bundle.manifest.outcome,
+    });
+  }
+  await stageInventoryPhase({
+    phase: "cycle-complete",
+    attemptRecords,
+  });
+  const expectedInventoryRecords = driftAttempts.length + 3;
+  if (stagedRecords.length !== expectedInventoryRecords) {
+    throw ledgerError(
+      "CHECKPOINT_NEXT_UNIT_MISMATCH",
+      "checkpoint candidate inventory suffix has the wrong record count",
+    );
+  }
+  const candidateAuthority = deriveV2GitLedgerCandidateInventoryAuthority(
+    stagedRecords,
+    repository,
+  );
+  const dispatchAuthority = deriveV2GitLedgerCandidateDispatchAuthority(
+    stagedRecords,
+    repository,
+  );
+  const completed = candidateAuthority.completed_cycle;
+  if (
+    completed === null || candidateAuthority.incomplete_cycle !== null ||
+    completed.cycle_id !== candidateInventoryCycleId(cycle.initial_inventory) ||
+    completed.cycle_receipt.receipt_digest !==
+      cycle.cycle_receipt.receipt_digest
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_NEXT_UNIT_MISMATCH",
+      "checkpoint suffix did not produce the admitted completed inventory",
+    );
+  }
+  const reachableBeforeDispatch = 1 + stagedRecords.length;
+  const reservation = createCandidateDispatchReservation({
+    repository,
+    candidateAuthority,
+    dispatchAuthority,
+    sourceTipCommitSha: predecessorCommitSha,
+    reachableRecordCount: reachableBeforeDispatch,
+    commandAuthority,
+    triggerIdentity,
+  });
+  let dispatchPayload;
+  let firstPlan;
+  if (reservation === null) {
+    const emptyCycle = newCandidateDispatchCycle({
+      repository,
+      candidateAuthority,
+      completed,
+      candidates: [],
+      batchCount: 0,
+    });
+    dispatchPayload = createCandidateDispatchPayload({
+      phase: "cycle-complete",
+      dispatchAuthority,
+      candidateAuthority,
+      commandAuthority,
+      triggerIdentity,
+      cycleCompletion: createCandidateDispatchCycleCompletion(emptyCycle),
+    });
+    firstPlan = null;
+  } else {
+    try {
+      firstPlan = createCandidateDispatchPlan({
+        reservation,
+        acknowledgements: [],
+      });
+    } catch (error) {
+      throw ledgerError(
+        "CHECKPOINT_DISPATCH_PLAN_UNREPRESENTABLE",
+        "checkpoint next unit cannot expose one bounded first dispatch plan",
+        error,
+      );
+    }
+    dispatchPayload = createCandidateDispatchPayload({
+      phase: "reserve",
+      dispatchAuthority,
+      candidateAuthority,
+      commandAuthority,
+      triggerIdentity,
+      reservation,
+    });
+  }
+  const dispatchRecord = createV2GitLedgerCandidateDispatchRecord({
+    predecessor_commit_sha: predecessorCommitSha,
+    server_observed_at:
+      priorServerTime ?? cycle.cycle_receipt.observed_at,
+    payload: dispatchPayload,
+  });
+  await stageRecord({
+    record: dispatchRecord,
+    evaluatedScopeReceipt:
+      createV2GitLedgerCandidateDispatchEvaluatedScopeReceipt({
+        repository,
+        payload: dispatchPayload,
+        trigger_identity: triggerIdentity,
+        repository_endpoint_receipt: repositoryEndpointReceipt,
+      }),
+    validateTransition: (authoritative) =>
+      validateCandidateDispatchTransition(
+        stagedRecords,
+        authoritative,
+        repository,
+        { reachableRecordCount: reachableBeforeDispatch },
+      ),
+  });
+  const finalDispatch = deriveV2GitLedgerCandidateDispatchAuthority(
+    stagedRecords,
+    repository,
+  ).current_cycle;
+  if (
+    stagedRecords.length !== expectedInventoryRecords + 1 ||
+    finalDispatch?.generation_id !== candidateDispatchGenerationId(
+      repository,
+      completed,
+    ) ||
+    (reservation === null
+      ? finalDispatch.cycle_complete !== true
+      : finalDispatch.active_reservation?.reservation.reservation_digest !==
+        reservation.reservation_digest)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_NEXT_UNIT_MISMATCH",
+      "checkpoint suffix does not include its exact first dispatch boundary",
+    );
+  }
+  const firstPlanBytes = firstPlan === null
+    ? 0
+    : Buffer.byteLength(canonicalJson(firstPlan), "utf8");
+  if (
+    firstPlan !== null &&
+    (firstPlan.schema_version !== 2 ||
+      firstPlanBytes > MAX_V2_CANDIDATE_DISPATCH_PLAN_BYTES)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_DISPATCH_PLAN_UNREPRESENTABLE",
+      "checkpoint next unit cannot expose one bounded first dispatch plan",
+    );
+  }
+  assertAdmissionCurrent();
+  return {
+    records: stagedRecords,
+    plans: stagedPlans,
+    attachments: stagedAttachments,
+    transaction_tip_commit_sha: predecessorCommitSha,
+    semantic_record_count: stagedRecords.length,
+    first_dispatch_plan: firstPlan,
+    first_dispatch_plan_bytes: firstPlanBytes,
+    consumed_provenance_identities: consumedJtis,
+  };
+}
+
+function checkpointTransactionPlannedRequests(checkpointPlan, suffix) {
+  return [
+    ...checkpointPlan.requests,
+    ...suffix.plans.flatMap((plan) => plan.requests),
+  ];
+}
+
+function assertCheckpointTransactionPlanCapacity({
+  checkpointPlan,
+  suffix,
+  requestBudget,
+}) {
+  validateHttpRequestBudget(requestBudget);
+  const writes = checkpointTransactionPlannedRequests(checkpointPlan, suffix);
+  const attachmentReadRequests = suffix.attachments.reduce(
+    (total, attachment) => total + (attachment === null
+      ? 0
+      : attachment.manifest.chunk_count + 1),
+    0,
+  );
+  // Blob reads cover the carrier, state, and frontier nodes. The six fixed
+  // reads are the checkpoint commit, three trees, and the protected-ref
+  // pre/post stability receipts required by the autonomous production load.
+  const checkpointReadRequests =
+    checkpointPlan.requests.filter(({ kind }) => kind === "blob").length + 6;
+  const suffixReadRequests = suffix.records.length * 3 +
+    attachmentReadRequests;
+  const futureRequestCount = writes.length + checkpointReadRequests +
+    suffixReadRequests;
+  const remainingRequests = requestBudget.limits.request_count -
+    requestBudget.request_count;
+  if (
+    writes.length > MAX_V2_PERSISTENT_FRONTIER_OPERATION_OBJECTS ||
+    futureRequestCount > remainingRequests
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_TRANSACTION_REQUEST_CAP",
+      "checkpoint transaction cannot fit its shared write and validation request budget",
+    );
+  }
+  let bodyBytes = 0;
+  for (const planned of writes) {
+    const bytes = Buffer.byteLength(JSON.stringify(planned.body), "utf8");
+    if (
+      requestBudget.request_body_bytes_limit !== null &&
+      bytes > requestBudget.request_body_bytes_limit
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_TRANSACTION_REQUEST_BODY_CAP",
+        "checkpoint transaction contains an oversized Git object request",
+      );
+    }
+    bodyBytes += bytes;
+  }
+  if (
+    requestBudget.total_request_body_bytes_limit !== null &&
+    bodyBytes > requestBudget.total_request_body_bytes_limit -
+      requestBudget.total_request_body_bytes
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_TRANSACTION_REQUEST_BODY_CAP",
+      "checkpoint transaction exceeds its aggregate Git object request bytes",
+    );
+  }
+  const remainingResponseBytes = requestBudget.limits.total_response_bytes -
+    requestBudget.total_response_bytes;
+  if (
+    futureRequestCount * requestBudget.limits.response_bytes >
+      remainingResponseBytes
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_TRANSACTION_RESPONSE_CAP",
+      "checkpoint transaction lacks a closed worst-case response byte budget",
+    );
+  }
+  if (
+    requestBudget.deadline_at_ms === null ||
+    requestBudget.deadline_at_ms <= performance.now()
+  ) {
+    throw ledgerError(
+      "checkpoint-transaction-timeout",
+      "checkpoint transaction exhausted its shared absolute deadline before writes",
+    );
+  }
+  return deepFreeze({
+    write_object_count: writes.length,
+    write_request_body_bytes: bodyBytes,
+    planned_loader_request_count:
+      checkpointReadRequests + suffixReadRequests,
+    planned_total_request_count: futureRequestCount,
+  });
+}
+
+async function publishCheckpointObjectPlan({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  checkpointPlan,
+  requestBudget,
+  assertAdmissionCurrent,
+}) {
+  for (const planned of checkpointPlan.requests) {
+    assertAdmissionCurrent();
+    const path = planned.kind === "blob"
+      ? `${repoPath}/git/blobs`
+      : planned.kind === "tree"
+        ? `${repoPath}/git/trees`
+        : `${repoPath}/git/commits`;
+    const capture = await request({
+      fetchImpl,
+      authorization,
+      base,
+      method: "POST",
+      path,
+      body: planned.body,
+      expectedStatus: 201,
+      requestBudget,
+      assertOperationCurrent: assertAdmissionCurrent,
+    });
+    assertAdmissionCurrent();
+    const actual = responseSha(
+      capture.data,
+      `created checkpoint ${planned.kind}`,
+    );
+    if (actual !== planned.expected_sha) {
+      throw ledgerError(
+        "CHECKPOINT_OBJECT_IDENTITY",
+        "created checkpoint Git object changed identity",
+      );
+    }
+    if (planned.kind === "commit") {
+      const commit = capture.data;
+      if (
+        commit.tree?.sha !== planned.body.tree ||
+        canonicalJson(commit.parents?.map(({ sha: parent }) => parent)) !==
+          canonicalJson(planned.body.parents) ||
+        commit.message !== planned.body.message
+      ) {
+        throw ledgerError(
+          "CHECKPOINT_COMMIT_ECHO",
+          "created checkpoint commit did not echo its exact tree and parent",
+        );
+      }
+    }
+  }
+}
+
+async function publishCheckpointSuffixPlans({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  suffix,
+  requestBudget,
+  assertAdmissionCurrent,
+}) {
+  for (let index = 0; index < suffix.records.length; index += 1) {
+    assertAdmissionCurrent();
+    const entry = suffix.records[index];
+    const plan = suffix.plans[index];
+    const objects = await createCommitObjects({
+      fetchImpl,
+      authorization,
+      base,
+      repoPath,
+      envelope: entry.envelope,
+      parents: entry.parents,
+      requestBudget,
+      candidateInventoryAttachment: suffix.attachments[index],
+      assertOperationCurrent: assertAdmissionCurrent,
+    });
+    assertAdmissionCurrent();
+    if (
+      objects.blob_sha !== plan.blob_sha ||
+      objects.tree_sha !== plan.tree_sha ||
+      objects.commit_sha !== plan.commit_sha
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_SUFFIX_OBJECT_IDENTITY",
+        "checkpoint suffix write differs from its complete off-ref plan",
+      );
+    }
+  }
+}
+
+function checkpointPreparationDiagnostic({
+  sourceLoadHandle,
+  checkpointState,
+  checkpointPlan,
+  suffix,
+  capacity,
+}) {
+  const firstPlan = suffix.first_dispatch_plan;
+  const withoutDigest = {
+    schema: V2_GIT_LEDGER_CHECKPOINT_PREPARATION_DIAGNOSTIC_SCHEMA,
+    schema_version: 1,
+    state: "prepared",
+    profile: CHECKPOINT_PROFILE,
+    source_tip_commit_sha: sourceLoadHandle.source_tip_commit_sha,
+    source_commit_count: sourceLoadHandle.source_commit_count,
+    checkpoint_commit_sha: checkpointPlan.commit_sha,
+    transaction_tip_commit_sha: suffix.transaction_tip_commit_sha,
+    epoch_commit_count: suffix.semantic_record_count + 1,
+    semantic_record_count: suffix.semantic_record_count,
+    frontier_entry_count: checkpointState.prefix_frontier.root.count,
+    frontier_node_count: checkpointState.prefix_frontier.node_count,
+    checkpoint_state_digest: checkpointState.checkpoint_state_digest,
+    next_unit_admission_digest:
+      checkpointState.next_unit.admission_digest,
+    first_dispatch_plan_schema_version: firstPlan?.schema_version ?? 0,
+    first_dispatch_plan_bytes: suffix.first_dispatch_plan_bytes,
+    first_dispatch_plan_digest: firstPlan?.plan_digest ?? null,
+    planned_write_object_count: capacity.write_object_count,
+    planned_write_request_body_bytes: capacity.write_request_body_bytes,
+    planned_loader_request_count: capacity.planned_loader_request_count,
+    planned_total_request_count: capacity.planned_total_request_count,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    preparation_digest: digestCanonical(
+      "codex-review-gate-v2-checkpoint-preparation-diagnostic",
+      withoutDigest,
+    ),
+  });
+}
+
+function checkpointValidationDiagnostic({
+  prepared,
+  suffix,
+  frontier,
+  futureState,
+}) {
+  const withoutDigest = {
+    schema: V2_GIT_LEDGER_CHECKPOINT_VALIDATION_DIAGNOSTIC_SCHEMA,
+    schema_version: 1,
+    validated: true,
+    ref_published: false,
+    profile: CHECKPOINT_PROFILE,
+    checkpoint_commit_sha: prepared.checkpoint_plan.commit_sha,
+    transaction_tip_commit_sha: suffix.records.at(-1).commit_sha,
+    epoch_commit_count: suffix.records.length + 1,
+    semantic_record_count: suffix.records.length,
+    frontier_entry_count: frontier.entry_count,
+    frontier_node_count: frontier.node_count,
+    checkpoint_state_digest:
+      prepared.checkpoint_state.checkpoint_state_digest,
+    next_unit_admission_digest:
+      prepared.checkpoint_state.next_unit.admission_digest,
+    first_dispatch_plan_digest:
+      prepared.suffix.first_dispatch_plan?.plan_digest ?? null,
+    query_seed_digest: futureState.query_seed_digest,
+    source_projection_digest: futureState.source_projection_digest,
+    authority_projection_digest:
+      futureState.authority_projection_digest,
+    candidate_inventory_authority_digest:
+      futureState.candidate_inventory_authority_digest,
+    candidate_dispatch_authority_digest:
+      futureState.candidate_dispatch_authority_digest,
+    future_state_digest: futureState.future_state_digest,
+  };
+  return deepFreeze({
+    ...withoutDigest,
+    validation_digest: digestCanonical(
+      "codex-review-gate-v2-checkpoint-validation-diagnostic",
+      withoutDigest,
+    ),
+  });
+}
+
+async function prepareBootstrapCheckpointCandidateTransaction({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  ref,
+  refSuffix,
+  repo,
+  capability,
+  preflightHandle,
+  verifyWorkflowProvenance,
+  requestBudget,
+  provenanceBudget,
+  sourcePrivate,
+  admissionPrivate,
+  assertAdmissionCurrent,
+}) {
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const rawSource = await loadStableChain({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    ref,
+    refSuffix,
+    repo,
+    verifyWorkflowProvenance,
+    provenanceBudget,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  await validateStoredProviderIdentityAuthorities(
+    rawSource.records,
+    capability.provider_identity_policy,
+    preflightHandle,
+    repo,
+  );
+  assertAdmissionCurrent();
+  requireCurrentCapability(rawSource, capability);
+  validateBootstrapOnlyCheckpointBoundary(rawSource);
+  assertHttpDeadlineOpen(requestBudget);
+  const sourceLoadHandle = admissionPrivate.source_load_handle;
+  const sourceManifestDigest = digestCanonical(
+    "codex-review-gate-v2-fully-reachable-record-manifest",
+    checkpointRecordManifest(rawSource.records),
+  );
+  if (
+    rawSource.tip_commit_sha !== sourceLoadHandle.source_tip_commit_sha ||
+    rawSource.records.length !== sourceLoadHandle.source_commit_count ||
+    sourceManifestDigest !==
+      sourcePrivate.loaded.fully_reachable_record_manifest_digest ||
+    sourcePrivate.loaded.inventory_digest !==
+      sourceLoadHandle.source_inventory_digest
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_SOURCE_CHANGED",
+      "checkpoint source handle differs from its fresh full stable replay",
+    );
+  }
+  const epochId = digestCanonical(
+    "codex-review-gate-v2-checkpoint-epoch",
+    {
+      repository: repo,
+      ledger_ref: ref,
+      source_tip_commit_sha: rawSource.tip_commit_sha,
+      source_load_digest: sourceLoadHandle.source_load_digest,
+      next_unit_admission_digest:
+        admissionPrivate.next_unit_admission_handle
+          .next_unit_admission_digest,
+    },
+  );
+  const prefixFrontier = await buildBootstrapCheckpointPrefixFrontier({
+    records: rawSource.records,
+    epochId,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const checkpointState = buildBootstrapCheckpointState({
+    repository: repo,
+    ledgerRef: ref,
+    epochId,
+    rawSource,
+    sourceLoadHandle,
+    admissionHandle: admissionPrivate.next_unit_admission_handle,
+    admissionPrivate,
+    capability,
+    prefixFrontier,
+  });
+  const stateLayout = checkpointStateTreeLayout(checkpointState);
+  assertAdmissionCurrent();
+  const checkpointFence = await readRef({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    ref,
+    refSuffix,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  if (checkpointFence.target_commit_sha !== rawSource.tip_commit_sha) {
+    throw ledgerError(
+      "CHECKPOINT_SOURCE_STALE",
+      "checkpoint source changed before checkpoint provenance was minted",
+    );
+  }
+  if (
+    Date.parse(checkpointFence.server_time) <
+      Date.parse(rawSource.observed_at)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_TIME_REGRESSION",
+      "checkpoint carrier observation time precedes its source prefix",
+    );
+  }
+  const carrierPayload = checkpointCarrierPayload({
+    repository: repo,
+    ledgerRef: ref,
+    epochId,
+    sourceTipCommitSha: rawSource.tip_commit_sha,
+    checkpointState,
+    stateTreeSha: stateLayout.tree_sha,
+  });
+  const checkpointIdentity = {
+    record_type: "epoch-checkpoint",
+    kind: null,
+    effect_id: null,
+    idempotency_key: null,
+    payload_digest: carrierPayload.payload_digest,
+  };
+  assertAdmissionCurrent();
+  const checkpointProvenance = await obtainWorkflowProvenance({
+    verifyWorkflowProvenance,
+    operation: "checkpoint-rotate",
+    repository: repo,
+    ledgerRef: ref,
+    predecessorCommitSha: rawSource.tip_commit_sha,
+    protectionReceiptDigest:
+      capability.protection.live_ruleset_receipt_digest,
+    source: sourceWorkflow(capability.controller_release),
+    effectScope: null,
+    evaluatedScopeReceipt: null,
+    recordIdentity: checkpointIdentity,
+    serverTime: checkpointFence.server_time,
+    policy: capability.workflow_provenance_policy,
+    provenanceBudget,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const prefixIdentities = new Set(rawSource.records.map((entry) =>
+    provenanceReplayIdentity(entry.envelope.workflow_provenance)));
+  assertUnusedProvenanceJti(prefixIdentities, checkpointProvenance.receipt);
+  const carrier = sealCheckpointCarrier({
+    payload: carrierPayload,
+    serverTime: checkpointFence.server_time,
+    sourceWorkflowValue: sourceWorkflow(capability.controller_release),
+    workflowProvenance: checkpointProvenance.receipt,
+    workflowProvenanceJwt: checkpointProvenance.compact_jwt,
+  });
+  validateCheckpointCarrier(carrier, {
+    repository: repo,
+    ledgerRef: ref,
+    sourceTipCommitSha: rawSource.tip_commit_sha,
+    checkpointState,
+    stateTreeSha: stateLayout.tree_sha,
+    capability,
+  });
+  const checkpointPlan = planBootstrapCheckpointObjects({
+    checkpointState,
+    prefixFrontier,
+    carrier,
+    sourceTipCommitSha: rawSource.tip_commit_sha,
+  });
+  assertHttpDeadlineOpen(requestBudget);
+  const suffix = await planBootstrapCheckpointCandidateSuffix({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    ref,
+    refSuffix,
+    repository: repo,
+    capability,
+    verifyWorkflowProvenance,
+    requestBudget,
+    provenanceBudget,
+    sourceTipCommitSha: rawSource.tip_commit_sha,
+    checkpointCommitSha: checkpointPlan.commit_sha,
+    checkpointServerTime: carrier.server_observed_at,
+    prefixProvenanceIdentities: prefixIdentities,
+    admissionPrivate,
+    assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const finalFence = await readRef({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    ref,
+    refSuffix,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  if (
+    finalFence.target_commit_sha !== rawSource.tip_commit_sha ||
+    Date.parse(finalFence.server_time) < Date.parse(
+      suffix.records.at(-1).envelope.server_observed_at,
+    )
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_SOURCE_STALE",
+      "checkpoint source changed before the complete off-ref write plan",
+    );
+  }
+  const capacity = assertCheckpointTransactionPlanCapacity({
+    checkpointPlan,
+    suffix,
+    requestBudget,
+  });
+  assertAdmissionCurrent();
+  await publishCheckpointObjectPlan({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    checkpointPlan,
+    requestBudget,
+    assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  await publishCheckpointSuffixPlans({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    suffix,
+    requestBudget,
+    assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const privateBinding = {
+    source_load_handle: sourceLoadHandle,
+    admission_private: admissionPrivate,
+    raw_source_tip_commit_sha: rawSource.tip_commit_sha,
+    checkpoint_state: checkpointState,
+    prefix_frontier_manifest: prefixFrontier.manifest,
+    carrier,
+    checkpoint_plan: checkpointPlan,
+    suffix,
+  };
+  const result = checkpointPreparationDiagnostic({
+    sourceLoadHandle,
+    checkpointState,
+    checkpointPlan,
+    suffix,
+    capacity,
+  });
+  privateBinding.result = result;
+  const validation = await loadBootstrapCheckpointCandidateTransaction({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    ref,
+    repo,
+    capability,
+    verifyWorkflowProvenance,
+    requestBudget,
+    provenanceBudget,
+    prepared: privateBinding,
+    assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  if (
+    validation.transaction_tip_commit_sha !==
+      result.transaction_tip_commit_sha ||
+    validation.checkpoint_state_digest !== result.checkpoint_state_digest
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_VALIDATION_MISMATCH",
+      "checkpoint transaction failed its immediate seeded loader validation",
+    );
+  }
+  return {
+    result,
+    private_binding: privateBinding,
+  };
+}
+
+async function fetchExactGitBlobBytes({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  objectOid,
+  maximumBytes,
+  requestBudget,
+  assertOperationCurrent = () => {},
+}) {
+  const capture = await request({
+    fetchImpl,
+    authorization,
+    base,
+    method: "GET",
+    path: `${repoPath}/git/blobs/${objectOid}`,
+    expectedStatus: 200,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  const blob = capture.data;
+  assertObject(blob, "checkpoint Git blob");
+  if (
+    sha(blob.sha, "checkpoint Git blob SHA") !== objectOid ||
+    blob.encoding !== "base64" || typeof blob.content !== "string"
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_BLOB_SHAPE",
+      "checkpoint Git blob response is not canonical base64",
+    );
+  }
+  const compact = blob.content.replace(/\n/gu, "");
+  const bytes = Buffer.from(compact, "base64");
+  if (
+    bytes.byteLength === 0 || bytes.byteLength > maximumBytes ||
+    bytes.toString("base64") !== compact ||
+    gitObjectSha("blob", bytes) !== objectOid
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_BLOB_IDENTITY",
+      "checkpoint Git blob bytes changed identity or exceeded their cap",
+    );
+  }
+  return bytes;
+}
+
+async function fetchExactGitTree({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  treeSha,
+  maximumEntries,
+  requestBudget,
+  assertOperationCurrent = () => {},
+}) {
+  const capture = await request({
+    fetchImpl,
+    authorization,
+    base,
+    method: "GET",
+    path: `${repoPath}/git/trees/${treeSha}`,
+    expectedStatus: 200,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  const tree = capture.data;
+  assertObject(tree, "checkpoint Git tree");
+  if (
+    sha(tree.sha, "checkpoint Git tree SHA") !== treeSha ||
+    !Array.isArray(tree.tree) || tree.tree.length === 0 ||
+    tree.tree.length > maximumEntries || tree.truncated === true
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_TREE_CAP",
+      "checkpoint Git tree is truncated or exceeds its entry cap",
+    );
+  }
+  const entries = tree.tree.map((entry, index) => {
+    assertObject(entry, `checkpoint Git tree entry ${index}`);
+    return {
+      path: boundedString(
+        entry.path,
+        `checkpoint Git tree entry ${index}.path`,
+        256,
+      ),
+      mode: entry.mode,
+      type: entry.type,
+      sha: sha(entry.sha, `checkpoint Git tree entry ${index}.sha`),
+    };
+  });
+  if (canonicalGitTreeSha(entries) !== treeSha) {
+    throw ledgerError(
+      "CHECKPOINT_TREE_IDENTITY",
+      "checkpoint Git tree entries do not match their object identity",
+    );
+  }
+  return deepFreeze(entries);
+}
+
+async function fetchExactCheckpointCommit({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  commitSha,
+  expectedTreeSha,
+  expectedParentSha,
+  expectedServerTime,
+  requestBudget,
+  assertOperationCurrent = () => {},
+}) {
+  const capture = await request({
+    fetchImpl,
+    authorization,
+    base,
+    method: "GET",
+    path: `${repoPath}/git/commits/${commitSha}`,
+    expectedStatus: 200,
+    requestBudget,
+    assertOperationCurrent,
+  });
+  validateExactCheckpointCommitValue(capture.data, {
+    commitSha,
+    expectedTreeSha,
+    expectedParentSha,
+    expectedServerTime,
+  });
+}
+
+function validateExactCheckpointCommitValue(commit, {
+  commitSha,
+  expectedTreeSha,
+  expectedParentSha,
+  expectedServerTime,
+}) {
+  assertObject(commit, "checkpoint Git commit");
+  const parents = Array.isArray(commit.parents)
+    ? commit.parents.map((parent) => {
+      assertObject(parent, "checkpoint Git commit parent");
+      return sha(parent.sha, "checkpoint Git commit parent SHA");
+    })
+    : null;
+  const message = "Codex Review Gate v2: epoch-checkpoint #0";
+  if (
+    sha(commit.sha, "checkpoint Git commit SHA") !== commitSha ||
+    commit.tree?.sha !== expectedTreeSha ||
+    canonicalJson(parents) !== canonicalJson([expectedParentSha]) ||
+    commit.message !== message
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_COMMIT_BINDING",
+      "checkpoint Git commit differs from its exact tree or parent",
+    );
+  }
+  for (const [label, identity] of [
+    ["author", commit.author],
+    ["committer", commit.committer],
+  ]) {
+    assertObject(identity, `checkpoint Git commit ${label}`);
+    if (
+      identity.name !== COMMIT_AUTHOR.name ||
+      identity.email !== COMMIT_AUTHOR.email ||
+      timestamp(identity.date, `checkpoint Git commit ${label} date`) !==
+        expectedServerTime
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_COMMIT_IDENTITY",
+        "checkpoint Git commit identity is not canonical",
+      );
+    }
+  }
+  if (gitObjectSha("commit", canonicalGitCommitBytes({
+    treeSha: expectedTreeSha,
+    parents: [expectedParentSha],
+    message,
+    serverTime: expectedServerTime,
+  })) !== commitSha) {
+    throw ledgerError(
+      "CHECKPOINT_COMMIT_IDENTITY",
+      "checkpoint Git commit bytes changed identity",
+    );
+  }
+}
+
+function parseCanonicalCheckpointJson(bytes, label) {
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw ledgerError(
+      "CHECKPOINT_JSON_UTF8",
+      `${label} is not canonical UTF-8`,
+      error,
+    );
+  }
+  if (!text.endsWith("\n")) {
+    throw ledgerError(
+      "CHECKPOINT_JSON_CANONICAL",
+      `${label} lacks its canonical newline`,
+    );
+  }
+  let value;
+  try {
+    value = JSON.parse(text.slice(0, -1));
+  } catch (error) {
+    throw ledgerError(
+      "CHECKPOINT_JSON_INVALID",
+      `${label} is not JSON`,
+      error,
+    );
+  }
+  if (`${canonicalJson(value)}\n` !== text) {
+    throw ledgerError(
+      "CHECKPOINT_JSON_CANONICAL",
+      `${label} is not canonical JSON`,
+    );
+  }
+  return value;
+}
+
+function validateCheckpointPrefixEntries(entries, checkpointState) {
+  if (!Array.isArray(entries) || entries.length !== 9) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_MEMBERSHIP",
+      "checkpoint prefix frontier does not contain exactly nine bootstrap facts",
+    );
+  }
+  const ordinals = new Map();
+  const oidFacts = new Map();
+  const provenanceFacts = new Map();
+  for (const entry of entries) {
+    const key = entry.key;
+    const value = entry.value;
+    if (key?.kind === "ordinal") ordinals.set(key.ordinal, value);
+    else if (key?.kind === "record-oid") oidFacts.set(key.record_oid, value);
+    else if (key?.kind === "provenance-identity") {
+      provenanceFacts.set(key.identity, value);
+    } else {
+      throw ledgerError(
+        "CHECKPOINT_FRONTIER_MEMBERSHIP",
+        "checkpoint prefix frontier contains an unsupported key",
+      );
+    }
+  }
+  if (
+    ordinals.size !== 3 || oidFacts.size !== 3 ||
+    provenanceFacts.size !== 3
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_MEMBERSHIP",
+      "checkpoint prefix frontier key classes are incomplete",
+    );
+  }
+  const types = ["genesis", "capability-canary", "capability-attestation"];
+  const facts = [];
+  for (let ordinal = 0; ordinal < 3; ordinal += 1) {
+    const fact = ordinals.get(ordinal);
+    if (
+      fact === undefined || fact.ordinal !== ordinal ||
+      fact.sequence !== ordinal || fact.record_type !== types[ordinal] ||
+      fact.parent_oid !== (ordinal === 0
+        ? null
+        : facts[ordinal - 1].record_oid) ||
+      canonicalJson(oidFacts.get(fact.record_oid)) !== canonicalJson(fact)
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_FRONTIER_MEMBERSHIP",
+        "checkpoint prefix frontier record facts are not one bootstrap chain",
+      );
+    }
+    const provenance = provenanceFacts.get(fact.provenance_identity);
+    if (
+      provenance?.ordinal !== ordinal ||
+      provenance.record_oid !== fact.record_oid ||
+      provenance.provenance_receipt_digest !==
+        fact.provenance_receipt_digest ||
+      provenance.provenance_token_sha256 !== fact.provenance_token_sha256
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_FRONTIER_MEMBERSHIP",
+        "checkpoint prefix frontier provenance index is inconsistent",
+      );
+    }
+    const queryRecord = checkpointState.source.query_records[ordinal];
+    if (
+      queryRecord.commit_sha !== fact.record_oid ||
+      (queryRecord.parents[0] ?? null) !== fact.parent_oid ||
+      queryRecord.tree_sha !== fact.tree_oid ||
+      queryRecord.blob_sha !== fact.blob_oid ||
+      queryRecord.envelope.sequence !== fact.sequence ||
+      queryRecord.envelope.record_type !== fact.record_type ||
+      queryRecord.envelope.envelope_digest !== fact.envelope_digest ||
+      queryRecord.envelope.payload_digest !== fact.payload_digest ||
+      queryRecord.envelope.server_observed_at !== fact.server_observed_at ||
+      provenanceReplayIdentity(queryRecord.envelope.workflow_provenance) !==
+        fact.provenance_identity ||
+      queryRecord.envelope.workflow_provenance.receipt_digest !==
+        fact.provenance_receipt_digest ||
+      queryRecord.envelope.workflow_provenance.token_sha256 !==
+        fact.provenance_token_sha256
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_FRONTIER_MEMBERSHIP",
+        "checkpoint query seed differs from its exact frontier record fact",
+      );
+    }
+    facts.push(fact);
+  }
+  if (
+    facts[0].record_oid !== checkpointState.source.genesis_commit_sha ||
+    facts[2].record_oid !== checkpointState.source.tip_commit_sha ||
+    facts[2].record_oid !==
+      checkpointState.source.capability_attestation_commit_sha ||
+    facts[2].provenance_receipt_digest !==
+      checkpointState.source.capability_activation.oidc_attestation_digest
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_MEMBERSHIP",
+      "checkpoint prefix frontier differs from its source boundary",
+    );
+  }
+  const manifest = facts.map((fact) => ({
+    record_oid: fact.record_oid,
+    parent_oid: fact.parent_oid,
+    tree_oid: fact.tree_oid,
+    envelope_digest: fact.envelope_digest,
+    record_type: fact.record_type,
+    kind: null,
+    effect_id: null,
+    idempotency_key: null,
+    payload_digest: fact.payload_digest,
+    workflow_provenance_receipt_digest:
+      fact.provenance_receipt_digest,
+    workflow_provenance_jti: fact.provenance_identity,
+    server_observed_at: fact.server_observed_at,
+  }));
+  if (digestCanonical(
+    "codex-review-gate-v2-fully-reachable-record-manifest",
+    manifest,
+  ) !== checkpointState.source.record_manifest_digest) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_MEMBERSHIP",
+      "checkpoint prefix frontier cannot reconstruct its source manifest",
+    );
+  }
+  let rolling = digestCanonical(
+    "codex-review-gate-v2-checkpoint-audit-root-empty",
+    { record_count: 0 },
+  );
+  for (const fact of facts) {
+    rolling = digestCanonical(
+      "codex-review-gate-v2-checkpoint-audit-root-step",
+      {
+        prior_root: rolling,
+        ordinal: fact.ordinal,
+        record_oid: fact.record_oid,
+        parent_oid: fact.parent_oid,
+        envelope_digest: fact.envelope_digest,
+        record_type: fact.record_type,
+        server_observed_at: fact.server_observed_at,
+      },
+    );
+  }
+  if (rolling !== checkpointState.source.rolling_audit_root) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_MEMBERSHIP",
+      "checkpoint prefix frontier rolling audit root is invalid",
+    );
+  }
+  return {
+    entry_count: entries.length,
+    provenance_identities: new Set(provenanceFacts.keys()),
+    tip_server_observed_at: facts[2].server_observed_at,
+    attestation_fact: structuredClone(facts[2]),
+  };
+}
+
+async function loadCheckpointPrefixFrontier({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  checkpointState,
+  treeEntries,
+  requestBudget,
+  assertOperationCurrent = () => {},
+}) {
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const manifest = validateCheckpointPrefixFrontierManifest(
+    checkpointState.prefix_frontier,
+  );
+  if (
+    treeEntries.length !== manifest.tree_entry_count ||
+    treeEntries.some((entry) =>
+      entry.mode !== "100644" || entry.type !== "blob" ||
+      entry.path !== `n-${entry.sha}.json`) ||
+    digestCanonical(
+      "codex-review-gate-v2-checkpoint-frontier-oids",
+      treeEntries.map(({ sha: objectOid }) => objectOid).sort(),
+    ) !== manifest.oid_set_digest
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_TREE_MISMATCH",
+      "checkpoint frontier tree differs from its bounded manifest",
+    );
+  }
+  const allowed = new Map(treeEntries.map((entry) => [entry.sha, entry]));
+  const read = new Map();
+  let readBytes = 0;
+  const frontier = createV2PersistentMerkleMap({
+    domain: CHECKPOINT_PREFIX_FRONTIER_DOMAIN,
+    epoch_id: checkpointState.epoch_id,
+    readBlob: async (objectOid, { max_bytes: maxBytes }) => {
+      assertOperationCurrent();
+      if (!allowed.has(objectOid) || read.has(objectOid)) {
+        throw ledgerError(
+          "CHECKPOINT_FRONTIER_OBJECT_REUSE",
+          "checkpoint frontier requested a missing or repeated object",
+        );
+      }
+      const bytes = await fetchExactGitBlobBytes({
+        fetchImpl,
+        authorization,
+        base,
+        repoPath,
+        objectOid,
+        maximumBytes: Math.min(
+          maxBytes,
+          MAX_V2_PERSISTENT_FRONTIER_NODE_BYTES,
+        ),
+        requestBudget,
+        assertOperationCurrent,
+      });
+      assertOperationCurrent();
+      assertHttpDeadlineOpen(requestBudget);
+      read.set(objectOid, bytes);
+      readBytes += bytes.byteLength;
+      return new Uint8Array(bytes);
+    },
+    writeBlob: async () => {
+      throw ledgerError(
+        "CHECKPOINT_FRONTIER_READ_ONLY",
+        "checkpoint frontier loader cannot write objects",
+      );
+    },
+  });
+  const page = await frontier.scan({
+    root: manifest.root,
+    limit: manifest.root.count,
+  });
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  if (
+    page.next_cursor !== null || read.size !== allowed.size ||
+    readBytes !== manifest.raw_node_bytes ||
+    read.size !== manifest.node_count
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_FRONTIER_CLOSURE_MISMATCH",
+      "checkpoint frontier node closure differs from its complete tree",
+    );
+  }
+  const validated = validateCheckpointPrefixEntries(
+    page.entries,
+    checkpointState,
+  );
+  assertOperationCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  return {
+    entry_count: validated.entry_count,
+    node_count: read.size,
+    provenance_identities: validated.provenance_identities,
+    tip_server_observed_at: validated.tip_server_observed_at,
+    attestation_fact: validated.attestation_fact,
+  };
+}
+
+function sameGitTreeEntries(actual, expected) {
+  const byPath = (entries) => [...entries].sort((left, right) =>
+    left.path.localeCompare(right.path));
+  return canonicalJson(byPath(actual)) === canonicalJson(byPath(expected));
+}
+
+async function loadBootstrapCheckpointCandidateTransaction({
+  fetchImpl,
+  authorization,
+  base,
+  repoPath,
+  ref,
+  repo,
+  capability,
+  verifyWorkflowProvenance,
+  requestBudget,
+  provenanceBudget,
+  prepared,
+  assertAdmissionCurrent,
+}) {
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  if (
+    prepared === null || typeof prepared !== "object" ||
+    prepared.checkpoint_plan === undefined ||
+    prepared.suffix === undefined || prepared.checkpoint_state === undefined
+  ) {
+    throw ledgerError(
+      "UNTRUSTED_CHECKPOINT_PREPARATION_DIAGNOSTIC",
+      "checkpoint loader requires one private prepared transaction binding",
+    );
+  }
+  const expectedSuffixCount = prepared.suffix.semantic_record_count;
+  if (
+    expectedSuffixCount < 4 ||
+    expectedSuffixCount > MAX_V2_CANDIDATE_SCAN_PASSES + 3
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_SUFFIX_CAP",
+      "checkpoint suffix record count is outside its closed profile",
+    );
+  }
+  const reverse = [];
+  let cursor = prepared.suffix.transaction_tip_commit_sha;
+  for (let index = 0; index < expectedSuffixCount; index += 1) {
+    assertAdmissionCurrent();
+    const entry = await fetchCommitEnvelope({
+      fetchImpl,
+      authorization,
+      base,
+      repoPath,
+      commitSha: cursor,
+      repo,
+      ref,
+      requestBudget,
+      assertOperationCurrent: assertAdmissionCurrent,
+    });
+    assertAdmissionCurrent();
+    if (entry.parents.length !== 1) {
+      throw ledgerError(
+        "CHECKPOINT_SUFFIX_PARENT",
+        "checkpoint suffix record lacks one exact predecessor",
+      );
+    }
+    reverse.push(entry);
+    cursor = entry.parents[0];
+    assertAdmissionCurrent();
+    assertHttpDeadlineOpen(requestBudget);
+  }
+  if (cursor !== prepared.checkpoint_plan.commit_sha) {
+    throw ledgerError(
+      "CHECKPOINT_SUFFIX_PARENT",
+      "checkpoint suffix does not terminate at its exact checkpoint root",
+    );
+  }
+  let suffixRecords = reverse.reverse();
+  for (let index = 0; index < suffixRecords.length; index += 1) {
+    const expectedParent = index === 0
+      ? prepared.checkpoint_plan.commit_sha
+      : suffixRecords[index - 1].commit_sha;
+    const entry = suffixRecords[index];
+    if (
+      entry.parents[0] !== expectedParent ||
+      entry.envelope.predecessor_commit_sha !== expectedParent ||
+      entry.envelope.sequence !== index + 1
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_SUFFIX_SEQUENCE",
+        "checkpoint suffix sequence or parent binding is invalid",
+      );
+    }
+  }
+
+  assertAdmissionCurrent();
+  const rootEntries = await fetchExactGitTree({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    treeSha: prepared.checkpoint_plan.tree_sha,
+    maximumEntries: 2,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const expectedRootEntries = [{
+    path: V2_GIT_LEDGER_BLOB_PATH,
+    mode: "100644",
+    type: "blob",
+    sha: prepared.checkpoint_plan.carrier_blob_sha,
+  }, {
+    path: V2_GIT_LEDGER_CHECKPOINT_STATE_PATH,
+    mode: "040000",
+    type: "tree",
+    sha: prepared.checkpoint_plan.state_tree_sha,
+  }];
+  if (!sameGitTreeEntries(rootEntries, expectedRootEntries)) {
+    throw ledgerError(
+      "CHECKPOINT_ROOT_TREE_MISMATCH",
+      "checkpoint root tree differs from its carrier and state trees",
+    );
+  }
+  assertAdmissionCurrent();
+  const carrierBytes = await fetchExactGitBlobBytes({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    objectOid: prepared.checkpoint_plan.carrier_blob_sha,
+    maximumBytes: MAX_V2_GIT_LEDGER_BLOB_BYTES,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  const carrierValue = parseCanonicalCheckpointJson(
+    carrierBytes,
+    "checkpoint carrier",
+  );
+  assertHttpDeadlineOpen(requestBudget);
+  assertAdmissionCurrent();
+  const stateTreeEntries = await fetchExactGitTree({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    treeSha: prepared.checkpoint_plan.state_tree_sha,
+    maximumEntries: 2,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const expectedStateEntries = [{
+    path: V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH,
+    mode: "100644",
+    type: "blob",
+    sha: prepared.checkpoint_plan.state_blob_sha,
+  }, {
+    path: V2_GIT_LEDGER_CHECKPOINT_FRONTIER_NODES_PATH,
+    mode: "040000",
+    type: "tree",
+    sha: prepared.checkpoint_plan.frontier_tree_sha,
+  }];
+  if (!sameGitTreeEntries(stateTreeEntries, expectedStateEntries)) {
+    throw ledgerError(
+      "CHECKPOINT_STATE_TREE_MISMATCH",
+      "checkpoint state tree differs from its exact state and frontier",
+    );
+  }
+  assertAdmissionCurrent();
+  const stateBytes = await fetchExactGitBlobBytes({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    objectOid: prepared.checkpoint_plan.state_blob_sha,
+    maximumBytes: MAX_V2_GIT_LEDGER_BLOB_BYTES,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  const checkpointState = validateBootstrapCheckpointState(
+    parseCanonicalCheckpointJson(stateBytes, "checkpoint state"),
+  );
+  validateCheckpointCapabilityAgainstFactory(checkpointState, capability);
+  assertHttpDeadlineOpen(requestBudget);
+  if (
+    checkpointState.checkpoint_state_digest !==
+      prepared.checkpoint_state.checkpoint_state_digest ||
+    canonicalJson(checkpointState.repository) !== canonicalJson(repo) ||
+    checkpointState.ledger_ref !== ref ||
+    checkpointState.prefix_frontier.tree_sha !==
+      prepared.checkpoint_plan.frontier_tree_sha ||
+    checkpointState.next_unit.admission_digest !==
+      prepared.admission_private.next_unit_admission_handle
+        .next_unit_admission_digest ||
+    checkpointState.source.tip_commit_sha !==
+      prepared.raw_source_tip_commit_sha
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_STATE_BINDING",
+      "checkpoint state differs from its private source and admission facts",
+    );
+  }
+  const carrier = validateCheckpointCarrier(carrierValue, {
+    repository: repo,
+    ledgerRef: ref,
+    sourceTipCommitSha: prepared.raw_source_tip_commit_sha,
+    checkpointState,
+    stateTreeSha: prepared.checkpoint_plan.state_tree_sha,
+    capability,
+  });
+  assertHttpDeadlineOpen(requestBudget);
+  assertAdmissionCurrent();
+  await fetchExactCheckpointCommit({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    commitSha: prepared.checkpoint_plan.commit_sha,
+    expectedTreeSha: prepared.checkpoint_plan.tree_sha,
+    expectedParentSha: prepared.raw_source_tip_commit_sha,
+    expectedServerTime: carrier.server_observed_at,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const frontierTreeEntries = await fetchExactGitTree({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    treeSha: prepared.checkpoint_plan.frontier_tree_sha,
+    maximumEntries: MAX_V2_PERSISTENT_FRONTIER_OPERATION_OBJECTS,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  const frontier = await loadCheckpointPrefixFrontier({
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    checkpointState,
+    treeEntries: frontierTreeEntries,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  if (
+    Date.parse(checkpointState.source.observed_at) <
+      Date.parse(frontier.tip_server_observed_at)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_TIME_REGRESSION",
+      "checkpoint source observation time precedes its authenticated tip",
+    );
+  }
+  let priorServerTime = checkpointState.source.observed_at;
+  if (
+    Date.parse(carrier.server_observed_at) < Date.parse(priorServerTime)
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_TIME_REGRESSION",
+      "checkpoint carrier observation time precedes its source prefix",
+    );
+  }
+  priorServerTime = carrier.server_observed_at;
+  for (const entry of suffixRecords) {
+    if (
+      Date.parse(entry.envelope.server_observed_at) <
+        Date.parse(priorServerTime)
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_TIME_REGRESSION",
+        "checkpoint suffix observation time regressed across its epoch root",
+      );
+    }
+    priorServerTime = entry.envelope.server_observed_at;
+  }
+  assertHttpDeadlineOpen(requestBudget);
+  const consumedJtis = new Set(frontier.provenance_identities);
+  assertAdmissionCurrent();
+  const checkpointLiveReceipt = await reverifyStoredWorkflowProvenance({
+    verifyWorkflowProvenance,
+    envelope: carrier,
+    policy: capability.workflow_provenance_policy,
+    provenanceBudget,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  assertUnusedProvenanceJti(consumedJtis, checkpointLiveReceipt);
+
+  suffixRecords = await hydrateCurrentCandidateInventoryAttachments({
+    records: suffixRecords,
+    fetchImpl,
+    authorization,
+    base,
+    repoPath,
+    repository: repo,
+    requestBudget,
+    assertOperationCurrent: assertAdmissionCurrent,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  for (const entry of suffixRecords) {
+    validateV2GitLedgerEnvelope(entry.envelope, {
+      repository: repo,
+      ledger_ref: ref,
+      source_workflow: sourceWorkflow(capability.controller_release),
+      provenance_policy: provenanceExpected(capability),
+    });
+    assertAdmissionCurrent();
+    const liveReceipt = await reverifyStoredWorkflowProvenance({
+      verifyWorkflowProvenance,
+      envelope: entry.envelope,
+      policy: capability.workflow_provenance_policy,
+      provenanceBudget,
+    });
+    assertAdmissionCurrent();
+    assertHttpDeadlineOpen(requestBudget);
+    assertUnusedProvenanceJti(consumedJtis, liveReceipt);
+  }
+  const projectedState = projectChainState(
+    suffixRecords,
+    suffixRecords.at(-1).envelope.server_observed_at,
+    {
+      epochRecordOffset: 1,
+      latestCapabilitySeed: checkpointLatestCapabilitySeed(checkpointState),
+    },
+  );
+  const candidateAuthority =
+    projectedState.authority_projection.candidate_inventory;
+  const dispatchAuthority =
+    projectedState.authority_projection.candidate_dispatch;
+  const admittedCycle = prepared.admission_private.cycle;
+  if (
+    candidateAuthority.incomplete_cycle !== null ||
+    candidateAuthority.completed_cycle?.cycle_id !==
+      checkpointState.next_unit.cycle_id ||
+    candidateAuthority.completed_cycle?.cycle_receipt.receipt_digest !==
+      admittedCycle.cycle_receipt.receipt_digest ||
+    dispatchAuthority.active_reservation === null
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_SUFFIX_AUTHORITY",
+      "checkpoint suffix does not reconstruct its admitted candidate authority",
+    );
+  }
+  const firstPlan = createCandidateDispatchPlan(
+    dispatchAuthority.active_reservation,
+  );
+  const firstPlanBytes = Buffer.byteLength(canonicalJson(firstPlan), "utf8");
+  if (
+    firstPlan.schema_version !== 2 ||
+    firstPlanBytes > MAX_V2_CANDIDATE_DISPATCH_PLAN_BYTES ||
+    canonicalJson(firstPlan) !== canonicalJson(
+      prepared.suffix.first_dispatch_plan,
+    )
+  ) {
+    throw ledgerError(
+      "CHECKPOINT_DISPATCH_PLAN_UNREPRESENTABLE",
+      "checkpoint loader cannot reconstruct its exact bounded dispatch plan",
+    );
+  }
+  const queryRecords = [
+    ...checkpointState.source.query_records.map((entry) =>
+      deepFreeze(structuredClone(entry))),
+    ...suffixRecords,
+  ];
+  const queryState = {
+    ...projectedState,
+    projection: projectV2GitLedgerRecords(queryRecords),
+    authority_projection: deriveV2GitLedgerAuthority(queryRecords),
+  };
+  const futureState = bootstrapCheckpointFutureState({
+    checkpointCommitSha: prepared.checkpoint_plan.commit_sha,
+    checkpointState,
+    suffixRecords,
+    projectedState: queryState,
+    firstDispatchPlan: firstPlan,
+  });
+  assertAdmissionCurrent();
+  assertHttpDeadlineOpen(requestBudget);
+  return checkpointValidationDiagnostic({
+    prepared,
+    suffix: { records: suffixRecords },
+    frontier,
+    futureState,
+  });
+}
+
 async function createCommitObjects({
   fetchImpl,
   authorization,
@@ -21944,11 +31142,113 @@ async function createCommitObjects({
   envelope,
   parents,
   requestBudget,
+  candidateInventoryAttachment = null,
+  assertOperationCurrent = () => {},
 }) {
+  let attachmentTreeCapture = null;
+  let attachmentBlobCaptures = [];
+  let attachmentTreeSha = null;
+  if (candidateInventoryAttachment !== null) {
+    const manifest = validateCandidateInventoryAttachmentManifest(
+      candidateInventoryAttachment.manifest,
+    );
+    if (
+      envelope.record_type !== "candidate-inventory-observation" ||
+      envelope.payload.schema_version !== 2 ||
+      envelope.payload.phase !== "attempt" ||
+      envelope.payload.attachment_manifest.manifest_digest !==
+        manifest.manifest_digest
+    ) {
+      throw ledgerError(
+        "candidate-inventory-attachment-binding",
+        "candidate inventory attachment is not bound by one attempt envelope",
+      );
+    }
+    if (!Array.isArray(candidateInventoryAttachment.chunks) ||
+        !Array.isArray(candidateInventoryAttachment.tree_entries) ||
+        candidateInventoryAttachment.chunks.length !== manifest.chunk_count ||
+        canonicalJson(candidateInventoryAttachment.tree_entries) !==
+          canonicalJson(manifest.artifacts.flatMap((artifact) =>
+            artifact.chunks.map((chunk) => ({
+              path: chunk.path,
+              mode: "100644",
+              type: "blob",
+              sha: chunk.blob_sha,
+            }))))) {
+      throw ledgerError(
+        "candidate-inventory-attachment-binding",
+        "candidate inventory attachment chunks differ from their sealed manifest",
+      );
+    }
+    for (const [index, chunk] of
+      candidateInventoryAttachment.chunks.entries()) {
+      const expected = manifest.artifacts.flatMap((artifact) =>
+        artifact.chunks)[index];
+      const bytes = Buffer.from(chunk.bytes);
+      if (
+        chunk.path !== expected.path ||
+        bytes.byteLength !== expected.byte_length ||
+        gitObjectSha("blob", bytes) !== expected.blob_sha ||
+        rawDigest(bytes) !== expected.sha256
+      ) {
+        throw ledgerError(
+          "candidate-inventory-attachment-binding",
+          "candidate inventory attachment bytes differ from their manifest",
+        );
+      }
+      assertOperationCurrent();
+      const capture = await request({
+        fetchImpl,
+        authorization,
+        base,
+        method: "POST",
+        path: `${repoPath}/git/blobs`,
+        body: { content: bytes.toString("base64"), encoding: "base64" },
+        expectedStatus: 201,
+        requestBudget,
+        assertOperationCurrent,
+      });
+      assertOperationCurrent();
+      if (responseSha(capture.data, "created candidate attachment blob") !==
+          expected.blob_sha) {
+        throw ledgerError(
+          "candidate-inventory-attachment-blob-identity",
+          "created candidate inventory attachment blob changed identity",
+        );
+      }
+      attachmentBlobCaptures.push(capture);
+    }
+    assertOperationCurrent();
+    attachmentTreeCapture = await request({
+      fetchImpl,
+      authorization,
+      base,
+      method: "POST",
+      path: `${repoPath}/git/trees`,
+      body: { tree: structuredClone(candidateInventoryAttachment.tree_entries) },
+      expectedStatus: 201,
+      requestBudget,
+      assertOperationCurrent,
+    });
+    assertOperationCurrent();
+    attachmentTreeSha = responseSha(
+      attachmentTreeCapture.data,
+      "created candidate attachment tree",
+    );
+    if (attachmentTreeSha !== manifest.attachment_tree_sha ||
+        canonicalGitTreeSha(candidateInventoryAttachment.tree_entries) !==
+          attachmentTreeSha) {
+      throw ledgerError(
+        "candidate-inventory-attachment-tree-identity",
+        "created candidate inventory attachment tree changed identity",
+      );
+    }
+  }
   const bytes = `${canonicalJson(envelope)}\n`;
   if (Buffer.byteLength(bytes, "utf8") > MAX_V2_GIT_LEDGER_BLOB_BYTES) {
     throw ledgerError("blob-size", "Git ledger envelope exceeds its blob cap");
   }
+  assertOperationCurrent();
   const blobCapture = await request({
     fetchImpl,
     authorization,
@@ -21958,32 +31258,42 @@ async function createCommitObjects({
     body: { content: bytes, encoding: "utf-8" },
     expectedStatus: 201,
     requestBudget,
+    assertOperationCurrent,
   });
+  assertOperationCurrent();
   const blobSha = responseSha(blobCapture.data, "created blob");
+  const rootEntries = [{
+    path: V2_GIT_LEDGER_BLOB_PATH,
+    mode: "100644",
+    type: "blob",
+    sha: blobSha,
+  }, ...(attachmentTreeSha === null ? [] : [{
+    path: V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_PATH,
+    mode: "040000",
+    type: "tree",
+    sha: attachmentTreeSha,
+  }])];
+  assertOperationCurrent();
   const treeCapture = await request({
     fetchImpl,
     authorization,
     base,
     method: "POST",
     path: `${repoPath}/git/trees`,
-    body: {
-      tree: [{
-        path: V2_GIT_LEDGER_BLOB_PATH,
-        mode: "100644",
-        type: "blob",
-        sha: blobSha,
-      }],
-    },
+    body: { tree: rootEntries },
     expectedStatus: 201,
     requestBudget,
+    assertOperationCurrent,
   });
+  assertOperationCurrent();
   const treeSha = responseSha(treeCapture.data, "created tree");
-  if (canonicalTreeSha(blobSha) !== treeSha) {
+  if (canonicalGitTreeSha(rootEntries) !== treeSha) {
     throw ledgerError(
       "tree-identity",
       "created Git ledger tree does not match its exact Git object identity",
     );
   }
+  assertOperationCurrent();
   const commitCapture = await request({
     fetchImpl,
     authorization,
@@ -22005,7 +31315,9 @@ async function createCommitObjects({
     },
     expectedStatus: 201,
     requestBudget,
+    assertOperationCurrent,
   });
+  assertOperationCurrent();
   const commit = commitCapture.data;
   const commitSha = responseSha(commit, "created commit");
   if (
@@ -22030,6 +31342,18 @@ async function createCommitObjects({
       blob: { object_sha: blobSha, ...captureReceipt(blobCapture) },
       tree: { object_sha: treeSha, ...captureReceipt(treeCapture) },
       commit: { object_sha: commitSha, ...captureReceipt(commitCapture) },
+      ...(attachmentTreeSha === null ? {} : {
+        candidate_inventory_attachments: {
+          tree: {
+            object_sha: attachmentTreeSha,
+            ...captureReceipt(attachmentTreeCapture),
+          },
+          blobs: attachmentBlobCaptures.map((capture, index) => ({
+            object_sha: candidateInventoryAttachment.chunks[index].blob_sha,
+            ...captureReceipt(capture),
+          })),
+        },
+      }),
     },
   };
 }
@@ -22043,6 +31367,7 @@ async function readRef({
   refSuffix,
   allowAbsent = false,
   requestBudget,
+  assertOperationCurrent = () => {},
 }) {
   const capture = await request({
     fetchImpl,
@@ -22052,6 +31377,7 @@ async function readRef({
     path: `${repoPath}/git/ref/${refSuffix}`,
     expectedStatus: [200, 404],
     requestBudget,
+    assertOperationCurrent,
   });
   if (capture.http_status === 404) {
     validateAbsentRefBody(capture.data);
@@ -22193,6 +31519,25 @@ function validateNonFastForwardConflict(capture) {
   }
 }
 
+function assertHttpDeadlineOpen(requestBudget, requestDeadlineAt = null) {
+  const now = performance.now();
+  if (
+    requestBudget.deadline_at_ms !== null &&
+    now >= requestBudget.deadline_at_ms
+  ) {
+    throw ledgerError(
+      "checkpoint-transaction-timeout",
+      "checkpoint transaction exceeded its shared absolute deadline",
+    );
+  }
+  if (requestDeadlineAt !== null && now >= requestDeadlineAt) {
+    throw ledgerError(
+      "http-timeout",
+      "Git ledger GitHub request exceeded its fixed deadline",
+    );
+  }
+}
+
 async function request({
   fetchImpl,
   authorization,
@@ -22202,8 +31547,35 @@ async function request({
   body = null,
   expectedStatus,
   requestBudget,
+  assertOperationCurrent = () => {},
 }) {
+  assertOperationCurrent();
   validateHttpRequestBudget(requestBudget);
+  assertHttpDeadlineOpen(requestBudget);
+  const bodyText = body === null ? null : JSON.stringify(body);
+  const bodyBytes = bodyText === null
+    ? 0
+    : Buffer.byteLength(bodyText, "utf8");
+  assertHttpDeadlineOpen(requestBudget);
+  if (
+    requestBudget.request_body_bytes_limit !== null &&
+    bodyBytes > requestBudget.request_body_bytes_limit
+  ) {
+    throw ledgerError(
+      "http-request-body-cap",
+      "Git ledger GitHub request exceeds its per-request body cap",
+    );
+  }
+  if (
+    requestBudget.total_request_body_bytes_limit !== null &&
+    bodyBytes > requestBudget.total_request_body_bytes_limit -
+      requestBudget.total_request_body_bytes
+  ) {
+    throw ledgerError(
+      "http-total-request-byte-cap",
+      "Git ledger exhausted its aggregate GitHub request body cap",
+    );
+  }
   if (requestBudget.request_count >= requestBudget.limits.request_count) {
     throw ledgerError(
       "http-request-cap",
@@ -22211,6 +31583,21 @@ async function request({
     );
   }
   requestBudget.request_count += 1;
+  requestBudget.total_request_body_bytes += bodyBytes;
+
+  const remainingMs = requestBudget.deadline_at_ms === null
+    ? requestBudget.limits.timeout_ms
+    : Math.min(
+      requestBudget.limits.timeout_ms,
+      Math.ceil(requestBudget.deadline_at_ms - performance.now()),
+    );
+  if (remainingMs < 1) {
+    throw ledgerError(
+      "checkpoint-transaction-timeout",
+      "checkpoint transaction exceeded its shared absolute deadline",
+    );
+  }
+  const requestDeadlineAt = performance.now() + remainingMs;
 
   const controller = new AbortController();
   let rejectDeadline;
@@ -22225,7 +31612,7 @@ async function request({
     );
     controller.abort(error);
     rejectDeadline(error);
-  }, requestBudget.limits.timeout_ms);
+  }, remainingMs);
   try {
     let response;
     try {
@@ -22240,23 +31627,42 @@ async function request({
             "x-github-api-version": "2022-11-28",
             ...(body === null ? {} : { "content-type": "application/json" }),
           },
-          ...(body === null ? {} : { body: JSON.stringify(body) }),
+          ...(bodyText === null ? {} : { body: bodyText }),
         }),
         deadline,
       ]);
+      assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
     } catch (error) {
-      if (error?.code === "http-timeout") throw error;
+      if (
+        error?.code === "http-timeout" ||
+        error?.code === "checkpoint-transaction-timeout"
+      ) throw error;
       throw ledgerError(
         "http-request-failed",
         "Git ledger GitHub request failed before a response was read",
         error,
       );
     }
+    assertOperationCurrent();
+    let responseStatus;
+    let responseHeaders;
+    let responseBody;
+    try {
+      responseStatus = response?.status;
+      responseHeaders = response?.headers;
+      responseBody = response?.body;
+    } catch (error) {
+      throw ledgerError(
+        "invalid-http-response",
+        "Git ledger GitHub response properties could not be read",
+        error,
+      );
+    }
     if (
       response === null || typeof response !== "object" ||
-      !Number.isInteger(response.status) ||
-      typeof response.headers?.get !== "function" ||
-      typeof response.body?.getReader !== "function"
+      !Number.isInteger(responseStatus) ||
+      typeof responseHeaders?.get !== "function" ||
+      typeof responseBody?.getReader !== "function"
     ) {
       throw ledgerError(
         "invalid-http-response",
@@ -22264,14 +31670,14 @@ async function request({
       );
     }
     const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
-    if (!expected.includes(response.status)) {
+    if (!expected.includes(responseStatus)) {
       throw ledgerError(
         "unexpected-http-status",
-        `Git ledger expected HTTP ${expected.join(" or ")} and received ${response.status}`,
+        `Git ledger expected HTTP ${expected.join(" or ")} and received ${responseStatus}`,
       );
     }
     const declaredLength = parseContentLength(
-      response.headers.get("content-length"),
+      responseHeaders.get("content-length"),
     );
     if (declaredLength !== null &&
         declaredLength > requestBudget.limits.response_bytes) {
@@ -22280,21 +31686,28 @@ async function request({
         "Git ledger GitHub response exceeds its declared byte cap",
       );
     }
-    const serverTime = githubServerTime(response.headers.get("date"));
+    const serverTime = githubServerTime(responseHeaders.get("date"));
+    assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
     const rawBody = await readResponseBodyBounded({
-      response,
+      responseBody,
       deadline,
       controller,
       requestBudget,
+      requestDeadlineAt,
+      assertOperationCurrent,
     });
+    assertOperationCurrent();
+    assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
     let data;
     try {
       data = JSON.parse(rawBody);
     } catch (error) {
       throw ledgerError("invalid-api-json", "Git ledger API response is not JSON", error);
     }
+    assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
+    assertOperationCurrent();
     return {
-      http_status: response.status,
+      http_status: responseStatus,
       server_time: serverTime,
       raw_body: rawBody,
       data,
@@ -22304,19 +31717,56 @@ async function request({
   }
 }
 
-function createHttpRequestBudget(limits) {
+function createHttpRequestBudget(limits, {
+  deadline_at_ms: deadlineAtMs = null,
+  request_body_bytes: requestBodyBytes = null,
+  total_request_body_bytes: totalRequestBodyBytes = null,
+} = {}) {
+  if (
+    deadlineAtMs !== null &&
+    (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= performance.now())
+  ) {
+    throw new TypeError("Git ledger HTTP budget deadline is invalid");
+  }
+  for (const [label, value] of [
+    ["request body bytes", requestBodyBytes],
+    ["total request body bytes", totalRequestBodyBytes],
+  ]) {
+    if (value !== null && (!Number.isSafeInteger(value) || value < 1)) {
+      throw new TypeError(`Git ledger HTTP budget ${label} is invalid`);
+    }
+  }
+  if (
+    requestBodyBytes !== null && totalRequestBodyBytes !== null &&
+    requestBodyBytes > totalRequestBodyBytes
+  ) {
+    throw new TypeError(
+      "Git ledger HTTP per-request body cap exceeds its aggregate cap",
+    );
+  }
   return {
     request_count: 0,
     total_response_bytes: 0,
+    total_request_body_bytes: 0,
+    deadline_at_ms: deadlineAtMs,
+    request_body_bytes_limit: requestBodyBytes,
+    total_request_body_bytes_limit: totalRequestBodyBytes,
     limits: normalizeHttpLimits(limits),
   };
 }
 
-function createProvenanceBudget(timeoutMs) {
+function createProvenanceBudget(timeoutMs, deadlineAtMs = null) {
+  if (
+    deadlineAtMs !== null &&
+    (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= performance.now())
+  ) {
+    throw new TypeError("Git ledger provenance budget deadline is invalid");
+  }
   return {
     call_count: 0,
     maximum_calls: MAX_V2_GIT_LEDGER_COMMITS * 8 + 64,
     timeout_ms: normalizeProvenanceTimeout(timeoutMs),
+    deadline_at_ms: deadlineAtMs,
   };
 }
 
@@ -22326,7 +31776,10 @@ function consumeProvenanceBudget(budget) {
     !Number.isSafeInteger(budget.call_count) || budget.call_count < 0 ||
     !Number.isSafeInteger(budget.maximum_calls) || budget.maximum_calls < 1 ||
     !Number.isSafeInteger(budget.timeout_ms) || budget.timeout_ms < 1 ||
-    budget.timeout_ms > V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS
+    budget.timeout_ms > V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS ||
+    (budget.deadline_at_ms !== null &&
+      (!Number.isFinite(budget.deadline_at_ms) ||
+        budget.deadline_at_ms <= 0))
   ) {
     throw new TypeError("Git ledger provenance verifier budget is invalid");
   }
@@ -22337,6 +31790,19 @@ function consumeProvenanceBudget(budget) {
     );
   }
   budget.call_count += 1;
+  const timeoutMs = budget.deadline_at_ms === null
+    ? budget.timeout_ms
+    : Math.min(
+      budget.timeout_ms,
+      Math.ceil(budget.deadline_at_ms - performance.now()),
+    );
+  if (timeoutMs < 1) {
+    throw ledgerError(
+      "checkpoint-transaction-timeout",
+      "checkpoint transaction exceeded its shared absolute deadline",
+    );
+  }
+  const deadlineAtMs = performance.now() + timeoutMs;
   const controller = new AbortController();
   let rejectDeadline;
   const deadline = new Promise((resolve, reject) => {
@@ -22350,11 +31816,28 @@ function consumeProvenanceBudget(budget) {
     );
     controller.abort(error);
     rejectDeadline(error);
-  }, budget.timeout_ms);
+  }, timeoutMs);
   return {
     signal: controller.signal,
     deadline,
-    timeout_ms: budget.timeout_ms,
+    timeout_ms: timeoutMs,
+    assertOpen() {
+      if (
+        budget.deadline_at_ms !== null &&
+        performance.now() >= budget.deadline_at_ms
+      ) {
+        throw ledgerError(
+          "checkpoint-transaction-timeout",
+          "checkpoint transaction exceeded its shared absolute deadline",
+        );
+      }
+      if (performance.now() >= deadlineAtMs) {
+        throw ledgerError(
+          "provenance-timeout",
+          "Git ledger provenance verifier exceeded its fixed deadline",
+        );
+      }
+    },
     finish() {
       clearTimeout(timer);
     },
@@ -22374,7 +31857,18 @@ function validateHttpRequestBudget(value) {
     value === null || typeof value !== "object" || Array.isArray(value) ||
     !Number.isSafeInteger(value.request_count) || value.request_count < 0 ||
     !Number.isSafeInteger(value.total_response_bytes) ||
-    value.total_response_bytes < 0 || value.limits === null ||
+    value.total_response_bytes < 0 ||
+    !Number.isSafeInteger(value.total_request_body_bytes) ||
+    value.total_request_body_bytes < 0 ||
+    (value.deadline_at_ms !== null &&
+      (!Number.isFinite(value.deadline_at_ms) || value.deadline_at_ms <= 0)) ||
+    (value.request_body_bytes_limit !== null &&
+      (!Number.isSafeInteger(value.request_body_bytes_limit) ||
+        value.request_body_bytes_limit < 1)) ||
+    (value.total_request_body_bytes_limit !== null &&
+      (!Number.isSafeInteger(value.total_request_body_bytes_limit) ||
+        value.total_request_body_bytes_limit < 1)) ||
+    value.limits === null ||
     typeof value.limits !== "object"
   ) {
     throw new TypeError("Git ledger HTTP budget is invalid");
@@ -22408,44 +31902,78 @@ function normalizeHttpLimits(value) {
 }
 
 async function readResponseBodyBounded({
-  response,
+  responseBody,
   deadline,
   controller,
   requestBudget,
+  requestDeadlineAt,
+  assertOperationCurrent = () => {},
 }) {
-  const reader = response.body.getReader();
+  assertOperationCurrent();
+  const reader = responseBody.getReader();
   const chunks = [];
   let responseBytes = 0;
+  let chunkCount = 0;
   try {
     while (true) {
+      assertOperationCurrent();
+      assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
       let read;
       try {
         read = await Promise.race([reader.read(), deadline]);
       } catch (error) {
-        if (error?.code === "http-timeout") throw error;
+        if (
+          error?.code === "http-timeout" ||
+          error?.code === "checkpoint-transaction-timeout"
+        ) throw error;
         throw ledgerError(
           "http-body-failed",
           "Git ledger GitHub response body could not be read",
           error,
         );
       }
-      if (
-        read === null || typeof read !== "object" ||
-        typeof read.done !== "boolean"
-      ) {
+      assertOperationCurrent();
+      assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
+      let done;
+      let value;
+      try {
+        done = read?.done;
+        if (done === false) value = read.value;
+      } catch (error) {
+        throw ledgerError(
+          "invalid-http-response",
+          "Git ledger GitHub response stream chunk could not be read",
+          error,
+        );
+      }
+      if (read === null || typeof read !== "object" ||
+          typeof done !== "boolean") {
         throw ledgerError(
           "invalid-http-response",
           "Git ledger GitHub response stream returned an invalid chunk",
         );
       }
-      if (read.done) break;
-      if (!(read.value instanceof Uint8Array)) {
+      if (done) break;
+      if (!(value instanceof Uint8Array)) {
         throw ledgerError(
           "invalid-http-response",
           "Git ledger GitHub response stream chunk is not bytes",
         );
       }
-      responseBytes += read.value.byteLength;
+      const chunkBytes = value.byteLength;
+      chunkCount += 1;
+      if (
+        chunkBytes === 0 ||
+        chunkCount > MAX_V2_GIT_LEDGER_HTTP_BODY_CHUNKS
+      ) {
+        controller.abort();
+        void reader.cancel().catch(() => {});
+        throw ledgerError(
+          "http-response-chunk-cap",
+          "Git ledger GitHub response stream exceeds its chunk profile",
+        );
+      }
+      responseBytes += chunkBytes;
       if (responseBytes > requestBudget.limits.response_bytes) {
         controller.abort();
         void reader.cancel().catch(() => {});
@@ -22455,7 +31983,7 @@ async function readResponseBodyBounded({
         );
       }
       if (
-        requestBudget.total_response_bytes + read.value.byteLength >
+        requestBudget.total_response_bytes + chunkBytes >
         requestBudget.limits.total_response_bytes
       ) {
         controller.abort();
@@ -22465,13 +31993,22 @@ async function readResponseBodyBounded({
           "Git ledger exhausted its aggregate GitHub response byte cap",
         );
       }
-      requestBudget.total_response_bytes += read.value.byteLength;
-      chunks.push(Buffer.from(
-        read.value.buffer,
-        read.value.byteOffset,
-        read.value.byteLength,
-      ));
+      assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
+      const snapshot = Buffer.from(value);
+      if (snapshot.byteLength !== chunkBytes) {
+        throw ledgerError(
+          "invalid-http-response",
+          "Git ledger GitHub response stream chunk changed during snapshot",
+        );
+      }
+      assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
+      requestBudget.total_response_bytes += chunkBytes;
+      chunks.push(snapshot);
     }
+  } catch (error) {
+    controller.abort();
+    void reader.cancel().catch(() => {});
+    throw error;
   } finally {
     reader.releaseLock?.();
   }
@@ -22481,16 +32018,25 @@ async function readResponseBodyBounded({
       "Git ledger GitHub response body must be non-empty",
     );
   }
+  assertOperationCurrent();
+  let decoded;
   try {
-    return new TextDecoder("utf-8", { fatal: true })
+    decoded = new TextDecoder("utf-8", { fatal: true })
       .decode(Buffer.concat(chunks, responseBytes));
   } catch (error) {
+    if (
+      error?.code === "http-timeout" ||
+      error?.code === "checkpoint-transaction-timeout"
+    ) throw error;
     throw ledgerError(
       "invalid-api-utf8",
       "Git ledger GitHub response is not valid UTF-8",
       error,
     );
   }
+  assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
+  assertOperationCurrent();
+  return decoded;
 }
 
 function parseContentLength(value) {
@@ -24674,6 +34220,7 @@ async function reverifyReachableWorkflowProvenance({
   ledgerRef,
   verifyWorkflowProvenance,
   provenanceBudget,
+  assertOperationCurrent = () => {},
 }) {
   let activeCapability = null;
   const evidence = [];
@@ -24708,12 +34255,14 @@ async function reverifyReachableWorkflowProvenance({
       source_workflow: sourceWorkflow(recordCapability.controller_release),
       provenance_policy: provenanceExpected(recordCapability),
     });
+    assertOperationCurrent();
     const liveReceipt = await reverifyStoredWorkflowProvenance({
       verifyWorkflowProvenance,
       envelope,
       policy: recordCapability.workflow_provenance_policy,
       provenanceBudget,
     });
+    assertOperationCurrent();
     const withoutDigest = {
       record_oid: entry.commit_sha,
       stored_receipt_digest: envelope.workflow_provenance.receipt_digest,
@@ -24777,8 +34326,12 @@ async function callWorkflowProvenanceVerifier({
       }),
       verifierSignal.deadline,
     ]);
+    verifierSignal.assertOpen();
   } catch (error) {
-    if (error?.code === "provenance-timeout") throw error;
+    if (
+      error?.code === "provenance-timeout" ||
+      error?.code === "checkpoint-transaction-timeout"
+    ) throw error;
     if (new Set(["oidc-kid-unavailable", "OIDC_KID_UNAVAILABLE"])
       .has(error?.code)) {
       throw ledgerError(
@@ -24822,6 +34375,7 @@ async function callWorkflowProvenanceVerifier({
   if (rawDigest(jwt) !== receipt.token_sha256) {
     throw new Error("workflow provenance verifier JWT digest is invalid");
   }
+  verifierSignal.assertOpen();
   return deepFreeze({ receipt, compact_jwt: jwt });
 }
 
@@ -24949,11 +34503,16 @@ function validateProvenanceRequest(value) {
   const recordIdentity = normalizeProvenanceRecordIdentity(value.record_identity);
   const productionOperation = RECORD_TYPES.has(operation);
   const repositoryOperation = REPOSITORY_RECORD_TYPES.has(operation);
+  const checkpointOperation = operation === "checkpoint-rotate";
   if ((productionOperation &&
         ((repositoryOperation ? effectScope !== null : effectScope === null) ||
           evaluatedScopeReceipt === null ||
           recordIdentity === null)) ||
+      (checkpointOperation &&
+        (effectScope !== null || evaluatedScopeReceipt !== null ||
+          recordIdentity?.record_type !== "epoch-checkpoint")) ||
       (!productionOperation &&
+        !checkpointOperation &&
         (effectScope !== null || evaluatedScopeReceipt !== null ||
           recordIdentity !== null))) {
     throw new Error(
@@ -25056,11 +34615,16 @@ function normalizeProvenanceOperationBinding(value) {
     );
   const recordIdentity = normalizeProvenanceRecordIdentity(value.record_identity);
   const repositoryOperation = REPOSITORY_RECORD_TYPES.has(operation);
+  const checkpointOperation = operation === "checkpoint-rotate";
   if ((RECORD_TYPES.has(operation) &&
         ((repositoryOperation ? effectScope !== null : effectScope === null) ||
           evaluatedScopeReceipt === null ||
           recordIdentity === null)) ||
+      (checkpointOperation &&
+        (effectScope !== null || evaluatedScopeReceipt !== null ||
+          recordIdentity?.record_type !== "epoch-checkpoint")) ||
       (!RECORD_TYPES.has(operation) &&
+        !checkpointOperation &&
         (effectScope !== null || evaluatedScopeReceipt !== null ||
           recordIdentity !== null))) {
     throw new Error(
@@ -25520,14 +35084,15 @@ function normalizeEvaluatedScopeInventoryReceipt(value, relation, scope) {
       "shard_index", "evidence_receipt_digest", "observed_at",
     ], "evaluated repository inventory receipt");
     if (
-      !new Set(["cycle-start", "shard", "cycle-complete"]).has(value.phase) ||
+      !new Set(["cycle-start", "shard", "attempt", "cycle-complete"])
+        .has(value.phase) ||
       !CANDIDATE_CYCLE_ID.test(value.cycle_id)
     ) {
       throw new Error("evaluated repository inventory phase is unsupported");
     }
     digest(value.initial_inventory_receipt_digest,
       "evaluated repository inventory initial digest");
-    if (value.phase === "shard") {
+    if (new Set(["shard", "attempt"]).has(value.phase)) {
       nonnegativeInteger(value.shard_index,
         "evaluated repository inventory shard_index");
     } else if (value.shard_index !== null) {
@@ -26271,7 +35836,10 @@ function normalizeProvenanceRecordIdentity(value) {
   exactKeys(value, [
     "record_type", "kind", "effect_id", "idempotency_key", "payload_digest",
   ], "workflow provenance record_identity");
-  if (!RECORD_TYPES.has(value.record_type)) {
+  if (
+    !RECORD_TYPES.has(value.record_type) &&
+    value.record_type !== "epoch-checkpoint"
+  ) {
     throw new TypeError("workflow provenance record type is not production");
   }
   const effect = new Set(["effect-intent", "effect-response"])
@@ -26579,15 +36147,12 @@ function validateCommitIdentity({ commit, commitSha, treeSha, parents, envelope 
       );
     }
   }
-  const lines = [
-    `tree ${treeSha}`,
-    ...parents.map((parent) => `parent ${parent}`),
-    `author ${identity.name} <${identity.email}> ${gitTimestamp(identity.date)}`,
-    `committer ${identity.name} <${identity.email}> ${gitTimestamp(identity.date)}`,
-    "",
-    commitMessage(envelope),
-  ];
-  const bytes = Buffer.from(lines.join("\n"), "utf8");
+  const bytes = canonicalGitCommitBytes({
+    treeSha,
+    parents,
+    message: commitMessage(envelope),
+    serverTime: envelope.server_observed_at,
+  });
   if (gitObjectSha("commit", bytes) !== commitSha) {
     throw ledgerError(
       "commit-object-identity",
@@ -26606,12 +36171,55 @@ function gitObjectSha(type, bytes) {
   return createHash("sha1").update(header).update(bytes).digest("hex");
 }
 
+function canonicalGitTreeBytes(entriesValue) {
+  if (!Array.isArray(entriesValue) || entriesValue.length === 0) {
+    throw new TypeError("Git ledger tree requires one or more entries");
+  }
+  const seen = new Set();
+  const entries = entriesValue.map((entry, index) => {
+    assertObject(entry, `Git ledger tree entry ${index}`);
+    exactKeys(entry, ["path", "mode", "type", "sha"],
+      `Git ledger tree entry ${index}`);
+    const path = boundedString(entry.path, `Git ledger tree entry ${index}.path`, 256);
+    if (!/^[0-9A-Za-z][0-9A-Za-z._-]*$/u.test(path) || seen.has(path)) {
+      throw ledgerError("tree-shape", "Git ledger tree paths are not closed and unique");
+    }
+    seen.add(path);
+    const type = entry.type;
+    const mode = entry.mode;
+    if (!(
+      type === "blob" && mode === "100644" ||
+      type === "tree" && mode === "040000"
+    )) {
+      throw ledgerError("tree-shape", "Git ledger tree entry mode/type is unsupported");
+    }
+    return {
+      path,
+      mode,
+      type,
+      sha: sha(entry.sha, `Git ledger tree entry ${index}.sha`),
+    };
+  }).sort((left, right) => Buffer.compare(
+    Buffer.from(`${left.path}${left.type === "tree" ? "/" : ""}`, "utf8"),
+    Buffer.from(`${right.path}${right.type === "tree" ? "/" : ""}`, "utf8"),
+  ));
+  return Buffer.concat(entries.map((entry) => Buffer.concat([
+    Buffer.from(`${entry.mode} ${entry.path}\0`, "utf8"),
+    Buffer.from(entry.sha, "hex"),
+  ])));
+}
+
 function canonicalTreeSha(blobSha) {
-  const treeBytes = Buffer.concat([
-    Buffer.from(`100644 ${V2_GIT_LEDGER_BLOB_PATH}\0`, "utf8"),
-    Buffer.from(sha(blobSha, "Git ledger tree blob SHA"), "hex"),
-  ]);
-  return gitObjectSha("tree", treeBytes);
+  return canonicalGitTreeSha([{
+    path: V2_GIT_LEDGER_BLOB_PATH,
+    mode: "100644",
+    type: "blob",
+    sha: blobSha,
+  }]);
+}
+
+function canonicalGitTreeSha(entries) {
+  return gitObjectSha("tree", canonicalGitTreeBytes(entries));
 }
 
 function commitMessage(envelope) {
