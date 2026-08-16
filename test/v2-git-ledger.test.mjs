@@ -1,15 +1,26 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import {
+  copyFile,
+  mkdtemp,
+  open,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { inflateRawSync } from "node:zlib";
+import { setTimeout as delay } from "node:timers/promises";
+import { deflateRawSync, gunzipSync, inflateRawSync } from "node:zlib";
 
 import {
   V2_GIT_LEDGER_BLOB_PATH,
   V2_GIT_LEDGER_CAPABILITY_SCHEMA,
   V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA,
+  V2_GIT_LEDGER_ENVELOPE_SCHEMA,
   V2_GIT_LEDGER_CHECKPOINT_ADMISSION_INSPECTION_SCHEMA,
   V2_GIT_LEDGER_CHECKPOINT_FRONTIER_NODES_PATH,
   V2_GIT_LEDGER_CHECKPOINT_PREPARATION_DIAGNOSTIC_SCHEMA,
@@ -26,6 +37,8 @@ import {
   MAX_V2_GIT_LEDGER_COMMITS,
   MAX_V2_GIT_LEDGER_BLOB_BYTES,
   MAX_V2_CANDIDATE_DISPATCH_PLAN_BYTES,
+  MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_BINDING_BYTES,
+  MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_PLAN_BYTES,
   MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_ACTION_BYTES,
   MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_RECEIPT_BYTES,
   MAX_V2_SCHEDULED_CANDIDATE_LEDGER_RECORDS,
@@ -33,6 +46,7 @@ import {
   V2_GIT_LEDGER_OIDC_CLAIMS,
   V2_GIT_LEDGER_PROVENANCE_RECEIPT_SCHEMA,
   V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
+  V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
   V2_GIT_LEDGER_PROVENANCE_VERIFIER_RESULT_SCHEMA,
   V2_GIT_LEDGER_PUBLIC_ENVELOPE_SCHEMA,
   assertV2GitLedgerControlPlaneAuthorityHandle,
@@ -74,9 +88,13 @@ import {
   projectV2GitLedgerCandidateDispatchBinding,
   projectV2GitLedgerCandidateDispatchPlan,
   validateV2GitLedgerControlPlaneAuthority,
+  validateV2GitLedgerCandidateDispatchBinding,
+  validateV2GitLedgerCandidateDispatchPlan,
+  validateV2GitLedgerCandidateDispatchReservation,
   validateV2GitLedgerDiscoveryContinuityReceipt,
   validateV2GitLedgerEstablishedRunnerStateAuthority,
   validateV2GitLedgerInitialRunnerStateAuthority,
+  validateV2GitLedgerRecord,
 } from "../packages/action/src/v2/git-ledger.mjs";
 import {
   assertV2ProductionRunnerAuthorityHandle,
@@ -89,6 +107,7 @@ import {
   V2_CANDIDATE_SHARD_RECEIPT_SCHEMA,
   createV2GitHubCandidateInventory,
   createV2GitHubCurrentOpenCandidateInventory,
+  consumeV2CurrentOpenProductionCandidateAuthorityHandle,
   finalizeV2CandidateInventoryCycle,
   validateV2CandidateInventory,
 } from "../packages/action/src/v2/candidate-inventory.mjs";
@@ -139,6 +158,37 @@ const POTENTIAL = "c".repeat(40);
 const TIME = "2026-08-13T12:00:00.000Z";
 const PR = { number: 7, node_id: "PR_7" };
 const OWNER = { run_id: "9001", run_attempt: 1, actor_id: "15368" };
+const C65_BATCH0_GIT_FIXTURE_URL = new URL(
+  "./fixtures/v2-git-ledger-c65-batch0.git-fixture.json.gz",
+  import.meta.url,
+);
+const C65_BATCH0_GIT_FIXTURE_GZIP_BYTES = 723_650;
+const C65_BATCH0_GIT_FIXTURE_GZIP_SHA256 =
+  "sha256:62308a780a93d0b2399881b7556d745d2b6fbc9aac4ce779e8f110bf1b6c18a0";
+const C65_BATCH0_GIT_FIXTURE_JSON_BYTES = 4_051_651;
+const C65_BATCH0_GIT_FIXTURE_JSON_SHA256 =
+  "sha256:b3baf61e1d92c840f3fd1775bd1b34123a0734c32798ea31755d4906cb708db5";
+const C65_BATCH0_GIT_FIXTURE_MAX_GZIP_BYTES = 2 * 1024 * 1024;
+const C65_BATCH0_GIT_FIXTURE_MAX_JSON_BYTES = 16 * 1024 * 1024;
+const C65_BATCH0_GIT_FIXTURE_O_CLOEXEC = fsConstants.O_CLOEXEC ?? ({
+  darwin: 0x01000000,
+  linux: 0x00080000,
+})[process.platform] ?? 0;
+const C65_BATCH0_GIT_FIXTURE_O_NONBLOCK = fsConstants.O_NONBLOCK ?? 0;
+const C65_BATCH0_GIT_FIXTURE_OPEN_FLAGS =
+  fsConstants.O_RDONLY |
+  fsConstants.O_NOFOLLOW |
+  C65_BATCH0_GIT_FIXTURE_O_NONBLOCK |
+  C65_BATCH0_GIT_FIXTURE_O_CLOEXEC;
+const C65_BATCH0_GIT_FIXTURE_COUNTS = Object.freeze({
+  blobs: 199,
+  trees: 199,
+  commits: 198,
+});
+const C65_BATCH0_GIT_FIXTURE_REF =
+  "874a4280bd98032c47a2a5b73ab5e885b33edbc0";
+const C65_BATCH0_GIT_FIXTURE_CLOCK_SECOND = 119;
+const HISTORICAL_LEDGER_FIXTURES = new WeakMap();
 const CONTROL = {
   comment_id: "71",
   comment_node_id: "IC_71",
@@ -180,7 +230,7 @@ const APP = {
 // review helper synthetic-token pool joey-private-v3: bearer-a
 const SYNTHETIC_BEARER = "codex_synth_v1_bearer_a";
 
-test("bootstrap proves one-winner canary and production append is exact-ref stable", async () => {
+test("bootstrap proves one-winner canary and high-level lease append is exact-ref stable", async () => {
   const fixture = githubGitFixture();
   const ledger = makeLedger(fixture);
 
@@ -203,26 +253,16 @@ test("bootstrap proves one-winner canary and production append is exact-ref stab
   assert.equal(initial.pre_ref.target_commit_sha, initial.post_ref.target_commit_sha);
 
   const lease = (await acquireDefaultDiscovery(ledger)).lease_receipt;
-  const intent = effectRecord({
-    predecessor: lease.acquire_commit_sha,
-    lease,
-    effectId: "effect-1",
-    idempotencyKey: "intent-1",
-    at: TIME,
-  });
-  const receipt = await ledger.appendRecord(intent);
-  assert.equal(receipt.record_type, "effect-intent");
-  assert.equal(receipt.predecessor_commit_sha, lease.acquire_commit_sha);
-  assert.equal(receipt.ref_reread.target_commit_sha, receipt.commit_sha);
-  assert.equal(receipt.stable, true);
+  assert.equal(lease.acquire_commit_sha, fixture.refTarget);
 
   const loaded = await ledger.load();
-  assert.equal(loaded.tip_commit_sha, receipt.commit_sha);
-  assert.equal(loaded.effect_intent_count, 1);
+  assert.equal(loaded.tip_commit_sha, lease.acquire_commit_sha);
+  assert.equal(loaded.post_ref.target_commit_sha, lease.acquire_commit_sha);
+  assert.equal(loaded.effect_intent_count, 0);
   assert.equal(loaded.active_lease.lease_id, lease.lease_id);
   assert.deepEqual(
     loaded.records.map((entry) => entry.envelope.record_type),
-    ["genesis", "capability-canary", "capability-attestation", "lease-acquire", "effect-intent"],
+    ["genesis", "capability-canary", "capability-attestation", "lease-acquire"],
   );
   assert.equal(
     fixture.calls.some((call) =>
@@ -230,6 +270,235 @@ test("bootstrap proves one-winner canary and production append is exact-ref stab
     false,
   );
 });
+
+test("public raw effect append seams reject effect identities before writes",
+  async (t) => {
+    const snapshotWrites = (fixture) => ({
+      write_calls: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+      patches: fixture.calls.filter(({ method }) => method === "PATCH").length,
+      object_posts: fixture.calls.filter(({ method, path }) =>
+        method === "POST" && new Set([
+          "/git/blobs", "/git/trees", "/git/commits",
+        ]).has(path)).length,
+    });
+    const assertRejectedBeforeWrites = async ({ fixture, ledger, append }) => {
+      const loaded = await ledger.load();
+      const before = snapshotWrites(fixture);
+      await assert.rejects(
+        append(),
+        (error) => error.code === "UNTRUSTED_RAW_EFFECT_APPEND",
+      );
+      assert.deepEqual(snapshotWrites(fixture), before);
+      assert.equal((await ledger.load()).tip_commit_sha, loaded.tip_commit_sha);
+    };
+    const rawIntentContext = async (suffix) => {
+      const fixture = githubGitFixture();
+      const ledger = makeLedger(fixture);
+      await ledger.bootstrapCapability();
+      const lease = (await acquireDefaultDiscovery(ledger)).lease_receipt;
+      return {
+        fixture,
+        ledger,
+        input: effectIntentInput({
+          predecessor: lease.acquire_commit_sha,
+          lease,
+          effectId: `effect-raw-${suffix}`,
+          idempotencyKey: `intent-raw-${suffix}`,
+          at: TIME,
+        }),
+      };
+    };
+
+    await t.test("appendRecord", async () => {
+      const context = await rawIntentContext("record");
+      await assertRejectedBeforeWrites({
+        ...context,
+        append: () => context.ledger.appendRecord(
+          createV2GitLedgerEffectIntentRecord(context.input),
+        ),
+      });
+    });
+
+    await t.test("append alias", async () => {
+      const context = await rawIntentContext("alias");
+      await assertRejectedBeforeWrites({
+        ...context,
+        append: () => context.ledger.append(
+          createV2GitLedgerEffectIntentRecord(context.input),
+        ),
+      });
+    });
+
+    await t.test("appendEffectIntent", async () => {
+      const context = await rawIntentContext("intent");
+      await assertRejectedBeforeWrites({
+        ...context,
+        append: () => context.ledger.appendEffectIntent(context.input),
+      });
+    });
+
+    await t.test("appendEffectResponse", async () => {
+      const fixture = githubGitFixture();
+      const context = await createProtectedInitialRunnerContext(fixture);
+      const schedulerPlan = schedulerObservationRecord({
+        predecessor: context.lease.acquire_commit_sha,
+        lease: context.lease,
+        priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+        initialAuthority: context.initialAuthority,
+      }).payload.action;
+      const schedulerAppend = await context.ledger
+        .appendInitialSchedulerObservation({
+          initial_runner_state_authority: context.initialAuthority,
+          scheduler_evaluation: schedulerPlan.scheduler_evaluation,
+          status_plan: schedulerPlan.status_plan,
+        });
+      const statusIntent = await context.ledger.appendStatusWriteIntent({
+        scheduler_append: schedulerAppend,
+        status_write_index: 0,
+      });
+      const intentRecord = recordFromFixtureEnvelope(fixtureEnvelopeAt(
+        fixture,
+        statusIntent.intent_append_receipt.commit_sha,
+      ));
+      const receipt = statusWriteResponseReceipt(
+        statusIntent.transport,
+        statusIntent.intent_append_receipt.ref_reread.server_time,
+      );
+      await assertRejectedBeforeWrites({
+        fixture,
+        ledger: context.ledger,
+        append: () => context.ledger.appendEffectResponse({
+          intent_record: intentRecord,
+          intent_commit_sha: statusIntent.intent_append_receipt.commit_sha,
+          server_observed_at: receipt.refetch_server_time,
+          receipt,
+        }),
+      });
+    });
+  });
+
+test("public append cannot replace one validated null-effect snapshot through later accessor values",
+  async () => {
+    const fixture = githubGitFixture();
+    const ledger = makeLedger(fixture);
+    await ledger.bootstrapCapability();
+    const discovery = await acquireDefaultDiscovery(ledger);
+    const lease = discovery.lease_receipt;
+    const loaded = await ledger.load();
+    const boundary = loaded.post_ref.server_time;
+    const nullEffectRecord = createV2GitLedgerRecord({
+      record_type: "lease-release",
+      predecessor_commit_sha: loaded.tip_commit_sha,
+      pull_request: structuredClone(lease.scope.pull_request),
+      head_ref_oid: lease.scope.head_ref_oid,
+      base_ref_oid: lease.scope.base_ref_oid,
+      potential_merge_commit_oid:
+        lease.scope.potential_merge_commit_oid,
+      kind: null,
+      effect_id: null,
+      idempotency_key: null,
+      server_observed_at: boundary,
+      payload: {
+        lease_id: lease.lease_id,
+        owner: structuredClone(lease.owner),
+        acquire_commit_sha: lease.acquire_commit_sha,
+        released_at: boundary,
+      },
+      control_comment_binding: loaded.control_comment_binding,
+      lease: leaseBinding(lease),
+    });
+    const effect = effectRecord({
+      predecessor: loaded.tip_commit_sha,
+      lease,
+      effectId: "accessor-late-effect",
+      idempotencyKey: "accessor-late-effect-key",
+      at: boundary,
+    });
+    const keys = Object.keys(nullEffectRecord);
+    assert.deepEqual(keys, Object.keys(effect));
+    assert.equal(keys.at(-1), "record_digest");
+
+    const accessorRecord = ({ onRecordDigestRead, selectRecord }) => {
+      const record = {};
+      for (const key of keys) {
+        Object.defineProperty(record, key, {
+          enumerable: true,
+          configurable: false,
+          get() {
+            const selected = selectRecord();
+            const value = selected[key];
+            if (key === "record_digest") onRecordDigestRead();
+            return value;
+          },
+        });
+      }
+      return record;
+    };
+
+    let validationRecordDigestReads = 0;
+    const probe = accessorRecord({
+      onRecordDigestRead() {
+        validationRecordDigestReads += 1;
+      },
+      selectRecord: () => nullEffectRecord,
+    });
+    assert.deepEqual(validateV2GitLedgerRecord(probe), nullEffectRecord);
+    assert.ok(validationRecordDigestReads > 0);
+
+    let nullSnapshotReadsRemaining = validationRecordDigestReads;
+    let effectIdentityVisible = false;
+    const switchingRecord = accessorRecord({
+      onRecordDigestRead() {
+        if (!effectIdentityVisible) {
+          nullSnapshotReadsRemaining -= 1;
+          if (nullSnapshotReadsRemaining === 0) {
+            effectIdentityVisible = true;
+          }
+        }
+      },
+      selectRecord: () => effectIdentityVisible ? effect : nullEffectRecord,
+    });
+    const before = {
+      write_calls: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+      patches: fixture.calls.filter(({ method }) => method === "PATCH").length,
+      object_posts: fixture.calls.filter(({ method, path }) =>
+        method === "POST" && new Set([
+          "/git/blobs", "/git/trees", "/git/commits",
+        ]).has(path)).length,
+    };
+    await assert.rejects(
+      ledger.appendRecord(switchingRecord, {
+        evaluated_scope_receipt:
+          discovery.effect_evaluated_scope_receipt,
+      }),
+      (error) => error.code === "lease-scope-authority-mismatch",
+    );
+    assert.equal(effectIdentityVisible, true);
+    assert.deepEqual({
+      write_calls: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+      patches: fixture.calls.filter(({ method }) => method === "PATCH").length,
+      object_posts: fixture.calls.filter(({ method, path }) =>
+        method === "POST" && new Set([
+          "/git/blobs", "/git/trees", "/git/commits",
+        ]).has(path)).length,
+    }, before);
+    const final = await ledger.load();
+    assert.equal(final.tip_commit_sha, loaded.tip_commit_sha);
+    assert.equal(final.active_lease.lease_id, lease.lease_id);
+    assert.equal(final.effect_intent_count, 0);
+  });
 
 test("bootstrap reuses one stable capability across live receipt churn", async () => {
   const fixture = githubGitFixture();
@@ -289,25 +558,21 @@ test("two concurrent siblings advance the protected ref exactly once", async () 
   const fixture = githubGitFixture();
   const ledger = makeLedger(fixture);
   await ledger.bootstrapCapability();
-  const lease = (await acquireDefaultDiscovery(ledger)).lease_receipt;
-
-  const left = effectRecord({
-    predecessor: lease.acquire_commit_sha,
-    lease,
-    effectId: "effect-left",
-    idempotencyKey: "intent-left",
-    at: TIME,
-  });
-  const right = effectRecord({
-    predecessor: lease.acquire_commit_sha,
-    lease,
-    effectId: "effect-right",
-    idempotencyKey: "intent-right",
-    at: TIME,
-  });
+  const loaded = await ledger.load();
+  const authority = {
+    evaluated_scope_receipt: await ledger.defaultEvaluatedScopeReceipt(),
+  };
+  const left = {
+    ...leaseInput(loaded.tip_commit_sha),
+    lease_id: "lease-run-9001-left",
+  };
+  const right = {
+    ...leaseInput(loaded.tip_commit_sha),
+    lease_id: "lease-run-9001-right",
+  };
   const outcomes = await Promise.allSettled([
-    ledger.appendRecord(left),
-    ledger.appendRecord(right),
+    ledger.acquireLease(left, authority),
+    ledger.acquireLease(right, authority),
   ]);
   assert.equal(outcomes.filter((entry) => entry.status === "fulfilled").length, 1);
   assert.equal(outcomes.filter((entry) => entry.status === "rejected").length, 1);
@@ -316,7 +581,8 @@ test("two concurrent siblings advance the protected ref exactly once", async () 
   assert.match(rejected.reason.message, /unreachable/u);
 
   const final = await ledger.load();
-  assert.equal(final.effect_intent_count, 1);
+  assert.equal(final.effect_intent_count, 0);
+  assert.equal(final.records.at(-1).envelope.record_type, "lease-acquire");
   assert.equal(final.records.at(-1).commit_sha, fixture.refTarget);
   assert.equal(fixture.commits.size > final.commit_count, true,
     "the losing sibling remains an unreachable Git object");
@@ -536,32 +802,49 @@ test("multi-parent, noncanonical bytes, and digest tampering fail closed", async
 test("reachable history rejects duplicate effect and idempotency identities", async (t) => {
   async function historyWithTwoIntents() {
     const fixture = githubGitFixture();
-    const ledger = makeLedger(fixture);
-    await ledger.bootstrapCapability();
-    const lease = (await acquireDefaultDiscovery(ledger)).lease_receipt;
-    const first = await ledger.appendRecord(effectRecord({
-      predecessor: lease.acquire_commit_sha,
-      lease,
+    const context = await createProtectedInitialRunnerContext(fixture);
+    const firstLoaded = await context.ledger.load();
+    const firstRecord = effectRecord({
+      predecessor: firstLoaded.tip_commit_sha,
+      lease: context.lease,
       effectId: "effect-first",
       idempotencyKey: "key-first",
-      at: TIME,
-    }));
-    await ledger.appendRecord(effectRecord({
-      predecessor: first.commit_sha,
-      lease,
+      at: firstLoaded.post_ref.server_time,
+    });
+    await materializeHistoricalProductionRecord({
+      ledger: context.ledger,
+      loaded: firstLoaded,
+      record: firstRecord,
+      evaluatedScopeReceipt: context.evaluatedScopeReceipt,
+    });
+    const secondLoaded = await context.ledger.load();
+    const secondRecord = effectRecord({
+      predecessor: secondLoaded.tip_commit_sha,
+      lease: context.lease,
       effectId: "effect-second",
       idempotencyKey: "key-second",
-      at: TIME,
-    }));
-    return { fixture, ledger };
+      at: secondLoaded.post_ref.server_time,
+    });
+    await materializeHistoricalProductionRecord({
+      ledger: context.ledger,
+      loaded: secondLoaded,
+      record: secondRecord,
+      evaluatedScopeReceipt: context.evaluatedScopeReceipt,
+    });
+    return {
+      fixture,
+      ledger: context.ledger,
+      firstEffectId: firstRecord.effect_id,
+      firstIdempotencyKey: firstRecord.idempotency_key,
+    };
   }
 
   await t.test("duplicate effect", async () => {
-    const { fixture, ledger } = await historyWithTwoIntents();
+    const { fixture, ledger, firstEffectId } = await historyWithTwoIntents();
     fixture.rewriteTipEnvelope((envelope) => {
-      envelope.effect_id = "effect-first";
+      envelope.effect_id = firstEffectId;
       envelope.workflow_provenance.operation_binding.record_identity.effect_id =
-        "effect-first";
+        firstEffectId;
       resealProvenance(envelope.workflow_provenance);
       resealEnvelope(envelope);
     });
@@ -572,11 +855,12 @@ test("reachable history rejects duplicate effect and idempotency identities", as
   });
 
   await t.test("duplicate idempotency", async () => {
-    const { fixture, ledger } = await historyWithTwoIntents();
+    const { fixture, ledger, firstIdempotencyKey } =
+      await historyWithTwoIntents();
     fixture.rewriteTipEnvelope((envelope) => {
-      envelope.idempotency_key = "key-first";
+      envelope.idempotency_key = firstIdempotencyKey;
       envelope.workflow_provenance.operation_binding.record_identity
-        .idempotency_key = "key-first";
+        .idempotency_key = firstIdempotencyKey;
       resealProvenance(envelope.workflow_provenance);
       resealEnvelope(envelope);
     });
@@ -589,45 +873,49 @@ test("reachable history rejects duplicate effect and idempotency identities", as
 
 test("lease expiry and release both prevent later effects without refund", async () => {
   const fixture = githubGitFixture();
-  const ledger = makeLedger(fixture);
-  await ledger.bootstrapCapability();
-  const lease = (await acquireDefaultDiscovery(ledger)).lease_receipt;
-  fixture.advanceServerTime(700);
+  const context = await createProtectedInitialRunnerContext(fixture);
+  const plan = schedulerObservationRecord({
+    predecessor: context.lease.acquire_commit_sha,
+    lease: context.lease,
+    priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+    initialAuthority: context.initialAuthority,
+  }).payload.action;
+  fixture.advanceServerTime(1_000);
 
   const postsBeforeExpiry = fixture.writeCalls;
   await assert.rejects(
-    ledger.appendRecord(effectRecord({
-      predecessor: lease.acquire_commit_sha,
-      lease,
-      effectId: "expired-effect",
-      idempotencyKey: "expired-key",
-      at: TIME,
-    })),
-    (error) => error.code === "lease-required" || error.code === "lease-expired",
+    context.ledger.appendInitialSchedulerObservation({
+      initial_runner_state_authority: context.initialAuthority,
+      scheduler_evaluation: plan.scheduler_evaluation,
+      status_plan: plan.status_plan,
+    }),
+    (error) => new Set([
+      "lease-required", "lease-expired", "lease-write-window",
+      "initial-runner-authority-stale",
+    ]).has(error.code),
   );
   assert.equal(fixture.writeCalls, postsBeforeExpiry,
     "expired lease rejection must occur before Git object writes");
 
   const fixture2 = githubGitFixture();
-  const ledger2 = makeLedger(fixture2);
-  await ledger2.bootstrapCapability();
-  const lease2 = (await acquireDefaultDiscovery(ledger2)).lease_receipt;
-  const release = await ledger2.releaseLease({
-    predecessor_commit_sha: lease2.acquire_commit_sha,
-    lease_receipt: lease2,
-    released_at: TIME,
-    control_comment_binding: null,
-  });
+  const context2 = await createProtectedInitialRunnerContext(fixture2);
+  const plan2 = schedulerObservationRecord({
+    predecessor: context2.lease.acquire_commit_sha,
+    lease: context2.lease,
+    priorAuthorityDigest: context2.initialAuthority.prior_authority_digest,
+    initialAuthority: context2.initialAuthority,
+  }).payload.action;
+  await releaseFixtureDiscoveryLease(context2.ledger, context2.discovery);
   const writesBeforeReleased = fixture2.writeCalls;
   await assert.rejects(
-    ledger2.appendRecord(effectRecord({
-      predecessor: release.commit_sha,
-      lease: lease2,
-      effectId: "released-effect",
-      idempotencyKey: "released-key",
-      at: TIME,
-    })),
-    (error) => error.code === "lease-required",
+    context2.ledger.appendInitialSchedulerObservation({
+      initial_runner_state_authority: context2.initialAuthority,
+      scheduler_evaluation: plan2.scheduler_evaluation,
+      status_plan: plan2.status_plan,
+    }),
+    (error) => new Set([
+      "lease-required", "initial-runner-authority-stale", "stale-predecessor",
+    ]).has(error.code),
   );
   assert.equal(fixture2.writeCalls, writesBeforeReleased,
     "released lease rejection must occur before Git object writes");
@@ -834,11 +1122,11 @@ test("capability attestation exact-binds its canary authority and race",
     });
   });
 
-test("control comment creation is intent-null then exact response-bound", async () => {
+test("historical control comment creation is intent-null then exact response-bound", async () => {
   const fixture = githubGitFixture();
-  const ledger = makeLedger(fixture);
-  await ledger.bootstrapCapability();
-  const lease = (await acquireDefaultDiscovery(ledger)).lease_receipt;
+  const context = await createProtectedInitialRunnerContext(fixture);
+  const { ledger, lease, evaluatedScopeReceipt } = context;
+  const source = await ledger.load();
   const intent = createV2GitLedgerRecord({
     record_type: "effect-intent",
     predecessor_commit_sha: lease.acquire_commit_sha,
@@ -849,7 +1137,7 @@ test("control comment creation is intent-null then exact response-bound", async 
     kind: "control-comment-create",
     effect_id: "control-comment-1",
     idempotency_key: "control-comment-create-1",
-    server_observed_at: TIME,
+    server_observed_at: source.post_ref.server_time,
     payload: effectPayload({
       phase: "intent",
       kind: "control-comment-create",
@@ -863,10 +1151,17 @@ test("control comment creation is intent-null then exact response-bound", async 
     control_comment_binding: null,
     lease: leaseBinding(lease),
   });
-  const intentReceipt = await ledger.appendRecord(intent);
+  await materializeHistoricalProductionRecord({
+    ledger,
+    loaded: source,
+    record: intent,
+    evaluatedScopeReceipt,
+  });
+  const intentCommitSha = fixture.refTarget;
+  const afterIntent = await ledger.load();
   const responseRecord = createV2GitLedgerRecord({
     record_type: "effect-response",
-    predecessor_commit_sha: intentReceipt.commit_sha,
+    predecessor_commit_sha: intentCommitSha,
     pull_request: PR,
     head_ref_oid: HEAD,
     base_ref_oid: BASE,
@@ -874,12 +1169,12 @@ test("control comment creation is intent-null then exact response-bound", async 
     kind: "control-comment-create",
     effect_id: "control-comment-1",
     idempotency_key: "control-comment-create-1",
-    server_observed_at: TIME,
+    server_observed_at: afterIntent.post_ref.server_time,
     payload: effectPayload({
       phase: "response",
       kind: "control-comment-create",
-      predecessor: intentReceipt.commit_sha,
-      intentCommitSha: intentReceipt.commit_sha,
+      predecessor: intentCommitSha,
+      intentCommitSha,
       action: {
         method: "POST",
         body_digest: `sha256:${"4".repeat(64)}`,
@@ -899,7 +1194,12 @@ test("control comment creation is intent-null then exact response-bound", async 
     control_comment_binding: CONTROL,
     lease: leaseBinding(lease),
   });
-  await ledger.appendRecord(responseRecord);
+  await materializeHistoricalProductionRecord({
+    ledger,
+    loaded: afterIntent,
+    record: responseRecord,
+    evaluatedScopeReceipt,
+  });
   const loaded = await ledger.load();
   assert.deepEqual(loaded.control_comment_binding, CONTROL);
   assert.deepEqual(loaded.projection.control_comment_binding, CONTROL);
@@ -920,66 +1220,73 @@ test("control comment creation is intent-null then exact response-bound", async 
       ...structuredClone(intentPlan.payload),
       predecessor_commit_sha: loaded.tip_commit_sha,
     },
+    server_observed_at: loaded.post_ref.server_time,
   });
-  const writes = fixture.writeCalls;
+  const before = fixture.snapshotHistoricalState();
   await assert.rejects(
-    ledger.appendRecord(createAgain),
-    (error) => error.code === "control-comment-exists",
+    materializeHistoricalProductionRecord({
+      ledger,
+      loaded,
+      record: createAgain,
+      evaluatedScopeReceipt,
+    }),
+    (error) => error.code === "control-comment-binding",
   );
-  assert.equal(fixture.writeCalls, writes);
+  assert.equal(fixture.refTarget, before.ref_target);
+  assert.deepEqual(new Set(fixture.blobs.keys()), before.blob_keys);
+  assert.deepEqual(new Set(fixture.trees.keys()), before.tree_keys);
+  assert.deepEqual(new Set(fixture.commits.keys()), before.commit_keys);
 });
 
-test("GitHub ref Date, not caller clock, controls record and lease time", async () => {
+test("GitHub ref Date, not caller clock, controls high-level lease time", async () => {
   const fixture = githubGitFixture();
   const ledger = makeLedger(fixture);
   await ledger.bootstrapCapability();
-  const lease = (await acquireDefaultDiscovery(ledger)).lease_receipt;
+  const initial = await ledger.load();
+  const lease = await ledger.acquireLease(leaseInput(initial.tip_commit_sha));
   assert.equal(Date.parse(lease.acquired_at) > Date.parse(TIME), true);
   assert.equal(
     Date.parse(lease.expires_at) - Date.parse(lease.acquired_at),
     600_000,
   );
-  const receipt = await ledger.appendRecord(effectRecord({
-    predecessor: lease.acquire_commit_sha,
-    lease,
-    effectId: "backdated-effect",
-    idempotencyKey: "backdated-key",
-    at: TIME,
-  }));
   const loaded = await ledger.load();
-  const actual = loaded.records.find((entry) => entry.commit_sha === receipt.commit_sha);
+  const actual = loaded.records.find((entry) =>
+    entry.commit_sha === lease.acquire_commit_sha);
   assert.equal(Date.parse(actual.envelope.server_observed_at) > Date.parse(TIME), true);
 
-  const future = effectRecord({
-    predecessor: loaded.tip_commit_sha,
-    lease,
-    effectId: "future-effect",
-    idempotencyKey: "future-key",
-    at: "2099-01-01T00:00:00.000Z",
-  });
-  const writes = fixture.writeCalls;
+  const futureFixture = githubGitFixture();
+  const futureLedger = makeLedger(futureFixture);
+  await futureLedger.bootstrapCapability();
+  const futureLoaded = await futureLedger.load();
+  const future = {
+    ...leaseInput(futureLoaded.tip_commit_sha),
+    observed_at: "2099-01-01T00:00:00.000Z",
+  };
+  const writes = futureFixture.writeCalls;
   await assert.rejects(
-    ledger.appendRecord(future),
+    futureLedger.acquireLease(future),
     (error) => error.code === "caller-clock-ahead",
   );
-  assert.equal(fixture.writeCalls, writes);
+  assert.equal(futureFixture.writeCalls, writes);
 });
 
 test("final ref Date fence rejects a lease too short for the bounded append", async () => {
   const fixture = githubGitFixture();
-  const ledger = makeLedger(fixture);
-  await ledger.bootstrapCapability();
-  const lease = (await acquireDefaultDiscovery(ledger)).lease_receipt;
-  fixture.advanceServerTime(480);
+  const context = await createProtectedInitialRunnerContext(fixture);
+  const plan = schedulerObservationRecord({
+    predecessor: context.lease.acquire_commit_sha,
+    lease: context.lease,
+    priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+    initialAuthority: context.initialAuthority,
+  }).payload.action;
+  fixture.advanceServerTime(780);
   const writes = fixture.writeCalls;
   await assert.rejects(
-    ledger.appendRecord(effectRecord({
-      predecessor: lease.acquire_commit_sha,
-      lease,
-      effectId: "short-write-window",
-      idempotencyKey: "short-write-window-key",
-      at: TIME,
-    })),
+    context.ledger.appendInitialSchedulerObservation({
+      initial_runner_state_authority: context.initialAuthority,
+      scheduler_evaluation: plan.scheduler_evaluation,
+      status_plan: plan.status_plan,
+    }),
     (error) => error.code === "lease-write-window",
   );
   assert.equal(fixture.writeCalls, writes,
@@ -1042,17 +1349,11 @@ test("workflow provenance failures reject before Git object writes", async (t) =
         return result;
       });
       await failing.bootstrapCapability();
-      const lease = (await acquireDefaultDiscovery(failing)).lease_receipt;
+      const discovery = await acquireDefaultDiscovery(failing);
       const writes = fixture.writeCalls;
       failureEnabled = true;
       await assert.rejects(
-        failing.appendRecord(effectRecord({
-          predecessor: lease.acquire_commit_sha,
-          lease,
-          effectId: `invalid-${name}`,
-          idempotencyKey: `invalid-key-${name}`,
-          at: TIME,
-        })),
+        releaseFixtureDiscoveryLease(failing, discovery),
         pattern,
       );
       assert.equal(fixture.writeCalls, writes);
@@ -2542,11 +2843,11 @@ test("automatic review request binding is exact, controller-owned, and resumable
   });
 });
 
-test("reservation status binding is required before the retry-zero request attempt", async () => {
+test("historical reservation status binding is required before the retry-zero request attempt", async () => {
   const fixture = githubGitFixture();
   const context = await createProtectedInitialRunnerContext(fixture);
   const {
-    ledger, lease, initialAuthority, evaluatedScopeReceipt,
+    ledger, lease, initialAuthority,
   } = context;
   const generation = automaticGeneration(1);
   const beforeObservation = await ledger.load();
@@ -2581,7 +2882,10 @@ test("reservation status binding is required before the retry-zero request attem
     observation: observationRecord,
     headLedger: statusControl.scoped_authority.runner_state.head_ledger,
   });
-  const reservation = await ledger.appendRecord(reservationRecord);
+  const reservation = await appendHistoricalEffectRecord(
+    ledger,
+    reservationRecord,
+  );
   const postAction = observationRecord.payload.action.scheduler_plan.actions
     .find((action) => action.kind === "post_review_request");
 
@@ -2596,7 +2900,7 @@ test("reservation status binding is required before the retry-zero request attem
   });
   let writes = fixture.writeCalls;
   await assert.rejects(
-    ledger.appendRecord(beforeStatusAttempt),
+    appendHistoricalEffectRecord(ledger, beforeStatusAttempt),
     (error) => error.code === "reservation-status-binding-required",
   );
   assert.equal(fixture.writeCalls, writes, "no Git object is written before status intent");
@@ -2608,7 +2912,10 @@ test("reservation status binding is required before the retry-zero request attem
     reservationRecordOid: reservation.commit_sha,
     reservationDigest: reservationRecord.payload.action.reservation_digest,
   });
-  const statusIntent = await ledger.appendRecord(statusIntentRecord);
+  const statusIntent = await appendHistoricalEffectRecord(
+    ledger,
+    statusIntentRecord,
+  );
   const afterAmbiguousStatusAttempt = effectAttemptRecord({
     predecessor: statusIntent.commit_sha,
     lease,
@@ -2620,7 +2927,7 @@ test("reservation status binding is required before the retry-zero request attem
   });
   writes = fixture.writeCalls;
   await assert.rejects(
-    ledger.appendRecord(afterAmbiguousStatusAttempt),
+    appendHistoricalEffectRecord(ledger, afterAmbiguousStatusAttempt),
     (error) => error.code === "reservation-status-binding-required",
   );
   assert.equal(fixture.writeCalls, writes, "ambiguous status never permits request POST");
@@ -5038,11 +5345,11 @@ test("established runner authority preserves history and binds each current run"
   assert.equal(fixture.writeCalls, writesAfterStaleFence);
 });
 
-test("scheduler observation run identity must equal its protected lease owner", async () => {
+test("scheduler observation run identity must equal its protected run authority", async () => {
   const fixture = githubGitFixture();
   const context = await createProtectedInitialRunnerContext(fixture);
   const {
-    ledger, lease, initialAuthority, evaluatedScopeReceipt,
+    ledger, lease, initialAuthority,
   } = context;
   const loaded = await ledger.load();
   const valid = schedulerObservationRecord({
@@ -5053,29 +5360,19 @@ test("scheduler observation run identity must equal its protected lease owner", 
   });
   const action = structuredClone(valid.payload.action);
   action.scheduler_evaluation.run_id = "9002";
-  const forged = createV2GitLedgerRecord({
-    ...recordPlan(valid),
-    effect_id: "scheduler-observation-wrong-run",
-    idempotency_key: "scheduler-observation-wrong-run-key",
-    payload: effectPayload({
-      phase: "intent",
-      kind: "scheduler-observation",
-      predecessor: lease.acquire_commit_sha,
-      action,
-    }),
-  });
   const writes = fixture.writeCalls;
   await assert.rejects(
-    ledger.appendRecord(forged, {
-      evaluated_scope_receipt: evaluatedScopeReceipt,
+    ledger.appendInitialSchedulerObservation({
       initial_runner_state_authority: initialAuthority,
+      scheduler_evaluation: action.scheduler_evaluation,
+      status_plan: action.status_plan,
     }),
-    (error) => error.code === "scheduler-run-identity-mismatch",
+    (error) => error.code === "initial-scheduler-evaluation-mismatch",
   );
   assert.equal(fixture.writeCalls, writes);
 });
 
-test("authority projection preserves ordered full records and request intent binding", async () => {
+test("historical authority projection preserves ordered full records and request intent binding", async () => {
   const fixture = githubGitFixture();
   const context = await createProtectedInitialRunnerContext(fixture);
   const { ledger, lease } = context;
@@ -5093,7 +5390,7 @@ test("authority projection preserves ordered full records and request intent bin
     attemptRecordOid: prefix.attemptReceipt.commit_sha,
     schedulerActionKey: prefix.schedulerActionKey,
   });
-  const intent = await ledger.appendRecord(intentRecord);
+  const intent = await appendHistoricalEffectRecord(ledger, intentRecord);
   const reviewResponseReceipt =
     await automaticReviewRequestBindingReceipt({
       action: intentRecord.payload.action,
@@ -5115,7 +5412,7 @@ test("authority projection preserves ordered full records and request intent bin
       receipt: reviewResponseReceipt,
     }),
   });
-  const response = await ledger.appendRecord(responseRecord);
+  const response = await appendHistoricalEffectRecord(ledger, responseRecord);
   const loaded = await ledger.load();
   const authority = deriveV2GitLedgerAuthority(loaded.records, {
     pull_request: PR,
@@ -5207,7 +5504,7 @@ test("closure-bound control-plane receipt derives an empty effect authority", as
   assert.match(receipt.receipt_digest, /^sha256:/u);
 });
 
-test("artifact binding response requires one opaque aggregate admission", async () => {
+test("public raw artifact binding records require the protected high-level seam", async () => {
   const setup = await createAutomaticRecoveryTransitionContext({
     bindArtifact: false,
   });
@@ -5234,8 +5531,7 @@ test("artifact binding response requires one opaque aggregate admission", async 
     setup.ledger.appendRecord(readyRecord, {
       evaluated_scope_receipt: setup.context.evaluatedScopeReceipt,
     }),
-    (error) => error.code ===
-      "UNTRUSTED_AUTOMATIC_ARTIFACT_BINDING_APPEND_ADMISSION",
+    (error) => error.code === "UNTRUSTED_RAW_EFFECT_APPEND",
   );
   assert.equal(setup.fixture.writeCalls, writesBeforeReady);
   assert.equal(setup.fixture.refTarget, tipBeforeReady);
@@ -5303,8 +5599,7 @@ test("artifact binding response requires one opaque aggregate admission", async 
     setup.ledger.appendRecord(forgedResponse, {
       evaluated_scope_receipt: setup.context.evaluatedScopeReceipt,
     }),
-    (error) => error.code ===
-      "UNTRUSTED_AUTOMATIC_ARTIFACT_BINDING_APPEND_ADMISSION",
+    (error) => error.code === "UNTRUSTED_RAW_EFFECT_APPEND",
   );
   assert.equal(setup.fixture.writeCalls, writesBefore);
   assert.equal(setup.fixture.refTarget, tipBefore);
@@ -5317,16 +5612,8 @@ test("protected candidate inventory is a sharded durable repository superset", a
     ref: "refs/heads/main",
     shaValue: BASE,
   });
-  const restricted = createV2GitHubGitLedgerBootstrap({
-    fetch: fixture.fetch,
-    token: SYNTHETIC_BEARER,
-    repository: REPOSITORY,
-    ledgerRef: V2_GIT_LEDGER_REF,
-    restBaseUrl: "https://api.github.test",
-    bootstrapCapabilityInput: bootstrapInputForCapability(capability),
-    verifyWorkflowProvenance: verifier,
-  });
-  const { ledger } = await restricted.bootstrapCapability();
+  const ledger = makeLedger(fixture, capability, verifier);
+  await ledger.bootstrapCapability();
   const transportFixture = candidateTransportFixture(512);
   const transport = createV2GitHubCandidateInventory({
     fetch: transportFixture.fetch,
@@ -5416,7 +5703,7 @@ test("protected candidate inventory is a sharded durable repository superset", a
   );
 });
 
-test("generic candidate inventory APIs reject compact records before writes",
+test("generic candidate inventory APIs reject raw legacy and compact records before writes",
   async () => {
     const fixture = githubGitFixture();
     const capability = scheduleCapabilityReceipt();
@@ -5459,7 +5746,7 @@ test("generic candidate inventory APIs reject compact records before writes",
     };
     const tipBefore = fixture.refTarget;
     const isTypedRejection = (error) =>
-      error.code === "UNTRUSTED_COMPACT_CANDIDATE_INVENTORY_APPEND";
+      error.code === "UNTRUSTED_CANDIDATE_INVENTORY_APPEND";
     const assertNoWrites = () => {
       assert.equal(fixture.writeCalls, writesBefore);
       assert.deepEqual({
@@ -5481,6 +5768,24 @@ test("generic candidate inventory APIs reject compact records before writes",
         trigger_identity: triggerIdentity,
         repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
       }),
+      isTypedRejection,
+    );
+    assertNoWrites();
+
+    const legacyPayload = candidateInventoryPayload({
+      phase: "cycle-start",
+      initial: cycle.initial_inventory,
+      priorAuthorityDigest:
+        loaded.authority_projection.candidate_inventory.authority_digest,
+    });
+    const legacyRecord = createV2GitLedgerCandidateInventoryRecord({
+      predecessor_commit_sha: loaded.tip_commit_sha,
+      owner: legacyPayload.owner,
+      server_observed_at: loaded.post_ref.server_time,
+      payload: legacyPayload,
+    });
+    await assert.rejects(
+      ledger.productionApiForTest().appendRecord(legacyRecord),
       isTypedRejection,
     );
     assertNoWrites();
@@ -6130,6 +6435,3935 @@ test("atomic refresh reconciliation privately preserves a dirty persist decision
     }, capObjectsBefore);
   });
 
+function currentOpenDispatchMeasurementPlan(productionAuthority, {
+  sourceCandidateIndex = 0,
+  batchIndex = 0,
+  batchCount = 1,
+} = {}) {
+  assert.ok(
+    sourceCandidateIndex >= 0 &&
+      sourceCandidateIndex < productionAuthority.candidate_count,
+  );
+  const sourceGenerationRecordOid = "1".repeat(40);
+  const summary = productionAuthority.candidates[sourceCandidateIndex];
+  const lifecycleGenerationId =
+    `candidate-lifecycle:${digestCanonical(
+      "codex-review-gate-v2-current-open-lifecycle-generation",
+      {
+        repository: candidateRepository(),
+        identity_digest: summary.identity_digest,
+      },
+    ).slice("sha256:".length)}`;
+  const candidateWithoutDigest = {
+    schema: "codex-review-gate-git-ledger-candidate-dispatch-selection-v2",
+    schema_version: 2,
+    source_generation_record_oid: sourceGenerationRecordOid,
+    identity: structuredClone(summary.identity),
+    identity_digest: summary.identity_digest,
+    lifecycle_seed: structuredClone(summary.lifecycle_seed),
+    lifecycle_seed_digest: summary.lifecycle_seed_digest,
+    lifecycle_generation_id: lifecycleGenerationId,
+  };
+  const candidate = {
+    ...candidateWithoutDigest,
+    selection_digest: digestCanonical(
+      "codex-review-gate-v2-current-open-dispatch-selection",
+      {
+        source_generation_record_oid: sourceGenerationRecordOid,
+        identity_digest: summary.identity_digest,
+        lifecycle_seed_digest: summary.lifecycle_seed_digest,
+        lifecycle_generation_id: lifecycleGenerationId,
+      },
+    ),
+  };
+  const candidateSource = {
+    schema: "codex-review-gate-git-ledger-candidate-dispatch-source-v2",
+    schema_version: 2,
+    source_profile: "stable-graphql-current-open-v4",
+    source_generation_id: `candidate-source:${"2".repeat(64)}`,
+    source_generation_record_oid: sourceGenerationRecordOid,
+    source_generation_digest: rawDigest("binding-size-source-generation"),
+    production_candidate_authority_digest: productionAuthority.authority_digest,
+    candidate_set_digest: productionAuthority.candidate_set_digest,
+    source_current_open_semantic_digest:
+      productionAuthority.source_current_open_semantic_digest,
+    lifecycle_candidate_set_digest:
+      rawDigest("binding-size-lifecycle-candidate-set"),
+  };
+  const withoutDigest = {
+    schema: "codex-review-gate-git-ledger-candidate-dispatch-plan-v2",
+    schema_version: 2,
+    repository: structuredClone(REPOSITORY),
+    generation_id: `candidate-dispatch:${"3".repeat(64)}`,
+    cycle_id: `candidate-cycle:${"4".repeat(64)}`,
+    candidate_source: candidateSource,
+    candidate_inventory_authority_digest:
+      rawDigest("binding-size-candidate-authority"),
+    candidate_dispatch_authority_digest:
+      rawDigest("binding-size-dispatch-authority"),
+    reservation_record_oid: "5".repeat(40),
+    reservation_digest: rawDigest("binding-size-reservation"),
+    inventory_digest: rawDigest("binding-size-inventory"),
+    batch_index: batchIndex,
+    batch_count: batchCount,
+    dispatch_digest: rawDigest("binding-size-dispatch"),
+    items: [{ candidate_index: 0, candidate }],
+    remaining_count: 1,
+    dispatch_commit_budget_required: 1,
+    candidate_execution_commit_budget_required: 1,
+    total_commit_budget_required: 2,
+    remaining_ledger_commit_capacity_after_dispatch: 4094,
+  };
+  return validateV2GitLedgerCandidateDispatchPlan({
+    ...withoutDigest,
+    plan_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-dispatch-plan",
+      withoutDigest,
+    ),
+  });
+}
+
+function currentOpenDispatchMeasurementBinding(plan) {
+  const item = plan.items[0];
+  const withoutDigest = {
+    schema: "codex-review-gate-git-ledger-candidate-dispatch-binding-v2",
+    schema_version: 2,
+    repository: structuredClone(plan.repository),
+    generation_id: plan.generation_id,
+    cycle_id: plan.cycle_id,
+    candidate_source: structuredClone(plan.candidate_source),
+    candidate_inventory_authority_digest:
+      plan.candidate_inventory_authority_digest,
+    candidate_dispatch_authority_digest:
+      plan.candidate_dispatch_authority_digest,
+    inventory_digest: plan.inventory_digest,
+    reservation_record_oid: plan.reservation_record_oid,
+    reservation_digest: plan.reservation_digest,
+    dispatch_digest: plan.dispatch_digest,
+    batch_index: plan.batch_index,
+    batch_count: plan.batch_count,
+    candidate_index: item.candidate_index,
+    candidate: structuredClone(item.candidate),
+  };
+  return {
+    ...withoutDigest,
+    binding_digest: digestCanonical(
+      "codex-review-gate-v2-current-open-candidate-dispatch-binding",
+      withoutDigest,
+    ),
+  };
+}
+
+test("current-open v3 rejects one oversized exact binding before atomic reserve",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const currentOpen = currentOpenSuppressionAdapterFixture({
+      initialNumbers: [PR.number],
+    });
+    currentOpen.setRefNames(PR.number, {
+      head: `feature/${"h".repeat(247)}`,
+      base: `release/${"b".repeat(247)}`,
+    });
+    currentOpen.setPullRequestNodeId(PR.number, "P".repeat(256));
+    currentOpen.setHeadRepository(PR.number, {
+      id: "R".repeat(256),
+      databaseId: Number.MAX_SAFE_INTEGER,
+      nameWithOwner: `${"o".repeat(100)}/${"r".repeat(100)}`,
+    });
+    let pair = null;
+    currentOpen.setAfterProjection((value) => {
+      pair = value;
+      currentOpen.setAfterProjection(null);
+    });
+    let legacyFinishCalls = 0;
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-binding-size-configuration-v1",
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        legacyFinishCalls += 1;
+        throw new Error("oversized current-open binding used legacy REST");
+      },
+    });
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+    });
+    const ledger = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    });
+    await ledger.bootstrapCapability();
+    const input = {
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    };
+    const before = {
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+      patches: fixture.calls.filter(({ method }) => method === "PATCH").length,
+      object_posts: fixture.calls.filter(({ method, path }) =>
+        method === "POST" && new Set([
+          "/git/blobs", "/git/trees", "/git/commits",
+        ]).has(path)).length,
+    };
+
+    await assert.rejects(
+      ledger.reconcileCandidateInventoryRefreshAtomically(input),
+      (error) => error.code === "candidate-dispatch-binding-size",
+    );
+
+    assert.notEqual(pair, null);
+    const measurementPlan = currentOpenDispatchMeasurementPlan(
+      pair.production_candidate_authority,
+    );
+    assert.ok(Buffer.byteLength(canonicalJson(measurementPlan), "utf8") <
+      MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_PLAN_BYTES);
+    assert.ok(Buffer.byteLength(canonicalJson(
+      currentOpenDispatchMeasurementBinding(measurementPlan),
+    ), "utf8") > MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_BINDING_BYTES);
+    assert.throws(
+      () => projectV2GitLedgerCandidateDispatchBinding(measurementPlan, 0),
+      (error) => error.code === "candidate-dispatch-binding-size",
+    );
+    assert.equal(currentOpen.calls.length, 4);
+    assert.equal(legacyFinishCalls, 0);
+    assert.deepEqual({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+      patches: fixture.calls.filter(({ method }) => method === "PATCH").length,
+      object_posts: fixture.calls.filter(({ method, path }) =>
+        method === "POST" && new Set([
+          "/git/blobs", "/git/trees", "/git/commits",
+        ]).has(path)).length,
+    }, before);
+    const loaded = await ledger.load();
+    assert.equal(
+      loaded.authority_projection.candidate_inventory.completed_generation ??
+        null,
+      null,
+    );
+    assert.equal(
+      loaded.authority_projection.candidate_dispatch.active_reservation,
+      null,
+    );
+    assert.equal(
+      consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        pair.production_candidate_authority,
+        pair.projection,
+      ),
+      pair.production_candidate_authority,
+    );
+    assert.throws(
+      () => consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        pair.production_candidate_authority,
+        pair.projection,
+      ),
+      (error) =>
+        error.code === "CONSUMED_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
+    );
+  });
+
+test("C65 golden loader keeps one opened object across path replacement",
+  async () => {
+    const raceDirectory = await mkdtemp(join(
+      tmpdir(),
+      "codex-review-gate-c65-fixture-race-",
+    ));
+    try {
+      const racePath = join(raceDirectory, "fixture.json.gz");
+      const displacedPath = join(raceDirectory, "opened.json.gz");
+      await copyFile(C65_BATCH0_GIT_FIXTURE_URL, racePath);
+      const asset = await loadC65Batch0GitFixtureState({
+        fixtureUrl: racePath,
+        async afterFileIdentityCheck() {
+          await rename(racePath, displacedPath);
+          await writeFile(
+            racePath,
+            Buffer.alloc(C65_BATCH0_GIT_FIXTURE_MAX_GZIP_BYTES + 1),
+          );
+        },
+      });
+      assert.equal(asset.git.commits.length, 198);
+      assert.equal(asset.git.ref_target, C65_BATCH0_GIT_FIXTURE_REF);
+    } finally {
+      await rm(raceDirectory, { recursive: true, force: true });
+    }
+  });
+
+test("C65 golden loader rejects a writerless FIFO without blocking",
+  { timeout: 2_000 }, async () => {
+    const fifoDirectory = await mkdtemp(join(
+      tmpdir(),
+      "codex-review-gate-c65-fixture-fifo-",
+    ));
+    const fifoPath = join(fifoDirectory, "fixture.json.gz");
+    let completed;
+    try {
+      const created = spawnSync("/usr/bin/mkfifo", [fifoPath], {
+        encoding: "utf8",
+        timeout: 1_000,
+      });
+      assert.equal(created.status, 0, created.stderr);
+      const pending = loadC65Batch0GitFixtureState({
+        fixtureUrl: fifoPath,
+      });
+      completed = pending.then(
+        () => ({ status: "resolved", error: null }),
+        (error) => ({ status: "rejected", error }),
+      );
+      const outcome = await Promise.race([
+        completed,
+        delay(250).then(() => ({ status: "blocked", error: null })),
+      ]);
+      if (outcome.status === "blocked") {
+        await writeFile(fifoPath, Buffer.alloc(0));
+        await completed;
+      }
+      assert.equal(outcome.status, "rejected");
+      assert.match(outcome.error.message, /regular file/u);
+    } finally {
+      await rm(fifoDirectory, { recursive: true, force: true });
+    }
+  });
+
+test("C65 golden load reverifies every historical provenance exactly once",
+  async () => {
+    const asset = await loadC65Batch0GitFixtureState();
+    const fixture = githubGitFixture(asset.git);
+    const triggerIdentity = scheduleTriggerIdentity();
+    const historicalReverificationLog = [];
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+      historicalTokenAuthorities: asset.historical_token_authorities,
+      historicalReverificationLog,
+    });
+    const ledger = makeLedger(
+      fixture,
+      scheduleCapabilityReceipt(),
+      verifier,
+      await loadFixtureProviderPreflight(),
+    );
+    assert.equal((await ledger.load()).commit_count, 198);
+    assertC65HistoricalProvenanceReverification(
+      historicalReverificationLog,
+      asset.historical_token_authorities,
+    );
+  });
+
+test("C65 fresh provenance factories share one monotonic mint authority",
+  async () => {
+    const asset = await loadC65Batch0GitFixtureState();
+    const fixture = githubGitFixture(asset.git);
+    const stored = fixtureEnvelopeAt(fixture, fixture.refTarget)
+      .workflow_provenance;
+    const provenanceRequest = {
+      schema: V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
+      schema_version: 1,
+      ...structuredClone(stored.operation_binding),
+    };
+    const mintState = createFixtureProvenanceMintState(
+      asset.historical_token_authorities,
+    );
+    const createVerifier = (runId, fixedJti = null) => provenanceVerifier({
+      eventName: "schedule",
+      ref: "refs/heads/main",
+      shaValue: BASE,
+      runIdentity: { ...OWNER, run_id: runId },
+      fixedJti,
+      historicalTokenAuthorities: asset.historical_token_authorities,
+      fixtureProvenanceMintState: mintState,
+    });
+    const verifierOne = createVerifier("9401");
+    const verifierTwo = createVerifier("9402");
+    const request = (mode, compactJwt = null) => ({
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode,
+      provenance_request: provenanceRequest,
+      compact_jwt: compactJwt,
+      stored_receipt: mode === "mint-and-verify" ? null : stored,
+    });
+    const first = await verifierOne(request("mint-and-verify"));
+    const second = await verifierTwo(request("mint-and-verify"));
+    const firstPayload = JSON.parse(Buffer.from(
+      first.compact_jwt.split(".")[1],
+      "base64url",
+    ).toString("utf8"));
+    const secondPayload = JSON.parse(Buffer.from(
+      second.compact_jwt.split(".")[1],
+      "base64url",
+    ).toString("utf8"));
+    assert.deepEqual(
+      [firstPayload.ordinal, secondPayload.ordinal],
+      [719, 720],
+    );
+    assert.notEqual(firstPayload.jti, secondPayload.jti);
+    assert.notEqual(first.compact_jwt, second.compact_jwt);
+    assert.notEqual(
+      first.receipt.token_sha256,
+      second.receipt.token_sha256,
+    );
+    assert.equal(first.receipt.claims.run_id, "9401");
+    assert.equal(second.receipt.claims.run_id, "9402");
+    const replayedSecond = await verifierOne(
+      request("reverify", second.compact_jwt),
+    );
+    assert.equal(replayedSecond.receipt.claims.run_id, "9402");
+    assert.deepEqual(
+      mintState.minted_authorities.map(({ ordinal }) => ordinal),
+      [719, 720],
+    );
+    await assert.rejects(
+      createVerifier("9403", firstPayload.jti)(request("mint-and-verify")),
+      /duplicate fixture provenance jti/u,
+    );
+  });
+
+test("current-open v3 reconciliation publishes one fresh generation without legacy REST",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const currentOpen = currentOpenSuppressionAdapterFixture({
+      initialNumbers: [PR.number],
+    });
+    let legacyFinishCalls = 0;
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-test-configuration-v1",
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        legacyFinishCalls += 1;
+        throw new Error("fresh current-open generation used legacy REST");
+      },
+    });
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+    });
+    const ledger = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    });
+    await ledger.bootstrapCapability();
+    const workflowCommandHandle = await createScheduleWorkflowCommandHandle();
+    const input = {
+      workflow_command_handle: workflowCommandHandle,
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    };
+    const before = {
+      patches: fixture.calls.filter(({ method }) => method === "PATCH").length,
+      ref: fixture.refTarget,
+      commits: fixture.commits.size,
+    };
+
+    const reconciled = await ledger
+      .reconcileCandidateInventoryRefreshAtomically(input);
+
+    assert.equal(reconciled.schema_version, 2);
+    assert.equal(reconciled.state, "persisted");
+    assert.equal(reconciled.persistence_mode, "current-open-generation-v3");
+    assert.equal(reconciled.publication_result.state, "persisted");
+    assert.equal(
+      reconciled.publication_result.publication_outcome,
+      "published",
+    );
+    assert.equal(
+      reconciled.publication_result.published_record_commit_shas.length,
+      2,
+      "one generation and its first reservation must share one publication",
+    );
+    assert.equal(legacyFinishCalls, 0);
+    assert.equal(currentOpen.calls.length, 4);
+    assert.equal(
+      fixture.calls.filter(({ method }) => method === "PATCH").length -
+        before.patches,
+      1,
+    );
+    assert.equal(fixture.commits.size - before.commits, 2);
+    assert.notEqual(fixture.refTarget, before.ref);
+    assertNoCandidateRefreshPrivateAuthority(reconciled);
+
+    const restarted = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    });
+    const loaded = await restarted.load();
+    const generation = loaded.authority_projection.candidate_inventory
+      .completed_generation;
+    assert.equal(generation.source_profile, "stable-graphql-current-open-v4");
+    assert.equal(generation.candidate_count, 1);
+    assert.equal(generation.candidates[0].identity.number, PR.number);
+    const stableLifecycleId = (repository, identityDigest) =>
+      `candidate-lifecycle:${digestCanonical(
+        "codex-review-gate-v2-current-open-lifecycle-generation",
+        { repository, identity_digest: identityDigest },
+      ).slice("sha256:".length)}`;
+    const candidateRepository = {
+      owner: REPOSITORY.owner,
+      name: REPOSITORY.name,
+      id: REPOSITORY.id,
+      node_id: REPOSITORY.node_id,
+    };
+    assert.equal(
+      generation.candidates[0].lifecycle_generation_id,
+      stableLifecycleId(
+        candidateRepository,
+        generation.candidates[0].identity_digest,
+      ),
+    );
+    assert.notEqual(
+      stableLifecycleId(
+        { ...candidateRepository, name: "other-repo" },
+        generation.candidates[0].identity_digest,
+      ),
+      generation.candidates[0].lifecycle_generation_id,
+    );
+    assert.notEqual(
+      stableLifecycleId(candidateRepository, `sha256:${"f".repeat(64)}`),
+      generation.candidates[0].lifecycle_generation_id,
+    );
+    assert.equal(
+      loaded.authority_projection.candidate_dispatch.active_reservation
+        .reservation.candidates[0].identity.number,
+      PR.number,
+    );
+    const restartedDispatch = await restarted.loadOrReserveCandidateDispatch({
+      workflow_command_handle: workflowCommandHandle,
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    });
+    assert.equal(restartedDispatch.state, "dispatch");
+    const projectedBinding = projectV2GitLedgerCandidateDispatchBinding(
+      restartedDispatch.plan,
+      0,
+    );
+    const active = loaded.authority_projection.candidate_dispatch
+      .active_reservation;
+    assert.deepEqual(Object.keys(projectedBinding).sort(), [
+      "batch_count",
+      "batch_index",
+      "binding_digest",
+      "candidate",
+      "candidate_dispatch_authority_digest",
+      "candidate_index",
+      "candidate_inventory_authority_digest",
+      "candidate_source",
+      "cycle_id",
+      "dispatch_digest",
+      "generation_id",
+      "inventory_digest",
+      "repository",
+      "reservation_digest",
+      "reservation_record_oid",
+      "schema",
+      "schema_version",
+    ]);
+    assert.equal(projectedBinding.schema,
+      "codex-review-gate-git-ledger-candidate-dispatch-binding-v2");
+    assert.equal(projectedBinding.schema_version, 2);
+    assert.deepEqual(projectedBinding.repository, active.reservation.repository);
+    assert.equal(projectedBinding.generation_id,
+      active.reservation.generation_id);
+    assert.equal(projectedBinding.cycle_id, active.reservation.cycle_id);
+    assert.deepEqual(projectedBinding.candidate_source,
+      active.reservation.candidate_source);
+    assert.equal(projectedBinding.candidate_inventory_authority_digest,
+      active.reservation.candidate_inventory_authority_digest);
+    assert.equal(projectedBinding.candidate_dispatch_authority_digest,
+      loaded.authority_projection.candidate_dispatch.authority_digest);
+    assert.equal(projectedBinding.inventory_digest,
+      active.reservation.inventory_digest);
+    assert.equal(projectedBinding.reservation_record_oid,
+      active.reservation_record_oid);
+    assert.equal(projectedBinding.reservation_digest,
+      active.reservation.reservation_digest);
+    assert.equal(projectedBinding.dispatch_digest,
+      active.reservation.dispatch_digest);
+    assert.equal(projectedBinding.batch_index,
+      active.reservation.batch_index);
+    assert.equal(projectedBinding.batch_count,
+      active.reservation.batch_count);
+    assert.equal(projectedBinding.candidate_index, 0);
+    assert.deepEqual(projectedBinding.candidate,
+      active.reservation.candidates[0]);
+    assert.match(projectedBinding.binding_digest, /^sha256:/u);
+    const hybridDowngrade = {
+      generation_id: projectedBinding.generation_id,
+      cycle_id: projectedBinding.cycle_id,
+      inventory_digest: projectedBinding.inventory_digest,
+      batch_index: projectedBinding.batch_index,
+      batch_count: projectedBinding.batch_count,
+      dispatch_digest: projectedBinding.dispatch_digest,
+      candidate: structuredClone(projectedBinding.candidate),
+    };
+    assert.throws(
+      () => validateV2GitLedgerCandidateDispatchBinding(hybridDowngrade),
+      /source representation|downgrade/u,
+    );
+    const resealBinding = (value) => {
+      const { binding_digest: _digest, ...withoutDigest } = value;
+      return {
+        ...withoutDigest,
+        binding_digest: digestCanonical(
+          "codex-review-gate-v2-current-open-candidate-dispatch-binding",
+          withoutDigest,
+        ),
+      };
+    };
+    const resealSelection = (value) => ({
+      ...value,
+      selection_digest: digestCanonical(
+        "codex-review-gate-v2-current-open-dispatch-selection",
+        {
+          source_generation_record_oid:
+            value.source_generation_record_oid,
+          identity_digest: value.identity_digest,
+          lifecycle_seed_digest: value.lifecycle_seed_digest,
+          lifecycle_generation_id: value.lifecycle_generation_id,
+        },
+      ),
+    });
+    assert.deepEqual(
+      validateV2GitLedgerCandidateDispatchBinding(projectedBinding),
+      projectedBinding,
+    );
+    const identityTimestampAlias = structuredClone(projectedBinding);
+    identityTimestampAlias.candidate.identity.created_at =
+      identityTimestampAlias.candidate.identity.created_at.replace(
+        ".000Z",
+        "Z",
+      );
+    assert.notEqual(
+      identityTimestampAlias.candidate.identity.created_at,
+      projectedBinding.candidate.identity.created_at,
+    );
+    assert.throws(
+      () => validateV2GitLedgerCandidateDispatchBinding(
+        identityTimestampAlias,
+      ),
+      /identity\.created_at.*canonical millisecond UTC representation/u,
+    );
+    const lifecycleTamper = structuredClone(projectedBinding);
+    lifecycleTamper.candidate.lifecycle_generation_id =
+      `candidate-lifecycle:${"f".repeat(64)}`;
+    lifecycleTamper.candidate = resealSelection(lifecycleTamper.candidate);
+    assert.throws(
+      () => validateV2GitLedgerCandidateDispatchBinding(
+        resealBinding(lifecycleTamper),
+      ),
+      /changes its lifecycle identity/u,
+    );
+    const planTamper = structuredClone(restartedDispatch.plan);
+    planTamper.items[0].candidate.lifecycle_generation_id =
+      `candidate-lifecycle:${"f".repeat(64)}`;
+    planTamper.items[0].candidate = resealSelection(
+      planTamper.items[0].candidate,
+    );
+    delete planTamper.plan_digest;
+    planTamper.plan_digest = digestCanonical(
+      "codex-review-gate-v2-candidate-dispatch-plan",
+      planTamper,
+    );
+    assert.throws(
+      () => validateV2GitLedgerCandidateDispatchPlan(planTamper),
+      /changes its lifecycle identity/u,
+    );
+    const sourceTamper = structuredClone(projectedBinding);
+    sourceTamper.candidate_source.source_generation_record_oid =
+      "f".repeat(40);
+    assert.throws(
+      () => validateV2GitLedgerCandidateDispatchBinding(
+        resealBinding(sourceTamper),
+      ),
+      /changes its source generation/u,
+    );
+    const generationEntry = loaded.records.find((entry) =>
+      entry.envelope.record_type === "candidate-inventory-observation" &&
+      entry.envelope.payload.schema_version === 3);
+    assert.notEqual(generationEntry, undefined);
+    const generationIndex = loaded.records.indexOf(generationEntry);
+    const generationEvidence = durableCurrentOpenGenerationAttachmentValue(
+      fixture,
+      generationEntry.envelope.payload.attachment_manifest,
+    );
+    const hydratedGenerationPrefix = loaded.records
+      .slice(0, generationIndex + 1)
+      .map((entry, index) => index === generationIndex
+        ? {
+            ...structuredClone(entry),
+            candidate_inventory_attachment_evidence:
+              structuredClone(generationEvidence),
+          }
+        : structuredClone(entry));
+    assert.equal(
+      deriveV2GitLedgerCandidateInventoryAuthority(
+        hydratedGenerationPrefix,
+        REPOSITORY,
+      ).completed_generation.generation_id,
+      generationEntry.envelope.payload.generation_id,
+    );
+    const resealGenerationManifest = (manifestValue) => {
+      const manifest = structuredClone(manifestValue);
+      delete manifest.manifest_digest;
+      return {
+        ...manifest,
+        manifest_digest: digestCanonical(
+          "codex-review-gate-v2-current-open-generation-attachment-manifest",
+          manifest,
+        ),
+      };
+    };
+    const sourceGenerationTamper = structuredClone(hydratedGenerationPrefix);
+    const sourceGenerationEntry = sourceGenerationTamper[generationIndex];
+    const sourceGenerationPayload = structuredClone(
+      sourceGenerationEntry.envelope.payload,
+    );
+    sourceGenerationPayload.generation_id =
+      `candidate-source:${"f".repeat(64)}`;
+    sourceGenerationPayload.attachment_manifest = resealGenerationManifest({
+      ...sourceGenerationPayload.attachment_manifest,
+      generation_id: sourceGenerationPayload.generation_id,
+    });
+    resealFixtureCandidateInventoryEnvelopePayload(
+      sourceGenerationEntry.envelope,
+      sourceGenerationPayload,
+    );
+    assert.throws(
+      () => deriveV2GitLedgerCandidateInventoryAuthority(
+        sourceGenerationTamper,
+        REPOSITORY,
+      ),
+      (error) => error.code === "candidate-inventory-source-generation",
+    );
+
+    const lifecycleGenerationTamper = structuredClone(
+      hydratedGenerationPrefix,
+    );
+    const lifecycleGenerationEntry =
+      lifecycleGenerationTamper[generationIndex];
+    const lifecycleEvidence = structuredClone(
+      lifecycleGenerationEntry.candidate_inventory_attachment_evidence,
+    );
+    lifecycleEvidence.lifecycle_candidates[0].lifecycle_generation_id =
+      `candidate-lifecycle:${"f".repeat(64)}`;
+    lifecycleEvidence.lifecycle_candidate_set_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-lifecycle-candidate-set",
+      lifecycleEvidence.lifecycle_candidates.map((candidate) => ({
+        identity_digest: candidate.identity_digest,
+        lifecycle_seed_digest: candidate.lifecycle_seed_digest,
+        lifecycle_generation_id: candidate.lifecycle_generation_id,
+      })),
+    );
+    lifecycleEvidence.dispatch_batch_digests = [digestCanonical(
+      "codex-review-gate-v2-current-open-dispatch-batch-binding",
+      {
+        batch_index: 0,
+        candidate_offset: 0,
+        candidate_count: 1,
+        candidates: lifecycleEvidence.lifecycle_candidates.map(
+          (candidate) => ({
+            identity: structuredClone(candidate.identity),
+            identity_digest: candidate.identity_digest,
+            lifecycle_seed: structuredClone(candidate.lifecycle_seed),
+            lifecycle_seed_digest: candidate.lifecycle_seed_digest,
+            lifecycle_generation_id: candidate.lifecycle_generation_id,
+          }),
+        ),
+      },
+    )];
+    delete lifecycleEvidence.evidence_digest;
+    lifecycleEvidence.evidence_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-generation-evidence",
+      lifecycleEvidence,
+    );
+    lifecycleGenerationEntry.candidate_inventory_attachment_evidence =
+      lifecycleEvidence;
+    const lifecycleGenerationPayload = structuredClone(
+      lifecycleGenerationEntry.envelope.payload,
+    );
+    lifecycleGenerationPayload.lifecycle_candidate_set_digest =
+      lifecycleEvidence.lifecycle_candidate_set_digest;
+    lifecycleGenerationPayload.dispatch_batch_digests =
+      structuredClone(lifecycleEvidence.dispatch_batch_digests);
+    lifecycleGenerationPayload.attachment_manifest = resealGenerationManifest({
+      ...lifecycleGenerationPayload.attachment_manifest,
+      lifecycle_candidate_set_digest:
+        lifecycleEvidence.lifecycle_candidate_set_digest,
+      dispatch_batch_digests:
+        structuredClone(lifecycleEvidence.dispatch_batch_digests),
+      evidence_digest: lifecycleEvidence.evidence_digest,
+    });
+    resealFixtureCandidateInventoryEnvelopePayload(
+      lifecycleGenerationEntry.envelope,
+      lifecycleGenerationPayload,
+    );
+    assert.throws(
+      () => deriveV2GitLedgerCandidateInventoryAuthority(
+        lifecycleGenerationTamper,
+        REPOSITORY,
+      ),
+      (error) => error.code === "candidate-inventory-lifecycle-generation",
+    );
+    const rawGenerationRecord = createV2GitLedgerCandidateInventoryRecord({
+      predecessor_commit_sha: loaded.tip_commit_sha,
+      owner: generationEntry.envelope.payload.owner,
+      server_observed_at: loaded.post_ref.server_time,
+      payload: generationEntry.envelope.payload,
+    });
+    const rawBefore = {
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    };
+    await assert.rejects(
+      restarted.productionApiForTest().appendRecord(rawGenerationRecord),
+      (error) => error.code === "UNTRUSTED_CANDIDATE_INVENTORY_APPEND",
+    );
+    assert.deepEqual({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    }, rawBefore);
+  });
+
+test("current-open v3 reconciliation suppresses only a durable repeated empty generation",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt({
+      allowedEventNames: ["pull_request_target", "schedule"],
+    });
+    const triggerIdentity = scheduleTriggerIdentity();
+    const currentOpen = currentOpenSuppressionAdapterFixture();
+    let legacyFinishCalls = 0;
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-empty-suppression-configuration-v1",
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        legacyFinishCalls += 1;
+        throw new Error("current-open empty suppression used legacy REST");
+      },
+    });
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+      deriveTriggerFromRequest: true,
+    });
+    const ledger = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    });
+    await ledger.bootstrapCapability();
+    const historicalDiscovery = await acquireDefaultDiscovery(ledger);
+    const historicalIntent = effectRecord({
+      predecessor: historicalDiscovery.lease_receipt.acquire_commit_sha,
+      lease: historicalDiscovery.lease_receipt,
+      effectId: "historical-empty-suppression-effect",
+      idempotencyKey: "historical-empty-suppression-effect-key",
+      at: TIME,
+    });
+    const historicalIntentAppend = await appendHistoricalEffectRecord(
+      ledger,
+      historicalIntent,
+      historicalDiscovery.effect_evaluated_scope_receipt,
+    );
+    const historicalResponseTime =
+      historicalIntentAppend.ref_reread.server_time;
+    const historicalResponse = createV2GitLedgerEffectResponseRecord({
+      intent_record: historicalIntent,
+      intent_commit_sha: historicalIntentAppend.commit_sha,
+      server_observed_at: historicalResponseTime,
+      receipt: {
+        is_resolved: true,
+        response_server_time: historicalResponseTime,
+        run_id: OWNER.run_id,
+        raw_body_sha256: rawDigest(
+          "historical-empty-suppression-effect-response-v1",
+        ),
+      },
+    });
+    await appendHistoricalEffectRecord(
+      ledger,
+      historicalResponse,
+      historicalDiscovery.effect_evaluated_scope_receipt,
+    );
+    await releaseFixtureDiscoveryLease(ledger, historicalDiscovery);
+    const historical = await ledger.load();
+    assert.equal(historical.effect_intent_count, 1);
+    assert.equal(historical.effect_response_count, 1);
+    const input = () => ({
+      workflow_command_handle: createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    });
+    const firstInput = input();
+    firstInput.workflow_command_handle = await firstInput.workflow_command_handle;
+    const first = await ledger.reconcileCandidateInventoryRefreshAtomically(
+      firstInput,
+    );
+    assert.equal(first.state, "persisted");
+    assert.equal(first.publication_result.published_record_commit_shas.length, 2);
+    const before = {
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    };
+    const callsBefore = currentOpen.calls.length;
+    const secondInput = input();
+    secondInput.workflow_command_handle =
+      await secondInput.workflow_command_handle;
+
+    const second = await ledger.reconcileCandidateInventoryRefreshAtomically(
+      secondInput,
+    );
+
+    assert.equal(second.schema_version, 2);
+    assert.equal(second.state, "suppressed");
+    assert.equal(second.reason, "semantic-unchanged-not-due");
+    assert.equal(second.persistence_mode, null);
+    assert.equal(second.publication_result, null);
+    assert.equal(second.suppression_result.state, "suppressed");
+    assert.equal(
+      second.suppression_result.assurance,
+      "bounded-sampled-empty-at-observation-boundary",
+    );
+    assert.equal(second.suppression_result.github_atomic_snapshot, false);
+    assert.equal(second.suppression_result.github_ref_fence, null);
+    assert.equal(second.suppression_result.writes_performed, false);
+    assert.equal(currentOpen.calls.length - callsBefore, 4);
+    assert.equal(legacyFinishCalls, 0);
+    assert.deepEqual({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    }, before);
+  });
+
+test("current-open v3 reconciliation rejects untrusted live authority pairs before Git writes",
+  async (t) => {
+    const cases = [
+      {
+        name: "cloned pair",
+        code: "UNTRUSTED_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
+        collect: async (left) => {
+          const exact = await left.collectProductionCandidateAuthority();
+          return Object.freeze({
+            projection: exact.projection,
+            production_candidate_authority: structuredClone(
+              exact.production_candidate_authority,
+            ),
+          });
+        },
+      },
+      {
+        name: "cross-factory same-set pair",
+        code: "UNTRUSTED_CURRENT_OPEN_PRODUCTION_AUTHORITY_PAIR",
+        collect: async (left, right) => {
+          const leftPair = await left.collectProductionCandidateAuthority();
+          const rightPair = await right.collectProductionCandidateAuthority();
+          return Object.freeze({
+            projection: leftPair.projection,
+            production_candidate_authority:
+              rightPair.production_candidate_authority,
+          });
+        },
+      },
+      {
+        name: "stale same-factory pair",
+        code: "STALE_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
+        collect: async (left) => {
+          const stale = await left.collectProductionCandidateAuthority();
+          await left.collectProductionCandidateAuthority();
+          return stale;
+        },
+      },
+    ];
+    for (const testCase of cases) {
+      await t.test(testCase.name, async () => {
+        const fixture = githubGitFixture();
+        const capability = scheduleCapabilityReceipt();
+        const triggerIdentity = scheduleTriggerIdentity();
+        const left = currentOpenSuppressionAdapterFixture({
+          initialNumbers: [PR.number],
+        });
+        const right = currentOpenSuppressionAdapterFixture({
+          initialNumbers: [PR.number],
+        });
+        const refreshAdapter = Object.freeze({
+          schema:
+            "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+          schema_version: 2,
+          configuration_digest: rawDigest(
+            `candidate-current-open-v3-${testCase.name}-configuration-v1`,
+          ),
+          collectCurrentOpenCandidateAuthority: () =>
+            testCase.collect(left, right),
+          async finishLegacyCandidateInventoryAttempt() {
+            throw new Error("untrusted current-open pair used legacy REST");
+          },
+        });
+        const verifier = provenanceVerifier({
+          eventName: "schedule",
+          ref: triggerIdentity.ref,
+          shaValue: triggerIdentity.sha,
+        });
+        const ledger = makeLedger(fixture, capability, verifier, null, {
+          candidateInventoryRefreshAdapter: refreshAdapter,
+        });
+        await ledger.bootstrapCapability();
+        const input = {
+          workflow_command_handle:
+            await createScheduleWorkflowCommandHandle(),
+          trigger_identity: triggerIdentity,
+          repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+        };
+        const before = {
+          writes: fixture.writeCalls,
+          blobs: fixture.blobs.size,
+          trees: fixture.trees.size,
+          commits: fixture.commits.size,
+          ref: fixture.refTarget,
+        };
+        await assert.rejects(
+          ledger.reconcileCandidateInventoryRefreshAtomically(input),
+          (error) => error.code === testCase.code,
+        );
+        assert.deepEqual({
+          writes: fixture.writeCalls,
+          blobs: fixture.blobs.size,
+          trees: fixture.trees.size,
+          commits: fixture.commits.size,
+          ref: fixture.refTarget,
+        }, before);
+      });
+    }
+  });
+
+test("current-open v3 rejects observations older than durable authority",
+  async (t) => {
+    const refreshAdapter = (label, collect) => Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        `candidate-current-open-v3-observation-${label}-configuration-v1`,
+      ),
+      collectCurrentOpenCandidateAuthority: collect,
+      async finishLegacyCandidateInventoryAttempt() {
+        throw new Error("stale current-open observation used legacy REST");
+      },
+    });
+    const reconciliationInput = async (triggerIdentity) => ({
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    });
+    const snapshotWrites = (fixture) => ({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    });
+    const assertRejectedBeforeConsumption = async ({
+      ledger,
+      fixture,
+      triggerIdentity,
+      returnedPairs,
+    }) => {
+      const before = snapshotWrites(fixture);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const pairCountBefore = returnedPairs.length;
+        await assert.rejects(
+          ledger.reconcileCandidateInventoryRefreshAtomically(
+            await reconciliationInput(triggerIdentity),
+          ),
+          (error) => error.code === "candidate-inventory-time",
+        );
+        assert.equal(returnedPairs.length, pairCountBefore + 1);
+        const pair = returnedPairs.at(-1);
+        assert.equal(
+          consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+            pair.production_candidate_authority,
+            pair.projection,
+          ),
+          pair.production_candidate_authority,
+        );
+        assert.deepEqual(snapshotWrites(fixture), before);
+      }
+    };
+
+    await t.test("v3 predecessor", async () => {
+      const fixture = githubGitFixture();
+      const capability = scheduleCapabilityReceipt();
+      const triggerIdentity = scheduleTriggerIdentity();
+      const verifier = provenanceVerifier({
+        eventName: "schedule",
+        ref: triggerIdentity.ref,
+        shaValue: triggerIdentity.sha,
+      });
+      const staleCurrentOpen = currentOpenSuppressionAdapterFixture({
+        initialNumbers: [PR.number],
+      });
+      const stalePairs = [];
+      const laterCurrentOpen = currentOpenSuppressionAdapterFixture();
+      for (let scan = 0; scan < 3; scan += 1) {
+        await laterCurrentOpen.collectProductionCandidateAuthority();
+      }
+      laterCurrentOpen.setListedNumbers([]);
+      const publisher = makeLedger(fixture, capability, verifier, null, {
+        candidateInventoryRefreshAdapter: refreshAdapter(
+          "v3-predecessor-publisher",
+          laterCurrentOpen.collectProductionCandidateAuthority,
+        ),
+      });
+      await publisher.bootstrapCapability();
+      await publisher.reconcileCandidateInventoryRefreshAtomically(
+        await reconciliationInput(triggerIdentity),
+      );
+      const durable = await publisher.load();
+      assert.ok(Date.parse(
+        durable.authority_projection.candidate_inventory.completed_generation
+          .observed_at,
+      ) > Date.parse(TIME));
+      const staleLedger = makeLedger(fixture, capability, verifier, null, {
+        candidateInventoryRefreshAdapter: refreshAdapter(
+          "v3-predecessor-stale",
+          async () => {
+            const pair = await staleCurrentOpen
+              .collectProductionCandidateAuthority();
+            stalePairs.push(pair);
+            return pair;
+          },
+        ),
+      });
+      await assertRejectedBeforeConsumption({
+        ledger: staleLedger,
+        fixture,
+        triggerIdentity,
+        returnedPairs: stalePairs,
+      });
+    });
+
+    await t.test("legacy predecessor", async () => {
+      const fixture = githubGitFixture();
+      const capability = scheduleCapabilityReceipt();
+      const triggerIdentity = scheduleTriggerIdentity();
+      const verifier = provenanceVerifier({
+        eventName: "schedule",
+        ref: triggerIdentity.ref,
+        shaValue: triggerIdentity.sha,
+      });
+      const staleCurrentOpen = currentOpenSuppressionAdapterFixture({
+        initialNumbers: [PR.number],
+      });
+      const stalePairs = [];
+      const ledger = makeLedger(fixture, capability, verifier, null, {
+        candidateInventoryRefreshAdapter: refreshAdapter(
+          "legacy-predecessor-stale",
+          async () => {
+            const pair = await staleCurrentOpen
+              .collectProductionCandidateAuthority();
+            stalePairs.push(pair);
+            return pair;
+          },
+        ),
+      });
+      await ledger.bootstrapCapability();
+      const legacyTransport = candidateTransportFixture(0);
+      legacyTransport.advanceServerTime(10);
+      const completed = await appendCompletedCandidateInventory({
+        ledger,
+        transportFixture: legacyTransport,
+      });
+      assert.ok(Date.parse(
+        completed.authority_projection.candidate_inventory.completed_cycle
+          .cycle_receipt.observed_at,
+      ) > Date.parse(TIME));
+      await ledger.loadOrReserveCandidateDispatch(
+        await reconciliationInput(triggerIdentity),
+      );
+      await assertRejectedBeforeConsumption({
+        ledger,
+        fixture,
+        triggerIdentity,
+        returnedPairs: stalePairs,
+      });
+    });
+  });
+
+test("current-open v3 generation rejects projection and timestamp aliases",
+  async (t) => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const currentOpen = currentOpenSuppressionAdapterFixture({
+      initialNumbers: [PR.number],
+    });
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-generation-reseal-configuration-v1",
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        throw new Error("generation reseal used legacy REST");
+      },
+    });
+    const ledger = makeLedger(
+      fixture,
+      capability,
+      provenanceVerifier({
+        eventName: "schedule",
+        ref: triggerIdentity.ref,
+        shaValue: triggerIdentity.sha,
+      }),
+      null,
+      { candidateInventoryRefreshAdapter: refreshAdapter },
+    );
+    await ledger.bootstrapCapability();
+    await ledger.reconcileCandidateInventoryRefreshAtomically({
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    });
+    const loaded = await ledger.load();
+    const generationIndex = loaded.records.findIndex((entry) =>
+      entry.envelope.record_type === "candidate-inventory-observation" &&
+      entry.envelope.payload.schema_version === 3);
+    assert.notEqual(generationIndex, -1);
+    const generationEntry = loaded.records[generationIndex];
+    const evidence = durableCurrentOpenGenerationAttachmentValue(
+      fixture,
+      generationEntry.envelope.payload.attachment_manifest,
+    );
+    assert.equal(
+      evidence.current_open_projection_digest,
+      generationEntry.envelope.payload.current_open_projection_digest,
+    );
+    assert.equal(
+      generationEntry.envelope.payload.attachment_manifest
+        .current_open_projection_digest,
+      generationEntry.envelope.payload.current_open_projection_digest,
+    );
+    const prefix = loaded.records.slice(0, generationIndex + 1)
+      .map((entry, index) => index === generationIndex
+        ? {
+            ...structuredClone(entry),
+            candidate_inventory_attachment_evidence:
+              structuredClone(evidence),
+          }
+        : structuredClone(entry));
+
+    await t.test("projection digest", () => {
+      const forged = structuredClone(prefix);
+      const entry = forged[generationIndex];
+      const forgedProjectionDigest = `sha256:${"f".repeat(64)}`;
+      const forgedEvidence = structuredClone(
+        entry.candidate_inventory_attachment_evidence,
+      );
+      forgedEvidence.current_open_projection_digest = forgedProjectionDigest;
+      delete forgedEvidence.evidence_digest;
+      forgedEvidence.evidence_digest = digestCanonical(
+        "codex-review-gate-v2-current-open-generation-evidence",
+        forgedEvidence,
+      );
+      entry.candidate_inventory_attachment_evidence = forgedEvidence;
+      const payload = structuredClone(entry.envelope.payload);
+      payload.current_open_projection_digest = forgedProjectionDigest;
+      const manifest = structuredClone(payload.attachment_manifest);
+      manifest.current_open_projection_digest = forgedProjectionDigest;
+      manifest.evidence_digest = forgedEvidence.evidence_digest;
+      delete manifest.manifest_digest;
+      manifest.manifest_digest = digestCanonical(
+        "codex-review-gate-v2-current-open-generation-attachment-manifest",
+        manifest,
+      );
+      payload.attachment_manifest = manifest;
+      resealFixtureCandidateInventoryEnvelopePayload(entry.envelope, payload);
+      assert.throws(
+        () => deriveV2GitLedgerCandidateInventoryAuthority(
+          forged,
+          REPOSITORY,
+        ),
+        (error) => error.code === "candidate-inventory-source-generation",
+      );
+    });
+
+    for (const field of ["started_at", "completed_at", "observed_at"]) {
+      await t.test(`${field} canonical timestamp`, () => {
+        const forged = structuredClone(prefix);
+        const entry = forged[generationIndex];
+        const payload = structuredClone(entry.envelope.payload);
+        if (field === "observed_at") {
+          payload.observed_at = payload.observed_at.replace(".000Z", "Z");
+        } else {
+          payload.observation_window[field] =
+            payload.observation_window[field].replace(".000Z", "Z");
+        }
+        assert.throws(
+          () => {
+            resealFixtureCandidateInventoryEnvelopePayload(
+              entry.envelope,
+              payload,
+            );
+            deriveV2GitLedgerCandidateInventoryAuthority(
+              forged,
+              REPOSITORY,
+            );
+          },
+          /canonical/u,
+        );
+      });
+    }
+  });
+
+test("current-open v3 dispatch binds whole-source and lifecycle identities",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const currentOpen = currentOpenSuppressionAdapterFixture({
+      initialNumbers: [PR.number],
+    });
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-source-binding-configuration-v1",
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        throw new Error("current-open source binding used legacy REST");
+      },
+    });
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+    });
+    const ledger = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    });
+    await ledger.bootstrapCapability();
+    await ledger.reconcileCandidateInventoryRefreshAtomically({
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    });
+    const loaded = await ledger.load();
+    const generation = loaded.authority_projection.candidate_inventory
+      .completed_generation;
+    const reservation = loaded.authority_projection.candidate_dispatch
+      .active_reservation.reservation;
+
+    assert.deepEqual(reservation.candidate_source, {
+      schema: "codex-review-gate-git-ledger-candidate-dispatch-source-v2",
+      schema_version: 2,
+      source_profile: generation.source_profile,
+      source_generation_id: generation.generation_id,
+      source_generation_record_oid: generation.generation_record_oid,
+      source_generation_digest: generation.generation_digest,
+      production_candidate_authority_digest:
+        generation.source_authority_digest,
+      candidate_set_digest: generation.candidate_set_digest,
+      source_current_open_semantic_digest: generation.source_semantic_digest,
+      lifecycle_candidate_set_digest:
+        generation.lifecycle_candidate_set_digest,
+    });
+    assert.equal(
+      validateV2GitLedgerCandidateDispatchReservation(reservation)
+        .candidates[0].lifecycle_seed.updated_at,
+      reservation.candidates[0].lifecycle_seed.updated_at,
+    );
+
+    const timestampTamper = structuredClone(reservation);
+    timestampTamper.candidates[0].lifecycle_seed.updated_at =
+      timestampTamper.candidates[0].lifecycle_seed.updated_at.replace(
+        ".000Z",
+        "Z",
+      );
+    timestampTamper.candidates[0].lifecycle_seed_digest = rawDigest(
+      `codex-review-gate-v2-production-candidate-lifecycle-seed\n${canonicalJson({
+        identity: timestampTamper.candidates[0].identity,
+        lifecycle_seed: timestampTamper.candidates[0].lifecycle_seed,
+      })}\n`,
+    );
+    timestampTamper.candidates[0].selection_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-dispatch-selection",
+      {
+        source_generation_record_oid:
+          timestampTamper.candidates[0].source_generation_record_oid,
+        identity_digest: timestampTamper.candidates[0].identity_digest,
+        lifecycle_seed_digest:
+          timestampTamper.candidates[0].lifecycle_seed_digest,
+        lifecycle_generation_id:
+          timestampTamper.candidates[0].lifecycle_generation_id,
+      },
+    );
+    timestampTamper.dispatch_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-candidate-dispatch-selection",
+      {
+        repository: timestampTamper.repository,
+        generation_id: timestampTamper.generation_id,
+        cycle_id: timestampTamper.cycle_id,
+        candidate_source: timestampTamper.candidate_source,
+        candidate_inventory_authority_digest:
+          timestampTamper.candidate_inventory_authority_digest,
+        inventory_digest: timestampTamper.inventory_digest,
+        batch_index: timestampTamper.batch_index,
+        batch_count: timestampTamper.batch_count,
+        candidate_offset: timestampTamper.candidate_offset,
+        candidates: timestampTamper.candidates,
+      },
+    );
+    delete timestampTamper.reservation_digest;
+    timestampTamper.reservation_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-candidate-dispatch-reservation",
+      timestampTamper,
+    );
+    assert.throws(
+      () => validateV2GitLedgerCandidateDispatchReservation(timestampTamper),
+      /lifecycle_seed\.updated_at.*canonical/u,
+    );
+
+    const lifecycleTamper = structuredClone(reservation);
+    lifecycleTamper.candidates[0].lifecycle_generation_id =
+      `candidate-lifecycle:${"f".repeat(64)}`;
+    lifecycleTamper.candidates[0].selection_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-dispatch-selection",
+      {
+        source_generation_record_oid:
+          lifecycleTamper.candidates[0].source_generation_record_oid,
+        identity_digest: lifecycleTamper.candidates[0].identity_digest,
+        lifecycle_seed_digest:
+          lifecycleTamper.candidates[0].lifecycle_seed_digest,
+        lifecycle_generation_id:
+          lifecycleTamper.candidates[0].lifecycle_generation_id,
+      },
+    );
+    lifecycleTamper.dispatch_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-candidate-dispatch-selection",
+      {
+        repository: lifecycleTamper.repository,
+        generation_id: lifecycleTamper.generation_id,
+        cycle_id: lifecycleTamper.cycle_id,
+        candidate_source: lifecycleTamper.candidate_source,
+        candidate_inventory_authority_digest:
+          lifecycleTamper.candidate_inventory_authority_digest,
+        inventory_digest: lifecycleTamper.inventory_digest,
+        batch_index: lifecycleTamper.batch_index,
+        batch_count: lifecycleTamper.batch_count,
+        candidate_offset: lifecycleTamper.candidate_offset,
+        candidates: lifecycleTamper.candidates,
+      },
+    );
+    delete lifecycleTamper.reservation_digest;
+    lifecycleTamper.reservation_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-candidate-dispatch-reservation",
+      lifecycleTamper,
+    );
+    assert.throws(
+      () => validateV2GitLedgerCandidateDispatchReservation(lifecycleTamper),
+      /changes its lifecycle identity/u,
+    );
+
+    const sourceTamper = structuredClone(reservation);
+    sourceTamper.candidate_source.source_generation_record_oid = "f".repeat(40);
+    sourceTamper.candidate_source.production_candidate_authority_digest =
+      `sha256:${"f".repeat(64)}`;
+    assert.throws(
+      () => validateV2GitLedgerCandidateDispatchReservation(sourceTamper),
+      /candidate changes its source generation/u,
+    );
+  });
+
+test("current-open v3 reservation bindings survive every durable acknowledgement",
+  async (t) => {
+    const createAttempt = async (
+      candidateCount,
+      label,
+      { configureCurrentOpen = null } = {},
+    ) => {
+      const fixture = githubGitFixture();
+      const capability = scheduleCapabilityReceipt();
+      const triggerIdentity = scheduleTriggerIdentity();
+      const runIdentity = { ...OWNER };
+      const preflight = await loadFixtureProviderPreflight();
+      const currentOpen = currentOpenSuppressionAdapterFixture({
+        initialNumbers: Array.from(
+          { length: candidateCount },
+          (_, index) => PR.number + index,
+        ),
+        exactScopeCandidateNumber: PR.number,
+      });
+      configureCurrentOpen?.(currentOpen);
+      let publicationPair = null;
+      currentOpen.setAfterProjection((pair) => {
+        publicationPair = pair;
+        currentOpen.setAfterProjection(null);
+      });
+      let legacyFinishCalls = 0;
+      const refreshAdapter = Object.freeze({
+        schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+        schema_version: 2,
+        configuration_digest: rawDigest(
+          `candidate-current-open-v3-${label}-configuration-v1`,
+        ),
+        collectCurrentOpenCandidateAuthority:
+          currentOpen.collectProductionCandidateAuthority,
+        async finishLegacyCandidateInventoryAttempt() {
+          legacyFinishCalls += 1;
+          throw new Error("current-open sequential dispatch used legacy REST");
+        },
+      });
+      const verifier = provenanceVerifier({
+        eventName: "schedule",
+        ref: triggerIdentity.ref,
+        shaValue: triggerIdentity.sha,
+        runIdentity,
+      });
+      const ledger = makeLedger(
+        fixture,
+        capability,
+        verifier,
+        preflight,
+        { candidateInventoryRefreshAdapter: refreshAdapter },
+      );
+      await ledger.bootstrapCapability();
+      const scanCommand = await createScheduleWorkflowCommandHandle({
+        runIdentity,
+      });
+      const input = {
+        workflow_command_handle: scanCommand,
+        trigger_identity: triggerIdentity,
+        repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+      };
+      await ledger.reconcileCandidateInventoryRefreshAtomically(input);
+      const reserved = await ledger.loadOrReserveCandidateDispatch(input);
+      const originalBindings = reserved.plan.items.map((_, index) =>
+        projectV2GitLedgerCandidateDispatchBinding(reserved.plan, index));
+      assert.equal(originalBindings.length, Math.min(candidateCount, 64));
+      assert.equal(new Set(originalBindings.map((binding) =>
+        binding.candidate_dispatch_authority_digest)).size, 1);
+      if (candidateCount === 64) {
+        const planBytes = Buffer.byteLength(
+          canonicalJson(reserved.plan),
+          "utf8",
+        );
+        const bindingBytes = originalBindings.map((binding) =>
+          Buffer.byteLength(canonicalJson(binding), "utf8"));
+        assert.equal(planBytes, 69_644);
+        assert.ok(planBytes <=
+          MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_PLAN_BYTES);
+        assert.equal(Math.max(...bindingBytes), 2_996);
+        assert.ok(bindingBytes.every((bytes) =>
+          bytes <= MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_BINDING_BYTES));
+      }
+      return {
+        fixture,
+        capability,
+        triggerIdentity,
+        runIdentity,
+        preflight,
+        refreshAdapter,
+        verifier,
+        input,
+        originalBindings,
+        currentOpen,
+        publicationPair,
+        legacyFinishCalls: () => legacyFinishCalls,
+      };
+    };
+
+    const makeRestartedLedger = (attempt) => makeLedger(
+      attempt.fixture,
+      attempt.capability,
+      attempt.verifier,
+      attempt.preflight,
+      { candidateInventoryRefreshAdapter: attempt.refreshAdapter },
+    );
+
+    const loadWithProjectionBuildCounts = async (ledger) => {
+      const originalStructuredClone = globalThis.structuredClone;
+      const originalFlatMap = Array.prototype.flatMap;
+      const counts = { inventory: 0, dispatch: 0, attempt_prefix_scans: 0 };
+      globalThis.structuredClone = function instrumentedStructuredClone(
+        value,
+        ...options
+      ) {
+        if (
+          Array.isArray(value) && value.length > 0 &&
+          value.every((item) =>
+            item !== null && typeof item === "object" &&
+            Object.hasOwn(item, "record_oid") &&
+            Object.hasOwn(item, "payload_digest"))
+        ) {
+          const frames = new Error().stack?.split("\n") ?? [];
+          const buildIndex = frames.findIndex((frame) =>
+            frame.includes("buildCandidateInventoryAuthority") ||
+            frame.includes("buildCandidateDispatchAuthority"));
+          const buildFrame = frames[buildIndex] ?? "";
+          const callerFrame = frames[buildIndex + 1] ?? "";
+          const directProjectionBuild =
+            callerFrame.includes("projectChainState") ||
+            callerFrame.includes("currentCandidateInventoryAuthority") ||
+            callerFrame.includes("currentCandidateDispatchAuthority");
+          if (directProjectionBuild) {
+            if (buildFrame.includes("buildCandidateInventoryAuthority")) {
+              counts.inventory += 1;
+            } else if (buildFrame.includes("buildCandidateDispatchAuthority")) {
+              counts.dispatch += 1;
+            }
+          }
+        }
+        return Reflect.apply(originalStructuredClone, this, [value, ...options]);
+      };
+      Array.prototype.flatMap = function instrumentedFlatMap(...args) {
+        const frames = new Error().stack?.split("\n") ?? [];
+        if (
+          frames.some((frame) =>
+            frame.includes("candidateDispatchScheduledAcquireAttempts")) &&
+          frames.some((frame) => frame.includes("projectChainState"))
+        ) {
+          counts.attempt_prefix_scans += 1;
+        }
+        return Reflect.apply(originalFlatMap, this, args);
+      };
+      try {
+        return { loaded: await ledger.load(), counts };
+      } finally {
+        Array.prototype.flatMap = originalFlatMap;
+        globalThis.structuredClone = originalStructuredClone;
+      }
+    };
+
+    const prepareCandidate = async (
+      attempt,
+      candidateIndex,
+      runId,
+      { full },
+    ) => {
+      const ledger = makeRestartedLedger(attempt);
+      const binding = attempt.originalBindings[candidateIndex];
+      const candidate = binding.candidate;
+      const number = candidate.identity.number;
+      const nodeId = candidate.identity.node_id;
+      const headOid = candidate.lifecycle_seed.head.sha;
+      const headRefName = candidate.lifecycle_seed.head.ref;
+      attempt.runIdentity.run_id = runId;
+      attempt.runIdentity.run_attempt = 1;
+      const scheduledCommand = await createScheduleWorkflowCommandHandle({
+        pullRequestNumber: number,
+        dispatchBinding: binding,
+        runIdentity: attempt.runIdentity,
+      });
+      const minimal = await loadFixtureMinimalScopeForCandidate(
+        number,
+        headOid,
+        headRefName,
+        nodeId,
+        TIME,
+      );
+      const scheduled = await ledger
+        .loadCandidateDispatchForScheduledPullRequest({
+          workflow_command_handle: scheduledCommand,
+          minimal_scope_handle: minimal,
+          trigger_identity: attempt.triggerIdentity,
+          expected_dispatch_binding: binding,
+        });
+      const preScopeReceipt = await ledger
+        .loadScheduledPullRequestEvaluatedScopeReceipt({
+          candidate_dispatch_handle: scheduled.candidate_dispatch_handle,
+          minimal_scope_handle: minimal,
+          trigger_identity: attempt.triggerIdentity,
+        });
+      const prepared = {
+        ...attempt,
+        ledger,
+        binding,
+        candidateIndex,
+        scheduledCommand,
+        scheduled,
+        minimal,
+        preScopeReceipt,
+        schedulerScope: {
+          pullRequest: { number, node_id: nodeId },
+          headOid,
+          baseOid: candidate.lifecycle_seed.base.sha,
+          potentialMergeCommitOid: POTENTIAL,
+          statusIdempotencyKey: `status:fixture-head-pending-${number}`,
+        },
+      };
+      if (!full) {
+        const leaseReceipt = await ledger.acquireLease({
+          predecessor_commit_sha:
+            scheduled.reservation_receipt.source_tip_commit_sha,
+          pull_request: { number, node_id: nodeId },
+          head_ref_oid: headOid,
+          base_ref_oid: candidate.lifecycle_seed.base.sha,
+          potential_merge_commit_oid: POTENTIAL,
+          lease_id: `lease:${runId}:1:${minimal.receipt_digest.slice(-16)}`,
+          owner: structuredClone(attempt.runIdentity),
+          observed_at: minimal.observed_at,
+          lease_ttl_seconds: 900,
+          control_comment_binding: null,
+        }, {
+          evaluated_scope_receipt: preScopeReceipt,
+        });
+        await ledger.releaseLease({
+          predecessor_commit_sha: leaseReceipt.acquire_commit_sha,
+          lease_receipt: leaseReceipt,
+          released_at: leaseReceipt.acquired_at,
+          control_comment_binding: null,
+        }, {
+          evaluated_scope_receipt: preScopeReceipt,
+        });
+        return { ...prepared, discovery: null };
+      }
+      let discoveryServerTime = Date.parse(TIME);
+      const nextDiscoveryServerTime = () => {
+        discoveryServerTime = Math.max(
+          discoveryServerTime + 1_000,
+          Date.parse(attempt.fixture.peekServerTime()) + 1_000,
+        );
+        return new Date(discoveryServerTime).toISOString();
+      };
+      const discovery = await acquireFixtureLeasedDiscovery({
+        ledger,
+        command: scheduledCommand,
+        preScopeReceipt,
+        minimalPre: minimal,
+        minimalFetch: (url, init) => minimalScopeFetchForCandidate({
+          number,
+          nodeId,
+          headOid,
+          headRefName,
+          serverTime: nextDiscoveryServerTime(),
+          urlValue: url,
+          init,
+        }),
+        transport: createProviderTransport(providerTransportFixture({
+          nextServerTime: nextDiscoveryServerTime,
+          comment: null,
+          headOid,
+          headRefName,
+          pullRequestNumber: number,
+          pullRequestNodeId: nodeId,
+        }).fetch),
+      });
+      return {
+        ...prepared,
+        discovery,
+      };
+    };
+
+    const projectRemainingBindings = (plan) => plan === null
+      ? null
+      : plan.items.map((_, index) =>
+        projectV2GitLedgerCandidateDispatchBinding(plan, index));
+
+    const executeCandidate = async (attempt, candidateIndex, {
+      full,
+      expectCycleComplete,
+      runId,
+      decision = "pending",
+    }) => {
+      const prepared = await prepareCandidate(
+        attempt,
+        candidateIndex,
+        runId,
+        { full },
+      );
+      prepared.schedulerScope.decision = decision;
+      let result;
+      if (full) {
+        const completed = await completeScheduledCandidateDispatchAttempt(
+          prepared,
+          { expectCycleComplete },
+        );
+        result = completed.ack;
+      } else {
+        result = await prepared.ledger.recoverCandidateDispatchFailure({
+          workflow_command_handle: prepared.scheduledCommand,
+          trigger_identity: prepared.triggerIdentity,
+          repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+          expected_dispatch_binding: prepared.binding,
+        });
+        assert.equal(result.recovery_mode, "released");
+        assert.equal(result.cycle_complete, expectCycleComplete);
+      }
+      return { prepared, result };
+    };
+
+    const assertTerminalCycle = (loaded, candidateCount, executions = null) => {
+      const dispatchRecords = loaded.records.filter((entry) =>
+        entry.envelope.record_type === "candidate-dispatch-observation");
+      const acks = dispatchRecords.filter((entry) =>
+        entry.envelope.payload.phase === "candidate-ack");
+      assert.equal(acks.length, candidateCount);
+      assert.deepEqual(
+        [...acks.map((entry) =>
+          entry.envelope.payload.candidate_ack.candidate_index)].sort(
+          (left, right) => left - right,
+        ),
+        Array.from({ length: candidateCount }, (_, index) => index),
+      );
+      if (executions !== null) {
+        assert.equal(executions.length, candidateCount);
+        for (const [ordinal, ack] of acks.entries()) {
+          const execution = executions[ordinal];
+          const payload = ack.envelope.payload;
+          const expectedCurrentDigest = execution.prepared.preScopeReceipt
+            .inventory_receipt.candidate_dispatch_authority_digest;
+          assert.equal(
+            payload.candidate_ack.candidate_index,
+            execution.prepared.candidateIndex,
+          );
+          assert.equal(
+            payload.prior_candidate_dispatch_authority_digest,
+            expectedCurrentDigest,
+          );
+          assert.equal(
+            payload.command_authority.pull_request_number,
+            execution.prepared.binding.candidate.identity.number,
+          );
+          assert.deepEqual(
+            payload.trigger_identity,
+            execution.prepared.triggerIdentity,
+          );
+          if (ordinal + 1 < executions.length) {
+            assert.equal(
+              execution.result.dispatch_authority_digest,
+              executions[ordinal + 1].prepared.preScopeReceipt
+                .inventory_receipt.candidate_dispatch_authority_digest,
+            );
+          }
+        }
+        assert.equal(
+          executions.at(-1).result.dispatch_authority_digest,
+          loaded.authority_projection.candidate_dispatch.authority_digest,
+        );
+      }
+      const batches = dispatchRecords.filter((entry) =>
+        entry.envelope.payload.phase === "batch-complete");
+      assert.equal(batches.length, 1);
+      assert.deepEqual(
+        batches[0].envelope.payload.batch_completion.ack_record_oids,
+        [...acks]
+          .sort((left, right) =>
+            left.envelope.payload.candidate_ack.candidate_index -
+              right.envelope.payload.candidate_ack.candidate_index)
+          .map((entry) => entry.commit_sha),
+      );
+      assert.equal(dispatchRecords.filter((entry) =>
+        entry.envelope.payload.phase === "cycle-complete").length, 1);
+      assert.equal(
+        loaded.authority_projection.candidate_dispatch.current_cycle
+          .cycle_complete,
+        true,
+      );
+    };
+
+    await t.test(
+      "terminal nonempty generation suppresses an equivalent fresh scan",
+      async () => {
+        const attempt = await createAttempt(
+          1,
+          "terminal-semantic-equivalence",
+        );
+        const execution = await executeCandidate(attempt, 0, {
+          full: true,
+          expectCycleComplete: true,
+          runId: "9090",
+          decision: "clean",
+        });
+        const beforeLoaded = await makeRestartedLedger(attempt).load();
+        assertTerminalCycle(beforeLoaded, 1, [execution]);
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        attempt.runIdentity.run_id = "9091";
+        attempt.runIdentity.run_attempt = 1;
+        const input = {
+          ...attempt.input,
+          workflow_command_handle: await createScheduleWorkflowCommandHandle({
+            runIdentity: attempt.runIdentity,
+          }),
+        };
+
+        const result = await makeRestartedLedger(attempt)
+          .reconcileCandidateInventoryRefreshAtomically(input);
+
+        assert.equal(result.schema_version, 2);
+        assert.equal(result.state, "suppressed");
+        assert.equal(result.reason, "semantic-unchanged-not-due");
+        assert.equal(result.persistence_mode, null);
+        assert.equal(result.publication_result, null);
+        assert.equal(result.suppression_result.state, "suppressed");
+        assert.equal(
+          result.suppression_result.assurance,
+          "authenticated-current-open-terminal-not-due",
+        );
+        assert.equal(result.suppression_result.writes_performed, false);
+        assert.equal(Object.isFrozen(result), true);
+        assert.equal(Object.isFrozen(result.suppression_result), true);
+        assertNoCandidateRefreshPrivateAuthority(result);
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          4,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        }, before);
+        const afterLoaded = await makeRestartedLedger(attempt).load();
+        assert.equal(
+          afterLoaded.authority_projection.candidate_inventory
+            .authority_digest,
+          beforeLoaded.authority_projection.candidate_inventory
+            .authority_digest,
+        );
+        assert.equal(
+          afterLoaded.authority_projection.candidate_dispatch
+            .authority_digest,
+          beforeLoaded.authority_projection.candidate_dispatch
+            .authority_digest,
+        );
+        assert.deepEqual(
+          afterLoaded.authority_projection.candidate_dispatch.current_cycle,
+          beforeLoaded.authority_projection.candidate_dispatch.current_cycle,
+        );
+      },
+    );
+
+    await t.test(
+      "a cached live pair cannot authorize semantic suppression",
+      async () => {
+        const attempt = await createAttempt(1, "terminal-cached-live-pair");
+        await executeCandidate(attempt, 0, {
+          full: true,
+          expectCycleComplete: true,
+          runId: "9091",
+          decision: "clean",
+        });
+        const cachedPair = await attempt.currentOpen
+          .collectProductionCandidateAuthority();
+        attempt.currentOpen.setListedNumbers([PR.number, PR.number + 1]);
+        attempt.currentOpen.reuseLastProductionPair();
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        attempt.runIdentity.run_id = "9092";
+        attempt.runIdentity.run_attempt = 1;
+
+        await assert.rejects(
+          makeRestartedLedger(attempt)
+            .reconcileCandidateInventoryRefreshAtomically({
+              ...attempt.input,
+              workflow_command_handle:
+                await createScheduleWorkflowCommandHandle({
+                  runIdentity: attempt.runIdentity,
+                }),
+            }),
+          (error) =>
+            error.code === "STALE_CURRENT_OPEN_INVENTORY_PROJECTION_HANDLE",
+        );
+
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          0,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        }, before);
+        assert.equal(
+          consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+            cachedPair.production_candidate_authority,
+            cachedPair.projection,
+          ),
+          cachedPair.production_candidate_authority,
+        );
+        attempt.currentOpen.reuseLastProductionPair(false);
+        attempt.runIdentity.run_id = "9093";
+        const fresh = await makeRestartedLedger(attempt)
+          .reconcileCandidateInventoryRefreshAtomically({
+            ...attempt.input,
+            workflow_command_handle: await createScheduleWorkflowCommandHandle({
+              runIdentity: attempt.runIdentity,
+            }),
+          });
+        assert.equal(fresh.state, "persisted");
+        assert.equal(fresh.publication_result.candidate_count, 2);
+        assert.equal(
+          fresh.publication_result.published_record_commit_shas.length,
+          2,
+        );
+      },
+    );
+
+    await t.test(
+      "candidate-set and lifecycle changes are never suppressed",
+      async (changeTest) => {
+        const cases = [{
+          label: "candidate-set change",
+          mutate(currentOpen) {
+            currentOpen.setListedNumbers([PR.number, PR.number + 1]);
+          },
+          expectedCount: 2,
+        }, {
+          label: "lifecycle seed change",
+          mutate(currentOpen) {
+            currentOpen.setHeadRefOid(PR.number, "3".repeat(40));
+          },
+          expectedCount: 1,
+        }];
+        for (const testCase of cases) {
+          await changeTest.test(testCase.label, async () => {
+            const attempt = await createAttempt(
+              1,
+              `terminal-${testCase.label.replaceAll(" ", "-")}`,
+            );
+            await executeCandidate(attempt, 0, {
+              full: true,
+              expectCycleComplete: true,
+              runId: "9092",
+              decision: "clean",
+            });
+            const before = {
+              writes: attempt.fixture.writeCalls,
+              commits: attempt.fixture.commits.size,
+              ref: attempt.fixture.refTarget,
+              patches: attempt.fixture.calls.filter(({ method }) =>
+                method === "PATCH").length,
+            };
+            const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+            testCase.mutate(attempt.currentOpen);
+            attempt.runIdentity.run_id = "9093";
+            attempt.runIdentity.run_attempt = 1;
+            const input = {
+              ...attempt.input,
+              workflow_command_handle:
+                await createScheduleWorkflowCommandHandle({
+                  runIdentity: attempt.runIdentity,
+                }),
+            };
+
+            const result = await makeRestartedLedger(attempt)
+              .reconcileCandidateInventoryRefreshAtomically(input);
+
+            assert.equal(result.state, "persisted");
+            assert.equal(result.suppression_result, null);
+            assert.equal(
+              result.publication_result.candidate_count,
+              testCase.expectedCount,
+            );
+            assert.equal(
+              result.publication_result.published_record_commit_shas.length,
+              2,
+            );
+            assert.equal(
+              attempt.currentOpen.calls.length - currentOpenCallsBefore,
+              4,
+            );
+            assert.equal(attempt.legacyFinishCalls(), 0);
+            assert.equal(attempt.fixture.writeCalls > before.writes, true);
+            assert.equal(attempt.fixture.commits.size - before.commits, 2);
+            assert.notEqual(attempt.fixture.refTarget, before.ref);
+            assert.equal(
+              attempt.fixture.calls.filter(({ method }) =>
+                method === "PATCH").length - before.patches,
+              1,
+            );
+          });
+        }
+      },
+    );
+
+    await t.test(
+      "a due boundary crossed after the live scan falls back to publication",
+      async () => {
+        const attempt = await createAttempt(1, "terminal-due-boundary");
+        await executeCandidate(attempt, 0, {
+          full: true,
+          expectCycleComplete: true,
+          runId: "9094",
+          decision: "clean",
+        });
+        const terminal = await makeRestartedLedger(attempt).load();
+        const schedulerRecord = terminal.records.find((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "scheduler-observation");
+        assert.notEqual(schedulerRecord, undefined);
+        const dueAt = schedulerRecord.envelope.payload.action.scheduler_plan
+          .due_at;
+        assert.notEqual(dueAt, null);
+        assert.ok(Date.parse(dueAt) > Date.parse(terminal.post_ref.server_time));
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        let crossed = false;
+        attempt.currentOpen.setAfterProjection(() => {
+          if (crossed) return;
+          crossed = true;
+          attempt.fixture.advanceServerTime(Math.max(
+            1,
+            Math.ceil(
+              (Date.parse(dueAt) -
+                Date.parse(attempt.fixture.peekServerTime())) / 1_000,
+            ) + 1,
+          ));
+        });
+        attempt.runIdentity.run_id = "9095";
+        attempt.runIdentity.run_attempt = 1;
+        const input = {
+          ...attempt.input,
+          workflow_command_handle: await createScheduleWorkflowCommandHandle({
+            runIdentity: attempt.runIdentity,
+          }),
+        };
+
+        const result = await makeRestartedLedger(attempt)
+          .reconcileCandidateInventoryRefreshAtomically(input);
+
+        assert.equal(crossed, true);
+        assert.equal(result.state, "persisted");
+        assert.equal(result.suppression_result, null);
+        assert.equal(
+          result.publication_result.published_record_commit_shas.length,
+          2,
+        );
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          4,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.equal(attempt.fixture.writeCalls > before.writes, true);
+        assert.equal(attempt.fixture.commits.size - before.commits, 2);
+        assert.notEqual(attempt.fixture.refTarget, before.ref);
+        assert.equal(
+          attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length - before.patches,
+          1,
+        );
+      },
+    );
+
+    await t.test(
+      "a regressed final ref Date cannot hide a crossed due boundary",
+      async () => {
+        const attempt = await createAttempt(1, "terminal-ref-date-regression");
+        await executeCandidate(attempt, 0, {
+          full: true,
+          expectCycleComplete: true,
+          runId: "9096",
+          decision: "clean",
+        });
+        const terminal = await makeRestartedLedger(attempt).load();
+        const schedulerRecord = terminal.records.find((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "scheduler-observation");
+        assert.notEqual(schedulerRecord, undefined);
+        const dueAt = schedulerRecord.envelope.payload.action.scheduler_plan
+          .due_at;
+        assert.notEqual(dueAt, null);
+        assert.ok(Date.parse(dueAt) > Date.parse(terminal.post_ref.server_time));
+        let returnedPair = null;
+        attempt.currentOpen.setAfterProjection((pair) => {
+          returnedPair = pair;
+          attempt.currentOpen.setAfterProjection(null);
+          attempt.fixture.advanceServerTime(Math.max(
+            1,
+            Math.ceil(
+              (Date.parse(dueAt) -
+                Date.parse(attempt.fixture.peekServerTime())) / 1_000,
+            ) + 1,
+          ));
+          attempt.fixture.overrideRefReadServerTimeAfter(
+            3,
+            pair.projection.receipt.observation_window.completed_at,
+          );
+        });
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        attempt.runIdentity.run_id = "9097";
+        attempt.runIdentity.run_attempt = 1;
+
+        await assert.rejects(
+          makeRestartedLedger(attempt)
+            .reconcileCandidateInventoryRefreshAtomically({
+              ...attempt.input,
+              workflow_command_handle:
+                await createScheduleWorkflowCommandHandle({
+                  runIdentity: attempt.runIdentity,
+                }),
+            }),
+          (error) => error.code === "candidate-inventory-cycle-stale",
+        );
+
+        assert.notEqual(returnedPair, null);
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          4,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        }, before);
+        assert.equal(
+          consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+            returnedPair.production_candidate_authority,
+            returnedPair.projection,
+          ),
+          returnedPair.production_candidate_authority,
+        );
+      },
+    );
+
+    await t.test(
+      "a regressed publication write fence rejects before object staging",
+      async () => {
+        const attempt = await createAttempt(
+          1,
+          "terminal-publication-ref-date-regression",
+        );
+        await executeCandidate(attempt, 0, {
+          full: true,
+          expectCycleComplete: true,
+          runId: "9098",
+          decision: "clean",
+        });
+        attempt.currentOpen.setListedNumbers([PR.number, PR.number + 1]);
+        let returnedPair = null;
+        attempt.currentOpen.setAfterProjection((pair) => {
+          returnedPair = pair;
+          attempt.currentOpen.setAfterProjection(null);
+          attempt.fixture.overrideRefReadServerTimeAfter(
+            3,
+            pair.projection.receipt.observation_window.completed_at,
+          );
+        });
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        attempt.runIdentity.run_id = "9099";
+        attempt.runIdentity.run_attempt = 1;
+
+        await assert.rejects(
+          makeRestartedLedger(attempt)
+            .reconcileCandidateInventoryRefreshAtomically({
+              ...attempt.input,
+              workflow_command_handle:
+                await createScheduleWorkflowCommandHandle({
+                  runIdentity: attempt.runIdentity,
+                }),
+            }),
+          (error) => error.code === "candidate-inventory-cycle-stale",
+        );
+
+        assert.notEqual(returnedPair, null);
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          4,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        }, before);
+        assert.equal(
+          consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+            returnedPair.production_candidate_authority,
+            returnedPair.projection,
+          ),
+          returnedPair.production_candidate_authority,
+        );
+      },
+    );
+
+    await t.test(
+      "an unsettled reservation blocks refresh before another live scan",
+      async () => {
+        const attempt = await createAttempt(1, "unsettled-reservation");
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        attempt.runIdentity.run_id = "9096";
+        attempt.runIdentity.run_attempt = 1;
+        await assert.rejects(
+          makeRestartedLedger(attempt)
+            .reconcileCandidateInventoryRefreshAtomically({
+              ...attempt.input,
+              workflow_command_handle:
+                await createScheduleWorkflowCommandHandle({
+                  runIdentity: attempt.runIdentity,
+                }),
+            }),
+          (error) =>
+            error.code === "candidate-inventory-cycle-dispatch-unsettled",
+        );
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          0,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        }, before);
+      },
+    );
+
+    await t.test(
+      "an active lease blocks refresh before another live scan",
+      async () => {
+        const attempt = await createAttempt(1, "active-lease");
+        await prepareCandidate(attempt, 0, "9098", { full: true });
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        attempt.runIdentity.run_id = "9099";
+        attempt.runIdentity.run_attempt = 1;
+        await assert.rejects(
+          makeRestartedLedger(attempt)
+            .reconcileCandidateInventoryRefreshAtomically({
+              ...attempt.input,
+              workflow_command_handle:
+                await createScheduleWorkflowCommandHandle({
+                  runIdentity: attempt.runIdentity,
+                }),
+            }),
+          (error) => error.code === "candidate-inventory-cycle-lease-active",
+        );
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          0,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        }, before);
+      },
+    );
+
+    await t.test(
+      "a recovered terminal generation requires a fresh publication",
+      async () => {
+        const attempt = await createAttempt(1, "recovered-terminal");
+        await executeCandidate(attempt, 0, {
+          full: false,
+          expectCycleComplete: true,
+          runId: "9100",
+        });
+        const terminal = await makeRestartedLedger(attempt).load();
+        const ack = terminal.records.find((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          entry.envelope.payload.phase === "candidate-ack");
+        assert.notEqual(ack, undefined);
+        assert.equal(
+          ack.envelope.payload.candidate_ack.terminal_authority.kind,
+          "durable-prefix-recovery",
+        );
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        attempt.runIdentity.run_id = "9101";
+        attempt.runIdentity.run_attempt = 1;
+
+        const result = await makeRestartedLedger(attempt)
+          .reconcileCandidateInventoryRefreshAtomically({
+            ...attempt.input,
+            workflow_command_handle:
+              await createScheduleWorkflowCommandHandle({
+                runIdentity: attempt.runIdentity,
+              }),
+          });
+
+        assert.equal(result.state, "persisted");
+        assert.equal(result.suppression_result, null);
+        assert.equal(
+          result.publication_result.published_record_commit_shas.length,
+          2,
+        );
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          4,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.equal(attempt.fixture.writeCalls > before.writes, true);
+        assert.equal(attempt.fixture.commits.size - before.commits, 2);
+        assert.notEqual(attempt.fixture.refTarget, before.ref);
+        assert.equal(
+          attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length - before.patches,
+          1,
+        );
+      },
+    );
+
+    for (const order of [[0, 1], [1, 0]]) {
+      await t.test(`two candidates complete in order ${order.join("-")}`,
+        async () => {
+          const attempt = await createAttempt(2, `order-${order.join("-")}`);
+          const processed = new Set();
+          const executions = [];
+          const matrixRunId = order[0] === 0 ? "9100" : "9110";
+          for (const candidateIndex of order) {
+            const executed = await executeCandidate(attempt, candidateIndex, {
+              full: true,
+              expectCycleComplete: processed.size === 1,
+              runId: matrixRunId,
+            });
+            executions.push(executed);
+            processed.add(candidateIndex);
+            const expected = attempt.originalBindings.filter(
+              (_, index) => !processed.has(index),
+            );
+            assert.deepEqual(
+              projectRemainingBindings(executed.result.remaining_plan),
+              expected.length === 0 ? null : expected,
+            );
+          }
+          let terminal;
+          if (order[0] === 0) {
+            const measured = await loadWithProjectionBuildCounts(
+              makeRestartedLedger(attempt),
+            );
+            terminal = measured.loaded;
+            const inventoryChanges = terminal.records.filter((entry) =>
+              entry.envelope.record_type ===
+                "candidate-inventory-observation").length;
+            const dispatchChanges = terminal.records.filter((entry) =>
+              entry.envelope.record_type ===
+                "candidate-dispatch-observation").length;
+            assert.ok(
+              measured.counts.inventory <= inventoryChanges + 1 &&
+                measured.counts.dispatch <= dispatchChanges + 1,
+              `inventory authority rebuilt ${measured.counts.inventory} times ` +
+                `for ${inventoryChanges} state changes; dispatch authority ` +
+                `rebuilt ${measured.counts.dispatch} times for ` +
+                `${dispatchChanges} state changes`,
+            );
+            assert.ok(
+              measured.counts.attempt_prefix_scans <= 1,
+              `scheduled attempt history was rescanned ` +
+                `${measured.counts.attempt_prefix_scans} times`,
+            );
+          } else {
+            terminal = await makeRestartedLedger(attempt).load();
+          }
+          assertTerminalCycle(terminal, 2, executions);
+          if (order[0] === 1) {
+            const forged = structuredClone(terminal.records);
+            const batchIndex = forged.findIndex((entry) =>
+              entry.envelope.record_type ===
+                "candidate-dispatch-observation" &&
+              entry.envelope.payload.phase === "batch-complete");
+            const indexSortedLastAck = forged.find((entry) =>
+              entry.envelope.record_type ===
+                "candidate-dispatch-observation" &&
+              entry.envelope.payload.phase === "candidate-ack" &&
+              entry.envelope.payload.candidate_ack.candidate_index === 1);
+            assert.notEqual(batchIndex, -1);
+            assert.notEqual(indexSortedLastAck, undefined);
+            const payload = structuredClone(
+              forged[batchIndex].envelope.payload,
+            );
+            payload.command_authority = structuredClone(
+              indexSortedLastAck.envelope.payload.command_authority,
+            );
+            payload.trigger_identity = structuredClone(
+              indexSortedLastAck.envelope.payload.trigger_identity,
+            );
+            delete forged[batchIndex].envelope.public_envelope_digest;
+            resealFixtureEnvelopePayload(
+              forged[batchIndex].envelope,
+              payload,
+            );
+            forged[batchIndex].envelope.public_envelope_digest =
+              digestCanonical(
+                "codex-review-gate-v2-git-ledger-public-envelope",
+                forged[batchIndex].envelope,
+              );
+            assert.throws(
+              () => deriveV2GitLedgerCandidateDispatchAuthority(
+                forged.slice(0, batchIndex + 1),
+                REPOSITORY,
+              ),
+              /batch completion differs from reachable acks/u,
+            );
+          }
+        });
+    }
+
+    await t.test("second acknowledgement response loss completes once after restart",
+      async () => {
+        const attempt = await createAttempt(2, "ack-response-loss");
+        const first = await executeCandidate(attempt, 0, {
+          full: true,
+          expectCycleComplete: false,
+          runId: "9200",
+        });
+        assert.deepEqual(
+          projectRemainingBindings(first.result.remaining_plan),
+          attempt.originalBindings.slice(1),
+        );
+        const second = await prepareCandidate(attempt, 1, "9200", {
+          full: true,
+        });
+        await assert.rejects(
+          completeScheduledCandidateDispatchAttempt(second, {
+            expectCycleComplete: true,
+            beforeAck() {
+              attempt.fixture.failNextCandidateDispatchUpdateAfterApply(
+                "candidate-ack",
+              );
+            },
+          }),
+          (error) => error.code === "unexpected-http-status",
+        );
+        const afterLoss = await makeRestartedLedger(attempt).load();
+        assert.equal(afterLoss.records.filter((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          entry.envelope.payload.phase === "candidate-ack").length, 2);
+        assert.equal(afterLoss.records.filter((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          new Set(["batch-complete", "cycle-complete"]).has(
+            entry.envelope.payload.phase,
+          )).length, 0);
+        attempt.runIdentity.run_id = "9203";
+        attempt.runIdentity.run_attempt = 1;
+        const recoveryInput = {
+          ...attempt.input,
+          workflow_command_handle: await createScheduleWorkflowCommandHandle({
+            runIdentity: attempt.runIdentity,
+          }),
+        };
+        const restarted = makeRestartedLedger(attempt);
+        const completed = await restarted.loadOrReserveCandidateDispatch(
+          recoveryInput,
+        );
+        assert.equal(completed.state, "complete");
+        const final = await restarted.load();
+        assertTerminalCycle(final, 2);
+        const writesBeforeReplay = attempt.fixture.writeCalls;
+        attempt.runIdentity.run_id = "9204";
+        const replayInput = {
+          ...attempt.input,
+          workflow_command_handle: await createScheduleWorkflowCommandHandle({
+            runIdentity: attempt.runIdentity,
+          }),
+        };
+        assert.equal(
+          (await makeRestartedLedger(attempt)
+            .loadOrReserveCandidateDispatch(replayInput)).state,
+          "complete",
+        );
+        assert.equal(attempt.fixture.writeCalls, writesBeforeReplay);
+      });
+
+    await t.test("64 original bindings retain D1 across fresh endpoint execution",
+      async () => {
+        const attempt = await createAttempt(64, "sixty-four");
+        attempt.fixture.freezeServerTime();
+        const reservationAuthorityDigest = attempt.originalBindings[0]
+          .candidate_dispatch_authority_digest;
+        assert.equal(new Set(attempt.originalBindings.map((binding) =>
+          binding.candidate.identity_digest)).size, 64);
+        assert.equal(new Set(attempt.originalBindings.map((binding) =>
+          binding.candidate.identity.number)).size, 64);
+        assert.ok(attempt.originalBindings.every((binding) =>
+          binding.candidate_dispatch_authority_digest ===
+            reservationAuthorityDigest));
+        const projectedBindingsJson = canonicalJson(attempt.originalBindings);
+        assert.match(projectedBindingsJson, /^[\x00-\x7f]+$/u);
+        assert.ok(Buffer.byteLength(projectedBindingsJson, "utf8") * 2 <=
+          512 * 1024);
+
+        const first = await executeCandidate(attempt, 0, {
+          full: true,
+          expectCycleComplete: false,
+          runId: "9300",
+        });
+        assert.equal(
+          first.prepared.preScopeReceipt.inventory_receipt
+            .candidate_dispatch_authority_digest,
+          reservationAuthorityDigest,
+        );
+        assert.deepEqual(
+          projectRemainingBindings(first.result.remaining_plan),
+          attempt.originalBindings.slice(1),
+        );
+
+        const last = await executeCandidate(attempt, 63, {
+          full: true,
+          expectCycleComplete: false,
+          runId: "9300",
+        });
+        assert.equal(
+          last.prepared.preScopeReceipt.inventory_receipt
+            .candidate_dispatch_authority_digest,
+          first.result.dispatch_authority_digest,
+        );
+        assert.notEqual(
+          last.prepared.preScopeReceipt.inventory_receipt
+            .candidate_dispatch_authority_digest,
+          reservationAuthorityDigest,
+        );
+        const lastRemainingBindings = projectRemainingBindings(
+          last.result.remaining_plan,
+        );
+        assert.deepEqual(
+          lastRemainingBindings,
+          attempt.originalBindings.slice(1, 63),
+        );
+        assert.ok(lastRemainingBindings.every((binding) =>
+          binding.candidate_dispatch_authority_digest ===
+            reservationAuthorityDigest));
+
+        const restarted = await makeRestartedLedger(attempt).load();
+        const acks = restarted.records.filter((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          entry.envelope.payload.phase === "candidate-ack");
+        assert.deepEqual(acks.map((entry) =>
+          entry.envelope.payload.candidate_ack.candidate_index), [0, 63]);
+        assert.equal(restarted.records.some((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          new Set(["batch-complete", "cycle-complete"]).has(
+            entry.envelope.payload.phase,
+          )), false);
+        assert.equal(
+          restarted.authority_projection.candidate_dispatch.authority_digest,
+          last.result.dispatch_authority_digest,
+        );
+      });
+
+    await t.test(
+      "the second batch rejects one oversized binding before reservation",
+      async () => {
+        const asset = await loadC65Batch0GitFixtureState();
+        const fixture = githubGitFixture(asset.git);
+        const capability = scheduleCapabilityReceipt();
+        const triggerIdentity = scheduleTriggerIdentity();
+        const preflight = await loadFixtureProviderPreflight();
+        const provenanceMintState = createFixtureProvenanceMintState(
+          asset.historical_token_authorities,
+        );
+        const historicalReverificationLogs = [];
+        const historicalMaxOrdinal = Math.max(
+          ...asset.historical_token_authorities.map(({ ordinal }) => ordinal),
+        );
+        const assertFreshFactoryMints = (priorCount, runId) => {
+          const minted = provenanceMintState.minted_authorities;
+          assert.ok(minted.length >= priorCount);
+          assert.ok(minted.slice(priorCount).every(({ run_identity }) =>
+            run_identity.run_id === runId));
+          assert.deepEqual(
+            minted.map(({ ordinal }) => ordinal),
+            Array.from(
+              { length: minted.length },
+              (_, index) => historicalMaxOrdinal + index + 1,
+            ),
+          );
+          assert.equal(
+            new Set(minted.map(({ token_sha256 }) => token_sha256)).size,
+            minted.length,
+          );
+          assert.equal(
+            new Set(minted.map(({ jti }) => jti)).size,
+            minted.length,
+          );
+        };
+        const createFreshLedger = async (runId) => {
+          const runIdentity = {
+            ...OWNER,
+            run_id: runId,
+            run_attempt: 1,
+          };
+          const historicalReverificationLog = [];
+          historicalReverificationLogs.push(historicalReverificationLog);
+          const verifier = provenanceVerifier({
+            eventName: "schedule",
+            ref: triggerIdentity.ref,
+            shaValue: triggerIdentity.sha,
+            runIdentity,
+            historicalTokenAuthorities:
+              asset.historical_token_authorities,
+            historicalReverificationLog,
+            fixtureProvenanceMintState: provenanceMintState,
+          });
+          return {
+            ledger: makeLedger(
+              fixture,
+              capability,
+              verifier,
+              preflight,
+            ),
+            input: {
+              workflow_command_handle:
+                await createScheduleWorkflowCommandHandle({ runIdentity }),
+              trigger_identity: triggerIdentity,
+              repository_endpoint_receipt:
+                scheduleRepositoryEndpointReceipt(),
+            },
+            historicalReverificationLog,
+          };
+        };
+        const initial = await createFreshLedger("9401");
+        let priorMintCount = provenanceMintState.minted_authorities.length;
+        const completedBatch = await initial.ledger.load();
+        assertFreshFactoryMints(priorMintCount, "9401");
+        assertC65HistoricalProvenanceReverification(
+          initial.historicalReverificationLog,
+          asset.historical_token_authorities,
+        );
+        assert.equal(completedBatch.commit_count, 198);
+        assert.equal(completedBatch.tip_commit_sha, C65_BATCH0_GIT_FIXTURE_REF);
+        const generation = completedBatch.authority_projection
+          .candidate_inventory.completed_generation;
+        assert.notEqual(generation, null);
+        assert.equal(generation.candidate_count, 65);
+        assert.equal(generation.candidates.length, 65);
+        const cycle = completedBatch.authority_projection.candidate_dispatch
+          .current_cycle;
+        assert.equal(cycle.candidate_count, 65);
+        assert.equal(cycle.batch_count, 2);
+        assert.equal(cycle.completed_batches.length, 1);
+        assert.equal(cycle.completed_batches[0].batch_index, 0);
+        assert.equal(cycle.completed_batches[0].candidate_count, 64);
+        assert.equal(cycle.completed_batches[0].ack_record_oids.length, 64);
+        assert.equal(new Set(cycle.completed_batches[0].ack_record_oids).size, 64);
+        assert.equal(cycle.active_reservation, null);
+        assert.equal(cycle.cycle_complete, false);
+        assert.equal(completedBatch.records.filter((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          entry.envelope.payload.phase === "candidate-ack").length, 64);
+        const reserves = completedBatch.records.filter((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          entry.envelope.payload.phase === "reserve");
+        assert.equal(reserves.length, 1);
+        assert.equal(reserves[0].envelope.payload.reservation.batch_index, 0);
+
+        const oversizedPlan = currentOpenDispatchMeasurementPlan(
+          {
+            candidate_count: generation.candidate_count,
+            candidates: generation.candidates,
+            authority_digest: generation.source_authority_digest,
+            candidate_set_digest: generation.candidate_set_digest,
+            source_current_open_semantic_digest:
+              generation.source_semantic_digest,
+          },
+          { sourceCandidateIndex: 64, batchIndex: 1, batchCount: 2 },
+        );
+        assert.ok(Buffer.byteLength(canonicalJson(oversizedPlan), "utf8") <
+          MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_PLAN_BYTES);
+        assert.ok(Buffer.byteLength(canonicalJson(
+          currentOpenDispatchMeasurementBinding(oversizedPlan),
+        ), "utf8") > MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_BINDING_BYTES);
+        assert.throws(
+          () => projectV2GitLedgerCandidateDispatchBinding(oversizedPlan, 0),
+          (error) => error.code === "candidate-dispatch-binding-size",
+        );
+
+        const snapshot = () => ({
+          writes: fixture.writeCalls,
+          blob_oids: [...fixture.blobs.keys()].sort(),
+          tree_oids: [...fixture.trees.keys()].sort(),
+          commit_oids: [...fixture.commits.keys()].sort(),
+          ref: fixture.refTarget,
+          patches: fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+          object_posts: fixture.calls.filter(({ method, path }) =>
+            method === "POST" && new Set([
+              "/git/blobs", "/git/trees", "/git/commits",
+            ]).has(path)).length,
+        });
+        const before = snapshot();
+        const rejectNextBatch = async (runId) => {
+          const restarted = await createFreshLedger(runId);
+          priorMintCount = provenanceMintState.minted_authorities.length;
+          await assert.rejects(
+            restarted.ledger.loadOrReserveCandidateDispatch(restarted.input),
+            (error) => error.code === "candidate-dispatch-binding-size",
+          );
+          assertFreshFactoryMints(priorMintCount, runId);
+          assertC65HistoricalProvenanceReverification(
+            restarted.historicalReverificationLog,
+            asset.historical_token_authorities,
+          );
+          assert.deepEqual(snapshot(), before);
+        };
+
+        await rejectNextBatch("9402");
+        await rejectNextBatch("9403");
+        assert.equal(
+          new Set(historicalReverificationLogs).size,
+          historicalReverificationLogs.length,
+        );
+        const final = await createFreshLedger("9404");
+        priorMintCount = provenanceMintState.minted_authorities.length;
+        const loaded = await final.ledger.load();
+        assertFreshFactoryMints(priorMintCount, "9404");
+        assertC65HistoricalProvenanceReverification(
+          final.historicalReverificationLog,
+          asset.historical_token_authorities,
+        );
+        assert.equal(
+          loaded.authority_projection.candidate_dispatch.active_reservation,
+          null,
+        );
+        assert.equal(
+          loaded.authority_projection.candidate_dispatch.current_cycle
+            .completed_batches.length,
+          1,
+        );
+        assert.equal(loaded.records.filter((entry) =>
+          entry.envelope.record_type === "candidate-dispatch-observation" &&
+          entry.envelope.payload.phase === "reserve").length, 1);
+        assert.deepEqual(snapshot(), before);
+      },
+    );
+  });
+
+test("mature checkpoint preserves the bootstrap-only capacity boundary",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const transportFixture = candidateTransportFixture(255);
+    const cycle = await readIdentityDriftCandidateInventoryCycle({
+      transportFixture,
+      priorInventory: null,
+      listedNumbersAfterInitial: Array.from(
+        { length: 255 },
+        (_, index) => index + 2,
+      ),
+      mutateAfterInitial: () => {
+        transportFixture.setCandidateState(1, "closed");
+      },
+    });
+    const currentOpen = currentOpenSuppressionAdapterFixture({
+      initialNumbers: [PR.number],
+    });
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 1,
+      configuration_digest: rawDigest(
+        "mature-checkpoint-bootstrap-boundary-adapter-v1",
+      ),
+      collectCurrentOpenProjection:
+        currentOpen.adapter.collectCurrentOpenProjection,
+      async collectCandidateInventoryAttempt(request) {
+        const evidence = request.attempt_index === 0
+          ? cycle.drift_attempts[0]
+          : {
+              initial_inventory: cycle.initial_inventory,
+              shard_receipts: cycle.shard_receipts,
+              final_inventory: cycle.final_inventory,
+              final_shard_receipts: cycle.final_shard_receipts,
+            };
+        return {
+          schema: "codex-review-gate-git-ledger-candidate-full-refresh-result-v2",
+          schema_version: 1,
+          request_handle: request.request_handle,
+          attempt_index: request.attempt_index,
+          ...evidence,
+        };
+      },
+    });
+    const ledger = makeLedger(
+      fixture,
+      capability,
+      provenanceVerifier({
+        eventName: "schedule",
+        ref: triggerIdentity.ref,
+        shaValue: triggerIdentity.sha,
+      }),
+      null,
+      { candidateInventoryRefreshAdapter: refreshAdapter },
+    );
+    await ledger.bootstrapCapability();
+    const input = {
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    };
+    const before = {
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    };
+    await assert.rejects(
+      ledger.reconcileCandidateInventoryRefreshAtomically(input),
+      (error) => error.code === "CANDIDATE_INVENTORY_CHECKPOINT_REQUIRED",
+    );
+    assert.deepEqual({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    }, before);
+  });
+
+test("mature quiescent checkpoint preserves public authority and continues its next unit",
+  async () => {
+    const source = await matureQuiescentCheckpointSourceFixture();
+    const before = {
+      writes: source.fixture.writeCalls,
+      blobs: source.fixture.blobs.size,
+      trees: source.fixture.trees.size,
+      commits: source.fixture.commits.size,
+      ref: source.fixture.refTarget,
+      patches: source.fixture.calls.filter(({ method }) =>
+        method === "PATCH").length,
+    };
+    source.fixture.failNextCandidateInventoryUpdateAfterApply();
+
+    const reconciled = await makeLedger(
+      source.fixture,
+      source.capability,
+      source.verifier,
+      source.preflight,
+      { candidateInventoryRefreshAdapter: source.refreshAdapter },
+    ).reconcileCandidateInventoryRefreshAtomically(source.checkpointInput);
+
+    assert.equal(reconciled.state, "persisted");
+    assert.equal(reconciled.persistence_mode, "private-must-persist");
+    assert.equal(reconciled.publication_result.state, "persisted");
+    assert.equal(
+      reconciled.publication_result.published_record_commit_shas.length,
+      5,
+    );
+    assert.equal(reconciled.publication_result.append_receipts.length, 0);
+    assert.equal(reconciled.publication_result.final_commit_count, 6);
+    assert.equal(source.fixture.writeCalls > before.writes, true);
+    assert.equal(source.fixture.commits.size > before.commits, true);
+    assert.notEqual(source.fixture.refTarget, before.ref);
+    assert.equal(
+      source.fixture.calls.filter(({ method }) => method === "PATCH").length -
+        before.patches,
+      1,
+    );
+
+    const restart = makeLedger(
+      source.fixture,
+      source.capability,
+      source.verifier,
+      source.preflight,
+      { candidateInventoryRefreshAdapter: source.refreshAdapter },
+    );
+    const loaded = await restart.load();
+    assert.equal(loaded.checkpoint.profile, "mature-quiescent-v1");
+    assert.equal(loaded.commit_count, 6);
+    assert.equal(loaded.epoch_commit_count, 6);
+    assert.equal(
+      loaded.logical_record_count,
+      source.terminal.commit_count + 6,
+    );
+    assert.equal(
+      loaded.provenance_reverification.length,
+      source.terminal.records.length + 6,
+    );
+    const reverifiedRecordOids = loaded.provenance_reverification.map(
+      ({ record_oid: recordOid }) => recordOid,
+    );
+    assert.equal(new Set(reverifiedRecordOids).size, reverifiedRecordOids.length);
+    assert.deepEqual(
+      reverifiedRecordOids.slice(0, source.terminal.records.length),
+      source.terminal.records.map(({ commit_sha: commitSha }) => commitSha),
+    );
+    const layout = matureCheckpointFixtureLayout(source.fixture);
+    assert.equal(layout.suffix.length, 5);
+    assert.equal(layout.seed.records.some((entry) =>
+      entry.candidate_inventory_attachment_evidence !== null), true);
+    const readOnlySnapshot = () => ({
+      writes: source.fixture.writeCalls,
+      blobs: source.fixture.blobs.size,
+      trees: source.fixture.trees.size,
+      commits: source.fixture.commits.size,
+      ref: source.fixture.refTarget,
+      patches: source.fixture.calls.filter(({ method }) =>
+        method === "PATCH").length,
+    });
+    const freshLoad = (verifier = source.verifier) => makeLedger(
+      source.fixture,
+      source.capability,
+      verifier,
+      source.preflight,
+      { candidateInventoryRefreshAdapter: source.refreshAdapter },
+    ).load();
+    const rejectReadOnly = async (expectedCode, action) => {
+      const snapshot = readOnlySnapshot();
+      await assert.rejects(action, (error) => error.code === expectedCode);
+      assert.deepEqual(readOnlySnapshot(), snapshot);
+    };
+
+    const classificationMutations = [
+      ["unknown key", (value) => { value.unknown_key = true; }],
+      ["state", (value) => { value.state = "unknown"; }],
+      ["reason", (value) => { value.reason = "unknown"; }],
+      ["source tip", (value) => { value.source_tip_commit_sha = 7; }],
+      ["source count", (value) => { value.source_commit_count = "4096"; }],
+      ["semantic digest", (value) => {
+        value.semantic_inventory_digest = false;
+      }],
+      ["semantic change", (value) => { value.semantic_change = "false"; }],
+      ["drift count", (value) => { value.drift_attempt_count = "0"; }],
+      ["drift codes", (value) => { value.drift_codes = {}; }],
+      ["authoritative timestamp alias", (value) => {
+        value.authoritative_observed_at =
+          value.authoritative_observed_at.replace(".000Z", "Z");
+      }],
+      ["candidate count", (value) => { value.candidate_count = "255"; }],
+      ["due count", (value) => { value.due_candidate_count = -1; }],
+      ["nullable due boundary", (value) => {
+        value.due_candidate_count = 0;
+        value.earliest_due_at = value.authoritative_observed_at;
+      }],
+      ["inventory budget", (value) => {
+        value.inventory_commit_budget_required = -1;
+      }],
+      ["dispatch budget", (value) => {
+        value.dispatch_commit_budget_required = "1";
+      }],
+      ["execution budget", (value) => {
+        value.candidate_execution_commit_budget_required = null;
+      }],
+      ["total budget", (value) => {
+        value.total_commit_budget_required = false;
+      }],
+      ["remaining capacity", (value) => {
+        value.remaining_ledger_commit_capacity_after_dispatch = "0";
+      }],
+      ["projection digest", (value) => {
+        value.projection_digest = `sha256:${"f".repeat(64)}`;
+      }, false],
+    ];
+    for (const [label, mutateClassification, resealProjectionDigest = true]
+      of classificationMutations) {
+      const original = source.fixture.snapshotHistoricalState();
+      try {
+        resealMatureCheckpointClassificationForFixture({
+          fixture: source.fixture,
+          mutateClassification,
+          resealProjectionDigest,
+        });
+        await rejectReadOnly(
+          "CANDIDATE_INVENTORY_CLASSIFICATION_PROJECTION",
+          freshLoad(),
+        );
+      } catch (error) {
+        error.message = `${label}: ${error.message}`;
+        throw error;
+      } finally {
+        source.fixture.restoreHistoricalState(original);
+      }
+    }
+
+    const stateBlobOid = layout.state_blob_entry.sha;
+    const originalStateBlob = source.fixture.blobs.get(stateBlobOid);
+    const tamperedStateBytes = Buffer.from(originalStateBlob.bytes);
+    tamperedStateBytes[0] ^= 1;
+    source.fixture.blobs.set(stateBlobOid, {
+      ...originalStateBlob,
+      content: tamperedStateBytes.toString("utf8"),
+      bytes: tamperedStateBytes,
+    });
+    try {
+      await rejectReadOnly("CHECKPOINT_BLOB_IDENTITY", freshLoad());
+    } finally {
+      source.fixture.blobs.set(stateBlobOid, originalStateBlob);
+    }
+
+    const sourceChunkOid = layout.manifest.chunks[0].blob_sha;
+    const originalSourceChunk = source.fixture.blobs.get(sourceChunkOid);
+    const tamperedSourceChunk = Buffer.from(originalSourceChunk.bytes);
+    tamperedSourceChunk[0] ^= 1;
+    source.fixture.blobs.set(sourceChunkOid, {
+      ...originalSourceChunk,
+      content: tamperedSourceChunk.toString("utf8"),
+      bytes: tamperedSourceChunk,
+    });
+    try {
+      await rejectReadOnly("CHECKPOINT_BLOB_IDENTITY", freshLoad());
+    } finally {
+      source.fixture.blobs.set(sourceChunkOid, originalSourceChunk);
+    }
+
+    const sourceJwt = layout.seed.records[0].envelope.workflow_provenance_jwt;
+    let rejectedSourceJwt = false;
+    const rejectingVerifier = async (request, options) => {
+      if (
+        request.mode === "reverify-stored" &&
+        request.compact_jwt === sourceJwt
+      ) {
+        rejectedSourceJwt = true;
+        const error = new Error("fixture rejects the changed stored JWT");
+        error.code = "fixture-stored-jwt-tamper";
+        throw error;
+      }
+      return source.verifier(request, options);
+    };
+    await rejectReadOnly(
+      "workflow-provenance-verification-failed",
+      freshLoad(rejectingVerifier),
+    );
+    assert.equal(rejectedSourceJwt, true);
+
+    const firstSuffix = layout.suffix[0];
+    const originalFirstSuffixCommit = source.fixture.commits.get(
+      firstSuffix.sha,
+    );
+    source.fixture.commits.set(firstSuffix.sha, {
+      ...structuredClone(originalFirstSuffixCommit),
+      parents: layout.checkpoint_commit.parents.map(({ sha }) => ({ sha })),
+    });
+    try {
+      await rejectReadOnly("commit-object-identity", freshLoad());
+    } finally {
+      source.fixture.commits.set(firstSuffix.sha, originalFirstSuffixCommit);
+    }
+    assert.equal(
+      loaded.records.length,
+      source.terminal.records.length + 5,
+    );
+    assert.deepEqual(
+      loaded.records.slice(0, source.terminal.records.length).map((entry) => ({
+        commit_sha: entry.commit_sha,
+        envelope_digest: entry.envelope.envelope_digest,
+      })),
+      source.terminal.records.map((entry) => ({
+        commit_sha: entry.commit_sha,
+        envelope_digest: entry.envelope.envelope_digest,
+      })),
+    );
+    assert.equal(loaded.active_lease, null);
+    assert.equal(loaded.effect_intent_count, source.terminal.effect_intent_count);
+    assert.equal(
+      loaded.effect_response_count,
+      source.terminal.effect_response_count,
+    );
+    assert.deepEqual(
+      loaded.control_comment_binding,
+      source.terminal.control_comment_binding,
+    );
+    assert.deepEqual(
+      loaded.authority_projection.runner_state,
+      source.terminal.authority_projection.runner_state,
+    );
+    assert.equal(
+      loaded.authority_projection.candidate_inventory.completed_cycle
+        .cycle_receipt.open_pull_requests.length,
+      255,
+    );
+    const active = loaded.authority_projection.candidate_dispatch
+      .active_reservation;
+    assert.notEqual(active, null);
+    assert.equal(
+      active.reservation.remaining_ledger_commit_capacity_after_dispatch,
+      2,
+    );
+    const reserved = await restart.loadOrReserveCandidateDispatch(
+      source.checkpointInput,
+    );
+    assert.equal(reserved.state, "dispatch");
+    assert.equal(reserved.restarted, true);
+    assert.equal(reserved.plan.items.length, 64);
+    const checkpointBindings = reserved.plan.items.map((_, index) =>
+      projectV2GitLedgerCandidateDispatchBinding(reserved.plan, index));
+
+    source.runIdentity.run_id = "9605";
+    source.runIdentity.run_attempt = 1;
+    const restartInput = {
+      ...source.checkpointInput,
+      workflow_command_handle: await createScheduleWorkflowCommandHandle({
+        runIdentity: source.runIdentity,
+      }),
+    };
+    const freshReservation = await makeLedger(
+      source.fixture,
+      source.capability,
+      source.verifier,
+      source.preflight,
+      { candidateInventoryRefreshAdapter: source.refreshAdapter },
+    ).loadOrReserveCandidateDispatch(restartInput);
+    assert.equal(
+      freshReservation.reservation_receipt.reservation_record_oid,
+      reserved.reservation_receipt.reservation_record_oid,
+    );
+    assert.deepEqual(
+      freshReservation.plan.items.map((_, index) =>
+        projectV2GitLedgerCandidateDispatchBinding(
+          freshReservation.plan,
+          index,
+        )),
+      checkpointBindings,
+    );
+
+    const first = await prepareCompactCandidateDispatchItem({
+      ...source,
+      binding: checkpointBindings[0],
+      runId: "9606",
+    });
+    const immutableReservationAuthority = first.preScopeReceipt
+      .inventory_receipt.candidate_dispatch_authority_digest;
+    const completed = await completeScheduledCandidateDispatchAttempt(first, {
+      expectCycleComplete: false,
+    });
+    assert.notEqual(
+      completed.ack.dispatch_authority_digest,
+      immutableReservationAuthority,
+    );
+    const afterAck = await makeLedger(
+      source.fixture,
+      source.capability,
+      source.verifier,
+      source.preflight,
+      { candidateInventoryRefreshAdapter: source.refreshAdapter },
+    ).load();
+    assert.equal(
+      afterAck.authority_projection.candidate_dispatch.authority_digest,
+      completed.ack.dispatch_authority_digest,
+    );
+    assert.equal(afterAck.next_sequence, afterAck.commit_count);
+    assert.equal(
+      afterAck.logical_record_count,
+      source.terminal.commit_count + afterAck.commit_count,
+    );
+    assert.equal(
+      afterAck.records.length,
+      source.terminal.records.length + afterAck.commit_count - 1,
+    );
+    assert.equal(afterAck.active_lease, null);
+    assert.equal(afterAck.records.filter((entry) =>
+      entry.envelope.record_type === "candidate-dispatch-observation" &&
+      entry.envelope.payload.phase === "candidate-ack" &&
+      entry.envelope.payload.candidate_ack.generation_id ===
+        active.reservation.generation_id).length, 1);
+    const remainingBindings = completed.ack.remaining_plan.items.map(
+      (_, index) => projectV2GitLedgerCandidateDispatchBinding(
+        completed.ack.remaining_plan,
+        index,
+      ),
+    );
+    assert.deepEqual(remainingBindings, checkpointBindings.slice(1));
+  });
+
+test("mature checkpoint refuses nonquiescent source boundaries without writes",
+  async (t) => {
+    const snapshot = (fixture) => ({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+      patches: fixture.calls.filter(({ method }) => method === "PATCH").length,
+    });
+
+    await t.test("active reservation", async () => {
+      const attempt = await stableEmptyCandidateRefreshReconciliationFixture({
+        currentOpenNumbers: [PR.number],
+        fullTransportOptions: { exactScopeCandidateNumber: PR.number },
+      });
+      attempt.fullTransport.setListedNumbers([PR.number]);
+      await attempt.ledger.reconcileCandidateInventoryRefreshAtomically(
+        attempt.input,
+      );
+      const reserved = await attempt.ledger.loadOrReserveCandidateDispatch(
+        attempt.input,
+      );
+      assert.equal(reserved.state, "dispatch");
+      const before = snapshot(attempt.fixture);
+      await assert.rejects(
+        attempt.ledger.reconcileCandidateInventoryRefreshAtomically(
+          attempt.input,
+        ),
+        (error) => error.code ===
+          "candidate-inventory-cycle-dispatch-unsettled",
+      );
+      assert.deepEqual(snapshot(attempt.fixture), before);
+    });
+
+    await t.test("active lease", async () => {
+      const attempt = await createCompactScheduledCandidateDispatchAttempt();
+      const before = snapshot(attempt.fixture);
+      await assert.rejects(
+        attempt.ledger.reconcileCandidateInventoryRefreshAtomically(
+          attempt.input,
+        ),
+        (error) => error.code === "candidate-inventory-cycle-lease-active",
+      );
+      assert.deepEqual(snapshot(attempt.fixture), before);
+    });
+
+    await t.test("incomplete inventory", async () => {
+      const historical = await legacyIncompleteCandidateRefreshFixture({
+        candidateCount: 1,
+      });
+      const currentOpen = currentOpenSuppressionAdapterFixture({
+        initialNumbers: Array.from({ length: 255 }, (_, index) => index + 1),
+      });
+      const checkpointNumbers = Array.from(
+        { length: 255 },
+        (_, index) => index + 1,
+      );
+      const refreshAdapter = Object.freeze({
+        schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+        schema_version: 1,
+        configuration_digest: rawDigest(
+          "mature-checkpoint-incomplete-source-adapter-v1",
+        ),
+        collectCurrentOpenProjection:
+          currentOpen.adapter.collectCurrentOpenProjection,
+        async collectCandidateInventoryAttempt(request) {
+          const attempt = request.attempt_index === 0
+            ? await readDriftingCandidateInventoryAttempt({
+                request,
+                transportFixture: historical.transportFixture,
+                finalNumbers: checkpointNumbers,
+              })
+            : await readCandidateInventoryAttempt({
+                transportFixture: historical.transportFixture,
+                priorInventory: request.prior_inventory,
+                initialInventory: request.initial_inventory,
+              });
+          return {
+            schema:
+              "codex-review-gate-git-ledger-candidate-full-refresh-result-v2",
+            schema_version: 1,
+            request_handle: request.request_handle,
+            attempt_index: request.attempt_index,
+            ...attempt,
+          };
+        },
+      });
+      const ledger = makeLedger(
+        historical.fixture,
+        historical.capability,
+        historical.verifier,
+        null,
+        { candidateInventoryRefreshAdapter: refreshAdapter },
+      );
+      const before = snapshot(historical.fixture);
+      await assert.rejects(
+        ledger.reconcileCandidateInventoryRefreshAtomically({
+          workflow_command_handle:
+            await createScheduleWorkflowCommandHandle(),
+          trigger_identity: historical.triggerIdentity,
+          repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+        }),
+        (error) => error.code === "CHECKPOINT_SOURCE_BOUNDARY_UNSUPPORTED",
+      );
+      assert.deepEqual(snapshot(historical.fixture), before);
+    });
+  });
+
+test("current-open v3 lifecycle ids remain stable across seed and presence changes",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const runIdentity = { ...OWNER };
+    const preflight = await loadFixtureProviderPreflight();
+    const currentOpen = currentOpenSuppressionAdapterFixture({
+      initialNumbers: [PR.number],
+      exactScopeCandidateNumber: PR.number,
+    });
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-lifecycle-lineage-configuration-v1",
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        throw new Error("current-open lifecycle lineage used legacy REST");
+      },
+    });
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+      runIdentity,
+    });
+    const ledger = makeLedger(
+      fixture,
+      capability,
+      verifier,
+      preflight,
+      { candidateInventoryRefreshAdapter: refreshAdapter },
+    );
+    await ledger.bootstrapCapability();
+    const scanInput = async (runId) => {
+      runIdentity.run_id = runId;
+      runIdentity.run_attempt = 1;
+      return {
+        workflow_command_handle: await createScheduleWorkflowCommandHandle({
+          runIdentity,
+        }),
+        trigger_identity: triggerIdentity,
+        repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+      };
+    };
+    const completeGeneration = async ({ input, headOid, runId }) => {
+      const reserved = await ledger.loadOrReserveCandidateDispatch(input);
+      const binding = projectV2GitLedgerCandidateDispatchBinding(
+        reserved.plan,
+        0,
+      );
+      runIdentity.run_id = runId;
+      const scheduledCommand = await createScheduleWorkflowCommandHandle({
+        pullRequestNumber: PR.number,
+        dispatchBinding: binding,
+        runIdentity,
+      });
+      const minimal = await loadFixtureMinimalScopeForCandidate(
+        PR.number,
+        headOid,
+        "feature",
+      );
+      const scheduled = await ledger
+        .loadCandidateDispatchForScheduledPullRequest({
+          workflow_command_handle: scheduledCommand,
+          minimal_scope_handle: minimal,
+          trigger_identity: triggerIdentity,
+          expected_dispatch_binding: binding,
+        });
+      const preScopeReceipt = await ledger
+        .loadScheduledPullRequestEvaluatedScopeReceipt({
+          candidate_dispatch_handle: scheduled.candidate_dispatch_handle,
+          minimal_scope_handle: minimal,
+          trigger_identity: triggerIdentity,
+        });
+      const discovery = await acquireFixtureLeasedDiscovery({
+        ledger,
+        command: scheduledCommand,
+        preScopeReceipt,
+        minimalPre: minimal,
+        minimalFetch: (url, init) => minimalScopeFetchForCandidate({
+          number: PR.number,
+          nodeId: PR.node_id,
+          headOid,
+          headRefName: "feature",
+          serverTime: "2026-08-13T14:00:00.000Z",
+          urlValue: url,
+          init,
+        }),
+        transport: createProviderTransport(providerTransportFixture({
+          startSecond: 3600,
+          headOid,
+          headRefName: "feature",
+        }).fetch),
+      });
+      await releaseFixtureDiscoveryLease(ledger, discovery);
+      const recovered = await ledger.recoverCandidateDispatchFailure({
+        workflow_command_handle: scheduledCommand,
+        trigger_identity: triggerIdentity,
+        repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+        expected_dispatch_binding: binding,
+      });
+      assert.equal(recovered.recovery_mode, "released");
+      assert.equal(recovered.cycle_complete, true);
+    };
+
+    const firstInput = await scanInput("9101");
+    await ledger.reconcileCandidateInventoryRefreshAtomically(firstInput);
+    const firstGeneration = (await ledger.load()).authority_projection
+      .candidate_inventory.completed_generation;
+    const firstLifecycleId =
+      firstGeneration.candidates[0].lifecycle_generation_id;
+    await completeGeneration({
+      input: firstInput,
+      headOid: HEAD,
+      runId: "9102",
+    });
+
+    const changedHead = "d".repeat(40);
+    currentOpen.setHeadRefOid(PR.number, changedHead);
+    const secondInput = await scanInput("9103");
+    await ledger.reconcileCandidateInventoryRefreshAtomically(secondInput);
+    const secondGeneration = (await ledger.load()).authority_projection
+      .candidate_inventory.completed_generation;
+    assert.notEqual(secondGeneration.generation_id, firstGeneration.generation_id);
+    assert.equal(
+      secondGeneration.candidates[0].lifecycle_generation_id,
+      firstLifecycleId,
+    );
+    assert.notEqual(
+      secondGeneration.candidates[0].lifecycle_seed_digest,
+      firstGeneration.candidates[0].lifecycle_seed_digest,
+    );
+    await completeGeneration({
+      input: secondInput,
+      headOid: changedHead,
+      runId: "9104",
+    });
+
+    currentOpen.setListedNumbers([]);
+    const absentInput = await scanInput("9105");
+    await ledger.reconcileCandidateInventoryRefreshAtomically(absentInput);
+    assert.deepEqual(
+      (await ledger.load()).authority_projection.candidate_inventory
+        .completed_generation.candidates,
+      [],
+    );
+
+    currentOpen.setListedNumbers([PR.number]);
+    const reappearedInput = await scanInput("9106");
+    await ledger.reconcileCandidateInventoryRefreshAtomically(reappearedInput);
+    const restarted = makeLedger(
+      fixture,
+      capability,
+      verifier,
+      preflight,
+      { candidateInventoryRefreshAdapter: refreshAdapter },
+    );
+    const reappearedGeneration = (await restarted.load()).authority_projection
+      .candidate_inventory.completed_generation;
+    const reappeared = reappearedGeneration.candidates[0];
+    const expectedReappearedLifecycleId =
+      `candidate-lifecycle:${digestCanonical(
+        "codex-review-gate-v2-current-open-lifecycle-generation",
+        {
+          repository: {
+            owner: REPOSITORY.owner,
+            name: REPOSITORY.name,
+            id: REPOSITORY.id,
+            node_id: REPOSITORY.node_id,
+          },
+          identity_digest: reappeared.identity_digest,
+        },
+      ).slice("sha256:".length)}`;
+    assert.equal(reappeared.lifecycle_generation_id, firstLifecycleId);
+    assert.equal(
+      reappeared.lifecycle_generation_id,
+      expectedReappearedLifecycleId,
+    );
+  });
+
+test("current-open v3 reconciliation rejects a consumed live pair before a second write",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const currentOpen = currentOpenSuppressionAdapterFixture();
+    let pair = null;
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-consumed-pair-configuration-v1",
+      ),
+      async collectCurrentOpenCandidateAuthority() {
+        const fresh = await currentOpen.collectProductionCandidateAuthority();
+        if (pair !== null) {
+          consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+            fresh.production_candidate_authority,
+            fresh.projection,
+          );
+        }
+        pair = fresh;
+        return pair;
+      },
+      async finishLegacyCandidateInventoryAttempt() {
+        throw new Error("current-open consumed pair used legacy REST");
+      },
+    });
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+    });
+    const ledger = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    });
+    await ledger.bootstrapCapability();
+    const input = {
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    };
+    const first = await ledger.reconcileCandidateInventoryRefreshAtomically(
+      input,
+    );
+    assert.equal(first.state, "persisted");
+    const before = {
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    };
+    await assert.rejects(
+      ledger.reconcileCandidateInventoryRefreshAtomically(input),
+      (error) =>
+        error.code === "CONSUMED_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
+    );
+    assert.deepEqual({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    }, before);
+  });
+
+test("current-open v3 reconciliation recovers one applied atomic publication",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const currentOpen = currentOpenSuppressionAdapterFixture({
+      initialNumbers: [PR.number],
+    });
+    let legacyFinishCalls = 0;
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-response-loss-test-configuration-v1",
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        legacyFinishCalls += 1;
+        throw new Error("fresh current-open generation used legacy REST");
+      },
+    });
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+    });
+    const ledger = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    });
+    await ledger.bootstrapCapability();
+    const input = {
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    };
+    const patchesBefore = fixture.calls.filter(({ method }) =>
+      method === "PATCH").length;
+    fixture.failNextCandidateInventoryUpdateAfterApply();
+
+    const reconciled = await ledger
+      .reconcileCandidateInventoryRefreshAtomically(input);
+
+    assert.equal(reconciled.state, "persisted");
+    assert.equal(
+      reconciled.publication_result.publication_outcome,
+      "recovered-after-apply",
+    );
+    assert.equal(reconciled.publication_result.append_receipts.length, 0);
+    assert.equal(
+      reconciled.publication_result.published_record_commit_shas.length,
+      2,
+    );
+    assert.equal(legacyFinishCalls, 0);
+    assert.equal(currentOpen.calls.length, 4);
+    assert.equal(
+      fixture.calls.filter(({ method }) => method === "PATCH").length -
+        patchesBefore,
+      1,
+    );
+    const loaded = await makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    }).load();
+    assert.equal(
+      loaded.authority_projection.candidate_inventory.completed_generation
+        .candidate_count,
+      1,
+    );
+    assert.equal(
+      loaded.authority_projection.candidate_dispatch.active_reservation
+        .reservation.candidates[0].identity.number,
+      PR.number,
+    );
+  });
+
+test("current-open v3 reconciliation recognizes its publication below a later generation",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const verifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+    });
+    const firstCurrentOpen = currentOpenSuppressionAdapterFixture();
+    const secondCurrentOpen = currentOpenSuppressionAdapterFixture();
+    const refreshAdapter = (name, currentOpen) => Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        `candidate-current-open-v3-${name}-configuration-v1`,
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        throw new Error("current-open suffix reconciliation used legacy REST");
+      },
+    });
+    const first = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter:
+        refreshAdapter("prefix", firstCurrentOpen),
+    });
+    await first.bootstrapCapability();
+    const second = makeLedger(fixture, capability, verifier, null, {
+      candidateInventoryRefreshAdapter:
+        refreshAdapter("suffix", secondCurrentOpen),
+    });
+    secondCurrentOpen.setListedNumbers([PR.number]);
+    const firstInput = {
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    };
+    const secondInput = {
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    };
+    let suffixResult = null;
+    fixture.afterNextCandidateInventoryUpdateApplied(async () => {
+      suffixResult = await second.reconcileCandidateInventoryRefreshAtomically(
+        secondInput,
+      );
+    });
+    const patchesBefore = fixture.calls.filter(({ method }) =>
+      method === "PATCH").length;
+
+    const prefixResult = await first
+      .reconcileCandidateInventoryRefreshAtomically(firstInput);
+
+    assert.equal(prefixResult.state, "persisted");
+    assert.equal(
+      prefixResult.publication_result.publication_outcome,
+      "recovered-after-apply",
+    );
+    assert.equal(
+      prefixResult.publication_result.published_record_commit_shas.length,
+      2,
+    );
+    assert.equal(suffixResult.state, "persisted");
+    assert.equal(
+      suffixResult.publication_result.publication_outcome,
+      "published",
+    );
+    assert.equal(
+      fixture.calls.filter(({ method }) => method === "PATCH").length -
+        patchesBefore,
+      2,
+    );
+    const loaded = await first.load();
+    const prefixStart = loaded.records.findIndex(({ commit_sha: commitSha }) =>
+      commitSha ===
+        prefixResult.publication_result.published_record_commit_shas[0]);
+    assert.deepEqual(
+      loaded.records.slice(prefixStart, prefixStart + 2)
+        .map(({ commit_sha: commitSha }) => commitSha),
+      prefixResult.publication_result.published_record_commit_shas,
+    );
+    assert.equal(
+      loaded.tip_commit_sha,
+      suffixResult.publication_result.published_record_commit_shas.at(-1),
+    );
+  });
+
+test("current-open v3 reconciliation rejects 512 capacity and 513 scan cap without Git writes",
+  async (t) => {
+    for (const [candidateCount, expectedCode] of [
+      [512, "candidate-inventory-cycle-commit-capacity"],
+      [513, "CANDIDATE_OPEN_SET_CAP"],
+    ]) {
+      await t.test(`${candidateCount} candidates`, async () => {
+        const fixture = githubGitFixture();
+        const capability = scheduleCapabilityReceipt();
+        const triggerIdentity = scheduleTriggerIdentity();
+        const currentOpen = currentOpenSuppressionAdapterFixture({
+          initialNumbers: Array.from(
+            { length: candidateCount },
+            (_, index) => index + 1,
+          ),
+        });
+        let legacyFinishCalls = 0;
+        const refreshAdapter = Object.freeze({
+          schema:
+            "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+          schema_version: 2,
+          configuration_digest: rawDigest(
+            `candidate-current-open-v3-cap-${candidateCount}-configuration-v1`,
+          ),
+          collectCurrentOpenCandidateAuthority:
+            currentOpen.collectProductionCandidateAuthority,
+          async finishLegacyCandidateInventoryAttempt() {
+            legacyFinishCalls += 1;
+            throw new Error("fresh current-open generation used legacy REST");
+          },
+        });
+        const verifier = provenanceVerifier({
+          eventName: "schedule",
+          ref: triggerIdentity.ref,
+          shaValue: triggerIdentity.sha,
+        });
+        const ledger = makeLedger(fixture, capability, verifier, null, {
+          candidateInventoryRefreshAdapter: refreshAdapter,
+        });
+        await ledger.bootstrapCapability();
+        const before = {
+          writes: fixture.writeCalls,
+          blobs: fixture.blobs.size,
+          trees: fixture.trees.size,
+          commits: fixture.commits.size,
+          ref: fixture.refTarget,
+        };
+
+        await assert.rejects(
+          ledger.reconcileCandidateInventoryRefreshAtomically({
+            workflow_command_handle:
+              await createScheduleWorkflowCommandHandle(),
+            trigger_identity: triggerIdentity,
+            repository_endpoint_receipt:
+              scheduleRepositoryEndpointReceipt(),
+          }),
+          (error) => error.code === expectedCode,
+        );
+
+        assert.equal(currentOpen.calls.length, candidateCount === 512 ? 14 : 6);
+        assert.equal(legacyFinishCalls, 0);
+        assert.deepEqual({
+          writes: fixture.writeCalls,
+          blobs: fixture.blobs.size,
+          trees: fixture.trees.size,
+          commits: fixture.commits.size,
+          ref: fixture.refTarget,
+        }, before);
+      });
+    }
+  });
+
 test("atomic refresh reconciliation rejects forged attempts and concurrent reentry",
   async (t) => {
     for (const accessorKey of [
@@ -6733,6 +10967,648 @@ test("atomic refresh reconciliation persists one candidate, recovers response lo
       });
   });
 
+test("current-open v3 reconciliation finishes one durable legacy cycle in place",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const transportFixture = candidateTransportFixture(1);
+    const cycle = await readCandidateInventoryCycle({ transportFixture });
+    const finishCalls = [];
+    let currentOpenCalls = 0;
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-refresh-legacy-finish-test-configuration-v1",
+      ),
+      async collectCurrentOpenCandidateAuthority() {
+        currentOpenCalls += 1;
+        throw new Error("legacy finish must not collect current-open evidence");
+      },
+      async finishLegacyCandidateInventoryAttempt(request) {
+        finishCalls.push(request);
+        return {
+          schema:
+            "codex-review-gate-git-ledger-candidate-inventory-legacy-finish-result-v2",
+          schema_version: 1,
+          request_handle: request.request_handle,
+          cycle_id: request.cycle_id,
+          start_record_oid: request.start_record_oid,
+          next_shard_index: request.next_shard_index,
+          initial_inventory: cycle.initial_inventory,
+          shard_receipts: cycle.shard_receipts,
+          final_inventory: cycle.final_inventory,
+          final_shard_receipts: cycle.final_shard_receipts,
+        };
+      },
+    });
+    const ledger = makeLedger(
+      fixture,
+      capability,
+      provenanceVerifier({
+        eventName: "schedule",
+        ref: triggerIdentity.ref,
+        shaValue: triggerIdentity.sha,
+      }),
+      null,
+      { candidateInventoryRefreshAdapter: refreshAdapter },
+    );
+    await ledger.bootstrapCapability();
+    const workflowCommandHandle = await createScheduleWorkflowCommandHandle();
+    let loaded = await ledger.load();
+    await appendCandidateInventoryPhase({
+      ledger,
+      loaded,
+      phase: "cycle-start",
+      initial: cycle.initial_inventory,
+    });
+    loaded = await ledger.load();
+    const incomplete = loaded.authority_projection.candidate_inventory
+      .incomplete_cycle;
+    assert.notEqual(incomplete, null);
+    const startRecordOid = incomplete.start_record_oid;
+    const patchCountBefore = fixture.calls.filter(({ method }) =>
+      method === "PATCH").length;
+    const result = await ledger.reconcileCandidateInventoryRefreshAtomically({
+      workflow_command_handle: workflowCommandHandle,
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    });
+    assert.equal(result.state, "persisted");
+    assert.equal(result.persistence_mode, "legacy-finish-v1");
+    assert.equal(result.publication_result.publication_outcome, "published");
+    assert.equal(currentOpenCalls, 0);
+    assert.equal(finishCalls.length, 1);
+    assert.equal(finishCalls[0].mode, "finish-existing");
+    assert.equal(finishCalls[0].query_state, "all");
+    assert.equal(finishCalls[0].start_record_oid, startRecordOid);
+    assert.equal(
+      fixture.calls.filter(({ method }) => method === "PATCH").length -
+        patchCountBefore,
+      1,
+    );
+    const final = await ledger.load();
+    const authority = final.authority_projection.candidate_inventory;
+    assert.equal(authority.incomplete_cycle, null);
+    assert.equal(authority.completed_cycle.start_record_oid, startRecordOid);
+    assert.equal(
+      final.records.filter((entry) =>
+        entry.envelope.record_type === "candidate-inventory-observation" &&
+        entry.envelope.payload.schema_version === 1 &&
+        entry.envelope.payload.phase === "cycle-start").length,
+      1,
+    );
+    assert.notEqual(
+      final.authority_projection.candidate_dispatch.active_reservation,
+      null,
+    );
+  });
+
+test("current-open v3 legacy finish is one-shot, recoverable, and bounded",
+  async (t) => {
+    await t.test("continues one exact durable shard prefix", async () => {
+      const cycle = directClosedCandidateInventoryCycle(257);
+      const attempt = await legacyIncompleteCandidateRefreshFixture({
+        candidateCount: 0,
+        cycleOverride: cycle,
+        seedShardCount: 1,
+      });
+      const before = await attempt.ledger.load();
+      const result = await attempt.ledger
+        .reconcileCandidateInventoryRefreshAtomically(attempt.input);
+      assert.equal(result.state, "persisted");
+      assert.equal(attempt.finishCalls.length, 1);
+      assert.equal(attempt.finishCalls[0].next_shard_index, 1);
+      assert.deepEqual(
+        attempt.finishCalls[0].completed_shard_receipts,
+        cycle.shard_receipts.slice(0, 1),
+      );
+      assert.equal(
+        result.publication_result.published_record_commit_shas.length,
+        3,
+        "remaining shard, same-cycle completion, and empty dispatch share one CAS",
+      );
+      const final = await attempt.ledger.load();
+      assert.equal(final.commit_count - before.commit_count, 3);
+      assert.equal(
+        final.authority_projection.candidate_inventory.completed_cycle
+          .start_record_oid,
+        before.authority_projection.candidate_inventory.incomplete_cycle
+          .start_record_oid,
+      );
+    });
+
+    await t.test(
+      "rejects future nested shard evidence before publication planning",
+      async () => {
+        const cycle = directClosedCandidateInventoryCycle(2);
+        let malicious = true;
+        let futureEvidenceAt = null;
+        const attempt = await legacyIncompleteCandidateRefreshFixture({
+          candidateCount: 2,
+          cycleOverride: cycle,
+          wrapFinishResult({ result }) {
+            if (!malicious) return result;
+            const writeFenceAt = new Date(
+              Date.parse(attempt.fixture.peekServerTime()) + 30_000,
+            ).toISOString();
+            futureEvidenceAt = new Date(
+              Date.parse(writeFenceAt) + 30_000,
+            ).toISOString();
+            attempt.fixture.overrideRefReadServerTimeAfter(
+              3,
+              writeFenceAt,
+            );
+            return {
+              ...result,
+              shard_receipts: [directCandidateShardReceiptWithEndpointTimes(
+                result.shard_receipts[0],
+                [futureEvidenceAt, result.shard_receipts[0].observed_at],
+              )],
+            };
+          },
+        });
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        };
+
+        await assert.rejects(
+          attempt.ledger.reconcileCandidateInventoryRefreshAtomically(
+            attempt.input,
+          ),
+          (error) => error.code === "candidate-inventory-cycle-stale",
+        );
+
+        assert.notEqual(futureEvidenceAt, null);
+        assert.equal(attempt.finishCalls.length, 1);
+        assert.equal(attempt.currentOpenCalls, 0);
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        }, before);
+
+        malicious = false;
+        const retry = await attempt.ledger
+          .reconcileCandidateInventoryRefreshAtomically(attempt.input);
+        assert.equal(retry.state, "persisted");
+        assert.equal(retry.persistence_mode, "legacy-finish-v1");
+        assert.equal(attempt.finishCalls.length, 2);
+      },
+    );
+
+    await t.test(
+      "authority replay rejects resealed future nested shard evidence",
+      async () => {
+        const attempt = await legacyIncompleteCandidateRefreshFixture({
+          candidateCount: 2,
+          cycleOverride: directClosedCandidateInventoryCycle(2),
+          seedShardCount: 1,
+        });
+        const loaded = await attempt.ledger.load();
+        const forged = structuredClone(loaded.records);
+        const shardEntry = forged.findLast((entry) =>
+          entry.envelope.record_type === "candidate-inventory-observation" &&
+          entry.envelope.payload.schema_version === 1 &&
+          entry.envelope.payload.phase === "shard");
+        assert.notEqual(shardEntry, undefined);
+        const futureEvidenceAt = new Date(
+          Date.parse(shardEntry.envelope.server_observed_at) + 1_000,
+        ).toISOString();
+        const payload = structuredClone(shardEntry.envelope.payload);
+        payload.shard_receipt = directCandidateShardReceiptWithEndpointTimes(
+          payload.shard_receipt,
+          [futureEvidenceAt, payload.shard_receipt.observed_at],
+        );
+        resealFixtureCandidateInventoryEnvelopePayload(
+          shardEntry.envelope,
+          payload,
+        );
+
+        assert.throws(
+          () => deriveV2GitLedgerCandidateInventoryAuthority(
+            forged,
+            REPOSITORY,
+          ),
+          (error) => error.code === "candidate-inventory-time",
+        );
+      },
+    );
+
+    await t.test(
+      "authority replay rejects transport regression hidden by predecessor top-level time",
+      async () => {
+        const attempt = await legacyIncompleteCandidateRefreshFixture({
+          candidateCount: 257,
+          cycleOverride: directClosedCandidateInventoryCycle(257),
+          seedShardCount: 2,
+        });
+        const loaded = await attempt.ledger.load();
+        const forged = structuredClone(loaded.records);
+        const shardEntries = forged.filter((entry) =>
+          entry.envelope.record_type === "candidate-inventory-observation" &&
+          entry.envelope.payload.schema_version === 1 &&
+          entry.envelope.payload.phase === "shard");
+        assert.equal(shardEntries.length, 2);
+        const priorRecordTime = Date.parse(
+          shardEntries[0].envelope.server_observed_at,
+        );
+        const initialTime = Date.parse(
+          forged.find((entry) =>
+            entry.envelope.record_type ===
+              "candidate-inventory-observation" &&
+            entry.envelope.payload.schema_version === 1 &&
+            entry.envelope.payload.phase === "cycle-start")
+            .envelope.payload.initial_inventory.observed_at,
+        );
+        assert.ok(priorRecordTime - initialTime >= 3);
+        const priorTopLevelTime = new Date(priorRecordTime - 2).toISOString();
+        const nextTime = new Date(priorRecordTime - 1).toISOString();
+        const priorNestedTime = new Date(priorRecordTime).toISOString();
+
+        const priorPayload = structuredClone(
+          shardEntries[0].envelope.payload,
+        );
+        priorPayload.shard_receipt =
+          directCandidateShardReceiptWithEndpointTimes(
+            priorPayload.shard_receipt,
+            priorPayload.shard_receipt.observations.map((_, index) =>
+              index === 0 ? priorNestedTime : priorTopLevelTime),
+          );
+        resealFixtureCandidateInventoryEnvelopePayload(
+          shardEntries[0].envelope,
+          priorPayload,
+        );
+
+        const nextEntryIndex = forged.indexOf(shardEntries[1]);
+        const nextPayload = structuredClone(
+          shardEntries[1].envelope.payload,
+        );
+        nextPayload.prior_candidate_authority_digest =
+          deriveV2GitLedgerCandidateInventoryAuthority(
+            forged.slice(0, nextEntryIndex),
+            REPOSITORY,
+          ).authority_digest;
+        nextPayload.shard_receipt =
+          directCandidateShardReceiptWithEndpointTimes(
+            nextPayload.shard_receipt,
+            nextPayload.shard_receipt.observations.map(() => nextTime),
+          );
+        resealFixtureCandidateInventoryEnvelopePayload(
+          shardEntries[1].envelope,
+          nextPayload,
+        );
+
+        assert.throws(
+          () => deriveV2GitLedgerCandidateInventoryAuthority(
+            forged,
+            REPOSITORY,
+          ),
+          (error) => error.code === "candidate-inventory-time",
+        );
+      },
+    );
+
+    await t.test("rejects a valid but different durable shard prefix",
+      async () => {
+        const cycle = directClosedCandidateInventoryCycle(257);
+        const alternate = {
+          ...cycle,
+          shard_receipts: directClosedCandidateShardReceipts(
+            cycle.initial_inventory,
+            "-alternate",
+          ),
+          final_shard_receipts: directClosedCandidateShardReceipts(
+            cycle.final_inventory,
+            "-alternate",
+          ),
+        };
+        const attempt = await legacyIncompleteCandidateRefreshFixture({
+          candidateCount: 0,
+          cycleOverride: cycle,
+          seedShardCount: 1,
+          wrapFinishResult({ result }) {
+            return {
+              ...result,
+              shard_receipts: alternate.shard_receipts,
+              final_shard_receipts: alternate.final_shard_receipts,
+            };
+          },
+        });
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        };
+        await assert.rejects(
+          attempt.ledger.reconcileCandidateInventoryRefreshAtomically(
+            attempt.input,
+          ),
+          (error) => error.code ===
+            "CANDIDATE_INVENTORY_LEGACY_FINISH_MISMATCH",
+        );
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        }, before);
+      });
+
+    await t.test("applied PATCH response loss", async () => {
+      const attempt = await legacyIncompleteCandidateRefreshFixture();
+      const loadedBefore = await attempt.ledger.load();
+      const patchCountBefore = attempt.fixture.calls.filter(({ method }) =>
+        method === "PATCH").length;
+      attempt.fixture.failNextCandidateInventoryUpdateAfterApply();
+      const result = await attempt.ledger
+        .reconcileCandidateInventoryRefreshAtomically(attempt.input);
+      assert.equal(result.state, "persisted");
+      assert.equal(result.publication_result.publication_outcome,
+        "recovered-after-apply");
+      assert.equal(result.publication_result.append_receipts.length, 0);
+      assert.equal(
+        result.publication_result.published_record_commit_shas.length,
+        attempt.cycle.shard_receipts.length + 2,
+      );
+      assert.equal(
+        attempt.fixture.calls.filter(({ method }) => method === "PATCH")
+          .length - patchCountBefore,
+        1,
+      );
+      const final = await attempt.ledger.load();
+      assert.equal(
+        final.commit_count - loadedBefore.commit_count,
+        attempt.cycle.shard_receipts.length + 2,
+      );
+      assert.equal(attempt.currentOpenCalls, 0);
+    });
+
+    await t.test("cloned and reused request handles", async () => {
+      let firstHandle = null;
+      let callbackIndex = 0;
+      const attempt = await legacyIncompleteCandidateRefreshFixture({
+        wrapFinishResult({ request, result }) {
+          callbackIndex += 1;
+          if (callbackIndex === 1) {
+            firstHandle = request.request_handle;
+            return {
+              ...result,
+              request_handle: structuredClone(request.request_handle),
+            };
+          }
+          return { ...result, request_handle: firstHandle };
+        },
+      });
+      const before = {
+        writes: attempt.fixture.writeCalls,
+        blobs: attempt.fixture.blobs.size,
+        trees: attempt.fixture.trees.size,
+        commits: attempt.fixture.commits.size,
+        ref: attempt.fixture.refTarget,
+      };
+      for (let index = 0; index < 2; index += 1) {
+        await assert.rejects(
+          attempt.ledger.reconcileCandidateInventoryRefreshAtomically(
+            attempt.input,
+          ),
+          (error) => error.code ===
+            "UNTRUSTED_CANDIDATE_INVENTORY_LEGACY_FINISH_RESULT",
+        );
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        }, before);
+      }
+      assert.equal(attempt.finishCalls.length, 2);
+      assert.equal(attempt.currentOpenCalls, 0);
+    });
+
+    await t.test("adapter evidence drift", async () => {
+      const attempt = await legacyIncompleteCandidateRefreshFixture({
+        wrapFinishResult({ result }) {
+          return {
+            ...result,
+            final_inventory: result.initial_inventory,
+            final_shard_receipts: result.shard_receipts,
+          };
+        },
+      });
+      const before = {
+        writes: attempt.fixture.writeCalls,
+        blobs: attempt.fixture.blobs.size,
+        trees: attempt.fixture.trees.size,
+        commits: attempt.fixture.commits.size,
+        ref: attempt.fixture.refTarget,
+      };
+      await assert.rejects(
+        attempt.ledger.reconcileCandidateInventoryRefreshAtomically(
+          attempt.input,
+        ),
+        (error) => new Set([
+          "CANDIDATE_INVENTORY_DRIFT",
+          "CANDIDATE_LIFECYCLE_DRIFT",
+        ]).has(error.code),
+      );
+      assert.deepEqual({
+        writes: attempt.fixture.writeCalls,
+        blobs: attempt.fixture.blobs.size,
+        trees: attempt.fixture.trees.size,
+        commits: attempt.fixture.commits.size,
+        ref: attempt.fixture.refTarget,
+      }, before);
+      assert.equal(attempt.currentOpenCalls, 0);
+    });
+
+    await t.test("durable source changes during the finish callback",
+      async () => {
+        let releaseFinish;
+        let markFinishStarted;
+        const finishStarted = new Promise((resolve) => {
+          markFinishStarted = resolve;
+        });
+        const finishGate = new Promise((resolve) => {
+          releaseFinish = resolve;
+        });
+        const attempt = await legacyIncompleteCandidateRefreshFixture({
+          async wrapFinishResult({ result }) {
+            markFinishStarted();
+            await finishGate;
+            return result;
+          },
+        });
+        const reconciliation = attempt.ledger
+          .reconcileCandidateInventoryRefreshAtomically(attempt.input);
+        await finishStarted;
+        const loaded = await attempt.ledger.load();
+        await appendCandidateInventoryPhase({
+          ledger: attempt.ledger,
+          loaded,
+          phase: "shard",
+          initial: attempt.cycle.initial_inventory,
+          shard: attempt.cycle.shard_receipts[0],
+        });
+        const afterSibling = {
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        };
+        releaseFinish();
+        await assert.rejects(
+          reconciliation,
+          (error) => error.code ===
+            "STALE_CANDIDATE_INVENTORY_LEGACY_FINISH_CLAIM",
+        );
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        }, afterSibling);
+        assert.equal(attempt.currentOpenCalls, 0);
+      });
+
+    await t.test("512-candidate tail capacity", async () => {
+      const attempt = await legacyIncompleteCandidateRefreshFixture({
+        candidateCount: 512,
+      });
+      const before = {
+        writes: attempt.fixture.writeCalls,
+        blobs: attempt.fixture.blobs.size,
+        trees: attempt.fixture.trees.size,
+        commits: attempt.fixture.commits.size,
+        ref: attempt.fixture.refTarget,
+      };
+      await assert.rejects(
+        attempt.ledger.reconcileCandidateInventoryRefreshAtomically(
+          attempt.input,
+        ),
+        (error) => error.code ===
+          "CANDIDATE_INVENTORY_LEGACY_FINISH_CAPACITY",
+      );
+      assert.deepEqual({
+        writes: attempt.fixture.writeCalls,
+        blobs: attempt.fixture.blobs.size,
+        trees: attempt.fixture.trees.size,
+        commits: attempt.fixture.commits.size,
+        ref: attempt.fixture.refTarget,
+      }, before);
+      assert.equal(attempt.finishCalls.length, 1);
+      assert.equal(attempt.currentOpenCalls, 0);
+    });
+  });
+
+test("compact hydrated replay rejects transport regression hidden by artifact top-level time",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const ledger = makeLedger(
+      fixture,
+      capability,
+      provenanceVerifier({
+        eventName: "schedule",
+        ref: triggerIdentity.ref,
+        shaValue: triggerIdentity.sha,
+      }),
+    );
+    await ledger.bootstrapCapability();
+    const cycle = await readIdentityDriftCandidateInventoryCycle({
+      transportFixture: candidateTransportFixture(2),
+      priorInventory: null,
+      listedNumbersAfterInitial: [3, 4],
+    });
+    await ledger.appendCandidateInventoryCycleIfRequired({
+      workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+      ...cycle,
+    });
+    const loaded = await ledger.load();
+    const startIndex = loaded.records.findIndex((entry) =>
+      entry.envelope.record_type === "candidate-inventory-observation" &&
+      entry.envelope.payload.schema_version === 2 &&
+      entry.envelope.payload.phase === "cycle-start");
+    const attemptIndex = loaded.records.findIndex((entry) =>
+      entry.envelope.record_type === "candidate-inventory-observation" &&
+      entry.envelope.payload.schema_version === 2 &&
+      entry.envelope.payload.phase === "attempt");
+    assert.ok(startIndex >= 0 && attemptIndex > startIndex);
+    const forged = loaded.records.slice(0, attemptIndex + 1)
+      .map((entry) => structuredClone(entry));
+    const startEntry = forged[startIndex];
+    const attemptEntry = forged[attemptIndex];
+    assert.equal(attemptEntry.envelope.payload.attempt_count, 2);
+
+    const evidence = structuredClone(cycle.drift_attempts[0]);
+    assert.equal(evidence.shard_receipts.length, 1);
+    assert.equal(evidence.shard_receipts[0].observations.length, 2);
+    const priorTopLevelTime = evidence.shard_receipts[0].observed_at;
+    const priorNestedTime = attemptEntry.envelope.server_observed_at;
+    assert.ok(
+      Date.parse(priorNestedTime) - Date.parse(priorTopLevelTime) >= 2,
+    );
+    evidence.shard_receipts[0] =
+      directCandidateShardReceiptWithEndpointTimes(
+        evidence.shard_receipts[0],
+        evidence.shard_receipts[0].observations.map((_, index) =>
+          index === 0 ? priorNestedTime : priorTopLevelTime),
+      );
+    const manifest = resealFixtureCandidateInventoryAttemptManifest(
+      attemptEntry.envelope.payload.attachment_manifest,
+      evidence,
+    );
+
+    const startPayload = structuredClone(startEntry.envelope.payload);
+    startPayload.expected_attempt_evidence_digests[0] =
+      manifest.attempt_evidence_digest;
+    resealFixtureCandidateInventoryEnvelopePayload(
+      startEntry.envelope,
+      startPayload,
+    );
+    const attemptPayload = structuredClone(attemptEntry.envelope.payload);
+    attemptPayload.prior_candidate_authority_digest =
+      deriveV2GitLedgerCandidateInventoryAuthority(
+        forged.slice(0, attemptIndex),
+        REPOSITORY,
+      ).authority_digest;
+    attemptPayload.expected_attempt_evidence_digests[0] =
+      manifest.attempt_evidence_digest;
+    attemptPayload.attempt_evidence_digest =
+      manifest.attempt_evidence_digest;
+    attemptPayload.attachment_manifest = manifest;
+    resealFixtureCandidateInventoryEnvelopePayload(
+      attemptEntry.envelope,
+      attemptPayload,
+    );
+    attemptEntry.candidate_inventory_attachment_evidence = evidence;
+
+    assert.throws(
+      () => deriveV2GitLedgerCandidateInventoryAuthority(forged, REPOSITORY),
+      (error) => error.code === "candidate-inventory-time",
+    );
+  });
+
 test("compact atomic restart preserves scheduled scope through terminal ACK",
   async () => {
     const runIdentity = { ...OWNER };
@@ -6860,6 +11736,8 @@ test("compact atomic restart preserves scheduled scope through terminal ACK",
       commits: attempt.fixture.commits.size,
       ref: attempt.fixture.refTarget,
     };
+    runIdentity.run_id = OWNER.run_id;
+    runIdentity.run_attempt = OWNER.run_attempt;
     await assert.rejects(
       appendCandidateInventoryPhase({
         ledger: restarted,
@@ -7141,6 +12019,217 @@ test("atomic refresh reconciliation exposes typed capacity boundaries without ad
           ref: fixture.refTarget,
         }, before);
       });
+
+    await t.test("current-open v3 publishes at 4094 and checkpoints at 4095 and 4096",
+      async () => {
+        const fixture = githubGitFixture();
+        const capability = scheduleCapabilityReceipt();
+        const triggerIdentity = scheduleTriggerIdentity();
+        const verifier = provenanceVerifier({
+          eventName: "schedule",
+          ref: triggerIdentity.ref,
+          shaValue: triggerIdentity.sha,
+        });
+        const currentOpen = currentOpenSuppressionAdapterFixture({
+          initialNumbers: [],
+        });
+        let legacyFinishCalls = 0;
+        const refreshAdapter = Object.freeze({
+          schema:
+            "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+          schema_version: 2,
+          configuration_digest: rawDigest(
+            "candidate-current-open-v3-saturated-epoch-configuration-v1",
+          ),
+          collectCurrentOpenCandidateAuthority:
+            currentOpen.collectProductionCandidateAuthority,
+          async finishLegacyCandidateInventoryAttempt() {
+            legacyFinishCalls += 1;
+            throw new Error("capacity boundary used legacy REST");
+          },
+        });
+        const ledger = makeLedger(
+          fixture,
+          capability,
+          verifier,
+          null,
+          { candidateInventoryRefreshAdapter: refreshAdapter },
+        );
+        await ledger.bootstrapCapability();
+        await padOrdinaryLedgerWithStandaloneAttestations({
+          fixture,
+          verifier,
+          targetCommitCount: MAX_V2_GIT_LEDGER_COMMITS - 2,
+        });
+        assert.equal(
+          fixtureEnvelopeAt(fixture, fixture.refTarget).sequence + 1,
+          MAX_V2_GIT_LEDGER_COMMITS - 2,
+        );
+        assert.equal(
+          (await ledger.load()).commit_count,
+          MAX_V2_GIT_LEDGER_COMMITS - 2,
+        );
+        const boundary4094 = fixture.snapshotHistoricalState();
+        const input = async () => ({
+          workflow_command_handle: await createScheduleWorkflowCommandHandle(),
+          trigger_identity: triggerIdentity,
+          repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+        });
+        const snapshot = () => ({
+          writes: fixture.writeCalls,
+          patches: fixture.calls.filter(({ method }) => method === "PATCH")
+            .length,
+          blobs: fixture.blobs.size,
+          trees: fixture.trees.size,
+          commits: fixture.commits.size,
+          ref: fixture.refTarget,
+        });
+        const callsBeforePublish = currentOpen.calls.length;
+        const beforePublish = snapshot();
+        const published = await ledger
+          .reconcileCandidateInventoryRefreshAtomically(await input());
+        assert.equal(published.state, "persisted");
+        assert.equal(published.publication_result.final_commit_count,
+          MAX_V2_GIT_LEDGER_COMMITS);
+        assert.equal(published.publication_result
+          .published_record_commit_shas.length, 2);
+        assert.equal(currentOpen.calls.length - callsBeforePublish, 4);
+        assert.equal(fixture.commits.size - beforePublish.commits, 2);
+        assert.equal(
+          fixture.calls.filter(({ method }) => method === "PATCH").length -
+            beforePublish.patches,
+          1,
+        );
+
+        fixture.restoreHistoricalState(boundary4094);
+        const assertCheckpointAt = async (targetCommitCount) => {
+          await padOrdinaryLedgerWithStandaloneAttestations({
+            fixture,
+            verifier,
+            targetCommitCount,
+          });
+          assert.equal(
+            fixtureEnvelopeAt(fixture, fixture.refTarget).sequence + 1,
+            targetCommitCount,
+          );
+          assert.equal((await ledger.load()).commit_count, targetCommitCount);
+          const before = snapshot();
+          const callsBefore = currentOpen.calls.length;
+          const result = await ledger
+            .reconcileCandidateInventoryRefreshAtomically(await input());
+          assert.equal(result.state, "checkpoint-required");
+          assert.equal(
+            result.reason,
+            "candidate-inventory-checkpoint-required",
+          );
+          assert.equal(result.persistence_mode, null);
+          assert.equal(result.suppression_result, null);
+          assert.equal(result.publication_result, null);
+          assert.equal(Object.isFrozen(result), true);
+          assertNoCandidateRefreshPrivateAuthority(result);
+          assert.equal(currentOpen.calls.length - callsBefore, 4);
+          assert.deepEqual(snapshot(), before);
+        };
+        await assertCheckpointAt(MAX_V2_GIT_LEDGER_COMMITS - 1);
+        await assertCheckpointAt(MAX_V2_GIT_LEDGER_COMMITS);
+        assert.equal(legacyFinishCalls, 0);
+      });
+
+    await t.test(
+      "a saturated terminal nonempty generation suppresses an equivalent scan",
+      async () => {
+        const attempt =
+          await createCurrentOpenV3ScheduledCandidateDispatchAttempt();
+        await completeScheduledCandidateDispatchAttempt(attempt);
+        attempt.fixture.freezeServerTime();
+        await padOrdinaryLedgerWithStandaloneAttestations({
+          fixture: attempt.fixture,
+          verifier: attempt.verifier,
+          targetCommitCount: MAX_V2_GIT_LEDGER_COMMITS,
+          templateCommitSha: attempt.capabilityAttestationCommitSha,
+        });
+        const ledger = makeLedger(
+          attempt.fixture,
+          attempt.capability,
+          attempt.verifier,
+          attempt.preflight,
+          { candidateInventoryRefreshAdapter: attempt.refreshAdapter },
+        );
+        const saturated = await ledger.load();
+        assert.equal(saturated.commit_count, MAX_V2_GIT_LEDGER_COMMITS);
+        assert.equal(
+          saturated.authority_projection.candidate_dispatch.current_cycle
+            .cycle_complete,
+          true,
+        );
+        assert.equal(
+          saturated.authority_projection.candidate_dispatch
+            .active_reservation,
+          null,
+        );
+        const before = {
+          writes: attempt.fixture.writeCalls,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        };
+        const currentOpenCallsBefore = attempt.currentOpen.calls.length;
+        attempt.runIdentity.run_id = "9097";
+        attempt.runIdentity.run_attempt = 1;
+
+        const result = await ledger.reconcileCandidateInventoryRefreshAtomically({
+          ...attempt.input,
+          workflow_command_handle: await createScheduleWorkflowCommandHandle({
+            runIdentity: attempt.runIdentity,
+          }),
+        });
+
+        assert.equal(result.state, "suppressed");
+        assert.equal(result.reason, "semantic-unchanged-not-due");
+        assert.equal(result.persistence_mode, null);
+        assert.equal(result.publication_result, null);
+        assert.equal(result.suppression_result.state, "suppressed");
+        assert.equal(
+          result.suppression_result.assurance,
+          "authenticated-current-open-terminal-not-due",
+        );
+        assert.equal(result.suppression_result.writes_performed, false);
+        assert.equal(Object.isFrozen(result), true);
+        assert.equal(Object.isFrozen(result.suppression_result), true);
+        assertNoCandidateRefreshPrivateAuthority(result);
+        assert.equal(
+          attempt.currentOpen.calls.length - currentOpenCallsBefore,
+          4,
+        );
+        assert.equal(attempt.legacyFinishCalls(), 0);
+        assert.deepEqual({
+          writes: attempt.fixture.writeCalls,
+          patches: attempt.fixture.calls.filter(({ method }) =>
+            method === "PATCH").length,
+          blobs: attempt.fixture.blobs.size,
+          trees: attempt.fixture.trees.size,
+          commits: attempt.fixture.commits.size,
+          ref: attempt.fixture.refTarget,
+        }, before);
+        const after = await ledger.load();
+        assert.equal(after.commit_count, MAX_V2_GIT_LEDGER_COMMITS);
+        assert.equal(
+          after.authority_projection.candidate_inventory.authority_digest,
+          saturated.authority_projection.candidate_inventory.authority_digest,
+        );
+        assert.equal(
+          after.authority_projection.candidate_dispatch.authority_digest,
+          saturated.authority_projection.candidate_dispatch.authority_digest,
+        );
+        assert.deepEqual(
+          after.authority_projection.candidate_dispatch.current_cycle,
+          saturated.authority_projection.candidate_dispatch.current_cycle,
+        );
+      },
+    );
 
     await t.test("512 candidates exceed a fresh epoch before Git staging",
       async () => {
@@ -8479,16 +13568,8 @@ test("candidate inventory fails closed on missing shards, wrong trigger, and shr
     ref: "refs/heads/main",
     shaValue: BASE,
   });
-  const restricted = createV2GitHubGitLedgerBootstrap({
-    fetch: fixture.fetch,
-    token: SYNTHETIC_BEARER,
-    repository: REPOSITORY,
-    ledgerRef: V2_GIT_LEDGER_REF,
-    restBaseUrl: "https://api.github.test",
-    bootstrapCapabilityInput: bootstrapInputForCapability(capability),
-    verifyWorkflowProvenance: verifier,
-  });
-  const { ledger } = await restricted.bootstrapCapability();
+  const ledger = makeLedger(fixture, capability, verifier);
+  await ledger.bootstrapCapability();
   const transportFixture = candidateTransportFixture(2);
   const transport = createV2GitHubCandidateInventory({
     fetch: transportFixture.fetch,
@@ -8846,6 +13927,10 @@ test("candidate dispatch compacts one regular full batch under its public cap",
       reserved.plan,
       0,
     );
+    assert.deepEqual(Object.keys(firstBinding).sort(), [
+      "batch_count", "batch_index", "candidate", "cycle_id",
+      "dispatch_digest", "generation_id", "inventory_digest",
+    ]);
     assert.deepEqual(firstBinding.candidate, reserved.plan.items[0].candidate);
     assert.equal(firstBinding.generation_id, reserved.plan.generation_id);
     assert.equal(firstBinding.cycle_id, reserved.plan.cycle_id);
@@ -9533,7 +14618,7 @@ test("checkpoint seed preserves Q0 future queries across an autonomous ref load"
         phase: "cycle-start",
         initial: context.cycle.final_inventory,
       }),
-      (error) => error.code === "CHECKPOINT_EPOCH_READ_ONLY",
+      (error) => error.code === "CHECKPOINT_STATE_BINDING",
     );
     assert.equal(context.fixture.writeCalls, writesBeforeRejectedMutation);
     assert.deepEqual({
@@ -10752,7 +15837,7 @@ test("compact candidate inventory and durable dispatch retain exact record capac
   );
 });
 
-test("candidate dispatch rejects request-binding stages that skip scheduler authority",
+test("candidate dispatch raw gate and replay reject request-binding stages that skip scheduler authority",
   async () => {
     const attempt = await createScheduledCandidateDispatchAttempt();
     const loaded = await attempt.ledger.load();
@@ -10819,11 +15904,23 @@ test("candidate dispatch rejects request-binding stages that skip scheduler auth
           evaluated_scope_receipt:
             attempt.discovery.effect_evaluated_scope_receipt,
         }),
-        (error) => error.code === "candidate-dispatch-attempt-order",
+        (error) => error.code === "UNTRUSTED_RAW_EFFECT_APPEND",
       );
       assert.equal(attempt.fixture.writeCalls, writesBefore);
       assert.equal(attempt.fixture.refTarget, tipBefore);
     }
+    const historicalTip = attempt.fixture.refTarget;
+    await assert.rejects(
+      materializeHistoricalProductionRecord({
+        ledger: attempt.ledger,
+        loaded,
+        record: skippedIntent,
+        evaluatedScopeReceipt:
+          attempt.discovery.effect_evaluated_scope_receipt,
+      }),
+      (error) => error.code === "candidate-dispatch-attempt-order",
+    );
+    assert.equal(attempt.fixture.refTarget, historicalTip);
   });
 
 test("candidate dispatch binds one released scheduled terminal result before ack", async () => {
@@ -11001,6 +16098,45 @@ test("candidate dispatch binds one released scheduled terminal result before ack
     (await ledger.load()).tip_commit_sha,
     beforeReplayedAttempt.tip_commit_sha,
   );
+  const originalAcquire = fixtureEnvelopeAt(
+    fixture,
+    discovery.lease_receipt.acquire_commit_sha,
+  );
+  const duplicateAcquiredAt = beforeReplayedAttempt.post_ref.server_time;
+  const duplicateAcquire = {
+    record_type: originalAcquire.record_type,
+    predecessor_commit_sha: beforeReplayedAttempt.tip_commit_sha,
+    pull_request: structuredClone(originalAcquire.pull_request),
+    head_ref_oid: originalAcquire.head_ref_oid,
+    base_ref_oid: originalAcquire.base_ref_oid,
+    potential_merge_commit_oid: originalAcquire.potential_merge_commit_oid,
+    kind: originalAcquire.kind,
+    effect_id: originalAcquire.effect_id,
+    idempotency_key: originalAcquire.idempotency_key,
+    server_observed_at: duplicateAcquiredAt,
+    payload: {
+      ...structuredClone(originalAcquire.payload),
+      acquired_at: duplicateAcquiredAt,
+      expires_at: new Date(
+        Date.parse(duplicateAcquiredAt) +
+          originalAcquire.payload.lease_ttl_seconds * 1_000,
+      ).toISOString(),
+    },
+    control_comment_binding:
+      structuredClone(originalAcquire.control_comment_binding),
+    lease: null,
+  };
+  const historicalTip = fixture.refTarget;
+  await assert.rejects(
+    materializeHistoricalProductionRecord({
+      ledger,
+      loaded: beforeReplayedAttempt,
+      record: duplicateAcquire,
+      evaluatedScopeReceipt: stalePreScopeReceipt,
+    }),
+    (error) => error.code === "candidate-dispatch-attempt-replayed",
+  );
+  assert.equal(fixture.refTarget, historicalTip);
   const terminalResult = candidateDispatchTerminalResult({
     decision: plan.scheduler_evaluation.decision,
     schedulerAppend,
@@ -13034,12 +18170,29 @@ test("provider event authority is pre-read, leased, fully rediscovered, and exac
     ledger.appendRecord(effect, {
       evaluated_scope_receipt: preScopeReceipt,
     }),
-    (error) => error.code === "full-discovery-receipt-required",
+    (error) => error.code === "UNTRUSTED_RAW_EFFECT_APPEND",
   );
   assert.equal(fixture.writeCalls, writesBeforePreScopeEffect);
-  const effectReceipt = await ledger.appendRecord(effect, {
+  const controlPlaneAuthority = await ledger.loadControlPlaneAuthority(
+    fullScopeReceipt.scope,
+  );
+  const initialAuthority = await ledger.loadInitialRunnerStateAuthority({
+    control_plane_authority: controlPlaneAuthority,
     evaluated_scope_receipt: fullScopeReceipt,
+    workflow_command_handle: command,
   });
+  const observationPlan = schedulerObservationRecord({
+    predecessor: lease.acquire_commit_sha,
+    lease,
+    priorAuthorityDigest: initialAuthority.prior_authority_digest,
+    initialAuthority,
+  }).payload.action;
+  const schedulerAppend = await ledger.appendInitialSchedulerObservation({
+    initial_runner_state_authority: initialAuthority,
+    scheduler_evaluation: observationPlan.scheduler_evaluation,
+    status_plan: observationPlan.status_plan,
+  });
+  const effectReceipt = schedulerAppend.append_receipt;
   const release = await ledger.releaseLease({
     predecessor_commit_sha: effectReceipt.commit_sha,
     lease_receipt: lease,
@@ -13410,7 +18563,7 @@ test("manual PR authority comes only from one protected workflow command and sta
     workflow_command_handle: command,
   });
   const beforeObservation = await ledger.load();
-  const observationRecord = schedulerObservationRecord({
+  const observationPlan = schedulerObservationRecord({
     predecessor: lease.acquire_commit_sha,
     lease,
     priorAuthorityDigest: priorRunnerAuthorityDigest(
@@ -13421,64 +18574,23 @@ test("manual PR authority comes only from one protected workflow command and sta
     idempotencyKey: "manual-scheduler-observation-key",
     initialAuthority,
   });
-  const observation = await ledger.appendRecord(observationRecord, {
-    evaluated_scope_receipt: fullManualReceipt,
+  const schedulerAppend = await ledger.appendInitialSchedulerObservation({
     initial_runner_state_authority: initialAuthority,
+    scheduler_evaluation:
+      observationPlan.payload.action.scheduler_evaluation,
+    status_plan: observationPlan.payload.action.status_plan,
   });
+  const observationRecord = schedulerAppend.record;
+  const observation = schedulerAppend.append_receipt;
   assert.deepEqual(observationRecord.payload.action.scheduler_plan.actions, []);
 
-  const generation = automaticGeneration(1);
-  const reservation = requestReservation({
-    generation,
-    schedulerIntentId: "v2-request:" + "1".repeat(64),
-  });
-  const attemptedPublication = effectAttemptRecord({
-    predecessor: observation.commit_sha,
-    lease,
-    generation,
-    observationRecordOid: observation.commit_sha,
-    reservationRecordOid: "2".repeat(40),
-    reservation,
-    schedulerActionKey: "manual-forbidden-post",
-  });
   const writesBeforeAttempt = fixture.writeCalls;
   await assert.rejects(
-    ledger.appendRecord(attemptedPublication, {
-      evaluated_scope_receipt: fullManualReceipt,
+    ledger.appendAutomaticRequestReservation({
+      scheduler_append: schedulerAppend,
     }),
-    (error) => error.code === "manual-publication-forbidden",
-  );
-  assert.equal(fixture.writeCalls, writesBeforeAttempt);
-
-  const commentPublication = createV2GitLedgerRecord({
-    record_type: "effect-intent",
-    predecessor_commit_sha: observation.commit_sha,
-    pull_request: PR,
-    head_ref_oid: HEAD,
-    base_ref_oid: BASE,
-    potential_merge_commit_oid: POTENTIAL,
-    kind: "control-comment-create",
-    effect_id: "manual-forbidden-comment",
-    idempotency_key: "manual-forbidden-comment-key",
-    server_observed_at: TIME,
-    payload: effectPayload({
-      phase: "intent",
-      kind: "control-comment-create",
-      predecessor: observation.commit_sha,
-      action: {
-        method: "POST",
-        body_digest: `sha256:${"5".repeat(64)}`,
-        pre_comment_inventory_digest: `sha256:${"6".repeat(64)}`,
-      },
-    }),
-    control_comment_binding: null,
-    lease: leaseBinding(lease),
-  });
-  await assert.rejects(
-    ledger.appendRecord(commentPublication, {
-      evaluated_scope_receipt: fullManualReceipt,
-    }),
-    (error) => error.code === "manual-publication-forbidden",
+    (error) => error.code ===
+      "automatic-reservation-scheduler-actions-required",
   );
   assert.equal(fixture.writeCalls, writesBeforeAttempt);
 
@@ -13760,6 +18872,34 @@ function resealFixtureProductionEnvelopePayload(envelope, payload) {
   resealEnvelope(envelope);
 }
 
+function resealFixtureCandidateInventoryEnvelopePayload(envelope, payload) {
+  envelope.payload = structuredClone(payload);
+  envelope.payload_digest = digestV2GitLedgerPayload(envelope.payload);
+  const binding = envelope.workflow_provenance.operation_binding;
+  const evaluated = binding.evaluated_scope_receipt;
+  binding.evaluated_scope_receipt =
+    createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
+      repository: envelope.repository,
+      payload: envelope.payload,
+      trigger_identity: {
+        event_name: evaluated.trigger_event_name,
+        ref: evaluated.trigger_ref,
+        sha: evaluated.trigger_sha,
+      },
+      repository_endpoint_receipt: evaluated.scope_endpoint_receipt,
+    });
+  binding.record_identity.payload_digest = envelope.payload_digest;
+  resealProvenance(envelope.workflow_provenance);
+  resealEnvelope(envelope);
+  if (Object.hasOwn(envelope, "public_envelope_digest")) {
+    delete envelope.public_envelope_digest;
+    envelope.public_envelope_digest = digestCanonical(
+      "codex-review-gate-v2-git-ledger-public-envelope",
+      envelope,
+    );
+  }
+}
+
 function resealFixtureAutomaticRecoveryCandidateAuthority(
   authorityValue,
   candidatesValue,
@@ -13968,7 +19108,11 @@ async function readDriftingCandidateInventoryAttempt({
 }
 
 function maximumClosedCandidateInventoryCycle() {
-  const candidates = Array.from({ length: 25_599 }, (_, index) => {
+  return directClosedCandidateInventoryCycle(25_599);
+}
+
+function directClosedCandidateInventoryCycle(candidateCount) {
+  const candidates = Array.from({ length: candidateCount }, (_, index) => {
     const number = index + 1;
     return {
       id: String(1_000_000 + number),
@@ -14081,7 +19225,7 @@ function directCandidateInventory({ candidates, priorInventoryDigest }) {
   });
 }
 
-function directClosedCandidateShardReceipts(inventory) {
+function directClosedCandidateShardReceipts(inventory, receiptSalt = "") {
   const repository = candidateRepository();
   const repoIdentity = {
     id: repository.id,
@@ -14112,7 +19256,7 @@ function directClosedCandidateShardReceipts(inventory) {
         status: 200,
         server_time: TIME,
         raw_body_sha256: rawDigest(
-          `closed-candidate-${candidate.number}`,
+          `closed-candidate-${candidate.number}${receiptSalt}`,
         ),
       },
     }));
@@ -14136,6 +19280,112 @@ function directClosedCandidateShardReceipts(inventory) {
       ),
     };
   });
+}
+
+function directCandidateShardReceiptWithEndpointTimes(receiptValue, times) {
+  const receipt = structuredClone(receiptValue);
+  assert.equal(receipt.observations.length, times.length);
+  receipt.observations = receipt.observations.map((observation, index) => ({
+    ...observation,
+    endpoint_receipt: {
+      ...observation.endpoint_receipt,
+      server_time: times[index],
+    },
+  }));
+  receipt.observed_at = times.at(-1);
+  delete receipt.receipt_digest;
+  return {
+    ...receipt,
+    receipt_digest: candidateDigestCanonical(
+      "codex-review-gate-v2-candidate-shard",
+      receipt,
+    ),
+  };
+}
+
+function resealFixtureCandidateInventoryAttemptManifest(
+  manifestValue,
+  evidence,
+) {
+  const manifest = structuredClone(manifestValue);
+  const values = [
+    evidence.initial_inventory,
+    ...evidence.shard_receipts,
+    evidence.final_inventory,
+    ...evidence.final_shard_receipts,
+  ];
+  assert.equal(manifest.artifacts.length, values.length);
+  let totalDecodedBytes = 0;
+  let totalEncodedBytes = 0;
+  const artifacts = manifest.artifacts.map((artifact, index) => {
+    const value = values[index];
+    const decoded = Buffer.from(canonicalJson(value), "utf8");
+    const encoded = deflateRawSync(decoded, { level: 9 });
+    assert.equal(artifact.chunks.length, 1);
+    const chunk = {
+      path: artifact.chunks[0].path,
+      chunk_index: 0,
+      byte_length: encoded.byteLength,
+      blob_sha: gitObjectSha("blob", encoded),
+      sha256: rawDigest(encoded),
+    };
+    totalDecodedBytes += decoded.byteLength;
+    totalEncodedBytes += encoded.byteLength;
+    return {
+      ...artifact,
+      receipt_digest: value.receipt_digest,
+      observed_at: value.observed_at,
+      decoded_byte_length: decoded.byteLength,
+      decoded_sha256: rawDigest(decoded),
+      encoded_byte_length: encoded.byteLength,
+      encoded_sha256: rawDigest(encoded),
+      chunk_count: 1,
+      chunks: [chunk],
+    };
+  });
+  const semanticArtifacts = artifacts.map((artifact) => ({
+    role: artifact.role,
+    shard_index: artifact.shard_index,
+    receipt_digest: artifact.receipt_digest,
+    observed_at: artifact.observed_at,
+    decoded_byte_length: artifact.decoded_byte_length,
+    decoded_sha256: artifact.decoded_sha256,
+  }));
+  const chunks = artifacts.flatMap((artifact) => artifact.chunks);
+  const treeBytes = canonicalGitTreeBytes(chunks.map((chunk) => ({
+    path: chunk.path,
+    mode: "100644",
+    type: "blob",
+    sha: chunk.blob_sha,
+  })));
+  const withoutDigest = {
+    ...manifest,
+    attempt_evidence_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-attempt-evidence",
+      {
+        repository: manifest.repository,
+        attempt_index: manifest.attempt_index,
+        attempt_count: manifest.attempt_count,
+        outcome: manifest.outcome,
+        artifacts: semanticArtifacts,
+      },
+    ),
+    artifact_count: artifacts.length,
+    artifacts,
+    chunk_count: chunks.length,
+    total_encoded_bytes: totalEncodedBytes,
+    total_decoded_bytes: totalDecodedBytes,
+    attachment_tree_sha: gitObjectSha("tree", treeBytes),
+    attachment_tree_sha256: rawDigest(treeBytes),
+  };
+  delete withoutDigest.manifest_digest;
+  return {
+    ...withoutDigest,
+    manifest_digest: digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-attachment-manifest",
+      withoutDigest,
+    ),
+  };
 }
 
 async function readIdentityDriftCandidateInventoryCycle({
@@ -14363,7 +19613,384 @@ async function createCompactScheduledCandidateDispatchAttempt({
   };
 }
 
-async function completeScheduledCandidateDispatchAttempt(attempt) {
+async function prepareCompactCandidateDispatchItem({
+  fixture,
+  capability,
+  verifier,
+  preflight,
+  refreshAdapter,
+  triggerIdentity,
+  runIdentity,
+  binding,
+  runId,
+}) {
+  runIdentity.run_id = runId;
+  runIdentity.run_attempt = 1;
+  const candidate = binding.candidate;
+  const number = candidate.number;
+  const nodeId = candidate.node_id;
+  const headOid = candidate.head_ref_oid;
+  const baseOid = candidate.base_ref_oid;
+  const headRefName = `candidate-${number}`;
+  const ledger = makeLedger(
+    fixture,
+    capability,
+    verifier,
+    preflight,
+    { candidateInventoryRefreshAdapter: refreshAdapter },
+  );
+  const scheduledCommand = await createScheduleWorkflowCommandHandle({
+    pullRequestNumber: number,
+    dispatchBinding: binding,
+    runIdentity,
+  });
+  const minimal = await loadFixtureMinimalScopeForCandidate(
+    number,
+    headOid,
+    headRefName,
+    nodeId,
+    TIME,
+  );
+  const scheduled = await ledger.loadCandidateDispatchForScheduledPullRequest({
+    workflow_command_handle: scheduledCommand,
+    minimal_scope_handle: minimal,
+    trigger_identity: triggerIdentity,
+    expected_dispatch_binding: binding,
+  });
+  const preScopeReceipt = await ledger
+    .loadScheduledPullRequestEvaluatedScopeReceipt({
+      candidate_dispatch_handle: scheduled.candidate_dispatch_handle,
+      minimal_scope_handle: minimal,
+      trigger_identity: triggerIdentity,
+    });
+  let discoveryServerTime = Date.parse(TIME);
+  const nextDiscoveryServerTime = () => {
+    discoveryServerTime = Math.max(
+      discoveryServerTime + 1_000,
+      Date.parse(fixture.peekServerTime()) + 1_000,
+    );
+    return new Date(discoveryServerTime).toISOString();
+  };
+  const discovery = await acquireFixtureLeasedDiscovery({
+    ledger,
+    command: scheduledCommand,
+    preScopeReceipt,
+    minimalPre: minimal,
+    minimalFetch: (url, init) => minimalScopeFetchForCandidate({
+      number,
+      nodeId,
+      headOid,
+      headRefName,
+      serverTime: nextDiscoveryServerTime(),
+      urlValue: url,
+      init,
+    }),
+    transport: createProviderTransport(providerTransportFixture({
+      nextServerTime: nextDiscoveryServerTime,
+      comment: null,
+      headOid,
+      headRefName,
+      pullRequestNumber: number,
+      pullRequestNodeId: nodeId,
+    }).fetch),
+  });
+  return {
+    fixture,
+    capability,
+    verifier,
+    preflight,
+    refreshAdapter,
+    triggerIdentity,
+    runIdentity,
+    ledger,
+    binding,
+    scheduledCommand,
+    scheduled,
+    preScopeReceipt,
+    discovery,
+    schedulerScope: {
+      pullRequest: { number, node_id: nodeId },
+      headOid,
+      baseOid,
+      potentialMergeCommitOid: POTENTIAL,
+      statusIdempotencyKey: `status:mature-checkpoint-${number}`,
+      decision: "clean",
+    },
+  };
+}
+
+async function matureQuiescentCheckpointSourceFixture() {
+  const runIdentity = { ...OWNER };
+  const preflight = await loadFixtureProviderPreflight();
+  const checkpointNumbers = Array.from(
+    { length: 255 },
+    (_, index) => index + 1,
+  );
+  let checkpointCollection = false;
+  const source = await stableEmptyCandidateRefreshReconciliationFixture({
+    currentOpenNumbers: [PR.number, PR.number + 1],
+    fullTransportOptions: {
+      exactScopeCandidateNumber: PR.number,
+    },
+    preflightHandle: preflight,
+    runIdentity,
+    collectAttempt: async ({ request, fullTransport, defaultCollectAttempt }) => {
+      if (!checkpointCollection) return defaultCollectAttempt(request);
+      if (request.attempt_index === 0) {
+        return readDriftingCandidateInventoryAttempt({
+          request,
+          transportFixture: fullTransport,
+          finalNumbers: checkpointNumbers,
+        });
+      }
+      return defaultCollectAttempt(request);
+    },
+  });
+  source.fullTransport.setListedNumbers([PR.number, PR.number + 1]);
+  const publication = await source.ledger
+    .reconcileCandidateInventoryRefreshAtomically(source.input);
+  assert.equal(publication.state, "persisted");
+  const reserved = await source.ledger.loadOrReserveCandidateDispatch(
+    source.input,
+  );
+  assert.equal(reserved.state, "dispatch");
+  assert.equal(reserved.plan.items.length, 2);
+  source.fixture.freezeServerTime();
+  const originalBindings = reserved.plan.items.map((_, index) =>
+    projectV2GitLedgerCandidateDispatchBinding(reserved.plan, index));
+
+  const first = await prepareCompactCandidateDispatchItem({
+    ...source,
+    preflight,
+    runIdentity,
+    binding: originalBindings[0],
+    runId: "9600",
+  });
+  const firstCompletion = await completeScheduledCandidateDispatchAttempt(
+    first,
+    { expectCycleComplete: false },
+  );
+  assert.deepEqual(
+    firstCompletion.ack.remaining_plan.items.map((_, index) =>
+      projectV2GitLedgerCandidateDispatchBinding(
+        firstCompletion.ack.remaining_plan,
+        index,
+      )),
+    originalBindings.slice(1),
+  );
+
+  const second = await prepareCompactCandidateDispatchItem({
+    ...source,
+    preflight,
+    runIdentity,
+    binding: originalBindings[1],
+    runId: "9600",
+  });
+  await assert.rejects(
+    completeScheduledCandidateDispatchAttempt(second, {
+      expectCycleComplete: true,
+      beforeAck() {
+        source.fixture.failNextCandidateDispatchUpdateAfterApply(
+          "candidate-ack",
+        );
+      },
+    }),
+    (error) => error.code === "unexpected-http-status",
+  );
+  const afterLoss = await makeLedger(
+    source.fixture,
+    source.capability,
+    source.verifier,
+    preflight,
+    { candidateInventoryRefreshAdapter: source.refreshAdapter },
+  ).load();
+  assert.equal(afterLoss.records.filter((entry) =>
+    entry.envelope.record_type === "candidate-dispatch-observation" &&
+    entry.envelope.payload.phase === "candidate-ack").length, 2);
+  assert.equal(afterLoss.records.some((entry) =>
+    entry.envelope.record_type === "candidate-dispatch-observation" &&
+    entry.envelope.payload.generation_id ===
+      originalBindings[1].generation_id &&
+    new Set(["batch-complete", "cycle-complete"]).has(
+      entry.envelope.payload.phase,
+    )), false);
+
+  runIdentity.run_id = "9603";
+  runIdentity.run_attempt = 1;
+  const terminalInput = {
+    ...source.input,
+    workflow_command_handle: await createScheduleWorkflowCommandHandle({
+      runIdentity,
+    }),
+  };
+  const terminalLedger = makeLedger(
+    source.fixture,
+    source.capability,
+    source.verifier,
+    preflight,
+    { candidateInventoryRefreshAdapter: source.refreshAdapter },
+  );
+  const terminalDispatch = await terminalLedger
+    .loadOrReserveCandidateDispatch(terminalInput);
+  assert.equal(terminalDispatch.state, "complete");
+  const terminal = await terminalLedger.load();
+  assert.equal(terminal.active_lease, null);
+  assert.equal(
+    terminal.authority_projection.candidate_dispatch.current_cycle
+      .cycle_complete,
+    true,
+  );
+  assert.equal(
+    terminal.authority_projection.candidate_dispatch.active_reservation,
+    null,
+  );
+  assert.equal(terminal.effect_intent_count > 0, true);
+  assert.equal(terminal.effect_response_count > 0, true);
+
+  checkpointCollection = true;
+  source.currentOpen.setListedNumbers(checkpointNumbers);
+  runIdentity.run_id = "9604";
+  runIdentity.run_attempt = 1;
+  const checkpointInput = {
+    ...source.input,
+    workflow_command_handle: await createScheduleWorkflowCommandHandle({
+      runIdentity,
+    }),
+  };
+  return {
+    ...source,
+    preflight,
+    runIdentity,
+    checkpointNumbers,
+    checkpointInput,
+    terminal,
+    originalBindings,
+  };
+}
+
+async function createCurrentOpenV3ScheduledCandidateDispatchAttempt({
+  decision = "clean",
+  leaseTtlSeconds = 900,
+} = {}) {
+  const fixture = githubGitFixture();
+  const capability = scheduleCapabilityReceipt();
+  const triggerIdentity = scheduleTriggerIdentity();
+  const runIdentity = { ...OWNER };
+  const preflight = await loadFixtureProviderPreflight();
+  const currentOpen = currentOpenSuppressionAdapterFixture({
+    initialNumbers: [PR.number],
+    exactScopeCandidateNumber: PR.number,
+  });
+  let legacyFinishCalls = 0;
+  const refreshAdapter = Object.freeze({
+    schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+    schema_version: 2,
+    configuration_digest: rawDigest(
+      "candidate-current-open-v3-scheduled-attempt-configuration-v1",
+    ),
+    collectCurrentOpenCandidateAuthority:
+      currentOpen.collectProductionCandidateAuthority,
+    async finishLegacyCandidateInventoryAttempt() {
+      legacyFinishCalls += 1;
+      throw new Error("current-open scheduled attempt used legacy REST");
+    },
+  });
+  const verifier = provenanceVerifier({
+    eventName: "schedule",
+    ref: triggerIdentity.ref,
+    shaValue: triggerIdentity.sha,
+    runIdentity,
+  });
+  const ledger = makeLedger(
+    fixture,
+    capability,
+    verifier,
+    preflight,
+    { candidateInventoryRefreshAdapter: refreshAdapter },
+  );
+  await ledger.bootstrapCapability();
+  const capabilityAttestationCommitSha = fixture.refTarget;
+  const scanCommand = await createScheduleWorkflowCommandHandle({
+    runIdentity,
+  });
+  const input = {
+    workflow_command_handle: scanCommand,
+    trigger_identity: triggerIdentity,
+    repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+  };
+  const publication = await ledger.reconcileCandidateInventoryRefreshAtomically(
+    input,
+  );
+  assert.equal(publication.state, "persisted");
+  const reserved = await ledger.loadOrReserveCandidateDispatch(input);
+  assert.equal(reserved.state, "dispatch");
+  const binding = projectV2GitLedgerCandidateDispatchBinding(
+    reserved.plan,
+    0,
+  );
+  runIdentity.run_id = "9002";
+  runIdentity.run_attempt = 1;
+  const restarted = makeLedger(
+    fixture,
+    capability,
+    verifier,
+    preflight,
+    { candidateInventoryRefreshAdapter: refreshAdapter },
+  );
+  const scheduledCommand = await createScheduleWorkflowCommandHandle({
+    pullRequestNumber: PR.number,
+    dispatchBinding: binding,
+    runIdentity,
+  });
+  const minimal = await loadFixtureMinimalScope();
+  const scheduled = await restarted
+    .loadCandidateDispatchForScheduledPullRequest({
+      workflow_command_handle: scheduledCommand,
+      minimal_scope_handle: minimal,
+      trigger_identity: triggerIdentity,
+      expected_dispatch_binding: binding,
+    });
+  const preScopeReceipt = await restarted
+    .loadScheduledPullRequestEvaluatedScopeReceipt({
+      candidate_dispatch_handle: scheduled.candidate_dispatch_handle,
+      minimal_scope_handle: minimal,
+      trigger_identity: triggerIdentity,
+    });
+  const discovery = await acquireFixtureLeasedDiscovery({
+    ledger: restarted,
+    command: scheduledCommand,
+    preScopeReceipt,
+    minimalPre: minimal,
+    leaseTtlSeconds,
+  });
+  return {
+    fixture,
+    ledger: restarted,
+    triggerIdentity,
+    runIdentity,
+    capability,
+    verifier,
+    preflight,
+    currentOpen,
+    refreshAdapter,
+    legacyFinishCalls: () => legacyFinishCalls,
+    capabilityAttestationCommitSha,
+    input,
+    publication,
+    reserved,
+    binding,
+    scheduledCommand,
+    scheduled,
+    preScopeReceipt,
+    discovery,
+    schedulerScope: { decision },
+  };
+}
+
+async function completeScheduledCandidateDispatchAttempt(
+  attempt,
+  { expectCycleComplete = true, beforeAck = null } = {},
+) {
   const fullScopeReceipt = attempt.discovery.effect_evaluated_scope_receipt;
   const controlPlaneAuthority = await attempt.ledger.loadControlPlaneAuthority(
     fullScopeReceipt.scope,
@@ -14386,6 +20013,7 @@ async function completeScheduledCandidateDispatchAttempt(attempt) {
     lease: attempt.discovery.lease_receipt,
     priorAuthorityDigest: initialAuthority.prior_authority_digest,
     initialAuthority,
+    ...(attempt.schedulerScope ?? {}),
   }).payload.action;
   const schedulerAppend = await attempt.ledger
     .appendInitialSchedulerObservation({
@@ -14429,6 +20057,9 @@ async function completeScheduledCandidateDispatchAttempt(attempt) {
       lease_release_receipt: releaseReceipt,
       terminal_result: terminalResult,
     });
+  if (beforeAck !== null) {
+    await beforeAck();
+  }
   const ack = await attempt.ledger.ackCandidateDispatch({
     candidate_dispatch_handle: attempt.scheduled.candidate_dispatch_handle,
     reservation_receipt: attempt.scheduled.reservation_receipt,
@@ -14436,7 +20067,12 @@ async function completeScheduledCandidateDispatchAttempt(attempt) {
     candidate_dispatch_result_handle:
       resultAuthority.candidate_dispatch_result_handle,
   });
-  assert.notEqual(ack.cycle_completion_append_receipt, null);
+  if (expectCycleComplete) {
+    assert.notEqual(ack.cycle_completion_append_receipt, null);
+  } else {
+    assert.equal(ack.batch_completion_append_receipt, null);
+    assert.equal(ack.cycle_completion_append_receipt, null);
+  }
   return {
     plan,
     schedulerAppend,
@@ -14784,24 +20420,313 @@ async function appendCandidateInventoryPhase({
       ? authority.incomplete_cycle?.cycle_id ?? null
       : null,
   });
-  return ledger.appendCandidateInventory({
+  const historical = HISTORICAL_LEDGER_FIXTURES.get(ledger);
+  if (historical === undefined) {
+    throw new Error("historical candidate inventory fixture is unavailable");
+  }
+  const observedAt = loaded.post_ref.server_time;
+  const record = createV2GitLedgerCandidateInventoryRecord({
     predecessor_commit_sha: loaded.tip_commit_sha,
     owner: OWNER,
-    server_observed_at: TIME,
+    server_observed_at: observedAt,
     payload,
-    trigger_identity: {
-      event_name: authorityOverride?.eventName ?? "schedule",
-      ref: "refs/heads/main",
-      sha: BASE,
-    },
-    repository_endpoint_receipt: {
-      method: "GET",
-      path: "/repos/owner/repo",
-      status: 200,
-      server_time: TIME,
-      raw_body_sha256: `sha256:${"a".repeat(64)}`,
-    },
   });
+  const evaluatedScopeReceipt =
+    createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
+      repository: REPOSITORY,
+      payload,
+      trigger_identity: {
+        event_name: authorityOverride?.eventName ?? "schedule",
+        ref: "refs/heads/main",
+        sha: BASE,
+      },
+      repository_endpoint_receipt: {
+        method: "GET",
+        path: "/repos/owner/repo",
+        status: 200,
+        server_time: TIME,
+        raw_body_sha256: `sha256:${"a".repeat(64)}`,
+      },
+    });
+  const sourceWorkflow = historicalSourceWorkflow(
+    historical.capability.controller_release,
+  );
+  const requestInput = {
+    schema: V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
+    schema_version: 1,
+    operation: record.record_type,
+    repository: REPOSITORY,
+    ledger_ref: V2_GIT_LEDGER_REF,
+    predecessor_commit_sha: record.predecessor_commit_sha,
+    protection_receipt_digest:
+      historical.capability.protection.live_ruleset_receipt_digest,
+    source_workflow: sourceWorkflow,
+    effect_scope: null,
+    evaluated_scope_receipt: evaluatedScopeReceipt,
+    record_identity: {
+      record_type: record.record_type,
+      kind: record.kind,
+      effect_id: record.effect_id,
+      idempotency_key: record.idempotency_key,
+      payload_digest: digestV2GitLedgerPayload(record.payload),
+    },
+    github_server_time: record.server_observed_at,
+  };
+  const nonce = digestCanonical(
+    "codex-review-gate-v2-git-ledger-provenance-nonce",
+    requestInput,
+  );
+  const requestWithoutDigest = {
+    ...requestInput,
+    nonce,
+    audience: `${V2_GIT_LEDGER_OIDC_AUDIENCE}:` +
+      nonce.slice("sha256:".length),
+  };
+  const provenanceRequest = {
+    ...requestWithoutDigest,
+    request_digest: digestCanonical(
+      "codex-review-gate-v2-git-ledger-provenance-request",
+      requestWithoutDigest,
+    ),
+  };
+  const provenance = await historical.verifier({
+    schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+    schema_version: 1,
+    mode: "mint-and-verify",
+    provenance_request: provenanceRequest,
+    compact_jwt: null,
+    stored_receipt: null,
+  });
+  const envelopeBase = {
+    schema: V2_GIT_LEDGER_ENVELOPE_SCHEMA,
+    schema_version: 1,
+    repository: REPOSITORY,
+    ledger_ref: V2_GIT_LEDGER_REF,
+    record_type: record.record_type,
+    sequence: loaded.records.at(-1).envelope.sequence + 1,
+    pull_request: record.pull_request,
+    head_ref_oid: record.head_ref_oid,
+    base_ref_oid: record.base_ref_oid,
+    potential_merge_commit_oid: record.potential_merge_commit_oid,
+    kind: record.kind,
+    effect_id: record.effect_id,
+    idempotency_key: record.idempotency_key,
+    predecessor_commit_sha: record.predecessor_commit_sha,
+    server_observed_at: record.server_observed_at,
+    payload: record.payload,
+    control_comment_binding: record.control_comment_binding,
+    lease: record.lease,
+    source_workflow: sourceWorkflow,
+    workflow_provenance: provenance.receipt,
+    workflow_provenance_jwt: provenance.compact_jwt,
+    payload_digest: digestV2GitLedgerPayload(record.payload),
+  };
+  const envelope = {
+    ...envelopeBase,
+    envelope_digest: digestCanonical(
+      "codex-review-gate-v2-git-ledger-envelope",
+      envelopeBase,
+    ),
+  };
+  const snapshot = historical.fixture.snapshotHistoricalState();
+  const objects = historical.fixture.materializeHistoricalEnvelope(envelope);
+  try {
+    await ledger.load();
+  } catch (error) {
+    historical.fixture.restoreHistoricalState(snapshot);
+    throw error;
+  }
+  return {
+    record_type: envelope.record_type,
+    sequence: envelope.sequence,
+    predecessor_commit_sha: envelope.predecessor_commit_sha,
+    commit_sha: objects.commit_sha,
+    tree_sha: objects.tree_sha,
+    blob_sha: objects.blob_sha,
+    server_observed_at: envelope.server_observed_at,
+    payload_digest: envelope.payload_digest,
+  };
+}
+
+async function materializeHistoricalProductionRecord({
+  ledger,
+  loaded,
+  record,
+  evaluatedScopeReceipt,
+}) {
+  const historical = HISTORICAL_LEDGER_FIXTURES.get(ledger);
+  if (historical === undefined) {
+    throw new Error("historical production record fixture is unavailable");
+  }
+  const sourceWorkflow = historicalSourceWorkflow(
+    historical.capability.controller_release,
+  );
+  const effectScope = record.pull_request === null
+    ? null
+    : {
+      pull_request: structuredClone(record.pull_request),
+      head_ref_oid: record.head_ref_oid,
+      base_ref_oid: record.base_ref_oid,
+      potential_merge_commit_oid: record.potential_merge_commit_oid,
+    };
+  const requestInput = {
+    schema: V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
+    schema_version: 1,
+    operation: record.record_type,
+    repository: REPOSITORY,
+    ledger_ref: V2_GIT_LEDGER_REF,
+    predecessor_commit_sha: record.predecessor_commit_sha,
+    protection_receipt_digest:
+      historical.capability.protection.live_ruleset_receipt_digest,
+    source_workflow: sourceWorkflow,
+    effect_scope: effectScope,
+    evaluated_scope_receipt: evaluatedScopeReceipt,
+    record_identity: {
+      record_type: record.record_type,
+      kind: record.kind,
+      effect_id: record.effect_id,
+      idempotency_key: record.idempotency_key,
+      payload_digest: digestV2GitLedgerPayload(record.payload),
+    },
+    github_server_time: record.server_observed_at,
+  };
+  const nonce = digestCanonical(
+    "codex-review-gate-v2-git-ledger-provenance-nonce",
+    requestInput,
+  );
+  const requestWithoutDigest = {
+    ...requestInput,
+    nonce,
+    audience: `${V2_GIT_LEDGER_OIDC_AUDIENCE}:` +
+      nonce.slice("sha256:".length),
+  };
+  const provenanceRequest = {
+    ...requestWithoutDigest,
+    request_digest: digestCanonical(
+      "codex-review-gate-v2-git-ledger-provenance-request",
+      requestWithoutDigest,
+    ),
+  };
+  const provenance = await historical.verifier({
+    schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+    schema_version: 1,
+    mode: "mint-and-verify",
+    provenance_request: provenanceRequest,
+    compact_jwt: null,
+    stored_receipt: null,
+  });
+  const envelopeBase = {
+    schema: V2_GIT_LEDGER_ENVELOPE_SCHEMA,
+    schema_version: 1,
+    repository: REPOSITORY,
+    ledger_ref: V2_GIT_LEDGER_REF,
+    record_type: record.record_type,
+    sequence: loaded.records.at(-1).envelope.sequence + 1,
+    pull_request: record.pull_request,
+    head_ref_oid: record.head_ref_oid,
+    base_ref_oid: record.base_ref_oid,
+    potential_merge_commit_oid: record.potential_merge_commit_oid,
+    kind: record.kind,
+    effect_id: record.effect_id,
+    idempotency_key: record.idempotency_key,
+    predecessor_commit_sha: record.predecessor_commit_sha,
+    server_observed_at: record.server_observed_at,
+    payload: record.payload,
+    control_comment_binding: record.control_comment_binding,
+    lease: record.lease,
+    source_workflow: sourceWorkflow,
+    workflow_provenance: provenance.receipt,
+    workflow_provenance_jwt: provenance.compact_jwt,
+    payload_digest: digestV2GitLedgerPayload(record.payload),
+  };
+  const envelope = {
+    ...envelopeBase,
+    envelope_digest: digestCanonical(
+      "codex-review-gate-v2-git-ledger-envelope",
+      envelopeBase,
+    ),
+  };
+  const snapshot = historical.fixture.snapshotHistoricalState();
+  historical.fixture.materializeHistoricalEnvelope(envelope);
+  try {
+    await ledger.load();
+  } catch (error) {
+    historical.fixture.restoreHistoricalState(snapshot);
+    throw error;
+  }
+  return envelope;
+}
+
+async function appendHistoricalEffectRecord(
+  ledger,
+  record,
+  evaluatedScopeReceipt = null,
+) {
+  const historical = HISTORICAL_LEDGER_FIXTURES.get(ledger);
+  if (historical === undefined) {
+    throw new Error("historical effect fixture is unavailable");
+  }
+  const loaded = await ledger.load();
+  const boundary = Date.parse(record.server_observed_at) <
+      Date.parse(loaded.post_ref.server_time)
+    ? loaded.post_ref.server_time
+    : record.server_observed_at;
+  let authoritativeRecord = record;
+  if (boundary !== record.server_observed_at) {
+    const plan = recordPlan(record);
+    plan.server_observed_at = boundary;
+    if (
+      plan.record_type === "effect-intent" &&
+      plan.kind === "effect-attempt"
+    ) {
+      const attempt = plan.payload.action.attempt;
+      attempt.recorded_at = boundary;
+      const { attempt_digest: _attemptDigest, ...withoutDigest } = attempt;
+      attempt.attempt_digest = runnerDigestCanonical(
+        "codex-review-gate-v2-request-attempt",
+        withoutDigest,
+      );
+    }
+    authoritativeRecord = createV2GitLedgerRecord(plan);
+  }
+  const receipt = evaluatedScopeReceipt ??
+    await ledger.defaultEffectEvaluatedScopeReceipt();
+  const envelope = await materializeHistoricalProductionRecord({
+    ledger,
+    loaded,
+    record: authoritativeRecord,
+    evaluatedScopeReceipt: receipt,
+  });
+  const commitSha = historical.fixture.refTarget;
+  return {
+    record_type: envelope.record_type,
+    sequence: envelope.sequence,
+    predecessor_commit_sha: envelope.predecessor_commit_sha,
+    commit_sha: commitSha,
+    server_observed_at: envelope.server_observed_at,
+    payload_digest: envelope.payload_digest,
+    ref_reread: {
+      target_commit_sha: commitSha,
+      server_time: envelope.server_observed_at,
+    },
+    stable: true,
+  };
+}
+
+function historicalSourceWorkflow(release) {
+  return {
+    repository: structuredClone(release.repository),
+    workflow_path: release.workflow_path,
+    workflow_ref: release.workflow_ref,
+    workflow_sha: release.workflow_sha,
+    job_workflow_ref: release.job_workflow_ref,
+    job_workflow_sha: release.job_workflow_sha,
+    caller_workflow_file_receipt_digest:
+      release.caller_workflow_file_receipt_digest,
+    job_workflow_file_receipt_digest:
+      release.job_workflow_file_receipt_digest,
+    release_receipt_digest: release.release_receipt_digest,
+  };
 }
 
 function candidateInventoryPayload({
@@ -14965,8 +20890,16 @@ function candidateResponse(value, { link = null, serverTime = TIME } = {}) {
   return new Response(body, { status: 200, headers });
 }
 
-function currentOpenSuppressionAdapterFixture({ initialNumbers = [] } = {}) {
+function currentOpenSuppressionAdapterFixture({
+  initialNumbers = [],
+  exactScopeCandidateNumber = null,
+} = {}) {
   let listedNumbers = [...initialNumbers];
+  const pullRequestNodeIdOverrides = new Map();
+  const headRefOidOverrides = new Map();
+  const headRefNameOverrides = new Map();
+  const baseRefNameOverrides = new Map();
+  const headRepositoryOverrides = new Map();
   let activePass = null;
   let responseCount = 0;
   let afterProjection = null;
@@ -14974,6 +20907,8 @@ function currentOpenSuppressionAdapterFixture({ initialNumbers = [] } = {}) {
   let driftNextFinalFence = false;
   let replayedRequestIdsRemaining = 0;
   let lastProjection = null;
+  let lastProductionPair = null;
+  let reuseProductionPair = false;
   const calls = [];
   const fetch = async (input, init = {}) => {
     const url = new URL(String(input));
@@ -15028,18 +20963,23 @@ function currentOpenSuppressionAdapterFixture({ initialNumbers = [] } = {}) {
     const end = Math.min(start + 100, passNumbers.length);
     const pageNumbers = passNumbers.slice(start, end);
     const nodes = pageNumbers.map((number) => ({
-      id: `PR_${number}`,
+      id: pullRequestNodeIdOverrides.get(number) ?? `PR_${number}`,
       fullDatabaseId: String(1000 + number),
       number,
       state: "OPEN",
       isDraft: false,
       createdAt: new Date(Date.UTC(2026, 0, 1, 0, number)).toISOString(),
       updatedAt: "2026-08-13T11:00:00.000Z",
-      headRefOid: number.toString(16).padStart(40, "0"),
-      headRefName: `feature-${number}`,
+      headRefOid: headRefOidOverrides.get(number) ??
+        (number === exactScopeCandidateNumber
+          ? HEAD
+          : number.toString(16).padStart(40, "0")),
+      headRefName: number === exactScopeCandidateNumber
+        ? headRefNameOverrides.get(number) ?? "feature"
+        : headRefNameOverrides.get(number) ?? `feature-${number}`,
       baseRefOid: BASE,
-      baseRefName: "main",
-      headRepository: {
+      baseRefName: baseRefNameOverrides.get(number) ?? "main",
+      headRepository: headRepositoryOverrides.get(number) ?? {
         id: REPOSITORY.node_id,
         databaseId: Number(REPOSITORY.id),
         nameWithOwner: `${REPOSITORY.owner}/${REPOSITORY.name}`,
@@ -15121,11 +21061,56 @@ function currentOpenSuppressionAdapterFixture({ initialNumbers = [] } = {}) {
       return projection;
     },
   });
+  const collectProductionCandidateAuthority = async () => {
+    if (reuseProductionPair && lastProductionPair !== null) {
+      return lastProductionPair;
+    }
+    const receipt = await currentOpen.scan();
+    const projection = currentOpen.projectForGitLedger(receipt);
+    const productionCandidateAuthority =
+      currentOpen.projectProductionCandidateAuthority(projection);
+    lastProjection = projection;
+    afterProjection?.({
+      projection,
+      production_candidate_authority: productionCandidateAuthority,
+    });
+    lastProductionPair = Object.freeze({
+      projection,
+      production_candidate_authority: productionCandidateAuthority,
+    });
+    return lastProductionPair;
+  };
   return {
     adapter,
     calls,
+    collectProductionCandidateAuthority,
     setListedNumbers(numbers) {
       listedNumbers = [...numbers];
+      activePass = null;
+    },
+    setHeadRefOid(number, headRefOid) {
+      assert.match(headRefOid, /^[0-9a-f]{40}$/u);
+      headRefOidOverrides.set(number, headRefOid);
+      activePass = null;
+    },
+    setPullRequestNodeId(number, nodeId) {
+      assert.equal(typeof nodeId, "string");
+      assert.ok(nodeId.length > 0 && Buffer.byteLength(nodeId, "utf8") <= 256);
+      pullRequestNodeIdOverrides.set(number, nodeId);
+      activePass = null;
+    },
+    setHeadRepository(number, value) {
+      assert.equal(typeof value, "object");
+      headRepositoryOverrides.set(number, structuredClone(value));
+      activePass = null;
+    },
+    setRefNames(number, { head, base }) {
+      assert.equal(typeof head, "string");
+      assert.equal(typeof base, "string");
+      assert.ok(head.length > 0 && head.length <= 255);
+      assert.ok(base.length > 0 && base.length <= 255);
+      headRefNameOverrides.set(number, head);
+      baseRefNameOverrides.set(number, base);
       activePass = null;
     },
     setAfterProjection(callback) {
@@ -15133,6 +21118,9 @@ function currentOpenSuppressionAdapterFixture({ initialNumbers = [] } = {}) {
     },
     reuseLastProjection(value = true) {
       reuseProjection = value;
+    },
+    reuseLastProductionPair(value = true) {
+      reuseProductionPair = value;
     },
     driftNextFence() {
       driftNextFinalFence = true;
@@ -15261,6 +21249,99 @@ async function stableEmptyCandidateRefreshReconciliationFixture({
   };
 }
 
+async function legacyIncompleteCandidateRefreshFixture({
+  candidateCount = 1,
+  seedShardCount = 0,
+  cycleOverride = null,
+  wrapFinishResult = null,
+} = {}) {
+  const fixture = githubGitFixture();
+  const capability = scheduleCapabilityReceipt();
+  const triggerIdentity = scheduleTriggerIdentity();
+  const transportFixture = candidateTransportFixture(candidateCount);
+  const cycle = cycleOverride ??
+    await readCandidateInventoryCycle({ transportFixture });
+  const finishCalls = [];
+  let currentOpenCalls = 0;
+  const refreshAdapter = Object.freeze({
+    schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+    schema_version: 2,
+    configuration_digest: rawDigest(
+      `candidate-refresh-legacy-finish-${candidateCount}-v1`,
+    ),
+    async collectCurrentOpenCandidateAuthority() {
+      currentOpenCalls += 1;
+      throw new Error("legacy finish must not collect current-open evidence");
+    },
+    async finishLegacyCandidateInventoryAttempt(request) {
+      finishCalls.push(request);
+      const result = {
+        schema:
+          "codex-review-gate-git-ledger-candidate-inventory-legacy-finish-result-v2",
+        schema_version: 1,
+        request_handle: request.request_handle,
+        cycle_id: request.cycle_id,
+        start_record_oid: request.start_record_oid,
+        next_shard_index: request.next_shard_index,
+        initial_inventory: cycle.initial_inventory,
+        shard_receipts: cycle.shard_receipts,
+        final_inventory: cycle.final_inventory,
+        final_shard_receipts: cycle.final_shard_receipts,
+      };
+      return wrapFinishResult === null
+        ? result
+        : wrapFinishResult({ request, result, cycle });
+    },
+  });
+  const verifier = provenanceVerifier({
+    eventName: "schedule",
+    ref: triggerIdentity.ref,
+    shaValue: triggerIdentity.sha,
+  });
+  const ledger = makeLedger(fixture, capability, verifier, null, {
+    candidateInventoryRefreshAdapter: refreshAdapter,
+  });
+  await ledger.bootstrapCapability();
+  const workflowCommandHandle = await createScheduleWorkflowCommandHandle();
+  let loaded = await ledger.load();
+  await appendCandidateInventoryPhase({
+    ledger,
+    loaded,
+    phase: "cycle-start",
+    initial: cycle.initial_inventory,
+  });
+  for (let index = 0; index < seedShardCount; index += 1) {
+    loaded = await ledger.load();
+    await appendCandidateInventoryPhase({
+      ledger,
+      loaded,
+      phase: "shard",
+      initial: cycle.initial_inventory,
+      shard: cycle.shard_receipts[index],
+    });
+  }
+  return {
+    fixture,
+    capability,
+    triggerIdentity,
+    transportFixture,
+    cycle,
+    finishCalls,
+    get currentOpenCalls() {
+      return currentOpenCalls;
+    },
+    refreshAdapter,
+    verifier,
+    ledger,
+    workflowCommandHandle,
+    input: {
+      workflow_command_handle: workflowCommandHandle,
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+    },
+  };
+}
+
 async function bootstrapCheckpointAdmissionFixture({
   fixture = githubGitFixture(),
   fetch = null,
@@ -15364,7 +21445,7 @@ function makeLedger(
       defaultFullAuthorityReceipt ??
       (await defaultAuthority()).evaluated_scope_receipt,
   });
-  return {
+  const ledger = {
     productionApiForTest: () => production,
     async bootstrapCapability() {
       const restricted = createV2GitHubGitLedgerBootstrap({
@@ -15495,7 +21576,11 @@ function makeLedger(
     },
     defaultEvaluatedScopeReceipt: async () =>
       (await defaultAuthority()).evaluated_scope_receipt,
+    defaultEffectEvaluatedScopeReceipt: async () =>
+      (await defaultEffectAuthority()).evaluated_scope_receipt,
   };
+  HISTORICAL_LEDGER_FIXTURES.set(ledger, { fixture, capability, verifier });
+  return ledger;
 }
 
 async function createProtectedInitialRunnerContext(
@@ -15618,6 +21703,7 @@ async function acquireFixtureLeasedDiscovery({
   leaseTtlSeconds = 600,
   transportStartSecond = 600,
   minimalServerTime = "2026-08-13T12:20:00.000Z",
+  minimalFetch = null,
 }) {
   const transportFixture = providerTransportFixture({
     startSecond: transportStartSecond,
@@ -15626,7 +21712,8 @@ async function acquireFixtureLeasedDiscovery({
     createProviderTransport(transportFixture.fetch);
   return acquireV2LeaseThenLoadDiscovery({
     command,
-    fetch: (url, init) => minimalScopeFetchAt(minimalServerTime, url, init),
+    fetch: minimalFetch ??
+      ((url, init) => minimalScopeFetchAt(minimalServerTime, url, init)),
     token: SYNTHETIC_BEARER,
     rest_base_url: "https://api.github.test",
     graphql_url: "https://api.github.test/graphql",
@@ -15940,6 +22027,72 @@ function provenancePolicy() {
   };
 }
 
+function createFixtureProvenanceMintState(historicalTokenAuthorities) {
+  const authoritiesByOrdinal = new Map();
+  const tokenDigests = new Set();
+  const jtis = new Set();
+  let nextOrdinal = 0;
+  const mintedAuthorities = [];
+  for (const authority of historicalTokenAuthorities) {
+    authoritiesByOrdinal.set(authority.ordinal, structuredClone(authority));
+    tokenDigests.add(authority.token_sha256);
+    if (authority.jti !== null) jtis.add(authority.jti);
+    nextOrdinal = Math.max(nextOrdinal, authority.ordinal);
+  }
+  return Object.freeze({
+    get minted_authorities() {
+      return mintedAuthorities.map((authority) =>
+        structuredClone(authority));
+    },
+    historical_matches(authorities) {
+      return canonicalJson(authorities) ===
+        canonicalJson(historicalTokenAuthorities);
+    },
+    authority_for_ordinal(ordinal) {
+      const authority = authoritiesByOrdinal.get(ordinal);
+      return authority === undefined ? null : structuredClone(authority);
+    },
+    mint({
+      fixed_jti,
+      jti_prefix,
+      omit_jti,
+      request_digest,
+      run_identity,
+      trigger,
+    }) {
+      const ordinal = nextOrdinal + 1;
+      const jti = omit_jti
+        ? null
+        : fixed_jti ?? `${jti_prefix}-${ordinal}`;
+      if (jti !== null) {
+        assert.equal(jtis.has(jti), false, "duplicate fixture provenance jti");
+      }
+      const compactJwt = fixtureJwt({ ordinal, jti, request_digest });
+      const tokenSha256 = rawDigest(compactJwt);
+      assert.equal(
+        tokenDigests.has(tokenSha256),
+        false,
+        "duplicate fixture provenance token",
+      );
+      const authority = Object.freeze({
+        ordinal,
+        token_sha256: tokenSha256,
+        jti,
+        request_digest,
+        run_identity: structuredClone(run_identity),
+        trigger: structuredClone(trigger),
+        compact_jwt: compactJwt,
+      });
+      nextOrdinal = ordinal;
+      tokenDigests.add(tokenSha256);
+      if (jti !== null) jtis.add(jti);
+      authoritiesByOrdinal.set(ordinal, authority);
+      mintedAuthorities.push(authority);
+      return structuredClone(authority);
+    },
+  });
+}
+
 function provenanceVerifier({
   fixedJti = null,
   omitJti = false,
@@ -15950,22 +22103,82 @@ function provenanceVerifier({
   claimsSupported = V2_GIT_LEDGER_OIDC_CLAIMS,
   runIdentity = OWNER,
   deriveTriggerFromRequest = false,
+  historicalTokenAuthorities = [],
+  historicalReverificationLog = null,
+  fixtureProvenanceMintState = null,
 } = {}) {
+  if (historicalReverificationLog !== null) {
+    assert.ok(Array.isArray(historicalReverificationLog));
+    assert.equal(historicalReverificationLog.length, 0);
+  }
+  if (fixtureProvenanceMintState !== null) {
+    assert.equal(
+      fixtureProvenanceMintState.historical_matches(
+        historicalTokenAuthorities,
+      ),
+      true,
+    );
+  }
   let ordinal = 0;
   const runIdentityByTokenOrdinal = new Map();
   const triggerByTokenOrdinal = new Map();
+  const historicalAuthorityByTokenOrdinal = new Map();
+  for (const authority of historicalTokenAuthorities) {
+    assertExactFixtureKeys(authority, [
+      "commit_oid",
+      "jti",
+      "ordinal",
+      "request_digest",
+      "run_identity",
+      "token_sha256",
+      "trigger",
+    ], "historical provenance authority");
+    assertFixtureOid(authority.commit_oid, "historical provenance commit oid");
+    assert.ok(Number.isSafeInteger(authority.ordinal));
+    assert.ok(authority.ordinal > 0);
+    assert.equal(
+      historicalAuthorityByTokenOrdinal.has(authority.ordinal),
+      false,
+      `duplicate historical provenance ordinal ${authority.ordinal}`,
+    );
+    assert.match(authority.token_sha256, /^sha256:[0-9a-f]{64}$/u);
+    assert.match(authority.request_digest, /^sha256:[0-9a-f]{64}$/u);
+    assert.equal(
+      authority.jti === null || typeof authority.jti === "string",
+      true,
+    );
+    assertExactFixtureKeys(authority.run_identity, [
+      "actor_id",
+      "run_attempt",
+      "run_id",
+    ], "historical provenance run identity");
+    assertExactFixtureKeys(authority.trigger, [
+      "event_name",
+      "ref",
+      "sha",
+    ], "historical provenance trigger");
+    historicalAuthorityByTokenOrdinal.set(
+      authority.ordinal,
+      structuredClone(authority),
+    );
+    runIdentityByTokenOrdinal.set(
+      authority.ordinal,
+      structuredClone(authority.run_identity),
+    );
+    triggerByTokenOrdinal.set(
+      authority.ordinal,
+      structuredClone(authority.trigger),
+    );
+    ordinal = Math.max(ordinal, authority.ordinal);
+  }
   return async (verifierRequest) => {
     const request = verifierRequest.provenance_request;
     let tokenOrdinal;
     let jti;
     let compactJwt;
     if (verifierRequest.mode === "mint-and-verify") {
-      ordinal += 1;
-      tokenOrdinal = ordinal;
-      jti = omitJti ? null : fixedJti ?? `${jtiPrefix}-${tokenOrdinal}`;
-      runIdentityByTokenOrdinal.set(tokenOrdinal, structuredClone(runIdentity));
       const evaluated = request.evaluated_scope_receipt;
-      triggerByTokenOrdinal.set(tokenOrdinal, {
+      const tokenTrigger = {
         event_name: deriveTriggerFromRequest && evaluated !== null &&
             evaluated !== undefined
           ? evaluated.trigger_event_name
@@ -15978,12 +22191,45 @@ function provenanceVerifier({
             evaluated !== undefined
           ? evaluated.trigger_sha
           : shaValue,
-      });
-      compactJwt = fixtureJwt({
-        ordinal: tokenOrdinal,
-        jti,
-        request_digest: request.request_digest,
-      });
+      };
+      if (fixtureProvenanceMintState === null) {
+        ordinal += 1;
+        tokenOrdinal = ordinal;
+        jti = omitJti ? null : fixedJti ?? `${jtiPrefix}-${tokenOrdinal}`;
+        compactJwt = fixtureJwt({
+          ordinal: tokenOrdinal,
+          jti,
+          request_digest: request.request_digest,
+        });
+        runIdentityByTokenOrdinal.set(
+          tokenOrdinal,
+          structuredClone(runIdentity),
+        );
+        triggerByTokenOrdinal.set(
+          tokenOrdinal,
+          structuredClone(tokenTrigger),
+        );
+      } else {
+        const mintedAuthority = fixtureProvenanceMintState.mint({
+          fixed_jti: fixedJti,
+          jti_prefix: jtiPrefix,
+          omit_jti: omitJti,
+          request_digest: request.request_digest,
+          run_identity: runIdentity,
+          trigger: tokenTrigger,
+        });
+        tokenOrdinal = mintedAuthority.ordinal;
+        jti = mintedAuthority.jti;
+        compactJwt = mintedAuthority.compact_jwt;
+        runIdentityByTokenOrdinal.set(
+          tokenOrdinal,
+          structuredClone(mintedAuthority.run_identity),
+        );
+        triggerByTokenOrdinal.set(
+          tokenOrdinal,
+          structuredClone(mintedAuthority.trigger),
+        );
+      }
     } else {
       compactJwt = verifierRequest.compact_jwt;
       const payload = JSON.parse(Buffer.from(
@@ -15991,7 +22237,48 @@ function provenanceVerifier({
         "base64url",
       ).toString("utf8"));
       tokenOrdinal = payload.ordinal;
-      jti = payload.jti;
+      jti = payload.jti ?? null;
+      const historicalAuthority = historicalAuthorityByTokenOrdinal.get(
+        tokenOrdinal,
+      );
+      if (historicalAuthority !== undefined) {
+        assert.equal(
+          rawDigest(compactJwt),
+          historicalAuthority.token_sha256,
+        );
+        assert.equal(
+          payload.request_digest,
+          historicalAuthority.request_digest,
+        );
+        assert.equal(request.request_digest, historicalAuthority.request_digest);
+        assert.equal(jti, historicalAuthority.jti);
+        historicalReverificationLog?.push(Object.freeze({
+          commit_oid: historicalAuthority.commit_oid,
+          token_sha256: historicalAuthority.token_sha256,
+          jti: historicalAuthority.jti,
+          request_digest: historicalAuthority.request_digest,
+        }));
+      } else if (fixtureProvenanceMintState !== null) {
+        const mintedAuthority = fixtureProvenanceMintState
+          .authority_for_ordinal(tokenOrdinal);
+        assert.notEqual(
+          mintedAuthority,
+          null,
+          `unknown shared fixture provenance ordinal ${tokenOrdinal}`,
+        );
+        assert.equal(rawDigest(compactJwt), mintedAuthority.token_sha256);
+        assert.equal(payload.request_digest, mintedAuthority.request_digest);
+        assert.equal(request.request_digest, mintedAuthority.request_digest);
+        assert.equal(jti, mintedAuthority.jti);
+        runIdentityByTokenOrdinal.set(
+          tokenOrdinal,
+          structuredClone(mintedAuthority.run_identity),
+        );
+        triggerByTokenOrdinal.set(
+          tokenOrdinal,
+          structuredClone(mintedAuthority.trigger),
+        );
+      }
     }
     const tokenRunIdentity = runIdentityByTokenOrdinal.get(tokenOrdinal) ??
       runIdentity;
@@ -16115,8 +22402,8 @@ function leaseInput(predecessor) {
   };
 }
 
-function effectRecord({ predecessor, lease, effectId, idempotencyKey, at }) {
-  return createV2GitLedgerEffectIntentRecord({
+function effectIntentInput({ predecessor, lease, effectId, idempotencyKey, at }) {
+  return {
     predecessor_commit_sha: predecessor,
     scope: {
       pull_request: PR,
@@ -16134,7 +22421,17 @@ function effectRecord({ predecessor, lease, effectId, idempotencyKey, at }) {
     },
     control_comment_binding: null,
     lease_receipt: lease,
-  });
+  };
+}
+
+function effectRecord({ predecessor, lease, effectId, idempotencyKey, at }) {
+  return createV2GitLedgerEffectIntentRecord(effectIntentInput({
+    predecessor,
+    lease,
+    effectId,
+    idempotencyKey,
+    at,
+  }));
 }
 
 function automaticReservationRecord({ predecessor, lease, generation }) {
@@ -16211,6 +22508,11 @@ function schedulerObservationRecord({
   idempotencyKey = "scheduler-observation-key-1",
   initialAuthority = null,
   decision = "pending",
+  pullRequest = PR,
+  headOid = HEAD,
+  baseOid = BASE,
+  potentialMergeCommitOid = POTENTIAL,
+  statusIdempotencyKey = "status:fixture-head-pending",
 }) {
   const priorScheduling = initialAuthority === null
     ? initialScheduling({ trigger })
@@ -16253,11 +22555,11 @@ function schedulerObservationRecord({
     decision: evaluation.decision,
     writes: trigger === "manual" ? [] : [{
       role: "head-sentinel",
-      sha: HEAD,
+      sha: headOid,
       context: "codex/github-review-gate",
       state: "pending",
       reason: "awaiting-terminal-test-merge-decision",
-      idempotency_key: "status:fixture-head-pending",
+      idempotency_key: statusIdempotencyKey,
     }],
     terminal_cutover: false,
     freshness_assurance: "point-in-time",
@@ -16295,10 +22597,10 @@ function schedulerObservationRecord({
   return createV2GitLedgerRecord({
     record_type: "effect-intent",
     predecessor_commit_sha: predecessor,
-    pull_request: PR,
-    head_ref_oid: HEAD,
-    base_ref_oid: BASE,
-    potential_merge_commit_oid: POTENTIAL,
+    pull_request: pullRequest,
+    head_ref_oid: headOid,
+    base_ref_oid: baseOid,
+    potential_merge_commit_oid: potentialMergeCommitOid,
     kind: "scheduler-observation",
     effect_id: effectId,
     idempotency_key: idempotencyKey,
@@ -16308,6 +22610,10 @@ function schedulerObservationRecord({
       kind: "scheduler-observation",
       predecessor,
       action,
+      pullRequest,
+      headOid,
+      baseOid,
+      potentialMergeCommitOid,
     }),
     control_comment_binding: null,
     lease: leaseBinding(lease),
@@ -17529,7 +23835,10 @@ async function appendGenericRequiredStatus(
     control_comment_binding: null,
     lease_receipt: lease,
   });
-  const intentReceipt = await ledger.appendRecord(intentRecord);
+  const intentReceipt = await appendHistoricalEffectRecord(
+    ledger,
+    intentRecord,
+  );
   const responseReceipt = statusWriteResponseReceipt({
     target_sha: planned.sha,
     role: planned.role,
@@ -17543,7 +23852,7 @@ async function appendGenericRequiredStatus(
     server_observed_at: responseReceipt.refetch_server_time,
     receipt: responseReceipt,
   });
-  return ledger.appendRecord(responseRecord);
+  return appendHistoricalEffectRecord(ledger, responseRecord);
 }
 
 async function appendProtectedRequestPrefix(
@@ -17559,10 +23868,11 @@ async function appendProtectedRequestPrefix(
     priorAuthorityDigest: priorRunnerAuthorityDigest(beforeObservation.records),
     initialAuthority,
   });
-  const observationReceipt = await ledger.appendRecord(observationRecord, {
-    evaluated_scope_receipt: evaluatedScopeReceipt,
-    initial_runner_state_authority: initialAuthority,
-  });
+  const observationReceipt = await appendHistoricalEffectRecord(
+    ledger,
+    observationRecord,
+    evaluatedScopeReceipt,
+  );
   const requiredStatus = await appendGenericRequiredStatus(
     ledger,
     lease,
@@ -17580,7 +23890,10 @@ async function appendProtectedRequestPrefix(
     observation: observationRecord,
     headLedger: statusControl.scoped_authority.runner_state.head_ledger,
   });
-  const reservationReceipt = await ledger.appendRecord(reservationRecord);
+  const reservationReceipt = await appendHistoricalEffectRecord(
+    ledger,
+    reservationRecord,
+  );
   const reservationStatusIntent = reservationStatusIntentRecord({
     predecessor: reservationReceipt.commit_sha,
     lease,
@@ -17588,14 +23901,16 @@ async function appendProtectedRequestPrefix(
     reservationRecordOid: reservationReceipt.commit_sha,
     reservationDigest: reservationRecord.payload.action.reservation_digest,
   });
-  const reservationStatusIntentReceipt = await ledger.appendRecord(
+  const reservationStatusIntentReceipt = await appendHistoricalEffectRecord(
+    ledger,
     reservationStatusIntent,
   );
   const reservationStatusResponse = reservationStatusResponseRecord(
     reservationStatusIntent,
     reservationStatusIntentReceipt.commit_sha,
   );
-  const reservationStatusResponseReceipt = await ledger.appendRecord(
+  const reservationStatusResponseReceipt = await appendHistoricalEffectRecord(
+    ledger,
     reservationStatusResponse,
   );
   const postAction = observationRecord.payload.action.scheduler_plan.actions
@@ -17609,7 +23924,10 @@ async function appendProtectedRequestPrefix(
     reservation: reservationRecord.payload.action.reservation,
     schedulerActionKey: postAction.idempotency_key,
   });
-  const attemptReceipt = await ledger.appendRecord(attemptRecord);
+  const attemptReceipt = await appendHistoricalEffectRecord(
+    ledger,
+    attemptRecord,
+  );
   return {
     generation,
     observationRecord,
@@ -17652,7 +23970,10 @@ async function appendControlledRequestAfterObservation(
     observation: observationRecord,
     headLedger: statusControl.scoped_authority.runner_state.head_ledger,
   });
-  const reservationReceipt = await ledger.appendRecord(reservationRecord);
+  const reservationReceipt = await appendHistoricalEffectRecord(
+    ledger,
+    reservationRecord,
+  );
   const reservationStatusIntent = reservationStatusIntentRecord({
     predecessor: reservationReceipt.commit_sha,
     lease,
@@ -17660,14 +23981,16 @@ async function appendControlledRequestAfterObservation(
     reservationRecordOid: reservationReceipt.commit_sha,
     reservationDigest: reservationRecord.payload.action.reservation_digest,
   });
-  const reservationStatusIntentReceipt = await ledger.appendRecord(
+  const reservationStatusIntentReceipt = await appendHistoricalEffectRecord(
+    ledger,
     reservationStatusIntent,
   );
   const reservationStatusResponse = reservationStatusResponseRecord(
     reservationStatusIntent,
     reservationStatusIntentReceipt.commit_sha,
   );
-  const reservationStatusResponseReceipt = await ledger.appendRecord(
+  const reservationStatusResponseReceipt = await appendHistoricalEffectRecord(
+    ledger,
     reservationStatusResponse,
   );
   const postAction = observationRecord.payload.action.scheduler_plan.actions
@@ -17681,7 +24004,10 @@ async function appendControlledRequestAfterObservation(
     reservation: reservationRecord.payload.action.reservation,
     schedulerActionKey: postAction.idempotency_key,
   });
-  const attemptReceipt = await ledger.appendRecord(attemptRecord);
+  const attemptReceipt = await appendHistoricalEffectRecord(
+    ledger,
+    attemptRecord,
+  );
   const requestIntentRecord = reviewRequestRecord({
     predecessor: attemptReceipt.commit_sha,
     lease,
@@ -17694,7 +24020,10 @@ async function appendControlledRequestAfterObservation(
     attemptRecordOid: attemptReceipt.commit_sha,
     schedulerActionKey: postAction.idempotency_key,
   });
-  const requestIntent = await ledger.appendRecord(requestIntentRecord);
+  const requestIntent = await appendHistoricalEffectRecord(
+    ledger,
+    requestIntentRecord,
+  );
   const requestResponseReceipt =
     await automaticReviewRequestBindingReceipt({
       action: requestIntentRecord.payload.action,
@@ -17716,7 +24045,10 @@ async function appendControlledRequestAfterObservation(
       receipt: requestResponseReceipt,
     }),
   });
-  const requestResponse = await ledger.appendRecord(requestResponseRecord);
+  const requestResponse = await appendHistoricalEffectRecord(
+    ledger,
+    requestResponseRecord,
+  );
   const bindingIntentRecord = createV2GitLedgerRecord({
     ...recordPlan(requestIntentRecord),
     predecessor_commit_sha: requestResponse.commit_sha,
@@ -17736,7 +24068,10 @@ async function appendControlledRequestAfterObservation(
       },
     }),
   });
-  const bindingIntent = await ledger.appendRecord(bindingIntentRecord);
+  const bindingIntent = await appendHistoricalEffectRecord(
+    ledger,
+    bindingIntentRecord,
+  );
   const boundAt = requestResponseReceipt.created_at;
   const bindingResponseRecord = createV2GitLedgerRecord({
     ...recordPlan(bindingIntentRecord),
@@ -17764,7 +24099,10 @@ async function appendControlledRequestAfterObservation(
       },
     }),
   });
-  const bindingResponse = await ledger.appendRecord(bindingResponseRecord);
+  const bindingResponse = await appendHistoricalEffectRecord(
+    ledger,
+    bindingResponseRecord,
+  );
   return { boundAt, bindingResponse };
 }
 
@@ -17938,6 +24276,10 @@ function effectPayload({
   action,
   intentCommitSha = null,
   receipt = null,
+  pullRequest = PR,
+  headOid = HEAD,
+  baseOid = BASE,
+  potentialMergeCommitOid = POTENTIAL,
 }) {
   return {
     schema: "codex-review-gate-git-ledger-effect-payload-v2",
@@ -17945,10 +24287,10 @@ function effectPayload({
     phase,
     kind,
     scope: {
-      pull_request: PR,
-      head_ref_oid: HEAD,
-      base_ref_oid: BASE,
-      potential_merge_commit_oid: POTENTIAL,
+      pull_request: pullRequest,
+      head_ref_oid: headOid,
+      base_ref_oid: baseOid,
+      potential_merge_commit_oid: potentialMergeCommitOid,
     },
     generation,
     ordinal: generation?.index ?? 1,
@@ -18003,6 +24345,31 @@ async function loadFixtureMinimalScope() {
     token: SYNTHETIC_BEARER,
     repository: { owner: REPOSITORY.owner, name: REPOSITORY.name },
     pull_number: PR.number,
+    rest_base_url: "https://api.github.test",
+    graphql_url: "https://api.github.test/graphql",
+  });
+}
+
+async function loadFixtureMinimalScopeForCandidate(
+  number,
+  headOid = number.toString(16).padStart(40, "0"),
+  headRefName = `feature-${number}`,
+  nodeId = `PR_${number}`,
+  serverTime = TIME,
+) {
+  return loadV2MinimalLiveScope({
+    fetch: (url, init) => minimalScopeFetchForCandidate({
+      number,
+      nodeId,
+      headOid,
+      headRefName,
+      serverTime,
+      urlValue: url,
+      init,
+    }),
+    token: SYNTHETIC_BEARER,
+    repository: { owner: REPOSITORY.owner, name: REPOSITORY.name },
+    pull_number: number,
     rest_base_url: "https://api.github.test",
     graphql_url: "https://api.github.test/graphql",
   });
@@ -18163,6 +24530,85 @@ async function minimalScopeFetchAt(serverTime, urlValue, init = {}) {
     }, date);
   }
   throw new Error(`unexpected minimal scope request ${init.method} ${url.href}`);
+}
+
+async function minimalScopeFetchForCandidate({
+  number,
+  nodeId,
+  headOid,
+  headRefName,
+  serverTime,
+  urlValue,
+  init = {},
+}) {
+  const url = new URL(urlValue);
+  const date = new Date(serverTime).toUTCString();
+  const pullPath = `/repos/owner/repo/pulls/${number}`;
+  if (url.pathname === pullPath) {
+    return response(200, {
+      number,
+      url: `https://api.github.test${pullPath}`,
+      node_id: nodeId,
+      state: "open",
+      merged: false,
+      merged_at: null,
+      updated_at: TIME,
+    }, date);
+  }
+  if (url.pathname === "/graphql") {
+    assert.equal(init.method, "POST");
+    return response(200, {
+      data: {
+        repository: {
+          id: REPOSITORY.node_id,
+          name: REPOSITORY.name,
+          owner: { login: REPOSITORY.owner },
+          pullRequest: {
+            id: nodeId,
+            number,
+            state: "OPEN",
+            merged: false,
+            mergedAt: null,
+            isDraft: false,
+            updatedAt: TIME,
+            mergeable: "MERGEABLE",
+            baseRefName: "main",
+            baseRef: { name: "main", target: { oid: BASE } },
+            headRefName,
+            headRefOid: headOid,
+            headRef: { name: headRefName, target: { oid: headOid } },
+            potentialMergeCommit: {
+              oid: POTENTIAL,
+              tree: { oid: "e".repeat(40) },
+              parents: {
+                totalCount: 2,
+                pageInfo: { hasNextPage: false, endCursor: "parent-2" },
+                nodes: [{ oid: BASE }, { oid: headOid }],
+              },
+            },
+          },
+        },
+      },
+    }, date);
+  }
+  if (url.pathname === `/repos/owner/repo/compare/${BASE}...${headOid}`) {
+    return response(200, {
+      base_commit: { sha: BASE },
+      merge_base_commit: { sha: BASE },
+    }, date);
+  }
+  if (url.pathname === `/repos/owner/repo/git/ref/pull/${number}/merge`) {
+    return response(200, {
+      ref: `refs/pull/${number}/merge`,
+      url: `https://api.github.test/repos/owner/repo/git/refs/pull/${number}/merge`,
+      object: {
+        type: "commit",
+        sha: POTENTIAL,
+        url: `https://api.github.test/repos/owner/repo/git/commits/${POTENTIAL}`,
+      },
+    }, date);
+  }
+  throw new Error(`unexpected candidate scope request ${init.method} ${url.href}`);
 }
 
 async function loadFixtureProviderPreflight({
@@ -18378,7 +24824,12 @@ function providerPreflightFetch({ actor, app }) {
 
 function providerTransportFixture({
   startSecond = 600,
+  nextServerTime = null,
   comment = providerIssueComment(),
+  headOid = HEAD,
+  headRefName = "feature",
+  pullRequestNumber = PR.number,
+  pullRequestNodeId = PR.node_id,
 } = {}) {
   let second = startSecond;
   let currentComment = structuredClone(comment);
@@ -18391,12 +24842,21 @@ function providerTransportFixture({
       const method = init.method ?? "GET";
       calls.push({ method, path: url.pathname });
       second += 1;
-      const date = new Date(Date.UTC(2026, 7, 13, 12, 0, second)).toUTCString();
+      const date = nextServerTime === null
+        ? new Date(Date.UTC(2026, 7, 13, 12, 0, second)).toUTCString()
+        : new Date(nextServerTime()).toUTCString();
       const repoPath = "/repos/owner/repo";
       if (url.pathname === "/graphql") {
         const query = String(JSON.parse(init.body).query);
         if (query.includes("CodexReviewGateV2Scope")) {
-          return response(200, { data: providerScopePayload() }, date);
+          return response(200, {
+            data: providerScopePayload({
+              headOid,
+              headRefName,
+              pullRequestNumber,
+              pullRequestNodeId,
+            }),
+          }, date);
         }
         if (query.includes("CodexReviewGateV2ReviewThreads")) {
           return response(200, {
@@ -18411,30 +24871,31 @@ function providerTransportFixture({
         }
         return response(200, { errors: [{ message: "unexpected query" }] }, date);
       }
-      if (url.pathname === `${repoPath}/pulls/7`) {
+      if (url.pathname === `${repoPath}/pulls/${pullRequestNumber}`) {
         return response(200, {
-          number: 7,
-          node_id: PR.node_id,
-          url: "https://api.github.test/repos/owner/repo/pulls/7",
+          number: pullRequestNumber,
+          node_id: pullRequestNodeId,
+          url: `https://api.github.test${repoPath}/pulls/${pullRequestNumber}`,
           state: "open",
           merged: false,
           merged_at: null,
           mergeable: true,
           merge_commit_sha: POTENTIAL,
           base: { ref: "main", sha: BASE },
-          head: { ref: "feature", sha: HEAD },
+          head: { ref: headRefName, sha: headOid },
         }, date);
       }
-      if (url.pathname === `${repoPath}/compare/${BASE}...${HEAD}`) {
+      if (url.pathname === `${repoPath}/compare/${BASE}...${headOid}`) {
         return response(200, {
           base_commit: { sha: BASE },
           merge_base_commit: { sha: BASE },
         }, date);
       }
-      if (url.pathname === `${repoPath}/git/ref/pull/7/merge`) {
+      if (url.pathname ===
+          `${repoPath}/git/ref/pull/${pullRequestNumber}/merge`) {
         return response(200, {
-          ref: "refs/pull/7/merge",
-          url: "https://api.github.test/repos/owner/repo/git/refs/pull/7/merge",
+          ref: `refs/pull/${pullRequestNumber}/merge`,
+          url: `https://api.github.test${repoPath}/git/refs/pull/${pullRequestNumber}/merge`,
           object: {
             type: "commit",
             sha: POTENTIAL,
@@ -18442,16 +24903,17 @@ function providerTransportFixture({
           },
         }, date);
       }
-      if (url.pathname === `${repoPath}/issues/7/comments`) {
+      if (url.pathname ===
+          `${repoPath}/issues/${pullRequestNumber}/comments`) {
         return response(200, currentComment === null ? [] : [currentComment], date);
       }
-      if (url.pathname === `${repoPath}/pulls/7/reviews` ||
-          url.pathname === `${repoPath}/pulls/7/comments` ||
-          url.pathname === `${repoPath}/issues/7/reactions` ||
+      if (url.pathname === `${repoPath}/pulls/${pullRequestNumber}/reviews` ||
+          url.pathname === `${repoPath}/pulls/${pullRequestNumber}/comments` ||
+          url.pathname === `${repoPath}/issues/${pullRequestNumber}/reactions` ||
           url.pathname === `${repoPath}/issues/comments/71/reactions`) {
         return response(200, [], date);
       }
-      if (url.pathname === `${repoPath}/commits/${HEAD}/check-runs`) {
+      if (url.pathname === `${repoPath}/commits/${headOid}/check-runs`) {
         return response(200, { total_count: 0, check_runs: [] }, date);
       }
       if (url.pathname === `${repoPath}/issues/comments/71`) {
@@ -18505,15 +24967,20 @@ function providerIssueComment(overrides = {}) {
   };
 }
 
-function providerScopePayload() {
+function providerScopePayload({
+  headOid = HEAD,
+  headRefName = "feature",
+  pullRequestNumber = PR.number,
+  pullRequestNodeId = PR.node_id,
+} = {}) {
   return {
     repository: {
       id: REPOSITORY.node_id,
       name: REPOSITORY.name,
       owner: { login: REPOSITORY.owner },
       pullRequest: {
-        id: PR.node_id,
-        number: PR.number,
+        id: pullRequestNodeId,
+        number: pullRequestNumber,
         state: "OPEN",
         merged: false,
         mergedAt: null,
@@ -18522,16 +24989,16 @@ function providerScopePayload() {
         baseRefName: "main",
         baseRefOid: BASE,
         baseRef: { name: "main", target: { oid: BASE } },
-        headRefName: "feature",
-        headRefOid: HEAD,
-        headRef: { name: "feature", target: { oid: HEAD } },
+        headRefName,
+        headRefOid: headOid,
+        headRef: { name: headRefName, target: { oid: headOid } },
         potentialMergeCommit: {
           oid: POTENTIAL,
           tree: { oid: "e".repeat(40) },
           parents: {
             totalCount: 2,
             pageInfo: { hasNextPage: false, endCursor: "parent-2" },
-            nodes: [{ oid: BASE }, { oid: HEAD }],
+            nodes: [{ oid: BASE }, { oid: headOid }],
           },
         },
       },
@@ -18822,13 +25289,867 @@ function durableCandidateInventoryAttachmentValue(
   return null;
 }
 
-function githubGitFixture() {
-  const calls = [];
+function durableCurrentOpenGenerationAttachmentValue(fixture, manifest) {
+  assert.equal(manifest.encoding, "deflate-raw");
+  const chunks = manifest.chunks.map(({ blob_sha: blobSha }) => {
+    const chunk = fixture.blobs.get(blobSha);
+    assert.notEqual(chunk, undefined, `missing generation blob ${blobSha}`);
+    return Buffer.isBuffer(chunk.bytes)
+      ? chunk.bytes
+      : Buffer.from(chunk.content, "utf8");
+  });
+  return JSON.parse(inflateRawSync(Buffer.concat(chunks)).toString("utf8"));
+}
+
+async function padOrdinaryLedgerWithStandaloneAttestations({
+  fixture,
+  verifier,
+  targetCommitCount,
+  templateCommitSha = fixture.refTarget,
+}) {
+  const template = fixtureEnvelopeAt(fixture, templateCommitSha);
+  assert.equal(template.record_type, "capability-attestation");
+  const sourceBinding = template.workflow_provenance.operation_binding;
+  const current = fixtureEnvelopeAt(fixture, fixture.refTarget);
+  const paddingServerTime = current.server_observed_at;
+  for (
+    let sequence = current.sequence + 1;
+    sequence < targetCommitCount;
+    sequence += 1
+  ) {
+    const requestInput = {
+      schema: V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
+      schema_version: 1,
+      operation: sourceBinding.operation,
+      repository: structuredClone(sourceBinding.repository),
+      ledger_ref: sourceBinding.ledger_ref,
+      predecessor_commit_sha: fixture.refTarget,
+      protection_receipt_digest:
+        sourceBinding.protection_receipt_digest,
+      source_workflow: structuredClone(sourceBinding.source_workflow),
+      effect_scope: null,
+      evaluated_scope_receipt: null,
+      record_identity: null,
+      github_server_time: paddingServerTime,
+    };
+    const nonce = digestCanonical(
+      "codex-review-gate-v2-git-ledger-provenance-nonce",
+      requestInput,
+    );
+    const requestWithoutDigest = {
+      ...requestInput,
+      nonce,
+      audience: `${V2_GIT_LEDGER_OIDC_AUDIENCE}:` +
+        nonce.slice("sha256:".length),
+    };
+    const provenanceRequest = {
+      ...requestWithoutDigest,
+      request_digest: digestCanonical(
+        "codex-review-gate-v2-git-ledger-provenance-request",
+        requestWithoutDigest,
+      ),
+    };
+    const provenance = await verifier({
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode: "mint-and-verify",
+      provenance_request: provenanceRequest,
+      compact_jwt: null,
+      stored_receipt: null,
+    });
+    const envelope = structuredClone(template);
+    envelope.sequence = sequence;
+    envelope.predecessor_commit_sha = fixture.refTarget;
+    envelope.server_observed_at = paddingServerTime;
+    envelope.workflow_provenance = provenance.receipt;
+    envelope.workflow_provenance_jwt = provenance.compact_jwt;
+    delete envelope.envelope_digest;
+    envelope.envelope_digest = digestCanonical(
+      "codex-review-gate-v2-git-ledger-envelope",
+      envelope,
+    );
+    fixture.materializeHistoricalEnvelope(envelope);
+  }
+}
+
+function fixtureEnvelopeAt(fixture, commitSha) {
+  const commit = fixture.commits.get(commitSha);
+  assert.notEqual(commit, undefined, `missing fixture commit ${commitSha}`);
+  const tree = fixture.trees.get(commit.tree.sha);
+  assert.notEqual(tree, undefined, `missing fixture tree ${commit.tree.sha}`);
+  const entry = tree.tree.find((candidate) =>
+    candidate.path === V2_GIT_LEDGER_BLOB_PATH &&
+    candidate.type === "blob");
+  assert.notEqual(entry, undefined, "missing fixture envelope blob entry");
+  const blob = fixture.blobs.get(entry.sha);
+  assert.notEqual(blob, undefined, `missing fixture blob ${entry.sha}`);
+  return JSON.parse(blob.content);
+}
+
+function matureCheckpointFixtureLayout(fixture) {
+  const suffix = [];
+  let cursor = fixture.refTarget;
+  let checkpointCommit = null;
+  let checkpointTree = null;
+  while (cursor !== null) {
+    const commit = fixture.commits.get(cursor);
+    assert.notEqual(commit, undefined, `missing checkpoint commit ${cursor}`);
+    const tree = fixture.trees.get(commit.tree.sha);
+    assert.notEqual(tree, undefined, `missing checkpoint tree ${commit.tree.sha}`);
+    const stateEntry = tree.tree.find((entry) =>
+      entry.path === V2_GIT_LEDGER_CHECKPOINT_STATE_PATH &&
+      entry.type === "tree");
+    if (stateEntry !== undefined) {
+      checkpointCommit = commit;
+      checkpointTree = tree;
+      break;
+    }
+    suffix.unshift({ sha: cursor, commit, tree });
+    cursor = commit.parents.length === 0 ? null : commit.parents[0].sha;
+  }
+  assert.notEqual(checkpointCommit, null, "missing mature checkpoint root");
+  assert.notEqual(checkpointTree, null, "missing mature checkpoint root tree");
+  const stateTreeEntry = checkpointTree.tree.find((entry) =>
+    entry.path === V2_GIT_LEDGER_CHECKPOINT_STATE_PATH &&
+    entry.type === "tree");
+  const stateTree = fixture.trees.get(stateTreeEntry.sha);
+  assert.notEqual(stateTree, undefined, "missing mature checkpoint state tree");
+  const stateBlobEntry = stateTree.tree.find((entry) =>
+    entry.path === V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH &&
+    entry.type === "blob");
+  const sourceTreeEntry = stateTree.tree.find((entry) =>
+    entry.path === "source-query-seed-v1" && entry.type === "tree");
+  assert.notEqual(stateBlobEntry, undefined, "missing mature checkpoint state blob");
+  assert.notEqual(sourceTreeEntry, undefined, "missing mature checkpoint source seed");
+  const sourceTree = fixture.trees.get(sourceTreeEntry.sha);
+  assert.notEqual(sourceTree, undefined, "missing mature checkpoint source tree");
+  const manifestEntry = sourceTree.tree.find((entry) =>
+    entry.path === "manifest-v1.json" && entry.type === "blob");
+  const chunksEntry = sourceTree.tree.find((entry) =>
+    entry.path === "chunks-v1" && entry.type === "tree");
+  assert.notEqual(manifestEntry, undefined, "missing mature checkpoint manifest");
+  assert.notEqual(chunksEntry, undefined, "missing mature checkpoint chunks");
+  const manifest = JSON.parse(fixture.blobs.get(manifestEntry.sha).content);
+  const chunkTree = fixture.trees.get(chunksEntry.sha);
+  assert.notEqual(chunkTree, undefined, "missing mature checkpoint chunk tree");
+  const encoded = Buffer.concat(manifest.chunks.map(({ blob_sha: blobSha }) =>
+    Buffer.from(fixture.blobs.get(blobSha).bytes)));
+  const seed = JSON.parse(inflateRawSync(encoded).toString("utf8"));
+  return {
+    checkpoint_commit: checkpointCommit,
+    checkpoint_tree: checkpointTree,
+    state_tree: stateTree,
+    state_blob_entry: stateBlobEntry,
+    source_tree: sourceTree,
+    manifest,
+    chunk_tree: chunkTree,
+    seed,
+    suffix,
+  };
+}
+
+function resealMatureCheckpointClassificationForFixture({
+  fixture,
+  mutateClassification,
+  resealProjectionDigest = true,
+}) {
+  const layout = matureCheckpointFixtureLayout(fixture);
+  const rootEnvelopeEntry = layout.checkpoint_tree.tree.find((entry) =>
+    entry.path === V2_GIT_LEDGER_BLOB_PATH && entry.type === "blob");
+  assert.notEqual(rootEnvelopeEntry, undefined,
+    "missing mature checkpoint carrier");
+  const state = JSON.parse(
+    fixture.blobs.get(layout.state_blob_entry.sha).content,
+  );
+  const classification = state.next_unit.classification_projection;
+  mutateClassification(classification);
+  if (resealProjectionDigest) {
+    delete classification.projection_digest;
+    classification.projection_digest = digestCanonical(
+      "codex-review-gate-v2-candidate-inventory-cycle-classification",
+      classification,
+    );
+  }
+  state.next_unit.projection_digest = classification.projection_digest;
+  state.next_unit.admission_digest = digestCanonical(
+    "codex-review-gate-v2-checkpoint-next-unit-admission",
+    {
+      schema:
+        "codex-review-gate-git-ledger-checkpoint-next-unit-admission-handle-v2",
+      schema_version: 1,
+      repository: structuredClone(state.repository),
+      ledger_ref: state.ledger_ref,
+      source_load_digest: state.source.source_load_digest,
+      next_unit_kind: state.next_unit.kind,
+      cycle_id: state.next_unit.cycle_id,
+      stable_cycle_receipt_digest:
+        state.next_unit.stable_cycle_receipt_digest,
+      stable_command_authority_digest:
+        state.next_unit.stable_command_authority_digest,
+      trigger_identity_digest: state.next_unit.trigger_identity_digest,
+      projection_digest: state.next_unit.projection_digest,
+      total_commit_budget_required:
+        state.next_unit.total_commit_budget_required,
+      current_epoch_remaining_commit_capacity:
+        state.next_unit.current_epoch_remaining_commit_capacity,
+      fresh_epoch_remaining_commit_capacity:
+        state.next_unit.fresh_epoch_remaining_commit_capacity,
+    },
+  );
+  delete state.checkpoint_state_digest;
+  state.checkpoint_state_digest = digestCanonical(
+    "codex-review-gate-v2-checkpoint-state",
+    state,
+  );
+  const stateContent = `${canonicalJson(state)}\n`;
+  const stateBytes = Buffer.from(stateContent, "utf8");
+  const stateBlobSha = gitObjectSha("blob", stateBytes);
+  fixture.blobs.set(stateBlobSha, {
+    sha: stateBlobSha,
+    content: stateContent,
+    bytes: stateBytes,
+  });
+  const nextStateTreeEntries = layout.state_tree.tree.map((entry) =>
+    entry.path === V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH
+      ? { ...entry, sha: stateBlobSha }
+      : structuredClone(entry));
+  const stateTreeSha = canonicalGitTreeSha(nextStateTreeEntries);
+  fixture.trees.set(stateTreeSha, {
+    sha: stateTreeSha,
+    tree: nextStateTreeEntries,
+  });
+
+  const carrier = JSON.parse(
+    fixture.blobs.get(rootEnvelopeEntry.sha).content,
+  );
+  carrier.payload.checkpoint_state_tree_sha = stateTreeSha;
+  carrier.payload.checkpoint_state_digest = state.checkpoint_state_digest;
+  carrier.payload.next_unit_admission_digest =
+    state.next_unit.admission_digest;
+  delete carrier.payload.payload_digest;
+  carrier.payload.payload_digest = digestCanonical(
+    "codex-review-gate-v2-checkpoint-carrier-payload",
+    carrier.payload,
+  );
+  carrier.payload_digest = carrier.payload.payload_digest;
+  carrier.workflow_provenance.operation_binding.record_identity
+    .payload_digest = carrier.payload_digest;
+  resealProvenance(carrier.workflow_provenance);
+  delete carrier.carrier_digest;
+  carrier.carrier_digest = digestCanonical(
+    "codex-review-gate-v2-checkpoint-carrier",
+    carrier,
+  );
+  const carrierContent = `${canonicalJson(carrier)}\n`;
+  const carrierBytes = Buffer.from(carrierContent, "utf8");
+  const carrierBlobSha = gitObjectSha("blob", carrierBytes);
+  fixture.blobs.set(carrierBlobSha, {
+    sha: carrierBlobSha,
+    content: carrierContent,
+    bytes: carrierBytes,
+  });
+  const rootTreeEntries = layout.checkpoint_tree.tree.map((entry) => {
+    if (entry.path === V2_GIT_LEDGER_BLOB_PATH) {
+      return { ...entry, sha: carrierBlobSha };
+    }
+    if (entry.path === V2_GIT_LEDGER_CHECKPOINT_STATE_PATH) {
+      return { ...entry, sha: stateTreeSha };
+    }
+    return structuredClone(entry);
+  });
+  const rootTreeSha = canonicalGitTreeSha(rootTreeEntries);
+  fixture.trees.set(rootTreeSha, {
+    sha: rootTreeSha,
+    tree: rootTreeEntries,
+  });
+  let predecessor = storeRewrittenFixtureCommit({
+    fixture,
+    original: layout.checkpoint_commit,
+    treeSha: rootTreeSha,
+    parents: layout.checkpoint_commit.parents.map(({ sha }) => sha),
+  });
+  const checkpointCommitSha = predecessor;
+
+  const semanticRecords = layout.seed.records.map((entry) =>
+    structuredClone(entry));
+  const attemptRecords = [];
+  for (const { commit: originalCommit, tree: originalTree } of layout.suffix) {
+    const envelopeEntry = originalTree.tree.find((entry) =>
+      entry.path === V2_GIT_LEDGER_BLOB_PATH && entry.type === "blob");
+    const envelope = JSON.parse(
+      fixture.blobs.get(envelopeEntry.sha).content,
+    );
+    envelope.predecessor_commit_sha = predecessor;
+    envelope.workflow_provenance.operation_binding
+      .predecessor_commit_sha = predecessor;
+    const candidateAuthority =
+      deriveV2GitLedgerCandidateInventoryAuthority(
+        semanticRecords,
+        REPOSITORY,
+      );
+    if (envelope.record_type === "candidate-inventory-observation") {
+      envelope.payload.prior_candidate_authority_digest =
+        candidateAuthority.authority_digest;
+      if (envelope.payload.phase === "attempt") {
+        const priorAttempt = attemptRecords.at(-1) ?? null;
+        envelope.payload.prior_attempt_record_oid =
+          priorAttempt?.record_oid ?? null;
+      } else if (envelope.payload.phase === "cycle-complete") {
+        envelope.payload.attempt_records = attemptRecords.map(
+          (attempt) => structuredClone(attempt),
+        );
+      }
+    } else if (
+      envelope.record_type === "candidate-dispatch-observation"
+    ) {
+      const candidateAuthorityDigest = candidateAuthority.authority_digest;
+      const completedRecordOid =
+        candidateAuthority.completed_cycle.complete_record_oid;
+      const generationId = `candidate-dispatch:${digestCanonical(
+        "codex-review-gate-v2-candidate-dispatch-generation",
+        {
+          repository: {
+            owner: REPOSITORY.owner,
+            name: REPOSITORY.name,
+            id: REPOSITORY.id,
+            node_id: REPOSITORY.node_id,
+          },
+          cycle_id: envelope.payload.cycle_id,
+          completed_cycle_record_oid: completedRecordOid,
+          inventory_digest: envelope.payload.inventory_digest,
+        },
+      ).slice("sha256:".length)}`;
+      envelope.payload.generation_id = generationId;
+      envelope.payload.candidate_inventory_authority_digest =
+        candidateAuthorityDigest;
+      envelope.payload.completed_cycle_record_oid = completedRecordOid;
+      const reservation = envelope.payload.reservation;
+      reservation.generation_id = generationId;
+      reservation.candidate_inventory_authority_digest =
+        candidateAuthorityDigest;
+      reservation.completed_cycle_record_oid = completedRecordOid;
+      reservation.source_tip_commit_sha = predecessor;
+      reservation.dispatch_digest = digestCanonical(
+        "codex-review-gate-v2-candidate-dispatch-selection",
+        {
+          repository: reservation.repository,
+          generation_id: reservation.generation_id,
+          cycle_id: reservation.cycle_id,
+          candidate_inventory_authority_digest:
+            reservation.candidate_inventory_authority_digest,
+          inventory_digest: reservation.inventory_digest,
+          batch_index: reservation.batch_index,
+          batch_count: reservation.batch_count,
+          candidate_offset: reservation.candidate_offset,
+          candidates: reservation.candidates,
+        },
+      );
+      delete reservation.reservation_digest;
+      reservation.reservation_digest = digestCanonical(
+        "codex-review-gate-v2-candidate-dispatch-reservation",
+        reservation,
+      );
+    }
+    const operationBinding = envelope.workflow_provenance.operation_binding;
+    const evaluatedScope = operationBinding.evaluated_scope_receipt;
+    const evaluatedScopeInput = {
+      repository: evaluatedScope.repository,
+      payload: envelope.payload,
+      trigger_identity: {
+        event_name: evaluatedScope.trigger_event_name,
+        ref: evaluatedScope.trigger_ref,
+        sha: evaluatedScope.trigger_sha,
+      },
+      repository_endpoint_receipt:
+        evaluatedScope.scope_endpoint_receipt,
+    };
+    operationBinding.evaluated_scope_receipt =
+      envelope.record_type === "candidate-inventory-observation"
+        ? createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt(
+          evaluatedScopeInput,
+        )
+        : createV2GitLedgerCandidateDispatchEvaluatedScopeReceipt(
+          evaluatedScopeInput,
+        );
+    envelope.payload_digest = digestV2GitLedgerPayload(envelope.payload);
+    operationBinding.record_identity.payload_digest = envelope.payload_digest;
+    resealProvenance(envelope.workflow_provenance);
+    resealEnvelope(envelope);
+    const envelopeContent = `${canonicalJson(envelope)}\n`;
+    const envelopeBytes = Buffer.from(envelopeContent, "utf8");
+    const envelopeBlobSha = gitObjectSha("blob", envelopeBytes);
+    fixture.blobs.set(envelopeBlobSha, {
+      sha: envelopeBlobSha,
+      content: envelopeContent,
+      bytes: envelopeBytes,
+    });
+    const nextTreeEntries = originalTree.tree.map((entry) =>
+      entry.path === V2_GIT_LEDGER_BLOB_PATH
+        ? { ...entry, sha: envelopeBlobSha }
+        : structuredClone(entry));
+    const treeSha = canonicalGitTreeSha(nextTreeEntries);
+    fixture.trees.set(treeSha, { sha: treeSha, tree: nextTreeEntries });
+    predecessor = storeRewrittenFixtureCommit({
+      fixture,
+      original: originalCommit,
+      treeSha,
+      parents: [predecessor],
+    });
+    let attachmentEvidence = null;
+    if (envelope.record_type === "candidate-inventory-observation") {
+      if (envelope.payload.phase === "attempt") {
+        const values = envelope.payload.attachment_manifest.artifacts.map(
+          (artifact) => ({
+            artifact,
+            value: durableCandidateInventoryAttachmentValue(
+              fixture,
+              artifact.receipt_digest,
+            ),
+          }),
+        );
+        assert.equal(values.every(({ value }) => value !== null), true);
+        attachmentEvidence = {
+          initial_inventory: values.find(({ artifact }) =>
+            artifact.role === "initial-inventory").value,
+          shard_receipts: values.filter(({ artifact }) =>
+            artifact.role === "initial-shard").map(({ value }) => value),
+          final_inventory: values.find(({ artifact }) =>
+            artifact.role === "final-inventory").value,
+          final_shard_receipts: values.filter(({ artifact }) =>
+            artifact.role === "final-shard").map(({ value }) => value),
+        };
+        attemptRecords.push({
+          record_oid: predecessor,
+          attempt_evidence_digest:
+            envelope.payload.attempt_evidence_digest,
+          attachment_manifest_digest:
+            envelope.payload.attachment_manifest.manifest_digest,
+          outcome: envelope.payload.outcome,
+        });
+      }
+    }
+    semanticRecords.push({
+      commit_sha: predecessor,
+      parents: fixture.commits.get(predecessor).parents.map(({ sha }) => sha),
+      tree_sha: treeSha,
+      blob_sha: envelopeBlobSha,
+      envelope: structuredClone(envelope),
+      evidence: {},
+      ...(attachmentEvidence === null ? {} : {
+        candidate_inventory_attachment_evidence: attachmentEvidence,
+      }),
+    });
+  }
+  const rewrittenSnapshot = fixture.snapshotHistoricalState();
+  rewrittenSnapshot.ref_target = predecessor;
+  fixture.restoreHistoricalState(rewrittenSnapshot);
+  return {
+    checkpoint_commit_sha: checkpointCommitSha,
+    transaction_tip_commit_sha: predecessor,
+  };
+}
+
+function assertExactFixtureKeys(value, expectedKeys, label) {
+  assert.equal(
+    value !== null && typeof value === "object" && !Array.isArray(value),
+    true,
+    `${label} must be an object`,
+  );
+  assert.deepEqual(
+    Object.keys(value).sort(),
+    [...expectedKeys].sort(),
+    `${label} has unexpected keys`,
+  );
+}
+
+function assertFixtureOid(value, label) {
+  assert.equal(typeof value, "string", `${label} must be a string`);
+  assert.match(value, /^[0-9a-f]{40}$/u, `${label} must be a Git OID`);
+}
+
+function assertSortedUniqueFixtureOids(records, label) {
+  let prior = null;
+  for (const record of records) {
+    assertFixtureOid(record.sha, `${label} sha`);
+    if (prior !== null) {
+      assert.ok(prior < record.sha, `${label} OIDs must be sorted and unique`);
+    }
+    prior = record.sha;
+  }
+}
+
+function assertC65HistoricalProvenanceReverification(actual, expected) {
+  const project = (entry) => canonicalJson({
+    commit_oid: entry.commit_oid,
+    token_sha256: entry.token_sha256,
+    jti: entry.jti,
+    request_digest: entry.request_digest,
+  });
+  assert.equal(actual.length, expected.length);
+  assert.equal(new Set(actual.map(project)).size, actual.length);
+  assert.deepEqual(actual.map(project).sort(), expected.map(project).sort());
+}
+
+async function loadC65Batch0GitFixtureState({
+  fixtureUrl = C65_BATCH0_GIT_FIXTURE_URL,
+  afterFileIdentityCheck = null,
+} = {}) {
+  assert.notEqual(
+    C65_BATCH0_GIT_FIXTURE_O_CLOEXEC,
+    0,
+    "C65 fixture loader requires an explicit close-on-exec flag",
+  );
+  assert.notEqual(
+    C65_BATCH0_GIT_FIXTURE_O_NONBLOCK,
+    0,
+    "C65 fixture loader requires an explicit nonblocking flag",
+  );
+  const handle = await open(fixtureUrl, C65_BATCH0_GIT_FIXTURE_OPEN_FLAGS);
+  let encoded;
+  try {
+    const before = await handle.stat();
+    assert.equal(before.isFile(), true, "C65 fixture must be a regular file");
+    assert.ok(before.size <= C65_BATCH0_GIT_FIXTURE_MAX_GZIP_BYTES);
+    assert.equal(before.size, C65_BATCH0_GIT_FIXTURE_GZIP_BYTES);
+    await afterFileIdentityCheck?.();
+    const chunks = [];
+    let total = 0;
+    while (total <= C65_BATCH0_GIT_FIXTURE_MAX_GZIP_BYTES) {
+      const buffer = Buffer.allocUnsafe(Math.min(
+        64 * 1024,
+        C65_BATCH0_GIT_FIXTURE_MAX_GZIP_BYTES + 1 - total,
+      ));
+      const { bytesRead } = await handle.read(
+        buffer,
+        0,
+        buffer.byteLength,
+        null,
+      );
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      assert.ok(total <= C65_BATCH0_GIT_FIXTURE_MAX_GZIP_BYTES);
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+    encoded = Buffer.concat(chunks, total);
+    const after = await handle.stat();
+    assert.deepEqual({
+      dev: after.dev,
+      ino: after.ino,
+      type: after.mode & fsConstants.S_IFMT,
+      size: after.size,
+    }, {
+      dev: before.dev,
+      ino: before.ino,
+      type: before.mode & fsConstants.S_IFMT,
+      size: before.size,
+    });
+    assert.equal(after.isFile(), true);
+    assert.equal(after.size, encoded.byteLength);
+  } finally {
+    await handle.close();
+  }
+  assert.equal(encoded.byteLength, C65_BATCH0_GIT_FIXTURE_GZIP_BYTES);
+  assert.equal(rawDigest(encoded), C65_BATCH0_GIT_FIXTURE_GZIP_SHA256);
+  const decoded = gunzipSync(encoded, {
+    maxOutputLength: C65_BATCH0_GIT_FIXTURE_MAX_JSON_BYTES,
+  });
+  assert.equal(decoded.byteLength, C65_BATCH0_GIT_FIXTURE_JSON_BYTES);
+  assert.equal(rawDigest(decoded), C65_BATCH0_GIT_FIXTURE_JSON_SHA256);
+  const decodedText = decoded.toString("utf8");
+  assert.equal(Buffer.byteLength(decodedText, "utf8"), decoded.byteLength);
+  const value = JSON.parse(decodedText);
+  assert.equal(canonicalJson(value), decodedText);
+  assertExactFixtureKeys(value, [
+    "blobs",
+    "clock_second",
+    "commits",
+    "ref_target",
+    "schema",
+    "schema_version",
+    "server_time_frozen",
+    "trees",
+  ], "C65 fixture");
+  assert.equal(value.schema, "codex-review-gate-v2-reachable-git-fixture");
+  assert.equal(value.schema_version, 1);
+  assert.equal(value.ref_target, C65_BATCH0_GIT_FIXTURE_REF);
+  assert.equal(value.clock_second, C65_BATCH0_GIT_FIXTURE_CLOCK_SECOND);
+  assert.equal(value.server_time_frozen, true);
+  assert.equal(value.blobs.length, C65_BATCH0_GIT_FIXTURE_COUNTS.blobs);
+  assert.equal(value.trees.length, C65_BATCH0_GIT_FIXTURE_COUNTS.trees);
+  assert.equal(value.commits.length, C65_BATCH0_GIT_FIXTURE_COUNTS.commits);
+  assertSortedUniqueFixtureOids(value.blobs, "C65 fixture blob");
+  assertSortedUniqueFixtureOids(value.trees, "C65 fixture tree");
+  assertSortedUniqueFixtureOids(value.commits, "C65 fixture commit");
+
   const blobs = new Map();
+  for (const blob of value.blobs) {
+    assertExactFixtureKeys(blob, ["bytes_base64", "sha"], "C65 fixture blob");
+    assert.equal(typeof blob.bytes_base64, "string");
+    const bytes = Buffer.from(blob.bytes_base64, "base64");
+    assert.equal(bytes.toString("base64"), blob.bytes_base64);
+    assert.ok(bytes.byteLength <= MAX_V2_GIT_LEDGER_BLOB_BYTES);
+    assert.equal(gitObjectSha("blob", bytes), blob.sha);
+    blobs.set(blob.sha, bytes);
+  }
+
   const trees = new Map();
+  for (const tree of value.trees) {
+    assertExactFixtureKeys(tree, ["entries", "sha"], "C65 fixture tree");
+    assert.ok(Array.isArray(tree.entries));
+    assert.ok(tree.entries.length > 0 && tree.entries.length <= 64);
+    const entryPaths = new Set();
+    for (const entry of tree.entries) {
+      assertExactFixtureKeys(
+        entry,
+        ["mode", "path", "sha", "type"],
+        "C65 fixture tree entry",
+      );
+      assert.equal(typeof entry.path, "string");
+      assert.ok(Buffer.byteLength(entry.path, "utf8") > 0);
+      assert.ok(Buffer.byteLength(entry.path, "utf8") <= 1024);
+      assert.equal(entry.path.includes("/"), false);
+      assert.equal(entry.path.includes("\0"), false);
+      assert.notEqual(entry.path, ".");
+      assert.notEqual(entry.path, "..");
+      assert.equal(entryPaths.has(entry.path), false);
+      entryPaths.add(entry.path);
+      assertFixtureOid(entry.sha, "C65 fixture tree entry sha");
+      assert.equal(
+        (entry.type === "blob" && entry.mode === "100644") ||
+          (entry.type === "tree" && entry.mode === "040000"),
+        true,
+      );
+    }
+    assert.equal(canonicalGitTreeSha(tree.entries), tree.sha);
+    trees.set(tree.sha, structuredClone(tree.entries));
+  }
+
   const commits = new Map();
-  let refTarget = null;
-  let second = 0;
+  for (const commit of value.commits) {
+    assertExactFixtureKeys(commit, [
+      "author",
+      "committer",
+      "message",
+      "parent_shas",
+      "sha",
+      "tree_sha",
+    ], "C65 fixture commit");
+    assertFixtureOid(commit.tree_sha, "C65 fixture commit tree sha");
+    assert.ok(Array.isArray(commit.parent_shas));
+    assert.ok(commit.parent_shas.length <= 1);
+    for (const parentSha of commit.parent_shas) {
+      assertFixtureOid(parentSha, "C65 fixture commit parent sha");
+      assert.notEqual(parentSha, commit.sha);
+    }
+    for (const [role, identity] of [
+      ["author", commit.author],
+      ["committer", commit.committer],
+    ]) {
+      assertExactFixtureKeys(
+        identity,
+        ["date", "email", "name"],
+        `C65 fixture commit ${role}`,
+      );
+      assert.equal(identity.name, "Codex Review Gate");
+      assert.equal(
+        identity.email,
+        "codex-review-gate@users.noreply.github.com",
+      );
+      assert.equal(typeof identity.date, "string");
+      assert.equal(Number.isFinite(Date.parse(identity.date)), true);
+      assert.equal(new Date(identity.date).toISOString(), identity.date);
+    }
+    assert.equal(typeof commit.message, "string");
+    assert.ok(Buffer.byteLength(commit.message, "utf8") <= 1024);
+    assert.equal(commit.message.includes("\0"), false);
+    const commitBytes = Buffer.from([
+      `tree ${commit.tree_sha}`,
+      ...commit.parent_shas.map((parent) => `parent ${parent}`),
+      `author ${commit.author.name} <${commit.author.email}> ` +
+        gitTimestamp(commit.author.date),
+      `committer ${commit.committer.name} <${commit.committer.email}> ` +
+        gitTimestamp(commit.committer.date),
+      "",
+      commit.message,
+    ].join("\n"), "utf8");
+    assert.equal(gitObjectSha("commit", commitBytes), commit.sha);
+    commits.set(commit.sha, structuredClone(commit));
+  }
+
+  const reachableCommits = [];
+  const reachableCommitOids = new Set();
+  let cursor = value.ref_target;
+  while (cursor !== null) {
+    assert.equal(reachableCommitOids.has(cursor), false, "C65 commit cycle");
+    const commit = commits.get(cursor);
+    assert.notEqual(commit, undefined, `missing C65 commit ${cursor}`);
+    reachableCommitOids.add(cursor);
+    reachableCommits.push(commit);
+    cursor = commit.parent_shas.length === 0 ? null : commit.parent_shas[0];
+  }
+  assert.equal(reachableCommitOids.size, commits.size);
+
+  const reachableTreeOids = new Set();
+  const reachableBlobOids = new Set();
+  const pendingTrees = reachableCommits.map((commit) => commit.tree_sha);
+  while (pendingTrees.length > 0) {
+    const treeSha = pendingTrees.pop();
+    if (reachableTreeOids.has(treeSha)) continue;
+    const entries = trees.get(treeSha);
+    assert.notEqual(entries, undefined, `missing C65 tree ${treeSha}`);
+    reachableTreeOids.add(treeSha);
+    for (const entry of entries) {
+      if (entry.type === "tree") {
+        assert.equal(trees.has(entry.sha), true, `missing C65 tree ${entry.sha}`);
+        pendingTrees.push(entry.sha);
+      } else {
+        assert.equal(blobs.has(entry.sha), true, `missing C65 blob ${entry.sha}`);
+        reachableBlobOids.add(entry.sha);
+      }
+    }
+  }
+  assert.equal(reachableTreeOids.size, trees.size);
+  assert.equal(reachableBlobOids.size, blobs.size);
+
+  const historicalTokenAuthorities = [];
+  const tokenOrdinals = new Set();
+  const tokenDigests = new Set();
+  const tokenJtis = new Set();
+  let priorOrdinal = 0;
+  const fixtureServerTime = new Date(Date.UTC(
+    2026,
+    7,
+    13,
+    12,
+    0,
+    value.clock_second,
+  )).toISOString();
+  const chronologicalCommits = [...reachableCommits].reverse();
+  for (let sequence = 0; sequence < chronologicalCommits.length; sequence += 1) {
+    const commit = chronologicalCommits[sequence];
+    assert.ok(commit.author.date <= fixtureServerTime);
+    assert.ok(commit.committer.date <= fixtureServerTime);
+    const entries = trees.get(commit.tree_sha);
+    const envelopeEntries = entries.filter((entry) =>
+      entry.path === V2_GIT_LEDGER_BLOB_PATH && entry.type === "blob");
+    assert.equal(envelopeEntries.length, 1);
+    const envelopeBytes = blobs.get(envelopeEntries[0].sha);
+    const envelopeText = envelopeBytes.toString("utf8");
+    const envelope = JSON.parse(envelopeText);
+    assert.equal(`${canonicalJson(envelope)}\n`, envelopeText);
+    assert.equal(envelope.schema, V2_GIT_LEDGER_ENVELOPE_SCHEMA);
+    assert.equal(envelope.sequence, sequence);
+    assert.equal(
+      envelope.predecessor_commit_sha,
+      sequence === 0 ? null : chronologicalCommits[sequence - 1].sha,
+    );
+    assert.equal(commit.author.date, envelope.server_observed_at);
+    assert.equal(commit.committer.date, envelope.server_observed_at);
+    assert.equal(
+      commit.message,
+      `Codex Review Gate v2: ${envelope.record_type} #${sequence}`,
+    );
+    assert.ok(envelope.server_observed_at <= fixtureServerTime);
+
+    const jwt = envelope.workflow_provenance_jwt;
+    assert.equal(typeof jwt, "string");
+    const jwtParts = jwt.split(".");
+    assert.equal(jwtParts.length, 3);
+    for (const part of jwtParts) {
+      assert.equal(Buffer.from(part, "base64url").toString("base64url"), part);
+    }
+    const jwtHeader = JSON.parse(
+      Buffer.from(jwtParts[0], "base64url").toString("utf8"),
+    );
+    assert.deepEqual(jwtHeader, {
+      alg: "RS256",
+      kid: "fixture-key-1",
+      typ: "JWT",
+    });
+    const jwtPayload = JSON.parse(
+      Buffer.from(jwtParts[1], "base64url").toString("utf8"),
+    );
+    assertExactFixtureKeys(
+      jwtPayload,
+      ["jti", "ordinal", "request_digest"],
+      "C65 fixture provenance JWT payload",
+    );
+    assert.ok(Number.isSafeInteger(jwtPayload.ordinal));
+    assert.ok(jwtPayload.ordinal > priorOrdinal);
+    priorOrdinal = jwtPayload.ordinal;
+    assert.equal(fixtureJwt(jwtPayload), jwt);
+    assert.equal(tokenOrdinals.has(jwtPayload.ordinal), false);
+    tokenOrdinals.add(jwtPayload.ordinal);
+    assert.equal(tokenJtis.has(jwtPayload.jti), false);
+    tokenJtis.add(jwtPayload.jti);
+
+    const receipt = envelope.workflow_provenance;
+    assert.equal(rawDigest(jwt), receipt.token_sha256);
+    assert.equal(
+      jwtPayload.request_digest,
+      receipt.operation_binding.request_digest,
+    );
+    assert.equal(jwtPayload.jti, receipt.claims.jti);
+    assert.equal(tokenDigests.has(receipt.token_sha256), false);
+    tokenDigests.add(receipt.token_sha256);
+    historicalTokenAuthorities.push(Object.freeze({
+      commit_oid: commit.sha,
+      ordinal: jwtPayload.ordinal,
+      token_sha256: receipt.token_sha256,
+      jti: jwtPayload.jti,
+      request_digest: jwtPayload.request_digest,
+      run_identity: Object.freeze({
+        run_id: receipt.claims.run_id,
+        run_attempt: Number(receipt.claims.run_attempt),
+        actor_id: OWNER.actor_id,
+      }),
+      trigger: Object.freeze({
+        event_name: receipt.claims.event_name,
+        ref: receipt.claims.ref,
+        sha: receipt.claims.sha,
+      }),
+    }));
+  }
+  assert.equal(historicalTokenAuthorities.length, commits.size);
+  assert.equal(priorOrdinal, 718);
+
+  return Object.freeze({
+    git: Object.freeze({
+      ref_target: value.ref_target,
+      clock_second: value.clock_second,
+      server_time_frozen: value.server_time_frozen,
+      blobs: Object.freeze([...blobs].map(([sha, bytes]) =>
+        Object.freeze({ sha, bytes: Buffer.from(bytes) }))),
+      trees: Object.freeze([...trees].map(([sha, entries]) =>
+        Object.freeze({ sha, entries: structuredClone(entries) }))),
+      commits: Object.freeze([...commits].map(([sha, commit]) =>
+        Object.freeze({ sha, ...structuredClone(commit) }))),
+    }),
+    historical_token_authorities: Object.freeze(historicalTokenAuthorities),
+  });
+}
+
+function githubGitFixture(seed = null) {
+  const calls = [];
+  const blobs = new Map((seed?.blobs ?? []).map(({ sha, bytes }) => [sha, {
+    sha,
+    content: Buffer.from(bytes).toString("utf8"),
+    bytes: Buffer.from(bytes),
+  }]));
+  const trees = new Map((seed?.trees ?? []).map(({ sha, entries }) => [sha, {
+    sha,
+    tree: structuredClone(entries),
+  }]));
+  const commits = new Map((seed?.commits ?? []).map((commit) => [commit.sha, {
+    sha: commit.sha,
+    message: commit.message,
+    tree: { sha: commit.tree_sha },
+    parents: commit.parent_shas.map((sha) => ({ sha })),
+    author: structuredClone(commit.author),
+    committer: structuredClone(commit.committer),
+  }]));
+  let refTarget = seed?.ref_target ?? null;
+  let second = seed?.clock_second ?? 0;
   let mismatchReread = false;
   let refRereadOverride = null;
   let failAttestationUpdate = false;
@@ -18836,12 +26157,14 @@ function githubGitFixture() {
   let failRereadAfterEffectUpdate = null;
   let failRefReadOnce = false;
   let failCandidateDispatchPhase = null;
+  let failCandidateDispatchPhaseAfterApply = null;
   let failCandidateInventoryCommitPhase = null;
   let failCandidateInventoryUpdate = false;
   let failCandidateInventoryUpdateAfterApply = false;
   let afterCandidateInventoryUpdateApplied = null;
   let moveRefOnCommitRead = false;
-  let serverTimeFrozen = false;
+  let serverTimeFrozen = seed?.server_time_frozen ?? false;
+  let refReadServerTimeOverride = null;
 
   const fixture = {
     calls,
@@ -18849,8 +26172,78 @@ function githubGitFixture() {
     trees,
     commits,
     get refTarget() { return refTarget; },
+    peekServerTime() {
+      return new Date(Date.UTC(2026, 7, 13, 12, 0, second)).toISOString();
+    },
     get writeCalls() {
       return calls.filter((call) => new Set(["POST", "PATCH"]).has(call.method)).length;
+    },
+    snapshotHistoricalState() {
+      return {
+        ref_target: refTarget,
+        blob_keys: new Set(blobs.keys()),
+        tree_keys: new Set(trees.keys()),
+        commit_keys: new Set(commits.keys()),
+      };
+    },
+    restoreHistoricalState(snapshot) {
+      for (const key of blobs.keys()) {
+        if (!snapshot.blob_keys.has(key)) blobs.delete(key);
+      }
+      for (const key of trees.keys()) {
+        if (!snapshot.tree_keys.has(key)) trees.delete(key);
+      }
+      for (const key of commits.keys()) {
+        if (!snapshot.commit_keys.has(key)) commits.delete(key);
+      }
+      refTarget = snapshot.ref_target;
+    },
+    materializeHistoricalEnvelope(envelope) {
+      assert.equal(envelope.predecessor_commit_sha, refTarget);
+      const envelopeBytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
+      const blobSha = gitObjectSha("blob", envelopeBytes);
+      blobs.set(blobSha, {
+        sha: blobSha,
+        content: envelopeBytes.toString("utf8"),
+        bytes: envelopeBytes,
+      });
+      const treeEntries = [{
+        path: V2_GIT_LEDGER_BLOB_PATH,
+        mode: "100644",
+        type: "blob",
+        sha: blobSha,
+      }];
+      const treeSha = canonicalGitTreeSha(treeEntries);
+      trees.set(treeSha, { sha: treeSha, tree: treeEntries });
+      const message =
+        `Codex Review Gate v2: ${envelope.record_type} #${envelope.sequence}`;
+      const commitBytes = Buffer.from([
+        `tree ${treeSha}`,
+        `parent ${refTarget}`,
+        `author Codex Review Gate <codex-review-gate@users.noreply.github.com> ${gitTimestamp(envelope.server_observed_at)}`,
+        `committer Codex Review Gate <codex-review-gate@users.noreply.github.com> ${gitTimestamp(envelope.server_observed_at)}`,
+        "",
+        message,
+      ].join("\n"), "utf8");
+      const commitSha = gitObjectSha("commit", commitBytes);
+      commits.set(commitSha, {
+        sha: commitSha,
+        message,
+        tree: { sha: treeSha },
+        parents: [{ sha: refTarget }],
+        author: {
+          name: "Codex Review Gate",
+          email: "codex-review-gate@users.noreply.github.com",
+          date: envelope.server_observed_at,
+        },
+        committer: {
+          name: "Codex Review Gate",
+          email: "codex-review-gate@users.noreply.github.com",
+          date: envelope.server_observed_at,
+        },
+      });
+      refTarget = commitSha;
+      return { blob_sha: blobSha, tree_sha: treeSha, commit_sha: commitSha };
     },
     mismatchNextRefReread() { mismatchReread = true; },
     failNextAttestationUpdate() { failAttestationUpdate = true; },
@@ -18860,6 +26253,9 @@ function githubGitFixture() {
     },
     failNextCandidateDispatchUpdate(phase) {
       failCandidateDispatchPhase = phase;
+    },
+    failNextCandidateDispatchUpdateAfterApply(phase) {
+      failCandidateDispatchPhaseAfterApply = phase;
     },
     failNextCandidateInventoryCommit(phase) {
       failCandidateInventoryCommitPhase = phase;
@@ -18879,6 +26275,11 @@ function githubGitFixture() {
     advanceServerTime(seconds) { second += seconds; },
     freezeServerTime() { serverTimeFrozen = true; },
     resumeServerTime() { serverTimeFrozen = false; },
+    overrideRefReadServerTimeAfter(occurrence, serverTime) {
+      assert.ok(Number.isSafeInteger(occurrence) && occurrence > 0);
+      assert.equal(new Date(serverTime).toISOString(), serverTime);
+      refReadServerTimeOverride = { occurrence, server_time: serverTime };
+    },
     moveRefToParentOnNextCommitRead() { moveRefOnCommitRead = true; },
     tipRecordType() { return recordType(refTarget); },
     rewriteTipText(mutator) {
@@ -19061,6 +26462,19 @@ function githubGitFixture() {
           date,
         );
         if (
+          failCandidateDispatchPhaseAfterApply !== null &&
+          recordType(body.sha) === "candidate-dispatch-observation" &&
+          recordEnvelope(body.sha).payload.phase ===
+            failCandidateDispatchPhaseAfterApply
+        ) {
+          failCandidateDispatchPhaseAfterApply = null;
+          return response(500, {
+            message: "Internal Server Error",
+            documentation_url: "https://docs.github.com/rest",
+            status: "500",
+          }, date);
+        }
+        if (
           afterCandidateInventoryUpdateApplied !== null &&
           candidateInventoryUpdate
         ) {
@@ -19096,24 +26510,33 @@ function githubGitFixture() {
         return successfulUpdateResponse;
       }
       if (init.method === "GET" && path === "/git/ref/heads/codex-review-gate-ledger-v2") {
+        let refDate = date;
+        if (refReadServerTimeOverride !== null) {
+          refReadServerTimeOverride.occurrence -= 1;
+          if (refReadServerTimeOverride.occurrence === 0) {
+            refDate = new Date(refReadServerTimeOverride.server_time)
+              .toUTCString();
+            refReadServerTimeOverride = null;
+          }
+        }
         if (failRefReadOnce) {
           failRefReadOnce = false;
           return response(500, {
             message: "Internal Server Error",
             documentation_url: "https://docs.github.com/rest",
             status: "500",
-          }, date);
+          }, refDate);
         }
         if (refTarget === null) {
           return response(404, {
             message: "Not Found",
             documentation_url: "https://docs.github.com/rest/git/refs#get-a-reference",
             status: "404",
-          }, date);
+          }, refDate);
         }
         const target = refRereadOverride ?? refTarget;
         refRereadOverride = null;
-        return response(200, refBody(target), date);
+        return response(200, refBody(target), refDate);
       }
       const commitMatch = path.match(/^\/git\/commits\/([0-9a-f]{40})$/u);
       if (init.method === "GET" && commitMatch !== null) {
@@ -19560,6 +26983,8 @@ async function resealBootstrapCheckpointSourceProvenanceForFixture({
           repository: reservation.repository,
           generation_id: reservation.generation_id,
           cycle_id: reservation.cycle_id,
+          candidate_inventory_authority_digest:
+            reservation.candidate_inventory_authority_digest,
           inventory_digest: reservation.inventory_digest,
           batch_index: reservation.batch_index,
           batch_count: reservation.batch_count,
@@ -19750,16 +27175,19 @@ function gitObjectSha(type, bytes) {
   return createHash("sha1").update(header).update(bytes).digest("hex");
 }
 
-function canonicalGitTreeSha(entriesValue) {
+function canonicalGitTreeBytes(entriesValue) {
   const entries = [...entriesValue].sort((left, right) => Buffer.compare(
     Buffer.from(`${left.path}${left.type === "tree" ? "/" : ""}`, "utf8"),
     Buffer.from(`${right.path}${right.type === "tree" ? "/" : ""}`, "utf8"),
   ));
-  const bytes = Buffer.concat(entries.map((entry) => Buffer.concat([
+  return Buffer.concat(entries.map((entry) => Buffer.concat([
     Buffer.from(`${entry.mode} ${entry.path}\0`, "utf8"),
     Buffer.from(entry.sha, "hex"),
   ])));
-  return gitObjectSha("tree", bytes);
+}
+
+function canonicalGitTreeSha(entriesValue) {
+  return gitObjectSha("tree", canonicalGitTreeBytes(entriesValue));
 }
 
 function gitTimestamp(value) {

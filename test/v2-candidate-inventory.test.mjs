@@ -771,7 +771,10 @@ test("production current-open authority closes the canonical 512-candidate summa
   assert.ok(Object.isFrozen(authority.candidates[0].lifecycle_seed.head.repo));
   assert.equal(
     candidateInventory
-      .assertV2CurrentOpenProductionCandidateAuthorityHandle(authority),
+      .assertV2CurrentOpenProductionCandidateAuthorityHandle(
+        authority,
+        sourceProjection,
+      ),
     authority,
   );
   assert.equal(fake.calls.length, callsAfterProjection, "upgrade is zero-I/O");
@@ -850,7 +853,10 @@ test("production current-open authority is one-shot, same-factory, and never off
   for (const untrusted of [structuredClone(authority), offline]) {
     assert.throws(
       () => candidateInventory
-        .assertV2CurrentOpenProductionCandidateAuthorityHandle(untrusted),
+        .assertV2CurrentOpenProductionCandidateAuthorityHandle(
+          untrusted,
+          sourceProjection,
+        ),
       (error) =>
         error.code === "UNTRUSTED_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
     );
@@ -872,10 +878,71 @@ test("production current-open authority is one-shot, same-factory, and never off
   );
   assert.equal(
     candidateInventory
-      .assertV2CurrentOpenProductionCandidateAuthorityHandle(currentAuthority),
+      .assertV2CurrentOpenProductionCandidateAuthorityHandle(
+        currentAuthority,
+        currentProjection,
+      ),
     currentAuthority,
   );
   assert.equal(ownerFake.calls.length, callsAfterProjection);
+});
+
+test("production current-open live admission requires its exact source projection pair", async () => {
+  const candidateInventory = await import(
+    "../packages/action/src/v2/candidate-inventory.mjs"
+  );
+  const leftFake = fakeGraphQL({ datasets: () => candidateRange(1, 2) });
+  const rightFake = fakeGraphQL({ datasets: () => candidateRange(1, 2) });
+  const leftFactory = createCurrentOpen(candidateInventory, leftFake);
+  const rightFactory = createCurrentOpen(candidateInventory, rightFake);
+  const leftReceipt = await leftFactory.scan();
+  const rightReceipt = await rightFactory.scan();
+  const leftProjection = leftFactory.projectForGitLedger(leftReceipt);
+  const leftSiblingProjection = leftFactory.projectForGitLedger(leftReceipt);
+  const rightProjection = rightFactory.projectForGitLedger(rightReceipt);
+  const leftAuthority = leftFactory.projectProductionCandidateAuthority(
+    leftProjection,
+  );
+  const rightAuthority = rightFactory.projectProductionCandidateAuthority(
+    rightProjection,
+  );
+  assert.deepEqual(leftAuthority, rightAuthority,
+    "equivalent factories intentionally publish equal durable summaries");
+
+  for (const [authority, wrongProjection] of [
+    [leftAuthority, rightProjection],
+    [rightAuthority, leftProjection],
+    [leftAuthority, leftSiblingProjection],
+    [leftAuthority, structuredClone(leftProjection)],
+    [leftAuthority, null],
+  ]) {
+    assert.throws(
+      () => candidateInventory
+        .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+          authority,
+          wrongProjection,
+        ),
+      (error) =>
+        error.code === "UNTRUSTED_CURRENT_OPEN_PRODUCTION_AUTHORITY_PAIR",
+    );
+  }
+  assert.equal(
+    candidateInventory
+      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        leftAuthority,
+        leftProjection,
+      ),
+    leftAuthority,
+    "failed cross-pair attempts do not consume the correct live pair",
+  );
+  assert.equal(
+    candidateInventory
+      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        rightAuthority,
+        rightProjection,
+      ),
+    rightAuthority,
+  );
 });
 
 test("production current-open live admission is one-shot and revoked when the next scan begins", async () => {
@@ -896,6 +963,7 @@ test("production current-open live admission is one-shot and revoked when the ne
     candidateInventory
       .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
         consumedAuthority,
+        consumedProjection,
       ),
     consumedAuthority,
   );
@@ -903,6 +971,7 @@ test("production current-open live admission is one-shot and revoked when the ne
     () => candidateInventory
       .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
         consumedAuthority,
+        consumedProjection,
       ),
     (error) =>
       error.code === "CONSUMED_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
@@ -944,7 +1013,10 @@ test("production current-open live admission is one-shot and revoked when the ne
     "the next scan is blocked before its first adapter response");
   assert.throws(
     () => candidateInventory
-      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(firstAuthority),
+      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        firstAuthority,
+        firstProjection,
+      ),
     (error) =>
       error.code === "STALE_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
   );
@@ -954,7 +1026,10 @@ test("production current-open live admission is one-shot and revoked when the ne
   const secondReceipt = await secondScan;
   assert.throws(
     () => candidateInventory
-      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(firstAuthority),
+      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        firstAuthority,
+        firstProjection,
+      ),
     (error) =>
       error.code === "STALE_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
   );
@@ -964,7 +1039,10 @@ test("production current-open live admission is one-shot and revoked when the ne
   );
   assert.equal(
     candidateInventory
-      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(secondAuthority),
+      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        secondAuthority,
+        secondProjection,
+      ),
     secondAuthority,
   );
 });
@@ -1013,7 +1091,10 @@ test("production current-open authority claim blocks synchronous mint reentry", 
   assert.equal(fake.calls.length, callsBeforeProjection);
   assert.equal(
     candidateInventory
-      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(authority),
+      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        authority,
+        projection,
+      ),
     authority,
   );
 });
@@ -1060,6 +1141,7 @@ test("production current-open authority rechecks revocation before brand publica
     candidateInventory
       .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
         replacementAuthority,
+        replacementProjection,
       ),
     replacementAuthority,
   );
@@ -1131,7 +1213,10 @@ test("production current-open canonical digests ignore runtime intrinsic poisoni
     "restored canonicalization must replay the branded public summary");
   assert.equal(
     candidateInventory
-      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(authority),
+      .consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+        authority,
+        projection,
+      ),
     authority,
   );
 });
@@ -1182,7 +1267,10 @@ test("production current-open authority enforces exact own-data replay", async (
   }
   assert.equal(
     candidateInventory
-      .assertV2CurrentOpenProductionCandidateAuthorityHandle(authority),
+      .assertV2CurrentOpenProductionCandidateAuthorityHandle(
+        authority,
+        projection,
+      ),
     authority,
     "offline validation failures cannot consume or replace the live brand",
   );
@@ -1388,23 +1476,43 @@ test("current-open deadlines ignore poisoned Array iterators for fetch and body 
   const candidateInventory = await import(
     "../packages/action/src/v2/candidate-inventory.mjs"
   );
-  const delayedFetchFactory = createCurrentOpen(candidateInventory, {
-    fetch: async () => {
-      await new Promise((resolve) => setTimeout(resolve, 80));
-      return jsonResponse(
+  let fetchSettled = false;
+  let releaseFetch;
+  const fetchGate = new Promise((resolve) => {
+    releaseFetch = () => {
+      fetchSettled = true;
+      resolve(jsonResponse(
         { message: "late failure" },
         { Date: "Thu, 13 Aug 2026 12:00:00 GMT" },
         500,
-      );
-    },
+      ));
+    };
+  });
+  const fetchFallback = setTimeout(releaseFetch, 500);
+  const delayedFetchFactory = createCurrentOpen(candidateInventory, {
+    fetch: () => fetchGate,
   }, { timeoutMs: 5 });
-  const fetchResult = await withTruncatedArrayIterator(
-    () => delayedFetchFactory.scan(),
-  );
-  assert.equal(fetchResult.error?.code, "CANDIDATE_HTTP_TIMEOUT");
-  assert.ok(fetchResult.elapsedMs < 60, "fetch deadline settles before adapter");
+  try {
+    const fetchResult = await withTruncatedArrayIterator(
+      () => delayedFetchFactory.scan(),
+    );
+    assert.equal(fetchResult.error?.code, "CANDIDATE_HTTP_TIMEOUT");
+    assert.equal(fetchSettled, false, "fetch deadline settles before adapter");
+  } finally {
+    clearTimeout(fetchFallback);
+    releaseFetch();
+  }
 
   let cancelled = false;
+  let readSettled = false;
+  let releaseRead;
+  const readGate = new Promise((resolve) => {
+    releaseRead = () => {
+      readSettled = true;
+      resolve({ done: true, value: undefined });
+    };
+  });
+  const readFallback = setTimeout(releaseRead, 500);
   const delayedReadFactory = createCurrentOpen(candidateInventory, {
     fetch: async () => ({
       status: 200,
@@ -1423,10 +1531,7 @@ test("current-open deadlines ignore poisoned Array iterators for fetch and body 
         getReader() {
           return {
             read() {
-              return new Promise((resolve) => setTimeout(
-                () => resolve({ done: true, value: undefined }),
-                80,
-              ));
+              return readGate;
             },
             cancel() {
               cancelled = true;
@@ -1438,12 +1543,17 @@ test("current-open deadlines ignore poisoned Array iterators for fetch and body 
       },
     }),
   }, { timeoutMs: 5 });
-  const readResult = await withTruncatedArrayIterator(
-    () => delayedReadFactory.scan(),
-  );
-  assert.equal(readResult.error?.code, "CANDIDATE_HTTP_TIMEOUT");
-  assert.ok(readResult.elapsedMs < 60, "body deadline settles before reader");
-  assert.equal(cancelled, true);
+  try {
+    const readResult = await withTruncatedArrayIterator(
+      () => delayedReadFactory.scan(),
+    );
+    assert.equal(readResult.error?.code, "CANDIDATE_HTTP_TIMEOUT");
+    assert.equal(readSettled, false, "body deadline settles before reader");
+    assert.equal(cancelled, true);
+  } finally {
+    clearTimeout(readFallback);
+    releaseRead();
+  }
 });
 
 test("current-open transport keeps typed errors private from abort and cancel adapters", {
@@ -3315,7 +3425,6 @@ async function withTruncatedArrayIterator(operation) {
       return { done: true, value: undefined };
     },
   });
-  const startedAt = Date.now();
   let error = null;
   try {
     await operation();
@@ -3324,7 +3433,7 @@ async function withTruncatedArrayIterator(operation) {
   } finally {
     Object.defineProperty(iteratorPrototype, "next", nextDescriptor);
   }
-  return { error, elapsedMs: Date.now() - startedAt };
+  return { error };
 }
 
 function listPullRequest(

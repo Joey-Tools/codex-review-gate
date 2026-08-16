@@ -77,6 +77,7 @@ const EXPECTED_V2_RUNTIME_MODULE_PATHS = Object.freeze([
   "src/v2/control-plane-receipt.mjs",
   "src/v2/effect-status-wal.mjs",
   "src/v2/git-ledger.mjs",
+  "src/v2/persistent-frontier.mjs",
   "src/v2/projection.mjs",
   "src/v2/projector.mjs",
   "src/v2/public-report-projector.mjs",

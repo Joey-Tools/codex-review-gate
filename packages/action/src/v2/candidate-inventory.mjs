@@ -818,15 +818,20 @@ export function projectV2CurrentOpenCandidateInventoryForGitLedger() {
 }
 
 /**
- * Consume the exact production authority minted by one factory upgrade.
+ * Consume the exact production authority and source-projection pair minted by
+ * one factory upgrade.
  *
  * Offline structural replay never registers this private brand. The binding
  * deliberately retains the exact source projection identity and private scan
- * generation while the public durable summary exposes neither. Starting any
- * newer scan synchronously revokes the prior generation, and each handle is
- * admitted once.
+ * generation while the public durable summary exposes neither. The source
+ * projection remains ephemeral and is identity-checked here; it is not part of
+ * the durable authority. Starting any newer scan synchronously revokes the
+ * prior generation, and each exact pair is admitted once.
  */
-export function consumeV2CurrentOpenProductionCandidateAuthorityHandle(value) {
+export function consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+  value,
+  sourceProjection,
+) {
   const binding = value === null ||
       (typeof value !== "object" && typeof value !== "function")
     ? undefined
@@ -838,6 +843,23 @@ export function consumeV2CurrentOpenProductionCandidateAuthorityHandle(value) {
     throw inventoryError(
       "UNTRUSTED_CURRENT_OPEN_PRODUCTION_AUTHORITY_HANDLE",
       "production candidate authority requires the exact live factory handle",
+    );
+  }
+  const projectionBinding = sourceProjection === null ||
+      (typeof sourceProjection !== "object" &&
+        typeof sourceProjection !== "function")
+    ? undefined
+    : safeWeakMapGet(
+      CURRENT_OPEN_GIT_LEDGER_PROJECTION_HANDLES,
+      sourceProjection,
+    );
+  if (sourceProjection !== binding.source_projection ||
+      projectionBinding === undefined ||
+      projectionBinding.factory_epoch !== binding.factory_epoch ||
+      projectionBinding.scan_generation !== binding.scan_generation) {
+    throw inventoryError(
+      "UNTRUSTED_CURRENT_OPEN_PRODUCTION_AUTHORITY_PAIR",
+      "production candidate authority requires its exact live source projection",
     );
   }
   if (binding.generation_token.active !== true ||
@@ -865,8 +887,14 @@ export function consumeV2CurrentOpenProductionCandidateAuthorityHandle(value) {
   return value;
 }
 
-export function assertV2CurrentOpenProductionCandidateAuthorityHandle(value) {
-  return consumeV2CurrentOpenProductionCandidateAuthorityHandle(value);
+export function assertV2CurrentOpenProductionCandidateAuthorityHandle(
+  value,
+  sourceProjection,
+) {
+  return consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+    value,
+    sourceProjection,
+  );
 }
 
 /**

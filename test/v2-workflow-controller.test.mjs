@@ -38,6 +38,7 @@ import {
   listAllOpenPullRequests,
   loadV2GitLedgerTriggerIdentity,
   loadV2MinimalLiveScope,
+  MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES,
   markV2EffectAttempted,
   projectV2MinimalScopeForGitLedger,
   projectV2LeasedDiscoveryContinuityForGitLedger,
@@ -51,6 +52,7 @@ import {
   validateV2EffectLedger,
   validateV2StatusWrites,
   V2WorkflowControllerError,
+  writeV2ScheduleDispatchMatrixOutput,
   writeV2WorkflowOutputs,
 } from "../packages/action/src/v2/workflow-controller.mjs";
 import {
@@ -67,6 +69,9 @@ import {
   V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
   V2_GIT_LEDGER_PROVENANCE_VERIFIER_RESULT_SCHEMA,
   V2_GIT_LEDGER_REF,
+  calculateV2GitLedgerCandidateDispatchCommitBudget,
+  MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_BINDING_BYTES,
+  MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_PLAN_BYTES,
   projectV2GitLedgerCandidateDispatchBinding,
   V2_GIT_LEDGER_CANDIDATE_DISPATCH_PLAN_SCHEMA,
   validateV2GitLedgerProvenanceReceipt,
@@ -93,6 +98,23 @@ const MERGE_BASE = "d".repeat(40);
 const TREE = "e".repeat(40);
 const PUBLIC_DIGEST = `sha256:${"f".repeat(64)}`;
 const TIME = "2026-08-13T12:00:00.000Z";
+
+function fixtureHeadForPull(number) {
+  return number === 7 ? HEAD : number.toString(16).padStart(40, "0");
+}
+
+function fixtureHeadRefForPull(number) {
+  return number === 7 ? "feature" : `feature-${number}`;
+}
+
+function fixtureMergeForPull(number) {
+  return number === 7 ? MERGE : (10_000 + number).toString(16).padStart(40, "0");
+}
+
+function fixtureTreeForPull(number) {
+  return number === 7 ? TREE : (20_000 + number).toString(16).padStart(40, "0");
+}
+
 const REQUEST_URL =
   "https://github.com/owner/repo/pull/7#issuecomment-1001";
 const ARTIFACT_URL =
@@ -2501,7 +2523,7 @@ test("production assembler forms a branded preflight and OIDC bootstrap handoff"
           ...environment,
           ...oidc.environment,
           GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.test",
+          GITHUB_API_URL: "https://api.github.com",
         },
         fetch,
       }).then(
@@ -2544,7 +2566,7 @@ test("production initial route binds the full branded automatic request chain", 
       ...environment,
       ...oidc.environment,
       GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.test",
+      GITHUB_API_URL: "https://api.github.com",
     }, { fetch: github.fetch });
     const cycle = result.cycle;
 
@@ -2762,7 +2784,7 @@ test("production binds a terminal primary status before its head sentinel", asyn
       ...environment,
       ...oidc.environment,
       GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.test",
+      GITHUB_API_URL: "https://api.github.com",
     }, { fetch: github.fetch });
 
     assert.equal(result.cycle.terminal_result.decision, "findings");
@@ -2814,7 +2836,7 @@ for (const failedIntentOrdinal of [1, 2]) {
           ...environment,
           ...oidc.environment,
           GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.test",
+          GITHUB_API_URL: "https://api.github.com",
         };
 
         await assert.rejects(
@@ -2899,7 +2921,7 @@ for (const failedResponseOrdinal of [1, 2]) {
           ...environment,
           ...oidc.environment,
           GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.test",
+          GITHUB_API_URL: "https://api.github.com",
         };
 
         await assert.rejects(
@@ -2961,7 +2983,7 @@ test("second terminal status ambiguity consumes its suffix without retry", async
       ...environment,
       ...oidc.environment,
       GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.test",
+      GITHUB_API_URL: "https://api.github.com",
     };
     const first = await runV2WorkflowControllerCli(firstEnvironment, {
       fetch: github.fetch,
@@ -3011,10 +3033,10 @@ test("second terminal status ambiguity consumes its suffix without retry", async
 for (const refetchMode of ["missing", "drift", "duplicate", "error"]) {
   test(`status ${refetchMode} refetch consumes one intent without retry`, async () => {
     await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
+      eventName: "pull_request_target",
+      event: { pull_request: { number: 7 } },
+      route: "ordinary",
+      pullRequest: "7",
     }, async ({ environment }) => {
       const command = await prepareV2WorkflowCommand(environment);
       const liveTime = new Date().toISOString();
@@ -3025,7 +3047,7 @@ for (const refetchMode of ["missing", "drift", "duplicate", "error"]) {
         ...environment,
         ...oidc.environment,
         GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.test",
+        GITHUB_API_URL: "https://api.github.com",
       }, { fetch: github.fetch });
       const cycle = result.cycle;
 
@@ -3099,7 +3121,7 @@ for (const requestCase of [
           ...environment,
           ...oidc.environment,
           GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.test",
+          GITHUB_API_URL: "https://api.github.com",
         }, { fetch: github.fetch });
         const cycle = result.cycle;
 
@@ -3182,7 +3204,7 @@ test("automatic request binding resumes internal ledger appends without a second
         ...environment,
         ...oidc.environment,
         GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.test",
+        GITHUB_API_URL: "https://api.github.com",
       }, { fetch: github.fetch });
 
       assert.equal(
@@ -3227,7 +3249,7 @@ test("intent-persisted restart consumes the existing automatic request attempt",
         ...environment,
         ...oidc.environment,
         GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.test",
+        GITHUB_API_URL: "https://api.github.com",
       };
 
       await assert.rejects(
@@ -3309,7 +3331,7 @@ test("production advances addressed findings through three automatic generations
         ...environment,
         ...oidc.environment,
         GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.test",
+        GITHUB_API_URL: "https://api.github.com",
       };
       const runLeg = async (name, runId) => {
         const legEnvironment = await makeWorkflowLegEnvironment({
@@ -3863,7 +3885,7 @@ test("bound automatic request fails closed when its no-refund lease release fail
           ...environment,
           ...oidc.environment,
           GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.test",
+          GITHUB_API_URL: "https://api.github.com",
         },
         fetch: github.fetch,
       }),
@@ -3910,7 +3932,7 @@ test("ambiguous status retains its intent when no-refund release fails", async (
           ...environment,
           ...oidc.environment,
           GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.test",
+          GITHUB_API_URL: "https://api.github.com",
         },
         fetch: github.fetch,
       }),
@@ -3961,7 +3983,7 @@ test("ambiguous reservation status retains two writes when lease release fails",
             ...environment,
             ...oidc.environment,
             GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-            GITHUB_API_URL: "https://api.github.test",
+            GITHUB_API_URL: "https://api.github.com",
           },
           fetch: github.fetch,
         }),
@@ -4007,7 +4029,7 @@ test("established history preserves one bound request without replay", async () 
       ...environment,
       ...oidc.environment,
       GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.test",
+      GITHUB_API_URL: "https://api.github.com",
     };
     const first = await runV2WorkflowControllerCli(firstEnvironment, {
       fetch: github.fetch,
@@ -4146,7 +4168,7 @@ test("incompatible live configuration publishes only a rich zero-effect result",
       ...environment,
       ...oidc.environment,
       GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.test",
+      GITHUB_API_URL: "https://api.github.com",
     }, { fetch });
     assert.equal(result.cycle.terminal_result.decision, "blocked-configuration");
     assert.equal(result.cycle.terminal_result.public_effects_performed, 0);
@@ -4304,7 +4326,70 @@ test("scan-all run rejects the single-PR route and list-open has no production C
   });
 });
 
-test("schedule-dispatch durably scans once and restarts the active raw-plan matrix", async () => {
+test("schedule-dispatch bootstraps one current-open candidate without legacy REST", async () => {
+  await withWorkflowCliFixture({
+    eventName: "schedule",
+    event: {},
+    route: "scan-all-open",
+    pullRequest: "",
+  }, async ({ environment }) => {
+    const command = await prepareV2WorkflowCommand(environment);
+    const liveTime = new Date().toISOString();
+    const oidc = productionOidcFixture(command, liveTime);
+    const selectedEnvironment = {
+      ...environment,
+      ...oidc.environment,
+      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+      GITHUB_API_URL: "https://api.github.com",
+    };
+    const github = productionControllerGitHubFixture(
+      command,
+      oidc,
+      liveTime,
+      {
+        candidateNumbers: [7],
+        apiOrigin: "https://api.github.com",
+      },
+    );
+    const currentOpenRequestsBefore =
+      github.currentOpenCandidateRequests().length;
+    const inventoryRequestsBefore =
+      github.candidateInventoryRequests().length;
+    const lifecycleRequestsBefore =
+      github.candidateLifecycleRequests().length;
+    const ledgerWritesBefore = github.ledgerWriteRequests().length;
+
+    const result = await runV2ScheduleDispatchCli(selectedEnvironment, {
+      fetch: github.fetch,
+    });
+
+    assert.equal(result.matrix.include.length, 1);
+    assert.equal(result.matrix.include[0].enabled, true);
+    assert.equal(result.matrix.include[0].pull_request, 7);
+    assert.equal(
+      github.currentOpenCandidateRequests().length - currentOpenRequestsBefore,
+      4,
+    );
+    assert.equal(
+      github.candidateInventoryRequests().length - inventoryRequestsBefore,
+      0,
+    );
+    assert.equal(
+      github.candidateLifecycleRequests().length - lifecycleRequestsBefore,
+      0,
+    );
+    assert.equal(
+      github.ledgerWriteRequests().slice(ledgerWritesBefore)
+        .filter((request) => request.startsWith("PATCH /git/refs/"))
+        .length,
+      4,
+      "bootstrap plus current-open publication must use four protected-ref updates",
+    );
+    assertNoDispatchAuthorityInternals(result);
+  });
+});
+
+test("schedule-dispatch persists current-open authority without legacy full refresh and restarts the active raw-plan matrix", async () => {
   await withWorkflowCliFixture({
     eventName: "schedule",
     event: {},
@@ -4371,15 +4456,49 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
     assert.equal(row.enabled, true);
     assert.equal(row.pull_request, 7);
     const rowBinding = JSON.parse(row.dispatch_binding);
-    assert.equal(rowBinding.candidate.number, 7);
+    assert.equal(rowBinding.candidate.schema_version, 2);
+    assert.equal(rowBinding.candidate.identity.number, 7);
     assert.deepEqual(Object.keys(rowBinding).sort(), [
       "batch_count",
       "batch_index",
+      "binding_digest",
       "candidate",
+      "candidate_dispatch_authority_digest",
+      "candidate_index",
+      "candidate_inventory_authority_digest",
+      "candidate_source",
       "cycle_id",
       "dispatch_digest",
       "generation_id",
       "inventory_digest",
+      "repository",
+      "reservation_digest",
+      "reservation_record_oid",
+      "schema",
+      "schema_version",
+    ]);
+    assert.deepEqual(Object.keys(rowBinding.candidate_source).sort(), [
+      "candidate_set_digest",
+      "lifecycle_candidate_set_digest",
+      "production_candidate_authority_digest",
+      "schema",
+      "schema_version",
+      "source_current_open_semantic_digest",
+      "source_generation_digest",
+      "source_generation_id",
+      "source_generation_record_oid",
+      "source_profile",
+    ]);
+    assert.deepEqual(Object.keys(rowBinding.candidate).sort(), [
+      "identity",
+      "identity_digest",
+      "lifecycle_generation_id",
+      "lifecycle_seed",
+      "lifecycle_seed_digest",
+      "schema",
+      "schema_version",
+      "selection_digest",
+      "source_generation_record_oid",
     ]);
     assert.equal(
       first.rendered,
@@ -4391,9 +4510,7 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
     );
     assert.deepEqual(github.candidateInventoryPhases().slice(
       inventoryPhasesBefore,
-    ), [
-      "cycle-start", "attempt", "cycle-complete",
-    ]);
+    ), ["current-open-generation"]);
     assert.deepEqual(github.candidateDispatchPhases().slice(
       dispatchPhasesBefore,
     ), ["reserve"]);
@@ -4410,16 +4527,11 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
     );
     assert.equal(
       github.candidateInventoryRequests().length - inventoryRequestsBefore,
-      4,
+      0,
     );
     assert.equal(
       github.candidateLifecycleRequests().length - lifecycleRequestsBefore,
-      2,
-    );
-    assert.equal(
-      github.candidateInventoryRequests().every((path) =>
-        path.includes("state=all") && !path.includes("state=open")),
-      true,
+      0,
     );
     assertNoDispatchAuthorityInternals(first);
 
@@ -4438,6 +4550,8 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
     oidc.bindCommand(restartCommand);
     const restartInventoryRequestsBefore =
       github.candidateInventoryRequests().length;
+    const restartLifecycleRequestsBefore =
+      github.candidateLifecycleRequests().length;
     const restartCurrentOpenRequestsBefore =
       github.currentOpenCandidateRequests().length;
     const recordsBefore = github.ledgerRecordCount();
@@ -4456,6 +4570,11 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
       restartCurrentOpenRequestsBefore,
       "active reservation restart must not resample current-open candidates",
     );
+    assert.equal(
+      github.candidateLifecycleRequests().length,
+      restartLifecycleRequestsBefore,
+      "active reservation restart must not read legacy candidate lifecycle",
+    );
     assert.equal(github.ledgerRecordCount(), recordsBefore);
     assert.equal(
       github.ledgerWriteRequests().length,
@@ -4470,7 +4589,7 @@ test("schedule-dispatch durably scans once and restarts the active raw-plan matr
   });
 });
 
-test("schedule-dispatch reconciles one durable atomic publication response loss",
+test("schedule-dispatch reconciles one durable current-open publication response loss without legacy refresh",
   async () => {
     await withWorkflowCliFixture({
       eventName: "schedule",
@@ -4504,6 +4623,8 @@ test("schedule-dispatch reconciles one durable atomic publication response loss"
         github.currentOpenCandidateRequests().length;
       const candidateInventoryRequestsBeforePublication =
         github.candidateInventoryRequests().length;
+      const candidateLifecycleRequestsBeforePublication =
+        github.candidateLifecycleRequests().length;
       const inventoryPhasesBefore = github.candidateInventoryPhases().length;
       const dispatchPhasesBefore = github.candidateDispatchPhases().length;
       const ledgerWritesBeforePublication =
@@ -4537,13 +4658,16 @@ test("schedule-dispatch reconciles one durable atomic publication response loss"
       assert.equal(
         github.candidateInventoryRequests().length -
           candidateInventoryRequestsBeforePublication,
-        4,
+        0,
+      );
+      assert.equal(
+        github.candidateLifecycleRequests().length -
+          candidateLifecycleRequestsBeforePublication,
+        0,
       );
       assert.deepEqual(github.candidateInventoryPhases().slice(
         inventoryPhasesBefore,
-      ), [
-        "cycle-start", "attempt", "cycle-complete",
-      ]);
+      ), ["current-open-generation"]);
       assert.deepEqual(github.candidateDispatchPhases().slice(
         dispatchPhasesBefore,
       ), ["reserve"]);
@@ -4558,6 +4682,8 @@ test("schedule-dispatch reconciles one durable atomic publication response loss"
         github.currentOpenCandidateRequests().length;
       const candidateInventoryRequestsBefore =
         github.candidateInventoryRequests().length;
+      const candidateLifecycleRequestsBefore =
+        github.candidateLifecycleRequests().length;
       const externalWritesBefore = github.externalWriteRequests().length;
       const recordsBefore = github.ledgerRecordCount();
       const restartLedgerWritesBefore = github.ledgerWriteRequests().length;
@@ -4594,6 +4720,11 @@ test("schedule-dispatch reconciles one durable atomic publication response loss"
         0,
       );
       assert.equal(
+        github.candidateLifecycleRequests().length -
+          candidateLifecycleRequestsBefore,
+        0,
+      );
+      assert.equal(
         github.externalWriteRequests().length - externalWritesBefore,
         0,
       );
@@ -4618,6 +4749,8 @@ test("schedule-dispatch expands every compact batch item into a workflow binding
         GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
         GITHUB_API_URL: "https://api.github.com",
       };
+      const githubOutput = join(runnerTemp, "compact-matrix-github-output");
+      await writeFile(githubOutput, "", { mode: 0o600 });
       const candidateNumbers = Array.from({ length: 64 }, (_, index) =>
         index + 1);
       const github = productionControllerGitHubFixture(
@@ -4629,9 +4762,10 @@ test("schedule-dispatch expands every compact batch item into a workflow binding
           apiOrigin: "https://api.github.com",
         },
       );
-      const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
-        fetch: github.fetch,
-      });
+      const dispatch = await runV2ScheduleDispatchCli({
+        ...sharedEnvironment,
+        GITHUB_OUTPUT: githubOutput,
+      }, { fetch: github.fetch });
 
       assert.equal(dispatch.matrix.include.length, candidateNumbers.length);
       const matrixBindings = [];
@@ -4656,39 +4790,90 @@ test("schedule-dispatch expands every compact batch item into a workflow binding
         assert.deepEqual(Object.keys(legCommand.dispatch_binding).sort(), [
           "batch_count",
           "batch_index",
+          "binding_digest",
           "candidate",
+          "candidate_dispatch_authority_digest",
+          "candidate_index",
+          "candidate_inventory_authority_digest",
+          "candidate_source",
           "cycle_id",
           "dispatch_digest",
           "generation_id",
           "inventory_digest",
+          "repository",
+          "reservation_digest",
+          "reservation_record_oid",
+          "schema",
+          "schema_version",
         ]);
+        assert.deepEqual(Object.keys(
+          legCommand.dispatch_binding.candidate_source,
+        ).sort(), [
+          "candidate_set_digest",
+          "lifecycle_candidate_set_digest",
+          "production_candidate_authority_digest",
+          "schema",
+          "schema_version",
+          "source_current_open_semantic_digest",
+          "source_generation_digest",
+          "source_generation_id",
+          "source_generation_record_oid",
+          "source_profile",
+        ]);
+        assert.deepEqual(Object.keys(
+          legCommand.dispatch_binding.candidate,
+        ).sort(), [
+          "identity",
+          "identity_digest",
+          "lifecycle_generation_id",
+          "lifecycle_seed",
+          "lifecycle_seed_digest",
+          "schema",
+          "schema_version",
+          "selection_digest",
+          "source_generation_record_oid",
+        ]);
+        assert.ok(
+          Buffer.byteLength(row.dispatch_binding, "utf8") <=
+            MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_BINDING_BYTES,
+        );
       }
       const firstBinding = matrixBindings[0];
+      const commitBudget = calculateV2GitLedgerCandidateDispatchCommitBudget({
+        candidate_count: matrixBindings.length,
+        batch_count: firstBinding.batch_count,
+        reachable_record_count: github.ledgerRecordCount() - 1,
+      });
       const planWithoutDigest = {
         schema: V2_GIT_LEDGER_CANDIDATE_DISPATCH_PLAN_SCHEMA,
         schema_version: 2,
-        repository: {
-          owner: "owner",
-          name: "repo",
-          id: "42",
-          node_id: "R_repo",
-          owner_id: "88",
-        },
+        repository: firstBinding.repository,
         generation_id: firstBinding.generation_id,
         cycle_id: firstBinding.cycle_id,
+        candidate_source: firstBinding.candidate_source,
+        candidate_inventory_authority_digest:
+          firstBinding.candidate_inventory_authority_digest,
+        candidate_dispatch_authority_digest:
+          firstBinding.candidate_dispatch_authority_digest,
+        reservation_record_oid: firstBinding.reservation_record_oid,
+        reservation_digest: firstBinding.reservation_digest,
         inventory_digest: firstBinding.inventory_digest,
         batch_index: firstBinding.batch_index,
         batch_count: firstBinding.batch_count,
         dispatch_digest: firstBinding.dispatch_digest,
-        items: matrixBindings.map((binding, candidateIndex) => ({
-          candidate_index: candidateIndex,
+        items: matrixBindings.map((binding) => ({
+          candidate_index: binding.candidate_index,
           candidate: binding.candidate,
         })),
         remaining_count: matrixBindings.length,
-        dispatch_commit_budget_required: 67,
-        candidate_execution_commit_budget_required: 960,
-        total_commit_budget_required: 1_027,
-        remaining_ledger_commit_capacity_after_dispatch: 1_000,
+        dispatch_commit_budget_required:
+          commitBudget.dispatch_commit_budget_required,
+        candidate_execution_commit_budget_required:
+          commitBudget.candidate_execution_commit_budget_required,
+        total_commit_budget_required:
+          commitBudget.total_commit_budget_required,
+        remaining_ledger_commit_capacity_after_dispatch:
+          commitBudget.remaining_ledger_commit_capacity_after_dispatch,
       };
       const compactPlan = {
         ...planWithoutDigest,
@@ -4697,6 +4882,10 @@ test("schedule-dispatch expands every compact batch item into a workflow binding
           planWithoutDigest,
         ),
       };
+      assert.ok(
+        Buffer.byteLength(canonicalJson(compactPlan), "utf8") <=
+          MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_PLAN_BYTES,
+      );
       for (const [index, binding] of matrixBindings.entries()) {
         assert.deepEqual(
           projectV2GitLedgerCandidateDispatchBinding(compactPlan, index),
@@ -4723,6 +4912,44 @@ test("schedule-dispatch expands every compact batch item into a workflow binding
         );
       }
       assert.equal(github.externalWrites.length, publicWrites);
+      const githubOutputLine = `matrix=${canonicalJson(dispatch.matrix)}\n`;
+      assert.equal(await readFile(githubOutput, "utf8"), githubOutputLine);
+      assert.ok(
+        Buffer.byteLength(githubOutputLine, "utf16le") <=
+          MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES,
+      );
+      const oversizedRows = Array.from(
+        { length: 4 },
+        () => dispatch.matrix.include,
+      ).flat();
+      assert.equal(oversizedRows.length, 256);
+      const oversizedLine = `matrix=${canonicalJson({
+        include: oversizedRows,
+      })}\n`;
+      assert.ok(
+        Buffer.byteLength(oversizedLine, "utf16le") >
+          MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES,
+      );
+      const oversizedOutput = join(
+        runnerTemp,
+        "oversized-compact-matrix-github-output",
+      );
+      const originalOutput = Buffer.from("sentinel=unchanged\n", "utf8");
+      await writeFile(oversizedOutput, originalOutput, { mode: 0o600 });
+      const ledgerWritesBeforeOversizedOutput =
+        github.ledgerWriteRequests().length;
+      await assert.rejects(
+        writeV2ScheduleDispatchMatrixOutput({
+          rows: oversizedRows,
+          environment: { GITHUB_OUTPUT: oversizedOutput },
+        }),
+        (error) => error?.code === "SCHEDULE_DISPATCH_OUTPUT_TOO_LARGE",
+      );
+      assert.deepEqual(await readFile(oversizedOutput), originalOutput);
+      assert.equal(
+        github.ledgerWriteRequests().length,
+        ledgerWritesBeforeOversizedOutput,
+      );
       assertNoDispatchAuthorityInternals(dispatch);
     });
   });
@@ -4801,12 +5028,12 @@ test("schedule-dispatch hard-fails the 512-candidate capacity boundary without w
       assert.equal(
         github.candidateInventoryRequests().length -
           candidateInventoryRequestsBefore,
-        24,
+        0,
       );
       assert.equal(
         github.candidateLifecycleRequests().length -
           candidateLifecycleRequestsBefore,
-        1_024,
+        0,
       );
       assert.equal(github.ledgerRecordCount(), recordsBefore);
       assert.equal(
@@ -4916,7 +5143,7 @@ test("schedule-dispatch rejects 513 current-open candidates before full refresh"
     });
   });
 
-test("schedule-dispatch supersedes an incomplete inventory cycle on restart", async () => {
+test("schedule-dispatch ignores a legacy phase fault on a fresh current-open restart", async () => {
   await withWorkflowCliFixture({
     eventName: "schedule",
     event: {},
@@ -4945,11 +5172,16 @@ test("schedule-dispatch supersedes an incomplete inventory cycle on restart", as
       "candidate-inventory-observation",
       "shard",
     );
-    await assert.rejects(
-      runV2ScheduleDispatchCli(sharedEnvironment, { fetch: github.fetch }),
-    );
-    assert.deepEqual(github.candidateInventoryPhases(), ["cycle-start"]);
-    assert.deepEqual(github.candidateDispatchPhases(), []);
+    const first = await runV2ScheduleDispatchCli(sharedEnvironment, {
+      fetch: github.fetch,
+    });
+    assert.equal(first.matrix.include[0].pull_request, 7);
+    assert.deepEqual(github.candidateInventoryPhases(), [
+      "current-open-generation",
+    ]);
+    assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
+    const inventoryRequests = github.candidateInventoryRequests().length;
+    const currentOpenRequests = github.currentOpenCandidateRequests().length;
 
     const restartEnvironment = await makeWorkflowLegEnvironment({
       environment: sharedEnvironment,
@@ -4967,23 +5199,22 @@ test("schedule-dispatch supersedes an incomplete inventory cycle on restart", as
       fetch: github.fetch,
     });
 
-    assert.equal(restarted.matrix.include.length, 1);
-    assert.equal(restarted.matrix.include[0].enabled, true);
-    assert.equal(restarted.matrix.include[0].pull_request, 7);
+    assert.deepEqual(restarted.matrix, first.matrix);
     assert.deepEqual(github.candidateInventoryPhases(), [
-      "cycle-start",
-      "cycle-start",
-      "shard",
-      "cycle-complete",
+      "current-open-generation",
     ]);
     assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-    assert.equal(github.candidateInventoryRequests().length, 6);
-    assert.equal(github.candidateLifecycleRequests().length, 3);
+    assert.equal(github.candidateInventoryRequests().length, inventoryRequests);
+    assert.equal(
+      github.currentOpenCandidateRequests().length,
+      currentOpenRequests,
+    );
+    assert.equal(github.candidateLifecycleRequests().length, 0);
     assertNoDispatchAuthorityInternals(restarted);
   });
 });
 
-test("schedule-dispatch supersedes close/reopen drift within one bounded run",
+test("schedule-dispatch does not enter legacy close/reopen drift on a fresh current-open run",
   async () => {
     await withWorkflowCliFixture({
       eventName: "schedule",
@@ -5018,24 +5249,16 @@ test("schedule-dispatch supersedes close/reopen drift within one bounded run",
       assert.equal(result.matrix.include[0].enabled, true);
       assert.equal(result.matrix.include[0].pull_request, 7);
       assert.deepEqual(github.candidateInventoryPhases(), [
-        "cycle-start",
-        "shard",
-        "cycle-start",
-        "shard",
-        "cycle-complete",
+        "current-open-generation",
       ]);
-      assert.deepEqual(github.candidateLifecycleRequests(), [
-        "/repos/owner/repo/pulls/7:open",
-        "/repos/owner/repo/pulls/7:closed",
-        "/repos/owner/repo/pulls/7:open",
-        "/repos/owner/repo/pulls/7:open",
-      ]);
+      assert.deepEqual(github.candidateInventoryRequests(), []);
+      assert.deepEqual(github.candidateLifecycleRequests(), []);
       assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
       assertNoDispatchAuthorityInternals(result);
     });
   });
 
-test("schedule-dispatch retains a candidate first observed by a drifting pass",
+test("schedule-dispatch ignores legacy drift snapshots on a fresh current-open run",
   async () => {
     await withWorkflowCliFixture({
       eventName: "schedule",
@@ -5051,6 +5274,7 @@ test("schedule-dispatch retains a candidate first observed by a drifting pass",
         oidc,
         liveTime,
         {
+          candidateNumbers: [7, 8],
           candidateInventorySnapshots: [
             [7], [7],
             [7, 8], [7, 8],
@@ -5074,16 +5298,15 @@ test("schedule-dispatch retains a candidate first observed by a drifting pass",
         [7, 8],
       );
       assert.deepEqual(github.candidateInventoryPhases(), [
-        "cycle-start", "shard",
-        "cycle-start", "shard", "cycle-complete",
+        "current-open-generation",
       ]);
-      assert.equal(github.candidateInventoryRequests().length, 6);
-      assert.equal(github.candidateLifecycleRequests().length, 7);
+      assert.equal(github.candidateInventoryRequests().length, 0);
+      assert.equal(github.candidateLifecycleRequests().length, 0);
       assertNoDispatchAuthorityInternals(result);
     });
   });
 
-test("schedule-dispatch fails typed after bounded lifecycle drift exhaustion",
+test("schedule-dispatch does not enter bounded legacy lifecycle retries on a fresh current-open run",
   async () => {
     await withWorkflowCliFixture({
       eventName: "schedule",
@@ -5108,41 +5331,24 @@ test("schedule-dispatch fails typed after bounded lifecycle drift exhaustion",
         },
       );
 
-      await assert.rejects(
-        runV2ScheduleDispatchCli({
+      const result = await runV2ScheduleDispatchCli({
           ...environment,
           ...oidc.environment,
           GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
           GITHUB_API_URL: "https://api.github.com",
-        }, { fetch: github.fetch }),
-        (error) => {
-          assert.equal(
-            error?.code,
-            "CANDIDATE_INVENTORY_STABILITY_EXHAUSTED",
-          );
-          assert.deepEqual(error.details, {
-            attempts: MAX_V2_CANDIDATE_SCAN_PASSES,
-            last_drift_code: "CANDIDATE_LIFECYCLE_DRIFT",
-          });
-          return true;
-        },
-      );
-      assert.deepEqual(
-        github.candidateInventoryPhases(),
-        Array.from(
-          { length: MAX_V2_CANDIDATE_SCAN_PASSES },
-          () => ["cycle-start", "shard"],
-        ).flat(),
-      );
-      assert.equal(
-        github.candidateLifecycleRequests().length,
-        MAX_V2_CANDIDATE_SCAN_PASSES * 2,
-      );
-      assert.deepEqual(github.candidateDispatchPhases(), []);
+        }, { fetch: github.fetch });
+      assert.equal(result.matrix.include[0].pull_request, 7);
+      assert.deepEqual(github.candidateInventoryPhases(), [
+        "current-open-generation",
+      ]);
+      assert.deepEqual(github.candidateInventoryRequests(), []);
+      assert.deepEqual(github.candidateLifecycleRequests(), []);
+      assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
+      assertNoDispatchAuthorityInternals(result);
     });
   });
 
-test("schedule-dispatch reuses a completed inventory when reservation restarts", async () => {
+test("schedule-dispatch retries an unapplied atomic reservation with a fresh current-open scan", async () => {
   await withWorkflowCliFixture({
     eventName: "schedule",
     event: {},
@@ -5174,13 +5380,10 @@ test("schedule-dispatch reuses a completed inventory when reservation restarts",
     await assert.rejects(
       runV2ScheduleDispatchCli(sharedEnvironment, { fetch: github.fetch }),
     );
-    assert.deepEqual(github.candidateInventoryPhases(), [
-      "cycle-start",
-      "shard",
-      "cycle-complete",
-    ]);
+    assert.deepEqual(github.candidateInventoryPhases(), []);
     assert.deepEqual(github.candidateDispatchPhases(), []);
     const inventoryRequests = github.candidateInventoryRequests().length;
+    const currentOpenRequests = github.currentOpenCandidateRequests().length;
 
     const restartEnvironment = await makeWorkflowLegEnvironment({
       environment: sharedEnvironment,
@@ -5203,12 +5406,15 @@ test("schedule-dispatch reuses a completed inventory when reservation restarts",
     assert.equal(
       github.candidateInventoryRequests().length,
       inventoryRequests,
-      "completed inventory restart must not rescan candidates",
+      "current-open retry must not fall back to legacy inventory",
+    );
+    assert.equal(
+      github.currentOpenCandidateRequests().length - currentOpenRequests,
+      4,
+      "an unapplied atomic publication must collect fresh current-open authority",
     );
     assert.deepEqual(github.candidateInventoryPhases(), [
-      "cycle-start",
-      "shard",
-      "cycle-complete",
+      "current-open-generation",
     ]);
     assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
     assertNoDispatchAuthorityInternals(restarted);
@@ -5243,9 +5449,32 @@ test("schedule-dispatch publishes the exact one-row disabled sentinel for an emp
         apiOrigin: "https://api.github.com",
       },
     );
+    const firstCurrentOpenRequestsBefore =
+      github.currentOpenCandidateRequests().length;
+    const firstCandidateInventoryRequestsBefore =
+      github.candidateInventoryRequests().length;
+    const firstCandidateLifecycleRequestsBefore =
+      github.candidateLifecycleRequests().length;
     await runV2ScheduleDispatchCli(selectedEnvironment, {
       fetch: github.fetch,
     });
+    assert.equal(
+      github.currentOpenCandidateRequests().length -
+        firstCurrentOpenRequestsBefore,
+      4,
+    );
+    assert.equal(
+      github.candidateInventoryRequests().length -
+        firstCandidateInventoryRequestsBefore,
+      0,
+      "fresh empty current-open authority must not use legacy full inventory REST",
+    );
+    assert.equal(
+      github.candidateLifecycleRequests().length -
+        firstCandidateLifecycleRequestsBefore,
+      0,
+      "fresh empty current-open authority must not read legacy lifecycle REST",
+    );
     const currentOpenRequestsBefore =
       github.currentOpenCandidateRequests().length;
     const candidateInventoryRequestsBefore =
@@ -5254,9 +5483,7 @@ test("schedule-dispatch publishes the exact one-row disabled sentinel for an emp
     const ledgerWritesBefore = github.ledgerWriteRequests().length;
     const inventoryPhasesBefore = github.candidateInventoryPhases();
     const dispatchPhasesBefore = github.candidateDispatchPhases();
-    assert.deepEqual(inventoryPhasesBefore, [
-      "cycle-start", "attempt", "cycle-complete",
-    ]);
+    assert.deepEqual(inventoryPhasesBefore, ["current-open-generation"]);
     assert.deepEqual(dispatchPhasesBefore, ["cycle-complete"]);
     const restartOutput = join(root, "github-output-empty-restart");
     await writeFile(restartOutput, "", { mode: 0o600 });
@@ -5341,6 +5568,10 @@ test("scheduled production run acknowledges its exact matrix binding through cyc
     });
     const [matrixRow] = dispatch.matrix.include;
     assert.equal(matrixRow.enabled, true);
+    const scheduledCurrentOpenRequestsBefore =
+      github.currentOpenCandidateRequests().length;
+    const scheduledInventoryRequestsBefore =
+      github.candidateInventoryRequests().length;
 
     const scheduledEnvironment = await makeWorkflowLegEnvironment({
       environment: sharedEnvironment,
@@ -5370,6 +5601,16 @@ test("scheduled production run acknowledges its exact matrix binding through cyc
       "bound",
     );
     assert.equal(github.activeLease(), false);
+    assert.equal(
+      github.currentOpenCandidateRequests().length,
+      scheduledCurrentOpenRequestsBefore,
+      "scheduled execution must reuse its durable dispatch authority",
+    );
+    assert.equal(
+      github.candidateInventoryRequests().length,
+      scheduledInventoryRequestsBefore,
+      "scheduled execution must not refresh legacy inventory",
+    );
     assert.deepEqual(github.candidateDispatchPhases(), [
       "reserve",
       "candidate-ack",
@@ -5407,7 +5648,215 @@ test("scheduled production run acknowledges its exact matrix binding through cyc
   });
 });
 
-test("scheduled recovery closes a queued artifact suffix before candidate ack",
+test("scheduled production consumes two immutable matrix bindings across restart and final ack response loss", async () => {
+  await withWorkflowCliFixture({
+    eventName: "schedule",
+    event: {},
+    route: "scan-all-open",
+    pullRequest: "",
+  }, async ({ environment, runnerTemp }) => {
+    const scanCommand = await prepareV2WorkflowCommand(environment);
+    const liveTime = new Date().toISOString();
+    const oidc = productionOidcFixture(scanCommand, liveTime);
+    const sharedEnvironment = {
+      ...environment,
+      ...oidc.environment,
+      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+      GITHUB_API_URL: "https://api.github.com",
+    };
+    const github = productionControllerGitHubFixture(
+      scanCommand,
+      oidc,
+      liveTime,
+      {
+        candidateNumbers: [7, 8],
+        apiOrigin: "https://api.github.com",
+        serverTimeStepMilliseconds: 500,
+      },
+    );
+    const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
+      fetch: github.fetch,
+    });
+    assert.deepEqual(
+      dispatch.matrix.include.map((row) => row.pull_request),
+      [7, 8],
+    );
+    const originalBindings = dispatch.matrix.include.map((row) =>
+      JSON.parse(row.dispatch_binding));
+    assert.equal(
+      new Set(originalBindings.map((binding) =>
+        binding.candidate_dispatch_authority_digest)).size,
+      1,
+      "one reservation must keep one immutable D1 matrix authority",
+    );
+
+    const runScheduledCandidate = async (index, { expectFailure = false } = {}) => {
+      const row = dispatch.matrix.include[index];
+      const scheduledEnvironment = await makeWorkflowLegEnvironment({
+        environment: sharedEnvironment,
+        runnerTemp,
+        name: `scheduled-two-candidate-${row.pull_request}`,
+        runId: String(123_457 + index),
+        route: "ordinary",
+        pullRequest: String(row.pull_request),
+        dispatchBinding: row.dispatch_binding,
+      });
+      const scheduledCommand = await prepareV2WorkflowCommand(
+        scheduledEnvironment,
+      );
+      oidc.bindCommand(scheduledCommand);
+      const invocation = runV2WorkflowControllerCli(scheduledEnvironment, {
+        fetch: github.fetch,
+      });
+      if (expectFailure) {
+        await assert.rejects(invocation, (error) => {
+          assert.equal(error?.code, "CANDIDATE_DISPATCH_COMPLETION_FAILED");
+          assert.equal(error?.details?.upstream_code, "unexpected-http-status");
+          assert.equal(error?.details?.public_effects_performed, 3);
+          assert.equal(error?.details?.budget_refunded, false);
+          assert.equal(error?.details?.lease_released, true);
+          return true;
+        });
+        return null;
+      }
+      const result = await invocation;
+      assert.deepEqual(scheduledCommand.dispatch_binding, originalBindings[index]);
+      assert.equal(result.cycle.terminal_result.public_effects_performed, 3);
+      assert.equal(result.cycle.terminal_result.status_effect_outcome, "bound");
+      assert.equal(
+        result.cycle.terminal_result.automatic_request_effect_outcome,
+        "bound",
+      );
+      assertNoProtectedProductionInternals(result.cycle);
+      return result;
+    };
+
+    await runScheduledCandidate(0);
+    assert.equal(github.activeLease(), false);
+    assert.deepEqual(github.candidateDispatchPhases(), [
+      "reserve",
+      "candidate-ack",
+    ]);
+    const currentOpenRequestsAfterFirst =
+      github.currentOpenCandidateRequests().length;
+    const legacyInventoryRequestsAfterFirst =
+      github.candidateInventoryRequests().length;
+    const legacyLifecycleRequestsAfterFirst =
+      github.candidateLifecycleRequests().length;
+    const ledgerWritesAfterFirst = github.ledgerWriteRequests().length;
+
+    const remainingEnvironment = await makeWorkflowLegEnvironment({
+      environment: sharedEnvironment,
+      runnerTemp,
+      name: "scheduled-two-candidate-remaining-restart",
+      runId: "123459",
+      route: "scan-all-open",
+      pullRequest: "",
+    });
+    const remainingCommand = await prepareV2WorkflowCommand(
+      remainingEnvironment,
+    );
+    oidc.bindCommand(remainingCommand);
+    const remaining = await runV2ScheduleDispatchCli(remainingEnvironment, {
+      fetch: github.fetch,
+    });
+    assert.deepEqual(remaining.matrix.include, [dispatch.matrix.include[1]]);
+    assert.equal(
+      github.currentOpenCandidateRequests().length,
+      currentOpenRequestsAfterFirst,
+    );
+    assert.equal(
+      github.candidateInventoryRequests().length,
+      legacyInventoryRequestsAfterFirst,
+    );
+    assert.equal(
+      github.candidateLifecycleRequests().length,
+      legacyLifecycleRequestsAfterFirst,
+    );
+    assert.equal(
+      github.ledgerWriteRequests().length,
+      ledgerWritesAfterFirst,
+      "remaining-plan restart must be a read-only durable reload",
+    );
+    assertNoDispatchAuthorityInternals(remaining);
+
+    github.failNextDurableRecordUpdates("candidate-dispatch-observation:");
+    await runScheduledCandidate(1, { expectFailure: true });
+
+    assert.equal(github.activeLease(), false);
+    assert.deepEqual(github.candidateDispatchPhases(), [
+      "reserve",
+      "candidate-ack",
+      "candidate-ack",
+    ]);
+    assert.equal(
+      github.currentOpenCandidateRequests().length,
+      currentOpenRequestsAfterFirst,
+      "restart must load the durable reservation before any fresh scan",
+    );
+    assert.equal(
+      github.candidateInventoryRequests().length,
+      legacyInventoryRequestsAfterFirst,
+      "current-open scheduled execution must not use legacy inventory",
+    );
+    const completionEnvironment = await makeWorkflowLegEnvironment({
+      environment: sharedEnvironment,
+      runnerTemp,
+      name: "scheduled-two-candidate-completion-restart",
+      runId: "123460",
+      route: "scan-all-open",
+      pullRequest: "",
+    });
+    const completionCommand = await prepareV2WorkflowCommand(
+      completionEnvironment,
+    );
+    oidc.bindCommand(completionCommand);
+    const completed = await runV2ScheduleDispatchCli(completionEnvironment, {
+      fetch: github.fetch,
+    });
+    assert.deepEqual(completed.matrix, {
+      include: [{
+        enabled: false,
+        pull_request: 0,
+        dispatch_binding: "null",
+      }],
+    });
+    assert.equal(
+      github.currentOpenCandidateRequests().length,
+      currentOpenRequestsAfterFirst,
+      "completion restart must not resample current-open candidates",
+    );
+    assert.equal(
+      github.candidateInventoryRequests().length,
+      legacyInventoryRequestsAfterFirst,
+      "completion restart must not use legacy inventory",
+    );
+    assertNoDispatchAuthorityInternals(completed);
+    assert.deepEqual(github.candidateDispatchPhases(), [
+      "reserve",
+      "candidate-ack",
+      "candidate-ack",
+      "batch-complete",
+      "cycle-complete",
+    ]);
+    assert.equal(
+      github.candidateProtocolOrder().filter((entry) =>
+        entry === "candidate-dispatch:candidate-ack").length,
+      2,
+    );
+    assert.deepEqual(
+      github.requestComments().map((comment) =>
+        new URL(comment.issue_url).pathname),
+      [
+        "/repos/owner/repo/issues/7",
+        "/repos/owner/repo/issues/8",
+      ],
+    );
+    assertFixtureServerClockWithinOidcSkew(github);
+  });
+});
+
+test("an intervening candidate scan preserves a queued artifact suffix after ready response loss",
   async () => {
     await withWorkflowCliFixture({
       eventName: "schedule",
@@ -5457,6 +5906,12 @@ test("scheduled recovery closes a queued artifact suffix before candidate ack",
       });
       const request = github.requestComments().at(-1);
       assert.ok(request, "scheduled automatic request exists");
+      assert.deepEqual(
+        github.candidateDispatchPhases(),
+        ["reserve", "candidate-ack", "batch-complete", "cycle-complete"],
+      );
+      const completedDispatchRecords = github.candidateDispatchRecords();
+      assert.equal(github.activeLease(), false);
       const addFinding = (id) => {
         const finding = productionAutomaticRecoveryFinding({ id, request });
         const address = productionAutomaticRecoveryAddress({
@@ -5464,6 +5919,21 @@ test("scheduled recovery closes a queued artifact suffix before candidate ack",
           finding,
         });
         github.addSnapshotIssueComments(finding, address);
+      };
+      const artifactBindingFamilyEntries = () =>
+        github.effectRecordEntries().filter(({ record }) =>
+          typeof record.kind === "string" &&
+          record.kind.includes("artifact-binding"));
+      const assertCanonicalArtifactBindingFamily = (entries) => {
+        const canonicalKinds = new Set([
+          "artifact-binding",
+          "artifact-binding-ready",
+        ]);
+        assert.equal(
+          entries.some(({ record }) => !canonicalKinds.has(record.kind)),
+          false,
+          "artifact binding family must not contain a noncanonical sibling",
+        );
       };
 
       addFinding(3180);
@@ -5495,7 +5965,42 @@ test("scheduled recovery closes a queued artifact suffix before candidate ack",
         }),
         (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
       );
+      const artifactPrefixEntries = artifactBindingFamilyEntries();
+      assertCanonicalArtifactBindingFamily(artifactPrefixEntries);
+      assert.deepEqual(
+        artifactPrefixEntries.map(({ record }) =>
+          `${record.record_type}:${record.kind}`),
+        [
+          "effect-intent:artifact-binding",
+          "effect-intent:artifact-binding-ready",
+          "effect-response:artifact-binding-ready",
+        ],
+      );
+      assert.equal(
+        new Set(artifactPrefixEntries.map(({ commit_sha: commitSha }) =>
+          commitSha)).size,
+        3,
+      );
+      for (const { commit_sha: commitSha } of artifactPrefixEntries) {
+        assert.match(commitSha, /^[0-9a-f]{40}$/u);
+      }
+      assert.deepEqual(
+        github.artifactBindingPointReadRequests(),
+        [],
+        "the durable ready prefix must precede every provider point read",
+      );
+      assert.deepEqual(
+        github.candidateDispatchRecords(),
+        completedDispatchRecords,
+        "artifact prefix persistence must not rewrite completed candidate records",
+      );
       addFinding(3200);
+
+      const dispatchRecordsBeforeInterveningScan =
+        github.candidateDispatchRecords();
+      const publicWritesBeforeInterveningScan = github.externalWrites.length;
+      const pointReadsBeforeInterveningScan =
+        github.artifactBindingPointReadRequests();
 
       const secondScanEnvironment = await makeWorkflowLegEnvironment({
         environment: sharedEnvironment,
@@ -5513,28 +6018,62 @@ test("scheduled recovery closes a queued artifact suffix before candidate ack",
         secondScanEnvironment,
         { fetch: github.fetch },
       );
-      const secondScheduledEnvironment = await makeWorkflowLegEnvironment({
+      assert.deepEqual(secondDispatch.matrix, {
+        include: [{
+          enabled: false,
+          pull_request: 0,
+          dispatch_binding: "null",
+        }],
+      });
+      assert.equal(
+        github.externalWrites.length,
+        publicWritesBeforeInterveningScan,
+      );
+      assert.deepEqual(
+        github.artifactBindingPointReadRequests(),
+        pointReadsBeforeInterveningScan,
+      );
+      const artifactEntriesAfterInterveningScan =
+        artifactBindingFamilyEntries();
+      assertCanonicalArtifactBindingFamily(
+        artifactEntriesAfterInterveningScan,
+      );
+      assert.deepEqual(
+        artifactEntriesAfterInterveningScan,
+        artifactPrefixEntries,
+        "intervening scan must not append, replace, or reorder artifact records",
+      );
+      assert.deepEqual(
+        github.candidateDispatchRecords(),
+        dispatchRecordsBeforeInterveningScan,
+        "intervening scan must not reuse candidate phases as new recovery evidence",
+      );
+      const dispatchRecordsAfterInterveningScan =
+        github.candidateDispatchRecords();
+      const secondOrdinaryEnvironment = await makeWorkflowLegEnvironment({
         environment: secondScanEnvironment,
         runnerTemp,
         name: "scheduled-queue-close",
         runId: "123474",
         route: "ordinary",
         pullRequest: "7",
-        dispatchBinding:
-          secondDispatch.matrix.include[0].dispatch_binding,
       });
-      const secondScheduledCommand = await prepareV2WorkflowCommand(
-        secondScheduledEnvironment,
+      secondOrdinaryEnvironment.GITHUB_EVENT_NAME = "pull_request_target";
+      secondOrdinaryEnvironment.V2_CONTROLLER_EVENT_PATH = ordinaryEventPath;
+      const secondOrdinaryCommand = await prepareV2WorkflowCommand(
+        secondOrdinaryEnvironment,
       );
-      oidc.bindCommand(secondScheduledCommand);
+      oidc.bindCommand(secondOrdinaryCommand);
       const result = await runV2WorkflowControllerCli(
-        secondScheduledEnvironment,
+        secondOrdinaryEnvironment,
         { fetch: github.fetch },
       );
 
+      const finalArtifactEntries = artifactBindingFamilyEntries();
+      assertCanonicalArtifactBindingFamily(finalArtifactEntries);
       assert.deepEqual(
-        github.effectRecordKinds().filter((kind) =>
-          kind.includes("artifact-binding")),
+        finalArtifactEntries.map(({ record }) =>
+          `${record.record_type}:${record.kind}`),
         [
           "effect-intent:artifact-binding",
           "effect-intent:artifact-binding-ready",
@@ -5547,13 +6086,33 @@ test("scheduled recovery closes a queued artifact suffix before candidate ack",
         ],
       );
       assert.deepEqual(
+        finalArtifactEntries.slice(0, artifactPrefixEntries.length),
+        artifactPrefixEntries,
+        "ordinary continuation must retain the exact durable prefix",
+      );
+      const finalArtifactOids = finalArtifactEntries.map(
+        ({ commit_sha: commitSha }) => commitSha,
+      );
+      assert.equal(new Set(finalArtifactOids).size, 8);
+      const prefixArtifactOids = new Set(
+        artifactPrefixEntries.map(({ commit_sha: commitSha }) => commitSha),
+      );
+      for (const commitSha of finalArtifactOids.slice(
+        artifactPrefixEntries.length,
+      )) {
+        assert.match(commitSha, /^[0-9a-f]{40}$/u);
+        assert.equal(prefixArtifactOids.has(commitSha), false);
+      }
+      assert.deepEqual(
         github.artifactBindingPointReadRequests(),
         [3180, 3200].map((id) =>
           `/repos/owner/repo/issues/comments/${id}`),
       );
-      assert.deepEqual(github.candidateDispatchPhases().slice(-4), [
-        "reserve", "candidate-ack", "batch-complete", "cycle-complete",
-      ]);
+      assert.deepEqual(
+        github.candidateDispatchRecords(),
+        dispatchRecordsAfterInterveningScan,
+        "ordinary artifact continuation must not rewrite candidate records",
+      );
       assert.equal(github.activeLease(), false);
       assertNoProtectedProductionInternals(result.cycle);
       assertFixtureServerClockWithinOidcSkew(github);
@@ -5693,7 +6252,7 @@ test("scheduled completion uses same-run recovery after a durable lease release"
   });
 });
 
-test("schedule-dispatch recovers one ready released attempt before a fresh load", async () => {
+test("schedule-dispatch recovers one ready released attempt without a fresh candidate scan", async () => {
   await withWorkflowCliFixture({
     eventName: "schedule",
     event: {},
@@ -5737,6 +6296,10 @@ test("schedule-dispatch recovers one ready released attempt before a fresh load"
     const scheduledCommand = await prepareV2WorkflowCommand(
       scheduledEnvironment,
     );
+    assert.deepEqual(
+      scheduledCommand.dispatch_binding,
+      JSON.parse(dispatch.matrix.include[0].dispatch_binding),
+    );
     oidc.bindCommand(scheduledCommand);
     await assert.rejects(
       runV2WorkflowControllerCli(scheduledEnvironment, {
@@ -5744,10 +6307,35 @@ test("schedule-dispatch recovers one ready released attempt before a fresh load"
       }),
       (error) => error?.code === "CANDIDATE_DISPATCH_COMPLETION_FAILED",
     );
+    assert.ok(
+      github.requestComments().at(-1),
+      "the failed scheduled attempt must have performed its public request",
+    );
     assert.equal(github.activeLease(), false);
     assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
+    const releasedAttemptProtocol = github.candidateProtocolOrder();
+    assert.equal(
+      releasedAttemptProtocol.filter((entry) =>
+        entry === "lease-acquire:").length,
+      1,
+    );
+    assert.equal(
+      releasedAttemptProtocol.filter((entry) =>
+        entry === "lease-release:").length,
+      1,
+    );
+    assert.equal(releasedAttemptProtocol.at(-1), "lease-release:");
+    const dispatchRecordsBeforeRecovery = github.candidateDispatchRecords();
+    assert.equal(
+      dispatchRecordsBeforeRecovery.filter(({ phase }) =>
+        phase === "candidate-ack").length,
+      0,
+    );
     const inventoryRequests = github.candidateInventoryRequests().length;
+    const lifecycleRequests = github.candidateLifecycleRequests().length;
+    const currentOpenRequests = github.currentOpenCandidateRequests().length;
     const publicWrites = github.externalWrites.length;
+    const pointReads = github.artifactBindingPointReadRequests();
 
     const recoveryEnvironment = await makeWorkflowLegEnvironment({
       environment: sharedEnvironment,
@@ -5777,13 +6365,63 @@ test("schedule-dispatch recovers one ready released attempt before a fresh load"
       inventoryRequests,
       "recovery must not start another diagnostic or candidate scan",
     );
+    assert.equal(
+      github.candidateLifecycleRequests().length,
+      lifecycleRequests,
+      "ready recovery must not read legacy candidate lifecycle",
+    );
+    assert.equal(
+      github.currentOpenCandidateRequests().length,
+      currentOpenRequests,
+      "ready recovery must not resample current-open candidates",
+    );
     assert.equal(github.externalWrites.length, publicWrites);
-    assert.deepEqual(github.candidateDispatchPhases(), [
-      "reserve",
-      "candidate-ack",
-      "batch-complete",
-      "cycle-complete",
-    ]);
+    assert.deepEqual(github.artifactBindingPointReadRequests(), pointReads);
+    assert.equal(
+      github.candidateProtocolOrder().filter((entry) =>
+        entry === "lease-acquire:").length,
+      1,
+      "recovery must consume the single released attempt without a new lease",
+    );
+    assert.equal(
+      github.candidateProtocolOrder().filter((entry) =>
+        entry === "lease-release:").length,
+      1,
+    );
+    const dispatchRecordsAfterRecovery = github.candidateDispatchRecords();
+    const recoveryRecords = dispatchRecordsAfterRecovery.slice(
+      dispatchRecordsBeforeRecovery.length,
+    );
+    assert.deepEqual(
+      recoveryRecords.map(({ phase }) => phase),
+      ["candidate-ack", "batch-complete", "cycle-complete"],
+    );
+    const dispatchRecordOidsBeforeRecovery = new Set(
+      dispatchRecordsBeforeRecovery.map(({ commit_sha: commitSha }) =>
+        commitSha),
+    );
+    assert.equal(
+      new Set(recoveryRecords.map(({ commit_sha: commitSha }) => commitSha))
+        .size,
+      3,
+      "recovery ack and both completion records must have unique OIDs",
+    );
+    for (const { commit_sha: commitSha } of recoveryRecords) {
+      assert.match(commitSha, /^[0-9a-f]{40}$/u);
+      assert.equal(
+        dispatchRecordOidsBeforeRecovery.has(commitSha),
+        false,
+        "fresh recovery records must not reuse a pre-recovery OID",
+      );
+    }
+    const recoveryAckRecords = recoveryRecords.filter(({ phase }) =>
+      phase === "candidate-ack");
+    assert.equal(recoveryAckRecords.length, 1);
+    assert.equal(
+      dispatchRecordsAfterRecovery.filter(({ phase }) =>
+        phase === "candidate-ack").length,
+      1,
+    );
     assertNoDispatchAuthorityInternals(recovered);
     assertFixtureServerClockWithinOidcSkew(github);
   });
@@ -5841,6 +6479,8 @@ test("schedule-dispatch returns a zero-effect sentinel while recovery is not rea
     const recordsBefore = github.ledgerRecordCount();
     const writesBefore = github.externalWrites.length;
     const inventoryRequests = github.candidateInventoryRequests().length;
+    const lifecycleRequests = github.candidateLifecycleRequests().length;
+    const currentOpenRequests = github.currentOpenCandidateRequests().length;
 
     const pendingEnvironment = await makeWorkflowLegEnvironment({
       environment: sharedEnvironment,
@@ -5866,6 +6506,11 @@ test("schedule-dispatch returns a zero-effect sentinel while recovery is not rea
     assert.equal(github.ledgerRecordCount(), recordsBefore);
     assert.equal(github.externalWrites.length, writesBefore);
     assert.equal(github.candidateInventoryRequests().length, inventoryRequests);
+    assert.equal(github.candidateLifecycleRequests().length, lifecycleRequests);
+    assert.equal(
+      github.currentOpenCandidateRequests().length,
+      currentOpenRequests,
+    );
     assert.equal(github.activeLease(), true);
     assertNoDispatchAuthorityInternals(pending);
   });
@@ -6459,7 +7104,7 @@ function productionPreflightBoundaryFixture(command) {
 function productionPreflightFetchFixture(command, {
   callerWorkflowState = "active",
   ledgerBranchPresent = true,
-  apiOrigin = "https://api.github.test",
+  apiOrigin = "https://api.github.com",
 } = {}) {
   const paths = [];
   const repository = "owner/repo";
@@ -6637,7 +7282,7 @@ function productionControllerGitHubFixture(
     candidateInventorySnapshots = null,
     candidateLifecycleStates = null,
     currentOpenCandidateSnapshots = null,
-    apiOrigin = "https://api.github.test",
+    apiOrigin = "https://api.github.com",
     snapshotIssueComments = [],
     serverTimeStepMilliseconds = 1_000,
   } = {},
@@ -6911,7 +7556,11 @@ function productionControllerGitHubFixture(
         inventory.slice((page - 1) * 100, page * 100),
       )));
     }
-    if (method === "POST" && path === "/repos/owner/repo/issues/7/comments") {
+    const issueCommentPost = path.match(
+      /^\/repos\/owner\/repo\/issues\/([1-9][0-9]*)\/comments$/u,
+    );
+    if (method === "POST" && issueCommentPost !== null) {
+      const pullNumber = Number(issueCommentPost[1]);
       requestPostCount += 1;
       if (requestPostMode === "throw") {
         throw new Error("simulated automatic request transport uncertainty");
@@ -6928,8 +7577,9 @@ function productionControllerGitHubFixture(
         node_id: `IC_${nextRequestId}`,
         url: `${apiOrigin}/repos/owner/repo/issues/comments/${nextRequestId}`,
         html_url:
-          `https://github.com/owner/repo/pull/7#issuecomment-${nextRequestId}`,
-        issue_url: `${apiOrigin}/repos/owner/repo/issues/7`,
+          `https://github.com/owner/repo/pull/${pullNumber}` +
+          `#issuecomment-${nextRequestId}`,
+        issue_url: `${apiOrigin}/repos/owner/repo/issues/${pullNumber}`,
         author_association: "NONE",
         body,
         created_at: createdAt,
@@ -6971,11 +7621,13 @@ function productionControllerGitHubFixture(
         : request;
       return redated(jsonResponse(JSON.stringify(exact)));
     }
-    if (
-      method === "GET" && path === "/repos/owner/repo/issues/7/comments" &&
-      requests.size > 0
-    ) {
-      return redated(jsonResponse(JSON.stringify(allIssueComments())));
+    const issueCommentsGet = path.match(
+      /^\/repos\/owner\/repo\/issues\/([1-9][0-9]*)\/comments$/u,
+    );
+    if (method === "GET" && issueCommentsGet !== null && requests.size > 0) {
+      return redated(jsonResponse(JSON.stringify(
+        allIssueComments(Number(issueCommentsGet[1])),
+      )));
     }
     if (
       method === "GET" &&
@@ -7045,7 +7697,11 @@ function productionControllerGitHubFixture(
     const response = await redated(await transportFetch(input, init), {
       advance: !artifactBindingPointRead,
     });
-    if (response.status !== 404 || path === `${repoPrefix}/git/ref/pull/7/merge`) {
+    if (
+      response.status !== 404 ||
+      /^\/repos\/owner\/repo\/git\/ref\/pull\/[1-9][0-9]*\/merge$/u
+        .test(path)
+    ) {
       return response;
     }
     throw new Error(`unexpected production controller request ${method} ${path}`);
@@ -7106,6 +7762,22 @@ function productionControllerGitHubFixture(
       .filter((record) =>
         record.record_type === "candidate-dispatch-observation")
       .map((record) => record.payload.phase),
+    candidateDispatchRecords: () => reachableRecordEntries()
+      .filter(({ record }) =>
+        record.record_type === "candidate-dispatch-observation")
+      .map(({ commit_sha: commitSha, record }) => ({
+        commit_sha: commitSha,
+        phase: record.payload.phase,
+      })),
+    effectRecordEntries: () => reachableRecordEntries()
+      .filter(({ record }) =>
+        new Set(["effect-intent", "effect-response"]).has(
+          record.record_type,
+        ))
+      .map(({ commit_sha: commitSha, record }) => ({
+        commit_sha: commitSha,
+        record: structuredClone(record),
+      })),
     candidateProtocolOrder() {
       const records = reachableRecords();
       const start = records.findIndex((record) =>
@@ -7468,15 +8140,18 @@ function productionControllerGitHubFixture(
   function isExactProviderArtifactPath(path) {
     return /^\/repos\/owner\/repo\/issues\/comments\/[1-9][0-9]*$/u
       .test(path) ||
-      /^\/repos\/owner\/repo\/pulls\/7\/reviews\/[1-9][0-9]*$/u
+      /^\/repos\/owner\/repo\/pulls\/[1-9][0-9]*\/reviews\/[1-9][0-9]*$/u
         .test(path);
   }
 
-  function allIssueComments() {
+  function allIssueComments(pullNumber) {
+    const issuePath = `/repos/owner/repo/issues/${pullNumber}`;
     return [
       ...snapshotIssueComments,
       ...requests.values(),
-    ].map((comment) => structuredClone(comment)).sort((left, right) =>
+    ].filter((comment) =>
+      new URL(comment.issue_url).pathname === issuePath)
+      .map((comment) => structuredClone(comment)).sort((left, right) =>
       Date.parse(left.created_at) - Date.parse(right.created_at) ||
       Number(left.id) - Number(right.id));
   }
@@ -7528,7 +8203,7 @@ function productionControllerGitHubFixture(
       updated_at: TIME,
       draft: false,
       mergeable: true,
-      merge_commit_sha: MERGE,
+      merge_commit_sha: fixtureMergeForPull(number),
       base: {
         ref: "main",
         sha: BASE,
@@ -7539,8 +8214,8 @@ function productionControllerGitHubFixture(
         },
       },
       head: {
-        ref: "feature",
-        sha: HEAD,
+        ref: fixtureHeadRefForPull(number),
+        sha: fixtureHeadForPull(number),
         repo: {
           id: 42,
           node_id: "R_repo",
@@ -7564,8 +8239,8 @@ function productionControllerGitHubFixture(
       isDraft: false,
       createdAt: candidateInventoryListPull(number).created_at,
       updatedAt: TIME,
-      headRefOid: number.toString(16).padStart(40, "0"),
-      headRefName: `feature-${number}`,
+      headRefOid: fixtureHeadForPull(number),
+      headRefName: fixtureHeadRefForPull(number),
       baseRefOid: BASE,
       baseRefName: "main",
       headRepository: repository,
@@ -8069,6 +8744,11 @@ function completeSnapshotFetch({
     if (url.pathname === "/graphql" && method === "POST") {
       const body = JSON.parse(options.body);
       if (String(body.query).includes("CodexReviewGateV2Scope")) {
+        const pullNumber = Number(body.variables?.number);
+        const head = fixtureHeadForPull(pullNumber);
+        const headRefName = fixtureHeadRefForPull(pullNumber);
+        const merge = fixtureMergeForPull(pullNumber);
+        const tree = fixtureTreeForPull(pullNumber);
         return jsonResponse(JSON.stringify({
           data: {
             repository: {
@@ -8076,8 +8756,8 @@ function completeSnapshotFetch({
               name: "repo",
               owner: { login: "owner" },
               pullRequest: {
-                id: "PR_7",
-                number: 7,
+                id: `PR_${pullNumber}`,
+                number: pullNumber,
                 state: "OPEN",
                 merged: false,
                 mergedAt: null,
@@ -8086,16 +8766,16 @@ function completeSnapshotFetch({
                 mergeable: "MERGEABLE",
                 baseRefName: "main",
                 baseRef: { name: "main", target: { oid: BASE } },
-                headRefName: "feature",
-                headRefOid: HEAD,
-                headRef: { name: "feature", target: { oid: HEAD } },
+                headRefName,
+                headRefOid: head,
+                headRef: { name: headRefName, target: { oid: head } },
                 potentialMergeCommit: {
-                  oid: MERGE,
-                  tree: { oid: TREE },
+                  oid: merge,
+                  tree: { oid: tree },
                   parents: {
                     totalCount: 2,
                     pageInfo: { hasNextPage: false, endCursor: "parent-2" },
-                    nodes: [{ oid: BASE }, { oid: HEAD }],
+                    nodes: [{ oid: BASE }, { oid: head }],
                   },
                 },
               },
@@ -8121,43 +8801,65 @@ function completeSnapshotFetch({
         errors: [{ message: "unexpected test GraphQL query" }],
       }));
     }
-    if (url.pathname === `${repoPath}/pulls/7`) {
+    const pullMatch = url.pathname.match(
+      /^\/repos\/owner\/repo\/pulls\/([1-9][0-9]*)$/u,
+    );
+    if (pullMatch !== null) {
+      const pullNumber = Number(pullMatch[1]);
+      const head = fixtureHeadForPull(pullNumber);
+      const headRefName = fixtureHeadRefForPull(pullNumber);
+      const merge = fixtureMergeForPull(pullNumber);
       return jsonResponse(JSON.stringify({
-        number: 7,
-        node_id: "PR_7",
-        url: `${apiOrigin}/repos/owner/repo/pulls/7`,
+        number: pullNumber,
+        node_id: `PR_${pullNumber}`,
+        url: `${apiOrigin}/repos/owner/repo/pulls/${pullNumber}`,
         state: "open",
         merged: false,
         merged_at: null,
         updated_at: TIME,
         mergeable: true,
-        merge_commit_sha: MERGE,
+        merge_commit_sha: merge,
         base: { ref: "main", sha: BASE },
-        head: { ref: "feature", sha: HEAD },
+        head: { ref: headRefName, sha: head },
       }));
     }
-    if (url.pathname === `${repoPath}/compare/${BASE}...${HEAD}`) {
+    const compareMatch = url.pathname.match(
+      /^\/repos\/owner\/repo\/compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})$/u,
+    );
+    if (compareMatch !== null && compareMatch[1] === BASE) {
       return jsonResponse(JSON.stringify({
         base_commit: { sha: BASE },
         merge_base_commit: { sha: BASE },
       }));
     }
-    if (url.pathname === `${repoPath}/git/ref/pull/7/merge`) {
+    const mergeRefMatch = url.pathname.match(
+      /^\/repos\/owner\/repo\/git\/ref\/pull\/([1-9][0-9]*)\/merge$/u,
+    );
+    if (mergeRefMatch !== null) {
+      const pullNumber = Number(mergeRefMatch[1]);
+      const merge = fixtureMergeForPull(pullNumber);
       return jsonResponse(JSON.stringify({
-        ref: "refs/pull/7/merge",
-        url: `${apiOrigin}/repos/owner/repo/git/refs/pull/7/merge`,
+        ref: `refs/pull/${pullNumber}/merge`,
+        url: `${apiOrigin}/repos/owner/repo/git/refs/pull/${pullNumber}/merge`,
         object: {
           type: "commit",
-          sha: MERGE,
-          url: `${apiOrigin}/repos/owner/repo/git/commits/${MERGE}`,
+          sha: merge,
+          url: `${apiOrigin}/repos/owner/repo/git/commits/${merge}`,
         },
       }));
     }
-    if (url.pathname === `${repoPath}/commits/${HEAD}/check-runs`) {
+    if (/^\/repos\/owner\/repo\/commits\/[0-9a-f]{40}\/check-runs$/u
+      .test(url.pathname)) {
       return jsonResponse(JSON.stringify({ total_count: 0, check_runs: [] }));
     }
-    if (url.pathname === `${repoPath}/issues/7/comments`) {
-      return jsonResponse(JSON.stringify(issueComments));
+    const issueCommentsMatch = url.pathname.match(
+      /^\/repos\/owner\/repo\/issues\/([1-9][0-9]*)\/comments$/u,
+    );
+    if (issueCommentsMatch !== null) {
+      const pullNumber = Number(issueCommentsMatch[1]);
+      return jsonResponse(JSON.stringify(issueComments.filter((comment) =>
+        new URL(comment.issue_url).pathname ===
+          `${repoPath}/issues/${pullNumber}`)));
     }
     const issueCommentMatch = url.pathname.match(
       /^\/repos\/owner\/repo\/issues\/comments\/([1-9][0-9]*)$/u,
@@ -8169,11 +8871,10 @@ function completeSnapshotFetch({
         ? jsonResponse(JSON.stringify({ message: "Not Found" }), 404)
         : jsonResponse(JSON.stringify(comment));
     }
-    if (new Set([
-      `${repoPath}/pulls/7/reviews`,
-      `${repoPath}/pulls/7/comments`,
-      `${repoPath}/issues/7/reactions`,
-    ]).has(url.pathname)) {
+    if (
+      /^\/repos\/owner\/repo\/(?:pulls\/[1-9][0-9]*\/(?:reviews|comments)|issues\/[1-9][0-9]*\/reactions)$/u
+        .test(url.pathname)
+    ) {
       return jsonResponse("[]");
     }
     if (url.pathname === `${repoPath}/collaborators/maintainer/permission`) {
@@ -8220,9 +8921,9 @@ function productionTerminalFindingIssueComment() {
   return {
     id: 202,
     node_id: "IC_202",
-    url: "https://api.github.test/repos/owner/repo/issues/comments/202",
+    url: "https://api.github.com/repos/owner/repo/issues/comments/202",
     html_url: "https://github.com/owner/repo/pull/7#issuecomment-202",
-    issue_url: "https://api.github.test/repos/owner/repo/issues/7",
+    issue_url: "https://api.github.com/repos/owner/repo/issues/7",
     author_association: "NONE",
     body:
       "### 💡 Codex Review\n\n" +
@@ -8263,7 +8964,7 @@ async function withProductionAutomaticRecoveryScenario(callback, {
       ...environment,
       ...oidc.environment,
       GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.test",
+      GITHUB_API_URL: "https://api.github.com",
     };
     const initial = await runV2WorkflowControllerCli(firstEnvironment, {
       fetch: github.fetch,

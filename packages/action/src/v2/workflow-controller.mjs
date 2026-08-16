@@ -60,8 +60,6 @@ import {
   projectV2GitLedgerAutomaticReviewRequestTransport,
   projectV2GitLedgerReservationStatusTransport,
   projectV2GitLedgerStatusWriteTransport,
-  V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_REQUEST_SCHEMA,
-  V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_RESULT_SCHEMA,
   V2_GIT_LEDGER_CANDIDATE_REFRESH_ADAPTER_SCHEMA,
   V2_GIT_LEDGER_CANDIDATE_REFRESH_RECONCILIATION_SCHEMA,
   V2_GIT_LEDGER_AUTOMATIC_REVIEW_REQUEST_BINDING_RECEIPT_SCHEMA,
@@ -119,6 +117,8 @@ export const V2_OPEN_PULL_REQUEST_DIAGNOSTIC_SCHEMA =
 export const V2_PRODUCTION_ASSEMBLY_SCHEMA =
   "codex-review-gate-production-assembly-v2";
 export const MAX_V2_OPEN_PULL_REQUEST_MATRIX_JOBS = 256;
+export const MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES =
+  1024 * 1024;
 export const V2_MINIMAL_SCOPE_RECEIPT_SCHEMA =
   "codex-review-gate-minimal-scope-receipt-v2";
 export const V2_GITHUB_OIDC_VERIFIER_SCHEMA =
@@ -134,6 +134,14 @@ export const V2_GITHUB_OIDC_HTTP_TIMEOUT_MS =
 export const V2_GITHUB_OIDC_MAX_RESPONSE_BYTES = 1024 * 1024;
 export const V2_GITHUB_OIDC_MAX_TOTAL_BYTES = 2 * 1024 * 1024;
 export const V2_GITHUB_OIDC_MAX_REQUESTS = 128;
+const V2_CANDIDATE_LEGACY_FINISH_REQUEST_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-inventory-legacy-finish-request-v2";
+const V2_CANDIDATE_LEGACY_FINISH_RESULT_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-inventory-legacy-finish-result-v2";
+const V2_CURRENT_OPEN_GENERATION_PUBLICATION_SCHEMA =
+  "codex-review-gate-git-ledger-current-open-generation-publication-v3";
+const V2_CANDIDATE_LEGACY_FINISH_PUBLICATION_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-inventory-legacy-finish-publication-v2";
 export const V2_MINIMAL_SCOPE_QUERY = V2_SCOPE_QUERY.replace(
   "        isDraft\n",
   "        isDraft\n        updatedAt\n",
@@ -3559,15 +3567,32 @@ export async function runV2ScheduleDispatchCli(
     repository_endpoint_receipt:
       activation.preflight_handle.repository_endpoint_receipt,
   });
+  return writeV2ScheduleDispatchMatrixOutput({ rows, environment });
+}
+
+export async function writeV2ScheduleDispatchMatrixOutput({
+  rows,
+  environment = process.env,
+}) {
   const matrix = deepFreeze({ include: rows });
   const canonical = canonicalJson(matrix);
   if (/[\0\r\n]/u.test(canonical)) {
     throw new Error("schedule-dispatch matrix is not one canonical output line");
   }
+  const githubOutputLine = `matrix=${canonical}\n`;
+  if (
+    Buffer.byteLength(githubOutputLine, "utf16le") >
+      MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES
+  ) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_OUTPUT_TOO_LARGE",
+      "schedule-dispatch matrix exceeds the GitHub job-output byte cap",
+    );
+  }
   if (environment.GITHUB_OUTPUT !== undefined) {
     await appendFile(
       requiredEnv(environment, "GITHUB_OUTPUT"),
-      `matrix=${canonical}\n`,
+      githubOutputLine,
       { encoding: "utf8" },
     );
   }
@@ -3604,18 +3629,32 @@ async function loadV2ScheduleDispatchMatrixRows({
   const candidateAuthority = loaded.authority_projection?.candidate_inventory;
   assertObject(candidateAuthority, "candidate inventory authority");
   const completedInventory = candidateAuthority.completed_cycle;
+  const completedGeneration = candidateAuthority.completed_generation ?? null;
+  if (completedInventory !== null && completedGeneration !== null) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_CANDIDATE_AUTHORITY_INVALID",
+      "candidate inventory authority returned two completed source generations",
+    );
+  }
   const currentDispatch = loaded.authority_projection?.candidate_dispatch
     ?.current_cycle ?? null;
+  const completedSourceRecordOid = completedInventory?.complete_record_oid ??
+    completedGeneration?.generation_record_oid ?? null;
+  const completedSourceDigest = completedInventory?.cycle_receipt
+    ?.receipt_digest ?? completedGeneration?.inventory_digest ?? null;
   const completedInventoryAlreadyDispatched =
-    completedInventory !== null && currentDispatch?.cycle_complete === true &&
-    currentDispatch.cycle_id === completedInventory.cycle_id &&
+    completedSourceRecordOid !== null && completedSourceDigest !== null &&
+    currentDispatch?.cycle_complete === true &&
     currentDispatch.completed_cycle_record_oid ===
-      completedInventory.complete_record_oid &&
-    currentDispatch.inventory_digest ===
-      completedInventory.cycle_receipt.receipt_digest;
+      completedSourceRecordOid &&
+    currentDispatch.inventory_digest === completedSourceDigest &&
+    (completedInventory === null ||
+      currentDispatch.cycle_id === completedInventory.cycle_id);
   let refreshPersisted = false;
   if (
-    completedInventory === null || candidateAuthority.incomplete_cycle !== null ||
+    completedSourceRecordOid === null ||
+    candidateAuthority.incomplete_cycle !== null ||
+    candidateAuthority.atomic_cycle !== null ||
     completedInventoryAlreadyDispatched
   ) {
     const reconciliation = validateV2CandidateRefreshReconciliation(
@@ -3716,10 +3755,13 @@ async function loadV2ScheduleDispatchMatrixRows({
       plan,
       itemIndex,
     );
+    const candidateNumber = binding.candidate.schema_version === 2
+      ? binding.candidate.identity?.number
+      : binding.candidate.number;
     return {
       enabled: true,
       pull_request: positiveInteger(
-        binding.candidate.number,
+        candidateNumber,
         "candidate dispatch matrix pull_request",
       ),
       dispatch_binding: canonicalJson(binding),
@@ -3736,7 +3778,7 @@ function validateV2CandidateRefreshReconciliation(value) {
   ], "candidate inventory reconciliation result");
   if (
     value.schema !== V2_GIT_LEDGER_CANDIDATE_REFRESH_RECONCILIATION_SCHEMA ||
-    value.schema_version !== 1 ||
+    value.schema_version !== 2 ||
     typeof value.reason !== "string" ||
     typeof value.ledger_ref !== "string" ||
     !DIGEST.test(value.adapter_configuration_digest) ||
@@ -3748,12 +3790,13 @@ function validateV2CandidateRefreshReconciliation(value) {
     );
   }
   assertObject(value.repository, "candidate refresh repository");
-  assertObject(value.suppression_result, "candidate suppression result");
   if (value.state === "suppressed") {
+    assertObject(value.suppression_result, "candidate suppression result");
     if (
       value.persistence_mode !== null ||
       value.publication_result !== null ||
-      value.suppression_result.state !== "suppressed"
+      value.suppression_result.state !== "suppressed" ||
+      value.suppression_result.writes_performed !== false
     ) {
       throw controllerFailure(
         "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
@@ -3764,22 +3807,98 @@ function validateV2CandidateRefreshReconciliation(value) {
   }
   if (
     value.state !== "persisted" ||
-    value.persistence_mode !== "private-must-persist" ||
-    value.suppression_result.state !== "persist-required"
+    !new Set([
+      "current-open-generation-v3",
+      "legacy-finish-v1",
+    ]).has(value.persistence_mode) ||
+    value.suppression_result !== null
   ) {
     throw controllerFailure(
       "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
       "candidate refresh returned an unsupported reconciliation state",
     );
   }
-  assertObject(value.publication_result, "candidate refresh publication");
-  if (value.publication_result.state !== "persisted") {
+  validateV2CandidateRefreshPublication(
+    value.publication_result,
+    value.persistence_mode,
+  );
+  return value;
+}
+
+function validateV2CandidateRefreshPublication(value, persistenceMode) {
+  assertObject(value, "candidate refresh publication");
+  const currentOpen = persistenceMode === "current-open-generation-v3";
+  exactKeys(value, currentOpen
+    ? [
+        "schema", "schema_version", "state", "reason",
+        "publication_outcome", "repository", "ledger_ref", "generation_id",
+        "production_candidate_authority_digest", "candidate_count",
+        "candidate_set_digest", "source_current_open_semantic_digest",
+        "lifecycle_candidate_set_digest", "attachment_manifest_digest",
+        "published_record_commit_shas", "append_receipts",
+        "latest_append_receipt", "final_tip_commit_sha",
+        "final_commit_count", "writes_performed", "result_digest",
+      ]
+    : [
+        "schema", "schema_version", "state", "reason",
+        "publication_outcome", "repository", "ledger_ref", "cycle_id",
+        "start_record_oid", "cycle_receipt_digest",
+        "published_record_commit_shas", "append_receipts",
+        "latest_append_receipt", "final_tip_commit_sha",
+        "final_commit_count", "writes_performed", "result_digest",
+      ], "candidate refresh publication");
+  if (
+    value.schema !== (currentOpen
+      ? V2_CURRENT_OPEN_GENERATION_PUBLICATION_SCHEMA
+      : V2_CANDIDATE_LEGACY_FINISH_PUBLICATION_SCHEMA) ||
+    value.schema_version !== 1 ||
+    value.state !== "persisted" ||
+    !new Set(["published", "recovered-after-apply"])
+      .has(value.publication_outcome) ||
+    typeof value.reason !== "string" ||
+    typeof value.ledger_ref !== "string" ||
+    !Array.isArray(value.published_record_commit_shas) ||
+    value.published_record_commit_shas.length !== 2 ||
+    value.published_record_commit_shas.some((oid) => !SHA.test(oid)) ||
+    !Array.isArray(value.append_receipts) ||
+    !SHA.test(value.final_tip_commit_sha) ||
+    !Number.isSafeInteger(value.final_commit_count) ||
+    value.final_commit_count < 0 ||
+    value.writes_performed !== true ||
+    !DIGEST.test(value.result_digest)
+  ) {
     throw controllerFailure(
       "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
       "candidate refresh did not return one durable atomic publication",
     );
   }
-  return value;
+  assertObject(value.repository, "candidate refresh publication repository");
+  if (currentOpen) {
+    if (
+      typeof value.generation_id !== "string" ||
+      !Number.isSafeInteger(value.candidate_count) ||
+      value.candidate_count < 0 ||
+      !DIGEST.test(value.production_candidate_authority_digest) ||
+      !DIGEST.test(value.candidate_set_digest) ||
+      !DIGEST.test(value.source_current_open_semantic_digest) ||
+      !DIGEST.test(value.lifecycle_candidate_set_digest) ||
+      !DIGEST.test(value.attachment_manifest_digest)
+    ) {
+      throw controllerFailure(
+        "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+        "current-open generation publication is invalid",
+      );
+    }
+  } else if (
+    typeof value.cycle_id !== "string" ||
+    !SHA.test(value.start_record_oid) ||
+    !DIGEST.test(value.cycle_receipt_digest)
+  ) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+      "legacy finish publication is invalid",
+    );
+  }
 }
 
 function disabledV2CandidateDispatchRows() {
@@ -3818,7 +3937,7 @@ function createV2CandidateInventoryRefreshAdapter({
     restBaseUrl: normalizedRestBase,
   });
   const configurationDigest = gitLedgerDigestCanonical(
-    "codex-review-gate-v2-candidate-refresh-adapter-configuration",
+    "codex-review-gate-v2-candidate-refresh-adapter-v2-configuration",
     {
       repository: candidateRepository,
       rest_base_url: normalizedRestBase,
@@ -3827,8 +3946,8 @@ function createV2CandidateInventoryRefreshAdapter({
         rawDigest(V2_CURRENT_OPEN_PULL_REQUESTS_QUERY),
       current_open_max_candidates: MAX_V2_CURRENT_OPEN_CANDIDATES,
       current_open_max_pages: MAX_V2_CURRENT_OPEN_CANDIDATE_PAGES,
-      candidate_max_pages: MAX_V2_CANDIDATE_PAGES,
-      max_scan_passes: MAX_V2_CANDIDATE_SCAN_PASSES,
+      legacy_finish_max_pages: MAX_V2_CANDIDATE_PAGES,
+      legacy_finish_max_scan_passes: MAX_V2_CANDIDATE_SCAN_PASSES,
       timeout_ms: V2_CANDIDATE_HTTP_TIMEOUT_MS,
       controller_release_digest: gitLedgerDigestCanonical(
         "codex-review-gate-v2-candidate-refresh-controller-release",
@@ -3838,14 +3957,19 @@ function createV2CandidateInventoryRefreshAdapter({
   );
   return deepFreeze({
     schema: V2_GIT_LEDGER_CANDIDATE_REFRESH_ADAPTER_SCHEMA,
-    schema_version: 1,
+    schema_version: 2,
     configuration_digest: configurationDigest,
-    async collectCurrentOpenProjection() {
+    async collectCurrentOpenCandidateAuthority() {
       const receipt = await currentOpen.scan();
-      return currentOpen.projectForGitLedger(receipt);
+      const projection = currentOpen.projectForGitLedger(receipt);
+      return Object.freeze({
+        projection,
+        production_candidate_authority:
+          currentOpen.projectProductionCandidateAuthority(projection),
+      });
     },
-    async collectCandidateInventoryAttempt(request) {
-      return collectV2CandidateInventoryAttempt({
+    async finishLegacyCandidateInventoryAttempt(request) {
+      return finishV2LegacyCandidateInventoryAttempt({
         request,
         transport,
         repository: candidateRepository,
@@ -3854,34 +3978,53 @@ function createV2CandidateInventoryRefreshAdapter({
   });
 }
 
-async function collectV2CandidateInventoryAttempt({
+async function finishV2LegacyCandidateInventoryAttempt({
   request,
   transport,
   repository,
 }) {
-  assertObject(request, "candidate full refresh request");
+  assertObject(request, "legacy candidate inventory finish request");
   exactKeys(request, [
-    "schema", "schema_version", "request_handle", "attempt_index",
-    "repository", "prior_inventory", "initial_inventory", "max_scan_passes",
-  ], "candidate full refresh request");
+    "schema", "schema_version", "request_handle", "mode", "query_state",
+    "repository", "source_binding", "cycle_id", "start_record_oid",
+    "initial_inventory", "completed_shard_receipts", "next_shard_index",
+  ], "legacy candidate inventory finish request");
   if (
-    request.schema !== V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_REQUEST_SCHEMA ||
+    request.schema !== V2_CANDIDATE_LEGACY_FINISH_REQUEST_SCHEMA ||
     request.schema_version !== 1 ||
-    !Number.isSafeInteger(request.attempt_index) ||
-    request.attempt_index < 0 ||
-    request.attempt_index >= MAX_V2_CANDIDATE_SCAN_PASSES ||
-    request.max_scan_passes !== MAX_V2_CANDIDATE_SCAN_PASSES ||
+    request.mode !== "finish-existing" ||
+    request.query_state !== "all" ||
     canonicalJson(request.repository) !== canonicalJson(repository)
   ) {
     throw controllerFailure(
-      "CANDIDATE_REFRESH_REQUEST_INVALID",
-      "protected ledger requested an invalid candidate inventory attempt",
+      "CANDIDATE_LEGACY_FINISH_REQUEST_INVALID",
+      "protected ledger requested an invalid legacy inventory continuation",
     );
   }
-  const initialInventory = request.initial_inventory ??
-    await transport.scan({ prior_inventory: request.prior_inventory });
-  const shardReceipts = [];
-  for (let index = 0; index < initialInventory.shards.length; index += 1) {
+  assertObject(request.source_binding, "legacy finish source binding");
+  assertObject(request.initial_inventory, "legacy finish initial inventory");
+  if (
+    typeof request.cycle_id !== "string" ||
+    !SHA.test(request.start_record_oid) ||
+    !Array.isArray(request.initial_inventory.shards) ||
+    !Array.isArray(request.completed_shard_receipts) ||
+    !Number.isSafeInteger(request.next_shard_index) ||
+    request.next_shard_index < 0 ||
+    request.next_shard_index !== request.completed_shard_receipts.length ||
+    request.next_shard_index > request.initial_inventory.shards.length
+  ) {
+    throw controllerFailure(
+      "CANDIDATE_LEGACY_FINISH_REQUEST_INVALID",
+      "legacy inventory continuation differs from its durable shard prefix",
+    );
+  }
+  const initialInventory = request.initial_inventory;
+  const shardReceipts = structuredClone(request.completed_shard_receipts);
+  for (
+    let index = request.next_shard_index;
+    index < initialInventory.shards.length;
+    index += 1
+  ) {
     shardReceipts.push(await transport.readShard({
       inventory: initialInventory,
       shard_index: index,
@@ -3898,10 +4041,12 @@ async function collectV2CandidateInventoryAttempt({
     }));
   }
   return deepFreeze({
-    schema: V2_GIT_LEDGER_CANDIDATE_FULL_REFRESH_RESULT_SCHEMA,
+    schema: V2_CANDIDATE_LEGACY_FINISH_RESULT_SCHEMA,
     schema_version: 1,
     request_handle: request.request_handle,
-    attempt_index: request.attempt_index,
+    cycle_id: request.cycle_id,
+    start_record_oid: request.start_record_oid,
+    next_shard_index: request.next_shard_index,
     initial_inventory: initialInventory,
     shard_receipts: shardReceipts,
     final_inventory: finalInventory,

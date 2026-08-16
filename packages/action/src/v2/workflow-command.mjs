@@ -65,8 +65,21 @@ const POSITIVE_DECIMAL = /^[1-9][0-9]{0,31}$/u;
 const SHA = /^[0-9a-f]{40}$/u;
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const CANDIDATE_CYCLE_ID = /^candidate-cycle:[0-9a-f]{64}$/u;
+const CANDIDATE_SOURCE_GENERATION_ID =
+  /^candidate-source:[0-9a-f]{64}$/u;
+const CANDIDATE_LIFECYCLE_GENERATION_ID =
+  /^candidate-lifecycle:[0-9a-f]{64}$/u;
 const CANDIDATE_DISPATCH_GENERATION_ID =
   /^candidate-dispatch:[0-9a-f]{64}$/u;
+const V2_CANDIDATE_DISPATCH_BINDING_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-dispatch-binding-v2";
+const V2_CANDIDATE_DISPATCH_SOURCE_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-dispatch-source-v2";
+const V2_CANDIDATE_DISPATCH_SELECTION_SCHEMA =
+  "codex-review-gate-git-ledger-candidate-dispatch-selection-v2";
+const V2_CURRENT_OPEN_SOURCE_PROFILE = "stable-graphql-current-open-v4";
+const MAX_V2_CANDIDATE_DISPATCH_ITEMS = 64;
+const MAX_V2_CANDIDATE_DISPATCH_BATCHES = 8;
 const TIMESTAMP =
   /^(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?:\.(\d{1,3}))?Z$/u;
 const CREATE_FLAGS = constants.O_CREAT | constants.O_EXCL | constants.O_RDWR |
@@ -322,6 +335,7 @@ export function validateV2WorkflowCommandStructure(value) {
   validateClosedCommandRelationship({
     eventName,
     pullRequestNumber,
+    repository,
     route: value.route,
     dispatchBinding,
   });
@@ -505,6 +519,7 @@ function deriveRoute(environment, pullRequestNumber) {
 function validateClosedCommandRelationship({
   eventName,
   pullRequestNumber,
+  repository,
   route,
   dispatchBinding,
 }) {
@@ -544,9 +559,17 @@ function validateClosedCommandRelationship({
     );
   }
   if (dispatchBinding !== null &&
-      dispatchBinding.candidate.number !== pullRequestNumber) {
+      dispatchCandidateNumber(dispatchBinding.candidate) !==
+        pullRequestNumber) {
     throw new Error(
       "dispatch binding candidate does not match the trusted pull-request selector",
+    );
+  }
+  if (dispatchBinding?.schema_version === 2 &&
+      (dispatchBinding.repository.owner !== repository.owner ||
+        dispatchBinding.repository.name !== repository.name)) {
+    throw new Error(
+      "dispatch binding repository does not match the workflow command repository",
     );
   }
 }
@@ -606,7 +629,7 @@ function readDispatchBindingEnvironment(environment, {
     );
   }
   const binding = validateDispatchBinding(parsed);
-  if (binding.candidate.number !== pullRequestNumber) {
+  if (dispatchCandidateNumber(binding.candidate) !== pullRequestNumber) {
     throw new Error(
       "dispatch binding candidate does not match the trusted pull-request selector",
     );
@@ -616,6 +639,9 @@ function readDispatchBindingEnvironment(environment, {
 
 function validateDispatchBinding(value) {
   assertPlainObject(value, "workflow command.dispatch_binding");
+  if (value.schema_version === 2) {
+    return validateCurrentOpenDispatchBinding(value);
+  }
   exactKeys(value, [
     "generation_id",
     "cycle_id",
@@ -645,7 +671,8 @@ function validateDispatchBinding(value) {
     value.batch_count,
     "workflow command.dispatch_binding.batch_count",
   );
-  if (batchIndex >= batchCount || batchCount > 8) {
+  if (batchIndex >= batchCount ||
+      batchCount > MAX_V2_CANDIDATE_DISPATCH_BATCHES) {
     throw new Error("workflow command dispatch binding batch identity is invalid");
   }
   digest(value.dispatch_digest,
@@ -681,6 +708,336 @@ function validateDispatchBinding(value) {
     "workflow command.dispatch_binding.candidate.observation_raw_body_sha256");
 
   return deepFreeze(structuredClone(value));
+}
+
+function validateCurrentOpenDispatchBinding(value) {
+  const label = "workflow command.dispatch_binding";
+  exactKeys(value, [
+    "schema",
+    "schema_version",
+    "repository",
+    "generation_id",
+    "cycle_id",
+    "candidate_source",
+    "candidate_inventory_authority_digest",
+    "candidate_dispatch_authority_digest",
+    "inventory_digest",
+    "reservation_record_oid",
+    "reservation_digest",
+    "dispatch_digest",
+    "batch_index",
+    "batch_count",
+    "candidate_index",
+    "candidate",
+    "binding_digest",
+  ], label);
+  if (value.schema !== V2_CANDIDATE_DISPATCH_BINDING_SCHEMA ||
+      value.schema_version !== 2 ||
+      typeof value.generation_id !== "string" ||
+      !CANDIDATE_DISPATCH_GENERATION_ID.test(value.generation_id) ||
+      typeof value.cycle_id !== "string" ||
+      !CANDIDATE_CYCLE_ID.test(value.cycle_id)) {
+    throw new TypeError(`${label} schema or generation is invalid`);
+  }
+
+  const repository = validateDispatchRepository(
+    value.repository,
+    `${label}.repository`,
+  );
+  const candidateSource = validateCurrentOpenDispatchSource(
+    value.candidate_source,
+    `${label}.candidate_source`,
+  );
+  const candidate = validateCurrentOpenDispatchCandidate(
+    value.candidate,
+    `${label}.candidate`,
+  );
+  if (candidate.source_generation_record_oid !==
+      candidateSource.source_generation_record_oid) {
+    throw new Error(`${label} changes its source generation`);
+  }
+  if (candidate.lifecycle_generation_id !==
+      currentOpenLifecycleGenerationId(
+        repository,
+        candidate.identity_digest,
+      )) {
+    throw new Error(`${label} changes its lifecycle identity`);
+  }
+
+  const batchIndex = nonnegativeSafeInteger(
+    value.batch_index,
+    `${label}.batch_index`,
+  );
+  const batchCount = positiveSafeInteger(
+    value.batch_count,
+    `${label}.batch_count`,
+  );
+  const candidateIndex = nonnegativeSafeInteger(
+    value.candidate_index,
+    `${label}.candidate_index`,
+  );
+  if (candidateIndex >= MAX_V2_CANDIDATE_DISPATCH_ITEMS ||
+      batchIndex >= batchCount ||
+      batchCount > MAX_V2_CANDIDATE_DISPATCH_BATCHES) {
+    throw new Error(`${label} batch identity is invalid`);
+  }
+
+  for (const [field, fieldLabel] of [
+    [value.candidate_inventory_authority_digest, "candidate authority"],
+    [value.candidate_dispatch_authority_digest, "dispatch authority"],
+    [value.inventory_digest, "inventory"],
+    [value.reservation_digest, "reservation"],
+    [value.dispatch_digest, "dispatch"],
+    [value.binding_digest, "binding"],
+  ]) {
+    digest(field, `${label} ${fieldLabel} digest`);
+  }
+  sha(value.reservation_record_oid, `${label}.reservation_record_oid`);
+
+  const normalized = {
+    schema: V2_CANDIDATE_DISPATCH_BINDING_SCHEMA,
+    schema_version: 2,
+    repository,
+    generation_id: value.generation_id,
+    cycle_id: value.cycle_id,
+    candidate_source: candidateSource,
+    candidate_inventory_authority_digest:
+      value.candidate_inventory_authority_digest,
+    candidate_dispatch_authority_digest:
+      value.candidate_dispatch_authority_digest,
+    inventory_digest: value.inventory_digest,
+    reservation_record_oid: value.reservation_record_oid,
+    reservation_digest: value.reservation_digest,
+    dispatch_digest: value.dispatch_digest,
+    batch_index: batchIndex,
+    batch_count: batchCount,
+    candidate_index: candidateIndex,
+    candidate,
+  };
+  if (value.binding_digest !== ledgerDigestCanonical(
+    "codex-review-gate-v2-current-open-candidate-dispatch-binding",
+    normalized,
+  )) {
+    throw new Error(`${label}.binding_digest is invalid`);
+  }
+  if (Buffer.byteLength(canonicalJson(value), "utf8") >
+      MAX_V2_WORKFLOW_DISPATCH_BINDING_BYTES) {
+    throw new TypeError(`${label} exceeds its 4096-byte bound`);
+  }
+  return deepFreeze({
+    ...normalized,
+    binding_digest: value.binding_digest,
+  });
+}
+
+function validateDispatchRepository(value, label) {
+  assertPlainObject(value, label);
+  exactKeys(value, ["owner", "name", "id", "node_id", "owner_id"], label);
+  if (!REPOSITORY_PART.test(value.owner) ||
+      !REPOSITORY_PART.test(value.name)) {
+    throw new TypeError(`${label} contains a non-canonical GitHub path part`);
+  }
+  return {
+    owner: value.owner,
+    name: value.name,
+    id: decimal(value.id, `${label}.id`),
+    node_id: boundedNonemptyString(value.node_id, `${label}.node_id`, 256),
+    owner_id: decimal(value.owner_id, `${label}.owner_id`),
+  };
+}
+
+function validateCurrentOpenDispatchSource(value, label) {
+  assertPlainObject(value, label);
+  exactKeys(value, [
+    "schema",
+    "schema_version",
+    "source_profile",
+    "source_generation_id",
+    "source_generation_record_oid",
+    "source_generation_digest",
+    "production_candidate_authority_digest",
+    "candidate_set_digest",
+    "source_current_open_semantic_digest",
+    "lifecycle_candidate_set_digest",
+  ], label);
+  if (value.schema !== V2_CANDIDATE_DISPATCH_SOURCE_SCHEMA ||
+      value.schema_version !== 2 ||
+      value.source_profile !== V2_CURRENT_OPEN_SOURCE_PROFILE ||
+      typeof value.source_generation_id !== "string" ||
+      !CANDIDATE_SOURCE_GENERATION_ID.test(value.source_generation_id)) {
+    throw new TypeError(`${label} schema or generation is invalid`);
+  }
+  sha(value.source_generation_record_oid,
+    `${label}.source_generation_record_oid`);
+  for (const [field, fieldLabel] of [
+    [value.source_generation_digest, "generation"],
+    [value.production_candidate_authority_digest, "production authority"],
+    [value.candidate_set_digest, "candidate set"],
+    [value.source_current_open_semantic_digest, "source semantic"],
+    [value.lifecycle_candidate_set_digest, "lifecycle candidate set"],
+  ]) {
+    digest(field, `${label} ${fieldLabel} digest`);
+  }
+  return deepFreeze(structuredClone(value));
+}
+
+function validateCurrentOpenDispatchCandidate(value, label) {
+  assertPlainObject(value, label);
+  exactKeys(value, [
+    "schema",
+    "schema_version",
+    "source_generation_record_oid",
+    "identity",
+    "identity_digest",
+    "lifecycle_seed",
+    "lifecycle_seed_digest",
+    "lifecycle_generation_id",
+    "selection_digest",
+  ], label);
+  if (value.schema !== V2_CANDIDATE_DISPATCH_SELECTION_SCHEMA ||
+      value.schema_version !== 2) {
+    throw new TypeError(`${label} schema is invalid`);
+  }
+  sha(value.source_generation_record_oid,
+    `${label}.source_generation_record_oid`);
+
+  assertPlainObject(value.identity, `${label}.identity`);
+  exactKeys(value.identity, ["id", "node_id", "number", "created_at"],
+    `${label}.identity`);
+  const identity = {
+    id: decimal(value.identity.id, `${label}.identity.id`),
+    node_id: boundedNonemptyString(
+      value.identity.node_id,
+      `${label}.identity.node_id`,
+      256,
+    ),
+    number: positiveSafeInteger(
+      value.identity.number,
+      `${label}.identity.number`,
+    ),
+    created_at: normalizedLedgerTimestamp(
+      value.identity.created_at,
+      `${label}.identity.created_at`,
+    ),
+  };
+  digest(value.identity_digest, `${label}.identity_digest`);
+  if (value.identity_digest !== currentOpenDigestCanonical(
+    "codex-review-gate-v2-production-candidate-identity",
+    identity,
+  )) {
+    throw new Error(`${label}.identity_digest is invalid`);
+  }
+
+  assertPlainObject(value.lifecycle_seed, `${label}.lifecycle_seed`);
+  exactKeys(value.lifecycle_seed, [
+    "state",
+    "updated_at",
+    "draft",
+    "base",
+    "head",
+  ], `${label}.lifecycle_seed`);
+  if (value.lifecycle_seed.state !== "open" ||
+      typeof value.lifecycle_seed.draft !== "boolean") {
+    throw new TypeError(`${label}.lifecycle_seed is invalid`);
+  }
+  const updatedAt = normalizedLedgerTimestamp(
+    value.lifecycle_seed.updated_at,
+    `${label}.lifecycle_seed.updated_at`,
+  );
+  const lifecycleSeed = {
+    state: "open",
+    updated_at: updatedAt,
+    draft: value.lifecycle_seed.draft,
+    base: validateCurrentOpenRefSeed(
+      value.lifecycle_seed.base,
+      `${label}.lifecycle_seed.base`,
+    ),
+    head: validateCurrentOpenRefSeed(
+      value.lifecycle_seed.head,
+      `${label}.lifecycle_seed.head`,
+    ),
+  };
+  digest(value.lifecycle_seed_digest, `${label}.lifecycle_seed_digest`);
+  if (value.lifecycle_seed_digest !== currentOpenDigestCanonical(
+    "codex-review-gate-v2-production-candidate-lifecycle-seed",
+    { identity, lifecycle_seed: lifecycleSeed },
+  )) {
+    throw new Error(`${label}.lifecycle_seed_digest is invalid`);
+  }
+  if (typeof value.lifecycle_generation_id !== "string" ||
+      !CANDIDATE_LIFECYCLE_GENERATION_ID.test(
+        value.lifecycle_generation_id,
+      )) {
+    throw new TypeError(`${label}.lifecycle_generation_id is invalid`);
+  }
+  digest(value.selection_digest, `${label}.selection_digest`);
+  if (value.selection_digest !== ledgerDigestCanonical(
+    "codex-review-gate-v2-current-open-dispatch-selection",
+    {
+      source_generation_record_oid: value.source_generation_record_oid,
+      identity_digest: value.identity_digest,
+      lifecycle_seed_digest: value.lifecycle_seed_digest,
+      lifecycle_generation_id: value.lifecycle_generation_id,
+    },
+  )) {
+    throw new Error(`${label}.selection_digest is invalid`);
+  }
+  return deepFreeze({
+    schema: V2_CANDIDATE_DISPATCH_SELECTION_SCHEMA,
+    schema_version: 2,
+    source_generation_record_oid: value.source_generation_record_oid,
+    identity,
+    identity_digest: value.identity_digest,
+    lifecycle_seed: lifecycleSeed,
+    lifecycle_seed_digest: value.lifecycle_seed_digest,
+    lifecycle_generation_id: value.lifecycle_generation_id,
+    selection_digest: value.selection_digest,
+  });
+}
+
+function validateCurrentOpenRefSeed(value, label) {
+  assertPlainObject(value, label);
+  exactKeys(value, ["ref", "sha", "repo"], label);
+  assertPlainObject(value.repo, `${label}.repo`);
+  exactKeys(value.repo, ["id", "node_id", "full_name"], `${label}.repo`);
+  return {
+    ref: boundedNonemptyString(value.ref, `${label}.ref`, 255),
+    sha: sha(value.sha, `${label}.sha`),
+    repo: {
+      id: decimal(value.repo.id, `${label}.repo.id`),
+      node_id: boundedNonemptyString(
+        value.repo.node_id,
+        `${label}.repo.node_id`,
+        256,
+      ),
+      full_name: boundedNonemptyString(
+        value.repo.full_name,
+        `${label}.repo.full_name`,
+        256,
+      ),
+    },
+  };
+}
+
+function dispatchCandidateNumber(candidate) {
+  return candidate.schema_version === 2
+    ? candidate.identity.number
+    : candidate.number;
+}
+
+function currentOpenLifecycleGenerationId(repository, identityDigest) {
+  return `candidate-lifecycle:${ledgerDigestCanonical(
+    "codex-review-gate-v2-current-open-lifecycle-generation",
+    {
+      repository: {
+        owner: repository.owner,
+        name: repository.name,
+        id: repository.id,
+        node_id: repository.node_id,
+      },
+      identity_digest: identityDigest,
+    },
+  ).slice("sha256:".length)}`;
 }
 
 async function readAdvisoryEvent(environment) {
@@ -1166,6 +1523,15 @@ function ledgerTimestamp(value, label) {
   return value;
 }
 
+function normalizedLedgerTimestamp(value, label) {
+  ledgerTimestamp(value, label);
+  const normalized = new Date(Date.parse(value)).toISOString();
+  if (value !== normalized) {
+    throw new TypeError(`${label} must use normalized millisecond UTC form`);
+  }
+  return normalized;
+}
+
 function sha(value, label) {
   if (typeof value !== "string" || !SHA.test(value)) {
     throw new TypeError(`${label} must be one lowercase SHA-1 object id`);
@@ -1216,6 +1582,18 @@ function canonicalJson(value) {
   const encoded = JSON.stringify(value);
   if (encoded === undefined) throw new TypeError("canonical JSON value is unsupported");
   return encoded;
+}
+
+function rawDigest(value) {
+  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function ledgerDigestCanonical(domain, value) {
+  return rawDigest(`${domain}\0${canonicalJson(value)}`);
+}
+
+function currentOpenDigestCanonical(domain, value) {
+  return rawDigest(`${domain}\n${canonicalJson(value)}\n`);
 }
 
 function decodeUtf8(bytes, label) {
