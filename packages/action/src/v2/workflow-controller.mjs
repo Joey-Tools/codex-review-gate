@@ -1198,9 +1198,55 @@ function normalizeOidcJwks(value) {
     ) {
       throw new TypeError(`OIDC JWKS key[${index}] is not one unique RSA signing key`);
     }
-    byKid.set(key.kid, deepFreeze(structuredClone(key)));
+    let publicKey;
+    try {
+      publicKey = createPublicKey({
+        key: { kty: key.kty, n: key.n, e: key.e },
+        format: "jwk",
+      });
+      const details = publicKey.asymmetricKeyDetails;
+      if (
+        publicKey.asymmetricKeyType !== "rsa" ||
+        !Number.isSafeInteger(details?.modulusLength) ||
+        details.modulusLength < 2_048 ||
+        typeof details.publicExponent !== "bigint" ||
+        details.publicExponent < 3n || details.publicExponent % 2n === 0n
+      ) {
+        throw new TypeError("OIDC JWKS RSA key parameters are invalid");
+      }
+    } catch (error) {
+      throw controllerFailure(
+        "OIDC_JWK_INVALID",
+        `OIDC JWKS key[${index}] cannot construct one trusted RSA key`,
+        null,
+        error,
+      );
+    }
+    byKid.set(key.kid, Object.freeze({
+      algorithm: key.alg,
+      public_key: publicKey,
+    }));
   }
-  return byKid;
+  return Object.freeze({
+    has(kid) { return byKid.has(kid); },
+    get(kid) { return byKid.get(kid); },
+  });
+}
+
+function validateCheckpointOidcRecordIdentity(value) {
+  assertObject(value, "checkpoint OIDC provenance record_identity");
+  exactKeys(value, [
+    "record_type", "kind", "effect_id", "idempotency_key", "payload_digest",
+  ], "checkpoint OIDC provenance record_identity");
+  if (
+    value.record_type !== "epoch-checkpoint" ||
+    value.kind !== null || value.effect_id !== null ||
+    value.idempotency_key !== null || !DIGEST.test(value.payload_digest)
+  ) {
+    throw new TypeError(
+      "checkpoint OIDC provenance record_identity does not bind one exact ledger checkpoint",
+    );
+  }
 }
 
 function validateEffectBoundOidcRequest(request) {
@@ -1225,13 +1271,31 @@ function validateEffectBoundOidcRequest(request) {
     "candidate-inventory-observation",
     "candidate-dispatch-observation",
   ]).has(request.operation);
+  const checkpointRecord = request.operation === "checkpoint-rotate";
+  const checkpointIdentity =
+    request.record_identity?.record_type === "epoch-checkpoint";
+  if (checkpointRecord) {
+    if (
+      request.effect_scope !== null ||
+      request.evaluated_scope_receipt !== null
+    ) {
+      throw new TypeError(
+        "checkpoint OIDC provenance request cannot carry effect scope authority",
+      );
+    }
+    validateCheckpointOidcRecordIdentity(request.record_identity);
+  } else if (checkpointIdentity) {
+    throw new TypeError(
+      "epoch-checkpoint OIDC provenance identity requires checkpoint-rotate",
+    );
+  }
   if (
-    repositoryScopedRecord
+    !checkpointRecord && (repositoryScopedRecord
       ? request.effect_scope !== null ||
         request.evaluated_scope_receipt === null || request.record_identity === null
       : (request.effect_scope === null) !==
           (request.evaluated_scope_receipt === null) ||
-        (request.effect_scope === null) !== (request.record_identity === null)
+        (request.effect_scope === null) !== (request.record_identity === null))
   ) {
     throw new TypeError("OIDC provenance request scope authority fields are inconsistent");
   }
@@ -1294,25 +1358,17 @@ function verifyGitHubOidcJwt({ jwt, request, trust }) {
     );
   }
   const key = trust.keys.get(header.kid);
-  let publicKey;
-  try {
-    publicKey = createPublicKey({
-      key: { kty: "RSA", n: key.n, e: key.e },
-      format: "jwk",
-    });
-  } catch (error) {
+  if (key.algorithm !== header.alg) {
     throw controllerFailure(
-      "OIDC_JWK_INVALID",
-      "GitHub OIDC signing key could not be constructed",
-      null,
-      error,
+      "OIDC_JWT_HEADER_UNSUPPORTED",
+      "GitHub OIDC token header algorithm differs from its trusted key",
     );
   }
   const signature = decodeBase64Url(segments[2], "OIDC JWT signature");
   const valid = verifySignature(
     "RSA-SHA256",
     Buffer.from(`${segments[0]}.${segments[1]}`, "ascii"),
-    publicKey,
+    key.public_key,
     signature,
   );
   if (!valid) {
@@ -3651,19 +3707,23 @@ async function loadV2ScheduleDispatchMatrixRows({
     (completedInventory === null ||
       currentDispatch.cycle_id === completedInventory.cycle_id);
   let refreshPersisted = false;
+  let candidateRefreshReconciliation = null;
   if (
     completedSourceRecordOid === null ||
     candidateAuthority.incomplete_cycle !== null ||
     candidateAuthority.atomic_cycle !== null ||
     completedInventoryAlreadyDispatched
   ) {
-    const reconciliation = validateV2CandidateRefreshReconciliation(
-      await ledger.reconcileCandidateInventoryRefreshAtomically({
-        workflow_command_handle: command,
-        trigger_identity: triggerIdentity,
-        repository_endpoint_receipt: repositoryEndpointReceipt,
-      }),
-    );
+    const reconciliation =
+      validateV2CandidateRefreshReconciliationForSource(
+        await ledger.reconcileCandidateInventoryRefreshAtomically({
+          workflow_command_handle: command,
+          trigger_identity: triggerIdentity,
+          repository_endpoint_receipt: repositoryEndpointReceipt,
+        }),
+        candidateAuthority,
+      );
+    candidateRefreshReconciliation = reconciliation;
     if (reconciliation.state === "suppressed") {
       if (reconciliation.publication_result !== null) {
         throw controllerFailure(
@@ -3693,6 +3753,10 @@ async function loadV2ScheduleDispatchMatrixRows({
     workflow_command_handle: command,
     trigger_identity: triggerIdentity,
     repository_endpoint_receipt: repositoryEndpointReceipt,
+    ...(candidateRefreshReconciliation === null ? {} : {
+      candidate_refresh_reconciliation_result:
+        candidateRefreshReconciliation,
+    }),
   });
   assertObject(dispatch, "candidate dispatch load result");
   if (
@@ -3769,7 +3833,60 @@ async function loadV2ScheduleDispatchMatrixRows({
   }));
 }
 
-function validateV2CandidateRefreshReconciliation(value) {
+function expectedLegacyCandidateRefreshPublicationBoundary(incomplete) {
+  if (incomplete === null) return null;
+  assertObject(incomplete, "incomplete candidate inventory authority");
+  assertObject(
+    incomplete.initial_inventory,
+    "incomplete candidate inventory initial scan",
+  );
+  const shards = incomplete.initial_inventory.shards;
+  const shardReceipts = incomplete.shard_receipts;
+  const nextShardIndex = incomplete.next_shard_index;
+  if (
+    !Array.isArray(shards) || shards.length > MAX_V2_CANDIDATE_PAGES ||
+    !Array.isArray(shardReceipts) || shardReceipts.length !== nextShardIndex ||
+    !Number.isSafeInteger(nextShardIndex) || nextShardIndex < 0 ||
+    nextShardIndex > shards.length
+  ) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_CANDIDATE_AUTHORITY_INVALID",
+      "incomplete candidate inventory returned an invalid durable shard boundary",
+    );
+  }
+  if (
+    typeof incomplete.cycle_id !== "string" ||
+    !SHA.test(incomplete.start_record_oid)
+  ) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_CANDIDATE_AUTHORITY_INVALID",
+      "incomplete candidate inventory returned an invalid durable cycle identity",
+    );
+  }
+  return deepFreeze({
+    cycle_id: incomplete.cycle_id,
+    start_record_oid: incomplete.start_record_oid,
+    published_record_count: shards.length - nextShardIndex + 2,
+  });
+}
+
+export function validateV2CandidateRefreshReconciliationForSource(
+  value,
+  candidateAuthority,
+) {
+  assertObject(candidateAuthority, "candidate inventory authority");
+  return validateV2CandidateRefreshReconciliation(
+    value,
+    expectedLegacyCandidateRefreshPublicationBoundary(
+      candidateAuthority.incomplete_cycle,
+    ),
+  );
+}
+
+function validateV2CandidateRefreshReconciliation(
+  value,
+  expectedLegacyPublicationBoundary,
+) {
   assertObject(value, "candidate inventory reconciliation result");
   exactKeys(value, [
     "schema", "schema_version", "state", "reason", "repository",
@@ -3793,6 +3910,7 @@ function validateV2CandidateRefreshReconciliation(value) {
   if (value.state === "suppressed") {
     assertObject(value.suppression_result, "candidate suppression result");
     if (
+      expectedLegacyPublicationBoundary !== null ||
       value.persistence_mode !== null ||
       value.publication_result !== null ||
       value.suppression_result.state !== "suppressed" ||
@@ -3818,14 +3936,28 @@ function validateV2CandidateRefreshReconciliation(value) {
       "candidate refresh returned an unsupported reconciliation state",
     );
   }
+  if (
+    (value.persistence_mode === "legacy-finish-v1") !==
+      (expectedLegacyPublicationBoundary !== null)
+  ) {
+    throw controllerFailure(
+      "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+      "candidate refresh persistence mode differs from its durable source boundary",
+    );
+  }
   validateV2CandidateRefreshPublication(
     value.publication_result,
     value.persistence_mode,
+    expectedLegacyPublicationBoundary,
   );
   return value;
 }
 
-function validateV2CandidateRefreshPublication(value, persistenceMode) {
+function validateV2CandidateRefreshPublication(
+  value,
+  persistenceMode,
+  expectedLegacyPublicationBoundary,
+) {
   assertObject(value, "candidate refresh publication");
   const currentOpen = persistenceMode === "current-open-generation-v3";
   exactKeys(value, currentOpen
@@ -3858,7 +3990,9 @@ function validateV2CandidateRefreshPublication(value, persistenceMode) {
     typeof value.reason !== "string" ||
     typeof value.ledger_ref !== "string" ||
     !Array.isArray(value.published_record_commit_shas) ||
-    value.published_record_commit_shas.length !== 2 ||
+    value.published_record_commit_shas.length !== (currentOpen
+      ? 2
+      : expectedLegacyPublicationBoundary?.published_record_count) ||
     value.published_record_commit_shas.some((oid) => !SHA.test(oid)) ||
     !Array.isArray(value.append_receipts) ||
     !SHA.test(value.final_tip_commit_sha) ||
@@ -3891,7 +4025,10 @@ function validateV2CandidateRefreshPublication(value, persistenceMode) {
     }
   } else if (
     typeof value.cycle_id !== "string" ||
+    value.cycle_id !== expectedLegacyPublicationBoundary?.cycle_id ||
     !SHA.test(value.start_record_oid) ||
+    value.start_record_oid !==
+      expectedLegacyPublicationBoundary?.start_record_oid ||
     !DIGEST.test(value.cycle_receipt_digest)
   ) {
     throw controllerFailure(

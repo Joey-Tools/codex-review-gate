@@ -58,6 +58,7 @@ import {
   assertV2GitLedgerStatusWriteIntentHandle,
   assertV2GitLedgerCandidateDispatchHandle,
   assertV2GitLedgerCandidateDispatchResultHandle,
+  V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_PATH,
   V2_GIT_LEDGER_REF,
   createV2GitHubGitLedger,
   createV2GitHubGitLedgerBootstrap,
@@ -10281,6 +10282,20 @@ test("current-open v3 reconciliation recognizes its publication below a later ge
     const prefixStart = loaded.records.findIndex(({ commit_sha: commitSha }) =>
       commitSha ===
         prefixResult.publication_result.published_record_commit_shas[0]);
+    const prefixAuthority = deriveV2GitLedgerCandidateInventoryAuthority(
+      loaded.records.slice(0, prefixStart + 2),
+      REPOSITORY,
+    );
+    assert.equal(
+      prefixAuthority.completed_generation.generation_record_oid,
+      prefixResult.publication_result.published_record_commit_shas[0],
+    );
+    assert.equal(prefixAuthority.completed_generation.candidate_count, 0);
+    assert.equal(
+      loaded.authority_projection.candidate_inventory.completed_generation
+        .candidate_count,
+      1,
+    );
     assert.deepEqual(
       loaded.records.slice(prefixStart, prefixStart + 2)
         .map(({ commit_sha: commitSha }) => commitSha),
@@ -10290,6 +10305,785 @@ test("current-open v3 reconciliation recognizes its publication below a later ge
       loaded.tip_commit_sha,
       suffixResult.publication_result.published_record_commit_shas.at(-1),
     );
+  });
+
+test("current-open v3 mature checkpoint recovers one two-record publication",
+  async () => {
+    const fixture = githubGitFixture();
+    const capability = scheduleCapabilityReceipt();
+    const triggerIdentity = scheduleTriggerIdentity();
+    const runIdentity = { ...OWNER };
+    const preflight = await loadFixtureProviderPreflight();
+    let provenanceVerificationCalls = 0;
+    const exactVerifier = provenanceVerifier({
+      eventName: "schedule",
+      ref: triggerIdentity.ref,
+      shaValue: triggerIdentity.sha,
+      runIdentity,
+    });
+    const verifier = async (...args) => {
+      provenanceVerificationCalls += 1;
+      return exactVerifier(...args);
+    };
+    const currentOpen = currentOpenSuppressionAdapterFixture({
+      initialNumbers: Array.from(
+        { length: 255 },
+        (_, index) => PR.number + index,
+      ),
+      exactScopeCandidateNumber: PR.number,
+    });
+    const refreshAdapter = Object.freeze({
+      schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+      schema_version: 2,
+      configuration_digest: rawDigest(
+        "candidate-current-open-v3-mature-response-loss-configuration-v1",
+      ),
+      collectCurrentOpenCandidateAuthority:
+        currentOpen.collectProductionCandidateAuthority,
+      async finishLegacyCandidateInventoryAttempt() {
+        throw new Error("current-open mature checkpoint used legacy REST");
+      },
+    });
+    const ledger = makeLedger(fixture, capability, verifier, preflight, {
+      candidateInventoryRefreshAdapter: refreshAdapter,
+    });
+    await ledger.bootstrapCapability();
+    await padOrdinaryLedgerWithStandaloneAttestations({
+      fixture,
+      verifier,
+      targetCommitCount: 7,
+    });
+    assert.equal((await ledger.load()).commit_count, 7);
+    const callsBefore = currentOpen.calls.length;
+    const patchesBefore = fixture.calls.filter(({ method }) =>
+      method === "PATCH").length;
+    let provenanceVerificationCallsAtPublicationApply = null;
+    fixture.afterNextCandidateInventoryUpdateApplied(() => {
+      provenanceVerificationCallsAtPublicationApply =
+        provenanceVerificationCalls;
+    });
+    fixture.failNextCandidateInventoryUpdateAfterApply();
+
+    const workflowCommandHandle = await createScheduleWorkflowCommandHandle();
+    const repositoryEndpointReceipt = scheduleRepositoryEndpointReceipt();
+    const result = await ledger.reconcileCandidateInventoryRefreshAtomically({
+      workflow_command_handle: workflowCommandHandle,
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: repositoryEndpointReceipt,
+    });
+
+    assert.equal(result.state, "persisted");
+    assert.equal(result.persistence_mode, "current-open-generation-v3");
+    assert.equal(
+      result.publication_result.publication_outcome,
+      "recovered-after-apply",
+    );
+    assert.equal(result.publication_result.final_commit_count, 3);
+    assert.equal(result.publication_result.append_receipts.length, 0);
+    assert.equal(
+      result.publication_result.published_record_commit_shas.length,
+      2,
+    );
+    assert.equal(
+      fixture.calls.filter(({ method }) => method === "PATCH").length -
+        patchesBefore,
+      1,
+    );
+    assert.equal(currentOpen.calls.length > callsBefore, true);
+    assertNoCandidateRefreshPrivateAuthority(result);
+    assert.notEqual(provenanceVerificationCallsAtPublicationApply, null);
+    assert.equal(
+      provenanceVerificationCalls -
+        provenanceVerificationCallsAtPublicationApply,
+      11,
+      "response-loss publication must retain its post-CAS full replay",
+    );
+    const publicationPatchIndex = fixture.calls.map(({ method }) => method)
+      .lastIndexOf("PATCH");
+    assert.notEqual(publicationPatchIndex, -1);
+    assert.equal(
+      fixture.calls.slice(publicationPatchIndex + 1).some(({ method, path }) =>
+        method === "GET" && path.startsWith("/git/commits/")),
+      true,
+      "response-loss reconciliation must fully reload after the applied CAS",
+    );
+    const readCountsAfter = (callIndex) => {
+      const calls = fixture.calls.slice(callIndex);
+      return {
+        refs: calls.filter(({ method, path }) =>
+          method === "GET" &&
+          path === "/git/ref/heads/codex-review-gate-ledger-v2").length,
+        objects: calls.filter(({ method, path }) =>
+          method === "GET" && (
+            path.startsWith("/git/commits/") ||
+            path.startsWith("/git/trees/") ||
+            path.startsWith("/git/blobs/")
+          )).length,
+      };
+    };
+    const reserveWithContinuation = async ({
+      targetLedger,
+      reconciliationResult,
+    }) => {
+      const callIndex = fixture.calls.length;
+      const verificationIndex = provenanceVerificationCalls;
+      const writeIndex = fixture.writeCalls;
+      const dispatch = await targetLedger.loadOrReserveCandidateDispatch({
+        workflow_command_handle: workflowCommandHandle,
+        trigger_identity: triggerIdentity,
+        repository_endpoint_receipt: repositoryEndpointReceipt,
+        candidate_refresh_reconciliation_result: reconciliationResult,
+      });
+      assert.equal(dispatch.state, "dispatch");
+      assert.equal(dispatch.restarted, true);
+      return {
+        dispatch,
+        reads: readCountsAfter(callIndex),
+        provenance_reverification_count:
+          provenanceVerificationCalls - verificationIndex,
+        write_count: fixture.writeCalls - writeIndex,
+      };
+    };
+    const assertFullReplay = (attempt, label) => {
+      assert.equal(attempt.reads.refs, 2, `${label} must use a full ref fence`);
+      assert.ok(
+        attempt.reads.objects > 0,
+        `${label} must replay stored Git objects`,
+      );
+      assert.equal(
+        attempt.provenance_reverification_count,
+        11,
+        `${label} must reverify the complete mature checkpoint query`,
+      );
+      assert.equal(attempt.write_count, 0, `${label} must remain read-only`);
+    };
+    const malformed = await reserveWithContinuation({
+      targetLedger: ledger,
+      reconciliationResult: {},
+    });
+    assertFullReplay(malformed, "malformed continuation");
+    const cloned = await reserveWithContinuation({
+      targetLedger: ledger,
+      reconciliationResult: structuredClone(result),
+    });
+    assertFullReplay(cloned, "cloned continuation");
+    const restarted = makeLedger(
+      fixture,
+      capability,
+      verifier,
+      preflight,
+      { candidateInventoryRefreshAdapter: refreshAdapter },
+    );
+    const crossFactory = await reserveWithContinuation({
+      targetLedger: restarted,
+      reconciliationResult: result,
+    });
+    assertFullReplay(crossFactory, "cross-factory continuation");
+    const exact = await reserveWithContinuation({
+      targetLedger: ledger,
+      reconciliationResult: result,
+    });
+    assert.deepEqual(exact.reads, { refs: 1, objects: 0 });
+    assert.equal(exact.provenance_reverification_count, 0);
+    assert.equal(exact.write_count, 0);
+    const consumed = await reserveWithContinuation({
+      targetLedger: ledger,
+      reconciliationResult: result,
+    });
+    assertFullReplay(consumed, "consumed continuation");
+    for (const attempt of [malformed, cloned, crossFactory, consumed]) {
+      assert.equal(
+        attempt.dispatch.plan.plan_digest,
+        exact.dispatch.plan.plan_digest,
+      );
+    }
+    const restartedDispatch = crossFactory.dispatch;
+    const callsAfterPublication = currentOpen.calls.length;
+    const beforeRestart = {
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    };
+    const restartCallIndex = fixture.calls.length;
+    const restartVerificationIndex = provenanceVerificationCalls;
+    const loaded = await restarted.load();
+    const restartReads = readCountsAfter(restartCallIndex);
+    assert.equal(restartReads.refs, 2);
+    assert.ok(restartReads.objects > 0);
+    assert.equal(
+      provenanceVerificationCalls - restartVerificationIndex,
+      11,
+      "restart must not inherit another factory's continuation",
+    );
+    assert.equal(currentOpen.calls.length, callsAfterPublication);
+    assert.deepEqual({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    }, beforeRestart);
+    assert.equal(loaded.checkpoint.profile, "mature-quiescent-v1");
+    assert.equal(loaded.commit_count, 3);
+    assert.equal(loaded.epoch_commit_count, 3);
+    assert.equal(loaded.logical_record_count, 10);
+    assert.equal(
+      loaded.authority_projection.candidate_inventory.completed_generation
+        .candidate_count,
+      255,
+    );
+    assert.equal(
+      loaded.authority_projection.candidate_dispatch.active_reservation
+        .reservation.candidates.length,
+      64,
+    );
+    assert.equal(
+      loaded.checkpoint.candidate_inventory_authority_digest,
+      loaded.authority_projection.candidate_inventory.authority_digest,
+    );
+    assert.equal(
+      loaded.checkpoint.candidate_dispatch_authority_digest,
+      loaded.authority_projection.candidate_dispatch.authority_digest,
+    );
+    const checkpointLayout = matureCheckpointFixtureLayout(fixture);
+    const checkpointState = JSON.parse(
+      fixture.blobs.get(checkpointLayout.state_blob_entry.sha).content,
+    );
+    assert.equal(checkpointState.schema_version, 3);
+    assert.equal(checkpointState.next_unit.candidate_count, 255);
+    assert.equal(checkpointState.next_unit.semantic_record_count, 2);
+    assert.equal(
+      checkpointLayout.suffix.length,
+      checkpointState.next_unit.semantic_record_count,
+    );
+    assert.equal(
+      checkpointState.next_unit.total_commit_budget_required,
+      4090,
+    );
+    assert.equal(
+      checkpointState.next_unit.current_epoch_remaining_commit_capacity,
+      -1,
+    );
+    assert.equal(
+      checkpointState.next_unit.fresh_epoch_remaining_commit_capacity,
+      5,
+    );
+    const readOnlySnapshot = () => ({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+      patches: fixture.calls.filter(({ method }) => method === "PATCH").length,
+    });
+    const resealedStateMutations = [
+      ["attachment manifest", (nextUnit) => {
+        nextUnit.attachment_manifest_digest = rawDigest(
+          "tampered-current-open-checkpoint-attachment-manifest",
+        );
+      }],
+      ["production authority", (nextUnit) => {
+        nextUnit.production_candidate_authority_digest = rawDigest(
+          "tampered-current-open-checkpoint-production-authority",
+        );
+      }],
+      ["current-open projection", (nextUnit) => {
+        nextUnit.current_open_projection_digest = rawDigest(
+          "tampered-current-open-checkpoint-projection",
+        );
+      }],
+      ["stable command", (nextUnit) => {
+        nextUnit.stable_command_authority_digest = rawDigest(
+          "tampered-current-open-checkpoint-command",
+        );
+      }],
+      ["trigger identity", (nextUnit) => {
+        nextUnit.trigger_identity_digest = rawDigest(
+          "tampered-current-open-checkpoint-trigger",
+        );
+      }],
+      ["repository endpoint", (nextUnit) => {
+        nextUnit.repository_endpoint_receipt_digest = rawDigest(
+          "tampered-current-open-checkpoint-endpoint",
+        );
+      }],
+      ["total budget", (nextUnit) => {
+        nextUnit.total_commit_budget_required -= 1;
+      }],
+      ["current capacity", (nextUnit) => {
+        nextUnit.current_epoch_remaining_commit_capacity -= 1;
+      }],
+      ["fresh capacity", (nextUnit) => {
+        nextUnit.fresh_epoch_remaining_commit_capacity -= 1;
+      }],
+      ["admission digest", (nextUnit) => {
+        nextUnit.admission_digest = rawDigest(
+          "tampered-current-open-checkpoint-admission",
+        );
+      }, false, "CHECKPOINT_NEXT_UNIT_ADMISSION"],
+    ];
+    for (const [
+      label,
+      mutateNextUnit,
+      resealAdmissionDigest = true,
+      expectedCode = "CHECKPOINT_SUFFIX_AUTHORITY",
+    ] of resealedStateMutations) {
+      const original = fixture.snapshotHistoricalState();
+      try {
+        resealMatureCurrentOpenCheckpointStateForFixture({
+          fixture,
+          mutateNextUnit,
+          resealAdmissionDigest,
+        });
+        const beforeTamperedLoad = readOnlySnapshot();
+        await assert.rejects(
+          makeLedger(
+            fixture,
+            capability,
+            verifier,
+            preflight,
+            { candidateInventoryRefreshAdapter: refreshAdapter },
+          ).load(),
+          (error) => error.code === expectedCode,
+        );
+        assert.deepEqual(readOnlySnapshot(), beforeTamperedLoad);
+      } catch (error) {
+        error.message = `${label}: ${error.message}`;
+        throw error;
+      } finally {
+        fixture.restoreHistoricalState(original);
+      }
+    }
+    const generationEntry = loaded.records.find(({ commit_sha: commitSha }) =>
+      commitSha ===
+        result.publication_result.published_record_commit_shas[0]);
+    assert.notEqual(generationEntry, undefined);
+    const generationCommit = fixture.commits.get(generationEntry.commit_sha);
+    assert.notEqual(generationCommit, undefined);
+    const generationTree = fixture.trees.get(generationCommit.tree.sha);
+    assert.notEqual(generationTree, undefined);
+    const attachmentTreeEntry = generationTree.tree.find((entry) =>
+      entry.path === V2_GIT_LEDGER_CANDIDATE_INVENTORY_ATTACHMENT_PATH &&
+      entry.type === "tree");
+    assert.notEqual(attachmentTreeEntry, undefined);
+    const attachmentTreePath = `/git/trees/${attachmentTreeEntry.sha}`;
+    assert.equal(restartedDispatch.state, "dispatch");
+    assert.equal(restartedDispatch.restarted, true);
+    assert.equal(
+      restartedDispatch.plan.items[0].candidate.identity.number,
+      PR.number,
+    );
+    const dispatchBinding = projectV2GitLedgerCandidateDispatchBinding(
+      restartedDispatch.plan,
+      0,
+    );
+    runIdentity.run_id = "9002";
+    runIdentity.run_attempt = 1;
+    const scheduledCommand = await createScheduleWorkflowCommandHandle({
+      pullRequestNumber: PR.number,
+      dispatchBinding,
+      runIdentity,
+    });
+    const minimal = await loadFixtureMinimalScope();
+    const scheduled = await restarted
+      .loadCandidateDispatchForScheduledPullRequest({
+      workflow_command_handle: scheduledCommand,
+      minimal_scope_handle: minimal,
+      trigger_identity: triggerIdentity,
+      expected_dispatch_binding: dispatchBinding,
+    });
+    const preScopeReceipt =
+      await restarted.loadScheduledPullRequestEvaluatedScopeReceipt({
+        candidate_dispatch_handle: scheduled.candidate_dispatch_handle,
+        minimal_scope_handle: minimal,
+        trigger_identity: triggerIdentity,
+      });
+    const discovery = await acquireFixtureLeasedDiscovery({
+      ledger: restarted,
+      command: scheduledCommand,
+      preScopeReceipt,
+      minimalPre: minimal,
+    });
+    const completed = await completeScheduledCandidateDispatchAttempt({
+      ledger: restarted,
+      preflight,
+      scheduled,
+      scheduledCommand,
+      discovery,
+    }, { expectCycleComplete: false });
+    assert.notEqual(completed.ack.ack_append_receipt, null);
+    assert.equal(completed.ack.remaining_plan.items.length, 63);
+    const attachmentTreeReadsBefore = fixture.calls.filter(({ method, path }) =>
+      method === "GET" && path === attachmentTreePath).length;
+    const beforeNonInventoryRestart = {
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    };
+    const extended = await makeLedger(
+      fixture,
+      capability,
+      verifier,
+      preflight,
+      { candidateInventoryRefreshAdapter: refreshAdapter },
+    ).load();
+    assert.equal(extended.commit_count, 9);
+    assert.ok(
+      matureCheckpointFixtureLayout(fixture).suffix.length >
+        checkpointState.next_unit.semantic_record_count,
+    );
+    assert.notEqual(
+      extended.checkpoint.candidate_dispatch_authority_digest,
+      extended.authority_projection.candidate_dispatch.authority_digest,
+      "a later suffix must project beyond the authenticated transaction state",
+    );
+    assert.equal(
+      fixture.calls.filter(({ method, path }) =>
+        method === "GET" && path === attachmentTreePath).length -
+        attachmentTreeReadsBefore,
+      1,
+      "a later scheduled-dispatch suffix must not reload the admitted attachment",
+    );
+    assert.deepEqual({
+      writes: fixture.writeCalls,
+      blobs: fixture.blobs.size,
+      trees: fixture.trees.size,
+      commits: fixture.commits.size,
+      ref: fixture.refTarget,
+    }, beforeNonInventoryRestart);
+    assert.equal(currentOpen.calls.length, callsAfterPublication);
+    const admittedIndex = extended.records.findIndex(
+      ({ commit_sha: commitSha }) => commitSha === generationEntry.commit_sha,
+    );
+    assert.notEqual(admittedIndex, -1);
+    const admittedEntry = extended.records[admittedIndex];
+    const admittedManifest = admittedEntry.envelope.payload
+      .attachment_manifest;
+    const admittedEvidence = durableCurrentOpenGenerationAttachmentValue(
+      fixture,
+      admittedManifest,
+    );
+    const admittedGeneration = deriveV2GitLedgerCandidateInventoryAuthority(
+      extended.records.slice(0, admittedIndex + 1),
+      REPOSITORY,
+    ).completed_generation;
+    assert.notEqual(admittedGeneration.candidates, null);
+    assert.deepEqual(
+      admittedGeneration.attachment_manifest,
+      admittedManifest,
+    );
+    assert.equal(
+      admittedEvidence.evidence_digest,
+      admittedManifest.evidence_digest,
+    );
+    assert.equal(
+      admittedEvidence.current_open_projection_digest,
+      admittedManifest.current_open_projection_digest,
+    );
+    assert.equal(
+      admittedEvidence.production_candidate_authority.authority_digest,
+      admittedManifest.production_candidate_authority_digest,
+    );
+    assert.equal(
+      admittedEvidence.production_candidate_authority.candidate_set_digest,
+      admittedManifest.candidate_set_digest,
+    );
+    assert.equal(
+      admittedEvidence.lifecycle_candidate_set_digest,
+      admittedManifest.lifecycle_candidate_set_digest,
+    );
+    assert.deepEqual(
+      admittedEvidence.dispatch_batch_digests,
+      admittedManifest.dispatch_batch_digests,
+    );
+    assert.deepEqual(
+      admittedGeneration.candidates,
+      admittedEvidence.lifecycle_candidates,
+    );
+    assert.deepEqual(
+      admittedGeneration.candidates.map(({ identity }) => identity.number),
+      Array.from({ length: 255 }, (_, index) => PR.number + index),
+    );
+  });
+
+async function matureCurrentOpenContinuationFixture(configurationLabel) {
+  const fixture = githubGitFixture();
+  const capability = scheduleCapabilityReceipt();
+  const triggerIdentity = scheduleTriggerIdentity();
+  const preflight = await loadFixtureProviderPreflight();
+  const verification = { calls: 0 };
+  const exactVerifier = provenanceVerifier({
+    eventName: "schedule",
+    ref: triggerIdentity.ref,
+    shaValue: triggerIdentity.sha,
+  });
+  const verifier = async (...args) => {
+    verification.calls += 1;
+    return exactVerifier(...args);
+  };
+  const currentOpen = currentOpenSuppressionAdapterFixture({
+    initialNumbers: Array.from(
+      { length: 255 },
+      (_, index) => PR.number + index,
+    ),
+    exactScopeCandidateNumber: PR.number,
+  });
+  const refreshAdapter = Object.freeze({
+    schema: "codex-review-gate-git-ledger-candidate-refresh-adapter-v2",
+    schema_version: 2,
+    configuration_digest: rawDigest(configurationLabel),
+    collectCurrentOpenCandidateAuthority:
+      currentOpen.collectProductionCandidateAuthority,
+    async finishLegacyCandidateInventoryAttempt() {
+      throw new Error("current-open mature checkpoint used legacy REST");
+    },
+  });
+  const ledger = makeLedger(fixture, capability, verifier, preflight, {
+    candidateInventoryRefreshAdapter: refreshAdapter,
+  });
+  await ledger.bootstrapCapability();
+  await padOrdinaryLedgerWithStandaloneAttestations({
+    fixture,
+    verifier,
+    targetCommitCount: 7,
+  });
+  const workflowCommandHandle = await createScheduleWorkflowCommandHandle();
+  const repositoryEndpointReceipt = scheduleRepositoryEndpointReceipt();
+  const result = await ledger.reconcileCandidateInventoryRefreshAtomically({
+    workflow_command_handle: workflowCommandHandle,
+    trigger_identity: triggerIdentity,
+    repository_endpoint_receipt: repositoryEndpointReceipt,
+  });
+  assert.equal(result.persistence_mode, "current-open-generation-v3");
+  return {
+    fixture,
+    ledger,
+    result,
+    trigger_identity: triggerIdentity,
+    workflow_command_handle: workflowCommandHandle,
+    repository_endpoint_receipt: repositoryEndpointReceipt,
+    verification,
+  };
+}
+
+test("current-open v3 mature continuation ref drift falls back to a full load",
+  async () => {
+    const context = await matureCurrentOpenContinuationFixture(
+      "candidate-current-open-v3-mature-ref-drift-configuration-v1",
+    );
+    const {
+      fixture,
+      ledger,
+      result,
+      trigger_identity: triggerIdentity,
+      workflow_command_handle: workflowCommandHandle,
+      repository_endpoint_receipt: repositoryEndpointReceipt,
+      verification,
+    } = context;
+    fixture.overrideNextRefReadTarget(
+      result.publication_result.published_record_commit_shas[0],
+    );
+    const callIndex = fixture.calls.length;
+    const verificationIndex = verification.calls;
+    const writeIndex = fixture.writeCalls;
+    const durableTip = fixture.refTarget;
+
+    const dispatch = await ledger.loadOrReserveCandidateDispatch({
+      workflow_command_handle: workflowCommandHandle,
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: repositoryEndpointReceipt,
+      candidate_refresh_reconciliation_result: result,
+    });
+
+    const reads = fixture.calls.slice(callIndex).filter(({ method }) =>
+      method === "GET");
+    assert.equal(dispatch.state, "dispatch");
+    assert.equal(dispatch.restarted, true);
+    assert.equal(
+      reads.filter(({ path }) =>
+        path === "/git/ref/heads/codex-review-gate-ledger-v2").length,
+      3,
+    );
+    assert.equal(
+      reads.some(({ path }) => path.startsWith("/git/commits/")),
+      true,
+    );
+    assert.equal(verification.calls - verificationIndex, 11);
+    assert.equal(fixture.writeCalls - writeIndex, 0);
+    assert.equal(fixture.refTarget, durableTip);
+  });
+
+test("current-open v3 mature continuation time regression falls back to a full load",
+  async () => {
+    const context = await matureCurrentOpenContinuationFixture(
+      "candidate-current-open-v3-mature-time-regression-configuration-v1",
+    );
+    const {
+      fixture,
+      ledger,
+      result,
+      trigger_identity: triggerIdentity,
+      workflow_command_handle: workflowCommandHandle,
+      repository_endpoint_receipt: repositoryEndpointReceipt,
+      verification,
+    } = context;
+    const durableTip = fixture.refTarget;
+    assert.equal(result.publication_result.final_tip_commit_sha, durableTip);
+    fixture.overrideRefReadServerTimeAfter(
+      1,
+      "2020-01-01T00:00:00.000Z",
+    );
+    const callIndex = fixture.calls.length;
+    const verificationIndex = verification.calls;
+    const writeIndex = fixture.writeCalls;
+
+    const dispatch = await ledger.loadOrReserveCandidateDispatch({
+      workflow_command_handle: workflowCommandHandle,
+      trigger_identity: triggerIdentity,
+      repository_endpoint_receipt: repositoryEndpointReceipt,
+      candidate_refresh_reconciliation_result: result,
+    });
+
+    const reads = fixture.calls.slice(callIndex).filter(({ method }) =>
+      method === "GET");
+    assert.equal(dispatch.state, "dispatch");
+    assert.equal(dispatch.restarted, true);
+    assert.equal(
+      reads.filter(({ path }) =>
+        path === "/git/ref/heads/codex-review-gate-ledger-v2").length,
+      3,
+    );
+    assert.equal(
+      reads.some(({ path }) => path.startsWith("/git/commits/")),
+      true,
+    );
+    assert.equal(verification.calls - verificationIndex, 11);
+    assert.equal(fixture.writeCalls - writeIndex, 0);
+    assert.equal(fixture.refTarget, durableTip);
+  });
+
+test("current-open v3 mature continuation binds command trigger and endpoint",
+  async (t) => {
+    const cases = [
+      {
+        label: "stable command",
+        async input(context) {
+          return {
+            workflow_command_handle:
+              await createScheduleWorkflowCommandHandle({
+                selectionPolicy: "disabled",
+              }),
+            trigger_identity: context.trigger_identity,
+            repository_endpoint_receipt:
+              context.repository_endpoint_receipt,
+          };
+        },
+        expected_error_code: "candidate-dispatch-restart-authority-mismatch",
+      },
+      {
+        label: "trigger identity",
+        async input(context) {
+          return {
+            workflow_command_handle: context.workflow_command_handle,
+            trigger_identity: {
+              ...context.trigger_identity,
+              sha: "3".repeat(40),
+            },
+            repository_endpoint_receipt:
+              context.repository_endpoint_receipt,
+          };
+        },
+        expected_error_code: "candidate-dispatch-restart-authority-mismatch",
+      },
+      {
+        label: "repository endpoint receipt",
+        async input(context) {
+          return {
+            workflow_command_handle: context.workflow_command_handle,
+            trigger_identity: context.trigger_identity,
+            repository_endpoint_receipt: {
+              ...context.repository_endpoint_receipt,
+              raw_body_sha256: `sha256:${"b".repeat(64)}`,
+            },
+          };
+        },
+        expected_error_code: null,
+      },
+    ];
+    for (const testCase of cases) {
+      await t.test(testCase.label, async () => {
+        const context = await matureCurrentOpenContinuationFixture(
+          `candidate-current-open-v3-mature-${testCase.label}-binding-v1`,
+        );
+        const input = await testCase.input(context);
+        const callIndex = context.fixture.calls.length;
+        const verificationIndex = context.verification.calls;
+        const writeIndex = context.fixture.writeCalls;
+        let firstDispatch = null;
+        let firstError = null;
+        try {
+          firstDispatch = await context.ledger
+            .loadOrReserveCandidateDispatch({
+              ...input,
+              candidate_refresh_reconciliation_result: context.result,
+            });
+        } catch (error) {
+          firstError = error;
+        }
+        const reads = context.fixture.calls.slice(callIndex)
+          .filter(({ method }) => method === "GET");
+        assert.equal(
+          reads.filter(({ path }) =>
+            path === "/git/ref/heads/codex-review-gate-ledger-v2").length,
+          2,
+        );
+        assert.equal(
+          reads.some(({ path }) => path.startsWith("/git/commits/")),
+          true,
+        );
+        assert.equal(context.verification.calls - verificationIndex, 11);
+        assert.equal(context.fixture.writeCalls - writeIndex, 0);
+        if (testCase.expected_error_code === null) {
+          assert.equal(firstError, null);
+          assert.equal(firstDispatch.state, "dispatch");
+        } else {
+          assert.equal(firstDispatch, null);
+          assert.equal(firstError?.code, testCase.expected_error_code);
+        }
+
+        const consumedCallIndex = context.fixture.calls.length;
+        const consumedVerificationIndex = context.verification.calls;
+        const consumed = await context.ledger.loadOrReserveCandidateDispatch({
+          workflow_command_handle: context.workflow_command_handle,
+          trigger_identity: context.trigger_identity,
+          repository_endpoint_receipt:
+            context.repository_endpoint_receipt,
+          candidate_refresh_reconciliation_result: context.result,
+        });
+        const consumedReads = context.fixture.calls.slice(consumedCallIndex)
+          .filter(({ method }) => method === "GET");
+        assert.equal(consumed.state, "dispatch");
+        assert.equal(
+          consumedReads.filter(({ path }) =>
+            path === "/git/ref/heads/codex-review-gate-ledger-v2").length,
+          2,
+        );
+        assert.equal(
+          context.verification.calls - consumedVerificationIndex,
+          11,
+        );
+        if (firstDispatch !== null) {
+          assert.equal(
+            firstDispatch.plan.plan_digest,
+            consumed.plan.plan_digest,
+          );
+        }
+      });
+    }
   });
 
 test("current-open v3 reconciliation rejects 512 capacity and 513 scan cap without Git writes",
@@ -12020,7 +12814,7 @@ test("atomic refresh reconciliation exposes typed capacity boundaries without ad
         }, before);
       });
 
-    await t.test("current-open v3 publishes at 4094 and checkpoints at 4095 and 4096",
+    await t.test("current-open v3 publishes at 4094 and rotates at 4095 and 4096",
       async () => {
         const fixture = githubGitFixture();
         const capability = scheduleCapabilityReceipt();
@@ -12101,8 +12895,11 @@ test("atomic refresh reconciliation exposes typed capacity boundaries without ad
           1,
         );
 
-        fixture.restoreHistoricalState(boundary4094);
-        const assertCheckpointAt = async (targetCommitCount) => {
+        const assertCheckpointAt = async (targetCommitCount, {
+          appendLaterGeneration = false,
+        } = {}) => {
+          fixture.restoreHistoricalState(boundary4094);
+          currentOpen.setListedNumbers([]);
           await padOrdinaryLedgerWithStandaloneAttestations({
             fixture,
             verifier,
@@ -12115,22 +12912,146 @@ test("atomic refresh reconciliation exposes typed capacity boundaries without ad
           assert.equal((await ledger.load()).commit_count, targetCommitCount);
           const before = snapshot();
           const callsBefore = currentOpen.calls.length;
+          let laterGeneration = null;
+          if (appendLaterGeneration) {
+            fixture.afterNextCandidateInventoryUpdateApplied(async () => {
+              currentOpen.setListedNumbers([PR.number]);
+              laterGeneration = await makeLedger(
+                fixture,
+                capability,
+                verifier,
+                null,
+                { candidateInventoryRefreshAdapter: refreshAdapter },
+              ).reconcileCandidateInventoryRefreshAtomically(await input());
+            });
+          }
           const result = await ledger
             .reconcileCandidateInventoryRefreshAtomically(await input());
-          assert.equal(result.state, "checkpoint-required");
-          assert.equal(
-            result.reason,
-            "candidate-inventory-checkpoint-required",
-          );
-          assert.equal(result.persistence_mode, null);
+          assert.equal(result.state, "persisted");
+          assert.equal(result.reason, "current-open-generation-persisted");
+          assert.equal(result.persistence_mode, "current-open-generation-v3");
           assert.equal(result.suppression_result, null);
-          assert.equal(result.publication_result, null);
+          assert.equal(result.publication_result.state, "persisted");
+          assert.equal(
+            result.publication_result.published_record_commit_shas.length,
+            2,
+          );
+          const expectedFinalCommitCount = appendLaterGeneration ? 5 : 3;
+          assert.equal(result.publication_result.append_receipts.length, 0);
+          if (appendLaterGeneration) {
+            assert.equal(laterGeneration.state, "persisted");
+            assert.equal(
+              result.publication_result.publication_outcome,
+              "recovered-after-apply",
+            );
+            assert.equal(
+              laterGeneration.publication_result.publication_outcome,
+              "published",
+            );
+          }
+          assert.equal(
+            result.publication_result.final_commit_count,
+            expectedFinalCommitCount,
+          );
           assert.equal(Object.isFrozen(result), true);
           assertNoCandidateRefreshPrivateAuthority(result);
-          assert.equal(currentOpen.calls.length - callsBefore, 4);
-          assert.deepEqual(snapshot(), before);
+          assert.equal(
+            currentOpen.calls.length - callsBefore,
+            appendLaterGeneration ? 8 : 4,
+          );
+          assert.equal(
+            snapshot().patches - before.patches,
+            appendLaterGeneration ? 2 : 1,
+          );
+          assert.equal(snapshot().commits > before.commits, true);
+          const loaded = await makeLedger(
+            fixture,
+            capability,
+            verifier,
+            null,
+            { candidateInventoryRefreshAdapter: refreshAdapter },
+          ).load();
+          assert.equal(loaded.checkpoint.profile, "mature-quiescent-v1");
+          assert.equal(loaded.commit_count, expectedFinalCommitCount);
+          assert.equal(
+            loaded.authority_projection.candidate_inventory
+              .completed_generation.candidate_count,
+            appendLaterGeneration ? 1 : 0,
+          );
+          if (appendLaterGeneration) {
+            assert.equal(
+              loaded.authority_projection.candidate_dispatch
+                .active_reservation.reservation.candidates[0].identity.number,
+              PR.number,
+            );
+          } else {
+            assert.equal(
+              loaded.authority_projection.candidate_dispatch.current_cycle
+                .cycle_complete,
+              true,
+            );
+          }
+          const admittedGenerationIndex = loaded.records.findIndex(
+            ({ commit_sha: commitSha }) => commitSha ===
+              result.publication_result.published_record_commit_shas[0],
+          );
+          assert.notEqual(admittedGenerationIndex, -1);
+          const admittedGenerationEntry =
+            loaded.records[admittedGenerationIndex];
+          const admittedGenerationManifest =
+            admittedGenerationEntry.envelope.payload.attachment_manifest;
+          const admittedGenerationEvidence =
+            durableCurrentOpenGenerationAttachmentValue(
+              fixture,
+              admittedGenerationManifest,
+            );
+          const admittedGenerationAuthority =
+            deriveV2GitLedgerCandidateInventoryAuthority(
+              loaded.records.slice(0, admittedGenerationIndex + 1),
+              REPOSITORY,
+            ).completed_generation;
+          assert.deepEqual(admittedGenerationAuthority.candidates, []);
+          assert.deepEqual(
+            admittedGenerationEvidence.lifecycle_candidates,
+            [],
+          );
+          assert.deepEqual(
+            admittedGenerationAuthority.attachment_manifest,
+            admittedGenerationManifest,
+          );
+          assert.equal(
+            admittedGenerationEvidence.evidence_digest,
+            admittedGenerationManifest.evidence_digest,
+          );
+          const layout = matureCheckpointFixtureLayout(fixture);
+          const checkpointState = JSON.parse(
+            fixture.blobs.get(layout.state_blob_entry.sha).content,
+          );
+          assert.equal(checkpointState.schema_version, 3);
+          assert.equal(
+            checkpointState.next_unit.profile,
+            "current-open-generation-v1",
+          );
+          assert.equal(checkpointState.next_unit.candidate_count, 0);
+          assert.equal(checkpointState.next_unit.semantic_record_count, 2);
+          assert.equal(
+            checkpointState.next_unit.total_commit_budget_required,
+            2,
+          );
+          assert.equal(
+            checkpointState.next_unit
+              .fresh_epoch_remaining_commit_capacity,
+            MAX_V2_GIT_LEDGER_COMMITS - 3,
+          );
+          assert.equal(
+            checkpointState.next_unit
+              .current_epoch_remaining_commit_capacity,
+            targetCommitCount === MAX_V2_GIT_LEDGER_COMMITS ? -2 : -1,
+          );
         };
-        await assertCheckpointAt(MAX_V2_GIT_LEDGER_COMMITS - 1);
+        await assertCheckpointAt(MAX_V2_GIT_LEDGER_COMMITS - 1, {
+          appendLaterGeneration: true,
+        });
         await assertCheckpointAt(MAX_V2_GIT_LEDGER_COMMITS);
         assert.equal(legacyFinishCalls, 0);
       });
@@ -21142,6 +22063,8 @@ function assertNoCandidateRefreshPrivateAuthority(value) {
     "must_persist_handle",
     "must_persist_claim",
     "request_handle",
+    "loaded",
+    "continuation",
   ]);
   for (const key of Reflect.ownKeys(value)) {
     assert.equal(
@@ -25749,6 +26672,374 @@ function resealMatureCheckpointClassificationForFixture({
   };
 }
 
+function resealMatureCurrentOpenCheckpointStateForFixture({
+  fixture,
+  mutateNextUnit,
+  resealAdmissionDigest = true,
+}) {
+  const layout = matureCheckpointFixtureLayout(fixture);
+  assert.equal(layout.suffix.length, 2);
+  const rootEnvelopeEntry = layout.checkpoint_tree.tree.find((entry) =>
+    entry.path === V2_GIT_LEDGER_BLOB_PATH && entry.type === "blob");
+  assert.notEqual(rootEnvelopeEntry, undefined,
+    "missing mature current-open checkpoint carrier");
+  const state = JSON.parse(
+    fixture.blobs.get(layout.state_blob_entry.sha).content,
+  );
+  assert.equal(state.schema_version, 3);
+  mutateNextUnit(state.next_unit);
+  if (resealAdmissionDigest) {
+    state.next_unit.admission_digest = digestCanonical(
+      "codex-review-gate-v2-current-open-checkpoint-admission",
+      {
+        schema:
+          "codex-review-gate-git-ledger-current-open-checkpoint-admission-v1",
+        schema_version: 1,
+        profile: state.next_unit.profile,
+        repository: structuredClone(state.repository),
+        ledger_ref: state.ledger_ref,
+        source_load_digest: state.source.source_load_digest,
+        next_unit_kind: state.next_unit.kind,
+        generation_id: state.next_unit.generation_id,
+        current_open_receipt_digest:
+          state.next_unit.current_open_receipt_digest,
+        current_open_projection_digest:
+          state.next_unit.current_open_projection_digest,
+        production_candidate_authority_digest:
+          state.next_unit.production_candidate_authority_digest,
+        candidate_count: state.next_unit.candidate_count,
+        candidate_set_digest: state.next_unit.candidate_set_digest,
+        source_current_open_semantic_digest:
+          state.next_unit.source_current_open_semantic_digest,
+        lifecycle_candidate_set_digest:
+          state.next_unit.lifecycle_candidate_set_digest,
+        attachment_manifest_digest:
+          state.next_unit.attachment_manifest_digest,
+        stable_command_authority_digest:
+          state.next_unit.stable_command_authority_digest,
+        trigger_identity_digest: state.next_unit.trigger_identity_digest,
+        repository_endpoint_receipt_digest:
+          state.next_unit.repository_endpoint_receipt_digest,
+        total_commit_budget_required:
+          state.next_unit.total_commit_budget_required,
+        current_epoch_remaining_commit_capacity:
+          state.next_unit.current_epoch_remaining_commit_capacity,
+        fresh_epoch_remaining_commit_capacity:
+          state.next_unit.fresh_epoch_remaining_commit_capacity,
+      },
+    );
+  }
+  delete state.checkpoint_state_digest;
+  state.checkpoint_state_digest = digestCanonical(
+    "codex-review-gate-v2-checkpoint-state",
+    state,
+  );
+  const stateContent = `${canonicalJson(state)}\n`;
+  const stateBytes = Buffer.from(stateContent, "utf8");
+  const stateBlobSha = gitObjectSha("blob", stateBytes);
+  fixture.blobs.set(stateBlobSha, {
+    sha: stateBlobSha,
+    content: stateContent,
+    bytes: stateBytes,
+  });
+  const nextStateTreeEntries = layout.state_tree.tree.map((entry) =>
+    entry.path === V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH
+      ? { ...entry, sha: stateBlobSha }
+      : structuredClone(entry));
+  const stateTreeSha = canonicalGitTreeSha(nextStateTreeEntries);
+  fixture.trees.set(stateTreeSha, {
+    sha: stateTreeSha,
+    tree: nextStateTreeEntries,
+  });
+
+  const carrier = JSON.parse(
+    fixture.blobs.get(rootEnvelopeEntry.sha).content,
+  );
+  carrier.payload.checkpoint_state_tree_sha = stateTreeSha;
+  carrier.payload.checkpoint_state_digest = state.checkpoint_state_digest;
+  carrier.payload.next_unit_admission_digest =
+    state.next_unit.admission_digest;
+  delete carrier.payload.payload_digest;
+  carrier.payload.payload_digest = digestCanonical(
+    "codex-review-gate-v2-checkpoint-carrier-payload",
+    carrier.payload,
+  );
+  carrier.payload_digest = carrier.payload.payload_digest;
+  carrier.workflow_provenance.operation_binding.record_identity
+    .payload_digest = carrier.payload_digest;
+  resealProvenance(carrier.workflow_provenance);
+  delete carrier.carrier_digest;
+  carrier.carrier_digest = digestCanonical(
+    "codex-review-gate-v2-checkpoint-carrier",
+    carrier,
+  );
+  const carrierContent = `${canonicalJson(carrier)}\n`;
+  const carrierBytes = Buffer.from(carrierContent, "utf8");
+  const carrierBlobSha = gitObjectSha("blob", carrierBytes);
+  fixture.blobs.set(carrierBlobSha, {
+    sha: carrierBlobSha,
+    content: carrierContent,
+    bytes: carrierBytes,
+  });
+  const rootTreeEntries = layout.checkpoint_tree.tree.map((entry) => {
+    if (entry.path === V2_GIT_LEDGER_BLOB_PATH) {
+      return { ...entry, sha: carrierBlobSha };
+    }
+    if (entry.path === V2_GIT_LEDGER_CHECKPOINT_STATE_PATH) {
+      return { ...entry, sha: stateTreeSha };
+    }
+    return structuredClone(entry);
+  });
+  const rootTreeSha = canonicalGitTreeSha(rootTreeEntries);
+  fixture.trees.set(rootTreeSha, {
+    sha: rootTreeSha,
+    tree: rootTreeEntries,
+  });
+  let predecessor = storeRewrittenFixtureCommit({
+    fixture,
+    original: layout.checkpoint_commit,
+    treeSha: rootTreeSha,
+    parents: layout.checkpoint_commit.parents.map(({ sha }) => sha),
+  });
+  const checkpointCommitSha = predecessor;
+
+  const storeSuffixEnvelope = ({ originalCommit, originalTree, envelope }) => {
+    const operationBinding = envelope.workflow_provenance.operation_binding;
+    const evaluatedScope = operationBinding.evaluated_scope_receipt;
+    const evaluatedScopeInput = {
+      repository: evaluatedScope.repository,
+      payload: envelope.payload,
+      trigger_identity: {
+        event_name: evaluatedScope.trigger_event_name,
+        ref: evaluatedScope.trigger_ref,
+        sha: evaluatedScope.trigger_sha,
+      },
+      repository_endpoint_receipt:
+        evaluatedScope.scope_endpoint_receipt,
+    };
+    operationBinding.evaluated_scope_receipt =
+      envelope.record_type === "candidate-inventory-observation"
+        ? createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt(
+          evaluatedScopeInput,
+        )
+        : createV2GitLedgerCandidateDispatchEvaluatedScopeReceipt(
+          evaluatedScopeInput,
+        );
+    envelope.payload_digest = digestV2GitLedgerPayload(envelope.payload);
+    operationBinding.record_identity.payload_digest = envelope.payload_digest;
+    resealProvenance(envelope.workflow_provenance);
+    resealEnvelope(envelope);
+    const envelopeContent = `${canonicalJson(envelope)}\n`;
+    const envelopeBytes = Buffer.from(envelopeContent, "utf8");
+    const envelopeBlobSha = gitObjectSha("blob", envelopeBytes);
+    fixture.blobs.set(envelopeBlobSha, {
+      sha: envelopeBlobSha,
+      content: envelopeContent,
+      bytes: envelopeBytes,
+    });
+    const nextTreeEntries = originalTree.tree.map((entry) =>
+      entry.path === V2_GIT_LEDGER_BLOB_PATH
+        ? { ...entry, sha: envelopeBlobSha }
+        : structuredClone(entry));
+    const treeSha = canonicalGitTreeSha(nextTreeEntries);
+    fixture.trees.set(treeSha, { sha: treeSha, tree: nextTreeEntries });
+    const commitSha = storeRewrittenFixtureCommit({
+      fixture,
+      original: originalCommit,
+      treeSha,
+      parents: [predecessor],
+    });
+    predecessor = commitSha;
+    return { commitSha, treeSha, envelopeBlobSha };
+  };
+
+  const generationOriginal = layout.suffix[0];
+  const generationEnvelopeEntry = generationOriginal.tree.tree.find((entry) =>
+    entry.path === V2_GIT_LEDGER_BLOB_PATH && entry.type === "blob");
+  const generationEnvelope = JSON.parse(
+    fixture.blobs.get(generationEnvelopeEntry.sha).content,
+  );
+  assert.equal(generationEnvelope.record_type,
+    "candidate-inventory-observation");
+  assert.equal(generationEnvelope.payload.phase, "current-open-generation");
+  generationEnvelope.predecessor_commit_sha = predecessor;
+  generationEnvelope.workflow_provenance.operation_binding
+    .predecessor_commit_sha = predecessor;
+  const generationStored = storeSuffixEnvelope({
+    originalCommit: generationOriginal.commit,
+    originalTree: generationOriginal.tree,
+    envelope: generationEnvelope,
+  });
+  const attachmentEvidence = durableCurrentOpenGenerationAttachmentValue(
+    fixture,
+    generationEnvelope.payload.attachment_manifest,
+  );
+  const semanticRecords = layout.seed.records.map((entry) =>
+    structuredClone(entry));
+  semanticRecords.push({
+    commit_sha: generationStored.commitSha,
+    parents: fixture.commits.get(generationStored.commitSha).parents.map(
+      ({ sha }) => sha,
+    ),
+    tree_sha: generationStored.treeSha,
+    blob_sha: generationStored.envelopeBlobSha,
+    envelope: structuredClone(generationEnvelope),
+    evidence: {},
+    candidate_inventory_attachment_evidence: attachmentEvidence,
+  });
+  const candidateAuthority = deriveV2GitLedgerCandidateInventoryAuthority(
+    semanticRecords,
+    REPOSITORY,
+  );
+  const generation = candidateAuthority.completed_generation;
+  assert.notEqual(generation, null);
+  assert.notEqual(generation.candidates, null);
+  const sourceBinding = {
+    schema: "codex-review-gate-git-ledger-candidate-dispatch-source-v2",
+    schema_version: 2,
+    source_profile: generation.source_profile,
+    source_generation_id: generation.generation_id,
+    source_generation_record_oid: generation.generation_record_oid,
+    source_generation_digest: generation.generation_digest,
+    production_candidate_authority_digest:
+      generation.source_authority_digest,
+    candidate_set_digest: generation.candidate_set_digest,
+    source_current_open_semantic_digest: generation.source_semantic_digest,
+    lifecycle_candidate_set_digest:
+      generation.lifecycle_candidate_set_digest,
+  };
+  const dispatchGenerationId = `candidate-dispatch:${digestCanonical(
+    "codex-review-gate-v2-current-open-dispatch-generation",
+    {
+      repository: candidateRepository(),
+      generation_record_oid: generation.generation_record_oid,
+      generation_digest: generation.generation_digest,
+      inventory_digest: generation.inventory_digest,
+    },
+  ).slice("sha256:".length)}`;
+  const cycleId = `candidate-cycle:${digestCanonical(
+    "codex-review-gate-v2-current-open-dispatch-cycle",
+    {
+      repository: candidateRepository(),
+      generation_record_oid: generation.generation_record_oid,
+      generation_digest: generation.generation_digest,
+    },
+  ).slice("sha256:".length)}`;
+  const selections = generation.candidates.map((candidate) => {
+    const withoutDigest = {
+      schema:
+        "codex-review-gate-git-ledger-candidate-dispatch-selection-v2",
+      schema_version: 2,
+      source_generation_record_oid: generation.generation_record_oid,
+      identity: structuredClone(candidate.identity),
+      identity_digest: candidate.identity_digest,
+      lifecycle_seed: structuredClone(candidate.lifecycle_seed),
+      lifecycle_seed_digest: candidate.lifecycle_seed_digest,
+      lifecycle_generation_id: candidate.lifecycle_generation_id,
+    };
+    return {
+      ...withoutDigest,
+      selection_digest: digestCanonical(
+        "codex-review-gate-v2-current-open-dispatch-selection",
+        {
+          source_generation_record_oid:
+            withoutDigest.source_generation_record_oid,
+          identity_digest: withoutDigest.identity_digest,
+          lifecycle_seed_digest: withoutDigest.lifecycle_seed_digest,
+          lifecycle_generation_id: withoutDigest.lifecycle_generation_id,
+        },
+      ),
+    };
+  });
+
+  const dispatchOriginal = layout.suffix[1];
+  const dispatchEnvelopeEntry = dispatchOriginal.tree.tree.find((entry) =>
+    entry.path === V2_GIT_LEDGER_BLOB_PATH && entry.type === "blob");
+  const dispatchEnvelope = JSON.parse(
+    fixture.blobs.get(dispatchEnvelopeEntry.sha).content,
+  );
+  assert.equal(dispatchEnvelope.record_type, "candidate-dispatch-observation");
+  assert.equal(dispatchEnvelope.payload.phase, "reserve");
+  dispatchEnvelope.predecessor_commit_sha = predecessor;
+  dispatchEnvelope.workflow_provenance.operation_binding
+    .predecessor_commit_sha = predecessor;
+  const originalReservation = dispatchEnvelope.payload.reservation;
+  const reservationWithoutDigest = {
+    ...structuredClone(originalReservation),
+    generation_id: dispatchGenerationId,
+    cycle_id: cycleId,
+    candidate_inventory_authority_digest:
+      candidateAuthority.authority_digest,
+    candidate_source: sourceBinding,
+    inventory_digest: generation.inventory_digest,
+    source_tip_commit_sha: generation.generation_record_oid,
+    candidates: selections.slice(
+      originalReservation.candidate_offset,
+      originalReservation.candidate_offset +
+        originalReservation.candidates.length,
+    ),
+  };
+  delete reservationWithoutDigest.reservation_digest;
+  reservationWithoutDigest.dispatch_digest = digestCanonical(
+    "codex-review-gate-v2-current-open-candidate-dispatch-selection",
+    {
+      repository: structuredClone(reservationWithoutDigest.repository),
+      generation_id: reservationWithoutDigest.generation_id,
+      cycle_id: reservationWithoutDigest.cycle_id,
+      candidate_source: structuredClone(
+        reservationWithoutDigest.candidate_source,
+      ),
+      candidate_inventory_authority_digest:
+        reservationWithoutDigest.candidate_inventory_authority_digest,
+      inventory_digest: reservationWithoutDigest.inventory_digest,
+      batch_index: reservationWithoutDigest.batch_index,
+      batch_count: reservationWithoutDigest.batch_count,
+      candidate_offset: reservationWithoutDigest.candidate_offset,
+      candidates: structuredClone(reservationWithoutDigest.candidates),
+    },
+  );
+  const reservation = validateV2GitLedgerCandidateDispatchReservation({
+    ...reservationWithoutDigest,
+    reservation_digest: digestCanonical(
+      "codex-review-gate-v2-current-open-candidate-dispatch-reservation",
+      reservationWithoutDigest,
+    ),
+  });
+  Object.assign(dispatchEnvelope.payload, {
+    generation_id: dispatchGenerationId,
+    cycle_id: cycleId,
+    candidate_inventory_authority_digest:
+      candidateAuthority.authority_digest,
+    candidate_source: sourceBinding,
+    inventory_digest: generation.inventory_digest,
+    reservation,
+  });
+  const dispatchStored = storeSuffixEnvelope({
+    originalCommit: dispatchOriginal.commit,
+    originalTree: dispatchOriginal.tree,
+    envelope: dispatchEnvelope,
+  });
+  semanticRecords.push({
+    commit_sha: dispatchStored.commitSha,
+    parents: fixture.commits.get(dispatchStored.commitSha).parents.map(
+      ({ sha }) => sha,
+    ),
+    tree_sha: dispatchStored.treeSha,
+    blob_sha: dispatchStored.envelopeBlobSha,
+    envelope: structuredClone(dispatchEnvelope),
+    evidence: {},
+  });
+  deriveV2GitLedgerCandidateDispatchAuthority(semanticRecords, REPOSITORY);
+
+  const rewrittenSnapshot = fixture.snapshotHistoricalState();
+  rewrittenSnapshot.ref_target = predecessor;
+  fixture.restoreHistoricalState(rewrittenSnapshot);
+  return {
+    checkpoint_commit_sha: checkpointCommitSha,
+    transaction_tip_commit_sha: predecessor,
+  };
+}
+
 function assertExactFixtureKeys(value, expectedKeys, label) {
   assert.equal(
     value !== null && typeof value === "object" && !Array.isArray(value),
@@ -26279,6 +27570,12 @@ function githubGitFixture(seed = null) {
       assert.ok(Number.isSafeInteger(occurrence) && occurrence > 0);
       assert.equal(new Date(serverTime).toISOString(), serverTime);
       refReadServerTimeOverride = { occurrence, server_time: serverTime };
+    },
+    overrideNextRefReadTarget(targetCommitSha) {
+      assert.match(targetCommitSha, /^[0-9a-f]{40}$/u);
+      assert.equal(commits.has(targetCommitSha), true);
+      assert.equal(refRereadOverride, null);
+      refRereadOverride = targetCommitSha;
     },
     moveRefToParentOnNextCommitRead() { moveRefOnCommitRead = true; },
     tipRecordType() { return recordType(refTarget); },

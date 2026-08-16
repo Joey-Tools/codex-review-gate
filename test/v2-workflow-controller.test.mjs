@@ -49,6 +49,7 @@ import {
   runV2ScheduleDispatchCli,
   runV2WorkflowControllerCli,
   validateV2ProductionPreflightBoundary,
+  validateV2CandidateRefreshReconciliationForSource,
   validateV2EffectLedger,
   validateV2StatusWrites,
   V2WorkflowControllerError,
@@ -59,17 +60,29 @@ import {
   createV2GitHubTransport,
 } from "../packages/action/src/v2/transport.mjs";
 import {
+  createV2GitHubCandidateInventory,
   MAX_V2_CANDIDATE_SCAN_PASSES,
 } from "../packages/action/src/v2/candidate-inventory.mjs";
 import {
   V2_GIT_LEDGER_BLOB_PATH,
+  V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA,
+  V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH,
+  V2_GIT_LEDGER_CHECKPOINT_STATE_PATH,
+  V2_GIT_LEDGER_ENVELOPE_SCHEMA,
   V2_GIT_LEDGER_OIDC_AUDIENCE,
   V2_GIT_LEDGER_OIDC_CLAIMS,
   V2_GIT_LEDGER_LEASE_RECEIPT_SCHEMA,
+  V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS,
+  V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
   V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
   V2_GIT_LEDGER_PROVENANCE_VERIFIER_RESULT_SCHEMA,
   V2_GIT_LEDGER_REF,
   calculateV2GitLedgerCandidateDispatchCommitBudget,
+  createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt,
+  createV2GitLedgerCandidateInventoryRecord,
+  deriveV2GitLedgerCandidateInventoryAuthority,
+  digestV2GitLedgerPayload,
+  MAX_V2_GIT_LEDGER_COMMITS,
   MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_BINDING_BYTES,
   MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_PLAN_BYTES,
   projectV2GitLedgerCandidateDispatchBinding,
@@ -1434,6 +1447,129 @@ test("production OIDC verifier caches trust material and mints one signed token 
   assert.deepEqual(oidc.calls.map((call) => call.kind), [
     "discovery", "jwks", "mint", "mint",
   ]);
+});
+
+test("OIDC verifier admits only the closed checkpoint-rotate provenance shape", async () => {
+  const oidc = oidcFixture();
+  const verifier = createV2GitHubOidcProvenanceVerifier({
+    fetch: oidc.fetch,
+    environment: oidc.environment,
+    policy: oidc.policy,
+    clock: () => Date.parse(TIME),
+  });
+  const invalidCases = [
+    ["other operation", (request) => { request.operation = "load"; }],
+    ["other record type", (request) => {
+      request.record_identity.record_type = "candidate-inventory-observation";
+    }],
+    ["effect scope only", (request) => { request.effect_scope = {}; }],
+    ["evaluated receipt only", (request) => {
+      request.evaluated_scope_receipt = {};
+    }],
+    ["missing identity", (request) => { request.record_identity = null; }],
+    ["checkpoint effect kind", (request) => {
+      request.record_identity.kind = "request-comment";
+    }],
+    ["checkpoint effect id", (request) => {
+      request.record_identity.effect_id = "checkpoint-effect";
+    }],
+    ["checkpoint idempotency key", (request) => {
+      request.record_identity.idempotency_key = "checkpoint-idempotency";
+    }],
+    ["invalid payload digest", (request) => {
+      request.record_identity.payload_digest = `sha256:${"g".repeat(64)}`;
+    }],
+    ["extra identity field", (request) => {
+      request.record_identity.ledger_ref = request.ledger_ref;
+    }],
+  ];
+  for (const [index, [label, mutate]] of invalidCases.entries()) {
+    const request = checkpointOidcRequestFixture(index.toString(16));
+    mutate(request);
+    const sealed = resealOidcRequestFixture(request);
+    await assert.rejects(
+      verifier.verifyWorkflowProvenance(
+        oidcVerifierRequest("mint-and-verify", sealed),
+        oidcVerifierExecutionContext(),
+      ),
+      undefined,
+      label,
+    );
+    assert.deepEqual(
+      oidc.calls.map((call) => call.kind),
+      ["discovery", "jwks"],
+      `${label} must fail before OIDC mint`,
+    );
+  }
+  assert.deepEqual(oidc.calls.map((call) => call.kind), ["discovery", "jwks"]);
+
+  const request = checkpointOidcRequestFixture("f");
+  const verified = await verifier.verifyWorkflowProvenance(
+    oidcVerifierRequest("mint-and-verify", request),
+    oidcVerifierExecutionContext(),
+  );
+  validateV2GitLedgerProvenanceReceipt(verified.receipt, {
+    request,
+    policy: oidc.policy,
+  });
+  assert.equal(
+    verified.receipt.operation_binding.record_identity.record_type,
+    "epoch-checkpoint",
+  );
+  assert.deepEqual(oidc.calls.map((call) => call.kind), [
+    "discovery", "jwks", "mint",
+  ]);
+});
+
+test("OIDC verifier keeps precompiled JWKS keys closed to one trust snapshot", async () => {
+  const snapshots = [oidcFixture(), oidcFixture()];
+  for (const [index, oidc] of snapshots.entries()) {
+    const verifier = createV2GitHubOidcProvenanceVerifier({
+      fetch: oidc.fetch,
+      environment: oidc.environment,
+      policy: oidc.policy,
+      clock: () => Date.parse(TIME),
+    });
+    for (const suffix of (index === 0 ? ["a", "b"] : ["c", "d"])) {
+      const request = oidcRequestFixture(suffix);
+      const verified = await verifier.verifyWorkflowProvenance(
+        oidcVerifierRequest("mint-and-verify", request),
+        oidcVerifierExecutionContext(),
+      );
+      validateV2GitLedgerProvenanceReceipt(verified.receipt, {
+        request,
+        policy: oidc.policy,
+      });
+    }
+    assert.deepEqual(oidc.calls.map((call) => call.kind), [
+      "discovery", "jwks", "mint", "mint",
+    ]);
+  }
+
+  const invalidCases = [
+    ["duplicate kid", { duplicateJwksKey: true }, /unique RSA signing key/u],
+    ["unsupported key algorithm", {
+      jwksKeyOverrides: { alg: "RS512" },
+    }, /unique RSA signing key/u],
+    ["unconstructable RSA key", {
+      jwksKeyOverrides: { e: "AA" },
+    }, /trusted RSA key/u],
+  ];
+  for (const [label, options, message] of invalidCases) {
+    const oidc = oidcFixture(options);
+    const verifier = createV2GitHubOidcProvenanceVerifier({
+      fetch: oidc.fetch,
+      environment: oidc.environment,
+      policy: oidc.policy,
+      clock: () => Date.parse(TIME),
+    });
+    await assert.rejects(verifier.initialize(), message, label);
+    assert.deepEqual(
+      oidc.calls.map((call) => call.kind),
+      ["discovery", "jwks"],
+      `${label} must fail before token mint`,
+    );
+  }
 });
 
 test("OIDC verifier rejects replay and hostile mint URLs without exposing tokens", async () => {
@@ -4326,6 +4462,594 @@ test("scan-all run rejects the single-PR route and list-open has no production C
   });
 });
 
+function historicalCandidateInventorySourceWorkflow(controllerRelease) {
+  return {
+    repository: structuredClone(controllerRelease.repository),
+    workflow_path: controllerRelease.workflow_path,
+    workflow_ref: controllerRelease.workflow_ref,
+    workflow_sha: controllerRelease.workflow_sha,
+    job_workflow_ref: controllerRelease.job_workflow_ref,
+    job_workflow_sha: controllerRelease.job_workflow_sha,
+    caller_workflow_file_receipt_digest:
+      controllerRelease.caller_workflow_file_receipt_digest,
+    job_workflow_file_receipt_digest:
+      controllerRelease.job_workflow_file_receipt_digest,
+    release_receipt_digest: controllerRelease.release_receipt_digest,
+  };
+}
+
+function historicalCandidateInventoryPayload({
+  phase,
+  owner,
+  initialInventory,
+  shardReceipt = null,
+  priorCandidateAuthorityDigest,
+}) {
+  return {
+    schema: V2_GIT_LEDGER_CANDIDATE_INVENTORY_RECORD_SCHEMA,
+    schema_version: 1,
+    phase,
+    cycle_id:
+      `candidate-cycle:${initialInventory.receipt_digest.slice("sha256:".length)}`,
+    owner: structuredClone(owner),
+    prior_candidate_authority_digest: priorCandidateAuthorityDigest,
+    supersedes_incomplete_cycle_id: null,
+    initial_inventory_receipt_digest: initialInventory.receipt_digest,
+    initial_inventory: phase === "cycle-start"
+      ? structuredClone(initialInventory)
+      : null,
+    shard_receipt: phase === "shard"
+      ? structuredClone(shardReceipt)
+      : null,
+    final_inventory: null,
+    cycle_receipt: null,
+  };
+}
+
+async function mintHistoricalCandidateInventoryEnvelope({
+  verifier,
+  capability,
+  priorEnvelope,
+  record,
+  evaluatedScopeReceipt,
+}) {
+  const sourceWorkflow = historicalCandidateInventorySourceWorkflow(
+    capability.controller_release,
+  );
+  const requestInput = {
+    schema: V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
+    schema_version: 1,
+    operation: record.record_type,
+    repository: structuredClone(capability.repository),
+    ledger_ref: V2_GIT_LEDGER_REF,
+    predecessor_commit_sha: record.predecessor_commit_sha,
+    protection_receipt_digest:
+      capability.protection.live_ruleset_receipt_digest,
+    source_workflow: sourceWorkflow,
+    effect_scope: null,
+    evaluated_scope_receipt: evaluatedScopeReceipt,
+    record_identity: {
+      record_type: record.record_type,
+      kind: record.kind,
+      effect_id: record.effect_id,
+      idempotency_key: record.idempotency_key,
+      payload_digest: digestV2GitLedgerPayload(record.payload),
+    },
+    github_server_time: record.server_observed_at,
+  };
+  const nonce = gitLedgerDigestDomain(
+    "codex-review-gate-v2-git-ledger-provenance-nonce",
+    requestInput,
+  );
+  const requestWithoutDigest = {
+    ...requestInput,
+    nonce,
+    audience:
+      `${V2_GIT_LEDGER_OIDC_AUDIENCE}:${nonce.slice("sha256:".length)}`,
+  };
+  const provenanceRequest = {
+    ...requestWithoutDigest,
+    request_digest: gitLedgerDigestDomain(
+      "codex-review-gate-v2-git-ledger-provenance-request",
+      requestWithoutDigest,
+    ),
+  };
+  const provenance = await verifier.verifyWorkflowProvenance(
+    {
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode: "mint-and-verify",
+      provenance_request: provenanceRequest,
+      compact_jwt: null,
+      stored_receipt: null,
+    },
+    {
+      signal: new AbortController().signal,
+      deadline_ms: V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS,
+    },
+  );
+  const envelopeBase = {
+    schema: V2_GIT_LEDGER_ENVELOPE_SCHEMA,
+    schema_version: 1,
+    repository: structuredClone(capability.repository),
+    ledger_ref: V2_GIT_LEDGER_REF,
+    record_type: record.record_type,
+    sequence: priorEnvelope.sequence + 1,
+    pull_request: record.pull_request,
+    head_ref_oid: record.head_ref_oid,
+    base_ref_oid: record.base_ref_oid,
+    potential_merge_commit_oid: record.potential_merge_commit_oid,
+    kind: record.kind,
+    effect_id: record.effect_id,
+    idempotency_key: record.idempotency_key,
+    predecessor_commit_sha: record.predecessor_commit_sha,
+    server_observed_at: record.server_observed_at,
+    payload: structuredClone(record.payload),
+    control_comment_binding: record.control_comment_binding,
+    lease: record.lease,
+    source_workflow: sourceWorkflow,
+    workflow_provenance: provenance.receipt,
+    workflow_provenance_jwt: provenance.compact_jwt,
+    payload_digest: digestV2GitLedgerPayload(record.payload),
+  };
+  return {
+    ...envelopeBase,
+    envelope_digest: gitLedgerDigestDomain(
+      "codex-review-gate-v2-git-ledger-envelope",
+      envelopeBase,
+    ),
+  };
+}
+
+async function seedHistoricalLegacyIncompleteCandidateCycle({
+  github,
+  verifier,
+  capability,
+  triggerIdentity,
+  owner,
+}) {
+  const repository = {
+    owner: capability.repository.owner,
+    name: capability.repository.name,
+    id: capability.repository.id,
+    node_id: capability.repository.node_id,
+  };
+  const transport = createV2GitHubCandidateInventory({
+    fetch: github.fetch,
+    token: "synthetic-token-for-v2-controller-tests-only",
+    repository,
+    restBaseUrl: "https://api.github.com",
+  });
+  const initialInventory = await transport.scan();
+  assert.equal(initialInventory.shards.length, 2);
+  const completedShard = await transport.readShard({
+    inventory: initialInventory,
+    shard_index: 0,
+  });
+  const initialAuthority = deriveV2GitLedgerCandidateInventoryAuthority(
+    [],
+    capability.repository,
+  );
+  const startPayload = historicalCandidateInventoryPayload({
+    phase: "cycle-start",
+    owner,
+    initialInventory,
+    priorCandidateAuthorityDigest: initialAuthority.authority_digest,
+  });
+  const startRecord = createV2GitLedgerCandidateInventoryRecord({
+    predecessor_commit_sha: github.ledgerTipCommitSha(),
+    owner,
+    server_observed_at: initialInventory.observed_at,
+    payload: startPayload,
+  });
+  const startScope = createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
+    repository: capability.repository,
+    payload: startPayload,
+    trigger_identity: triggerIdentity,
+    repository_endpoint_receipt: capability.repository_endpoint_receipt,
+  });
+  const startEnvelope = await mintHistoricalCandidateInventoryEnvelope({
+    verifier,
+    capability,
+    priorEnvelope: github.ledgerLatestEnvelope(),
+    record: startRecord,
+    evaluatedScopeReceipt: startScope,
+  });
+  const startEntry = github.materializeHistoricalLedgerEnvelope(startEnvelope);
+  const afterStart = deriveV2GitLedgerCandidateInventoryAuthority(
+    [startEntry],
+    capability.repository,
+  );
+  const shardPayload = historicalCandidateInventoryPayload({
+    phase: "shard",
+    owner,
+    initialInventory,
+    shardReceipt: completedShard,
+    priorCandidateAuthorityDigest: afterStart.authority_digest,
+  });
+  const shardRecord = createV2GitLedgerCandidateInventoryRecord({
+    predecessor_commit_sha: github.ledgerTipCommitSha(),
+    owner,
+    server_observed_at: completedShard.observed_at,
+    payload: shardPayload,
+  });
+  const shardScope = createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
+    repository: capability.repository,
+    payload: shardPayload,
+    trigger_identity: triggerIdentity,
+    repository_endpoint_receipt: capability.repository_endpoint_receipt,
+  });
+  const shardEnvelope = await mintHistoricalCandidateInventoryEnvelope({
+    verifier,
+    capability,
+    priorEnvelope: startEnvelope,
+    record: shardRecord,
+    evaluatedScopeReceipt: shardScope,
+  });
+  const shardEntry = github.materializeHistoricalLedgerEnvelope(shardEnvelope);
+  const incompleteAuthority = deriveV2GitLedgerCandidateInventoryAuthority(
+    [startEntry, shardEntry],
+    capability.repository,
+  );
+  return {
+    cycle_id: startPayload.cycle_id,
+    start_record_oid: startEntry.commit_sha,
+    initial_inventory: initialInventory,
+    completed_shard: completedShard,
+    incomplete_authority: incompleteAuthority.incomplete_cycle,
+  };
+}
+
+async function padHistoricalCapabilityAttestations({
+  github,
+  createVerifier,
+  targetRecordCount,
+}) {
+  let priorEnvelope = github.ledgerLatestEnvelope();
+  assert.equal(priorEnvelope.record_type, "capability-attestation");
+  let predecessorCommitSha = github.ledgerTipCommitSha();
+  let recordCount = priorEnvelope.sequence + 1;
+  assert.equal(recordCount, 3);
+  let verifier = null;
+  let verifierMintCount = 120;
+  while (recordCount < targetRecordCount) {
+    if (verifierMintCount === 120) {
+      verifier = createVerifier();
+      await verifier.initialize();
+      verifierMintCount = 0;
+    }
+    const binding = structuredClone(
+      priorEnvelope.workflow_provenance.operation_binding,
+    );
+    const nonceInput = {
+      schema: V2_GIT_LEDGER_PROVENANCE_REQUEST_SCHEMA,
+      schema_version: 1,
+      ...binding,
+      predecessor_commit_sha: predecessorCommitSha,
+    };
+    delete nonceInput.nonce;
+    delete nonceInput.audience;
+    delete nonceInput.request_digest;
+    const nonce = gitLedgerDigestDomain(
+      "codex-review-gate-v2-git-ledger-provenance-nonce",
+      nonceInput,
+    );
+    const requestWithoutDigest = {
+      ...nonceInput,
+      nonce,
+      audience:
+        `${V2_GIT_LEDGER_OIDC_AUDIENCE}:${nonce.slice("sha256:".length)}`,
+    };
+    const provenanceRequest = {
+      ...requestWithoutDigest,
+      request_digest: gitLedgerDigestDomain(
+        "codex-review-gate-v2-git-ledger-provenance-request",
+        requestWithoutDigest,
+      ),
+    };
+    const provenance = await verifier.verifyWorkflowProvenance(
+      {
+        schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+        schema_version: 1,
+        mode: "mint-and-verify",
+        provenance_request: provenanceRequest,
+        compact_jwt: null,
+        stored_receipt: null,
+      },
+      {
+        signal: new AbortController().signal,
+        deadline_ms: V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS,
+      },
+    );
+    const {
+      envelope_digest: _priorEnvelopeDigest,
+      workflow_provenance: _priorWorkflowProvenance,
+      workflow_provenance_jwt: _priorWorkflowProvenanceJwt,
+      ...template
+    } = priorEnvelope;
+    const envelopeBase = {
+      ...structuredClone(template),
+      sequence: recordCount,
+      predecessor_commit_sha: predecessorCommitSha,
+      workflow_provenance: provenance.receipt,
+      workflow_provenance_jwt: provenance.compact_jwt,
+    };
+    const envelope = {
+      ...envelopeBase,
+      envelope_digest: gitLedgerDigestDomain(
+        "codex-review-gate-v2-git-ledger-envelope",
+        envelopeBase,
+      ),
+    };
+    const entry = github.materializeHistoricalLedgerEnvelope(envelope);
+    predecessorCommitSha = entry.commit_sha;
+    priorEnvelope = envelope;
+    recordCount += 1;
+    verifierMintCount += 1;
+  }
+  return {
+    record_count: recordCount,
+    tip_commit_sha: predecessorCommitSha,
+  };
+}
+
+test("schedule-dispatch binds a legacy finish publication to its durable remaining shard count", () => {
+  const oid = (digit) => digit.repeat(40);
+  const digest = (digit) => `sha256:${digit.repeat(64)}`;
+  const candidateAuthority = {
+    completed_cycle: null,
+    completed_generation: null,
+    incomplete_cycle: {
+      cycle_id: `candidate-cycle:${"2".repeat(64)}`,
+      start_record_oid: oid("3"),
+      initial_inventory: { shards: [{}, {}] },
+      shard_receipts: [{}],
+      next_shard_index: 1,
+    },
+    atomic_cycle: null,
+  };
+  let publishedRecordCount = 3;
+  const reconciliation = () => ({
+    schema:
+      "codex-review-gate-git-ledger-candidate-refresh-reconciliation-v2",
+    schema_version: 2,
+    state: "persisted",
+    reason: "legacy-incomplete-cycle-finished",
+    repository: {},
+    ledger_ref: "refs/heads/codex-review-gate-ledger-v2",
+    adapter_configuration_digest: digest("1"),
+    persistence_mode: "legacy-finish-v1",
+    suppression_result: null,
+    publication_result: {
+      schema:
+        "codex-review-gate-git-ledger-candidate-inventory-legacy-finish-publication-v2",
+      schema_version: 1,
+      state: "persisted",
+      reason: "legacy-incomplete-cycle-finished",
+      publication_outcome: "published",
+      repository: {},
+      ledger_ref: "refs/heads/codex-review-gate-ledger-v2",
+      cycle_id: `candidate-cycle:${"2".repeat(64)}`,
+      start_record_oid: oid("3"),
+      cycle_receipt_digest: digest("4"),
+      published_record_commit_shas: Array.from(
+        { length: publishedRecordCount },
+        (_, index) => oid(String(index + 5)),
+      ),
+      append_receipts: [],
+      latest_append_receipt: null,
+      final_tip_commit_sha: oid("9"),
+      final_commit_count: 9,
+      writes_performed: true,
+      result_digest: digest("a"),
+    },
+    result_digest: digest("b"),
+  });
+  assert.equal(
+    validateV2CandidateRefreshReconciliationForSource(
+      reconciliation(),
+      candidateAuthority,
+    ).publication_result.published_record_commit_shas.length,
+    3,
+  );
+
+  for (const invalidCount of [2, 4]) {
+    publishedRecordCount = invalidCount;
+    assert.throws(
+      () => validateV2CandidateRefreshReconciliationForSource(
+        reconciliation(),
+        candidateAuthority,
+      ),
+      (error) => error?.code ===
+        "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+    );
+  }
+  publishedRecordCount = 3;
+  candidateAuthority.incomplete_cycle.shard_receipts = [];
+  assert.throws(
+    () => validateV2CandidateRefreshReconciliationForSource(
+      reconciliation(),
+      candidateAuthority,
+    ),
+    (error) => error?.code ===
+      "SCHEDULE_DISPATCH_CANDIDATE_AUTHORITY_INVALID",
+  );
+
+  candidateAuthority.incomplete_cycle.shard_receipts = [{}];
+  candidateAuthority.incomplete_cycle.cycle_id =
+    `candidate-cycle:${"c".repeat(64)}`;
+  assert.throws(
+    () => validateV2CandidateRefreshReconciliationForSource(
+      reconciliation(),
+      candidateAuthority,
+    ),
+    (error) => error?.code ===
+      "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+  );
+
+  candidateAuthority.incomplete_cycle.cycle_id =
+    `candidate-cycle:${"2".repeat(64)}`;
+  candidateAuthority.incomplete_cycle.start_record_oid = oid("4");
+  assert.throws(
+    () => validateV2CandidateRefreshReconciliationForSource(
+      reconciliation(),
+      candidateAuthority,
+    ),
+    (error) => error?.code ===
+      "SCHEDULE_DISPATCH_RECONCILIATION_INVALID",
+  );
+});
+
+test("schedule-dispatch finishes the exact durable legacy shard suffix before publishing its matrix",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ root, environment }) => {
+      const command = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(command, liveTime);
+      const githubOutput = join(root, "legacy-finish-github-output");
+      await writeFile(githubOutput, "", { mode: 0o600 });
+      const selectedEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_OUTPUT: githubOutput,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
+      const github = productionControllerGitHubFixture(
+        command,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: Array.from(
+            { length: 257 },
+            (_, index) => index + 1,
+          ),
+          candidateLifecycleStates: [
+            ...Array.from({ length: 256 }, () => "closed"),
+            "open",
+            ...Array.from({ length: 256 }, () => "closed"),
+            "open",
+          ],
+          apiOrigin: "https://api.github.com",
+          serverTimeStepMilliseconds: 1,
+        },
+      );
+      let rejectCurrentOpen = true;
+      const bootstrapThenStopFetch = async (input, init = {}) => {
+        const url = new URL(String(input));
+        if (
+          rejectCurrentOpen && url.pathname === "/graphql" &&
+          String(init.method ?? "GET").toUpperCase() === "POST" &&
+          String(JSON.parse(String(init.body)).query).includes(
+            "CodexReviewGateCurrentOpenPullRequests",
+          )
+        ) {
+          return jsonResponse(JSON.stringify({
+            message: "fixture stop after protected-ledger bootstrap",
+          }), 500);
+        }
+        return github.fetch(input, init);
+      };
+      await assert.rejects(
+        runV2ScheduleDispatchCli(selectedEnvironment, {
+          fetch: bootstrapThenStopFetch,
+        }),
+      );
+      rejectCurrentOpen = false;
+      assert.deepEqual(github.candidateInventoryPhases(), []);
+      assert.deepEqual(github.candidateDispatchPhases(), []);
+      const capability = github.ledgerCapabilityReceipt();
+      assert.notEqual(capability, null);
+      const historicalVerifier = createV2GitHubOidcProvenanceVerifier({
+        fetch: github.fetch,
+        environment: selectedEnvironment,
+      });
+      await historicalVerifier.initialize();
+      const triggerIdentity = loadV2GitLedgerTriggerIdentity({
+        command,
+        environment: selectedEnvironment,
+      });
+      const legacy = await seedHistoricalLegacyIncompleteCandidateCycle({
+        github,
+        verifier: historicalVerifier,
+        capability,
+        triggerIdentity,
+        owner: {
+          run_id: selectedEnvironment.GITHUB_RUN_ID,
+          run_attempt: Number(selectedEnvironment.GITHUB_RUN_ATTEMPT),
+          actor_id: selectedEnvironment.GITHUB_ACTOR_ID,
+        },
+      });
+      assert.equal(legacy.incomplete_authority.cycle_id, legacy.cycle_id);
+      assert.equal(
+        legacy.incomplete_authority.start_record_oid,
+        legacy.start_record_oid,
+      );
+      assert.equal(legacy.incomplete_authority.next_shard_index, 1);
+      assert.equal(legacy.incomplete_authority.shard_receipts.length, 1);
+      assert.equal(legacy.initial_inventory.shards.length, 2);
+      const recordCountBefore = github.ledgerRecordCount();
+      const writeRequestsBefore = github.ledgerWriteRequests().length;
+      const inventoryRequestsBefore =
+        github.candidateInventoryRequests().length;
+      const lifecycleRequestsBefore =
+        github.candidateLifecycleRequests().length;
+      const currentOpenRequestsBefore =
+        github.currentOpenCandidateRequests().length;
+
+      const result = await runV2ScheduleDispatchCli(selectedEnvironment, {
+        fetch: github.fetch,
+      });
+
+      assert.equal(github.ledgerRecordCount() - recordCountBefore, 3);
+      assert.equal(
+        github.ledgerWriteRequests().slice(writeRequestsBefore)
+          .filter((request) => request.startsWith("PATCH /git/refs/"))
+          .length,
+        1,
+        "the remaining shard, completion, and reservation must share one ref CAS",
+      );
+      assert.deepEqual(github.candidateInventoryPhases(), [
+        "cycle-start",
+        "shard",
+        "shard",
+        "cycle-complete",
+      ]);
+      assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
+      const inventoryRecords = github.candidateInventoryRecordEntries();
+      assert.equal(inventoryRecords[0].commit_sha, legacy.start_record_oid);
+      assert.ok(inventoryRecords.every(({ cycle_id: cycleId }) =>
+        cycleId === legacy.cycle_id));
+      assert.equal(
+        github.currentOpenCandidateRequests().length,
+        currentOpenRequestsBefore,
+        "an incomplete legacy source must not be replaced by current-open sampling",
+      );
+      assert.ok(
+        github.candidateInventoryRequests().length > inventoryRequestsBefore,
+      );
+      assert.ok(
+        github.candidateLifecycleRequests().length > lifecycleRequestsBefore,
+      );
+      assert.deepEqual(
+        result.matrix.include.map(({ pull_request: pullRequest }) =>
+          pullRequest),
+        [257],
+      );
+      assert.equal(result.matrix.include[0].enabled, true);
+      assert.equal(
+        await readFile(githubOutput, "utf8"),
+        `matrix=${canonicalJson(result.matrix)}\n`,
+      );
+      assertNoDispatchAuthorityInternals(result);
+    });
+  });
+
 test("schedule-dispatch bootstraps one current-open candidate without legacy REST", async () => {
   await withWorkflowCliFixture({
     eventName: "schedule",
@@ -4388,6 +5112,164 @@ test("schedule-dispatch bootstraps one current-open candidate without legacy RES
     assertNoDispatchAuthorityInternals(result);
   });
 });
+
+test("schedule-dispatch checkpoints a 4095-record current-open source before publishing its matrix",
+  async () => {
+    await withWorkflowCliFixture({
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+    }, async ({ root, runnerTemp, environment }) => {
+      const command = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(command, liveTime);
+      const bootstrapEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
+      const github = productionControllerGitHubFixture(
+        command,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: [7],
+          apiOrigin: "https://api.github.com",
+          serverTimeStepMilliseconds: 1,
+          authoritativeWallClock: true,
+        },
+      );
+      let rejectCurrentOpen = true;
+      const bootstrapThenStopFetch = async (input, init = {}) => {
+        const url = new URL(String(input));
+        if (
+          rejectCurrentOpen && url.pathname === "/graphql" &&
+          String(init.method ?? "GET").toUpperCase() === "POST" &&
+          String(JSON.parse(String(init.body)).query).includes(
+            "CodexReviewGateCurrentOpenPullRequests",
+          )
+        ) {
+          return jsonResponse(JSON.stringify({
+            message: "fixture stop after protected-ledger bootstrap",
+          }), 500);
+        }
+        return github.fetch(input, init);
+      };
+      await assert.rejects(
+        runV2ScheduleDispatchCli(bootstrapEnvironment, {
+          fetch: bootstrapThenStopFetch,
+        }),
+      );
+      rejectCurrentOpen = false;
+      const padded = await padHistoricalCapabilityAttestations({
+        github,
+        createVerifier: () => createV2GitHubOidcProvenanceVerifier({
+          fetch: github.fetch,
+          environment: bootstrapEnvironment,
+        }),
+        targetRecordCount: MAX_V2_GIT_LEDGER_COMMITS - 1,
+      });
+      assert.equal(padded.record_count, MAX_V2_GIT_LEDGER_COMMITS - 1);
+      assert.equal(padded.tip_commit_sha, github.ledgerTipCommitSha());
+
+      const githubOutput = join(root, "current-open-4095-github-output");
+      await writeFile(githubOutput, "", { mode: 0o600 });
+      const checkpointEnvironment = await makeWorkflowLegEnvironment({
+        environment: bootstrapEnvironment,
+        runnerTemp,
+        name: "current-open-4095-checkpoint",
+        runId: "123457",
+        route: "scan-all-open",
+        pullRequest: "",
+        githubOutput,
+      });
+      const checkpointCommand = await prepareV2WorkflowCommand(
+        checkpointEnvironment,
+      );
+      oidc.bindCommand(checkpointCommand);
+      const oidcCallsBefore = oidc.calls.length;
+      const writesBefore = github.ledgerWriteRequests().length;
+      const currentOpenRequestsBefore =
+        github.currentOpenCandidateRequests().length;
+      const inventoryRequestsBefore =
+        github.candidateInventoryRequests().length;
+      const lifecycleRequestsBefore =
+        github.candidateLifecycleRequests().length;
+
+      const result = await runV2ScheduleDispatchCli(checkpointEnvironment, {
+        fetch: github.fetch,
+      });
+
+      assert.equal(
+        github.ledgerWriteRequests().slice(writesBefore)
+          .filter((request) => request.startsWith("PATCH /git/refs/"))
+          .length,
+        1,
+        "checkpoint carrier, generation, and reservation require one ref CAS",
+      );
+      assert.equal(
+        github.currentOpenCandidateRequests().length -
+          currentOpenRequestsBefore,
+        4,
+      );
+      assert.equal(
+        github.candidateInventoryRequests().length,
+        inventoryRequestsBefore,
+      );
+      assert.equal(
+        github.candidateLifecycleRequests().length,
+        lifecycleRequestsBefore,
+      );
+      assert.deepEqual(github.candidateInventoryPhases(), [
+        "current-open-generation",
+      ]);
+      assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
+      assert.deepEqual(
+        oidc.calls.slice(oidcCallsBefore).map(({ kind }) => kind),
+        [
+          "discovery", "jwks",
+          "mint", "mint", "mint", "mint", "mint", "mint",
+        ],
+        "the reconciled reserve must not perform another full load and load mint",
+      );
+      const checkpointState = github.ledgerLatestCheckpointState();
+      assert.notEqual(checkpointState, null);
+      assert.equal(checkpointState.schema_version, 3);
+      assert.equal(checkpointState.profile, "mature-quiescent-v1");
+      assert.equal(
+        checkpointState.source.commit_count,
+        MAX_V2_GIT_LEDGER_COMMITS - 1,
+      );
+      assert.equal(
+        checkpointState.next_unit.profile,
+        "current-open-generation-v1",
+      );
+      assert.equal(checkpointState.next_unit.kind, "current-open-generation");
+      assert.equal(checkpointState.next_unit.candidate_count, 1);
+      assert.ok(
+        checkpointState.next_unit.current_epoch_remaining_commit_capacity < 0,
+      );
+      assert.ok(
+        checkpointState.next_unit.fresh_epoch_remaining_commit_capacity >= 0,
+      );
+      assert.equal(result.matrix.include.length, 1);
+      assert.equal(result.matrix.include[0].enabled, true);
+      assert.equal(result.matrix.include[0].pull_request, 7);
+      const binding = JSON.parse(result.matrix.include[0].dispatch_binding);
+      assert.equal(binding.candidate.identity.number, 7);
+      assert.equal(
+        binding.candidate_source.source_profile,
+        "stable-graphql-current-open-v4",
+      );
+      assert.equal(
+        await readFile(githubOutput, "utf8"),
+        `matrix=${canonicalJson(result.matrix)}\n`,
+      );
+      assertNoDispatchAuthorityInternals(result);
+    });
+  });
 
 test("schedule-dispatch persists current-open authority without legacy full refresh and restarts the active raw-plan matrix", async () => {
   await withWorkflowCliFixture({
@@ -7285,6 +8167,7 @@ function productionControllerGitHubFixture(
     apiOrigin = "https://api.github.com",
     snapshotIssueComments = [],
     serverTimeStepMilliseconds = 1_000,
+    authoritativeWallClock = false,
   } = {},
 ) {
   const preflight = productionPreflightFetchFixture(command, {
@@ -7740,6 +8623,22 @@ function productionControllerGitHubFixture(
       structuredClone(candidateLifecycleRequests),
     currentOpenCandidateRequests: () =>
       structuredClone(currentOpenCandidateRequests),
+    ledgerTipCommitSha: () => refTarget,
+    ledgerLatestEnvelope: () => {
+      const entries = reachableRecordEntries();
+      return entries.length === 0
+        ? null
+        : structuredClone(entries.at(-1).record);
+    },
+    ledgerCapabilityReceipt: () => {
+      const attestation = reachableRecords().findLast((record) =>
+        record.record_type === "capability-attestation");
+      return attestation === undefined
+        ? null
+        : structuredClone(attestation.payload.capability_receipt);
+    },
+    ledgerLatestCheckpointState,
+    materializeHistoricalLedgerEnvelope,
     setCandidateNumbers(numbers) {
       if (
         candidateInventorySnapshots !== null ||
@@ -7758,6 +8657,14 @@ function productionControllerGitHubFixture(
       .filter((record) =>
         record.record_type === "candidate-inventory-observation")
       .map((record) => record.payload.phase),
+    candidateInventoryRecordEntries: () => reachableRecordEntries()
+      .filter(({ record }) =>
+        record.record_type === "candidate-inventory-observation")
+      .map(({ commit_sha: commitSha, record }) => ({
+        commit_sha: commitSha,
+        phase: record.payload.phase,
+        cycle_id: record.payload.cycle_id ?? null,
+      })),
     candidateDispatchPhases: () => reachableRecords()
       .filter((record) =>
         record.record_type === "candidate-dispatch-observation")
@@ -8072,8 +8979,12 @@ function productionControllerGitHubFixture(
   }
 
   function currentDate() {
+    const logicalTimestamp =
+      Date.parse(baseTime) + serverTimeOffsetMilliseconds;
     const rendered = new Date(
-      Date.parse(baseTime) + serverTimeOffsetMilliseconds,
+      authoritativeWallClock
+        ? Math.max(logicalTimestamp, Date.now(), maxServerTimestamp)
+        : logicalTimestamp,
     ).toUTCString();
     maxServerTimestamp = Math.max(maxServerTimestamp, Date.parse(rendered));
     return rendered;
@@ -8160,6 +9071,83 @@ function productionControllerGitHubFixture(
     return reachableRecordEntries().map(({ record }) => record);
   }
 
+  function materializeHistoricalLedgerEnvelope(envelope) {
+    assert.equal(envelope.predecessor_commit_sha, refTarget);
+    const bytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
+    const blobSha = gitObjectSha("blob", bytes);
+    blobs.set(blobSha, {
+      sha: blobSha,
+      bytes,
+      content: bytes.toString("utf8"),
+    });
+    const treeEntries = [{
+      path: V2_GIT_LEDGER_BLOB_PATH,
+      mode: "100644",
+      type: "blob",
+      sha: blobSha,
+    }];
+    const treeSha = canonicalTreeSha(treeEntries);
+    trees.set(treeSha, { sha: treeSha, tree: treeEntries });
+    const identity = {
+      name: "Codex Review Gate",
+      email: "codex-review-gate@users.noreply.github.com",
+      date: envelope.server_observed_at,
+    };
+    const message =
+      `Codex Review Gate v2: ${envelope.record_type} #${envelope.sequence}`;
+    const commitBytes = Buffer.from([
+      `tree ${treeSha}`,
+      `parent ${refTarget}`,
+      `author ${identity.name} <${identity.email}> ` +
+        `${Math.floor(Date.parse(identity.date) / 1000)} +0000`,
+      `committer ${identity.name} <${identity.email}> ` +
+        `${Math.floor(Date.parse(identity.date) / 1000)} +0000`,
+      "",
+      message,
+    ].join("\n"), "utf8");
+    const commitSha = gitObjectSha("commit", commitBytes);
+    commits.set(commitSha, {
+      sha: commitSha,
+      message,
+      tree: { sha: treeSha },
+      parents: [{ sha: refTarget }],
+      author: structuredClone(identity),
+      committer: structuredClone(identity),
+    });
+    refTarget = commitSha;
+    return {
+      commit_sha: commitSha,
+      parents: [envelope.predecessor_commit_sha],
+      tree_sha: treeSha,
+      blob_sha: blobSha,
+      envelope: structuredClone(envelope),
+    };
+  }
+
+  function ledgerLatestCheckpointState() {
+    let cursor = refTarget;
+    while (cursor !== null) {
+      const commit = commits.get(cursor);
+      const rootTree = commit === undefined
+        ? undefined
+        : trees.get(commit.tree.sha);
+      const stateTreeEntry = rootTree?.tree.find(({ path: entryPath }) =>
+        entryPath === V2_GIT_LEDGER_CHECKPOINT_STATE_PATH);
+      if (stateTreeEntry !== undefined) {
+        const stateTree = trees.get(stateTreeEntry.sha);
+        const stateBlobEntry = stateTree?.tree.find(({ path: entryPath }) =>
+          entryPath === V2_GIT_LEDGER_CHECKPOINT_STATE_BLOB_PATH);
+        const stateBlob = stateBlobEntry === undefined
+          ? undefined
+          : blobs.get(stateBlobEntry.sha);
+        assert.notEqual(stateBlob, undefined);
+        return JSON.parse(stateBlob.content);
+      }
+      cursor = commit?.parents[0]?.sha ?? null;
+    }
+    return null;
+  }
+
   function reachableRecordEntries() {
     const reachable = [];
     let cursor = refTarget;
@@ -8178,7 +9166,9 @@ function productionControllerGitHubFixture(
   function recordForCommit(commitSha) {
     const commit = commits.get(commitSha);
     const tree = trees.get(commit.tree.sha);
-    const blob = blobs.get(tree.tree[0].sha);
+    const blobEntry = tree.tree.find(({ path: entryPath }) =>
+      entryPath === V2_GIT_LEDGER_BLOB_PATH);
+    const blob = blobs.get(blobEntry.sha);
     return JSON.parse(blob.content);
   }
 
@@ -8313,6 +9303,8 @@ function oidcFixture({
   fixedJti = null,
   omitJti = false,
   headerOverrides = {},
+  jwksKeyOverrides = {},
+  duplicateJwksKey = false,
   claimOverrides = {},
   omitClaim = null,
   invalidSignature = false,
@@ -8333,15 +9325,19 @@ function oidcFixture({
     id_token_signing_alg_values_supported: ["RS256"],
     claims_supported: [...V2_GIT_LEDGER_OIDC_CLAIMS].sort(),
   };
+  const jwksKey = {
+    kty: "RSA",
+    use: "sig",
+    alg: "RS256",
+    kid: "fixture-kid",
+    n: publicJwk.n,
+    e: publicJwk.e,
+    ...jwksKeyOverrides,
+  };
   const jwksBody = {
-    keys: [{
-      kty: "RSA",
-      use: "sig",
-      alg: "RS256",
-      kid: "fixture-kid",
-      n: publicJwk.n,
-      e: publicJwk.e,
-    }],
+    keys: duplicateJwksKey
+      ? [jwksKey, structuredClone(jwksKey)]
+      : [jwksKey],
   };
   const discoveryRaw = JSON.stringify(discoveryBody);
   const jwksRaw = JSON.stringify(jwksBody);
@@ -8508,6 +9504,47 @@ function oidcRequestFixture(suffix) {
       withoutDigest,
     ),
   };
+}
+
+function resealOidcRequestFixture(value) {
+  const {
+    nonce: _nonce,
+    audience: _audience,
+    request_digest: _requestDigest,
+    ...input
+  } = structuredClone(value);
+  const nonce = ledgerDigestDomain(
+    "codex-review-gate-v2-git-ledger-provenance-nonce",
+    input,
+  );
+  const withoutDigest = {
+    ...input,
+    nonce,
+    audience: `${V2_GIT_LEDGER_OIDC_AUDIENCE}:${nonce.slice("sha256:".length)}`,
+  };
+  return {
+    ...withoutDigest,
+    request_digest: ledgerDigestDomain(
+      "codex-review-gate-v2-git-ledger-provenance-request",
+      withoutDigest,
+    ),
+  };
+}
+
+function checkpointOidcRequestFixture(suffix) {
+  return resealOidcRequestFixture({
+    ...oidcRequestFixture(suffix),
+    operation: "checkpoint-rotate",
+    effect_scope: null,
+    evaluated_scope_receipt: null,
+    record_identity: {
+      record_type: "epoch-checkpoint",
+      kind: null,
+      effect_id: null,
+      idempotency_key: null,
+      payload_digest: `sha256:${"d".repeat(64)}`,
+    },
+  });
 }
 
 function oidcVerifierRequest(

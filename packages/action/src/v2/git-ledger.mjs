@@ -161,6 +161,10 @@ const V2_GIT_LEDGER_CHECKPOINT_STATE_SCHEMA =
   "codex-review-gate-git-ledger-checkpoint-state-v2";
 const CHECKPOINT_PROFILE = "bootstrap-only-quiescent-v1";
 const MATURE_CHECKPOINT_PROFILE = "mature-quiescent-v1";
+const MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE =
+  "current-open-generation-v1";
+const V2_GIT_LEDGER_CURRENT_OPEN_CHECKPOINT_ADMISSION_SCHEMA =
+  "codex-review-gate-git-ledger-current-open-checkpoint-admission-v1";
 const V2_GIT_LEDGER_MATURE_CHECKPOINT_SOURCE_SEED_SCHEMA =
   "codex-review-gate-git-ledger-mature-checkpoint-source-seed-v2";
 const V2_GIT_LEDGER_MATURE_CHECKPOINT_SOURCE_MANIFEST_SCHEMA =
@@ -355,6 +359,7 @@ const SafeWeakMap = WeakMap;
 const SafeWeakSet = WeakSet;
 const safeWeakMapGet = SafeWeakMap.prototype.get;
 const safeWeakMapSet = SafeWeakMap.prototype.set;
+const safeWeakMapDelete = SafeWeakMap.prototype.delete;
 const safeWeakSetAdd = SafeWeakSet.prototype.add;
 const safeWeakSetHas = SafeWeakSet.prototype.has;
 const CONTROL_PLANE_AUTHORITY_HANDLES = new WeakSet();
@@ -512,6 +517,9 @@ export function createV2GitHubGitLedger({
   const candidateDispatchHandlesByPreScopeReceipt = new WeakMap();
   const loadedHydratedRecordAuthorities = new SafeWeakMap();
   const loadedProvenanceIdentityAuthorities = new SafeWeakMap();
+  const loadedStableChainAuthorities = new SafeWeakMap();
+  const matureCurrentOpenPublicationContinuations = new SafeWeakMap();
+  const candidateRefreshReconciliationContinuations = new SafeWeakMap();
   const leaseReleaseReceipts = new WeakMap();
   const checkpointSourceLoadHandles = new WeakMap();
   const checkpointNextUnitAdmissionHandles = new WeakMap();
@@ -588,6 +596,86 @@ export function createV2GitHubGitLedger({
       );
     }
     return new Set(identities);
+  };
+
+  const consumeCandidateRefreshDispatchContinuation = ({
+    reconciliationResult,
+    commandAuthority,
+    triggerIdentity,
+    repositoryEndpointReceipt,
+  }) => {
+    if (
+      reconciliationResult === null ||
+      typeof reconciliationResult !== "object"
+    ) return null;
+    const continuation = safeReflectApply(
+      safeWeakMapGet,
+      candidateRefreshReconciliationContinuations,
+      [reconciliationResult],
+    );
+    if (continuation === undefined) return null;
+    safeReflectApply(
+      safeWeakMapDelete,
+      candidateRefreshReconciliationContinuations,
+      [reconciliationResult],
+    );
+    const loaded = continuation.loaded;
+    const checkpoint = loaded?.checkpoint ?? null;
+    const publication = reconciliationResult.publication_result;
+    const candidateAuthority = loaded?.authority_projection
+      ?.candidate_inventory ?? null;
+    const dispatchAuthority = loaded?.authority_projection
+      ?.candidate_dispatch ?? null;
+    const stableCommandAuthorityDigest = digestCanonical(
+      "codex-review-gate-v2-checkpoint-stable-command-authority",
+      candidateDispatchStableCommandAuthority(commandAuthority),
+    );
+    const triggerIdentityDigest = digestCanonical(
+      "codex-review-gate-v2-checkpoint-trigger-identity",
+      normalizeCandidateDispatchTriggerIdentity(triggerIdentity),
+    );
+    const endpointReceiptDigest = digestCanonical(
+      "codex-review-gate-v2-checkpoint-repository-endpoint-receipt",
+      repositoryEndpointReceipt,
+    );
+    if (
+      continuation.reconciliation_ordinal !==
+        candidateRefreshReconciliationOrdinal ||
+      reconciliationResult.schema !==
+        V2_GIT_LEDGER_CANDIDATE_REFRESH_RECONCILIATION_SCHEMA ||
+      reconciliationResult.schema_version !== 2 ||
+      reconciliationResult.state !== "persisted" ||
+      reconciliationResult.persistence_mode !==
+        "current-open-generation-v3" ||
+      reconciliationResult.result_digest !==
+        continuation.reconciliation_result_digest ||
+      canonicalJson(reconciliationResult.repository) !== canonicalJson(repo) ||
+      reconciliationResult.ledger_ref !== ref ||
+      publication?.state !== "persisted" ||
+      publication.result_digest !== continuation.publication_result_digest ||
+      publication.final_tip_commit_sha !== continuation.tip_commit_sha ||
+      loaded?.tip_commit_sha !== continuation.tip_commit_sha ||
+      loaded?.record_scope !== "mature-checkpoint-query" ||
+      canonicalJson(loaded.repository) !== canonicalJson(repo) ||
+      loaded.ledger_ref !== ref ||
+      checkpoint?.profile !== MATURE_CHECKPOINT_PROFILE ||
+      checkpoint.epoch_root_commit_sha !==
+        continuation.checkpoint_epoch_root_commit_sha ||
+      checkpoint.future_state_digest !==
+        continuation.checkpoint_future_state_digest ||
+      checkpoint.next_unit_admission_digest !==
+        continuation.next_unit_admission_digest ||
+      candidateAuthority?.authority_digest !==
+        continuation.candidate_inventory_authority_digest ||
+      dispatchAuthority?.authority_digest !==
+        continuation.candidate_dispatch_authority_digest ||
+      stableCommandAuthorityDigest !==
+        continuation.stable_command_authority_digest ||
+      triggerIdentityDigest !== continuation.trigger_identity_digest ||
+      endpointReceiptDigest !==
+        continuation.repository_endpoint_receipt_digest
+    ) return null;
+    return continuation;
   };
 
   const mintCandidateDispatchHandle = ({
@@ -687,6 +775,13 @@ export function createV2GitHubGitLedger({
   // Phase A records exact in-memory admission facts only. These handles are
   // not accepted by any object-staging or ref-publication path.
   const mintCheckpointSourceLoadHandle = (loaded) => {
+    const stableChain = loadedStableChainAuthorities.get(loaded);
+    if (stableChain === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CHECKPOINT_SOURCE_LOAD",
+        "checkpoint source load requires this factory's authenticated stable chain",
+      );
+    }
     const inventory = loaded.authority_projection.candidate_inventory;
     const dispatch = loaded.authority_projection.candidate_dispatch;
     const currentDispatch = dispatch.current_cycle;
@@ -725,6 +820,7 @@ export function createV2GitHubGitLedger({
     });
     checkpointSourceLoadHandles.set(handle, deepFreeze({
       loaded,
+      stable_chain: stableChain,
       created_ordinal: ++checkpointAdmissionOrdinal,
     }));
     return handle;
@@ -790,6 +886,98 @@ export function createV2GitHubGitLedger({
       drift_attempts: structuredClone(driftAttempts),
       cycle: structuredClone(cycle),
       projection: structuredClone(projection),
+      current_epoch_budget: structuredClone(currentEpochBudget),
+      fresh_epoch_budget: structuredClone(freshEpochBudget),
+      created_ordinal: sourcePrivate.created_ordinal,
+    }));
+    return handle;
+  };
+
+  const mintCurrentOpenCheckpointAdmissionHandle = ({
+    sourceLoadHandle,
+    commandAuthority,
+    triggerIdentity,
+    repositoryEndpointReceipt,
+    productionCandidateAuthorityHandle,
+    projectionHandle,
+    normalizedProductionCandidateAuthority,
+    normalizedProjection,
+    publication,
+    currentEpochBudget,
+    freshEpochBudget,
+  }) => {
+    const sourcePrivate = checkpointSourceLoadHandles.get(sourceLoadHandle);
+    if (sourcePrivate === undefined) {
+      throw ledgerError(
+        "UNTRUSTED_CHECKPOINT_SOURCE_LOAD_HANDLE",
+        "current-open checkpoint admission requires its exact same-factory source handle",
+      );
+    }
+    const candidateCount = publication.production_candidate_authority
+      .candidate_count;
+    const withoutDigest = {
+      schema: V2_GIT_LEDGER_CURRENT_OPEN_CHECKPOINT_ADMISSION_SCHEMA,
+      schema_version: 1,
+      profile: MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE,
+      repository: structuredClone(repo),
+      ledger_ref: ref,
+      source_load_digest: sourceLoadHandle.source_load_digest,
+      next_unit_kind: "current-open-generation",
+      generation_id: publication.generation_id,
+      current_open_receipt_digest: publication.current_open_receipt_digest,
+      current_open_projection_digest:
+        publication.current_open_projection_digest,
+      production_candidate_authority_digest:
+        publication.production_candidate_authority.authority_digest,
+      candidate_count: candidateCount,
+      candidate_set_digest:
+        publication.production_candidate_authority.candidate_set_digest,
+      source_current_open_semantic_digest:
+        publication.production_candidate_authority
+          .source_current_open_semantic_digest,
+      lifecycle_candidate_set_digest:
+        publication.lifecycle_candidate_set_digest,
+      attachment_manifest_digest: publication.manifest.manifest_digest,
+      stable_command_authority_digest: digestCanonical(
+        "codex-review-gate-v2-checkpoint-stable-command-authority",
+        candidateDispatchStableCommandAuthority(commandAuthority),
+      ),
+      trigger_identity_digest: digestCanonical(
+        "codex-review-gate-v2-checkpoint-trigger-identity",
+        normalizeCandidateDispatchTriggerIdentity(triggerIdentity),
+      ),
+      repository_endpoint_receipt_digest: digestCanonical(
+        "codex-review-gate-v2-checkpoint-repository-endpoint-receipt",
+        repositoryEndpointReceipt,
+      ),
+      total_commit_budget_required:
+        currentEpochBudget.total_commit_budget_required,
+      current_epoch_remaining_commit_capacity:
+        currentEpochBudget.remaining_ledger_commit_capacity_after_dispatch,
+      fresh_epoch_remaining_commit_capacity:
+        freshEpochBudget.remaining_ledger_commit_capacity_after_dispatch,
+    };
+    const handle = deepFreeze({
+      ...withoutDigest,
+      next_unit_admission_digest: digestCanonical(
+        "codex-review-gate-v2-current-open-checkpoint-admission",
+        withoutDigest,
+      ),
+    });
+    checkpointNextUnitAdmissionHandles.set(handle, deepFreeze({
+      source_load_handle: sourceLoadHandle,
+      next_unit_admission_handle: handle,
+      next_unit_profile: MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE,
+      command_authority: structuredClone(commandAuthority),
+      trigger_identity: structuredClone(triggerIdentity),
+      repository_endpoint_receipt:
+        structuredClone(repositoryEndpointReceipt),
+      production_candidate_authority_handle:
+        productionCandidateAuthorityHandle,
+      projection_handle: projectionHandle,
+      normalized_production_candidate_authority:
+        structuredClone(normalizedProductionCandidateAuthority),
+      normalized_projection: structuredClone(normalizedProjection),
       current_epoch_budget: structuredClone(currentEpochBudget),
       fresh_epoch_budget: structuredClone(freshEpochBudget),
       created_ordinal: sourcePrivate.created_ordinal,
@@ -1037,6 +1225,145 @@ export function createV2GitHubGitLedger({
       loaded: reconciled,
       projection: admissionPrivate.projection,
     });
+  };
+
+  const publishMatureCurrentOpenCheckpoint = async ({
+    sourceLoadHandle,
+    nextUnitAdmissionHandle,
+  }) => {
+    const sourcePrivate = checkpointSourceLoadHandles.get(sourceLoadHandle);
+    const admissionPrivate = checkpointNextUnitAdmissionHandles.get(
+      nextUnitAdmissionHandle,
+    );
+    if (
+      sourcePrivate === undefined || admissionPrivate === undefined ||
+      admissionPrivate.source_load_handle !== sourceLoadHandle ||
+      admissionPrivate.next_unit_profile !==
+        MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE
+    ) {
+      throw ledgerError(
+        "UNTRUSTED_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE",
+        "current-open checkpoint publication requires its exact same-factory admission",
+      );
+    }
+    if (admissionPrivate.created_ordinal !== checkpointAdmissionOrdinal) {
+      throw ledgerError(
+        "STALE_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE",
+        "current-open checkpoint publication requires the latest admission",
+      );
+    }
+    validateMatureQuiescentCheckpointBoundary(sourcePrivate.loaded);
+    const requestBudget = createCheckpointRequestBudget();
+    const provenanceBudget = createCheckpointVerifierBudget(
+      requestBudget.deadline_at_ms,
+    );
+    const prepared = await publishMatureCheckpointCandidateTransaction({
+      fetchImpl,
+      authorization,
+      base,
+      repoPath,
+      ref,
+      refSuffix,
+      repo,
+      capability,
+      preflightHandle,
+      verifyWorkflowProvenance,
+      requestBudget,
+      provenanceBudget,
+      sourcePrivate,
+      admissionPrivate,
+      assertAdmissionCurrent: () =>
+        assertCheckpointAdmissionCurrent(admissionPrivate),
+    });
+    const reconciled = await api.load();
+    const suffixStart = sourceLoadHandle.source_commit_count;
+    const durableSuffix = reconciled.records.slice(
+      suffixStart,
+      suffixStart + prepared.suffix.records.length,
+    );
+    const checkpoint = reconciled.checkpoint;
+    const publication = prepared.suffix.current_open_publication;
+    const contiguousSuffix = durableSuffix.length === 2 &&
+      durableSuffix.every((entry, index) => {
+        const predecessorCommitSha = index === 0
+          ? checkpoint?.epoch_root_commit_sha
+          : durableSuffix[index - 1].commit_sha;
+        return entry.envelope.sequence === index + 1 &&
+          entry.parents.length === 1 &&
+          entry.parents[0] === predecessorCommitSha &&
+          entry.envelope.predecessor_commit_sha === predecessorCommitSha;
+      });
+    const exactPublication =
+      checkpoint?.profile === MATURE_CHECKPOINT_PROFILE &&
+      checkpoint.epoch_root_commit_sha ===
+        prepared.checkpoint_plan.commit_sha &&
+      checkpoint.source_tip_commit_sha === prepared.source_tip_commit_sha &&
+      checkpoint.source_record_count === sourceLoadHandle.source_commit_count &&
+      checkpoint.epoch_record_offset === 1 &&
+      checkpoint.checkpoint_state_digest ===
+        prepared.checkpoint_state.checkpoint_state_digest &&
+      checkpoint.source_query_seed_tree_sha ===
+        prepared.source_seed_bundle.source_tree_sha &&
+      checkpoint.source_query_seed_manifest_digest ===
+        prepared.source_seed_bundle.manifest.manifest_digest &&
+      checkpoint.next_unit_admission_digest ===
+        nextUnitAdmissionHandle.next_unit_admission_digest &&
+      contiguousSuffix &&
+      canonicalJson(durableSuffix.map(({ commit_sha: commitSha }) =>
+        commitSha)) === canonicalJson(prepared.suffix.records.map(
+        ({ commit_sha: commitSha }) => commitSha,
+      )) &&
+      checkpoint.future_state_digest ===
+        prepared.planned_future_state.future_state_digest;
+    if (!exactPublication) {
+      if (prepared.publication_error !== null) {
+        throw prepared.publication_error;
+      }
+      throw ledgerError(
+        "CHECKPOINT_PUBLICATION_MISMATCH",
+        "current-open checkpoint publication is absent from stable authority",
+      );
+    }
+    const recovered = prepared.publication_error !== null ||
+      prepared.ref_update === null || prepared.exact_ref === null ||
+      prepared.exact_ref.target_commit_sha !==
+        prepared.suffix.transaction_tip_commit_sha;
+    const result = currentOpenGenerationPublicationResult({
+      outcome: recovered ? "recovered-after-apply" : "published",
+      appendReceipts: [],
+      publishedRecordCommitShas: durableSuffix.map(
+        ({ commit_sha: commitSha }) => commitSha,
+      ),
+      loaded: reconciled,
+      publication,
+    });
+    safeReflectApply(
+      safeWeakMapSet,
+      matureCurrentOpenPublicationContinuations,
+      [result, deepFreeze({
+        loaded: reconciled,
+        reconciliation_ordinal: candidateRefreshReconciliationOrdinal,
+        publication_result_digest: result.result_digest,
+        tip_commit_sha: reconciled.tip_commit_sha,
+        checkpoint_epoch_root_commit_sha:
+          checkpoint.epoch_root_commit_sha,
+        checkpoint_future_state_digest: checkpoint.future_state_digest,
+        next_unit_admission_digest:
+          nextUnitAdmissionHandle.next_unit_admission_digest,
+        candidate_inventory_authority_digest:
+          reconciled.authority_projection.candidate_inventory
+            .authority_digest,
+        candidate_dispatch_authority_digest:
+          reconciled.authority_projection.candidate_dispatch.authority_digest,
+        stable_command_authority_digest:
+          nextUnitAdmissionHandle.stable_command_authority_digest,
+        trigger_identity_digest:
+          nextUnitAdmissionHandle.trigger_identity_digest,
+        repository_endpoint_receipt_digest:
+          nextUnitAdmissionHandle.repository_endpoint_receipt_digest,
+      })],
+    );
+    return result;
   };
 
   const candidateRefreshClassificationResult = ({
@@ -2234,10 +2561,10 @@ export function createV2GitHubGitLedger({
       ? 0
       : Math.ceil(candidateCount / MAX_V2_CANDIDATE_DISPATCH_ITEMS);
     const freshDispatchBudget =
-      calculateV2GitLedgerCandidateDispatchCommitBudget({
+      calculateCurrentOpenCheckpointCommitBudget({
         candidate_count: candidateCount,
         batch_count: batchCount,
-        reachable_record_count: 2,
+        source_record_count: 1,
       });
     if (freshDispatchBudget.remaining_ledger_commit_capacity_after_dispatch < 0) {
       throw ledgerError(
@@ -2246,16 +2573,33 @@ export function createV2GitHubGitLedger({
       );
     }
     const currentDispatchBudget =
-      calculateV2GitLedgerCandidateDispatchCommitBudget({
+      calculateCurrentOpenCheckpointCommitBudget({
         candidate_count: candidateCount,
         batch_count: batchCount,
-        reachable_record_count: Math.min(
-          MAX_V2_GIT_LEDGER_COMMITS,
-          sourceLoaded.commit_count + 1,
-        ),
+        source_record_count: sourceLoaded.commit_count,
       });
     if (currentDispatchBudget.remaining_ledger_commit_capacity_after_dispatch < 0) {
-      return deepFreeze({ state: "checkpoint-required" });
+      const sourceLoadHandle = mintCheckpointSourceLoadHandle(sourceLoaded);
+      const nextUnitAdmissionHandle =
+        mintCurrentOpenCheckpointAdmissionHandle({
+          sourceLoadHandle,
+          commandAuthority,
+          triggerIdentity: input.trigger_identity,
+          repositoryEndpointReceipt,
+          productionCandidateAuthorityHandle:
+            pair.production_candidate_authority,
+          projectionHandle: pair.projection,
+          normalizedProductionCandidateAuthority:
+            pair.normalized_production_candidate_authority,
+          normalizedProjection: pair.normalized_projection,
+          publication,
+          currentEpochBudget: currentDispatchBudget,
+          freshEpochBudget: freshDispatchBudget,
+        });
+      return publishMatureCurrentOpenCheckpoint({
+        sourceLoadHandle,
+        nextUnitAdmissionHandle,
+      });
     }
 
     const finalLoaded = await api.load();
@@ -3266,8 +3610,9 @@ export function createV2GitHubGitLedger({
               entry.envelope.workflow_provenance,
             ),
           )),
-        ]),
+          ]),
       );
+      loadedStableChainAuthorities.set(sealed, loaded);
       assertHttpDeadlineOpen(requestBudget);
       return sealed;
     },
@@ -3708,9 +4053,30 @@ export function createV2GitHubGitLedger({
               checkpointRequired: true,
             });
           }
-          return currentOpenGenerationReconciliationResult({
-            publicationResult,
-          });
+          const reconciliationResult =
+            currentOpenGenerationReconciliationResult({ publicationResult });
+          const continuation = safeReflectApply(
+            safeWeakMapGet,
+            matureCurrentOpenPublicationContinuations,
+            [publicationResult],
+          );
+          if (continuation !== undefined) {
+            safeReflectApply(
+              safeWeakMapDelete,
+              matureCurrentOpenPublicationContinuations,
+              [publicationResult],
+            );
+            safeReflectApply(
+              safeWeakMapSet,
+              candidateRefreshReconciliationContinuations,
+              [reconciliationResult, deepFreeze({
+                ...continuation,
+                reconciliation_result_digest:
+                  reconciliationResult.result_digest,
+              })],
+            );
+          }
+          return reconciliationResult;
         }
         const suppressionResult =
           await api.trySuppressCandidateInventoryRefresh(reconciliationInput);
@@ -6516,6 +6882,7 @@ export function createV2GitHubGitLedger({
       workflow_command_handle,
       trigger_identity,
       repository_endpoint_receipt,
+      candidate_refresh_reconciliation_result = null,
     }) {
       const command = await scheduledWorkflowCommandAuthority({
         workflow_command_handle,
@@ -6527,7 +6894,37 @@ export function createV2GitHubGitLedger({
         repository_endpoint_receipt,
         repo,
       );
-      let loaded = await api.load();
+      const continuation = consumeCandidateRefreshDispatchContinuation({
+        reconciliationResult: candidate_refresh_reconciliation_result,
+        commandAuthority: command.authority,
+        triggerIdentity: trigger_identity,
+        repositoryEndpointReceipt,
+      });
+      let loaded = null;
+      if (continuation !== null) {
+        try {
+          const fence = await readRef({
+            fetchImpl,
+            authorization,
+            base,
+            repoPath,
+            ref,
+            refSuffix,
+            requestBudget: createRequestBudget(),
+          });
+          if (
+            fence.target_commit_sha === continuation.tip_commit_sha &&
+            Date.parse(fence.server_time) >=
+              Date.parse(continuation.loaded.post_ref.server_time)
+          ) {
+            loaded = continuation.loaded;
+          }
+        } catch {
+          // A failed cheap revalidation never authorizes cached authority.
+          // The ordinary full load below remains the fail-closed fallback.
+        }
+      }
+      loaded ??= await api.load();
       let candidateAuthority = loaded.authority_projection.candidate_inventory;
       let dispatchAuthority = loaded.authority_projection.candidate_dispatch;
       let current = dispatchAuthority.current_cycle;
@@ -20614,6 +21011,41 @@ export function calculateV2GitLedgerCandidateDispatchCommitBudget({
   });
 }
 
+function calculateCurrentOpenCheckpointCommitBudget({
+  candidate_count,
+  batch_count,
+  source_record_count,
+}) {
+  const sourceRecordCount = integerBetween(
+    source_record_count,
+    0,
+    MAX_V2_GIT_LEDGER_COMMITS,
+    "current-open checkpoint source record count",
+  );
+  const dispatchBudget = calculateV2GitLedgerCandidateDispatchCommitBudget({
+    candidate_count,
+    batch_count,
+    reachable_record_count: Math.min(
+      MAX_V2_GIT_LEDGER_COMMITS,
+      sourceRecordCount + 1,
+    ),
+  });
+  const generationCommitBudgetRequired = 1;
+  const totalCommitBudgetRequired = generationCommitBudgetRequired +
+    dispatchBudget.total_commit_budget_required;
+  return deepFreeze({
+    generation_commit_budget_required: generationCommitBudgetRequired,
+    dispatch_commit_budget_required:
+      dispatchBudget.dispatch_commit_budget_required,
+    candidate_execution_commit_budget_required:
+      dispatchBudget.candidate_execution_commit_budget_required,
+    total_commit_budget_required: totalCommitBudgetRequired,
+    remaining_ledger_commit_capacity_after_dispatch:
+      MAX_V2_GIT_LEDGER_COMMITS - sourceRecordCount -
+      totalCommitBudgetRequired,
+  });
+}
+
 export function calculateV2GitLedgerCandidateDispatchReservedCommitBudget({
   dispatch_commit_budget_required,
   candidate_execution_commit_budget_required,
@@ -25867,16 +26299,44 @@ async function loadStableMatureCheckpointChain({
     carrier,
     checkpointLiveReceipt,
   ));
-  let suffixRecords = await hydrateCurrentCandidateInventoryAttachments({
-    records: initialSuffixRecords,
-    fetchImpl,
-    authorization,
-    base,
-    repoPath,
-    repository: repo,
-    requestBudget,
-    assertOperationCurrent,
-  });
+  const transactionSuffixCount =
+    checkpointState.next_unit.semantic_record_count;
+  const transactionSuffixRecords =
+    await hydrateCurrentCandidateInventoryAttachments({
+      records: initialSuffixRecords.slice(0, transactionSuffixCount),
+      fetchImpl,
+      authorization,
+      base,
+      repoPath,
+      repository: repo,
+      requestBudget,
+      assertOperationCurrent,
+    });
+  let suffixRecords = transactionSuffixRecords;
+  if (initialSuffixRecords.length > transactionSuffixCount) {
+    const laterSuffix = initialSuffixRecords.slice(transactionSuffixCount);
+    const laterAttachedInventoryRecord = laterSuffix.some((entry) =>
+      entry.candidate_inventory_attachment_tree_sha !== null);
+    if (laterAttachedInventoryRecord) {
+      const latestHydratedSuffix =
+        await hydrateCurrentCandidateInventoryAttachments({
+          records: initialSuffixRecords,
+          fetchImpl,
+          authorization,
+          base,
+          repoPath,
+          repository: repo,
+          requestBudget,
+          assertOperationCurrent,
+        });
+      suffixRecords = [
+        ...transactionSuffixRecords,
+        ...latestHydratedSuffix.slice(transactionSuffixCount),
+      ];
+    } else {
+      suffixRecords = [...transactionSuffixRecords, ...laterSuffix];
+    }
+  }
   for (const entry of suffixRecords) {
     validateV2GitLedgerEnvelope(entry.envelope, {
       repository: repo,
@@ -25898,8 +26358,6 @@ async function loadStableMatureCheckpointChain({
       liveReceipt,
     ));
   }
-  const transactionSuffixCount =
-    checkpointState.next_unit.semantic_record_count;
   const transactionSuffix = suffixRecords.slice(0, transactionSuffixCount);
   const transactionRecords = [...source.records, ...transactionSuffix];
   const transactionState = projectChainState(
@@ -25912,117 +26370,236 @@ async function loadStableMatureCheckpointChain({
     transactionState.authority_projection.candidate_dispatch;
   const activeReservation = transactionDispatchAuthority.active_reservation;
   const currentDispatchCycle = transactionDispatchAuthority.current_cycle;
-  const candidateCount = transactionCandidateAuthority.completed_cycle
-    ?.cycle_receipt.open_pull_requests.length ?? null;
-  const emptyDispatch = candidateCount === 0;
   const transactionCommandAuthority = activeReservation === null
     ? currentDispatchCycle?.dispatch_command_authority ?? null
     : activeReservation.scan_command_authority;
   const transactionTriggerIdentity = activeReservation === null
     ? currentDispatchCycle?.trigger_identity ?? null
     : activeReservation.reservation.trigger_identity;
-  if (
-    transactionCandidateAuthority.incomplete_cycle !== null ||
-    transactionCandidateAuthority.atomic_cycle !== null ||
-    transactionCandidateAuthority.completed_cycle?.cycle_id !==
-      checkpointState.next_unit.cycle_id ||
-    transactionCandidateAuthority.completed_cycle?.cycle_receipt
-      .receipt_digest !==
-      checkpointState.next_unit.stable_cycle_receipt_digest ||
-    currentDispatchCycle === null || candidateCount === null ||
-    emptyDispatch !== (
-      activeReservation === null && currentDispatchCycle.cycle_complete === true
-    ) ||
-    !emptyDispatch && (
-      activeReservation === null || currentDispatchCycle.cycle_complete
-    ) ||
-    transactionCommandAuthority === null ||
-    transactionTriggerIdentity === null ||
-    digestCanonical(
-      "codex-review-gate-v2-checkpoint-stable-command-authority",
-      candidateDispatchStableCommandAuthority(
-        transactionCommandAuthority,
-      ),
-    ) !== checkpointState.next_unit.stable_command_authority_digest ||
-    digestCanonical(
-      "codex-review-gate-v2-checkpoint-trigger-identity",
-      normalizeCandidateDispatchTriggerIdentity(
-        transactionTriggerIdentity,
-      ),
-    ) !== checkpointState.next_unit.trigger_identity_digest
-  ) {
-    throw ledgerError(
-      "CHECKPOINT_SUFFIX_AUTHORITY",
-      "mature checkpoint transaction prefix does not reconstruct its next unit",
+  let firstPlan;
+  if (checkpointState.schema_version === 3) {
+    const nextUnit = checkpointState.next_unit;
+    const generationEntry = transactionSuffix[0];
+    const dispatchEntry = transactionSuffix[1];
+    const generation = transactionCandidateAuthority.completed_generation;
+    const completedSource = candidateInventoryCompletedSource(
+      transactionCandidateAuthority,
     );
-  }
-  const classification = checkpointState.next_unit.classification_projection;
-  const attemptEntries = transactionSuffix.filter((entry) =>
-    entry.envelope.record_type === "candidate-inventory-observation" &&
-    entry.envelope.payload.phase === "attempt");
-  const attemptCount = attemptEntries.length;
-  const driftCodes = attemptEntries.slice(0, -1).map((entry) =>
-    entry.envelope.payload.outcome);
-  const attemptEvidence = attemptEntries.map((entry) =>
-    candidateInventoryAttachmentEvidence(entry));
-  if (attemptEvidence.some((evidence) => evidence === null)) {
-    throw ledgerError(
-      "CHECKPOINT_NEXT_UNIT_ATTACHMENT",
-      "mature checkpoint transaction lacks one attempt attachment",
-    );
-  }
-  const stableAttempt = attemptEvidence.at(-1);
-  const budgetCycle = {
-    shard_receipts: stableAttempt.shard_receipts,
-    cycle_receipt:
-      transactionCandidateAuthority.completed_cycle.cycle_receipt,
-  };
-  const budgetDriftAttempts = attemptEvidence.slice(0, -1).map((evidence) => ({
-    shard_receipts: evidence.shard_receipts,
-  }));
-  const sourceBudget = candidateInventoryCycleCommitBudgetAtRecordCount({
-    state: "persist-required",
-    reachableRecordCount: checkpointState.source.commit_count,
-    driftAttempts: budgetDriftAttempts,
-    cycle: budgetCycle,
-  });
-  const freshBudget = candidateInventoryCycleCommitBudgetAtRecordCount({
-    state: "persist-required",
-    reachableRecordCount: 1,
-    driftAttempts: budgetDriftAttempts,
-    cycle: budgetCycle,
-  });
-  if (
-    checkpointState.next_unit.semantic_record_count !== attemptCount + 3 ||
-    classification.semantic_inventory_digest !==
-      candidateInventoryCycleSemanticDigest(
-        transactionCandidateAuthority.completed_cycle.cycle_receipt,
+    const attachmentEvidence = generationEntry
+      ?.candidate_inventory_attachment_evidence ?? null;
+    const endpointDigests = transactionSuffix.map((entry) => {
+      const endpoint = entry.envelope.workflow_provenance.operation_binding
+        .evaluated_scope_receipt?.scope_endpoint_receipt ?? null;
+      return endpoint === null ? null : digestCanonical(
+        "codex-review-gate-v2-checkpoint-repository-endpoint-receipt",
+        endpoint,
+      );
+    });
+    const candidateCount = generation?.candidate_count ?? null;
+    const emptyDispatch = candidateCount === 0;
+    const batchCount = candidateCount === null || candidateCount === 0
+      ? 0
+      : Math.ceil(candidateCount / MAX_V2_CANDIDATE_DISPATCH_ITEMS);
+    const sourceBudget = candidateCount === null
+      ? null
+      : calculateCurrentOpenCheckpointCommitBudget({
+          candidate_count: candidateCount,
+          batch_count: batchCount,
+          source_record_count: checkpointState.source.commit_count,
+        });
+    const freshBudget = candidateCount === null
+      ? null
+      : calculateCurrentOpenCheckpointCommitBudget({
+          candidate_count: candidateCount,
+          batch_count: batchCount,
+          source_record_count: 1,
+        });
+    if (
+      transactionSuffix.length !== 2 ||
+      generationEntry?.envelope.record_type !==
+        "candidate-inventory-observation" ||
+      generationEntry.envelope.payload.schema_version !== 3 ||
+      generationEntry.envelope.payload.phase !== "current-open-generation" ||
+      dispatchEntry?.envelope.record_type !==
+        "candidate-dispatch-observation" ||
+      transactionCandidateAuthority.incomplete_cycle !== null ||
+      transactionCandidateAuthority.atomic_cycle !== null ||
+      transactionCandidateAuthority.completed_cycle !== null ||
+      generation === null || completedSource === null ||
+      completedSource.source_kind !== "current-open-v3" ||
+      generation.generation_record_oid !== generationEntry.commit_sha ||
+      generation.generation_id !== nextUnit.generation_id ||
+      generation.source_authority_digest !==
+        nextUnit.production_candidate_authority_digest ||
+      generation.current_open_projection_digest !==
+        nextUnit.current_open_projection_digest ||
+      generation.candidate_count !== nextUnit.candidate_count ||
+      generation.candidate_set_digest !== nextUnit.candidate_set_digest ||
+      generation.source_semantic_digest !==
+        nextUnit.source_current_open_semantic_digest ||
+      generation.lifecycle_candidate_set_digest !==
+        nextUnit.lifecycle_candidate_set_digest ||
+      generation.attachment_manifest.manifest_digest !==
+        nextUnit.attachment_manifest_digest ||
+      attachmentEvidence?.production_candidate_authority.authority_digest !==
+        nextUnit.production_candidate_authority_digest ||
+      attachmentEvidence.current_open_projection_digest !==
+        nextUnit.current_open_projection_digest ||
+      generationEntry.envelope.payload.current_open_receipt_digest !==
+        nextUnit.current_open_receipt_digest ||
+      currentDispatchCycle === null ||
+      currentDispatchCycle.generation_id !==
+        completedSource.dispatch_generation_id ||
+      emptyDispatch !== (
+        activeReservation === null &&
+        currentDispatchCycle.cycle_complete === true
       ) ||
-    classification.candidate_count !==
-      candidateCount ||
-    classification.drift_attempt_count !== attemptCount - 1 ||
-    canonicalJson(classification.drift_codes) !== canonicalJson(driftCodes) ||
-    classification.inventory_commit_budget_required !==
-      sourceBudget.inventory_commit_budget_required ||
-    classification.dispatch_commit_budget_required !==
-      sourceBudget.dispatch_commit_budget_required ||
-    classification.candidate_execution_commit_budget_required !==
-      sourceBudget.candidate_execution_commit_budget_required ||
-    classification.total_commit_budget_required !==
-      sourceBudget.total_commit_budget_required ||
-    classification.remaining_ledger_commit_capacity_after_dispatch !==
-      sourceBudget.remaining_ledger_commit_capacity_after_dispatch ||
-    checkpointState.next_unit.fresh_epoch_remaining_commit_capacity !==
-      freshBudget.remaining_ledger_commit_capacity_after_dispatch
-  ) {
-    throw ledgerError(
-      "CHECKPOINT_NEXT_UNIT_PROJECTION",
-      "mature checkpoint classification differs from its transaction prefix",
+      !emptyDispatch && (
+        activeReservation === null || currentDispatchCycle.cycle_complete
+      ) ||
+      transactionCommandAuthority === null ||
+      transactionTriggerIdentity === null ||
+      endpointDigests.some((entry) =>
+        entry !== nextUnit.repository_endpoint_receipt_digest) ||
+      digestCanonical(
+        "codex-review-gate-v2-checkpoint-stable-command-authority",
+        candidateDispatchStableCommandAuthority(transactionCommandAuthority),
+      ) !== nextUnit.stable_command_authority_digest ||
+      digestCanonical(
+        "codex-review-gate-v2-checkpoint-trigger-identity",
+        normalizeCandidateDispatchTriggerIdentity(
+          transactionTriggerIdentity,
+        ),
+      ) !== nextUnit.trigger_identity_digest ||
+      sourceBudget === null || freshBudget === null ||
+      sourceBudget.total_commit_budget_required !==
+        nextUnit.total_commit_budget_required ||
+      sourceBudget.remaining_ledger_commit_capacity_after_dispatch !==
+        nextUnit.current_epoch_remaining_commit_capacity ||
+      freshBudget.remaining_ledger_commit_capacity_after_dispatch !==
+        nextUnit.fresh_epoch_remaining_commit_capacity ||
+      sourceBudget.remaining_ledger_commit_capacity_after_dispatch >= 0 ||
+      freshBudget.remaining_ledger_commit_capacity_after_dispatch < 0
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_SUFFIX_AUTHORITY",
+        "mature current-open checkpoint does not reconstruct its admitted generation",
+      );
+    }
+    firstPlan = activeReservation === null
+      ? null
+      : createCandidateDispatchPlan(activeReservation, {
+          candidateDispatchAuthorityDigest:
+            transactionDispatchAuthority.authority_digest,
+        });
+  } else {
+    const candidateCount = transactionCandidateAuthority.completed_cycle
+      ?.cycle_receipt.open_pull_requests.length ?? null;
+    const emptyDispatch = candidateCount === 0;
+    if (
+      transactionCandidateAuthority.incomplete_cycle !== null ||
+      transactionCandidateAuthority.atomic_cycle !== null ||
+      transactionCandidateAuthority.completed_cycle?.cycle_id !==
+        checkpointState.next_unit.cycle_id ||
+      transactionCandidateAuthority.completed_cycle?.cycle_receipt
+        .receipt_digest !==
+        checkpointState.next_unit.stable_cycle_receipt_digest ||
+      currentDispatchCycle === null || candidateCount === null ||
+      emptyDispatch !== (
+        activeReservation === null &&
+        currentDispatchCycle.cycle_complete === true
+      ) ||
+      !emptyDispatch && (
+        activeReservation === null || currentDispatchCycle.cycle_complete
+      ) ||
+      transactionCommandAuthority === null ||
+      transactionTriggerIdentity === null ||
+      digestCanonical(
+        "codex-review-gate-v2-checkpoint-stable-command-authority",
+        candidateDispatchStableCommandAuthority(
+          transactionCommandAuthority,
+        ),
+      ) !== checkpointState.next_unit.stable_command_authority_digest ||
+      digestCanonical(
+        "codex-review-gate-v2-checkpoint-trigger-identity",
+        normalizeCandidateDispatchTriggerIdentity(
+          transactionTriggerIdentity,
+        ),
+      ) !== checkpointState.next_unit.trigger_identity_digest
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_SUFFIX_AUTHORITY",
+        "mature checkpoint transaction prefix does not reconstruct its next unit",
+      );
+    }
+    const classification = checkpointState.next_unit
+      .classification_projection;
+    const attemptEntries = transactionSuffix.filter((entry) =>
+      entry.envelope.record_type === "candidate-inventory-observation" &&
+      entry.envelope.payload.phase === "attempt");
+    const attemptCount = attemptEntries.length;
+    const driftCodes = attemptEntries.slice(0, -1).map((entry) =>
+      entry.envelope.payload.outcome);
+    const attemptEvidence = attemptEntries.map((entry) =>
+      candidateInventoryAttachmentEvidence(entry));
+    if (attemptEvidence.some((evidence) => evidence === null)) {
+      throw ledgerError(
+        "CHECKPOINT_NEXT_UNIT_ATTACHMENT",
+        "mature checkpoint transaction lacks one attempt attachment",
+      );
+    }
+    const stableAttempt = attemptEvidence.at(-1);
+    const budgetCycle = {
+      shard_receipts: stableAttempt.shard_receipts,
+      cycle_receipt:
+        transactionCandidateAuthority.completed_cycle.cycle_receipt,
+    };
+    const budgetDriftAttempts = attemptEvidence.slice(0, -1).map(
+      (evidence) => ({ shard_receipts: evidence.shard_receipts }),
     );
+    const sourceBudget = candidateInventoryCycleCommitBudgetAtRecordCount({
+      state: "persist-required",
+      reachableRecordCount: checkpointState.source.commit_count,
+      driftAttempts: budgetDriftAttempts,
+      cycle: budgetCycle,
+    });
+    const freshBudget = candidateInventoryCycleCommitBudgetAtRecordCount({
+      state: "persist-required",
+      reachableRecordCount: 1,
+      driftAttempts: budgetDriftAttempts,
+      cycle: budgetCycle,
+    });
+    if (
+      checkpointState.next_unit.semantic_record_count !== attemptCount + 3 ||
+      classification.semantic_inventory_digest !==
+        candidateInventoryCycleSemanticDigest(
+          transactionCandidateAuthority.completed_cycle.cycle_receipt,
+        ) ||
+      classification.candidate_count !== candidateCount ||
+      classification.drift_attempt_count !== attemptCount - 1 ||
+      canonicalJson(classification.drift_codes) !== canonicalJson(driftCodes) ||
+      classification.inventory_commit_budget_required !==
+        sourceBudget.inventory_commit_budget_required ||
+      classification.dispatch_commit_budget_required !==
+        sourceBudget.dispatch_commit_budget_required ||
+      classification.candidate_execution_commit_budget_required !==
+        sourceBudget.candidate_execution_commit_budget_required ||
+      classification.total_commit_budget_required !==
+        sourceBudget.total_commit_budget_required ||
+      classification.remaining_ledger_commit_capacity_after_dispatch !==
+        sourceBudget.remaining_ledger_commit_capacity_after_dispatch ||
+      checkpointState.next_unit.fresh_epoch_remaining_commit_capacity !==
+        freshBudget.remaining_ledger_commit_capacity_after_dispatch
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_NEXT_UNIT_PROJECTION",
+        "mature checkpoint classification differs from its transaction prefix",
+      );
+    }
+    firstPlan = activeReservation === null
+      ? null
+      : createCandidateDispatchPlan(activeReservation);
   }
-  const firstPlan = activeReservation === null
-    ? null
-    : createCandidateDispatchPlan(activeReservation);
   const futureState = matureCheckpointFutureState({
     checkpointCommitSha: checkpointRoot.commit_sha,
     checkpointState,
@@ -26037,10 +26614,12 @@ async function loadStableMatureCheckpointChain({
       "mature checkpoint semantic query exceeds its first-slice cap",
     );
   }
-  const queryState = projectChainState(
-    queryRecords,
-    suffixRecords.at(-1).envelope.server_observed_at,
-  );
+  const queryState = suffixRecords.length === transactionSuffixCount
+    ? transactionState
+    : projectChainState(
+      queryRecords,
+      suffixRecords.at(-1).envelope.server_observed_at,
+    );
   assertOperationCurrent();
   const postRef = await readRef({
     fetchImpl,
@@ -26125,7 +26704,7 @@ async function loadStableBootstrapCheckpointChain({
   let suffixRecords = [...reverseSuffixRecords].reverse();
   const suffixCount = suffixRecords.length;
   if (
-    suffixCount < 4 ||
+    suffixCount < 2 ||
     suffixCount > MAX_V2_GIT_LEDGER_COMMITS - 1 ||
     suffixRecords.at(-1).envelope.sequence !== suffixCount ||
     checkpointRoot.parents.length !== 1
@@ -26191,7 +26770,10 @@ async function loadStableBootstrapCheckpointChain({
       assertOperationCurrent,
     });
   }
-  if (suffixCount > MAX_V2_CANDIDATE_SCAN_PASSES + 3) {
+  if (
+    suffixCount < 4 ||
+    suffixCount > MAX_V2_CANDIDATE_SCAN_PASSES + 3
+  ) {
     throw ledgerError(
       "CHECKPOINT_SUFFIX_CAP",
       "bootstrap checkpoint suffix exceeds its closed next-unit profile",
@@ -34703,9 +35285,64 @@ function buildMatureCheckpointState({
 }) {
   const sourceManifest = checkpointRecordManifest(rawSource.records);
   const capabilityActivation = matureCheckpointCapabilityActivation(rawSource);
+  const currentOpenNextUnit = admissionPrivate.next_unit_profile ===
+    MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE;
+  const nextUnit = currentOpenNextUnit
+    ? {
+        profile: admissionHandle.profile,
+        kind: admissionHandle.next_unit_kind,
+        admission_digest: admissionHandle.next_unit_admission_digest,
+        generation_id: admissionHandle.generation_id,
+        current_open_receipt_digest:
+          admissionHandle.current_open_receipt_digest,
+        current_open_projection_digest:
+          admissionHandle.current_open_projection_digest,
+        production_candidate_authority_digest:
+          admissionHandle.production_candidate_authority_digest,
+        candidate_count: admissionHandle.candidate_count,
+        candidate_set_digest: admissionHandle.candidate_set_digest,
+        source_current_open_semantic_digest:
+          admissionHandle.source_current_open_semantic_digest,
+        lifecycle_candidate_set_digest:
+          admissionHandle.lifecycle_candidate_set_digest,
+        attachment_manifest_digest:
+          admissionHandle.attachment_manifest_digest,
+        stable_command_authority_digest:
+          admissionHandle.stable_command_authority_digest,
+        trigger_identity_digest: admissionHandle.trigger_identity_digest,
+        repository_endpoint_receipt_digest:
+          admissionHandle.repository_endpoint_receipt_digest,
+        semantic_record_count: 2,
+        total_commit_budget_required:
+          admissionHandle.total_commit_budget_required,
+        current_epoch_remaining_commit_capacity:
+          admissionHandle.current_epoch_remaining_commit_capacity,
+        fresh_epoch_remaining_commit_capacity:
+          admissionHandle.fresh_epoch_remaining_commit_capacity,
+      }
+    : {
+        kind: admissionHandle.next_unit_kind,
+        admission_digest: admissionHandle.next_unit_admission_digest,
+        cycle_id: admissionHandle.cycle_id,
+        stable_cycle_receipt_digest:
+          admissionHandle.stable_cycle_receipt_digest,
+        stable_command_authority_digest:
+          admissionHandle.stable_command_authority_digest,
+        trigger_identity_digest: admissionHandle.trigger_identity_digest,
+        projection_digest: admissionHandle.projection_digest,
+        classification_projection:
+          structuredClone(admissionPrivate.projection),
+        semantic_record_count: admissionPrivate.drift_attempts.length + 4,
+        total_commit_budget_required:
+          admissionHandle.total_commit_budget_required,
+        current_epoch_remaining_commit_capacity:
+          admissionHandle.current_epoch_remaining_commit_capacity,
+        fresh_epoch_remaining_commit_capacity:
+          admissionHandle.fresh_epoch_remaining_commit_capacity,
+      };
   const withoutDigest = {
     schema: V2_GIT_LEDGER_CHECKPOINT_STATE_SCHEMA,
-    schema_version: 2,
+    schema_version: currentOpenNextUnit ? 3 : 2,
     profile: MATURE_CHECKPOINT_PROFILE,
     repository: structuredClone(repository),
     ledger_ref: ledgerRef,
@@ -34742,26 +35379,7 @@ function buildMatureCheckpointState({
         rawSource.authority_projection.candidate_dispatch.authority_digest,
       observed_at: rawSource.observed_at,
     },
-    next_unit: {
-      kind: admissionHandle.next_unit_kind,
-      admission_digest: admissionHandle.next_unit_admission_digest,
-      cycle_id: admissionHandle.cycle_id,
-      stable_cycle_receipt_digest:
-        admissionHandle.stable_cycle_receipt_digest,
-      stable_command_authority_digest:
-        admissionHandle.stable_command_authority_digest,
-      trigger_identity_digest: admissionHandle.trigger_identity_digest,
-      projection_digest: admissionHandle.projection_digest,
-      classification_projection:
-        structuredClone(admissionPrivate.projection),
-      semantic_record_count: admissionPrivate.drift_attempts.length + 4,
-      total_commit_budget_required:
-        admissionHandle.total_commit_budget_required,
-      current_epoch_remaining_commit_capacity:
-        admissionHandle.current_epoch_remaining_commit_capacity,
-      fresh_epoch_remaining_commit_capacity:
-        admissionHandle.fresh_epoch_remaining_commit_capacity,
-    },
+    next_unit: nextUnit,
   };
   return deepFreeze({
     ...withoutDigest,
@@ -34779,9 +35397,11 @@ function validateMatureCheckpointState(value) {
     "epoch_id", "epoch_sequence", "source", "next_unit",
     "checkpoint_state_digest",
   ], "mature checkpoint state");
+  const currentOpenNextUnit = value.schema_version === 3;
   if (
     value.schema !== V2_GIT_LEDGER_CHECKPOINT_STATE_SCHEMA ||
-    value.schema_version !== 2 || value.profile !== MATURE_CHECKPOINT_PROFILE ||
+    !new Set([2, 3]).has(value.schema_version) ||
+    value.profile !== MATURE_CHECKPOINT_PROFILE ||
     value.epoch_sequence !== 0
   ) {
     throw ledgerError(
@@ -34863,93 +35483,193 @@ function validateMatureCheckpointState(value) {
     );
   }
   assertObject(value.next_unit, "mature checkpoint next unit");
-  exactKeys(value.next_unit, [
-    "kind", "admission_digest", "cycle_id",
-    "stable_cycle_receipt_digest", "stable_command_authority_digest",
-    "trigger_identity_digest", "projection_digest",
-    "classification_projection", "semantic_record_count",
-    "total_commit_budget_required",
-    "current_epoch_remaining_commit_capacity",
-    "fresh_epoch_remaining_commit_capacity",
-  ], "mature checkpoint next unit");
-  if (
-    value.next_unit.kind !== "candidate-inventory-cycle" ||
-    value.next_unit.semantic_record_count < 4 ||
-    value.next_unit.semantic_record_count > MAX_V2_CANDIDATE_SCAN_PASSES + 3
-  ) {
-    throw ledgerError(
-      "CHECKPOINT_NEXT_UNIT_SCHEMA",
-      "mature checkpoint next unit is outside its closed profile",
+  let expectedAdmissionDigest;
+  if (currentOpenNextUnit) {
+    exactKeys(value.next_unit, [
+      "profile", "kind", "admission_digest", "generation_id",
+      "current_open_receipt_digest", "current_open_projection_digest",
+      "production_candidate_authority_digest", "candidate_count",
+      "candidate_set_digest", "source_current_open_semantic_digest",
+      "lifecycle_candidate_set_digest", "attachment_manifest_digest",
+      "stable_command_authority_digest", "trigger_identity_digest",
+      "repository_endpoint_receipt_digest", "semantic_record_count",
+      "total_commit_budget_required",
+      "current_epoch_remaining_commit_capacity",
+      "fresh_epoch_remaining_commit_capacity",
+    ], "mature current-open checkpoint next unit");
+    if (
+      value.next_unit.profile !== MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE ||
+      value.next_unit.kind !== "current-open-generation" ||
+      value.next_unit.semantic_record_count !== 2 ||
+      !CANDIDATE_SOURCE_GENERATION_ID.test(value.next_unit.generation_id)
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_NEXT_UNIT_SCHEMA",
+        "mature current-open checkpoint next unit is outside its closed profile",
+      );
+    }
+    integerBetween(
+      value.next_unit.candidate_count,
+      0,
+      MAX_V2_CANDIDATE_DISPATCH_CYCLE_ITEMS,
+      "mature current-open checkpoint candidate count",
     );
-  }
-  boundedString(value.next_unit.cycle_id, "mature checkpoint cycle_id", 128);
-  for (const field of [
-    "admission_digest", "stable_cycle_receipt_digest",
-    "stable_command_authority_digest", "trigger_identity_digest",
-    "projection_digest",
-  ]) digest(value.next_unit[field], `mature checkpoint next unit ${field}`);
-  positiveInteger(
-    value.next_unit.total_commit_budget_required,
-    "mature checkpoint next unit total commit budget",
-  );
-  integerBetween(
-    value.next_unit.current_epoch_remaining_commit_capacity,
-    -MAX_V2_GIT_LEDGER_COMMITS,
-    MAX_V2_GIT_LEDGER_COMMITS,
-    "mature checkpoint current epoch remaining capacity",
-  );
-  integerBetween(
-    value.next_unit.fresh_epoch_remaining_commit_capacity,
-    -MAX_V2_GIT_LEDGER_COMMITS,
-    MAX_V2_GIT_LEDGER_COMMITS,
-    "mature checkpoint fresh epoch remaining capacity",
-  );
-  const classification =
-    validateCandidateInventoryCycleClassificationProjection(
-      value.next_unit.classification_projection,
-    );
-  const classificationDigest = classification.projection_digest;
-  if (
-    digest(classificationDigest, "mature checkpoint classification digest") !==
-      value.next_unit.projection_digest ||
-    classification.state !== "checkpoint-required" ||
-    classification.source_tip_commit_sha !== value.source.tip_commit_sha ||
-    classification.source_commit_count !== value.source.commit_count ||
-    classification.total_commit_budget_required !==
-      value.next_unit.total_commit_budget_required ||
-    classification.remaining_ledger_commit_capacity_after_dispatch !==
-      value.next_unit.current_epoch_remaining_commit_capacity
-  ) {
-    throw ledgerError(
-      "CHECKPOINT_NEXT_UNIT_PROJECTION",
-      "mature checkpoint classification differs from admission",
-    );
-  }
-  const admissionFacts = {
-    schema: V2_GIT_LEDGER_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE_SCHEMA,
-    schema_version: 1,
-    repository: structuredClone(repository),
-    ledger_ref: ledgerRef,
-    source_load_digest: value.source.source_load_digest,
-    next_unit_kind: value.next_unit.kind,
-    cycle_id: value.next_unit.cycle_id,
-    stable_cycle_receipt_digest:
-      value.next_unit.stable_cycle_receipt_digest,
-    stable_command_authority_digest:
-      value.next_unit.stable_command_authority_digest,
-    trigger_identity_digest: value.next_unit.trigger_identity_digest,
-    projection_digest: value.next_unit.projection_digest,
-    total_commit_budget_required:
+    for (const field of [
+      "admission_digest", "current_open_receipt_digest",
+      "current_open_projection_digest",
+      "production_candidate_authority_digest", "candidate_set_digest",
+      "source_current_open_semantic_digest",
+      "lifecycle_candidate_set_digest", "attachment_manifest_digest",
+      "stable_command_authority_digest", "trigger_identity_digest",
+      "repository_endpoint_receipt_digest",
+    ]) digest(value.next_unit[field],
+      `mature current-open checkpoint next unit ${field}`);
+    positiveInteger(
       value.next_unit.total_commit_budget_required,
-    current_epoch_remaining_commit_capacity:
+      "mature current-open checkpoint total commit budget",
+    );
+    integerBetween(
       value.next_unit.current_epoch_remaining_commit_capacity,
-    fresh_epoch_remaining_commit_capacity:
+      -MAX_V2_GIT_LEDGER_COMMITS,
+      -1,
+      "mature current-open checkpoint current epoch remaining capacity",
+    );
+    integerBetween(
       value.next_unit.fresh_epoch_remaining_commit_capacity,
-  };
-  if (value.next_unit.admission_digest !== digestCanonical(
-    "codex-review-gate-v2-checkpoint-next-unit-admission",
-    admissionFacts,
-  )) {
+      0,
+      MAX_V2_GIT_LEDGER_COMMITS,
+      "mature current-open checkpoint fresh epoch remaining capacity",
+    );
+    const admissionFacts = {
+      schema: V2_GIT_LEDGER_CURRENT_OPEN_CHECKPOINT_ADMISSION_SCHEMA,
+      schema_version: 1,
+      profile: value.next_unit.profile,
+      repository: structuredClone(repository),
+      ledger_ref: ledgerRef,
+      source_load_digest: value.source.source_load_digest,
+      next_unit_kind: value.next_unit.kind,
+      generation_id: value.next_unit.generation_id,
+      current_open_receipt_digest:
+        value.next_unit.current_open_receipt_digest,
+      current_open_projection_digest:
+        value.next_unit.current_open_projection_digest,
+      production_candidate_authority_digest:
+        value.next_unit.production_candidate_authority_digest,
+      candidate_count: value.next_unit.candidate_count,
+      candidate_set_digest: value.next_unit.candidate_set_digest,
+      source_current_open_semantic_digest:
+        value.next_unit.source_current_open_semantic_digest,
+      lifecycle_candidate_set_digest:
+        value.next_unit.lifecycle_candidate_set_digest,
+      attachment_manifest_digest:
+        value.next_unit.attachment_manifest_digest,
+      stable_command_authority_digest:
+        value.next_unit.stable_command_authority_digest,
+      trigger_identity_digest: value.next_unit.trigger_identity_digest,
+      repository_endpoint_receipt_digest:
+        value.next_unit.repository_endpoint_receipt_digest,
+      total_commit_budget_required:
+        value.next_unit.total_commit_budget_required,
+      current_epoch_remaining_commit_capacity:
+        value.next_unit.current_epoch_remaining_commit_capacity,
+      fresh_epoch_remaining_commit_capacity:
+        value.next_unit.fresh_epoch_remaining_commit_capacity,
+    };
+    expectedAdmissionDigest = digestCanonical(
+      "codex-review-gate-v2-current-open-checkpoint-admission",
+      admissionFacts,
+    );
+  } else {
+    exactKeys(value.next_unit, [
+      "kind", "admission_digest", "cycle_id",
+      "stable_cycle_receipt_digest", "stable_command_authority_digest",
+      "trigger_identity_digest", "projection_digest",
+      "classification_projection", "semantic_record_count",
+      "total_commit_budget_required",
+      "current_epoch_remaining_commit_capacity",
+      "fresh_epoch_remaining_commit_capacity",
+    ], "mature checkpoint next unit");
+    if (
+      value.next_unit.kind !== "candidate-inventory-cycle" ||
+      value.next_unit.semantic_record_count < 4 ||
+      value.next_unit.semantic_record_count > MAX_V2_CANDIDATE_SCAN_PASSES + 3
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_NEXT_UNIT_SCHEMA",
+        "mature checkpoint next unit is outside its closed profile",
+      );
+    }
+    boundedString(value.next_unit.cycle_id, "mature checkpoint cycle_id", 128);
+    for (const field of [
+      "admission_digest", "stable_cycle_receipt_digest",
+      "stable_command_authority_digest", "trigger_identity_digest",
+      "projection_digest",
+    ]) digest(value.next_unit[field], `mature checkpoint next unit ${field}`);
+    positiveInteger(
+      value.next_unit.total_commit_budget_required,
+      "mature checkpoint next unit total commit budget",
+    );
+    integerBetween(
+      value.next_unit.current_epoch_remaining_commit_capacity,
+      -MAX_V2_GIT_LEDGER_COMMITS,
+      MAX_V2_GIT_LEDGER_COMMITS,
+      "mature checkpoint current epoch remaining capacity",
+    );
+    integerBetween(
+      value.next_unit.fresh_epoch_remaining_commit_capacity,
+      -MAX_V2_GIT_LEDGER_COMMITS,
+      MAX_V2_GIT_LEDGER_COMMITS,
+      "mature checkpoint fresh epoch remaining capacity",
+    );
+    const classification =
+      validateCandidateInventoryCycleClassificationProjection(
+        value.next_unit.classification_projection,
+      );
+    const classificationDigest = classification.projection_digest;
+    if (
+      digest(classificationDigest,
+        "mature checkpoint classification digest") !==
+        value.next_unit.projection_digest ||
+      classification.state !== "checkpoint-required" ||
+      classification.source_tip_commit_sha !== value.source.tip_commit_sha ||
+      classification.source_commit_count !== value.source.commit_count ||
+      classification.total_commit_budget_required !==
+        value.next_unit.total_commit_budget_required ||
+      classification.remaining_ledger_commit_capacity_after_dispatch !==
+        value.next_unit.current_epoch_remaining_commit_capacity
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_NEXT_UNIT_PROJECTION",
+        "mature checkpoint classification differs from admission",
+      );
+    }
+    const admissionFacts = {
+      schema: V2_GIT_LEDGER_CHECKPOINT_NEXT_UNIT_ADMISSION_HANDLE_SCHEMA,
+      schema_version: 1,
+      repository: structuredClone(repository),
+      ledger_ref: ledgerRef,
+      source_load_digest: value.source.source_load_digest,
+      next_unit_kind: value.next_unit.kind,
+      cycle_id: value.next_unit.cycle_id,
+      stable_cycle_receipt_digest:
+        value.next_unit.stable_cycle_receipt_digest,
+      stable_command_authority_digest:
+        value.next_unit.stable_command_authority_digest,
+      trigger_identity_digest: value.next_unit.trigger_identity_digest,
+      projection_digest: value.next_unit.projection_digest,
+      total_commit_budget_required:
+        value.next_unit.total_commit_budget_required,
+      current_epoch_remaining_commit_capacity:
+        value.next_unit.current_epoch_remaining_commit_capacity,
+      fresh_epoch_remaining_commit_capacity:
+        value.next_unit.fresh_epoch_remaining_commit_capacity,
+    };
+    expectedAdmissionDigest = digestCanonical(
+      "codex-review-gate-v2-checkpoint-next-unit-admission",
+      admissionFacts,
+    );
+  }
+  if (value.next_unit.admission_digest !== expectedAdmissionDigest) {
     throw ledgerError(
       "CHECKPOINT_NEXT_UNIT_ADMISSION",
       "mature checkpoint next-unit admission digest is invalid",
@@ -36373,6 +37093,257 @@ async function planBootstrapCheckpointCandidateSuffix({
     return entry;
   };
 
+  if (admissionPrivate.next_unit_profile ===
+      MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE) {
+    const admissionHandle = admissionPrivate.next_unit_admission_handle;
+    const priorCandidateAuthority =
+      deriveV2GitLedgerCandidateInventoryAuthority(
+        semanticSourceRecords,
+        repository,
+      );
+    const publication = prepareCurrentOpenGenerationPublication({
+      authority: admissionPrivate.normalized_production_candidate_authority,
+      projection: admissionPrivate.normalized_projection,
+      priorCandidateAuthority,
+      commandAuthority,
+    });
+    const publicationBinding = {
+      generation_id: publication.generation_id,
+      current_open_receipt_digest: publication.current_open_receipt_digest,
+      current_open_projection_digest:
+        publication.current_open_projection_digest,
+      production_candidate_authority_digest:
+        publication.production_candidate_authority.authority_digest,
+      candidate_count:
+        publication.production_candidate_authority.candidate_count,
+      candidate_set_digest:
+        publication.production_candidate_authority.candidate_set_digest,
+      source_current_open_semantic_digest:
+        publication.production_candidate_authority
+          .source_current_open_semantic_digest,
+      lifecycle_candidate_set_digest:
+        publication.lifecycle_candidate_set_digest,
+      attachment_manifest_digest: publication.manifest.manifest_digest,
+    };
+    const admissionBinding = Object.fromEntries(
+      Object.keys(publicationBinding).map((key) => [key, admissionHandle[key]]),
+    );
+    const candidateCount = publication.production_candidate_authority
+      .candidate_count;
+    const batchCount = candidateCount === 0
+      ? 0
+      : Math.ceil(candidateCount / MAX_V2_CANDIDATE_DISPATCH_ITEMS);
+    const currentEpochBudget =
+      calculateCurrentOpenCheckpointCommitBudget({
+        candidate_count: candidateCount,
+        batch_count: batchCount,
+        source_record_count: semanticSourceRecords.length,
+      });
+    const freshEpochBudget =
+      calculateCurrentOpenCheckpointCommitBudget({
+        candidate_count: candidateCount,
+        batch_count: batchCount,
+        source_record_count: 1,
+      });
+    if (
+      priorCandidateAuthority.authority_digest !==
+        admissionPrivate.source_load_handle
+          .candidate_inventory_authority_digest ||
+      canonicalJson(publicationBinding) !== canonicalJson(admissionBinding) ||
+      canonicalJson(currentEpochBudget) !==
+        canonicalJson(admissionPrivate.current_epoch_budget) ||
+      canonicalJson(freshEpochBudget) !==
+        canonicalJson(admissionPrivate.fresh_epoch_budget) ||
+      admissionHandle.total_commit_budget_required !==
+        currentEpochBudget.total_commit_budget_required ||
+      admissionHandle.current_epoch_remaining_commit_capacity !==
+        currentEpochBudget.remaining_ledger_commit_capacity_after_dispatch ||
+      admissionHandle.fresh_epoch_remaining_commit_capacity !==
+        freshEpochBudget.remaining_ledger_commit_capacity_after_dispatch ||
+      currentEpochBudget.remaining_ledger_commit_capacity_after_dispatch >= 0 ||
+      freshEpochBudget.remaining_ledger_commit_capacity_after_dispatch < 0 ||
+      admissionHandle.stable_command_authority_digest !== digestCanonical(
+        "codex-review-gate-v2-checkpoint-stable-command-authority",
+        candidateDispatchStableCommandAuthority(commandAuthority),
+      ) ||
+      admissionHandle.trigger_identity_digest !== digestCanonical(
+        "codex-review-gate-v2-checkpoint-trigger-identity",
+        normalizeCandidateDispatchTriggerIdentity(triggerIdentity),
+      ) ||
+      admissionHandle.repository_endpoint_receipt_digest !== digestCanonical(
+        "codex-review-gate-v2-checkpoint-repository-endpoint-receipt",
+        repositoryEndpointReceipt,
+      )
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_NEXT_UNIT_PROJECTION",
+        "current-open checkpoint admission differs from its fresh normalized authority",
+      );
+    }
+    const owner = candidateDispatchOwner(commandAuthority);
+    const generationPayload = currentOpenGenerationPayload({
+      authority: priorCandidateAuthority,
+      owner,
+      publication,
+    });
+    const generationRecord = createV2GitLedgerCandidateInventoryRecord({
+      predecessor_commit_sha: predecessorCommitSha,
+      owner,
+      server_observed_at: priorServerTime,
+      payload: generationPayload,
+    });
+    await stageRecord({
+      record: generationRecord,
+      evaluatedScopeReceipt:
+        createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt({
+          repository,
+          payload: generationPayload,
+          trigger_identity: triggerIdentity,
+          repository_endpoint_receipt: repositoryEndpointReceipt,
+        }),
+      validateTransition: (authoritative) =>
+        validateCandidateInventoryTransition(
+          semanticRecords(),
+          authoritative,
+          repository,
+          { currentAuthority: priorCandidateAuthority },
+        ),
+      candidateInventoryAttachment: publication,
+    });
+    const candidateAuthority =
+      deriveV2GitLedgerCandidateInventoryAuthority(
+        semanticRecords(),
+        repository,
+      );
+    const dispatchAuthority = deriveV2GitLedgerCandidateDispatchAuthority(
+      semanticRecords(),
+      repository,
+    );
+    const completedSource = candidateInventoryCompletedSource(
+      candidateAuthority,
+    );
+    if (
+      completedSource === null ||
+      completedSource.source_kind !== "current-open-v3" ||
+      completedSource.generation_id !== admissionHandle.generation_id
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_NEXT_UNIT_MISMATCH",
+        "current-open checkpoint suffix did not produce its admitted generation",
+      );
+    }
+    const reachableBeforeDispatch = 2;
+    const reservation = createCandidateDispatchReservation({
+      repository,
+      candidateAuthority,
+      dispatchAuthority,
+      sourceTipCommitSha: predecessorCommitSha,
+      reachableRecordCount: reachableBeforeDispatch,
+      commandAuthority,
+      triggerIdentity,
+    });
+    let dispatchPayload;
+    if (reservation === null) {
+      const emptyCycle = newCandidateDispatchCycle({
+        repository,
+        candidateAuthority,
+        completed: null,
+        candidates: [],
+        batchCount: 0,
+      });
+      dispatchPayload = createCandidateDispatchPayload({
+        phase: "cycle-complete",
+        dispatchAuthority,
+        candidateAuthority,
+        commandAuthority,
+        triggerIdentity,
+        cycleCompletion: createCandidateDispatchCycleCompletion(emptyCycle),
+      });
+    } else {
+      dispatchPayload = createCandidateDispatchPayload({
+        phase: "reserve",
+        dispatchAuthority,
+        candidateAuthority,
+        commandAuthority,
+        triggerIdentity,
+        reservation,
+      });
+    }
+    const dispatchRecord = createV2GitLedgerCandidateDispatchRecord({
+      predecessor_commit_sha: predecessorCommitSha,
+      server_observed_at: priorServerTime,
+      payload: dispatchPayload,
+    });
+    await stageRecord({
+      record: dispatchRecord,
+      evaluatedScopeReceipt:
+        createV2GitLedgerCandidateDispatchEvaluatedScopeReceipt({
+          repository,
+          payload: dispatchPayload,
+          trigger_identity: triggerIdentity,
+          repository_endpoint_receipt: repositoryEndpointReceipt,
+        }),
+      validateTransition: (authoritative) =>
+        validateCandidateDispatchTransition(
+          semanticRecords(),
+          authoritative,
+          repository,
+          { reachableRecordCount: reachableBeforeDispatch },
+        ),
+    });
+    const finalDispatchAuthority =
+      deriveV2GitLedgerCandidateDispatchAuthority(
+        semanticRecords(),
+        repository,
+      );
+    const activeReservation = finalDispatchAuthority.active_reservation;
+    const currentCycle = finalDispatchAuthority.current_cycle;
+    if (
+      stagedRecords.length !== 2 || currentCycle === null ||
+      currentCycle.generation_id !== completedSource.dispatch_generation_id ||
+      (reservation === null
+        ? activeReservation !== null || currentCycle.cycle_complete !== true
+        : activeReservation?.reservation.reservation_digest !==
+            reservation.reservation_digest || currentCycle.cycle_complete)
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_NEXT_UNIT_MISMATCH",
+        "current-open checkpoint suffix lacks its exact first dispatch boundary",
+      );
+    }
+    const firstPlan = activeReservation === null
+      ? null
+      : createCandidateDispatchPlan(activeReservation, {
+          candidateDispatchAuthorityDigest:
+            finalDispatchAuthority.authority_digest,
+        });
+    const firstPlanBytes = firstPlan === null
+      ? 0
+      : Buffer.byteLength(canonicalJson(firstPlan), "utf8");
+    if (
+      firstPlan !== null &&
+      (firstPlan.schema_version !== 2 ||
+        firstPlanBytes > candidateDispatchPlanByteCap(firstPlan))
+    ) {
+      throw ledgerError(
+        "CHECKPOINT_DISPATCH_PLAN_UNREPRESENTABLE",
+        "current-open checkpoint cannot expose one bounded first dispatch plan",
+      );
+    }
+    assertAdmissionCurrent();
+    return {
+      records: stagedRecords,
+      plans: stagedPlans,
+      attachments: stagedAttachments,
+      transaction_tip_commit_sha: predecessorCommitSha,
+      semantic_record_count: stagedRecords.length,
+      first_dispatch_plan: firstPlan,
+      first_dispatch_plan_bytes: firstPlanBytes,
+      consumed_provenance_identities: consumedJtis,
+      current_open_publication: publication,
+    };
+  }
+
   const emptyInventoryAuthority =
     deriveV2GitLedgerCandidateInventoryAuthority(
       semanticSourceRecords,
@@ -37185,19 +38156,22 @@ async function publishMatureCheckpointCandidateTransaction({
   assertAdmissionCurrent,
 }) {
   assertAdmissionCurrent();
-  let rawSource = await loadStableChain({
-    fetchImpl,
-    authorization,
-    base,
-    repoPath,
-    ref,
-    refSuffix,
-    repo,
-    verifyWorkflowProvenance,
-    provenanceBudget,
-    requestBudget,
-    assertOperationCurrent: assertAdmissionCurrent,
-  });
+  let rawSource = admissionPrivate.next_unit_profile ===
+      MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE
+    ? sourcePrivate.stable_chain
+    : await loadStableChain({
+        fetchImpl,
+        authorization,
+        base,
+        repoPath,
+        ref,
+        refSuffix,
+        repo,
+        verifyWorkflowProvenance,
+        provenanceBudget,
+        requestBudget,
+        assertOperationCurrent: assertAdmissionCurrent,
+      });
   assertAdmissionCurrent();
   await validateStoredProviderIdentityAuthorities(
     rawSource.records,
@@ -37445,6 +38419,13 @@ async function publishMatureCheckpointCandidateTransaction({
     throw ledgerError(
       "CHECKPOINT_SOURCE_STALE",
       "mature checkpoint final source fence changed or regressed",
+    );
+  }
+  if (admissionPrivate.next_unit_profile ===
+      MATURE_CURRENT_OPEN_NEXT_UNIT_PROFILE) {
+    consumeV2CurrentOpenProductionCandidateAuthorityHandle(
+      admissionPrivate.production_candidate_authority_handle,
+      admissionPrivate.projection_handle,
     );
   }
   const capacity = assertCheckpointTransactionPlanCapacity({
