@@ -96,7 +96,6 @@ import {
   validateV2GitLedgerDiscoveryContinuityReceipt,
   validateV2GitLedgerEstablishedRunnerStateAuthority,
   validateV2GitLedgerInitialRunnerStateAuthority,
-  validateV2GitLedgerRecord,
 } from "../packages/action/src/v2/git-ledger.mjs";
 import {
   assertV2ProductionRunnerAuthorityHandle,
@@ -383,7 +382,7 @@ test("public raw effect append seams reject effect identities before writes",
     });
   });
 
-test("public append cannot replace one validated null-effect snapshot through later accessor values",
+test("public append cannot replace one validated null-effect snapshot through later source mutation",
   async () => {
     const fixture = githubGitFixture();
     const ledger = makeLedger(fixture);
@@ -420,49 +419,17 @@ test("public append cannot replace one validated null-effect snapshot through la
       idempotencyKey: "accessor-late-effect-key",
       at: boundary,
     });
-    const keys = Object.keys(nullEffectRecord);
-    assert.deepEqual(keys, Object.keys(effect));
-    assert.equal(keys.at(-1), "record_digest");
-
-    const accessorRecord = ({ onRecordDigestRead, selectRecord }) => {
-      const record = {};
-      for (const key of keys) {
-        Object.defineProperty(record, key, {
-          enumerable: true,
-          configurable: false,
-          get() {
-            const selected = selectRecord();
-            const value = selected[key];
-            if (key === "record_digest") onRecordDigestRead();
-            return value;
-          },
-        });
-      }
-      return record;
-    };
-
-    let validationRecordDigestReads = 0;
-    const probe = accessorRecord({
-      onRecordDigestRead() {
-        validationRecordDigestReads += 1;
-      },
-      selectRecord: () => nullEffectRecord,
-    });
-    assert.deepEqual(validateV2GitLedgerRecord(probe), nullEffectRecord);
-    assert.ok(validationRecordDigestReads > 0);
-
-    let nullSnapshotReadsRemaining = validationRecordDigestReads;
+    const switchingRecord = structuredClone(nullEffectRecord);
+    const effectReplacement = structuredClone(effect);
     let effectIdentityVisible = false;
-    const switchingRecord = accessorRecord({
-      onRecordDigestRead() {
-        if (!effectIdentityVisible) {
-          nullSnapshotReadsRemaining -= 1;
-          if (nullSnapshotReadsRemaining === 0) {
-            effectIdentityVisible = true;
-          }
-        }
+    const authority = {};
+    Object.defineProperty(authority, "evaluated_scope_receipt", {
+      enumerable: true,
+      get() {
+        Object.assign(switchingRecord, effectReplacement);
+        effectIdentityVisible = true;
+        return discovery.effect_evaluated_scope_receipt;
       },
-      selectRecord: () => effectIdentityVisible ? effect : nullEffectRecord,
     });
     const before = {
       write_calls: fixture.writeCalls,
@@ -477,10 +444,7 @@ test("public append cannot replace one validated null-effect snapshot through la
         ]).has(path)).length,
     };
     await assert.rejects(
-      ledger.appendRecord(switchingRecord, {
-        evaluated_scope_receipt:
-          discovery.effect_evaluated_scope_receipt,
-      }),
+      ledger.appendRecord(switchingRecord, authority),
       (error) => error.code === "lease-scope-authority-mismatch",
     );
     assert.equal(effectIdentityVisible, true);
