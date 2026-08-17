@@ -11,6 +11,9 @@ export const PUBLIC_NO_START_CONFIRMATION_MS = 15 * 60 * 1000;
 export const PRIVATE_RECONCILIATION_INTERVAL_MS = 2 * 60 * 60 * 1000;
 export const PRIVATE_INCONCLUSIVE_AFTER_MS = 6 * 60 * 60 * 1000;
 export const MAX_EXACT_STATUS_WRITES = 1_000;
+export const V2_PUBLIC_WAIT_COMPLETION_SCHEMA =
+  "codex-review-gate-public-wait-completion-v2";
+export const MAX_V2_PUBLIC_WAIT_COMPLETIONS = 9;
 
 export const V2_SCHEDULER_TRIGGERS = Object.freeze([
   "initial",
@@ -42,6 +45,7 @@ const INPUT_KEYS = Object.freeze([
   "complete_snapshots",
   "status",
   "applied_action_keys",
+  "wait_completions",
 ]);
 const EPOCH_KEYS = Object.freeze([
   "id",
@@ -92,6 +96,53 @@ const STATUS_KEYS = Object.freeze([
   "exact_sha_context_count",
   "latest_idempotency_key",
 ]);
+const WAIT_COMPLETION_KEYS = Object.freeze([
+  "schema",
+  "schema_version",
+  "repository",
+  "pull_request",
+  "head_ref_oid",
+  "epoch_id",
+  "generation_index",
+  "stage",
+  "deadline",
+  "completed_at",
+  "environment",
+  "trusted_workflow",
+  "run",
+  "source_observation_record_oid",
+  "stage_nonce",
+  "receipt_digest",
+]);
+const WAIT_COMPLETION_REPOSITORY_KEYS = Object.freeze(["owner", "name"]);
+const WAIT_COMPLETION_PULL_REQUEST_KEYS = Object.freeze(["number"]);
+const WAIT_COMPLETION_ENVIRONMENT_KEYS = Object.freeze([
+  "name",
+  "id",
+  "wait_timer_rule_id",
+  "wait_timer_minutes",
+]);
+const WAIT_COMPLETION_WORKFLOW_KEYS = Object.freeze([
+  "repository",
+  "path",
+  "sha",
+]);
+const WAIT_COMPLETION_RUN_KEYS = Object.freeze([
+  "run_id",
+  "run_attempt",
+  "wait_job_id",
+  "continuation_job_id",
+]);
+const PUBLIC_WAIT_STAGES = new Set([
+  "public-initial",
+  "public-post-request",
+  "public-no-start",
+]);
+const PUBLIC_WAIT_ENVIRONMENT_BY_STAGE = Object.freeze({
+  "public-initial": "codex-review-gate-public-initial-15m",
+  "public-post-request": "codex-review-gate-public-post-request-15m",
+  "public-no-start": "codex-review-gate-public-no-start-15m",
+});
 const AUTOMATIC_REQUEST_STATES = new Set([
   "available",
   "intent-persisted",
@@ -111,6 +162,8 @@ const SINGLE_STATUS_WRITE_DECISIONS = new Set([
 const STRICT_UTC_TIMESTAMP =
   /^(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?:\.(\d{1,3}))?Z$/u;
 const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
+const TRUSTED_WAIT_WORKFLOW_REPOSITORY =
+  "Joey-Tools/codex-review-gate-action";
 
 // These schemas are deliberately descriptive rather than executable JSON
 // Schema documents. planV2Actions performs the same closed-key validation at
@@ -130,6 +183,7 @@ export const V2_SCHEDULER_OUTPUT_SCHEMA = Object.freeze({
     "schema_version",
     "actions",
     "due_at",
+    "required_wait",
     "automatic_retry_stopped",
     "event_wakeup_hints_are_advisory",
     "freshness_assurance",
@@ -190,12 +244,27 @@ export function planV2Actions(rawInput) {
     });
   }
 
-  if (NO_START_DECISIONS.has(evaluation.decision) && evaluation.no_start_candidate !== null) {
-    return planNoStartConfirmation(input, nowMs, epochStartMs, applied);
-  }
-
   if (evaluation.decision === "not-selected") {
     return output({ actions, dueAtMs: null, automaticRetryStopped: true });
+  }
+
+  const waitBarrier = input.public_wait_supported
+    ? publicWaitBarrier(input, epochStartMs)
+    : null;
+  if (
+    waitBarrier !== null &&
+    !hasMatchingPublicWaitCompletion(input, waitBarrier)
+  ) {
+    return output({
+      actions: [],
+      dueAtMs: waitBarrier.deadline_ms,
+      requiredWait: waitBarrier,
+      automaticRetryStopped: automaticRetryStopped(input, nowMs, epochStartMs),
+    });
+  }
+
+  if (NO_START_DECISIONS.has(evaluation.decision) && evaluation.no_start_candidate !== null) {
+    return planNoStartConfirmation(input, nowMs, epochStartMs, applied);
   }
 
   if (
@@ -251,6 +320,13 @@ function planRecoveredFindings(input, nowMs, applied) {
     dueAtMs: input.public_wait_supported
       ? nowMs + PUBLIC_POST_REQUEST_WAIT_MS
       : nowMs + PRIVATE_RECONCILIATION_INTERVAL_MS,
+    requiredWait: input.public_wait_supported
+      ? {
+          stage: "public-post-request",
+          deadline_ms: nowMs + PUBLIC_POST_REQUEST_WAIT_MS,
+          deadline: iso(nowMs + PUBLIC_POST_REQUEST_WAIT_MS),
+        }
+      : null,
     automaticRetryStopped: true,
   });
 }
@@ -269,6 +345,11 @@ function planPublicPending(input, nowMs, epochStartMs, applied) {
       return output({
         actions,
         dueAtMs: initialDeadlineMs,
+        requiredWait: {
+          stage: "public-initial",
+          deadline_ms: initialDeadlineMs,
+          deadline: iso(initialDeadlineMs),
+        },
         automaticRetryStopped: automaticRetryStopped(input, nowMs, epochStartMs) ||
           actions.some((action) => action.kind === "record_head_ledger"),
       });
@@ -297,6 +378,11 @@ function planPublicPending(input, nowMs, epochStartMs, applied) {
         return output({
           actions,
           dueAtMs: resultDeadlineMs,
+          requiredWait: {
+            stage: "public-post-request",
+            deadline_ms: resultDeadlineMs,
+            deadline: iso(resultDeadlineMs),
+          },
           automaticRetryStopped: true,
         });
       }
@@ -334,6 +420,11 @@ function planPublicPending(input, nowMs, epochStartMs, applied) {
     return output({
       actions,
       dueAtMs: nowMs + PUBLIC_POST_REQUEST_WAIT_MS,
+      requiredWait: {
+        stage: "public-post-request",
+        deadline_ms: nowMs + PUBLIC_POST_REQUEST_WAIT_MS,
+        deadline: iso(nowMs + PUBLIC_POST_REQUEST_WAIT_MS),
+      },
       automaticRetryStopped: true,
     });
   }
@@ -355,6 +446,11 @@ function planPublicPending(input, nowMs, epochStartMs, applied) {
     return output({
       actions,
       dueAtMs: originMs + PUBLIC_POST_REQUEST_WAIT_MS,
+      requiredWait: {
+        stage: "public-post-request",
+        deadline_ms: originMs + PUBLIC_POST_REQUEST_WAIT_MS,
+        deadline: iso(originMs + PUBLIC_POST_REQUEST_WAIT_MS),
+      },
       automaticRetryStopped: true,
     });
   }
@@ -490,8 +586,74 @@ function planNoStartConfirmation(input, nowMs, epochStartMs, applied) {
     dueAtMs: input.public_wait_supported
       ? dueAtMs
       : currentMs + PRIVATE_RECONCILIATION_INTERVAL_MS,
+    requiredWait: input.public_wait_supported
+      ? {
+          stage: "public-no-start",
+          deadline_ms: dueAtMs,
+          deadline: iso(dueAtMs),
+        }
+      : null,
     automaticRetryStopped: true,
   });
+}
+
+function publicWaitBarrier(input, epochStartMs) {
+  const evaluation = input.evaluation;
+  const initialBarrier = {
+    stage: "public-initial",
+    deadline_ms: epochStartMs + PUBLIC_INITIAL_WAIT_MS,
+    deadline: iso(epochStartMs + PUBLIC_INITIAL_WAIT_MS),
+  };
+  const requestOriginMs = requestWaitOrigin(input);
+  const postRequestBarrier = requestOriginMs === null
+    ? null
+    : {
+        stage: "public-post-request",
+        deadline_ms: requestOriginMs + PUBLIC_POST_REQUEST_WAIT_MS,
+        deadline: iso(requestOriginMs + PUBLIC_POST_REQUEST_WAIT_MS),
+      };
+  if (
+    postRequestBarrier !== null &&
+    !hasMatchingPublicWaitCompletion(input, postRequestBarrier)
+  ) {
+    return postRequestBarrier;
+  }
+  if (
+    postRequestBarrier === null &&
+    !hasMatchingPublicWaitCompletion(input, initialBarrier)
+  ) {
+    return initialBarrier;
+  }
+  if (
+    NO_START_DECISIONS.has(evaluation.decision) &&
+    evaluation.no_start_candidate !== null
+  ) {
+    const origins = [evaluation, ...input.complete_snapshots]
+      .filter((snapshot) => snapshot.no_start_candidate !== null)
+      .filter((snapshot) => matchingNoStartSnapshot(snapshot, evaluation))
+      .map((snapshot) => timestampMs(
+        snapshot.observed_at,
+        "public no-start wait origin",
+      ));
+    const originMs = Math.min(...origins);
+    return {
+      stage: "public-no-start",
+      deadline_ms: originMs + PUBLIC_NO_START_CONFIRMATION_MS,
+      deadline: iso(originMs + PUBLIC_NO_START_CONFIRMATION_MS),
+    };
+  }
+  if (postRequestBarrier !== null) return postRequestBarrier;
+  return initialBarrier;
+}
+
+function hasMatchingPublicWaitCompletion(input, barrier) {
+  if (Date.parse(input.now) < barrier.deadline_ms) return false;
+  return input.wait_completions.some((completion) =>
+    completion.epoch_id === input.epoch.id &&
+    completion.generation_index ===
+      input.epoch.automatic_request.generation_index &&
+    completion.stage === barrier.stage &&
+    completion.deadline === barrier.deadline);
 }
 
 function appendAutomaticRequestActions(actions, input, applied) {
@@ -710,12 +872,33 @@ function hasStatusCapLedger(actions) {
     action.kind === "record_head_ledger" && action.reason === "status-cap-exhausted");
 }
 
-function output({ actions, dueAtMs, automaticRetryStopped }) {
+function output({
+  actions,
+  dueAtMs,
+  requiredWait = null,
+  automaticRetryStopped,
+}) {
+  if (
+    requiredWait !== null &&
+    (
+      !PUBLIC_WAIT_STAGES.has(requiredWait.stage) ||
+      requiredWait.deadline_ms !== dueAtMs ||
+      requiredWait.deadline !== iso(dueAtMs)
+    )
+  ) {
+    throw new TypeError("required public wait must bind the exact due_at");
+  }
   return {
     schema: V2_SCHEDULER_SCHEMA,
     schema_version: V2_SCHEDULER_SCHEMA_VERSION,
     actions,
     due_at: dueAtMs === null ? null : iso(dueAtMs),
+    required_wait: requiredWait === null
+      ? null
+      : {
+          stage: requiredWait.stage,
+          deadline: requiredWait.deadline,
+        },
     automatic_retry_stopped: automaticRetryStopped,
     event_wakeup_hints_are_advisory: true,
     freshness_assurance: "point-in-time",
@@ -743,6 +926,23 @@ function automaticIntentId(epochId, generationIndex) {
 
 function digest(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex");
+}
+
+function digestCanonical(domain, value) {
+  return `sha256:${createHash("sha256")
+    .update(`${domain}\0${canonicalJson(value)}`, "utf8")
+    .digest("hex")}`;
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function iso(milliseconds) {
@@ -820,7 +1020,228 @@ function validateInput(input) {
   if (new Set(input.applied_action_keys).size !== input.applied_action_keys.length) {
     throw new TypeError("applied_action_keys must not contain duplicates");
   }
+  validateV2PublicWaitCompletions(input.wait_completions, {
+    epoch_id: input.epoch.id,
+    maximum_generation_index: input.epoch.automatic_request.generation_index,
+    observed_not_after: input.now,
+  });
   return input;
+}
+
+function positiveSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function decimalString(value, label) {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/u.test(value)) {
+    throw new TypeError(`${label} must be a positive decimal string`);
+  }
+  return value;
+}
+
+function sha(value, label) {
+  if (typeof value !== "string" || !/^[0-9a-f]{40}$/u.test(value)) {
+    throw new TypeError(`${label} must be a lowercase 40-character SHA`);
+  }
+  return value;
+}
+
+function repositoryPart(value, label) {
+  if (
+    typeof value !== "string" ||
+    !/^[A-Za-z0-9_.-]{1,100}$/u.test(value)
+  ) {
+    throw new TypeError(`${label} is not a bounded repository component`);
+  }
+  return value;
+}
+
+function repositoryName(value, label) {
+  if (typeof value !== "string") {
+    throw new TypeError(`${label} must be owner/name`);
+  }
+  const parts = value.split("/");
+  if (parts.length !== 2) {
+    throw new TypeError(`${label} must be owner/name`);
+  }
+  repositoryPart(parts[0], `${label}.owner`);
+  repositoryPart(parts[1], `${label}.name`);
+  return value;
+}
+
+function jobId(value, label) {
+  if (typeof value !== "string" || !/^[A-Za-z_][A-Za-z0-9_-]{0,127}$/u.test(value)) {
+    throw new TypeError(`${label} is not a bounded workflow job id`);
+  }
+  return value;
+}
+
+export function validateV2PublicWaitCompletions(value, expected = {}) {
+  if (!Array.isArray(value) || value.length > MAX_V2_PUBLIC_WAIT_COMPLETIONS) {
+    throw new TypeError(
+      `wait_completions must be an array of at most ${MAX_V2_PUBLIC_WAIT_COMPLETIONS} receipts`,
+    );
+  }
+  const digests = new Set();
+  const phases = new Set();
+  let priorCompletedAtMs = null;
+  for (const [index, completion] of value.entries()) {
+    const label = `wait_completions[${index}]`;
+    assertRecord(completion, label);
+    assertClosedKeys(completion, WAIT_COMPLETION_KEYS, label);
+    if (
+      completion.schema !== V2_PUBLIC_WAIT_COMPLETION_SCHEMA ||
+      completion.schema_version !== 1
+    ) {
+      throw new TypeError(`${label} has an unsupported schema`);
+    }
+    assertRecord(completion.repository, `${label}.repository`);
+    assertClosedKeys(
+      completion.repository,
+      WAIT_COMPLETION_REPOSITORY_KEYS,
+      `${label}.repository`,
+    );
+    repositoryPart(completion.repository.owner, `${label}.repository.owner`);
+    repositoryPart(completion.repository.name, `${label}.repository.name`);
+    assertRecord(completion.pull_request, `${label}.pull_request`);
+    assertClosedKeys(
+      completion.pull_request,
+      WAIT_COMPLETION_PULL_REQUEST_KEYS,
+      `${label}.pull_request`,
+    );
+    positiveSafeInteger(
+      completion.pull_request.number,
+      `${label}.pull_request.number`,
+    );
+    sha(completion.head_ref_oid, `${label}.head_ref_oid`);
+    assertNonEmptyString(completion.epoch_id, `${label}.epoch_id`);
+    const generationIndex = positiveSafeInteger(
+      completion.generation_index,
+      `${label}.generation_index`,
+    );
+    if (generationIndex > 3) {
+      throw new TypeError(`${label}.generation_index exceeds the closed cap`);
+    }
+    if (!PUBLIC_WAIT_STAGES.has(completion.stage)) {
+      throw new TypeError(`${label}.stage is not closed`);
+    }
+    const deadlineMs = timestampMs(completion.deadline, `${label}.deadline`);
+    const completedAtMs = timestampMs(
+      completion.completed_at,
+      `${label}.completed_at`,
+    );
+    if (completedAtMs < deadlineMs) {
+      throw new TypeError(`${label}.completed_at precedes its deadline`);
+    }
+    assertRecord(completion.environment, `${label}.environment`);
+    assertClosedKeys(
+      completion.environment,
+      WAIT_COMPLETION_ENVIRONMENT_KEYS,
+      `${label}.environment`,
+    );
+    assertNonEmptyString(
+      completion.environment.name,
+      `${label}.environment.name`,
+    );
+    if (
+      completion.environment.name !==
+        PUBLIC_WAIT_ENVIRONMENT_BY_STAGE[completion.stage]
+    ) {
+      throw new TypeError(`${label}.environment.name differs from its stage`);
+    }
+    decimalString(completion.environment.id, `${label}.environment.id`);
+    decimalString(
+      completion.environment.wait_timer_rule_id,
+      `${label}.environment.wait_timer_rule_id`,
+    );
+    if (completion.environment.wait_timer_minutes !== 15) {
+      throw new TypeError(`${label} does not bind the fifteen-minute rule`);
+    }
+    assertRecord(completion.trusted_workflow, `${label}.trusted_workflow`);
+    assertClosedKeys(
+      completion.trusted_workflow,
+      WAIT_COMPLETION_WORKFLOW_KEYS,
+      `${label}.trusted_workflow`,
+    );
+    const trustedWorkflowRepository = repositoryName(
+      completion.trusted_workflow.repository,
+      `${label}.trusted_workflow.repository`,
+    );
+    if (
+      trustedWorkflowRepository !== TRUSTED_WAIT_WORKFLOW_REPOSITORY ||
+      completion.trusted_workflow.path !==
+        ".github/workflows/codex-review-gate.yml"
+    ) {
+      throw new TypeError(`${label} has an unsupported trusted workflow`);
+    }
+    sha(completion.trusted_workflow.sha, `${label}.trusted_workflow.sha`);
+    assertRecord(completion.run, `${label}.run`);
+    assertClosedKeys(completion.run, WAIT_COMPLETION_RUN_KEYS, `${label}.run`);
+    decimalString(completion.run.run_id, `${label}.run.run_id`);
+    positiveSafeInteger(completion.run.run_attempt, `${label}.run.run_attempt`);
+    jobId(completion.run.wait_job_id, `${label}.run.wait_job_id`);
+    jobId(
+      completion.run.continuation_job_id,
+      `${label}.run.continuation_job_id`,
+    );
+    sha(
+      completion.source_observation_record_oid,
+      `${label}.source_observation_record_oid`,
+    );
+    if (!/^[0-9a-f]{64}$/u.test(completion.stage_nonce)) {
+      throw new TypeError(`${label}.stage_nonce must be 32 lowercase hex bytes`);
+    }
+    if (!SHA256_DIGEST.test(completion.receipt_digest)) {
+      throw new TypeError(`${label}.receipt_digest is invalid`);
+    }
+    const { receipt_digest: _receiptDigest, ...withoutDigest } = completion;
+    if (
+      completion.receipt_digest !== digestCanonical(
+        "codex-review-gate-v2-public-wait-completion",
+        withoutDigest,
+      )
+    ) {
+      throw new TypeError(`${label}.receipt_digest does not bind its content`);
+    }
+    if (
+      expected.epoch_id !== undefined &&
+      completion.epoch_id !== expected.epoch_id
+    ) {
+      throw new TypeError(`${label} belongs to another epoch`);
+    }
+    if (
+      expected.maximum_generation_index !== undefined &&
+      generationIndex > expected.maximum_generation_index
+    ) {
+      throw new TypeError(`${label} belongs to a future generation`);
+    }
+    if (
+      expected.observed_not_after !== undefined &&
+      completedAtMs > timestampMs(
+        expected.observed_not_after,
+        "wait completion authority boundary",
+      )
+    ) {
+      throw new TypeError(`${label}.completed_at follows its authority boundary`);
+    }
+    if (
+      priorCompletedAtMs !== null &&
+      completedAtMs < priorCompletedAtMs
+    ) {
+      throw new TypeError("wait_completions must be completion-time ordered");
+    }
+    const phase = `${completion.epoch_id}\0${generationIndex}\0${completion.stage}`;
+    if (digests.has(completion.receipt_digest) || phases.has(phase)) {
+      throw new TypeError("wait_completions must be digest- and phase-unique");
+    }
+    digests.add(completion.receipt_digest);
+    phases.add(phase);
+    priorCompletedAtMs = completedAtMs;
+  }
+  return value;
 }
 
 function validateAutomaticRequest(request, epochStartMs, nowMs) {

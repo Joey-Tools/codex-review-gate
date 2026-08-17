@@ -23,6 +23,14 @@ Release workflow 及其 publication change 都不得修改该 caller、安装 v2
 graph、切换 required status context 或声称 v2 已激活。成功 publication 只是进入
 单独 review 的 activation phase 的一个输入。
 
+发布出的 controller 仍采用 pre-activation profile：production effects authority
+保持 false；protected ledger 也拒绝非空 public-wait completion history，因为本发布
+没有受信任的 completion producer。Deadline、server time、route boundary 与 wake-up
+hint 都只是 advisory。Phase 2 必须先交付 immutable、已 review 的 wait
+producer/consumer topology（或 Environment-bound controller OIDC authority）、
+durable phase-specific completion receipt，以及 post-request wait 的稳定持久 origin。
+当前 caller-owned 外层 wait job 不满足这一 authority contract。
+
 ## 封闭的 repository 与 ref 合约
 
 机器可读的发布前 baseline 位于
@@ -197,6 +205,10 @@ branch、tag、symbolic ref、short SHA，以及所有其他 floating 或不同 
 - 完整 event topology、`17 */2 * * *` schedule、repository-wide
   `codex-review-gate-v2-${{ github.repository }}` concurrency、
   `cancel-in-progress: false` 与 `pull-request` dispatch input；
+- initial job-level
+  `${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}`
+  admission filter，确保 ordinary issue comment 不会启动 controller；并保留不含
+  `always()` bypass 的 direct downstream `needs` chain；
 - schedule route 的 `scan-all-open` coordinator、controller-owned durable
   candidate inventory/reservation 与 canonical matrix output；per-candidate job
   必须消费 `fromJSON(needs.schedule-dispatch.outputs.matrix)`，原样传递
@@ -223,6 +235,12 @@ named environments 全部存在，且每个 environment 都有且只有一个 ex
 `wait_timer` protection rule。Workflow 的 5-minute job timeout 不是 public wait；
 该边界由 environment protection rule 提供。缺失、不可读、提前释放或非 15-minute
 证据都会阻止 rollout。
+
+Activation change 还必须恢复 pre-activation guard 下有意不可达的 whole-controller
+正向覆盖，包括 automatic HTTP actor、aggregate retry/exhaustion loop、release-phase
+diagnostic、schedule row-state classification 与 near-capacity scheduled dispatch。
+Phase 1 的 lower-level protocol test 只保护 dormant state-machine invariant，不能作为
+live activation evidence。
 
 以下步骤共同构成一次 required-context ruleset/branch-protection switch；其
 forward order 必须是：

@@ -2295,6 +2295,7 @@ function runnerInput(snapshotValue, controller) {
       },
       applied_action_keys: [],
       no_start_candidate: null,
+      wait_completions: [],
     },
     head_ledger: null,
     reservation: null,

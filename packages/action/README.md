@@ -20,6 +20,17 @@ repository is a frozen v1 archive and is not a v2 source.
 > not make `codex/github-review-gate` a required check. Missing or unverified
 > activation evidence fails closed.
 
+The shipped profile is deliberately pre-activation: both production-effects
+authorities remain false, and the protected ledger admits no public-wait
+completion because this release has no trusted completion producer. An
+observation-boundary string, wake-up hint, `due_at`, or later GitHub server time
+is advisory only and cannot authorise a request or terminal effect. Production
+activation therefore requires a separately reviewed immutable wait
+producer/consumer DAG (or an Environment-bound controller OIDC authority), a
+durable phase-specific completion receipt, and a stable persisted origin for
+each post-request wait. This release supplies none of those positive
+authorities.
+
 ## Supported public boundary
 
 Ordinary consumers call the trusted reusable workflow:
@@ -30,6 +41,7 @@ jobs:
     uses: Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2
     with:
       pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
+      selection-policy: joey-default
       controller-mode: ordinary
       observation-boundary: initial
 ```
@@ -190,6 +202,16 @@ reviewed and proven:
 An environment name alone does not configure or prove a wait timer. A copied
 fixture, a green composite step, or an observed status with a generic
 `github-actions[bot]` creator is not activation proof.
+
+The current reconciliation fixture cannot close this boundary: its outer wait
+jobs are caller-owned, while the reusable controller has no authenticated
+evidence that those jobs ran. Before activation, the wait producer and the
+effect consumer must be controlled by the same immutable reviewed topology (or
+the controller itself must verify an Environment-bound OIDC identity). The
+activation change must also restore whole-controller positive coverage for the
+automatic HTTP actor, aggregate retry/exhaustion loops, release diagnostics,
+schedule row-state classification, and near-capacity schedule dispatch; these
+paths are intentionally unreachable under the pre-activation guard.
 
 ## v1 archive boundary
 

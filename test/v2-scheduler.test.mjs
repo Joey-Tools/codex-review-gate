@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -18,6 +19,7 @@ import { V2_DECISIONS } from "../packages/action/src/v2/schema.mjs";
 const START = "2026-08-13T08:00:00.000Z";
 const EPOCH_ID = "repo:1:base:head:merge";
 const DIGEST_A = `sha256:${"a".repeat(64)}`;
+const SHA_A = "a".repeat(40);
 
 function at(milliseconds) {
   return new Date(Date.parse(START) + milliseconds).toISOString();
@@ -62,6 +64,7 @@ function recoveryAuthority(priorGenerationIndex = 1) {
 
 test("a proved prior findings generation schedules only the immediate next generation", () => {
   const plan = planV2Actions(input({
+    public_wait_supported: false,
     now: at(PUBLIC_INITIAL_WAIT_MS),
     evaluation: snapshot({
       decision: "findings",
@@ -155,6 +158,7 @@ function input(overrides = {}) {
       latest_idempotency_key: null,
     },
     applied_action_keys: [],
+    wait_completions: [],
   };
   return {
     ...base,
@@ -168,6 +172,67 @@ function input(overrides = {}) {
       ...(overrides.status || {}),
     },
   };
+}
+
+function waitCompletion(stage, deadline, overrides = {}) {
+  const generationIndex = overrides.generation_index ?? 1;
+  const withoutDigest = {
+    schema: "codex-review-gate-public-wait-completion-v2",
+    schema_version: 1,
+    repository: { owner: "example", name: "repo" },
+    pull_request: { number: 7 },
+    head_ref_oid: SHA_A,
+    epoch_id: EPOCH_ID,
+    generation_index: generationIndex,
+    stage,
+    deadline,
+    completed_at: deadline,
+    environment: {
+      name: `codex-review-gate-${stage}-15m`,
+      id: "101",
+      wait_timer_rule_id: "201",
+      wait_timer_minutes: 15,
+    },
+    trusted_workflow: {
+      repository: "Joey-Tools/codex-review-gate-action",
+      path: ".github/workflows/codex-review-gate.yml",
+      sha: SHA_A,
+    },
+    run: {
+      run_id: "1001",
+      run_attempt: 1,
+      wait_job_id: `${stage}-wait`,
+      continuation_job_id: `after-${stage}`,
+    },
+    source_observation_record_oid: "b".repeat(40),
+    stage_nonce: "c".repeat(64),
+    ...overrides,
+  };
+  delete withoutDigest.receipt_digest;
+  return {
+    ...withoutDigest,
+    receipt_digest: digestCanonical(
+      "codex-review-gate-v2-public-wait-completion",
+      withoutDigest,
+    ),
+  };
+}
+
+function digestCanonical(domain, value) {
+  return `sha256:${createHash("sha256")
+    .update(`${domain}\0${canonicalJson(value)}`, "utf8")
+    .digest("hex")}`;
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function actionsOfKind(plan, kind) {
@@ -189,6 +254,7 @@ test("exports a closed, versioned, point-in-time plan", () => {
     "schema_version",
     "actions",
     "due_at",
+    "required_wait",
     "automatic_retry_stopped",
     "event_wakeup_hints_are_advisory",
     "freshness_assurance",
@@ -218,20 +284,132 @@ test("rejects unknown input, nested, and action-state fields", () => {
   );
 });
 
+test("wait completion authority is closed, fresh, unique, and phase-specific", () => {
+  const deadline = at(PUBLIC_INITIAL_WAIT_MS);
+  assert.throws(
+    () => planV2Actions(input({
+      now: deadline,
+      wait_completions: [waitCompletion("public-initial", deadline, {
+        completed_at: at(PUBLIC_INITIAL_WAIT_MS - 1),
+      })],
+    })),
+    /completed_at precedes its deadline/u,
+  );
+  assert.throws(
+    () => planV2Actions(input({
+      now: deadline,
+      wait_completions: [waitCompletion("public-initial", deadline, {
+        trusted_workflow: {
+          repository: "example/forged-controller",
+          path: ".github/workflows/codex-review-gate.yml",
+          sha: SHA_A,
+        },
+      })],
+    })),
+    /unsupported trusted workflow/u,
+  );
+  const postReceipt = waitCompletion("public-post-request", deadline);
+  const wrongPhase = planV2Actions(input({
+    now: deadline,
+    wait_completions: [postReceipt],
+  }));
+  assert.deepEqual(wrongPhase.actions, []);
+  assert.equal(wrongPhase.due_at, deadline);
+  assert.throws(
+    () => planV2Actions(input({
+      now: deadline,
+      wait_completions: [postReceipt, structuredClone(postReceipt)],
+    })),
+    /digest- and phase-unique/u,
+  );
+  const valid = waitCompletion("public-initial", deadline);
+  const cases = [
+    [
+      waitCompletion("public-initial", deadline, {
+        completed_at: at(PUBLIC_INITIAL_WAIT_MS + 1),
+      }),
+      /completed_at follows its authority boundary/u,
+    ],
+    [
+      waitCompletion("public-initial", deadline, {
+        epoch_id: "another-epoch",
+      }),
+      /belongs to another epoch/u,
+    ],
+    [
+      waitCompletion("public-initial", deadline, {
+        generation_index: 2,
+      }),
+      /belongs to a future generation/u,
+    ],
+    [
+      {
+        ...valid,
+        receipt_digest:
+          `${valid.receipt_digest.slice(0, -1)}${valid.receipt_digest.endsWith("0") ? "1" : "0"}`,
+      },
+      /receipt_digest does not bind its content/u,
+    ],
+  ];
+  for (const [completion, pattern] of cases) {
+    assert.throws(
+      () => planV2Actions(input({
+        now: deadline,
+        wait_completions: [completion],
+      })),
+      pattern,
+    );
+  }
+  assert.throws(
+    () => planV2Actions(input({
+      now: at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
+      wait_completions: [
+        waitCompletion(
+          "public-post-request",
+          at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
+        ),
+        valid,
+      ],
+    })),
+    /completion-time ordered/u,
+  );
+});
+
 test("public orchestration waits 15 minutes before a fresh pre-request evaluation", () => {
   const initial = planV2Actions(input());
   assert.equal(initial.due_at, at(PUBLIC_INITIAL_WAIT_MS));
-  assert.deepEqual(initial.actions.map((action) => action.kind), ["publish_status"]);
-  assert.equal(initial.actions[0].decision, "pending");
+  assert.deepEqual(initial.required_wait, {
+    stage: "public-initial",
+    deadline: at(PUBLIC_INITIAL_WAIT_MS),
+  });
+  assert.deepEqual(initial.actions, []);
   assert.equal(initial.automatic_retry_stopped, false);
 
   const due = planV2Actions(input({ now: at(PUBLIC_INITIAL_WAIT_MS) }));
-  assert.equal(due.due_at, null);
-  assert.deepEqual(due.actions.map((action) => action.kind), [
+  assert.equal(due.due_at, at(PUBLIC_INITIAL_WAIT_MS));
+  assert.deepEqual(due.required_wait, {
+    stage: "public-initial",
+    deadline: at(PUBLIC_INITIAL_WAIT_MS),
+  });
+  assert.deepEqual(due.actions, []);
+
+  const completed = planV2Actions(input({
+    now: at(PUBLIC_INITIAL_WAIT_MS),
+    wait_completions: [waitCompletion(
+      "public-initial",
+      at(PUBLIC_INITIAL_WAIT_MS),
+    )],
+  }));
+  assert.equal(completed.due_at, null);
+  assert.equal(completed.required_wait, null);
+  assert.deepEqual(completed.actions.map((action) => action.kind), [
     "publish_status",
     "evaluate_snapshot",
   ]);
-  assert.equal(due.actions.at(-1).reason, "public-initial-wait-complete");
+  assert.equal(
+    completed.actions.at(-1).reason,
+    "public-initial-wait-complete",
+  );
 });
 
 test("a fresh pending public snapshot consumes one reservation before one non-retried POST", () => {
@@ -242,9 +420,17 @@ test("a fresh pending public snapshot consumes one reservation before one non-re
       snapshot_fingerprint: "snapshot-after-initial-wait-fingerprint",
       observed_at: at(PUBLIC_INITIAL_WAIT_MS),
     }),
+    wait_completions: [waitCompletion(
+      "public-initial",
+      at(PUBLIC_INITIAL_WAIT_MS),
+    )],
   }));
 
   assert.equal(plan.due_at, at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS));
+  assert.deepEqual(plan.required_wait, {
+    stage: "public-post-request",
+    deadline: at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
+  });
   assert.equal(plan.automatic_retry_stopped, true);
   assert.deepEqual(plan.actions.map((action) => action.kind), [
     "publish_status",
@@ -270,6 +456,10 @@ test("a persisted request intent can perform its one effect but an attempted eff
         intent_persisted_at: at(PUBLIC_INITIAL_WAIT_MS),
       }),
     },
+    wait_completions: [waitCompletion(
+      "public-initial",
+      at(PUBLIC_INITIAL_WAIT_MS),
+    )],
   }));
   assert.equal(actionsOfKind(persisted, "post_review_request").length, 1);
   assert.equal(actionsOfKind(persisted, "post_review_request")[0].retry_limit, 0);
@@ -285,6 +475,10 @@ test("a persisted request intent can perform its one effect but an attempted eff
         effect_attempted_at: at(PUBLIC_INITIAL_WAIT_MS),
       }),
     },
+    wait_completions: [waitCompletion(
+      "public-initial",
+      at(PUBLIC_INITIAL_WAIT_MS),
+    )],
   }));
   assert.equal(actionsOfKind(attempted, "post_review_request").length, 0);
   assert.equal(attempted.due_at, at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS));
@@ -321,8 +515,34 @@ test("public orchestration waits another 15 minutes after the controlled request
       }),
     },
   }));
-  assert.equal(due.due_at, null);
-  assert.equal(actionsOfKind(due, "evaluate_snapshot")[0].reason, "public-post-request-wait-complete");
+  assert.equal(
+    due.due_at,
+    at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
+  );
+  assert.deepEqual(due.actions, []);
+
+  const completed = planV2Actions(input({
+    now: at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
+    evaluation: snapshot({ observed_at: at(PUBLIC_INITIAL_WAIT_MS) }),
+    epoch: {
+      controlled_request: controlledRequest(requestAt),
+      automatic_request: automaticRequest({
+        state: "effect-attempted",
+        intent_id: "auto-request:intent-1",
+        intent_persisted_at: requestAt,
+        effect_attempted_at: requestAt,
+      }),
+    },
+    wait_completions: [waitCompletion(
+      "public-post-request",
+      at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
+    )],
+  }));
+  assert.equal(completed.due_at, null);
+  assert.equal(
+    actionsOfKind(completed, "evaluate_snapshot")[0].reason,
+    "public-post-request-wait-complete",
+  );
 });
 
 test("provider event wakeups are opportunistic and never replace the due timer", () => {
@@ -340,6 +560,21 @@ test("provider event wakeups are opportunistic and never replace the due timer",
     evaluation: snapshot({ observed_at: at(5 * 60 * 1000) }),
   }));
   assert.equal(pending.due_at, at(PUBLIC_INITIAL_WAIT_MS));
+});
+
+test("schedule and provider wakeups cannot consume an expired deadline alone", () => {
+  for (const trigger of ["schedule", "provider-event"]) {
+    const plan = planV2Actions(input({
+      trigger,
+      now: at(PUBLIC_INITIAL_WAIT_MS),
+      evaluation: snapshot({
+        snapshot_id: `snapshot-${trigger}-at-deadline`,
+        observed_at: at(PUBLIC_INITIAL_WAIT_MS),
+      }),
+    }));
+    assert.deepEqual(plan.actions, [], trigger);
+    assert.equal(plan.due_at, at(PUBLIC_INITIAL_WAIT_MS), trigger);
+  }
 });
 
 test("manual dispatch is evaluate-only and cannot publish or request", () => {
@@ -363,6 +598,45 @@ test("not-selected is terminal and cannot publish, request, or schedule follow-u
   assert.deepEqual(plan.actions, []);
   assert.equal(plan.due_at, null);
   assert.equal(plan.automatic_retry_stopped, true);
+});
+
+test("no-start cannot skip the initial public wait without a controlled request", () => {
+  const observedAt = at(
+    PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS,
+  );
+  const noStartDeadline = at(
+    PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS +
+      PUBLIC_NO_START_CONFIRMATION_MS,
+  );
+  const evaluation = snapshot({
+    decision: "skipped-unavailable",
+    snapshot_id: "pre-request-no-start",
+    snapshot_fingerprint: "pre-request-no-start-fingerprint",
+    observed_at: observedAt,
+    no_start_candidate: {
+      artifact_id: "issue-comment-pre-request",
+      artifact_digest: DIGEST_A,
+      scope_fingerprint: "pre-request-scope",
+      lifecycle_fingerprint: "pre-request-lifecycle",
+      first_seen_at: at(PUBLIC_INITIAL_WAIT_MS + 1),
+    },
+  });
+  for (const waitCompletions of [
+    [],
+    [waitCompletion("public-no-start", noStartDeadline)],
+  ]) {
+    const plan = planV2Actions(input({
+      now: noStartDeadline,
+      evaluation,
+      wait_completions: waitCompletions,
+    }));
+    assert.deepEqual(plan.actions, []);
+    assert.deepEqual(plan.required_wait, {
+      stage: "public-initial",
+      deadline: at(PUBLIC_INITIAL_WAIT_MS),
+    });
+    assert.equal(plan.due_at, at(PUBLIC_INITIAL_WAIT_MS));
+  }
 });
 
 test("no-start needs a second independent stable snapshot at least 15 minutes later", () => {
@@ -399,10 +673,34 @@ test("no-start needs a second independent stable snapshot at least 15 minutes la
     epoch,
   }));
   assert.deepEqual(waiting.actions, []);
+  assert.deepEqual(waiting.required_wait, {
+    stage: "public-post-request",
+    deadline: firstObservedAt,
+  });
+  assert.equal(waiting.due_at, firstObservedAt);
+
+  const postRequestCompletion = waitCompletion(
+    "public-post-request",
+    firstObservedAt,
+  );
+  const noStartWaiting = planV2Actions(input({
+    now: firstObservedAt,
+    evaluation: first,
+    epoch,
+    wait_completions: [postRequestCompletion],
+  }));
+  assert.deepEqual(noStartWaiting.actions, []);
   assert.equal(
-    waiting.due_at,
+    noStartWaiting.due_at,
     at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS + PUBLIC_NO_START_CONFIRMATION_MS),
   );
+  assert.deepEqual(noStartWaiting.required_wait, {
+    stage: "public-no-start",
+    deadline: at(
+      PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS +
+        PUBLIC_NO_START_CONFIRMATION_MS,
+    ),
+  });
 
   const secondObservedAt = at(
     PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS + PUBLIC_NO_START_CONFIRMATION_MS,
@@ -415,11 +713,31 @@ test("no-start needs a second independent stable snapshot at least 15 minutes la
     provider_activity_fingerprint: "no-provider-activity",
     no_start_candidate: candidate,
   });
+  const laterStageCannotSkipPostRequest = planV2Actions(input({
+    now: secondObservedAt,
+    evaluation: second,
+    complete_snapshots: [first],
+    epoch,
+    wait_completions: [waitCompletion(
+      "public-no-start",
+      secondObservedAt,
+    )],
+  }));
+  assert.deepEqual(laterStageCannotSkipPostRequest.actions, []);
+  assert.deepEqual(laterStageCannotSkipPostRequest.required_wait, {
+    stage: "public-post-request",
+    deadline: firstObservedAt,
+  });
+
   const confirmed = planV2Actions(input({
     now: secondObservedAt,
     evaluation: second,
     complete_snapshots: [first],
     epoch,
+    wait_completions: [
+      postRequestCompletion,
+      waitCompletion("public-no-start", secondObservedAt),
+    ],
   }));
   const published = onlyAction(confirmed, "publish_status");
   assert.equal(published.decision, "skipped-unavailable");
@@ -462,6 +780,10 @@ test("no-start confirmation restarts when provider activity or bound artifact st
         effect_attempted_at: requestAt,
       }),
     },
+    wait_completions: [waitCompletion(
+      "public-post-request",
+      at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
+    )],
   }));
   assert.deepEqual(actionsOfKind(plan, "publish_status"), []);
   assert.equal(plan.due_at, at(60 * 60 * 1000));
@@ -664,17 +986,22 @@ test("schedule still evaluates an already-successful open epoch", () => {
 
 test("status publication is idempotent and exact sha/context counts fail closed", () => {
   const clean = snapshot({ decision: "clean" });
-  const first = planV2Actions(input({ evaluation: clean }));
+  const first = planV2Actions(input({
+    public_wait_supported: false,
+    evaluation: clean,
+  }));
   const publish = onlyAction(first, "publish_status");
   assert.equal(publish.required_write_slots, 1);
 
   const duplicate = planV2Actions(input({
+    public_wait_supported: false,
     evaluation: clean,
     status: { latest_idempotency_key: publish.idempotency_key },
   }));
   assert.deepEqual(duplicate.actions, []);
 
   const oneSlot = planV2Actions(input({
+    public_wait_supported: false,
     evaluation: snapshot({ decision: "findings" }),
     status: { exact_sha_context_count: MAX_EXACT_STATUS_WRITES - 1 },
   }));
@@ -685,18 +1012,29 @@ test("status publication is idempotent and exact sha/context counts fail closed"
   assert.equal(oneSlot.automatic_retry_stopped, true);
 
   const exhausted = planV2Actions(input({
+    public_wait_supported: false,
     evaluation: snapshot({ decision: "findings" }),
     status: { exact_sha_context_count: MAX_EXACT_STATUS_WRITES },
   }));
   assert.equal(onlyAction(exhausted, "record_head_ledger").reason, "status-cap-exhausted");
 
   const lastPendingSlot = planV2Actions(input({
+    public_wait_supported: false,
+    epoch: {
+      automatic_request: automaticRequest({
+        state: "effect-attempted",
+        intent_id: "auto-request:intent-1",
+        intent_persisted_at: START,
+        effect_attempted_at: START,
+      }),
+    },
     status: { exact_sha_context_count: MAX_EXACT_STATUS_WRITES - 1 },
   }));
   assert.equal(onlyAction(lastPendingSlot, "publish_status").required_write_slots, 1);
-  assert.equal(lastPendingSlot.due_at, at(PUBLIC_INITIAL_WAIT_MS));
+  assert.equal(lastPendingSlot.due_at, at(PRIVATE_RECONCILIATION_INTERVAL_MS));
 
   const lastCleanSlot = planV2Actions(input({
+    public_wait_supported: false,
     evaluation: clean,
     status: { exact_sha_context_count: MAX_EXACT_STATUS_WRITES - 1 },
   }));
@@ -707,7 +1045,10 @@ test("status publication is idempotent and exact sha/context counts fail closed"
     "blocked-configuration",
     "blocked-input",
   ]) {
-    const negative = planV2Actions(input({ evaluation: snapshot({ decision }) }));
+    const negative = planV2Actions(input({
+      public_wait_supported: false,
+      evaluation: snapshot({ decision }),
+    }));
     assert.equal(
       onlyAction(negative, "publish_status").required_write_slots,
       2,
@@ -718,12 +1059,14 @@ test("status publication is idempotent and exact sha/context counts fail closed"
 
 test("head mode authorizes only non-success sentinel writes", () => {
   const clean = planV2Actions(input({
+    public_wait_supported: false,
     status_target_mode: "head",
     evaluation: snapshot({ decision: "clean" }),
   }));
   assert.deepEqual(actionsOfKind(clean, "publish_status"), []);
 
   const findings = planV2Actions(input({
+    public_wait_supported: false,
     status_target_mode: "head",
     evaluation: snapshot({ decision: "findings" }),
     status: { exact_sha_context_count: MAX_EXACT_STATUS_WRITES - 1 },
@@ -732,9 +1075,13 @@ test("head mode authorizes only non-success sentinel writes", () => {
 });
 
 test("an applied action key suppresses a duplicate declarative effect", () => {
-  const first = planV2Actions(input({ evaluation: snapshot({ decision: "findings" }) }));
+  const first = planV2Actions(input({
+    public_wait_supported: false,
+    evaluation: snapshot({ decision: "findings" }),
+  }));
   const key = first.actions[0].idempotency_key;
   const second = planV2Actions(input({
+    public_wait_supported: false,
     evaluation: snapshot({ decision: "findings" }),
     applied_action_keys: [key],
   }));

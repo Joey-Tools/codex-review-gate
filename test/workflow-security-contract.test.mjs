@@ -11,6 +11,10 @@ const calledWorkflowPath = join(
   actionRoot,
   ".github/workflows/codex-review-gate.yml",
 );
+const reconcileWorkflowPath = join(
+  actionRoot,
+  ".github/workflows/codex-review-gate-reconcile.yml",
+);
 const rootCallerWorkflowPath = join(
   repoRoot,
   ".github/workflows/codex-review-gate.yml",
@@ -23,6 +27,12 @@ const templateWorkflowPath = join(
   repoRoot,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
 );
+const v2ConsumerDocs = [
+  ["English README", join(actionRoot, "README.md")],
+  ["Chinese README", join(actionRoot, "README.zh-CN.md")],
+  ["English cookbook", join(actionRoot, "COOKBOOK.md")],
+  ["Chinese cookbook", join(actionRoot, "COOKBOOK.zh-CN.md")],
+];
 
 const CANONICAL_ACTION_REPOSITORY = "JoeyTeng/codex-review-gate-action";
 const CANONICAL_WORKFLOW_FILE_PATH =
@@ -81,6 +91,8 @@ const EXPECTED_CALLED_JOB_IF = `
 const CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262";
 const CHECKOUT_TARGET = `actions/checkout@${CHECKOUT_SHA}`;
 const CHECKOUT_PATH = ".codex-review-gate-action";
+const V2_PUBLIC_WORKFLOW_CALL =
+  "Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2";
 
 const V2_WORKFLOW_INPUTS = {
   "pull-request": { required: "false", type: "string", default: '""' },
@@ -405,6 +417,116 @@ test("the published v2 workflow is workflow_call-only and exposes only controlle
       `${name} runner must not be caller-selected`,
     );
     assert.doesNotMatch(blockText(job), /^\s+(?:permissions|secrets):/m);
+  }
+});
+
+test("complete v2 consumer examples pass every required workflow_call input", () => {
+  const called = readYamlLines(calledWorkflowPath);
+  const workflowInputs = childBlock(
+    childBlock(childBlock(rootBlock(called), "on"), "workflow_call"),
+    "inputs",
+  );
+  const requiredInputs = directKeys(workflowInputs).filter((name) =>
+    directScalar(childBlock(workflowInputs, name), "required") === "true"
+  );
+  assert.ok(
+    requiredInputs.includes("selection-policy"),
+    "the source workflow must keep selection-policy required",
+  );
+
+  for (const [label, path] of v2ConsumerDocs) {
+    const examples = [];
+    for (const source of markdownYamlBlocks(readFileSync(path, "utf8"))) {
+      if (!source.includes(V2_PUBLIC_WORKFLOW_CALL)) continue;
+      const root = rootBlock(yamlLines(source));
+      if (!directKeys(root).includes("jobs")) continue;
+      const jobs = childBlock(root, "jobs");
+      for (const jobName of directKeys(jobs)) {
+        const job = childBlock(jobs, jobName);
+        if (!directKeys(job).includes("uses")) continue;
+        if (directScalar(job, "uses") !== V2_PUBLIC_WORKFLOW_CALL) continue;
+        examples.push({ jobName, job });
+      }
+    }
+
+    assert.equal(
+      examples.length,
+      1,
+      `${label} must contain exactly one complete public v2 consumer example`,
+    );
+    const [{ jobName, job }] = examples;
+    assert.ok(
+      directKeys(job).includes("with"),
+      `${label} ${jobName} must pass reusable-workflow inputs`,
+    );
+    const inputs = childBlock(job, "with");
+    for (const name of requiredInputs) {
+      assert.equal(
+        directKeys(inputs).filter((candidate) => candidate === name).length,
+        1,
+        `${label} ${jobName} must pass required input ${name} exactly once`,
+      );
+    }
+    assert.equal(
+      directScalar(inputs, "selection-policy"),
+      "joey-default",
+      `${label} ${jobName} must select the released joey-default policy`,
+    );
+  }
+});
+
+test("v2 reconcile filters non-PR issue comments before the natural needs chain", () => {
+  const reconcile = readYamlLines(reconcileWorkflowPath);
+  const jobs = childBlock(rootBlock(reconcile), "jobs");
+  const expectedChain = [
+    "initial",
+    "public-initial-wait",
+    "after-public-initial",
+    "public-post-request-wait",
+    "after-public-post-request",
+    "public-no-start-wait",
+    "after-public-no-start",
+  ];
+  assert.deepEqual(directKeys(jobs), expectedChain);
+
+  const initial = childBlock(jobs, "initial");
+  assert.deepEqual(directKeys(initial), [
+    "name",
+    "if",
+    "permissions",
+    "uses",
+    "with",
+  ]);
+  assert.equal(
+    directScalar(initial, "if"),
+    "${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}",
+  );
+  assert.equal(
+    directScalar(childBlock(initial, "with"), "controller-mode"),
+    "${{ github.event_name == 'workflow_dispatch' && 'evaluate-only' || github.event_name == 'schedule' && 'scan-all-open' || (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment') && 'provider-event-hint' || 'ordinary' }}",
+    "the admission filter must not weaken the controller route parser",
+  );
+
+  for (let index = 1; index < expectedChain.length; index += 1) {
+    const jobName = expectedChain[index];
+    const job = childBlock(jobs, jobName);
+    assert.equal(
+      directScalar(job, "needs"),
+      expectedChain[index - 1],
+      `${jobName} must remain directly chained to its predecessor`,
+    );
+    assert.equal(
+      directKeys(job).includes("continue-on-error"),
+      false,
+      `${jobName} must not bypass a skipped or failed predecessor`,
+    );
+    if (directKeys(job).includes("if")) {
+      assert.doesNotMatch(
+        directScalar(job, "if"),
+        /\balways\s*\(/u,
+        `${jobName} must preserve GitHub's natural skipped-needs behavior`,
+      );
+    }
   }
 });
 
@@ -1385,6 +1507,11 @@ function readYamlLines(path) {
 
 function yamlLines(source) {
   return source.split(/\r?\n/u);
+}
+
+function markdownYamlBlocks(source) {
+  return [...source.matchAll(/^```ya?ml[^\n]*\r?\n([\s\S]*?)^```\s*$/gmu)]
+    .map((match) => match[1]);
 }
 
 function rootBlock(lines) {

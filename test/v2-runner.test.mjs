@@ -451,18 +451,23 @@ test("prepare can publish an automatic decision without inventing a request", as
   const snapshot = makeSnapshot();
   const input = makeRunnerInput({ operation: "prepare-request", snapshot });
   input.head_ledger = makeLedger(snapshot);
+  let schedulerInput = null;
   const output = await runV2Operation(input, {
     transport: { async loadSnapshot() { return snapshot; } },
     reduceSnapshot: () => makeReducerReport(snapshot, "clean"),
     ...fakeProjectionDependencies(),
-    planActions: () => ({
-      actions: [{
-        kind: "publish_status",
-        decision: "clean",
-        required_write_slots: 1,
-      }],
-    }),
+    planActions: (value) => {
+      schedulerInput = value;
+      return {
+        actions: [{
+          kind: "publish_status",
+          decision: "clean",
+          required_write_slots: 1,
+        }],
+      };
+    },
   });
+  assert.deepEqual(schedulerInput.wait_completions, []);
   assert.equal(output.reservation, null);
   assert.equal(output.post_intent, null);
   assert.deepEqual(
@@ -1104,6 +1109,7 @@ function makeRunnerInput({ operation, snapshot }) {
       },
       applied_action_keys: [],
       no_start_candidate: null,
+      wait_completions: [],
     },
     head_ledger: null,
     reservation: null,

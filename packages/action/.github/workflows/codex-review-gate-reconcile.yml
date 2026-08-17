@@ -41,6 +41,7 @@ concurrency:
 jobs:
   initial:
     name: Initial trusted controller observation
+    if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
     permissions:
       contents: write
       id-token: write

@@ -9,6 +9,7 @@ import {
   V2_SCHEDULER_SCHEMA,
   V2_SCHEDULER_SCHEMA_VERSION,
   planV2Actions,
+  validateV2PublicWaitCompletions,
 } from "./scheduler.mjs";
 import {
   V2_STATUS_CONTEXT,
@@ -123,6 +124,7 @@ const SCHEDULING_KEYS = Object.freeze([
   "status",
   "applied_action_keys",
   "no_start_candidate",
+  "wait_completions",
 ]);
 const RUN_IDENTITY_KEYS = Object.freeze(["run_id", "run_attempt"]);
 const HEAD_LEDGER_KEYS = Object.freeze([
@@ -1516,6 +1518,7 @@ function buildSchedulerInput(input, snapshot, projectedSnapshot, reducerReport) 
       latest_idempotency_key: scheduling.status.latest_idempotency_key,
     },
     applied_action_keys: scheduling.applied_action_keys,
+    wait_completions: scheduling.wait_completions,
   };
 }
 
@@ -2006,6 +2009,10 @@ function validateSchedulingInput(value, operation) {
   if (value.no_start_candidate !== null) {
     assertRecord(value.no_start_candidate, "scheduling.no_start_candidate");
   }
+  validateV2PublicWaitCompletions(value.wait_completions, {
+    epoch_id: value.epoch.id,
+    maximum_generation_index: value.epoch.automatic_request.generation_index,
+  });
 }
 
 function validateDependencies(value) {

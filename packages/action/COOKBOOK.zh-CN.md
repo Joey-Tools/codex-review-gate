@@ -16,6 +16,7 @@ jobs:
     uses: Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2
     with:
       pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
+      selection-policy: joey-default
       controller-mode: ordinary
       observation-boundary: initial
 ```

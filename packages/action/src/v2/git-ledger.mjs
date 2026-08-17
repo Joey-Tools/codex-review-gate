@@ -4,6 +4,7 @@ import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 import {
   planV2Actions,
+  validateV2PublicWaitCompletions,
   V2_SCHEDULER_SCHEMA,
   V2_SCHEDULER_SCHEMA_VERSION,
 } from "./scheduler.mjs";
@@ -4699,6 +4700,7 @@ export function createV2GitHubGitLedger({
             initial.scheduling.status.latest_idempotency_key,
         },
         applied_action_keys: initial.scheduling.applied_action_keys,
+        wait_completions: initial.scheduling.wait_completions,
       });
       const statusPlan = validateRunnerStatusPlan(
         status_plan,
@@ -4834,6 +4836,7 @@ export function createV2GitHubGitLedger({
             established.scheduling.status.latest_idempotency_key,
         },
         applied_action_keys: established.scheduling.applied_action_keys,
+        wait_completions: established.scheduling.wait_completions,
       });
       const statusPlan = validateRunnerStatusPlan(
         status_plan,
@@ -6987,12 +6990,29 @@ export function createV2GitHubGitLedger({
             "candidate dispatch restart differs from its durable schedule authority",
           );
         }
-        const recoveryRequired = candidateDispatchRecoveryRequirement({
-          loaded,
-          active,
-          reservationBaseAuthorityDigest:
-            reservationBaseAuthorityDigestForLoaded({ loaded, active }),
-        });
+        let recoveryRequired;
+        try {
+          recoveryRequired = candidateDispatchRecoveryRequirement({
+            loaded,
+            active,
+            reservationBaseAuthorityDigest:
+              reservationBaseAuthorityDigestForLoaded({ loaded, active }),
+          });
+        } catch (error) {
+          if (error?.code !== "candidate-dispatch-wait-outstanding") {
+            throw error;
+          }
+          return deepFreeze({
+            schema: "codex-review-gate-git-ledger-candidate-dispatch-load-v2",
+            schema_version: 1,
+            state: "wait-pending",
+            restarted: true,
+            candidate_dispatch_handle: null,
+            reservation_receipt: null,
+            plan: null,
+            recovery_required: null,
+          });
+        }
         if (recoveryRequired !== null) {
           return deepFreeze({
             schema: "codex-review-gate-git-ledger-candidate-dispatch-load-v2",
@@ -12949,6 +12969,7 @@ function initialRunnerScheduling({
     },
     applied_action_keys: [],
     no_start_candidate: null,
+    wait_completions: [],
   };
 }
 
@@ -17905,6 +17926,15 @@ function validateCandidateDispatchTerminalResult({
       value.wakeup_hints.length > 128) {
     throw new TypeError("candidate dispatch terminal wakeup_hints is invalid");
   }
+  if (
+    value.wakeup_hints.startsWith("public-") ||
+    observation.scheduler_plan.required_wait !== null
+  ) {
+    throw ledgerError(
+      "candidate-dispatch-wait-outstanding",
+      "candidate dispatch cannot become terminal while scheduler wait authority is outstanding",
+    );
+  }
   const effects = nonnegativeInteger(
     value.public_effects_performed,
     "candidate dispatch terminal public effects",
@@ -18142,6 +18172,12 @@ function validateCandidateDispatchTerminalHistoryRecords({
   const observationAction = validateV2GitLedgerSchedulerObservation(
     observation.envelope.payload.action,
   );
+  if (observationAction.scheduler_plan.required_wait !== null) {
+    throw ledgerError(
+      "candidate-dispatch-wait-outstanding",
+      "candidate terminal history cannot acknowledge an outstanding scheduler wait",
+    );
+  }
   if (terminal.decision !== observationAction.scheduler_evaluation.decision) {
     throw new Error("candidate dispatch terminal projection changes scheduler decision");
   }
@@ -18933,6 +18969,15 @@ function deriveCandidateDispatchRecoveryEvidence({
     : validateV2GitLedgerSchedulerObservation(
       observation.envelope.payload.action,
     );
+  if (
+    observationAction !== null &&
+    observationAction.scheduler_plan.required_wait !== null
+  ) {
+    throw ledgerError(
+      "candidate-dispatch-wait-outstanding",
+      "candidate dispatch recovery cannot acknowledge an outstanding scheduler wait",
+    );
+  }
   const status = candidateDispatchRecoveryEffectOutcome(
     prefix,
     "status-write",
@@ -21708,6 +21753,7 @@ function candidateDispatchRecoveryRequirement({
       post_ref_receipt: refReceipt(loaded.post_ref),
     });
   } catch (error) {
+    if (error?.code === "candidate-dispatch-wait-outstanding") throw error;
     if (error?.code !== "candidate-dispatch-recovery-not-ready") throw error;
   }
   const leaseExpiresAt = timestamp(
@@ -30959,6 +31005,12 @@ function validateSchedulerObservationLineage(priorRecords, value) {
     );
   }
   const observations = schedulerObservationRecords(priorRecords, scope);
+  if (action.prior_scheduling.wait_completions.length !== 0) {
+    throw ledgerError(
+      "public-wait-completion-producer-unavailable",
+      "scheduler observation cannot introduce public wait completion authority without a trusted producer",
+    );
+  }
   if (observations.some((entry) =>
     entry.envelope.payload.action.scheduler_evaluation.snapshot_id ===
       action.scheduler_evaluation.snapshot_id)) {
@@ -30983,6 +31035,7 @@ function validateSchedulerObservationLineage(priorRecords, value) {
     if (
       action.prior_scheduling.complete_snapshots.length !== 0 ||
       action.prior_scheduling.applied_action_keys.length !== 0 ||
+      action.prior_scheduling.wait_completions.length !== 0 ||
       action.prior_scheduling.status.exact_sha_context_count !== 0 ||
       action.prior_scheduling.status.latest_idempotency_key !== null ||
       action.prior_scheduling.status.head_sentinel_receipt !== null ||
@@ -31262,6 +31315,17 @@ function deriveRunnerScheduling(records, scope, repository, currentInput) {
       records.at(-1).envelope.server_observed_at,
   );
   const status = deriveRunnerSchedulingStatus(records, scope);
+  for (const observation of observations) {
+    if (
+      observation.envelope.payload.action.prior_scheduling
+        .wait_completions.length !== 0
+    ) {
+      throw ledgerError(
+        "public-wait-completion-producer-unavailable",
+        "runner scheduling history contains public wait completion authority without a trusted producer",
+      );
+    }
+  }
   return {
     trigger: currentInput.trigger,
     public_wait_supported: first.public_wait_supported,
@@ -31281,6 +31345,10 @@ function deriveRunnerScheduling(records, scope, repository, currentInput) {
     },
     applied_action_keys: deriveAppliedSchedulerActionKeys(records, scope),
     no_start_candidate: structuredClone(currentInput.no_start_candidate),
+    // Pre-activation production has no trusted completion producer. Derivation
+    // is therefore closed over reachable observations and cannot echo caller
+    // input into durable authority.
+    wait_completions: [],
   };
 }
 
@@ -40805,6 +40873,7 @@ export function validateV2GitLedgerSchedulerObservation(
       latest_idempotency_key: scheduling.status.latest_idempotency_key,
     },
     applied_action_keys: scheduling.applied_action_keys,
+    wait_completions: scheduling.wait_completions,
   });
   if (canonicalJson(schedulerPlan) !== canonicalJson(expectedPlan)) {
     throw new Error("scheduler observation plan is not the closed scheduler result");
@@ -40968,7 +41037,7 @@ function validateRunnerScheduling(value, boundaryValue, expected = null) {
   exactKeys(value, [
     "trigger", "public_wait_supported", "status_target_mode", "run_identity", "epoch",
     "complete_snapshots", "status", "applied_action_keys",
-    "no_start_candidate",
+    "no_start_candidate", "wait_completions",
   ], "runner scheduling");
   if (!new Set(["initial", "timer", "schedule", "provider-event", "manual"])
     .has(value.trigger) || typeof value.public_wait_supported !== "boolean" ||
@@ -41065,6 +41134,11 @@ function validateRunnerScheduling(value, boundaryValue, expected = null) {
     validateRunnerNoStartCandidate(value.no_start_candidate, boundary,
       "runner scheduling no_start_candidate");
   }
+  validateV2PublicWaitCompletions(value.wait_completions, {
+    epoch_id: value.epoch.id,
+    maximum_generation_index: value.epoch.automatic_request.generation_index,
+    observed_not_after: boundary,
+  });
   return value;
 }
 
@@ -41225,7 +41299,7 @@ function validateRunnerHeadSentinel(value, boundary) {
 function validateRunnerSchedulerPlan(value) {
   assertObject(value, "runner scheduler plan");
   exactKeys(value, [
-    "schema", "schema_version", "actions", "due_at",
+    "schema", "schema_version", "actions", "due_at", "required_wait",
     "automatic_retry_stopped", "event_wakeup_hints_are_advisory",
     "freshness_assurance",
   ], "runner scheduler plan");
@@ -41240,6 +41314,24 @@ function validateRunnerSchedulerPlan(value) {
     throw new Error("runner scheduler plan is not closed v2 output");
   }
   if (value.due_at !== null) timestamp(value.due_at, "runner scheduler plan due_at");
+  if (value.required_wait !== null) {
+    assertObject(value.required_wait, "runner scheduler plan required_wait");
+    exactKeys(value.required_wait, ["stage", "deadline"],
+      "runner scheduler plan required_wait");
+    if (
+      !new Set([
+        "public-initial",
+        "public-post-request",
+        "public-no-start",
+      ]).has(value.required_wait.stage) ||
+      timestamp(
+        value.required_wait.deadline,
+        "runner scheduler plan required_wait deadline",
+      ) !== value.due_at
+    ) {
+      throw new Error("runner scheduler plan required_wait differs from due_at");
+    }
+  }
   const keys = new Set();
   for (const [index, action] of value.actions.entries()) {
     validateRunnerSchedulerAction(action, `runner scheduler plan action[${index}]`);

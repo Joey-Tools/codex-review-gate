@@ -80,6 +80,7 @@ import {
   deriveV2GitLedgerCandidateInventoryAuthority,
   deriveV2GitLedgerCandidateDispatchAuthority,
   deriveV2GitLedgerAuthority,
+  deriveV2GitLedgerRunnerState,
   digestV2GitLedgerStableCapabilityAuthorization,
   digestV2GitLedgerPayload,
   projectV2GitLedgerAutomaticReservation,
@@ -5371,6 +5372,189 @@ test("scheduler observation run identity must equal its protected run authority"
     (error) => error.code === "initial-scheduler-evaluation-mismatch",
   );
   assert.equal(fixture.writeCalls, writes);
+});
+
+test("scheduler history rejects a canonical wait completion without a trusted producer", async () => {
+  const fixture = githubGitFixture();
+  const runIdentity = structuredClone(OWNER);
+  const preflight = await loadFixtureProviderPreflight({
+    visibility: "public",
+  });
+  const context = await createProtectedInitialRunnerContext(fixture, {
+    runIdentity,
+    preflight,
+  });
+  const firstPlan = schedulerObservationRecord({
+    predecessor: context.lease.acquire_commit_sha,
+    lease: context.lease,
+    priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+    initialAuthority: context.initialAuthority,
+  }).payload.action;
+  const firstAppend = await context.ledger.appendInitialSchedulerObservation({
+    initial_runner_state_authority: context.initialAuthority,
+    scheduler_evaluation: firstPlan.scheduler_evaluation,
+    status_plan: firstPlan.status_plan,
+  });
+  await releaseFixtureDiscoveryLease(context.ledger, context.discovery);
+
+  fixture.advanceServerTime(3600);
+  runIdentity.run_attempt = 2;
+  const establishedContext = await acquireEstablishedRunnerContext({
+    ledger: context.ledger,
+    runIdentity,
+    observationBoundary: "public-initial-wait-complete",
+    transportStartSecond: 7200,
+    minimalServerTime: "2026-08-13T16:00:00.000Z",
+  });
+  const established = await context.ledger.loadEstablishedRunnerStateAuthority({
+    control_plane_authority: establishedContext.controlPlaneAuthority,
+    evaluated_scope_receipt: establishedContext.evaluatedScopeReceipt,
+    workflow_command_handle: establishedContext.workflowCommandHandle,
+  });
+  const loaded = await context.ledger.load();
+  const runnerState = deriveV2GitLedgerRunnerState(
+    loaded.records,
+    established.scope,
+    loaded.post_ref.server_time,
+  );
+  const priorScheduling = structuredClone(runnerState.scheduling);
+  priorScheduling.trigger = established.scheduling.trigger;
+  priorScheduling.run_identity = structuredClone(
+    established.scheduling.run_identity,
+  );
+  const deadline = new Date(
+    Date.parse(priorScheduling.epoch.started_at) + 15 * 60 * 1000,
+  ).toISOString();
+  const topology = established.preflight_authority.public_wait_topology
+    .environments.find((entry) => entry.stage === "initial");
+  assert.notEqual(topology, undefined);
+  const completionWithoutDigest = {
+    schema: "codex-review-gate-public-wait-completion-v2",
+    schema_version: 1,
+    repository: { owner: REPOSITORY.owner, name: REPOSITORY.name },
+    pull_request: { number: PR.number },
+    head_ref_oid: HEAD,
+    epoch_id: priorScheduling.epoch.id,
+    generation_index: 1,
+    stage: "public-initial",
+    deadline,
+    completed_at: deadline,
+    environment: {
+      name: topology.name,
+      id: topology.id,
+      wait_timer_rule_id: topology.wait_timer_rule_id,
+      wait_timer_minutes: topology.wait_timer_minutes,
+    },
+    trusted_workflow: {
+      repository: "Joey-Tools/codex-review-gate-action",
+      path: ".github/workflows/codex-review-gate.yml",
+      sha: BASE,
+    },
+    run: {
+      run_id: established.scheduling.run_identity.run_id,
+      run_attempt: established.scheduling.run_identity.run_attempt,
+      wait_job_id: "public_initial_wait",
+      continuation_job_id: "controller",
+    },
+    source_observation_record_oid: firstAppend.append_receipt.commit_sha,
+    stage_nonce: "d".repeat(64),
+  };
+  priorScheduling.wait_completions = [{
+    ...completionWithoutDigest,
+    receipt_digest: digestCanonical(
+      "codex-review-gate-v2-public-wait-completion",
+      completionWithoutDigest,
+    ),
+  }];
+  const observedAt = established.source_authority.post_ref_receipt.server_time;
+  const evaluation = {
+    epoch_id: priorScheduling.epoch.id,
+    decision: "pending",
+    complete: true,
+    snapshot_id: "snapshot-forged-wait-completion",
+    snapshot_fingerprint: `sha256:${"4".repeat(64)}`,
+    observed_at: observedAt,
+    provider_activity_fingerprint: `sha256:${"5".repeat(64)}`,
+    no_start_candidate: structuredClone(priorScheduling.no_start_candidate),
+    run_id: priorScheduling.run_identity.run_id,
+    run_attempt: priorScheduling.run_identity.run_attempt,
+  };
+  const schedulerPlan = planV2Actions({
+    schema: V2_SCHEDULER_SCHEMA,
+    schema_version: V2_SCHEDULER_SCHEMA_VERSION,
+    trigger: priorScheduling.trigger,
+    now: observedAt,
+    public_wait_supported: priorScheduling.public_wait_supported,
+    status_target_mode: priorScheduling.status_target_mode,
+    epoch: priorScheduling.epoch,
+    evaluation,
+    complete_snapshots: priorScheduling.complete_snapshots,
+    status: {
+      exact_sha_context_count:
+        priorScheduling.status.exact_sha_context_count,
+      latest_idempotency_key: priorScheduling.status.latest_idempotency_key,
+    },
+    applied_action_keys: priorScheduling.applied_action_keys,
+    wait_completions: priorScheduling.wait_completions,
+  });
+  const statusPlan = buildV2StatusPlan({
+    decision: "pending",
+    status_target_mode: priorScheduling.status_target_mode,
+    status_context: "codex/github-review-gate",
+    target: {
+      mode: priorScheduling.status_target_mode,
+      validated: true,
+      terminal_sha: POTENTIAL,
+      head_sentinel_sha: HEAD,
+      head_sentinel_receipt: priorScheduling.status.head_sentinel_receipt,
+    },
+    snapshot_fingerprint: evaluation.snapshot_fingerprint,
+  });
+  const action = {
+    schema: "codex-review-gate-git-ledger-scheduler-observation-v2",
+    schema_version: 1,
+    prior_authority_digest: established.prior_authority_digest,
+    prior_scheduling: priorScheduling,
+    prior_head_ledger: structuredClone(established.head_ledger),
+    scheduler_evaluation: evaluation,
+    scheduler_plan: schedulerPlan,
+    scheduler_plan_digest: digestCanonical(
+      "codex-review-gate-v2-scheduler-plan",
+      schedulerPlan,
+    ),
+    status_plan: statusPlan,
+    status_plan_digest: digestCanonical(
+      "codex-review-gate-v2-status-plan",
+      statusPlan,
+    ),
+    evaluated_scope_receipt_digest:
+      established.evaluated_scope_authority
+        .record_evaluated_scope_receipt_digest,
+    snapshot_server_time: observedAt,
+    initial_runner_state_authority: null,
+  };
+  const forged = createV2GitLedgerEffectIntentRecord({
+    predecessor_commit_sha: established.source_authority.tip_commit_sha,
+    scope: established.scope,
+    kind: "scheduler-observation",
+    effect_id: "scheduler-observation:forged-wait-completion",
+    idempotency_key: "scheduler-observation:forged-wait-completion",
+    server_observed_at: observedAt,
+    action,
+    control_comment_binding: null,
+    lease_receipt: established.lease_authority,
+  });
+  const writesBefore = fixture.writeCalls;
+  await assert.rejects(
+    appendHistoricalEffectRecord(
+      context.ledger,
+      forged,
+      establishedContext.evaluatedScopeReceipt,
+    ),
+    (error) =>
+      error.code === "public-wait-completion-producer-unavailable",
+  );
+  assert.equal(fixture.writeCalls, writesBefore);
 });
 
 test("historical authority projection preserves ordered full records and request intent binding", async () => {
@@ -16844,6 +17028,99 @@ test("candidate dispatch raw gate and replay reject request-binding stages that 
     assert.equal(attempt.fixture.refTarget, historicalTip);
   });
 
+test("candidate public wait stays pending on the same reservation after due_at without dispatch or ACK", async () => {
+  const attempt = await createScheduledCandidateDispatchAttempt({
+    visibility: "public",
+  });
+  const fullScopeReceipt = attempt.discovery.effect_evaluated_scope_receipt;
+  const controlPlaneAuthority = await attempt.ledger.loadControlPlaneAuthority(
+    fullScopeReceipt.scope,
+  );
+  const initialAuthority = await attempt.ledger.loadInitialRunnerStateAuthority({
+    control_plane_authority: controlPlaneAuthority,
+    evaluated_scope_receipt: fullScopeReceipt,
+    workflow_command_handle: attempt.scheduledCommand,
+  });
+  const controlPlaneReceipt =
+    createV2ControlPlaneReceiptFromGitLedgerAuthority(controlPlaneAuthority);
+  const runnerAuthority = createV2ProductionRunnerAuthority({
+    preflight_handle: attempt.preflight,
+    control_plane_receipt: controlPlaneReceipt,
+    initial_runner_state_authority: initialAuthority,
+    expected_scope: initialAuthority.scope,
+  });
+  const plan = schedulerObservationRecord({
+    predecessor: attempt.discovery.lease_receipt.acquire_commit_sha,
+    lease: attempt.discovery.lease_receipt,
+    priorAuthorityDigest: initialAuthority.prior_authority_digest,
+    initialAuthority,
+  }).payload.action;
+  assert.deepEqual(plan.scheduler_plan.actions, []);
+  assert.deepEqual(plan.scheduler_plan.required_wait, {
+    stage: "public-initial",
+    deadline: plan.scheduler_plan.due_at,
+  });
+  const schedulerAppend = await attempt.ledger
+    .appendInitialSchedulerObservation({
+      initial_runner_state_authority: initialAuthority,
+      scheduler_evaluation: plan.scheduler_evaluation,
+      status_plan: plan.status_plan,
+    });
+  const releaseReceipt = await releaseFixtureDiscoveryLease(
+    attempt.ledger,
+    attempt.discovery,
+  );
+  const terminalResult = candidateDispatchTerminalResult({
+    decision: plan.scheduler_evaluation.decision,
+    schedulerAppend,
+    leaseReleaseReceipt: releaseReceipt,
+    preflight: attempt.preflight,
+    continuityAuthority: attempt.discovery.continuity_authority,
+    controlPlaneReceipt,
+    initialAuthority,
+    runnerAuthority,
+  });
+  terminalResult.due_at = plan.scheduler_plan.due_at;
+  terminalResult.wakeup_hints = "";
+  const writesBeforeTerminal = attempt.fixture.writeCalls;
+  await assert.rejects(
+    attempt.ledger.createCandidateDispatchResultAuthority({
+      candidate_dispatch_handle: attempt.scheduled.candidate_dispatch_handle,
+      scheduler_append: schedulerAppend,
+      production_runner_authority: runnerAuthority,
+      lease_release_receipt: releaseReceipt,
+      terminal_result: terminalResult,
+    }),
+    (error) => error.code === "candidate-dispatch-wait-outstanding",
+  );
+  assert.equal(attempt.fixture.writeCalls, writesBeforeTerminal);
+
+  attempt.fixture.advanceServerTime(3600);
+  attempt.runIdentity.run_id = "9003";
+  attempt.runIdentity.run_attempt = 1;
+  const resumeCommand = await createScheduleWorkflowCommandHandle({
+    runIdentity: attempt.runIdentity,
+  });
+  const writesBeforeResume = attempt.fixture.writeCalls;
+  const resumed = await attempt.ledger.loadOrReserveCandidateDispatch({
+    workflow_command_handle: resumeCommand,
+    trigger_identity: attempt.triggerIdentity,
+    repository_endpoint_receipt: scheduleRepositoryEndpointReceipt(),
+  });
+  assert.equal(resumed.state, "wait-pending");
+  assert.equal(resumed.restarted, true);
+  assert.equal(resumed.candidate_dispatch_handle, null);
+  assert.equal(resumed.reservation_receipt, null);
+  assert.equal(resumed.plan, null);
+  assert.equal(resumed.recovery_required, null);
+  assert.equal(attempt.fixture.writeCalls, writesBeforeResume);
+  const final = await attempt.ledger.load();
+  const current = final.authority_projection.candidate_dispatch.current_cycle;
+  assert.notEqual(current.active_reservation, null);
+  assert.equal(current.completed_batches.length, 0);
+  assert.equal(current.cycle_complete, false);
+});
+
 test("candidate dispatch binds one released scheduled terminal result before ack", async () => {
   const fixture = githubGitFixture();
   const capability = scheduleCapabilityReceipt({
@@ -20386,6 +20663,7 @@ async function readCandidateShardRound(transport, inventory) {
 
 async function createScheduledCandidateDispatchAttempt({
   leaseTtlSeconds = 900,
+  visibility = "private",
 } = {}) {
   const fixture = githubGitFixture();
   const capability = scheduleCapabilityReceipt();
@@ -20397,7 +20675,7 @@ async function createScheduledCandidateDispatchAttempt({
     shaValue: triggerIdentity.sha,
     runIdentity,
   });
-  const preflight = await loadFixtureProviderPreflight();
+  const preflight = await loadFixtureProviderPreflight({ visibility });
   const ledger = makeLedger(fixture, capability, verifier, preflight);
   await ledger.bootstrapCapability();
   const candidateFixture = candidateTransportFixture(0, {
@@ -23418,6 +23696,7 @@ function initialScheduling({
     },
     applied_action_keys: [],
     no_start_candidate: null,
+    wait_completions: [],
     decision,
   };
 }
@@ -23472,11 +23751,15 @@ function schedulerObservationRecord({
       latest_idempotency_key: null,
     },
     applied_action_keys: [],
+    wait_completions: priorScheduling.wait_completions,
   });
   const statusPlan = {
     mode: priorScheduling.status_target_mode,
     decision: evaluation.decision,
-    writes: trigger === "manual" ? [] : [{
+    writes: trigger === "manual" ||
+        !schedulerPlan.actions.some((action) => action.kind === "publish_status")
+      ? []
+      : [{
       role: "head-sentinel",
       sha: headOid,
       context: "codex/github-review-gate",
@@ -25537,9 +25820,10 @@ async function minimalScopeFetchForCandidate({
 async function loadFixtureProviderPreflight({
   actor = CODEX_ACTOR,
   app = CODEX_APP,
+  visibility = "private",
 } = {}) {
   return createV2GitHubWorkflowPreflight({
-    fetch: providerPreflightFetch({ actor, app }),
+    fetch: providerPreflightFetch({ actor, app, visibility }),
     token: SYNTHETIC_BEARER,
     repository: `${REPOSITORY.owner}/${REPOSITORY.name}`,
     restBaseUrl: "https://api.github.test",
@@ -25589,7 +25873,7 @@ function providerPreflightCommand() {
   };
 }
 
-function providerPreflightFetch({ actor, app }) {
+function providerPreflightFetch({ actor, app, visibility = "private" }) {
   const ledgerRuleset = {
     id: 101,
     name: "Codex ledger protection",
@@ -25623,8 +25907,8 @@ function providerPreflightFetch({ actor, app }) {
         id: Number(REPOSITORY.id),
         full_name: "owner/repo",
         node_id: REPOSITORY.node_id,
-        visibility: "private",
-        private: true,
+        visibility,
+        private: visibility !== "public",
         default_branch: "main",
         permissions: {
           admin: false,
@@ -25634,6 +25918,39 @@ function providerPreflightFetch({ actor, app }) {
           pull: true,
         },
         owner: { id: Number(REPOSITORY.owner_id), login: "owner" },
+      };
+    } else if (path === "/repos/owner/repo/environments") {
+      const names = [
+        "codex-review-gate-public-initial-15m",
+        "codex-review-gate-public-post-request-15m",
+        "codex-review-gate-public-no-start-15m",
+      ];
+      body = {
+        total_count: names.length,
+        environments: names.map((name, index) => ({
+          id: 301 + index,
+          name,
+        })),
+      };
+    } else if (path.startsWith("/repos/owner/repo/environments/")) {
+      const name = decodeURIComponent(path.split("/").at(-1));
+      const names = [
+        "codex-review-gate-public-initial-15m",
+        "codex-review-gate-public-post-request-15m",
+        "codex-review-gate-public-no-start-15m",
+      ];
+      const index = names.indexOf(name);
+      if (index === -1) {
+        throw new Error(`unexpected public wait environment ${name}`);
+      }
+      body = {
+        id: 301 + index,
+        name,
+        protection_rules: [{
+          id: 401 + index,
+          type: "wait_timer",
+          wait_timer: 15,
+        }],
       };
     } else if (path === "/repos/Joey-Tools/codex-review-gate-action") {
       body = {

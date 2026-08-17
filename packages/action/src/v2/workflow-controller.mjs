@@ -20,7 +20,6 @@ import { TextDecoder } from "node:util";
 import { V2_STATUS_CONTEXT } from "./projection.mjs";
 import { assertV2PublicReport } from "./public-report.mjs";
 import { reduceV2Snapshot } from "./reducer.mjs";
-import { PUBLIC_INITIAL_WAIT_MS } from "./scheduler.mjs";
 import {
   MAX_V2_WORKFLOW_COMMAND_BYTES,
   MAX_V2_WORKFLOW_EVENT_BYTES,
@@ -202,19 +201,6 @@ const STATUS_PLAN_DECISIONS = new Set([
 const HEAD_MODE_SUPPRESSED_DECISIONS = new Set([
   "clean",
   "skipped-unavailable",
-]);
-const PUBLIC_WAIT_NO_START_DECISIONS = new Set([
-  "skipped-unavailable",
-  "blocked-configuration",
-]);
-const PUBLIC_WAIT_PENDING_DECISIONS = new Set([
-  "pending",
-  "inconclusive",
-]);
-const PUBLIC_WAIT_AUTOMATIC_REQUEST_STATES = new Set([
-  "available",
-  "intent-persisted",
-  "effect-attempted",
 ]);
 const SHA = /^[0-9a-f]{40}$/u;
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
@@ -3483,52 +3469,34 @@ function assertNoCompactReducerReport(value, label, depth = 0) {
 function projectV2WorkflowWakeupHint(result, scheduling = null) {
   const due = result.scheduler_plan?.due_at;
   if (due === null || due === undefined) return "";
-  if (scheduling?.public_wait_supported !== true) return "private-reconcile";
-  const evaluation = result.scheduler_evaluation;
-  assertObject(evaluation, "public wait scheduler evaluation");
-  assertObject(scheduling.epoch, "public wait scheduler epoch");
-  assertObject(
-    scheduling.epoch.automatic_request,
-    "public wait automatic request state",
-  );
-  if (!PUBLIC_WAIT_AUTOMATIC_REQUEST_STATES.has(
-    scheduling.epoch.automatic_request.state,
-  )) {
+  const requiredWait = result.scheduler_plan.required_wait ?? null;
+  if (requiredWait === null) return "private-reconcile";
+  if (scheduling?.public_wait_supported !== true) {
     throw controllerFailure(
       "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
-      "a public scheduler due_at carried an unknown automatic request state",
+      "a required public wait lacks public scheduling authority",
     );
   }
-  if (
-    PUBLIC_WAIT_NO_START_DECISIONS.has(evaluation.decision) &&
-    evaluation.no_start_candidate !== null
-  ) {
-    return "public-no-start-wait";
+  assertObject(requiredWait, "public required wait");
+  exactKeys(requiredWait, ["stage", "deadline"], "public required wait");
+  if (timestamp(requiredWait.deadline, "public required wait deadline") !== due) {
+    throw controllerFailure(
+      "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
+      "a required public wait differs from scheduler due_at",
+    );
   }
-  if (
-    evaluation.decision === "findings" &&
-    scheduling.epoch.automatic_request.generation_index > 1
-  ) {
-    return "public-post-request-wait";
+  const hint = {
+    "public-initial": "public-initial-wait",
+    "public-post-request": "public-post-request-wait",
+    "public-no-start": "public-no-start-wait",
+  }[requiredWait.stage];
+  if (hint === undefined) {
+    throw controllerFailure(
+      "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
+      "a required public wait carries an unknown stage",
+    );
   }
-  const observedAt = Date.parse(timestamp(
-    evaluation.observed_at,
-    "public wait scheduler evaluation observed_at",
-  ));
-  const epochStartedAt = Date.parse(timestamp(
-    scheduling.epoch.started_at,
-    "public wait scheduler epoch started_at",
-  ));
-  if (observedAt < epochStartedAt + PUBLIC_INITIAL_WAIT_MS) {
-    return "public-initial-wait";
-  }
-  if (PUBLIC_WAIT_PENDING_DECISIONS.has(evaluation.decision)) {
-    return "public-post-request-wait";
-  }
-  throw controllerFailure(
-    "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
-    "a public scheduler due_at did not match a closed wait phase",
-  );
+  return hint;
 }
 
 async function writeExclusiveCanonical(path, value) {
@@ -3797,6 +3765,20 @@ async function loadV2ScheduleDispatchMatrixRows({
     assertObject(dispatch, "candidate dispatch post-recovery load result");
   }
   if (dispatch.state === "complete") {
+    return disabledV2CandidateDispatchRows();
+  }
+  if (dispatch.state === "wait-pending") {
+    if (
+      dispatch.candidate_dispatch_handle !== null ||
+      dispatch.reservation_receipt !== null ||
+      dispatch.plan !== null ||
+      dispatch.recovery_required !== null
+    ) {
+      throw controllerFailure(
+        "SCHEDULE_DISPATCH_WAIT_PENDING_INVALID",
+        "candidate dispatch wait-pending state exposed executable authority",
+      );
+    }
     return disabledV2CandidateDispatchRows();
   }
   if (dispatch.state !== "dispatch") {
@@ -4375,6 +4357,7 @@ async function activateV2ProductionLedgerAuthority({
       { state: handoff.state, public_effects_performed: 0 },
     );
   }
+  assertV2ProductionEffectsAuthorized(preflightHandle);
   let candidateInventoryRefreshAdapter;
   try {
     const controllerRelease = handoff.state === "bootstrap"
@@ -4475,6 +4458,37 @@ async function activateV2ProductionLedgerAuthority({
     preflight_handle: preflightHandle,
     handoff,
   });
+}
+
+function assertV2ProductionEffectsAuthorized(preflightHandle) {
+  const preflight = assertV2WorkflowPreflightHandle(preflightHandle);
+  const publicWaitAuthorized =
+    preflight.public_wait?.production_effects_authorized === true;
+  const stabilityAuthorized =
+    preflight.stability?.production_effects_authorized === true;
+  const liveCanaryRequired = preflight.public_wait?.live_canary_required === true;
+  // Pre-activation has no trusted Environment-backed live-canary producer.
+  // Required canaries therefore remain unconditionally unauthorized; a
+  // future activation must add and validate that producer rather than admit a
+  // caller-shaped receipt. Non-required private topology is shape-valid only
+  // when the preflight carries no canary at all.
+  const liveCanaryValid = liveCanaryRequired
+    ? false
+    : preflight.public_wait?.live_canary_required === false &&
+      preflight.public_wait.live_canary === null;
+  if (!publicWaitAuthorized || !stabilityAuthorized || !liveCanaryValid) {
+    throw controllerFailure(
+      "PRODUCTION_EFFECTS_UNAUTHORIZED",
+      "the branded workflow preflight does not authorize production effects",
+      {
+        public_effects_performed: 0,
+        public_wait_production_effects_authorized: publicWaitAuthorized,
+        stability_production_effects_authorized: stabilityAuthorized,
+        live_canary_required: liveCanaryRequired,
+        live_canary_valid: liveCanaryValid,
+      },
+    );
+  }
 }
 
 export function assertV2InitialProductionLedgerApi(ledger) {
@@ -5149,7 +5163,9 @@ async function assembleV2InitialProductionObservation({
       continuity_authority: discovery.continuity_authority,
       handoff,
     });
-    if (candidateDispatch !== null) {
+    const candidateWaitOutstanding = schedulerAppend.record.payload.action
+      .scheduler_plan.required_wait !== null;
+    if (candidateDispatch !== null && !candidateWaitOutstanding) {
       try {
         for (const [name, callback] of [
           ["createCandidateDispatchResultAuthority",

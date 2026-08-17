@@ -19,6 +19,15 @@ Codex Review Gate v2 是一个 trusted reusable GitHub workflow（受信任的�
 > ruleset switch 完成前，不得把 `codex/github-review-gate` 加为 required check。
 > 缺失或未经验证的 activation evidence 必须 fail closed。
 
+当前发布采用明确的 pre-activation profile：两个 production-effects authority
+都保持 false，且 protected ledger 不接受任何 public-wait completion，因为本发布
+没有受信任的 completion producer。`observation-boundary` 字符串、wake-up hint、
+`due_at` 或更晚的 GitHub server time 都只是 advisory，不能授权 request 或 terminal
+effect。Production activation 必须另行交付并 review immutable wait producer/consumer
+DAG（或 Environment-bound controller OIDC authority）、durable phase-specific
+completion receipt，以及每个 post-request wait 的稳定持久 origin；当前发布不提供
+这些正向 authority。
+
 ## 支持的公开边界
 
 普通 consumer 调用 trusted reusable workflow：
@@ -29,6 +38,7 @@ jobs:
     uses: Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2
     with:
       pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
+      selection-policy: joey-default
       controller-mode: ordinary
       observation-boundary: initial
 ```
@@ -173,6 +183,14 @@ ambiguous attempt 不得 replay。
 
 Environment name 本身不会配置或证明 wait timer。Copied fixture、绿色 composite step，
 或 creator 为 generic `github-actions[bot]` 的 status 都不是 activation proof。
+
+当前 reconciliation fixture 不能闭合这个边界：它的外层 wait job 由 caller 控制，
+reusable controller 没有经过认证的证据证明这些 job 确实运行。激活前，wait producer
+和 effect consumer 必须由同一个 immutable、已 review topology 控制；另一种选择是让
+controller 自身验证 Environment-bound OIDC identity。Activation change 还必须恢复
+automatic HTTP actor、aggregate retry/exhaustion loop、release diagnostic 与
+schedule row-state classification、near-capacity schedule dispatch 的
+whole-controller 正向覆盖；这些路径在当前 pre-activation guard 下有意不可达。
 
 ## v1 archive 边界
 

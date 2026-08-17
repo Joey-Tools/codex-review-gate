@@ -24,6 +24,16 @@ install the v2 reconcile graph, change a required status context, or claim that
 v2 is active. A successful publication is only an input to the separately
 reviewed activation phase.
 
+The published controller remains in a pre-activation profile. Its production
+effects authorities are false, and its protected ledger rejects non-empty
+public-wait completion history because this release contains no trusted
+completion producer. Deadlines, server time, route boundaries, and wake-up
+hints remain advisory only. Phase 2 must first deliver an immutable reviewed
+wait producer/consumer topology (or an Environment-bound controller OIDC
+authority), durable phase-specific completion receipts, and a persisted stable
+origin for post-request waits. The current caller-owned outer wait jobs do not
+satisfy that authority contract.
+
 ## Closed repository and ref contract
 
 The machine-readable pre-release baseline is
@@ -213,6 +223,10 @@ initial job. The activation review must preserve all of these contracts:
 - the complete event topology, the `17 */2 * * *` schedule, repository-wide
   `codex-review-gate-v2-${{ github.repository }}` concurrency with
   `cancel-in-progress: false`, and the `pull-request` dispatch input;
+- the initial job-level
+  `${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}`
+  admission filter, so ordinary issue comments never start the controller, and
+  the direct downstream `needs` chain without an `always()` bypass;
 - the schedule route's `scan-all-open` coordinator, its controller-owned
   durable candidate inventory/reservation, and its canonical matrix output;
   the per-candidate job must consume
@@ -241,6 +255,13 @@ one 15-minute `wait_timer` protection rule. The workflow's five-minute job
 timeout is not the public wait; the environment protection rule supplies that
 boundary. Missing, unreadable, early-released, or non-15-minute evidence blocks
 the rollout.
+
+The activation change must also restore positive whole-controller coverage
+that is intentionally unreachable under the pre-activation guard, including
+the automatic HTTP actor, aggregate retry and exhaustion loops, release-phase
+diagnostics, schedule row-state classification, and near-capacity scheduled
+dispatch. Lower-level protocol tests protect the dormant state-machine
+invariants in Phase 1; they are not live activation evidence.
 
 Treat the following as one required-context ruleset/branch-protection switch and
 use this forward order:

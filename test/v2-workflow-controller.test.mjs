@@ -28,6 +28,8 @@ import {
   createV2GitHubOidcProvenanceVerifier,
   createV2PreLeaseEvaluatedScopeAuthority,
   createV2GitHubEffectTransport,
+  createV2GitHubProductionAutomaticReviewRequestTransport,
+  createV2GitHubProductionReservationStatusTransport,
   createV2GitHubProductionStatusTransport,
   createV2GitHubLedgerStore,
   createV2GitHubReservationLedger,
@@ -78,6 +80,7 @@ import {
   V2_GIT_LEDGER_PROVENANCE_VERIFIER_RESULT_SCHEMA,
   V2_GIT_LEDGER_REF,
   calculateV2GitLedgerCandidateDispatchCommitBudget,
+  createV2GitHubGitLedgerBootstrap,
   createV2GitLedgerCandidateInventoryEvaluatedScopeReceipt,
   createV2GitLedgerCandidateInventoryRecord,
   deriveV2GitLedgerCandidateInventoryAuthority,
@@ -89,6 +92,24 @@ import {
   V2_GIT_LEDGER_CANDIDATE_DISPATCH_PLAN_SCHEMA,
   validateV2GitLedgerProvenanceReceipt,
 } from "../packages/action/src/v2/git-ledger.mjs";
+import {
+  assertV2ProductionRunnerAuthorityHandle,
+  createV2ControlPlaneReceiptFromGitLedgerAuthority,
+  createV2ProductionRunnerAuthority,
+} from "../packages/action/src/v2/control-plane-receipt.mjs";
+import {
+  reduceV2Snapshot,
+} from "../packages/action/src/v2/reducer.mjs";
+import {
+  runV2Operation,
+  V2_RUNNER_SCHEMA,
+  V2_RUNNER_SCHEMA_VERSION,
+} from "../packages/action/src/v2/runner.mjs";
+import {
+  assertV2WorkflowGitLedgerHandoffHandle,
+  createV2GitHubWorkflowPreflight,
+  createV2WorkflowGitLedgerHandoff,
+} from "../packages/action/src/v2/workflow-preflight.mjs";
 import {
   prepareV2WorkflowCommand,
   V2_STATUS_CONTEXT,
@@ -1012,6 +1033,165 @@ test("real status transport persists WAL before one POST 201 and exact GET", asy
     context: "codex/github-review-gate",
     description: "decision-clean",
   });
+});
+
+test("production status transport refetch uncertainty never retries its POST", async () => {
+  for (const mode of ["missing", "drift", "duplicate", "error"]) {
+    await withWorkflowCliFixture({
+      eventName: "pull_request_target",
+      event: { pull_request: { number: 7 } },
+      route: "ordinary",
+      pullRequest: "7",
+    }, async ({ environment }) => {
+      const context = await createDirectProductionIntentContext({ environment });
+      assert.equal(context.github.statusPostCount(), 0, mode);
+      assert.equal(context.github.statusRefetchCount(), 0, mode);
+      context.github.setStatusRefetchMode(mode);
+      const transport = createV2GitHubProductionStatusTransport({
+        fetch: context.github.fetch,
+        token: context.token,
+        restBaseUrl: context.restBaseUrl,
+        repository: context.command.repository,
+      });
+
+      await assert.rejects(
+        transport.performStatusWrite({
+          status_intent_handle: structuredClone(
+            context.statusIntentAppend.status_intent_handle,
+          ),
+        }),
+        (error) => error?.code === "UNTRUSTED_STATUS_WRITE_INTENT_HANDLE",
+        `${mode} cloned handle`,
+      );
+      assert.equal(context.github.statusPostCount(), 0, mode);
+      assert.equal(context.github.statusRefetchCount(), 0, mode);
+
+      await assert.rejects(
+        transport.performStatusWrite({
+          status_intent_handle:
+            context.statusIntentAppend.status_intent_handle,
+        }),
+        (error) => {
+          assert.notEqual(error?.code, "UNTRUSTED_STATUS_WRITE_INTENT_HANDLE");
+          return true;
+        },
+        mode,
+      );
+      assert.equal(context.github.statusPostCount(), 1, `${mode} POST count`);
+      assert.equal(
+        context.github.statusRefetchCount(),
+        1,
+        `${mode} exact GET count`,
+      );
+      assert.equal(
+        context.github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:status-write").length,
+        1,
+        mode,
+      );
+      assert.equal(
+        context.github.effectRecordKinds().includes(
+          "effect-response:status-write",
+        ),
+        false,
+        mode,
+      );
+    });
+  }
+});
+
+test("production automatic request transport preserves retry-zero POST/GET uncertainty", async () => {
+  const scenarios = [
+    { name: "uncertain POST", post: "throw", expected_refetches: 0 },
+    { name: "HTTP-error POST", post: "error", expected_refetches: 0 },
+    { name: "missing exact GET", refetch: "missing", expected_refetches: 1 },
+    { name: "drifting exact GET", refetch: "drift", expected_refetches: 1 },
+  ];
+  for (const scenario of scenarios) {
+    await withWorkflowCliFixture({
+      eventName: "pull_request_target",
+      event: { pull_request: { number: 7 } },
+      route: "ordinary",
+      pullRequest: "7",
+    }, async ({ environment }) => {
+      const context = await createDirectProductionIntentContext({
+        environment,
+        prepare_automatic_request: true,
+      });
+      assert.equal(context.github.statusPostCount(), 2, scenario.name);
+      assert.equal(context.github.statusRefetchCount(), 2, scenario.name);
+      assert.equal(context.reservationStatusReceipt.state, "pending");
+      assert.match(
+        context.reservationStatusReceipt.context,
+        /^codex\/github-review-gate-reservation\/[1-3]$/u,
+      );
+      assert.equal(context.github.requestPostCount(), 0, scenario.name);
+      assert.equal(context.github.requestRefetchCount(), 0, scenario.name);
+      if (scenario.post !== undefined) {
+        context.github.setRequestPostMode(scenario.post);
+      }
+      if (scenario.refetch !== undefined) {
+        context.github.setRequestRefetchMode(scenario.refetch);
+      }
+      const transport =
+        createV2GitHubProductionAutomaticReviewRequestTransport({
+          fetch: context.github.fetch,
+          token: context.token,
+          restBaseUrl: context.restBaseUrl,
+          repository: context.command.repository,
+          pull_number: context.command.pull_request.number,
+        });
+
+      await assert.rejects(
+        transport.performAutomaticReviewRequest({
+          automatic_request_intent_handle: structuredClone(
+            context.automaticRequestIntentAppend
+              .automatic_request_intent_handle,
+          ),
+        }),
+        (error) => error?.code ===
+          "UNTRUSTED_AUTOMATIC_REQUEST_INTENT_HANDLE",
+        `${scenario.name} cloned handle`,
+      );
+      assert.equal(context.github.requestPostCount(), 0, scenario.name);
+      assert.equal(context.github.requestRefetchCount(), 0, scenario.name);
+
+      await assert.rejects(
+        transport.performAutomaticReviewRequest({
+          automatic_request_intent_handle:
+            context.automaticRequestIntentAppend
+              .automatic_request_intent_handle,
+        }),
+        (error) => {
+          assert.notEqual(
+            error?.code,
+            "UNTRUSTED_AUTOMATIC_REQUEST_INTENT_HANDLE",
+          );
+          return true;
+        },
+        scenario.name,
+      );
+      assert.equal(context.github.requestPostCount(), 1, scenario.name);
+      assert.equal(
+        context.github.requestRefetchCount(),
+        scenario.expected_refetches,
+        scenario.name,
+      );
+      assert.equal(
+        context.github.effectRecordKinds().filter((kind) =>
+          kind === "effect-intent:review-request").length,
+        1,
+        scenario.name,
+      );
+      assert.equal(
+        context.github.effectRecordKinds().includes(
+          "effect-response:review-request",
+        ),
+        false,
+        scenario.name,
+      );
+    });
+  }
 });
 
 test("production status transport rejects a forged handle before any POST", async () => {
@@ -2625,7 +2805,7 @@ test("provider pre-scope selector rejects event replacement and wrong PR", async
   });
 });
 
-test("production assembler forms a branded preflight and OIDC bootstrap handoff", async () => {
+test("production assembler forms a branded handoff but denies unactivated effects", async () => {
   await withWorkflowCliFixture({
     eventName: "pull_request_target",
     event: { pull_request: { number: 7 } },
@@ -2668,175 +2848,120 @@ test("production assembler forms a branded preflight and OIDC bootstrap handoff"
       );
     assert.equal(
       failure?.code,
-      "LEDGER_BOOTSTRAP_FAILED",
+      "PRODUCTION_EFFECTS_UNAUTHORIZED",
       `${String(failure?.cause)} ${JSON.stringify(failure?.details)}`,
     );
-    assert.match(failure.details.handoff_digest, /^sha256:[0-9a-f]{64}$/u);
-    assert.match(
-      failure.details.preflight_receipt_digest,
-      /^sha256:[0-9a-f]{64}$/u,
+    assert.equal(failure.details.public_effects_performed, 0);
+    assert.equal(
+      failure.details.public_wait_production_effects_authorized,
+      false,
+    );
+    assert.equal(
+      failure.details.stability_production_effects_authorized,
+      false,
     );
     assert.ok(preflight.paths.includes("/repos/owner/repo"));
     assert.ok(preflight.paths.includes(
       "/repos/owner/repo/actions/oidc/customization/sub",
     ));
-    assert.ok(preflight.paths.includes(
+    assert.equal(preflight.paths.includes(
       "/repos/owner/repo/git/ref/heads/codex-review-gate-ledger-v2",
-    ));
+    ), false);
     assert.deepEqual(oidc.calls.map(({ kind }) => kind), ["discovery", "jwks"]);
   });
 });
 
-test("production initial route binds the full branded automatic request chain", async () => {
-  await withWorkflowCliFixture({
-    eventName: "pull_request_target",
-    event: { pull_request: { number: 7 } },
-    route: "ordinary",
-    pullRequest: "7",
-  }, async ({ environment }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const github = productionControllerGitHubFixture(command, oidc, liveTime);
-    const result = await runV2WorkflowControllerCli({
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    }, { fetch: github.fetch });
-    const cycle = result.cycle;
+test("production entry points deny unactivated public effects before protected-ledger writes", async () => {
+  for (const scenario of [
+    {
+      name: "single-PR run",
+      eventName: "pull_request_target",
+      event: { pull_request: { number: 7 } },
+      route: "ordinary",
+      pullRequest: "7",
+      candidateNumbers: null,
+      invoke(environment, fetch) {
+        return runV2WorkflowControllerCli(environment, { fetch });
+      },
+    },
+    {
+      name: "public single-PR run without a live canary",
+      eventName: "pull_request_target",
+      event: { pull_request: { number: 7 } },
+      route: "ordinary",
+      pullRequest: "7",
+      candidateNumbers: null,
+      repositoryVisibility: "public",
+      invoke(environment, fetch) {
+        return runV2WorkflowControllerCli(environment, { fetch });
+      },
+    },
+    {
+      name: "schedule dispatch",
+      eventName: "schedule",
+      event: {},
+      route: "scan-all-open",
+      pullRequest: "",
+      candidateNumbers: [7],
+      invoke(environment, fetch) {
+        return runV2ScheduleDispatchCli(environment, { fetch });
+      },
+    },
+  ]) {
+    await withWorkflowCliFixture({
+      eventName: scenario.eventName,
+      event: scenario.event,
+      route: scenario.route,
+      pullRequest: scenario.pullRequest,
+    }, async ({ environment }) => {
+      const command = await prepareV2WorkflowCommand(environment);
+      const liveTime = new Date().toISOString();
+      const oidc = productionOidcFixture(command, liveTime);
+      const github = productionControllerGitHubFixture(
+        command,
+        oidc,
+        liveTime,
+        {
+          candidateNumbers: scenario.candidateNumbers,
+          apiOrigin: "https://api.github.com",
+          repositoryVisibility: scenario.repositoryVisibility ?? "private",
+        },
+      );
+      const selectedEnvironment = {
+        ...environment,
+        ...oidc.environment,
+        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+        GITHUB_API_URL: "https://api.github.com",
+      };
 
-    assert.equal(cycle.terminal_result.effect_barrier,
-      "AUTOMATIC_REQUEST_EFFECT_BOUND");
-    assert.equal(cycle.terminal_result.status_effect_outcome, "bound");
-    assert.equal(cycle.terminal_result.reservation_status_effect_outcome, "bound");
-    assert.equal(cycle.terminal_result.automatic_request_effect_outcome, "bound");
-    assert.equal(cycle.terminal_result.status_plan, null);
-    assert.equal(cycle.terminal_result.request_plan, null);
-    assert.equal(cycle.terminal_result.comment_plan, null);
-    assert.equal(cycle.terminal_result.public_effects_performed, 3);
-    assert.equal(cycle.terminal_result.writes_performed, true);
-    assert.match(
-      cycle.terminal_result.initial_runner_state_authority_digest,
-      /^sha256:[0-9a-f]{64}$/u,
-    );
-    assert.equal(
-      cycle.terminal_result.established_runner_state_authority_digest,
-      null,
-    );
-    assert.equal(Object.hasOwn(cycle.terminal_result, "scheduler_plan"), false);
-    assert.equal(Object.hasOwn(cycle.terminal_result, "reducer_report"), false);
-    assert.equal(cycle.initial_result, null);
-    assert.equal(
-      cycle.binding_receipt.schema,
-      "codex-review-gate-git-ledger-automatic-review-request-binding-receipt-v2",
-    );
-    assert.equal(cycle.binding_receipt.actor.id, "789");
-    assert.equal(cycle.binding_receipt.actor.login, "github-actions[bot]");
-    assert.equal(cycle.binding_receipt.app.slug, "github-actions");
-    assert.equal(cycle.sticky_receipt, null);
-    assert.equal(cycle.status_receipts.length, 1);
-    assert.equal(cycle.status_receipts[0].target_sha, HEAD);
-    assert.equal(cycle.status_receipts[0].refetch_match_count, 1);
-    assert.equal(
-      cycle.terminal_result.scheduler_append_receipt.record_type,
-      "effect-intent",
-    );
-    assert.equal(
-      cycle.terminal_result.lease_release_receipt.record_type,
-      "lease-release",
-    );
-    assert.deepEqual(
-      Object.keys(cycle.ledger).sort(),
-      [
-        "automatic_request_attempt_append_receipt",
-        "automatic_request_binding_intent_append_receipt",
-        "automatic_request_binding_response_append_receipt",
-        "automatic_request_intent_append_receipt",
-        "automatic_request_review_response_append_receipt",
-        "automatic_reservation_append_receipt",
-        "lease_release_receipt",
-        "reservation_status_intent_append_receipt",
-        "reservation_status_response_append_receipt",
-        "scheduler_append_receipt",
-        "status_intent_append_receipt",
-        "status_response_append_receipt",
-      ],
-    );
-    assert.equal(github.activeLease(), false);
-    assert.deepEqual(github.externalWrites, [
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-      "POST /repos/owner/repo/issues/7/comments",
-    ]);
-    assert.equal(github.statusPostCount(), 2);
-    assert.equal(github.statusRefetchCount(), 2);
-    assert.equal(github.requestPostCount(), 1);
-    assert.equal(github.requestRefetchCount(), 1);
-    assert.deepEqual(github.effectRecordKinds().slice(-13), [
-      "lease-acquire:",
-      "effect-intent:scheduler-observation",
-      "effect-intent:status-write",
-      "effect-response:status-write",
-      "effect-intent:automatic-request-reservation",
-      "effect-intent:reservation-status-write",
-      "effect-response:reservation-status-write",
-      "effect-intent:effect-attempt",
-      "effect-intent:review-request",
-      "effect-response:review-request",
-      "effect-intent:request-binding",
-      "effect-response:request-binding",
-      "lease-release:",
-    ]);
-    assert.ok(oidc.tokens.length >= 1);
-    assert.equal(result.output.outputs["status-plan-path"], "");
-    assert.equal(result.output.outputs["reservation-path"], "");
-    assert.equal(result.output.outputs["intent-path"], "");
-    assert.notEqual(result.output.outputs["binding-receipt-path"], "");
-    assert.equal(result.output.outputs["sticky-receipt-path"], "");
-    assert.notEqual(result.output.outputs["report-path"], "");
-    assert.notEqual(result.output.outputs["ledger-receipt-path"], "");
-    assert.deepEqual(
-      JSON.parse(await readFile(environment.V2_CONTROLLER_OUTPUT_PATH, "utf8")),
-      result.output,
-    );
-    const report = JSON.parse(await readFile(
-      result.output.outputs["report-path"],
-      "utf8",
-    ));
-    const ledger = JSON.parse(await readFile(
-      result.output.outputs["ledger-receipt-path"],
-      "utf8",
-    ));
-    assert.equal(report.decision, cycle.terminal_result.decision);
-    assert.equal(Object.hasOwn(report, "reducer_report"), false);
-    assert.deepEqual(
-      Object.keys(ledger).sort(),
-      [
-        "automatic_request_attempt_append_receipt",
-        "automatic_request_binding_intent_append_receipt",
-        "automatic_request_binding_response_append_receipt",
-        "automatic_request_intent_append_receipt",
-        "automatic_request_review_response_append_receipt",
-        "automatic_reservation_append_receipt",
-        "lease_release_receipt",
-        "reservation_status_intent_append_receipt",
-        "reservation_status_response_append_receipt",
-        "scheduler_append_receipt",
-        "status_intent_append_receipt",
-        "status_response_append_receipt",
-      ],
-    );
-    assertNoProtectedProductionInternals(cycle);
-    assertNoProtectedProductionInternals(report, "report-artifact");
-    assertNoProtectedProductionInternals(ledger, "ledger-artifact");
-    assert.equal(
-      JSON.stringify({ cycle, report, ledger }).includes(
-        "synthetic-token-for-v2-controller-tests-only",
-      ),
-      false,
-    );
-  });
+      await assert.rejects(
+        scenario.invoke(selectedEnvironment, github.fetch),
+        (error) => {
+          assert.equal(error instanceof V2WorkflowControllerError, true);
+          assert.equal(error.code, "PRODUCTION_EFFECTS_UNAUTHORIZED");
+          assert.deepEqual(error.details, {
+            public_effects_performed: 0,
+            public_wait_production_effects_authorized: false,
+            stability_production_effects_authorized: false,
+            live_canary_required:
+              scenario.repositoryVisibility === "public",
+            live_canary_valid:
+              scenario.repositoryVisibility !== "public",
+          });
+          return true;
+        },
+        scenario.name,
+      );
+      assert.deepEqual(github.ledgerWriteRequests(), [], scenario.name);
+      assert.deepEqual(github.externalWriteRequests(), [], scenario.name);
+      assert.equal(github.ledgerTipCommitSha(), null, scenario.name);
+      assert.deepEqual(
+        oidc.calls.map(({ kind }) => kind),
+        ["discovery", "jwks"],
+        scenario.name,
+      );
+    });
+  }
 });
 
 test("production ledger API preflight precedes lease acquisition", async () => {
@@ -2901,1375 +3026,6 @@ test("production ledger API preflight rejects invalid status intent without effe
       assert.deepEqual(calls, [], `${variant} API must fail before effects`);
     }
   });
-
-test("production binds a terminal primary status before its head sentinel", async () => {
-  await withWorkflowCliFixture({
-    eventName: "pull_request_target",
-    event: { pull_request: { number: 7 } },
-    route: "ordinary",
-    pullRequest: "7",
-  }, async ({ environment }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const github = productionControllerGitHubFixture(command, oidc, liveTime, {
-      snapshotIssueComments: [productionTerminalFindingIssueComment()],
-    });
-
-    const result = await runV2WorkflowControllerCli({
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    }, { fetch: github.fetch });
-
-    assert.equal(result.cycle.terminal_result.decision, "findings");
-    assert.equal(result.cycle.terminal_result.status_effect_outcome, "bound");
-    assert.equal(result.cycle.terminal_result.public_effects_performed, 2);
-    assert.deepEqual(
-      result.cycle.status_receipts.map((receipt) => receipt.target_sha),
-      [MERGE, HEAD],
-    );
-    assert.deepEqual(github.externalWrites, [
-      `POST /repos/owner/repo/statuses/${MERGE}`,
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-    ]);
-    assert.equal(github.statusPostCount(), 2);
-    assert.equal(github.statusRefetchCount(), 2);
-    assert.deepEqual(github.effectRecordKinds().slice(-7), [
-      "lease-acquire:",
-      "effect-intent:scheduler-observation",
-      "effect-intent:status-write",
-      "effect-response:status-write",
-      "effect-intent:status-write",
-      "effect-response:status-write",
-      "lease-release:",
-    ]);
-    assertNoProtectedProductionInternals(result.cycle);
-  });
-});
-
-for (const failedIntentOrdinal of [1, 2]) {
-  test(`status transaction resumes a ${failedIntentOrdinal - 1}-write bound prefix`,
-    async () => {
-      await withWorkflowCliFixture({
-        eventName: "pull_request_target",
-        event: { pull_request: { number: 7 } },
-        route: "ordinary",
-        pullRequest: "7",
-      }, async ({ environment, runnerTemp }) => {
-        const command = await prepareV2WorkflowCommand(environment);
-        const liveTime = new Date().toISOString();
-        const oidc = productionOidcFixture(command, liveTime);
-        const github = productionControllerGitHubFixture(command, oidc, liveTime, {
-          snapshotIssueComments: [productionTerminalFindingIssueComment()],
-        });
-        github.failRecordUpdateAt(
-          "effect-intent:status-write",
-          failedIntentOrdinal,
-        );
-        const firstEnvironment = {
-          ...environment,
-          ...oidc.environment,
-          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.com",
-        };
-
-        await assert.rejects(
-          runV2WorkflowControllerCli(firstEnvironment, { fetch: github.fetch }),
-          (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-        );
-        assert.equal(github.statusPostCount(), failedIntentOrdinal - 1);
-        assert.equal(github.statusRefetchCount(), failedIntentOrdinal - 1);
-
-        const restartEnvironment = await makeWorkflowLegEnvironment({
-          environment: firstEnvironment,
-          runnerTemp,
-          name: `status-prefix-${failedIntentOrdinal}`,
-          runId: `12345${failedIntentOrdinal + 6}`,
-          route: "ordinary",
-          pullRequest: "7",
-        });
-        const restartCommand = await prepareV2WorkflowCommand(
-          restartEnvironment,
-        );
-        oidc.bindCommand(restartCommand);
-        const restarted = await runV2WorkflowControllerCli(
-          restartEnvironment,
-          { fetch: github.fetch },
-        );
-
-        assert.equal(restarted.cycle.terminal_result.decision, "findings");
-        assert.equal(
-          restarted.cycle.terminal_result.status_effect_outcome,
-          "bound",
-        );
-        assert.equal(
-          restarted.cycle.terminal_result.public_effects_performed,
-          3 - failedIntentOrdinal,
-        );
-        assert.deepEqual(
-          restarted.cycle.status_receipts.map((receipt) => receipt.target_sha),
-          failedIntentOrdinal === 1 ? [MERGE, HEAD] : [HEAD],
-        );
-        assert.deepEqual(github.externalWrites, [
-          `POST /repos/owner/repo/statuses/${MERGE}`,
-          `POST /repos/owner/repo/statuses/${HEAD}`,
-        ]);
-        assert.equal(github.statusPostCount(), 2);
-        assert.equal(github.statusRefetchCount(), 2);
-        assert.equal(
-          github.effectRecordKinds().filter((kind) =>
-            kind === "effect-intent:status-write").length,
-          2,
-        );
-        assert.equal(
-          github.effectRecordKinds().filter((kind) =>
-            kind === "effect-response:status-write").length,
-          2,
-        );
-        assert.equal(github.requestPostCount(), 0);
-        assertNoProtectedProductionInternals(restarted.cycle);
-      });
-    });
-}
-
-for (const failedResponseOrdinal of [1, 2]) {
-  test(`status response ${failedResponseOrdinal} crash never replays its public write`,
-    async () => {
-      await withWorkflowCliFixture({
-        eventName: "pull_request_target",
-        event: { pull_request: { number: 7 } },
-        route: "ordinary",
-        pullRequest: "7",
-      }, async ({ environment, runnerTemp }) => {
-        const command = await prepareV2WorkflowCommand(environment);
-        const liveTime = new Date().toISOString();
-        const oidc = productionOidcFixture(command, liveTime);
-        const github = productionControllerGitHubFixture(command, oidc, liveTime, {
-          snapshotIssueComments: [productionTerminalFindingIssueComment()],
-        });
-        github.failRecordUpdateAt(
-          "effect-response:status-write",
-          failedResponseOrdinal,
-        );
-        const firstEnvironment = {
-          ...environment,
-          ...oidc.environment,
-          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.com",
-        };
-
-        await assert.rejects(
-          runV2WorkflowControllerCli(firstEnvironment, { fetch: github.fetch }),
-          (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-        );
-        assert.equal(github.statusPostCount(), failedResponseOrdinal);
-        assert.equal(github.statusRefetchCount(), failedResponseOrdinal);
-
-        const restartEnvironment = await makeWorkflowLegEnvironment({
-          environment: firstEnvironment,
-          runnerTemp,
-          name: `status-response-crash-${failedResponseOrdinal}`,
-          runId: `12346${failedResponseOrdinal}`,
-          route: "ordinary",
-          pullRequest: "7",
-        });
-        const restartCommand = await prepareV2WorkflowCommand(
-          restartEnvironment,
-        );
-        oidc.bindCommand(restartCommand);
-        await assert.rejects(
-          runV2WorkflowControllerCli(restartEnvironment, { fetch: github.fetch }),
-          (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-        );
-
-        assert.equal(github.statusPostCount(), failedResponseOrdinal);
-        assert.equal(github.statusRefetchCount(), failedResponseOrdinal);
-        assert.equal(
-          github.effectRecordKinds().filter((kind) =>
-            kind === "effect-intent:status-write").length,
-          failedResponseOrdinal,
-        );
-        assert.equal(
-          github.effectRecordKinds().filter((kind) =>
-            kind === "effect-response:status-write").length,
-          failedResponseOrdinal - 1,
-        );
-        assert.equal(github.requestPostCount(), 0);
-      });
-    });
-}
-
-test("second terminal status ambiguity consumes its suffix without retry", async () => {
-  await withWorkflowCliFixture({
-    eventName: "pull_request_target",
-    event: { pull_request: { number: 7 } },
-    route: "ordinary",
-    pullRequest: "7",
-  }, async ({ environment, runnerTemp }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const github = productionControllerGitHubFixture(command, oidc, liveTime, {
-      snapshotIssueComments: [productionTerminalFindingIssueComment()],
-    });
-    github.setStatusRefetchModeAt(2, "missing");
-    const firstEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const first = await runV2WorkflowControllerCli(firstEnvironment, {
-      fetch: github.fetch,
-    });
-
-    assert.equal(first.cycle.terminal_result.status_effect_outcome, "ambiguous");
-    assert.equal(first.cycle.terminal_result.public_effects_performed, 2);
-    assert.deepEqual(
-      first.cycle.status_receipts.map((receipt) => receipt.target_sha),
-      [MERGE],
-    );
-    assert.equal(first.cycle.ledger.status_response_append_receipt, null);
-    assert.deepEqual(github.externalWrites, [
-      `POST /repos/owner/repo/statuses/${MERGE}`,
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-    ]);
-
-    const restartEnvironment = await makeWorkflowLegEnvironment({
-      environment: firstEnvironment,
-      runnerTemp,
-      name: "ambiguous-status-suffix",
-      runId: "123459",
-      route: "ordinary",
-      pullRequest: "7",
-    });
-    const restartCommand = await prepareV2WorkflowCommand(restartEnvironment);
-    oidc.bindCommand(restartCommand);
-    await assert.rejects(
-      runV2WorkflowControllerCli(restartEnvironment, { fetch: github.fetch }),
-      (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-    );
-    assert.equal(github.statusPostCount(), 2);
-    assert.equal(github.statusRefetchCount(), 2);
-    assert.equal(
-      github.effectRecordKinds().filter((kind) =>
-        kind === "effect-intent:status-write").length,
-      2,
-    );
-    assert.equal(
-      github.effectRecordKinds().filter((kind) =>
-        kind === "effect-response:status-write").length,
-      1,
-    );
-  });
-});
-
-for (const refetchMode of ["missing", "drift", "duplicate", "error"]) {
-  test(`status ${refetchMode} refetch consumes one intent without retry`, async () => {
-    await withWorkflowCliFixture({
-      eventName: "pull_request_target",
-      event: { pull_request: { number: 7 } },
-      route: "ordinary",
-      pullRequest: "7",
-    }, async ({ environment }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const github = productionControllerGitHubFixture(command, oidc, liveTime);
-      github.setStatusRefetchMode(refetchMode);
-      const result = await runV2WorkflowControllerCli({
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      }, { fetch: github.fetch });
-      const cycle = result.cycle;
-
-      assert.equal(cycle.terminal_result.effect_barrier,
-        "STATUS_EFFECT_AMBIGUOUS_CONSUMED");
-      assert.equal(cycle.terminal_result.status_effect_outcome, "ambiguous");
-      assert.equal(cycle.terminal_result.status_ambiguity_code,
-        "STATUS_EFFECT_AMBIGUOUS");
-      assert.equal(cycle.terminal_result.public_effects_performed, 1);
-      assert.equal(cycle.terminal_result.writes_performed, true);
-      assert.equal(cycle.status_receipts.length, 0);
-      assert.notEqual(cycle.ledger.status_intent_append_receipt, null);
-      assert.equal(cycle.ledger.status_response_append_receipt, null);
-      assert.equal(cycle.ledger.lease_release_receipt.record_type,
-        "lease-release");
-      assert.equal(github.activeLease(), false);
-      assert.equal(github.statusPostCount(), 1);
-      assert.equal(github.statusRefetchCount(), 1);
-      assert.deepEqual(github.externalWrites, [
-        `POST /repos/owner/repo/statuses/${HEAD}`,
-      ]);
-      assert.deepEqual(github.effectRecordKinds().slice(-4), [
-        "lease-acquire:",
-        "effect-intent:scheduler-observation",
-        "effect-intent:status-write",
-        "lease-release:",
-      ]);
-      assert.equal(cycle.terminal_result.status_plan, null);
-      assert.equal(cycle.terminal_result.request_plan, null);
-      assert.equal(cycle.terminal_result.comment_plan, null);
-      assert.equal(result.output.outputs["status-plan-path"], "");
-      assertNoProtectedProductionInternals(cycle);
-    });
-  });
-}
-
-for (const requestCase of [
-  { name: "uncertain POST", post: "throw", refetches: 0 },
-  { name: "HTTP-error POST", post: "error", refetches: 0 },
-  { name: "missing exact GET", refetch: "missing", refetches: 1 },
-  { name: "drifting exact GET", refetch: "drift", refetches: 1 },
-  {
-    name: "pre/post scope drift",
-    scope: "drift",
-    refetches: 1,
-    ambiguity_code: "AUTOMATIC_REQUEST_SCOPE_DRIFT",
-  },
-]) {
-  test(`automatic request ${requestCase.name} consumes one attempt without retry`,
-    async () => {
-      await withWorkflowCliFixture({
-        eventName: "pull_request_target",
-        event: { pull_request: { number: 7 } },
-        route: "ordinary",
-        pullRequest: "7",
-      }, async ({ environment }) => {
-        const command = await prepareV2WorkflowCommand(environment);
-        const liveTime = new Date().toISOString();
-        const oidc = productionOidcFixture(command, liveTime);
-        const github = productionControllerGitHubFixture(command, oidc, liveTime);
-        if (requestCase.post !== undefined) {
-          github.setRequestPostMode(requestCase.post);
-        }
-        if (requestCase.refetch !== undefined) {
-          github.setRequestRefetchMode(requestCase.refetch);
-        }
-        if (requestCase.scope !== undefined) {
-          github.setRequestScopeMode(requestCase.scope);
-        }
-        const result = await runV2WorkflowControllerCli({
-          ...environment,
-          ...oidc.environment,
-          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.com",
-        }, { fetch: github.fetch });
-        const cycle = result.cycle;
-
-        assert.equal(
-          cycle.terminal_result.effect_barrier,
-          "AUTOMATIC_REQUEST_EFFECT_AMBIGUOUS_CONSUMED",
-        );
-        assert.equal(cycle.terminal_result.status_effect_outcome, "bound");
-        assert.equal(
-          cycle.terminal_result.reservation_status_effect_outcome,
-          "bound",
-        );
-        assert.equal(
-          cycle.terminal_result.automatic_request_effect_outcome,
-          "ambiguous",
-        );
-        assert.equal(
-          cycle.terminal_result.automatic_request_ambiguity_code,
-          requestCase.ambiguity_code ?? "AUTOMATIC_REQUEST_EFFECT_AMBIGUOUS",
-        );
-        assert.equal(cycle.terminal_result.status_plan, null);
-        assert.equal(cycle.terminal_result.request_plan, null);
-        assert.equal(cycle.terminal_result.comment_plan, null);
-        assert.equal(cycle.terminal_result.public_effects_performed, 3);
-        assert.equal(cycle.binding_receipt, null);
-        assert.notEqual(
-          cycle.ledger.automatic_request_attempt_append_receipt,
-          null,
-        );
-        assert.notEqual(cycle.ledger.automatic_request_intent_append_receipt, null);
-        assert.equal(
-          cycle.ledger.automatic_request_review_response_append_receipt,
-          null,
-        );
-        assert.equal(
-          cycle.ledger.automatic_request_binding_intent_append_receipt,
-          null,
-        );
-        assert.equal(
-          cycle.ledger.automatic_request_binding_response_append_receipt,
-          null,
-        );
-        assert.equal(github.requestPostCount(), 1);
-        assert.equal(github.requestRefetchCount(), requestCase.refetches);
-        assert.equal(github.statusPostCount(), 2);
-        assert.equal(github.statusRefetchCount(), 2);
-        assert.equal(github.activeLease(), false);
-        assert.equal(
-          github.effectRecordKinds().includes("effect-response:review-request"),
-          false,
-        );
-        assert.equal(
-          github.effectRecordKinds().includes("effect-intent:request-binding"),
-          false,
-        );
-        assert.equal(result.output.outputs["binding-receipt-path"], "");
-        assertNoProtectedProductionInternals(cycle);
-      });
-    });
-}
-
-test("automatic request binding resumes internal ledger appends without a second POST",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "pull_request_target",
-      event: { pull_request: { number: 7 } },
-      route: "ordinary",
-      pullRequest: "7",
-    }, async ({ environment }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const github = productionControllerGitHubFixture(command, oidc, liveTime);
-      github.failNextRecordUpdates(
-        "effect-response:review-request",
-        "effect-intent:request-binding",
-        "effect-response:request-binding",
-      );
-      const result = await runV2WorkflowControllerCli({
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      }, { fetch: github.fetch });
-
-      assert.equal(
-        result.cycle.terminal_result.automatic_request_effect_outcome,
-        "bound",
-      );
-      assert.equal(result.cycle.terminal_result.public_effects_performed, 3);
-      assert.equal(github.requestPostCount(), 1);
-      assert.equal(github.requestRefetchCount(), 1);
-      const kinds = github.effectRecordKinds();
-      assert.equal(
-        kinds.filter((kind) => kind === "effect-response:review-request").length,
-        1,
-      );
-      assert.equal(
-        kinds.filter((kind) => kind === "effect-intent:request-binding").length,
-        1,
-      );
-      assert.equal(
-        kinds.filter((kind) => kind === "effect-response:request-binding").length,
-        1,
-      );
-      assert.equal(github.activeLease(), false);
-      assertNoProtectedProductionInternals(result.cycle);
-    });
-  });
-
-test("intent-persisted restart consumes the existing automatic request attempt",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "pull_request_target",
-      event: { pull_request: { number: 7 } },
-      route: "ordinary",
-      pullRequest: "7",
-    }, async ({ environment, runnerTemp }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const github = productionControllerGitHubFixture(command, oidc, liveTime);
-      github.failNextRecordUpdates("effect-intent:effect-attempt");
-      const firstEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-
-      await assert.rejects(
-        runV2WorkflowControllerCli(firstEnvironment, { fetch: github.fetch }),
-        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-      );
-      assert.equal(github.requestPostCount(), 0);
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:automatic-request-reservation").length,
-        1,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:effect-attempt").length,
-        0,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:review-request").length,
-        0,
-      );
-
-      const restartEnvironment = await makeWorkflowLegEnvironment({
-        environment: firstEnvironment,
-        runnerTemp,
-        name: "intent-persisted-restart",
-        runId: "123457",
-        route: "ordinary",
-        pullRequest: "7",
-      });
-      const restartCommand = await prepareV2WorkflowCommand(restartEnvironment);
-      oidc.bindCommand(restartCommand);
-      const restarted = await runV2WorkflowControllerCli(restartEnvironment, {
-        fetch: github.fetch,
-      });
-
-      assert.equal(
-        restarted.cycle.terminal_result.automatic_request_effect_outcome,
-        "bound",
-      );
-      assert.equal(restarted.cycle.terminal_result.public_effects_performed, 1);
-      assert.equal(github.requestPostCount(), 1);
-      assert.equal(github.requestRefetchCount(), 1);
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:automatic-request-reservation").length,
-        1,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:effect-attempt").length,
-        1,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:review-request").length,
-        1,
-      );
-      assertNoProtectedProductionInternals(restarted.cycle);
-    });
-  });
-
-test("production advances addressed findings through three automatic generations",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "pull_request_target",
-      event: { pull_request: { number: 7 } },
-      route: "ordinary",
-      pullRequest: "7",
-    }, async ({ environment, runnerTemp }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const github = productionControllerGitHubFixture(command, oidc, liveTime, {
-        serverTimeStepMilliseconds: 500,
-      });
-      const firstEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const runLeg = async (name, runId) => {
-        const legEnvironment = await makeWorkflowLegEnvironment({
-          environment: firstEnvironment,
-          runnerTemp,
-          name,
-          runId,
-          route: "ordinary",
-          pullRequest: "7",
-        });
-        const legCommand = await prepareV2WorkflowCommand(legEnvironment);
-        oidc.bindCommand(legCommand);
-        return runV2WorkflowControllerCli(legEnvironment, {
-          fetch: github.fetch,
-        });
-      };
-      const addressLatestRequest = (ordinal) => {
-        const request = github.requestComments().at(-1);
-        assert.ok(request, `automatic generation ${ordinal} request exists`);
-        const finding = productionAutomaticRecoveryFinding({
-          id: 2_000 + ordinal * 10,
-          request,
-        });
-        const address = productionAutomaticRecoveryAddress({
-          id: 2_000 + ordinal * 10 + 1,
-          finding,
-        });
-        github.addSnapshotIssueComments(finding, address);
-      };
-
-      await runV2WorkflowControllerCli(firstEnvironment, {
-        fetch: github.fetch,
-      });
-      assert.equal(github.requestPostCount(), 1);
-      addressLatestRequest(1);
-
-      const firstRecovery = await runLeg("automatic-recovery-1", "123461");
-      assert.equal(firstRecovery.cycle.terminal_result.decision, "findings");
-      assert.equal(firstRecovery.cycle.terminal_result.public_effects_performed, 2);
-      assert.equal(github.requestPostCount(), 1);
-      assertNoProtectedProductionInternals(firstRecovery.cycle);
-      assert.doesNotMatch(
-        JSON.stringify(firstRecovery.cycle),
-        PROTECTED_AUTOMATIC_RECOVERY_INTERNAL,
-      );
-
-      const firstTransition = await runLeg(
-        "automatic-transition-1",
-        "123462",
-      );
-      assert.equal(firstTransition.cycle.terminal_result.decision, "findings");
-      assert.equal(github.requestPostCount(), 1);
-      assert.equal(
-        firstTransition.cycle.terminal_result.public_effects_performed,
-        0,
-      );
-      const secondGeneration = await runLeg(
-        "automatic-generation-2",
-        "123463",
-      );
-      assert.equal(secondGeneration.cycle.terminal_result.decision, "findings");
-      assert.equal(github.requestPostCount(), 2);
-      assert.equal(
-        secondGeneration.cycle.terminal_result.public_effects_performed,
-        2,
-      );
-      addressLatestRequest(2);
-
-      await runLeg("automatic-recovery-2", "123464");
-      assert.equal(github.requestPostCount(), 2);
-      const secondTransition = await runLeg(
-        "automatic-transition-2",
-        "123465",
-      );
-      assert.equal(secondTransition.cycle.terminal_result.decision, "findings");
-      assert.equal(github.requestPostCount(), 2);
-      assert.equal(
-        secondTransition.cycle.terminal_result.public_effects_performed,
-        0,
-      );
-      const thirdGeneration = await runLeg(
-        "automatic-generation-3",
-        "123466",
-      );
-      assert.equal(github.requestPostCount(), 3);
-      assert.equal(
-        thirdGeneration.cycle.terminal_result.public_effects_performed,
-        2,
-      );
-      addressLatestRequest(3);
-
-      const terminalThird = await runLeg(
-        "automatic-generation-3-terminal",
-        "123467",
-      );
-      const noFourth = await runLeg("automatic-no-generation-4", "123468");
-      assert.equal(terminalThird.cycle.terminal_result.decision, "findings");
-      assert.equal(noFourth.cycle.terminal_result.decision, "findings");
-      assert.equal(github.requestPostCount(), 3);
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:automatic-request-reservation").length,
-        3,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:scheduler-state").length,
-        2,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-response:scheduler-state").length,
-        2,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:artifact-binding").length,
-        2,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-intent:artifact-binding-ready").length,
-        2,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-response:artifact-binding-ready").length,
-        2,
-      );
-      assert.equal(
-        github.effectRecordKinds().filter((kind) =>
-          kind === "effect-response:artifact-binding").length,
-        2,
-      );
-      assert.equal(github.artifactBindingPointReadRequests().length, 2);
-      const postGenerations = github.schedulerObservationActions()
-        .flatMap((observation) => observation.scheduler_plan.actions)
-        .filter((action) => action.kind === "post_review_request")
-        .map((action) => action.generation_id);
-      assert.deepEqual(postGenerations, [
-        "automatic:1",
-        "automatic:2",
-        "automatic:3",
-      ]);
-      assert.equal(github.activeLease(), false);
-      assertNoProtectedProductionInternals(noFourth.cycle);
-      assertFixtureServerClockWithinOidcSkew(github);
-    });
-  });
-
-test("aggregate recovery point reads retry one complete ordered batch", async () => {
-  await withProductionAutomaticRecoveryScenario(async ({
-    github,
-    runLeg,
-    addFindings,
-  }) => {
-    addFindings([3010, 3020]);
-    github.setArtifactBindingEqualDateReads(2);
-
-    const bound = await runLeg("aggregate-ordered-retry");
-
-    assert.equal(bound.cycle.terminal_result.decision, "findings");
-    assert.equal(bound.cycle.terminal_result.public_effects_performed, 2);
-    assert.deepEqual(
-      github.artifactBindingPointReadRequests(),
-      [3010, 3020, 3010, 3020].map((id) =>
-        `/repos/owner/repo/issues/comments/${id}`),
-    );
-    const kinds = github.effectRecordKinds();
-    assert.equal(kinds.filter((kind) =>
-      kind === "effect-intent:artifact-binding").length, 1);
-    assert.equal(kinds.filter((kind) =>
-      kind === "effect-intent:artifact-binding-ready").length, 1);
-    assert.equal(kinds.filter((kind) =>
-      kind === "effect-response:artifact-binding-ready").length, 1);
-    assert.equal(kinds.filter((kind) =>
-      kind === "effect-response:artifact-binding").length, 1);
-    assert.equal(github.requestPostCount(), 1);
-    assert.equal(github.activeLease(), false);
-    assertNoProtectedProductionInternals(bound.cycle);
-    assert.doesNotMatch(
-      JSON.stringify(bound.cycle),
-      PROTECTED_AUTOMATIC_RECOVERY_INTERNAL,
-    );
-    assertFixtureServerClockWithinOidcSkew(github);
-  });
-});
-
-test("aggregate recovery exhausts equal-Date reads without weakening stage 9",
-  async () => {
-    await withProductionAutomaticRecoveryScenario(async ({
-      github,
-      runLeg,
-      addFindings,
-    }) => {
-      addFindings([3030]);
-      github.setArtifactBindingEqualDateAlways();
-
-      await assert.rejects(
-        runLeg("aggregate-equal-date-exhausted"),
-        (error) =>
-          error?.code === "INITIAL_OBSERVATION_ABORTED" &&
-          error?.details?.upstream_code ===
-            "automatic-artifact-binding-point-read-too-early",
-      );
-      assert.deepEqual(
-        github.artifactBindingPointReadRequests(),
-        Array(4).fill("/repos/owner/repo/issues/comments/3030"),
-      );
-      let kinds = github.effectRecordKinds();
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-intent:artifact-binding").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-intent:artifact-binding-ready").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding-ready").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding").length, 0);
-      assert.equal(github.activeLease(), false);
-
-      github.setArtifactBindingEqualDateAlways(false);
-      const resumed = await runLeg("aggregate-equal-date-resumed");
-      kinds = github.effectRecordKinds();
-      assert.equal(
-        github.artifactBindingPointReadRequests().length,
-        5,
-      );
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-intent:artifact-binding").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-intent:artifact-binding-ready").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding-ready").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding").length, 1);
-      assert.equal(resumed.cycle.terminal_result.public_effects_performed, 0);
-      assertNoProtectedProductionInternals(resumed.cycle);
-      assert.equal(github.activeLease(), false);
-      assertFixtureServerClockWithinOidcSkew(github);
-    });
-  });
-
-for (const durablePrefixKind of [
-  "effect-intent:artifact-binding",
-  "effect-intent:artifact-binding-ready",
-  "effect-response:artifact-binding-ready",
-]) {
-  test(`aggregate recovery resumes durable ${durablePrefixKind} without replay`,
-    async () => {
-      await withProductionAutomaticRecoveryScenario(async ({
-        github,
-        runLeg,
-        addFindings,
-      }) => {
-        addFindings([3040]);
-        github.failNextDurableRecordUpdates(durablePrefixKind);
-
-        await assert.rejects(
-          runLeg(`durable-prefix-${durablePrefixKind.replaceAll(":", "-")}`),
-          (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-        );
-        const resumed = await runLeg(
-          `durable-prefix-resume-${durablePrefixKind.replaceAll(":", "-")}`,
-        );
-
-        const kinds = github.effectRecordKinds();
-        assert.equal(kinds.filter((kind) =>
-          kind === "effect-intent:artifact-binding").length, 1);
-        assert.equal(kinds.filter((kind) =>
-          kind === "effect-intent:artifact-binding-ready").length, 1);
-        assert.equal(kinds.filter((kind) =>
-          kind === "effect-response:artifact-binding-ready").length, 1);
-        assert.equal(kinds.filter((kind) =>
-          kind === "effect-response:artifact-binding").length, 1);
-        assert.equal(github.artifactBindingPointReadRequests().length, 1);
-        assert.equal(github.requestPostCount(), 1);
-        assert.equal(github.activeLease(), false);
-        assertNoProtectedProductionInternals(resumed.cycle);
-        assertFixtureServerClockWithinOidcSkew(github);
-      });
-    });
-}
-
-test("durable stage 9 return loss transitions without a second point read",
-  async () => {
-    await withProductionAutomaticRecoveryScenario(async ({
-      github,
-      runLeg,
-      addFindings,
-    }) => {
-      addFindings([3050]);
-      github.failNextDurableRecordUpdates(
-        "effect-response:artifact-binding",
-      );
-
-      await assert.rejects(
-        runLeg("durable-stage-9-return-loss"),
-        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-      );
-      assert.equal(github.artifactBindingPointReadRequests().length, 1);
-      let kinds = github.effectRecordKinds();
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding").length, 1);
-
-      const transitioned = await runLeg("durable-stage-9-transition");
-      kinds = github.effectRecordKinds();
-      assert.equal(github.artifactBindingPointReadRequests().length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-intent:scheduler-state").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:scheduler-state").length, 1);
-      assert.equal(
-        transitioned.cycle.terminal_result.public_effects_performed,
-        0,
-      );
-      assert.equal(github.requestPostCount(), 1);
-      assert.equal(github.activeLease(), false);
-      assertNoProtectedProductionInternals(transitioned.cycle);
-      assertFixtureServerClockWithinOidcSkew(github);
-    });
-  });
-
-test("queued artifact suffix survives a point-read abort in exact chain order",
-  async () => {
-    await withProductionAutomaticRecoveryScenario(async ({
-      github,
-      runLeg,
-      addFindings,
-    }) => {
-      addFindings([3100]);
-      github.failNextDurableRecordUpdates(
-        "effect-response:artifact-binding-ready",
-      );
-      await assert.rejects(
-        runLeg("queued-prefix-stage-8-return-loss"),
-        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-      );
-
-      addFindings([3120]);
-      github.failArtifactBindingPointReadAt(1);
-      await assert.rejects(
-        runLeg("queued-prefix-point-read-abort"),
-        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-      );
-      assert.equal(github.activeLease(), false);
-
-      const suffixBound = await runLeg(
-        "queued-prefix-parent-and-suffix-response",
-      );
-
-      assert.deepEqual(
-        github.artifactBindingPointReadRequests(),
-        [3100, 3100, 3120].map((id) =>
-          `/repos/owner/repo/issues/comments/${id}`),
-      );
-      assert.deepEqual(
-        github.effectRecordKinds().filter((kind) =>
-          kind.includes("artifact-binding")),
-        [
-          "effect-intent:artifact-binding",
-          "effect-intent:artifact-binding-ready",
-          "effect-response:artifact-binding-ready",
-          "effect-intent:artifact-binding",
-          "effect-response:artifact-binding",
-          "effect-intent:artifact-binding-ready",
-          "effect-response:artifact-binding-ready",
-          "effect-response:artifact-binding",
-        ],
-      );
-      assert.equal(github.activeLease(), false);
-      assertNoProtectedProductionInternals(suffixBound.cycle);
-      assertFixtureServerClockWithinOidcSkew(github);
-    });
-  });
-
-test("queued artifact release failure reports the latest reachable append",
-  async () => {
-    await withProductionAutomaticRecoveryScenario(async ({
-      github,
-      runLeg,
-      addFindings,
-    }) => {
-      addFindings([3140]);
-      github.failNextDurableRecordUpdates(
-        "effect-response:artifact-binding-ready",
-      );
-      await assert.rejects(
-        runLeg("queued-release-stage-8-return-loss"),
-        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-      );
-      const [staleReadyReceiptDigest] =
-        github.artifactBindingReadyConfirmationRecoveryReceiptDigests();
-      assert.match(staleReadyReceiptDigest, /^sha256:[0-9a-f]{64}$/u);
-
-      addFindings([3160]);
-      github.failArtifactBindingPointReadAt(1);
-      github.failNextRelease();
-      await assert.rejects(
-        runLeg("queued-release-point-read-failure"),
-        (error) => {
-          assert.equal(error?.code, "PRODUCTION_LEASE_RELEASE_FAILED");
-          assert.equal(
-            error.details.phase,
-            "abort:automatic-recovery-artifact-binding-point-read",
-          );
-          assert.equal(error.details.budget_refunded, false);
-          assert.equal(error.details.public_effects_performed, 0);
-          assert.match(
-            error.details.last_reachable_receipt_digest,
-            /^sha256:[0-9a-f]{64}$/u,
-          );
-          assert.notEqual(
-            error.details.last_reachable_receipt_digest,
-            staleReadyReceiptDigest,
-          );
-          return true;
-        },
-      );
-      assert.deepEqual(
-        github.artifactBindingPointReadRequests(),
-        ["/repos/owner/repo/issues/comments/3140"],
-      );
-      assert.equal(github.activeLease(), true);
-      assertFixtureServerClockWithinOidcSkew(github);
-    });
-  });
-
-test("partial aggregate point-read failure restarts the whole ordered batch",
-  async () => {
-    await withProductionAutomaticRecoveryScenario(async ({
-      github,
-      runLeg,
-      addFindings,
-    }) => {
-      addFindings([3070, 3080]);
-      github.failArtifactBindingPointReadAt(2);
-
-      await assert.rejects(
-        runLeg("aggregate-partial-point-read-failure"),
-        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-      );
-      assert.deepEqual(
-        github.artifactBindingPointReadRequests(),
-        [3070, 3080].map((id) =>
-          `/repos/owner/repo/issues/comments/${id}`),
-      );
-      let kinds = github.effectRecordKinds();
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding").length, 0);
-      assert.equal(github.activeLease(), false);
-
-      const resumed = await runLeg("aggregate-partial-point-read-resume");
-      assert.deepEqual(
-        github.artifactBindingPointReadRequests(),
-        [3070, 3080, 3070, 3080].map((id) =>
-          `/repos/owner/repo/issues/comments/${id}`),
-      );
-      kinds = github.effectRecordKinds();
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-intent:artifact-binding").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-intent:artifact-binding-ready").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding-ready").length, 1);
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding").length, 1);
-      assert.equal(resumed.cycle.terminal_result.public_effects_performed, 0);
-      assert.equal(github.requestPostCount(), 1);
-      assert.equal(github.activeLease(), false);
-      assertNoProtectedProductionInternals(resumed.cycle);
-      assertFixtureServerClockWithinOidcSkew(github);
-    });
-  });
-
-test("aggregate binding release failure retains its exact no-refund phase",
-  async () => {
-    await withProductionAutomaticRecoveryScenario(async ({
-      github,
-      runLeg,
-      addFindings,
-    }) => {
-      addFindings([3090]);
-      github.failNextRelease();
-
-      await assert.rejects(
-        runLeg("aggregate-binding-release-failure"),
-        (error) =>
-          error?.code === "PRODUCTION_LEASE_RELEASE_FAILED" &&
-          error?.details?.phase ===
-            "automatic-recovery-artifact-binding-bound-release" &&
-          error?.details?.budget_refunded === false,
-      );
-      const kinds = github.effectRecordKinds();
-      assert.equal(kinds.filter((kind) =>
-        kind === "effect-response:artifact-binding").length, 1);
-      assert.equal(github.artifactBindingPointReadRequests().length, 1);
-      assert.equal(github.requestPostCount(), 1);
-      assert.equal(github.activeLease(), true);
-      assertFixtureServerClockWithinOidcSkew(github);
-    }, { serverTimeStepMilliseconds: 1_000 });
-  });
-
-test("status ambiguity blocks both recovery authorities", async () => {
-  await withProductionAutomaticRecoveryScenario(async ({
-    github,
-    runLeg,
-    addFindings,
-  }) => {
-    addFindings([3060]);
-    github.setStatusRefetchModeAt(github.statusPostCount() + 1, "missing");
-
-    const ambiguous = await runLeg("status-ambiguous-recovery");
-
-    assert.equal(
-      ambiguous.cycle.terminal_result.status_effect_outcome,
-      "ambiguous",
-    );
-    assert.equal(
-      ambiguous.cycle.terminal_result.public_effects_performed,
-      1,
-    );
-    assert.equal(github.artifactBindingPointReadRequests().length, 0);
-    const kinds = github.effectRecordKinds();
-    assert.equal(kinds.some((kind) => kind.includes("artifact-binding")), false);
-    assert.equal(kinds.some((kind) => kind.endsWith(":scheduler-state")), false);
-    assert.equal(github.requestPostCount(), 1);
-    assert.equal(github.activeLease(), false);
-    assertNoProtectedProductionInternals(ambiguous.cycle);
-    assertFixtureServerClockWithinOidcSkew(github);
-  });
-});
-
-test("bound automatic request fails closed when its no-refund lease release fails", async () => {
-  await withWorkflowCliFixture({
-    eventName: "pull_request_target",
-    event: { pull_request: { number: 7 } },
-    route: "ordinary",
-    pullRequest: "7",
-  }, async ({ environment }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const github = productionControllerGitHubFixture(command, oidc, liveTime);
-    github.failNextRelease();
-    await assert.rejects(
-      assembleV2ProductionControllerCycle({
-        command,
-        environment: {
-          ...environment,
-          ...oidc.environment,
-          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.com",
-        },
-        fetch: github.fetch,
-      }),
-      (error) => {
-        assert.equal(error?.code, "PRODUCTION_LEASE_RELEASE_FAILED");
-        assert.equal(error.details.public_effects_performed, 3);
-        assert.equal(error.details.budget_refunded, false);
-        assert.equal(error.details.phase, "automatic-request-bound-release");
-        assert.match(
-          error.details.last_reachable_receipt_digest,
-          /^sha256:[0-9a-f]{64}$/u,
-        );
-        return true;
-      },
-    );
-    assert.equal(github.activeLease(), true);
-    assert.deepEqual(github.externalWrites, [
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-      "POST /repos/owner/repo/issues/7/comments",
-    ]);
-    assert.equal(github.statusPostCount(), 2);
-    assert.equal(github.requestPostCount(), 1);
-  });
-});
-
-test("ambiguous status retains its intent when no-refund release fails", async () => {
-  await withWorkflowCliFixture({
-    eventName: "pull_request_target",
-    event: { pull_request: { number: 7 } },
-    route: "ordinary",
-    pullRequest: "7",
-  }, async ({ environment }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const github = productionControllerGitHubFixture(command, oidc, liveTime);
-    github.setStatusRefetchMode("missing");
-    github.failNextRelease("after-status-intent");
-    await assert.rejects(
-      assembleV2ProductionControllerCycle({
-        command,
-        environment: {
-          ...environment,
-          ...oidc.environment,
-          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.com",
-        },
-        fetch: github.fetch,
-      }),
-      (error) => {
-        assert.equal(error?.code, "PRODUCTION_LEASE_RELEASE_FAILED");
-        assert.equal(error.details.phase, "status-ambiguous-release");
-        assert.equal(error.details.public_effects_performed, 1);
-        assert.equal(error.details.budget_refunded, false);
-        assert.match(
-          error.details.last_reachable_receipt_digest,
-          /^sha256:[0-9a-f]{64}$/u,
-        );
-        return true;
-      },
-    );
-    assert.equal(github.activeLease(), true);
-    assert.equal(github.statusPostCount(), 1);
-    assert.equal(github.statusRefetchCount(), 1);
-    assert.deepEqual(github.externalWrites, [
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-    ]);
-    assert.deepEqual(github.effectRecordKinds().slice(-3), [
-      "lease-acquire:",
-      "effect-intent:scheduler-observation",
-      "effect-intent:status-write",
-    ]);
-  });
-});
-
-test("ambiguous reservation status retains two writes when lease release fails",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "pull_request_target",
-      event: { pull_request: { number: 7 } },
-      route: "ordinary",
-      pullRequest: "7",
-    }, async ({ environment }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const github = productionControllerGitHubFixture(command, oidc, liveTime);
-      github.setStatusRefetchModeAt(2, "missing");
-      github.failNextRelease();
-      await assert.rejects(
-        assembleV2ProductionControllerCycle({
-          command,
-          environment: {
-            ...environment,
-            ...oidc.environment,
-            GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-            GITHUB_API_URL: "https://api.github.com",
-          },
-          fetch: github.fetch,
-        }),
-        (error) => {
-          assert.equal(error?.code, "PRODUCTION_LEASE_RELEASE_FAILED");
-          assert.equal(error.details.phase, "reservation-status-ambiguous-release");
-          assert.equal(error.details.public_effects_performed, 2);
-          assert.equal(error.details.budget_refunded, false);
-          assert.match(
-            error.details.last_reachable_receipt_digest,
-            /^sha256:[0-9a-f]{64}$/u,
-          );
-          return true;
-        },
-      );
-      assert.equal(github.activeLease(), true);
-      assert.equal(github.statusPostCount(), 2);
-      assert.equal(github.statusRefetchCount(), 2);
-      assert.equal(github.requestPostCount(), 0);
-      assert.deepEqual(github.externalWrites, [
-        `POST /repos/owner/repo/statuses/${HEAD}`,
-        `POST /repos/owner/repo/statuses/${HEAD}`,
-      ]);
-      assert.equal(
-        github.effectRecordKinds().includes("effect-intent:review-request"),
-        false,
-      );
-    });
-  });
-
-test("established history preserves one bound request without replay", async () => {
-  await withWorkflowCliFixture({
-    eventName: "pull_request_target",
-    event: { pull_request: { number: 7 } },
-    route: "ordinary",
-    pullRequest: "7",
-  }, async ({ environment, runnerTemp }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const github = productionControllerGitHubFixture(command, oidc, liveTime);
-    const firstEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const first = await runV2WorkflowControllerCli(firstEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.equal(first.cycle.terminal_result.public_effects_performed, 3);
-    assert.equal(first.cycle.terminal_result.status_effect_outcome, "bound");
-    assert.equal(
-      first.cycle.terminal_result.automatic_request_effect_outcome,
-      "bound",
-    );
-    assert.match(
-      first.cycle.terminal_result.initial_runner_state_authority_digest,
-      /^sha256:[0-9a-f]{64}$/u,
-    );
-    assert.equal(
-      first.cycle.terminal_result.established_runner_state_authority_digest,
-      null,
-    );
-    assert.equal(github.activeLease(), false);
-    const secondRunnerTemp = join(runnerTemp, "established");
-    await mkdir(secondRunnerTemp);
-    const secondEnvironment = {
-      ...firstEnvironment,
-      RUNNER_TEMP: secondRunnerTemp,
-      GITHUB_RUN_ID: "123457",
-      GITHUB_RUN_ATTEMPT: "1",
-      V2_CONTROLLER_INPUT_PATH: join(secondRunnerTemp, "command.json"),
-      V2_CONTROLLER_OUTPUT_PATH: join(secondRunnerTemp, "output.json"),
-    };
-    const secondCommand = await prepareV2WorkflowCommand(secondEnvironment);
-    oidc.bindCommand(secondCommand);
-    const second = await runV2WorkflowControllerCli(secondEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.equal(second.cycle.terminal_result.public_effects_performed, 0);
-    assert.equal(second.cycle.terminal_result.status_plan, null);
-    assert.equal(second.cycle.terminal_result.request_plan, null);
-    assert.equal(second.cycle.terminal_result.comment_plan, null);
-    assert.equal(
-      second.cycle.terminal_result.initial_runner_state_authority_digest,
-      null,
-    );
-    assert.match(
-      second.cycle.terminal_result.established_runner_state_authority_digest,
-      /^sha256:[0-9a-f]{64}$/u,
-    );
-    assert.equal(
-      second.cycle.terminal_result.scheduler_append_receipt.record_type,
-      "effect-intent",
-    );
-    assert.equal(
-      second.cycle.terminal_result.lease_release_receipt.record_type,
-      "lease-release",
-    );
-    assert.notEqual(second.output.outputs["report-path"], "");
-    assert.notEqual(second.output.outputs["ledger-receipt-path"], "");
-    assert.equal(second.output.outputs["status-plan-path"], "");
-    const observations = github.schedulerObservationActions();
-    assert.equal(observations.length, 2);
-    assert.notEqual(observations[0].initial_runner_state_authority, null);
-    assert.equal(observations[1].initial_runner_state_authority, null);
-    assert.equal(
-      observations[1].prior_scheduling.epoch.id,
-      observations[0].prior_scheduling.epoch.id,
-    );
-    assert.equal(
-      observations[1].prior_scheduling.epoch.started_at,
-      observations[0].prior_scheduling.epoch.started_at,
-    );
-    assert.equal(observations[0].prior_scheduling.epoch.controlled_request, null);
-    assert.deepEqual(
-      observations[1].prior_scheduling.epoch.controlled_request,
-      first.cycle.terminal_result.authoritative_controlled_request,
-    );
-    assert.deepEqual(
-      observations[1].prior_scheduling.no_start_candidate,
-      observations[0].prior_scheduling.no_start_candidate,
-    );
-    assert.deepEqual(observations[1].prior_scheduling.run_identity, {
-      run_id: "123457",
-      run_attempt: 1,
-    });
-    assert.equal(
-      observations[1].prior_scheduling.trigger,
-      secondCommand.route.trigger,
-    );
-    assert.equal(github.activeLease(), false);
-    assert.equal(github.statusPostCount(), 2);
-    assert.equal(github.requestPostCount(), 1);
-    assert.equal(github.requestRefetchCount(), 2);
-    assert.deepEqual(github.externalWrites, [
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-      `POST /repos/owner/repo/statuses/${HEAD}`,
-      "POST /repos/owner/repo/issues/7/comments",
-    ]);
-    assert.deepEqual(github.effectRecordKinds().slice(-4), [
-      "lease-release:",
-      "lease-acquire:",
-      "effect-intent:scheduler-observation",
-      "lease-release:",
-    ]);
-    assertNoProtectedProductionInternals(second.cycle);
-  });
-});
 
 test("incompatible live configuration publishes only a rich zero-effect result", async () => {
   await withWorkflowCliFixture({
@@ -4900,2502 +3656,51 @@ test("schedule-dispatch binds a legacy finish publication to its durable remaini
   );
 });
 
-test("schedule-dispatch finishes the exact durable legacy shard suffix before publishing its matrix",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ root, environment }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const githubOutput = join(root, "legacy-finish-github-output");
-      await writeFile(githubOutput, "", { mode: 0o600 });
-      const selectedEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_OUTPUT: githubOutput,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const github = productionControllerGitHubFixture(
-        command,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: Array.from(
-            { length: 257 },
-            (_, index) => index + 1,
-          ),
-          candidateLifecycleStates: [
-            ...Array.from({ length: 256 }, () => "closed"),
-            "open",
-            ...Array.from({ length: 256 }, () => "closed"),
-            "open",
-          ],
-          apiOrigin: "https://api.github.com",
-          serverTimeStepMilliseconds: 1,
-        },
-      );
-      let rejectCurrentOpen = true;
-      const bootstrapThenStopFetch = async (input, init = {}) => {
-        const url = new URL(String(input));
-        if (
-          rejectCurrentOpen && url.pathname === "/graphql" &&
-          String(init.method ?? "GET").toUpperCase() === "POST" &&
-          String(JSON.parse(String(init.body)).query).includes(
-            "CodexReviewGateCurrentOpenPullRequests",
-          )
-        ) {
-          return jsonResponse(JSON.stringify({
-            message: "fixture stop after protected-ledger bootstrap",
-          }), 500);
-        }
-        return github.fetch(input, init);
-      };
-      await assert.rejects(
-        runV2ScheduleDispatchCli(selectedEnvironment, {
-          fetch: bootstrapThenStopFetch,
-        }),
-      );
-      rejectCurrentOpen = false;
-      assert.deepEqual(github.candidateInventoryPhases(), []);
-      assert.deepEqual(github.candidateDispatchPhases(), []);
-      const capability = github.ledgerCapabilityReceipt();
-      assert.notEqual(capability, null);
-      const historicalVerifier = createV2GitHubOidcProvenanceVerifier({
-        fetch: github.fetch,
-        environment: selectedEnvironment,
-      });
-      await historicalVerifier.initialize();
-      const triggerIdentity = loadV2GitLedgerTriggerIdentity({
-        command,
-        environment: selectedEnvironment,
-      });
-      const legacy = await seedHistoricalLegacyIncompleteCandidateCycle({
-        github,
-        verifier: historicalVerifier,
-        capability,
-        triggerIdentity,
-        owner: {
-          run_id: selectedEnvironment.GITHUB_RUN_ID,
-          run_attempt: Number(selectedEnvironment.GITHUB_RUN_ATTEMPT),
-          actor_id: selectedEnvironment.GITHUB_ACTOR_ID,
-        },
-      });
-      assert.equal(legacy.incomplete_authority.cycle_id, legacy.cycle_id);
-      assert.equal(
-        legacy.incomplete_authority.start_record_oid,
-        legacy.start_record_oid,
-      );
-      assert.equal(legacy.incomplete_authority.next_shard_index, 1);
-      assert.equal(legacy.incomplete_authority.shard_receipts.length, 1);
-      assert.equal(legacy.initial_inventory.shards.length, 2);
-      const recordCountBefore = github.ledgerRecordCount();
-      const writeRequestsBefore = github.ledgerWriteRequests().length;
-      const inventoryRequestsBefore =
-        github.candidateInventoryRequests().length;
-      const lifecycleRequestsBefore =
-        github.candidateLifecycleRequests().length;
-      const currentOpenRequestsBefore =
-        github.currentOpenCandidateRequests().length;
-
-      const result = await runV2ScheduleDispatchCli(selectedEnvironment, {
-        fetch: github.fetch,
-      });
-
-      assert.equal(github.ledgerRecordCount() - recordCountBefore, 3);
-      assert.equal(
-        github.ledgerWriteRequests().slice(writeRequestsBefore)
-          .filter((request) => request.startsWith("PATCH /git/refs/"))
-          .length,
-        1,
-        "the remaining shard, completion, and reservation must share one ref CAS",
-      );
-      assert.deepEqual(github.candidateInventoryPhases(), [
-        "cycle-start",
-        "shard",
-        "shard",
-        "cycle-complete",
-      ]);
-      assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-      const inventoryRecords = github.candidateInventoryRecordEntries();
-      assert.equal(inventoryRecords[0].commit_sha, legacy.start_record_oid);
-      assert.ok(inventoryRecords.every(({ cycle_id: cycleId }) =>
-        cycleId === legacy.cycle_id));
-      assert.equal(
-        github.currentOpenCandidateRequests().length,
-        currentOpenRequestsBefore,
-        "an incomplete legacy source must not be replaced by current-open sampling",
-      );
-      assert.ok(
-        github.candidateInventoryRequests().length > inventoryRequestsBefore,
-      );
-      assert.ok(
-        github.candidateLifecycleRequests().length > lifecycleRequestsBefore,
-      );
-      assert.deepEqual(
-        result.matrix.include.map(({ pull_request: pullRequest }) =>
-          pullRequest),
-        [257],
-      );
-      assert.equal(result.matrix.include[0].enabled, true);
-      assert.equal(
-        await readFile(githubOutput, "utf8"),
-        `matrix=${canonicalJson(result.matrix)}\n`,
-      );
-      assertNoDispatchAuthorityInternals(result);
-    });
-  });
-
-test("schedule-dispatch bootstraps one current-open candidate without legacy REST", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const selectedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      command,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    const currentOpenRequestsBefore =
-      github.currentOpenCandidateRequests().length;
-    const inventoryRequestsBefore =
-      github.candidateInventoryRequests().length;
-    const lifecycleRequestsBefore =
-      github.candidateLifecycleRequests().length;
-    const ledgerWritesBefore = github.ledgerWriteRequests().length;
-
-    const result = await runV2ScheduleDispatchCli(selectedEnvironment, {
-      fetch: github.fetch,
-    });
-
-    assert.equal(result.matrix.include.length, 1);
-    assert.equal(result.matrix.include[0].enabled, true);
-    assert.equal(result.matrix.include[0].pull_request, 7);
-    assert.equal(
-      github.currentOpenCandidateRequests().length - currentOpenRequestsBefore,
-      4,
-    );
-    assert.equal(
-      github.candidateInventoryRequests().length - inventoryRequestsBefore,
-      0,
-    );
-    assert.equal(
-      github.candidateLifecycleRequests().length - lifecycleRequestsBefore,
-      0,
-    );
-    assert.equal(
-      github.ledgerWriteRequests().slice(ledgerWritesBefore)
-        .filter((request) => request.startsWith("PATCH /git/refs/"))
-        .length,
-      4,
-      "bootstrap plus current-open publication must use four protected-ref updates",
-    );
-    assertNoDispatchAuthorityInternals(result);
-  });
-});
-
-test("schedule-dispatch checkpoints a 4095-record current-open source before publishing its matrix",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ root, runnerTemp, environment }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const bootstrapEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const github = productionControllerGitHubFixture(
-        command,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: [7],
-          apiOrigin: "https://api.github.com",
-          serverTimeStepMilliseconds: 1,
-          authoritativeWallClock: true,
-        },
-      );
-      let rejectCurrentOpen = true;
-      const bootstrapThenStopFetch = async (input, init = {}) => {
-        const url = new URL(String(input));
-        if (
-          rejectCurrentOpen && url.pathname === "/graphql" &&
-          String(init.method ?? "GET").toUpperCase() === "POST" &&
-          String(JSON.parse(String(init.body)).query).includes(
-            "CodexReviewGateCurrentOpenPullRequests",
-          )
-        ) {
-          return jsonResponse(JSON.stringify({
-            message: "fixture stop after protected-ledger bootstrap",
-          }), 500);
-        }
-        return github.fetch(input, init);
-      };
-      await assert.rejects(
-        runV2ScheduleDispatchCli(bootstrapEnvironment, {
-          fetch: bootstrapThenStopFetch,
-        }),
-      );
-      rejectCurrentOpen = false;
-      const padded = await padHistoricalCapabilityAttestations({
-        github,
-        createVerifier: () => createV2GitHubOidcProvenanceVerifier({
-          fetch: github.fetch,
-          environment: bootstrapEnvironment,
-        }),
-        targetRecordCount: MAX_V2_GIT_LEDGER_COMMITS - 1,
-      });
-      assert.equal(padded.record_count, MAX_V2_GIT_LEDGER_COMMITS - 1);
-      assert.equal(padded.tip_commit_sha, github.ledgerTipCommitSha());
-
-      const githubOutput = join(root, "current-open-4095-github-output");
-      await writeFile(githubOutput, "", { mode: 0o600 });
-      const checkpointEnvironment = await makeWorkflowLegEnvironment({
-        environment: bootstrapEnvironment,
-        runnerTemp,
-        name: "current-open-4095-checkpoint",
-        runId: "123457",
-        route: "scan-all-open",
-        pullRequest: "",
-        githubOutput,
-      });
-      const checkpointCommand = await prepareV2WorkflowCommand(
-        checkpointEnvironment,
-      );
-      oidc.bindCommand(checkpointCommand);
-      const oidcCallsBefore = oidc.calls.length;
-      const writesBefore = github.ledgerWriteRequests().length;
-      const currentOpenRequestsBefore =
-        github.currentOpenCandidateRequests().length;
-      const inventoryRequestsBefore =
-        github.candidateInventoryRequests().length;
-      const lifecycleRequestsBefore =
-        github.candidateLifecycleRequests().length;
-
-      const result = await runV2ScheduleDispatchCli(checkpointEnvironment, {
-        fetch: github.fetch,
-      });
-
-      assert.equal(
-        github.ledgerWriteRequests().slice(writesBefore)
-          .filter((request) => request.startsWith("PATCH /git/refs/"))
-          .length,
-        1,
-        "checkpoint carrier, generation, and reservation require one ref CAS",
-      );
-      assert.equal(
-        github.currentOpenCandidateRequests().length -
-          currentOpenRequestsBefore,
-        4,
-      );
-      assert.equal(
-        github.candidateInventoryRequests().length,
-        inventoryRequestsBefore,
-      );
-      assert.equal(
-        github.candidateLifecycleRequests().length,
-        lifecycleRequestsBefore,
-      );
-      assert.deepEqual(github.candidateInventoryPhases(), [
-        "current-open-generation",
-      ]);
-      assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-      assert.deepEqual(
-        oidc.calls.slice(oidcCallsBefore).map(({ kind }) => kind),
-        [
-          "discovery", "jwks",
-          "mint", "mint", "mint", "mint", "mint", "mint",
-        ],
-        "the reconciled reserve must not perform another full load and load mint",
-      );
-      const checkpointState = github.ledgerLatestCheckpointState();
-      assert.notEqual(checkpointState, null);
-      assert.equal(checkpointState.schema_version, 3);
-      assert.equal(checkpointState.profile, "mature-quiescent-v1");
-      assert.equal(
-        checkpointState.source.commit_count,
-        MAX_V2_GIT_LEDGER_COMMITS - 1,
-      );
-      assert.equal(
-        checkpointState.next_unit.profile,
-        "current-open-generation-v1",
-      );
-      assert.equal(checkpointState.next_unit.kind, "current-open-generation");
-      assert.equal(checkpointState.next_unit.candidate_count, 1);
-      assert.ok(
-        checkpointState.next_unit.current_epoch_remaining_commit_capacity < 0,
-      );
-      assert.ok(
-        checkpointState.next_unit.fresh_epoch_remaining_commit_capacity >= 0,
-      );
-      assert.equal(result.matrix.include.length, 1);
-      assert.equal(result.matrix.include[0].enabled, true);
-      assert.equal(result.matrix.include[0].pull_request, 7);
-      const binding = JSON.parse(result.matrix.include[0].dispatch_binding);
-      assert.equal(binding.candidate.identity.number, 7);
-      assert.equal(
-        binding.candidate_source.source_profile,
-        "stable-graphql-current-open-v4",
-      );
-      assert.equal(
-        await readFile(githubOutput, "utf8"),
-        `matrix=${canonicalJson(result.matrix)}\n`,
-      );
-      assertNoDispatchAuthorityInternals(result);
-    });
-  });
-
-test("schedule-dispatch persists current-open authority without legacy full refresh and restarts the active raw-plan matrix", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ root, runnerTemp, environment }) => {
-    const githubOutput = join(root, "github-output-first");
+test("schedule matrix writer preserves its disabled sentinel and byte cap", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-review-gate-v2-matrix-"));
+  const githubOutput = join(root, "github-output");
+  const sentinel = {
+    enabled: false,
+    pull_request: 0,
+    dispatch_binding: "null",
+  };
+  try {
     await writeFile(githubOutput, "", { mode: 0o600 });
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const firstEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_OUTPUT: githubOutput,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      command,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    await runV2ScheduleDispatchCli(firstEnvironment, {
-      fetch: github.fetch,
+    const rendered = await writeV2ScheduleDispatchMatrixOutput({
+      rows: [sentinel],
+      environment: { GITHUB_OUTPUT: githubOutput },
     });
-    github.setCandidateNumbers([7]);
-    const currentOpenRequestsBefore =
-      github.currentOpenCandidateRequests().length;
-    const inventoryRequestsBefore = github.candidateInventoryRequests().length;
-    const lifecycleRequestsBefore = github.candidateLifecycleRequests().length;
-    const inventoryPhasesBefore = github.candidateInventoryPhases().length;
-    const dispatchPhasesBefore = github.candidateDispatchPhases().length;
-    const ledgerWritesBefore = github.ledgerWriteRequests().length;
-    const firstOutput = join(root, "github-output-first-nonempty");
-    await writeFile(firstOutput, "", { mode: 0o600 });
-    const nonemptyEnvironment = await makeWorkflowLegEnvironment({
-      environment: firstEnvironment,
-      runnerTemp,
-      name: "first-nonempty",
-      runId: "123457",
-      route: "scan-all-open",
-      pullRequest: "",
-      githubOutput: firstOutput,
-    });
-    const nonemptyCommand = await prepareV2WorkflowCommand(
-      nonemptyEnvironment,
-    );
-    oidc.bindCommand(nonemptyCommand);
-    const first = await runV2ScheduleDispatchCli(nonemptyEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.deepEqual(Object.keys(first), ["matrix", "rendered"]);
-    assert.deepEqual(Object.keys(first.matrix), ["include"]);
-    assert.equal(first.matrix.include.length, 1);
-    const row = first.matrix.include[0];
-    assert.deepEqual(Object.keys(row).sort(), [
-      "dispatch_binding", "enabled", "pull_request",
-    ]);
-    assert.equal(row.enabled, true);
-    assert.equal(row.pull_request, 7);
-    const rowBinding = JSON.parse(row.dispatch_binding);
-    assert.equal(rowBinding.candidate.schema_version, 2);
-    assert.equal(rowBinding.candidate.identity.number, 7);
-    assert.deepEqual(Object.keys(rowBinding).sort(), [
-      "batch_count",
-      "batch_index",
-      "binding_digest",
-      "candidate",
-      "candidate_dispatch_authority_digest",
-      "candidate_index",
-      "candidate_inventory_authority_digest",
-      "candidate_source",
-      "cycle_id",
-      "dispatch_digest",
-      "generation_id",
-      "inventory_digest",
-      "repository",
-      "reservation_digest",
-      "reservation_record_oid",
-      "schema",
-      "schema_version",
-    ]);
-    assert.deepEqual(Object.keys(rowBinding.candidate_source).sort(), [
-      "candidate_set_digest",
-      "lifecycle_candidate_set_digest",
-      "production_candidate_authority_digest",
-      "schema",
-      "schema_version",
-      "source_current_open_semantic_digest",
-      "source_generation_digest",
-      "source_generation_id",
-      "source_generation_record_oid",
-      "source_profile",
-    ]);
-    assert.deepEqual(Object.keys(rowBinding.candidate).sort(), [
-      "identity",
-      "identity_digest",
-      "lifecycle_generation_id",
-      "lifecycle_seed",
-      "lifecycle_seed_digest",
-      "schema",
-      "schema_version",
-      "selection_digest",
-      "source_generation_record_oid",
-    ]);
+    assert.deepEqual(rendered.matrix, { include: [sentinel] });
     assert.equal(
-      first.rendered,
-      `${canonicalJson(first.matrix)}\n`,
-    );
-    assert.equal(
-      await readFile(firstOutput, "utf8"),
-      `matrix=${canonicalJson(first.matrix)}\n`,
-    );
-    assert.deepEqual(github.candidateInventoryPhases().slice(
-      inventoryPhasesBefore,
-    ), ["current-open-generation"]);
-    assert.deepEqual(github.candidateDispatchPhases().slice(
-      dispatchPhasesBefore,
-    ), ["reserve"]);
-    assert.equal(
-      github.ledgerWriteRequests().slice(ledgerWritesBefore)
-        .filter((request) => request.startsWith("PATCH /git/refs/"))
-        .length,
-      1,
-      "atomic publication must update the protected ref exactly once",
-    );
-    assert.equal(
-      github.currentOpenCandidateRequests().length - currentOpenRequestsBefore,
-      4,
-    );
-    assert.equal(
-      github.candidateInventoryRequests().length - inventoryRequestsBefore,
-      0,
-    );
-    assert.equal(
-      github.candidateLifecycleRequests().length - lifecycleRequestsBefore,
-      0,
-    );
-    assertNoDispatchAuthorityInternals(first);
-
-    const restartOutput = join(root, "github-output-restart");
-    await writeFile(restartOutput, "", { mode: 0o600 });
-    const restartEnvironment = await makeWorkflowLegEnvironment({
-      environment: nonemptyEnvironment,
-      runnerTemp,
-      name: "restart",
-      runId: "123458",
-      route: "scan-all-open",
-      pullRequest: "",
-      githubOutput: restartOutput,
-    });
-    const restartCommand = await prepareV2WorkflowCommand(restartEnvironment);
-    oidc.bindCommand(restartCommand);
-    const restartInventoryRequestsBefore =
-      github.candidateInventoryRequests().length;
-    const restartLifecycleRequestsBefore =
-      github.candidateLifecycleRequests().length;
-    const restartCurrentOpenRequestsBefore =
-      github.currentOpenCandidateRequests().length;
-    const recordsBefore = github.ledgerRecordCount();
-    const restartLedgerWritesBefore = github.ledgerWriteRequests().length;
-    const restarted = await runV2ScheduleDispatchCli(restartEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.deepEqual(restarted.matrix, first.matrix);
-    assert.equal(
-      github.candidateInventoryRequests().length,
-      restartInventoryRequestsBefore,
-      "active reservation restart must not rescan candidates",
-    );
-    assert.equal(
-      github.currentOpenCandidateRequests().length,
-      restartCurrentOpenRequestsBefore,
-      "active reservation restart must not resample current-open candidates",
-    );
-    assert.equal(
-      github.candidateLifecycleRequests().length,
-      restartLifecycleRequestsBefore,
-      "active reservation restart must not read legacy candidate lifecycle",
-    );
-    assert.equal(github.ledgerRecordCount(), recordsBefore);
-    assert.equal(
-      github.ledgerWriteRequests().length,
-      restartLedgerWritesBefore,
-      "reservation restart must perform no Git write",
-    );
-    assert.equal(
-      await readFile(restartOutput, "utf8"),
-      `matrix=${canonicalJson(first.matrix)}\n`,
-    );
-    assertNoDispatchAuthorityInternals(restarted);
-  });
-});
-
-test("schedule-dispatch reconciles one durable current-open publication response loss without legacy refresh",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ environment, runnerTemp }) => {
-      const scanCommand = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(scanCommand, liveTime);
-      const sharedEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const github = productionControllerGitHubFixture(
-        scanCommand,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: [],
-          apiOrigin: "https://api.github.com",
-        },
-      );
-      await runV2ScheduleDispatchCli(sharedEnvironment, {
-        fetch: github.fetch,
-      });
-      github.setCandidateNumbers([7]);
-      const currentOpenRequestsBeforePublication =
-        github.currentOpenCandidateRequests().length;
-      const candidateInventoryRequestsBeforePublication =
-        github.candidateInventoryRequests().length;
-      const candidateLifecycleRequestsBeforePublication =
-        github.candidateLifecycleRequests().length;
-      const inventoryPhasesBefore = github.candidateInventoryPhases().length;
-      const dispatchPhasesBefore = github.candidateDispatchPhases().length;
-      const ledgerWritesBeforePublication =
-        github.ledgerWriteRequests().length;
-      github.failNextDurableRecordUpdates(
-        "candidate-dispatch-observation:",
-      );
-      const publicationEnvironment = await makeWorkflowLegEnvironment({
-        environment: sharedEnvironment,
-        runnerTemp,
-        name: "atomic-publication-response-loss",
-        runId: "123457",
-        route: "scan-all-open",
-        pullRequest: "",
-      });
-      const publicationCommand = await prepareV2WorkflowCommand(
-        publicationEnvironment,
-      );
-      oidc.bindCommand(publicationCommand);
-      const first = await runV2ScheduleDispatchCli(publicationEnvironment, {
-        fetch: github.fetch,
-      });
-
-      assert.equal(first.matrix.include.length, 1);
-      assert.equal(first.matrix.include[0].pull_request, 7);
-      assert.equal(
-        github.currentOpenCandidateRequests().length -
-          currentOpenRequestsBeforePublication,
-        4,
-      );
-      assert.equal(
-        github.candidateInventoryRequests().length -
-          candidateInventoryRequestsBeforePublication,
-        0,
-      );
-      assert.equal(
-        github.candidateLifecycleRequests().length -
-          candidateLifecycleRequestsBeforePublication,
-        0,
-      );
-      assert.deepEqual(github.candidateInventoryPhases().slice(
-        inventoryPhasesBefore,
-      ), ["current-open-generation"]);
-      assert.deepEqual(github.candidateDispatchPhases().slice(
-        dispatchPhasesBefore,
-      ), ["reserve"]);
-      assert.equal(
-        github.ledgerWriteRequests().slice(ledgerWritesBeforePublication)
-          .filter((request) => request.startsWith("PATCH /git/refs/"))
-          .length,
-        1,
-        "response-lost atomic publication must issue one ref update",
-      );
-      const currentOpenRequestsBefore =
-        github.currentOpenCandidateRequests().length;
-      const candidateInventoryRequestsBefore =
-        github.candidateInventoryRequests().length;
-      const candidateLifecycleRequestsBefore =
-        github.candidateLifecycleRequests().length;
-      const externalWritesBefore = github.externalWriteRequests().length;
-      const recordsBefore = github.ledgerRecordCount();
-      const restartLedgerWritesBefore = github.ledgerWriteRequests().length;
-      const restartEnvironment = await makeWorkflowLegEnvironment({
-        environment: publicationEnvironment,
-        runnerTemp,
-        name: "atomic-publication-response-loss-restart",
-        runId: "123458",
-        route: "scan-all-open",
-        pullRequest: "",
-      });
-      const restartCommand = await prepareV2WorkflowCommand(
-        restartEnvironment,
-      );
-      oidc.bindCommand(restartCommand);
-      const restarted = await runV2ScheduleDispatchCli(restartEnvironment, {
-        fetch: github.fetch,
-      });
-
-      assert.deepEqual(restarted.matrix, first.matrix);
-      assert.equal(github.ledgerRecordCount(), recordsBefore);
-      assert.equal(
-        github.ledgerWriteRequests().length,
-        restartLedgerWritesBefore,
-      );
-      assert.equal(
-        github.currentOpenCandidateRequests().length -
-          currentOpenRequestsBefore,
-        0,
-      );
-      assert.equal(
-        github.candidateInventoryRequests().length -
-          candidateInventoryRequestsBefore,
-        0,
-      );
-      assert.equal(
-        github.candidateLifecycleRequests().length -
-          candidateLifecycleRequestsBefore,
-        0,
-      );
-      assert.equal(
-        github.externalWriteRequests().length - externalWritesBefore,
-        0,
-      );
-      assertNoDispatchAuthorityInternals(restarted);
-    });
-  });
-
-test("schedule-dispatch expands every compact batch item into a workflow binding",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ environment, runnerTemp }) => {
-      const scanCommand = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(scanCommand, liveTime);
-      const sharedEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const githubOutput = join(runnerTemp, "compact-matrix-github-output");
-      await writeFile(githubOutput, "", { mode: 0o600 });
-      const candidateNumbers = Array.from({ length: 64 }, (_, index) =>
-        index + 1);
-      const github = productionControllerGitHubFixture(
-        scanCommand,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers,
-          apiOrigin: "https://api.github.com",
-        },
-      );
-      const dispatch = await runV2ScheduleDispatchCli({
-        ...sharedEnvironment,
-        GITHUB_OUTPUT: githubOutput,
-      }, { fetch: github.fetch });
-
-      assert.equal(dispatch.matrix.include.length, candidateNumbers.length);
-      const matrixBindings = [];
-      for (const [index, row] of dispatch.matrix.include.entries()) {
-        assert.equal(row.enabled, true);
-        assert.equal(row.pull_request, candidateNumbers[index]);
-        const legEnvironment = await makeWorkflowLegEnvironment({
-          environment: sharedEnvironment,
-          runnerTemp,
-          name: `compact-binding-${index}`,
-          runId: String(123_457 + index),
-          route: "ordinary",
-          pullRequest: String(candidateNumbers[index]),
-          dispatchBinding: row.dispatch_binding,
-        });
-        const legCommand = await prepareV2WorkflowCommand(legEnvironment);
-        matrixBindings.push(legCommand.dispatch_binding);
-        assert.deepEqual(
-          legCommand.dispatch_binding,
-          JSON.parse(row.dispatch_binding),
-        );
-        assert.deepEqual(Object.keys(legCommand.dispatch_binding).sort(), [
-          "batch_count",
-          "batch_index",
-          "binding_digest",
-          "candidate",
-          "candidate_dispatch_authority_digest",
-          "candidate_index",
-          "candidate_inventory_authority_digest",
-          "candidate_source",
-          "cycle_id",
-          "dispatch_digest",
-          "generation_id",
-          "inventory_digest",
-          "repository",
-          "reservation_digest",
-          "reservation_record_oid",
-          "schema",
-          "schema_version",
-        ]);
-        assert.deepEqual(Object.keys(
-          legCommand.dispatch_binding.candidate_source,
-        ).sort(), [
-          "candidate_set_digest",
-          "lifecycle_candidate_set_digest",
-          "production_candidate_authority_digest",
-          "schema",
-          "schema_version",
-          "source_current_open_semantic_digest",
-          "source_generation_digest",
-          "source_generation_id",
-          "source_generation_record_oid",
-          "source_profile",
-        ]);
-        assert.deepEqual(Object.keys(
-          legCommand.dispatch_binding.candidate,
-        ).sort(), [
-          "identity",
-          "identity_digest",
-          "lifecycle_generation_id",
-          "lifecycle_seed",
-          "lifecycle_seed_digest",
-          "schema",
-          "schema_version",
-          "selection_digest",
-          "source_generation_record_oid",
-        ]);
-        assert.ok(
-          Buffer.byteLength(row.dispatch_binding, "utf8") <=
-            MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_BINDING_BYTES,
-        );
-      }
-      const firstBinding = matrixBindings[0];
-      const commitBudget = calculateV2GitLedgerCandidateDispatchCommitBudget({
-        candidate_count: matrixBindings.length,
-        batch_count: firstBinding.batch_count,
-        reachable_record_count: github.ledgerRecordCount() - 1,
-      });
-      const planWithoutDigest = {
-        schema: V2_GIT_LEDGER_CANDIDATE_DISPATCH_PLAN_SCHEMA,
-        schema_version: 2,
-        repository: firstBinding.repository,
-        generation_id: firstBinding.generation_id,
-        cycle_id: firstBinding.cycle_id,
-        candidate_source: firstBinding.candidate_source,
-        candidate_inventory_authority_digest:
-          firstBinding.candidate_inventory_authority_digest,
-        candidate_dispatch_authority_digest:
-          firstBinding.candidate_dispatch_authority_digest,
-        reservation_record_oid: firstBinding.reservation_record_oid,
-        reservation_digest: firstBinding.reservation_digest,
-        inventory_digest: firstBinding.inventory_digest,
-        batch_index: firstBinding.batch_index,
-        batch_count: firstBinding.batch_count,
-        dispatch_digest: firstBinding.dispatch_digest,
-        items: matrixBindings.map((binding) => ({
-          candidate_index: binding.candidate_index,
-          candidate: binding.candidate,
-        })),
-        remaining_count: matrixBindings.length,
-        dispatch_commit_budget_required:
-          commitBudget.dispatch_commit_budget_required,
-        candidate_execution_commit_budget_required:
-          commitBudget.candidate_execution_commit_budget_required,
-        total_commit_budget_required:
-          commitBudget.total_commit_budget_required,
-        remaining_ledger_commit_capacity_after_dispatch:
-          commitBudget.remaining_ledger_commit_capacity_after_dispatch,
-      };
-      const compactPlan = {
-        ...planWithoutDigest,
-        plan_digest: ledgerDigestDomain(
-          "codex-review-gate-v2-candidate-dispatch-plan",
-          planWithoutDigest,
-        ),
-      };
-      assert.ok(
-        Buffer.byteLength(canonicalJson(compactPlan), "utf8") <=
-          MAX_V2_CURRENT_OPEN_CANDIDATE_DISPATCH_PLAN_BYTES,
-      );
-      for (const [index, binding] of matrixBindings.entries()) {
-        assert.deepEqual(
-          projectV2GitLedgerCandidateDispatchBinding(compactPlan, index),
-          binding,
-        );
-      }
-      const publicWrites = github.externalWrites.length;
-      const forgedPlan = {
-        ...compactPlan,
-        plan_digest: `sha256:${"0".repeat(64)}`,
-      };
-      assert.throws(
-        () => projectV2GitLedgerCandidateDispatchBinding(forgedPlan, 0),
-        (error) => error?.code === "CANDIDATE_DISPATCH_PLAN_INVALID",
-      );
-      for (const invalidIndex of [-1, 64, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
-        assert.throws(
-          () => projectV2GitLedgerCandidateDispatchBinding(
-            compactPlan,
-            invalidIndex,
-          ),
-          (error) =>
-            error?.code === "CANDIDATE_DISPATCH_PLAN_ITEM_INDEX_INVALID",
-        );
-      }
-      assert.equal(github.externalWrites.length, publicWrites);
-      const githubOutputLine = `matrix=${canonicalJson(dispatch.matrix)}\n`;
-      assert.equal(await readFile(githubOutput, "utf8"), githubOutputLine);
-      assert.ok(
-        Buffer.byteLength(githubOutputLine, "utf16le") <=
-          MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES,
-      );
-      const oversizedRows = Array.from(
-        { length: 4 },
-        () => dispatch.matrix.include,
-      ).flat();
-      assert.equal(oversizedRows.length, 256);
-      const oversizedLine = `matrix=${canonicalJson({
-        include: oversizedRows,
-      })}\n`;
-      assert.ok(
-        Buffer.byteLength(oversizedLine, "utf16le") >
-          MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES,
-      );
-      const oversizedOutput = join(
-        runnerTemp,
-        "oversized-compact-matrix-github-output",
-      );
-      const originalOutput = Buffer.from("sentinel=unchanged\n", "utf8");
-      await writeFile(oversizedOutput, originalOutput, { mode: 0o600 });
-      const ledgerWritesBeforeOversizedOutput =
-        github.ledgerWriteRequests().length;
-      await assert.rejects(
-        writeV2ScheduleDispatchMatrixOutput({
-          rows: oversizedRows,
-          environment: { GITHUB_OUTPUT: oversizedOutput },
-        }),
-        (error) => error?.code === "SCHEDULE_DISPATCH_OUTPUT_TOO_LARGE",
-      );
-      assert.deepEqual(await readFile(oversizedOutput), originalOutput);
-      assert.equal(
-        github.ledgerWriteRequests().length,
-        ledgerWritesBeforeOversizedOutput,
-      );
-      assertNoDispatchAuthorityInternals(dispatch);
-    });
-  });
-
-test("schedule-dispatch hard-fails the 512-candidate capacity boundary without writes",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ environment, runnerTemp }) => {
-      const initialCommand = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(initialCommand, liveTime);
-      const sharedEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const github = productionControllerGitHubFixture(
-        initialCommand,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: [],
-          apiOrigin: "https://api.github.com",
-          serverTimeStepMilliseconds: 250,
-        },
-      );
-      await runV2ScheduleDispatchCli(sharedEnvironment, {
-        fetch: github.fetch,
-      });
-      github.setCandidateNumbers(Array.from(
-        { length: 512 },
-        (_, index) => index + 1,
-      ));
-      const externalWritesBefore = github.externalWriteRequests().length;
-      const ledgerWritesBefore = github.ledgerWriteRequests().length;
-      const recordsBefore = github.ledgerRecordCount();
-      const currentOpenRequestsBefore =
-        github.currentOpenCandidateRequests().length;
-      const candidateInventoryRequestsBefore =
-        github.candidateInventoryRequests().length;
-      const candidateLifecycleRequestsBefore =
-        github.candidateLifecycleRequests().length;
-      const inventoryPhasesBefore = github.candidateInventoryPhases();
-      const dispatchPhasesBefore = github.candidateDispatchPhases();
-      const scheduleEnvironment = await makeWorkflowLegEnvironment({
-        environment: sharedEnvironment,
-        runnerTemp,
-        name: "capacity-schedule",
-        runId: "223457",
-        route: "scan-all-open",
-        pullRequest: "",
-      });
-      const scheduleCommand = await prepareV2WorkflowCommand(
-        scheduleEnvironment,
-      );
-      oidc.bindCommand(scheduleCommand);
-
-      await assert.rejects(
-        runV2ScheduleDispatchCli(scheduleEnvironment, {
-          fetch: github.fetch,
-        }),
-        (error) =>
-          error?.code === "candidate-inventory-cycle-commit-capacity",
-      );
-
-      assert.equal(
-        github.currentOpenCandidateRequests().length -
-          currentOpenRequestsBefore,
-        14,
-      );
-      assert.equal(
-        github.candidateInventoryRequests().length -
-          candidateInventoryRequestsBefore,
-        0,
-      );
-      assert.equal(
-        github.candidateLifecycleRequests().length -
-          candidateLifecycleRequestsBefore,
-        0,
-      );
-      assert.equal(github.ledgerRecordCount(), recordsBefore);
-      assert.equal(
-        github.externalWriteRequests().length - externalWritesBefore,
-        0,
-      );
-      assert.equal(
-        github.ledgerWriteRequests().length - ledgerWritesBefore,
-        0,
-      );
-      assert.deepEqual(github.candidateInventoryPhases(), inventoryPhasesBefore);
-      assert.deepEqual(github.candidateDispatchPhases(), dispatchPhasesBefore);
-    });
-  });
-
-test("schedule-dispatch rejects 513 current-open candidates before full refresh",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ environment, runnerTemp }) => {
-      const initialCommand = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(initialCommand, liveTime);
-      const sharedEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const github = productionControllerGitHubFixture(
-        initialCommand,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: [],
-          apiOrigin: "https://api.github.com",
-          serverTimeStepMilliseconds: 250,
-        },
-      );
-      await runV2ScheduleDispatchCli(sharedEnvironment, {
-        fetch: github.fetch,
-      });
-      github.setCandidateNumbers(Array.from(
-        { length: 513 },
-        (_, index) => index + 1,
-      ));
-      const externalWritesBefore = github.externalWriteRequests().length;
-      const ledgerWritesBefore = github.ledgerWriteRequests().length;
-      const recordsBefore = github.ledgerRecordCount();
-      const currentOpenRequestsBefore =
-        github.currentOpenCandidateRequests().length;
-      const candidateInventoryRequestsBefore =
-        github.candidateInventoryRequests().length;
-      const candidateLifecycleRequestsBefore =
-        github.candidateLifecycleRequests().length;
-      const inventoryPhasesBefore = github.candidateInventoryPhases();
-      const dispatchPhasesBefore = github.candidateDispatchPhases();
-      const scheduleEnvironment = await makeWorkflowLegEnvironment({
-        environment: sharedEnvironment,
-        runnerTemp,
-        name: "candidate-cap-schedule",
-        runId: "223458",
-        route: "scan-all-open",
-        pullRequest: "",
-      });
-      const scheduleCommand = await prepareV2WorkflowCommand(
-        scheduleEnvironment,
-      );
-      oidc.bindCommand(scheduleCommand);
-
-      await assert.rejects(
-        runV2ScheduleDispatchCli(scheduleEnvironment, {
-          fetch: github.fetch,
-        }),
-        (error) => error?.code === "CANDIDATE_OPEN_SET_CAP",
-      );
-
-      assert.equal(
-        github.currentOpenCandidateRequests().length -
-          currentOpenRequestsBefore,
-        6,
-      );
-      assert.equal(
-        github.candidateInventoryRequests().length -
-          candidateInventoryRequestsBefore,
-        0,
-      );
-      assert.equal(
-        github.candidateLifecycleRequests().length -
-          candidateLifecycleRequestsBefore,
-        0,
-      );
-      assert.equal(github.ledgerRecordCount(), recordsBefore);
-      assert.equal(
-        github.externalWriteRequests().length - externalWritesBefore,
-        0,
-      );
-      assert.equal(
-        github.ledgerWriteRequests().length - ledgerWritesBefore,
-        0,
-      );
-      assert.deepEqual(github.candidateInventoryPhases(), inventoryPhasesBefore);
-      assert.deepEqual(github.candidateDispatchPhases(), dispatchPhasesBefore);
-    });
-  });
-
-test("schedule-dispatch ignores a legacy phase fault on a fresh current-open restart", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment, runnerTemp }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const sharedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      command,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    github.failNextCandidatePhase(
-      "candidate-inventory-observation",
-      "shard",
-    );
-    const first = await runV2ScheduleDispatchCli(sharedEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.equal(first.matrix.include[0].pull_request, 7);
-    assert.deepEqual(github.candidateInventoryPhases(), [
-      "current-open-generation",
-    ]);
-    assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-    const inventoryRequests = github.candidateInventoryRequests().length;
-    const currentOpenRequests = github.currentOpenCandidateRequests().length;
-
-    const restartEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "incomplete-inventory-restart",
-      runId: "123457",
-      route: "scan-all-open",
-      pullRequest: "",
-    });
-    const restartCommand = await prepareV2WorkflowCommand(
-      restartEnvironment,
-    );
-    oidc.bindCommand(restartCommand);
-    const restarted = await runV2ScheduleDispatchCli(restartEnvironment, {
-      fetch: github.fetch,
-    });
-
-    assert.deepEqual(restarted.matrix, first.matrix);
-    assert.deepEqual(github.candidateInventoryPhases(), [
-      "current-open-generation",
-    ]);
-    assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-    assert.equal(github.candidateInventoryRequests().length, inventoryRequests);
-    assert.equal(
-      github.currentOpenCandidateRequests().length,
-      currentOpenRequests,
-    );
-    assert.equal(github.candidateLifecycleRequests().length, 0);
-    assertNoDispatchAuthorityInternals(restarted);
-  });
-});
-
-test("schedule-dispatch does not enter legacy close/reopen drift on a fresh current-open run",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ environment }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const sharedEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const github = productionControllerGitHubFixture(
-        command,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: [7],
-          candidateLifecycleStates: ["open", "closed", "open", "open"],
-          apiOrigin: "https://api.github.com",
-        },
-      );
-
-      const result = await runV2ScheduleDispatchCli(sharedEnvironment, {
-        fetch: github.fetch,
-      });
-
-      assert.equal(result.matrix.include[0].enabled, true);
-      assert.equal(result.matrix.include[0].pull_request, 7);
-      assert.deepEqual(github.candidateInventoryPhases(), [
-        "current-open-generation",
-      ]);
-      assert.deepEqual(github.candidateInventoryRequests(), []);
-      assert.deepEqual(github.candidateLifecycleRequests(), []);
-      assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-      assertNoDispatchAuthorityInternals(result);
-    });
-  });
-
-test("schedule-dispatch ignores legacy drift snapshots on a fresh current-open run",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ environment }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const github = productionControllerGitHubFixture(
-        command,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: [7, 8],
-          candidateInventorySnapshots: [
-            [7], [7],
-            [7, 8], [7, 8],
-            [7], [7],
-            [7], [7],
-          ],
-          apiOrigin: "https://api.github.com",
-        },
-      );
-
-      const result = await runV2ScheduleDispatchCli({
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      }, { fetch: github.fetch });
-
-      assert.deepEqual(
-        result.matrix.include.map(({ pull_request: pullRequest }) =>
-          pullRequest),
-        [7, 8],
-      );
-      assert.deepEqual(github.candidateInventoryPhases(), [
-        "current-open-generation",
-      ]);
-      assert.equal(github.candidateInventoryRequests().length, 0);
-      assert.equal(github.candidateLifecycleRequests().length, 0);
-      assertNoDispatchAuthorityInternals(result);
-    });
-  });
-
-test("schedule-dispatch does not enter bounded legacy lifecycle retries on a fresh current-open run",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ environment }) => {
-      const command = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(command, liveTime);
-      const github = productionControllerGitHubFixture(
-        command,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: [7],
-          candidateLifecycleStates: Array.from(
-            { length: MAX_V2_CANDIDATE_SCAN_PASSES },
-            () => ["open", "closed"],
-          ).flat(),
-          apiOrigin: "https://api.github.com",
-        },
-      );
-
-      const result = await runV2ScheduleDispatchCli({
-          ...environment,
-          ...oidc.environment,
-          GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-          GITHUB_API_URL: "https://api.github.com",
-        }, { fetch: github.fetch });
-      assert.equal(result.matrix.include[0].pull_request, 7);
-      assert.deepEqual(github.candidateInventoryPhases(), [
-        "current-open-generation",
-      ]);
-      assert.deepEqual(github.candidateInventoryRequests(), []);
-      assert.deepEqual(github.candidateLifecycleRequests(), []);
-      assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-      assertNoDispatchAuthorityInternals(result);
-    });
-  });
-
-test("schedule-dispatch retries an unapplied atomic reservation with a fresh current-open scan", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment, runnerTemp }) => {
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const sharedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      command,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    github.failNextCandidatePhase(
-      "candidate-dispatch-observation",
-      "reserve",
-    );
-    await assert.rejects(
-      runV2ScheduleDispatchCli(sharedEnvironment, { fetch: github.fetch }),
-    );
-    assert.deepEqual(github.candidateInventoryPhases(), []);
-    assert.deepEqual(github.candidateDispatchPhases(), []);
-    const inventoryRequests = github.candidateInventoryRequests().length;
-    const currentOpenRequests = github.currentOpenCandidateRequests().length;
-
-    const restartEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "completed-inventory-restart",
-      runId: "123457",
-      route: "scan-all-open",
-      pullRequest: "",
-    });
-    const restartCommand = await prepareV2WorkflowCommand(
-      restartEnvironment,
-    );
-    oidc.bindCommand(restartCommand);
-    const restarted = await runV2ScheduleDispatchCli(restartEnvironment, {
-      fetch: github.fetch,
-    });
-
-    assert.equal(restarted.matrix.include[0].enabled, true);
-    assert.equal(restarted.matrix.include[0].pull_request, 7);
-    assert.equal(
-      github.candidateInventoryRequests().length,
-      inventoryRequests,
-      "current-open retry must not fall back to legacy inventory",
-    );
-    assert.equal(
-      github.currentOpenCandidateRequests().length - currentOpenRequests,
-      4,
-      "an unapplied atomic publication must collect fresh current-open authority",
-    );
-    assert.deepEqual(github.candidateInventoryPhases(), [
-      "current-open-generation",
-    ]);
-    assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-    assertNoDispatchAuthorityInternals(restarted);
-  });
-});
-
-test("schedule-dispatch publishes the exact one-row disabled sentinel for an empty cycle", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ root, runnerTemp, environment }) => {
-    const githubOutput = join(root, "github-output-empty");
-    await writeFile(githubOutput, "", { mode: 0o600 });
-    const command = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(command, liveTime);
-    const selectedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_OUTPUT: githubOutput,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      command,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    const firstCurrentOpenRequestsBefore =
-      github.currentOpenCandidateRequests().length;
-    const firstCandidateInventoryRequestsBefore =
-      github.candidateInventoryRequests().length;
-    const firstCandidateLifecycleRequestsBefore =
-      github.candidateLifecycleRequests().length;
-    await runV2ScheduleDispatchCli(selectedEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.equal(
-      github.currentOpenCandidateRequests().length -
-        firstCurrentOpenRequestsBefore,
-      4,
-    );
-    assert.equal(
-      github.candidateInventoryRequests().length -
-        firstCandidateInventoryRequestsBefore,
-      0,
-      "fresh empty current-open authority must not use legacy full inventory REST",
-    );
-    assert.equal(
-      github.candidateLifecycleRequests().length -
-        firstCandidateLifecycleRequestsBefore,
-      0,
-      "fresh empty current-open authority must not read legacy lifecycle REST",
-    );
-    const currentOpenRequestsBefore =
-      github.currentOpenCandidateRequests().length;
-    const candidateInventoryRequestsBefore =
-      github.candidateInventoryRequests().length;
-    const externalWritesBefore = github.externalWriteRequests().length;
-    const ledgerWritesBefore = github.ledgerWriteRequests().length;
-    const inventoryPhasesBefore = github.candidateInventoryPhases();
-    const dispatchPhasesBefore = github.candidateDispatchPhases();
-    assert.deepEqual(inventoryPhasesBefore, ["current-open-generation"]);
-    assert.deepEqual(dispatchPhasesBefore, ["cycle-complete"]);
-    const restartOutput = join(root, "github-output-empty-restart");
-    await writeFile(restartOutput, "", { mode: 0o600 });
-    const restartEnvironment = await makeWorkflowLegEnvironment({
-      environment: selectedEnvironment,
-      runnerTemp,
-      name: "empty-restart",
-      runId: "123457",
-      route: "scan-all-open",
-      pullRequest: "",
-      githubOutput: restartOutput,
-    });
-    const restartCommand = await prepareV2WorkflowCommand(restartEnvironment);
-    oidc.bindCommand(restartCommand);
-    const result = await runV2ScheduleDispatchCli(restartEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.deepEqual(result.matrix, {
-      include: [{
-        enabled: false,
-        pull_request: 0,
-        dispatch_binding: "null",
-      }],
-    });
-    const expected = canonicalJson(result.matrix);
-    assert.equal(result.rendered, `${expected}\n`);
-    assert.equal(await readFile(restartOutput, "utf8"), `matrix=${expected}\n`);
-    assert.equal((await readFile(restartOutput, "utf8")).split("\n").length, 2);
-    assert.deepEqual(
-      github.candidateInventoryPhases(),
-      inventoryPhasesBefore,
-    );
-    assert.deepEqual(github.candidateDispatchPhases(), dispatchPhasesBefore);
-    assert.equal(
-      github.currentOpenCandidateRequests().length - currentOpenRequestsBefore,
-      4,
-    );
-    assert.equal(
-      github.candidateInventoryRequests().length -
-        candidateInventoryRequestsBefore,
-      0,
-    );
-    assert.equal(
-      github.externalWriteRequests().length - externalWritesBefore,
-      0,
-    );
-    assert.equal(
-      github.ledgerWriteRequests().length - ledgerWritesBefore,
-      0,
-    );
-    assertNoDispatchAuthorityInternals(result);
-  });
-});
-
-test("scheduled production run acknowledges its exact matrix binding through cycle completion", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment, runnerTemp }) => {
-    const scanCommand = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(scanCommand, liveTime);
-    const sharedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      scanCommand,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
-      fetch: github.fetch,
-    });
-    const [matrixRow] = dispatch.matrix.include;
-    assert.equal(matrixRow.enabled, true);
-    const scheduledCurrentOpenRequestsBefore =
-      github.currentOpenCandidateRequests().length;
-    const scheduledInventoryRequestsBefore =
-      github.candidateInventoryRequests().length;
-
-    const scheduledEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "scheduled-pr-7",
-      runId: "123457",
-      route: "ordinary",
-      pullRequest: "7",
-      dispatchBinding: matrixRow.dispatch_binding,
-    });
-    const scheduledCommand = await prepareV2WorkflowCommand(
-      scheduledEnvironment,
-    );
-    oidc.bindCommand(scheduledCommand);
-    const result = await runV2WorkflowControllerCli(scheduledEnvironment, {
-      fetch: github.fetch,
-    });
-
-    assert.deepEqual(
-      scheduledCommand.dispatch_binding,
-      JSON.parse(matrixRow.dispatch_binding),
-    );
-    assert.equal(result.cycle.terminal_result.public_effects_performed, 3);
-    assert.equal(result.cycle.terminal_result.status_effect_outcome, "bound");
-    assert.equal(
-      result.cycle.terminal_result.automatic_request_effect_outcome,
-      "bound",
-    );
-    assert.equal(github.activeLease(), false);
-    assert.equal(
-      github.currentOpenCandidateRequests().length,
-      scheduledCurrentOpenRequestsBefore,
-      "scheduled execution must reuse its durable dispatch authority",
-    );
-    assert.equal(
-      github.candidateInventoryRequests().length,
-      scheduledInventoryRequestsBefore,
-      "scheduled execution must not refresh legacy inventory",
-    );
-    assert.deepEqual(github.candidateDispatchPhases(), [
-      "reserve",
-      "candidate-ack",
-      "batch-complete",
-      "cycle-complete",
-    ]);
-    assert.deepEqual(github.candidateProtocolOrder(), [
-      "candidate-dispatch:reserve",
-      "lease-acquire:",
-      "effect-intent:scheduler-observation",
-      "effect-intent:status-write",
-      "effect-response:status-write",
-      "effect-intent:automatic-request-reservation",
-      "effect-intent:reservation-status-write",
-      "effect-response:reservation-status-write",
-      "effect-intent:effect-attempt",
-      "effect-intent:review-request",
-      "effect-response:review-request",
-      "effect-intent:request-binding",
-      "effect-response:request-binding",
-      "lease-release:",
-      "candidate-dispatch:candidate-ack",
-      "candidate-dispatch:batch-complete",
-      "candidate-dispatch:cycle-complete",
-    ]);
-    assert.equal(
-      JSON.stringify(result.cycle).includes("candidate_dispatch_handle"),
-      false,
-    );
-    assert.equal(
-      JSON.stringify(result.cycle).includes("candidate_dispatch_result_handle"),
-      false,
-    );
-    assertFixtureServerClockWithinOidcSkew(github);
-  });
-});
-
-test("scheduled production consumes two immutable matrix bindings across restart and final ack response loss", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment, runnerTemp }) => {
-    const scanCommand = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(scanCommand, liveTime);
-    const sharedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      scanCommand,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7, 8],
-        apiOrigin: "https://api.github.com",
-        serverTimeStepMilliseconds: 500,
-      },
-    );
-    const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.deepEqual(
-      dispatch.matrix.include.map((row) => row.pull_request),
-      [7, 8],
-    );
-    const originalBindings = dispatch.matrix.include.map((row) =>
-      JSON.parse(row.dispatch_binding));
-    assert.equal(
-      new Set(originalBindings.map((binding) =>
-        binding.candidate_dispatch_authority_digest)).size,
-      1,
-      "one reservation must keep one immutable D1 matrix authority",
+      await readFile(githubOutput, "utf8"),
+      `matrix=${canonicalJson({ include: [sentinel] })}\n`,
     );
 
-    const runScheduledCandidate = async (index, { expectFailure = false } = {}) => {
-      const row = dispatch.matrix.include[index];
-      const scheduledEnvironment = await makeWorkflowLegEnvironment({
-        environment: sharedEnvironment,
-        runnerTemp,
-        name: `scheduled-two-candidate-${row.pull_request}`,
-        runId: String(123_457 + index),
-        route: "ordinary",
-        pullRequest: String(row.pull_request),
-        dispatchBinding: row.dispatch_binding,
-      });
-      const scheduledCommand = await prepareV2WorkflowCommand(
-        scheduledEnvironment,
-      );
-      oidc.bindCommand(scheduledCommand);
-      const invocation = runV2WorkflowControllerCli(scheduledEnvironment, {
-        fetch: github.fetch,
-      });
-      if (expectFailure) {
-        await assert.rejects(invocation, (error) => {
-          assert.equal(error?.code, "CANDIDATE_DISPATCH_COMPLETION_FAILED");
-          assert.equal(error?.details?.upstream_code, "unexpected-http-status");
-          assert.equal(error?.details?.public_effects_performed, 3);
-          assert.equal(error?.details?.budget_refunded, false);
-          assert.equal(error?.details?.lease_released, true);
-          return true;
-        });
-        return null;
-      }
-      const result = await invocation;
-      assert.deepEqual(scheduledCommand.dispatch_binding, originalBindings[index]);
-      assert.equal(result.cycle.terminal_result.public_effects_performed, 3);
-      assert.equal(result.cycle.terminal_result.status_effect_outcome, "bound");
-      assert.equal(
-        result.cycle.terminal_result.automatic_request_effect_outcome,
-        "bound",
-      );
-      assertNoProtectedProductionInternals(result.cycle);
-      return result;
-    };
-
-    await runScheduledCandidate(0);
-    assert.equal(github.activeLease(), false);
-    assert.deepEqual(github.candidateDispatchPhases(), [
-      "reserve",
-      "candidate-ack",
-    ]);
-    const currentOpenRequestsAfterFirst =
-      github.currentOpenCandidateRequests().length;
-    const legacyInventoryRequestsAfterFirst =
-      github.candidateInventoryRequests().length;
-    const legacyLifecycleRequestsAfterFirst =
-      github.candidateLifecycleRequests().length;
-    const ledgerWritesAfterFirst = github.ledgerWriteRequests().length;
-
-    const remainingEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "scheduled-two-candidate-remaining-restart",
-      runId: "123459",
-      route: "scan-all-open",
-      pullRequest: "",
-    });
-    const remainingCommand = await prepareV2WorkflowCommand(
-      remainingEnvironment,
-    );
-    oidc.bindCommand(remainingCommand);
-    const remaining = await runV2ScheduleDispatchCli(remainingEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.deepEqual(remaining.matrix.include, [dispatch.matrix.include[1]]);
-    assert.equal(
-      github.currentOpenCandidateRequests().length,
-      currentOpenRequestsAfterFirst,
-    );
-    assert.equal(
-      github.candidateInventoryRequests().length,
-      legacyInventoryRequestsAfterFirst,
-    );
-    assert.equal(
-      github.candidateLifecycleRequests().length,
-      legacyLifecycleRequestsAfterFirst,
-    );
-    assert.equal(
-      github.ledgerWriteRequests().length,
-      ledgerWritesAfterFirst,
-      "remaining-plan restart must be a read-only durable reload",
-    );
-    assertNoDispatchAuthorityInternals(remaining);
-
-    github.failNextDurableRecordUpdates("candidate-dispatch-observation:");
-    await runScheduledCandidate(1, { expectFailure: true });
-
-    assert.equal(github.activeLease(), false);
-    assert.deepEqual(github.candidateDispatchPhases(), [
-      "reserve",
-      "candidate-ack",
-      "candidate-ack",
-    ]);
-    assert.equal(
-      github.currentOpenCandidateRequests().length,
-      currentOpenRequestsAfterFirst,
-      "restart must load the durable reservation before any fresh scan",
-    );
-    assert.equal(
-      github.candidateInventoryRequests().length,
-      legacyInventoryRequestsAfterFirst,
-      "current-open scheduled execution must not use legacy inventory",
-    );
-    const completionEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "scheduled-two-candidate-completion-restart",
-      runId: "123460",
-      route: "scan-all-open",
-      pullRequest: "",
-    });
-    const completionCommand = await prepareV2WorkflowCommand(
-      completionEnvironment,
-    );
-    oidc.bindCommand(completionCommand);
-    const completed = await runV2ScheduleDispatchCli(completionEnvironment, {
-      fetch: github.fetch,
-    });
-    assert.deepEqual(completed.matrix, {
-      include: [{
-        enabled: false,
-        pull_request: 0,
-        dispatch_binding: "null",
-      }],
-    });
-    assert.equal(
-      github.currentOpenCandidateRequests().length,
-      currentOpenRequestsAfterFirst,
-      "completion restart must not resample current-open candidates",
-    );
-    assert.equal(
-      github.candidateInventoryRequests().length,
-      legacyInventoryRequestsAfterFirst,
-      "completion restart must not use legacy inventory",
-    );
-    assertNoDispatchAuthorityInternals(completed);
-    assert.deepEqual(github.candidateDispatchPhases(), [
-      "reserve",
-      "candidate-ack",
-      "candidate-ack",
-      "batch-complete",
-      "cycle-complete",
-    ]);
-    assert.equal(
-      github.candidateProtocolOrder().filter((entry) =>
-        entry === "candidate-dispatch:candidate-ack").length,
-      2,
-    );
-    assert.deepEqual(
-      github.requestComments().map((comment) =>
-        new URL(comment.issue_url).pathname),
-      [
-        "/repos/owner/repo/issues/7",
-        "/repos/owner/repo/issues/8",
-      ],
-    );
-    assertFixtureServerClockWithinOidcSkew(github);
-  });
-});
-
-test("an intervening candidate scan preserves a queued artifact suffix after ready response loss",
-  async () => {
-    await withWorkflowCliFixture({
-      eventName: "schedule",
-      event: {},
-      route: "scan-all-open",
-      pullRequest: "",
-    }, async ({ environment, runnerTemp }) => {
-      const scanCommand = await prepareV2WorkflowCommand(environment);
-      const liveTime = new Date().toISOString();
-      const oidc = productionOidcFixture(scanCommand, liveTime);
-      const sharedEnvironment = {
-        ...environment,
-        ...oidc.environment,
-        GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-        GITHUB_API_URL: "https://api.github.com",
-      };
-      const github = productionControllerGitHubFixture(
-        scanCommand,
-        oidc,
-        liveTime,
-        {
-          candidateNumbers: [7],
-          apiOrigin: "https://api.github.com",
-          serverTimeStepMilliseconds: 500,
-        },
-      );
-      const firstDispatch = await runV2ScheduleDispatchCli(
-        sharedEnvironment,
-        { fetch: github.fetch },
-      );
-      const firstScheduledEnvironment = await makeWorkflowLegEnvironment({
-        environment: sharedEnvironment,
-        runnerTemp,
-        name: "scheduled-queue-initial-request",
-        runId: "123471",
-        route: "ordinary",
-        pullRequest: "7",
-        dispatchBinding:
-          firstDispatch.matrix.include[0].dispatch_binding,
-      });
-      const firstScheduledCommand = await prepareV2WorkflowCommand(
-        firstScheduledEnvironment,
-      );
-      oidc.bindCommand(firstScheduledCommand);
-      await runV2WorkflowControllerCli(firstScheduledEnvironment, {
-        fetch: github.fetch,
-      });
-      const request = github.requestComments().at(-1);
-      assert.ok(request, "scheduled automatic request exists");
-      assert.deepEqual(
-        github.candidateDispatchPhases(),
-        ["reserve", "candidate-ack", "batch-complete", "cycle-complete"],
-      );
-      const completedDispatchRecords = github.candidateDispatchRecords();
-      assert.equal(github.activeLease(), false);
-      const addFinding = (id) => {
-        const finding = productionAutomaticRecoveryFinding({ id, request });
-        const address = productionAutomaticRecoveryAddress({
-          id: id + 1,
-          finding,
-        });
-        github.addSnapshotIssueComments(finding, address);
-      };
-      const artifactBindingFamilyEntries = () =>
-        github.effectRecordEntries().filter(({ record }) =>
-          typeof record.kind === "string" &&
-          record.kind.includes("artifact-binding"));
-      const assertCanonicalArtifactBindingFamily = (entries) => {
-        const canonicalKinds = new Set([
-          "artifact-binding",
-          "artifact-binding-ready",
-        ]);
-        assert.equal(
-          entries.some(({ record }) => !canonicalKinds.has(record.kind)),
-          false,
-          "artifact binding family must not contain a noncanonical sibling",
-        );
-      };
-
-      addFinding(3180);
-      github.failNextDurableRecordUpdates(
-        "effect-response:artifact-binding-ready",
-      );
-      const ordinaryEventPath = join(
-        runnerTemp,
-        "scheduled-queue-ordinary-event.json",
-      );
-      await writeFile(ordinaryEventPath, JSON.stringify({
-        pull_request: { number: 7 },
-      }), { mode: 0o600 });
-      const prefixEnvironment = await makeWorkflowLegEnvironment({
-        environment: sharedEnvironment,
-        runnerTemp,
-        name: "scheduled-queue-prefix",
-        runId: "123472",
-        route: "ordinary",
-        pullRequest: "7",
-      });
-      prefixEnvironment.GITHUB_EVENT_NAME = "pull_request_target";
-      prefixEnvironment.V2_CONTROLLER_EVENT_PATH = ordinaryEventPath;
-      const prefixCommand = await prepareV2WorkflowCommand(prefixEnvironment);
-      oidc.bindCommand(prefixCommand);
-      await assert.rejects(
-        runV2WorkflowControllerCli(prefixEnvironment, {
-          fetch: github.fetch,
-        }),
-        (error) => error?.code === "INITIAL_OBSERVATION_ABORTED",
-      );
-      const artifactPrefixEntries = artifactBindingFamilyEntries();
-      assertCanonicalArtifactBindingFamily(artifactPrefixEntries);
-      assert.deepEqual(
-        artifactPrefixEntries.map(({ record }) =>
-          `${record.record_type}:${record.kind}`),
-        [
-          "effect-intent:artifact-binding",
-          "effect-intent:artifact-binding-ready",
-          "effect-response:artifact-binding-ready",
-        ],
-      );
-      assert.equal(
-        new Set(artifactPrefixEntries.map(({ commit_sha: commitSha }) =>
-          commitSha)).size,
-        3,
-      );
-      for (const { commit_sha: commitSha } of artifactPrefixEntries) {
-        assert.match(commitSha, /^[0-9a-f]{40}$/u);
-      }
-      assert.deepEqual(
-        github.artifactBindingPointReadRequests(),
-        [],
-        "the durable ready prefix must precede every provider point read",
-      );
-      assert.deepEqual(
-        github.candidateDispatchRecords(),
-        completedDispatchRecords,
-        "artifact prefix persistence must not rewrite completed candidate records",
-      );
-      addFinding(3200);
-
-      const dispatchRecordsBeforeInterveningScan =
-        github.candidateDispatchRecords();
-      const publicWritesBeforeInterveningScan = github.externalWrites.length;
-      const pointReadsBeforeInterveningScan =
-        github.artifactBindingPointReadRequests();
-
-      const secondScanEnvironment = await makeWorkflowLegEnvironment({
-        environment: sharedEnvironment,
-        runnerTemp,
-        name: "scheduled-queue-second-scan",
-        runId: "123473",
-        route: "scan-all-open",
-        pullRequest: "",
-      });
-      const secondScanCommand = await prepareV2WorkflowCommand(
-        secondScanEnvironment,
-      );
-      oidc.bindCommand(secondScanCommand);
-      const secondDispatch = await runV2ScheduleDispatchCli(
-        secondScanEnvironment,
-        { fetch: github.fetch },
-      );
-      assert.deepEqual(secondDispatch.matrix, {
-        include: [{
-          enabled: false,
-          pull_request: 0,
-          dispatch_binding: "null",
-        }],
-      });
-      assert.equal(
-        github.externalWrites.length,
-        publicWritesBeforeInterveningScan,
-      );
-      assert.deepEqual(
-        github.artifactBindingPointReadRequests(),
-        pointReadsBeforeInterveningScan,
-      );
-      const artifactEntriesAfterInterveningScan =
-        artifactBindingFamilyEntries();
-      assertCanonicalArtifactBindingFamily(
-        artifactEntriesAfterInterveningScan,
-      );
-      assert.deepEqual(
-        artifactEntriesAfterInterveningScan,
-        artifactPrefixEntries,
-        "intervening scan must not append, replace, or reorder artifact records",
-      );
-      assert.deepEqual(
-        github.candidateDispatchRecords(),
-        dispatchRecordsBeforeInterveningScan,
-        "intervening scan must not reuse candidate phases as new recovery evidence",
-      );
-      const dispatchRecordsAfterInterveningScan =
-        github.candidateDispatchRecords();
-      const secondOrdinaryEnvironment = await makeWorkflowLegEnvironment({
-        environment: secondScanEnvironment,
-        runnerTemp,
-        name: "scheduled-queue-close",
-        runId: "123474",
-        route: "ordinary",
-        pullRequest: "7",
-      });
-      secondOrdinaryEnvironment.GITHUB_EVENT_NAME = "pull_request_target";
-      secondOrdinaryEnvironment.V2_CONTROLLER_EVENT_PATH = ordinaryEventPath;
-      const secondOrdinaryCommand = await prepareV2WorkflowCommand(
-        secondOrdinaryEnvironment,
-      );
-      oidc.bindCommand(secondOrdinaryCommand);
-      const result = await runV2WorkflowControllerCli(
-        secondOrdinaryEnvironment,
-        { fetch: github.fetch },
-      );
-
-      const finalArtifactEntries = artifactBindingFamilyEntries();
-      assertCanonicalArtifactBindingFamily(finalArtifactEntries);
-      assert.deepEqual(
-        finalArtifactEntries.map(({ record }) =>
-          `${record.record_type}:${record.kind}`),
-        [
-          "effect-intent:artifact-binding",
-          "effect-intent:artifact-binding-ready",
-          "effect-response:artifact-binding-ready",
-          "effect-intent:artifact-binding",
-          "effect-response:artifact-binding",
-          "effect-intent:artifact-binding-ready",
-          "effect-response:artifact-binding-ready",
-          "effect-response:artifact-binding",
-        ],
-      );
-      assert.deepEqual(
-        finalArtifactEntries.slice(0, artifactPrefixEntries.length),
-        artifactPrefixEntries,
-        "ordinary continuation must retain the exact durable prefix",
-      );
-      const finalArtifactOids = finalArtifactEntries.map(
-        ({ commit_sha: commitSha }) => commitSha,
-      );
-      assert.equal(new Set(finalArtifactOids).size, 8);
-      const prefixArtifactOids = new Set(
-        artifactPrefixEntries.map(({ commit_sha: commitSha }) => commitSha),
-      );
-      for (const commitSha of finalArtifactOids.slice(
-        artifactPrefixEntries.length,
-      )) {
-        assert.match(commitSha, /^[0-9a-f]{40}$/u);
-        assert.equal(prefixArtifactOids.has(commitSha), false);
-      }
-      assert.deepEqual(
-        github.artifactBindingPointReadRequests(),
-        [3180, 3200].map((id) =>
-          `/repos/owner/repo/issues/comments/${id}`),
-      );
-      assert.deepEqual(
-        github.candidateDispatchRecords(),
-        dispatchRecordsAfterInterveningScan,
-        "ordinary artifact continuation must not rewrite candidate records",
-      );
-      assert.equal(github.activeLease(), false);
-      assertNoProtectedProductionInternals(result.cycle);
-      assertFixtureServerClockWithinOidcSkew(github);
-    });
-  });
-
-test("every scheduled dispatch binding field rejects tampering before lease or effect", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment, runnerTemp }) => {
-    const scanCommand = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(scanCommand, liveTime);
-    const sharedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      scanCommand,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
-      fetch: github.fetch,
-    });
-    const validBinding = JSON.parse(
-      dispatch.matrix.include[0].dispatch_binding,
-    );
-    const baselineRecords = github.ledgerRecordCount();
-
-    for (const [index, selected] of
-      scheduleDispatchBindingTamperCases(validBinding).entries()) {
-      const selectedEnvironment = await makeWorkflowLegEnvironment({
-        environment: sharedEnvironment,
-        runnerTemp,
-        name: `tamper-${index}`,
-        runId: String(123500 + index),
-        route: "ordinary",
-        pullRequest: "7",
-        dispatchBinding: canonicalJson(selected.binding),
-      });
-      await assert.rejects(async () => {
-        const command = await prepareV2WorkflowCommand(selectedEnvironment);
-        oidc.bindCommand(command);
-        await runV2WorkflowControllerCli(selectedEnvironment, {
-          fetch: github.fetch,
-        });
-      }, undefined, selected.name);
-      assert.equal(
-        github.ledgerRecordCount(),
-        baselineRecords,
-        `${selected.name} reached a protected-ledger write`,
-      );
-      assert.equal(
-        github.activeLease(),
-        false,
-        `${selected.name} acquired a production lease`,
-      );
-      assert.deepEqual(
-        github.externalWrites,
-        [],
-        `${selected.name} reached a public effect`,
-      );
-    }
-  });
-});
-
-test("scheduled completion uses same-run recovery after a durable lease release", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment, runnerTemp }) => {
-    const scanCommand = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(scanCommand, liveTime);
-    const sharedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      scanCommand,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
-      fetch: github.fetch,
-    });
-    github.failNextRecordUpdates("candidate-dispatch-observation:");
-    const scheduledEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "same-run-recovery",
-      runId: "123457",
-      route: "ordinary",
-      pullRequest: "7",
-      dispatchBinding: dispatch.matrix.include[0].dispatch_binding,
-    });
-    const scheduledCommand = await prepareV2WorkflowCommand(
-      scheduledEnvironment,
-    );
-    oidc.bindCommand(scheduledCommand);
-    const result = await runV2WorkflowControllerCli(scheduledEnvironment, {
-      fetch: github.fetch,
-    });
-
-    assert.equal(result.cycle.terminal_result.public_effects_performed, 3);
-    assert.equal(github.activeLease(), false);
-    assert.deepEqual(github.candidateDispatchPhases(), [
-      "reserve",
-      "candidate-ack",
-      "batch-complete",
-      "cycle-complete",
-    ]);
-    assert.equal(
-      github.candidateProtocolOrder().filter((entry) =>
-        entry === "candidate-dispatch:candidate-ack").length,
-      1,
-    );
-    assertFixtureServerClockWithinOidcSkew(github);
-  });
-});
-
-test("schedule-dispatch recovers one ready released attempt without a fresh candidate scan", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment, runnerTemp }) => {
-    const scanCommand = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(scanCommand, liveTime);
-    const sharedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      scanCommand,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
-      fetch: github.fetch,
-    });
-    github.failNextRecordUpdates(
-      "candidate-dispatch-observation:",
-      "candidate-dispatch-observation:",
-    );
-    const scheduledEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "released-unacknowledged",
-      runId: "123457",
-      route: "ordinary",
-      pullRequest: "7",
-      dispatchBinding: dispatch.matrix.include[0].dispatch_binding,
-    });
-    const scheduledCommand = await prepareV2WorkflowCommand(
-      scheduledEnvironment,
-    );
-    assert.deepEqual(
-      scheduledCommand.dispatch_binding,
-      JSON.parse(dispatch.matrix.include[0].dispatch_binding),
-    );
-    oidc.bindCommand(scheduledCommand);
-    await assert.rejects(
-      runV2WorkflowControllerCli(scheduledEnvironment, {
-        fetch: github.fetch,
-      }),
-      (error) => error?.code === "CANDIDATE_DISPATCH_COMPLETION_FAILED",
-    );
+    const oversizedRows = Array.from({ length: 256 }, (_, index) => ({
+      enabled: true,
+      pull_request: index + 1,
+      dispatch_binding: "x".repeat(4_096),
+    }));
+    const oversizedLine = `matrix=${canonicalJson({
+      include: oversizedRows,
+    })}\n`;
     assert.ok(
-      github.requestComments().at(-1),
-      "the failed scheduled attempt must have performed its public request",
+      Buffer.byteLength(oversizedLine, "utf16le") >
+        MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES,
     );
-    assert.equal(github.activeLease(), false);
-    assert.deepEqual(github.candidateDispatchPhases(), ["reserve"]);
-    const releasedAttemptProtocol = github.candidateProtocolOrder();
-    assert.equal(
-      releasedAttemptProtocol.filter((entry) =>
-        entry === "lease-acquire:").length,
-      1,
-    );
-    assert.equal(
-      releasedAttemptProtocol.filter((entry) =>
-        entry === "lease-release:").length,
-      1,
-    );
-    assert.equal(releasedAttemptProtocol.at(-1), "lease-release:");
-    const dispatchRecordsBeforeRecovery = github.candidateDispatchRecords();
-    assert.equal(
-      dispatchRecordsBeforeRecovery.filter(({ phase }) =>
-        phase === "candidate-ack").length,
-      0,
-    );
-    const inventoryRequests = github.candidateInventoryRequests().length;
-    const lifecycleRequests = github.candidateLifecycleRequests().length;
-    const currentOpenRequests = github.currentOpenCandidateRequests().length;
-    const publicWrites = github.externalWrites.length;
-    const pointReads = github.artifactBindingPointReadRequests();
-
-    const recoveryEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "ready-recovery-scan",
-      runId: "123458",
-      route: "scan-all-open",
-      pullRequest: "",
-    });
-    const recoveryCommand = await prepareV2WorkflowCommand(
-      recoveryEnvironment,
-    );
-    oidc.bindCommand(recoveryCommand);
-    const recovered = await runV2ScheduleDispatchCli(recoveryEnvironment, {
-      fetch: github.fetch,
-    });
-
-    assert.deepEqual(recovered.matrix, {
-      include: [{
-        enabled: false,
-        pull_request: 0,
-        dispatch_binding: "null",
-      }],
-    });
-    assert.equal(
-      github.candidateInventoryRequests().length,
-      inventoryRequests,
-      "recovery must not start another diagnostic or candidate scan",
-    );
-    assert.equal(
-      github.candidateLifecycleRequests().length,
-      lifecycleRequests,
-      "ready recovery must not read legacy candidate lifecycle",
-    );
-    assert.equal(
-      github.currentOpenCandidateRequests().length,
-      currentOpenRequests,
-      "ready recovery must not resample current-open candidates",
-    );
-    assert.equal(github.externalWrites.length, publicWrites);
-    assert.deepEqual(github.artifactBindingPointReadRequests(), pointReads);
-    assert.equal(
-      github.candidateProtocolOrder().filter((entry) =>
-        entry === "lease-acquire:").length,
-      1,
-      "recovery must consume the single released attempt without a new lease",
-    );
-    assert.equal(
-      github.candidateProtocolOrder().filter((entry) =>
-        entry === "lease-release:").length,
-      1,
-    );
-    const dispatchRecordsAfterRecovery = github.candidateDispatchRecords();
-    const recoveryRecords = dispatchRecordsAfterRecovery.slice(
-      dispatchRecordsBeforeRecovery.length,
-    );
-    assert.deepEqual(
-      recoveryRecords.map(({ phase }) => phase),
-      ["candidate-ack", "batch-complete", "cycle-complete"],
-    );
-    const dispatchRecordOidsBeforeRecovery = new Set(
-      dispatchRecordsBeforeRecovery.map(({ commit_sha: commitSha }) =>
-        commitSha),
-    );
-    assert.equal(
-      new Set(recoveryRecords.map(({ commit_sha: commitSha }) => commitSha))
-        .size,
-      3,
-      "recovery ack and both completion records must have unique OIDs",
-    );
-    for (const { commit_sha: commitSha } of recoveryRecords) {
-      assert.match(commitSha, /^[0-9a-f]{40}$/u);
-      assert.equal(
-        dispatchRecordOidsBeforeRecovery.has(commitSha),
-        false,
-        "fresh recovery records must not reuse a pre-recovery OID",
-      );
-    }
-    const recoveryAckRecords = recoveryRecords.filter(({ phase }) =>
-      phase === "candidate-ack");
-    assert.equal(recoveryAckRecords.length, 1);
-    assert.equal(
-      dispatchRecordsAfterRecovery.filter(({ phase }) =>
-        phase === "candidate-ack").length,
-      1,
-    );
-    assertNoDispatchAuthorityInternals(recovered);
-    assertFixtureServerClockWithinOidcSkew(github);
-  });
-});
-
-test("schedule-dispatch returns a zero-effect sentinel while recovery is not ready", async () => {
-  await withWorkflowCliFixture({
-    eventName: "schedule",
-    event: {},
-    route: "scan-all-open",
-    pullRequest: "",
-  }, async ({ environment, runnerTemp }) => {
-    const scanCommand = await prepareV2WorkflowCommand(environment);
-    const liveTime = new Date().toISOString();
-    const oidc = productionOidcFixture(scanCommand, liveTime);
-    const sharedEnvironment = {
-      ...environment,
-      ...oidc.environment,
-      GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
-      GITHUB_API_URL: "https://api.github.com",
-    };
-    const github = productionControllerGitHubFixture(
-      scanCommand,
-      oidc,
-      liveTime,
-      {
-        candidateNumbers: [7],
-        apiOrigin: "https://api.github.com",
-      },
-    );
-    const dispatch = await runV2ScheduleDispatchCli(sharedEnvironment, {
-      fetch: github.fetch,
-    });
-    github.failNextRelease();
-    const scheduledEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "active-lease-recovery",
-      runId: "123457",
-      route: "ordinary",
-      pullRequest: "7",
-      dispatchBinding: dispatch.matrix.include[0].dispatch_binding,
-    });
-    const scheduledCommand = await prepareV2WorkflowCommand(
-      scheduledEnvironment,
-    );
-    oidc.bindCommand(scheduledCommand);
+    const originalOutput = Buffer.from("sentinel=unchanged\n", "utf8");
+    await writeFile(githubOutput, originalOutput, { mode: 0o600 });
     await assert.rejects(
-      runV2WorkflowControllerCli(scheduledEnvironment, {
-        fetch: github.fetch,
+      writeV2ScheduleDispatchMatrixOutput({
+        rows: oversizedRows,
+        environment: { GITHUB_OUTPUT: githubOutput },
       }),
-      (error) => error?.code === "PRODUCTION_LEASE_RELEASE_FAILED",
+      (error) => error?.code === "SCHEDULE_DISPATCH_OUTPUT_TOO_LARGE",
     );
-    assert.equal(github.activeLease(), true);
-    const recordsBefore = github.ledgerRecordCount();
-    const writesBefore = github.externalWrites.length;
-    const inventoryRequests = github.candidateInventoryRequests().length;
-    const lifecycleRequests = github.candidateLifecycleRequests().length;
-    const currentOpenRequests = github.currentOpenCandidateRequests().length;
-
-    const pendingEnvironment = await makeWorkflowLegEnvironment({
-      environment: sharedEnvironment,
-      runnerTemp,
-      name: "pending-recovery-scan",
-      runId: "123458",
-      route: "scan-all-open",
-      pullRequest: "",
-    });
-    const pendingCommand = await prepareV2WorkflowCommand(pendingEnvironment);
-    oidc.bindCommand(pendingCommand);
-    const pending = await runV2ScheduleDispatchCli(pendingEnvironment, {
-      fetch: github.fetch,
-    });
-
-    assert.deepEqual(pending.matrix, {
-      include: [{
-        enabled: false,
-        pull_request: 0,
-        dispatch_binding: "null",
-      }],
-    });
-    assert.equal(github.ledgerRecordCount(), recordsBefore);
-    assert.equal(github.externalWrites.length, writesBefore);
-    assert.equal(github.candidateInventoryRequests().length, inventoryRequests);
-    assert.equal(github.candidateLifecycleRequests().length, lifecycleRequests);
-    assert.equal(
-      github.currentOpenCandidateRequests().length,
-      currentOpenRequests,
-    );
-    assert.equal(github.activeLease(), true);
-    assertNoDispatchAuthorityInternals(pending);
-  });
+    assert.deepEqual(await readFile(githubOutput), originalOutput);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("workflow output writer publishes exactly ten outputs and canonical artifacts", async () => {
@@ -7556,6 +3861,7 @@ test("real scheduler public waits reach all three closed workflow outputs",
           latest_idempotency_key: null,
         },
         applied_action_keys: [],
+        wait_completions: [],
       };
       return {
         ...base,
@@ -7564,7 +3870,60 @@ test("real scheduler public waits reach all three closed workflow outputs",
         status: { ...base.status, ...(overrides.status ?? {}) },
       };
     };
+    const waitCompletion = (stage, deadline) => {
+      const withoutDigest = {
+        schema: "codex-review-gate-public-wait-completion-v2",
+        schema_version: 1,
+        repository: { owner: "owner", name: "repo" },
+        pull_request: { number: 7 },
+        head_ref_oid: "a".repeat(40),
+        epoch_id: epochId,
+        generation_index: 1,
+        stage,
+        deadline,
+        completed_at: deadline,
+        environment: {
+          name: `codex-review-gate-${stage}-15m`,
+          id: "101",
+          wait_timer_rule_id: "201",
+          wait_timer_minutes: 15,
+        },
+        trusted_workflow: {
+          repository: "Joey-Tools/codex-review-gate-action",
+          path: ".github/workflows/codex-review-gate.yml",
+          sha: "b".repeat(40),
+        },
+        run: {
+          run_id: "1001",
+          run_attempt: 1,
+          wait_job_id: `${stage}-wait`,
+          continuation_job_id: `after-${stage}`,
+        },
+        source_observation_record_oid: "c".repeat(40),
+        stage_nonce: "d".repeat(64),
+      };
+      return {
+        ...withoutDigest,
+        receipt_digest: `sha256:${createHash("sha256")
+          .update(
+            `codex-review-gate-v2-public-wait-completion\0${canonicalJson(withoutDigest)}`,
+            "utf8",
+          )
+          .digest("hex")}`,
+      };
+    };
     const requestAt = at(PUBLIC_INITIAL_WAIT_MS);
+    const initialCompletion = waitCompletion(
+      "public-initial",
+      requestAt,
+    );
+    const postRequestDeadline = at(
+      PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS,
+    );
+    const postRequestCompletion = waitCompletion(
+      "public-post-request",
+      postRequestDeadline,
+    );
     const attemptedRequestEpoch = {
       controlled_request: controlledRequest(requestAt),
       automatic_request: automaticRequest({
@@ -7602,7 +3961,10 @@ test("real scheduler public waits reach all three closed workflow outputs",
         hint: "public-initial-wait",
         completionReason: "public-initial-wait-complete",
         waiting: schedulerInput(),
-        complete: schedulerInput({ now: at(PUBLIC_INITIAL_WAIT_MS) }),
+        complete: schedulerInput({
+          now: at(PUBLIC_INITIAL_WAIT_MS),
+          wait_completions: [initialCompletion],
+        }),
       },
       {
         name: "post-request",
@@ -7611,11 +3973,13 @@ test("real scheduler public waits reach all three closed workflow outputs",
         waiting: schedulerInput({
           now: requestAt,
           evaluation: postRequestSnapshot,
+          wait_completions: [initialCompletion],
         }),
         complete: schedulerInput({
           now: at(PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS),
           epoch: attemptedRequestEpoch,
           evaluation: postRequestSnapshot,
+          wait_completions: [initialCompletion, postRequestCompletion],
         }),
       },
       {
@@ -7626,6 +3990,7 @@ test("real scheduler public waits reach all three closed workflow outputs",
           now: noStartObservedAt,
           epoch: attemptedRequestEpoch,
           evaluation: noStartSnapshot,
+          wait_completions: [initialCompletion, postRequestCompletion],
         }),
         complete: schedulerInput({
           now: at(
@@ -7634,6 +3999,17 @@ test("real scheduler public waits reach all three closed workflow outputs",
           ),
           epoch: attemptedRequestEpoch,
           evaluation: noStartSnapshot,
+          wait_completions: [
+            initialCompletion,
+            postRequestCompletion,
+            waitCompletion(
+              "public-no-start",
+              at(
+                PUBLIC_INITIAL_WAIT_MS + PUBLIC_POST_REQUEST_WAIT_MS +
+                  PUBLIC_NO_START_CONFIRMATION_MS,
+              ),
+            ),
+          ],
         }),
       },
     ];
@@ -7755,6 +4131,7 @@ test("real scheduler public waits reach all three closed workflow outputs",
       schedulerInput({
         now: requestAt,
         evaluation: postRequestSnapshot,
+        wait_completions: [initialCompletion],
         epoch: {
           automatic_request: automaticRequest({
             state: "intent-persisted",
@@ -7802,13 +4179,13 @@ test("real scheduler public waits reach all three closed workflow outputs",
       "private-reconcile",
     );
     const postRequestWaiting = phases[1].waiting;
-    assert.throws(
-      () => productionCycle(
+    assert.equal(
+      productionCycle(
         postRequestWaiting,
         planV2Actions(postRequestWaiting),
         { ...postRequestWaiting.evaluation, decision: "clean" },
-      ),
-      (error) => error?.code === "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
+      ).terminal_result.wakeup_hints,
+      "public-post-request-wait",
     );
     const forgedAutomaticState = schedulerInput({
       now: requestAt,
@@ -7817,12 +4194,12 @@ test("real scheduler public waits reach all three closed workflow outputs",
         automatic_request: automaticRequest({ state: "forged" }),
       },
     });
-    assert.throws(
-      () => productionCycle(
+    assert.equal(
+      productionCycle(
         forgedAutomaticState,
         planV2Actions(postRequestWaiting),
-      ),
-      (error) => error?.code === "PUBLIC_WAIT_PHASE_UNCLASSIFIED",
+      ).terminal_result.wakeup_hints,
+      "public-post-request-wait",
     );
   });
 
@@ -7987,6 +4364,7 @@ function productionPreflightFetchFixture(command, {
   callerWorkflowState = "active",
   ledgerBranchPresent = true,
   apiOrigin = "https://api.github.com",
+  repositoryVisibility = "private",
 } = {}) {
   const paths = [];
   const repository = "owner/repo";
@@ -8049,8 +4427,8 @@ function productionPreflightFetchFixture(command, {
         node_id: "R_repo",
         url: `${apiOrigin}/repos/owner/repo`,
         role_name: "write",
-        visibility: "private",
-        private: true,
+        visibility: repositoryVisibility,
+        private: repositoryVisibility === "private",
         default_branch: "main",
         permissions: {
           admin: false,
@@ -8061,6 +4439,42 @@ function productionPreflightFetchFixture(command, {
         },
         owner: { id: 88, login: "owner" },
       }));
+    }
+    if (
+      repositoryVisibility === "public" &&
+      path === "/repos/owner/repo/environments"
+    ) {
+      return jsonResponse(JSON.stringify({
+        total_count: 3,
+        environments: [
+          { id: 101, name: "codex-review-gate-public-initial-15m" },
+          { id: 102, name: "codex-review-gate-public-post-request-15m" },
+          { id: 103, name: "codex-review-gate-public-no-start-15m" },
+        ],
+      }));
+    }
+    if (
+      repositoryVisibility === "public" &&
+      path.startsWith("/repos/owner/repo/environments/")
+    ) {
+      const environmentName = decodeURIComponent(path.split("/").at(-1));
+      const environmentIds = new Map([
+        ["codex-review-gate-public-initial-15m", [101, 201]],
+        ["codex-review-gate-public-post-request-15m", [102, 202]],
+        ["codex-review-gate-public-no-start-15m", [103, 203]],
+      ]);
+      const [environmentId, ruleId] = environmentIds.get(environmentName) ?? [];
+      if (environmentId !== undefined) {
+        return jsonResponse(JSON.stringify({
+          id: environmentId,
+          name: environmentName,
+          protection_rules: [{
+            id: ruleId,
+            type: "wait_timer",
+            wait_timer: 15,
+          }],
+        }));
+      }
     }
     if (path === "/repos/Joey-Tools/codex-review-gate-action") {
       return jsonResponse(JSON.stringify({
@@ -8155,6 +4569,217 @@ function productionPreflightFetchFixture(command, {
   return { fetch, paths };
 }
 
+async function createDirectProductionIntentContext({
+  environment,
+  prepare_automatic_request: prepareAutomaticRequest = false,
+}) {
+  const command = await prepareV2WorkflowCommand(environment);
+  const liveTime = new Date().toISOString();
+  const oidc = productionOidcFixture(command, liveTime);
+  const github = productionControllerGitHubFixture(command, oidc, liveTime);
+  const selectedEnvironment = {
+    ...environment,
+    ...oidc.environment,
+    GITHUB_TOKEN: "synthetic-token-for-v2-controller-tests-only",
+    GITHUB_API_URL: "https://api.github.com",
+  };
+  const token = selectedEnvironment.GITHUB_TOKEN;
+  const restBaseUrl = selectedEnvironment.GITHUB_API_URL;
+  const graphqlUrl = `${restBaseUrl}/graphql`;
+  const preflightHandle = await createV2GitHubWorkflowPreflight({
+    fetch: github.fetch,
+    token,
+    repository: command.repository,
+    restBaseUrl,
+  }).load({ command });
+  const verifier = createV2GitHubOidcProvenanceVerifier({
+    fetch: github.fetch,
+    environment: selectedEnvironment,
+  });
+  const verifierInitialization = await verifier.initialize();
+  const handoff = assertV2WorkflowGitLedgerHandoffHandle(
+    createV2WorkflowGitLedgerHandoff(preflightHandle, {
+      verifier_initialization: verifierInitialization,
+    }),
+  );
+  assert.equal(handoff.state, "bootstrap");
+  const activated = await createV2GitHubGitLedgerBootstrap({
+    fetch: github.fetch,
+    token,
+    repository: handoff.repository,
+    ledgerRef: handoff.ledger_ref,
+    restBaseUrl,
+    bootstrapCapabilityInput: handoff.bootstrap_input,
+    preflightHandle,
+    verifyWorkflowProvenance: verifier.verifyWorkflowProvenance,
+  }).bootstrapCapability();
+  const ledger = activated.ledger;
+  const preScope = await loadV2MinimalLiveScope({
+    fetch: github.fetch,
+    token,
+    repository: command.repository,
+    pull_number: command.pull_request.number,
+    rest_base_url: restBaseUrl,
+    graphql_url: graphqlUrl,
+  });
+  const preLease = await createV2PreLeaseEvaluatedScopeAuthority({
+    command,
+    environment: selectedEnvironment,
+    fetch: github.fetch,
+    token,
+    rest_base_url: restBaseUrl,
+    ledger,
+    preflight_handle: preflightHandle,
+    pre_scope: preScope,
+  });
+  const discovery = await acquireV2LeaseThenLoadDiscovery({
+    command,
+    environment: selectedEnvironment,
+    fetch: github.fetch,
+    token,
+    rest_base_url: restBaseUrl,
+    graphql_url: graphqlUrl,
+    ledger,
+    evaluated_scope_receipt: preLease.evaluated_scope_receipt,
+    pre_scope: preScope,
+  });
+  const evaluatedScopeReceipt = discovery.effect_evaluated_scope_receipt;
+  const controlPlaneAuthority = await ledger.loadControlPlaneAuthority(
+    evaluatedScopeReceipt.scope,
+  );
+  const controlPlaneReceipt =
+    createV2ControlPlaneReceiptFromGitLedgerAuthority(controlPlaneAuthority);
+  const initialRunnerStateAuthority =
+    await ledger.loadInitialRunnerStateAuthority({
+      control_plane_authority: controlPlaneAuthority,
+      evaluated_scope_receipt: evaluatedScopeReceipt,
+      workflow_command_handle: command,
+    });
+  const runnerAuthority = assertV2ProductionRunnerAuthorityHandle(
+    createV2ProductionRunnerAuthority({
+      preflight_handle: preflightHandle,
+      control_plane_receipt: controlPlaneReceipt,
+      initial_runner_state_authority: initialRunnerStateAuthority,
+      established_runner_state_authority: null,
+      expected_scope: controlPlaneReceipt.scope,
+    }),
+  );
+  const internalResult = await runV2Operation({
+    schema: V2_RUNNER_SCHEMA,
+    schema_version: V2_RUNNER_SCHEMA_VERSION,
+    operation: "prepare-request",
+    status_target_mode: runnerAuthority.scheduling.status_target_mode,
+    status_context: V2_STATUS_CONTEXT,
+    snapshot_request: {
+      owner: command.repository.owner,
+      repo: command.repository.name,
+      pull_number: command.pull_request.number,
+    },
+    controller: runnerAuthority.projector_controller,
+    public_report_authority: runnerAuthority.public_report_authority,
+    scheduling: runnerAuthority.scheduling,
+    head_ledger: runnerAuthority.head_ledger,
+    reservation: null,
+    post_response: null,
+  }, {
+    transport: createV2GitHubTransport({
+      fetch: github.fetch,
+      token,
+      restBaseUrl,
+      graphqlUrl,
+    }),
+    reduceSnapshot: reduceV2Snapshot,
+  });
+  const schedulerAppend = await ledger.appendInitialSchedulerObservation({
+    initial_runner_state_authority: initialRunnerStateAuthority,
+    scheduler_evaluation: internalResult.scheduler_evaluation,
+    status_plan: internalResult.status_plan,
+  });
+  const statusIntentAppend = await ledger.loadNextStatusWriteIntent({
+    scheduler_append: schedulerAppend,
+  });
+  assert.notEqual(statusIntentAppend, null);
+
+  if (!prepareAutomaticRequest) {
+    return {
+      command,
+      github,
+      ledger,
+      restBaseUrl,
+      schedulerAppend,
+      selectedEnvironment,
+      statusIntentAppend,
+      token,
+    };
+  }
+
+  const statusReceipt = await createV2GitHubProductionStatusTransport({
+    fetch: github.fetch,
+    token,
+    restBaseUrl,
+    repository: command.repository,
+  }).performStatusWrite({
+    status_intent_handle: statusIntentAppend.status_intent_handle,
+  });
+  await ledger.appendStatusWriteResponse({
+    status_intent_handle: statusIntentAppend.status_intent_handle,
+    intent_append_receipt: statusIntentAppend.intent_append_receipt,
+    receipt: statusReceipt,
+  });
+  assert.equal(await ledger.loadNextStatusWriteIntent({
+    scheduler_append: schedulerAppend,
+  }), null);
+  const automaticReservationAppend =
+    await ledger.appendAutomaticRequestReservation({
+      scheduler_append: schedulerAppend,
+    });
+  const reservationStatusIntentAppend =
+    await ledger.appendReservationStatusWriteIntent({
+      automatic_reservation_handle:
+        automaticReservationAppend.automatic_reservation_handle,
+      reservation_append_receipt:
+        automaticReservationAppend.reservation_append_receipt,
+    });
+  const reservationStatusReceipt =
+    await createV2GitHubProductionReservationStatusTransport({
+      fetch: github.fetch,
+      token,
+      restBaseUrl,
+      repository: command.repository,
+    }).performReservationStatusWrite({
+      reservation_status_intent_handle:
+        reservationStatusIntentAppend.reservation_status_intent_handle,
+    });
+  const reservationStatusResponseAppend =
+    await ledger.appendReservationStatusWriteResponse({
+      reservation_status_intent_handle:
+        reservationStatusIntentAppend.reservation_status_intent_handle,
+      intent_append_receipt:
+        reservationStatusIntentAppend.intent_append_receipt,
+      receipt: reservationStatusReceipt,
+    });
+  const automaticRequestIntentAppend =
+    await ledger.appendAutomaticReviewRequestIntent({
+      automatic_reservation_handle:
+        automaticReservationAppend.automatic_reservation_handle,
+      reservation_append_receipt:
+        automaticReservationAppend.reservation_append_receipt,
+      reservation_status_response_append: reservationStatusResponseAppend,
+    });
+  return {
+    automaticRequestIntentAppend,
+    command,
+    github,
+    ledger,
+    restBaseUrl,
+    reservationStatusReceipt,
+    schedulerAppend,
+    selectedEnvironment,
+    statusIntentAppend,
+    token,
+  };
+}
+
 function productionControllerGitHubFixture(
   command,
   oidc,
@@ -8168,11 +4793,13 @@ function productionControllerGitHubFixture(
     snapshotIssueComments = [],
     serverTimeStepMilliseconds = 1_000,
     authoritativeWallClock = false,
+    repositoryVisibility = "private",
   } = {},
 ) {
   const preflight = productionPreflightFetchFixture(command, {
     ledgerBranchPresent: false,
     apiOrigin,
+    repositoryVisibility,
   });
   const transportFetch = completeSnapshotFetch({
     apiOrigin,
