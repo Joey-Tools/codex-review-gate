@@ -314,7 +314,7 @@ function assertReusableWorkflowContract(reusable) {
     {
       name: "codex-review-gate",
       jobIf: "    if: inputs.controller-mode != 'scan-all-open'",
-      timeout: "5",
+      timeout: "10",
       route: "${{ inputs.controller-mode }}",
       observationBoundary: "${{ inputs.observation-boundary }}",
       pullRequest: "${{ inputs.pull-request }}",
@@ -334,7 +334,7 @@ function assertReusableWorkflowContract(reusable) {
     {
       name: "scheduled-pull-requests",
       jobIf: "    if: inputs.controller-mode == 'scan-all-open'",
-      timeout: "5",
+      timeout: "10",
       route: "ordinary",
       observationBoundary: "initial",
       pullRequest: "${{ matrix.pull_request }}",
