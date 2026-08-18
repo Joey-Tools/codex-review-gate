@@ -73,10 +73,25 @@ const EVIDENCE_BASIS_KINDS = new Set([
   "no-start-rejection",
   "unresolved-inline-finding",
   "malformed-evidence",
+  "unknown-terminal",
+  "stable-evidence-blocker",
   "incomplete-snapshot",
   "unstable-scope",
   "configuration",
   "input",
+]);
+const ARTIFACT_PUBLICATION_BASIS_KINDS = new Set([
+  "terminal-clean",
+  "terminal-findings",
+  "unresolved-inline-finding",
+  "malformed-evidence",
+  "unknown-terminal",
+]);
+const LEGACY_WHOLE_PR_ARTIFACT_BASIS_KINDS = new Set([
+  "terminal-clean",
+  "terminal-findings",
+  "unresolved-inline-finding",
+  "malformed-evidence",
 ]);
 const PULL_REQUEST_LIFECYCLES = new Set(["open", "closed", "merged"]);
 const EVIDENCE_BASIS_KEYS = [
@@ -247,7 +262,12 @@ export function buildStickyAuditProjection({
 
   let priorEntries = [];
   if (prior_projection !== null) {
-    const prior = validateStickyMetadata(prior_projection);
+    // Schema version 1 was already deployed with whole-pr assurance on
+    // artifact-backed snapshots. It is accepted only as inert audit history; the
+    // current reducer report below still passes the strict current contract.
+    const prior = validateStickyMetadata(prior_projection, {
+      allow_legacy_artifact_scope: true,
+    });
     if (!sameScope(prior.scope, normalizedScope)) {
       throw new Error("prior sticky projection belongs to a different repository or pull request");
     }
@@ -283,7 +303,9 @@ export function buildStickyAuditProjection({
     edit_log: [...priorEntries, entry],
   };
 
-  validateStickyMetadata(metadata);
+  validateStickyMetadata(metadata, {
+    allow_legacy_artifact_scope_before_sequence: sequence,
+  });
   const body = renderStickyBody(metadata);
   const bodyBytes = Buffer.byteLength(body, "utf8");
   if (bodyBytes > MAX_GENERATED_STICKY_COMMENT_BYTES) {
@@ -340,7 +362,12 @@ export function parseStickyAuditProjection(body) {
     }
     const metadataJson = UTF8_DECODER.decode(metadataBytes);
     const metadata = JSON.parse(metadataJson);
-    validateStickyMetadata(metadata);
+    // The schema version did not change when artifact publication assurance was
+    // corrected. Parsing therefore accepts the old artifact scope spelling,
+    // but parsed state remains audit-only and is never reducer authority.
+    validateStickyMetadata(metadata, {
+      allow_legacy_artifact_scope: true,
+    });
     if (canonicalJson(metadata) !== metadataJson) {
       return null;
     }
@@ -734,11 +761,19 @@ function normalizeEvidenceBasis(value) {
     EVIDENCE_BASIS_KINDS,
     "reducer_report.evidence_basis.kind",
   );
-  const scopeAssurance = exactString(
+  const scopeAssurance = enumValue(
     value.scope_assurance,
-    "whole-pr-contractual",
+    new Set(["whole-pr-contractual", "artifact-publication-only"]),
     "reducer_report.evidence_basis.scope_assurance",
   );
+  const expectedScopeAssurance = ARTIFACT_PUBLICATION_BASIS_KINDS.has(kind)
+    ? "artifact-publication-only"
+    : "whole-pr-contractual";
+  if (scopeAssurance !== expectedScopeAssurance) {
+    throw new Error(
+      `reducer_report.evidence_basis.${kind} must use ${expectedScopeAssurance}`,
+    );
+  }
   return {
     kind,
     scope_assurance: scopeAssurance,
@@ -751,7 +786,10 @@ function normalizeEvidenceBasis(value) {
   };
 }
 
-function validateStickyMetadata(metadata) {
+function validateStickyMetadata(metadata, {
+  allow_legacy_artifact_scope = false,
+  allow_legacy_artifact_scope_before_sequence = 0,
+} = {}) {
   assertExactKeys(metadata, METADATA_KEYS, "sticky metadata");
   if (
     metadata.schema !== STICKY_AUDIT_SCHEMA ||
@@ -789,7 +827,11 @@ function validateStickyMetadata(metadata) {
       throw new Error(`sticky metadata.edit_log[${index}] has a non-contiguous sequence`);
     }
     const normalizedEdit = normalizeEdit(entry.edit);
-    validateSnapshot(entry.snapshot);
+    validateSnapshot(entry.snapshot, {
+      allow_legacy_artifact_scope:
+        allow_legacy_artifact_scope ||
+        entry.sequence < allow_legacy_artifact_scope_before_sequence,
+    });
     if (entry.previous_entry_hash !== previousEntryHash) {
       throw new Error(`sticky metadata.edit_log[${index}] breaks the previous-entry chain`);
     }
@@ -815,7 +857,7 @@ function validateStickyMetadata(metadata) {
   return metadata;
 }
 
-function validateSnapshot(snapshot) {
+function validateSnapshot(snapshot, { allow_legacy_artifact_scope = false } = {}) {
   assertExactKeys(snapshot, SNAPSHOT_KEYS, "sticky snapshot");
   if (snapshot.report_schema_version !== 2) {
     throw new Error("sticky snapshot report_schema_version must be exactly 2");
@@ -945,9 +987,9 @@ function validateSnapshot(snapshot) {
     EVIDENCE_BASIS_KINDS,
     "sticky snapshot.evidence_basis_kind",
   );
-  nullableExactString(
+  nullableEnumValue(
     snapshot.evidence_scope_assurance,
-    "whole-pr-contractual",
+    new Set(["whole-pr-contractual", "artifact-publication-only"]),
     "sticky snapshot.evidence_scope_assurance",
   );
   if (
@@ -957,6 +999,21 @@ function validateSnapshot(snapshot) {
     throw new Error(
       "sticky snapshot evidence scope assurance must bind every non-null basis",
     );
+  }
+  const expectedScopeAssurance =
+    ARTIFACT_PUBLICATION_BASIS_KINDS.has(snapshot.evidence_basis_kind)
+      ? "artifact-publication-only"
+      : "whole-pr-contractual";
+  const acceptedLegacyArtifactScope =
+    allow_legacy_artifact_scope &&
+    LEGACY_WHOLE_PR_ARTIFACT_BASIS_KINDS.has(snapshot.evidence_basis_kind) &&
+    snapshot.evidence_scope_assurance === "whole-pr-contractual";
+  if (
+    snapshot.evidence_basis_kind !== null &&
+    snapshot.evidence_scope_assurance !== expectedScopeAssurance &&
+    !acceptedLegacyArtifactScope
+  ) {
+    throw new Error("sticky snapshot evidence scope assurance does not match its basis kind");
   }
   validateProviderBasisPair(snapshot.provider_profile, snapshot.evidence_basis_kind);
   exactString(snapshot.status_context, V2_STATUS_CONTEXT, "sticky snapshot.status_context");
@@ -1062,6 +1119,9 @@ function validateProviderBasisPair(providerProfile, evidenceBasisKind) {
           "thumbs-up-clean",
           "unresolved-inline-finding",
           "malformed-evidence",
+          "unknown-terminal",
+          "stable-evidence-blocker",
+          "input",
         ]);
   if (!allowedBasis.has(evidenceBasisKind)) {
     throw new Error("sticky snapshot provider profile does not match its closed evidence basis");

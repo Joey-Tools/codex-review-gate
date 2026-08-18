@@ -4353,13 +4353,10 @@ export function createV2GitHubGitLedger({
         evaluated_scope_receipt: evaluatedScopeReceipt,
         workflow_command: commandAuthority.command,
       });
-      if (loaded.records.some((entry) =>
-        new Set(["effect-intent", "effect-response"])
-          .has(entry.envelope.record_type) &&
-        sameHeadScope(entry.envelope, scope))) {
+      if (hasPriorRunnerEffects(loaded.records, scope)) {
         throw ledgerError(
           "initial-runner-history-exists",
-          "initial runner authority requires an effect-free head epoch",
+          "initial runner authority requires a head epoch without prior runner effects",
         );
       }
       const currentRef = await readRef({
@@ -4553,7 +4550,7 @@ export function createV2GitHubGitLedger({
       const runnerState = controlPlaneAuthority.scoped_authority.runner_state;
       if (
         runnerState?.scheduling === null ||
-        schedulerObservationRecords(loaded.records, scope).length === 0
+        headSchedulerObservationRecords(loaded.records, scope).length === 0
       ) {
         throw ledgerError(
           "established-runner-history-required",
@@ -5007,7 +5004,10 @@ export function createV2GitHubGitLedger({
           status_write_index,
           status_write_count: writes.length,
         },
-        control_comment_binding: loaded.control_comment_binding,
+        control_comment_binding: currentScopeControlCommentBinding(
+          loaded.records,
+          schedulerAuthority.scope,
+        ),
         lease_receipt: schedulerAuthority.lease_authority,
       });
       const appendReceipt = await appendRecordInternal(record, {
@@ -5289,7 +5289,10 @@ export function createV2GitHubGitLedger({
           reservation_digest: reservation.reservation_digest,
           budget_limit: 3,
         },
-        control_comment_binding: loaded.control_comment_binding,
+        control_comment_binding: currentScopeControlCommentBinding(
+          loaded.records,
+          schedulerAuthority.scope,
+        ),
         lease_receipt: schedulerAuthority.lease_authority,
       });
       const appendReceipt = await appendRecordInternal(record, {
@@ -5385,7 +5388,10 @@ export function createV2GitHubGitLedger({
           state: "pending",
           description_digest: reservation.reservation_digest,
         },
-        control_comment_binding: loaded.control_comment_binding,
+        control_comment_binding: currentScopeControlCommentBinding(
+          loaded.records,
+          privateReservation.scope,
+        ),
         lease_receipt: privateReservation.lease_authority,
       });
       const appendReceipt = await appendRecordInternal(record, {
@@ -5605,13 +5611,16 @@ export function createV2GitHubGitLedger({
         ordinal: reservation.ordinal,
         action: {
           scheduler_observation_record_oid:
-            reservationAction.scheduler_observation_record_oid,
+            schedulerAuthority.observation_record_oid,
           reservation_record_oid:
             privateReservation.reservation_append_receipt.commit_sha,
           scheduler_action_key: schedulerActionKey,
           attempt,
         },
-        control_comment_binding: loaded.control_comment_binding,
+        control_comment_binding: currentScopeControlCommentBinding(
+          loaded.records,
+          privateReservation.scope,
+        ),
         lease_receipt: privateReservation.lease_authority,
       });
       const attemptAppendReceipt = await appendRecordInternal(attemptRecord, {
@@ -5665,13 +5674,16 @@ export function createV2GitHubGitLedger({
           method: "POST",
           request_body_sha256: rawDigest(reservation.body),
           scheduler_observation_record_oid:
-            reservationAction.scheduler_observation_record_oid,
+            schedulerAuthority.observation_record_oid,
           reservation_record_oid:
             privateReservation.reservation_append_receipt.commit_sha,
           attempt_record_oid: attemptAppendReceipt.commit_sha,
           scheduler_action_key: schedulerActionKey,
         },
-        control_comment_binding: afterAttempt.control_comment_binding,
+        control_comment_binding: currentScopeControlCommentBinding(
+          afterAttempt.records,
+          privateReservation.scope,
+        ),
         lease_receipt: privateReservation.lease_authority,
       });
       const intentAppendReceipt = await appendRecordInternal(intentRecord, {
@@ -5707,6 +5719,9 @@ export function createV2GitHubGitLedger({
         evaluated_scope_receipt: privateReservation.evaluated_scope_receipt,
         lease_authority: privateReservation.lease_authority,
         scope: privateReservation.scope,
+        reservation_origin_scope: recordOrEnvelopeScope(
+          privateReservation.reservation_record,
+        ),
         reservation,
         attempt: authoritativeAttempt,
         attempt_record: attemptRecord,
@@ -5804,6 +5819,14 @@ export function createV2GitHubGitLedger({
             artifact_binding_candidate_handle,
           ),
         );
+      const candidateProfile =
+        automaticRecoveryArtifactBindingCandidateProfile(candidateAuthority);
+      if (candidateProfile.purpose === "terminal-clean-completion") {
+        throw ledgerError(
+          "terminal-clean-artifact-binding-disabled",
+          "terminal clean carriers have no authenticated request lineage and are audit-only",
+        );
+      }
       const evaluatedScopeReceipt = schedulerAuthority.evaluated_scope_receipt;
       if (
         fullScopeReceipts.get(evaluatedScopeReceipt) === undefined ||
@@ -5830,13 +5853,24 @@ export function createV2GitHubGitLedger({
         full_scope_receipt_digest: evaluatedScopeReceipt.receipt_digest,
         provider_identity_policy: capability.provider_identity_policy,
       });
-      validateRequiredStatusBindingsForObservation(
+      validateAutomaticRecoveryArtifactBindingStatusLineage(
         loaded.records,
         schedulerAuthority.observation_record_oid,
+        candidateAuthority,
       );
-      const existingIntents = loaded.records.filter((entry) =>
+      const currentIncarnationRecords = currentScopeIncarnationRecords(
+        loaded.records,
+        schedulerAuthority.scope,
+      );
+      const incarnationAnchorRecordOid =
+        currentScopeIncarnationAnchorRecordOid(
+          loaded.records,
+          schedulerAuthority.scope,
+        );
+      const existingIntents = currentIncarnationRecords.filter((entry) =>
         entry.envelope.record_type === "effect-intent" &&
         entry.envelope.kind === "artifact-binding" &&
+        sameExactScope(entry.envelope, schedulerAuthority.scope) &&
         entry.envelope.payload.generation.generation_id ===
           candidateAuthority.generation_id &&
         entry.envelope.payload.action.request_binding_record_oid ===
@@ -5845,11 +5879,13 @@ export function createV2GitHubGitLedger({
         automaticRecoveryArtifactBindingCandidateAggregateSemantic(
           candidateAuthority,
         );
-      const completedEffectIds = new Set(loaded.records.flatMap((entry) =>
-        entry.envelope.record_type === "effect-response" &&
-          entry.envelope.kind === "artifact-binding"
-          ? [entry.envelope.effect_id]
-          : []));
+      const completedEffectIds = new Set(
+        currentIncarnationRecords.flatMap((entry) =>
+          entry.envelope.record_type === "effect-response" &&
+            entry.envelope.kind === "artifact-binding"
+            ? [entry.envelope.effect_id]
+            : []),
+      );
       let currentCandidateOffset = 0;
       let encounteredIncomplete = false;
       let existingIntent = null;
@@ -5955,8 +5991,10 @@ export function createV2GitHubGitLedger({
           automaticRecoveryArtifactBindingCandidateSetDigest(
             selectedCandidateAuthority,
           );
-        const identity = candidateSetDigest
-          .slice("sha256:".length);
+        const identity = automaticRecoveryArtifactBindingEffectIdentity({
+          candidate_set_digest: candidateSetDigest,
+          incarnation_anchor_record_oid: incarnationAnchorRecordOid,
+        });
         intentRecord = createV2GitLedgerEffectIntentRecord({
           predecessor_commit_sha: loaded.tip_commit_sha,
           scope: schedulerAuthority.scope,
@@ -5977,7 +6015,10 @@ export function createV2GitHubGitLedger({
               schedulerAuthority.observation_record_oid,
             full_scope_receipt_digest: evaluatedScopeReceipt.receipt_digest,
           }),
-          control_comment_binding: loaded.control_comment_binding,
+          control_comment_binding: currentScopeControlCommentBinding(
+            loaded.records,
+            schedulerAuthority.scope,
+          ),
           lease_receipt: schedulerAuthority.lease_authority,
         });
         validateAutomaticRecoveryArtifactBindingEnvelopeSize(
@@ -6059,7 +6100,10 @@ export function createV2GitHubGitLedger({
             full_scope_receipt_digest: evaluatedScopeReceipt.receipt_digest,
             intent_reachability_boundary: reachabilityBoundary,
           }),
-          control_comment_binding: loaded.control_comment_binding,
+          control_comment_binding: currentScopeControlCommentBinding(
+            loaded.records,
+            schedulerAuthority.scope,
+          ),
           lease_receipt: schedulerAuthority.lease_authority,
         });
         validateAutomaticRecoveryArtifactBindingEnvelopeSize(
@@ -6141,7 +6185,10 @@ export function createV2GitHubGitLedger({
           server_observed_at: loaded.post_ref.server_time,
           receipt: readyReceipt,
           lease_receipt: schedulerAuthority.lease_authority,
-          control_comment_binding: loaded.control_comment_binding,
+          control_comment_binding: currentScopeControlCommentBinding(
+            loaded.records,
+            schedulerAuthority.scope,
+          ),
         });
         validateAutomaticRecoveryArtifactBindingEnvelopeSize(
           readyConfirmationRecord,
@@ -6206,8 +6253,10 @@ export function createV2GitHubGitLedger({
           automaticRecoveryArtifactBindingCandidateSetDigest(
             queuedCandidateAuthority,
           );
-        const queuedIdentity = queuedCandidateSetDigest
-          .slice("sha256:".length);
+        const queuedIdentity = automaticRecoveryArtifactBindingEffectIdentity({
+          candidate_set_digest: queuedCandidateSetDigest,
+          incarnation_anchor_record_oid: incarnationAnchorRecordOid,
+        });
         const queuedIntentRecord = createV2GitLedgerEffectIntentRecord({
           predecessor_commit_sha: loaded.tip_commit_sha,
           scope: schedulerAuthority.scope,
@@ -6228,7 +6277,10 @@ export function createV2GitHubGitLedger({
               schedulerAuthority.observation_record_oid,
             full_scope_receipt_digest: evaluatedScopeReceipt.receipt_digest,
           }),
-          control_comment_binding: loaded.control_comment_binding,
+          control_comment_binding: currentScopeControlCommentBinding(
+            loaded.records,
+            schedulerAuthority.scope,
+          ),
           lease_receipt: schedulerAuthority.lease_authority,
         });
         validateAutomaticRecoveryArtifactBindingEnvelopeSize(
@@ -6431,7 +6483,10 @@ export function createV2GitHubGitLedger({
         server_observed_at: loaded.post_ref.server_time,
         receipt,
         lease_receipt: privateIntent.lease_authority,
-        control_comment_binding: loaded.control_comment_binding,
+        control_comment_binding: currentScopeControlCommentBinding(
+          loaded.records,
+          privateIntent.scope,
+        ),
       });
       validateAutomaticRecoveryArtifactBindingEnvelopeSize(
         responseRecord,
@@ -6553,7 +6608,10 @@ export function createV2GitHubGitLedger({
             recovery_transition_digest: transitionDigest,
             recovery_authority: recoveryAuthority,
           },
-          control_comment_binding: loaded.control_comment_binding,
+          control_comment_binding: currentScopeControlCommentBinding(
+            loaded.records,
+            schedulerAuthority.scope,
+          ),
           lease_receipt: schedulerAuthority.lease_authority,
         });
         const intentAdmission = Object.freeze({});
@@ -6623,7 +6681,10 @@ export function createV2GitHubGitLedger({
           server_observed_at: loaded.post_ref.server_time,
           receipt: responseReceipt,
           lease_receipt: schedulerAuthority.lease_authority,
-          control_comment_binding: loaded.control_comment_binding,
+          control_comment_binding: currentScopeControlCommentBinding(
+            loaded.records,
+            schedulerAuthority.scope,
+          ),
         });
       const responseAdmission = Object.freeze({});
       automaticRecoveryAppendAdmissions.set(responseAdmission, {
@@ -6691,7 +6752,19 @@ export function createV2GitHubGitLedger({
       const requestScopeDigest = automaticReviewRequestScopeDigest(
         bindingReceipt.request_scope_receipt.pre_scope,
       );
-      if (requestScopeDigest !== privateIntent.reservation.pre_scope_digest) {
+      const sameHeadRetarget =
+        sameHeadScope(
+          privateIntent.reservation_origin_scope,
+          privateIntent.scope,
+        ) &&
+        !sameExactScope(
+          privateIntent.reservation_origin_scope,
+          privateIntent.scope,
+        );
+      if (
+        requestScopeDigest !== privateIntent.reservation.pre_scope_digest &&
+        !sameHeadRetarget
+      ) {
         throw ledgerError(
           "automatic-review-request-pre-scope-mismatch",
           "automatic review request scope differs from its protected reservation",
@@ -8865,6 +8938,14 @@ export function createV2GitHubGitLedger({
               writeFence.server_time,
             )
           : authoritativeRecordTime(normalized, writeFence.server_time);
+      if (new Set(["lease-acquire", "lease-release"])
+        .has(authoritativeRecord.record_type)) {
+        authoritativeRecord.control_comment_binding =
+          currentScopeControlCommentBinding(
+            loaded.records,
+            recordScope(authoritativeRecord),
+          );
+      }
       validateProductionTransition(
         loaded,
         authoritativeRecord,
@@ -13325,7 +13406,7 @@ function validateInitialRunnerStateAppendAdmission({
     }
     return null;
   }
-  const priorObservations = schedulerObservationRecords(
+  const priorObservations = headSchedulerObservationRecords(
     loaded.records,
     recordScope(record),
   );
@@ -13411,7 +13492,7 @@ function validateEstablishedRunnerStateAppendAdmission({
     }
     return null;
   }
-  const priorObservations = schedulerObservationRecords(
+  const priorObservations = headSchedulerObservationRecords(
     loaded.records,
     recordScope(record),
   );
@@ -18320,7 +18401,10 @@ function validateCandidateDispatchTerminalHistoryRecords({
   const relevantDurableArtifactIntents = controlledRequest === null ||
       automaticRequest === null
     ? []
-    : allRecords.slice(0, releaseIndex).filter((entry) =>
+    : currentScopeIncarnationRecords(
+        allRecords.slice(0, releaseIndex),
+        scheduledScopeReceipt.scope,
+      ).filter((entry) =>
         entry.envelope.record_type === "effect-intent" &&
         entry.envelope.kind === "artifact-binding" &&
         entry.envelope.payload.generation.generation_id ===
@@ -18437,7 +18521,15 @@ function validateCandidateDispatchArtifactBindingTerminalChain({
       "candidate dispatch terminal history is not the closed production chain",
     );
   }
-  const transactionIntents = allRecords.filter((entry) =>
+  const observation = allRecords.find((entry) =>
+    entry.commit_sha === observationOid);
+  const incarnationRecords = observation === undefined
+    ? []
+    : currentScopeIncarnationRecords(
+        allRecords,
+        envelopeScope(observation.envelope),
+      );
+  const transactionIntents = incarnationRecords.filter((entry) =>
     entry.envelope.record_type === "effect-intent" &&
     entry.envelope.kind === "artifact-binding" &&
     entry.envelope.payload.generation.generation_id ===
@@ -18446,7 +18538,7 @@ function validateCandidateDispatchArtifactBindingTerminalChain({
       transactionRequestBindingRecordOid);
   const transactionIntentOids = new Set(transactionIntents.map((entry) =>
     entry.commit_sha));
-  const responses = allRecords.filter((entry) =>
+  const responses = incarnationRecords.filter((entry) =>
     entry.envelope.record_type === "effect-response" &&
     entry.envelope.kind === "artifact-binding" &&
     transactionIntentOids.has(entry.envelope.payload.intent_commit_sha));
@@ -18592,8 +18684,6 @@ function validateCandidateDispatchArtifactBindingTerminalChain({
       );
     }
   }
-  const observation = allRecords.find((entry) =>
-    entry.commit_sha === observationOid);
   const currentOids = currentArtifactRecords.map((entry) => entry.commit_sha);
   const expectedCurrentOids = expectedRecords
     .slice(expectedRecords.length - currentOids.length)
@@ -22031,20 +22121,12 @@ export function projectV2GitLedgerRecords(records) {
     sticky_comments: [],
   };
   const scopes = new Map();
-  let controlCommentBinding = null;
   for (const entry of records) {
     assertObject(entry, "projected Git ledger entry");
     const commitSha = sha(entry.commit_sha, "projected Git ledger commit_sha");
     const envelope = entry.envelope;
     validateProjectionEnvelope(envelope);
     if (!RECORD_TYPES.has(envelope.record_type)) continue;
-    if (
-      envelope.record_type === "effect-response" &&
-      new Set(["control-comment-create", "control-comment-update"])
-        .has(envelope.kind)
-    ) {
-      controlCommentBinding = structuredClone(envelope.control_comment_binding);
-    }
     const item = {
       record_oid: commitSha,
       parent_oid: entry.parents[0] ?? null,
@@ -22159,6 +22241,16 @@ export function projectV2GitLedgerRecords(records) {
   const scopeCounters = [...scopes.values()].sort((left, right) =>
     left.pull_request.number - right.pull_request.number ||
     left.head_ref_oid.localeCompare(right.head_ref_oid));
+  const latestScopedRecord = records.findLast((entry) =>
+    RECORD_TYPES.has(entry.envelope.record_type) &&
+    entry.envelope.pull_request !== null &&
+    entry.envelope.head_ref_oid !== null);
+  const controlCommentBinding = latestScopedRecord === undefined
+    ? null
+    : currentScopeControlCommentBinding(
+      records,
+      envelopeScope(latestScopedRecord.envelope),
+    );
   const withoutDigest = {
     schema: V2_GIT_LEDGER_AUTHORITY_PROJECTION_SCHEMA,
     schema_version: 1,
@@ -22184,16 +22276,27 @@ export function deriveV2GitLedgerAuthority(
   const scope = expectedScope === null
     ? null
     : normalizeEffectScope(expectedScope);
-  const matches = (item) => scope === null || (
+  const currentIncarnationOids = scope === null
+    ? null
+    : new Set(currentScopeIncarnationRecords(records, scope).map((entry) =>
+      entry.commit_sha));
+  const headHistorySelectors = new Set([
+    "automatic_reservations",
+    "automatic_requests",
+    "request_bindings",
+    "artifact_bindings",
+    "scheduler_states",
+  ]);
+  const matches = (selector, item) => scope === null || (
     canonicalJson(item.pull_request) === canonicalJson(scope.pull_request) &&
     item.head_ref_oid === scope.head_ref_oid &&
-    item.base_ref_oid === scope.base_ref_oid &&
-    item.potential_merge_commit_oid === scope.potential_merge_commit_oid
+    (headHistorySelectors.has(selector) ||
+      currentIncarnationOids.has(item.record_oid))
   );
   const authorityFactsByOid = new Map();
-  for (const selector of Object.values(projection.selectors)) {
-    for (const item of selector) {
-      if (matches(item)) {
+  for (const [selector, items] of Object.entries(projection.selectors)) {
+    for (const item of items) {
+      if (matches(selector, item)) {
         authorityFactsByOid.set(item.record_oid, structuredClone(item));
       }
     }
@@ -22246,10 +22349,11 @@ export function deriveV2GitLedgerAuthority(
     source_inventory_digest: sourceInventoryDigest,
     authority_facts: authorityFacts,
     scope_counters: structuredClone(scopeCounters),
-    control_comment_binding:
-      projection.control_comment_binding === null
+    control_comment_binding: scope === null
+      ? projection.control_comment_binding === null
         ? null
-        : structuredClone(projection.control_comment_binding),
+        : structuredClone(projection.control_comment_binding)
+      : currentScopeControlCommentBinding(records, scope),
     candidate_inventory: candidateInventory,
     candidate_dispatch: candidateDispatch,
     runner_state: runnerState,
@@ -22285,14 +22389,16 @@ export function deriveV2GitLedgerRunnerState(
     throw new TypeError("runner state requires one reachable ledger history");
   }
   const observations = schedulerObservationRecords(records, scope);
+  const headObservations = headSchedulerObservationRecords(records, scope);
   const latestObservation = observations.at(-1) ?? null;
-  const scheduling = latestObservation === null
+  const scheduling = headObservations.length === 0
     ? null
     : deriveRunnerScheduling(
       records,
       scope,
       repository,
-      latestObservation.envelope.payload.action.prior_scheduling,
+      (latestObservation ?? headObservations.at(-1)).envelope.payload.action
+        .prior_scheduling,
     );
   const headLedger = deriveRunnerHeadLedger(
     records,
@@ -22334,6 +22440,7 @@ export function deriveV2GitLedgerRunnerState(
     const binding = records.find((candidate) =>
       candidate.envelope.record_type === "effect-response" &&
       candidate.envelope.kind === "request-binding" &&
+      sameHeadScope(candidate.envelope, scope) &&
       candidate.envelope.payload.action.attempt_record_oid === entry.commit_sha);
     return {
       record_oid: entry.commit_sha,
@@ -22347,9 +22454,11 @@ export function deriveV2GitLedgerRunnerState(
       binding_record_oid: binding?.commit_sha ?? null,
     };
   });
+  const currentIncarnation = new Set(currentScopeIncarnationRecords(records, scope));
   const statusInventory = requiredStatusIntentRecords(records, scope)
     .map((entry) => {
       const response = records.find((candidate) =>
+        currentIncarnation.has(candidate) &&
         candidate.envelope.record_type === "effect-response" &&
         candidate.envelope.effect_id === entry.envelope.effect_id);
       const action = entry.envelope.payload.action;
@@ -23991,11 +24100,9 @@ export function validateV2GitLedgerAutomaticReviewRequestBindingReceipt(
     { repository, scope },
   );
   if (
-    Date.parse(requestScope.pre_scope.observed_at) < Date.parse(notBefore) ||
+    Date.parse(requestScope.pre_scope.observed_at) > Date.parse(notBefore) ||
     Date.parse(created) < Date.parse(notBefore) ||
     Date.parse(postServerTime) < Date.parse(created) ||
-    Date.parse(postServerTime) <
-      Date.parse(requestScope.pre_scope.observed_at) ||
     Date.parse(refetchServerTime) < Date.parse(postServerTime) ||
     Date.parse(requestScope.post_scope.observed_at) <
       Date.parse(refetchServerTime) ||
@@ -24394,7 +24501,7 @@ const AUTOMATIC_RECOVERY_AUTHORITY_KEYS = Object.freeze([
   "authority_digest",
 ]);
 
-const AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_AUTHORITY_KEYS =
+const LEGACY_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_AUTHORITY_KEYS =
   Object.freeze([
     "schema", "schema_version", "decision", "snapshot_fingerprint",
     "review_epoch_id", "observed_at", "generation_id", "generation_index",
@@ -24404,11 +24511,31 @@ const AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_AUTHORITY_KEYS =
     "authority_digest",
   ]);
 
-const AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_ITEM_AUTHORITY_KEYS =
+const AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_AUTHORITY_KEYS =
+  Object.freeze([
+    "schema", "schema_version", "candidate_version", "purpose", "decision",
+    "snapshot_fingerprint", "review_epoch_id", "observed_at", "generation_id",
+    "generation_index", "request_id", "request_node_id", "request_bound_at",
+    "request_binding_record_oid", "request_binding_receipt_digest",
+    "expected_actor", "expected_app", "scope", "candidates",
+    "authority_digest",
+  ]);
+
+const LEGACY_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_ITEM_AUTHORITY_KEYS =
   Object.freeze([
     "schema", "schema_version", "decision", "snapshot_fingerprint",
     "review_epoch_id", "observed_at", "generation_id", "generation_index",
     "request_id", "request_node_id", "request_bound_at",
+    "request_binding_record_oid", "request_binding_receipt_digest",
+    "expected_actor", "expected_app", "scope", "candidate",
+    "authority_digest",
+  ]);
+
+const AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_ITEM_AUTHORITY_KEYS =
+  Object.freeze([
+    "schema", "schema_version", "candidate_version", "purpose", "decision",
+    "snapshot_fingerprint", "review_epoch_id", "observed_at", "generation_id",
+    "generation_index", "request_id", "request_node_id", "request_bound_at",
     "request_binding_record_oid", "request_binding_receipt_digest",
     "expected_actor", "expected_app", "scope", "candidate",
     "authority_digest",
@@ -24502,20 +24629,80 @@ function validateAutomaticRecoveryArtifactBindingCandidateScope(value) {
   return value;
 }
 
-function validateAutomaticRecoveryArtifactBindingCandidateAuthority(value) {
-  assertObject(value, "automatic recovery artifact binding candidate authority");
+function automaticRecoveryArtifactBindingCandidateProfile(value, {
+  item = false,
+} = {}) {
+  const label = item
+    ? "automatic recovery artifact binding candidate item"
+    : "automatic recovery artifact binding candidate authority";
+  const expectedSchema = item
+    ? "codex-review-gate-git-ledger-automatic-recovery-artifact-binding-candidate-v2"
+    : "codex-review-gate-runner-automatic-recovery-artifact-binding-candidate-authority-v2";
+  if (value.schema !== expectedSchema) {
+    throw new Error(`${label} is unsupported`);
+  }
+  if (value.schema_version === 1) {
+    exactKeys(
+      value,
+      item
+        ? LEGACY_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_ITEM_AUTHORITY_KEYS
+        : LEGACY_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_AUTHORITY_KEYS,
+      label,
+    );
+    if (value.decision !== "findings") {
+      throw new Error(`${label} legacy profile is findings-only`);
+    }
+    return {
+      legacy: true,
+      candidate_version: 1,
+      purpose: "finding-recovery",
+      decision: "findings",
+      minimum_generation: 1,
+      maximum_generation: 2,
+      exact_candidate_count: null,
+    };
+  }
   exactKeys(
     value,
-    AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_AUTHORITY_KEYS,
-    "automatic recovery artifact binding candidate authority",
+    item
+      ? AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_ITEM_AUTHORITY_KEYS
+      : AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_AUTHORITY_KEYS,
+    label,
   );
-  if (
-    value.schema !==
-      "codex-review-gate-runner-automatic-recovery-artifact-binding-candidate-authority-v2" ||
-    value.schema_version !== 1 || value.decision !== "findings"
-  ) {
-    throw new Error("automatic recovery artifact binding candidate authority is unsupported");
+  if (value.schema_version !== 2 || value.candidate_version !== 1) {
+    throw new Error(`${label} version is unsupported`);
   }
+  if (value.purpose === "finding-recovery" && value.decision === "findings") {
+    return {
+      legacy: false,
+      candidate_version: value.candidate_version,
+      purpose: value.purpose,
+      decision: value.decision,
+      minimum_generation: 1,
+      maximum_generation: 2,
+      exact_candidate_count: null,
+    };
+  }
+  if (
+    value.purpose === "terminal-clean-completion" &&
+    value.decision === "pending"
+  ) {
+    return {
+      legacy: false,
+      candidate_version: value.candidate_version,
+      purpose: value.purpose,
+      decision: value.decision,
+      minimum_generation: 1,
+      maximum_generation: 3,
+      exact_candidate_count: 1,
+    };
+  }
+  throw new Error(`${label} purpose and decision are inconsistent`);
+}
+
+function validateAutomaticRecoveryArtifactBindingCandidateAuthority(value) {
+  assertObject(value, "automatic recovery artifact binding candidate authority");
+  const profile = automaticRecoveryArtifactBindingCandidateProfile(value);
   digest(value.snapshot_fingerprint,
     "automatic recovery artifact binding candidate snapshot_fingerprint");
   if (!RUNNER_EPOCH_ID.test(value.review_epoch_id)) {
@@ -24523,7 +24710,10 @@ function validateAutomaticRecoveryArtifactBindingCandidateAuthority(value) {
   }
   const observedAt = timestamp(value.observed_at,
     "automatic recovery artifact binding candidate observed_at");
-  const generationIndex = integerBetween(value.generation_index, 1, 2,
+  const generationIndex = integerBetween(
+    value.generation_index,
+    profile.minimum_generation,
+    profile.maximum_generation,
     "automatic recovery artifact binding candidate generation_index");
   if (value.generation_id !== `automatic:${generationIndex}`) {
     throw new Error("automatic recovery artifact binding candidate generation is invalid");
@@ -24548,7 +24738,9 @@ function validateAutomaticRecoveryArtifactBindingCandidateAuthority(value) {
   if (!Array.isArray(value.candidates) ||
       value.candidates.length < 1 ||
       value.candidates.length >
-        MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATES) {
+        MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATES ||
+      profile.exact_candidate_count !== null &&
+        value.candidates.length !== profile.exact_candidate_count) {
     throw ledgerError(
       "automatic-artifact-binding-candidate-count",
       "automatic recovery artifact binding candidate inventory is unbounded",
@@ -24604,10 +24796,17 @@ function automaticRecoveryArtifactBindingCandidateItemAuthority(
   if (candidate === undefined) {
     throw new Error("automatic recovery artifact candidate is outside its authority");
   }
+  const profile = automaticRecoveryArtifactBindingCandidateProfile(aggregate);
   const withoutDigest = {
     schema:
       "codex-review-gate-git-ledger-automatic-recovery-artifact-binding-candidate-v2",
-    schema_version: 1,
+    schema_version: aggregate.schema_version,
+    ...(profile.legacy
+      ? {}
+      : {
+          candidate_version: profile.candidate_version,
+          purpose: profile.purpose,
+        }),
     decision: aggregate.decision,
     snapshot_fingerprint: aggregate.snapshot_fingerprint,
     review_epoch_id: aggregate.review_epoch_id,
@@ -24637,18 +24836,9 @@ function automaticRecoveryArtifactBindingCandidateItemAuthority(
 function validateAutomaticRecoveryArtifactBindingCandidateItemAuthority(value) {
   assertObject(value,
     "automatic recovery artifact binding candidate item authority");
-  exactKeys(
-    value,
-    AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATE_ITEM_AUTHORITY_KEYS,
-    "automatic recovery artifact binding candidate item authority",
-  );
-  if (
-    value.schema !==
-      "codex-review-gate-git-ledger-automatic-recovery-artifact-binding-candidate-v2" ||
-    value.schema_version !== 1 || value.decision !== "findings"
-  ) {
-    throw new Error("automatic recovery artifact binding candidate item is unsupported");
-  }
+  const profile = automaticRecoveryArtifactBindingCandidateProfile(value, {
+    item: true,
+  });
   digest(value.snapshot_fingerprint,
     "automatic recovery artifact binding candidate item snapshot_fingerprint");
   if (!RUNNER_EPOCH_ID.test(value.review_epoch_id)) {
@@ -24656,7 +24846,10 @@ function validateAutomaticRecoveryArtifactBindingCandidateItemAuthority(value) {
   }
   const observedAt = timestamp(value.observed_at,
     "automatic recovery artifact binding candidate item observed_at");
-  const generationIndex = integerBetween(value.generation_index, 1, 2,
+  const generationIndex = integerBetween(
+    value.generation_index,
+    profile.minimum_generation,
+    profile.maximum_generation,
     "automatic recovery artifact binding candidate item generation_index");
   if (value.generation_id !== `automatic:${generationIndex}`) {
     throw new Error("automatic recovery artifact binding candidate item generation is invalid");
@@ -24681,6 +24874,9 @@ function validateAutomaticRecoveryArtifactBindingCandidateItemAuthority(value) {
   validateAutomaticRecoveryArtifactBindingCandidate(value.candidate, {
     observed_at: observedAt,
     request_bound_at: requestBoundAt,
+    ...(profile.exact_candidate_count === null
+      ? {}
+      : { candidate_count: profile.exact_candidate_count }),
   });
   requireExactArtifactUrl(
     value.candidate.artifact_url,
@@ -24703,8 +24899,14 @@ function validateAutomaticRecoveryArtifactBindingCandidateItemAuthority(value) {
 function automaticRecoveryArtifactBindingCandidateSemantic(value) {
   const authority =
     validateAutomaticRecoveryArtifactBindingCandidateItemAuthority(value);
+  const profile = automaticRecoveryArtifactBindingCandidateProfile(authority, {
+    item: true,
+  });
   const candidate = authority.candidate;
   return {
+    candidate_version: profile.candidate_version,
+    purpose: profile.purpose,
+    decision: profile.decision,
     review_epoch_id: authority.review_epoch_id,
     generation_id: authority.generation_id,
     request_id: authority.request_id,
@@ -24728,10 +24930,16 @@ function automaticRecoveryArtifactBindingCandidateSemantic(value) {
   };
 }
 
-function automaticRecoveryArtifactBindingCandidateAggregateSemantic(value) {
+function automaticRecoveryArtifactBindingCandidateAggregateSemantic(value, {
+  preserve_legacy_digest: preserveLegacyDigest = false,
+} = {}) {
   const authority =
     validateAutomaticRecoveryArtifactBindingCandidateAuthority(value);
-  return {
+  const profile = automaticRecoveryArtifactBindingCandidateProfile(authority);
+  const semantic = {
+    candidate_version: profile.candidate_version,
+    purpose: profile.purpose,
+    decision: profile.decision,
     review_epoch_id: authority.review_epoch_id,
     generation_id: authority.generation_id,
     request_id: authority.request_id,
@@ -24752,6 +24960,12 @@ function automaticRecoveryArtifactBindingCandidateAggregateSemantic(value) {
       evidence_raw_body_sha256: candidate.evidence_raw_body_sha256,
     })),
   };
+  if (profile.legacy && preserveLegacyDigest) {
+    delete semantic.candidate_version;
+    delete semantic.purpose;
+    delete semantic.decision;
+  }
+  return semantic;
 }
 
 function automaticRecoveryArtifactBindingCandidateSemanticContext(value) {
@@ -24841,9 +25055,13 @@ function automaticRecoveryArtifactBindingCandidateSuffixAuthority(
 }
 
 function automaticRecoveryArtifactBindingCandidateSetDigest(value) {
+  const authority =
+    validateAutomaticRecoveryArtifactBindingCandidateAuthority(value);
   return digestCanonical(
     "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate-set",
-    automaticRecoveryArtifactBindingCandidateAggregateSemantic(value),
+    automaticRecoveryArtifactBindingCandidateAggregateSemantic(authority, {
+      preserve_legacy_digest: authority.schema_version === 1,
+    }),
   );
 }
 
@@ -28139,11 +28357,11 @@ function projectChainState(records, observedAt, {
   const effectByIdempotency = new Map();
   const responseByEffect = new Set();
   const leaseIds = new Set();
+  const controlCommentStates = new Map();
   let activeLease = null;
   let latestCapability = latestCapabilitySeed === null
     ? null
     : structuredClone(latestCapabilitySeed);
-  let currentControlComment = null;
   const candidateInventoryState = {
     source_records: [],
     seen_cycle_ids: new Set(),
@@ -28207,6 +28425,23 @@ function projectChainState(records, observedAt, {
   };
   for (const [recordIndex, record] of records.entries()) {
     const envelope = record.envelope;
+    const effectScope = envelopeScope(envelope);
+    let controlCommentState = null;
+    if (effectScope !== null) {
+      const headKey = canonicalJson({
+        pull_request: effectScope.pull_request,
+        head_ref_oid: effectScope.head_ref_oid,
+      });
+      const exactKey = canonicalJson({
+        base_ref_oid: effectScope.base_ref_oid,
+        potential_merge_commit_oid: effectScope.potential_merge_commit_oid,
+      });
+      controlCommentState = controlCommentStates.get(headKey) ?? null;
+      if (controlCommentState?.exact_key !== exactKey) {
+        controlCommentState = { exact_key: exactKey, binding: null };
+        controlCommentStates.set(headKey, controlCommentState);
+      }
+    }
     if (
       (candidateInventoryState.incomplete !== null ||
         candidateInventoryState.atomic !== null) &&
@@ -28497,6 +28732,7 @@ function projectChainState(records, observedAt, {
       }
       validateEnvelopeLease(envelope, activeLease);
       requireSameScope(envelopeScope(envelope), activeLease.scope, "effect record");
+      const currentControlComment = controlCommentState.binding;
       if (envelope.kind === "control-comment-create") {
         if (
           currentControlComment !== null ||
@@ -28562,7 +28798,9 @@ function projectChainState(records, observedAt, {
         responseByEffect.add(envelope.effect_id);
         if (new Set(["control-comment-create", "control-comment-update"])
           .has(envelope.kind)) {
-          currentControlComment = structuredClone(envelope.control_comment_binding);
+          controlCommentState.binding = structuredClone(
+            envelope.control_comment_binding,
+          );
         }
       }
     }
@@ -28992,6 +29230,10 @@ function validateProductionTransition(
     active_lease: loaded.active_lease,
     reachable_record_count: loaded.commit_count,
   });
+  const currentControlComment = currentScopeControlCommentBinding(
+    loaded.records,
+    recordScope(record),
+  );
   if (record.record_type === "lease-acquire") {
     if (loaded.active_lease !== null) {
       throw ledgerError("lease-active", "another unexpired controller lease is active");
@@ -29004,7 +29246,7 @@ function validateProductionTransition(
     if (
       record.control_comment_binding !== null &&
       canonicalJson(record.control_comment_binding) !==
-        canonicalJson(loaded.control_comment_binding)
+        canonicalJson(currentControlComment)
     ) {
       throw ledgerError(
         "control-comment-binding",
@@ -29028,7 +29270,7 @@ function validateProductionTransition(
     throw ledgerError("lease-expired", "effect record is at or after lease expiry");
   }
   if (record.kind === "control-comment-create") {
-    if (loaded.control_comment_binding !== null) {
+    if (currentControlComment !== null) {
       throw ledgerError(
         "control-comment-exists",
         "control-comment-create cannot replace an authorized controller comment",
@@ -29036,10 +29278,10 @@ function validateProductionTransition(
     }
   } else if (record.kind === "control-comment-update") {
     if (
-      loaded.control_comment_binding === null ||
+      currentControlComment === null ||
       (record.record_type === "effect-intent" &&
         canonicalJson(record.control_comment_binding) !==
-          canonicalJson(loaded.control_comment_binding))
+          canonicalJson(currentControlComment))
     ) {
       throw ledgerError(
         "control-comment-binding",
@@ -29049,7 +29291,7 @@ function validateProductionTransition(
   } else if (
     record.control_comment_binding !== null &&
     canonicalJson(record.control_comment_binding) !==
-      canonicalJson(loaded.control_comment_binding)
+      canonicalJson(currentControlComment)
   ) {
     throw ledgerError(
       "control-comment-binding",
@@ -29258,7 +29500,8 @@ function validateArtifactBindingReadyLineage(
     canonicalJson(envelopeScope(acquire)) !== canonicalJson(readyScope) ||
     canonicalJson(envelopeScope(scheduler)) !== canonicalJson(readyScope) ||
     schedulerObservation === null ||
-    schedulerObservation.scheduler_evaluation.decision !== "findings" ||
+    schedulerObservation.scheduler_evaluation.decision !==
+      candidateAuthority?.decision ||
     schedulerObservation.scheduler_evaluation.epoch_id !==
       candidateAuthority.review_epoch_id ||
     schedulerObservation.evaluated_scope_receipt_digest !==
@@ -29344,6 +29587,13 @@ function validateArtifactBindingReadyConfirmationLineage(
       scheduler.kind === "scheduler-observation"
       ? validateV2GitLedgerSchedulerObservation(scheduler.payload.action)
       : null;
+  const intent = priorRecords[intentIndex]?.envelope;
+  const candidateAuthority = intent?.record_type === "effect-intent" &&
+      intent.kind === "artifact-binding"
+    ? validateAutomaticRecoveryArtifactBindingCandidateAuthority(
+        intent.payload.action.candidate_authority,
+      )
+    : null;
   const scope = recordScope(value);
   const currentEntries = schedulerIndex < 0 || boundaryIndex < schedulerIndex
     ? []
@@ -29373,7 +29623,8 @@ function validateArtifactBindingReadyConfirmationLineage(
     scheduler?.lease?.acquire_commit_sha !==
       boundary.continuation_lease_acquire_commit_sha ||
     schedulerAction === null ||
-    schedulerAction.scheduler_evaluation.decision !== "findings" ||
+    schedulerAction.scheduler_evaluation.decision !==
+      candidateAuthority?.decision ||
     schedulerAction.evaluated_scope_receipt_digest !==
       boundary.continuation_full_scope_receipt_digest ||
     evaluated !== null && evaluated.receipt_digest !==
@@ -29410,6 +29661,15 @@ function validateArtifactBindingLineage(priorRecords, value, repositoryValue) {
     validateAutomaticRecoveryArtifactBindingCandidateAuthority(
       action.candidate_authority,
     );
+  const candidateProfile = automaticRecoveryArtifactBindingCandidateProfile(
+    candidateAuthority,
+  );
+  if (candidateProfile.purpose !== "finding-recovery") {
+    throw ledgerError(
+      "terminal-clean-artifact-binding-disabled",
+      "terminal clean carriers are parser-compatible audit bytes without durable binding authority",
+    );
+  }
   if (value.record_type === "effect-intent") {
     validateAutomaticRecoveryArtifactBindingQueueLineage(
       priorRecords,
@@ -29434,13 +29694,30 @@ function validateArtifactBindingLineage(priorRecords, value, repositoryValue) {
     binding,
     repository,
   );
-  requireSameScope(
-    value.record_type?.startsWith("effect-")
-      ? recordScope(value)
-      : envelopeScope(value),
-    envelopeScope(binding),
-    "artifact binding request lineage",
-  );
+  const currentScope = value.record_type?.startsWith("effect-")
+    ? recordScope(value)
+    : envelopeScope(value);
+  const requestScope = envelopeScope(binding);
+  const exactRequestScope = canonicalJson(currentScope) ===
+    canonicalJson(requestScope);
+  const sameHeadRequestRetarget =
+    candidateProfile.purpose === "finding-recovery" &&
+    canonicalJson(currentScope.pull_request) ===
+      canonicalJson(requestScope.pull_request) &&
+    currentScope.head_ref_oid === requestScope.head_ref_oid &&
+    candidateAuthority.scope.repository.owner === repository.owner &&
+    candidateAuthority.scope.repository.name === repository.name &&
+    candidateAuthority.scope.repository.node_id === repository.node_id &&
+    canonicalJson(candidateAuthority.scope.pull_request) ===
+      canonicalJson(currentScope.pull_request) &&
+    candidateAuthority.scope.base_oid === currentScope.base_ref_oid &&
+    candidateAuthority.scope.head_oid === currentScope.head_ref_oid;
+  if (!exactRequestScope && !sameHeadRequestRetarget) {
+    throw ledgerError(
+      "artifact-request-lineage-mismatch",
+      "artifact binding request lineage is outside its exact PR and head authority",
+    );
+  }
   const bindingPayload = binding.payload;
   const observationEntry = priorRecords.find((entry) =>
     entry.commit_sha === action.scheduler_observation_record_oid);
@@ -29452,8 +29729,10 @@ function validateArtifactBindingLineage(priorRecords, value, repositoryValue) {
   const controlled = observation?.prior_scheduling.epoch.controlled_request ?? null;
   const automatic = observation?.prior_scheduling.epoch.automatic_request ?? null;
   if (
-    canonicalJson(bindingPayload.generation) !==
-      canonicalJson(value.payload.generation) ||
+    bindingPayload.generation.generation_id !==
+      value.payload.generation.generation_id ||
+    bindingPayload.generation.kind !== value.payload.generation.kind ||
+    bindingPayload.generation.index !== value.payload.generation.index ||
     bindingPayload.action.generation_id !== action.generation_id ||
     bindingPayload.action.request_id !== action.request_id ||
     bindingPayload.receipt.request_id !== action.request_id ||
@@ -29466,7 +29745,7 @@ function validateArtifactBindingLineage(priorRecords, value, repositoryValue) {
     observationEntry?.envelope.record_type !== "effect-intent" ||
     observationEntry.envelope.kind !== "scheduler-observation" ||
     priorRecords.indexOf(observationEntry) < priorRecords.indexOf(bindingEntry) ||
-    observation.scheduler_evaluation.decision !== "findings" ||
+    observation.scheduler_evaluation.decision !== candidateAuthority.decision ||
     observation.scheduler_evaluation.snapshot_fingerprint !==
       candidateAuthority.snapshot_fingerprint ||
     observation.scheduler_evaluation.epoch_id !==
@@ -29532,11 +29811,16 @@ function validateAutomaticRecoveryArtifactBindingQueueLineage(
   candidateAuthority,
 ) {
   const action = value.payload.action;
+  const incarnationRecords = currentScopeIncarnationRecords(
+    priorRecords,
+    recordOrEnvelopeScope(value),
+  );
   const queueParentOid =
     action.queued_after_artifact_binding_intent_record_oid;
-  const priorIntents = priorRecords.filter((entry) =>
+  const priorIntents = incarnationRecords.filter((entry) =>
     entry.envelope.record_type === "effect-intent" &&
     entry.envelope.kind === "artifact-binding" &&
+    sameExactScope(entry.envelope, recordOrEnvelopeScope(value)) &&
     entry.envelope.payload.generation.generation_id ===
       candidateAuthority.generation_id &&
     entry.envelope.payload.action.request_binding_record_oid ===
@@ -29553,16 +29837,18 @@ function validateAutomaticRecoveryArtifactBindingQueueLineage(
   const parentEntry = priorIntents.find((entry) =>
     entry.commit_sha === queueParentOid);
   const parent = parentEntry?.envelope;
-  const readyEntries = priorRecords.filter((entry) =>
+  const readyEntries = incarnationRecords.filter((entry) =>
     entry.envelope.record_type === "effect-intent" &&
     entry.envelope.kind === "artifact-binding-ready" &&
     entry.envelope.payload.action.artifact_binding_intent_record_oid ===
       queueParentOid);
   const ready = readyEntries[0];
-  const confirmations = ready === undefined ? [] : priorRecords.filter((entry) =>
-    entry.envelope.record_type === "effect-response" &&
-    entry.envelope.kind === "artifact-binding-ready" &&
-    entry.envelope.payload.intent_commit_sha === ready.commit_sha);
+  const confirmations = ready === undefined
+    ? []
+    : incarnationRecords.filter((entry) =>
+        entry.envelope.record_type === "effect-response" &&
+        entry.envelope.kind === "artifact-binding-ready" &&
+        entry.envelope.payload.intent_commit_sha === ready.commit_sha);
   const parentAuthority = parent?.record_type === "effect-intent" &&
       parent.kind === "artifact-binding"
     ? validateAutomaticRecoveryArtifactBindingCandidateAuthority(
@@ -29697,7 +29983,8 @@ function validateAutomaticRecoveryArtifactReachabilityLineage({
     currentAcquireIndex < 0 ||
     currentAcquireIndex >= continuationSchedulerIndex ||
     continuationObservation === null ||
-    continuationObservation.scheduler_evaluation.decision !== "findings" ||
+    continuationObservation.scheduler_evaluation.decision !==
+      candidateAuthority.decision ||
     continuationObservation.scheduler_evaluation.epoch_id !==
       candidateAuthority.review_epoch_id ||
     continuationObservation.evaluated_scope_receipt_digest !==
@@ -29740,10 +30027,11 @@ function validateReviewRequestLineage(priorRecords, value) {
     const envelope = entry.envelope;
     return envelope.record_type === "effect-intent" &&
       envelope.kind === "automatic-request-reservation" &&
-      canonicalJson(envelopeScope(envelope)) ===
-        canonicalJson(recordOrEnvelopeScope(value)) &&
-      canonicalJson(envelope.payload.generation) ===
-        canonicalJson(value.payload.generation);
+      sameHeadScope(envelope, recordOrEnvelopeScope(value)) &&
+      sameAutomaticGenerationIdentity(
+        envelope.payload.generation,
+        value.payload.generation,
+      );
   });
   if (reservations.length !== 1) {
     throw ledgerError(
@@ -29762,10 +30050,10 @@ function validateReviewRequestLineage(priorRecords, value) {
   if (
     attempts.length !== 1 ||
     reservation.commit_sha !== action.reservation_record_oid ||
-    reservation.envelope.payload.action.scheduler_observation_record_oid !==
-      action.scheduler_observation_record_oid ||
     attempts[0].envelope.payload.action.reservation_record_oid !==
       reservation.commit_sha ||
+    attempts[0].envelope.payload.action.scheduler_observation_record_oid !==
+      action.scheduler_observation_record_oid ||
     attempts[0].envelope.payload.action.scheduler_action_key !==
       action.scheduler_action_key ||
     reservation.envelope.payload.action.post_scheduler_action_key !==
@@ -29779,15 +30067,31 @@ function validateReviewRequestLineage(priorRecords, value) {
   if (value.record_type === "effect-response") {
     const intent = priorRecords.find((entry) =>
       entry.commit_sha === value.payload.intent_commit_sha);
+    const receipt = value.payload.receipt;
+    const preScopeObservedAt =
+      receipt.request_scope_receipt.pre_scope.observed_at;
+    const postScopeObservedAt =
+      receipt.request_scope_receipt.post_scope.observed_at;
+    const exactLegacyCollapsedBoundary = new Set([
+      preScopeObservedAt,
+      receipt.created_at,
+      receipt.post_server_time,
+      receipt.refetch_server_time,
+      postScopeObservedAt,
+    ]).size === 1;
+    const currentTimeLineage = intent !== undefined &&
+      Date.parse(preScopeObservedAt) <=
+        Date.parse(intent.envelope.server_observed_at) &&
+      Date.parse(intent.envelope.server_observed_at) <=
+        Date.parse(receipt.created_at);
     if (
       intent?.envelope.record_type !== "effect-intent" ||
       intent.envelope.kind !== "review-request" ||
-      Date.parse(value.payload.receipt.request_scope_receipt.pre_scope.observed_at) <
-        Date.parse(intent.envelope.server_observed_at)
+      !currentTimeLineage && !exactLegacyCollapsedBoundary
     ) {
       throw ledgerError(
-        "review-request-scope-precedes-intent",
-        "review request scope evidence precedes its durable retry-zero intent",
+        "review-request-time-lineage",
+        "review request scope, intent, and created times are not causal",
       );
     }
   }
@@ -29889,6 +30193,57 @@ function validateRequiredStatusBindingsForObservation(
     throw ledgerError(
       "automatic-request-required-status-unbound",
       "automatic request requires every exact semantic status response binding",
+    );
+  }
+}
+
+function validateAutomaticRecoveryArtifactBindingStatusLineage(
+  priorRecords,
+  observationRecordOid,
+  candidateAuthorityValue,
+) {
+  const candidateAuthority =
+    validateAutomaticRecoveryArtifactBindingCandidateAuthority(
+      candidateAuthorityValue,
+    );
+  const profile = automaticRecoveryArtifactBindingCandidateProfile(
+    candidateAuthority,
+  );
+  if (profile.purpose === "finding-recovery") {
+    validateRequiredStatusBindingsForObservation(
+      priorRecords,
+      observationRecordOid,
+    );
+    return;
+  }
+  const observation = priorRecords.find((entry) =>
+    entry.commit_sha === observationRecordOid);
+  if (
+    observation?.envelope.record_type !== "effect-intent" ||
+    observation.envelope.kind !== "scheduler-observation"
+  ) {
+    throw ledgerError(
+      "scheduler-observation-required",
+      "terminal clean artifact binding requires one protected scheduler observation",
+    );
+  }
+  const statusPlan = observation.envelope.payload.action.status_plan;
+  const suppressedWrites = statusPlan.suppressed_writes ?? [];
+  if (
+    statusPlan.decision !== "pending" ||
+    statusPlan.terminal_cutover !== false ||
+    [...statusPlan.writes, ...suppressedWrites].some((write) =>
+      write.role !== "head-sentinel" || write.state !== "pending")
+  ) {
+    throw ledgerError(
+      "automatic-artifact-binding-terminal-status-forbidden",
+      "terminal clean artifact binding must preserve one non-terminal pending result",
+    );
+  }
+  if (statusPlan.writes.length > 0) {
+    validateRequiredStatusBindingsForObservation(
+      priorRecords,
+      observationRecordOid,
     );
   }
 }
@@ -30351,7 +30706,7 @@ function validateAutomaticRecoveryArtifactBindingCandidateAgainstObservation({
   const repositoryScope = authority.scope.repository;
   const pullRequestScope = authority.scope.pull_request;
   if (
-    observation.scheduler_evaluation.decision !== "findings" ||
+    observation.scheduler_evaluation.decision !== authority.decision ||
     observation.scheduler_evaluation.snapshot_fingerprint !==
       authority.snapshot_fingerprint ||
     observation.scheduler_evaluation.epoch_id !== authority.review_epoch_id ||
@@ -30723,8 +31078,15 @@ function validateCurrentAutomaticRecoveryArtifactBindingIntent({
   const readyConfirmation = loaded.records.find((entry) =>
     entry.commit_sha ===
       privateIntent.ready_confirmation_append_receipt.commit_sha);
+  const currentIncarnation = new Set(currentScopeIncarnationRecords(
+    loaded.records,
+    privateIntent.scope,
+  ));
   const activeLease = loaded.active_lease;
   if (
+    !currentIncarnation.has(intent) ||
+    !currentIncarnation.has(ready) ||
+    !currentIncarnation.has(readyConfirmation) ||
     intent?.envelope.record_type !== "effect-intent" ||
     intent.envelope.kind !== "artifact-binding" ||
     canonicalJson(intent.envelope.payload.action) !==
@@ -30798,9 +31160,14 @@ function validateAutomaticRecoveryFindingBindings(
 function validateAutomaticRecoveryArtifactBindingQueueComplete(
   priorRecords,
   authorityValue,
+  scope,
 ) {
   const authority = validateAutomaticRequestRecoveryAuthority(authorityValue);
-  const incomplete = priorRecords.some((entry) => {
+  const incarnationRecords = currentScopeIncarnationRecords(
+    priorRecords,
+    scope,
+  );
+  const incomplete = incarnationRecords.some((entry) => {
     const envelope = entry.envelope;
     return envelope.record_type === "effect-intent" &&
       envelope.kind === "artifact-binding" &&
@@ -30808,7 +31175,7 @@ function validateAutomaticRecoveryArtifactBindingQueueComplete(
         authority.prior_generation_id &&
       envelope.payload.action.request_binding_record_oid ===
         authority.prior_request_binding_record_oid &&
-      !priorRecords.some((candidate) =>
+      !incarnationRecords.some((candidate) =>
         candidate.envelope.record_type === "effect-response" &&
         candidate.envelope.kind === "artifact-binding" &&
         candidate.envelope.effect_id === envelope.effect_id);
@@ -30841,6 +31208,7 @@ function validateSchedulerStateLineage(priorRecords, value, repositoryValue) {
   validateAutomaticRecoveryArtifactBindingQueueComplete(
     priorRecords,
     intentAuthority,
+    scope,
   );
   validateAutomaticRecoveryFindingBindings(
     priorRecords.slice(0, priorRecords.indexOf(observation)),
@@ -31005,6 +31373,7 @@ function validateSchedulerObservationLineage(priorRecords, value) {
     );
   }
   const observations = schedulerObservationRecords(priorRecords, scope);
+  const headObservations = headSchedulerObservationRecords(priorRecords, scope);
   if (action.prior_scheduling.wait_completions.length !== 0) {
     throw ledgerError(
       "public-wait-completion-producer-unavailable",
@@ -31019,7 +31388,7 @@ function validateSchedulerObservationLineage(priorRecords, value) {
       "scheduler observation repeats one protected snapshot identity",
     );
   }
-  if (observations.length === 0) {
+  if (headObservations.length === 0) {
     if (action.initial_runner_state_authority === null) {
       throw ledgerError(
         "initial-runner-authority-required",
@@ -31114,13 +31483,11 @@ function validateInitialRunnerStateHistoricalAuthority({
   if (
     runnerPriorAuthorityDigest(priorRecords, scope) !==
       authority.prior_authority_digest ||
-    priorRecords.some((entry) =>
-      new Set(["effect-intent", "effect-response"])
-        .has(entry.envelope.record_type) && sameHeadScope(entry.envelope, scope))
+    hasPriorRunnerEffects(priorRecords, scope)
   ) {
     throw ledgerError(
       "initial-runner-prior-history-mismatch",
-      "initial runner authority does not bind an effect-free predecessor",
+      "initial runner authority does not bind a predecessor without prior runner effects",
     );
   }
   if (
@@ -31281,21 +31648,103 @@ function runnerPriorAuthorityDigest(records, scope) {
 }
 
 function schedulerObservationRecords(records, scope) {
+  return currentScopeIncarnationRecords(records, scope).filter((entry) =>
+    entry.envelope.record_type === "effect-intent" &&
+    entry.envelope.kind === "scheduler-observation");
+}
+
+function headSchedulerObservationRecords(records, scope) {
   return records.filter((entry) =>
     entry.envelope.record_type === "effect-intent" &&
     entry.envelope.kind === "scheduler-observation" &&
     sameHeadScope(entry.envelope, scope));
 }
 
+function hasPriorRunnerEffects(records, scope) {
+  return records.some((entry) =>
+    new Set(["effect-intent", "effect-response"])
+      .has(entry.envelope.record_type) &&
+    sameHeadScope(entry.envelope, scope) &&
+    !new Set(["control-comment-create", "control-comment-update"])
+      .has(entry.envelope.kind));
+}
+
+function currentScopeIncarnationRecords(records, scope) {
+  let lastForeignScopeIndex = -1;
+  for (const [index, entry] of records.entries()) {
+    if (
+      sameHeadScope(entry.envelope, scope) &&
+      !sameExactScope(entry.envelope, scope)
+    ) {
+      lastForeignScopeIndex = index;
+    }
+  }
+  return records.slice(lastForeignScopeIndex + 1).filter((entry) =>
+    sameExactScope(entry.envelope, scope));
+}
+
+function currentScopeIncarnationAnchorRecordOid(records, scope) {
+  let anchorRecordOid = null;
+  for (const entry of records) {
+    if (
+      sameHeadScope(entry.envelope, scope) &&
+      !sameExactScope(entry.envelope, scope)
+    ) {
+      anchorRecordOid = entry.commit_sha;
+    }
+  }
+  return anchorRecordOid;
+}
+
+function automaticRecoveryArtifactBindingEffectIdentity({
+  candidate_set_digest: candidateSetDigestValue,
+  incarnation_anchor_record_oid: incarnationAnchorRecordOidValue,
+}) {
+  const candidateSetDigest = digest(
+    candidateSetDigestValue,
+    "automatic artifact binding candidate set digest",
+  );
+  if (incarnationAnchorRecordOidValue === null) {
+    return candidateSetDigest.slice("sha256:".length);
+  }
+  const incarnationAnchorRecordOid = sha(
+    incarnationAnchorRecordOidValue,
+    "automatic artifact binding incarnation anchor record OID",
+  );
+  return digestCanonical(
+    "codex-review-gate-v2-automatic-artifact-binding-incarnation-identity",
+    {
+      candidate_set_digest: candidateSetDigest,
+      incarnation_anchor_record_oid: incarnationAnchorRecordOid,
+    },
+  ).slice("sha256:".length);
+}
+
+function currentScopeControlCommentBinding(records, scope) {
+  let binding = null;
+  for (const entry of currentScopeIncarnationRecords(records, scope)) {
+    const envelope = entry.envelope;
+    if (
+      envelope.record_type === "effect-response" &&
+      new Set(["control-comment-create", "control-comment-update"])
+        .has(envelope.kind)
+    ) {
+      binding = structuredClone(envelope.control_comment_binding);
+    }
+  }
+  return binding;
+}
+
 function deriveRunnerScheduling(records, scope, repository, currentInput) {
   const observations = schedulerObservationRecords(records, scope);
-  if (observations.length === 0) {
+  const headObservations = headSchedulerObservationRecords(records, scope);
+  if (headObservations.length === 0) {
     throw ledgerError(
       "scheduler-observation-required",
       "runner scheduling cannot be derived without a protected observation",
     );
   }
-  const first = observations[0].envelope.payload.action.prior_scheduling;
+  const first = headObservations[0].envelope.payload.action.prior_scheduling;
   const completeSnapshots = [];
   const snapshotIds = new Set();
   for (const observation of observations) {
@@ -31344,7 +31793,9 @@ function deriveRunnerScheduling(records, scope, repository, currentInput) {
       head_sentinel_receipt: status.head_sentinel_receipt,
     },
     applied_action_keys: deriveAppliedSchedulerActionKeys(records, scope),
-    no_start_candidate: structuredClone(currentInput.no_start_candidate),
+    no_start_candidate: observations.length === 0
+      ? null
+      : structuredClone(currentInput.no_start_candidate),
     // Pre-activation production has no trusted completion producer. Derivation
     // is therefore closed over reachable observations and cannot echo caller
     // input into durable authority.
@@ -31691,7 +32142,14 @@ function recoverAutomaticRequestAttemptAuthority({
     reservation_record: reservationEntry.envelope,
     reservation_append_receipt: reservationAppendReceipt,
     reservation: structuredClone(reservationAction.reservation),
-    generation: structuredClone(reservationEntry.envelope.payload.generation),
+    // A same-head base/potential retarget preserves the consumed reservation
+    // as origin history, but every new effect must bind the current exact
+    // review incarnation. The stable automatic generation identity links the
+    // continuation back to that origin without copying its stale epoch digest.
+    generation: automaticEffectGeneration(
+      reservationAction.reservation.generation_index,
+      schedulerAuthority.scope,
+    ),
   });
   const privateStatusIntent = deepFreeze({
     automatic_reservation_handle: automaticReservationHandle,
@@ -31747,6 +32205,18 @@ function countAutomaticReservations(records, scope) {
 function sameHeadScope(value, scope) {
   return canonicalJson(value.pull_request) === canonicalJson(scope.pull_request) &&
     value.head_ref_oid === scope.head_ref_oid;
+}
+
+function sameExactScope(value, scope) {
+  return sameHeadScope(value, scope) &&
+    value.base_ref_oid === scope.base_ref_oid &&
+    value.potential_merge_commit_oid === scope.potential_merge_commit_oid;
+}
+
+function sameAutomaticGenerationIdentity(left, right) {
+  return left?.kind === "automatic" && right?.kind === "automatic" &&
+    left.generation_id === right.generation_id &&
+    left.index === right.index;
 }
 
 function deriveRunnerHeadLedger(records, scope, repository, observedAtValue) {
@@ -31809,26 +32279,27 @@ function runnerHeadLedgerDigestFromRecords(
 }
 
 function requiredStatusIntentRecords(records, scope) {
-  return records.filter((entry) => {
+  return currentScopeIncarnationRecords(records, scope).filter((entry) => {
     const envelope = entry.envelope;
     return envelope.record_type === "effect-intent" &&
       envelope.kind === "status-write" &&
       envelope.payload.action.context === "codex/github-review-gate" &&
-      sameHeadScope(envelope, scope);
+      sameExactScope(envelope, scope);
   });
 }
 
 function deriveRunnerSchedulingStatus(records, scope) {
   const intents = requiredStatusIntentRecords(records, scope);
+  const currentRecords = currentScopeIncarnationRecords(records, scope);
   let headSentinelReceipt = null;
-  for (const entry of records) {
+  for (const entry of currentRecords) {
     const envelope = entry.envelope;
     if (
       envelope.record_type !== "effect-response" ||
       envelope.kind !== "status-write" ||
       envelope.payload.action.role !== "head-sentinel" ||
       envelope.payload.action.context !== "codex/github-review-gate" ||
-      !sameHeadScope(envelope, scope)
+      !sameExactScope(envelope, scope)
     ) continue;
     if (envelope.payload.receipt.state === "success") {
       throw ledgerError(
@@ -31882,6 +32353,7 @@ function deriveAppliedSchedulerActionKeys(records, scope) {
       statusIndexes.set(key, state);
     }
   };
+  const currentRecords = new Set(currentScopeIncarnationRecords(records, scope));
   for (const entry of records) {
     const envelope = entry.envelope;
     if (envelope.record_type !== "effect-intent" ||
@@ -31892,7 +32364,10 @@ function deriveAppliedSchedulerActionKeys(records, scope) {
         `reservation:${entry.commit_sha}`);
     } else if (envelope.kind === "effect-attempt") {
       add(action.scheduler_action_key, `attempt:${entry.commit_sha}`);
-    } else if (envelope.kind === "status-write") {
+    } else if (
+      envelope.kind === "status-write" &&
+      currentRecords.has(entry)
+    ) {
       add(
         action.scheduler_action_key,
         `status:${action.scheduler_observation_record_oid}:` +
@@ -31918,15 +32393,34 @@ function validateEffectAttemptLineage(priorRecords, value) {
     entry.commit_sha === action.reservation_record_oid);
   const observation = priorRecords.find((entry) =>
     entry.commit_sha === action.scheduler_observation_record_oid);
+  const reservationAction = reservation?.envelope.payload.action;
+  const reservationValue = reservationAction?.reservation;
+  const observationAction =
+    observation?.envelope.record_type === "effect-intent" &&
+      observation.envelope.kind === "scheduler-observation"
+      ? validateV2GitLedgerSchedulerObservation(
+          observation.envelope.payload.action,
+        )
+      : null;
+  const postAction = observationAction?.scheduler_plan.actions.find((entry) =>
+    entry.kind === "post_review_request" &&
+    entry.idempotency_key === action.scheduler_action_key);
   if (
     reservation?.envelope.record_type !== "effect-intent" ||
     reservation.envelope.kind !== "automatic-request-reservation" ||
-    observation?.envelope.record_type !== "effect-intent" ||
-    observation.envelope.kind !== "scheduler-observation" ||
-    reservation.envelope.payload.action.scheduler_observation_record_oid !==
-      observation.commit_sha ||
-    reservation.envelope.payload.action.post_scheduler_action_key !==
-      action.scheduler_action_key
+    observationAction === null ||
+    !sameHeadScope(reservation.envelope, recordOrEnvelopeScope(value)) ||
+    !sameExactScope(observation.envelope, recordOrEnvelopeScope(value)) ||
+    reservationAction.post_scheduler_action_key !==
+      action.scheduler_action_key ||
+    postAction === undefined ||
+    postAction.depends_on_idempotency_key !==
+      reservationAction.scheduler_action_key ||
+    postAction.intent_id !== reservationValue.scheduler_intent_id ||
+    postAction.generation_id !== reservationValue.generation_id ||
+    postAction.generation_index !== reservationValue.generation_index ||
+    canonicalJson(postAction.recovery_authority) !==
+      canonicalJson(reservationValue.recovery_authority)
   ) {
     throw ledgerError(
       "effect-attempt-reservation-required",
@@ -31936,8 +32430,10 @@ function validateEffectAttemptLineage(priorRecords, value) {
   validateV2GitLedgerRequestAttempt(action.attempt, {
     reservation: reservation.envelope.payload.action.reservation,
   });
-  if (canonicalJson(value.payload.generation) !==
-      canonicalJson(reservation.envelope.payload.generation)) {
+  if (!sameAutomaticGenerationIdentity(
+    value.payload.generation,
+    reservation.envelope.payload.generation,
+  )) {
     throw ledgerError(
       "effect-attempt-generation-mismatch",
       "effect attempt differs from its consumed reservation generation",
@@ -31948,8 +32444,10 @@ function validateEffectAttemptLineage(priorRecords, value) {
     return envelope.record_type === "effect-response" &&
       envelope.kind === "reservation-status-write" &&
       envelope.payload.action.reservation_record_oid === reservation.commit_sha &&
-      canonicalJson(envelope.payload.generation) ===
-        canonicalJson(value.payload.generation);
+      sameAutomaticGenerationIdentity(
+        envelope.payload.generation,
+        value.payload.generation,
+      );
   });
   if (reservationStatusResponses.length !== 1) {
     throw ledgerError(
@@ -32681,8 +33179,10 @@ function validateRequestBindingLineage(priorRecords, value, repositoryValue) {
     attempt.envelope.kind !== "effect-attempt" ||
     requestAction.reservation_record_oid !== reservation.commit_sha ||
     requestAction.attempt_record_oid !== attempt.commit_sha ||
-    canonicalJson(reservation.envelope.payload.generation) !==
-      canonicalJson(value.payload.generation) ||
+    !sameAutomaticGenerationIdentity(
+      reservation.envelope.payload.generation,
+      value.payload.generation,
+    ) ||
     canonicalJson(attempt.envelope.payload.generation) !==
       canonicalJson(value.payload.generation)
   ) {

@@ -8,7 +8,7 @@
 
 export const V2_PUBLIC_REPORT_SCHEMA_VERSION = 2;
 export const V2_PUBLIC_REPORT_POLICY_SHA256 =
-  "29e07793900bb480278cee322746dde679ddcf3b18a8b7b82f552fec389291fc";
+  "d1a56b2e40ab6affc676a40733671d065c03d9d96e155643977c6b30eee03ad6";
 export const V2_PUBLIC_REPORT_POLICY_DIGEST =
   `sha256:${V2_PUBLIC_REPORT_POLICY_SHA256}`;
 export const V2_PUBLIC_REPORT_AUTHORITY_SHA256 = V2_PUBLIC_REPORT_POLICY_SHA256;
@@ -98,11 +98,6 @@ const STATE_MATRIX = Object.freeze([
   },
   {
     decision: "clean", selected: true, modes: ["implicit", "explicit"],
-    profiles: ["terminal-payload", "mixed"], kinds: ["terminal-payload"],
-    statuses: ["compliant", "warning", "unknown"],
-  },
-  {
-    decision: "clean", selected: true, modes: ["implicit", "explicit"],
     profiles: ["thumbs-up-clean"], kinds: ["current-request-reaction"],
     statuses: ["compliant", "warning"],
   },
@@ -114,7 +109,13 @@ const STATE_MATRIX = Object.freeze([
   {
     decision: "inconclusive", selected: true, modes: ["implicit", "explicit"],
     profiles: ["terminal-payload", "thumbs-up-clean", "mixed", "no-start-rejection", "unknown"],
-    kinds: [null, "malformed-terminal", "unknown-terminal", "stable-evidence-blocker"],
+    kinds: [
+      null,
+      "terminal-payload",
+      "malformed-terminal",
+      "unknown-terminal",
+      "stable-evidence-blocker",
+    ],
     statuses: ["compliant", "warning", "unknown"],
   },
   {
@@ -140,7 +141,7 @@ const STATE_MATRIX = Object.freeze([
 ]);
 
 const BASIS_OUTCOMES = deepFreeze({
-  "terminal-payload": ["clean", "findings"],
+  "terminal-payload": ["inconclusive", "findings"],
   "current-request-reaction": ["clean"],
   "stable-exact-no-start": ["skipped-unavailable", "blocked-configuration"],
   "malformed-terminal": ["inconclusive"],
@@ -157,6 +158,11 @@ const BASIS_PROFILES = deepFreeze({
   "stable-evidence-blocker": ["terminal-payload", "thumbs-up-clean", "mixed", "no-start-rejection", "unknown"],
   "stable-input-blocker": ["terminal-payload", "thumbs-up-clean", "mixed", "no-start-rejection", "unknown", null],
 });
+const ARTIFACT_PUBLICATION_BASIS_KINDS = new Set([
+  "terminal-payload",
+  "malformed-terminal",
+  "unknown-terminal",
+]);
 
 export function validateV2PublicReport(value) {
   exactObject(
@@ -357,10 +363,36 @@ function validateEvidenceBasis(value, report) {
     exact(value.pagination_complete, true, "accepted evidence pagination_complete");
     exact(value.final_reread_complete, true, "accepted evidence final_reread_complete");
   }
-  exact(value.scope_assurance, "whole-pr-contractual", "report.evidence_basis.scope_assurance");
+  exact(
+    value.scope_assurance,
+    ARTIFACT_PUBLICATION_BASIS_KINDS.has(value.kind)
+      ? "artifact-publication-only"
+      : "whole-pr-contractual",
+    "report.evidence_basis.scope_assurance",
+  );
   exact(value.provider_input_lineage, "unavailable", "report.evidence_basis.provider_input_lineage");
   nullable(value.finding_recovery, (item) => validateFindingRecovery(item), "report.evidence_basis.finding_recovery");
   validateAuthorityReceipt(value.authority_receipt, value, report);
+
+  if (
+    value.finding_recovery !== null &&
+    value.kind !== "current-request-reaction"
+  ) {
+    fail("finding recovery requires current-request-reaction evidence");
+  }
+
+  if (
+    value.kind === "terminal-payload" &&
+    value.outcome === "inconclusive" &&
+    (
+      value.server_times.request !== null ||
+      value.finding_recovery !== null ||
+      value.authority_receipt.selected_request !== null ||
+      value.authority_receipt.recovery !== null
+    )
+  ) {
+    fail("terminal clean classification lineage must be null");
+  }
 
   if (["current-request-reaction", "stable-exact-no-start"].includes(value.kind)) {
     if (report.request_policy.generation_id === null) {
@@ -433,6 +465,9 @@ function validateAuthorityReceipt(value, basis, report) {
 
   if (["current-request-reaction", "stable-exact-no-start"].includes(basis.kind)) {
     if (value.selected_request === null) fail("request-bound evidence requires selected_request receipt data");
+    if (basis.kind === "current-request-reaction" && value.selected_artifact !== null) {
+      fail("current-request reaction selected artifact must be null");
+    }
     if (basis.kind === "stable-exact-no-start") {
       exact(report.request_policy.manual, false, "stable exact no-start manual request flag");
       exact(report.review_epoch.controlled_request_id, report.request_policy.request_id, "review epoch controlled request id");

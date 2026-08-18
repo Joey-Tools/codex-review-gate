@@ -46,6 +46,7 @@ const CONTROLLER_KEYS = Object.freeze([
   "server_enforcement",
   "budget",
   "request_bindings",
+  "generation_admissions",
   "artifact_bindings",
   "thread_resolution_observations",
   "no_start_observations",
@@ -56,12 +57,46 @@ const REQUEST_BINDING_KEYS = Object.freeze([
   "kind",
   "base_oid",
   "head_oid",
+  "current_incarnation",
   "controlled",
   "generation_id",
   "generation_kind",
   "generation_index",
 ]);
-const ARTIFACT_BINDING_KEYS = Object.freeze(["id", "request_id"]);
+const GENERATION_ADMISSION_KEYS = Object.freeze([
+  "prior_generation_id",
+  "next_generation_id",
+  "prior_request_id",
+  "next_request_id",
+  "head_oid",
+  "prior_request_binding_record_oid",
+  "recovery_transition_record_oid",
+  "recovery_transition_payload_digest",
+  "next_request_binding_record_oid",
+  "next_request_binding_payload_digest",
+  "transition_server_time",
+  "ledger_order",
+]);
+const GENERATION_ADMISSION_LEDGER_ORDER_KEYS = Object.freeze([
+  "prior_request_binding_index",
+  "recovery_transition_index",
+  "next_request_binding_index",
+]);
+const LEGACY_ARTIFACT_BINDING_KEYS = Object.freeze(["id", "request_id"]);
+const ARTIFACT_BINDING_KEYS = Object.freeze([
+  "id",
+  "request_id",
+  "generation_id",
+  "request_node_id",
+  "artifact_selector",
+  "artifact_node_id",
+  "artifact_url",
+  "artifact_type",
+  "artifact_created_at",
+  "raw_body_sha256",
+  "actor",
+  "app",
+]);
 const THREAD_RESOLUTION_OBSERVATION_KEYS = Object.freeze([
   "thread_id",
   "repository_id",
@@ -110,9 +145,17 @@ export function deriveV2EvidenceRequest({ discovery_snapshot, controller }) {
   const normalizedController = normalizeController(controller);
 
   const requestComments = requestCommentsById(discovery_snapshot);
-  const bindings = requestBindingsById(normalizedController, requestComments);
+  const bindings = requestBindingsById(
+    normalizedController,
+    requestComments,
+    discovery_snapshot.scope.head_ref_oid,
+  );
   const selectorsByKey = new Map(
-    deriveSelectors(discovery_snapshot).map((selector) => [selectorKey(selector), selector]),
+    deriveSelectors(
+      discovery_snapshot,
+      bindings,
+      discovery_snapshot.scope.head_ref_oid,
+    ).map((selector) => [selectorKey(selector), selector]),
   );
   for (const observation of normalizedController.no_start_observations) {
     selectorsByKey.set(
@@ -131,7 +174,9 @@ export function deriveV2EvidenceRequest({ discovery_snapshot, controller }) {
 
   const permissionSubjects = selectors.filter((selector) =>
     selector.kind === "issue_comment" &&
-    (bindings.get(selector.id)?.kind === "manual" ||
+    ((bindings.get(selector.id)?.head_oid ===
+        discovery_snapshot.scope.head_ref_oid &&
+      bindings.get(selector.id)?.kind === "manual") ||
       isAddressCommandCandidate(
         inventoryArtifact(discovery_snapshot, selector)?.body,
       )));
@@ -181,6 +226,7 @@ export function projectV2TransportSnapshots({
   const requestBindings = requestBindingsById(
     normalizedController,
     requestComments,
+    evidence_snapshot.scope.head_ref_oid,
   );
   const epoch = projectEpoch(evidence_snapshot);
   const requests = projectRequests({
@@ -194,7 +240,12 @@ export function projectV2TransportSnapshots({
     exactBySelector,
     controller: normalizedController,
   });
-  bindProviderArtifacts(provider.artifacts, normalizedController.artifact_bindings, requests);
+  bindProviderArtifacts(
+    provider.artifacts,
+    normalizedController.artifact_bindings,
+    requests,
+    exactBySelector,
+  );
   const noStartObservations = projectNoStartObservations({
     discoverySnapshot: discovery_snapshot,
     evidenceSnapshot: evidence_snapshot,
@@ -202,6 +253,11 @@ export function projectV2TransportSnapshots({
     controller: normalizedController,
     requests,
   });
+  const generationAdmissions = projectGenerationAdmissions(
+    normalizedController.generation_admissions,
+    requests,
+    epoch.head_oid,
+  );
 
   const withoutFingerprint = {
     schema_version: 2,
@@ -223,6 +279,7 @@ export function projectV2TransportSnapshots({
     threads: provider.threads,
     acknowledgements: provider.acknowledgements,
     no_start_observations: noStartObservations,
+    generation_admissions: generationAdmissions,
     evidence_authority: {
       pagination_sha256: digestCanonical(
         "codex-review-gate-v2-pagination-authority",
@@ -269,6 +326,7 @@ export function projectV2TransportSnapshots({
     threads: withoutFingerprint.threads,
     acknowledgements: withoutFingerprint.acknowledgements,
     no_start_observations: withoutFingerprint.no_start_observations,
+    generation_admissions: withoutFingerprint.generation_admissions,
     evidence_authority: withoutFingerprint.evidence_authority,
     budget: withoutFingerprint.budget,
   };
@@ -489,7 +547,7 @@ function serviceStartInventory(observations) {
   };
 }
 
-function deriveSelectors(snapshot) {
+function deriveSelectors(snapshot, requestBindings, currentHead) {
   const selectors = new Map();
   const add = (kind, id) => selectors.set(`${kind}:${id}`, { kind, id });
   const reviews = new Map(snapshot.pages.reviews.map((review) => [review.id, review]));
@@ -497,8 +555,11 @@ function deriveSelectors(snapshot) {
   for (const comment of snapshot.pages.issue_comments) {
     const native = issueCommentForCore(comment);
     const terminal = parseCodexIssueCommentTerminalHeading(comment.body ?? "");
+    const currentRequest =
+      comment.body === V2_MANUAL_REVIEW_REQUEST &&
+      requestBindings.get(comment.id)?.head_oid === currentHead;
     if (
-      comment.body === V2_MANUAL_REVIEW_REQUEST ||
+      currentRequest ||
       isAddressCommandCandidate(comment.body) ||
       terminal.terminalLooking ||
       providerLike(comment)
@@ -655,6 +716,9 @@ function projectRequests({ requestComments, requestBindings, evidenceSnapshot })
     ]),
   );
   return [...requestComments.values()]
+    .filter((comment) =>
+      requestBindings.get(comment.id)?.head_oid ===
+        evidenceSnapshot.scope.head_ref_oid)
     .sort(compareIds)
     .map((comment) => {
       const binding = requestBindings.get(comment.id);
@@ -669,6 +733,7 @@ function projectRequests({ requestComments, requestBindings, evidenceSnapshot })
         stable: true,
         base_oid: binding.base_oid,
         head_oid: binding.head_oid,
+        current_incarnation: binding.current_incarnation,
         actor_permission: binding.kind === "manual"
           ? projectActorPermission(permissions.get(comment.id))
           : null,
@@ -677,6 +742,31 @@ function projectRequests({ requestComments, requestBindings, evidenceSnapshot })
         generation_index: binding.generation_index,
       };
     });
+}
+
+function projectGenerationAdmissions(admissions, requests, currentHead) {
+  const requestsById = new Map(requests.map((request) => [request.id, request]));
+  return admissions.map((admission) => {
+    const prior = requestsById.get(admission.prior_request_id);
+    const next = requestsById.get(admission.next_request_id);
+    if (
+      admission.head_oid !== currentHead ||
+      prior?.generation_id !== admission.prior_generation_id ||
+      next?.generation_id !== admission.next_generation_id ||
+      prior.head_oid !== currentHead ||
+      next.head_oid !== currentHead ||
+      Date.parse(admission.transition_server_time) <=
+        Date.parse(prior.created_at) ||
+      Date.parse(admission.transition_server_time) >=
+        Date.parse(next.created_at)
+    ) {
+      throw projectorFailure(
+        "GENERATION_ADMISSION_LINEAGE_INVALID",
+        `generation admission ${admission.next_generation_id} is not bound to its same-head request transition`,
+      );
+    }
+    return structuredClone(admission);
+  });
 }
 
 function projectActorPermission(permission) {
@@ -695,13 +785,16 @@ function projectActorPermission(permission) {
   };
 }
 
-function bindProviderArtifacts(artifacts, bindings, requests) {
+function bindProviderArtifacts(artifacts, bindings, requests, exactBySelector) {
   const requestsById = new Map(requests.map((request) => [request.id, request]));
   const artifactsById = new Map(artifacts.map((artifact) => [artifact.id, artifact]));
   for (const binding of bindings) {
     const artifact = artifactsById.get(binding.id);
     const request = requestsById.get(binding.request_id);
     if (artifact === undefined || request === undefined) {
+      if (isRichArtifactBinding(binding)) {
+        throw artifactBindingReceiptMismatch(binding.id);
+      }
       throw projectorFailure(
         "ARTIFACT_GENERATION_BINDING_INVALID",
         `artifact binding ${binding.id} does not bind an observed artifact and request generation`,
@@ -713,8 +806,69 @@ function bindProviderArtifacts(artifacts, bindings, requests) {
         `artifact ${binding.id} is not strictly later than request ${binding.request_id}`,
       );
     }
-    artifact.request_id = request.id;
+    if (!isRichArtifactBinding(binding)) {
+      // Historical two-field receipts predate exact carrier commitments. They
+      // remain sufficient for fail-closed findings and recovery bookkeeping,
+      // but can never authorize a positive terminal-clean result.
+      if (artifact.kind === "terminal-findings") {
+        artifact.request_id = request.id;
+      }
+      continue;
+    }
+    if (!artifactBindingMatchesExactArtifact(
+      binding,
+      artifact,
+      request,
+      exactBySelector,
+    )) {
+      throw artifactBindingReceiptMismatch(binding.id);
+    }
+    if (artifact.kind === "terminal-findings") {
+      artifact.request_id = request.id;
+    }
   }
+}
+
+function artifactBindingMatchesExactArtifact(
+  binding,
+  artifact,
+  request,
+  exactBySelector,
+) {
+  const exactReceipt = exactBySelector.get(selectorKey(binding.artifact_selector));
+  const exactRequest = exactBySelector.get(`issue_comment:${request.id}`);
+  if (exactReceipt === undefined) {
+    return false;
+  }
+  const nativeArtifact = exactReceipt.artifact;
+  const nativeCreatedAt = binding.artifact_selector.kind === "pull_request_review"
+    ? nativeArtifact.submitted_at
+    : nativeArtifact.created_at;
+  return binding.id === binding.artifact_selector.id &&
+    binding.generation_id === request.generation_id &&
+    exactRequest?.artifact.node_id === binding.request_node_id &&
+    binding.artifact_type === binding.artifact_selector.kind &&
+    artifact.id === binding.id &&
+    artifact.url === binding.artifact_url &&
+    artifact.created_at === binding.artifact_created_at &&
+    nativeArtifact.id === binding.id &&
+    nativeArtifact.node_id === binding.artifact_node_id &&
+    nativeArtifact.html_url === binding.artifact_url &&
+    nativeCreatedAt === binding.artifact_created_at &&
+    exactReceipt.raw_body_sha256 === binding.raw_body_sha256 &&
+    isDeepStrictEqual(nativeArtifact.author, binding.actor) &&
+    isDeepStrictEqual(nativeArtifact.app, binding.app);
+}
+
+function artifactBindingReceiptMismatch(id) {
+  return projectorFailure(
+    "ARTIFACT_BINDING_RECEIPT_MISMATCH",
+    `artifact binding ${id} does not match the current exact carrier receipt`,
+  );
+}
+
+function isRichArtifactBinding(binding) {
+  return Object.hasOwn(binding, "artifact_selector");
 }
 
 function permissionObservation(receipt) {
@@ -735,6 +889,7 @@ function projectProviderEvidence({
   const artifacts = [];
   const threads = [];
   const acknowledgements = [];
+  const historicalTopLevelCarriers = [];
   const parserOptions = repositoryParserOptions(snapshot);
   const nativeReviews = snapshot.pages.reviews.map(reviewForCore);
   const nativeInline = snapshot.pages.inline_comments.map(inlineCommentForCore);
@@ -773,6 +928,16 @@ function projectProviderEvidence({
     if (parsed === null || parsed.kind === "pending") {
       continue;
     }
+    if (
+      parsed.kind === "finding" &&
+      parsed.headSha !== snapshot.scope.head_ref_oid &&
+      providerLike(comment)
+    ) {
+      historicalTopLevelCarriers.push({
+        carrier: comment,
+        finding_created_at: parsed.createdAt,
+      });
+    }
     const projected = projectParsedArtifact(
       parsed,
       comment,
@@ -795,6 +960,15 @@ function projectProviderEvidence({
     const parsed = parseCodexReviewArtifact(reviewForCore(review), parserOptions);
     if (parsed === null) {
       continue;
+    }
+    if (
+      parsed.kind === "finding" &&
+      parsed.headSha !== snapshot.scope.head_ref_oid
+    ) {
+      historicalTopLevelCarriers.push({
+        carrier: review,
+        finding_created_at: parsed.createdAt,
+      });
     }
     const projected = projectParsedArtifact(
       parsed,
@@ -819,13 +993,20 @@ function projectProviderEvidence({
     // provider resolution timestamp and forces recovery onto a future request.
     fallbackResolutionObservedAt: evidenceSnapshot.server_time,
   });
-  projectRequestReactions(snapshot, acknowledgements);
+  projectRequestReactions(
+    snapshot,
+    acknowledgements,
+    new Set(controller.request_bindings
+      .filter((binding) => binding.head_oid === snapshot.scope.head_ref_oid)
+      .map((binding) => binding.id)),
+  );
   projectAddressedAcknowledgements({
     snapshot,
     exactBySelector,
     artifacts,
     threads,
     acknowledgements,
+    historicalTopLevelCarriers,
   });
 
   return {
@@ -1003,10 +1184,13 @@ function projectInlineFindings({
   }
 }
 
-function projectRequestReactions(snapshot, acknowledgements) {
+function projectRequestReactions(snapshot, acknowledgements, currentRequestIds) {
   const requests = requestCommentsById(snapshot);
   for (const group of snapshot.pages.reactions.issue_comments) {
-    if (!requests.has(group.subject_id)) {
+    if (
+      !requests.has(group.subject_id) ||
+      !currentRequestIds.has(group.subject_id)
+    ) {
       continue;
     }
     for (const reaction of group.reactions) {
@@ -1040,6 +1224,7 @@ function projectAddressedAcknowledgements({
   artifacts,
   threads,
   acknowledgements,
+  historicalTopLevelCarriers,
 }) {
   const permissions = new Map(
     snapshot.permissions.actor_permissions.map((permission) => [
@@ -1133,11 +1318,28 @@ function projectAddressedAcknowledgements({
       );
     }
     const matches = addressable.filter((finding) => finding.carrier_url === targetUrl);
-    if (matches.length !== 1) {
+    const historicalMatches = historicalTopLevelCarriers.filter(
+      ({ carrier }) => carrier.html_url === targetUrl,
+    );
+    if (matches.length + historicalMatches.length !== 1) {
       throw projectorFailure(
         "ADDRESS_COMMAND_TARGET_INVALID",
         `address command ${comment.id} does not bind one top-level carrier`,
       );
+    }
+    if (historicalMatches.length === 1) {
+      const historical = historicalMatches[0];
+      assertCanonicalCarrierHtmlUrl(historical.carrier, snapshot);
+      if (
+        Date.parse(comment.created_at) <=
+          Date.parse(historical.finding_created_at)
+      ) {
+        throw projectorFailure(
+          "ADDRESS_COMMAND_NOT_LATER",
+          `address command ${comment.id} is not strictly later than its finding`,
+        );
+      }
+      continue;
     }
     const selected = matches[0];
     if (Date.parse(comment.created_at) <= Date.parse(selected.finding_created_at)) {
@@ -1297,21 +1499,23 @@ function providerActivityVetoesNoStart({
         return true;
       }
     }
-    const reactionGroups = [
-      snapshot.pages.reactions.issue,
-      ...snapshot.pages.reactions.issue_comments.map((group) => group.reactions),
-      ...snapshot.pages.reactions.reviews.map((group) => group.reactions),
-      ...snapshot.pages.reactions.inline_comments.map((group) => group.reactions),
-    ];
-    for (const reaction of reactionGroups.flat()) {
-      const actor = reaction.author === null
-        ? null
-        : { login: reaction.author.login, type: reaction.author.type };
-      if (
-        isExactV2CodexProviderIdentity(actor) &&
-        Date.parse(reaction.created_at) >= Date.parse(request.created_at)
-      ) {
-        return true;
+    if (request.current_incarnation) {
+      for (const group of snapshot.pages.reactions.issue_comments) {
+        if (group.subject_id !== request.id) {
+          continue;
+        }
+        for (const reaction of group.reactions) {
+          const actor = reaction.author === null
+            ? null
+            : { login: reaction.author.login, type: reaction.author.type };
+          if (
+            isExactV2CodexProviderIdentity(actor) &&
+            (reaction.content === "+1" || reaction.content === "eyes") &&
+            Date.parse(reaction.created_at) >= Date.parse(request.created_at)
+          ) {
+            return true;
+          }
+        }
       }
     }
   }
@@ -1361,6 +1565,7 @@ function normalizeController(value) {
     oneOf(binding.kind, ["automatic", "manual"], `${label}.kind`);
     sha(binding.base_oid, `${label}.base_oid`);
     sha(binding.head_oid, `${label}.head_oid`);
+    boolean(binding.current_incarnation, `${label}.current_incarnation`);
     boolean(binding.controlled, `${label}.controlled`);
     oneOf(binding.generation_kind, ["automatic", "manual"], `${label}.generation_kind`);
     nonNegativeInteger(binding.generation_index, `${label}.generation_index`);
@@ -1378,15 +1583,106 @@ function normalizeController(value) {
     }
     bindingIds.add(binding.id);
   });
+  if (!Array.isArray(value.generation_admissions) ||
+      value.generation_admissions.length > 2) {
+    throw new TypeError("controller.generation_admissions must be a bounded array");
+  }
+  const admittedNextGenerations = new Set();
+  value.generation_admissions.forEach((admission, index) => {
+    const label = `controller.generation_admissions[${index}]`;
+    exactObject(admission, GENERATION_ADMISSION_KEYS, label);
+    const priorMatch = /^automatic:([1-2])$/u.exec(admission.prior_generation_id);
+    const nextMatch = /^automatic:([2-3])$/u.exec(admission.next_generation_id);
+    if (
+      priorMatch === null ||
+      nextMatch === null ||
+      Number(priorMatch[1]) !== index + 1 ||
+      Number(nextMatch[1]) !== index + 2
+    ) {
+      throw new TypeError(`${label} must advance one ordered automatic generation`);
+    }
+    decimal(admission.prior_request_id, `${label}.prior_request_id`);
+    decimal(admission.next_request_id, `${label}.next_request_id`);
+    sha(admission.head_oid, `${label}.head_oid`);
+    sha(admission.prior_request_binding_record_oid,
+      `${label}.prior_request_binding_record_oid`);
+    sha(admission.recovery_transition_record_oid,
+      `${label}.recovery_transition_record_oid`);
+    sha(admission.next_request_binding_record_oid,
+      `${label}.next_request_binding_record_oid`);
+    if (!DIGEST.test(admission.recovery_transition_payload_digest) ||
+        !DIGEST.test(admission.next_request_binding_payload_digest)) {
+      throw new TypeError(`${label} must bind both durable payload digests`);
+    }
+    timestamp(admission.transition_server_time,
+      `${label}.transition_server_time`);
+    exactObject(admission.ledger_order,
+      GENERATION_ADMISSION_LEDGER_ORDER_KEYS, `${label}.ledger_order`);
+    const priorOrder = admission.ledger_order.prior_request_binding_index;
+    const transitionOrder = admission.ledger_order.recovery_transition_index;
+    const nextOrder = admission.ledger_order.next_request_binding_index;
+    for (const [field, position] of Object.entries(admission.ledger_order)) {
+      nonNegativeInteger(position, `${label}.ledger_order.${field}`);
+    }
+    if (!(priorOrder < transitionOrder && transitionOrder < nextOrder)) {
+      throw new TypeError(`${label}.ledger_order is not strictly causal`);
+    }
+    if (admittedNextGenerations.has(admission.next_generation_id)) {
+      throw new TypeError(`${label} repeats a next generation`);
+    }
+    admittedNextGenerations.add(admission.next_generation_id);
+    const previous = value.generation_admissions[index - 1];
+    if (
+      previous !== undefined &&
+      (
+        previous.next_generation_id !== admission.prior_generation_id ||
+        previous.next_request_id !== admission.prior_request_id ||
+        previous.next_request_binding_record_oid !==
+          admission.prior_request_binding_record_oid ||
+        previous.ledger_order.next_request_binding_index !==
+          admission.ledger_order.prior_request_binding_index
+      )
+    ) {
+      throw new TypeError(`${label} does not continue the prior durable admission`);
+    }
+  });
   if (!Array.isArray(value.artifact_bindings)) {
     throw new TypeError("controller.artifact_bindings must be an array");
   }
   const artifactBindingIds = new Set();
   value.artifact_bindings.forEach((binding, index) => {
     const label = `controller.artifact_bindings[${index}]`;
-    exactObject(binding, ARTIFACT_BINDING_KEYS, label);
+    const rich = Object.hasOwn(binding, "artifact_selector");
+    exactObject(
+      binding,
+      rich ? ARTIFACT_BINDING_KEYS : LEGACY_ARTIFACT_BINDING_KEYS,
+      label,
+    );
     decimal(binding.id, `${label}.id`);
     decimal(binding.request_id, `${label}.request_id`);
+    if (rich) {
+      exactObject(binding.artifact_selector, ["kind", "id"],
+        `${label}.artifact_selector`);
+      oneOf(binding.artifact_selector.kind, [...SELECTOR_KINDS],
+        `${label}.artifact_selector.kind`);
+      decimal(binding.artifact_selector.id, `${label}.artifact_selector.id`);
+      exact(binding.artifact_selector.id, binding.id,
+        `${label}.artifact_selector.id`);
+      boundedString(binding.artifact_node_id, `${label}.artifact_node_id`, 256);
+      if (!/^(?:automatic|manual):[1-9][0-9]*$/u.test(binding.generation_id)) {
+        throw new TypeError(`${label}.generation_id is invalid`);
+      }
+      boundedString(binding.request_node_id, `${label}.request_node_id`, 256);
+      githubUrl(binding.artifact_url, `${label}.artifact_url`);
+      oneOf(binding.artifact_type, [...SELECTOR_KINDS],
+        `${label}.artifact_type`);
+      timestamp(binding.artifact_created_at, `${label}.artifact_created_at`);
+      if (!DIGEST.test(binding.raw_body_sha256)) {
+        throw new TypeError(`${label}.raw_body_sha256 must be a SHA-256 digest`);
+      }
+      validateBindingActor(binding.actor, `${label}.actor`);
+      validateBindingApp(binding.app, `${label}.app`);
+    }
     if (artifactBindingIds.has(binding.id)) {
       throw new TypeError(`controller.artifact_bindings repeats id ${binding.id}`);
     }
@@ -1616,7 +1912,7 @@ function requestCommentsById(snapshot) {
   );
 }
 
-function requestBindingsById(controller, requestComments) {
+function requestBindingsById(controller, requestComments, currentHead) {
   const bindings = new Map(
     controller.request_bindings.map((binding) => [binding.id, binding]),
   );
@@ -1628,8 +1924,8 @@ function requestBindingsById(controller, requestComments) {
       );
     }
   }
-  for (const id of bindings.keys()) {
-    if (!requestComments.has(id)) {
+  for (const [id, binding] of bindings) {
+    if (binding.head_oid === currentHead && !requestComments.has(id)) {
       throw projectorFailure(
         "REQUEST_BINDING_ORPHANED",
         `controller binding ${id} has no exact visible request artifact`,
@@ -1902,6 +2198,39 @@ function timestamp(value, label) {
 function boundedString(value, label, max) {
   if (typeof value !== "string" || value.length > max) {
     throw new TypeError(`${label} must be a string no longer than ${max}`);
+  }
+}
+
+function validateBindingActor(value, label) {
+  exactObject(value, ["id", "node_id", "login", "type"], label);
+  decimal(value.id, `${label}.id`);
+  boundedString(value.node_id, `${label}.node_id`, 256);
+  boundedString(value.login, `${label}.login`, 128);
+  boundedString(value.type, `${label}.type`, 64);
+}
+
+function validateBindingApp(value, label) {
+  exactObject(value, ["id", "node_id", "slug"], label);
+  decimal(value.id, `${label}.id`);
+  boundedString(value.node_id, `${label}.node_id`, 256);
+  boundedString(value.slug, `${label}.slug`, 128);
+}
+
+function githubUrl(value, label) {
+  boundedString(value, label, 2048);
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (error) {
+    throw new TypeError(`${label} must be an absolute URL`, { cause: error });
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname !== "github.com" ||
+    parsed.username !== "" ||
+    parsed.password !== ""
+  ) {
+    throw new TypeError(`${label} must be one credential-free github.com URL`);
   }
 }
 

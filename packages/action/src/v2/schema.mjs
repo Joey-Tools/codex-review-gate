@@ -57,6 +57,14 @@ export const TERMINAL_V2_DECISIONS = new Set([
   "blocked-input",
 ]);
 
+const ARTIFACT_PUBLICATION_BASIS_KINDS = new Set([
+  "terminal-clean",
+  "terminal-findings",
+  "unresolved-inline-finding",
+  "malformed-evidence",
+  "unknown-terminal",
+]);
+
 export const V2_REDUCER_INPUT_SCHEMA = deepFreeze({
   schema_version: 2,
   exact_keys: [
@@ -74,6 +82,7 @@ export const V2_REDUCER_INPUT_SCHEMA = deepFreeze({
     "threads",
     "acknowledgements",
     "no_start_observations",
+    "generation_admissions",
     "evidence_authority",
     "budget",
   ],
@@ -123,6 +132,7 @@ export const V2_REDUCER_INPUT_SCHEMA = deepFreeze({
       "stable",
       "base_oid",
       "head_oid",
+      "current_incarnation",
       "actor_permission",
       "generation_id",
       "generation_kind",
@@ -198,6 +208,29 @@ export const V2_REDUCER_INPUT_SCHEMA = deepFreeze({
       "confirmation_run_id",
       "request_run_id",
     ],
+  },
+  generation_admission: {
+    exact_keys: [
+      "prior_generation_id",
+      "next_generation_id",
+      "prior_request_id",
+      "next_request_id",
+      "head_oid",
+      "prior_request_binding_record_oid",
+      "recovery_transition_record_oid",
+      "recovery_transition_payload_digest",
+      "next_request_binding_record_oid",
+      "next_request_binding_payload_digest",
+      "transition_server_time",
+      "ledger_order",
+    ],
+    ledger_order: {
+      exact_keys: [
+        "prior_request_binding_index",
+        "recovery_transition_index",
+        "next_request_binding_index",
+      ],
+    },
   },
   evidence_authority: {
     exact_keys: ["pagination_sha256", "final_reread_sha256"],
@@ -338,11 +371,20 @@ export function assertV2ReducerInput(value) {
   const threads = array(value.threads, "threads");
   const acknowledgements = array(value.acknowledgements, "acknowledgements");
   const noStartObservations = array(value.no_start_observations, "no_start_observations");
+  const generationAdmissions = array(
+    value.generation_admissions,
+    "generation_admissions",
+  );
   requests.forEach((item, index) => validateRequest(item, index));
   artifacts.forEach((item, index) => validateArtifact(item, index));
   threads.forEach((item, index) => validateThread(item, index));
   acknowledgements.forEach((item, index) => validateAcknowledgement(item, index));
   noStartObservations.forEach((item, index) => validateNoStartObservation(item, index));
+  if (generationAdmissions.length > 2) {
+    throw new Error("generation_admissions must contain at most two transitions");
+  }
+  generationAdmissions.forEach((item, index) =>
+    validateGenerationAdmission(item, index));
   uniqueField(requests, "id", "requests");
   uniqueField(artifacts, "id", "artifacts");
   uniqueField(threads, "id", "threads");
@@ -391,6 +433,48 @@ export function assertV2ReducerInput(value) {
       );
     }
   }
+  const requestsById = new Map(requests.map((request) => [request.id, request]));
+  const seenAdmissionRequests = new Set();
+  const seenAdmissionTransitions = new Set();
+  generationAdmissions.forEach((admission, index) => {
+    const label = `generation_admissions[${index}]`;
+    const prior = requestsById.get(admission.prior_request_id);
+    const next = requestsById.get(admission.next_request_id);
+    if (
+      admission.head_oid !== value.review_epoch.head_oid ||
+      prior?.generation_id !== admission.prior_generation_id ||
+      next?.generation_id !== admission.next_generation_id ||
+      prior?.head_oid !== value.review_epoch.head_oid ||
+      next?.head_oid !== value.review_epoch.head_oid
+    ) {
+      throw new Error(`${label} must bind two observed requests on the current head`);
+    }
+    if (Date.parse(admission.transition_server_time) >= Date.parse(next.created_at)) {
+      throw new Error(`${label} transition must strictly precede its next request`);
+    }
+    if (
+      seenAdmissionRequests.has(admission.next_request_id) ||
+      seenAdmissionTransitions.has(admission.recovery_transition_record_oid)
+    ) {
+      throw new Error(`${label} repeats a durable generation admission identity`);
+    }
+    seenAdmissionRequests.add(admission.next_request_id);
+    seenAdmissionTransitions.add(admission.recovery_transition_record_oid);
+    const previous = generationAdmissions[index - 1];
+    if (
+      previous !== undefined &&
+      (
+        previous.next_generation_id !== admission.prior_generation_id ||
+        previous.next_request_id !== admission.prior_request_id ||
+        previous.next_request_binding_record_oid !==
+          admission.prior_request_binding_record_oid ||
+        previous.ledger_order.next_request_binding_index !==
+          admission.ledger_order.prior_request_binding_index
+      )
+    ) {
+      throw new Error(`${label} does not continue the prior durable admission`);
+    }
+  });
 
   exactObject(
     value.evidence_authority,
@@ -620,7 +704,12 @@ function validateReducerReportSemantics(value) {
     value.status_target.mode === "test-merge-with-head-sentinel" &&
     value.status_target.sha === null &&
     !(
+      value.decision === "not-selected" ||
       value.decision === "blocked-input" ||
+      (
+        value.decision === "blocked-configuration" &&
+        kind === "configuration"
+      ) ||
       (
         value.decision === "findings" &&
         ["terminal-findings", "unresolved-inline-finding"].includes(kind)
@@ -674,19 +763,10 @@ function validateReducerReportSemantics(value) {
     case "clean":
       requireState({
         selection: ["selected"],
-        profiles: ["terminal-payload", "mixed", "thumbs-up-clean"],
-        kinds: ["terminal-clean", "thumbs-up-clean"],
+        profiles: ["thumbs-up-clean"],
+        kinds: ["thumbs-up-clean"],
       });
-      if (
-        kind === "thumbs-up-clean" &&
-        !["thumbs-up-clean", "mixed"].includes(value.provider_profile)
-      ) {
-        throw new Error("report clean profile does not match its evidence authority");
-      }
-      if (
-        kind === "terminal-clean" &&
-        !["terminal-payload", "mixed"].includes(value.provider_profile)
-      ) {
+      if (kind === "thumbs-up-clean" && value.provider_profile !== "thumbs-up-clean") {
         throw new Error("report clean profile does not match its evidence authority");
       }
       break;
@@ -724,6 +804,7 @@ function validateReducerReportSemantics(value) {
         profiles: ["unknown", "terminal-payload", "mixed"],
         kinds: [
           null,
+          "terminal-clean",
           "input",
           "malformed-evidence",
           "unknown-terminal",
@@ -745,6 +826,22 @@ function validateEvidenceAuthoritySemantics(value) {
   }
   const receipt = basis.authority_receipt;
   if (
+    basis.kind === "terminal-clean" &&
+    (
+      receipt.selected_request !== null ||
+      receipt.selected_generation !== null ||
+      receipt.recovery !== null
+    )
+  ) {
+    throw new Error("report terminal clean classification lineage must be null");
+  }
+  if (
+    basis.kind === "thumbs-up-clean" &&
+    receipt.selected_artifact !== null
+  ) {
+    throw new Error("report reaction clean authority selected artifact must be null");
+  }
+  if (
     receipt.selected_request !== null &&
     receipt.selected_request.id !== value.request_policy.selected_request_id
   ) {
@@ -753,12 +850,8 @@ function validateEvidenceAuthoritySemantics(value) {
     );
   }
   if (
-    new Set([
-      "terminal-clean",
-      "terminal-findings",
-      "unresolved-inline-finding",
-      "no-start-rejection",
-    ]).has(basis.kind)
+    ARTIFACT_PUBLICATION_BASIS_KINDS.has(basis.kind) ||
+    basis.kind === "no-start-rejection"
   ) {
     if (
       receipt.selected_artifact === null ||
@@ -778,7 +871,7 @@ function validateEvidenceAuthoritySemantics(value) {
       receipt.selected_request === null ||
       receipt.recovery.new_request_id !== receipt.selected_request.id ||
       receipt.recovery.completion_id !== basis.artifact_id ||
-      !new Set(["terminal-clean", "thumbs-up-clean"]).has(basis.kind)
+      basis.kind !== "thumbs-up-clean"
     ) {
       throw new Error("report evidence recovery receipt is not bound to its request and completion");
     }
@@ -816,6 +909,7 @@ function validateRequest(value, index) {
   bool(value.stable, `${label}.stable`);
   sha(value.base_oid, `${label}.base_oid`);
   sha(value.head_oid, `${label}.head_oid`);
+  bool(value.current_incarnation, `${label}.current_incarnation`);
   validateGeneration(value, label);
   if (value.kind === "manual") {
     validateActorPermission(value.actor_permission, `${label}.actor_permission`);
@@ -949,6 +1043,65 @@ function validateGeneration(value, label) {
   exact(value.kind, value.generation_kind, `${label}.generation_kind`);
 }
 
+function validateGenerationAdmission(value, index) {
+  const label = `generation_admissions[${index}]`;
+  exactObject(
+    value,
+    V2_REDUCER_INPUT_SCHEMA.generation_admission.exact_keys,
+    label,
+  );
+  const priorIndex = index + 1;
+  const nextIndex = priorIndex + 1;
+  exact(
+    value.prior_generation_id,
+    `automatic:${priorIndex}`,
+    `${label}.prior_generation_id`,
+  );
+  exact(
+    value.next_generation_id,
+    `automatic:${nextIndex}`,
+    `${label}.next_generation_id`,
+  );
+  decimal(value.prior_request_id, `${label}.prior_request_id`);
+  decimal(value.next_request_id, `${label}.next_request_id`);
+  sha(value.head_oid, `${label}.head_oid`);
+  sha(
+    value.prior_request_binding_record_oid,
+    `${label}.prior_request_binding_record_oid`,
+  );
+  sha(
+    value.recovery_transition_record_oid,
+    `${label}.recovery_transition_record_oid`,
+  );
+  digest(
+    value.recovery_transition_payload_digest,
+    `${label}.recovery_transition_payload_digest`,
+  );
+  sha(
+    value.next_request_binding_record_oid,
+    `${label}.next_request_binding_record_oid`,
+  );
+  digest(
+    value.next_request_binding_payload_digest,
+    `${label}.next_request_binding_payload_digest`,
+  );
+  timestamp(value.transition_server_time, `${label}.transition_server_time`);
+  exactObject(
+    value.ledger_order,
+    V2_REDUCER_INPUT_SCHEMA.generation_admission.ledger_order.exact_keys,
+    `${label}.ledger_order`,
+  );
+  const priorOrder = value.ledger_order.prior_request_binding_index;
+  const transitionOrder = value.ledger_order.recovery_transition_index;
+  const nextOrder = value.ledger_order.next_request_binding_index;
+  nonNegativeSafeInteger(priorOrder, `${label}.ledger_order.prior_request_binding_index`);
+  nonNegativeSafeInteger(transitionOrder, `${label}.ledger_order.recovery_transition_index`);
+  nonNegativeSafeInteger(nextOrder, `${label}.ledger_order.next_request_binding_index`);
+  if (!(priorOrder < transitionOrder && transitionOrder < nextOrder)) {
+    throw new Error(`${label}.ledger_order must be strictly causal`);
+  }
+}
+
 function validateEvidenceBasis(value) {
   if (value === null) {
     return;
@@ -957,11 +1110,16 @@ function validateEvidenceBasis(value) {
   oneOf(value.kind, V2_REDUCER_OUTPUT_SCHEMA.evidence_basis.kind, "report.evidence_basis.kind");
   nullableOneOf(
     value.scope_assurance,
-    ["whole-pr-contractual"],
+    ["whole-pr-contractual", "artifact-publication-only"],
     "report.evidence_basis.scope_assurance",
   );
-  if (value.scope_assurance !== "whole-pr-contractual") {
-    throw new Error("report.evidence_basis must bind the whole-PR contractual scope");
+  const expectedAssurance = ARTIFACT_PUBLICATION_BASIS_KINDS.has(value.kind)
+    ? "artifact-publication-only"
+    : "whole-pr-contractual";
+  if (value.scope_assurance !== expectedAssurance) {
+    throw new Error(
+      `report.evidence_basis.${value.kind} must use ${expectedAssurance} scope assurance`,
+    );
   }
   nullableDecimal(value.artifact_id, "report.evidence_basis.artifact_id");
   boundedString(value.summary, "report.evidence_basis.summary", 256);
@@ -1107,10 +1265,19 @@ function validateProviderBasisPair(profile, kind) {
     ? ["thumbs-up-clean"]
     : profile === "no-start-rejection"
       ? ["no-start-rejection"]
-      : [
+      : profile === "terminal-payload"
+        ? [
           "terminal-clean",
           "terminal-findings",
-          "thumbs-up-clean",
+          "unresolved-inline-finding",
+          "malformed-evidence",
+          "unknown-terminal",
+          "stable-evidence-blocker",
+          "input",
+        ]
+        : [
+          "terminal-clean",
+          "terminal-findings",
           "unresolved-inline-finding",
           "malformed-evidence",
           "unknown-terminal",

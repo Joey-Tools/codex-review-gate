@@ -764,6 +764,9 @@ function projectAutomaticRecoveryArtifactBindingCandidateAuthority({
   controlled_request: controlledRequest,
   scheduler_evaluation: schedulerEvaluation,
 }) {
+  // Provider terminal-clean carriers do not expose authenticated
+  // request/run/input-base lineage. They remain classification-only and must
+  // never enter the positive artifact-binding recovery path.
   if (
     compactReport.decision !== "findings" ||
     compactReport.evidence_basis?.kind !== "terminal-findings" ||
@@ -808,42 +811,30 @@ function projectAutomaticRecoveryArtifactBindingCandidateAuthority({
     entry.selector.id === selectedRequest.id);
   const rawRequest = evidenceSnapshot.pages.issue_comments.find((entry) =>
     entry.id === selectedRequest.id);
+  const discoveryRequest = discoverySnapshot.pages.issue_comments.find((entry) =>
+    entry.id === selectedRequest.id);
   if (
     exactRequest === undefined || rawRequest === undefined ||
+    discoveryRequest === undefined ||
+    !isDeepStrictEqual(discoveryRequest, rawRequest) ||
     !isDeepStrictEqual(exactRequest.artifact, rawRequest) ||
     rawRequest.node_id.length === 0 ||
     rawRequest.html_url !== selectedRequest.url ||
     rawRequest.body !== V2_REQUEST_BODY ||
     rawRequest.created_at !== rawRequest.updated_at ||
-    rawRequest.created_at !== selectedRequest.created_at
+    rawRequest.created_at !== selectedRequest.created_at ||
+    Date.parse(exactRequest.response_server_time) >
+      Date.parse(evidenceSnapshot.server_time)
   ) {
     return null;
   }
-  const postRequestFindings = canonicalInput.artifacts
-    .filter((artifact) =>
-      artifact.kind === "terminal-findings" &&
-      artifact.commit_oid === canonicalInput.review_epoch.head_oid &&
-      Date.parse(artifact.created_at) > Date.parse(selectedRequest.created_at))
-    .sort((left, right) =>
-      Date.parse(left.created_at) - Date.parse(right.created_at) ||
-      (BigInt(left.id) < BigInt(right.id)
-        ? -1
-        : BigInt(left.id) > BigInt(right.id) ? 1 : 0));
-  if (
-    postRequestFindings.length === 0 ||
-    !postRequestFindings.some((artifact) =>
-      artifact.id === compactReport.evidence_basis.artifact_id) ||
-    postRequestFindings.some((artifact) =>
-      artifact.stable !== true ||
-      (artifact.request_id !== null &&
-        artifact.request_id !== selectedRequest.id))
-  ) {
-    return null;
-  }
-  const unboundFindings = postRequestFindings.filter((artifact) =>
-    artifact.request_id === null);
-  if (unboundFindings.length === 0) return null;
-  if (unboundFindings.length >
+  const unboundArtifacts = selectUnboundFindingRecoveryArtifacts(
+    canonicalInput,
+    compactReport,
+    selectedRequest,
+  );
+  if (unboundArtifacts === null || unboundArtifacts.length === 0) return null;
+  if (unboundArtifacts.length >
       MAX_V2_AUTOMATIC_RECOVERY_ARTIFACT_BINDING_CANDIDATES) {
     throw runnerError(
       "AUTOMATIC_RECOVERY_ARTIFACT_CANDIDATE_LIMIT_EXCEEDED",
@@ -852,7 +843,7 @@ function projectAutomaticRecoveryArtifactBindingCandidateAuthority({
   }
   let expectedActor = null;
   let expectedApp = null;
-  const candidates = unboundFindings.map((artifact, index) => {
+  const candidates = unboundArtifacts.map((artifact, index) => {
     const selectorKind = artifact.channel === "issue-comment"
       ? "issue_comment"
       : artifact.channel === "pull-request-review"
@@ -867,18 +858,29 @@ function projectAutomaticRecoveryArtifactBindingCandidateAuthority({
     const collection = selectorKind === "issue_comment"
       ? evidenceSnapshot.pages.issue_comments
       : evidenceSnapshot.pages.reviews;
+    const discoveryCollection = selectorKind === "issue_comment"
+      ? discoverySnapshot.pages.issue_comments
+      : discoverySnapshot.pages.reviews;
     const carrier = collection.find((item) => item.id === artifact.id);
+    const discoveryCarrier = discoveryCollection.find((item) =>
+      item.id === artifact.id);
     const exactArtifact = evidenceSnapshot.pages.exact_artifacts.find((entry) =>
       entry.selector.kind === selectorKind && entry.selector.id === artifact.id);
     const carrierCreatedAt = selectorKind === "issue_comment"
       ? carrier?.created_at
       : carrier?.submitted_at;
+    const carrierUpdatedAt = selectorKind === "issue_comment"
+      ? carrier?.updated_at
+      : carrierCreatedAt;
     if (
-      carrier === undefined || exactArtifact === undefined ||
+      carrier === undefined || discoveryCarrier === undefined ||
+      exactArtifact === undefined ||
+      !isDeepStrictEqual(discoveryCarrier, carrier) ||
       !isDeepStrictEqual(exactArtifact.artifact, carrier) ||
       carrier.node_id.length === 0 ||
       carrier.html_url !== artifact.url ||
       carrierCreatedAt !== artifact.created_at ||
+      carrierUpdatedAt !== carrierCreatedAt ||
       !isExactV2CodexProviderIdentity(carrier.author, carrier.app) ||
       Date.parse(exactArtifact.response_server_time) >
         Date.parse(evidenceSnapshot.server_time)
@@ -902,7 +904,7 @@ function projectAutomaticRecoveryArtifactBindingCandidateAuthority({
     }
     const withoutDigest = {
       index,
-      count: unboundFindings.length,
+      count: unboundArtifacts.length,
       selector: { kind: selectorKind, id: artifact.id },
       artifact_node_id: carrier.node_id,
       artifact_url: carrier.html_url,
@@ -960,6 +962,39 @@ function projectAutomaticRecoveryArtifactBindingCandidateAuthority({
       withoutDigest,
     ),
   });
+}
+
+function selectUnboundFindingRecoveryArtifacts(
+  canonicalInput,
+  compactReport,
+  selectedRequest,
+) {
+  const postRequestFindings = canonicalInput.artifacts
+    .filter((artifact) =>
+      artifact.kind === "terminal-findings" &&
+      artifact.commit_oid === canonicalInput.review_epoch.head_oid &&
+      Date.parse(artifact.created_at) > Date.parse(selectedRequest.created_at))
+    .sort(compareArtifactEvidence);
+  if (
+    postRequestFindings.length === 0 ||
+    !postRequestFindings.some((artifact) =>
+      artifact.id === compactReport.evidence_basis.artifact_id) ||
+    postRequestFindings.some((artifact) =>
+      artifact.stable !== true ||
+      (artifact.request_id !== null &&
+        artifact.request_id !== selectedRequest.id))
+  ) {
+    return null;
+  }
+  return postRequestFindings.filter((artifact) => artifact.request_id === null);
+}
+
+function compareArtifactEvidence(left, right) {
+  const timeOrder = Date.parse(left.created_at) - Date.parse(right.created_at);
+  if (timeOrder !== 0) return timeOrder;
+  const leftId = BigInt(left.id);
+  const rightId = BigInt(right.id);
+  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
 }
 
 export function evaluateV2Only(input, dependencies) {
@@ -2083,6 +2118,7 @@ function controllerForProjection(input, discoverySnapshot, responseArtifact) {
     generation_id: input.reservation.generation_id,
     generation_kind: input.reservation.generation_kind,
     generation_index: input.reservation.generation_index,
+    current_incarnation: true,
   };
   const existing = controller.request_bindings.find(
     (binding) => binding?.id === responseArtifact.id,
@@ -2096,6 +2132,7 @@ function controllerForProjection(input, discoverySnapshot, responseArtifact) {
       || existing.generation_id !== provisional.generation_id
       || existing.generation_kind !== provisional.generation_kind
       || existing.generation_index !== provisional.generation_index
+      || existing.current_incarnation !== provisional.current_incarnation
     ) {
       throw runnerError(
         "PREMATURE_REQUEST_BINDING",

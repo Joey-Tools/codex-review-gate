@@ -69,6 +69,7 @@ function snapshot(overrides = {}) {
     threads: [],
     acknowledgements: [],
     no_start_observations: [],
+    generation_admissions: [],
     evidence_authority: {
       pagination_sha256: DIGEST,
       final_reread_sha256: DIGEST,
@@ -94,6 +95,7 @@ function automaticRequest(overrides = {}) {
     stable: true,
     base_oid: BASE,
     head_oid: HEAD,
+    current_incarnation: true,
     actor_permission: null,
     generation_id: "automatic:1",
     generation_kind: "automatic",
@@ -103,6 +105,28 @@ function automaticRequest(overrides = {}) {
   value.url = overrides.url ??
     `https://github.com/owner/repo/pull/7#issuecomment-${value.id}`;
   return value;
+}
+
+function generationAdmission(prior, next, overrides = {}) {
+  return {
+    prior_generation_id: prior.generation_id,
+    next_generation_id: next.generation_id,
+    prior_request_id: prior.id,
+    next_request_id: next.id,
+    head_oid: HEAD,
+    prior_request_binding_record_oid: "1".repeat(40),
+    recovery_transition_record_oid: "2".repeat(40),
+    recovery_transition_payload_digest: `sha256:${"2".repeat(64)}`,
+    next_request_binding_record_oid: "3".repeat(40),
+    next_request_binding_payload_digest: `sha256:${"3".repeat(64)}`,
+    transition_server_time: "2026-08-13T12:04:00Z",
+    ledger_order: {
+      prior_request_binding_index: 10,
+      recovery_transition_index: 11,
+      next_request_binding_index: 12,
+    },
+    ...overrides,
+  };
 }
 
 function manualRequest(overrides = {}) {
@@ -117,6 +141,7 @@ function manualRequest(overrides = {}) {
     stable: true,
     base_oid: BASE,
     head_oid: HEAD,
+    current_incarnation: true,
     actor_permission: {
       assurance: "point-in-time-only",
       request_time_permission: "unproven",
@@ -160,6 +185,18 @@ function artifact(kind, overrides = {}) {
   value.url = overrides.url ??
     `https://github.com/owner/repo/pull/7#issuecomment-${value.id}`;
   return value;
+}
+
+function snapshotWithBoundTerminalClean(overrides = {}) {
+  const request = automaticRequest();
+  return snapshot(merge({
+    requests: [request],
+    artifacts: [artifact("terminal-clean", { request_id: request.id })],
+    budget: {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 1,
+    },
+  }, overrides));
 }
 
 function acknowledgement(kind, overrides = {}) {
@@ -321,6 +358,61 @@ test("returns not-selected without evaluating provider evidence", () => {
   assert.equal(report.evidence_basis, null);
 });
 
+test("early non-provider decisions tolerate an unavailable test-merge target", () => {
+  const unavailableTarget = {
+    mergeable: "UNKNOWN",
+    merge_oid: null,
+    merge_tree_oid: null,
+    merge_ref_oid: null,
+    merge_parents: [],
+  };
+  for (const mergeable of ["CONFLICTING", "UNKNOWN"]) {
+    const notSelected = reduceV2Snapshot(
+      snapshot({
+        selection: { intent: "disabled", eligible: false, reason: "Opted out" },
+        review_epoch: { ...unavailableTarget, mergeable },
+      }),
+      OPTIONS,
+    );
+    assert.equal(notSelected.decision, "not-selected", mergeable);
+    assert.equal(notSelected.status_target.sha, null, mergeable);
+
+    const blockedConfiguration = reduceV2Snapshot(
+      snapshot({
+        review_epoch: { ...unavailableTarget, mergeable },
+        server_enforcement: { app_bound: false },
+      }),
+      OPTIONS,
+    );
+    assert.equal(blockedConfiguration.decision, "blocked-configuration", mergeable);
+    assert.equal(blockedConfiguration.status_target.sha, null, mergeable);
+  }
+
+  const forgedPending = reduceV2Snapshot(snapshot(), OPTIONS);
+  Object.assign(forgedPending.review_epoch, unavailableTarget);
+  forgedPending.status_target.sha = null;
+  assert.throws(
+    () => assertV2ReducerOutput(forgedPending),
+    /null status target requires an input blocker or independent negative provider evidence/u,
+  );
+
+  const forgedNoStartBlock = reduceV2Snapshot(snapshot({
+    selection: { intent: "explicit" },
+    requests: [automaticRequest()],
+    no_start_observations: [noStart()],
+    budget: {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 1,
+    },
+  }), OPTIONS);
+  Object.assign(forgedNoStartBlock.review_epoch, unavailableTarget);
+  forgedNoStartBlock.status_target.sha = null;
+  assert.throws(
+    () => assertV2ReducerOutput(forgedNoStartBlock),
+    /null status target requires an input blocker or independent negative provider evidence/u,
+  );
+});
+
 test("blocks an epoch that does not bind merge-base and ordered parents", () => {
   const report = reduceV2Snapshot(
     snapshot({ review_epoch: { merge_parents: [HEAD, BASE] } }),
@@ -432,7 +524,7 @@ test("blocks a required missing or incompatible ruleset without falsifying inten
 
 test("evaluates optional ruleset and explicit no-infrastructure selections as not-enforced", () => {
   const workflowOnly = reduceV2Snapshot(
-    snapshot({
+    snapshotWithBoundTerminalClean({
       server_enforcement: {
         controller_available: true,
         workflow_present: true,
@@ -441,15 +533,14 @@ test("evaluates optional ruleset and explicit no-infrastructure selections as no
         ruleset_compatible: false,
         app_bound: false,
       },
-      artifacts: [artifact("terminal-clean")],
     }),
     OPTIONS,
   );
-  assert.equal(workflowOnly.decision, "clean");
+  assert.equal(workflowOnly.decision, "inconclusive");
   assert.equal(workflowOnly.server_enforcement.status, "not-enforced");
 
   const explicit = reduceV2Snapshot(
-    snapshot({
+    snapshotWithBoundTerminalClean({
       selection: { intent: "explicit", reason: "User explicitly selected review" },
       server_enforcement: {
         controller_available: true,
@@ -459,11 +550,10 @@ test("evaluates optional ruleset and explicit no-infrastructure selections as no
         ruleset_compatible: false,
         app_bound: false,
       },
-      artifacts: [artifact("terminal-clean")],
     }),
     OPTIONS,
   );
-  assert.equal(explicit.decision, "clean");
+  assert.equal(explicit.decision, "inconclusive");
   assert.equal(explicit.server_enforcement.status, "not-enforced");
 });
 
@@ -497,11 +587,14 @@ test("invalid potential targets preserve independent terminal evidence", () => {
   assert.equal(findings.decision, "findings");
   assert.equal(findings.provider_profile, "terminal-payload");
   assert.equal(findings.evidence_basis.kind, "terminal-findings");
+  assert.equal(
+    findings.evidence_basis.scope_assurance,
+    "artifact-publication-only",
+  );
   assert.equal(findings.status_target.sha, null);
 
-  const clean = reduceV2Snapshot(snapshot({
+  const clean = reduceV2Snapshot(snapshotWithBoundTerminalClean({
     review_epoch: invalidEpoch,
-    artifacts: [artifact("terminal-clean")],
   }), OPTIONS);
   assert.equal(clean.selection.status, "selected");
   assert.equal(clean.decision, "blocked-input");
@@ -549,34 +642,52 @@ test("accepts the sealed projector-shaped fixture with opaque transport identiti
   assert.doesNotThrow(() => assertV2ReducerOutput(report));
 });
 
-test("accepts a stable latest terminal clean payload", () => {
+test("retains a stable terminal clean payload as audit-only classification", () => {
   const report = reduceV2Snapshot(
-    snapshot({ artifacts: [artifact("terminal-clean")] }),
+    snapshotWithBoundTerminalClean(),
     OPTIONS,
   );
-  assert.equal(report.decision, "clean");
+  assert.equal(report.decision, "inconclusive");
   assert.equal(report.provider_profile, "terminal-payload");
   assert.equal(report.provider_input_lineage, "unavailable");
   assert.equal(report.evidence_basis.kind, "terminal-clean");
-  assert.equal(report.evidence_basis.scope_assurance, "whole-pr-contractual");
-  assert.deepEqual(report.evidence_basis.authority_receipt, {
-    selected_request: null,
-    selected_artifact: {
-      id: "2001",
-      url: "https://github.com/owner/repo/pull/7#issuecomment-2001",
-      created_at: "2026-08-13T12:10:00Z",
-    },
-    pagination_sha256: DIGEST,
-    final_reread_sha256: DIGEST,
-    recovery: null,
-    selected_generation: null,
-  });
+  assert.equal(report.evidence_basis.scope_assurance, "artifact-publication-only");
+  assert.equal(report.evidence_basis.artifact_id, "2001");
+  assert.equal(report.evidence_basis.authority_receipt.selected_request, null);
+  assert.equal(report.evidence_basis.authority_receipt.selected_generation, null);
+  assert.equal(report.evidence_basis.authority_receipt.recovery, null);
+});
+
+test("terminal clean classification rejects request-generation lineage", () => {
+  const report = reduceV2Snapshot(
+    snapshotWithBoundTerminalClean(),
+    OPTIONS,
+  );
+  const request = automaticRequest();
+  report.evidence_basis.authority_receipt.selected_request = {
+    id: request.id,
+    url: request.url,
+    created_at: request.created_at,
+  };
+  report.evidence_basis.authority_receipt.selected_generation = {
+    id: request.generation_id,
+    kind: request.generation_kind,
+    index: request.generation_index,
+  };
+
+  assert.throws(
+    () => assertV2ReducerOutput(report),
+    /terminal clean classification lineage must be null/u,
+  );
 });
 
 test("does not accept a terminal artifact bound to another head", () => {
   const report = reduceV2Snapshot(
-    snapshot({
-      artifacts: [artifact("terminal-clean", { commit_oid: "9".repeat(40) })],
+    snapshotWithBoundTerminalClean({
+      artifacts: [artifact("terminal-clean", {
+        request_id: "1001",
+        commit_oid: "9".repeat(40),
+      })],
     }),
     OPTIONS,
   );
@@ -585,19 +696,167 @@ test("does not accept a terminal artifact bound to another head", () => {
   assert.equal(report.evidence_basis, null);
 });
 
-test("keeps mixed reactions as audit evidence without shutting terminal clean", () => {
+test("same-head evidence from an earlier base cannot authorize the current review epoch",
+  async (context) => {
+    const priorBaseRequest = automaticRequest({ base_oid: "9".repeat(40) });
+    const currentManualRequest = manualRequest();
+    const laterPriorBaseManualRequest = manualRequest({
+      id: "1004",
+      base_oid: "9".repeat(40),
+      created_at: "2026-08-13T12:05:00Z",
+      updated_at: "2026-08-13T12:05:00Z",
+      generation_id: "manual:2",
+      generation_index: 2,
+    });
+    const cases = [
+      {
+        name: "terminal clean bound to an earlier-base request",
+        input: snapshot({
+          requests: [priorBaseRequest],
+          artifacts: [artifact("terminal-clean", {
+            request_id: priorBaseRequest.id,
+          })],
+          budget: {
+            automatic_requests_on_head: 1,
+            automatic_reservations_on_head: 1,
+          },
+        }),
+        decision: "inconclusive",
+        providerProfile: "terminal-payload",
+        basisKind: "terminal-clean",
+        selectedRequestId: priorBaseRequest.id,
+      },
+      {
+        name: "unbound terminal clean",
+        input: snapshot({
+          artifacts: [artifact("terminal-clean")],
+        }),
+        decision: "inconclusive",
+        providerProfile: "terminal-payload",
+        basisKind: "terminal-clean",
+      },
+      {
+        name: "unbound terminal clean cannot bypass a current request binding",
+        input: snapshot({
+          requests: [automaticRequest()],
+          artifacts: [artifact("terminal-clean")],
+          budget: {
+            automatic_requests_on_head: 1,
+            automatic_reservations_on_head: 1,
+          },
+        }),
+        decision: "inconclusive",
+        providerProfile: "terminal-payload",
+        basisKind: "terminal-clean",
+        selectedRequestId: "1001",
+      },
+      {
+        name: "plus-one bound to an earlier-base request",
+        input: snapshot({
+          requests: [priorBaseRequest],
+          acknowledgements: [acknowledgement("plus-one")],
+          budget: {
+            automatic_requests_on_head: 1,
+            automatic_reservations_on_head: 1,
+          },
+        }),
+        decision: "pending",
+        providerProfile: "unknown",
+      },
+      {
+        name: "no-start response bound to an earlier-base request",
+        input: snapshot({
+          requests: [priorBaseRequest],
+          no_start_observations: [noStart()],
+          budget: {
+            automatic_requests_on_head: 1,
+            automatic_reservations_on_head: 1,
+          },
+        }),
+        decision: "pending",
+        providerProfile: "unknown",
+      },
+      {
+        name: "base ABA cannot revive an older current-base request",
+        input: snapshot({
+          selection: { intent: "explicit" },
+          requests: [currentManualRequest, laterPriorBaseManualRequest],
+          acknowledgements: [acknowledgement("plus-one", {
+            request_id: currentManualRequest.id,
+          })],
+          budget: { manual_requests_in_epoch: 2 },
+        }),
+        decision: "pending",
+        providerProfile: "unknown",
+        selectedRequestId: laterPriorBaseManualRequest.id,
+      },
+      {
+        name: "durable base ABA cannot revive a request from an earlier incarnation",
+        input: snapshot({
+          requests: [automaticRequest({ current_incarnation: false })],
+          acknowledgements: [acknowledgement("plus-one")],
+          budget: {
+            automatic_requests_on_head: 1,
+            automatic_reservations_on_head: 1,
+          },
+        }),
+        decision: "pending",
+        providerProfile: "unknown",
+        selectedRequestId: "1001",
+      },
+    ];
+
+    for (const fixture of cases) {
+      await context.test(fixture.name, () => {
+        const report = reduceV2Snapshot(fixture.input, OPTIONS);
+        assert.equal(report.decision, fixture.decision);
+        assert.equal(report.provider_profile, fixture.providerProfile);
+        assert.equal(report.evidence_basis?.kind ?? null, fixture.basisKind ?? null);
+        if (fixture.selectedRequestId !== undefined) {
+          assert.equal(
+            report.request_policy.selected_request_id,
+            fixture.selectedRequestId,
+          );
+        }
+      });
+    }
+  });
+
+test("terminal clean classification remains outcome authority over a later current +1", () => {
   const report = reduceV2Snapshot(
     snapshot({
       requests: [automaticRequest()],
       artifacts: [artifact("terminal-clean")],
+      acknowledgements: [
+        acknowledgement("plus-one"),
+        acknowledgement("eyes", { created_at: "2026-08-13T12:16:00Z" }),
+      ],
+      budget: { automatic_requests_on_head: 1, automatic_reservations_on_head: 1 },
+    }),
+    OPTIONS,
+  );
+  assert.equal(report.decision, "inconclusive");
+  assert.equal(report.provider_profile, "mixed");
+  assert.equal(report.evidence_basis.kind, "terminal-clean");
+  assert.equal(report.evidence_basis.scope_assurance, "artifact-publication-only");
+  assert.equal(report.evidence_basis.authority_receipt.selected_request, null);
+});
+
+test("current-bound terminal clean remains classification-only over current +1", () => {
+  const report = reduceV2Snapshot(
+    snapshot({
+      requests: [automaticRequest()],
+      artifacts: [artifact("terminal-clean", { request_id: "1001" })],
       acknowledgements: [acknowledgement("plus-one")],
       budget: { automatic_requests_on_head: 1, automatic_reservations_on_head: 1 },
     }),
     OPTIONS,
   );
-  assert.equal(report.decision, "clean");
+  assert.equal(report.decision, "inconclusive");
   assert.equal(report.provider_profile, "mixed");
-  assert.match(report.evidence_basis.summary, /audit evidence/);
+  assert.equal(report.evidence_basis.kind, "terminal-clean");
+  assert.equal(report.evidence_basis.artifact_id, "2001");
+  assert.equal(report.evidence_basis.authority_receipt.selected_request, null);
 });
 
 test("equal-time terminal carriers conflict only across different channels", () => {
@@ -615,25 +874,29 @@ test("equal-time terminal carriers conflict only across different channels", () 
   );
   assert.equal(report.decision, "inconclusive");
   assert.equal(report.evidence_basis.kind, "malformed-evidence");
+  assert.equal(
+    report.evidence_basis.scope_assurance,
+    "artifact-publication-only",
+  );
 });
 
 test("same-channel equal-time terminals use kind precedence then positive id", () => {
   const latestClean = reduceV2Snapshot(
-    snapshot({
+    snapshotWithBoundTerminalClean({
       artifacts: [
-        artifact("terminal-clean"),
-        artifact("terminal-clean", { id: "2004" }),
+        artifact("terminal-clean", { request_id: "1001" }),
+        artifact("terminal-clean", { id: "2004", request_id: "1001" }),
       ],
     }),
     OPTIONS,
   );
-  assert.equal(latestClean.decision, "clean");
+  assert.equal(latestClean.decision, "inconclusive");
   assert.equal(latestClean.evidence_basis.artifact_id, "2004");
 
   const findingsWin = reduceV2Snapshot(
-    snapshot({
+    snapshotWithBoundTerminalClean({
       artifacts: [
-        artifact("terminal-clean"),
+        artifact("terminal-clean", { request_id: "1001" }),
         artifact("terminal-findings", { id: "2004" }),
       ],
     }),
@@ -643,9 +906,9 @@ test("same-channel equal-time terminals use kind precedence then positive id", (
   assert.equal(findingsWin.evidence_basis.artifact_id, "2004");
 
   const malformedWins = reduceV2Snapshot(
-    snapshot({
+    snapshotWithBoundTerminalClean({
       artifacts: [
-        artifact("terminal-clean"),
+        artifact("terminal-clean", { request_id: "1001" }),
         artifact("terminal-findings", { id: "2004" }),
         artifact("malformed", { id: "2005" }),
       ],
@@ -664,6 +927,10 @@ test("an unstable canonically selected terminal carrier is unknown, never malfor
     );
     assert.equal(report.decision, "inconclusive");
     assert.equal(report.evidence_basis.kind, "unknown-terminal");
+    assert.equal(
+      report.evidence_basis.scope_assurance,
+      "artifact-publication-only",
+    );
     assert.equal(report.evidence_basis.artifact_id, artifact(kind).id);
     assert.equal(
       report.evidence_basis.authority_receipt.selected_artifact.id,
@@ -673,20 +940,48 @@ test("an unstable canonically selected terminal carrier is unknown, never malfor
   }
 });
 
+test("artifact-publication-only evidence binds its exact selected artifact identity", () => {
+  const reports = [
+    reduceV2Snapshot(
+      snapshot({ artifacts: [artifact("malformed")] }),
+      OPTIONS,
+    ),
+    reduceV2Snapshot(
+      snapshot({ artifacts: [artifact("terminal-clean", { stable: false })] }),
+      OPTIONS,
+    ),
+  ];
+
+  for (const report of reports) {
+    assert.equal(
+      report.evidence_basis.scope_assurance,
+      "artifact-publication-only",
+    );
+    const forged = structuredClone(report);
+    forged.evidence_basis.artifact_id = null;
+    forged.evidence_basis.authority_receipt.selected_artifact = null;
+    assert.throws(
+      () => assertV2ReducerOutput(forged),
+      /must bind its exact selected artifact/u,
+    );
+  }
+});
+
 test("terminal stability is evaluated after canonical outcome selection", () => {
   const stableLatest = reduceV2Snapshot(
-    snapshot({
+    snapshotWithBoundTerminalClean({
       artifacts: [
         artifact("malformed", { stable: false }),
         artifact("terminal-clean", {
           id: "2003",
+          request_id: "1001",
           created_at: "2026-08-13T12:20:00Z",
         }),
       ],
     }),
     OPTIONS,
   );
-  assert.equal(stableLatest.decision, "clean");
+  assert.equal(stableLatest.decision, "inconclusive");
   assert.equal(stableLatest.evidence_basis.kind, "terminal-clean");
   assert.equal(stableLatest.evidence_basis.artifact_id, "2003");
 
@@ -721,7 +1016,7 @@ test("terminal stability is evaluated after canonical outcome selection", () => 
   assert.equal(stableMalformedWins.evidence_basis.artifact_id, "2005");
 });
 
-test("stable terminal clean survives request admission and budget anomalies", () => {
+test("terminal clean cannot bypass request admission and budget anomalies", () => {
   const unadmitted = automaticRequest({
     id: "1004",
     generation_id: "automatic:2",
@@ -738,22 +1033,21 @@ test("stable terminal clean survives request admission and budget anomalies", ()
     }),
     OPTIONS,
   );
-  assert.equal(unadmittedReport.decision, "clean");
+  assert.equal(unadmittedReport.decision, "inconclusive");
   assert.equal(unadmittedReport.request_policy.status, "unknown");
-  assert.equal(
-    unadmittedReport.evidence_basis.authority_receipt.selected_request,
-    null,
-  );
+  assert.equal(unadmittedReport.provider_profile, "terminal-payload");
+  assert.equal(unadmittedReport.evidence_basis.kind, "terminal-clean");
 
   const overLimitReport = reduceV2Snapshot(
-    snapshot({
-      artifacts: [artifact("terminal-clean")],
+    snapshotWithBoundTerminalClean({
       budget: { manual_requests_in_epoch: 65 },
     }),
     OPTIONS,
   );
-  assert.equal(overLimitReport.decision, "clean");
+  assert.equal(overLimitReport.decision, "inconclusive");
   assert.equal(overLimitReport.request_policy.status, "unknown");
+  assert.equal(overLimitReport.provider_profile, "terminal-payload");
+  assert.equal(overLimitReport.evidence_basis.kind, "terminal-clean");
   assert.match(overLimitReport.request_policy.reason, /64/u);
 });
 
@@ -822,14 +1116,10 @@ test("top-level finding recovery requires human closure, a new request, and late
     }),
     OPTIONS,
   );
-  assert.equal(clean.decision, "clean");
+  assert.equal(clean.decision, "findings");
   assert.equal(clean.provider_profile, "terminal-payload");
-  assert.deepEqual(clean.evidence_basis.authority_receipt.recovery, {
-    finding_ids: ["finding-1"],
-    closure_ids: ["3003"],
-    new_request_id: "1004",
-    completion_id: "2003",
-  });
+  assert.equal(clean.evidence_basis.kind, "terminal-findings");
+  assert.equal(clean.evidence_basis.authority_receipt.recovery, null);
 });
 
 test("finding recovery clean must bind the exact new selected request", () => {
@@ -875,6 +1165,312 @@ test("finding recovery clean must bind the exact new selected request", () => {
   }
 });
 
+test("closed historical findings can recover through an admitted new generation and later +1", () => {
+  const prior = automaticRequest();
+  const next = automaticRequest({
+    id: "1004",
+    created_at: "2026-08-13T12:20:00Z",
+    updated_at: "2026-08-13T12:20:00Z",
+    generation_id: "automatic:2",
+    generation_index: 2,
+  });
+  const input = snapshot({
+    requests: [prior, next],
+    artifacts: [artifact("terminal-findings", { request_id: prior.id })],
+    threads: [{
+      id: "top-level:2002:0",
+      finding_id: "finding-1",
+      kind: "top-level",
+      created_at: "2026-08-13T12:10:00Z",
+      is_resolved: false,
+      resolution_observed_at: null,
+      stable: true,
+    }],
+    acknowledgements: [
+      acknowledgement("addressed", { created_at: "2026-08-13T12:15:00Z" }),
+      acknowledgement("plus-one", {
+        request_id: next.id,
+        created_at: "2026-08-13T12:25:00Z",
+      }),
+    ],
+    budget: {
+      automatic_requests_on_head: 2,
+      automatic_reservations_on_head: 2,
+    },
+  });
+  const report = reduceV2Snapshot(input, OPTIONS);
+  assert.equal(report.decision, "clean");
+  assert.equal(report.provider_profile, "thumbs-up-clean");
+  assert.equal(report.evidence_basis.kind, "thumbs-up-clean");
+  assert.deepEqual(report.evidence_basis.authority_receipt.recovery, {
+    finding_ids: ["finding-1"],
+    closure_ids: ["3003"],
+    new_request_id: next.id,
+    completion_id: "3001",
+  });
+  assert.equal(report.request_policy.selected_request_id, next.id);
+  assert.doesNotThrow(() => assertV2ReducerOutput(report));
+
+  const unclosed = structuredClone(input);
+  unclosed.acknowledgements = unclosed.acknowledgements.filter(
+    ({ kind }) => kind !== "addressed",
+  );
+  assert.equal(reduceV2Snapshot(unclosed, OPTIONS).decision, "findings");
+
+  const currentGenerationFinding = structuredClone(input);
+  currentGenerationFinding.generation_admissions = [generationAdmission(prior, next)];
+  currentGenerationFinding.artifacts[0].request_id = next.id;
+  currentGenerationFinding.artifacts[0].created_at = "2026-08-13T12:21:00Z";
+  currentGenerationFinding.acknowledgements.find(
+    ({ kind }) => kind === "addressed",
+  ).created_at = "2026-08-13T12:22:00Z";
+  const currentFindingReport = reduceV2Snapshot(currentGenerationFinding, OPTIONS);
+  assert.equal(currentFindingReport.decision, "findings");
+  assert.equal(currentFindingReport.provider_profile, "mixed");
+
+  const oldBaseFinding = structuredClone(input);
+  oldBaseFinding.requests[0].base_oid = "9".repeat(40);
+  oldBaseFinding.requests[0].current_incarnation = false;
+  oldBaseFinding.generation_admissions = [generationAdmission(prior, next)];
+  const oldBaseReport = reduceV2Snapshot(oldBaseFinding, OPTIONS);
+  assert.equal(oldBaseReport.decision, "clean");
+  assert.equal(oldBaseReport.provider_profile, "thumbs-up-clean");
+  assert.deepEqual(
+    oldBaseReport.evidence_basis.authority_receipt.recovery,
+    report.evidence_basis.authority_receipt.recovery,
+  );
+
+  const foreignHeadFinding = structuredClone(input);
+  foreignHeadFinding.requests[0].head_oid = "8".repeat(40);
+  foreignHeadFinding.requests[0].current_incarnation = false;
+  foreignHeadFinding.generation_admissions = [generationAdmission(prior, next)];
+  assert.throws(
+    () => reduceV2Snapshot(foreignHeadFinding, OPTIONS),
+    /must bind two observed requests on the current head/u,
+  );
+});
+
+test("a superseded terminal clean does not block recovery of the canonically latest findings", () => {
+  const prior = automaticRequest();
+  const next = automaticRequest({
+    id: "1004",
+    created_at: "2026-08-13T12:20:00Z",
+    updated_at: "2026-08-13T12:20:00Z",
+    generation_id: "automatic:2",
+    generation_index: 2,
+  });
+  const input = snapshot({
+    requests: [prior, next],
+    artifacts: [
+      artifact("terminal-clean", {
+        request_id: prior.id,
+        created_at: "2026-08-13T12:05:00Z",
+      }),
+      artifact("terminal-findings", { request_id: prior.id }),
+    ],
+    threads: [{
+      id: "top-level:2002:0",
+      finding_id: "finding-1",
+      kind: "top-level",
+      created_at: "2026-08-13T12:10:00Z",
+      is_resolved: false,
+      resolution_observed_at: null,
+      stable: true,
+    }],
+    acknowledgements: [
+      acknowledgement("addressed", { created_at: "2026-08-13T12:15:00Z" }),
+      acknowledgement("plus-one", {
+        request_id: next.id,
+        created_at: "2026-08-13T12:25:00Z",
+      }),
+    ],
+    budget: {
+      automatic_requests_on_head: 2,
+      automatic_reservations_on_head: 2,
+    },
+  });
+  const report = reduceV2Snapshot(input, OPTIONS);
+
+  assert.equal(report.decision, "clean");
+  assert.equal(report.provider_profile, "thumbs-up-clean");
+  assert.equal(report.evidence_basis.kind, "thumbs-up-clean");
+  assert.equal(report.evidence_basis.authority_receipt.selected_artifact, null);
+  assert.deepEqual(report.evidence_basis.authority_receipt.recovery, {
+    finding_ids: ["finding-1"],
+    closure_ids: ["3003"],
+    new_request_id: next.id,
+    completion_id: "3001",
+  });
+
+  const equalTimeClean = structuredClone(input);
+  equalTimeClean.artifacts.find(
+    ({ kind }) => kind === "terminal-clean",
+  ).created_at = "2026-08-13T12:10:00Z";
+  assert.equal(reduceV2Snapshot(equalTimeClean, OPTIONS).decision, "findings");
+
+  const unstableEarlierClean = structuredClone(input);
+  unstableEarlierClean.artifacts.find(
+    ({ kind }) => kind === "terminal-clean",
+  ).stable = false;
+  const unstableEarlierReport = reduceV2Snapshot(unstableEarlierClean, OPTIONS);
+  assert.equal(unstableEarlierReport.request_policy.status, "compliant");
+  assert.equal(unstableEarlierReport.request_policy.selected_request_id, next.id);
+  assert.equal(unstableEarlierReport.decision, "findings");
+  assert.equal(unstableEarlierReport.evidence_basis.kind, "terminal-findings");
+  assert.equal(unstableEarlierReport.evidence_basis.authority_receipt.recovery, null);
+
+  const latestClean = structuredClone(input);
+  latestClean.artifacts.find(
+    ({ kind }) => kind === "terminal-clean",
+  ).created_at = "2026-08-13T12:11:00Z";
+  assert.equal(reduceV2Snapshot(latestClean, OPTIONS).decision, "findings");
+
+  const olderUnclosedFinding = structuredClone(input);
+  olderUnclosedFinding.artifacts.push(artifact("terminal-findings", {
+    id: "2004",
+    request_id: prior.id,
+    created_at: "2026-08-13T12:07:00Z",
+    finding_ids: ["finding-0"],
+  }));
+  olderUnclosedFinding.threads.push({
+    id: "top-level:2004:0",
+    finding_id: "finding-0",
+    kind: "top-level",
+    created_at: "2026-08-13T12:07:00Z",
+    is_resolved: false,
+    resolution_observed_at: null,
+    stable: true,
+  });
+  olderUnclosedFinding.generation_admissions = [generationAdmission(prior, next)];
+  const olderUnclosedReport = reduceV2Snapshot(olderUnclosedFinding, OPTIONS);
+  assert.equal(olderUnclosedReport.request_policy.status, "compliant");
+  assert.equal(olderUnclosedReport.request_policy.selected_request_id, next.id);
+  assert.equal(olderUnclosedReport.decision, "findings");
+  assert.equal(olderUnclosedReport.evidence_basis.artifact_id, "2004");
+
+  const latestCurrentFinding = structuredClone(input);
+  latestCurrentFinding.artifacts.push(artifact("terminal-findings", {
+    id: "2005",
+    request_id: next.id,
+    created_at: "2026-08-13T12:26:00Z",
+    finding_ids: ["finding-2"],
+  }));
+  latestCurrentFinding.threads.push({
+    id: "top-level:2005:0",
+    finding_id: "finding-2",
+    kind: "top-level",
+    created_at: "2026-08-13T12:26:00Z",
+    is_resolved: false,
+    resolution_observed_at: null,
+    stable: true,
+  });
+  const latestFindingReport = reduceV2Snapshot(latestCurrentFinding, OPTIONS);
+  assert.equal(latestFindingReport.decision, "findings");
+  assert.equal(latestFindingReport.evidence_basis.artifact_id, "2005");
+
+  const noClosure = structuredClone(input);
+  noClosure.acknowledgements = noClosure.acknowledgements.filter(
+    ({ kind }) => kind !== "addressed",
+  );
+  assert.equal(reduceV2Snapshot(noClosure, OPTIONS).decision, "findings");
+
+  const closureAtRequest = structuredClone(input);
+  closureAtRequest.acknowledgements.find(
+    ({ kind }) => kind === "addressed",
+  ).created_at = next.created_at;
+  closureAtRequest.generation_admissions = [generationAdmission(prior, next)];
+  const closureAtRequestReport = reduceV2Snapshot(closureAtRequest, OPTIONS);
+  assert.equal(closureAtRequestReport.request_policy.status, "compliant");
+  assert.equal(closureAtRequestReport.request_policy.selected_request_id, next.id);
+  assert.equal(closureAtRequestReport.decision, "findings");
+
+  const completionAtRequest = structuredClone(input);
+  completionAtRequest.acknowledgements.find(
+    ({ kind }) => kind === "plus-one",
+  ).created_at = next.created_at;
+  assert.equal(reduceV2Snapshot(completionAtRequest, OPTIONS).decision, "findings");
+
+  const terminalPrecedence = structuredClone(input);
+  terminalPrecedence.artifacts = [artifact("terminal-clean", {
+    request_id: next.id,
+    created_at: "2026-08-13T12:22:00Z",
+  })];
+  terminalPrecedence.threads = [];
+  terminalPrecedence.acknowledgements = terminalPrecedence.acknowledgements.filter(
+    ({ kind }) => kind === "plus-one",
+  );
+  terminalPrecedence.generation_admissions = [generationAdmission(prior, next)];
+  const terminalReport = reduceV2Snapshot(terminalPrecedence, OPTIONS);
+  assert.equal(terminalReport.decision, "inconclusive");
+  assert.equal(terminalReport.provider_profile, "mixed");
+  assert.equal(terminalReport.evidence_basis.kind, "terminal-clean");
+  assert.equal(terminalReport.evidence_basis.authority_receipt.recovery, null);
+});
+
+test("an admitted manual request can recover closed findings after automatic quota exhaustion", () => {
+  const prior = automaticRequest();
+  const manual = manualRequest({
+    created_at: "2026-08-13T12:20:00Z",
+    updated_at: "2026-08-13T12:20:00Z",
+  });
+  const input = snapshot({
+    selection: { intent: "explicit" },
+    requests: [prior, manual],
+    artifacts: [artifact("terminal-findings", { request_id: prior.id })],
+    threads: [{
+      id: "top-level:2002:0",
+      finding_id: "finding-1",
+      kind: "top-level",
+      created_at: "2026-08-13T12:10:00Z",
+      is_resolved: false,
+      resolution_observed_at: null,
+      stable: true,
+    }],
+    acknowledgements: [
+      acknowledgement("addressed", { created_at: "2026-08-13T12:15:00Z" }),
+      acknowledgement("plus-one", {
+        request_id: manual.id,
+        created_at: "2026-08-13T12:25:00Z",
+      }),
+    ],
+    budget: {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 3,
+      manual_requests_in_epoch: 1,
+    },
+  });
+
+  const report = reduceV2Snapshot(input, OPTIONS);
+  assert.equal(report.decision, "clean");
+  assert.equal(report.provider_profile, "thumbs-up-clean");
+  assert.equal(report.request_policy.generation_id, "manual:1");
+  assert.deepEqual(report.evidence_basis.authority_receipt.recovery, {
+    finding_ids: ["finding-1"],
+    closure_ids: ["3003"],
+    new_request_id: manual.id,
+    completion_id: "3001",
+  });
+
+  const unclosed = structuredClone(input);
+  unclosed.acknowledgements = unclosed.acknowledgements.filter(
+    ({ kind }) => kind !== "addressed",
+  );
+  assert.equal(reduceV2Snapshot(unclosed, OPTIONS).decision, "findings");
+
+  const wrongHeadRequest = structuredClone(input);
+  wrongHeadRequest.requests.find(({ kind }) => kind === "manual").head_oid =
+    "8".repeat(40);
+  wrongHeadRequest.requests.find(({ kind }) => kind === "manual").current_incarnation =
+    false;
+  assert.equal(reduceV2Snapshot(wrongHeadRequest, OPTIONS).decision, "findings");
+
+  const oldReaction = structuredClone(input);
+  oldReaction.acknowledgements.find(
+    ({ kind }) => kind === "plus-one",
+  ).created_at = "2026-08-13T12:19:59Z";
+  assert.equal(reduceV2Snapshot(oldReaction, OPTIONS).decision, "findings");
+});
+
 test("inline findings require a stable resolution observation followed by a new request", () => {
   const unresolved = reduceV2Snapshot(
     snapshot({
@@ -912,10 +1508,10 @@ test("inline findings require a stable resolution observation followed by a new 
     }),
     OPTIONS,
   );
-  assert.equal(clean.decision, "clean");
+  assert.equal(clean.decision, "findings");
 });
 
-test("accepts a unique controlled-request +1 and treats later eyes as liveness-only", () => {
+test("accepts a unique controlled-request +1 only while no equal-or-later eyes exists", () => {
   const input = snapshot({
     requests: [automaticRequest()],
     acknowledgements: [acknowledgement("plus-one")],
@@ -925,14 +1521,44 @@ test("accepts a unique controlled-request +1 and treats later eyes as liveness-o
   assert.equal(clean.decision, "clean");
   assert.equal(clean.provider_profile, "thumbs-up-clean");
 
+  const earlierEyes = reduceV2Snapshot(
+    snapshot({
+      requests: [automaticRequest()],
+      acknowledgements: [
+        acknowledgement("eyes", { created_at: "2026-08-13T12:14:00Z" }),
+        acknowledgement("plus-one"),
+      ],
+      budget: { automatic_requests_on_head: 1, automatic_reservations_on_head: 1 },
+    }),
+    OPTIONS,
+  );
+  assert.equal(earlierEyes.decision, "clean");
+  assert.equal(earlierEyes.provider_profile, "thumbs-up-clean");
+
   input.acknowledgements.push(
     acknowledgement("eyes", {
       created_at: "2026-08-13T12:16:00Z",
     }),
   );
-  const stillClean = reduceV2Snapshot(input, OPTIONS);
-  assert.equal(stillClean.decision, "clean");
-  assert.equal(stillClean.provider_profile, "thumbs-up-clean");
+  const laterEyes = reduceV2Snapshot(input, OPTIONS);
+  assert.equal(laterEyes.decision, "pending");
+  assert.equal(laterEyes.provider_profile, "unknown");
+  assert.equal(laterEyes.evidence_basis, null);
+
+  const equalTimeEyes = reduceV2Snapshot(
+    snapshot({
+      requests: [automaticRequest()],
+      acknowledgements: [
+        acknowledgement("plus-one"),
+        acknowledgement("eyes", { created_at: "2026-08-13T12:15:00Z" }),
+      ],
+      budget: { automatic_requests_on_head: 1, automatic_reservations_on_head: 1 },
+    }),
+    OPTIONS,
+  );
+  assert.equal(equalTimeEyes.decision, "pending");
+  assert.equal(equalTimeEyes.provider_profile, "unknown");
+  assert.equal(equalTimeEyes.evidence_basis, null);
 
   const sameSecond = reduceV2Snapshot(
     snapshot({
@@ -945,6 +1571,47 @@ test("accepts a unique controlled-request +1 and treats later eyes as liveness-o
     OPTIONS,
   );
   assert.equal(sameSecond.decision, "pending");
+});
+
+test("reaction-only clean rejects selected artifact lineage", () => {
+  const report = reduceV2Snapshot(
+    snapshot({
+      requests: [automaticRequest()],
+      acknowledgements: [acknowledgement("plus-one")],
+      budget: { automatic_requests_on_head: 1, automatic_reservations_on_head: 1 },
+    }),
+    OPTIONS,
+  );
+  report.evidence_basis.authority_receipt.selected_artifact = {
+    id: "3001",
+    url: "https://github.com/owner/repo/pull/7#issuecomment-3001",
+    created_at: "2026-08-13T12:15:00Z",
+  };
+
+  assert.throws(
+    () => assertV2ReducerOutput(report),
+    /reaction clean authority selected artifact must be null/u,
+  );
+});
+
+test("closed reducer output rejects mixed profile for reaction-only clean", () => {
+  const clean = reduceV2Snapshot(
+    snapshot({
+      requests: [automaticRequest()],
+      acknowledgements: [acknowledgement("plus-one")],
+      budget: { automatic_requests_on_head: 1, automatic_reservations_on_head: 1 },
+    }),
+    OPTIONS,
+  );
+  assert.equal(clean.decision, "clean");
+  assert.equal(clean.provider_profile, "thumbs-up-clean");
+
+  const forged = structuredClone(clean);
+  forged.provider_profile = "mixed";
+  assert.throws(
+    () => assertV2ReducerOutput(forged),
+    /clean.*provider profile|provider profile.*evidence basis/u,
+  );
 });
 
 test("an automatic generation after the first requires a proved finding-closure chain", () => {
@@ -970,6 +1637,142 @@ test("an automatic generation after the first requires a proved finding-closure 
   assert.equal(report.request_policy.status, "unknown");
   assert.equal(report.request_policy.selected_request_id, "1001");
   assert.equal(report.request_policy.generation_id, "automatic:1");
+});
+
+test("durable recovery admission retains a retargeted generation without restoring positive evidence", () => {
+  const prior = automaticRequest({ base_oid: "9".repeat(40) });
+  const next = automaticRequest({
+    id: "1003",
+    base_oid: "9".repeat(40),
+    created_at: "2026-08-13T12:05:00Z",
+    updated_at: "2026-08-13T12:05:00Z",
+    generation_id: "automatic:2",
+    generation_index: 2,
+  });
+  const admitted = snapshot({
+    requests: [prior, next],
+    acknowledgements: [acknowledgement("plus-one", {
+      request_id: next.id,
+      created_at: "2026-08-13T12:10:00Z",
+    })],
+    generation_admissions: [generationAdmission(prior, next)],
+    budget: {
+      automatic_requests_on_head: 2,
+      automatic_reservations_on_head: 2,
+    },
+  });
+  assert.doesNotThrow(() => assertV2ReducerInput(admitted));
+
+  const report = reduceV2Snapshot(admitted, OPTIONS);
+  assert.equal(report.decision, "pending");
+  assert.equal(report.request_policy.status, "compliant");
+  assert.equal(report.request_policy.selected_request_id, next.id);
+  assert.equal(report.request_policy.generation_id, "automatic:2");
+  assert.equal(report.provider_profile, "unknown");
+  assert.equal(report.evidence_basis, null);
+
+  for (const transitionServerTime of [
+    "2026-08-13T11:59:00Z",
+    "2026-08-13T12:00:00Z",
+  ]) {
+    const nonCausal = structuredClone(admitted);
+    nonCausal.generation_admissions[0].transition_server_time = transitionServerTime;
+    const rejected = reduceV2Snapshot(nonCausal, OPTIONS);
+    assert.equal(rejected.decision, "pending", transitionServerTime);
+    assert.equal(rejected.request_policy.status, "unknown", transitionServerTime);
+    assert.equal(rejected.request_policy.selected_request_id, prior.id, transitionServerTime);
+    assert.equal(rejected.request_policy.generation_id, prior.generation_id, transitionServerTime);
+  }
+  for (const transitionServerTime of [
+    "2026-08-13T12:05:00Z",
+    "2026-08-13T12:06:00Z",
+  ]) {
+    const nonCausal = structuredClone(admitted);
+    nonCausal.generation_admissions[0].transition_server_time = transitionServerTime;
+    assert.throws(
+      () => reduceV2Snapshot(nonCausal, OPTIONS),
+      /transition must strictly precede its next request/u,
+      transitionServerTime,
+    );
+  }
+
+  const malformed = [
+    (value) => {
+      value.generation_admissions[0].unexpected = true;
+    },
+    (value) => {
+      value.generation_admissions[0].head_oid = "8".repeat(40);
+    },
+    (value) => {
+      value.generation_admissions[0].next_request_id = "9999";
+    },
+    (value) => {
+      value.generation_admissions[0].ledger_order.recovery_transition_index = 12;
+    },
+    (value) => {
+      value.generation_admissions[0].recovery_transition_payload_digest = "sha256:tampered";
+    },
+    (value) => {
+      value.generation_admissions[0].prior_generation_id = "automatic:2";
+      value.generation_admissions[0].next_generation_id = "automatic:3";
+    },
+  ];
+  for (const mutate of malformed) {
+    const value = structuredClone(admitted);
+    mutate(value);
+    assert.throws(() => assertV2ReducerInput(value));
+  }
+});
+
+test("one durable recovery transition cannot authorize two generation advances", () => {
+  const first = automaticRequest();
+  const second = automaticRequest({
+    id: "1003",
+    created_at: "2026-08-13T12:05:00Z",
+    updated_at: "2026-08-13T12:05:00Z",
+    generation_id: "automatic:2",
+    generation_index: 2,
+  });
+  const third = automaticRequest({
+    id: "1004",
+    created_at: "2026-08-13T12:10:00Z",
+    updated_at: "2026-08-13T12:10:00Z",
+    generation_id: "automatic:3",
+    generation_index: 3,
+  });
+  const firstAdmission = generationAdmission(first, second);
+  const secondAdmission = generationAdmission(second, third, {
+    prior_request_binding_record_oid: firstAdmission.next_request_binding_record_oid,
+    recovery_transition_record_oid: "4".repeat(40),
+    recovery_transition_payload_digest: `sha256:${"4".repeat(64)}`,
+    next_request_binding_record_oid: "5".repeat(40),
+    next_request_binding_payload_digest: `sha256:${"5".repeat(64)}`,
+    transition_server_time: "2026-08-13T12:09:00Z",
+    ledger_order: {
+      prior_request_binding_index: 12,
+      recovery_transition_index: 13,
+      next_request_binding_index: 14,
+    },
+  });
+  const distinctTransitions = snapshot({
+    requests: [first, second, third],
+    generation_admissions: [firstAdmission, secondAdmission],
+    budget: {
+      automatic_requests_on_head: 3,
+      automatic_reservations_on_head: 3,
+    },
+  });
+  assert.doesNotThrow(() => assertV2ReducerInput(distinctTransitions));
+
+  const reusedTransition = structuredClone(distinctTransitions);
+  reusedTransition.generation_admissions[1].recovery_transition_record_oid =
+    firstAdmission.recovery_transition_record_oid;
+  reusedTransition.generation_admissions[1].recovery_transition_payload_digest =
+    firstAdmission.recovery_transition_payload_digest;
+  assert.throws(
+    () => assertV2ReducerInput(reusedTransition),
+    /repeats a durable generation admission identity/u,
+  );
 });
 
 test("every extra request generation removes request-bound reaction authority", () => {
@@ -1079,13 +1882,9 @@ test("same-head base retarget does not refund or hide an earlier generation", ()
     })],
     budget: { automatic_requests_on_head: 2, automatic_reservations_on_head: 2 },
   }), OPTIONS);
-  assert.equal(report.decision, "clean");
+  assert.equal(report.decision, "findings");
   assert.equal(report.request_policy.generation_id, "automatic:2");
-  assert.deepEqual(report.evidence_basis.authority_receipt.selected_generation, {
-    id: "automatic:2",
-    kind: "automatic",
-    index: 2,
-  });
+  assert.equal(report.evidence_basis.authority_receipt.selected_generation, null);
 });
 
 test("manual +1 exposes only the accepted weak permission assurances", () => {
@@ -1175,6 +1974,89 @@ test("recognizes only either exact no-start body after an independent 15-minute 
   assert.equal(carrierBeforeRequest.decision, "pending");
 });
 
+test("no-start is blocked only by current-request provider activity in its causal window", () => {
+  const prior = automaticRequest({
+    base_oid: "9".repeat(40),
+    current_incarnation: false,
+  });
+  const current = automaticRequest({
+    id: "1004",
+    created_at: "2026-08-13T12:20:00Z",
+    updated_at: "2026-08-13T12:20:00Z",
+    generation_id: "automatic:2",
+    generation_index: 2,
+  });
+  const currentNoStart = noStart({
+    request_id: current.id,
+    carrier_created_at: "2026-08-13T12:20:30Z",
+    first_seen_at: "2026-08-13T12:21:00Z",
+    confirmed_at: "2026-08-13T12:36:00Z",
+  });
+  const baseInput = snapshot({
+    requests: [prior, current],
+    generation_admissions: [generationAdmission(prior, current)],
+    no_start_observations: [currentNoStart],
+    budget: {
+      automatic_requests_on_head: 2,
+      automatic_reservations_on_head: 2,
+    },
+  });
+
+  const staleIncarnationActivity = structuredClone(baseInput);
+  staleIncarnationActivity.acknowledgements = [
+    acknowledgement("plus-one", {
+      request_id: prior.id,
+      created_at: "2026-08-13T12:15:00Z",
+    }),
+    acknowledgement("eyes", {
+      request_id: prior.id,
+      created_at: "2026-08-13T12:16:00Z",
+    }),
+  ];
+  const staleReport = reduceV2Snapshot(staleIncarnationActivity, OPTIONS);
+  assert.equal(staleReport.decision, "skipped-unavailable");
+  assert.equal(staleReport.provider_profile, "no-start-rejection");
+  assert.equal(staleReport.request_policy.selected_request_id, current.id);
+
+  const earlyCurrentActivity = structuredClone(baseInput);
+  earlyCurrentActivity.acknowledgements = [
+    acknowledgement("plus-one", {
+      request_id: current.id,
+      created_at: "2026-08-13T12:19:00Z",
+    }),
+    acknowledgement("eyes", {
+      request_id: current.id,
+      created_at: "2026-08-13T12:19:30Z",
+    }),
+  ];
+  assert.equal(
+    reduceV2Snapshot(earlyCurrentActivity, OPTIONS).decision,
+    "skipped-unavailable",
+  );
+
+  for (const createdAt of [
+    "2026-08-13T12:20:00Z",
+    "2026-08-13T12:21:00Z",
+  ]) {
+    const currentActivity = structuredClone(baseInput);
+    currentActivity.acknowledgements = [acknowledgement("eyes", {
+      request_id: current.id,
+      created_at: createdAt,
+    })];
+    const blocked = reduceV2Snapshot(currentActivity, OPTIONS);
+    assert.equal(blocked.decision, "pending", createdAt);
+    assert.equal(blocked.provider_profile, "unknown", createdAt);
+    assert.equal(blocked.evidence_basis, null, createdAt);
+  }
+
+  const terminal = structuredClone(staleIncarnationActivity);
+  terminal.artifacts = [artifact("terminal-clean", { request_id: current.id })];
+  const terminalReport = reduceV2Snapshot(terminal, OPTIONS);
+  assert.equal(terminalReport.decision, "inconclusive");
+  assert.equal(terminalReport.provider_profile, "mixed");
+  assert.equal(terminalReport.evidence_basis.kind, "terminal-clean");
+});
+
 test("turns an exact no-start rejection into an explicit configuration block", () => {
   const report = reduceV2Snapshot(
     snapshot({
@@ -1262,4 +2144,8 @@ test("fails closed on incomplete pagination, unstable scope, and malformed artif
   );
   assert.equal(malformed.decision, "inconclusive");
   assert.equal(malformed.evidence_basis.kind, "malformed-evidence");
+  assert.equal(
+    malformed.evidence_basis.scope_assurance,
+    "artifact-publication-only",
+  );
 });

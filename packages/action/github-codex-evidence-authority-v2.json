@@ -346,14 +346,14 @@
     },
     "clean": {
       "provider_profile": "terminal-payload",
-      "decision": "clean",
-      "scope_assurance": "whole-pr-contractual",
+      "decision": "inconclusive",
+      "scope_assurance": "artifact-publication-only",
       "provider_input_lineage": "unavailable"
     },
     "findings": {
       "provider_profile": "terminal-payload",
       "decision": "findings",
-      "scope_assurance": "whole-pr-contractual",
+      "scope_assurance": "artifact-publication-only",
       "provider_input_lineage": "unavailable"
     },
     "mixed": {
@@ -361,7 +361,7 @@
       "terminal_payload_controls_decision": true,
       "reaction_evidence_role": "audit-only",
       "plus_one_never_overrides_terminal_findings": true,
-      "scope_assurance": "whole-pr-contractual",
+      "scope_assurance": "artifact-publication-only",
       "provider_input_lineage": "unavailable"
     }
   },
@@ -378,7 +378,8 @@
     "historical_profile_required": false,
     "historical_samples_required": 0,
     "eyes_is_liveness_only": true,
-    "eyes_never_vetoes_accepted_plus_one": true,
+    "eyes_at_or_after_selected_plus_one_vetoes_reaction_only_clean": true,
+    "eyes_never_vetoes_terminal_payload": true,
     "terminal_payload_precedence": true,
     "scope_assurance": "whole-pr-contractual",
     "provider_input_lineage": "unavailable"
@@ -456,12 +457,12 @@
   },
   "finding_recovery_contract": {
     "applies_when_prior_applicable_finding_exists": true,
-    "ordinary_terminal_clean_without_prior_finding_requires_request_binding": false,
+    "terminal_clean_can_supply_positive_completion": false,
     "required_sequence": [
       "finding",
       "proved-closure",
       "new-request-generation",
-      "later-clean"
+      "later-current-request-reaction"
     ],
     "inline_closure": {
       "authority": "final-direct-graphql-thread-read",
@@ -496,7 +497,6 @@
     },
     "later_clean": {
       "accepted_kinds": [
-        "terminal-clean",
         "current-request-reaction"
       ],
       "must_bind_new_request_generation": true,
@@ -1059,7 +1059,7 @@
       ],
       "kind_outcome_relation": {
         "terminal-payload": [
-          "clean",
+          "inconclusive",
           "findings"
         ],
         "current-request-reaction": [
@@ -1079,8 +1079,7 @@
           "inconclusive"
         ],
         "stable-input-blocker": [
-          "blocked-input",
-          "blocked-configuration"
+          "blocked-input"
         ]
       },
       "kind_profile_relation": {
@@ -1156,8 +1155,17 @@
       ],
       "kind_selected_object_relation": {
         "terminal-payload": {
-          "selected_request": "optional",
-          "selected_artifact": "required"
+          "selected_request_by_outcome": {
+            "inconclusive": null,
+            "findings": "optional"
+          },
+          "request_server_time_by_outcome": {
+            "inconclusive": null,
+            "findings": "optional"
+          },
+          "selected_artifact": "required",
+          "finding_recovery": null,
+          "authority_receipt_recovery": null
         },
         "current-request-reaction": {
           "selected_request": "required",
@@ -1195,12 +1203,15 @@
         "finding_url_repository_and_pull_request_equal_review_epoch": true,
         "current_request_reaction_selected_url_equals_selected_request_url": true
       },
-      "whole_pr_kind_values": [
+      "artifact_publication_kind_values": [
         "terminal-payload",
+        "malformed-terminal",
+        "unknown-terminal"
+      ],
+      "artifact_publication_scope_assurance": "artifact-publication-only",
+      "whole_pr_kind_values": [
         "current-request-reaction",
         "stable-exact-no-start",
-        "malformed-terminal",
-        "unknown-terminal",
         "stable-evidence-blocker",
         "stable-input-blocker"
       ],
@@ -1299,7 +1310,7 @@
           "later_clean_id": "canonical-decimal-string"
         },
         "all_time_fields_type": "strict-utc-server-time",
-        "terminal_clean_requires_selected_artifact_bound_to_new_request_generation": true,
+        "terminal_clean_cannot_supply_finding_recovery": true,
         "current_request_reaction_requires_selected_request_and_no_selected_artifact": true,
         "later_clean_server_time_field": "later_clean_server_time",
         "later_clean_server_time_strictly_after_new_request": true
@@ -1349,7 +1360,7 @@
         "selection_selected": true,
         "selection_modes": ["implicit", "explicit"],
         "provider_profiles": ["terminal-payload", "mixed"],
-        "decisions": ["clean"],
+        "decisions": ["inconclusive"],
         "basis_kinds": ["terminal-payload"],
         "request_policy_statuses": ["compliant", "warning", "unknown"]
       },
@@ -1385,6 +1396,7 @@
         "decisions": ["inconclusive"],
         "basis_kinds": [
           null,
+          "terminal-payload",
           "malformed-terminal",
           "unknown-terminal",
           "stable-evidence-blocker"

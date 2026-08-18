@@ -240,6 +240,63 @@ test("projects a manual exact request and its stable exact-provider +1", () => {
   }]);
 });
 
+test("ignores a durably bound request comment from an earlier head", () => {
+  const oldHead = "9".repeat(40);
+  const requestComment = issueComment("301", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T12:00:10.000Z",
+    updated_at: "2026-08-13T12:00:10.000Z",
+  });
+  const oldPlusOne = reaction("401", "+1", "2026-08-13T12:00:30.000Z");
+  const reactions = reactionInventory(
+    [requestComment],
+    new Map([[requestComment.id, [oldPlusOne]]]),
+  );
+  const discovery = snapshot({ issueComments: [requestComment], reactions });
+  const controller = makeController({
+    requestBindings: [{
+      id: requestComment.id,
+      kind: "automatic",
+      base_oid: BASE,
+      head_oid: oldHead,
+      current_incarnation: false,
+      controlled: true,
+    }],
+  });
+
+  const evidenceRequest = deriveV2EvidenceRequest({
+    discovery_snapshot: discovery,
+    controller,
+  });
+  assert.deepEqual(evidenceRequest, {
+    artifactSelectors: [],
+    permissionSubjects: [],
+  });
+
+  const evidence = snapshot({
+    issueComments: [requestComment],
+    reactions,
+    serverTime: "2026-08-13T12:01:00.000Z",
+  });
+  const projected = projectV2TransportSnapshots({
+    discovery_snapshot: discovery,
+    evidence_snapshot: evidence,
+    controller,
+  });
+  assert.deepEqual(projected.requests, []);
+  assert.deepEqual(projected.acknowledgements, []);
+
+  assert.throws(
+    () => deriveV2EvidenceRequest({
+      discovery_snapshot: discovery,
+      controller: makeController(),
+    }),
+    (error) => error instanceof V2ProjectorError &&
+      error.code === "REQUEST_BINDING_MISSING",
+  );
+});
+
 test("v2 reactions require the exact bracketed Bot identity", () => {
   const requestComment = issueComment("301", {
     body: "@codex review",
@@ -532,6 +589,132 @@ test("one exact write-authorized address command closes one aggregate top-level 
     stable: true,
   }]);
 });
+
+test("ignores an exact authorized address command for an authenticated earlier-head carrier", () => {
+  const earlierHead = "9".repeat(40);
+  const finding = issueComment("202", {
+    body:
+      "### 💡 Codex Review\n\n" +
+      `- [P1] Earlier-head finding https://github.com/owner/repo/blob/${earlierHead}/src/a.js#L1`,
+    author: BOT,
+    app: codexApp(),
+    created_at: "2026-08-13T12:00:10.000Z",
+    updated_at: "2026-08-13T12:00:10.000Z",
+  });
+  const address = issueComment("303", {
+    body: `/codex-gate addressed ${finding.html_url}`,
+    author: HUMAN,
+    created_at: "2026-08-13T12:00:30.000Z",
+    updated_at: "2026-08-13T12:00:30.000Z",
+  });
+  const snapshotInput = { issueComments: [finding, address] };
+  const discovery = snapshot(snapshotInput);
+  const evidence = snapshot({
+    ...snapshotInput,
+    exactArtifacts: [
+      exact("issue_comment", finding),
+      exact("issue_comment", address),
+    ],
+    actorPermissions: [actorPermission(address.id, address.author)],
+    serverTime: "2026-08-13T12:01:00.000Z",
+  });
+
+  const projected = projectV2TransportSnapshots({
+    discovery_snapshot: discovery,
+    evidence_snapshot: evidence,
+    controller: makeController(),
+  });
+
+  assert.deepEqual(projected.artifacts, []);
+  assert.deepEqual(projected.threads, []);
+  assert.deepEqual(projected.acknowledgements, []);
+});
+
+test("historical address filtering preserves fail-closed target binding",
+  async (context) => {
+    const projectAddressFixture = ({ finding = null, review = null, targetUrl }) => {
+      const address = issueComment("303", {
+        body: `/codex-gate addressed ${targetUrl}`,
+        author: HUMAN,
+        created_at: "2026-08-13T12:00:30.000Z",
+        updated_at: "2026-08-13T12:00:30.000Z",
+      });
+      const issueComments = [finding, address].filter((item) => item !== null);
+      const reviews = review === null ? [] : [review];
+      const discovery = snapshot({ issueComments, reviews });
+      const evidence = snapshot({
+        issueComments,
+        reviews,
+        exactArtifacts: [
+          ...issueComments.map((item) => exact("issue_comment", item)),
+          ...reviews.map((item) => exact("pull_request_review", item)),
+        ],
+        actorPermissions: [actorPermission(address.id, address.author)],
+        serverTime: "2026-08-13T12:01:00.000Z",
+      });
+      return () => projectV2TransportSnapshots({
+        discovery_snapshot: discovery,
+        evidence_snapshot: evidence,
+        controller: makeController(),
+      });
+    };
+
+    await context.test("absent current-head target", () => {
+      assert.throws(
+        projectAddressFixture({
+          targetUrl:
+            "https://github.com/owner/repo/pull/7#issuecomment-202",
+        }),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "ADDRESS_COMMAND_TARGET_INVALID",
+      );
+    });
+
+    await context.test("wrong historical carrier URL", () => {
+      const earlierHead = "9".repeat(40);
+      const finding = issueComment("202", {
+        body:
+          "### 💡 Codex Review\n\n" +
+          `- [P1] Earlier-head finding https://github.com/owner/repo/blob/${earlierHead}/src/a.js#L1`,
+        author: BOT,
+        app: codexApp(),
+      });
+      assert.throws(
+        projectAddressFixture({
+          finding,
+          targetUrl:
+            "https://github.com/owner/repo/pull/7#issuecomment-999",
+        }),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "ADDRESS_COMMAND_TARGET_INVALID",
+      );
+    });
+
+    await context.test("ambiguous current-head carrier identity", () => {
+      const body =
+        "### 💡 Codex Review\n\n" +
+        `- [P1] Current finding https://github.com/owner/repo/blob/${HEAD}/src/a.js#L1`;
+      const finding = issueComment("202", {
+        body,
+        author: BOT,
+        app: codexApp(),
+      });
+      const review = terminalReview("202", {
+        body,
+        state: "COMMENTED",
+        commit_id: HEAD,
+      });
+      assert.throws(
+        projectAddressFixture({
+          finding,
+          review,
+          targetUrl: finding.html_url,
+        }),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "TOP_LEVEL_CARRIER_AMBIGUOUS",
+      );
+    });
+  });
 
 test("projects nullable, conflicting, and stale potential-merge facts as blocked input", () => {
   for (const scopeOverrides of [
@@ -844,6 +1027,124 @@ test("provider service activity at or after the request vetoes no-start", () => 
   }
 });
 
+test("provider reaction on an earlier request does not veto current no-start", () => {
+  const prior = issueComment("300", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T12:00:00.000Z",
+    updated_at: "2026-08-13T12:00:00.000Z",
+  });
+  const current = issueComment("301", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T12:05:00.000Z",
+    updated_at: "2026-08-13T12:05:00.000Z",
+  });
+  const noStart = issueComment("401", {
+    body: V2_NO_START_BODIES[0],
+    author: BOT,
+    app: codexApp(),
+    created_at: "2026-08-13T12:05:30.000Z",
+    updated_at: "2026-08-13T12:05:30.000Z",
+  });
+  const priorPlusOne = reaction("501", "+1", "2026-08-13T12:10:00.000Z");
+  const reactions = reactionInventory(
+    [prior, current, noStart],
+    new Map([[prior.id, [priorPlusOne]]]),
+  );
+  const admission = controllerGenerationAdmission(prior, current);
+  const controller = makeController({
+    requestBindings: [
+      {
+        id: prior.id,
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        current_incarnation: false,
+        controlled: true,
+      },
+      {
+        id: current.id,
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        controlled: true,
+      },
+    ],
+    generationAdmissions: [admission],
+    budget: {
+      automatic_requests_on_head: 2,
+      automatic_reservations_on_head: 2,
+      manual_requests_in_epoch: 0,
+    },
+  });
+  controller.no_start_observations = [{
+    request_id: current.id,
+    carrier_selector: { kind: "issue_comment", id: noStart.id },
+    first_seen_at: "2026-08-13T12:11:00.000Z",
+    first_run_id: "1",
+    confirmation_run_id: "2",
+    request_run_id: "0",
+  }];
+  const discovery = snapshot({
+    issueComments: [prior, current, noStart],
+    reactions,
+    serverTime: "2026-08-13T12:11:00.000Z",
+  });
+  const evidence = snapshot({
+    issueComments: [prior, current, noStart],
+    reactions,
+    exactArtifacts: [
+      exact("issue_comment", prior),
+      exact("issue_comment", current),
+      exact("issue_comment", noStart),
+    ],
+    serverTime: "2026-08-13T12:26:00.000Z",
+  });
+
+  const projected = projectV2TransportSnapshots({
+    discovery_snapshot: discovery,
+    evidence_snapshot: evidence,
+    controller,
+  });
+  assert.equal(projected.no_start_observations.length, 1);
+  assert.equal(projected.no_start_observations[0].request_id, current.id);
+  assert.equal(reduceV2Snapshot(projected, {
+    status_target_mode: "test-merge-with-head-sentinel",
+    status_context: "codex/github-review-gate",
+  }).decision, "skipped-unavailable");
+
+  for (const [id, content, createdAt] of [
+    ["502", "+1", current.created_at],
+    ["503", "eyes", "2026-08-13T12:10:00.000Z"],
+  ]) {
+    const currentReaction = reaction(id, content, createdAt);
+    const currentReactions = reactionInventory(
+      [prior, current, noStart],
+      new Map([[current.id, [currentReaction]]]),
+    );
+    const vetoed = projectV2TransportSnapshots({
+      discovery_snapshot: snapshot({
+        issueComments: [prior, current, noStart],
+        reactions: currentReactions,
+        serverTime: "2026-08-13T12:11:00.000Z",
+      }),
+      evidence_snapshot: snapshot({
+        issueComments: [prior, current, noStart],
+        reactions: currentReactions,
+        exactArtifacts: [
+          exact("issue_comment", prior),
+          exact("issue_comment", current),
+          exact("issue_comment", noStart),
+        ],
+        serverTime: "2026-08-13T12:26:00.000Z",
+      }),
+      controller,
+    });
+    assert.deepEqual(vetoed.no_start_observations, []);
+  }
+});
+
 test("service evidence rejects a non-exact provider App", () => {
   assert.throws(
     () => projectNoStartWithServiceRun({
@@ -1098,8 +1399,15 @@ test("automatic recovery accepts one exact addressed top-level finding and emits
     assertSafeAutomaticRecoveryProof(proof);
   });
 
-test("automatic recovery advances an exactly admitted second generation to generation three",
+test("automatic recovery advances an earlier-base second generation after a same-head retarget",
   async () => {
+    const retargetedBase = "9".repeat(40);
+    const retargetedMergeBase = "8".repeat(40);
+    const retargetedScope = {
+      base_ref_tip: retargetedBase,
+      merge_base_sha: retargetedMergeBase,
+      ordered_parent_oids: [retargetedBase, HEAD],
+    };
     const firstRequest = issueComment("301", {
       body: "@codex review",
       author: HUMAN,
@@ -1185,6 +1493,7 @@ test("automatic recovery advances an exactly admitted second generation to gener
     });
     const discovery = snapshot({
       issueComments,
+      scopeOverrides: retargetedScope,
       serverTime: "2026-08-13T12:05:00.000Z",
     });
     const evidence = snapshot({
@@ -1195,6 +1504,7 @@ test("automatic recovery advances an exactly admitted second generation to gener
         actorPermission(firstAddress.id, firstAddress.author),
         actorPermission(secondAddress.id, secondAddress.author),
       ],
+      scopeOverrides: retargetedScope,
       serverTime: "2026-08-13T12:20:00.000Z",
     });
     const projected = projectV2TransportSnapshots({
@@ -1221,8 +1531,12 @@ test("automatic recovery advances an exactly admitted second generation to gener
     });
 
     assert.equal(report.request_policy.status, "compliant");
+    assert.equal(report.request_policy.selected_request_id, secondRequest.id);
+    assert.equal(controller.request_bindings[1].base_oid, BASE);
     assert.equal(proof.prior_generation_id, "automatic:2");
     assert.equal(proof.next_generation_id, "automatic:3");
+    assert.equal(proof.scope.base_oid, retargetedBase);
+    assert.equal(proof.scope.merge_base_oid, retargetedMergeBase);
     assert.deepEqual(proof.closure_ids, [secondAddress.id]);
     assertSafeAutomaticRecoveryProof(proof);
     const secondGenerationInput = runnerInput(evidence, controller);
@@ -1266,6 +1580,7 @@ test("automatic recovery advances an exactly admitted second generation to gener
       const poisonedComments = [...issueComments, artifact];
       const poisonedDiscovery = snapshot({
         issueComments: poisonedComments,
+        scopeOverrides: retargetedScope,
         serverTime: "2026-08-13T12:05:00.000Z",
       });
       const poisonedEvidence = snapshot({
@@ -1276,6 +1591,7 @@ test("automatic recovery advances an exactly admitted second generation to gener
           actorPermission(firstAddress.id, firstAddress.author),
           actorPermission(secondAddress.id, secondAddress.author),
         ],
+        scopeOverrides: retargetedScope,
         serverTime: "2026-08-13T12:20:00.000Z",
       });
       const poisonedProjected = projectV2TransportSnapshots({
@@ -1283,6 +1599,11 @@ test("automatic recovery advances an exactly admitted second generation to gener
         evidence_snapshot: poisonedEvidence,
         controller,
       });
+      assert.equal(poisonedProjected.review_epoch.base_oid, retargetedBase);
+      assert.equal(
+        poisonedProjected.review_epoch.merge_base_oid,
+        retargetedMergeBase,
+      );
       const poisonedReport = reduceV2Snapshot(poisonedProjected, {
         status_target_mode: "test-merge-with-head-sentinel",
         status_context: "codex/github-review-gate",
@@ -1908,7 +2229,88 @@ test("inline evidence requires exact provider identity on its parent review", ()
   );
 });
 
-test("machine E2E reduces a raw terminal clean without evaluate-only effects", async () => {
+test("projects durable same-head recovery admission across base retarget without positive evidence", () => {
+  const prior = issueComment("201", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T12:00:00.000Z",
+    updated_at: "2026-08-13T12:00:00.000Z",
+  });
+  const next = issueComment("203", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T12:05:00.000Z",
+    updated_at: "2026-08-13T12:05:00.000Z",
+  });
+  const discovery = snapshot({ issueComments: [prior, next] });
+  const evidence = snapshot({
+    issueComments: [prior, next],
+    exactArtifacts: [
+      exact("issue_comment", prior),
+      exact("issue_comment", next),
+    ],
+    serverTime: "2026-08-13T12:06:00.000Z",
+  });
+  const admission = controllerGenerationAdmission(prior, next);
+  const controller = makeController({
+    requestBindings: [
+      {
+        id: prior.id,
+        kind: "automatic",
+        base_oid: "9".repeat(40),
+        head_oid: HEAD,
+        controlled: true,
+      },
+      {
+        id: next.id,
+        kind: "automatic",
+        base_oid: "9".repeat(40),
+        head_oid: HEAD,
+        controlled: true,
+      },
+    ],
+    generationAdmissions: [admission],
+    budget: {
+      automatic_requests_on_head: 2,
+      automatic_reservations_on_head: 2,
+      manual_requests_in_epoch: 0,
+    },
+  });
+  const projected = projectV2TransportSnapshots({
+    discovery_snapshot: discovery,
+    evidence_snapshot: evidence,
+    controller,
+  });
+  assert.deepEqual(projected.generation_admissions, [admission]);
+
+  const report = reduceV2Snapshot(projected, {
+    status_target_mode: "test-merge-with-head-sentinel",
+    status_context: "codex/github-review-gate",
+  });
+  assert.equal(report.decision, "pending");
+  assert.equal(report.request_policy.status, "compliant");
+  assert.equal(report.request_policy.selected_request_id, next.id);
+  assert.equal(report.request_policy.generation_id, "automatic:2");
+  assert.equal(report.provider_profile, "unknown");
+  assert.equal(report.evidence_basis, null);
+
+  for (const transitionServerTime of [prior.created_at, next.created_at]) {
+    const invalid = structuredClone(controller);
+    invalid.generation_admissions[0].transition_server_time =
+      transitionServerTime;
+    assert.throws(
+      () => projectV2TransportSnapshots({
+        discovery_snapshot: discovery,
+        evidence_snapshot: evidence,
+        controller: invalid,
+      }),
+      (error) => error instanceof V2ProjectorError &&
+        error.code === "GENERATION_ADMISSION_LINEAGE_INVALID",
+    );
+  }
+});
+
+test("machine E2E keeps a raw unbound terminal clean non-authoritative", async () => {
   const clean = issueComment("202", {
     body: CLEAN_BODY,
     author: BOT,
@@ -1929,18 +2331,446 @@ test("machine E2E reduces a raw terminal clean without evaluate-only effects", a
 
   assert.equal(result.reducer_report.provider_profile, "terminal-payload");
   assert.equal(result.reducer_report.evidence_basis.kind, "terminal-clean");
+  assert.equal(
+    result.reducer_report.evidence_basis.scope_assurance,
+    "artifact-publication-only",
+  );
+  assert.equal(result.decision, "inconclusive");
+  assert.deepEqual(result.scheduler_plan.actions, []);
+  assert.deepEqual(result.status_plan.writes, []);
+  assert.equal(result.writes_performed, false);
+});
+
+test("machine E2E reduces a current-request-bound raw terminal clean without effects", async () => {
+  const request = issueComment("201", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T11:59:00.000Z",
+    updated_at: "2026-08-13T11:59:00.000Z",
+  });
+  const clean = issueComment("202", {
+    body: CLEAN_BODY,
+    author: BOT,
+    app: codexApp(),
+  });
+  const discovery = snapshot({ issueComments: [request, clean] });
+  const cleanExact = exact("issue_comment", clean);
+  const evidence = snapshot({
+    issueComments: [request, clean],
+    exactArtifacts: [
+      exact("issue_comment", request),
+      cleanExact,
+    ],
+    serverTime: "2026-08-13T12:01:00.000Z",
+  });
+  const controller = makeController({
+    requestBindings: [{
+      id: request.id,
+      kind: "automatic",
+      base_oid: BASE,
+      head_oid: HEAD,
+      controlled: true,
+    }],
+    artifactBindings: [richArtifactBinding(
+      "issue_comment",
+      clean,
+      cleanExact,
+      request.id,
+    )],
+    budget: {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 1,
+      manual_requests_in_epoch: 0,
+    },
+  });
+  const transport = sequentialTransport(discovery, evidence);
+
+  const result = await runV2Operation(
+    runnerInput(evidence, controller),
+    { transport, reduceSnapshot: reduceV2Snapshot },
+  );
+
+  assert.equal(result.reducer_report.provider_profile, "terminal-payload");
+  assert.equal(result.reducer_report.evidence_basis.kind, "terminal-clean");
   assert.equal(result.report.provider_profile, "terminal-payload");
   assert.equal(result.report.evidence_basis.kind, "terminal-payload");
   assert.equal(result.report.selection.source, "active-ruleset");
-  assert.equal(result.decision, "clean");
+  assert.equal(result.reducer_report.evidence_basis.authority_receipt.selected_request, null);
+  assert.equal(result.reducer_report.evidence_basis.authority_receipt.selected_generation, null);
+  assert.equal(result.reducer_report.evidence_basis.authority_receipt.recovery, null);
+  assert.equal(result.report.evidence_basis.scope_assurance, "artifact-publication-only");
+  assert.equal(result.decision, "inconclusive");
   assert.deepEqual(result.scheduler_plan.actions, []);
   assert.deepEqual(result.status_plan.writes, []);
   assert.equal(result.status_plan.suppression_reason, "evaluate-only");
-  assert.equal(result.status_plan.suppressed_writes.length, 1);
+  assert.equal(result.status_plan.suppressed_writes.length, 2);
+  assert.equal(
+    result.status_plan.suppressed_writes.every(({ state }) => state === "error"),
+    true,
+  );
+  assert.equal(result.status_plan.terminal_cutover, false);
   assert.equal(result.writes_performed, false);
   assert.deepEqual(transport.calls[1].artifactSelectors, [
+    { kind: "issue_comment", id: "201" },
     { kind: "issue_comment", id: "202" },
   ]);
+});
+
+test("machine E2E rejects raw terminal clean without current positive authority",
+  async (context) => {
+    const cases = [{
+      name: "current request without artifact binding",
+      requestBaseOid: BASE,
+      bindingKind: "none",
+    }, {
+      name: "current request with legacy two-field artifact binding",
+      requestBaseOid: BASE,
+      bindingKind: "legacy",
+    }, {
+      name: "rich artifact bound to an earlier-base request",
+      requestBaseOid: "9".repeat(40),
+      bindingKind: "rich",
+    }];
+
+    for (const fixture of cases) {
+      await context.test(fixture.name, async () => {
+        const request = issueComment("201", {
+          body: "@codex review",
+          author: HUMAN,
+          created_at: "2026-08-13T11:59:00.000Z",
+          updated_at: "2026-08-13T11:59:00.000Z",
+        });
+        const clean = issueComment("202", {
+          body: CLEAN_BODY,
+          author: BOT,
+          app: codexApp(),
+        });
+        const discovery = snapshot({ issueComments: [request, clean] });
+        const cleanExact = exact("issue_comment", clean);
+        const evidence = snapshot({
+          issueComments: [request, clean],
+          exactArtifacts: [
+            exact("issue_comment", request),
+            cleanExact,
+          ],
+          serverTime: "2026-08-13T12:01:00.000Z",
+        });
+        const controller = makeController({
+          requestBindings: [{
+            id: request.id,
+            kind: "automatic",
+            base_oid: fixture.requestBaseOid,
+            head_oid: HEAD,
+            controlled: true,
+          }],
+          artifactBindings: fixture.bindingKind === "none"
+            ? []
+            : fixture.bindingKind === "legacy"
+              ? [{ id: clean.id, request_id: request.id }]
+              : [richArtifactBinding(
+                  "issue_comment",
+                  clean,
+                  cleanExact,
+                  request.id,
+                )],
+          budget: {
+            automatic_requests_on_head: 1,
+            automatic_reservations_on_head: 1,
+            manual_requests_in_epoch: 0,
+          },
+        });
+        const transport = sequentialTransport(discovery, evidence);
+
+        const result = await runV2Operation(
+          runnerInput(evidence, controller),
+          { transport, reduceSnapshot: reduceV2Snapshot },
+        );
+
+        assert.equal(
+          result.reducer_report.request_policy.selected_request_id,
+          request.id,
+        );
+        assert.equal(result.reducer_report.provider_profile, "terminal-payload");
+        assert.equal(result.reducer_report.evidence_basis.kind, "terminal-clean");
+        assert.equal(
+          result.reducer_report.evidence_basis.scope_assurance,
+          "artifact-publication-only",
+        );
+        assert.equal(
+          result.reducer_report.evidence_basis.authority_receipt.selected_request,
+          null,
+        );
+        assert.equal(result.report.provider_profile, "terminal-payload");
+        assert.equal(result.report.evidence_basis.kind, "terminal-payload");
+        assert.equal(result.report.evidence_basis.scope_assurance,
+          "artifact-publication-only");
+        assert.equal(result.decision, "inconclusive");
+        assert.deepEqual(result.scheduler_plan.actions, []);
+        assert.deepEqual(result.status_plan.writes, []);
+        assert.equal(result.writes_performed, false);
+      });
+    }
+  });
+
+test("terminal-clean rich artifact binding rejects every closed commitment drift",
+  async (context) => {
+    const request = issueComment("201", {
+      body: "@codex review",
+      author: HUMAN,
+      created_at: "2026-08-13T11:59:00.000Z",
+      updated_at: "2026-08-13T11:59:00.000Z",
+    });
+    const clean = issueComment("202", {
+      body: CLEAN_BODY,
+      author: BOT,
+      app: codexApp(),
+      created_at: "2026-08-13T12:00:20.000Z",
+      updated_at: "2026-08-13T12:00:20.000Z",
+    });
+    const cleanExact = exact("issue_comment", clean);
+    const discovery = snapshot({ issueComments: [request, clean] });
+    const evidence = snapshot({
+      issueComments: [request, clean],
+      exactArtifacts: [
+        exact("issue_comment", request),
+        cleanExact,
+      ],
+      serverTime: "2026-08-13T12:01:00.000Z",
+    });
+    const baseBinding = richArtifactBinding(
+      "issue_comment",
+      clean,
+      cleanExact,
+      request.id,
+    );
+    assert.equal(baseBinding.generation_id, "automatic:1");
+    assert.equal(baseBinding.request_node_id, request.node_id);
+    const cases = [{
+      name: "selector kind",
+      mutate(binding) { binding.artifact_selector.kind = "pull_request_review"; },
+    }, {
+      name: "selector and top-level id",
+      mutate(binding) {
+        binding.id = "203";
+        binding.artifact_selector.id = "203";
+      },
+    }, {
+      name: "artifact type",
+      mutate(binding) { binding.artifact_type = "pull_request_review"; },
+    }, {
+      name: "artifact node id",
+      mutate(binding) { binding.artifact_node_id = "IC_edited"; },
+    }, {
+      name: "artifact URL",
+      mutate(binding) {
+        binding.artifact_url =
+          "https://github.com/owner/repo/pull/7#issuecomment-999";
+      },
+    }, {
+      name: "artifact created time",
+      mutate(binding) {
+        binding.artifact_created_at = "2026-08-13T12:00:21.000Z";
+      },
+    }, {
+      name: "raw body digest",
+      mutate(binding) {
+        binding.raw_body_sha256 = `sha256:${"1".repeat(64)}`;
+      },
+    }, {
+      name: "actor",
+      mutate(binding) { binding.actor.node_id = "BOT_edited"; },
+    }, {
+      name: "App",
+      mutate(binding) { binding.app.node_id = "APP_edited"; },
+    }, {
+      name: "request id",
+      mutate(binding) { binding.request_id = "999"; },
+    }, {
+      name: "generation id",
+      changedField: "generation_id",
+      mutate(binding) { binding.generation_id = "automatic:2"; },
+    }, {
+      name: "request node id",
+      changedField: "request_node_id",
+      mutate(binding) { binding.request_node_id = "IC_edited"; },
+    }];
+
+    for (const fixture of cases) {
+      await context.test(fixture.name, () => {
+        const binding = structuredClone(baseBinding);
+        fixture.mutate(binding);
+        if (fixture.changedField !== undefined) {
+          assert.notEqual(
+            binding[fixture.changedField],
+            baseBinding[fixture.changedField],
+          );
+          const restored = structuredClone(binding);
+          restored[fixture.changedField] = baseBinding[fixture.changedField];
+          assert.deepEqual(restored, baseBinding);
+        }
+        assert.throws(
+          () => projectV2TransportSnapshots({
+            discovery_snapshot: discovery,
+            evidence_snapshot: evidence,
+            controller: makeController({
+              requestBindings: [{
+                id: request.id,
+                kind: "automatic",
+                base_oid: BASE,
+                head_oid: HEAD,
+                controlled: true,
+              }],
+              artifactBindings: [binding],
+              budget: {
+                automatic_requests_on_head: 1,
+                automatic_reservations_on_head: 1,
+                manual_requests_in_epoch: 0,
+              },
+            }),
+          }),
+          (error) => error instanceof V2ProjectorError &&
+            error.code === "ARTIFACT_BINDING_RECEIPT_MISMATCH",
+        );
+      });
+    }
+  });
+
+test("terminal-clean durable binding rejects edited, deleted, and wrong-provider carriers",
+  async (context) => {
+    const request = issueComment("201", {
+      body: "@codex review",
+      author: HUMAN,
+      created_at: "2026-08-13T11:59:00.000Z",
+      updated_at: "2026-08-13T11:59:00.000Z",
+    });
+    const original = issueComment("202", {
+      body: CLEAN_BODY,
+      author: BOT,
+      app: codexApp(),
+      created_at: "2026-08-13T12:00:20.000Z",
+      updated_at: "2026-08-13T12:00:20.000Z",
+    });
+    const originalExact = exact("issue_comment", original);
+    const binding = richArtifactBinding(
+      "issue_comment",
+      original,
+      originalExact,
+      request.id,
+    );
+    const controller = makeController({
+      requestBindings: [{
+        id: request.id,
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        controlled: true,
+      }],
+      artifactBindings: [binding],
+      budget: {
+        automatic_requests_on_head: 1,
+        automatic_reservations_on_head: 1,
+        manual_requests_in_epoch: 0,
+      },
+    });
+    const cases = [{
+      name: "stable carrier was edited after the durable receipt",
+      carrier: {
+        ...structuredClone(original),
+        body: CLEAN_BODY.replace(
+          "Didn't find any major issues.",
+          "Didn't find any major issues. Chef's kiss.",
+        ),
+      },
+      rawBodySha256: `sha256:${"2".repeat(64)}`,
+    }, {
+      name: "carrier was deleted",
+      carrier: null,
+      rawBodySha256: null,
+    }, {
+      name: "carrier no longer has the exact provider",
+      carrier: {
+        ...structuredClone(original),
+        author: HUMAN,
+        app: null,
+      },
+      rawBodySha256: DIGEST,
+    }];
+
+    for (const fixture of cases) {
+      await context.test(fixture.name, () => {
+        const issueComments = fixture.carrier === null
+          ? [request]
+          : [request, fixture.carrier];
+        const exactArtifacts = [exact("issue_comment", request)];
+        if (fixture.carrier !== null) {
+          const receipt = exact("issue_comment", fixture.carrier);
+          receipt.raw_body_sha256 = fixture.rawBodySha256;
+          exactArtifacts.push(receipt);
+        }
+        const discovery = snapshot({ issueComments });
+        const evidence = snapshot({
+          issueComments,
+          exactArtifacts,
+          serverTime: "2026-08-13T12:01:00.000Z",
+        });
+        assert.throws(
+          () => projectV2TransportSnapshots({
+            discovery_snapshot: discovery,
+            evidence_snapshot: evidence,
+            controller,
+          }),
+          (error) => error instanceof V2ProjectorError &&
+            error.code === "ARTIFACT_BINDING_RECEIPT_MISMATCH",
+        );
+      });
+    }
+  });
+
+test("machine E2E rejects a same-head +1 bound to an earlier base", async () => {
+  const request = issueComment("301", {
+    body: "@codex review",
+    author: HUMAN,
+    created_at: "2026-08-13T12:00:10.000Z",
+    updated_at: "2026-08-13T12:00:10.000Z",
+  });
+  const plusOne = reaction("401", "+1", "2026-08-13T12:00:30.000Z");
+  const reactions = reactionInventory([request], new Map([[request.id, [plusOne]]]));
+  const discovery = snapshot({ issueComments: [request], reactions });
+  const evidence = snapshot({
+    issueComments: [request],
+    reactions,
+    exactArtifacts: [exact("issue_comment", request)],
+    serverTime: "2026-08-13T12:01:00.000Z",
+  });
+  const controller = makeController({
+    requestBindings: [{
+      id: request.id,
+      kind: "automatic",
+      base_oid: "9".repeat(40),
+      head_oid: HEAD,
+      controlled: true,
+    }],
+    budget: {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 1,
+      manual_requests_in_epoch: 0,
+    },
+  });
+  const transport = sequentialTransport(discovery, evidence);
+
+  const result = await runV2Operation(
+    runnerInput(evidence, controller),
+    { transport, reduceSnapshot: reduceV2Snapshot },
+  );
+
+  assert.equal(result.reducer_report.request_policy.status, "compliant");
+  assert.equal(result.reducer_report.request_policy.selected_request_id, request.id);
+  assert.equal(result.reducer_report.provider_profile, "unknown");
+  assert.equal(result.reducer_report.evidence_basis, null);
+  assert.equal(result.decision, "pending");
+  assert.deepEqual(result.scheduler_plan.actions, []);
+  assert.deepEqual(result.status_plan.writes, []);
+  assert.equal(result.writes_performed, false);
 });
 
 test("machine E2E reduces a raw manual request plus exact-provider +1 as clean", async () => {
@@ -2193,6 +3023,7 @@ function scopeReceiptWithEndpointEvidence(receipt) {
 
 function makeController({
   requestBindings = [],
+  generationAdmissions = [],
   artifactBindings = [],
   budget = {
     automatic_requests_on_head: 0,
@@ -2227,8 +3058,10 @@ function makeController({
       generation_id: `${binding.kind}:${index + 1}`,
       generation_kind: binding.kind,
       generation_index: index + 1,
+      current_incarnation: true,
       ...binding,
     })),
+    generation_admissions: generationAdmissions,
     artifact_bindings: artifactBindings,
     thread_resolution_observations: [],
     no_start_observations: [],
@@ -2236,6 +3069,28 @@ function makeController({
       required: true,
       assurance: "two-complete-point-in-time-snapshots",
     },
+  };
+}
+
+function controllerGenerationAdmission(priorRequest, nextRequest, overrides = {}) {
+  return {
+    prior_generation_id: "automatic:1",
+    next_generation_id: "automatic:2",
+    prior_request_id: priorRequest.id,
+    next_request_id: nextRequest.id,
+    head_oid: HEAD,
+    prior_request_binding_record_oid: "1".repeat(40),
+    recovery_transition_record_oid: "2".repeat(40),
+    recovery_transition_payload_digest: `sha256:${"2".repeat(64)}`,
+    next_request_binding_record_oid: "3".repeat(40),
+    next_request_binding_payload_digest: `sha256:${"3".repeat(64)}`,
+    transition_server_time: "2026-08-13T12:04:00.000Z",
+    ledger_order: {
+      prior_request_binding_index: 10,
+      recovery_transition_index: 11,
+      next_request_binding_index: 12,
+    },
+    ...overrides,
   };
 }
 
@@ -2414,7 +3269,12 @@ function inlineAutomaticRecoveryFixture({
   const evidence = snapshot({
     ...snapshotInput,
     exactArtifacts: [
-      ...issueComments.map((item) => exact("issue_comment", item)),
+      ...issueComments
+        .filter((item) =>
+          item.body !== "@codex review" ||
+          controller.request_bindings.find((binding) => binding.id === item.id)
+            ?.head_oid === (scopeOverrides.head_ref_oid ?? HEAD))
+        .map((item) => exact("issue_comment", item)),
       exact("pull_request_review", parent),
       ...inlineComments.map((item) => exact("inline_comment", item)),
     ],
@@ -2708,6 +3568,25 @@ function exact(kind, artifact) {
     artifact: structuredClone(artifact),
     response_server_time: "2026-08-13T12:00:40.000Z",
     raw_body_sha256: DIGEST,
+  };
+}
+
+function richArtifactBinding(kind, artifact, exactReceipt, requestId) {
+  return {
+    id: artifact.id,
+    request_id: requestId,
+    generation_id: "automatic:1",
+    request_node_id: `IC_${requestId}`,
+    artifact_selector: { kind, id: artifact.id },
+    artifact_node_id: artifact.node_id,
+    artifact_url: artifact.html_url,
+    artifact_type: kind,
+    artifact_created_at: kind === "pull_request_review"
+      ? artifact.submitted_at
+      : artifact.created_at,
+    raw_body_sha256: exactReceipt.raw_body_sha256,
+    actor: structuredClone(artifact.author),
+    app: structuredClone(artifact.app),
   };
 }
 

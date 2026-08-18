@@ -166,13 +166,20 @@ Key precedence rules are:
    evidence, or exhausted request authority is `inconclusive`.
 6. A confirmed no-start response is `skipped-unavailable` only for implicit
    selection; an explicitly requested route is blocked instead.
-7. `clean` requires complete stable evidence and an admitted terminal clean or
-   accepted closed reaction basis.
+7. `clean` requires complete stable evidence and an accepted closed reaction
+   basis. A terminal clean classifies the provider artifact but is not positive
+   completion authority.
 8. Otherwise the selected current epoch remains `pending`.
 
 Positive completion is deliberately stricter than negative evidence. A
 finding may block from a trustworthy carrier even when unrelated acquisition
 is incomplete; clean never arises from a partial snapshot.
+
+Reaction-only clean selects the unique latest eligible request and its exact
+provider `+1`. An exact-provider `eyes` reaction at the same or a later
+semantic time vetoes that reaction-only result; an earlier `eyes` reaction does
+not. Reactions never override a selected terminal payload, including in the
+`mixed` profile.
 
 ## Review epoch and status targets
 
@@ -180,10 +187,127 @@ One v2 review epoch binds repository and PR identity plus exact base, head,
 merge base, and ordered potential-merge data. Lifecycle must remain open.
 Initial and final scope projections must match before positive completion.
 
+Request quotas and automatic generation continuity remain head-scoped across a
+base retarget, so an older generation is never hidden or refunded. Positive
+`+1` and no-start authority are narrower: they must bind the latest admitted
+head generation, and that request must also match the current base and head.
+An earlier-base request can therefore support the next recovery generation or
+retain negative finding history, but it cannot authorize the current review
+epoch after the test-merge input changes. A stable current-head terminal clean
+may still classify the published artifact, but no accepted provider schema
+binds that carrier to a request, run, or input base.
+
+Durable controller history is partitioned deliberately. Only
+`automatic-request-reservation` intents and `review-request`,
+`request-binding`, `artifact-binding`, and `scheduler-state` responses survive
+a same-PR, same-head base or potential-merge retarget. Status and sentinel
+bindings, no-start and thread-resolution observations, and control/sticky
+comment bindings remain exact-current and are read only from the current
+incarnation: the exact-scope suffix after the latest durable same-head record
+from another base or potential merge. This prevents an A-to-B-to-A retarget
+from reviving A's earlier scheduler, status, sentinel, no-start, or comment
+authority. Retained earlier-base history preserves budget, generation,
+retry-zero, recovery, and negative-finding continuity, but cannot become
+current positive authority. An automatic reservation defines its generation
+origin. Its later review-request and request-binding records reference that
+origin even when a same-head retarget moves the request operation into a new
+exact scope; a manual request binding defines its own generation because it has
+no reservation. Artifact-binding and scheduler-state records likewise
+reference an existing origin and never redefine it from their current
+operation scope.
+
+Partial transactions obey the same split. A head-scoped reservation that has
+not reached its retry-zero attempt remains charged after a retarget, while the
+recovered attempt and request binding must bind the new exact scope and its
+scheduler observation. An unanswered artifact-binding intent is exact-current
+and current-incarnation: an intent from an old scope, or from an earlier visit
+to the same exact tuple separated by a durable foreign-scope record, is
+quarantined rather than compared with or replayed as the current candidate.
+The stable incarnation anchor is the latest durable same-head foreign-scope
+record; it participates in the effect identity, while a crash or lease change
+inside one incarnation resumes the same transaction.
+
+The control-plane audit receipt is schema version 2. Its serialized validator
+also accepts the exact closed legacy version-1 shape for audit compatibility,
+but deserialization never recreates the process-local authority handle. Version
+2 marks request bindings with `current_incarnation`, requires the true markers
+to form one ledger suffix, and joins each current binding to its exact current
+generation. A visible request comment from an earlier head must still have a
+durable audit binding, but it is excluded from exact selectors, projected
+requests, and reactions. A visible current-head request without a binding fails
+closed.
+
+The legacy version-1 receipt retains its original request-binding ceiling of
+three automatic plus sixty-four manual bindings. Sticky schema-version-1
+projections recognize the exact historical `terminal-clean`,
+`terminal-findings`, `malformed-evidence`, and `unresolved-inline-finding`
+whole-PR scope profiles for audit and continuation compatibility only; current
+snapshots still require their current scope assurance.
+
+An address command that uniquely targets an exact-refetched, closed-provider
+finding carrier excluded solely because it belongs to an earlier head is
+historical and is ignored. Unknown targets, non-canonical or misbound URLs,
+ambiguous carriers, and invalid current-head targets still fail closed. Likewise,
+provider reactions from an earlier incarnation or before the selected current
+request do not suppress a valid current no-start result. Only exact-provider
+activity bound to that selected request at or after its request time is a
+no-start disqualifier.
+
+Serialized receipts retain record OIDs, payload digests, response times, and
+other audit pointers. The generic projector surface exposes only fields that
+the closed receipt can independently join or that the branded live-ledger path
+authorizes; it deliberately omits source-row pointers that a deserialized
+manifest digest cannot independently revalidate. Closed generation admissions
+are the exception only where the receipt proves the prior-binding,
+recovery-transition, and next-binding order and identities together.
+
+Control-comment create/update history alone is not prior runner scheduling
+state. The first scheduler observation after such a comment-only predecessor
+still requires the same-load initial runner authority; after that observation
+and its status transaction, later scheduling requires established authority.
+
+A stable, final-reread current-head terminal clean is classification-only. It
+produces `inconclusive` with a `terminal-payload` (or `mixed`) profile and an
+exact `artifact-publication-only` artifact basis. Its selected request,
+generation, and recovery fields remain null, and a reaction cannot override the
+terminal classification. The runner exposes no terminal-clean binding
+candidate, the ledger admits no new terminal-clean completion transaction, and
+the projector never manufactures request lineage for such a carrier. Exact
+rich carrier commitments remain useful for findings and audit integrity, while
+legacy two-field bindings remain findings-only.
+
+Conversely, a completing current-request reaction binds its selected request
+and has no selected artifact. A non-null finding-recovery receipt is valid only
+on that reaction basis. Stable input blockers map only to `blocked-input`; they
+cannot manufacture `blocked-configuration`.
+
+Finding recovery remains stricter: after the prior finding is proved closed and
+a causally later current request generation is admitted, only a later reaction
+on that current request may complete clean. A terminal-clean carrier cannot
+supply or replace this recovery step. The completing request may be a manual
+generation when automatic quota is exhausted; automatic-to-automatic recovery
+still requires the strictly increasing closed generation chain.
+
+The ledger candidate-authority compatibility boundary therefore remains
+findings-only: schema version 1 retains its original byte and digest identity
+for `finding-recovery` / `findings` in automatic generations 1 and 2, and no
+version may turn an unauthenticated terminal clean into completion authority.
+Any historical terminal-clean-shaped record is audit-only and cannot be
+continued or projected as positive evidence. The closed parser may recognize
+its bytes, but durable replay rejects the terminal-clean binding purpose before
+any scheduler or generation lineage could authorize it.
+
+The pre-activation B boundary still makes production effects unreachable.
+Local proof composes the real runner, protected ledger transactions, fresh
+control-plane receipt, projector, reducer, and controller ordering without
+inventing a positive terminal-clean route. It is not activation evidence.
+
 The primary terminal policy targets the test-merge commit. Where required, the
 controller also writes a head sentinel so a stale or mismatched merge result
 cannot silently satisfy a head-only rule. Target choice is a closed scheduler
-mode, not a consumer-defined SHA.
+mode, not a consumer-defined SHA. When no potential merge is validated,
+`not-selected` and configuration-blocked results retain a null primary target;
+they do not substitute the head commit for a missing test-merge target.
 
 Commit Status remains keyed by repository SHA and context. It is not a
 cryptographic attestation, provider artefact, or PR-isolation proof. V2 relies
@@ -230,17 +354,26 @@ protocol.
 For review requests:
 
 1. reserve the scheduler request;
-2. persist the retry-zero intent;
+2. complete the exact safe pre-scope read;
 3. persist the pre-effect attempt;
-4. perform exactly one request POST;
-5. bind the exact 201 response;
-6. rebuild/reduce the subsequent snapshot;
-7. publish only controller-authorised status and sticky effects.
+4. persist the retry-zero request intent;
+5. perform exactly one request POST;
+6. bind the exact 201 response;
+7. rebuild/reduce the subsequent snapshot;
+8. publish only controller-authorised status and sticky effects.
 
 An attempted effect with an ambiguous response is never reclaimed or replayed.
-Later invocations may reuse an already bound response but cannot create a
-second effect for the same idempotency key. Status and sticky effects follow
-the same reserve, persist, perform, and bind discipline.
+A pre-scope read failure leaves neither a pre-effect attempt nor a retry-zero
+request intent, and remains retryable without claiming that a POST happened.
+Later invocations may reuse an already bound response but cannot create a second
+effect for the same idempotency key. Status and sticky effects follow the same
+reserve, persist, perform, and bind discipline.
+
+The trusted server-time chain is ordered as `pre-scope <= pre-effect attempt <=
+retry-zero request intent <= request created_at <= POST response <= exact
+refetch <= post-scope`. The request-intent boundary therefore proves
+write-ahead persistence before the public POST; it must not be misused as a
+lower bound on the earlier pre-scope observation.
 
 This provides durable causal ordering, not distributed atomicity. If
 persistence or response binding cannot be proved, the controller stops closed

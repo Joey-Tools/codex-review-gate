@@ -245,6 +245,7 @@ export function projectV2AutomaticRequestRecoveryAuthority({
     selectedRequest,
     reducerInput: reducer_input,
     evidenceSnapshot: evidence_snapshot,
+    controller,
   })) {
     return null;
   }
@@ -848,6 +849,9 @@ function projectEvidenceBasis({
     evidenceSnapshot,
     selected,
   });
+  const terminalCleanClassification = compactBasis.kind === "terminal-clean";
+  const reactionClean = compactBasis.kind === "thumbs-up-clean";
+  const projectedRecovery = terminalCleanClassification ? null : recovery;
   const accepted = [
     "terminal-payload",
     "current-request-reaction",
@@ -873,7 +877,7 @@ function projectEvidenceBasis({
           ? null
           : reducerInput.requests.find((request) => request.id === requestPolicy.request_id)
             ?.created_at ?? null
-        : recovery?.new_request_server_time ?? null,
+        : projectedRecovery?.new_request_server_time ?? null,
       selected: selected.map((item) => ({
         id: item.id,
         server_time: item.created_at,
@@ -885,19 +889,19 @@ function projectEvidenceBasis({
       reducerInput.inventories.acknowledgements &&
       reducerInput.inventories.no_start,
     final_reread_complete: reducerInput.complete,
-    scope_assurance: "whole-pr-contractual",
+    scope_assurance: compactBasis.scope_assurance,
     provider_input_lineage: "unavailable",
-    finding_recovery: recovery,
+    finding_recovery: projectedRecovery,
     authority_receipt: {
-      selected_request: authority.selected_request === null
+      selected_request: terminalCleanClassification || authority.selected_request === null
         ? null
         : publicSelectedObject(authority.selected_request),
-      selected_artifact: authority.selected_artifact === null
+      selected_artifact: reactionClean || authority.selected_artifact === null
         ? null
         : publicSelectedObject(authority.selected_artifact),
       pagination_sha256: authority.pagination_sha256,
       final_reread_sha256: authority.final_reread_sha256,
-      recovery: authority.recovery === null
+      recovery: terminalCleanClassification || authority.recovery === null
         ? null
         : structuredClone(authority.recovery),
     },
@@ -1103,6 +1107,7 @@ function automaticRecoveryRequestInventoryIsClosed({
   selectedRequest,
   reducerInput,
   evidenceSnapshot,
+  controller,
 }) {
   const currentRequests = reducerInput.requests.filter((request) =>
     request.head_oid === reducerInput.review_epoch.head_oid);
@@ -1169,12 +1174,28 @@ function automaticRecoveryRequestInventoryIsClosed({
   const reducerRequestsById = new Map(
     reducerInput.requests.map((request) => [request.id, request]),
   );
+  const controllerBindingsById = new Map(
+    controller.request_bindings.map((binding) => [binding.id, binding]),
+  );
   for (const rawRequest of evidenceSnapshot.pages.issue_comments.filter(
     (comment) => comment.body === "@codex review",
   )) {
     const projected = reducerRequestsById.get(rawRequest.id);
+    if (projected === undefined) {
+      const historicalBinding = controllerBindingsById.get(rawRequest.id);
+      // Earlier-head requests remain in the immutable page inventory for
+      // audit, but the generic projector intentionally excludes them from the
+      // current-head reducer inventory and exact-refetch selector set.
+      if (
+        historicalBinding === undefined ||
+        historicalBinding.head_oid === reducerInput.review_epoch.head_oid ||
+        historicalBinding.current_incarnation !== false
+      ) {
+        return false;
+      }
+      continue;
+    }
     if (
-      projected === undefined ||
       projected.url !== rawRequest.html_url ||
       projected.created_at !== rawRequest.created_at ||
       projected.updated_at !== rawRequest.updated_at ||

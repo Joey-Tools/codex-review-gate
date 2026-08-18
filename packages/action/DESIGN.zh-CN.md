@@ -153,12 +153,16 @@ schema，并返回以下之一：
    request authority 是 `inconclusive`。
 6. Confirmed no-start response 只有在 implicit selection 下才是
    `skipped-unavailable`；explicitly requested route 应 blocked。
-7. `clean` 要求 complete stable evidence 以及 admitted terminal clean 或 accepted closed
-   reaction basis。
+7. `clean` 要求 complete stable evidence 以及 accepted closed reaction basis。Terminal
+   clean 只分类 provider artifact，不提供 positive completion authority。
 8. 其他 selected current epoch 保持 `pending`。
 
 Positive completion 刻意比 negative evidence 更严格。Trustworthy carrier 中的 finding
 即使无关 acquisition 不完整也可以阻断；partial snapshot 永远不能得到 clean。
+
+Reaction-only clean 选择 unique latest eligible request 及其 exact-provider `+1`。语义
+时间相同或更晚的 exact-provider `eyes` 会否决这个 reaction-only 结果；更早的 `eyes`
+不会。Reaction 永远不能覆盖已选择的 terminal payload，包括 `mixed` profile。
 
 ## Review epoch 和 status target
 
@@ -166,9 +170,103 @@ Positive completion 刻意比 negative evidence 更严格。Trustworthy carrier 
 potential-merge data。Lifecycle 必须保持 open。Positive completion 前，initial/final
 scope projection 必须一致。
 
+Request quota 与 automatic generation continuity 在 base retarget 后仍按 head 计量，
+因此旧 generation 不会被隐藏或退款。Positive `+1` 和 no-start authority 更窄：它们必须
+绑定 head 范围内最新 admitted generation，而且该 request 还必须匹配当前 base 与 head。
+Earlier-base request 可以支持下一次 recovery generation 或保留 negative finding history，
+但 test-merge input 改变后不能授权当前 review epoch。稳定的 current-head terminal clean
+仍可分类已发布 artifact，但当前 accepted provider schema 不会把 carrier 绑定到 request、
+run 或 input base。
+
+Durable controller history 有意分区。只有 `automatic-request-reservation` intent 与
+`review-request`、`request-binding`、`artifact-binding`、`scheduler-state` response 会在
+同 PR、同 head 的 base 或 potential-merge retarget 后保留。Status/sentinel binding、
+no-start/thread-resolution observation 以及 control/sticky-comment binding 仍必须匹配
+exact current scope，而且只能从 current incarnation 读取：即同 head 最后一个异 scope
+durable record 之后的 exact-scope suffix。这样 A-to-B-to-A retarget 不会复活 A 的旧
+scheduler、status、sentinel、no-start 或 comment authority。保留的 earlier-base history
+只延续 budget、generation、retry-zero、recovery 与 negative findings，不能成为当前
+positive authority。Automatic reservation 定义 generation origin；后续 review-request 与
+request-binding 即使因同 head retarget 进入新的 exact scope，也只引用该 origin。Manual
+request-binding 因没有 reservation 而定义自身 generation。Artifact-binding 和
+scheduler-state record 同样只引用既有 origin，绝不能用自身 current operation scope
+重新定义它。
+
+Partial transaction 也遵守同一分区。尚未进入 retry-zero attempt 的 head-scoped
+reservation 在 retarget 后继续占用额度，但恢复出的 attempt 与 request binding 必须绑定新
+exact scope 及其 scheduler observation。尚未应答的 artifact-binding intent 只属于 exact
+current scope 与 current incarnation：旧 scope intent，或被 durable foreign-scope record
+隔开的同一 exact tuple 的更早 intent，都会被隔离，不会与 current candidate 比较或重放。
+稳定的 incarnation anchor 是最新同 head foreign-scope durable record；它参与 effect
+identity，而同一 incarnation 内的 crash 或 lease 变化仍恢复同一 transaction。
+
+Control-plane audit receipt 当前为 schema version 2。Serialized validator 仍为 audit
+compatibility 接受 exact closed legacy version-1 shape，但反序列化绝不会重建
+process-local authority handle。Version 2 用 `current_incarnation` 标记 request binding，
+要求所有 true marker 构成一个 ledger suffix，并把每个 current binding join 到其 exact
+current generation。较早 head 的 visible request comment 仍必须有 durable audit binding，
+但会从 exact selector、projected request 和 reaction 中过滤；visible current-head request
+缺少 binding 时 fail closed。
+
+Legacy version-1 receipt 保留原始 request-binding 上限：3 条 automatic 加 64 条 manual。
+Sticky schema-version-1 projection 只为 audit/continuation compatibility 识别精确历史
+`terminal-clean`、`terminal-findings`、`malformed-evidence` 与
+`unresolved-inline-finding` whole-PR scope profile；current snapshot 仍必须使用当前 scope
+assurance。
+
+如果 addressed command 唯一指向一个经过 exact refetch、closed-provider 校验，但仅因属于
+较早 head 而被过滤的 finding carrier，则该命令只属于历史并被忽略。Unknown target、
+non-canonical 或错误绑定 URL、ambiguous carrier 以及无效 current-head target 仍 fail closed。
+同样，较早 incarnation 的 provider reaction 或发生在 selected current request 之前的
+reaction 不会压制有效 current no-start；只有绑定该 selected request 且发生于 request time
+同时或之后的 exact-provider activity 才能否决 no-start。
+
+Serialized receipt 保留 record OID、payload digest、response time 和其他 audit pointer。
+Generic projector surface 只暴露 closed receipt 可独立 join 的字段，或 branded live-ledger
+path 已授权的字段；对于仅靠反序列化 manifest digest 无法独立重新验证的 source-row
+pointer，则刻意不暴露。只有当 receipt 同时证明 prior binding、recovery transition 和 next
+binding 的顺序与 identity 时，closed generation admission 才携带相应指针。
+
+只有 control-comment create/update history 不算 prior runner scheduling state。这样的
+comment-only predecessor 之后，第一次 scheduler observation 仍必须使用 same-load initial
+runner authority；该 observation 及其 status transaction 完成后，后续 scheduling 必须使用
+established authority。
+
+稳定、经过 final reread 的 current-head terminal clean 只用于分类。它产生
+`inconclusive`，provider profile 为 `terminal-payload`（或 `mixed`），并携带精确
+`artifact-publication-only` artifact basis；selected request、generation 与 recovery 均为
+null，reaction 也不能覆盖 terminal classification。Runner 不暴露 terminal-clean binding
+candidate，ledger 不接纳新的 terminal-clean completion transaction，projector 也不为该
+carrier 制造 request lineage。Exact rich carrier commitment 仍用于 findings 与 audit
+integrity，legacy two-field binding 仍只适用于 findings。
+
+相反，完成 positive authority 的 current-request reaction 必须绑定 selected request，且
+selected artifact 必须为 null。非 null finding-recovery receipt 只允许出现在该 reaction
+basis 上。Stable input blocker 只映射到 `blocked-input`，不能制造
+`blocked-configuration`。
+
+Finding recovery 更严格：prior finding 被证明 closed，且因果上更晚的 current request
+generation admitted 后，只有该 current request 上更晚的 reaction 才能完成 clean。
+Terminal-clean carrier 不能提供或替代这个 recovery step。Automatic quota 耗尽时，完成
+request 可以是 manual generation；automatic-to-automatic recovery 仍要求严格递增的 closed
+generation chain。
+
+因此 ledger candidate-authority compatibility boundary 始终是 findings-only：schema
+version 1 只为 automatic generation 1 和 2 的 `finding-recovery` / `findings` 保留原始 byte
+与 digest identity；任何版本都不能把没有认证 lineage 的 terminal clean 变成 completion
+authority。历史 terminal-clean-shaped record 只能用于 audit，不能继续事务或投影为
+positive evidence。Closed parser 可以识别其字节，但 durable replay 会在 scheduler 或
+generation lineage 可能授权之前拒绝 terminal-clean binding purpose。
+
+Pre-activation B boundary 仍使 production effects 当前不可达。本地证明组合真实 runner、
+protected ledger transaction、fresh control-plane receipt、projector、reducer 与 controller
+ordering，但不会发明 positive terminal-clean route；它不是 activation evidence。
+
 Primary terminal policy 以 test-merge commit 为 target；需要时 controller 也写 head
 sentinel，避免 stale/mismatched merge result 静默满足 head-only rule。Target choice 是
-closed scheduler mode，不是 consumer-defined SHA。
+closed scheduler mode，不是 consumer-defined SHA。没有 validated potential merge 时，
+`not-selected` 与 configuration-blocked 结果保留 null primary target；不会用 head commit
+冒充缺失的 test-merge target。
 
 Commit Status 仍按 repository SHA/context 建索引。它不是 cryptographic attestation、
 provider artefact 或 PR-isolation proof。V2 依赖 controller receipt、exact epoch binding、
@@ -208,16 +306,24 @@ idempotency key，并遵循 persist-before-effect protocol。
 Review request 顺序：
 
 1. reserve scheduler request；
-2. persist retry-zero intent；
+2. 完成 exact safe pre-scope read；
 3. persist pre-effect attempt；
-4. perform exactly one request POST；
-5. bind exact 201 response；
-6. rebuild/reduce subsequent snapshot；
-7. 只 publish controller-authorised status/sticky effect。
+4. persist retry-zero request intent；
+5. perform exactly one request POST；
+6. bind exact 201 response；
+7. rebuild/reduce subsequent snapshot；
+8. 只 publish controller-authorised status/sticky effect。
 
-有 ambiguous response 的 attempted effect 绝不 reclaim 或 replay。后续 invocation 可以
-复用 already-bound response，但不能为同一 idempotency key 创建第二个 effect。Status 和
-sticky effect 遵循同样的 reserve、persist、perform、bind discipline。
+有 ambiguous response 的 attempted effect 绝不 reclaim 或 replay。Pre-scope read failure
+不会留下 pre-effect attempt 或 retry-zero request intent，因此保持可重试且不会声称 POST
+已发生。后续 invocation 可以复用 already-bound response，但不能为同一 idempotency key
+创建第二个 effect。Status 和 sticky effect 遵循同样的 reserve、persist、perform、bind
+discipline。
+
+Trusted server-time 顺序为 `pre-scope <= pre-effect attempt <= retry-zero request intent <=
+request created_at <= POST response <= exact refetch <= post-scope`。Request-intent boundary
+证明公开 POST 之前已经完成 write-ahead persistence；不能反过来把它当作更早 pre-scope
+observation 的下界。
 
 这提供 durable causal ordering，不是 distributed atomicity。如果无法证明 persistence
 或 response binding，controller 必须 closed stop，并保留 ledger 供 recovery。

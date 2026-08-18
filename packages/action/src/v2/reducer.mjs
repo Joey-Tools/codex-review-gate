@@ -45,6 +45,13 @@ export {
 const NO_START_CONFIRMATION_MS = 15 * 60 * 1000;
 const AUTOMATIC_REQUEST_LIMIT = 3;
 const MANUAL_REQUEST_LIMIT = 64;
+const ARTIFACT_PUBLICATION_BASIS_KINDS = new Set([
+  "terminal-clean",
+  "terminal-findings",
+  "unresolved-inline-finding",
+  "malformed-evidence",
+  "unknown-terminal",
+]);
 
 /**
  * Reduce one sealed, normalized provider snapshot into a deterministic report.
@@ -132,10 +139,9 @@ export function reduceV2Snapshot(snapshot, options) {
   const requestEvaluation = evaluateRequests(snapshot);
   const evidence = evaluateProviderEvidence(snapshot, requestEvaluation);
 
-  // Terminal carrier precedence is independent from request production. A
-  // request budget, generation-admission, sidecar, reaction, or no-start
-  // anomaly may degrade those planes, but it cannot erase one independently
-  // stable current-scope terminal outcome.
+  // Terminal problems and trustworthy findings remain independent negative
+  // evidence. Positive terminal completion additionally requires an exact
+  // binding to the latest admitted request in the current base/head epoch.
   if (evidence.terminal_problem !== null) {
     return finish(context, {
       request_policy: requestEvaluation.policy,
@@ -226,7 +232,7 @@ export function reduceV2Snapshot(snapshot, options) {
       request_policy: requestEvaluation.policy,
       provider_profile: evidence.profile,
       evidence_basis: evidence.terminal_clean,
-      decision: "clean",
+      decision: "inconclusive",
     });
   }
 
@@ -402,11 +408,11 @@ function serverStatus(value) {
 }
 
 function evaluateRequests(snapshot) {
-  const currentRequests = snapshot.requests.filter(
+  const headRequests = snapshot.requests.filter(
     (request) => request.head_oid === snapshot.review_epoch.head_oid,
   );
-  const visibleAutomatic = currentRequests.filter((request) => request.kind === "automatic").length;
-  const visibleManual = currentRequests.filter((request) => request.kind === "manual").length;
+  const visibleAutomatic = headRequests.filter((request) => request.kind === "automatic").length;
+  const visibleManual = headRequests.filter((request) => request.kind === "manual").length;
   let limitFailure = null;
   if (
     snapshot.budget.automatic_requests_on_head < visibleAutomatic ||
@@ -424,21 +430,28 @@ function evaluateRequests(snapshot) {
     limitFailure = `Manual requests exceed the per-review-epoch limit of ${MANUAL_REQUEST_LIMIT}`;
   }
 
-  const authoritative = admittedGenerations(snapshot, currentRequests);
+  const authoritative = admittedGenerations(snapshot, headRequests);
   const admissionFailure = requestInventoryAdmissionFailure(
-    currentRequests,
+    headRequests,
     authoritative,
   );
   const ordered = [...authoritative].sort(compareEvidence);
   const selected = ordered.at(-1) ?? null;
+  const positiveSelected =
+    selected !== null &&
+    selected.current_incarnation &&
+    selected.base_oid === snapshot.review_epoch.base_oid &&
+    selected.head_oid === snapshot.review_epoch.head_oid
+      ? selected
+      : null;
   let status = "compliant";
   let reason = selected === null
-    ? "No current-epoch request has been observed"
+    ? "No head-scoped request generation has been observed"
       : ordered.length === 1
-      ? "Exactly one current-epoch request was observed"
+      ? "Exactly one head-scoped request generation was observed"
       : "Multiple admitted generations were observed; the latest generation is authoritative";
 
-  if (selected === null && currentRequests.length > 0) {
+  if (selected === null && headRequests.length > 0) {
     status = "unknown";
     reason = "No observed request has an admitted generation and recovery chain";
   }
@@ -477,12 +490,19 @@ function evaluateRequests(snapshot) {
 
   return {
     selected,
+    positive_selected: positiveSelected,
     policy: requestPolicy(status, selected, reason, permissionFields),
     selected_is_authoritative:
       selected !== null &&
       status === "compliant" &&
       requestHasStableExactShape(selected) &&
       (selected.kind !== "manual" || manualPermissionIsAccepted(selected)),
+    positive_selected_is_authoritative:
+      positiveSelected !== null &&
+      status === "compliant" &&
+      requestHasStableExactShape(positiveSelected) &&
+      (positiveSelected.kind !== "manual" ||
+        manualPermissionIsAccepted(positiveSelected)),
     automatic_capacity_exhausted:
       snapshot.budget.automatic_reservations_on_head >= AUTOMATIC_REQUEST_LIMIT,
     limit_failure: limitFailure,
@@ -540,11 +560,28 @@ function admittedGenerations(snapshot, requests) {
         candidate.kind === "automatic" &&
         candidate.generation_index === request.generation_index - 1,
     );
-    if (prior !== undefined && generationFindingClosureIsProven(snapshot, prior, request)) {
+    if (
+      prior !== undefined &&
+      (
+        generationFindingClosureIsProven(snapshot, prior, request) ||
+        durableGenerationAdmissionIsProven(snapshot, prior, request)
+      )
+    ) {
       admitted.push(request);
     }
   }
   return admitted;
+}
+
+function durableGenerationAdmissionIsProven(snapshot, priorRequest, newRequest) {
+  return snapshot.generation_admissions.some((admission) =>
+    admission.prior_generation_id === priorRequest.generation_id &&
+    admission.next_generation_id === newRequest.generation_id &&
+    admission.prior_request_id === priorRequest.id &&
+    admission.next_request_id === newRequest.id &&
+    admission.head_oid === snapshot.review_epoch.head_oid &&
+    compareTimestamp(admission.transition_server_time, priorRequest.created_at) > 0 &&
+    compareTimestamp(newRequest.created_at, admission.transition_server_time) > 0);
 }
 
 function generationFindingClosureIsProven(snapshot, priorRequest, newRequest) {
@@ -606,6 +643,15 @@ function evaluateProviderEvidence(snapshot, requestEvaluation) {
   const providerAcknowledgements = snapshot.acknowledgements.filter(
     (acknowledgement) => acknowledgement.exact_provider,
   );
+  const currentRequest = requestEvaluation.positive_selected;
+  const hasCurrentRequestProviderActivity = currentRequest !== null &&
+    providerAcknowledgements.some(
+      (acknowledgement) =>
+        (acknowledgement.kind === "plus-one" || acknowledgement.kind === "eyes") &&
+        acknowledgement.request_id === currentRequest.id &&
+        acknowledgement.commit_oid === snapshot.review_epoch.head_oid &&
+        compareTimestamp(acknowledgement.created_at, currentRequest.created_at) >= 0,
+    );
   const hasReaction = providerAcknowledgements.some(
     (acknowledgement) => acknowledgement.kind === "plus-one" || acknowledgement.kind === "eyes",
   );
@@ -664,37 +710,51 @@ function evaluateProviderEvidence(snapshot, requestEvaluation) {
       )
     : null;
 
-  const terminalClean = selectTerminalClean(
+  // Terminal payloads expose artifact-publication classification only. Until
+  // the provider supplies an authenticated request/run/input-base lineage,
+  // terminal-clean can never become positive completion authority.
+  const terminalClean = selectTerminalCleanClassification(
     snapshot,
-    terminal,
-    requestEvaluation,
-    profile,
     terminalSelection.selected,
   );
-  const acceptedPlusOne = terminalClean === null
-    ? selectAcceptedPlusOne(snapshot, terminal, requestEvaluation)
+  const acceptedPlusOne =
+    malformed.length === 0 &&
+    terminalSelection.conflict === null &&
+    terminalSelection.unstable === null
+    ? selectAcceptedPlusOne(
+        snapshot,
+        terminal,
+        terminalSelection.selected,
+        requestEvaluation,
+      )
     : null;
-  const blockingFinding = findBlockingFinding(
-    snapshot,
-    terminal,
-    terminalClean,
-    terminalSelection.selected,
-    terminalSelection.conflict,
-  );
+  const recoveredHistoricalFindings =
+    acceptedPlusOne !== null &&
+    acceptedPlusOne.authority_receipt.recovery !== null;
+  const blockingFinding = recoveredHistoricalFindings
+    ? null
+    : findBlockingFinding(
+        snapshot,
+        terminal,
+        terminalSelection.selected,
+        terminalSelection.conflict,
+      );
   const noStart = terminal.length === 0 && malformed.length === 0 &&
-      providerAcknowledgements.length === 0
+      !hasCurrentRequestProviderActivity
     ? selectNoStart(snapshot, requestEvaluation)
     : null;
+  const classifiedTerminal = terminalClean !== null ||
+    blockingFinding !== null || terminalProblem !== null;
 
   return {
     profile:
       noStart !== null
         ? "no-start-rejection"
         : acceptedPlusOne !== null
-          ? terminal.length > 0
-            ? "mixed"
-            : "thumbs-up-clean"
-          : profile,
+          ? "thumbs-up-clean"
+          : classifiedTerminal
+            ? profile
+            : "unknown",
     blocking_finding: blockingFinding,
     terminal_problem: terminalProblem,
     unstable_evidence: unstableEvidence,
@@ -707,7 +767,6 @@ function evaluateProviderEvidence(snapshot, requestEvaluation) {
 function findBlockingFinding(
   snapshot,
   terminal,
-  terminalClean,
   selectedTerminal,
   terminalConflict,
 ) {
@@ -716,7 +775,6 @@ function findBlockingFinding(
   );
   if (
     findingArtifacts.length === 0 ||
-    terminalClean !== null ||
     terminalConflict !== null ||
     selectedTerminal?.kind === "malformed"
   ) {
@@ -751,38 +809,9 @@ function findBlockingFinding(
   );
 }
 
-function selectTerminalClean(
-  snapshot,
-  terminal,
-  requestEvaluation,
-  profile,
-  selectedTerminal,
-) {
+function selectTerminalCleanClassification(snapshot, selectedTerminal) {
   const latestTerminal = selectedTerminal;
   if (latestTerminal?.kind !== "terminal-clean" || !latestTerminal.stable) {
-    return null;
-  }
-  const recoversPriorFindings = terminal.some(
-    (artifact) => artifact.kind === "terminal-findings" && artifact.stable,
-  );
-  if (
-    recoversPriorFindings &&
-    (
-      requestEvaluation.selected === null ||
-      !requestEvaluation.selected_is_authoritative ||
-      latestTerminal.request_id !== requestEvaluation.selected.id
-    )
-  ) {
-    return null;
-  }
-  const recovery = completionRecoversFindings(
-    snapshot,
-    terminal,
-    requestEvaluation,
-    latestTerminal.created_at,
-    latestTerminal.id,
-  );
-  if (!recovery.accepted) {
     return null;
   }
   return basis(
@@ -790,24 +819,21 @@ function selectTerminalClean(
     "terminal-clean",
     "artifact-publication-only",
     latestTerminal.id,
-    profile === "mixed"
-      ? "Latest terminal payload is clean; reactions are retained only as audit evidence"
-      : "Latest stable terminal payload is clean",
+    "Latest stable terminal payload classifies the artifact as clean but has no provider input lineage",
     {
-      selectedRequest:
-        latestTerminal.request_id !== null &&
-        latestTerminal.request_id === requestEvaluation.selected?.id
-          ? requestEvaluation.selected
-          : null,
       selectedArtifact: latestTerminal,
-      recovery: recovery.receipt,
     },
   );
 }
 
-function selectAcceptedPlusOne(snapshot, terminal, requestEvaluation) {
-  const request = requestEvaluation.selected;
-  if (!requestEvaluation.selected_is_authoritative || request === null) {
+function selectAcceptedPlusOne(
+  snapshot,
+  terminal,
+  selectedTerminal,
+  requestEvaluation,
+) {
+  const request = requestEvaluation.positive_selected;
+  if (!requestEvaluation.positive_selected_is_authoritative || request === null) {
     return null;
   }
   const matching = snapshot.acknowledgements
@@ -825,11 +851,26 @@ function selectAcceptedPlusOne(snapshot, terminal, requestEvaluation) {
   if (selected === null) {
     return null;
   }
-  // `eyes` is liveness-only. It never changes a selected generation's +1
-  // outcome and is retained only in the sealed audit inventory.
+  // Reaction-only clean is a weak fallback. An exact-provider `eyes` on the
+  // selected request at or after the selected +1 proves that fallback is not
+  // a stable clean signal. Terminal payload classification is handled before
+  // this function and therefore keeps its precedence.
+  const blockingEyes = snapshot.acknowledgements.some(
+    (acknowledgement) =>
+      acknowledgement.kind === "eyes" &&
+      acknowledgement.request_id === request.id &&
+      acknowledgement.exact_provider &&
+      acknowledgement.stable &&
+      acknowledgement.commit_oid === snapshot.review_epoch.head_oid &&
+      compareTimestamp(acknowledgement.created_at, selected.created_at) >= 0,
+  );
+  if (blockingEyes) {
+    return null;
+  }
   const recovery = completionRecoversFindings(
     snapshot,
     terminal,
+    selectedTerminal,
     requestEvaluation,
     selected.created_at,
     selected.id,
@@ -855,20 +896,41 @@ function selectAcceptedPlusOne(snapshot, terminal, requestEvaluation) {
 function completionRecoversFindings(
   snapshot,
   terminal,
+  selectedTerminal,
   requestEvaluation,
   completionCreatedAt,
   completionId,
 ) {
-  const findingArtifacts = terminal.filter(
-    (artifact) => artifact.kind === "terminal-findings" && artifact.stable,
-  ).sort(compareEvidence);
+  if (
+    terminal.length > 0 &&
+    (
+      selectedTerminal?.kind !== "terminal-findings" ||
+      !selectedTerminal.stable ||
+      terminal.some(
+        (artifact) =>
+          !artifact.stable ||
+          (
+            artifact.kind === "terminal-clean" &&
+            compareTimestamp(
+              artifact.created_at,
+              selectedTerminal.created_at,
+            ) >= 0
+          ),
+      )
+    )
+  ) {
+    return { accepted: false, receipt: null };
+  }
+  const findingArtifacts = terminal
+    .filter((artifact) => artifact.kind === "terminal-findings")
+    .sort(compareEvidence);
   if (findingArtifacts.length === 0) {
     return { accepted: true, receipt: null };
   }
-  const request = requestEvaluation.selected;
+  const request = requestEvaluation.positive_selected;
   if (
     request === null ||
-    !requestEvaluation.selected_is_authoritative ||
+    !requestEvaluation.positive_selected_is_authoritative ||
     compareTimestamp(completionCreatedAt, request.created_at) <= 0
   ) {
     return { accepted: false, receipt: null };
@@ -876,7 +938,29 @@ function completionRecoversFindings(
   const findingIds = [];
   const closureIds = [];
   for (const artifact of findingArtifacts) {
-    if (compareTimestamp(completionCreatedAt, artifact.created_at) <= 0) {
+    const priorRequest = artifact.request_id === null
+      ? null
+      : snapshot.requests.find(
+          (candidate) => candidate.id === artifact.request_id,
+        ) ?? null;
+    const automaticGenerationFollowsPrior =
+      request.kind === "automatic" &&
+      priorRequest?.kind === "automatic" &&
+      priorRequest.generation_kind === request.generation_kind &&
+      priorRequest.generation_index < request.generation_index;
+    const manualGenerationFollowsPrior =
+      request.kind === "manual" &&
+      priorRequest !== null &&
+      compareTimestamp(request.created_at, priorRequest.created_at) > 0;
+    if (
+      priorRequest === null ||
+      priorRequest.id === request.id ||
+      (!automaticGenerationFollowsPrior && !manualGenerationFollowsPrior) ||
+      priorRequest.head_oid !== snapshot.review_epoch.head_oid ||
+      !requestHasStableExactShape(priorRequest) ||
+      compareTimestamp(artifact.created_at, priorRequest.created_at) <= 0 ||
+      compareTimestamp(completionCreatedAt, artifact.created_at) <= 0
+    ) {
       return { accepted: false, receipt: null };
     }
     for (const findingId of artifact.finding_ids) {
@@ -938,12 +1022,12 @@ function findingClosure(snapshot, artifact, findingId, thread) {
 }
 
 function selectNoStart(snapshot, requestEvaluation) {
-  const request = requestEvaluation.selected;
+  const request = requestEvaluation.positive_selected;
   if (
     request === null ||
     request.kind !== "automatic" ||
     !request.controlled ||
-    !requestEvaluation.selected_is_authoritative
+    !requestEvaluation.positive_selected_is_authoritative
   ) {
     return null;
   }
@@ -999,7 +1083,7 @@ function requestPolicy(status, selectedRequest, reason, permission = {}) {
 function basis(
   snapshot,
   kind,
-  _scopeAssurance,
+  scopeAssurance,
   artifactId,
   summary,
   {
@@ -1010,7 +1094,9 @@ function basis(
 ) {
   return {
     kind,
-    scope_assurance: "whole-pr-contractual",
+    scope_assurance: ARTIFACT_PUBLICATION_BASIS_KINDS.has(kind)
+      ? scopeAssurance
+      : "whole-pr-contractual",
     artifact_id: artifactId,
     summary,
     authority_receipt: {

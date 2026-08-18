@@ -94,6 +94,7 @@ import {
   validateV2GitLedgerCandidateDispatchPlan,
   validateV2GitLedgerCandidateDispatchReservation,
   validateV2GitLedgerDiscoveryContinuityReceipt,
+  validateV2GitLedgerEnvelope,
   validateV2GitLedgerEstablishedRunnerStateAuthority,
   validateV2GitLedgerInitialRunnerStateAuthority,
 } from "../packages/action/src/v2/git-ledger.mjs";
@@ -101,6 +102,7 @@ import {
   assertV2ProductionRunnerAuthorityHandle,
   createV2ControlPlaneReceiptFromGitLedgerAuthority,
   createV2ProductionRunnerAuthority,
+  deriveV2ProjectorControlAuthority,
 } from "../packages/action/src/v2/control-plane-receipt.mjs";
 import {
   MAX_V2_CANDIDATES_PER_SHARD,
@@ -1090,7 +1092,17 @@ test("capability attestation exact-binds its canary authority and race",
 
 test("historical control comment creation is intent-null then exact response-bound", async () => {
   const fixture = githubGitFixture();
-  const context = await createProtectedInitialRunnerContext(fixture);
+  const runIdentity = { ...OWNER };
+  const verifier = provenanceVerifier({
+    eventName: "pull_request_target",
+    ref: "refs/heads/main",
+    deriveTriggerFromRequest: true,
+    runIdentity,
+  });
+  const context = await createProtectedInitialRunnerContext(fixture, {
+    runIdentity,
+    verifier,
+  });
   const { ledger, lease, evaluatedScopeReceipt } = context;
   const source = await ledger.load();
   const intent = createV2GitLedgerRecord({
@@ -1202,6 +1214,117 @@ test("historical control comment creation is intent-null then exact response-bou
   assert.deepEqual(new Set(fixture.blobs.keys()), before.blob_keys);
   assert.deepEqual(new Set(fixture.trees.keys()), before.tree_keys);
   assert.deepEqual(new Set(fixture.commits.keys()), before.commit_keys);
+
+  const scopeA = structuredClone(evaluatedScopeReceipt.scope);
+  const scopeB = {
+    ...structuredClone(scopeA),
+    base_ref_oid: "d".repeat(40),
+  };
+  await releaseFixtureDiscoveryLease(ledger, context.discovery);
+  fixture.advanceServerTime(7_200);
+  runIdentity.run_id = "9002";
+  const bRun = await acquireEstablishedRunnerContext({
+    ledger,
+    runIdentity,
+    observationBoundary: "public-post-request-wait-complete",
+    transportStartSecond: 9_000,
+    minimalServerTime: "2026-08-13T15:00:00.000Z",
+    scope: scopeB,
+  });
+  assert.equal(
+    bRun.controlPlaneAuthority.scoped_authority.control_comment_binding,
+    null,
+  );
+  await releaseFixtureDiscoveryLease(ledger, bRun.discovery);
+
+  fixture.advanceServerTime(7_200);
+  runIdentity.run_id = "9003";
+  const a2Run = await acquireEstablishedRunnerContext({
+    ledger,
+    runIdentity,
+    observationBoundary: "public-post-request-wait-complete",
+    transportStartSecond: 18_000,
+    minimalServerTime: "2026-08-13T18:00:00.000Z",
+    scope: scopeA,
+  });
+  assert.equal(
+    a2Run.controlPlaneAuthority.scoped_authority.control_comment_binding,
+    null,
+    "the durable B boundary prevents the old A comment from reviving in A2",
+  );
+  const afterA2 = await ledger.load();
+  assert.equal(
+    deriveV2GitLedgerAuthority(
+      afterA2.records,
+      scopeA,
+      afterA2.observed_at,
+    ).control_comment_binding,
+    null,
+  );
+  assert.equal(
+    deriveV2GitLedgerAuthority(
+      afterA2.records,
+      {
+        ...structuredClone(scopeA),
+        pull_request: { number: PR.number + 1, node_id: "PR_foreign" },
+      },
+      afterA2.observed_at,
+    ).control_comment_binding,
+    null,
+  );
+
+  const a2InitialCommand = await createPullRequestTargetWorkflowCommandHandle({
+    runIdentity,
+    observationBoundary: "initial",
+  });
+  const a2Initial = await ledger.loadInitialRunnerStateAuthority({
+    control_plane_authority: a2Run.controlPlaneAuthority,
+    evaluated_scope_receipt: a2Run.evaluatedScopeReceipt,
+    workflow_command_handle: a2InitialCommand,
+  });
+  const initialSeed = schedulerObservationRecord({
+    predecessor: a2Run.discovery.lease_receipt.acquire_commit_sha,
+    lease: a2Run.discovery.lease_receipt,
+    priorAuthorityDigest: a2Initial.prior_authority_digest,
+    initialAuthority: a2Initial,
+    effectId: "scheduler-observation-comment-a2-initial",
+    idempotencyKey: "scheduler-observation-comment-a2-initial",
+  }).payload.action;
+  const firstScheduler = await ledger.appendInitialSchedulerObservation({
+    initial_runner_state_authority: a2Initial,
+    scheduler_evaluation: initialSeed.scheduler_evaluation,
+    status_plan: initialSeed.status_plan,
+  });
+  await appendRequiredStatusForScheduler(ledger, firstScheduler);
+
+  const establishedControlPlane = await ledger.loadControlPlaneAuthority(
+    scopeA,
+  );
+  const a2Established = await ledger.loadEstablishedRunnerStateAuthority({
+    control_plane_authority: establishedControlPlane,
+    evaluated_scope_receipt: a2Run.evaluatedScopeReceipt,
+    workflow_command_handle: a2Run.workflowCommandHandle,
+  });
+  const establishedInputs = schedulerInputsForEstablishedAuthority(
+    a2Established,
+    { snapshotId: "snapshot-comment-a2-established" },
+  );
+  const secondScheduler = await ledger.appendEstablishedSchedulerObservation({
+    established_runner_state_authority: a2Established,
+    ...establishedInputs,
+  });
+  const afterSchedulers = await ledger.load();
+  assert.deepEqual(
+    deriveV2GitLedgerRunnerState(
+      afterSchedulers.records,
+      scopeA,
+      afterSchedulers.post_ref.server_time,
+    ).observation_history.map((entry) => entry.record_oid),
+    [
+      firstScheduler.append_receipt.commit_sha,
+      secondScheduler.append_receipt.commit_sha,
+    ],
+  );
 });
 
 test("GitHub ref Date, not caller clock, controls high-level lease time", async () => {
@@ -2654,8 +2777,216 @@ test("automatic request restart resumes one durable reservation without minting 
   );
 });
 
+test("same-head retarget resumes one partial reservation in the current scope without redefining its origin",
+  async () => {
+    const fixture = githubGitFixture();
+    const runIdentity = { ...OWNER };
+    const scopeA = {
+      pull_request: structuredClone(PR),
+      head_ref_oid: HEAD,
+      base_ref_oid: BASE,
+      potential_merge_commit_oid: null,
+    };
+    const scopeB = {
+      ...structuredClone(scopeA),
+      base_ref_oid: "d".repeat(40),
+    };
+    const verifier = provenanceVerifier({
+      eventName: "pull_request_target",
+      ref: "refs/heads/main",
+      deriveTriggerFromRequest: true,
+      runIdentity,
+    });
+    const context = await createProtectedInitialRunnerContext(fixture, {
+      runIdentity,
+      scope: scopeA,
+      verifier,
+    });
+    const plan = schedulerObservationRecord({
+      predecessor: context.lease.acquire_commit_sha,
+      lease: context.lease,
+      priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+      initialAuthority: context.initialAuthority,
+    }).payload.action;
+    const initialAppend = await context.ledger
+      .appendInitialSchedulerObservation({
+        initial_runner_state_authority: context.initialAuthority,
+        scheduler_evaluation: plan.scheduler_evaluation,
+        status_plan: plan.status_plan,
+      });
+    const { automatic } = await appendAutomaticReservationStatus(
+      context.ledger,
+      initialAppend,
+    );
+    await releaseFixtureDiscoveryLease(context.ledger, context.discovery);
+
+    fixture.advanceServerTime(7_200);
+    runIdentity.run_id = "9002";
+    const resumed = await acquireEstablishedRunnerContext({
+      ledger: context.ledger,
+      runIdentity,
+      observationBoundary: "public-initial-wait-complete",
+      transportStartSecond: 9_000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+      scope: scopeB,
+    });
+    const established = await context.ledger
+      .loadEstablishedRunnerStateAuthority({
+        control_plane_authority: resumed.controlPlaneAuthority,
+        evaluated_scope_receipt: resumed.evaluatedScopeReceipt,
+        workflow_command_handle: resumed.workflowCommandHandle,
+      });
+    assert.equal(
+      established.scheduling.epoch.automatic_request.state,
+      "intent-persisted",
+    );
+    assert.equal(
+      established.scheduling.epoch.automatic_request.generation_index,
+      1,
+    );
+    const inputs = schedulerInputsForEstablishedAuthority(established, {
+      snapshotId: "snapshot-retarget-partial-reservation",
+    });
+    const schedulerAppend = await context.ledger
+      .appendEstablishedSchedulerObservation({
+        established_runner_state_authority: established,
+        ...inputs,
+      });
+    fixture.freezeServerTime();
+    const recovered = await context.ledger
+      .appendRecoveredAutomaticReviewRequestIntent({
+        scheduler_append: schedulerAppend,
+      });
+    assert.equal(recovered.transport.generation_id, "automatic:1");
+    assert.equal(
+      recovered.transport.reservation_digest,
+      automatic.reservation.reservation_digest,
+    );
+    const writesBeforeLostResponseRestart = fixture.writeCalls;
+    await assert.rejects(
+      context.ledger.appendRecoveredAutomaticReviewRequestIntent({
+        scheduler_append: schedulerAppend,
+      }),
+      (error) => error.code === "automatic-recovery-attempt-unavailable",
+    );
+    assert.equal(
+      fixture.writeCalls,
+      writesBeforeLostResponseRestart,
+      "an unanswered retry-zero intent cannot replay its external effect",
+    );
+    const minimalScopeB = await loadFixtureMinimalScope(scopeB);
+    const requestReceipt = await automaticReviewRequestBindingReceipt({
+      action: {
+        method: recovered.transport.method,
+        request_body_sha256: rawDigest(recovered.transport.body),
+      },
+      observedAt: recovered.intent_append_receipt.ref_reread.server_time,
+      minimalScopeHandle: minimalScopeB,
+    });
+    const binding = await context.ledger
+      .appendAutomaticReviewRequestBinding({
+        automatic_request_intent_handle:
+          recovered.automatic_request_intent_handle,
+        intent_append_receipt: recovered.intent_append_receipt,
+        receipt: requestReceipt,
+      });
+    assert.equal(
+      binding.authoritative_controlled_request.request_id,
+      requestReceipt.request_id,
+    );
+
+    const loaded = await context.ledger.load();
+    const reservations = loaded.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "automatic-request-reservation");
+    const attempts = loaded.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "effect-attempt");
+    const requestIntents = loaded.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "review-request");
+    assert.equal(reservations.length, 1);
+    assert.equal(attempts.length, 1);
+    assert.equal(requestIntents.length, 1);
+    assert.equal(reservations[0].envelope.base_ref_oid, scopeA.base_ref_oid);
+    assert.equal(attempts[0].envelope.base_ref_oid, scopeB.base_ref_oid);
+    assert.equal(requestIntents[0].envelope.base_ref_oid, scopeB.base_ref_oid);
+    assert.equal(
+      attempts[0].envelope.payload.action.reservation_record_oid,
+      reservations[0].commit_sha,
+    );
+    assert.equal(
+      attempts[0].envelope.payload.action.scheduler_observation_record_oid,
+      schedulerAppend.append_receipt.commit_sha,
+      "the resumed attempt names the current B scheduler authority",
+    );
+    assert.notEqual(
+      attempts[0].envelope.payload.action.scheduler_observation_record_oid,
+      reservations[0].envelope.payload.action
+        .scheduler_observation_record_oid,
+    );
+    assert.notEqual(
+      attempts[0].envelope.payload.generation.review_epoch_digest,
+      reservations[0].envelope.payload.generation.review_epoch_digest,
+      "the continuation binds B while the reservation keeps its A origin",
+    );
+    assert.equal(loaded.records.filter((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "review-request").length, 1);
+    const reviewRequestResponse = loaded.records.find((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "review-request");
+    const brandedReceipt = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await context.ledger.loadControlPlaneAuthority(scopeB),
+    );
+    const generation = brandedReceipt.derived.generations.find((item) =>
+      item.generation_id === "automatic:1");
+    assert.notEqual(generation, undefined);
+    assert.equal(generation.base_oid, scopeA.base_ref_oid);
+    assert.equal(
+      generation.review_epoch_digest,
+      reservations[0].envelope.payload.generation.review_epoch_digest,
+    );
+    assert.equal(
+      generation.request_effect_record_oid,
+      reviewRequestResponse.commit_sha,
+    );
+    assert.equal(
+      generation.request_binding_record_oid,
+      binding.request_binding_response_append_receipt.commit_sha,
+    );
+    const projectedRequestBinding =
+      brandedReceipt.derived.request_bindings.find((item) =>
+        item.record_oid ===
+          binding.request_binding_response_append_receipt.commit_sha);
+    assert.notEqual(projectedRequestBinding, undefined);
+    assert.equal(projectedRequestBinding.base_oid, scopeB.base_ref_oid);
+    assert.equal(projectedRequestBinding.current_incarnation, true);
+    const controller = deriveV2ProjectorControlAuthority(
+      brandedReceipt,
+      brandedReceipt.scope,
+    );
+    assert.ok(controller.request_bindings.some((item) =>
+      item.id === requestReceipt.request_id &&
+      item.base_oid === scopeB.base_ref_oid &&
+      item.current_incarnation === true));
+    const abaState = deriveV2GitLedgerRunnerState(
+      loaded.records,
+      scopeA,
+      loaded.post_ref.server_time,
+    );
+    assert.equal(
+      abaState.scheduling.epoch.automatic_request.state,
+      "effect-attempted",
+      "returning to A cannot refund the B continuation attempt",
+    );
+  });
+
 test("automatic review request binding is exact, controller-owned, and resumable", async (t) => {
-  const prepare = async (fixture) => {
+  const prepare = async (fixture, {
+    advanceBeforeRequestIntent = 0,
+    receiptTimes = null,
+  } = {}) => {
     const context = await createProtectedInitialRunnerContext(fixture);
     const plan = schedulerObservationRecord({
       predecessor: context.lease.acquire_commit_sha,
@@ -2673,6 +3004,9 @@ test("automatic review request binding is exact, controller-owned, and resumable
       context.ledger,
       schedulerAppend,
     );
+    if (advanceBeforeRequestIntent > 0) {
+      fixture.advanceServerTime(advanceBeforeRequestIntent);
+    }
     const requestIntent = await context.ledger
       .appendAutomaticReviewRequestIntent({
         automatic_reservation_handle:
@@ -2680,15 +3014,124 @@ test("automatic review request binding is exact, controller-owned, and resumable
         reservation_append_receipt: automatic.reservation_append_receipt,
         reservation_status_response_append: response,
       });
+    const resolvedReceiptTimes = typeof receiptTimes === "function"
+      ? receiptTimes({
+          intentBoundary:
+            requestIntent.intent_append_receipt.ref_reread.server_time,
+          preScopeObservedAt: context.minimalScopeHandle.observed_at,
+        })
+      : receiptTimes;
     const receipt = await automaticReviewRequestBindingReceipt({
       action: {
         method: "POST",
         request_body_sha256: rawDigest("@codex review"),
       },
       observedAt: requestIntent.intent_append_receipt.ref_reread.server_time,
+      ...resolvedReceiptTimes,
     });
     return { context, automatic, requestIntent, receipt };
   };
+
+  await t.test("accepts pre-scope before the durable intent and advancing public-effect dates",
+    async () => {
+      const fixture = githubGitFixture();
+      const { context, requestIntent, receipt } = await prepare(fixture, {
+        advanceBeforeRequestIntent: 10,
+        receiptTimes: ({ intentBoundary, preScopeObservedAt }) => {
+          const createdAt = new Date(
+            Date.parse(intentBoundary) + 1_000,
+          ).toISOString();
+          const postServerTime = new Date(
+            Date.parse(createdAt) + 1_000,
+          ).toISOString();
+          const refetchServerTime = new Date(
+            Date.parse(postServerTime) + 1_000,
+          ).toISOString();
+          return {
+            preScopeObservedAt,
+            createdAt,
+            postServerTime,
+            refetchServerTime,
+            postScopeObservedAt: new Date(
+              Date.parse(refetchServerTime) + 1_000,
+            ).toISOString(),
+          };
+        },
+      });
+      assert.ok(
+        Date.parse(receipt.request_scope_receipt.pre_scope.observed_at) <
+          Date.parse(requestIntent.intent_append_receipt.ref_reread.server_time),
+      );
+      const binding = await context.ledger
+        .appendAutomaticReviewRequestBinding({
+          automatic_request_intent_handle:
+            requestIntent.automatic_request_intent_handle,
+          intent_append_receipt: requestIntent.intent_append_receipt,
+          receipt,
+        });
+      assert.equal(
+        binding.authoritative_controlled_request.request_id,
+        receipt.request_id,
+      );
+      const loaded = await context.ledger.load();
+      assert.equal(loaded.records.filter((entry) =>
+        entry.envelope.record_type === "effect-response" &&
+        entry.envelope.kind === "review-request").length, 1);
+    });
+
+  await t.test("rejects every inversion in the public-effect time chain",
+    async (timingTest) => {
+      for (const mutation of [
+        "pre-scope-after-intent",
+        "created-before-intent",
+        "post-before-created",
+        "refetch-before-post",
+        "post-scope-before-refetch",
+      ]) {
+        await timingTest.test(mutation, async () => {
+          const fixture = githubGitFixture();
+          const prepared = await prepare(fixture, {
+            advanceBeforeRequestIntent: 10,
+            receiptTimes: ({ intentBoundary, preScopeObservedAt }) => {
+              const at = (offset) => new Date(
+                Date.parse(intentBoundary) + offset * 1_000,
+              ).toISOString();
+              const times = {
+                preScopeObservedAt,
+                createdAt: at(2),
+                postServerTime: at(3),
+                refetchServerTime: at(4),
+                postScopeObservedAt: at(5),
+              };
+              if (mutation === "pre-scope-after-intent") {
+                times.preScopeObservedAt = at(1);
+              } else if (mutation === "created-before-intent") {
+                times.createdAt = at(-1);
+              } else if (mutation === "post-before-created") {
+                times.postServerTime = at(1);
+              } else if (mutation === "refetch-before-post") {
+                times.refetchServerTime = at(2);
+              } else {
+                times.postScopeObservedAt = at(3);
+              }
+              return times;
+            },
+          });
+          const writesBefore = fixture.writeCalls;
+          await assert.rejects(
+            prepared.context.ledger.appendAutomaticReviewRequestBinding({
+              automatic_request_intent_handle:
+                prepared.requestIntent.automatic_request_intent_handle,
+              intent_append_receipt:
+                prepared.requestIntent.intent_append_receipt,
+              receipt: prepared.receipt,
+            }),
+            (error) => error.code === "automatic-review-request-time-order",
+          );
+          assert.equal(fixture.writeCalls, writesBefore);
+        });
+      }
+    });
 
   await t.test("rejects ambiguity before any response and returns bound authority", async () => {
     const fixture = githubGitFixture();
@@ -2969,6 +3412,1405 @@ test("automatic recovery transition persists one opaque generation advance", asy
   );
 });
 
+test("delayed findings bind in the current base while preserving the origin request",
+  async () => {
+    const setup = await createRetargetedDelayedFindingContext();
+    const { bEstablished, delayed, scopeA, scopeB, verifier } = setup;
+    assert.equal(
+      bEstablished.scheduling.epoch.controlled_request.binding_record_oid,
+      setup.requestBinding.request_binding_response_append_receipt.commit_sha,
+    );
+    assert.equal(
+      bEstablished.scheduling.epoch.automatic_request.generation_index,
+      1,
+    );
+    assert.equal(delayed.runnerResult.decision, "findings");
+    assert.notEqual(delayed.artifactBindingCandidateHandle, null);
+
+    const intent = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: delayed.schedulerAppend,
+        artifact_binding_candidate_handle:
+          delayed.artifactBindingCandidateHandle,
+      });
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: intent.transport,
+        snapshots: delayed.snapshots,
+      });
+    const response = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intent.artifact_binding_intent_handle,
+        intent_append_receipt: intent.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    assert.deepEqual(
+      response.bindings.map((binding) => ({
+        artifact_id: binding.artifact_selector.id,
+        request_id: binding.request_id,
+      })),
+      [{ artifact_id: "202", request_id: "71" }],
+    );
+
+    const fresh = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      verifier,
+      setup.context.preflight,
+    );
+    const loaded = await fresh.load();
+    const bindingRecords = loaded.records.filter((entry) =>
+      entry.envelope.kind === "artifact-binding" ||
+      entry.envelope.kind === "artifact-binding-ready");
+    assert.equal(bindingRecords.length, 4);
+    assert.ok(bindingRecords.every((entry) =>
+      entry.envelope.pull_request.number === PR.number &&
+      entry.envelope.pull_request.node_id === PR.node_id &&
+      entry.envelope.head_ref_oid === HEAD &&
+      entry.envelope.base_ref_oid === scopeB.base_ref_oid &&
+      entry.envelope.potential_merge_commit_oid === null));
+    const requestBindingRecord = loaded.records.find((entry) =>
+      entry.commit_sha ===
+        setup.requestBinding.request_binding_response_append_receipt.commit_sha);
+    assert.notEqual(requestBindingRecord, undefined);
+    assert.ok(bindingRecords.every((entry) =>
+      entry.envelope.payload.generation.generation_id === "automatic:1" &&
+      entry.envelope.payload.generation.kind === "automatic" &&
+      entry.envelope.payload.generation.index === 1));
+    assert.ok(bindingRecords.every((entry) =>
+      entry.envelope.payload.generation.review_epoch_digest !==
+        requestBindingRecord.envelope.payload.generation.review_epoch_digest));
+    const receipt = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await fresh.loadControlPlaneAuthority(scopeB),
+    );
+    assert.deepEqual(
+      receipt.derived.generations.map((generation) => ({
+        generation_id: generation.generation_id,
+        base_oid: generation.base_oid,
+        head_oid: generation.head_oid,
+      })),
+      [{
+        generation_id: "automatic:1",
+        base_oid: scopeA.base_ref_oid,
+        head_oid: scopeA.head_ref_oid,
+      }],
+    );
+    assert.deepEqual(
+      receipt.derived.artifact_bindings.map((binding) => ({
+        artifact_id: binding.artifact_selector.id,
+        request_id: binding.request_id,
+      })),
+      [{ artifact_id: "202", request_id: "71" }],
+    );
+    assert.equal(
+      receipt.derived.artifact_bindings[0].request_binding_record_oid,
+      setup.requestBinding.request_binding_response_append_receipt.commit_sha,
+    );
+  });
+
+test("same-head retarget quarantines one partial artifact intent before binding the current scope",
+  async () => {
+    const runIdentity = { ...OWNER };
+    const scopeA = {
+      pull_request: structuredClone(PR),
+      head_ref_oid: HEAD,
+      base_ref_oid: BASE,
+      potential_merge_commit_oid: null,
+    };
+    const scopeB = {
+      ...structuredClone(scopeA),
+      base_ref_oid: "d".repeat(40),
+    };
+    const verifier = provenanceVerifier({
+      eventName: "pull_request_target",
+      ref: "refs/heads/main",
+      deriveTriggerFromRequest: true,
+      runIdentity,
+    });
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+      runIdentity,
+      verifier,
+      scope: scopeA,
+    });
+    const intentA = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    const afterA = await setup.ledger.load();
+    const durableIntentA = afterA.records.find((entry) =>
+      entry.commit_sha === intentA.intent_append_receipt.commit_sha);
+    assert.notEqual(durableIntentA, undefined);
+    assert.equal(durableIntentA.envelope.base_ref_oid, scopeA.base_ref_oid);
+    assert.equal(afterA.records.some((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "artifact-binding"), false);
+    await releaseFixtureDiscoveryLease(
+      setup.ledger,
+      setup.context.discovery,
+    );
+
+    setup.fixture.advanceServerTime(7_200);
+    runIdentity.run_id = "9002";
+    const bRun = await acquireEstablishedRunnerContext({
+      ledger: setup.ledger,
+      runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 9_000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+      scope: scopeB,
+    });
+    const bObservation = await appendAutomaticRecoveryObservation({
+      ledger: setup.ledger,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: bRun.evaluatedScopeReceipt,
+      workflowCommandHandle: bRun.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      historicalSnapshots: setup.historicalSnapshots,
+      requireArtifactBinding: false,
+      expectRecoveryHandle: false,
+      expectArtifactBindingCandidateHandle: true,
+    });
+    const intentB = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: bObservation.schedulerAppend,
+        artifact_binding_candidate_handle:
+          bObservation.artifactBindingCandidateHandle,
+      });
+    assert.notEqual(
+      intentB.intent_append_receipt.commit_sha,
+      intentA.intent_append_receipt.commit_sha,
+    );
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: intentB.transport,
+        snapshots: bObservation.snapshots,
+      });
+    const responseB = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intentB.artifact_binding_intent_handle,
+        intent_append_receipt: intentB.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    assert.equal(responseB.bindings.length, intentB.transport.expected_count);
+    const staleAHandles = await loadAutomaticRecoveryProviderArtifactHandles({
+      ledger: setup.ledger,
+      fixture: setup.fixture,
+      transport: intentA.transport,
+      snapshots: setup.snapshots,
+    });
+    const writesBeforeStaleAContinuation = setup.fixture.writeCalls;
+    await assert.rejects(
+      setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          intentA.artifact_binding_intent_handle,
+        intent_append_receipt: intentA.intent_append_receipt,
+        provider_artifact_handles: staleAHandles,
+      }),
+      (error) => new Set([
+        "stale-scheduler-status-authority",
+        "stale-automatic-artifact-binding-intent-authority",
+      ]).has(error.code),
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeStaleAContinuation);
+
+    const final = await setup.ledger.load();
+    const artifactIntents = final.records.filter((entry) =>
+      entry.envelope.record_type === "effect-intent" &&
+      entry.envelope.kind === "artifact-binding");
+    const artifactResponses = final.records.filter((entry) =>
+      entry.envelope.record_type === "effect-response" &&
+      entry.envelope.kind === "artifact-binding");
+    assert.equal(artifactIntents.length, 2);
+    assert.deepEqual(
+      artifactIntents.map((entry) => entry.envelope.base_ref_oid),
+      [scopeA.base_ref_oid, scopeB.base_ref_oid],
+    );
+    assert.equal(artifactResponses.length, 1);
+    assert.equal(
+      artifactResponses[0].envelope.payload.intent_commit_sha,
+      intentB.intent_append_receipt.commit_sha,
+      "the current response cannot complete the quarantined A intent",
+    );
+  });
+
+test("artifact binding A to B to A quarantines every incomplete A1 prefix",
+  async (t) => {
+    await t.test("same-incarnation control resumes the original transaction",
+      async () => {
+        const setup = await createAutomaticRecoveryTransitionContext({
+          bindArtifact: false,
+        });
+        setup.fixture.failRereadAfterEffectUpdate(
+          "artifact-binding-ready",
+          2,
+        );
+        await assert.rejects(
+          setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: setup.schedulerAppend,
+            artifact_binding_candidate_handle:
+              setup.artifactBindingCandidateHandle,
+          }),
+          (error) => error.code === "unexpected-http-status",
+        );
+        const partial = await setup.ledger.load();
+        const original = partial.records.find((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "artifact-binding");
+        assert.notEqual(original, undefined);
+        const resumed = await setup.ledger
+          .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: setup.schedulerAppend,
+            artifact_binding_candidate_handle:
+              setup.artifactBindingCandidateHandle,
+          });
+        assert.equal(
+          resumed.intent_append_receipt.commit_sha,
+          original.commit_sha,
+        );
+        assert.equal(
+          resumed.ready_confirmation_append_receipt.commit_sha,
+          partial.records.find((entry) =>
+            entry.envelope.record_type === "effect-response" &&
+            entry.envelope.kind === "artifact-binding-ready").commit_sha,
+        );
+      });
+
+    for (const failure of [
+      { label: "intent", kind: "artifact-binding", occurrence: 1 },
+      {
+        label: "ready-intent",
+        kind: "artifact-binding-ready",
+        occurrence: 1,
+      },
+      {
+        label: "ready-confirmation",
+        kind: "artifact-binding-ready",
+        occurrence: 2,
+      },
+    ]) {
+      await t.test(failure.label, async () => {
+        const runIdentity = { ...OWNER };
+        const scopeA = {
+          pull_request: structuredClone(PR),
+          head_ref_oid: HEAD,
+          base_ref_oid: BASE,
+          potential_merge_commit_oid: null,
+        };
+        const scopeB = {
+          ...structuredClone(scopeA),
+          base_ref_oid: "d".repeat(40),
+        };
+        const verifier = provenanceVerifier({
+          eventName: "pull_request_target",
+          ref: "refs/heads/main",
+          deriveTriggerFromRequest: true,
+          runIdentity,
+        });
+        const setup = await createAutomaticRecoveryTransitionContext({
+          bindArtifact: false,
+          runIdentity,
+          verifier,
+          scope: scopeA,
+        });
+        setup.fixture.failRereadAfterEffectUpdate(
+          failure.kind,
+          failure.occurrence,
+        );
+        await assert.rejects(
+          setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: setup.schedulerAppend,
+            artifact_binding_candidate_handle:
+              setup.artifactBindingCandidateHandle,
+          }),
+          (error) => error.code === "unexpected-http-status",
+        );
+        const afterA1 = await setup.ledger.load();
+        const a1Intent = afterA1.records.find((entry) =>
+          entry.envelope.record_type === "effect-intent" &&
+          entry.envelope.kind === "artifact-binding" &&
+          entry.envelope.base_ref_oid === scopeA.base_ref_oid);
+        assert.notEqual(a1Intent, undefined);
+        assert.equal(afterA1.records.some((entry) =>
+          entry.envelope.record_type === "effect-response" &&
+          entry.envelope.kind === "artifact-binding" &&
+          entry.envelope.payload.intent_commit_sha === a1Intent.commit_sha),
+        false);
+        await releaseFixtureDiscoveryLease(
+          setup.ledger,
+          setup.context.discovery,
+        );
+
+        setup.fixture.advanceServerTime(7_200);
+        runIdentity.run_id = `91${failure.occurrence}2`;
+        const bRun = await acquireEstablishedRunnerContext({
+          ledger: setup.ledger,
+          runIdentity,
+          observationBoundary: "public-post-request-wait-complete",
+          transportStartSecond: 9_000,
+          minimalServerTime: "2026-08-13T15:00:00.000Z",
+          scope: scopeB,
+        });
+        const afterB = await setup.ledger.load();
+        const bAnchor = afterB.records.at(-1);
+        assert.equal(bAnchor.envelope.base_ref_oid, scopeB.base_ref_oid);
+        await releaseFixtureDiscoveryLease(setup.ledger, bRun.discovery);
+
+        setup.fixture.advanceServerTime(7_200);
+        runIdentity.run_id = `92${failure.occurrence}3`;
+        const a2Run = await acquireEstablishedRunnerContext({
+          ledger: setup.ledger,
+          runIdentity,
+          observationBoundary: "public-post-request-wait-complete",
+          transportStartSecond: 18_000,
+          minimalServerTime: "2026-08-13T18:00:00.000Z",
+          scope: scopeA,
+        });
+        const a2Observation = await appendAutomaticRecoveryObservation({
+          ledger: setup.ledger,
+          preflight: setup.context.preflight,
+          evaluatedScopeReceipt: a2Run.evaluatedScopeReceipt,
+          workflowCommandHandle: a2Run.workflowCommandHandle,
+          requestCreatedAt: setup.requestCreatedAt,
+          findingCreatedAt: setup.findingCreatedAt,
+          findingLine: 2,
+          historicalSnapshots: setup.historicalSnapshots,
+          requireArtifactBinding: false,
+          expectRecoveryHandle: false,
+          expectArtifactBindingCandidateHandle: true,
+        });
+        const a2Intent = await setup.ledger
+          .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: a2Observation.schedulerAppend,
+            artifact_binding_candidate_handle:
+              a2Observation.artifactBindingCandidateHandle,
+          });
+        const afterA2Intent = await setup.ledger.load();
+        const a2Entry = afterA2Intent.records.find((entry) =>
+          entry.commit_sha === a2Intent.intent_append_receipt.commit_sha);
+        assert.notEqual(a2Entry, undefined);
+        assert.notEqual(a2Entry.commit_sha, a1Intent.commit_sha);
+        assert.notEqual(
+          a2Entry.envelope.effect_id,
+          a1Intent.envelope.effect_id,
+          "the B boundary must salt the otherwise colliding A2 effect identity",
+        );
+        assert.deepEqual(
+          a2Entry.envelope.payload.action.candidate_authority.candidates
+            .map((candidate) => candidate.selector.id),
+          a1Intent.envelope.payload.action.candidate_authority.candidates
+            .map((candidate) => candidate.selector.id),
+          "A2 reuses the same carrier tuple without continuing A1",
+        );
+        assert.notEqual(
+          a2Entry.envelope.payload.action.candidate_authority.authority_digest,
+          a1Intent.envelope.payload.action.candidate_authority.authority_digest,
+          "current evidence drift is evaluated within A2, not against A1",
+        );
+        const providerArtifactHandles =
+          await loadAutomaticRecoveryProviderArtifactHandles({
+            ledger: setup.ledger,
+            fixture: setup.fixture,
+            transport: a2Intent.transport,
+            snapshots: a2Observation.snapshots,
+          });
+        const a2Response = await setup.ledger
+          .appendAutomaticRecoveryArtifactBindingResponse({
+            artifact_binding_intent_handle:
+              a2Intent.artifact_binding_intent_handle,
+            intent_append_receipt: a2Intent.intent_append_receipt,
+            provider_artifact_handles: providerArtifactHandles,
+          });
+        assert.equal(a2Response.bindings.length, 1);
+        const final = await setup.ledger.load();
+        const bindingResponses = final.records.filter((entry) =>
+          entry.envelope.record_type === "effect-response" &&
+          entry.envelope.kind === "artifact-binding");
+        assert.equal(bindingResponses.length, 1);
+        assert.equal(
+          bindingResponses[0].envelope.payload.intent_commit_sha,
+          a2Entry.commit_sha,
+        );
+        setup.fixture.advanceServerTime(60);
+        const completedA2 = await appendAutomaticRecoveryObservation({
+          ledger: setup.ledger,
+          preflight: setup.context.preflight,
+          evaluatedScopeReceipt: a2Run.evaluatedScopeReceipt,
+          workflowCommandHandle: a2Run.workflowCommandHandle,
+          requestCreatedAt: setup.requestCreatedAt,
+          findingCreatedAt: setup.findingCreatedAt,
+          findingLine: 2,
+          historicalSnapshots: [
+            ...setup.historicalSnapshots,
+            a2Observation.snapshots,
+          ],
+          requireArtifactBinding: true,
+          expectRecoveryHandle: true,
+          expectArtifactBindingCandidateHandle: false,
+        });
+        const transition = await setup.ledger
+          .appendAutomaticRequestRecoveryTransition({
+            scheduler_append: completedA2.schedulerAppend,
+            recovery_handle: completedA2.recoveryHandle,
+          });
+        assert.equal(transition.prior_generation_id, "automatic:1");
+        assert.equal(transition.next_generation_id, "automatic:2");
+      });
+    }
+  });
+
+test("retargeted findings binding rejects foreign or drifted lineage authority",
+  async (t) => {
+    for (const mutation of [{
+      label: "foreign-head",
+      mutate(authority) {
+        authority.scope.head_oid = "f".repeat(40);
+      },
+    }, {
+      label: "foreign-pull-request",
+      mutate(authority) {
+        authority.scope.pull_request.node_id = "PR_foreign";
+      },
+    }, {
+      label: "request-binding-receipt",
+      mutate(authority) {
+        authority.request_binding_receipt_digest =
+          `sha256:${"0".repeat(64)}`;
+      },
+    }, {
+      label: "generation",
+      mutate(authority) {
+        authority.generation_id = "automatic:2";
+        authority.generation_index = 2;
+      },
+    }]) {
+      await t.test(mutation.label, async () => {
+        const setup = await createRetargetedDelayedFindingContext();
+        setup.fixture.failRereadAfterEffectUpdate("artifact-binding", 1);
+        await assert.rejects(
+          setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+            scheduler_append: setup.delayed.schedulerAppend,
+            artifact_binding_candidate_handle:
+              setup.delayed.artifactBindingCandidateHandle,
+          }),
+          (error) => error.code === "unexpected-http-status",
+        );
+        const durable = await setup.ledger.load();
+        const sourceIntent = fixtureEnvelopeAt(
+          setup.fixture,
+          durable.tip_commit_sha,
+        );
+        assert.equal(sourceIntent.record_type, "effect-intent");
+        assert.equal(sourceIntent.kind, "artifact-binding");
+        const forged = resealFixtureAutomaticRecoveryIntentEnvelope(
+          sourceIntent,
+          mutation.mutate,
+        );
+        const provenanceRequest = structuredClone(
+          forged.workflow_provenance.operation_binding,
+        );
+        const minted = await setup.verifier({
+          schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+          schema_version: 1,
+          mode: "mint-and-verify",
+          provenance_request: provenanceRequest,
+          compact_jwt: null,
+          stored_receipt: null,
+        });
+        forged.workflow_provenance = minted.receipt;
+        forged.workflow_provenance_jwt = minted.compact_jwt;
+        resealEnvelope(forged);
+        setup.fixture.rewriteTipEnvelope((envelope) => {
+          Object.assign(envelope, forged);
+        });
+
+        const writesBeforeReplay = setup.fixture.writeCalls;
+        const tipBeforeReplay = setup.fixture.refTarget;
+        const restarted = makeLedger(
+          setup.fixture,
+          setup.context.capability,
+          setup.verifier,
+          setup.context.preflight,
+        );
+        await assert.rejects(
+          restarted.load(),
+          (error) => error.code === "artifact-request-lineage-mismatch",
+        );
+        assert.equal(setup.fixture.writeCalls, writesBeforeReplay);
+        assert.equal(setup.fixture.refTarget, tipBeforeReplay);
+      });
+    }
+  });
+
+test("durable recovery and its next request project one causal generation admission",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext();
+    const nextGeneration = await createNextAutomaticRequestContext(setup, {
+      requestId: "72",
+      runId: "9002",
+      transportStartSecond: 9_000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+    });
+    const receipt = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await nextGeneration.ledger.loadControlPlaneAuthority(
+        nextGeneration.context.evaluatedScopeReceipt.scope,
+      ),
+    );
+    assert.deepEqual(
+      receipt.derived.generations.map((generation) =>
+        generation.generation_id),
+      ["automatic:1", "automatic:2"],
+    );
+    assert.equal(receipt.derived.recovery_bindings.length, 1);
+    assert.equal(
+      receipt.derived.recovery_bindings[0].next_request_id,
+      "72",
+    );
+    const controller = deriveV2ProjectorControlAuthority(
+      receipt,
+      receipt.scope,
+    );
+    assert.equal(controller.generation_admissions.length, 1);
+    const admission = controller.generation_admissions[0];
+    assert.equal(admission.prior_generation_id, "automatic:1");
+    assert.equal(admission.next_generation_id, "automatic:2");
+    assert.equal(admission.prior_request_id, "71");
+    assert.equal(admission.next_request_id, "72");
+    assert.equal(admission.head_oid, HEAD);
+    assert.equal(
+      admission.recovery_transition_record_oid,
+      receipt.derived.recovery_bindings[0].record_oid,
+    );
+    assert.equal(
+      admission.recovery_transition_payload_digest,
+      receipt.derived.recovery_bindings[0].payload_digest,
+    );
+    assert.ok(
+      admission.ledger_order.prior_request_binding_index <
+        admission.ledger_order.recovery_transition_index,
+    );
+    assert.ok(
+      admission.ledger_order.recovery_transition_index <
+        admission.ledger_order.next_request_binding_index,
+    );
+    assert.equal(
+      controller.request_bindings.find((binding) =>
+        binding.id === admission.next_request_id)?.current_incarnation,
+      true,
+      "only the causally later request is current-incarnation authority",
+    );
+  });
+
+test("control-plane receipt retains same-head history across a base retarget without old exact-scope status authority",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext();
+    await setup.ledger.appendAutomaticRequestRecoveryTransition({
+      scheduler_append: setup.schedulerAppend,
+      recovery_handle: setup.recoveryHandle,
+    });
+    const original = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await setup.ledger.loadControlPlaneAuthority(
+        setup.context.evaluatedScopeReceipt.scope,
+      ),
+    );
+    assert.equal(original.derived.budget.automatic_requests_on_head, 1);
+    assert.deepEqual(
+      original.derived.generations.map((generation) => generation.generation_id),
+      ["automatic:1"],
+    );
+    assert.equal(original.derived.request_bindings.length, 1);
+    assert.equal(
+      original.derived.request_bindings[0].current_incarnation,
+      true,
+    );
+    assert.equal(original.derived.artifact_bindings.length, 1);
+    assert.equal(original.derived.recovery_bindings.length, 1);
+    assert.ok(original.derived.status_bindings.length > 0);
+    assert.notEqual(original.derived.sentinel_binding, null);
+    const assertRetainsHeadHistory = (receipt) => {
+      assert.equal(receipt.derived.budget.automatic_requests_on_head, 1);
+      assert.deepEqual(
+        receipt.derived.generations.map((generation) => ({
+          id: generation.generation_id,
+          base_oid: generation.base_oid,
+          head_oid: generation.head_oid,
+          review_epoch_digest: generation.review_epoch_digest,
+        })),
+        original.derived.generations.map((generation) => ({
+          id: generation.generation_id,
+          base_oid: generation.base_oid,
+          head_oid: generation.head_oid,
+          review_epoch_digest: generation.review_epoch_digest,
+        })),
+      );
+      assert.deepEqual(
+        receipt.derived.request_bindings.map((binding) => ({
+          ...binding,
+          current_incarnation: undefined,
+        })),
+        original.derived.request_bindings.map((binding) => ({
+          ...binding,
+          current_incarnation: undefined,
+        })),
+      );
+      assert.equal(
+        receipt.derived.request_bindings[0].current_incarnation,
+        false,
+      );
+      assert.deepEqual(
+        receipt.derived.artifact_bindings,
+        original.derived.artifact_bindings,
+      );
+      assert.deepEqual(
+        receipt.derived.recovery_bindings,
+        original.derived.recovery_bindings,
+      );
+      assert.deepEqual(receipt.derived.status_bindings, []);
+      assert.equal(receipt.derived.sentinel_binding, null);
+      assert.equal(receipt.derived.control_comment_binding, null);
+      assert.equal(receipt.derived.sticky_comment_binding, null);
+    };
+
+    await releaseFixtureDiscoveryLease(
+      setup.ledger,
+      setup.context.discovery,
+    );
+    const potentialOnlyRetarget =
+      createV2ControlPlaneReceiptFromGitLedgerAuthority(
+        await setup.ledger.loadControlPlaneAuthority({
+          pull_request: structuredClone(PR),
+          head_ref_oid: HEAD,
+          base_ref_oid: BASE,
+          potential_merge_commit_oid: "e".repeat(40),
+        }),
+      );
+    assertRetainsHeadHistory(potentialOnlyRetarget);
+
+    const retargetedScope = {
+      pull_request: structuredClone(PR),
+      head_ref_oid: HEAD,
+      base_ref_oid: "d".repeat(40),
+      potential_merge_commit_oid: "e".repeat(40),
+    };
+    const retargeted = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await setup.ledger.loadControlPlaneAuthority(retargetedScope),
+    );
+
+    assertRetainsHeadHistory(retargeted);
+    const projected = deriveV2ProjectorControlAuthority(
+      retargeted,
+      retargeted.scope,
+    );
+    assert.deepEqual(projected.request_bindings, [{
+      id: "71",
+      kind: "automatic",
+      base_oid: BASE,
+      head_oid: HEAD,
+      current_incarnation: false,
+      controlled: true,
+      generation_id: "automatic:1",
+      generation_kind: "automatic",
+      generation_index: 1,
+    }]);
+    assert.deepEqual(
+      projected.artifact_bindings,
+      original.derived.artifact_bindings.map((binding) => ({
+        id: binding.artifact_selector.id,
+        request_id: binding.request_id,
+        generation_id: binding.generation_id,
+        request_node_id: binding.request_node_id,
+        artifact_selector: binding.artifact_selector,
+        artifact_node_id: binding.artifact_node_id,
+        artifact_url: binding.artifact_url,
+        artifact_type: binding.artifact_type,
+        artifact_created_at: binding.artifact_created_at,
+        raw_body_sha256: binding.raw_body_sha256,
+        actor: binding.actor,
+        app: binding.app,
+      })),
+    );
+
+    const exactPersistedScope = structuredClone(
+      setup.context.evaluatedScopeReceipt.scope,
+    );
+    const foreignHeadScope = {
+      ...structuredClone(exactPersistedScope),
+      head_ref_oid: "f".repeat(40),
+    };
+    const foreignHead = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await setup.ledger.loadControlPlaneAuthority(foreignHeadScope),
+    );
+    assert.deepEqual(foreignHead.derived.budget, {
+      automatic_reservations_on_head: 0,
+      automatic_requests_on_head: 0,
+      manual_requests_in_epoch: 0,
+    });
+    assert.deepEqual(foreignHead.derived.generations, []);
+    assert.equal(foreignHead.derived.request_bindings.length, 1);
+    assert.equal(
+      foreignHead.derived.request_bindings[0].record_oid,
+      original.derived.request_bindings[0].record_oid,
+    );
+    assert.equal(
+      foreignHead.derived.request_bindings[0].head_oid,
+      exactPersistedScope.head_ref_oid,
+    );
+    assert.equal(
+      foreignHead.derived.request_bindings[0].current_incarnation,
+      false,
+      "a same-PR foreign-head binding is retained only as audit history",
+    );
+    assert.deepEqual(foreignHead.derived.artifact_bindings, []);
+    assert.deepEqual(foreignHead.derived.recovery_bindings, []);
+    assert.deepEqual(foreignHead.derived.status_bindings, []);
+    assert.equal(foreignHead.derived.sentinel_binding, null);
+    const foreignHeadController = deriveV2ProjectorControlAuthority(
+      foreignHead,
+      foreignHead.scope,
+    );
+    assert.deepEqual(foreignHeadController.budget, {
+      automatic_reservations_on_head: 0,
+      automatic_requests_on_head: 0,
+      manual_requests_in_epoch: 0,
+    });
+    assert.deepEqual(foreignHeadController.generations, []);
+    assert.deepEqual(foreignHeadController.generation_admissions, []);
+    assert.equal(
+      foreignHeadController.request_bindings.some((binding) =>
+        binding.current_incarnation),
+      false,
+    );
+    const afterExactScopeHistory = await setup.ledger.load();
+    const foreignHeadRunner = deriveV2GitLedgerRunnerState(
+      afterExactScopeHistory.records,
+      foreignHeadScope,
+      afterExactScopeHistory.post_ref.server_time,
+    );
+    assert.deepEqual(foreignHeadRunner.observation_history, []);
+    assert.equal(
+      foreignHeadRunner.scheduling,
+      null,
+      "a foreign head has no current scheduler snapshot authority",
+    );
+    assert.deepEqual(foreignHeadRunner.status_inventory, []);
+
+    const foreignPullRequestScope = {
+      ...structuredClone(exactPersistedScope),
+      pull_request: { number: PR.number + 1, node_id: "PR_foreign" },
+    };
+    const foreignPullRequest = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await setup.ledger.loadControlPlaneAuthority({
+        ...foreignPullRequestScope,
+      }),
+    );
+    assert.deepEqual(foreignPullRequest.derived.budget, {
+      automatic_reservations_on_head: 0,
+      automatic_requests_on_head: 0,
+      manual_requests_in_epoch: 0,
+    });
+    assert.deepEqual(foreignPullRequest.derived.generations, []);
+    assert.deepEqual(foreignPullRequest.derived.request_bindings, []);
+    assert.deepEqual(foreignPullRequest.derived.artifact_bindings, []);
+    assert.deepEqual(foreignPullRequest.derived.recovery_bindings, []);
+    assert.deepEqual(foreignPullRequest.derived.status_bindings, []);
+    assert.equal(foreignPullRequest.derived.sentinel_binding, null);
+    const foreignPullRequestRunner = deriveV2GitLedgerRunnerState(
+      afterExactScopeHistory.records,
+      foreignPullRequestScope,
+      afterExactScopeHistory.post_ref.server_time,
+    );
+    assert.deepEqual(foreignPullRequestRunner.observation_history, []);
+    assert.equal(
+      foreignPullRequestRunner.scheduling,
+      null,
+      "a foreign pull request has no current scheduler snapshot authority",
+    );
+    assert.deepEqual(foreignPullRequestRunner.status_inventory, []);
+  });
+
+test("runner retarget bootstrap keeps head recovery but resets exact scheduler authority",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext();
+    const loaded = await setup.ledger.load();
+    const retargeted = deriveV2GitLedgerRunnerState(
+      loaded.records,
+      {
+        ...structuredClone(setup.context.evaluatedScopeReceipt.scope),
+        potential_merge_commit_oid: "e".repeat(40),
+      },
+      loaded.post_ref.server_time,
+    );
+
+    assert.notEqual(retargeted.scheduling, null);
+    assert.deepEqual(retargeted.scheduling.complete_snapshots, []);
+    assert.equal(retargeted.scheduling.status.exact_sha_context_count, 0);
+    assert.equal(retargeted.scheduling.status.latest_idempotency_key, null);
+    assert.equal(retargeted.scheduling.status.head_sentinel_receipt, null);
+    assert.equal(retargeted.scheduling.no_start_candidate, null);
+    assert.deepEqual(
+      retargeted.scheduling.applied_action_keys,
+      retargeted.scheduling.applied_action_keys.filter((key) =>
+        key.startsWith("persist-auto-request-intent:") ||
+        key.startsWith("post-review-request:")),
+      "head-wide reservation and retry-zero effects survive without old status keys",
+    );
+    assert.deepEqual(retargeted.observation_history, []);
+    assert.equal(retargeted.effect_attempts.length, 1);
+    assert.deepEqual(retargeted.status_inventory, []);
+    assert.equal(retargeted.head_ledger.exact_sha_context_count, 0);
+    assert.equal(retargeted.head_ledger.latest_status_idempotency_key, null);
+    assert.equal(retargeted.head_ledger.automatic_request_count, 1,
+      "same-head reservation quota remains consumed across retarget");
+    assert.equal(retargeted.reservations.length, 1,
+      "same-head reservation recovery facts remain available");
+  });
+
+test("retarget writes scheduler recovery in the current scope without redefining the generation origin",
+  async () => {
+    const runIdentity = { ...OWNER };
+    const verifier = provenanceVerifier({
+      eventName: "pull_request_target",
+      ref: "refs/heads/main",
+      deriveTriggerFromRequest: true,
+      runIdentity,
+    });
+    const setup = await createAutomaticRecoveryTransitionContext({
+      runIdentity,
+      verifier,
+    });
+    const scopeA = setup.context.evaluatedScopeReceipt.scope;
+    const scopeB = {
+      ...structuredClone(scopeA),
+      base_ref_oid: "d".repeat(40),
+      potential_merge_commit_oid: "e".repeat(40),
+    };
+    await releaseFixtureDiscoveryLease(
+      setup.ledger,
+      setup.context.discovery,
+    );
+    setup.fixture.advanceServerTime(7_200);
+    runIdentity.run_id = "9002";
+    runIdentity.run_attempt = 1;
+    const nextRun = await acquireEstablishedRunnerContext({
+      ledger: setup.ledger,
+      runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 9_000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+      scope: scopeB,
+    });
+    const recovery = await appendAutomaticRecoveryObservation({
+      ledger: setup.ledger,
+      preflight: setup.context.preflight,
+      evaluatedScopeReceipt: nextRun.evaluatedScopeReceipt,
+      workflowCommandHandle: nextRun.workflowCommandHandle,
+      requestCreatedAt: setup.requestCreatedAt,
+      findingCreatedAt: setup.findingCreatedAt,
+      historicalSnapshots: setup.historicalSnapshots,
+      requireArtifactBinding: true,
+      expectRecoveryHandle: true,
+      expectArtifactBindingCandidateHandle: false,
+    });
+    const transition = await setup.ledger
+      .appendAutomaticRequestRecoveryTransition({
+        scheduler_append: recovery.schedulerAppend,
+        recovery_handle: recovery.recoveryHandle,
+      });
+    assert.equal(transition.prior_generation_id, "automatic:1");
+    assert.equal(transition.next_generation_id, "automatic:2");
+
+    const fresh = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      verifier,
+      setup.context.preflight,
+    );
+    const loaded = await fresh.load();
+    const schedulerState = loaded.records.filter((entry) =>
+      entry.envelope.kind === "scheduler-state");
+    assert.equal(schedulerState.length, 2);
+    assert.ok(schedulerState.every((entry) =>
+      entry.envelope.base_ref_oid === scopeB.base_ref_oid &&
+      entry.envelope.potential_merge_commit_oid ===
+        scopeB.potential_merge_commit_oid));
+    const receipt = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await fresh.loadControlPlaneAuthority(scopeB),
+    );
+    assert.equal(receipt.derived.generations.length, 1);
+    assert.equal(receipt.derived.generations[0].generation_id, "automatic:1");
+    assert.equal(receipt.derived.generations[0].base_oid, scopeA.base_ref_oid);
+    assert.equal(receipt.derived.generations[0].head_oid, scopeA.head_ref_oid);
+    assert.equal(receipt.derived.recovery_bindings.length, 1);
+    assert.equal(
+      receipt.derived.recovery_bindings[0].prior_generation_id,
+      "automatic:1",
+    );
+    assert.equal(
+      receipt.derived.recovery_bindings[0].next_generation_id,
+      "automatic:2",
+    );
+  });
+
+test("durable A to B to A retargets isolate exact scheduler incarnations",
+  async () => {
+    const runIdentity = { ...OWNER };
+    const originScope = {
+      pull_request: structuredClone(PR),
+      head_ref_oid: HEAD,
+      base_ref_oid: BASE,
+      potential_merge_commit_oid: null,
+    };
+    const verifier = provenanceVerifier({
+      eventName: "pull_request_target",
+      ref: "refs/heads/main",
+      deriveTriggerFromRequest: true,
+      runIdentity,
+    });
+    const setup = await createAutomaticRecoveryTransitionContext({
+      runIdentity,
+      verifier,
+      scope: originScope,
+    });
+    await setup.ledger.appendAutomaticRequestRecoveryTransition({
+      scheduler_append: setup.schedulerAppend,
+      recovery_handle: setup.recoveryHandle,
+    });
+    const scopeA = setup.context.evaluatedScopeReceipt.scope;
+    const scopeB = {
+      ...structuredClone(scopeA),
+      base_ref_oid: "d".repeat(40),
+    };
+    assert.equal(scopeA.potential_merge_commit_oid, null);
+    assert.equal(scopeB.potential_merge_commit_oid, null);
+    const a1ObservationOids = (await setup.ledger.load()).records
+      .filter((entry) =>
+        entry.envelope.record_type === "effect-intent" &&
+        entry.envelope.kind === "scheduler-observation" &&
+        entry.envelope.base_ref_oid === scopeA.base_ref_oid)
+      .map((entry) => entry.commit_sha);
+    assert.ok(a1ObservationOids.length > 0);
+    await releaseFixtureDiscoveryLease(
+      setup.ledger,
+      setup.context.discovery,
+    );
+
+    setup.fixture.advanceServerTime(7_200);
+    runIdentity.run_id = "9002";
+    runIdentity.run_attempt = 1;
+    const bRun = await acquireEstablishedRunnerContext({
+      ledger: setup.ledger,
+      runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 9_000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+      scope: scopeB,
+    });
+    const bInitialCommand = await createPullRequestTargetWorkflowCommandHandle({
+      runIdentity,
+      observationBoundary: "initial",
+    });
+    await assert.rejects(
+      setup.ledger.loadInitialRunnerStateAuthority({
+        control_plane_authority: bRun.controlPlaneAuthority,
+        evaluated_scope_receipt: bRun.evaluatedScopeReceipt,
+        workflow_command_handle: bInitialCommand,
+      }),
+      (error) => error.code === "initial-runner-history-exists",
+    );
+    const bEstablished = await setup.ledger
+      .loadEstablishedRunnerStateAuthority({
+        control_plane_authority: bRun.controlPlaneAuthority,
+        evaluated_scope_receipt: bRun.evaluatedScopeReceipt,
+        workflow_command_handle: bRun.workflowCommandHandle,
+      });
+    const bReceipt = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      bRun.controlPlaneAuthority,
+    );
+    const bProduction = createV2ProductionRunnerAuthority({
+      preflight_handle: setup.context.preflight,
+      control_plane_receipt: bReceipt,
+      established_runner_state_authority: bEstablished,
+      expected_scope: scopeB,
+    });
+    assert.deepEqual(bEstablished.scheduling.complete_snapshots, []);
+    assert.deepEqual(bEstablished.scheduling.wait_completions, []);
+    assert.equal(bEstablished.scheduling.status.exact_sha_context_count, 0);
+    assert.equal(bEstablished.scheduling.status.latest_idempotency_key, null);
+    assert.equal(bEstablished.scheduling.status.head_sentinel_receipt, null);
+    assert.equal(bEstablished.scheduling.no_start_candidate, null);
+    assert.equal(bEstablished.scheduling.epoch.controlled_request.request_id, "71");
+    assert.equal(
+      bEstablished.scheduling.epoch.automatic_request.generation_index,
+      2,
+    );
+    assert.equal(bProduction.head_ledger.automatic_request_count, 1);
+    assert.equal(bReceipt.derived.generations.length, 1);
+    const bApplied = bEstablished.scheduling.applied_action_keys;
+    assert.ok(bApplied.some((key) =>
+      key.startsWith("persist-auto-request-intent:")));
+    assert.ok(bApplied.some((key) =>
+      key.startsWith("post-review-request:")));
+    assert.ok(bApplied.every((key) =>
+      key.startsWith("persist-auto-request-intent:") ||
+      key.startsWith("post-review-request:")));
+    const bInputs = schedulerInputsForEstablishedAuthority(bEstablished, {
+      snapshotId: "snapshot-retarget-b",
+    });
+    bInputs.status_plan = buildV2StatusPlan({
+      decision: bInputs.scheduler_evaluation.decision,
+      status_target_mode: bEstablished.scheduling.status_target_mode,
+      status_context: "codex/github-review-gate",
+      target: {
+        validated: false,
+        terminal_sha: scopeB.potential_merge_commit_oid,
+        head_sentinel_sha: scopeB.head_ref_oid,
+        head_sentinel_receipt:
+          bEstablished.scheduling.status.head_sentinel_receipt,
+      },
+      snapshot_fingerprint:
+        bInputs.scheduler_evaluation.snapshot_fingerprint,
+    });
+    const bAppend = await setup.ledger.appendEstablishedSchedulerObservation({
+      established_runner_state_authority: bEstablished,
+      ...bInputs,
+    });
+    const bStatus = await appendRequiredStatusForScheduler(
+      setup.ledger,
+      bAppend,
+    );
+    const currentBLoad = await setup.ledger.load();
+    const currentB = deriveV2GitLedgerRunnerState(
+      currentBLoad.records,
+      scopeB,
+      currentBLoad.post_ref.server_time,
+    );
+    assert.deepEqual(
+      currentB.observation_history.map((entry) => entry.record_oid),
+      [bAppend.append_receipt.commit_sha],
+      "the current B incarnation exposes its durable observation",
+    );
+    assert.deepEqual(
+      currentB.scheduling.complete_snapshots.map((snapshot) =>
+        snapshot.snapshot_id),
+      ["snapshot-retarget-b"],
+    );
+    assert.equal(currentB.status_inventory.length, 1);
+    assert.equal(
+      currentB.status_inventory[0].response_record_oid,
+      bStatus.response_append_receipt.commit_sha,
+    );
+    assert.notEqual(
+      currentB.scheduling.status.head_sentinel_receipt,
+      null,
+      "the current B incarnation exposes its response-bound sentinel",
+    );
+    const currentBReceipt = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await setup.ledger.loadControlPlaneAuthority(scopeB),
+    );
+    assert.equal(currentBReceipt.derived.status_bindings.length, 1);
+    assert.notEqual(currentBReceipt.derived.sentinel_binding, null);
+    await releaseFixtureDiscoveryLease(setup.ledger, bRun.discovery);
+
+    setup.fixture.advanceServerTime(7_200);
+    runIdentity.run_id = "9003";
+    const a2Run = await acquireEstablishedRunnerContext({
+      ledger: setup.ledger,
+      runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 18_000,
+      minimalServerTime: "2026-08-13T18:00:00.000Z",
+      scope: scopeA,
+    });
+    const a2Established = await setup.ledger
+      .loadEstablishedRunnerStateAuthority({
+        control_plane_authority: a2Run.controlPlaneAuthority,
+        evaluated_scope_receipt: a2Run.evaluatedScopeReceipt,
+        workflow_command_handle: a2Run.workflowCommandHandle,
+      });
+    const a2Receipt = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      a2Run.controlPlaneAuthority,
+    );
+    createV2ProductionRunnerAuthority({
+      preflight_handle: setup.context.preflight,
+      control_plane_receipt: a2Receipt,
+      established_runner_state_authority: a2Established,
+      expected_scope: scopeA,
+    });
+    assert.deepEqual(a2Established.scheduling.complete_snapshots, []);
+    assert.equal(a2Established.scheduling.status.exact_sha_context_count, 0);
+    assert.equal(a2Established.scheduling.status.head_sentinel_receipt, null);
+    assert.equal(a2Established.scheduling.no_start_candidate, null);
+    const a2Inputs = schedulerInputsForEstablishedAuthority(a2Established, {
+      snapshotId: "snapshot-retarget-a2",
+    });
+    const a2Append = await setup.ledger.appendEstablishedSchedulerObservation({
+      established_runner_state_authority: a2Established,
+      ...a2Inputs,
+    });
+
+    const fresh = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      verifier,
+      setup.context.preflight,
+    );
+    const freshLoad = await fresh.load();
+    const freshA = deriveV2GitLedgerRunnerState(
+      freshLoad.records,
+      scopeA,
+      freshLoad.post_ref.server_time,
+    );
+    const freshB = deriveV2GitLedgerRunnerState(
+      freshLoad.records,
+      scopeB,
+      freshLoad.post_ref.server_time,
+    );
+    assert.deepEqual(
+      freshA.observation_history.map((entry) => entry.record_oid),
+      [a2Append.append_receipt.commit_sha],
+    );
+    assert.ok(freshA.observation_history.every((entry) =>
+      !a1ObservationOids.includes(entry.record_oid) &&
+      entry.record_oid !== bAppend.append_receipt.commit_sha));
+    assert.deepEqual(freshB.observation_history, []);
+    assert.deepEqual(freshB.scheduling.complete_snapshots, []);
+    assert.deepEqual(freshB.status_inventory, []);
+    assert.equal(freshA.head_ledger.automatic_request_count, 1);
+    assert.equal(freshA.reservations.length, 1);
+    assert.equal(freshA.effect_attempts.length, 1);
+    const freshAReceipt = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await fresh.loadControlPlaneAuthority(scopeA),
+    );
+    assert.equal(freshAReceipt.derived.request_bindings.length, 1);
+    assert.equal(
+      freshAReceipt.derived.request_bindings[0].current_incarnation,
+      false,
+      "the old A1 request remains in head history but not the A2 incarnation",
+    );
+    assert.deepEqual(freshAReceipt.derived.status_bindings, []);
+    assert.equal(freshAReceipt.derived.sentinel_binding, null);
+    assert.deepEqual(freshAReceipt.derived.no_start_observations, []);
+    assert.deepEqual(freshAReceipt.derived.thread_resolution_observations, []);
+    assert.equal(freshAReceipt.derived.control_comment_binding, null);
+    assert.equal(freshAReceipt.derived.sticky_comment_binding, null);
+  });
+
+test("durable potential null to OID to null boundaries isolate exact scheduler incarnations",
+  async () => {
+    const fixture = githubGitFixture();
+    const runIdentity = { ...OWNER };
+    const scopeA = {
+      pull_request: structuredClone(PR),
+      head_ref_oid: HEAD,
+      base_ref_oid: BASE,
+      potential_merge_commit_oid: null,
+    };
+    const scopeB = {
+      ...structuredClone(scopeA),
+      potential_merge_commit_oid: "e".repeat(40),
+    };
+    const verifier = provenanceVerifier({
+      eventName: "pull_request_target",
+      ref: "refs/heads/main",
+      deriveTriggerFromRequest: true,
+      runIdentity,
+    });
+    const context = await createProtectedInitialRunnerContext(fixture, {
+      runIdentity,
+      verifier,
+      scope: scopeA,
+    });
+    const a1Seed = schedulerObservationRecord({
+      predecessor: context.lease.acquire_commit_sha,
+      lease: context.lease,
+      priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+      initialAuthority: context.initialAuthority,
+    }).payload.action;
+    const a1Append = await context.ledger.appendInitialSchedulerObservation({
+      initial_runner_state_authority: context.initialAuthority,
+      scheduler_evaluation: a1Seed.scheduler_evaluation,
+      status_plan: a1Seed.status_plan,
+    });
+    const a1Status = await appendRequiredStatusForScheduler(
+      context.ledger,
+      a1Append,
+    );
+    const a1Load = await context.ledger.load();
+    const currentA1 = deriveV2GitLedgerRunnerState(
+      a1Load.records,
+      scopeA,
+      a1Load.post_ref.server_time,
+    );
+    assert.deepEqual(
+      currentA1.observation_history.map((entry) => entry.record_oid),
+      [a1Append.append_receipt.commit_sha],
+    );
+    assert.equal(
+      currentA1.status_inventory[0].response_record_oid,
+      a1Status.response_append_receipt.commit_sha,
+    );
+    assert.notEqual(
+      currentA1.scheduling.status.head_sentinel_receipt,
+      null,
+    );
+    await releaseFixtureDiscoveryLease(context.ledger, context.discovery);
+
+    fixture.advanceServerTime(7_200);
+    runIdentity.run_id = "9002";
+    const bRun = await acquireEstablishedRunnerContext({
+      ledger: context.ledger,
+      runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 9_000,
+      minimalServerTime: "2026-08-13T15:00:00.000Z",
+      scope: scopeB,
+    });
+    const bEstablished = await context.ledger
+      .loadEstablishedRunnerStateAuthority({
+        control_plane_authority: bRun.controlPlaneAuthority,
+        evaluated_scope_receipt: bRun.evaluatedScopeReceipt,
+        workflow_command_handle: bRun.workflowCommandHandle,
+      });
+    assert.deepEqual(bEstablished.scheduling.complete_snapshots, []);
+    assert.deepEqual(
+      bRun.controlPlaneAuthority.scoped_authority.runner_state
+        .status_inventory,
+      [],
+    );
+    assert.equal(bEstablished.scheduling.status.head_sentinel_receipt, null);
+    const bInputs = schedulerInputsForEstablishedAuthority(bEstablished, {
+      snapshotId: "snapshot-potential-b",
+    });
+    bInputs.status_plan = buildV2StatusPlan({
+      decision: bInputs.scheduler_evaluation.decision,
+      status_target_mode: bEstablished.scheduling.status_target_mode,
+      status_context: "codex/github-review-gate",
+      target: {
+        validated: false,
+        terminal_sha: scopeB.potential_merge_commit_oid,
+        head_sentinel_sha: scopeB.head_ref_oid,
+        head_sentinel_receipt:
+          bEstablished.scheduling.status.head_sentinel_receipt,
+      },
+      snapshot_fingerprint:
+        bInputs.scheduler_evaluation.snapshot_fingerprint,
+    });
+    const bAppend = await context.ledger.appendEstablishedSchedulerObservation({
+      established_runner_state_authority: bEstablished,
+      ...bInputs,
+    });
+    const bStatus = await appendRequiredStatusForScheduler(
+      context.ledger,
+      bAppend,
+    );
+    const bLoad = await context.ledger.load();
+    const currentB = deriveV2GitLedgerRunnerState(
+      bLoad.records,
+      scopeB,
+      bLoad.post_ref.server_time,
+    );
+    assert.deepEqual(
+      currentB.observation_history.map((entry) => entry.record_oid),
+      [bAppend.append_receipt.commit_sha],
+    );
+    assert.deepEqual(
+      currentB.scheduling.complete_snapshots.map((snapshot) =>
+        snapshot.snapshot_id),
+      ["snapshot-potential-b"],
+    );
+    assert.equal(
+      currentB.status_inventory[0].response_record_oid,
+      bStatus.response_append_receipt.commit_sha,
+    );
+    assert.notEqual(currentB.scheduling.status.head_sentinel_receipt, null);
+    await releaseFixtureDiscoveryLease(context.ledger, bRun.discovery);
+
+    fixture.advanceServerTime(7_200);
+    runIdentity.run_id = "9003";
+    const a2Run = await acquireEstablishedRunnerContext({
+      ledger: context.ledger,
+      runIdentity,
+      observationBoundary: "public-post-request-wait-complete",
+      transportStartSecond: 18_000,
+      minimalServerTime: "2026-08-13T18:00:00.000Z",
+      scope: scopeA,
+    });
+    const a2Established = await context.ledger
+      .loadEstablishedRunnerStateAuthority({
+        control_plane_authority: a2Run.controlPlaneAuthority,
+        evaluated_scope_receipt: a2Run.evaluatedScopeReceipt,
+        workflow_command_handle: a2Run.workflowCommandHandle,
+      });
+    assert.deepEqual(
+      a2Established.scheduling.complete_snapshots,
+      [],
+      "the null potential is an exact value, not a wildcard for B",
+    );
+    assert.deepEqual(
+      a2Run.controlPlaneAuthority.scoped_authority.runner_state
+        .status_inventory,
+      [],
+    );
+    assert.equal(
+      a2Established.scheduling.status.head_sentinel_receipt,
+      null,
+      "the durable B boundary prevents A1 sentinel revival",
+    );
+    const a2Inputs = schedulerInputsForEstablishedAuthority(a2Established, {
+      snapshotId: "snapshot-potential-a2",
+    });
+    const a2Append = await context.ledger
+      .appendEstablishedSchedulerObservation({
+        established_runner_state_authority: a2Established,
+        ...a2Inputs,
+      });
+
+    const fresh = makeLedger(
+      fixture,
+      context.capability,
+      verifier,
+      context.preflight,
+    );
+    const freshLoad = await fresh.load();
+    const freshA = deriveV2GitLedgerRunnerState(
+      freshLoad.records,
+      scopeA,
+      freshLoad.post_ref.server_time,
+    );
+    const freshB = deriveV2GitLedgerRunnerState(
+      freshLoad.records,
+      scopeB,
+      freshLoad.post_ref.server_time,
+    );
+    assert.deepEqual(
+      freshA.observation_history.map((entry) => entry.record_oid),
+      [a2Append.append_receipt.commit_sha],
+    );
+    assert.ok(freshA.observation_history.every((entry) =>
+      entry.record_oid !== a1Append.append_receipt.commit_sha &&
+      entry.record_oid !== bAppend.append_receipt.commit_sha));
+    assert.deepEqual(
+      freshA.scheduling.complete_snapshots.map((snapshot) =>
+        snapshot.snapshot_id),
+      ["snapshot-potential-a2"],
+    );
+    assert.deepEqual(freshA.status_inventory, []);
+    assert.equal(freshA.scheduling.status.head_sentinel_receipt, null);
+    assert.deepEqual(freshB.observation_history, []);
+    assert.deepEqual(freshB.scheduling.complete_snapshots, []);
+    assert.deepEqual(freshB.status_inventory, []);
+    assert.equal(freshB.scheduling.status.head_sentinel_receipt, null);
+  });
+
 test("automatic recovery findings mint an opaque artifact-binding candidate before recovery",
   async () => {
     const setup = await createAutomaticRecoveryTransitionContext({
@@ -2990,6 +4832,488 @@ test("automatic recovery findings mint an opaque artifact-binding candidate befo
       ),
       /exact runner result object/u,
     );
+  });
+
+test("terminal clean classification is audit-only and cannot mint ledger binding authority",
+  async () => {
+    const setup = await createTerminalCleanArtifactBindingContext();
+    assert.equal(setup.runnerResult.decision, "inconclusive");
+    assert.equal(setup.runnerResult.status_plan.terminal_cutover, false);
+    assert.ok(setup.runnerResult.status_plan.writes.every((write) =>
+      write.state !== "success"));
+    assert.equal(setup.recoveryHandle, null);
+    assert.equal(setup.artifactBindingCandidateHandle, null);
+    const loaded = await setup.ledger.load();
+    assert.equal(loaded.records.some((entry) =>
+      entry.envelope.kind === "artifact-binding"), false);
+  });
+
+test("terminal clean remains classification-only after a fresh ledger restart",
+  async () => {
+    const setup = await createTerminalCleanArtifactBindingContext();
+    const restarted = await createFreshAutomaticRecoveryContinuation(setup, {
+      terminalClean: true,
+      includeAddresses: false,
+      requireArtifactBinding: false,
+      expectRecoveryHandle: false,
+      expectArtifactBindingCandidateHandle: false,
+    });
+    assert.equal(restarted.recovery.runnerResult.decision, "inconclusive");
+    assert.equal(
+      restarted.recovery.runnerResult.status_plan.terminal_cutover,
+      false,
+    );
+    assert.equal(restarted.recovery.artifactBindingCandidateHandle, null);
+    assert.equal(restarted.recovery.recoveryHandle, null);
+    const loaded = await restarted.ledger.load();
+    assert.equal(loaded.records.some((entry) =>
+      entry.envelope.kind === "artifact-binding"), false);
+  });
+
+test("generalized artifact-binding candidates cannot cross scheduler decisions",
+  async () => {
+    const mismatch = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+      schedulerDecisionOverride: "clean",
+    });
+    assert.equal(mismatch.runnerResult.decision, "findings");
+    assert.equal(mismatch.schedulerEvaluation.decision, "clean");
+    assert.deepEqual(
+      {
+        ...mismatch.schedulerEvaluation,
+        decision: mismatch.runnerResult.scheduler_evaluation.decision,
+      },
+      mismatch.runnerResult.scheduler_evaluation,
+    );
+    assert.equal(mismatch.schedulerStatusPlan.decision, "clean");
+    assert.equal(mismatch.statusResponses.length,
+      mismatch.schedulerStatusPlan.writes.length);
+    assert.ok(mismatch.statusResponses.length > 0);
+
+    const before = await mismatch.ledger.load();
+    const writesBefore = mismatch.fixture.writeCalls;
+    await assert.rejects(
+      mismatch.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: mismatch.schedulerAppend,
+        artifact_binding_candidate_handle:
+          mismatch.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code ===
+        "automatic-artifact-binding-candidate-observation-mismatch",
+    );
+    const after = await mismatch.ledger.load();
+    assert.equal(mismatch.fixture.writeCalls, writesBefore);
+    assert.equal(after.tip_commit_sha, before.tip_commit_sha);
+    assert.equal(after.records.filter((entry) =>
+      entry.envelope.kind === "artifact-binding").length, 0);
+  });
+
+test("historical v2 terminal-clean bytes parse for audit but durable lineage rejects their purpose",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    setup.fixture.failRereadAfterEffectUpdate("artifact-binding", 1);
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+    const beforeRewrite = await setup.ledger.load();
+    const findingIntent = fixtureEnvelopeAt(
+      setup.fixture,
+      beforeRewrite.tip_commit_sha,
+    );
+    assert.equal(findingIntent.record_type, "effect-intent");
+    assert.equal(findingIntent.kind, "artifact-binding");
+    const sourceAuthority = findingIntent.payload.action.candidate_authority;
+    assert.equal(sourceAuthority.decision, "findings");
+    const schedulerEntry = beforeRewrite.records.find((entry) =>
+      entry.commit_sha ===
+        findingIntent.payload.action.scheduler_observation_record_oid);
+    assert.notEqual(schedulerEntry, undefined);
+    assert.equal(
+      schedulerEntry.envelope.payload.action.scheduler_evaluation.decision,
+      "findings",
+    );
+
+    const historicalTerminal = resealFixtureAutomaticRecoveryIntentEnvelope(
+      findingIntent,
+      (authority) => {
+        authority.schema_version = 2;
+        authority.candidate_version = 1;
+        authority.purpose = "terminal-clean-completion";
+        authority.decision = "pending";
+        authority.generation_id = "automatic:3";
+        authority.generation_index = 3;
+      },
+    );
+    const provenanceRequest = structuredClone(
+      historicalTerminal.workflow_provenance.operation_binding,
+    );
+    const minted = await setup.context.verifier({
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode: "mint-and-verify",
+      provenance_request: provenanceRequest,
+      compact_jwt: null,
+      stored_receipt: null,
+    });
+    historicalTerminal.workflow_provenance = minted.receipt;
+    historicalTerminal.workflow_provenance_jwt = minted.compact_jwt;
+    resealEnvelope(historicalTerminal);
+    assert.equal(
+      validateV2GitLedgerEnvelope(historicalTerminal),
+      historicalTerminal,
+    );
+    assert.equal(
+      historicalTerminal.payload.action.candidate_authority.purpose,
+      "terminal-clean-completion",
+    );
+    assert.equal(
+      historicalTerminal.payload.action.candidate_authority.decision,
+      "pending",
+    );
+    const mintedJwtPayload = JSON.parse(Buffer.from(
+      minted.compact_jwt.split(".")[1],
+      "base64url",
+    ).toString("utf8"));
+    assert.equal(
+      mintedJwtPayload.request_digest,
+      provenanceRequest.request_digest,
+      "the durable historical fixture uses a token minted for its exact payload",
+    );
+    const reverified = await setup.context.verifier({
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode: "reverify-stored",
+      provenance_request: provenanceRequest,
+      compact_jwt: minted.compact_jwt,
+      stored_receipt: minted.receipt,
+    });
+    assert.deepEqual(reverified.receipt, minted.receipt);
+    setup.fixture.rewriteTipEnvelope((envelope) => {
+      Object.assign(envelope, historicalTerminal);
+    });
+    assert.notEqual(setup.fixture.refTarget, beforeRewrite.tip_commit_sha);
+    assert.deepEqual(
+      fixtureEnvelopeAt(setup.fixture, setup.fixture.refTarget),
+      historicalTerminal,
+    );
+
+    const restarted = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      setup.context.verifier,
+      setup.context.preflight,
+    );
+    const writesBeforeReplay = setup.fixture.writeCalls;
+    const durableTip = setup.fixture.refTarget;
+    await assert.rejects(
+      restarted.load(),
+      (error) => error.code === "terminal-clean-artifact-binding-disabled",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeReplay);
+    assert.equal(setup.fixture.refTarget, durableTip);
+
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code === "terminal-clean-artifact-binding-disabled",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeReplay);
+    assert.equal(setup.fixture.refTarget, durableTip);
+
+    const current = await createTerminalCleanArtifactBindingContext();
+    assert.equal(current.artifactBindingCandidateHandle, null);
+    assert.equal(current.recoveryHandle, null);
+    assert.equal((await current.ledger.load()).records.some((entry) =>
+      entry.envelope.kind === "artifact-binding"), false);
+  });
+
+test("legacy v1 finding authority remains durable and can never authorize clean",
+  async () => {
+    const setup = await createAutomaticRecoveryTransitionContext({
+      bindArtifact: false,
+    });
+    setup.fixture.failRereadAfterEffectUpdate("artifact-binding", 1);
+    await assert.rejects(
+      setup.ledger.loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      }),
+      (error) => error.code === "unexpected-http-status",
+    );
+    const beforeRewrite = await setup.ledger.load();
+    const sourceIntent = fixtureEnvelopeAt(
+      setup.fixture,
+      beforeRewrite.tip_commit_sha,
+    );
+    assert.equal(sourceIntent.record_type, "effect-intent");
+    assert.equal(sourceIntent.kind, "artifact-binding");
+    assert.equal(
+      sourceIntent.payload.action.candidate_authority.schema_version,
+      1,
+    );
+
+    const v2Intent = resealFixtureAutomaticRecoveryIntentEnvelope(
+      sourceIntent,
+      (authority) => {
+        authority.schema_version = 2;
+        authority.candidate_version = 1;
+        authority.purpose = "finding-recovery";
+      },
+    );
+    const v2ProvenanceRequest = structuredClone(
+      v2Intent.workflow_provenance.operation_binding,
+    );
+    const v2Minted = await setup.context.verifier({
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode: "mint-and-verify",
+      provenance_request: v2ProvenanceRequest,
+      compact_jwt: null,
+      stored_receipt: null,
+    });
+    v2Intent.workflow_provenance = v2Minted.receipt;
+    v2Intent.workflow_provenance_jwt = v2Minted.compact_jwt;
+    resealEnvelope(v2Intent);
+    assert.equal(validateV2GitLedgerEnvelope(v2Intent), v2Intent);
+    const v2JwtPayload = JSON.parse(Buffer.from(
+      v2Minted.compact_jwt.split(".")[1],
+      "base64url",
+    ).toString("utf8"));
+    assert.equal(
+      v2JwtPayload.request_digest,
+      v2ProvenanceRequest.request_digest,
+    );
+    const v2Reverified = await setup.context.verifier({
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode: "reverify-stored",
+      provenance_request: v2ProvenanceRequest,
+      compact_jwt: v2Minted.compact_jwt,
+      stored_receipt: v2Minted.receipt,
+    });
+    assert.deepEqual(v2Reverified.receipt, v2Minted.receipt);
+
+    const legacyEnvelope = resealFixtureAutomaticRecoveryIntentEnvelope(
+      v2Intent,
+      (authority) => {
+        authority.schema_version = 1;
+        delete authority.candidate_version;
+        delete authority.purpose;
+      },
+    );
+    const legacyProvenanceRequest = structuredClone(
+      legacyEnvelope.workflow_provenance.operation_binding,
+    );
+    const staleJwtPayload = JSON.parse(Buffer.from(
+      legacyEnvelope.workflow_provenance_jwt.split(".")[1],
+      "base64url",
+    ).toString("utf8"));
+    assert.notEqual(
+      staleJwtPayload.request_digest,
+      legacyProvenanceRequest.request_digest,
+      "resealing the legacy payload invalidates the source JWT request binding",
+    );
+    setup.fixture.rewriteTipEnvelope((envelope) => {
+      Object.assign(envelope, legacyEnvelope);
+    });
+
+    const strictReplayVerifier = async (request, options) => {
+      if (request.mode === "reverify-stored") {
+        const jwtPayload = JSON.parse(Buffer.from(
+          request.compact_jwt.split(".")[1],
+          "base64url",
+        ).toString("utf8"));
+        if (
+          jwtPayload.request_digest !==
+            request.provenance_request.request_digest
+        ) {
+          throw new Error("fixture JWT is not bound to the provenance request");
+        }
+      }
+      return setup.context.verifier(request, options);
+    };
+    const staleTip = setup.fixture.refTarget;
+    const writesBeforeStaleReplay = setup.fixture.writeCalls;
+    await assert.rejects(
+      makeLedger(
+        setup.fixture,
+        setup.context.capability,
+        strictReplayVerifier,
+        setup.context.preflight,
+      ).load(),
+      (error) => error.code === "workflow-provenance-verification-failed",
+    );
+    assert.equal(setup.fixture.writeCalls, writesBeforeStaleReplay);
+    assert.equal(setup.fixture.refTarget, staleTip);
+
+    const minted = await setup.context.verifier({
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode: "mint-and-verify",
+      provenance_request: legacyProvenanceRequest,
+      compact_jwt: null,
+      stored_receipt: null,
+    });
+    legacyEnvelope.workflow_provenance = minted.receipt;
+    legacyEnvelope.workflow_provenance_jwt = minted.compact_jwt;
+    resealEnvelope(legacyEnvelope);
+    const exactJwtPayload = JSON.parse(Buffer.from(
+      minted.compact_jwt.split(".")[1],
+      "base64url",
+    ).toString("utf8"));
+    assert.equal(
+      exactJwtPayload.request_digest,
+      legacyProvenanceRequest.request_digest,
+    );
+    const reverified = await setup.context.verifier({
+      schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_REQUEST_SCHEMA,
+      schema_version: 1,
+      mode: "reverify-stored",
+      provenance_request: legacyProvenanceRequest,
+      compact_jwt: minted.compact_jwt,
+      stored_receipt: minted.receipt,
+    });
+    assert.deepEqual(reverified.receipt, minted.receipt);
+    setup.fixture.rewriteTipEnvelope((envelope) => {
+      Object.assign(envelope, legacyEnvelope);
+    });
+    assert.notEqual(setup.fixture.refTarget, staleTip);
+    assert.deepEqual(
+      fixtureEnvelopeAt(setup.fixture, setup.fixture.refTarget),
+      legacyEnvelope,
+    );
+    assert.equal(validateV2GitLedgerEnvelope(legacyEnvelope), legacyEnvelope);
+    const legacyAuthority = legacyEnvelope.payload.action
+      .candidate_authority;
+    assert.equal(legacyAuthority.schema_version, 1);
+    assert.equal(legacyAuthority.decision, "findings");
+    assert.equal(Object.hasOwn(legacyAuthority, "candidate_version"), false);
+    assert.equal(Object.hasOwn(legacyAuthority, "purpose"), false);
+    const expectedLegacyCandidateSetDigest = digestCanonical(
+      "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate-set",
+      {
+        review_epoch_id: legacyAuthority.review_epoch_id,
+        generation_id: legacyAuthority.generation_id,
+        request_id: legacyAuthority.request_id,
+        request_node_id: legacyAuthority.request_node_id,
+        request_bound_at: legacyAuthority.request_bound_at,
+        request_binding_record_oid:
+          legacyAuthority.request_binding_record_oid,
+        request_binding_receipt_digest:
+          legacyAuthority.request_binding_receipt_digest,
+        expected_actor: structuredClone(legacyAuthority.expected_actor),
+        expected_app: structuredClone(legacyAuthority.expected_app),
+        scope: structuredClone(legacyAuthority.scope),
+        candidates: legacyAuthority.candidates.map((candidate) => ({
+          selector: structuredClone(candidate.selector),
+          artifact_node_id: candidate.artifact_node_id,
+          artifact_url: candidate.artifact_url,
+          artifact_type: candidate.artifact_type,
+          artifact_created_at: candidate.artifact_created_at,
+          evidence_raw_body_sha256: candidate.evidence_raw_body_sha256,
+        })),
+      },
+    );
+    assert.equal(
+      legacyEnvelope.payload.action.candidate_set_digest,
+      expectedLegacyCandidateSetDigest,
+    );
+    const expectedEffectIdentity = `automatic-artifact-bindings:${
+      expectedLegacyCandidateSetDigest.slice("sha256:".length)
+    }`;
+    assert.equal(legacyEnvelope.effect_id, expectedEffectIdentity);
+    assert.equal(legacyEnvelope.idempotency_key, expectedEffectIdentity);
+    assert.equal(
+      legacyEnvelope.workflow_provenance.operation_binding.record_identity
+        .effect_id,
+      expectedEffectIdentity,
+    );
+    assert.equal(
+      legacyEnvelope.workflow_provenance.operation_binding.record_identity
+        .idempotency_key,
+      expectedEffectIdentity,
+    );
+
+    const restarted = makeLedger(
+      setup.fixture,
+      setup.context.capability,
+      setup.context.verifier,
+      setup.context.preflight,
+    );
+    const durable = await restarted.load();
+    const durableLegacyAuthority = durable.records.at(-1).envelope.payload
+      .action.candidate_authority;
+    assert.equal(durableLegacyAuthority.schema_version, 1);
+    assert.equal(durableLegacyAuthority.decision, "findings");
+
+    const recovered = await setup.ledger
+      .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+        scheduler_append: setup.schedulerAppend,
+        artifact_binding_candidate_handle:
+          setup.artifactBindingCandidateHandle,
+      });
+    assert.equal(
+      recovered.intent_append_receipt.commit_sha,
+      durable.tip_commit_sha,
+    );
+    assert.equal(
+      recovered.transport.candidate_set_digest,
+      expectedLegacyCandidateSetDigest,
+    );
+    const providerArtifactHandles =
+      await loadAutomaticRecoveryProviderArtifactHandles({
+        ledger: setup.ledger,
+        fixture: setup.fixture,
+        transport: recovered.transport,
+        snapshots: setup.snapshots,
+      });
+    const response = await setup.ledger
+      .appendAutomaticRecoveryArtifactBindingResponse({
+        artifact_binding_intent_handle:
+          recovered.artifact_binding_intent_handle,
+        intent_append_receipt: recovered.intent_append_receipt,
+        provider_artifact_handles: providerArtifactHandles,
+      });
+    assert.equal(response.bindings.length, 1);
+    const projected = createV2ControlPlaneReceiptFromGitLedgerAuthority(
+      await setup.ledger.loadControlPlaneAuthority(
+        setup.context.evaluatedScopeReceipt.scope,
+      ),
+    );
+    assert.deepEqual(
+      projected.derived.artifact_bindings.map((binding) => ({
+        id: binding.artifact_selector.id,
+        request_id: binding.request_id,
+      })),
+      [{ id: "202", request_id: "71" }],
+    );
+    const continued = await createFreshAutomaticRecoveryContinuation(setup);
+    assert.equal(continued.recovery.runnerResult.decision, "findings");
+    assert.notEqual(continued.recovery.recoveryHandle, null);
+
+    for (const decision of ["pending", "clean"]) {
+      const forbidden = resealFixtureAutomaticRecoveryIntentEnvelope(
+        legacyEnvelope,
+        (authority) => {
+          authority.decision = decision;
+        },
+      );
+      assert.throws(
+        () => validateV2GitLedgerEnvelope(forbidden),
+        /legacy profile is findings-only/u,
+      );
+    }
   });
 
 test("automatic recovery artifact bindings commit one exact aggregate transaction",
@@ -20086,10 +22410,39 @@ function resealFixtureAutomaticRecoveryCandidateAuthority(
   return authority;
 }
 
+function resealFixtureAutomaticRecoveryCandidateAuthorityExact(
+  authorityValue,
+) {
+  const authority = structuredClone(authorityValue);
+  authority.candidates = authority.candidates.map((candidateValue) => {
+    const candidate = structuredClone(candidateValue);
+    delete candidate.candidate_digest;
+    candidate.candidate_digest = runnerDigestCanonical(
+      "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate",
+      candidate,
+    );
+    return candidate;
+  });
+  delete authority.authority_digest;
+  authority.authority_digest = runnerDigestCanonical(
+    "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate-authority",
+    authority,
+  );
+  return authority;
+}
+
 function fixtureAutomaticRecoveryCandidateSetDigest(authority) {
+  const profile = authority.schema_version === 1
+    ? {}
+    : {
+        candidate_version: authority.candidate_version,
+        purpose: authority.purpose,
+        decision: authority.decision,
+      };
   return digestCanonical(
     "codex-review-gate-v2-automatic-recovery-artifact-binding-candidate-set",
     {
+      ...profile,
       review_epoch_id: authority.review_epoch_id,
       generation_id: authority.generation_id,
       request_id: authority.request_id,
@@ -20111,6 +22464,37 @@ function fixtureAutomaticRecoveryCandidateSetDigest(authority) {
       })),
     },
   );
+}
+
+function resealFixtureAutomaticRecoveryIntentEnvelope(
+  envelopeValue,
+  mutateAuthority,
+) {
+  const envelope = structuredClone(envelopeValue);
+  const payload = structuredClone(envelope.payload);
+  const authority = structuredClone(payload.action.candidate_authority);
+  mutateAuthority(authority);
+  payload.action.candidate_authority =
+    resealFixtureAutomaticRecoveryCandidateAuthorityExact(authority);
+  payload.action.generation_id = authority.generation_id;
+  payload.generation.generation_id = authority.generation_id;
+  payload.generation.index = authority.generation_index;
+  payload.ordinal = authority.generation_index;
+  payload.action.candidate_set_digest =
+    fixtureAutomaticRecoveryCandidateSetDigest(
+      payload.action.candidate_authority,
+    );
+  const effectIdentity = `automatic-artifact-bindings:${
+    payload.action.candidate_set_digest.slice("sha256:".length)
+  }`;
+  envelope.effect_id = effectIdentity;
+  envelope.idempotency_key = effectIdentity;
+  const recordIdentity = envelope.workflow_provenance.operation_binding
+    .record_identity;
+  recordIdentity.effect_id = effectIdentity;
+  recordIdentity.idempotency_key = effectIdentity;
+  resealFixtureProductionEnvelopePayload(envelope, payload);
+  return envelope;
 }
 
 async function appendCompletedCandidateInventory({
@@ -22755,8 +25139,15 @@ async function createProtectedInitialRunnerContext(
     capability: capabilityOverride = null,
     verifier: verifierOverride = null,
     preflight: preflightOverride = null,
+    scope = null,
   } = {},
 ) {
+  const exactScope = scope ?? {
+    pull_request: PR,
+    head_ref_oid: HEAD,
+    base_ref_oid: BASE,
+    potential_merge_commit_oid: POTENTIAL,
+  };
   const preflight = preflightOverride ?? await loadFixtureProviderPreflight();
   const capability = capabilityOverride ?? capabilityReceiptForTrigger(
     "pull_request_target",
@@ -22765,19 +25156,19 @@ async function createProtectedInitialRunnerContext(
   const verifier = verifierOverride ?? provenanceVerifier({
       eventName: "pull_request_target",
       ref: "refs/heads/main",
-      shaValue: BASE,
+      shaValue: exactScope.base_ref_oid,
       runIdentity,
     });
   const ledger = makeLedger(fixture, capability, verifier, preflight);
   await ledger.bootstrapCapability();
-  const minimalScopeHandle = await loadFixtureMinimalScope();
+  const minimalScopeHandle = await loadFixtureMinimalScope(exactScope);
   const preScopeReceipt = await ledger
     .createPullRequestEventEvaluatedScopeReceipt({
       minimal_scope_handle: minimalScopeHandle,
       trigger_identity: {
         event_name: "pull_request_target",
         ref: "refs/heads/main",
-        sha: BASE,
+        sha: exactScope.base_ref_oid,
       },
     });
   const workflowCommandHandle =
@@ -22788,6 +25179,7 @@ async function createProtectedInitialRunnerContext(
     preScopeReceipt,
     minimalPre: minimalScopeHandle,
     leaseTtlSeconds: 900,
+    scope: exactScope,
   });
   const lease = discovery.lease_receipt;
   const evaluatedScopeReceipt = discovery.effect_evaluated_scope_receipt;
@@ -22812,6 +25204,7 @@ async function createProtectedInitialRunnerContext(
     controlPlaneAuthority,
     continuityAuthority: discovery.continuity_authority,
     discovery,
+    minimalScopeHandle,
   };
 }
 
@@ -22821,15 +25214,22 @@ async function acquireEstablishedRunnerContext({
   observationBoundary,
   transportStartSecond,
   minimalServerTime,
+  scope = null,
 }) {
-  const minimalScopeHandle = await loadFixtureMinimalScope();
+  const exactScope = scope ?? {
+    pull_request: PR,
+    head_ref_oid: HEAD,
+    base_ref_oid: BASE,
+    potential_merge_commit_oid: POTENTIAL,
+  };
+  const minimalScopeHandle = await loadFixtureMinimalScope(exactScope);
   const preScopeReceipt = await ledger
     .createPullRequestEventEvaluatedScopeReceipt({
       minimal_scope_handle: minimalScopeHandle,
       trigger_identity: {
         event_name: "pull_request_target",
         ref: "refs/heads/main",
-        sha: BASE,
+        sha: exactScope.base_ref_oid,
       },
     });
   const workflowCommandHandle =
@@ -22844,6 +25244,7 @@ async function acquireEstablishedRunnerContext({
     minimalPre: minimalScopeHandle,
     transportStartSecond,
     minimalServerTime,
+    scope: exactScope,
   });
   const evaluatedScopeReceipt = discovery.effect_evaluated_scope_receipt;
   const controlPlaneAuthority = await ledger.loadControlPlaneAuthority(
@@ -22869,16 +25270,31 @@ async function acquireFixtureLeasedDiscovery({
   transportStartSecond = 600,
   minimalServerTime = "2026-08-13T12:20:00.000Z",
   minimalFetch = null,
+  scope = null,
 }) {
+  const exactScope = scope ?? {
+    pull_request: PR,
+    head_ref_oid: HEAD,
+    base_ref_oid: BASE,
+    potential_merge_commit_oid: POTENTIAL,
+  };
   const transportFixture = providerTransportFixture({
     startSecond: transportStartSecond,
+    headOid: exactScope.head_ref_oid,
+    baseOid: exactScope.base_ref_oid,
+    potentialMergeCommitOid: exactScope.potential_merge_commit_oid,
   });
   const transport = transportOverride ??
     createProviderTransport(transportFixture.fetch);
   return acquireV2LeaseThenLoadDiscovery({
     command,
     fetch: minimalFetch ??
-      ((url, init) => minimalScopeFetchAt(minimalServerTime, url, init)),
+      ((url, init) => minimalScopeFetchAt(
+        minimalServerTime,
+        url,
+        init,
+        exactScope,
+      )),
     token: SYNTHETIC_BEARER,
     rest_base_url: "https://api.github.test",
     graphql_url: "https://api.github.test/graphql",
@@ -24138,12 +26554,133 @@ async function appendAutomaticReservationStatus(ledger, schedulerAppend) {
   return { automatic, intent, response };
 }
 
-async function createAutomaticRecoveryTransitionContext({
-  bindArtifact = true,
-  additionalFindingIds = [],
-  includeAddresses = true,
-  beforeRecoveryObservation = null,
-} = {}) {
+async function createOriginAutomaticRequestBindingContext({
+  runIdentity,
+  verifier,
+  scope,
+}) {
+  const fixture = githubGitFixture();
+  const context = await createProtectedInitialRunnerContext(fixture, {
+    runIdentity,
+    verifier,
+    scope,
+  });
+  fixture.freezeServerTime();
+  const seed = schedulerObservationRecord({
+    predecessor: context.lease.acquire_commit_sha,
+    lease: context.lease,
+    priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+    initialAuthority: context.initialAuthority,
+  }).payload.action;
+  const schedulerAppend = await context.ledger
+    .appendInitialSchedulerObservation({
+      initial_runner_state_authority: context.initialAuthority,
+      scheduler_evaluation: seed.scheduler_evaluation,
+      status_plan: seed.status_plan,
+    });
+  const { automatic, response } = await appendAutomaticReservationStatus(
+    context.ledger,
+    schedulerAppend,
+  );
+  const requestIntent = await context.ledger
+    .appendAutomaticReviewRequestIntent({
+      automatic_reservation_handle: automatic.automatic_reservation_handle,
+      reservation_append_receipt: automatic.reservation_append_receipt,
+      reservation_status_response_append: response,
+    });
+  const requestReceipt = await automaticReviewRequestBindingReceipt({
+    action: {
+      method: "POST",
+      request_body_sha256: rawDigest("@codex review"),
+    },
+    observedAt: requestIntent.intent_append_receipt.ref_reread.server_time,
+    minimalScopeHandle: context.minimalScopeHandle,
+  });
+  const requestBinding = await context.ledger
+    .appendAutomaticReviewRequestBinding({
+      automatic_request_intent_handle:
+        requestIntent.automatic_request_intent_handle,
+      intent_append_receipt: requestIntent.intent_append_receipt,
+      receipt: requestReceipt,
+    });
+  return {
+    fixture,
+    context,
+    ledger: context.ledger,
+    runIdentity,
+    requestBinding,
+    requestCreatedAt: requestReceipt.created_at,
+    findingCreatedAt: new Date(
+      Date.parse(requestReceipt.created_at) + 1000,
+    ).toISOString(),
+  };
+}
+
+async function createRetargetedDelayedFindingContext() {
+  const runIdentity = { ...OWNER };
+  const scopeA = {
+    pull_request: structuredClone(PR),
+    head_ref_oid: HEAD,
+    base_ref_oid: BASE,
+    potential_merge_commit_oid: null,
+  };
+  const scopeB = {
+    ...structuredClone(scopeA),
+    base_ref_oid: "d".repeat(40),
+  };
+  const verifier = provenanceVerifier({
+    eventName: "pull_request_target",
+    ref: "refs/heads/main",
+    deriveTriggerFromRequest: true,
+    runIdentity,
+  });
+  const setup = await createOriginAutomaticRequestBindingContext({
+    runIdentity,
+    verifier,
+    scope: scopeA,
+  });
+  await releaseFixtureDiscoveryLease(setup.ledger, setup.context.discovery);
+  setup.fixture.advanceServerTime(7_200);
+  runIdentity.run_id = "9002";
+  const bRun = await acquireEstablishedRunnerContext({
+    ledger: setup.ledger,
+    runIdentity,
+    observationBoundary: "public-post-request-wait-complete",
+    transportStartSecond: 9_000,
+    minimalServerTime: "2026-08-13T15:00:00.000Z",
+    scope: scopeB,
+  });
+  const bEstablished = await setup.ledger
+    .loadEstablishedRunnerStateAuthority({
+      control_plane_authority: bRun.controlPlaneAuthority,
+      evaluated_scope_receipt: bRun.evaluatedScopeReceipt,
+      workflow_command_handle: bRun.workflowCommandHandle,
+    });
+  const delayed = await appendAutomaticRecoveryObservation({
+    ledger: setup.ledger,
+    preflight: setup.context.preflight,
+    evaluatedScopeReceipt: bRun.evaluatedScopeReceipt,
+    workflowCommandHandle: bRun.workflowCommandHandle,
+    requestCreatedAt: setup.requestCreatedAt,
+    findingCreatedAt: setup.findingCreatedAt,
+    historicalSnapshots: [],
+    includeAddresses: false,
+    requireArtifactBinding: false,
+    expectRecoveryHandle: false,
+    expectArtifactBindingCandidateHandle: true,
+  });
+  return {
+    ...setup,
+    bEstablished,
+    bRun,
+    delayed,
+    scopeA,
+    scopeB,
+    verifier,
+  };
+}
+
+async function createTerminalCleanArtifactBindingContext() {
   const fixture = githubGitFixture();
   const runIdentity = { ...OWNER };
   const context = await createProtectedInitialRunnerContext(fixture, {
@@ -24179,6 +26716,265 @@ async function createAutomaticRecoveryTransitionContext({
     },
     observedAt: requestIntent.intent_append_receipt.ref_reread.server_time,
   });
+  await context.ledger.appendAutomaticReviewRequestBinding({
+    automatic_request_intent_handle:
+      requestIntent.automatic_request_intent_handle,
+    intent_append_receipt: requestIntent.intent_append_receipt,
+    receipt: requestReceipt,
+  });
+  const findingCreatedAt = new Date(
+    Date.parse(requestReceipt.created_at) + 1000,
+  ).toISOString();
+  fixture.advanceServerTime(10);
+  const observation = await appendAutomaticRecoveryObservation({
+    ledger: context.ledger,
+    preflight: context.preflight,
+    evaluatedScopeReceipt: context.evaluatedScopeReceipt,
+    workflowCommandHandle: context.workflowCommandHandle,
+    requestCreatedAt: requestReceipt.created_at,
+    findingCreatedAt,
+    terminalClean: true,
+    includeAddresses: false,
+    requireArtifactBinding: false,
+    expectRecoveryHandle: false,
+    expectArtifactBindingCandidateHandle: false,
+  });
+  return {
+    fixture,
+    context,
+    ledger: context.ledger,
+    requestCreatedAt: requestReceipt.created_at,
+    findingCreatedAt,
+    runIdentity,
+    ...observation,
+  };
+}
+
+async function createNextAutomaticRequestContext(setup, {
+  requestId,
+  runId,
+  transportStartSecond,
+  minimalServerTime,
+}) {
+  const transition = await setup.ledger
+    .appendAutomaticRequestRecoveryTransition({
+      scheduler_append: setup.schedulerAppend,
+      recovery_handle: setup.recoveryHandle,
+    });
+  await releaseFixtureDiscoveryLease(
+    setup.ledger,
+    setup.context.discovery,
+  );
+  setup.fixture.advanceServerTime(7200);
+  setup.runIdentity.run_id = runId;
+  setup.runIdentity.run_attempt = 1;
+  const ledger = makeLedger(
+    setup.fixture,
+    setup.context.capability,
+    setup.context.verifier,
+    setup.context.preflight,
+  );
+  const nextRun = await acquireEstablishedRunnerContext({
+    ledger,
+    runIdentity: setup.runIdentity,
+    observationBoundary: "public-post-request-wait-complete",
+    transportStartSecond,
+    minimalServerTime,
+  });
+  const planning = await appendAutomaticRecoveryObservation({
+    ledger,
+    preflight: setup.context.preflight,
+    evaluatedScopeReceipt: nextRun.evaluatedScopeReceipt,
+    workflowCommandHandle: nextRun.workflowCommandHandle,
+    requestCreatedAt: setup.requestCreatedAt,
+    findingCreatedAt: setup.findingCreatedAt,
+    requestId: setup.requestId ?? "71",
+    historicalSnapshots: setup.historicalSnapshots ?? [setup.snapshots],
+    includePrimaryFinding: false,
+    includeAddresses: false,
+    requireArtifactBinding: false,
+    expectRecoveryHandle: false,
+    expectArtifactBindingCandidateHandle: false,
+    applyStatusWrites: false,
+  });
+  while (true) {
+    const statusIntent = await ledger.loadNextStatusWriteIntent({
+      scheduler_append: planning.schedulerAppend,
+    });
+    if (statusIntent === null) break;
+    await ledger.appendStatusWriteResponse({
+      status_intent_handle: statusIntent.status_intent_handle,
+      intent_append_receipt: statusIntent.intent_append_receipt,
+      receipt: statusWriteResponseReceipt(
+        statusIntent.transport,
+        statusIntent.intent_append_receipt.ref_reread.server_time,
+      ),
+    });
+  }
+  const automatic = await ledger.appendAutomaticRequestReservation({
+    scheduler_append: planning.schedulerAppend,
+  });
+  const reservationStatusIntent =
+    await ledger.appendReservationStatusWriteIntent({
+      automatic_reservation_handle: automatic.automatic_reservation_handle,
+      reservation_append_receipt: automatic.reservation_append_receipt,
+    });
+  const response = await ledger.appendReservationStatusWriteResponse({
+    reservation_status_intent_handle:
+      reservationStatusIntent.reservation_status_intent_handle,
+    intent_append_receipt: reservationStatusIntent.intent_append_receipt,
+    receipt: reservationStatusWriteResponseReceipt(
+      reservationStatusIntent.transport,
+      reservationStatusIntent.intent_append_receipt.ref_reread.server_time,
+    ),
+  });
+  const requestIntent = await ledger.appendAutomaticReviewRequestIntent({
+    automatic_reservation_handle: automatic.automatic_reservation_handle,
+    reservation_append_receipt: automatic.reservation_append_receipt,
+    reservation_status_response_append: response,
+  });
+  const requestReceipt = await automaticReviewRequestBindingReceipt({
+    action: {
+      method: "POST",
+      request_body_sha256: rawDigest("@codex review"),
+    },
+    observedAt: requestIntent.intent_append_receipt.ref_reread.server_time,
+    requestId,
+  });
+  await ledger.appendAutomaticReviewRequestBinding({
+    automatic_request_intent_handle:
+      requestIntent.automatic_request_intent_handle,
+    intent_append_receipt: requestIntent.intent_append_receipt,
+    receipt: requestReceipt,
+  });
+  return {
+    ...setup,
+    ledger,
+    context: {
+      ...setup.context,
+      discovery: nextRun.discovery,
+      evaluatedScopeReceipt: nextRun.evaluatedScopeReceipt,
+      workflowCommandHandle: nextRun.workflowCommandHandle,
+    },
+    requestCreatedAt: requestReceipt.created_at,
+    findingCreatedAt: new Date(
+      Date.parse(requestReceipt.created_at) + 1000,
+    ).toISOString(),
+    requestId,
+    generationId: transition.next_generation_id,
+    historicalSnapshots: setup.historicalSnapshots ?? [setup.snapshots],
+    schedulerAppend: planning.schedulerAppend,
+    recoveryHandle: null,
+    artifactBindingCandidateHandle: null,
+  };
+}
+
+async function observeAndBindAutomaticFinding(setup, { artifactId }) {
+  setup.fixture.advanceServerTime(60);
+  const candidate = await appendAutomaticRecoveryObservation({
+    ledger: setup.ledger,
+    preflight: setup.context.preflight,
+    evaluatedScopeReceipt: setup.context.evaluatedScopeReceipt,
+    workflowCommandHandle: setup.context.workflowCommandHandle,
+    requestCreatedAt: setup.requestCreatedAt,
+    findingCreatedAt: setup.findingCreatedAt,
+    requestId: setup.requestId,
+    artifactId,
+    historicalSnapshots: setup.historicalSnapshots ?? [],
+    requireArtifactBinding: false,
+    expectRecoveryHandle: false,
+    expectArtifactBindingCandidateHandle: true,
+  });
+  const intent = await setup.ledger
+    .loadOrAppendAutomaticRecoveryArtifactBindingIntent({
+      scheduler_append: candidate.schedulerAppend,
+      artifact_binding_candidate_handle:
+        candidate.artifactBindingCandidateHandle,
+    });
+  const handles = await loadAutomaticRecoveryProviderArtifactHandles({
+    ledger: setup.ledger,
+    fixture: setup.fixture,
+    transport: intent.transport,
+    snapshots: candidate.snapshots,
+  });
+  await setup.ledger.appendAutomaticRecoveryArtifactBindingResponse({
+    artifact_binding_intent_handle: intent.artifact_binding_intent_handle,
+    intent_append_receipt: intent.intent_append_receipt,
+    provider_artifact_handles: handles,
+  });
+  setup.fixture.advanceServerTime(60);
+  const completed = await appendAutomaticRecoveryObservation({
+    ledger: setup.ledger,
+    preflight: setup.context.preflight,
+    evaluatedScopeReceipt: setup.context.evaluatedScopeReceipt,
+    workflowCommandHandle: setup.context.workflowCommandHandle,
+    requestCreatedAt: setup.requestCreatedAt,
+    findingCreatedAt: setup.findingCreatedAt,
+    requestId: setup.requestId,
+    artifactId,
+    historicalSnapshots: setup.historicalSnapshots ?? [],
+    requireArtifactBinding: true,
+    expectRecoveryHandle: true,
+    expectArtifactBindingCandidateHandle: false,
+  });
+  return {
+    ...setup,
+    ...completed,
+    historicalSnapshots: [
+      ...(setup.historicalSnapshots ?? []),
+      completed.snapshots,
+    ],
+  };
+}
+
+async function createAutomaticRecoveryTransitionContext({
+  bindArtifact = true,
+  additionalFindingIds = [],
+  includeAddresses = true,
+  beforeRecoveryObservation = null,
+  schedulerDecisionOverride = null,
+  runIdentity: runIdentityOverride = null,
+  verifier: verifierOverride = null,
+  scope = null,
+} = {}) {
+  const fixture = githubGitFixture();
+  const runIdentity = runIdentityOverride ?? { ...OWNER };
+  const context = await createProtectedInitialRunnerContext(fixture, {
+    runIdentity,
+    verifier: verifierOverride,
+    scope,
+  });
+  fixture.freezeServerTime();
+  const seed = schedulerObservationRecord({
+    predecessor: context.lease.acquire_commit_sha,
+    lease: context.lease,
+    priorAuthorityDigest: context.initialAuthority.prior_authority_digest,
+    initialAuthority: context.initialAuthority,
+  }).payload.action;
+  const firstSchedulerAppend = await context.ledger
+    .appendInitialSchedulerObservation({
+      initial_runner_state_authority: context.initialAuthority,
+      scheduler_evaluation: seed.scheduler_evaluation,
+      status_plan: seed.status_plan,
+    });
+  const { automatic, response } = await appendAutomaticReservationStatus(
+    context.ledger,
+    firstSchedulerAppend,
+  );
+  const requestIntent = await context.ledger
+    .appendAutomaticReviewRequestIntent({
+      automatic_reservation_handle: automatic.automatic_reservation_handle,
+      reservation_append_receipt: automatic.reservation_append_receipt,
+      reservation_status_response_append: response,
+    });
+  const requestReceipt = await automaticReviewRequestBindingReceipt({
+    action: {
+      method: "POST",
+      request_body_sha256: rawDigest("@codex review"),
+    },
+    observedAt: requestIntent.intent_append_receipt.ref_reread.server_time,
+    minimalScopeHandle: context.minimalScopeHandle,
+  });
   const requestBinding = await context.ledger
     .appendAutomaticReviewRequestBinding({
       automatic_request_intent_handle:
@@ -24206,6 +27002,7 @@ async function createAutomaticRecoveryTransitionContext({
     additionalFindingIds,
     includeAddresses,
     expectRecoveryHandle: false,
+    schedulerDecisionOverride,
   });
   let recovery = candidateObservation;
   if (bindArtifact) {
@@ -24249,6 +27046,7 @@ async function createAutomaticRecoveryTransitionContext({
     requestCreatedAt: requestReceipt.created_at,
     findingCreatedAt,
     runIdentity,
+    historicalSnapshots: [recovery.snapshots],
     ...recovery,
   };
 }
@@ -24313,9 +27111,16 @@ async function appendAutomaticRecoveryObservation({
   additionalFindingIds = [],
   includePrimaryFinding = true,
   includeAddresses = true,
+  requestId = "71",
+  artifactId = "202",
+  terminalClean = false,
+  malformedTerminal = false,
+  historicalSnapshots = [],
   expectRecoveryHandle = true,
   expectArtifactBindingCandidateHandle = !expectRecoveryHandle,
   requireArtifactBinding = expectRecoveryHandle,
+  applyStatusWrites = true,
+  schedulerDecisionOverride = null,
 }) {
   const controlPlaneAuthority = await ledger
     .loadControlPlaneAuthority(evaluatedScopeReceipt.scope);
@@ -24346,6 +27151,12 @@ async function appendAutomaticRecoveryObservation({
     includeAddresses,
     findingLine,
     requireArtifactBinding,
+    requestId,
+    artifactId,
+    terminalClean,
+    malformedTerminal,
+    historicalSnapshots,
+    scope: establishedAuthority.scope,
   });
   const runnerResult = await runV2Operation({
     schema: V2_RUNNER_SCHEMA,
@@ -24379,28 +27190,56 @@ async function appendAutomaticRecoveryObservation({
     artifactBindingCandidateHandle === null,
     !expectArtifactBindingCandidateHandle,
   );
+  const schedulerEvaluation = schedulerDecisionOverride === null
+    ? runnerResult.scheduler_evaluation
+    : {
+        ...runnerResult.scheduler_evaluation,
+        decision: schedulerDecisionOverride,
+      };
+  const schedulerStatusPlan = schedulerDecisionOverride === null
+    ? runnerResult.status_plan
+    : buildV2StatusPlan({
+        decision: schedulerDecisionOverride,
+        status_target_mode:
+          productionAuthority.scheduling.status_target_mode,
+        status_context: "codex/github-review-gate",
+        target: {
+          validated: true,
+          terminal_sha:
+            productionAuthority.scheduling.status_target_mode === "head"
+              ? snapshots.evidence.scope.head_ref_oid
+              : snapshots.evidence.scope.potential_merge_oid,
+          head_sentinel_sha: snapshots.evidence.scope.head_ref_oid,
+          head_sentinel_receipt:
+            productionAuthority.scheduling.status.head_sentinel_receipt,
+        },
+        snapshot_fingerprint:
+          runnerResult.scheduler_evaluation.snapshot_fingerprint,
+      });
   const schedulerAppend = await ledger
     .appendEstablishedSchedulerObservation({
       established_runner_state_authority: establishedAuthority,
-      scheduler_evaluation: runnerResult.scheduler_evaluation,
-      status_plan: runnerResult.status_plan,
+      scheduler_evaluation: schedulerEvaluation,
+      status_plan: schedulerStatusPlan,
     });
   const statusIntents = [];
   const statusResponses = [];
-  while (true) {
-    const statusIntent = await ledger.loadNextStatusWriteIntent({
-      scheduler_append: schedulerAppend,
-    });
-    if (statusIntent === null) break;
-    statusIntents.push(statusIntent);
-    statusResponses.push(await ledger.appendStatusWriteResponse({
-      status_intent_handle: statusIntent.status_intent_handle,
-      intent_append_receipt: statusIntent.intent_append_receipt,
-      receipt: statusWriteResponseReceipt(
-        statusIntent.transport,
-        statusIntent.intent_append_receipt.ref_reread.server_time,
-      ),
-    }));
+  if (applyStatusWrites && schedulerStatusPlan.writes.length > 0) {
+    while (true) {
+      const statusIntent = await ledger.loadNextStatusWriteIntent({
+        scheduler_append: schedulerAppend,
+      });
+      if (statusIntent === null) break;
+      statusIntents.push(statusIntent);
+      statusResponses.push(await ledger.appendStatusWriteResponse({
+        status_intent_handle: statusIntent.status_intent_handle,
+        intent_append_receipt: statusIntent.intent_append_receipt,
+        receipt: statusWriteResponseReceipt(
+          statusIntent.transport,
+          statusIntent.intent_append_receipt.ref_reread.server_time,
+        ),
+      }));
+    }
   }
   return {
     schedulerAppend,
@@ -24409,6 +27248,8 @@ async function appendAutomaticRecoveryObservation({
     recoveryHandle,
     artifactBindingCandidateHandle,
     runnerResult,
+    schedulerEvaluation,
+    schedulerStatusPlan,
     snapshots,
     controlPlaneAuthority,
     establishedAuthority,
@@ -24424,9 +27265,16 @@ async function createFreshAutomaticRecoveryContinuation(
     precedingFindingIds = [],
     additionalFindingIds = [],
     includePrimaryFinding = true,
+    includeAddresses = true,
     expectRecoveryHandle = true,
     expectArtifactBindingCandidateHandle = !expectRecoveryHandle,
     requireArtifactBinding = expectRecoveryHandle,
+    requestId = "71",
+    artifactId = "202",
+    terminalClean = false,
+    continuationRunId = "9002",
+    transportStartSecond = 9000,
+    minimalServerTime = "2026-08-13T15:00:00.000Z",
   } = {},
 ) {
   await releaseFixtureDiscoveryLease(
@@ -24434,7 +27282,7 @@ async function createFreshAutomaticRecoveryContinuation(
     setup.context.discovery,
   );
   setup.fixture.advanceServerTime(7200);
-  setup.runIdentity.run_id = "9002";
+  setup.runIdentity.run_id = continuationRunId;
   setup.runIdentity.run_attempt = 1;
   const ledger = createV2GitHubGitLedger({
     ...factoryInput(setup.fixture, setup.context.capability),
@@ -24445,8 +27293,8 @@ async function createFreshAutomaticRecoveryContinuation(
     ledger,
     runIdentity: setup.runIdentity,
     observationBoundary: "public-post-request-wait-complete",
-    transportStartSecond: 9000,
-    minimalServerTime: "2026-08-13T15:00:00.000Z",
+    transportStartSecond,
+    minimalServerTime,
   });
   const recovery = await appendAutomaticRecoveryObservation({
     ledger,
@@ -24460,9 +27308,14 @@ async function createFreshAutomaticRecoveryContinuation(
     precedingFindingIds,
     additionalFindingIds,
     includePrimaryFinding,
+    includeAddresses,
     expectRecoveryHandle,
     expectArtifactBindingCandidateHandle,
     requireArtifactBinding,
+    requestId,
+    artifactId,
+    terminalClean,
+    historicalSnapshots: setup.historicalSnapshots ?? [],
   });
   return { ledger, nextRun, recovery };
 }
@@ -24479,21 +27332,37 @@ function automaticRecoverySnapshotFixture({
   includeAddresses = true,
   findingLine = 1,
   requireArtifactBinding = true,
+  requestId = "71",
+  artifactId = "202",
+  terminalClean = false,
+  malformedTerminal = false,
+  historicalSnapshots = [],
+  scope = {
+    pull_request: PR,
+    head_ref_oid: HEAD,
+    base_ref_oid: BASE,
+    potential_merge_commit_oid: POTENTIAL,
+  },
 }) {
   const addressCreatedAt = new Date(
     Date.parse(findingCreatedAt) + 1000,
   ).toISOString();
-  const request = automaticRecoveryIssueComment("71", {
+  const request = automaticRecoveryIssueComment(requestId, {
     body: "@codex review",
     author: ACTOR,
     app: GITHUB_ACTIONS_APP,
     created_at: requestCreatedAt,
     updated_at: requestCreatedAt,
   });
-  const finding = automaticRecoveryIssueComment("202", {
-    body:
-      "### 💡 Codex Review\n\n" +
-      `- [P1] Fix the current-head issue https://github.com/owner/repo/blob/${HEAD}/src/a.js#L${findingLine}`,
+  const finding = automaticRecoveryIssueComment(artifactId, {
+    body: terminalClean
+      ? "Codex Review: Didn't find any major issues.\n\n" +
+        `**Reviewed commit:** \`${HEAD}\``
+      : malformedTerminal
+        ? "Codex Review: Didn't find any major issues.\n\n" +
+          "Missing the required reviewed commit marker."
+        : "### 💡 Codex Review\n\n" +
+          `- [P1] Fix the current-head issue https://github.com/owner/repo/blob/${HEAD}/src/a.js#L${findingLine}`,
     author: CODEX_ACTOR,
     app: CODEX_APP,
     created_at: findingCreatedAt,
@@ -24528,12 +27397,17 @@ function automaticRecoverySnapshotFixture({
       updated_at: createdAt,
     });
   });
-  const findings = [
-    ...precedingFindings,
-    ...(includePrimaryFinding ? [finding] : []),
-    ...additionalFindings,
-  ];
-  const addresses = includeAddresses ? findings.map((artifact, index) => {
+  const terminalCarrier = terminalClean || malformedTerminal;
+  const findings = terminalCarrier
+    ? precedingFindings
+    : [
+        ...precedingFindings,
+        ...(includePrimaryFinding ? [finding] : []),
+        ...additionalFindings,
+      ];
+  const terminalArtifacts = terminalCarrier ? [finding] : [];
+  const addresses = includeAddresses && !terminalCarrier
+    ? findings.map((artifact, index) => {
     const createdAt = new Date(
       Date.parse(addressCreatedAt) + (additionalFindingIds.length * 1000) +
         (index * 1000),
@@ -24547,9 +27421,26 @@ function automaticRecoverySnapshotFixture({
         updated_at: createdAt,
       },
     );
-  }) : [];
+    })
+    : [];
   const address = addresses[0] ?? null;
-  const issueComments = [request, ...findings, ...addresses];
+  const currentIssueComments = [
+    request,
+    ...findings,
+    ...terminalArtifacts,
+    ...addresses,
+  ];
+  const historicalIssueComments = historicalSnapshots.flatMap((snapshot) =>
+    snapshot.evidence.pages.issue_comments);
+  const issueComments = [...new Map([
+    ...historicalIssueComments,
+    ...currentIssueComments,
+  ].map((artifact) => [artifact.id, structuredClone(artifact)])).values()]
+    .sort((left, right) =>
+      Date.parse(left.created_at) - Date.parse(right.created_at) ||
+      (BigInt(left.id) < BigInt(right.id)
+        ? -1
+        : BigInt(left.id) > BigInt(right.id) ? 1 : 0));
   const providerArtifacts = issueComments.map((artifact) =>
     providerIssueComment({
       id: Number(artifact.id),
@@ -24578,7 +27469,17 @@ function automaticRecoverySnapshotFixture({
   const discovery = automaticRecoverySnapshot({
     issueComments,
     serverTime: discoveryServerTime,
+    exactScope: scope,
   });
+  const actorPermissions = [...new Map([
+    ...historicalSnapshots.flatMap((snapshot) =>
+      snapshot.evidence.permissions.actor_permissions),
+    ...addresses.map((item) =>
+      automaticRecoveryActorPermission(item, finalServerTime)),
+  ].map((permission) => [
+    `${permission.subject.kind}:${permission.subject.id}`,
+    structuredClone(permission),
+  ])).values()];
   const evidence = automaticRecoverySnapshot({
     issueComments,
     exactArtifacts: issueComments.map((artifact, index) =>
@@ -24587,13 +27488,13 @@ function automaticRecoverySnapshotFixture({
         finalServerTime,
         rawDigest(JSON.stringify(providerArtifacts[index])),
       )),
-    actorPermissions: addresses.map((item) =>
-      automaticRecoveryActorPermission(item, finalServerTime)),
+    actorPermissions,
     serverTime: finalServerTime,
+    exactScope: scope,
   });
   assert.ok(controller.request_bindings.some((binding) =>
     binding.id === request.id && binding.controlled === true));
-  if (includePrimaryFinding) {
+  if (includePrimaryFinding || terminalClean) {
     assert.equal(
       controller.artifact_bindings.some((binding) =>
         binding.id === finding.id && binding.request_id === request.id),
@@ -24616,6 +27517,12 @@ function automaticRecoverySnapshot({
   exactArtifacts = [],
   actorPermissions = [],
   serverTime,
+  exactScope = {
+    pull_request: PR,
+    head_ref_oid: HEAD,
+    base_ref_oid: BASE,
+    potential_merge_commit_oid: POTENTIAL,
+  },
 }) {
   const reactions = {
     issue: [],
@@ -24628,15 +27535,21 @@ function automaticRecoverySnapshot({
   };
   const scope = {
     base_ref_name: "main",
-    base_ref_tip: BASE,
+    base_ref_tip: exactScope.base_ref_oid,
     head_ref_name: "feature",
-    head_ref_oid: HEAD,
-    merge_base_sha: BASE,
-    potential_merge_oid: POTENTIAL,
-    potential_merge_tree: "e".repeat(40),
-    ordered_parent_oids: [BASE, HEAD],
-    merge_ref_oid: POTENTIAL,
-    mergeable: "MERGEABLE",
+    head_ref_oid: exactScope.head_ref_oid,
+    merge_base_sha: exactScope.base_ref_oid,
+    potential_merge_oid: exactScope.potential_merge_commit_oid,
+    potential_merge_tree: exactScope.potential_merge_commit_oid === null
+      ? null
+      : "e".repeat(40),
+    ordered_parent_oids: exactScope.potential_merge_commit_oid === null
+      ? []
+      : [exactScope.base_ref_oid, exactScope.head_ref_oid],
+    merge_ref_oid: exactScope.potential_merge_commit_oid,
+    mergeable: exactScope.potential_merge_commit_oid === null
+      ? "CONFLICTING"
+      : "MERGEABLE",
   };
   const scopeReceipt = {
     repository_owner: REPOSITORY.owner,
@@ -24732,10 +27645,14 @@ function automaticRecoveryScopeReceipt(receipt) {
     endpoint_receipts: {
       pull_request: endpoint("GET", `${repoPath}/pulls/${PR.number}`),
       graphql: endpoint("POST", "/graphql"),
-      compare: endpoint("GET", `${repoPath}/compare/${BASE}...${HEAD}`),
+      compare: endpoint(
+        "GET",
+        `${repoPath}/compare/${receipt.base_ref_tip}...${receipt.head_ref_oid}`,
+      ),
       merge_ref: endpoint(
         "GET",
         `${repoPath}/git/ref/pull/${PR.number}/merge`,
+        receipt.merge_ref_oid === null ? 404 : 200,
       ),
     },
   };
@@ -25509,9 +28426,15 @@ function evaluatedScopeReceipt({
   });
 }
 
-async function loadFixtureMinimalScope() {
+async function loadFixtureMinimalScope(scope = null) {
+  const exactScope = scope ?? {
+    pull_request: PR,
+    head_ref_oid: HEAD,
+    base_ref_oid: BASE,
+    potential_merge_commit_oid: POTENTIAL,
+  };
   return loadV2MinimalLiveScope({
-    fetch: minimalScopeFetch,
+    fetch: (url, init) => minimalScopeFetchAt(TIME, url, init, exactScope),
     token: SYNTHETIC_BEARER,
     repository: { owner: REPOSITORY.owner, name: REPOSITORY.name },
     pull_number: PR.number,
@@ -25548,13 +28471,19 @@ async function loadFixtureMinimalScopeForCandidate(
 async function automaticReviewRequestBindingReceipt({
   action,
   observedAt = TIME,
+  preScopeObservedAt = observedAt,
+  createdAt = observedAt,
+  postServerTime = createdAt,
+  refetchServerTime = postServerTime,
+  postScopeObservedAt = refetchServerTime,
   requestId = "71",
   actor = ACTOR,
   app = APP,
+  minimalScopeHandle = null,
 } = {}) {
-  const minimal = await loadFixtureMinimalScope();
-  const preScope = minimalScopeReceiptAt(minimal, observedAt);
-  const postScope = minimalScopeReceiptAt(minimal, observedAt);
+  const minimal = minimalScopeHandle ?? await loadFixtureMinimalScope();
+  const preScope = minimalScopeReceiptAt(minimal, preScopeObservedAt);
+  const postScope = minimalScopeReceiptAt(minimal, postScopeObservedAt);
   const scopeWithoutDigest = {
     schema: "codex-review-gate-parent-recorded-request-scope-v1",
     schema_version: 1,
@@ -25580,8 +28509,8 @@ async function automaticReviewRequestBindingReceipt({
       `https://github.com/owner/repo/pull/7#issuecomment-${requestId}`,
     issue_url: "https://api.github.test/repos/owner/repo/issues/7",
     body_sha256: action.request_body_sha256,
-    created_at: observedAt,
-    updated_at: observedAt,
+    created_at: createdAt,
+    updated_at: createdAt,
     actor: structuredClone(actor),
     app: structuredClone(app),
   };
@@ -25595,11 +28524,11 @@ async function automaticReviewRequestBindingReceipt({
     schema_version: 1,
     http_status: 201,
     ...identity,
-    post_server_time: observedAt,
+    post_server_time: postServerTime,
     post_raw_body_sha256: `sha256:${"2".repeat(64)}`,
     request_digest: requestDigest,
     refetch_http_status: 200,
-    refetch_server_time: observedAt,
+    refetch_server_time: refetchServerTime,
     refetch_raw_body_sha256: `sha256:${"4".repeat(64)}`,
     refetched_request_digest: requestDigest,
     request_scope_receipt: requestScopeReceipt,
@@ -25632,7 +28561,17 @@ async function minimalScopeFetch(urlValue, init = {}) {
   return minimalScopeFetchAt(TIME, urlValue, init);
 }
 
-async function minimalScopeFetchAt(serverTime, urlValue, init = {}) {
+async function minimalScopeFetchAt(
+  serverTime,
+  urlValue,
+  init = {},
+  scope = {
+    pull_request: PR,
+    head_ref_oid: HEAD,
+    base_ref_oid: BASE,
+    potential_merge_commit_oid: POTENTIAL,
+  },
+) {
   const url = new URL(urlValue);
   const date = new Date(serverTime).toUTCString();
   if (url.pathname === "/repos/owner/repo/pulls/7") {
@@ -25662,40 +28601,63 @@ async function minimalScopeFetchAt(serverTime, urlValue, init = {}) {
             mergedAt: null,
             isDraft: false,
             updatedAt: TIME,
-            mergeable: "MERGEABLE",
+            mergeable: scope.potential_merge_commit_oid === null
+              ? "CONFLICTING"
+              : "MERGEABLE",
             baseRefName: "main",
-            baseRef: { name: "main", target: { oid: BASE } },
-            headRefName: "feature",
-            headRefOid: HEAD,
-            headRef: { name: "feature", target: { oid: HEAD } },
-            potentialMergeCommit: {
-              oid: POTENTIAL,
-              tree: { oid: "e".repeat(40) },
-              parents: {
-                totalCount: 2,
-                pageInfo: { hasNextPage: false, endCursor: "parent-2" },
-                nodes: [{ oid: BASE }, { oid: HEAD }],
-              },
+            baseRef: {
+              name: "main",
+              target: { oid: scope.base_ref_oid },
             },
+            headRefName: "feature",
+            headRefOid: scope.head_ref_oid,
+            headRef: {
+              name: "feature",
+              target: { oid: scope.head_ref_oid },
+            },
+            potentialMergeCommit:
+              scope.potential_merge_commit_oid === null
+                ? null
+                : {
+                    oid: scope.potential_merge_commit_oid,
+                    tree: { oid: "e".repeat(40) },
+                    parents: {
+                      totalCount: 2,
+                      pageInfo: {
+                        hasNextPage: false,
+                        endCursor: "parent-2",
+                      },
+                      nodes: [
+                        { oid: scope.base_ref_oid },
+                        { oid: scope.head_ref_oid },
+                      ],
+                    },
+                  },
           },
         },
       },
     }, date);
   }
-  if (url.pathname === `/repos/owner/repo/compare/${BASE}...${HEAD}`) {
+  if (url.pathname ===
+      `/repos/owner/repo/compare/${scope.base_ref_oid}...${scope.head_ref_oid}`) {
     return response(200, {
-      base_commit: { sha: BASE },
-      merge_base_commit: { sha: BASE },
+      base_commit: { sha: scope.base_ref_oid },
+      merge_base_commit: { sha: scope.base_ref_oid },
     }, date);
   }
   if (url.pathname === "/repos/owner/repo/git/ref/pull/7/merge") {
+    if (scope.potential_merge_commit_oid === null) {
+      return response(404, { message: "Not Found" }, date);
+    }
     return response(200, {
       ref: "refs/pull/7/merge",
       url: "https://api.github.test/repos/owner/repo/git/refs/pull/7/merge",
       object: {
         type: "commit",
-        sha: POTENTIAL,
-        url: `https://api.github.test/repos/owner/repo/git/commits/${POTENTIAL}`,
+        sha: scope.potential_merge_commit_oid,
+        url:
+          "https://api.github.test/repos/owner/repo/git/commits/" +
+          scope.potential_merge_commit_oid,
       },
     }, date);
   }
@@ -26031,6 +28993,8 @@ function providerTransportFixture({
   nextServerTime = null,
   comment = providerIssueComment(),
   headOid = HEAD,
+  baseOid = BASE,
+  potentialMergeCommitOid = POTENTIAL,
   headRefName = "feature",
   pullRequestNumber = PR.number,
   pullRequestNodeId = PR.node_id,
@@ -26056,6 +29020,8 @@ function providerTransportFixture({
           return response(200, {
             data: providerScopePayload({
               headOid,
+              baseOid,
+              potentialMergeCommitOid,
               headRefName,
               pullRequestNumber,
               pullRequestNodeId,
@@ -26083,27 +29049,32 @@ function providerTransportFixture({
           state: "open",
           merged: false,
           merged_at: null,
-          mergeable: true,
-          merge_commit_sha: POTENTIAL,
-          base: { ref: "main", sha: BASE },
+          mergeable: potentialMergeCommitOid !== null,
+          merge_commit_sha: potentialMergeCommitOid,
+          base: { ref: "main", sha: baseOid },
           head: { ref: headRefName, sha: headOid },
         }, date);
       }
-      if (url.pathname === `${repoPath}/compare/${BASE}...${headOid}`) {
+      if (url.pathname === `${repoPath}/compare/${baseOid}...${headOid}`) {
         return response(200, {
-          base_commit: { sha: BASE },
-          merge_base_commit: { sha: BASE },
+          base_commit: { sha: baseOid },
+          merge_base_commit: { sha: baseOid },
         }, date);
       }
       if (url.pathname ===
           `${repoPath}/git/ref/pull/${pullRequestNumber}/merge`) {
+        if (potentialMergeCommitOid === null) {
+          return response(404, { message: "Not Found" }, date);
+        }
         return response(200, {
           ref: `refs/pull/${pullRequestNumber}/merge`,
           url: `https://api.github.test${repoPath}/git/refs/pull/${pullRequestNumber}/merge`,
           object: {
             type: "commit",
-            sha: POTENTIAL,
-            url: `https://api.github.test/repos/owner/repo/git/commits/${POTENTIAL}`,
+            sha: potentialMergeCommitOid,
+            url:
+              "https://api.github.test/repos/owner/repo/git/commits/" +
+              potentialMergeCommitOid,
           },
         }, date);
       }
@@ -26173,6 +29144,8 @@ function providerIssueComment(overrides = {}) {
 
 function providerScopePayload({
   headOid = HEAD,
+  baseOid = BASE,
+  potentialMergeCommitOid = POTENTIAL,
   headRefName = "feature",
   pullRequestNumber = PR.number,
   pullRequestNodeId = PR.node_id,
@@ -26189,22 +29162,26 @@ function providerScopePayload({
         merged: false,
         mergedAt: null,
         isDraft: false,
-        mergeable: "MERGEABLE",
+        mergeable: potentialMergeCommitOid === null
+          ? "CONFLICTING"
+          : "MERGEABLE",
         baseRefName: "main",
-        baseRefOid: BASE,
-        baseRef: { name: "main", target: { oid: BASE } },
+        baseRefOid: baseOid,
+        baseRef: { name: "main", target: { oid: baseOid } },
         headRefName,
         headRefOid: headOid,
         headRef: { name: headRefName, target: { oid: headOid } },
-        potentialMergeCommit: {
-          oid: POTENTIAL,
-          tree: { oid: "e".repeat(40) },
-          parents: {
-            totalCount: 2,
-            pageInfo: { hasNextPage: false, endCursor: "parent-2" },
-            nodes: [{ oid: BASE }, { oid: headOid }],
-          },
-        },
+        potentialMergeCommit: potentialMergeCommitOid === null
+          ? null
+          : {
+              oid: potentialMergeCommitOid,
+              tree: { oid: "e".repeat(40) },
+              parents: {
+                totalCount: 2,
+                pageInfo: { hasNextPage: false, endCursor: "parent-2" },
+                nodes: [{ oid: baseOid }, { oid: headOid }],
+              },
+            },
       },
     },
   };

@@ -8,11 +8,18 @@ import {
   bindV2Request,
   buildV2StatusPlan,
   buildV2AttemptReceipt,
+  assertV2AutomaticRecoveryArtifactBindingCandidateHandle,
   deriveV2EpochId,
+  getV2AutomaticRecoveryArtifactBindingCandidateHandle,
   prepareV2Request,
+  projectV2AutomaticRecoveryArtifactBindingCandidateForGitLedger,
   projectV2RunnerCandidateSuppressionEvidence,
   runV2Operation,
 } from "../packages/action/src/v2/runner.mjs";
+import {
+  V2_PROJECTOR_CONTROLLER_SCHEMA,
+} from "../packages/action/src/v2/projector.mjs";
+import { reduceV2Snapshot } from "../packages/action/src/v2/reducer.mjs";
 import {
   createV2GitHubTransport,
 } from "../packages/action/src/v2/transport.mjs";
@@ -401,6 +408,54 @@ test("bind rejects replay, missing attempt authority, and post-hoc causal orderi
     }),
     /request times must order reservation/u,
   );
+});
+
+test("bind-request projects its provisional request only in the current incarnation", async () => {
+  const snapshot = makeSnapshot();
+  const reservation = prepareV2Request({
+    snapshot,
+    head_ledger: makeLedger(snapshot),
+    scheduler_post_action: schedulerPostAction(),
+  });
+  const input = makeRunnerInput({ operation: "bind-request", snapshot });
+  input.controller = { request_bindings: [] };
+  input.reservation = reservation;
+  input.post_response = makePostResponse(reservation);
+  input.head_ledger = makeLedger(snapshot, { automatic_request_count: 1 });
+  input.scheduling.epoch.automatic_request = attemptedSchedulerState(reservation);
+  let projectedBinding = null;
+  const output = await runV2Operation(input, {
+    transport: {
+      async loadSnapshot() {
+        return structuredClone(snapshot);
+      },
+    },
+    deriveEvidenceRequest: ({ controller }) => {
+      assert.equal(controller.request_bindings.length, 1);
+      projectedBinding = structuredClone(controller.request_bindings[0]);
+      return { artifactSelectors: [], permissionSubjects: [] };
+    },
+    projectSnapshots: ({ evidence_snapshot: evidenceSnapshot }) => ({
+      ...evidenceSnapshot,
+      complete: true,
+    }),
+    reduceSnapshot: () => makeReducerReport(snapshot, "pending"),
+    projectPublicReport: ({ compact_report: report }) => ({
+      schema_version: 2,
+      decision: report.decision,
+    }),
+    planActions: () => ({ actions: [] }),
+    getExactArtifact: () => ({
+      selector: { kind: "issue_comment", id: "501" },
+      artifact: normalizedCreatedComment(),
+      response_server_time: "2026-08-13T12:00:02.000Z",
+      raw_body_sha256: digest("b"),
+    }),
+  });
+
+  assert.equal(projectedBinding.current_incarnation, true);
+  assert.equal(projectedBinding.id, "501");
+  assert.equal(output.binding_receipt.post_refetch.artifact_id, "501");
 });
 
 test("evaluate-only loads discovery and exact-evidence snapshots without mutation actions", async () => {
@@ -911,6 +966,569 @@ test("head mode evaluates but never publishes a terminal success to head", async
   assert.equal(invalidFindingPlan.terminal_cutover, false);
 });
 
+test("provider-unbound terminal clean never mints positive binding authority",
+  async (context) => {
+    const cases = [{
+      name: "generation one current request",
+      expectedDecision: "inconclusive",
+      prepare() {
+        return providerUnboundTerminalCleanFixture();
+      },
+    }, {
+      name: "generation three current request",
+      expectedDecision: "findings",
+      prepare() {
+        const fixture = providerUnboundTerminalCleanFixture();
+        promoteProviderUnboundFixtureToGeneration(fixture, 3);
+        return fixture;
+      },
+    }, {
+      name: "delayed carrier after an older-base generation",
+      expectedDecision: "findings",
+      prepare() {
+        const fixture = providerUnboundTerminalCleanFixture();
+        promoteProviderUnboundFixtureToGeneration(fixture, 3);
+        fixture.input.controller.request_bindings[1].base_oid = sha("9");
+        return fixture;
+      },
+    }];
+
+    for (const scenario of cases) {
+      await context.test(scenario.name, async () => {
+        const fixture = scenario.prepare();
+        const result = await runV2Operation(
+          fixture.input,
+          providerUnboundTerminalCleanDependencies(fixture),
+        );
+
+        assert.equal(result.decision, scenario.expectedDecision);
+        assert.equal(result.reducer_report.provider_input_lineage, "unavailable");
+        if (scenario.expectedDecision === "inconclusive") {
+          assert.equal(
+            result.reducer_report.provider_profile,
+            "terminal-payload",
+          );
+          assert.equal(
+            result.reducer_report.evidence_basis.kind,
+            "terminal-clean",
+          );
+          assert.equal(
+            result.reducer_report.evidence_basis.scope_assurance,
+            "artifact-publication-only",
+          );
+          assert.equal(
+            result.reducer_report.evidence_basis.artifact_id,
+            fixture.clean.id,
+          );
+        }
+        assert.equal(
+          getV2AutomaticRecoveryArtifactBindingCandidateHandle(result),
+          null,
+        );
+        assert.equal(
+          Object.hasOwn(result, "artifact_binding_candidate_handle"),
+          false,
+        );
+        assertRunnerEvidenceRequestsHaveNoTerminalBindingPurpose(fixture);
+      });
+    }
+  });
+
+test("generation one and two findings retain opaque recovery binding authority",
+  async (context) => {
+    for (const scenario of [{
+      name: "generation 1",
+      generationIndex: 1,
+      earlierBase: false,
+    }, {
+      name: "generation 2",
+      generationIndex: 2,
+      earlierBase: false,
+    }, {
+      name: "generation 1 after a same-head base retarget",
+      generationIndex: 1,
+      earlierBase: true,
+    }]) {
+      await context.test(scenario.name, async () => {
+        const { generationIndex } = scenario;
+        const fixture = providerUnboundTerminalCleanFixture();
+        fixture.clean.body =
+          "### 💡 Codex Review\n\n" +
+          `- [P1] Generation ${generationIndex} ` +
+          `https://github.com/owner/repo/blob/${HEAD}/src/c.js#L3`;
+        replaceCandidateCarrier(fixture);
+        if (generationIndex > 1) {
+          promoteProviderUnboundFixtureToGeneration(fixture, generationIndex);
+        }
+        if (scenario.earlierBase) {
+          fixture.input.controller.request_bindings.at(-1).base_oid = sha("9");
+          fixture.input.controller.request_bindings.at(-1)
+            .current_incarnation = false;
+        }
+        const result = await runV2Operation(
+          fixture.input,
+          providerUnboundTerminalCleanDependencies(fixture),
+        );
+
+        assert.equal(result.decision, "findings");
+        const handle = getV2AutomaticRecoveryArtifactBindingCandidateHandle(
+          result,
+        );
+        assert.notEqual(handle, null);
+        assert.equal(
+          assertV2AutomaticRecoveryArtifactBindingCandidateHandle(handle, {
+            runner_result: result,
+          }),
+          handle,
+        );
+        const authority =
+          projectV2AutomaticRecoveryArtifactBindingCandidateForGitLedger(
+            handle,
+          );
+        assert.equal(authority.decision, "findings");
+        assert.equal(authority.generation_id, `automatic:${generationIndex}`);
+        assert.equal(authority.generation_index, generationIndex);
+        assert.equal(authority.request_id, fixture.request.id);
+        assert.equal(authority.candidates.length, 1);
+        assert.deepEqual(authority.candidates[0].selector, {
+          kind: "issue_comment",
+          id: fixture.clean.id,
+        });
+        assert.equal(Object.hasOwn(authority, "purpose"), false);
+        assert.equal(Object.hasOwn(authority.candidates[0], "purpose"), false);
+        assertRunnerEvidenceRequestsHaveNoTerminalBindingPurpose(fixture);
+      });
+    }
+  });
+
+test("generation three findings cannot mint a useless recovery binding candidate",
+  async () => {
+    const fixture = providerUnboundTerminalCleanFixture();
+    fixture.clean.body =
+      "### 💡 Codex Review\n\n" +
+      `- [P1] Generation 3 https://github.com/owner/repo/blob/${HEAD}/src/c.js#L3`;
+    replaceCandidateCarrier(fixture);
+    promoteProviderUnboundFixtureToGeneration(fixture, 3);
+    const result = await runV2Operation(
+      fixture.input,
+      providerUnboundTerminalCleanDependencies(fixture),
+    );
+
+    assert.equal(result.decision, "findings");
+    assert.equal(result.reducer_report.request_policy.generation_id, "automatic:3");
+    assert.equal(result.reducer_report.request_policy.generation_index, 3);
+    assert.equal(
+      getV2AutomaticRecoveryArtifactBindingCandidateHandle(result),
+      null,
+    );
+  });
+
+function providerUnboundTerminalCleanFixture() {
+  const request = candidateIssueComment("301", {
+    body: V2_REQUEST_BODY,
+    author: {
+      id: "1001",
+      login: "github-actions[bot]",
+      type: "Bot",
+      node_id: "BOT_actions",
+    },
+    app: { id: "15368", slug: "github-actions", node_id: "APP_actions" },
+    created_at: "2026-08-13T11:59:00.000Z",
+    updated_at: "2026-08-13T11:59:00.000Z",
+  });
+  const clean = candidateIssueComment("401", {
+    body:
+      "Codex Review: Didn't find any major issues.\n\n" +
+      `**Reviewed commit:** \`${HEAD}\``,
+    author: {
+      id: "9001",
+      login: "chatgpt-codex-connector[bot]",
+      type: "Bot",
+      node_id: "BOT_codex",
+    },
+    app: {
+      id: "9002",
+      slug: "chatgpt-codex-connector",
+      node_id: "APP_codex",
+    },
+    author_association: "NONE",
+    created_at: "2026-08-13T11:59:50.000Z",
+    updated_at: "2026-08-13T11:59:50.000Z",
+  });
+  const exactRequest = candidateExactArtifact(request, digest("7"));
+  const exactClean = candidateExactArtifact(clean, digest("8"));
+  const discovery = makeSnapshot();
+  const evidence = makeSnapshot();
+  for (const snapshot of [discovery, evidence]) {
+    setScopeReceiptTime(
+      snapshot.scope_receipts.pre,
+      "2026-08-13T11:59:58.000Z",
+    );
+    setScopeReceiptTime(
+      snapshot.scope_receipts.post,
+      SERVER_TIME,
+    );
+  }
+  discovery.pages.issue_comments = [
+    structuredClone(request),
+    structuredClone(clean),
+  ];
+  evidence.pages.issue_comments = [
+    structuredClone(request),
+    structuredClone(clean),
+  ];
+  for (const snapshot of [discovery, evidence]) {
+    snapshot.pages.reactions.issue_comments = [request, clean].map(
+      (comment) => ({ subject_id: comment.id, reactions: [] }),
+    );
+  }
+  evidence.pages.exact_artifacts = [exactRequest, exactClean];
+  discovery.completeness.item_count = 2;
+  evidence.completeness.item_count = 4;
+  const controller = {
+    schema: V2_PROJECTOR_CONTROLLER_SCHEMA,
+    schema_version: 1,
+    selection: { policy: "user-explicit" },
+    server_enforcement: {
+      workflow: {
+        present: true,
+        compatible: true,
+        source: "trusted-reusable-workflow",
+        path: ".github/workflows/review-gate.yml",
+        revision: HEAD,
+      },
+      ruleset: {
+        required: true,
+        present: true,
+        compatible: true,
+        status_context: "codex/github-review-gate",
+        expected_source: "github-actions",
+        source_id: "15368",
+      },
+      app: { required: true, bound: true, source_matches: true },
+    },
+    budget: {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 1,
+      manual_requests_in_epoch: 0,
+    },
+    request_bindings: [{
+      id: request.id,
+      kind: "automatic",
+      base_oid: sha("a"),
+      head_oid: HEAD,
+      controlled: true,
+      generation_id: "automatic:1",
+      generation_kind: "automatic",
+      generation_index: 1,
+      current_incarnation: true,
+    }],
+    generation_admissions: [],
+    artifact_bindings: [],
+    thread_resolution_observations: [],
+    no_start_observations: [],
+    final_reread: {
+      required: true,
+      assurance: "two-complete-point-in-time-snapshots",
+    },
+  };
+  const input = makeRunnerInput({
+    operation: "evaluate-only",
+    snapshot: evidence,
+  });
+  input.controller = controller;
+  input.public_report_authority.selection = {
+    selected: true,
+    intent: "required",
+    mode: "implicit",
+    source: "active-ruleset",
+  };
+  input.scheduling.epoch.controlled_request = {
+    request_id: request.id,
+    bound_at: request.created_at,
+    binding_record_oid: sha("1"),
+    binding_receipt_digest: digest("6"),
+  };
+  input.scheduling.epoch.automatic_request = {
+    state: "effect-attempted",
+    generation_index: 1,
+    recovery_authority: null,
+    intent_id: "automatic:1:provider-unbound-fixture",
+    intent_persisted_at: request.created_at,
+    effect_attempted_at: request.created_at,
+  };
+  const snapshotRequests = [];
+  return {
+    request,
+    clean,
+    discovery,
+    evidence,
+    input,
+    snapshotRequests,
+  };
+}
+
+function providerUnboundTerminalCleanDependencies(fixture) {
+  return {
+    transport: sequentialSnapshotTransport(
+      fixture.discovery,
+      fixture.evidence,
+      fixture.snapshotRequests,
+    ),
+    reduceSnapshot: reduceV2Snapshot,
+  };
+}
+
+function promoteProviderUnboundFixtureToGeneration(fixture, generationIndex) {
+  assert.ok(generationIndex === 2 || generationIndex === 3);
+  const priorCount = generationIndex - 1;
+  const priorRequests = ["291", "292"].slice(0, priorCount).map((id, index) =>
+    candidateIssueComment(id, {
+      body: V2_REQUEST_BODY,
+      author: structuredClone(fixture.request.author),
+      app: structuredClone(fixture.request.app),
+      created_at: `2026-08-13T11:${30 + index * 10}:00.000Z`,
+      updated_at: `2026-08-13T11:${30 + index * 10}:00.000Z`,
+    }));
+  const priorFindings = ["391", "392"].slice(0, priorCount).map((id, index) =>
+    candidateIssueComment(id, {
+      body:
+        "### 💡 Codex Review\n\n" +
+        `- [P1] Generation ${index + 1} ` +
+        `https://github.com/owner/repo/blob/${HEAD}/src/a.js#L${index + 1}`,
+      author: structuredClone(fixture.clean.author),
+      app: structuredClone(fixture.clean.app),
+      author_association: "NONE",
+      created_at: `2026-08-13T11:${31 + index * 10}:00.000Z`,
+      updated_at: `2026-08-13T11:${31 + index * 10}:00.000Z`,
+    }));
+  const addresses = ["491", "492"].slice(0, priorCount).map((id, index) =>
+    candidateIssueComment(id, {
+      body: `/codex-gate addressed ${priorFindings[index].html_url}`,
+      created_at: `2026-08-13T11:${32 + index * 10}:00.000Z`,
+      updated_at: `2026-08-13T11:${32 + index * 10}:00.000Z`,
+    }));
+  const historical = priorRequests.flatMap((request, index) => [
+    request,
+    priorFindings[index],
+    addresses[index],
+  ]);
+  for (const snapshot of [fixture.discovery, fixture.evidence]) {
+    snapshot.pages.issue_comments = [
+      ...historical.map((comment) => structuredClone(comment)),
+      ...snapshot.pages.issue_comments,
+    ];
+    snapshot.pages.reactions.issue_comments = snapshot.pages.issue_comments.map(
+      (comment) => ({ subject_id: comment.id, reactions: [] }),
+    );
+    snapshot.completeness.item_count += historical.length;
+  }
+  fixture.evidence.pages.exact_artifacts = [
+    ...historical.map((comment, index) =>
+      candidateExactArtifact(comment, digest(String(index + 1)))),
+    ...fixture.evidence.pages.exact_artifacts,
+  ];
+  fixture.evidence.permissions.actor_permissions = addresses.map((address) =>
+    candidateActorPermission(address.id, address.author));
+  fixture.evidence.completeness.item_count += historical.length;
+  fixture.input.controller.request_bindings = [
+    ...priorRequests.map((request, index) => ({
+      id: request.id,
+      kind: "automatic",
+      base_oid: sha("a"),
+      head_oid: HEAD,
+      controlled: true,
+      generation_id: `automatic:${index + 1}`,
+      generation_kind: "automatic",
+      generation_index: index + 1,
+      current_incarnation: true,
+    })),
+    {
+      ...fixture.input.controller.request_bindings[0],
+      generation_id: `automatic:${generationIndex}`,
+      generation_index: generationIndex,
+    },
+  ];
+  const generationRequests = [...priorRequests, fixture.request];
+  const nextBindingRecordOids = priorRequests.map((_, index) =>
+    sha(String(index + 6)));
+  fixture.input.controller.generation_admissions = priorRequests.map(
+    (request, index) => ({
+      prior_generation_id: `automatic:${index + 1}`,
+      next_generation_id: `automatic:${index + 2}`,
+      prior_request_id: request.id,
+      next_request_id: generationRequests[index + 1].id,
+      head_oid: HEAD,
+      prior_request_binding_record_oid: index === 0
+        ? sha("2")
+        : nextBindingRecordOids[index - 1],
+      recovery_transition_record_oid: sha(String(index + 4)),
+      recovery_transition_payload_digest: digest(String(index + 2)),
+      next_request_binding_record_oid: nextBindingRecordOids[index],
+      next_request_binding_payload_digest: digest(String(index + 4)),
+      transition_server_time: addresses[index].created_at,
+      ledger_order: {
+        prior_request_binding_index: index * 2,
+        recovery_transition_index: index * 2 + 1,
+        next_request_binding_index: index * 2 + 2,
+      },
+    }),
+  );
+  fixture.input.controller.artifact_bindings = priorFindings.map(
+    (finding, index) => ({
+      id: finding.id,
+      request_id: priorRequests[index].id,
+    }),
+  );
+  fixture.input.controller.budget = {
+    automatic_requests_on_head: generationIndex,
+    automatic_reservations_on_head: generationIndex,
+    manual_requests_in_epoch: 0,
+  };
+  fixture.input.scheduling.epoch.automatic_request = {
+    state: "effect-attempted",
+    generation_index: generationIndex,
+    recovery_authority: {
+      prior_generation_id: `automatic:${generationIndex - 1}`,
+      finding_ids: [priorFindings.at(-1).id],
+      closure_ids: [addresses.at(-1).id],
+      closure_observed_at: addresses.at(-1).created_at,
+    },
+    intent_id: `automatic:${generationIndex}:provider-unbound-fixture`,
+    intent_persisted_at: fixture.request.created_at,
+    effect_attempted_at: fixture.request.created_at,
+  };
+}
+
+function candidateIssueComment(id, overrides = {}) {
+  return {
+    id,
+    node_id: `IC_${id}`,
+    url: `https://api.github.test/repos/owner/repo/issues/comments/${id}`,
+    html_url: `https://github.com/owner/repo/pull/42#issuecomment-${id}`,
+    issue_url: "https://api.github.test/repos/owner/repo/issues/42",
+    author: {
+      id: "42",
+      login: "reviewer",
+      type: "User",
+      node_id: "USER_reviewer",
+    },
+    app: null,
+    author_association: "MEMBER",
+    body: "ordinary comment",
+    created_at: "2026-08-13T11:59:30.000Z",
+    updated_at: "2026-08-13T11:59:30.000Z",
+    ...overrides,
+  };
+}
+
+function candidateExactArtifact(artifact, rawBodySha256) {
+  return {
+    selector: { kind: "issue_comment", id: artifact.id },
+    artifact: structuredClone(artifact),
+    response_server_time: "2026-08-13T11:59:59.000Z",
+    raw_body_sha256: rawBodySha256,
+  };
+}
+
+function candidateActorPermission(subjectId, subjectActor) {
+  const receipt = {
+    subject: { kind: "issue_comment", id: subjectId },
+    actor: structuredClone(subjectActor),
+    effective_permission: "write",
+    role_name: "write",
+    permissions: {
+      admin: false,
+      maintain: false,
+      push: true,
+      triage: true,
+      pull: true,
+    },
+    mapping_source: "user.permissions",
+    permission_assurance: "point-in-time-only",
+    request_time_permission: "unproven",
+    permission_aba_excluded: false,
+    endpoint:
+      `https://api.github.test/repos/owner/repo/collaborators/` +
+      `${subjectActor.login}/permission`,
+    http_status: 200,
+    response_server_time: "2026-08-13T11:59:59.000Z",
+    raw_body_sha256: digest("9"),
+  };
+  return {
+    subject: { kind: "issue_comment", id: subjectId },
+    actor: structuredClone(subjectActor),
+    assurance: "point-in-time-only",
+    request_time_permission: "unproven",
+    permission_aba_excluded: false,
+    stable: true,
+    pre: structuredClone(receipt),
+    post: structuredClone(receipt),
+  };
+}
+
+function setScopeReceiptTime(receipt, serverTime) {
+  receipt.server_time = serverTime;
+  for (const endpoint of Object.values(receipt.endpoint_receipts)) {
+    if (endpoint !== null) endpoint.server_time = serverTime;
+  }
+}
+
+function replaceCandidateCarrier(fixture) {
+  fixture.discovery.pages.issue_comments[1] = structuredClone(fixture.clean);
+  fixture.evidence.pages.issue_comments[1] = structuredClone(fixture.clean);
+  fixture.evidence.pages.exact_artifacts[1].artifact =
+    structuredClone(fixture.clean);
+}
+
+function assertRunnerEvidenceRequestsHaveNoTerminalBindingPurpose(fixture) {
+  assert.equal(fixture.snapshotRequests.length, 2);
+  assert.deepEqual(fixture.snapshotRequests[0], {
+    owner: fixture.input.snapshot_request.owner,
+    repo: fixture.input.snapshot_request.repo,
+    pullNumber: fixture.input.snapshot_request.pull_number,
+    artifactSelectors: [],
+  });
+  assert.deepEqual(Object.keys(fixture.snapshotRequests[1]).sort(), [
+    "artifactSelectors",
+    "owner",
+    "permissionSubjects",
+    "pullNumber",
+    "repo",
+  ]);
+  for (const selector of fixture.snapshotRequests[1].artifactSelectors) {
+    assert.deepEqual(Object.keys(selector).sort(), ["id", "kind"]);
+  }
+  assert.deepEqual(
+    fixture.snapshotRequests[1].artifactSelectors
+      .map(({ kind, id }) => `${kind}:${id}`)
+      .sort(),
+    fixture.evidence.pages.exact_artifacts
+      .map(({ selector: { kind, id } }) => `${kind}:${id}`)
+      .sort(),
+  );
+  assert.equal(
+    JSON.stringify(fixture.snapshotRequests[1]).includes(
+      "terminal-clean-completion",
+    ),
+    false,
+  );
+}
+
+function sequentialSnapshotTransport(discovery, evidence, requests = []) {
+  const snapshots = [discovery, evidence];
+  return {
+    async loadSnapshot(request) {
+      requests.push(structuredClone(request));
+      const snapshot = snapshots.shift();
+      if (snapshot === undefined) {
+        throw new Error("unexpected third transport snapshot");
+      }
+      return structuredClone(snapshot);
+    },
+  };
+}
+
 function createRunnerLiveTransport(limits = undefined) {
   return createV2GitHubTransport({
     fetch: createRunnerTransportFetch(),
@@ -1155,23 +1773,32 @@ function makeReducerReport(
   decision,
   statusTargetMode = "test-merge-with-head-sentinel",
 ) {
-  const cleanArtifact = {
+  const cleanRequest = {
+    id: "1001",
+    url: `https://github.com/owner/repo/pull/${snapshot.pull_request.number}#issuecomment-1001`,
+    created_at: "2026-08-13T11:58:00.000Z",
+  };
+  const cleanAcknowledgement = {
     id: "2001",
     url: `https://github.com/owner/repo/pull/${snapshot.pull_request.number}#issuecomment-2001`,
     created_at: "2026-08-13T11:59:59.000Z",
   };
   const cleanBasis = {
-    kind: "terminal-clean",
+    kind: "thumbs-up-clean",
     scope_assurance: "whole-pr-contractual",
-    artifact_id: cleanArtifact.id,
-    summary: "Exact terminal clean fixture",
+    artifact_id: cleanAcknowledgement.id,
+    summary: "Exact current-request reaction fixture",
     authority_receipt: {
-      selected_request: null,
-      selected_artifact: cleanArtifact,
+      selected_request: cleanRequest,
+      selected_artifact: null,
       pagination_sha256: FINGERPRINT,
       final_reread_sha256: FINGERPRINT,
       recovery: null,
-      selected_generation: null,
+      selected_generation: {
+        id: "automatic:1",
+        kind: "automatic",
+        index: 1,
+      },
     },
   };
   return {
@@ -1201,17 +1828,17 @@ function makeReducerReport(
     },
     request_policy: {
       status: "compliant",
-      selected_request_id: null,
+      selected_request_id: decision === "clean" ? cleanRequest.id : null,
       reason: "test",
       permission_assurance: null,
       request_time_permission: null,
       permission_aba_excluded: null,
-      generation_id: null,
-      generation_kind: null,
-      generation_index: null,
+      generation_id: decision === "clean" ? "automatic:1" : null,
+      generation_kind: decision === "clean" ? "automatic" : null,
+      generation_index: decision === "clean" ? 1 : null,
     },
     provider_input_lineage: "unavailable",
-    provider_profile: decision === "clean" ? "terminal-payload" : "unknown",
+    provider_profile: decision === "clean" ? "thumbs-up-clean" : "unknown",
     evidence_basis: decision === "clean" ? cleanBasis : null,
     status_target: {
       mode: statusTargetMode,

@@ -4,8 +4,13 @@ import test from "node:test";
 import {
   V2_PUBLIC_REPORT_SELECTION_AUTHORITY_SCHEMA,
   V2PublicReportProjectionError,
+  projectV2AutomaticRequestRecoveryAuthority,
   projectV2PublicReport,
 } from "../packages/action/src/v2/public-report-projector.mjs";
+import {
+  V2_PROJECTOR_CONTROLLER_SCHEMA,
+  projectV2TransportSnapshots,
+} from "../packages/action/src/v2/projector.mjs";
 import {
   reduceV2Snapshot,
 } from "../packages/action/src/v2/reducer.mjs";
@@ -81,41 +86,104 @@ test("projects head mode without advertising a terminal merge target", () => {
   );
 });
 
-test("head mode can report a clean decision without claiming a head success", () => {
-  const input = reducerInput({ artifacts: [terminalCleanArtifact()] });
+test("head mode retains terminal-clean classification without claiming success", () => {
+  const input = reducerInputWithBoundTerminalClean();
   const compact = reduceV2Snapshot(input, HEAD_OPTIONS);
   const publicReport = projectV2PublicReport({
     compact_report: compact,
     reducer_input: input,
-    evidence_snapshot: transportSnapshot({ issueComments: [terminalCleanComment()] }),
+    evidence_snapshot: transportSnapshot({
+      issueComments: [automaticRequestComment(), terminalCleanComment()],
+    }),
     selection_authority: selectionAuthority(),
     head_sentinel_receipt: null,
   });
 
-  assert.equal(publicReport.decision, "clean");
+  assert.equal(publicReport.decision, "inconclusive");
   assert.equal(publicReport.status_target.mode, "head");
   assert.equal(publicReport.status_target.head_sentinel_state, "absent");
   assert.equal(publicReport.status_target.potential_target_state, "not-applicable");
 });
 
-test("projects terminal clean only with exact selected artifact and a non-success head sentinel", () => {
-  const clean = terminalCleanArtifact();
-  const input = reducerInput({ artifacts: [clean] });
+test("projects terminal clean only as exact artifact classification", () => {
+  const clean = terminalCleanArtifact({ request_id: "1001" });
+  const input = reducerInputWithBoundTerminalClean();
   const compact = reduceV2Snapshot(input, OPTIONS);
   const publicReport = projectV2PublicReport({
     compact_report: compact,
     reducer_input: input,
-    evidence_snapshot: transportSnapshot({ issueComments: [terminalCleanComment()] }),
+    evidence_snapshot: transportSnapshot({
+      issueComments: [automaticRequestComment(), terminalCleanComment()],
+    }),
     selection_authority: selectionAuthority(),
     head_sentinel_receipt: sentinelReceipt(),
   });
 
-  assert.equal(publicReport.decision, "clean");
+  assert.equal(publicReport.decision, "inconclusive");
   assert.equal(publicReport.provider_profile, "terminal-payload");
   assert.equal(publicReport.evidence_basis.kind, "terminal-payload");
   assert.deepEqual(publicReport.evidence_basis.selected_ids, ["2001"]);
   assert.deepEqual(publicReport.evidence_basis.selected_urls, [clean.url]);
+  assert.equal(publicReport.evidence_basis.scope_assurance,
+    "artifact-publication-only");
+  assert.equal(publicReport.evidence_basis.server_times.request, null);
+  assert.equal(publicReport.evidence_basis.finding_recovery, null);
+  assert.equal(publicReport.evidence_basis.authority_receipt.selected_request, null);
+  assert.equal(publicReport.evidence_basis.authority_receipt.recovery, null);
   assert.equal(publicReport.status_target.head_sentinel_state, "pending");
+});
+
+test("rejects forged terminal clean request-generation lineage before projection", () => {
+  const input = reducerInputWithBoundTerminalClean();
+  const compact = reduceV2Snapshot(input, OPTIONS);
+  const request = input.requests[0];
+  compact.evidence_basis.authority_receipt.selected_request = {
+    id: request.id,
+    url: request.url,
+    created_at: request.created_at,
+  };
+  compact.evidence_basis.authority_receipt.selected_generation = {
+    id: request.generation_id,
+    kind: request.generation_kind,
+    index: request.generation_index,
+  };
+
+  assert.throws(
+    () => projectV2PublicReport({
+      compact_report: compact,
+      reducer_input: input,
+      evidence_snapshot: transportSnapshot({
+        issueComments: [automaticRequestComment(), terminalCleanComment()],
+      }),
+      selection_authority: selectionAuthority(),
+      head_sentinel_receipt: sentinelReceipt(),
+    }),
+    /terminal clean classification lineage must be null/u,
+  );
+});
+
+test("projects a bound terminal clean ahead of a current +1 in mixed evidence", () => {
+  const input = reducerInputWithBoundTerminalClean({
+    acknowledgements: [plusOneAcknowledgement("1001")],
+  });
+  const compact = reduceV2Snapshot(input, OPTIONS);
+  const rawRequest = automaticRequestComment();
+  const publicReport = projectV2PublicReport({
+    compact_report: compact,
+    reducer_input: input,
+    evidence_snapshot: transportSnapshot({
+      issueComments: [rawRequest, terminalCleanComment()],
+      issueReactionMap: new Map([[rawRequest.id, [providerReaction()]]]),
+    }),
+    selection_authority: selectionAuthority(),
+    head_sentinel_receipt: sentinelReceipt(),
+  });
+
+  assert.equal(publicReport.decision, "inconclusive");
+  assert.equal(publicReport.provider_profile, "mixed");
+  assert.equal(publicReport.evidence_basis.kind, "terminal-payload");
+  assert.deepEqual(publicReport.evidence_basis.selected_ids, ["2001"]);
+  assert.equal(publicReport.request_policy.request_id, "1001");
 });
 
 test("projects malformed terminal conflicts with their computed provider profile", () => {
@@ -434,6 +502,41 @@ test("preserves the manual point-read permission tuple for an exact +1 basis", (
     permission_aba_excluded: false,
   });
   assert.equal(publicReport.review_epoch.controlled_request_id, null);
+  assert.equal(publicReport.evidence_basis.authority_receipt.selected_artifact, null);
+});
+
+test("rejects forged reaction selected artifact lineage before projection", () => {
+  const request = automaticRequest();
+  const input = reducerInput({
+    requests: [request],
+    acknowledgements: [plusOneAcknowledgement(request.id)],
+    budget: {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 1,
+      manual_requests_in_epoch: 0,
+    },
+  });
+  const compact = reduceV2Snapshot(input, OPTIONS);
+  compact.evidence_basis.authority_receipt.selected_artifact = {
+    id: "3001",
+    url: "https://github.com/owner/repo/pull/7#issuecomment-3001",
+    created_at: "2026-08-13T12:10:00Z",
+  };
+  const rawRequest = automaticRequestComment();
+
+  assert.throws(
+    () => projectV2PublicReport({
+      compact_report: compact,
+      reducer_input: input,
+      evidence_snapshot: transportSnapshot({
+        issueComments: [rawRequest],
+        issueReactionMap: new Map([[rawRequest.id, [providerReaction()]]]),
+      }),
+      selection_authority: selectionAuthority(),
+      head_sentinel_receipt: sentinelReceipt(),
+    }),
+    /reaction clean authority selected artifact must be null/u,
+  );
 });
 
 test("projects an unselected result without leaking selected-only structures", () => {
@@ -458,21 +561,22 @@ test("projects an unselected result without leaking selected-only structures", (
   assert.equal(publicReport.evidence_basis, null);
 });
 
-test("fails closed when a terminal result has no observed non-success head sentinel", () => {
-  const input = reducerInput({ artifacts: [terminalCleanArtifact()] });
+test("terminal classification does not require a positive-cutover sentinel", () => {
+  const input = reducerInputWithBoundTerminalClean();
   const compact = reduceV2Snapshot(input, OPTIONS);
-  assert.throws(
-    () => projectV2PublicReport({
-      compact_report: compact,
-      reducer_input: input,
-      evidence_snapshot: transportSnapshot({ issueComments: [terminalCleanComment()] }),
-      selection_authority: selectionAuthority(),
-      head_sentinel_receipt: null,
+  const report = projectV2PublicReport({
+    compact_report: compact,
+    reducer_input: input,
+    evidence_snapshot: transportSnapshot({
+      issueComments: [automaticRequestComment(), terminalCleanComment()],
     }),
-    (error) =>
-      error instanceof V2PublicReportProjectionError &&
-      error.code === "HEAD_SENTINEL_UNPROVEN",
-  );
+    selection_authority: selectionAuthority(),
+    head_sentinel_receipt: null,
+  });
+  assert.equal(report.decision, "inconclusive");
+  assert.equal(report.status_target.head_sentinel_state, "absent");
+  assert.equal(report.evidence_basis.scope_assurance,
+    "artifact-publication-only");
 });
 
 test("fails closed when GitHub Dates cannot prove a strictly later target reread", () => {
@@ -520,6 +624,141 @@ test("rejects a selection source that contradicts sealed workflow and ruleset fa
   );
 });
 
+test("automatic recovery ignores a durably bound earlier-head request", () => {
+  const fixture = earlierHeadAutomaticRecoveryFixture();
+  const input = projectV2TransportSnapshots({
+    discovery_snapshot: fixture.discovery,
+    evidence_snapshot: fixture.evidence,
+    controller: fixture.controller,
+  });
+  assert.deepEqual(input.requests.map((request) => request.id), [
+    fixture.currentRequest.id,
+  ]);
+  const compact = reduceV2Snapshot(input, OPTIONS);
+  assert.equal(compact.decision, "findings");
+
+  const authority = projectV2AutomaticRequestRecoveryAuthority({
+    compact_report: compact,
+    reducer_input: input,
+    discovery_snapshot: fixture.discovery,
+    evidence_snapshot: fixture.evidence,
+    controller: fixture.controller,
+    controlled_request: fixture.controlledRequest,
+  });
+
+  assert.notEqual(authority, null);
+  assert.equal(authority.prior_request_id, fixture.currentRequest.id);
+  assert.equal(authority.finding_ids.length, 1);
+  assert.deepEqual(authority.closure_ids, [fixture.address.id]);
+});
+
+test("automatic recovery fails closed for incomplete current-head request authority",
+  async (context) => {
+    await context.test("visible request has no durable binding", () => {
+      const unexpected = requestComment("1002", "2026-08-13T12:01:00Z");
+      const fixture = earlierHeadAutomaticRecoveryFixture({
+        extraIssueComments: [unexpected],
+      });
+
+      assert.throws(
+        () => projectV2TransportSnapshots({
+          discovery_snapshot: fixture.discovery,
+          evidence_snapshot: fixture.evidence,
+          controller: fixture.controller,
+        }),
+        (error) => error.code === "REQUEST_BINDING_MISSING",
+      );
+    });
+
+    await context.test("current-head binding has no visible request", () => {
+      const fixture = earlierHeadAutomaticRecoveryFixture({
+        extraRequestBindings: [{
+          id: "1002",
+          kind: "automatic",
+          base_oid: BASE,
+          head_oid: HEAD,
+          current_incarnation: true,
+          controlled: true,
+          generation_id: "automatic:2",
+          generation_kind: "automatic",
+          generation_index: 2,
+        }],
+      });
+
+      assert.throws(
+        () => projectV2TransportSnapshots({
+          discovery_snapshot: fixture.discovery,
+          evidence_snapshot: fixture.evidence,
+          controller: fixture.controller,
+        }),
+        (error) => error.code === "REQUEST_BINDING_ORPHANED",
+      );
+    });
+
+    await context.test("noncurrent binding lacks the historical audit marker", () => {
+      const fixture = earlierHeadAutomaticRecoveryFixture();
+      fixture.controller.request_bindings[0].current_incarnation = true;
+      const input = projectV2TransportSnapshots({
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+      });
+      const compact = reduceV2Snapshot(input, OPTIONS);
+
+      assert.equal(projectV2AutomaticRequestRecoveryAuthority({
+        compact_report: compact,
+        reducer_input: input,
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+        controlled_request: fixture.controlledRequest,
+      }), null);
+    });
+
+    await context.test("unexpected current-head generation is not ignored", () => {
+      const unexpected = requestComment("1002", "2026-08-13T11:50:00Z");
+      const fixture = earlierHeadAutomaticRecoveryFixture({
+        extraIssueComments: [unexpected],
+        extraExactArtifactIds: [unexpected.id],
+        extraRequestBindings: [{
+          id: unexpected.id,
+          kind: "automatic",
+          base_oid: BASE,
+          head_oid: HEAD,
+          current_incarnation: true,
+          controlled: true,
+          generation_id: "automatic:2",
+          generation_kind: "automatic",
+          generation_index: 2,
+        }],
+        budget: {
+          automatic_requests_on_head: 2,
+          automatic_reservations_on_head: 2,
+          manual_requests_in_epoch: 0,
+        },
+      });
+      const input = projectV2TransportSnapshots({
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+      });
+      assert.deepEqual(input.requests.map((request) => request.id), [
+        fixture.currentRequest.id,
+        unexpected.id,
+      ]);
+      const compact = reduceV2Snapshot(input, OPTIONS);
+
+      assert.equal(projectV2AutomaticRequestRecoveryAuthority({
+        compact_report: compact,
+        reducer_input: input,
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+        controlled_request: fixture.controlledRequest,
+      }), null);
+    });
+  });
+
 function reducerInput(overrides = {}) {
   const input = {
     schema_version: 2,
@@ -565,6 +804,7 @@ function reducerInput(overrides = {}) {
     threads: [],
     acknowledgements: [],
     no_start_observations: [],
+    generation_admissions: [],
     evidence_authority: {
       pagination_sha256: DIGEST,
       final_reread_sha256: DIGEST,
@@ -578,7 +818,226 @@ function reducerInput(overrides = {}) {
   return { ...input, ...structuredClone(overrides) };
 }
 
-function terminalCleanArtifact() {
+function earlierHeadAutomaticRecoveryFixture({
+  extraIssueComments = [],
+  extraRequestBindings = [],
+  extraExactArtifactIds = [],
+  budget = {
+    automatic_requests_on_head: 1,
+    automatic_reservations_on_head: 1,
+    manual_requests_in_epoch: 0,
+  },
+} = {}) {
+  const oldHeadRequest = requestComment("901", "2026-08-13T11:00:00Z");
+  const currentRequest = requestComment("1001", "2026-08-13T12:00:00Z");
+  const finding = issueComment("2002", {
+    author: providerActor(),
+    app: providerApp(),
+    body:
+      "### 💡 Codex Review\n\n" +
+      `- [P1] Fix the current-head issue https://github.com/owner/repo/blob/${HEAD}/src/a.js#L1`,
+    created_at: "2026-08-13T12:00:10Z",
+    updated_at: "2026-08-13T12:00:10Z",
+  });
+  const address = issueComment("2003", {
+    body: `/codex-gate addressed ${finding.html_url}`,
+    created_at: "2026-08-13T12:00:30Z",
+    updated_at: "2026-08-13T12:00:30Z",
+  });
+  const issueComments = [
+    oldHeadRequest,
+    currentRequest,
+    finding,
+    address,
+    ...extraIssueComments,
+  ];
+  const controller = automaticRecoveryController({
+    requestBindings: [
+      {
+        id: oldHeadRequest.id,
+        kind: "automatic",
+        base_oid: "8".repeat(40),
+        head_oid: "9".repeat(40),
+        current_incarnation: false,
+        controlled: true,
+        generation_id: "automatic:1",
+        generation_kind: "automatic",
+        generation_index: 1,
+      },
+      {
+        id: currentRequest.id,
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        current_incarnation: true,
+        controlled: true,
+        generation_id: "automatic:1",
+        generation_kind: "automatic",
+        generation_index: 1,
+      },
+      ...extraRequestBindings,
+    ],
+    artifactBindings: [{ id: finding.id, request_id: currentRequest.id }],
+    budget,
+  });
+  const discovery = recoveryTransportSnapshot({
+    issueComments,
+    exactArtifactIds: [],
+    preTime: "2026-08-13T12:04:00Z",
+    postTime: "2026-08-13T12:05:00Z",
+  });
+  const evidence = recoveryTransportSnapshot({
+    issueComments,
+    exactArtifactIds: [
+      currentRequest.id,
+      finding.id,
+      address.id,
+      ...extraExactArtifactIds,
+    ],
+    actorPermissions: [manualPermissionReceipt(address)],
+    preTime: "2026-08-13T12:19:00Z",
+    postTime: "2026-08-13T12:20:00Z",
+  });
+  return {
+    oldHeadRequest,
+    currentRequest,
+    finding,
+    address,
+    controller,
+    discovery,
+    evidence,
+    controlledRequest: {
+      request_id: currentRequest.id,
+      bound_at: currentRequest.created_at,
+      binding_record_oid: "1".repeat(40),
+      binding_receipt_digest: DIGEST,
+    },
+  };
+}
+
+function automaticRecoveryController({
+  requestBindings,
+  artifactBindings,
+  budget,
+}) {
+  return {
+    schema: V2_PROJECTOR_CONTROLLER_SCHEMA,
+    schema_version: 1,
+    selection: { policy: "user-explicit" },
+    server_enforcement: {
+      workflow: {
+        present: true,
+        compatible: true,
+        source: "trusted-reusable-workflow",
+        path: ".github/workflows/review-gate.yml",
+        revision: HEAD,
+      },
+      ruleset: {
+        required: true,
+        present: true,
+        compatible: true,
+        status_context: "codex/github-review-gate",
+        expected_source: "github-actions",
+        source_id: "15368",
+      },
+      app: { required: true, bound: true, source_matches: true },
+    },
+    budget: structuredClone(budget),
+    request_bindings: structuredClone(requestBindings),
+    generation_admissions: [],
+    artifact_bindings: structuredClone(artifactBindings),
+    thread_resolution_observations: [],
+    no_start_observations: [],
+    final_reread: {
+      required: true,
+      assurance: "two-complete-point-in-time-snapshots",
+    },
+  };
+}
+
+function recoveryTransportSnapshot({
+  issueComments,
+  exactArtifactIds,
+  actorPermissions = [],
+  preTime,
+  postTime,
+}) {
+  const snapshot = transportSnapshot({
+    issueComments,
+    actorPermissions,
+    preTime,
+    postTime,
+  });
+  const selectedIds = new Set(exactArtifactIds);
+  const exactArtifacts = snapshot.pages.exact_artifacts.filter((receipt) =>
+    selectedIds.has(receipt.selector.id));
+  snapshot.completeness.item_count -=
+    snapshot.pages.exact_artifacts.length - exactArtifacts.length;
+  snapshot.pages.exact_artifacts = exactArtifacts;
+  return snapshot;
+}
+
+function requestComment(id, createdAt) {
+  return issueComment(id, {
+    body: "@codex review",
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+}
+
+function issueComment(id, overrides = {}) {
+  return {
+    id,
+    node_id: `IC_${id}`,
+    url: `https://api.github.test/repos/owner/repo/issues/comments/${id}`,
+    html_url: `https://github.com/owner/repo/pull/7#issuecomment-${id}`,
+    issue_url: "https://api.github.test/repos/owner/repo/issues/7",
+    author: {
+      id: "42",
+      node_id: "USER_reviewer",
+      login: "reviewer",
+      type: "User",
+    },
+    app: null,
+    author_association: "MEMBER",
+    body: "ordinary comment",
+    created_at: "2026-08-13T12:00:00Z",
+    updated_at: "2026-08-13T12:00:00Z",
+    ...structuredClone(overrides),
+  };
+}
+
+function providerActor() {
+  return {
+    id: "9001",
+    node_id: "BOT_codex",
+    login: "chatgpt-codex-connector[bot]",
+    type: "Bot",
+  };
+}
+
+function providerApp() {
+  return {
+    id: "15368",
+    slug: "chatgpt-codex-connector",
+    node_id: "APP_codex",
+  };
+}
+
+function reducerInputWithBoundTerminalClean(overrides = {}) {
+  return reducerInput({
+    requests: [automaticRequest()],
+    artifacts: [terminalCleanArtifact({ request_id: "1001" })],
+    budget: {
+      automatic_requests_on_head: 1,
+      automatic_reservations_on_head: 1,
+      manual_requests_in_epoch: 0,
+    },
+    ...structuredClone(overrides),
+  });
+}
+
+function terminalCleanArtifact(overrides = {}) {
   return {
     id: "2001",
     url: "https://github.com/owner/repo/pull/7#issuecomment-2001",
@@ -589,6 +1048,27 @@ function terminalCleanArtifact() {
     commit_oid: HEAD,
     stable: true,
     finding_ids: [],
+    ...structuredClone(overrides),
+  };
+}
+
+function automaticRequest() {
+  return {
+    id: "1001",
+    url: "https://github.com/owner/repo/pull/7#issuecomment-1001",
+    kind: "automatic",
+    body: "@codex review",
+    created_at: "2026-08-13T12:00:00Z",
+    updated_at: "2026-08-13T12:00:00Z",
+    controlled: true,
+    stable: true,
+    base_oid: BASE,
+    head_oid: HEAD,
+    actor_permission: null,
+    generation_id: "automatic:1",
+    generation_kind: "automatic",
+    generation_index: 1,
+    current_incarnation: true,
   };
 }
 
@@ -622,6 +1102,7 @@ function manualRequest() {
     generation_id: "manual:1",
     generation_kind: "manual",
     generation_index: 1,
+    current_incarnation: true,
   };
 }
 
@@ -657,6 +1138,27 @@ function terminalCleanComment() {
       `**Reviewed commit:** \`${HEAD}\``,
     created_at: "2026-08-13T12:10:00Z",
     updated_at: "2026-08-13T12:10:00Z",
+  };
+}
+
+function automaticRequestComment() {
+  return {
+    id: "1001",
+    node_id: "IC_1001",
+    url: "https://api.github.test/repos/owner/repo/issues/comments/1001",
+    html_url: "https://github.com/owner/repo/pull/7#issuecomment-1001",
+    issue_url: "https://api.github.test/repos/owner/repo/issues/7",
+    author: {
+      id: "42",
+      node_id: "USER_reviewer",
+      login: "reviewer",
+      type: "User",
+    },
+    app: null,
+    author_association: "MEMBER",
+    body: "@codex review",
+    created_at: "2026-08-13T12:00:00Z",
+    updated_at: "2026-08-13T12:00:00Z",
   };
 }
 

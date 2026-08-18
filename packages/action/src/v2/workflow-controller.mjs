@@ -4491,6 +4491,36 @@ function assertV2ProductionEffectsAuthorized(preflightHandle) {
   }
 }
 
+/**
+ * Persist a retry-zero automatic request attempt only after its safe
+ * pre-effect scope read succeeds. The effect callback remains single-shot:
+ * once persistence succeeds, any effect uncertainty is intentionally allowed
+ * to escape without retrying or reclaiming the attempt.
+ */
+export async function executeV2PreScopedAutomaticRequestAttempt({
+  load_pre_scope: loadPreScope,
+  persist_attempt: persistAttempt,
+  perform_attempt: performAttempt,
+}) {
+  for (const [name, callback] of [
+    ["load_pre_scope", loadPreScope],
+    ["persist_attempt", persistAttempt],
+    ["perform_attempt", performAttempt],
+  ]) {
+    if (typeof callback !== "function") {
+      throw new TypeError(
+        `pre-scoped automatic request requires ${name}`,
+      );
+    }
+  }
+  const preScope = await loadPreScope();
+  const attempt = await persistAttempt();
+  return performAttempt({
+    pre_scope: preScope,
+    attempt,
+  });
+}
+
 export function assertV2InitialProductionLedgerApi(ledger) {
   for (const [name, callback] of [
     ["loadControlPlaneAuthority", ledger?.loadControlPlaneAuthority],
@@ -4894,7 +4924,24 @@ async function assembleV2InitialProductionObservation({
     let automaticRequestOutcome = "not-required";
     let automaticRequestAmbiguityCode = null;
     let automaticRequestIntentSource = "none";
-    const completeAutomaticRequestEffect = async () => {
+    const loadAutomaticRequestPreScope = async () => {
+      failurePhase = "automatic-request-pre-scope";
+      return assertV2MinimalLiveScopeHandle(
+        await loadV2MinimalLiveScope({
+          fetch,
+          token,
+          repository: command.repository,
+          pull_number: command.pull_request.number,
+          rest_base_url: restBaseUrl,
+          graphql_url: graphqlUrl,
+        }),
+        {
+          repository: command.repository,
+          pull_number: command.pull_request.number,
+        },
+      );
+    };
+    const completeAutomaticRequestEffect = async (requestPreScope) => {
         const requestTransport =
           createV2GitHubProductionAutomaticReviewRequestTransport({
             fetch,
@@ -4903,23 +4950,8 @@ async function assembleV2InitialProductionObservation({
             repository: command.repository,
             pull_number: command.pull_request.number,
           });
-        failurePhase = "automatic-request-pre-scope";
         let bindingReceiptCandidate = null;
         try {
-          const requestPreScope = assertV2MinimalLiveScopeHandle(
-            await loadV2MinimalLiveScope({
-              fetch,
-              token,
-              repository: command.repository,
-              pull_number: command.pull_request.number,
-              rest_base_url: restBaseUrl,
-              graphql_url: graphqlUrl,
-            }),
-            {
-              repository: command.repository,
-              pull_number: command.pull_request.number,
-            },
-          );
           failurePhase = "automatic-request-post-refetch";
           publicEffectsPerformed += 1;
           const requestCapture =
@@ -5013,15 +5045,23 @@ async function assembleV2InitialProductionObservation({
             { public_effects_performed: publicEffectsPerformed },
           );
         }
-        failurePhase = "automatic-request-recovered-intent";
-        automaticRequestIntentAppend =
-          await ledger.appendRecoveredAutomaticReviewRequestIntent({
-            scheduler_append: schedulerAppend,
-          });
-        automaticRequestIntentSource = "recovered-reservation";
-        lastReachableReceiptDigest =
-          automaticRequestIntentAppend.intent_append_receipt.receipt_digest;
-        await completeAutomaticRequestEffect();
+        await executeV2PreScopedAutomaticRequestAttempt({
+          load_pre_scope: loadAutomaticRequestPreScope,
+          persist_attempt: async () => {
+            failurePhase = "automatic-request-recovered-intent";
+            automaticRequestIntentAppend =
+              await ledger.appendRecoveredAutomaticReviewRequestIntent({
+                scheduler_append: schedulerAppend,
+              });
+            automaticRequestIntentSource = "recovered-reservation";
+            lastReachableReceiptDigest =
+              automaticRequestIntentAppend.intent_append_receipt
+                .receipt_digest;
+            return automaticRequestIntentAppend;
+          },
+          perform_attempt: ({ pre_scope: requestPreScope }) =>
+            completeAutomaticRequestEffect(requestPreScope),
+        });
       } else {
         failurePhase = "automatic-reservation";
         automaticReservationAppend =
@@ -5094,19 +5134,28 @@ async function assembleV2InitialProductionObservation({
 
         if (reservationStatusOutcome === "bound") {
           failurePhase = "automatic-request-intent";
-          automaticRequestIntentAppend =
-            await ledger.appendAutomaticReviewRequestIntent({
-              automatic_reservation_handle:
-                automaticReservationAppend.automatic_reservation_handle,
-              reservation_append_receipt:
-                automaticReservationAppend.reservation_append_receipt,
-              reservation_status_response_append:
-                reservationStatusResponseAppend,
-            });
-          automaticRequestIntentSource = "new-reservation";
-          lastReachableReceiptDigest =
-            automaticRequestIntentAppend.intent_append_receipt.receipt_digest;
-          await completeAutomaticRequestEffect();
+          await executeV2PreScopedAutomaticRequestAttempt({
+            load_pre_scope: loadAutomaticRequestPreScope,
+            persist_attempt: async () => {
+              failurePhase = "automatic-request-intent";
+              automaticRequestIntentAppend =
+                await ledger.appendAutomaticReviewRequestIntent({
+                  automatic_reservation_handle:
+                    automaticReservationAppend.automatic_reservation_handle,
+                  reservation_append_receipt:
+                    automaticReservationAppend.reservation_append_receipt,
+                  reservation_status_response_append:
+                    reservationStatusResponseAppend,
+                });
+              automaticRequestIntentSource = "new-reservation";
+              lastReachableReceiptDigest =
+                automaticRequestIntentAppend.intent_append_receipt
+                  .receipt_digest;
+              return automaticRequestIntentAppend;
+            },
+            perform_attempt: ({ pre_scope: requestPreScope }) =>
+              completeAutomaticRequestEffect(requestPreScope),
+          });
         }
       }
     }

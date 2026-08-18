@@ -169,7 +169,7 @@ function headStatusTarget(overrides = {}) {
 function terminalBasis(overrides = {}) {
   return {
     kind: "terminal-payload",
-    outcome: "clean",
+    outcome: "inconclusive",
     selected_ids: ["2001"],
     selected_urls: [ARTIFACT_URL],
     server_times: {
@@ -178,7 +178,7 @@ function terminalBasis(overrides = {}) {
     },
     pagination_complete: true,
     final_reread_complete: true,
-    scope_assurance: "whole-pr-contractual",
+    scope_assurance: "artifact-publication-only",
     provider_input_lineage: "unavailable",
     finding_recovery: null,
     authority_receipt: {
@@ -229,6 +229,7 @@ function reactionBasis(overrides = {}) {
       request: "2026-08-13T12:00:00Z",
       selected: [{ id: "3001", server_time: "2026-08-13T12:10:00Z" }],
     },
+    scope_assurance: "whole-pr-contractual",
     finding_recovery: null,
     authority_receipt: {
       selected_request: {
@@ -256,6 +257,7 @@ function noStartBasis(overrides = {}) {
       request: "2026-08-13T12:00:00Z",
       selected: [{ id: "5001", server_time: "2026-08-13T12:00:30Z" }],
     },
+    scope_assurance: "whole-pr-contractual",
     finding_recovery: null,
     authority_receipt: {
       selected_request: {
@@ -290,12 +292,12 @@ function recoveryBasis(overrides = {}) {
     top_level_actor_stable: true,
     top_level_actor_permission: "write",
   });
-  return terminalBasis({
-    selected_ids: ["2001"],
-    selected_urls: [ARTIFACT_URL],
+  return reactionBasis({
+    selected_ids: ["3001"],
+    selected_urls: [REQUEST_URL],
     server_times: {
       request: "2026-08-13T12:07:00Z",
-      selected: [{ id: "2001", server_time: "2026-08-13T12:10:00Z" }],
+      selected: [{ id: "3001", server_time: "2026-08-13T12:10:00Z" }],
     },
     finding_recovery: {
       closure_records: [
@@ -309,7 +311,7 @@ function recoveryBasis(overrides = {}) {
       new_generation_id: "automatic:2",
       new_request_id: "1001",
       new_request_server_time: "2026-08-13T12:07:00Z",
-      later_clean_id: "2001",
+      later_clean_id: "3001",
       later_clean_server_time: "2026-08-13T12:10:00Z",
     },
     authority_receipt: {
@@ -318,18 +320,14 @@ function recoveryBasis(overrides = {}) {
         url: REQUEST_URL,
         created_at: "2026-08-13T12:07:00Z",
       },
-      selected_artifact: {
-        id: "2001",
-        url: ARTIFACT_URL,
-        created_at: "2026-08-13T12:10:00Z",
-      },
+      selected_artifact: null,
       pagination_sha256: DIGEST,
       final_reread_sha256: DIGEST,
       recovery: {
         finding_ids: ["finding-1", "finding-2"],
         closure_ids: ["closure-1", "closure-2"],
         new_request_id: "1001",
-        completion_id: "2001",
+        completion_id: "3001",
       },
     },
     ...overrides,
@@ -361,7 +359,7 @@ test("vendors the exact stable authority bytes and exports their digest", async 
     import.meta.url,
   ));
   const actual = createHash("sha256").update(bytes).digest("hex");
-  assert.equal(actual, "29e07793900bb480278cee322746dde679ddcf3b18a8b7b82f552fec389291fc");
+  assert.equal(actual, "d1a56b2e40ab6affc676a40733671d065c03d9d96e155643977c6b30eee03ad6");
   assert.equal(V2_PUBLIC_REPORT_POLICY_SHA256, actual);
   assert.equal(V2_PUBLIC_REPORT_AUTHORITY_SHA256, actual);
   assert.equal(V2_PUBLIC_REPORT_POLICY_DIGEST, `sha256:${actual}`);
@@ -369,6 +367,95 @@ test("vendors the exact stable authority bytes and exports their digest", async 
   assert.equal(V2_PUBLIC_REPORT_SCHEMA_VERSION, 2);
   assert.equal(V2_PUBLIC_REPORT_SCHEMA.schema_version, 2);
   assert(Object.isFrozen(V2_PUBLIC_REPORT_SCHEMA));
+});
+
+test("vendored authority matches the classification-only terminal contract", async () => {
+  const authority = JSON.parse(await readFile(new URL(
+    "../packages/action/github-codex-evidence-authority-v2.json",
+    import.meta.url,
+  ), "utf8"));
+  assert.deepEqual(authority.terminal_evidence.clean, {
+    provider_profile: "terminal-payload",
+    decision: "inconclusive",
+    scope_assurance: "artifact-publication-only",
+    provider_input_lineage: "unavailable",
+  });
+  assert.equal(
+    authority.terminal_evidence.findings.scope_assurance,
+    "artifact-publication-only",
+  );
+  assert.equal(
+    authority.terminal_evidence.mixed.scope_assurance,
+    "artifact-publication-only",
+  );
+  assert.deepEqual(
+    authority.report_contract.evidence_basis_schema
+      .kind_outcome_relation["terminal-payload"],
+    ["inconclusive", "findings"],
+  );
+  assert.deepEqual(
+    authority.report_contract.evidence_basis_schema
+      .artifact_publication_kind_values,
+    ["terminal-payload", "malformed-terminal", "unknown-terminal"],
+  );
+  assert.equal(
+    authority.report_contract.evidence_basis_schema
+      .artifact_publication_scope_assurance,
+    "artifact-publication-only",
+  );
+  const terminalClean = authority.report_contract.report_state_matrix
+    .find((row) => row.state === "terminal-clean");
+  assert.deepEqual(terminalClean.decisions, ["inconclusive"]);
+  const inconclusive = authority.report_contract.report_state_matrix
+    .find((row) => row.state === "inconclusive");
+  assert.ok(inconclusive.basis_kinds.includes("terminal-payload"));
+  const reactionClean = authority.report_contract.report_state_matrix
+    .find((row) => row.state === "accepted-thumbs-up-clean");
+  assert.deepEqual(reactionClean.provider_profiles, ["thumbs-up-clean"]);
+  assert.deepEqual(reactionClean.decisions, ["clean"]);
+  assert.deepEqual(reactionClean.basis_kinds, ["current-request-reaction"]);
+  assert.deepEqual(
+    authority.report_contract.evidence_basis_schema
+      .kind_profile_relation["current-request-reaction"],
+    ["thumbs-up-clean"],
+  );
+  assert.deepEqual(
+    authority.report_contract.evidence_basis_schema
+      .kind_selected_object_relation["terminal-payload"],
+    {
+      selected_request_by_outcome: {
+        inconclusive: null,
+        findings: "optional",
+      },
+      request_server_time_by_outcome: {
+        inconclusive: null,
+        findings: "optional",
+      },
+      selected_artifact: "required",
+      finding_recovery: null,
+      authority_receipt_recovery: null,
+    },
+  );
+  assert.equal(
+    authority.report_contract.evidence_basis_schema
+      .kind_selected_object_relation["current-request-reaction"]
+      .selected_artifact,
+    null,
+  );
+  assert.deepEqual(
+    authority.report_contract.evidence_basis_schema
+      .kind_outcome_relation["stable-input-blocker"],
+    ["blocked-input"],
+  );
+  assert.equal(
+    authority.reaction_evidence
+      .eyes_at_or_after_selected_plus_one_vetoes_reaction_only_clean,
+    true,
+  );
+  assert.equal(
+    authority.reaction_evidence.eyes_never_vetoes_terminal_payload,
+    true,
+  );
 });
 
 test("accepts a closed selected-pending public report and returns the same value", () => {
@@ -385,7 +472,7 @@ test("accepts head mode only as a non-terminal status target", () => {
     provider_profile: "terminal-payload",
     evidence_basis: terminalBasis(),
     status_target: headStatusTarget(),
-    decision: "clean",
+    decision: "inconclusive",
   });
   assert.equal(validateV2PublicReport(terminalClean), terminalClean);
 
@@ -416,13 +503,20 @@ test("accepts the exact ten required fields without optional metadata", () => {
   ]);
 });
 
-test("accepts terminal clean evidence with authority receipts", () => {
+test("accepts terminal clean artifact classification with authority receipts", () => {
   const value = report({
     provider_profile: "terminal-payload",
     evidence_basis: terminalBasis(),
-    decision: "clean",
+    decision: "inconclusive",
   });
   assert.equal(validateV2PublicReport(value), value);
+
+  const findings = report({
+    provider_profile: "terminal-payload",
+    evidence_basis: terminalBasis({ outcome: "findings" }),
+    decision: "findings",
+  });
+  assert.equal(validateV2PublicReport(findings), findings);
 });
 
 test("accepts request-bound reaction and no-start evidence only after its request", () => {
@@ -453,6 +547,80 @@ test("accepts request-bound reaction and no-start evidence only after its reques
       /strictly after the request time/u,
     );
   }
+});
+
+test("current-request reaction rejects selected artifact lineage", () => {
+  const basis = reactionBasis({
+    selected_ids: ["1001"],
+    server_times: {
+      request: "2026-08-13T12:00:00Z",
+      selected: [{ id: "1001", server_time: "2026-08-13T12:10:00Z" }],
+    },
+  });
+  basis.authority_receipt.selected_artifact = {
+    id: "1001",
+    url: REQUEST_URL,
+    created_at: "2026-08-13T12:10:00Z",
+  };
+  const forged = report({
+    provider_profile: "thumbs-up-clean",
+    evidence_basis: basis,
+    decision: "clean",
+  });
+
+  assert.throws(
+    () => validateV2PublicReport(forged),
+    /current-request reaction selected artifact must be null/u,
+  );
+});
+
+test("terminal findings classification rejects finding recovery lineage", () => {
+  const artifactUrl = "https://github.com/owner/repo/pull/7#issuecomment-3001";
+  for (const providerProfile of ["terminal-payload", "mixed"]) {
+    const basis = recoveryBasis({
+      kind: "terminal-payload",
+      outcome: "findings",
+      selected_urls: [artifactUrl],
+      scope_assurance: "artifact-publication-only",
+    });
+    basis.authority_receipt.selected_artifact = {
+      id: "3001",
+      url: artifactUrl,
+      created_at: "2026-08-13T12:10:00Z",
+    };
+    const forged = report({
+      provider_profile: providerProfile,
+      evidence_basis: basis,
+      request_policy: requestPolicy({
+        generation_id: "automatic:2",
+        generation_index: 2,
+        automatic_reservations_consumed_on_head: 2,
+      }),
+      decision: "findings",
+    });
+
+    assert.throws(
+      () => validateV2PublicReport(forged),
+      /finding recovery requires current-request-reaction evidence/u,
+      providerProfile,
+    );
+  }
+});
+
+test("closed public report rejects mixed profile for reaction-only clean", () => {
+  const clean = report({
+    provider_profile: "thumbs-up-clean",
+    evidence_basis: reactionBasis(),
+    decision: "clean",
+  });
+  assert.equal(validateV2PublicReport(clean), clean);
+
+  const forged = clone(clean);
+  forged.provider_profile = "mixed";
+  assert.throws(
+    () => validateV2PublicReport(forged),
+    /provider_profile|authority-approved public report state/u,
+  );
 });
 
 test("accepts not-selected with nullable selected-only structures", () => {
@@ -551,21 +719,21 @@ test("rejects near-miss evidence ordering, profile, and outcome relations", () =
         selected: [{ id: "9999", server_time: "2026-08-13T12:10:00Z" }],
       },
     }),
-    decision: "clean",
+    decision: "inconclusive",
   });
   assert.throws(() => validateV2PublicReport(wrongOrder), /must equal "2001"/);
 
   const wrongOutcome = report({
     provider_profile: "terminal-payload",
     evidence_basis: terminalBasis({ outcome: "findings" }),
-    decision: "clean",
+    decision: "inconclusive",
   });
   assert.throws(() => validateV2PublicReport(wrongOutcome), /evidence_basis.outcome/);
 
   const wrongProfile = report({
     provider_profile: "thumbs-up-clean",
     evidence_basis: terminalBasis(),
-    decision: "clean",
+    decision: "inconclusive",
   });
   assert.throws(() => validateV2PublicReport(wrongProfile), /provider_profile/);
 
@@ -578,9 +746,28 @@ test("rejects near-miss evidence ordering, profile, and outcome relations", () =
         selected: [{ id: "02001", server_time: "2026-08-13T12:10:00Z" }],
       },
     }),
-    decision: "clean",
+    decision: "inconclusive",
   });
   assert.throws(() => validateV2PublicReport(nonCanonicalId), /selected_ids\[0\]/u);
+});
+
+test("terminal clean classification rejects request lineage", () => {
+  const basis = terminalBasis();
+  basis.authority_receipt.selected_request = {
+    id: "1001",
+    url: REQUEST_URL,
+    created_at: "2026-08-13T12:00:00Z",
+  };
+  const forged = report({
+    provider_profile: "terminal-payload",
+    evidence_basis: basis,
+    decision: "inconclusive",
+  });
+
+  assert.throws(
+    () => validateV2PublicReport(forged),
+    /terminal clean classification lineage must be null/u,
+  );
 });
 
 test("binds every public artifact URL to the review epoch and object semantics", () => {
@@ -622,7 +809,7 @@ test("binds every public artifact URL to the review epoch and object semantics",
     const invalid = report({
       provider_profile: "terminal-payload",
       evidence_basis: basis,
-      decision: "clean",
+      decision: "inconclusive",
     });
     assert.throws(
       () => validateV2PublicReport(invalid),
@@ -631,7 +818,7 @@ test("binds every public artifact URL to the review epoch and object semantics",
   }
 
   const recovery = report({
-    provider_profile: "terminal-payload",
+    provider_profile: "thumbs-up-clean",
     evidence_basis: recoveryBasis(),
     request_policy: requestPolicy({
       generation_id: "automatic:2",
@@ -664,7 +851,7 @@ test("binds every public artifact URL to the review epoch and object semantics",
 
 test("finding recovery requires one unique closure evidence id per finding", () => {
   const valid = report({
-    provider_profile: "terminal-payload",
+    provider_profile: "thumbs-up-clean",
     evidence_basis: recoveryBasis(),
     request_policy: requestPolicy({
       generation_id: "automatic:2",
@@ -697,8 +884,8 @@ test("rejects near-miss validated status target relations", () => {
   assert.throws(() => validateV2PublicReport(changedPost), /merge_ref_oid/);
 
   const positiveWithoutTarget = report({
-    provider_profile: "terminal-payload",
-    evidence_basis: terminalBasis(),
+    provider_profile: "thumbs-up-clean",
+    evidence_basis: reactionBasis(),
     status_target: statusTarget({
       potential_merge_commit_oid: null,
       potential_merge_commit_tree_oid: null,
@@ -712,8 +899,8 @@ test("rejects near-miss validated status target relations", () => {
   assert.throws(() => validateV2PublicReport(positiveWithoutTarget), /positive decision target state/);
 
   const cleanWithoutSentinel = report({
-    provider_profile: "terminal-payload",
-    evidence_basis: terminalBasis(),
+    provider_profile: "thumbs-up-clean",
+    evidence_basis: reactionBasis(),
     status_target: statusTarget({ head_sentinel_state: "absent" }),
     decision: "clean",
   });

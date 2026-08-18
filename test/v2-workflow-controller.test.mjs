@@ -37,6 +37,7 @@ import {
   createV2ProductionInitialCycle,
   executeV2ControllerCycle,
   executeV2EffectOnce,
+  executeV2PreScopedAutomaticRequestAttempt,
   listAllOpenPullRequests,
   loadV2GitLedgerTriggerIdentity,
   loadV2MinimalLiveScope,
@@ -275,25 +276,34 @@ function publicReport({
     request_time_permission: null,
     permission_aba_excluded: null,
   };
-  const terminal = ["clean", "findings"].includes(decision);
+  const clean = decision === "clean";
+  const findings = decision === "findings";
   const noStart = decision === "skipped-unavailable";
-  const evidenceBasis = terminal
+  const evidenceBasis = clean
     ? publicEvidenceBasis({
-      kind: "terminal-payload",
+      kind: "current-request-reaction",
       outcome: decision,
       id: "2001",
-      url: ARTIFACT_URL,
-      requestBound: false,
+      url: REQUEST_URL,
+      requestBound: true,
     })
-    : noStart
+    : findings
       ? publicEvidenceBasis({
-        kind: "stable-exact-no-start",
+        kind: "terminal-payload",
         outcome: decision,
-        id: "2002",
-        url: NO_START_URL,
-        requestBound: true,
+        id: "2001",
+        url: ARTIFACT_URL,
+        requestBound: false,
       })
-      : null;
+      : noStart
+        ? publicEvidenceBasis({
+          kind: "stable-exact-no-start",
+          outcome: decision,
+          id: "2002",
+          url: NO_START_URL,
+          requestBound: true,
+        })
+        : null;
   return {
     schema_version: 2,
     snapshot_fingerprint: PUBLIC_DIGEST,
@@ -319,13 +329,15 @@ function publicReport({
       controlled_request_id: "1001",
     },
     request_policy: requestPolicy,
-    provider_profile: terminal
-      ? "terminal-payload"
-      : noStart
-        ? "no-start-rejection"
-        : decision === "pending"
-          ? "unknown"
-          : null,
+    provider_profile: clean
+      ? "thumbs-up-clean"
+      : findings
+        ? "terminal-payload"
+        : noStart
+          ? "no-start-rejection"
+          : decision === "pending"
+            ? "unknown"
+            : null,
     provider_input_lineage: "unavailable",
     evidence_basis: evidenceBasis,
     status_target: publicStatusTarget({ mode, targetState, decision }),
@@ -365,6 +377,7 @@ function preEpochPublicReport(decision) {
 function publicEvidenceBasis({ kind, outcome, id, url, requestBound }) {
   const artifactTime = "2026-08-13T12:10:00.000Z";
   const requestTime = requestBound ? "2026-08-13T12:05:00.000Z" : null;
+  const reaction = kind === "current-request-reaction";
   return {
     kind,
     outcome,
@@ -376,14 +389,18 @@ function publicEvidenceBasis({ kind, outcome, id, url, requestBound }) {
     },
     pagination_complete: true,
     final_reread_complete: true,
-    scope_assurance: "whole-pr-contractual",
+    scope_assurance: kind === "terminal-payload"
+      ? "artifact-publication-only"
+      : "whole-pr-contractual",
     provider_input_lineage: "unavailable",
     finding_recovery: null,
     authority_receipt: {
       selected_request: requestBound
         ? { id: "1001", url: REQUEST_URL, created_at: requestTime }
         : null,
-      selected_artifact: { id, url, created_at: artifactTime },
+      selected_artifact: reaction
+        ? null
+        : { id, url, created_at: artifactTime },
       pagination_sha256: PUBLIC_DIGEST,
       final_reread_sha256: PUBLIC_DIGEST,
       recovery: null,
@@ -2964,6 +2981,136 @@ test("production entry points deny unactivated public effects before protected-l
   }
 });
 
+test("automatic request pre-scope failure leaves retry-zero attempt unconsumed", async () => {
+  await withWorkflowCliFixture({
+    eventName: "pull_request_target",
+    event: { pull_request: { number: 7 } },
+    route: "ordinary",
+    pullRequest: "7",
+  }, async ({ environment }) => {
+    const context = await createDirectProductionIntentContext({
+      environment,
+      prepare_automatic_request: "intent-ready",
+    });
+    let requestPublicEffects = 0;
+    const perform = () => executeV2PreScopedAutomaticRequestAttempt({
+      load_pre_scope: () => loadV2MinimalLiveScope({
+        fetch: context.github.fetch,
+        token: context.token,
+        repository: context.command.repository,
+        pull_number: context.command.pull_request.number,
+        rest_base_url: context.restBaseUrl,
+        graphql_url: `${context.restBaseUrl}/graphql`,
+      }),
+      persist_attempt: () =>
+        context.ledger.appendAutomaticReviewRequestIntent({
+          automatic_reservation_handle:
+            context.automaticReservationAppend
+              .automatic_reservation_handle,
+          reservation_append_receipt:
+            context.automaticReservationAppend.reservation_append_receipt,
+          reservation_status_response_append:
+            context.reservationStatusResponseAppend,
+        }),
+      perform_attempt: ({ attempt }) => {
+        requestPublicEffects += 1;
+        return createV2GitHubProductionAutomaticReviewRequestTransport({
+          fetch: context.github.fetch,
+          token: context.token,
+          restBaseUrl: context.restBaseUrl,
+          repository: context.command.repository,
+          pull_number: context.command.pull_request.number,
+        }).performAutomaticReviewRequest({
+          automatic_request_intent_handle:
+            attempt.automatic_request_intent_handle,
+        });
+      },
+    });
+    context.github.failNextAutomaticRequestPreScope();
+    await assert.rejects(
+      perform,
+      /minimal GraphQL PR scope did not return its closed HTTP status/u,
+    );
+    assert.equal(requestPublicEffects, 0);
+    assert.equal(context.github.requestPostCount(), 0);
+    assert.equal(context.github.requestRefetchCount(), 0);
+    assert.equal(
+      context.github.effectRecordKinds().includes(
+        "effect-intent:effect-attempt",
+      ),
+      false,
+    );
+    assert.equal(
+      context.github.effectRecordKinds().includes(
+        "effect-intent:review-request",
+      ),
+      false,
+    );
+
+    const capture = await perform();
+    assert.equal(capture.identity.request_id, "901");
+    assert.equal(requestPublicEffects, 1);
+    assert.equal(context.github.requestPostCount(), 1);
+    assert.equal(context.github.requestRefetchCount(), 1);
+    assert.equal(
+      context.github.effectRecordKinds().filter((kind) =>
+        kind === "effect-intent:effect-attempt").length,
+      1,
+    );
+  });
+
+  let persisted = 0;
+  let performed = 0;
+  await assert.rejects(
+    executeV2PreScopedAutomaticRequestAttempt({
+      async load_pre_scope() { return { stable: true }; },
+      async persist_attempt() {
+        persisted += 1;
+        return { durable: true };
+      },
+      async perform_attempt() {
+        performed += 1;
+        throw new Error("simulated post uncertainty");
+      },
+    }),
+    /simulated post uncertainty/u,
+  );
+  assert.equal(persisted, 1);
+  assert.equal(performed, 1);
+
+  const source = await readFile(CONTROLLER_PATH, "utf8");
+  const helperStart = source.indexOf(
+    "export async function executeV2PreScopedAutomaticRequestAttempt",
+  );
+  const preScopeRead = source.indexOf(
+    "const preScope = await loadPreScope();",
+    helperStart,
+  );
+  const durableAttempt = source.indexOf(
+    "const attempt = await persistAttempt();",
+    helperStart,
+  );
+  const productionBranch = source.indexOf(
+    "async function assembleV2InitialProductionObservation",
+  );
+  const productionBranchEnd = source.indexOf(
+    "async function recoverV2ScheduledCandidateAfterRelease",
+    productionBranch,
+  );
+  const productionUse = source.indexOf(
+    "await executeV2PreScopedAutomaticRequestAttempt({",
+    productionBranch,
+  );
+  const productionUseCount = source
+    .slice(productionBranch, productionBranchEnd)
+    .match(/await executeV2PreScopedAutomaticRequestAttempt\(\{/gu)
+    ?.length ?? 0;
+  assert.ok(helperStart >= 0);
+  assert.ok(preScopeRead > helperStart && preScopeRead < durableAttempt);
+  assert.ok(productionUse > productionBranch);
+  assert.equal(productionUseCount, 2);
+});
+
 test("production ledger API preflight precedes lease acquisition", async () => {
   const source = await readFile(CONTROLLER_PATH, "utf8");
   const observationStart = source.indexOf(
@@ -4573,6 +4720,9 @@ async function createDirectProductionIntentContext({
   environment,
   prepare_automatic_request: prepareAutomaticRequest = false,
 }) {
+  if (!new Set([false, true, "intent-ready"]).has(prepareAutomaticRequest)) {
+    throw new TypeError("direct production intent preparation mode is invalid");
+  }
   const command = await prepareV2WorkflowCommand(environment);
   const liveTime = new Date().toISOString();
   const oidc = productionOidcFixture(command, liveTime);
@@ -4758,6 +4908,20 @@ async function createDirectProductionIntentContext({
         reservationStatusIntentAppend.intent_append_receipt,
       receipt: reservationStatusReceipt,
     });
+  if (prepareAutomaticRequest === "intent-ready") {
+    return {
+      automaticReservationAppend,
+      command,
+      github,
+      ledger,
+      reservationStatusResponseAppend,
+      restBaseUrl,
+      schedulerAppend,
+      selectedEnvironment,
+      statusIntentAppend,
+      token,
+    };
+  }
   const automaticRequestIntentAppend =
     await ledger.appendAutomaticReviewRequestIntent({
       automatic_reservation_handle:
@@ -4828,6 +4992,7 @@ function productionControllerGitHubFixture(
   let requestPostMode = "exact";
   let requestRefetchMode = "exact";
   let requestScopeMode = "exact";
+  let failAutomaticRequestPreScope = false;
   const failedRecordUpdates = new Map();
   const durableFailedRecordUpdates = new Map();
   const failedRecordUpdateOrdinals = new Map();
@@ -4960,6 +5125,19 @@ function productionControllerGitHubFixture(
           },
         });
         return redated(response);
+      }
+      if (
+        failAutomaticRequestPreScope &&
+        String(request.query).includes("CodexReviewGateV2Scope") &&
+        requestPostCount === 0 &&
+        effectRecordKinds().includes(
+          "effect-response:reservation-status-write",
+        )
+      ) {
+        failAutomaticRequestPreScope = false;
+        return redated(jsonResponse(JSON.stringify({
+          message: "simulated automatic request pre-scope failure",
+        }), 500));
       }
     }
     if (
@@ -5234,6 +5412,9 @@ function productionControllerGitHubFixture(
     setRequestPostMode(mode) { requestPostMode = mode; },
     setRequestRefetchMode(mode) { requestRefetchMode = mode; },
     setRequestScopeMode(mode) { requestScopeMode = mode; },
+    failNextAutomaticRequestPreScope() {
+      failAutomaticRequestPreScope = true;
+    },
     statusPostCount: () => statusPostCount,
     statusRefetchCount: () => statusRefetchCount,
     requestPostCount: () => requestPostCount,
