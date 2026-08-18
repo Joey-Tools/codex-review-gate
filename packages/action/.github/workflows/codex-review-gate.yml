@@ -66,7 +66,7 @@ jobs:
     if: inputs.controller-mode != 'scan-all-open'
     name: codex/github-review-gate controller
     runs-on: ubuntu-slim
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       decision: ${{ steps.controller.outputs.decision }}
       report-path: ${{ steps.controller.outputs.report-path }}
@@ -191,7 +191,7 @@ jobs:
     name: codex/github-review-gate scheduled PR ${{ matrix.pull_request }}
     needs: schedule-dispatch
     runs-on: ubuntu-slim
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       max-parallel: 1

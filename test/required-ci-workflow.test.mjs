@@ -56,7 +56,7 @@ test("required CI exposes only the Node.js 20 review-gate closure", () => {
   assert.equal(directScalar(job, "runs-on"), "ubuntu-latest");
 
   const steps = listItemBlocks(childBlock(job, "steps"));
-  assert.equal(steps.length, 6);
+  assert.equal(steps.length, 7);
   const checkoutSteps = steps.filter(
     (step) =>
       itemKeys(step).includes("uses") &&
@@ -90,8 +90,10 @@ test("required CI exposes only the Node.js 20 review-gate closure", () => {
   assert.deepEqual(itemKeys(steps[4]), ["run"]);
   assert.equal(itemScalar(steps[4], "run"), "npm run test:state-machine");
   assert.deepEqual(itemKeys(steps[5]), ["run"]);
+  assert.equal(itemScalar(steps[5], "run"), "npm run test:v2");
+  assert.deepEqual(itemKeys(steps[6]), ["run"]);
   assert.equal(
-    itemScalar(steps[5], "run"),
+    itemScalar(steps[6], "run"),
     "node --test test/required-ci-workflow.test.mjs",
   );
 

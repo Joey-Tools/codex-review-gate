@@ -275,6 +275,21 @@ test("the activated source and template callers contain only the canonical reusa
 });
 
 test("the published v2 workflow is workflow_call-only and exposes only controller outputs", () => {
+  const gitLedger = readFileSync(
+    join(actionRoot, "src/v2/git-ledger.mjs"),
+    "utf8",
+  );
+  const transactionBudget = gitLedger.match(
+    /const MAX_V2_GIT_LEDGER_CHECKPOINT_TRANSACTION_MS = (\d+) \* 60 \* 1000;/u,
+  );
+  assert.ok(
+    transactionBudget,
+    "the workflow timeout contract must remain bound to the Git-ledger transaction budget",
+  );
+  const transactionBudgetMilliseconds =
+    Number.parseInt(transactionBudget[1], 10) * 60 * 1000;
+  assert.equal(transactionBudgetMilliseconds, 300_000);
+
   assert.equal(
     relative(actionRoot, calledWorkflowPath),
     CANONICAL_WORKFLOW_FILE_PATH,
@@ -342,7 +357,10 @@ test("the published v2 workflow is workflow_call-only and exposes only controlle
     directScalar(ordinary, "name"),
     "codex/github-review-gate controller",
   );
-  assert.equal(directScalar(ordinary, "timeout-minutes"), "5");
+  const ordinaryTimeout = directScalar(ordinary, "timeout-minutes");
+  assert.equal(ordinaryTimeout, "10");
+  const ordinaryTimeoutMinutes = Number.parseInt(ordinaryTimeout, 10);
+  assert.equal(ordinaryTimeoutMinutes, 10);
 
   const jobOutputs = childBlock(ordinary, "outputs");
   assert.deepEqual(directKeys(jobOutputs), V2_WORKFLOW_OUTPUTS);
@@ -394,7 +412,24 @@ test("the published v2 workflow is workflow_call-only and exposes only controlle
     "codex/github-review-gate scheduled PR ${{ matrix.pull_request }}",
   );
   assert.equal(directScalar(scheduled, "needs"), "schedule-dispatch");
-  assert.equal(directScalar(scheduled, "timeout-minutes"), "5");
+  const scheduledTimeout = directScalar(scheduled, "timeout-minutes");
+  assert.equal(scheduledTimeout, "10");
+  const scheduledTimeoutMinutes = Number.parseInt(scheduledTimeout, 10);
+  assert.equal(scheduledTimeoutMinutes, 10);
+  assert.equal(
+    scheduledTimeoutMinutes,
+    ordinaryTimeoutMinutes,
+    "ordinary and scheduled PR controllers must share one execution budget",
+  );
+  assert.ok(
+    ordinaryTimeoutMinutes * 60 * 1000 > transactionBudgetMilliseconds,
+    "the controller job must outlive one worst-case Git-ledger transaction",
+  );
+  assert.equal(
+    ordinaryTimeoutMinutes * 60 * 1000 - transactionBudgetMilliseconds,
+    300_000,
+    "the job must retain five minutes for checkout, preflight, effects, and lease cleanup",
+  );
   assert.deepEqual(scalarMapping(childBlock(scheduled, "strategy")), {
     "fail-fast": "false",
     "max-parallel": "1",

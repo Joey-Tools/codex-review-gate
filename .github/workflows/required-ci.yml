@@ -24,4 +24,5 @@ jobs:
           node-version: "20"
       - run: npm run check:state-machine
       - run: npm run test:state-machine
+      - run: npm run test:v2
       - run: node --test test/required-ci-workflow.test.mjs

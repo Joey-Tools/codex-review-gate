@@ -3,7 +3,7 @@ id: 20260813-7bf930a-action-v2-release-pipeline
 title: Action v2 Release Pipeline
 status: blocked
 created: 2026-08-13
-updated: 2026-08-17
+updated: 2026-08-18
 branch: wip/codex-review-v2
 pr: https://github.com/Joey-Tools/codex-review-gate/pull/33
 supersedes: [20260518-9a806cf-release-automation]
@@ -51,6 +51,9 @@ superseded_by:
 - Freeze-v5 review corrected the final terminal-precedence recovery edge: a stable terminal clean that is strictly superseded by the canonically later terminal findings no longer blocks those findings from completing through proved closure, a later admitted request generation, and an exact later reaction. Equal-time, later, or unstable clean carriers remain blocking for that recovery path, all findings still require closure, and terminal clean remains classification-only. The durable effect-ordering documentation now also matches production exactly: reserve, complete the safe pre-scope read, persist the pre-effect attempt and retry-zero request intent, then perform the single POST; a pre-scope failure leaves no attempt or request intent.
 - The unreachable positive controller tests were mapped one by one to lower-level production protocol coverage or to explicit future-activation coverage blockers. Terminal clean now has no positive controller route; lower-level tests prove its classification-only result and the absence of binding authority, while findings recovery retains the real runner/ledger/control-receipt/projector/reducer chain. Activation must restore whole-controller evidence for the private automatic HTTP parser, exact four-attempt aggregate retry/exhaustion and restart-first loops, exact release-phase/last-reachable diagnostics, and schedule row-state-to-sentinel classification. It must also persist the first post-request wait origin: recomputing that origin after binding can shift the deadline and cannot be made safe by weakening phase uniqueness.
 - Ordinary issue comments now stop at the initial reconciliation job, while pull-request issue comments retain the provider-event route. The English and Chinese consumer examples now supply the required `selection-policy`, and the activation/runbook text distinguishes advisory timing from trusted wait-completion authority.
+- Formal single review found that the ordinary and scheduled controller jobs shared the ledger's exact five-minute worst-case budget, so both now use 10-minute job timeouts. Tests bind their shared timeout and require it to exceed the five-minute ledger budget, preserving a five-minute outer margin.
+- Required CI retains the legacy `check:state-machine` and `test:state-machine` gates and adds `npm run test:v2`; the final-byte discovery run completed 904/904 tests green in 3,348,998.49 ms.
+- On GitHub.com, `job.workflow_repository` and `job.workflow_sha` are the official called-workflow identity fields. actionlint 1.7.12 diagnoses them only because its expression schema lags GitHub's current context, so that diagnostic is schema lag rather than an unresolved workflow defect.
 
 ## Blockers
 - The source repository does not currently expose `ACTION_REPO_PUSH_TOKEN_V2`; the only listed repository secret is the retired `ACTION_REPO_PUSH_TOKEN`. Organization-secret visibility could not be verified because the current identity received HTTP 403.

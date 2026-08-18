@@ -66,6 +66,7 @@ function assertScheduleFanoutContract(source) {
   const coordinator = jobBlock(source, "schedule-dispatch");
   const scheduled = jobBlock(source, "scheduled-pull-requests");
   assert.match(ordinary, /^    if: inputs\.controller-mode != 'scan-all-open'$/mu);
+  assert.match(ordinary, /^    timeout-minutes: 10$/mu);
   assert.match(
     coordinator,
     /^    if: inputs\.controller-mode == 'scan-all-open'$/mu,
@@ -78,6 +79,7 @@ function assertScheduleFanoutContract(source) {
     /^    if: inputs\.controller-mode == 'scan-all-open'$/mu,
   );
   assert.match(scheduled, /^    needs: schedule-dispatch$/mu);
+  assert.match(scheduled, /^    timeout-minutes: 10$/mu);
   assert.match(scheduled, /^      fail-fast: false$/mu);
   assert.match(scheduled, /^      max-parallel: 1$/mu);
   assert.match(
@@ -102,7 +104,6 @@ test("v2 reusable is a fixed exact-release trusted-controller boundary", () => {
   assert.match(reusable, /^  workflow_call:$/mu);
   assert.doesNotMatch(reusable, /^  (?:schedule|workflow_dispatch|issue_comment|pull_request_target):$/mu);
   assert.match(reusable, /runs-on: ubuntu-slim/u);
-  assert.match(reusable, /timeout-minutes: 5/u);
   assert.match(
     reusable,
     /uses: actions\/checkout@11d5960a326750d5838078e36cf38b85af677262/u,
