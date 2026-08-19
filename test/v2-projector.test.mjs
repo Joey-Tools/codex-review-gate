@@ -240,7 +240,7 @@ test("projects a manual exact request and its stable exact-provider +1", () => {
   }]);
 });
 
-test("ignores a durably bound request comment from an earlier head", () => {
+test("bindings define request identity; unbound candidates require no-push proof", () => {
   const oldHead = "9".repeat(40);
   const requestComment = issueComment("301", {
     body: "@codex review",
@@ -287,15 +287,174 @@ test("ignores a durably bound request comment from an earlier head", () => {
   assert.deepEqual(projected.requests, []);
   assert.deepEqual(projected.acknowledgements, []);
 
+  const unboundEvidenceRequest = deriveV2EvidenceRequest({
+    discovery_snapshot: discovery,
+    controller: makeController(),
+  });
+  assert.deepEqual(unboundEvidenceRequest, {
+    artifactSelectors: [{ kind: "issue_comment", id: requestComment.id }],
+    permissionSubjects: [{ kind: "issue_comment", id: requestComment.id }],
+  });
+  const unboundEvidence = snapshot({
+    issueComments: [requestComment],
+    reactions,
+    exactArtifacts: [exact("issue_comment", requestComment)],
+    actorPermissions: [readOnlyActorPermission(
+      requestComment.id,
+      requestComment.author,
+    )],
+    serverTime: "2026-08-13T12:01:00.000Z",
+  });
+  const unboundProjected = projectV2TransportSnapshots({
+    discovery_snapshot: discovery,
+    evidence_snapshot: unboundEvidence,
+    controller: makeController(),
+  });
+  assert.deepEqual(unboundProjected.requests, []);
+  assert.deepEqual(unboundProjected.acknowledgements, []);
+
+  const authorizedEvidence = snapshot({
+    issueComments: [requestComment],
+    reactions,
+    exactArtifacts: [exact("issue_comment", requestComment)],
+    actorPermissions: [
+      actorPermission(requestComment.id, requestComment.author),
+    ],
+    serverTime: "2026-08-13T12:01:00.000Z",
+  });
   assert.throws(
-    () => deriveV2EvidenceRequest({
+    () => projectV2TransportSnapshots({
       discovery_snapshot: discovery,
+      evidence_snapshot: authorizedEvidence,
       controller: makeController(),
     }),
     (error) => error instanceof V2ProjectorError &&
       error.code === "REQUEST_BINDING_MISSING",
   );
 });
+
+test("unbound request candidates require stable actor-matched two-point authority",
+  async (context) => {
+    const candidate = issueComment("301", {
+      body: "@codex review",
+      author: HUMAN,
+      created_at: "2026-08-13T12:00:10.000Z",
+      updated_at: "2026-08-13T12:00:10.000Z",
+    });
+    const discovery = snapshot({ issueComments: [candidate] });
+    const project = (actorPermissions) => projectV2TransportSnapshots({
+      discovery_snapshot: discovery,
+      evidence_snapshot: snapshot({
+        issueComments: [candidate],
+        exactArtifacts: [exact("issue_comment", candidate)],
+        actorPermissions,
+        serverTime: "2026-08-13T12:01:00.000Z",
+      }),
+      controller: makeController(),
+    });
+
+    await context.test("missing receipt", () => {
+      assert.throws(
+        () => project([]),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "MISSING_ACTOR_PERMISSION",
+      );
+    });
+
+    await context.test("unstable receipt", () => {
+      const permission = readOnlyActorPermission(candidate.id, candidate.author);
+      permission.stable = false;
+      assert.throws(
+        () => project([permission]),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "PERMISSION_UNSTABLE",
+      );
+    });
+
+    // Public projector entry points validate the closed transport schema first.
+    // Their repeated actor/projection checks are defense-in-depth invariants.
+    await context.test(
+      "transport rejects actor differing from exact artifact author",
+      () => {
+        const permission = readOnlyActorPermission(candidate.id, candidate.author);
+        const other = actor("77", "other", "User", "USER_other");
+        permission.actor = structuredClone(other);
+        permission.pre.actor = structuredClone(other);
+        permission.post.actor = structuredClone(other);
+        assert.throws(
+          () => project([permission]),
+          (error) => error instanceof V2ProjectorError &&
+            error.code === "INVALID_TRANSPORT_SNAPSHOT" &&
+            error.cause instanceof TypeError &&
+            error.cause.message ===
+              "snapshot.permissions.actor_permissions[0] permission actor must equal its exact artifact author",
+        );
+      },
+    );
+
+    await context.test(
+      "transport rejects mixed pre/post permission projections",
+      () => {
+        const permission = readOnlyActorPermission(candidate.id, candidate.author);
+        const authorized = actorPermission(candidate.id, candidate.author);
+        permission.post = authorized.post;
+        assert.throws(
+          () => project([permission]),
+          (error) => error instanceof V2ProjectorError &&
+            error.code === "INVALID_TRANSPORT_SNAPSHOT" &&
+            error.cause instanceof TypeError &&
+            error.cause.message ===
+              "snapshot.permissions.actor_permissions[0] pre/post permission projections differ",
+        );
+      },
+    );
+  });
+
+test("current-head request bindings fail closed when their comment is absent or edited",
+  async (context) => {
+    const controller = makeController({
+      requestBindings: [{
+        id: "301",
+        kind: "automatic",
+        base_oid: BASE,
+        head_oid: HEAD,
+        current_incarnation: true,
+        controlled: true,
+      }],
+      budget: {
+        automatic_requests_on_head: 1,
+        automatic_reservations_on_head: 1,
+        manual_requests_in_epoch: 0,
+      },
+    });
+
+    await context.test("absent comment", () => {
+      assert.throws(
+        () => deriveV2EvidenceRequest({
+          discovery_snapshot: snapshot(),
+          controller,
+        }),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "REQUEST_BINDING_ORPHANED",
+      );
+    });
+
+    await context.test("edited comment", () => {
+      const edited = issueComment("301", {
+        body: "@codex review",
+        created_at: "2026-08-13T12:00:10.000Z",
+        updated_at: "2026-08-13T12:00:20.000Z",
+      });
+      assert.throws(
+        () => deriveV2EvidenceRequest({
+          discovery_snapshot: snapshot({ issueComments: [edited] }),
+          controller,
+        }),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "REQUEST_BINDING_ORPHANED",
+      );
+    });
+  });
 
 test("v2 reactions require the exact bracketed Bot identity", () => {
   const requestComment = issueComment("301", {
@@ -589,6 +748,72 @@ test("one exact write-authorized address command closes one aggregate top-level 
     stable: true,
   }]);
 });
+
+test("stable unauthorized address lookalikes are inert while authorized commands close findings",
+  () => {
+    const finding = issueComment("202", {
+      body:
+        "### 💡 Codex Review\n\n" +
+        `- [P1] Fix the issue https://github.com/owner/repo/blob/${HEAD}/src/a.js#L1`,
+      author: BOT,
+      app: codexApp(),
+      created_at: "2026-08-13T12:00:10.000Z",
+      updated_at: "2026-08-13T12:00:10.000Z",
+    });
+    const outsider = issueComment("303", {
+      body: `/codex-gate addressed ${finding.html_url}`,
+      author: actor("77", "outsider", "User", "USER_outsider"),
+      created_at: "2026-08-13T12:00:20.000Z",
+      updated_at: "2026-08-13T12:00:20.000Z",
+    });
+    const nonUser = issueComment("304", {
+      body: `/codex-gate addressed ${finding.html_url}`,
+      author: BOT,
+      app: codexApp(),
+      created_at: "2026-08-13T12:00:25.000Z",
+      updated_at: "2026-08-13T12:00:25.000Z",
+    });
+    const maintainer = issueComment("305", {
+      body: `/codex-gate addressed ${finding.html_url}`,
+      author: HUMAN,
+      created_at: "2026-08-13T12:00:30.000Z",
+      updated_at: "2026-08-13T12:00:30.000Z",
+    });
+    const outsiderPermission = readOnlyActorPermission(
+      outsider.id,
+      outsider.author,
+    );
+    const issueComments = [finding, outsider, nonUser, maintainer];
+    const discovery = snapshot({ issueComments });
+    const evidence = snapshot({
+      issueComments,
+      exactArtifacts: issueComments.map((comment) =>
+        exact("issue_comment", comment)),
+      actorPermissions: [
+        outsiderPermission,
+        actorPermission(nonUser.id, nonUser.author),
+        actorPermission(maintainer.id, maintainer.author),
+      ],
+      serverTime: "2026-08-13T12:01:00.000Z",
+    });
+
+    const projected = projectV2TransportSnapshots({
+      discovery_snapshot: discovery,
+      evidence_snapshot: evidence,
+      controller: makeController(),
+    });
+
+    assert.deepEqual(projected.acknowledgements, [{
+      id: maintainer.id,
+      kind: "addressed",
+      request_id: null,
+      finding_id: projected.artifacts[0].finding_ids[0],
+      created_at: maintainer.created_at,
+      commit_oid: HEAD,
+      exact_provider: false,
+      stable: true,
+    }]);
+  });
 
 test("ignores an exact authorized address command for an authenticated earlier-head carrier", () => {
   const earlierHead = "9".repeat(40);
@@ -1800,15 +2025,24 @@ test("automatic top-level recovery rejects incomplete or unstable raw authority"
       );
     });
 
-    await context.test("Bot address actor", async () => {
+    await context.test("authorized malformed address target", async () => {
       const fixture = topLevelAutomaticRecoveryFixture({
-        addressOverrides: { author: BOT, app: codexApp() },
+        addressOverrides: { body: "/codex-gate addressed not-a-url" },
       });
       await assert.rejects(
         runAutomaticRecoveryFixture(fixture),
         (error) => error instanceof V2ProjectorError &&
-          error.code === "ADDRESS_COMMAND_ACTOR_INVALID",
+          error.code === "ADDRESS_COMMAND_TARGET_INVALID",
       );
+    });
+
+    await context.test("Bot address actor is inert", async () => {
+      const fixture = topLevelAutomaticRecoveryFixture({
+        addressOverrides: { author: BOT, app: codexApp() },
+      });
+      const result = await runAutomaticRecoveryFixture(fixture);
+      assert.equal(result.decision, "findings");
+      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
     });
 
     await context.test("permission drift", async () => {
@@ -1823,6 +2057,28 @@ test("automatic top-level recovery rejects incomplete or unstable raw authority"
           error.code === "PERMISSION_UNSTABLE",
       );
     });
+
+    await context.test(
+      "transport rejects address actor differing from exact artifact author",
+      async () => {
+        const fixture = topLevelAutomaticRecoveryFixture({
+          permissionMutator(permission) {
+            const other = actor("77", "other", "User", "USER_other");
+            permission.actor = structuredClone(other);
+            permission.pre.actor = structuredClone(other);
+            permission.post.actor = structuredClone(other);
+          },
+        });
+        await assert.rejects(
+          runAutomaticRecoveryFixture(fixture),
+          (error) => error instanceof V2ProjectorError &&
+            error.code === "INVALID_TRANSPORT_SNAPSHOT" &&
+            error.cause instanceof TypeError &&
+            error.cause.message ===
+              "snapshot.permissions.actor_permissions[0] permission actor must equal its exact artifact author",
+        );
+      },
+    );
 
     await context.test("missing permission receipt", async () => {
       const fixture = topLevelAutomaticRecoveryFixture();
@@ -2031,21 +2287,28 @@ test("automatic recovery rejects ineligible controlled request generations",
       const fixture = inlineAutomaticRecoveryFixture({
         requestOverrides: { updated_at: "2026-08-13T11:59:01.000Z" },
       });
-      const result = await runAutomaticRecoveryFixture(fixture);
-      assert.equal(getV2AutomaticRequestRecoveryHandle(result), null);
+      await assert.rejects(
+        runAutomaticRecoveryFixture(fixture),
+        (error) => error instanceof V2ProjectorError &&
+          error.code === "REQUEST_BINDING_ORPHANED",
+      );
     });
 
     await context.test("forged compliant request policy is not authority", () => {
-      const editedManual = issueComment("300", {
+      const unprivilegedManual = issueComment("300", {
         body: "@codex review",
         author: HUMAN,
         created_at: "2026-08-13T11:50:00.000Z",
-        updated_at: "2026-08-13T11:50:01.000Z",
+        updated_at: "2026-08-13T11:50:00.000Z",
       });
+      const unprivilegedPermission = readOnlyActorPermission(
+        unprivilegedManual.id,
+        unprivilegedManual.author,
+      );
       const fixture = topLevelAutomaticRecoveryFixture({
-        extraIssueComments: [editedManual],
+        extraIssueComments: [unprivilegedManual],
         extraRequestBindings: [{
-          id: editedManual.id,
+          id: unprivilegedManual.id,
           kind: "manual",
           base_oid: BASE,
           head_oid: HEAD,
@@ -2054,9 +2317,7 @@ test("automatic recovery rejects ineligible controlled request generations",
           generation_kind: "manual",
           generation_index: 1,
         }],
-        extraActorPermissions: [
-          actorPermission(editedManual.id, editedManual.author),
-        ],
+        extraActorPermissions: [unprivilegedPermission],
       });
       const projected = projectV2TransportSnapshots({
         discovery_snapshot: fixture.discovery,
@@ -3655,6 +3916,20 @@ function actorPermission(subjectId, subjectActor) {
     pre: structuredClone(receipt),
     post: structuredClone(receipt),
   };
+}
+
+function readOnlyActorPermission(subjectId, subjectActor) {
+  const permission = actorPermission(subjectId, subjectActor);
+  for (const receipt of [permission.pre, permission.post]) {
+    receipt.effective_permission = "read";
+    receipt.role_name = "read";
+    receipt.permissions.admin = false;
+    receipt.permissions.maintain = false;
+    receipt.permissions.push = false;
+    receipt.permissions.triage = false;
+    receipt.permissions.pull = true;
+  }
+  return permission;
 }
 
 function transportCapability(serverTime) {

@@ -14,10 +14,15 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
+import { setImmediate as nodeSetImmediate } from "node:timers";
 import { pathToFileURL } from "node:url";
-import { TextDecoder } from "node:util";
+import { TextDecoder, types as utilTypes } from "node:util";
 
-import { V2_STATUS_CONTEXT } from "./projection.mjs";
+import {
+  verifyStickyCommentRawDigest,
+  V2_STATUS_CONTEXT,
+} from "./projection.mjs";
 import { assertV2PublicReport } from "./public-report.mjs";
 import { reduceV2Snapshot } from "./reducer.mjs";
 import {
@@ -118,6 +123,39 @@ export const V2_PRODUCTION_ASSEMBLY_SCHEMA =
 export const MAX_V2_OPEN_PULL_REQUEST_MATRIX_JOBS = 256;
 export const MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES =
   1024 * 1024;
+const MAX_V2_GITHUB_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MAX_V2_GITHUB_JSON_RESPONSE_CHUNKS = 4_096;
+const MAX_V2_GITHUB_JSON_OPERATION_BYTES = 16 * 1024 * 1024;
+const V2_GITHUB_JSON_REQUEST_TIMEOUT_MS = 15_000;
+const scheduleImmediateIntrinsic = nodeSetImmediate;
+const reflectApplyIntrinsic = Reflect.apply;
+const reflectOwnKeysIntrinsic = Reflect.ownKeys;
+const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
+const objectHasOwnIntrinsic = Object.hasOwn;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(
+  typedArrayPrototype,
+  "buffer",
+).get;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(
+  typedArrayPrototype,
+  "byteOffset",
+).get;
+const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(
+  typedArrayPrototype,
+  "byteLength",
+).get;
+const arrayBufferDetachedGetter = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "detached",
+)?.get ?? null;
+const arrayBufferResizableGetter = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "resizable",
+)?.get ?? null;
+const isArrayBufferIntrinsic = utilTypes.isArrayBuffer;
+const isUint8ArrayIntrinsic = utilTypes.isUint8Array;
+const uint8ArraySetIntrinsic = Uint8Array.prototype.set;
 export const V2_MINIMAL_SCOPE_RECEIPT_SCHEMA =
   "codex-review-gate-minimal-scope-receipt-v2";
 export const V2_GITHUB_OIDC_VERIFIER_SCHEMA =
@@ -629,34 +667,41 @@ export function createV2GitHubOidcProvenanceVerifier(options = {}) {
   const budget = { requests: 0, bytes: 0, last_server_time: null };
   const consumedReplayIdentities = new Set();
   let trustPromise = null;
-  const trustMaterial = (signal) => {
-    if (signal.aborted) throw oidcAbortFailure(signal);
+  const trustMaterial = (execution) => {
+    execution.assertOpen();
     trustPromise ??= loadOidcTrustMaterial({
       fetchImpl,
       clock,
       limits,
       budget,
       policy,
-      signal,
+      deadline: execution,
     });
-    return waitForOidcPromise(trustPromise, signal);
+    return execution.wait(() => trustPromise);
   };
   const initialize = async () => {
     const execution = createOidcExecutionDeadline({
       signal: new AbortController().signal,
       deadline_ms: V2_GIT_LEDGER_PROVENANCE_TIMEOUT_MS,
     });
+    let completed = false;
     try {
-      const trust = await trustMaterial(execution.signal);
-      return deepFreeze({
-        schema: V2_GITHUB_OIDC_VERIFIER_SCHEMA,
-        schema_version: 1,
-        discovery: trust.discovery_receipt,
-        jwks: trust.jwks_receipt,
-        initialized: true,
+      const result = await execution.wait(async () => {
+        const trust = await trustMaterial(execution);
+        const initialized = deepFreeze({
+          schema: V2_GITHUB_OIDC_VERIFIER_SCHEMA,
+          schema_version: 1,
+          discovery: trust.discovery_receipt,
+          jwks: trust.jwks_receipt,
+          initialized: true,
+        });
+        execution.assertOpen();
+        return initialized;
       });
+      completed = true;
+      return result;
     } finally {
-      execution.finish();
+      execution.finish(completed);
     }
   };
 
@@ -664,116 +709,123 @@ export function createV2GitHubOidcProvenanceVerifier(options = {}) {
     const execution = createOidcExecutionDeadline(
       normalizeOidcVerifierExecutionContext(executionOptions),
     );
+    let completed = false;
     try {
-      const {
-        mode,
-        request,
-        compact_jwt: storedJwt,
-        stored_receipt: storedReceipt,
-      } = normalizeOidcVerifierRequest(verifierRequest);
-      const trust = await trustMaterial(execution.signal);
-      const expectedAudience = validateEffectBoundOidcRequest(request);
-      let jwt;
-      let minted = null;
-      if (mode === "mint-and-verify") {
-        const tokenUrl = new URL(mintUrl.href);
-        tokenUrl.searchParams.set("audience", expectedAudience);
-        minted = await oidcJsonRequest({
-          fetchImpl,
-          clock,
-          limits,
-          budget,
-          signal: execution.signal,
-          url: tokenUrl,
-          label: "GitHub Actions OIDC token mint",
-          headers: {
-            Accept: "application/json",
-            Authorization: `Bearer ${mintToken}`,
-          },
+      const result = await execution.wait(async () => {
+        const {
+          mode,
+          request,
+          compact_jwt: storedJwt,
+          stored_receipt: storedReceipt,
+        } = normalizeOidcVerifierRequest(verifierRequest);
+        const trust = await trustMaterial(execution);
+        const expectedAudience = validateEffectBoundOidcRequest(request);
+        let jwt;
+        let minted = null;
+        if (mode === "mint-and-verify") {
+          const tokenUrl = new URL(mintUrl.href);
+          tokenUrl.searchParams.set("audience", expectedAudience);
+          minted = await oidcJsonRequest({
+            fetchImpl,
+            clock,
+            limits,
+            budget,
+            deadline: execution,
+            url: tokenUrl,
+            label: "GitHub Actions OIDC token mint",
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${mintToken}`,
+            },
+          });
+          assertObject(minted.data, "GitHub Actions OIDC mint response");
+          exactKeys(minted.data, ["value"], "GitHub Actions OIDC mint response");
+          jwt = boundedSecret(minted.data.value, "GitHub Actions OIDC JWT", 64 * 1024);
+        } else {
+          jwt = storedJwt;
+          validateV2GitLedgerProvenanceReceipt(storedReceipt, { request });
+          if (rawDigest(jwt) !== storedReceipt.token_sha256) {
+            throw controllerFailure(
+              "OIDC_STORED_TOKEN_DIGEST_MISMATCH",
+              "stored OIDC JWT differs from its protected-ledger receipt",
+            );
+          }
+        }
+        const verified = verifyGitHubOidcJwt({
+          jwt,
+          request,
+          trust,
         });
-        assertObject(minted.data, "GitHub Actions OIDC mint response");
-        exactKeys(minted.data, ["value"], "GitHub Actions OIDC mint response");
-        jwt = boundedSecret(minted.data.value, "GitHub Actions OIDC JWT", 64 * 1024);
-      } else {
-        jwt = storedJwt;
-        validateV2GitLedgerProvenanceReceipt(storedReceipt, { request });
-        if (rawDigest(jwt) !== storedReceipt.token_sha256) {
-          throw controllerFailure(
-            "OIDC_STORED_TOKEN_DIGEST_MISMATCH",
-            "stored OIDC JWT differs from its protected-ledger receipt",
+        const tokenSha256 = rawDigest(jwt);
+        let replayReceiptDigest;
+        if (mode === "mint-and-verify") {
+          const replayIdentity = verified.claims.jti === undefined
+            ? `jwt:${tokenSha256}`
+            : `jti:${verified.claims.jti}`;
+          if (consumedReplayIdentities.has(replayIdentity)) {
+            throw controllerFailure(
+              "OIDC_REPLAY_DETECTED",
+              "GitHub Actions OIDC token identity was reused within this controller job",
+            );
+          }
+          consumedReplayIdentities.add(replayIdentity);
+          replayReceiptDigest = gitLedgerDigestCanonical(
+            "codex-review-gate-v2-oidc-replay-prevention",
+            {
+              request_digest: request.request_digest,
+              token_sha256: tokenSha256,
+              token_response_server_time: minted.server_time,
+              token_response_raw_body_sha256: minted.raw_body_sha256,
+              replay_identity_sha256: rawDigest(replayIdentity),
+            },
           );
+        } else {
+          replayReceiptDigest = storedReceipt.replay_prevention_receipt_digest;
         }
-      }
-      const verified = verifyGitHubOidcJwt({
-        jwt,
-        request,
-        trust,
-      });
-      const tokenSha256 = rawDigest(jwt);
-      let replayReceiptDigest;
-      if (mode === "mint-and-verify") {
-        const replayIdentity = verified.claims.jti === undefined
-          ? `jwt:${tokenSha256}`
-          : `jti:${verified.claims.jti}`;
-        if (consumedReplayIdentities.has(replayIdentity)) {
-          throw controllerFailure(
-            "OIDC_REPLAY_DETECTED",
-            "GitHub Actions OIDC token identity was reused within this controller job",
-          );
-        }
-        consumedReplayIdentities.add(replayIdentity);
-        replayReceiptDigest = gitLedgerDigestCanonical(
-          "codex-review-gate-v2-oidc-replay-prevention",
-          {
-            request_digest: request.request_digest,
-            token_sha256: tokenSha256,
-            token_response_server_time: minted.server_time,
-            token_response_raw_body_sha256: minted.raw_body_sha256,
-            replay_identity_sha256: rawDigest(replayIdentity),
-          },
+        const withoutDigest = {
+          schema: V2_GIT_LEDGER_PROVENANCE_RECEIPT_SCHEMA,
+          schema_version: 1,
+          verified: true,
+          signature_verified: true,
+          jwks_verified: true,
+          live_supported: true,
+          issuer: V2_GITHUB_OIDC_ISSUER,
+          audience: expectedAudience,
+          algorithm: "RS256",
+          key_id: verified.key_id,
+          claims: verified.claims,
+          token_sha256: tokenSha256,
+          discovery: trust.discovery_receipt,
+          jwks: trust.jwks_receipt,
+          verified_at_server_time: request.github_server_time,
+          replay_prevention_receipt_digest: replayReceiptDigest,
+          operation_binding: oidcOperationBinding(request),
+        };
+        const receipt = deepFreeze({
+          ...withoutDigest,
+          receipt_digest: gitLedgerDigestCanonical(
+            "codex-review-gate-v2-git-ledger-provenance",
+            withoutDigest,
+          ),
+        });
+        validateV2GitLedgerProvenanceReceipt(
+          receipt,
+          mode === "mint-and-verify" ? { request, policy } : { request },
         );
-      } else {
-        replayReceiptDigest = storedReceipt.replay_prevention_receipt_digest;
-      }
-      const withoutDigest = {
-        schema: V2_GIT_LEDGER_PROVENANCE_RECEIPT_SCHEMA,
-        schema_version: 1,
-        verified: true,
-        signature_verified: true,
-        jwks_verified: true,
-        live_supported: true,
-        issuer: V2_GITHUB_OIDC_ISSUER,
-        audience: expectedAudience,
-        algorithm: "RS256",
-        key_id: verified.key_id,
-        claims: verified.claims,
-        token_sha256: tokenSha256,
-        discovery: trust.discovery_receipt,
-        jwks: trust.jwks_receipt,
-        verified_at_server_time: request.github_server_time,
-        replay_prevention_receipt_digest: replayReceiptDigest,
-        operation_binding: oidcOperationBinding(request),
-      };
-      const receipt = deepFreeze({
-        ...withoutDigest,
-        receipt_digest: gitLedgerDigestCanonical(
-          "codex-review-gate-v2-git-ledger-provenance",
-          withoutDigest,
-        ),
+        const verifiedResult = deepFreeze({
+          schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_RESULT_SCHEMA,
+          schema_version: 1,
+          mode,
+          compact_jwt: mode === "mint-and-verify" ? jwt : null,
+          receipt,
+        });
+        execution.assertOpen();
+        return verifiedResult;
       });
-      validateV2GitLedgerProvenanceReceipt(
-        receipt,
-        mode === "mint-and-verify" ? { request, policy } : { request },
-      );
-      return deepFreeze({
-        schema: V2_GIT_LEDGER_PROVENANCE_VERIFIER_RESULT_SCHEMA,
-        schema_version: 1,
-        mode,
-        compact_jwt: mode === "mint-and-verify" ? jwt : null,
-        receipt,
-      });
+      completed = true;
+      return result;
     } finally {
-      execution.finish();
+      execution.finish(completed);
     }
   };
 
@@ -974,23 +1026,15 @@ function normalizeOidcVerifierExecutionContext(value) {
 }
 
 function createOidcExecutionDeadline({ signal, deadline_ms: deadlineMs }) {
-  const controller = new AbortController();
-  const abortFromCaller = () => controller.abort(signal.reason);
-  if (signal.aborted) abortFromCaller();
-  else signal.addEventListener("abort", abortFromCaller, { once: true });
-  const timer = setTimeout(() => {
-    controller.abort(controllerFailure(
+  return createControllerAbsoluteDeadline({
+    timeout_ms: deadlineMs,
+    timeout_error: controllerFailure(
       "OIDC_VERIFIER_TIMEOUT",
       "OIDC provenance verifier exceeded its fixed deadline",
-    ));
-  }, deadlineMs);
-  return {
-    signal: controller.signal,
-    finish() {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", abortFromCaller);
-    },
-  };
+    ),
+    caller_signal: signal,
+    abort_failure: oidcAbortFailure,
+  });
 }
 
 function oidcAbortFailure(signal) {
@@ -1003,25 +1047,156 @@ function oidcAbortFailure(signal) {
   );
 }
 
-function waitForOidcPromise(promise, signal) {
-  if (signal.aborted) {
-    Promise.resolve(promise).catch(() => {});
-    return Promise.reject(oidcAbortFailure(signal));
-  }
-  return new Promise((resolvePromise, rejectPromise) => {
-    const abort = () => rejectPromise(oidcAbortFailure(signal));
-    signal.addEventListener("abort", abort, { once: true });
-    Promise.resolve(promise).then(
-      (value) => {
-        signal.removeEventListener("abort", abort);
-        resolvePromise(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", abort);
-        rejectPromise(error);
-      },
-    );
+const CONTROLLER_DEADLINE_TERMINATED = Symbol("controller-deadline-terminated");
+
+function createControllerAbsoluteDeadline({
+  timeout_ms: timeoutMs,
+  timeout_error: timeoutError,
+  caller_signal: callerSignal = null,
+  parent_deadline: parentDeadline = null,
+  abort_failure: abortFailure,
+}) {
+  const controller = new AbortController();
+  const expiresAt = performance.now() + timeoutMs;
+  const sourceSignal = callerSignal;
+  let authoritativeFailure = null;
+  let finished = false;
+  let adapterAbortScheduled = false;
+  let resolveTermination;
+  const termination = new Promise((resolvePromise) => {
+    resolveTermination = resolvePromise;
   });
+  const abortAdapterBestEffort = () => {
+    if (adapterAbortScheduled) return;
+    adapterAbortScheduled = true;
+    startDeferredBestEffort(() => controller.abort(
+      new Error("controller adapter cancelled after terminal failure"),
+    ));
+  };
+  const terminate = (reason) => {
+    if (finished || authoritativeFailure !== null) return;
+    authoritativeFailure = abortFailure({ reason });
+    resolveTermination(CONTROLLER_DEADLINE_TERMINATED);
+    abortAdapterBestEffort();
+  };
+  const abortFromSource = sourceSignal === null
+    ? null
+    : () => terminate(sourceSignal.reason);
+  if (sourceSignal?.aborted) abortFromSource();
+  else sourceSignal?.addEventListener("abort", abortFromSource, { once: true });
+  if (parentDeadline !== null) {
+    parentDeadline.termination.then(() => {
+      try {
+        parentDeadline.assertOpen();
+      } catch (error) {
+        terminate(error);
+      }
+    }, () => {});
+  }
+  const timer = setTimeout(() => terminate(timeoutError), timeoutMs);
+  const deadline = {
+    signal: controller.signal,
+    termination,
+    abort(reason) {
+      terminate(reason);
+    },
+    assertOpen() {
+      if (authoritativeFailure !== null) throw authoritativeFailure;
+      if (parentDeadline !== null) {
+        try {
+          parentDeadline.assertOpen();
+        } catch (error) {
+          terminate(error);
+        }
+      }
+      if (performance.now() >= expiresAt) {
+        terminate(timeoutError);
+      }
+      if (authoritativeFailure !== null) throw authoritativeFailure;
+    },
+    wait(operationFactory, onLateValue = null) {
+      try {
+        deadline.assertOpen();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      let operation;
+      try {
+        operation = operationFactory();
+      } catch (error) {
+        try {
+          deadline.assertOpen();
+        } catch (deadlineError) {
+          return Promise.reject(deadlineError);
+        }
+        return Promise.reject(error);
+      }
+      return waitForOidcPromise(operation, deadline, onLateValue);
+    },
+    finish(requireOpen = false) {
+      try {
+        if (requireOpen) deadline.assertOpen();
+      } finally {
+        finished = true;
+        clearTimeout(timer);
+        if (sourceSignal !== null && abortFromSource !== null) {
+          startDeferredBestEffort(() => {
+            const removeEventListener = sourceSignal.removeEventListener;
+            if (typeof removeEventListener === "function") {
+              return removeEventListener.call(sourceSignal, "abort", abortFromSource);
+            }
+            return undefined;
+          });
+        }
+      }
+    },
+  };
+  return deadline;
+}
+
+async function waitForOidcPromise(promise, deadline, onLateValue = null) {
+  const operation = Promise.resolve(promise).then(
+    (value) => ({ state: "fulfilled", value }),
+    (error) => ({ state: "rejected", error }),
+  );
+  try {
+    deadline.assertOpen();
+  } catch (error) {
+    discardLateControllerValue(operation, onLateValue);
+    throw error;
+  }
+  const outcome = await Promise.race([operation, deadline.termination]);
+  try {
+    deadline.assertOpen();
+  } catch (error) {
+    if (outcome === CONTROLLER_DEADLINE_TERMINATED) {
+      discardLateControllerValue(operation, onLateValue);
+    } else if (outcome.state === "fulfilled") {
+      invokeLateControllerValue(onLateValue, outcome.value);
+    }
+    throw error;
+  }
+  if (outcome === CONTROLLER_DEADLINE_TERMINATED) {
+    throw new Error("controller deadline terminated without an authoritative failure");
+  }
+  if (outcome.state === "rejected") throw outcome.error;
+  return outcome.value;
+}
+
+function discardLateControllerValue(operation, onLateValue) {
+  operation.then(
+    (outcome) => {
+      if (outcome.state === "fulfilled") {
+        invokeLateControllerValue(onLateValue, outcome.value);
+      }
+    },
+    () => {},
+  );
+}
+
+function invokeLateControllerValue(onLateValue, value) {
+  if (onLateValue === null) return;
+  startDeferredBestEffort(onLateValue, value);
 }
 
 function normalizeOidcVerifierRequest(value) {
@@ -1062,14 +1237,14 @@ async function loadOidcTrustMaterial({
   limits,
   budget,
   policy,
-  signal,
+  deadline,
 }) {
   const discovery = await oidcJsonRequest({
     fetchImpl,
     clock,
     limits,
     budget,
-    signal,
+    deadline,
     url: new URL(V2_GITHUB_OIDC_DISCOVERY_URL),
     label: "GitHub Actions OIDC discovery",
     headers: { Accept: "application/json" },
@@ -1080,7 +1255,7 @@ async function loadOidcTrustMaterial({
     clock,
     limits,
     budget,
-    signal,
+    deadline,
     url: new URL(V2_GITHUB_OIDC_JWKS_URL),
     label: "GitHub Actions OIDC JWKS",
     headers: { Accept: "application/json" },
@@ -1487,35 +1662,36 @@ async function oidcJsonRequest({
   clock,
   limits,
   budget,
-  signal,
+  deadline: parentDeadline,
   url,
   label,
   headers,
 }) {
-  if (signal.aborted) throw oidcAbortFailure(signal);
+  parentDeadline.assertOpen();
   if (budget.requests >= limits.max_requests) {
     throw controllerFailure("OIDC_REQUEST_LIMIT", "OIDC HTTP request budget exhausted");
   }
   budget.requests += 1;
-  const controller = new AbortController();
-  const abortFromCaller = () => controller.abort(signal.reason);
-  signal.addEventListener("abort", abortFromCaller, { once: true });
-  const timer = setTimeout(
-    () => controller.abort(controllerFailure(
+  const requestDeadline = createControllerAbsoluteDeadline({
+    timeout_ms: limits.timeout_ms,
+    timeout_error: controllerFailure(
       "OIDC_HTTP_TIMEOUT",
       `${label} exceeded its fixed request deadline`,
-    )),
-    limits.timeout_ms,
-  );
-  let response;
+    ),
+    parent_deadline: parentDeadline,
+    abort_failure: oidcAbortFailure,
+  });
+  let response = null;
   let bytes;
+  let bodyConsumed = false;
+  let completed = false;
   try {
-    response = await waitForOidcPromise(fetchImpl(url.href, {
+    response = await requestDeadline.wait(() => fetchImpl(url.href, {
       method: "GET",
       redirect: "error",
-      signal: controller.signal,
+      signal: requestDeadline.signal,
       headers,
-    }), controller.signal);
+    }), cancelResponseBody);
     if (
       response === null || typeof response !== "object" || response.status !== 200 ||
       typeof response.headers?.get !== "function"
@@ -1536,7 +1712,7 @@ async function oidcJsonRequest({
         limits.max_response_bytes,
         limits.max_total_bytes - budget.bytes,
       ),
-      controller,
+      requestDeadline,
       label,
       {
         unreadable: "OIDC_HTTP_UNREADABLE",
@@ -1545,57 +1721,65 @@ async function oidcJsonRequest({
         exhausted: "OIDC_TOTAL_BYTES_EXCEEDED",
       },
     );
+    bodyConsumed = true;
+    requestDeadline.assertOpen();
+    budget.bytes += bytes.byteLength;
+    if (budget.bytes > limits.max_total_bytes) {
+      throw controllerFailure("OIDC_TOTAL_BYTES_EXCEEDED", "OIDC HTTP byte budget exhausted");
+    }
+    const serverTime = canonicalHttpDate(response.headers.get("date"), `${label} Date`);
+    if (
+      budget.last_server_time !== null &&
+      Date.parse(serverTime) < Date.parse(budget.last_server_time)
+    ) {
+      throw controllerFailure("OIDC_SERVER_TIME_REGRESSED", `${label} server Date regressed`);
+    }
+    const now = Number(clock());
+    if (!Number.isFinite(now) || Math.abs(now - Date.parse(serverTime)) > limits.clock_skew_ms) {
+      throw controllerFailure("OIDC_CLOCK_SKEW", `${label} server Date is outside the clock bound`);
+    }
+    budget.last_server_time = serverTime;
+    let rawBody;
+    try {
+      rawBody = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (error) {
+      throw controllerFailure("OIDC_INVALID_UTF8", `${label} response is not UTF-8`, null, error);
+    }
+    requestDeadline.assertOpen();
+    let data;
+    try {
+      data = JSON.parse(rawBody);
+    } catch (error) {
+      throw controllerFailure("OIDC_INVALID_JSON", `${label} response is not JSON`, null, error);
+    }
+    const capture = {
+      data,
+      server_time: serverTime,
+      raw_body_sha256: rawDigest(bytes),
+    };
+    requestDeadline.assertOpen();
+    completed = true;
+    return capture;
   } catch (error) {
     if (error instanceof V2WorkflowControllerError) throw error;
     throw controllerFailure(
-      controller.signal.aborted ? "OIDC_HTTP_TIMEOUT" : "OIDC_HTTP_FAILED",
+      requestDeadline.signal.aborted ? "OIDC_HTTP_TIMEOUT" : "OIDC_HTTP_FAILED",
       `${label} failed`,
       null,
       error,
     );
   } finally {
-    clearTimeout(timer);
-    signal.removeEventListener("abort", abortFromCaller);
+    if (response !== null && !bodyConsumed) {
+      cancelResponseBodyBestEffort(response);
+    }
+    requestDeadline.finish(completed);
   }
-  budget.bytes += bytes.byteLength;
-  if (budget.bytes > limits.max_total_bytes) {
-    throw controllerFailure("OIDC_TOTAL_BYTES_EXCEEDED", "OIDC HTTP byte budget exhausted");
-  }
-  const serverTime = canonicalHttpDate(response.headers.get("date"), `${label} Date`);
-  if (
-    budget.last_server_time !== null &&
-    Date.parse(serverTime) < Date.parse(budget.last_server_time)
-  ) {
-    throw controllerFailure("OIDC_SERVER_TIME_REGRESSED", `${label} server Date regressed`);
-  }
-  const now = Number(clock());
-  if (!Number.isFinite(now) || Math.abs(now - Date.parse(serverTime)) > limits.clock_skew_ms) {
-    throw controllerFailure("OIDC_CLOCK_SKEW", `${label} server Date is outside the clock bound`);
-  }
-  budget.last_server_time = serverTime;
-  let rawBody;
-  try {
-    rawBody = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch (error) {
-    throw controllerFailure("OIDC_INVALID_UTF8", `${label} response is not UTF-8`, null, error);
-  }
-  let data;
-  try {
-    data = JSON.parse(rawBody);
-  } catch (error) {
-    throw controllerFailure("OIDC_INVALID_JSON", `${label} response is not JSON`, null, error);
-  }
-  return {
-    data,
-    server_time: serverTime,
-    raw_body_sha256: rawDigest(bytes),
-  };
 }
 
 async function readBoundedControllerResponse(
   response,
   maximum,
-  controller,
+  deadline,
   label,
   codes,
 ) {
@@ -1605,62 +1789,166 @@ async function readBoundedControllerResponse(
   if (typeof response.body?.getReader === "function") {
     const reader = response.body.getReader();
     const chunks = [];
+    let chunkCount = 0;
     let size = 0;
+    let complete = false;
     try {
       while (true) {
-        const { done, value } = await waitForControllerAbort(
-          reader.read(),
-          controller.signal,
+        const result = await deadline.wait(() => reader.read());
+        const { done, value } = snapshotClosedByteStreamReadResult(
+          result,
+          () => controllerFailure(
+            codes.unreadable,
+            `${label} returned a malformed read result`,
+          ),
         );
-        if (done) break;
-        if (!(value instanceof Uint8Array)) {
-          throw controllerFailure(codes.unreadable, `${label} returned non-byte data`);
+        if (done) {
+          complete = true;
+          break;
         }
-        if (value.byteLength === 0) continue;
-        size += value.byteLength;
-        if (size > maximum) {
-          controller.abort(new Error(`${label} exceeded its byte budget`));
-          await reader.cancel().catch(() => {});
-          throw controllerFailure(codes.too_large, `${label} response is too large`);
-        }
-        if (chunks.length >= 16_384) {
-          controller.abort(new Error(`${label} exceeded its chunk cap`));
-          await reader.cancel().catch(() => {});
+        chunkCount += 1;
+        if (chunkCount > 16_384) {
+          deadline.abort(new Error(`${label} exceeded its chunk cap`));
           throw controllerFailure(
             codes.fragmented,
             `${label} response exceeds the bounded chunk inventory`,
           );
         }
-        chunks.push(Buffer.from(value));
+        const view = inspectFixedUint8ArrayChunk(
+          value,
+          () => controllerFailure(codes.unreadable, `${label} returned non-byte data`),
+        );
+        if (view.byte_length === 0) continue;
+        if (view.byte_length > maximum - size) {
+          deadline.abort(new Error(`${label} exceeded its byte budget`));
+          throw controllerFailure(codes.too_large, `${label} response is too large`);
+        }
+        const chunk = snapshotFixedUint8ArrayChunk(
+          value,
+          view,
+          () => controllerFailure(codes.unreadable, `${label} returned unstable byte data`),
+        );
+        size += chunk.length;
+        chunks.push(chunk);
       }
     } finally {
-      reader.releaseLock();
+      cleanupReaderBestEffort(reader, !complete);
     }
-    return Buffer.concat(chunks, size);
+    deadline.assertOpen();
+    const bytes = Buffer.concat(chunks, size);
+    deadline.assertOpen();
+    return bytes;
   }
   throw controllerFailure(codes.unreadable, `${label} has no bounded stream reader`);
 }
 
-function waitForControllerAbort(promise, signal) {
-  if (signal.aborted) {
-    Promise.resolve(promise).catch(() => {});
-    return Promise.reject(signal.reason ?? new Error("controller request aborted"));
+function snapshotClosedByteStreamReadResult(result, failure) {
+  if (result === null || typeof result !== "object") throw failure();
+  let keys;
+  let doneDescriptor;
+  let valueDescriptor;
+  try {
+    keys = reflectOwnKeysIntrinsic(result);
+    doneDescriptor = objectGetOwnPropertyDescriptorIntrinsic(result, "done");
+    valueDescriptor = objectGetOwnPropertyDescriptorIntrinsic(result, "value");
+  } catch {
+    throw failure();
   }
-  return new Promise((resolvePromise, rejectPromise) => {
-    const abort = () => rejectPromise(
-      signal.reason ?? new Error("controller request aborted"),
-    );
-    signal.addEventListener("abort", abort, { once: true });
-    Promise.resolve(promise).then(
-      (value) => {
-        signal.removeEventListener("abort", abort);
-        resolvePromise(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", abort);
-        rejectPromise(error);
-      },
-    );
+  const exactKeys = keys.length === 2 && (
+    (keys[0] === "done" && keys[1] === "value") ||
+    (keys[0] === "value" && keys[1] === "done")
+  );
+  if (
+    !exactKeys || doneDescriptor === undefined || valueDescriptor === undefined ||
+    !objectHasOwnIntrinsic(doneDescriptor, "value") ||
+    !objectHasOwnIntrinsic(valueDescriptor, "value")
+  ) {
+    throw failure();
+  }
+  const done = doneDescriptor.value;
+  const value = valueDescriptor.value;
+  if (typeof done !== "boolean" || (done && value !== undefined)) throw failure();
+  return { done, value };
+}
+
+function inspectFixedUint8ArrayChunk(value, failure) {
+  try {
+    if (!reflectApplyIntrinsic(isUint8ArrayIntrinsic, utilTypes, [value])) {
+      throw failure();
+    }
+    const backing = reflectApplyIntrinsic(typedArrayBufferGetter, value, []);
+    const byteOffset = reflectApplyIntrinsic(typedArrayByteOffsetGetter, value, []);
+    const byteLength = reflectApplyIntrinsic(typedArrayByteLengthGetter, value, []);
+    const detached = arrayBufferDetachedGetter === null
+      ? false
+      : reflectApplyIntrinsic(arrayBufferDetachedGetter, backing, []);
+    const resizable = arrayBufferResizableGetter === null
+      ? false
+      : reflectApplyIntrinsic(arrayBufferResizableGetter, backing, []);
+    if (
+      !reflectApplyIntrinsic(isArrayBufferIntrinsic, utilTypes, [backing]) ||
+      detached || resizable
+    ) {
+      throw failure();
+    }
+    return {
+      backing,
+      byte_offset: byteOffset,
+      byte_length: byteLength,
+    };
+  } catch (error) {
+    if (error instanceof V2WorkflowControllerError) throw error;
+    throw failure();
+  }
+}
+
+function snapshotFixedUint8ArrayChunk(value, expected, failure) {
+  try {
+    const before = inspectFixedUint8ArrayChunk(value, failure);
+    if (
+      before.backing !== expected.backing ||
+      before.byte_offset !== expected.byte_offset ||
+      before.byte_length !== expected.byte_length
+    ) {
+      throw failure();
+    }
+    const snapshot = Buffer.alloc(expected.byte_length);
+    reflectApplyIntrinsic(uint8ArraySetIntrinsic, snapshot, [value, 0]);
+    const after = inspectFixedUint8ArrayChunk(value, failure);
+    if (
+      after.backing !== expected.backing ||
+      after.byte_offset !== expected.byte_offset ||
+      after.byte_length !== expected.byte_length
+    ) {
+      throw failure();
+    }
+    return snapshot;
+  } catch (error) {
+    if (error instanceof V2WorkflowControllerError) throw error;
+    throw failure();
+  }
+}
+
+function cleanupReaderBestEffort(reader, shouldCancel) {
+  startDeferredBestEffort(() => {
+    if (shouldCancel) {
+      try {
+        const cancel = reader?.cancel;
+        if (typeof cancel === "function") {
+          Promise.resolve(cancel.call(reader)).catch(() => {});
+        }
+      } catch {
+        // Cancellation cannot replace the primary transport result.
+      }
+    }
+    try {
+      const releaseLock = reader?.releaseLock;
+      if (typeof releaseLock === "function") {
+        Promise.resolve(releaseLock.call(reader)).catch(() => {});
+      }
+    } catch {
+      // Lock release cannot replace the primary transport result.
+    }
   });
 }
 
@@ -2857,21 +3145,29 @@ async function controllerApiJsonRequest({
     throw controllerFailure("MINIMAL_SCOPE_REQUEST_LIMIT", "minimal scope request cap exhausted");
   }
   budget.requests += 1;
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(new Error(`${label} timed out`)),
-    limits.timeout_ms,
+  const timeoutError = controllerFailure(
+    "MINIMAL_SCOPE_TIMEOUT",
+    `${label} exceeded its fixed request deadline`,
   );
-  let response;
+  const requestDeadline = createControllerAbsoluteDeadline({
+    timeout_ms: limits.timeout_ms,
+    timeout_error: timeoutError,
+    abort_failure: (signal) => signal.reason instanceof V2WorkflowControllerError
+      ? signal.reason
+      : timeoutError,
+  });
+  let response = null;
   let bytes;
+  let bodyConsumed = false;
+  let completed = false;
   try {
-    response = await fetchImpl(url.href, {
+    response = await requestDeadline.wait(() => fetchImpl(url.href, {
       method,
       redirect: "error",
-      signal: controller.signal,
+      signal: requestDeadline.signal,
       headers,
       ...(body === null ? {} : { body: JSON.stringify(body) }),
-    });
+    }), cancelResponseBody);
     if (
       response === null || typeof response !== "object" ||
       !Number.isInteger(response.status) ||
@@ -2894,7 +3190,7 @@ async function controllerApiJsonRequest({
     bytes = await readBoundedControllerResponse(
       response,
       Math.min(limits.max_response_bytes, limits.max_total_bytes - budget.bytes),
-      controller,
+      requestDeadline,
       label,
       {
         unreadable: "MINIMAL_SCOPE_HTTP_ERROR",
@@ -2903,10 +3199,46 @@ async function controllerApiJsonRequest({
         exhausted: "MINIMAL_SCOPE_TOTAL_LIMIT",
       },
     );
+    bodyConsumed = true;
+    requestDeadline.assertOpen();
+    budget.bytes += bytes.byteLength;
+    if (budget.bytes > limits.max_total_bytes) {
+      throw controllerFailure("MINIMAL_SCOPE_TOTAL_LIMIT", "minimal scope byte cap exhausted");
+    }
+    const serverTime = canonicalHttpDate(response.headers.get("date"), `${label} Date`);
+    if (
+      budget.last_server_time !== null &&
+      Date.parse(serverTime) < Date.parse(budget.last_server_time)
+    ) {
+      throw controllerFailure("MINIMAL_SCOPE_TIME_REGRESSED", `${label} Date regressed`);
+    }
+    budget.last_server_time = serverTime;
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (error) {
+      throw controllerFailure("MINIMAL_SCOPE_INVALID_UTF8", `${label} is not UTF-8`, null, error);
+    }
+    requestDeadline.assertOpen();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (error) {
+      throw controllerFailure("MINIMAL_SCOPE_INVALID_JSON", `${label} is not JSON`, null, error);
+    }
+    const capture = {
+      data,
+      status: response.status,
+      server_time: serverTime,
+      raw_body_sha256: rawDigest(bytes),
+    };
+    requestDeadline.assertOpen();
+    completed = true;
+    return capture;
   } catch (error) {
     if (error instanceof V2WorkflowControllerError) throw error;
     throw controllerFailure(
-      controller.signal.aborted
+      requestDeadline.signal.aborted
         ? "MINIMAL_SCOPE_TIMEOUT"
         : "MINIMAL_SCOPE_NETWORK_ERROR",
       `${label} failed`,
@@ -2914,38 +3246,11 @@ async function controllerApiJsonRequest({
       error,
     );
   } finally {
-    clearTimeout(timer);
+    if (response !== null && !bodyConsumed) {
+      cancelResponseBodyBestEffort(response);
+    }
+    requestDeadline.finish(completed);
   }
-  budget.bytes += bytes.byteLength;
-  if (budget.bytes > limits.max_total_bytes) {
-    throw controllerFailure("MINIMAL_SCOPE_TOTAL_LIMIT", "minimal scope byte cap exhausted");
-  }
-  const serverTime = canonicalHttpDate(response.headers.get("date"), `${label} Date`);
-  if (
-    budget.last_server_time !== null &&
-    Date.parse(serverTime) < Date.parse(budget.last_server_time)
-  ) {
-    throw controllerFailure("MINIMAL_SCOPE_TIME_REGRESSED", `${label} Date regressed`);
-  }
-  budget.last_server_time = serverTime;
-  let text;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch (error) {
-    throw controllerFailure("MINIMAL_SCOPE_INVALID_UTF8", `${label} is not UTF-8`, null, error);
-  }
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (error) {
-    throw controllerFailure("MINIMAL_SCOPE_INVALID_JSON", `${label} is not JSON`, null, error);
-  }
-  return {
-    data,
-    status: response.status,
-    server_time: serverTime,
-    raw_body_sha256: rawDigest(bytes),
-  };
 }
 
 function normalizeMinimalScopeLimits(value) {
@@ -3295,17 +3600,20 @@ export async function listAllOpenPullRequests({
   const base = normalizeRestBase(restBaseUrl);
   const authorization = boundedString(token, "token", 4096);
   const repoPath = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
+  const responseBudget = createGithubJsonResponseBudget();
   const first = await loadOpenPullRequestInventoryPass({
     fetchImpl,
     authorization,
     base,
     repoPath,
+    responseBudget,
   });
   const second = await loadOpenPullRequestInventoryPass({
     fetchImpl,
     authorization,
     base,
     repoPath,
+    responseBudget,
   });
   if (canonicalJson(first) !== canonicalJson(second)) {
     throw controllerFailure(
@@ -3333,6 +3641,7 @@ async function loadOpenPullRequestInventoryPass({
   authorization,
   base,
   repoPath,
+  responseBudget,
 }) {
   const pulls = [];
   const ids = new Set();
@@ -3344,6 +3653,7 @@ async function loadOpenPullRequestInventoryPass({
       method: "GET",
       path: `${repoPath}/pulls?state=open&sort=created&direction=asc&per_page=100&page=${page}`,
       expectedStatus: 200,
+      responseBudget,
     });
     for (const pull of capture.data) {
       assertObject(pull, "open pull request");
@@ -6332,6 +6642,9 @@ export async function executeV2EffectOnce({
   if (effect.kind === "request-comment") {
     return deepFreeze({ ledger: attempted, capture, binding_required: true });
   }
+  if (effect.kind === "sticky-comment") {
+    validateStickyCaptureIdentity(capture, effect);
+  }
   const receipt = receipt_builder === null
     ? capture.receipt
     : await receipt_builder(structuredClone(capture), structuredClone(effect));
@@ -6341,6 +6654,8 @@ export async function executeV2EffectOnce({
     http_status: capture.http_status,
     server_time: capture.server_time,
     raw_body: capture.raw_body,
+    raw_body_sha256: capture.raw_body_sha256,
+    exact_refetch: capture.exact_refetch ?? null,
     receipt,
   });
   await persistExactLedger(persist_ledger, bound, "bound");
@@ -6387,6 +6702,8 @@ export async function bindAttemptedV2RequestEffect({
     http_status: capture.http_status,
     server_time: capture.server_time,
     raw_body: capture.raw_body,
+    raw_body_sha256: capture.raw_body_sha256,
+    exact_refetch: capture.exact_refetch ?? null,
     receipt: binding_receipt,
   });
   await persistExactLedger(persist_ledger, bound, "bound");
@@ -6413,6 +6730,7 @@ export function createV2GitHubEffectTransport({
       const repo = normalizeRepository(repository);
       const pullNumber = positiveInteger(pull_number, "pull_number");
       const repoPath = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
+      const responseBudget = createGithubJsonResponseBudget();
       if (effect.kind === "request-comment") {
         const reservation = effect.payload.reservation;
         if (
@@ -6430,6 +6748,7 @@ export function createV2GitHubEffectTransport({
           path: `${repoPath}/issues/${pullNumber}/comments`,
           body: { body: reservation.body },
           expectedStatus: 201,
+          responseBudget,
         });
       }
       if (effect.kind === "commit-status") {
@@ -6446,6 +6765,7 @@ export function createV2GitHubEffectTransport({
             description: write.reason.slice(0, 140),
           },
           expectedStatus: 201,
+          responseBudget,
         });
         const created = parseStatusResponse(capture.data, write);
         const exact = await findExactStatus({
@@ -6455,6 +6775,7 @@ export function createV2GitHubEffectTransport({
           repoPath,
           shaValue: write.sha,
           statusId: created.id,
+          responseBudget,
         });
         const refetched = parseStatusResponse(exact.status, write);
         if (canonicalJson(created) !== canonicalJson(refetched)) {
@@ -6484,6 +6805,7 @@ export function createV2GitHubEffectTransport({
         path,
         body: { body: sticky_body },
         expectedStatus: effect.payload.method === "POST" ? 201 : 200,
+        responseBudget,
       });
       const comment = parseCommentIdentity(capture.data, sticky_body);
       const exact = await requestJson({
@@ -6494,6 +6816,7 @@ export function createV2GitHubEffectTransport({
         path: `${repoPath}/issues/comments/${comment.comment_id}`,
         body: null,
         expectedStatus: 200,
+        responseBudget,
       });
       const refetched = parseCommentIdentity(exact.data, sticky_body);
       if (canonicalJson(comment) !== canonicalJson(refetched)) {
@@ -6505,7 +6828,7 @@ export function createV2GitHubEffectTransport({
         exact_refetch: {
           server_time: exact.server_time,
           raw_body: exact.raw_body,
-          raw_body_sha256: rawDigest(exact.raw_body),
+          raw_body_sha256: exact.raw_body_sha256,
         },
       });
     },
@@ -6538,6 +6861,7 @@ export function createV2GitHubProductionStatusTransport({
   return Object.freeze({
     async performStatusWrite({ status_intent_handle: statusIntentHandle }) {
       const write = projectV2GitLedgerStatusWriteTransport(statusIntentHandle);
+      const responseBudget = createGithubJsonResponseBudget();
       const capture = await requestJson({
         fetchImpl,
         authorization,
@@ -6550,6 +6874,7 @@ export function createV2GitHubProductionStatusTransport({
           description: write.description,
         },
         expectedStatus: 201,
+        responseBudget,
       });
       const created = parseProductionStatusIdentity(capture.data, write);
       const exact = await refetchExactProductionStatus({
@@ -6559,6 +6884,7 @@ export function createV2GitHubProductionStatusTransport({
         repoPath,
         write,
         status_id: created.status_id,
+        responseBudget,
       });
       if (canonicalJson(created) !== canonicalJson(exact.status)) {
         throw new Error(
@@ -6577,7 +6903,7 @@ export function createV2GitHubProductionStatusTransport({
         updated_at: created.updated_at,
         creator: structuredClone(created.creator),
         post_server_time: capture.server_time,
-        post_raw_body_sha256: rawDigest(capture.raw_body),
+        post_raw_body_sha256: capture.raw_body_sha256,
         refetch_server_time: exact.refetch_server_time,
         refetch_page_count: exact.pages.length,
         refetch_item_count: exact.item_count,
@@ -6629,6 +6955,7 @@ export function createV2GitHubProductionReservationStatusTransport({
       const write = projectV2GitLedgerReservationStatusTransport(
         reservationStatusIntentHandle,
       );
+      const responseBudget = createGithubJsonResponseBudget();
       const capture = await requestJson({
         fetchImpl,
         authorization,
@@ -6641,6 +6968,7 @@ export function createV2GitHubProductionReservationStatusTransport({
           description: write.description,
         },
         expectedStatus: 201,
+        responseBudget,
       });
       const created = parseProductionStatusIdentity(capture.data, write);
       const exact = await refetchExactProductionStatus({
@@ -6650,6 +6978,7 @@ export function createV2GitHubProductionReservationStatusTransport({
         repoPath,
         write,
         status_id: created.status_id,
+        responseBudget,
       });
       if (canonicalJson(created) !== canonicalJson(exact.status)) {
         throw new Error(
@@ -6667,7 +6996,7 @@ export function createV2GitHubProductionReservationStatusTransport({
         updated_at: created.updated_at,
         creator: structuredClone(created.creator),
         post_server_time: capture.server_time,
-        post_raw_body_sha256: rawDigest(capture.raw_body),
+        post_raw_body_sha256: capture.raw_body_sha256,
         refetch_server_time: exact.refetch_server_time,
         refetch_page_count: exact.pages.length,
         refetch_item_count: exact.item_count,
@@ -6728,6 +7057,7 @@ export function createV2GitHubProductionAutomaticReviewRequestTransport({
           "automatic request transport differs from the selected pull request",
         );
       }
+      const responseBudget = createGithubJsonResponseBudget();
       const capture = await requestJson({
         fetchImpl,
         authorization,
@@ -6736,6 +7066,7 @@ export function createV2GitHubProductionAutomaticReviewRequestTransport({
         path: write.path,
         body: structuredClone(write.json),
         expectedStatus: write.expected_status,
+        responseBudget,
       });
       const created = parseProductionAutomaticRequestIdentity(capture.data, {
         base,
@@ -6751,6 +7082,7 @@ export function createV2GitHubProductionAutomaticReviewRequestTransport({
         path: `${repoPath}/issues/comments/${created.request_id}`,
         body: null,
         expectedStatus: 200,
+        responseBudget,
       });
       const refetched = parseProductionAutomaticRequestIdentity(exact.data, {
         base,
@@ -6766,9 +7098,9 @@ export function createV2GitHubProductionAutomaticReviewRequestTransport({
       return deepFreeze({
         identity: created,
         post_server_time: capture.server_time,
-        post_raw_body_sha256: rawDigest(capture.raw_body),
+        post_raw_body_sha256: capture.raw_body_sha256,
         refetch_server_time: exact.server_time,
-        refetch_raw_body_sha256: rawDigest(exact.raw_body),
+        refetch_raw_body_sha256: exact.raw_body_sha256,
       });
     },
   });
@@ -6945,6 +7277,9 @@ export function parseV2EffectLedgerComment(body) {
       return null;
     }
     const text = bytes.toString("utf8");
+    if (!bytes.equals(Buffer.from(text, "utf8"))) {
+      return null;
+    }
     const value = JSON.parse(text);
     if (canonicalJson(value) !== text) {
       return null;
@@ -6983,8 +7318,7 @@ export function createV2GitHubLedgerStore({
   const actor = normalizeTrustedActor(trusted_actor);
   const repoPath = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
 
-  const store = {
-    async loadLedger(scope) {
+  async function loadLedgerWithBudget(scope, responseBudget) {
       const normalizedScope = normalizeLedgerScope(scope);
       const candidates = [];
       for (let page = 1; page <= 20; page += 1) {
@@ -6995,6 +7329,7 @@ export function createV2GitHubLedgerStore({
           method: "GET",
           path: `${repoPath}/issues/${pullNumber}/comments?per_page=100&page=${page}`,
           expectedStatus: 200,
+          responseBudget,
         });
         for (const comment of capture.data) {
           const parsed = parseV2EffectLedgerComment(comment.body);
@@ -7025,6 +7360,7 @@ export function createV2GitHubLedgerStore({
         path: `${repoPath}/issues/comments/${positiveInteger(selected.comment.id, "ledger comment id")}`,
         body: null,
         expectedStatus: 200,
+        responseBudget,
       });
       assertTrustedLedgerActor(exact.data, actor);
       if (exact.data.body !== selected.comment.body) {
@@ -7039,14 +7375,20 @@ export function createV2GitHubLedgerStore({
         comment_id: String(selected.comment.id),
         comment_node_id: boundedString(exact.data.node_id, "ledger comment node_id", 256),
         response_server_time: exact.server_time,
-        raw_body_sha256: rawDigest(exact.raw_body),
+        raw_body_sha256: exact.raw_body_sha256,
       });
+  }
+
+  const store = {
+    loadLedger(scope) {
+      return loadLedgerWithBudget(scope, createGithubJsonResponseBudget());
     },
 
     async persistLedger(ledger) {
+      const responseBudget = createGithubJsonResponseBudget();
       const desired = validateV2EffectLedger(ledger);
       const scope = ledgerScope(desired);
-      const current = await store.loadLedger(scope);
+      const current = await loadLedgerWithBudget(scope, responseBudget);
       if (current !== null && current.ledger.ledger_digest === desired.ledger_digest) {
         return structuredClone(desired);
       }
@@ -7068,6 +7410,7 @@ export function createV2GitHubLedgerStore({
         path,
         body: { body },
         expectedStatus: method === "POST" ? 201 : 200,
+        responseBudget,
       });
       assertTrustedLedgerActor(write.data, actor);
       if (write.data.body !== body) {
@@ -7082,6 +7425,7 @@ export function createV2GitHubLedgerStore({
         path: `${repoPath}/issues/comments/${id}`,
         body: null,
         expectedStatus: 200,
+        responseBudget,
       });
       assertTrustedLedgerActor(exact.data, actor);
       if (exact.data.body !== body) {
@@ -7122,8 +7466,7 @@ export function createV2GitHubReservationLedger({
   const creator = normalizeStatusCreator(expected_creator);
   const repoPath = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
 
-  return Object.freeze({
-    async loadReservations({ head_ref_oid }) {
+  async function loadReservationsWithBudget({ head_ref_oid }, responseBudget) {
       const head = sha(head_ref_oid, "head_ref_oid");
       const records = [];
       for (let page = 1; page <= 10; page += 1) {
@@ -7134,6 +7477,7 @@ export function createV2GitHubReservationLedger({
           method: "GET",
           path: `${repoPath}/commits/${head}/statuses?per_page=100&page=${page}`,
           expectedStatus: 200,
+          responseBudget,
         });
         for (const status of capture.data) {
           if (!String(status.context ?? "").startsWith(V2_RESERVATION_STATUS_CONTEXT_PREFIX)) {
@@ -7171,13 +7515,23 @@ export function createV2GitHubReservationLedger({
         automatic_reservations_on_head: records.length,
         records,
       });
+  }
+
+  return Object.freeze({
+    loadReservations(input) {
+      return loadReservationsWithBudget(
+        input,
+        createGithubJsonResponseBudget(),
+      );
     },
 
     async persistReservation(reservation) {
+      const responseBudget = createGithubJsonResponseBudget();
       validateReservationStatusInput(reservation, creator);
-      const before = await this.loadReservations({
-        head_ref_oid: reservation.epoch_head_sha,
-      });
+      const before = await loadReservationsWithBudget(
+        { head_ref_oid: reservation.epoch_head_sha },
+        responseBudget,
+      );
       if (before.records.some((record) =>
         record.reservation_digest === reservation.reservation_digest)) {
         throw new Error("reservation digest was already consumed on this head");
@@ -7199,14 +7553,16 @@ export function createV2GitHubReservationLedger({
           description,
         },
         expectedStatus: 201,
+        responseBudget,
       });
       parseReservationStatus(capture.data, reservation.epoch_head_sha, creator, {
         ordinal: reservation.ordinal,
         reservation_digest: reservation.reservation_digest,
       });
-      const after = await this.loadReservations({
-        head_ref_oid: reservation.epoch_head_sha,
-      });
+      const after = await loadReservationsWithBudget(
+        { head_ref_oid: reservation.epoch_head_sha },
+        responseBudget,
+      );
       const persisted = after.records.find((record) =>
         record.ordinal === reservation.ordinal &&
         record.reservation_digest === reservation.reservation_digest);
@@ -7254,7 +7610,7 @@ export function reserveV2Effect({
   if (current.effects.some((effect) => effect.idempotency_key === key)) {
     throw new Error("effect idempotency key is already consumed");
   }
-  const normalizedPayload = validateEffectPayload(kind, payload, current);
+  const normalizedPayload = validateEffectPayload(kind, payload, current, key);
   const at = timestamp(recorded_at, "recorded_at");
   if (Date.parse(at) < Date.parse(current.created_at)) {
     throw new Error("effect reservation cannot predate its ledger");
@@ -7305,28 +7661,49 @@ export function bindV2EffectResponse({
   http_status,
   server_time,
   raw_body,
+  raw_body_sha256,
+  exact_refetch = null,
   receipt = null,
 }) {
-  return updateEffect(ledger, effect_id, (effect) => {
+  return updateEffect(ledger, effect_id, (effect, current) => {
     if (effect.state !== "attempted") {
       throw new Error("only an attempted effect can bind a response");
     }
-    const expected = effect.kind === "commit-status" ||
-        effect.kind === "request-comment" ||
-        (effect.kind === "sticky-comment" && effect.payload.method === "POST")
-      ? 201
-      : 200;
+    const expected = expectedEffectHttpStatus(effect);
     if (http_status !== expected) {
       throw new Error(`effect requires exact HTTP ${expected}`);
     }
     if (typeof raw_body !== "string") {
       throw new TypeError("raw_body must be the exact UTF-8 response text");
     }
-    validateEffectReceipt(effect.kind, receipt);
+    const rawBodyBytes = Buffer.from(raw_body, "utf8");
+    if (rawBodyBytes.toString("utf8") !== raw_body) {
+      throw new TypeError("raw_body must round-trip as exact UTF-8 without replacement");
+    }
+    const exactRawBodyDigest = rawDigest(rawBodyBytes);
+    const responseRawBodyDigest = digest(raw_body_sha256, "raw_body_sha256");
+    if (responseRawBodyDigest !== exactRawBodyDigest) {
+      throw new Error(
+        "raw_body_sha256 does not bind the exact UTF-8 response bytes",
+      );
+    }
+    validateEffectReceipt(effect.kind, receipt, effect, current);
     const responseTime = timestamp(server_time, "server_time");
     if (Date.parse(responseTime) < Date.parse(effect.attempted_at)) {
       throw new Error("effect response server time predates its durable attempt");
     }
+    const normalizedExactRefetch = normalizeEffectExactRefetch(
+      effect,
+      exact_refetch,
+      receipt,
+      responseTime,
+    );
+    validateStickyReceiptBinding(effect, receipt, normalizedExactRefetch);
+    validateRequestReceiptResponseBinding(effect, receipt, {
+      http_status,
+      server_time: responseTime,
+      raw_body_sha256: responseRawBodyDigest,
+    });
     return {
       ...effect,
       state: "bound",
@@ -7335,7 +7712,8 @@ export function bindV2EffectResponse({
         schema_version: 1,
         http_status,
         server_time: responseTime,
-        raw_body_sha256: rawDigest(raw_body),
+        raw_body_sha256: responseRawBodyDigest,
+        exact_refetch: normalizedExactRefetch,
         receipt,
       },
     };
@@ -7580,7 +7958,22 @@ function validateEffect(effect, ledger, index) {
   enumValue(effect.kind, EFFECT_KINDS, `${label}.kind`);
   boundedString(effect.effect_id, `${label}.effect_id`, 256);
   boundedString(effect.idempotency_key, `${label}.idempotency_key`, 256);
-  validateEffectPayload(effect.kind, effect.payload, ledger);
+  const normalizedPayload = validateEffectPayload(
+    effect.kind,
+    effect.payload,
+    ledger,
+    effect.idempotency_key,
+  );
+  if (
+    effect.effect_id !== effectId(
+      ledger,
+      effect.kind,
+      effect.idempotency_key,
+      normalizedPayload,
+    )
+  ) {
+    throw new Error(`${label}.effect_id does not bind its exact ledger scope, kind, key, and payload`);
+  }
   enumValue(effect.state, new Set(["reserved", "attempted", "bound"]), `${label}.state`);
   timestamp(effect.reserved_at, `${label}.reserved_at`);
   if (Date.parse(effect.reserved_at) < Date.parse(ledger.created_at)) {
@@ -7602,12 +7995,184 @@ function validateEffect(effect, ledger, index) {
       throw new Error(`${label} attempted state already has a response`);
     }
     if (effect.state === "bound") {
-      assertObject(effect.response, `${label}.response`);
+      validateEffectResponse(effect, `${label}.response`, ledger);
     }
   }
 }
 
-function validateEffectPayload(kind, payload, ledger) {
+function validateEffectResponse(effect, label, ledger) {
+  const response = effect.response;
+  assertObject(response, label);
+  exactKeys(response, [
+    "schema", "schema_version", "http_status", "server_time",
+    "raw_body_sha256", "exact_refetch", "receipt",
+  ], label);
+  if (
+    response.schema !== V2_EFFECT_RESPONSE_SCHEMA ||
+    response.schema_version !== 1
+  ) {
+    throw new Error(`${label} has an unsupported schema`);
+  }
+  if (response.http_status !== expectedEffectHttpStatus(effect)) {
+    throw new Error(`${label} has the wrong exact HTTP status`);
+  }
+  const responseTime = timestamp(response.server_time, `${label}.server_time`);
+  if (Date.parse(responseTime) < Date.parse(effect.attempted_at)) {
+    throw new Error(`${label} predates the durable effect attempt`);
+  }
+  digest(response.raw_body_sha256, `${label}.raw_body_sha256`);
+  validateEffectReceipt(effect.kind, response.receipt, effect, ledger);
+  const normalizedExactRefetch = normalizeEffectExactRefetch(
+    effect,
+    response.exact_refetch,
+    response.receipt,
+    responseTime,
+  );
+  validateStickyReceiptBinding(effect, response.receipt, normalizedExactRefetch);
+  validateRequestReceiptResponseBinding(effect, response.receipt, response);
+  if (canonicalJson(normalizedExactRefetch) !== canonicalJson(response.exact_refetch)) {
+    throw new Error(`${label}.exact_refetch is not canonical`);
+  }
+}
+
+function expectedEffectHttpStatus(effect) {
+  return effect.kind === "commit-status" ||
+      effect.kind === "request-comment" ||
+      (effect.kind === "sticky-comment" && effect.payload.method === "POST")
+    ? 201
+    : 200;
+}
+
+function normalizeEffectExactRefetch(effect, value, receipt, responseTime) {
+  let candidate = value;
+  const receiptRefetch = effect.kind === "request-comment"
+    ? normalizeRequestReceiptRefetch(receipt)
+    : null;
+  if (
+    effect.kind === "request-comment" && candidate !== null &&
+    receiptRefetch === null
+  ) {
+    throw new Error("request-comment exact refetch requires its binding receipt");
+  }
+  if (effect.kind === "request-comment" && candidate === null && receiptRefetch !== null) {
+    candidate = {
+      server_time: receiptRefetch.response_server_time,
+      raw_body_sha256: receiptRefetch.raw_body_sha256,
+    };
+  }
+  if (candidate === null) {
+    throw new Error(`${effect.kind} response requires an exact refetch receipt`);
+  }
+  assertObject(candidate, `${effect.kind} exact_refetch`);
+  const hasRawBody = effect.kind === "sticky-comment";
+  exactKeys(
+    candidate,
+    hasRawBody
+      ? ["server_time", "raw_body", "raw_body_sha256"]
+      : ["server_time", "raw_body_sha256"],
+    `${effect.kind} exact_refetch`,
+  );
+  const serverTime = timestamp(
+    candidate.server_time,
+    `${effect.kind} exact_refetch.server_time`,
+  );
+  const rawBodySha256 = digest(
+    candidate.raw_body_sha256,
+    `${effect.kind} exact_refetch.raw_body_sha256`,
+  );
+  if (hasRawBody) {
+    if (typeof candidate.raw_body !== "string") {
+      throw new TypeError("sticky-comment exact_refetch.raw_body must be exact UTF-8 text");
+    }
+    const rawBodyBytes = Buffer.from(candidate.raw_body, "utf8");
+    if (
+      rawBodyBytes.toString("utf8") !== candidate.raw_body ||
+      rawDigest(rawBodyBytes) !== rawBodySha256
+    ) {
+      throw new Error("sticky-comment exact refetch body does not bind its raw digest");
+    }
+  }
+  if (Date.parse(serverTime) < Date.parse(responseTime)) {
+    throw new Error(`${effect.kind} exact refetch predates the write response`);
+  }
+  if (
+    effect.kind === "request-comment" &&
+    receiptRefetch !== null
+  ) {
+    if (
+      receiptRefetch.response_server_time !== serverTime ||
+      receiptRefetch.raw_body_sha256 !== rawBodySha256
+    ) {
+      throw new Error("request-comment exact refetch differs from its binding receipt");
+    }
+  }
+  return hasRawBody
+    ? {
+        server_time: serverTime,
+        raw_body: candidate.raw_body,
+        raw_body_sha256: rawBodySha256,
+      }
+    : {
+        server_time: serverTime,
+        raw_body_sha256: rawBodySha256,
+      };
+}
+
+function normalizeRequestReceiptRefetch(receipt) {
+  if (receipt?.post_refetch === undefined) return null;
+  assertObject(receipt.post_refetch, "request-comment receipt.post_refetch");
+  exactKeys(receipt.post_refetch, [
+    "response_server_time", "raw_body_sha256", "artifact_id",
+    "artifact_digest",
+  ], "request-comment receipt.post_refetch");
+  return {
+    response_server_time: timestamp(
+      receipt.post_refetch.response_server_time,
+      "request-comment receipt.post_refetch.response_server_time",
+    ),
+    raw_body_sha256: digest(
+      receipt.post_refetch.raw_body_sha256,
+      "request-comment receipt.post_refetch.raw_body_sha256",
+    ),
+    artifact_id: positiveDecimalString(
+      receipt.post_refetch.artifact_id,
+      "request-comment receipt.post_refetch.artifact_id",
+    ),
+    artifact_digest: digest(
+      receipt.post_refetch.artifact_digest,
+      "request-comment receipt.post_refetch.artifact_digest",
+    ),
+  };
+}
+
+function validateRequestReceiptResponseBinding(effect, receipt, response) {
+  if (effect.kind !== "request-comment" || receipt.post_response === undefined) return;
+  assertObject(receipt.post_response, "request-comment receipt.post_response");
+  exactKeys(receipt.post_response, [
+    "status", "server_time", "raw_body_sha256", "id", "node_id", "url",
+    "html_url", "actor", "app", "body", "created_at", "updated_at",
+  ], "request-comment receipt.post_response");
+  const status = positiveInteger(
+    receipt.post_response.status,
+    "request-comment receipt.post_response.status",
+  );
+  const serverTime = timestamp(
+    receipt.post_response.server_time,
+    "request-comment receipt.post_response.server_time",
+  );
+  const rawBodySha256 = digest(
+    receipt.post_response.raw_body_sha256,
+    "request-comment receipt.post_response.raw_body_sha256",
+  );
+  if (
+    status !== response.http_status || serverTime !== response.server_time ||
+    rawBodySha256 !== response.raw_body_sha256
+  ) {
+    throw new Error("request-comment write response differs from its binding receipt");
+  }
+}
+
+function validateEffectPayload(kind, payload, ledger, idempotencyKey) {
   assertObject(payload, `${kind} payload`);
   if (kind === "request-comment") {
     exactKeys(payload, ["reservation", "attempt"], "request-comment payload");
@@ -7628,6 +8193,9 @@ function validateEffectPayload(kind, payload, ledger) {
       "role", "sha", "context", "state", "reason", "idempotency_key",
     ], "commit-status payload");
     validateLegacyStatusPayload(payload, ledger.head_ref_oid);
+    if (payload.idempotency_key !== idempotencyKey) {
+      throw new Error("commit-status payload idempotency_key must equal its effect idempotency_key");
+    }
   } else {
     exactKeys(payload, [
       "method", "comment_id", "body_sha256", "projection_digest",
@@ -7674,13 +8242,37 @@ function validateLegacyStatusPayload(payload, headRefOid) {
   });
 }
 
-function validateEffectReceipt(kind, receipt) {
+function validateEffectReceipt(kind, receipt, effect = null, ledger = null) {
   if (receipt === null) {
     throw new Error(`${kind} response requires a closed receipt`);
   }
   assertObject(receipt, `${kind} receipt`);
-  if (kind === "request-comment" && receipt.schema !== V2_REQUEST_BINDING_SCHEMA) {
-    throw new Error("request-comment response requires a v2 binding receipt");
+  if (kind === "request-comment") {
+    const fullKeys = [
+      "schema", "schema_version", "repository", "pull_request",
+      "epoch_head_sha", "ordinal", "generation_id", "generation_kind",
+      "generation_index", "recovery_authority", "scheduler_intent_id",
+      "intent_id", "intent_digest", "reservation_digest", "body",
+      "automatic", "consumed", "effect_attempt", "pre_scope_digest",
+      "post_scope_digest", "post_response", "post_refetch", "ledger_update",
+      "non_replayable_effect_policy", "receipt_digest",
+    ];
+    exactKeys(receipt, fullKeys, "request-comment receipt");
+    if (
+      receipt.schema !== V2_REQUEST_BINDING_SCHEMA ||
+      receipt.schema_version !== 1
+    ) {
+      throw new Error("request-comment response requires a v2 binding receipt");
+    }
+    digest(receipt.receipt_digest, "request-comment receipt.receipt_digest");
+    const { receipt_digest: _receiptDigest, ...withoutDigest } = receipt;
+    if (receipt.receipt_digest !== digestCanonical(
+      "codex-review-gate-v2-request-binding",
+      withoutDigest,
+    )) {
+      throw new Error("request-comment binding receipt digest is invalid");
+    }
+    if (effect !== null) validateRequestReceiptForEffect(receipt, effect);
   }
   if (kind === "commit-status") {
     exactKeys(receipt, ["sha", "context", "state", "id"], "status receipt");
@@ -7690,15 +8282,241 @@ function validateEffectReceipt(kind, receipt) {
     }
     enumValue(receipt.state, STATUS_STATES, "status receipt.state");
     boundedString(receipt.id, "status receipt.id", 64);
+    if (
+      effect !== null &&
+      (receipt.sha !== effect.payload.sha ||
+        receipt.context !== effect.payload.context ||
+        receipt.state !== effect.payload.state)
+    ) {
+      throw new Error("status receipt differs from the reserved exact payload");
+    }
   }
   if (kind === "sticky-comment") {
     exactKeys(receipt, [
       "comment_id", "comment_node_id", "raw_body_sha256", "binding_sha256",
+      "raw_binding",
     ], "sticky receipt");
     boundedString(receipt.comment_id, "sticky receipt.comment_id", 32);
     boundedString(receipt.comment_node_id, "sticky receipt.comment_node_id", 256);
     digest(receipt.raw_body_sha256, "sticky receipt.raw_body_sha256");
     digest(receipt.binding_sha256, "sticky receipt.binding_sha256");
+    assertObject(receipt.raw_binding, "sticky receipt.raw_binding");
+    if (
+      receipt.raw_binding.comment_id !== receipt.comment_id ||
+      receipt.raw_binding.comment_node_id !== receipt.comment_node_id ||
+      receipt.raw_binding.raw_body_sha256 !== receipt.raw_body_sha256 ||
+      receipt.raw_binding.binding_sha256 !== receipt.binding_sha256
+    ) {
+      throw new Error("sticky receipt flat identity differs from its raw binding");
+    }
+    if (
+      ledger !== null &&
+      (receipt.raw_binding.repository_node_id !== ledger.repository_node_id ||
+        receipt.raw_binding.pull_request_node_id !== ledger.pull_request_node_id ||
+        receipt.raw_binding.head_sha !== ledger.head_ref_oid)
+    ) {
+      throw new Error("sticky receipt raw binding differs from its effect ledger scope");
+    }
+    if (
+      effect !== null &&
+      receipt.raw_body_sha256 !== effect.payload.body_sha256
+    ) {
+      throw new Error("sticky receipt differs from the reserved exact body digest");
+    }
+    if (
+      effect?.payload.method === "PATCH" &&
+      receipt.comment_id !== String(effect.payload.comment_id)
+    ) {
+      throw new Error("sticky receipt differs from the reserved comment identity");
+    }
+  }
+}
+
+function validateStickyCaptureIdentity(capture, effect) {
+  const captured = normalizeStickyIdentity(
+    capture.sticky_identity,
+    effect,
+    "sticky capture identity",
+  );
+  const exact = stickyIdentityFromExactRefetch(
+    capture.exact_refetch,
+    effect,
+    "sticky capture exact refetch",
+  );
+  if (canonicalJson(captured) !== canonicalJson(exact.identity)) {
+    throw new Error("sticky write identity differs from its exact GET refetch");
+  }
+}
+
+function validateStickyReceiptBinding(effect, receipt, exactRefetch) {
+  if (effect.kind !== "sticky-comment") return;
+  const exact = stickyIdentityFromExactRefetch(
+    exactRefetch,
+    effect,
+    "sticky durable exact refetch",
+  );
+  if (
+    receipt.comment_id !== exact.identity.comment_id ||
+    receipt.comment_node_id !== exact.identity.comment_node_id ||
+    receipt.raw_body_sha256 !== exact.identity.body_sha256
+  ) {
+    throw new Error("sticky receipt identity differs from its exact GET refetch");
+  }
+  if (!verifyStickyCommentRawDigest(receipt.raw_binding, exact.body)) {
+    throw new Error("sticky receipt binding_sha256 does not bind its exact projection body");
+  }
+}
+
+function stickyIdentityFromExactRefetch(value, effect, label) {
+  assertObject(value, label);
+  if (typeof value.raw_body !== "string") {
+    throw new TypeError(`${label}.raw_body must be exact UTF-8 JSON text`);
+  }
+  const rawBytes = Buffer.from(value.raw_body, "utf8");
+  if (rawBytes.toString("utf8") !== value.raw_body) {
+    throw new TypeError(`${label}.raw_body must round-trip as exact UTF-8`);
+  }
+  let data;
+  try {
+    data = JSON.parse(value.raw_body);
+  } catch (error) {
+    throw new Error(`${label}.raw_body must be exact JSON`, { cause: error });
+  }
+  assertObject(data, `${label}.data`);
+  if (typeof data.body !== "string") {
+    throw new TypeError(`${label}.data.body must be exact UTF-8 text`);
+  }
+  const bodyBytes = Buffer.from(data.body, "utf8");
+  if (bodyBytes.toString("utf8") !== data.body) {
+    throw new TypeError(`${label}.data.body must round-trip as exact UTF-8`);
+  }
+  const identity = normalizeStickyIdentity({
+    comment_id: String(positiveInteger(data.id, `${label}.data.id`)),
+    comment_node_id: data.node_id,
+    body_sha256: rawDigest(bodyBytes),
+  }, effect, `${label}.identity`);
+  return { identity, body: data.body };
+}
+
+function normalizeStickyIdentity(value, effect, label) {
+  assertObject(value, label);
+  exactKeys(
+    value,
+    ["comment_id", "comment_node_id", "body_sha256"],
+    label,
+  );
+  const identity = {
+    comment_id: boundedString(value.comment_id, `${label}.comment_id`, 32),
+    comment_node_id: boundedString(
+      value.comment_node_id,
+      `${label}.comment_node_id`,
+      256,
+    ),
+    body_sha256: digest(value.body_sha256, `${label}.body_sha256`),
+  };
+  if (identity.body_sha256 !== effect.payload.body_sha256) {
+    throw new Error(`${label} differs from the reserved exact body digest`);
+  }
+  if (
+    effect.payload.method === "PATCH" &&
+    identity.comment_id !== String(effect.payload.comment_id)
+  ) {
+    throw new Error(`${label} differs from the reserved PATCH comment identity`);
+  }
+  return identity;
+}
+
+function validateRequestReceiptForEffect(receipt, effect) {
+  const reservation = effect.payload.reservation;
+  const attempt = effect.payload.attempt;
+  const expectedReservationBinding = {
+    repository: reservation.repository,
+    pull_request: reservation.pull_request,
+    epoch_head_sha: reservation.epoch_head_sha,
+    ordinal: reservation.ordinal,
+    generation_id: reservation.generation_id,
+    generation_kind: reservation.generation_kind,
+    generation_index: reservation.generation_index,
+    recovery_authority: reservation.recovery_authority,
+    scheduler_intent_id: reservation.scheduler_intent_id,
+    intent_id: reservation.intent_id,
+    intent_digest: reservation.intent_digest,
+    reservation_digest: reservation.reservation_digest,
+    body: reservation.body,
+    automatic: reservation.automatic,
+    consumed: reservation.consumed,
+    effect_attempt: attempt,
+    pre_scope_digest: reservation.pre_scope_digest,
+    post_scope_digest: reservation.pre_scope_digest,
+    non_replayable_effect_policy: "retry-zero-no-reclaim",
+  };
+  const actualReservationBinding = Object.fromEntries(
+    Object.keys(expectedReservationBinding).map((key) => [key, receipt[key]]),
+  );
+  if (
+    canonicalJson(actualReservationBinding) !==
+    canonicalJson(expectedReservationBinding)
+  ) {
+    throw new Error("request-comment binding receipt differs from its reserved effect");
+  }
+
+  const post = receipt.post_response;
+  assertObject(post, "request-comment receipt.post_response");
+  positiveDecimalString(post.id, "request-comment receipt.post_response.id");
+  boundedString(post.node_id, "request-comment receipt.post_response.node_id", 256);
+  boundedString(post.url, "request-comment receipt.post_response.url", 4096);
+  boundedString(post.html_url, "request-comment receipt.post_response.html_url", 4096);
+  assertObject(post.actor, "request-comment receipt.post_response.actor");
+  if (post.app !== null) assertObject(post.app, "request-comment receipt.post_response.app");
+  if (post.body !== reservation.body) {
+    throw new Error("request-comment binding receipt body differs from its reservation");
+  }
+  const createdAt = timestamp(
+    post.created_at,
+    "request-comment receipt.post_response.created_at",
+  );
+  const updatedAt = timestamp(
+    post.updated_at,
+    "request-comment receipt.post_response.updated_at",
+  );
+  const responseTime = timestamp(
+    post.server_time,
+    "request-comment receipt.post_response.server_time",
+  );
+  if (
+    Date.parse(createdAt) > Date.parse(updatedAt) ||
+    Date.parse(updatedAt) > Date.parse(responseTime)
+  ) {
+    throw new Error("request-comment binding receipt response times are not causal");
+  }
+  const refetch = normalizeRequestReceiptRefetch(receipt);
+  if (refetch.artifact_id !== post.id) {
+    throw new Error("request-comment refetch artifact differs from the POST identity");
+  }
+  if (Date.parse(refetch.response_server_time) < Date.parse(responseTime)) {
+    throw new Error("request-comment exact refetch predates its POST response");
+  }
+  assertObject(receipt.ledger_update, "request-comment receipt.ledger_update");
+  exactKeys(receipt.ledger_update, [
+    "previous_ledger_digest", "next_ledger", "next_ledger_digest",
+  ], "request-comment receipt.ledger_update");
+  digest(
+    receipt.ledger_update.previous_ledger_digest,
+    "request-comment receipt.ledger_update.previous_ledger_digest",
+  );
+  assertObject(
+    receipt.ledger_update.next_ledger,
+    "request-comment receipt.ledger_update.next_ledger",
+  );
+  digest(
+    receipt.ledger_update.next_ledger_digest,
+    "request-comment receipt.ledger_update.next_ledger_digest",
+  );
+  if (receipt.ledger_update.next_ledger_digest !== digestCanonical(
+    "codex-review-gate-v2-head-ledger",
+    receipt.ledger_update.next_ledger,
+  )) {
+    throw new Error("request-comment next ledger digest is invalid");
   }
 }
 
@@ -7794,35 +8612,66 @@ async function requestJson({
   path,
   body,
   expectedStatus,
+  responseBudget,
 }) {
-  const response = await fetchImpl(`${base}${path}`, {
-    method,
-    headers: {
-      accept: "application/vnd.github+json",
-      authorization: `Bearer ${authorization}`,
-      "x-github-api-version": "2022-11-28",
-      ...(body === null ? {} : { "content-type": "application/json" }),
-    },
-    ...(body === null ? {} : { body: JSON.stringify(body) }),
-  });
-  if (response?.status !== expectedStatus) {
-    throw new Error(`GitHub effect expected HTTP ${expectedStatus} and received ${response?.status}`);
-  }
-  const serverTime = githubServerTime(response.headers?.get?.("date"));
-  const rawBody = await response.text();
-  let data;
+  const label = "GitHub effect response";
+  const deadline = createGithubJsonRequestDeadline(label);
+  let response = null;
+  let bodyConsumed = false;
+  let completed = false;
   try {
-    data = JSON.parse(rawBody);
-  } catch (error) {
-    throw new Error("GitHub effect response is not exact JSON", { cause: error });
+    response = await deadline.wait(() => fetchImpl(
+      `${base}${path}`,
+      {
+        method,
+        signal: deadline.signal,
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${authorization}`,
+          "x-github-api-version": "2022-11-28",
+          ...(body === null ? {} : { "content-type": "application/json" }),
+        },
+        ...(body === null ? {} : { body: JSON.stringify(body) }),
+      },
+    ), cancelResponseBody);
+    if (response?.status !== expectedStatus) {
+      throw new Error(`GitHub effect expected HTTP ${expectedStatus} and received ${response?.status}`);
+    }
+    const serverTime = githubServerTime(response.headers?.get?.("date"));
+    const {
+      raw_body: rawBody,
+      raw_body_sha256: rawBodySha256,
+    } = await readBoundedUtf8Response(
+      response,
+      label,
+      responseBudget,
+      deadline,
+    );
+    bodyConsumed = true;
+    deadline.assertOpen();
+    let data;
+    try {
+      data = JSON.parse(rawBody);
+    } catch (error) {
+      throw new Error("GitHub effect response is not exact JSON", { cause: error });
+    }
+    assertObject(data, "GitHub effect response");
+    const capture = {
+      http_status: response.status,
+      server_time: serverTime,
+      raw_body: rawBody,
+      raw_body_sha256: rawBodySha256,
+      data,
+    };
+    deadline.assertOpen();
+    completed = true;
+    return capture;
+  } finally {
+    if (response !== null && !bodyConsumed) {
+      cancelResponseBodyBestEffort(response);
+    }
+    deadline.finish(completed);
   }
-  assertObject(data, "GitHub effect response");
-  return {
-    http_status: response.status,
-    server_time: serverTime,
-    raw_body: rawBody,
-    data,
-  };
 }
 
 async function requestJsonArray({
@@ -7832,30 +8681,331 @@ async function requestJsonArray({
   method,
   path,
   expectedStatus,
+  responseBudget,
 }) {
-  const response = await fetchImpl(`${base}${path}`, {
-    method,
-    headers: {
-      accept: "application/vnd.github+json",
-      authorization: `Bearer ${authorization}`,
-      "x-github-api-version": "2022-11-28",
-    },
-  });
-  if (response?.status !== expectedStatus) {
-    throw new Error(`GitHub ledger read expected HTTP ${expectedStatus} and received ${response?.status}`);
-  }
-  const serverTime = githubServerTime(response.headers?.get?.("date"));
-  const rawBody = await response.text();
-  let data;
+  const label = "GitHub ledger inventory";
+  const deadline = createGithubJsonRequestDeadline(label);
+  let response = null;
+  let bodyConsumed = false;
+  let completed = false;
   try {
-    data = JSON.parse(rawBody);
+    response = await deadline.wait(() => fetchImpl(
+      `${base}${path}`,
+      {
+        method,
+        signal: deadline.signal,
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${authorization}`,
+          "x-github-api-version": "2022-11-28",
+        },
+      },
+    ), cancelResponseBody);
+    if (response?.status !== expectedStatus) {
+      throw new Error(`GitHub ledger read expected HTTP ${expectedStatus} and received ${response?.status}`);
+    }
+    const serverTime = githubServerTime(response.headers?.get?.("date"));
+    const {
+      raw_body: rawBody,
+      raw_body_sha256: rawBodySha256,
+    } = await readBoundedUtf8Response(
+      response,
+      label,
+      responseBudget,
+      deadline,
+    );
+    bodyConsumed = true;
+    deadline.assertOpen();
+    let data;
+    try {
+      data = JSON.parse(rawBody);
+    } catch (error) {
+      throw new Error("GitHub ledger inventory is not exact JSON", { cause: error });
+    }
+    if (!Array.isArray(data)) {
+      throw new TypeError("GitHub ledger inventory response must be an array");
+    }
+    const capture = {
+      http_status: response.status,
+      server_time: serverTime,
+      raw_body: rawBody,
+      raw_body_sha256: rawBodySha256,
+      data,
+    };
+    deadline.assertOpen();
+    completed = true;
+    return capture;
+  } finally {
+    if (response !== null && !bodyConsumed) {
+      cancelResponseBodyBestEffort(response);
+    }
+    deadline.finish(completed);
+  }
+}
+
+async function readBoundedUtf8Response(
+  response,
+  label,
+  responseBudget,
+  deadline,
+) {
+  assertGithubJsonResponseBudget(responseBudget);
+  const contentLength = response?.headers?.get?.("content-length");
+  let declaredBytes = 0;
+  if (contentLength !== null && contentLength !== undefined) {
+    if (
+      typeof contentLength !== "string" ||
+      !/^(?:0|[1-9][0-9]*)$/u.test(contentLength)
+    ) {
+      throw new Error(`${label} has a malformed Content-Length`);
+    }
+    if (BigInt(contentLength) > BigInt(MAX_V2_GITHUB_JSON_RESPONSE_BYTES)) {
+      throw new Error(
+        `${label} exceeds the ${MAX_V2_GITHUB_JSON_RESPONSE_BYTES}-byte cap`,
+      );
+    }
+    declaredBytes = Number(contentLength);
+    if (
+      responseBudget.bytes + declaredBytes >
+      MAX_V2_GITHUB_JSON_OPERATION_BYTES
+    ) {
+      throw new Error(
+        `${label} exceeds the ${MAX_V2_GITHUB_JSON_OPERATION_BYTES}-byte aggregate budget`,
+      );
+    }
+  }
+  let reader = null;
+  const chunks = [];
+  let chunkCount = 0;
+  let totalBytes = 0;
+  let complete = false;
+  try {
+    reader = response?.body?.getReader?.();
+    if (reader === undefined || reader === null || typeof reader.read !== "function") {
+      throw new Error(`${label} body is not a readable byte stream`);
+    }
+    while (true) {
+      const result = await deadline.wait(() => reader.read());
+      const { done, value } = snapshotClosedByteStreamReadResult(
+        result,
+        () => new Error(`${label} byte stream returned a malformed read result`),
+      );
+      if (done) {
+        complete = true;
+        break;
+      }
+      chunkCount += 1;
+      if (chunkCount > MAX_V2_GITHUB_JSON_RESPONSE_CHUNKS) {
+        throw new Error(
+          `${label} exceeds the ${MAX_V2_GITHUB_JSON_RESPONSE_CHUNKS}-chunk cap`,
+        );
+      }
+      const view = inspectFixedUint8ArrayChunk(
+        value,
+        () => new Error(`${label} byte stream returned a non-byte chunk`),
+      );
+      if (view.byte_length > MAX_V2_GITHUB_JSON_RESPONSE_BYTES - totalBytes) {
+        throw new Error(
+          `${label} exceeds the ${MAX_V2_GITHUB_JSON_RESPONSE_BYTES}-byte cap`,
+        );
+      }
+      const nextTotalBytes = totalBytes + view.byte_length;
+      if (
+        responseBudget.bytes + Math.max(declaredBytes, nextTotalBytes) >
+        MAX_V2_GITHUB_JSON_OPERATION_BYTES
+      ) {
+        throw new Error(
+          `${label} exceeds the ${MAX_V2_GITHUB_JSON_OPERATION_BYTES}-byte aggregate budget`,
+        );
+      }
+      const chunk = snapshotFixedUint8ArrayChunk(
+        value,
+        view,
+        () => new Error(`${label} byte stream returned an unstable byte chunk`),
+      );
+      totalBytes += chunk.length;
+      chunks.push(chunk);
+    }
+  } finally {
+    if (reader !== null) {
+      cleanupReaderBestEffort(reader, !complete);
+    }
+  }
+  deadline.assertOpen();
+  responseBudget.bytes += Math.max(declaredBytes, totalBytes);
+  const rawBytes = Buffer.concat(chunks, totalBytes);
+  let rawBody;
+  try {
+    rawBody = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(rawBytes);
   } catch (error) {
-    throw new Error("GitHub ledger inventory is not exact JSON", { cause: error });
+    throw new Error(`${label} is not valid UTF-8`, { cause: error });
   }
-  if (!Array.isArray(data)) {
-    throw new TypeError("GitHub ledger inventory response must be an array");
+  const rawBodySha256 = rawDigest(rawBytes);
+  deadline.assertOpen();
+  return {
+    raw_body: rawBody,
+    raw_body_sha256: rawBodySha256,
+  };
+}
+
+function createGithubJsonResponseBudget() {
+  return { bytes: 0 };
+}
+
+function assertGithubJsonResponseBudget(value) {
+  if (
+    value === null || typeof value !== "object" ||
+    !Number.isSafeInteger(value.bytes) || value.bytes < 0 ||
+    value.bytes > MAX_V2_GITHUB_JSON_OPERATION_BYTES
+  ) {
+    throw new TypeError("GitHub JSON response budget is invalid");
   }
-  return { http_status: response.status, server_time: serverTime, raw_body: rawBody, data };
+}
+
+const GITHUB_JSON_DEADLINE_TERMINATED = Symbol("github-json-deadline-terminated");
+
+function createGithubJsonRequestDeadline(label) {
+  const controller = new AbortController();
+  const expiresAt = performance.now() + V2_GITHUB_JSON_REQUEST_TIMEOUT_MS;
+  const timeoutError = new Error(
+    `${label} exceeded its fixed ${V2_GITHUB_JSON_REQUEST_TIMEOUT_MS}ms request deadline`,
+  );
+  let expired = false;
+  let finished = false;
+  let adapterAbortScheduled = false;
+  let resolveTermination;
+  const termination = new Promise((resolvePromise) => {
+    resolveTermination = resolvePromise;
+  });
+  const expire = () => {
+    if (expired || finished) return;
+    expired = true;
+    resolveTermination(GITHUB_JSON_DEADLINE_TERMINATED);
+    if (!adapterAbortScheduled) {
+      adapterAbortScheduled = true;
+      startDeferredBestEffort(() => controller.abort(
+        new Error("GitHub JSON adapter cancelled after terminal deadline"),
+      ));
+    }
+  };
+  const timer = setTimeout(expire, V2_GITHUB_JSON_REQUEST_TIMEOUT_MS);
+  const deadline = {
+    signal: controller.signal,
+    termination,
+    expiredOrElapsed() {
+      if (!expired && githubJsonDeadlineExpired(expiresAt)) expire();
+      return expired;
+    },
+    assertOpen() {
+      if (deadline.expiredOrElapsed()) throw timeoutError;
+    },
+    wait(operationFactory, onLateValue = null) {
+      if (deadline.expiredOrElapsed()) {
+        return Promise.reject(timeoutError);
+      }
+      let operation;
+      try {
+        operation = operationFactory();
+      } catch (error) {
+        if (deadline.expiredOrElapsed()) {
+          return Promise.reject(timeoutError);
+        }
+        return Promise.reject(error);
+      }
+      return waitForGithubJsonDeadline(
+        operation,
+        deadline,
+        timeoutError,
+        onLateValue,
+      );
+    },
+    finish(requireOpen = false) {
+      try {
+        if (requireOpen) deadline.assertOpen();
+      } finally {
+        finished = true;
+        clearTimeout(timer);
+      }
+    },
+  };
+  return deadline;
+}
+
+async function waitForGithubJsonDeadline(
+  promise,
+  deadline,
+  timeoutError,
+  onLateValue,
+) {
+  const operation = Promise.resolve(promise).then(
+    (value) => ({ state: "fulfilled", value }),
+    (error) => ({ state: "rejected", error }),
+  );
+  if (deadline.expiredOrElapsed()) {
+    discardLateGithubJsonValue(operation, onLateValue);
+    throw timeoutError;
+  }
+  const outcome = await Promise.race([operation, deadline.termination]);
+  if (
+    outcome === GITHUB_JSON_DEADLINE_TERMINATED ||
+    deadline.expiredOrElapsed()
+  ) {
+    if (outcome === GITHUB_JSON_DEADLINE_TERMINATED) {
+      discardLateGithubJsonValue(operation, onLateValue);
+    } else if (outcome.state === "fulfilled" && onLateValue !== null) {
+      startDeferredBestEffort(onLateValue, outcome.value);
+    }
+    throw timeoutError;
+  }
+  if (outcome.state === "rejected") throw outcome.error;
+  return outcome.value;
+}
+
+function discardLateGithubJsonValue(operation, onLateValue) {
+  if (onLateValue === null) return;
+  operation.then((outcome) => {
+    if (outcome.state === "fulfilled") {
+      startDeferredBestEffort(onLateValue, outcome.value);
+    }
+  }, () => {});
+}
+
+function githubJsonDeadlineExpired(expiresAt) {
+  return performance.now() >= expiresAt;
+}
+
+function startDeferredBestEffort(action, value = undefined) {
+  if (typeof action !== "function") return;
+  try {
+    let invoked = false;
+    scheduleImmediateIntrinsic(() => {
+      if (invoked) return;
+      invoked = true;
+      try {
+        Promise.resolve(action(value)).catch(() => {});
+      } catch {
+        // Deferred cleanup cannot replace the authoritative transport result.
+      }
+    });
+  } catch {
+    // Cleanup scheduling is best-effort after the result has settled.
+  }
+}
+
+function cancelResponseBody(response) {
+  const body = response?.body;
+  const cancel = body?.cancel;
+  if (typeof cancel === "function") {
+    return cancel.call(body);
+  }
+  return undefined;
+}
+
+function cancelResponseBodyBestEffort(response) {
+  startDeferredBestEffort(cancelResponseBody, response);
 }
 
 async function findExactStatus({
@@ -7865,6 +9015,7 @@ async function findExactStatus({
   repoPath,
   shaValue,
   statusId,
+  responseBudget,
 }) {
   let found = null;
   let foundCapture = null;
@@ -7876,6 +9027,7 @@ async function findExactStatus({
       method: "GET",
       path: `${repoPath}/commits/${shaValue}/statuses?per_page=100&page=${page}`,
       expectedStatus: 200,
+      responseBudget,
     });
     for (const status of capture.data) {
       if (String(status.id) === String(statusId)) {
@@ -7899,7 +9051,7 @@ async function findExactStatus({
   return {
     status: found,
     server_time: foundCapture.server_time,
-    raw_body_sha256: rawDigest(foundCapture.raw_body),
+    raw_body_sha256: foundCapture.raw_body_sha256,
   };
 }
 
@@ -7910,6 +9062,7 @@ async function refetchExactProductionStatus({
   repoPath,
   write,
   status_id: statusId,
+  responseBudget,
 }) {
   const pages = [];
   let itemCount = 0;
@@ -7924,12 +9077,13 @@ async function refetchExactProductionStatus({
       path: `${repoPath}/commits/${write.target_sha}/statuses` +
         `?per_page=100&page=${page}`,
       expectedStatus: 200,
+      responseBudget,
     });
     pages.push({
       page,
       http_status: capture.http_status,
       server_time: capture.server_time,
-      raw_body_sha256: rawDigest(capture.raw_body),
+      raw_body_sha256: capture.raw_body_sha256,
       item_count: capture.data.length,
     });
     itemCount += capture.data.length;

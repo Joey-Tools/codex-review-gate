@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import { TextDecoder } from "node:util";
+import { performance } from "node:perf_hooks";
+import { setImmediate as scheduleImmediateBinding } from "node:timers";
+import { TextDecoder, types as utilTypes } from "node:util";
 
 import {
   V2_GIT_LEDGER_BOOTSTRAP_INPUT_SCHEMA,
@@ -90,8 +92,47 @@ const MAX_PAGES = 20;
 const MAX_ITEMS = 2_000;
 const MAX_REQUESTS = 64;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_RESPONSE_CHUNKS = 4_096;
 const MAX_TOTAL_RESPONSE_BYTES = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
+const REQUEST_DEADLINE_EXPIRED = Symbol("request-deadline-expired");
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const TYPED_ARRAY_BUFFER_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "buffer",
+).get;
+const TYPED_ARRAY_BYTE_OFFSET_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteOffset",
+).get;
+const TYPED_ARRAY_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteLength",
+).get;
+const ARRAY_BUFFER_DETACHED_GETTER = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "detached",
+)?.get ?? null;
+const ARRAY_BUFFER_RESIZABLE_GETTER = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "resizable",
+)?.get ?? null;
+const BUFFER_ALLOC_UNSAFE = Buffer.allocUnsafe;
+const IS_ARRAY_BUFFER = utilTypes.isArrayBuffer;
+const IS_UINT8_ARRAY = utilTypes.isUint8Array;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const OBJECT_HAS_OWN = Object.hasOwn;
+const REFLECT_APPLY = Reflect.apply;
+const REFLECT_OWN_KEYS = Reflect.ownKeys;
+const SAFE_SCHEDULE_IMMEDIATE = scheduleImmediateBinding;
+const SAFE_ABORT_CONTROLLER = AbortController;
+const ABORT_CONTROLLER_ABORT = AbortController.prototype.abort;
+const ABORT_CONTROLLER_SIGNAL_GETTER = Object.getOwnPropertyDescriptor(
+  AbortController.prototype,
+  "signal",
+).get;
+const SAFE_UINT8_ARRAY = Uint8Array;
+const UINT8_ARRAY_SET = Uint8Array.prototype.set;
 const HTTP_DATE =
   /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-3][0-9] (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{4} (?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9] GMT$/u;
 const JSON_CONTENT_TYPE =
@@ -1743,10 +1784,11 @@ class ReadOnlyGitHubClient {
     const items = [];
     const receipts = [];
     const identities = new Set();
+    let expectedLastPage = null;
     for (let page = 1; page <= MAX_PAGES; page += 1) {
-      const separator = path.includes("?") ? "&" : "?";
+      const pageUrl = paginationPageUrl(this.restBase, path, page);
       const capture = await this.get(
-        `${path}${separator}per_page=${PAGE_SIZE}&page=${page}`,
+        `${pageUrl.pathname}${pageUrl.search}`,
         { label: `${label} page ${page}`, queryAlreadyPresent: true },
       );
       if (!Array.isArray(capture.data)) {
@@ -1773,8 +1815,43 @@ class ReadOnlyGitHubClient {
           );
         }
       }
-      if (capture.data.length < PAGE_SIZE) {
+      const pagination = parsePaginationLink(capture.link, {
+        restBase: this.restBase,
+        path,
+        page,
+        label,
+      });
+      if (pagination.lastPage !== null) {
+        if (expectedLastPage !== null &&
+            pagination.lastPage !== expectedLastPage) {
+          throw preflightFailure(
+            "PAGINATION_INCOMPLETE",
+            `${label} changed its promised last page`,
+          );
+        }
+        expectedLastPage = pagination.lastPage;
+      }
+      if (expectedLastPage !== null) {
+        if (
+          page > expectedLastPage ||
+          (page < expectedLastPage && pagination.nextPage !== page + 1) ||
+          (page === expectedLastPage && pagination.nextPage !== null)
+        ) {
+          throw preflightFailure(
+            "PAGINATION_INCOMPLETE",
+            `${label} violated its promised last page`,
+          );
+        }
+      }
+      const { nextPage } = pagination;
+      if (nextPage === null) {
         return { items, receipts };
+      }
+      if (nextPage !== page + 1 || nextPage > MAX_PAGES) {
+        throw preflightFailure(
+          "PAGINATION_INCOMPLETE",
+          `${label} exceeds the ${MAX_PAGES}-page cap`,
+        );
       }
     }
     throw preflightFailure(
@@ -1834,29 +1911,29 @@ class ReadOnlyGitHubClient {
     }
     this.requestCount += 1;
     const url = new URL(`${this.restBase}${path}`);
-    const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(new Error(`${label} timed out`)),
-      REQUEST_TIMEOUT_MS,
-    );
-    let response;
+    const deadline = createRequestDeadline(label);
+    let response = null;
+    let bodyConsumed = false;
+    let completed = false;
+    let rawBytes;
     let rawBody;
     try {
-      response = await this.fetchImpl(url.href, {
+      response = await deadline.run(() => this.fetchImpl(url.href, {
         method: "GET",
         redirect: "error",
-        signal: controller.signal,
+        signal: deadline.signal,
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${this.authorization}`,
           "User-Agent": "codex-review-gate-v2-workflow-preflight",
           "X-GitHub-Api-Version": "2022-11-28",
         },
-      });
+      }), cancelResponseBody);
+      const status = response?.status;
       if (
         response === null || typeof response !== "object" ||
-        !Number.isInteger(response.status) ||
-        typeof response.text !== "function" ||
+        !Number.isInteger(status) ||
+        typeof response.body?.getReader !== "function" ||
         typeof response.headers?.get !== "function"
       ) {
         throw preflightFailure(
@@ -1868,6 +1945,7 @@ class ReadOnlyGitHubClient {
       if (declaredLength !== null && declaredLength > MAX_RESPONSE_BYTES) {
         throw preflightFailure("HTTP_UNREADABLE", `${label} response is too large`);
       }
+      this.assertTotalBytesAvailable(declaredLength, label);
       const contentType = response.headers.get("content-type");
       if (typeof contentType !== "string" ||
           !JSON_CONTENT_TYPE.test(contentType.trim())) {
@@ -1876,7 +1954,94 @@ class ReadOnlyGitHubClient {
           `${label} response has a noncanonical JSON Content-Type`,
         );
       }
-      rawBody = await response.text();
+      const link = response.headers.get("link");
+      rawBytes = await readBoundedResponseBytes(
+        response,
+        label,
+        deadline,
+        {
+          assertAvailable: (byteLength) =>
+            this.assertTotalBytesAvailable(byteLength, label),
+          consume: (byteLength) => this.consumeTotalBytes(byteLength, label),
+        },
+      );
+      bodyConsumed = true;
+      try {
+        rawBody = new TextDecoder("utf-8", {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(rawBytes);
+      } catch (error) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} response is not valid UTF-8`,
+          null,
+          error,
+        );
+      }
+      if (!Buffer.from(rawBody, "utf8").equals(rawBytes)) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} response does not have one exact UTF-8 representation`,
+        );
+      }
+      if (rawBytes.length === 0 || rawBytes.length > MAX_RESPONSE_BYTES) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} response violates the bounded non-empty body policy`,
+        );
+      }
+      const serverTime = normalizeServerDate(
+        response.headers.get("date"),
+        label,
+      );
+      if (this.lastServerTime !== null &&
+          Date.parse(serverTime) < Date.parse(this.lastServerTime)) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} server Date regressed during preflight`,
+        );
+      }
+      const receipt = {
+        method: "GET",
+        path: `${url.pathname}${url.search}`,
+        status,
+        server_time: serverTime,
+        raw_body_sha256: rawDigest(rawBytes),
+      };
+      const allowed = status === 200 ||
+        (allowNotFound && status === 404);
+      if (!allowed) {
+        throw preflightFailure(
+          status === 404 ? "NOT_FOUND" : "HTTP_UNREADABLE",
+          `${label} returned unexpected HTTP ${status}`,
+          { status },
+        );
+      }
+      let data;
+      try {
+        data = JSON.parse(rawBody);
+      } catch (error) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} response is not JSON`,
+          null,
+          error,
+        );
+      }
+      deadline.assertOpen();
+      this.lastServerTime = serverTime;
+      this.endpointReceipts.push(receipt);
+      const capture = {
+        data,
+        status,
+        raw_body: rawBody,
+        receipt,
+        link,
+      };
+      deadline.assertOpen();
+      completed = true;
+      return capture;
     } catch (error) {
       if (error instanceof V2WorkflowPreflightError) throw error;
       throw preflightFailure(
@@ -1886,60 +2051,35 @@ class ReadOnlyGitHubClient {
         error,
       );
     } finally {
-      clearTimeout(timer);
+      if (response !== null && !bodyConsumed) {
+        cancelResponseBodyBestEffort(response);
+      }
+      try {
+        deadline.finish(completed);
+      } catch (error) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} request failed`,
+          null,
+          error,
+        );
+      }
     }
-    const bytes = Buffer.from(rawBody, "utf8");
-    if (bytes.length === 0 || bytes.length > MAX_RESPONSE_BYTES ||
-        this.totalBytes + bytes.length > MAX_TOTAL_RESPONSE_BYTES) {
+  }
+
+  assertTotalBytesAvailable(byteLength, label) {
+    if (byteLength !== null &&
+        byteLength > MAX_TOTAL_RESPONSE_BYTES - this.totalBytes) {
       throw preflightFailure(
         "HTTP_UNREADABLE",
         `${label} response violates the bounded non-empty body policy`,
       );
     }
-    this.totalBytes += bytes.length;
-    const serverTime = normalizeServerDate(response.headers.get("date"), label);
-    if (this.lastServerTime !== null &&
-        Date.parse(serverTime) < Date.parse(this.lastServerTime)) {
-      throw preflightFailure(
-        "HTTP_UNREADABLE",
-        `${label} server Date regressed during preflight`,
-      );
-    }
-    this.lastServerTime = serverTime;
-    const receipt = {
-      method: "GET",
-      path: `${url.pathname}${url.search}`,
-      status: response.status,
-      server_time: serverTime,
-      raw_body_sha256: rawDigest(bytes),
-    };
-    this.endpointReceipts.push(receipt);
-    const allowed = response.status === 200 ||
-      (allowNotFound && response.status === 404);
-    if (!allowed) {
-      throw preflightFailure(
-        response.status === 404 ? "NOT_FOUND" : "HTTP_UNREADABLE",
-        `${label} returned unexpected HTTP ${response.status}`,
-        { status: response.status },
-      );
-    }
-    let data;
-    try {
-      data = JSON.parse(rawBody);
-    } catch (error) {
-      throw preflightFailure(
-        "HTTP_UNREADABLE",
-        `${label} response is not JSON`,
-        null,
-        error,
-      );
-    }
-    return {
-      data,
-      status: response.status,
-      raw_body: rawBody,
-      receipt,
-    };
+  }
+
+  consumeTotalBytes(byteLength, label) {
+    this.assertTotalBytesAvailable(byteLength, label);
+    this.totalBytes += byteLength;
   }
 }
 
@@ -2486,6 +2626,112 @@ function normalizeServerDate(value, label) {
   return new Date(milliseconds).toISOString();
 }
 
+function paginationPageUrl(restBase, path, page) {
+  const url = new URL(`${restBase}${path}`);
+  url.searchParams.set("per_page", String(PAGE_SIZE));
+  url.searchParams.set("page", String(page));
+  return url;
+}
+
+function parsePaginationLink(value, { restBase, path, page, label }) {
+  if (value === null || value === "") {
+    return { nextPage: null, lastPage: null };
+  }
+  if (typeof value !== "string" || value.length > 8_192) {
+    throw preflightFailure(
+      "PAGINATION_INCOMPLETE",
+      `${label} returned an invalid Link header`,
+    );
+  }
+  const relations = new Map();
+  const entries = value.split(",");
+  if (entries.length > 4) {
+    throw preflightFailure(
+      "PAGINATION_INCOMPLETE",
+      `${label} returned an ambiguous Link header`,
+    );
+  }
+  for (const entry of entries) {
+    const match = entry.trim().match(
+      /^<([^<>\u0000-\u0020\u007f]+)>; rel="(next|prev|first|last)"$/u,
+    );
+    if (match === null || relations.has(match[2])) {
+      throw preflightFailure(
+        "PAGINATION_INCOMPLETE",
+        `${label} returned a malformed or duplicate Link relation`,
+      );
+    }
+    const relation = match[2];
+    let target;
+    try {
+      target = new URL(match[1]);
+    } catch (error) {
+      throw preflightFailure(
+        "PAGINATION_INCOMPLETE",
+        `${label} returned an invalid Link target`,
+        null,
+        error,
+      );
+    }
+    const pageValues = target.searchParams.getAll("page");
+    if (pageValues.length !== 1 || !/^[1-9][0-9]*$/u.test(pageValues[0])) {
+      throw preflightFailure(
+        "PAGINATION_INCOMPLETE",
+        `${label} Link relation omitted one canonical page`,
+      );
+    }
+    const targetPage = Number(pageValues[0]);
+    if (!Number.isSafeInteger(targetPage) || targetPage > MAX_PAGES) {
+      throw preflightFailure(
+        "PAGINATION_INCOMPLETE",
+        `${label} exceeds the ${MAX_PAGES}-page cap`,
+      );
+    }
+    const expected = paginationPageUrl(restBase, path, targetPage);
+    if (
+      target.origin !== expected.origin ||
+      target.pathname !== expected.pathname ||
+      target.username !== "" || target.password !== "" || target.hash !== "" ||
+      canonicalJson(canonicalPaginationSearch(target.searchParams)) !==
+        canonicalJson(canonicalPaginationSearch(expected.searchParams))
+    ) {
+      throw preflightFailure(
+        "PAGINATION_INCOMPLETE",
+        `${label} Link relation left the canonical pagination scope`,
+      );
+    }
+    if (
+      (relation === "next" && targetPage !== page + 1) ||
+      (relation === "prev" && (page === 1 || targetPage !== page - 1)) ||
+      (relation === "first" && targetPage !== 1) ||
+      (relation === "last" && targetPage < page)
+    ) {
+      throw preflightFailure(
+        "PAGINATION_INCOMPLETE",
+        `${label} Link relation targeted the wrong page`,
+      );
+    }
+    relations.set(relation, targetPage);
+  }
+  const nextPage = relations.get("next") ?? null;
+  const lastPage = relations.get("last") ?? null;
+  if (
+    (nextPage === null && lastPage !== null && lastPage > page) ||
+    (nextPage !== null && lastPage !== null && lastPage < nextPage)
+  ) {
+    throw preflightFailure(
+      "PAGINATION_INCOMPLETE",
+      `${label} Link relations disagree about later pages`,
+    );
+  }
+  return { nextPage, lastPage };
+}
+
+function canonicalPaginationSearch(searchParams) {
+  return [...searchParams.entries()].sort((left, right) =>
+    left[0].localeCompare(right[0]) || left[1].localeCompare(right[1]));
+}
+
 function parseContentLength(value) {
   if (value === null) return null;
   if (!/^(?:0|[1-9][0-9]*)$/u.test(value)) {
@@ -2496,6 +2742,355 @@ function parseContentLength(value) {
     throw preflightFailure("HTTP_UNREADABLE", "response Content-Length is too large");
   }
   return number;
+}
+
+function snapshotResponseReadResult(value, label) {
+  if (value === null || typeof value !== "object") {
+    throw preflightFailure(
+      "HTTP_UNREADABLE",
+      `${label} response body returned an invalid read result`,
+    );
+  }
+  let keys;
+  let doneDescriptor;
+  let valueDescriptor;
+  try {
+    keys = REFLECT_OWN_KEYS(value);
+    doneDescriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, "done");
+    valueDescriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, "value");
+  } catch (error) {
+    throw preflightFailure(
+      "HTTP_UNREADABLE",
+      `${label} response body returned an unreadable read result`,
+      null,
+      error,
+    );
+  }
+  if (
+    keys.length !== 2 || !keys.includes("done") || !keys.includes("value") ||
+    !isOwnDataDescriptor(doneDescriptor) ||
+    !isOwnDataDescriptor(valueDescriptor) ||
+    typeof doneDescriptor.value !== "boolean"
+  ) {
+    throw preflightFailure(
+      "HTTP_UNREADABLE",
+      `${label} response body returned an invalid read result`,
+    );
+  }
+  if (doneDescriptor.value) {
+    if (valueDescriptor.value !== undefined) {
+      throw preflightFailure(
+        "HTTP_UNREADABLE",
+        `${label} response body ended with an unexpected fragment`,
+      );
+    }
+    return { done: true, chunk: null };
+  }
+  return {
+    done: false,
+    chunk: inspectResponseByteChunk(valueDescriptor.value, label),
+  };
+}
+
+function isOwnDataDescriptor(value) {
+  return value !== undefined &&
+    REFLECT_APPLY(OBJECT_HAS_OWN, Object, [value, "value"]) &&
+    !REFLECT_APPLY(OBJECT_HAS_OWN, Object, [value, "get"]) &&
+    !REFLECT_APPLY(OBJECT_HAS_OWN, Object, [value, "set"]);
+}
+
+function inspectResponseByteChunk(value, label) {
+  let isBytes;
+  let backing;
+  let isOrdinaryArrayBuffer;
+  let detached;
+  let resizable;
+  let byteOffset;
+  let byteLength;
+  try {
+    isBytes = REFLECT_APPLY(IS_UINT8_ARRAY, utilTypes, [value]);
+    if (isBytes) {
+      backing = REFLECT_APPLY(TYPED_ARRAY_BUFFER_GETTER, value, []);
+      isOrdinaryArrayBuffer = REFLECT_APPLY(
+        IS_ARRAY_BUFFER,
+        utilTypes,
+        [backing],
+      );
+      detached = ARRAY_BUFFER_DETACHED_GETTER === null
+        ? false
+        : REFLECT_APPLY(ARRAY_BUFFER_DETACHED_GETTER, backing, []);
+      resizable = ARRAY_BUFFER_RESIZABLE_GETTER === null
+        ? false
+        : REFLECT_APPLY(ARRAY_BUFFER_RESIZABLE_GETTER, backing, []);
+      byteOffset = REFLECT_APPLY(TYPED_ARRAY_BYTE_OFFSET_GETTER, value, []);
+      byteLength = REFLECT_APPLY(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []);
+    }
+  } catch (error) {
+    throw preflightFailure(
+      "HTTP_UNREADABLE",
+      `${label} response body returned an unreadable byte chunk`,
+      null,
+      error,
+    );
+  }
+  if (!isBytes || !isOrdinaryArrayBuffer || detached || resizable) {
+    throw preflightFailure(
+      "HTTP_UNREADABLE",
+      `${label} response body returned a non-byte chunk`,
+    );
+  }
+  return { backing, byteOffset, byteLength };
+}
+
+function copyResponseByteChunk(chunk, label) {
+  try {
+    const source = new SAFE_UINT8_ARRAY(
+      chunk.backing,
+      chunk.byteOffset,
+      chunk.byteLength,
+    );
+    const copy = BUFFER_ALLOC_UNSAFE(chunk.byteLength);
+    REFLECT_APPLY(UINT8_ARRAY_SET, copy, [source, 0]);
+    return copy;
+  } catch (error) {
+    throw preflightFailure(
+      "HTTP_UNREADABLE",
+      `${label} response body byte chunk could not be copied`,
+      null,
+      error,
+    );
+  }
+}
+
+async function readBoundedResponseBytes(
+  response,
+  label,
+  deadline,
+  totalBytesBudget,
+) {
+  let reader = null;
+  const chunks = [];
+  let chunkCount = 0;
+  let totalBytes = 0;
+  let complete = false;
+  try {
+    reader = response.body.getReader();
+    if (reader === null || typeof reader !== "object" ||
+        typeof reader.read !== "function") {
+      throw preflightFailure(
+        "HTTP_UNREADABLE",
+        `${label} response body is not a readable byte stream`,
+      );
+    }
+    while (true) {
+      const result = snapshotResponseReadResult(
+        await deadline.run(() => reader.read()),
+        label,
+      );
+      deadline.assertOpen();
+      if (result.done) {
+        complete = true;
+        break;
+      }
+      chunkCount += 1;
+      if (chunkCount > MAX_RESPONSE_CHUNKS) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} response exceeds the ${MAX_RESPONSE_CHUNKS}-chunk cap`,
+        );
+      }
+      if (result.chunk.byteLength > MAX_RESPONSE_BYTES - totalBytes) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} response is too large`,
+        );
+      }
+      totalBytesBudget.assertAvailable(result.chunk.byteLength);
+      const chunk = copyResponseByteChunk(result.chunk, label);
+      deadline.assertOpen();
+      if (chunk.length > MAX_RESPONSE_BYTES - totalBytes) {
+        throw preflightFailure(
+          "HTTP_UNREADABLE",
+          `${label} response is too large`,
+        );
+      }
+      totalBytesBudget.consume(chunk.length);
+      totalBytes += chunk.length;
+      chunks.push(chunk);
+    }
+  } finally {
+    if (!complete && reader !== null && typeof reader === "object") {
+      cancelReaderBestEffort(reader);
+    }
+    if (reader !== null && typeof reader === "object") {
+      releaseReaderLockBestEffort(reader);
+    }
+  }
+  return Buffer.concat(chunks, totalBytes);
+}
+
+function createRequestDeadline(label) {
+  const controller = new SAFE_ABORT_CONTROLLER();
+  const signal = REFLECT_APPLY(ABORT_CONTROLLER_SIGNAL_GETTER, controller, []);
+  const timeoutError = new Error(
+    `${label} exceeded its fixed ${REQUEST_TIMEOUT_MS}ms request deadline`,
+  );
+  const expiresAt = performance.now() + REQUEST_TIMEOUT_MS;
+  let expired = false;
+  let abortStarted = false;
+  let resolveExpiration;
+  const expiration = new Promise((resolve) => {
+    resolveExpiration = resolve;
+  });
+  const abort = () => {
+    if (abortStarted) return;
+    abortStarted = true;
+    // Native abort listeners run after the authoritative rejection settles.
+    // They must be non-throwing; Node reports listener errors process-wide.
+    startBestEffort(() => REFLECT_APPLY(
+      ABORT_CONTROLLER_ABORT,
+      controller,
+      [new Error(`${label} request cleanup after deadline`)],
+    ));
+  };
+  const expire = () => {
+    if (expired) return;
+    expired = true;
+    resolveExpiration(REQUEST_DEADLINE_EXPIRED);
+    abort();
+  };
+  const expiredOrElapsed = () => {
+    if (!expired && performance.now() >= expiresAt) expire();
+    return expired;
+  };
+  const assertOpen = () => {
+    if (expiredOrElapsed()) {
+      expire();
+      throw timeoutError;
+    }
+  };
+  const timer = setTimeout(expire, REQUEST_TIMEOUT_MS);
+  return {
+    signal,
+    assertOpen,
+    run(invoke, onLateValue = null) {
+      assertOpen();
+      const operation = Promise.resolve().then(() => {
+        assertOpen();
+        return invoke();
+      });
+      return waitForRequestDeadline(
+        operation,
+        expiration,
+        expiredOrElapsed,
+        timeoutError,
+        onLateValue,
+      );
+    },
+    finish(completed = false) {
+      try {
+        if (completed) assertOpen();
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
+}
+
+function waitForRequestDeadline(
+  operation,
+  expiration,
+  expiredOrElapsed,
+  timeoutError,
+  onLateValue,
+) {
+  const tracked = Promise.resolve(operation).then(
+    (value) => ({ state: "fulfilled", value }),
+    (error) => ({ state: "rejected", error }),
+  );
+  if (expiredOrElapsed()) {
+    handleTimedOutRequestOperation(
+      tracked,
+      REQUEST_DEADLINE_EXPIRED,
+      onLateValue,
+    );
+    return Promise.reject(timeoutError);
+  }
+  return Promise.race([tracked, expiration]).then((outcome) => {
+    if (outcome === REQUEST_DEADLINE_EXPIRED || expiredOrElapsed()) {
+      handleTimedOutRequestOperation(tracked, outcome, onLateValue);
+      throw timeoutError;
+    }
+    if (outcome.state === "rejected") throw outcome.error;
+    return outcome.value;
+  });
+}
+
+function handleTimedOutRequestOperation(tracked, outcome, onLateValue) {
+  if (outcome?.state === "fulfilled") {
+    startBestEffort(onLateValue, outcome.value);
+    return;
+  }
+  if (outcome === REQUEST_DEADLINE_EXPIRED &&
+      typeof onLateValue === "function") {
+    tracked.then((late) => {
+      if (late.state === "fulfilled") {
+        startBestEffort(onLateValue, late.value);
+      }
+    });
+  }
+}
+
+function startBestEffort(action, value = undefined) {
+  if (typeof action !== "function") return;
+  let invoked = false;
+  const invokeOnce = () => {
+    if (invoked) return;
+    invoked = true;
+    try {
+      Promise.resolve(action(value)).catch(() => {});
+    } catch {
+      // Direct cleanup invocation failures cannot affect the primary result.
+    }
+  };
+  try {
+    SAFE_SCHEDULE_IMMEDIATE(invokeOnce);
+  } catch {
+    // Cleanup dispatch is best-effort and cannot replace the primary result.
+  }
+}
+
+function cancelReaderBestEffort(reader) {
+  startBestEffort(() => {
+    const cancel = reader.cancel;
+    if (typeof cancel === "function") {
+      return REFLECT_APPLY(cancel, reader, []);
+    }
+    return undefined;
+  });
+}
+
+function releaseReaderLockBestEffort(reader) {
+  startBestEffort(() => {
+    const releaseLock = reader.releaseLock;
+    if (typeof releaseLock === "function") {
+      return REFLECT_APPLY(releaseLock, reader, []);
+    }
+    return undefined;
+  });
+}
+
+function cancelResponseBodyBestEffort(response) {
+  startBestEffort(cancelResponseBody, response);
+}
+
+function cancelResponseBody(response) {
+  const body = response?.body;
+  const cancel = body?.cancel;
+  if (typeof cancel === "function") {
+    return REFLECT_APPLY(cancel, body, []);
+  }
+  return undefined;
 }
 
 function timestamp(value, label) {

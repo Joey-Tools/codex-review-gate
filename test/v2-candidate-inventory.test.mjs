@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
+import { setImmediate as scheduleImmediate } from "node:timers";
 
 import {
   MAX_V2_CANDIDATES_PER_SHARD,
@@ -11,6 +14,9 @@ import {
   validateV2CandidateCycleReceipt,
   validateV2CandidateInventory,
 } from "../packages/action/src/v2/candidate-inventory.mjs";
+
+const requireBuiltin = createRequire(import.meta.url);
+const mutableTimers = requireBuiltin("node:timers");
 
 const API = "https://api.github.com";
 const GRAPHQL_URL = "https://api.github.com/graphql";
@@ -1549,6 +1555,7 @@ test("current-open deadlines ignore poisoned Array iterators for fetch and body 
     );
     assert.equal(readResult.error?.code, "CANDIDATE_HTTP_TIMEOUT");
     assert.equal(readSettled, false, "body deadline settles before reader");
+    await nextCleanupTurn();
     assert.equal(cancelled, true);
   } finally {
     clearTimeout(readFallback);
@@ -1587,54 +1594,75 @@ test("current-open transport keeps typed errors private from abort and cancel ad
     timeoutError instanceof candidateInventory.V2CandidateInventoryError,
     true,
   );
-  assert.equal(typeof abortReason, "string");
+  await nextCleanupTurn();
+  assert.equal(abortReason instanceof Error, true);
+  assert.notStrictEqual(abortReason, timeoutError);
+  assert.equal(timeoutError?.code, "CANDIDATE_HTTP_TIMEOUT");
+  assert.equal(timeoutError?.name, "V2CandidateInventoryError");
+  assert.equal(
+    timeoutError instanceof candidateInventory.V2CandidateInventoryError,
+    true,
+  );
 
   let cancelReason = null;
+  let oversizedAbortReason = null;
   let delivered = false;
   const oversizedFactory = createCurrentOpen(candidateInventory, {
-    fetch: async () => ({
-      status: 200,
-      headers: {
-        get(name) {
-          if (name.toLowerCase() === "date") {
-            return "Thu, 13 Aug 2026 12:00:00 GMT";
+    fetch: async (_input, init) => {
+      init.signal.addEventListener("abort", () => {
+        oversizedAbortReason = init.signal.reason;
+        if (oversizedAbortReason !== null &&
+            typeof oversizedAbortReason === "object") {
+          oversizedAbortReason.code = "FORGED_OVERSIZED_ABORT";
+          oversizedAbortReason.name = "ForgedOversizedAbort";
+          oversizedAbortReason.details = { forged: true };
+          oversizedAbortReason.cause = new Error("forged oversized cause");
+        }
+      }, { once: true });
+      return {
+        status: 200,
+        headers: {
+          get(name) {
+            if (name.toLowerCase() === "date") {
+              return "Thu, 13 Aug 2026 12:00:00 GMT";
+            }
+            if (name.toLowerCase() === "x-github-request-id") {
+              return "TEST:PRIVATE-CANCEL-REASON";
+            }
+            return null;
           }
-          if (name.toLowerCase() === "x-github-request-id") {
-            return "TEST:PRIVATE-CANCEL-REASON";
-          }
-          return null;
         },
-      },
-      body: {
-        getReader() {
-          return {
-            read() {
-              if (delivered) {
-                return Promise.resolve({ done: true, value: undefined });
-              }
-              delivered = true;
-              return Promise.resolve({
-                done: false,
-                value: new Uint8Array(
-                  candidateInventory
-                    .MAX_V2_CURRENT_OPEN_CANDIDATE_RESPONSE_BYTES + 1,
-                ),
-              });
-            },
-            cancel(reason) {
-              cancelReason = reason;
-              if (reason !== null && typeof reason === "object") {
-                reason.code = "FORGED_CANCEL";
-                reason.name = "ForgedCancel";
-                Object.setPrototypeOf(reason, Error.prototype);
-              }
-              return Promise.resolve();
-            },
-            releaseLock() {},
-          };
+        body: {
+          getReader() {
+            return {
+              read() {
+                if (delivered) {
+                  return Promise.resolve({ done: true, value: undefined });
+                }
+                delivered = true;
+                return Promise.resolve({
+                  done: false,
+                  value: new Uint8Array(
+                    candidateInventory
+                      .MAX_V2_CURRENT_OPEN_CANDIDATE_RESPONSE_BYTES + 1,
+                  ),
+                });
+              },
+              cancel(reason) {
+                cancelReason = reason;
+                if (reason !== null && typeof reason === "object") {
+                  reason.code = "FORGED_CANCEL";
+                  reason.name = "ForgedCancel";
+                  Object.setPrototypeOf(reason, Error.prototype);
+                }
+                return Promise.resolve();
+              },
+              releaseLock() {},
+            };
+          },
         },
-      },
-    }),
+      };
+    },
   });
   let oversizedError = null;
   try {
@@ -1648,7 +1676,193 @@ test("current-open transport keeps typed errors private from abort and cancel ad
     oversizedError instanceof candidateInventory.V2CandidateInventoryError,
     true,
   );
+  await nextCleanupTurn();
   assert.equal(typeof cancelReason, "string");
+  assert.notStrictEqual(oversizedAbortReason, oversizedError);
+  assert.equal(oversizedError.code, "CANDIDATE_RESPONSE_TOO_LARGE");
+  assert.equal(oversizedError.name, "V2CandidateInventoryError");
+  assert.equal(oversizedError.details, null);
+  assert.equal(oversizedError.cause, undefined);
+  assert.equal(
+    Object.getPrototypeOf(oversizedError),
+    candidateInventory.V2CandidateInventoryError.prototype,
+  );
+});
+
+test("candidate timeout settles before blocking abort and throwing reader cleanup", {
+  timeout: 2_000,
+}, async () => {
+  const candidateInventory = await import(
+    "../packages/action/src/v2/candidate-inventory.mjs"
+  );
+  const events = [];
+  let signalReason = null;
+  let cancelReason = null;
+  let poisonedSchedulerCalls = 0;
+  const originalSetImmediate = mutableTimers.setImmediate;
+  const factory = createCurrentOpen(candidateInventory, {
+    fetch: async (_input, init) => {
+      mutableTimers.setImmediate = (callback, ...args) => {
+        poisonedSchedulerCalls += 1;
+        Reflect.apply(callback, undefined, args);
+        Reflect.apply(callback, undefined, args);
+        return {};
+      };
+      syncBuiltinESMExports();
+      init.signal.addEventListener("abort", () => {
+        signalReason = init.signal.reason;
+        events.push("abort-start");
+        blockEventLoop(15);
+        if (signalReason !== null && typeof signalReason === "object") {
+          signalReason.code = "FORGED_CLEANUP";
+          signalReason.name = "ForgedCleanup";
+          signalReason.details = { forged: true };
+          signalReason.cause = new Error("forged cleanup cause");
+          Object.setPrototypeOf(signalReason, null);
+        }
+        events.push("abort-end");
+      }, { once: true });
+      return {
+        status: 200,
+        headers: {
+          get(name) {
+            if (name.toLowerCase() === "date") {
+              return "Thu, 13 Aug 2026 12:00:00 GMT";
+            }
+            if (name.toLowerCase() === "x-github-request-id") {
+              return "TEST:DEFERRED-HOSTILE-CLEANUP";
+            }
+            return null;
+          },
+        },
+        body: {
+          getReader() {
+            return {
+              read() {
+                return new Promise(() => {});
+              },
+              cancel(reason) {
+                cancelReason = reason;
+                events.push("cancel-start");
+                blockEventLoop(15);
+                events.push("cancel-end");
+                throw new Error("hostile cancel failure");
+              },
+              releaseLock() {
+                events.push("release-start");
+                blockEventLoop(15);
+                events.push("release-end");
+                throw new Error("hostile release failure");
+              },
+            };
+          },
+        },
+      };
+    },
+  }, { timeoutMs: 5 });
+
+  let caught = null;
+  try {
+    try {
+      await factory.scan();
+    } catch (error) {
+      caught = error;
+      events.push("caller-catch");
+    }
+  } finally {
+    mutableTimers.setImmediate = originalSetImmediate;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(caught?.code, "CANDIDATE_HTTP_TIMEOUT");
+  assert.equal(caught?.name, "V2CandidateInventoryError");
+  assert.equal(caught?.details, null);
+  assert.equal(caught?.cause, undefined);
+  assert.equal(
+    Object.getPrototypeOf(caught),
+    candidateInventory.V2CandidateInventoryError.prototype,
+  );
+  assert.deepEqual(events, ["caller-catch"]);
+  assert.equal(poisonedSchedulerCalls, 0);
+
+  await nextCleanupTurn();
+
+  assert.deepEqual(events, [
+    "caller-catch",
+    "abort-start",
+    "abort-end",
+    "cancel-start",
+    "cancel-end",
+    "release-start",
+    "release-end",
+  ]);
+  assert.notStrictEqual(signalReason, caught);
+  assert.equal(typeof cancelReason, "string");
+  assert.equal(caught.code, "CANDIDATE_HTTP_TIMEOUT");
+  assert.equal(caught.name, "V2CandidateInventoryError");
+  assert.equal(caught.details, null);
+  assert.equal(caught.cause, undefined);
+  assert.equal(
+    Object.getPrototypeOf(caught),
+    candidateInventory.V2CandidateInventoryError.prototype,
+  );
+});
+
+test("state=all timeout also settles before its fresh abort cleanup reason", {
+  timeout: 2_000,
+}, async () => {
+  const events = [];
+  let signalReason = null;
+  const transport = createV2GitHubCandidateInventory({
+    fetch: (_input, init) => new Promise(() => {
+      init.signal.addEventListener("abort", () => {
+        signalReason = init.signal.reason;
+        events.push("abort-start");
+        blockEventLoop(15);
+        signalReason.code = "FORGED_STATE_ALL_CLEANUP";
+        signalReason.name = "ForgedStateAllCleanup";
+        signalReason.details = { forged: true };
+        signalReason.cause = new Error("forged state=all cleanup cause");
+        Object.setPrototypeOf(signalReason, null);
+        events.push("abort-end");
+      }, { once: true });
+    }),
+    token: "synthetic-candidate-inventory-token",
+    repository: REPOSITORY,
+    restBaseUrl: API,
+    timeoutMs: 5,
+  });
+
+  let caught = null;
+  try {
+    await transport.scan();
+  } catch (error) {
+    caught = error;
+    events.push("caller-catch");
+  }
+
+  assert.equal(caught?.code, "CANDIDATE_HTTP_TIMEOUT");
+  assert.equal(caught?.name, "V2CandidateInventoryError");
+  assert.equal(caught?.details, null);
+  assert.equal(caught?.cause, undefined);
+  assert.equal(
+    Object.getPrototypeOf(caught),
+    V2CandidateInventoryError.prototype,
+  );
+  assert.deepEqual(events, ["caller-catch"]);
+
+  await nextCleanupTurn();
+
+  assert.deepEqual(events, ["caller-catch", "abort-start", "abort-end"]);
+  assert.notStrictEqual(signalReason, caught);
+  assert.equal(caught.code, "CANDIDATE_HTTP_TIMEOUT");
+  assert.equal(caught.name, "V2CandidateInventoryError");
+  assert.equal(caught.details, null);
+  assert.equal(caught.cause, undefined);
+  assert.equal(
+    Object.getPrototypeOf(caught),
+    V2CandidateInventoryError.prototype,
+  );
 });
 
 test("current-open rejects adapter-forged typed errors", async () => {
@@ -2547,7 +2761,7 @@ test("current-open GraphQL bounds chunked bodies and keeps one deadline through 
       }).scan(),
       (error) => error.code === "CANDIDATE_RESPONSE_TOO_LARGE",
     );
-    await Promise.resolve();
+    await nextCleanupTurn();
     assert.ok(pulls <= 4, "streaming stops at the first cap-crossing chunk");
     assert.equal(cancelled, true);
   }
@@ -2607,6 +2821,7 @@ test("current-open rejects empty and over-fragmented response bodies", async () 
       }).scan(),
       (error) => error.code === scenario.code,
     );
+    await nextCleanupTurn();
     assert.ok(tracker.pulls <= scenario.maxPulls);
     assert.equal(tracker.cancellations, 1);
   }
@@ -2661,8 +2876,126 @@ test("current-open monotonic deadline survives immediately-ready body chunks", a
     }).scan(),
     (error) => error.code === "CANDIDATE_HTTP_TIMEOUT",
   );
+  await nextCleanupTurn();
   assert.ok(tracker.pulls <= 128, "deadline checking bounds ready microtasks");
   assert.equal(tracker.cancellations, 1);
+});
+
+test("candidate request tails cannot outlive the monotonic deadline", async () => {
+  const performanceNowDescriptor = Object.getOwnPropertyDescriptor(
+    performance,
+    "now",
+  );
+  const setTimeoutDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "setTimeout",
+  );
+  const clearTimeoutDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "clearTimeout",
+  );
+  let monotonicTime = 0;
+  let timerCallbackCount = 0;
+  const timerHandles = [];
+  Object.defineProperty(performance, "now", {
+    configurable: true,
+    value: () => monotonicTime,
+    writable: true,
+  });
+  Object.defineProperty(globalThis, "setTimeout", {
+    ...setTimeoutDescriptor,
+    value(callback, delay, ...args) {
+      const handle = {
+        callback() {
+          timerCallbackCount += 1;
+          Reflect.apply(callback, undefined, args);
+        },
+        cleared: false,
+        delay,
+      };
+      timerHandles.push(handle);
+      return handle;
+    },
+  });
+  Object.defineProperty(globalThis, "clearTimeout", {
+    ...clearTimeoutDescriptor,
+    value(handle) {
+      handle.cleared = true;
+    },
+  });
+  let isolatedCandidateInventory;
+  try {
+    isolatedCandidateInventory = await import(
+      "../packages/action/src/v2/candidate-inventory.mjs?deadline-tail"
+    );
+  } finally {
+    if (performanceNowDescriptor === undefined) {
+      delete performance.now;
+    } else {
+      Object.defineProperty(performance, "now", performanceNowDescriptor);
+    }
+    Object.defineProperty(globalThis, "setTimeout", setTimeoutDescriptor);
+    Object.defineProperty(globalThis, "clearTimeout", clearTimeoutDescriptor);
+  }
+
+  const stateAllFake = fakeGitHub({
+    datasets: () => candidateRange(1, 1),
+  });
+  const stateAllFetch = async (input, init) => {
+    const response = await stateAllFake.fetch(input, init);
+    return {
+      status: response.status,
+      headers: {
+        get(name) {
+          const value = response.headers.get(name);
+          if (name.toLowerCase() === "link") monotonicTime += 11;
+          return value;
+        },
+      },
+      body: response.body,
+    };
+  };
+  await assert.rejects(
+    isolatedCandidateInventory.createV2GitHubCandidateInventory({
+      fetch: stateAllFetch,
+      token: "synthetic-candidate-inventory-token",
+      repository: REPOSITORY,
+      restBaseUrl: API,
+      timeoutMs: 10,
+    }).scan(),
+    (error) => error.code === "CANDIDATE_HTTP_TIMEOUT",
+  );
+
+  monotonicTime = 0;
+  const parseDescriptor = Object.getOwnPropertyDescriptor(JSON, "parse");
+  const originalParse = parseDescriptor.value;
+  Object.defineProperty(JSON, "parse", {
+    ...parseDescriptor,
+    value(value, ...args) {
+      const parsed = Reflect.apply(originalParse, JSON, [value, ...args]);
+      if (typeof value === "string" && value.startsWith('{"data":')) {
+        monotonicTime += 11;
+      }
+      return parsed;
+    },
+  });
+  try {
+    const currentOpenFake = fakeGraphQL({
+      datasets: () => candidateRange(1, 1),
+    });
+    await assert.rejects(
+      createCurrentOpen(isolatedCandidateInventory, currentOpenFake, {
+        timeoutMs: 10,
+      }).scan(),
+      (error) => error.code === "CANDIDATE_HTTP_TIMEOUT",
+    );
+  } finally {
+    Object.defineProperty(JSON, "parse", parseDescriptor);
+  }
+
+  assert.equal(timerCallbackCount, 0);
+  assert.equal(timerHandles.length, 2);
+  assert.ok(timerHandles.every(({ cleared }) => cleared));
 });
 
 test("state=all transport shares the bounded response chunk profile", async () => {
@@ -2677,6 +3010,7 @@ test("state=all transport shares the bounded response chunk profile", async () =
     createTransport(fetch).scan(),
     (error) => error.code === "CANDIDATE_HTTP_UNREADABLE",
   );
+  await nextCleanupTurn();
   assert.equal(tracker.pulls, 1);
   assert.equal(tracker.cancellations, 1);
 });
@@ -3590,4 +3924,15 @@ function jsonTextResponse(value, headers, status = 200) {
       ...headers,
     },
   });
+}
+
+function nextCleanupTurn() {
+  return new Promise((resolve) => scheduleImmediate(resolve));
+}
+
+function blockEventLoop(durationMs) {
+  const deadline = performance.now() + durationMs;
+  while (performance.now() < deadline) {
+    // Exercise a synchronously blocking untrusted cleanup adapter.
+  }
 }

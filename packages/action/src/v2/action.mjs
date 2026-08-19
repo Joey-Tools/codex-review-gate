@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
   closeSync,
@@ -7,12 +8,11 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readSync,
   realpathSync,
   writeFileSync,
 } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { V2_STATUS_CONTEXT } from "./projection.mjs";
 import { reduceV2Snapshot } from "./reducer.mjs";
@@ -25,6 +25,26 @@ import { createV2GitHubTransport } from "./transport.mjs";
 
 export const MAX_OPERATION_INPUT_BYTES = 1024 * 1024;
 
+const CONTROLLER_INPUT_READER_PATH = fileURLToPath(
+  new URL("./controller-input-reader.mjs", import.meta.url),
+);
+const CONTROLLER_INPUT_READER_TIMEOUT_MILLISECONDS = 10_000;
+const CONTROLLER_INPUT_READER_BUFFER_OVERHEAD = 64 * 1024;
+const CONTROLLER_INPUT_READER_FAILURES = [
+  ["UNSUPPORTED", "isolated controller input reading is unsupported"],
+  ["INVALID_REQUEST", "isolated controller input reader rejected its fixed request"],
+  ["MISSING", "operation-input-path or an anchored parent became missing during read"],
+  ["UNREADABLE", "operation-input-path or an anchored parent became unreadable during read"],
+  ["ACCESS_POLICY", "operation-input-path traversal violated its access policy"],
+  ["IDENTITY", "operation-input-path or an anchored directory object identity changed during read"],
+  ["CONTENT", "operation-input-path content changed during read"],
+  ["SIZE_LIMIT", "operation-input-path violated its byte-size limit"],
+  ["INTERNAL", "isolated controller input reader failed internally"],
+].map(([code, message]) => [
+  Buffer.from(`CODEX_CONTROLLER_READER_${code}\n`, "ascii"),
+  message,
+]);
+
 const OPERATIONS = new Set(V2_OPERATIONS);
 const STATUS_TARGET_MODES = new Set(V2_STATUS_TARGET_MODES);
 const OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u;
@@ -32,74 +52,165 @@ const REPOSITORY_PATTERN = /^(?!\.\.?$)[A-Za-z0-9._-]{1,100}$/u;
 const POSITIVE_INTEGER_PATTERN = /^[1-9][0-9]*$/u;
 
 /**
- * Read controller input without following replacement or aliasing paths.
+ * Read controller input without allowing traversal to redirect to a different
+ * directory object.
  *
  * Protected properties:
- * - access policy: every selected path component is inside canonical
- *   RUNNER_TEMP, is not a symlink, and the final file is regular,
- *   single-linked, and not group/world writable;
- * - object identity: lstat/fstat device and inode must remain equal;
+ * - access policy: the input suffix is resolved relative to the same held
+ *   canonical RUNNER_TEMP directory object. At each observed stat, the leaf
+ *   is regular, single-linked, and has no group/other write mode bit;
+ * - object identity: directory and leaf lstat/fstat device, inode, and type
+ *   must remain equal, and the parent-selected leaf descriptor stays held
+ *   through the child read. A same-object symlink inserted during the
+ *   open/chdir seam can be traversed, but cannot redirect to another object;
  * - content stability: two positioned reads from the same descriptor must be
- *   byte-identical. Benign timestamp changes alone are not mutation evidence.
+ *   byte-identical, and every observed descriptor/path size must equal the
+ *   parent-selected size. Benign timestamp changes alone are not evidence;
+ * - representation integrity: the stable raw bytes must round-trip through
+ *   UTF-8 exactly and be the unique canonical JSON plus one LF encoding.
  */
 export function readControllerInputFile(
   inputPath,
   runnerTemp,
   { maxBytes = MAX_OPERATION_INPUT_BYTES } = {},
 ) {
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes <= 0 ||
+    maxBytes > MAX_OPERATION_INPUT_BYTES
+  ) {
+    throw new TypeError(
+      `maxBytes must be an integer from 1 through ${MAX_OPERATION_INPUT_BYTES}`,
+    );
+  }
+  assertIsolatedReaderCapabilities();
   const selectedPath = canonicalSelectedPath(inputPath, "operation-input-path");
   const selectedRoot = canonicalSelectedPath(runnerTemp, "RUNNER_TEMP");
-  const canonicalRoot = realpathSync(selectedRoot);
-  if (canonicalRoot !== selectedRoot) {
-    throw new Error("RUNNER_TEMP must itself be a canonical non-symlink path");
-  }
-  assertDescendant(canonicalRoot, selectedPath);
-  assertNoSymlinkComponents(canonicalRoot, selectedPath);
+  assertDescendant(selectedRoot, selectedPath);
 
-  const pathStat = lstatSync(selectedPath, { bigint: true, throwIfNoEntry: false });
-  if (pathStat === undefined) {
-    throw new Error("operation-input-path does not exist");
-  }
-  assertInputFileAccessPolicy(pathStat);
-
-  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
-  let descriptor;
+  let rootDescriptor;
   try {
-    descriptor = openSync(selectedPath, fsConstants.O_RDONLY | noFollow);
+    rootDescriptor = openSync(
+      selectedRoot,
+      fsConstants.O_RDONLY |
+        fsConstants.O_NONBLOCK |
+        fsConstants.O_DIRECTORY |
+        fsConstants.O_NOFOLLOW,
+    );
   } catch (error) {
-    throw new Error("operation-input-path could not be opened without following links", {
-      cause: error,
-    });
+    throw runnerTempOpenFailure(error);
   }
 
   try {
-    const openedStat = fstatSync(descriptor, { bigint: true });
-    assertInputFileAccessPolicy(openedStat);
-    assertSameObject(pathStat, openedStat, "operation-input-path changed before open");
-    const size = Number(openedStat.size);
-    if (!Number.isSafeInteger(size) || size <= 0 || size > maxBytes) {
-      throw new Error(`operation-input-path must contain 1 through ${maxBytes} bytes`);
+    let openedRootStat;
+    try {
+      openedRootStat = fstatSync(rootDescriptor, { bigint: true });
+    } catch (error) {
+      throw new Error("opened RUNNER_TEMP directory became unreadable", { cause: error });
     }
-    const first = readExact(descriptor, size);
-    const second = readExact(descriptor, size);
-    if (!first.equals(second)) {
-      throw new Error("operation-input-path content changed while it was read");
+    if (!openedRootStat.isDirectory()) {
+      throw new Error("opened RUNNER_TEMP object must identify a directory");
     }
-    const finalOpenedStat = fstatSync(descriptor, { bigint: true });
-    assertInputFileAccessPolicy(finalOpenedStat);
-    assertSameObject(openedStat, finalOpenedStat, "opened input object was replaced");
-    if (finalOpenedStat.size !== openedStat.size) {
-      throw new Error("operation-input-path size changed while it was read");
+
+    const canonicalRoot = realpathSync(selectedRoot);
+    if (canonicalRoot !== selectedRoot) {
+      throw new Error("RUNNER_TEMP must itself be a canonical non-symlink path");
     }
-    const finalPathStat = lstatSync(selectedPath, { bigint: true, throwIfNoEntry: false });
-    if (finalPathStat === undefined) {
-      throw new Error("operation-input-path became unreadable or missing after read");
+
+    // This is an early diagnostic only. The child process's held-fd/cwd walk
+    // below is the access-policy boundary for concurrent parent replacement.
+    assertNoSymlinkComponents(canonicalRoot, selectedPath);
+    const preflightInputStat = lstatSync(selectedPath, {
+      bigint: true,
+      throwIfNoEntry: false,
+    });
+    if (preflightInputStat === undefined) {
+      throw new Error("operation-input-path does not exist");
     }
-    assertInputFileAccessPolicy(finalPathStat);
-    assertSameObject(openedStat, finalPathStat, "operation-input-path was replaced after open");
-    return parseCanonicalControllerJson(first);
+    assertInputFileAccessPolicy(preflightInputStat);
+
+    let inputDescriptor;
+    try {
+      inputDescriptor = openSync(
+        selectedPath,
+        fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+      );
+    } catch (error) {
+      throw operationInputOpenFailure(error);
+    }
+
+    try {
+      let openedInputStat;
+      try {
+        openedInputStat = fstatSync(inputDescriptor, { bigint: true });
+      } catch (error) {
+        throw new Error("opened operation-input-path became unreadable", { cause: error });
+      }
+      assertInputFileAccessPolicy(openedInputStat);
+      assertSameInputObject(
+        preflightInputStat,
+        openedInputStat,
+        "operation-input-path changed before open",
+      );
+      const selectedSize = Number(openedInputStat.size);
+      if (!Number.isSafeInteger(selectedSize) || selectedSize <= 0 || selectedSize > maxBytes) {
+        throw new Error(`operation-input-path must contain 1 through ${maxBytes} bytes`);
+      }
+
+      const result = spawnSync(
+        process.execPath,
+        [
+          CONTROLLER_INPUT_READER_PATH,
+          canonicalRoot,
+          selectedPath,
+          String(maxBytes),
+          String(selectedSize),
+        ],
+        {
+          cwd: sep,
+          env: {},
+          encoding: null,
+          timeout: CONTROLLER_INPUT_READER_TIMEOUT_MILLISECONDS,
+          killSignal: "SIGKILL",
+          maxBuffer: maxBytes + CONTROLLER_INPUT_READER_BUFFER_OVERHEAD,
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe", rootDescriptor, inputDescriptor],
+          windowsHide: true,
+        },
+      );
+      if (result.error !== undefined) {
+        throw new Error("isolated controller input reader failed", { cause: result.error });
+      }
+      const success =
+        result.status === 0 &&
+        result.signal === null &&
+        Buffer.isBuffer(result.stderr) &&
+        result.stderr.length === 0;
+      if (!success) {
+        const classifiedMessage =
+          result.status === 1 &&
+          result.signal === null &&
+          Buffer.isBuffer(result.stdout) &&
+          result.stdout.length === 0 &&
+          Buffer.isBuffer(result.stderr)
+            ? controllerInputReaderFailureMessage(result.stderr)
+            : undefined;
+        throw new Error(
+          classifiedMessage ?? "isolated controller input reader rejected operation-input-path",
+        );
+      }
+      if (
+        !Buffer.isBuffer(result.stdout) ||
+        result.stdout.length !== selectedSize
+      ) {
+        throw new Error("isolated controller input reader returned invalid data");
+      }
+      return parseCanonicalControllerJson(result.stdout);
+    } finally {
+      closeSync(inputDescriptor);
+    }
   } finally {
-    closeSync(descriptor);
+    closeSync(rootDescriptor);
   }
 }
 
@@ -363,6 +474,62 @@ function assertNoSymlinkComponents(root, selectedPath) {
   }
 }
 
+function assertIsolatedReaderCapabilities() {
+  if (!["darwin", "linux"].includes(process.platform)) {
+    throw new Error("isolated controller input reading requires linux or darwin");
+  }
+  if (!isAbsolute(process.execPath) || !isAbsolute(CONTROLLER_INPUT_READER_PATH)) {
+    throw new Error("isolated controller input reading requires absolute executables");
+  }
+  for (const name of ["O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK"]) {
+    const value = fsConstants[name];
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new Error(`isolated controller input reading requires ${name}`);
+    }
+  }
+}
+
+function runnerTempOpenFailure(error) {
+  if (error !== null && typeof error === "object") {
+    if (error.code === "ENOENT") {
+      return new Error("RUNNER_TEMP became missing before open", { cause: error });
+    }
+    if (["EACCES", "EPERM"].includes(error.code)) {
+      return new Error("RUNNER_TEMP became unreadable before open", { cause: error });
+    }
+    if (["ELOOP", "ENOTDIR"].includes(error.code)) {
+      return new Error("RUNNER_TEMP traversal violated its directory access policy", {
+        cause: error,
+      });
+    }
+  }
+  return new Error("RUNNER_TEMP could not be opened safely", { cause: error });
+}
+
+function operationInputOpenFailure(error) {
+  if (error !== null && typeof error === "object") {
+    if (error.code === "ENOENT") {
+      return new Error("operation-input-path became missing before open", { cause: error });
+    }
+    if (["EACCES", "EPERM"].includes(error.code)) {
+      return new Error("operation-input-path became unreadable before open", { cause: error });
+    }
+    if (["ELOOP", "ENOTDIR", "ENXIO"].includes(error.code)) {
+      return new Error("operation-input-path violated its access policy before open", {
+        cause: error,
+      });
+    }
+  }
+  return new Error("operation-input-path could not be opened safely", { cause: error });
+}
+
+function controllerInputReaderFailureMessage(stderr) {
+  for (const [token, message] of CONTROLLER_INPUT_READER_FAILURES) {
+    if (stderr.equals(token)) return message;
+  }
+  return undefined;
+}
+
 function assertInputFileAccessPolicy(stat) {
   if (!stat.isFile()) {
     throw new Error("operation-input-path must identify a regular file");
@@ -375,27 +542,21 @@ function assertInputFileAccessPolicy(stat) {
   }
 }
 
-function assertSameObject(left, right, message) {
-  if (left.dev !== right.dev || left.ino !== right.ino) {
+function assertSameInputObject(left, right, message) {
+  if (
+    left.dev !== right.dev ||
+    left.ino !== right.ino ||
+    (left.mode & 0o170000n) !== (right.mode & 0o170000n)
+  ) {
     throw new Error(message);
   }
 }
 
-function readExact(descriptor, size) {
-  const buffer = Buffer.allocUnsafe(size);
-  let offset = 0;
-  while (offset < size) {
-    const count = readSync(descriptor, buffer, offset, size - offset, offset);
-    if (count === 0) {
-      throw new Error("operation-input-path became unreadable during read");
-    }
-    offset += count;
-  }
-  return buffer;
-}
-
 function parseCanonicalControllerJson(bytes) {
   const text = bytes.toString("utf8");
+  if (!bytes.equals(Buffer.from(text, "utf8"))) {
+    throw new Error("operation-input-path is not valid UTF-8 JSON");
+  }
   let value;
   try {
     value = JSON.parse(text);

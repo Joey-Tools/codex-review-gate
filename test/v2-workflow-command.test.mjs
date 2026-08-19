@@ -1023,6 +1023,29 @@ test("reader rejects checkout paths, symlinks, hardlinks, loose mode, and event 
   });
 });
 
+test("reader rejects a leading UTF-8 BOM without rejecting U+FEFF in advisory data", async () => {
+  await withFixture({
+    eventName: "pull_request_target",
+    event: { note: "legal \uFEFF data", pull_request: { number: 7 } },
+    route: "ordinary",
+    pullRequest: "7",
+  }, async ({ environment, inputPath, eventBytes }) => {
+    const command = await prepareV2WorkflowCommand(environment);
+    assert.equal(command.invocation.event_payload_sha256, sha256(eventBytes));
+
+    const commandBytes = await readFile(inputPath);
+    await writeFile(
+      inputPath,
+      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), commandBytes]),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      readV2WorkflowCommand(environment),
+      /not exact JSON|canonical sorted compact JSON|not valid UTF-8/u,
+    );
+  });
+});
+
 test("subprocess preparation succeeds and production run remains fail-closed without live assembler", async () => {
   await withFixture({
     eventName: "pull_request_target",

@@ -1,9 +1,11 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomBytes } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { setImmediate as scheduleImmediate } from "node:timers";
 import { TextDecoder, types as utilTypes } from "node:util";
 
 const SafeAbortController = AbortController;
+const SafeError = Error;
 const SafePromise = Promise;
 const SafeSet = Set;
 const SafeWeakMap = WeakMap;
@@ -25,8 +27,10 @@ const safeObjectIsFrozen = Object.isFrozen;
 const safeObjectKeys = Object.keys;
 const safeObjectValues = Object.values;
 const reflectOwnKeysIntrinsic = Reflect.ownKeys;
+const safeSetImmediate = scheduleImmediate;
 const safeSetTimeout = setTimeout;
 const safeStructuredClone = structuredClone;
+const abortControllerAbortIntrinsic = SafeAbortController.prototype.abort;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
 const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(
   typedArrayPrototype,
@@ -3511,6 +3515,12 @@ function validateCurrentOpenGraphqlRequest(
   }
 }
 
+/*
+ * The request deadline bounds asynchronous fetch and body-read tails. JavaScript
+ * cannot preempt an adapter that blocks before returning, and AbortSignal
+ * listeners must remain cooperative and non-throwing. Reader cleanup methods
+ * are hostile best-effort hooks and run only after the primary result settles.
+ */
 async function graphqlJsonRequest({
   fetchImpl,
   authorization,
@@ -3551,10 +3561,14 @@ async function graphqlJsonRequest({
   const deadline = new SafePromise((_, reject) => {
     rejectDeadline = reject;
   });
+  const abortTransport = createBestEffortOnce(() =>
+    reflectApply(abortControllerAbortIntrinsic, controller, [
+      new SafeError("candidate inventory transport cleanup"),
+    ]));
   const timer = safeSetTimeout(() => {
     timedOut = true;
-    controller.abort(TRANSPORT_ABORT_SENTINEL);
     rejectDeadline(timeoutError);
+    abortTransport();
   }, timeoutMs);
   try {
     const requestHeaders = safeObjectFreeze({
@@ -3646,7 +3660,7 @@ async function graphqlJsonRequest({
     }
     const bytes = await readBoundedResponseBody({
       responseView,
-      controller,
+      abortTransport,
       deadline,
       deadlineAt,
       timeoutError,
@@ -3661,7 +3675,7 @@ async function graphqlJsonRequest({
       `${label} response body`,
       "CANDIDATE_PAGE_MALFORMED",
     );
-    return {
+    const capture = {
       data,
       request_body_base64: requestBytes.toString("base64"),
       raw_body_base64: Buffer.from(bytes).toString("base64"),
@@ -3676,17 +3690,17 @@ async function graphqlJsonRequest({
         request_id: requestId,
       },
     };
+    assertCandidateHttpDeadline(deadlineAt, timeoutError);
+    return capture;
   } catch (error) {
     if (timedOut) {
       throw timeoutError;
     }
     if (isInventoryError(error)) {
-      if (!controller.signal.aborted) {
-        controller.abort(TRANSPORT_ABORT_SENTINEL);
-      }
+      abortTransport();
       throw error;
     }
-    controller.abort(TRANSPORT_ABORT_SENTINEL);
+    abortTransport();
     throw inventoryError(
       "CANDIDATE_HTTP_UNREADABLE",
       `${label} failed`,
@@ -3814,6 +3828,7 @@ function assertNoDuplicateJsonObjectKeys(text) {
   if (offset !== text.length) throw new SyntaxError("trailing JSON data");
 }
 
+// Uses the same cooperative-adapter and deferred-cleanup contract above.
 async function jsonRequest({
   fetchImpl,
   authorization,
@@ -3850,10 +3865,14 @@ async function jsonRequest({
   const deadline = new SafePromise((_, reject) => {
     rejectDeadline = reject;
   });
+  const abortTransport = createBestEffortOnce(() =>
+    reflectApply(abortControllerAbortIntrinsic, controller, [
+      new SafeError("candidate inventory transport cleanup"),
+    ]));
   const timer = safeSetTimeout(() => {
     timedOut = true;
-    controller.abort(TRANSPORT_ABORT_SENTINEL);
     rejectDeadline(timeoutError);
+    abortTransport();
   }, timeoutMs);
   try {
     const response = await settleFirst(
@@ -3919,7 +3938,7 @@ async function jsonRequest({
     }
     const bytes = await readBoundedResponseBody({
       responseView,
-      controller,
+      abortTransport,
       deadline,
       deadlineAt,
       timeoutError,
@@ -3942,7 +3961,7 @@ async function jsonRequest({
         error,
       );
     }
-    return {
+    const capture = {
       data,
       link: readExternalHeader(responseView, "link", label),
       ...(captureRawBody
@@ -3956,17 +3975,17 @@ async function jsonRequest({
         raw_body_sha256: rawDigest(bytes),
       },
     };
+    assertCandidateHttpDeadline(deadlineAt, timeoutError);
+    return capture;
   } catch (error) {
     if (timedOut) {
       throw timeoutError;
     }
     if (isInventoryError(error)) {
-      if (!controller.signal.aborted) {
-        controller.abort(TRANSPORT_ABORT_SENTINEL);
-      }
+      abortTransport();
       throw error;
     }
-    controller.abort(TRANSPORT_ABORT_SENTINEL);
+    abortTransport();
     throw inventoryError(
       "CANDIDATE_HTTP_UNREADABLE",
       `${label} failed`,
@@ -3980,7 +3999,7 @@ async function jsonRequest({
 
 async function readBoundedResponseBody({
   responseView,
-  controller,
+  abortTransport,
   deadline,
   deadlineAt,
   timeoutError,
@@ -4000,13 +4019,25 @@ async function readBoundedResponseBody({
   const remainingTotalBytes = maxTotalBytes - priorTotalBytes;
   const capacity = Math.min(maxResponseBytes, remainingTotalBytes);
   const bytes = new Uint8Array(capacity);
+  const cancelReader = createBestEffortOnce(() => {
+    const cancel = reader.cancel;
+    if (typeof cancel === "function") {
+      return reflectApply(cancel, reader, [TRANSPORT_ABORT_SENTINEL]);
+    }
+    return undefined;
+  });
+  const releaseReader = createBestEffortOnce(() => {
+    const releaseLock = reader.releaseLock;
+    if (typeof releaseLock === "function") {
+      return reflectApply(releaseLock, reader, []);
+    }
+    return undefined;
+  });
   let total = 0;
   let reads = 0;
   let chunks = 0;
-  let failed = null;
-  const assertBeforeDeadline = () => {
-    if (monotonicNow() >= deadlineAt) throw timeoutError;
-  };
+  const assertBeforeDeadline = () =>
+    assertCandidateHttpDeadline(deadlineAt, timeoutError);
   try {
     while (true) {
       assertBeforeDeadline();
@@ -4089,25 +4120,11 @@ async function readBoundedResponseBody({
       total = nextTotal;
     }
   } catch (error) {
-    failed = error;
-    controller.abort(TRANSPORT_ABORT_SENTINEL);
-    try {
-      void reader.cancel(TRANSPORT_ABORT_SENTINEL).catch(() => {});
-    } catch {
-      // Preserve the typed transport failure that caused cancellation.
-    }
+    abortTransport();
+    cancelReader();
     throw error;
   } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      if (failed === null) {
-        throw inventoryError(
-          "CANDIDATE_HTTP_UNREADABLE",
-          `${label} body reader could not be released`,
-        );
-      }
-    }
+    releaseReader();
   }
   return bytes.subarray(0, total);
 }
@@ -4478,6 +4495,42 @@ function canonicalJson(value) {
 
 function monotonicNow() {
   return reflectApply(performanceNowIntrinsic, performance, []);
+}
+
+function assertCandidateHttpDeadline(deadlineAt, timeoutError) {
+  if (monotonicNow() >= deadlineAt) throw timeoutError;
+}
+
+function createBestEffortOnce(action) {
+  let started = false;
+  return () => {
+    if (started) return;
+    started = true;
+    startBestEffort(action);
+  };
+}
+
+function startBestEffort(action) {
+  let invoked = false;
+  try {
+    safeSetImmediate(() => {
+      if (invoked) return;
+      invoked = true;
+      try {
+        const result = action();
+        const promise = reflectApply(
+          promiseResolveIntrinsic,
+          SafePromise,
+          [result],
+        );
+        reflectApply(promiseThenIntrinsic, promise, [undefined, () => {}]);
+      } catch {
+        // Cleanup adapters are untrusted and cannot replace the primary result.
+      }
+    });
+  } catch {
+    // Cleanup scheduling is best-effort and cannot replace the primary result.
+  }
 }
 
 function settleFirst(left, right) {

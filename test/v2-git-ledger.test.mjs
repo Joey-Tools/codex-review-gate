@@ -10,10 +10,14 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
+import {
+  setImmediate as nextTurn,
+  setTimeout as delay,
+} from "node:timers/promises";
 import { deflateRawSync, gunzipSync, inflateRawSync } from "node:zlib";
 
 import {
@@ -147,6 +151,9 @@ import {
   loadV2ProviderPreScopeArtifact,
   V2_TRANSPORT_DEFAULT_LIMITS,
 } from "../packages/action/src/v2/transport.mjs";
+
+const requireBuiltin = createRequire(import.meta.url);
+const mutableTimers = requireBuiltin("node:timers");
 
 const REPOSITORY = {
   owner: "owner",
@@ -735,6 +742,17 @@ test("multi-parent, noncanonical bytes, and digest tampering fail closed", async
     await assert.rejects(
       ledger.load(),
       (error) => error.code === "noncanonical-blob",
+    );
+  });
+
+  await t.test("UTF-8 BOM is not normalized out of a canonical blob", async () => {
+    const fixture = githubGitFixture();
+    const ledger = makeLedger(fixture);
+    await ledger.bootstrapCapability();
+    fixture.rewriteTipText((text) => `\ufeff${text}`);
+    await assert.rejects(
+      ledger.load(),
+      (error) => error.code === "invalid-json",
     );
   });
 
@@ -1455,26 +1473,85 @@ test("workflow provenance verifier has an abortable hard deadline", async () => 
   const setup = makeLedger(fixture);
   await setup.bootstrapCapability();
   let observedSignal = null;
+  let abortCalls = 0;
+  let abortObservedAfterFailure = null;
+  let failureObserved = false;
+  let cleanupReason = null;
+  let cleanupReasonSnapshot = null;
+  let synchronousWork = 0;
   const stalled = createV2GitHubGitLedger({
     ...factoryInput(fixture, capabilityReceipt()),
     provenanceTimeoutMs: 5,
     verifyWorkflowProvenance: async (_request, { signal, deadline_ms }) => {
       assert.equal(deadline_ms, 5);
       observedSignal = signal;
-      return new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        abortCalls += 1;
+        abortObservedAfterFailure = failureObserved;
+        cleanupReason = signal.reason;
+        cleanupReasonSnapshot = {
+          cause: cleanupReason.cause,
+          code: cleanupReason.code,
+          details: cleanupReason.details,
+          message: cleanupReason.message,
+          name: cleanupReason.name,
+          prototype: Object.getPrototypeOf(cleanupReason),
+        };
+        for (let index = 0; index < 1_000; index += 1) {
+          synchronousWork += index & 1;
+        }
+        cleanupReason.message = "mutated hostile provenance cleanup";
+        cleanupReason.code = "mutated-cleanup";
+        cleanupReason.cause = new Error("mutated cleanup cause");
+        cleanupReason.details = { mutated: true };
+      }, { once: true });
+      return new Promise((resolve) => {
         void resolve;
-        signal.addEventListener("abort", () => reject(signal.reason), {
-          once: true,
-        });
       });
     },
   });
   const writes = fixture.writeCalls;
+  let caught;
   await assert.rejects(
     stalled.load(),
-    (error) => error.code === "provenance-timeout",
+    (error) => {
+      caught = error;
+      return error.code === "provenance-timeout";
+    },
   );
+  const caughtSnapshot = {
+    cause: caught.cause,
+    code: caught.code,
+    details: caught.details,
+    message: caught.message,
+    name: caught.name,
+    prototype: Object.getPrototypeOf(caught),
+  };
+  failureObserved = true;
+  assert.equal(observedSignal?.aborted, false);
+  assert.equal(abortCalls, 0);
+  await nextTurn();
   assert.equal(observedSignal?.aborted, true);
+  assert.equal(abortCalls, 1);
+  assert.equal(abortObservedAfterFailure, true);
+  assert.equal(synchronousWork, 500);
+  assert.notEqual(cleanupReason, caught);
+  assert.deepEqual(cleanupReasonSnapshot, {
+    cause: undefined,
+    code: undefined,
+    details: undefined,
+    message: "Git ledger provenance verifier cleanup",
+    name: "Error",
+    prototype: Error.prototype,
+  });
+  assert.deepEqual({
+    cause: caught.cause,
+    code: caught.code,
+    details: caught.details,
+    message: caught.message,
+    name: caught.name,
+    prototype: Object.getPrototypeOf(caught),
+  }, caughtSnapshot);
   assert.equal(fixture.writeCalls, writes);
 });
 
@@ -1796,6 +1873,102 @@ test("HTTP transport caps declared, streamed, aggregate, and stalled bodies", as
     );
   });
 
+  await t.test("timeout settles before deferred abort cleanup", async () => {
+    let observedSignal = null;
+    let abortCalls = 0;
+    let abortObservedAfterFailure = null;
+    let failureObserved = false;
+    let cleanupReason = null;
+    let cleanupReasonSnapshot = null;
+    let poisonedSchedulerCalls = 0;
+    let synchronousWork = 0;
+    const originalSetImmediate = mutableTimers.setImmediate;
+    const ledger = createV2GitHubGitLedger({
+      ...factoryInput({
+        fetch: (_url, { signal }) => {
+          mutableTimers.setImmediate = (callback, ...args) => {
+            poisonedSchedulerCalls += 1;
+            Reflect.apply(callback, undefined, args);
+            Reflect.apply(callback, undefined, args);
+            return {};
+          };
+          syncBuiltinESMExports();
+          observedSignal = signal;
+          signal.addEventListener("abort", () => {
+            abortCalls += 1;
+            abortObservedAfterFailure = failureObserved;
+            cleanupReason = signal.reason;
+            cleanupReasonSnapshot = {
+              cause: cleanupReason.cause,
+              code: cleanupReason.code,
+              details: cleanupReason.details,
+              message: cleanupReason.message,
+              name: cleanupReason.name,
+              prototype: Object.getPrototypeOf(cleanupReason),
+            };
+            for (let index = 0; index < 1_000; index += 1) {
+              synchronousWork += index & 1;
+            }
+            cleanupReason.message = "mutated hostile HTTP cleanup";
+            cleanupReason.code = "mutated-cleanup";
+            cleanupReason.cause = new Error("mutated cleanup cause");
+            cleanupReason.details = { mutated: true };
+          }, { once: true });
+          return new Promise(() => {});
+        },
+      }, capabilityReceipt()),
+      httpLimits: { ...V2_GIT_LEDGER_HTTP_LIMITS, timeout_ms: 5 },
+    });
+    let caught;
+    try {
+      await assert.rejects(
+        ledger.load(),
+        (error) => {
+          caught = error;
+          return error.code === "http-timeout";
+        },
+      );
+    } finally {
+      mutableTimers.setImmediate = originalSetImmediate;
+      syncBuiltinESMExports();
+    }
+    const caughtSnapshot = {
+      cause: caught.cause,
+      code: caught.code,
+      details: caught.details,
+      message: caught.message,
+      name: caught.name,
+      prototype: Object.getPrototypeOf(caught),
+    };
+    failureObserved = true;
+    assert.equal(observedSignal?.aborted, false);
+    assert.equal(abortCalls, 0);
+    assert.equal(poisonedSchedulerCalls, 0);
+    await nextTurn();
+    assert.equal(observedSignal?.aborted, true);
+    assert.equal(abortCalls, 1);
+    assert.equal(abortObservedAfterFailure, true);
+    assert.equal(poisonedSchedulerCalls, 0);
+    assert.equal(synchronousWork, 500);
+    assert.notEqual(cleanupReason, caught);
+    assert.deepEqual(cleanupReasonSnapshot, {
+      cause: undefined,
+      code: undefined,
+      details: undefined,
+      message: "Git ledger HTTP request cleanup",
+      name: "Error",
+      prototype: Error.prototype,
+    });
+    assert.deepEqual({
+      cause: caught.cause,
+      code: caught.code,
+      details: caught.details,
+      message: caught.message,
+      name: caught.name,
+      prototype: Object.getPrototypeOf(caught),
+    }, caughtSnapshot);
+  });
+
   await t.test("zero-length response chunks", async () => {
     const body = new ReadableStream({
       start(controller) {
@@ -1815,6 +1988,425 @@ test("HTTP transport caps declared, streamed, aggregate, and stalled bodies", as
       ledger.load(),
       (error) => error.code === "http-response-chunk-cap",
     );
+  });
+
+  await t.test("terminal stream results are exact and close once", async (t) => {
+    const initializedLedgerWithTerminalValue = async (terminalValue) => {
+      const fixture = githubGitFixture();
+      let mutationEnabled = false;
+      const state = { mutated: false, body_cancel_calls: 0 };
+      const wrapped = {
+        async fetch(url, init) {
+          const original = await fixture.fetch(url, init);
+          if (
+            !mutationEnabled || state.mutated || init.method !== "GET" ||
+            !new URL(url).pathname.endsWith(
+              "/git/ref/heads/codex-review-gate-ledger-v2",
+            )
+          ) return original;
+          state.mutated = true;
+          const prefix = new Uint8Array(await original.arrayBuffer());
+          let readIndex = 0;
+          const reader = {
+            async read() {
+              readIndex += 1;
+              if (readIndex === 1) return { done: false, value: prefix };
+              if (readIndex === 2) {
+                return terminalValue === undefined
+                  ? { done: true, value: undefined }
+                  : { done: true, value: terminalValue };
+              }
+              throw new Error("response reader advanced past its terminal result");
+            },
+            cancel() { return Promise.resolve(); },
+            releaseLock() {},
+          };
+          return {
+            status: original.status,
+            headers: original.headers,
+            body: {
+              getReader() { return reader; },
+              cancel() {
+                state.body_cancel_calls += 1;
+                return Promise.resolve();
+              },
+            },
+          };
+        },
+      };
+      const ledger = makeLedger(wrapped);
+      await ledger.bootstrapCapability();
+      mutationEnabled = true;
+      return { ledger, state };
+    };
+
+    await t.test("terminal bytes cannot hide behind a valid prefix", async () => {
+      const { ledger, state } = await initializedLedgerWithTerminalValue(
+        new Uint8Array([0x20, 0x7b, 0x7d]),
+      );
+      await assert.rejects(
+        ledger.load(),
+        (error) => error.code === "invalid-http-response",
+      );
+      assert.deepEqual(state, { mutated: true, body_cancel_calls: 0 });
+      await nextTurn();
+      assert.deepEqual(state, { mutated: true, body_cancel_calls: 1 });
+    });
+
+    await t.test("valid terminal completion is not cancelled", async () => {
+      const { ledger, state } =
+        await initializedLedgerWithTerminalValue(undefined);
+      await ledger.load();
+      assert.deepEqual(state, { mutated: true, body_cancel_calls: 0 });
+    });
+  });
+
+  await t.test("hostile reader results cannot alter byte accounting or cleanup", async (t) => {
+    const ledgerWithReader = ({
+      firstResult,
+      releaseLock,
+      responseBytes = V2_GIT_LEDGER_HTTP_LIMITS.response_bytes,
+    }) => {
+      const state = {
+        body_cancel_calls: 0,
+        reader_cancel_calls: 0,
+      };
+      let readCount = 0;
+      const reader = {
+        async read() {
+          readCount += 1;
+          return readCount === 1
+            ? firstResult
+            : { done: true, value: undefined };
+        },
+        cancel() {
+          state.reader_cancel_calls += 1;
+          return Promise.resolve();
+        },
+      };
+      Object.defineProperty(reader, "releaseLock", releaseLock ?? {
+        value() {},
+        configurable: true,
+      });
+      const responseBody = {
+        getReader() { return reader; },
+        cancel() {
+          state.body_cancel_calls += 1;
+          return Promise.resolve();
+        },
+      };
+      const ledger = createV2GitHubGitLedger({
+        ...factoryInput({
+          fetch: async () => ({
+            status: 200,
+            headers: new Headers({ Date: new Date(TIME).toUTCString() }),
+            body: responseBody,
+          }),
+        }, capabilityReceipt()),
+        httpLimits: {
+          ...V2_GIT_LEDGER_HTTP_LIMITS,
+          response_bytes: responseBytes,
+        },
+      });
+      return { ledger, state };
+    };
+
+    const initializedLedgerWithRefChunk = async (createChunk) => {
+      const fixture = githubGitFixture();
+      let mutationEnabled = false;
+      const state = {
+        body_cancel_calls: 0,
+        selected_bytes: null,
+      };
+      const wrapped = {
+        async fetch(url, init) {
+          const original = await fixture.fetch(url, init);
+          const selected = mutationEnabled && state.selected_bytes === null &&
+            init.method === "GET" &&
+            new URL(url).pathname.endsWith(
+              "/git/ref/heads/codex-review-gate-ledger-v2",
+            );
+          if (!selected) return original;
+          state.selected_bytes = new Uint8Array(await original.arrayBuffer());
+          const chunk = createChunk(state.selected_bytes);
+          let readCount = 0;
+          const reader = {
+            async read() {
+              readCount += 1;
+              return readCount === 1
+                ? { done: false, value: chunk }
+                : { done: true, value: undefined };
+            },
+            cancel() { return Promise.resolve(); },
+            releaseLock() {},
+          };
+          return {
+            status: original.status,
+            headers: original.headers,
+            body: {
+              getReader() { return reader; },
+              cancel() {
+                state.body_cancel_calls += 1;
+                return Promise.resolve();
+              },
+            },
+          };
+        },
+      };
+      const ledger = makeLedger(wrapped);
+      await ledger.bootstrapCapability();
+      mutationEnabled = true;
+      return { ledger, state };
+    };
+
+    await t.test("oversize internal length is capped before a snapshot", async (context) => {
+      const observations = {
+        buffer_from_copy_attempts: 0,
+        iterator_calls: 0,
+        value_of_calls: 0,
+      };
+      class X extends Uint8Array {
+        valueOf() {
+          observations.value_of_calls += 1;
+          return new Uint8Array([0x7b, 0x7d, 0x20]);
+        }
+        [Symbol.iterator]() {
+          observations.iterator_calls += 1;
+          throw new Error("hostile typed-array iterator");
+        }
+      }
+      const chunk = new X([0x5b, 0x5d, 0x58]);
+      Object.defineProperty(chunk, "byteLength", { value: 2 });
+      const originalBufferFrom = Buffer.from;
+      context.mock.method(Buffer, "from", function (value, ...rest) {
+        if (
+          value instanceof Uint8Array &&
+          value.length === 3 &&
+          value[0] === 0x5b &&
+          value[1] === 0x5d &&
+          value[2] === 0x58
+        ) {
+          observations.buffer_from_copy_attempts += 1;
+        }
+        return Reflect.apply(originalBufferFrom, Buffer, [value, ...rest]);
+      });
+      const { ledger, state } = ledgerWithReader({
+        firstResult: { done: false, value: chunk },
+        responseBytes: 2,
+      });
+      await assert.rejects(
+        ledger.load(),
+        (error) => error.code === "http-response-cap",
+      );
+      assert.deepEqual(state, {
+        body_cancel_calls: 0,
+        reader_cancel_calls: 0,
+      });
+      assert.deepEqual(observations, {
+        buffer_from_copy_attempts: 0,
+        iterator_calls: 0,
+        value_of_calls: 0,
+      });
+      await nextTurn();
+      assert.deepEqual(state, {
+        body_cancel_calls: 1,
+        reader_cancel_calls: 1,
+      });
+    });
+
+    await t.test("same-length subclass valueOf cannot replace response bytes", async () => {
+      const observations = {
+        iterator_calls: 0,
+        replacement_bytes: null,
+        value_of_calls: 0,
+      };
+      class X extends Uint8Array {
+        valueOf() {
+          observations.value_of_calls += 1;
+          return observations.replacement_bytes;
+        }
+        [Symbol.iterator]() {
+          observations.iterator_calls += 1;
+          throw new Error("hostile typed-array iterator");
+        }
+      }
+      const { ledger, state } = await initializedLedgerWithRefChunk((bytes) => {
+        observations.replacement_bytes = new Uint8Array(bytes.length);
+        observations.replacement_bytes.fill(0x58);
+        return new X(bytes);
+      });
+      const loaded = await ledger.load();
+      assert.equal(observations.value_of_calls, 0);
+      assert.equal(observations.iterator_calls, 0);
+      assert.equal(state.body_cancel_calls, 0);
+      assert.equal(
+        loaded.pre_ref.raw_body_sha256,
+        rawDigest(state.selected_bytes),
+      );
+      assert.notEqual(
+        rawDigest(state.selected_bytes),
+        rawDigest(observations.replacement_bytes),
+      );
+    });
+
+    await t.test("SharedArrayBuffer backing is rejected before a snapshot", async () => {
+      const { ledger, state } = ledgerWithReader({
+        firstResult: {
+          done: false,
+          value: new Uint8Array(new SharedArrayBuffer(2)),
+        },
+      });
+      await assert.rejects(
+        ledger.load(),
+        (error) =>
+          error.code === "invalid-http-response" &&
+          /ordinary ArrayBuffer backing/u.test(error.cause?.message),
+      );
+      assert.deepEqual(state, {
+        body_cancel_calls: 0,
+        reader_cancel_calls: 0,
+      });
+      await nextTurn();
+      assert.deepEqual(state, {
+        body_cancel_calls: 1,
+        reader_cancel_calls: 1,
+      });
+    });
+
+    for (const field of ["done", "value"]) {
+      await t.test(`${field} getter is rejected without invocation`, async () => {
+        const state = { getter_calls: 0 };
+        const firstResult = {};
+        Object.defineProperties(firstResult, {
+          done: field === "done"
+            ? {
+                get() {
+                  state.getter_calls += 1;
+                  return false;
+                },
+                enumerable: true,
+              }
+            : { value: false, enumerable: true },
+          value: field === "value"
+            ? {
+                get() {
+                  state.getter_calls += 1;
+                  return new Uint8Array([0x7b, 0x7d]);
+                },
+                enumerable: true,
+              }
+            : {
+                value: new Uint8Array([0x7b, 0x7d]),
+                enumerable: true,
+              },
+        });
+        const { ledger, state: transportState } = ledgerWithReader({
+          firstResult,
+        });
+        await assert.rejects(
+          ledger.load(),
+          (error) => error.code === "invalid-http-response",
+        );
+        assert.equal(state.getter_calls, 0);
+        assert.deepEqual(transportState, {
+          body_cancel_calls: 0,
+          reader_cancel_calls: 0,
+        });
+        await nextTurn();
+        assert.deepEqual(transportState, {
+          body_cancel_calls: 1,
+          reader_cancel_calls: 1,
+        });
+      });
+    }
+
+    for (const mode of ["getter", "call"]) {
+      await t.test(`releaseLock ${mode} failure preserves the primary error`, async () => {
+        const state = { release_calls: 0 };
+        const releaseLock = mode === "getter"
+          ? {
+              get() {
+                state.release_calls += 1;
+                throw new Error("hostile releaseLock getter");
+              },
+              configurable: true,
+            }
+          : {
+              value() {
+                state.release_calls += 1;
+                throw new Error("hostile releaseLock call");
+              },
+              configurable: true,
+            };
+        const { ledger, state: transportState } = ledgerWithReader({
+          firstResult: {
+            done: true,
+            value: new Uint8Array([0x58]),
+          },
+          releaseLock,
+        });
+        await assert.rejects(
+          ledger.load(),
+          (error) =>
+            error.code === "invalid-http-response" &&
+            /terminal stream result contains bytes/u.test(error.message),
+        );
+        assert.equal(state.release_calls, 0);
+        assert.deepEqual(transportState, {
+          body_cancel_calls: 0,
+          reader_cancel_calls: 0,
+        });
+        await nextTurn();
+        assert.equal(state.release_calls, 1);
+        assert.deepEqual(transportState, {
+          body_cancel_calls: 1,
+          reader_cancel_calls: 1,
+        });
+      });
+
+      await t.test(`releaseLock ${mode} throw null cannot mask the primary error`, async () => {
+        const state = { release_calls: 0 };
+        const releaseLock = mode === "getter"
+          ? {
+              get() {
+                state.release_calls += 1;
+                throw null;
+              },
+              configurable: true,
+            }
+          : {
+              value() {
+                state.release_calls += 1;
+                throw null;
+              },
+              configurable: true,
+            };
+        const { ledger, state: transportState } = ledgerWithReader({
+          firstResult: {
+            done: true,
+            value: new Uint8Array([0x58]),
+          },
+          releaseLock,
+        });
+        await assert.rejects(
+          ledger.load(),
+          (error) =>
+            error.code === "invalid-http-response" &&
+            /terminal stream result contains bytes/u.test(error.message),
+        );
+        assert.equal(state.release_calls, 0);
+        assert.deepEqual(transportState, {
+          body_cancel_calls: 0,
+          reader_cancel_calls: 0,
+        });
+        await nextTurn();
+        assert.equal(state.release_calls, 1);
+        assert.deepEqual(transportState, {
+          body_cancel_calls: 1,
+          reader_cancel_calls: 1,
+        });
+      });
+    }
   });
 
   await t.test("response status is snapshotted once", async () => {
@@ -1840,6 +2432,214 @@ test("HTTP transport caps declared, streamed, aggregate, and stalled bodies", as
       (error) => error.code === "unexpected-http-status",
     );
     assert.equal(statusReads, 1);
+  });
+
+  await t.test("pre-body rejection cancels without awaiting cancellation", async (t) => {
+    const assertRejectedAndCancelled = async ({
+      status = 200,
+      contentLength = null,
+      responseBytes = V2_GIT_LEDGER_HTTP_LIMITS.response_bytes,
+      expectedCode,
+    }) => {
+      let cancelCalls = 0;
+      let cancelObservedAfterFailure = null;
+      let failureObserved = false;
+      let readerCalls = 0;
+      let synchronousWork = 0;
+      const responseBody = {
+        getReader() {
+          readerCalls += 1;
+          throw new Error("response body must not be read");
+        },
+        cancel() {
+          cancelCalls += 1;
+          cancelObservedAfterFailure = failureObserved;
+          for (let index = 0; index < 1_000; index += 1) {
+            synchronousWork += index & 1;
+          }
+          return new Promise(() => {});
+        },
+      };
+      const headers = new Headers({ Date: new Date(TIME).toUTCString() });
+      if (contentLength !== null) headers.set("Content-Length", contentLength);
+      const ledger = createV2GitHubGitLedger({
+        ...factoryInput({
+          fetch: async () => ({ status, headers, body: responseBody }),
+        }, capabilityReceipt()),
+        httpLimits: {
+          ...V2_GIT_LEDGER_HTTP_LIMITS,
+          response_bytes: responseBytes,
+        },
+      });
+      const outcome = await Promise.race([
+        ledger.load().then(
+          () => ({ state: "resolved" }),
+          (error) => ({ state: "rejected", error }),
+        ),
+        delay(250, { state: "timeout" }),
+      ]);
+      assert.equal(outcome.state, "rejected");
+      assert.equal(outcome.error.code, expectedCode);
+      failureObserved = true;
+      assert.equal(readerCalls, 0);
+      assert.equal(cancelCalls, 0);
+      await nextTurn();
+      assert.equal(cancelCalls, 1);
+      assert.equal(cancelObservedAfterFailure, true);
+      assert.equal(synchronousWork, 500);
+    };
+
+    await t.test("unexpected status", async () => {
+      await assertRejectedAndCancelled({
+        status: 500,
+        expectedCode: "unexpected-http-status",
+      });
+    });
+
+    await t.test("malformed Content-Length", async () => {
+      await assertRejectedAndCancelled({
+        contentLength: "01",
+        expectedCode: "invalid-content-length",
+      });
+    });
+
+    await t.test("oversized Content-Length", async () => {
+      await assertRejectedAndCancelled({
+        contentLength: "3",
+        responseBytes: 2,
+        expectedCode: "http-response-cap",
+      });
+    });
+
+    await t.test("overdue fetch fulfillment still cancels its response", async (context) => {
+      let monotonicNow = 5_000;
+      let cancelCalls = 0;
+      let readerCalls = 0;
+      const timeoutMs = 1_000;
+      const ownNowBefore = Object.getOwnPropertyDescriptor(performance, "now");
+      context.mock.method(
+        Object.getPrototypeOf(performance),
+        "now",
+        () => monotonicNow,
+      );
+      const responseBody = {
+        getReader() {
+          readerCalls += 1;
+          throw new Error("overdue response body must not be read");
+        },
+        cancel() {
+          cancelCalls += 1;
+          return new Promise(() => {});
+        },
+      };
+      const ledger = createV2GitHubGitLedger({
+        ...factoryInput({
+          fetch: async () => {
+            monotonicNow += timeoutMs;
+            return {
+              status: 200,
+              headers: new Headers({
+                Date: new Date(TIME).toUTCString(),
+              }),
+              body: responseBody,
+            };
+          },
+        }, capabilityReceipt()),
+        httpLimits: {
+          ...V2_GIT_LEDGER_HTTP_LIMITS,
+          timeout_ms: timeoutMs,
+        },
+      });
+      try {
+        const outcome = await Promise.race([
+          ledger.load().then(
+            () => ({ state: "resolved" }),
+            (error) => ({ state: "rejected", error }),
+          ),
+          delay(250, { state: "timeout" }),
+        ]);
+        assert.equal(outcome.state, "rejected");
+        assert.equal(outcome.error.code, "http-timeout");
+        assert.equal(readerCalls, 0);
+        assert.equal(cancelCalls, 0);
+        await nextTurn();
+        assert.equal(cancelCalls, 1);
+      } finally {
+        context.mock.restoreAll();
+      }
+      assert.deepEqual(
+        Object.getOwnPropertyDescriptor(performance, "now"),
+        ownNowBefore,
+      );
+    });
+  });
+
+  await t.test("response receipts bind exact UTF-8 bytes and reject a BOM", async (t) => {
+    const initializedLedgerWithFirstRefMutation = async (mutateBytes) => {
+      const fixture = githubGitFixture();
+      let selectedBytes = null;
+      let mutationEnabled = false;
+      const wrapped = {
+        get selectedBytes() { return selectedBytes; },
+        async fetch(url, init) {
+          const original = await fixture.fetch(url, init);
+          const originalBytes = Buffer.from(await original.arrayBuffer());
+          const selected = mutationEnabled && selectedBytes === null &&
+            init.method === "GET" &&
+            new URL(url).pathname.endsWith(
+              "/git/ref/heads/codex-review-gate-ledger-v2",
+            );
+          const bytes = selected
+            ? Buffer.from(mutateBytes(originalBytes))
+            : originalBytes;
+          if (selected) selectedBytes = Buffer.from(bytes);
+          return new Response(bytes, {
+            status: original.status,
+            headers: original.headers,
+          });
+        },
+      };
+      const ledger = makeLedger(wrapped);
+      await ledger.bootstrapCapability();
+      mutationEnabled = true;
+      return { ledger, wrapped };
+    };
+
+    await t.test("valid internal U+FEFF hashes the exact non-BOM bytes", async () => {
+      const { ledger, wrapped } =
+        await initializedLedgerWithFirstRefMutation((bytes) => {
+          const value = JSON.parse(bytes.toString("utf8"));
+          value.node_id = "REF_\ufeffledger";
+          return Buffer.from(JSON.stringify(value), "utf8");
+        });
+      const loaded = await ledger.load();
+      assert.notEqual(wrapped.selectedBytes, null);
+      assert.equal(loaded.pre_ref.node_id, "REF_\ufeffledger");
+      assert.equal(
+        loaded.pre_ref.raw_body_sha256,
+        rawDigest(wrapped.selectedBytes),
+      );
+    });
+
+    await t.test("UTF-8 BOM is not normalized into valid JSON", async () => {
+      const { ledger } = await initializedLedgerWithFirstRefMutation(
+        (bytes) => Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), bytes]),
+      );
+      await assert.rejects(
+        ledger.load(),
+        (error) => error.code === "invalid-api-json",
+      );
+    });
+
+    await t.test("malformed UTF-8 remains rejected before JSON parsing", async () => {
+      const { ledger } = await initializedLedgerWithFirstRefMutation(
+        () => Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x80, 0x7d]),
+      );
+      await assert.rejects(
+        ledger.load(),
+        (error) => error.code === "invalid-api-utf8",
+      );
+    });
   });
 });
 

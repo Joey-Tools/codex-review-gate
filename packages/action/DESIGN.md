@@ -102,8 +102,30 @@ evidence.
 ## Plan-only composite adapter
 
 `action.yml` executes `src/v2/action.mjs`. It accepts an operation input path
-under `RUNNER_TEMP`, validates that the path is controller-owned rather than
-checkout/PR-controlled, performs read-only transport, and returns closed plans.
+under `RUNNER_TEMP`, confines the read to the selected `RUNNER_TEMP` directory
+object rather than a checkout/PR-controlled path, performs read-only transport,
+and returns closed plans.
+
+On Linux and macOS, the reader holds the selected `RUNNER_TEMP` directory open
+while one isolated child walks from `/`. Each directory component is opened
+without following the leaf, held across `chdir`, and compared by device, inode,
+and file type before traversal continues. The leaf is opened nonblocking and
+without following it in the parent and remains held as inherited descriptor 4.
+The child reads only that selected descriptor and requires the relative leaf to
+match its device, inode, file type, access policy, and selected size both before
+and after the two positioned reads. The stable bytes must also be strict UTF-8
+and the unique canonical JSON representation. This protects against redirection
+to a different directory or leaf object; it does not prove producer provenance
+or that a race-time symlink resolving to the same object was never traversed.
+It also assumes no privileged bind-mount, mount-namespace, or filesystem
+identity-semantic attack; those require native mount-aware APIs. Other platforms
+fail closed.
+
+At each observed leaf stat, the access-policy predicate is exactly: regular
+file, link count one, and POSIX group/other write mode bits clear. It does not
+inspect extended ACLs and does not establish protection from a same-UID writer,
+owner provenance, or privileged mount authority; those are outside the fixed
+Ubuntu production threat model.
 
 Its operations are `prepare-request`, `bind-request`, and `evaluate-only`.
 Its required, no-default status target enum is `head` or

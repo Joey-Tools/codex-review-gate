@@ -143,6 +143,7 @@ const POST_RESPONSE_KEYS = Object.freeze([
   "status",
   "server_time",
   "raw_body",
+  "raw_body_sha256",
   "attempt",
 ]);
 const RESERVATION_KEYS = Object.freeze([
@@ -222,12 +223,18 @@ const RUNNER_CANDIDATE_SUPPRESSION_RESULT_BINDINGS = new SafeWeakMap();
  */
 export async function runV2Operation(rawInput, rawDependencies) {
   const input = validateRunnerInput(rawInput);
-  const candidateSuppressionInput = deepFreeze(safeStructuredClone(input));
+  const candidateSuppressionInput = input.operation === "prepare-request"
+    ? deepFreeze(safeStructuredClone(input))
+    : safeObjectFreeze({ operation: input.operation });
   const dependencies = validateDependencies(rawDependencies);
-  const responseArtifact = input.operation === "bind-request"
-    ? parsePostResponse(input.post_response, input.reservation)
+  const normalizedResponseReservation = input.operation === "bind-request"
+    ? validateReservation(input.reservation)
     : null;
-  const bindArtifactSelectors = responseArtifact === null
+  const responseCapture = input.operation === "bind-request"
+    ? parsePostResponse(input.post_response, normalizedResponseReservation)
+    : null;
+  const responseArtifact = responseCapture?.response ?? null;
+  const bindArtifactSelectors = responseCapture === null
     ? []
     : [{ kind: "issue_comment", id: responseArtifact.id }];
   const discoverySnapshot = await dependencies.transport.loadSnapshot({
@@ -356,9 +363,9 @@ export async function runV2Operation(rawInput, rawDependencies) {
       kind: "issue_comment",
       id: responseArtifact.id,
     });
-    bindingReceipt = bindV2Request({
-      reservation: input.reservation,
-      post_response: input.post_response,
+    bindingReceipt = bindCapturedV2Request({
+      normalized_reservation: normalizedResponseReservation,
+      response_capture: responseCapture,
       response_artifact: responseArtifact,
       snapshot: evidenceSnapshot,
       exact_artifact: exactArtifact,
@@ -1211,16 +1218,39 @@ export function bindV2Request({
   binding_ledger,
 }) {
   const normalizedReservation = validateReservation(reservation);
-  const parsedResponse = parsePostResponse(post_response, normalizedReservation);
-  if (response_artifact !== null && !isDeepEqual(response_artifact, parsedResponse)) {
+  const responseCapture = parsePostResponse(post_response, normalizedReservation);
+  return bindCapturedV2Request({
+    normalized_reservation: normalizedReservation,
+    response_capture: responseCapture,
+    response_artifact,
+    snapshot,
+    exact_artifact,
+    scheduler_automatic_request,
+    binding_ledger,
+  });
+}
+
+function bindCapturedV2Request({
+  normalized_reservation: normalizedReservation,
+  response_capture: responseCapture,
+  response_artifact,
+  snapshot,
+  exact_artifact,
+  scheduler_automatic_request,
+  binding_ledger,
+}) {
+  if (
+    response_artifact !== null &&
+    !isDeepEqual(response_artifact, responseCapture.response)
+  ) {
     throw runnerError(
       "POST_RESPONSE_PARSE_MISMATCH",
       "pre-parsed POST response does not equal the exact 201 response body",
     );
   }
-  const response = parsedResponse;
+  const response = responseCapture.response;
   const attempt = validateAttemptReceipt(
-    post_response.attempt,
+    responseCapture.attempt,
     normalizedReservation,
     scheduler_automatic_request,
   );
@@ -1292,11 +1322,10 @@ export function bindV2Request({
     );
   }
 
-  const responseRawDigest = digestRaw(post_response.raw_body);
   const responseRecord = {
     status: 201,
     server_time: response.server_time,
-    raw_body_sha256: responseRawDigest,
+    raw_body_sha256: responseCapture.raw_body_sha256,
     id: response.id,
     node_id: response.node_id,
     url: response.url,
@@ -1579,16 +1608,38 @@ function buildPostIntent(reservation) {
 
 function parsePostResponse(postResponse, reservation) {
   assertClosedRecord(postResponse, POST_RESPONSE_KEYS, "post_response");
-  if (postResponse.status !== 201) {
+  const status = postResponse.status;
+  const rawServerTime = postResponse.server_time;
+  const rawBody = postResponse.raw_body;
+  const rawBodySha256Value = postResponse.raw_body_sha256;
+  const attempt = postResponse.attempt;
+  if (status !== 201) {
     throw runnerError("POST_RESPONSE_NOT_CREATED", "bind-request requires exact HTTP 201");
   }
-  const serverTime = canonicalTimestamp(postResponse.server_time, "post_response.server_time");
-  if (typeof postResponse.raw_body !== "string" || postResponse.raw_body.length === 0) {
+  const serverTime = canonicalTimestamp(rawServerTime, "post_response.server_time");
+  if (typeof rawBody !== "string" || rawBody.length === 0) {
     throw new TypeError("post_response.raw_body must be the non-empty exact response text");
+  }
+  const rawBodyBytes = Buffer.from(rawBody, "utf8");
+  if (rawBodyBytes.toString("utf8") !== rawBody) {
+    throw runnerError(
+      "POST_RESPONSE_INVALID_UTF8",
+      "post_response.raw_body must be strict UTF-8 and round-trip without substitution",
+    );
+  }
+  const rawBodySha256 = digestString(
+    rawBodySha256Value,
+    "post_response.raw_body_sha256",
+  );
+  if (digestRaw(rawBodyBytes) !== rawBodySha256) {
+    throw runnerError(
+      "POST_RESPONSE_DIGEST_MISMATCH",
+      "post_response.raw_body_sha256 does not match the exact response bytes",
+    );
   }
   let body;
   try {
-    body = JSON.parse(postResponse.raw_body);
+    body = JSON.parse(rawBody);
   } catch (error) {
     throw runnerError("POST_RESPONSE_INVALID_JSON", "201 response body is not valid JSON", {
       cause: error,
@@ -1640,7 +1691,11 @@ function parsePostResponse(postResponse, reservation) {
       "created comment URLs do not bind the reserved repository and pull request",
     );
   }
-  return response;
+  return {
+    response,
+    raw_body_sha256: rawBodySha256,
+    attempt,
+  };
 }
 
 function validateExactArtifact(exactEntry, response) {
@@ -2436,7 +2491,7 @@ function normalizeApp(value) {
 }
 
 function digestRaw(value) {
-  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function digestCanonical(domain, value) {

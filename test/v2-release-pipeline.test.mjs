@@ -75,6 +75,7 @@ const EXPECTED_V2_RUNTIME_MODULE_PATHS = Object.freeze([
   "src/v2/action.mjs",
   "src/v2/candidate-inventory.mjs",
   "src/v2/control-plane-receipt.mjs",
+  "src/v2/controller-input-reader.mjs",
   "src/v2/effect-status-wal.mjs",
   "src/v2/git-ledger.mjs",
   "src/v2/persistent-frontier.mjs",
@@ -93,7 +94,6 @@ const EXPECTED_V2_RUNTIME_MODULE_PATHS = Object.freeze([
 ]);
 const SOURCE_ONLY_REQUIRED_CI_PATHS = Object.freeze([
   ".github/workflows/required-ci.yml",
-  ".github/workflows/required-ci-router.yml",
 ]);
 const PRODUCTION_ACTION_REPOSITORY = "Joey-Tools/codex-review-gate-action";
 const PRODUCTION_REUSABLE_PATH = ".github/workflows/codex-review-gate.yml";

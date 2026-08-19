@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 
+const requireFromTest = createRequire(import.meta.url);
+const mutableTimers = requireFromTest("node:timers");
 const FRONTIER_MODULE =
   "../packages/action/src/v2/persistent-frontier.mjs";
 const EPOCH_ID = `sha256:${"a".repeat(64)}`;
@@ -1037,6 +1040,347 @@ test("persistent frontier keeps cursor state off mutable collection methods", as
     (error) => error.code === "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
   );
   assert.equal(poisonedArrayIteratorCalls, 0);
+});
+
+test("persistent frontier duration fence survives wall-clock rollback", async (context) => {
+  const current = await import(FRONTIER_MODULE);
+  const store = memoryBlobStore();
+  const writer = current.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    ...store.adapter,
+  });
+  const published = await writer.apply({
+    root: writer.emptyRoot(),
+    updates: [{ key: { number: 1 }, value: { state: "open" } }],
+    mode: "upsert",
+  });
+
+  let wallNow = 1_000_000;
+  let monotonicNow = 10_000;
+  context.mock.method(Date, "now", () => wallNow);
+  context.mock.method(performance, "now", () => monotonicNow);
+  const isolated = await import(`${FRONTIER_MODULE}?monotonic-wall-rollback`);
+  let observedWallDeadline = null;
+  const reader = isolated.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    operation_limits: { max_duration_ms: 25 },
+    readBlob(objectOid, options) {
+      observedWallDeadline = options.deadline_ms;
+      wallNow -= 60_000;
+      monotonicNow += 26;
+      return store.adapter.readBlob(objectOid, options);
+    },
+    writeBlob: async () => assert.fail("deadline probe must not write"),
+  });
+
+  await assert.rejects(
+    reader.lookup({ root: published.root, key: { number: 1 } }),
+    (error) => error.code === "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
+  );
+  assert.equal(
+    observedWallDeadline,
+    1_000_025,
+    "adapter evidence retains its wall-clock deadline",
+  );
+});
+
+test("persistent frontier rejects settlement at the exact monotonic deadline", async (context) => {
+  const current = await import(FRONTIER_MODULE);
+  const store = memoryBlobStore();
+  const writer = current.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    ...store.adapter,
+  });
+  const published = await writer.apply({
+    root: writer.emptyRoot(),
+    updates: [{ key: { number: 1 }, value: { state: "open" } }],
+    mode: "upsert",
+  });
+
+  let wallNow = 1_000_000;
+  let monotonicNow = 10_000;
+  context.mock.method(Date, "now", () => wallNow);
+  context.mock.method(performance, "now", () => monotonicNow);
+  const isolated = await import(`${FRONTIER_MODULE}?monotonic-exact-boundary`);
+  const reader = isolated.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    operation_limits: { max_duration_ms: 25 },
+    readBlob(objectOid, options) {
+      monotonicNow += 25;
+      return store.adapter.readBlob(objectOid, options);
+    },
+    writeBlob: async () => assert.fail("deadline probe must not write"),
+  });
+
+  await assert.rejects(
+    reader.lookup({ root: published.root, key: { number: 1 } }),
+    (error) => error.code === "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
+  );
+});
+
+test("persistent frontier ignores wall-clock jumps for duration enforcement", async (context) => {
+  const current = await import(FRONTIER_MODULE);
+  const store = memoryBlobStore();
+  const writer = current.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    ...store.adapter,
+  });
+  const published = await writer.apply({
+    root: writer.emptyRoot(),
+    updates: [{ key: { number: 1 }, value: { state: "open" } }],
+    mode: "upsert",
+  });
+
+  let wallNow = 1_000_000;
+  let monotonicNow = 10_000;
+  context.mock.method(Date, "now", () => wallNow);
+  context.mock.method(performance, "now", () => monotonicNow);
+  const isolated = await import(`${FRONTIER_MODULE}?wall-clock-forward-jump`);
+  let observedWallDeadline = null;
+  const reader = isolated.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    operation_limits: { max_duration_ms: 25 },
+    readBlob(objectOid, options) {
+      observedWallDeadline = options.deadline_ms;
+      wallNow += 60_000;
+      monotonicNow += 24;
+      return store.adapter.readBlob(objectOid, options);
+    },
+    writeBlob: async () => assert.fail("deadline probe must not write"),
+  });
+
+  assert.deepEqual(
+    await reader.lookup({ root: published.root, key: { number: 1 } }),
+    { found: true, value: { state: "open" } },
+  );
+  assert.equal(observedWallDeadline, 1_000_025);
+});
+
+test("persistent frontier rearms an early timer until monotonic expiry", async (context) => {
+  const current = await import(FRONTIER_MODULE);
+  const store = memoryBlobStore();
+  const writer = current.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    ...store.adapter,
+  });
+  const published = await writer.apply({
+    root: writer.emptyRoot(),
+    updates: [{ key: { number: 1 }, value: { state: "open" } }],
+    mode: "upsert",
+  });
+
+  let wallNow = 1_000_000;
+  let monotonicNow = 10_000;
+  const timerHandles = [];
+  context.mock.method(Date, "now", () => wallNow);
+  context.mock.method(performance, "now", () => monotonicNow);
+  context.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    const handle = { callback, cleared: false, delay };
+    timerHandles.push(handle);
+    return handle;
+  });
+  context.mock.method(globalThis, "clearTimeout", (handle) => {
+    handle.cleared = true;
+  });
+  const isolated = await import(`${FRONTIER_MODULE}?early-timeout-callback`);
+  let requestSignal = null;
+  const reader = isolated.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    operation_limits: { max_duration_ms: 25 },
+    readBlob: async (_objectOid, { signal }) => {
+      requestSignal = signal;
+      return new Promise(() => {});
+    },
+    writeBlob: async () => assert.fail("deadline probe must not write"),
+  });
+
+  const pending = reader.lookup({
+    root: published.root,
+    key: { number: 1 },
+  });
+  let outcome = "pending";
+  void pending.then(
+    () => { outcome = "resolved"; },
+    (error) => { outcome = error.code; },
+  );
+  for (let index = 0; index < 4 && timerHandles.length === 0; index += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(timerHandles.length, 1);
+  assert.equal(timerHandles[0].delay, 25);
+
+  timerHandles[0].callback();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(outcome, "pending", "an early timer callback cannot expire the call");
+  assert.equal(requestSignal?.aborted, false);
+  assert.equal(timerHandles.length, 2);
+  assert.equal(timerHandles[1].delay, 25);
+
+  monotonicNow += 25;
+  timerHandles[1].callback();
+  await assert.rejects(
+    pending,
+    (error) => error.code === "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
+  );
+  assert.equal(requestSignal?.aborted, false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(timerHandles[1].cleared, true);
+});
+
+test("persistent frontier timeout settles before bounded abort cleanup and ignores timer export poison", async (context) => {
+  const current = await import(FRONTIER_MODULE);
+  const store = memoryBlobStore();
+  const writer = current.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    ...store.adapter,
+  });
+  const published = await writer.apply({
+    root: writer.emptyRoot(),
+    updates: [{ key: { number: 1 }, value: { state: "open" } }],
+    mode: "upsert",
+  });
+
+  let monotonicNow = 10_000;
+  const timerHandles = [];
+  context.mock.method(Date, "now", () => 1_000_000);
+  context.mock.method(performance, "now", () => monotonicNow);
+  context.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    const handle = { callback, cleared: false, delay };
+    timerHandles.push(handle);
+    return handle;
+  });
+  context.mock.method(globalThis, "clearTimeout", (handle) => {
+    handle.cleared = true;
+  });
+
+  const isolated = await import(
+    `${FRONTIER_MODULE}?deferred-bounded-abort-cleanup`
+  );
+  let requestSignal = null;
+  let failureObserved = false;
+  let abortCalls = 0;
+  let abortObservedAfterFailure = null;
+  let caughtError = null;
+  let cleanupReasonBeforeMutation = null;
+  let synchronousWork = 0;
+  const reader = isolated.createV2PersistentMerkleMap({
+    domain: "candidate-current-state",
+    epoch_id: EPOCH_ID,
+    operation_limits: { max_duration_ms: 25 },
+    readBlob: async (_objectOid, { signal }) => {
+      requestSignal = signal;
+      signal.addEventListener("abort", () => {
+        abortCalls += 1;
+        abortObservedAfterFailure = failureObserved;
+        for (let index = 0; index < 1_000; index += 1) {
+          synchronousWork += index & 1;
+        }
+        cleanupReasonBeforeMutation = {
+          value: signal.reason,
+          name: signal.reason.name,
+          code: signal.reason.code,
+          details: signal.reason.details,
+          prototype: Object.getPrototypeOf(signal.reason),
+        };
+        signal.reason.name = "MutatedCleanupError";
+        signal.reason.code = "MUTATED_CLEANUP_REASON";
+        signal.reason.details = { mutated: true };
+      }, { once: true });
+      return new Promise(() => {});
+    },
+    writeBlob: async () => assert.fail("deadline probe must not write"),
+  });
+
+  const pending = reader.lookup({
+    root: published.root,
+    key: { number: 1 },
+  });
+  for (let index = 0;
+    index < 8 && (timerHandles.length === 0 || requestSignal === null);
+    index += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(timerHandles.length, 1);
+  assert.notEqual(requestSignal, null);
+
+  const originalSetImmediate = mutableTimers.setImmediate;
+  let poisonedSchedulerCalls = 0;
+  let poisonedCallbackCalls = 0;
+  let timerCallbackError = null;
+  mutableTimers.setImmediate = (callback) => {
+    poisonedSchedulerCalls += 1;
+    callback();
+    poisonedCallbackCalls += 1;
+    callback();
+    poisonedCallbackCalls += 1;
+    return { poisoned: true };
+  };
+  syncBuiltinESMExports();
+  try {
+    monotonicNow += 25;
+    timerHandles[0].callback();
+  } catch (error) {
+    timerCallbackError = error;
+  } finally {
+    mutableTimers.setImmediate = originalSetImmediate;
+    syncBuiltinESMExports();
+  }
+  assert.equal(timerCallbackError, null);
+  assert.equal(poisonedSchedulerCalls, 0);
+  assert.equal(poisonedCallbackCalls, 0);
+
+  try {
+    await pending;
+    assert.fail("deadline probe must reject");
+  } catch (error) {
+    caughtError = error;
+  }
+  failureObserved = true;
+  assert.equal(caughtError.name, "V2PersistentFrontierError");
+  assert.equal(caughtError.code, "PERSISTENT_FRONTIER_OPERATION_TIMEOUT");
+  assert.equal(caughtError.details, null);
+  assert.equal(Object.hasOwn(caughtError, "cause"), false);
+  assert.equal(
+    Object.getPrototypeOf(caughtError),
+    isolated.V2PersistentFrontierError.prototype,
+  );
+  assert.equal(abortCalls, 0);
+  assert.equal(requestSignal.aborted, false);
+  assert.equal(timerHandles[0].cleared, true);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(abortCalls, 1);
+  assert.equal(abortObservedAfterFailure, true);
+  assert.equal(requestSignal.aborted, true);
+  assert.notEqual(requestSignal.reason, caughtError);
+  assert.equal(cleanupReasonBeforeMutation.value, requestSignal.reason);
+  assert.equal(cleanupReasonBeforeMutation.name, "Error");
+  assert.equal(cleanupReasonBeforeMutation.code, undefined);
+  assert.equal(cleanupReasonBeforeMutation.details, undefined);
+  assert.equal(cleanupReasonBeforeMutation.prototype, Error.prototype);
+  assert.equal(requestSignal.reason.name, "MutatedCleanupError");
+  assert.equal(requestSignal.reason.code, "MUTATED_CLEANUP_REASON");
+  assert.deepEqual(requestSignal.reason.details, { mutated: true });
+  assert.equal(caughtError.name, "V2PersistentFrontierError");
+  assert.equal(caughtError.code, "PERSISTENT_FRONTIER_OPERATION_TIMEOUT");
+  assert.equal(caughtError.details, null);
+  assert.equal(Object.hasOwn(caughtError, "cause"), false);
+  assert.equal(
+    Object.getPrototypeOf(caughtError),
+    isolated.V2PersistentFrontierError.prototype,
+  );
+  assert.equal(synchronousWork, 500);
 });
 
 test("persistent frontier resists accidental canonical helper monkey patches", async () => {

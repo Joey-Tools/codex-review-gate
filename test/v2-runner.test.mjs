@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -281,6 +282,10 @@ test("bind requires exact 201, exact request body, stable scope, and exact refet
   });
 
   assert.equal(receipt.post_response.status, 201);
+  assert.equal(
+    receipt.post_response.raw_body_sha256,
+    postResponse.raw_body_sha256,
+  );
   assert.equal(receipt.post_response.body, V2_REQUEST_BODY);
   assert.equal(receipt.post_response.created_at, receipt.post_response.updated_at);
   assert.equal(receipt.post_refetch.artifact_id, "501");
@@ -340,6 +345,114 @@ test("bind requires exact 201, exact request body, stable scope, and exact refet
     }),
     /field body/u,
   );
+});
+
+test("bind requires a strict UTF-8 POST body bound to its captured byte digest", () => {
+  const snapshot = makeSnapshot();
+  const reservation = prepareV2Request({
+    snapshot,
+    head_ledger: makeLedger(snapshot),
+    scheduler_post_action: schedulerPostAction(),
+  });
+  const postResponse = makePostResponse(reservation);
+  const exactArtifact = {
+    selector: { kind: "issue_comment", id: "501" },
+    artifact: normalizedCreatedComment(),
+    response_server_time: "2026-08-13T12:00:02.000Z",
+    raw_body_sha256: digest("b"),
+  };
+  const bind = (response) => bindV2Request({
+    reservation,
+    post_response: response,
+    snapshot,
+    scheduler_automatic_request: attemptedSchedulerState(reservation),
+    binding_ledger: makeLedger(snapshot, { automatic_request_count: 1 }),
+    exact_artifact: exactArtifact,
+  });
+
+  const { raw_body_sha256: omittedDigest, ...missingDigest } = postResponse;
+  assert.equal(typeof omittedDigest, "string");
+  assert.throws(() => bind(missingDigest), /closed schema.*raw_body_sha256/u);
+
+  const loneSurrogateBody = postResponse.raw_body.replace(
+    V2_REQUEST_BODY,
+    `${V2_REQUEST_BODY}\ud800`,
+  );
+  assert.throws(
+    () => bind({
+      ...postResponse,
+      raw_body: loneSurrogateBody,
+      raw_body_sha256: sha256Utf8(loneSurrogateBody),
+    }),
+    /strict UTF-8/u,
+  );
+  assert.throws(
+    () => bind({ ...postResponse, raw_body_sha256: digest("0") }),
+    /does not match the exact response bytes/u,
+  );
+
+  const replacementBody = JSON.stringify({
+    ...JSON.parse(postResponse.raw_body),
+    transport_note: "\ufffd",
+  });
+  const replacementDigest = sha256Utf8(replacementBody);
+  const receipt = bind({
+    ...postResponse,
+    raw_body: replacementBody,
+    raw_body_sha256: replacementDigest,
+  });
+  assert.equal(receipt.post_response.raw_body_sha256, replacementDigest);
+});
+
+test("bind consumes one snapshot of accessor-backed POST response raw fields", () => {
+  const snapshot = makeSnapshot();
+  const reservation = prepareV2Request({
+    snapshot,
+    head_ledger: makeLedger(snapshot),
+    scheduler_post_action: schedulerPostAction(),
+  });
+  const exactArtifact = {
+    selector: { kind: "issue_comment", id: "501" },
+    artifact: normalizedCreatedComment(),
+    response_server_time: "2026-08-13T12:00:02.000Z",
+    raw_body_sha256: digest("b"),
+  };
+  const bind = (response) => bindV2Request({
+    reservation,
+    post_response: response,
+    snapshot,
+    scheduler_automatic_request: attemptedSchedulerState(reservation),
+    binding_ledger: makeLedger(snapshot, { automatic_request_count: 1 }),
+    exact_artifact: exactArtifact,
+  });
+
+  const bodyCapture = makePostResponse(reservation);
+  const exactRawBody = bodyCapture.raw_body;
+  let rawBodyReads = 0;
+  Object.defineProperty(bodyCapture, "raw_body", {
+    enumerable: true,
+    get() {
+      rawBodyReads += 1;
+      return rawBodyReads === 1 ? exactRawBody : "\ud800";
+    },
+  });
+  const bodyReceipt = bind(bodyCapture);
+  assert.equal(rawBodyReads, 1);
+  assert.equal(bodyReceipt.post_response.raw_body_sha256, sha256Utf8(exactRawBody));
+
+  const digestCapture = makePostResponse(reservation);
+  const exactDigest = digestCapture.raw_body_sha256;
+  let digestReads = 0;
+  Object.defineProperty(digestCapture, "raw_body_sha256", {
+    enumerable: true,
+    get() {
+      digestReads += 1;
+      return digestReads === 1 ? exactDigest : digest("0");
+    },
+  });
+  const digestReceipt = bind(digestCapture);
+  assert.equal(digestReads, 1);
+  assert.equal(digestReceipt.post_response.raw_body_sha256, exactDigest);
 });
 
 test("bind rejects replay, missing attempt authority, and post-hoc causal ordering", () => {
@@ -420,7 +533,28 @@ test("bind-request projects its provisional request only in the current incarnat
   const input = makeRunnerInput({ operation: "bind-request", snapshot });
   input.controller = { request_bindings: [] };
   input.reservation = reservation;
-  input.post_response = makePostResponse(reservation);
+  const postResponse = makePostResponse(reservation);
+  const rawBody = postResponse.raw_body;
+  const rawBodySha256 = postResponse.raw_body_sha256;
+  let rawBodyReads = 0;
+  let rawBodySha256Reads = 0;
+  Object.defineProperties(postResponse, {
+    raw_body: {
+      enumerable: true,
+      get() {
+        rawBodyReads += 1;
+        return rawBodyReads === 1 ? rawBody : "\ud800";
+      },
+    },
+    raw_body_sha256: {
+      enumerable: true,
+      get() {
+        rawBodySha256Reads += 1;
+        return rawBodySha256Reads === 1 ? rawBodySha256 : digest("0");
+      },
+    },
+  });
+  input.post_response = postResponse;
   input.head_ledger = makeLedger(snapshot, { automatic_request_count: 1 });
   input.scheduling.epoch.automatic_request = attemptedSchedulerState(reservation);
   let projectedBinding = null;
@@ -456,6 +590,9 @@ test("bind-request projects its provisional request only in the current incarnat
   assert.equal(projectedBinding.current_incarnation, true);
   assert.equal(projectedBinding.id, "501");
   assert.equal(output.binding_receipt.post_refetch.artifact_id, "501");
+  assert.equal(rawBodyReads, 1);
+  assert.equal(rawBodySha256Reads, 1);
+  assert.equal(output.binding_receipt.post_response.raw_body_sha256, rawBodySha256);
 });
 
 test("evaluate-only loads discovery and exact-evidence snapshots without mutation actions", async () => {
@@ -1967,6 +2104,22 @@ function scopeReceiptWithEndpointEvidence(receipt) {
 }
 
 function makePostResponse(reservation) {
+  const rawBody = JSON.stringify({
+    id: 501,
+    node_id: "IC_501",
+    url: "https://api.github.test/repos/owner/repo/issues/comments/501",
+    html_url: "https://github.com/owner/repo/pull/42#issuecomment-501",
+    issue_url: "https://api.github.test/repos/owner/repo/issues/42",
+    user: { id: 1001, login: "github-actions[bot]", type: "Bot", node_id: "BOT_actions" },
+    performed_via_github_app: {
+      id: 15368,
+      slug: "github-actions",
+      node_id: "APP_actions",
+    },
+    body: V2_REQUEST_BODY,
+    created_at: "2026-08-13T12:00:01.000Z",
+    updated_at: "2026-08-13T12:00:01.000Z",
+  });
   return {
     status: 201,
     server_time: "2026-08-13T12:00:01.000Z",
@@ -1974,22 +2127,8 @@ function makePostResponse(reservation) {
       reservation,
       recorded_at: reservation.created_at,
     }),
-    raw_body: JSON.stringify({
-      id: 501,
-      node_id: "IC_501",
-      url: "https://api.github.test/repos/owner/repo/issues/comments/501",
-      html_url: "https://github.com/owner/repo/pull/42#issuecomment-501",
-      issue_url: "https://api.github.test/repos/owner/repo/issues/42",
-      user: { id: 1001, login: "github-actions[bot]", type: "Bot", node_id: "BOT_actions" },
-      performed_via_github_app: {
-        id: 15368,
-        slug: "github-actions",
-        node_id: "APP_actions",
-      },
-      body: V2_REQUEST_BODY,
-      created_at: "2026-08-13T12:00:01.000Z",
-      updated_at: "2026-08-13T12:00:01.000Z",
-    }),
+    raw_body: rawBody,
+    raw_body_sha256: sha256Utf8(rawBody),
   };
 }
 
@@ -2079,4 +2218,8 @@ function sha(character) {
 
 function digest(character) {
   return `sha256:${character.repeat(64)}`;
+}
+
+function sha256Utf8(value) {
+  return `sha256:${createHash("sha256").update(Buffer.from(value, "utf8")).digest("hex")}`;
 }

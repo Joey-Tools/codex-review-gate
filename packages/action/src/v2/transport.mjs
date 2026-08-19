@@ -1,6 +1,23 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
+import { setImmediate as scheduleImmediateBinding } from "node:timers";
 import { isDeepStrictEqual, TextDecoder } from "node:util";
+
+const safeSetImmediate = scheduleImmediateBinding;
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const TYPED_ARRAY_BUFFER_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "buffer",
+).get;
+const TYPED_ARRAY_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteLength",
+).get;
+const TYPED_ARRAY_BYTE_OFFSET_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteOffset",
+).get;
 
 export const V2_GITHUB_SNAPSHOT_SCHEMA_VERSION = 2;
 
@@ -30,6 +47,7 @@ const REVIEW_STATES = new Set([
 ]);
 const DIFF_SIDES = new Set(["LEFT", "RIGHT"]);
 const SERVICE_START_APP_SLUG = "chatgpt-codex-connector";
+const MAX_V2_TRANSPORT_RESPONSE_CHUNKS = 4_096;
 const CHECK_RUN_STATUSES = new Set([
   "queued",
   "in_progress",
@@ -186,6 +204,13 @@ export class V2TransportError extends Error {
   }
 }
 
+/**
+ * Same-realm fetch adapters and their AbortSignal listeners are trusted code:
+ * they must be nonthrowing, avoid synchronous blocking, and cooperate with
+ * cancellation. A same-thread deadline cannot preempt synchronous adapter code.
+ * Remote-derived response metadata, body chunks, and reader results are instead
+ * validated as untrusted input. Direct cancel/release cleanup throws are ignored.
+ */
 export function createV2GitHubTransport(options = {}) {
   assertClosedObject(options, "transport options", [
     "fetch",
@@ -275,6 +300,7 @@ export async function loadV2GitHubSnapshot(options) {
  * This deliberately performs exactly one REST GET. The caller supplies the
  * complete expected provider identities because the public Codex identity
  * strings alone do not bind one GitHub actor or App object.
+ * Its injected fetch adapter follows createV2GitHubTransport's trust contract.
  */
 export async function loadV2ProviderPreScopeArtifact(options) {
   assertClosedObject(options, "provider pre-scope options", [
@@ -677,6 +703,7 @@ class TransportWork {
     let totalCheckRuns = null;
     let loadedCheckRuns = 0;
     let lastServerTime = null;
+    let expectedLastPage = null;
 
     for (let page = 1; page <= this.limits.max_pages; page += 1) {
       const response = await this.rest(
@@ -764,21 +791,56 @@ class TransportWork {
           `${phase} current-head check-run pages exceeded total_count=${totalCheckRuns}`,
         );
       }
-      const linkedNext = parseAndValidateNextLink(
+      const pagination = parseAndValidatePaginationLink(
         response.headers.get("link"),
         this.restBaseUrl,
         path,
         page,
         this.limits.page_size,
+        this.limits.max_pages,
         `${phase} current-head check runs`,
         { filter: "all" },
       );
+      if (pagination.lastPage !== null) {
+        if (
+          expectedLastPage !== null &&
+          pagination.lastPage !== expectedLastPage
+        ) {
+          throw transportFailure(
+            "INCOMPLETE_PAGINATION",
+            `${phase} current-head check-run pagination changed its promised last page ` +
+              `from ${expectedLastPage} to ${pagination.lastPage}`,
+          );
+        }
+        expectedLastPage = pagination.lastPage;
+      }
+      if (
+        expectedLastPage !== null &&
+        (
+          page > expectedLastPage ||
+          (page < expectedLastPage && pagination.nextPage !== page + 1) ||
+          (page === expectedLastPage && pagination.nextPage !== null)
+        )
+      ) {
+        throw transportFailure(
+          "INCOMPLETE_PAGINATION",
+          `${phase} current-head check-run page ${page} violated its promised last page ` +
+            `${expectedLastPage}`,
+        );
+      }
       if (loadedCheckRuns === totalCheckRuns) {
-        if (linkedNext) {
+        if (pagination.nextPage !== null) {
           throw transportFailure(
             "INVALID_PAGINATION_LINK",
             `${phase} current-head check-run page ${page} advertised another page after ` +
               "total_count was satisfied",
+          );
+        }
+        if (expectedLastPage !== null && page !== expectedLastPage) {
+          throw transportFailure(
+            "INCOMPLETE_PAGINATION",
+            `${phase} current-head check-run total_count was satisfied on page ${page} ` +
+              `before promised last page ${expectedLastPage}`,
           );
         }
         matchingRuns.sort(compareDecimalIdObjects);
@@ -798,6 +860,13 @@ class TransportWork {
           "INCOMPLETE_PAGINATION",
           `${phase} current-head check-run page ${page} ended before ` +
             `total_count=${totalCheckRuns} was satisfied`,
+        );
+      }
+      if (pagination.nextPage !== page + 1) {
+        throw transportFailure(
+          "INCOMPLETE_PAGINATION",
+          `${phase} current-head check-run page ${page} did not link the next page ` +
+            `before total_count=${totalCheckRuns} was satisfied`,
         );
       }
     }
@@ -1410,6 +1479,7 @@ class TransportWork {
   async paginateRest(path, label, normalize) {
     const result = [];
     const ids = new Set();
+    let expectedLastPage = null;
     for (let page = 1; page <= this.limits.max_pages; page += 1) {
       const response = await this.rest(
         "GET",
@@ -1442,15 +1512,42 @@ class TransportWork {
         ids.add(item.id);
         result.push(item);
       }
-      const linkedNext = parseAndValidateNextLink(
+      const pagination = parseAndValidatePaginationLink(
         response.headers.get("link"),
         this.restBaseUrl,
         path,
         page,
         this.limits.page_size,
+        this.limits.max_pages,
         label,
       );
-      if (!linkedNext && response.data.length < this.limits.page_size) {
+      if (pagination.lastPage !== null) {
+        if (
+          expectedLastPage !== null &&
+          pagination.lastPage !== expectedLastPage
+        ) {
+          throw transportFailure(
+            "INCOMPLETE_PAGINATION",
+            `${label} changed its promised last page from ${expectedLastPage} to ` +
+              `${pagination.lastPage}`,
+          );
+        }
+        expectedLastPage = pagination.lastPage;
+      }
+      if (
+        expectedLastPage !== null &&
+        (
+          page > expectedLastPage ||
+          (page < expectedLastPage && pagination.nextPage !== page + 1) ||
+          (page === expectedLastPage && pagination.nextPage !== null)
+        )
+      ) {
+        throw transportFailure(
+          "INCOMPLETE_PAGINATION",
+          `${label} page ${page} violated its promised last page ${expectedLastPage}`,
+        );
+      }
+      if (pagination.nextPage === null) {
         return result;
       }
     }
@@ -1549,27 +1646,27 @@ class TransportWork {
       );
     }
     this.requestCount += 1;
-    const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(new Error(`${label} timed out`)),
-      this.limits.request_timeout_ms,
-    );
+    const deadline = new RequestDeadline(this.limits.request_timeout_ms, label);
     let response;
     let rawBody;
     let serverTime;
+    let cancelResponse = () => {};
     try {
-      response = await this.fetchImpl(url, {
+      deadline.checkpoint();
+      const fetchOperation = this.fetchImpl(url, {
         ...options,
         redirect: "error",
-        signal: controller.signal,
+        signal: deadline.signal,
       });
+      response = await awaitRequestOperation(fetchOperation, deadline, {
+        onLateFulfilled: cancelResponseBody,
+      });
+      cancelResponse = createBestEffortOnce(() => cancelResponseBody(response));
+      deadline.checkpoint();
       if (
         response === null ||
         typeof response !== "object" ||
-        (
-          typeof response.arrayBuffer !== "function" &&
-          typeof response.body?.getReader !== "function"
-        ) ||
+        typeof response.body?.getReader !== "function" ||
         !response.headers ||
         typeof response.headers.get !== "function" ||
         !Number.isInteger(response.status)
@@ -1579,78 +1676,104 @@ class TransportWork {
           `${label} fetch did not return a Response-compatible object`,
         );
       }
+      deadline.checkpoint();
       serverTime = normalizeServerDate(response.headers.get("date"), label);
       this.observeServerTime(serverTime, label);
+      deadline.checkpoint();
       const declaredLength = parseContentLength(response.headers.get("content-length"), label);
       if (declaredLength !== null) {
         this.enforceResponseBudget(declaredLength, this.responseBytes, label, true);
       }
+      deadline.checkpoint();
       const remainingWorkBytes = this.limits.max_total_response_bytes - this.responseBytes;
       rawBody = await readBoundedResponseBody(
         response,
         Math.min(this.limits.max_response_bytes, remainingWorkBytes),
         label,
-        controller,
+        deadline,
       );
-    } catch (error) {
-      if (error instanceof V2TransportError) {
-        throw error;
-      }
-      const code = controller.signal.aborted ? "REQUEST_TIMEOUT" : "NETWORK_ERROR";
-      throw transportFailure(code, `${label} request failed: ${error.message}`, null, error);
-    } finally {
-      clearTimeout(timer);
-    }
-    const byteLength = rawBody.byteLength;
-    this.enforceResponseBudget(byteLength, this.responseBytes, label, false);
-    this.responseBytes += byteLength;
+      deadline.checkpoint();
+      const byteLength = rawBody.byteLength;
+      this.enforceResponseBudget(byteLength, this.responseBytes, label, false);
+      this.responseBytes += byteLength;
 
-    let text;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(rawBody);
-    } catch (error) {
-      throw transportFailure(
-        "INVALID_UTF8",
-        `${label} response body was not valid UTF-8`,
-        null,
-        error,
-      );
-    }
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (error) {
-      throw transportFailure(
-        "INVALID_JSON",
-        `${label} response was not valid JSON`,
-        null,
-        error,
-      );
-    }
-    if (allowNotFound && response.status === 404) {
-      return {
-        data: null,
+      deadline.checkpoint();
+      let text;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(rawBody);
+      } catch (error) {
+        throw transportFailure(
+          "INVALID_UTF8",
+          `${label} response body was not valid UTF-8`,
+          null,
+          error,
+        );
+      }
+      deadline.checkpoint();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        throw transportFailure(
+          "INVALID_JSON",
+          `${label} response was not valid JSON`,
+          null,
+          error,
+        );
+      }
+      deadline.checkpoint();
+      if (allowNotFound && response.status === 404) {
+        const result = {
+          data: null,
+          status: response.status,
+          serverTime,
+          headers: response.headers,
+          bodySha256: sha256(rawBody),
+        };
+        deadline.checkpoint();
+        return result;
+      }
+      if (response.status < 200 || response.status >= 300) {
+        const message = typeof data?.message === "string" ? `: ${data.message}` : "";
+        throw transportFailure(
+          "HTTP_ERROR",
+          `${label} failed with HTTP ${response.status}${message}`,
+          { status: response.status },
+        );
+      }
+      const result = {
+        data,
         status: response.status,
         serverTime,
         headers: response.headers,
         bodySha256: sha256(rawBody),
       };
-    }
-    if (response.status < 200 || response.status >= 300) {
-      const message = typeof data?.message === "string" ? `: ${data.message}` : "";
+      deadline.checkpoint();
+      return result;
+    } catch (error) {
+      const timedOut = deadline.expiredOrElapsed();
+      if (!timedOut) {
+        deadline.abort();
+      }
+      cancelResponse();
+      if (timedOut) {
+        if (error instanceof V2TransportError && error.code === "REQUEST_TIMEOUT") {
+          throw error;
+        }
+        throw deadline.failure(error);
+      }
+      if (error instanceof V2TransportError) {
+        throw error;
+      }
       throw transportFailure(
-        "HTTP_ERROR",
-        `${label} failed with HTTP ${response.status}${message}`,
-        { status: response.status },
+        "NETWORK_ERROR",
+        `${label} request failed: ${error.message}`,
+        null,
+        error,
       );
+    } finally {
+      deadline.close();
     }
-    return {
-      data,
-      status: response.status,
-      serverTime,
-      headers: response.headers,
-      bodySha256: sha256(rawBody),
-    };
   }
 
   enforceResponseBudget(byteLength, priorBytes, label, declared) {
@@ -1686,54 +1809,325 @@ class TransportWork {
   }
 }
 
-async function readBoundedResponseBody(response, maxBytes, label, controller) {
+const REQUEST_DEADLINE_EXPIRED = Symbol("request-deadline-expired");
+
+class RequestDeadline {
+  constructor(timeoutMs, label) {
+    this.timeoutMs = timeoutMs;
+    this.label = label;
+    this.controller = new AbortController();
+    this.expiresAt = performance.now() + timeoutMs;
+    this.expired = false;
+    this.abortStarted = false;
+    this.expiration = new Promise((resolve) => {
+      this.resolveExpiration = resolve;
+    });
+    this.timer = setTimeout(() => this.expire(), timeoutMs);
+  }
+
+  get signal() {
+    return this.controller.signal;
+  }
+
+  expire() {
+    if (this.expired) {
+      return;
+    }
+    this.expired = true;
+    this.abort();
+    this.resolveExpiration(REQUEST_DEADLINE_EXPIRED);
+  }
+
+  abort() {
+    if (this.abortStarted || this.controller.signal.aborted) {
+      return;
+    }
+    this.abortStarted = true;
+    const abortReason = new Error(`${this.label} request cleanup`);
+    startBestEffort(() => this.controller.abort(abortReason));
+  }
+
+  expiredOrElapsed() {
+    if (!this.expired && performance.now() >= this.expiresAt) {
+      this.expire();
+    }
+    return this.expired;
+  }
+
+  checkpoint() {
+    if (this.expiredOrElapsed()) {
+      throw this.failure();
+    }
+  }
+
+  failure(cause = undefined) {
+    return transportFailure(
+      "REQUEST_TIMEOUT",
+      `${this.label} request timed out after ${this.timeoutMs} ms`,
+      null,
+      cause,
+    );
+  }
+
+  close() {
+    clearTimeout(this.timer);
+  }
+}
+
+async function awaitRequestOperation(operation, deadline, {
+  onTimeout = undefined,
+  onLateFulfilled = undefined,
+} = {}) {
+  const tracked = Promise.resolve(operation).then(
+    (value) => ({ state: "fulfilled", value }),
+    (error) => ({ state: "rejected", error }),
+  );
+  if (deadline.expiredOrElapsed()) {
+    handleTimedOutOperation(tracked, REQUEST_DEADLINE_EXPIRED, onTimeout, onLateFulfilled);
+    throw deadline.failure();
+  }
+  const outcome = await Promise.race([tracked, deadline.expiration]);
+  if (outcome === REQUEST_DEADLINE_EXPIRED || deadline.expiredOrElapsed()) {
+    handleTimedOutOperation(tracked, outcome, onTimeout, onLateFulfilled);
+    const cause = outcome?.state === "rejected" ? outcome.error : undefined;
+    throw deadline.failure(cause);
+  }
+  if (outcome.state === "rejected") {
+    throw outcome.error;
+  }
+  return outcome.value;
+}
+
+function handleTimedOutOperation(tracked, outcome, onTimeout, onLateFulfilled) {
+  startBestEffort(onTimeout);
+  if (outcome?.state === "fulfilled") {
+    startBestEffort(onLateFulfilled, outcome.value);
+    return;
+  }
+  if (outcome === REQUEST_DEADLINE_EXPIRED && typeof onLateFulfilled === "function") {
+    tracked.then((late) => {
+      if (late.state === "fulfilled") {
+        startBestEffort(onLateFulfilled, late.value);
+      }
+    });
+  }
+}
+
+function createBestEffortOnce(action) {
+  let started = false;
+  return () => {
+    if (started) {
+      return;
+    }
+    started = true;
+    startBestEffort(action);
+  };
+}
+
+function startBestEffort(action, value = undefined) {
+  if (typeof action !== "function") {
+    return;
+  }
+  let invoked = false;
+  try {
+    safeSetImmediate(() => {
+      if (invoked) {
+        return;
+      }
+      invoked = true;
+      try {
+        Promise.resolve(action(value)).catch(() => {});
+      } catch {
+        // Ignore direct cancel/release throws from deferred cleanup calls.
+        // Node rethrows AbortSignal listener exceptions outside this catch; those
+        // listeners are trusted adapter code and must remain nonthrowing.
+      }
+    });
+  } catch {
+    // Scheduling cleanup is best-effort and must never replace the primary result.
+  }
+}
+
+function cancelResponseBody(response) {
+  if (typeof response?.body?.cancel === "function") {
+    return response.body.cancel();
+  }
+  return undefined;
+}
+
+async function readBoundedResponseBody(
+  response,
+  maxBytes,
+  label,
+  deadline,
+) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
     throw transportFailure(
       "TOTAL_RESPONSE_BYTE_LIMIT_EXCEEDED",
       `${label} has no remaining response-byte budget`,
     );
   }
-  if (typeof response.body?.getReader !== "function") {
-    const body = Buffer.from(await response.arrayBuffer());
-    if (body.byteLength > maxBytes) {
-      throw transportFailure(
-        "RESPONSE_BYTE_LIMIT_EXCEEDED",
-        `${label} returned more than its remaining ${maxBytes}-byte budget`,
-      );
-    }
-    return body;
-  }
-
+  deadline.checkpoint();
   const reader = response.body.getReader();
+  const cancelReader = createBestEffortOnce(() => reader.cancel());
   const chunks = [];
+  let chunkCount = 0;
   let byteLength = 0;
+  let complete = false;
   try {
+    deadline.checkpoint();
     while (true) {
-      const { done, value } = await reader.read();
+      deadline.checkpoint();
+      const readResult = await awaitRequestOperation(
+        reader.read(),
+        deadline,
+        {
+          onTimeout: cancelReader,
+          onLateFulfilled: cancelReader,
+        },
+      );
+      deadline.checkpoint();
+      const { done, value } = normalizeResponseReadResult(readResult, label);
+      deadline.checkpoint();
       if (done) {
+        complete = true;
         break;
       }
-      if (!(value instanceof Uint8Array)) {
+      const internalByteLength = responseChunkInternalByteLength(value, label);
+      if (internalByteLength === 0) {
+        cancelReader();
         throw transportFailure(
           "INVALID_FETCH_RESPONSE",
-          `${label} response stream returned a non-byte chunk`,
+          `${label} response stream returned an empty byte chunk`,
         );
       }
-      byteLength += value.byteLength;
-      if (byteLength > maxBytes) {
-        controller.abort(new Error(`${label} response-byte budget exceeded`));
-        await reader.cancel().catch(() => {});
+      chunkCount += 1;
+      if (chunkCount > MAX_V2_TRANSPORT_RESPONSE_CHUNKS) {
+        cancelReader();
+        throw transportFailure(
+          "RESPONSE_CHUNK_LIMIT_EXCEEDED",
+          `${label} response exceeded the ${MAX_V2_TRANSPORT_RESPONSE_CHUNKS}-chunk cap`,
+        );
+      }
+      if (internalByteLength > maxBytes - byteLength) {
+        deadline.abort();
+        cancelReader();
         throw transportFailure(
           "RESPONSE_BYTE_LIMIT_EXCEEDED",
           `${label} returned more than its remaining ${maxBytes}-byte budget`,
         );
       }
-      chunks.push(Buffer.from(value));
+      const chunk = copyResponseByteChunk(value, internalByteLength, label);
+      const nextByteLength = byteLength + chunk.length;
+      if (nextByteLength > maxBytes) {
+        deadline.abort();
+        cancelReader();
+        throw transportFailure(
+          "RESPONSE_BYTE_LIMIT_EXCEEDED",
+          `${label} returned more than its remaining ${maxBytes}-byte budget`,
+        );
+      }
+      chunks.push(chunk);
+      byteLength = nextByteLength;
+      deadline.checkpoint();
     }
   } finally {
-    reader.releaseLock();
+    if (!complete) {
+      cancelReader();
+    }
+    startBestEffort(() => reader.releaseLock());
   }
+  deadline.checkpoint();
   return Buffer.concat(chunks, byteLength);
+}
+
+function responseChunkInternalByteLength(value, label) {
+  if (!(value instanceof Uint8Array)) {
+    throw transportFailure(
+      "INVALID_FETCH_RESPONSE",
+      `${label} response stream returned a non-byte chunk`,
+    );
+  }
+  try {
+    return Reflect.apply(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []);
+  } catch (error) {
+    throw transportFailure(
+      "INVALID_FETCH_RESPONSE",
+      `${label} response stream returned an unreadable byte chunk`,
+      null,
+      error,
+    );
+  }
+}
+
+function copyResponseByteChunk(value, internalByteLength, label) {
+  try {
+    const buffer = Reflect.apply(TYPED_ARRAY_BUFFER_GETTER, value, []);
+    const byteOffset = Reflect.apply(TYPED_ARRAY_BYTE_OFFSET_GETTER, value, []);
+    const copy = Buffer.from(new Uint8Array(buffer, byteOffset, internalByteLength));
+    if (copy.length !== internalByteLength) {
+      throw new Error("byte chunk copy length changed");
+    }
+    return copy;
+  } catch (error) {
+    throw transportFailure(
+      "INVALID_FETCH_RESPONSE",
+      `${label} response stream byte chunk could not be copied exactly`,
+      null,
+      error,
+    );
+  }
+}
+
+function normalizeResponseReadResult(result, label) {
+  if (!isPlainObject(result)) {
+    throw transportFailure(
+      "INVALID_FETCH_RESPONSE",
+      `${label} response stream returned a non-object read result`,
+    );
+  }
+  let keys;
+  let doneDescriptor;
+  let valueDescriptor;
+  try {
+    keys = Reflect.ownKeys(result);
+    doneDescriptor = Object.getOwnPropertyDescriptor(result, "done");
+    valueDescriptor = Object.getOwnPropertyDescriptor(result, "value");
+  } catch (error) {
+    throw transportFailure(
+      "INVALID_FETCH_RESPONSE",
+      `${label} response stream returned an unreadable read result`,
+      null,
+      error,
+    );
+  }
+  if (
+    keys.length !== 2 ||
+    !keys.includes("done") ||
+    !keys.includes("value") ||
+    !Object.hasOwn(doneDescriptor ?? {}, "value") ||
+    !Object.hasOwn(valueDescriptor ?? {}, "value")
+  ) {
+    throw transportFailure(
+      "INVALID_FETCH_RESPONSE",
+      `${label} response stream returned a non-closed read result`,
+    );
+  }
+  const done = doneDescriptor.value;
+  const value = valueDescriptor.value;
+  if (typeof done !== "boolean") {
+    throw transportFailure(
+      "INVALID_FETCH_RESPONSE",
+      `${label} response stream returned a non-boolean done flag`,
+    );
+  }
+  if (done && value !== undefined) {
+    throw transportFailure(
+      "INVALID_FETCH_RESPONSE",
+      `${label} response stream returned a terminal value`,
+    );
+  }
+  return { done, value };
 }
 
 function normalizeMergeRefreshResponse(data, request, repoPath, restBaseUrl, label) {
@@ -2329,7 +2723,9 @@ function normalizeActorPermissionResponse(value, expectedActor, path) {
     new Set(["admin", "write", "read", "none"]),
     `${path}.permission`,
   );
-  const roleName = requireNonEmptyString(value.role_name, `${path}.role_name`);
+  const roleName = value.role_name === "" && permission === "none"
+    ? ""
+    : requireNonEmptyString(value.role_name, `${path}.role_name`);
   const responseActor = normalizeActor(value.user, `${path}.user`);
   if (
     responseActor.id !== expectedActor.id ||
@@ -2348,6 +2744,13 @@ function normalizeActorPermissionResponse(value, expectedActor, path) {
   let mappingSource;
   if (value.user.permissions !== undefined) {
     assertPlainObject(value.user.permissions, `${path}.user.permissions`);
+    assertClosedObject(value.user.permissions, `${path}.user.permissions`, [
+      "admin",
+      "maintain",
+      "push",
+      "triage",
+      "pull",
+    ]);
     permissions = {
       admin: requireBoolean(value.user.permissions.admin, `${path}.user.permissions.admin`),
       maintain: requireBoolean(
@@ -2370,6 +2773,14 @@ function normalizeActorPermissionResponse(value, expectedActor, path) {
       pull: readOrHigher,
     };
     mappingSource = "legacy-permission";
+  }
+  if (
+    roleName === "" &&
+    Object.values(permissions).some((allowed) => allowed)
+  ) {
+    throw new TypeError(
+      `${path}.user.permissions must all be false when permission is none and role_name is empty`,
+    );
   }
   return {
     effective_permission: permission,
@@ -2553,72 +2964,116 @@ function nextCursor(pageInfo, previous, label) {
   return cursor;
 }
 
-function parseAndValidateNextLink(
+function parseAndValidatePaginationLink(
   header,
   restBaseUrl,
   path,
   page,
   pageSize,
+  maxPages,
   label,
   fixedQuery = {},
 ) {
   if (header === null || header === "") {
-    return false;
+    return { nextPage: null, lastPage: null };
   }
-  if (typeof header !== "string") {
-    throw transportFailure("INVALID_PAGINATION_LINK", `${label} Link header was not a string`);
+  if (typeof header !== "string" || header.length > 8_192) {
+    throw transportFailure(
+      "INVALID_PAGINATION_LINK",
+      `${label} returned an invalid Link header`,
+    );
   }
-  let nextUrl = null;
-  for (const part of header.split(",")) {
-    const match = part.trim().match(/^<([^>]+)>;\s*rel="([^"]+)"$/);
-    if (!match) {
-      continue;
+  const entries = header.split(",");
+  if (entries.length > 4) {
+    throw transportFailure(
+      "INVALID_PAGINATION_LINK",
+      `${label} returned an ambiguous Link header`,
+    );
+  }
+  const relations = new Map();
+  for (const entry of entries) {
+    const match = entry.trim().match(
+      /^<([^<>\u0000-\u0020\u007f]+)>; rel="(next|prev|first|last)"$/u,
+    );
+    if (match === null || relations.has(match[2])) {
+      throw transportFailure(
+        "INVALID_PAGINATION_LINK",
+        `${label} returned a malformed, unknown, or duplicate Link relation`,
+      );
     }
-    if (match[2].split(/\s+/).includes("next")) {
-      if (nextUrl !== null) {
-        throw transportFailure(
-          "INVALID_PAGINATION_LINK",
-          `${label} returned more than one rel=next link`,
-        );
-      }
-      nextUrl = match[1];
+    const relation = match[2];
+    let target;
+    try {
+      target = new URL(match[1]);
+    } catch (error) {
+      throw transportFailure(
+        "INVALID_PAGINATION_LINK",
+        `${label} returned an invalid Link target`,
+        null,
+        error,
+      );
     }
-  }
-  if (nextUrl === null) {
-    if (/rel="[^"]*\bnext\b/.test(header)) {
-      throw transportFailure("INVALID_PAGINATION_LINK", `${label} returned a malformed next link`);
+    const pageValues = target.searchParams.getAll("page");
+    if (pageValues.length !== 1 || !/^[1-9][0-9]*$/u.test(pageValues[0])) {
+      throw transportFailure(
+        "INVALID_PAGINATION_LINK",
+        `${label} Link relation omitted one canonical page`,
+      );
     }
-    return false;
+    const targetPage = Number(pageValues[0]);
+    if (!Number.isSafeInteger(targetPage) || targetPage > maxPages) {
+      throw transportFailure(
+        "PAGE_LIMIT_EXCEEDED",
+        `${label} Link relation exceeded the ${maxPages}-page cap`,
+      );
+    }
+    const expected = apiUrl(restBaseUrl, path);
+    for (const [key, value] of Object.entries(fixedQuery)) {
+      expected.searchParams.set(key, String(value));
+    }
+    expected.searchParams.set("per_page", String(pageSize));
+    expected.searchParams.set("page", String(targetPage));
+    const expectedParameters = [...expected.searchParams.entries()].sort(compareEntries);
+    const actualParameters = [...target.searchParams.entries()].sort(compareEntries);
+    if (
+      target.origin !== expected.origin ||
+      target.pathname !== expected.pathname ||
+      target.username !== "" ||
+      target.password !== "" ||
+      target.hash !== "" ||
+      !isDeepStrictEqual(actualParameters, expectedParameters)
+    ) {
+      throw transportFailure(
+        "INVALID_PAGINATION_LINK",
+        `${label} Link relation left its canonical pagination scope`,
+        { expected: expected.href, actual: target.href },
+      );
+    }
+    if (
+      (relation === "next" && targetPage !== page + 1) ||
+      (relation === "prev" && (page === 1 || targetPage !== page - 1)) ||
+      (relation === "first" && targetPage !== 1) ||
+      (relation === "last" && targetPage < page)
+    ) {
+      throw transportFailure(
+        "INVALID_PAGINATION_LINK",
+        `${label} Link relation targeted the wrong page`,
+      );
+    }
+    relations.set(relation, targetPage);
   }
-  const expected = apiUrl(restBaseUrl, path);
-  for (const [key, value] of Object.entries(fixedQuery)) {
-    expected.searchParams.set(key, String(value));
-  }
-  expected.searchParams.set("per_page", String(pageSize));
-  expected.searchParams.set("page", String(page + 1));
-  let parsed;
-  try {
-    parsed = new URL(nextUrl);
-  } catch {
-    throw transportFailure("INVALID_PAGINATION_LINK", `${label} returned an invalid next URL`);
-  }
-  const expectedParameters = [...expected.searchParams.entries()].sort(compareEntries);
-  const actualParameters = [...parsed.searchParams.entries()].sort(compareEntries);
+  const nextPage = relations.get("next") ?? null;
+  const lastPage = relations.get("last") ?? null;
   if (
-    parsed.origin !== expected.origin ||
-    parsed.pathname !== expected.pathname ||
-    parsed.username !== "" ||
-    parsed.password !== "" ||
-    parsed.hash !== "" ||
-    !isDeepStrictEqual(actualParameters, expectedParameters)
+    (nextPage === null && lastPage !== null && lastPage > page) ||
+    (nextPage !== null && lastPage !== null && lastPage < nextPage)
   ) {
     throw transportFailure(
       "INVALID_PAGINATION_LINK",
-      `${label} next link was not the canonical next page`,
-      { expected: expected.href, actual: parsed.href },
+      `${label} Link relations disagreed about later pages`,
     );
   }
-  return true;
+  return { nextPage, lastPage };
 }
 
 function compareEntries(left, right) {
@@ -3461,7 +3916,11 @@ export function assertV2Snapshot(snapshot) {
     snapshot.pull_request.number,
   );
   assertPageRelations(snapshot.pages, snapshot.server_time);
-  assertPermissions(snapshot.permissions, "snapshot.permissions");
+  assertPermissions(
+    snapshot.permissions,
+    "snapshot.permissions",
+    snapshot.pages.exact_artifacts,
+  );
   assertServiceStartObservations(
     snapshot.service_start_observations,
     snapshot.scope.head_ref_oid,
@@ -4234,7 +4693,7 @@ function assertServiceStartCheckRun(value, expectedHeadSha, path) {
   }
 }
 
-function assertPermissions(value, path) {
+function assertPermissions(value, path, exactArtifacts) {
   assertClosedObject(value, path, ["transport_capabilities", "actor_permissions"]);
   assertClosedObject(value.transport_capabilities, `${path}.transport_capabilities`, [
     "stable",
@@ -4253,6 +4712,10 @@ function assertPermissions(value, path) {
   if (!Array.isArray(value.actor_permissions)) {
     throw new TypeError(`${path}.actor_permissions must be an array`);
   }
+  const exactArtifactsBySubject = new Map(exactArtifacts.map((entry) => [
+    `${entry.selector.kind}:${entry.selector.id}`,
+    entry,
+  ]));
   const subjectKeys = new Set();
   for (const [index, receipt] of value.actor_permissions.entries()) {
     const receiptPath = `${path}.actor_permissions[${index}]`;
@@ -4277,6 +4740,17 @@ function assertPermissions(value, path) {
     }
     subjectKeys.add(subjectKey);
     assertActor(receipt.actor, `${receiptPath}.actor`);
+    const exactArtifact = exactArtifactsBySubject.get(subjectKey);
+    if (
+      exactArtifact === undefined ||
+      receipt.actor === null ||
+      exactArtifact.artifact.author === null ||
+      !isDeepStrictEqual(receipt.actor, exactArtifact.artifact.author)
+    ) {
+      throw new TypeError(
+        `${receiptPath} permission actor must equal its exact artifact author`,
+      );
+    }
     if (receipt.assurance !== "point-in-time-only") {
       throw new TypeError(`${receiptPath}.assurance must be point-in-time-only`);
     }
@@ -4348,17 +4822,28 @@ function assertActorPermissionReceipt(value, path) {
   ]);
   assertClosedObject(value.subject, `${path}.subject`, ["kind", "id"]);
   assertActor(value.actor, `${path}.actor`);
-  requireEnum(
+  const effectivePermission = requireEnum(
     value.effective_permission,
     new Set(["admin", "write", "read", "none"]),
     `${path}.effective_permission`,
   );
-  requireNonEmptyString(value.role_name, `${path}.role_name`);
+  if (value.role_name !== "" || effectivePermission !== "none") {
+    requireNonEmptyString(value.role_name, `${path}.role_name`);
+  }
   assertClosedObject(value.permissions, `${path}.permissions`, [
     "admin", "maintain", "push", "triage", "pull",
   ]);
   for (const key of ["admin", "maintain", "push", "triage", "pull"]) {
     requireBoolean(value.permissions[key], `${path}.permissions.${key}`);
+  }
+  if (
+    value.role_name === "" &&
+    Object.values(value.permissions).some((allowed) => allowed)
+  ) {
+    throw new TypeError(
+      `${path}.permissions must all be false when effective_permission is none and ` +
+        "role_name is empty",
+    );
   }
   requireEnum(
     value.mapping_source,

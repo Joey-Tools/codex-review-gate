@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,19 +19,6 @@ const CHECKOUT =
 const SETUP_NODE =
   "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
 const REQUIRED_REPOSITORY = "Joey-Tools/codex-review-gate";
-const REQUIRED_REPOSITORIES = [
-  "Joey-Tools/codex-review-gate",
-  "Joey-Tools/codex-apple-notes-toolkit",
-  "Joey-Tools/codex-debug-triage",
-  "Joey-Tools/codex-personal-sync",
-  "Joey-Tools/codex-project-journal",
-  "Joey-Tools/codex-private-workflows",
-  "Joey-Tools/codex-review-workflows",
-  "Joey-Tools/codex-rollout-backup",
-  "Joey-Tools/codex-toolbox",
-  "Joey-Tools/codex-waited-delivery",
-  "Joey-Tools/codex-workflow-hygiene",
-];
 
 test("required CI exposes only the Node.js 20 review-gate closure", () => {
   const source = readFileSync(requiredWorkflowPath, "utf8");
@@ -103,105 +90,12 @@ test("required CI exposes only the Node.js 20 review-gate closure", () => {
   assert.doesNotMatch(source, /^\s+[A-Za-z-]+:\s*write\s*$/mu);
 });
 
-test("the ruleset router uses a read-only pull_request envelope", () => {
-  const source = readFileSync(routerWorkflowPath, "utf8");
-  const root = rootBlock(yamlLines(source));
-
-  assert.deepEqual(directKeys(root), ["name", "on", "permissions", "jobs"]);
-  assert.equal(directScalar(root, "name"), "Required CI Router");
-  const on = childBlock(root, "on");
-  assert.deepEqual(directKeys(on), ["pull_request"]);
-  assert.deepEqual(directKeys(childBlock(on, "pull_request")), []);
-  assert.deepEqual(scalarMapping(childBlock(root, "permissions")), {
-    contents: "read",
-  });
-
-  assert.doesNotMatch(source, /pull_request_target|actions\/checkout/u);
-  assert.doesNotMatch(source, /\bsecrets\b/u);
-  assert.doesNotMatch(source, /^\s+[A-Za-z-]+:\s*write\s*$/mu);
-});
-
-test("the router is unconditional and fails closed outside the exact allowlist", () => {
-  const lines = readYamlLines(routerWorkflowPath);
-  const jobs = childBlock(rootBlock(lines), "jobs");
-  const job = childBlock(jobs, "repository-allowlist");
-
-  assert.deepEqual(directKeys(job), ["name", "runs-on", "steps"]);
-  assert.equal(
-    directScalar(job, "name"),
-    "Required CI repository allowlist",
-  );
-  assert.equal(directScalar(job, "runs-on"), "ubuntu-slim");
-
-  const steps = listItemBlocks(childBlock(job, "steps"));
-  assert.equal(steps.length, 1);
-  assert.deepEqual(itemKeys(steps[0]), ["name", "shell", "env", "run"]);
-  assert.equal(itemScalar(steps[0], "name"), "Reject unknown repositories");
-  assert.equal(itemScalar(steps[0], "shell"), "bash");
-  assert.deepEqual(scalarMapping(childBlock(steps[0], "env")), {
-    REPOSITORY: "${{ github.repository }}",
-  });
-  assert.equal(itemScalar(steps[0], "run"), "|");
-
-  const script = blockText(steps[0]);
-  assert.deepEqual(
-    [...script.matchAll(/"(Joey-Tools\/[A-Za-z0-9-]+)"/gu)].map(
-      (match) => match[1],
-    ),
-    REQUIRED_REPOSITORIES,
-  );
-  assert.match(script, /case "\$REPOSITORY" in/u);
-  assert.match(script, /^\s+\*\)\s*$/mu);
-  assert.match(script, /^\s+exit 1\s*$/mu);
-});
-
-test("the router statically calls each protected default-branch workflow once", () => {
-  const source = readFileSync(routerWorkflowPath, "utf8");
-  const jobs = childBlock(rootBlock(yamlLines(source)), "jobs");
-  const expectedJobIds = [
-    "repository-allowlist",
-    ...REQUIRED_REPOSITORIES.map((repository) => repository.split("/")[1]),
-  ];
-  assert.deepEqual(directKeys(jobs), expectedJobIds);
-
-  for (const repository of REQUIRED_REPOSITORIES) {
-    const slug = repository.split("/")[1];
-    const job = childBlock(jobs, slug);
-    assert.deepEqual(
-      directKeys(job),
-      repository === "Joey-Tools/codex-project-journal"
-        ? ["name", "if", "uses", "with"]
-        : ["name", "if", "uses"],
-    );
-    assert.equal(directScalar(job, "name"), `Required CI - ${slug}`);
-    assert.equal(
-      directScalar(job, "if"),
-      `\${{ github.repository == '${repository}' }}`,
-    );
-    assert.equal(
-      directScalar(job, "uses"),
-      `${repository}/.github/workflows/required-ci.yml@master`,
-    );
-    if (repository === "Joey-Tools/codex-project-journal") {
-      assert.deepEqual(scalarMapping(childBlock(job, "with")), {
-        run_fatal_signal_tests: '"1"',
-      });
-    }
-  }
-
-  assert.doesNotMatch(source, /^\s+(?:repository|ref):/mu);
-
-  const calls = [...source.matchAll(/^\s+uses:\s+(\S+)\s*$/gmu)].map(
-    (match) => match[1],
-  );
-  assert.equal(calls.length, REQUIRED_REPOSITORIES.length);
-  assert.ok(calls.every((call) => !call.includes("${{")));
-  assert.ok(calls.every((call) => call.endsWith("@master")));
-});
-
-function readYamlLines(path) {
-  return yamlLines(readFileSync(path, "utf8"));
-}
+test(
+  "the pull-request router stays deferred until all 11 protected masters publish required-ci.yml",
+  () => {
+    assert.equal(existsSync(routerWorkflowPath), false);
+  },
+);
 
 function yamlLines(source) {
   return source.split(/\r?\n/u);
@@ -341,10 +235,6 @@ function itemScalar(item, key) {
     { ...item, headerIndent: item.headerIndent, start: item.start + 1 },
     key,
   );
-}
-
-function blockText(block) {
-  return block.lines.slice(block.start, block.end).join("\n");
 }
 
 function indentOf(line) {

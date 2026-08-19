@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setImmediate as scheduleImmediate } from "node:timers";
 import { TextDecoder, TextEncoder, types as utilTypes } from "node:util";
 
 export const V2_PERSISTENT_FRONTIER_ROOT_SCHEMA =
@@ -40,8 +41,10 @@ const SafeBuffer = Buffer;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const dateNow = Date.now;
+const performanceNowIntrinsic = performance.now;
 const safeSetTimeout = setTimeout;
 const safeClearTimeout = clearTimeout;
+const safeScheduleImmediate = scheduleImmediate;
 const objectFreeze = Object.freeze;
 const objectIsFrozen = Object.isFrozen;
 const objectIs = Object.is;
@@ -134,6 +137,12 @@ export class V2PersistentFrontierError extends Error {
  * trusted authority boundary. Captured helpers reduce accidental monkey-patch
  * dispatch, but this module is not a realm sandbox and does not authorize a
  * generic caller-supplied adapter to mint production checkpoint authority.
+ * The hard deadline cannot preempt arbitrary synchronous work during the
+ * initial trusted adapter call; a post-call monotonic fence still classifies
+ * an adapter that returns or throws at or after the exact deadline as timed out.
+ * Adapter abort listeners are trusted cleanup and must remain non-throwing,
+ * cooperative, and bounded. Native Node EventTarget listener failures may be
+ * rethrown on process.nextTick and are not contained by this module.
  * Serialized roots/nodes must also arrive through the ledger's byte-bounded
  * decoder; JavaScript cannot enumerate an already-materialized, unbounded own
  * key set without first allocating that enumeration.
@@ -1326,13 +1335,16 @@ function normalizeOperationLimits(value) {
 }
 
 function createOperationContext({ limits, readBlob, writeBlob }) {
-  const startedAt = dateNow();
+  const adapterDeadlineAt = dateNow() + limits.max_duration_ms;
+  const deadlineMonotonicAt = monotonicNow() + limits.max_duration_ms;
   return {
     limits,
     readBlob,
     writeBlob,
-    started_at: startedAt,
-    deadline_at: startedAt + limits.max_duration_ms,
+    // Wall-clock values are adapter evidence only. Duration enforcement uses
+    // the monotonic deadline so a host clock adjustment cannot extend a call.
+    adapter_deadline_at: adapterDeadlineAt,
+    deadline_monotonic_at: deadlineMonotonicAt,
     read_objects: 0,
     write_objects: 0,
     read_bytes: 0,
@@ -1343,7 +1355,7 @@ function createOperationContext({ limits, readBlob, writeBlob }) {
 }
 
 function assertOperationOpen(operation) {
-  if (dateNow() > operation.deadline_at) {
+  if (monotonicNow() >= operation.deadline_monotonic_at) {
     throw frontierError(
       "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
       "persistent frontier operation exceeded its absolute deadline",
@@ -1382,8 +1394,8 @@ async function callBlobAdapter({
   }
   operation[objectKey] += 1;
   operation[byteKey] += suppliedByteLength;
-  const remainingMs = operation.deadline_at - dateNow();
-  if (remainingMs < 0) {
+  const remainingMs = operation.deadline_monotonic_at - monotonicNow();
+  if (remainingMs <= 0) {
     throw frontierError(
       "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
       "persistent frontier operation exceeded its absolute deadline",
@@ -1393,17 +1405,24 @@ async function callBlobAdapter({
   let timer;
   let locallyTimedOut = false;
   const timeout = new SafePromise((_, reject) => {
-    timer = safeSetTimeout(() => {
-      locallyTimedOut = true;
-      try {
-        abortController(controller);
-      } finally {
-        reject(frontierError(
-          "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
-          `persistent frontier ${kind} exceeded its absolute deadline`,
-        ));
+    const expire = () => {
+      const timeoutRemainingMs =
+        operation.deadline_monotonic_at - monotonicNow();
+      if (timeoutRemainingMs > 0) {
+        timer = safeSetTimeout(
+          expire,
+          timeoutRemainingMs > 1 ? timeoutRemainingMs : 1,
+        );
+        return;
       }
-    }, remainingMs > 1 ? remainingMs : 1);
+      locallyTimedOut = true;
+      reject(frontierError(
+        "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
+        `persistent frontier ${kind} exceeded its absolute deadline`,
+      ));
+      deferAbortController(controller);
+    };
+    timer = safeSetTimeout(expire, remainingMs > 1 ? remainingMs : 1);
   });
   let result;
   try {
@@ -1414,19 +1433,20 @@ async function callBlobAdapter({
           MAX_V2_PERSISTENT_FRONTIER_NODE_BYTES,
           expectedBytes,
         ),
-        deadline_ms: operation.deadline_at,
+        deadline_ms: operation.adapter_deadline_at,
         signal: abortSignal(controller),
       }])
       : reflectApply(adapter, undefined, [new SafeUint8Array(bytes), {
         expected_object_oid: objectOid,
         max_bytes: byteLimit - operation[byteKey] +
           typedArrayByteLength(bytes),
-        deadline_ms: operation.deadline_at,
+        deadline_ms: operation.adapter_deadline_at,
         signal: abortSignal(controller),
       }]);
     result = await settleFirst(call, timeout);
   } catch (error) {
-    if (locallyTimedOut || dateNow() > operation.deadline_at) {
+    if (locallyTimedOut ||
+        monotonicNow() >= operation.deadline_monotonic_at) {
       throw frontierError(
         "PERSISTENT_FRONTIER_OPERATION_TIMEOUT",
         `persistent frontier ${kind} exceeded its absolute deadline`,
@@ -1470,6 +1490,10 @@ async function callBlobAdapter({
       error,
     );
   }
+}
+
+function monotonicNow() {
+  return reflectApply(performanceNowIntrinsic, performance, []);
 }
 
 function gitBlobOid(bytes) {
@@ -1879,7 +1903,28 @@ function isResizableArrayBuffer(value) {
 }
 
 function abortController(controller) {
-  return reflectApply(abortControllerAbortIntrinsic, controller, []);
+  return reflectApply(abortControllerAbortIntrinsic, controller, [
+    new Error("persistent frontier adapter cleanup after timeout"),
+  ]);
+}
+
+function deferAbortController(controller) {
+  let invoked = false;
+  const cleanup = () => {
+    if (invoked) return;
+    invoked = true;
+    try {
+      abortController(controller);
+    } catch {
+      // The caller-visible timeout settled in the prior turn. This catches
+      // synchronous controller failure, not native EventTarget rethrows.
+    }
+  };
+  try {
+    safeScheduleImmediate(cleanup);
+  } catch {
+    // Scheduling adapter cleanup is best-effort after the primary timeout.
+  }
 }
 
 function abortSignal(controller) {

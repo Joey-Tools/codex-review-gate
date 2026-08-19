@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import test from "node:test";
+import { setImmediate as liveSetImmediate } from "node:timers";
 
 import {
   V2_WORKFLOW_PREFLIGHT_INTEGRATION_ID,
@@ -7,6 +10,7 @@ import {
   V2_WORKFLOW_PREFLIGHT_OIDC_AUDIENCE,
   V2_WORKFLOW_PREFLIGHT_SCHEMA,
   V2_WORKFLOW_PREFLIGHT_STATUS_CONTEXT,
+  V2WorkflowPreflightError,
   assertV2BlockedConfigurationWorkflowResultHandle,
   assertV2WorkflowGitLedgerHandoffHandle,
   assertV2WorkflowPreflightHandle,
@@ -34,6 +38,9 @@ const LEDGER_SHA = "c".repeat(40);
 const DATE = "Thu, 13 Aug 2026 12:00:00 GMT";
 const REPOSITORY = "acme/widget";
 const CALLER_PATH = ".github/workflows/caller.yml";
+const RESPONSE_BYTE_CAP = 2 * 1024 * 1024;
+const RESPONSE_CHUNK_CAP = 4_096;
+const OPERATION_BYTE_CAP = 16 * 1024 * 1024;
 const SYNTHETIC_BEARER = Object.freeze({
   catalog_id: "bearer-a",
   value: "codex_synth_v1_bearer_a",
@@ -370,11 +377,19 @@ function makeFixture(overrides = {}) {
 function response(status, body, {
   date = DATE,
   contentType = "application/json; charset=utf-8",
+  contentLength = "actual",
   jsonSpacing = 0,
+  link = null,
+  rawBytes = null,
+  bodyChunkCount = 1,
+  onBodyCancel = null,
+  onReaderCancel = null,
 } = {}) {
   const raw = typeof body === "string"
     ? body
     : JSON.stringify(body, null, jsonSpacing);
+  const bytes = rawBytes === null ? Buffer.from(raw, "utf8") : Buffer.from(rawBytes);
+  const decoded = bytes.toString("utf8");
   return {
     status,
     headers: {
@@ -384,13 +399,131 @@ function response(status, body, {
           return contentType;
         }
         if (name.toLowerCase() === "content-length") {
-          return String(Buffer.byteLength(raw));
+          if (contentLength === null) return null;
+          return contentLength === "actual"
+            ? String(bytes.byteLength)
+            : String(contentLength);
         }
+        if (name.toLowerCase() === "link") return link;
         return null;
       },
     },
+    body: {
+      cancel() {
+        return onBodyCancel?.();
+      },
+      getReader() {
+        let emitted = 0;
+        return {
+          async read() {
+            if (emitted >= bodyChunkCount) {
+              return { done: true, value: undefined };
+            }
+            emitted += 1;
+            return {
+              done: false,
+              value: emitted === bodyChunkCount
+                ? Uint8Array.from(bytes)
+                : new Uint8Array(),
+            };
+          },
+          cancel() {
+            return onReaderCancel?.();
+          },
+          releaseLock() {},
+        };
+      },
+    },
     async text() {
-      return raw;
+      return decoded;
+    },
+  };
+}
+
+function paginationLink(path, relations) {
+  const separator = path.includes("?") ? "&" : "?";
+  return relations.map(([relation, page]) =>
+    `<https://api.github.test${path}${separator}per_page=100&page=${page}>; rel="${relation}"`
+  ).join(", ");
+}
+
+function nextPageLink(path, page) {
+  return paginationLink(path, [["next", page]]);
+}
+
+function paddedJsonBytes(value, byteLength) {
+  const encoded = Buffer.from(JSON.stringify(value), "utf8");
+  assert.ok(encoded.byteLength <= byteLength);
+  return Buffer.concat([
+    encoded,
+    Buffer.alloc(byteLength - encoded.byteLength, 0x20),
+  ]);
+}
+
+async function captureFixtureResponses(fixture) {
+  const captures = [];
+  await load({
+    async fetch(url, init) {
+      const value = await fixture.fetch(url, init);
+      captures.push({
+        url,
+        status: value.status,
+        date: value.headers.get("date"),
+        contentType: value.headers.get("content-type"),
+        link: value.headers.get("link"),
+        rawBytes: Buffer.from(await value.text(), "utf8"),
+      });
+      return value;
+    },
+  });
+  return captures;
+}
+
+function replayResponsesAtTotalBytes(captures, totalBytes, {
+  contentLength = "1",
+  onBodyCancel = null,
+  onReaderCancel = null,
+} = {}) {
+  const baseTotal = captures.reduce(
+    (sum, capture) => sum + capture.rawBytes.byteLength,
+    0,
+  );
+  assert.ok(baseTotal <= totalBytes);
+  let remainingPadding = totalBytes - baseTotal;
+  const responses = captures.map((capture) => {
+    const padding = Math.min(
+      remainingPadding,
+      RESPONSE_BYTE_CAP - capture.rawBytes.byteLength,
+    );
+    remainingPadding -= padding;
+    return {
+      ...capture,
+      rawBytes: Buffer.concat([
+        capture.rawBytes,
+        Buffer.alloc(padding, 0x20),
+      ]),
+    };
+  });
+  assert.equal(remainingPadding, 0);
+  let requestIndex = 0;
+  return {
+    async fetch(url) {
+      const capture = responses[requestIndex];
+      assert.notEqual(capture, undefined);
+      requestIndex += 1;
+      assert.equal(url, capture.url);
+      return response(capture.status, "", {
+        date: capture.date,
+        contentType: capture.contentType,
+        contentLength,
+        link: capture.link,
+        onBodyCancel,
+        onReaderCancel,
+        rawBytes: capture.rawBytes,
+      });
+    },
+    assertComplete() {
+      assert.equal(requestIndex, responses.length);
     },
   };
 }
@@ -404,12 +537,62 @@ async function load(fixture, commandValue = command()) {
   }).load({ command: commandValue });
 }
 
-async function rejectsCode(promise, code) {
+async function rejectsCode(promise, code, message = undefined) {
   await assert.rejects(promise, (error) => {
     assert.equal(error?.name, "V2WorkflowPreflightError");
     assert.equal(error?.code, code);
     return true;
-  });
+  }, message);
+}
+
+function drainCleanupTasks() {
+  return new Promise((resolve) => globalThis.setImmediate(resolve));
+}
+
+async function rejectsHostileReadResult(label, makeReadResult) {
+  let requestSignal = null;
+  let reads = 0;
+  let readerCancels = 0;
+  let releases = 0;
+  let bodyCancels = 0;
+  const neverSettles = new Promise(() => {});
+  await rejectsCode(load({
+    async fetch(_url, init) {
+      requestSignal = init.signal;
+      return {
+        status: 200,
+        headers: responseHeaders(2),
+        body: {
+          cancel() {
+            bodyCancels += 1;
+            return neverSettles;
+          },
+          getReader() {
+            return {
+              async read() {
+                reads += 1;
+                return makeReadResult();
+              },
+              cancel() {
+                readerCancels += 1;
+                return neverSettles;
+              },
+              releaseLock() {
+                releases += 1;
+                return neverSettles;
+              },
+            };
+          },
+        },
+      };
+    },
+  }), "HTTP_UNREADABLE", label);
+  assert.equal(reads, 1, label);
+  await drainCleanupTasks();
+  assert.equal(readerCancels, 1, label);
+  assert.equal(releases, 1, label);
+  assert.equal(bodyCancels, 1, label);
+  assert.equal(requestSignal?.aborted, false, label);
 }
 
 test("accepts one structurally closed scheduled pull-request leg", async () => {
@@ -895,10 +1078,21 @@ test("private repositories skip public waits and may have no required context", 
 });
 
 test("reads a required status context from page two", async () => {
+  const rulesPath = "/repos/acme/widget/rules/branches/main";
   const pageOne = Array.from({ length: 100 }, (_, index) =>
     effectiveRule(`filler_${index}`, 1000 + index));
   const fixture = makeFixture({
-    defaultRulePages: [pageOne, [statusRule(2000), workflowPinRule(2001)]],
+    intercept(url) {
+      if (url.pathname !== rulesPath) return null;
+      const page = Number(url.searchParams.get("page"));
+      return {
+        status: 200,
+        body: page === 1
+          ? pageOne
+          : [statusRule(2000), workflowPinRule(2001)],
+        link: page === 1 ? nextPageLink(rulesPath, 2) : null,
+      };
+    },
   });
   const receipt = await load(fixture);
 
@@ -1259,3 +1453,1206 @@ test("fails closed on unreadable API responses and incomplete pagination", async
     "PAGINATION_INCOMPLETE",
   );
 });
+
+test("follows a short effective-rule page when Link declares a next page", async () => {
+  const rulesPath = "/repos/acme/widget/rules/branches/main";
+  await rejectsCode(
+    load(makeFixture({
+      intercept(url) {
+        if (url.pathname !== rulesPath) return null;
+        const page = Number(url.searchParams.get("page"));
+        return {
+          status: 200,
+          body: page === 1
+            ? [statusRule(), workflowPinRule()]
+            : [statusRule(12)],
+          link: page === 1 ? nextPageLink(rulesPath, 2) : null,
+        };
+      },
+    })),
+    "RULESET_AMBIGUOUS",
+  );
+});
+
+test("follows Link before rejecting a second exact ledger ruleset", async () => {
+  const inventoryPath = "/repos/acme/widget/rulesets?includes_parents=true";
+  const duplicateRuleset = {
+    ...structuredClone(bootstrapRuleset()),
+    id: 31,
+    name: "Codex ledger protection duplicate",
+  };
+  await rejectsCode(load(makeFixture({
+    rulesetDetails: new Map([
+      ["30", bootstrapRuleset()],
+      ["31", duplicateRuleset],
+    ]),
+    intercept(url) {
+      if (url.pathname !== "/repos/acme/widget/rulesets") return null;
+      const page = Number(url.searchParams.get("page"));
+      return {
+        status: 200,
+        body: page === 1 ? [bootstrapRuleset()] : [duplicateRuleset],
+        link: page === 1 ? nextPageLink(inventoryPath, 2) : null,
+      };
+    },
+  })), "LEDGER_BOOTSTRAP_INELIGIBLE");
+});
+
+test("rejects invalid pagination scope before a second page fetch", async () => {
+  const rulesPath = "/repos/acme/widget/rules/branches/main";
+  const canonicalNext = nextPageLink(rulesPath, 2);
+  const invalidLinks = [
+    ["malformed", "not-a-link"],
+    ["loop", nextPageLink(rulesPath, 1)],
+    [
+      "cross-origin",
+      canonicalNext.replace(
+        "https://api.github.test",
+        "https://pagination.example",
+      ),
+    ],
+    [
+      "path drift",
+      canonicalNext.replace(
+        "/rules/branches/main",
+        "/rules/branches/release",
+      ),
+    ],
+    ["query drift", canonicalNext.replace("per_page=100", "per_page=99")],
+    ["page drift", nextPageLink(rulesPath, 3)],
+  ];
+  for (const [label, link] of invalidLinks) {
+    const paginationFetches = [];
+    const fixture = makeFixture({
+      intercept(url) {
+        if (url.pathname !== rulesPath) return null;
+        paginationFetches.push(url.href);
+        const page = Number(url.searchParams.get("page"));
+        return {
+          status: 200,
+          body: [effectiveRule(`scope_filler_${page}`, 4000 + page)],
+          link: page === 1 ? link : null,
+        };
+      },
+    });
+    await rejectsCode(
+      load(fixture),
+      "PAGINATION_INCOMPLETE",
+      label,
+    );
+    const expectedFirstPage =
+      `https://api.github.test${rulesPath}?per_page=100&page=1`;
+    assert.deepEqual(paginationFetches, [expectedFirstPage], label);
+    const firstPageIndex = fixture.calls.findIndex(
+      ({ url }) => url.href === expectedFirstPage,
+    );
+    assert.notEqual(firstPageIndex, -1, label);
+    assert.equal(fixture.calls.length, firstPageIndex + 1, label);
+  }
+});
+
+test("fails closed when a promised last page disappears or changes", async () => {
+  const rulesPath = "/repos/acme/widget/rules/branches/main";
+  const cases = [
+    ["missing page-two Link", null],
+    ["changed page-two last", paginationLink(rulesPath, [["last", 2]])],
+  ];
+  for (const [label, pageTwoLink] of cases) {
+    const fetchedPages = [];
+    await rejectsCode(load(makeFixture({
+      intercept(url) {
+        if (url.pathname !== rulesPath) return null;
+        const page = Number(url.searchParams.get("page"));
+        fetchedPages.push(page);
+        return {
+          status: 200,
+          body: [effectiveRule(`last_filler_${page}`, 5000 + page)],
+          link: page === 1
+            ? paginationLink(rulesPath, [["next", 2], ["last", 3]])
+            : pageTwoLink,
+        };
+      },
+    })), "PAGINATION_INCOMPLETE", label);
+    assert.deepEqual(fetchedPages, [1, 2], label);
+  }
+});
+
+test("accepts one consistent promised last page through page three", async () => {
+  const rulesPath = "/repos/acme/widget/rules/branches/main";
+  const fetchedPages = [];
+  const receipt = await load(makeFixture({
+    intercept(url) {
+      if (url.pathname !== rulesPath) return null;
+      const page = Number(url.searchParams.get("page"));
+      fetchedPages.push(page);
+      return {
+        status: 200,
+        body: page === 3
+          ? [statusRule(), workflowPinRule()]
+          : [effectiveRule(`consistent_last_filler_${page}`, 5100 + page)],
+        link: page === 1
+          ? paginationLink(rulesPath, [["next", 2], ["last", 3]])
+          : page === 2
+          ? paginationLink(rulesPath, [["next", 3], ["last", 3]])
+          : paginationLink(rulesPath, [["last", 3]]),
+      };
+    },
+  }));
+  assert.equal(receipt.ruleset.required, true);
+  assert.deepEqual(fetchedPages, [1, 2, 3]);
+});
+
+test("accepts page twenty as terminal and rejects a page twenty-one link", async () => {
+  const rulesPath = "/repos/acme/widget/rules/branches/main";
+  const expectedUrls = Array.from({ length: 20 }, (_, index) =>
+    `https://api.github.test${rulesPath}?per_page=100&page=${index + 1}`
+  );
+  const makeTwentyPageFixture = (continuePastCap) => {
+    const fetchedUrls = [];
+    const fixture = makeFixture({
+      intercept(url) {
+        if (url.pathname !== rulesPath) return null;
+        fetchedUrls.push(url.href);
+        const page = Number(url.searchParams.get("page"));
+        return {
+          status: 200,
+          body: page === 20
+            ? [statusRule(), workflowPinRule()]
+            : [effectiveRule(`page_cap_filler_${page}`, 6000 + page)],
+          link: page < 20
+            ? nextPageLink(rulesPath, page + 1)
+            : continuePastCap ? nextPageLink(rulesPath, 21) : null,
+        };
+      },
+    });
+    return { fixture, fetchedUrls };
+  };
+
+  const terminal = makeTwentyPageFixture(false);
+  const receipt = await load(terminal.fixture);
+  assert.equal(receipt.ruleset.required, true);
+  assert.deepEqual(terminal.fetchedUrls, expectedUrls);
+
+  const overflow = makeTwentyPageFixture(true);
+  await rejectsCode(load(overflow.fixture), "PAGINATION_INCOMPLETE");
+  assert.deepEqual(overflow.fetchedUrls, expectedUrls);
+});
+
+test("enforces the streamed response-byte cap despite absent or low Content-Length", async () => {
+  const ledgerPath =
+    "/repos/acme/widget/branches/codex-review-gate-ledger-v2";
+  const exactBytes = paddedJsonBytes(
+    { message: "Not Found" },
+    RESPONSE_BYTE_CAP,
+  );
+  const exactReceipt = await load(makeFixture({
+    ledgerPresent: false,
+    intercept(url) {
+      if (url.pathname !== ledgerPath) return null;
+      return {
+        status: 404,
+        rawBytes: exactBytes,
+        contentLength: null,
+      };
+    },
+  }));
+  assert.equal(
+    exactReceipt.endpoint_receipts.find(
+      (endpoint) => endpoint.path === ledgerPath,
+    )?.raw_body_sha256,
+    `sha256:${createHash("sha256").update(exactBytes).digest("hex")}`,
+  );
+
+  const overCapBytes = paddedJsonBytes(
+    { message: "Not Found" },
+    RESPONSE_BYTE_CAP + 1,
+  );
+  for (const contentLength of [null, String(RESPONSE_BYTE_CAP)]) {
+    let readerCancels = 0;
+    let bodyCancels = 0;
+    await rejectsCode(load(makeFixture({
+      ledgerPresent: false,
+      intercept(url) {
+        if (url.pathname !== ledgerPath) return null;
+        return {
+          status: 404,
+          rawBytes: overCapBytes,
+          contentLength,
+          onReaderCancel() {
+            readerCancels += 1;
+            return new Promise(() => {});
+          },
+          onBodyCancel() {
+            bodyCancels += 1;
+            return new Promise(() => {});
+          },
+        };
+      },
+    })), "HTTP_UNREADABLE");
+    await drainCleanupTasks();
+    assert.equal(readerCancels, 1);
+    assert.equal(bodyCancels, 1);
+  }
+});
+
+test("rejects noncanonical or oversized Content-Length before reading", async () => {
+  const ledgerPath =
+    "/repos/acme/widget/branches/codex-review-gate-ledger-v2";
+  for (const contentLength of [
+    "01",
+    "+1",
+    "1 ",
+    String(RESPONSE_BYTE_CAP + 1),
+  ]) {
+    let readerCancels = 0;
+    let bodyCancels = 0;
+    await rejectsCode(load(makeFixture({
+      ledgerPresent: false,
+      intercept(url) {
+        if (url.pathname !== ledgerPath) return null;
+        return {
+          status: 404,
+          body: { message: "Not Found" },
+          contentLength,
+          onReaderCancel() {
+            readerCancels += 1;
+          },
+          onBodyCancel() {
+            bodyCancels += 1;
+            return new Promise(() => {});
+          },
+        };
+      },
+    })), "HTTP_UNREADABLE");
+    await drainCleanupTasks();
+    assert.equal(readerCancels, 0);
+    assert.equal(bodyCancels, 1);
+  }
+});
+
+test("counts empty chunks against the response chunk cap at 4096 plus one", async () => {
+  const ledgerPath =
+    "/repos/acme/widget/branches/codex-review-gate-ledger-v2";
+  const rawBytes = Buffer.from('{"message":"Not Found"}', "utf8");
+  await load(makeFixture({
+    ledgerPresent: false,
+    intercept(url) {
+      if (url.pathname !== ledgerPath) return null;
+      return {
+        status: 404,
+        rawBytes,
+        contentLength: null,
+        bodyChunkCount: RESPONSE_CHUNK_CAP,
+      };
+    },
+  }));
+
+  let readerCancels = 0;
+  let bodyCancels = 0;
+  await rejectsCode(load(makeFixture({
+    ledgerPresent: false,
+    intercept(url) {
+      if (url.pathname !== ledgerPath) return null;
+      return {
+        status: 404,
+        rawBytes,
+        contentLength: "1",
+        bodyChunkCount: RESPONSE_CHUNK_CAP + 1,
+        onReaderCancel() {
+          readerCancels += 1;
+          return new Promise(() => {});
+        },
+        onBodyCancel() {
+          bodyCancels += 1;
+          return new Promise(() => {});
+        },
+      };
+    },
+  })), "HTTP_UNREADABLE");
+  await drainCleanupTasks();
+  assert.equal(readerCancels, 1);
+  assert.equal(bodyCancels, 1);
+});
+
+test("enforces the aggregate response-byte cap from actual streamed bytes", async () => {
+  const captures = await captureFixtureResponses(makeFixture());
+  const exactReplay = replayResponsesAtTotalBytes(
+    captures,
+    OPERATION_BYTE_CAP,
+    { contentLength: "actual" },
+  );
+  await load(exactReplay);
+  exactReplay.assertComplete();
+
+  for (const [contentLength, expectedReaderCancels] of [
+    [null, 1],
+    ["1", 1],
+    ["actual", 0],
+  ]) {
+    let readerCancels = 0;
+    let bodyCancels = 0;
+    const overCapReplay = replayResponsesAtTotalBytes(
+      captures,
+      OPERATION_BYTE_CAP + 1,
+      {
+        contentLength,
+        onReaderCancel() {
+          readerCancels += 1;
+          return new Promise(() => {});
+        },
+        onBodyCancel() {
+          bodyCancels += 1;
+          return new Promise(() => {});
+        },
+      },
+    );
+    await rejectsCode(load(overCapReplay), "HTTP_UNREADABLE");
+    await drainCleanupTasks();
+    assert.equal(readerCancels, expectedReaderCancels);
+    assert.equal(bodyCancels, 1);
+  }
+});
+
+test("binds exact valid UTF-8 response bytes and rejects malformed UTF-8", async () => {
+  const ledgerPath =
+    "/repos/acme/widget/branches/codex-review-gate-ledger-v2";
+  const legalBytes = Buffer.from(
+    '{ "message" : "Not \\u0046\\uFEFFound" }\n',
+    "utf8",
+  );
+  const legalJson = legalBytes.toString("utf8");
+  assert.equal(JSON.parse(legalJson).message, "Not F\uFEFFound");
+  assert.notEqual(JSON.stringify(JSON.parse(legalJson)), legalJson);
+  const legalFixture = makeFixture({
+    ledgerPresent: false,
+    intercept(url) {
+      if (url.pathname === ledgerPath) {
+        return { status: 404, rawBytes: legalBytes };
+      }
+      return null;
+    },
+  });
+  const receipt = await load(legalFixture);
+  const ledgerReceipt = receipt.endpoint_receipts.find(
+    (endpoint) => endpoint.path === ledgerPath,
+  );
+  assert.equal(
+    ledgerReceipt?.raw_body_sha256,
+    `sha256:${createHash("sha256").update(legalBytes).digest("hex")}`,
+  );
+
+  const leadingBomBytes = Buffer.concat([
+    Buffer.from([0xEF, 0xBB, 0xBF]),
+    Buffer.from('{"message":"Not Found"}', "utf8"),
+  ]);
+  await rejectsCode(
+    load(makeFixture({
+      ledgerPresent: false,
+      intercept(url) {
+        if (url.pathname === ledgerPath) {
+          return { status: 404, rawBytes: leadingBomBytes };
+        }
+        return null;
+      },
+    })),
+    "HTTP_UNREADABLE",
+  );
+
+  const prefix = Buffer.from('{"message":"Not Found ', "utf8");
+  const suffix = Buffer.from('"}', "utf8");
+  const malformedBytes = Buffer.concat([
+    prefix,
+    Buffer.from([0x80]),
+    suffix,
+  ]);
+  await rejectsCode(
+    load(makeFixture({
+      ledgerPresent: false,
+      intercept(url) {
+        if (url.pathname === ledgerPath) {
+          return { status: 404, rawBytes: malformedBytes };
+        }
+        return null;
+      },
+    })),
+    "HTTP_UNREADABLE",
+  );
+});
+
+test("workflow preflight deadline bounds a stalled fetch", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let requestSignal = null;
+  const operation = load({
+    fetch(_url, init) {
+      requestSignal = init.signal;
+      return new Promise(() => {});
+    },
+  });
+  try {
+    for (let index = 0; index < 10 && requestSignal === null; index += 1) {
+      await Promise.resolve();
+    }
+    assert.notEqual(requestSignal, null);
+    const rejection = rejectsCode(operation, "HTTP_UNREADABLE");
+    context.mock.timers.tick(15_000);
+    await rejection;
+    await drainCleanupTasks();
+    assert.equal(requestSignal.aborted, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("workflow preflight deadline bounds a stalled response-body read", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let requestSignal = null;
+  let readStarted = false;
+  let cancelCalled = false;
+  const operation = load({
+    async fetch(_url, init) {
+      requestSignal = init.signal;
+      return {
+        status: 200,
+        headers: responseHeaders(2),
+        body: {
+          getReader() {
+            return {
+              read() {
+                readStarted = true;
+                return new Promise(() => {});
+              },
+              cancel() {
+                cancelCalled = true;
+                return Promise.resolve();
+              },
+              releaseLock() {},
+            };
+          },
+        },
+      };
+    },
+  });
+  try {
+    for (let index = 0; index < 10 && !readStarted; index += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(readStarted, true);
+    const rejection = rejectsCode(operation, "HTTP_UNREADABLE");
+    context.mock.timers.tick(15_000);
+    await rejection;
+    await drainCleanupTasks();
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(cancelCalled, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("workflow preflight settles deadline failure before next-turn hostile cleanup", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const neverSettles = new Promise(() => {});
+  const cleanupEvents = [];
+  const cleanupObservedErrors = [];
+  let caught = null;
+  let requestSignal = null;
+  let readStarted = false;
+  let abortReason = null;
+  let abortReasonMessage = null;
+  let abortReasonPrototype = null;
+  let abortReasonWasError = false;
+  let readerCancelThis = null;
+  let readerReleaseThis = null;
+  let bodyCancelThis = null;
+  const observeCleanup = (event) => {
+    cleanupEvents.push(event);
+    cleanupObservedErrors.push(caught);
+  };
+  let reader;
+  reader = {
+    read() {
+      readStarted = true;
+      return neverSettles;
+    },
+    get cancel() {
+      observeCleanup("reader cancel getter");
+      return function cancel() {
+        observeCleanup("reader cancel call");
+        readerCancelThis = this;
+        throw new Error("synthetic reader cancel failure");
+      };
+    },
+    get releaseLock() {
+      observeCleanup("reader release getter");
+      return function releaseLock() {
+        observeCleanup("reader release call");
+        readerReleaseThis = this;
+        return neverSettles;
+      };
+    },
+  };
+  let body;
+  body = {
+    get cancel() {
+      observeCleanup("body cancel getter");
+      return function cancel() {
+        observeCleanup("body cancel call");
+        bodyCancelThis = this;
+        throw new Error("synthetic body cancel failure");
+      };
+    },
+    getReader() {
+      return reader;
+    },
+  };
+  const operation = load({
+    async fetch(_url, init) {
+      requestSignal = init.signal;
+      requestSignal.addEventListener("abort", () => {
+        observeCleanup("abort listener");
+        abortReason = requestSignal.reason;
+        abortReasonMessage = abortReason.message;
+        abortReasonPrototype = Object.getPrototypeOf(abortReason);
+        abortReasonWasError = abortReason instanceof Error;
+        abortReason.name = "HostileCleanupReason";
+        abortReason.message = "mutated cleanup reason";
+        abortReason.code = "HOSTILE";
+        abortReason.details = { mutated: true };
+        abortReason.cause = { mutated: true };
+        Object.setPrototypeOf(abortReason, null);
+        return neverSettles;
+      }, { once: true });
+      return {
+        status: 200,
+        headers: responseHeaders(1),
+        body,
+      };
+    },
+  });
+  const authoritativeRejection = operation.then(
+    () => assert.fail("expected the stalled request to reject"),
+    (error) => {
+      caught = error;
+      return error;
+    },
+  );
+  try {
+    for (let index = 0; index < 10 && !readStarted; index += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(readStarted, true);
+    context.mock.timers.tick(15_000);
+    const authoritativeError = await authoritativeRejection;
+    assert.equal(authoritativeError, caught);
+    assert.equal(caught?.name, "V2WorkflowPreflightError");
+    assert.equal(caught?.code, "HTTP_UNREADABLE");
+    assert.equal(caught?.details, null);
+    assert.equal(caught instanceof V2WorkflowPreflightError, true);
+    assert.equal(caught?.cause instanceof Error, true);
+    const caughtPrototype = Object.getPrototypeOf(caught);
+    const caughtMessage = caught.message;
+    const caughtCause = caught.cause;
+    const caughtCausePrototype = Object.getPrototypeOf(caughtCause);
+    const caughtCauseName = caughtCause.name;
+    const caughtCauseMessage = caughtCause.message;
+    assert.deepEqual(cleanupEvents, []);
+    assert.equal(requestSignal?.aborted, false);
+
+    await drainCleanupTasks();
+
+    assert.deepEqual(cleanupEvents, [
+      "abort listener",
+      "reader cancel getter",
+      "reader cancel call",
+      "reader release getter",
+      "reader release call",
+      "body cancel getter",
+      "body cancel call",
+    ]);
+    assert.equal(
+      cleanupObservedErrors.every((error) => error === authoritativeError),
+      true,
+    );
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(requestSignal?.reason, abortReason);
+    assert.notEqual(abortReason, authoritativeError);
+    assert.notEqual(abortReason, caughtCause);
+    assert.equal(abortReasonWasError, true);
+    assert.equal(abortReasonPrototype, Error.prototype);
+    assert.match(abortReasonMessage, / cleanup after deadline$/u);
+    assert.equal(abortReason?.name, "HostileCleanupReason");
+    assert.equal(abortReason?.code, "HOSTILE");
+    assert.equal(readerCancelThis, reader);
+    assert.equal(readerReleaseThis, reader);
+    assert.equal(bodyCancelThis, body);
+    assert.equal(Object.getPrototypeOf(authoritativeError), caughtPrototype);
+    assert.equal(caughtPrototype, V2WorkflowPreflightError.prototype);
+    assert.equal(authoritativeError.name, "V2WorkflowPreflightError");
+    assert.equal(authoritativeError.code, "HTTP_UNREADABLE");
+    assert.equal(authoritativeError.message, caughtMessage);
+    assert.equal(authoritativeError.details, null);
+    assert.equal(authoritativeError.cause, caughtCause);
+    assert.equal(Object.getPrototypeOf(caughtCause), caughtCausePrototype);
+    assert.equal(caughtCause.name, caughtCauseName);
+    assert.equal(caughtCause.message, caughtCauseMessage);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("workflow preflight retains its initialized scheduler after builtin poisoning", {
+  timeout: 2_000,
+}, async (context) => {
+  await drainCleanupTasks();
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const require = createRequire(import.meta.url);
+  const cjsTimers = require("node:timers");
+  const originalSetImmediate = cjsTimers.setImmediate;
+  assert.equal(liveSetImmediate, originalSetImmediate);
+  let poisonCalls = 0;
+  function poisonedSetImmediate() {
+    poisonCalls += 1;
+    throw new Error("synthetic poisoned setImmediate");
+  }
+  const neverSettles = new Promise(() => {});
+  const cleanupObservedSettlement = [];
+  let authoritativeSettled = false;
+  let requestSignal = null;
+  let readStarted = false;
+  let deadlineAborts = 0;
+  let readerCancels = 0;
+  let readerReleases = 0;
+  let bodyCancels = 0;
+  try {
+    cjsTimers.setImmediate = poisonedSetImmediate;
+    syncBuiltinESMExports();
+    assert.equal(liveSetImmediate, poisonedSetImmediate);
+
+    const operation = load({
+      async fetch(_url, init) {
+        requestSignal = init.signal;
+        requestSignal.addEventListener("abort", () => {
+          deadlineAborts += 1;
+          cleanupObservedSettlement.push(authoritativeSettled);
+        }, { once: true });
+        return {
+          status: 200,
+          headers: responseHeaders(1),
+          body: {
+            cancel() {
+              bodyCancels += 1;
+              cleanupObservedSettlement.push(authoritativeSettled);
+              return neverSettles;
+            },
+            getReader() {
+              return {
+                read() {
+                  readStarted = true;
+                  return neverSettles;
+                },
+                cancel() {
+                  readerCancels += 1;
+                  cleanupObservedSettlement.push(authoritativeSettled);
+                  return neverSettles;
+                },
+                releaseLock() {
+                  readerReleases += 1;
+                  cleanupObservedSettlement.push(authoritativeSettled);
+                  return neverSettles;
+                },
+              };
+            },
+          },
+        };
+      },
+    });
+    const authoritativeRejection = operation.then(
+      () => assert.fail("expected the stalled request to reject"),
+      (error) => {
+        authoritativeSettled = true;
+        return error;
+      },
+    );
+    for (let index = 0; index < 10 && !readStarted; index += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(readStarted, true);
+    context.mock.timers.tick(15_000);
+    const authoritativeError = await authoritativeRejection;
+    assert.equal(authoritativeError?.name, "V2WorkflowPreflightError");
+    assert.equal(authoritativeError?.code, "HTTP_UNREADABLE");
+    assert.equal(poisonCalls, 0);
+    assert.equal(requestSignal?.aborted, false);
+    assert.equal(deadlineAborts, 0);
+    assert.equal(readerCancels, 0);
+    assert.equal(readerReleases, 0);
+    assert.equal(bodyCancels, 0);
+
+    await drainCleanupTasks();
+
+    assert.equal(poisonCalls, 0);
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(deadlineAborts, 1);
+    assert.equal(readerCancels, 1);
+    assert.equal(readerReleases, 1);
+    assert.equal(bodyCancels, 1);
+    assert.deepEqual(cleanupObservedSettlement, [true, true, true, true]);
+  } finally {
+    cjsTimers.setImmediate = originalSetImmediate;
+    syncBuiltinESMExports();
+    context.mock.timers.reset();
+  }
+  assert.equal(cjsTimers.setImmediate, originalSetImmediate);
+  assert.equal(liveSetImmediate, originalSetImmediate);
+});
+
+test("workflow preflight never awaits a non-settling reader cancellation", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let cancelCalled = false;
+  let requestSignal = null;
+  let deadlineAborts = 0;
+  const operation = load({
+    async fetch(_url, init) {
+      requestSignal = init.signal;
+      requestSignal.addEventListener("abort", () => {
+        deadlineAborts += 1;
+      });
+      return {
+        status: 200,
+        headers: responseHeaders(1),
+        body: {
+          getReader() {
+            return {
+              async read() {
+                return { done: false, value: "not bytes" };
+              },
+              cancel() {
+                cancelCalled = true;
+                return new Promise(() => {});
+              },
+              releaseLock() {},
+            };
+          },
+        },
+      };
+    },
+  });
+  try {
+    await rejectsCode(operation, "HTTP_UNREADABLE");
+    await drainCleanupTasks();
+    assert.equal(cancelCalled, true);
+    assert.equal(requestSignal?.aborted, false);
+    assert.equal(deadlineAborts, 0);
+    context.mock.timers.tick(15_000);
+    assert.equal(requestSignal?.aborted, false);
+    assert.equal(deadlineAborts, 0);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("workflow preflight cleans up invalid reader shapes and throwing read getters", {
+  timeout: 2_000,
+}, async () => {
+  const readerFactories = [
+    ["invalid reader shape", ({ cancel, releaseLock }) => ({
+      read: null,
+      cancel,
+      releaseLock,
+    })],
+    ["throwing read getter", ({ cancel, releaseLock }) => ({
+      get read() {
+        throw new Error("synthetic read getter failure");
+      },
+      cancel,
+      releaseLock,
+    })],
+  ];
+  for (const [label, makeReader] of readerFactories) {
+    let requestSignal = null;
+    let readerCancels = 0;
+    let releases = 0;
+    let bodyCancels = 0;
+    const neverSettles = new Promise(() => {});
+    await rejectsCode(load({
+      async fetch(_url, init) {
+        requestSignal = init.signal;
+        return {
+          status: 200,
+          headers: responseHeaders(1),
+          body: {
+            cancel() {
+              bodyCancels += 1;
+              return neverSettles;
+            },
+            getReader() {
+              return makeReader({
+                cancel() {
+                  readerCancels += 1;
+                  return neverSettles;
+                },
+                releaseLock() {
+                  releases += 1;
+                },
+              });
+            },
+          },
+        };
+      },
+    }), "HTTP_UNREADABLE", label);
+    await drainCleanupTasks();
+    assert.equal(readerCancels, 1, label);
+    assert.equal(releases, 1, label);
+    assert.equal(bodyCancels, 1, label);
+    assert.equal(requestSignal?.aborted, false, label);
+  }
+});
+
+test("workflow preflight rejects accessor-backed stream read results", {
+  timeout: 2_000,
+}, async () => {
+  let doneGetterCalls = 0;
+  await rejectsHostileReadResult("stateful done getter", () =>
+    Object.defineProperties({}, {
+      done: {
+        enumerable: true,
+        get() {
+          doneGetterCalls += 1;
+          return doneGetterCalls > 1;
+        },
+      },
+      value: { enumerable: true, value: undefined },
+    })
+  );
+  assert.equal(doneGetterCalls, 0);
+
+  let valueGetterCalls = 0;
+  await rejectsHostileReadResult("value getter", () =>
+    Object.defineProperties({}, {
+      done: { enumerable: true, value: false },
+      value: {
+        enumerable: true,
+        get() {
+          valueGetterCalls += 1;
+          return new Uint8Array([0x5B, 0x5D]);
+        },
+      },
+    })
+  );
+  assert.equal(valueGetterCalls, 0);
+});
+
+test("workflow preflight rejects terminal fragments and non-byte chunks", {
+  timeout: 2_000,
+}, async () => {
+  for (const [label, readResult] of [
+    [
+      "terminal bytes",
+      { done: true, value: new Uint8Array([0x5B, 0x5D]) },
+    ],
+    ["non-byte chunk", { done: false, value: "[]" }],
+  ]) {
+    await rejectsHostileReadResult(label, () => readResult);
+  }
+});
+
+test("workflow preflight accounts and parses a Uint8Array by its internal bytes", {
+  timeout: 2_000,
+}, async () => {
+  const rulesPath = "/repos/acme/widget/rules/branches/main";
+  const targetUrl =
+    `https://api.github.test${rulesPath}?per_page=100&page=1`;
+  const fixture = makeFixture();
+  const fetchedUrls = [];
+  const hostileChunk = new Uint8Array([0x5B, 0x5D, 0x58]);
+  Object.defineProperty(hostileChunk, "byteLength", {
+    configurable: true,
+    value: 2,
+  });
+  let reads = 0;
+  let readerCancels = 0;
+  let releases = 0;
+  let bodyCancels = 0;
+  const neverSettles = new Promise(() => {});
+  await rejectsCode(load({
+    async fetch(url, init) {
+      fetchedUrls.push(url);
+      if (url !== targetUrl) return fixture.fetch(url, init);
+      return {
+        status: 200,
+        headers: responseHeaders(3),
+        body: {
+          cancel() {
+            bodyCancels += 1;
+            return neverSettles;
+          },
+          getReader() {
+            return {
+              async read() {
+                reads += 1;
+                return reads === 1
+                  ? { done: false, value: hostileChunk }
+                  : { done: true, value: undefined };
+              },
+              cancel() {
+                readerCancels += 1;
+                return neverSettles;
+              },
+              releaseLock() {
+                releases += 1;
+                return neverSettles;
+              },
+            };
+          },
+        },
+      };
+    },
+  }), "HTTP_UNREADABLE");
+  assert.equal(reads, 2);
+  await drainCleanupTasks();
+  assert.equal(releases, 1);
+  assert.equal(readerCancels, 0);
+  assert.equal(bodyCancels, 0);
+  assert.equal(fetchedUrls.at(-1), targetUrl);
+});
+
+test("workflow preflight rejects a fetch settled after its monotonic deadline", {
+  timeout: 2_000,
+}, async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const fixture = makeFixture();
+  let firstRequest = true;
+  let resolveFetch = null;
+  let requestSignal = null;
+  let lateResponseCancelled = false;
+  const operation = load({
+    fetch(url, init) {
+      if (!firstRequest) return fixture.fetch(url, init);
+      firstRequest = false;
+      requestSignal = init.signal;
+      const readyResponse = fixture.fetch(url, init);
+      return new Promise((resolve) => {
+        resolveFetch = () => {
+          void readyResponse.then((value) => {
+            value.body.cancel = () => {
+              lateResponseCancelled = true;
+              return Promise.resolve();
+            };
+            resolve(value);
+          });
+        };
+      });
+    },
+  });
+  try {
+    for (let index = 0; index < 10 && resolveFetch === null; index += 1) {
+      await Promise.resolve();
+    }
+    assert.notEqual(resolveFetch, null);
+    const rejection = rejectsCode(operation, "HTTP_UNREADABLE");
+    monotonicNow += 15_000;
+    resolveFetch();
+    await rejection;
+    await drainCleanupTasks();
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(lateResponseCancelled, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("workflow preflight rejects a body read settled after its monotonic deadline", {
+  timeout: 2_000,
+}, async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const fixture = makeFixture();
+  let firstRequest = true;
+  let resolveRead = null;
+  let requestSignal = null;
+  let readerCancelled = false;
+  const operation = load({
+    async fetch(url, init) {
+      requestSignal = init.signal;
+      const value = await fixture.fetch(url, init);
+      if (!firstRequest) return value;
+      firstRequest = false;
+      const bytes = Buffer.from(await value.text(), "utf8");
+      let emitted = false;
+      value.body.getReader = () => ({
+        read() {
+          if (emitted) {
+            return Promise.resolve({ done: true, value: undefined });
+          }
+          emitted = true;
+          return new Promise((resolve) => {
+            resolveRead = () => resolve({
+              done: false,
+              value: Uint8Array.from(bytes),
+            });
+          });
+        },
+        cancel() {
+          readerCancelled = true;
+          return Promise.resolve();
+        },
+        releaseLock() {},
+      });
+      return value;
+    },
+  });
+  try {
+    for (let index = 0; index < 10 && resolveRead === null; index += 1) {
+      await Promise.resolve();
+    }
+    assert.notEqual(resolveRead, null);
+    const rejection = rejectsCode(operation, "HTTP_UNREADABLE");
+    monotonicNow += 15_000;
+    resolveRead();
+    await rejection;
+    await drainCleanupTasks();
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(readerCancelled, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("workflow preflight rechecks its monotonic deadline after JSON decoding", {
+  timeout: 2_000,
+}, async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const originalParse = JSON.parse;
+  let advanced = false;
+  context.mock.method(JSON, "parse", (...args) => {
+    const value = originalParse(...args);
+    if (!advanced) {
+      advanced = true;
+      monotonicNow += 15_000;
+    }
+    return value;
+  });
+  const fixture = makeFixture();
+  let requestSignal = null;
+  try {
+    await rejectsCode(load({
+      fetch(url, init) {
+        requestSignal ??= init.signal;
+        return fixture.fetch(url, init);
+      },
+    }), "HTTP_UNREADABLE");
+    assert.equal(advanced, true);
+    await drainCleanupTasks();
+    assert.equal(requestSignal?.aborted, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("workflow preflight revalidates a completed capture before clearing its timer", {
+  timeout: 2_000,
+}, async (context) => {
+  let afterParse = false;
+  const afterParseTimes = [];
+  context.mock.method(performance, "now", () => {
+    if (!afterParse) return 100;
+    const value = afterParseTimes.length < 2 ? 100 : 15_100;
+    afterParseTimes.push(value);
+    return value;
+  });
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const originalParse = JSON.parse;
+  context.mock.method(JSON, "parse", (...args) => {
+    const value = originalParse(...args);
+    afterParse = true;
+    return value;
+  });
+  const fixture = makeFixture();
+  let requestSignal = null;
+  let deadlineAborts = 0;
+  try {
+    await rejectsCode(load({
+      fetch(url, init) {
+        requestSignal ??= init.signal;
+        requestSignal.addEventListener("abort", () => {
+          deadlineAborts += 1;
+        }, { once: true });
+        return fixture.fetch(url, init);
+      },
+    }), "HTTP_UNREADABLE");
+    assert.deepEqual(afterParseTimes, [100, 100, 15_100]);
+    await drainCleanupTasks();
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(deadlineAborts, 1);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("workflow preflight captures status once before its final deadline fence", {
+  timeout: 2_000,
+}, async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const fixture = makeFixture();
+  let firstResponse = true;
+  let statusReads = 0;
+  let firstRequestSignal = null;
+  let deadlineAborts = 0;
+  try {
+    await load({
+      async fetch(url, init) {
+        const value = await fixture.fetch(url, init);
+        if (!firstResponse) return value;
+        firstResponse = false;
+        firstRequestSignal = init.signal;
+        firstRequestSignal.addEventListener("abort", () => {
+          deadlineAborts += 1;
+        });
+        const status = value.status;
+        Object.defineProperty(value, "status", {
+          configurable: true,
+          get() {
+            statusReads += 1;
+            if (statusReads === 4) monotonicNow += 15_000;
+            return status;
+          },
+        });
+        return value;
+      },
+    });
+    assert.equal(statusReads, 1);
+    assert.equal(monotonicNow, 100);
+    assert.equal(firstRequestSignal?.aborted, false);
+    assert.equal(deadlineAborts, 0);
+    context.mock.timers.tick(15_000);
+    assert.equal(firstRequestSignal?.aborted, false);
+    assert.equal(deadlineAborts, 0);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+function responseHeaders(contentLength) {
+  return {
+    get(name) {
+      if (name.toLowerCase() === "date") return DATE;
+      if (name.toLowerCase() === "content-type") return "application/json";
+      if (name.toLowerCase() === "content-length") return String(contentLength);
+      return null;
+    },
+  };
+}

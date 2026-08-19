@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 
 import {
@@ -14,6 +16,9 @@ import {
   projectV2TransportSnapshotForGitLedger,
   validateStatusTarget,
 } from "../packages/action/src/v2/transport.mjs";
+
+const requireBuiltin = createRequire(import.meta.url);
+const mutableTimers = requireBuiltin("node:timers");
 
 const API = "https://api.github.test";
 const GRAPHQL = `${API}/graphql`;
@@ -703,7 +708,7 @@ test("provider pre-scope rejects a deleted carrier and changed full-snapshot byt
   );
 });
 
-test("REST pagination continues past a full final page and loads every comment reaction page", async () => {
+test("REST pagination follows canonical links and loads every comment reaction page", async () => {
   const issueComments = [issueComment(101), issueComment(102)];
   const fake = createFakeGitHub({
     issueComments,
@@ -730,9 +735,181 @@ test("REST pagination continues past a full final page and loads every comment r
   const commentPageCalls = fake.calls.filter(
     (call) => call.path === `/repos/${OWNER}/${REPO}/issues/${PR}/comments`,
   );
-  assert.deepEqual(commentPageCalls.map((call) => call.query.page), ["1", "2", "3"]);
+  assert.deepEqual(commentPageCalls.map((call) => call.query.page), ["1", "2"]);
   assert.equal(snapshot.pages.reactions.issue_comments.length, 2);
   assertV2Snapshot(snapshot);
+});
+
+test("REST pagination rejects a broken promised last-page chain", async () => {
+  const issuePath = `/repos/${OWNER}/${REPO}/issues/${PR}/comments`;
+  const fake = createFakeGitHub({
+    issueComments: [issueComment(101), issueComment(102), issueComment(103)],
+    paginationLinkMutator({ path, page, url, defaultLink }) {
+      if (path !== issuePath) return defaultLink;
+      if (page === 1) {
+        return paginationLink(url, { next: 2, last: 3 });
+      }
+      if (page === 2) return null;
+      return defaultLink;
+    },
+  });
+
+  await assert.rejects(
+    createTransport(fake.fetch, { page_size: 2, max_pages: 20 }).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INCOMPLETE_PAGINATION");
+      return true;
+    },
+  );
+  assert.deepEqual(
+    fake.calls.filter((call) => call.path === issuePath).map((call) => call.query.page),
+    ["1", "2"],
+  );
+});
+
+test("REST pagination rejects last-page promise drift", async () => {
+  const issuePath = `/repos/${OWNER}/${REPO}/issues/${PR}/comments`;
+  const fake = createFakeGitHub({
+    issueComments: [issueComment(101), issueComment(102), issueComment(103)],
+    paginationLinkMutator({ path, page, url, defaultLink }) {
+      if (path !== issuePath) return defaultLink;
+      if (page === 1) return paginationLink(url, { next: 2, last: 3 });
+      if (page === 2) return paginationLink(url, { last: 2 });
+      return defaultLink;
+    },
+  });
+
+  await assert.rejects(
+    createTransport(fake.fetch, { page_size: 2, max_pages: 20 }).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INCOMPLETE_PAGINATION");
+      return true;
+    },
+  );
+  assert.deepEqual(
+    fake.calls.filter((call) => call.path === issuePath).map((call) => call.query.page),
+    ["1", "2"],
+  );
+});
+
+test("REST pagination accepts one stable three-page promise", async () => {
+  const issuePath = `/repos/${OWNER}/${REPO}/issues/${PR}/comments`;
+  const fake = createFakeGitHub({
+    issueComments: [issueComment(101), issueComment(102), issueComment(103)],
+  });
+  const snapshot = await createTransport(fake.fetch, {
+    page_size: 1,
+    max_pages: 20,
+  }).loadSnapshot({ owner: OWNER, repo: REPO, pullNumber: PR });
+
+  assert.deepEqual(snapshot.pages.issue_comments.map((comment) => comment.id), [
+    "101",
+    "102",
+    "103",
+  ]);
+  assert.deepEqual(
+    fake.calls.filter((call) => call.path === issuePath).map((call) => call.query.page),
+    ["1", "2", "3"],
+  );
+});
+
+test("REST pagination rejects every noncanonical Link scope before a second fetch", async () => {
+  const issuePath = `/repos/${OWNER}/${REPO}/issues/${PR}/comments`;
+  for (const [label, mutate] of [
+    ["origin", (url) => { url.host = "attacker.example"; }],
+    ["path", (url) => { url.pathname = `${url.pathname}/other`; }],
+    ["query", (url) => { url.searchParams.set("extra", "1"); }],
+    ["page", (url) => { url.searchParams.set("page", "3"); }],
+  ]) {
+    const fake = createFakeGitHub({
+      issueComments: [issueComment(101), issueComment(102)],
+      paginationLinkMutator({ path, page, url, defaultLink }) {
+        if (path !== issuePath || page !== 1) return defaultLink;
+        const next = paginationUrl(url, 2);
+        mutate(next);
+        return `<${next.href}>; rel="next"`;
+      },
+    });
+    await assert.rejects(
+      createTransport(fake.fetch, { page_size: 1, max_pages: 20 }).loadSnapshot({
+        owner: OWNER,
+        repo: REPO,
+        pullNumber: PR,
+      }),
+      (error) => {
+        assert.ok(error instanceof V2TransportError, label);
+        assert.equal(error.code, "INVALID_PAGINATION_LINK", label);
+        return true;
+      },
+    );
+    assert.deepEqual(
+      fake.calls.filter((call) => call.path === issuePath).map((call) => call.query.page),
+      ["1"],
+      label,
+    );
+  }
+
+  const unknown = createFakeGitHub({
+    issueComments: [issueComment(101), issueComment(102)],
+    paginationLinkMutator({ path, page, url, defaultLink }) {
+      if (path !== issuePath || page !== 1) return defaultLink;
+      return `<${paginationUrl(url, 2).href}>; rel="canonical"`;
+    },
+  });
+  await assert.rejects(
+    createTransport(unknown.fetch, { page_size: 1, max_pages: 20 }).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INVALID_PAGINATION_LINK");
+      return true;
+    },
+  );
+  assert.deepEqual(
+    unknown.calls.filter((call) => call.path === issuePath).map((call) => call.query.page),
+    ["1"],
+  );
+});
+
+test("REST pagination rejects a promised page beyond the configured page cap", async () => {
+  const issuePath = `/repos/${OWNER}/${REPO}/issues/${PR}/comments`;
+  const fake = createFakeGitHub({
+    issueComments: [issueComment(101), issueComment(102), issueComment(103)],
+    paginationLinkMutator({ path, page, url, defaultLink }) {
+      if (path !== issuePath || page !== 1) return defaultLink;
+      return paginationLink(url, { next: 2, last: 3 });
+    },
+  });
+
+  await assert.rejects(
+    createTransport(fake.fetch, { page_size: 2, max_pages: 2 }).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "PAGE_LIMIT_EXCEEDED");
+      return true;
+    },
+  );
+  assert.deepEqual(
+    fake.calls.filter((call) => call.path === issuePath).map((call) => call.query.page),
+    ["1"],
+  );
 });
 
 test("check-run discovery uses filter=all and fully paginates the exact current head", async () => {
@@ -766,6 +943,51 @@ test("check-run discovery uses filter=all and fully paginates the exact current 
   );
   assert.deepEqual(calls.map((call) => call.query.page), ["1", "2", "3", "1", "2", "3"]);
   assert.ok(calls.every((call) => call.query.filter === "all"));
+});
+
+test("check-run Link promises stay bound to total_count", async () => {
+  const checkRunsPath = `/repos/${OWNER}/${REPO}/commits/${HEAD}/check-runs`;
+  for (const [label, mutate, expectedPages] of [
+    [
+      "total_count completed before promised last page",
+      ({ page, url, defaultLink }) => page === 1
+        ? paginationLink(url, { next: 2, last: 3 })
+        : page === 2
+          ? null
+          : defaultLink,
+      ["1", "2"],
+    ],
+    [
+      "total_count requires a page absent from Link",
+      ({ page, defaultLink }) => page === 1 ? null : defaultLink,
+      ["1"],
+    ],
+  ]) {
+    const fake = createFakeGitHub({
+      checkRuns: [checkRun(501), checkRun(502)],
+      paginationLinkMutator({ path, ...context }) {
+        return path === checkRunsPath ? mutate(context) : context.defaultLink;
+      },
+    });
+
+    await assert.rejects(
+      createTransport(fake.fetch, { page_size: 1, max_pages: 20 }).loadSnapshot({
+        owner: OWNER,
+        repo: REPO,
+        pullNumber: PR,
+      }),
+      (error) => {
+        assert.ok(error instanceof V2TransportError, label);
+        assert.equal(error.code, "INCOMPLETE_PAGINATION", label);
+        return true;
+      },
+    );
+    assert.deepEqual(
+      fake.calls.filter((call) => call.path === checkRunsPath).map((call) => call.query.page),
+      expectedPages,
+      label,
+    );
+  }
 });
 
 test("check-run discovery drift is preserved as unstable evidence", async () => {
@@ -942,6 +1164,213 @@ test("manual actor permission receipts bind exact actor identity, endpoint, Date
   );
 });
 
+test("Bot none permission with an empty role is accepted only with exact all-false authority", async () => {
+  const none = actorPermissionResponse();
+  none.permission = "none";
+  none.role_name = "";
+  none.user.permissions = {
+    admin: false,
+    maintain: false,
+    push: false,
+    triage: false,
+    pull: false,
+  };
+  const fake = createFakeGitHub({
+    actorPermissionResponses: [structuredClone(none), structuredClone(none)],
+  });
+  const selector = { kind: "issue_comment", id: 101 };
+  const snapshot = await createTransport(fake.fetch).loadSnapshot({
+    owner: OWNER,
+    repo: REPO,
+    pullNumber: PR,
+    artifactSelectors: [selector],
+    permissionSubjects: [selector],
+  });
+
+  const receipt = snapshot.permissions.actor_permissions[0];
+  assert.equal(receipt.actor.type, "Bot");
+  assert.equal(receipt.pre.effective_permission, "none");
+  assert.equal(receipt.pre.role_name, "");
+  assert.deepEqual(receipt.pre.permissions, {
+    admin: false,
+    maintain: false,
+    push: false,
+    triage: false,
+    pull: false,
+  });
+  assert.equal(receipt.pre.mapping_source, "user.permissions");
+  assert.equal(receipt.stable, true);
+
+  const forged = structuredClone(none);
+  forged.user.permissions.push = true;
+  const forgedFake = createFakeGitHub({
+    actorPermissionResponses: [forged, structuredClone(forged)],
+  });
+  await assert.rejects(
+    createTransport(forgedFake.fetch).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+      artifactSelectors: [selector],
+      permissionSubjects: [selector],
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INVALID_RESPONSE_SCHEMA");
+      return true;
+    },
+  );
+
+  const unknownCapability = structuredClone(none);
+  unknownCapability.user.permissions.deployments = true;
+  const unknownCapabilityFake = createFakeGitHub({
+    actorPermissionResponses: [unknownCapability],
+  });
+  await assert.rejects(
+    createTransport(unknownCapabilityFake.fetch).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+      artifactSelectors: [selector],
+      permissionSubjects: [selector],
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INVALID_RESPONSE_SCHEMA");
+      return true;
+    },
+  );
+
+  for (const [field, mutate] of [
+    ["id", (user) => { user.id += 1; }],
+    ["node_id", (user) => { user.node_id = "BOT_other"; }],
+    ["login", (user) => { user.login = "other[bot]"; }],
+    ["type", (user) => { user.type = "User"; }],
+  ]) {
+    const mismatchedActor = structuredClone(none);
+    mutate(mismatchedActor.user);
+    const mismatchedFake = createFakeGitHub({
+      actorPermissionResponses: [mismatchedActor],
+    });
+    await assert.rejects(
+      createTransport(mismatchedFake.fetch).loadSnapshot({
+        owner: OWNER,
+        repo: REPO,
+        pullNumber: PR,
+        artifactSelectors: [selector],
+        permissionSubjects: [selector],
+      }),
+      (error) => {
+        assert.ok(error instanceof V2TransportError, field);
+        assert.equal(error.code, "PERMISSION_ACTOR_MISMATCH", field);
+        return true;
+      },
+    );
+  }
+});
+
+test("snapshot permissions stay bound to the selected exact artifact author", async () => {
+  const selector = { kind: "issue_comment", id: 101 };
+  const snapshot = structuredClone(
+    await createTransport(createFakeGitHub().fetch).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+      artifactSelectors: [selector],
+      permissionSubjects: [selector],
+    }),
+  );
+  const receipt = snapshot.permissions.actor_permissions[0];
+  receipt.actor = null;
+  receipt.pre.actor = null;
+  receipt.post.actor = null;
+
+  assert.throws(
+    () => assertV2Snapshot(snapshot),
+    /permission actor must equal its exact artifact author/u,
+  );
+});
+
+test("User read permission with a non-empty role remains accepted", async () => {
+  const user = {
+    id: 8_001,
+    login: "outside-user",
+    type: "User",
+    node_id: "U_outside",
+  };
+  const read = {
+    permission: "read",
+    role_name: "read",
+    user: {
+      ...user,
+      permissions: {
+        admin: false,
+        maintain: false,
+        push: false,
+        triage: false,
+        pull: true,
+      },
+    },
+  };
+  const fake = createFakeGitHub({
+    issueComments: [issueComment(101, { user })],
+    actorPermissionResponses: [structuredClone(read), structuredClone(read)],
+  });
+  const selector = { kind: "issue_comment", id: 101 };
+  const snapshot = await createTransport(fake.fetch).loadSnapshot({
+    owner: OWNER,
+    repo: REPO,
+    pullNumber: PR,
+    artifactSelectors: [selector],
+    permissionSubjects: [selector],
+  });
+
+  const receipt = snapshot.permissions.actor_permissions[0];
+  assert.equal(receipt.actor.type, "User");
+  assert.equal(receipt.pre.effective_permission, "read");
+  assert.equal(receipt.pre.role_name, "read");
+  assert.equal(receipt.pre.permissions.push, false);
+  assert.equal(receipt.pre.permissions.pull, true);
+});
+
+test("actor permission 404 and null artifact actors remain closed failures", async () => {
+  const selector = { kind: "issue_comment", id: 101 };
+  const missingPermission = createFakeGitHub({ actorPermissionResponses: [null] });
+  await assert.rejects(
+    createTransport(missingPermission.fetch).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+      artifactSelectors: [selector],
+      permissionSubjects: [selector],
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "HTTP_ERROR");
+      assert.equal(error.details.status, 404);
+      return true;
+    },
+  );
+
+  const nullActor = createFakeGitHub({
+    issueComments: [issueComment(101, { user: null })],
+  });
+  await assert.rejects(
+    createTransport(nullActor.fetch).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+      artifactSelectors: [selector],
+      permissionSubjects: [selector],
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "PERMISSION_SUBJECT_ACTOR_UNKNOWN");
+      return true;
+    },
+  );
+});
+
 test("actor permission drift across the point reads fails closed", async () => {
   const write = actorPermissionResponse();
   const read = actorPermissionResponse();
@@ -1042,6 +1471,723 @@ test("streamed response bodies are stopped at the per-response byte ceiling", as
   );
 });
 
+test("streamed response bodies reject excessive one-byte fragmentation", async () => {
+  let reads = 0;
+  let cancelCalls = 0;
+  const reader = {
+    async read() {
+      reads += 1;
+      return { done: false, value: new Uint8Array([0x20]) };
+    },
+    cancel() {
+      cancelCalls += 1;
+    },
+    releaseLock() {},
+  };
+  const fetch = async () => ({
+    status: 200,
+    headers: new Headers({ Date: SERVER_DATE }),
+    body: { getReader: () => reader },
+  });
+
+  await assert.rejects(
+    createTransport(fetch).loadSnapshot({ owner: OWNER, repo: REPO, pullNumber: PR }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "RESPONSE_CHUNK_LIMIT_EXCEEDED");
+      return true;
+    },
+  );
+  assert.equal(reads, 4_097);
+  await drainCleanupTasks();
+  assert.equal(cancelCalls, 1);
+});
+
+test("streamed response bodies reject an empty byte fragment immediately", async () => {
+  let reads = 0;
+  let cancelCalls = 0;
+  const reader = {
+    async read() {
+      reads += 1;
+      return { done: false, value: new Uint8Array() };
+    },
+    cancel() {
+      cancelCalls += 1;
+    },
+    releaseLock() {},
+  };
+  const fetch = async () => ({
+    status: 200,
+    headers: new Headers({ Date: SERVER_DATE }),
+    body: { getReader: () => reader },
+  });
+
+  await assert.rejects(
+    createTransport(fetch).loadSnapshot({ owner: OWNER, repo: REPO, pullNumber: PR }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INVALID_FETCH_RESPONSE");
+      return true;
+    },
+  );
+  assert.equal(reads, 1);
+  await drainCleanupTasks();
+  assert.equal(cancelCalls, 1);
+});
+
+test("stream read results use a closed boolean terminal protocol", async () => {
+  for (const [label, readResult] of [
+    ["null result", null],
+    ["truthy non-boolean done", { done: "yes", value: undefined }],
+    ["terminal value", { done: true, value: new Uint8Array([0x7b, 0x7d]) }],
+    ["extra field", { done: true, value: undefined, extra: true }],
+  ]) {
+    let cancelCalls = 0;
+    let releaseLockCalls = 0;
+    const reader = {
+      async read() {
+        return readResult;
+      },
+      cancel() {
+        cancelCalls += 1;
+      },
+      releaseLock() {
+        releaseLockCalls += 1;
+      },
+    };
+    const fetch = async () => ({
+      status: 200,
+      headers: new Headers({ Date: SERVER_DATE }),
+      body: { getReader: () => reader },
+    });
+
+    await assert.rejects(
+      createTransport(fetch).loadSnapshot({ owner: OWNER, repo: REPO, pullNumber: PR }),
+      (error) => {
+        assert.ok(error instanceof V2TransportError, label);
+        assert.equal(error.code, "INVALID_FETCH_RESPONSE", label);
+        return true;
+      },
+    );
+    await drainCleanupTasks();
+    assert.equal(cancelCalls, 1, label);
+    assert.equal(releaseLockCalls, 1, label);
+  }
+});
+
+test("stream byte accounting ignores a shadowed Uint8Array byteLength", async () => {
+  const fake = createFakeGitHub();
+  let firstRequest = true;
+  let firstBodyBytes;
+  const fetch = async (...args) => {
+    const original = await fake.fetch(...args);
+    if (!firstRequest) return original;
+    firstRequest = false;
+    firstBodyBytes = Buffer.from(await original.arrayBuffer());
+    const prefix = new Uint8Array(firstBodyBytes.subarray(0, -3));
+    const suffix = new Uint8Array(firstBodyBytes.subarray(-3));
+    Object.defineProperty(suffix, "byteLength", {
+      configurable: true,
+      value: 2,
+    });
+    const chunks = [prefix, suffix];
+    let index = 0;
+    return {
+      status: original.status,
+      headers: original.headers,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (index < chunks.length) {
+                const value = chunks[index];
+                index += 1;
+                return { done: false, value };
+              }
+              return { done: true, value: undefined };
+            },
+            cancel() {},
+            releaseLock() {},
+          };
+        },
+      },
+    };
+  };
+
+  const snapshot = await createTransport(fetch).loadSnapshot({
+    owner: OWNER,
+    repo: REPO,
+    pullNumber: PR,
+  });
+  assert.equal(
+    snapshot.scope_receipts.pre.endpoint_receipts.pull_request.raw_body_sha256,
+    `sha256:${createHash("sha256").update(firstBodyBytes).digest("hex")}`,
+  );
+});
+
+test("response metadata and budget failures abort and cancel without awaiting cleanup", async () => {
+  for (const scenario of [
+    {
+      label: "invalid response schema",
+      status: "200",
+      headers: new Headers({ Date: SERVER_DATE }),
+      limits: undefined,
+      code: "INVALID_FETCH_RESPONSE",
+    },
+    {
+      label: "missing server Date",
+      status: 200,
+      headers: new Headers(),
+      limits: undefined,
+      code: "MISSING_SERVER_DATE",
+    },
+    {
+      label: "declared response budget",
+      status: 200,
+      headers: new Headers({ Date: SERVER_DATE, "Content-Length": "2049" }),
+      limits: { max_response_bytes: 2_048 },
+      code: "RESPONSE_BYTE_LIMIT_EXCEEDED",
+    },
+  ]) {
+    let observedSignal;
+    let cancelCalls = 0;
+    const fetch = async (_input, options) => {
+      observedSignal = options.signal;
+      return {
+        status: scenario.status,
+        headers: scenario.headers,
+        body: {
+          getReader() {
+            throw new Error("body must not be read after an earlier response failure");
+          },
+          cancel() {
+            cancelCalls += 1;
+            return new Promise(() => {});
+          },
+        },
+      };
+    };
+
+    await assert.rejects(
+      createTransport(fetch, scenario.limits).loadSnapshot({
+        owner: OWNER,
+        repo: REPO,
+        pullNumber: PR,
+      }),
+      (error) => {
+        assert.ok(error instanceof V2TransportError, scenario.label);
+        assert.equal(error.code, scenario.code, scenario.label);
+        return true;
+      },
+    );
+    await drainCleanupTasks();
+    assert.equal(observedSignal.aborted, true, scenario.label);
+    assert.equal(cancelCalls, 1, scenario.label);
+  }
+});
+
+test("response bodies without a reader never invoke an unbounded arrayBuffer fallback", async () => {
+  let arrayBufferCalls = 0;
+  let cancelCalls = 0;
+  let observedSignal;
+  const fetch = async (_input, options) => {
+    observedSignal = options.signal;
+    return {
+      status: 200,
+      headers: new Headers({ Date: SERVER_DATE }),
+      arrayBuffer() {
+        arrayBufferCalls += 1;
+        return Promise.resolve(new Uint8Array(2_049));
+      },
+      body: {
+        cancel() {
+          cancelCalls += 1;
+          return new Promise(() => {});
+        },
+      },
+    };
+  };
+
+  await assert.rejects(
+    createTransport(fetch, { max_response_bytes: 2_048 }).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INVALID_FETCH_RESPONSE");
+      return true;
+    },
+  );
+  assert.equal(arrayBufferCalls, 0);
+  await drainCleanupTasks();
+  assert.equal(cancelCalls, 1);
+  assert.equal(observedSignal.aborted, true);
+});
+
+test("request failure settles before a nonthrowing abort listener and response cleanup", async () => {
+  let failureObserved = false;
+  let caughtError;
+  let observedSignal;
+  let observedAbortReason;
+  let abortCalls = 0;
+  let cancelCalls = 0;
+  let abortObservedAfterFailure = null;
+  let cancelObservedAfterFailure = null;
+  let synchronousWork = 0;
+  const fetch = async (_input, options) => {
+    observedSignal = options.signal;
+    options.signal.addEventListener("abort", () => {
+      abortCalls += 1;
+      abortObservedAfterFailure = failureObserved;
+      observedAbortReason = options.signal.reason;
+      if (observedAbortReason && typeof observedAbortReason === "object") {
+        observedAbortReason.code = "FORGED_BY_ABORT";
+        observedAbortReason.name = "ForgedAbortReason";
+        observedAbortReason.details = { forged: true };
+        Object.setPrototypeOf(observedAbortReason, null);
+      }
+      for (let index = 0; index < 1_000; index += 1) {
+        synchronousWork += index & 1;
+      }
+    }, { once: true });
+    return {
+      status: "200",
+      headers: new Headers({ Date: SERVER_DATE }),
+      body: {
+        getReader() {
+          throw new Error("invalid response metadata must prevent body reads");
+        },
+        cancel() {
+          cancelCalls += 1;
+          cancelObservedAfterFailure = failureObserved;
+          for (let index = 0; index < 1_000; index += 1) {
+            synchronousWork += index & 1;
+          }
+          throw new Error("synchronous response cancellation failure");
+        },
+      },
+    };
+  };
+
+  await assert.rejects(
+    createTransport(fetch).loadSnapshot({ owner: OWNER, repo: REPO, pullNumber: PR }),
+    (error) => {
+      caughtError = error;
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INVALID_FETCH_RESPONSE");
+      return true;
+    },
+  );
+  const caughtPrototype = Object.getPrototypeOf(caughtError);
+  const caughtDetails = caughtError.details;
+  failureObserved = true;
+  assert.equal(abortCalls, 0);
+  assert.equal(cancelCalls, 0);
+
+  await drainCleanupTasks();
+  assert.equal(abortCalls, 1);
+  assert.equal(cancelCalls, 1);
+  assert.equal(abortObservedAfterFailure, true);
+  assert.equal(cancelObservedAfterFailure, true);
+  assert.equal(synchronousWork, 1_000);
+  assert.equal(observedSignal.reason, observedAbortReason);
+  assert.notEqual(observedAbortReason, caughtError);
+  assert.equal(caughtError.code, "INVALID_FETCH_RESPONSE");
+  assert.equal(caughtError.name, "V2TransportError");
+  assert.equal(Object.getPrototypeOf(caughtError), caughtPrototype);
+  assert.equal(caughtError.details, caughtDetails);
+});
+
+test("request failure settles before throwing synchronous reader cleanup", async () => {
+  let failureObserved = false;
+  let cancelCalls = 0;
+  let releaseLockCalls = 0;
+  let cancelObservedAfterFailure = null;
+  let releaseObservedAfterFailure = null;
+  let synchronousWork = 0;
+  const reader = {
+    async read() {
+      return { done: "yes", value: undefined };
+    },
+    cancel() {
+      cancelCalls += 1;
+      cancelObservedAfterFailure = failureObserved;
+      for (let index = 0; index < 1_000; index += 1) {
+        synchronousWork += index & 1;
+      }
+      throw new Error("synchronous reader cancellation failure");
+    },
+    releaseLock() {
+      releaseLockCalls += 1;
+      releaseObservedAfterFailure = failureObserved;
+      for (let index = 0; index < 1_000; index += 1) {
+        synchronousWork += index & 1;
+      }
+      throw new Error("synchronous reader release failure");
+    },
+  };
+  const fetch = async () => ({
+    status: 200,
+    headers: new Headers({ Date: SERVER_DATE }),
+    body: { getReader: () => reader },
+  });
+
+  await assert.rejects(
+    createTransport(fetch).loadSnapshot({ owner: OWNER, repo: REPO, pullNumber: PR }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "INVALID_FETCH_RESPONSE");
+      return true;
+    },
+  );
+  failureObserved = true;
+  assert.equal(cancelCalls, 0);
+  assert.equal(releaseLockCalls, 0);
+
+  await drainCleanupTasks();
+  assert.equal(cancelCalls, 1);
+  assert.equal(releaseLockCalls, 1);
+  assert.equal(cancelObservedAfterFailure, true);
+  assert.equal(releaseObservedAfterFailure, true);
+  assert.equal(synchronousWork, 1_000);
+});
+
+test("cleanup scheduling resists post-import builtin live-binding poison", async () => {
+  const events = [];
+  let poisonedSchedulerCalls = 0;
+  let abortCalls = 0;
+  let cancelCalls = 0;
+  let caughtError = null;
+  const originalSetImmediate = mutableTimers.setImmediate;
+  const fetch = async (_input, options) => {
+    mutableTimers.setImmediate = (callback, ...args) => {
+      poisonedSchedulerCalls += 1;
+      Reflect.apply(callback, undefined, args);
+      Reflect.apply(callback, undefined, args);
+      return {};
+    };
+    syncBuiltinESMExports();
+    options.signal.addEventListener("abort", () => {
+      abortCalls += 1;
+      events.push("abort");
+    }, { once: true });
+    return {
+      status: "200",
+      headers: new Headers({ Date: SERVER_DATE }),
+      body: {
+        getReader() {
+          throw new Error("invalid response metadata must prevent body reads");
+        },
+        cancel() {
+          cancelCalls += 1;
+          events.push("cancel");
+        },
+      },
+    };
+  };
+
+  try {
+    try {
+      await createTransport(fetch).loadSnapshot({
+        owner: OWNER,
+        repo: REPO,
+        pullNumber: PR,
+      });
+    } catch (error) {
+      caughtError = error;
+      events.push("caller-catch");
+    }
+  } finally {
+    mutableTimers.setImmediate = originalSetImmediate;
+    syncBuiltinESMExports();
+  }
+
+  assert.ok(caughtError instanceof V2TransportError);
+  assert.equal(caughtError.code, "INVALID_FETCH_RESPONSE");
+  assert.equal(poisonedSchedulerCalls, 0);
+  assert.deepEqual(events, ["caller-catch"]);
+
+  await drainCleanupTasks();
+  assert.equal(abortCalls, 1);
+  assert.equal(cancelCalls, 1);
+  assert.deepEqual(events, ["caller-catch", "abort", "cancel"]);
+});
+
+test("request deadline rejects a fetch promise that ignores abort", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let resolveFetch;
+  let observedSignal;
+  let lateBodyCancelCalls = 0;
+  const fetch = (_input, options) => {
+    observedSignal = options.signal;
+    return new Promise((resolve) => {
+      resolveFetch = resolve;
+    });
+  };
+  const pending = createTransport(fetch, { request_timeout_ms: 25 }).loadSnapshot({
+    owner: OWNER,
+    repo: REPO,
+    pullNumber: PR,
+  });
+  let outcome = null;
+  pending.then(
+    () => {
+      outcome = { status: "fulfilled" };
+    },
+    (error) => {
+      outcome = { status: "rejected", error };
+    },
+  );
+
+  t.mock.timers.tick(25);
+  await drainMicrotasks();
+
+  assert.equal(outcome?.status, "rejected");
+  assert.ok(outcome.error instanceof V2TransportError);
+  assert.equal(outcome.error.code, "REQUEST_TIMEOUT");
+  await drainCleanupTasks();
+  assert.equal(observedSignal.aborted, true);
+
+  resolveFetch({
+    status: 200,
+    headers: new Headers({ Date: SERVER_DATE }),
+    body: {
+      cancel() {
+        lateBodyCancelCalls += 1;
+        return new Promise(() => {});
+      },
+    },
+  });
+  await drainMicrotasks();
+  await drainCleanupTasks();
+  assert.equal(lateBodyCancelCalls, 1);
+});
+
+test("request deadline rejects a stalled body without awaiting its stalled cancel", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let readCalls = 0;
+  let cancelCalls = 0;
+  const reader = {
+    read() {
+      readCalls += 1;
+      return new Promise(() => {});
+    },
+    cancel() {
+      cancelCalls += 1;
+      return new Promise(() => {});
+    },
+    releaseLock() {},
+  };
+  const fetch = async () => ({
+    status: 200,
+    headers: new Headers({ Date: SERVER_DATE }),
+    body: { getReader: () => reader },
+  });
+  const pending = createTransport(fetch, { request_timeout_ms: 25 }).loadSnapshot({
+    owner: OWNER,
+    repo: REPO,
+    pullNumber: PR,
+  });
+  let outcome = null;
+  pending.then(
+    () => {
+      outcome = { status: "fulfilled" };
+    },
+    (error) => {
+      outcome = { status: "rejected", error };
+    },
+  );
+  await drainMicrotasks();
+  assert.equal(readCalls, 1);
+
+  t.mock.timers.tick(25);
+  await drainMicrotasks();
+
+  assert.equal(outcome?.status, "rejected");
+  assert.ok(outcome.error instanceof V2TransportError);
+  assert.equal(outcome.error.code, "REQUEST_TIMEOUT");
+  await drainCleanupTasks();
+  assert.equal(cancelCalls, 1);
+});
+
+test("elapsed monotonic request deadline wins before its timer callback", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let monotonicNow = 1_000;
+  t.mock.method(performance, "now", () => monotonicNow);
+  let resolveFirstFetch;
+  let fetchCalls = 0;
+  let bodyCancelCalls = 0;
+  let observedSignal;
+  const fetch = (_input, options) => {
+    fetchCalls += 1;
+    observedSignal = options.signal;
+    if (fetchCalls === 1) {
+      return new Promise((resolve) => {
+        resolveFirstFetch = () => resolve({
+          status: 200,
+          headers: new Headers({ Date: SERVER_DATE }),
+          body: {
+            getReader() {
+              throw new Error("expired response body must not be read");
+            },
+            cancel() {
+              bodyCancelCalls += 1;
+              return new Promise(() => {});
+            },
+          },
+        });
+      });
+    }
+    throw new Error("request advanced after its absolute deadline");
+  };
+  const pending = createTransport(fetch, { request_timeout_ms: 25 }).loadSnapshot({
+    owner: OWNER,
+    repo: REPO,
+    pullNumber: PR,
+  });
+
+  monotonicNow += 25;
+  resolveFirstFetch();
+
+  await assert.rejects(
+    pending,
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "REQUEST_TIMEOUT");
+      return true;
+    },
+  );
+  assert.equal(fetchCalls, 1);
+  await drainCleanupTasks();
+  assert.equal(observedSignal.aborted, true);
+  assert.equal(bodyCancelCalls, 1);
+});
+
+test("elapsed monotonic deadline after a body read settles cancels before its timer", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let monotonicNow = 1_500;
+  t.mock.method(performance, "now", () => monotonicNow);
+  let resolveRead;
+  let readCalls = 0;
+  let readerCancelCalls = 0;
+  let releaseLockCalls = 0;
+  let bodyCancelCalls = 0;
+  let observedSignal;
+  const reader = {
+    read() {
+      readCalls += 1;
+      return new Promise((resolve) => {
+        resolveRead = resolve;
+      });
+    },
+    cancel() {
+      readerCancelCalls += 1;
+      return new Promise(() => {});
+    },
+    releaseLock() {
+      releaseLockCalls += 1;
+    },
+  };
+  const fetch = async (_input, options) => {
+    observedSignal = options.signal;
+    return {
+      status: 200,
+      headers: new Headers({ Date: SERVER_DATE }),
+      body: {
+        getReader() {
+          return reader;
+        },
+        cancel() {
+          bodyCancelCalls += 1;
+          return new Promise(() => {});
+        },
+      },
+    };
+  };
+  const pending = createTransport(fetch, { request_timeout_ms: 25 }).loadSnapshot({
+    owner: OWNER,
+    repo: REPO,
+    pullNumber: PR,
+  });
+  await drainMicrotasks();
+  assert.equal(readCalls, 1);
+
+  monotonicNow += 25;
+  resolveRead({ done: false, value: new Uint8Array([123]) });
+
+  await assert.rejects(
+    pending,
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "REQUEST_TIMEOUT");
+      return true;
+    },
+  );
+  await drainCleanupTasks();
+  assert.equal(observedSignal.aborted, true);
+  assert.equal(readCalls, 1);
+  assert.equal(readerCancelCalls, 1);
+  assert.equal(releaseLockCalls, 1);
+  assert.equal(bodyCancelCalls, 1);
+});
+
+test("deadline crossing while acquiring a body reader cancels the locked reader", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let monotonicNow = 2_000;
+  t.mock.method(performance, "now", () => monotonicNow);
+  let readCalls = 0;
+  let readerCancelCalls = 0;
+  let releaseLockCalls = 0;
+  let bodyCancelCalls = 0;
+  const reader = {
+    read() {
+      readCalls += 1;
+      throw new Error("expired reader must not be read");
+    },
+    cancel() {
+      readerCancelCalls += 1;
+      return new Promise(() => {});
+    },
+    releaseLock() {
+      releaseLockCalls += 1;
+    },
+  };
+  const fetch = async () => ({
+    status: 200,
+    headers: new Headers({ Date: SERVER_DATE }),
+    body: {
+      getReader() {
+        monotonicNow += 25;
+        return reader;
+      },
+      cancel() {
+        bodyCancelCalls += 1;
+        throw new TypeError("locked stream");
+      },
+    },
+  });
+
+  await assert.rejects(
+    createTransport(fetch, { request_timeout_ms: 25 }).loadSnapshot({
+      owner: OWNER,
+      repo: REPO,
+      pullNumber: PR,
+    }),
+    (error) => {
+      assert.ok(error instanceof V2TransportError);
+      assert.equal(error.code, "REQUEST_TIMEOUT");
+      return true;
+    },
+  );
+  await drainCleanupTasks();
+  assert.equal(readCalls, 0);
+  assert.equal(readerCancelCalls, 1);
+  assert.equal(releaseLockCalls, 1);
+  assert.equal(bodyCancelCalls, 1);
+});
+
 test("server Date regression between any two requests fails closed", async () => {
   const fake = createFakeGitHub({
     serverDates: [
@@ -1069,6 +2215,16 @@ function createTransport(fetch, limits = undefined) {
     graphqlUrl: GRAPHQL,
     ...(limits ? { limits } : {}),
   });
+}
+
+async function drainMicrotasks(turns = 8) {
+  for (let turn = 0; turn < turns; turn += 1) {
+    await Promise.resolve();
+  }
+}
+
+function drainCleanupTasks() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function providerPreScopeOptions(fetch, selector, overrides = {}) {
@@ -1118,6 +2274,7 @@ function createFakeGitHub(overrides = {}) {
       actorPermissionResponse(),
     ],
     scopeMutator: overrides.scopeMutator ?? null,
+    paginationLinkMutator: overrides.paginationLinkMutator ?? null,
   };
   const calls = [];
   let scopeCalls = 0;
@@ -1220,16 +2377,26 @@ function createFakeGitHub(overrides = {}) {
       }, 200, headers);
     }
     if (url.pathname === `${repoPath}/issues/${PR}/comments`) {
-      return paginatedResponse(state.issueComments, url, headers);
+      return paginatedResponse(
+        state.issueComments,
+        url,
+        headers,
+        state.paginationLinkMutator,
+      );
     }
     if (url.pathname === `${repoPath}/pulls/${PR}/reviews`) {
-      return paginatedResponse(state.reviews, url, headers);
+      return paginatedResponse(state.reviews, url, headers, state.paginationLinkMutator);
     }
     if (url.pathname === `${repoPath}/pulls/${PR}/comments`) {
-      return paginatedResponse(state.inlineComments, url, headers);
+      return paginatedResponse(
+        state.inlineComments,
+        url,
+        headers,
+        state.paginationLinkMutator,
+      );
     }
     if (url.pathname === `${repoPath}/issues/${PR}/reactions`) {
-      return paginatedResponse(state.issueReactions, url, headers);
+      return paginatedResponse(state.issueReactions, url, headers, state.paginationLinkMutator);
     }
     if (url.pathname === `${repoPath}/commits/${HEAD}/check-runs`) {
       if (url.searchParams.get("filter") !== "all") {
@@ -1240,7 +2407,12 @@ function createFakeGitHub(overrides = {}) {
         checkRunDiscoveries += 1;
         state.checkRunMutator?.(checkRunDiscoveries, state.checkRuns);
       }
-      return checkRunsPaginatedResponse(state.checkRuns, url, headers);
+      return checkRunsPaginatedResponse(
+        state.checkRuns,
+        url,
+        headers,
+        state.paginationLinkMutator,
+      );
     }
     const actorPermissionMatch = url.pathname.match(
       new RegExp(`^${repoPath}/collaborators/([^/]+)/permission$`),
@@ -1257,6 +2429,7 @@ function createFakeGitHub(overrides = {}) {
         state.issueCommentReactions.get(issueReactionMatch[1]) ?? [],
         url,
         headers,
+        state.paginationLinkMutator,
       );
     }
     const inlineReactionMatch = url.pathname.match(
@@ -1267,6 +2440,7 @@ function createFakeGitHub(overrides = {}) {
         state.inlineCommentReactions.get(inlineReactionMatch[1]) ?? [],
         url,
         headers,
+        state.paginationLinkMutator,
       );
     }
     const exactIssueMatch = url.pathname.match(
@@ -1580,24 +2754,76 @@ function graphqlPaginatedConnection(nodes, after, pageSize) {
   };
 }
 
-function paginatedResponse(items, url, headers) {
+function paginatedResponse(items, url, headers, linkMutator = null) {
   const perPage = Number(url.searchParams.get("per_page") || 30);
   const page = Number(url.searchParams.get("page") || 1);
   const start = (page - 1) * perPage;
-  return jsonResponse(items.slice(start, start + perPage), 200, headers);
+  const totalPages = Math.ceil(items.length / perPage);
+  const relations = {};
+  if (page < totalPages) {
+    relations.next = page + 1;
+    relations.last = totalPages;
+  }
+  if (page > 1 && totalPages > 1) {
+    relations.prev = page - 1;
+    relations.first = 1;
+  }
+  const defaultLink = paginationLink(url, relations);
+  const mutatedLink = linkMutator === null ? undefined : linkMutator({
+    path: url.pathname,
+    page,
+    perPage,
+    totalPages,
+    url: new URL(url.href),
+    defaultLink,
+  });
+  const selectedLink = mutatedLink === undefined ? defaultLink : mutatedLink;
+  const nextHeaders = { ...headers };
+  if (selectedLink !== null && selectedLink !== "") {
+    nextHeaders.Link = selectedLink;
+  }
+  return jsonResponse(items.slice(start, start + perPage), 200, nextHeaders);
 }
 
-function checkRunsPaginatedResponse(items, url, headers) {
+function paginationLink(url, relations) {
+  return Object.entries(relations).map(([relation, page]) =>
+    `<${paginationUrl(url, page).href}>; rel="${relation}"`).join(", ");
+}
+
+function paginationUrl(url, page) {
+  const target = new URL(url.href);
+  target.searchParams.set("page", String(page));
+  return target;
+}
+
+function checkRunsPaginatedResponse(items, url, headers, linkMutator = null) {
   const perPage = Number(url.searchParams.get("per_page") || 30);
   const page = Number(url.searchParams.get("page") || 1);
   const start = (page - 1) * perPage;
   const pageItems = items.slice(start, start + perPage);
-  const nextPage = start + pageItems.length < items.length ? page + 1 : null;
+  const totalPages = Math.ceil(items.length / perPage);
+  const relations = {};
+  if (page < totalPages) {
+    relations.next = page + 1;
+    relations.last = totalPages;
+  }
+  if (page > 1 && totalPages > 1) {
+    relations.prev = page - 1;
+    relations.first = 1;
+  }
+  const defaultLink = paginationLink(url, relations);
+  const mutatedLink = linkMutator === null ? undefined : linkMutator({
+    path: url.pathname,
+    page,
+    perPage,
+    totalPages,
+    url: new URL(url.href),
+    defaultLink,
+  });
+  const selectedLink = mutatedLink === undefined ? defaultLink : mutatedLink;
   const nextHeaders = { ...headers };
-  if (nextPage !== null) {
-    const next = new URL(url);
-    next.searchParams.set("page", String(nextPage));
-    nextHeaders.Link = `<${next.href}>; rel="next"`;
+  if (selectedLink !== null && selectedLink !== "") {
+    nextHeaders.Link = selectedLink;
   }
   return jsonResponse({ total_count: items.length, check_runs: pageItems }, 200, nextHeaders);
 }

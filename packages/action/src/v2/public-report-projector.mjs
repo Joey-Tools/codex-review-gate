@@ -1178,7 +1178,9 @@ function automaticRecoveryRequestInventoryIsClosed({
     controller.request_bindings.map((binding) => [binding.id, binding]),
   );
   for (const rawRequest of evidenceSnapshot.pages.issue_comments.filter(
-    (comment) => comment.body === "@codex review",
+    (comment) =>
+      controllerBindingsById.has(comment.id) &&
+      comment.body === "@codex review",
   )) {
     const projected = reducerRequestsById.get(rawRequest.id);
     if (projected === undefined) {

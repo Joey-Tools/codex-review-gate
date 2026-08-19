@@ -1,5 +1,7 @@
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { TextDecoder } from "node:util";
+import { setImmediate as scheduleImmediateBinding } from "node:timers";
+import { TextDecoder, types as utilTypes } from "node:util";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 import {
@@ -356,6 +358,33 @@ const BOOTSTRAP_AUTHORITY = Symbol("v2-git-ledger-bootstrap-authority");
 const safeReflectApply = Reflect.apply;
 const safeReflectOwnKeys = Reflect.ownKeys;
 const safeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayBufferGetter = safeGetOwnPropertyDescriptor(
+  typedArrayPrototype,
+  "buffer",
+).get;
+const typedArrayByteLengthGetter = safeGetOwnPropertyDescriptor(
+  typedArrayPrototype,
+  "byteLength",
+).get;
+const typedArrayByteOffsetGetter = safeGetOwnPropertyDescriptor(
+  typedArrayPrototype,
+  "byteOffset",
+).get;
+const arrayBufferDetachedGetter = safeGetOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "detached",
+)?.get ?? null;
+const arrayBufferResizableGetter = safeGetOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "resizable",
+)?.get ?? null;
+const isArrayBufferIntrinsic = utilTypes.isArrayBuffer;
+const isUint8ArrayIntrinsic = utilTypes.isUint8Array;
+const uint8ArraySetIntrinsic = Uint8Array.prototype.set;
+const bufferAllocIntrinsic = Buffer.alloc;
+const abortControllerAbortIntrinsic = AbortController.prototype.abort;
+const safeScheduleImmediate = scheduleImmediateBinding;
 const SafeWeakMap = WeakMap;
 const SafeWeakSet = WeakSet;
 const safeWeakMapGet = SafeWeakMap.prototype.get;
@@ -27589,7 +27618,8 @@ async function fetchCurrentOpenGenerationAttachmentEvidence({
   }
   let text;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+      .decode(decoded);
   } catch (error) {
     throw ledgerError(
       "candidate-inventory-attachment-utf8",
@@ -27781,7 +27811,8 @@ async function fetchCandidateInventoryAttachmentEvidence({
     }
     let text;
     try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+        .decode(decoded);
     } catch (error) {
       throw ledgerError(
         "candidate-inventory-attachment-utf8",
@@ -27943,8 +27974,8 @@ async function fetchCommitEnvelope({
       checkpoint_state_tree_sha: checkpointStateTreeSha,
       commit: structuredClone(commit),
       evidence: {
-        commit_raw_body_sha256: rawDigest(commitCapture.raw_body),
-        tree_raw_body_sha256: rawDigest(treeCapture.raw_body),
+        commit_raw_body_sha256: rawDigest(commitCapture.raw_body_bytes),
+        tree_raw_body_sha256: rawDigest(treeCapture.raw_body_bytes),
         commit_server_time: commitCapture.server_time,
         tree_server_time: treeCapture.server_time,
       },
@@ -28011,7 +28042,8 @@ async function fetchCommitEnvelope({
   }
   let text;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+      .decode(bytes);
   } catch {
     throw ledgerError(
       "invalid-blob-utf8",
@@ -28085,9 +28117,9 @@ async function fetchCommitEnvelope({
     candidate_inventory_attachment_tree_sha: attachmentTreeSha,
     envelope,
     evidence: {
-      commit_raw_body_sha256: rawDigest(commitCapture.raw_body),
-      tree_raw_body_sha256: rawDigest(treeCapture.raw_body),
-      blob_raw_body_sha256: rawDigest(blobCapture.raw_body),
+      commit_raw_body_sha256: rawDigest(commitCapture.raw_body_bytes),
+      tree_raw_body_sha256: rawDigest(treeCapture.raw_body_bytes),
+      blob_raw_body_sha256: rawDigest(blobCapture.raw_body_bytes),
       commit_server_time: commitCapture.server_time,
       tree_server_time: treeCapture.server_time,
       blob_server_time: blobCapture.server_time,
@@ -39254,7 +39286,8 @@ function validateExactCheckpointCommitValue(commit, {
 function parseCanonicalCheckpointJson(bytes, label) {
   let text;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+      .decode(bytes);
   } catch (error) {
     throw ledgerError(
       "CHECKPOINT_JSON_UTF8",
@@ -40166,7 +40199,7 @@ async function readRef({
         absent: true,
         ref,
         server_time: capture.server_time,
-        raw_body_sha256: rawDigest(capture.raw_body),
+        raw_body_sha256: rawDigest(capture.raw_body_bytes),
       });
     }
     throw ledgerError("ref-absent", "protected Git ledger ref is absent");
@@ -40218,7 +40251,7 @@ async function updateRefStrict(options) {
       "Git ledger append lost the atomic ref race; the sibling commit is unreachable",
     );
     error.http_status = capture.http_status;
-    error.raw_body_sha256 = rawDigest(capture.raw_body);
+    error.raw_body_sha256 = rawDigest(capture.raw_body_bytes);
     throw error;
   }
   const ref = parseRefCapture(capture, options.ref);
@@ -40248,7 +40281,7 @@ async function raceUpdateRef(options) {
       outcome: "winner",
       http_status: 200,
       server_time: capture.server_time,
-      raw_body_sha256: rawDigest(capture.raw_body),
+      raw_body_sha256: rawDigest(capture.raw_body_bytes),
     };
   }
   validateNonFastForwardConflict(capture);
@@ -40256,7 +40289,7 @@ async function raceUpdateRef(options) {
     outcome: "non-fast-forward",
     http_status: capture.http_status,
     server_time: capture.server_time,
-    raw_body_sha256: rawDigest(capture.raw_body),
+    raw_body_sha256: rawDigest(capture.raw_body_bytes),
   };
 }
 
@@ -40274,7 +40307,7 @@ function parseRefCapture(capture, expectedRef) {
     node_id: boundedString(capture.data.node_id, "Git ref node_id", 256),
     target_commit_sha: sha(capture.data.object.sha, "Git ref target SHA"),
     server_time: capture.server_time,
-    raw_body_sha256: rawDigest(capture.raw_body),
+    raw_body_sha256: rawDigest(capture.raw_body_bytes),
   });
 }
 
@@ -40385,14 +40418,20 @@ async function request({
     void resolve;
     rejectDeadline = reject;
   });
+  const abortRequest = createAbortBestEffort(
+    controller,
+    "Git ledger HTTP request cleanup",
+  );
   const timer = setTimeout(() => {
     const error = ledgerError(
       "http-timeout",
       "Git ledger GitHub request exceeded its fixed deadline",
     );
-    controller.abort(error);
     rejectDeadline(error);
+    abortRequest();
   }, remainingMs);
+  let responseBody = null;
+  let responseBodyComplete = false;
   try {
     let response;
     try {
@@ -40411,7 +40450,6 @@ async function request({
         }),
         deadline,
       ]);
-      assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
     } catch (error) {
       if (
         error?.code === "http-timeout" ||
@@ -40423,14 +40461,22 @@ async function request({
         error,
       );
     }
+    try {
+      responseBody = response?.body;
+    } catch (error) {
+      throw ledgerError(
+        "invalid-http-response",
+        "Git ledger GitHub response body could not be captured",
+        error,
+      );
+    }
+    assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
     assertOperationCurrent();
     let responseStatus;
     let responseHeaders;
-    let responseBody;
     try {
       responseStatus = response?.status;
       responseHeaders = response?.headers;
-      responseBody = response?.body;
     } catch (error) {
       throw ledgerError(
         "invalid-http-response",
@@ -40471,16 +40517,17 @@ async function request({
     const rawBody = await readResponseBodyBounded({
       responseBody,
       deadline,
-      controller,
+      abortRequest,
       requestBudget,
       requestDeadlineAt,
       assertOperationCurrent,
     });
+    responseBodyComplete = true;
     assertOperationCurrent();
     assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
     let data;
     try {
-      data = JSON.parse(rawBody);
+      data = JSON.parse(rawBody.text);
     } catch (error) {
       throw ledgerError("invalid-api-json", "Git ledger API response is not JSON", error);
     }
@@ -40489,11 +40536,16 @@ async function request({
     return {
       http_status: responseStatus,
       server_time: serverTime,
-      raw_body: rawBody,
+      raw_body: rawBody.text,
+      raw_body_bytes: rawBody.bytes,
       data,
     };
+  } catch (error) {
+    abortRequest();
+    throw error;
   } finally {
     clearTimeout(timer);
+    if (!responseBodyComplete) cancelReadableBestEffort(responseBody);
   }
 }
 
@@ -40589,13 +40641,17 @@ function consumeProvenanceBudget(budget) {
     void resolve;
     rejectDeadline = reject;
   });
+  const abortVerifier = createAbortBestEffort(
+    controller,
+    "Git ledger provenance verifier cleanup",
+  );
   const timer = setTimeout(() => {
     const error = ledgerError(
       "provenance-timeout",
       "Git ledger provenance verifier exceeded its fixed deadline",
     );
-    controller.abort(error);
     rejectDeadline(error);
+    abortVerifier();
   }, timeoutMs);
   return {
     signal: controller.signal,
@@ -40684,7 +40740,7 @@ function normalizeHttpLimits(value) {
 async function readResponseBodyBounded({
   responseBody,
   deadline,
-  controller,
+  abortRequest,
   requestBudget,
   requestDeadlineAt,
   assertOperationCurrent = () => {},
@@ -40694,6 +40750,8 @@ async function readResponseBodyBounded({
   const chunks = [];
   let responseBytes = 0;
   let chunkCount = 0;
+  const cancelReader = createBestEffortOnce(() => cancelReadable(reader));
+  const releaseReader = createBestEffortOnce(() => releaseReaderLock(reader));
   try {
     while (true) {
       assertOperationCurrent();
@@ -40714,49 +40772,23 @@ async function readResponseBodyBounded({
       }
       assertOperationCurrent();
       assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
-      let done;
-      let value;
-      try {
-        done = read?.done;
-        if (done === false) value = read.value;
-      } catch (error) {
-        throw ledgerError(
-          "invalid-http-response",
-          "Git ledger GitHub response stream chunk could not be read",
-          error,
-        );
+      const { done, chunk } = closedResponseReadResult(read);
+      if (done) {
+        break;
       }
-      if (read === null || typeof read !== "object" ||
-          typeof done !== "boolean") {
-        throw ledgerError(
-          "invalid-http-response",
-          "Git ledger GitHub response stream returned an invalid chunk",
-        );
-      }
-      if (done) break;
-      if (!(value instanceof Uint8Array)) {
-        throw ledgerError(
-          "invalid-http-response",
-          "Git ledger GitHub response stream chunk is not bytes",
-        );
-      }
-      const chunkBytes = value.byteLength;
+      const chunkBytes = chunk.byte_length;
       chunkCount += 1;
       if (
         chunkBytes === 0 ||
         chunkCount > MAX_V2_GIT_LEDGER_HTTP_BODY_CHUNKS
       ) {
-        controller.abort();
-        void reader.cancel().catch(() => {});
         throw ledgerError(
           "http-response-chunk-cap",
           "Git ledger GitHub response stream exceeds its chunk profile",
         );
       }
-      responseBytes += chunkBytes;
-      if (responseBytes > requestBudget.limits.response_bytes) {
-        controller.abort();
-        void reader.cancel().catch(() => {});
+      const nextResponseBytes = responseBytes + chunkBytes;
+      if (nextResponseBytes > requestBudget.limits.response_bytes) {
         throw ledgerError(
           "http-response-cap",
           "Git ledger GitHub response exceeds its streamed byte cap",
@@ -40766,31 +40798,32 @@ async function readResponseBodyBounded({
         requestBudget.total_response_bytes + chunkBytes >
         requestBudget.limits.total_response_bytes
       ) {
-        controller.abort();
-        void reader.cancel().catch(() => {});
         throw ledgerError(
           "http-total-byte-cap",
           "Git ledger exhausted its aggregate GitHub response byte cap",
         );
       }
       assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
-      const snapshot = Buffer.from(value);
-      if (snapshot.byteLength !== chunkBytes) {
+      const snapshot = snapshotResponseByteChunk(chunk);
+      const copiedBytes = snapshot.length;
+      if (copiedBytes !== chunkBytes) {
         throw ledgerError(
           "invalid-http-response",
-          "Git ledger GitHub response stream chunk changed during snapshot",
+          "Git ledger GitHub response stream chunk copy changed length",
         );
       }
       assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
-      requestBudget.total_response_bytes += chunkBytes;
+      assertOperationCurrent();
+      responseBytes += copiedBytes;
+      requestBudget.total_response_bytes += copiedBytes;
       chunks.push(snapshot);
     }
   } catch (error) {
-    controller.abort();
-    void reader.cancel().catch(() => {});
+    abortRequest();
+    cancelReader();
     throw error;
   } finally {
-    reader.releaseLock?.();
+    releaseReader();
   }
   if (responseBytes === 0) {
     throw ledgerError(
@@ -40799,10 +40832,11 @@ async function readResponseBodyBounded({
     );
   }
   assertOperationCurrent();
+  const bytes = Buffer.concat(chunks, responseBytes);
   let decoded;
   try {
-    decoded = new TextDecoder("utf-8", { fatal: true })
-      .decode(Buffer.concat(chunks, responseBytes));
+    decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+      .decode(bytes);
   } catch (error) {
     if (
       error?.code === "http-timeout" ||
@@ -40816,7 +40850,243 @@ async function readResponseBodyBounded({
   }
   assertHttpDeadlineOpen(requestBudget, requestDeadlineAt);
   assertOperationCurrent();
-  return decoded;
+  return { bytes, text: decoded };
+}
+
+function closedResponseReadResult(read) {
+  let descriptors;
+  try {
+    if (read === null || typeof read !== "object") {
+      throw new TypeError("response stream result is not an object");
+    }
+    descriptors = Object.getOwnPropertyDescriptors(read);
+  } catch (error) {
+    throw ledgerError(
+      "invalid-http-response",
+      "Git ledger GitHub response stream result could not be snapshotted",
+      error,
+    );
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    keys.length !== 2 ||
+    !Object.hasOwn(descriptors, "done") ||
+    !Object.hasOwn(descriptors, "value")
+  ) {
+    throw ledgerError(
+      "invalid-http-response",
+      "Git ledger GitHub response stream result is not closed",
+    );
+  }
+  const doneDescriptor = descriptors.done;
+  const valueDescriptor = descriptors.value;
+  if (
+    !Object.hasOwn(doneDescriptor, "value") ||
+    !Object.hasOwn(valueDescriptor, "value") ||
+    Object.hasOwn(doneDescriptor, "get") ||
+    Object.hasOwn(doneDescriptor, "set") ||
+    Object.hasOwn(valueDescriptor, "get") ||
+    Object.hasOwn(valueDescriptor, "set") ||
+    typeof doneDescriptor.value !== "boolean"
+  ) {
+    throw ledgerError(
+      "invalid-http-response",
+      "Git ledger GitHub response stream result uses invalid descriptors",
+    );
+  }
+  const done = doneDescriptor.value;
+  const value = valueDescriptor.value;
+  if (done) {
+    if (value !== undefined) {
+      throw ledgerError(
+        "invalid-http-response",
+        "Git ledger GitHub response terminal stream result contains bytes",
+      );
+    }
+    return { done: true, chunk: null };
+  }
+  return { done: false, chunk: inspectResponseByteChunk(value) };
+}
+
+function inspectResponseByteChunk(value) {
+  let isBytes;
+  try {
+    isBytes = safeReflectApply(isUint8ArrayIntrinsic, utilTypes, [value]);
+  } catch (error) {
+    throw ledgerError(
+      "invalid-http-response",
+      "Git ledger GitHub response stream chunk could not be inspected",
+      error,
+    );
+  }
+  if (!isBytes) {
+    throw ledgerError(
+      "invalid-http-response",
+      "Git ledger GitHub response stream chunk is not bytes",
+    );
+  }
+  try {
+    const backing = safeReflectApply(typedArrayBufferGetter, value, []);
+    const isOrdinaryArrayBuffer = safeReflectApply(
+      isArrayBufferIntrinsic,
+      utilTypes,
+      [backing],
+    );
+    if (!isOrdinaryArrayBuffer) {
+      throw new TypeError(
+        "response byte chunks require ordinary ArrayBuffer backing",
+      );
+    }
+    const detached = arrayBufferDetachedGetter === null
+      ? false
+      : safeReflectApply(arrayBufferDetachedGetter, backing, []);
+    const resizable = arrayBufferResizableGetter === null
+      ? false
+      : safeReflectApply(arrayBufferResizableGetter, backing, []);
+    const byteOffset = safeReflectApply(
+      typedArrayByteOffsetGetter,
+      value,
+      [],
+    );
+    const byteLength = safeReflectApply(
+      typedArrayByteLengthGetter,
+      value,
+      [],
+    );
+    if (detached || resizable) {
+      throw new TypeError(
+        "response byte chunks require fixed attached backing",
+      );
+    }
+    return { value, backing, byte_offset: byteOffset, byte_length: byteLength };
+  } catch (error) {
+    throw ledgerError(
+      "invalid-http-response",
+      "Git ledger GitHub response stream chunk could not be inspected exactly",
+      error,
+    );
+  }
+}
+
+function snapshotResponseByteChunk(chunk) {
+  try {
+    const isBytes = safeReflectApply(
+      isUint8ArrayIntrinsic,
+      utilTypes,
+      [chunk.value],
+    );
+    const backing = safeReflectApply(
+      typedArrayBufferGetter,
+      chunk.value,
+      [],
+    );
+    const byteOffset = safeReflectApply(
+      typedArrayByteOffsetGetter,
+      chunk.value,
+      [],
+    );
+    const byteLength = safeReflectApply(
+      typedArrayByteLengthGetter,
+      chunk.value,
+      [],
+    );
+    const isOrdinaryArrayBuffer = safeReflectApply(
+      isArrayBufferIntrinsic,
+      utilTypes,
+      [backing],
+    );
+    const detached = !isOrdinaryArrayBuffer ||
+      arrayBufferDetachedGetter === null
+      ? false
+      : safeReflectApply(arrayBufferDetachedGetter, backing, []);
+    const resizable = !isOrdinaryArrayBuffer ||
+      arrayBufferResizableGetter === null
+      ? false
+      : safeReflectApply(arrayBufferResizableGetter, backing, []);
+    if (
+      !isBytes ||
+      !isOrdinaryArrayBuffer ||
+      detached ||
+      resizable ||
+      backing !== chunk.backing ||
+      byteOffset !== chunk.byte_offset ||
+      byteLength !== chunk.byte_length
+    ) {
+      throw new TypeError("response byte chunk changed before snapshot");
+    }
+    const source = new Uint8Array(backing, byteOffset, byteLength);
+    const snapshot = safeReflectApply(bufferAllocIntrinsic, Buffer, [byteLength]);
+    safeReflectApply(uint8ArraySetIntrinsic, snapshot, [source, 0]);
+    return snapshot;
+  } catch (error) {
+    throw ledgerError(
+      "invalid-http-response",
+      "Git ledger GitHub response stream chunk could not be copied exactly",
+      error,
+    );
+  }
+}
+
+function releaseReaderLock(reader) {
+  if (
+    reader === null ||
+    (typeof reader !== "object" && typeof reader !== "function")
+  ) {
+    throw new TypeError("response reader is not an object");
+  }
+  const releaseLock = reader.releaseLock;
+  if (typeof releaseLock !== "function") {
+    throw new TypeError("response reader releaseLock is not callable");
+  }
+  return safeReflectApply(releaseLock, reader, []);
+}
+
+function cancelReadableBestEffort(readable) {
+  startBestEffort(() => cancelReadable(readable));
+}
+
+function cancelReadable(readable) {
+  if (readable === null || typeof readable !== "object") return;
+  const cancel = readable.cancel;
+  if (typeof cancel !== "function") return;
+  return safeReflectApply(cancel, readable, []);
+}
+
+function createAbortBestEffort(controller, message) {
+  // AbortSignal listeners are trusted to remain non-throwing. The fresh reason
+  // keeps listener mutation separate from the authoritative request failure.
+  return createBestEffortOnce(() => safeReflectApply(
+    abortControllerAbortIntrinsic,
+    controller,
+    [new Error(message)],
+  ));
+}
+
+function createBestEffortOnce(action) {
+  let started = false;
+  return () => {
+    if (started) return;
+    started = true;
+    startBestEffort(action);
+  };
+}
+
+function startBestEffort(action) {
+  if (typeof action !== "function") return;
+  let invoked = false;
+  try {
+    safeScheduleImmediate(() => {
+      if (invoked) return;
+      invoked = true;
+      try {
+        void Promise.resolve(action()).catch(() => {});
+      } catch {
+        // Isolate synchronous cleanup errors and returned promise rejections.
+      }
+    });
+  } catch {
+    // Scheduling cleanup is best-effort and must not replace the primary result.
+  }
 }
 
 function parseContentLength(value) {
@@ -44984,7 +45254,7 @@ function captureReceipt(capture) {
   return {
     http_status: capture.http_status,
     server_time: capture.server_time,
-    raw_body_sha256: rawDigest(capture.raw_body),
+    raw_body_sha256: rawDigest(capture.raw_body_bytes),
   };
 }
 
@@ -45274,7 +45544,7 @@ function validateCanonicalJsonValue(value, label, depth = 0) {
 }
 
 function rawDigest(value) {
-  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function digestCanonical(domain, value) {

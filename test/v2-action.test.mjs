@@ -1,18 +1,25 @@
 import assert from "node:assert/strict";
-import {
+import childProcess from "node:child_process";
+import fs, {
   chmodSync,
+  closeSync,
   linkSync,
   mkdtempSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   canonicalActionJson,
@@ -24,6 +31,9 @@ import {
 } from "../packages/action/src/v2/action.mjs";
 
 const ACTION_YAML_URL = new URL("../packages/action/action.yml", import.meta.url);
+const SIZE_RACE_FIXTURE_PATH = fileURLToPath(
+  new URL("../test-fixtures/controller-input-reader-size-race.mjs", import.meta.url),
+);
 
 test("plan adapter exposes only required closed v2 inputs and plan paths", () => {
   const action = readFileSync(ACTION_YAML_URL, "utf8");
@@ -95,6 +105,19 @@ test("controller input requires canonical stable regular data below runner temp"
     /cannot traverse a symlink/u,
   );
 
+  const fifoPath = join(controllerDirectory, "input.fifo");
+  const fifoCreation = childProcess.spawnSync("/usr/bin/mkfifo", [fifoPath], {
+    encoding: "utf8",
+    env: {},
+    shell: false,
+  });
+  assert.equal(fifoCreation.error, undefined);
+  assert.equal(fifoCreation.status, 0);
+  assert.throws(
+    () => readControllerInputFile(fifoPath, root),
+    /must identify a regular file/u,
+  );
+
   const hardLinkPath = join(controllerDirectory, "input-hardlink.json");
   linkSync(inputPath, hardLinkPath);
   assert.throws(
@@ -110,6 +133,231 @@ test("controller input requires canonical stable regular data below runner temp"
     () => readControllerInputFile(outsidePath, root),
     /descendant of RUNNER_TEMP/u,
   );
+});
+
+test("controller input rejects malformed UTF-8 without rejecting a real replacement character", (context) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "codex-review-gate-v2-utf8-")));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const controllerDirectory = join(root, "controller");
+  mkdirSync(controllerDirectory, { mode: 0o700 });
+
+  const malformedPath = join(controllerDirectory, "malformed.json");
+  writeFileSync(malformedPath, Buffer.from([
+    0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0x80, 0x22, 0x7d, 0x0a,
+  ]), { mode: 0o600 });
+  assert.throws(
+    () => readControllerInputFile(malformedPath, root),
+    /not valid UTF-8 JSON/u,
+  );
+
+  const replacementCharacterPath = join(controllerDirectory, "replacement.json");
+  const replacementCharacterValue = { a: "\ufffd" };
+  writeFileSync(
+    replacementCharacterPath,
+    canonicalActionJson(replacementCharacterValue),
+    { mode: 0o600 },
+  );
+  assert.deepEqual(
+    readControllerInputFile(replacementCharacterPath, root),
+    replacementCharacterValue,
+  );
+});
+
+test("controller input rejects a parent replacement after the parent preflight", (context) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "codex-review-gate-v2-parent-race-")));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), "codex-review-gate-v2-parent-race-outside-")));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  context.after(() => rmSync(outside, { recursive: true, force: true }));
+
+  const controllerDirectory = join(root, "controller");
+  const originalControllerDirectory = join(root, "controller-original");
+  const outsideControllerDirectory = join(outside, "controller");
+  mkdirSync(controllerDirectory, { mode: 0o700 });
+  mkdirSync(outsideControllerDirectory, { mode: 0o700 });
+  const inputPath = join(controllerDirectory, "input.json");
+  writeFileSync(inputPath, canonicalActionJson({ source: "A" }), { mode: 0o600 });
+  writeFileSync(
+    join(outsideControllerDirectory, "input.json"),
+    canonicalActionJson({ source: "B" }),
+    { mode: 0o600 },
+  );
+
+  const originalLstatSync = fs.lstatSync;
+  let seamTriggered = false;
+  fs.lstatSync = (...arguments_) => {
+    const result = originalLstatSync(...arguments_);
+    if (!seamTriggered && arguments_[0] === controllerDirectory) {
+      seamTriggered = true;
+      renameSync(controllerDirectory, originalControllerDirectory);
+      symlinkSync(outsideControllerDirectory, controllerDirectory);
+    }
+    return result;
+  };
+  syncBuiltinESMExports();
+
+  let rejection = null;
+  try {
+    readControllerInputFile(inputPath, root);
+  } catch (error) {
+    rejection = error;
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(seamTriggered, true, "the parent replacement seam must execute");
+  assert.ok(rejection instanceof Error, "the replaced parent must be rejected");
+  assert.match(rejection.message, /violated its access policy|object identity changed/u);
+});
+
+test("controller input binds the selected leaf across a pathname replacement", (context) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "codex-review-gate-v2-leaf-race-")));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const controllerDirectory = join(root, "controller");
+  mkdirSync(controllerDirectory, { mode: 0o700 });
+  const inputPath = join(controllerDirectory, "input.json");
+  const displacedPath = join(controllerDirectory, "input-original.json");
+  const replacementPath = join(controllerDirectory, "input-replacement.json");
+  writeFileSync(inputPath, canonicalActionJson({ source: "A" }), { mode: 0o600 });
+  writeFileSync(replacementPath, canonicalActionJson({ source: "B" }), { mode: 0o600 });
+
+  const originalSpawnSync = childProcess.spawnSync;
+  let seamTriggered = false;
+  childProcess.spawnSync = (...arguments_) => {
+    if (!seamTriggered) {
+      seamTriggered = true;
+      renameSync(inputPath, displacedPath);
+      renameSync(replacementPath, inputPath);
+    }
+    return originalSpawnSync(...arguments_);
+  };
+  syncBuiltinESMExports();
+
+  let rejection = null;
+  try {
+    readControllerInputFile(inputPath, root);
+  } catch (error) {
+    rejection = error;
+  } finally {
+    childProcess.spawnSync = originalSpawnSync;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(seamTriggered, true, "the post-selection leaf replacement seam must execute");
+  assert.ok(rejection instanceof Error, "the replaced selected leaf must be rejected");
+  assert.match(rejection.message, /object identity changed/u);
+});
+
+test("controller input binds successful child output to the selected leaf size", (context) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "codex-review-gate-v2-output-size-")));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const controllerDirectory = join(root, "controller");
+  mkdirSync(controllerDirectory, { mode: 0o700 });
+  const inputPath = join(controllerDirectory, "input.json");
+  writeFileSync(inputPath, canonicalActionJson({ source: "A" }), { mode: 0o600 });
+
+  const originalSpawnSync = childProcess.spawnSync;
+  let seamTriggered = false;
+  childProcess.spawnSync = () => {
+    seamTriggered = true;
+    return {
+      error: undefined,
+      signal: null,
+      status: 0,
+      stderr: Buffer.alloc(0),
+      stdout: Buffer.from(canonicalActionJson({ source: "different-length" }), "utf8"),
+    };
+  };
+  syncBuiltinESMExports();
+
+  let rejection = null;
+  try {
+    readControllerInputFile(inputPath, root);
+  } catch (error) {
+    rejection = error;
+  } finally {
+    childProcess.spawnSync = originalSpawnSync;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(seamTriggered, true, "the successful child output seam must execute");
+  assert.ok(rejection instanceof Error, "a selected-size mismatch must be rejected");
+  assert.match(rejection.message, /returned invalid data/u);
+});
+
+test("isolated leaf reader rejects a size mutation after its final descriptor stat", (context) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "codex-review-gate-v2-size-race-")));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const inputPath = join(root, "input.json");
+  const bytes = Buffer.from(canonicalActionJson({ source: "stable" }), "utf8");
+  writeFileSync(inputPath, bytes, { mode: 0o600 });
+
+  const descriptor = openSync(inputPath, "r");
+  let result;
+  try {
+    result = childProcess.spawnSync(
+      process.execPath,
+      [
+        SIZE_RACE_FIXTURE_PATH,
+        "input.json",
+        String(bytes.length + 16),
+        String(bytes.length),
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {},
+        maxBuffer: 64 * 1024,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe", "ignore", descriptor],
+      },
+    );
+  } finally {
+    closeSync(descriptor);
+  }
+
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null);
+  assert.equal(result.status, 0);
+  assert.equal(result.stderr, "");
+  assert.equal(result.stdout, "CONTENT\n");
+});
+
+test("controller input tolerates benign sibling churn and directory metadata changes", (context) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "codex-review-gate-v2-parent-churn-")));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const controllerDirectory = join(root, "controller");
+  mkdirSync(controllerDirectory, { mode: 0o700 });
+  const inputPath = join(controllerDirectory, "input.json");
+  const value = { source: "stable" };
+  writeFileSync(inputPath, canonicalActionJson(value), { mode: 0o600 });
+
+  const originalLstatSync = fs.lstatSync;
+  let seamTriggered = false;
+  fs.lstatSync = (...arguments_) => {
+    const result = originalLstatSync(...arguments_);
+    if (!seamTriggered && arguments_[0] === controllerDirectory) {
+      seamTriggered = true;
+      const sibling = join(controllerDirectory, "sibling");
+      mkdirSync(sibling, { mode: 0o700 });
+      rmSync(sibling, { recursive: true });
+      const timestamp = new Date(Date.now() - 2_000);
+      utimesSync(controllerDirectory, timestamp, timestamp);
+    }
+    return result;
+  };
+  syncBuiltinESMExports();
+
+  let actual;
+  try {
+    actual = readControllerInputFile(inputPath, root);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(seamTriggered, true, "the benign parent metadata seam must execute");
+  assert.deepEqual(actual, value);
 });
 
 test("read-only transport guard admits REST GET and named v2 GraphQL queries only", async () => {

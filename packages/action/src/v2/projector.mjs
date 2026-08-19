@@ -144,7 +144,10 @@ export function deriveV2EvidenceRequest({ discovery_snapshot, controller }) {
   assertCompleteTransportSnapshot(discovery_snapshot, "discovery_snapshot");
   const normalizedController = normalizeController(controller);
 
-  const requestComments = requestCommentsById(discovery_snapshot);
+  const requestComments = requestCommentsById(
+    discovery_snapshot,
+    normalizedController,
+  );
   const bindings = requestBindingsById(
     normalizedController,
     requestComments,
@@ -172,14 +175,17 @@ export function deriveV2EvidenceRequest({ discovery_snapshot, controller }) {
     );
   }
 
-  const permissionSubjects = selectors.filter((selector) =>
-    selector.kind === "issue_comment" &&
-    ((bindings.get(selector.id)?.head_oid ===
-        discovery_snapshot.scope.head_ref_oid &&
-      bindings.get(selector.id)?.kind === "manual") ||
-      isAddressCommandCandidate(
-        inventoryArtifact(discovery_snapshot, selector)?.body,
-      )));
+  const permissionSubjects = selectors.filter((selector) => {
+    if (selector.kind !== "issue_comment") return false;
+    const comment = inventoryArtifact(discovery_snapshot, selector);
+    const binding = bindings.get(selector.id);
+    const unboundRequestCandidate =
+      comment?.body === V2_MANUAL_REVIEW_REQUEST && binding === undefined;
+    return unboundRequestCandidate ||
+      (binding?.head_oid === discovery_snapshot.scope.head_ref_oid &&
+        binding.kind === "manual") ||
+      isAddressCommandCandidate(comment?.body);
+  });
 
   return deepFreeze({
     artifactSelectors: selectors,
@@ -216,13 +222,20 @@ export function projectV2TransportSnapshots({
     expectedRequest.permissionSubjects,
     exactBySelector,
   );
+  assertUnboundRequestCandidateAuthority(
+    evidence_snapshot,
+    normalizedController,
+  );
   assertThreadResolutionClosure(
     discovery_snapshot,
     evidence_snapshot,
     normalizedController.thread_resolution_observations,
   );
 
-  const requestComments = requestCommentsById(discovery_snapshot);
+  const requestComments = requestCommentsById(
+    discovery_snapshot,
+    normalizedController,
+  );
   const requestBindings = requestBindingsById(
     normalizedController,
     requestComments,
@@ -555,11 +568,14 @@ function deriveSelectors(snapshot, requestBindings, currentHead) {
   for (const comment of snapshot.pages.issue_comments) {
     const native = issueCommentForCore(comment);
     const terminal = parseCodexIssueCommentTerminalHeading(comment.body ?? "");
+    const binding = requestBindings.get(comment.id);
+    const exactRequestBody = comment.body === V2_MANUAL_REVIEW_REQUEST;
     const currentRequest =
-      comment.body === V2_MANUAL_REVIEW_REQUEST &&
-      requestBindings.get(comment.id)?.head_oid === currentHead;
+      exactRequestBody && binding?.head_oid === currentHead;
+    const unboundRequestCandidate = exactRequestBody && binding === undefined;
     if (
       currentRequest ||
+      unboundRequestCandidate ||
       isAddressCommandCandidate(comment.body) ||
       terminal.terminalLooking ||
       providerLike(comment)
@@ -688,6 +704,48 @@ function assertPermissionClosure(snapshot, subjects, exactBySelector) {
         `manual request ${key} has no two-point actor permission receipt`,
       );
     }
+  }
+}
+
+function assertUnboundRequestCandidateAuthority(snapshot, controller) {
+  const boundIds = new Set(
+    controller.request_bindings.map((binding) => binding.id),
+  );
+  const permissions = new Map(
+    snapshot.permissions.actor_permissions.map((permission) => [
+      permission.subject.id,
+      permission,
+    ]),
+  );
+  for (const comment of snapshot.pages.issue_comments) {
+    if (
+      comment.body !== V2_MANUAL_REVIEW_REQUEST ||
+      boundIds.has(comment.id)
+    ) {
+      continue;
+    }
+    const permission = permissions.get(comment.id);
+    if (permission === undefined) {
+      throw projectorFailure(
+        "MISSING_ACTOR_PERMISSION",
+        `unbound request candidate ${comment.id} has no two-point actor permission receipt`,
+      );
+    }
+    const initiallyAuthorized = permission.pre.permissions.push;
+    const finallyAuthorized = permission.post.permissions.push;
+    if (!initiallyAuthorized && !finallyAuthorized) {
+      continue;
+    }
+    if (!initiallyAuthorized || !finallyAuthorized) {
+      throw projectorFailure(
+        "REQUEST_PERMISSION_UNSTABLE",
+        `unbound request candidate ${comment.id} does not have stable no-push authority`,
+      );
+    }
+    throw projectorFailure(
+      "REQUEST_BINDING_MISSING",
+      `authorized exact request ${comment.id} has no persistent controller binding`,
+    );
   }
 }
 
@@ -1185,12 +1243,8 @@ function projectInlineFindings({
 }
 
 function projectRequestReactions(snapshot, acknowledgements, currentRequestIds) {
-  const requests = requestCommentsById(snapshot);
   for (const group of snapshot.pages.reactions.issue_comments) {
-    if (
-      !requests.has(group.subject_id) ||
-      !currentRequestIds.has(group.subject_id)
-    ) {
+    if (!currentRequestIds.has(group.subject_id)) {
       continue;
     }
     for (const reaction of group.reactions) {
@@ -1281,8 +1335,7 @@ function projectAddressedAcknowledgements({
   }
 
   for (const comment of snapshot.pages.issue_comments) {
-    const targetUrl = parseAddressCommand(comment.body);
-    if (targetUrl === null) {
+    if (!isAddressCommandCandidate(comment.body)) {
       continue;
     }
     const exactKey = `issue_comment:${comment.id}`;
@@ -1292,29 +1345,43 @@ function projectAddressedAcknowledgements({
         `address command ${comment.id} was not exact-refetched`,
       );
     }
+    const permission = permissions.get(exactKey);
+    if (
+      permission === undefined ||
+      !permission.stable ||
+      comment.author === null ||
+      !isDeepStrictEqual(permission.actor, comment.author)
+    ) {
+      throw projectorFailure(
+        "ADDRESS_COMMAND_PERMISSION_INVALID",
+        `address command ${comment.id} has no stable two-point actor authority`,
+      );
+    }
+    if (comment.author.type !== "User") {
+      continue;
+    }
+    const initiallyAuthorized = permission.pre.permissions.push;
+    const finallyAuthorized = permission.post.permissions.push;
+    if (!initiallyAuthorized && !finallyAuthorized) {
+      continue;
+    }
+    if (!initiallyAuthorized || !finallyAuthorized) {
+      throw projectorFailure(
+        "ADDRESS_COMMAND_PERMISSION_INVALID",
+        `address command ${comment.id} has no stable two-point write authority`,
+      );
+    }
     if (comment.created_at !== comment.updated_at) {
       throw projectorFailure(
         "ADDRESS_COMMAND_EDITED",
         `address command ${comment.id} was edited`,
       );
     }
-    if (comment.author === null || comment.author.type !== "User") {
+    const targetUrl = parseAddressCommand(comment.body);
+    if (targetUrl === null) {
       throw projectorFailure(
-        "ADDRESS_COMMAND_ACTOR_INVALID",
-        `address command ${comment.id} is not authored by a human user`,
-      );
-    }
-    const permission = permissions.get(exactKey);
-    if (
-      permission === undefined ||
-      !permission.stable ||
-      !permission.pre.permissions.push ||
-      !permission.post.permissions.push ||
-      !isDeepStrictEqual(permission.actor, comment.author)
-    ) {
-      throw projectorFailure(
-        "ADDRESS_COMMAND_PERMISSION_INVALID",
-        `address command ${comment.id} has no stable two-point write authority`,
+        "ADDRESS_COMMAND_TARGET_INVALID",
+        `address command ${comment.id} has no canonical target URL`,
       );
     }
     const matches = addressable.filter((finding) => finding.carrier_url === targetUrl);
@@ -1904,10 +1971,19 @@ function transportLineage(discovery, evidence, controller) {
   };
 }
 
-function requestCommentsById(snapshot) {
+function requestCommentsById(snapshot, controller) {
+  // A lookalike comment is not a request identity. The controller's already
+  // validated bindings define the closed identity domain; the raw transport
+  // only proves that each current binding still has one unedited exact body.
+  const boundIds = new Set(
+    controller.request_bindings.map((binding) => binding.id),
+  );
   return new Map(
     snapshot.pages.issue_comments
-      .filter((comment) => comment.body === V2_MANUAL_REVIEW_REQUEST)
+      .filter((comment) =>
+        boundIds.has(comment.id) &&
+        comment.body === V2_MANUAL_REVIEW_REQUEST &&
+        comment.created_at === comment.updated_at)
       .map((comment) => [comment.id, comment]),
   );
 }
@@ -1916,14 +1992,6 @@ function requestBindingsById(controller, requestComments, currentHead) {
   const bindings = new Map(
     controller.request_bindings.map((binding) => [binding.id, binding]),
   );
-  for (const id of requestComments.keys()) {
-    if (!bindings.has(id)) {
-      throw projectorFailure(
-        "REQUEST_BINDING_MISSING",
-        `exact request ${id} has no persistent controller binding`,
-      );
-    }
-  }
   for (const [id, binding] of bindings) {
     if (binding.head_oid === currentHead && !requestComments.has(id)) {
       throw projectorFailure(

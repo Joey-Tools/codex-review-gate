@@ -95,8 +95,24 @@ provider evidence。
 ## Plan-only composite adapter
 
 `action.yml` 执行 `src/v2/action.mjs`。它接受 `RUNNER_TEMP` 下的 operation input path，
-验证该 path 是 controller-owned 而非 checkout/PR-controlled，执行 read-only transport，
-再返回 closed plan。
+将读取限制在选定的 `RUNNER_TEMP` directory object 而非 checkout/PR-controlled path，
+执行 read-only transport，再返回 closed plan。
+
+在 Linux 和 macOS 上，reader 会持续持有选定的 `RUNNER_TEMP` directory descriptor，
+并由一个隔离 child 从 `/` 开始遍历。每个 directory component 都先以 no-follow 方式
+打开，在 `chdir` 期间保持 descriptor，再按 device、inode 和 file type 比较后继续；
+leaf 则由 parent 以 nonblocking、no-follow 方式打开并作为 inherited descriptor 4 持续持有。
+Child 只读取该 selected descriptor，并在两次 positioned read 前后要求 relative leaf 的
+device、inode、file type、access policy 和 selected size 均一致；stable bytes 还必须是
+strict UTF-8 和唯一 canonical JSON representation。该机制防止读取被重定向到不同
+directory 或 leaf object；它不证明 producer provenance，也不证明 race 中解析到相同对象的
+symlink 从未被短暂遍历。它还假定攻击者不能控制 privileged bind mount、mount namespace
+或 filesystem identity semantics；这些场景需要 native mount-aware API。其他平台会 fail closed。
+
+每次观测 leaf stat 时，access-policy predicate 都严格限定为：regular file、link count 为一，
+且 POSIX group/other write mode bit 均未设置。它不检查 extended ACL，也不证明能够防御
+same-UID writer、owner provenance 或 privileged mount authority；这些不属于固定 Ubuntu
+production threat model。
 
 Operations 是 `prepare-request`、`bind-request`、`evaluate-only`；必填且无默认值的
 status target enum 是 `head` 或 `test-merge-with-head-sentinel`。`head` 只授权

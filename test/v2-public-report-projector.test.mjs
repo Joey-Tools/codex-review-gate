@@ -652,22 +652,35 @@ test("automatic recovery ignores a durably bound earlier-head request", () => {
   assert.deepEqual(authority.closure_ids, [fixture.address.id]);
 });
 
-test("automatic recovery fails closed for incomplete current-head request authority",
+test("automatic recovery consumes only durably bound request identities",
   async (context) => {
-    await context.test("visible request has no durable binding", () => {
+    await context.test("unbound exact request lookalike is inert", () => {
       const unexpected = requestComment("1002", "2026-08-13T12:01:00Z");
       const fixture = earlierHeadAutomaticRecoveryFixture({
         extraIssueComments: [unexpected],
+        extraExactArtifactIds: [unexpected.id],
+        extraActorPermissions: [readOnlyPermissionReceipt(unexpected)],
       });
+      const input = projectV2TransportSnapshots({
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+      });
+      assert.deepEqual(input.requests.map((request) => request.id), [
+        fixture.currentRequest.id,
+      ]);
+      const compact = reduceV2Snapshot(input, OPTIONS);
 
-      assert.throws(
-        () => projectV2TransportSnapshots({
-          discovery_snapshot: fixture.discovery,
-          evidence_snapshot: fixture.evidence,
-          controller: fixture.controller,
-        }),
-        (error) => error.code === "REQUEST_BINDING_MISSING",
-      );
+      const authority = projectV2AutomaticRequestRecoveryAuthority({
+        compact_report: compact,
+        reducer_input: input,
+        discovery_snapshot: fixture.discovery,
+        evidence_snapshot: fixture.evidence,
+        controller: fixture.controller,
+        controlled_request: fixture.controlledRequest,
+      });
+      assert.notEqual(authority, null);
+      assert.equal(authority.prior_request_id, fixture.currentRequest.id);
     });
 
     await context.test("current-head binding has no visible request", () => {
@@ -822,6 +835,7 @@ function earlierHeadAutomaticRecoveryFixture({
   extraIssueComments = [],
   extraRequestBindings = [],
   extraExactArtifactIds = [],
+  extraActorPermissions = [],
   budget = {
     automatic_requests_on_head: 1,
     automatic_reservations_on_head: 1,
@@ -894,7 +908,10 @@ function earlierHeadAutomaticRecoveryFixture({
       address.id,
       ...extraExactArtifactIds,
     ],
-    actorPermissions: [manualPermissionReceipt(address)],
+    actorPermissions: [
+      manualPermissionReceipt(address),
+      ...extraActorPermissions,
+    ],
     preTime: "2026-08-13T12:19:00Z",
     postTime: "2026-08-13T12:20:00Z",
   });
@@ -1253,6 +1270,20 @@ function manualPermissionReceipt(comment) {
     pre: point("2026-08-13T12:01:00Z"),
     post: point("2026-08-13T12:20:00Z"),
   };
+}
+
+function readOnlyPermissionReceipt(comment) {
+  const permission = manualPermissionReceipt(comment);
+  for (const receipt of [permission.pre, permission.post]) {
+    receipt.effective_permission = "read";
+    receipt.role_name = "read";
+    receipt.permissions.admin = false;
+    receipt.permissions.maintain = false;
+    receipt.permissions.push = false;
+    receipt.permissions.triage = false;
+    receipt.permissions.pull = true;
+  }
+  return permission;
 }
 
 function selectionAuthority(overrides = {}) {

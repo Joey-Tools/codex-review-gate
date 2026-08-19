@@ -12,9 +12,13 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
+import timers from "node:timers";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { TextDecoder } from "node:util";
 import test from "node:test";
 
 import {
@@ -43,11 +47,13 @@ import {
   loadV2MinimalLiveScope,
   MAX_V2_SCHEDULE_DISPATCH_GITHUB_OUTPUT_UTF16_BYTES,
   markV2EffectAttempted,
+  parseV2EffectLedgerComment,
   projectV2MinimalScopeForGitLedger,
   projectV2LeasedDiscoveryContinuityForGitLedger,
   readV2ProviderEventSelector,
   reserveAndPersistV2Effect,
   reserveV2Effect,
+  renderV2EffectLedgerComment,
   runV2ListOpenCli,
   runV2ScheduleDispatchCli,
   runV2WorkflowControllerCli,
@@ -62,6 +68,10 @@ import {
 import {
   createV2GitHubTransport,
 } from "../packages/action/src/v2/transport.mjs";
+import {
+  bindStickyCommentRawDigest,
+  buildStickyAuditProjection,
+} from "../packages/action/src/v2/projection.mjs";
 import {
   createV2GitHubCandidateInventory,
   MAX_V2_CANDIDATE_SCAN_PASSES,
@@ -133,6 +143,16 @@ const MERGE_BASE = "d".repeat(40);
 const TREE = "e".repeat(40);
 const PUBLIC_DIGEST = `sha256:${"f".repeat(64)}`;
 const TIME = "2026-08-13T12:00:00.000Z";
+
+function nextTurn() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+const CLEANUP_BLOCK = new Int32Array(new SharedArrayBuffer(4));
+
+function blockCleanupBriefly() {
+  Atomics.wait(CLEANUP_BLOCK, 0, 0, 2);
+}
 
 function fixtureHeadForPull(number) {
   return number === 7 ? HEAD : number.toString(16).padStart(40, "0");
@@ -538,12 +558,34 @@ test("status effects use an append-only retry-zero WAL before exact response bin
     /only a durably reserved effect/u,
   );
 
+  const rawBody = JSON.stringify({ id: 1 });
+  assert.throws(
+    () => bindV2EffectResponse({
+      ledger: attempted,
+      effect_id: attempted.effects[0].effect_id,
+      http_status: 201,
+      server_time: "2026-08-13T12:00:02.000Z",
+      raw_body: rawBody,
+      receipt: {
+        sha: MERGE,
+        context: "codex/github-review-gate",
+        state: "success",
+        id: "1",
+      },
+    }),
+    /raw_body_sha256 must be a lowercase SHA-256 digest/u,
+  );
   const bound = bindV2EffectResponse({
     ledger: attempted,
     effect_id: attempted.effects[0].effect_id,
     http_status: 201,
     server_time: "2026-08-13T12:00:02.000Z",
-    raw_body: JSON.stringify({ id: 1 }),
+    raw_body: rawBody,
+    raw_body_sha256: sha256(rawBody),
+    exact_refetch: {
+      server_time: "2026-08-13T12:00:03.000Z",
+      raw_body_sha256: sha256(`[${rawBody}]`),
+    },
     receipt: {
       sha: MERGE,
       context: "codex/github-review-gate",
@@ -552,6 +594,95 @@ test("status effects use an append-only retry-zero WAL before exact response bin
     },
   });
   assert.equal(validateV2EffectLedger(bound).effects[0].state, "bound");
+  assert.deepEqual(bound.effects[0].response.exact_refetch, {
+    server_time: "2026-08-13T12:00:03.000Z",
+    raw_body_sha256: sha256(`[${rawBody}]`),
+  });
+  assert.deepEqual(
+    parseV2EffectLedgerComment(renderV2EffectLedgerComment(bound)),
+    bound,
+  );
+
+  assert.throws(
+    () => bindV2EffectResponse({
+      ledger: attempted,
+      effect_id: attempted.effects[0].effect_id,
+      http_status: 201,
+      server_time: "2026-08-13T12:00:02.000Z",
+      raw_body: "\uD800",
+      raw_body_sha256: sha256(Buffer.from("\uFFFD", "utf8")),
+      exact_refetch: {
+        server_time: "2026-08-13T12:00:03.000Z",
+        raw_body_sha256: sha256("[]"),
+      },
+      receipt: {
+        sha: MERGE,
+        context: "codex/github-review-gate",
+        state: "success",
+        id: "1",
+      },
+    }),
+    /round-trip as exact UTF-8/u,
+  );
+
+  const reseal = (ledgerValue) => {
+    const copy = structuredClone(ledgerValue);
+    const { ledger_digest: _ledgerDigest, ...withoutDigest } = copy;
+    copy.ledger_digest = digestDomain(
+      "codex-review-gate-v2-effect-ledger",
+      withoutDigest,
+    );
+    return copy;
+  };
+  const corruptions = [
+    ["closed keys", (responseValue) => { responseValue.unexpected = true; }],
+    ["schema", (responseValue) => { responseValue.schema_version = 2; }],
+    ["status", (responseValue) => { responseValue.http_status = 200; }],
+    ["time", (responseValue) => {
+      responseValue.server_time = "2026-08-13T12:00:00.000Z";
+    }],
+    ["raw digest", (responseValue) => {
+      responseValue.raw_body_sha256 = "sha256:not-a-digest";
+    }],
+    ["receipt", (responseValue) => { responseValue.receipt.state = "failure"; }],
+    ["refetch time", (responseValue) => {
+      responseValue.exact_refetch.server_time = "2026-08-13T12:00:01.000Z";
+    }],
+  ];
+  for (const [label, corrupt] of corruptions) {
+    const altered = structuredClone(bound);
+    corrupt(altered.effects[0].response);
+    assert.throws(
+      () => validateV2EffectLedger(reseal(altered)),
+      undefined,
+      label,
+    );
+  }
+  const forgedIdentity = structuredClone(bound);
+  forgedIdentity.effects[0].effect_id = `v2-effect:${"f".repeat(64)}`;
+  assert.throws(
+    () => validateV2EffectLedger(reseal(forgedIdentity)),
+    /effect_id does not bind its exact ledger scope, kind, key, and payload/u,
+  );
+
+  const driftedStatusKey = structuredClone(bound);
+  const driftedEffect = driftedStatusKey.effects[0];
+  driftedEffect.idempotency_key = `status:${"e".repeat(64)}`;
+  driftedEffect.effect_id = `v2-effect:${digestDomain(
+    "codex-review-gate-v2-effect-id",
+    {
+      repository_node_id: driftedStatusKey.repository_node_id,
+      pull_request_node_id: driftedStatusKey.pull_request_node_id,
+      head_ref_oid: driftedStatusKey.head_ref_oid,
+      kind: driftedEffect.kind,
+      idempotency_key: driftedEffect.idempotency_key,
+      payload: driftedEffect.payload,
+    },
+  ).slice("sha256:".length)}`;
+  assert.throws(
+    () => validateV2EffectLedger(reseal(driftedStatusKey)),
+    /payload idempotency_key must equal its effect idempotency_key/u,
+  );
   assert.throws(
     () => reserveV2Effect({
       ledger: bound,
@@ -954,6 +1085,7 @@ test("ambiguous or wrong-status effects stay consumed and cannot bind", () => {
       http_status: 500,
       server_time: TIME,
       raw_body: "failure",
+      raw_body_sha256: sha256("failure"),
       receipt: null,
     }),
     /requires exact HTTP 201/u,
@@ -966,6 +1098,221 @@ test("ambiguous or wrong-status effects stay consumed and cannot bind", () => {
       attempted_at: TIME,
     }),
     /only a durably reserved effect/u,
+  );
+});
+
+test("real sticky POST persists and binds exact GET identity evidence", async () => {
+  const sticky = stickyReceiptFixture();
+  const stickyBody = sticky.body;
+  const initial = createV2EffectLedger({
+    repository_node_id: "R_repo",
+    pull_request_node_id: "PR_7",
+    head_ref_oid: HEAD,
+    created_at: TIME,
+  });
+  const reserved = reserveV2Effect({
+    ledger: initial,
+    kind: "sticky-comment",
+    idempotency_key: `sticky:${"2".repeat(64)}`,
+    payload: {
+      method: "POST",
+      comment_id: null,
+      body_sha256: sticky.body_sha256,
+      projection_digest: `sha256:${"3".repeat(64)}`,
+    },
+    recorded_at: TIME,
+  });
+  const attempted = markV2EffectAttempted({
+    ledger: reserved,
+    effect_id: reserved.effects[0].effect_id,
+    attempted_at: "2026-08-13T12:00:01.000Z",
+  });
+  const rawBody = JSON.stringify({
+    id: 72,
+    node_id: "IC_72",
+    body: stickyBody,
+  });
+  const transport = createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    fetch: async (_url, init) => response(
+      init.method === "POST" ? 201 : 200,
+      rawBody,
+      init.method === "POST"
+        ? "Wed, 13 Aug 2026 12:00:02 GMT"
+        : "Wed, 13 Aug 2026 12:00:03 GMT",
+    ),
+  });
+  const capture = await transport.performEffect({
+    effect: attempted.effects[0],
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+    sticky_body: stickyBody,
+  });
+  assert.equal(capture.exact_refetch.raw_body, rawBody);
+  await assert.rejects(
+    executeV2EffectOnce({
+      ledger: reserved,
+      effect_id: reserved.effects[0].effect_id,
+      attempted_at: "2026-08-13T12:00:01.000Z",
+      persist_ledger: async (value) => structuredClone(value),
+      perform_effect: async () => ({
+        ...structuredClone(capture),
+        sticky_identity: {
+          comment_id: "999",
+          comment_node_id: "FORGED_NODE",
+          body_sha256: sticky.body_sha256,
+        },
+      }),
+      receipt_builder: async () => structuredClone(sticky.receipt),
+    }),
+    /write identity differs from its exact GET refetch/u,
+  );
+  const bound = bindV2EffectResponse({
+    ledger: attempted,
+    effect_id: attempted.effects[0].effect_id,
+    http_status: capture.http_status,
+    server_time: capture.server_time,
+    raw_body: capture.raw_body,
+    raw_body_sha256: capture.raw_body_sha256,
+    exact_refetch: capture.exact_refetch,
+    receipt: sticky.receipt,
+  });
+  assert.deepEqual(bound.effects[0].response.exact_refetch, {
+    server_time: "2026-08-13T12:00:03.000Z",
+    raw_body: rawBody,
+    raw_body_sha256: sha256(rawBody),
+  });
+
+  const forgedIdentity = stickyReceiptFixture({
+    commentId: "999",
+    commentNodeId: "FORGED_NODE",
+  });
+  assert.throws(
+    () => bindV2EffectResponse({
+      ledger: attempted,
+      effect_id: attempted.effects[0].effect_id,
+      http_status: capture.http_status,
+      server_time: capture.server_time,
+      raw_body: capture.raw_body,
+      raw_body_sha256: capture.raw_body_sha256,
+      exact_refetch: capture.exact_refetch,
+      receipt: forgedIdentity.receipt,
+    }),
+    /receipt identity differs from its exact GET refetch/u,
+  );
+  const forgedDurableIdentity = structuredClone(bound);
+  forgedDurableIdentity.effects[0].response.receipt =
+    structuredClone(forgedIdentity.receipt);
+  const {
+    ledger_digest: _forgedDurableIdentityDigest,
+    ...forgedDurableIdentityBody
+  } = forgedDurableIdentity;
+  forgedDurableIdentity.ledger_digest = digestDomain(
+    "codex-review-gate-v2-effect-ledger",
+    forgedDurableIdentityBody,
+  );
+  assert.throws(
+    () => validateV2EffectLedger(forgedDurableIdentity),
+    /receipt identity differs from its exact GET refetch/u,
+  );
+
+  const forgedBinding = structuredClone(sticky.receipt);
+  forgedBinding.binding_sha256 = `sha256:${"0".repeat(64)}`;
+  forgedBinding.raw_binding.binding_sha256 = forgedBinding.binding_sha256;
+  assert.throws(
+    () => bindV2EffectResponse({
+      ledger: attempted,
+      effect_id: attempted.effects[0].effect_id,
+      http_status: capture.http_status,
+      server_time: capture.server_time,
+      raw_body: capture.raw_body,
+      raw_body_sha256: capture.raw_body_sha256,
+      exact_refetch: capture.exact_refetch,
+      receipt: forgedBinding,
+    }),
+    /binding_sha256 does not bind its exact projection body/u,
+  );
+});
+
+test("real sticky PATCH rejects forged node identity and projection binding", async () => {
+  const sticky = stickyReceiptFixture();
+  const initial = createV2EffectLedger({
+    repository_node_id: "R_repo",
+    pull_request_node_id: "PR_7",
+    head_ref_oid: HEAD,
+    created_at: TIME,
+  });
+  const reserved = reserveV2Effect({
+    ledger: initial,
+    kind: "sticky-comment",
+    idempotency_key: `sticky:${"4".repeat(64)}`,
+    payload: {
+      method: "PATCH",
+      comment_id: "72",
+      body_sha256: sticky.body_sha256,
+      projection_digest: `sha256:${"5".repeat(64)}`,
+    },
+    recorded_at: TIME,
+  });
+  const attempted = markV2EffectAttempted({
+    ledger: reserved,
+    effect_id: reserved.effects[0].effect_id,
+    attempted_at: "2026-08-13T12:00:01.000Z",
+  });
+  const rawBody = JSON.stringify({
+    id: 72,
+    node_id: "IC_72",
+    body: sticky.body,
+  });
+  const transport = createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    fetch: async (_url, init) => response(
+      200,
+      rawBody,
+      init.method === "PATCH"
+        ? "Wed, 13 Aug 2026 12:00:02 GMT"
+        : "Wed, 13 Aug 2026 12:00:03 GMT",
+    ),
+  });
+  const capture = await transport.performEffect({
+    effect: attempted.effects[0],
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+    sticky_body: sticky.body,
+  });
+
+  const forgedNode = stickyReceiptFixture({ commentNodeId: "FORGED_NODE" });
+  assert.throws(
+    () => bindV2EffectResponse({
+      ledger: attempted,
+      effect_id: attempted.effects[0].effect_id,
+      http_status: capture.http_status,
+      server_time: capture.server_time,
+      raw_body: capture.raw_body,
+      raw_body_sha256: capture.raw_body_sha256,
+      exact_refetch: capture.exact_refetch,
+      receipt: forgedNode.receipt,
+    }),
+    /receipt identity differs from its exact GET refetch/u,
+  );
+
+  const forgedBinding = structuredClone(sticky.receipt);
+  forgedBinding.binding_sha256 = `sha256:${"0".repeat(64)}`;
+  forgedBinding.raw_binding.binding_sha256 = forgedBinding.binding_sha256;
+  assert.throws(
+    () => bindV2EffectResponse({
+      ledger: attempted,
+      effect_id: attempted.effects[0].effect_id,
+      http_status: capture.http_status,
+      server_time: capture.server_time,
+      raw_body: capture.raw_body,
+      raw_body_sha256: capture.raw_body_sha256,
+      exact_refetch: capture.exact_refetch,
+      receipt: forgedBinding,
+    }),
+    /binding_sha256 does not bind its exact projection body/u,
   );
 });
 
@@ -1032,6 +1379,10 @@ test("real status transport persists WAL before one POST 201 and exact GET", asy
 
   assert.deepEqual(persisted.map(({ phase }) => phase), ["reserved", "attempted", "bound"]);
   assert.equal(outcome.ledger.effects[0].state, "bound");
+  assert.deepEqual(outcome.ledger.effects[0].response.exact_refetch, {
+    server_time: "2026-08-13T12:00:03.000Z",
+    raw_body_sha256: sha256(`[${responseBody}]`),
+  });
   assert.deepEqual(
     requests.map(({ method, url }) => ({ method, url })),
     [
@@ -1050,6 +1401,540 @@ test("real status transport persists WAL before one POST 201 and exact GET", asy
     context: "codex/github-review-gate",
     description: "decision-clean",
   });
+});
+
+test("effect transport hashes legal UTF-8 bytes and rejects a malformed equivalent", async () => {
+  const legalRaw = Buffer.from(JSON.stringify({
+    id: 901,
+    sha: MERGE,
+    context: "codex/github-review-gate",
+    state: "success",
+    marker: "\uFFFD",
+  }), "utf8");
+  const replacement = Buffer.from("\uFFFD", "utf8");
+  const replacementIndex = legalRaw.indexOf(replacement);
+  assert.notEqual(replacementIndex, -1);
+  const malformedRaw = Buffer.concat([
+    legalRaw.subarray(0, replacementIndex),
+    Buffer.from([0x80]),
+    legalRaw.subarray(replacementIndex + replacement.length),
+  ]);
+  const attempted = attemptedStatusLedger();
+  const effect = attempted.effects[0];
+  const makeTransport = (postBody) => createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    async fetch(_url, init) {
+      return response(
+        init.method === "POST" ? 201 : 200,
+        init.method === "POST"
+          ? postBody
+          : Buffer.from(`[${legalRaw.toString("utf8")}]`, "utf8"),
+        init.method === "POST"
+          ? "Wed, 13 Aug 2026 12:00:02 GMT"
+          : "Wed, 13 Aug 2026 12:00:03 GMT",
+      );
+    },
+  });
+
+  const capture = await makeTransport(legalRaw).performEffect({
+    effect,
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+  });
+  assert.equal(capture.raw_body, legalRaw.toString("utf8"));
+  assert.equal(capture.raw_body_sha256, sha256(legalRaw));
+  const bound = bindV2EffectResponse({
+    ledger: attempted,
+    effect_id: effect.effect_id,
+    http_status: capture.http_status,
+    server_time: capture.server_time,
+    raw_body: capture.raw_body,
+    raw_body_sha256: capture.raw_body_sha256,
+    exact_refetch: capture.exact_refetch,
+    receipt: capture.receipt,
+  });
+  assert.equal(
+    bound.effects[0].response.raw_body_sha256,
+    sha256(legalRaw),
+  );
+
+  await assert.rejects(
+    makeTransport(malformedRaw).performEffect({
+      effect,
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+    }),
+    /valid UTF-8/u,
+  );
+});
+
+test("effect transport fails closed on unbounded or non-byte response streams", async () => {
+  const effect = attemptedStatusEffect();
+  const perform = (rawResponse) => createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    fetch: async () => rawResponse,
+  }).performEffect({
+    effect,
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+  });
+  const rawResponse = ({ contentLength = null, body }) => ({
+    status: 201,
+    headers: {
+      get(name) {
+        if (name.toLowerCase() === "date") {
+          return "Wed, 13 Aug 2026 12:00:02 GMT";
+        }
+        if (name.toLowerCase() === "content-length") return contentLength;
+        return null;
+      },
+    },
+    body,
+  });
+
+  await assert.rejects(
+    perform(rawResponse({ body: null })),
+    /not a readable byte stream/u,
+  );
+  let malformedReaderCancelled = false;
+  let malformedReaderReleased = false;
+  const malformedReader = {
+    get read() {
+      throw new Error("reader shape getter failed");
+    },
+    cancel() {
+      malformedReaderCancelled = true;
+      return new Promise(() => {});
+    },
+    releaseLock() {
+      malformedReaderReleased = true;
+    },
+  };
+  await assert.rejects(
+    perform(rawResponse({
+      body: { getReader: () => malformedReader },
+    })),
+    /reader shape getter failed/u,
+  );
+  await nextTurn();
+  assert.equal(malformedReaderCancelled, true);
+  assert.equal(malformedReaderReleased, true);
+  await assert.rejects(
+    perform(rawResponse({ contentLength: "01", body: null })),
+    /malformed Content-Length/u,
+  );
+  await assert.rejects(
+    perform(rawResponse({ contentLength: String(16 * 1024 * 1024 + 1), body: null })),
+    /16777216-byte cap/u,
+  );
+  await assert.rejects(
+    perform(rawResponse({
+      body: byteReader([{ done: false, value: "{}" }]),
+    })),
+    /non-byte chunk/u,
+  );
+
+  let fragmentCount = 0;
+  await assert.rejects(
+    perform(rawResponse({
+      body: byteReader(async () => {
+        fragmentCount += 1;
+        return { done: false, value: new Uint8Array() };
+      }),
+    })),
+    /4096-chunk cap/u,
+  );
+  assert.equal(fragmentCount, 4_097);
+
+  let statusBodyCancelled = false;
+  await assert.rejects(
+    perform({
+      status: 500,
+      headers: { get: () => null },
+      body: {
+        cancel() {
+          statusBodyCancelled = true;
+          return new Promise(() => {});
+        },
+      },
+    }),
+    /expected HTTP 201/u,
+  );
+  await nextTurn();
+  assert.equal(statusBodyCancelled, true);
+});
+
+test("controller JSON streams snapshot closed results and intrinsic Uint8Array bytes", async () => {
+  const load = (read) => createV2GitHubLedgerStore({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+    fetch: async () => githubStreamResponse(read),
+  }).loadLedger({
+    repository_node_id: "R_repo",
+    pull_request_node_id: "PR_7",
+    head_ref_oid: HEAD,
+  });
+
+  let doneReads = 0;
+  let valueReads = 0;
+  let accessorRead = 0;
+  await assert.rejects(
+    load(() => {
+      if (accessorRead++ > 0) return { done: true, value: undefined };
+      return {
+        get done() {
+          doneReads += 1;
+          return doneReads === 1;
+        },
+        get value() {
+          valueReads += 1;
+          return Buffer.from("[]", "utf8");
+        },
+      };
+    }),
+    /malformed read result/u,
+  );
+  assert.equal(doneReads, 0);
+  assert.equal(valueReads, 0);
+
+  const shadowedLength = new Uint8Array(Buffer.from("[]X", "utf8"));
+  Object.defineProperty(shadowedLength, "byteLength", { value: 2 });
+  let shadowRead = 0;
+  await assert.rejects(
+    load(() => shadowRead++ === 0
+      ? { done: false, value: shadowedLength }
+      : { done: true, value: undefined }),
+    /not exact JSON/u,
+  );
+
+  let valueOfCalls = 0;
+  class ReplacingUint8Array extends Uint8Array {
+    valueOf() {
+      valueOfCalls += 1;
+      return new Uint8Array(Buffer.from("[]", "utf8"));
+    }
+  }
+  const replacingChunk = new ReplacingUint8Array(Buffer.from("{}", "utf8"));
+  let replacingRead = 0;
+  await assert.rejects(
+    load(() => replacingRead++ === 0
+      ? { done: false, value: replacingChunk }
+      : { done: true, value: undefined }),
+    /must be an array/u,
+  );
+  assert.equal(valueOfCalls, 0);
+
+  class OversizedUint8Array extends Uint8Array {
+    valueOf() {
+      throw new Error("oversized chunk must not be copied");
+    }
+  }
+  const oversized = new OversizedUint8Array(16 * 1024 * 1024 + 1);
+  await assert.rejects(
+    load(() => ({ done: false, value: oversized })),
+    /16777216-byte cap/u,
+  );
+});
+
+test("effect transport deadline bounds a stalled body and non-settling cancel", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let requestSignal = null;
+  let readStarted = false;
+  let cancelCalled = false;
+  const transport = createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    fetch: async (_url, init) => {
+      requestSignal = init.signal;
+      return {
+        status: 201,
+        headers: {
+          get(name) {
+            return name.toLowerCase() === "date"
+              ? "Wed, 13 Aug 2026 12:00:02 GMT"
+              : null;
+          },
+        },
+        body: {
+          getReader() {
+            return {
+              read() {
+                readStarted = true;
+                return new Promise(() => {});
+              },
+              cancel() {
+                cancelCalled = true;
+                return new Promise(() => {});
+              },
+              releaseLock() {},
+            };
+          },
+        },
+      };
+    },
+  });
+  const operation = transport.performEffect({
+    effect: attemptedStatusEffect(),
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+  });
+  try {
+    for (let index = 0; index < 10 && !readStarted; index += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(readStarted, true);
+    const rejection = assert.rejects(operation, /15000ms request deadline/u);
+    context.mock.timers.tick(15_000);
+    await rejection;
+    await nextTurn();
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(cancelCalled, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("effect transport rejects before deferred abort with an isolated reason", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const events = [];
+  let requestSignal = null;
+  let caught = null;
+  const transport = createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    fetch: (_url, init) => {
+      requestSignal = init.signal;
+      requestSignal.addEventListener("abort", () => {
+        events.push("abort-listener");
+        blockCleanupBriefly();
+        requestSignal.reason.message = "mutated adapter cleanup reason";
+        requestSignal.reason.code = "MUTATED";
+      });
+      return new Promise(() => {});
+    },
+  });
+  const operation = transport.performEffect({
+    effect: attemptedStatusEffect(),
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+  });
+  try {
+    await Promise.resolve();
+    assert.notEqual(requestSignal, null);
+    const observed = operation.then(
+      () => assert.fail("stalled effect request unexpectedly succeeded"),
+      (error) => {
+        caught = error;
+        events.push("rejected");
+      },
+    );
+    context.mock.timers.tick(15_000);
+    await observed;
+    const authoritativeMessage = caught?.message;
+    assert.match(authoritativeMessage ?? "", /15000ms request deadline/u);
+    assert.deepEqual(events, ["rejected"]);
+    assert.equal(requestSignal.aborted, false);
+
+    await nextTurn();
+    assert.deepEqual(events, ["rejected", "abort-listener"]);
+    assert.equal(requestSignal.aborted, true);
+    assert.notEqual(requestSignal.reason, caught);
+    assert.equal(requestSignal.reason.message, "mutated adapter cleanup reason");
+    assert.equal(caught?.message, authoritativeMessage);
+    assert.equal(caught?.code, undefined);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("effect transport monotonic expiry wins before an overdue timer callback", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  let requestSignal = null;
+  let cancelCalled = false;
+  const transport = createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    fetch: async (_url, init) => {
+      requestSignal = init.signal;
+      return {
+        status: 201,
+        headers: {
+          get(name) {
+            return name.toLowerCase() === "date"
+              ? "Wed, 13 Aug 2026 12:00:02 GMT"
+              : null;
+          },
+        },
+        body: {
+          getReader() {
+            return {
+              read() {
+                monotonicNow += 15_001;
+                return Promise.resolve({
+                  done: false,
+                  value: Buffer.from("{}", "utf8"),
+                });
+              },
+              cancel() {
+                cancelCalled = true;
+                return Promise.resolve();
+              },
+              releaseLock() {},
+            };
+          },
+        },
+      };
+    },
+  });
+
+  await assert.rejects(
+    transport.performEffect({
+      effect: attemptedStatusEffect(),
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+    }),
+    /15000ms request deadline/u,
+  );
+  await nextTurn();
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(cancelCalled, true);
+});
+
+test("effect transport rechecks its deadline after strict UTF-8 decoding", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  const originalDecode = TextDecoder.prototype.decode;
+  let advanceOnDecode = true;
+  context.mock.method(TextDecoder.prototype, "decode", function (...args) {
+    const decoded = originalDecode.apply(this, args);
+    if (advanceOnDecode) {
+      advanceOnDecode = false;
+      monotonicNow += 15_001;
+    }
+    return decoded;
+  });
+  let requestSignal = null;
+  const raw = JSON.stringify({
+    id: 901,
+    sha: MERGE,
+    context: "codex/github-review-gate",
+    state: "success",
+  });
+  const transport = createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    fetch: async (_url, init) => {
+      requestSignal = init.signal;
+      return response(
+        201,
+        raw,
+        "Wed, 13 Aug 2026 12:00:02 GMT",
+      );
+    },
+  });
+
+  await assert.rejects(
+    transport.performEffect({
+      effect: attemptedStatusEffect(),
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+    }),
+    /15000ms request deadline/u,
+  );
+  await nextTurn();
+  assert.equal(requestSignal?.aborted, true);
+});
+
+test("effect transport rechecks its deadline after JSON object validation", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  const originalParse = JSON.parse;
+  let advanceOnParse = true;
+  context.mock.method(JSON, "parse", function (...args) {
+    const parsed = originalParse.apply(this, args);
+    if (advanceOnParse) {
+      advanceOnParse = false;
+      monotonicNow += 15_001;
+    }
+    return parsed;
+  });
+  let requestSignal = null;
+  let calls = 0;
+  const transport = createV2GitHubEffectTransport({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    fetch: async (_url, init) => {
+      calls += 1;
+      requestSignal = init.signal;
+      return response(201, JSON.stringify({
+        id: 901,
+        sha: MERGE,
+        context: "codex/github-review-gate",
+        state: "success",
+      }), "Wed, 13 Aug 2026 12:00:02 GMT");
+    },
+  });
+
+  await assert.rejects(
+    transport.performEffect({
+      effect: attemptedStatusEffect(),
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+    }),
+    /15000ms request deadline/u,
+  );
+  await nextTurn();
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(calls, 1);
+});
+
+test("ledger inventory rechecks its deadline after JSON array validation", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  const originalParse = JSON.parse;
+  let advanceOnParse = true;
+  context.mock.method(JSON, "parse", function (...args) {
+    const parsed = originalParse.apply(this, args);
+    if (advanceOnParse) {
+      advanceOnParse = false;
+      monotonicNow += 15_001;
+    }
+    return parsed;
+  });
+  let requestSignal = null;
+  let calls = 0;
+  const store = createV2GitHubLedgerStore({
+    token: "synthetic-token-for-v2-controller-tests-only",
+    restBaseUrl: "https://api.github.test",
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+    fetch: async (_url, init) => {
+      calls += 1;
+      requestSignal = init.signal;
+      return response(200, "[]", "Wed, 13 Aug 2026 12:00:01 GMT");
+    },
+  });
+
+  await assert.rejects(
+    store.loadLedger({
+      repository_node_id: "R_repo",
+      pull_request_node_id: "PR_7",
+      head_ref_oid: HEAD,
+    }),
+    /15000ms request deadline/u,
+  );
+  await nextTurn();
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(calls, 1);
 });
 
 test("production status transport refetch uncertainty never retries its POST", async () => {
@@ -1238,6 +2123,33 @@ test("production status transport rejects a forged handle before any POST", asyn
   assert.equal(fetchCalls, 0);
 });
 
+test("effect ledger comment rejects malformed UTF-8 without rejecting U+FFFD", () => {
+  const ledger = createV2EffectLedger({
+    repository_node_id: "R_\uFFFD",
+    pull_request_node_id: "PR_7",
+    head_ref_oid: HEAD,
+    created_at: TIME,
+  });
+  const rendered = renderV2EffectLedgerComment(ledger);
+  assert.deepEqual(parseV2EffectLedgerComment(rendered), ledger);
+
+  const match = rendered.match(/\n([A-Za-z0-9+/]+={0,2})\n-->\n$/u);
+  assert.notEqual(match, null);
+  const encoded = match[1];
+  const canonicalBytes = Buffer.from(encoded, "base64");
+  const replacement = Buffer.from("\uFFFD", "utf8");
+  const replacementIndex = canonicalBytes.indexOf(replacement);
+  assert.notEqual(replacementIndex, -1);
+  const malformedBytes = Buffer.concat([
+    canonicalBytes.subarray(0, replacementIndex),
+    Buffer.from([0x80]),
+    canonicalBytes.subarray(replacementIndex + replacement.length),
+  ]);
+  const malformed = rendered.replace(encoded, malformedBytes.toString("base64"));
+
+  assert.equal(parseV2EffectLedgerComment(malformed), null);
+});
+
 test("GitHub ledger store persists and exact-refetches monotonic controller state", async () => {
   let comment = null;
   const calls = [];
@@ -1381,9 +2293,65 @@ test("legacy cycle keeps its compatibility order outside production authority", 
     retry_limit: 0,
     attempt_digest: `sha256:${"6".repeat(64)}`,
   };
-  const binding = {
+  const requestRawBody = JSON.stringify({ id: 71 });
+  const bindingNextLedger = {};
+  const bindingWithoutDigest = {
     schema: "codex-review-gate-request-binding-v2",
-    receipt_digest: `sha256:${"7".repeat(64)}`,
+    schema_version: 1,
+    repository: structuredClone(reservation.repository),
+    pull_request: structuredClone(reservation.pull_request),
+    epoch_head_sha: reservation.epoch_head_sha,
+    ordinal: reservation.ordinal,
+    generation_id: reservation.generation_id,
+    generation_kind: reservation.generation_kind,
+    generation_index: reservation.generation_index,
+    recovery_authority: reservation.recovery_authority,
+    scheduler_intent_id: reservation.scheduler_intent_id,
+    intent_id: reservation.intent_id,
+    intent_digest: reservation.intent_digest,
+    reservation_digest: reservation.reservation_digest,
+    body: reservation.body,
+    automatic: true,
+    consumed: true,
+    effect_attempt: structuredClone(attempt),
+    pre_scope_digest: reservation.pre_scope_digest,
+    post_scope_digest: reservation.pre_scope_digest,
+    post_response: {
+      status: 201,
+      server_time: "2026-08-13T12:00:02.000Z",
+      raw_body_sha256: sha256(requestRawBody),
+      id: "71",
+      node_id: "IC_71",
+      url: "https://api.github.test/repos/owner/repo/issues/comments/71",
+      html_url: "https://github.test/owner/repo/pull/7#issuecomment-71",
+      actor: { login: "github-actions[bot]", type: "Bot" },
+      app: null,
+      body: reservation.body,
+      created_at: "2026-08-13T12:00:02.000Z",
+      updated_at: "2026-08-13T12:00:02.000Z",
+    },
+    post_refetch: {
+      response_server_time: "2026-08-13T12:00:03.000Z",
+      raw_body_sha256: `sha256:${"8".repeat(64)}`,
+      artifact_id: "71",
+      artifact_digest: `sha256:${"9".repeat(64)}`,
+    },
+    ledger_update: {
+      previous_ledger_digest: `sha256:${"a".repeat(64)}`,
+      next_ledger: bindingNextLedger,
+      next_ledger_digest: digestDomain(
+        "codex-review-gate-v2-head-ledger",
+        bindingNextLedger,
+      ),
+    },
+    non_replayable_effect_policy: "retry-zero-no-reclaim",
+  };
+  const binding = {
+    ...bindingWithoutDigest,
+    receipt_digest: digestDomain(
+      "codex-review-gate-v2-request-binding",
+      bindingWithoutDigest,
+    ),
   };
   const pendingWrite = statusWrite({
     role: "head-sentinel",
@@ -1467,8 +2435,9 @@ test("legacy cycle keeps its compatibility order outside production authority", 
       },
     }),
   };
-  const stickyBody = "controller sticky body";
-  const stickyDigest = `sha256:${createHash("sha256").update(stickyBody).digest("hex")}`;
+  const stickyBinding = stickyReceiptFixture();
+  const stickyBody = stickyBinding.body;
+  const stickyDigest = stickyBinding.body_sha256;
   const initialInput = {
     phase: "initial",
     status_target_mode: "test-merge-with-head-sentinel",
@@ -1506,10 +2475,16 @@ test("legacy cycle keeps its compatibility order outside production authority", 
       async performEffect({ effect }) {
         events.push(`effect:${effect.kind}:${effect.payload.state ?? effect.payload.method ?? "post"}`);
         if (effect.kind === "commit-status") {
+          const rawBody = JSON.stringify({ id: effect.payload.state });
           return {
             http_status: 201,
             server_time: "2026-08-13T12:00:02.000Z",
-            raw_body: JSON.stringify({ id: effect.payload.state }),
+            raw_body: rawBody,
+            raw_body_sha256: sha256(rawBody),
+            exact_refetch: {
+              server_time: "2026-08-13T12:00:03.000Z",
+              raw_body_sha256: sha256(`[${rawBody}]`),
+            },
             receipt: {
               sha: effect.payload.sha,
               context: effect.payload.context,
@@ -1519,16 +2494,34 @@ test("legacy cycle keeps its compatibility order outside production authority", 
           };
         }
         if (effect.kind === "request-comment") {
+          const rawBody = JSON.stringify({ id: 71 });
           return {
             http_status: 201,
             server_time: "2026-08-13T12:00:02.000Z",
-            raw_body: JSON.stringify({ id: 71 }),
+            raw_body: rawBody,
+            raw_body_sha256: sha256(rawBody),
           };
         }
+        const rawBody = JSON.stringify({
+          id: 72,
+          node_id: "IC_72",
+          body: stickyBody,
+        });
         return {
           http_status: 201,
           server_time: "2026-08-13T12:00:02.000Z",
-          raw_body: JSON.stringify({ id: 72 }),
+          raw_body: rawBody,
+          raw_body_sha256: sha256(rawBody),
+          sticky_identity: {
+            comment_id: "72",
+            comment_node_id: "IC_72",
+            body_sha256: stickyDigest,
+          },
+          exact_refetch: {
+            server_time: "2026-08-13T12:00:03.000Z",
+            raw_body: rawBody,
+            raw_body_sha256: sha256(rawBody),
+          },
         };
       },
     },
@@ -1551,12 +2544,7 @@ test("legacy cycle keeps its compatibility order outside production authority", 
           body_sha256: stickyDigest,
           projection_digest: `sha256:${"e".repeat(64)}`,
         },
-        receipt_builder: async () => ({
-          comment_id: "72",
-          comment_node_id: "IC_72",
-          raw_body_sha256: stickyDigest,
-          binding_sha256: `sha256:${"f".repeat(64)}`,
-        }),
+        receipt_builder: async () => structuredClone(stickyBinding.receipt),
       };
     },
     clock(_phase, floor) { return floor ?? TIME; },
@@ -1577,6 +2565,161 @@ test("legacy cycle keeps its compatibility order outside production authority", 
   assert.equal(outcome.binding_receipt.receipt_digest, binding.receipt_digest);
   assert.equal(outcome.sticky_receipt.comment_id, "72");
   assert.equal(outcome.ledger.effects.every((effect) => effect.state === "bound"), true);
+  for (const effect of outcome.ledger.effects) {
+    assert.equal(effect.effect_id, `v2-effect:${digestDomain(
+      "codex-review-gate-v2-effect-id",
+      {
+        repository_node_id: outcome.ledger.repository_node_id,
+        pull_request_node_id: outcome.ledger.pull_request_node_id,
+        head_ref_oid: outcome.ledger.head_ref_oid,
+        kind: effect.kind,
+        idempotency_key: effect.idempotency_key,
+        payload: effect.payload,
+      },
+    ).slice("sha256:".length)}`);
+  }
+  const requestResponse = outcome.ledger.effects.find((effect) =>
+    effect.kind === "request-comment").response;
+  assert.deepEqual(requestResponse.exact_refetch, {
+    server_time: binding.post_refetch.response_server_time,
+    raw_body_sha256: binding.post_refetch.raw_body_sha256,
+  });
+  const stickyResponse = outcome.ledger.effects.find((effect) =>
+    effect.kind === "sticky-comment").response;
+  assert.deepEqual(stickyResponse.exact_refetch, {
+    server_time: "2026-08-13T12:00:03.000Z",
+    raw_body: JSON.stringify({ id: 72, node_id: "IC_72", body: stickyBody }),
+    raw_body_sha256: sha256(JSON.stringify({
+      id: 72,
+      node_id: "IC_72",
+      body: stickyBody,
+    })),
+  });
+  const tamperedRequestReceipt = structuredClone(outcome.ledger);
+  const alteredBindingReceipt = tamperedRequestReceipt.effects.find((effect) =>
+    effect.kind === "request-comment").response.receipt;
+  alteredBindingReceipt.reservation_digest = `sha256:${"0".repeat(64)}`;
+  const {
+    receipt_digest: _tamperedBindingDigest,
+    ...tamperedBindingBody
+  } = alteredBindingReceipt;
+  alteredBindingReceipt.receipt_digest = digestDomain(
+    "codex-review-gate-v2-request-binding",
+    tamperedBindingBody,
+  );
+  const {
+    ledger_digest: _tamperedLedgerDigest,
+    ...tamperedRequestReceiptBody
+  } = tamperedRequestReceipt;
+  tamperedRequestReceipt.ledger_digest = digestDomain(
+    "codex-review-gate-v2-effect-ledger",
+    tamperedRequestReceiptBody,
+  );
+  assert.throws(
+    () => validateV2EffectLedger(tamperedRequestReceipt),
+    /differs from its reserved effect/u,
+  );
+  const tamperedStickyReceipt = structuredClone(outcome.ledger);
+  const alteredStickyReceipt = tamperedStickyReceipt.effects.find((effect) =>
+    effect.kind === "sticky-comment").response.receipt;
+  alteredStickyReceipt.raw_body_sha256 = `sha256:${"0".repeat(64)}`;
+  alteredStickyReceipt.raw_binding.raw_body_sha256 =
+    alteredStickyReceipt.raw_body_sha256;
+  const {
+    ledger_digest: _tamperedStickyDigest,
+    ...tamperedStickyReceiptBody
+  } = tamperedStickyReceipt;
+  tamperedStickyReceipt.ledger_digest = digestDomain(
+    "codex-review-gate-v2-effect-ledger",
+    tamperedStickyReceiptBody,
+  );
+  assert.throws(
+    () => validateV2EffectLedger(tamperedStickyReceipt),
+    /reserved exact body digest/u,
+  );
+  for (const [kind, suffix] of [
+    ["commit-status", "1"],
+    ["request-comment", "2"],
+    ["sticky-comment", "3"],
+  ]) {
+    const tamperedIdentity = structuredClone(outcome.ledger);
+    tamperedIdentity.effects.find((effect) => effect.kind === kind).effect_id =
+      `v2-effect:${suffix.repeat(64)}`;
+    const {
+      ledger_digest: _tamperedIdentityDigest,
+      ...tamperedIdentityBody
+    } = tamperedIdentity;
+    tamperedIdentity.ledger_digest = digestDomain(
+      "codex-review-gate-v2-effect-ledger",
+      tamperedIdentityBody,
+    );
+    assert.throws(
+      () => validateV2EffectLedger(tamperedIdentity),
+      /effect_id does not bind its exact ledger scope, kind, key, and payload/u,
+      kind,
+    );
+  }
+  for (const [kind, mutate] of [
+    ["commit-status", (effect) => { effect.payload.reason = "forged-reason"; }],
+    ["request-comment", (effect) => {
+      effect.idempotency_key = `post-review-request:${"4".repeat(64)}`;
+    }],
+    ["sticky-comment", (effect) => {
+      effect.idempotency_key = `sticky:${"5".repeat(64)}`;
+    }],
+  ]) {
+    const tamperedTuple = structuredClone(outcome.ledger);
+    mutate(tamperedTuple.effects.find((effect) => effect.kind === kind));
+    const {
+      ledger_digest: _tamperedTupleDigest,
+      ...tamperedTupleBody
+    } = tamperedTuple;
+    tamperedTuple.ledger_digest = digestDomain(
+      "codex-review-gate-v2-effect-ledger",
+      tamperedTupleBody,
+    );
+    assert.throws(
+      () => validateV2EffectLedger(tamperedTuple),
+      /effect_id does not bind its exact ledger scope, kind, key, and payload/u,
+      kind,
+    );
+  }
+  for (const [field, replacement] of [
+    ["repository_node_id", "R_forged"],
+    ["pull_request_node_id", "PR_forged"],
+  ]) {
+    const tamperedScope = structuredClone(outcome.ledger);
+    tamperedScope[field] = replacement;
+    const {
+      ledger_digest: _tamperedScopeDigest,
+      ...tamperedScopeBody
+    } = tamperedScope;
+    tamperedScope.ledger_digest = digestDomain(
+      "codex-review-gate-v2-effect-ledger",
+      tamperedScopeBody,
+    );
+    assert.throws(
+      () => validateV2EffectLedger(tamperedScope),
+      /effect_id does not bind its exact ledger scope, kind, key, and payload/u,
+      field,
+    );
+  }
+  const tamperedHead = structuredClone(outcome.ledger);
+  tamperedHead.effects = tamperedHead.effects.filter((effect) =>
+    effect.kind === "sticky-comment");
+  tamperedHead.head_ref_oid = "f".repeat(40);
+  const {
+    ledger_digest: _tamperedHeadDigest,
+    ...tamperedHeadBody
+  } = tamperedHead;
+  tamperedHead.ledger_digest = digestDomain(
+    "codex-review-gate-v2-effect-ledger",
+    tamperedHeadBody,
+  );
+  assert.throws(
+    () => validateV2EffectLedger(tamperedHead),
+    /effect_id does not bind its exact ledger scope, kind, key, and payload/u,
+  );
 });
 
 test("production OIDC verifier caches trust material and mints one signed token per ledger operation", async () => {
@@ -1985,6 +3128,690 @@ test("OIDC verifier enforces request, byte, and GitHub Date clock bounds before 
     ),
     (error) => error?.code === "OIDC_VERIFIER_TIMEOUT",
   );
+});
+
+test("OIDC HTTP expiry wins without a timer callback and late cancel cannot hang", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  const oidc = oidcFixture();
+  let requestSignal = null;
+  let cancelCalled = false;
+  const verifier = createV2GitHubOidcProvenanceVerifier({
+    environment: oidc.environment,
+    clock: () => Date.parse(TIME),
+    http_limits: { timeout_ms: 10 },
+    fetch(_url, init) {
+      requestSignal = init.signal;
+      monotonicNow += 11;
+      return {
+        status: 200,
+        headers: {
+          get(name) {
+            return name.toLowerCase() === "date"
+              ? "Thu, 13 Aug 2026 12:00:00 GMT"
+              : null;
+          },
+        },
+        body: {
+          cancel() {
+            cancelCalled = true;
+            return new Promise(() => {});
+          },
+        },
+      };
+    },
+  });
+
+  await assert.rejects(
+    verifier.initialize(),
+    (error) => error?.code === "OIDC_HTTP_TIMEOUT",
+  );
+  await nextTurn();
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(cancelCalled, true);
+});
+
+test("OIDC outer timeout rejects before adapter abort and source cleanup", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const events = [];
+  const oidc = oidcFixture();
+  let sourceAbortListener = null;
+  const sourceSignal = {
+    aborted: false,
+    reason: undefined,
+    addEventListener(type, listener) {
+      assert.equal(type, "abort");
+      sourceAbortListener = listener;
+    },
+    removeEventListener(type, listener) {
+      assert.equal(type, "abort");
+      assert.equal(listener, sourceAbortListener);
+      events.push("source-remove");
+      blockCleanupBriefly();
+      throw new Error("source remove failed");
+    },
+  };
+  let requestSignal = null;
+  let caught = null;
+  const verifier = createV2GitHubOidcProvenanceVerifier({
+    environment: oidc.environment,
+    clock: () => Date.parse(TIME),
+    http_limits: { timeout_ms: 100 },
+    fetch(_url, init) {
+      requestSignal = init.signal;
+      requestSignal.addEventListener("abort", () => {
+        events.push("adapter-abort");
+        blockCleanupBriefly();
+        requestSignal.reason.code = "MUTATED";
+        requestSignal.reason.message = "mutated child adapter cleanup reason";
+      });
+      return new Promise(() => {});
+    },
+  });
+  const operation = verifier.verifyWorkflowProvenance(
+    oidcVerifierRequest("mint-and-verify", oidcRequestFixture("7")),
+    oidcVerifierExecutionContext({ signal: sourceSignal, deadline_ms: 10 }),
+  );
+  try {
+    for (let index = 0; index < 10 && requestSignal === null; index += 1) {
+      await Promise.resolve();
+    }
+    assert.notEqual(requestSignal, null);
+    const observed = operation.then(
+      () => assert.fail("stalled OIDC verification unexpectedly succeeded"),
+      (error) => {
+        caught = error;
+        events.push("rejected");
+      },
+    );
+    context.mock.timers.tick(10);
+    await observed;
+    const authoritativeMessage = caught?.message;
+    assert.equal(caught?.code, "OIDC_VERIFIER_TIMEOUT");
+    assert.deepEqual(events, ["rejected"]);
+    assert.equal(requestSignal.aborted, false);
+
+    await nextTurn();
+    assert.equal(events[0], "rejected");
+    assert.equal(events.includes("adapter-abort"), true);
+    assert.equal(events.includes("source-remove"), true);
+    assert.equal(requestSignal.aborted, true);
+    assert.notEqual(requestSignal.reason, caught);
+    assert.notEqual(requestSignal.reason, sourceSignal.reason);
+    assert.equal(requestSignal.reason.message, "mutated child adapter cleanup reason");
+    assert.equal(caught?.code, "OIDC_VERIFIER_TIMEOUT");
+    assert.equal(caught?.message, authoritativeMessage);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("OIDC HTTP hard deadline bounds a non-cooperative body and cancel", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const oidc = oidcFixture();
+  let requestSignal = null;
+  let readStarted = false;
+  let cancelCalled = false;
+  const verifier = createV2GitHubOidcProvenanceVerifier({
+    environment: oidc.environment,
+    clock: () => Date.parse(TIME),
+    http_limits: { timeout_ms: 10 },
+    fetch: async (_url, init) => {
+      requestSignal = init.signal;
+      return {
+        status: 200,
+        headers: {
+          get(name) {
+            return name.toLowerCase() === "date"
+              ? "Thu, 13 Aug 2026 12:00:00 GMT"
+              : null;
+          },
+        },
+        body: {
+          getReader() {
+            return {
+              read() {
+                readStarted = true;
+                return new Promise(() => {});
+              },
+              cancel() {
+                cancelCalled = true;
+                return new Promise(() => {});
+              },
+              releaseLock() {},
+            };
+          },
+        },
+      };
+    },
+  });
+  const operation = verifier.initialize();
+  try {
+    for (let index = 0; index < 10 && !readStarted; index += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(readStarted, true);
+    const rejection = assert.rejects(
+      operation,
+      (error) => error?.code === "OIDC_HTTP_TIMEOUT",
+    );
+    context.mock.timers.tick(10);
+    await rejection;
+    await nextTurn();
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(cancelCalled, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
+test("OIDC HTTP deadline is rechecked after JSON parsing", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  const originalParse = JSON.parse;
+  let advanceOnParse = true;
+  context.mock.method(JSON, "parse", function (...args) {
+    const parsed = originalParse.apply(this, args);
+    if (advanceOnParse) {
+      advanceOnParse = false;
+      monotonicNow += 11;
+    }
+    return parsed;
+  });
+  const oidc = oidcFixture();
+  const verifier = createV2GitHubOidcProvenanceVerifier({
+    fetch: oidc.fetch,
+    environment: oidc.environment,
+    clock: () => Date.parse(TIME),
+    http_limits: { timeout_ms: 10 },
+  });
+
+  await assert.rejects(
+    verifier.initialize(),
+    (error) => error?.code === "OIDC_HTTP_TIMEOUT",
+  );
+  assert.deepEqual(oidc.calls.map((call) => call.kind), ["discovery"]);
+});
+
+test("OIDC outer deadline fences synchronous verification after settlement", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  const originalParse = JSON.parse;
+  let expireDuringVerification = false;
+  context.mock.method(JSON, "parse", function (...args) {
+    const parsed = originalParse.apply(this, args);
+    if (expireDuringVerification) {
+      expireDuringVerification = false;
+      monotonicNow += 11;
+    }
+    return parsed;
+  });
+  const oidc = oidcFixture();
+  const verifier = createV2GitHubOidcProvenanceVerifier({
+    fetch: oidc.fetch,
+    environment: oidc.environment,
+    policy: oidc.policy,
+    clock: () => Date.parse(TIME),
+  });
+  const request = oidcRequestFixture("a");
+  const minted = await verifier.verifyWorkflowProvenance(
+    oidcVerifierRequest("mint-and-verify", request),
+    oidcVerifierExecutionContext(),
+  );
+  expireDuringVerification = true;
+
+  await assert.rejects(
+    verifier.verifyWorkflowProvenance(
+      oidcVerifierRequest(
+        "reverify-stored",
+        request,
+        minted.compact_jwt,
+        minted.receipt,
+      ),
+      oidcVerifierExecutionContext({ deadline_ms: 10 }),
+    ),
+    (error) => error?.code === "OIDC_VERIFIER_TIMEOUT",
+  );
+});
+
+test("minimal scope bounds non-cooperative fetches and reader cleanup", {
+  timeout: 2_000,
+}, async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let requestSignal = null;
+  const stalled = loadV2MinimalLiveScope({
+    fetch(_url, init) {
+      requestSignal = init.signal;
+      return new Promise(() => {});
+    },
+    token: "synthetic-token-for-v2-controller-tests-only",
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+    rest_base_url: "https://api.github.test",
+    graphql_url: "https://api.github.test/graphql",
+    http_limits: { timeout_ms: 10 },
+  });
+  try {
+    await Promise.resolve();
+    const rejection = assert.rejects(
+      stalled,
+      (error) => error?.code === "MINIMAL_SCOPE_TIMEOUT",
+    );
+    context.mock.timers.tick(10);
+    await rejection;
+    await nextTurn();
+    assert.equal(requestSignal?.aborted, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+
+  let readerCancelCalled = false;
+  const oversized = loadV2MinimalLiveScope({
+    fetch: async () => ({
+      status: 200,
+      headers: {
+        get(name) {
+          return name.toLowerCase() === "date"
+            ? "Thu, 13 Aug 2026 12:00:00 GMT"
+            : null;
+        },
+      },
+      body: {
+        getReader() {
+          return {
+            read: async () => ({ done: false, value: Buffer.alloc(17) }),
+            cancel() {
+              readerCancelCalled = true;
+              return new Promise(() => {});
+            },
+            releaseLock() {},
+          };
+        },
+      },
+    }),
+    token: "synthetic-token-for-v2-controller-tests-only",
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+    rest_base_url: "https://api.github.test",
+    graphql_url: "https://api.github.test/graphql",
+    http_limits: { max_response_bytes: 16 },
+  });
+  await assert.rejects(
+    oversized,
+    (error) => error?.code === "MINIMAL_SCOPE_RESPONSE_LIMIT",
+  );
+  await nextTurn();
+  assert.equal(readerCancelCalled, true);
+
+  let fragmentCount = 0;
+  let fragmentCancelCalled = false;
+  await assert.rejects(
+    loadV2MinimalLiveScope({
+      fetch: async () => ({
+        status: 200,
+        headers: {
+          get(name) {
+            return name.toLowerCase() === "date"
+              ? "Thu, 13 Aug 2026 12:00:00 GMT"
+              : null;
+          },
+        },
+        body: {
+          getReader() {
+            return {
+              read() {
+                fragmentCount += 1;
+                return Promise.resolve({
+                  done: false,
+                  value: new Uint8Array(),
+                });
+              },
+              cancel() {
+                fragmentCancelCalled = true;
+                return new Promise(() => {});
+              },
+              releaseLock() {},
+            };
+          },
+        },
+      }),
+      token: "synthetic-token-for-v2-controller-tests-only",
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+      rest_base_url: "https://api.github.test",
+      graphql_url: "https://api.github.test/graphql",
+    }),
+    (error) => error?.code === "MINIMAL_SCOPE_RESPONSE_FRAGMENTED",
+  );
+  assert.equal(fragmentCount, 16_385);
+  await nextTurn();
+  assert.equal(fragmentCancelCalled, true);
+
+  let responseCancelCalled = false;
+  await assert.rejects(
+    loadV2MinimalLiveScope({
+      fetch: async () => ({
+        status: 500,
+        headers: { get: () => null },
+        body: {
+          cancel() {
+            responseCancelCalled = true;
+            return new Promise(() => {});
+          },
+        },
+      }),
+      token: "synthetic-token-for-v2-controller-tests-only",
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+      rest_base_url: "https://api.github.test",
+      graphql_url: "https://api.github.test/graphql",
+    }),
+    (error) => error?.code === "MINIMAL_SCOPE_HTTP_ERROR",
+  );
+  await nextTurn();
+  assert.equal(responseCancelCalled, true);
+});
+
+test("minimal scope rejects before hostile cleanup under a poisoned timer binding", async () => {
+  const events = [];
+  const reader = {
+    read() {
+      return Promise.resolve({ done: "not-boolean", value: undefined });
+    },
+    get cancel() {
+      events.push("reader-cancel-get");
+      return function () {
+        events.push("reader-cancel-call");
+        blockCleanupBriefly();
+        throw new Error("reader cancel failed");
+      };
+    },
+    get releaseLock() {
+      events.push("reader-release-get");
+      return function () {
+        events.push("reader-release-call");
+        blockCleanupBriefly();
+        throw new Error("reader release failed");
+      };
+    },
+  };
+  const body = {
+    getReader() {
+      return reader;
+    },
+    get cancel() {
+      events.push("body-cancel-get");
+      return function () {
+        events.push("body-cancel-call");
+        blockCleanupBriefly();
+        throw new Error("body cancel failed");
+      };
+    },
+  };
+  let caught = null;
+  const originalImmediate = timers.setImmediate;
+  let poisonedSchedulerCalls = 0;
+  timers.setImmediate = (callback) => {
+    poisonedSchedulerCalls += 1;
+    callback();
+    callback();
+    return { poisoned: true };
+  };
+  syncBuiltinESMExports();
+  try {
+    await loadV2MinimalLiveScope({
+      fetch: async () => ({
+        status: 200,
+        headers: {
+          get(name) {
+            return name.toLowerCase() === "date"
+              ? "Thu, 13 Aug 2026 12:00:00 GMT"
+              : null;
+          },
+        },
+        body,
+      }),
+      token: "synthetic-token-for-v2-controller-tests-only",
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+      rest_base_url: "https://api.github.test",
+      graphql_url: "https://api.github.test/graphql",
+    }).then(
+      () => assert.fail("malformed minimal-scope reader unexpectedly succeeded"),
+      (error) => {
+        caught = error;
+        events.push("rejected");
+      },
+    );
+    assert.equal(caught?.code, "MINIMAL_SCOPE_HTTP_ERROR");
+    assert.deepEqual(events, ["rejected"]);
+
+    await nextTurn();
+    assert.deepEqual(events, [
+      "rejected",
+      "reader-cancel-get",
+      "reader-cancel-call",
+      "reader-release-get",
+      "reader-release-call",
+      "body-cancel-get",
+      "body-cancel-call",
+    ]);
+    assert.equal(poisonedSchedulerCalls, 0);
+    assert.equal(caught?.code, "MINIMAL_SCOPE_HTTP_ERROR");
+  } finally {
+    timers.setImmediate = originalImmediate;
+    syncBuiltinESMExports();
+  }
+});
+
+test("minimal scope runs each deferred cleanup callback once", async () => {
+  const originalImmediate = timers.setImmediate;
+  timers.setImmediate = (callback, ...args) => originalImmediate(() => {
+    callback(...args);
+    callback(...args);
+  });
+  syncBuiltinESMExports();
+  let freshLoadMinimalScope;
+  try {
+    const moduleUrl = new URL(
+      "../packages/action/src/v2/workflow-controller.mjs",
+      import.meta.url,
+    );
+    moduleUrl.searchParams.set("test", "repeated-deferred-scheduler");
+    ({ loadV2MinimalLiveScope: freshLoadMinimalScope } = await import(moduleUrl.href));
+  } finally {
+    timers.setImmediate = originalImmediate;
+    syncBuiltinESMExports();
+  }
+
+  let readerCancelCalls = 0;
+  let releaseCalls = 0;
+  let bodyCancelCalls = 0;
+  const body = {
+    getReader() {
+      return {
+        read() {
+          return Promise.resolve({ done: "not-boolean", value: undefined });
+        },
+        cancel() {
+          readerCancelCalls += 1;
+        },
+        releaseLock() {
+          releaseCalls += 1;
+        },
+      };
+    },
+    cancel() {
+      bodyCancelCalls += 1;
+    },
+  };
+
+  await assert.rejects(
+    freshLoadMinimalScope({
+      fetch: async () => ({
+        status: 200,
+        headers: {
+          get(name) {
+            return name.toLowerCase() === "date"
+              ? "Thu, 13 Aug 2026 12:00:00 GMT"
+              : null;
+          },
+        },
+        body,
+      }),
+      token: "synthetic-token-for-v2-controller-tests-only",
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+      rest_base_url: "https://api.github.test",
+      graphql_url: "https://api.github.test/graphql",
+    }),
+    (error) => error?.code === "MINIMAL_SCOPE_HTTP_ERROR",
+  );
+  assert.deepEqual(
+    [readerCancelCalls, releaseCalls, bodyCancelCalls],
+    [0, 0, 0],
+  );
+  await nextTurn();
+  assert.deepEqual(
+    [readerCancelCalls, releaseCalls, bodyCancelCalls],
+    [1, 1, 1],
+  );
+});
+
+test("minimal scope shared reader snapshots descriptors and intrinsic bytes", async () => {
+  const load = (read) => loadV2MinimalLiveScope({
+    fetch: async () => githubStreamResponse(read),
+    token: "synthetic-token-for-v2-controller-tests-only",
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+    rest_base_url: "https://api.github.test",
+    graphql_url: "https://api.github.test/graphql",
+  });
+
+  let doneReads = 0;
+  let valueReads = 0;
+  let accessorRead = 0;
+  await assert.rejects(
+    load(() => {
+      if (accessorRead++ > 0) return { done: true, value: undefined };
+      return {
+        get done() {
+          doneReads += 1;
+          return doneReads === 1;
+        },
+        get value() {
+          valueReads += 1;
+          return Buffer.from("{}", "utf8");
+        },
+      };
+    }),
+    (error) => error?.code === "MINIMAL_SCOPE_HTTP_ERROR",
+  );
+  assert.equal(doneReads, 0);
+  assert.equal(valueReads, 0);
+
+  const shadowedLength = new Uint8Array(Buffer.from("{}X", "utf8"));
+  Object.defineProperty(shadowedLength, "byteLength", { value: 2 });
+  let shadowRead = 0;
+  await assert.rejects(
+    load(() => shadowRead++ === 0
+      ? { done: false, value: shadowedLength }
+      : { done: true, value: undefined }),
+    (error) => error?.code === "MINIMAL_SCOPE_INVALID_JSON",
+  );
+
+  let valueOfCalls = 0;
+  class ReplacingUint8Array extends Uint8Array {
+    valueOf() {
+      valueOfCalls += 1;
+      return new Uint8Array(Buffer.from("{}", "utf8"));
+    }
+  }
+  const replacingChunk = new ReplacingUint8Array(Buffer.from("[]", "utf8"));
+  let replacingRead = 0;
+  await assert.rejects(
+    load(() => replacingRead++ === 0
+      ? { done: false, value: replacingChunk }
+      : { done: true, value: undefined }),
+  );
+  assert.equal(valueOfCalls, 0);
+});
+
+test("minimal scope monotonic expiry cancels a late response without waiting", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  let requestSignal = null;
+  let cancelCalled = false;
+  const operation = loadV2MinimalLiveScope({
+    fetch(_url, init) {
+      requestSignal = init.signal;
+      monotonicNow += 11;
+      return {
+        status: 200,
+        headers: { get: () => null },
+        body: {
+          cancel() {
+            cancelCalled = true;
+            return new Promise(() => {});
+          },
+        },
+      };
+    },
+    token: "synthetic-token-for-v2-controller-tests-only",
+    repository: { owner: "owner", name: "repo" },
+    pull_number: 7,
+    rest_base_url: "https://api.github.test",
+    graphql_url: "https://api.github.test/graphql",
+    http_limits: { timeout_ms: 10 },
+  });
+
+  await assert.rejects(
+    operation,
+    (error) => error?.code === "MINIMAL_SCOPE_TIMEOUT",
+  );
+  await nextTurn();
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(cancelCalled, true);
+});
+
+test("minimal scope deadline is rechecked after JSON parsing", async (context) => {
+  let monotonicNow = 100;
+  context.mock.method(performance, "now", () => monotonicNow);
+  const originalParse = JSON.parse;
+  let advanceOnParse = true;
+  context.mock.method(JSON, "parse", function (...args) {
+    const parsed = originalParse.apply(this, args);
+    if (advanceOnParse) {
+      advanceOnParse = false;
+      monotonicNow += 11;
+    }
+    return parsed;
+  });
+  const fixture = minimalScopeFixture([{}]);
+  let requestSignal = null;
+
+  await assert.rejects(
+    loadV2MinimalLiveScope({
+      fetch(url, init) {
+        requestSignal = init.signal;
+        return fixture.fetch(url, init);
+      },
+      token: "synthetic-token-for-v2-controller-tests-only",
+      repository: { owner: "owner", name: "repo" },
+      pull_number: 7,
+      rest_base_url: "https://api.github.test",
+      graphql_url: "https://api.github.test/graphql",
+      http_limits: { timeout_ms: 10 },
+    }),
+    (error) => error?.code === "MINIMAL_SCOPE_TIMEOUT",
+  );
+  await nextTurn();
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(fixture.events.length, 1);
 });
 
 test("minimal live scope preserves a nullable potential merge receipt", async () => {
@@ -7102,11 +8929,183 @@ function assertFixtureServerClockWithinOidcSkew(github) {
 }
 
 function response(status, body, date) {
+  return new Response(body, {
+    status,
+    headers: {
+      date,
+      "content-length": String(Buffer.byteLength(body)),
+      "content-type": "application/json",
+    },
+  });
+}
+
+function byteReader(source) {
+  let index = 0;
+  return {
+    getReader() {
+      return {
+        async read() {
+          if (typeof source === "function") return source();
+          return source[index++] ?? { done: true, value: undefined };
+        },
+        async cancel() {},
+        releaseLock() {},
+      };
+    },
+  };
+}
+
+function githubStreamResponse(read, status = 200) {
   return {
     status,
-    headers: { get: (name) => name.toLowerCase() === "date" ? date : null },
-    async text() { return body; },
+    headers: {
+      get(name) {
+        return name.toLowerCase() === "date"
+          ? "Wed, 13 Aug 2026 12:00:02 GMT"
+          : null;
+      },
+    },
+    body: {
+      getReader() {
+        return {
+          read,
+          cancel() {},
+          releaseLock() {},
+        };
+      },
+    },
   };
+}
+
+function stickyReceiptFixture({
+  commentId = "72",
+  commentNodeId = "IC_72",
+} = {}) {
+  const reducerReport = {
+    schema_version: 2,
+    selection: {
+      status: "selected",
+      intent: "implicit",
+      reason: "selected current-head provider evidence",
+    },
+    server_enforcement: {
+      status: "enforced",
+      controller_available: true,
+      workflow_present: true,
+      workflow_compatible: true,
+      ruleset_required: true,
+      ruleset_compatible: true,
+      app_bound: true,
+    },
+    review_epoch: {
+      repository_id: "R_database",
+      pull_request_number: 7,
+      base_oid: BASE,
+      head_oid: HEAD,
+      merge_base_oid: MERGE_BASE,
+      merge_oid: MERGE,
+      merge_tree_oid: TREE,
+      merge_parents: [BASE, HEAD],
+      merge_ref_oid: MERGE,
+      mergeable: "MERGEABLE",
+      lifecycle: "open",
+    },
+    request_policy: {
+      status: "compliant",
+      selected_request_id: "987654321",
+      reason: "one controlled exact-scope request",
+      permission_assurance: null,
+      request_time_permission: null,
+      permission_aba_excluded: null,
+      generation_id: "automatic:1",
+      generation_kind: "automatic",
+      generation_index: 1,
+    },
+    provider_profile: "unknown",
+    provider_input_lineage: "unavailable",
+    evidence_basis: null,
+    status_target: {
+      mode: "test-merge-with-head-sentinel",
+      sha: MERGE,
+      context: "codex/github-review-gate",
+    },
+    decision: "pending",
+    freshness_assurance: "point-in-time",
+    snapshot_fingerprint: `sha256:${"7".repeat(64)}`,
+  };
+  const projection = buildStickyAuditProjection({
+    reducer_report: reducerReport,
+    scope: {
+      repository_node_id: "R_repo",
+      pull_request_node_id: "PR_7",
+    },
+    edit: {
+      timestamp: TIME,
+      actor_login: "github-actions[bot]",
+      run_id: "777",
+      run_attempt: 1,
+    },
+  });
+  const rawBinding = bindStickyCommentRawDigest({
+    raw_body: projection.body,
+    repository_node_id: "R_repo",
+    repository_id: reducerReport.review_epoch.repository_id,
+    pull_request_node_id: "PR_7",
+    pull_request_number: 7,
+    base_sha: BASE,
+    head_sha: HEAD,
+    merge_base_sha: MERGE_BASE,
+    test_merge_sha: MERGE,
+    test_merge_tree_sha: TREE,
+    merge_parent_shas: [BASE, HEAD],
+    pull_request_lifecycle: "open",
+    provider_input_lineage: "unavailable",
+    comment_id: commentId,
+    comment_node_id: commentNodeId,
+  });
+  return {
+    body: projection.body,
+    body_sha256: projection.body_sha256,
+    receipt: {
+      comment_id: rawBinding.comment_id,
+      comment_node_id: rawBinding.comment_node_id,
+      raw_body_sha256: rawBinding.raw_body_sha256,
+      binding_sha256: rawBinding.binding_sha256,
+      raw_binding: rawBinding,
+    },
+  };
+}
+
+function attemptedStatusEffect() {
+  return attemptedStatusLedger().effects[0];
+}
+
+function attemptedStatusLedger() {
+  const initial = createV2EffectLedger({
+    repository_node_id: "R_repo",
+    pull_request_node_id: "PR_7",
+    head_ref_oid: HEAD,
+    created_at: TIME,
+  });
+  const reserved = reserveV2Effect({
+    ledger: initial,
+    kind: "commit-status",
+    idempotency_key: `status:${"9".repeat(64)}`,
+    payload: {
+      role: "primary-terminal",
+      sha: MERGE,
+      context: "codex/github-review-gate",
+      state: "success",
+      reason: "decision-clean",
+      idempotency_key: `status:${"9".repeat(64)}`,
+    },
+    recorded_at: TIME,
+  });
+  return markV2EffectAttempted({
+    ledger: reserved,
+    effect_id: reserved.effects[0].effect_id,
+    attempted_at: "2026-08-13T12:00:01.000Z",
+  });
 }
 
 function reservationFixture() {
@@ -7117,6 +9116,10 @@ function reservationFixture() {
     pull_request: { number: 7, node_id: "PR_7" },
     epoch_head_sha: HEAD,
     ordinal: 1,
+    generation_id: "automatic:1",
+    generation_kind: "automatic",
+    generation_index: 1,
+    recovery_authority: null,
     scheduler_intent_id: "scheduler-intent",
     intent_id: "v2-request:intent",
     intent_digest: `sha256:${"2".repeat(64)}`,

@@ -19,10 +19,6 @@ const rootCallerWorkflowPath = join(
   repoRoot,
   ".github/workflows/codex-review-gate.yml",
 );
-const requiredCiRouterWorkflowPath = join(
-  repoRoot,
-  ".github/workflows/required-ci-router.yml",
-);
 const templateWorkflowPath = join(
   repoRoot,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
@@ -42,19 +38,6 @@ const CANONICAL_CALL =
 const CANONICAL_JOB_WORKFLOW_REF =
   `${CANONICAL_ACTION_REPOSITORY}/${CANONICAL_WORKFLOW_FILE_PATH}` +
   "@refs/tags/v1";
-const REQUIRED_CI_ROUTER_CALLS = new Set([
-  "Joey-Tools/codex-review-gate/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-apple-notes-toolkit/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-debug-triage/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-personal-sync/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-project-journal/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-private-workflows/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-review-workflows/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-rollout-backup/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-toolbox/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-waited-delivery/.github/workflows/required-ci.yml@master",
-  "Joey-Tools/codex-workflow-hygiene/.github/workflows/required-ci.yml@master",
-]);
 const EXPECTED_CALLED_JOB_IF = `
 \${{
   (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
@@ -715,7 +698,6 @@ test("every external source action is pinned to one literal lower-case full SHA"
   ];
   let externalUseCount = 0;
   let canonicalCallerUseCount = 0;
-  const requiredCiRouterCalls = new Set();
 
   for (const path of [...new Set(files)]) {
     const label = relative(repoRoot, path);
@@ -731,14 +713,6 @@ test("every external source action is pinned to one literal lower-case full SHA"
         canonicalCallerUseCount += 1;
         continue;
       }
-      if (
-        path === requiredCiRouterWorkflowPath &&
-        REQUIRED_CI_ROUTER_CALLS.has(target)
-      ) {
-        requiredCiRouterCalls.add(target);
-        continue;
-      }
-
       externalUseCount += 1;
       assert.match(
         target,
@@ -756,11 +730,6 @@ test("every external source action is pinned to one literal lower-case full SHA"
     canonicalCallerUseCount,
     2,
     "only the source and template callers may use the canonical floating selector",
-  );
-  assert.deepEqual(
-    requiredCiRouterCalls,
-    REQUIRED_CI_ROUTER_CALLS,
-    "only the exact protected-default required-CI calls may use @master",
   );
 });
 
