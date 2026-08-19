@@ -3,7 +3,7 @@ id: 20260813-7bf930a-action-v2-release-pipeline
 title: Action v2 Release Pipeline
 status: blocked
 created: 2026-08-13
-updated: 2026-08-18
+updated: 2026-08-19
 branch: wip/codex-review-v2
 pr: https://github.com/Joey-Tools/codex-review-gate/pull/33
 supersedes: [20260518-9a806cf-release-automation]
@@ -54,18 +54,19 @@ superseded_by:
 - Formal single review found that the ordinary and scheduled controller jobs shared the ledger's exact five-minute worst-case budget, so both now use 10-minute job timeouts. Tests bind their shared timeout and require it to exceed the five-minute ledger budget, preserving a five-minute outer margin.
 - Required CI retains the legacy `check:state-machine` and `test:state-machine` gates and adds `npm run test:v2`; the final-byte discovery run completed 904/904 tests green in 3,348,998.49 ms.
 - On GitHub.com, `job.workflow_repository` and `job.workflow_sha` are the official called-workflow identity fields. actionlint 1.7.12 diagnoses them only because its expression schema lags GitHub's current context, so that diagnostic is schema lag rather than an unresolved workflow defect.
+- The final current-byte audits closed every previously reported freeze-v2/v3/v5, reducer/projector, ledger/scope, incarnation, runner/receipt, and public-report contract finding without identifying another P0-P2 issue. The separately coupled Waited Required-CI hardening is independently merge-ready at signed head `6699f93084c1af5264402bf70cb0d95169baf5ae`: its ordinary and strict-live CI jobs, current-head GitHub Codex review gate, and final unresolved-thread scan are all clean.
 
 ## Blockers
 - The source repository does not currently expose `ACTION_REPO_PUSH_TOKEN_V2`; the only listed repository secret is the retired `ACTION_REPO_PUSH_TOKEN`. Organization-secret visibility could not be verified because the current identity received HTTP 403.
 - `ACTION_RELEASE_SIGNING_PRIVATE_KEY_V2` and `ACTION_RELEASE_SIGNING_FINGERPRINT_V2` are not currently configured or verified.
 - The target `master` and `v2*` ruleset/maintenance policy, including the selected token's narrow bypass or maintenance role, remains external configuration that must be proved before publication.
-- The post-review Waited Required-CI hardening and its signed follow-up are complete. The final current-byte source broad gate, signed source follow-up, fresh formal reviews over both complete ranges, PR reviews, and CI completion remain pending before any release workflow may be dispatched.
+- The source implementation and its Waited Required-CI prerequisite are complete delivery slices, but neither completion authorizes a release dispatch while the publication and activation blockers in this section remain open.
 - Production activation remains externally and architecturally blocked: this release has no immutable trusted wait-completion producer/consumer DAG or Environment-bound controller OIDC authority, no live-canary receipt chain, and no stable persisted post-request wait origin. Caller-owned outer wait-job outputs, route boundaries, wake-up hints, `due_at`, and later server time cannot substitute for those authorities.
 - No v2 target publication, provenance admission, live canary, consumer deployment, environment-rule verification, or required-context switch has been performed by this local work.
 
 ## Next Steps
 - Configure and independently verify the protected environment, fine-grained PAT or GitHub App credential, OpenPGP signing identity, and target ruleset without weakening tag immutability.
-- Create and verify the signed source follow-up, retain the verified Waited Required-CI follow-up `e47a84eab1ce39eed480a4f3a132943ea83841f4`, complete fresh formal review over each original-base-to-final-head range, and close the authorized PR/CI loops without touching unrelated PRs.
+- Keep the reviewed source and Waited delivery heads immutable while the publication and activation blockers are closed. Any later source change must repeat the complete local admission, signed-commit verification, fresh formal review, PR review, and current-head CI loop.
 - Re-run read-only `scripts/release-action-subtree.sh --check`, then manually approve exactly one fixed v2.0.0 publication only when every publication blocker is closed. Keep the source-root `@v1` caller and its required context unchanged.
 - After publication, independently download and verify the exact provenance and remote v2 commit/tags/signatures before admitting its 40-hex action commit as the sole production selector.
 - In a separate reviewed activation, configure and API-verify all three exact 15-minute environment rules, deploy the complete exact-SHA graph to a non-required live canary, and prove the released workflow identity, waits, receipts, and `codex/github-review-gate` status.

@@ -3782,7 +3782,7 @@ test("artifact binding A to B to A quarantines every incomplete A1 prefix",
           workflowCommandHandle: a2Run.workflowCommandHandle,
           requestCreatedAt: setup.requestCreatedAt,
           findingCreatedAt: setup.findingCreatedAt,
-          findingLine: 2,
+          findingLine: 1,
           historicalSnapshots: setup.historicalSnapshots,
           requireArtifactBinding: false,
           expectRecoveryHandle: false,
@@ -3799,6 +3799,11 @@ test("artifact binding A to B to A quarantines every incomplete A1 prefix",
           entry.commit_sha === a2Intent.intent_append_receipt.commit_sha);
         assert.notEqual(a2Entry, undefined);
         assert.notEqual(a2Entry.commit_sha, a1Intent.commit_sha);
+        assert.equal(
+          a2Entry.envelope.payload.action.candidate_set_digest,
+          a1Intent.envelope.payload.action.candidate_set_digest,
+          "A1 and A2 must retain the same candidate set before identity salting",
+        );
         assert.notEqual(
           a2Entry.envelope.effect_id,
           a1Intent.envelope.effect_id,
@@ -3848,7 +3853,7 @@ test("artifact binding A to B to A quarantines every incomplete A1 prefix",
           workflowCommandHandle: a2Run.workflowCommandHandle,
           requestCreatedAt: setup.requestCreatedAt,
           findingCreatedAt: setup.findingCreatedAt,
-          findingLine: 2,
+          findingLine: 1,
           historicalSnapshots: [
             ...setup.historicalSnapshots,
             a2Observation.snapshots,
