@@ -582,17 +582,16 @@ test("canonical reusable identity keeps the caller workflow binding independent"
   }
 });
 
-test("receipt provenance variables stay bound to GitHub server contexts", async () => {
+test("the live v2 plan adapter binds only its closed inputs and GitHub API endpoints", async () => {
   const actionDefinition = await readFile(actionDefinitionPath, "utf8");
   const expectedBindings = [
-    "CODEX_REVIEW_GATE_ACTION_REPOSITORY: ${{ github.action_repository }}",
-    "CODEX_REVIEW_GATE_ACTION_REF: ${{ github.action_ref }}",
-    "CODEX_REVIEW_GATE_WORKFLOW_REF: ${{ github.workflow_ref }}",
-    "CODEX_REVIEW_GATE_WORKFLOW_SHA: ${{ github.workflow_sha }}",
-    "CODEX_REVIEW_GATE_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}",
-    "CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}",
-    "CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}",
-    "CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}",
+    "V2_GITHUB_TOKEN: ${{ inputs.github-token }}",
+    "V2_PULL_REQUEST: ${{ inputs.pull-request }}",
+    "V2_OPERATION: ${{ inputs.operation }}",
+    "V2_STATUS_TARGET_MODE: ${{ inputs.status-target-mode }}",
+    "V2_OPERATION_INPUT_PATH: ${{ inputs.operation-input-path }}",
+    "V2_REST_BASE_URL: ${{ github.api_url }}",
+    "V2_GRAPHQL_URL: ${{ github.graphql_url }}",
   ];
 
   for (const binding of expectedBindings) {
@@ -602,14 +601,18 @@ test("receipt provenance variables stay bound to GitHub server contexts", async 
       `action.yml must bind ${binding}`,
     );
   }
-});
-
-test("the action disables producer receipts outside GitHub.com", async () => {
-  const actionDefinition = await readFile(actionDefinitionPath, "utf8");
+  assert.doesNotMatch(actionDefinition, /CODEX_REVIEW_GATE_/u);
   assert.match(
     actionDefinition,
-    /CODEX_REVIEW_GATE_RECEIPT_PATH: \$\{\{ github\.server_url == 'https:\/\/github\.com'/,
+    /run: node "\$GITHUB_ACTION_PATH\/src\/v2\/action\.mjs"/u,
   );
+});
+
+test("the v2 action omits v1 receipts while the retained v1 gate disables them off GitHub.com", async () => {
+  const actionDefinition = await readFile(actionDefinitionPath, "utf8");
+  assert.doesNotMatch(actionDefinition, /CODEX_REVIEW_GATE_RECEIPT_PATH/u);
+  assert.doesNotMatch(actionDefinition, /src\/gate\.mjs/u);
+  assert.match(actionDefinition, /src\/v2\/action\.mjs/u);
 
   const { result, receiptRaw, output } = await runReceiptGate({
     actionRef: ACTION_SHA,

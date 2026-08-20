@@ -11,6 +11,10 @@ const calledWorkflowPath = join(
   actionRoot,
   ".github/workflows/codex-review-gate.yml",
 );
+const reconcileWorkflowPath = join(
+  actionRoot,
+  ".github/workflows/codex-review-gate-reconcile.yml",
+);
 const rootCallerWorkflowPath = join(
   repoRoot,
   ".github/workflows/codex-review-gate.yml",
@@ -19,6 +23,12 @@ const templateWorkflowPath = join(
   repoRoot,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
 );
+const v2ConsumerDocs = [
+  ["English README", join(actionRoot, "README.md")],
+  ["Chinese README", join(actionRoot, "README.zh-CN.md")],
+  ["English cookbook", join(actionRoot, "COOKBOOK.md")],
+  ["Chinese cookbook", join(actionRoot, "COOKBOOK.zh-CN.md")],
+];
 
 const CANONICAL_ACTION_REPOSITORY = "JoeyTeng/codex-review-gate-action";
 const CANONICAL_WORKFLOW_FILE_PATH =
@@ -64,7 +74,95 @@ const EXPECTED_CALLED_JOB_IF = `
 const CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262";
 const CHECKOUT_TARGET = `actions/checkout@${CHECKOUT_SHA}`;
 const CHECKOUT_PATH = ".codex-review-gate-action";
-const LOCAL_ACTION = `./${CHECKOUT_PATH}`;
+const V2_PUBLIC_WORKFLOW_CALL =
+  "Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2";
+
+const V2_WORKFLOW_INPUTS = {
+  "pull-request": { required: "false", type: "string", default: '""' },
+  "selection-policy": { required: "true", type: "string" },
+  "controller-mode": {
+    required: "false",
+    type: "string",
+    default: "ordinary",
+  },
+  "observation-boundary": {
+    required: "false",
+    type: "string",
+    default: "initial",
+  },
+};
+const V2_WORKFLOW_OUTPUTS = [
+  "decision",
+  "report-path",
+  "status-plan-path",
+  "reservation-path",
+  "intent-path",
+  "binding-receipt-path",
+  "sticky-receipt-path",
+  "ledger-receipt-path",
+  "due-at",
+  "wakeup-hints",
+];
+const V2_ACTION_OUTPUTS = [
+  "decision",
+  "result-path",
+  "report-path",
+  "status-plan-path",
+  "reservation-path",
+  "intent-path",
+  "binding-receipt-path",
+];
+const V2_WORKFLOW_JOBS = [
+  "codex-review-gate",
+  "schedule-dispatch",
+  "scheduled-pull-requests",
+];
+
+function expectedControllerEnvironment({
+  inputPath,
+  outputPath,
+  route,
+  observationBoundary,
+  pullRequest,
+  dispatchBinding,
+}) {
+  return {
+    GITHUB_TOKEN: "${{ github.token }}",
+    GITHUB_REPOSITORY: "${{ github.repository }}",
+    GITHUB_EVENT_NAME: "${{ github.event_name }}",
+    GITHUB_REF: "${{ github.ref }}",
+    GITHUB_SHA: "${{ github.sha }}",
+    GITHUB_RUN_ID: "${{ github.run_id }}",
+    GITHUB_RUN_ATTEMPT: "${{ github.run_attempt }}",
+    GITHUB_ACTOR_ID: "${{ github.actor_id }}",
+    GITHUB_WORKFLOW_REF: "${{ github.workflow_ref }}",
+    GITHUB_WORKFLOW_SHA: "${{ github.workflow_sha }}",
+    V2_CONTROLLER_EVENT_PATH: "${{ github.event_path }}",
+    V2_CONTROLLER_INPUT_PATH: inputPath,
+    V2_CONTROLLER_OUTPUT_PATH: outputPath,
+    V2_CONTROLLER_ROUTE: route,
+    V2_CONTROLLER_OBSERVATION_BOUNDARY: observationBoundary,
+    V2_CONTROLLER_PULL_REQUEST: pullRequest,
+    V2_CONTROLLER_DISPATCH_BINDING: dispatchBinding,
+    V2_SELECTION_POLICY: "${{ inputs.selection-policy }}",
+    V2_STATUS_CONTEXT: "codex/github-review-gate",
+    V2_STATUS_TARGET_MODE: "test-merge-with-head-sentinel",
+    V2_PUBLIC_WAIT_PREFLIGHT_REQUIRED: '"true"',
+    V2_PUBLIC_WAIT_MINUTES: '"15"',
+    V2_PUBLIC_WAIT_ENVIRONMENT_INITIAL:
+      "codex-review-gate-public-initial-15m",
+    V2_PUBLIC_WAIT_ENVIRONMENT_POST_REQUEST:
+      "codex-review-gate-public-post-request-15m",
+    V2_PUBLIC_WAIT_ENVIRONMENT_NO_START:
+      "codex-review-gate-public-no-start-15m",
+    V2_EXPECTED_WORKFLOW_REPOSITORY: "${{ job.workflow_repository }}",
+    V2_ACTUAL_WORKFLOW_REPOSITORY: "${{ job.workflow_repository }}",
+    V2_EXPECTED_WORKFLOW_SHA: "${{ job.workflow_sha }}",
+    V2_EXPECTED_WORKFLOW_PATH:
+      ".github/workflows/codex-review-gate.yml",
+    V2_CHECKED_OUT_RELEASE_SHA: "${{ steps.checkout.outputs.commit }}",
+  };
+}
 
 const RECEIPT_OUTPUTS = {
   "producer-receipt-artifact-id": "artifact-id",
@@ -159,7 +257,22 @@ test("the activated source and template callers contain only the canonical reusa
   }
 });
 
-test("the published workflow source is workflow_call-only and preserves receipt outputs", () => {
+test("the published v2 workflow is workflow_call-only and exposes only controller outputs", () => {
+  const gitLedger = readFileSync(
+    join(actionRoot, "src/v2/git-ledger.mjs"),
+    "utf8",
+  );
+  const transactionBudget = gitLedger.match(
+    /const MAX_V2_GIT_LEDGER_CHECKPOINT_TRANSACTION_MS = (\d+) \* 60 \* 1000;/u,
+  );
+  assert.ok(
+    transactionBudget,
+    "the workflow timeout contract must remain bound to the Git-ledger transaction budget",
+  );
+  const transactionBudgetMilliseconds =
+    Number.parseInt(transactionBudget[1], 10) * 60 * 1000;
+  assert.equal(transactionBudgetMilliseconds, 300_000);
+
   assert.equal(
     relative(actionRoot, calledWorkflowPath),
     CANONICAL_WORKFLOW_FILE_PATH,
@@ -167,107 +280,409 @@ test("the published workflow source is workflow_call-only and preserves receipt 
   );
 
   const called = readYamlLines(calledWorkflowPath);
-  assert.deepEqual(directKeys(rootBlock(called)), ["name", "on", "jobs"]);
+  const root = rootBlock(called);
+  assert.deepEqual(directKeys(root), ["name", "on", "permissions", "jobs"]);
+  assert.equal(directScalar(root, "name"), "Codex Review Gate v2");
 
-  const on = childBlock(rootBlock(called), "on");
+  const on = childBlock(root, "on");
   assert.deepEqual(directKeys(on), ["workflow_call"]);
   const workflowCall = childBlock(on, "workflow_call");
-  assert.deepEqual(directKeys(workflowCall), ["outputs"]);
-  const workflowOutputs = childBlock(workflowCall, "outputs");
-  assert.deepEqual(directKeys(workflowOutputs), Object.keys(RECEIPT_OUTPUTS));
+  assert.deepEqual(directKeys(workflowCall), ["inputs", "outputs"]);
 
-  const jobs = childBlock(rootBlock(called), "jobs");
-  assert.deepEqual(directKeys(jobs), ["codex-review-gate"]);
-  const job = childBlock(jobs, "codex-review-gate");
-  assert.deepEqual(directKeys(job), [
-    "name",
+  const workflowInputs = childBlock(workflowCall, "inputs");
+  assert.deepEqual(directKeys(workflowInputs), Object.keys(V2_WORKFLOW_INPUTS));
+  for (const [name, expected] of Object.entries(V2_WORKFLOW_INPUTS)) {
+    const input = childBlock(workflowInputs, name);
+    const expectedKeys = ["description", "required", "type"];
+    if (Object.hasOwn(expected, "default")) expectedKeys.push("default");
+    assert.deepEqual(directKeys(input), expectedKeys);
+    const actual = scalarMapping(input);
+    const selected = { required: actual.required, type: actual.type };
+    if (Object.hasOwn(expected, "default")) selected.default = actual.default;
+    assert.deepEqual(selected, expected);
+  }
+
+  const workflowOutputs = childBlock(workflowCall, "outputs");
+  assert.deepEqual(directKeys(workflowOutputs), V2_WORKFLOW_OUTPUTS);
+  for (const name of V2_WORKFLOW_OUTPUTS) {
+    const output = childBlock(workflowOutputs, name);
+    assert.deepEqual(directKeys(output), ["description", "value"]);
+    assert.equal(
+      directScalar(output, "value"),
+      `\${{ jobs.codex-review-gate.outputs.${name} }}`,
+    );
+  }
+
+  assert.deepEqual(scalarMapping(childBlock(root, "permissions")), {
+    contents: "write",
+    "id-token": "write",
+    issues: "write",
+    "pull-requests": "write",
+    statuses: "write",
+  });
+
+  const jobs = childBlock(root, "jobs");
+  assert.deepEqual(directKeys(jobs), V2_WORKFLOW_JOBS);
+  const ordinary = childBlock(jobs, "codex-review-gate");
+  assert.deepEqual(directKeys(ordinary), [
     "if",
+    "name",
     "runs-on",
     "timeout-minutes",
     "outputs",
     "steps",
   ]);
-  assert.equal(directFoldedScalar(job, "if"), EXPECTED_CALLED_JOB_IF);
-  assert.doesNotMatch(blockText(job), /^\s+(?:permissions|secrets):/m);
-  const runner = directScalar(job, "runs-on");
   assert.equal(
-    runner,
-    "ubuntu-slim",
-    "the reusable producer must run on the GitHub-hosted canary runner",
+    directScalar(ordinary, "if"),
+    "inputs.controller-mode != 'scan-all-open'",
   );
-  assert.doesNotMatch(
-    runner,
-    /\$\{\{|\b(?:vars|inputs|matrix)\./u,
-    "caller-controlled contexts must not select the reusable producer runner",
+  assert.equal(
+    directScalar(ordinary, "name"),
+    "codex/github-review-gate controller",
   );
+  const ordinaryTimeout = directScalar(ordinary, "timeout-minutes");
+  assert.equal(ordinaryTimeout, "10");
+  const ordinaryTimeoutMinutes = Number.parseInt(ordinaryTimeout, 10);
+  assert.equal(ordinaryTimeoutMinutes, 10);
 
-  const jobOutputs = childBlock(job, "outputs");
-  assert.deepEqual(directKeys(jobOutputs), Object.keys(RECEIPT_OUTPUTS));
-  const action = readYamlLines(actionDefinitionPath);
-  const actionOutputs = childBlock(rootBlock(action), "outputs");
-  assert.deepEqual(directKeys(actionOutputs), Object.keys(RECEIPT_OUTPUTS));
-
-  for (const [name, uploadOutput] of Object.entries(RECEIPT_OUTPUTS)) {
-    assert.equal(
-      directScalar(childBlock(workflowOutputs, name), "value"),
-      `\${{ jobs.codex-review-gate.outputs.${name} }}`,
-    );
+  const jobOutputs = childBlock(ordinary, "outputs");
+  assert.deepEqual(directKeys(jobOutputs), V2_WORKFLOW_OUTPUTS);
+  for (const name of V2_WORKFLOW_OUTPUTS) {
     assert.equal(
       directScalar(jobOutputs, name),
-      `\${{ steps.gate.outputs.${name} }}`,
+      `\${{ steps.controller.outputs.${name} }}`,
     );
+  }
+
+  const coordinator = childBlock(jobs, "schedule-dispatch");
+  assert.deepEqual(directKeys(coordinator), [
+    "if",
+    "name",
+    "runs-on",
+    "timeout-minutes",
+    "outputs",
+    "steps",
+  ]);
+  assert.equal(
+    directScalar(coordinator, "if"),
+    "inputs.controller-mode == 'scan-all-open'",
+  );
+  assert.equal(
+    directScalar(coordinator, "name"),
+    "codex/github-review-gate schedule coordinator",
+  );
+  assert.equal(directScalar(coordinator, "timeout-minutes"), "15");
+  assert.deepEqual(scalarMapping(childBlock(coordinator, "outputs")), {
+    matrix: "${{ steps.controller.outputs.matrix }}",
+  });
+
+  const scheduled = childBlock(jobs, "scheduled-pull-requests");
+  assert.deepEqual(directKeys(scheduled), [
+    "if",
+    "name",
+    "needs",
+    "runs-on",
+    "timeout-minutes",
+    "strategy",
+    "steps",
+  ]);
+  assert.equal(
+    directScalar(scheduled, "if"),
+    "inputs.controller-mode == 'scan-all-open'",
+  );
+  assert.equal(
+    directScalar(scheduled, "name"),
+    "codex/github-review-gate scheduled PR ${{ matrix.pull_request }}",
+  );
+  assert.equal(directScalar(scheduled, "needs"), "schedule-dispatch");
+  const scheduledTimeout = directScalar(scheduled, "timeout-minutes");
+  assert.equal(scheduledTimeout, "10");
+  const scheduledTimeoutMinutes = Number.parseInt(scheduledTimeout, 10);
+  assert.equal(scheduledTimeoutMinutes, 10);
+  assert.equal(
+    scheduledTimeoutMinutes,
+    ordinaryTimeoutMinutes,
+    "ordinary and scheduled PR controllers must share one execution budget",
+  );
+  assert.ok(
+    ordinaryTimeoutMinutes * 60 * 1000 > transactionBudgetMilliseconds,
+    "the controller job must outlive one worst-case Git-ledger transaction",
+  );
+  assert.equal(
+    ordinaryTimeoutMinutes * 60 * 1000 - transactionBudgetMilliseconds,
+    300_000,
+    "the job must retain five minutes for checkout, preflight, effects, and lease cleanup",
+  );
+  assert.deepEqual(scalarMapping(childBlock(scheduled, "strategy")), {
+    "fail-fast": "false",
+    "max-parallel": "1",
+    matrix: "${{ fromJSON(needs.schedule-dispatch.outputs.matrix) }}",
+  });
+
+  for (const [name, job] of [
+    ["codex-review-gate", ordinary],
+    ["schedule-dispatch", coordinator],
+    ["scheduled-pull-requests", scheduled],
+  ]) {
     assert.equal(
-      directScalar(childBlock(actionOutputs, name), "value"),
-      `\${{ steps.upload-producer-receipt.outputs.${uploadOutput} }}`,
+      directScalar(job, "runs-on"),
+      "ubuntu-slim",
+      `${name} must use the fixed GitHub-hosted canary runner`,
+    );
+    assert.doesNotMatch(
+      directScalar(job, "runs-on"),
+      /\$\{\{|\b(?:vars|inputs|matrix)\./u,
+      `${name} runner must not be caller-selected`,
+    );
+    assert.doesNotMatch(blockText(job), /^\s+(?:permissions|secrets):/m);
+  }
+});
+
+test("complete v2 consumer examples pass every required workflow_call input", () => {
+  const called = readYamlLines(calledWorkflowPath);
+  const workflowInputs = childBlock(
+    childBlock(childBlock(rootBlock(called), "on"), "workflow_call"),
+    "inputs",
+  );
+  const requiredInputs = directKeys(workflowInputs).filter((name) =>
+    directScalar(childBlock(workflowInputs, name), "required") === "true"
+  );
+  assert.ok(
+    requiredInputs.includes("selection-policy"),
+    "the source workflow must keep selection-policy required",
+  );
+
+  for (const [label, path] of v2ConsumerDocs) {
+    const examples = [];
+    for (const source of markdownYamlBlocks(readFileSync(path, "utf8"))) {
+      if (!source.includes(V2_PUBLIC_WORKFLOW_CALL)) continue;
+      const root = rootBlock(yamlLines(source));
+      if (!directKeys(root).includes("jobs")) continue;
+      const jobs = childBlock(root, "jobs");
+      for (const jobName of directKeys(jobs)) {
+        const job = childBlock(jobs, jobName);
+        if (!directKeys(job).includes("uses")) continue;
+        if (directScalar(job, "uses") !== V2_PUBLIC_WORKFLOW_CALL) continue;
+        examples.push({ jobName, job });
+      }
+    }
+
+    assert.equal(
+      examples.length,
+      1,
+      `${label} must contain exactly one complete public v2 consumer example`,
+    );
+    const [{ jobName, job }] = examples;
+    assert.ok(
+      directKeys(job).includes("with"),
+      `${label} ${jobName} must pass reusable-workflow inputs`,
+    );
+    const inputs = childBlock(job, "with");
+    for (const name of requiredInputs) {
+      assert.equal(
+        directKeys(inputs).filter((candidate) => candidate === name).length,
+        1,
+        `${label} ${jobName} must pass required input ${name} exactly once`,
+      );
+    }
+    assert.equal(
+      directScalar(inputs, "selection-policy"),
+      "joey-default",
+      `${label} ${jobName} must select the released joey-default policy`,
     );
   }
 });
 
-test("the called workflow checks out only its exact resolved release and runs it locally", () => {
-  const lines = readYamlLines(calledWorkflowPath);
-  const job = childBlock(
-    childBlock(rootBlock(lines), "jobs"),
-    "codex-review-gate",
-  );
-  const steps = childBlock(job, "steps");
-  const items = listItemBlocks(steps);
+test("v2 reconcile filters non-PR issue comments before the natural needs chain", () => {
+  const reconcile = readYamlLines(reconcileWorkflowPath);
+  const jobs = childBlock(rootBlock(reconcile), "jobs");
+  const expectedChain = [
+    "initial",
+    "public-initial-wait",
+    "after-public-initial",
+    "public-post-request-wait",
+    "after-public-post-request",
+    "public-no-start-wait",
+    "after-public-no-start",
+  ];
+  assert.deepEqual(directKeys(jobs), expectedChain);
 
-  assert.equal(items.length, 2);
-  assert.deepEqual(itemKeys(items[0]), ["name", "id", "uses", "with"]);
-  assert.equal(itemScalar(items[0], "id"), "checkout");
-  assert.equal(itemScalar(items[0], "uses"), CHECKOUT_TARGET);
-  assert.deepEqual(scalarMapping(childBlock(items[0], "with")), {
-    repository: "${{ job.workflow_repository }}",
-    ref: "${{ job.workflow_sha }}",
-    path: CHECKOUT_PATH,
-    "persist-credentials": "false",
-  });
-
-  assert.deepEqual(
-    itemKeys(items[1]),
-    ["name", "id", "uses", "env", "with"],
-  );
-  assert.equal(itemScalar(items[1], "id"), "gate");
-  assert.equal(itemScalar(items[1], "uses"), LOCAL_ACTION);
-  assert.deepEqual(scalarMapping(childBlock(items[1], "env")), {
-    CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA:
-      "${{ steps.checkout.outputs.commit }}",
-  });
+  const initial = childBlock(jobs, "initial");
+  assert.deepEqual(directKeys(initial), [
+    "name",
+    "if",
+    "permissions",
+    "uses",
+    "with",
+  ]);
   assert.equal(
-    scalarMapping(childBlock(items[1], "with"))["github-token"],
-    "${{ github.token }}",
+    directScalar(initial, "if"),
+    "${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}",
   );
-  assert.doesNotMatch(blockText(job), /\bsecrets\./u);
+  assert.equal(
+    directScalar(childBlock(initial, "with"), "controller-mode"),
+    "${{ github.event_name == 'workflow_dispatch' && 'evaluate-only' || github.event_name == 'schedule' && 'scan-all-open' || (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment') && 'provider-event-hint' || 'ordinary' }}",
+    "the admission filter must not weaken the controller route parser",
+  );
 
-  const checkout = blockText(items[0]);
-  assert.doesNotMatch(
-    checkout,
-    /github\.(?:repository|sha|workflow_sha|event)|pull_request|refs\/pull/,
-    "the called workflow must not check out the caller or pull-request tree",
-  );
+  for (let index = 1; index < expectedChain.length; index += 1) {
+    const jobName = expectedChain[index];
+    const job = childBlock(jobs, jobName);
+    assert.equal(
+      directScalar(job, "needs"),
+      expectedChain[index - 1],
+      `${jobName} must remain directly chained to its predecessor`,
+    );
+    assert.equal(
+      directKeys(job).includes("continue-on-error"),
+      false,
+      `${jobName} must not bypass a skipped or failed predecessor`,
+    );
+    if (directKeys(job).includes("if")) {
+      assert.doesNotMatch(
+        directScalar(job, "if"),
+        /\balways\s*\(/u,
+        `${jobName} must preserve GitHub's natural skipped-needs behavior`,
+      );
+    }
+  }
+});
+
+test("every v2 workflow leg checks out the exact release and runs one closed controller route", () => {
+  const lines = readYamlLines(calledWorkflowPath);
+  const jobs = childBlock(rootBlock(lines), "jobs");
+  const runMarker = "        run: |\n";
+  const cases = [
+    {
+      jobName: "codex-review-gate",
+      gated: false,
+      controllerName: "Run trusted v2 controller",
+      environment: expectedControllerEnvironment({
+        inputPath: "${{ runner.temp }}/codex-review-gate-v2-command.json",
+        outputPath:
+          "${{ runner.temp }}/codex-review-gate-v2-controller-output.json",
+        route: "${{ inputs.controller-mode }}",
+        observationBoundary: "${{ inputs.observation-boundary }}",
+        pullRequest: "${{ inputs.pull-request }}",
+        dispatchBinding: '""',
+      }),
+      run: `${runMarker}          set -euo pipefail
+          test "$V2_CHECKED_OUT_RELEASE_SHA" = "$V2_EXPECTED_WORKFLOW_SHA"
+          node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" prepare-command
+          node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" run
+          test -s "$V2_CONTROLLER_OUTPUT_PATH"`,
+    },
+    {
+      jobName: "schedule-dispatch",
+      gated: false,
+      controllerName: "Build durable scheduled pull-request matrix",
+      environment: expectedControllerEnvironment({
+        inputPath:
+          "${{ runner.temp }}/codex-review-gate-v2-schedule-command.json",
+        outputPath:
+          "${{ runner.temp }}/codex-review-gate-v2-schedule-output.json",
+        route: "scan-all-open",
+        observationBoundary: "initial",
+        pullRequest: '""',
+        dispatchBinding: '""',
+      }),
+      run: `${runMarker}          set -euo pipefail
+          test "$V2_CHECKED_OUT_RELEASE_SHA" = "$V2_EXPECTED_WORKFLOW_SHA"
+          node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" prepare-command
+          node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" schedule-dispatch`,
+    },
+    {
+      jobName: "scheduled-pull-requests",
+      gated: true,
+      controllerName: "Run trusted v2 scheduled controller",
+      environment: expectedControllerEnvironment({
+        inputPath:
+          "${{ runner.temp }}/codex-review-gate-v2-scheduled-command.json",
+        outputPath:
+          "${{ runner.temp }}/codex-review-gate-v2-scheduled-output.json",
+        route: "ordinary",
+        observationBoundary: "initial",
+        pullRequest: "${{ matrix.pull_request }}",
+        dispatchBinding: "${{ matrix.dispatch_binding }}",
+      }),
+      run: `${runMarker}          set -euo pipefail
+          test "$V2_CHECKED_OUT_RELEASE_SHA" = "$V2_EXPECTED_WORKFLOW_SHA"
+          node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" prepare-command
+          node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" run
+          test -s "$V2_CONTROLLER_OUTPUT_PATH"`,
+    },
+  ];
+
+  for (const spec of cases) {
+    const job = childBlock(jobs, spec.jobName);
+    const items = listItemBlocks(childBlock(job, "steps"));
+    assert.equal(items.length, 2, `${spec.jobName} must have exactly two steps`);
+    for (const [index, item] of items.entries()) {
+      const keys = new Set(itemKeys(item));
+      assert.notEqual(
+        keys.has("uses"),
+        keys.has("run"),
+        `${spec.jobName} step ${index} must have exactly one of uses or run`,
+      );
+    }
+
+    assert.deepEqual(
+      itemKeys(items[0]),
+      spec.gated
+        ? ["name", "if", "id", "uses", "with"]
+        : ["name", "id", "uses", "with"],
+    );
+    assert.equal(
+      itemScalar(items[0], "name"),
+      "Check out exact called-workflow release",
+    );
+    if (spec.gated) {
+      assert.equal(itemScalar(items[0], "if"), "matrix.enabled");
+    }
+    assert.equal(itemScalar(items[0], "id"), "checkout");
+    assert.equal(itemScalar(items[0], "uses"), CHECKOUT_TARGET);
+    assert.deepEqual(scalarMapping(childBlock(items[0], "with")), {
+      repository: "${{ job.workflow_repository }}",
+      ref: "${{ job.workflow_sha }}",
+      path: CHECKOUT_PATH,
+      "persist-credentials": "false",
+    });
+    assert.doesNotMatch(
+      blockText(items[0]),
+      /github\.(?:repository|sha|workflow_sha|event)|pull_request|refs\/pull/,
+      `${spec.jobName} must not check out the caller or pull-request tree`,
+    );
+
+    assert.deepEqual(
+      itemKeys(items[1]),
+      spec.gated
+        ? ["name", "if", "id", "shell", "env", "run"]
+        : ["name", "id", "shell", "env", "run"],
+    );
+    assert.equal(itemScalar(items[1], "name"), spec.controllerName);
+    if (spec.gated) {
+      assert.equal(itemScalar(items[1], "if"), "matrix.enabled");
+    }
+    assert.equal(itemScalar(items[1], "id"), "controller");
+    assert.equal(itemScalar(items[1], "shell"), "bash");
+    assert.deepEqual(
+      scalarMapping(childBlock(items[1], "env")),
+      spec.environment,
+    );
+    const controllerText = blockText(items[1]);
+    const runIndex = controllerText.indexOf(runMarker);
+    assert.notEqual(
+      runIndex,
+      -1,
+      `${spec.jobName} controller must have one literal run block`,
+    );
+    assert.equal(controllerText.slice(runIndex).trimEnd(), spec.run);
+    assert.doesNotMatch(blockText(job), /\bsecrets\./u);
+  }
 
   const source = readFileSync(calledWorkflowPath, "utf8");
-  assert.doesNotMatch(source, /^\s*run:/m);
+  assert.doesNotMatch(source, /\/src\/gate\.mjs/u);
+  assert.doesNotMatch(source, /uses:\s+\.\/\.codex-review-gate-action/u);
   assert.doesNotMatch(
     source,
     /\b(?:curl|wget|git\s+clone|gh\s+release\s+download|Invoke-WebRequest)\b/i,
@@ -298,7 +713,6 @@ test("every external source action is pinned to one literal lower-case full SHA"
         canonicalCallerUseCount += 1;
         continue;
       }
-
       externalUseCount += 1;
       assert.match(
         target,
@@ -414,51 +828,42 @@ test("the source action scanner ignores syntax-like block scalar and comment tex
   assert.deepEqual(usesTargets(source, "block scalar fixture"), [target]);
 });
 
-test("the composite captures caller and called workflow identities from distinct contexts", () => {
+test("the v2 composite binds only closed plan inputs and GitHub API endpoints", () => {
   const action = readYamlLines(actionDefinitionPath);
-  const runs = childBlock(rootBlock(action), "runs");
+  const root = rootBlock(action);
+  const actionOutputs = childBlock(root, "outputs");
+  assert.deepEqual(directKeys(actionOutputs), V2_ACTION_OUTPUTS);
+  for (const name of V2_ACTION_OUTPUTS) {
+    assert.equal(
+      directScalar(childBlock(actionOutputs, name), "value"),
+      `\${{ steps.plan.outputs.${name} }}`,
+    );
+  }
+
+  const runs = childBlock(root, "runs");
   const steps = childBlock(runs, "steps");
   const gateStep = listItemBlocks(steps)[0];
   const env = scalarMapping(childBlock(gateStep, "env"));
 
+  assert.deepEqual(itemKeys(gateStep), ["name", "id", "shell", "env", "run"]);
+  assert.equal(itemScalar(gateStep, "name"), "Build closed v2 plans");
+  assert.equal(itemScalar(gateStep, "id"), "plan");
   assert.equal(itemScalar(gateStep, "shell"), "bash");
   assert.equal(
     itemScalar(gateStep, "run"),
-    'node "$GITHUB_ACTION_PATH/src/gate.mjs"',
+    'node "$GITHUB_ACTION_PATH/src/v2/action.mjs"',
   );
 
-  assert.equal(
-    env.CODEX_REVIEW_GATE_WORKFLOW_REF,
-    "${{ github.workflow_ref }}",
-  );
-  assert.equal(
-    env.CODEX_REVIEW_GATE_WORKFLOW_SHA,
-    "${{ github.workflow_sha }}",
-  );
-  assert.equal(
-    env.CODEX_REVIEW_GATE_JOB_WORKFLOW_REF,
-    "${{ job.workflow_ref }}",
-  );
-  assert.equal(
-    env.CODEX_REVIEW_GATE_JOB_WORKFLOW_SHA,
-    "${{ job.workflow_sha }}",
-  );
-  assert.equal(
-    env.CODEX_REVIEW_GATE_JOB_WORKFLOW_REPOSITORY,
-    "${{ job.workflow_repository }}",
-  );
-  assert.equal(
-    env.CODEX_REVIEW_GATE_JOB_WORKFLOW_FILE_PATH,
-    "${{ job.workflow_file_path }}",
-  );
-  assert.equal(
-    Object.hasOwn(
-      env,
-      "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA",
-    ),
-    false,
-    "the composite must receive the checkout commit only from the called workflow step",
-  );
+  assert.deepEqual(env, {
+    V2_GITHUB_TOKEN: "${{ inputs.github-token }}",
+    V2_PULL_REQUEST: "${{ inputs.pull-request }}",
+    V2_OPERATION: "${{ inputs.operation }}",
+    V2_STATUS_TARGET_MODE: "${{ inputs.status-target-mode }}",
+    V2_OPERATION_INPUT_PATH: "${{ inputs.operation-input-path }}",
+    V2_REST_BASE_URL: "${{ github.api_url }}",
+    V2_GRAPHQL_URL: "${{ github.graphql_url }}",
+  });
+  assert.doesNotMatch(blockText(gateStep), /CODEX_REVIEW_GATE_|src\/gate\.mjs/u);
 });
 
 test("the canonical v1 canary binds W to the tag object and C to the peeled checkout commit", () => {
@@ -1106,6 +1511,11 @@ function readYamlLines(path) {
 
 function yamlLines(source) {
   return source.split(/\r?\n/u);
+}
+
+function markdownYamlBlocks(source) {
+  return [...source.matchAll(/^```ya?ml[^\n]*\r?\n([\s\S]*?)^```\s*$/gmu)]
+    .map((match) => match[1]);
 }
 
 function rootBlock(lines) {

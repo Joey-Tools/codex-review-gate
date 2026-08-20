@@ -11,6 +11,8 @@ export const MAX_STATE_COMMENT_BYTES = 60 * 1024;
 export const MAX_FINDING_ID_SAMPLES = 4;
 export const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
+export const V2_OFFICIAL_CODEX_BOT_LOGIN =
+  "chatgpt-codex-connector[bot]";
 export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
 const MAX_CODEX_TERMINAL_HEADING_CODE_UNITS = 512;
 const MAX_CODEX_TERMINAL_HEADING_GRAPHEMES = 64;
@@ -246,6 +248,26 @@ export function isFullCommitSha(value) {
 
 export function isTrustedCodexRestUser(user, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   return isCodexBot(user?.login, botLogins) && user?.type === "Bot";
+}
+
+/**
+ * Exact v2 provider identity. The one-argument form is for REST records that
+ * carry no App (reactions); the two-argument form requires the relevant App.
+ * Legacy callers intentionally retain their configurable login set.
+ */
+export function isExactV2CodexProviderIdentity(user, ...relevantApp) {
+  if (
+    user?.login !== V2_OFFICIAL_CODEX_BOT_LOGIN ||
+    user?.type !== "Bot"
+  ) {
+    return false;
+  }
+  return relevantApp.length === 0 ||
+    (relevantApp.length === 1 && isExactV2CodexProviderApp(relevantApp[0]));
+}
+
+export function isExactV2CodexProviderApp(app) {
+  return app?.slug === OFFICIAL_CODEX_APP_SLUG;
 }
 
 export function parseCodexIssueCommentTerminalHeading(body) {

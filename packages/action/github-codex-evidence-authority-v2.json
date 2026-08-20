@@ -1,0 +1,1460 @@
+{
+  "schema": "github-codex-evidence-authority-v2",
+  "schema_version": 2,
+  "scope": "github-codex-review-lane-decision",
+  "report_role": "canonical-public-reducer-report",
+  "compact_normalized_decision_role": "internal-only-not-a-public-report",
+  "github_host": "github.com",
+  "provider_identity": {
+    "user_login": "chatgpt-codex-connector[bot]",
+    "user_type": "Bot",
+    "app_slug": "chatgpt-codex-connector"
+  },
+  "decision_values": [
+    "not-selected",
+    "pending",
+    "clean",
+    "findings",
+    "inconclusive",
+    "skipped-unavailable",
+    "blocked-configuration",
+    "blocked-input"
+  ],
+  "provider_profile_values": [
+    "terminal-payload",
+    "thumbs-up-clean",
+    "mixed",
+    "no-start-rejection",
+    "unknown",
+    null
+  ],
+  "request_policy_status_values": [
+    "compliant",
+    "warning",
+    "unknown",
+    "not-applicable"
+  ],
+  "freshness_assurance_values": [
+    "point-in-time"
+  ],
+  "selection_schema": {
+    "closed": true,
+    "required_fields": [
+      "selected",
+      "intent",
+      "mode",
+      "source"
+    ],
+    "selected_values": [
+      true,
+      false
+    ],
+    "intent_values": [
+      "none",
+      "required",
+      "explicit"
+    ],
+    "mode_values": [
+      "none",
+      "implicit",
+      "explicit"
+    ],
+    "source_values": [
+      "none",
+      "active-ruleset",
+      "workflow",
+      "joey-default",
+      "user-explicit",
+      "legacy-triple"
+    ],
+    "allowed_combinations": [
+      {
+        "selected": false,
+        "intent": "none",
+        "mode": "none",
+        "source": "none"
+      },
+      {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "active-ruleset"
+      },
+      {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "workflow"
+      },
+      {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "joey-default"
+      },
+      {
+        "selected": true,
+        "intent": "explicit",
+        "mode": "explicit",
+        "source": "user-explicit"
+      },
+      {
+        "selected": true,
+        "intent": "explicit",
+        "mode": "explicit",
+        "source": "legacy-triple"
+      }
+    ]
+  },
+  "server_enforcement_values": [
+    "enforced",
+    "not-enforced",
+    "not-applicable"
+  ],
+  "server_configuration_schema": {
+    "closed": true,
+    "required_fields": [
+      "controller_available",
+      "workflow_present",
+      "workflow_compatible",
+      "ruleset_required",
+      "ruleset_compatible",
+      "app_bound"
+    ],
+    "workflow_compatible_requires_present": true,
+    "ruleset_compatible_requires_required": true,
+    "ruleset_required_and_enforced_requires_compatible": true,
+    "controller_availability_is_not_workflow_presence": true,
+    "app_binding_is_an_observed_fact_not_selection_intent": true,
+    "explicit_selection_never_changes_observed_configuration": true
+  },
+  "selection_policy_values": [
+    "joey-default",
+    "required-infrastructure-only",
+    "user-explicit",
+    "legacy-triple",
+    "disabled"
+  ],
+  "selection_precedence": [
+    "active-ruleset",
+    "workflow",
+    "selection_policy"
+  ],
+  "selection_precedence_derivation": {
+    "active_ruleset_when": "ruleset_required",
+    "workflow_when": "not ruleset_required and workflow_present",
+    "selection_policy_when": "not ruleset_required and not workflow_present",
+    "active_ruleset_overrides_present_workflow_and_selection_policy": true,
+    "present_workflow_overrides_selection_policy": true,
+    "explicit_selection_policy_never_overrides_observed_infrastructure": true
+  },
+  "selection_policy_source_derivation": {
+    "joey-default": "joey-default",
+    "required-infrastructure-only": "none",
+    "user-explicit": "user-explicit",
+    "legacy-triple": "legacy-triple",
+    "disabled": "none"
+  },
+  "selection_request_policy_warning_derivation": {
+    "none": null,
+    "active-ruleset": null,
+    "workflow": null,
+    "joey-default": null,
+    "user-explicit": null,
+    "legacy-triple": "legacy-triple-alias"
+  },
+  "server_enforcement_derivation": {
+    "input_fields": [
+      "controller_available",
+      "workflow_present",
+      "workflow_compatible",
+      "ruleset_required",
+      "ruleset_compatible",
+      "app_bound"
+    ],
+    "not_selected": "not-applicable",
+    "selected_enforced_iff_all_true": [
+      "controller_available",
+      "workflow_present",
+      "workflow_compatible",
+      "ruleset_required",
+      "ruleset_compatible",
+      "app_bound"
+    ],
+    "selected_otherwise": "not-enforced",
+    "configuration_block_predicates": [
+      "not controller_available",
+      "workflow_present and not workflow_compatible",
+      "ruleset_required and not workflow_present",
+      "ruleset_required and not workflow_compatible",
+      "ruleset_required and not ruleset_compatible",
+      "ruleset_required and not app_bound"
+    ],
+    "compatible_workflow_without_required_ruleset_is_evaluable": true,
+    "explicit_or_joey_default_without_workflow_or_ruleset_is_evaluable": true,
+    "selection_source_never_overrides_observed_configuration": true,
+    "configuration_block_decision": "blocked-configuration"
+  },
+  "lane_selection_matrix": [
+    {
+      "case": "active-ruleset-compatible-workflow",
+      "selection": {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "active-ruleset"
+      },
+      "server_enforcement": "enforced",
+      "initial_decision": "pending",
+      "non_clean_blocks_local_merge_ready": true
+    },
+    {
+      "case": "active-ruleset-workflow-missing",
+      "selection": {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "active-ruleset"
+      },
+      "server_enforcement": "not-enforced",
+      "initial_decision": "blocked-configuration",
+      "non_clean_blocks_local_merge_ready": true
+    },
+    {
+      "case": "active-ruleset-workflow-incompatible-or-ambiguous",
+      "selection": {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "active-ruleset"
+      },
+      "server_enforcement": "not-enforced",
+      "initial_decision": "blocked-configuration",
+      "non_clean_blocks_local_merge_ready": true
+    },
+    {
+      "case": "compatible-workflow-without-required-ruleset",
+      "selection": {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "workflow"
+      },
+      "server_enforcement": "not-enforced",
+      "initial_decision": "pending",
+      "non_clean_blocks_local_merge_ready": true,
+      "operator_recommend_ruleset": true
+    },
+    {
+      "case": "incompatible-or-ambiguous-workflow-without-required-ruleset",
+      "selection": {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "workflow"
+      },
+      "server_enforcement": "not-enforced",
+      "initial_decision": "blocked-configuration",
+      "non_clean_blocks_local_merge_ready": true
+    },
+    {
+      "case": "joey-default-without-server-enforcement",
+      "selection": {
+        "selected": true,
+        "intent": "required",
+        "mode": "implicit",
+        "source": "joey-default"
+      },
+      "server_enforcement": "not-enforced",
+      "initial_decision": "pending",
+      "non_clean_blocks_local_merge_ready": true,
+      "operator_recommend_ruleset": true
+    },
+    {
+      "case": "no-ruleset-no-workflow-no-explicit-request",
+      "selection": {
+        "selected": false,
+        "intent": "none",
+        "mode": "none",
+        "source": "none"
+      },
+      "server_enforcement": "not-applicable",
+      "initial_decision": "not-selected",
+      "non_clean_blocks_local_merge_ready": false
+    },
+    {
+      "case": "user-explicit-without-server-configuration",
+      "selection": {
+        "selected": true,
+        "intent": "explicit",
+        "mode": "explicit",
+        "source": "user-explicit"
+      },
+      "server_enforcement": "not-enforced",
+      "initial_decision": "pending",
+      "non_clean_blocks_local_merge_ready": true
+    },
+    {
+      "case": "legacy-triple-alias-without-server-configuration",
+      "local_shape": "double",
+      "selection": {
+        "selected": true,
+        "intent": "explicit",
+        "mode": "explicit",
+        "source": "legacy-triple"
+      },
+      "server_enforcement": "not-enforced",
+      "initial_decision": "pending",
+      "request_policy_warning": "legacy-triple-alias",
+      "non_clean_blocks_local_merge_ready": true
+    }
+  ],
+  "terminal_evidence": {
+    "carrier_schema": {
+      "required_fields": [
+        "channel",
+        "created_at",
+        "id",
+        "outcome"
+      ],
+      "channel_values": [
+        "issue-comment",
+        "pull-request-review"
+      ],
+      "channel_mapping": {
+        "terminal_issue_comment": "issue-comment",
+        "top_level_review_or_inline_finding_parent_review": "pull-request-review"
+      },
+      "created_at_type": "strict-utc-server-time",
+      "id_type": "canonical-decimal-string",
+      "outcome_values": [
+        "clean",
+        "findings",
+        "malformed"
+      ]
+    },
+    "selection_precedence": {
+      "semantic_time": "created_at",
+      "later_semantic_time_wins": true,
+      "equal_time_cross_channel": "inconclusive",
+      "equal_time_same_channel_outcome_order": [
+        "malformed",
+        "findings",
+        "clean"
+      ],
+      "equal_time_same_channel_same_outcome_tiebreaker": "greatest-canonical-decimal-id"
+    },
+    "clean": {
+      "provider_profile": "terminal-payload",
+      "decision": "inconclusive",
+      "scope_assurance": "artifact-publication-only",
+      "provider_input_lineage": "unavailable"
+    },
+    "findings": {
+      "provider_profile": "terminal-payload",
+      "decision": "findings",
+      "scope_assurance": "artifact-publication-only",
+      "provider_input_lineage": "unavailable"
+    },
+    "mixed": {
+      "provider_profile": "mixed",
+      "terminal_payload_controls_decision": true,
+      "reaction_evidence_role": "audit-only",
+      "plus_one_never_overrides_terminal_findings": true,
+      "scope_assurance": "artifact-publication-only",
+      "provider_input_lineage": "unavailable"
+    }
+  },
+  "reaction_evidence": {
+    "accepted_content": "+1",
+    "provider_profile": "thumbs-up-clean",
+    "decision": "clean",
+    "requires_unique_latest_eligible_generation_request": true,
+    "requires_exact_provider_identity": true,
+    "requires_exact_parent_join": true,
+    "requires_reaction_created_strictly_after_request_server_time": true,
+    "requires_complete_current_scope_request_and_reaction_pages": true,
+    "requires_final_complete_current_scope_reread": true,
+    "historical_profile_required": false,
+    "historical_samples_required": 0,
+    "eyes_is_liveness_only": true,
+    "eyes_at_or_after_selected_plus_one_vetoes_reaction_only_clean": true,
+    "eyes_never_vetoes_terminal_payload": true,
+    "terminal_payload_precedence": true,
+    "scope_assurance": "whole-pr-contractual",
+    "provider_input_lineage": "unavailable"
+  },
+  "no_start_rejection": {
+    "profile": "no-start-rejection",
+    "controlled_request_body": "@codex review",
+    "exact_bodies": [
+      "To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).",
+      "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors)."
+    ],
+    "requires_controlled_request": true,
+    "requires_first_observation_after_controlled_request": true,
+    "requires_carrier_created_strictly_after_request_server_time": true,
+    "required_server_time_fields": [
+      "request_created_at",
+      "carrier_created_at",
+      "first_observation_server_time",
+      "stable_reread_server_time"
+    ],
+    "requires_first_observation_in_run_different_from_request": true,
+    "requires_stable_reread_in_later_run": true,
+    "requires_direct_stable_reread": true,
+    "minimum_stable_reread_seconds": 900,
+    "requires_exact_provider_identity": true,
+    "any_post_request_service_start_or_provider_activity_disqualifies": true,
+    "start_evidence_disqualifiers": [
+      "terminal-evidence",
+      "accepted-provider-reaction",
+      "provider-review-activity",
+      "exact-app-post-request-run-activity"
+    ],
+    "implicit_decision": "skipped-unavailable",
+    "explicit_decision": "blocked-configuration",
+    "quota_credit_and_generic_failures_never_qualify": true
+  },
+  "manual_request_permission": {
+    "permission_assurance": "point-in-time-only",
+    "request_time_permission": "unproven",
+    "permission_aba_excluded": false
+  },
+  "request_generation_contract": {
+    "automatic": {
+      "maximum_reservations_per_head": 3,
+      "accounting_scope": [
+        "repository",
+        "pull_request",
+        "head_ref_oid"
+      ],
+      "shared_across_base_retargets": true,
+      "reservation_consumes_one_unit": true,
+      "post_consumes_additional_unit": false,
+      "network_uncertainty_refunds_unit": false,
+      "reservation_reuse_or_retry_after_uncertain_post": false,
+      "one_post_attempt_per_reservation": true
+    },
+    "manual": {
+      "maximum_exact_requests_per_review_epoch": 64,
+      "consumes_automatic_budget": false,
+      "requires_exact_body": "@codex review"
+    },
+    "generation_rules": {
+      "one_exact_request_per_generation": true,
+      "initial_automatic_generation_requires_local_lanes_terminal": true,
+      "additional_automatic_generation_requires_finding_recovery_closure": true,
+      "valid_multiple_generations_create_warning": false,
+      "same_generation_or_unadmitted_extra_is_not_an_authoritative_generation": true,
+      "same_generation_or_unadmitted_extra_forces_request_policy_unknown": true,
+      "same_generation_or_unadmitted_extra_disables_request_bound_evidence": true,
+      "same_generation_or_unadmitted_extra_does_not_erase_independent_terminal_outcome": true,
+      "same_generation_or_unadmitted_extra_creates_warning": false,
+      "pending_malformed_or_inconclusive_does_not_authorize_new_automatic_generation": true,
+      "same_head_base_retarget_never_resets_or_refunds_budget": true
+    }
+  },
+  "finding_recovery_contract": {
+    "applies_when_prior_applicable_finding_exists": true,
+    "terminal_clean_can_supply_positive_completion": false,
+    "required_sequence": [
+      "finding",
+      "proved-closure",
+      "new-request-generation",
+      "later-current-request-reaction"
+    ],
+    "inline_closure": {
+      "authority": "final-direct-graphql-thread-read",
+      "required_is_resolved": true,
+      "resolved_at_required": false,
+      "resolution_observed_at_source": "controller-response-http-date",
+      "resolution_observed_at_semantics": "observation-time-lower-bound",
+      "provider_resolution_time_claimed": false,
+      "addressed_command_required": false,
+      "closure_observation_http_date_strictly_after_finding": true,
+      "closure_observation_http_date_strictly_before_new_request": true
+    },
+    "top_level_closure": {
+      "exact_body_template": "/codex-gate addressed <finding.html_url>",
+      "finding_url_field": "finding.html_url",
+      "extra_prefix_suffix_or_whitespace_allowed": false,
+      "unedited_required": true,
+      "stable_actor_required": true,
+      "actor_minimum_repository_permission": "write",
+      "accepted_repository_permissions": [
+        "write",
+        "maintain",
+        "admin"
+      ],
+      "addressed_created_at_strictly_after_finding": true,
+      "addressed_created_at_strictly_before_new_request": true
+    },
+    "new_request": {
+      "must_be_new_generation": true,
+      "must_be_strictly_after_every_required_closure": true,
+      "must_bind_same_current_review_epoch": true
+    },
+    "later_clean": {
+      "accepted_kinds": [
+        "current-request-reaction"
+      ],
+      "must_bind_new_request_generation": true,
+      "semantic_time_strictly_after_new_request": true
+    }
+  },
+  "point_in_time_contract": {
+    "freshness_assurance": "point-in-time",
+    "requires_final_reread": true,
+    "public_server_time_encoding": "strict-utc-server-time",
+    "strict_utc_pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?Z$",
+    "http_date_is_normalized_before_publication": true,
+    "proves_continuous_scope_stability": false,
+    "proves_no_intermediate_aba": false
+  },
+  "status_target_mode_contract": {
+    "input_name": "status-target-mode",
+    "required": true,
+    "has_default": false,
+    "accepted_values": [
+      "head",
+      "test-merge-with-head-sentinel"
+    ],
+    "caller_must_supply_exact_value": true,
+    "joey_tools_production_caller": {
+      "mode": "test-merge-with-head-sentinel",
+      "literal_hardcoded": true,
+      "variable_or_expression_forbidden": true
+    }
+  },
+  "status_target_schema": {
+    "closed": true,
+    "discriminator": "mode",
+    "required_fields": [
+      "context",
+      "mode",
+      "live_base_ref_tip",
+      "head_ref_oid",
+      "pr_merge_base",
+      "potential_merge_commit_oid",
+      "potential_merge_commit_tree_oid",
+      "potential_merge_commit_parent_oids",
+      "merge_ref_oid",
+      "potential_target_state",
+      "head_sentinel_state",
+      "validation_receipt"
+    ],
+    "context": "codex/github-review-gate",
+    "mode_values": [
+      "head",
+      "test-merge-with-head-sentinel"
+    ],
+    "oid_type": "lowercase-git-oid",
+    "oid_pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+    "head_sentinel_state_semantics": "pre-publication-point-in-time-observation",
+    "decision_to_write_projection_is_separate": true,
+    "variants": {
+      "head": {
+        "potential_target_state": "not-applicable",
+        "potential_fields_must_be_null": [
+          "potential_merge_commit_oid",
+          "potential_merge_commit_tree_oid",
+          "potential_merge_commit_parent_oids",
+          "merge_ref_oid"
+        ],
+        "head_sentinel_state_values": [
+          "absent",
+          "pending",
+          "failure",
+          "error"
+        ],
+        "validation_requirements": {
+          "pr_state": "OPEN",
+          "pr_merged": false,
+          "pr_merged_at": null,
+          "pre_post_scope_stable": true,
+          "head_ref_oid_equals_review_epoch_head_ref_oid": true,
+          "potential_merge_validation_not_applicable": true
+        },
+        "validation_receipt_schema": {
+          "closed": true,
+          "nullable": false,
+          "required_fields": [
+            "pre",
+            "post"
+          ],
+          "observation_required_fields": [
+            "observed_http_date",
+            "pr_state",
+            "pr_merged",
+            "pr_merged_at",
+            "live_base_ref_tip",
+            "head_ref_oid",
+            "pr_merge_base"
+          ],
+          "stable_projection_fields": [
+            "pr_state",
+            "pr_merged",
+            "pr_merged_at",
+            "live_base_ref_tip",
+            "head_ref_oid",
+            "pr_merge_base"
+          ],
+          "post_http_date_strictly_after_pre": true,
+          "observed_http_date_type": "strict-utc-server-time",
+          "validated_pre_post_type_preserving_equal": true
+        }
+      },
+      "test-merge-with-head-sentinel": {
+        "potential_target_state_values": [
+          "validated",
+          "unavailable",
+          "invalid",
+          "conflicting",
+          "stale"
+        ],
+        "head_sentinel_state_values": [
+          "absent",
+          "pending",
+          "failure",
+          "error"
+        ],
+        "validated_parent_order": [
+          "live_base_ref_tip",
+          "head_ref_oid"
+        ],
+        "potential_fields_nullable_unless_validated": [
+          "potential_merge_commit_oid",
+          "potential_merge_commit_tree_oid",
+          "potential_merge_commit_parent_oids",
+          "merge_ref_oid"
+        ],
+        "target_state_relation": {
+          "validated": {
+            "potential_fields": "all-non-null",
+            "validation_receipt": "non-null"
+          },
+          "unavailable": {
+            "potential_fields": "all-null",
+            "validation_receipt": null
+          },
+          "invalid": {
+            "potential_fields": "all-null",
+            "validation_receipt": null
+          },
+          "conflicting": {
+            "potential_fields": "all-null",
+            "validation_receipt": null
+          },
+          "stale": {
+            "potential_fields": "all-null",
+            "validation_receipt": null
+          }
+        },
+        "validation_requirements": {
+          "pr_state": "OPEN",
+          "pr_merged": false,
+          "pr_merged_at": null,
+          "mergeable": "MERGEABLE",
+          "potential_merge_commit_required": true,
+          "potential_merge_commit_oid_distinct_from_live_base_ref_tip": true,
+          "potential_merge_commit_oid_distinct_from_head_ref_oid": true,
+          "potential_merge_commit_parent_count": 2,
+          "potential_merge_commit_parents_exact_order": [
+            "live_base_ref_tip",
+            "head_ref_oid"
+          ],
+          "merge_ref_oid_equals_potential_merge_commit_oid": true,
+          "pre_post_scope_and_tree_stable": true
+        },
+        "validation_receipt_schema": {
+          "closed": true,
+          "nullable_unless_target_state_validated": true,
+          "required_fields": [
+            "pre",
+            "post"
+          ],
+          "observation_required_fields": [
+            "observed_http_date",
+            "pr_state",
+            "pr_merged",
+            "pr_merged_at",
+            "mergeable",
+            "live_base_ref_tip",
+            "head_ref_oid",
+            "pr_merge_base",
+            "potential_merge_commit_oid",
+            "potential_merge_commit_tree_oid",
+            "potential_merge_commit_parent_oids",
+            "merge_ref_oid"
+          ],
+          "stable_projection_fields": [
+            "pr_state",
+            "pr_merged",
+            "pr_merged_at",
+            "mergeable",
+            "live_base_ref_tip",
+            "head_ref_oid",
+            "pr_merge_base",
+            "potential_merge_commit_oid",
+            "potential_merge_commit_tree_oid",
+            "potential_merge_commit_parent_oids",
+            "merge_ref_oid"
+          ],
+          "post_http_date_strictly_after_pre": true,
+          "observed_http_date_type": "strict-utc-server-time",
+          "validated_pre_post_type_preserving_equal": true
+        }
+      }
+    }
+  },
+  "status_publication_contract": {
+    "context": "codex/github-review-gate",
+    "mode_required": true,
+    "has_default": false,
+    "mode_values": [
+      "head",
+      "test-merge-with-head-sentinel"
+    ],
+    "head_success_forbidden": true,
+    "terminal_verdict_requires_validated_potential_merge": true,
+    "terminal_success_requires_validated_potential_merge": true,
+    "terminal_decision_requires_observed_head_state_not_success": true,
+    "report_head_sentinel_state_is_pre_publication_observed_state": true,
+    "publication_plan_must_not_be_projected_back_into_observed_state": true,
+    "pre_epoch_selected_blocker_has_no_status_target_and_writes_nothing": true,
+    "variants": {
+      "head": {
+        "role": "non-success-head-sentinel-only",
+        "terminal_cutover_supported": false,
+        "potential_merge_status_supported": false,
+        "positive_decision_may_observe_absent_head_sentinel": true,
+        "positive_publication": "suppressed-unsupported-terminal-target",
+        "decision_projection": {
+          "not-selected": {
+            "head_write": null,
+            "potential_merge_write": null,
+            "terminal_cutover": false
+          },
+          "pending": {
+            "head_write": "pending",
+            "potential_merge_write": null,
+            "terminal_cutover": false
+          },
+          "clean": {
+            "head_write": null,
+            "head_requirement": "remain-non-success",
+            "potential_merge_write": null,
+            "terminal_cutover": false,
+            "publication": "suppressed-unsupported-terminal-target"
+          },
+          "findings": {
+            "head_write": "failure",
+            "potential_merge_write": null,
+            "terminal_cutover": false
+          },
+          "inconclusive": {
+            "head_write": "error",
+            "potential_merge_write": null,
+            "terminal_cutover": false
+          },
+          "skipped-unavailable": {
+            "allowed_selection_mode": "implicit",
+            "head_write": null,
+            "head_requirement": "remain-non-success",
+            "potential_merge_write": null,
+            "terminal_cutover": false,
+            "publication": "suppressed-unsupported-terminal-target"
+          },
+          "blocked-configuration": {
+            "head_write": "error",
+            "potential_merge_write": null,
+            "terminal_cutover": false
+          },
+          "blocked-input": {
+            "head_write": "error",
+            "potential_merge_write": null,
+            "terminal_cutover": false
+          }
+        }
+      },
+      "test-merge-with-head-sentinel": {
+        "role": "validated-potential-merge-terminal-with-head-sentinel",
+        "terminal_cutover_supported": true,
+        "positive_decision_requires_existing_or_new_non_success_head_sentinel": true,
+        "potential_merge_status_requires_validated_target": true,
+        "invalid_null_conflicting_or_stale_target": {
+          "potential_merge_status": null,
+          "head_requirement": "remain-non-success",
+          "preserve_decision_specific_head_write": true,
+          "findings_head_write": "failure",
+          "other_negative_head_write": "error"
+        },
+        "decision_projection": {
+          "not-selected": {
+            "head_write": null,
+            "potential_merge_write": null
+          },
+          "pending": {
+            "head_write": "pending",
+            "potential_merge_write": null
+          },
+          "clean": {
+            "head_write": null,
+            "head_requirement": "remain-non-success",
+            "potential_merge_write": "success"
+          },
+          "findings": {
+            "head_write": "failure",
+            "potential_merge_write": "failure"
+          },
+          "inconclusive": {
+            "head_write": "error",
+            "potential_merge_write": "error"
+          },
+          "skipped-unavailable": {
+            "allowed_selection_mode": "implicit",
+            "head_write": null,
+            "head_requirement": "remain-non-success",
+            "potential_merge_write": "success"
+          },
+          "blocked-configuration": {
+            "head_write": "error",
+            "potential_merge_write": "error"
+          },
+          "blocked-input": {
+            "head_write": "error",
+            "potential_merge_write": "error"
+          }
+        }
+      }
+    }
+  },
+  "required_report_fields": [
+    "selection",
+    "server_enforcement",
+    "review_epoch",
+    "request_policy",
+    "provider_profile",
+    "provider_input_lineage",
+    "evidence_basis",
+    "status_target",
+    "decision",
+    "freshness_assurance"
+  ],
+  "report_contract": {
+    "top_level_closed": true,
+    "required_core_fields_are_exact": true,
+    "top_level_field_set_closed_to_required_plus_optional": true,
+    "allowed_additional_top_level_fields": [
+      "schema_version",
+      "snapshot_fingerprint"
+    ],
+    "allowed_additional_top_level_field_schemas": {
+      "schema_version": {
+        "const": 2
+      },
+      "snapshot_fingerprint": {
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      }
+    },
+    "required_top_level_fields": [
+      "selection",
+      "server_enforcement",
+      "review_epoch",
+      "request_policy",
+      "provider_profile",
+      "provider_input_lineage",
+      "evidence_basis",
+      "status_target",
+      "decision",
+      "freshness_assurance"
+    ],
+    "closed_decision_enum": true,
+    "provider_input_lineage": "unavailable",
+    "freshness_assurance": "point-in-time",
+    "manual_request_permission_fields": [
+      "permission_assurance",
+      "request_time_permission",
+      "permission_aba_excluded"
+    ],
+    "status_target_required_when_selected_after_epoch": true,
+    "review_epoch_required_when_selected_after_epoch": true,
+    "pre_epoch_blocker_relation": {
+      "selection_selected": true,
+      "decision_values": [
+        "blocked-input",
+        "blocked-configuration"
+      ],
+      "review_epoch": null,
+      "status_target": null,
+      "provider_profile": null,
+      "evidence_basis_kind_values": [
+        null
+      ],
+      "basis_null_requires_reason": true,
+      "reason_values": [
+        "pr-selector-missing",
+        "pr-selector-ambiguous",
+        "pr-lifecycle-unverified",
+        "selected-pr-not-open",
+        "scope-unavailable",
+        "range-unavailable",
+        "server-controller-unavailable-before-epoch"
+      ],
+      "reason_is_authority_metadata_not_a_report_field": true,
+      "epoch_established_requires_non_null_review_epoch_and_status_target": true
+    },
+    "review_epoch_schema": {
+      "closed": true,
+      "required_fields": [
+        "host",
+        "repository",
+        "pull_request",
+        "pr_state",
+        "pr_merged",
+        "pr_merged_at",
+        "base_ref",
+        "live_base_ref_tip",
+        "head_ref",
+        "head_ref_oid",
+        "pr_merge_base",
+        "controlled_request_id"
+      ],
+      "host": "github.com",
+      "eligible_pr_state": "OPEN",
+      "eligible_pr_merged": false,
+      "eligible_pr_merged_at": null,
+      "pull_request_type": "positive-integer",
+      "git_oid_type": "lowercase-git-oid",
+      "git_oid_pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+      "controlled_request_id_type": "canonical-decimal-string-or-null",
+      "automatic_request_relation": "controlled_request_id-equals-request_policy.request_id",
+      "manual_request_relation": "controlled_request_id-is-null"
+    },
+    "request_policy_schema": {
+      "closed": true,
+      "required_fields": [
+        "status",
+        "warnings",
+        "warning_evidence",
+        "request_id",
+        "request_url",
+        "manual",
+        "generation_id",
+        "generation_kind",
+        "generation_index",
+        "automatic_reservations_consumed_on_head",
+        "manual_requests_in_review_epoch",
+        "permission_assurance",
+        "request_time_permission",
+        "permission_aba_excluded"
+      ],
+      "warning_values": [
+        "legacy-triple-alias"
+      ],
+      "status_warning_relation": {
+        "compliant": "empty",
+        "warning": "non-empty",
+        "unknown": "any-closed-warning-list",
+        "not-applicable": "empty-except-legacy-triple-alias"
+      },
+      "request_id_type": "canonical-decimal-string-or-null",
+      "request_url_type": "canonical-current-epoch-github-pull-request-comment-url-or-null",
+      "request_identity_nullable": true,
+      "generation_kind_values": [
+        "automatic",
+        "manual",
+        null
+      ],
+      "generation_budget_fields": {
+        "automatic_reservations_consumed_on_head": {
+          "minimum": 0,
+          "maximum": 3
+        },
+        "manual_requests_in_review_epoch": {
+          "minimum": 0,
+          "maximum": 64
+        }
+      },
+      "generation_relations": {
+        "generation_and_request_identity_all_null_or_all_present": true,
+        "generation_id_pattern": "^(automatic|manual):([1-9][0-9]*)$",
+        "generation_id_kind_and_index_must_match": true,
+        "automatic_generation_index_not_greater_than_consumed_reservations": true,
+        "automatic_generation_index_maximum": 3,
+        "automatic_generation_requires_request_id_and_url": true,
+        "manual_generation_index_maximum": 64,
+        "manual_generation_requires_request_id_and_url": true,
+        "manual_generation_index_not_greater_than_manual_requests_in_review_epoch": true,
+        "manual_boolean_matches_generation_kind": true,
+        "request_bound_evidence_requires_non_null_generation": true
+      },
+      "warning_relations": {
+        "legacy_triple_source_requires_legacy_triple_alias": true,
+        "non_legacy_source_forbids_legacy_triple_alias": true,
+        "generation_shape_never_creates_a_warning": true
+      },
+      "warning_evidence_schema": {
+        "closed": true,
+        "required_fields": [
+          "legacy_triple_alias"
+        ],
+        "warnings_are_exact_projection": true,
+        "legacy_triple_alias_when_legacy_source": true,
+        "legacy_triple_alias_when_non_legacy_source": null
+      },
+      "non_manual_permission_fields": null,
+      "manual_permission_fields": {
+        "permission_assurance": "point-in-time-only",
+        "request_time_permission": "unproven",
+        "permission_aba_excluded": false
+      },
+      "accepted_no_start_preserves_actual_status": [
+        "compliant",
+        "warning",
+        "unknown"
+      ],
+      "not_applicable_requires_no_eligible_request_plane": true,
+      "not_applicable_requires_null_generation_and_request_identity": true,
+      "not_applicable_allowed_states": [
+        "not-selected",
+        "pre-epoch-blocker",
+        "pre-provider-blocker"
+      ],
+      "not_applicable_legacy_source_may_retain_alias_warning": true
+    },
+    "evidence_basis_schema": {
+      "closed": true,
+      "nullable": true,
+      "required_fields_when_non_null": [
+        "kind",
+        "outcome",
+        "selected_ids",
+        "selected_urls",
+        "server_times",
+        "pagination_complete",
+        "final_reread_complete",
+        "scope_assurance",
+        "provider_input_lineage",
+        "finding_recovery",
+        "authority_receipt"
+      ],
+      "kind_values": [
+        "terminal-payload",
+        "current-request-reaction",
+        "stable-exact-no-start",
+        "malformed-terminal",
+        "unknown-terminal",
+        "stable-evidence-blocker",
+        "stable-input-blocker"
+      ],
+      "outcome_values": [
+        "clean",
+        "findings",
+        "inconclusive",
+        "skipped-unavailable",
+        "blocked-configuration",
+        "blocked-input"
+      ],
+      "kind_outcome_relation": {
+        "terminal-payload": [
+          "inconclusive",
+          "findings"
+        ],
+        "current-request-reaction": [
+          "clean"
+        ],
+        "stable-exact-no-start": [
+          "skipped-unavailable",
+          "blocked-configuration"
+        ],
+        "malformed-terminal": [
+          "inconclusive"
+        ],
+        "unknown-terminal": [
+          "inconclusive"
+        ],
+        "stable-evidence-blocker": [
+          "inconclusive"
+        ],
+        "stable-input-blocker": [
+          "blocked-input"
+        ]
+      },
+      "kind_profile_relation": {
+        "terminal-payload": [
+          "terminal-payload",
+          "mixed"
+        ],
+        "current-request-reaction": [
+          "thumbs-up-clean"
+        ],
+        "stable-exact-no-start": [
+          "no-start-rejection"
+        ],
+        "malformed-terminal": [
+          "terminal-payload",
+          "mixed",
+          "unknown"
+        ],
+        "unknown-terminal": [
+          "terminal-payload",
+          "mixed",
+          "unknown"
+        ],
+        "stable-evidence-blocker": [
+          "terminal-payload",
+          "thumbs-up-clean",
+          "mixed",
+          "no-start-rejection",
+          "unknown"
+        ],
+        "stable-input-blocker": [
+          "terminal-payload",
+          "thumbs-up-clean",
+          "mixed",
+          "no-start-rejection",
+          "unknown",
+          null
+        ]
+      },
+      "accepted_kind_values": [
+        "terminal-payload",
+        "current-request-reaction",
+        "stable-exact-no-start"
+      ],
+      "accepted_basis_requires_non_empty_equal_length_ids_urls": true,
+      "accepted_basis_requires_complete_pagination_and_final_reread": true,
+      "stable_blocker_kind_values": [
+        "malformed-terminal",
+        "unknown-terminal",
+        "stable-evidence-blocker",
+        "stable-input-blocker"
+      ],
+      "stable_blocker_may_have_empty_selected_evidence": true,
+      "stable_blocker_may_record_incomplete_pagination_or_final_reread": true,
+      "selected_ids_urls_server_times_share_index_order": true,
+      "server_times_schema": {
+        "closed": true,
+        "required_fields": [
+          "request",
+          "selected"
+        ],
+        "selected_record_required_fields": [
+          "id",
+          "server_time"
+        ],
+        "request_nullable_only_for_non_request_bound_kind": true,
+        "id_type": "canonical-decimal-string",
+        "time_type": "strict-utc-server-time"
+      },
+      "request_bound_kind_values": [
+        "current-request-reaction",
+        "stable-exact-no-start"
+      ],
+      "kind_selected_object_relation": {
+        "terminal-payload": {
+          "selected_request_by_outcome": {
+            "inconclusive": null,
+            "findings": "optional"
+          },
+          "request_server_time_by_outcome": {
+            "inconclusive": null,
+            "findings": "optional"
+          },
+          "selected_artifact": "required",
+          "finding_recovery": null,
+          "authority_receipt_recovery": null
+        },
+        "current-request-reaction": {
+          "selected_request": "required",
+          "selected_artifact": null,
+          "selected_urls_role": "parent-request-url"
+        },
+        "stable-exact-no-start": {
+          "selected_request": "required",
+          "selected_artifact": "required"
+        },
+        "malformed-terminal": {
+          "selected_request": "optional",
+          "selected_artifact": "required"
+        },
+        "unknown-terminal": {
+          "selected_request": "optional",
+          "selected_artifact": "required"
+        },
+        "stable-evidence-blocker": {
+          "selected_request": "optional",
+          "selected_artifact": "optional"
+        },
+        "stable-input-blocker": {
+          "selected_request": "optional",
+          "selected_artifact": "optional"
+        }
+      },
+      "nonterminal_instability_maps_to": "stable-evidence-blocker",
+      "malformed_terminal_requires_actual_selected_terminal_artifact": true,
+      "url_epoch_relation": {
+        "scheme_and_host": "https://github.com",
+        "repository_and_pull_request_equal_review_epoch": true,
+        "selected_request_fragment": "issuecomment-<selected_request.id>",
+        "selected_artifact_fragment_matches_artifact_id": true,
+        "finding_url_repository_and_pull_request_equal_review_epoch": true,
+        "current_request_reaction_selected_url_equals_selected_request_url": true
+      },
+      "artifact_publication_kind_values": [
+        "terminal-payload",
+        "malformed-terminal",
+        "unknown-terminal"
+      ],
+      "artifact_publication_scope_assurance": "artifact-publication-only",
+      "whole_pr_kind_values": [
+        "current-request-reaction",
+        "stable-exact-no-start",
+        "stable-evidence-blocker",
+        "stable-input-blocker"
+      ],
+      "whole_pr_scope_assurance": "whole-pr-contractual",
+      "provider_input_lineage": "unavailable",
+      "authority_receipt_schema": {
+        "closed": true,
+        "required_fields": [
+          "selected_request",
+          "selected_artifact",
+          "pagination_sha256",
+          "final_reread_sha256",
+          "recovery"
+        ],
+        "selected_object_schema": {
+          "closed": true,
+          "nullable": true,
+          "required_fields_when_non_null": [
+            "id",
+            "url",
+            "created_at"
+          ],
+          "id_type": "canonical-decimal-string",
+          "url_type": "canonical-github-pull-artifact-url",
+          "created_at_type": "strict-utc-server-time"
+        },
+        "digest_pattern": "^sha256:[0-9a-f]{64}$",
+        "recovery_schema": {
+          "closed": true,
+          "nullable": true,
+          "required_fields_when_non_null": [
+            "finding_ids",
+            "closure_ids",
+            "new_request_id",
+            "completion_id"
+          ],
+          "finding_and_closure_ids_non_empty_equal_length": true,
+          "finding_and_closure_id_type": "non-empty-string",
+          "new_request_and_completion_id_type": "canonical-decimal-string",
+          "new_request_and_completion_ids_are_positive": true
+        },
+        "every_non_null_basis_requires_receipt": true
+      },
+      "finding_recovery_schema": {
+        "closed": true,
+        "nullable": true,
+        "required_fields_when_non_null": [
+          "closure_records",
+          "new_generation_id",
+          "new_request_id",
+          "new_request_server_time",
+          "later_clean_id",
+          "later_clean_server_time"
+        ],
+        "closure_record_schema": {
+          "closed": true,
+          "required_fields": [
+            "finding_id",
+            "finding_kind",
+            "finding_url",
+            "finding_server_time",
+            "closure_evidence_id",
+            "closure_server_time",
+            "inline_final_is_resolved",
+            "top_level_exact_body",
+            "top_level_unedited",
+            "top_level_actor_stable",
+            "top_level_actor_permission"
+          ],
+          "finding_kind_values": [
+            "inline",
+            "top-level"
+          ],
+          "one_unique_record_per_prior_applicable_finding": true,
+          "inline_relation": {
+            "inline_final_is_resolved": true,
+            "top_level_fields": null
+          },
+          "top_level_relation": {
+            "inline_final_is_resolved": null,
+            "top_level_exact_body_template": "/codex-gate addressed <finding.html_url>",
+            "top_level_unedited": true,
+            "top_level_actor_stable": true,
+            "top_level_actor_permission_values": [
+              "write",
+              "maintain",
+              "admin"
+            ]
+          },
+          "strict_time_relation": "finding_server_time < closure_server_time < new_request_server_time"
+        },
+        "id_types": {
+          "finding_id": "non-empty-string",
+          "closure_evidence_id": "non-empty-string",
+          "new_request_id": "canonical-decimal-string",
+          "later_clean_id": "canonical-decimal-string"
+        },
+        "all_time_fields_type": "strict-utc-server-time",
+        "terminal_clean_cannot_supply_finding_recovery": true,
+        "current_request_reaction_requires_selected_request_and_no_selected_artifact": true,
+        "later_clean_server_time_field": "later_clean_server_time",
+        "later_clean_server_time_strictly_after_new_request": true
+      }
+    },
+    "selection_server_relations": {
+      "none_source": {
+        "server_enforcement": "not-applicable",
+        "decision": "not-selected"
+      },
+      "active_ruleset_with_all_six_configuration_facts_true": {
+        "server_enforcement": "enforced"
+      },
+      "active_ruleset_with_missing_incompatible_or_ambiguous_workflow": {
+        "server_enforcement": "not-enforced",
+        "decision": "blocked-configuration"
+      },
+      "workflow_source_without_active_required_target": {
+        "server_enforcement": "not-enforced"
+      },
+      "explicit_source_does_not_override_server_derivation": true,
+      "selected_intent_survives_blocked_decision": true,
+      "not_selected_forbids_enforced": true,
+      "configuration_error_requires_blocked_configuration": true
+    },
+    "report_state_matrix": [
+      {
+        "state": "not-selected",
+        "selection_selected": false,
+        "selection_modes": ["none"],
+        "provider_profiles": [null],
+        "decisions": ["not-selected"],
+        "basis_kinds": [null],
+        "request_policy_statuses": ["not-applicable"]
+      },
+      {
+        "state": "selected-pending",
+        "selection_selected": true,
+        "selection_modes": ["implicit", "explicit"],
+        "provider_profiles": ["unknown"],
+        "decisions": ["pending"],
+        "basis_kinds": [null],
+        "request_policy_statuses": ["compliant", "warning", "unknown"]
+      },
+      {
+        "state": "terminal-clean",
+        "selection_selected": true,
+        "selection_modes": ["implicit", "explicit"],
+        "provider_profiles": ["terminal-payload", "mixed"],
+        "decisions": ["inconclusive"],
+        "basis_kinds": ["terminal-payload"],
+        "request_policy_statuses": ["compliant", "warning", "unknown"]
+      },
+      {
+        "state": "accepted-thumbs-up-clean",
+        "selection_selected": true,
+        "selection_modes": ["implicit", "explicit"],
+        "provider_profiles": ["thumbs-up-clean"],
+        "decisions": ["clean"],
+        "basis_kinds": ["current-request-reaction"],
+        "request_policy_statuses": ["compliant", "warning"]
+      },
+      {
+        "state": "terminal-findings",
+        "selection_selected": true,
+        "selection_modes": ["implicit", "explicit"],
+        "provider_profiles": ["terminal-payload", "mixed"],
+        "decisions": ["findings"],
+        "basis_kinds": ["terminal-payload"],
+        "request_policy_statuses": ["compliant", "warning", "unknown"]
+      },
+      {
+        "state": "inconclusive",
+        "selection_selected": true,
+        "selection_modes": ["implicit", "explicit"],
+        "provider_profiles": [
+          "terminal-payload",
+          "thumbs-up-clean",
+          "mixed",
+          "no-start-rejection",
+          "unknown"
+        ],
+        "decisions": ["inconclusive"],
+        "basis_kinds": [
+          null,
+          "terminal-payload",
+          "malformed-terminal",
+          "unknown-terminal",
+          "stable-evidence-blocker"
+        ],
+        "request_policy_statuses": ["compliant", "warning", "unknown"]
+      },
+      {
+        "state": "implicit-skipped-unavailable",
+        "selection_selected": true,
+        "selection_modes": ["implicit"],
+        "provider_profiles": ["no-start-rejection"],
+        "decisions": ["skipped-unavailable"],
+        "basis_kinds": ["stable-exact-no-start"],
+        "request_policy_statuses": ["compliant", "warning", "unknown"]
+      },
+      {
+        "state": "explicit-no-start-configuration-block",
+        "selection_selected": true,
+        "selection_modes": ["explicit"],
+        "provider_profiles": ["no-start-rejection"],
+        "decisions": ["blocked-configuration"],
+        "basis_kinds": ["stable-exact-no-start"],
+        "request_policy_statuses": ["compliant", "warning", "unknown"]
+      },
+      {
+        "state": "pre-provider-configuration-block",
+        "selection_selected": true,
+        "selection_modes": ["implicit", "explicit"],
+        "provider_profiles": [null],
+        "decisions": ["blocked-configuration"],
+        "basis_kinds": [null],
+        "request_policy_statuses": ["not-applicable"]
+      },
+      {
+        "state": "pre-epoch-input-block",
+        "selection_selected": true,
+        "selection_modes": ["implicit", "explicit"],
+        "provider_profiles": [null],
+        "decisions": ["blocked-input"],
+        "basis_kinds": [null],
+        "request_policy_statuses": ["not-applicable"]
+      },
+      {
+        "state": "input-block",
+        "selection_selected": true,
+        "selection_modes": ["implicit", "explicit"],
+        "provider_profiles": [
+          "terminal-payload",
+          "thumbs-up-clean",
+          "mixed",
+          "no-start-rejection",
+          "unknown",
+          null
+        ],
+        "decisions": ["blocked-input"],
+        "basis_kinds": [null, "stable-input-blocker"],
+        "request_policy_statuses": ["compliant", "warning", "unknown"]
+      }
+    ]
+  }
+}

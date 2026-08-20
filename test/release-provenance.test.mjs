@@ -3,11 +3,11 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
-  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -19,8 +19,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  discoverV2RuntimeModulePaths,
   parseVerifiedOpenPgpStatus,
-  selectWorkflowShaResolutionCandidate,
   writeManifest,
 } from "../scripts/generate-action-release-provenance.mjs";
 
@@ -30,115 +30,80 @@ const generatorPath = join(
   "scripts",
   "generate-action-release-provenance.mjs",
 );
-const decisionTablePath = join(
+const productionBaselinePath = join(
   repositoryRoot,
-  "packages",
-  "action",
-  "decision-table.json",
+  "docs",
+  "release",
+  "action-v2-repository-baselines.json",
 );
-const receiptSchemaPath = join(
-  repositoryRoot,
-  "packages",
-  "action",
-  "producer-receipt.schema.json",
-);
-const actionDefinitionPath = join(
-  repositoryRoot,
-  "packages",
-  "action",
-  "action.yml",
-);
-const SOURCE_REPOSITORY = "JoeyTeng/codex-review-gate";
-const ACTION_REPOSITORY = "JoeyTeng/codex-review-gate-action";
-const RELEASE = "1.5.1";
-const PROVENANCE_SCHEMA_ID =
-  "urn:joeyteng:codex-review-gate:release-provenance:2";
-const RECEIPT_SCHEMA_ID =
-  "urn:joeyteng:codex-review-gate:producer-receipt:1";
-const DECISION_TABLE_SCHEMA_ID =
-  "urn:joeyteng:codex-review-gate:decision-table:1";
-const REUSABLE_WORKFLOW_PATH = ".github/workflows/codex-review-gate.yml";
-const reusableWorkflowPath = join(
-  repositoryRoot,
-  "packages",
-  "action",
-  REUSABLE_WORKFLOW_PATH,
-);
-const REUSABLE_WORKFLOW_REFERENCE =
-  `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@v1`;
-const REUSABLE_WORKFLOW_CHECKOUT_PATH = ".codex-review-gate-action";
-const REUSABLE_WORKFLOW_LOCAL_ACTION_USE =
-  `./${REUSABLE_WORKFLOW_CHECKOUT_PATH}`;
-const CHECKOUT_SHA =
-  "11d5960a326750d5838078e36cf38b85af677262";
-const UPLOAD_ARTIFACT_SHA =
-  "ea165f8d65b6e75b540449e92b4886f43607fa02";
-const SOURCE_CHECKOUT_BINDINGS = {
-  step_id: "checkout",
-  uses: `actions/checkout@${CHECKOUT_SHA}`,
-  repository: "${{ job.workflow_repository }}",
-  ref: "${{ job.workflow_sha }}",
-  path: REUSABLE_WORKFLOW_CHECKOUT_PATH,
-  persist_credentials: false,
-  commit_output: "${{ steps.checkout.outputs.commit }}",
-  local_action: {
-    step_id: "gate",
-    uses: REUSABLE_WORKFLOW_LOCAL_ACTION_USE,
-    checked_out_action_commit_environment: {
-      name: "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA",
-      value: "${{ steps.checkout.outputs.commit }}",
-    },
+const EVIDENCE_AUTHORITY_POLICY_PATH =
+  "github-codex-evidence-authority-v2.json";
+const SOURCE_PACKAGE_IDENTITY = Object.freeze({
+  name: "codex-review-gate-source",
+  version: "2.0.0",
+  repository: {
+    type: "git",
+    url: "git+https://github.com/Joey-Tools/codex-review-gate.git",
   },
-};
-const RELEASE_PROVENANCE_ADMISSION = {
-  first_admitted_reusable_release: "1.5.1",
-  v1_5_0_complete_asset: {
-    admission: "fail-closed-not-admitted",
-    digest_erratum_supported: false,
+});
+const ACTION_PACKAGE_IDENTITY = Object.freeze({
+  name: "codex-review-gate-action",
+  version: "2.0.0",
+  repository: {
+    type: "git",
+    url: "git+https://github.com/Joey-Tools/codex-review-gate-action.git",
   },
-};
-const WORKFLOW_SHA_RESOLUTION_POLICY = {
-  manifest_candidates_field:
-    "runtime_closure.called_workflow.workflow_sha_resolution.candidates",
-  selection:
-    "selected-sha-equals-exactly-one-validated-release-provenance-candidate",
-  candidate_values_must_equal_declared_fields: true,
-  candidate_kinds: [
-    {
-      kind: "signed-major-tag-object",
-      workflow_sha_field: "tags.v1.tag_object_oid",
-      action_commit_field: "tags.v1.peeled_commit_oid",
-    },
-    {
-      kind: "exact-action-commit",
-      workflow_sha_field: "action.commit_oid",
-      action_commit_field: "action.commit_oid",
-    },
-  ],
-  common_required_equality:
-    "tags.v1.peeled_commit_oid-equals-action.commit_oid",
-};
+});
+const EXPECTED_V2_RUNTIME_MODULE_PATHS = Object.freeze([
+  "src/v2/action.mjs",
+  "src/v2/candidate-inventory.mjs",
+  "src/v2/control-plane-receipt.mjs",
+  "src/v2/controller-input-reader.mjs",
+  "src/v2/effect-status-wal.mjs",
+  "src/v2/git-ledger.mjs",
+  "src/v2/persistent-frontier.mjs",
+  "src/v2/projection.mjs",
+  "src/v2/projector.mjs",
+  "src/v2/public-report-projector.mjs",
+  "src/v2/public-report.mjs",
+  "src/v2/reducer.mjs",
+  "src/v2/runner.mjs",
+  "src/v2/scheduler.mjs",
+  "src/v2/schema.mjs",
+  "src/v2/transport.mjs",
+  "src/v2/workflow-command.mjs",
+  "src/v2/workflow-controller.mjs",
+  "src/v2/workflow-preflight.mjs",
+]);
+const SOURCE_ONLY_REQUIRED_CI_PATHS = Object.freeze([
+  ".github/workflows/required-ci.yml",
+]);
+const FIXTURE_EVIDENCE_AUTHORITY_POLICY = Object.freeze({
+  schema: "github-codex-evidence-authority-v2",
+  schema_version: 2,
+  scope: "release-fixture",
+});
 const testEnvironment = {
   ...process.env,
   CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "1",
+  GIT_ASKPASS: "/usr/bin/false",
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_TERMINAL_PROMPT: "0",
   NODE_ENV: "test",
 };
 
-function git(repo, args, { encoding = "utf8", input } = {}) {
+function git(repo, args, { encoding = "utf8" } = {}) {
   return execFileSync("git", ["-C", repo, ...args], {
     encoding,
     env: testEnvironment,
-    input,
     maxBuffer: 64 * 1024 * 1024,
-    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
   });
 }
 
-function gitText(repo, args, options = {}) {
-  return git(repo, args, options).trim();
+function gitText(repo, args) {
+  return git(repo, args).trim();
 }
 
 function initialiseRepository(path) {
@@ -150,1309 +115,1060 @@ function initialiseRepository(path) {
   git(path, ["config", "tag.gpgSign", "false"]);
 }
 
-function writeJson(path, value) {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-function writeText(path, value) {
+function writeText(path, value, mode) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, value);
+  if (mode !== undefined) chmodSync(path, mode);
 }
 
-function replaceRequired(text, expected, replacement, label) {
-  assert.notEqual(text.indexOf(expected), -1, `${label} fixture target is missing`);
-  return text.replace(expected, replacement);
+function writeJson(path, value) {
+  writeText(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function writeActionFixture(
-  destination,
-  {
-    duplicateStatusContext = false,
-    nonUtf8Path = false,
-    placeholder = false,
-    conflateRunAndPullRequestHeads = false,
-    anchorCheckoutAlias = false,
-    extraExternalAction = false,
-    flowExternalUse = false,
-    floatingCheckout = false,
-    directCommitWorkflowShaAuthority = false,
-    mutateReceiptSchema = false,
-    mutatePolicyMajor = false,
-    mutateRerunContract = false,
-    mutateTagDriftContract = false,
-    wrongCalledPath = false,
-    wrongCalledRef = false,
-    wrongCalledRepository = false,
-    wrongCalledShaBinding = false,
-    wrongCheckoutPath = false,
-    wrongCheckoutRef = false,
-    wrongCheckoutRepository = false,
-    wrongCheckoutStepId = false,
-    wrongCheckoutOutputBinding = false,
-    wrongLocalActionUse = false,
-    persistCheckoutCredentials = false,
-    quotedExternalUse = false,
-    weakenDecisionPolicy = false,
-    weakenPositiveConsumerRequirement = false,
-  } = {},
-) {
-  let actionDefinition = readFileSync(actionDefinitionPath, "utf8");
-  if (duplicateStatusContext) {
-    actionDefinition = replaceRequired(
-      actionDefinition,
-      "  status-context:\n",
-      "  status-context:\n  status-context:\n",
-      "duplicate status-context",
-    );
-  }
-  writeText(
-    join(destination, "action.yml"),
-    actionDefinition,
-  );
-  let reusableWorkflow = readFileSync(reusableWorkflowPath, "utf8");
-  const replacements = [
-    [
-      floatingCheckout,
-      `actions/checkout@${CHECKOUT_SHA}`,
-      "actions/checkout@v4",
-      "floating checkout",
-    ],
-    [
-      wrongCheckoutRepository,
-      "repository: ${{ job.workflow_repository }}",
-      "repository: ${{ github.repository }}",
-      "checkout repository",
-    ],
-    [
-      wrongCheckoutRef,
-      "ref: ${{ job.workflow_sha }}",
-      "ref: ${{ github.sha }}",
-      "checkout ref",
-    ],
-    [
-      wrongCheckoutPath,
-      `path: ${REUSABLE_WORKFLOW_CHECKOUT_PATH}`,
-      "path: .wrong-action-path",
-      "checkout path",
-    ],
-    [
-      persistCheckoutCredentials,
-      "persist-credentials: false",
-      "persist-credentials: true",
-      "checkout credentials",
-    ],
-    [
-      wrongCheckoutStepId,
-      "id: checkout",
-      "id: source-checkout",
-      "checkout step ID",
-    ],
-    [
-      wrongCheckoutOutputBinding,
-      "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ steps.checkout.outputs.commit }}",
-      "CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA: ${{ job.workflow_sha }}",
-      "checkout output binding",
-    ],
-    [
-      wrongLocalActionUse,
-      `uses: ${REUSABLE_WORKFLOW_LOCAL_ACTION_USE}`,
-      "uses: ./evil",
-      "local action path",
-    ],
-  ];
-  for (const [enabled, expected, replacement, label] of replacements) {
-    if (enabled) {
-      reusableWorkflow = replaceRequired(
-        reusableWorkflow,
-        expected,
-        replacement,
-        label,
-      );
-    }
-  }
-  if (anchorCheckoutAlias) {
-    reusableWorkflow = replaceRequired(
-      reusableWorkflow,
-      "      - name: Check out exact called-workflow release\n",
-      "      - &checkout-step\n        name: Check out exact called-workflow release\n",
-      "checkout anchor",
-    );
-    reusableWorkflow += "      - *checkout-step\n";
-  }
-  if (extraExternalAction) {
-    reusableWorkflow += `      - name: Unexpected external runtime dependency
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-`;
-  }
-  if (flowExternalUse) {
-    reusableWorkflow +=
-      "      - { uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 }\n";
-  }
-  if (quotedExternalUse) {
-    reusableWorkflow +=
-      "      - 'uses': actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020\n";
-  }
-  writeText(join(destination, REUSABLE_WORKFLOW_PATH), reusableWorkflow);
-  writeJson(join(destination, "package.json"), {
-    name: "codex-review-gate-action",
-    version: RELEASE,
-    private: true,
-  });
-  if (mutateReceiptSchema) {
-    const schema = JSON.parse(readFileSync(receiptSchemaPath, "utf8"));
-    schema.additionalProperties = true;
-    writeJson(join(destination, "producer-receipt.schema.json"), schema);
-  } else {
-    copyFileSync(
-      receiptSchemaPath,
-      join(destination, "producer-receipt.schema.json"),
-    );
-  }
-  if (
-    placeholder ||
-    conflateRunAndPullRequestHeads ||
-    directCommitWorkflowShaAuthority ||
-    mutatePolicyMajor ||
-    mutateRerunContract ||
-    mutateTagDriftContract ||
-    wrongCalledPath ||
-    wrongCalledRef ||
-    wrongCalledRepository ||
-    wrongCalledShaBinding ||
-    weakenDecisionPolicy ||
-    weakenPositiveConsumerRequirement
-  ) {
-    const table = JSON.parse(readFileSync(decisionTablePath, "utf8"));
-    if (placeholder) {
-      table["<unresolved-release-placeholder>"] = "test-only-bad-key";
-    }
-    if (weakenDecisionPolicy) {
-      table.evidence_rows.find(({ id }) => id === "clean-current").precondition =
-        "weakened-test-only-precondition";
-    }
-    if (conflateRunAndPullRequestHeads) {
-      table.producer_receipt_boundary.run_attempt_identity.required_equalities = [
-        "id-equals-receipt-producer-run-id",
-        "run_attempt-equals-receipt-producer-run-attempt",
-        "repository-full_name-equals-receipt-producer-repository",
-        "head_sha-equals-selected-receipt-status-head_sha",
-      ];
-    }
-    if (weakenPositiveConsumerRequirement) {
-      table.producer_receipt_boundary.positive_consumer_requirement
-        .selected_status.receipt_member_state = "pending";
-    }
-    if (mutatePolicyMajor) {
-      table.policy_major = 2;
-    }
-    if (mutateRerunContract) {
-      table.producer_receipt_boundary.run_attempt_identity.referenced_workflows
-        .rerun_resolution = "allow-current-v1-substitution";
-    }
-    if (mutateTagDriftContract) {
-      table.producer_receipt_boundary.run_attempt_identity.referenced_workflows
-        .tag_drift = "follow-current-v1-target";
-    }
-    if (directCommitWorkflowShaAuthority) {
-      const referencedEqualities =
-        table.producer_receipt_boundary.run_attempt_identity
-          .referenced_workflows.required_equalities;
-      const referencedIndex = referencedEqualities.indexOf(
-        "selected-sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
-      );
-      assert.notEqual(referencedIndex, -1);
-      referencedEqualities[referencedIndex] =
-        "selected-sha-equals-validated-release-provenance-action-commit_oid";
-      const calledEqualities =
-        table.producer_receipt_boundary.called_workflow_authority
-          .required_equalities;
-      const calledIndex = calledEqualities.indexOf(
-        "receipt-producer-job-workflow_sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
-      );
-      assert.notEqual(calledIndex, -1);
-      calledEqualities[calledIndex] =
-        "receipt-producer-job-workflow_sha-equals-validated-release-provenance-action-commit_oid";
-    }
-    if (wrongCalledRepository) {
-      table.producer_receipt_boundary.called_workflow_authority.repository =
-        "Mallory/codex-review-gate-action";
-    }
-    if (wrongCalledPath) {
-      table.producer_receipt_boundary.called_workflow_authority
-        .workflow_file_path = ".github/workflows/wrong.yml";
-    }
-    if (wrongCalledRef) {
-      table.producer_receipt_boundary.run_attempt_identity.referenced_workflows
-        .expected_ref = "refs/heads/v1";
-    }
-    if (wrongCalledShaBinding) {
-      table.producer_receipt_boundary.run_attempt_identity.referenced_workflows
-        .required_equalities[2] = "selected-sha-follows-current-v1-target";
-    }
-    writeJson(join(destination, "decision-table.json"), table);
-  } else {
-    copyFileSync(decisionTablePath, join(destination, "decision-table.json"));
-  }
-  writeText(join(destination, "src", "gate.mjs"), "export const fixture = true;\n");
-  writeText(
-    join(destination, "notes", "line\nbreak\tname.txt"),
-    "NUL-safe path fixture\n",
-  );
-  void nonUtf8Path;
-}
-
-function stageNonUtf8Path(repo, prefix) {
-  const blobOid = gitText(repo, ["hash-object", "-w", "--stdin"], {
-    input: "invalid UTF-8 path fixture\n",
-  });
-  const rawPath = Buffer.concat([
-    Buffer.from(`${prefix}notes/non-utf8-`, "utf8"),
-    Buffer.from([0xff]),
-  ]);
-  const indexRecord = Buffer.concat([
-    Buffer.from(`100644 blob ${blobOid}\t`, "ascii"),
-    rawPath,
-    Buffer.from([0]),
-  ]);
-  git(repo, ["update-index", "--add", "-z", "--index-info"], {
-    encoding: null,
-    input: indexRecord,
-  });
-  const index = git(repo, ["ls-files", "-z"], { encoding: null });
-  assert.notEqual(index.indexOf(0xff), -1, `raw path was not staged: ${index.toString("hex")}`);
-}
-
-function commitAll(repo, message, { nonUtf8Prefix = null } = {}) {
-  git(repo, ["add", "."]);
-  if (nonUtf8Prefix !== null) {
-    stageNonUtf8Path(repo, nonUtf8Prefix);
-  }
+function commitAll(repo, message) {
+  git(repo, ["add", "--all"]);
   git(repo, ["commit", "-q", "-m", message]);
   return gitText(repo, ["rev-parse", "HEAD"]);
 }
 
-function createFixture(t, options = {}) {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-provenance-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const sourceRepo = join(root, "source");
-  const actionRepo = join(root, "action");
-  initialiseRepository(sourceRepo);
-  initialiseRepository(actionRepo);
-
-  writeJson(join(sourceRepo, "package.json"), {
-    name: "codex-review-gate-source",
-    version: RELEASE,
-    private: true,
-  });
-  writeActionFixture(join(sourceRepo, "packages", "action"), options);
-  const sourceCommit = commitAll(sourceRepo, "source release", {
-    nonUtf8Prefix: options.nonUtf8Path ? "packages/action/" : null,
-  });
-
-  writeActionFixture(actionRepo, options);
-  const actionCommit = commitAll(actionRepo, "action split", {
-    nonUtf8Prefix: options.nonUtf8Path ? "" : null,
-  });
-  for (const name of ["v1.5.1", "v1.5", "v1"]) {
-    git(actionRepo, ["tag", "-a", name, actionCommit, "-m", `fixture ${name}`]);
-  }
-
-  return { root, sourceRepo, sourceCommit, actionRepo, actionCommit };
+function sortedObject(entries) {
+  return Object.fromEntries(
+    Object.entries(entries).sort(([left], [right]) => left.localeCompare(right)),
+  );
 }
 
-function generatorArguments(fixture, output, { testOnlySkip = true } = {}) {
-  const arguments_ = [
+function compareUtf8Paths(left, right) {
+  return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
+}
+
+function liveV2RuntimeModulePaths() {
+  const runtimeRoot = join(repositoryRoot, "packages", "action", "src", "v2");
+  return readdirSync(runtimeRoot, { withFileTypes: true })
+    .map((entry) => {
+      assert.equal(
+        entry.isFile(),
+        true,
+        `live v2 runtime entry must be a regular file: ${entry.name}`,
+      );
+      assert.match(
+        entry.name,
+        /^[a-z0-9]+(?:-[a-z0-9]+)*\.mjs$/u,
+        `live v2 runtime entry must have a canonical module name: ${entry.name}`,
+      );
+      return `src/v2/${entry.name}`;
+    })
+    .sort(compareUtf8Paths);
+}
+
+function writeRefSnapshot(path, refs) {
+  const lines = Object.entries(refs)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([ref, oid]) => `${oid}\t${ref}`);
+  writeText(path, `${lines.join("\n")}\n`);
+}
+
+function copyCommitTree(sourceRepo, commit, destination) {
+  const paths = git(sourceRepo, ["ls-tree", "-r", "-z", "--name-only", commit], {
+    encoding: null,
+  })
+    .subarray(0, -1)
+    .toString("utf8")
+    .split("\0");
+  for (const path of paths) {
+    writeText(join(destination, path), git(sourceRepo, ["show", `${commit}:${path}`]));
+  }
+}
+
+function writeV2ActionTree(
+  repo,
+  {
+    actionPackageIdentity = ACTION_PACKAGE_IDENTITY,
+    extraRuntimeModulePaths = [],
+    omitEvidenceAuthorityPolicy = false,
+  } = {},
+) {
+  writeText(
+    join(repo, "action.yml"),
+    `name: Codex Review Gate v2 Plan Adapter
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: node "$GITHUB_ACTION_PATH/src/v2/action.mjs"
+`,
+  );
+  writeText(
+    join(repo, ".github", "workflows", "codex-review-gate.yml"),
+    `name: Codex Review Gate v2
+on:
+  workflow_call:
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" run
+`,
+  );
+  writeText(
+    join(repo, ".github", "workflows", "codex-review-gate-reconcile.yml"),
+    `name: Codex Review Gate v2 Reconcile
+on:
+  workflow_dispatch:
+jobs:
+  reconcile:
+    uses: ./.github/workflows/codex-review-gate.yml
+`,
+  );
+  writeJson(join(repo, "package.json"), {
+    ...actionPackageIdentity,
+    type: "module",
+  });
+  const runtimeModulePaths = [
+    ...EXPECTED_V2_RUNTIME_MODULE_PATHS,
+    ...extraRuntimeModulePaths,
+  ].sort(compareUtf8Paths);
+  for (const path of runtimeModulePaths) {
+    writeText(
+      join(repo, path),
+      `export const name = ${JSON.stringify(path)};\n`,
+    );
+  }
+  if (!omitEvidenceAuthorityPolicy) {
+    writeJson(
+      join(repo, EVIDENCE_AUTHORITY_POLICY_PATH),
+      FIXTURE_EVIDENCE_AUTHORITY_POLICY,
+    );
+  }
+  // Retained files are history/runtime implementation details, not public v1 selectors.
+  writeText(join(repo, "src", "core.mjs"), "export const legacyCore = true;\n");
+  writeText(join(repo, "src", "gate.mjs"), "export const legacyGate = true;\n");
+}
+
+function createGeneratorFixture(t, actionTreeOptions = {}) {
+  const root = mkdtempSync(join(tmpdir(), "release-provenance-v2-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const actionRepo = join(root, "action");
+  const sourceRepo = join(root, "source");
+  initialiseRepository(actionRepo);
+
+  const firstRootCommits = [];
+  for (let index = 1; index <= 14; index += 1) {
+    writeText(join(actionRepo, "history.txt"), `${index}\n`);
+    firstRootCommits.push(commitAll(actionRepo, `action history ${index}`));
+  }
+  const baselineMaster = firstRootCommits.at(-1);
+  const preSubtree = firstRootCommits[7];
+
+  git(actionRepo, ["switch", "-q", "--orphan", "archive"]);
+  let archiveHead;
+  for (let index = 1; index <= 7; index += 1) {
+    writeText(join(actionRepo, "archive.txt"), `${index}\n`);
+    archiveHead = commitAll(actionRepo, `archive history ${index}`);
+  }
+  git(actionRepo, ["switch", "-q", "master"]);
+  writeV2ActionTree(actionRepo, actionTreeOptions);
+  const actionCommit = commitAll(actionRepo, "release v2.0.0");
+  for (const tag of ["v2.0.0", "v2.0", "v2"]) {
+    git(actionRepo, ["tag", "-a", tag, actionCommit, "-m", `fixture ${tag}`]);
+  }
+
+  initialiseRepository(sourceRepo);
+  copyCommitTree(actionRepo, actionCommit, join(sourceRepo, "packages", "action"));
+  writeJson(join(sourceRepo, "package.json"), {
+    ...SOURCE_PACKAGE_IDENTITY,
+    private: true,
+    type: "module",
+  });
+  writeText(join(sourceRepo, "README.md"), "source fixture\n");
+  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
+    writeText(join(sourceRepo, path), "name: Source-only required CI fixture\n");
+  }
+  const sourceCommit = commitAll(sourceRepo, "source release");
+
+  const frozenRefs = {
+    "refs/heads/master": baselineMaster,
+  };
+  const targetBaselineRefs = sortedObject({
+    "refs/heads/archive/pre-subtree-release-candidate-2026-05-16": archiveHead,
+    "refs/heads/master": baselineMaster,
+    "refs/heads/pre-subtree-master-2026-05-18": preSubtree,
+  });
+  const targetRefs = sortedObject({
+    ...targetBaselineRefs,
+    "refs/heads/master": actionCommit,
+    "refs/tags/v2": gitText(actionRepo, ["rev-parse", "refs/tags/v2"]),
+    "refs/tags/v2.0": gitText(actionRepo, ["rev-parse", "refs/tags/v2.0"]),
+    "refs/tags/v2.0.0": gitText(actionRepo, ["rev-parse", "refs/tags/v2.0.0"]),
+  });
+  const baselinePath = join(root, "baseline.json");
+  const targetPath = join(root, "target.tsv");
+  const frozenPath = join(root, "frozen.tsv");
+  writeJson(baselinePath, {
+    $schema: "urn:joey-tools:codex-review-gate:action-v2-repository-baselines:1",
+    schema_version: 1,
+    frozen_repository: {
+      repository: "JoeyTeng/codex-review-gate-action",
+      url: "file:///fixture/frozen.git",
+      default_branch: "master",
+      default_commit_oid: baselineMaster,
+      default_tree_oid: gitText(actionRepo, ["rev-parse", `${baselineMaster}^{tree}`]),
+      refs: sortedObject(frozenRefs),
+    },
+    target_repository: {
+      repository: "Joey-Tools/codex-review-gate-action",
+      url: "file:///fixture/target.git",
+      default_branch: "master",
+      default_commit_oid: baselineMaster,
+      default_tree_oid: gitText(actionRepo, ["rev-parse", `${baselineMaster}^{tree}`]),
+      head_commit_count: 21,
+      head_root_count: 2,
+      refs: targetBaselineRefs,
+    },
+    release: {
+      version: "2.0.0",
+      immutable_tag: "v2.0.0",
+      aliases: ["v2.0", "v2"],
+    },
+  });
+  writeRefSnapshot(targetPath, targetRefs);
+  writeRefSnapshot(frozenPath, frozenRefs);
+  return {
+    root,
+    actionRepo,
+    sourceRepo,
+    sourceCommit,
+    actionCommit,
+    baselinePath,
+    targetPath,
+    frozenPath,
+    targetRefs,
+  };
+}
+
+function runGenerator(fixture, output, overrides = {}) {
+  const args = [
     generatorPath,
     "--source-repo",
     fixture.sourceRepo,
-    "--source-repository",
-    SOURCE_REPOSITORY,
-    "--source-commit",
-    fixture.sourceCommit,
-    "--source-default-ref",
-    "refs/heads/master",
+    "--source-ref",
+    overrides.sourceRef ?? fixture.sourceCommit,
     "--action-repo",
     fixture.actionRepo,
-    "--action-repository",
-    ACTION_REPOSITORY,
-    "--action-commit",
+    "--action-ref",
     fixture.actionCommit,
-    "--action-default-ref",
-    "refs/heads/master",
-    "--immutable-tag-ref",
-    "refs/tags/v1.5.1",
-    "--minor-tag-ref",
-    "refs/tags/v1.5",
-    "--major-tag-ref",
-    "refs/tags/v1",
+    "--target-refs",
+    overrides.targetPath ?? fixture.targetPath,
+    "--frozen-refs",
+    fixture.frozenPath,
+    "--baseline",
+    fixture.baselinePath,
     "--output",
     output,
+    "--test-only-skip-signatures",
   ];
-  if (testOnlySkip) {
-    arguments_.push("--test-only-skip-signature-verification");
-  }
-  return arguments_;
-}
-
-function runGenerator(args, environment = testEnvironment) {
   return spawnSync(process.execPath, args, {
     encoding: "utf8",
-    env: environment,
+    env: { ...testEnvironment, ...overrides.env },
     maxBuffer: 64 * 1024 * 1024,
   });
 }
 
-function digest(bytes) {
-  return createHash("sha256").update(bytes).digest("hex");
-}
-
-test("decision table freezes the 1.4 verdict and 1.5 producer boundary", () => {
-  const raw = readFileSync(decisionTablePath);
-  const table = JSON.parse(raw.toString("utf8"));
-  assert.equal(table.schema, DECISION_TABLE_SCHEMA_ID);
-  assert.equal(table.schema_version, 1);
-  assert.equal(table.policy_major, 1);
-  assert.equal(table.policy_version, "1.4.0");
+test("release contract locks every live v2 runtime module in byte order", () => {
   assert.deepEqual(
-    table.status_precedence.map(({ state }) => state),
-    ["failure", "error", "success", "pending"],
+    liveV2RuntimeModulePaths(),
+    EXPECTED_V2_RUNTIME_MODULE_PATHS,
   );
-  const rows = new Map(table.evidence_rows.map((row) => [row.id, row]));
-  assert.equal(rows.size, table.evidence_rows.length);
-  assert.equal(rows.get("clean-current").controlling_state, "success-after-final-stability");
-  assert.equal(rows.get("clean-nonancestor").reducer_effect, "audit-ignore-and-reduce-remaining");
-  assert.equal(rows.get("finding-thread-current-unresolved").precondition.endsWith("exactly false"), true);
-  assert.equal(rows.get("finding-thread-current-resolved").precondition.endsWith("exactly true"), true);
-  assert.equal(rows.get("final-reread-instability").controlling_state, "error");
-  assert.equal(rows.get("overall-max-wait-expired").controlling_state, "failure");
-  assert.equal(rows.has("progress-nonancestor"), false);
-  assert.equal(rows.get("plus-one").controlling_state, "none");
-  assert.match(table.finding_closure.strictly_later, /validated updated_at/);
-  assert.match(table.finding_closure.strictly_later, /issue-comment IDs never break that tie/);
-  assert.match(
-    table.finding_closure.strictly_later,
-    /larger canonical numeric ID breaks an equal-time tie only within that review channel/,
-  );
-  assert.equal(table.orchestration.initial_ack_seconds, 300);
-  assert.equal(table.orchestration.ack_retry_cap_seconds, 1800);
-  assert.equal(table.orchestration.result_deadline_seconds, 3600);
-  assert.equal(table.orchestration.overall_max_wait_seconds, 7200);
-  assert.equal(
-    table.producer_receipt_boundary.run_attempt_api,
-    "GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}",
-  );
-  assert.equal(
-    table.producer_receipt_boundary.artifact_inventory_api,
-    "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
-  );
-  assert.equal(table.producer_receipt_boundary.status_get_by_id_api, null);
-  assert.equal(table.producer_receipt_boundary.producer_protocol_major, 1);
-  assert.equal(
-    table.producer_receipt_boundary.canonical_reusable_workflow_reference,
-    REUSABLE_WORKFLOW_REFERENCE,
-  );
-  assert.equal(table.producer_receipt_boundary.caller_selector, "v1");
-  assert.deepEqual(
-    table.producer_receipt_boundary.source_checkout,
-    SOURCE_CHECKOUT_BINDINGS,
-  );
-  assert.deepEqual(
-    table.producer_receipt_boundary.release_provenance_admission,
-    RELEASE_PROVENANCE_ADMISSION,
-  );
-  assert.match(
-    table.producer_receipt_boundary.selector_authority,
-    /exactly one release provenance workflow SHA candidate/,
-  );
-  assert.deepEqual(
-    table.producer_receipt_boundary.run_attempt_identity,
-    {
-      head_role: "caller-workflow-event-commit",
-      required_equalities: [
-        "id-equals-receipt-producer-run-id",
-        "run_attempt-equals-receipt-producer-run-attempt",
-        "repository-full_name-equals-receipt-producer-repository",
-      ],
-      referenced_workflows: {
-        field: "referenced_workflows",
-        availability:
-          "optional-nullable-upstream-but-required-non-null-for-this-reusable-workflow-contract",
-        selection: "exactly-one-exact-called-workflow-member",
-        expected_path: REUSABLE_WORKFLOW_REFERENCE,
-        expected_ref: "refs/tags/v1",
-        workflow_sha_resolution: WORKFLOW_SHA_RESOLUTION_POLICY,
-        required_equalities: [
-          `selected-path-equals-${REUSABLE_WORKFLOW_REFERENCE}`,
-          "selected-ref-equals-refs/tags/v1",
-          "selected-sha-equals-receipt-producer-job-workflow_sha",
-          "selected-sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
-          "each-workflow-sha-resolution-candidate-value-equals-its-declared-validated-release-provenance-field",
-          "validated-release-provenance-tags-v1-peeled_commit_oid-equals-validated-release-provenance-action-commit_oid",
-          "selected-path-repository-and-file-equal-receipt-producer-job-workflow_repository-and-workflow_file_path",
-        ],
-        rerun_resolution:
-          "Validate referenced_workflows from the exact receipt run attempt; never substitute the current v1 target or evidence from another attempt.",
-        tag_drift:
-          "A later v1 move does not change the exact workflow SHA recorded for an earlier run attempt or its selection from the release provenance candidate set.",
-        authority:
-          "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding",
-      },
-    },
-  );
-  assert.deepEqual(
-    table.producer_receipt_boundary.called_workflow_authority,
-    {
-      availability: "github.com-only-job-context",
-      repository: ACTION_REPOSITORY,
-      workflow_file_path: REUSABLE_WORKFLOW_PATH,
-      caller_selector: "v1",
-      caller_ref: "refs/tags/v1",
-      caller_identity_role:
-        "producer.environment.GITHUB_WORKFLOW_REF/SHA-identifies-caller-workflow-file",
-      called_job_identity_role:
-        "producer.job.workflow_ref/repository/file_path-identifies-workflow-file-defining-current-job-and-workflow_sha-identifies-selected-workflow-object-under-the-closed-resolution-policy",
-      required_equalities: [
-        `receipt-producer-job-workflow_repository-equals-${ACTION_REPOSITORY}`,
-        `receipt-producer-job-workflow_file_path-equals-${REUSABLE_WORKFLOW_PATH}`,
-        `receipt-producer-job-workflow_ref-equals-${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@refs/tags/v1`,
-        "receipt-producer-job-workflow_sha-is-lower-case-40-hex",
-        "receipt-producer-job-workflow_sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
-        "each-workflow-sha-resolution-candidate-value-equals-its-declared-validated-release-provenance-field",
-        "validated-release-provenance-tags-v1-peeled_commit_oid-equals-validated-release-provenance-action-commit_oid",
-        "receipt-producer-action-repository-equals-receipt-producer-job-workflow_repository",
-        "receipt-producer-action-ref-equals-receipt-producer-job-workflow_sha",
-        "reusable-workflow-source-checkout-id-equals-checkout",
-        "reusable-workflow-gate-checked-out-action-commit-env-equals-steps-checkout-outputs-commit",
-        "receipt-producer-action-commit_sha-equals-reusable-workflow-gate-checked-out-action-commit-env",
-        "receipt-producer-action-commit_sha-equals-validated-release-provenance-action-commit_oid",
-        "receipt-producer-action-immutable-is-true",
-      ],
-      caller_called_sha_domain_separation:
-        "GITHUB_WORKFLOW_SHA identifies the caller workflow file and must not be required to equal producer.job.workflow_sha for a reusable invocation.",
-    },
-  );
-  assert.equal(
-    table.producer_receipt_boundary.head_domain_separation
-      .workflow_run_head_may_differ_from_status_and_pull_request_head,
-    true,
-  );
-  assert.deepEqual(
-    table.producer_receipt_boundary.head_domain_separation
-      .consumer_must_not_require,
-    [
-      "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
-      "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha",
-      "exact-run-attempt-head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
-      "receipt-producer-environment-GITHUB_WORKFLOW_SHA-equals-receipt-producer-job-workflow_sha",
-    ],
-  );
-  assert.deepEqual(
-    table.producer_receipt_boundary.positive_consumer_requirement,
-    {
-      operator: "all-of",
-      execution: {
-        result: "completed",
-      },
-      selected_status: {
-        membership: "unique-rest-record-and-receipt-status-member",
-        rest_record_state: "success",
-        receipt_member_state: "success",
-      },
-    },
-  );
-  assert.doesNotMatch(raw.toString("utf8"), /<[^<>]+>/);
-});
-
-test("head domains separate run, caller, called workflow, and PR status", () => {
-  const table = JSON.parse(readFileSync(decisionTablePath, "utf8"));
-  const workflowRunHead = "1".repeat(40);
-  const currentPullRequestHead = "2".repeat(40);
-  const callerWorkflowSha = "3".repeat(40);
-  const calledWorkflowSha = "4".repeat(40);
-  const receipt = {
-    producer: {
-      environment: { GITHUB_WORKFLOW_SHA: callerWorkflowSha },
-      job: { workflow_sha: calledWorkflowSha },
-    },
-    statuses: [{ head_sha: currentPullRequestHead }],
-  };
-  const exactRunAttempt = {
-    head_sha: workflowRunHead,
-    referenced_workflows: [{ sha: calledWorkflowSha }],
-  };
-  const artifact = { workflow_run: { head_sha: workflowRunHead } };
-  const restStatusListRequest = { ref: currentPullRequestHead };
-  const graphQlStatusContext = { commit: { oid: currentPullRequestHead } };
-
-  assert.notEqual(exactRunAttempt.head_sha, callerWorkflowSha);
-  assert.notEqual(callerWorkflowSha, calledWorkflowSha);
-  assert.equal(
-    exactRunAttempt.referenced_workflows[0].sha,
-    receipt.producer.job.workflow_sha,
-  );
-  assert.equal(artifact.workflow_run.head_sha, exactRunAttempt.head_sha);
-  assert.equal(receipt.statuses[0].head_sha, currentPullRequestHead);
-  assert.equal(restStatusListRequest.ref, currentPullRequestHead);
-  assert.equal(graphQlStatusContext.commit.oid, currentPullRequestHead);
-  assert.notEqual(exactRunAttempt.head_sha, receipt.statuses[0].head_sha);
-  assert.equal(
-    table.producer_receipt_boundary.head_domain_separation
-      .workflow_run_head_may_differ_from_status_and_pull_request_head,
-    true,
-  );
-});
-
-test("generator emits deterministic complete post-merge provenance", (t) => {
-  const fixture = createFixture(t);
-  const firstOutput = join(fixture.root, "v1.5.1-release-provenance.json");
-  const first = runGenerator(generatorArguments(fixture, firstOutput));
-  assert.equal(first.status, 0, first.stderr);
-
-  const firstBytes = readFileSync(firstOutput);
-  assert.match(first.stdout, new RegExp(`sha256:${digest(firstBytes)}`));
-  const manifest = JSON.parse(firstBytes.toString("utf8"));
-  assert.equal(manifest.schema, PROVENANCE_SCHEMA_ID);
-  assert.equal(manifest.schema_version, 2);
-  assert.equal(manifest.release, RELEASE);
-  assert.deepEqual(manifest.compatibility, {
-    producer_protocol_major: 1,
-    github_immutable_release_required: true,
-    receipt_schema: {
-      schema_id: RECEIPT_SCHEMA_ID,
-      schema_version: 1,
-    },
-    decision_table: {
-      schema_id: DECISION_TABLE_SCHEMA_ID,
-      schema_version: 1,
-      policy_major: 1,
-      policy_version: "1.4.0",
-    },
-    called_workflow: {
-      repository: ACTION_REPOSITORY,
-      path: REUSABLE_WORKFLOW_PATH,
-      caller_selector: "v1",
-    },
-  });
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.release_provenance_admission,
-    RELEASE_PROVENANCE_ADMISSION,
-  );
-  const sourceActionTree = gitText(fixture.sourceRepo, [
-    "rev-parse",
-    `${fixture.sourceCommit}:packages/action`,
-  ]);
-  const actionTree = gitText(fixture.actionRepo, [
-    "rev-parse",
-    `${fixture.actionCommit}^{tree}`,
-  ]);
-  assert.equal(manifest.source.commit_oid, fixture.sourceCommit);
-  assert.equal(manifest.source.action_subtree.tree_oid, sourceActionTree);
-  assert.equal(manifest.action.commit_oid, fixture.actionCommit);
-  assert.equal(manifest.action.tree_oid, actionTree);
-  assert.equal(sourceActionTree, actionTree);
-  assert.equal(manifest.proofs.source_subtree_equals_action_root, true);
-  assert.equal(
-    manifest.proofs.critical_files_action_commit_oid,
-    fixture.actionCommit,
-  );
-  assert.equal(manifest.proofs.workflow_sha_resolution_candidates_unique, true);
-  assert.equal(manifest.proofs.major_tag_object_is_workflow_sha_candidate, true);
-  assert.equal(manifest.proofs.action_commit_is_workflow_sha_candidate, true);
-  assert.equal(manifest.proofs.major_tag_peels_to_action_commit, true);
-  assert.equal(manifest.proofs.all_tag_signatures_verified, false);
-  assert.equal(manifest.proofs.production_signature_verification_required, true);
-  assert.equal(manifest.proofs.revocation_freshness_checked, false);
-  assert.equal(manifest.proofs.runtime_external_action_set_closed, true);
-  assert.equal(manifest.proofs.release_asset_is_signed_attestation, false);
-  assert.equal(
-    manifest.action.canonical_uses,
-    `${ACTION_REPOSITORY}@${fixture.actionCommit}`,
-  );
-  assert.deepEqual(
-    Object.values(manifest.tags).map((entry) => entry.peeled_commit_oid),
-    [fixture.actionCommit, fixture.actionCommit, fixture.actionCommit],
-  );
-  assert.ok(
-    Object.values(manifest.tags).every(
-      (entry) =>
-        entry.annotated &&
-        entry.signature.method === "test-only-skip" &&
-        entry.signature.signing_key_fingerprint === null &&
-        entry.signature.primary_key_fingerprint === null,
-    ),
-  );
-  assert.deepEqual(Object.keys(manifest.tags), ["v1.5.1", "v1.5", "v1"]);
-  const majorTagObjectOid = manifest.tags.v1.tag_object_oid;
-  const workflowShaResolution = {
-    selection: "selected-sha-equals-exactly-one-candidate",
-    action_commit_oid: fixture.actionCommit,
-    candidates: [
-      {
-        kind: "signed-major-tag-object",
-        workflow_sha_field: "tags.v1.tag_object_oid",
-        workflow_sha: majorTagObjectOid,
-        action_commit_field: "tags.v1.peeled_commit_oid",
-        action_commit_oid: fixture.actionCommit,
-      },
-      {
-        kind: "exact-action-commit",
-        workflow_sha_field: "action.commit_oid",
-        workflow_sha: fixture.actionCommit,
-        action_commit_field: "action.commit_oid",
-        action_commit_oid: fixture.actionCommit,
-      },
-    ],
-  };
-  assert.notEqual(majorTagObjectOid, fixture.actionCommit);
-  assert.equal(manifest.tags.v1.peeled_commit_oid, fixture.actionCommit);
-  const expectedSourceCheckout = SOURCE_CHECKOUT_BINDINGS;
-  assert.deepEqual(
-    manifest.runtime_closure.source_checkout,
-    expectedSourceCheckout,
-  );
-  assert.deepEqual(manifest.runtime_closure.local_action_use, {
-    release_path: REUSABLE_WORKFLOW_PATH,
-    source_path: `packages/action/${REUSABLE_WORKFLOW_PATH}`,
-    uses: REUSABLE_WORKFLOW_LOCAL_ACTION_USE,
-  });
-  assert.deepEqual(manifest.runtime_closure.external_actions, [
-    {
-      release_path: REUSABLE_WORKFLOW_PATH,
-      source_path: `packages/action/${REUSABLE_WORKFLOW_PATH}`,
-      uses: `actions/checkout@${CHECKOUT_SHA}`,
-      repository: "actions/checkout",
-      commit_sha: CHECKOUT_SHA,
-    },
-    {
-      release_path: "action.yml",
-      source_path: "packages/action/action.yml",
-      uses: `actions/upload-artifact@${UPLOAD_ARTIFACT_SHA}`,
-      repository: "actions/upload-artifact",
-      commit_sha: UPLOAD_ARTIFACT_SHA,
-    },
-  ]);
-  assert.deepEqual(manifest.runtime_closure.called_workflow, {
-    repository: ACTION_REPOSITORY,
-    caller_selector: "v1",
-    caller_reference: REUSABLE_WORKFLOW_REFERENCE,
-    immutable_reference:
-      `${ACTION_REPOSITORY}/${REUSABLE_WORKFLOW_PATH}@${fixture.actionCommit}`,
-    workflow_sha_resolution: workflowShaResolution,
-    resolved_commit_oid: fixture.actionCommit,
-    peeled_action_commit_oid: fixture.actionCommit,
-    release_path: REUSABLE_WORKFLOW_PATH,
-    source_path: `packages/action/${REUSABLE_WORKFLOW_PATH}`,
-    blob_oid: manifest.critical_files.reusable_workflow.blob_oid,
-    raw_sha256: manifest.critical_files.reusable_workflow.raw_sha256,
-  });
-
-  const rawTree = git(
-    fixture.actionRepo,
-    ["ls-tree", "-r", "-z", "--full-tree", fixture.actionCommit],
-    { encoding: null },
-  );
-  assert.equal(manifest.released_tree.action_commit_oid, fixture.actionCommit);
-  assert.equal(manifest.released_tree.raw_sha256, digest(rawTree));
-  assert.equal(
-    manifest.released_tree.entry_count,
-    manifest.released_tree.entries.length,
-  );
-  assert.ok(
-    manifest.released_tree.entries.every(
-      ({ mode, type, blob_oid }) =>
-        /^[0-7]{6}$/.test(mode) &&
-        type === "blob" &&
-        /^[0-9a-f]{40}$/.test(blob_oid),
-    ),
-  );
-  assert.ok(
-    manifest.released_tree.entries.some(
-      ({ path }) => path === "notes/line\nbreak\tname.txt",
-    ),
-  );
-  for (const critical of Object.values(manifest.critical_files)) {
-    const rawBlob = git(
-      fixture.actionRepo,
-      ["cat-file", "blob", critical.blob_oid],
-      { encoding: null },
+  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
+    assert.equal(
+      existsSync(join(repositoryRoot, "packages", "action", path)),
+      false,
+      `${path} must remain outside the released action subtree`,
     );
-    assert.equal(critical.raw_sha256, digest(rawBlob));
   }
-  assert.equal(
-    manifest.critical_files.decision_table.immutable_url,
-    `https://github.com/${ACTION_REPOSITORY}/blob/${fixture.actionCommit}/decision-table.json`,
-  );
-  assert.equal(
-    manifest.critical_files.decision_table.policy_version,
-    "1.4.0",
-  );
-  assert.equal(manifest.critical_files.decision_table.policy_major, 1);
-  assert.equal(
-    manifest.critical_files.decision_table.frozen_admission_sha256,
-    digest(readFileSync(decisionTablePath)),
-  );
-  assert.equal(
-    manifest.critical_files.producer_receipt_schema.frozen_admission_sha256,
-    digest(readFileSync(receiptSchemaPath)),
-  );
-  assert.equal(
-    manifest.critical_files.action_definition.frozen_admission_sha256,
-    digest(readFileSync(actionDefinitionPath)),
-  );
-  assert.equal(
-    manifest.critical_files.reusable_workflow.frozen_admission_sha256,
-    digest(readFileSync(reusableWorkflowPath)),
-  );
-  assert.equal(
-    manifest.critical_files.reusable_workflow.action_commit_oid,
-    fixture.actionCommit,
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.run_attempt_api.route,
-    "/repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}",
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.run_attempt_api.required_equalities,
-    [
-      "id-equals-receipt-producer-run-id",
-      "run_attempt-equals-receipt-producer-run-attempt",
-      "repository-full_name-equals-receipt-producer-repository",
-    ],
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.run_attempt_api.referenced_workflows,
-    {
-      field: "referenced_workflows",
-      availability:
-        "optional-nullable-upstream-but-required-non-null-for-this-reusable-workflow-contract",
-      selection: "exactly-one-exact-called-workflow-member",
-      expected_path: REUSABLE_WORKFLOW_REFERENCE,
-      expected_ref: "refs/tags/v1",
-      workflow_sha_resolution: workflowShaResolution,
-      workflow_sha_resolution_policy: WORKFLOW_SHA_RESOLUTION_POLICY,
-      required_equalities: [
-        `selected-path-equals-${REUSABLE_WORKFLOW_REFERENCE}`,
-        "selected-ref-equals-refs/tags/v1",
-        "selected-sha-equals-receipt-producer-job-workflow_sha",
-        "selected-sha-equals-exactly-one-validated-release-provenance-runtime_closure-called_workflow-workflow_sha_resolution-candidate",
-        "each-workflow-sha-resolution-candidate-value-equals-its-declared-validated-release-provenance-field",
-        "validated-release-provenance-tags-v1-peeled_commit_oid-equals-validated-release-provenance-action-commit_oid",
-        "selected-path-repository-and-file-equal-receipt-producer-job-workflow_repository-and-workflow_file_path",
-      ],
-      rerun_resolution:
-        "exact-receipt-run-attempt-only-no-current-selector-substitution",
-      tag_drift:
-        "later-v1-movement-does-not-change-historical-attempt-workflow-sha-or-candidate-selection",
-      authority:
-        "run-level-attempt-corroboration-only-no-job-callsite-or-receipt-cryptographic-binding",
-    },
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.called_workflow_authority
-      .workflow_sha_resolution,
-    workflowShaResolution,
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.called_workflow_authority
-      .workflow_sha_resolution_policy,
-    WORKFLOW_SHA_RESOLUTION_POLICY,
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.called_workflow_authority.accepted_resolved_sha,
-    fixture.actionCommit,
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.called_workflow_authority
-      .peeled_action_commit_oid,
-    fixture.actionCommit,
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.exact_action_bindings,
-    [
-      "producer.action.repository-equals-producer.job.workflow_repository",
-      "producer.action.ref-equals-producer.job.workflow_sha",
-      "producer.action.commit_sha-equals-CODEX_REVIEW_GATE_CHECKED_OUT_ACTION_COMMIT_SHA",
-      "producer.action.commit_sha-equals-release-provenance.action.commit_oid",
-      "producer.action.immutable-is-true",
-    ],
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.source_checkout,
-    expectedSourceCheckout,
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.artifact_inventory_api.route,
-    "/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.receipt_statuses.scope,
-    "run-level-ordered-multi-pull-request",
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.accepted_execution_result_for_positive_decision,
-    "completed",
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.positive_consumer_requirement,
-    {
-      operator: "all-of",
-      execution: {
-        result: "completed",
-      },
-      selected_status: {
-        membership: "unique-rest-record-and-receipt-status-member",
-        rest_record_state: "success",
-        receipt_member_state: "success",
-      },
-    },
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.artifact_inventory_api.required_output_bindings,
-    [
-      "producer-receipt-artifact-id",
-      "producer-receipt-artifact-url",
-      "producer-receipt-artifact-digest",
-    ],
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.artifact_inventory_api.expected_zip_member_count,
-    1,
-  );
-  assert.ok(
-    manifest.contracts.producer_receipt.artifact_inventory_api.required_metadata.includes(
-      "digest",
-    ),
-  );
-  assert.ok(
-    manifest.contracts.producer_receipt.artifact_inventory_api.required_equalities.includes(
-      "producer-receipt-artifact-id-equals-artifact-api-id",
-    ),
-  );
-  assert.ok(
-    manifest.contracts.producer_receipt.artifact_inventory_api.required_equalities.includes(
-      "artifact-api-workflow_run-head_sha-equals-exact-run-attempt-head_sha",
-    ),
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.receipt_statuses.required_head_equalities,
-    [
-      "selected-receipt-status-head_sha-equals-current-pull-request-head_sha",
-      "rest-status-list-request-ref-equals-current-pull-request-head_sha",
-      "selected-graphql-status-context-commit-oid-equals-current-pull-request-head_sha",
-      "selected-receipt-status-head_sha-equals-selected-graphql-status-context-commit-oid",
-    ],
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.head_domain_separation
-      .workflow_run_head_may_differ_from_status_and_pull_request_head,
-    true,
-  );
-  assert.ok(
-    !manifest.contracts.producer_receipt.run_attempt_api.required_equalities.includes(
-      "head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
-    ),
-  );
-  assert.equal(
-    manifest.contracts.producer_receipt.head_domain_separation
-      .caller_workflow_sha_may_differ_from_called_workflow_sha,
-    true,
-  );
-  assert.deepEqual(
-    manifest.contracts.producer_receipt.head_domain_separation
-      .consumer_must_not_require,
-    [
-      "exact-run-attempt-head_sha-equals-selected-receipt-status-head_sha",
-      "artifact-api-workflow_run-head_sha-equals-selected-receipt-status-head_sha",
-      "exact-run-attempt-head_sha-equals-receipt-producer-environment-GITHUB_WORKFLOW_SHA",
-      "receipt-producer-environment-GITHUB_WORKFLOW_SHA-equals-receipt-producer-job-workflow_sha",
-    ],
-  );
-  assert.equal(manifest.contracts.status.rest.get_by_id_available, false);
-
-  const secondOutput = join(fixture.root, "second-provenance.json");
-  const second = runGenerator(generatorArguments(fixture, secondOutput));
-  assert.equal(second.status, 0, second.stderr);
-  assert.deepEqual(readFileSync(secondOutput), firstBytes);
-});
-
-test("annotated @v1 live shape selects the tag-object candidate", (t) => {
-  const fixture = createFixture(t);
-  const output = join(fixture.root, "live-shape-provenance.json");
-  const result = runGenerator(generatorArguments(fixture, output));
-  assert.equal(result.status, 0, result.stderr);
-  const manifest = JSON.parse(readFileSync(output, "utf8"));
-  const observedWorkflowSha = manifest.tags.v1.tag_object_oid;
-  const receipt = {
-    producer: {
-      job: { workflow_sha: observedWorkflowSha },
-      action: {
-        repository: ACTION_REPOSITORY,
-        ref: observedWorkflowSha,
-        commit_sha: fixture.actionCommit,
-        immutable: true,
-      },
-    },
-  };
-  const referencedWorkflow = {
-    path: REUSABLE_WORKFLOW_REFERENCE,
-    ref: "refs/tags/v1",
-    sha: observedWorkflowSha,
-  };
-
-  assert.notEqual(observedWorkflowSha, fixture.actionCommit);
-  assert.equal(referencedWorkflow.sha, receipt.producer.job.workflow_sha);
-  assert.equal(receipt.producer.action.ref, observedWorkflowSha);
-  assert.equal(receipt.producer.action.commit_sha, fixture.actionCommit);
-  assert.notEqual(
-    receipt.producer.action.commit_sha,
-    receipt.producer.action.ref,
-  );
-  assert.equal(
-    selectWorkflowShaResolutionCandidate(
-      observedWorkflowSha,
-      manifest.runtime_closure.called_workflow.workflow_sha_resolution,
-    ).kind,
-    "signed-major-tag-object",
-  );
-  assert.equal(manifest.tags.v1.peeled_commit_oid, fixture.actionCommit);
-  assert.equal(manifest.action.commit_oid, fixture.actionCommit);
-  assert.equal(
-    manifest.proofs.critical_files_action_commit_oid,
-    fixture.actionCommit,
-  );
-});
-
-test("workflow SHA resolution admits both closed branches and rejects mutations", (t) => {
-  const fixture = createFixture(t);
-  const output = join(fixture.root, "workflow-sha-resolution.json");
-  const result = runGenerator(generatorArguments(fixture, output));
-  assert.equal(result.status, 0, result.stderr);
-  const manifest = JSON.parse(readFileSync(output, "utf8"));
-  const resolution =
-    manifest.runtime_closure.called_workflow.workflow_sha_resolution;
-  const tagObjectOid = manifest.tags.v1.tag_object_oid;
-  const actionCommitOid = manifest.action.commit_oid;
-
-  assert.notEqual(tagObjectOid, actionCommitOid);
-  assert.equal(
-    selectWorkflowShaResolutionCandidate(tagObjectOid, resolution).kind,
-    "signed-major-tag-object",
-  );
-  assert.equal(
-    selectWorkflowShaResolutionCandidate(actionCommitOid, resolution).kind,
-    "exact-action-commit",
-  );
-
-  for (const [index, selectedSha] of [
-    [0, tagObjectOid],
-    [1, actionCommitOid],
+  for (const [path, expected] of [
+    [join(repositoryRoot, "package.json"), SOURCE_PACKAGE_IDENTITY],
+    [join(repositoryRoot, "packages", "action", "package.json"), ACTION_PACKAGE_IDENTITY],
   ]) {
-    const mutated = structuredClone(resolution);
-    mutated.candidates[index].workflow_sha = "f".repeat(40);
-    assert.throws(
-      () => selectWorkflowShaResolutionCandidate(selectedSha, mutated),
-      /must equal exactly one release provenance candidate/,
+    const actual = JSON.parse(readFileSync(path, "utf8"));
+    assert.deepEqual(
+      {
+        name: actual.name,
+        version: actual.version,
+        repository: actual.repository,
+      },
+      expected,
     );
   }
 });
 
-test("GnuPG status parser records distinct signing and primary fingerprints", () => {
-  const signingKeyFingerprint = "1".repeat(40);
-  const primaryKeyFingerprint = "2".repeat(40);
-  const result = {
-    stdout: Buffer.from(
-      `[GNUPG:] GOODSIG ${signingKeyFingerprint} Release Signing Subkey\n` +
-        `[GNUPG:] VALIDSIG ${signingKeyFingerprint} 2026-08-09 0 0 0 0 0 0 00 ${primaryKeyFingerprint}\n`,
-      "utf8",
-    ),
-    stderr: Buffer.alloc(0),
-  };
-  assert.deepEqual(parseVerifiedOpenPgpStatus(result, "v1.5.1"), {
-    signingKeyFingerprint,
-    primaryKeyFingerprint,
+test("runtime module discovery fails closed on structural ambiguity", async (t) => {
+  const regularEntries = EXPECTED_V2_RUNTIME_MODULE_PATHS.map((path) => ({
+    path,
+    mode: "100644",
+    type: "blob",
+  }));
+  assert.deepEqual(
+    discoverV2RuntimeModulePaths({ entries: [...regularEntries].reverse() }),
+    EXPECTED_V2_RUNTIME_MODULE_PATHS,
+  );
+
+  await t.test("missing required entry", () => {
+    assert.throws(
+      () => discoverV2RuntimeModulePaths({
+        entries: regularEntries.filter(({ path }) => path !== "src/v2/action.mjs"),
+      }),
+      /missing required v2 identity src\/v2\/action\.mjs/u,
+    );
   });
 
+  await t.test("symlinked module", () => {
+    assert.throws(
+      () => discoverV2RuntimeModulePaths({
+        entries: regularEntries.map((entry) => entry.path === "src/v2/reducer.mjs"
+          ? { ...entry, mode: "120000" }
+          : entry),
+      }),
+      /must be a regular non-symlink Git blob/u,
+    );
+  });
+
+  await t.test("duplicate path", () => {
+    assert.throws(
+      () => discoverV2RuntimeModulePaths({
+        entries: [...regularEntries, { ...regularEntries[0] }],
+      }),
+      /duplicate path/u,
+    );
+  });
+
+  await t.test("noncanonical module path", () => {
+    assert.throws(
+      () => discoverV2RuntimeModulePaths({
+        entries: [
+          ...regularEntries,
+          { path: "src/v2/Not_Canonical.mjs", mode: "100644", type: "blob" },
+        ],
+      }),
+      /noncanonical path/u,
+    );
+  });
+});
+
+test("production baseline freezes every old personal ref and the transferred target", () => {
+  const baselineBytes = readFileSync(productionBaselinePath);
+  assert.equal(
+    createHash("sha256").update(baselineBytes).digest("hex"),
+    "63dc08cdf35720a5659ec6e2557ac4a3f49c26be331f4b62d1cb3e402336df6a",
+  );
+  const baseline = JSON.parse(baselineBytes);
+  assert.equal(baseline.frozen_repository.repository, "JoeyTeng/codex-review-gate-action");
+  assert.equal(Object.keys(baseline.frozen_repository.refs).length, 27);
+  assert.equal(
+    baseline.frozen_repository.refs["refs/heads/master"],
+    "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
+  );
+  assert.equal(
+    baseline.frozen_repository.default_tree_oid,
+    "8d909dd441b28b6915c46f60e8a144e64fd5268b",
+  );
+  assert.equal(
+    baseline.frozen_repository.refs["refs/tags/v1.5.1"],
+    "f9201d016b0abd21403550c3bf8030eb0beb76b4",
+  );
+  assert.deepEqual(Object.keys(baseline.target_repository.refs), [
+    "refs/heads/archive/pre-subtree-release-candidate-2026-05-16",
+    "refs/heads/master",
+    "refs/heads/pre-subtree-master-2026-05-18",
+  ]);
+  assert.equal(baseline.target_repository.head_commit_count, 21);
+  assert.equal(baseline.target_repository.head_root_count, 2);
+  assert.deepEqual(baseline.release, {
+    version: "2.0.0",
+    immutable_tag: "v2.0.0",
+    aliases: ["v2.0", "v2"],
+  });
+});
+
+test("GnuPG status parser binds signing and primary fingerprints", () => {
+  const signing = "0123456789ABCDEF0123456789ABCDEF01234567";
+  const primary = "89ABCDEF0123456789ABCDEF0123456789ABCDEF";
+  const result = {
+    stdout: Buffer.from(""),
+    stderr: Buffer.from(
+      `[GNUPG:] GOODSIG ${signing.slice(-16)} Release Fixture\n` +
+        `[GNUPG:] VALIDSIG ${signing} 2026-08-13 1786579200 0 4 0 1 10 00 ${primary}\n`,
+    ),
+  };
+  assert.deepEqual(parseVerifiedOpenPgpStatus(result, "v2.0.0"), {
+    signingKeyFingerprint: signing.toLowerCase(),
+    primaryKeyFingerprint: primary.toLowerCase(),
+  });
+  assert.deepEqual(
+    parseVerifiedOpenPgpStatus(
+      {
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.from(
+          `[GNUPG:] GOODSIG ${primary.slice(-16)} Release Fixture\n` +
+            `[GNUPG:] VALIDSIG ${primary} 2026-08-13 1786579200 0 4 0 1 10 00\n`,
+        ),
+      },
+      "v2-primary-key",
+    ),
+    {
+      signingKeyFingerprint: primary.toLowerCase(),
+      primaryKeyFingerprint: primary.toLowerCase(),
+    },
+  );
+  assert.throws(
+    () =>
+      parseVerifiedOpenPgpStatus(
+        {
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(`[GNUPG:] BADSIG ${signing.slice(-16)} bad\n`),
+        },
+        "v2.0.0",
+      ),
+    /rejecting GnuPG signature status/,
+  );
   for (const invalidLength of [41, 63]) {
     const invalidFingerprint = "3".repeat(invalidLength);
     assert.throws(
       () =>
         parseVerifiedOpenPgpStatus(
           {
-            stdout: Buffer.from(
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(
               "[GNUPG:] GOODSIG 3333333333333333 Invalid Length\n" +
-                `[GNUPG:] VALIDSIG ${invalidFingerprint} 2026-08-09 0 0 0 0 0 0 00 ${primaryKeyFingerprint}\n`,
-              "utf8",
+                `[GNUPG:] VALIDSIG ${invalidFingerprint} 2026-08-13 0 0 0 0 0 0 00 ${primary}\n`,
             ),
-            stderr: Buffer.alloc(0),
           },
-          "invalid tag",
+          "v2.0.0",
         ),
       /inconsistent GOODSIG\/VALIDSIG identity/,
     );
   }
 });
 
-test("final pre-publication ref-race failure publishes no manifest", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-publish-race-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
-  const phases = [];
-  let refsStable = true;
-
-  await assert.rejects(
-    writeManifest(
-      output,
-      { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 },
-      {
-        beforePublish: () => {
-          phases.push("before-publication");
-          assert.equal(existsSync(output), false);
-        },
-        afterStagingValidation: () => {
-          phases.push("after-staging-validation");
-          refsStable = false;
-        },
-        finalPrePublish: () => {
-          phases.push("final-pre-publication");
-          assert.equal(existsSync(output), false);
-          if (!refsStable) {
-            throw new Error("simulated final pre-publication ref drift");
-          }
-        },
-      },
-    ),
-    /simulated final pre-publication ref drift/,
+test("generator emits complete v2-only split, tag, tree, and frozen-ref provenance", (t) => {
+  const fixture = createGeneratorFixture(t);
+  const output = join(fixture.root, "provenance.json");
+  const result = runGenerator(fixture, output);
+  assert.equal(result.status, 0, result.stderr);
+  const manifest = JSON.parse(readFileSync(output, "utf8"));
+  assert.equal(
+    manifest.$schema,
+    "urn:joey-tools:codex-review-gate:action-release-provenance:3",
   );
-  assert.deepEqual(phases, [
-    "before-publication",
-    "after-staging-validation",
-    "final-pre-publication",
+  assert.equal(manifest.source.commit_oid, fixture.sourceCommit);
+  const sourcePackageBytes = readFileSync(
+    join(fixture.sourceRepo, "package.json"),
+  );
+  const sourcePackageOid = gitText(fixture.sourceRepo, [
+    "rev-parse",
+    `${fixture.sourceCommit}:package.json`,
   ]);
+  assert.deepEqual(manifest.source.package_identity, {
+    role: "v2-source-package",
+    path: "package.json",
+    object_oid: sourcePackageOid,
+    sha256: createHash("sha256").update(sourcePackageBytes).digest("hex"),
+    name: SOURCE_PACKAGE_IDENTITY.name,
+    version: SOURCE_PACKAGE_IDENTITY.version,
+    repository_url: SOURCE_PACKAGE_IDENTITY.repository.url,
+  });
+  assert.equal(manifest.action.commit_oid, fixture.actionCommit);
+  assert.equal(manifest.action.source_subtree_tree_equal, true);
+  assert.deepEqual(manifest.release.selector_policy.admitted, ["v2.0.0", "v2.0", "v2"]);
+  assert.equal(manifest.release.selector_policy.v1_refs_admitted, false);
+  assert.equal(manifest.remote_state.target.no_v1_refs, true);
+  assert.equal(manifest.remote_state.frozen_personal.all_refs_equal_recorded_baseline, true);
+  assert.equal(manifest.history.transferred_initial_heads.commit_count, 21);
+  assert.equal(manifest.history.transferred_initial_heads.root_count, 2);
+  assert.equal(manifest.history.transferred_master_is_ancestor, true);
+  assert.ok(manifest.history.release_split.commit_count >= 15);
+  assert.ok(manifest.released_tree.entry_count >= 14);
+  assert.equal(manifest.runtime_identity.public_entry.path, "action.yml");
+  assert.equal(manifest.runtime_identity.reusable_workflow.path, ".github/workflows/codex-review-gate.yml");
+  assert.equal(
+    manifest.runtime_identity.reconciliation_workflow.path,
+    ".github/workflows/codex-review-gate-reconcile.yml",
+  );
+  assert.equal(manifest.runtime_identity.controller.path, "src/v2/workflow-controller.mjs");
+  assert.equal(manifest.runtime_identity.plan_adapter.path, "src/v2/action.mjs");
+  assert.deepEqual(
+    manifest.runtime_identity.runtime_modules.map(({ path }) => path),
+    EXPECTED_V2_RUNTIME_MODULE_PATHS,
+  );
+  const policyBytes = readFileSync(
+    join(fixture.actionRepo, EVIDENCE_AUTHORITY_POLICY_PATH),
+  );
+  const policySha256 = createHash("sha256").update(policyBytes).digest("hex");
+  const policyTreeEntry = manifest.released_tree.entries.find(
+    ({ path }) => path === EVIDENCE_AUTHORITY_POLICY_PATH,
+  );
+  assert.ok(policyTreeEntry);
+  assert.deepEqual(manifest.runtime_identity.evidence_authority_policy, {
+    role: "v2-evidence-authority-policy",
+    path: EVIDENCE_AUTHORITY_POLICY_PATH,
+    object_oid: policyTreeEntry.object_oid,
+    sha256: policySha256,
+    policy_digest: `sha256:${policySha256}`,
+  });
+  const actionPackageBytes = readFileSync(
+    join(fixture.actionRepo, "package.json"),
+  );
+  const actionPackageTreeEntry = manifest.released_tree.entries.find(
+    ({ path }) => path === "package.json",
+  );
+  assert.ok(actionPackageTreeEntry);
+  assert.deepEqual(manifest.runtime_identity.package, {
+    role: "v2-action-package",
+    path: "package.json",
+    object_oid: actionPackageTreeEntry.object_oid,
+    sha256: createHash("sha256").update(actionPackageBytes).digest("hex"),
+    name: ACTION_PACKAGE_IDENTITY.name,
+    version: ACTION_PACKAGE_IDENTITY.version,
+    repository_url: ACTION_PACKAGE_IDENTITY.repository.url,
+  });
+  const releasedPaths = new Set(
+    manifest.released_tree.entries.map(({ path }) => path),
+  );
+  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
+    assert.equal(existsSync(join(fixture.sourceRepo, path)), true);
+    assert.equal(releasedPaths.has(path), false);
+  }
+  assert.doesNotMatch(
+    JSON.stringify(manifest.runtime_identity),
+    /required-ci/u,
+  );
+  assert.equal(manifest.runtime_identity.legacy_files_policy.selector_compatibility_granted, false);
+  for (const tag of ["v2.0.0", "v2.0", "v2"]) {
+    assert.equal(manifest.tags[tag].direct, true);
+    assert.equal(manifest.tags[tag].peeled_commit_oid, fixture.actionCommit);
+    assert.equal(manifest.tags[tag].signature.method, "closed-test-only-skip");
+  }
+});
+
+test("a newly added canonical v2 module cannot escape runtime identity", (t) => {
+  const futureModulePath = "src/v2/zz-future-module.mjs";
+  const fixture = createGeneratorFixture(t, {
+    extraRuntimeModulePaths: [futureModulePath],
+  });
+  const output = join(fixture.root, "future-module-provenance.json");
+  const result = runGenerator(fixture, output);
+  assert.equal(result.status, 0, result.stderr);
+  const manifest = JSON.parse(readFileSync(output, "utf8"));
+  assert.deepEqual(
+    manifest.runtime_identity.runtime_modules.map(({ path }) => path),
+    [...EXPECTED_V2_RUNTIME_MODULE_PATHS, futureModulePath].sort(compareUtf8Paths),
+  );
+});
+
+test("generator rejects a missing evidence authority policy without publishing", (t) => {
+  const fixture = createGeneratorFixture(t, {
+    omitEvidenceAuthorityPolicy: true,
+  });
+  const output = join(fixture.root, "missing-policy-provenance.json");
+  const result = runGenerator(fixture, output);
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /missing required v2 identity github-codex-evidence-authority-v2\.json/u,
+  );
   assert.equal(existsSync(output), false);
 });
 
-test("post-publication failure preserves this invocation's linked output for audit", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-post-publish-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
-  const manifest = { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 };
-  const published = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  let linkedIdentity;
+test("generator rejects stale source and action package identities", async (t) => {
+  await t.test("source package", () => {
+    const fixture = createGeneratorFixture(t);
+    writeJson(join(fixture.sourceRepo, "package.json"), {
+      ...SOURCE_PACKAGE_IDENTITY,
+      version: "1.5.1",
+      private: true,
+      type: "module",
+    });
+    const staleSourceCommit = commitAll(fixture.sourceRepo, "stale source package");
+    const output = join(fixture.root, "stale-source-package.json");
+    const result = runGenerator(fixture, output, {
+      sourceRef: staleSourceCommit,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      /source package\.json must identify codex-review-gate-source@2\.0\.0/u,
+    );
+    assert.equal(existsSync(output), false);
+  });
 
-  await assert.rejects(
-    writeManifest(
-      output,
-      manifest,
-      {
-        afterPublish: () => {
-          assert.equal(existsSync(output), true);
-          linkedIdentity = lstatSync(output, { bigint: true });
-          throw new Error("simulated post-publication ref drift");
+  await t.test("action package", () => {
+    const fixture = createGeneratorFixture(t, {
+      actionPackageIdentity: {
+        ...ACTION_PACKAGE_IDENTITY,
+        repository: {
+          type: "git",
+          url: "git+https://github.com/JoeyTeng/codex-review-gate-action.git",
         },
       },
-    ),
-    /leaving the final output path untouched.*Verify whether .* exists, isolate any retained object, and use a new output path for retry/,
+    });
+    const output = join(fixture.root, "stale-action-package.json");
+    const result = runGenerator(fixture, output);
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      /released package\.json must identify codex-review-gate-action@2\.0\.0/u,
+    );
+    assert.equal(existsSync(output), false);
+  });
+});
+
+test("generator ignores ambient Git repository and config injection", (t) => {
+  const fixture = createGeneratorFixture(t);
+  const rogueRepository = join(fixture.root, "rogue");
+  initialiseRepository(rogueRepository);
+  writeText(join(rogueRepository, "rogue.txt"), "not the release repository\n");
+  commitAll(rogueRepository, "rogue");
+  const output = join(fixture.root, "ambient-git.json");
+  const result = runGenerator(fixture, output, {
+    env: {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.repositoryformatversion",
+      GIT_CONFIG_VALUE_0: "99",
+      GIT_DIR: join(rogueRepository, ".git"),
+      GIT_WORK_TREE: rogueRepository,
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const manifest = JSON.parse(readFileSync(output, "utf8"));
+  assert.equal(manifest.source.commit_oid, fixture.sourceCommit);
+  assert.equal(manifest.action.commit_oid, fixture.actionCommit);
+});
+
+test("generator rejects any target v1 ref without publishing a manifest", (t) => {
+  const fixture = createGeneratorFixture(t);
+  const mutatedTarget = join(fixture.root, "target-v1.tsv");
+  writeRefSnapshot(mutatedTarget, {
+    ...fixture.targetRefs,
+    "refs/tags/v1": fixture.actionCommit,
+  });
+  const output = join(fixture.root, "rejected.json");
+  const result = runGenerator(fixture, output, { targetPath: mutatedTarget });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /differs from the frozen contract|v1 ref is forbidden/);
+  assert.equal(existsSync(output), false);
+});
+
+test("generator rejects source/action tree mismatch without publishing", (t) => {
+  const fixture = createGeneratorFixture(t);
+  writeText(join(fixture.sourceRepo, "packages", "action", "extra.txt"), "changed\n");
+  const changedSource = commitAll(fixture.sourceRepo, "mutate source tree");
+  const output = join(fixture.root, "tree-mismatch.json");
+  const result = runGenerator(fixture, output, { sourceRef: changedSource });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /source packages\/action tree differs/);
+  assert.equal(existsSync(output), false);
+});
+
+test("production generation cannot activate the signature bypass", (t) => {
+  const fixture = createGeneratorFixture(t);
+  const output = join(fixture.root, "production-bypass.json");
+  const result = spawnSync(
+    process.execPath,
+    [
+      generatorPath,
+      "--source-repo",
+      fixture.sourceRepo,
+      "--source-ref",
+      fixture.sourceCommit,
+      "--action-repo",
+      fixture.actionRepo,
+      "--action-ref",
+      fixture.actionCommit,
+      "--target-refs",
+      fixture.targetPath,
+      "--frozen-refs",
+      fixture.frozenPath,
+      "--baseline",
+      fixture.baselinePath,
+      "--output",
+      output,
+      "--test-only-skip-signatures",
+    ],
+    {
+      encoding: "utf8",
+      env: { ...testEnvironment, CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "0" },
+    },
   );
-  assert.equal(existsSync(output), true);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /closed test environment/);
+  assert.equal(existsSync(output), false);
+});
+
+test("production rejects a rewritten repository freeze baseline", (t) => {
+  const fixture = createGeneratorFixture(t);
+  const baseline = JSON.parse(readFileSync(fixture.baselinePath, "utf8"));
+  baseline.frozen_repository.refs["refs/heads/master"] = "f".repeat(40);
+  writeJson(fixture.baselinePath, baseline);
+  const output = join(fixture.root, "rewritten-baseline.json");
+  const result = spawnSync(
+    process.execPath,
+    [
+      generatorPath,
+      "--source-repo",
+      fixture.sourceRepo,
+      "--source-ref",
+      fixture.sourceCommit,
+      "--action-repo",
+      fixture.actionRepo,
+      "--action-ref",
+      fixture.actionCommit,
+      "--target-refs",
+      fixture.targetPath,
+      "--frozen-refs",
+      fixture.frozenPath,
+      "--baseline",
+      fixture.baselinePath,
+      "--expected-signing-fingerprint",
+      "A".repeat(40),
+      "--output",
+      output,
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...testEnvironment,
+        CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "0",
+      },
+    },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /source release contract|permanent production freeze/);
+  assert.equal(existsSync(output), false);
+});
+
+test("production generation rejects unsigned annotated tags", (t) => {
+  const fixture = createGeneratorFixture(t);
+  const output = join(fixture.root, "unsigned.json");
+  const result = spawnSync(
+    process.execPath,
+    [
+      generatorPath,
+      "--source-repo",
+      fixture.sourceRepo,
+      "--source-ref",
+      fixture.sourceCommit,
+      "--action-repo",
+      fixture.actionRepo,
+      "--action-ref",
+      fixture.actionCommit,
+      "--target-refs",
+      fixture.targetPath,
+      "--frozen-refs",
+      fixture.frozenPath,
+      "--baseline",
+      fixture.baselinePath,
+      "--expected-signing-fingerprint",
+      "A".repeat(40),
+      "--output",
+      output,
+    ],
+    { encoding: "utf8", env: testEnvironment },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /OpenPGP signature verification failed/);
+  assert.equal(existsSync(output), false);
+});
+
+test("production signature verification ignores a malicious repo-local GPG program", (t) => {
+  const fixture = createGeneratorFixture(t);
+  const marker = join(fixture.root, "fake-gpg-ran");
+  const fakeGpg = join(fixture.root, "fake-gpg");
+  writeText(
+    fakeGpg,
+    `#!/bin/sh
+printf 'ran\n' > ${JSON.stringify(marker)}
+printf '%s\n' '[GNUPG:] GOODSIG 0123456789ABCDEF Fake Signer'
+printf '%s\n' '[GNUPG:] VALIDSIG 0000000000000000000000000123456789ABCDEF 2026-08-13 0 0 0 0 0 0 00 0000000000000000000000000123456789ABCDEF'
+exit 0
+`,
+    0o755,
+  );
+  git(fixture.actionRepo, ["config", "gpg.program", fakeGpg]);
+  git(fixture.actionRepo, ["config", "gpg.openpgp.program", fakeGpg]);
+  const output = join(fixture.root, "malicious-gpg.json");
+  const result = spawnSync(
+    process.execPath,
+    [
+      generatorPath,
+      "--source-repo",
+      fixture.sourceRepo,
+      "--source-ref",
+      fixture.sourceCommit,
+      "--action-repo",
+      fixture.actionRepo,
+      "--action-ref",
+      fixture.actionCommit,
+      "--target-refs",
+      fixture.targetPath,
+      "--frozen-refs",
+      fixture.frozenPath,
+      "--baseline",
+      fixture.baselinePath,
+      "--expected-signing-fingerprint",
+      "A".repeat(40),
+      "--output",
+      output,
+    ],
+    { encoding: "utf8", env: testEnvironment },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /OpenPGP signature verification failed/);
+  assert.equal(existsSync(marker), false);
+  assert.equal(existsSync(output), false);
+});
+
+test("final pre-publication audit failure publishes no manifest", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-pre-publish-race-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "manifest.json");
+  const phases = [];
+  await assert.rejects(
+    writeManifest(output, { release: "2.0.0" }, {
+      beforePublish: async () => phases.push("before"),
+      afterStagingValidation: async () => phases.push("staged"),
+      finalPrePublish: async () => {
+        phases.push("final");
+        throw new Error("simulated final ref drift");
+      },
+    }),
+    /simulated final ref drift/,
+  );
+  assert.deepEqual(phases, ["before", "staged", "final"]);
+  assert.equal(existsSync(output), false);
+});
+
+test("writeManifest publishes a private create-only file with a stable digest", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-publication-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "manifest.json");
+  const manifest = { release: "2.0.0", commit: "a".repeat(40) };
+  const result = await writeManifest(output, manifest);
+  const bytes = readFileSync(output);
+  assert.equal(result.absoluteOutput, output);
+  assert.equal(result.digest, createHash("sha256").update(bytes).digest("hex"));
+  assert.equal(lstatSync(output).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(bytes), manifest);
+});
+
+test("writeManifest never overwrites an existing output", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-existing-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "manifest.json");
+  writeText(output, "keep me\n");
+  await assert.rejects(
+    writeManifest(output, { release: "2.0.0" }),
+    /output already exists; refusing to replace/,
+  );
+  assert.equal(readFileSync(output, "utf8"), "keep me\n");
+});
+
+test("writeManifest preserves a concurrent winner at the create-only boundary", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-race-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "manifest.json");
+  await assert.rejects(
+    writeManifest(output, { release: "2.0.0" }, {
+      finalPrePublish: async () => writeFileSync(output, "winner\n"),
+    }),
+    /output already exists; refusing to replace/,
+  );
+  assert.equal(readFileSync(output, "utf8"), "winner\n");
+});
+
+test("writeManifest revalidates staged content immediately before linking", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-stage-mutate-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "manifest.json");
+  await assert.rejects(
+    writeManifest(output, { release: "2.0.0" }, {
+      afterStagingValidation: async () => {
+        const stagingName = readdirSync(root).find((name) =>
+          name.startsWith("manifest.json.tmp-"));
+        assert.ok(stagingName);
+        const stagingPath = join(root, stagingName, "manifest");
+        const intended = readFileSync(stagingPath);
+        writeFileSync(stagingPath, Buffer.alloc(intended.length, "x"));
+      },
+    }),
+    /manifest staging object content differs from the intended manifest/,
+  );
+  assert.equal(existsSync(output), false);
+});
+
+test("writeManifest retains a linked output after a post-link audit failure", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-post-link-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "manifest.json");
+  await assert.rejects(
+    writeManifest(output, { release: "2.0.0" }, {
+      afterLink: async () => {
+        throw new Error("simulated audit failure");
+      },
+    }),
+    /leaving the final output path untouched/,
+  );
+  assert.equal(JSON.parse(readFileSync(output, "utf8")).release, "2.0.0");
+});
+
+test("post-publication failure preserves this invocation's linked output for audit", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-post-publish-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "manifest.json");
+  const manifest = { release: "2.0.0", audit: true };
+  const expected = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  let linkedIdentity;
+  await assert.rejects(
+    writeManifest(output, manifest, {
+      afterPublish: async () => {
+        linkedIdentity = lstatSync(output, { bigint: true });
+        throw new Error("simulated post-publication ref drift");
+      },
+    }),
+    /leaving the final output path untouched.*use a new output path for retry/,
+  );
   const retainedIdentity = lstatSync(output, { bigint: true });
   assert.equal(retainedIdentity.dev, linkedIdentity.dev);
   assert.equal(retainedIdentity.ino, linkedIdentity.ino);
-  assert.deepEqual(readFileSync(output), published);
+  assert.deepEqual(readFileSync(output), expected);
 });
 
-test("post-publication failure preserves a replacement output", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-post-replace-"));
+test("post-publication failure never removes a replacement output", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-post-replace-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
+  const output = join(root, "manifest.json");
   const replacementPath = join(root, "replacement.json");
-  const manifest = { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 };
-  const replacement = Buffer.from(
-    `${JSON.stringify(manifest, null, 2)}\n`,
-    "utf8",
-  );
+  const replacement = Buffer.from("replacement audit object\n");
   writeFileSync(replacementPath, replacement, { mode: 0o600 });
-
   await assert.rejects(
-    writeManifest(
-      output,
-      manifest,
-      {
-        afterPublish: () => {
-          renameSync(replacementPath, output);
-          throw new Error("simulated post-publication ref drift");
-        },
+    writeManifest(output, { release: "2.0.0" }, {
+      afterPublish: async () => {
+        renameSync(replacementPath, output);
+        throw new Error("simulated post-publication ref drift");
       },
-    ),
-    /leaving the final output path untouched.*Verify whether .* exists, isolate any retained object, and use a new output path for retry/,
+    }),
+    /leaving the final output path untouched.*use a new output path for retry/,
   );
-  assert.equal(existsSync(output), true);
   assert.deepEqual(readFileSync(output), replacement);
 });
 
 test("post-link identity validation preserves an early replacement", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-link-replace-"));
+  const root = mkdtempSync(join(tmpdir(), "manifest-link-replace-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
+  const output = join(root, "manifest.json");
   const replacementPath = join(root, "replacement.json");
-  const manifest = { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 };
-  const replacement = Buffer.from(
-    `${JSON.stringify(manifest, null, 2)}\n`,
-    "utf8",
-  );
+  const replacement = Buffer.from("early replacement\n");
   writeFileSync(replacementPath, replacement, { mode: 0o600 });
-
   await assert.rejects(
-    writeManifest(output, manifest, {
-      afterLink: () => renameSync(replacementPath, output),
+    writeManifest(output, { release: "2.0.0" }, {
+      afterLink: async () => renameSync(replacementPath, output),
     }),
-    /leaving the final output path untouched.*Verify whether .* exists, isolate any retained object, and use a new output path for retry/,
+    /leaving the final output path untouched.*use a new output path for retry/,
   );
-  assert.equal(existsSync(output), true);
   assert.deepEqual(readFileSync(output), replacement);
 });
 
-test("post-link failure distinguishes a moved final path from retained output", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-post-move-"));
+test("post-link validation rejects a silent same-object content mutation", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-link-mutate-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
-  const movedOutput = join(root, "release-provenance.moved.json");
-  const manifest = { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 };
-  const published = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-
-  await assert.rejects(
-    writeManifest(output, manifest, {
-      afterLink: () => renameSync(output, movedOutput),
-    }),
-    /leaving the final output path untouched.*Verify whether .* exists, isolate any retained object, and use a new output path for retry/,
-  );
-  assert.equal(existsSync(output), false);
-  assert.equal(existsSync(movedOutput), true);
-  assert.deepEqual(readFileSync(movedOutput), published);
-});
-
-test("post-publication failure never unlinks an in-place changed object", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-post-mutate-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
-  const manifest = { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 };
-  const published = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  const changed = Buffer.alloc(published.length, "x");
+  const output = join(root, "manifest.json");
+  const manifest = { release: "2.0.0", mutate: "after-link" };
+  const intended = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  const changed = Buffer.alloc(intended.length, "x");
   let linkedIdentity;
-
   await assert.rejects(
     writeManifest(output, manifest, {
-      afterPublish: () => {
+      afterLink: async () => {
         linkedIdentity = lstatSync(output, { bigint: true });
         writeFileSync(output, changed);
-        const changedIdentity = lstatSync(output, { bigint: true });
-        assert.equal(changedIdentity.dev, linkedIdentity.dev);
-        assert.equal(changedIdentity.ino, linkedIdentity.ino);
-        assert.equal(changedIdentity.size, linkedIdentity.size);
-        throw new Error("simulated in-place post-publication race");
       },
     }),
-    /leaving the final output path untouched.*Verify whether .* exists, isolate any retained object, and use a new output path for retry/,
+    /published manifest content differs from the intended manifest/,
   );
-  assert.equal(existsSync(output), true);
   const retainedIdentity = lstatSync(output, { bigint: true });
   assert.equal(retainedIdentity.dev, linkedIdentity.dev);
   assert.equal(retainedIdentity.ino, linkedIdentity.ino);
   assert.deepEqual(readFileSync(output), changed);
 });
 
-test("post-link staging cleanup failure preserves the primary audit error", async (t) => {
-  if (typeof process.getuid !== "function" || process.getuid() === 0) {
-    t.skip("permission-based staging cleanup fault requires a non-root POSIX user");
-    return;
-  }
-
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-cleanup-failure-"));
-  t.after(() => {
-    chmodSync(root, 0o700);
-    rmSync(root, { recursive: true, force: true });
-  });
-  const output = join(root, "release-provenance.json");
-  const manifest = { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 };
-  const published = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-
-  try {
-    await assert.rejects(
-      writeManifest(output, manifest, {
-        afterPublish: () => {
-          chmodSync(root, 0o500);
-          throw new Error("simulated post-publication ref drift");
-        },
-      }),
-      (error) => {
-        assert.ok(error instanceof AggregateError);
-        assert.match(
-          error.message,
-          /manifest publication failed after linking output \(simulated post-publication ref drift\); staging cleanup also failed/,
-        );
-        assert.match(
-          error.message,
-          /leaving the final output path untouched.*use a new output path for retry/,
-        );
-        assert.equal(
-          error.errors.some(
-            (cause) => cause.message === "simulated post-publication ref drift",
-          ),
-          true,
-        );
-        assert.ok(error.errors.length >= 2);
-        return true;
-      },
-    );
-  } finally {
-    chmodSync(root, 0o700);
-  }
-  assert.equal(existsSync(output), true);
-  assert.deepEqual(readFileSync(output), published);
-});
-
-test("manifest publication never overwrites an existing output", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-existing-output-"));
+test("post-link failure distinguishes a moved final path from retained output", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-post-move-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
-  const existing = Buffer.from("known-good-existing-manifest\n", "utf8");
-  writeFileSync(output, existing, { mode: 0o600 });
-
+  const output = join(root, "manifest.json");
+  const moved = join(root, "manifest.moved.json");
+  const manifest = { release: "2.0.0", moved: true };
   await assert.rejects(
-    writeManifest(output, {
-      schema: PROVENANCE_SCHEMA_ID,
-      schema_version: 2,
+    writeManifest(output, manifest, {
+      afterLink: async () => renameSync(output, moved),
     }),
-    /output already exists; refusing to replace/,
+    /leaving the final output path untouched.*use a new output path for retry/,
   );
-  assert.deepEqual(readFileSync(output), existing);
+  assert.equal(existsSync(output), false);
+  assert.deepEqual(JSON.parse(readFileSync(moved, "utf8")), manifest);
 });
 
-test("concurrent output creation is preserved instead of overwritten", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-concurrent-output-"));
+test("post-publication failure never unlinks an in-place changed object", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-post-mutate-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
-  const replacement = Buffer.from("concurrent-publisher-manifest\n", "utf8");
-
+  const output = join(root, "manifest.json");
+  const manifest = { release: "2.0.0", mutate: true };
+  const intended = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  const changed = Buffer.alloc(intended.length, "x");
+  let linkedIdentity;
   await assert.rejects(
-    writeManifest(
-      output,
-      { schema: PROVENANCE_SCHEMA_ID, schema_version: 2 },
-      {
-        finalPrePublish: () => {
-          writeFileSync(output, replacement, { flag: "wx", mode: 0o600 });
-        },
+    writeManifest(output, manifest, {
+      afterPublish: async () => {
+        linkedIdentity = lstatSync(output, { bigint: true });
+        writeFileSync(output, changed);
+        const changedIdentity = lstatSync(output, { bigint: true });
+        assert.equal(changedIdentity.dev, linkedIdentity.dev);
+        assert.equal(changedIdentity.ino, linkedIdentity.ino);
+        throw new Error("simulated in-place mutation");
       },
-    ),
-    /output already exists; refusing to replace/,
+    }),
+    /leaving the final output path untouched.*use a new output path for retry/,
   );
-  assert.deepEqual(readFileSync(output), replacement);
+  const retainedIdentity = lstatSync(output, { bigint: true });
+  assert.equal(retainedIdentity.dev, linkedIdentity.dev);
+  assert.equal(retainedIdentity.ino, linkedIdentity.ino);
+  assert.deepEqual(readFileSync(output), changed);
+});
+
+test("final audit revalidation rejects a silent same-object content mutation", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "manifest-final-mutate-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const output = join(root, "manifest.json");
+  const manifest = { release: "2.0.0", mutate: "after-audit" };
+  const intended = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  const changed = Buffer.alloc(intended.length, "x");
+  let linkedIdentity;
+  await assert.rejects(
+    writeManifest(output, manifest, {
+      afterPublish: async () => {
+        linkedIdentity = lstatSync(output, { bigint: true });
+        writeFileSync(output, changed);
+      },
+    }),
+    /published manifest after final audit content differs from the intended manifest/,
+  );
+  const retainedIdentity = lstatSync(output, { bigint: true });
+  assert.equal(retainedIdentity.dev, linkedIdentity.dev);
+  assert.equal(retainedIdentity.ino, linkedIdentity.ino);
+  assert.deepEqual(readFileSync(output), changed);
 });
 
 test("same-process concurrent invocations cannot collide on private staging", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codex-review-gate-concurrent-stage-"));
+  const root = mkdtempSync(join(tmpdir(), "manifest-concurrent-stage-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "release-provenance.json");
+  const output = join(root, "manifest.json");
   let releaseFirst;
   let reportFirstReady;
   const firstReady = new Promise((resolveReady) => {
@@ -1461,304 +1177,53 @@ test("same-process concurrent invocations cannot collide on private staging", as
   const firstMayPublish = new Promise((resolvePublish) => {
     releaseFirst = resolvePublish;
   });
-
   const first = assert.rejects(
-    writeManifest(
-      output,
-      { invocation: "first" },
-      {
-        finalPrePublish: async () => {
-          reportFirstReady();
-          await firstMayPublish;
-        },
+    writeManifest(output, { invocation: "first" }, {
+      finalPrePublish: async () => {
+        reportFirstReady();
+        await firstMayPublish;
       },
-    ),
+    }),
     /output already exists; refusing to replace/,
   );
   await firstReady;
-
-  const secondManifest = { invocation: "second" };
-  await writeManifest(output, secondManifest);
+  const second = { invocation: "second" };
+  await writeManifest(output, second);
   releaseFirst();
   await first;
-  assert.deepEqual(
-    JSON.parse(readFileSync(output, "utf8")),
-    secondManifest,
-  );
+  assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), second);
 });
 
-test("production generation rejects unsigned annotated tags", (t) => {
-  const fixture = createFixture(t);
-  const output = join(fixture.root, "unsigned.json");
-  const result = runGenerator(
-    generatorArguments(fixture, output, { testOnlySkip: false }),
-  );
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /signature verification failed/);
-  assert.equal(existsSync(output), false);
-});
-
-test("production signature verification ignores a malicious repo-local GPG program", (t) => {
-  const fixture = createFixture(t);
-  const fakeGpg = join(fixture.root, "fake-gpg");
-  writeText(
-    fakeGpg,
-    `#!/bin/sh
-printf '%s\n' '[GNUPG:] GOODSIG 0123456789ABCDEF Fake Signer'
-printf '%s\n' '[GNUPG:] VALIDSIG 0000000000000000000000000123456789ABCDEF 2026-08-09 0 0 0 0 0 0 00 0000000000000000000000000123456789ABCDEF'
-exit 0
-`,
-  );
-  chmodSync(fakeGpg, 0o755);
-  git(fixture.actionRepo, ["config", "gpg.program", fakeGpg]);
-  git(fixture.actionRepo, ["config", "gpg.openpgp.program", fakeGpg]);
-
-  const output = join(fixture.root, "malicious-gpg.json");
-  const result = runGenerator(
-    generatorArguments(fixture, output, { testOnlySkip: false }),
-  );
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /signature verification failed/);
-  assert.equal(existsSync(output), false);
-});
-
-test("generation rejects a semantic mutation that preserves decision row IDs", (t) => {
-  const fixture = createFixture(t, { weakenDecisionPolicy: true });
-  const output = join(fixture.root, "weakened-policy.json");
-  const result = runGenerator(generatorArguments(fixture, output));
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /does not match the reviewed frozen release policy/);
-  assert.equal(existsSync(output), false);
-});
-
-test("generation rejects a weakened positive consumer status requirement", (t) => {
-  const fixture = createFixture(t, {
-    weakenPositiveConsumerRequirement: true,
-  });
-  const output = join(fixture.root, "weakened-positive-consumer.json");
-  const result = runGenerator(generatorArguments(fixture, output));
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /positive consumer contract contradicts release policy/);
-  assert.equal(existsSync(output), false);
-});
-
-test("generation rejects a mutated receipt v1 schema", (t) => {
-  const fixture = createFixture(t, { mutateReceiptSchema: true });
-  const output = join(fixture.root, "mutated-receipt-schema.json");
-  const result = runGenerator(generatorArguments(fixture, output));
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /reviewed frozen receipt v1 schema/);
-  assert.equal(existsSync(output), false);
-});
-
-test("generation rejects reusable workflow authority mutations", async (t) => {
-  const cases = [
-    {
-      name: "policy major",
-      options: { mutatePolicyMajor: true },
-      pattern: /decision table identity contradicts compatibility policy/,
-    },
-    {
-      name: "called repository",
-      options: { wrongCalledRepository: true },
-      pattern: /called workflow authority contradicts release policy/,
-    },
-    {
-      name: "called path",
-      options: { wrongCalledPath: true },
-      pattern: /called workflow authority contradicts release policy/,
-    },
-    {
-      name: "called ref",
-      options: { wrongCalledRef: true },
-      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
-    },
-    {
-      name: "called sha binding",
-      options: { wrongCalledShaBinding: true },
-      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
-    },
-    {
-      name: "old direct commit sha authority",
-      options: { directCommitWorkflowShaAuthority: true },
-      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
-    },
-    {
-      name: "tag drift",
-      options: { mutateTagDriftContract: true },
-      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
-    },
-    {
-      name: "rerun substitution",
-      options: { mutateRerunContract: true },
-      pattern: /exact-attempt referenced workflow contract contradicts release policy/,
-    },
-  ];
-  for (const testCase of cases) {
-    await t.test(testCase.name, () => {
-      const fixture = createFixture(t, testCase.options);
-      const output = join(fixture.root, `${testCase.name.replaceAll(" ", "-")}.json`);
-      const result = runGenerator(generatorArguments(fixture, output));
-      assert.notEqual(result.status, 0);
-      assert.match(result.stderr, testCase.pattern);
-      assert.equal(existsSync(output), false);
-    });
+test("post-link staging cleanup failure preserves the primary audit error", async (t) => {
+  if (typeof process.getuid !== "function" || process.getuid() === 0) {
+    t.skip("permission-based staging cleanup fault requires a non-root POSIX user");
+    return;
   }
-});
-
-test("generation rejects an open or mutated runtime closure", async (t) => {
-  await t.test("floating external action", () => {
-    const fixture = createFixture(t, { floatingCheckout: true });
-    const output = join(fixture.root, "floating-runtime-action.json");
-    const result = runGenerator(generatorArguments(fixture, output));
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
-    assert.equal(existsSync(output), false);
+  const root = mkdtempSync(join(tmpdir(), "manifest-cleanup-failure-"));
+  t.after(() => {
+    chmodSync(root, 0o700);
+    rmSync(root, { recursive: true, force: true });
   });
-
-  await t.test("extra pinned external action", () => {
-    const fixture = createFixture(t, { extraExternalAction: true });
-    const output = join(fixture.root, "extra-runtime-action.json");
-    const result = runGenerator(generatorArguments(fixture, output));
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
-    assert.equal(existsSync(output), false);
-  });
-
-  const bindingMutations = [
-    ["wrong checkout repository", { wrongCheckoutRepository: true }],
-    ["wrong checkout ref", { wrongCheckoutRef: true }],
-    ["wrong checkout path", { wrongCheckoutPath: true }],
-    ["persisted checkout credentials", { persistCheckoutCredentials: true }],
-    ["wrong checkout step id", { wrongCheckoutStepId: true }],
-    ["wrong checkout output binding", { wrongCheckoutOutputBinding: true }],
-  ];
-  for (const [name, options] of bindingMutations) {
-    await t.test(name, () => {
-      const fixture = createFixture(t, options);
-      const output = join(fixture.root, `${name.replaceAll(" ", "-")}.json`);
-      const result = runGenerator(generatorArguments(fixture, output));
-      assert.notEqual(result.status, 0);
-      assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
-      assert.equal(existsSync(output), false);
-    });
+  const output = join(root, "manifest.json");
+  try {
+    await assert.rejects(
+      writeManifest(output, { release: "2.0.0" }, {
+        afterPublish: async () => {
+          chmodSync(root, 0o500);
+          throw new Error("simulated post-publication ref drift");
+        },
+      }),
+      (error) => {
+        assert.ok(error instanceof AggregateError);
+        assert.match(error.message, /simulated post-publication ref drift/);
+        assert.match(error.message, /staging cleanup also failed/);
+        assert.match(error.message, /leaving the final output path untouched/);
+        assert.ok(error.errors.length >= 2);
+        return true;
+      },
+    );
+  } finally {
+    chmodSync(root, 0o700);
   }
-
-  await t.test("wrong local action path", () => {
-    const fixture = createFixture(t, { wrongLocalActionUse: true });
-    const output = join(fixture.root, "wrong-local-action-path.json");
-    const result = runGenerator(generatorArguments(fixture, output));
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
-    assert.equal(existsSync(output), false);
-  });
-
-  const nonCanonicalYamlCases = [
-    ["flow-style uses mapping", { flowExternalUse: true }],
-    ["quoted uses mapping", { quotedExternalUse: true }],
-    ["anchor alias step", { anchorCheckoutAlias: true }],
-  ];
-  for (const [name, options] of nonCanonicalYamlCases) {
-    await t.test(name, () => {
-      const fixture = createFixture(t, options);
-      const output = join(fixture.root, `${name.replaceAll(" ", "-")}.json`);
-      const result = runGenerator(generatorArguments(fixture, output));
-      assert.notEqual(result.status, 0);
-      assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
-      assert.equal(existsSync(output), false);
-    });
-  }
-});
-
-test("generation rejects a consumer contract that conflates workflow-run and PR heads", (t) => {
-  const fixture = createFixture(t, {
-    conflateRunAndPullRequestHeads: true,
-  });
-  const output = join(fixture.root, "conflated-run-pr-heads.json");
-  const result = runGenerator(generatorArguments(fixture, output));
-  assert.notEqual(result.status, 0);
-  assert.match(
-    result.stderr,
-    /workflow-run and pull-request head binding contract contradicts release policy/,
-  );
-  assert.equal(existsSync(output), false);
-});
-
-test("generation rejects a release tree that differs from the source subtree", (t) => {
-  const fixture = createFixture(t);
-  writeText(join(fixture.actionRepo, "unexpected.txt"), "not in source subtree\n");
-  const actionCommit = commitAll(fixture.actionRepo, "divergent action tree");
-  const output = join(fixture.root, "divergent.json");
-  const result = runGenerator(
-    generatorArguments({ ...fixture, actionCommit }, output),
-  );
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /does not equal action root tree/);
-});
-
-test("generation rejects nested tags and unresolved placeholders", async (t) => {
-  await t.test("nested annotated tag", () => {
-    const fixture = createFixture(t);
-    git(fixture.actionRepo, [
-      "tag",
-      "-a",
-      "v1.5.1-inner",
-      fixture.actionCommit,
-      "-m",
-      "inner fixture",
-    ]);
-    git(fixture.actionRepo, [
-      "tag",
-      "-f",
-      "-a",
-      "v1.5.1",
-      "refs/tags/v1.5.1-inner",
-      "-m",
-      "nested fixture",
-    ]);
-    const result = runGenerator(
-      generatorArguments(fixture, join(fixture.root, "nested.json")),
-    );
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /must be a direct annotated tag/);
-  });
-
-  await t.test("placeholder in decision table", () => {
-    const fixture = createFixture(t, { placeholder: true });
-    const result = runGenerator(
-      generatorArguments(fixture, join(fixture.root, "placeholder.json")),
-    );
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /contains an unresolved placeholder/);
-  });
-});
-
-test("generation rejects duplicate YAML keys and non-UTF8 release paths", async (t) => {
-  await t.test("duplicate status-context", () => {
-    const fixture = createFixture(t, { duplicateStatusContext: true });
-    const result = runGenerator(
-      generatorArguments(fixture, join(fixture.root, "duplicate-yaml.json")),
-    );
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /reviewed frozen runtime entrypoint/);
-  });
-
-  await t.test("non-UTF8 path", () => {
-    const fixture = createFixture(t, { nonUtf8Path: true });
-    const rawTree = git(
-      fixture.actionRepo,
-      ["ls-tree", "-r", "-z", "--full-tree", fixture.actionCommit],
-      { encoding: null },
-    );
-    assert.notEqual(
-      rawTree.indexOf(0xff),
-      -1,
-      `fixture must contain a raw 0xff path byte: ${rawTree.toString("hex")}`,
-    );
-    const result = runGenerator(
-      generatorArguments(fixture, join(fixture.root, "non-utf8.json")),
-    );
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /published action path is not canonical UTF-8/);
-  });
+  assert.equal(existsSync(output), true);
 });
