@@ -14,13 +14,11 @@ const routerWorkflowPath = join(
   ".github/workflows/required-ci-router.yml",
 );
 
-const CHECKOUT =
-  "actions/checkout@11d5960a326750d5838078e36cf38b85af677262";
-const SETUP_NODE =
-  "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
+const CHECKOUT = "actions/checkout@v4";
+const SETUP_NODE = "actions/setup-node@v4";
 const REQUIRED_REPOSITORY = "Joey-Tools/codex-review-gate";
 
-test("required CI exposes only the Node.js 20 review-gate closure", () => {
+test("required CI exposes the complete Node.js 20 delivery closure", () => {
   const source = readFileSync(requiredWorkflowPath, "utf8");
   const root = rootBlock(yamlLines(source));
 
@@ -43,7 +41,7 @@ test("required CI exposes only the Node.js 20 review-gate closure", () => {
   assert.equal(directScalar(job, "runs-on"), "ubuntu-latest");
 
   const steps = listItemBlocks(childBlock(job, "steps"));
-  assert.equal(steps.length, 7);
+  assert.equal(steps.length, 8);
   const checkoutSteps = steps.filter(
     (step) =>
       itemKeys(step).includes("uses") &&
@@ -73,18 +71,30 @@ test("required CI exposes only the Node.js 20 review-gate closure", () => {
     "node-version": '"20"',
   });
   assert.deepEqual(itemKeys(steps[3]), ["run"]);
-  assert.equal(itemScalar(steps[3], "run"), "npm run check:state-machine");
+  assert.equal(itemScalar(steps[3], "run"), "npm run check");
   assert.deepEqual(itemKeys(steps[4]), ["run"]);
-  assert.equal(itemScalar(steps[4], "run"), "npm run test:state-machine");
+  assert.equal(itemScalar(steps[4], "run"), "npm test");
   assert.deepEqual(itemKeys(steps[5]), ["run"]);
-  assert.equal(itemScalar(steps[5], "run"), "npm run test:v2");
+  assert.equal(itemScalar(steps[5], "run"), "bash -n scripts/release-action-subtree.sh");
   assert.deepEqual(itemKeys(steps[6]), ["run"]);
+  assert.equal(itemScalar(steps[6], "run"), "shellcheck scripts/release-action-subtree.sh");
+  assert.deepEqual(itemKeys(steps[7]), ["run"]);
   assert.equal(
-    itemScalar(steps[6], "run"),
+    itemScalar(steps[7], "run"),
     "node --test test/required-ci-workflow.test.mjs",
   );
 
+  const actionUses = steps
+    .filter((step) => itemKeys(step).includes("uses"))
+    .map((step) => itemScalar(step, "uses"));
+  assert.deepEqual(actionUses, [CHECKOUT, SETUP_NODE]);
+  for (const action of actionUses) {
+    assert.match(action, /^actions\/[a-z0-9-]+@v[1-9][0-9]*$/u);
+  }
+
   assert.doesNotMatch(source, /pull_request_target|\bsecrets\b/u);
+  assert.doesNotMatch(source, /uses:\s*[^\n]+@main\b/u);
+  assert.doesNotMatch(source, /uses:\s*[^\n]+@[0-9a-f]{40}\b/u);
   assert.doesNotMatch(source, /inputs\.(?:repository|ref)/u);
   assert.doesNotMatch(source, /repository:\s*\$\{\{\s*github\.repository/u);
   assert.doesNotMatch(source, /^\s+[A-Za-z-]+:\s*write\s*$/mu);

@@ -582,29 +582,34 @@ test("canonical reusable identity keeps the caller workflow binding independent"
   }
 });
 
-test("the live v2 plan adapter binds only its closed inputs and GitHub API endpoints", async () => {
+test("the live v2 direct runtime uses only the closed JavaScript Action ABI", async () => {
   const actionDefinition = await readFile(actionDefinitionPath, "utf8");
-  const expectedBindings = [
-    "V2_GITHUB_TOKEN: ${{ inputs.github-token }}",
-    "V2_PULL_REQUEST: ${{ inputs.pull-request }}",
-    "V2_OPERATION: ${{ inputs.operation }}",
-    "V2_STATUS_TARGET_MODE: ${{ inputs.status-target-mode }}",
-    "V2_OPERATION_INPUT_PATH: ${{ inputs.operation-input-path }}",
-    "V2_REST_BASE_URL: ${{ github.api_url }}",
-    "V2_GRAPHQL_URL: ${{ github.graphql_url }}",
+  const expectedInputs = [
+    "github_token",
+    "pr_number",
+    "expected_head_sha",
+    "operation",
+    "request_comment_id",
+    "request_review",
+    "limits_profile",
   ];
 
-  for (const binding of expectedBindings) {
-    assert.equal(
-      actionDefinition.split("\n").some((line) => line.trim() === binding),
-      true,
-      `action.yml must bind ${binding}`,
-    );
+  for (const input of expectedInputs) {
+    assert.match(actionDefinition, new RegExp(`^  ${input}:$`, "mu"));
   }
-  assert.doesNotMatch(actionDefinition, /CODEX_REVIEW_GATE_/u);
+  for (const legacyInput of [
+    "github-token",
+    "pull-request",
+    "request-review",
+    "max-pages",
+    "max-objects",
+  ]) {
+    assert.doesNotMatch(actionDefinition, new RegExp(`^  ${legacyInput}:$`, "mu"));
+  }
+  assert.doesNotMatch(actionDefinition, /using:\s*composite|\n\s*steps:|\$\{\{/u);
   assert.match(
     actionDefinition,
-    /run: node "\$GITHUB_ACTION_PATH\/src\/v2\/action\.mjs"/u,
+    /runs:\n  using: node20\n  main: src\/v2\/gate-runtime\.mjs\n?$/u,
   );
 });
 
@@ -612,7 +617,8 @@ test("the v2 action omits v1 receipts while the retained v1 gate disables them o
   const actionDefinition = await readFile(actionDefinitionPath, "utf8");
   assert.doesNotMatch(actionDefinition, /CODEX_REVIEW_GATE_RECEIPT_PATH/u);
   assert.doesNotMatch(actionDefinition, /src\/gate\.mjs/u);
-  assert.match(actionDefinition, /src\/v2\/action\.mjs/u);
+  assert.doesNotMatch(actionDefinition, /src\/v2\/action\.mjs/u);
+  assert.match(actionDefinition, /src\/v2\/gate-runtime\.mjs/u);
 
   const { result, receiptRaw, output } = await runReceiptGate({
     actionRef: ACTION_SHA,

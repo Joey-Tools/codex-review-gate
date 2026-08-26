@@ -1,0 +1,2183 @@
+import assert from "node:assert/strict";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  V2_HARD_LIMITS,
+  V2_LIMITS_PROFILES,
+  V2_OUTPUT_KEYS,
+  V2_REACTION_FETCH_CONCURRENCY,
+  V2_RECOVERY_CODES,
+  V2_STABILITY_INTERVAL_MS,
+  V2_STABILITY_WINDOW_MS,
+  V2_STATUS_CONTEXT,
+  V2_STICKY_MARKER,
+  appendV2GateSummary,
+  buildCanonicalV2ReviewRequestBody,
+  buildV2GateReport,
+  buildV2ReactionCleanArtifacts,
+  buildV2StickyCommentBody,
+  canonicalV2RequestComments,
+  normalizeV2LimitsProfile,
+  normalizeV2Operation,
+  normalizeV2RequestReview,
+  parseCanonicalV2ReviewRequestBody,
+  runV2GateCli,
+  waitForStableV2Snapshot,
+} from "../packages/action/src/v2/gate-runtime.mjs";
+
+const OWNER = "owner";
+const REPO = "repo";
+const REPOSITORY = `${OWNER}/${REPO}`;
+const PR = 17;
+const REPO_ID = 424_242;
+const HEAD = "a".repeat(40);
+const NEXT_HEAD = "d".repeat(40);
+const BASE = "b".repeat(40);
+const OLD_HEAD = "c".repeat(40);
+const CODEX_BOT = { login: "chatgpt-codex-connector[bot]", type: "Bot" };
+const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
+const HUMAN = { login: "joey", type: "User" };
+const READER = { login: "reader", type: "User" };
+const CODEX_APP = { slug: "chatgpt-codex-connector" };
+
+test("normalizers, profiles, result vocabulary, and production constants are closed", () => {
+  assert.equal(normalizeV2Operation(undefined), "reconcile");
+  assert.equal(normalizeV2Operation("begin-review"), "begin-review");
+  assert.throws(() => normalizeV2Operation("scan"), /reconcile or begin-review/u);
+  assert.equal(normalizeV2RequestReview(undefined), true);
+  assert.equal(normalizeV2RequestReview("TRUE"), true);
+  assert.equal(normalizeV2RequestReview("false"), false);
+  assert.throws(() => normalizeV2RequestReview("1"), /true or false/u);
+  assert.equal(normalizeV2LimitsProfile(""), "default");
+  assert.equal(normalizeV2LimitsProfile("expanded"), "expanded");
+  assert.throws(() => normalizeV2LimitsProfile("custom"), /default or expanded/u);
+  assert.deepEqual(V2_LIMITS_PROFILES.default, {
+    maxPages: 20,
+    maxObjects: 2_000,
+    maxAttempts: 128,
+    maxSnapshotBytes: 32 * 1024 * 1024,
+    requestTimeoutMs: 10_000,
+    reconcileBudgetMs: 60_000,
+  });
+  assert.deepEqual(V2_LIMITS_PROFILES.expanded, {
+    maxPages: 100,
+    maxObjects: 10_000,
+    maxAttempts: 512,
+    maxSnapshotBytes: 64 * 1024 * 1024,
+    requestTimeoutMs: 20_000,
+    reconcileBudgetMs: 300_000,
+  });
+  assert.deepEqual(V2_HARD_LIMITS, {
+    maxPages: 1_000,
+    maxObjects: 20_000,
+    maxAttempts: 2_048,
+    maxSnapshotBytes: 64 * 1024 * 1024,
+    requestTimeoutMs: 30_000,
+    reconcileBudgetMs: 720_000,
+  });
+  assert.equal(V2_STABILITY_INTERVAL_MS, 5_000);
+  assert.equal(V2_STABILITY_WINDOW_MS, 60_000);
+  assert.equal(V2_REACTION_FETCH_CONCURRENCY, 4);
+  assert.deepEqual(V2_OUTPUT_KEYS, [
+    "execution_health",
+    "gate_outcome",
+    "recovery_code",
+    "retry_safe",
+  ]);
+  assert.deepEqual([...V2_RECOVERY_CODES].sort(), [
+    "fix_findings",
+    "none",
+    "raise_protected_limit",
+    "reconcile",
+    "refresh_head",
+    "repair_permissions",
+    "request_clean_generation",
+    "retry_begin",
+    "retry_reconcile",
+    "unsupported_target",
+    "use_expanded_limits",
+    "wait_provider",
+    "wait_then_reconcile",
+  ]);
+  assert.throws(() => buildV2GateReport({
+    executionHealth: "unhealthy",
+    gateOutcome: "success",
+    recoveryCode: "none",
+  }), /unhealthy\/success/u);
+  assert.throws(() => buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    recoveryCode: "invented",
+  }), /closed v2 set/u);
+  assert.equal(buildV2GateReport({
+    executionHealth: "unhealthy",
+    gateOutcome: "pending",
+    recoveryCode: "retry_begin",
+  }).retrySafe, false);
+  assert.equal(buildV2GateReport({
+    executionHealth: "unhealthy",
+    gateOutcome: "pending",
+    recoveryCode: "retry_reconcile",
+  }).retrySafe, true);
+});
+
+test("canonical workflow request binds repository, PR, head, base epoch, and run exactly", () => {
+  const body = canonicalRequestBody();
+  assert.equal(
+    body,
+    `@codex review\n\n<!-- codex-review-gate-request-v2\n` +
+      `{"baseRef":"main","baseRepositoryId":"${REPO_ID}","baseSha":"${BASE}",` +
+      `"headSha":"${HEAD}","prNumber":"${PR}","repositoryId":"${REPO_ID}",` +
+      `"runId":"123","version":2}\n-->`,
+  );
+  assert.deepEqual(parseCanonicalV2ReviewRequestBody(body), {
+    version: 2,
+    repositoryId: String(REPO_ID),
+    prNumber: String(PR),
+    headSha: HEAD,
+    baseSha: BASE,
+    baseRef: "main",
+    baseRepositoryId: String(REPO_ID),
+    runId: "123",
+  });
+  for (const invalid of [
+    `${body}\n`,
+    body.replace(HEAD, HEAD.slice(0, 10)),
+    body.replace('"runId":"123"', '"runId":"0123"'),
+    body.replace("@codex review", "Please @codex review"),
+  ]) {
+    assert.equal(parseCanonicalV2ReviewRequestBody(invalid), null);
+  }
+  assert.throws(() => canonicalRequestBody(HEAD.toUpperCase()), /full lowercase SHA/u);
+  assert.throws(() => canonicalRequestBody(HEAD.slice(0, 10)), /full lowercase SHA/u);
+  assert.throws(
+    () => canonicalRequestBody(HEAD, { baseSha: BASE.slice(0, 10) }),
+    /base must be one full lowercase SHA/u,
+  );
+  assert.equal(canonicalV2RequestComments([workflowRequest({ user: HUMAN })]).length, 0);
+  assert.equal(canonicalV2RequestComments([workflowRequest({
+    updated_at: "2026-08-25T08:00:01Z",
+  })]).length, 0);
+  assert.equal(canonicalV2RequestComments([workflowRequest()]).length, 1);
+});
+
+test("qualifying +1 is strict, head-bound, and vetoed by same-or-later eyes", () => {
+  const request = workflowRequest();
+  const requests = canonicalV2RequestComments([request]);
+  const valid = buildV2ReactionCleanArtifacts(requests, new Map([["101", [
+    reaction({ id: 201, created_at: "2026-08-25T08:01:00Z" }),
+  ]]]));
+  assert.equal(valid.errors.length, 0);
+  assert.equal(valid.artifacts.length, 1);
+  assert.equal(valid.artifacts[0].headSha, HEAD);
+
+  const equal = buildV2ReactionCleanArtifacts(requests, new Map([["101", [
+    reaction({ id: 202, created_at: "2026-08-25T08:00:00Z" }),
+  ]]]));
+  assert.equal(equal.artifacts.length, 0);
+  assert.match(equal.errors[0], /not strictly after/u);
+
+  const vetoed = buildV2ReactionCleanArtifacts(requests, new Map([["101", [
+    reaction({ id: 203, created_at: "2026-08-25T08:01:00Z" }),
+    reaction({ id: 204, content: "eyes", created_at: "2026-08-25T08:01:00Z" }),
+  ]]]));
+  assert.equal(vetoed.artifacts.length, 0);
+  assert.equal(vetoed.livenessVetoed, true);
+  assert.equal(canonicalV2RequestComments([ordinaryRequest()]).length, 0);
+});
+
+test("snapshot stability requires two adjacent complete fingerprints within one deadline", async () => {
+  const sequence = [snapshot("one"), snapshot("two"), snapshot("two")];
+  let clock = 0;
+  const sleeps = [];
+  const stable = await waitForStableV2Snapshot({
+    loadSnapshot: async () => sequence.shift(),
+    sleep: async (milliseconds) => {
+      sleeps.push(milliseconds);
+      clock += milliseconds;
+    },
+    now: () => clock,
+    intervalMs: 5,
+    windowMs: 20,
+  });
+  assert.equal(stable.kind, "stable");
+  assert.equal(stable.loads, 3);
+  assert.deepEqual(sleeps, [5, 5]);
+
+  let load = 0;
+  clock = 0;
+  const unstable = await waitForStableV2Snapshot({
+    loadSnapshot: async () => snapshot(String(load++)),
+    sleep: async (milliseconds) => { clock += milliseconds; },
+    now: () => clock,
+    intervalMs: 5,
+    windowMs: 15,
+  });
+  assert.equal(unstable.kind, "unstable");
+  assert.equal(unstable.loads, 3);
+});
+
+test("workflow_dispatch clean reconcile publishes exact outputs, status, summary, and sticky", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context);
+  const { result, sleeps } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(result.report.retrySafe, false);
+  assert.deepEqual(github.statusWrites.map(({ state, sha }) => [state, sha]), [
+    ["pending", HEAD],
+    ["success", HEAD],
+  ]);
+  assert.deepEqual(sleeps, [1]);
+  assert.deepEqual(readOutputs(environment.GITHUB_OUTPUT), {
+    execution_health: "healthy",
+    gate_outcome: "success",
+    recovery_code: "none",
+    retry_safe: "false",
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /0 unresolved, 0 resolved, 0 historical, 0 indeterminate/u);
+  assert.equal(github.stickyCreates.length, 1);
+  assert.doesNotMatch(github.stickyCreates[0], /@codex review/u);
+  assert.match(github.stickyCreates[0], new RegExp(V2_STICKY_MARKER, "u"));
+  const baseEpochCalls = github.calls.filter(({ path }) => path === "/graphql");
+  assert.equal(baseEpochCalls.length, 4);
+  for (const { body } of baseEpochCalls) {
+    assert.deepEqual(body.variables, { owner: OWNER, repo: REPO, number: PR });
+    assert.match(body.query, /BASE_REF_CHANGED_EVENT/u);
+    assert.match(body.query, /BASE_REF_FORCE_PUSHED_EVENT/u);
+    assert.match(body.query, /timelineItems\(\s*last: 1/su);
+  }
+});
+
+test("the JavaScript Action reads INPUT_* values without composite env bridging", async (context) => {
+  const github = createGitHubMock({ issueComments: [workflowRequest()] });
+  const environment = runtimeEnvironment(context);
+  for (const [internal, actionInput] of [
+    ["GITHUB_TOKEN", "INPUT_GITHUB_TOKEN"],
+    ["PR_NUMBER", "INPUT_PR_NUMBER"],
+    ["EXPECTED_HEAD_SHA", "INPUT_EXPECTED_HEAD_SHA"],
+    ["OPERATION_INPUT", "INPUT_OPERATION"],
+    ["REQUEST_COMMENT_ID", "INPUT_REQUEST_COMMENT_ID"],
+    ["REQUEST_REVIEW_INPUT", "INPUT_REQUEST_REVIEW"],
+    ["LIMITS_PROFILE", "INPUT_LIMITS_PROFILE"],
+  ]) {
+    environment[actionInput] = environment[internal];
+    delete environment[internal];
+  }
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+});
+
+test("issue_comment created and edited require exact sender and author before runtime authority", async (context) => {
+  for (const action of ["created", "edited"]) {
+    const terminal = cleanIssueComment(HEAD, { id: action === "created" ? 201 : 202 });
+    const github = createGitHubMock({
+      issueComments: [ordinaryRequest(), terminal],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `provider-${action}`,
+      eventName: "issue_comment",
+      expectedHeadSha: "",
+      requestReview: "false",
+      requestCommentId: String(terminal.id),
+      event: issueCommentEvent(action, terminal),
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.report.gateOutcome, "success", action);
+  }
+
+  const terminal = cleanIssueComment(HEAD);
+  const environment = runtimeEnvironment(context, {
+    suffix: "provider-wrong-sender",
+    eventName: "issue_comment",
+    expectedHeadSha: "",
+    requestReview: "false",
+    requestCommentId: String(terminal.id),
+    event: issueCommentEvent("created", terminal, { sender: HUMAN }),
+  });
+  const result = await runV2GateCli({
+    environment,
+    fetchImpl: async () => { throw new Error("fetch must not run"); },
+  });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.report.reason, /sender\/author contract/u);
+});
+
+test("repository_dispatch is rejected before any GitHub API request", async (context) => {
+  const environment = runtimeEnvironment(context, {
+    eventName: "repository_dispatch",
+    event: { action: "codex-review-gate", client_payload: { pull_request: PR } },
+  });
+  const result = await runV2GateCli({
+    environment,
+    fetchImpl: async () => { throw new Error("fetch must not run"); },
+  });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.report.reason, /Unsupported v2 runtime event: repository_dispatch/u);
+});
+
+test("invalid manual expected head is unhealthy/not_applicable and writes no status", async (context) => {
+  const github = createGitHubMock({ pullRequestOverrides: { head: { sha: NEXT_HEAD } } });
+  const environment = runtimeEnvironment(context);
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("stale provider event is healthy/not_applicable and writes no status", async (context) => {
+  const terminal = cleanIssueComment(HEAD);
+  const github = createGitHubMock({
+    issueComments: [terminal],
+    pullRequestOverrides: { head: { sha: NEXT_HEAD } },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "stale-provider",
+    eventName: "issue_comment",
+    expectedHeadSha: "",
+    requestReview: "false",
+    requestCommentId: String(terminal.id),
+    event: issueCommentEvent("created", terminal),
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("stale provider finding is rejected before any current-head status write", async (context) => {
+  const terminal = findingIssueComment(HEAD);
+  const github = createGitHubMock({
+    issueComments: [terminal],
+    pullRequestOverrides: { head: { sha: NEXT_HEAD } },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "stale-provider-finding",
+    eventName: "issue_comment",
+    expectedHeadSha: "",
+    requestReview: "false",
+    requestCommentId: String(terminal.id),
+    event: issueCommentEvent("created", terminal),
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.deepEqual(github.statusWrites, []);
+  assert.deepEqual(github.stickyCreates, []);
+  assert.deepEqual(github.stickyPatches, []);
+  assert.equal(
+    github.calls.some(({ path }) => path.endsWith(`/issues/${PR}/comments`)),
+    false,
+  );
+  assert.equal(
+    github.calls.some(({ path }) => path.endsWith(`/pulls/${PR}/reviews`)),
+    false,
+  );
+});
+
+test("a head change after pending never retargets status or evidence", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    pullRequestSequence: [
+      {},
+      { head: { sha: NEXT_HEAD } },
+    ],
+  });
+  const environment = runtimeEnvironment(context);
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.deepEqual(github.statusWrites.map(({ state, sha }) => [state, sha]), [
+    ["pending", HEAD],
+  ]);
+  assert.equal(github.calls.some((call) => call.path.includes(NEXT_HEAD)), false);
+  assert.deepEqual(github.stickyCreates, []);
+  assert.deepEqual(github.stickyPatches, []);
+});
+
+test("reconcile pins the initial default branch and base ref across every snapshot", async (context) => {
+  const evidence = [
+    ordinaryRequest(),
+    cleanIssueComment(HEAD, {
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    }),
+  ];
+  const retargeted = createGitHubMock({
+    issueComments: evidence,
+    pullRequestSequence: [
+      {},
+      {},
+      { base: { sha: BASE, ref: "release" } },
+    ],
+  });
+  const retargetedEnvironment = runtimeEnvironment(context, {
+    suffix: "base-ref-retarget",
+  });
+  const { result: retargetedResult } = await runGate(
+    retargetedEnvironment,
+    retargeted,
+    { stabilityWindowMs: 3 },
+  );
+  assert.equal(retargetedResult.report.executionHealth, "unhealthy");
+  assert.equal(retargetedResult.report.gateOutcome, "pending");
+  assert.equal(retargetedResult.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(retargeted.statusWrites.some(({ state }) => state === "success"), false);
+
+  const renamedTogether = createGitHubMock({
+    issueComments: evidence,
+    repositorySequence: [
+      {},
+      {},
+      { default_branch: "release" },
+    ],
+    pullRequestSequence: [
+      {},
+      {},
+      { base: { sha: BASE, ref: "release" } },
+    ],
+  });
+  const renamedEnvironment = runtimeEnvironment(context, {
+    suffix: "default-and-base-ref-rename",
+  });
+  const { result: renamedResult } = await runGate(
+    renamedEnvironment,
+    renamedTogether,
+    { stabilityWindowMs: 3 },
+  );
+  assert.equal(renamedResult.report.executionHealth, "unhealthy");
+  assert.equal(renamedResult.report.gateOutcome, "pending");
+  assert.equal(renamedResult.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(renamedTogether.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("latest base-ref timeline epoch invalidates older positive evidence on the same head", async (context) => {
+  for (const [suffix, epoch] of [
+    ["retarget-epoch", baseRefChangedEvent()],
+    ["force-push-epoch", baseRefForcePushedEvent()],
+  ]) {
+    const github = createGitHubMock({
+      baseEpoch: epoch,
+      issueComments: [
+        ordinaryRequest(),
+        cleanIssueComment(HEAD, {
+          created_at: "2026-08-25T08:02:00Z",
+          updated_at: "2026-08-25T08:02:00Z",
+        }),
+      ],
+    });
+    const environment = runtimeEnvironment(context, { suffix });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.match(result.report.reason, /strictly newer than base epoch/u, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("after a base epoch only a direct canonical-request +1 can recover clean", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const generation = workflowRequest({
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const lateTerminalClean = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+  });
+  const lateCleanGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation, lateTerminalClean],
+  });
+  const lateCleanEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-unattributed-terminal-clean",
+  });
+  const { result: lateClean } = await runGate(lateCleanEnvironment, lateCleanGitHub);
+  assert.equal(lateClean.report.gateOutcome, "pending");
+  assert.equal(lateClean.report.recoveryCode, "request_clean_generation");
+  assert.match(lateClean.report.reason, /cannot be attributed.*canonical request/u);
+  assert.equal(lateCleanGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const findingGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [
+      findingIssueComment(HEAD, {
+        created_at: "2026-08-25T08:06:00Z",
+        updated_at: "2026-08-25T08:06:00Z",
+      }),
+      generation,
+      lateTerminalClean,
+    ],
+  });
+  const findingEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-late-clean-cannot-resolve-finding",
+  });
+  const { result: finding } = await runGate(findingEnvironment, findingGitHub);
+  assert.equal(finding.report.gateOutcome, "failure");
+  assert.equal(finding.report.counts.unresolved, 1);
+  assert.equal(finding.report.counts.resolved, 0);
+  assert.equal(findingGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const reactionGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation],
+    reactionsByCommentId: new Map([[String(generation.id), [reaction({
+      created_at: "2026-08-25T08:15:00Z",
+    })]]]),
+  });
+  const reactionEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-direct-reaction-recovered",
+  });
+  const { result: recovered } = await runGate(reactionEnvironment, reactionGitHub);
+  assert.equal(recovered.report.gateOutcome, "success");
+  assert.match(recovered.report.reason, /request-reaction/u);
+});
+
+test("base-bound workflow markers do not cross base commit epochs", async (context) => {
+  const request = workflowRequest({
+    body: canonicalRequestBody(HEAD, { baseSha: OLD_HEAD }),
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [
+      request,
+      cleanIssueComment(HEAD, {
+        created_at: "2026-08-25T08:15:00Z",
+        updated_at: "2026-08-25T08:15:00Z",
+      }),
+    ],
+  });
+  const environment = runtimeEnvironment(context, { suffix: "marker-base-mismatch" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a base epoch change between complete reads cannot publish success", async (context) => {
+  const request = ordinaryRequest();
+  const clean = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const epoch = baseRefChangedEvent();
+  const github = createGitHubMock({
+    issueComments: [request, clean],
+    baseEpochSequence: [null, null, epoch, epoch],
+  });
+  const environment = runtimeEnvironment(context, { suffix: "base-epoch-snapshot-change" });
+  const { result } = await runGate(environment, github, { stabilityWindowMs: 3 });
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("GraphQL base-epoch errors fail closed without publishing success", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    baseEpochResponseMutator: (response) => ({
+      ...response,
+      errors: [{ message: "synthetic timeline error" }],
+    }),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "base-epoch-graphql-error" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("base-epoch GraphQL accepts unrelated timeline items with no filtered event", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    baseEpochResponseMutator: (response) => ({
+      ...response,
+      data: {
+        ...response.data,
+        repository: {
+          ...response.data.repository,
+          pullRequest: {
+            ...response.data.repository.pullRequest,
+            timelineItems: {
+              totalCount: 13,
+              filteredCount: 0,
+              pageCount: 0,
+              nodes: [],
+            },
+          },
+        },
+      },
+    }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "base-epoch-unrelated-timeline-items",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+});
+
+test("pull_request_target base-ref edits immediately replace old success with pending", async (context) => {
+  const github = createGitHubMock();
+  const environment = runtimeEnvironment(context, {
+    suffix: "base-edit-trigger",
+    eventName: "pull_request_target",
+    expectedHeadSha: HEAD,
+    requestReview: "false",
+    requestCommentId: "",
+    event: baseChangeEvent(),
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.deepEqual(github.statusWrites.map(({ state, sha }) => [state, sha]), [
+    ["pending", HEAD],
+  ]);
+  assert.equal(github.calls.some(({ path }) => path === "/graphql"), false);
+});
+
+test("non-base pull_request_target edits are rejected before GitHub API access", async (context) => {
+  const environment = runtimeEnvironment(context, {
+    suffix: "non-base-edit-trigger",
+    eventName: "pull_request_target",
+    expectedHeadSha: HEAD,
+    requestReview: "false",
+    requestCommentId: "",
+    event: baseChangeEvent({ changes: { title: { from: "Old title" } } }),
+  });
+  const result = await runV2GateCli({
+    environment,
+    fetchImpl: async () => { throw new Error("fetch must not run"); },
+  });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.report.reason, /base-ref-change contract/u);
+});
+
+test("terminal clean without an authorized request generation cannot pass", async (context) => {
+  const github = createGitHubMock({ issueComments: [cleanIssueComment(HEAD)] });
+  const environment = runtimeEnvironment(context);
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("ordinary writer request can bind terminal clean but never makes reaction-only clean head-bound", async (context) => {
+  const ordinary = ordinaryRequest();
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const terminalGitHub = createGitHubMock({ issueComments: [ordinary, terminal] });
+  const terminalEnvironment = runtimeEnvironment(context, { suffix: "ordinary-terminal" });
+  const { result: terminalResult } = await runGate(terminalEnvironment, terminalGitHub);
+  assert.equal(terminalResult.report.gateOutcome, "success");
+  assert.equal(
+    terminalGitHub.calls.some((call) => call.path.endsWith(`/commits/${HEAD}`)),
+    false,
+  );
+
+  const reactionGitHub = createGitHubMock({
+    issueComments: [ordinary],
+    reactionsByCommentId: new Map([[String(ordinary.id), [reaction()]]]),
+  });
+  const reactionEnvironment = runtimeEnvironment(context, { suffix: "ordinary-reaction" });
+  const { result: reactionResult } = await runGate(reactionEnvironment, reactionGitHub);
+  assert.equal(reactionResult.report.gateOutcome, "pending");
+  assert.equal(
+    reactionGitHub.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
+    false,
+  );
+});
+
+test("ordinary request author permission is enforced without letting a 404 commenter DoS", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [request, terminal],
+    permissionByLogin: new Map(),
+    permissionMissingLogins: new Set([READER.login]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "permission-404" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.executionHealth, "healthy");
+
+  const anyGitHub = createGitHubMock({ issueComments: [request, terminal] });
+  const anyEnvironment = runtimeEnvironment(context, { suffix: "permission-any" });
+  anyEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "any";
+  const { result: anyResult } = await runGate(anyEnvironment, anyGitHub);
+  assert.equal(anyResult.report.gateOutcome, "success");
+});
+
+test("authority filtering caches permissions and avoids exact-refetch DoS", async (context) => {
+  const deniedRequests = Array.from({ length: 70 }, (_, index) => {
+    const id = 1_000 + index;
+    return ordinaryRequest({
+      id,
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-${id}`,
+      user: READER,
+    });
+  });
+  const terminalClean = cleanIssueComment(HEAD, {
+    id: 2_000,
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-2000`,
+  });
+  const deniedGitHub = createGitHubMock({
+    issueComments: [...deniedRequests, terminalClean],
+    permissionByLogin: new Map([[READER.login, "read"]]),
+  });
+  const deniedEnvironment = runtimeEnvironment(context, {
+    suffix: "denied-request-refetch-budget",
+  });
+  const { result: deniedResult } = await runGate(deniedEnvironment, deniedGitHub);
+  assert.equal(deniedResult.exitCode, 0);
+  assert.equal(deniedResult.report.executionHealth, "healthy");
+  assert.equal(deniedResult.report.gateOutcome, "pending");
+  assert.equal(deniedGitHub.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(
+    deniedGitHub.calls.filter(({ path }) =>
+      path.includes(`/${READER.login}/`) && path.endsWith("/permission")
+    ).length,
+    1,
+    "more than 61 requests from one denied login require one permission lookup",
+  );
+  for (const denied of deniedRequests) {
+    assert.equal(
+      deniedGitHub.calls.some(({ path }) =>
+        path === `/repos/${REPOSITORY}/issues/comments/${denied.id}`
+      ),
+      false,
+      `denied request ${denied.id} must not be exact-refetched`,
+    );
+  }
+  assert.equal(
+    deniedGitHub.calls.filter(({ path }) =>
+      path === `/repos/${REPOSITORY}/issues/comments/${terminalClean.id}`
+    ).length,
+    1,
+    "provider terminal evidence remains exact-refetched",
+  );
+
+  const canonical = workflowRequest({
+    id: 2_001,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-2001`,
+  });
+  const authorizedOrdinary = ordinaryRequest({
+    id: 2_002,
+    created_at: "2026-08-25T08:11:00Z",
+    updated_at: "2026-08-25T08:11:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-2002`,
+  });
+  const providerProgress = progressIssueComment({
+    id: 2_003,
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-2003`,
+  });
+  const authoritativeGitHub = createGitHubMock({
+    issueComments: [canonical, authorizedOrdinary, providerProgress],
+    permissionByLogin: new Map([[HUMAN.login, "write"]]),
+  });
+  const authoritativeEnvironment = runtimeEnvironment(context, {
+    suffix: "authoritative-refetch-scope",
+  });
+  const { result: authoritativeResult } = await runGate(
+    authoritativeEnvironment,
+    authoritativeGitHub,
+  );
+  assert.equal(authoritativeResult.exitCode, 0);
+  assert.equal(authoritativeResult.report.executionHealth, "healthy");
+  assert.equal(authoritativeResult.report.gateOutcome, "pending");
+
+  const permissionCalls = authoritativeGitHub.calls.filter(({ path }) =>
+    path.includes("/collaborators/") && path.endsWith("/permission")
+  );
+  assert.equal(
+    permissionCalls.filter(({ path }) => path.includes(`/${HUMAN.login}/`)).length,
+    1,
+    "the authorized login is queried once in the completed pending snapshot",
+  );
+  for (const expected of [canonical, authorizedOrdinary, providerProgress]) {
+    assert.equal(
+      authoritativeGitHub.calls.filter(({ path }) =>
+        path === `/repos/${REPOSITORY}/issues/comments/${expected.id}`
+      ).length,
+      1,
+      `authoritative comment ${expected.id} is exact-refetched in the completed snapshot`,
+    );
+  }
+});
+
+test("newer authorized generation prevents reuse of older canonical +1", async (context) => {
+  const oldRequest = workflowRequest({ id: 101 });
+  const newer = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [oldRequest, newer],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context);
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+});
+
+test("short Reviewed commit is accepted only through GitHub unambiguous resolution", async (context) => {
+  const request = ordinaryRequest();
+  const short = HEAD.slice(0, 10);
+  const terminal = cleanIssueComment(short, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({ issueComments: [request, terminal] });
+  const environment = runtimeEnvironment(context, { suffix: "short-resolved" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.ok(github.calls.some((call) => call.path.endsWith(`/commits/${short}`)));
+
+  const ambiguousGitHub = createGitHubMock({
+    issueComments: [request, terminal],
+    commitResolution: () => ({ status: 422, message: "short SHA is ambiguous" }),
+  });
+  const ambiguousEnvironment = runtimeEnvironment(context, { suffix: "short-ambiguous" });
+  const { result: ambiguous } = await runGate(ambiguousEnvironment, ambiguousGitHub);
+  assert.equal(ambiguous.report.gateOutcome, "pending");
+  assert.equal(ambiguous.report.recoveryCode, "request_clean_generation");
+  assert.equal(ambiguous.report.counts.indeterminate > 0, true);
+
+  const redirectedRef = NEXT_HEAD.slice(0, 10);
+  const redirectedTerminal = cleanIssueComment(redirectedRef, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const redirectedGitHub = createGitHubMock({
+    issueComments: [request, redirectedTerminal],
+    commitResolution: () => ({ data: { sha: HEAD } }),
+  });
+  const redirectedEnvironment = runtimeEnvironment(context, {
+    suffix: "short-branch-tag-redirect",
+  });
+  const { result: redirected } = await runGate(redirectedEnvironment, redirectedGitHub);
+  assert.equal(redirected.report.gateOutcome, "pending");
+  assert.equal(redirected.report.recoveryCode, "request_clean_generation");
+  assert.equal(redirected.report.counts.indeterminate > 0, true);
+  assert.equal(
+    redirectedGitHub.calls.some((call) =>
+      call.path.endsWith(`/commits/${redirectedRef}`)),
+    true,
+  );
+});
+
+test("approved review short commit also requires GitHub resolution and native commit agreement", async (context) => {
+  const short = HEAD.slice(0, 10);
+  const resolvedGitHub = createGitHubMock({
+    issueComments: [ordinaryRequest()],
+    reviews: [approvedReview(short)],
+  });
+  const resolvedEnvironment = runtimeEnvironment(context, { suffix: "approved-short" });
+  const { result: resolved } = await runGate(resolvedEnvironment, resolvedGitHub);
+  assert.equal(resolved.report.gateOutcome, "success");
+  assert.ok(resolvedGitHub.calls.some((call) => call.path.endsWith(`/commits/${short}`)));
+
+  const ambiguousGitHub = createGitHubMock({
+    issueComments: [ordinaryRequest()],
+    reviews: [approvedReview(short)],
+    commitResolution: () => ({ status: 422, message: "short SHA is ambiguous" }),
+  });
+  const ambiguousEnvironment = runtimeEnvironment(context, {
+    suffix: "approved-short-ambiguous",
+  });
+  const { result: ambiguous } = await runGate(ambiguousEnvironment, ambiguousGitHub);
+  assert.equal(ambiguous.report.gateOutcome, "pending");
+  assert.equal(ambiguous.report.recoveryCode, "request_clean_generation");
+  assert.equal(ambiguous.report.counts.indeterminate > 0, true);
+});
+
+test("same-head finding remains blocking after clean from the same generation", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [
+      ordinaryRequest(),
+      cleanIssueComment(HEAD, {
+        created_at: "2026-08-25T08:06:00Z",
+        updated_at: "2026-08-25T08:06:00Z",
+      }),
+    ],
+    reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00Z" })],
+  });
+  const environment = runtimeEnvironment(context);
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.deepEqual(result.report.counts, {
+    unresolved: 1,
+    resolved: 0,
+    historical: 0,
+    indeterminate: 0,
+  });
+  assert.equal(github.statusWrites.at(-1).state, "failure");
+});
+
+test("finding supersession requires a strictly newer authorized generation and later head-bound clean", async (context) => {
+  const first = ordinaryRequest({ id: 101 });
+  const second = ordinaryRequest({
+    id: 102,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const clean = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [first, second, clean],
+    reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00Z" })],
+  });
+  const environment = runtimeEnvironment(context, { suffix: "superseded" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.deepEqual(result.report.counts, {
+    unresolved: 0,
+    resolved: 1,
+    historical: 0,
+    indeterminate: 0,
+  });
+
+  const noCleanGitHub = createGitHubMock({
+    issueComments: [first, second],
+    reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00Z" })],
+  });
+  const noCleanEnvironment = runtimeEnvironment(context, { suffix: "not-superseded" });
+  const { result: noClean } = await runGate(noCleanEnvironment, noCleanGitHub);
+  assert.equal(noClean.report.gateOutcome, "failure");
+  assert.equal(noClean.report.counts.unresolved, 1);
+});
+
+test("a strict later generation can supersede an older cross-channel timestamp ambiguity", async (context) => {
+  const laterGeneration = ordinaryRequest({
+    id: 102,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const laterClean = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [
+      ordinaryRequest(),
+      findingIssueComment(HEAD, {
+        created_at: "2026-08-25T08:05:00.100Z",
+        updated_at: "2026-08-25T08:05:00.100Z",
+      }),
+      laterGeneration,
+      laterClean,
+    ],
+    reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00.900Z" })],
+  });
+  const environment = runtimeEnvironment(context, { suffix: "old-channel-conflict" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.deepEqual(result.report.counts, {
+    unresolved: 0,
+    resolved: 2,
+    historical: 0,
+    indeterminate: 1,
+  });
+});
+
+test("a current cross-channel timestamp ambiguity cannot publish success", async (context) => {
+  const issueClean = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:05:00.100Z",
+    updated_at: "2026-08-25T08:05:00.100Z",
+  });
+  const reviewClean = approvedReview(HEAD, {
+    submitted_at: "2026-08-25T08:05:00.900Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), issueClean],
+    reviews: [reviewClean],
+  });
+  const environment = runtimeEnvironment(context, { suffix: "current-channel-conflict" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.counts.indeterminate, 1);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("historical findings are counted without being silently treated as current", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [
+      ordinaryRequest(),
+      cleanIssueComment(HEAD, {
+        created_at: "2026-08-25T08:10:00Z",
+        updated_at: "2026-08-25T08:10:00Z",
+      }),
+    ],
+    reviews: [findingReview(OLD_HEAD, { submitted_at: "2026-08-25T08:05:00Z" })],
+  });
+  const environment = runtimeEnvironment(context);
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.counts.historical, 1);
+  assert.match(
+    readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
+    /1 historical/u,
+  );
+});
+
+test("malformed provider terminal evidence is indeterminate and cannot pass", async (context) => {
+  const malformed = cleanIssueComment(HEAD, {
+    body: "Codex Review: Didn't find any major issues.",
+  });
+  const github = createGitHubMock({ issueComments: [ordinaryRequest(), malformed] });
+  const environment = runtimeEnvironment(context);
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.counts.indeterminate > 0, true);
+});
+
+test("older malformed and provider-identity errors become historical after a strict clean generation", async (context) => {
+  const malformed = cleanIssueComment(HEAD, {
+    id: 201,
+    body: "Codex Review: Didn't find any major issues.",
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const invalidProvider = cleanIssueComment(HEAD, {
+    id: 202,
+    performed_via_github_app: { slug: "wrong-provider" },
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const generation = ordinaryRequest({
+    id: 103,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const clean = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [malformed, invalidProvider, generation, clean],
+  });
+  const environment = runtimeEnvironment(context, { suffix: "historical-malformed" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.counts.indeterminate, 2);
+});
+
+test("old-head malformed review errors can recover but current-generation provider errors cannot pass", async (context) => {
+  const oldHeadMalformed = findingReview(OLD_HEAD, {
+    id: 400,
+    body: "Unrecognized terminal review body",
+    submitted_at: "2026-08-25T08:01:00Z",
+  });
+  const oldHeadInvalidProvider = findingReview(OLD_HEAD, {
+    id: 401,
+    performed_via_github_app: { slug: "wrong-provider" },
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const generation = ordinaryRequest({
+    id: 103,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const clean = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+  });
+  const recoveredGitHub = createGitHubMock({
+    issueComments: [generation, clean],
+    reviews: [oldHeadMalformed, oldHeadInvalidProvider],
+  });
+  const recoveredEnvironment = runtimeEnvironment(context, {
+    suffix: "old-head-malformed-recovered",
+  });
+  const { result: recovered } = await runGate(recoveredEnvironment, recoveredGitHub);
+  assert.equal(recovered.report.gateOutcome, "success");
+  assert.equal(recovered.report.counts.indeterminate, 2);
+
+  const currentGenerationError = cleanIssueComment(HEAD, {
+    id: 204,
+    performed_via_github_app: { slug: "wrong-provider" },
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+  });
+  const blockedGitHub = createGitHubMock({
+    issueComments: [generation, currentGenerationError, clean],
+  });
+  const blockedEnvironment = runtimeEnvironment(context, {
+    suffix: "current-generation-provider-error",
+  });
+  const { result: blocked } = await runGate(blockedEnvironment, blockedGitHub);
+  assert.equal(blocked.report.gateOutcome, "pending");
+  assert.equal(blocked.report.recoveryCode, "request_clean_generation");
+  assert.equal(blocked.report.counts.indeterminate, 1);
+});
+
+test("later eyes or progress prevents a clean from superseding an older finding", async (context) => {
+  const generation = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const clean = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+  });
+  const finding = findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00Z" });
+
+  const eyesGitHub = createGitHubMock({
+    issueComments: [generation, clean],
+    reviews: [finding],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 502,
+      content: "eyes",
+      created_at: "2026-08-25T08:16:00Z",
+    })]]]),
+  });
+  const eyesEnvironment = runtimeEnvironment(context, { suffix: "supersession-eyes" });
+  const { result: eyesResult } = await runGate(eyesEnvironment, eyesGitHub);
+  assert.equal(eyesResult.report.gateOutcome, "failure");
+  assert.equal(eyesResult.report.counts.unresolved, 1);
+  assert.equal(eyesResult.report.counts.resolved, 0);
+
+  const progressGitHub = createGitHubMock({
+    issueComments: [generation, clean, progressIssueComment()],
+    reviews: [finding],
+  });
+  const progressEnvironment = runtimeEnvironment(context, { suffix: "supersession-progress" });
+  const { result: progressResult } = await runGate(progressEnvironment, progressGitHub);
+  assert.equal(progressResult.report.gateOutcome, "failure");
+  assert.equal(progressResult.report.counts.unresolved, 1);
+  assert.equal(progressResult.report.counts.resolved, 0);
+});
+
+test("exact-refetch drift and continuously changing clean snapshots remain unhealthy pending", async (context) => {
+  const request = ordinaryRequest();
+  const clean = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const refetchGitHub = createGitHubMock({
+    issueComments: [request, clean],
+    commentRefetchMutator: (comment) => comment.id === clean.id
+      ? { ...comment, body: `${comment.body}\nchanged` }
+      : comment,
+  });
+  const refetchEnvironment = runtimeEnvironment(context, { suffix: "refetch-drift" });
+  const { result: refetch } = await runGate(refetchEnvironment, refetchGitHub, {
+    stabilityWindowMs: 3,
+  });
+  assert.equal(refetch.exitCode, 1);
+  assert.equal(refetch.report.executionHealth, "unhealthy");
+  assert.equal(refetch.report.gateOutcome, "pending");
+  assert.equal(refetch.report.recoveryCode, "wait_then_reconcile");
+
+  const changing = [1, 2, 3, 4].map((id) => [
+    request,
+    cleanIssueComment(HEAD, {
+      id: 300 + id,
+      created_at: `2026-08-25T08:0${id + 1}:00Z`,
+      updated_at: `2026-08-25T08:0${id + 1}:00Z`,
+    }),
+  ]);
+  const changingGitHub = createGitHubMock({ issueCommentSnapshots: changing });
+  const changingEnvironment = runtimeEnvironment(context, { suffix: "changing-clean" });
+  const { result: unstable } = await runGate(changingEnvironment, changingGitHub, {
+    stabilityWindowMs: 3,
+  });
+  assert.equal(unstable.exitCode, 1);
+  assert.equal(unstable.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(changingGitHub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("fixed default and expanded profiles fail closed at aggregate snapshot caps", async (context) => {
+  const defaultComments = Array.from({ length: 2_100 }, (_, index) =>
+    genericComment(index + 1));
+  const defaultGitHub = createGitHubMock({ issueComments: defaultComments });
+  const defaultEnvironment = runtimeEnvironment(context, { suffix: "default-cap" });
+  const { result: defaultResult } = await runGate(defaultEnvironment, defaultGitHub);
+  assert.equal(defaultResult.exitCode, 1);
+  assert.equal(defaultResult.report.executionHealth, "unhealthy");
+  assert.equal(defaultResult.report.gateOutcome, "pending");
+  assert.equal(defaultResult.report.recoveryCode, "use_expanded_limits");
+
+  const expandedComments = Array.from({ length: 10_100 }, (_, index) =>
+    genericComment(index + 1));
+  const expandedGitHub = createGitHubMock({ issueComments: expandedComments });
+  const expandedEnvironment = runtimeEnvironment(context, { suffix: "expanded-cap" });
+  expandedEnvironment.LIMITS_PROFILE = "expanded";
+  const { result: expandedResult } = await runGate(expandedEnvironment, expandedGitHub);
+  assert.equal(expandedResult.exitCode, 1);
+  assert.equal(expandedResult.report.recoveryCode, "raise_protected_limit");
+});
+
+test("unsupported scope is unhealthy/not_applicable and receives no status write", async (context) => {
+  for (const [suffix, mockOptions, environmentOptions, mutateEnvironment] of [
+    ["fork", { pullRequestOverrides: {
+      head: { repo: { id: 99, full_name: "someone/fork" } },
+    } }, {}],
+    ["draft", { pullRequestOverrides: { draft: true } }, {}],
+    ["base", { pullRequestOverrides: { base: { ref: "release" } } }, {}],
+    ["ghes", {}, { serverUrl: "https://ghe.example.test" }],
+    ["windows", {}, {}, (environment) => { environment.RUNNER_OS = "Windows"; }],
+    ["self-hosted", {}, {}, (environment) => {
+      environment.RUNNER_ENVIRONMENT = "self-hosted";
+    }],
+  ]) {
+    const github = createGitHubMock(mockOptions);
+    const environment = runtimeEnvironment(context, { suffix, ...environmentOptions });
+    mutateEnvironment?.(environment);
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.equal(result.report.recoveryCode, "unsupported_target", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("begin-review posts one exact same-run marker, adopts it on rerun, and supports request_review=false", async (context) => {
+  const github = createGitHubMock();
+  const environment = runtimeEnvironment(context, {
+    suffix: "begin",
+    operation: "begin-review",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+  assert.deepEqual(parseCanonicalV2ReviewRequestBody(github.requestBodies[0]), {
+    version: 2,
+    repositoryId: String(REPO_ID),
+    prNumber: String(PR),
+    headSha: HEAD,
+    baseSha: BASE,
+    baseRef: "main",
+    baseRepositoryId: String(REPO_ID),
+    runId: "123",
+  });
+
+  const rerunEnvironment = runtimeEnvironment(context, {
+    suffix: "begin-rerun",
+    operation: "begin-review",
+  });
+  const { result: rerun } = await runGate(rerunEnvironment, github);
+  assert.equal(rerun.report.gateOutcome, "pending");
+  assert.equal(github.requestBodies.length, 1);
+
+  const disabledGitHub = createGitHubMock();
+  const disabledEnvironment = runtimeEnvironment(context, {
+    suffix: "begin-disabled",
+    operation: "begin-review",
+    requestReview: "false",
+  });
+  const { result: disabled } = await runGate(disabledEnvironment, disabledGitHub);
+  assert.equal(disabled.report.gateOutcome, "pending");
+  assert.deepEqual(disabledGitHub.requestBodies, []);
+});
+
+test("unknown begin-review POST is reconciled by exact same-run reread without duplication", async (context) => {
+  const github = createGitHubMock({ postUnknownAfterCreate: true });
+  const environment = runtimeEnvironment(context, {
+    suffix: "begin-unknown",
+    operation: "begin-review",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(result.report.retrySafe, false);
+  assert.equal(github.requestBodies.length, 1);
+});
+
+for (const postUnknownReread of ["hidden", "failure"]) {
+  test(`unknown begin-review POST with ${postUnknownReread} visibility is not immediately retry-safe`, async (context) => {
+    const github = createGitHubMock({
+      postUnknownAfterCreate: true,
+      postUnknownReread,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `begin-unknown-${postUnknownReread}`,
+      operation: "begin-review",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.report.executionHealth, "unhealthy");
+    assert.equal(result.report.gateOutcome, "pending");
+    assert.equal(result.report.recoveryCode, "retry_begin");
+    assert.equal(result.report.retrySafe, false);
+    assert.equal(github.requestBodies.length, 1);
+    assert.deepEqual(
+      github.statusWrites.map(({ state, sha }) => [state, sha]),
+      [["pending", HEAD]],
+    );
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.match(summary, /Wait for the exact same-run request marker to settle/u);
+    assert.match(summary, /rerun the original workflow run/u);
+    assert.doesNotMatch(summary, /Retry the identical begin-review invocation/u);
+  });
+}
+
+test("begin-review terminal paths reread exact PR scope and never add stale diagnostics", async (context) => {
+  const existingGitHub = createGitHubMock({
+    issueComments: [workflowRequest()],
+    pullRequestSequence: [{}, { head: { sha: NEXT_HEAD } }],
+  });
+  const existingEnvironment = runtimeEnvironment(context, {
+    suffix: "begin-existing-stale",
+    operation: "begin-review",
+  });
+  const { result: existing } = await runGate(existingEnvironment, existingGitHub);
+  assert.equal(existing.report.gateOutcome, "not_applicable");
+  assert.deepEqual(existingGitHub.requestBodies, []);
+  assert.deepEqual(existingGitHub.stickyCreates, []);
+  assert.deepEqual(existingGitHub.stickyPatches, []);
+
+  const disabledGitHub = createGitHubMock({
+    pullRequestSequence: [{}, { state: "closed" }],
+  });
+  const disabledEnvironment = runtimeEnvironment(context, {
+    suffix: "begin-disabled-stale",
+    operation: "begin-review",
+    requestReview: "false",
+  });
+  const { result: disabled } = await runGate(disabledEnvironment, disabledGitHub);
+  assert.equal(disabled.report.gateOutcome, "not_applicable");
+  assert.deepEqual(disabledGitHub.requestBodies, []);
+  assert.deepEqual(disabledGitHub.stickyCreates, []);
+
+  const unknownGitHub = createGitHubMock({
+    postUnknownAfterCreate: true,
+    pullRequestSequence: [{}, {}, { head: { sha: NEXT_HEAD } }],
+  });
+  const unknownEnvironment = runtimeEnvironment(context, {
+    suffix: "begin-unknown-stale",
+    operation: "begin-review",
+  });
+  const { result: unknown } = await runGate(unknownEnvironment, unknownGitHub);
+  assert.equal(unknown.report.gateOutcome, "not_applicable");
+  assert.equal(unknownGitHub.requestBodies.length, 1);
+  assert.deepEqual(unknownGitHub.stickyCreates, []);
+  assert.deepEqual(unknownGitHub.stickyPatches, []);
+});
+
+test("failure and success projection failures preserve the closed result matrix", async (context) => {
+  const findingGitHub = createGitHubMock({
+    issueComments: [ordinaryRequest()],
+    reviews: [findingReview()],
+    statusFailureStates: new Set(["failure"]),
+  });
+  const findingEnvironment = runtimeEnvironment(context, { suffix: "failure-projection" });
+  const { result: findingResult } = await runGate(findingEnvironment, findingGitHub);
+  assert.equal(findingResult.exitCode, 1);
+  assert.equal(findingResult.report.executionHealth, "unhealthy");
+  assert.equal(findingResult.report.gateOutcome, "failure");
+  assert.equal(findingResult.report.recoveryCode, "repair_permissions");
+
+  const cleanGitHub = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    statusFailureStates: new Set(["success"]),
+  });
+  const cleanEnvironment = runtimeEnvironment(context, { suffix: "success-projection" });
+  const { result: cleanResult } = await runGate(cleanEnvironment, cleanGitHub);
+  assert.equal(cleanResult.exitCode, 1);
+  assert.equal(cleanResult.report.executionHealth, "unhealthy");
+  assert.equal(cleanResult.report.gateOutcome, "unknown");
+  assert.equal(cleanResult.report.recoveryCode, "repair_permissions");
+});
+
+test("sticky diagnostics update the lowest-id duplicate and emit one bounded warning", async (context) => {
+  const lowerIdButNewer = stickyComment({
+    id: 301,
+    created_at: "2026-08-25T09:00:00Z",
+    updated_at: "2026-08-25T09:00:00Z",
+  });
+  const higherIdButOlder = stickyComment({ id: 302, created_at: "2026-08-25T07:00:00Z" });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), higherIdButOlder, lowerIdButNewer],
+  });
+  const environment = runtimeEnvironment(context);
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...values) => { warnings.push(values.join(" ")); };
+  let result;
+  try {
+    ({ result } = await runGate(environment, github));
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(github.stickyPatches.at(-1).id, "301");
+  assert.equal(github.stickyCreates.length, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /^Found 2 canonical v2 sticky diagnostics;/u);
+  assert.match(warnings[0], /updating lowest-id comment 301$/u);
+  assert.equal(warnings[0].length < 160, true);
+  assert.equal(github.calls.some(({ method }) => method === "DELETE"), false);
+});
+
+test("summary and sticky diagnostics are bounded Markdown, HTML, and mention safe", (context) => {
+  const reason = `<script>@codex review [unsafe](https://example.test) ${"x".repeat(4_000)}`;
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason,
+    recoveryCode: "request_clean_generation",
+  });
+  const sticky = buildV2StickyCommentBody(report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const environment = runtimeEnvironment(context, { suffix: "safe-diagnostics" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  for (const diagnostic of [sticky, summary]) {
+    assert.doesNotMatch(diagnostic, /@codex review/iu);
+    assert.doesNotMatch(diagnostic, /<script>/iu);
+    assert.match(diagnostic, /&lt;script&gt;&#64;codex review/u);
+    assert.equal(diagnostic.length < 5_000, true);
+  }
+});
+
+test("untrusted finding excerpts cannot inject review requests, Markdown, or HTML markers", async (context) => {
+  const injectedPath = encodeURIComponent(
+    "<script>@codex review</script><!-- codex-review-gate:v2:diagnostic -->[link](x)",
+  ).replace(/[!'()*]/gu, (character) =>
+    `%${character.codePointAt(0).toString(16).toUpperCase()}`
+  );
+  const finding = findingIssueComment(HEAD, {
+    body: [
+      "### 💡 Codex Review",
+      "",
+      `https://github.com/${REPOSITORY}/blob/${HEAD}/${injectedPath}#L1`,
+    ].join("\n"),
+  });
+  const github = createGitHubMock({ issueComments: [ordinaryRequest(), finding] });
+  const environment = runtimeEnvironment(context, { suffix: "finding-injection" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(github.stickyCreates.length, 1);
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  const sticky = github.stickyCreates[0];
+  for (const diagnostic of [summary, sticky]) {
+    assert.doesNotMatch(diagnostic, /@codex review/iu);
+    assert.doesNotMatch(diagnostic, /<script>|<\/script>|\[link\]\(x\)/iu);
+    assert.match(diagnostic, /&lt;script&gt;&#64;codex review&lt;\/script&gt;/u);
+    assert.equal(diagnostic.length < 5_000, true);
+  }
+  assert.equal(
+    sticky.split(`<!-- ${V2_STICKY_MARKER} -->`).length - 1,
+    1,
+  );
+});
+
+test("invalid configuration still emits exactly the public unhealthy output schema", async (context) => {
+  const environment = runtimeEnvironment(context, { operation: "invalid" });
+  const result = await runV2GateCli({
+    environment,
+    fetchImpl: async () => { throw new Error("fetch must not run"); },
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "unknown");
+  assert.deepEqual(Object.keys(readOutputs(environment.GITHUB_OUTPUT)), V2_OUTPUT_KEYS);
+});
+
+function snapshot(fingerprint) {
+  return { selfConsistent: true, headSha: HEAD, fingerprint };
+}
+
+function canonicalRequestBody(headSha = HEAD, overrides = {}) {
+  return buildCanonicalV2ReviewRequestBody({
+    repositoryId: REPO_ID,
+    prNumber: PR,
+    headSha,
+    baseSha: BASE,
+    baseRef: "main",
+    baseRepositoryId: REPO_ID,
+    runId: "123",
+    ...overrides,
+  });
+}
+
+function workflowRequest(overrides = {}) {
+  return {
+    id: 101,
+    body: canonicalRequestBody(),
+    created_at: "2026-08-25T08:00:00Z",
+    updated_at: "2026-08-25T08:00:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-101`,
+    user: ACTIONS_BOT,
+    app: null,
+    performed_via_github_app: null,
+    ...overrides,
+  };
+}
+
+function ordinaryRequest(overrides = {}) {
+  return {
+    id: 101,
+    body: "@codex review",
+    created_at: "2026-08-25T08:00:00Z",
+    updated_at: "2026-08-25T08:00:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-101`,
+    user: HUMAN,
+    app: null,
+    performed_via_github_app: null,
+    ...overrides,
+  };
+}
+
+function cleanIssueComment(commitRef = HEAD, overrides = {}) {
+  return {
+    id: 201,
+    body: [
+      "Codex Review: Didn't find any major issues.",
+      "",
+      `**Reviewed commit:** \`${commitRef}\``,
+    ].join("\n"),
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-201`,
+    user: CODEX_BOT,
+    performed_via_github_app: CODEX_APP,
+    ...overrides,
+  };
+}
+
+function findingIssueComment(headSha = HEAD, overrides = {}) {
+  return {
+    id: 202,
+    body: [
+      "### 💡 Codex Review",
+      "",
+      `https://github.com/${REPOSITORY}/blob/${headSha}/src/finding.mjs#L1`,
+    ].join("\n"),
+    created_at: "2026-08-25T08:05:00Z",
+    updated_at: "2026-08-25T08:05:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
+    user: CODEX_BOT,
+    performed_via_github_app: CODEX_APP,
+    ...overrides,
+  };
+}
+
+function findingReview(headSha = HEAD, overrides = {}) {
+  return {
+    id: 401,
+    state: "COMMENTED",
+    body: [
+      "### 💡 Codex Review",
+      "",
+      `https://github.com/${REPOSITORY}/blob/${headSha}/src/finding.mjs#L1`,
+    ].join("\n"),
+    commit_id: headSha,
+    submitted_at: "2026-08-25T08:05:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#pullrequestreview-401`,
+    user: CODEX_BOT,
+    app: null,
+    performed_via_github_app: null,
+    ...overrides,
+  };
+}
+
+function approvedReview(commitRef = HEAD, overrides = {}) {
+  return {
+    id: 402,
+    state: "APPROVED",
+    body: `Coverage: \`${commitRef}\`.\n\nNo findings.`,
+    commit_id: HEAD,
+    submitted_at: "2026-08-25T08:05:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#pullrequestreview-402`,
+    user: CODEX_BOT,
+    app: null,
+    performed_via_github_app: null,
+    ...overrides,
+  };
+}
+
+function progressIssueComment(overrides = {}) {
+  return {
+    id: 204,
+    body: "Codex Review in progress",
+    created_at: "2026-08-25T08:16:00Z",
+    updated_at: "2026-08-25T08:16:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-204`,
+    user: CODEX_BOT,
+    performed_via_github_app: CODEX_APP,
+    ...overrides,
+  };
+}
+
+function reaction(overrides = {}) {
+  return {
+    id: 501,
+    content: "+1",
+    created_at: "2026-08-25T08:01:00Z",
+    user: CODEX_BOT,
+    ...overrides,
+  };
+}
+
+function genericComment(id) {
+  return {
+    id,
+    body: `Ordinary discussion ${id}`,
+    created_at: "2026-08-25T07:00:00Z",
+    updated_at: "2026-08-25T07:00:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-${id}`,
+    user: HUMAN,
+    app: null,
+    performed_via_github_app: null,
+  };
+}
+
+function stickyComment(overrides = {}) {
+  return {
+    id: 301,
+    body: `Old diagnostic\n\n<!-- ${V2_STICKY_MARKER} -->\n<!-- {} -->`,
+    created_at: "2026-08-25T08:00:00Z",
+    updated_at: "2026-08-25T08:00:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-301`,
+    user: ACTIONS_BOT,
+    app: null,
+    performed_via_github_app: null,
+    ...overrides,
+  };
+}
+
+function issueCommentEvent(action, comment, overrides = {}) {
+  return {
+    action,
+    issue: {
+      number: PR,
+      pull_request: { url: `https://api.github.com/repos/${REPOSITORY}/pulls/${PR}` },
+    },
+    comment,
+    sender: CODEX_BOT,
+    repository: { full_name: REPOSITORY, default_branch: "main" },
+    ...overrides,
+  };
+}
+
+function baseChangeEvent(overrides = {}) {
+  return {
+    action: "edited",
+    number: PR,
+    changes: { base: { ref: { from: "release" } } },
+    pull_request: {
+      number: PR,
+      head: { sha: HEAD },
+      base: {
+        ref: "main",
+        repo: { id: REPO_ID, full_name: REPOSITORY },
+      },
+    },
+    sender: HUMAN,
+    repository: {
+      id: REPO_ID,
+      full_name: REPOSITORY,
+      default_branch: "main",
+    },
+    ...overrides,
+  };
+}
+
+function runtimeEnvironment(context, {
+  suffix = "default",
+  operation = "reconcile",
+  requestReview = "true",
+  requestCommentId = "",
+  limitsProfile = "default",
+  expectedHeadSha = HEAD,
+  eventName = "workflow_dispatch",
+  event = null,
+  serverUrl = "https://github.com",
+} = {}) {
+  const directory = mkdtempSync(join(tmpdir(), `codex-review-gate-v2-${suffix}-`));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const environment = {
+    GITHUB_TOKEN: "test-token",
+    GITHUB_REPOSITORY: REPOSITORY,
+    PR_NUMBER: String(PR),
+    EXPECTED_HEAD_SHA: expectedHeadSha,
+    OPERATION_INPUT: operation,
+    REQUEST_COMMENT_ID: requestCommentId,
+    REQUEST_REVIEW_INPUT: requestReview,
+    LIMITS_PROFILE: limitsProfile,
+    GITHUB_API_URL: serverUrl === "https://github.com"
+      ? "https://api.github.com"
+      : `${serverUrl}/api/v3`,
+    GITHUB_SERVER_URL: serverUrl,
+    GITHUB_RUN_ID: "123",
+    GITHUB_REF_TYPE: "branch",
+    GITHUB_REF_NAME: "main",
+    RUNNER_OS: "Linux",
+    RUNNER_ENVIRONMENT: "github-hosted",
+    GITHUB_EVENT_NAME: eventName,
+    GITHUB_EVENT_PATH: join(directory, "event.json"),
+    GITHUB_OUTPUT: join(directory, "output"),
+    GITHUB_STEP_SUMMARY: join(directory, "summary"),
+  };
+  writeFileSync(
+    environment.GITHUB_EVENT_PATH,
+    `${JSON.stringify(event || {
+      ref: "refs/heads/main",
+      repository: { full_name: REPOSITORY, default_branch: "main" },
+      inputs: {
+        operation,
+        pr_number: String(PR),
+        expected_head_sha: expectedHeadSha,
+        request_comment_id: requestCommentId,
+        request_review: String(requestReview).toLowerCase() !== "false",
+        limits_profile: limitsProfile,
+      },
+    })}\n`,
+    "utf8",
+  );
+  return environment;
+}
+
+async function runGate(environment, github, {
+  stabilityIntervalMs = 1,
+  stabilityWindowMs = 4,
+} = {}) {
+  let clock = 0;
+  const sleeps = [];
+  const result = await runV2GateCli({
+    environment,
+    fetchImpl: github.fetch,
+    sleep: async (milliseconds) => {
+      sleeps.push(milliseconds);
+      clock += milliseconds;
+    },
+    now: () => clock,
+    stabilityIntervalMs,
+    stabilityWindowMs,
+  });
+  return { result, sleeps };
+}
+
+function readOutputs(path) {
+  return Object.fromEntries(
+    readFileSync(path, "utf8")
+      .trimEnd()
+      .split("\n")
+      .map((line) => {
+        const separator = line.indexOf("=");
+        return [line.slice(0, separator), line.slice(separator + 1)];
+      }),
+  );
+}
+
+function createGitHubMock({
+  issueComments = [],
+  issueCommentSnapshots = null,
+  reviews = [],
+  reviewSnapshots = null,
+  reactionsByCommentId = new Map(),
+  pullRequestOverrides = {},
+  pullRequestSequence = null,
+  repositoryOverrides = {},
+  repositorySequence = null,
+  baseEpoch = null,
+  baseEpochSequence = null,
+  baseEpochResponseMutator = null,
+  permissionByLogin = new Map([[HUMAN.login, "write"]]),
+  permissionMissingLogins = new Set(),
+  commitResolution = null,
+  commentRefetchMutator = null,
+  reviewRefetchMutator = null,
+  statusFailureStates = new Set(),
+  statusAckMutator = null,
+  postUnknownAfterCreate = false,
+  postUnknownReread = "visible",
+} = {}) {
+  const comments = issueComments.map((value) => structuredClone(value));
+  const commentSnapshots = issueCommentSnapshots?.map((snapshotComments) =>
+    snapshotComments.map((value) => structuredClone(value))) || null;
+  const reviewList = reviews.map((value) => structuredClone(value));
+  const reviewSnapshotList = reviewSnapshots?.map((snapshotReviews) =>
+    snapshotReviews.map((value) => structuredClone(value))) || null;
+  const calls = [];
+  const statusWrites = [];
+  const statusAttempts = [];
+  const requestBodies = [];
+  const stickyCreates = [];
+  const stickyPatches = [];
+  let nextCommentId = 10_000;
+  let commentSnapshotIndex = 0;
+  let reviewSnapshotIndex = 0;
+  let pullRequestIndex = 0;
+  let repositoryIndex = 0;
+  let baseEpochIndex = 0;
+  let activeComments = comments;
+  let activeReviews = reviewList;
+  let unknownPostUsed = false;
+  let unknownPostCommentId = "";
+
+  function currentComments() {
+    if (!commentSnapshots) return comments;
+    return commentSnapshots[Math.min(commentSnapshotIndex, commentSnapshots.length - 1)] || [];
+  }
+
+  function currentReviews() {
+    if (!reviewSnapshotList) return reviewList;
+    return reviewSnapshotList[Math.min(reviewSnapshotIndex, reviewSnapshotList.length - 1)] || [];
+  }
+
+  function pullRequest() {
+    const sequence = pullRequestSequence?.[
+      Math.min(pullRequestIndex, pullRequestSequence.length - 1)
+    ] || {};
+    pullRequestIndex += 1;
+    const headOverride = { ...(pullRequestOverrides.head || {}), ...(sequence.head || {}) };
+    const baseOverride = { ...(pullRequestOverrides.base || {}), ...(sequence.base || {}) };
+    const value = {
+      number: PR,
+      state: "open",
+      draft: false,
+      merged: false,
+      merged_at: null,
+      comments: currentComments().length,
+      commits: 1,
+      user: { ...HUMAN },
+      head: {
+        sha: HEAD,
+        ref: "feature",
+        repo: { id: REPO_ID, full_name: REPOSITORY },
+        user: { ...HUMAN },
+      },
+      base: {
+        sha: BASE,
+        ref: "main",
+        repo: { id: REPO_ID, full_name: REPOSITORY },
+      },
+      ...pullRequestOverrides,
+      ...sequence,
+    };
+    value.head = {
+      sha: HEAD,
+      ref: "feature",
+      user: { ...HUMAN, ...(pullRequestOverrides.head?.user || {}), ...(sequence.head?.user || {}) },
+      ...headOverride,
+      repo: {
+        id: REPO_ID,
+        full_name: REPOSITORY,
+        ...(pullRequestOverrides.head?.repo || {}),
+        ...(sequence.head?.repo || {}),
+      },
+    };
+    value.base = {
+      sha: BASE,
+      ref: "main",
+      ...baseOverride,
+      repo: {
+        id: REPO_ID,
+        full_name: REPOSITORY,
+        ...(pullRequestOverrides.base?.repo || {}),
+        ...(sequence.base?.repo || {}),
+      },
+    };
+    value.user = {
+      ...HUMAN,
+      ...(pullRequestOverrides.user || {}),
+      ...(sequence.user || {}),
+    };
+    return value;
+  }
+
+  function repository() {
+    const sequence = repositorySequence?.[
+      Math.min(repositoryIndex, repositorySequence.length - 1)
+    ] || {};
+    repositoryIndex += 1;
+    return {
+      id: REPO_ID,
+      full_name: REPOSITORY,
+      fork: false,
+      default_branch: "main",
+      ...repositoryOverrides,
+      ...sequence,
+    };
+  }
+
+  const fetch = async (rawUrl, options = {}) => {
+    const url = new URL(rawUrl);
+    const path = url.pathname.replace(/^\/api\/v3(?=\/repos\/)/u, "");
+    const method = options.method || "GET";
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ method, path, search: url.search, body });
+
+    if (method === "GET" && path === `/repos/${REPOSITORY}`) {
+      return jsonResponse(repository());
+    }
+    if (method === "GET" && path === `/repos/${REPOSITORY}/pulls/${PR}`) {
+      return jsonResponse(pullRequest());
+    }
+    if (method === "POST" && path === "/graphql") {
+      const selected = baseEpochSequence
+        ? baseEpochSequence[Math.min(baseEpochIndex, baseEpochSequence.length - 1)]
+        : baseEpoch;
+      baseEpochIndex += 1;
+      const response = baseEpochGraphQlResponse(selected);
+      return jsonResponse(
+        typeof baseEpochResponseMutator === "function"
+          ? baseEpochResponseMutator(response)
+          : response,
+      );
+    }
+    if (method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`) {
+      if (unknownPostUsed && postUnknownReread === "failure") {
+        return jsonResponse({ message: "synthetic unknown POST reread failure" }, 500);
+      }
+      activeComments = currentComments();
+      if (unknownPostUsed && postUnknownReread === "hidden") {
+        activeComments = activeComments.filter(
+          ({ id }) => String(id) !== unknownPostCommentId,
+        );
+      }
+      const response = paginatedResponse(activeComments, url);
+      if (!response.hasNext) commentSnapshotIndex += 1;
+      return response.response;
+    }
+    if (method === "GET" && path === `/repos/${REPOSITORY}/pulls/${PR}/reviews`) {
+      activeReviews = currentReviews();
+      const response = paginatedResponse(activeReviews, url);
+      if (!response.hasNext) reviewSnapshotIndex += 1;
+      return response.response;
+    }
+
+    const exactComment = /^\/repos\/owner\/repo\/issues\/comments\/(\d+)$/u.exec(path);
+    if (method === "GET" && exactComment) {
+      const original = activeComments.find((value) => String(value.id) === exactComment[1]) ||
+        comments.find((value) => String(value.id) === exactComment[1]);
+      if (!original) return jsonResponse({ message: "not found" }, 404);
+      const value = typeof commentRefetchMutator === "function"
+        ? commentRefetchMutator(structuredClone(original))
+        : original;
+      return jsonResponse(value);
+    }
+
+    const exactReview = /^\/repos\/owner\/repo\/pulls\/17\/reviews\/(\d+)$/u.exec(path);
+    if (method === "GET" && exactReview) {
+      const original = activeReviews.find((value) => String(value.id) === exactReview[1]) ||
+        reviewList.find((value) => String(value.id) === exactReview[1]);
+      if (!original) return jsonResponse({ message: "not found" }, 404);
+      const value = typeof reviewRefetchMutator === "function"
+        ? reviewRefetchMutator(structuredClone(original))
+        : original;
+      return jsonResponse(value);
+    }
+
+    const reactions = /^\/repos\/owner\/repo\/issues\/comments\/(\d+)\/reactions$/u.exec(
+      path,
+    );
+    if (method === "GET" && reactions) {
+      return paginatedResponse(reactionsByCommentId.get(reactions[1]) || [], url).response;
+    }
+
+    const permission = /^\/repos\/owner\/repo\/collaborators\/([^/]+)\/permission$/u.exec(
+      path,
+    );
+    if (method === "GET" && permission) {
+      const login = decodeURIComponent(permission[1]);
+      if (permissionMissingLogins.has(login)) {
+        return jsonResponse({ message: "not found" }, 404);
+      }
+      return jsonResponse({ permission: permissionByLogin.get(login) || "read" });
+    }
+
+    const commit = /^\/repos\/owner\/repo\/commits\/([0-9a-f]{7,40})$/u.exec(path);
+    if (method === "GET" && commit) {
+      if (typeof commitResolution === "function") {
+        const resolved = commitResolution(commit[1]);
+        return jsonResponse(
+          resolved?.data || { message: resolved?.message || "not found" },
+          resolved?.status || (resolved?.data ? 200 : 404),
+        );
+      }
+      return HEAD.startsWith(commit[1])
+        ? jsonResponse({ sha: HEAD })
+        : jsonResponse({ message: "not found" }, 404);
+    }
+
+    if (method === "POST" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`) {
+      const created = {
+        id: nextCommentId,
+        body: body.body,
+        created_at: "2026-08-25T09:00:00Z",
+        updated_at: "2026-08-25T09:00:00Z",
+        html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-${nextCommentId}`,
+        user: ACTIONS_BOT,
+        app: null,
+        performed_via_github_app: null,
+      };
+      nextCommentId += 1;
+      comments.push(created);
+      activeComments = comments;
+      unknownPostCommentId = String(created.id);
+      if (body.body.startsWith("@codex review")) requestBodies.push(body.body);
+      if (body.body.includes(`<!-- ${V2_STICKY_MARKER} -->`)) stickyCreates.push(body.body);
+      if (postUnknownAfterCreate && !unknownPostUsed && body.body.startsWith("@codex review")) {
+        unknownPostUsed = true;
+        return jsonResponse({ message: "synthetic unknown POST" }, 500);
+      }
+      return jsonResponse(created, 201);
+    }
+
+    if (method === "PATCH" && exactComment) {
+      const target = comments.find((value) => String(value.id) === exactComment[1]);
+      if (!target) return jsonResponse({ message: "not found" }, 404);
+      target.body = body.body;
+      target.updated_at = "2026-08-25T09:00:00Z";
+      stickyPatches.push({ id: exactComment[1], body: body.body });
+      return jsonResponse(target);
+    }
+
+    const status = /^\/repos\/owner\/repo\/statuses\/([0-9a-f]{40})$/u.exec(path);
+    if (method === "POST" && status) {
+      const attempted = { ...body, sha: status[1] };
+      statusAttempts.push(attempted);
+      if (statusFailureStates.has(attempted.state)) {
+        return jsonResponse({ message: `synthetic ${attempted.state} failure` }, 500);
+      }
+      statusWrites.push(attempted);
+      const acknowledged = typeof statusAckMutator === "function"
+        ? statusAckMutator(structuredClone(attempted))
+        : attempted;
+      return jsonResponse(acknowledged, 201);
+    }
+
+    return jsonResponse({ message: `unexpected ${method} ${path}` }, 404);
+  };
+
+  return {
+    fetch,
+    calls,
+    statusWrites,
+    statusAttempts,
+    requestBodies,
+    stickyCreates,
+    stickyPatches,
+  };
+}
+
+function baseEpochGraphQlResponse(event = null) {
+  return {
+    data: {
+      repository: {
+        nameWithOwner: REPOSITORY,
+        pullRequest: {
+          number: PR,
+          timelineItems: {
+            filteredCount: event === null ? 0 : 1,
+            pageCount: event === null ? 0 : 1,
+            nodes: event === null ? [] : [structuredClone(event)],
+          },
+        },
+      },
+    },
+  };
+}
+
+function baseRefChangedEvent(overrides = {}) {
+  return {
+    __typename: "BaseRefChangedEvent",
+    id: "BRE_kwDOExample1",
+    createdAt: "2026-08-25T08:05:00Z",
+    previousRefName: "release",
+    currentRefName: "main",
+    actor: { __typename: "User", login: HUMAN.login },
+    ...overrides,
+  };
+}
+
+function baseRefForcePushedEvent(overrides = {}) {
+  return {
+    __typename: "BaseRefForcePushedEvent",
+    id: "BRFPE_kwDOExample1",
+    createdAt: "2026-08-25T08:05:00Z",
+    beforeCommit: { oid: "e".repeat(40) },
+    afterCommit: { oid: BASE },
+    ref: { name: "main" },
+    actor: { __typename: "User", login: HUMAN.login },
+    ...overrides,
+  };
+}
+
+function paginatedResponse(items, url) {
+  const perPage = Number(url.searchParams.get("per_page") || "30");
+  const page = Number(url.searchParams.get("page") || "1");
+  const start = (page - 1) * perPage;
+  const values = items.slice(start, start + perPage);
+  const hasNext = start + values.length < items.length;
+  const headers = {};
+  if (hasNext) {
+    const next = new URL(url);
+    next.searchParams.set("per_page", String(perPage));
+    next.searchParams.set("page", String(page + 1));
+    headers.link = `<${next.href}>; rel="next"`;
+  }
+  return { response: jsonResponse(values, 200, headers), hasNext };
+}
+
+function jsonResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json", ...headers },
+  });
+}

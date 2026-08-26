@@ -1680,17 +1680,17 @@ test("rejects official Codex issue comments with missing or wrong REST identity 
   }
 });
 
-test("accepts only exact 10- or 40-character clean issue-comment commit markers", () => {
+test("accepts exact 7-40-character clean issue-comment commit markers", () => {
   const parseMarker = (commitRef) => parseCodexIssueCommentArtifact(
     liveCodexIssueComment([
       "Codex Review: Didn't find any major issues.",
       "",
       `**Reviewed commit:** \`${commitRef}\``,
     ].join("\n")),
-    { owner: "owner", repo: "repo" },
+    { owner: "owner", repo: "repo", allowShortCommitRefs: true },
   );
 
-  for (const length of [7, 9, ...Array.from({ length: 29 }, (_, index) => index + 11)]) {
+  for (const length of [6, 41]) {
     const artifact = parseMarker("a".repeat(length));
     assert.equal(artifact.kind, "malformed", `commit marker length ${length}`);
     assert.equal(
@@ -1698,6 +1698,12 @@ test("accepts only exact 10- or 40-character clean issue-comment commit markers"
       "clean Codex issue comment must contain exactly one Reviewed commit marker",
       `commit marker length ${length}`,
     );
+  }
+
+  for (const length of Array.from({ length: 34 }, (_, index) => index + 7)) {
+    const artifact = parseMarker("a".repeat(length));
+    assert.equal(artifact.kind, "clean", `commit marker length ${length}`);
+    assert.equal(artifact.commitRef, "a".repeat(length), `commit marker length ${length}`);
   }
 
   assert.deepEqual(parseMarker(FULL_SHA_A), {
@@ -2117,7 +2123,22 @@ test("accepts an exact-repository full-SHA Codex issue-comment finding", () => {
     kind: "finding",
     headSha: FULL_SHA_A,
     samples: ["src/lib name.rs:12"],
+    findingCount: 1,
   });
+});
+
+test("counts every finding link while bounding displayed samples", () => {
+  const links = [1, 2, 3, 4].map(
+    (line) => `https://github.com/owner/repo/blob/${FULL_SHA_A}/src/lib.mjs#L${line}`,
+  );
+  const artifact = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(["### 💡 Codex Review", "", ...links].join("\n")),
+    { owner: "owner", repo: "repo" },
+  );
+
+  assert.equal(artifact.kind, "finding");
+  assert.equal(artifact.findingCount, 4);
+  assert.deepEqual(artifact.samples, ["src/lib.mjs:1", "src/lib.mjs:2", "src/lib.mjs:3"]);
 });
 
 test("rejects mixed or malformed Codex issue-comment finding links", () => {
@@ -2317,7 +2338,7 @@ test("rejects clean Codex reviews with a wrong user type or short parent commit"
   assert.equal(shortCommit.reason, "Codex review is not bound to a full commit SHA");
 });
 
-test("rejects an APPROVED review whose body is finding-formatted", () => {
+test("treats a finding-formatted APPROVED review as a finding", () => {
   const artifact = parseCodexReviewArtifact(
     liveCodexReview({
       state: "APPROVED",
@@ -2330,11 +2351,10 @@ test("rejects an APPROVED review whose body is finding-formatted", () => {
     { owner: "owner", repo: "repo" },
   );
 
-  assert.equal(artifact.kind, "malformed");
-  assert.equal(
-    artifact.reason,
-    "Codex review state conflicts with its non-clean body",
-  );
+  assert.equal(artifact.kind, "finding");
+  assert.equal(artifact.headSha, FULL_SHA_A);
+  assert.equal(artifact.findingCount, 1);
+  assert.deepEqual(artifact.samples, ["src/lib.mjs:7"]);
 });
 
 test("rejects a Codex review finding whose URL conflicts with the parent commit", () => {

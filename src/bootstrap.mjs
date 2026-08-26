@@ -1,7 +1,52 @@
-export const DEFAULT_STATUS_CONTEXT = "codex/review-gate";
+export const DEFAULT_STATUS_CONTEXT = "codex/github-review-gate";
+export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
 export const DEFAULT_STATUS_INTEGRATION_ID = 15368;
 export const DEFAULT_RULESET_NAME = "Must Pass Codex Review";
 export const DEFAULT_WORKFLOW_PATH = ".github/workflows/codex-review-gate.yml";
+export const DEFAULT_RULESET_ENFORCEMENT = "disabled";
+export const DEFAULT_CONTROL_PLANE_OWNER = "@JoeyTeng";
+export const DEFAULT_CODEOWNERS_PATH = ".github/CODEOWNERS";
+export const CANONICAL_V2_WORKFLOW_USES =
+  "JoeyTeng/codex-review-gate-action@v2";
+export const LEGACY_V1_WORKFLOW_USES =
+  "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1";
+const LEGACY_V1_DIRECT_ACTION_USES = "JoeyTeng/codex-review-gate-action@v1";
+const CODEX_REVIEW_GATE_CALLER_PATTERN =
+  /(?:^|[\s,{])["']?uses["']?\s*:\s*["']?JoeyTeng\/codex-review-gate-action(?:\/\.github\/workflows\/codex-review-gate\.ya?ml)?@[^\s,}#"']+/imu;
+const CONTROL_PLANE_CODEOWNERS_BEGIN =
+  "# BEGIN codex-review-gate control-plane";
+const CONTROL_PLANE_CODEOWNERS_END =
+  "# END codex-review-gate control-plane";
+const CONTROL_PLANE_CODEOWNERS_PATTERNS = [
+  "/.github/workflows/",
+  "/.github/CODEOWNERS",
+];
+const CANONICAL_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
+  \${{
+    (
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch
+    ) ||
+    (
+      github.event_name == 'issue_comment' &&
+      (github.event.action == 'created' || github.event.action == 'edited') &&
+      github.event.issue.pull_request &&
+      github.event.sender.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.sender.type == 'Bot' &&
+      github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.comment.user.type == 'Bot'
+    ) ||
+    (
+      github.event_name == 'pull_request_target' &&
+      github.event.action == 'edited' &&
+      github.event.changes.base.ref.from &&
+      github.event.changes.base.ref.from != github.event.pull_request.base.ref &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch
+    )
+  }}
+`);
 
 const DEFAULT_REF_CONDITIONS = {
   ref_name: {
@@ -9,6 +54,51 @@ const DEFAULT_REF_CONDITIONS = {
     exclude: [],
   },
 };
+
+export function directoryWitnessFromMetadata(path, metadata, label = "Directory") {
+  if (metadata === null || metadata === undefined) {
+    throw new Error(`${label} is missing: ${path}`);
+  }
+  if (metadata.isSymbolicLink()) {
+    throw new Error(`${label} must not be a symbolic link: ${path}`);
+  }
+  if (!metadata.isDirectory()) {
+    throw new Error(`${label} must be a directory: ${path}`);
+  }
+
+  const permissionMask = typeof metadata.mode === "bigint" ? 0o7777n : 0o7777;
+  return {
+    path,
+    dev: metadata.dev,
+    ino: metadata.ino,
+    mode: metadata.mode & permissionMask,
+    uid: metadata.uid,
+    gid: metadata.gid,
+  };
+}
+
+export function assertDirectoryWitnessStable(
+  expected,
+  metadata,
+  phase = "revalidation",
+) {
+  const current = directoryWitnessFromMetadata(expected.path, metadata, "Verified parent");
+  if (current.dev !== expected.dev || current.ino !== expected.ino) {
+    throw new Error(
+      `Verified parent object identity changed during ${phase}: ${expected.path}`,
+    );
+  }
+  if (
+    current.mode !== expected.mode ||
+    current.uid !== expected.uid ||
+    current.gid !== expected.gid
+  ) {
+    throw new Error(
+      `Verified parent access policy changed during ${phase}: ${expected.path}`,
+    );
+  }
+  return current;
+}
 
 export function parseRepoSlug(value) {
   if (typeof value !== "string" || value.trim() === "") {
@@ -28,6 +118,115 @@ export function parseRepoSlug(value) {
   };
 }
 
+export function normalizeControlPlaneOwner(value) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("Control-plane owner must be a GitHub user handle such as @JoeyTeng.");
+  }
+
+  const normalized = value.trim();
+  if (!/^@[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u.test(normalized)) {
+    throw new Error(
+      `Control-plane owner must be one GitHub user handle such as @JoeyTeng: ${value}`,
+    );
+  }
+  return normalized;
+}
+
+export function ensureControlPlaneCodeownersContent(
+  existing,
+  owner = DEFAULT_CONTROL_PLANE_OWNER,
+) {
+  const normalizedOwner = normalizeControlPlaneOwner(owner);
+  if (existing !== null && typeof existing !== "string") {
+    throw new Error("Existing .github/CODEOWNERS content must be UTF-8 text or null.");
+  }
+  if (existing?.includes("\0")) {
+    throw new Error("Existing .github/CODEOWNERS contains a NUL byte.");
+  }
+
+  const source = existing ?? "";
+  const newline = selectCodeownersNewline(source);
+  const lines = source === "" ? [] : source.split(newline);
+  const beginIndexes = findExactLineIndexes(lines, CONTROL_PLANE_CODEOWNERS_BEGIN);
+  const endIndexes = findExactLineIndexes(lines, CONTROL_PLANE_CODEOWNERS_END);
+  if (beginIndexes.length !== endIndexes.length || beginIndexes.length > 1) {
+    throw new Error(
+      "Existing .github/CODEOWNERS has an ambiguous codex-review-gate managed block.",
+    );
+  }
+
+  let unmanagedLines = lines;
+  if (beginIndexes.length === 1) {
+    const begin = beginIndexes[0];
+    const end = endIndexes[0];
+    if (end <= begin) {
+      throw new Error(
+        "Existing .github/CODEOWNERS has a malformed codex-review-gate managed block.",
+      );
+    }
+    unmanagedLines = [...lines.slice(0, begin), ...lines.slice(end + 1)];
+  }
+
+  while (
+    unmanagedLines.length > 0 &&
+    unmanagedLines[unmanagedLines.length - 1].trim() === ""
+  ) {
+    unmanagedLines = unmanagedLines.slice(0, -1);
+  }
+  const managedLines = [
+    CONTROL_PLANE_CODEOWNERS_BEGIN,
+    ...CONTROL_PLANE_CODEOWNERS_PATTERNS.map(
+      (pattern) => `${pattern} ${normalizedOwner}`,
+    ),
+    CONTROL_PLANE_CODEOWNERS_END,
+  ];
+  const content = [
+    ...unmanagedLines,
+    ...(unmanagedLines.length > 0 ? [""] : []),
+    ...managedLines,
+  ].join(newline) + newline;
+  validateControlPlaneCodeownersContent(content, normalizedOwner);
+  return { changed: content !== source, content };
+}
+
+export function validateControlPlaneCodeownersContent(
+  value,
+  owner = DEFAULT_CONTROL_PLANE_OWNER,
+) {
+  const normalizedOwner = normalizeControlPlaneOwner(owner);
+  if (typeof value !== "string" || value === "" || value.includes("\0")) {
+    throw new Error("Default-branch .github/CODEOWNERS must be non-empty UTF-8 text.");
+  }
+  if (Buffer.byteLength(value, "utf8") >= 3 * 1024 * 1024) {
+    throw new Error("Default-branch .github/CODEOWNERS must remain below GitHub's 3 MB limit.");
+  }
+  const lines = value.split(/\r?\n/u);
+  const rules = lines
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  const expected = CONTROL_PLANE_CODEOWNERS_PATTERNS.map(
+    (pattern) => `${pattern} ${normalizedOwner}`,
+  );
+  const beginIndexes = findExactLineIndexes(lines, CONTROL_PLANE_CODEOWNERS_BEGIN);
+  const endIndexes = findExactLineIndexes(lines, CONTROL_PLANE_CODEOWNERS_END);
+  if (
+    beginIndexes.length !== 1 ||
+    endIndexes.length !== 1 ||
+    endIndexes[0] !== beginIndexes[0] + 3 ||
+    endIndexes[0] !== lines.length - 2 ||
+    lines[beginIndexes[0] + 1] !== expected[0] ||
+    lines[beginIndexes[0] + 2] !== expected[1] ||
+    rules.length < expected.length ||
+    rules[rules.length - 2] !== expected[0] ||
+    rules[rules.length - 1] !== expected[1]
+  ) {
+    throw new Error(
+      `Default-branch .github/CODEOWNERS must end with exact, non-overridable ownership for /.github/workflows/ and /.github/CODEOWNERS by ${normalizedOwner}.`,
+    );
+  }
+  return value;
+}
+
 export function rulesetHasRequiredStatusContext(
   ruleset,
   context = DEFAULT_STATUS_CONTEXT,
@@ -35,6 +234,41 @@ export function rulesetHasRequiredStatusContext(
 ) {
   return requiredStatusChecks(ruleset).some((check) =>
     requiredStatusCheckMatches(check, context, integrationId),
+  );
+}
+
+export function rulesetHasRequiredPullRequestPolicy(ruleset) {
+  return (ruleset.rules ?? []).some(
+    (rule) =>
+      rule.type === "pull_request" &&
+      rule.parameters?.required_review_thread_resolution === true &&
+      rule.parameters?.require_code_owner_review === true &&
+      rule.parameters?.dismiss_stale_reviews_on_push === true &&
+      Number.isSafeInteger(rule.parameters?.required_approving_review_count) &&
+      rule.parameters.required_approving_review_count >= 0,
+  );
+}
+
+export function rulesetHasNonFastForwardPolicy(ruleset) {
+  return (ruleset.rules ?? []).some(
+    (rule) =>
+      rule.type === "non_fast_forward" &&
+      (rule.parameters === undefined || rule.parameters === null),
+  );
+}
+
+export function rulesetHasGatePolicy(
+  ruleset,
+  context = DEFAULT_STATUS_CONTEXT,
+  { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  return (
+    rulesetHasRequiredStatusContext(ruleset, context, { integrationId }) &&
+    rulesetHasStrictStatusPolicy(ruleset, context) &&
+    rulesetHasRequiredPullRequestPolicy(ruleset) &&
+    rulesetHasNonFastForwardPolicy(ruleset) &&
+    Array.isArray(ruleset.bypass_actors) &&
+    ruleset.bypass_actors.length === 0
   );
 }
 
@@ -50,6 +284,17 @@ function requiredStatusChecks(ruleset) {
     .flatMap((rule) => rule.parameters?.required_status_checks ?? []);
 }
 
+function rulesetHasStrictStatusPolicy(ruleset, context) {
+  return (ruleset.rules ?? []).some(
+    (rule) =>
+      rule.type === "required_status_checks" &&
+      rule.parameters?.strict_required_status_checks_policy === true &&
+      (rule.parameters?.required_status_checks ?? []).some(
+        (check) => check?.context === context,
+      ),
+  );
+}
+
 export function findEffectiveRulesetWithStatusContext(
   rulesets,
   context = DEFAULT_STATUS_CONTEXT,
@@ -60,6 +305,19 @@ export function findEffectiveRulesetWithStatusContext(
       ruleset.enforcement === "active" &&
       rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
       rulesetHasRequiredStatusContext(ruleset, context, { integrationId }),
+  );
+}
+
+export function findEffectiveRulesetWithGatePolicy(
+  rulesets,
+  context = DEFAULT_STATUS_CONTEXT,
+  { defaultBranch = null, integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  return rulesets.find(
+    (ruleset) =>
+      ruleset.enforcement === "active" &&
+      rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
+      rulesetHasGatePolicy(ruleset, context, { integrationId }),
   );
 }
 
@@ -89,9 +347,15 @@ export function ensureStatusContextInRules(
   {
     integrationId = DEFAULT_STATUS_INTEGRATION_ID,
     strict = true,
-    doNotEnforceOnCreate = true,
+    doNotEnforceOnCreate = undefined,
+    removeContexts = [LEGACY_STATUS_CONTEXT],
   } = {},
 ) {
+  if (integrationId !== DEFAULT_STATUS_INTEGRATION_ID) {
+    throw new Error(
+      `Codex Review Gate requires the GitHub Actions source integration id ${DEFAULT_STATUS_INTEGRATION_ID}.`,
+    );
+  }
   const rules = existingRules.map(stripRuleForRulesetPayload);
   const index = rules.findIndex((rule) => rule.type === "required_status_checks");
 
@@ -112,9 +376,11 @@ export function ensureStatusContextInRules(
 
   const rule = rules[index];
   const parameters = structuredCloneSafe(rule.parameters ?? {});
-  const checks = [...(parameters.required_status_checks ?? [])];
+  const originalChecks = [...(parameters.required_status_checks ?? [])];
+  const removableContexts = new Set(removeContexts.filter((item) => item !== context));
+  const checks = originalChecks.filter((check) => !removableContexts.has(check?.context));
   const statusIndex = checks.findIndex((check) => check?.context === context);
-  let changed = false;
+  let changed = checks.length !== originalChecks.length;
   if (statusIndex === -1) {
     checks.push(buildRequiredStatusCheck({ context, integrationId }));
     changed = true;
@@ -124,11 +390,16 @@ export function ensureStatusContextInRules(
   }
 
   parameters.required_status_checks = checks.map(normalizeRequiredStatusCheck);
-  if (parameters.strict_required_status_checks_policy === undefined) {
+  if (parameters.strict_required_status_checks_policy !== strict) {
     parameters.strict_required_status_checks_policy = strict;
+    changed = true;
   }
-  if (parameters.do_not_enforce_on_create === undefined) {
+  if (
+    doNotEnforceOnCreate !== undefined &&
+    parameters.do_not_enforce_on_create !== doNotEnforceOnCreate
+  ) {
     parameters.do_not_enforce_on_create = doNotEnforceOnCreate;
+    changed = true;
   }
 
   rules[index] = {
@@ -142,14 +413,100 @@ export function ensureStatusContextInRules(
   };
 }
 
+export function ensurePullRequestPolicyInRules(existingRules) {
+  const rules = existingRules.map(stripRuleForRulesetPayload);
+  const index = rules.findIndex((rule) => rule.type === "pull_request");
+  if (index === -1) {
+    return {
+      changed: true,
+      rules: [buildPullRequestRule(), ...rules],
+    };
+  }
+
+  const rule = rules[index];
+  const parameters = structuredCloneSafe(rule.parameters ?? {});
+  let changed = false;
+  for (const [key, value] of Object.entries(defaultPullRequestParameters())) {
+    if (parameters[key] === undefined) {
+      parameters[key] = value;
+      changed = true;
+    }
+  }
+  if (parameters.required_review_thread_resolution !== true) {
+    parameters.required_review_thread_resolution = true;
+    changed = true;
+  }
+  if (parameters.require_code_owner_review !== true) {
+    parameters.require_code_owner_review = true;
+    changed = true;
+  }
+  if (parameters.dismiss_stale_reviews_on_push !== true) {
+    parameters.dismiss_stale_reviews_on_push = true;
+    changed = true;
+  }
+  if (
+    !Number.isSafeInteger(parameters.required_approving_review_count) ||
+    parameters.required_approving_review_count < 0
+  ) {
+    parameters.required_approving_review_count = 0;
+    changed = true;
+  }
+  rules[index] = { type: "pull_request", parameters };
+  return { changed, rules };
+}
+
+export function ensureNonFastForwardPolicyInRules(existingRules) {
+  const rules = existingRules.map(stripRuleForRulesetPayload);
+  const indexes = rules.flatMap((rule, index) =>
+    rule.type === "non_fast_forward" ? [index] : []
+  );
+  if (indexes.length === 0) {
+    return {
+      changed: true,
+      rules: [...rules, { type: "non_fast_forward" }],
+    };
+  }
+  const keptIndex = indexes[0];
+  const normalized = rules.filter(
+    (rule, index) => rule.type !== "non_fast_forward" || index === keptIndex,
+  );
+  const normalizedIndex = normalized.findIndex((rule) => rule.type === "non_fast_forward");
+  const changed = indexes.length !== 1 || normalized[normalizedIndex].parameters !== undefined;
+  normalized[normalizedIndex] = { type: "non_fast_forward" };
+  return { changed, rules: normalized };
+}
+
+export function ensureGatePolicyInRules(
+  existingRules,
+  context = DEFAULT_STATUS_CONTEXT,
+  {
+    integrationId = DEFAULT_STATUS_INTEGRATION_ID,
+    strict = true,
+    doNotEnforceOnCreate = undefined,
+  } = {},
+) {
+  const pullRequest = ensurePullRequestPolicyInRules(existingRules);
+  const status = ensureStatusContextInRules(pullRequest.rules, context, {
+    integrationId,
+    strict,
+    doNotEnforceOnCreate,
+  });
+  const nonFastForward = ensureNonFastForwardPolicyInRules(status.rules);
+  return {
+    changed: pullRequest.changed || status.changed || nonFastForward.changed,
+    rules: nonFastForward.rules,
+  };
+}
+
 export function buildCreateRulesetPayload({
   name = DEFAULT_RULESET_NAME,
   context = DEFAULT_STATUS_CONTEXT,
   integrationId = DEFAULT_STATUS_INTEGRATION_ID,
+  enforcement = DEFAULT_RULESET_ENFORCEMENT,
   strict = true,
-  doNotEnforceOnCreate = true,
+  doNotEnforceOnCreate = undefined,
 } = {}) {
-  const { rules } = ensureStatusContextInRules([], context, {
+  const { rules } = ensureGatePolicyInRules([], context, {
     integrationId,
     strict,
     doNotEnforceOnCreate,
@@ -158,7 +515,8 @@ export function buildCreateRulesetPayload({
   return {
     name,
     target: "branch",
-    enforcement: "active",
+    enforcement,
+    bypass_actors: [],
     conditions: structuredCloneSafe(DEFAULT_REF_CONDITIONS),
     rules,
   };
@@ -170,9 +528,9 @@ export function buildUpdateRulesetPayload(
     context = DEFAULT_STATUS_CONTEXT,
     integrationId = DEFAULT_STATUS_INTEGRATION_ID,
     defaultBranch = null,
-    enforcement = "active",
+    enforcement = undefined,
     strict = true,
-    doNotEnforceOnCreate = true,
+    doNotEnforceOnCreate = undefined,
   } = {},
 ) {
   const requiredTarget = "branch";
@@ -183,10 +541,17 @@ export function buildUpdateRulesetPayload(
   }
 
   const coversDefaultBranch = rulesetCoversDefaultBranch(ruleset, defaultBranch);
+  const preservesCompleteActivePolicy =
+    ruleset.enforcement === "active" &&
+    coversDefaultBranch &&
+    rulesetHasGatePolicy(ruleset, context, { integrationId });
+  const requiredEnforcement = enforcement ?? (
+    preservesCompleteActivePolicy ? "active" : DEFAULT_RULESET_ENFORCEMENT
+  );
   const requiredConditions = coversDefaultBranch
     ? structuredCloneSafe(ruleset.conditions)
     : addDefaultBranchToConditions(ruleset.conditions, defaultBranch);
-  const { changed: rulesChanged, rules } = ensureStatusContextInRules(
+  const { changed: rulesChanged, rules } = ensureGatePolicyInRules(
     ruleset.rules ?? [],
     context,
     {
@@ -198,24 +563,457 @@ export function buildUpdateRulesetPayload(
   const changed =
     rulesChanged ||
     ruleset.target !== requiredTarget ||
-    ruleset.enforcement !== enforcement ||
-    !coversDefaultBranch;
+    ruleset.enforcement !== requiredEnforcement ||
+    !coversDefaultBranch ||
+    !Array.isArray(ruleset.bypass_actors) ||
+    ruleset.bypass_actors.length > 0;
 
   const payload = {
     name: ruleset.name,
     target: requiredTarget,
-    enforcement,
+    enforcement: requiredEnforcement,
+    bypass_actors: [],
     rules,
   };
   if (requiredConditions !== undefined) {
     payload.conditions = requiredConditions;
   }
 
-  if (Array.isArray(ruleset.bypass_actors) && ruleset.bypass_actors.length > 0) {
-    payload.bypass_actors = ruleset.bypass_actors.map(stripBypassActorForRulesetPayload);
+  return { changed, payload };
+}
+
+export function rulesetWritableFingerprint(ruleset) {
+  if (ruleset === null || typeof ruleset !== "object" || Array.isArray(ruleset)) {
+    throw new Error("Ruleset readback must be an object before update.");
+  }
+  return canonicalJson({
+    name: ruleset.name,
+    target: ruleset.target,
+    enforcement: ruleset.enforcement,
+    bypass_actors: Array.isArray(ruleset.bypass_actors)
+      ? ruleset.bypass_actors.map(stripBypassActorForRulesetPayload)
+      : ruleset.bypass_actors,
+    conditions: structuredCloneSafe(ruleset.conditions),
+    rules: Array.isArray(ruleset.rules)
+      ? ruleset.rules.map(stripRuleForRulesetPayload)
+      : ruleset.rules,
+  });
+}
+
+export function validateCanonicalV2WorkflowContent(value) {
+  if (typeof value !== "string" || value === "") {
+    throw new Error("Canonical v2 workflow must be non-empty UTF-8 text.");
   }
 
-  return { changed, payload };
+  const usesMatches = value.match(/^\s*uses:\s*([^\s#]+)\s*$/gm) ?? [];
+  const expectedUses = `uses: ${CANONICAL_V2_WORKFLOW_USES}`;
+  if (
+    usesMatches.length !== 1 ||
+    usesMatches[0].trim() !== expectedUses
+  ) {
+    throw new Error(
+      `Canonical v2 workflow must contain exactly one literal "${expectedUses}" call.`,
+    );
+  }
+
+  const jobIfExpression = extractCanonicalJobIfExpression(value);
+  if (jobIfExpression !== CANONICAL_JOB_IF_EXPRESSION) {
+    throw new Error(
+      "Canonical v2 workflow job.if must exactly match the closed runner-admission expression.",
+    );
+  }
+  if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
+    throw new Error("Canonical v2 workflow must not retain a v1 caller.");
+  }
+  if (/^\s*schedule:\s*$/m.test(value) || /^\s*-?\s*cron:\s*/m.test(value)) {
+    throw new Error("Canonical v2 workflow must not allocate cron runners.");
+  }
+  if (/^\s*pull_request_review(?:_comment)?:\s*$/m.test(value)) {
+    throw new Error("Canonical v2 workflow must not start a writable review-event job.");
+  }
+  if (/^\s*repository_dispatch:\s*$/m.test(value)) {
+    throw new Error("Canonical v2 workflow must not expose repository_dispatch.");
+  }
+  if (
+    !/^  pull_request_target:\n    types: \[edited\]$/m.test(value) ||
+    !/^\s*issue_comment:\s*$/m.test(value) ||
+    !/^\s*types:\s*\[created, edited\]\s*$/m.test(value) ||
+    !/^\s*workflow_dispatch:\s*$/m.test(value)
+  ) {
+    throw new Error(
+      "Canonical v2 workflow must expose pull_request_target edited, issue_comment created/edited, and workflow_dispatch.",
+    );
+  }
+
+  for (const fragment of [
+    "github.event_name == 'workflow_dispatch'",
+    "github.ref_type == 'branch'",
+    "github.ref_name == github.event.repository.default_branch",
+    "github.event_name == 'issue_comment'",
+    "github.event.action == 'created'",
+    "github.event.action == 'edited'",
+    "github.event.sender.login",
+    "github.event.sender.type",
+    "github.event.comment.user.login",
+    "github.event.comment.user.type",
+    "github.event_name == 'pull_request_target'",
+    "github.event.changes.base.ref.from",
+    "github.event.changes.base.ref.from != github.event.pull_request.base.ref",
+    "github.event.pull_request.base.repo.full_name == github.repository",
+    "github.event.pull_request.base.ref == github.event.repository.default_branch",
+    "chatgpt-codex-connector[bot]",
+    "github_token:",
+    "pr_number:",
+    "expected_head_sha:",
+    "operation:",
+    "request_comment_id:",
+    "request_review:",
+    "limits_profile:",
+    "CODEX_REVIEW_GATE_LIMITS_PROFILE",
+    "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
+    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+  ]) {
+    if (!value.includes(fragment)) {
+      throw new Error(`Canonical v2 workflow is missing required fragment: ${fragment}`);
+    }
+  }
+  for (const input of [
+    "operation",
+    "pr_number",
+    "expected_head_sha",
+    "request_comment_id",
+    "request_review",
+    "limits_profile",
+  ]) {
+    if (!new RegExp(`^      ${input}:\\s*$`, "m").test(value)) {
+      throw new Error(`Canonical v2 workflow is missing typed dispatch input: ${input}`);
+    }
+  }
+  for (const forbidden of [
+    "github.event.client_payload",
+    "CODEX_REVIEW_GATE_MAX_PAGES",
+    "CODEX_REVIEW_GATE_MAX_OBJECTS",
+    "request_author_permission:",
+  ]) {
+    if (value.includes(forbidden)) {
+      throw new Error(`Canonical v2 workflow contains rejected legacy surface: ${forbidden}`);
+    }
+  }
+  return value;
+}
+
+export function installedWorkflowMatchesCanonical(installed, canonical) {
+  validateCanonicalV2WorkflowContent(canonical);
+  return typeof installed === "string" && installed === canonical;
+}
+
+export function workflowContainsLegacyV1Caller(value) {
+  return (
+    typeof value === "string" &&
+    (value.includes(LEGACY_V1_WORKFLOW_USES) ||
+      value.includes(LEGACY_V1_DIRECT_ACTION_USES))
+  );
+}
+
+export function workflowContainsCodexReviewGateCaller(value) {
+  return (
+    typeof value === "string" &&
+    CODEX_REVIEW_GATE_CALLER_PATTERN.test(
+      value.split(/\r?\n/u).map(stripYamlComment).join("\n"),
+    )
+  );
+}
+
+export function workflowCanWriteStatuses(value) {
+  if (typeof value !== "string") {
+    throw new Error("Workflow content must be text before permissions inspection.");
+  }
+  const normalizedValue = value.startsWith("\uFEFF") ? value.slice(1) : value;
+  if (/\uFEFF/u.test(normalizedValue)) {
+    throw new Error(
+      "Workflow uses an embedded UTF-8 BOM that cannot prove read-only status access.",
+    );
+  }
+  if (/[\u0085\u2028\u2029]/u.test(normalizedValue)) {
+    throw new Error(
+      "Workflow uses a non-ASCII YAML line separator that cannot prove read-only status access.",
+    );
+  }
+  const lines = normalizedValue.split(/\r?\n/u);
+  let blockScalarIndent = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index];
+    const rawIndent = rawLine.match(/^ */u)[0].length;
+    if (blockScalarIndent !== null) {
+      if (rawLine.trim() === "" || rawIndent > blockScalarIndent) {
+        continue;
+      }
+      blockScalarIndent = null;
+    }
+    const line = stripYamlComment(rawLine);
+    if (/^\s*[^:#]+:\s*[|>][+-]?[1-9]?\s*$/u.test(line)) {
+      blockScalarIndent = rawIndent;
+    }
+    const structuralLine = stripYamlQuotedSegments(line).replace(
+      /\$\{\{.*?\}\}/gu,
+      "",
+    );
+    if (
+      /(?:^|[\s:[{,?])(?:&[A-Za-z0-9_-]+|\*[A-Za-z0-9_-]+|!(?:!|<|[A-Za-z_]))/u.test(
+        structuralLine,
+      )
+    ) {
+      throw new Error(
+        "Workflow uses YAML tags, anchors, or aliases that cannot prove read-only status access.",
+      );
+    }
+    if (
+      /"[^"\r\n]*\\[^"\r\n]*"\s*:/u.test(line) ||
+      /(?:^|[,{?]\s*)"[^"\r\n]*\\/u.test(line)
+    ) {
+      throw new Error(
+        "Workflow uses an escaped double-quoted mapping key that cannot prove read-only status access.",
+      );
+    }
+    if (
+      /(?:^|[,{?]\s*)["'](?:permissions|statuses)["']\s*:/iu.test(line)
+    ) {
+      throw new Error(
+        "Workflow uses a quoted permissions or statuses key that cannot prove read-only status access.",
+      );
+    }
+    if (/(?:^|[,{]\s*)\?\s+/u.test(line)) {
+      throw new Error(
+        "Workflow uses an explicit YAML mapping key that cannot prove read-only status access.",
+      );
+    }
+    if (/^\s*<<\s*:/u.test(line) || /:\s*[&*][A-Za-z0-9_-]+(?:\s|$)/u.test(line)) {
+      throw new Error(
+        "Workflow permissions are opaque because YAML anchors, aliases, or merge keys are present.",
+      );
+    }
+    if (
+      /(?:^|[,{]\s*)permissions\s*:/iu.test(line) &&
+      !/^( *)(?:permissions):\s*(.*?)\s*$/iu.test(line)
+    ) {
+      throw new Error(
+        "Workflow uses a nested flow-style permissions mapping that cannot prove read-only status access.",
+      );
+    }
+    const match = line.match(/^( *)(?:permissions):\s*(.*?)\s*$/iu);
+    if (match === null) {
+      continue;
+    }
+    const permissionsIndent = match[1].length;
+    const scalar = unquoteYamlScalar(match[2]);
+    if (scalar !== "") {
+      if (scalar === "read-all" || scalar === "{}") {
+        continue;
+      }
+      if (
+        scalar === "write-all" ||
+        (/^\{.*\}$/u.test(scalar) && /(?:^|[,{]\s*)statuses\s*:\s*write(?:\s*[,}]|$)/iu.test(scalar))
+      ) {
+        return true;
+      }
+      throw new Error(
+        `Workflow has an opaque permissions scalar that cannot prove statuses are read-only: ${scalar}`,
+      );
+    }
+
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const childLine = stripYamlComment(lines[cursor]);
+      if (childLine.trim() === "") {
+        continue;
+      }
+      const childIndent = childLine.match(/^ */u)[0].length;
+      if (childIndent <= permissionsIndent) {
+        break;
+      }
+      const statusMatch = childLine.match(/^\s*statuses\s*:\s*(.*?)\s*$/iu);
+      if (statusMatch === null) {
+        if (/(?:^|\s|["'])statuses(?:\s|["']|:)/iu.test(childLine)) {
+          throw new Error(
+            "Workflow uses an opaque statuses permission key that cannot prove read-only status access.",
+          );
+        }
+        continue;
+      }
+      const statusPermission = unquoteYamlScalar(statusMatch[1]);
+      if (statusPermission === "write") {
+        return true;
+      }
+      if (statusPermission !== "read" && statusPermission !== "none") {
+        throw new Error(
+          `Workflow has an opaque statuses permission: ${statusPermission || "<mapping>"}`,
+        );
+      }
+    }
+  }
+  return false;
+}
+
+export function decodeGitHubFileContent(value) {
+  if (
+    value?.type !== "file" ||
+    value.encoding !== "base64" ||
+    typeof value.content !== "string"
+  ) {
+    throw new Error("GitHub Contents API did not return a base64-encoded file.");
+  }
+  return decodeCanonicalBase64Text(value.content, "GitHub Contents API");
+}
+
+export function decodeGitHubBlobContent(value) {
+  if (value?.encoding !== "base64" || typeof value.content !== "string") {
+    throw new Error("GitHub Git Blobs API did not return base64-encoded content.");
+  }
+  return decodeCanonicalBase64Text(value.content, "GitHub Git Blobs API");
+}
+
+export function validateCanonicalV2WorkflowInventory(
+  workflowFiles,
+  canonicalWorkflow,
+  canonicalPath = DEFAULT_WORKFLOW_PATH,
+) {
+  if (!Array.isArray(workflowFiles)) {
+    throw new Error("Default-branch workflow inventory must be an array.");
+  }
+  const canonicalMatches = workflowFiles.filter((file) => file?.path === canonicalPath);
+  if (canonicalMatches.length !== 1) {
+    throw new Error(
+      `${canonicalPath} must occur exactly once in the complete default-branch workflow inventory.`,
+    );
+  }
+  if (!installedWorkflowMatchesCanonical(canonicalMatches[0].content, canonicalWorkflow)) {
+    throw new Error(`${canonicalPath} differs from the canonical v2 workflow bytes.`);
+  }
+
+  const callerPaths = workflowFiles
+    .filter(
+      (file) =>
+        file?.path !== canonicalPath && workflowContainsCodexReviewGateCaller(file?.content),
+    )
+    .map((file) => file.path)
+    .sort();
+  if (callerPaths.length > 0) {
+    throw new Error(
+      `Additional v1/v2 gate callers remain on the default branch: ${callerPaths.join(", ")}`,
+    );
+  }
+
+  const statusWriterPaths = workflowFiles
+    .filter((file) => file?.path !== canonicalPath && workflowCanWriteStatuses(file?.content))
+    .map((file) => file.path)
+    .sort();
+  if (statusWriterPaths.length > 0) {
+    throw new Error(
+      `Additional workflows can write commit statuses: ${statusWriterPaths.join(", ")}`,
+    );
+  }
+  return canonicalWorkflow;
+}
+
+function extractCanonicalJobIfExpression(value) {
+  const match = value.match(
+    /^    if:\s*>-\s*\r?\n([\s\S]*?)^    runs-on:/mu,
+  );
+  if (match === null) {
+    throw new Error("Canonical v2 workflow must contain one folded codex-review-gate job.if.");
+  }
+  return normalizeWorkflowExpression(match[1]);
+}
+
+function normalizeWorkflowExpression(value) {
+  return value.replace(/\s+/gu, " ").trim();
+}
+
+function stripYamlComment(line) {
+  let singleQuoted = false;
+  let doubleQuoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === "'" && !doubleQuoted) {
+      singleQuoted = !singleQuoted;
+    } else if (char === '"' && !singleQuoted && line[index - 1] !== "\\") {
+      doubleQuoted = !doubleQuoted;
+    } else if (
+      char === "#" &&
+      !singleQuoted &&
+      !doubleQuoted &&
+      (index === 0 || /[ \t]/u.test(line[index - 1]))
+    ) {
+      return line.slice(0, index).trimEnd();
+    }
+  }
+  return line;
+}
+
+function stripYamlQuotedSegments(line) {
+  let result = "";
+  let quote = null;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (quote === null) {
+      if (char === "'" || char === '"') {
+        quote = char;
+        result += " ";
+      } else {
+        result += char;
+      }
+      continue;
+    }
+    result += " ";
+    if (quote === '"' && char === "\\") {
+      if (index + 1 < line.length) {
+        index += 1;
+        result += " ";
+      }
+      continue;
+    }
+    if (quote === "'" && char === "'" && line[index + 1] === "'") {
+      index += 1;
+      result += " ";
+      continue;
+    }
+    if (char === quote) {
+      quote = null;
+    }
+  }
+  return result;
+}
+
+function unquoteYamlScalar(value) {
+  const trimmed = value.trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim().toLowerCase();
+  }
+  return trimmed.toLowerCase();
+}
+
+function decodeCanonicalBase64Text(content, sourceLabel) {
+  const encoded = content.replace(/\s/g, "");
+  if (
+    encoded === "" ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      encoded,
+    )
+  ) {
+    throw new Error(`${sourceLabel} returned malformed base64 text content.`);
+  }
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.toString("base64") !== encoded) {
+    throw new Error(`${sourceLabel} returned non-canonical base64 text content.`);
+  }
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(bytes)) {
+    throw new Error(`${sourceLabel} returned content that is not valid UTF-8.`);
+  }
+  return text;
 }
 
 export function workflowContentEndpoint(repoSlug, workflowPath, ref) {
@@ -243,14 +1041,54 @@ function buildRequiredStatusChecksRule({
   strict,
   doNotEnforceOnCreate,
 }) {
+  const parameters = {
+    strict_required_status_checks_policy: strict,
+    required_status_checks: [buildRequiredStatusCheck({ context, integrationId })],
+  };
+  if (doNotEnforceOnCreate !== undefined) {
+    parameters.do_not_enforce_on_create = doNotEnforceOnCreate;
+  }
   return {
     type: "required_status_checks",
-    parameters: {
-      strict_required_status_checks_policy: strict,
-      do_not_enforce_on_create: doNotEnforceOnCreate,
-      required_status_checks: [buildRequiredStatusCheck({ context, integrationId })],
-    },
+    parameters,
   };
+}
+
+function buildPullRequestRule() {
+  return {
+    type: "pull_request",
+    parameters: defaultPullRequestParameters(),
+  };
+}
+
+function defaultPullRequestParameters() {
+  return {
+    dismiss_stale_reviews_on_push: true,
+    require_code_owner_review: true,
+    require_last_push_approval: false,
+    required_approving_review_count: 0,
+    required_review_thread_resolution: true,
+  };
+}
+
+function selectCodeownersNewline(value) {
+  const withoutCrLf = value.replace(/\r\n/gu, "");
+  if (withoutCrLf.includes("\r")) {
+    throw new Error(
+      "Existing .github/CODEOWNERS uses unsupported bare carriage returns.",
+    );
+  }
+  return value.includes("\r\n") ? "\r\n" : "\n";
+}
+
+function findExactLineIndexes(lines, expected) {
+  const indexes = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index] === expected) {
+      indexes.push(index);
+    }
+  }
+  return indexes;
 }
 
 function buildRequiredStatusCheck({ context, integrationId }) {
@@ -294,6 +1132,20 @@ function structuredCloneSafe(value) {
     return undefined;
   }
   return JSON.parse(JSON.stringify(value));
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function addDefaultBranchToConditions(conditions, defaultBranch) {

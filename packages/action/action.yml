@@ -1,68 +1,48 @@
-name: Codex Review Gate v2 Plan Adapter
-description: >-
-  Read a complete Codex review snapshot and produce closed v2 effect plans.
-  This low-level Action never posts comments or commit statuses and does not
-  complete the gate by itself; ordinary consumers must call the trusted
-  reusable workflow.
+name: Codex Review Gate
+description: Reconcile trusted OpenAI Codex review evidence for one pull request.
 author: JoeyTeng
 branding:
   icon: shield
   color: blue
 
 inputs:
-  github-token:
-    description: Token used only for complete read transport by this plan-only adapter.
+  github_token:
+    description: Token used to read pull-request evidence, update diagnostics, and write the gate status.
     required: true
-  pull-request:
-    description: Canonical positive pull request number.
+  pr_number:
+    description: Canonical positive pull request number to reconcile.
     required: true
+  expected_head_sha:
+    description: Exact full pull-request head SHA required by workflow_dispatch; provider events bind their initial current head.
+    required: false
+    default: ""
   operation:
-    description: "Closed operation: prepare-request, bind-request, or evaluate-only."
-    required: true
-  status-target-mode:
-    description: "Closed mode: head or test-merge-with-head-sentinel."
-    required: true
-  operation-input-path:
-    description: >-
-      Absolute path under runner.temp to controller-generated canonical JSON.
-      Checkout and pull-request-controlled files are rejected.
-    required: true
+    description: "Closed operation: reconcile or begin-review."
+    required: false
+    default: reconcile
+  request_comment_id:
+    description: Optional untrusted issue-comment selector hint; it never supplies authority or skips full reconciliation.
+    required: false
+    default: ""
+  request_review:
+    description: Whether begin-review should post a best-effort OpenAI Codex review request.
+    required: false
+    default: "true"
+  limits_profile:
+    description: "Closed reviewed evidence-limits profile: default or expanded."
+    required: false
+    default: default
 
 outputs:
-  decision:
-    description: Closed v2 reducer decision.
-    value: ${{ steps.plan.outputs.decision }}
-  result-path:
-    description: Runner-temp path to the complete plan-only result.
-    value: ${{ steps.plan.outputs.result-path }}
-  report-path:
-    description: Runner-temp path to the canonical rich public v2 report.
-    value: ${{ steps.plan.outputs.report-path }}
-  status-plan-path:
-    description: Runner-temp path to the scheduler-authorized status plan.
-    value: ${{ steps.plan.outputs.status-plan-path }}
-  reservation-path:
-    description: Runner-temp path to a consumed request reservation, or empty.
-    value: ${{ steps.plan.outputs.reservation-path }}
-  intent-path:
-    description: Runner-temp path to the retry-zero POST intent, or empty.
-    value: ${{ steps.plan.outputs.intent-path }}
-  binding-receipt-path:
-    description: Runner-temp path to the exact-201 binding receipt, or empty.
-    value: ${{ steps.plan.outputs.binding-receipt-path }}
+  execution_health:
+    description: "Runtime health: healthy or unhealthy."
+  gate_outcome:
+    description: "Gate result: success, failure, pending, not_applicable, or unknown."
+  recovery_code:
+    description: Stable machine-readable next-action code.
+  retry_safe:
+    description: Whether an immediate identical-input retry is a valid recovery action.
 
 runs:
-  using: composite
-  steps:
-    - name: Build closed v2 plans
-      id: plan
-      shell: bash
-      env:
-        V2_GITHUB_TOKEN: ${{ inputs.github-token }}
-        V2_PULL_REQUEST: ${{ inputs.pull-request }}
-        V2_OPERATION: ${{ inputs.operation }}
-        V2_STATUS_TARGET_MODE: ${{ inputs.status-target-mode }}
-        V2_OPERATION_INPUT_PATH: ${{ inputs.operation-input-path }}
-        V2_REST_BASE_URL: ${{ github.api_url }}
-        V2_GRAPHQL_URL: ${{ github.graphql_url }}
-      run: node "$GITHUB_ACTION_PATH/src/v2/action.mjs"
+  using: node20
+  main: src/v2/gate-runtime.mjs

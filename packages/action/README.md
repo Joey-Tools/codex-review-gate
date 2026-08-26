@@ -2,255 +2,284 @@
 
 Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
-Codex Review Gate v2 is a trusted reusable GitHub workflow that reduces a
-complete Codex provider-evidence snapshot, controls review-request and status
-effects, and publishes the `codex/github-review-gate` commit status.
+Codex Review Gate reduces trusted OpenAI Codex review evidence for one pull
+request to the required `codex/github-review-gate` commit status. Every run
+rebuilds its decision from GitHub. A database, workflow artifact, sticky
+comment or earlier run is never decision authority.
 
-The public v2 release repository is
-[`Joey-Tools/codex-review-gate-action`](https://github.com/Joey-Tools/codex-review-gate-action).
-The personal [`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action)
-repository is a frozen v1 archive and is not a v2 source.
+The public Action is released from
+[`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action).
+Canonical source, tests and release automation live in
+[`Joey-Tools/codex-review-gate`](https://github.com/Joey-Tools/codex-review-gate).
 
-> [!CAUTION]
-> Production activation is not yet supported. The production controller-input
-> assembler, durable scheduled dispatcher, and automatic effect chain are
-> implemented and locally gated, but publication admission and live activation
-> proof remain P0 prerequisites. Until the environment-wait preflight, required
-> live canary, exact-SHA consumer rollout, and ruleset switch are complete, do
-> not make `codex/github-review-gate` a required check. Missing or unverified
-> activation evidence fails closed.
+## Install the complete consumer contract
 
-The shipped profile is deliberately pre-activation: both production-effects
-authorities remain false, and the protected ledger admits no public-wait
-completion because this release has no trusted completion producer. An
-observation-boundary string, wake-up hint, `due_at`, or later GitHub server time
-is advisory only and cannot authorise a request or terminal effect. Production
-activation therefore requires a separately reviewed immutable wait
-producer/consumer DAG (or an Environment-bound controller OIDC authority), a
-durable phase-specific completion receipt, and a stable persisted origin for
-each post-request wait. This release supplies none of those positive
-authorities.
-
-## Supported public boundary
-
-Ordinary consumers call the trusted reusable workflow:
+Consumers use the floating major:
 
 ```yaml
-jobs:
-  codex-review-gate:
-    uses: Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2
-    with:
-      pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
-      selection-policy: joey-default
-      controller-mode: ordinary
-      observation-boundary: initial
+- uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
-`@v2` is the documented floating release alias. The release pipeline resolves
-and publishes an immutable signed v2 commit, while the called workflow checks
-out the exact selected workflow object through `job.workflow_repository` and
-`job.workflow_sha`. Consumers delegate compatible v2 upgrades to that release
-alias; they do not copy runtime files or select the composite Action directly.
+That step alone is not an installation. Copy the complete
+[canonical workflow](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/.github/workflows/codex-review-gate.yml)
+and import the supplied
+[disabled ruleset template](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json).
+The copied workflow owns triggers, typed dispatch inputs, permissions,
+concurrency, runner-free event filtering and the stable status context. A
+reusable workflow is not the v2 consumer ABI.
 
-The example is an interface specimen, not an activation recipe. A complete
-production caller is the reviewed reconciliation graph, activated only after
-publication by replacing every reusable call with the same admitted immutable
-release SHA and satisfying [Repository activation](#repository-activation).
-The release package's `.github/workflows/codex-review-gate-reconcile.yml` is a
-template/contract fixture for that orchestration. It is not a central router
-and must not be copied as proof that production activation is safe.
+The ruleset must require all four server-side conditions:
 
-### Permissions
+- `codex/github-review-gate`, with expected source GitHub Actions;
+- the branch is up to date;
+- all review conversations are resolved; and
+- non-fast-forward updates to the default branch are blocked.
 
-The caller supplies this permission ceiling:
+Keep the imported ruleset disabled until a harmless canary has proved the
+actual status source and complete wiring. The
+[human-readable guide](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/human.md)
+explains the installation to a person. The
+[agent-executable guide](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/agent.md)
+lets an agent perform that same installation for a person.
 
-```yaml
-permissions:
-  contents: write
-  id-token: write
-  issues: write
-  pull-requests: write
-  statuses: write
-```
+## Trigger contract
 
-A called workflow cannot elevate the caller token. `id-token: write` and
-`contents: write` are confined to the API-only controller jobs so each protected
-Git-ledger record can carry exact workflow provenance and advance the dedicated
-ledger ref. The trusted controller owns all mutation ordering and never checks
-out or executes pull-request code.
+The canonical workflow has only these entries:
 
-## The composite Action is plan-only
+- `pull_request_target` with activity type `edited`, admitted only for an
+  actual base-ref retarget back to the repository default branch;
+- `issue_comment` with activity types `created` and `edited`; and
+- `workflow_dispatch` for one explicitly selected pull request.
 
-`action.yml` is a low-level adapter for trusted controller implementations. It
-can read one complete snapshot and produce closed v2 plans, but it deliberately
-does not post comments, write commit statuses, persist effect ledgers, perform
-public waits, or complete the gate.
+There is no cron, `repository_dispatch`, broad `pull_request` reset job or
+writable automatic `pull_request_review` job. Review objects and reaction-only
+completion are discovered by a later reconcile.
 
-Do not use this as a consumer gate:
+An automatic comment job is admitted before runner allocation only when both
+the event sender and comment author are the exact Codex provider:
+`chatgpt-codex-connector[bot]`, GitHub type `Bot`. The Action repeats identity
+and scope checks after the runner starts. An edited Codex comment may invalidate
+an earlier decision, which is why both `created` and `edited` are admitted.
+The base-retarget job is likewise filtered before runner allocation: title,
+body and other edits do not start a runner. A qualifying retarget immediately
+replaces any persistent success on the unchanged head with pending.
 
-```yaml
-- uses: Joey-Tools/codex-review-gate-action@v2
-```
+Manual runs use the protected default-branch workflow. A feature-ref dispatch
+is unsupported. The typed `workflow_dispatch` business inputs are:
 
-Even an exact-SHA composite invocation remains plan-only. Treat its outputs as
-untrusted-to-execute plans until a trusted controller validates, persists, and
-performs them in the required order. A successful composite step is never a
-successful review gate and must not be registered as a required status check.
-
-The adapter inputs are intentionally controller-oriented:
-
-| Input | Description |
-| --- | --- |
-| `github-token` | Token used only for complete read transport. |
-| `pull-request` | Canonical positive pull-request number. |
-| `operation` | `prepare-request`, `bind-request`, or `evaluate-only`. |
-| `status-target-mode` | Required, with no default: `head` or `test-merge-with-head-sentinel`. `head` can publish only a non-success sentinel; clean/skipped terminal publication is suppressed. |
-| `operation-input-path` | Controller-generated canonical JSON under `RUNNER_TEMP`; checkout and PR-controlled paths are rejected. |
-
-Its outputs are runner-temp paths to the canonical rich public v2 report and
-effect plans. The compact reducer result remains controller-internal:
-`decision`, `result-path`, `report-path`, `status-plan-path`,
-`reservation-path`, `intent-path`, and `binding-receipt-path`. They are not
-receipts proving that any remote effect occurred.
-
-## Reusable workflow inputs and outputs
-
-The public `workflow_call` boundary accepts:
-
-| Input | Default | Description |
+| Input | Type | Contract |
 | --- | --- | --- |
-| `pull-request` | empty | Pull-request number; empty is reserved for a controller-owned scan. |
-| `selection-policy` | none | Required closed repository selection policy. |
-| `controller-mode` | `ordinary` | Closed route selected by the trusted workflow family. Consumers must not invent modes. |
-| `observation-boundary` | `initial` | Closed scheduler observation boundary; it is never provider evidence. |
+| `operation` | choice | `reconcile` or `begin-review`; defaults to `reconcile`. |
+| `pr_number` | number | Required canonical positive PR number. Exactly one PR is processed. |
+| `expected_head_sha` | string | Required full expected PR-head SHA. A stale run never follows a different head. |
+| `request_comment_id` | string | Optional evidence-location hint; never authority. |
+| `request_review` | boolean | Defaults to `true`; controls request posting for `begin-review`. |
+| `limits_profile` | choice | `default` or `expanded`; defaults to `default`. |
 
-It reports controller-owned outputs such as `decision`, `report-path`,
-`status-plan-path`, request reservation/binding paths, sticky and effect-ledger
-receipt paths, `due-at`, and `wakeup-hints`. Paths refer to the called job's
-`RUNNER_TEMP`; they are controller evidence, not a cross-job artifact API.
-Only the controller's exact remote-effect receipts and final status establish
-that an effect was performed.
+Every dispatch value is untrusted and revalidated against GitHub. Inputs
+cannot provide a verdict, provider identity, status context, stale override,
+numeric resource limit or permission to skip a full reconcile. A hint may
+allow an early stop only after the runtime proves that no newer relevant
+evidence was skipped. GitHub exposes the typed numeric `pr_number` as a string
+at the Action boundary; the Action still requires its canonical positive
+decimal representation.
 
-## Scheduled scan and dispatch
+The Action step uses the corresponding underscore-named inputs:
+`github_token`, `pr_number`, `expected_head_sha`, `operation`,
+`request_comment_id`, `request_review` and `limits_profile`. `github_token` and
+`pr_number` are required. A manual run must supply the full
+`expected_head_sha`; the automatic comment path may leave it empty so the
+runtime can bind the authoritative head at startup. Neither path may follow a
+later head change.
 
-The reconciliation schedule selects `scan-all-open` only for the trusted
-coordinator. That coordinator builds or resumes the protected candidate
-inventory, persists one active dispatch reservation before projection, and
-publishes only a canonical GitHub matrix. It never uses the diagnostic
-all-open-PR listing as dispatch authority.
+## Operations
 
-The fan-out is deliberately serial (`max-parallel: 1`, `fail-fast: false`).
-Each enabled row carries the controller-produced pull-request number and the
-original canonical `dispatch_binding`; a row cannot rebuild, replace, or select
-its own candidate. The scheduled leg rehydrates that binding from the durable
-ledger before lease acquisition, performs the ordinary closed controller
-protocol, releases the lease without a refund, and durably acknowledges the
-candidate. A crash exposes either the same active row or a closed recovery
-state; it never silently redispatches an attempted candidate. An empty cycle
-uses one disabled sentinel row so no pull-request command is prepared.
+### `begin-review`
 
-## What v2 decides
+`begin-review` validates the exact PR and expected head, establishes pending
+on that head, and by default posts a fresh exact `@codex review` request with
+the canonical hidden binding. `request_review=false` only establishes pending;
+it is an advanced best-effort option and does not add a dedicated cross-job
+barrier.
 
-The reducer's closed decisions are:
+Runs for the same PR are serialised with `cancel-in-progress: false`. GitHub can
+still replace a not-yet-started pending workflow run, so observe the exact
+`begin-review` run complete before treating it as a barrier or posting a
+dependent request.
 
-- `not-selected`
-- `pending`
-- `clean`
-- `findings`
-- `inconclusive`
-- `skipped-unavailable`
-- `blocked-configuration`
-- `blocked-input`
+For the usual low-cost path, an agent may post exact `@codex review` directly
+while other checks run and invoke GHA only when reconciliation is needed. Use
+`begin-review` when the workflow must coordinate the pending transition and
+request, including a deliberate same-head re-review after an earlier success.
 
-Positive completion requires a complete and stable snapshot, a current review
-epoch, compatible server enforcement, and provider evidence admitted by the
-closed v2 authority. Trustworthy findings remain negative evidence even when
-another inventory is incomplete. Missing configuration, unstable scope,
-incomplete pagination, malformed evidence, or unproved activation never turns
-into clean.
+### `reconcile`
 
-The controller targets the test-merge commit and uses a head sentinel where
-required. Commit statuses are effects planned by the reducer/scheduler and
-performed only by the trusted controller after durable reservation. The
-Joey-Tools reusable workflow always supplies
-`test-merge-with-head-sentinel`; consumers cannot select this production
-value through variables. The public plan adapter retains `head` only for the
-closed non-success/suppressed compatibility contract described above. The
-request path is retry-zero: intent and attempt state are persisted before the
-single POST, and an ambiguous attempt is not replayed.
+`reconcile` first re-reads the selected PR. Only while its head equals the
+bound expected head does it replace that exact SHA's gate status with pending
+and collect evidence. It never retargets the run or writes the decision to a
+new head. A later run must handle a changed head.
 
-## Repository activation
+The reducer reads qualifying Codex top-level issue comments and pull-request
+review bodies. Inline review threads are deliberately outside the reducer;
+the ruleset's “all conversations resolved” requirement is their authority.
 
-Activation remains blocked until all of the following are independently
-reviewed and proven:
+## Evidence semantics
 
-1. The reviewed release contains the closed command assembler, durable
-   scheduled dispatcher, and automatic effect protocol for every supported
-   event and scan route, and the admitted release tree matches those bytes.
-2. The repository has the three named public-wait environments required by the
-   v2 workflow family, each with an exact 15-minute wait-timer rule:
-   `codex-review-gate-public-initial-15m`,
-   `codex-review-gate-public-post-request-15m`, and
-   `codex-review-gate-public-no-start-15m`.
-3. A trusted Environment API preflight proves those rules, and a live canary
-   proves that early release cannot authorize a request or terminal effect.
-4. The generated caller uses the organisation `@v2` reusable workflow, the
-   documented permission ceiling, and controller-owned concurrency.
-5. The repository ruleset requires the exact
-   `codex/github-review-gate` context only after successful canary evidence.
+A review generation begins with an exact, unedited `@codex review` request.
+The visible first line is exact and contains no additional visible text. An
+ordinary request author needs `write`, `maintain` or `admin` permission by
+default; protected default-branch configuration may deliberately relax this
+to `any`. A workflow-authored request additionally carries the canonical v2
+hidden marker binding the full head SHA, current base repository/ref/SHA and
+workflow run. Qualifying Codex findings block regardless of request-author
+permission.
 
-An environment name alone does not configure or prove a wait timer. A copied
-fixture, a green composite step, or an observed status with a generic
-`github-actions[bot]` creator is not activation proof.
+Every snapshot also reads the latest GitHub PR timeline
+`BaseRefChangedEvent` or `BaseRefForcePushedEvent`. Positive request and clean
+authority must be strictly newer than that base epoch; equal timestamps are
+ambiguous and stay pending. A provider terminal payload does not identify the
+request or base snapshot that produced it, so a PR with an observed base epoch
+uses a deliberately narrower recovery rule: only a qualifying provider `+1`
+attached directly to a strictly post-epoch, base-bound canonical workflow
+request can supply positive clean authority or supersede an older finding.
+Ordinary direct `@codex review` requests remain supported without a workflow
+marker on PRs that have no base epoch. Findings remain conservative across the
+epoch boundary, and an unlineaged terminal clean stays pending rather than
+being guessed into the new generation.
 
-The current reconciliation fixture cannot close this boundary: its outer wait
-jobs are caller-owned, while the reusable controller has no authenticated
-evidence that those jobs ran. Before activation, the wait producer and the
-effect consumer must be controlled by the same immutable reviewed topology (or
-the controller itself must verify an Environment-bound OIDC identity). The
-activation change must also restore whole-controller positive coverage for the
-automatic HTTP actor, aggregate retry/exhaustion loops, release diagnostics,
-schedule row-state classification, and near-capacity schedule dispatch; these
-paths are intentionally unreachable under the pre-activation guard.
+Terminal clean text and a qualifying provider `+1` otherwise have equal clean
+authority; the base-epoch lineage rule above is the deliberate exception.
+When terminal evidence names a reviewed commit, it may use a full or short SHA.
+A short SHA is accepted only when GitHub resolves it unambiguously to the
+current PR head. For a pull-request review, the resolved SHA must also agree
+with the review's native `commit_id`.
 
-## v1 archive boundary
+Any qualifying current-head non-inline finding blocks immediately. On the
+same head, an older finding can be superseded only by:
 
-The release subtree intentionally retains v1 implementation files,
-`decision-table.json`, and `producer-receipt.schema.json` so the transferred
-history and frozen v1 contract remain inspectable. They are legacy,
-major-isolated artefacts:
+1. a strictly newer authorised review generation; and
+2. a later clean result bound to that generation and head.
 
-- `decision-table.json` remains the authoritative v1 policy table only.
-- `src/core.mjs`, `src/gate.mjs`, and producer receipt v1 are not v2 runtime
-  entry points.
-- v2 has no selector, compatibility fallback, or downgrade path to v1.
-- the v2 target repository must contain no `v1*` branch or tag selector.
-- a v2 configuration or evidence failure stays blocked/inconclusive; it never
-  invokes the legacy reducer.
+An arbitrary later clean does not erase findings. Ambiguous order or binding
+cannot pass. Historical findings remain visible in diagnostics.
 
-Existing personal-repository v1 consumers remain on their frozen archive.
-Migration means installing the organisation v2 reusable workflow after its
-activation gate closes; changing a personal `@v1` reference to an organisation
-composite reference is not a valid migration.
+## Stable clean and limits
 
-## Package map
+A finding can decide failure from the first complete observation. Only a clean
+candidate must survive two independent, fully paginated GitHub snapshots five
+seconds apart. Each snapshot covers the fixed PR lifecycle, base and head; the
+latest filtered base-change/force-push timeline epoch;
+request IDs, revisions, authors and reactions; qualifying Codex comments and
+reviews with their identities, times, actor/App identity and body digests;
+reviewed-SHA resolution and native review `commit_id`; and pagination and
+exact-refetch completeness.
 
-- `.github/workflows/codex-review-gate.yml`: trusted public v2 controller entry.
-- `.github/workflows/codex-review-gate-reconcile.yml`: orchestration template
-  and contract fixture, not a central router.
-- `action.yml`: plan-only composite adapter.
-- `src/v2/workflow-controller.mjs`: trusted effect-ordering controller runtime.
-- `src/v2/action.mjs`: composite plan adapter.
-- `src/v2/transport.mjs`, `projector.mjs`, `reducer.mjs`, `scheduler.mjs`, and
-  related modules: closed v2 evidence and planning pipeline.
-- `src/core.mjs`, `src/gate.mjs`, `decision-table.json`, and
-  `producer-receipt.schema.json`: retained legacy v1 archive.
-- [DESIGN.md](DESIGN.md): trust, state, and effect-ordering design.
-- [COOKBOOK.md](COOKBOOK.md): pre-activation validation and recovery recipes.
+The head and decision-relevant fingerprint must match across both reads. A
+same-head request, edit, reaction or other relevant evidence change restarts
+the stability window. A head/lifecycle mismatch makes the run stale. API,
+pagination and cap failures are incomplete observations, never evidence of
+stability. If no stable clean pair is available within the reconcile budget,
+the gate stays pending for a later provider event or manual reconcile.
 
-## Feedback and development
+The reviewed profiles are fixed:
+
+| Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `default` | 20 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
+| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
+
+Page size is 100, one response is capped at 8 MiB, the inter-read delay is five
+seconds and the job timeout is 14 minutes. A repository may persistently select
+`expanded`. Temporary per-dispatch numeric overrides are not part of v2.0.
+
+## Public result ABI
+
+The Action exposes exactly four public outputs:
+
+| Output | Values | Meaning |
+| --- | --- | --- |
+| `execution_health` | `healthy`, `unhealthy` | Whether the evaluator completed trustworthily. |
+| `gate_outcome` | `success`, `failure`, `pending`, `not_applicable`, `unknown` | The review-gate decision. |
+| `recovery_code` | closed set below | The safe next-action category. |
+| `retry_safe` | boolean | Whether an immediate retry with identical inputs is a valid recovery action. |
+
+The closed `recovery_code` set is:
+
+```text
+none
+wait_provider
+reconcile
+fix_findings
+request_clean_generation
+retry_reconcile
+wait_then_reconcile
+use_expanded_limits
+raise_protected_limit
+refresh_head
+repair_permissions
+retry_begin
+unsupported_target
+```
+
+Workflow conclusion reports execution health; the status on the expected PR
+head reports gate outcome. Findings normally produce `healthy/failure`, not an
+execution error. `unhealthy/success` is invalid. `status_projection` and the
+finding counts are summary-only, not public Action outputs.
+
+When they can be derived without another evidence query, the sticky diagnostic
+and Actions summary report:
+
+- `findings_unresolved`;
+- `findings_resolved`;
+- `findings_historical`;
+- `findings_indeterminate`.
+
+Incomplete API reads, pagination or cap hits make affected counts `unknown`,
+never `0`. These counts cover only normalised non-inline reducer findings and
+do not replace conversation-resolution enforcement.
+
+See [DESIGN.md](DESIGN.md) for the authority and consistency model and
+[COOKBOOK.md](COOKBOOK.md) for recovery procedures.
+
+## Exact-head merge closure
+
+A success is an observation, not a permanent lease. Immediately before merge,
+an agent must dispatch `reconcile` with the exact current head and require all
+of the following at one final read:
+
+- Action result `healthy/success`;
+- `codex/github-review-gate` success from GitHub Actions on that same head;
+- the PR head remains unchanged;
+- the branch is up to date;
+- all review conversations are resolved; and
+- the ruleset allows the merge.
+
+If any item changes, stop and reconcile the new current state.
+
+## Supported boundary
+
+Stable v2.0 supports GitHub.com public and private repositories; ordinary
+same-repository branches with an open, non-draft PR targeting the default
+branch; GitHub-hosted Linux runners (`ubuntu-slim`, with `ubuntu-latest` as the
+adopted fallback); and ordinary merge, squash and rebase methods.
+
+It fails closed for GHES, forks, merge queues, non-default bases, drafts,
+bot-owned PRs, self-hosted/Windows/macOS runners, and new operations on closed
+or merged PRs.
+
+The runtime is API-only. It does not check out or execute consumer/PR code,
+upload artifacts, retain raw API payloads, or introduce a runtime GitHub App.
+Diagnostics are best effort and never authority.
+
+## v1 boundary
+
+Existing v1 consumers remain valid until deliberately migrated. v2 does not
+rewrite, republish or fall back to v1. A consumer may remove v1 and install v2
+in one PR, then validate the installed `@v2` gate in a separate harmless PR
+that is closed without merging.
+
+## Feedback
 
 Report public package issues at
-[`Joey-Tools/codex-review-gate-action`](https://github.com/Joey-Tools/codex-review-gate-action/issues).
-Canonical development and release automation live in
-[`Joey-Tools/codex-review-gate`](https://github.com/Joey-Tools/codex-review-gate).
+[`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action/issues).

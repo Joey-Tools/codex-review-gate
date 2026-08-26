@@ -2,230 +2,264 @@
 
 语言：[British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
-Codex Review Gate v2 是一个 trusted reusable GitHub workflow（受信任的可复用工作流）：
-它归并完整的 Codex provider evidence snapshot，控制 review request 和 status effect，
-并发布 `codex/github-review-gate` commit status。
+Codex Review Gate 把单个 PR 上可信的 OpenAI Codex review 证据归约为 required
+commit status `codex/github-review-gate`。每次运行都从 GitHub 重建决策；数据库、
+workflow artifact、sticky comment 或旧运行都不是决策 authority。
 
-公开 v2 release repository 是
-[`Joey-Tools/codex-review-gate-action`](https://github.com/Joey-Tools/codex-review-gate-action)。
-个人仓库 [`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action)
-是冻结的 v1 archive，不是 v2 来源。
-
-> [!CAUTION]
-> 目前还不支持 production activation。Production controller-input assembler、
-> durable scheduled dispatcher 与 automatic effect chain 已实现并通过本地门禁，
-> 但 publication admission 和 live activation proof 仍是 P0 前置条件。在
-> environment-wait preflight、必要 live canary、exact-SHA consumer rollout 与
-> ruleset switch 完成前，不得把 `codex/github-review-gate` 加为 required check。
-> 缺失或未经验证的 activation evidence 必须 fail closed。
-
-当前发布采用明确的 pre-activation profile：两个 production-effects authority
-都保持 false，且 protected ledger 不接受任何 public-wait completion，因为本发布
-没有受信任的 completion producer。`observation-boundary` 字符串、wake-up hint、
-`due_at` 或更晚的 GitHub server time 都只是 advisory，不能授权 request 或 terminal
-effect。Production activation 必须另行交付并 review immutable wait producer/consumer
-DAG（或 Environment-bound controller OIDC authority）、durable phase-specific
-completion receipt，以及每个 post-request wait 的稳定持久 origin；当前发布不提供
-这些正向 authority。
-
-## 支持的公开边界
-
-普通 consumer 调用 trusted reusable workflow：
-
-```yaml
-jobs:
-  codex-review-gate:
-    uses: Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2
-    with:
-      pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
-      selection-policy: joey-default
-      controller-mode: ordinary
-      observation-boundary: initial
-```
-
-`@v2` 是公开文档采用的 floating release alias（浮动发布别名）。Release pipeline
-会解析并发布 immutable signed v2 commit；called workflow 则通过
-`job.workflow_repository` 和 `job.workflow_sha` checkout 精确选中的 workflow
-object。Consumer 把兼容的 v2 upgrade 委托给这个 release alias，不复制 runtime
-文件，也不直接选择 composite Action。
-
-上面的示例只是 interface specimen，不是 activation recipe。完整 production caller 是
-已经 review 的 reconciliation graph；publication 后必须把其中每个 reusable call 都替换为
-同一个已 admit 的 immutable release SHA，并满足[仓库激活](#仓库激活)中的前置条件。
-Release package 内的 `.github/workflows/codex-review-gate-reconcile.yml` 只是
-orchestration template/contract fixture，不是 central router；复制它不能证明可以安全
-启用 production。
-
-### 权限
-
-Caller 提供以下 permission ceiling：
-
-```yaml
-permissions:
-  contents: write
-  id-token: write
-  issues: write
-  pull-requests: write
-  statuses: write
-```
-
-Called workflow 无法提升 caller token 权限。`id-token: write` 与
-`contents: write` 仅限 API-only controller jobs，用于给 protected Git ledger 的每条
-record 绑定 exact workflow provenance，并推进专用 ledger ref。Trusted controller
-拥有全部 mutation ordering，且不会 checkout 或执行 pull-request code。
-
-## Composite Action 仅生成计划
-
-`action.yml` 是给 trusted controller implementation 使用的低层 adapter。它可以读取
-一份完整 snapshot 并生成 closed v2 plan，但刻意不会 post comment、写 commit status、
-持久化 effect ledger、执行 public wait 或完成 gate。
-
-不要把下面的写法当作 consumer gate：
-
-```yaml
-- uses: Joey-Tools/codex-review-gate-action@v2
-```
-
-即便 composite invocation 使用 exact SHA，它仍然只生成计划。在 trusted controller
-按规定顺序校验、持久化并执行之前，所有 output 都只是不可直接执行的 plan。Composite
-step 成功绝不等于 review gate 成功，也不得注册为 required status check。
-
-Adapter inputs 刻意面向 controller：
-
-| Input | 说明 |
-| --- | --- |
-| `github-token` | 仅用于完整 read transport 的 token。 |
-| `pull-request` | Canonical positive pull-request number。 |
-| `operation` | `prepare-request`、`bind-request` 或 `evaluate-only`。 |
-| `status-target-mode` | 必填且无默认值：`head` 或 `test-merge-with-head-sentinel`。`head` 只能发布 non-success sentinel；clean/skipped terminal publication 会被 suppressed。 |
-| `operation-input-path` | 位于 `RUNNER_TEMP` 的 controller-generated canonical JSON；拒绝 checkout 和 PR-controlled path。 |
-
-Outputs 是 canonical rich public v2 report 和 effect plan 的 runner-temp path；
-compact reducer result 仅供 controller 内部使用：`decision`、
-`result-path`、`report-path`、`status-plan-path`、`reservation-path`、
-`intent-path`、`binding-receipt-path`。它们不是证明 remote effect 已发生的 receipt。
-
-## Reusable workflow inputs 和 outputs
-
-公开 `workflow_call` 边界接受：
-
-| Input | 默认值 | 说明 |
-| --- | --- | --- |
-| `pull-request` | empty | Pull-request number；只有 controller-owned scan 可以为空。 |
-| `selection-policy` | none | 必填的 closed repository selection policy。 |
-| `controller-mode` | `ordinary` | Trusted workflow family 选择的 closed route；consumer 不得自造 mode。 |
-| `observation-boundary` | `initial` | Closed scheduler observation boundary；它绝不是 provider evidence。 |
-
-Workflow 会报告 controller-owned outputs，例如 `decision`、`report-path`、
-`status-plan-path`、request reservation/binding path、sticky/effect-ledger receipt
-path、`due-at` 和 `wakeup-hints`。这些 path 属于 called job 的 `RUNNER_TEMP`，
-是 controller evidence，不是跨 job artifact API。只有 controller 的精确 remote-effect
-receipt 和 final status 能证明 effect 已执行。
-
-## Scheduled scan 与 dispatch
-
-Reconciliation schedule 只会为 trusted coordinator 选择 `scan-all-open`。Coordinator
-会创建或恢复 protected candidate inventory，在投影前持久化唯一 active dispatch
-reservation，并且只发布 canonical GitHub matrix；它不会把 diagnostic all-open-PR
-listing 当作 dispatch authority。
-
-Fan-out 被刻意串行化（`max-parallel: 1`、`fail-fast: false`）。每个 enabled row 只携带
-controller 生成的 pull-request number 与原始 canonical `dispatch_binding`，不得重建、
-替换或自行选择 candidate。Scheduled leg 在 lease acquisition 前从 durable ledger
-rehydrate 该 binding，然后执行 ordinary closed controller protocol、无退款 release lease，
-并 durable ack candidate。Crash 后只会暴露同一个 active row 或 closed recovery state，
-不会静默重新 dispatch 已尝试的 candidate。Empty cycle 使用一个 disabled sentinel row，
-因此不会 prepare pull-request command。
-
-## v2 如何决策
-
-Reducer 的 closed decisions 是：
-
-- `not-selected`
-- `pending`
-- `clean`
-- `findings`
-- `inconclusive`
-- `skipped-unavailable`
-- `blocked-configuration`
-- `blocked-input`
-
-Positive completion 要求 snapshot 完整且稳定、review epoch 当前、server enforcement
-兼容，并且 provider evidence 通过 closed v2 authority。可信 finding 即便在其他 inventory
-不完整时仍是 negative evidence。缺失配置、不稳定 scope、不完整 pagination、malformed
-evidence 或未证明的 activation 绝不会变成 clean。
-
-Controller 以 test-merge commit 为主要 target，并在需要时使用 head sentinel。Commit
-status 是 reducer/scheduler 生成、由 trusted controller 在 durable reservation 后执行的
-effect。Joey-Tools reusable workflow 始终传入
-`test-merge-with-head-sentinel`，consumer 不能通过 variable 选择 production 值；公开
-plan adapter 保留 `head`，仅用于上述 closed non-success/suppressed compatibility
-contract。Request path 是 retry-zero：单次 POST 前必须持久化 intent 和 attempt state，
-ambiguous attempt 不得 replay。
-
-## 仓库激活
-
-在以下条件全部经过独立 review 和证明前，activation 保持 blocked：
-
-1. 已 review 的 release 包含每个支持 event/scan route 的 closed command assembler、
-   durable scheduled dispatcher 与 automatic effect protocol，且 admitted release tree
-   与这些 byte 精确一致。
-2. 仓库存在 v2 workflow family 要求的三个 public-wait environment，且每个都配置精确
-   15 分钟 wait-timer rule：`codex-review-gate-public-initial-15m`、
-   `codex-review-gate-public-post-request-15m`、
-   `codex-review-gate-public-no-start-15m`。
-3. Trusted Environment API preflight 证明这些 rule，live canary 证明 early release 无法
-   authorize request 或 terminal effect。
-4. Generated caller 使用 organization `@v2` reusable workflow、本文 permission ceiling
-   和 controller-owned concurrency。
-5. 只有 canary evidence 成功后，repository ruleset 才能 require 精确的
-   `codex/github-review-gate` context。
-
-Environment name 本身不会配置或证明 wait timer。Copied fixture、绿色 composite step，
-或 creator 为 generic `github-actions[bot]` 的 status 都不是 activation proof。
-
-当前 reconciliation fixture 不能闭合这个边界：它的外层 wait job 由 caller 控制，
-reusable controller 没有经过认证的证据证明这些 job 确实运行。激活前，wait producer
-和 effect consumer 必须由同一个 immutable、已 review topology 控制；另一种选择是让
-controller 自身验证 Environment-bound OIDC identity。Activation change 还必须恢复
-automatic HTTP actor、aggregate retry/exhaustion loop、release diagnostic 与
-schedule row-state classification、near-capacity schedule dispatch 的
-whole-controller 正向覆盖；这些路径在当前 pre-activation guard 下有意不可达。
-
-## v1 archive 边界
-
-Release subtree 刻意保留 v1 implementation file、`decision-table.json` 和
-`producer-receipt.schema.json`，让 transferred history 和 frozen v1 contract 仍可检查。
-它们是 legacy、major-isolated artefact：
-
-- `decision-table.json` 只继续作为 v1 policy table 的 authority。
-- `src/core.mjs`、`src/gate.mjs` 和 producer receipt v1 不是 v2 runtime entry point。
-- v2 不存在选择 v1 的 selector、compatibility fallback 或 downgrade path。
-- v2 target repository 不得包含任何 `v1*` branch 或 tag selector。
-- v2 configuration/evidence failure 只能保持 blocked/inconclusive，绝不调用 legacy reducer。
-
-个人仓库的现有 v1 consumer 继续留在 frozen archive。迁移是等 activation gate 闭合后安装
-organization v2 reusable workflow；把个人 `@v1` 改成 organization composite reference
-不是有效迁移。
-
-## Package map
-
-- `.github/workflows/codex-review-gate.yml`：trusted public v2 controller entry。
-- `.github/workflows/codex-review-gate-reconcile.yml`：orchestration template 和
-  contract fixture，不是 central router。
-- `action.yml`：plan-only composite adapter。
-- `src/v2/workflow-controller.mjs`：trusted effect-ordering controller runtime。
-- `src/v2/action.mjs`：composite plan adapter。
-- `src/v2/transport.mjs`、`projector.mjs`、`reducer.mjs`、`scheduler.mjs` 及相关模块：
-  closed v2 evidence/planning pipeline。
-- `src/core.mjs`、`src/gate.mjs`、`decision-table.json`、
-  `producer-receipt.schema.json`：保留的 legacy v1 archive。
-- [DESIGN.zh-CN.md](DESIGN.zh-CN.md)：trust、state 和 effect-ordering design。
-- [COOKBOOK.zh-CN.md](COOKBOOK.zh-CN.md)：pre-activation validation 和 recovery recipe。
-
-## 反馈和开发
-
-公开 package 问题请报到
-[`Joey-Tools/codex-review-gate-action`](https://github.com/Joey-Tools/codex-review-gate-action/issues)。
-Canonical development 和 release automation 位于
+公开 Action 从
+[`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action)
+发布；canonical source、测试和发布自动化位于
 [`Joey-Tools/codex-review-gate`](https://github.com/Joey-Tools/codex-review-gate)。
+
+## 安装完整消费者契约
+
+消费者使用 floating major：
+
+```yaml
+- uses: JoeyTeng/codex-review-gate-action@v2
+```
+
+仅有这个 step 不算完成安装。请复制完整
+[canonical workflow](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/.github/workflows/codex-review-gate.yml)，
+并导入附带的
+[disabled ruleset 模板](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json)。
+复制的 workflow 负责 triggers、typed dispatch inputs、permissions、concurrency、
+runner 启动前事件过滤和稳定 status context。reusable workflow 不是 v2 consumer
+ABI。
+
+ruleset 必须同时要求四个服务器端条件：
+
+- `codex/github-review-gate`，expected source 为 GitHub Actions；
+- branch up to date；
+- 所有 review conversations 均已 resolved；
+- 禁止 default branch 的 non-fast-forward updates。
+
+在无害 canary 证明实际 status source 和完整接线前，保持导入的 ruleset disabled。
+[人类可读指南](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/human.zh-CN.md)
+向人解释安装流程；
+[agent 可执行指南](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/agent.zh-CN.md)
+让 agent 代替人执行同一套安装。
+
+## Trigger 契约
+
+canonical workflow 只有以下入口：
+
+- activity type 为 `edited` 的 `pull_request_target`，且只允许实际 retarget 回
+  repository default branch；
+- activity types 为 `created` 和 `edited` 的 `issue_comment`；
+- 为单个明确指定 PR 运行的 `workflow_dispatch`。
+
+没有 cron、`repository_dispatch`、宽泛的 `pull_request` reset job 或可写 status
+的自动 `pull_request_review` job。review objects 和 reaction-only completion 由
+之后的 reconcile 发现。
+
+只有 event sender 和 comment author 都是 exact Codex provider
+`chatgpt-codex-connector[bot]`、GitHub type `Bot` 时，自动 comment job 才会在
+runner 分配前被 admit。Action 在 runner 启动后再次校验 identity 和 scope。
+edited Codex comment 可能使旧决策失效，所以 `created` 与 `edited` 都必须 admit。
+base-retarget job 同样在 runner allocation 前筛选：title、body 或其他 edit 不会启动
+runner。符合条件的 retarget 会立即把 unchanged head 上持久化的旧 success 改为 pending。
+
+manual run 使用受保护 default branch 上的 workflow；feature-ref dispatch 不受
+支持。typed `workflow_dispatch` business inputs 是：
+
+| Input | 类型 | 契约 |
+| --- | --- | --- |
+| `operation` | choice | `reconcile` 或 `begin-review`；默认为 `reconcile`。 |
+| `pr_number` | number | 必填 canonical positive PR number；每次只处理一个 PR。 |
+| `expected_head_sha` | string | 必填完整 expected PR-head SHA；stale run 绝不跟随不同 head。 |
+| `request_comment_id` | string | 可选 evidence-location hint；绝不是 authority。 |
+| `request_review` | boolean | 默认为 `true`；控制 `begin-review` 是否发送 request。 |
+| `limits_profile` | choice | `default` 或 `expanded`；默认为 `default`。 |
+
+所有 dispatch values 都是不可信输入，必须与 GitHub 重新校验。inputs 不能提供
+verdict、provider identity、status context、stale override、数值型 resource
+limit，或跳过 full reconcile 的权限。只有在 runtime 证明没有跳过任何更新的相关
+证据后，hint 才能帮助 early stop。GitHub 在 Action boundary 会把 typed numeric
+`pr_number` 暴露为 string；Action 仍要求其为 canonical positive decimal
+representation。
+
+Action step 使用对应的 underscore 命名 inputs：`github_token`、`pr_number`、
+`expected_head_sha`、`operation`、`request_comment_id`、`request_review` 和
+`limits_profile`。`github_token` 与 `pr_number` 必填。manual run 必须提供完整
+`expected_head_sha`；自动 comment 路径可以留空，让 runtime 在启动时绑定
+authoritative head。两条路径都不能跟随之后发生的 head change。
+
+## Operations
+
+### `begin-review`
+
+`begin-review` 校验 exact PR 和 expected head，在该 head 上建立 pending，并默认
+发送一条带 canonical hidden binding 的 fresh exact `@codex review` request。
+`request_review=false` 只建立 pending；这是 advanced best-effort option，不会增加
+专用 cross-job barrier。
+
+同一 PR 的 runs 使用 `cancel-in-progress: false` 串行化。GitHub 仍可能替换尚未
+启动的 pending workflow run，所以必须观察 exact `begin-review` run 完成，才能把
+它视为 barrier 或发送依赖它的 request。
+
+普通低成本路径中，agent 可以在其他 checks 运行时直接发送 exact
+`@codex review`，只在需要 reconcile 时调用 GHA。workflow 必须协调 pending
+transition 和 request 时使用 `begin-review`；这也包括旧 success 后的 deliberate
+same-head re-review。
+
+### `reconcile`
+
+`reconcile` 首先重读所选 PR。只有其 head 仍等于绑定的 expected head 时，它才会
+把该 exact SHA 的 gate status 改为 pending 并收集证据。它绝不把本次运行重定向到
+new head，也不向 new head 写入本次决策。head 变化必须由之后的新运行处理。
+
+reducer 读取符合条件的 Codex top-level issue comments 和 PR review bodies。
+inline review threads 有意留在 reducer 外；ruleset 的 “all conversations
+resolved” 要求才是其 authority。
+
+## Evidence 语义
+
+review generation 始于一条 exact、未编辑的 `@codex review` request。visible first
+line 必须 exact，且不得有其他 visible text。普通 request author 默认需要
+`write`、`maintain` 或 `admin` 权限；受保护 default-branch configuration 可以明确
+放宽为 `any`。workflow-authored request 还必须带 canonical v2 hidden marker，绑定
+完整 head SHA、当前 base repository/ref/SHA 和 workflow run。符合条件的 Codex
+findings 不受 request-author permission 影响，始终阻塞。
+
+每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
+`BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base
+epoch；timestamp 相同属于歧义，保持 pending。provider terminal payload 不会标明
+产生它的 request 或 base snapshot，因此一旦 PR 出现过 base epoch，就采用更窄的
+recovery rule：只有直接附着在 epoch 后、绑定当前 base 的 canonical workflow request
+上的合格 provider `+1`，才能提供 positive clean authority 或 supersede 旧 finding。
+没有 base epoch 的 PR 仍支持无需 workflow marker 的 ordinary direct
+`@codex review`。findings 在 epoch boundary 两侧始终保守阻塞；无法归因的 terminal
+clean 保持 pending，runtime 不会猜测它属于新 generation。
+
+除此 base-epoch lineage 例外外，terminal clean 文本和符合条件的 provider `+1`
+具有相同 clean authority。
+terminal evidence 指定 reviewed commit 时，可以使用 full 或 short SHA。只有
+GitHub 能把 short SHA 无歧义解析为 current PR head 时才接受；对于 PR review，
+resolved SHA 还必须与 review 原生 `commit_id` 一致。
+
+任何符合条件的 current-head non-inline finding 都会立即阻塞。在同一个 head 上，
+旧 finding 只有同时满足以下条件才能被 supersede：
+
+1. 存在严格更新的 authorised review generation；
+2. 随后出现绑定该 generation 和 head 的 clean result。
+
+任意更晚的 clean 不能抹掉 findings。ordering 或 binding 有歧义时不能 pass。
+historical findings 仍保留在 diagnostics 中。
+
+## 稳定 clean 和 limits
+
+finding 可以由第一次完整 observation 直接判定 failure。只有 clean candidate 必须
+通过两次独立、fully paginated 的 GitHub snapshots，两次间隔 5 秒。每个 snapshot
+都覆盖固定 PR lifecycle、base 和 head，以及最新 filtered base-change/force-push
+timeline epoch；request IDs、revisions、authors 与
+reactions；符合条件的 Codex comments/reviews 的 identities、times、actor/App
+identity 和 body digests；reviewed-SHA resolution 与原生 review `commit_id`；
+以及 pagination 与 exact-refetch completeness。
+
+两次读取之间，head 和 decision-relevant fingerprint 必须相同。同一 head 上新的
+request、edit、reaction 或其他 relevant evidence change 会重启 stability window。
+head/lifecycle mismatch 会使运行 stale。API、pagination 或 cap failure 是
+incomplete observation，绝不是 stability 证据。若 reconcile budget 内无法得到
+stable clean pair，gate 保持 pending，等待之后的 provider event 或 manual
+reconcile。
+
+reviewed profiles 固定如下：
+
+| Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `default` | 20 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
+| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
+
+page size 为 100，每个 response 上限为 8 MiB，inter-read delay 为 5 秒，job timeout
+为 14 分钟。仓库可以持久选择 `expanded`。v2.0 不支持每次 dispatch 临时提供
+任意数值 override。
+
+## Public result ABI
+
+Action 精确暴露四个 public outputs：
+
+| Output | Values | 含义 |
+| --- | --- | --- |
+| `execution_health` | `healthy`、`unhealthy` | evaluator 是否可信地完成执行。 |
+| `gate_outcome` | `success`、`failure`、`pending`、`not_applicable`、`unknown` | review-gate 决策。 |
+| `recovery_code` | 下列 closed set | 安全 next-action 类别。 |
+| `retry_safe` | boolean | 使用相同 inputs 立即 retry 是否是有效恢复操作。 |
+
+`recovery_code` closed set 是：
+
+```text
+none
+wait_provider
+reconcile
+fix_findings
+request_clean_generation
+retry_reconcile
+wait_then_reconcile
+use_expanded_limits
+raise_protected_limit
+refresh_head
+repair_permissions
+retry_begin
+unsupported_target
+```
+
+workflow conclusion 报告 execution health；expected PR head 上的 status 报告 gate
+outcome。finding 通常得到 `healthy/failure`，而不是 execution error。
+`unhealthy/success` 非法。`status_projection` 与 finding counts 只出现在 summary，
+不是 public Action outputs。
+
+无需额外 evidence query 即可推导时，sticky diagnostic 和 Actions summary 会报告：
+
+- `findings_unresolved`；
+- `findings_resolved`；
+- `findings_historical`；
+- `findings_indeterminate`。
+
+API 读取、pagination 不完整或 cap hit 会使受影响 counts 为 `unknown`，绝不能写成
+`0`。这些 counts 只覆盖 normalized non-inline reducer findings，不能替代
+conversation-resolution enforcement。
+
+authority 和 consistency 模型见 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)，恢复操作见
+[COOKBOOK.zh-CN.md](COOKBOOK.zh-CN.md)。
+
+## Exact-head merge closure
+
+success 是一次 observation，不是永久 lease。merge 前，agent 必须立即用 exact
+current head dispatch `reconcile`，并在一次 final read 中同时要求：
+
+- Action result 为 `healthy/success`；
+- 同一 head 上来自 GitHub Actions 的 `codex/github-review-gate` 为 success；
+- PR head 保持不变；
+- branch up to date；
+- 所有 review conversations 均已 resolved；
+- ruleset 允许 merge。
+
+任一项变化都必须停止，并对新的 current state 重新 reconcile。
+
+## 支持边界
+
+stable v2.0 支持 GitHub.com public/private repositories；以 default branch 为 base
+的 open、non-draft PR 及普通 same-repository branches；GitHub-hosted Linux
+runners（优先 `ubuntu-slim`，采用 `ubuntu-latest` fallback）；以及普通 merge、
+squash 和 rebase methods。
+
+GHES、forks、merge queues、non-default bases、drafts、bot-owned PRs、
+self-hosted/Windows/macOS runners，以及对 closed/merged PR 发起的新 operation 都会
+fail closed。
+
+runtime 只调用 API，不 checkout 或执行 consumer/PR code，不上传 artifacts，不保留
+raw API payload，也不引入 runtime GitHub App。diagnostics 只是 best effort，绝不
+是 authority。
+
+## v1 边界
+
+现有 v1 consumers 在明确迁移前保持有效。v2 不 rewrite、republish 或 fallback 到
+v1。消费者可以在一个 PR 中移除 v1 并安装 v2，再用单独的无害 PR 验证已安装的
+`@v2` gate；该 canary PR 验证后直接关闭，不 merge。
+
+## 反馈
+
+公开 package 问题请提交到
+[`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action/issues)。

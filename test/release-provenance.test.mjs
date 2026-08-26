@@ -1,1229 +1,1460 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createHash, generateKeyPairSync, verify as verifyBytes } from "node:crypto";
 import {
   chmodSync,
-  existsSync,
-  lstatSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
-  renameSync,
+  readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 
 import {
+  buildCandidate,
+  canonicalReleaseAssetSnapshot,
+  canonicalReleaseInventorySnapshot,
+  compareSemver,
+  createGitHubAppJwt,
+  createPublicationPlan,
+  createReleasePlan,
   discoverV2RuntimeModulePaths,
+  extractCandidateTransport,
+  finalizeProvenance,
+  parseSemver,
   parseVerifiedOpenPgpStatus,
+  readGitHubAppInstallation,
+  readReleaseManifest,
+  validatePublicationPlan,
+  validateGitHubSigningKeyInventory,
+  validateActionMetadata,
+  validatePublisherRulesets,
+  validateSigningKeyHome,
+  validateTargetReleaseObjects,
+  verifyCandidate,
+  verifyPublishedAssets,
   writeManifest,
 } from "../scripts/generate-action-release-provenance.mjs";
 
-const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const generatorPath = join(
-  repositoryRoot,
-  "scripts",
-  "generate-action-release-provenance.mjs",
+const PRIMARY = "AD403DAB5377F9FA0F7D775EC2844D3367B8A71B";
+const SUBKEY = "4DD48552DDEAF6D961769DD4A49827EC48984E2C";
+const TARGET_HEAD = "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01";
+const WORKFLOW_REF =
+  "Joey-Tools/codex-review-gate/.github/workflows/sync-action-subtree.yml@refs/heads/master";
+const ACTION_METADATA = readFileSync(new URL("../packages/action/action.yml", import.meta.url), "utf8");
+const PUBLISHER_WORKFLOW = readFileSync(
+  new URL("../.github/workflows/sync-action-subtree.yml", import.meta.url),
+  "utf8",
 );
-const productionBaselinePath = join(
-  repositoryRoot,
-  "docs",
-  "release",
-  "action-v2-repository-baselines.json",
-);
-const EVIDENCE_AUTHORITY_POLICY_PATH =
-  "github-codex-evidence-authority-v2.json";
-const SOURCE_PACKAGE_IDENTITY = Object.freeze({
-  name: "codex-review-gate-source",
-  version: "2.0.0",
-  repository: {
-    type: "git",
-    url: "git+https://github.com/Joey-Tools/codex-review-gate.git",
-  },
-});
-const ACTION_PACKAGE_IDENTITY = Object.freeze({
-  name: "codex-review-gate-action",
-  version: "2.0.0",
-  repository: {
-    type: "git",
-    url: "git+https://github.com/Joey-Tools/codex-review-gate-action.git",
-  },
-});
-const EXPECTED_V2_RUNTIME_MODULE_PATHS = Object.freeze([
-  "src/v2/action.mjs",
-  "src/v2/candidate-inventory.mjs",
-  "src/v2/control-plane-receipt.mjs",
-  "src/v2/controller-input-reader.mjs",
-  "src/v2/effect-status-wal.mjs",
-  "src/v2/git-ledger.mjs",
-  "src/v2/persistent-frontier.mjs",
-  "src/v2/projection.mjs",
-  "src/v2/projector.mjs",
-  "src/v2/public-report-projector.mjs",
-  "src/v2/public-report.mjs",
-  "src/v2/reducer.mjs",
-  "src/v2/runner.mjs",
-  "src/v2/scheduler.mjs",
-  "src/v2/schema.mjs",
-  "src/v2/transport.mjs",
-  "src/v2/workflow-command.mjs",
-  "src/v2/workflow-controller.mjs",
-  "src/v2/workflow-preflight.mjs",
-]);
-const SOURCE_ONLY_REQUIRED_CI_PATHS = Object.freeze([
-  ".github/workflows/required-ci.yml",
-]);
-const FIXTURE_EVIDENCE_AUTHORITY_POLICY = Object.freeze({
-  schema: "github-codex-evidence-authority-v2",
-  schema_version: 2,
-  scope: "release-fixture",
-});
-const testEnvironment = {
-  ...process.env,
-  CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "1",
-  GIT_ASKPASS: "/usr/bin/false",
-  GIT_CONFIG_GLOBAL: "/dev/null",
-  GIT_CONFIG_NOSYSTEM: "1",
-  GIT_TERMINAL_PROMPT: "0",
-  NODE_ENV: "test",
-};
+const RELEASE_SIGNING_PUBLIC_KEY = `-----BEGIN PGP PUBLIC KEY BLOCK-----
 
-function git(repo, args, { encoding = "utf8" } = {}) {
+mDMEaowbyBYJKwYBBAHaRw8BAQdAY29ZomqF1Ca0db1zFK6QQSB5UR2wK+mh77cC
+6i+Zobu0V0pvZXlUZW5nLUNvZGV4IChGb3IgSm9leS1Ub29scy9jb2RleC1yZXZp
+ZXctZ2F0ZS1hY3Rpb24gcmVsZWFzZSBvbmx5KSA8Y29kZXhAbWFoYW5lLm1lPoiT
+BBMWCgA7FiEErUA9q1N3+foPfXdewoRNM2e4pxsFAmqMG8gCGwMFCwkIBwICIgIG
+FQoJCAsCBBYCAwECHgcCF4AACgkQwoRNM2e4pxtVLAD/UOjJDnO309VsRcwYlbi1
+pPP0P+NZkR3HmrLN1bXd3wwA/3vjaTbZtEQGFifJCMbUDDPczkfXWa48wEbzyjif
+3j8PtFVKb2V5VGVuZy1Db2RleCAoRm9yIEpvZXlUZW5nL2NvZGV4LXJldmlldy1n
+YXRlLWFjdGlvbiByZWxlYXNlIG9ubHkpIDxjb2RleEBtYWhhbmUubWU+iJYEExYK
+AD4CGwMFCwkIBwICIgIGFQoJCAsCBBYCAwECHgcCF4AWIQStQD2rU3f5+g99d17C
+hE0zZ7inGwUCaow2kwIZAQAKCRDChE0zZ7inGyvAAQDUmwztSXWn+ImXcOWmmjKK
+YY7zT3X6nbdLCeFPZO18nwD/ZTVvo5ge7Du/I2U6epsdq7DL0GsBfedO6l4pr8EC
+9QG4OARqjBvIEgorBgEEAZdVAQUBAQdAlnj5jeGelfwd8nowsU4u2mN0634NiYdg
+fvQVBu4mHHQDAQgHiHgEGBYKACAWIQStQD2rU3f5+g99d17ChE0zZ7inGwUCaowb
+yAIbDAAKCRDChE0zZ7inG3R1AQDqu+hYRTHAevMyZ/iooJiYvkLMEk4ceDp7kq8y
+oL/X6AEA5QgLb5O1yzywP2LZwr3h4EJ5JGomiqLg1i7pH/OIvwK4MwRqjCK+Fgkr
+BgEEAdpHDwEBB0B6uJCtDIMdB8Ts7f2b6ZQ3tGoDJ0BF1DqNL3nbhTm4Z4jvBBgW
+CgAgFiEErUA9q1N3+foPfXdewoRNM2e4pxsFAmqMIr4CGwIAgQkQwoRNM2e4pxt2
+IAQZFgoAHRYhBE3UhVLd6vbZYXad1KSYJ+xImE4sBQJqjCK+AAoJEKSYJ+xImE4s
+0e0A/1XDBldzpvb802mkYdXXzTdwUz8qLDuIYZFvzvLpLwo/AQCIY/AzytqOKItd
+CipWc2AK9P8q4CxCSQgoEWLsh3JACfTSAP92wbpsxFL6QR++Z4EI1t0kePBYE2Uz
+o9vhFyL26ME6bAEAi0DEqdr3gczrcwfU8JLBtGDNjLoX+yQjvBcZIJ6rgAs=
+=sJtz
+-----END PGP PUBLIC KEY BLOCK-----`;
+const APP_BYPASS = [{
+  actor_id: 4700530,
+  actor_type: "Integration",
+  bypass_mode: "always",
+}];
+
+test("publisher identity preflight creates a short-lived RS256 App JWT", () => {
+  const now = 1_800_000_000;
+  const clientId = "Iv23liSyntheticPublisher";
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const token = createGitHubAppJwt({ clientId, privateKey, now });
+  const parts = token.split(".");
+  assert.equal(parts.length, 3);
+  assert.deepEqual(JSON.parse(Buffer.from(parts[0], "base64url")), { alg: "RS256", typ: "JWT" });
+  assert.deepEqual(JSON.parse(Buffer.from(parts[1], "base64url")), {
+    iat: now - 60,
+    exp: now + 540,
+    iss: clientId,
+  });
+  assert.equal(
+    verifyBytes(
+      "RSA-SHA256",
+      Buffer.from(`${parts[0]}.${parts[1]}`),
+      publicKey,
+      Buffer.from(parts[2], "base64url"),
+    ),
+    true,
+  );
+  const changedClaims = Buffer.from(JSON.stringify({
+    iat: now - 60,
+    exp: now + 541,
+    iss: clientId,
+  })).toString("base64url");
+  assert.equal(
+    verifyBytes(
+      "RSA-SHA256",
+      Buffer.from(`${parts[0]}.${changedClaims}`),
+      publicKey,
+      Buffer.from(parts[2], "base64url"),
+    ),
+    false,
+  );
+});
+
+test("publisher identity preflight requests installation detail with an in-memory Bearer JWT", async () => {
+  const now = 1_800_000_000;
+  const clientId = "Iv23liSyntheticPublisher";
+  const installationId = "12345678";
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  let observed;
+  const installation = await readGitHubAppInstallation({
+    clientId,
+    privateKey,
+    installationId,
+    now,
+    fetchImpl: async (url, options) => {
+      observed = { url, options };
+      return {
+        status: 200,
+        text: async () => JSON.stringify({ id: Number(installationId), app_slug: "publisher" }),
+      };
+    },
+  });
+  assert.deepEqual(installation, { id: Number(installationId), app_slug: "publisher" });
+  assert.equal(observed.url, `https://api.github.com/app/installations/${installationId}`);
+  assert.equal(observed.options.method, "GET");
+  assert.equal(observed.options.redirect, "error");
+  assert.match(observed.options.headers.Authorization, /^Bearer [^.]+\.[^.]+\.[^.]+$/u);
+  assert.doesNotMatch(observed.options.headers.Authorization, /^token /u);
+  assert.equal(observed.options.headers["X-GitHub-Api-Version"], "2022-11-28");
+});
+
+test("publisher identity preflight rejects malformed App JWT inputs", () => {
+  const { privateKey: rsaPrivateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const { privateKey: ecPrivateKey } = generateKeyPairSync("ec", {
+    namedCurve: "prime256v1",
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  for (const clientId of ["short", "invalid client id", "x".repeat(129)]) {
+    assert.throws(
+      () => createGitHubAppJwt({ clientId, privateKey: rsaPrivateKey, now: 1_800_000_000 }),
+      /client ID is malformed/u,
+    );
+  }
+  for (const now of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => createGitHubAppJwt({ clientId: "Iv23liSyntheticPublisher", privateKey: rsaPrivateKey, now }),
+      /JWT time is invalid/u,
+    );
+  }
+  assert.throws(
+    () => createGitHubAppJwt({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey: ecPrivateKey,
+      now: 1_800_000_000,
+    }),
+    /private key must be RSA/u,
+  );
+});
+
+test("publisher workflow keeps App JWT and installation-token authentication classes separate", () => {
+  const tokenStep = PUBLISHER_WORKFLOW.match(
+    /      - name: Create least-privilege publisher token\n(?<body>[\s\S]*?)(?=\n      - name: )/u,
+  )?.groups?.body;
+  const identityStep = PUBLISHER_WORKFLOW.match(
+    /      - name: Validate publisher identity and repository scope\n(?<body>[\s\S]*?)(?=\n      - name: )/u,
+  )?.groups?.body;
+  assert.ok(tokenStep, "publisher token step must remain present");
+  assert.ok(identityStep, "publisher identity step must remain present");
+  assert.match(tokenStep, /uses: actions\/create-github-app-token@v3/u);
+  assert.match(tokenStep, /client-id: \$\{\{ vars\.RELEASE_PUBLISHER_APP_CLIENT_ID \}\}/u);
+  assert.match(tokenStep, /repositories: codex-review-gate-action/u);
+  assert.deepEqual(
+    [...tokenStep.matchAll(/^          (permission-[^:]+): (\S+)$/gmu)]
+      .map((match) => [match[1], match[2]]),
+    [
+      ["permission-administration", "read"],
+      ["permission-contents", "write"],
+    ],
+  );
+  const identityLines = identityStep.split("\n");
+  const appCommandIndex = identityLines.findIndex((line) =>
+    line.includes("node scripts/generate-action-release-provenance.mjs github-app-installation"));
+  assert.ok(appCommandIndex > 0, "bounded App-JWT command must remain present");
+  assert.equal(
+    identityLines[appCommandIndex - 1],
+    '          RELEASE_PUBLISHER_APP_PRIVATE_KEY="$app_private_key" \\',
+  );
+  assert.equal(
+    identityLines[appCommandIndex],
+    "            node scripts/generate-action-release-provenance.mjs github-app-installation \\",
+  );
+  const executableIdentityStep = identityLines
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+  assert.match(identityStep, /--client-id "\$APP_CLIENT_ID"/u);
+  assert.doesNotMatch(executableIdentityStep, /app\/installations/u);
+  assert.equal([...executableIdentityStep.matchAll(/\bgh api\b/gu)].length, 1);
+  assert.match(
+    identityStep,
+    /GH_TOKEN="\$installation_token" gh api installation\/repositories/u,
+  );
+});
+
+function ruleset({
+  name,
+  target = "branch",
+  include,
+  exclude = [],
+  bypass = [],
+  ruleTypes,
+}) {
+  return {
+    name,
+    enforcement: "active",
+    target,
+    conditions: { ref_name: { include, exclude } },
+    bypass_actors: bypass,
+    rules: ruleTypes.map((type) => ({ type })),
+  };
+}
+
+function productionRulesets() {
+  return [
+    ruleset({
+      name: "publisher-master-update",
+      include: ["refs/heads/master"],
+      bypass: APP_BYPASS,
+      ruleTypes: ["update"],
+    }),
+    ruleset({
+      name: "master-integrity",
+      include: ["refs/heads/master"],
+      ruleTypes: [
+        "deletion",
+        "non_fast_forward",
+        "required_linear_history",
+        "required_signatures",
+      ],
+    }),
+    ruleset({
+      name: "freeze-v1-tags",
+      target: "tag",
+      include: ["refs/tags/v1", "refs/tags/v1.*"],
+      ruleTypes: ["creation", "update", "deletion", "non_fast_forward"],
+    }),
+    ruleset({
+      name: "publisher-v2-plus-tags",
+      target: "tag",
+      include: ["refs/tags/v*"],
+      exclude: ["refs/tags/v1", "refs/tags/v1.*"],
+      bypass: APP_BYPASS,
+      ruleTypes: ["creation", "update", "deletion", "non_fast_forward"],
+    }),
+  ];
+}
+
+function inventoryRecord(path, sha256, size, mode = "100644") {
+  return { path, type: "file", mode, size, sha256 };
+}
+
+function manifest({ version = "2.0.0", tree = "a".repeat(40), files, expectedHead = TARGET_HEAD } = {}) {
+  const payloadFiles = files ?? [
+    inventoryRecord("action.yml", "b".repeat(64), 85),
+    inventoryRecord("package.json", "c".repeat(64), 180),
+    inventoryRecord("src/v2/gate-runtime.mjs", "d".repeat(64), 32),
+  ];
+  return {
+    $schema: "urn:joey-tools:codex-review-gate:release-manifest:2",
+    schema_version: 2,
+    version,
+    contract_versions: {
+      toolchain: "node20",
+      release_schema: 2,
+      status: 2,
+      template: 2,
+      baseline: 3,
+    },
+    source: {
+      repository: "Joey-Tools/codex-review-gate",
+      path: "packages/action",
+      tree,
+    },
+    target: {
+      repository: "JoeyTeng/codex-review-gate-action",
+      ref: "refs/heads/master",
+      expected_head: expectedHead,
+      previous_version: "1.5.1",
+    },
+    files: payloadFiles,
+    entrypoint: {
+      metadata_path: "action.yml",
+      using: "node20",
+      main: "src/v2/gate-runtime.mjs",
+    },
+    signer: {
+      name: "JoeyTeng-Codex",
+      email: "codex@mahane.me",
+      primary_fingerprint: PRIMARY,
+      signing_subkey_fingerprint: SUBKEY,
+    },
+  };
+}
+
+function releaseAsset(id, overrides = {}) {
+  return {
+    id,
+    node_id: `RA_${id}`,
+    name: "release-provenance.json",
+    state: "uploaded",
+    content_type: "application/json",
+    size: 123,
+    digest: `sha256:${"a".repeat(64)}`,
+    created_at: "2026-08-25T12:00:00Z",
+    updated_at: "2026-08-25T12:00:00Z",
+    url: `https://api.github.com/repos/JoeyTeng/codex-review-gate-action/releases/assets/${id}`,
+    browser_download_url:
+      "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/v2.0.0/release-provenance.json",
+    uploader: {
+      id: 4700530,
+      node_id: "MDM6QXBwNDcwMDUzMA==",
+      login: "codex-review-gate-action-publisher[bot]",
+      type: "Bot",
+    },
+    ...overrides,
+  };
+}
+
+function gpg(home, args, options = {}) {
+  return execFileSync("gpg", ["--batch", "--homedir", home, ...args], {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...options,
+  });
+}
+
+function keyFingerprints(home) {
+  return gpg(home, ["--with-colons", "--with-subkey-fingerprint", "--list-secret-keys"])
+    .split("\n")
+    .filter((line) => line.startsWith("fpr:"))
+    .map((line) => line.split(":")[9]);
+}
+
+function git(repo, args, options = {}) {
   return execFileSync("git", ["-C", repo, ...args], {
-    encoding,
-    env: testEnvironment,
-    maxBuffer: 64 * 1024 * 1024,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...options,
+  }).trim();
+}
+
+function gitObjectBytes(repo, type, objectId) {
+  return execFileSync("git", ["-C", repo, "cat-file", type, objectId], {
+    encoding: null,
+    maxBuffer: 16 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
 
-function gitText(repo, args) {
-  return git(repo, args).trim();
+function writeRawGitObject(repo, type, bytes) {
+  return execFileSync("git", [
+    "-C", repo,
+    "hash-object",
+    "--literally",
+    "-w",
+    "-t", type,
+    "--stdin",
+  ], {
+    encoding: "utf8",
+    input: bytes,
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
 }
 
-function initialiseRepository(path) {
-  mkdirSync(path, { recursive: true });
-  git(path, ["init", "-q", "--initial-branch=master"]);
-  git(path, ["config", "user.name", "Release Fixture"]);
-  git(path, ["config", "user.email", "release-fixture@example.invalid"]);
-  git(path, ["config", "commit.gpgSign", "false"]);
-  git(path, ["config", "tag.gpgSign", "false"]);
+function appendGitObjectHeader(source, header) {
+  return source.replace("\n\n", `\n${header}\n\n`);
 }
 
-function writeText(path, value, mode) {
+function duplicateGitObjectHeader(source, name) {
+  const match = new RegExp(`^${name} .+$`, "mu").exec(source);
+  assert.ok(match, `${name} header must be present in the fixture`);
+  return source.replace(`${match[0]}\n`, `${match[0]}\n${match[0]}\n`);
+}
+
+function write(path, bytes) {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, value);
-  if (mode !== undefined) chmodSync(path, mode);
+  writeFileSync(path, bytes);
 }
 
 function writeJson(path, value) {
-  writeText(path, `${JSON.stringify(value, null, 2)}\n`);
+  write(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function commitAll(repo, message) {
+function commit(repo, message) {
   git(repo, ["add", "--all"]);
   git(repo, ["commit", "-q", "-m", message]);
-  return gitText(repo, ["rev-parse", "HEAD"]);
+  return git(repo, ["rev-parse", "HEAD"]);
 }
 
-function sortedObject(entries) {
-  return Object.fromEntries(
-    Object.entries(entries).sort(([left], [right]) => left.localeCompare(right)),
-  );
-}
-
-function compareUtf8Paths(left, right) {
-  return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
-}
-
-function liveV2RuntimeModulePaths() {
-  const runtimeRoot = join(repositoryRoot, "packages", "action", "src", "v2");
-  return readdirSync(runtimeRoot, { withFileTypes: true })
-    .map((entry) => {
-      assert.equal(
-        entry.isFile(),
-        true,
-        `live v2 runtime entry must be a regular file: ${entry.name}`,
-      );
-      assert.match(
-        entry.name,
-        /^[a-z0-9]+(?:-[a-z0-9]+)*\.mjs$/u,
-        `live v2 runtime entry must have a canonical module name: ${entry.name}`,
-      );
-      return `src/v2/${entry.name}`;
-    })
-    .sort(compareUtf8Paths);
-}
-
-function writeRefSnapshot(path, refs) {
-  const lines = Object.entries(refs)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([ref, oid]) => `${oid}\t${ref}`);
-  writeText(path, `${lines.join("\n")}\n`);
-}
-
-function copyCommitTree(sourceRepo, commit, destination) {
-  const paths = git(sourceRepo, ["ls-tree", "-r", "-z", "--name-only", commit], {
+function payloadInventory(repo, ref) {
+  const raw = execFileSync("git", [
+    "-C", repo,
+    "ls-tree",
+    "-rz",
+    "--full-tree",
+    "--format=%(objectmode)%x09%(objecttype)%x09%(objectname)%x09%(path)",
+    `${ref}:packages/action`,
+  ], {
     encoding: null,
-  })
-    .subarray(0, -1)
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return raw
+    .subarray(0, raw.at(-1) === 0 ? -1 : undefined)
     .toString("utf8")
-    .split("\0");
-  for (const path of paths) {
-    writeText(join(destination, path), git(sourceRepo, ["show", `${commit}:${path}`]));
-  }
+    .split("\0")
+    .filter(Boolean)
+    .map((row) => {
+      const [mode, objectType, objectId, path] = row.split("\t");
+      assert.equal(objectType, "blob");
+      const bytes = execFileSync("git", ["-C", repo, "cat-file", "blob", objectId], {
+        encoding: null,
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return inventoryRecord(
+        path,
+        createHash("sha256").update(bytes).digest("hex"),
+        bytes.byteLength,
+        mode,
+      );
+    })
+    .sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
 }
 
-function writeV2ActionTree(
-  repo,
-  {
-    actionPackageIdentity = ACTION_PACKAGE_IDENTITY,
-    extraRuntimeModulePaths = [],
-    omitEvidenceAuthorityPolicy = false,
-  } = {},
-) {
-  writeText(
-    join(repo, "action.yml"),
-    `name: Codex Review Gate v2 Plan Adapter
-runs:
-  using: composite
-  steps:
-    - shell: bash
-      run: node "$GITHUB_ACTION_PATH/src/v2/action.mjs"
-`,
-  );
-  writeText(
-    join(repo, ".github", "workflows", "codex-review-gate.yml"),
-    `name: Codex Review Gate v2
-on:
-  workflow_call:
-jobs:
-  gate:
-    runs-on: ubuntu-latest
-    steps:
-      - run: node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" run
-`,
-  );
-  writeText(
-    join(repo, ".github", "workflows", "codex-review-gate-reconcile.yml"),
-    `name: Codex Review Gate v2 Reconcile
-on:
-  workflow_dispatch:
-jobs:
-  reconcile:
-    uses: ./.github/workflows/codex-review-gate.yml
-`,
-  );
-  writeJson(join(repo, "package.json"), {
-    ...actionPackageIdentity,
-    type: "module",
-  });
-  const runtimeModulePaths = [
-    ...EXPECTED_V2_RUNTIME_MODULE_PATHS,
-    ...extraRuntimeModulePaths,
-  ].sort(compareUtf8Paths);
-  for (const path of runtimeModulePaths) {
-    writeText(
-      join(repo, path),
-      `export const name = ${JSON.stringify(path)};\n`,
-    );
+function nulInventoryDigest(records) {
+  const hash = createHash("sha256");
+  for (const record of records) {
+    for (const field of [record.path, record.type, record.mode, String(record.size), record.sha256]) {
+      hash.update(field, "utf8");
+      hash.update("\0", "binary");
+    }
   }
-  if (!omitEvidenceAuthorityPolicy) {
-    writeJson(
-      join(repo, EVIDENCE_AUTHORITY_POLICY_PATH),
-      FIXTURE_EVIDENCE_AUTHORITY_POLICY,
-    );
-  }
-  // Retained files are history/runtime implementation details, not public v1 selectors.
-  writeText(join(repo, "src", "core.mjs"), "export const legacyCore = true;\n");
-  writeText(join(repo, "src", "gate.mjs"), "export const legacyGate = true;\n");
+  return hash.digest("hex");
 }
 
-function createGeneratorFixture(t, actionTreeOptions = {}) {
-  const root = mkdtempSync(join(tmpdir(), "release-provenance-v2-"));
+function releaseFixture(t, { version = "2.0.0" } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "release-provenance-fixture-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const actionRepo = join(root, "action");
-  const sourceRepo = join(root, "source");
-  initialiseRepository(actionRepo);
-
-  const firstRootCommits = [];
-  for (let index = 1; index <= 14; index += 1) {
-    writeText(join(actionRepo, "history.txt"), `${index}\n`);
-    firstRootCommits.push(commitAll(actionRepo, `action history ${index}`));
-  }
-  const baselineMaster = firstRootCommits.at(-1);
-  const preSubtree = firstRootCommits[7];
-
-  git(actionRepo, ["switch", "-q", "--orphan", "archive"]);
-  let archiveHead;
-  for (let index = 1; index <= 7; index += 1) {
-    writeText(join(actionRepo, "archive.txt"), `${index}\n`);
-    archiveHead = commitAll(actionRepo, `archive history ${index}`);
-  }
-  git(actionRepo, ["switch", "-q", "master"]);
-  writeV2ActionTree(actionRepo, actionTreeOptions);
-  const actionCommit = commitAll(actionRepo, "release v2.0.0");
-  for (const tag of ["v2.0.0", "v2.0", "v2"]) {
-    git(actionRepo, ["tag", "-a", tag, actionCommit, "-m", `fixture ${tag}`]);
-  }
-
-  initialiseRepository(sourceRepo);
-  copyCommitTree(actionRepo, actionCommit, join(sourceRepo, "packages", "action"));
-  writeJson(join(sourceRepo, "package.json"), {
-    ...SOURCE_PACKAGE_IDENTITY,
-    private: true,
+  const targetRepo = join(root, "target");
+  mkdirSync(targetRepo);
+  git(targetRepo, ["init", "-q", "--initial-branch=master"]);
+  git(targetRepo, ["config", "user.name", "JoeyTeng-Codex"]);
+  git(targetRepo, ["config", "user.email", "codex@mahane.me"]);
+  write(join(targetRepo, "action.yml"), "name: Legacy Action\n");
+  const targetHead = commit(targetRepo, "Release codex-review-gate-action v1.5.1");
+  git(targetRepo, ["tag", "-a", "v1.5.1", targetHead, "-m", "Release codex-review-gate-action v1.5.1"]);
+  const repo = join(root, "source");
+  mkdirSync(repo);
+  git(repo, ["init", "-q", "--initial-branch=master"]);
+  git(repo, ["config", "user.name", "Release Fixture"]);
+  git(repo, ["config", "user.email", "release-fixture@example.invalid"]);
+  write(join(repo, "packages", "action", "action.yml"), ACTION_METADATA);
+  writeJson(join(repo, "packages", "action", "package.json"), {
+    name: "codex-review-gate-action",
+    version,
     type: "module",
-  });
-  writeText(join(sourceRepo, "README.md"), "source fixture\n");
-  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
-    writeText(join(sourceRepo, path), "name: Source-only required CI fixture\n");
-  }
-  const sourceCommit = commitAll(sourceRepo, "source release");
-
-  const frozenRefs = {
-    "refs/heads/master": baselineMaster,
-  };
-  const targetBaselineRefs = sortedObject({
-    "refs/heads/archive/pre-subtree-release-candidate-2026-05-16": archiveHead,
-    "refs/heads/master": baselineMaster,
-    "refs/heads/pre-subtree-master-2026-05-18": preSubtree,
-  });
-  const targetRefs = sortedObject({
-    ...targetBaselineRefs,
-    "refs/heads/master": actionCommit,
-    "refs/tags/v2": gitText(actionRepo, ["rev-parse", "refs/tags/v2"]),
-    "refs/tags/v2.0": gitText(actionRepo, ["rev-parse", "refs/tags/v2.0"]),
-    "refs/tags/v2.0.0": gitText(actionRepo, ["rev-parse", "refs/tags/v2.0.0"]),
-  });
-  const baselinePath = join(root, "baseline.json");
-  const targetPath = join(root, "target.tsv");
-  const frozenPath = join(root, "frozen.tsv");
-  writeJson(baselinePath, {
-    $schema: "urn:joey-tools:codex-review-gate:action-v2-repository-baselines:1",
-    schema_version: 1,
-    frozen_repository: {
-      repository: "JoeyTeng/codex-review-gate-action",
-      url: "file:///fixture/frozen.git",
-      default_branch: "master",
-      default_commit_oid: baselineMaster,
-      default_tree_oid: gitText(actionRepo, ["rev-parse", `${baselineMaster}^{tree}`]),
-      refs: sortedObject(frozenRefs),
-    },
-    target_repository: {
-      repository: "Joey-Tools/codex-review-gate-action",
-      url: "file:///fixture/target.git",
-      default_branch: "master",
-      default_commit_oid: baselineMaster,
-      default_tree_oid: gitText(actionRepo, ["rev-parse", `${baselineMaster}^{tree}`]),
-      head_commit_count: 21,
-      head_root_count: 2,
-      refs: targetBaselineRefs,
-    },
-    release: {
-      version: "2.0.0",
-      immutable_tag: "v2.0.0",
-      aliases: ["v2.0", "v2"],
+    repository: {
+      type: "git",
+      url: "git+https://github.com/JoeyTeng/codex-review-gate-action.git",
     },
   });
-  writeRefSnapshot(targetPath, targetRefs);
-  writeRefSnapshot(frozenPath, frozenRefs);
-  return {
-    root,
-    actionRepo,
-    sourceRepo,
-    sourceCommit,
-    actionCommit,
-    baselinePath,
-    targetPath,
-    frozenPath,
-    targetRefs,
-  };
+  write(
+    join(repo, "packages", "action", "src", "v2", "gate-runtime.mjs"),
+    `export const version = ${JSON.stringify(version)};\n`,
+  );
+  const payloadCommit = commit(repo, "Install release payload");
+  const tree = git(repo, ["rev-parse", `${payloadCommit}:packages/action`]);
+  const files = payloadInventory(repo, payloadCommit);
+  writeJson(join(repo, "release-manifest.json"), manifest({ version, tree, files, expectedHead: targetHead }));
+  const sourceCommit = commit(repo, `Release intent ${version}`);
+  const plan = createReleasePlan({ repo, sourceRef: sourceCommit, controlRef: sourceCommit });
+  const planPath = join(root, "release-plan.json");
+  writeJson(planPath, plan);
+  const candidateDir = join(root, "candidate");
+  const candidate = buildCandidate({
+    repo,
+    sourceRef: sourceCommit,
+    controlRef: sourceCommit,
+    planPath,
+    outputDir: candidateDir,
+  });
+  return { root, repo, targetRepo, targetHead, sourceCommit, plan, candidateDir, candidate, tree, files };
 }
 
-function runGenerator(fixture, output, overrides = {}) {
-  const args = [
-    generatorPath,
-    "--source-repo",
-    fixture.sourceRepo,
-    "--source-ref",
-    overrides.sourceRef ?? fixture.sourceCommit,
-    "--action-repo",
-    fixture.actionRepo,
-    "--action-ref",
-    fixture.actionCommit,
-    "--target-refs",
-    overrides.targetPath ?? fixture.targetPath,
-    "--frozen-refs",
-    fixture.frozenPath,
-    "--baseline",
-    fixture.baselinePath,
-    "--output",
-    output,
-    "--test-only-skip-signatures",
-  ];
-  return spawnSync(process.execPath, args, {
+function materializeTargetRelease(state, {
+  tree = state.tree,
+  parent = state.targetHead,
+  sourceCommit = state.sourceCommit,
+  manifestDigest = state.plan.manifest_sha256,
+  tagTarget,
+} = {}) {
+  git(state.targetRepo, ["fetch", "-q", state.repo, state.sourceCommit]);
+  const subject = `Release codex-review-gate-action ${state.plan.immutable_tag}`;
+  const message = `${subject}\n\nSource: Joey-Tools/codex-review-gate@${sourceCommit}\nManifest-SHA256: ${manifestDigest}\n`;
+  const releaseCommit = execFileSync("git", [
+    "-C", state.targetRepo,
+    "commit-tree", tree,
+    "-p", parent,
+  ], {
     encoding: "utf8",
-    env: { ...testEnvironment, ...overrides.env },
-    maxBuffer: 64 * 1024 * 1024,
-  });
+    input: message,
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "JoeyTeng-Codex",
+      GIT_AUTHOR_EMAIL: "codex@mahane.me",
+      GIT_COMMITTER_NAME: "JoeyTeng-Codex",
+      GIT_COMMITTER_EMAIL: "codex@mahane.me",
+    },
+  }).trim();
+  git(state.targetRepo, ["tag", "-f", "-a", state.plan.immutable_tag, tagTarget ?? releaseCommit, "-m", subject]);
+  return {
+    releaseCommit,
+    fullTagObject: git(state.targetRepo, ["rev-parse", `refs/tags/${state.plan.immutable_tag}`]),
+  };
 }
 
-test("release contract locks every live v2 runtime module in byte order", () => {
-  assert.deepEqual(
-    liveV2RuntimeModulePaths(),
-    EXPECTED_V2_RUNTIME_MODULE_PATHS,
-  );
-  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
-    assert.equal(
-      existsSync(join(repositoryRoot, "packages", "action", path)),
-      false,
-      `${path} must remain outside the released action subtree`,
-    );
-  }
-  for (const [path, expected] of [
-    [join(repositoryRoot, "package.json"), SOURCE_PACKAGE_IDENTITY],
-    [join(repositoryRoot, "packages", "action", "package.json"), ACTION_PACKAGE_IDENTITY],
-  ]) {
-    const actual = JSON.parse(readFileSync(path, "utf8"));
-    assert.deepEqual(
-      {
-        name: actual.name,
-        version: actual.version,
-        repository: actual.repository,
-      },
-      expected,
-    );
-  }
+function createCandidateTransport(state, path) {
+  execFileSync("tar", [
+    "--format=ustar",
+    "-cf", path,
+    "-C", state.candidateDir,
+    "candidate.json",
+    state.candidate.archive.name,
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+}
+
+test("SemVer policy emits only an immutable tag for prereleases", () => {
+  assert.deepEqual(parseSemver("2.0.0-rc.1"), {
+    version: "2.0.0-rc.1",
+    major: 2,
+    minor: 0,
+    patch: 0,
+    prerelease: "rc.1",
+    immutableTag: "v2.0.0-rc.1",
+    majorAlias: null,
+  });
 });
 
-test("runtime module discovery fails closed on structural ambiguity", async (t) => {
-  const regularEntries = EXPECTED_V2_RUNTIME_MODULE_PATHS.map((path) => ({
-    path,
-    mode: "100644",
-    type: "blob",
+test("SemVer policy emits one floating alias for every future stable major", () => {
+  assert.equal(parseSemver("3.4.5").majorAlias, "v3");
+  assert.equal(parseSemver("10.0.0").majorAlias, "v10");
+  assert.throws(() => parseSemver("1.9.0"), /new v1 releases are forbidden/u);
+  assert.throws(() => parseSemver("v2.0.0"), /canonical SemVer/u);
+});
+
+test("SemVer comparison preserves huge canonical numeric components and aliases", () => {
+  const lower = "9007199254740992";
+  const higher = "9007199254740993";
+  assert.equal(compareSemver(`${lower}.0.0`, `${higher}.0.0`), -1);
+  assert.equal(compareSemver(`${higher}.0.0`, `${lower}.0.0`), 1);
+  assert.equal(compareSemver(`2.${lower}.0`, `2.${higher}.0`), -1);
+  assert.equal(compareSemver(`2.0.${lower}`, `2.0.${higher}`), -1);
+  assert.equal(compareSemver(`2.0.0-${lower}`, `2.0.0-${higher}`), -1);
+  assert.equal(parseSemver(`${higher}.0.0`).majorAlias, `v${higher}`);
+});
+
+test("publisher rulesets match the four-rule production contract", () => {
+  assert.equal(validatePublisherRulesets(productionRulesets()), true);
+  const unexpected = productionRulesets();
+  unexpected.push(ruleset({
+    name: "unexpected-active-rule",
+    include: ["refs/heads/release"],
+    ruleTypes: ["update"],
   }));
-  assert.deepEqual(
-    discoverV2RuntimeModulePaths({ entries: [...regularEntries].reverse() }),
-    EXPECTED_V2_RUNTIME_MODULE_PATHS,
-  );
-
-  await t.test("missing required entry", () => {
-    assert.throws(
-      () => discoverV2RuntimeModulePaths({
-        entries: regularEntries.filter(({ path }) => path !== "src/v2/action.mjs"),
-      }),
-      /missing required v2 identity src\/v2\/action\.mjs/u,
-    );
-  });
-
-  await t.test("symlinked module", () => {
-    assert.throws(
-      () => discoverV2RuntimeModulePaths({
-        entries: regularEntries.map((entry) => entry.path === "src/v2/reducer.mjs"
-          ? { ...entry, mode: "120000" }
-          : entry),
-      }),
-      /must be a regular non-symlink Git blob/u,
-    );
-  });
-
-  await t.test("duplicate path", () => {
-    assert.throws(
-      () => discoverV2RuntimeModulePaths({
-        entries: [...regularEntries, { ...regularEntries[0] }],
-      }),
-      /duplicate path/u,
-    );
-  });
-
-  await t.test("noncanonical module path", () => {
-    assert.throws(
-      () => discoverV2RuntimeModulePaths({
-        entries: [
-          ...regularEntries,
-          { path: "src/v2/Not_Canonical.mjs", mode: "100644", type: "blob" },
-        ],
-      }),
-      /noncanonical path/u,
-    );
-  });
+  assert.throws(() => validatePublisherRulesets(unexpected), /exactly the four adopted/u);
 });
 
-test("production baseline freezes every old personal ref and the transferred target", () => {
-  const baselineBytes = readFileSync(productionBaselinePath);
-  assert.equal(
-    createHash("sha256").update(baselineBytes).digest("hex"),
-    "63dc08cdf35720a5659ec6e2557ac4a3f49c26be331f4b62d1cb3e402336df6a",
+test("master integrity cannot grant a bypass or omit a required protection", () => {
+  const withBypass = productionRulesets();
+  withBypass[1].bypass_actors = APP_BYPASS;
+  assert.throws(() => validatePublisherRulesets(withBypass), /master-integrity/u);
+  const withoutSignatures = productionRulesets();
+  withoutSignatures[1].rules = withoutSignatures[1].rules.filter(
+    (rule) => rule.type !== "required_signatures",
   );
-  const baseline = JSON.parse(baselineBytes);
-  assert.equal(baseline.frozen_repository.repository, "JoeyTeng/codex-review-gate-action");
-  assert.equal(Object.keys(baseline.frozen_repository.refs).length, 27);
-  assert.equal(
-    baseline.frozen_repository.refs["refs/heads/master"],
-    "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
-  );
-  assert.equal(
-    baseline.frozen_repository.default_tree_oid,
-    "8d909dd441b28b6915c46f60e8a144e64fd5268b",
-  );
-  assert.equal(
-    baseline.frozen_repository.refs["refs/tags/v1.5.1"],
-    "f9201d016b0abd21403550c3bf8030eb0beb76b4",
-  );
-  assert.deepEqual(Object.keys(baseline.target_repository.refs), [
-    "refs/heads/archive/pre-subtree-release-candidate-2026-05-16",
-    "refs/heads/master",
-    "refs/heads/pre-subtree-master-2026-05-18",
+  assert.throws(() => validatePublisherRulesets(withoutSignatures), /master-integrity/u);
+});
+
+test("publisher master bypass is limited to default-branch updates", () => {
+  const withoutUpdate = productionRulesets();
+  withoutUpdate[0].rules = [];
+  assert.throws(() => validatePublisherRulesets(withoutUpdate), /publisher-master-update/u);
+  const withExtraRule = productionRulesets();
+  withExtraRule[0].rules.push({ type: "required_status_checks" });
+  assert.throws(() => validatePublisherRulesets(withExtraRule), /publisher-master-update/u);
+  const defaultBranchToken = productionRulesets();
+  defaultBranchToken[0].conditions.ref_name.include = ["~DEFAULT_BRANCH"];
+  assert.throws(() => validatePublisherRulesets(defaultBranchToken), /publisher-master-update/u);
+});
+
+test("v1 is frozen without bypass while only v2-plus tags grant the App bypass", () => {
+  const v1Bypass = productionRulesets();
+  v1Bypass[2].bypass_actors = APP_BYPASS;
+  assert.throws(() => validatePublisherRulesets(v1Bypass), /freeze-v1-tags/u);
+  const missingV1Exclusion = productionRulesets();
+  missingV1Exclusion[3].conditions.ref_name.exclude = [];
+  assert.throws(() => validatePublisherRulesets(missingV1Exclusion), /publisher-v2-plus-tags/u);
+  const broadV1Pattern = productionRulesets();
+  broadV1Pattern[2].conditions.ref_name.include = ["refs/tags/v1*"];
+  assert.throws(() => validatePublisherRulesets(broadV1Pattern), /freeze-v1-tags/u);
+});
+
+test("repository baseline v3 records the split tag protections", () => {
+  const baseline = JSON.parse(readFileSync(
+    new URL("../docs/release/action-v2-repository-baselines.json", import.meta.url),
+    "utf8",
+  ));
+  assert.equal(baseline.schema_version, 3);
+  assert.deepEqual(Object.keys(baseline.required_rulesets).sort(), [
+    "freeze_v1_tags",
+    "master_integrity",
+    "publisher_master_update",
+    "publisher_v2_plus_tags",
   ]);
-  assert.equal(baseline.target_repository.head_commit_count, 21);
-  assert.equal(baseline.target_repository.head_root_count, 2);
-  assert.deepEqual(baseline.release, {
-    version: "2.0.0",
-    immutable_tag: "v2.0.0",
-    aliases: ["v2.0", "v2"],
-  });
+  assert.equal(baseline.observed_ids_are_execution_dependencies, false);
 });
 
-test("GnuPG status parser binds signing and primary fingerprints", () => {
-  const signing = "0123456789ABCDEF0123456789ABCDEF01234567";
-  const primary = "89ABCDEF0123456789ABCDEF0123456789ABCDEF";
-  const result = {
-    stdout: Buffer.from(""),
-    stderr: Buffer.from(
-      `[GNUPG:] GOODSIG ${signing.slice(-16)} Release Fixture\n` +
-        `[GNUPG:] VALIDSIG ${signing} 2026-08-13 1786579200 0 4 0 1 10 00 ${primary}\n`,
-    ),
-  };
-  assert.deepEqual(parseVerifiedOpenPgpStatus(result, "v2.0.0"), {
-    signingKeyFingerprint: signing.toLowerCase(),
-    primaryKeyFingerprint: primary.toLowerCase(),
-  });
-  assert.deepEqual(
-    parseVerifiedOpenPgpStatus(
-      {
-        stdout: Buffer.alloc(0),
-        stderr: Buffer.from(
-          `[GNUPG:] GOODSIG ${primary.slice(-16)} Release Fixture\n` +
-            `[GNUPG:] VALIDSIG ${primary} 2026-08-13 1786579200 0 4 0 1 10 00\n`,
-        ),
-      },
-      "v2-primary-key",
-    ),
-    {
-      signingKeyFingerprint: primary.toLowerCase(),
-      primaryKeyFingerprint: primary.toLowerCase(),
+test("manifest v2 binds baseline v3, exact inventory, signer, and Node.js entrypoint", () => {
+  const root = mkdtempSync(join(tmpdir(), "release-manifest-v2-"));
+  try {
+    const path = join(root, "release-manifest.json");
+    writeJson(path, manifest());
+    const parsed = readReleaseManifest(path);
+    assert.equal(parsed.release.majorAlias, "v2");
+    assert.equal(parsed.contract_versions.baseline, 3);
+    assert.deepEqual(parsed.entrypoint, {
+      metadata_path: "action.yml",
+      using: "node20",
+      main: "src/v2/gate-runtime.mjs",
+    });
+    const composite = manifest();
+    composite.entrypoint.using = "composite";
+    writeJson(path, composite);
+    assert.throws(() => readReleaseManifest(path), /action entrypoint differs/u);
+    const changedTarget = manifest();
+    changedTarget.target.repository = "Joey-Tools/codex-review-gate-action";
+    writeJson(path, changedTarget);
+    assert.throws(() => readReleaseManifest(path), /target repository\/ref/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("release planning validates the real JavaScript Action and manifest tree", (t) => {
+  const state = releaseFixture(t);
+  assert.equal(state.plan.source_tree, state.tree);
+  assert.deepEqual(state.candidate.payload.files, state.files);
+  assert.equal(state.candidate.payload.inventory_sha256, nulInventoryDigest(state.files));
+});
+
+test("Action metadata parser admits only the closed node20 JavaScript schema", () => {
+  assert.equal(validateActionMetadata(Buffer.from(ACTION_METADATA)), true);
+  const replaceDescription = (replacement) => ACTION_METADATA.replace(
+    /^description: .*$/mu,
+    replacement,
+  );
+  const invalid = new Map([
+    ["malformed flow scalar", replaceDescription("description: [")],
+    ["duplicate key", ACTION_METADATA.replace("author: JoeyTeng\n", "author: JoeyTeng\nauthor: Mallory\n")],
+    ["duplicate runs", ACTION_METADATA.replace("runs:\n", "runs:\n  using: node20\n  main: src/v2/gate-runtime.mjs\nruns:\n")],
+    ["duplicate runs using", ACTION_METADATA.replace("  using: node20", "  using: node20\n  using: node20")],
+    ["duplicate runs main", ACTION_METADATA.replace("  main: src/v2/gate-runtime.mjs", "  main: src/v2/gate-runtime.mjs\n  main: src/v2/gate-runtime.mjs")],
+    ["unknown top-level key", `${ACTION_METADATA}unexpected: value\n`],
+    ["anchor", replaceDescription("description: &desc Reconcile evidence.")],
+    ["alias", replaceDescription("description: *desc")],
+    ["tag", replaceDescription("description: !str Reconcile evidence.")],
+    ["merge key", ACTION_METADATA.replace("  icon: shield\n", "  <<: *branding\n  icon: shield\n")],
+    ["multiple documents", `---\n${ACTION_METADATA}`],
+    ["block scalar", replaceDescription("description: |\n  Reconcile evidence.")],
+    ["flow mapping", ACTION_METADATA.replace("branding:\n  icon: shield\n  color: blue", "branding: {icon: shield, color: blue}")],
+    ["tab indentation", ACTION_METADATA.replace("  using: node20", "\tusing: node20")],
+    ["control character", ACTION_METADATA.replace("author: JoeyTeng", "author: JoeyTeng\u0001")],
+    ["NEL structural injection", ACTION_METADATA.replace(
+      "description: Reconcile trusted OpenAI Codex review evidence for one pull request.",
+      "description: harmless\u0085  runs:\u0085    using: node20",
+    )],
+    ["Unicode line separator indentation", ACTION_METADATA.replace("  using: node20", "\u2028\u2028using: node20")],
+    ["Unicode paragraph separator indentation", ACTION_METADATA.replace("  main: src/v2/gate-runtime.mjs", "\u2029\u2029main: src/v2/gate-runtime.mjs")],
+    ["non-breaking-space indentation", ACTION_METADATA.replace("  using: node20", "\u00a0\u00a0using: node20")],
+    ["non-ASCII scalar", ACTION_METADATA.replace("author: JoeyTeng", "author: JoeyTéng")],
+    ["extra lifecycle hook", ACTION_METADATA.replace(
+      "  main: src/v2/gate-runtime.mjs",
+      "  main: src/v2/gate-runtime.mjs\n  post: cleanup.mjs",
+    )],
+    ["unknown input", ACTION_METADATA.replace("inputs:\n", "inputs:\n  unexpected:\n    description: Unknown.\n    required: false\n")],
+  ]);
+  for (const [label, source] of invalid) {
+    assert.throws(
+      () => validateActionMetadata(Buffer.from(source)),
+      /root action\.yml|root Action/u,
+      label,
+    );
+  }
+});
+
+test("YAML alternate line breaks cannot create a parser-equivalent metadata override", () => {
+  for (const separator of ["\u0085", "\u2028", "\u2029"]) {
+    const injected = ACTION_METADATA.replace(
+      "description: Reconcile trusted OpenAI Codex review evidence for one pull request.",
+      `description: harmless${separator}runs:${separator}  using: composite${separator}  main: attacker.mjs`,
+    );
+    const lineFeedEquivalent = injected.replaceAll(separator, "\n");
+    assert.match(lineFeedEquivalent, /^runs:\n  using: composite\n  main: attacker\.mjs$/mu);
+    assert.throws(
+      () => validateActionMetadata(Buffer.from(injected)),
+      /root action\.yml/u,
+      `alternate YAML line break U+${separator.codePointAt(0).toString(16).toUpperCase()}`,
+    );
+    assert.throws(
+      () => validateActionMetadata(Buffer.from(lineFeedEquivalent)),
+      /duplicate key runs/u,
+      "the LF-equivalent structure must also fail closed",
+    );
+  }
+});
+
+test("release planning rejects a composite Action even when its manifest claims node20", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "release-composite-fixture-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repo = join(root, "source");
+  mkdirSync(repo);
+  git(repo, ["init", "-q", "--initial-branch=master"]);
+  git(repo, ["config", "user.name", "Release Fixture"]);
+  git(repo, ["config", "user.email", "release-fixture@example.invalid"]);
+  write(join(repo, "packages", "action", "action.yml"), [
+    "name: Composite",
+    "runs:",
+    "  using: composite",
+    "  steps:",
+    "    - shell: bash",
+    "      run: true",
+    "",
+  ].join("\n"));
+  writeJson(join(repo, "packages", "action", "package.json"), {
+    name: "codex-review-gate-action",
+    version: "2.0.0",
+    repository: {
+      type: "git",
+      url: "git+https://github.com/JoeyTeng/codex-review-gate-action.git",
     },
+  });
+  write(join(repo, "packages", "action", "src", "v2", "gate-runtime.mjs"), "export {};\n");
+  const payloadCommit = commit(repo, "Install composite payload");
+  writeJson(join(repo, "release-manifest.json"), manifest({
+    tree: git(repo, ["rev-parse", `${payloadCommit}:packages/action`]),
+    files: payloadInventory(repo, payloadCommit),
+  }));
+  const sourceCommit = commit(repo, "Release intent");
+  assert.throws(
+    () => createReleasePlan({ repo, sourceRef: sourceCommit, controlRef: sourceCommit }),
+    /closed mapping-only subset|JavaScript Action policy/u,
+  );
+});
+
+test("candidate verification binds the NUL-delimited inventory digest", (t) => {
+  const state = releaseFixture(t);
+  assert.equal(state.candidate.payload.inventory_sha256, nulInventoryDigest(state.candidate.payload.files));
+  const candidatePath = join(state.candidateDir, "candidate.json");
+  const original = readFileSync(candidatePath, "utf8");
+  const tampered = JSON.parse(original);
+  tampered.payload.inventory_sha256 = "f".repeat(64);
+  writeJson(candidatePath, tampered);
+  assert.throws(() => verifyCandidate(state.candidateDir), /NUL-delimited inventory digest/u);
+  writeFileSync(candidatePath, original);
+  assert.equal(verifyCandidate(state.candidateDir).payload.inventory_sha256, nulInventoryDigest(state.files));
+});
+
+test("candidate transport extracts only the two exact root regular files", (t) => {
+  const state = releaseFixture(t);
+  const transport = join(state.root, "candidate.tar");
+  createCandidateTransport(state, transport);
+  const extracted = join(state.root, "extracted");
+  assert.equal(extractCandidateTransport({ archivePath: transport, outputDir: extracted }), true);
+  assert.deepEqual(readdirSync(extracted).sort(), [
+    state.candidate.archive.name,
+    "candidate.json",
+  ].sort());
+  const trailing = join(state.root, "candidate-trailing.tar");
+  writeFileSync(trailing, Buffer.concat([readFileSync(transport), Buffer.from("unexpected")]), { flag: "wx" });
+  assert.throws(
+    () => extractCandidateTransport({ archivePath: trailing, outputDir: join(state.root, "trailing-output") }),
+    /end marker|non-zero data/u,
+  );
+});
+
+test("candidate transport rejects symlinks before reading their content", (t) => {
+  const state = releaseFixture(t);
+  const transportRoot = join(state.root, "symlink-transport");
+  mkdirSync(transportRoot);
+  symlinkSync(join(state.candidateDir, "candidate.json"), join(transportRoot, "candidate.json"));
+  copyFileSync(join(state.candidateDir, state.candidate.archive.name), join(transportRoot, state.candidate.archive.name));
+  chmodSync(join(transportRoot, state.candidate.archive.name), 0o600);
+  const transport = join(state.root, "symlink-candidate.tar");
+  execFileSync("tar", [
+    "--format=ustar",
+    "-cf", transport,
+    "-C", transportRoot,
+    "candidate.json",
+    state.candidate.archive.name,
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  assert.throws(
+    () => extractCandidateTransport({ archivePath: transport, outputDir: join(state.root, "symlink-output") }),
+    /must contain exactly two root regular files|rejects links and special entries/u,
+  );
+});
+
+test("publication plan rebinds the candidate and exact live source closure", (t) => {
+  const state = releaseFixture(t);
+  write(join(state.repo, "docs", "operator-note.md"), "Documentation-only recovery.\n");
+  const liveMaster = commit(state.repo, "Document recovery");
+  const publicationPlan = createPublicationPlan({
+    candidateDir: state.candidateDir,
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    liveMasterRef: liveMaster,
+  });
+  assert.equal(publicationPlan.schema, "codex-review-gate-action-publication-plan-v1");
+  assert.equal(publicationPlan.live_source_master, liveMaster);
+  assert.equal(publicationPlan.write_eligible, true);
+  assert.equal(publicationPlan.candidate.archive_sha256, state.candidate.archive.sha256);
+  const planPath = join(state.root, "publication-plan.json");
+  writeJson(planPath, publicationPlan);
+  assert.deepEqual(validatePublicationPlan({
+    publicationPlanPath: planPath,
+    candidateDir: state.candidateDir,
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    liveMasterRef: liveMaster,
+  }), publicationPlan);
+  publicationPlan.candidate.archive_sha256 = "f".repeat(64);
+  writeJson(planPath, publicationPlan);
+  assert.throws(() => validatePublicationPlan({
+    publicationPlanPath: planPath,
+    candidateDir: state.candidateDir,
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    liveMasterRef: liveMaster,
+  }), /publication plan differs/u);
+});
+
+test("publication plan fails closed when live master changes publisher controls", (t) => {
+  const state = releaseFixture(t);
+  write(join(state.repo, "test", "release-provenance.test.mjs"), "// changed control\n");
+  const liveMaster = commit(state.repo, "Change publisher control");
+  const publicationPlan = createPublicationPlan({
+    candidateDir: state.candidateDir,
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    liveMasterRef: liveMaster,
+  });
+  assert.equal(publicationPlan.write_eligible, false);
+  assert.equal(publicationPlan.recovery_code, "publisher-control-drift");
+  assert.match(publicationPlan.reason, /publisher-control-drift/u);
+});
+
+test("provenance binds workflow, release objects, signatures, and alias transition", (t) => {
+  const state = releaseFixture(t);
+  const outputDir = join(state.root, "release-assets");
+  const { releaseCommit, fullTagObject } = materializeTargetRelease(state);
+  const result = finalizeProvenance({
+    candidateDir: state.candidateDir,
+    releaseCommit,
+    fullTagObject,
+    releaseParent: state.targetHead,
+    aliasName: "v2",
+    aliasBefore: "none",
+    aliasMode: "create",
+    workflowRef: WORKFLOW_REF,
+    workflowRunId: "123456",
+    workflowRunAttempt: "2",
+    outputDir,
+  });
+  assert.equal(result.provenance.workflow.run_id, "123456");
+  assert.equal(result.provenance.target.parent, state.targetHead);
+  assert.deepEqual(result.provenance.alias_transition, {
+    name: "v2",
+    before: null,
+    target_commit: releaseCommit,
+    target_version: "2.0.0",
+    mode: "create",
+  });
+  assert.deepEqual(result.provenance.signatures.provenance, {
+    path: "release-provenance.json",
+    detached_signature: "release-provenance.json.asc",
+    primary_fingerprint: PRIMARY,
+    signing_subkey_fingerprint: SUBKEY,
+  });
+  writeFileSync(join(outputDir, "release-provenance.json.asc"), "test-only detached signature\n", {
+    flag: "wx",
+    mode: 0o600,
+  });
+  assert.deepEqual(readdirSync(outputDir).sort(), [
+    state.candidate.archive.name,
+    "release-provenance.json",
+    "release-provenance.json.asc",
+  ].sort());
+  assert.equal(verifyPublishedAssets({
+    assetDir: outputDir,
+    repo: state.repo,
+    targetRepo: state.targetRepo,
+    sourceRef: state.sourceCommit,
+    releaseCommit,
+    fullTagObject,
+  }), true);
+  const archivePath = join(outputDir, state.candidate.archive.name);
+  const archiveBytes = readFileSync(archivePath);
+  writeFileSync(archivePath, Buffer.concat([archiveBytes, Buffer.from("tampered")]), { flag: "w" });
+  assert.throws(() => verifyPublishedAssets({
+    assetDir: outputDir,
+    repo: state.repo,
+    targetRepo: state.targetRepo,
+    sourceRef: state.sourceCommit,
+    releaseCommit,
+    fullTagObject,
+  }), /deterministic archive/u);
+  writeFileSync(archivePath, archiveBytes, { flag: "w" });
+});
+
+test("published provenance is cross-checked against actual wrapper and annotated tag objects", (t) => {
+  const state = releaseFixture(t);
+  const assertInvalid = (options, pattern) => {
+    const objects = materializeTargetRelease(state, options);
+    assert.throws(() => validateTargetReleaseObjects({
+      targetRepo: state.targetRepo,
+      plan: state.plan,
+      ...objects,
+    }), pattern);
+  };
+
+  assertInvalid({
+    tree: git(state.targetRepo, ["rev-parse", `${state.targetHead}^{tree}`]),
+  }, /tree, sole parent, or exact source\/manifest message/u);
+  assertInvalid({
+    parent: state.sourceCommit,
+  }, /tree, sole parent, or exact source\/manifest message/u);
+  assertInvalid({
+    sourceCommit: "f".repeat(40),
+  }, /tree, sole parent, or exact source\/manifest message/u);
+  assertInvalid({
+    manifestDigest: "e".repeat(64),
+  }, /tree, sole parent, or exact source\/manifest message/u);
+
+  const valid = materializeTargetRelease(state);
+  const subject = `Release codex-review-gate-action ${state.plan.immutable_tag}`;
+  git(state.targetRepo, ["tag", "-f", "-a", "nested-release-object", valid.releaseCommit, "-m", subject]);
+  const nestedObject = git(state.targetRepo, ["rev-parse", "refs/tags/nested-release-object"]);
+  git(state.targetRepo, ["tag", "-f", "-a", state.plan.immutable_tag, nestedObject, "-m", subject]);
+  assert.throws(() => validateTargetReleaseObjects({
+    targetRepo: state.targetRepo,
+    plan: state.plan,
+    releaseCommit: valid.releaseCommit,
+    fullTagObject: git(state.targetRepo, ["rev-parse", `refs/tags/${state.plan.immutable_tag}`]),
+  }), /tag object fields/u);
+});
+
+test("published release objects reject unknown or duplicate commit and tag headers", (t) => {
+  const state = releaseFixture(t);
+  const valid = materializeTargetRelease(state);
+  const commitText = gitObjectBytes(
+    state.targetRepo,
+    "commit",
+    valid.releaseCommit,
+  ).toString("utf8");
+  const tagText = gitObjectBytes(
+    state.targetRepo,
+    "tag",
+    valid.fullTagObject,
+  ).toString("utf8");
+  const installTag = (source) => {
+    const objectId = writeRawGitObject(state.targetRepo, "tag", Buffer.from(source));
+    git(state.targetRepo, ["update-ref", `refs/tags/${state.plan.immutable_tag}`, objectId]);
+    return objectId;
+  };
+  const tagForCommit = (commitId) => tagText.replace(
+    /^object [0-9a-f]{40}$/mu,
+    `object ${commitId}`,
+  );
+  const assertInvalidCommit = (source, pattern) => {
+    const releaseCommit = writeRawGitObject(state.targetRepo, "commit", Buffer.from(source));
+    const fullTagObject = installTag(tagForCommit(releaseCommit));
+    assert.throws(() => validateTargetReleaseObjects({
+      targetRepo: state.targetRepo,
+      plan: state.plan,
+      releaseCommit,
+      fullTagObject,
+    }), pattern);
+  };
+
+  assertInvalidCommit(
+    appendGitObjectHeader(commitText, "encoding UTF-8"),
+    /commit headers differ from the closed release-object policy/u,
+  );
+  assertInvalidCommit(
+    duplicateGitObjectHeader(commitText, "author"),
+    /duplicate author headers/u,
+  );
+  assertInvalidCommit(
+    duplicateGitObjectHeader(commitText, "parent"),
+    /duplicate parent headers/u,
+  );
+
+  const unknownTagObject = installTag(appendGitObjectHeader(tagText, "encoding UTF-8"));
+  assert.throws(() => validateTargetReleaseObjects({
+    targetRepo: state.targetRepo,
+    plan: state.plan,
+    releaseCommit: valid.releaseCommit,
+    fullTagObject: unknownTagObject,
+  }), /tag headers differ from the closed release-object policy/u);
+
+  const duplicateTaggerObject = installTag(duplicateGitObjectHeader(tagText, "tagger"));
+  assert.throws(() => validateTargetReleaseObjects({
+    targetRepo: state.targetRepo,
+    plan: state.plan,
+    releaseCommit: valid.releaseCommit,
+    fullTagObject: duplicateTaggerObject,
+  }), /duplicate tagger headers/u);
+});
+
+test("published release object validation admits an attached annotated-tag signature block", (t) => {
+  const state = releaseFixture(t);
+  const valid = materializeTargetRelease(state);
+  const tagText = gitObjectBytes(
+    state.targetRepo,
+    "tag",
+    valid.fullTagObject,
+  ).toString("utf8");
+  const signedTagText = `${tagText}-----BEGIN PGP SIGNATURE-----\n\nsynthetic-test-signature\n-----END PGP SIGNATURE-----\n`;
+  const fullTagObject = writeRawGitObject(
+    state.targetRepo,
+    "tag",
+    Buffer.from(signedTagText),
+  );
+  git(state.targetRepo, [
+    "update-ref",
+    `refs/tags/${state.plan.immutable_tag}`,
+    fullTagObject,
+  ]);
+  assert.equal(validateTargetReleaseObjects({
+    targetRepo: state.targetRepo,
+    plan: state.plan,
+    releaseCommit: valid.releaseCommit,
+    fullTagObject,
+  }), true);
+});
+
+test("previous_version full-tag peel must equal the wrapper commit parent", (t) => {
+  const state = releaseFixture(t);
+  const valid = materializeTargetRelease(state);
+  write(join(state.targetRepo, "legacy-drift.txt"), "unexpected prior release target\n");
+  const driftedPrevious = commit(state.targetRepo, "Move historical release target");
+  git(state.targetRepo, [
+    "tag",
+    "-f",
+    "-a",
+    `v${state.plan.previous_version}`,
+    driftedPrevious,
+    "-m",
+    `Release codex-review-gate-action v${state.plan.previous_version}`,
+  ]);
+  assert.throws(() => validateTargetReleaseObjects({
+    targetRepo: state.targetRepo,
+    plan: state.plan,
+    releaseCommit: valid.releaseCommit,
+    fullTagObject: valid.fullTagObject,
+  }), /previous_version tag does not identify the wrapper sole parent/u);
+});
+
+test("provenance rejects an invalid stable-alias transition", (t) => {
+  const state = releaseFixture(t);
+  assert.throws(() => finalizeProvenance({
+    candidateDir: state.candidateDir,
+    releaseCommit: "a".repeat(40),
+    fullTagObject: "b".repeat(40),
+    releaseParent: TARGET_HEAD,
+    aliasName: "v2",
+    aliasBefore: "none",
+    aliasMode: "force-with-lease",
+    workflowRef: WORKFLOW_REF,
+    workflowRunId: "1",
+    workflowRunAttempt: "1",
+    outputDir: join(state.root, "bad-assets"),
+  }), /mode\/object relationship/u);
+});
+
+test("public verification detects a same-name Release asset replacement", () => {
+  const initial = canonicalReleaseAssetSnapshot({ assets: [releaseAsset(101)] });
+  assert.equal(initial, canonicalReleaseAssetSnapshot({ assets: [releaseAsset(101)] }));
+  assert.notEqual(initial, canonicalReleaseAssetSnapshot({
+    assets: [releaseAsset(101, { digest: `sha256:${"f".repeat(64)}` })],
+  }));
+  const replacement = canonicalReleaseAssetSnapshot({
+    assets: [releaseAsset(202, {
+      node_id: "RA_202",
+      created_at: "2026-08-25T12:05:00Z",
+      updated_at: "2026-08-25T12:05:00Z",
+      url: "https://api.github.com/repos/JoeyTeng/codex-review-gate-action/releases/assets/202",
+    })],
+  });
+  assert.notEqual(initial, replacement);
+  assert.throws(() => canonicalReleaseAssetSnapshot({
+    assets: [releaseAsset(101, {
+      uploader: { id: 1, node_id: "U_1", login: "other", type: "User" },
+    })],
+  }), /asset metadata differs from policy/u);
+});
+
+test("release inventory fingerprints only decision-relevant stable metadata", () => {
+  const release = {
+    id: 11,
+    node_id: "RE_11",
+    tag_name: "v1.5.1",
+    name: "v1.5.1",
+    body: "legacy release",
+    target_commitish: "master",
+    prerelease: false,
+    draft: false,
+    immutable: true,
+    author: { id: 7, node_id: "U_7", login: "JoeyTeng", type: "User" },
+    assets: [releaseAsset(101, {
+      uploader: { id: 7, node_id: "U_7", login: "JoeyTeng", type: "User" },
+      download_count: 0,
+    })],
+  };
+  const secondRelease = {
+    ...structuredClone(release),
+    id: 12,
+    node_id: "RE_12",
+    tag_name: "v2.0.0",
+    name: "v2.0.0",
+    body: "current release",
+    author: {
+      id: 4700530,
+      node_id: "MDM6QXBwNDcwMDUzMA==",
+      login: "codex-review-gate-action-publisher[bot]",
+      type: "Bot",
+    },
+    assets: [
+      releaseAsset(103, { name: "release-provenance.json.asc" }),
+      releaseAsset(102),
+    ],
+  };
+  const initial = canonicalReleaseInventorySnapshot([[release], [secondRelease]]);
+  const observationalChange = structuredClone(release);
+  observationalChange.assets[0].download_count = 999;
+  observationalChange.assets[0].uploader.avatar_url = "https://avatars.invalid/new";
+  observationalChange.author.html_url = "https://github.com/JoeyTeng";
+  assert.equal(
+    initial,
+    canonicalReleaseInventorySnapshot([[observationalChange], [secondRelease]]),
+  );
+  assert.equal(
+    initial,
+    canonicalReleaseInventorySnapshot([
+      [
+        { ...structuredClone(secondRelease), assets: [...secondRelease.assets].reverse() },
+        structuredClone(observationalChange),
+      ],
+    ]),
+  );
+  const identityChange = structuredClone(release);
+  identityChange.assets[0].id = 202;
+  assert.notEqual(
+    initial,
+    canonicalReleaseInventorySnapshot([[identityChange], [secondRelease]]),
+  );
+  const policyChange = structuredClone(release);
+  policyChange.draft = true;
+  assert.notEqual(
+    initial,
+    canonicalReleaseInventorySnapshot([[policyChange], [secondRelease]]),
   );
   assert.throws(
-    () =>
-      parseVerifiedOpenPgpStatus(
-        {
-          stdout: Buffer.from(""),
-          stderr: Buffer.from(`[GNUPG:] BADSIG ${signing.slice(-16)} bad\n`),
-        },
-        "v2.0.0",
-      ),
-    /rejecting GnuPG signature status/,
+    () => canonicalReleaseAssetSnapshot(release),
+    /asset metadata differs from policy/u,
   );
-  for (const invalidLength of [41, 63]) {
-    const invalidFingerprint = "3".repeat(invalidLength);
+});
+
+test("OpenPGP status must bind the exact signing subkey and primary key", () => {
+  const accepted = parseVerifiedOpenPgpStatus({
+    status: 0,
+    stdout: [
+      `[GNUPG:] GOODSIG ${SUBKEY.slice(-16)} JoeyTeng-Codex`,
+      `[GNUPG:] VALIDSIG ${SUBKEY} 2026-08-25 1800000000 0 4 0 22 8 00 ${PRIMARY}`,
+      "",
+    ].join("\n"),
+  }, "release commit");
+  assert.equal(accepted.primaryFingerprint, PRIMARY);
+  assert.equal(accepted.signingFingerprint, SUBKEY);
+  assert.throws(() => parseVerifiedOpenPgpStatus({
+    status: 0,
+    stdout: [
+      `[GNUPG:] GOODSIG ${SUBKEY.slice(-16)} JoeyTeng-Codex`,
+      `[GNUPG:] VALIDSIG ${PRIMARY} 2026-08-25 1800000000 0 4 0 22 8 00 ${PRIMARY}`,
+      "",
+    ].join("\n"),
+  }, "tag"), /signer policy/u);
+});
+
+test("OpenPGP status rejects every negative signature state even with the expected VALIDSIG", () => {
+  const good = `[GNUPG:] GOODSIG ${SUBKEY.slice(-16)} JoeyTeng-Codex`;
+  const valid = `[GNUPG:] VALIDSIG ${SUBKEY} 2026-08-25 1800000000 0 4 0 22 8 00 ${PRIMARY}`;
+  for (const negative of [
+    `[GNUPG:] BADSIG ${SUBKEY.slice(-16)} JoeyTeng-Codex`,
+    `[GNUPG:] ERRSIG ${SUBKEY.slice(-16)} 22 8 00 1800000000 9 ${SUBKEY}`,
+    `[GNUPG:] REVKEYSIG ${SUBKEY} JoeyTeng-Codex`,
+    `[GNUPG:] EXPKEYSIG ${SUBKEY} JoeyTeng-Codex`,
+    `[GNUPG:] KEYEXPIRED 1800000000`,
+    `[GNUPG:] KEYREVOKED`,
+    `[GNUPG:] NO_PUBKEY ${SUBKEY.slice(-16)}`,
+    `[GNUPG:] EXPSIG ${SUBKEY} JoeyTeng-Codex`,
+    `[GNUPG:] FAILURE verify 33554433`,
+    `[GNUPG:] ERROR verify 33554433`,
+    `[GNUPG:] SIGEXPIRED 1800000000`,
+  ]) {
     assert.throws(
-      () =>
-        parseVerifiedOpenPgpStatus(
-          {
-            stdout: Buffer.from(""),
-            stderr: Buffer.from(
-              "[GNUPG:] GOODSIG 3333333333333333 Invalid Length\n" +
-                `[GNUPG:] VALIDSIG ${invalidFingerprint} 2026-08-13 0 0 0 0 0 0 00 ${primary}\n`,
-            ),
-          },
-          "v2.0.0",
-        ),
-      /inconsistent GOODSIG\/VALIDSIG identity/,
+      () => parseVerifiedOpenPgpStatus({
+        status: 0,
+        stdout: `${negative}\n${good}\n${valid}\n`,
+      }, "detached provenance"),
+      `must reject ${negative}`,
     );
   }
 });
 
-test("generator emits complete v2-only split, tag, tree, and frozen-ref provenance", (t) => {
-  const fixture = createGeneratorFixture(t);
-  const output = join(fixture.root, "provenance.json");
-  const result = runGenerator(fixture, output);
-  assert.equal(result.status, 0, result.stderr);
-  const manifest = JSON.parse(readFileSync(output, "utf8"));
+test("OpenPGP status accepts exactly one expected VALIDSIG", () => {
+  const good = `[GNUPG:] GOODSIG ${SUBKEY.slice(-16)} JoeyTeng-Codex`;
+  const valid = `[GNUPG:] VALIDSIG ${SUBKEY} 2026-08-25 1800000000 0 4 0 22 8 00 ${PRIMARY}`;
+  assert.throws(() => parseVerifiedOpenPgpStatus({ status: 0, stdout: "" }, "release commit"),
+    /exactly one GOODSIG and one VALIDSIG/u);
+  assert.throws(() => parseVerifiedOpenPgpStatus({
+    status: 0,
+    stdout: `${good}\n${valid}\n${valid}\n`,
+  }, "release commit"), /exactly one GOODSIG and one VALIDSIG/u);
+  assert.throws(() => parseVerifiedOpenPgpStatus({
+    status: 0,
+    stdout: `${good}\n${valid}\n[GNUPG:] VALIDSIG ${PRIMARY} 2026-08-25 1800000000 0 4 0 22 8 00 ${PRIMARY}\n`,
+  }, "release commit"), /exactly one GOODSIG and one VALIDSIG/u);
+  assert.throws(() => parseVerifiedOpenPgpStatus({
+    status: 0,
+    stdout: `${good}\n${good}\n${valid}\n`,
+  }, "release commit"), /exactly one GOODSIG and one VALIDSIG/u);
+});
+
+test("GitHub GPG inventory selects exactly one current pinned signing certificate", () => {
+  const selected = {
+    id: 5277815,
+    primary_key_id: null,
+    key_id: PRIMARY.slice(-16),
+    raw_key: RELEASE_SIGNING_PUBLIC_KEY,
+    revoked: false,
+    expires_at: null,
+    can_sign: true,
+    subkeys: [{
+      id: 5277817,
+      primary_key_id: 5277815,
+      key_id: SUBKEY.slice(-16),
+      revoked: false,
+      expires_at: null,
+      can_sign: true,
+    }],
+  };
+  const options = { primaryFingerprint: PRIMARY, signingFingerprint: SUBKEY };
   assert.equal(
-    manifest.$schema,
-    "urn:joey-tools:codex-review-gate:action-release-provenance:3",
+    validateGitHubSigningKeyInventory([selected], options),
+    RELEASE_SIGNING_PUBLIC_KEY,
   );
-  assert.equal(manifest.source.commit_oid, fixture.sourceCommit);
-  const sourcePackageBytes = readFileSync(
-    join(fixture.sourceRepo, "package.json"),
-  );
-  const sourcePackageOid = gitText(fixture.sourceRepo, [
-    "rev-parse",
-    `${fixture.sourceCommit}:package.json`,
+
+  for (const malformed of [null, {}, "unreadable", [null]]) {
+    assert.throws(
+      () => validateGitHubSigningKeyInventory(malformed, options),
+      `must reject malformed GitHub GPG response: ${JSON.stringify(malformed)}`,
+    );
+  }
+  assert.throws(() => validateGitHubSigningKeyInventory([], options));
+  assert.throws(() => validateGitHubSigningKeyInventory([
+    selected,
+    { ...structuredClone(selected), id: 201 },
+  ], options));
+
+  const rejectMutation = (label, mutate) => {
+    const inventory = [structuredClone(selected)];
+    mutate(inventory[0]);
+    assert.throws(
+      () => validateGitHubSigningKeyInventory(inventory, options),
+      `must reject GitHub GPG inventory with ${label}`,
+    );
+  };
+  rejectMutation("revoked primary", (key) => { key.revoked = true; });
+  rejectMutation("expiring primary", (key) => { key.expires_at = "2027-01-01T00:00:00Z"; });
+  rejectMutation("non-signing primary", (key) => { key.can_sign = false; });
+  rejectMutation("missing raw public key", (key) => { key.raw_key = null; });
+  rejectMutation("mismatched primary key ID", (key) => { key.key_id = "0".repeat(16); });
+  rejectMutation("missing signing subkey", (key) => { key.subkeys = []; });
+  rejectMutation("duplicate signing subkey", (key) => {
+    key.subkeys.push({ ...structuredClone(key.subkeys[0]), id: 103 });
+  });
+  rejectMutation("revoked signing subkey", (key) => { key.subkeys[0].revoked = true; });
+  rejectMutation("expiring signing subkey", (key) => {
+    key.subkeys[0].expires_at = "2027-01-01T00:00:00Z";
+  });
+  rejectMutation("non-signing subkey", (key) => { key.subkeys[0].can_sign = false; });
+  rejectMutation("unlinked signing subkey", (key) => { key.subkeys[0].primary_key_id = 999; });
+  rejectMutation("mismatched signing key ID", (key) => { key.subkeys[0].key_id = "0".repeat(16); });
+
+  rejectMutation("raw key content mismatch", (key) => {
+    key.raw_key = key.raw_key.replace("Y29ZomqF1Ca0", "Y29ZomqF1Ca1");
+  });
+});
+
+test("release keyring requires one valid non-expiring signing secret subkey", (t) => {
+  const root = mkdtempSync("/tmp/release-signing-keyring-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceHome = join(root, "source");
+  const validHome = join(root, "valid");
+  mkdirSync(sourceHome, { mode: 0o700 });
+  mkdirSync(validHome, { mode: 0o700 });
+  gpg(sourceHome, [
+    "--passphrase", "",
+    "--quick-generate-key",
+    "Release Pipeline Test <release-pipeline@example.invalid>",
+    "ed25519", "cert", "0",
   ]);
-  assert.deepEqual(manifest.source.package_identity, {
-    role: "v2-source-package",
-    path: "package.json",
-    object_oid: sourcePackageOid,
-    sha256: createHash("sha256").update(sourcePackageBytes).digest("hex"),
-    name: SOURCE_PACKAGE_IDENTITY.name,
-    version: SOURCE_PACKAGE_IDENTITY.version,
-    repository_url: SOURCE_PACKAGE_IDENTITY.repository.url,
-  });
-  assert.equal(manifest.action.commit_oid, fixture.actionCommit);
-  assert.equal(manifest.action.source_subtree_tree_equal, true);
-  assert.deepEqual(manifest.release.selector_policy.admitted, ["v2.0.0", "v2.0", "v2"]);
-  assert.equal(manifest.release.selector_policy.v1_refs_admitted, false);
-  assert.equal(manifest.remote_state.target.no_v1_refs, true);
-  assert.equal(manifest.remote_state.frozen_personal.all_refs_equal_recorded_baseline, true);
-  assert.equal(manifest.history.transferred_initial_heads.commit_count, 21);
-  assert.equal(manifest.history.transferred_initial_heads.root_count, 2);
-  assert.equal(manifest.history.transferred_master_is_ancestor, true);
-  assert.ok(manifest.history.release_split.commit_count >= 15);
-  assert.ok(manifest.released_tree.entry_count >= 14);
-  assert.equal(manifest.runtime_identity.public_entry.path, "action.yml");
-  assert.equal(manifest.runtime_identity.reusable_workflow.path, ".github/workflows/codex-review-gate.yml");
-  assert.equal(
-    manifest.runtime_identity.reconciliation_workflow.path,
-    ".github/workflows/codex-review-gate-reconcile.yml",
-  );
-  assert.equal(manifest.runtime_identity.controller.path, "src/v2/workflow-controller.mjs");
-  assert.equal(manifest.runtime_identity.plan_adapter.path, "src/v2/action.mjs");
-  assert.deepEqual(
-    manifest.runtime_identity.runtime_modules.map(({ path }) => path),
-    EXPECTED_V2_RUNTIME_MODULE_PATHS,
-  );
-  const policyBytes = readFileSync(
-    join(fixture.actionRepo, EVIDENCE_AUTHORITY_POLICY_PATH),
-  );
-  const policySha256 = createHash("sha256").update(policyBytes).digest("hex");
-  const policyTreeEntry = manifest.released_tree.entries.find(
-    ({ path }) => path === EVIDENCE_AUTHORITY_POLICY_PATH,
-  );
-  assert.ok(policyTreeEntry);
-  assert.deepEqual(manifest.runtime_identity.evidence_authority_policy, {
-    role: "v2-evidence-authority-policy",
-    path: EVIDENCE_AUTHORITY_POLICY_PATH,
-    object_oid: policyTreeEntry.object_oid,
-    sha256: policySha256,
-    policy_digest: `sha256:${policySha256}`,
-  });
-  const actionPackageBytes = readFileSync(
-    join(fixture.actionRepo, "package.json"),
-  );
-  const actionPackageTreeEntry = manifest.released_tree.entries.find(
-    ({ path }) => path === "package.json",
-  );
-  assert.ok(actionPackageTreeEntry);
-  assert.deepEqual(manifest.runtime_identity.package, {
-    role: "v2-action-package",
-    path: "package.json",
-    object_oid: actionPackageTreeEntry.object_oid,
-    sha256: createHash("sha256").update(actionPackageBytes).digest("hex"),
-    name: ACTION_PACKAGE_IDENTITY.name,
-    version: ACTION_PACKAGE_IDENTITY.version,
-    repository_url: ACTION_PACKAGE_IDENTITY.repository.url,
-  });
-  const releasedPaths = new Set(
-    manifest.released_tree.entries.map(({ path }) => path),
-  );
-  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
-    assert.equal(existsSync(join(fixture.sourceRepo, path)), true);
-    assert.equal(releasedPaths.has(path), false);
-  }
-  assert.doesNotMatch(
-    JSON.stringify(manifest.runtime_identity),
-    /required-ci/u,
-  );
-  assert.equal(manifest.runtime_identity.legacy_files_policy.selector_compatibility_granted, false);
-  for (const tag of ["v2.0.0", "v2.0", "v2"]) {
-    assert.equal(manifest.tags[tag].direct, true);
-    assert.equal(manifest.tags[tag].peeled_commit_oid, fixture.actionCommit);
-    assert.equal(manifest.tags[tag].signature.method, "closed-test-only-skip");
-  }
+  const [primary] = keyFingerprints(sourceHome);
+  gpg(sourceHome, ["--passphrase", "", "--quick-add-key", primary, "ed25519", "sign", "0"]);
+  gpg(sourceHome, ["--passphrase", "", "--quick-add-key", primary, "cv25519", "encr", "0"]);
+  const [, signing, encryption] = keyFingerprints(sourceHome);
+  const publicPath = join(root, "public.asc");
+  const signingSecretPath = join(root, "signing-secret.asc");
+  const encryptionSecretPath = join(root, "encryption-secret.asc");
+  gpg(sourceHome, ["--armor", "--output", publicPath, "--export", primary]);
+  gpg(sourceHome, [
+    "--passphrase", "", "--armor", "--output", signingSecretPath,
+    "--export-secret-subkeys", `${signing}!`,
+  ]);
+  gpg(sourceHome, [
+    "--passphrase", "", "--armor", "--output", encryptionSecretPath,
+    "--export-secret-subkeys", `${encryption}!`,
+  ]);
+  gpg(validHome, ["--import", publicPath]);
+  gpg(validHome, ["--import", signingSecretPath]);
+  assert.equal(validateSigningKeyHome({
+    gnupgHome: validHome,
+    primaryFingerprint: primary,
+    signingFingerprint: signing,
+  }), true);
+  assert.throws(() => validateSigningKeyHome({
+    gnupgHome: sourceHome,
+    primaryFingerprint: primary,
+    signingFingerprint: signing,
+  }), /no primary secret material/u);
+  gpg(validHome, ["--import", encryptionSecretPath]);
+  assert.throws(() => validateSigningKeyHome({
+    gnupgHome: validHome,
+    primaryFingerprint: primary,
+    signingFingerprint: signing,
+  }), /exactly one valid non-expiring pinned signing subkey/u);
 });
 
-test("a newly added canonical v2 module cannot escape runtime identity", (t) => {
-  const futureModulePath = "src/v2/zz-future-module.mjs";
-  const fixture = createGeneratorFixture(t, {
-    extraRuntimeModulePaths: [futureModulePath],
-  });
-  const output = join(fixture.root, "future-module-provenance.json");
-  const result = runGenerator(fixture, output);
-  assert.equal(result.status, 0, result.stderr);
-  const manifest = JSON.parse(readFileSync(output, "utf8"));
-  assert.deepEqual(
-    manifest.runtime_identity.runtime_modules.map(({ path }) => path),
-    [...EXPECTED_V2_RUNTIME_MODULE_PATHS, futureModulePath].sort(compareUtf8Paths),
-  );
-});
-
-test("generator rejects a missing evidence authority policy without publishing", (t) => {
-  const fixture = createGeneratorFixture(t, {
-    omitEvidenceAuthorityPolicy: true,
-  });
-  const output = join(fixture.root, "missing-policy-provenance.json");
-  const result = runGenerator(fixture, output);
-  assert.notEqual(result.status, 0);
-  assert.match(
-    result.stderr,
-    /missing required v2 identity github-codex-evidence-authority-v2\.json/u,
-  );
-  assert.equal(existsSync(output), false);
-});
-
-test("generator rejects stale source and action package identities", async (t) => {
-  await t.test("source package", () => {
-    const fixture = createGeneratorFixture(t);
-    writeJson(join(fixture.sourceRepo, "package.json"), {
-      ...SOURCE_PACKAGE_IDENTITY,
-      version: "1.5.1",
-      private: true,
-      type: "module",
-    });
-    const staleSourceCommit = commitAll(fixture.sourceRepo, "stale source package");
-    const output = join(fixture.root, "stale-source-package.json");
-    const result = runGenerator(fixture, output, {
-      sourceRef: staleSourceCommit,
-    });
-    assert.notEqual(result.status, 0);
-    assert.match(
-      result.stderr,
-      /source package\.json must identify codex-review-gate-source@2\.0\.0/u,
-    );
-    assert.equal(existsSync(output), false);
-  });
-
-  await t.test("action package", () => {
-    const fixture = createGeneratorFixture(t, {
-      actionPackageIdentity: {
-        ...ACTION_PACKAGE_IDENTITY,
-        repository: {
-          type: "git",
-          url: "git+https://github.com/JoeyTeng/codex-review-gate-action.git",
-        },
-      },
-    });
-    const output = join(fixture.root, "stale-action-package.json");
-    const result = runGenerator(fixture, output);
-    assert.notEqual(result.status, 0);
-    assert.match(
-      result.stderr,
-      /released package\.json must identify codex-review-gate-action@2\.0\.0/u,
-    );
-    assert.equal(existsSync(output), false);
-  });
-});
-
-test("generator ignores ambient Git repository and config injection", (t) => {
-  const fixture = createGeneratorFixture(t);
-  const rogueRepository = join(fixture.root, "rogue");
-  initialiseRepository(rogueRepository);
-  writeText(join(rogueRepository, "rogue.txt"), "not the release repository\n");
-  commitAll(rogueRepository, "rogue");
-  const output = join(fixture.root, "ambient-git.json");
-  const result = runGenerator(fixture, output, {
-    env: {
-      GIT_CONFIG_COUNT: "1",
-      GIT_CONFIG_KEY_0: "core.repositoryformatversion",
-      GIT_CONFIG_VALUE_0: "99",
-      GIT_DIR: join(rogueRepository, ".git"),
-      GIT_WORK_TREE: rogueRepository,
-    },
-  });
-  assert.equal(result.status, 0, result.stderr);
-  const manifest = JSON.parse(readFileSync(output, "utf8"));
-  assert.equal(manifest.source.commit_oid, fixture.sourceCommit);
-  assert.equal(manifest.action.commit_oid, fixture.actionCommit);
-});
-
-test("generator rejects any target v1 ref without publishing a manifest", (t) => {
-  const fixture = createGeneratorFixture(t);
-  const mutatedTarget = join(fixture.root, "target-v1.tsv");
-  writeRefSnapshot(mutatedTarget, {
-    ...fixture.targetRefs,
-    "refs/tags/v1": fixture.actionCommit,
-  });
-  const output = join(fixture.root, "rejected.json");
-  const result = runGenerator(fixture, output, { targetPath: mutatedTarget });
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /differs from the frozen contract|v1 ref is forbidden/);
-  assert.equal(existsSync(output), false);
-});
-
-test("generator rejects source/action tree mismatch without publishing", (t) => {
-  const fixture = createGeneratorFixture(t);
-  writeText(join(fixture.sourceRepo, "packages", "action", "extra.txt"), "changed\n");
-  const changedSource = commitAll(fixture.sourceRepo, "mutate source tree");
-  const output = join(fixture.root, "tree-mismatch.json");
-  const result = runGenerator(fixture, output, { sourceRef: changedSource });
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /source packages\/action tree differs/);
-  assert.equal(existsSync(output), false);
-});
-
-test("production generation cannot activate the signature bypass", (t) => {
-  const fixture = createGeneratorFixture(t);
-  const output = join(fixture.root, "production-bypass.json");
-  const result = spawnSync(
-    process.execPath,
-    [
-      generatorPath,
-      "--source-repo",
-      fixture.sourceRepo,
-      "--source-ref",
-      fixture.sourceCommit,
-      "--action-repo",
-      fixture.actionRepo,
-      "--action-ref",
-      fixture.actionCommit,
-      "--target-refs",
-      fixture.targetPath,
-      "--frozen-refs",
-      fixture.frozenPath,
-      "--baseline",
-      fixture.baselinePath,
-      "--output",
-      output,
-      "--test-only-skip-signatures",
-    ],
-    {
-      encoding: "utf8",
-      env: { ...testEnvironment, CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "0" },
-    },
-  );
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /closed test environment/);
-  assert.equal(existsSync(output), false);
-});
-
-test("production rejects a rewritten repository freeze baseline", (t) => {
-  const fixture = createGeneratorFixture(t);
-  const baseline = JSON.parse(readFileSync(fixture.baselinePath, "utf8"));
-  baseline.frozen_repository.refs["refs/heads/master"] = "f".repeat(40);
-  writeJson(fixture.baselinePath, baseline);
-  const output = join(fixture.root, "rewritten-baseline.json");
-  const result = spawnSync(
-    process.execPath,
-    [
-      generatorPath,
-      "--source-repo",
-      fixture.sourceRepo,
-      "--source-ref",
-      fixture.sourceCommit,
-      "--action-repo",
-      fixture.actionRepo,
-      "--action-ref",
-      fixture.actionCommit,
-      "--target-refs",
-      fixture.targetPath,
-      "--frozen-refs",
-      fixture.frozenPath,
-      "--baseline",
-      fixture.baselinePath,
-      "--expected-signing-fingerprint",
-      "A".repeat(40),
-      "--output",
-      output,
-    ],
-    {
-      encoding: "utf8",
-      env: {
-        ...testEnvironment,
-        CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "0",
-      },
-    },
-  );
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /source release contract|permanent production freeze/);
-  assert.equal(existsSync(output), false);
-});
-
-test("production generation rejects unsigned annotated tags", (t) => {
-  const fixture = createGeneratorFixture(t);
-  const output = join(fixture.root, "unsigned.json");
-  const result = spawnSync(
-    process.execPath,
-    [
-      generatorPath,
-      "--source-repo",
-      fixture.sourceRepo,
-      "--source-ref",
-      fixture.sourceCommit,
-      "--action-repo",
-      fixture.actionRepo,
-      "--action-ref",
-      fixture.actionCommit,
-      "--target-refs",
-      fixture.targetPath,
-      "--frozen-refs",
-      fixture.frozenPath,
-      "--baseline",
-      fixture.baselinePath,
-      "--expected-signing-fingerprint",
-      "A".repeat(40),
-      "--output",
-      output,
-    ],
-    { encoding: "utf8", env: testEnvironment },
-  );
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /OpenPGP signature verification failed/);
-  assert.equal(existsSync(output), false);
-});
-
-test("production signature verification ignores a malicious repo-local GPG program", (t) => {
-  const fixture = createGeneratorFixture(t);
-  const marker = join(fixture.root, "fake-gpg-ran");
-  const fakeGpg = join(fixture.root, "fake-gpg");
-  writeText(
-    fakeGpg,
-    `#!/bin/sh
-printf 'ran\n' > ${JSON.stringify(marker)}
-printf '%s\n' '[GNUPG:] GOODSIG 0123456789ABCDEF Fake Signer'
-printf '%s\n' '[GNUPG:] VALIDSIG 0000000000000000000000000123456789ABCDEF 2026-08-13 0 0 0 0 0 0 00 0000000000000000000000000123456789ABCDEF'
-exit 0
-`,
-    0o755,
-  );
-  git(fixture.actionRepo, ["config", "gpg.program", fakeGpg]);
-  git(fixture.actionRepo, ["config", "gpg.openpgp.program", fakeGpg]);
-  const output = join(fixture.root, "malicious-gpg.json");
-  const result = spawnSync(
-    process.execPath,
-    [
-      generatorPath,
-      "--source-repo",
-      fixture.sourceRepo,
-      "--source-ref",
-      fixture.sourceCommit,
-      "--action-repo",
-      fixture.actionRepo,
-      "--action-ref",
-      fixture.actionCommit,
-      "--target-refs",
-      fixture.targetPath,
-      "--frozen-refs",
-      fixture.frozenPath,
-      "--baseline",
-      fixture.baselinePath,
-      "--expected-signing-fingerprint",
-      "A".repeat(40),
-      "--output",
-      output,
-    ],
-    { encoding: "utf8", env: testEnvironment },
-  );
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /OpenPGP signature verification failed/);
-  assert.equal(existsSync(marker), false);
-  assert.equal(existsSync(output), false);
-});
-
-test("final pre-publication audit failure publishes no manifest", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-pre-publish-race-"));
+test("release keyring rejects even a still-valid key that carries an expiry", (t) => {
+  const root = mkdtempSync("/tmp/release-expiring-keyring-");
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const phases = [];
-  await assert.rejects(
-    writeManifest(output, { release: "2.0.0" }, {
-      beforePublish: async () => phases.push("before"),
-      afterStagingValidation: async () => phases.push("staged"),
-      finalPrePublish: async () => {
-        phases.push("final");
-        throw new Error("simulated final ref drift");
-      },
-    }),
-    /simulated final ref drift/,
-  );
-  assert.deepEqual(phases, ["before", "staged", "final"]);
-  assert.equal(existsSync(output), false);
+  const sourceHome = join(root, "source");
+  const strippedHome = join(root, "stripped");
+  mkdirSync(sourceHome, { mode: 0o700 });
+  mkdirSync(strippedHome, { mode: 0o700 });
+  gpg(sourceHome, [
+    "--passphrase", "",
+    "--quick-generate-key",
+    "Expiring Release Test <expiring-release@example.invalid>",
+    "ed25519", "cert", "1d",
+  ]);
+  const [primary] = keyFingerprints(sourceHome);
+  gpg(sourceHome, ["--passphrase", "", "--quick-add-key", primary, "ed25519", "sign", "1d"]);
+  const [, signing] = keyFingerprints(sourceHome);
+  const publicPath = join(root, "public.asc");
+  const signingSecretPath = join(root, "signing-secret.asc");
+  gpg(sourceHome, ["--armor", "--output", publicPath, "--export", primary]);
+  gpg(sourceHome, [
+    "--passphrase", "", "--armor", "--output", signingSecretPath,
+    "--export-secret-subkeys", `${signing}!`,
+  ]);
+  gpg(strippedHome, ["--import", publicPath]);
+  gpg(strippedHome, ["--import", signingSecretPath]);
+  assert.throws(() => validateSigningKeyHome({
+    gnupgHome: strippedHome,
+    primaryFingerprint: primary,
+    signingFingerprint: signing,
+  }), /valid non-expiring pinned primary key/u);
 });
 
-test("writeManifest publishes a private create-only file with a stable digest", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-publication-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const manifest = { release: "2.0.0", commit: "a".repeat(40) };
-  const result = await writeManifest(output, manifest);
-  const bytes = readFileSync(output);
-  assert.equal(result.absoluteOutput, output);
-  assert.equal(result.digest, createHash("sha256").update(bytes).digest("hex"));
-  assert.equal(lstatSync(output).mode & 0o777, 0o600);
-  assert.deepEqual(JSON.parse(bytes), manifest);
+test("runtime discovery admits only the declared v2 runtime module", () => {
+  assert.deepEqual(discoverV2RuntimeModulePaths({
+    "src/v2/gate-runtime.mjs": {},
+    ".github/workflows/codex-review-gate.yml": {},
+    "action.yml": {},
+  }), ["src/v2/gate-runtime.mjs"]);
 });
 
-test("writeManifest never overwrites an existing output", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-existing-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  writeText(output, "keep me\n");
-  await assert.rejects(
-    writeManifest(output, { release: "2.0.0" }),
-    /output already exists; refusing to replace/,
-  );
-  assert.equal(readFileSync(output, "utf8"), "keep me\n");
-});
-
-test("writeManifest preserves a concurrent winner at the create-only boundary", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-race-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  await assert.rejects(
-    writeManifest(output, { release: "2.0.0" }, {
-      finalPrePublish: async () => writeFileSync(output, "winner\n"),
-    }),
-    /output already exists; refusing to replace/,
-  );
-  assert.equal(readFileSync(output, "utf8"), "winner\n");
-});
-
-test("writeManifest revalidates staged content immediately before linking", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-stage-mutate-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  await assert.rejects(
-    writeManifest(output, { release: "2.0.0" }, {
-      afterStagingValidation: async () => {
-        const stagingName = readdirSync(root).find((name) =>
-          name.startsWith("manifest.json.tmp-"));
-        assert.ok(stagingName);
-        const stagingPath = join(root, stagingName, "manifest");
-        const intended = readFileSync(stagingPath);
-        writeFileSync(stagingPath, Buffer.alloc(intended.length, "x"));
-      },
-    }),
-    /manifest staging object content differs from the intended manifest/,
-  );
-  assert.equal(existsSync(output), false);
-});
-
-test("writeManifest retains a linked output after a post-link audit failure", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-post-link-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  await assert.rejects(
-    writeManifest(output, { release: "2.0.0" }, {
-      afterLink: async () => {
-        throw new Error("simulated audit failure");
-      },
-    }),
-    /leaving the final output path untouched/,
-  );
-  assert.equal(JSON.parse(readFileSync(output, "utf8")).release, "2.0.0");
-});
-
-test("post-publication failure preserves this invocation's linked output for audit", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-post-publish-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const manifest = { release: "2.0.0", audit: true };
-  const expected = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-  let linkedIdentity;
-  await assert.rejects(
-    writeManifest(output, manifest, {
-      afterPublish: async () => {
-        linkedIdentity = lstatSync(output, { bigint: true });
-        throw new Error("simulated post-publication ref drift");
-      },
-    }),
-    /leaving the final output path untouched.*use a new output path for retry/,
-  );
-  const retainedIdentity = lstatSync(output, { bigint: true });
-  assert.equal(retainedIdentity.dev, linkedIdentity.dev);
-  assert.equal(retainedIdentity.ino, linkedIdentity.ino);
-  assert.deepEqual(readFileSync(output), expected);
-});
-
-test("post-publication failure never removes a replacement output", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-post-replace-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const replacementPath = join(root, "replacement.json");
-  const replacement = Buffer.from("replacement audit object\n");
-  writeFileSync(replacementPath, replacement, { mode: 0o600 });
-  await assert.rejects(
-    writeManifest(output, { release: "2.0.0" }, {
-      afterPublish: async () => {
-        renameSync(replacementPath, output);
-        throw new Error("simulated post-publication ref drift");
-      },
-    }),
-    /leaving the final output path untouched.*use a new output path for retry/,
-  );
-  assert.deepEqual(readFileSync(output), replacement);
-});
-
-test("post-link identity validation preserves an early replacement", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-link-replace-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const replacementPath = join(root, "replacement.json");
-  const replacement = Buffer.from("early replacement\n");
-  writeFileSync(replacementPath, replacement, { mode: 0o600 });
-  await assert.rejects(
-    writeManifest(output, { release: "2.0.0" }, {
-      afterLink: async () => renameSync(replacementPath, output),
-    }),
-    /leaving the final output path untouched.*use a new output path for retry/,
-  );
-  assert.deepEqual(readFileSync(output), replacement);
-});
-
-test("post-link validation rejects a silent same-object content mutation", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-link-mutate-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const manifest = { release: "2.0.0", mutate: "after-link" };
-  const intended = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-  const changed = Buffer.alloc(intended.length, "x");
-  let linkedIdentity;
-  await assert.rejects(
-    writeManifest(output, manifest, {
-      afterLink: async () => {
-        linkedIdentity = lstatSync(output, { bigint: true });
-        writeFileSync(output, changed);
-      },
-    }),
-    /published manifest content differs from the intended manifest/,
-  );
-  const retainedIdentity = lstatSync(output, { bigint: true });
-  assert.equal(retainedIdentity.dev, linkedIdentity.dev);
-  assert.equal(retainedIdentity.ino, linkedIdentity.ino);
-  assert.deepEqual(readFileSync(output), changed);
-});
-
-test("post-link failure distinguishes a moved final path from retained output", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-post-move-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const moved = join(root, "manifest.moved.json");
-  const manifest = { release: "2.0.0", moved: true };
-  await assert.rejects(
-    writeManifest(output, manifest, {
-      afterLink: async () => renameSync(output, moved),
-    }),
-    /leaving the final output path untouched.*use a new output path for retry/,
-  );
-  assert.equal(existsSync(output), false);
-  assert.deepEqual(JSON.parse(readFileSync(moved, "utf8")), manifest);
-});
-
-test("post-publication failure never unlinks an in-place changed object", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-post-mutate-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const manifest = { release: "2.0.0", mutate: true };
-  const intended = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-  const changed = Buffer.alloc(intended.length, "x");
-  let linkedIdentity;
-  await assert.rejects(
-    writeManifest(output, manifest, {
-      afterPublish: async () => {
-        linkedIdentity = lstatSync(output, { bigint: true });
-        writeFileSync(output, changed);
-        const changedIdentity = lstatSync(output, { bigint: true });
-        assert.equal(changedIdentity.dev, linkedIdentity.dev);
-        assert.equal(changedIdentity.ino, linkedIdentity.ino);
-        throw new Error("simulated in-place mutation");
-      },
-    }),
-    /leaving the final output path untouched.*use a new output path for retry/,
-  );
-  const retainedIdentity = lstatSync(output, { bigint: true });
-  assert.equal(retainedIdentity.dev, linkedIdentity.dev);
-  assert.equal(retainedIdentity.ino, linkedIdentity.ino);
-  assert.deepEqual(readFileSync(output), changed);
-});
-
-test("final audit revalidation rejects a silent same-object content mutation", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-final-mutate-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  const manifest = { release: "2.0.0", mutate: "after-audit" };
-  const intended = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-  const changed = Buffer.alloc(intended.length, "x");
-  let linkedIdentity;
-  await assert.rejects(
-    writeManifest(output, manifest, {
-      afterPublish: async () => {
-        linkedIdentity = lstatSync(output, { bigint: true });
-        writeFileSync(output, changed);
-      },
-    }),
-    /published manifest after final audit content differs from the intended manifest/,
-  );
-  const retainedIdentity = lstatSync(output, { bigint: true });
-  assert.equal(retainedIdentity.dev, linkedIdentity.dev);
-  assert.equal(retainedIdentity.ino, linkedIdentity.ino);
-  assert.deepEqual(readFileSync(output), changed);
-});
-
-test("same-process concurrent invocations cannot collide on private staging", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "manifest-concurrent-stage-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const output = join(root, "manifest.json");
-  let releaseFirst;
-  let reportFirstReady;
-  const firstReady = new Promise((resolveReady) => {
-    reportFirstReady = resolveReady;
-  });
-  const firstMayPublish = new Promise((resolvePublish) => {
-    releaseFirst = resolvePublish;
-  });
-  const first = assert.rejects(
-    writeManifest(output, { invocation: "first" }, {
-      finalPrePublish: async () => {
-        reportFirstReady();
-        await firstMayPublish;
-      },
-    }),
-    /output already exists; refusing to replace/,
-  );
-  await firstReady;
-  const second = { invocation: "second" };
-  await writeManifest(output, second);
-  releaseFirst();
-  await first;
-  assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), second);
-});
-
-test("post-link staging cleanup failure preserves the primary audit error", async (t) => {
-  if (typeof process.getuid !== "function" || process.getuid() === 0) {
-    t.skip("permission-based staging cleanup fault requires a non-root POSIX user");
-    return;
-  }
-  const root = mkdtempSync(join(tmpdir(), "manifest-cleanup-failure-"));
-  t.after(() => {
-    chmodSync(root, 0o700);
-    rmSync(root, { recursive: true, force: true });
-  });
-  const output = join(root, "manifest.json");
+test("manifest writer is create-only and byte-stable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "release-provenance-write-"));
   try {
-    await assert.rejects(
-      writeManifest(output, { release: "2.0.0" }, {
-        afterPublish: async () => {
-          chmodSync(root, 0o500);
-          throw new Error("simulated post-publication ref drift");
-        },
-      }),
-      (error) => {
-        assert.ok(error instanceof AggregateError);
-        assert.match(error.message, /simulated post-publication ref drift/);
-        assert.match(error.message, /staging cleanup also failed/);
-        assert.match(error.message, /leaving the final output path untouched/);
-        assert.ok(error.errors.length >= 2);
-        return true;
-      },
-    );
+    const path = join(root, "release-provenance.json");
+    const result = await writeManifest(path, { schema: "test", value: 2 });
+    assert.match(result.digest, /^[0-9a-f]{64}$/u);
+    assert.equal(readFileSync(path, "utf8"), '{\n  "schema": "test",\n  "value": 2\n}\n');
+    await assert.rejects(() => writeManifest(path, { changed: true }), /EEXIST/u);
   } finally {
-    chmodSync(root, 0o700);
+    rmSync(root, { recursive: true, force: true });
   }
-  assert.equal(existsSync(output), true);
 });

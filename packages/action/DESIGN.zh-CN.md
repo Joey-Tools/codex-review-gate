@@ -1,402 +1,368 @@
-# Codex Review Gate v2 Design
+# Codex Review Gate v2 设计
 
 语言：[British English (en-GB)](DESIGN.md) | [简体中文 (zh-CN)](DESIGN.zh-CN.md)
 
-## 目标和 activation 状态
+## 目标
 
-V2 把一份 sealed Codex provider-evidence snapshot 归并为 closed decision，再由 trusted
-controller 按 durable order 执行已授权的 request、status 和 sticky-projection effect。
-公开 status context 是 `codex/github-review-gate`。
+v2 为单个 PR 提供低成本、fail-closed 的 required status。存在符合条件的 Codex
+finding、证据不完整或不稳定，或者所选 PR head 已变化时，它绝不能报告 success。
+它优先从 GitHub 当前状态恢复，而不是依赖持久私有状态；write 结果不确定时，允许
+少量 at-least-once duplicate。
 
-公开 trust boundary 是 organization reusable workflow：
+现有 GitHub controls 保持各自原生职责：
+
+- GitHub 保存 PR lifecycle、comments、reviews 和 reactions；
+- consumer workflow 负责窄 event admission、permissions 和 serialisation；
+- Action 重建并归约 non-inline Codex evidence；
+- ruleset 要求 status、branch freshness、resolved conversations 和
+  non-fast-forward protection；
+- merge agent 通过 exact-current-head reconcile 和 final server-side reread 闭环。
+
+Action 不是第二套 conversation resolver 或 branch-protection system。
+
+## 架构和 trust boundaries
+
+```text
+eligible Codex issue_comment   qualifying base retarget   protected workflow_dispatch
+             |                           |                           |
+             +---------------------------+---------------------------+
+                                v
+                copied canonical consumer workflow
+                - pre-runner identity filter
+                - typed inputs and narrow permissions
+                - one-PR concurrency
+                                |
+                                v
+          JoeyTeng/codex-review-gate-action@v2 (API only)
+                - bind one PR and expected head
+                - write pending on that head
+                - rebuild fully paginated evidence
+                - reduce finding / clean / pending
+                - require two stable snapshots for clean
+                                |
+                 +--------------+----------------+
+                 v                               v
+       codex/github-review-gate          summary + best-effort sticky
+                 |
+                 v
+ ruleset: required status + up to date + conversations resolved + no force-push
+```
+
+### Consumer workflow
+
+复制的 canonical workflow 是可信 repository configuration，也是受支持的 consumer
+envelope。裸 Action step 无法负责 events、runner-admission filters、permissions、
+typed dispatch 或 concurrency。
+
+automatic admission 覆盖 `issue_comment` `created`/`edited` 和一个狭窄的
+`pull_request_target` `edited` case。comment admission 在 runner 分配前，把 event
+sender 与 comment author 都精确校验为 login
+`chatgpt-codex-connector[bot]`、type `Bot`。base-edit admission 要求真实的
+`changes.base.ref.from` transition，且 current base 是同仓库 default branch；仅
+title/body edit 不分配 runner。Action 在 admission 后再次校验，因为两次校验保护
+不同边界。
+
+唯一 manual entry 是使用受保护 default-branch workflow 的 `workflow_dispatch`。
+manual inputs 是 closed typed schema，详见 [README.zh-CN.md](README.zh-CN.md)。
+feature-ref dispatch 不受支持。具有 native repository/Actions dispatch 权限的
+same-repository writers 是明确 trust boundary；v2 不维护 hard-coded actor
+allowlist。
+
+没有 cron、`repository_dispatch`、宽泛的 `pull_request` reset job 或可写 status
+的自动 `pull_request_review` job。没有 cron 可以避免 private repositories 为
+no-op run 支付费用。未创建或编辑符合条件 issue comment 的
+review-object/reaction change，通过 manual reconcile 收敛。
+
+所有 runtime jobs 都只调用 API，不 checkout 或执行 consumer/PR code。permission
+ceiling 是：
 
 ```yaml
-uses: Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  statuses: write
 ```
 
-`@v2` 是指向 immutable signed v2 commit 的 release alias。Called job materialize 精确
-selected workflow repository/object。这是 compatible-major 的集中式委托，不允许执行
-consumer repository 中的任意 code。
+runtime 不需要 `actions: read`、checks/content/PR write、OIDC 或专用 GitHub App。
+独立的 publisher App 绝不安装到 consumer repository。
 
-Production activation 仍为 blocked。Trusted production controller-input assembler、
-durable scheduled dispatcher 与 automatic effect protocol 已实现并通过本地门禁；
-publication admission 和 live activation proof 仍是 P0 前置条件。因此当前 package
-记录的是完整 local implementation boundary，不提供 supported required-check rollout。
-缺少 release、environment、server-time 或 canary evidence 时必须 fail closed。
+### Dispatch 与 Action inputs
 
-## 架构
+`workflow_dispatch` 暴露 `operation`、`pr_number`、`expected_head_sha`、可选
+`request_comment_id`、`request_review` 和 `limits_profile`。每个值都是不可信输入，
+必须与 GitHub 重新校验。manual path 必须提供完整 expected SHA。自动
+issue-comment path 可以不提供；runtime 会在启动时绑定 authoritative PR head。
+两条路径都会在剩余运行期间冻结该 head。
 
-```mermaid
-flowchart LR
-  A["Generated consumer caller"] --> B["Organisation reusable workflow @v2"]
-  B --> C["Trusted controller-input assembler"]
-  C --> D["Complete transport snapshots"]
-  D --> E["Projector"]
-  E --> F["Pure v2 reducer"]
-  F --> G["Scheduler and effect plans"]
-  G --> H["Durable controller ledger"]
-  H --> I["Remote effects and exact responses"]
-  I --> J["Sticky projection and final status"]
-  K["Composite action.yml"] -. "plan-only adapter" .-> D
-  K -. "never completes the gate" .-> G
+Action 使用 underscore 命名 inputs：`github_token`、`pr_number`、
+`expected_head_sha`、`operation`、`request_comment_id`、`request_review` 和
+`limits_profile`。`operation` closed to `reconcile|begin-review`，
+`limits_profile` closed to `default|expanded`，`request_review` 是 boolean。
+verdicts、identities、status context、stale overrides、numeric limits 和
+skip-reconcile controls 都不是 inputs。
+
+`request_comment_id` 只是 locator hint。reducer 可以用它避免不必要的 backward
+requests，但停止前必须证明全部更新的 relevant request、finding、progress
+artifact、malformed artifact 和 conflict 都已对账。hint 绝不提供 evidence
+authority。
+
+## Operations 和 head binding
+
+### `begin-review`
+
+`begin-review` 校验所选 supported PR 和 bound head，在该 exact SHA 上写 pending，
+并默认发送带 canonical workflow marker 的 fresh exact
+`@codex review` request。marker 绑定 v2 format、full head、当前 base
+repository/ref/SHA 和 workflow run。
+`request_review=false` 只执行 pending transition，不发送 request；它是 best effort，
+不会创建专用 barrier。
+
+workflow-authored request 的 logical attempt 绑定 repository ID、PR、expected head
+和 `GITHUB_RUN_ID`。rerun 可以采用自己的 exact、未编辑 matching marker。如果 POST
+结果 unknown，runtime 会先重读 GitHub，而不是盲目重复发送。持续不确定时保持
+pending，并报告 `retry_begin` 和 `retry_safe=false`：GitHub issue-comment creation
+没有 idempotency key，failure 可见前 side effect 可能已经成功。caller 应等待 exact
+same-run marker 的可见性稳定；若它仍不存在，只 rerun 原 workflow run。立即 retry
+或另行 dispatch 都可能生成 duplicate generation。
+
+同一 PR writers 使用 `cancel-in-progress: false`。这会串行化 active writers，但
+不能阻止 GitHub 替换尚未启动的 pending run。因此 caller 必须观察 exact
+`begin-review` run 完成，才能把它视为 barrier 或发送依赖它的 request。
+
+check 尚未通过时，agent 通常直接发送 exact `@codex review` 启动 Codex，从而在其他
+checks 运行期间避免 Actions runner。`begin-review` 保留为 coordinated path，尤其
+适用于 deliberate same-head re-review：它必须先使旧 success 失效。
+
+### `reconcile`
+
+manual reconcile 要求 caller 提供完整 `expected_head_sha`；automatic path 在启动时
+绑定等价值。runtime 重读 PR，并且只有 head 仍等于该值时，才会在收集证据前把
+该 SHA 的 gate status 改为 pending。pending 让中断的 recheck 保持 fail-closed，
+并在 deliberate re-review 时使旧 success 失效。
+
+stale run 绝不跟随不同 head，也绝不把结果投射到那里。head change 必须为 new
+current head 启动 fresh invocation。这就是 status projection 保护的 property：
+每个 decision 只属于 run 启动时明确提供或 authoritatively 绑定的 head。
+
+## Authority 模型
+
+### GitHub 是 reconstructive source
+
+每次 reconcile 都从 GitHub PR objects 重建 authority。没有 durable Git ledger、
+Actions-artifact ledger、central controller、cached receipt 或 sticky-comment
+authority。runtime 不上传 artifacts，也不保留 raw API payloads。
+
+best-effort sticky diagnostic 只是 output projection。其 v2 marker 与 request
+markers 不同，且不包含 `@codex review`。只有 `github-actions[bot]` marker comment
+符合条件。runtime 会尽量更新最旧的 canonical duplicate，保留并警告其他
+duplicates，也可以重建被删除的 diagnostic。sticky 缺失、编辑、重复或不可写都不能
+改变 gate decision。
+
+### Admitted evidence
+
+reducer 只消费符合条件的 Codex top-level issue comments 和 PR review bodies。
+它不把 inline review threads 或 conversation resolution 视为 reducer authority；
+installed ruleset 负责这个条件。
+
+provider carriers 必须绑定 exact bot identity。相似 name、复制的文本或 user-authored
+claim 都没有 authority。finding severity label 不影响 blocking：任何符合条件的
+finding 都会阻塞。
+
+### Review generations
+
+authorised generation 只能由一条 exact、未编辑的 `@codex review` request 建立。
+其 first visible line 必须 exact，且没有其他 visible text。普通 request author 默认
+必须有 `write`、`maintain` 或 `admin` repository permission。受保护的
+default-branch configuration 可以明确把 threshold 设为 `any`。workflow-authored
+request 还需要 exact v2 marker，绑定 full head 和 run。
+
+permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
+provider findings 不受 request-author permission 影响，始终阻塞。
+
+通常情况下，terminal clean text 与符合条件的 provider `+1` 是同等 clean carriers。
+一旦观察到 base epoch，terminal payload 无法证明它由哪个 request/base snapshot
+产生；在这个降级 lineage mode 中，只有直接附着在最新且严格晚于 epoch、绑定当前
+base 的 canonical workflow request 上的合格 `+1`，才能作为 positive 或
+superseding carrier。无法归因的 terminal clean 只保留为 diagnostic evidence，不能
+pass 或清除 finding。这是 carrier parity 的明确 fail-closed 例外。terminal
+carrier 包含 reviewed commit 时，只有 GitHub 能把 full/abbreviated SHA 无歧义
+解析为 current bound head 才接受。对于 PR review，resolved commit 还必须等于
+native `commit_id`。没有 match 或存在多个 relevant match 的 short prefix 属于
+indeterminate；runtime 绝不猜测，也不从无关 prose 中模糊提取方便的 token。
+
+### Finding supersession
+
+符合条件的 current-head finding 具有保守 precedence。在同一 head 上，旧
+non-inline finding 只有同时证明以下两项时才被 supersede：
+
+1. 存在严格更新的 authorised review generation；
+2. 之后出现属于该新 generation、绑定该 head 的 terminal clean 或合格 `+1`，并满足
+   上述 base-epoch direct-reaction rule。
+
+无关 later clean 不能清除 finding。temporal order、generation binding 或 head
+binding 有歧义时，仍为 failure 或 inconclusive。superseded finding 会作为
+historical evidence 保留在 diagnostic accounting 中，而不是从 GitHub 擦除。
+
+这种不对称允许从 obsolete/inapplicable finding 恢复，同时不让 positive evidence
+静默掩盖 finding。
+
+## Complete snapshots 和 stable success
+
+“snapshot” 是一组独立、fully paginated 的 GitHub API reads，用于判断固定 PR/head
+scope。它包括：
+
+- PR identity、lifecycle、base 和 head；
+- PR timeline 中最新 filtered `BaseRefChangedEvent` 或
+  `BaseRefForcePushedEvent`；
+- review-request IDs、revisions、authors 和 candidate reactions；
+- 符合条件的 Codex top-level comments/review bodies，包括 IDs、timestamps、
+  actor/App identity 和 body digests；
+- reviewed-commit resolution 与 native review `commit_id`；
+- collection completeness 与 exact-object refetch results。
+
+fingerprint 是 snapshot 中每个 decision-relevant value 的 deterministic
+representation。它只是两次 fresh reads 之间的 equality check，不是 durable
+receipt。
+
+GitHub 不提供 atomic cross-endpoint read。webhook delivery 可能先于 API visibility；
+Codex 可能分开发出 request、review 和 terminal objects；pagination 也可能跨越
+变化中的 server state。negative evidence 具有不对称性：符合条件的 finding 可以
+立即得到证明，而 clean 必须有完整证据证明没有 blocker。
+
+因此只有 clean candidate 使用 stability protocol：
+
+1. 完整获取 snapshot A；
+2. 等待 5 秒；
+3. 独立完整获取 snapshot B；
+4. 要求 fixed head 和 decision-relevant fingerprint 相同。
+
+同一 head 上 relevant request、edit、reaction、comment/review change 或
+exact-refetch change 会重启 stability window。head change、closure、merge 或
+expected-head mismatch 会使 run stale 并停止 retarget。pagination、API 和 cap
+failure 让 read incomplete，而不是“发生变化”。任何 incomplete 或 unstable
+observation 都不能产生 success。
+
+最新 base event 还是 evidence-epoch barrier。request generation 必须严格晚于它，
+clean evidence 才能 pass；timestamp 相同属于歧义。由于 GitHub 没有暴露由 provider
+认证的 request-to-terminal-payload lineage，epoch 后的 canonical request 必须在自己
+的 comment 上取得合格 provider `+1`；单独的 later terminal clean 不能 pass。
+workflow marker 直接绑定当前 base。findings 始终保守。
+导入的 ruleset 阻止 default branch non-fast-forward update；strict up-to-date 处理会
+扩大 required head 的普通 fast-forward movement。若管理员临时关闭这些保护后仍然
+force-push，下一次 exact reconcile 会从 timeline 恢复 pending；但在不增加 push
+listener、webhook App 或 cron 的 v2 边界内，无法实时 reset status。
+
+stability/reconcile budget 由 retries 共用。若到期仍没有 stable clean pair，
+runtime 报告 `unhealthy/pending` 和 `wait_then_reconcile`；之后的 provider event 或
+manual reconcile 会从 GitHub current state 重建。
+
+## Resource profiles
+
+每个 authoritative collection 都 fully paginate。cap hit 保持
+`unhealthy/pending`，并报告 exact cap、stopping point 和安全 next action。它绝不把
+truncated evidence 变成 success。
+
+profiles 是 policy，不是任意 dispatch numbers：
+
+| Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `default` | 20 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
+| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
+
+page size 为 100，单个 response 上限 8 MiB，clean inter-read delay 为 5 秒，
+workflow job timeout 为 14 分钟。确实存在大型 PR 的 repositories 可以持久选择
+reviewed `expanded` profile。per-dispatch numeric override 延期到 v2.0 之后。
+
+## Result 和 projection 模型
+
+public outputs 精确为：
+
+```text
+execution_health
+gate_outcome
+recovery_code
+retry_safe
 ```
 
-Production assembler 把每个 trusted event、scan、observation boundary 和 durable
-history 转换成精确 controller command。Package-local reconcile workflow 只是这个
-形状的 template/contract fixture，不是 hosted central router，也不是 activation evidence。
-
-## Trust boundary
-
-### Consumer boundary
-
-Consumer 只拥有 generated caller、permission ceiling 和 organization `@v2` call。
-Called workflow 不能提升 `GITHUB_TOKEN`。Consumer PR code、checkout file 和
-caller-supplied arbitrary JSON 不是 trusted controller input。
-
-### Release boundary
-
-Release pipeline 把完整 `packages/action` subtree 发布到
-`Joey-Tools/codex-review-gate-action`。个人 `JoeyTeng/codex-review-gate-action`
-repository 是 frozen v1 archive；v2 documentation、runtime identity 和 release alias
-绝不选择它。
-
-Selected reusable workflow checkout：
-
-- `repository: ${{ job.workflow_repository }}`
-- `ref: ${{ job.workflow_sha }}`
-- `persist-credentials: false`
-
-精确 selected object 是该 invocation 的 runtime source。Floating major alias 允许
-compatible v2 release；immutable release commit 和 signed tag 来自 release policy，
-不是 caller claim。
-
-### Controller boundary
-
-Trusted controller 拥有：
-
-- canonical input construction 和 state reconstruction；
-- complete read transport 和 bounded final reread；
-- durable request reservation 和 effect ledger persistence；
-- effect ordering 和 retry-zero enforcement；
-- response validation/binding；
-- sticky projection 和 commit-status publication；
-- server-time-bound wait transition。
-
-Reducer 和 plan adapter 无法自行获得这些 capability。
-
-### Provider-evidence boundary
-
-Event 和 wakeup hint 只是 observation trigger。Request comment、terminal provider
-artefact、finding、reaction、thread state、no-start response 和 lifecycle data 只有经过
-complete transport、closed-schema projection 和 stability check 后才可使用。Commit
-status、generic bot creator、sticky comment、scheduler deadline 或 prior decision 都不是
-provider evidence。
-
-## Plan-only composite adapter
-
-`action.yml` 执行 `src/v2/action.mjs`。它接受 `RUNNER_TEMP` 下的 operation input path，
-将读取限制在选定的 `RUNNER_TEMP` directory object 而非 checkout/PR-controlled path，
-执行 read-only transport，再返回 closed plan。
-
-在 Linux 和 macOS 上，reader 会持续持有选定的 `RUNNER_TEMP` directory descriptor，
-并由一个隔离 child 从 `/` 开始遍历。每个 directory component 都先以 no-follow 方式
-打开，在 `chdir` 期间保持 descriptor，再按 device、inode 和 file type 比较后继续；
-leaf 则由 parent 以 nonblocking、no-follow 方式打开并作为 inherited descriptor 4 持续持有。
-Child 只读取该 selected descriptor，并在两次 positioned read 前后要求 relative leaf 的
-device、inode、file type、access policy 和 selected size 均一致；stable bytes 还必须是
-strict UTF-8 和唯一 canonical JSON representation。该机制防止读取被重定向到不同
-directory 或 leaf object；它不证明 producer provenance，也不证明 race 中解析到相同对象的
-symlink 从未被短暂遍历。它还假定攻击者不能控制 privileged bind mount、mount namespace
-或 filesystem identity semantics；这些场景需要 native mount-aware API。其他平台会 fail closed。
-
-每次观测 leaf stat 时，access-policy predicate 都严格限定为：regular file、link count 为一，
-且 POSIX group/other write mode bit 均未设置。它不检查 extended ACL，也不证明能够防御
-same-UID writer、owner provenance 或 privileged mount authority；这些不属于固定 Ubuntu
-production threat model。
-
-Operations 是 `prepare-request`、`bind-request`、`evaluate-only`；必填且无默认值的
-status target enum 是 `head` 或 `test-merge-with-head-sentinel`。`head` 只授权
-non-success sentinel write；clean/skipped status publication 会显式 suppressed。所有
-terminal verdict 只能发布到 validated potential merge。Joey-Tools production reusable
-workflow 硬编码 `test-merge-with-head-sentinel`，不暴露 selector。
-
-Adapter 会拒绝 non-read GitHub transport，也拒绝任何声称已经 performed write 的 runner
-result。它不会：
-
-- 创建 `@codex review` comment；
-- 写 pending、success、failure 或 error status；
-- 持久化 scheduler intent 或 effect ledger；
-- 把 remote response 绑定为 executed effect；
-- 执行 environment wait；
-- 发布 sticky state projection；
-- 完成 branch protection。
-
-所以 direct composite（包括 exact-SHA invocation）只适合 controller development。
-Plan file 不是 effect receipt。消费这些 plan 的 controller 必须独立保持 closed schema、
-durability、ordering、idempotency 和 response-binding contract。
-
-## Projection 和 reduction
-
-Projector 把 immutable discovery/exact-evidence snapshot 与 explicit controller state
-结合，绑定 repository、PR、base、head、unique merge base、potential merge
-commit/tree/parents、lifecycle、selection、server enforcement、request、provider artefact、
-thread resolution、acknowledgement、no-start observation 和 inventory completeness。
-
-Selection 只能来自 explicit v2 controller intent 或 compatible v2 server enforcement。
-不存在通过 filesystem、tag name、legacy file 或 decision table heuristic 选择 policy major
-的路径。
-
-Reducer 是 pure function：没有 I/O、clock 或 environment dependency。它只接受 closed
-schema，并返回以下之一：
-
-- `not-selected`
-- `pending`
-- `clean`
-- `findings`
-- `inconclusive`
-- `skipped-unavailable`
-- `blocked-configuration`
-- `blocked-input`
-
-关键 precedence rules：
-
-1. Disabled 或 ineligible v2 selection 是 `not-selected`。
-2. Invalid/currently unbound review epoch 是 `blocked-input`。
-3. 缺少 compatible workflow/ruleset/App enforcement 是
-   `blocked-configuration`。
-4. Trustworthy blocking finding 是 `findings`，即使其他 inventory 不完整。
-5. Unstable scope、不完整 pagination/final reread、malformed/unstable evidence 或 exhausted
-   request authority 是 `inconclusive`。
-6. Confirmed no-start response 只有在 implicit selection 下才是
-   `skipped-unavailable`；explicitly requested route 应 blocked。
-7. `clean` 要求 complete stable evidence 以及 accepted closed reaction basis。Terminal
-   clean 只分类 provider artifact，不提供 positive completion authority。
-8. 其他 selected current epoch 保持 `pending`。
-
-Positive completion 刻意比 negative evidence 更严格。Trustworthy carrier 中的 finding
-即使无关 acquisition 不完整也可以阻断；partial snapshot 永远不能得到 clean。
-
-Reaction-only clean 选择 unique latest eligible request 及其 exact-provider `+1`。语义
-时间相同或更晚的 exact-provider `eyes` 会否决这个 reaction-only 结果；更早的 `eyes`
-不会。Reaction 永远不能覆盖已选择的 terminal payload，包括 `mixed` profile。
-
-## Review epoch 和 status target
-
-一个 v2 review epoch 绑定 repository/PR identity 以及精确 base、head、merge base 和有序
-potential-merge data。Lifecycle 必须保持 open。Positive completion 前，initial/final
-scope projection 必须一致。
-
-Request quota 与 automatic generation continuity 在 base retarget 后仍按 head 计量，
-因此旧 generation 不会被隐藏或退款。Positive `+1` 和 no-start authority 更窄：它们必须
-绑定 head 范围内最新 admitted generation，而且该 request 还必须匹配当前 base 与 head。
-Earlier-base request 可以支持下一次 recovery generation 或保留 negative finding history，
-但 test-merge input 改变后不能授权当前 review epoch。稳定的 current-head terminal clean
-仍可分类已发布 artifact，但当前 accepted provider schema 不会把 carrier 绑定到 request、
-run 或 input base。
-
-Durable controller history 有意分区。只有 `automatic-request-reservation` intent 与
-`review-request`、`request-binding`、`artifact-binding`、`scheduler-state` response 会在
-同 PR、同 head 的 base 或 potential-merge retarget 后保留。Status/sentinel binding、
-no-start/thread-resolution observation 以及 control/sticky-comment binding 仍必须匹配
-exact current scope，而且只能从 current incarnation 读取：即同 head 最后一个异 scope
-durable record 之后的 exact-scope suffix。这样 A-to-B-to-A retarget 不会复活 A 的旧
-scheduler、status、sentinel、no-start 或 comment authority。保留的 earlier-base history
-只延续 budget、generation、retry-zero、recovery 与 negative findings，不能成为当前
-positive authority。Automatic reservation 定义 generation origin；后续 review-request 与
-request-binding 即使因同 head retarget 进入新的 exact scope，也只引用该 origin。Manual
-request-binding 因没有 reservation 而定义自身 generation。Artifact-binding 和
-scheduler-state record 同样只引用既有 origin，绝不能用自身 current operation scope
-重新定义它。
-
-Partial transaction 也遵守同一分区。尚未进入 retry-zero attempt 的 head-scoped
-reservation 在 retarget 后继续占用额度，但恢复出的 attempt 与 request binding 必须绑定新
-exact scope 及其 scheduler observation。尚未应答的 artifact-binding intent 只属于 exact
-current scope 与 current incarnation：旧 scope intent，或被 durable foreign-scope record
-隔开的同一 exact tuple 的更早 intent，都会被隔离，不会与 current candidate 比较或重放。
-稳定的 incarnation anchor 是最新同 head foreign-scope durable record；它参与 effect
-identity，而同一 incarnation 内的 crash 或 lease 变化仍恢复同一 transaction。
-
-Control-plane audit receipt 当前为 schema version 2。Serialized validator 仍为 audit
-compatibility 接受 exact closed legacy version-1 shape，但反序列化绝不会重建
-process-local authority handle。Version 2 用 `current_incarnation` 标记 request binding，
-要求所有 true marker 构成一个 ledger suffix，并把每个 current binding join 到其 exact
-current generation。较早 head 的 visible request comment 仍必须有 durable audit binding，
-但会从 exact selector、projected request 和 reaction 中过滤；visible current-head request
-缺少 binding 时 fail closed。
-
-Legacy version-1 receipt 保留原始 request-binding 上限：3 条 automatic 加 64 条 manual。
-Sticky schema-version-1 projection 只为 audit/continuation compatibility 识别精确历史
-`terminal-clean`、`terminal-findings`、`malformed-evidence` 与
-`unresolved-inline-finding` whole-PR scope profile；current snapshot 仍必须使用当前 scope
-assurance。
-
-如果 addressed command 唯一指向一个经过 exact refetch、closed-provider 校验，但仅因属于
-较早 head 而被过滤的 finding carrier，则该命令只属于历史并被忽略。Unknown target、
-non-canonical 或错误绑定 URL、ambiguous carrier 以及无效 current-head target 仍 fail closed。
-同样，较早 incarnation 的 provider reaction 或发生在 selected current request 之前的
-reaction 不会压制有效 current no-start；只有绑定该 selected request 且发生于 request time
-同时或之后的 exact-provider activity 才能否决 no-start。
-
-Serialized receipt 保留 record OID、payload digest、response time 和其他 audit pointer。
-Generic projector surface 只暴露 closed receipt 可独立 join 的字段，或 branded live-ledger
-path 已授权的字段；对于仅靠反序列化 manifest digest 无法独立重新验证的 source-row
-pointer，则刻意不暴露。只有当 receipt 同时证明 prior binding、recovery transition 和 next
-binding 的顺序与 identity 时，closed generation admission 才携带相应指针。
-
-只有 control-comment create/update history 不算 prior runner scheduling state。这样的
-comment-only predecessor 之后，第一次 scheduler observation 仍必须使用 same-load initial
-runner authority；该 observation 及其 status transaction 完成后，后续 scheduling 必须使用
-established authority。
-
-稳定、经过 final reread 的 current-head terminal clean 只用于分类。它产生
-`inconclusive`，provider profile 为 `terminal-payload`（或 `mixed`），并携带精确
-`artifact-publication-only` artifact basis；selected request、generation 与 recovery 均为
-null，reaction 也不能覆盖 terminal classification。Runner 不暴露 terminal-clean binding
-candidate，ledger 不接纳新的 terminal-clean completion transaction，projector 也不为该
-carrier 制造 request lineage。Exact rich carrier commitment 仍用于 findings 与 audit
-integrity，legacy two-field binding 仍只适用于 findings。
-
-相反，完成 positive authority 的 current-request reaction 必须绑定 selected request，且
-selected artifact 必须为 null。非 null finding-recovery receipt 只允许出现在该 reaction
-basis 上。Stable input blocker 只映射到 `blocked-input`，不能制造
-`blocked-configuration`。
-
-Finding recovery 更严格：prior finding 被证明 closed，且因果上更晚的 current request
-generation admitted 后，只有该 current request 上更晚的 reaction 才能完成 clean。
-Terminal-clean carrier 不能提供或替代这个 recovery step。Automatic quota 耗尽时，完成
-request 可以是 manual generation；automatic-to-automatic recovery 仍要求严格递增的 closed
-generation chain。
-
-因此 ledger candidate-authority compatibility boundary 始终是 findings-only：schema
-version 1 只为 automatic generation 1 和 2 的 `finding-recovery` / `findings` 保留原始 byte
-与 digest identity；任何版本都不能把没有认证 lineage 的 terminal clean 变成 completion
-authority。历史 terminal-clean-shaped record 只能用于 audit，不能继续事务或投影为
-positive evidence。Closed parser 可以识别其字节，但 durable replay 会在 scheduler 或
-generation lineage 可能授权之前拒绝 terminal-clean binding purpose。
-
-Pre-activation B boundary 仍使 production effects 当前不可达。本地证明组合真实 runner、
-protected ledger transaction、fresh control-plane receipt、projector、reducer 与 controller
-ordering，但不会发明 positive terminal-clean route；它不是 activation evidence。
-
-Primary terminal policy 以 test-merge commit 为 target；需要时 controller 也写 head
-sentinel，避免 stale/mismatched merge result 静默满足 head-only rule。Target choice 是
-closed scheduler mode，不是 consumer-defined SHA。没有 validated potential merge 时，
-`not-selected` 与 configuration-blocked 结果保留 null primary target；不会用 head commit
-冒充缺失的 test-merge target。
-
-Commit Status 仍按 repository SHA/context 建索引。它不是 cryptographic attestation、
-provider artefact 或 PR-isolation proof。V2 依赖 controller receipt、exact epoch binding、
-complete provider reduction 和 final reread，而不是只看 creator/context 外观。
-
-## Scheduling 和 public wait
-
-Scheduler 在不 sleep、不执行 I/O 的情况下计算 effect，返回 closed action、`due-at` 和
-`wakeup-hints`；这些只是 advisory scheduling state，绝不是 evidence 或 verdict。
-
-Repository schedule 使用独立的 durable dispatch protocol。Coordinator 完成或恢复
-protected candidate inventory，证明整个 cycle 的 record/byte budget，持久化唯一 active
-reservation，然后才投影最多 64 个 canonical matrix rows。Scheduled rows 串行执行，
-且必须提交原始 dispatch binding。Ledger 对每个 candidate 强制 one-attempt，在 ack 前
-要求完整 acquire/effect/release authority，并记录 batch/cycle completion。Restart 只补齐
-partial bookkeeping 或暴露 typed recovery state，绝不会再次列出已 attempt 的 candidate。
-
-Public route 要求三个独立 15 分钟 environment boundary：
-
-- `codex-review-gate-public-initial-15m`
-- `codex-review-gate-public-post-request-15m`
-- `codex-review-gate-public-no-start-15m`
-
-每个 environment 必须配置精确 15 分钟 wait-timer protection rule；name 本身没有
-assurance。Trusted API preflight 和 live canary 必须证明 rule；controller 还必须校验
-server-time observation，让 early release 无法 authorize effect。Shell sleep、delayed cron
-或立即 workflow rerun 都不等价。
-
-Manual dispatch 是 `evaluate-only`：可以 evaluate，但不能 request review 或 publish
-status。Provider event 只是重建 snapshot 的 hint，不直接携带 trusted decision。
-
-## Durable effect ordering
-
-Controller effect ledger scope 是 repository、PR 和 head。每个 effect 有 identity 与
-idempotency key，并遵循 persist-before-effect protocol。
-
-Review request 顺序：
-
-1. reserve scheduler request；
-2. 完成 exact safe pre-scope read；
-3. persist pre-effect attempt；
-4. persist retry-zero request intent；
-5. perform exactly one request POST；
-6. bind exact 201 response；
-7. rebuild/reduce subsequent snapshot；
-8. 只 publish controller-authorised status/sticky effect。
-
-有 ambiguous response 的 attempted effect 绝不 reclaim 或 replay。Pre-scope read failure
-不会留下 pre-effect attempt 或 retry-zero request intent，因此保持可重试且不会声称 POST
-已发生。后续 invocation 可以复用 already-bound response，但不能为同一 idempotency key
-创建第二个 effect。Status 和 sticky effect 遵循同样的 reserve、persist、perform、bind
-discipline。
-
-Trusted server-time 顺序为 `pre-scope <= pre-effect attempt <= retry-zero request intent <=
-request created_at <= POST response <= exact refetch <= post-scope`。Request-intent boundary
-证明公开 POST 之前已经完成 write-ahead persistence；不能反过来把它当作更早 pre-scope
-observation 的下界。
-
-这提供 durable causal ordering，不是 distributed atomicity。如果无法证明 persistence
-或 response binding，controller 必须 closed stop，并保留 ledger 供 recovery。
-
-## Server enforcement 和 activation
-
-只有 trusted controller 以及 required server-side workflow/ruleset/App binding compatible
-时，v2 selection 才有意义。Reducer 通过 selection/server-enforcement status 明确表示
-这种区别，而不是从某 branch 上存在 workflow file 推断 readiness。
-
-Production activation 要求以下 property 同时成立：
-
-- admitted release 包含已 review 的 assembler、durable dispatch 与 effect protocol，且与
-  已通过本地门禁的 tree 一致；
-- organization reusable workflow `@v2` 是 selected public entry；
-- 所有 environment wait rule 通过 trusted API preflight；
-- live canary 证明 wait 和 server-time enforcement；
-- controller concurrency 和 durable ledger scope 正确；
-- exact status target/sentinel behaviour 已证明；
-- final snapshot/effect receipt 通过 terminal write 保持稳定；
-- 只有此后才把 `codex/github-review-gate` 加入 ruleset。
-
-在此之前，supported state 是 pre-activation validation。Copied caller、package-local
-reconcile fixture、green adapter run 或 locally constructed controller JSON 都无法满足
-activation gate。
-
-## Major isolation 和 retained v1 artefact
-
-Release tree 保留 v1 implementation/decision document，以保存 history 和 frozen archive：
-
-- `src/core.mjs`、`src/gate.mjs` 是 legacy v1 runtime file；
-- `decision-table.json` 只继续对 v1 policy major 1 有 authority；
-- `producer-receipt.schema.json` 描述 legacy producer receipt v1；
-- personal-repository `@v1` reference 仍是 frozen v1 consumer。
-
-这些文件在 v2 中刻意 unselected。V2 projector、reducer、scheduler、plan adapter 和
-workflow controller 只 import 自己的 `src/v2` module/closed schema。V2 controller 没有
-option、environment variable、tag fallback、error recovery 或 compatibility route 可以
-选择 v1 reducer。V2 failure 只能保持 `blocked-*`、`inconclusive` 或其他 closed v2
-outcome。
-
-Organization v2 target 不得暴露任何 `v1*` branch/tag selector。Split history 中存在 file
-不会产生 selection authority。这样的 major-isolated retention 保留 audit/archive
-continuity，但不会把 v1 变成 downgrade path。
-
-## Security non-guarantees
-
-V2 不声称：
-
-- floating major alias 是 post-run immutable provenance；
-- `github-actions[bot]` 能证明执行了哪份 workflow code；
-- commit status 本身能证明 provider evidence 或 PR isolation；
-- environment name 能证明 protection rule；
-- composite adapter 已执行 plan；
-- plan/result digest 是 signature 或 remote-effect receipt；
-- 一次 point-in-time reread 消除所有 TOCTOU risk；
-- retained v1 file 可被 v2 选择。
-
-设计实际依赖 explicit release selection、closed schema、complete snapshot、stable reread、
-durable effect identity、response binding 和 fail-closed activation evidence。
+`execution_health` 是 `healthy|unhealthy`；`gate_outcome` 是
+`success|failure|pending|not_applicable|unknown`；`retry_safe` 表示相同 inputs 的
+immediate retry 是否为有效 recovery operation。closed recovery-code set 见
+[README.zh-CN.md](README.zh-CN.md)。
+
+合法 semantic combinations 是：
+
+| Health/outcome | 含义 |
+| --- | --- |
+| `healthy/success` | 两次稳定完整 snapshots 证明 current-head clean。 |
+| `healthy/failure` | 已证明符合条件的 findings，并成功投射 failure status。 |
+| `unhealthy/failure` | 已证明 findings，但 failure-status projection 失败。 |
+| `healthy/pending` | provider evidence 尚未 terminal。 |
+| `unhealthy/pending` | API、pagination、cap 或 stability execution 不完整。 |
+| `healthy/not_applicable` | delayed automatic event 已 stale。 |
+| `unhealthy/not_applicable` | manual target 无效或 scope 不受支持。 |
+| `unhealthy/unknown` | 无法读取或投射任何 trusted state。 |
+
+`unhealthy/success` 被禁止。workflow conclusion 表示 execution health；bound head
+上的 commit status 表示 gate outcome。这样可把普通 findings 与 evaluator failure
+分开。
+
+`status_projection` 只出现在 summary。无需额外 evidence query 时，summary 和
+sticky 还会报告 `findings_unresolved`、`findings_resolved`、
+`findings_historical` 与 `findings_indeterminate`。pagination 不完整、API failure
+或 cap hit 会使受影响值为 `unknown`，而不是 zero。这些只是 normalized
+non-inline findings 的 diagnostics，不是 public Action outputs 或 inline-thread
+authority。
+
+summary 和 sticky 包含 bounded reason、recovery code 与具体 next action。必要时会
+暴露 object identities、digests、bounded escaped excerpts 和 links，但绝不暴露
+tokens、headers、raw payload dumps 或 untrusted workflow commands。
+
+at-least-once recovery 在 write result unknown 后可能生成少量 duplicate requests、
+statuses 或 diagnostic attempts。runtime 会保守地 fold/report duplicates；它们绝不
+允许选择一个方便的 clean 或漏掉 finding。
+
+## Exact-head merge closure
+
+stable A/B snapshots 只证明短暂 observation window，不会锁定 PR。merge 前，agent
+必须：
+
+1. 重读 exact current PR head；
+2. 为该 exact head dispatch `reconcile`；
+3. 要求 Action output 为 `healthy/success`；
+4. 重读同一 unchanged head 上、expected source 为 GitHub Actions 的
+   `codex/github-review-gate`；
+5. 要求 ruleset 确认 branch up to date、all conversations resolved 且 merge
+   allowed。
+
+任何 head 或 policy change 都必须重启该 closure。旧 success 绝不是 permanent
+review lease。
+
+## 支持边界和 non-goals
+
+stable v2.0 支持 GitHub.com public/private repositories、从普通
+same-repository branch 到 default branch 的 open non-draft PR、GitHub-hosted
+Linux runners，以及普通 merge/squash/rebase methods。
+
+GHES、forks、merge queues、non-default bases、drafts、bot-owned PRs、
+self-hosted/Windows/macOS runners，以及对 closed/merged PR 发起的新 operation 都会
+fail closed。
+
+本设计不宣称：
+
+- sticky diagnostics durable、unique 或 authoritative；
+- 两次 snapshots 可以阻止 snapshot B 之后的变化；
+- retries exactly once；
+- ambiguous short SHA 可以通过猜测变安全；
+- Action 会重复实现 branch freshness 或 conversation resolution；
+- stale run 会跟随或修复 new head；
+- status 以 PR 而不是 commit SHA 为 scope；
+- release publisher App 提供 runtime authority。
+
+## v1 隔离
+
+v1 对尚未迁移的 consumers 保持 frozen 和 valid。v2 不读取 v1 state、不发布
+compatibility selector、不修改 v1 refs，也不 fallback 到 v1 reducer。迁移在一个
+PR 中删除 v1 installation 并安装完整 v2 workflow/ruleset，再用单独的无害 canary
+PR 验证 v2；该 canary 不 merge，直接关闭。

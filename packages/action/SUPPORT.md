@@ -3,7 +3,7 @@
 Use GitHub issues in this repository for:
 
 - action bugs
-- incorrect `codex/review-gate` status behaviour
+- incorrect `codex/github-review-gate` status behaviour
 - documentation gaps
 - Marketplace listing issues
 - compatibility problems with target repository workflows
