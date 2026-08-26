@@ -1108,8 +1108,21 @@ superseded_by:
   passed under `/private/tmp` while inheriting the PR CI workflow identity and
   deliberately poisoned GitHub run/output variables, preserving the earlier
   Linux/path-alias regression coverage.
-- No push, PR, target-repository write, Release, tag, alias, Marketplace change,
-  ruleset mutation, or consumer installation had occurred at this checkpoint.
+- The GitHub Codex review of `717015f48aed5d5b1b1f326b06f4fca15562a11f`
+  repeated the already adjudicated recommendation to replace the official
+  token Action's floating `@v3` ref with an immutable SHA. This is not accepted
+  as an implementation change because it conflicts with Joey's fixed publisher
+  dependency policy above. To prevent future review-context loss, the
+  secret-bearing workflow step now carries a proximal security-policy comment
+  and a contract test: GitHub-owned Actions intentionally follow floating major
+  refs for automatic patch fixes, while a later move to immutable SHAs requires
+  Dependabot and a separate policy change. The review thread is resolved as an
+  explicitly accepted dependency-policy tradeoff rather than by silently
+  reversing the decision.
+- At the pre-PR implementation checkpoint, no target-repository write, Release,
+  tag, alias, Marketplace change, ruleset mutation, or consumer installation
+  had occurred. The later source-repository branch pushes and infrastructure PR
+  #34 recorded above do not cross that rollout boundary.
 - Existing source-repository PR #32 is explicitly outside this workstream and
   does not block or supply changes to this delivery.
 

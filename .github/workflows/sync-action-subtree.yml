@@ -413,6 +413,9 @@ jobs:
           node scripts/generate-action-release-provenance.mjs verify-github-signing-key \
             --input "$github_keys" \
             --output-public-key "$current_public_key"
+      # Security policy: allowlisted GitHub-owned Actions intentionally follow
+      # floating major refs so upstream patch fixes arrive automatically. Moving
+      # to immutable SHAs requires Dependabot and a separate policy change.
       - name: Create least-privilege publisher token
         id: publisher-token
         uses: actions/create-github-app-token@v3

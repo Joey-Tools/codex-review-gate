@@ -713,6 +713,10 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   for (const line of workflow.split("\n").filter((value) => /^\s*-?\s*uses:/u.test(value))) {
     assert.match(line, /@v[1-9][0-9]*$/u, line);
   }
+  assert.match(
+    workflow,
+    /Security policy: allowlisted GitHub-owned Actions intentionally follow[\s\S]*Moving[\s\S]*to immutable SHAs requires Dependabot and a separate policy change[\s\S]*uses: actions\/create-github-app-token@v3/u,
+  );
 
   assert.doesNotMatch(workflow, /GIT_ASKPASS:\s*\$\{\{\s*steps\.publisher-token/u);
   assert.doesNotMatch(workflow, /GIT_ASKPASS=.*>>\s*"\$GITHUB_ENV"/u);
