@@ -5,7 +5,7 @@ status: active
 created: 2026-08-25
 updated: 2026-08-26
 branch: codex/action-v2-release
-pr:
+pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
 superseded_by:
 ---
@@ -1098,8 +1098,8 @@ superseded_by:
 
 ## Next Steps
 
-- Open the source-repository infrastructure PR, then satisfy its CI, review,
-  and merge-readiness gates without involving PR #32.
+- Satisfy infrastructure PR #34's CI, review, and merge-readiness gates without
+  involving PR #32.
 - After the infrastructure PR merges, create the separate release-intent PR and
   execute the approved publisher workflow through RC and stable `v2.0.0`.
   Verify immutable refs, Release/assets, signatures, and floating alias before
