@@ -1070,6 +1070,18 @@ superseded_by:
   macOS structural diagnostic; the assertion now admits that exact fail-closed
   branch. The new environment-isolation invariant and the cross-platform
   transport regression pass `2/2`.
+- CI run `33013968499` then passed `646/647` tests in both Node lanes and
+  exposed one real command-scope defect: `RELEASE_TARGET_ASKPASS` remained an
+  exported environment variable for ordinary Git and Node subprocesses even
+  though the publisher token itself was already non-exported. The macOS test
+  had missed the leak because its `/var/folders` fixture path and Git's
+  `/private/var/folders` path did not compare equal; Linux used one spelling
+  and correctly blocked the subprocess. The publisher now captures the helper
+  path in a non-exported read-only shell variable, immediately unsets the
+  inherited name, and injects it only as `GIT_ASKPASS` on an allowlisted target
+  push. The fake Git regression now rejects any sensitive helper or token on
+  every non-push command rather than relying on a source-path match. With
+  `TMPDIR=/private/tmp`, the exact test changed from a stable failure to a pass.
 - No push, PR, target-repository write, Release, tag, alias, Marketplace change,
   ruleset mutation, or consumer installation had occurred at this checkpoint.
 - Existing source-repository PR #32 is explicitly outside this workstream and

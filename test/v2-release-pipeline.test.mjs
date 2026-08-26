@@ -735,7 +735,11 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(workflow, /Password for 'https:\/\/x-access-token@github\.com\/JoeyTeng\/codex-review-gate-action\.git'/u);
   assert.match(
     publisher,
-    /target_git_push\(\)[\s\S]*push_argv=\([^\n]*credential\.helper=[\s\S]*credential\.useHttpPath=true[\s\S]*http\.extraHeader=[\s\S]*"\$target_url" "\$refspec"\)[\s\S]*GIT_ASKPASS="\$RELEASE_TARGET_ASKPASS"[\s\S]*GIT_CONFIG_GLOBAL=\/dev\/null[\s\S]*GIT_CONFIG_NOSYSTEM=1[\s\S]*PUBLISHER_TOKEN="\$publisher_token"[\s\S]*command git "\$\{push_argv\[@\]\}"/u,
+    /release_target_askpass="\$\{RELEASE_TARGET_ASKPASS:-\}"[\s\S]*unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS[\s\S]*readonly publisher_token release_target_askpass/u,
+  );
+  assert.match(
+    publisher,
+    /target_git_push\(\)[\s\S]*push_argv=\([^\n]*credential\.helper=[\s\S]*credential\.useHttpPath=true[\s\S]*http\.extraHeader=[\s\S]*"\$target_url" "\$refspec"\)[\s\S]*GIT_ASKPASS="\$release_target_askpass"[\s\S]*GIT_CONFIG_GLOBAL=\/dev\/null[\s\S]*GIT_CONFIG_NOSYSTEM=1[\s\S]*PUBLISHER_TOKEN="\$publisher_token"[\s\S]*command git "\$\{push_argv\[@\]\}"/u,
   );
   assert.match(publisher, /source_live_master\(\)[\s\S]*source_git ls-remote/u);
   assert.doesNotMatch(publisher, /readonly manifest=|\[\[ -f "\$manifest"/u);
@@ -817,10 +821,8 @@ test("target pushes command-scope the approved synthetic credential through askp
   write(fakeGit, `#!/bin/sh
 set -eu
 is_push=false
-is_source=false
 for argument in "$@"; do
   [ "$argument" = push ] && is_push=true
-  [ "$argument" = "$EXPECTED_SOURCE_URL" ] && is_source=true
 done
 if [ "$is_push" = true ]; then
   [ -n "\${GIT_ASKPASS:-}" ] || { printf '%s\n' push-without-askpass >> "$ASKPASS_LOG"; exit 96; }
@@ -835,8 +837,8 @@ if [ "$is_push" = true ]; then
   [ "$username" = x-access-token ]
   [ "$password" = "$PUBLISHER_TOKEN" ]
   printf '%s\n' push-with-askpass >> "$ASKPASS_LOG"
-elif [ "$is_source" = true ] && [ -n "\${PUBLISHER_TOKEN:-}\${GH_TOKEN:-}\${GITHUB_TOKEN:-}\${RELEASE_TARGET_ASKPASS:-}" ]; then
-  printf '%s\n' source-observed-publisher-credential >> "$ASKPASS_LOG"
+elif [ -n "\${PUBLISHER_TOKEN:-}\${GH_TOKEN:-}\${GITHUB_TOKEN:-}\${RELEASE_PUBLISHER_TOKEN:-}\${RELEASE_TARGET_ASKPASS:-}\${GIT_ASKPASS:-}" ]; then
+  printf '%s\n' non-push-observed-publisher-credential >> "$ASKPASS_LOG"
   exit 98
 elif [ -n "\${GIT_ASKPASS:-}" ]; then
   printf '%s\n' non-push-observed-askpass >> "$ASKPASS_LOG"
@@ -865,7 +867,6 @@ esac
     env: {
       ASKPASS_LOG: askpassLog,
       CODEX_REVIEW_GATE_TEST_ENFORCE_ASKPASS: "1",
-      EXPECTED_SOURCE_URL: state.source,
       EXPECTED_TARGET_URL: state.target,
       GIT_ASKPASS: "",
       PATH: `${fakeBin}:${executionEnv.PATH}`,

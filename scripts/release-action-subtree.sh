@@ -19,9 +19,10 @@ if [[ -n "${RELEASE_PUBLISHER_TOKEN:-}" && -n "${GH_TOKEN:-}" &&
   exit 2
 fi
 publisher_token="${RELEASE_PUBLISHER_TOKEN:-${GH_TOKEN:-${PUBLISHER_TOKEN:-${GITHUB_TOKEN:-}}}}"
+release_target_askpass="${RELEASE_TARGET_ASKPASS:-}"
 unset RELEASE_PUBLISHER_TOKEN GH_TOKEN GITHUB_TOKEN PUBLISHER_TOKEN
-readonly publisher_token
-unset GIT_ASKPASS SSH_ASKPASS
+unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS
+readonly publisher_token release_target_askpass
 export GIT_TERMINAL_PROMPT=0
 
 # Every ordinary Git invocation is credential-free and ignores inherited
@@ -423,11 +424,11 @@ target_git_push() {
   fi
   if is_test_environment; then
     if [[ "${CODEX_REVIEW_GATE_TEST_ENFORCE_ASKPASS:-}" == "1" ]]; then
-      [[ -x "${RELEASE_TARGET_ASKPASS:-}" && -n "$publisher_token" ]] || {
+      [[ -x "$release_target_askpass" && -n "$publisher_token" ]] || {
         echo "error: test target-scoped askpass mode requires an executable helper and synthetic token" >&2
         return 1
       }
-      GIT_ASKPASS="$RELEASE_TARGET_ASKPASS" \
+      GIT_ASKPASS="$release_target_askpass" \
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_CONFIG_NOSYSTEM=1 \
         GIT_TERMINAL_PROMPT=0 \
@@ -439,11 +440,11 @@ target_git_push() {
     command git "${push_argv[@]}"
     return
   fi
-  [[ -x "${RELEASE_TARGET_ASKPASS:-}" && -n "$publisher_token" ]] || {
+  [[ -x "$release_target_askpass" && -n "$publisher_token" ]] || {
     echo "error: target-scoped askpass and publisher token are required for target mutation" >&2
     return 1
   }
-  GIT_ASKPASS="$RELEASE_TARGET_ASKPASS" \
+  GIT_ASKPASS="$release_target_askpass" \
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_NOSYSTEM=1 \
     GIT_TERMINAL_PROMPT=0 \
