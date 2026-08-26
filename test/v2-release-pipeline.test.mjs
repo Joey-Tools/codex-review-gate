@@ -25,6 +25,8 @@ const baselinePath = join(repositoryRoot, "docs", "release", "action-v2-reposito
 const actionMetadata = readFileSync(join(repositoryRoot, "packages", "action", "action.yml"), "utf8");
 const PRIMARY = "AD403DAB5377F9FA0F7D775EC2844D3367B8A71B";
 const SUBKEY = "4DD48552DDEAF6D961769DD4A49827EC48984E2C";
+const RELEASE_WORKFLOW_REF =
+  "Joey-Tools/codex-review-gate/.github/workflows/sync-action-subtree.yml@refs/heads/master";
 const SYNTHETIC_TOKEN_FIXTURE = Object.freeze({
   catalog: "joey-private-v3",
   id: "access-a",
@@ -37,7 +39,18 @@ const executionEnv = {
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_TERMINAL_PROMPT: "0",
+  // These tests invoke the publisher directly. Bind its production workflow
+  // identity and remove host-owned output/credentials instead of inheriting
+  // the unrelated workflow hosting the tests.
+  GH_TOKEN: "",
+  GITHUB_OUTPUT: "",
+  GITHUB_RUN_ATTEMPT: "1",
+  GITHUB_RUN_ID: "1",
+  GITHUB_TOKEN: "",
+  GITHUB_WORKFLOW_REF: RELEASE_WORKFLOW_REF,
   NODE_ENV: "test",
+  PUBLISHER_TOKEN: "",
+  RELEASE_PUBLISHER_TOKEN: "",
 };
 
 function run(file, args, options = {}) {
@@ -655,6 +668,20 @@ process.exit(2);
   };
 }
 
+test("publisher fixtures isolate the host workflow identity and credentials", () => {
+  const observed = JSON.parse(run(process.execPath, [
+    "-e",
+    "process.stdout.write(JSON.stringify({ workflowRef: process.env.GITHUB_WORKFLOW_REF, runId: process.env.GITHUB_RUN_ID, runAttempt: process.env.GITHUB_RUN_ATTEMPT, output: process.env.GITHUB_OUTPUT, tokens: [process.env.GH_TOKEN, process.env.GITHUB_TOKEN, process.env.PUBLISHER_TOKEN, process.env.RELEASE_PUBLISHER_TOKEN] }))",
+  ]));
+  assert.deepEqual(observed, {
+    workflowRef: RELEASE_WORKFLOW_REF,
+    runId: "1",
+    runAttempt: "1",
+    output: "",
+    tokens: ["", "", "", ""],
+  });
+});
+
 test("workflow and publisher expose the adopted staged ABI and scoped credentials", () => {
   const workflow = readFileSync(workflowPath, "utf8");
   const publisher = readFileSync(releaseScript, "utf8");
@@ -1106,7 +1133,10 @@ test("candidate transport is validated before extraction and rejects symlinks", 
     join(state.root, "unsafe-extracted"),
   ]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /exactly two root regular files|root-scoped mode-0600 regular files/u);
+  assert.match(
+    result.stderr,
+    /release tar rejects links and special entries: candidate\.json|exactly two root regular files|root-scoped mode-0600 regular files/u,
+  );
 });
 
 test("publication plan is mandatory, candidate-bound, and verified before publication", (t) => {

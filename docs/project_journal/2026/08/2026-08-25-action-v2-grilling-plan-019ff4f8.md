@@ -1056,6 +1056,20 @@ superseded_by:
   not rerun tests that create files inside its strictly read-only workspace;
   the complete test executions are recorded above. PR #32 was neither read nor
   used as evidence.
+- Infrastructure PR #34 exposed two test-harness portability defects in CI run
+  `33012740781`; neither defect relaxed or bypassed production validation. The
+  Node 20 and Node 24 jobs inherited the host CI workflow's
+  `GITHUB_WORKFLOW_REF`, while direct publisher fixtures must model the
+  canonical `sync-action-subtree.yml@refs/heads/master` workflow. The
+  production generator correctly rejected that non-canonical provenance. The
+  fixture environment now binds the canonical workflow ref and deterministic
+  run identity and clears host-owned `GITHUB_OUTPUT` plus ambient publisher
+  credentials. A hostile environment reproducing the PR CI workflow passed
+  the complete 35-test publisher file. A separate Ubuntu tar diagnostic used
+  the generator's valid link/special-entry rejection text rather than either
+  macOS structural diagnostic; the assertion now admits that exact fail-closed
+  branch. The new environment-isolation invariant and the cross-platform
+  transport regression pass `2/2`.
 - No push, PR, target-repository write, Release, tag, alias, Marketplace change,
   ruleset mutation, or consumer installation had occurred at this checkpoint.
 - Existing source-repository PR #32 is explicitly outside this workstream and
