@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Bash imports SHELLOPTS before executing this file. Disable inherited tracing,
+# verbose input echo, and automatic export before any credential expansion.
+set +x
+set +v
+set +a
 set -euo pipefail
 
 readonly SOURCE_REPOSITORY="Joey-Tools/codex-review-gate"
@@ -20,6 +25,7 @@ if [[ -n "${RELEASE_PUBLISHER_TOKEN:-}" && -n "${GH_TOKEN:-}" &&
 fi
 publisher_token="${RELEASE_PUBLISHER_TOKEN:-${GH_TOKEN:-${PUBLISHER_TOKEN:-${GITHUB_TOKEN:-}}}}"
 release_target_askpass="${RELEASE_TARGET_ASKPASS:-}"
+export -n publisher_token release_target_askpass
 unset RELEASE_PUBLISHER_TOKEN GH_TOKEN GITHUB_TOKEN PUBLISHER_TOKEN
 unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS
 readonly publisher_token release_target_askpass

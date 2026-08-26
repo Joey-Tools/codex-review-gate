@@ -1082,6 +1082,32 @@ superseded_by:
   push. The fake Git regression now rejects any sensitive helper or token on
   every non-push command rather than relying on a source-path match. With
   `TMPDIR=/private/tmp`, the exact test changed from a stable failure to a pass.
+- The final exact-head review of `39daa3e8337178c2ea01aed57664c776b9625b37`
+  found one further credential-isolation edge case. Bash imports `SHELLOPTS`
+  before executing the publisher, so an inherited `xtrace` exposed expanded
+  credential values before the script's `unset`, while inherited `allexport`
+  caused the captured lowercase token and askpass variables to remain visible
+  to ordinary subprocesses. The publisher now disables inherited trace,
+  verbose input echo, and automatic export before any credential expansion,
+  overwrites any inherited lowercase captures, and explicitly removes their
+  export attributes before making them read-only. The regression uses
+  the helper-approved `joey-private-v3` `access-a` synthetic fixture: one case
+  proves hostile `xtrace`/`verbose` stderr contains no token or capture
+  assignment, and the full target-push case runs under `allexport` while every
+  push and non-push fake Git invocation rejects inherited lowercase captures.
+  This revision is required because the earlier fix removed the uppercase
+  workflow variables but implicitly relied on the caller's default Bash option
+  state; command-scoped credential isolation must not depend on that ambient
+  shell state. Startup files such as `BASH_ENV` run before script control and
+  remain outside this in-script guarantee; the reviewed privileged workflow
+  does not set them. The installed synthetic-token catalog validated as
+  `joey-private-v3`; the two focused hostile-option regressions passed `2/2`.
+  The subsequent complete `npm test -- --test-reporter=dot` run exited `0`, and
+  `npm run check`, Bash syntax, ShellCheck, `git diff --check`, and the bundled
+  project-journal validator all passed. The entire 37-test publisher file also
+  passed under `/private/tmp` while inheriting the PR CI workflow identity and
+  deliberately poisoned GitHub run/output variables, preserving the earlier
+  Linux/path-alias regression coverage.
 - No push, PR, target-repository write, Release, tag, alias, Marketplace change,
   ruleset mutation, or consumer installation had occurred at this checkpoint.
 - Existing source-repository PR #32 is explicitly outside this workstream and

@@ -735,7 +735,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(workflow, /Password for 'https:\/\/x-access-token@github\.com\/JoeyTeng\/codex-review-gate-action\.git'/u);
   assert.match(
     publisher,
-    /release_target_askpass="\$\{RELEASE_TARGET_ASKPASS:-\}"[\s\S]*unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS[\s\S]*readonly publisher_token release_target_askpass/u,
+    /set \+x[\s\S]*set \+v[\s\S]*set \+a[\s\S]*release_target_askpass="\$\{RELEASE_TARGET_ASKPASS:-\}"[\s\S]*export -n publisher_token release_target_askpass[\s\S]*unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS[\s\S]*readonly publisher_token release_target_askpass/u,
   );
   assert.match(
     publisher,
@@ -810,6 +810,22 @@ test("malformed publish invocations still emit exactly one closed state and reco
   }
 });
 
+test("publisher disables inherited shell tracing before reading credentials", () => {
+  const result = invoke("bash", [releaseScript, "--help"], {
+    cwd: repositoryRoot,
+    env: {
+      RELEASE_PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      RELEASE_TARGET_ASKPASS: "/private/tmp/codex-review-gate-synthetic-askpass",
+      SHELLOPTS: "allexport:verbose:xtrace",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, new RegExp(SYNTHETIC_TOKEN_FIXTURE.value, "u"));
+  assert.doesNotMatch(result.stderr, /(?:publisher_token|release_target_askpass)=/u);
+  assert.equal(SYNTHETIC_TOKEN_FIXTURE.catalog, "joey-private-v3");
+  assert.equal(SYNTHETIC_TOKEN_FIXTURE.id, "access-a");
+});
+
 test("target pushes command-scope the approved synthetic credential through askpass", (t) => {
   const state = fixture(t);
   const built = buildAssembledCandidate(state);
@@ -826,6 +842,7 @@ for argument in "$@"; do
 done
 if [ "$is_push" = true ]; then
   [ -n "\${GIT_ASKPASS:-}" ] || { printf '%s\n' push-without-askpass >> "$ASKPASS_LOG"; exit 96; }
+  [ -z "\${publisher_token:-}\${release_target_askpass:-}" ] || { printf '%s\n' push-observed-lowercase-credential >> "$ASKPASS_LOG"; exit 95; }
   [ "\${GIT_CONFIG_GLOBAL:-}" = /dev/null ]
   [ "\${GIT_CONFIG_NOSYSTEM:-}" = 1 ]
   arguments=" $* "
@@ -837,7 +854,7 @@ if [ "$is_push" = true ]; then
   [ "$username" = x-access-token ]
   [ "$password" = "$PUBLISHER_TOKEN" ]
   printf '%s\n' push-with-askpass >> "$ASKPASS_LOG"
-elif [ -n "\${PUBLISHER_TOKEN:-}\${GH_TOKEN:-}\${GITHUB_TOKEN:-}\${RELEASE_PUBLISHER_TOKEN:-}\${RELEASE_TARGET_ASKPASS:-}\${GIT_ASKPASS:-}" ]; then
+elif [ -n "\${PUBLISHER_TOKEN:-}\${GH_TOKEN:-}\${GITHUB_TOKEN:-}\${RELEASE_PUBLISHER_TOKEN:-}\${RELEASE_TARGET_ASKPASS:-}\${GIT_ASKPASS:-}\${publisher_token:-}\${release_target_askpass:-}" ]; then
   printf '%s\n' non-push-observed-publisher-credential >> "$ASKPASS_LOG"
   exit 98
 elif [ -n "\${GIT_ASKPASS:-}" ]; then
@@ -873,6 +890,9 @@ esac
       PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
       REAL_GIT: run("which", ["git"]),
       RELEASE_TARGET_ASKPASS: askpass,
+      SHELLOPTS: "allexport",
+      publisher_token: SYNTHETIC_TOKEN_FIXTURE.value,
+      release_target_askpass: askpass,
     },
   });
   assert.equal(result.status, 0, result.stderr);
