@@ -91,13 +91,14 @@ stages:
 | `candidate-a` | Unprivileged | Independently materialize and test candidate A on a clean runner; record its tree, inventory, modes, sizes, and SHA-256 digests. |
 | `candidate-b` | Unprivileged | Independently materialize and test candidate B on another clean runner. |
 | `assemble` | Unprivileged | Require byte-identical candidates and produce the canonical candidate bundle. |
-| `admission` | Unprivileged | Reconstruct and validate the publication plan and candidate before approval; upload no privileged material. |
+| `publication-plan` | Unprivileged | Reconstruct and validate the publication plan and candidate before approval; upload no privileged material. |
 | `publish` | Privileged | After Environment approval, revalidate everything and perform signed remote publication. |
 | `verify` | Unprivileged | Re-read public refs and Release state and report the observed result. |
 
-The unprivileged `plan`, `candidate-a`, `candidate-b`, `assemble`, `admission`,
-and `verify` jobs use `ubuntu-slim` with 14-minute timeouts. The privileged
-`publish` job uses `ubuntu-24.04` with a 30-minute timeout.
+The unprivileged `plan`, `candidate-a`, `candidate-b`, `assemble`,
+`publication-plan`, and `verify` jobs use `ubuntu-slim` with 14-minute
+timeouts. The privileged `publish` job uses `ubuntu-24.04` with a 30-minute
+timeout.
 
 Only `publish` binds the `marketplace-production` Environment. Despite its
 historical name, this is the production publication-credential and approval
@@ -112,12 +113,16 @@ days. Before approval:
 - the candidate artifact contains no credential or signing-key material.
 
 Artifacts are transport between jobs, not a ledger or authoritative
-publication evidence. The `plan`, `candidate-a`, `candidate-b`, and `admission`
-artifacts are retained for one day; the assembled canonical candidate is
-retained for 35 days. Artifact display names include the workflow run ID and
-attempt. Consumers bind the server-returned artifact ID and a validated exact
-basename instead of trusting a display name. The committed manifest plus
-re-read Git and Release state remain authoritative.
+publication evidence. The `plan` artifact and candidate A/B artifacts
+(`candidate-a` and `candidate-b`) are retained for one day. The assembled
+canonical candidate and publication plan artifacts are each retained for 35
+days, covering the Environment's maximum 30-day approval wait. Those are the
+two frozen inputs to `publish`. The `publication-plan` stage creates the plan;
+there is no separate artifact named or classified as an admission artifact.
+Artifact display names include the workflow run ID and attempt. Consumers bind
+the server-returned artifact ID and a validated exact basename instead of
+trusting a display name. The committed manifest plus re-read Git and Release
+state remain authoritative.
 
 GitHub does not allocate the protected job's runner while it waits for required
 reviewer approval, and that wait does not consume billable runner time. The
@@ -357,8 +362,12 @@ provenance.
 `verify` has no Environment and no publisher or signing secrets.
 It performs a fresh public read of target `master`, the immutable tag and
 peeled commit, signatures, Release immutability and assets, and—after a stable
-release—the floating alias. It writes an Actions summary with observed state
-and an exact recovery action for every incomplete step.
+release—the floating alias. Its Actions summary records the observed state and
+one closed recovery result: `recovery_code=none` when verification is complete,
+or a supported non-success recovery code with the exact next action when any
+required state is incomplete, conflicting, or could not be proved. The summary
+must not omit the recovery result or substitute an open-ended instruction to
+guess at repair.
 
 Every full SemVer, including every prerelease, minor, and patch version,
 receives its immutable full tag and immutable GitHub Release. Marketplace is a
@@ -378,9 +387,46 @@ For the first stable release of a major, the separate Marketplace UI task may
 be completed after publisher success; its completion is not machine read-back
 evidence and is not a publisher admission condition. Dedicated
 immutable-tag and floating-alias canary jobs are deferred and are not v2.0
-publication or rollout gates. Prereleases may be published and tested by
-immutable full tag, but they are not production selectors and do not move
-`v2`.
+publication or rollout gates. The manual default-branch RC admission bridge
+below reuses the existing consumer workflows; it is not one of those deferred
+dedicated canary jobs. Prereleases are never production selectors and do not
+move `v2`.
+
+### Stable v2.0 RC admission bridge
+
+Before publishing stable `v2.0.0`, first publish one immutable
+`v2.0.0-rc.N` full tag and prove a complete live gate loop in the designated
+test consumer repository. Do not change the production bootstrap `@v2`
+templates or their normal floating selectors. Use this owner-reviewed,
+short-lived default-branch bridge instead:
+
+Prepare the bridge manually; do not add an RC override to the production
+bootstrap or activate the production v2 ruleset for this temporary admission
+exercise. Existing test-repository protection and the required owner review
+govern the two short-lived default-branch changes.
+
+1. In the designated test consumer, open a selector-only PR that changes only
+   the Action selectors in both installed canonical workflows—the verifier and
+   the controller—from `@v2` to the exact immutable `@v2.0.0-rc.N`. Have the
+   repository owner review it and merge it into the protected default branch.
+2. From that updated default branch, open a separate harmless test PR. Exercise
+   the complete normal `begin-review` and `reconcile` path on its exact head,
+   including the required Codex evidence and final gate result.
+3. Record the harmless test PR's exact head, the controller and verifier run
+   IDs or URLs, and the resolved tag `v2.0.0-rc.N`. After the live gate
+   succeeds, close that harmless test PR without merging it.
+4. Open and merge a forward PR that removes the temporary bridge and restores
+   the exact pre-bridge bytes of both default-branch workflows. If that state
+   contained the canonical production verifier and controller, both selectors
+   return to `@v2`; otherwise remove the temporary RC workflows rather than
+   leaving an immutable RC selector behind.
+
+A PR-local wrapper does not qualify: the trusted verifier and controller,
+including the controller's manual-dispatch contract, are loaded from the
+default branch. A non-default dispatch is likewise unsupported and provides no
+admission evidence. This temporarily merged selector bridge is a manual use of
+the existing consumer contract, not a publisher-integrated immutable-tag
+canary, floating-alias canary, dedicated canary job, or canary orchestrator.
 
 ## Reconcile, retry, and cancellation
 
@@ -456,10 +502,15 @@ scheduled consumer scan, dedicated immutable-tag or floating-alias canary jobs,
 or a separate canary orchestrator as release prerequisites.
 
 Stable `v2.0.0` admission additionally requires a published `v2.0.0-rc.N` and
-one complete live gate loop on a temporary PR in a real consumer repository.
-The RC uses only its immutable full tag; it does not move `v2`. The ordinary
-post-installation `@v2` consumer canary remains separate from the publisher and
-is closed unmerged after success.
+the default-branch RC admission bridge described above in the designated test
+consumer repository. The RC uses only its immutable full tag; it does not move
+`v2`. The selector-only bridge PR is merged temporarily so both trusted
+default-branch workflows resolve the RC, the separate harmless test PR is
+closed unmerged after success, and a forward PR then restores both workflows'
+exact pre-bridge bytes: only a consumer that originally had the canonical
+production verifier and controller returns both selectors to `@v2`; otherwise
+the temporary RC workflows are removed. The ordinary post-installation `@v2`
+consumer canary remains separate from the publisher.
 
 The following are explicitly deferred and must not be represented as completed
 or silently promoted into the current contract:

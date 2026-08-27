@@ -2,19 +2,24 @@
 
 This directory contains the canonical consumer-side assets:
 
-- `.github/workflows/codex-review-gate.yml` is the thin workflow that calls
-  `JoeyTeng/codex-review-gate-action@v2`;
+- `.github/workflows/codex-review-gate.yml` is the read-only pull-request
+  verifier that calls `JoeyTeng/codex-review-gate-action@v2`;
+- `.github/workflows/codex-review-gate-controller.yml` is the protected
+  default-branch controller that admits Codex events and precisely reruns the
+  verifier;
 - `.github/CODEOWNERS` is the default control-plane ownership file; replace
   `@JoeyTeng` with one GitHub user that has `write`, `maintain`, or `admin`
   permission when installing outside Joey-owned repositories;
 - `rulesets/codex-review-gate.json` is the default-branch ruleset, shipped with
   enforcement disabled.
 
-Copy the workflow unchanged. It provides `issue_comment` `created`/`edited`
-bot filtering before runner allocation and the sole manual entry point,
-`workflow_dispatch`. One manual run targets one PR and exact expected head.
-The workflow has no cron, `repository_dispatch`, automatic
-`pull_request_review` job, runtime GitHub App, or ledger.
+Copy both workflows unchanged. The verifier runs for pull-request `opened`,
+`reopened`, `synchronize`, and `ready_for_review` events and emits the sole
+required native CheckRun. The controller provides `issue_comment`
+`created`/`edited` bot filtering before runner allocation and the sole manual
+entry point, `workflow_dispatch`. One manual run targets one PR and exact
+expected head. Neither workflow has cron, `repository_dispatch`, an automatic
+`pull_request_review` job, a runtime GitHub App, or a ledger.
 
 The default runner is `ubuntu-slim`. Set the repository Actions variable
 `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` only when the supported
@@ -31,13 +36,20 @@ qualifying Codex findings remain blocking.
 
 The ruleset template requires `codex/github-review-gate` from expected source
 GitHub Actions (`integration_id: 15368`), a branch that is up to date, and all
-review conversations resolved. Because integration ID 15368 identifies the
-entire GitHub Actions App rather than this one workflow, the ruleset also
-requires Code Owner review and dismisses stale approvals. The template's
-ordinary approval count is zero, so only PRs changing `.github/workflows/` or
-`.github/CODEOWNERS` require the independent control-plane-owner approval; the
-bootstrap helper preserves an existing higher approval count. It has no bypass
-actors. Keep it disabled until the live canary succeeds.
+review conversations resolved. Integration ID 15368 identifies the whole
+GitHub Actions App, not this workflow or a unique producer. The compound
+control plane therefore exact-byte verifies both default-branch workflows,
+rejects noncanonical reserved-name producers and relevant write authority,
+requires Code Owner review for `.github/workflows/` and
+`.github/CODEOWNERS`, and dismisses stale approvals. The template's ordinary
+approval count is zero, so ordinary business-code PRs do not require a human
+approval; the bootstrap helper preserves an existing higher approval count.
+It has no bypass actors. Keep it disabled until the live canary succeeds.
+
+Activation also stops if it would silently make unrelated existing CODEOWNERS
+patterns newly approval-gated. Explicitly review that policy expansion, split
+or remove the unrelated patterns, or establish an equivalent Code Owner policy
+before activating.
 
 Prefer the bootstrap helper over copying the default CODEOWNERS file. Its
 `--control-plane-owner @USER` option preserves unrelated entries, appends the
@@ -58,16 +70,20 @@ process; do not bypass a reported safety failure with a manual copy.
 
 Rollout order:
 
-1. use one migration PR to remove v1, install the canonical v2 workflow, and
+1. use one migration PR to remove v1, install both canonical v2 workflows, and
    install or merge the control-plane CODEOWNERS rules;
 2. obtain an independent approval from the named control-plane owner;
-3. merge that PR so the manual workflow exists on the default branch;
+3. merge that exact reviewed head while every inventoried v1 requirement
+   remains active, then reread the merged/default/head scope before removing
+   the legacy requirement;
 4. import or stage the ruleset as Disabled;
 5. create a separate harmless PR, request `@codex review`, and reconcile its
    exact head when needed;
-6. verify the successful `codex/github-review-gate` status was created by
-   GitHub Actions on that exact head;
-7. activate the ruleset; and
+6. verify exactly one successful native `codex/github-review-gate` CheckRun on
+   the exact current PR test-merge SHA, bound to the canonical verifier
+   run/job, with no same-name legacy commit status or competing CheckRun;
+7. read back the unchanged disabled ruleset and control plane, activate it,
+   and read the active policy back exactly; and
 8. close the canary without merging it.
 
 Installation documentation:

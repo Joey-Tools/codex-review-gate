@@ -4,7 +4,7 @@ Languages: [British English (en-GB)](DESIGN.md) | [简体中文 (zh-CN)](DESIGN.
 
 ## Goal
 
-v2 supplies a low-cost, fail-closed required status for one pull request at a
+v2 supplies a low-cost, fail-closed native required CheckRun for one pull request at a
 time. It must not report success while qualifying Codex findings are present,
 while evidence is incomplete or unstable, or after the selected PR head has
 changed. It favours recovery from GitHub's current state over durable private
@@ -14,8 +14,10 @@ write.
 Existing GitHub controls keep their native responsibilities:
 
 - GitHub stores PR lifecycle, comments, reviews and reactions;
-- the consumer workflow owns narrow event admission, permissions and
-  serialisation;
+- two copied consumer workflows own separate event admission, permissions and
+  serialisation boundaries;
+- managed CODEOWNERS plus Code Owner review protect both workflows as part of
+  the compound no-runtime-App control plane;
 - the Action reconstructs and reduces non-inline Codex evidence;
 - the ruleset requires the status, branch freshness, resolved conversations
   and non-fast-forward protection; and
@@ -27,45 +29,83 @@ The Action is not a second conversation resolver or branch-protection system.
 ## Architecture and trust boundaries
 
 ```text
-eligible Codex issue_comment   qualifying base retarget   protected workflow_dispatch
-             |                           |                           |
-             +---------------------------+---------------------------+
-                                v
-                copied canonical consumer workflow
-                - pre-runner identity filter
-                - typed inputs and narrow permissions
-                - one-PR concurrency
+pull_request opened/reopened/synchronize/ready_for_review
                                 |
                                 v
-          JoeyTeng/codex-review-gate-action@v2 (API only)
-                - bind one PR and expected head
-                - write pending on that head
-                - rebuild fully paginated evidence
-                - reduce finding / clean / pending
-                - require two stable snapshots for clean
+          copied read-only canonical verifier
                                 |
-                 +--------------+----------------+
-                 v                               v
-       codex/github-review-gate          summary + best-effort sticky
-                 |
-                 v
- ruleset: required status + up to date + conversations resolved + no force-push
+          JoeyTeng/codex-review-gate-action@v2
+          - bind PR head, base and test-merge SHA
+          - fully paginate and reduce GitHub evidence
+          - require two stable snapshots for clean
+                                |
+                                v
+         native CheckRun codex/github-review-gate
+                                |
+                                v
+ ruleset: expected source + Code Owner review + stale dismissal
+          + up to date + conversations resolved + no force-push
+
+Codex issue_comment created/edited       protected workflow_dispatch
+                 |                                  |
+                 +----------------------------------+
+                                v
+          copied protected-default-branch controller
+          - exact pre-runner bot filter / typed inputs
+          - create or adopt review request
+          - establish and read back newer verifier attempt
+                                |
+                                +---- full rerun ----> verifier
+                                +---- summary / best-effort sticky
 ```
 
-### Consumer workflow
+### Consumer workflows
 
-The copied canonical workflow is trusted repository configuration and is the
-supported consumer envelope. A bare Action step cannot own events,
-runner-admission filters, permissions, typed dispatch or concurrency.
+The copied canonical verifier and controller are trusted repository
+configuration and form the supported consumer envelope. A bare Action step
+cannot own events, runner-admission filters, permissions, typed dispatch or
+concurrency.
 
-Automatic admission covers `issue_comment` `created`/`edited` and one narrow
-`pull_request_target` `edited` case. Comment admission checks both event sender
-and comment author against exact login `chatgpt-codex-connector[bot]` and exact
-type `Bot` before runner allocation. Base-edit admission requires an actual
-`changes.base.ref.from` transition whose current base is the same repository's
-default branch. Title/body-only edits do not allocate a runner. The Action
-revalidates the admitted event because the two checks protect different
-boundaries.
+The two workflows, managed `.github/CODEOWNERS` control plane and supplied ruleset
+are one installation contract. The canonical helper installs both workflows and
+the two final effective CODEOWNERS rules for `/.github/workflows/` and
+`/.github/CODEOWNERS`; callers explicitly select a GitHub user with `write`,
+`maintain` or `admin` permission as `--control-plane-owner @USER`. The first
+installation PR needs that owner's exact-current-head approval because its new
+base-branch CODEOWNERS policy cannot enforce its own bootstrap. That approval
+is necessary but insufficient: keep legacy protection through merge, bind a
+canonical read-only inventory SHA-256 into the approval snapshot, and require
+the final transaction to rebuild the strict inventory and match that external
+digest. The inventory binds complete ruleset `bypass_actors` and the complete
+matching effective `required_status_checks` rule with every parameter, not
+merely one matching check. It then authenticates the owner as current actor, rereads the latest
+exact-head approval, and synchronously merges the exact SHA. Immediately after
+merge, it rereads the current default and requires the PR's merged lifecycle,
+base, and head to remain the exact approved scope. Failure preserves every
+legacy requirement active; only success permits the separately authorised plan
+to remove and read back the inventoried legacy requirements.
+The migration PR carries both workflows plus CODEOWNERS. The ruleset is staged only
+after merge as Disabled, proved by canary, then activated with no bypass
+actors. Once active, Code Owner review and stale-approval dismissal protect
+later changes. Required check `integration_id: 15368` denotes the entire GitHub
+Actions App, so it is not by itself proof that the canonical verifier produced
+the CheckRun. Exact bytes, complete workflow inventory, CODEOWNERS, Code Owner
+review, strict freshness, no bypass and canary collision readback provide the
+adopted compound boundary.
+
+The verifier admits only `pull_request` `opened`, `reopened`, `synchronize` and
+`ready_for_review`. It fails closed outside same-repository, open, ready,
+default-base scope. `edited` is deliberately absent: after a base retarget, a
+ready PR must be converted to draft and marked ready again, while an
+already-draft PR is marked ready. The new `ready_for_review` event creates a
+verifier on the current base and test-merge SHA; rerunning the old event does
+not.
+
+The controller admits `issue_comment` `created`/`edited` and default-branch
+`workflow_dispatch`. Comment admission checks both event sender and comment
+author against exact login `chatgpt-codex-connector[bot]` and exact type `Bot`
+before runner allocation. The Action revalidates the admitted event because
+the two checks protect different boundaries.
 
 The only manual entry is `workflow_dispatch` using the protected default-
 branch workflow. The manual inputs are closed and typed as documented in
@@ -73,42 +113,47 @@ branch workflow. The manual inputs are closed and typed as documented in
 writers with the native repository and Actions permission to dispatch are an
 explicit trust boundary; v2 does not maintain a hard-coded actor allowlist.
 
-There is no cron, `repository_dispatch`, broad `pull_request` reset job or
-writable automatic `pull_request_review` job. The absence of cron avoids
+There is no cron, `repository_dispatch`, `pull_request_target` or writable
+automatic `pull_request_review` job. The absence of cron avoids
 billable no-op runs in private repositories. Review-object and reaction
 changes that do not create or edit a qualifying issue comment converge through
 manual reconcile.
 
 All runtime jobs are API-only. They do not check out or execute consumer or PR
-code. The permission ceiling is:
+code. The verifier is read-only. The controller alone receives the narrow
+mutation surface needed to create requests and rerun the exact verifier:
 
 ```yaml
 permissions:
+  actions: write
+  checks: read
   contents: read
   issues: write
   pull-requests: read
-  statuses: write
 ```
 
-The runtime does not need `actions: read`, checks/content/PR write, OIDC or a
-dedicated GitHub App. The separate publisher App is never installed in a
-consumer repository.
+Neither workflow receives statuses/checks/content/PR write or OIDC authority.
+There is no dedicated runtime GitHub App. The separate publisher App is never
+installed in a consumer repository.
 
 ### Dispatch and Action inputs
 
 `workflow_dispatch` exposes `operation`, `pr_number`, `expected_head_sha`,
-optional `request_comment_id`, `request_review` and `limits_profile`. Every
+optional `request_comment_id` and `request_review`. Every
 value is untrusted and revalidated against GitHub. The manual path requires a
 full expected SHA. The automatic issue-comment path may omit it; runtime then
 binds the authoritative PR head at startup. Both paths freeze that head for the
 remainder of the run.
 
-The Action uses underscore-named inputs `github_token`, `pr_number`,
-`expected_head_sha`, `operation`, `request_comment_id`, `request_review` and
-`limits_profile`. `operation` is closed to `reconcile|begin-review`,
-`limits_profile` to `default|expanded`, and `request_review` is boolean.
+The controller Action uses underscore-named inputs `github_token`, `pr_number`,
+`expected_head_sha`, `operation`, `request_comment_id` and `request_review`.
+`operation` is closed to `reconcile|begin-review`, and `request_review` is boolean.
 Verdicts, identities, status context, stale overrides, numeric limits and
 skip-reconcile controls are not inputs.
+
+Both Action steps derive `limits_profile=default|expanded` only from protected
+repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`. Dispatch has no profile
+or numeric override.
 
 `request_comment_id` is only a locator hint. The reducer may use it to avoid
 unnecessary backward requests, but must prove that every newer relevant
@@ -119,12 +164,13 @@ accounted for before stopping. A hint never supplies evidence authority.
 
 ### `begin-review`
 
-`begin-review` validates the selected supported PR and bound head, writes
-pending on that exact SHA, and by default posts a fresh exact
-`@codex review` request with the canonical workflow marker. The marker binds
+`begin-review` validates the selected supported PR and bound head, and by
+default creates or safely adopts a fresh exact `@codex review` request with the
+canonical controller marker. The marker binds
 the v2 format, full head, current base repository/ref/SHA and workflow run.
-`request_review=false` performs the pending transition without posting; it is
-best effort and creates no special barrier.
+`request_review=false` skips posting; it is best effort and creates no special
+barrier. After exact request readback, the controller establishes a newer full
+verifier attempt.
 
 A logical workflow-authored request attempt is bound to repository ID, PR,
 expected head and `GITHUB_RUN_ID`. A rerun may adopt its own exact, unedited,
@@ -136,7 +182,7 @@ the failure became visible. The caller waits for the exact same-run marker to
 settle and, if it remains absent, reruns the original workflow run; an immediate
 retry or distinct dispatch could create a duplicate generation.
 
-Same-PR writers use `cancel-in-progress: false`. This serialises active writers
+Same-PR controllers use `cancel-in-progress: false`. This serialises active writers
 but cannot prevent GitHub from replacing a not-yet-started pending run. A
 caller therefore observes the exact `begin-review` run complete before treating
 it as a barrier or posting a dependent request.
@@ -144,20 +190,22 @@ it as a barrier or posting a dependent request.
 Agents normally start Codex directly with exact `@codex review` when the check
 is not already passing, avoiding an Actions runner while other checks run.
 `begin-review` remains the coordinated path, especially for a deliberate
-same-head re-review that must first invalidate an earlier success.
+same-head re-review that must establish a newer verifier generation.
 
 ### `reconcile`
 
 Manual reconcile requires the caller's full `expected_head_sha`; the automatic
-path binds the equivalent value at startup. Runtime rereads the PR and, only
-while the head still equals that value, replaces that SHA's gate status with
-pending before collecting evidence. Pending makes an interrupted recheck
-fail-closed and invalidates an earlier success during a deliberate re-review.
+path binds the equivalent value at startup. The controller rereads the PR,
+locates exactly one canonical verifier on its current test-merge SHA, records
+baseline attempt `A`, establishes that no canonical attempt is queued or
+running, requests one full rerun, and requires exact attempt `A+1` plus its
+unique job/CheckRun to become observable. A jump, duplicate, ambiguous POST or
+unreadable inventory remains blocking and is never blindly retried.
 
-A stale run never follows a different head and never projects its result there.
-A head change requires a fresh invocation with the new current head. This is
-the protected property of status projection: every decision belongs only to
-the head that was explicitly or authoritatively bound at run start.
+The verifier is latest-generation single-flight with `cancel-in-progress:
+true`; cancellation cannot satisfy the gate. A stale verifier never follows a
+different head, base or test-merge SHA. Direct commit-status projection and its
+old mutation/readback state are deleted.
 
 ## Authority model
 
@@ -205,6 +253,11 @@ qualifying `+1` directly attached to the latest strictly post-epoch,
 base-bound canonical workflow request is a positive or superseding carrier.
 An unlineaged terminal clean remains diagnostic evidence and cannot pass or
 clear a finding. This is a deliberate fail-closed exception to carrier parity.
+Ordinary request reactions are provider-liveness signals only; ordinary `+1`
+cannot head-bind clean. Same-time/later official `eyes`/progress from Codex
+vetoes candidate clean evidence. Because reaction changes do not trigger the
+consumer workflow, a later provider event or manual reconcile must observe the
+settled state.
 When a terminal carrier includes a reviewed commit, a full or abbreviated SHA
 is accepted only if GitHub resolves it unambiguously to the current bound head.
 For a pull-request review, the resolved commit must also equal native
@@ -275,9 +328,11 @@ Workflow markers bind the current base directly. Findings remain conservative.
 The imported ruleset blocks non-fast-forward
 default-branch updates, and strict up-to-date handles ordinary fast-forward
 movement that expands the required head. If an administrator temporarily
-disables those protections and force-pushes anyway, the next exact reconcile
-recovers to pending from the timeline, but v2 cannot reset the status in real
-time without adding a push listener, webhook App or cron.
+disables those protections and force-pushes anyway, the next exact verifier
+reconstructs the timeline and remains blocking. V2 does not claim atomic
+invalidation of an older same-SHA success after arbitrary provider activity;
+the documented exact-current merge closure supplies that eventual boundary
+without a webhook App or cron.
 
 The stability/reconcile budget is shared across retries. If it expires without
 a stable clean pair, runtime reports `unhealthy/pending` with
@@ -300,8 +355,9 @@ The profiles are policy, not arbitrary dispatch numbers:
 
 Page size is 100, one response is capped at 8 MiB, the clean inter-read delay
 is five seconds and the workflow job timeout is 14 minutes. Repositories with
-legitimate large PRs may persistently select the reviewed `expanded` profile.
-Per-dispatch numeric overrides are deferred beyond v2.0.
+legitimate large PRs may persistently select the reviewed `expanded` profile
+through protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`.
+Per-dispatch profile and numeric overrides are deferred beyond v2.0.
 
 ## Result and projection model
 
@@ -324,20 +380,30 @@ Legal semantic combinations are:
 | Health/outcome | Meaning |
 | --- | --- |
 | `healthy/success` | Two stable complete snapshots proved current-head clean. |
-| `healthy/failure` | Qualifying findings were proved and failure status was projected. |
-| `unhealthy/failure` | Findings were proved but failure-status projection failed. |
-| `healthy/pending` | Provider evidence is not terminal yet. |
+| `healthy/failure` | Qualifying findings were proved. |
+| `unhealthy/failure` | Findings were proved but execution or final result handling also failed. |
+| `healthy/pending` | Evaluation completed safely, but current state cannot authorise success yet. Follow `recovery_code`; only `wait_provider` is a pure wait. |
 | `unhealthy/pending` | API, pagination, cap or stability execution is incomplete. |
 | `healthy/not_applicable` | A delayed automatic event is stale. |
 | `unhealthy/not_applicable` | A manual target is invalid or the scope is unsupported. |
-| `unhealthy/unknown` | No trusted state can be read or projected. |
+| `unhealthy/unknown` | No trusted state can be read. |
 
-`unhealthy/success` is forbidden. Workflow conclusion represents execution
-health. The commit status on the bound head represents gate outcome. This
-keeps ordinary findings distinct from evaluator failure.
+Every pending result remains blocking; `healthy/pending` is not a weak
+success.
 
-`status_projection` is summary-only. When no additional evidence query is
-needed, the summary and sticky also report `findings_unresolved`,
+`unhealthy/success` is forbidden. The verifier job maps only a stable
+`healthy/success` to a successful native conclusion. Every other pair maps to
+a blocking conclusion, keeping ordinary findings distinct from evaluator
+failure. The required verifier CheckRun belongs to the exact current PR
+test-merge SHA. The controller's CheckRun is bound to the default-branch commit and
+never supplies the required PR result. Direct status projection and
+`statusProjection` are deleted.
+
+Every result is interpreted through its `recovery_code`; the health/outcome
+pair is not an instruction by itself. Only `wait_provider` is a pure wait.
+
+When no additional evidence query is needed, the summary and sticky report
+`findings_unresolved`,
 `findings_resolved`, `findings_historical` and `findings_indeterminate`.
 Incomplete pagination, API failure or cap hits make affected values `unknown`,
 not zero. These are diagnostics for normalised non-inline findings, not public
@@ -348,8 +414,8 @@ action. They expose object identities, digests, bounded escaped excerpts and
 links when useful, but never tokens, headers, raw payload dumps or untrusted
 workflow commands.
 
-At-least-once recovery may create small duplicate requests, statuses or
-diagnostic attempts after an unknown write result. Duplicates are folded or
+At-least-once recovery may create small duplicate requests, verifier attempts
+or diagnostic comments after an unknown write result. Duplicates are folded or
 reported conservatively; they never authorise selection of a convenient clean
 or omission of a finding.
 
@@ -359,15 +425,18 @@ Stable A/B snapshots prove only a short observation window; they do not lock
 the PR. Immediately before merge, an agent must:
 
 1. reread the exact current PR head;
-2. dispatch `reconcile` for that exact head;
-3. require Action output `healthy/success`;
-4. reread `codex/github-review-gate` from expected source GitHub Actions on the
-   same unchanged head; and
-5. require the ruleset to confirm branch up to date, all conversations
+2. dispatch controller `reconcile` for that exact head;
+3. observe the strictly newer verifier attempt and its unique canonical
+   `codex/github-review-gate` CheckRun on the current test-merge SHA;
+4. require Action output `healthy/success` and a successful verifier conclusion;
+5. reread unchanged PR head, base and test-merge SHA; and
+6. require the ruleset to confirm branch up to date, all conversations
    resolved and merge allowed.
 
-Any head or policy change restarts this closure. A previous success is never a
-permanent review lease.
+Any head or policy change restarts this closure. Merge immediately with an
+exact-head compare-and-swap such as `gh pr merge --match-head-commit
+"$HEAD_SHA"`. A previous success is never a permanent review lease, and direct
+human UI merge outside this closure is unsupported.
 
 ## Supported boundary and non-goals
 
@@ -387,13 +456,17 @@ The design does not claim that:
 - an ambiguous short SHA can be made safe by guessing;
 - the Action duplicates branch freshness or conversation resolution;
 - a stale run follows or repairs a new head;
-- a status is scoped to a PR rather than its commit SHA; or
+- the required CheckRun proves workflow provenance beyond the compound
+  CODEOWNERS/inventory/canary boundary; or
 - the release publisher App contributes runtime authority.
 
 ## v1 isolation
 
 v1 remains frozen and valid for consumers that have not migrated. v2 does not
 read v1 state, publish a compatibility selector, mutate v1 refs or fall back to
-the v1 reducer. Migration removes the v1 installation and installs the complete
-v2 workflow/ruleset in one PR, then verifies v2 in a separate harmless canary
-PR that is closed unmerged.
+the v1 reducer. Migration removes the v1 caller and installs the canonical v2
+workflow plus CODEOWNERS in one PR after the pre-merge canonical inventory
+fingerprint closure. It then removes and reads back the inventoried legacy
+requirements, stages the v2 ruleset as Disabled, verifies
+it in a separate harmless canary PR, then activates it and closes the canary
+unmerged.

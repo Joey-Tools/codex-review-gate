@@ -10,8 +10,8 @@
 
 - `packages/action/`：完整 Action release subtree，包括 root `action.yml` 与 JavaScript
   runtime；
-- `templates/codex-gated-repo/`：canonical copied consumer workflow 与 Disabled
-  importable ruleset；
+- `templates/codex-gated-repo/`：两份 canonical copied consumer workflows 与
+  Disabled importable ruleset；
 - `src/bootstrap.mjs` 与 `scripts/bootstrap-codex-review-gate.mjs`：本地安装和远端
   ruleset staging/activation helper；
 - `docs/install/`：同一安装流程的人类可读指南与 agent 可执行版本，均提供中英文；
@@ -39,19 +39,27 @@ npm run test:release-provenance
 
 ## Consumer 模型
 
-V2 consumer 把
-`templates/codex-gated-repo/.github/workflows/codex-review-gate.yml` 复制到目标仓库的
-同一路径。Wrapper 调用兼容的 floating major：
+V2 consumer 把两份 canonical workflows 复制到目标仓库的相同路径：
+
+- `.github/workflows/codex-review-gate.yml` 是只读 `pull_request` verifier；它在 PR
+  test-merge SHA 上生成 GitHub-managed job CheckRun
+  `codex/github-review-gate`，这就是 required signal。
+- `.github/workflows/codex-review-gate-controller.yml` 是受保护 default branch 上的
+  controller；它接收 exact Codex events 与 typed manual operations、创建 review request，
+  并在需要 reconcile 时建立严格更新的 full verifier attempt。
+
+两份 workflows 都调用兼容的 floating major：
 
 ```yaml
 uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
-Copied wrapper 负责 triggers、最小 permissions、per-PR concurrency、typed
+Copied workflows 分别负责 triggers、最小 permissions、独立 per-PR concurrency、typed
 `workflow_dispatch`、runner 分配前的 exact Codex-bot filtering，以及受保护 repository
-configuration。Action 仅访问 API，绝不 checkout 或执行 PR code。
+configuration。Action 仅访问 API，绝不 checkout 或执行 PR code。V2 没有 commit-status
+bridge；只有 verifier 在 PR test-merge SHA 上的 native CheckRun 能满足 gate。
 
-Required status 是 `codex/github-review-gate`。Importable ruleset 把它绑定到 GitHub
+Required CheckRun 是 `codex/github-review-gate`。Importable ruleset 把它绑定到 GitHub
 Actions（`integration_id: 15368`），要求 branch up to date、all review conversations
 resolved、阻止 default-branch non-fast-forward updates，并且没有 bypass actors。
 不支持 “Any source”。
@@ -63,34 +71,30 @@ canary、不合并。
 
 ## Bootstrap
 
-先 dry run，再显式 apply 到 consumer worktree：
+先选择一个对 consumer repository 拥有 `write`、`maintain` 或 `admin` 权限的
+control-plane owner，再 dry run 并显式 apply 到 consumer worktree。Generic
+quickstart 的每个阶段都必须显式传入同一个 owner：
 
 ```bash
-node scripts/bootstrap-codex-review-gate.mjs \
-  --prepare-worktree /path/to/consumer
+CONTROL_PLANE_OWNER=@USER
 node scripts/bootstrap-codex-review-gate.mjs \
   --prepare-worktree /path/to/consumer \
+  --control-plane-owner "$CONTROL_PLANE_OWNER"
+node scripts/bootstrap-codex-review-gate.mjs \
+  --prepare-worktree /path/to/consumer \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
   --apply
 ```
 
-Canonical workflow 进入 consumer 默认分支后，以 Disabled 状态 stage ruleset：
+这个 quickstart 只完成 local preparation，不能授权或替代完整
+[人类安装指南](docs/install/human.zh-CN.md)与
+[Agent 执行手册](docs/install/agent.zh-CN.md)中的 repository-side preconditions、trusted-owner
+synchronous merge transaction、legacy protection inventory、canary 与 activation
+readbacks。不得只依据这个缩略示例执行 merge 或 activation。
 
-```bash
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
-```
-
-Activation 必须绑定 successful exact-head canary，并重新读取 evidence 与写入后的
-ruleset：
-
-```bash
-node scripts/bootstrap-codex-review-gate.mjs \
-  --repo OWNER/REPO \
-  --apply \
-  --activate \
-  --canary-pr PR_NUMBER \
-  --canary-head FULL_HEAD_SHA
-```
+Helper 默认的 `@JoeyTeng` 只适用于 Joey-owned repositories。其他仓库必须显式提供
+自己的合格 `@USER`；generic installation 不得依赖这个默认值。后续 repository staging、
+canary 与 activation 必须通过上面的某一份完整指南继续。
 
 ## 发布模型
 

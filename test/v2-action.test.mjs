@@ -6,6 +6,9 @@ const ACTION_YAML_URL = new URL("../packages/action/action.yml", import.meta.url
 
 test("direct gate Action exposes the adopted production ABI and entrypoint", () => {
   const action = readFileSync(ACTION_YAML_URL, "utf8");
+  assert.match(action, /Verify Codex review evidence or refresh the canonical pull-request verifier/u);
+  assert.match(action, /controller to update diagnostics and rerun the verifier/u);
+  assert.doesNotMatch(action, /write the gate status|commit status|status projection/iu);
   const inputs = yamlSection(action, "inputs", "outputs");
   assert.deepEqual(topLevelYamlKeys(inputs), [
     "github_token",

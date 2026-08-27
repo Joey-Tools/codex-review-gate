@@ -2,9 +2,10 @@
 
 语言：[British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
-Codex Review Gate 把单个 PR 上可信的 OpenAI Codex review 证据归约为 required
-commit status `codex/github-review-gate`。每次运行都从 GitHub 重建决策；数据库、
-workflow artifact、sticky comment 或旧运行都不是决策 authority。
+Codex Review Gate 把单个 PR 上可信的 OpenAI Codex review 证据归约为 PR test-merge
+SHA 上的 native required CheckRun `codex/github-review-gate`。每次 verifier run 都从
+GitHub 重建决策；数据库、workflow artifact、sticky comment、controller run 或旧
+verifier 都不是决策 authority。
 
 公开 Action 从
 [`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action)
@@ -19,22 +20,59 @@ workflow artifact、sticky comment 或旧运行都不是决策 authority。
 - uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
-仅有这个 step 不算完成安装。请复制完整
-[canonical workflow](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/.github/workflows/codex-review-gate.yml)，
-并导入附带的
-[disabled ruleset 模板](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json)。
-复制的 workflow 负责 triggers、typed dispatch inputs、permissions、concurrency、
-runner 启动前事件过滤和稳定 status context。reusable workflow 不是 v2 consumer
-ABI。
+仅有这个 step 不算完成安装。完整安装包含三个完整必需资产组：
 
-ruleset 必须同时要求四个服务器端条件：
+- 完整 two-workflow bundle：只读
+  [canonical verifier](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/.github/workflows/codex-review-gate.yml)
+  与受保护 default branch 上的
+  [canonical controller](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml)；
+- `.github/CODEOWNERS` 受管控制面，其最后生效的两条规则分别保护
+  `/.github/workflows/` 与 `/.github/CODEOWNERS`；
+- 附带的
+  [disabled ruleset 模板](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json)。
+
+请使用 canonical
+[`bootstrap-codex-review-gate.mjs`](https://github.com/Joey-Tools/codex-review-gate/blob/master/scripts/bootstrap-codex-review-gate.mjs)
+helper 安装，并始终显式传入 `--control-plane-owner @USER`；不要手工重建 workflow
+或受管 CODEOWNERS rules。所选 owner 必须是对 consumer repository 拥有 `write`、
+`maintain` 或 `admin` 权限的 GitHub user。第一次 installation PR 合并前，必须取得该
+owner 的独立 exact-head approval。首次 migration PR 只包含两份 canonical workflows 与
+CODEOWNERS，不在其中修改 ruleset。合并前移除所有 legacy `codex/review-gate`
+requirement 并不安全；应保留旧保护，把 canonical read-only legacy inventory
+SHA-256 绑定进 owner approval snapshot，并在 final transaction fresh 重建、精确匹配。
+Inventory 包含完整 ruleset `bypass_actors` 与全部 parameters 的完整 matching effective
+`required_status_checks` rule，而不只是 matching check。
+随后要求 authenticated actor 就是该 owner、fresh 重读 owner exact-head approval，并调用
+synchronous exact-SHA merge endpoint。Merge 后先立即重读 current default，并要求 PR
+确已 merged、base/head 仍精确等于 approved scope；readback 失败时保留全部 legacy
+requirements active。只有 readback 成功后，才在单独授权下删除并读回 inventoried legacy
+requirements。
+仅有 approval 与 head reread 不足以闭环。Merge 后把 supplied ruleset 以 Disabled stage，
+通过无害 canary 证明后才 activate。
+
+复制的 workflows 分别负责 triggers、typed dispatch inputs、permissions、独立
+concurrency namespace 与 runner 启动前事件过滤。verifier 的 GitHub-managed job
+CheckRun 是稳定 required signal。reusable workflow 与 commit-status bridge 都不是 v2
+consumer ABI。
+
+ruleset 必须同时要求以下服务器端条件：
 
 - `codex/github-review-gate`，expected source 为 GitHub Actions；
 - branch up to date；
+- 对受保护 workflow 与 CODEOWNERS paths 要求 Code Owner review；
+- push 后 dismiss stale approvals；
 - 所有 review conversations 均已 resolved；
-- 禁止 default branch 的 non-fast-forward updates。
+- 禁止 default branch 的 non-fast-forward updates；
+- bypass actors 为空。
 
-在无害 canary 证明实际 status source 和完整接线前，保持导入的 ruleset disabled。
+GitHub required check 的 `integration_id: 15368` 只标识整个 GitHub Actions App
+（the entire GitHub Actions App），不能只标识任一 workflow。两份 canonical workflow
+exact-byte verification、fail-closed workflow inventory、受管 CODEOWNERS、required Code
+Owner review、stale-approval dismissal、strict up-to-date、no bypass actors 与 canary
+collision checks 共同构成 compound control-plane boundary；这不是单一 workflow 的
+cryptographic proof。
+
+在无害 canary 证明实际 native CheckRun source 和完整接线前，保持导入的 ruleset disabled。
 [人类可读指南](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/human.zh-CN.md)
 向人解释安装流程；
 [agent 可执行指南](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/agent.zh-CN.md)
@@ -42,23 +80,29 @@ ruleset 必须同时要求四个服务器端条件：
 
 ## Trigger 契约
 
-canonical workflow 只有以下入口：
+canonical verifier 只有一个入口：
 
-- activity type 为 `edited` 的 `pull_request_target`，且只允许实际 retarget 回
-  repository default branch；
+- activity types 为 `opened`、`reopened`、`synchronize` 与 `ready_for_review` 的
+  `pull_request`。
+
+受保护 default branch 上的 controller 只有以下入口：
+
 - activity types 为 `created` 和 `edited` 的 `issue_comment`；
 - 为单个明确指定 PR 运行的 `workflow_dispatch`。
 
-没有 cron、`repository_dispatch`、宽泛的 `pull_request` reset job 或可写 status
-的自动 `pull_request_review` job。review objects 和 reaction-only completion 由
-之后的 reconcile 发现。
+没有 cron、`repository_dispatch`、`pull_request_target`、可写自动
+`pull_request_review` job、runtime GitHub App 或 status writer。review objects 和
+reaction-only completion 由之后的 authoritative verifier reconcile 发现。
 
 只有 event sender 和 comment author 都是 exact Codex provider
 `chatgpt-codex-connector[bot]`、GitHub type `Bot` 时，自动 comment job 才会在
 runner 分配前被 admit。Action 在 runner 启动后再次校验 identity 和 scope。
 edited Codex comment 可能使旧决策失效，所以 `created` 与 `edited` 都必须 admit。
-base-retarget job 同样在 runner allocation 前筛选：title、body 或其他 edit 不会启动
-runner。符合条件的 retarget 会立即把 unchanged head 上持久化的旧 success 改为 pending。
+verifier 会在 PR 不是 same-repository、open、ready 或 current-default-base 时 fail
+closed。`pull_request.edited` 被明确排除，所以 base retarget 不会生成 current verifier。
+对于 ready PR，先转为 draft 再 mark ready；对于已经是 draft 的 PR，直接 mark ready。
+新的 `ready_for_review` event 会为新 base 与 test-merge SHA 创建 verifier；native rerun
+旧 event 不能代替这一步。
 
 manual run 使用受保护 default branch 上的 workflow；feature-ref dispatch 不受
 支持。typed `workflow_dispatch` business inputs 是：
@@ -70,33 +114,35 @@ manual run 使用受保护 default branch 上的 workflow；feature-ref dispatch
 | `expected_head_sha` | string | 必填完整 expected PR-head SHA；stale run 绝不跟随不同 head。 |
 | `request_comment_id` | string | 可选 evidence-location hint；绝不是 authority。 |
 | `request_review` | boolean | 默认为 `true`；控制 `begin-review` 是否发送 request。 |
-| `limits_profile` | choice | `default` 或 `expanded`；默认为 `default`。 |
 
 所有 dispatch values 都是不可信输入，必须与 GitHub 重新校验。inputs 不能提供
-verdict、provider identity、status context、stale override、数值型 resource
-limit，或跳过 full reconcile 的权限。只有在 runtime 证明没有跳过任何更新的相关
+verdict、provider identity、required-check result、stale override、limits profile、
+数值型 resource limit，或跳过 full reconcile 的权限。只有在 runtime 证明没有跳过任何更新的相关
 证据后，hint 才能帮助 early stop。GitHub 在 Action boundary 会把 typed numeric
 `pr_number` 暴露为 string；Action 仍要求其为 canonical positive decimal
 representation。
 
-Action step 使用对应的 underscore 命名 inputs：`github_token`、`pr_number`、
-`expected_head_sha`、`operation`、`request_comment_id`、`request_review` 和
-`limits_profile`。`github_token` 与 `pr_number` 必填。manual run 必须提供完整
+controller Action step 使用对应的 underscore 命名 inputs：`github_token`、`pr_number`、
+`expected_head_sha`、`operation`、`request_comment_id` 与 `request_review`。
+`github_token` 与 `pr_number` 必填。manual run 必须提供完整
 `expected_head_sha`；自动 comment 路径可以留空，让 runtime 在启动时绑定
-authoritative head。两条路径都不能跟随之后发生的 head change。
+authoritative head。两条路径都不能跟随之后发生的 head change。两份 Action steps 只从
+受保护 repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 获得 `default` 或
+`expanded`；dispatch caller 不能覆盖该值。
 
 ## Operations
 
 ### `begin-review`
 
-`begin-review` 校验 exact PR 和 expected head，在该 head 上建立 pending，并默认
-发送一条带 canonical hidden binding 的 fresh exact `@codex review` request。
-`request_review=false` 只建立 pending；这是 advanced best-effort option，不会增加
-专用 cross-job barrier。
+`begin-review` 校验 exact PR 和 expected head，并默认创建或安全采用一条带 canonical
+hidden binding 的 fresh exact `@codex review` request。它先精确读回该 request，再请求
+exact current verifier 的 full rerun。`request_review=false` 是 advanced best-effort
+option，不会增加专用 barrier。
 
-同一 PR 的 runs 使用 `cancel-in-progress: false` 串行化。GitHub 仍可能替换尚未
-启动的 pending workflow run，所以必须观察 exact `begin-review` run 完成，才能把
-它视为 barrier 或发送依赖它的 request。
+同一 PR 的 controller runs 使用 `cancel-in-progress: false` 串行化。controller 记录
+verifier attempt `A`、要求没有 competing canonical attempt、只请求一次 full rerun，
+并必须观察 exact attempt `A+1` 及其唯一 canonical job/CheckRun。POST 不确定或新 attempt
+不可见时仍保持 blocking；concurrency 只是 scheduling，不是 mutation fence。
 
 普通低成本路径中，agent 可以在其他 checks 运行时直接发送 exact
 `@codex review`，只在需要 reconcile 时调用 GHA。workflow 必须协调 pending
@@ -105,9 +151,10 @@ same-head re-review。
 
 ### `reconcile`
 
-`reconcile` 首先重读所选 PR。只有其 head 仍等于绑定的 expected head 时，它才会
-把该 exact SHA 的 gate status 改为 pending 并收集证据。它绝不把本次运行重定向到
-new head，也不向 new head 写入本次决策。head 变化必须由之后的新运行处理。
+`reconcile` 重读所选 PR，并为 current test-merge SHA 定位唯一 canonical verifier。
+随后使用同一套 baseline/rerun/readback handshake 建立严格更新的 full verifier attempt。
+controller 不提供 verdict，也不改写 CheckRun；只有只读 verifier 收集证据，其 native job
+conclusion 承载 required result。
 
 reducer 读取符合条件的 Codex top-level issue comments 和 PR review bodies。
 inline review threads 有意留在 reducer 外；ruleset 的 “all conversations
@@ -134,6 +181,10 @@ clean 保持 pending，runtime 不会猜测它属于新 generation。
 
 除此 base-epoch lineage 例外外，terminal clean 文本和符合条件的 provider `+1`
 具有相同 clean authority。
+ordinary request reactions 仅用于 provider liveness；ordinary `+1` 本身不能
+head-bind clean。same-time/later official `eyes`/progress from Codex 会 veto candidate
+clean，因为 review activity 尚未被证明 terminal。reaction-only change 没有 automatic
+workflow event，必须由 later provider event or manual reconcile 重新观察。
 terminal evidence 指定 reviewed commit 时，可以使用 full 或 short SHA。只有
 GitHub 能把 short SHA 无歧义解析为 current PR head 时才接受；对于 PR review，
 resolved SHA 还必须与 review 原生 `commit_id` 一致。
@@ -203,12 +254,20 @@ refresh_head
 repair_permissions
 retry_begin
 unsupported_target
+create_verifier_run
 ```
 
-workflow conclusion 报告 execution health；expected PR head 上的 status 报告 gate
-outcome。finding 通常得到 `healthy/failure`，而不是 execution error。
-`unhealthy/success` 非法。`status_projection` 与 finding counts 只出现在 summary，
+finding 通常得到 `healthy/failure`，而不是 execution error；`unhealthy/success` 非法。
+在 verifier workflow 中，只有被证明稳定的 `healthy/success` 可以成功结束；findings、
+pending evidence、unsupported scope、cancel、timeout 与全部 unhealthy 结果都保持
+blocking。required verifier CheckRun 属于 exact current PR test-merge SHA。controller 的
+CheckRun 绑定 default-branch commit，绝不是 required PR signal。
+direct status projection 与 `status_projection` 已删除。finding counts 仍只出现在 summary，
 不是 public Action outputs。
+
+`healthy/pending` 不能安全授权 success，即使 evaluator 已可信地完成执行；它不是
+弱化的 success。每一种结果（包括 pending 与 not-applicable）都必须按自己的
+`recovery_code` 前进；only `wait_provider` 是无需 repair 或 reconcile 的 pure wait。
 
 无需额外 evidence query 即可推导时，sticky diagnostic 和 Actions summary 会报告：
 
@@ -227,16 +286,20 @@ authority 和 consistency 模型见 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)，恢复�
 ## Exact-head merge closure
 
 success 是一次 observation，不是永久 lease。merge 前，agent 必须立即用 exact
-current head dispatch `reconcile`，并在一次 final read 中同时要求：
+current head dispatch controller `reconcile`，观察严格更新的 verifier attempt 与其唯一
+canonical CheckRun，并在一次 final read 中同时要求：
 
 - Action result 为 `healthy/success`；
-- 同一 head 上来自 GitHub Actions 的 `codex/github-review-gate` 为 success；
-- PR head 保持不变；
+- 同一 current test-merge SHA 上来自 canonical verifier 的
+  `codex/github-review-gate` 为 success；
+- PR head、base 与 test-merge SHA 保持不变；
 - branch up to date；
 - 所有 review conversations 均已 resolved；
 - ruleset 允许 merge。
 
-任一项变化都必须停止，并对新的 current state 重新 reconcile。
+任一项变化都必须停止，并对新的 current state 重新 reconcile。随后立刻用
+`gh pr merge --match-head-commit "$HEAD_SHA"` 之类的 exact-head compare-and-swap
+完成 merge；跳过此 closure 的 direct human UI merge 不受支持。
 
 ## 支持边界
 

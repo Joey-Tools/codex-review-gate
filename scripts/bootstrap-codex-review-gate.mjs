@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_CODEOWNERS_PATH,
+  DEFAULT_CONTROLLER_WORKFLOW_PATH,
   DEFAULT_CONTROL_PLANE_OWNER,
   DEFAULT_RULESET_ENFORCEMENT,
   DEFAULT_RULESET_NAME,
@@ -26,6 +27,7 @@ import {
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
   buildUpdateRulesetPayload,
+  codeownersHasEffectiveUnmanagedPatterns,
   decodeGitHubBlobContent,
   directoryWitnessFromMetadata,
   ensureControlPlaneCodeownersContent,
@@ -38,27 +40,34 @@ import {
   rulesetHasGatePolicy,
   rulesetHasRequiredStatusContext,
   rulesetWritableFingerprint,
-  validateCanonicalV2WorkflowContent,
+  validateCanonicalV2ControllerWorkflowContent,
+  validateCanonicalV2VerifierWorkflowContent,
   validateCanonicalV2WorkflowInventory,
   validateControlPlaneCodeownersContent,
   workflowContainsCodexReviewGateCaller,
   workflowContainsLegacyV1Caller,
+  workflowSingleProducerPolicyViolations,
 } from "../src/bootstrap.mjs";
 
 const SOURCE_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const CANONICAL_WORKFLOW_SOURCE = join(
+const CANONICAL_VERIFIER_WORKFLOW_SOURCE = join(
   SOURCE_ROOT,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
 );
+const CANONICAL_CONTROLLER_WORKFLOW_SOURCE = join(
+  SOURCE_ROOT,
+  "templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
+);
+const GH_NOT_FOUND = Symbol("GitHub API not found");
 
 async function main() {
   const options = readCliOptions();
-  const canonicalWorkflow = await loadCanonicalWorkflow();
+  const canonicalWorkflows = await loadCanonicalWorkflows();
 
   if (options.prepareWorktree !== null) {
     await prepareConsumerWorktree({
       targetRoot: options.prepareWorktree,
-      canonicalWorkflow,
+      canonicalWorkflows,
       controlPlaneOwner: options.controlPlaneOwner,
       apply: options.apply,
     });
@@ -67,27 +76,24 @@ async function main() {
 
   const initialSecuritySnapshot = await loadConsumerSecuritySnapshot({
     repoSlug: options.repo.slug,
-    workflowPath: options.workflowPath,
-    canonicalWorkflow,
+    canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
   });
   const { defaultBranch } = initialSecuritySnapshot;
+
+  const effectiveRulesets = await loadRulesets(options.repo.slug);
   if (options.activate) {
-    await assertCanaryStatusSource({
-      repoSlug: options.repo.slug,
+    assertCodeownersActivationDoesNotExpandPolicy({
+      securitySnapshot: initialSecuritySnapshot,
+      rulesets: effectiveRulesets,
       defaultBranch,
-      defaultBranchHeadSha: initialSecuritySnapshot.defaultBranchHeadSha,
-      workflowPath: options.workflowPath,
-      prNumber: options.canaryPr,
-      headSha: options.canaryHead,
     });
   }
 
-  const effectiveRulesets = await loadRulesets(options.repo.slug);
-
   console.log(`Repository: ${options.repo.slug}`);
   console.log(`Default branch: ${defaultBranch}`);
-  console.log(`Workflow: ${options.workflowPath} exactly matches the canonical v2 caller`);
+  console.log(`Verifier: ${DEFAULT_WORKFLOW_PATH} exactly matches the canonical v2 verifier`);
+  console.log(`Controller: ${DEFAULT_CONTROLLER_WORKFLOW_PATH} exactly matches the canonical v2 controller`);
   console.log(`Control plane: ${DEFAULT_CODEOWNERS_PATH} protects the workflow and itself for ${options.controlPlaneOwner}`);
 
   const repoRulesets = effectiveRulesets.filter(
@@ -137,11 +143,16 @@ async function main() {
   }
 
   if (repoRuleset === undefined) {
+    if (options.activate) {
+      throw new Error(
+        `Cannot activate missing repository ruleset "${options.rulesetName}" directly. Run a plain --apply first to stage the disabled ruleset, then verify the canary and rerun with --activate.`,
+      );
+    }
     const payload = buildCreateRulesetPayload({
       name: options.rulesetName,
       context: options.context,
       integrationId: options.integrationId,
-      enforcement: options.activate ? "active" : DEFAULT_RULESET_ENFORCEMENT,
+      enforcement: DEFAULT_RULESET_ENFORCEMENT,
     });
 
     if (!options.apply) {
@@ -151,8 +162,7 @@ async function main() {
 
     const currentSecuritySnapshot = await loadConsumerSecuritySnapshot({
       repoSlug: options.repo.slug,
-      workflowPath: options.workflowPath,
-      canonicalWorkflow,
+      canonicalWorkflows,
       controlPlaneOwner: options.controlPlaneOwner,
       expectedDefaultBranch: defaultBranch,
     });
@@ -161,11 +171,10 @@ async function main() {
       currentSecuritySnapshot,
     );
     if (options.activate) {
-      await assertCanaryStatusSource({
+      await assertCanaryCheckRunSource({
         repoSlug: options.repo.slug,
         defaultBranch,
         defaultBranchHeadSha: currentSecuritySnapshot.defaultBranchHeadSha,
-        workflowPath: options.workflowPath,
         prNumber: options.canaryPr,
         headSha: options.canaryHead,
       });
@@ -186,8 +195,7 @@ async function main() {
     });
     const postWriteSecuritySnapshot = await loadConsumerSecuritySnapshot({
       repoSlug: options.repo.slug,
-      workflowPath: options.workflowPath,
-      canonicalWorkflow,
+      canonicalWorkflows,
       controlPlaneOwner: options.controlPlaneOwner,
       expectedDefaultBranch: defaultBranch,
     });
@@ -201,12 +209,62 @@ async function main() {
   }
 
   const fullRuleset = await ghJson(`repos/${options.repo.slug}/rulesets/${repoRuleset.id}`);
+  if (
+    options.activate &&
+    fullRuleset?.enforcement === "active" &&
+    rulesetCoversDefaultBranch(fullRuleset, defaultBranch) &&
+    rulesetHasGatePolicy(fullRuleset, options.context, {
+      integrationId: options.integrationId,
+    }) &&
+    !rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
+      integrationId: undefined,
+    })
+  ) {
+    console.log(
+      `No change: the complete v2 gate policy is already enforced by ${rulesetLabel(fullRuleset)}.`,
+    );
+    return;
+  }
+  if (options.activate && fullRuleset?.enforcement !== DEFAULT_RULESET_ENFORCEMENT) {
+    throw new Error(
+      `Repository ruleset "${options.rulesetName}" must be exactly read back as disabled before --activate can update it to active. An already-active complete gate is a no-op; any other enforcement state requires manual inspection.`,
+    );
+  }
   const { changed, payload } = buildUpdateRulesetPayload(fullRuleset, {
     context: options.context,
     integrationId: options.integrationId,
     defaultBranch,
     ...(options.activate ? { enforcement: "active" } : {}),
   });
+  if (options.activate) {
+    const expectedActivationPayload = {
+      ...fullRuleset,
+      enforcement: "active",
+    };
+    if (
+      fullRuleset.target !== "branch" ||
+      !rulesetCoversDefaultBranch(fullRuleset, defaultBranch) ||
+      !rulesetHasGatePolicy(fullRuleset, options.context, {
+        integrationId: options.integrationId,
+      }) ||
+      rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
+        integrationId: undefined,
+      }) ||
+      rulesetWritableFingerprint(payload) !==
+        rulesetWritableFingerprint(expectedActivationPayload)
+    ) {
+      throw new Error(
+        `Repository ruleset "${options.rulesetName}" is disabled but not an exact complete staged v2 policy. Run a plain --apply to repair and read back the disabled stage; --activate may change only enforcement from disabled to active.`,
+      );
+    }
+    await assertCanaryCheckRunSource({
+      repoSlug: options.repo.slug,
+      defaultBranch,
+      defaultBranchHeadSha: initialSecuritySnapshot.defaultBranchHeadSha,
+      prNumber: options.canaryPr,
+      headSha: options.canaryHead,
+    });
+  }
   if (!changed) {
     console.log(`No change: ${options.context} is already required by ${rulesetLabel(fullRuleset)}.`);
     return;
@@ -225,8 +283,7 @@ async function main() {
   }
   const currentSecuritySnapshot = await loadConsumerSecuritySnapshot({
     repoSlug: options.repo.slug,
-    workflowPath: options.workflowPath,
-    canonicalWorkflow,
+    canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
     expectedDefaultBranch: defaultBranch,
   });
@@ -235,11 +292,16 @@ async function main() {
     currentSecuritySnapshot,
   );
   if (activeWrite) {
-    await assertCanaryStatusSource({
+    const currentRulesets = await loadRulesets(options.repo.slug);
+    assertCodeownersActivationDoesNotExpandPolicy({
+      securitySnapshot: currentSecuritySnapshot,
+      rulesets: currentRulesets,
+      defaultBranch,
+    });
+    await assertCanaryCheckRunSource({
       repoSlug: options.repo.slug,
       defaultBranch,
       defaultBranchHeadSha: currentSecuritySnapshot.defaultBranchHeadSha,
-      workflowPath: options.workflowPath,
       prNumber: options.canaryPr,
       headSha: options.canaryHead,
     });
@@ -274,8 +336,7 @@ async function main() {
   });
   const postWriteSecuritySnapshot = await loadConsumerSecuritySnapshot({
     repoSlug: options.repo.slug,
-    workflowPath: options.workflowPath,
-    canonicalWorkflow,
+    canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
     expectedDefaultBranch: defaultBranch,
   });
@@ -330,7 +391,13 @@ function readCliOptions() {
   }
   if (values.context !== DEFAULT_STATUS_CONTEXT) {
     throw new Error(
-      `--context is fixed to "${DEFAULT_STATUS_CONTEXT}"; the v2 runtime does not support another status context.`,
+      `--context is fixed to "${DEFAULT_STATUS_CONTEXT}"; the v2 verifier does not support another required CheckRun name.`,
+    );
+  }
+  const workflowPath = normalizeWorkflowPath(values.workflow);
+  if (workflowPath !== DEFAULT_WORKFLOW_PATH) {
+    throw new Error(
+      `--workflow is fixed to "${DEFAULT_WORKFLOW_PATH}" because v2 verifies an exact two-workflow control plane.`,
     );
   }
 
@@ -345,7 +412,6 @@ function readCliOptions() {
     integrationId: DEFAULT_STATUS_INTEGRATION_ID,
     canaryPr: values.activate ? parseCanaryPr(values["canary-pr"]) : null,
     canaryHead: values.activate ? parseCanaryHead(values["canary-head"]) : null,
-    workflowPath: normalizeWorkflowPath(values.workflow),
   };
 }
 
@@ -364,8 +430,8 @@ Options:
   --canary-head SHA       Exact lowercase 40-hex canary head to verify before activation.
   --ruleset-name NAME     Repo ruleset to create or update. Defaults to "${DEFAULT_RULESET_NAME}".
   --control-plane-owner   GitHub user owning workflow and CODEOWNERS changes. Defaults to "${DEFAULT_CONTROL_PLANE_OWNER}".
-  --context CONTEXT       Required status context. Must remain "${DEFAULT_STATUS_CONTEXT}".
-  --workflow PATH         Gate workflow path. Defaults to "${DEFAULT_WORKFLOW_PATH}".
+  --context CONTEXT       Required CheckRun name. Must remain "${DEFAULT_STATUS_CONTEXT}".
+  --workflow PATH         Verifier path; fixed to "${DEFAULT_WORKFLOW_PATH}" while both workflows are verified.
   -h, --help              Show this help.
 `);
 }
@@ -388,72 +454,88 @@ function parseCanaryHead(value) {
   return value;
 }
 
-async function assertCanaryStatusSource({
+async function assertCanaryCheckRunSource({
   repoSlug,
   defaultBranch,
   defaultBranchHeadSha,
-  workflowPath,
   prNumber,
   headSha,
 }) {
   const pullRequest = await ghJson(`repos/${repoSlug}/pulls/${prNumber}`);
+  const mergeCommitSha = pullRequest?.merge_commit_sha;
   if (
     pullRequest?.state !== "open" ||
     pullRequest?.merged === true ||
     pullRequest?.draft === true ||
     pullRequest?.base?.ref !== defaultBranch ||
+    pullRequest?.base?.repo?.full_name !== repoSlug ||
+    pullRequest?.base?.sha !== defaultBranchHeadSha ||
     pullRequest?.head?.repo?.full_name !== repoSlug ||
-    pullRequest?.head?.sha !== headSha
+    pullRequest?.head?.sha !== headSha ||
+    typeof mergeCommitSha !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(mergeCommitSha)
   ) {
     throw new Error(
-      `Canary PR #${prNumber} is not an open, non-draft, same-repository default-branch PR at exact head ${headSha}.`,
+      `Canary PR #${prNumber} is not an open, non-draft, same-repository, up-to-date default-branch PR at exact head ${headSha} with a current test-merge SHA.`,
     );
   }
 
-  const pages = await ghJson(
-    `repos/${repoSlug}/commits/${encodeURIComponent(headSha)}/statuses?per_page=100`,
-    { paginate: true },
-  );
-  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
-    throw new Error("Canary status readback did not return complete paginated status arrays.");
-  }
-  const latest = pages
-    .flat()
-    .find((status) => status?.context === DEFAULT_STATUS_CONTEXT);
-  if (latest?.state !== "success") {
+  await assertCanaryControlPlaneUnchanged({ repoSlug, prNumber });
+  await assertNoLegacyGateStatus({ repoSlug, sha: headSha });
+  await assertNoLegacyGateStatus({ repoSlug, sha: mergeCommitSha });
+
+  const checkRuns = await loadCompleteCheckRuns({
+    repoSlug,
+    sha: mergeCommitSha,
+    checkName: DEFAULT_STATUS_CONTEXT,
+  });
+  if (checkRuns.length !== 1) {
     throw new Error(
-      `Canary head ${headSha} does not have a latest successful ${DEFAULT_STATUS_CONTEXT} status.`,
+      `Canary test-merge ${mergeCommitSha} must have exactly one latest CheckRun named ${DEFAULT_STATUS_CONTEXT}; found ${checkRuns.length}, so activation cannot exclude a missing or competing producer.`,
     );
   }
+  const checkRun = checkRuns[0];
   if (
-    latest?.sha !== headSha ||
-    latest?.creator?.login !== "github-actions[bot]" ||
-    latest?.creator?.type !== "Bot"
+    checkRun.name !== DEFAULT_STATUS_CONTEXT ||
+    checkRun.head_sha !== mergeCommitSha ||
+    checkRun.status !== "completed" ||
+    checkRun.conclusion !== "success" ||
+    Number(checkRun?.app?.id) !== DEFAULT_STATUS_INTEGRATION_ID ||
+    checkRun?.app?.slug !== "github-actions"
   ) {
     throw new Error(
-      `Canary ${DEFAULT_STATUS_CONTEXT} status was not produced by GitHub Actions.`,
+      `Canary ${DEFAULT_STATUS_CONTEXT} is not a successful native GitHub Actions CheckRun on the exact current test-merge SHA.`,
     );
   }
 
-  const runId = parseCanonicalRunTargetUrl(latest?.target_url, repoSlug);
+  const { runId, jobId } = parseCanonicalActionsJobDetailsUrl(
+    checkRun.details_url,
+    repoSlug,
+  );
   const run = await ghJson(`repos/${repoSlug}/actions/runs/${runId}`);
-  const expectedRunPath = `${workflowPath}@${defaultBranch}`;
+  const expectedRunPath = `${DEFAULT_WORKFLOW_PATH}@refs/pull/${prNumber}/merge`;
   if (
     Number(run?.id) !== runId ||
-    run?.html_url !== latest.target_url ||
     run?.repository?.full_name !== repoSlug ||
     run?.head_repository?.full_name !== repoSlug ||
     run?.path !== expectedRunPath ||
-    run?.head_branch !== defaultBranch ||
-    run?.head_sha !== defaultBranchHeadSha ||
-    !["issue_comment", "workflow_dispatch"].includes(run?.event) ||
+    run?.head_sha !== mergeCommitSha ||
+    run?.event !== "pull_request" ||
     run?.status !== "completed" ||
     run?.conclusion !== "success" ||
     !Number.isSafeInteger(run?.workflow_id) ||
-    run.workflow_id <= 0
+    run.workflow_id <= 0 ||
+    !Number.isSafeInteger(run?.run_attempt) ||
+    run.run_attempt <= 0 ||
+    !runContainsCanaryPullRequest(run, {
+      repoSlug,
+      prNumber,
+      headSha,
+      defaultBranch,
+    })
   ) {
     throw new Error(
-      `Canary status target does not resolve to a successful current-default-branch ${workflowPath} GitHub Actions run.`,
+      `Canary CheckRun does not resolve to a successful current pull_request run of ${DEFAULT_WORKFLOW_PATH} on refs/pull/${prNumber}/merge.`,
     );
   }
   const workflow = await ghJson(
@@ -461,7 +543,7 @@ async function assertCanaryStatusSource({
   );
   if (
     workflow?.id !== run.workflow_id ||
-    workflow?.path !== workflowPath ||
+    workflow?.path !== DEFAULT_WORKFLOW_PATH ||
     workflow?.state !== "active"
   ) {
     throw new Error(
@@ -469,20 +551,93 @@ async function assertCanaryStatusSource({
     );
   }
 
+  const jobPages = await ghJson(
+    `repos/${repoSlug}/actions/runs/${runId}/attempts/${run.run_attempt}/jobs?per_page=100`,
+    { paginate: true },
+  );
+  if (
+    !Array.isArray(jobPages) ||
+    jobPages.length === 0 ||
+    jobPages.some(
+      (page) =>
+        page === null ||
+        typeof page !== "object" ||
+        Array.isArray(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.jobs),
+    )
+  ) {
+    throw new Error(
+      "Canary Actions job readback did not return complete paginated job objects.",
+    );
+  }
+  const jobs = jobPages.flatMap((page) => page.jobs);
+  const jobTotalCount = jobPages[0].total_count;
+  if (
+    jobPages.some((page) => page.total_count !== jobTotalCount) ||
+    jobs.length !== jobTotalCount ||
+    jobs.some(
+      (job) =>
+        job === null ||
+        typeof job !== "object" ||
+        Array.isArray(job) ||
+        !Number.isSafeInteger(job.id) ||
+        job.id <= 0 ||
+        Number(job.run_id) !== runId ||
+        typeof job.head_sha !== "string" ||
+        !/^[0-9a-f]{40}$/u.test(job.head_sha) ||
+        typeof job.name !== "string" ||
+        job.name === "" ||
+        typeof job.status !== "string" ||
+        (job.conclusion !== null && typeof job.conclusion !== "string") ||
+        typeof job.check_run_url !== "string" ||
+        job.check_run_url === "",
+    )
+  ) {
+    throw new Error(
+      "Canary Actions job inventory is incomplete, malformed, or inconsistent with the verified run.",
+    );
+  }
+  const canonicalJobs = jobs.filter(
+    (job) => job.name === DEFAULT_STATUS_CONTEXT,
+  );
+  if (
+    canonicalJobs.length !== 1 ||
+    canonicalJobs[0].id !== jobId ||
+    canonicalJobs[0].head_sha !== mergeCommitSha ||
+    canonicalJobs[0].status !== "completed" ||
+    canonicalJobs[0].conclusion !== "success"
+  ) {
+    throw new Error(
+      `Verified run ${runId} must contain exactly one successful ${DEFAULT_STATUS_CONTEXT} canonical job bound to its exact head.`,
+    );
+  }
+  const canonicalJob = canonicalJobs[0];
+  const checkRunId = parseCanonicalCheckRunApiUrl(
+    canonicalJob.check_run_url,
+    repoSlug,
+  );
+  if (checkRunId !== checkRun.id) {
+    throw new Error(
+      "Canonical verifier job does not resolve to the unique canary CheckRun.",
+    );
+  }
+
   console.log(
-    `Canary: #${prNumber} at ${headSha} has a successful ${DEFAULT_STATUS_CONTEXT} status from GitHub Actions.`,
+    `Canary: #${prNumber} at head ${headSha} has one successful native ${DEFAULT_STATUS_CONTEXT} CheckRun on test-merge ${mergeCommitSha}.`,
   );
 }
 
-function parseCanonicalRunTargetUrl(value, repoSlug) {
+function parseCanonicalActionsJobDetailsUrl(value, repoSlug) {
   if (typeof value !== "string" || value === "") {
-    throw new Error("Canary status lacks a GitHub Actions run target_url.");
+    throw new Error("Canary CheckRun lacks a GitHub Actions job details_url.");
   }
   let url;
   try {
     url = new URL(value);
   } catch {
-    throw new Error("Canary status target_url is not an absolute URL.");
+    throw new Error("Canary CheckRun details_url is not an absolute URL.");
   }
   const expectedPrefix = `/${repoSlug}/actions/runs/`;
   if (
@@ -495,17 +650,173 @@ function parseCanonicalRunTargetUrl(value, repoSlug) {
     url.hash !== "" ||
     !url.pathname.startsWith(expectedPrefix)
   ) {
-    throw new Error("Canary status target_url is not a canonical same-repository GitHub run URL.");
+    throw new Error(
+      "Canary CheckRun details_url is not a canonical same-repository GitHub Actions job URL.",
+    );
   }
-  const runIdText = url.pathname.slice(expectedPrefix.length);
-  if (!/^[1-9][0-9]*$/u.test(runIdText)) {
-    throw new Error("Canary status target_url does not contain one canonical run id.");
+  const match = url.pathname
+    .slice(expectedPrefix.length)
+    .match(/^([1-9][0-9]*)\/job\/([1-9][0-9]*)$/u);
+  if (match === null) {
+    throw new Error(
+      "Canary CheckRun details_url does not contain one canonical run and job id.",
+    );
   }
-  const runId = Number(runIdText);
-  if (!Number.isSafeInteger(runId)) {
-    throw new Error("Canary status target_url run id exceeds the safe integer range.");
+  const runId = Number(match[1]);
+  const jobId = Number(match[2]);
+  if (!Number.isSafeInteger(runId) || !Number.isSafeInteger(jobId)) {
+    throw new Error("Canary CheckRun run or job id exceeds the safe integer range.");
   }
-  return runId;
+  return { runId, jobId };
+}
+
+async function assertCanaryControlPlaneUnchanged({ repoSlug, prNumber }) {
+  const pages = await ghJson(
+    `repos/${repoSlug}/pulls/${prNumber}/files?per_page=100`,
+    { paginate: true },
+  );
+  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
+    throw new Error(
+      "Canary changed-file readback did not return complete paginated arrays.",
+    );
+  }
+  const changedControlPlanePaths = pages
+    .flat()
+    .map((file) => file?.filename)
+    .filter(
+      (path) =>
+        typeof path === "string" &&
+        (path === DEFAULT_CODEOWNERS_PATH ||
+          path.startsWith(".github/workflows/")),
+    )
+    .sort();
+  if (changedControlPlanePaths.length > 0) {
+    throw new Error(
+      `Canary PR #${prNumber} changes the protected control plane (${changedControlPlanePaths.join(", ")}); use a harmless non-control-plane canary PR.`,
+    );
+  }
+}
+
+async function assertNoLegacyGateStatus({ repoSlug, sha }) {
+  const pages = await ghJson(
+    `repos/${repoSlug}/commits/${encodeURIComponent(sha)}/statuses?per_page=100`,
+    { paginate: true },
+  );
+  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
+    throw new Error(
+      "Canary legacy commit-status readback did not return complete paginated arrays.",
+    );
+  }
+  const collisions = pages
+    .flat()
+    .filter((status) => status?.context === DEFAULT_STATUS_CONTEXT);
+  if (collisions.length > 0) {
+    throw new Error(
+      `Canary commit ${sha} still has ${collisions.length} legacy commit status projection(s) named ${DEFAULT_STATUS_CONTEXT}; native-CheckRun activation requires none.`,
+    );
+  }
+}
+
+async function loadCompleteCheckRuns({ repoSlug, sha, checkName }) {
+  const pages = await ghJson(
+    `repos/${repoSlug}/commits/${encodeURIComponent(sha)}/check-runs?check_name=${encodeURIComponent(checkName)}&filter=latest&per_page=100`,
+    { paginate: true },
+  );
+  if (
+    !Array.isArray(pages) ||
+    pages.length === 0 ||
+    pages.some(
+      (page) =>
+        page === null ||
+        typeof page !== "object" ||
+        Array.isArray(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.check_runs),
+    )
+  ) {
+    throw new Error(
+      "Canary CheckRun readback did not return complete paginated objects.",
+    );
+  }
+  const checkRuns = pages.flatMap((page) => page.check_runs);
+  const totalCount = pages[0].total_count;
+  if (
+    pages.some((page) => page.total_count !== totalCount) ||
+    checkRuns.length !== totalCount ||
+    checkRuns.some(
+      (checkRun) =>
+        checkRun === null ||
+        typeof checkRun !== "object" ||
+        Array.isArray(checkRun) ||
+        !Number.isSafeInteger(checkRun.id) ||
+        checkRun.id <= 0 ||
+        checkRun.name !== checkName ||
+        checkRun.head_sha !== sha,
+    )
+  ) {
+    throw new Error(
+      "Canary CheckRun inventory is incomplete, malformed, or inconsistent with the exact-name filter.",
+    );
+  }
+  return checkRuns;
+}
+
+function runContainsCanaryPullRequest(
+  run,
+  { repoSlug, prNumber, headSha, defaultBranch },
+) {
+  if (!Array.isArray(run?.pull_requests) || run.pull_requests.length !== 1) {
+    return false;
+  }
+  const pullRequest = run.pull_requests[0];
+  return (
+    Number(pullRequest?.number) === prNumber &&
+    pullRequest?.head?.sha === headSha &&
+    pullRequest?.head?.repo?.full_name === repoSlug &&
+    pullRequest?.base?.ref === defaultBranch &&
+    pullRequest?.base?.repo?.full_name === repoSlug
+  );
+}
+
+function parseCanonicalCheckRunApiUrl(value, repoSlug) {
+  if (typeof value !== "string" || value === "") {
+    throw new Error("Canonical Actions job lacks a check_run_url.");
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Canonical Actions job check_run_url is not absolute.");
+  }
+  const expectedPrefix = `/repos/${repoSlug}/check-runs/`;
+  if (
+    url.protocol !== "https:" ||
+    url.hostname !== "api.github.com" ||
+    url.port !== "" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    !url.pathname.startsWith(expectedPrefix)
+  ) {
+    throw new Error(
+      "Canonical Actions job check_run_url is not a same-repository GitHub API URL.",
+    );
+  }
+  const checkRunIdText = url.pathname.slice(expectedPrefix.length);
+  if (!/^[1-9][0-9]*$/u.test(checkRunIdText)) {
+    throw new Error(
+      "Canonical Actions job check_run_url does not contain one canonical check-run id.",
+    );
+  }
+  const checkRunId = Number(checkRunIdText);
+  if (!Number.isSafeInteger(checkRunId)) {
+    throw new Error(
+      "Canonical Actions job check-run id exceeds the safe integer range.",
+    );
+  }
+  return checkRunId;
 }
 
 async function assertRulesetReadback({
@@ -697,8 +1008,7 @@ function valuesDeepEqual(left, right) {
 
 async function loadConsumerSecuritySnapshot({
   repoSlug,
-  workflowPath,
-  canonicalWorkflow,
+  canonicalWorkflows,
   controlPlaneOwner,
   expectedDefaultBranch = null,
 }) {
@@ -755,8 +1065,7 @@ async function loadConsumerSecuritySnapshot({
     });
     validateCanonicalV2WorkflowInventory(
       workflowFiles,
-      canonicalWorkflow,
-      workflowPath,
+      canonicalWorkflows,
     );
     validateControlPlaneCodeownersContent(
       codeownersContent,
@@ -770,6 +1079,16 @@ async function loadConsumerSecuritySnapshot({
         "GitHub reports CODEOWNERS syntax or ownership errors at the exact default-branch head.",
       );
     }
+    const classicBranchProtection =
+      await loadClassicBranchProtectionPolicy({
+        repoSlug,
+        defaultBranch,
+      });
+    if (classicBranchProtection.requiredStatusContexts.includes(LEGACY_STATUS_CONTEXT)) {
+      throw new Error(
+        `${LEGACY_STATUS_CONTEXT} is still required by classic branch protection on ${defaultBranch}; remove that legacy requirement manually before staging or activating v2.`,
+      );
+    }
     return {
       repoId: repoInfo.id,
       repoNodeId: repoInfo.node_id,
@@ -777,6 +1096,16 @@ async function loadConsumerSecuritySnapshot({
       defaultBranchHeadSha,
       workflowInventoryFingerprint: fingerprintWorkflowInventory(workflowFiles),
       codeownersFingerprint: fingerprintText(codeownersContent),
+      hasEffectiveUnmanagedCodeownersPatterns:
+        codeownersHasEffectiveUnmanagedPatterns(codeownersContent),
+      // The protected property is continued absence of the legacy context.
+      // Every snapshot independently validates endpoint/schema completeness and
+      // rejects that name across contexts plus checks[].context. Presence versus
+      // absence, strict, app_id, duplicates, and unrelated context changes do
+      // not change this property and intentionally are not frozen.
+      classicLegacyStatusAbsent: true,
+      classicCodeOwnerReviewRequired:
+        classicBranchProtection.codeOwnerReviewRequired,
       controlPlaneOwnerPermission,
     };
   } catch (error) {
@@ -798,6 +1127,11 @@ function assertConsumerSecuritySnapshotStable(
     current.defaultBranchHeadSha !== expected.defaultBranchHeadSha ||
     current.workflowInventoryFingerprint !== expected.workflowInventoryFingerprint ||
     current.codeownersFingerprint !== expected.codeownersFingerprint ||
+    current.hasEffectiveUnmanagedCodeownersPatterns !==
+      expected.hasEffectiveUnmanagedCodeownersPatterns ||
+    current.classicLegacyStatusAbsent !== expected.classicLegacyStatusAbsent ||
+    current.classicCodeOwnerReviewRequired !==
+      expected.classicCodeOwnerReviewRequired ||
     current.controlPlaneOwnerPermission !== expected.controlPlaneOwnerPermission
   ) {
     if (phase === "ruleset post-write readback") {
@@ -809,6 +1143,91 @@ function assertConsumerSecuritySnapshotStable(
       `Repository identity, default branch, canonical workflow inventory, CODEOWNERS, or control-plane owner permission changed during ${phase}; no conditional API write is available, so refusing the write.`,
     );
   }
+}
+
+async function loadClassicBranchProtectionPolicy({
+  repoSlug,
+  defaultBranch,
+}) {
+  const endpoint =
+    `repos/${repoSlug}/branches/${encodeURIComponent(defaultBranch)}/protection`;
+  const response = await ghJson(endpoint, { allowNotFound: true });
+  if (response === GH_NOT_FOUND) {
+    return {
+      requiredStatusContexts: [],
+      codeOwnerReviewRequired: false,
+    };
+  }
+  if (
+    response === null ||
+    typeof response !== "object" ||
+    Array.isArray(response) ||
+    !Object.prototype.hasOwnProperty.call(response, "required_status_checks")
+  ) {
+    throw new Error(
+      "Classic branch protection response is malformed or omits required_status_checks.",
+    );
+  }
+  const requiredStatusChecks = response.required_status_checks;
+  const requiredPullRequestReviews = response.required_pull_request_reviews;
+  let codeOwnerReviewRequired = false;
+  if (requiredPullRequestReviews !== null && requiredPullRequestReviews !== undefined) {
+    if (
+      typeof requiredPullRequestReviews !== "object" ||
+      Array.isArray(requiredPullRequestReviews) ||
+      typeof requiredPullRequestReviews.require_code_owner_reviews !== "boolean"
+    ) {
+      throw new Error(
+        "Classic branch protection required_pull_request_reviews is malformed or incomplete.",
+      );
+    }
+    codeOwnerReviewRequired =
+      requiredPullRequestReviews.require_code_owner_reviews;
+  }
+  if (requiredStatusChecks === null) {
+    return {
+      requiredStatusContexts: [],
+      codeOwnerReviewRequired,
+    };
+  }
+  if (
+    typeof requiredStatusChecks !== "object" ||
+    Array.isArray(requiredStatusChecks) ||
+    typeof requiredStatusChecks.strict !== "boolean" ||
+    !Array.isArray(requiredStatusChecks.contexts) ||
+    !Array.isArray(requiredStatusChecks.checks)
+  ) {
+    throw new Error(
+      "Classic branch protection required_status_checks is malformed or incomplete.",
+    );
+  }
+  const contexts = [];
+  for (const context of requiredStatusChecks.contexts) {
+    if (typeof context !== "string" || context === "") {
+      throw new Error(
+        "Classic branch protection contexts contain a malformed status context.",
+      );
+    }
+    contexts.push(context);
+  }
+  for (const check of requiredStatusChecks.checks) {
+    if (
+      check === null ||
+      typeof check !== "object" ||
+      Array.isArray(check) ||
+      typeof check.context !== "string" ||
+      check.context === ""
+    ) {
+      throw new Error(
+        "Classic branch protection checks contain a malformed status context.",
+      );
+    }
+    contexts.push(check.context);
+  }
+  return {
+    requiredStatusContexts: [...new Set(contexts)].sort(),
+    codeOwnerReviewRequired,
+  };
 }
 
 function fingerprintWorkflowInventory(workflowFiles) {
@@ -958,6 +1377,33 @@ async function loadRulesets(repoSlug) {
   );
 }
 
+function assertCodeownersActivationDoesNotExpandPolicy({
+  securitySnapshot,
+  rulesets,
+  defaultBranch,
+}) {
+  if (!securitySnapshot.hasEffectiveUnmanagedCodeownersPatterns) {
+    return;
+  }
+  const alreadyRequired =
+    securitySnapshot.classicCodeOwnerReviewRequired === true ||
+    rulesets.some(
+      (ruleset) =>
+        ruleset?.enforcement === "active" &&
+        rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
+        (ruleset.rules ?? []).some(
+          (rule) =>
+            rule?.type === "pull_request" &&
+            rule?.parameters?.require_code_owner_review === true,
+        ),
+    );
+  if (!alreadyRequired) {
+    throw new Error(
+      "Activation would newly require Code Owner approval for existing non-managed CODEOWNERS patterns. The installer will not silently broaden approval policy: explicitly accept and stage that policy expansion, split or remove the unrelated patterns, or enable an equivalent reviewed Code Owner rule before retrying --activate.",
+    );
+  }
+}
+
 function printDryRun(action, options, payload, existingRuleset = null) {
   console.log(`Dry run: would ${action} repository ruleset "${payload.name}".`);
   if (existingRuleset !== null) {
@@ -973,14 +1419,20 @@ function printDryRun(action, options, payload, existingRuleset = null) {
   console.log(`Run again with --apply to ${action} it.`);
 }
 
-async function loadCanonicalWorkflow() {
-  const content = await readFile(CANONICAL_WORKFLOW_SOURCE, "utf8");
-  return validateCanonicalV2WorkflowContent(content);
+async function loadCanonicalWorkflows() {
+  const [verifier, controller] = await Promise.all([
+    readFile(CANONICAL_VERIFIER_WORKFLOW_SOURCE, "utf8"),
+    readFile(CANONICAL_CONTROLLER_WORKFLOW_SOURCE, "utf8"),
+  ]);
+  return {
+    verifier: validateCanonicalV2VerifierWorkflowContent(verifier),
+    controller: validateCanonicalV2ControllerWorkflowContent(controller),
+  };
 }
 
 async function prepareConsumerWorktree({
   targetRoot,
-  canonicalWorkflow,
+  canonicalWorkflows,
   controlPlaneOwner,
   apply,
 }) {
@@ -990,9 +1442,21 @@ async function prepareConsumerWorktree({
     rootWitness,
     create: apply,
   });
-  const workflowPath = join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/"));
+  const verifierWorkflowPath = join(
+    targetRoot,
+    ...DEFAULT_WORKFLOW_PATH.split("/"),
+  );
+  const controllerWorkflowPath = join(
+    targetRoot,
+    ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/"),
+  );
   const codeownersPath = join(targetRoot, ...DEFAULT_CODEOWNERS_PATH.split("/"));
-  const currentWorkflow = await readOptionalRegularFile(workflowPath);
+  const currentVerifierWorkflow = await readOptionalRegularFile(
+    verifierWorkflowPath,
+  );
+  const currentControllerWorkflow = await readOptionalRegularFile(
+    controllerWorkflowPath,
+  );
   const currentCodeowners = await readOptionalRegularFile(codeownersPath);
   const lowerPrecedenceCodeowners = await findLowerPrecedenceCodeowners(targetRoot);
   if (lowerPrecedenceCodeowners !== null) {
@@ -1004,39 +1468,52 @@ async function prepareConsumerWorktree({
     currentCodeowners,
     controlPlaneOwner,
   );
-  const otherCallerPaths = await findOtherGateCallerWorkflowPaths({
+  const otherWorkflowConflicts = await findOtherGateCallerWorkflowPaths({
     targetRoot,
-    canonicalWorkflowPath: workflowPath,
+    canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
   });
-  if (otherCallerPaths.length > 0) {
+  if (otherWorkflowConflicts.length > 0) {
     throw new Error(
-      `Additional v1/v2 gate callers require explicit removal in the same installation PR: ${otherCallerPaths.join(", ")}`,
+      `Additional workflows have a v1/v2 gate caller, reserved CheckRun name, or relevant write authority and require explicit removal or review in the same installation PR: ${otherWorkflowConflicts.join(", ")}`,
     );
   }
   await revalidateDirectoryChain(parentWitnesses, "after local workflow inspection");
 
-  const workflowChanged = currentWorkflow !== canonicalWorkflow;
+  const verifierChanged =
+    currentVerifierWorkflow !== canonicalWorkflows.verifier;
+  const controllerChanged =
+    currentControllerWorkflow !== canonicalWorkflows.controller;
   console.log(`Target worktree: ${targetRoot}`);
-  console.log(`Workflow: ${DEFAULT_WORKFLOW_PATH}`);
+  console.log(`Verifier: ${DEFAULT_WORKFLOW_PATH}`);
+  console.log(`Controller: ${DEFAULT_CONTROLLER_WORKFLOW_PATH}`);
   console.log(`Control plane: ${DEFAULT_CODEOWNERS_PATH} -> ${controlPlaneOwner}`);
-  if (!workflowChanged) {
-    console.log("No change: local workflow already matches the canonical v2 bytes.");
+  if (!verifierChanged) {
+    console.log("No change: local verifier already matches the canonical v2 bytes.");
+  }
+  if (!controllerChanged) {
+    console.log("No change: local controller already matches the canonical v2 bytes.");
   }
   if (!preparedCodeowners.changed) {
     console.log("No change: local CODEOWNERS already has canonical final control-plane ownership.");
   }
-  if (!workflowChanged && !preparedCodeowners.changed) {
+  if (!verifierChanged && !controllerChanged && !preparedCodeowners.changed) {
     return;
   }
 
-  const workflowAction = currentWorkflow === null
-    ? "install the canonical v2 workflow"
-    : workflowContainsLegacyV1Caller(currentWorkflow)
-      ? "replace the canonical-path v1 caller with v2"
-      : "replace the drifted workflow with canonical v2 bytes";
+  const verifierAction = currentVerifierWorkflow === null
+    ? "install the canonical v2 verifier workflow"
+    : workflowContainsLegacyV1Caller(currentVerifierWorkflow)
+      ? "replace the canonical-path v1 caller with the v2 verifier"
+      : "replace the drifted verifier workflow with canonical v2 bytes";
+  const controllerAction = currentControllerWorkflow === null
+    ? "install the canonical v2 controller workflow"
+    : "replace the drifted controller workflow with canonical v2 bytes";
   if (!apply) {
-    if (workflowChanged) {
-      console.log(`Dry run: would ${workflowAction}.`);
+    if (verifierChanged) {
+      console.log(`Dry run: would ${verifierAction}.`);
+    }
+    if (controllerChanged) {
+      console.log(`Dry run: would ${controllerAction}.`);
     }
     if (preparedCodeowners.changed) {
       console.log(
@@ -1059,19 +1536,42 @@ async function prepareConsumerWorktree({
       label: "CODEOWNERS",
     });
   }
-  if (workflowChanged) {
+  if (verifierChanged) {
     await installPreparedConsumerFile({
-      path: workflowPath,
-      content: canonicalWorkflow,
-      expectedContent: currentWorkflow,
+      path: verifierWorkflowPath,
+      content: canonicalWorkflows.verifier,
+      expectedContent: currentVerifierWorkflow,
       parentWitnesses,
-      label: "workflow",
+      label: "verifier-workflow",
+    });
+  }
+  if (controllerChanged) {
+    await installPreparedConsumerFile({
+      path: controllerWorkflowPath,
+      content: canonicalWorkflows.controller,
+      expectedContent: currentControllerWorkflow,
+      parentWitnesses,
+      label: "controller-workflow",
     });
   }
 
-  const installedWorkflow = await readOptionalRegularFile(workflowPath);
-  if (!installedWorkflowMatchesCanonical(installedWorkflow, canonicalWorkflow)) {
-    throw new Error("Local workflow failed exact-byte post-install verification.");
+  const installedVerifier = await readOptionalRegularFile(verifierWorkflowPath);
+  const installedController = await readOptionalRegularFile(
+    controllerWorkflowPath,
+  );
+  if (
+    !installedWorkflowMatchesCanonical(
+      installedVerifier,
+      canonicalWorkflows.verifier,
+    ) ||
+    !installedWorkflowMatchesCanonical(
+      installedController,
+      canonicalWorkflows.controller,
+    )
+  ) {
+    throw new Error(
+      "Local verifier/controller workflows failed exact-byte post-install verification.",
+    );
   }
   const installedCodeowners = await readOptionalRegularFile(codeownersPath);
   validateControlPlaneCodeownersContent(installedCodeowners, controlPlaneOwner);
@@ -1079,8 +1579,11 @@ async function prepareConsumerWorktree({
     throw new Error("Local CODEOWNERS failed exact-byte post-install verification.");
   }
   await revalidateDirectoryChain(parentWitnesses, "after exact-byte verification");
-  if (workflowChanged) {
-    console.log(`Applied: ${workflowAction}.`);
+  if (verifierChanged) {
+    console.log(`Applied: ${verifierAction}.`);
+  }
+  if (controllerChanged) {
+    console.log(`Applied: ${controllerAction}.`);
   }
   if (preparedCodeowners.changed) {
     console.log(`Applied: protect the control plane with ${controlPlaneOwner}.`);
@@ -1449,8 +1952,12 @@ async function revalidateDirectoryChain(witnesses, phase) {
   }
 }
 
-async function findOtherGateCallerWorkflowPaths({ targetRoot, canonicalWorkflowPath }) {
+async function findOtherGateCallerWorkflowPaths({
+  targetRoot,
+  canonicalWorkflowPaths,
+}) {
   const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const canonicalPaths = new Set(canonicalWorkflowPaths);
   const entries = await readdir(workflowsDirectory, { withFileTypes: true }).catch((error) => {
     if (error?.code === "ENOENT") {
       return [];
@@ -1463,15 +1970,22 @@ async function findOtherGateCallerWorkflowPaths({ targetRoot, canonicalWorkflowP
       continue;
     }
     const absolutePath = join(workflowsDirectory, entry.name);
-    if (absolutePath === canonicalWorkflowPath) {
+    if (canonicalPaths.has(absolutePath)) {
       continue;
     }
     if (!entry.isFile() || entry.isSymbolicLink()) {
       throw new Error(`Cannot safely inspect non-regular workflow: ${absolutePath}`);
     }
     const content = await readFile(absolutePath, "utf8");
+    const violations = [];
     if (workflowContainsCodexReviewGateCaller(content)) {
-      callerPaths.push(absolutePath.slice(targetRoot.length + 1));
+      violations.push("gate caller");
+    }
+    violations.push(...workflowSingleProducerPolicyViolations(content));
+    if (violations.length > 0) {
+      callerPaths.push(
+        `${absolutePath.slice(targetRoot.length + 1)} (${violations.join(", ")})`,
+      );
     }
   }
   return callerPaths.sort();
@@ -1503,7 +2017,15 @@ function rulesetLabel(ruleset) {
   return `${ruleset.name} (${source}, id ${ruleset.id})`;
 }
 
-function ghJson(endpoint, { method = "GET", body = undefined, paginate = false } = {}) {
+function ghJson(
+  endpoint,
+  {
+    method = "GET",
+    body = undefined,
+    paginate = false,
+    allowNotFound = false,
+  } = {},
+) {
   return new Promise((resolve, reject) => {
     const args = ["api", endpoint];
     if (method !== "GET") {
@@ -1540,6 +2062,13 @@ function ghJson(endpoint, { method = "GET", body = undefined, paginate = false }
     child.on("error", reject);
     child.on("close", (code) => {
       if (code !== 0) {
+        if (
+          allowNotFound &&
+          stderr.trim() === "gh: Branch not protected (HTTP 404)"
+        ) {
+          resolve(GH_NOT_FOUND);
+          return;
+        }
         reject(new Error(stderr.trim() || `gh api ${endpoint} exited with ${code}`));
         return;
       }

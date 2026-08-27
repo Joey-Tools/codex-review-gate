@@ -330,6 +330,18 @@ jobs:
             --candidate "$RUNNER_TEMP/release-candidate" \
             --output "$RUNNER_TEMP/publication-plan-$GITHUB_RUN_ATTEMPT.json"
           printf 'artifact-basename=publication-plan-%s.json\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Explain privileged-boundary rejection
+        if: ${{ failure() && steps.publication-plan.outcome == 'failure' }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## Publication plan rejected
+
+          The credential-free admission stage rejected this source. The
+          privileged Environment did not start, no publisher token was minted,
+          and no signing key was imported. Only `write_eligible=true` or the
+          bounded `release-intent-superseded` recovery class may cross the
+          approval boundary.
+          SUMMARY
       - name: Upload publication plan
         id: upload-publication-plan
         uses: actions/upload-artifact@v7
@@ -564,9 +576,86 @@ jobs:
         with:
           node-version: "20"
       - name: Read back public release state
+        id: public-verification
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           scripts/release-action-subtree.sh --verify-published \
             --source-ref "$RELEASE_SOURCE_SHA" \
             --control-ref "$RELEASE_CONTROL_SHA"
+      - name: Summarize closed public verification
+        if: ${{ always() }}
+        env:
+          OBSERVED_SOURCE: ${{ steps.public-verification.outputs.observed_source }}
+          OBSERVED_TAG: ${{ steps.public-verification.outputs.observed_tag }}
+          RECOVERY_CODE: ${{ steps.public-verification.outputs.recovery_code }}
+          VERIFICATION_STAGE: ${{ steps.public-verification.outputs.verification_stage }}
+          VERIFICATION_STATE: ${{ steps.public-verification.outputs.verification_state }}
+          NEXT_ACTION: ${{ steps.public-verification.outputs.next_action }}
+          STEP_OUTCOME: ${{ steps.public-verification.outcome }}
+        run: |
+          set -euo pipefail
+          summary_valid=true
+          tuple="$STEP_OUTCOME:$VERIFICATION_STATE:$RECOVERY_CODE:$NEXT_ACTION:$VERIFICATION_STAGE"
+          case "$tuple" in
+            success:verified:none:none:complete)
+              action_text='No action is required.'
+              ;;
+            failure:blocked_conflict:immutable-tag-missing:reconcile-exact-source:immutable-tag|\
+            failure:blocked_conflict:major-alias-missing:reconcile-exact-source:floating-alias|\
+            failure:blocked_conflict:release-state-missing:reconcile-exact-source:immutable-release|\
+            failure:blocked_conflict:release-state-incomplete:reconcile-exact-source:immutable-release)
+              action_text='Redispatch the exact release-intent source SHA to reconcile the missing public prefix.'
+              ;;
+            failure:blocked_conflict:release-state-mismatch:repair-immutable-release-and-reconcile:immutable-release|\
+            failure:blocked_conflict:mutable-release:repair-immutable-release-and-reconcile:immutable-release)
+              action_text='Restore the immutable Release policy and state, then reconcile this exact source SHA.'
+              ;;
+            failure:blocked_conflict:published-state-mismatch:investigate-published-state:immutable-tag|\
+            failure:blocked_conflict:published-state-mismatch:investigate-published-state:floating-alias|\
+            failure:blocked_conflict:published-state-mismatch:investigate-published-state:immutable-release)
+              action_text='Stop mutation and inspect the conflicting immutable ref or Release state before any recovery attempt.'
+              ;;
+            failure:inconclusive:release-api-unreadable:retry-public-verification:immutable-release|\
+            failure:inconclusive:remote-read-inconclusive:retry-public-verification:immutable-tag|\
+            failure:inconclusive:remote-read-inconclusive:retry-public-verification:floating-alias|\
+            failure:inconclusive:remote-read-inconclusive:retry-public-verification:immutable-release)
+              action_text='Retry only the public verification job after GitHub reads recover.'
+              ;;
+            failure:inconclusive:verification-execution-failure:repair-verifier-and-rerun:initialization|\
+            failure:inconclusive:verification-execution-failure:repair-verifier-and-rerun:immutable-tag|\
+            failure:inconclusive:verification-execution-failure:repair-verifier-and-rerun:floating-alias|\
+            failure:inconclusive:verification-execution-failure:repair-verifier-and-rerun:immutable-release|\
+            failure:inconclusive:verification-state-missing:repair-verifier-and-rerun:initialization|\
+            failure:inconclusive:verification-state-missing:repair-verifier-and-rerun:immutable-tag|\
+            failure:inconclusive:verification-state-missing:repair-verifier-and-rerun:floating-alias|\
+            failure:inconclusive:verification-state-missing:repair-verifier-and-rerun:immutable-release)
+              action_text='Repair the verifier workflow, then rerun public verification for the same exact source SHA.'
+              ;;
+            *)
+              summary_valid=false
+              VERIFICATION_STATE=inconclusive
+              RECOVERY_CODE=verification-output-missing
+              VERIFICATION_STAGE=workflow
+              OBSERVED_SOURCE=unknown
+              OBSERVED_TAG=unknown
+              action_text='Repair the verifier workflow, then rerun public verification for the same exact source SHA.'
+              ;;
+          esac
+          if [[ ! "$OBSERVED_SOURCE" =~ ^[0-9a-f]{40}$ ||
+                ! "$OBSERVED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            summary_valid=false
+            OBSERVED_SOURCE=unknown
+            OBSERVED_TAG=unknown
+          fi
+          {
+            echo '## Public release verification'
+            echo
+            printf -- '- State: `%s`\n' "$VERIFICATION_STATE"
+            printf -- '- Stage: `%s`\n' "$VERIFICATION_STAGE"
+            printf -- '- Observed source: `%s`\n' "$OBSERVED_SOURCE"
+            printf -- '- Observed tag: `%s`\n' "$OBSERVED_TAG"
+            printf -- '- Recovery code: `%s`\n' "$RECOVERY_CODE"
+            printf -- '- Next action: %s\n' "$action_text"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [[ "$summary_valid" == true ]]

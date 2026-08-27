@@ -11,8 +11,8 @@ materialised into the existing Marketplace repository
 
 - `packages/action/`: complete Action release subtree, including the root
   `action.yml` and JavaScript runtime;
-- `templates/codex-gated-repo/`: canonical copied consumer workflow and
-  disabled importable ruleset;
+- `templates/codex-gated-repo/`: two canonical copied consumer workflows and
+  a disabled importable ruleset;
 - `src/bootstrap.mjs` and `scripts/bootstrap-codex-review-gate.mjs`: local
   installation and remote ruleset staging/activation helper;
 - `docs/install/`: one human-readable installation guide and one
@@ -43,21 +43,31 @@ npm run test:release-provenance
 
 ## Consumer Model
 
-V2 consumers copy
-`templates/codex-gated-repo/.github/workflows/codex-review-gate.yml` into the
-same path in their repository. The wrapper calls the compatible floating major:
+V2 consumers copy both canonical workflows into the same paths in their
+repository:
+
+- `.github/workflows/codex-review-gate.yml` is the read-only `pull_request`
+  verifier. Its GitHub-managed job CheckRun, `codex/github-review-gate`, is the
+  required signal on the PR test-merge SHA.
+- `.github/workflows/codex-review-gate-controller.yml` is the protected
+  default-branch controller. It admits exact Codex events and typed manual
+  operations, creates review requests, and establishes a strictly newer full
+  verifier attempt when reconciliation is needed.
+
+Both workflows call the compatible floating major:
 
 ```yaml
 uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
-The copied wrapper owns triggers, minimal permissions, per-PR concurrency,
-typed `workflow_dispatch`, exact pre-runner Codex-bot filtering and protected
-repository configuration. The Action remains API-only: it never checks out or
-executes pull-request code.
+The copied workflows own separate triggers, minimal permissions, per-PR
+concurrency namespaces, typed `workflow_dispatch`, exact pre-runner Codex-bot
+filtering and protected repository configuration. The Action remains API-only:
+it never checks out or executes pull-request code. There is no commit-status
+bridge: only the verifier's native PR test-merge CheckRun can satisfy the gate.
 
-The required status is `codex/github-review-gate`. The importable ruleset binds
-it to GitHub Actions (`integration_id: 15368`), requires the branch to be up to
+The required CheckRun is `codex/github-review-gate`. The importable ruleset
+binds it to GitHub Actions (`integration_id: 15368`), requires the branch to be up to
 date, requires all review conversations to be resolved, blocks
 non-fast-forward default-branch updates and has no bypass actors. “Any source”
 is not supported.
@@ -69,35 +79,32 @@ harmless canary PR proves the live gate and is closed unmerged.
 
 ## Bootstrap
 
-Prepare a consumer worktree with a dry run followed by an explicit apply:
+Choose a control-plane owner with `write`, `maintain`, or `admin` permission,
+then prepare a consumer worktree with a dry run followed by an explicit apply.
+Keep that owner explicit at every phase of this generic quickstart:
 
 ```bash
-node scripts/bootstrap-codex-review-gate.mjs \
-  --prepare-worktree /path/to/consumer
+CONTROL_PLANE_OWNER=@USER
 node scripts/bootstrap-codex-review-gate.mjs \
   --prepare-worktree /path/to/consumer \
+  --control-plane-owner "$CONTROL_PLANE_OWNER"
+node scripts/bootstrap-codex-review-gate.mjs \
+  --prepare-worktree /path/to/consumer \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
   --apply
 ```
 
-After the canonical workflow reaches the consumer default branch, stage the
-ruleset as Disabled:
+This quickstart performs local preparation only. It does not authorize or
+replace the repository-side preconditions, trusted-owner synchronous merge transaction,
+legacy-protection inventory, canary, or activation readbacks in the complete
+[human installation guide](docs/install/human.md) and
+[agent execution runbook](docs/install/agent.md). Do not merge or activate from
+this abbreviated example alone.
 
-```bash
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
-```
-
-Activation requires a successful exact-head canary and rereads both that
-evidence and the written ruleset:
-
-```bash
-node scripts/bootstrap-codex-review-gate.mjs \
-  --repo OWNER/REPO \
-  --apply \
-  --activate \
-  --canary-pr PR_NUMBER \
-  --canary-head FULL_HEAD_SHA
-```
+The helper default `@JoeyTeng` is only for Joey-owned repositories. Other
+repositories must supply their own eligible `@USER`; do not rely on that
+default in a generic installation. Continue with repository staging, canary and
+activation only through one of the complete guides above.
 
 ## Release Model
 

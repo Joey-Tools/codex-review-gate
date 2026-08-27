@@ -113,9 +113,17 @@ temporary_root=""
 reconcile_started=false
 reconcile_state_emitted=""
 reconcile_recovery_code_emitted=""
+verification_started=false
+verification_state_emitted=""
+verification_recovery_code_emitted=""
+verification_stage="initialization"
+verification_observed_source="unknown"
+verification_observed_tag="unknown"
 for requested_argument in "$@"; do
   if [[ "$requested_argument" == "--publish" ]]; then
     reconcile_started=true
+  elif [[ "$requested_argument" == "--verify-published" ]]; then
+    verification_started=true
   fi
 done
 
@@ -174,6 +182,78 @@ fail_reconcile() {
   exit 1
 }
 
+emit_verification_result() {
+  local state="$1"
+  local code="$2"
+  local stage="$3"
+  local next_action="$4"
+  local destination="${5:-stdout}"
+  case "$state" in
+    verified|blocked_conflict|inconclusive) ;;
+    *) echo "error: invalid verification state: $state" >&2; return 1 ;;
+  esac
+  [[ "$code" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || {
+    echo "error: invalid verification recovery code: $code" >&2
+    return 1
+  }
+  case "$stage" in
+    initialization|immutable-tag|floating-alias|immutable-release|complete) ;;
+    *) echo "error: invalid verification stage: $stage" >&2; return 1 ;;
+  esac
+  case "$next_action" in
+    none|reconcile-exact-source|repair-immutable-release-and-reconcile|investigate-published-state|retry-public-verification|repair-verifier-and-rerun) ;;
+    *) echo "error: invalid verification next action: $next_action" >&2; return 1 ;;
+  esac
+  [[ "$verification_observed_source" == "unknown" ||
+      "$verification_observed_source" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "error: invalid observed verification source" >&2
+    return 1
+  }
+  [[ "$verification_observed_tag" == "unknown" ||
+      "$verification_observed_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+    echo "error: invalid observed verification tag" >&2
+    return 1
+  }
+  [[ -z "$verification_state_emitted" && -z "$verification_recovery_code_emitted" ]] || {
+    echo "error: verification result was already emitted" >&2
+    return 1
+  }
+  verification_state_emitted="$state"
+  verification_recovery_code_emitted="$code"
+  if [[ "$destination" == "stderr" ]]; then
+    printf 'verification_state=%s\nverification_stage=%s\nrecovery_code=%s\nnext_action=%s\nobserved_source=%s\nobserved_tag=%s\n' \
+      "$state" "$stage" "$code" "$next_action" \
+      "$verification_observed_source" "$verification_observed_tag" >&2
+  else
+    printf 'verification_state=%s\nverification_stage=%s\nrecovery_code=%s\nnext_action=%s\nobserved_source=%s\nobserved_tag=%s\n' \
+      "$state" "$stage" "$code" "$next_action" \
+      "$verification_observed_source" "$verification_observed_tag"
+  fi
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    printf 'verification_state=%s\nverification_stage=%s\nrecovery_code=%s\nnext_action=%s\nobserved_source=%s\nobserved_tag=%s\n' \
+      "$state" "$stage" "$code" "$next_action" \
+      "$verification_observed_source" "$verification_observed_tag" >> "$GITHUB_OUTPUT"
+  fi
+}
+
+fail_verification() {
+  local state="$1"
+  local code="$2"
+  local stage="$3"
+  local next_action="$4"
+  shift 4
+  echo "error: $*" >&2
+  emit_verification_result "$state" "$code" "$stage" "$next_action" stderr
+  exit 1
+}
+
+fail_published_state() {
+  local stage="$1"
+  shift
+  fail_verification blocked_conflict published-state-mismatch "$stage" \
+    investigate-published-state "$*"
+}
+
 on_exit() {
   local status=$?
   trap - EXIT
@@ -195,6 +275,17 @@ on_exit() {
       elif [[ -z "$reconcile_recovery_code_emitted" ]]; then
         emit_success_recovery_code
       fi
+    fi
+  elif [[ "$verification_started" == true ]]; then
+    if [[ "$status" != 0 ]]; then
+      if [[ -z "$verification_state_emitted" ]]; then
+        emit_verification_result inconclusive verification-execution-failure \
+          "$verification_stage" repair-verifier-and-rerun stderr
+      fi
+    elif [[ -z "$verification_state_emitted" ]]; then
+      status=1
+      emit_verification_result inconclusive verification-state-missing \
+        "$verification_stage" repair-verifier-and-rerun stderr
     fi
   fi
   if [[ -n "$temporary_root" && -d "$temporary_root" ]]; then
@@ -528,6 +619,23 @@ case "$mode" in
       --live-master-ref "$live_source_master" \
       --candidate "$candidate" \
       --output "$output"
+    if ! jq -e '
+        (type == "object") and
+        ((.write_eligible == true and .recovery_code == null and .reason == null) or
+         (.write_eligible == false and
+          .recovery_code == "release-intent-superseded" and
+          (.reason | type == "string" and length > 0)))
+      ' "$output" >/dev/null; then
+      publication_write_eligible="$(jq -r '.write_eligible | if type == "boolean" then tostring else "invalid" end' "$output" 2>/dev/null || true)"
+      publication_recovery_code="$(jq -r '.recovery_code // ""' "$output" 2>/dev/null || true)"
+      if [[ "$publication_write_eligible" != "false" ||
+            ! "$publication_recovery_code" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ||
+            "$publication_recovery_code" == "release-intent-superseded" ]]; then
+        publication_recovery_code="publication-admission-invalid"
+      fi
+      echo "error: recovery_code=$publication_recovery_code; publication is not eligible for the privileged boundary" >&2
+      exit 1
+    fi
     exit 0
     ;;
   verify-publication-plan)
@@ -555,6 +663,8 @@ esac
 frozen_manifest_json="$(git cat-file blob "$source_commit:release-manifest.json")"
 release_version="$(jq -er .version <<< "$frozen_manifest_json")"
 immutable_tag="v${release_version}"
+verification_observed_source="$source_commit"
+verification_observed_tag="$immutable_tag"
 if [[ "$release_version" == *-* ]]; then
   prerelease=true
   major_alias=""
@@ -565,17 +675,29 @@ fi
 
 if [[ "$mode" == "verify-published" ]]; then
   verify_root="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/codex-review-gate-public-verify.XXXXXX")"
-  trap 'rm -rf -- "$verify_root"' EXIT
+  temporary_root="$verify_root"
   verify_repo="$verify_root/target"
   assets_dir="$verify_root/assets"
   mkdir -m 700 "$assets_dir"
 
-  remote_full="$(git ls-remote "$target_url" "refs/tags/$immutable_tag" "refs/tags/$immutable_tag^{}")"
-  [[ -n "$remote_full" ]] || { echo "error: immutable tag is not published" >&2; exit 1; }
+  verification_stage="immutable-tag"
+  if ! remote_full="$(git ls-remote "$target_url" "refs/tags/$immutable_tag" "refs/tags/$immutable_tag^{}")"; then
+    fail_verification inconclusive remote-read-inconclusive immutable-tag \
+      retry-public-verification "immutable tag state could not be read"
+  fi
+  [[ -n "$remote_full" ]] || {
+    fail_verification blocked_conflict immutable-tag-missing immutable-tag \
+      reconcile-exact-source "immutable tag is not published"
+  }
   full_tag_object="$(printf '%s\n' "$remote_full" | awk -v r="refs/tags/$immutable_tag" '$2 == r {print $1}')"
   full_commit="$(printf '%s\n' "$remote_full" | awk -v r="refs/tags/$immutable_tag^{}" '$2 == r {print $1}')"
-  [[ -n "$full_tag_object" && -n "$full_commit" ]] || { echo "error: immutable tag must be annotated" >&2; exit 1; }
-  git clone --quiet "$target_url" "$verify_repo"
+  [[ -n "$full_tag_object" && -n "$full_commit" ]] || {
+    fail_published_state immutable-tag "immutable tag must be annotated"
+  }
+  git clone --quiet "$target_url" "$verify_repo" || {
+    fail_verification inconclusive remote-read-inconclusive immutable-tag \
+      retry-public-verification "target repository could not be cloned"
+  }
   public_direct_tag_commit() {
     local tag="$1"
     local expected_subject="$2"
@@ -597,14 +719,39 @@ if [[ "$mode" == "verify-published" ]]; then
     [[ "$peeled" == "$direct_object" ]] || return 1
     printf '%s\n' "$direct_object"
   }
-  target_master="$(git -C "$verify_repo" rev-parse "origin/$TARGET_BRANCH")"
+
+  public_api_error_is_http_404() {
+    local error_file="$1"
+    [[ -s "$error_file" ]] &&
+      LC_ALL=C grep -Eq 'HTTP[[:space:]]+404([^0-9]|$)' "$error_file"
+  }
+
+  read_public_release_api() {
+    local tag="$1"
+    local output_file="$2"
+    local error_file="$3"
+    local api_status
+    if publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$tag" \
+      > "$output_file" 2> "$error_file"; then
+      return 0
+    else
+      api_status=$?
+    fi
+    if [[ "$api_status" != 0 ]] && public_api_error_is_http_404 "$error_file"; then
+      return 44
+    fi
+    return 75
+  }
+
+  target_master="$(git -C "$verify_repo" rev-parse "origin/$TARGET_BRANCH" 2>/dev/null)" || {
+    fail_published_state immutable-tag "target master is missing from the published repository"
+  }
   [[ "$(git -C "$verify_repo" rev-parse "refs/tags/$immutable_tag")" == "$full_tag_object" ]] || {
-    echo "error: immutable tag changed while public verification started" >&2
-    exit 1
+    fail_published_state immutable-tag "immutable tag changed while public verification started"
   }
   [[ "$(public_direct_tag_commit "$immutable_tag" "Release codex-review-gate-action $immutable_tag")" == "$full_commit" ]] || {
-    echo "error: immutable release ref is not an exact annotated tag directly targeting its release commit" >&2
-    exit 1
+    fail_published_state immutable-tag \
+      "immutable release ref is not an exact annotated tag directly targeting its release commit"
   }
   source_tree="$(git rev-parse "$source_commit:$SOURCE_PATH")"
   planned_master="$(jq -er .target.expected_head <<< "$frozen_manifest_json")"
@@ -612,28 +759,26 @@ if [[ "$mode" == "verify-published" ]]; then
   release_subject="Release codex-review-gate-action $immutable_tag"
   release_body="$(printf '%s\n\nSource: %s@%s\nManifest-SHA256: %s\n' "$release_subject" "$SOURCE_REPOSITORY" "$source_commit" "$manifest_digest")"
   [[ "$(git -C "$verify_repo" rev-parse "$full_commit^{tree}")" == "$source_tree" ]] || {
-    echo "error: published release tree differs from the exact source subtree" >&2
-    exit 1
+    fail_published_state immutable-tag "published release tree differs from the exact source subtree"
   }
   [[ "$(git -C "$verify_repo" show -s --format=%P "$full_commit")" == "$planned_master" ]] || {
-    echo "error: published release wrapper parent differs from target.expected_head" >&2
-    exit 1
+    fail_published_state immutable-tag \
+      "published release wrapper parent differs from target.expected_head"
   }
   [[ "$(git -C "$verify_repo" show -s --format=%an "$full_commit")" == "JoeyTeng-Codex" &&
       "$(git -C "$verify_repo" show -s --format=%ae "$full_commit")" == "codex@mahane.me" &&
       "$(git -C "$verify_repo" show -s --format=%cn "$full_commit")" == "JoeyTeng-Codex" &&
       "$(git -C "$verify_repo" show -s --format=%ce "$full_commit")" == "codex@mahane.me" &&
       "$(git -C "$verify_repo" show -s --format=%B "$full_commit")" == "$release_body" ]] || {
-    echo "error: published release wrapper identity or message differs from policy" >&2
-    exit 1
+    fail_published_state immutable-tag \
+      "published release wrapper identity or message differs from policy"
   }
   [[ "$(git -C "$verify_repo" for-each-ref --format='%(contents:subject)' "refs/tags/$immutable_tag")" == "$release_subject" ]] || {
-    echo "error: immutable tag message differs from policy" >&2
-    exit 1
+    fail_published_state immutable-tag "immutable tag message differs from policy"
   }
   git -C "$verify_repo" merge-base --is-ancestor "$full_commit" "$target_master" || {
-    echo "error: target master does not contain the immutable release commit" >&2
-    exit 1
+    fail_published_state immutable-tag \
+      "target master does not contain the immutable release commit"
   }
 
   verify_public_signature() {
@@ -650,7 +795,7 @@ if [[ "$mode" == "verify-published" ]]; then
 
   verify_later_release_completion() {
     local tag="$1"
-    local expected actual release_path api_file
+    local expected actual release_path api_file error_file api_status
     expected="$(printf '%s\n' \
       "codex-review-gate-action-${tag}.tar.gz" \
       "release-provenance.json" \
@@ -664,7 +809,13 @@ if [[ "$mode" == "verify-published" ]]; then
       return
     fi
     api_file="$verify_root/later-release-${tag}.json"
-    publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$tag" > "$api_file" 2>/dev/null || return 1
+    error_file="$verify_root/later-release-${tag}.err"
+    if read_public_release_api "$tag" "$api_file" "$error_file"; then
+      :
+    else
+      api_status=$?
+      return "$api_status"
+    fi
     [[ "$(jq -r .draft "$api_file")" == "false" &&
         "$(jq -r .immutable "$api_file")" == "true" &&
         "$(jq -r .author.login "$api_file")" == "codex-review-gate-action-publisher[bot]" ]] || return 1
@@ -675,40 +826,56 @@ if [[ "$mode" == "verify-published" ]]; then
   if ! is_test_environment; then
     export GNUPGHOME="$verify_root/gnupg"
     mkdir -m 700 "$GNUPGHOME"
-    publisher_gh api users/JoeyTeng-Codex/gpg_keys > "$verify_root/github-signing-keys.json"
+    publisher_gh api users/JoeyTeng-Codex/gpg_keys > "$verify_root/github-signing-keys.json" || {
+      fail_verification inconclusive remote-read-inconclusive immutable-tag \
+        retry-public-verification "GitHub signing-key inventory could not be read"
+    }
     node "$generator" verify-github-signing-key \
       --input "$verify_root/github-signing-keys.json" \
-      --output-public-key "$verify_root/release-signing-public-key.asc"
+      --output-public-key "$verify_root/release-signing-public-key.asc" || {
+      fail_published_state immutable-tag \
+        "GitHub signing-key inventory differs from release signer policy"
+    }
     gpg --batch --import "$verify_root/release-signing-public-key.asc" >/dev/null 2>&1
-    verify_public_signature commit "$full_commit" || { echo "error: release commit signature is invalid" >&2; exit 1; }
-    verify_public_signature tag "$immutable_tag" || { echo "error: immutable tag signature is invalid" >&2; exit 1; }
+    verify_public_signature commit "$full_commit" || {
+      fail_published_state immutable-tag "release commit signature is invalid"
+    }
+    verify_public_signature tag "$immutable_tag" || {
+      fail_published_state immutable-tag "immutable tag signature is invalid"
+    }
   fi
 
   alias_tag_object=""
   if [[ -n "$major_alias" ]]; then
-    remote_alias="$(git ls-remote "$target_url" "refs/tags/$major_alias" "refs/tags/$major_alias^{}")"
-    [[ -n "$remote_alias" ]] || { echo "error: stable major alias is not published" >&2; exit 1; }
+    verification_stage="floating-alias"
+    if ! remote_alias="$(git ls-remote "$target_url" "refs/tags/$major_alias" "refs/tags/$major_alias^{}")"; then
+      fail_verification inconclusive remote-read-inconclusive floating-alias \
+        retry-public-verification "stable major alias state could not be read"
+    fi
+    [[ -n "$remote_alias" ]] || {
+      fail_verification blocked_conflict major-alias-missing floating-alias \
+        reconcile-exact-source "stable major alias is not published"
+    }
     alias_tag_object="$(printf '%s\n' "$remote_alias" | awk -v r="refs/tags/$major_alias" '$2 == r {print $1}')"
     alias_commit="$(printf '%s\n' "$remote_alias" | awk -v r="refs/tags/$major_alias^{}" '$2 == r {print $1}')"
     [[ -n "$alias_tag_object" && -n "$alias_commit" &&
         "$(public_direct_tag_commit "$major_alias" "Codex Review Gate Action $major_alias")" == "$alias_commit" ]] || {
-      echo "error: stable major alias must be an exact annotated tag directly targeting a commit" >&2
-      exit 1
+      fail_published_state floating-alias \
+        "stable major alias must be an exact annotated tag directly targeting a commit"
     }
     [[ "$(git -C "$verify_repo" for-each-ref --format='%(contents:subject)' "refs/tags/$major_alias")" == "Codex Review Gate Action $major_alias" ]] || {
-      echo "error: stable major alias message differs from policy" >&2
-      exit 1
+      fail_published_state floating-alias "stable major alias message differs from policy"
     }
     git -C "$verify_repo" merge-base --is-ancestor "$alias_commit" "$target_master" || {
-      echo "error: target master does not contain the major alias commit" >&2
-      exit 1
+      fail_published_state floating-alias "target master does not contain the major alias commit"
     }
     if [[ "$alias_commit" != "$full_commit" ]]; then
       git -C "$verify_repo" merge-base --is-ancestor "$full_commit" "$alias_commit" || {
-        echo "error: stable major alias target is not forward from the requested release" >&2
-        exit 1
+        fail_published_state floating-alias \
+          "stable major alias target is not forward from the requested release"
       }
       later_release_found=false
+      later_release_read_failed=false
       while IFS= read -r later_tag; do
         [[ "$later_tag" == v* ]] || continue
         later_version="${later_tag#v}"
@@ -724,115 +891,248 @@ if [[ "$mode" == "verify-published" ]]; then
           verify_public_signature tag "$later_tag" || continue
           verify_public_signature commit "$alias_commit" || continue
         fi
-        verify_later_release_completion "$later_tag" || continue
-        later_release_found=true
-        break
+        if verify_later_release_completion "$later_tag"; then
+          later_release_found=true
+          break
+        else
+          later_release_status=$?
+          if [[ "$later_release_status" == 75 ]]; then
+            later_release_read_failed=true
+          fi
+          continue
+        fi
       done < <(git -C "$verify_repo" tag --points-at "$alias_commit" --list 'v*')
+      [[ "$later_release_read_failed" != true ]] || {
+        fail_verification inconclusive remote-read-inconclusive floating-alias \
+          retry-public-verification "later GitHub Release state could not be read"
+      }
       [[ "$later_release_found" == true ]] || {
-        echo "error: stable major alias is neither current nor a verified later stable release" >&2
-        exit 1
+        fail_published_state floating-alias \
+          "stable major alias is neither current nor a verified later stable release"
       }
     fi
     if ! is_test_environment; then
-      verify_public_signature tag "$major_alias" || { echo "error: major alias signature is invalid" >&2; exit 1; }
+      verify_public_signature tag "$major_alias" || {
+        fail_published_state floating-alias "major alias signature is invalid"
+      }
     fi
   fi
 
   expected_assets="$(printf '%s\n' "codex-review-gate-action-${immutable_tag}.tar.gz" "release-provenance.json" "release-provenance.json.asc" | LC_ALL=C sort)"
+  verification_stage="immutable-release"
   if [[ -n "$test_release_dir" ]]; then
     release_path="$test_release_dir/$immutable_tag"
-    [[ -f "$release_path/published" && -f "$release_path/immutable" && "$(cat "$release_path/prerelease")" == "$prerelease" ]] || {
-      echo "error: test release is not published with the expected state" >&2
-      exit 1
+    [[ -f "$release_path/published" && -f "$release_path/prerelease" ]] || {
+      fail_verification blocked_conflict release-state-incomplete immutable-release \
+        reconcile-exact-source "test release is not published with the expected state"
+    }
+    [[ -f "$release_path/immutable" ]] || {
+      fail_verification blocked_conflict mutable-release immutable-release \
+        repair-immutable-release-and-reconcile "published test Release is mutable"
+    }
+    [[ "$(cat "$release_path/prerelease")" == "$prerelease" ]] || {
+      fail_verification blocked_conflict release-state-mismatch immutable-release \
+        repair-immutable-release-and-reconcile "test Release prerelease state differs from policy"
     }
     for name in $expected_assets; do
+      [[ -f "$release_path/$name" ]] || {
+        fail_verification blocked_conflict release-state-incomplete immutable-release \
+          reconcile-exact-source "published test Release is missing an expected asset"
+      }
       cp "$release_path/$name" "$assets_dir/$name"
     done
   else
     expected_release_body="Signed release of $SOURCE_REPOSITORY@$source_commit."
-    release_state="$(publisher_gh release view "$immutable_tag" --repo "$TARGET_REPOSITORY" --json isDraft,isPrerelease,tagName,name,body)"
-    [[ "$(printf '%s' "$release_state" | jq -r .isDraft)" == "false" ]]
-    [[ "$(printf '%s' "$release_state" | jq -r .isPrerelease)" == "$prerelease" ]]
+    verification_release_view_error="$verify_root/release-view.err"
+    if release_state="$(publisher_gh release view "$immutable_tag" --repo "$TARGET_REPOSITORY" --json isDraft,isPrerelease,tagName,name,body 2> "$verification_release_view_error")"; then
+      :
+    else
+      release_view_status=$?
+      if [[ "$release_view_status" != 0 ]] &&
+        public_api_error_is_http_404 "$verification_release_view_error"; then
+        fail_verification blocked_conflict release-state-missing immutable-release \
+          reconcile-exact-source "GitHub Release is not published"
+      fi
+      fail_verification inconclusive release-api-unreadable immutable-release \
+        retry-public-verification "GitHub Release state could not be read"
+    fi
+    [[ "$(printf '%s' "$release_state" | jq -r .isDraft)" == "false" ]] || {
+      fail_verification blocked_conflict release-state-incomplete immutable-release \
+        reconcile-exact-source "GitHub Release remains a draft"
+    }
+    [[ "$(printf '%s' "$release_state" | jq -r .isPrerelease)" == "$prerelease" ]] || {
+      fail_published_state immutable-release "GitHub Release prerelease state differs from policy"
+    }
     [[ "$(printf '%s' "$release_state" | jq -r .tagName)" == "$immutable_tag" &&
         "$(printf '%s' "$release_state" | jq -r .name)" == "$immutable_tag" &&
         "$(printf '%s' "$release_state" | jq -r .body)" == "$expected_release_body" ]] || {
-      echo "error: published GitHub Release metadata differs from policy" >&2
-      exit 1
+      fail_published_state immutable-release "published GitHub Release metadata differs from policy"
     }
     initial_release_api="$verify_root/release-initial.json"
-    publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$initial_release_api"
-    [[ "$(jq -r .author.login "$initial_release_api")" == "codex-review-gate-action-publisher[bot]" ]]
-    [[ "$(jq -r .immutable "$initial_release_api")" == "true" ]] || {
-      echo "error: published GitHub Release is not immutable" >&2
-      exit 1
+    initial_release_error="$verify_root/release-initial.err"
+    if read_public_release_api "$immutable_tag" "$initial_release_api" "$initial_release_error"; then
+      :
+    else
+      initial_release_status=$?
+      if [[ "$initial_release_status" == 44 ]]; then
+        fail_published_state immutable-release \
+          "GitHub Release disappeared after its initial public view"
+      fi
+      fail_verification inconclusive release-api-unreadable immutable-release \
+        retry-public-verification "GitHub Release API state could not be read"
+    fi
+    [[ "$(jq -r .author.login "$initial_release_api")" == "codex-review-gate-action-publisher[bot]" ]] || {
+      fail_published_state immutable-release "published GitHub Release author differs from policy"
     }
-    initial_asset_snapshot="$(node "$generator" snapshot-release-assets --input "$initial_release_api")"
-    commit_verification="$(publisher_gh api "repos/$TARGET_REPOSITORY/commits/$full_commit" --jq '[.commit.verification.verified,.commit.verification.reason] | map(tostring) | join(" ")')"
-    [[ "$commit_verification" == "true valid" ]]
-    tag_verification="$(publisher_gh api "repos/$TARGET_REPOSITORY/git/tags/$full_tag_object" --jq '[.verification.verified,.verification.reason] | map(tostring) | join(" ")')"
-    [[ "$tag_verification" == "true valid" ]]
+    [[ "$(jq -r .immutable "$initial_release_api")" == "true" ]] || {
+      fail_verification blocked_conflict mutable-release immutable-release \
+        repair-immutable-release-and-reconcile "published GitHub Release is not immutable"
+    }
+    initial_asset_snapshot="$(node "$generator" snapshot-release-assets --input "$initial_release_api")" || {
+      fail_published_state immutable-release "published GitHub Release asset metadata is malformed"
+    }
+    if ! commit_verification="$(publisher_gh api "repos/$TARGET_REPOSITORY/commits/$full_commit" --jq '[.commit.verification.verified,.commit.verification.reason] | map(tostring) | join(" ")')"; then
+      fail_verification inconclusive release-api-unreadable immutable-release \
+        retry-public-verification "release commit verification state could not be read"
+    fi
+    [[ "$commit_verification" == "true valid" ]] || {
+      fail_published_state immutable-release "release commit signature is not verified by GitHub"
+    }
+    if ! tag_verification="$(publisher_gh api "repos/$TARGET_REPOSITORY/git/tags/$full_tag_object" --jq '[.verification.verified,.verification.reason] | map(tostring) | join(" ")')"; then
+      fail_verification inconclusive release-api-unreadable immutable-release \
+        retry-public-verification "immutable tag verification state could not be read"
+    fi
+    [[ "$tag_verification" == "true valid" ]] || {
+      fail_published_state immutable-release "immutable tag signature is not verified by GitHub"
+    }
     if [[ -n "$major_alias" ]]; then
-      alias_verification="$(publisher_gh api "repos/$TARGET_REPOSITORY/git/tags/$alias_tag_object" --jq '[.verification.verified,.verification.reason] | map(tostring) | join(" ")')"
-      [[ "$alias_verification" == "true valid" ]]
+      if ! alias_verification="$(publisher_gh api "repos/$TARGET_REPOSITORY/git/tags/$alias_tag_object" --jq '[.verification.verified,.verification.reason] | map(tostring) | join(" ")')"; then
+        fail_verification inconclusive release-api-unreadable immutable-release \
+          retry-public-verification "floating alias verification state could not be read"
+      fi
+      [[ "$alias_verification" == "true valid" ]] || {
+        fail_published_state immutable-release "floating alias signature is not verified by GitHub"
+      }
     fi
     actual_assets="$(printf '%s' "$initial_asset_snapshot" | jq -r '.[].name' | LC_ALL=C sort)"
-    [[ "$actual_assets" == "$expected_assets" ]] || { echo "error: published release asset inventory differs from policy" >&2; exit 1; }
-    publisher_gh release download "$immutable_tag" --repo "$TARGET_REPOSITORY" --pattern '*' --dir "$assets_dir"
+    [[ "$actual_assets" == "$expected_assets" ]] || {
+      fail_published_state immutable-release "published release asset inventory differs from policy"
+    }
+    release_download_error="$verify_root/release-download.err"
+    if publisher_gh release download "$immutable_tag" --repo "$TARGET_REPOSITORY" \
+      --pattern '*' --dir "$assets_dir" 2> "$release_download_error"; then
+      :
+    elif public_api_error_is_http_404 "$release_download_error"; then
+      fail_published_state immutable-release \
+        "GitHub Release disappeared before its assets could be downloaded"
+    else
+      fail_verification inconclusive release-api-unreadable immutable-release \
+        retry-public-verification "published release assets could not be downloaded"
+    fi
   fi
   actual_assets="$(find "$assets_dir" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
-  [[ "$actual_assets" == "$expected_assets" ]] || { echo "error: downloaded release asset inventory differs from policy" >&2; exit 1; }
+  [[ "$actual_assets" == "$expected_assets" ]] || {
+    fail_published_state immutable-release "downloaded release asset inventory differs from policy"
+  }
   node "$generator" verify-published-assets \
     --repo "$repo_root" \
     --target-repo "$verify_repo" \
     --source-ref "$source_commit" \
     --asset-dir "$assets_dir" \
     --release-commit "$full_commit" \
-    --full-tag-object "$full_tag_object"
+    --full-tag-object "$full_tag_object" || {
+    fail_published_state immutable-release \
+      "published release assets or provenance differ from the exact source"
+  }
   if ! is_test_environment; then
     provenance_status="$verify_root/provenance.gpg-status"
     gpg --batch --status-fd=1 --verify "$assets_dir/release-provenance.json.asc" "$assets_dir/release-provenance.json" > "$provenance_status" 2>/dev/null || {
-      echo "error: detached release provenance signature verification failed" >&2
-      exit 1
+      fail_published_state immutable-release \
+        "detached release provenance signature verification failed"
     }
     node "$generator" verify-openpgp-status \
       --input "$provenance_status" \
       --name "release provenance" || {
-      echo "error: detached release provenance signature does not match release signer policy" >&2
-      exit 1
+      fail_published_state immutable-release \
+        "detached release provenance signature does not match release signer policy"
     }
-    final_release_state="$(publisher_gh release view "$immutable_tag" --repo "$TARGET_REPOSITORY" --json isDraft,isPrerelease,tagName,name,body)"
+  fi
+  if [[ -z "$test_release_dir" ]]; then
+    final_release_view_error="$verify_root/release-final-view.err"
+    if final_release_state="$(publisher_gh release view "$immutable_tag" --repo "$TARGET_REPOSITORY" --json isDraft,isPrerelease,tagName,name,body 2> "$final_release_view_error")"; then
+      :
+    elif public_api_error_is_http_404 "$final_release_view_error"; then
+      fail_published_state immutable-release \
+        "GitHub Release disappeared during public verification"
+    else
+      fail_verification inconclusive release-api-unreadable immutable-release \
+        retry-public-verification "final GitHub Release state could not be read"
+    fi
     [[ "$final_release_state" == "$release_state" ]] || {
-      echo "error: GitHub Release metadata changed during public verification" >&2
-      exit 1
+      fail_published_state immutable-release \
+        "GitHub Release metadata changed during public verification"
     }
     final_release_api="$verify_root/release-final.json"
-    publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$final_release_api"
+    final_release_error="$verify_root/release-final.err"
+    if read_public_release_api "$immutable_tag" "$final_release_api" "$final_release_error"; then
+      :
+    else
+      final_release_status=$?
+      if [[ "$final_release_status" == 44 ]]; then
+        fail_published_state immutable-release \
+          "GitHub Release disappeared during its final API readback"
+      fi
+      fail_verification inconclusive release-api-unreadable immutable-release \
+        retry-public-verification "final GitHub Release API state could not be read"
+    fi
     [[ "$(jq -r .immutable "$final_release_api")" == "true" ]] || {
-      echo "error: GitHub Release immutability changed during public verification" >&2
-      exit 1
+      fail_verification blocked_conflict mutable-release immutable-release \
+        repair-immutable-release-and-reconcile \
+        "GitHub Release immutability changed during public verification"
     }
-    final_asset_snapshot="$(node "$generator" snapshot-release-assets --input "$final_release_api")"
+    if ! final_asset_snapshot="$(node "$generator" snapshot-release-assets --input "$final_release_api")"; then
+      fail_published_state immutable-release \
+        "final GitHub Release asset metadata is malformed"
+    fi
     [[ "$final_asset_snapshot" == "$initial_asset_snapshot" ]] || {
-      echo "error: GitHub Release asset identity or metadata changed during public verification" >&2
-      exit 1
+      fail_published_state immutable-release \
+        "GitHub Release asset identity or metadata changed during public verification"
     }
     [[ "$(jq -r .author.login "$final_release_api")" == "codex-review-gate-action-publisher[bot]" ]] || {
-      echo "error: GitHub Release author changed during public verification" >&2
-      exit 1
+      fail_published_state immutable-release \
+        "GitHub Release author changed during public verification"
     }
   fi
-  final_full="$(git ls-remote "$target_url" "refs/tags/$immutable_tag" "refs/tags/$immutable_tag^{}")"
-  [[ "$final_full" == "$remote_full" ]] || { echo "error: immutable tag changed during public verification" >&2; exit 1; }
-  if [[ -n "$major_alias" ]]; then
-    final_alias="$(git ls-remote "$target_url" "refs/tags/$major_alias" "refs/tags/$major_alias^{}")"
-    [[ "$final_alias" == "$remote_alias" ]] || { echo "error: major alias changed during public verification" >&2; exit 1; }
+  if ! final_full="$(git ls-remote "$target_url" "refs/tags/$immutable_tag" "refs/tags/$immutable_tag^{}")"; then
+    fail_verification inconclusive remote-read-inconclusive immutable-release \
+      retry-public-verification "immutable tag final state could not be read"
   fi
-  final_master="$(remote_master)"
-  git -C "$verify_repo" fetch --quiet origin "$final_master"
-  git -C "$verify_repo" merge-base --is-ancestor "$full_commit" "$final_master" || {
-    echo "error: final target master no longer contains the immutable release" >&2
-    exit 1
+  [[ "$final_full" == "$remote_full" ]] || {
+    fail_published_state immutable-release "immutable tag changed during public verification"
   }
+  if [[ -n "$major_alias" ]]; then
+    if ! final_alias="$(git ls-remote "$target_url" "refs/tags/$major_alias" "refs/tags/$major_alias^{}")"; then
+      fail_verification inconclusive remote-read-inconclusive immutable-release \
+        retry-public-verification "major alias final state could not be read"
+    fi
+    [[ "$final_alias" == "$remote_alias" ]] || {
+      fail_published_state immutable-release "major alias changed during public verification"
+    }
+  fi
+  if ! final_master="$(remote_master)"; then
+    fail_verification inconclusive remote-read-inconclusive immutable-release \
+      retry-public-verification "target master final state could not be read"
+  fi
+  git -C "$verify_repo" fetch --quiet origin "$final_master" || {
+    fail_verification inconclusive remote-read-inconclusive immutable-release \
+      retry-public-verification "target master final object could not be fetched"
+  }
+  git -C "$verify_repo" merge-base --is-ancestor "$full_commit" "$final_master" || {
+    fail_published_state immutable-release \
+      "final target master no longer contains the immutable release"
+  }
+  verification_stage="complete"
+  emit_verification_result verified none complete none
   exit 0
 fi
 
@@ -874,6 +1174,7 @@ preflight_write_eligible="$(jq -r .write_eligible <<< "$preflight_state")"
 preflight_recovery_code="$(jq -r '.recovery_code // ""' <<< "$preflight_state")"
 preflight_recovery_reason="$(jq -r '.reason // ""' <<< "$preflight_state")"
 stale_completion_authorized=false
+immutable_policy_preflight_complete=false
 require_publication_mutation() {
   local mutation_class="$1"
   if [[ "$preflight_write_eligible" != "true" ]]; then
@@ -886,6 +1187,11 @@ require_publication_mutation() {
       return 1
     fi
   fi
+  if [[ "$immutable_policy_preflight_complete" != "true" ]]; then
+    require_immutable_release_policy first-mutation
+    immutable_policy_preflight_complete=true
+  fi
+  verify_final_policy_fence "before-$mutation_class"
   return 0
 }
 candidate_source="$(json_field "$candidate/candidate.json" plan.source_commit)"
@@ -925,18 +1231,85 @@ fi
 
 temporary_root="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/codex-review-gate-release.XXXXXX")"
 stage_repo="$temporary_root/target"
-if ! is_test_environment; then
-  publisher_gh api --paginate --slurp "repos/$TARGET_REPOSITORY/rulesets" > "$temporary_root/rulesets.json"
-  jq -e 'type == "array"' "$temporary_root/rulesets.json" >/dev/null
-  mkdir "$temporary_root/ruleset-details"
-  while IFS= read -r ruleset_id; do
-    publisher_gh api "repos/$TARGET_REPOSITORY/rulesets/$ruleset_id" > "$temporary_root/ruleset-details/$ruleset_id.json"
-  done < <(jq -r 'flatten[] | .id' "$temporary_root/rulesets.json")
-  jq -s '.' "$temporary_root"/ruleset-details/*.json > "$temporary_root/ruleset-details.json"
-  node "$generator" verify-rulesets --input "$temporary_root/ruleset-details.json" || {
-    echo "error: effective target rulesets differ from the adopted publisher and integrity contract" >&2
-    exit 1
+ruleset_snapshot_counter=0
+immutable_policy_counter=0
+
+verify_ruleset_policy_snapshot() {
+  local label="$1"
+  local summary_file details_dir details_file ruleset_id
+  [[ -z "$test_release_dir" ]] || return 0
+  ruleset_snapshot_counter=$((ruleset_snapshot_counter + 1))
+  summary_file="$temporary_root/rulesets-${ruleset_snapshot_counter}-${label}.json"
+  details_dir="$temporary_root/ruleset-details-${ruleset_snapshot_counter}-${label}"
+  details_file="$temporary_root/ruleset-details-${ruleset_snapshot_counter}-${label}.json"
+  if ! publisher_gh api --paginate --slurp \
+      --header 'X-GitHub-Api-Version: 2026-03-10' \
+      "repos/$TARGET_REPOSITORY/rulesets" > "$summary_file"; then
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "target rulesets could not be read at the $label policy fence; retry the exact source SHA"
+  fi
+  jq -e '
+    type == "array" and
+    ([flatten[] | .id] as $ids |
+      ($ids | length) == 4 and
+      ($ids | unique | length) == 4 and
+      all($ids[]; type == "number" and . > 0))
+  ' "$summary_file" >/dev/null || {
+    fail_reconcile blocked_conflict publisher-ruleset-policy-changed \
+      "the active target ruleset inventory differs from the exact four-ruleset baseline"
   }
+  mkdir -m 700 "$details_dir"
+  while IFS= read -r ruleset_id; do
+    if ! publisher_gh api \
+        --header 'X-GitHub-Api-Version: 2026-03-10' \
+        "repos/$TARGET_REPOSITORY/rulesets/$ruleset_id" > "$details_dir/$ruleset_id.json"; then
+      fail_reconcile inconclusive remote-read-inconclusive \
+        "target ruleset $ruleset_id could not be read at the $label policy fence"
+    fi
+  done < <(jq -r 'flatten[] | .id' "$summary_file" | LC_ALL=C sort -n)
+  jq -s '.' "$details_dir"/*.json > "$details_file"
+  node "$generator" verify-rulesets --input "$details_file" || {
+    fail_reconcile blocked_conflict publisher-ruleset-policy-changed \
+      "effective target rulesets differ from the adopted publisher and integrity contract"
+  }
+}
+
+verify_final_policy_fence() {
+  local label="$1"
+  local observed_source_master
+  [[ -z "$test_release_dir" ]] || return 0
+  if ! observed_source_master="$(source_live_master)"; then
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "source master could not be read at the $label policy fence; retry the exact source SHA"
+  fi
+  [[ "$observed_source_master" == "$preflight_live_source" ]] || {
+    fail_reconcile inconclusive source-state-changed \
+      "source master moved after the publication plan; reconcile the partial prefix with the exact source SHA"
+  }
+  verify_ruleset_policy_snapshot "$label"
+}
+
+require_immutable_release_policy() {
+  local label="$1"
+  local policy_file
+  [[ -z "$test_release_dir" ]] || return 0
+  immutable_policy_counter=$((immutable_policy_counter + 1))
+  policy_file="$temporary_root/immutable-releases-${immutable_policy_counter}-${label}.json"
+  if ! publisher_gh api \
+      --header 'X-GitHub-Api-Version: 2026-03-10' \
+      "repos/$TARGET_REPOSITORY/immutable-releases" > "$policy_file"; then
+    fail_reconcile inconclusive immutable-release-policy-unreadable \
+      "target immutable-release policy could not be read before $label"
+  fi
+  jq -e 'type == "object" and keys == ["enabled"] and .enabled == true' \
+    "$policy_file" >/dev/null || {
+    fail_reconcile blocked_conflict immutable-release-policy-disabled \
+      "target immutable releases must be enabled before any release mutation"
+  }
+}
+
+if ! is_test_environment; then
+  verify_ruleset_policy_snapshot initial
 fi
 git clone --quiet "$target_url" "$stage_repo"
 git -C "$stage_repo" fetch --quiet --force --no-write-fetch-head \
@@ -1443,6 +1816,7 @@ else
         fi
       done < <(git -C "$stage_repo" tag --list 'v*')
       if [[ "$superseded" == true ]]; then
+        verify_final_policy_fence success-superseded
         emit_reconcile_state superseded
         echo "release_status=superseded; target history already contains a later immutable release"
         exit 0
@@ -2012,6 +2386,7 @@ if [[ -n "$major_alias" ]]; then
   fi
 fi
 if [[ "$reconcile_state" == "superseded" ]]; then
+  verify_final_policy_fence success-superseded
   emit_reconcile_state "$reconcile_state"
   echo "release_status=superseded; no durable target write is required or permitted"
   exit 0
@@ -2111,6 +2486,7 @@ reconcile_github_release() {
   local latest_before latest_after view_error
   local final_release_api final_confirm_api final_release_identity final_confirm_identity
   local final_asset_snapshot final_confirm_snapshot final_download_dir final_provenance_status
+  local post_publish_release_api
   local current_boundary before_boundary after_boundary published_boundary pre_alias_immutable
   local absent_boundary created_boundary
   local boundary_counter=0
@@ -2333,6 +2709,8 @@ reconcile_github_release() {
   }
   if [[ "$current_draft" == "true" ]]; then
     require_publication_mutation release-completion
+    require_immutable_release_policy release-publication
+    verify_final_policy_fence before-release-publication
     edit_args=(release edit "$immutable_tag" --repo "$TARGET_REPOSITORY" --draft=false)
     if [[ "$prerelease" == true ]]; then
       edit_args+=(--prerelease --latest=false)
@@ -2343,6 +2721,15 @@ reconcile_github_release() {
     fi
     publisher_gh "${edit_args[@]}"
   fi
+  post_publish_release_api="$temporary_root/current-release-post-publish.json"
+  publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$post_publish_release_api" || {
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "published GitHub Release could not be read back after publication"
+  }
+  jq -e '.draft == false and .immutable == true' "$post_publish_release_api" >/dev/null || {
+    fail_reconcile blocked_conflict immutable-release-mismatch \
+      "published GitHub Release must report draft=false and immutable=true before alias advancement"
+  }
   published_boundary="$(capture_release_boundary post-publish false true)" || {
     echo "error: published GitHub Release failed the exact immutable boundary readback" >&2
     return 1
@@ -2573,4 +2960,5 @@ if [[ -n "$major_alias" ]]; then
   fi
 fi
 
+verify_final_policy_fence success-readback
 emit_reconcile_state "$reconcile_state"

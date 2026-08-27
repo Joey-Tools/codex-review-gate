@@ -32,6 +32,55 @@ const SYNTHETIC_TOKEN_FIXTURE = Object.freeze({
   id: "access-a",
   value: "codex_synth_v1_access_a",
 });
+const FAKE_PUBLISHER_BYPASS = [{
+  actor_id: 4700530,
+  actor_type: "Integration",
+  bypass_mode: "always",
+}];
+const FAKE_PRODUCTION_RULESETS = [
+  {
+    id: 1,
+    name: "publisher-master-update",
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: ["refs/heads/master"], exclude: [] } },
+    bypass_actors: FAKE_PUBLISHER_BYPASS,
+    rules: [{ type: "update" }],
+  },
+  {
+    id: 2,
+    name: "master-integrity",
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: ["refs/heads/master"], exclude: [] } },
+    bypass_actors: [],
+    rules: ["deletion", "non_fast_forward", "required_linear_history", "required_signatures"]
+      .map((type) => ({ type })),
+  },
+  {
+    id: 3,
+    name: "freeze-v1-tags",
+    enforcement: "active",
+    target: "tag",
+    conditions: { ref_name: { include: ["refs/tags/v1", "refs/tags/v1.*"], exclude: [] } },
+    bypass_actors: [],
+    rules: ["creation", "update", "deletion", "non_fast_forward"].map((type) => ({ type })),
+  },
+  {
+    id: 4,
+    name: "publisher-v2-plus-tags",
+    enforcement: "active",
+    target: "tag",
+    conditions: {
+      ref_name: {
+        include: ["refs/tags/v*"],
+        exclude: ["refs/tags/v1", "refs/tags/v1.*"],
+      },
+    },
+    bypass_actors: FAKE_PUBLISHER_BYPASS,
+    rules: ["creation", "update", "deletion", "non_fast_forward"].map((type) => ({ type })),
+  },
+];
 const executionEnv = {
   ...process.env,
   CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "1",
@@ -52,6 +101,7 @@ const executionEnv = {
   PUBLISHER_TOKEN: "",
   RELEASE_PUBLISHER_TOKEN: "",
 };
+let verificationInvocationCounter = 0;
 
 function run(file, args, options = {}) {
   return execFileSync(file, args, {
@@ -404,6 +454,48 @@ function invokePublish(state, built, options = {}) {
   return result;
 }
 
+function invokeVerifyPublished(state, built, options = {}) {
+  verificationInvocationCounter += 1;
+  const githubOutput = join(state.root, `verify-published-${verificationInvocationCounter}.output`);
+  write(githubOutput, "");
+  const result = invoke("bash", releaseArgs(
+    state,
+    "--verify-published",
+    "--source-ref",
+    built.sourceCommit,
+    "--control-ref",
+    built.controlCommit,
+    ...(options.testRelease === false
+      ? []
+      : ["--test-release-dir", state.releases]),
+  ), {
+    cwd: state.source,
+    env: { ...options.env, GITHUB_OUTPUT: githubOutput },
+  });
+  const combined = `${result.stdout}\n${result.stderr}`;
+  const output = readFileSync(githubOutput, "utf8");
+  for (const field of [
+    "verification_state",
+    "verification_stage",
+    "recovery_code",
+    "next_action",
+    "observed_source",
+    "observed_tag",
+  ]) {
+    assert.equal(
+      [...combined.matchAll(new RegExp(`(?:^|\\n)${field}=[^\\n]+(?=\\n|$)`, "gu"))].length,
+      1,
+      `public verification must emit exactly one ${field}\n${combined}`,
+    );
+    assert.equal(
+      [...output.matchAll(new RegExp(`(?:^|\\n)${field}=[^\\n]+(?=\\n|$)`, "gu"))].length,
+      1,
+      `public verification output must contain exactly one ${field}\n${output}`,
+    );
+  }
+  return Object.assign(result, { githubOutput: output });
+}
+
 function advanceIntent(state, version, expectedHead, previousVersion) {
   git(state.source, ["switch", "-q", "master"]);
   const sourceCommit = writeReleaseIntent(state.source, version, expectedHead, previousVersion);
@@ -490,10 +582,18 @@ function fakeGithubEnvironment(state, mutationPhase) {
     latest: null,
     next_asset_id: 1,
     mutation_done: false,
+    policy_mutation_done: false,
+    immutable_policy_reads: 0,
+    immutable_policy_enabled: mutationPhase !== "immutable-policy-disabled",
+    release_api_reads: 0,
+    release_download_reads: 0,
+    release_view_reads: 0,
+    ruleset_drift: false,
     assets: [],
   });
   write(fakeGh, `#!/usr/bin/env node
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -502,6 +602,7 @@ const root = process.env.FAKE_GH_STATE;
 const statePath = join(root, "state.json");
 const assetsDir = join(root, "assets");
 const phase = process.env.FAKE_GH_MUTATION_PHASE;
+const productionRulesets = ${JSON.stringify(FAKE_PRODUCTION_RULESETS)};
 const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
 const save = (state) => writeFileSync(statePath, JSON.stringify(state, null, 2) + "\\n");
 const option = (name) => {
@@ -569,6 +670,70 @@ if (args[0] === "api") {
   const endpoint = args.slice(1).find((arg) => arg.startsWith("repos/"));
   const jq = option("--jq");
   let state = readState();
+  const requireCurrentApiVersion = () => {
+    if (!args.includes("X-GitHub-Api-Version: 2026-03-10")) {
+      process.stderr.write("missing immutable-release API version header\\n");
+      process.exit(2);
+    }
+  };
+  if (endpoint?.endsWith("/immutable-releases")) {
+    requireCurrentApiVersion();
+    state.immutable_policy_reads += 1;
+    process.stdout.write(JSON.stringify({ enabled: state.immutable_policy_enabled }) + "\\n");
+    if (!state.policy_mutation_done && phase === "source-policy-drift") {
+      execFileSync(process.env.REAL_GIT, [
+        "-C",
+        process.env.FAKE_SOURCE_REPOSITORY,
+        "update-ref",
+        "refs/heads/master",
+        process.env.FAKE_SOURCE_DRIFT_COMMIT,
+      ]);
+      state.policy_mutation_done = true;
+      save(state);
+    } else if (!state.policy_mutation_done && phase === "ruleset-policy-drift") {
+      state.ruleset_drift = true;
+      state.policy_mutation_done = true;
+      save(state);
+    } else if (!state.policy_mutation_done &&
+        phase === "source-drift-during-release-policy-read" &&
+        state.immutable_policy_reads === 2) {
+      execFileSync(process.env.REAL_GIT, [
+        "-C",
+        process.env.FAKE_SOURCE_REPOSITORY,
+        "update-ref",
+        "refs/heads/master",
+        process.env.FAKE_SOURCE_DRIFT_COMMIT,
+      ]);
+      state.policy_mutation_done = true;
+      save(state);
+    } else {
+      save(state);
+    }
+    process.exit(0);
+  }
+  if (endpoint?.endsWith("/rulesets")) {
+    requireCurrentApiVersion();
+    process.stdout.write(JSON.stringify([productionRulesets.map(({ id, name, enforcement, target }) => ({
+      id,
+      name,
+      enforcement,
+      target,
+    }))]) + "\\n");
+    process.exit(0);
+  }
+  const rulesetMatch = endpoint?.match(/\\/rulesets\\/(\\d+)$/u);
+  if (rulesetMatch) {
+    requireCurrentApiVersion();
+    const ruleset = productionRulesets.find(({ id }) => String(id) === rulesetMatch[1]);
+    if (!ruleset) fail404();
+    const markerDrift = process.env.FAKE_RULESET_DRIFT_MARKER &&
+      existsSync(process.env.FAKE_RULESET_DRIFT_MARKER);
+    const result = (state.ruleset_drift || markerDrift) && ruleset.id === 1
+      ? { ...ruleset, enforcement: "disabled" }
+      : ruleset;
+    process.stdout.write(JSON.stringify(result) + "\\n");
+    process.exit(0);
+  }
   if (endpoint?.endsWith("/releases?per_page=100")) {
     process.stdout.write(JSON.stringify([state.exists ? [releaseApi(state)] : []]) + "\\n");
     process.exit(0);
@@ -580,6 +745,12 @@ if (args[0] === "api") {
   }
   if (endpoint.includes("/releases/tags/")) {
     if (!state.exists) fail404();
+    state.release_api_reads += 1;
+    const releaseApi404 =
+      (phase === "verify-initial-api-404" && state.release_api_reads === 1) ||
+      (phase === "verify-final-api-404" && state.release_api_reads === 2);
+    save(state);
+    if (releaseApi404) fail404();
     if (jq === ".author.login") {
       process.stdout.write("codex-review-gate-action-publisher[bot]\\n");
       process.exit(0);
@@ -592,6 +763,17 @@ if (args[0] === "api") {
     process.stdout.write(JSON.stringify(releaseApi(state)) + "\\n");
     process.exit(0);
   }
+  if (endpoint.includes("/commits/") || endpoint.includes("/git/tags/")) {
+    if (jq) {
+      process.stdout.write("true valid\\n");
+    } else {
+      process.stdout.write(JSON.stringify({
+        commit: { verification: { verified: true, reason: "valid" } },
+        verification: { verified: true, reason: "valid" },
+      }) + "\\n");
+    }
+    process.exit(0);
+  }
   process.stderr.write("unsupported fake gh api: " + endpoint + "\\n");
   process.exit(2);
 }
@@ -599,6 +781,10 @@ if (args[0] === "api") {
 if (args[0] === "release" && args[1] === "view") {
   const state = readState();
   if (!state.exists) fail404();
+  state.release_view_reads += 1;
+  const releaseView404 = phase === "verify-final-view-404" && state.release_view_reads === 2;
+  save(state);
+  if (releaseView404) fail404();
   if (option("--jq") === ".assets[].name") {
     process.stdout.write(state.assets.map((asset) => asset.name).sort().join("\\n") + (state.assets.length ? "\\n" : ""));
     process.exit(0);
@@ -639,6 +825,9 @@ if (args[0] === "release" && args[1] === "upload") {
 
 if (args[0] === "release" && args[1] === "download") {
   const state = readState();
+  state.release_download_reads += 1;
+  save(state);
+  if (phase === "verify-download-404" && state.release_download_reads === 1) fail404();
   const pattern = option("--pattern");
   const destination = option("--dir");
   mkdirSync(destination, { recursive: true });
@@ -651,7 +840,7 @@ if (args[0] === "release" && args[1] === "edit") {
   let state = readState();
   if (phase === "before-immutable") state = mutateProvenance(state);
   state.draft = false;
-  state.immutable = true;
+  state.immutable = phase !== "post-publish-mutable";
   state.latest = args.includes("--latest") ? state.tag : state.latest;
   save(state);
   process.exit(0);
@@ -665,6 +854,65 @@ process.exit(2);
     FAKE_GH_MUTATION_PHASE: mutationPhase,
     FAKE_GH_STATE: fakeState,
     PATH: `${fakeBin}:${executionEnv.PATH}`,
+  };
+}
+
+function danglingCommit(repo, parent, message) {
+  const tree = git(repo, ["rev-parse", `${parent}^{tree}`]);
+  return execFileSync(
+    "git",
+    ["-C", repo, "commit-tree", tree, "-p", parent],
+    {
+      encoding: "utf8",
+      env: executionEnv,
+      input: `${message}\n`,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  ).trim();
+}
+
+function driftAfterMasterPushEnvironment(state, githubEnvironment, kind) {
+  const fakeBin = join(state.root, `post-master-${kind}-bin`);
+  const fakeGit = join(fakeBin, "git");
+  const mutationMarker = join(state.root, `post-master-${kind}.marker`);
+  const rulesetDriftMarker = join(state.root, `post-master-${kind}.ruleset-drift`);
+  const realGit = run("which", ["git"]);
+  const sourceBefore = git(state.source, ["rev-parse", "refs/heads/master"]);
+  const sourceDriftCommit = danglingCommit(
+    state.source,
+    sourceBefore,
+    `Source drift after publisher master write (${kind})`,
+  );
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+master_push=false
+for argument in "$@"; do
+  case "$argument" in
+    *:refs/heads/master) master_push=true ;;
+  esac
+done
+"$REAL_GIT" "$@"
+if [ "$master_push" = true ] && [ ! -e "$MUTATION_MARKER" ]; then
+  : > "$MUTATION_MARKER"
+  if [ "$DRIFT_KIND" = source ]; then
+    "$REAL_GIT" -C "$DRIFT_SOURCE_REPOSITORY" update-ref refs/heads/master "$DRIFT_SOURCE_COMMIT"
+  else
+    : > "$RULESET_DRIFT_MARKER"
+  fi
+fi
+`);
+  chmodSync(fakeGit, 0o755);
+  return {
+    ...githubEnvironment,
+    DRIFT_KIND: kind,
+    DRIFT_SOURCE_COMMIT: sourceDriftCommit,
+    DRIFT_SOURCE_REPOSITORY: state.source,
+    FAKE_RULESET_DRIFT_MARKER: rulesetDriftMarker,
+    MUTATION_MARKER: mutationMarker,
+    PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+    REAL_GIT: realGit,
+    RULESET_DRIFT_MARKER: rulesetDriftMarker,
   };
 }
 
@@ -701,6 +949,16 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(workflow, /plan:[\s\S]*candidate-a:[\s\S]*candidate-b:[\s\S]*assemble:[\s\S]*publication_plan:[\s\S]*publish:[\s\S]*verify:/u);
   assert.match(workflow, /publication_plan:[\s\S]*runs-on: ubuntu-slim/u);
   assert.match(workflow, /publish:[\s\S]*environment: marketplace-production/u);
+  assert.ok(
+    workflow.indexOf("Build credential-free publication plan") <
+      workflow.indexOf("Explain privileged-boundary rejection") &&
+      workflow.indexOf("Explain privileged-boundary rejection") <
+        workflow.indexOf("environment: marketplace-production"),
+  );
+  assert.match(
+    publisher,
+    /\.write_eligible == true and \.recovery_code == null and \.reason == null[\s\S]*\.write_eligible == false[\s\S]*release-intent-superseded[\s\S]*publication-admission-invalid[\s\S]*publication is not eligible for the privileged boundary/u,
+  );
   assert.ok(
     workflow.indexOf("Revalidate publication plan before minting credentials") <
       workflow.indexOf("Validate live release signing certificate before minting credentials") &&
@@ -765,6 +1023,22 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     /git\(\)[\s\S]*unset GH_TOKEN GITHUB_TOKEN PUBLISHER_TOKEN RELEASE_PUBLISHER_TOKEN[\s\S]*GIT_CONFIG_GLOBAL=\/dev\/null GIT_CONFIG_NOSYSTEM=1[\s\S]*command git -c credential\.helper= -c credential\.useHttpPath=true[\s\S]*http\.https:\/\/github\.com\/\.extraheader=/u,
   );
   assert.match(publisher, /prewrite-target-audit[\s\S]*audit_release_inventory[\s\S]*audit_release_history[\s\S]*initial_remote_ref_fingerprint/u);
+  assert.match(
+    publisher,
+    /require_immutable_release_policy\(\)[\s\S]*X-GitHub-Api-Version: 2026-03-10[\s\S]*immutable-releases[\s\S]*keys == \["enabled"\][\s\S]*\.enabled == true/u,
+  );
+  assert.match(
+    publisher,
+    /require_publication_mutation\(\)[\s\S]*require_immutable_release_policy first-mutation[\s\S]*verify_final_policy_fence "before-\$mutation_class"/u,
+  );
+  assert.match(
+    publisher,
+    /verify_final_policy_fence\(\)[\s\S]*preflight_live_source[\s\S]*verify_ruleset_policy_snapshot/u,
+  );
+  assert.match(
+    publisher,
+    /require_immutable_release_policy release-publication[\s\S]*verify_final_policy_fence before-release-publication[\s\S]*release edit[\s\S]*draft=false[\s\S]*\.draft == false and \.immutable == true/u,
+  );
   assert.ok(
     publisher.indexOf('[[ "$prewrite_ref_fingerprint_cloned" == "$initial_remote_ref_fingerprint" ]]') <
       publisher.indexOf('audit_release_inventory "$initial_release_inventory_fingerprint"'),
@@ -786,6 +1060,15 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.match(workflow, /outputs:[\s\S]*reconcile_state: \$\{\{ steps\.reconcile\.outputs\.reconcile_state \}\}[\s\S]*id: reconcile/u);
   assert.match(workflow, /verify:[\s\S]*if: \$\{\{ needs\.publish\.outputs\.reconcile_state != 'superseded' \}\}/u);
+  assert.match(
+    workflow,
+    /id: public-verification[\s\S]*Summarize closed public verification[\s\S]*Observed source:[\s\S]*Recovery code:[\s\S]*Next action:/u,
+  );
+  assert.match(
+    workflow,
+    /tuple="\$STEP_OUTCOME:\$VERIFICATION_STATE:\$RECOVERY_CODE:\$NEXT_ACTION:\$VERIFICATION_STAGE"[\s\S]*success:verified:none:none:complete[\s\S]*summary_valid=false[\s\S]*\[\[ "\$summary_valid" == true \]\]/u,
+  );
+  assert.doesNotMatch(workflow, /publish-next-version/u);
 });
 
 test("malformed publish invocations still emit exactly one closed state and recovery code", (t) => {
@@ -795,6 +1078,7 @@ test("malformed publish invocations still emit exactly one closed state and reco
     ["--publish", "--candidate"],
     ["--publish", "--unknown-publisher-option"],
     ["--publish", "--publish"],
+    ["--publish", "--verify-published"],
   ]) {
     const result = invoke("bash", [join(state.source, "scripts", "release-action-subtree.sh"), ...arguments_], {
       cwd: state.source,
@@ -1191,6 +1475,93 @@ test("publication plan is mandatory, candidate-bound, and verified before public
   assert.match(tampered.stderr, /recovery_code=publication-input-preflight/u);
   assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
   assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+
+  const fakeBin = join(state.root, "contradictory-admission-bin");
+  const fakeNode = join(fakeBin, "node");
+  mkdirSync(fakeBin);
+  write(fakeNode, `#!/bin/sh
+set -eu
+if [ "\${2:-}" = publication-plan ]; then
+  output=
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --output ]; then
+      shift
+      output="$1"
+    fi
+    shift
+  done
+  [ -n "$output" ]
+  printf '%s\n' "$FAKE_PLAN_JSON" > "$output"
+  exit 0
+fi
+exec "$REAL_NODE" "$@"
+`);
+  chmodSync(fakeNode, 0o755);
+  for (const [label, fakePlan] of [
+    ["eligible-with-conflict", {
+      write_eligible: true,
+      recovery_code: "publisher-control-drift",
+      reason: "contradictory",
+    }],
+    ["invalid-with-superseded", {
+      write_eligible: "invalid",
+      recovery_code: "release-intent-superseded",
+      reason: "contradictory",
+    }],
+  ]) {
+    const contradictoryOutput = join(state.root, `publication-plan-${label}.json`);
+    const contradictory = invoke("bash", releaseArgs(
+      state,
+      "--publication-plan",
+      "--source-ref",
+      built.sourceCommit,
+      "--control-ref",
+      built.controlCommit,
+      "--candidate",
+      built.assembled,
+      "--output",
+      contradictoryOutput,
+    ), {
+      cwd: state.source,
+      env: {
+        FAKE_PLAN_JSON: JSON.stringify(fakePlan),
+        PATH: `${fakeBin}:${executionEnv.PATH}`,
+        REAL_NODE: process.execPath,
+      },
+    });
+    assert.notEqual(contradictory.status, 0, label);
+    assert.match(contradictory.stderr, /recovery_code=publication-admission-invalid/u);
+  }
+});
+
+test("credential-free publication admission rejects non-superseded control drift", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "admission-before-drift" });
+  write(join(state.source, ".github", "workflows", "required-ci.yml"), "name: Drifted publisher control\n");
+  const driftedMaster = commit(state.source, "Drift publisher controls before admission");
+  const rejectedPlan = join(state.root, "publication-plan-control-drift.json");
+
+  const result = invoke("bash", releaseArgs(
+    state,
+    "--publication-plan",
+    "--source-ref",
+    built.sourceCommit,
+    "--control-ref",
+    built.controlCommit,
+    "--candidate",
+    built.assembled,
+    "--output",
+    rejectedPlan,
+  ), { cwd: state.source });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /recovery_code=publisher-control-drift/u);
+  const plan = JSON.parse(readFileSync(rejectedPlan, "utf8"));
+  assert.equal(plan.live_source_master, driftedMaster);
+  assert.equal(plan.write_eligible, false);
+  assert.equal(plan.recovery_code, "publisher-control-drift");
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
 });
 
 test("fresh stable publication verifies the immutable Release before advancing its alias", (t) => {
@@ -1212,6 +1583,167 @@ test("fresh stable publication verifies the immutable Release before advancing i
     "release-provenance.json",
     "release-provenance.json.asc",
   ]);
+});
+
+test("public verification emits one closed recovery tuple for success and key failure states", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "verify-closed-tuples" });
+  publishCandidate(state, built);
+  const fullObject = git(state.target, ["rev-parse", "refs/tags/v2.0.0"]);
+  const aliasObject = git(state.target, ["rev-parse", "refs/tags/v2"]);
+
+  const success = invokeVerifyPublished(state, built);
+  assert.equal(success.status, 0, success.stderr);
+  assert.match(success.stdout, /verification_state=verified/u);
+  assert.match(success.stdout, /verification_stage=complete/u);
+  assert.match(success.stdout, /recovery_code=none/u);
+  assert.match(success.stdout, /next_action=none/u);
+
+  git(state.target, ["update-ref", "-d", "refs/tags/v2"]);
+  const missingAlias = invokeVerifyPublished(state, built);
+  assert.notEqual(missingAlias.status, 0);
+  assert.match(missingAlias.stderr, /verification_state=blocked_conflict/u);
+  assert.match(missingAlias.stderr, /recovery_code=major-alias-missing/u);
+  assert.match(missingAlias.stderr, /next_action=reconcile-exact-source/u);
+  git(state.target, ["update-ref", "refs/tags/v2", aliasObject]);
+
+  replaceAliasWithNestedTag(state, "v2", "v2.0.0");
+  const malformedAlias = invokeVerifyPublished(state, built);
+  assert.notEqual(malformedAlias.status, 0);
+  assert.match(malformedAlias.stderr, /verification_state=blocked_conflict/u);
+  assert.match(malformedAlias.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(malformedAlias.stderr, /next_action=investigate-published-state/u);
+  git(state.target, ["update-ref", "refs/tags/v2", aliasObject]);
+
+  rmSync(join(state.releases, "v2.0.0", "immutable"));
+  const mutableRelease = invokeVerifyPublished(state, built);
+  assert.notEqual(mutableRelease.status, 0);
+  assert.match(mutableRelease.stderr, /verification_state=blocked_conflict/u);
+  assert.match(mutableRelease.stderr, /recovery_code=mutable-release/u);
+  assert.match(
+    mutableRelease.stderr,
+    /next_action=repair-immutable-release-and-reconcile/u,
+  );
+  write(join(state.releases, "v2.0.0", "immutable"), "");
+
+  git(state.target, ["update-ref", "-d", "refs/tags/v2.0.0"]);
+  const missingFullTag = invokeVerifyPublished(state, built);
+  assert.notEqual(missingFullTag.status, 0);
+  assert.match(missingFullTag.stderr, /verification_state=blocked_conflict/u);
+  assert.match(missingFullTag.stderr, /recovery_code=immutable-tag-missing/u);
+  assert.match(missingFullTag.stderr, /next_action=reconcile-exact-source/u);
+  git(state.target, ["update-ref", "refs/tags/v2.0.0", fullObject]);
+
+  const fakeBin = join(state.root, "verify-unreadable-bin");
+  const fakeGh = join(fakeBin, "gh");
+  mkdirSync(fakeBin);
+  write(fakeGh, "#!/bin/sh\necho 'simulated public API outage' >&2\nexit 1\n");
+  chmodSync(fakeGh, 0o755);
+  const unreadable = invokeVerifyPublished(state, built, {
+    testRelease: false,
+    env: { PATH: `${fakeBin}:${executionEnv.PATH}` },
+  });
+  assert.notEqual(unreadable.status, 0);
+  assert.match(unreadable.stderr, /verification_state=inconclusive/u);
+  assert.match(unreadable.stderr, /recovery_code=release-api-unreadable/u);
+  assert.match(unreadable.stderr, /next_action=retry-public-verification/u);
+});
+
+test("public verification treats a missing later alias Release as a deterministic conflict", (t) => {
+  const state = fixture(t);
+  const old = buildAssembledCandidate(state, { label: "verify-later-release-404-old" });
+  publishCandidate(state, old);
+  const oldCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+
+  advanceIntent(state, "2.1.0", oldCommit, "2.0.0");
+  const newer = buildAssembledCandidate(state, { label: "verify-later-release-404-newer" });
+  publishCandidate(state, newer);
+
+  const fakeBin = join(state.root, "verify-later-release-api-bin");
+  const fakeGh = join(fakeBin, "gh");
+  mkdirSync(fakeBin);
+  write(fakeGh, `#!/bin/sh
+if [ "\${FAKE_RELEASE_API_MODE:-}" = 404 ]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+else
+  echo 'simulated public API outage' >&2
+fi
+exit 1
+`);
+  chmodSync(fakeGh, 0o755);
+  const verifyEnv = { PATH: `${fakeBin}:${executionEnv.PATH}` };
+
+  const missing = invokeVerifyPublished(state, old, {
+    testRelease: false,
+    env: { ...verifyEnv, FAKE_RELEASE_API_MODE: "404" },
+  });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /verification_state=blocked_conflict/u);
+  assert.match(missing.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(missing.stderr, /next_action=investigate-published-state/u);
+
+  const unreadable = invokeVerifyPublished(state, old, {
+    testRelease: false,
+    env: { ...verifyEnv, FAKE_RELEASE_API_MODE: "outage" },
+  });
+  assert.notEqual(unreadable.status, 0);
+  assert.match(unreadable.stderr, /verification_state=inconclusive/u);
+  assert.match(unreadable.stderr, /recovery_code=remote-read-inconclusive/u);
+  assert.match(unreadable.stderr, /next_action=retry-public-verification/u);
+});
+
+test("public verification treats confirmed Release disappearance as a deterministic conflict", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "verify-confirmed-release-404" });
+  publishCandidate(state, built);
+  const githubEnvironment = fakeGithubEnvironment(state, "public-verify-release-404");
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-public-verify-release-404",
+    "state.json",
+  );
+  const fakeAssets = join(dirname(fakeStatePath), "assets");
+  const assetNames = releaseAssets(state, "v2.0.0").filter((name) =>
+    !["immutable", "prerelease", "published"].includes(name));
+  for (const name of assetNames) {
+    copyFileSync(join(state.releases, "v2.0.0", name), join(fakeAssets, name));
+  }
+  const publishedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  Object.assign(publishedState, {
+    assets: assetNames.map((name, index) => ({ name, id: index + 1 })),
+    body: `Signed release of Joey-Tools/codex-review-gate@${built.sourceCommit}.`,
+    draft: false,
+    exists: true,
+    immutable: true,
+    latest: "v2.0.0",
+    name: "v2.0.0",
+    next_asset_id: assetNames.length + 1,
+    prerelease: false,
+    tag: "v2.0.0",
+  });
+  writeJson(fakeStatePath, publishedState);
+
+  for (const phase of [
+    "verify-initial-api-404",
+    "verify-download-404",
+    "verify-final-view-404",
+    "verify-final-api-404",
+  ]) {
+    const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+    fakeState.release_api_reads = 0;
+    fakeState.release_download_reads = 0;
+    fakeState.release_view_reads = 0;
+    writeJson(fakeStatePath, fakeState);
+
+    const result = invokeVerifyPublished(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+    });
+    assert.notEqual(result.status, 0, `${phase} must fail closed`);
+    assert.match(result.stderr, /verification_state=blocked_conflict/u);
+    assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
+    assert.match(result.stderr, /next_action=investigate-published-state/u);
+  }
 });
 
 test("an already-complete release is a byte-stable no-op on rerun", (t) => {
@@ -1543,6 +2075,117 @@ exec "$REAL_GIT" "$@"
   assert.equal(existsSync(join(state.releases, "v2.0.0")), false);
 });
 
+test("disabled immutable-release policy blocks the first durable mutation", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "immutable-policy-disabled" });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, "immutable-policy-disabled"),
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=immutable-release-policy-disabled/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-immutable-policy-disabled", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.exists, false);
+  assert.deepEqual(fakeState.assets, []);
+});
+
+test("mutable post-publication readback blocks the floating alias", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "post-publish-mutable" });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, "post-publish-mutable"),
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=immutable-release-mismatch/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-post-publish-mutable", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.exists, true);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, false);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0"]), "tag");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+for (const policyDrift of ["source", "ruleset"]) {
+  test(`${policyDrift} policy drift after the first write stops the partial prefix`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: `post-master-${policyDrift}-drift` });
+    const githubEnvironment = fakeGithubEnvironment(state, `post-master-${policyDrift}-drift`);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: driftAfterMasterPushEnvironment(state, githubEnvironment, policyDrift),
+    });
+
+    assert.notEqual(result.status, 0);
+    if (policyDrift === "source") {
+      assert.match(result.stderr, /reconcile_state=inconclusive/u);
+      assert.match(result.stderr, /recovery_code=source-state-changed/u);
+    } else {
+      assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+      assert.match(result.stderr, /recovery_code=publisher-ruleset-policy-changed/u);
+    }
+    assert.notEqual(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-post-master-${policyDrift}-drift`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.exists, false);
+    assert.deepEqual(fakeState.assets, []);
+  });
+}
+
+test("release-policy read drift is fenced again before draft publication", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "pre-release-edit-source-drift" });
+  const sourceBefore = git(state.source, ["rev-parse", "refs/heads/master"]);
+  const sourceDriftCommit = danglingCommit(
+    state.source,
+    sourceBefore,
+    "Source drift during immutable-policy read",
+  );
+  const githubEnvironment = fakeGithubEnvironment(
+    state,
+    "source-drift-during-release-policy-read",
+  );
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      FAKE_SOURCE_DRIFT_COMMIT: sourceDriftCommit,
+      FAKE_SOURCE_REPOSITORY: state.source,
+      REAL_GIT: run("which", ["git"]),
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=inconclusive/u);
+  assert.match(result.stderr, /recovery_code=source-state-changed/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-source-drift-during-release-policy-read", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.immutable_policy_reads, 2);
+  assert.equal(fakeState.exists, true);
+  assert.equal(fakeState.draft, true);
+  assert.equal(fakeState.immutable, false);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0"]), "tag");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
 for (const mutationPhase of ["before-immutable", "after-immutable"]) {
   test(`same-name provenance replacement ${mutationPhase} blocks the floating alias`, (t) => {
     const state = fixture(t);
@@ -1619,6 +2262,7 @@ test("exact-source rematerialization can recover an old alias after source maste
   assert.equal(publicationPlan.control_commit, currentControl);
   assert.equal(publicationPlan.live_source_master, state.sourceCommit);
   assert.equal(publicationPlan.write_eligible, false);
+  assert.equal(publicationPlan.recovery_code, "release-intent-superseded");
 
   const output = publishCandidate(state, recovered);
   assert.match(output, /reconcile_state=resumable_partial/u);

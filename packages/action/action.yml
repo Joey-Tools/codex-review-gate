@@ -1,5 +1,5 @@
 name: Codex Review Gate
-description: Reconcile trusted OpenAI Codex review evidence for one pull request.
+description: Verify Codex review evidence or refresh the canonical pull-request verifier.
 author: JoeyTeng
 branding:
   icon: shield
@@ -7,29 +7,29 @@ branding:
 
 inputs:
   github_token:
-    description: Token used to read pull-request evidence, update diagnostics, and write the gate status.
+    description: Token used by the verifier to read evidence and by the controller to update diagnostics and rerun the verifier.
     required: true
   pr_number:
     description: Canonical positive pull request number to reconcile.
     required: true
   expected_head_sha:
-    description: Exact full pull-request head SHA required by workflow_dispatch; provider events bind their initial current head.
+    description: Exact full pull-request head SHA required by pull_request verification and workflow_dispatch; provider comments bind the current head after refetch.
     required: false
     default: ""
   operation:
-    description: "Closed operation: reconcile or begin-review."
+    description: "Closed controller operation: reconcile or begin-review; pull_request verification is always reconcile."
     required: false
     default: reconcile
   request_comment_id:
-    description: Optional untrusted issue-comment selector hint; it never supplies authority or skips full reconciliation.
+    description: Optional untrusted controller comment hint; it never supplies verifier authority.
     required: false
     default: ""
   request_review:
-    description: Whether begin-review should post a best-effort OpenAI Codex review request.
+    description: Whether controller begin-review should post or adopt a canonical OpenAI Codex review request.
     required: false
     default: "true"
   limits_profile:
-    description: "Closed reviewed evidence-limits profile: default or expanded."
+    description: "Protected-workflow evidence limits profile: default or expanded."
     required: false
     default: default
 

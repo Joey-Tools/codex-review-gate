@@ -35,14 +35,14 @@ superseded_by:
   `42773dd2736af2f8759951fc7ebf6e21ebf3275b`; its uncommitted audit fixes are in
   stash `7f96293371cc2adfa0aeccc49effbf4c9d519ff2`. Neither is design authority;
   both must be reconciled against this confirmed plan before delivery.
-- Normative implementation documentation will live in
+- Normative implementation documentation now lives in
   `packages/action/DESIGN.md` and `packages/action/DESIGN.zh-CN.md`; release and
   operator procedure lives in `docs/RELEASING.md` and
   `docs/RELEASING.zh-CN.md`; human and agent installation procedures live under
-  `docs/install/`. Those documents currently require native-CheckRun migration;
-  this journal overrides any inconsistent status-bridge wording until that
-  reconciliation lands. It remains the decision, evidence, and handoff
-  authority rather than duplicating those operational documents in full.
+  `docs/install/`. Those documents and the implementation have been reconciled
+  to the adopted native-CheckRun architecture. This journal remains the
+  decision, evidence, and handoff authority rather than duplicating those
+  operational documents in full.
 
 ## Adopted Product And Rollout Contract
 
@@ -765,6 +765,9 @@ superseded_by:
 - This journal-only signed commit is the required plan checkpoint before
   implementation reconciliation. The task list then advances from planning to
   implementation; no product decision remains open.
+- The signed plan checkpoint is
+  `4120dcf9f63c7547d420f5b7e269b63b4a1443ba`; `git verify-commit` accepted its
+  ED25519 signature before implementation resumed.
 - Local implementation, tests, documentation, fresh-context review, and signed
   commit precede PR readiness. Merge precedes the approved publisher run;
   release read-back precedes consumer installation and canary expansion.
@@ -1374,7 +1377,59 @@ superseded_by:
   its mutation/readback recovery state are deleted rather than migrated; the
   ruleset continues to own up-to-date-branch and resolved-conversation policy.
 
-### Verified Two-Workflow Platform Boundaries And Open Nodes
+### Final Native-CheckRun Implementation Checkpoint
+
+- Phase: implementation and documentation reconciliation complete; final
+  signed implementation checkpoint and frozen-head review remain pending.
+- The direct JavaScript Action now routes trusted `pull_request` launches to a
+  read-only verifier and `issue_comment` / `workflow_dispatch` launches to the
+  non-authoritative controller. The verifier retains the full reducer,
+  pagination, finding accounting, exact base/head/test-merge binding, and two
+  stable snapshots; only `healthy/success` exits successfully. The controller
+  retains canonical request creation/adoption, exact provider-event readback,
+  baseline `A` to exact `A+1` rerun observation, and unique canonical
+  job/CheckRun verification. V2 no longer posts commit statuses.
+- The copied consumer contract now contains the read-only `Codex Review Gate
+  Verifier` workflow and the separately permissioned `Codex Review Gate
+  Controller` workflow. Their job names, event filters, per-PR concurrency,
+  protected limits profile, and 14-minute runner budget are contract-tested.
+- Bootstrap installs and exact-byte verifies both workflows plus scoped
+  CODEOWNERS. Inventory rejects alternate required-name producers and relevant
+  write authority; activation proves the unique native GitHub Actions CheckRun
+  on the exact test-merge SHA, rejects a same-name legacy status, preserves the
+  disabled/readback/canary/active sequence, and fails closed on unmanaged
+  CODEOWNERS policy expansion.
+- Human-readable and agent-executable installation guides, package design and
+  recovery docs, and both release runbooks now describe the same two-workflow
+  contract. The stable-RC selector bridge changes and later restores both
+  canonical workflows; dedicated generated canary automation remains deferred.
+- Final local validation on the reconciled bytes:
+  - `npm test`: 701 of 701 passed, 0 failed, in 815131 ms;
+  - `npm run check`: passed;
+  - Action/runtime focused suite: 68 of 68 passed;
+  - bootstrap suite: 68 of 68 passed;
+  - workflow-security suite: 30 of 30 passed;
+  - workflow-contract suite: 8 of 8 passed;
+  - release pipeline suite: 46 of 46 passed;
+  - release-provenance suite: 38 of 38 passed;
+  - `bash -n` and ShellCheck passed for both release and legacy-inventory
+    scripts;
+  - actionlint passed both copied consumer workflows;
+  - `git diff --check` and project-journal validation passed.
+- The first full run passed 699 of 701 and exposed two test-only alternate
+  line-break fixtures that still replaced the old Action description literally.
+  Their helper now locates the root description structurally and asserts the
+  malicious NEL/LS/PS payload changed the fixture. Production parsing was not
+  loosened; the focused 38-test suite and the final 701-test run passed.
+- Source-repository publisher actionlint still reports its reviewed stale
+  metadata model for `actions/create-github-app-token@v3` plus five SC2016
+  informational literals. A live read of the official v3 `action.yml` on
+  2026-08-27 confirmed `client-id` is current and `app-id` carries the
+  `Use 'client-id' instead` deprecation message, so the workflow remains on
+  `client-id`. The publisher script, standalone ShellCheck, and 46-test release
+  suite pass.
+
+### Verified Two-Workflow Platform Boundaries And Resolution
 
 - Required-CheckRun source selection is not workflow provenance. GitHub's
   ruleset schema binds a required check to `context` plus `integration_id`;
@@ -1532,9 +1587,9 @@ superseded_by:
 
 ## Next Steps
 
-- Reconcile the confirmed contract across implementation, installation assets,
-  tests, and this journal; freeze a new signed checkpoint; then run one fresh
-  ordinary `gpt-5.6-sol` / `ultra` whole-range review over the exact final head.
+- Freeze the reconciled implementation, tests, docs, and this journal in a new
+  signed checkpoint; then run one fresh ordinary `gpt-5.6-sol` / `ultra`
+  whole-range review over that exact head and append only required fixes.
 - Run the already specified hidden-marker canary and live
   publisher/runner/Environment preflights as execution evidence; they are not
   remaining grilling choices.

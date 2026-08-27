@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   CANONICAL_V2_WORKFLOW_USES,
+  DEFAULT_CONTROLLER_WORKFLOW_PATH,
   DEFAULT_CONTROL_PLANE_OWNER,
   DEFAULT_STATUS_CONTEXT,
   DEFAULT_STATUS_INTEGRATION_ID,
@@ -26,6 +27,7 @@ import {
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
   buildUpdateRulesetPayload,
+  codeownersHasEffectiveUnmanagedPatterns,
   decodeGitHubBlobContent,
   decodeGitHubFileContent,
   directoryWitnessFromMetadata,
@@ -48,12 +50,14 @@ import {
   rulesetHasRequiredStatusContext,
   rulesetWritableFingerprint,
   validateCanonicalV2WorkflowContent,
+  validateCanonicalV2ControllerWorkflowContent,
   validateCanonicalV2WorkflowInventory,
   validateControlPlaneCodeownersContent,
   workflowCanWriteStatuses,
   workflowContainsCodexReviewGateCaller,
   workflowContainsLegacyV1Caller,
   workflowContentEndpoint,
+  workflowSingleProducerPolicyViolations,
 } from "../src/bootstrap.mjs";
 
 const BOOTSTRAP_SCRIPT = fileURLToPath(
@@ -66,9 +70,24 @@ const CANONICAL_WORKFLOW = readFileSync(
   ),
   "utf8",
 );
+const CANONICAL_CONTROLLER_WORKFLOW = readFileSync(
+  new URL(
+    "../templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const CANONICAL_WORKFLOWS = {
+  verifier: CANONICAL_WORKFLOW,
+  controller: CANONICAL_CONTROLLER_WORKFLOW,
+};
 const DEFAULT_BRANCH_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const CANARY_HEAD_SHA = "0123456789abcdef0123456789abcdef01234567";
 const CANARY_RUN_ID = 9007;
 const CANARY_WORKFLOW_ID = 17;
+const CANARY_JOB_ID = 18017;
+const CANARY_CHECK_RUN_ID = 28017;
+const CANARY_MERGE_SHA = "fedcba9876543210fedcba9876543210fedcba98";
 
 test("builds a disabled complete default-branch ruleset payload", () => {
   const payload = buildCreateRulesetPayload();
@@ -1126,6 +1145,19 @@ test("CODEOWNERS validation rejects missing, wrong, multi-owner, and later overr
   }
 });
 
+test("detects effective non-managed CODEOWNERS patterns without counting comments", () => {
+  const managedOnly = ensureControlPlaneCodeownersContent(null).content;
+  assert.equal(codeownersHasEffectiveUnmanagedPatterns(managedOnly), false);
+  assert.equal(
+    codeownersHasEffectiveUnmanagedPatterns(
+      ensureControlPlaneCodeownersContent(
+        "# existing comment\n\n/src/** @Alice\n",
+      ).content,
+    ),
+    true,
+  );
+});
+
 test("prepare-worktree creates and revalidates a missing workflow parent chain", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bootstrap-"));
   const workflowPath = join(
@@ -1139,7 +1171,8 @@ test("prepare-worktree creates and revalidates a missing workflow parent chain",
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 0, apply.stderr);
-    assert.match(apply.stdout, /Applied: install the canonical v2 workflow/u);
+    assert.match(apply.stdout, /Applied: install the canonical v2 verifier workflow/u);
+    assert.match(apply.stdout, /Applied: install the canonical v2 controller workflow/u);
     assert.equal(readFileSync(workflowPath, "utf8"), CANONICAL_WORKFLOW);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
@@ -1159,17 +1192,19 @@ test("prepare-worktree dry-runs and then replaces a canonical-path v1 caller", (
 
     const dryRun = runBootstrap(["--prepare-worktree", targetRoot]);
     assert.equal(dryRun.status, 0, dryRun.stderr);
-    assert.match(dryRun.stdout, /Dry run: would replace the canonical-path v1 caller with v2/u);
+    assert.match(dryRun.stdout, /Dry run: would replace the canonical-path v1 caller with the v2 verifier/u);
+    assert.match(dryRun.stdout, /Dry run: would install the canonical v2 controller workflow/u);
     assert.equal(readFileSync(workflowPath, "utf8"), legacyWorkflow);
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 0, apply.stderr);
-    assert.match(apply.stdout, /Applied: replace the canonical-path v1 caller with v2/u);
+    assert.match(apply.stdout, /Applied: replace the canonical-path v1 caller with the v2 verifier/u);
     assert.equal(readFileSync(workflowPath, "utf8"), CANONICAL_WORKFLOW);
 
     const repeat = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(repeat.status, 0, repeat.stderr);
-    assert.match(repeat.stdout, /already matches the canonical v2 bytes/u);
+    assert.match(repeat.stdout, /local verifier already matches the canonical v2 bytes/u);
+    assert.match(repeat.stdout, /local controller already matches the canonical v2 bytes/u);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
   }
@@ -1295,7 +1330,7 @@ test("prepare-worktree blocks additional v1 callers before writing", () => {
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 1);
-    assert.match(apply.stderr, /Additional v1\/v2 gate callers require explicit removal/u);
+    assert.match(apply.stderr, /Additional workflows have a v1\/v2 gate caller/u);
     assert.match(apply.stderr, /\.github\/workflows\/legacy-codex-review\.yml/u);
     assert.equal(existsSync(workflowPath), false);
   } finally {
@@ -1318,7 +1353,7 @@ test("prepare-worktree blocks an additional direct v2 caller before writing", ()
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 1);
-    assert.match(apply.stderr, /Additional v1\/v2 gate callers require explicit removal/u);
+    assert.match(apply.stderr, /Additional workflows have a v1\/v2 gate caller/u);
     assert.match(apply.stderr, /\.github\/workflows\/duplicate-v2\.yml/u);
     assert.equal(existsSync(workflowPath), false);
   } finally {
@@ -1599,6 +1634,15 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     ),
     false,
   );
+  for (const opaqueUses of [
+    "jobs:\n  gate:\n    uses: >-\n      JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
+    "jobs:\n  gate:\n    uses: \"JoeyTeng/codex-review-gate-action\\\n      @v2\"\n",
+  ]) {
+    assert.throws(
+      () => workflowContainsCodexReviewGateCaller(opaqueUses),
+      /opaque, escaped, flow-style, or multiline uses scalar/u,
+    );
+  }
   assert.equal(workflowCanWriteStatuses("name: Test\non: [push]\njobs: {}\n"), false);
   assert.equal(
     workflowCanWriteStatuses(
@@ -1607,11 +1651,158 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     true,
   );
   assert.equal(workflowCanWriteStatuses("permissions: write-all\njobs: {}\n"), true);
-  assert.equal(
-    workflowCanWriteStatuses("permissions: { contents: read, statuses: write }\njobs: {}\n"),
-    true,
+  assert.throws(
+    () =>
+      workflowCanWriteStatuses(
+        "permissions: { contents: read, statuses: write }\njobs: {}\n",
+      ),
+    /flow-style permissions mapping/u,
   );
   assert.equal(workflowCanWriteStatuses("permissions:\n  statuses : write\n"), true);
+  assert.equal(
+    workflowCanWriteStatuses("permissions:\r\n  statuses: write\r\njobs: {}\r\n"),
+    true,
+  );
+  for (const [name, inspect] of [
+    [
+      "permissions",
+      () =>
+        workflowCanWriteStatuses(
+          "permissions:\r  statuses: write\njobs: {}\n",
+        ),
+    ],
+    [
+      "job-name",
+      () =>
+        workflowSingleProducerPolicyViolations(
+          "permissions: {}\rjobs:\r  collision:\r    name: codex/github-review-gate\n",
+        ),
+    ],
+    [
+      "caller",
+      () =>
+        workflowContainsCodexReviewGateCaller(
+          "jobs:\r  gate:\r    uses: JoeyTeng/codex-review-gate-action@v2\n",
+        ),
+    ],
+    [
+      "legacy-caller",
+      () =>
+        workflowContainsLegacyV1Caller(
+          "jobs:\r  gate:\r    uses: JoeyTeng/codex-review-gate-action@v1\n",
+        ),
+    ],
+  ]) {
+    assert.throws(inspect, /bare CR YAML line break/u, name);
+  }
+  for (const lineBrokenFlow of [
+    "permissions:\n  {statuses: write}\njobs: {}\n",
+    "jobs:\n  test:\n    permissions:\n      {statuses: write}\n    runs-on: ubuntu-slim\n",
+  ]) {
+    assert.throws(
+      () => workflowCanWriteStatuses(lineBrokenFlow),
+      /line-broken flow-style permissions mapping/u,
+    );
+  }
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "permissions:\n  checks: read\n  issues: none\n  pull-requests: read\n  statuses: none\njobs:\n  test:\n    name: ordinary test\n    runs-on: ubuntu-slim\n",
+    ),
+    [],
+  );
+  for (const permission of ["checks", "issues", "pull-requests", "statuses"]) {
+    assert.deepEqual(
+      workflowSingleProducerPolicyViolations(
+        `permissions:\n  ${permission}: write\njobs: {}\n`,
+      ),
+      [`${permission}: write`],
+      permission,
+    );
+  }
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "permissions: write-all\njobs: {}\n",
+    ),
+    [
+      "actions: write",
+      "checks: write",
+      "issues: write",
+      "pull-requests: write",
+      "statuses: write",
+    ],
+  );
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "permissions:\n  contents: read\njobs:\n  collision:\n    name: codex/github-review-gate\n    runs-on: ubuntu-slim\n",
+    ),
+    [`job name: ${DEFAULT_STATUS_CONTEXT}`],
+  );
+  for (const indicator of [">-", "|-"]) {
+    assert.deepEqual(
+      workflowSingleProducerPolicyViolations(
+        `permissions: {}\njobs:\n  test:\n    runs-on: ubuntu-slim\n    name: ${indicator}\n      ordinary test\n`,
+      ),
+      [],
+      indicator,
+    );
+  }
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "permissions: {}\njobs:\n  collision:\n    name: >-\n      codex/github-review-gate\n    runs-on: ubuntu-slim\n",
+    ),
+    [`job name: ${DEFAULT_STATUS_CONTEXT}`],
+  );
+  assert.throws(
+    () =>
+      workflowSingleProducerPolicyViolations(
+        "permissions: {}\njobs:\n  test:\n    name: >-\n      ordinary\n      second line\n    runs-on: ubuntu-slim\n",
+      ),
+    /multiple or ambiguous physical content lines/u,
+  );
+  assert.throws(
+    () =>
+      workflowSingleProducerPolicyViolations(
+        "permissions: {}\njobs:\n  test:\n    name: >2-\n      ordinary test\n    runs-on: ubuntu-slim\n",
+      ),
+    /unsupported block-scalar job name indicator/u,
+  );
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "permissions: {}\n\"jobs\":\n  \"collision\":\n    \"name\": \"codex/github-review-gate\"\n    runs-on: ubuntu-slim\n",
+    ),
+    [`job name: ${DEFAULT_STATUS_CONTEXT}`],
+  );
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "permissions: {}\njobs:\n  collision:\n    name: ${{ matrix.check_name }}\n    runs-on: ubuntu-slim\n    strategy:\n      matrix:\n        check_name: [codex/github-review-gate]\n",
+    ),
+    [`job name: ${DEFAULT_STATUS_CONTEXT}`],
+  );
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "permissions: {}\njobs:\n  collision:\n    name: ${{ contains('}}', 'never') && 'x' || matrix.check_name }}\n    runs-on: ubuntu-slim\n",
+    ),
+    [`job name: ${DEFAULT_STATUS_CONTEXT}`],
+  );
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "permissions: {}\njobs:\n  matrix-test:\n    name: test-${{ matrix.os }}\n    runs-on: ubuntu-slim\n",
+    ),
+    [],
+  );
+  assert.throws(
+    () =>
+      workflowSingleProducerPolicyViolations(
+        "permissions: {}\njobs:\n  collision:\n    name: \"codex/github-review-\n      gate\"\n    runs-on: ubuntu-slim\n",
+      ),
+    /multiline or unterminated quoted job name/u,
+  );
+  assert.deepEqual(
+    workflowSingleProducerPolicyViolations(
+      "name: codex/github-review-gate\npermissions: {}\njobs:\n  test:\n    name: ordinary test\n    runs-on: ubuntu-slim\n    steps:\n      - name: codex/github-review-gate\n        run: 'true'\n",
+    ),
+    [],
+  );
   for (const quoted of [
     "permissions:\n  \"statuses\": write\njobs: {}\n",
     "permissions:\n  'statuses': write\njobs: {}\n",
@@ -1620,7 +1811,7 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
   ]) {
     assert.throws(
       () => workflowCanWriteStatuses(quoted),
-      /quoted permissions or statuses key|opaque statuses permission key/u,
+      /quoted protected permissions key|opaque permissions entry/u,
     );
   }
   for (const escaped of [
@@ -1630,7 +1821,7 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
   ]) {
     assert.throws(
       () => workflowCanWriteStatuses(escaped),
-      /escaped double-quoted mapping key/u,
+      /escaped double-quoted mapping key|opaque permissions entry/u,
     );
   }
   assert.throws(
@@ -1695,16 +1886,35 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () => decodeGitHubFileContent({ type: "file", encoding: "none", content: canonical }),
     /base64-encoded file/,
   );
+  assert.equal(
+    validateCanonicalV2ControllerWorkflowContent(CANONICAL_CONTROLLER_WORKFLOW),
+    CANONICAL_CONTROLLER_WORKFLOW,
+  );
   assert.throws(
-    () => validateCanonicalV2WorkflowContent(canonical.replace("  workflow_dispatch:\n", "  schedule:\n    - cron: '0 * * * *'\n  workflow_dispatch:\n")),
+    () =>
+      validateCanonicalV2WorkflowContent(
+        canonical.replace(
+          "  pull_request:\n",
+          "  schedule:\n    - cron: '0 * * * *'\n  pull_request:\n",
+        ),
+      ),
     /cron runners/,
   );
   assert.throws(
-    () => validateCanonicalV2WorkflowContent(canonical.replace("  workflow_dispatch:", "  pull_request_review:")),
-    /writable review-event job/,
+    () =>
+      validateCanonicalV2WorkflowContent(
+        canonical.replace("  pull_request:", "  pull_request_review:"),
+      ),
+    /adopted pull_request lifecycle types/,
   );
   assert.throws(
-    () => validateCanonicalV2WorkflowContent(canonical.replace("  workflow_dispatch:", "  repository_dispatch:")),
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace(
+          "  workflow_dispatch:",
+          "  repository_dispatch:",
+        ),
+      ),
     /must not expose repository_dispatch/,
   );
   assert.throws(
@@ -1719,15 +1929,15 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
   );
   assert.throws(
     () =>
-      validateCanonicalV2WorkflowContent(
-        canonical.replace("          github_token:", "          request_author_permission:\n          github_token:"),
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace("          github_token:", "          request_author_permission:\n          github_token:"),
       ),
     /rejected legacy surface: request_author_permission:/u,
   );
   assert.throws(
     () =>
-      validateCanonicalV2WorkflowContent(
-        canonical.replace(
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace(
           "github.event.comment.user.type == 'Bot'",
           "github.event.comment.user.type == 'Bot' || true",
         ),
@@ -1736,8 +1946,8 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
   );
   assert.throws(
     () =>
-      validateCanonicalV2WorkflowContent(
-        canonical.replace(
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace(
           "github.event.action == 'created' || github.event.action == 'edited'",
           "github.event.action == 'edited' || github.event.action == 'created'",
         ),
@@ -1751,13 +1961,17 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   const cleanInventory = [
     { path: canonicalPath, content: CANONICAL_WORKFLOW },
     {
+      path: DEFAULT_CONTROLLER_WORKFLOW_PATH,
+      content: CANONICAL_CONTROLLER_WORKFLOW,
+    },
+    {
       path: ".github/workflows/test.yml",
       content: "name: Test\non: [push]\njobs: {}\n",
     },
   ];
   assert.equal(
-    validateCanonicalV2WorkflowInventory(cleanInventory, CANONICAL_WORKFLOW),
-    CANONICAL_WORKFLOW,
+    validateCanonicalV2WorkflowInventory(cleanInventory, CANONICAL_WORKFLOWS),
+    CANONICAL_WORKFLOWS,
   );
 
   const legacyInventory = [
@@ -1769,7 +1983,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     },
   ];
   assert.throws(
-    () => validateCanonicalV2WorkflowInventory(legacyInventory, CANONICAL_WORKFLOW),
+    () => validateCanonicalV2WorkflowInventory(legacyInventory, CANONICAL_WORKFLOWS),
     /Additional v1\/v2 gate callers remain on the default branch: \.github\/workflows\/legacy-codex-review\.yml/u,
   );
 
@@ -1781,9 +1995,28 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     },
   ];
   assert.throws(
-    () => validateCanonicalV2WorkflowInventory(additionalV2Caller, CANONICAL_WORKFLOW),
+    () => validateCanonicalV2WorkflowInventory(additionalV2Caller, CANONICAL_WORKFLOWS),
     /Additional v1\/v2 gate callers.*extra-v2\.yml/u,
   );
+  for (const blockCaller of [
+    "jobs:\n  gate:\n    uses: >-\n      JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
+    "jobs:\n  gate:\n    uses: >-\n      JoeyTeng/codex-review-gate-action@v2\n",
+  ]) {
+    assert.throws(
+      () =>
+        validateCanonicalV2WorkflowInventory(
+          [
+            ...cleanInventory,
+            {
+              path: ".github/workflows/opaque-gate-caller.yml",
+              content: blockCaller,
+            },
+          ],
+          CANONICAL_WORKFLOWS,
+        ),
+      /opaque, escaped, flow-style, or multiline uses scalar/u,
+    );
+  }
 
   const additionalStatusWriter = [
     ...cleanInventory,
@@ -1793,8 +2026,8 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     },
   ];
   assert.throws(
-    () => validateCanonicalV2WorkflowInventory(additionalStatusWriter, CANONICAL_WORKFLOW),
-    /Additional workflows can write commit statuses.*status-writer\.yml/u,
+    () => validateCanonicalV2WorkflowInventory(additionalStatusWriter, CANONICAL_WORKFLOWS),
+    /single-producer policy.*status-writer\.yml.*statuses: write/u,
   );
   for (const quotedStatusWriter of [
     "permissions:\n  \"statuses\": write\njobs: {}\n",
@@ -1810,9 +2043,72 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
               content: quotedStatusWriter,
             },
           ],
-          CANONICAL_WORKFLOW,
+          CANONICAL_WORKFLOWS,
         ),
-      /quoted permissions or statuses key|opaque statuses permission key/u,
+      /quoted protected permissions key|opaque permissions entry/u,
+    );
+  }
+
+  for (const [name, content, expected] of [
+    [
+      "actions-writer",
+      "permissions:\n  actions: write\njobs: {}\n",
+      /actions: write/u,
+    ],
+    [
+      "checks-writer",
+      "permissions:\n  checks: write\njobs: {}\n",
+      /checks: write/u,
+    ],
+    [
+      "issues-writer",
+      "permissions:\n  issues: write\njobs: {}\n",
+      /issues: write/u,
+    ],
+    [
+      "pull-requests-writer",
+      "permissions:\n  pull-requests: write\njobs: {}\n",
+      /pull-requests: write/u,
+    ],
+    [
+      "reserved-job-name",
+      "permissions:\n  contents: read\njobs:\n  collision:\n    name: 'codex/github-review-gate'\n    runs-on: ubuntu-slim\n",
+      /job name: codex\/github-review-gate/u,
+    ],
+    [
+      "block-scalar-job-name",
+      "permissions: {}\njobs:\n  collision:\n    name: >-\n      codex/github-review-gate\n    runs-on: ubuntu-slim\n",
+      /job name: codex\/github-review-gate/u,
+    ],
+    [
+      "flow-root-jobs",
+      "{name: Test, on: push, jobs: {collision: {name: codex/github-review-gate}}}\n",
+      /flow-style root mapping/u,
+    ],
+    [
+      "line-broken-top-flow",
+      "permissions:\n  {statuses: write}\njobs: {}\n",
+      /line-broken flow-style permissions mapping/u,
+    ],
+    [
+      "line-broken-job-flow",
+      "jobs:\n  test:\n    permissions:\n      {checks: write}\n    runs-on: ubuntu-slim\n",
+      /line-broken flow-style permissions mapping/u,
+    ],
+    [
+      "inline-flow-read",
+      "permissions: {contents: read}\njobs: {}\n",
+      /flow-style permissions mapping/u,
+    ],
+  ]) {
+    assert.throws(
+      () =>
+        validateCanonicalV2WorkflowInventory(
+          [...cleanInventory, { path: `.github/workflows/${name}.yml`, content }],
+          CANONICAL_WORKFLOWS,
+        ),
+      expected,
+      name,
     );
   }
 });
@@ -1858,6 +2154,12 @@ test("remote staging and activation reject a post-merge extra v1 caller", () => 
             mode: "100644",
           },
           {
+            path: "codex-review-gate-controller.yml",
+            sha: "canonical-controller-blob",
+            type: "blob",
+            mode: "100644",
+          },
+          {
             path: "legacy-codex-review.yml",
             sha: "legacy-blob",
             type: "blob",
@@ -1868,6 +2170,12 @@ test("remote staging and activation reject a post-merge extra v1 caller", () => 
       [`repos/${repoSlug}/git/blobs/canonical-blob`]: {
         encoding: "base64",
         content: Buffer.from(CANONICAL_WORKFLOW, "utf8").toString("base64"),
+      },
+      [`repos/${repoSlug}/git/blobs/canonical-controller-blob`]: {
+        encoding: "base64",
+        content: Buffer.from(CANONICAL_CONTROLLER_WORKFLOW, "utf8").toString(
+          "base64",
+        ),
       },
       [`repos/${repoSlug}/git/blobs/legacy-blob`]: {
         encoding: "base64",
@@ -1927,7 +2235,22 @@ test("remote inventory rejects an extra v2 caller and an extra status writer", (
       [
         "status-writer",
         "permissions: write-all\njobs: {}\n",
-        /Additional workflows can write commit statuses.*extra\.yml/u,
+        /single-producer policy.*extra\.yml.*checks: write.*issues: write.*pull-requests: write.*statuses: write/u,
+      ],
+      [
+        "issues-writer",
+        "permissions:\n  issues: write\njobs: {}\n",
+        /single-producer policy.*extra\.yml.*issues: write/u,
+      ],
+      [
+        "reserved-job-name",
+        "permissions: {}\njobs:\n  collision:\n    name: codex/github-review-gate\n    runs-on: ubuntu-slim\n",
+        /single-producer policy.*extra\.yml.*job name: codex\/github-review-gate/u,
+      ],
+      [
+        "line-broken-flow",
+        "permissions:\n  {statuses: write}\njobs: {}\n",
+        /line-broken flow-style permissions mapping/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
@@ -1940,6 +2263,12 @@ test("remote inventory rejects an extra v2 caller and an extra status writer", (
             {
               path: "codex-review-gate.yml",
               sha: "canonical-blob",
+              type: "blob",
+              mode: "100644",
+            },
+            {
+              path: "codex-review-gate-controller.yml",
+              sha: "canonical-controller-blob",
               type: "blob",
               mode: "100644",
             },
@@ -1992,6 +2321,207 @@ test("remote bootstrap rejects default workflow write permissions", () => {
     });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /must set default workflow permissions to read/u);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("classic branch protection aggregates legacy contexts and fails closed", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  const endpoint =
+    `repos/${repoSlug}/branches/master/protection`;
+  try {
+    for (const [name, response, expectedStatus, expected] of [
+      [
+        "legacy-context",
+        {
+          required_status_checks: {
+            strict: true,
+            contexts: [LEGACY_STATUS_CONTEXT],
+            checks: [],
+          },
+        },
+        1,
+        /codex\/review-gate is still required by classic branch protection/u,
+      ],
+      [
+        "legacy-check",
+        {
+          required_status_checks: {
+            strict: true,
+            contexts: ["lint"],
+            checks: [{ context: LEGACY_STATUS_CONTEXT, app_id: 15368 }],
+          },
+        },
+        1,
+        /codex\/review-gate is still required by classic branch protection/u,
+      ],
+      [
+        "malformed",
+        {
+          required_status_checks: {
+            strict: true,
+            contexts: null,
+            checks: [],
+          },
+        },
+        1,
+        /required_status_checks is malformed or incomplete/u,
+      ],
+      [
+        "missing-required-status-checks",
+        { url: "https://api.github.com/repos/Joey-Tools/consumer/branches/master/protection" },
+        1,
+        /omits required_status_checks/u,
+      ],
+      [
+        "protected-without-required-checks",
+        { required_status_checks: null },
+        0,
+        /Dry run: would create repository ruleset/u,
+      ],
+      [
+        "forbidden",
+        { __fake_http_error: 403, message: "Forbidden" },
+        1,
+        /HTTP 403/u,
+      ],
+      [
+        "absent",
+        { __fake_http_error: 404, message: "Branch not protected" },
+        0,
+        /Dry run: would create repository ruleset/u,
+      ],
+      [
+        "generic-not-found",
+        { __fake_http_error: 404, message: "Not Found" },
+        1,
+        /Not Found \(HTTP 404\)/u,
+      ],
+      [
+        "permission-masked-not-found",
+        { __fake_http_error: 404, message: "Resource not found" },
+        1,
+        /Resource not found \(HTTP 404\)/u,
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        [endpoint]: response,
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
+      };
+      const result = runBootstrap(["--repo", repoSlug], {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, expectedStatus, `${name}: ${result.stderr}`);
+      assert.match(expectedStatus === 0 ? result.stdout : result.stderr, expected, name);
+      const calls = readFileSync(callLog, "utf8");
+      assert.doesNotMatch(calls, /^(?:POST|PUT) /mu, name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("classic legacy protection appearing during staging prevents every write", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const endpoint =
+    `GET repos/${repoSlug}/branches/master/protection`;
+  try {
+    createFakeGhExecutable(fakeBin);
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [endpoint]: {
+        __fake_sequence: [
+          {
+            required_status_checks: {
+              strict: true,
+              contexts: [],
+              checks: [],
+            },
+          },
+          {
+            required_status_checks: {
+              strict: true,
+              contexts: [],
+              checks: [{ context: LEGACY_STATUS_CONTEXT }],
+            },
+          },
+        ],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
+      [`POST repos/${repoSlug}/rulesets`]: { id: 7 },
+    };
+    const result = runBootstrap(["--repo", repoSlug, "--apply"], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /classic branch protection/u);
+    assert.doesNotMatch(
+      readFileSync(callLog, "utf8"),
+      new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"),
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("classic endpoint presence and unrelated policy drift do not freeze staging", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const endpoint =
+    `GET repos/${repoSlug}/branches/master/protection`;
+  try {
+    createFakeGhExecutable(fakeBin);
+    const presentWithoutLegacy = {
+      strict: true,
+      contexts: ["lint"],
+      checks: [
+        { context: "build", app_id: 1 },
+        { context: "build", app_id: 2 },
+      ],
+    };
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [endpoint]: {
+        __fake_sequence: [
+          { __fake_http_error: 404, message: "Branch not protected" },
+          { required_status_checks: presentWithoutLegacy },
+          { required_status_checks: presentWithoutLegacy },
+        ],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
+      [`POST repos/${repoSlug}/rulesets`]: {
+        id: 7,
+        name: "Must Pass Codex Review",
+      },
+      [`GET repos/${repoSlug}/rulesets/7`]: completeDisabledRulesetFixture(7),
+    };
+    const result = runBootstrap(["--repo", repoSlug, "--apply"], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Created ruleset/u);
+    assert.match(
+      readFileSync(callLog, "utf8"),
+      new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"),
+    );
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -2159,7 +2689,246 @@ test("plain remote apply does not downgrade a complete active v2 ruleset", () =>
   }
 });
 
-test("activation revalidates canary PR lifecycle and exact head immediately before create", () => {
+test("activation requires a staged disabled repository ruleset and preserves active no-op", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    const disabledIncomplete = completeDisabledRulesetFixture(7);
+    disabledIncomplete.rules = disabledIncomplete.rules.filter(
+      (rule) => rule.type !== "non_fast_forward",
+    );
+    for (const [name, rulesets, expectedStatus, expected] of [
+      [
+        "missing",
+        [],
+        1,
+        /Cannot activate missing repository ruleset.*plain --apply first/u,
+      ],
+      [
+        "active-complete",
+        [completeActiveRulesetFixture(7)],
+        0,
+        /complete v2 gate policy is already enforced/u,
+      ],
+      [
+        "active-incomplete",
+        [
+          {
+            ...completeActiveRulesetFixture(7),
+            rules: completeActiveRulesetFixture(7).rules.filter(
+              (rule) => rule.type !== "pull_request",
+            ),
+          },
+        ],
+        1,
+        /must be exactly read back as disabled before --activate/u,
+      ],
+      [
+        "disabled-incomplete",
+        [disabledIncomplete],
+        1,
+        /disabled but not an exact complete staged v2 policy/u,
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          rulesets,
+        ],
+        ...Object.fromEntries(
+          rulesets.map((ruleset) => [
+            `repos/${repoSlug}/rulesets/${ruleset.id}`,
+            ruleset,
+          ]),
+        ),
+        [`POST repos/${repoSlug}/rulesets`]: { id: 8 },
+        [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
+      };
+      const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, expectedStatus, `${name}: ${result.stderr}`);
+      assert.match(expectedStatus === 0 ? result.stdout : result.stderr, expected, name);
+      const calls = readFileSync(callLog, "utf8");
+      assert.doesNotMatch(calls, /^(?:POST|PUT) /mu, name);
+      assert.doesNotMatch(calls, new RegExp(`^GET repos/${repoSlug}/pulls/7$`, "mu"), name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("activation refuses to silently approval-gate existing unmanaged CODEOWNERS patterns", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const disabledRuleset = completeDisabledRulesetFixture(7);
+    const unmanagedCodeowners = ensureControlPlaneCodeownersContent(
+      "/src/** @Alice\n",
+    ).content;
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [`repos/${repoSlug}/git/blobs/codeowners-blob`]: {
+        encoding: "base64",
+        content: Buffer.from(unmanagedCodeowners, "utf8").toString("base64"),
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [disabledRuleset],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
+    };
+    const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /will not silently broaden approval policy/u,
+    );
+    const calls = readFileSync(callLog, "utf8");
+    assert.doesNotMatch(calls, new RegExp(`^GET repos/${repoSlug}/pulls/7$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("activation rejects a colliding exact-name check run before ruleset update", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const disabledRuleset = completeDisabledRulesetFixture(7);
+  const checkRunsEndpoint =
+    `repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`;
+  try {
+    createFakeGhExecutable(fakeBin);
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canaryRunResponses(repoSlug),
+      [`repos/${repoSlug}/pulls/7`]: canaryPullRequestFixture(
+        repoSlug,
+        CANARY_HEAD_SHA,
+      ),
+      [checkRunsEndpoint]: [
+        {
+          total_count: 2,
+          check_runs: [
+            canonicalCanaryCheckRunFixture(repoSlug),
+            {
+              ...canonicalCanaryCheckRunFixture(repoSlug),
+              id: CANARY_CHECK_RUN_ID + 1,
+            },
+          ],
+        },
+      ],
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [disabledRuleset],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
+      [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
+    };
+    const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /must have exactly one latest CheckRun/u);
+    assert.doesNotMatch(
+      readFileSync(callLog, "utf8"),
+      new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"),
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("native canary rejects legacy status projection and control-plane changes", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const [name, mutate, expected] of [
+      [
+        "legacy-status",
+        (responses) => {
+          responses[
+            `repos/${repoSlug}/commits/${CANARY_HEAD_SHA}/statuses?per_page=100`
+          ] = [[{
+            context: DEFAULT_STATUS_CONTEXT,
+            state: "success",
+            sha: CANARY_HEAD_SHA,
+          }]];
+        },
+        /legacy commit status projection/u,
+      ],
+      [
+        "control-plane-change",
+        (responses) => {
+          responses[`repos/${repoSlug}/pulls/7/files?per_page=100`] = [[{
+            filename: DEFAULT_CONTROLLER_WORKFLOW_PATH,
+          }]];
+        },
+        /changes the protected control plane/u,
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const disabledRuleset = completeDisabledRulesetFixture(7);
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        ...canaryRunResponses(repoSlug),
+        [`repos/${repoSlug}/pulls/7`]: canaryPullRequestFixture(
+          repoSlug,
+          CANARY_HEAD_SHA,
+        ),
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [disabledRuleset],
+        ],
+        [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
+      };
+      mutate(responses);
+      const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, 1, name);
+      assert.match(result.stderr, expected, name);
+      assert.doesNotMatch(
+        readFileSync(callLog, "utf8"),
+        new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"),
+      );
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("activation revalidates canary PR lifecycle and exact head immediately before update", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
   const stateDir = join(fixtureRoot, "state");
@@ -2169,17 +2938,18 @@ test("activation revalidates canary PR lifecycle and exact head immediately befo
   try {
     createFakeGhExecutable(fakeBin);
     const validPullRequest = canaryPullRequestFixture(repoSlug, headSha);
+    const disabledRuleset = completeDisabledRulesetFixture(7);
     const responses = {
       ...canonicalRemoteWorkflowResponses(repoSlug),
       ...canaryRunResponses(repoSlug),
       [`GET repos/${repoSlug}/pulls/7`]: {
         __fake_sequence: [validPullRequest, { ...validPullRequest, state: "closed" }],
       },
-      [`GET repos/${repoSlug}/commits/${headSha}/statuses?per_page=100`]: {
-        __fake_sequence: [successfulCanaryStatusPages({ repoSlug, headSha })],
-      },
-      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
-      [`POST repos/${repoSlug}/rulesets`]: { id: 7 },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [disabledRuleset],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
+      [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
     };
 
     const result = runBootstrap(activationArguments(repoSlug, headSha), {
@@ -2194,13 +2964,13 @@ test("activation revalidates canary PR lifecycle and exact head immediately befo
       countLines(calls, `GET repos/${repoSlug}/commits/${headSha}/statuses?per_page=100`),
       1,
     );
-    assert.doesNotMatch(calls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 
-test("activation revalidates exact-head status source immediately before create", () => {
+test("activation revalidates the native test-merge CheckRun immediately before update", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
   const stateDir = join(fixtureRoot, "state");
@@ -2210,24 +2980,30 @@ test("activation revalidates exact-head status source immediately before create"
   try {
     createFakeGhExecutable(fakeBin);
     const validPullRequest = canaryPullRequestFixture(repoSlug, headSha);
+    const disabledRuleset = completeDisabledRulesetFixture(7);
     const responses = {
       ...canonicalRemoteWorkflowResponses(repoSlug),
       ...canaryRunResponses(repoSlug),
       [`GET repos/${repoSlug}/pulls/7`]: {
         __fake_sequence: [validPullRequest, validPullRequest],
       },
-      [`GET repos/${repoSlug}/commits/${headSha}/statuses?per_page=100`]: {
+      [`GET repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: {
         __fake_sequence: [
-          successfulCanaryStatusPages({ repoSlug, headSha }),
-          successfulCanaryStatusPages({
-            repoSlug,
-            headSha,
-            creatorLogin: "other-app[bot]",
-          }),
+          [{ total_count: 1, check_runs: [canonicalCanaryCheckRunFixture(repoSlug)] }],
+          [{
+            total_count: 1,
+            check_runs: [{
+              ...canonicalCanaryCheckRunFixture(repoSlug),
+              app: { id: 99999, name: "Other", slug: "other" },
+            }],
+          }],
         ],
       },
-      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
-      [`POST repos/${repoSlug}/rulesets`]: { id: 7 },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [disabledRuleset],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
+      [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
     };
 
     const result = runBootstrap(activationArguments(repoSlug, headSha), {
@@ -2235,56 +3011,64 @@ test("activation revalidates exact-head status source immediately before create"
     });
 
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /status was not produced by GitHub Actions/u);
+    assert.match(result.stderr, /not a successful native GitHub Actions CheckRun/u);
     const calls = readFileSync(callLog, "utf8");
     assert.equal(countLines(calls, `GET repos/${repoSlug}/pulls/7`), 2);
     assert.equal(
-      countLines(calls, `GET repos/${repoSlug}/commits/${headSha}/statuses?per_page=100`),
+      countLines(calls, `GET repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`),
       2,
     );
-    assert.doesNotMatch(calls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 
-test("activation rejects a spoofed target URL and a non-canonical workflow run", () => {
+test("activation rejects a spoofed CheckRun URL and a non-canonical verifier run", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
   const headSha = "0123456789abcdef0123456789abcdef01234567";
   const validPullRequest = canaryPullRequestFixture(repoSlug, headSha);
   try {
-    for (const [name, statusPages, runOverrides, expected] of [
+    for (const [name, checkRunOverrides, runOverrides, expected] of [
       [
         "spoof-target",
-        successfulCanaryStatusPages({
-          repoSlug,
-          headSha,
-          targetUrl: "https://example.invalid/Joey-Tools/consumer/actions/runs/9007",
-        }),
+        { details_url: "https://example.invalid/Joey-Tools/consumer/actions/runs/9007/job/18017" },
         {},
-        /not a canonical same-repository GitHub run URL/u,
+        /not a canonical same-repository GitHub Actions job URL/u,
       ],
       [
         "wrong-workflow",
-        successfulCanaryStatusPages({ repoSlug, headSha }),
-        { path: ".github/workflows/attacker.yml@master" },
-        /does not resolve to a successful current-default-branch/u,
+        {},
+        { path: ".github/workflows/attacker.yml@refs/pull/7/merge" },
+        /does not resolve to a successful current pull_request run/u,
       ],
       [
-        "wrong-default-head",
-        successfulCanaryStatusPages({ repoSlug, headSha }),
+        "wrong-test-merge",
+        {},
         { head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-        /does not resolve to a successful current-default-branch/u,
+        /does not resolve to a successful current pull_request run/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
       createFakeGhExecutable(fakeBin);
+      const disabledRuleset = completeDisabledRulesetFixture(7);
       const responses = {
         ...canonicalRemoteWorkflowResponses(repoSlug),
         ...canaryRunResponses(repoSlug, runOverrides),
         [`GET repos/${repoSlug}/pulls/7`]: validPullRequest,
-        [`GET repos/${repoSlug}/commits/${headSha}/statuses?per_page=100`]: statusPages,
+        [`repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: [
+          {
+            total_count: 1,
+            check_runs: [
+              { ...canonicalCanaryCheckRunFixture(repoSlug), ...checkRunOverrides },
+            ],
+          },
+        ],
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [disabledRuleset],
+        ],
+        [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
       };
       const result = runBootstrap(activationArguments(repoSlug, headSha), {
         env: {
@@ -2372,7 +3156,7 @@ test("an active ruleset PUT cannot bypass the activation canary contract", () =>
   }
 });
 
-test("active create refuses default-branch and workflow drift between security reads", () => {
+test("activation update refuses default-branch and workflow drift between security reads", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
   const headSha = "0123456789abcdef0123456789abcdef01234567";
@@ -2407,21 +3191,23 @@ test("active create refuses default-branch and workflow drift between security r
             ],
           };
         },
-        /differs from the canonical v2 workflow bytes/u,
+        /differs from the canonical v2 verifier workflow bytes/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
       const stateDir = join(fixtureRoot, `state-${name}`);
       const callLog = join(fixtureRoot, `calls-${name}.log`);
       createFakeGhExecutable(fakeBin);
+      const disabledRuleset = completeDisabledRulesetFixture(7);
       const responses = {
         ...canonicalRemoteWorkflowResponses(repoSlug),
         ...canaryRunResponses(repoSlug),
         [`GET repos/${repoSlug}/pulls/7`]: validPullRequest,
-        [`GET repos/${repoSlug}/commits/${headSha}/statuses?per_page=100`]:
-          successfulCanaryStatusPages({ repoSlug, headSha }),
-        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
-        [`POST repos/${repoSlug}/rulesets`]: { id: 7 },
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [disabledRuleset],
+        ],
+        [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
+        [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
       };
       mutateResponses(responses);
       const result = runBootstrap(activationArguments(repoSlug, headSha), {
@@ -2431,7 +3217,7 @@ test("active create refuses default-branch and workflow drift between security r
       assert.match(result.stderr, expected, name);
       assert.doesNotMatch(
         readFileSync(callLog, "utf8"),
-        new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"),
+        new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"),
       );
     }
   } finally {
@@ -2439,7 +3225,7 @@ test("active create refuses default-branch and workflow drift between security r
   }
 });
 
-test("activation fails closed when post-create ruleset readback drifts", () => {
+test("activation fails closed when post-update ruleset readback drifts", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
   const repoSlug = "Joey-Tools/consumer";
@@ -2447,6 +3233,7 @@ test("activation fails closed when post-create ruleset readback drifts", () => {
   try {
     createFakeGhExecutable(fakeBin);
     const complete = completeActiveRulesetFixture(7);
+    const disabled = completeDisabledRulesetFixture(7);
     const missingBypass = { ...complete };
     delete missingBypass.bypass_actors;
     const releaseOnly = {
@@ -2478,15 +3265,13 @@ test("activation fails closed when post-create ruleset readback drifts", () => {
         [`GET repos/${repoSlug}/pulls/7`]: {
           __fake_sequence: [validPullRequest, validPullRequest],
         },
-        [`GET repos/${repoSlug}/commits/${headSha}/statuses?per_page=100`]: {
-          __fake_sequence: [
-            successfulCanaryStatusPages({ repoSlug, headSha }),
-            successfulCanaryStatusPages({ repoSlug, headSha }),
-          ],
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [disabled],
+        ],
+        [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
+        [`GET repos/${repoSlug}/rulesets/7`]: {
+          __fake_sequence: [disabled, disabled, disabled, disabled, readback],
         },
-        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
-        [`POST repos/${repoSlug}/rulesets`]: { id: 7 },
-        [`GET repos/${repoSlug}/rulesets/7`]: readback,
       };
 
       const result = runBootstrap(activationArguments(repoSlug, headSha), {
@@ -2496,11 +3281,11 @@ test("activation fails closed when post-create ruleset readback drifts", () => {
       assert.equal(result.status, 1, `${name}: ${result.stderr}`);
       assert.match(result.stderr, /Ruleset readback for id 7 is incomplete/u);
       const calls = readFileSync(callLog, "utf8");
-      assert.match(calls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
+      assert.match(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
       assert.match(calls, new RegExp(`^GET repos/${repoSlug}/rulesets/7$`, "mu"));
       assert.ok(
-        calls.indexOf(`POST repos/${repoSlug}/rulesets`) <
-          calls.indexOf(`GET repos/${repoSlug}/rulesets/7`),
+        calls.indexOf(`PUT repos/${repoSlug}/rulesets/7`) <
+          calls.lastIndexOf(`GET repos/${repoSlug}/rulesets/7`),
       );
     }
   } finally {
@@ -2508,7 +3293,7 @@ test("activation fails closed when post-create ruleset readback drifts", () => {
   }
 });
 
-test("activation succeeds only after complete active ruleset readback", () => {
+test("activation reads only the current test-merge CheckRun and succeeds after complete readback", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
   const stateDir = join(fixtureRoot, "state");
@@ -2518,21 +3303,24 @@ test("activation succeeds only after complete active ruleset readback", () => {
   try {
     createFakeGhExecutable(fakeBin);
     const validPullRequest = canaryPullRequestFixture(repoSlug, headSha);
+    const disabled = completeDisabledRulesetFixture(7);
+    const active = completeActiveRulesetFixture(7);
     const responses = {
       ...canonicalRemoteWorkflowResponses(repoSlug),
       ...canaryRunResponses(repoSlug),
       [`GET repos/${repoSlug}/pulls/7`]: {
         __fake_sequence: [validPullRequest, validPullRequest],
       },
-      [`GET repos/${repoSlug}/commits/${headSha}/statuses?per_page=100`]: {
-        __fake_sequence: [
-          successfulCanaryStatusPages({ repoSlug, headSha }),
-          successfulCanaryStatusPages({ repoSlug, headSha }),
-        ],
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [disabled],
+      ],
+      [`PUT repos/${repoSlug}/rulesets/7`]: {
+        id: 7,
+        name: "Must Pass Codex Review",
       },
-      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
-      [`POST repos/${repoSlug}/rulesets`]: { id: 7, name: "Must Pass Codex Review" },
-      [`GET repos/${repoSlug}/rulesets/7`]: completeActiveRulesetFixture(7),
+      [`GET repos/${repoSlug}/rulesets/7`]: {
+        __fake_sequence: [disabled, disabled, disabled, disabled, active],
+      },
     };
 
     const result = runBootstrap(activationArguments(repoSlug, headSha), {
@@ -2541,9 +3329,24 @@ test("activation succeeds only after complete active ruleset readback", () => {
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Ruleset readback: Must Pass Codex Review/u);
+    const calls = readFileSync(callLog, "utf8");
     assert.equal(
-      countLines(readFileSync(callLog, "utf8"), `GET repos/${repoSlug}/pulls/7`),
+      countLines(calls, `GET repos/${repoSlug}/pulls/7`),
       2,
+    );
+    assert.equal(
+      countLines(
+        calls,
+        `GET repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`,
+      ),
+      2,
+    );
+    assert.equal(
+      countLines(
+        calls,
+        `GET repos/${repoSlug}/commits/${DEFAULT_BRANCH_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`,
+      ),
+      0,
     );
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
@@ -2649,6 +3452,13 @@ function canonicalRemoteWorkflowResponses(repoSlug) {
       name: "master",
       commit: { sha: DEFAULT_BRANCH_SHA },
     },
+    [`repos/${repoSlug}/branches/master/protection`]: {
+      required_status_checks: {
+        strict: true,
+        contexts: [],
+        checks: [],
+      },
+    },
     [`repos/${repoSlug}/git/trees/${DEFAULT_BRANCH_SHA}`]: {
       truncated: false,
       tree: [{ path: ".github", sha: "github-tree", type: "tree" }],
@@ -2669,11 +3479,23 @@ function canonicalRemoteWorkflowResponses(repoSlug) {
           type: "blob",
           mode: "100644",
         },
+        {
+          path: "codex-review-gate-controller.yml",
+          sha: "canonical-controller-blob",
+          type: "blob",
+          mode: "100644",
+        },
       ],
     },
     [`repos/${repoSlug}/git/blobs/canonical-blob`]: {
       encoding: "base64",
       content: Buffer.from(CANONICAL_WORKFLOW, "utf8").toString("base64"),
+    },
+    [`repos/${repoSlug}/git/blobs/canonical-controller-blob`]: {
+      encoding: "base64",
+      content: Buffer.from(CANONICAL_CONTROLLER_WORKFLOW, "utf8").toString(
+        "base64",
+      ),
     },
     [`repos/${repoSlug}/git/blobs/codeowners-blob`]: {
       encoding: "base64",
@@ -2710,26 +3532,82 @@ function repositoryMetadataFixture(repoSlug, overrides = {}) {
 }
 
 function canaryRunResponses(repoSlug, overrides = {}) {
-  const targetUrl = `https://github.com/${repoSlug}/actions/runs/${CANARY_RUN_ID}`;
   return {
     [`repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}`]: {
       id: CANARY_RUN_ID,
-      html_url: targetUrl,
       repository: { full_name: repoSlug },
       head_repository: { full_name: repoSlug },
-      path: ".github/workflows/codex-review-gate.yml@master",
-      head_branch: "master",
-      head_sha: DEFAULT_BRANCH_SHA,
-      event: "workflow_dispatch",
+      path: ".github/workflows/codex-review-gate.yml@refs/pull/7/merge",
+      head_sha: CANARY_MERGE_SHA,
+      event: "pull_request",
       status: "completed",
       conclusion: "success",
       workflow_id: CANARY_WORKFLOW_ID,
+      run_attempt: 1,
+      pull_requests: [
+        {
+          number: 7,
+          head: {
+            sha: CANARY_HEAD_SHA,
+            repo: { full_name: repoSlug },
+          },
+          base: {
+            ref: "master",
+            repo: { full_name: repoSlug },
+          },
+        },
+      ],
       ...overrides,
     },
     [`repos/${repoSlug}/actions/workflows/${CANARY_WORKFLOW_ID}`]: {
       id: CANARY_WORKFLOW_ID,
       path: ".github/workflows/codex-review-gate.yml",
       state: "active",
+    },
+    [`repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}/attempts/1/jobs?per_page=100`]: [
+      {
+        total_count: 1,
+        jobs: [canonicalCanaryJobFixture(repoSlug)],
+      },
+    ],
+    [`repos/${repoSlug}/pulls/7/files?per_page=100`]: [[]],
+    [`repos/${repoSlug}/commits/${CANARY_HEAD_SHA}/statuses?per_page=100`]: [[]],
+    [`repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/statuses?per_page=100`]: [[]],
+    [`repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: [
+      {
+        total_count: 1,
+        check_runs: [canonicalCanaryCheckRunFixture(repoSlug)],
+      },
+    ],
+  };
+}
+
+function canonicalCanaryJobFixture(repoSlug) {
+  return {
+    id: CANARY_JOB_ID,
+    run_id: CANARY_RUN_ID,
+    head_sha: CANARY_MERGE_SHA,
+    name: DEFAULT_STATUS_CONTEXT,
+    status: "completed",
+    conclusion: "success",
+    check_run_url:
+      `https://api.github.com/repos/${repoSlug}/check-runs/${CANARY_CHECK_RUN_ID}`,
+  };
+}
+
+function canonicalCanaryCheckRunFixture(repoSlug) {
+  return {
+    id: CANARY_CHECK_RUN_ID,
+    name: DEFAULT_STATUS_CONTEXT,
+    head_sha: CANARY_MERGE_SHA,
+    status: "completed",
+    conclusion: "success",
+    details_url:
+      `https://github.com/${repoSlug}/actions/runs/${CANARY_RUN_ID}/job/${CANARY_JOB_ID}`,
+    app: {
+      id: DEFAULT_STATUS_INTEGRATION_ID,
+      name: "GitHub Actions",
+      slug: "github-actions",
     },
   };
 }
@@ -2739,11 +3617,16 @@ function canaryPullRequestFixture(repoSlug, headSha) {
     state: "open",
     merged: false,
     draft: false,
-    base: { ref: "master" },
+    base: {
+      ref: "master",
+      sha: DEFAULT_BRANCH_SHA,
+      repo: { full_name: repoSlug },
+    },
     head: {
       repo: { full_name: repoSlug },
       sha: headSha,
     },
+    merge_commit_sha: CANARY_MERGE_SHA,
   };
 }
 
@@ -2789,6 +3672,13 @@ function completeActiveRulesetFixture(id) {
       ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] },
     },
     rules,
+  };
+}
+
+function completeDisabledRulesetFixture(id) {
+  return {
+    ...completeActiveRulesetFixture(id),
+    enforcement: "disabled",
   };
 }
 
@@ -2898,6 +3788,21 @@ if (
   }
   writeFileSync(statePath, String(index + 1), "utf8");
   response = response.__fake_sequence[index];
+}
+if (
+  response !== null &&
+  typeof response === "object" &&
+  !Array.isArray(response) &&
+  Number.isSafeInteger(response.__fake_http_error)
+) {
+  process.stderr.write(
+    "gh: " +
+      (response.message ?? "API request failed") +
+      " (HTTP " +
+      response.__fake_http_error +
+      ")\\n",
+  );
+  process.exit(1);
 }
 process.stdout.write(JSON.stringify(response));
 `,

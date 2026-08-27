@@ -3,6 +3,8 @@ export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
 export const DEFAULT_STATUS_INTEGRATION_ID = 15368;
 export const DEFAULT_RULESET_NAME = "Must Pass Codex Review";
 export const DEFAULT_WORKFLOW_PATH = ".github/workflows/codex-review-gate.yml";
+export const DEFAULT_CONTROLLER_WORKFLOW_PATH =
+  ".github/workflows/codex-review-gate-controller.yml";
 export const DEFAULT_RULESET_ENFORCEMENT = "disabled";
 export const DEFAULT_CONTROL_PLANE_OWNER = "@JoeyTeng";
 export const DEFAULT_CODEOWNERS_PATH = ".github/CODEOWNERS";
@@ -11,6 +13,13 @@ export const CANONICAL_V2_WORKFLOW_USES =
 export const LEGACY_V1_WORKFLOW_USES =
   "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1";
 const LEGACY_V1_DIRECT_ACTION_USES = "JoeyTeng/codex-review-gate-action@v1";
+const SINGLE_PRODUCER_WRITE_PERMISSIONS = new Set([
+  "actions",
+  "checks",
+  "issues",
+  "pull-requests",
+  "statuses",
+]);
 const CODEX_REVIEW_GATE_CALLER_PATTERN =
   /(?:^|[\s,{])["']?uses["']?\s*:\s*["']?JoeyTeng\/codex-review-gate-action(?:\/\.github\/workflows\/codex-review-gate\.ya?ml)?@[^\s,}#"']+/imu;
 const CONTROL_PLANE_CODEOWNERS_BEGIN =
@@ -21,7 +30,7 @@ const CONTROL_PLANE_CODEOWNERS_PATTERNS = [
   "/.github/workflows/",
   "/.github/CODEOWNERS",
 ];
-const CANONICAL_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
+const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
   \${{
     (
       github.event_name == 'workflow_dispatch' &&
@@ -36,14 +45,6 @@ const CANONICAL_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
       github.event.sender.type == 'Bot' &&
       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
       github.event.comment.user.type == 'Bot'
-    ) ||
-    (
-      github.event_name == 'pull_request_target' &&
-      github.event.action == 'edited' &&
-      github.event.changes.base.ref.from &&
-      github.event.changes.base.ref.from != github.event.pull_request.base.ref &&
-      github.event.pull_request.base.repo.full_name == github.repository &&
-      github.event.pull_request.base.ref == github.event.repository.default_branch
     )
   }}
 `);
@@ -225,6 +226,27 @@ export function validateControlPlaneCodeownersContent(
     );
   }
   return value;
+}
+
+export function codeownersHasEffectiveUnmanagedPatterns(value) {
+  if (typeof value !== "string" || value === "" || value.includes("\0")) {
+    throw new Error("Default-branch .github/CODEOWNERS must be non-empty UTF-8 text.");
+  }
+  const lines = value.split(/\r?\n/u);
+  const beginIndexes = findExactLineIndexes(lines, CONTROL_PLANE_CODEOWNERS_BEGIN);
+  const endIndexes = findExactLineIndexes(lines, CONTROL_PLANE_CODEOWNERS_END);
+  if (beginIndexes.length !== 1 || endIndexes.length !== 1 || endIndexes[0] <= beginIndexes[0]) {
+    throw new Error(
+      "Default-branch .github/CODEOWNERS has an ambiguous codex-review-gate managed block.",
+    );
+  }
+  return lines.some((line, index) => {
+    if (index >= beginIndexes[0] && index <= endIndexes[0]) {
+      return false;
+    }
+    const trimmed = line.trim();
+    return trimmed !== "" && !trimmed.startsWith("#");
+  });
 }
 
 export function rulesetHasRequiredStatusContext(
@@ -601,51 +623,114 @@ export function rulesetWritableFingerprint(ruleset) {
 }
 
 export function validateCanonicalV2WorkflowContent(value) {
-  if (typeof value !== "string" || value === "") {
-    throw new Error("Canonical v2 workflow must be non-empty UTF-8 text.");
-  }
+  return validateCanonicalV2VerifierWorkflowContent(value);
+}
 
-  const usesMatches = value.match(/^\s*uses:\s*([^\s#]+)\s*$/gm) ?? [];
-  const expectedUses = `uses: ${CANONICAL_V2_WORKFLOW_USES}`;
-  if (
-    usesMatches.length !== 1 ||
-    usesMatches[0].trim() !== expectedUses
-  ) {
+export function validateCanonicalV2VerifierWorkflowContent(value) {
+  if (typeof value !== "string" || value === "") {
+    throw new Error("Canonical v2 verifier workflow must be non-empty UTF-8 text.");
+  }
+  assertCanonicalWorkflowLineEndings(value);
+  assertOneCanonicalActionCall(value, "verifier");
+  assertCommonWorkflowSafety(value, "verifier");
+  if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
+    throw new Error("Canonical v2 verifier workflow must not retain a v1 caller.");
+  }
+  if (!/^  pull_request:\n    types: \[opened, reopened, synchronize, ready_for_review\]$/m.test(value)) {
     throw new Error(
-      `Canonical v2 workflow must contain exactly one literal "${expectedUses}" call.`,
+      "Canonical v2 verifier workflow must expose only the adopted pull_request lifecycle types.",
     );
+  }
+  for (const forbiddenEvent of [
+    "issue_comment",
+    "workflow_dispatch",
+    "pull_request_target",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "repository_dispatch",
+  ]) {
+    if (new RegExp(`^  ${forbiddenEvent}:`, "m").test(value)) {
+      throw new Error(
+        `Canonical v2 verifier workflow must not expose ${forbiddenEvent}.`,
+      );
+    }
+  }
+  if (!/^  cancel-in-progress: true$/m.test(value)) {
+    throw new Error("Canonical v2 verifier workflow must cancel superseded attempts.");
+  }
+  for (const fragment of [
+    "jobs:\n  codex-review-gate:",
+    `name: ${DEFAULT_STATUS_CONTEXT}`,
+    "permissions:\n  contents: read\n  issues: read\n  pull-requests: read",
+    "github.event.pull_request.number",
+    "github.event.pull_request.head.sha",
+    "operation: reconcile",
+    "request_review: false",
+    "CODEX_REVIEW_GATE_LIMITS_PROFILE",
+    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
+  ]) {
+    if (!value.includes(fragment)) {
+      throw new Error(
+        `Canonical v2 verifier workflow is missing required fragment: ${fragment}`,
+      );
+    }
+  }
+  if (workflowSingleProducerPolicyViolations(value).some((violation) =>
+    violation.endsWith(": write"))) {
+    throw new Error(
+      "Canonical v2 verifier workflow must remain read-only.",
+    );
+  }
+  return value;
+}
+
+export function validateCanonicalV2ControllerWorkflowContent(value) {
+  if (typeof value !== "string" || value === "") {
+    throw new Error("Canonical v2 controller workflow must be non-empty UTF-8 text.");
+  }
+  assertCanonicalWorkflowLineEndings(value);
+  assertOneCanonicalActionCall(value, "controller");
+  assertCommonWorkflowSafety(value, "controller");
+  if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
+    throw new Error("Canonical v2 controller workflow must not retain a v1 caller.");
   }
 
   const jobIfExpression = extractCanonicalJobIfExpression(value);
-  if (jobIfExpression !== CANONICAL_JOB_IF_EXPRESSION) {
+  if (jobIfExpression !== CANONICAL_CONTROLLER_JOB_IF_EXPRESSION) {
     throw new Error(
-      "Canonical v2 workflow job.if must exactly match the closed runner-admission expression.",
+      "Canonical v2 controller workflow job.if must exactly match the closed runner-admission expression.",
     );
-  }
-  if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
-    throw new Error("Canonical v2 workflow must not retain a v1 caller.");
-  }
-  if (/^\s*schedule:\s*$/m.test(value) || /^\s*-?\s*cron:\s*/m.test(value)) {
-    throw new Error("Canonical v2 workflow must not allocate cron runners.");
-  }
-  if (/^\s*pull_request_review(?:_comment)?:\s*$/m.test(value)) {
-    throw new Error("Canonical v2 workflow must not start a writable review-event job.");
-  }
-  if (/^\s*repository_dispatch:\s*$/m.test(value)) {
-    throw new Error("Canonical v2 workflow must not expose repository_dispatch.");
   }
   if (
-    !/^  pull_request_target:\n    types: \[edited\]$/m.test(value) ||
-    !/^\s*issue_comment:\s*$/m.test(value) ||
-    !/^\s*types:\s*\[created, edited\]\s*$/m.test(value) ||
-    !/^\s*workflow_dispatch:\s*$/m.test(value)
+    !/^  issue_comment:\n    types: \[created, edited\]$/m.test(value) ||
+    !/^  workflow_dispatch:\s*$/m.test(value)
   ) {
     throw new Error(
-      "Canonical v2 workflow must expose pull_request_target edited, issue_comment created/edited, and workflow_dispatch.",
+      "Canonical v2 controller workflow must expose issue_comment created/edited and workflow_dispatch.",
     );
+  }
+  for (const forbiddenEvent of [
+    "pull_request",
+    "pull_request_target",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "repository_dispatch",
+  ]) {
+    if (new RegExp(`^  ${forbiddenEvent}:`, "m").test(value)) {
+      throw new Error(
+        `Canonical v2 controller workflow must not expose ${forbiddenEvent}.`,
+      );
+    }
+  }
+  if (!/^  cancel-in-progress: false$/m.test(value)) {
+    throw new Error("Canonical v2 controller workflow must not cancel an active request.");
   }
 
   for (const fragment of [
+    "jobs:\n  codex-review-gate-controller:",
+    "name: codex/review-gate-controller",
+    "permissions:\n  actions: write\n  checks: read\n  contents: read\n  issues: write\n  pull-requests: read",
     "github.event_name == 'workflow_dispatch'",
     "github.ref_type == 'branch'",
     "github.ref_name == github.event.repository.default_branch",
@@ -656,11 +741,6 @@ export function validateCanonicalV2WorkflowContent(value) {
     "github.event.sender.type",
     "github.event.comment.user.login",
     "github.event.comment.user.type",
-    "github.event_name == 'pull_request_target'",
-    "github.event.changes.base.ref.from",
-    "github.event.changes.base.ref.from != github.event.pull_request.base.ref",
-    "github.event.pull_request.base.repo.full_name == github.repository",
-    "github.event.pull_request.base.ref == github.event.repository.default_branch",
     "chatgpt-codex-connector[bot]",
     "github_token:",
     "pr_number:",
@@ -668,13 +748,12 @@ export function validateCanonicalV2WorkflowContent(value) {
     "operation:",
     "request_comment_id:",
     "request_review:",
-    "limits_profile:",
     "CODEX_REVIEW_GATE_LIMITS_PROFILE",
     "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
     "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
   ]) {
     if (!value.includes(fragment)) {
-      throw new Error(`Canonical v2 workflow is missing required fragment: ${fragment}`);
+      throw new Error(`Canonical v2 controller workflow is missing required fragment: ${fragment}`);
     }
   }
   for (const input of [
@@ -683,10 +762,9 @@ export function validateCanonicalV2WorkflowContent(value) {
     "expected_head_sha",
     "request_comment_id",
     "request_review",
-    "limits_profile",
   ]) {
     if (!new RegExp(`^      ${input}:\\s*$`, "m").test(value)) {
-      throw new Error(`Canonical v2 workflow is missing typed dispatch input: ${input}`);
+      throw new Error(`Canonical v2 controller workflow is missing typed dispatch input: ${input}`);
     }
   }
   for (const forbidden of [
@@ -696,50 +774,135 @@ export function validateCanonicalV2WorkflowContent(value) {
     "request_author_permission:",
   ]) {
     if (value.includes(forbidden)) {
-      throw new Error(`Canonical v2 workflow contains rejected legacy surface: ${forbidden}`);
+      throw new Error(`Canonical v2 controller workflow contains rejected legacy surface: ${forbidden}`);
     }
+  }
+  if (/^      limits_profile:\s*$/m.test(value)) {
+    throw new Error(
+      "Canonical v2 controller workflow contains rejected dispatch input: limits_profile.",
+    );
   }
   return value;
 }
 
 export function installedWorkflowMatchesCanonical(installed, canonical) {
-  validateCanonicalV2WorkflowContent(canonical);
-  return typeof installed === "string" && installed === canonical;
+  return (
+    typeof canonical === "string" &&
+    canonical !== "" &&
+    typeof installed === "string" &&
+    installed === canonical
+  );
+}
+
+function assertOneCanonicalActionCall(value, role) {
+  const usesMatches = value.match(/^\s*uses:\s*([^\s#]+)\s*$/gm) ?? [];
+  const expectedUses = `uses: ${CANONICAL_V2_WORKFLOW_USES}`;
+  if (usesMatches.length !== 1 || usesMatches[0].trim() !== expectedUses) {
+    throw new Error(
+      `Canonical v2 ${role} workflow must contain exactly one literal "${expectedUses}" call.`,
+    );
+  }
+}
+
+function assertCommonWorkflowSafety(value, role) {
+  if (/^\s*schedule:\s*$/m.test(value) || /^\s*-?\s*cron:\s*/m.test(value)) {
+    throw new Error(`Canonical v2 ${role} workflow must not allocate cron runners.`);
+  }
+  if (/^\s*repository_dispatch:\s*$/m.test(value)) {
+    throw new Error(`Canonical v2 ${role} workflow must not expose repository_dispatch.`);
+  }
+  for (const fragment of [
+    "runs-on: ${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}",
+    "timeout-minutes: 14",
+    "github_token:",
+  ]) {
+    if (!value.includes(fragment)) {
+      throw new Error(
+        `Canonical v2 ${role} workflow is missing required fragment: ${fragment}`,
+      );
+    }
+  }
 }
 
 export function workflowContainsLegacyV1Caller(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  assertCanonicalWorkflowLineEndings(value);
   return (
-    typeof value === "string" &&
-    (value.includes(LEGACY_V1_WORKFLOW_USES) ||
-      value.includes(LEGACY_V1_DIRECT_ACTION_USES))
+    value.includes(LEGACY_V1_WORKFLOW_USES) ||
+    value.includes(LEGACY_V1_DIRECT_ACTION_USES)
   );
 }
 
 export function workflowContainsCodexReviewGateCaller(value) {
-  return (
-    typeof value === "string" &&
-    CODEX_REVIEW_GATE_CALLER_PATTERN.test(
-      value.split(/\r?\n/u).map(stripYamlComment).join("\n"),
-    )
-  );
+  if (typeof value !== "string") {
+    return false;
+  }
+  assertCanonicalWorkflowLineEndings(value);
+  const uncommented = value.split(/\r?\n/u).map(stripYamlComment);
+  for (const line of uncommented) {
+    const usesMatch = line.match(
+      /^\s*(?:-\s*)?(?:uses|"uses"|'uses')\s*:\s*(.*?)\s*$/iu,
+    );
+    if (usesMatch === null) {
+      continue;
+    }
+    const scalar = usesMatch[1];
+    if (
+      scalar === "" ||
+      /^[|>][+-]?[1-9]?\s*$/u.test(scalar) ||
+      /^(?:[&*!]|\$\{\{|[\[{])/u.test(scalar) ||
+      /\\/u.test(scalar) ||
+      (scalar.startsWith('"') && !scalar.endsWith('"')) ||
+      (!scalar.startsWith('"') && scalar.endsWith('"')) ||
+      (scalar.startsWith("'") && !scalar.endsWith("'")) ||
+      (!scalar.startsWith("'") && scalar.endsWith("'"))
+    ) {
+      throw new Error(
+        "Workflow uses an opaque, escaped, flow-style, or multiline uses scalar that cannot prove another Codex review gate caller is absent.",
+      );
+    }
+  }
+  return CODEX_REVIEW_GATE_CALLER_PATTERN.test(uncommented.join("\n"));
 }
 
 export function workflowCanWriteStatuses(value) {
+  return workflowWritePermissions(value).has("statuses");
+}
+
+export function workflowSingleProducerPolicyViolations(
+  value,
+  reservedCheckName = DEFAULT_STATUS_CONTEXT,
+) {
+  const writePermissions = workflowWritePermissions(value);
+  const violations = [...writePermissions]
+    .sort()
+    .map((permission) => `${permission}: write`);
+  if (workflowHasExactJobName(value, reservedCheckName)) {
+    violations.push(`job name: ${reservedCheckName}`);
+  }
+  return violations;
+}
+
+function workflowWritePermissions(value) {
   if (typeof value !== "string") {
     throw new Error("Workflow content must be text before permissions inspection.");
   }
+  assertCanonicalWorkflowLineEndings(value);
   const normalizedValue = value.startsWith("\uFEFF") ? value.slice(1) : value;
   if (/\uFEFF/u.test(normalizedValue)) {
     throw new Error(
-      "Workflow uses an embedded UTF-8 BOM that cannot prove read-only status access.",
+      "Workflow uses an embedded UTF-8 BOM that prevents a conclusive relevant-write inventory.",
     );
   }
   if (/[\u0085\u2028\u2029]/u.test(normalizedValue)) {
     throw new Error(
-      "Workflow uses a non-ASCII YAML line separator that cannot prove read-only status access.",
+      "Workflow uses a non-ASCII YAML line separator that prevents a conclusive relevant-write inventory.",
     );
   }
   const lines = normalizedValue.split(/\r?\n/u);
+  const writes = new Set();
   let blockScalarIndent = null;
   for (let index = 0; index < lines.length; index += 1) {
     const rawLine = lines[index];
@@ -764,7 +927,7 @@ export function workflowCanWriteStatuses(value) {
       )
     ) {
       throw new Error(
-        "Workflow uses YAML tags, anchors, or aliases that cannot prove read-only status access.",
+        "Workflow uses YAML tags, anchors, or aliases that prevent a conclusive relevant-write inventory.",
       );
     }
     if (
@@ -772,19 +935,17 @@ export function workflowCanWriteStatuses(value) {
       /(?:^|[,{?]\s*)"[^"\r\n]*\\/u.test(line)
     ) {
       throw new Error(
-        "Workflow uses an escaped double-quoted mapping key that cannot prove read-only status access.",
+        "Workflow uses an escaped double-quoted mapping key that prevents a conclusive relevant-write inventory.",
       );
     }
-    if (
-      /(?:^|[,{?]\s*)["'](?:permissions|statuses)["']\s*:/iu.test(line)
-    ) {
+    if (/(?:^|[,{?]\s*)\s*["'](?:permissions|checks|issues|pull-requests|statuses)["']\s*:/iu.test(line)) {
       throw new Error(
-        "Workflow uses a quoted permissions or statuses key that cannot prove read-only status access.",
+        "Workflow uses a quoted protected permissions key that cannot prove single-producer access.",
       );
     }
     if (/(?:^|[,{]\s*)\?\s+/u.test(line)) {
       throw new Error(
-        "Workflow uses an explicit YAML mapping key that cannot prove read-only status access.",
+        "Workflow uses an explicit YAML mapping key that cannot prove single-producer access.",
       );
     }
     if (/^\s*<<\s*:/u.test(line) || /:\s*[&*][A-Za-z0-9_-]+(?:\s|$)/u.test(line)) {
@@ -797,7 +958,7 @@ export function workflowCanWriteStatuses(value) {
       !/^( *)(?:permissions):\s*(.*?)\s*$/iu.test(line)
     ) {
       throw new Error(
-        "Workflow uses a nested flow-style permissions mapping that cannot prove read-only status access.",
+        "Workflow uses a nested flow-style permissions mapping that cannot prove single-producer access.",
       );
     }
     const match = line.match(/^( *)(?:permissions):\s*(.*?)\s*$/iu);
@@ -810,17 +971,23 @@ export function workflowCanWriteStatuses(value) {
       if (scalar === "read-all" || scalar === "{}") {
         continue;
       }
-      if (
-        scalar === "write-all" ||
-        (/^\{.*\}$/u.test(scalar) && /(?:^|[,{]\s*)statuses\s*:\s*write(?:\s*[,}]|$)/iu.test(scalar))
-      ) {
-        return true;
+      if (scalar === "write-all") {
+        for (const permission of SINGLE_PRODUCER_WRITE_PERMISSIONS) {
+          writes.add(permission);
+        }
+        continue;
+      }
+      if (/^\{.*\}$/u.test(scalar)) {
+        throw new Error(
+          "Workflow uses a flow-style permissions mapping that cannot prove single-producer access.",
+        );
       }
       throw new Error(
-        `Workflow has an opaque permissions scalar that cannot prove statuses are read-only: ${scalar}`,
+        `Workflow has an opaque permissions scalar that cannot prove single-producer access: ${scalar}`,
       );
     }
 
+    let childMappingIndent = null;
     for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
       const childLine = stripYamlComment(lines[cursor]);
       if (childLine.trim() === "") {
@@ -830,27 +997,258 @@ export function workflowCanWriteStatuses(value) {
       if (childIndent <= permissionsIndent) {
         break;
       }
-      const statusMatch = childLine.match(/^\s*statuses\s*:\s*(.*?)\s*$/iu);
-      if (statusMatch === null) {
-        if (/(?:^|\s|["'])statuses(?:\s|["']|:)/iu.test(childLine)) {
-          throw new Error(
-            "Workflow uses an opaque statuses permission key that cannot prove read-only status access.",
-          );
-        }
-        continue;
-      }
-      const statusPermission = unquoteYamlScalar(statusMatch[1]);
-      if (statusPermission === "write") {
-        return true;
-      }
-      if (statusPermission !== "read" && statusPermission !== "none") {
+      if (/^\s*\{/u.test(childLine)) {
         throw new Error(
-          `Workflow has an opaque statuses permission: ${statusPermission || "<mapping>"}`,
+          "Workflow uses a line-broken flow-style permissions mapping that cannot prove single-producer access.",
         );
+      }
+      if (childMappingIndent === null) {
+        childMappingIndent = childIndent;
+      } else if (childIndent !== childMappingIndent) {
+        throw new Error(
+          "Workflow permissions contain a nested or malformed mapping that cannot prove single-producer access.",
+        );
+      }
+      const permissionMatch = childLine.match(
+        /^\s*([A-Za-z][A-Za-z0-9-]*)\s*:\s*(.*?)\s*$/u,
+      );
+      if (permissionMatch === null) {
+        throw new Error(
+          "Workflow contains an opaque permissions entry that cannot prove single-producer access.",
+        );
+      }
+      const permission = permissionMatch[1].toLowerCase();
+      const access = unquoteYamlScalar(permissionMatch[2]);
+      if (!new Set(["read", "write", "none"]).has(access)) {
+        throw new Error(
+          `Workflow has an opaque ${permission} permission: ${access || "<mapping>"}`,
+        );
+      }
+      if (access === "write" && SINGLE_PRODUCER_WRITE_PERMISSIONS.has(permission)) {
+        writes.add(permission);
       }
     }
   }
+  return writes;
+}
+
+function workflowHasExactJobName(value, reservedCheckName) {
+  if (typeof reservedCheckName !== "string" || reservedCheckName === "") {
+    throw new Error("Reserved check name must be non-empty text.");
+  }
+  assertCanonicalWorkflowLineEndings(value);
+  const lines = value.startsWith("\uFEFF")
+    ? value.slice(1).split(/\r?\n/u)
+    : value.split(/\r?\n/u);
+  const rootMappingIndent = lines.reduce((minimum, line) => {
+    const mapping = matchSimpleYamlMappingLine(stripYamlComment(line));
+    return mapping === null ? minimum : Math.min(minimum, mapping.indent);
+  }, Number.POSITIVE_INFINITY);
+  if (
+    rootMappingIndent === Number.POSITIVE_INFINITY &&
+    lines.some((line) => stripYamlComment(line).trimStart().startsWith("{"))
+  ) {
+    throw new Error(
+      "Workflow uses a flow-style root mapping that cannot prove the reserved check name is absent.",
+    );
+  }
+  let jobsIndent = null;
+  let jobIndent = null;
+  let currentJobIndent = null;
+  let propertyIndent = null;
+  let blockScalarIndent = null;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const rawLine = lines[lineIndex];
+    const rawIndent = rawLine.match(/^ */u)[0].length;
+    if (blockScalarIndent !== null) {
+      if (rawLine.trim() === "" || rawIndent > blockScalarIndent) {
+        continue;
+      }
+      blockScalarIndent = null;
+    }
+    const line = stripYamlComment(rawLine);
+    if (/^\s*[^:#]+:\s*[|>][+-]?[1-9]?\s*$/u.test(line)) {
+      blockScalarIndent = rawIndent;
+    }
+    if (jobsIndent === null) {
+      const jobsMatch = matchSimpleYamlMappingLine(line);
+      if (
+        jobsMatch === null ||
+        jobsMatch.key !== "jobs" ||
+        jobsMatch.indent !== rootMappingIndent
+      ) {
+        continue;
+      }
+      const jobsValue = unquoteYamlScalar(jobsMatch.value);
+      if (jobsValue === "{}") {
+        return false;
+      }
+      if (jobsValue !== "") {
+        throw new Error(
+          "Workflow uses a flow-style jobs mapping that cannot prove the reserved check name is absent.",
+        );
+      }
+      jobsIndent = jobsMatch.indent;
+      continue;
+    }
+    if (line.trim() === "") {
+      continue;
+    }
+    if (rawIndent <= jobsIndent) {
+      break;
+    }
+    if (line.trimStart().startsWith("{")) {
+      if (line.trim() === "{}") {
+        continue;
+      }
+      throw new Error(
+        "Workflow uses a line-broken flow-style jobs mapping that cannot prove the reserved check name is absent.",
+      );
+    }
+    const mappingMatch = matchSimpleYamlMappingLine(line);
+    if (mappingMatch === null) {
+      continue;
+    }
+    if (jobIndent === null) {
+      jobIndent = mappingMatch.indent;
+    }
+    if (mappingMatch.indent === jobIndent) {
+      currentJobIndent = jobIndent;
+      propertyIndent = null;
+      if (mappingMatch.value !== "" && mappingMatch.value !== "{}") {
+        throw new Error(
+          "Workflow uses a flow-style job definition that cannot prove the reserved check name is absent.",
+        );
+      }
+      continue;
+    }
+    if (currentJobIndent === null || mappingMatch.indent <= currentJobIndent) {
+      continue;
+    }
+    if (propertyIndent === null) {
+      propertyIndent = mappingMatch.indent;
+    }
+    if (mappingMatch.indent !== propertyIndent || mappingMatch.key !== "name") {
+      continue;
+    }
+    let name;
+    if (/^[|>]/u.test(mappingMatch.value)) {
+      if (![">-", "|-"].includes(mappingMatch.value)) {
+        throw new Error(
+          "Workflow uses an unsupported block-scalar job name indicator that cannot prove the reserved check name is absent.",
+        );
+      }
+      name = decodeSafeSingleLineJobNameBlock(
+        lines,
+        lineIndex,
+        propertyIndent,
+      );
+    } else {
+      name = unquoteSimpleYamlScalar(mappingMatch.value);
+    }
+    if (jobNameCouldResolveTo(name, reservedCheckName)) {
+      return true;
+    }
+  }
   return false;
+}
+
+function decodeSafeSingleLineJobNameBlock(
+  lines,
+  declarationIndex,
+  propertyIndent,
+) {
+  const contentIndex = declarationIndex + 1;
+  const contentLine = lines[contentIndex];
+  if (
+    contentLine === undefined ||
+    contentLine.trim() === "" ||
+    /^ *\t/u.test(contentLine)
+  ) {
+    throw new Error(
+      "Workflow block-scalar job name must have exactly one unambiguous physical content line.",
+    );
+  }
+  const contentIndent = contentLine.match(/^ */u)[0].length;
+  if (contentIndent <= propertyIndent) {
+    throw new Error(
+      "Workflow block-scalar job name content is missing or not indented beneath name.",
+    );
+  }
+  for (let index = contentIndex + 1; index < lines.length; index += 1) {
+    const followingLine = lines[index];
+    if (followingLine.trim() === "") {
+      if (/\t/u.test(followingLine)) {
+        throw new Error(
+          "Workflow block-scalar job name has ambiguous tab-indented blank content.",
+        );
+      }
+      continue;
+    }
+    const followingIndent = followingLine.match(/^ */u)[0].length;
+    if (followingIndent > propertyIndent) {
+      throw new Error(
+        "Workflow block-scalar job name has multiple or ambiguous physical content lines.",
+      );
+    }
+    break;
+  }
+  return contentLine.slice(contentIndent);
+}
+
+function matchSimpleYamlMappingLine(line) {
+  const plain = line.match(
+    /^( *)([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$/u,
+  );
+  if (plain !== null) {
+    return { indent: plain[1].length, key: plain[2], value: plain[3] };
+  }
+  const quoted = line.match(
+    /^( *)(?:"([A-Za-z_][A-Za-z0-9_-]*)"|'([A-Za-z_][A-Za-z0-9_-]*)')\s*:\s*(.*?)\s*$/u,
+  );
+  if (quoted !== null) {
+    return {
+      indent: quoted[1].length,
+      key: quoted[2] ?? quoted[3],
+      value: quoted[4],
+    };
+  }
+  return null;
+}
+
+function unquoteSimpleYamlScalar(value) {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith("'") && !trimmed.endsWith("'")) ||
+    (!trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+    (trimmed.startsWith('"') && !trimmed.endsWith('"')) ||
+    (!trimmed.startsWith('"') && trimmed.endsWith('"'))
+  ) {
+    throw new Error(
+      "Workflow uses a multiline or unterminated quoted job name that cannot prove the reserved check name is absent.",
+    );
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replaceAll("''", "'");
+  }
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    if (/\\/u.test(trimmed)) {
+      throw new Error(
+        "Workflow uses an escaped job name that cannot prove the reserved check name is absent.",
+      );
+    }
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function jobNameCouldResolveTo(name, reservedCheckName) {
+  const expressionStart = name.indexOf("${{");
+  if (expressionStart === -1) {
+    return name === reservedCheckName;
+  }
+  const fixedPrefix = name.slice(0, expressionStart);
+  return fixedPrefix === "" || reservedCheckName.startsWith(fixedPrefix);
 }
 
 export function decodeGitHubFileContent(value) {
@@ -873,26 +1271,31 @@ export function decodeGitHubBlobContent(value) {
 
 export function validateCanonicalV2WorkflowInventory(
   workflowFiles,
-  canonicalWorkflow,
-  canonicalPath = DEFAULT_WORKFLOW_PATH,
+  canonicalWorkflows,
 ) {
   if (!Array.isArray(workflowFiles)) {
     throw new Error("Default-branch workflow inventory must be an array.");
   }
-  const canonicalMatches = workflowFiles.filter((file) => file?.path === canonicalPath);
-  if (canonicalMatches.length !== 1) {
-    throw new Error(
-      `${canonicalPath} must occur exactly once in the complete default-branch workflow inventory.`,
-    );
+  const canonicalEntries = normalizeCanonicalWorkflowEntries(canonicalWorkflows);
+  for (const { path, content, role } of canonicalEntries) {
+    const matches = workflowFiles.filter((file) => file?.path === path);
+    if (matches.length !== 1) {
+      throw new Error(
+        `${path} must occur exactly once in the complete default-branch workflow inventory.`,
+      );
+    }
+    if (!installedWorkflowMatchesCanonical(matches[0].content, content)) {
+      throw new Error(`${path} differs from the canonical v2 ${role} workflow bytes.`);
+    }
   }
-  if (!installedWorkflowMatchesCanonical(canonicalMatches[0].content, canonicalWorkflow)) {
-    throw new Error(`${canonicalPath} differs from the canonical v2 workflow bytes.`);
-  }
+
+  const canonicalPaths = new Set(canonicalEntries.map((entry) => entry.path));
 
   const callerPaths = workflowFiles
     .filter(
       (file) =>
-        file?.path !== canonicalPath && workflowContainsCodexReviewGateCaller(file?.content),
+        !canonicalPaths.has(file?.path) &&
+        workflowContainsCodexReviewGateCaller(file?.content),
     )
     .map((file) => file.path)
     .sort();
@@ -902,16 +1305,50 @@ export function validateCanonicalV2WorkflowInventory(
     );
   }
 
-  const statusWriterPaths = workflowFiles
-    .filter((file) => file?.path !== canonicalPath && workflowCanWriteStatuses(file?.content))
-    .map((file) => file.path)
-    .sort();
-  if (statusWriterPaths.length > 0) {
+  const producerViolations = workflowFiles
+    .filter((file) => !canonicalPaths.has(file?.path))
+    .map((file) => ({
+      path: file.path,
+      violations: workflowSingleProducerPolicyViolations(file?.content),
+    }))
+    .filter((file) => file.violations.length > 0)
+    .sort((left, right) => left.path.localeCompare(right.path));
+  if (producerViolations.length > 0) {
     throw new Error(
-      `Additional workflows can write commit statuses: ${statusWriterPaths.join(", ")}`,
+      `Additional workflows violate the codex/github-review-gate single-producer policy: ${producerViolations
+        .map(({ path, violations }) => `${path} (${violations.join(", ")})`)
+        .join("; ")}`,
     );
   }
-  return canonicalWorkflow;
+  return canonicalWorkflows;
+}
+
+function normalizeCanonicalWorkflowEntries(canonicalWorkflows) {
+  if (
+    canonicalWorkflows === null ||
+    typeof canonicalWorkflows !== "object" ||
+    Array.isArray(canonicalWorkflows)
+  ) {
+    throw new Error(
+      "Canonical workflow inventory must provide verifier and controller workflow bytes.",
+    );
+  }
+  const verifier = canonicalWorkflows.verifier;
+  const controller = canonicalWorkflows.controller;
+  validateCanonicalV2VerifierWorkflowContent(verifier);
+  validateCanonicalV2ControllerWorkflowContent(controller);
+  return [
+    {
+      role: "verifier",
+      path: DEFAULT_WORKFLOW_PATH,
+      content: verifier,
+    },
+    {
+      role: "controller",
+      path: DEFAULT_CONTROLLER_WORKFLOW_PATH,
+      content: controller,
+    },
+  ];
 }
 
 function extractCanonicalJobIfExpression(value) {
@@ -947,6 +1384,14 @@ function stripYamlComment(line) {
     }
   }
   return line;
+}
+
+function assertCanonicalWorkflowLineEndings(value) {
+  if (/\r(?!\n)/u.test(value)) {
+    throw new Error(
+      "Workflow uses a bare CR YAML line break; security inventory accepts only LF or CRLF line endings.",
+    );
+  }
 }
 
 function stripYamlQuotedSegments(line) {

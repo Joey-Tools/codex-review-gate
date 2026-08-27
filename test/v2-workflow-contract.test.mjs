@@ -10,9 +10,16 @@ const sourceConsumer = readFileSync(
   new URL("../.github/workflows/codex-review-gate.yml", import.meta.url),
   "utf8",
 );
-const templateConsumer = readFileSync(
+const templateVerifier = readFileSync(
   new URL(
     "../templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const templateController = readFileSync(
+  new URL(
+    "../templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
     import.meta.url,
   ),
   "utf8",
@@ -87,7 +94,8 @@ test("v2 Action exposes only the closed operation, request, and limits-profile A
 });
 
 test("source remains on v1 until the v2 alias exists", () => {
-  assert.notEqual(sourceConsumer, templateConsumer);
+  assert.notEqual(sourceConsumer, templateVerifier);
+  assert.notEqual(sourceConsumer, templateController);
   assert.match(
     sourceConsumer,
     /uses: JoeyTeng\/codex-review-gate-action\/\.github\/workflows\/codex-review-gate\.yml@v1/u,
@@ -95,125 +103,178 @@ test("source remains on v1 until the v2 alias exists", () => {
   assert.doesNotMatch(sourceConsumer, /codex-review-gate-action@v2/u);
 });
 
-test("canonical consumer starts runners only for manual dispatch, exact Codex comments, or base edits", () => {
-  assert.match(templateConsumer, /^  pull_request_target:\n    types: \[edited\]$/mu);
-  assert.match(templateConsumer, /^  issue_comment:\n    types: \[created, edited\]$/mu);
-  assert.match(templateConsumer, /^  workflow_dispatch:$/mu);
+test("canonical verifier owns the native required CheckRun on selected pull-request events", () => {
+  assert.match(
+    templateVerifier,
+    /^name: Codex Review Gate Verifier$/mu,
+  );
+  assert.match(
+    templateVerifier,
+    /^  pull_request:\n    types: \[opened, reopened, synchronize, ready_for_review\]$/mu,
+  );
   assert.doesNotMatch(
-    templateConsumer,
-    /^  (?:repository_dispatch|schedule|pull_request|pull_request_review|pull_request_review_comment):/mu,
+    templateVerifier,
+    /^  (?:issue_comment|workflow_dispatch|pull_request_target|repository_dispatch|schedule|pull_request_review|pull_request_review_comment):/mu,
+  );
+  assert.match(templateVerifier, /^  codex-review-gate:$/mu);
+  assert.match(templateVerifier, /^    name: codex\/github-review-gate$/mu);
+  assert.equal(templateVerifier.match(/^    if:/gmu)?.length ?? 0, 0);
+});
+
+test("canonical controller starts runners only for default-branch dispatches or exact Codex comments", () => {
+  assert.match(templateController, /^name: Codex Review Gate Controller$/mu);
+  assert.match(templateController, /^  issue_comment:\n    types: \[created, edited\]$/mu);
+  assert.match(templateController, /^  workflow_dispatch:$/mu);
+  assert.doesNotMatch(
+    templateController,
+    /^  (?:pull_request|pull_request_target|repository_dispatch|schedule|pull_request_review|pull_request_review_comment):/mu,
   );
 
-  assert.match(templateConsumer, /github\.event_name == 'workflow_dispatch'/u);
-  assert.match(templateConsumer, /github\.ref_type == 'branch'/u);
+  assert.match(templateController, /github\.event_name == 'workflow_dispatch'/u);
+  assert.match(templateController, /github\.ref_type == 'branch'/u);
   assert.match(
-    templateConsumer,
+    templateController,
     /github\.ref_name == github\.event\.repository\.default_branch/u,
   );
-  assert.match(templateConsumer, /github\.event_name == 'issue_comment'/u);
-  assert.match(templateConsumer, /github\.event\.action == 'created'/u);
-  assert.match(templateConsumer, /github\.event\.action == 'edited'/u);
-  assert.match(templateConsumer, /github\.event\.issue\.pull_request/u);
+  assert.match(templateController, /github\.event_name == 'issue_comment'/u);
+  assert.match(templateController, /github\.event\.action == 'created'/u);
+  assert.match(templateController, /github\.event\.action == 'edited'/u);
+  assert.match(templateController, /github\.event\.issue\.pull_request/u);
   assert.match(
-    templateConsumer,
+    templateController,
     /github\.event\.sender\.login == 'chatgpt-codex-connector\[bot\]'/u,
   );
-  assert.match(templateConsumer, /github\.event\.sender\.type == 'Bot'/u);
+  assert.match(templateController, /github\.event\.sender\.type == 'Bot'/u);
   assert.match(
-    templateConsumer,
+    templateController,
     /github\.event\.comment\.user\.login == 'chatgpt-codex-connector\[bot\]'/u,
   );
-  assert.match(templateConsumer, /github\.event\.comment\.user\.type == 'Bot'/u);
-  assert.match(templateConsumer, /github\.event_name == 'pull_request_target'/u);
-  assert.match(templateConsumer, /github\.event\.changes\.base\.ref\.from/u);
-  assert.match(
-    templateConsumer,
-    /github\.event\.changes\.base\.ref\.from != github\.event\.pull_request\.base\.ref/u,
-  );
-  assert.match(
-    templateConsumer,
-    /github\.event\.pull_request\.base\.ref == github\.event\.repository\.default_branch/u,
-  );
+  assert.match(templateController, /github\.event\.comment\.user\.type == 'Bot'/u);
 
-  const jobIfCount = templateConsumer.match(/^    if:/gmu)?.length ?? 0;
+  const jobIfCount = templateController.match(/^    if:/gmu)?.length ?? 0;
   assert.equal(jobIfCount, 1);
-  assert.equal(templateConsumer.match(/^        if:/gmu)?.length ?? 0, 0);
+  assert.equal(templateController.match(/^        if:/gmu)?.length ?? 0, 0);
 });
 
 test("manual dispatch exposes only the typed single-PR business inputs", () => {
-  const dispatch = yamlSection(templateConsumer, "  workflow_dispatch", "permissions");
-  assert.deepEqual(topLevelYamlKeys(yamlChildBlock(dispatch, "inputs", 4), 6), [
-    "operation",
-    "pr_number",
-    "expected_head_sha",
-    "request_comment_id",
-    "request_review",
-    "limits_profile",
-  ]);
+  const dispatch = yamlSection(templateController, "  workflow_dispatch", "permissions");
+  assert.deepEqual(
+    topLevelYamlKeys(yamlChildBlock(dispatch, "inputs", 4), 6),
+    [
+      "operation",
+      "pr_number",
+      "expected_head_sha",
+      "request_comment_id",
+      "request_review",
+    ],
+  );
   assert.match(yamlChildBlock(dispatch, "operation", 6), /^        type: choice$/mu);
   assert.match(yamlChildBlock(dispatch, "pr_number", 6), /^        type: number$/mu);
   assert.match(yamlChildBlock(dispatch, "expected_head_sha", 6), /^        type: string$/mu);
   assert.match(yamlChildBlock(dispatch, "request_review", 6), /^        type: boolean$/mu);
   assert.match(yamlChildBlock(dispatch, "request_review", 6), /^        default: true$/mu);
-  assert.match(yamlChildBlock(dispatch, "limits_profile", 6), /- default\n          - expanded/u);
-  assert.doesNotMatch(templateConsumer, /batch|temporary|max_pages|max_objects|client_payload/u);
+  assert.doesNotMatch(
+    dispatch,
+    /limits_profile|batch|temporary|max_pages|max_objects|client_payload/u,
+  );
 });
 
-test("canonical consumer has the minimal permission, runner, and direct-action surface", () => {
+test("canonical verifier is read-only, latest-wins, and uses the direct Action", () => {
   assert.match(
-    templateConsumer,
-    /^permissions:\n  contents: read\n  issues: write\n  pull-requests: read\n  statuses: write$/mu,
+    templateVerifier,
+    /^permissions:\n  contents: read\n  issues: read\n  pull-requests: read$/mu,
   );
   assert.match(
-    templateConsumer,
-    /group: codex-review-gate-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.event\.issue\.number \|\| inputs\.pr_number \}\}/u,
+    templateVerifier,
+    /group: codex-review-gate-verifier-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.pull_request\.number \}\}/u,
   );
-  assert.match(templateConsumer, /^  cancel-in-progress: false$/mu);
+  assert.match(templateVerifier, /^  cancel-in-progress: true$/mu);
   assert.match(
-    templateConsumer,
+    templateVerifier,
     /^    runs-on: \$\{\{ vars\.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' \|\| 'ubuntu-slim' \}\}$/mu,
   );
-  assert.match(templateConsumer, /^    timeout-minutes: 14$/mu);
+  assert.match(templateVerifier, /^    timeout-minutes: 14$/mu);
   assert.equal(
-    (templateConsumer.match(/uses: JoeyTeng\/codex-review-gate-action@v2/gu) ?? [])
+    (templateVerifier.match(/uses: JoeyTeng\/codex-review-gate-action@v2/gu) ?? [])
       .length,
     1,
   );
   assert.doesNotMatch(
-    templateConsumer,
-    /actions\/checkout|\.\/\.github\/workflows|secrets:\s*inherit|contents: write|pull-requests: write|id-token:/u,
+    templateVerifier,
+    /actions\/checkout|\.\/\.github\/workflows|secrets:\s*inherit|actions: write|checks: write|contents: write|issues: write|pull-requests: write|statuses:|id-token:/u,
   );
   assert.match(
-    templateConsumer,
+    templateVerifier,
     /^          github_token: \$\{\{ github\.token \}\}$/mu,
   );
   assert.match(
-    templateConsumer,
+    templateVerifier,
     /^        env:\n          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: \$\{\{ vars\.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' \|\| 'write' \}\}$/mu,
   );
   assert.match(
-    templateConsumer,
-    /^          pr_number: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.pr_number \|\| github\.event_name == 'pull_request_target' && github\.event\.pull_request\.number \|\| github\.event\.issue\.number \}\}$/mu,
+    templateVerifier,
+    /^          pr_number: \$\{\{ github\.event\.pull_request\.number \}\}$/mu,
   );
   assert.match(
-    templateConsumer,
-    /^          expected_head_sha: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.expected_head_sha \|\| github\.event_name == 'pull_request_target' && github\.event\.pull_request\.head\.sha \|\| '' \}\}$/mu,
+    templateVerifier,
+    /^          expected_head_sha: \$\{\{ github\.event\.pull_request\.head\.sha \}\}$/mu,
+  );
+  assert.match(templateVerifier, /^          operation: reconcile$/mu);
+  assert.match(templateVerifier, /^          request_review: false$/mu);
+  assert.match(
+    templateVerifier,
+    /^          limits_profile: \$\{\{ vars\.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' \|\| 'default' \}\}$/mu,
+  );
+});
+
+test("canonical controller has only the adopted write authority and ledgerless inputs", () => {
+  assert.match(
+    templateController,
+    /^permissions:\n  actions: write\n  checks: read\n  contents: read\n  issues: write\n  pull-requests: read$/mu,
   );
   assert.match(
-    templateConsumer,
+    templateController,
+    /group: codex-review-gate-controller-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.issue\.number \|\| inputs\.pr_number \}\}/u,
+  );
+  assert.match(templateController, /^  cancel-in-progress: false$/mu);
+  assert.match(templateController, /^    name: codex\/review-gate-controller$/mu);
+  assert.match(
+    templateController,
+    /^    runs-on: \$\{\{ vars\.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' \|\| 'ubuntu-slim' \}\}$/mu,
+  );
+  assert.match(templateController, /^    timeout-minutes: 14$/mu);
+  assert.equal(
+    (templateController.match(/uses: JoeyTeng\/codex-review-gate-action@v2/gu) ?? [])
+      .length,
+    1,
+  );
+  assert.doesNotMatch(
+    templateController,
+    /actions\/checkout|\.\/\.github\/workflows|secrets:\s*inherit|checks: write|contents: write|pull-requests: write|statuses:|id-token:/u,
+  );
+  assert.match(
+    templateController,
+    /^          pr_number: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.pr_number \|\| github\.event\.issue\.number \}\}$/mu,
+  );
+  assert.match(
+    templateController,
+    /^          expected_head_sha: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.expected_head_sha \|\| '' \}\}$/mu,
+  );
+  assert.match(
+    templateController,
     /^          operation: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.operation \|\| 'reconcile' \}\}$/mu,
   );
   assert.match(
-    templateConsumer,
-    /^          request_comment_id: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.request_comment_id \|\| github\.event_name == 'issue_comment' && github\.event\.comment\.id \|\| '' \}\}$/mu,
+    templateController,
+    /^          request_comment_id: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.request_comment_id \|\| github\.event\.comment\.id \}\}$/mu,
   );
   assert.match(
-    templateConsumer,
+    templateController,
     /^          request_review: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.operation == 'begin-review' && inputs\.request_review \|\| false \}\}$/mu,
   );
   assert.match(
-    templateConsumer,
-    /^          limits_profile: \$\{\{ \(\(github\.event_name == 'workflow_dispatch' && inputs\.limits_profile == 'expanded'\) \|\| vars\.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded'\) && 'expanded' \|\| 'default' \}\}$/mu,
+    templateController,
+    /^          limits_profile: \$\{\{ vars\.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' \|\| 'default' \}\}$/mu,
   );
 });
 

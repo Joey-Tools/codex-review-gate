@@ -426,6 +426,14 @@ function writeJson(path, value) {
   write(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function replaceRootActionDescription(replacement) {
+  const rootDescription = /^description:[^\r\n]*$/mu;
+  assert.match(ACTION_METADATA, rootDescription, "root Action description fixture must exist");
+  const replaced = ACTION_METADATA.replace(rootDescription, replacement);
+  assert.notEqual(replaced, ACTION_METADATA, "root Action description fixture must change");
+  return replaced;
+}
+
 function commit(repo, message) {
   git(repo, ["add", "--all"]);
   git(repo, ["commit", "-q", "-m", message]);
@@ -696,10 +704,7 @@ test("release planning validates the real JavaScript Action and manifest tree", 
 
 test("Action metadata parser admits only the closed node20 JavaScript schema", () => {
   assert.equal(validateActionMetadata(Buffer.from(ACTION_METADATA)), true);
-  const replaceDescription = (replacement) => ACTION_METADATA.replace(
-    /^description: .*$/mu,
-    replacement,
-  );
+  const replaceDescription = (replacement) => replaceRootActionDescription(replacement);
   const invalid = new Map([
     ["malformed flow scalar", replaceDescription("description: [")],
     ["duplicate key", ACTION_METADATA.replace("author: JoeyTeng\n", "author: JoeyTeng\nauthor: Mallory\n")],
@@ -716,8 +721,7 @@ test("Action metadata parser admits only the closed node20 JavaScript schema", (
     ["flow mapping", ACTION_METADATA.replace("branding:\n  icon: shield\n  color: blue", "branding: {icon: shield, color: blue}")],
     ["tab indentation", ACTION_METADATA.replace("  using: node20", "\tusing: node20")],
     ["control character", ACTION_METADATA.replace("author: JoeyTeng", "author: JoeyTeng\u0001")],
-    ["NEL structural injection", ACTION_METADATA.replace(
-      "description: Reconcile trusted OpenAI Codex review evidence for one pull request.",
+    ["NEL structural injection", replaceRootActionDescription(
       "description: harmless\u0085  runs:\u0085    using: node20",
     )],
     ["Unicode line separator indentation", ACTION_METADATA.replace("  using: node20", "\u2028\u2028using: node20")],
@@ -741,8 +745,7 @@ test("Action metadata parser admits only the closed node20 JavaScript schema", (
 
 test("YAML alternate line breaks cannot create a parser-equivalent metadata override", () => {
   for (const separator of ["\u0085", "\u2028", "\u2029"]) {
-    const injected = ACTION_METADATA.replace(
-      "description: Reconcile trusted OpenAI Codex review evidence for one pull request.",
+    const injected = replaceRootActionDescription(
       `description: harmless${separator}runs:${separator}  using: composite${separator}  main: attacker.mjs`,
     );
     const lineFeedEquivalent = injected.replaceAll(separator, "\n");

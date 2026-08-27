@@ -15,9 +15,9 @@ import {
   V2_OUTPUT_KEYS,
   V2_REACTION_FETCH_CONCURRENCY,
   V2_RECOVERY_CODES,
+  V2_REQUIRED_CHECK_NAME,
   V2_STABILITY_INTERVAL_MS,
   V2_STABILITY_WINDOW_MS,
-  V2_STATUS_CONTEXT,
   V2_STICKY_MARKER,
   appendV2GateSummary,
   buildCanonicalV2ReviewRequestBody,
@@ -41,6 +41,7 @@ const REPO_ID = 424_242;
 const HEAD = "a".repeat(40);
 const NEXT_HEAD = "d".repeat(40);
 const BASE = "b".repeat(40);
+const TEST_MERGE = "e".repeat(40);
 const OLD_HEAD = "c".repeat(40);
 const CODEX_BOT = { login: "chatgpt-codex-connector[bot]", type: "Bot" };
 const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
@@ -93,6 +94,7 @@ test("normalizers, profiles, result vocabulary, and production constants are clo
     "retry_safe",
   ]);
   assert.deepEqual([...V2_RECOVERY_CODES].sort(), [
+    "create_verifier_run",
     "fix_findings",
     "none",
     "raise_protected_limit",
@@ -225,7 +227,7 @@ test("snapshot stability requires two adjacent complete fingerprints within one 
   assert.equal(unstable.loads, 3);
 });
 
-test("workflow_dispatch clean reconcile publishes exact outputs, status, summary, and sticky", async (context) => {
+test("pull_request verifier publishes exact outputs and succeeds only for stable clean evidence", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest()],
     reactionsByCommentId: new Map([["101", [reaction()]]]),
@@ -238,10 +240,7 @@ test("workflow_dispatch clean reconcile publishes exact outputs, status, summary
   assert.equal(result.report.gateOutcome, "success");
   assert.equal(result.report.recoveryCode, "none");
   assert.equal(result.report.retrySafe, false);
-  assert.deepEqual(github.statusWrites.map(({ state, sha }) => [state, sha]), [
-    ["pending", HEAD],
-    ["success", HEAD],
-  ]);
+  assert.deepEqual(github.statusWrites, []);
   assert.deepEqual(sleeps, [1]);
   assert.deepEqual(readOutputs(environment.GITHUB_OUTPUT), {
     execution_health: "healthy",
@@ -251,9 +250,8 @@ test("workflow_dispatch clean reconcile publishes exact outputs, status, summary
   });
   const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
   assert.match(summary, /0 unresolved, 0 resolved, 0 historical, 0 indeterminate/u);
-  assert.equal(github.stickyCreates.length, 1);
-  assert.doesNotMatch(github.stickyCreates[0], /@codex review/u);
-  assert.match(github.stickyCreates[0], new RegExp(V2_STICKY_MARKER, "u"));
+  assert.match(summary, new RegExp(TEST_MERGE, "u"));
+  assert.equal(github.stickyCreates.length, 0);
   const baseEpochCalls = github.calls.filter(({ path }) => path === "/graphql");
   assert.equal(baseEpochCalls.length, 4);
   for (const { body } of baseEpochCalls) {
@@ -280,12 +278,12 @@ test("the JavaScript Action reads INPUT_* values without composite env bridging"
     delete environment[internal];
   }
   const { result } = await runGate(environment, github);
-  assert.equal(result.exitCode, 0);
+  assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "wait_provider");
 });
 
-test("issue_comment created and edited require exact sender and author before runtime authority", async (context) => {
+test("issue_comment created and edited require exact sender and author before verifier rerun", async (context) => {
   for (const action of ["created", "edited"]) {
     const terminal = cleanIssueComment(HEAD, { id: action === "created" ? 201 : 202 });
     const github = createGitHubMock({
@@ -300,7 +298,11 @@ test("issue_comment created and edited require exact sender and author before ru
       event: issueCommentEvent(action, terminal),
     });
     const { result } = await runGate(environment, github);
-    assert.equal(result.report.gateOutcome, "success", action);
+    assert.equal(result.exitCode, 0, action);
+    assert.equal(result.report.executionHealth, "healthy", action);
+    assert.equal(result.report.gateOutcome, "pending", action);
+    assert.deepEqual(github.rerunRequests, ["7001"], action);
+    assert.equal(github.stickyCreates.length, 1, action);
   }
 
   const terminal = cleanIssueComment(HEAD);
@@ -318,6 +320,8 @@ test("issue_comment created and edited require exact sender and author before ru
   });
   assert.equal(result.exitCode, 1);
   assert.match(result.report.reason, /sender\/author contract/u);
+  assert.equal(result.report.recoveryCode, "unsupported_target");
+  assert.equal(result.report.retrySafe, false);
 });
 
 test("repository_dispatch is rejected before any GitHub API request", async (context) => {
@@ -331,11 +335,13 @@ test("repository_dispatch is rejected before any GitHub API request", async (con
   });
   assert.equal(result.exitCode, 1);
   assert.match(result.report.reason, /Unsupported v2 runtime event: repository_dispatch/u);
+  assert.equal(result.report.recoveryCode, "unsupported_target");
+  assert.equal(result.report.retrySafe, false);
 });
 
 test("invalid manual expected head is unhealthy/not_applicable and writes no status", async (context) => {
   const github = createGitHubMock({ pullRequestOverrides: { head: { sha: NEXT_HEAD } } });
-  const environment = runtimeEnvironment(context);
+  const environment = runtimeEnvironment(context, { eventName: "workflow_dispatch" });
   const { result } = await runGate(environment, github);
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.executionHealth, "unhealthy");
@@ -410,9 +416,7 @@ test("a head change after pending never retargets status or evidence", async (co
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "not_applicable");
   assert.equal(result.report.recoveryCode, "refresh_head");
-  assert.deepEqual(github.statusWrites.map(({ state, sha }) => [state, sha]), [
-    ["pending", HEAD],
-  ]);
+  assert.deepEqual(github.statusWrites, []);
   assert.equal(github.calls.some((call) => call.path.includes(NEXT_HEAD)), false);
   assert.deepEqual(github.stickyCreates, []);
   assert.deepEqual(github.stickyPatches, []);
@@ -472,6 +476,28 @@ test("reconcile pins the initial default branch and base ref across every snapsh
   assert.equal(renamedResult.report.gateOutcome, "pending");
   assert.equal(renamedResult.report.recoveryCode, "wait_then_reconcile");
   assert.equal(renamedTogether.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("reconcile pins head ref, head repository, and base SHA throughout a snapshot", async (context) => {
+  const evidence = [ordinaryRequest(), cleanIssueComment(HEAD)];
+  for (const [suffix, closingMutation] of [
+    ["head-ref-drift", { head: { ref: "renamed-feature" } }],
+    ["head-repository-drift", {
+      head: { repo: { id: 99, full_name: "owner/replacement" } },
+    }],
+    ["base-sha-drift", { base: { sha: "e".repeat(40) } }],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: evidence,
+      pullRequestSequence: [{}, {}, closingMutation],
+    });
+    const environment = runtimeEnvironment(context, { suffix });
+    const { result } = await runGate(environment, github, { stabilityWindowMs: 1 });
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
 });
 
 test("latest base-ref timeline epoch invalidates older positive evidence on the same head", async (context) => {
@@ -614,7 +640,124 @@ test("GraphQL base-epoch errors fail closed without publishing success", async (
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.executionHealth, "unhealthy");
   assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(result.report.retrySafe, false);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("semantic safe reads retry GraphQL and GET transport or decode failures", async (context) => {
+  const cases = [
+    {
+      suffix: "graphql-http-retry",
+      route: ({ method, path }) => method === "POST" && path === "/graphql",
+      firstResponse: () => jsonResponse({ message: "synthetic GraphQL retry" }, 502),
+    },
+    {
+      suffix: "graphql-transport-retry",
+      route: ({ method, path }) => method === "POST" && path === "/graphql",
+      firstResponse: () => { throw new Error("synthetic GraphQL transport failure"); },
+    },
+    {
+      suffix: "get-body-retry",
+      route: ({ method, path }) =>
+        method === "GET" && path === `/repos/${REPOSITORY}`,
+      firstResponse: () => failingBodyResponse("synthetic body stream failure"),
+    },
+    {
+      suffix: "get-non-json-retry",
+      route: ({ method, path }) =>
+        method === "GET" && path === `/repos/${REPOSITORY}`,
+      firstResponse: () => new Response("not json", { status: 200 }),
+    },
+  ];
+
+  for (const { suffix, route, firstResponse } of cases) {
+    let intercepted = false;
+    const github = createGitHubMock({
+      issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+      requestInterceptor: (request) => {
+        if (!intercepted && route(request)) {
+          intercepted = true;
+          return firstResponse();
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, { suffix });
+    const { result } = await runGate(environment, github);
+    assert.equal(intercepted, true, suffix);
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("safe-read exhaustion is retry-safe but deterministic schema and size failures are not", async (context) => {
+  const repositoryPath = `/repos/${REPOSITORY}`;
+  for (const status of [401, 403]) {
+    const github = createGitHubMock({
+      requestInterceptor: ({ method, path }) =>
+        method === "GET" && path === repositoryPath
+          ? jsonResponse({ message: "synthetic permission failure" }, status)
+          : undefined,
+    });
+    const environment = runtimeEnvironment(context, { suffix: `http-${status}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.report.recoveryCode, "repair_permissions", String(status));
+    assert.equal(result.report.retrySafe, false, String(status));
+    assert.equal(
+      github.calls.filter(({ method, path }) => method === "GET" && path === repositoryPath).length,
+      1,
+      String(status),
+    );
+  }
+
+  const exhausted = createGitHubMock({
+    requestInterceptor: ({ method, path }) =>
+      method === "GET" && path === repositoryPath
+        ? jsonResponse({ message: "synthetic transient failure" }, 502)
+        : undefined,
+  });
+  const exhaustedEnvironment = runtimeEnvironment(context, {
+    suffix: "safe-read-exhausted",
+  });
+  const { result: exhaustedResult } = await runGate(exhaustedEnvironment, exhausted);
+  assert.equal(exhaustedResult.report.recoveryCode, "retry_reconcile");
+  assert.equal(exhaustedResult.report.retrySafe, true);
+  assert.equal(
+    exhausted.calls.filter(({ method, path }) =>
+      method === "GET" && path === repositoryPath
+    ).length,
+    3,
+  );
+
+  for (const [suffix, response] of [
+    ["deterministic-schema", jsonResponse({ id: REPO_ID })],
+    ["deterministic-size", new Response("x".repeat(8 * 1024 * 1024 + 1), { status: 200 })],
+  ]) {
+    let used = false;
+    const github = createGitHubMock({
+      requestInterceptor: ({ method, path }) => {
+        if (!used && method === "GET" && path === repositoryPath) {
+          used = true;
+          return response;
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, { suffix });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.notEqual(result.report.recoveryCode, "retry_reconcile", suffix);
+    assert.equal(
+      github.calls.filter(({ method, path }) =>
+        method === "GET" && path === repositoryPath
+      ).length,
+      1,
+      suffix,
+    );
+  }
 });
 
 test("base-epoch GraphQL accepts unrelated timeline items with no filtered event", async (context) => {
@@ -647,42 +790,110 @@ test("base-epoch GraphQL accepts unrelated timeline items with no filtered event
   assert.equal(result.report.gateOutcome, "success");
 });
 
-test("pull_request_target base-ref edits immediately replace old success with pending", async (context) => {
-  const github = createGitHubMock();
-  const environment = runtimeEnvironment(context, {
-    suffix: "base-edit-trigger",
-    eventName: "pull_request_target",
-    expectedHeadSha: HEAD,
-    requestReview: "false",
-    requestCommentId: "",
-    event: baseChangeEvent(),
-  });
-  const { result } = await runGate(environment, github);
-  assert.equal(result.exitCode, 0);
-  assert.equal(result.report.executionHealth, "healthy");
-  assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "request_clean_generation");
-  assert.deepEqual(github.statusWrites.map(({ state, sha }) => [state, sha]), [
-    ["pending", HEAD],
-  ]);
-  assert.equal(github.calls.some(({ path }) => path === "/graphql"), false);
+test("pull_request verifier admits only the four canonical lifecycle actions", async (context) => {
+  for (const action of ["opened", "reopened", "synchronize", "ready_for_review"]) {
+    const github = createGitHubMock();
+    const environment = runtimeEnvironment(context, {
+      suffix: `pull-request-${action}`,
+      event: pullRequestEvent(action),
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.report.gateOutcome, "pending", action);
+    assert.equal(result.report.recoveryCode, "wait_provider", action);
+  }
 });
 
-test("non-base pull_request_target edits are rejected before GitHub API access", async (context) => {
+test("pull_request edited is rejected before GitHub API access", async (context) => {
   const environment = runtimeEnvironment(context, {
-    suffix: "non-base-edit-trigger",
-    eventName: "pull_request_target",
-    expectedHeadSha: HEAD,
-    requestReview: "false",
-    requestCommentId: "",
-    event: baseChangeEvent({ changes: { title: { from: "Old title" } } }),
+    suffix: "pull-request-edited",
+    event: pullRequestEvent("edited"),
   });
   const result = await runV2GateCli({
     environment,
     fetchImpl: async () => { throw new Error("fetch must not run"); },
   });
   assert.equal(result.exitCode, 1);
-  assert.match(result.report.reason, /base-ref-change contract/u);
+  assert.match(result.report.reason, /read-only verifier contract/u);
+});
+
+test("pull_request verifier rejects every tampered launch binding", async (context) => {
+  const cases = [
+    {
+      label: "github-sha",
+      mutateEnvironment: (environment) => { environment.GITHUB_SHA = NEXT_HEAD; },
+    },
+    {
+      label: "github-ref",
+      mutateEnvironment: (environment) => { environment.GITHUB_REF = "refs/heads/main"; },
+    },
+    {
+      label: "event-repository",
+      mutateEvent: (event) => { event.repository.full_name = "other/repository"; },
+    },
+    {
+      label: "event-head",
+      mutateEvent: (event) => { event.pull_request.head.sha = NEXT_HEAD; },
+    },
+    {
+      label: "event-base",
+      mutateEvent: (event) => { event.pull_request.base.sha = NEXT_HEAD; },
+    },
+    {
+      label: "operation",
+      mutateEnvironment: (environment) => { environment.OPERATION_INPUT = "begin-review"; },
+    },
+    {
+      label: "request-review",
+      mutateEnvironment: (environment) => { environment.REQUEST_REVIEW_INPUT = "true"; },
+    },
+    {
+      label: "request-comment",
+      mutateEnvironment: (environment) => { environment.REQUEST_COMMENT_ID = "123"; },
+    },
+  ];
+  for (const scenario of cases) {
+    const event = pullRequestEvent();
+    scenario.mutateEvent?.(event);
+    const environment = runtimeEnvironment(context, {
+      suffix: `pull-request-binding-${scenario.label}`,
+      event,
+    });
+    scenario.mutateEnvironment?.(environment);
+    const github = createGitHubMock();
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, scenario.label);
+    assert.notEqual(result.report.gateOutcome, "success", scenario.label);
+    assert.deepEqual(github.statusWrites, [], scenario.label);
+  }
+});
+
+test("pull_request verifier rejects a changed test-merge commit without retargeting", async (context) => {
+  const github = createGitHubMock({ pullRequestOverrides: { merge_commit_sha: NEXT_HEAD } });
+  const environment = runtimeEnvironment(context, { suffix: "test-merge-drift" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("test-merge drift between complete snapshots invalidates verifier success", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    pullRequestSequence: [
+      {},
+      {},
+      {},
+      { merge_commit_sha: NEXT_HEAD },
+    ],
+  });
+  const environment = runtimeEnvironment(context, { suffix: "test-merge-between-snapshots" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.deepEqual(github.statusWrites, []);
 });
 
 test("terminal clean without an authorized request generation cannot pass", async (context) => {
@@ -811,7 +1022,7 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
     suffix: "denied-request-refetch-budget",
   });
   const { result: deniedResult } = await runGate(deniedEnvironment, deniedGitHub);
-  assert.equal(deniedResult.exitCode, 0);
+  assert.equal(deniedResult.exitCode, 1);
   assert.equal(deniedResult.report.executionHealth, "healthy");
   assert.equal(deniedResult.report.gateOutcome, "pending");
   assert.equal(deniedGitHub.statusWrites.some(({ state }) => state === "success"), false);
@@ -819,8 +1030,8 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
     deniedGitHub.calls.filter(({ path }) =>
       path.includes(`/${READER.login}/`) && path.endsWith("/permission")
     ).length,
-    1,
-    "more than 61 requests from one denied login require one permission lookup",
+    2,
+    "opening and closing each cache more than 61 denied requests in one permission lookup",
   );
   for (const denied of deniedRequests) {
     assert.equal(
@@ -842,8 +1053,8 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
     deniedGitHub.calls.filter(({ path }) =>
       path === `/repos/${REPOSITORY}/issues/comments/${terminalClean.id}`
     ).length,
-    1,
-    "provider terminal evidence remains exact-refetched",
+    2,
+    "provider terminal evidence remains exact-refetched in opening and closing",
   );
 
   const canonical = workflowRequest({
@@ -875,7 +1086,7 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
     authoritativeEnvironment,
     authoritativeGitHub,
   );
-  assert.equal(authoritativeResult.exitCode, 0);
+  assert.equal(authoritativeResult.exitCode, 1);
   assert.equal(authoritativeResult.report.executionHealth, "healthy");
   assert.equal(authoritativeResult.report.gateOutcome, "pending");
 
@@ -884,16 +1095,16 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
   );
   assert.equal(
     permissionCalls.filter(({ path }) => path.includes(`/${HUMAN.login}/`)).length,
-    1,
-    "the authorized login is queried once in the completed pending snapshot",
+    2,
+    "the authorized login is queried once per opening and closing projection",
   );
   for (const expected of [canonical, authorizedOrdinary, providerProgress]) {
     assert.equal(
       authoritativeGitHub.calls.filter(({ path }) =>
         path === `/repos/${REPOSITORY}/issues/comments/${expected.id}`
       ).length,
-      1,
-      `authoritative comment ${expected.id} is exact-refetched in the completed snapshot`,
+      2,
+      `authoritative comment ${expected.id} is exact-refetched in opening and closing`,
     );
   }
 });
@@ -1008,7 +1219,8 @@ test("same-head finding remains blocking after clean from the same generation", 
     historical: 0,
     indeterminate: 0,
   });
-  assert.equal(github.statusWrites.at(-1).state, "failure");
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(github.statusWrites, []);
 });
 
 test("finding supersession requires a strictly newer authorized generation and later head-bound clean", async (context) => {
@@ -1321,6 +1533,62 @@ test("exact-refetch drift and continuously changing clean snapshots remain unhea
   assert.equal(changingGitHub.statusWrites.some(({ state }) => state === "success"), false);
 });
 
+test("snapshot closing reread catches late reviews, reactions, and provider edits", async (context) => {
+  const request = ordinaryRequest();
+  const clean = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const cases = [
+    {
+      suffix: "closing-late-finding-review",
+      github: createGitHubMock({
+        issueComments: [request, clean],
+        reviewSnapshots: [[], [findingReview(HEAD, {
+          submitted_at: "2026-08-25T08:03:00Z",
+        })]],
+      }),
+    },
+    {
+      suffix: "closing-later-eyes",
+      github: createGitHubMock({
+        issueComments: [request, clean],
+        reactionSnapshotsByCommentId: new Map([[String(request.id), [[], [reaction({
+          content: "eyes",
+          created_at: "2026-08-25T08:03:00Z",
+        })]]]]),
+      }),
+    },
+    {
+      suffix: "closing-provider-comment-edit",
+      github: createGitHubMock({
+        issueCommentSnapshots: [
+          [request, clean],
+          [request, {
+            ...clean,
+            body: `${clean.body}\n\nLate provider edit`,
+            updated_at: "2026-08-25T08:03:00Z",
+          }],
+        ],
+      }),
+    },
+  ];
+
+  for (const { suffix, github } of cases) {
+    const environment = runtimeEnvironment(context, { suffix });
+    const { result } = await runGate(environment, github, { stabilityWindowMs: 1 });
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
 test("fixed default and expanded profiles fail closed at aggregate snapshot caps", async (context) => {
   const defaultComments = Array.from({ length: 2_100 }, (_, index) =>
     genericComment(index + 1));
@@ -1438,16 +1706,149 @@ for (const postUnknownReread of ["hidden", "failure"]) {
     assert.equal(result.report.recoveryCode, "retry_begin");
     assert.equal(result.report.retrySafe, false);
     assert.equal(github.requestBodies.length, 1);
-    assert.deepEqual(
-      github.statusWrites.map(({ state, sha }) => [state, sha]),
-      [["pending", HEAD]],
-    );
+    assert.deepEqual(github.statusWrites, []);
     const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
     assert.match(summary, /Wait for the exact same-run request marker to settle/u);
     assert.match(summary, /rerun the original workflow run/u);
     assert.doesNotMatch(summary, /Retry the identical begin-review invocation/u);
   });
 }
+
+test("begin-review pre-POST safe-read exhaustion is a safe retry of begin", async (context) => {
+  let commentReads = 0;
+  const github = createGitHubMock({
+    requestInterceptor: ({ method, path }) => {
+      if (
+        method === "GET" &&
+        path === `/repos/${REPOSITORY}/issues/${PR}/comments`
+      ) {
+        commentReads += 1;
+        if (commentReads <= 3) {
+          return jsonResponse({ message: "synthetic pre-POST read failure" }, 502);
+        }
+      }
+      return undefined;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "begin-pre-post-safe-read-exhausted",
+    operation: "begin-review",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "retry_begin");
+  assert.equal(result.report.retrySafe, true);
+  assert.equal(github.requestBodies.length, 0);
+  assert.equal(github.stickyCreates.length, 1);
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  for (const diagnostic of [summary, github.stickyCreates[0]]) {
+    assert.match(diagnostic, /Retry the identical exact-head begin-review invocation/u);
+    assert.doesNotMatch(diagnostic, /Wait for the exact same-run request marker/u);
+  }
+});
+
+test("begin-review keeps every post-attempt verification failure retry-unsafe", async (context) => {
+  const pullRequestPath = `/repos/${REPOSITORY}/pulls/${PR}`;
+  const cases = [
+    {
+      suffix: "begin-unknown-scope-read-failure",
+      options: (() => {
+        let pullRequestReads = 0;
+        return {
+          postUnknownAfterCreate: true,
+          requestInterceptor: ({ method, path }) => {
+            if (method === "GET" && path === pullRequestPath) {
+              pullRequestReads += 1;
+              if (pullRequestReads >= 3) {
+                return jsonResponse({ message: "synthetic final scope failure" }, 502);
+              }
+            }
+            return undefined;
+          },
+        };
+      })(),
+    },
+    {
+      suffix: "begin-created-exact-refetch-failure",
+      options: {
+        requestInterceptor: ({ method, path }) => {
+          if (
+            method === "GET" &&
+            /^\/repos\/owner\/repo\/issues\/comments\/10000$/u.test(path)
+          ) {
+            return jsonResponse({ message: "synthetic exact refetch failure" }, 502);
+          }
+          return undefined;
+        },
+      },
+    },
+    {
+      suffix: "begin-created-exact-refetch-403",
+      options: {
+        requestInterceptor: ({ method, path }) => {
+          if (
+            method === "GET" &&
+            /^\/repos\/owner\/repo\/issues\/comments\/10000$/u.test(path)
+          ) {
+            return jsonResponse({ message: "synthetic exact refetch denial" }, 403);
+          }
+          return undefined;
+        },
+      },
+    },
+    {
+      suffix: "begin-created-final-scope-failure",
+      options: (() => {
+        let pullRequestReads = 0;
+        return {
+          requestInterceptor: ({ method, path }) => {
+            if (method === "GET" && path === pullRequestPath) {
+              pullRequestReads += 1;
+              if (pullRequestReads >= 3) {
+                return jsonResponse({ message: "synthetic final scope failure" }, 502);
+              }
+            }
+            return undefined;
+          },
+        };
+      })(),
+    },
+    {
+      suffix: "begin-created-final-scope-403",
+      options: (() => {
+        let pullRequestReads = 0;
+        return {
+          requestInterceptor: ({ method, path }) => {
+            if (method === "GET" && path === pullRequestPath) {
+              pullRequestReads += 1;
+              if (pullRequestReads >= 3) {
+                return jsonResponse({ message: "synthetic final scope denial" }, 403);
+              }
+            }
+            return undefined;
+          },
+        };
+      })(),
+    },
+  ];
+
+  for (const { suffix, options } of cases) {
+    const github = createGitHubMock(options);
+    const environment = runtimeEnvironment(context, {
+      suffix,
+      operation: "begin-review",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "retry_begin", suffix);
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.equal(github.requestBodies.length, 1, suffix);
+  }
+});
 
 test("begin-review terminal paths reread exact PR scope and never add stale diagnostics", async (context) => {
   const existingGitHub = createGitHubMock({
@@ -1492,30 +1893,167 @@ test("begin-review terminal paths reread exact PR scope and never add stale diag
   assert.deepEqual(unknownGitHub.stickyPatches, []);
 });
 
-test("failure and success projection failures preserve the closed result matrix", async (context) => {
-  const findingGitHub = createGitHubMock({
-    issueComments: [ordinaryRequest()],
-    reviews: [findingReview()],
-    statusFailureStates: new Set(["failure"]),
+test("healthy findings block the native verifier without any status projection", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), findingIssueComment(HEAD)],
   });
-  const findingEnvironment = runtimeEnvironment(context, { suffix: "failure-projection" });
-  const { result: findingResult } = await runGate(findingEnvironment, findingGitHub);
-  assert.equal(findingResult.exitCode, 1);
-  assert.equal(findingResult.report.executionHealth, "unhealthy");
-  assert.equal(findingResult.report.gateOutcome, "failure");
-  assert.equal(findingResult.report.recoveryCode, "repair_permissions");
+  const environment = runtimeEnvironment(context, { suffix: "native-finding" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.deepEqual(github.statusWrites, []);
+  assert.equal(github.calls.some(({ path }) => path.includes("/statuses/")), false);
+});
 
-  const cleanGitHub = createGitHubMock({
-    issueComments: [workflowRequest()],
-    reactionsByCommentId: new Map([["101", [reaction()]]]),
-    statusFailureStates: new Set(["success"]),
+test("manual controller reruns exact attempt A+1 and reads back one canonical CheckRun", async (context) => {
+  const github = createGitHubMock();
+  const environment = runtimeEnvironment(context, {
+    suffix: "manual-controller-rerun",
+    eventName: "workflow_dispatch",
   });
-  const cleanEnvironment = runtimeEnvironment(context, { suffix: "success-projection" });
-  const { result: cleanResult } = await runGate(cleanEnvironment, cleanGitHub);
-  assert.equal(cleanResult.exitCode, 1);
-  assert.equal(cleanResult.report.executionHealth, "unhealthy");
-  assert.equal(cleanResult.report.gateOutcome, "unknown");
-  assert.equal(cleanResult.report.recoveryCode, "repair_permissions");
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.deepEqual(github.rerunRequests, ["7001"]);
+  assert.equal(
+    github.calls.some(({ path }) =>
+      path === `/repos/${REPOSITORY}/actions/runs/7001/attempts/2/jobs`
+    ),
+    true,
+  );
+  assert.equal(
+    github.calls.some(({ path }) => path === `/repos/${REPOSITORY}/check-runs/9001`),
+    true,
+  );
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("controller reports create_verifier_run when the current test-merge has no verifier", async (context) => {
+  const github = createGitHubMock({ verifierRuns: [] });
+  const environment = runtimeEnvironment(context, {
+    suffix: "missing-verifier",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "create_verifier_run");
+  assert.equal(result.report.retrySafe, false);
+  assert.deepEqual(github.rerunRequests, []);
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /convert a ready PR to draft and mark it ready again/iu);
+});
+
+test("an unobservable verifier rerun remains fail-closed and is never posted twice", async (context) => {
+  const github = createGitHubMock({ verifierRerunAdvances: false });
+  const environment = runtimeEnvironment(context, {
+    suffix: "unobservable-rerun",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(result.report.retrySafe, false);
+  assert.deepEqual(github.rerunRequests, ["7001"]);
+});
+
+test("controller accepts either documented associated SHA domain and a ref-qualified workflow path", async (context) => {
+  const github = createGitHubMock({
+    verifierRuns: [verifierRun({
+      head_sha: HEAD,
+      path: `.github/workflows/codex-review-gate.yml@refs/pull/${PR}/merge`,
+    })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "head-associated-verifier-run",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(github.rerunRequests, ["7001"]);
+});
+
+test("controller never reruns an active verifier baseline", async (context) => {
+  const github = createGitHubMock({
+    verifierRuns: [verifierRun({ status: "in_progress", conclusion: null })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "active-verifier-baseline",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("controller adopts an ambiguous rerun POST only after exact A+1 readback", async (context) => {
+  const github = createGitHubMock({ verifierRerunStatus: 500 });
+  const environment = runtimeEnvironment(context, {
+    suffix: "ambiguous-rerun-observed",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.deepEqual(github.rerunRequests, ["7001"]);
+});
+
+test("controller rejects an A+2 jump as a competing rerun", async (context) => {
+  const github = createGitHubMock({ verifierRerunAttemptDelta: 2 });
+  const environment = runtimeEnvironment(context, {
+    suffix: "competing-rerun-jump",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.retrySafe, false);
+  assert.match(result.report.reason, /competing rerun/iu);
+  assert.deepEqual(github.rerunRequests, ["7001"]);
+});
+
+test("controller requires one canonical job and the GitHub Actions CheckRun source", async (context) => {
+  for (const fixture of ["duplicate-job", "wrong-check-source"]) {
+    const github = createGitHubMock({
+      requestInterceptor: ({ method, path }) => {
+        if (
+          fixture === "duplicate-job" &&
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/actions/runs/7001/attempts/2/jobs`
+        ) {
+          return jsonResponse({
+            total_count: 2,
+            jobs: [verifierJob(), verifierJob({ id: 8002 })],
+          });
+        }
+        if (
+          fixture === "wrong-check-source" &&
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/check-runs/9001`
+        ) {
+          return jsonResponse(verifierCheckRun({ app: { id: 1, slug: "other" } }));
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: fixture,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, fixture);
+    assert.equal(result.report.executionHealth, "unhealthy", fixture);
+    assert.equal(result.report.gateOutcome, "pending", fixture);
+    assert.deepEqual(github.rerunRequests, ["7001"], fixture);
+  }
 });
 
 test("sticky diagnostics update the lowest-id duplicate and emit one bounded warning", async (context) => {
@@ -1528,7 +2066,10 @@ test("sticky diagnostics update the lowest-id duplicate and emit one bounded war
   const github = createGitHubMock({
     issueComments: [workflowRequest(), higherIdButOlder, lowerIdButNewer],
   });
-  const environment = runtimeEnvironment(context);
+  const environment = runtimeEnvironment(context, {
+    suffix: "sticky-controller",
+    eventName: "workflow_dispatch",
+  });
   const warnings = [];
   const originalWarn = console.warn;
   console.warn = (...values) => { warnings.push(values.join(" ")); };
@@ -1574,7 +2115,7 @@ test("summary and sticky diagnostics are bounded Markdown, HTML, and mention saf
   }
 });
 
-test("untrusted finding excerpts cannot inject review requests, Markdown, or HTML markers", async (context) => {
+test("untrusted finding excerpts cannot inject review requests, Markdown, or HTML into verifier summary", async (context) => {
   const injectedPath = encodeURIComponent(
     "<script>@codex review</script><!-- codex-review-gate:v2:diagnostic -->[link](x)",
   ).replace(/[!'()*]/gu, (character) =>
@@ -1591,19 +2132,12 @@ test("untrusted finding excerpts cannot inject review requests, Markdown, or HTM
   const environment = runtimeEnvironment(context, { suffix: "finding-injection" });
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "failure");
-  assert.equal(github.stickyCreates.length, 1);
+  assert.equal(github.stickyCreates.length, 0);
   const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
-  const sticky = github.stickyCreates[0];
-  for (const diagnostic of [summary, sticky]) {
-    assert.doesNotMatch(diagnostic, /@codex review/iu);
-    assert.doesNotMatch(diagnostic, /<script>|<\/script>|\[link\]\(x\)/iu);
-    assert.match(diagnostic, /&lt;script&gt;&#64;codex review&lt;\/script&gt;/u);
-    assert.equal(diagnostic.length < 5_000, true);
-  }
-  assert.equal(
-    sticky.split(`<!-- ${V2_STICKY_MARKER} -->`).length - 1,
-    1,
-  );
+  assert.doesNotMatch(summary, /@codex review/iu);
+  assert.doesNotMatch(summary, /<script>|<\/script>|\[link\]\(x\)/iu);
+  assert.match(summary, /&lt;script&gt;&#64;codex review&lt;\/script&gt;/u);
+  assert.equal(summary.length < 5_000, true);
 });
 
 test("invalid configuration still emits exactly the public unhealthy output schema", async (context) => {
@@ -1615,6 +2149,8 @@ test("invalid configuration still emits exactly the public unhealthy output sche
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.executionHealth, "unhealthy");
   assert.equal(result.report.gateOutcome, "unknown");
+  assert.equal(result.report.recoveryCode, "unsupported_target");
+  assert.equal(result.report.retrySafe, false);
   assert.deepEqual(Object.keys(readOutputs(environment.GITHUB_OUTPUT)), V2_OUTPUT_KEYS);
 });
 
@@ -1795,15 +2331,20 @@ function issueCommentEvent(action, comment, overrides = {}) {
   };
 }
 
-function baseChangeEvent(overrides = {}) {
+function pullRequestEvent(action = "synchronize", overrides = {}) {
   return {
-    action: "edited",
+    action,
     number: PR,
-    changes: { base: { ref: { from: "release" } } },
     pull_request: {
       number: PR,
-      head: { sha: HEAD },
+      merge_commit_sha: TEST_MERGE,
+      head: {
+        sha: HEAD,
+        ref: "feature",
+        repo: { id: REPO_ID, full_name: REPOSITORY },
+      },
       base: {
+        sha: BASE,
         ref: "main",
         repo: { id: REPO_ID, full_name: REPOSITORY },
       },
@@ -1818,14 +2359,61 @@ function baseChangeEvent(overrides = {}) {
   };
 }
 
+function verifierRun(overrides = {}) {
+  return {
+    id: 7001,
+    run_number: 41,
+    run_attempt: 1,
+    event: "pull_request",
+    path: ".github/workflows/codex-review-gate.yml",
+    head_sha: TEST_MERGE,
+    head_branch: "feature",
+    status: "completed",
+    conclusion: "failure",
+    html_url: `https://github.com/${REPOSITORY}/actions/runs/7001`,
+    pull_requests: [{
+      number: PR,
+      head: { sha: HEAD },
+      base: { sha: BASE },
+    }],
+    ...overrides,
+  };
+}
+
+function verifierJob({ runId = 7001, runAttempt = 2, status = "queued", ...overrides } = {}) {
+  return {
+    id: 8001,
+    run_id: runId,
+    run_attempt: runAttempt,
+    name: V2_REQUIRED_CHECK_NAME,
+    head_sha: TEST_MERGE,
+    status,
+    conclusion: null,
+    check_run_url: `https://api.github.com/repos/${REPOSITORY}/check-runs/9001`,
+    ...overrides,
+  };
+}
+
+function verifierCheckRun({ status = "queued", ...overrides } = {}) {
+  return {
+    id: 9001,
+    name: V2_REQUIRED_CHECK_NAME,
+    head_sha: TEST_MERGE,
+    status,
+    conclusion: null,
+    app: { id: 15_368, slug: "github-actions" },
+    ...overrides,
+  };
+}
+
 function runtimeEnvironment(context, {
   suffix = "default",
   operation = "reconcile",
-  requestReview = "true",
+  requestReview = operation === "begin-review" ? "true" : "false",
   requestCommentId = "",
   limitsProfile = "default",
   expectedHeadSha = HEAD,
-  eventName = "workflow_dispatch",
+  eventName = operation === "begin-review" ? "workflow_dispatch" : "pull_request",
   event = null,
   serverUrl = "https://github.com",
 } = {}) {
@@ -1845,6 +2433,10 @@ function runtimeEnvironment(context, {
       : `${serverUrl}/api/v3`,
     GITHUB_SERVER_URL: serverUrl,
     GITHUB_RUN_ID: "123",
+    GITHUB_SHA: eventName === "pull_request" ? TEST_MERGE : BASE,
+    GITHUB_REF: eventName === "pull_request"
+      ? `refs/pull/${PR}/merge`
+      : "refs/heads/main",
     GITHUB_REF_TYPE: "branch",
     GITHUB_REF_NAME: "main",
     RUNNER_OS: "Linux",
@@ -1856,18 +2448,19 @@ function runtimeEnvironment(context, {
   };
   writeFileSync(
     environment.GITHUB_EVENT_PATH,
-    `${JSON.stringify(event || {
-      ref: "refs/heads/main",
-      repository: { full_name: REPOSITORY, default_branch: "main" },
-      inputs: {
-        operation,
-        pr_number: String(PR),
-        expected_head_sha: expectedHeadSha,
-        request_comment_id: requestCommentId,
-        request_review: String(requestReview).toLowerCase() !== "false",
-        limits_profile: limitsProfile,
-      },
-    })}\n`,
+    `${JSON.stringify(event || (eventName === "pull_request"
+      ? pullRequestEvent()
+      : {
+          ref: "refs/heads/main",
+          repository: { full_name: REPOSITORY, default_branch: "main" },
+          inputs: {
+            operation,
+            pr_number: String(PR),
+            expected_head_sha: expectedHeadSha,
+            request_comment_id: requestCommentId,
+            request_review: String(requestReview).toLowerCase() !== "false",
+          },
+        }))}\n`,
     "utf8",
   );
   return environment;
@@ -1911,6 +2504,7 @@ function createGitHubMock({
   reviews = [],
   reviewSnapshots = null,
   reactionsByCommentId = new Map(),
+  reactionSnapshotsByCommentId = new Map(),
   pullRequestOverrides = {},
   pullRequestSequence = null,
   repositoryOverrides = {},
@@ -1923,10 +2517,14 @@ function createGitHubMock({
   commitResolution = null,
   commentRefetchMutator = null,
   reviewRefetchMutator = null,
-  statusFailureStates = new Set(),
-  statusAckMutator = null,
   postUnknownAfterCreate = false,
   postUnknownReread = "visible",
+  verifierRuns = [verifierRun()],
+  verifierAttemptStatus = "queued",
+  verifierRerunAdvances = true,
+  verifierRerunAttemptDelta = 1,
+  verifierRerunStatus = 201,
+  requestInterceptor = null,
 } = {}) {
   const comments = issueComments.map((value) => structuredClone(value));
   const commentSnapshots = issueCommentSnapshots?.map((snapshotComments) =>
@@ -1936,20 +2534,22 @@ function createGitHubMock({
     snapshotReviews.map((value) => structuredClone(value))) || null;
   const calls = [];
   const statusWrites = [];
-  const statusAttempts = [];
   const requestBodies = [];
   const stickyCreates = [];
   const stickyPatches = [];
+  const rerunRequests = [];
   let nextCommentId = 10_000;
   let commentSnapshotIndex = 0;
   let reviewSnapshotIndex = 0;
   let pullRequestIndex = 0;
   let repositoryIndex = 0;
   let baseEpochIndex = 0;
+  const reactionSnapshotIndexes = new Map();
   let activeComments = comments;
   let activeReviews = reviewList;
   let unknownPostUsed = false;
   let unknownPostCommentId = "";
+  let rerunRequested = false;
 
   function currentComments() {
     if (!commentSnapshots) return comments;
@@ -1970,6 +2570,7 @@ function createGitHubMock({
     const baseOverride = { ...(pullRequestOverrides.base || {}), ...(sequence.base || {}) };
     const value = {
       number: PR,
+      merge_commit_sha: TEST_MERGE,
       state: "open",
       draft: false,
       merged: false,
@@ -2043,12 +2644,69 @@ function createGitHubMock({
     const method = options.method || "GET";
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ method, path, search: url.search, body });
+    if (typeof requestInterceptor === "function") {
+      const intercepted = await requestInterceptor({
+        method,
+        path,
+        body,
+        url,
+        calls: [...calls],
+      });
+      if (intercepted !== undefined) return intercepted;
+    }
 
     if (method === "GET" && path === `/repos/${REPOSITORY}`) {
       return jsonResponse(repository());
     }
     if (method === "GET" && path === `/repos/${REPOSITORY}/pulls/${PR}`) {
       return jsonResponse(pullRequest());
+    }
+    if (
+      method === "GET" &&
+      path === `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`
+    ) {
+      return jsonResponse({
+        total_count: verifierRuns.length,
+        workflow_runs: verifierRuns.map((run) => structuredClone(run)),
+      });
+    }
+    const exactRun = /^\/repos\/owner\/repo\/actions\/runs\/(\d+)$/u.exec(path);
+    if (method === "GET" && exactRun) {
+      const run = verifierRuns.find((value) => String(value.id) === exactRun[1]);
+      if (!run) return jsonResponse({ message: "not found" }, 404);
+      return jsonResponse({
+        ...structuredClone(run),
+        run_attempt: rerunRequested && verifierRerunAdvances
+          ? run.run_attempt + verifierRerunAttemptDelta
+          : run.run_attempt,
+        status: rerunRequested && verifierRerunAdvances
+          ? verifierAttemptStatus
+          : run.status,
+      });
+    }
+    const rerun = /^\/repos\/owner\/repo\/actions\/runs\/(\d+)\/rerun$/u.exec(path);
+    if (method === "POST" && rerun) {
+      rerunRequests.push(rerun[1]);
+      rerunRequested = true;
+      return verifierRerunStatus === 201
+        ? new Response(null, { status: 201 })
+        : jsonResponse({ message: "synthetic rerun failure" }, verifierRerunStatus);
+    }
+    const attemptJobs =
+      /^\/repos\/owner\/repo\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs$/u.exec(path);
+    if (method === "GET" && attemptJobs) {
+      const run = verifierRuns.find((value) => String(value.id) === attemptJobs[1]);
+      if (!run) return jsonResponse({ message: "not found" }, 404);
+      const attempt = Number(attemptJobs[2]);
+      const job = verifierJob({
+        runId: run.id,
+        runAttempt: attempt,
+        status: verifierAttemptStatus,
+      });
+      return jsonResponse({ total_count: 1, jobs: [job] });
+    }
+    if (method === "GET" && path === `/repos/${REPOSITORY}/check-runs/9001`) {
+      return jsonResponse(verifierCheckRun({ status: verifierAttemptStatus }));
     }
     if (method === "POST" && path === "/graphql") {
       const selected = baseEpochSequence
@@ -2109,7 +2767,16 @@ function createGitHubMock({
       path,
     );
     if (method === "GET" && reactions) {
-      return paginatedResponse(reactionsByCommentId.get(reactions[1]) || [], url).response;
+      const snapshots = reactionSnapshotsByCommentId.get(reactions[1]);
+      const snapshotIndex = reactionSnapshotIndexes.get(reactions[1]) || 0;
+      const values = snapshots
+        ? snapshots[Math.min(snapshotIndex, snapshots.length - 1)] || []
+        : reactionsByCommentId.get(reactions[1]) || [];
+      const response = paginatedResponse(values, url);
+      if (snapshots && !response.hasNext) {
+        reactionSnapshotIndexes.set(reactions[1], snapshotIndex + 1);
+      }
+      return response.response;
     }
 
     const permission = /^\/repos\/owner\/repo\/collaborators\/([^/]+)\/permission$/u.exec(
@@ -2170,20 +2837,6 @@ function createGitHubMock({
       return jsonResponse(target);
     }
 
-    const status = /^\/repos\/owner\/repo\/statuses\/([0-9a-f]{40})$/u.exec(path);
-    if (method === "POST" && status) {
-      const attempted = { ...body, sha: status[1] };
-      statusAttempts.push(attempted);
-      if (statusFailureStates.has(attempted.state)) {
-        return jsonResponse({ message: `synthetic ${attempted.state} failure` }, 500);
-      }
-      statusWrites.push(attempted);
-      const acknowledged = typeof statusAckMutator === "function"
-        ? statusAckMutator(structuredClone(attempted))
-        : attempted;
-      return jsonResponse(acknowledged, 201);
-    }
-
     return jsonResponse({ message: `unexpected ${method} ${path}` }, 404);
   };
 
@@ -2191,10 +2844,10 @@ function createGitHubMock({
     fetch,
     calls,
     statusWrites,
-    statusAttempts,
     requestBodies,
     stickyCreates,
     stickyPatches,
+    rerunRequests,
   };
 }
 
@@ -2262,4 +2915,12 @@ function jsonResponse(data, status = 200, headers = {}) {
     status,
     headers: { "content-type": "application/json", ...headers },
   });
+}
+
+function failingBodyResponse(message, status = 200) {
+  return new Response(new ReadableStream({
+    pull(controller) {
+      controller.error(new Error(message));
+    },
+  }), { status });
 }

@@ -78,12 +78,12 @@ Publisher 在任何写入前都会用 release policy 和当前 remote state 验�
 | `candidate-a` | 无特权 | 在 clean runner 独立 materialize 并测试 candidate A，记录 tree、inventory、modes、sizes 与 SHA-256 digests。 |
 | `candidate-b` | 无特权 | 在另一个 clean runner 独立 materialize 并测试 candidate B。 |
 | `assemble` | 无特权 | 要求两份 candidates byte-identical，并产出 canonical candidate bundle。 |
-| `admission` | 无特权 | 批准前重建并验证 publication plan 与 candidate，不上传任何 privileged material。 |
+| `publication-plan` | 无特权 | 批准前重建并验证 publication plan 与 candidate，不上传任何 privileged material。 |
 | `publish` | 有特权 | Environment 人工批准后重新验证全部状态并执行 signed remote publication。 |
 | `verify` | 无特权 | 重新读取公开 refs 与 Release state，并报告观察结果。 |
 
-无特权 `plan`、`candidate-a`、`candidate-b`、`assemble`、`admission` 与 `verify`
-jobs 使用 `ubuntu-slim`，timeout 为 14 分钟；privileged `publish` job 使用
+无特权 `plan`、`candidate-a`、`candidate-b`、`assemble`、`publication-plan` 与
+`verify` jobs 使用 `ubuntu-slim`，timeout 为 14 分钟；privileged `publish` job 使用
 `ubuntu-24.04`，timeout 为 30 分钟。
 
 只有 `publish` 绑定 `marketplace-production` Environment。尽管保留了历史名称，它
@@ -96,11 +96,14 @@ approval 最多 pending 30 天。在批准前：
 - 任何 job 都不能写 target repository 或 GitHub Release；
 - candidate artifact 不含 credential 或 signing-key material。
 
-Artifacts 只是 jobs 之间的 transport，不是 ledger，也不是权威发布证据。
-`plan`、`candidate-a`、`candidate-b` 与 `admission` artifacts 保留 1 天；assembled
-canonical candidate 保留 35 天。Artifact display name 包含 workflow run ID 与
-attempt；consumer 绑定 server-returned artifact ID 和经过验证的 exact basename，
-而不是信任 display name。权威状态仍是 committed manifest 与重新读取的 Git/Release
+Artifacts 只是 jobs 之间的 transport，不是 ledger，也不是权威发布证据。`plan`
+artifact 与 candidate A/B artifacts（`candidate-a` 和 `candidate-b`）保留 1 天。
+Assembled canonical candidate 与 publication plan artifacts 各保留 35 天，覆盖
+Environment 最长 30 天的 approval wait。它们是 `publish` 需要的两份 frozen
+inputs。`publication-plan` stage 会生成这份 plan；不存在单独名为或被分类为
+admission artifact 的 artifact。Artifact display name 包含 workflow run ID 与
+attempt；consumer 绑定 server-returned artifact ID 和经过验证的 exact basename，而
+不是信任 display name。权威状态仍是 committed manifest 与重新读取的 Git/Release
 state。
 
 等待 Required reviewer 批准期间，GitHub 不会为受保护 job 分配 runner，该等待也不
@@ -309,8 +312,11 @@ provenance。
 
 `verify` 不绑定 Environment，也没有 publisher/signing secrets。它会
 重新公开读取 target `master`、immutable tag/peeled commit、signatures、Release
-immutability/assets，以及 stable release 的 floating alias。Actions summary 必须
-列出 observed state，并为每个未完成步骤给出 exact recovery action。
+immutability/assets，以及 stable release 的 floating alias。Actions summary 必须列出
+observed state 和一个 closed recovery result：verification 完成时为
+`recovery_code=none`；任一 required state 不完整、冲突或无法证明时，则为一个
+supported non-success recovery code 及其 exact next action。Summary 不得遗漏 recovery
+result，也不得改用开放式的“自行猜测如何修复”指示。
 
 每个 full SemVer（包括每个 prerelease、minor 与 patch version）都获得 immutable full
 tag 与 immutable GitHub Release。Marketplace 是完全独立的 manual out-of-band
@@ -329,8 +335,40 @@ commit，且 immutable Release/provenance 必须匹配。对于每个 major 的�
 release，独立 Marketplace UI 操作可以在 publisher success 之后完成；它既不是
 machine read-back evidence，也不是 publisher admission condition。专用 immutable-tag
 与 floating-alias canary jobs 已延期，不属于 v2.0
-publication 或 rollout gates。Prerelease 可以通过 immutable full tag 发布和测试，
-但它不是 production selector，也不移动 `v2`。
+publication 或 rollout gates。下文的 manual default-branch RC admission bridge 复用现有
+consumer workflows，不是这些已延期的 dedicated canary jobs。Prerelease 永远不是
+production selector，也不移动 `v2`。
+
+### Stable v2.0 RC admission bridge
+
+发布 stable `v2.0.0` 前，必须先发布一个 immutable `v2.0.0-rc.N` full tag，
+并在指定 test consumer repository 中证明一次完整 live gate loop。不得修改
+production bootstrap `@v2` templates 及其 normal floating selectors；应使用以下经
+owner-reviewed 的短期 default-branch bridge：
+
+该 bridge 必须手工准备；不得给 production bootstrap 增加 RC override，也不得为这个
+临时 admission exercise 启用 production v2 ruleset。两次短期 default-branch change
+由 test repository 已有保护与 required owner review 约束。
+
+1. 在指定 test consumer 中打开一个 selector-only PR，只把已安装的两份 canonical
+   workflows（verifier 与 controller）中的 Action selectors 从 `@v2` 替换为 exact
+   immutable `@v2.0.0-rc.N`。由 repository owner review，然后合入受保护的 default
+   branch。
+2. 从已更新的 default branch 创建一个独立 harmless test PR；对其 exact head 跑完
+   normal `begin-review` 和 `reconcile` path，包括 required Codex evidence 与 final gate
+   result。
+3. 记录 harmless test PR 的 exact head、controller 与 verifier run IDs 或 URLs，以及
+   resolved tag `v2.0.0-rc.N`。Live gate 成功后，关闭该 harmless test PR，不要合并。
+4. 打开并合并一个 forward PR，移除临时 bridge，并恢复两份 default-branch
+   workflows 的 exact pre-bridge bytes。若原状态包含 canonical production verifier 与
+   controller，两者 selectors 都恢复为 `@v2`；否则删除 temporary RC workflows，不得
+   把 immutable RC selector 留在默认分支。
+
+PR-local wrapper 不合格：trusted verifier 与 controller（包括 controller 的 manual
+dispatch contract）从 default branch 加载。Non-default dispatch 同样不受支持，也不产生
+admission evidence。这个临时合入的 selector bridge 是对现有 consumer contract 的
+manual use，不是 publisher-integrated immutable-tag canary、floating-alias canary、
+dedicated canary job 或 canary orchestrator。
 
 ## Reconcile、retry 与 cancellation
 
@@ -397,10 +435,14 @@ publisher、两次 deterministic candidate builds、一个受保护 publication 
 floating-alias canary jobs，以及独立 canary orchestrator 引入 release
 prerequisites。
 
-Stable `v2.0.0` admission 还要求先发布 `v2.0.0-rc.N`，并在一个真实 consumer
-repository 的临时 PR 上跑通完整 live gate loop。RC 只使用 immutable full tag，不
-推进 `v2`。普通 post-installation `@v2` consumer canary 与 publisher 分离，成功后
-关闭且不合并。
+Stable `v2.0.0` admission 还要求先发布 `v2.0.0-rc.N`，并在指定 test
+consumer repository 中执行上文 default-branch RC admission bridge。RC 只使用
+immutable full tag，不推进 `v2`。Selector-only bridge PR 需临时合入，使两份 trusted
+default-branch workflows 都能解析 RC；独立 harmless test PR 在成功后关闭且不合并，
+然后用 forward PR 恢复两份 workflows 的 exact pre-bridge bytes：只有原本就有
+canonical production verifier 与 controller 时，两者 selectors 才都恢复为 `@v2`；
+否则删除 temporary RC workflows。普通 post-installation `@v2` consumer canary 仍与
+publisher 分离。
 
 以下事项明确延期，不得将其表述为已经完成，也不得静默升级为当前合约：
 

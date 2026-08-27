@@ -3,9 +3,10 @@
 Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
 Codex Review Gate reduces trusted OpenAI Codex review evidence for one pull
-request to the required `codex/github-review-gate` commit status. Every run
-rebuilds its decision from GitHub. A database, workflow artifact, sticky
-comment or earlier run is never decision authority.
+request to the native required CheckRun `codex/github-review-gate` on the PR
+test-merge SHA. Every verifier run rebuilds its decision from GitHub. A
+database, workflow artifact, sticky comment, controller run or earlier
+verifier is never decision authority.
 
 The public Action is released from
 [`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action).
@@ -20,23 +21,63 @@ Consumers use the floating major:
 - uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
-That step alone is not an installation. Copy the complete
-[canonical workflow](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/.github/workflows/codex-review-gate.yml)
-and import the supplied
-[disabled ruleset template](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json).
-The copied workflow owns triggers, typed dispatch inputs, permissions,
-concurrency, runner-free event filtering and the stable status context. A
-reusable workflow is not the v2 consumer ABI.
+That step alone is not an installation. The complete installation has three
+required repository asset groups:
 
-The ruleset must require all four server-side conditions:
+- the complete two-workflow bundle: the read-only
+  [canonical verifier](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/.github/workflows/codex-review-gate.yml)
+  and protected-default-branch
+  [canonical controller](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml);
+- a managed `.github/CODEOWNERS` control plane whose two final effective rules
+  protect `/.github/workflows/` and `/.github/CODEOWNERS`; and
+- the supplied
+  [disabled ruleset template](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json).
+
+Install them with the canonical
+[`bootstrap-codex-review-gate.mjs`](https://github.com/Joey-Tools/codex-review-gate/blob/master/scripts/bootstrap-codex-review-gate.mjs)
+helper, always passing an explicit `--control-plane-owner @USER`. Do not
+reconstruct the workflow or managed CODEOWNERS rules by hand. The selected
+owner must be a GitHub user with `write`, `maintain` or `admin` permission on
+the consumer repository. The first migration PR contains both canonical
+workflows and CODEOWNERS, not the ruleset mutation. Before merging it, keep
+every legacy requirement active, bind a canonical read-only legacy inventory
+SHA-256 into the owner approval snapshot and require a fresh identical inventory
+in the final transaction. That inventory includes the complete ruleset
+`bypass_actors` and the complete matching effective `required_status_checks`
+rule with every parameter, not merely its matching check. Then require the authenticated actor to be that
+owner, freshly reread the owner's exact-head approval, and use the synchronous
+exact-SHA merge endpoint. Immediately after merge, first reread the current
+default branch and require the PR to be merged with base and head still exactly
+the approved scope. If that readback fails, keep every legacy requirement
+active. Only after it succeeds, remove and read back the inventoried legacy
+requirements under separate authorization.
+Approval plus a head reread alone is insufficient. After merge, stage the
+supplied ruleset as Disabled, prove it with a harmless canary, then activate it.
+
+The copied workflows own separate triggers, typed dispatch inputs,
+permissions, concurrency namespaces and runner-free event filtering. The
+verifier's GitHub-managed job CheckRun is the stable required signal. A
+reusable workflow and a commit-status bridge are not the v2 consumer ABI.
+
+The ruleset must require all server-side conditions:
 
 - `codex/github-review-gate`, with expected source GitHub Actions;
 - the branch is up to date;
+- Code Owner review for the protected workflow and CODEOWNERS paths;
+- stale approvals are dismissed after a push;
 - all review conversations are resolved; and
-- non-fast-forward updates to the default branch are blocked.
+- non-fast-forward updates to the default branch are blocked; and
+- bypass actors are empty.
+
+GitHub's required-check `integration_id: 15368` identifies the entire GitHub
+Actions App, not either workflow alone. Exact-byte verification of both
+canonical workflows, fail-closed workflow inventory, the managed CODEOWNERS
+rules, required Code Owner review, stale-approval dismissal, strict up-to-date
+policy, no bypass actors and canary collision checks form one compound
+control-plane boundary. This is not cryptographic proof of one workflow.
 
 Keep the imported ruleset disabled until a harmless canary has proved the
-actual status source and complete wiring. The
+actual native CheckRun source and complete wiring. The
 [human-readable guide](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/human.md)
 explains the installation to a person. The
 [agent-executable guide](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/agent.md)
@@ -44,25 +85,32 @@ lets an agent perform that same installation for a person.
 
 ## Trigger contract
 
-The canonical workflow has only these entries:
+The canonical verifier has one entry:
 
-- `pull_request_target` with activity type `edited`, admitted only for an
-  actual base-ref retarget back to the repository default branch;
+- `pull_request` with activity types `opened`, `reopened`, `synchronize` and
+  `ready_for_review`.
+
+The protected-default-branch controller has only these entries:
+
 - `issue_comment` with activity types `created` and `edited`; and
 - `workflow_dispatch` for one explicitly selected pull request.
 
-There is no cron, `repository_dispatch`, broad `pull_request` reset job or
-writable automatic `pull_request_review` job. Review objects and reaction-only
-completion are discovered by a later reconcile.
+There is no cron, `repository_dispatch`, `pull_request_target`, writable
+automatic `pull_request_review` job, runtime GitHub App or status writer.
+Review objects and reaction-only completion are discovered by a later
+authoritative verifier reconcile.
 
 An automatic comment job is admitted before runner allocation only when both
 the event sender and comment author are the exact Codex provider:
 `chatgpt-codex-connector[bot]`, GitHub type `Bot`. The Action repeats identity
 and scope checks after the runner starts. An edited Codex comment may invalidate
 an earlier decision, which is why both `created` and `edited` are admitted.
-The base-retarget job is likewise filtered before runner allocation: title,
-body and other edits do not start a runner. A qualifying retarget immediately
-replaces any persistent success on the unchanged head with pending.
+The verifier fails closed unless the PR is same-repository, open, ready and
+targets the current default branch. A base retarget does not create a current
+verifier because `pull_request.edited` is intentionally absent. For a ready PR,
+convert it to draft and mark it ready again; for an already-draft PR, mark it
+ready. The resulting `ready_for_review` event creates a verifier for the new
+base and test-merge SHA. A native rerun of the old event is not a substitute.
 
 Manual runs use the protected default-branch workflow. A feature-ref dispatch
 is unsupported. The typed `workflow_dispatch` business inputs are:
@@ -74,38 +122,40 @@ is unsupported. The typed `workflow_dispatch` business inputs are:
 | `expected_head_sha` | string | Required full expected PR-head SHA. A stale run never follows a different head. |
 | `request_comment_id` | string | Optional evidence-location hint; never authority. |
 | `request_review` | boolean | Defaults to `true`; controls request posting for `begin-review`. |
-| `limits_profile` | choice | `default` or `expanded`; defaults to `default`. |
 
 Every dispatch value is untrusted and revalidated against GitHub. Inputs
-cannot provide a verdict, provider identity, status context, stale override,
-numeric resource limit or permission to skip a full reconcile. A hint may
+cannot provide a verdict, provider identity, required-check result, stale
+override, limits profile, numeric resource limit or permission to skip a full reconcile. A hint may
 allow an early stop only after the runtime proves that no newer relevant
 evidence was skipped. GitHub exposes the typed numeric `pr_number` as a string
 at the Action boundary; the Action still requires its canonical positive
 decimal representation.
 
-The Action step uses the corresponding underscore-named inputs:
+The controller Action step uses the corresponding underscore-named inputs:
 `github_token`, `pr_number`, `expected_head_sha`, `operation`,
-`request_comment_id`, `request_review` and `limits_profile`. `github_token` and
+`request_comment_id` and `request_review`. `github_token` and
 `pr_number` are required. A manual run must supply the full
 `expected_head_sha`; the automatic comment path may leave it empty so the
 runtime can bind the authoritative head at startup. Neither path may follow a
-later head change.
+later head change. Both Action steps receive `default` or `expanded` only from
+the protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`; dispatch
+callers cannot override it.
 
 ## Operations
 
 ### `begin-review`
 
-`begin-review` validates the exact PR and expected head, establishes pending
-on that head, and by default posts a fresh exact `@codex review` request with
-the canonical hidden binding. `request_review=false` only establishes pending;
-it is an advanced best-effort option and does not add a dedicated cross-job
-barrier.
+`begin-review` validates the exact PR and expected head, and by default creates
+or safely adopts a fresh exact `@codex review` request with the canonical
+hidden binding. It reads that request back before requesting a full rerun of
+the exact current verifier. `request_review=false` is an advanced best-effort
+option and does not add a dedicated barrier.
 
-Runs for the same PR are serialised with `cancel-in-progress: false`. GitHub can
-still replace a not-yet-started pending workflow run, so observe the exact
-`begin-review` run complete before treating it as a barrier or posting a
-dependent request.
+Controller runs for the same PR are serialised with `cancel-in-progress: false`.
+The controller records verifier attempt `A`, requires no competing canonical
+attempt, requests one full rerun, and must observe exact attempt `A+1` plus its
+unique canonical job/CheckRun. An ambiguous POST or invisible attempt remains
+blocking; concurrency is scheduling, not a mutation fence.
 
 For the usual low-cost path, an agent may post exact `@codex review` directly
 while other checks run and invoke GHA only when reconciliation is needed. Use
@@ -114,10 +164,11 @@ request, including a deliberate same-head re-review after an earlier success.
 
 ### `reconcile`
 
-`reconcile` first re-reads the selected PR. Only while its head equals the
-bound expected head does it replace that exact SHA's gate status with pending
-and collect evidence. It never retargets the run or writes the decision to a
-new head. A later run must handle a changed head.
+`reconcile` re-reads the selected PR and locates exactly one canonical verifier
+for its current test-merge SHA. It then uses the same baseline/rerun/readback
+handshake to establish a strictly newer full verifier attempt. The controller
+never supplies a verdict or rewrites a CheckRun; the read-only verifier alone
+collects evidence and its native job conclusion carries the required result.
 
 The reducer reads qualifying Codex top-level issue comments and pull-request
 review bodies. Inline review threads are deliberately outside the reducer;
@@ -149,6 +200,11 @@ being guessed into the new generation.
 
 Terminal clean text and a qualifying provider `+1` otherwise have equal clean
 authority; the base-epoch lineage rule above is the deliberate exception.
+Ordinary request reactions are provider liveness signals only; ordinary `+1`
+cannot head-bind clean by itself. Same-time/later official `eyes`/progress from
+Codex vetoes a candidate clean because review activity has not been proved
+terminal. Reaction-only changes have no automatic workflow event, so a later
+provider event or manual reconcile must observe them.
 When terminal evidence names a reviewed commit, it may use a full or short SHA.
 A short SHA is accepted only when GitHub resolves it unambiguously to the
 current PR head. For a pull-request review, the resolved SHA must also agree
@@ -220,12 +276,23 @@ refresh_head
 repair_permissions
 retry_begin
 unsupported_target
+create_verifier_run
 ```
 
-Workflow conclusion reports execution health; the status on the expected PR
-head reports gate outcome. Findings normally produce `healthy/failure`, not an
-execution error. `unhealthy/success` is invalid. `status_projection` and the
-finding counts are summary-only, not public Action outputs.
+Findings normally produce `healthy/failure`, not an execution error.
+`unhealthy/success` is invalid. In the verifier workflow, only a proved stable
+`healthy/success` may conclude successfully; findings, pending evidence,
+unsupported scope, cancellation, timeout and every unhealthy result remain
+blocking. The required verifier CheckRun belongs to the exact current PR
+test-merge SHA. The controller's CheckRun is attached to the default-branch commit
+and is never the required PR signal. Direct status projection and
+`status_projection` are deleted. Finding counts remain summary-only, not public
+Action outputs.
+
+`healthy/pending` cannot safely authorise success even when the evaluator
+completed trustworthily; it is not a weak success. Every result, including
+pending and not-applicable results, must follow its `recovery_code`. Only
+`wait_provider` is a pure wait without another repair or reconcile action.
 
 When they can be derived without another evidence query, the sticky diagnostic
 and Actions summary report:
@@ -245,17 +312,22 @@ See [DESIGN.md](DESIGN.md) for the authority and consistency model and
 ## Exact-head merge closure
 
 A success is an observation, not a permanent lease. Immediately before merge,
-an agent must dispatch `reconcile` with the exact current head and require all
-of the following at one final read:
+an agent must dispatch controller `reconcile` with the exact current head,
+observe the strictly newer verifier attempt and its unique canonical CheckRun,
+and require all of the following at one final read:
 
 - Action result `healthy/success`;
-- `codex/github-review-gate` success from GitHub Actions on that same head;
-- the PR head remains unchanged;
+- `codex/github-review-gate` success from the canonical verifier on the same
+  current test-merge SHA;
+- the PR head, base and test-merge SHA remain unchanged;
 - the branch is up to date;
 - all review conversations are resolved; and
 - the ruleset allows the merge.
 
-If any item changes, stop and reconcile the new current state.
+If any item changes, stop and reconcile the new current state. Merge
+immediately with an exact-head compare-and-swap such as
+`gh pr merge --match-head-commit "$HEAD_SHA"`; direct human UI merge outside
+this closure is unsupported.
 
 ## Supported boundary
 

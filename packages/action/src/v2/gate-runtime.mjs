@@ -11,7 +11,9 @@ import {
   parseCodexReviewArtifact,
 } from "../core.mjs";
 
-export const V2_STATUS_CONTEXT = "codex/github-review-gate";
+export const V2_REQUIRED_CHECK_NAME = "codex/github-review-gate";
+export const V2_VERIFIER_WORKFLOW_PATH = "codex-review-gate.yml";
+export const V2_GITHUB_ACTIONS_APP_ID = 15_368;
 export const V2_REQUEST_MARKER = "codex-review-gate-request-v2";
 export const V2_STICKY_MARKER = "codex-review-gate:v2:diagnostic";
 export const V2_STABILITY_INTERVAL_MS = 5_000;
@@ -65,6 +67,7 @@ export const V2_RECOVERY_CODES = Object.freeze(new Set([
   "repair_permissions",
   "retry_begin",
   "unsupported_target",
+  "create_verifier_run",
 ]));
 
 const FULL_SHA = /^[0-9a-f]{40}$/u;
@@ -413,7 +416,6 @@ export function buildV2GateReport({
   reason,
   recoveryCode,
   retrySafe,
-  statusProjection = "not_attempted",
   findingsUnresolved = 0,
   findingsResolved = 0,
   findingsHistorical = 0,
@@ -432,9 +434,6 @@ export function buildV2GateReport({
   }
   if (!V2_RECOVERY_CODES.has(recoveryCode)) {
     throw new Error(`recoveryCode is not in the closed v2 set: ${recoveryCode}`);
-  }
-  if (!new Set(["not_attempted", "pending", "success", "failure", "failed"]).has(statusProjection)) {
-    throw new Error("statusProjection is not a closed v2 projection state");
   }
   const counts = {
     unresolved: findingsUnresolved,
@@ -458,7 +457,6 @@ export function buildV2GateReport({
     reason: normalizedReason,
     recoveryCode,
     retrySafe: normalizedRetrySafe,
-    statusProjection,
     counts: Object.freeze(counts),
   });
 }
@@ -474,9 +472,20 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
   if (!summaryPath) return;
   const pr = context.prNumber ? `#${context.prNumber}` : "unknown";
   const head = context.headSha ? `\`${context.headSha}\`` : "unknown";
+  const testMerge = FULL_SHA.test(String(context.testMergeSha || ""))
+    ? `\`${context.testMergeSha}\``
+    : "unknown";
   const reason = formatV2DiagnosticText(report.reason, "No reason was reported");
   const nextAction = formatV2DiagnosticText(
-    recoveryInstruction(report.recoveryCode, context.prNumber),
+    context.verifierRunId
+      ? `Wait for verifier run ${context.verifierRunId} attempt ` +
+        `${context.verifierRunAttempt} to complete, then require its exact ` +
+        `${V2_REQUIRED_CHECK_NAME} result to be healthy/success before merge.`
+      : recoveryInstruction(
+          report.recoveryCode,
+          context.prNumber,
+          report.retrySafe,
+        ),
     "Inspect the workflow run and retry safely.",
   );
   const body = [
@@ -486,10 +495,16 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     `- Gate outcome: **${report.gateOutcome}**`,
     `- Pull request: **${pr}**`,
     `- Exact head: ${head}`,
+    `- Test-merge commit: ${testMerge}`,
     `- Reason: ${reason}`,
     `- Recovery code: \`${report.recoveryCode}\``,
-    `- Status projection: **${report.statusProjection}**`,
     `- Findings: ${formatV2FindingCounts(report.counts)}`,
+    ...(context.verifierRunId
+      ? [
+          `- Verifier run: ${formatV2DiagnosticText(context.verifierRunUrl || context.verifierRunId, "unknown", 500)}`,
+          `- Verifier attempt: **${context.verifierRunAttempt}**`,
+        ]
+      : []),
     "",
     `Next action: ${nextAction}`,
     "",
@@ -505,7 +520,15 @@ export function buildV2StickyCommentBody(report, context = {}) {
   }
   const reason = formatV2DiagnosticText(report.reason, "No reason was reported");
   const nextAction = formatV2DiagnosticText(
-    recoveryInstruction(report.recoveryCode, prNumber),
+    context.verifierRunId
+      ? `Wait for verifier run ${context.verifierRunId} attempt ` +
+        `${context.verifierRunAttempt} to complete, then require its exact ` +
+        `${V2_REQUIRED_CHECK_NAME} result to be healthy/success before merge.`
+      : recoveryInstruction(
+          report.recoveryCode,
+          prNumber,
+          report.retrySafe,
+        ),
     "Inspect the workflow run and retry safely.",
   );
   const hidden = canonicalJson({
@@ -518,7 +541,6 @@ export function buildV2StickyCommentBody(report, context = {}) {
     recoveryCode: report.recoveryCode,
     retrySafe: report.retrySafe,
     nextAction,
-    statusProjection: report.statusProjection,
     findingsUnresolved: report.counts.unresolved,
     findingsResolved: report.counts.resolved,
     findingsHistorical: report.counts.historical,
@@ -553,7 +575,11 @@ function reportOutputValues(report) {
   };
 }
 
-function recoveryInstruction(code, prNumber) {
+function recoveryInstruction(
+  code,
+  prNumber,
+  retrySafe = false,
+) {
   const target = Number.isSafeInteger(Number(prNumber)) ? ` for PR #${prNumber}` : "";
   if (code === "none") return "No recovery action is required.";
   if (code === "wait_provider") {
@@ -583,7 +609,13 @@ function recoveryInstruction(code, prNumber) {
     return `Repair the canonical workflow permissions or installation, then retry${target}.`;
   }
   if (code === "retry_begin") {
+    if (retrySafe) {
+      return `Retry the identical exact-head begin-review invocation${target}.`;
+    }
     return `Wait for the exact same-run request marker to settle${target}; if it remains absent, rerun the original workflow run instead of dispatching a new generation.`;
+  }
+  if (code === "create_verifier_run") {
+    return `Create a fresh verifier for the current test-merge commit${target}: convert a ready PR to draft and mark it ready again, or mark an existing draft ready, then reconcile again.`;
   }
   return `Move the PR to a supported v2 target shape before retrying${target}.`;
 }
@@ -705,10 +737,13 @@ const V2_RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 class V2RuntimeFailure extends Error {
   constructor(message, {
     executionHealth = "unhealthy",
-    recoveryCode = "retry_reconcile",
-    gateOutcome = "pending",
+    recoveryCode = null,
+    gateOutcome = null,
     counts = null,
     httpStatus = null,
+    responseReceived = false,
+    responsePhase = "none",
+    retrySafe = undefined,
   } = {}) {
     super(message);
     this.name = "V2RuntimeFailure";
@@ -717,7 +752,53 @@ class V2RuntimeFailure extends Error {
     this.gateOutcome = gateOutcome;
     this.counts = counts;
     this.httpStatus = httpStatus;
+    this.responseReceived = responseReceived;
+    this.responsePhase = responsePhase;
+    this.retrySafe = retrySafe;
   }
+}
+
+class V2ResponseSizeFailure extends V2RuntimeFailure {
+  constructor(message, options = {}) {
+    super(message, options);
+    this.name = "V2ResponseSizeFailure";
+  }
+}
+
+function transientV2SafeReadFailure(message, {
+  httpStatus = null,
+  responseReceived = false,
+  responsePhase = "transport",
+} = {}) {
+  return new V2RuntimeFailure(message, {
+    recoveryCode: "retry_reconcile",
+    retrySafe: true,
+    httpStatus,
+    responseReceived,
+    responsePhase,
+  });
+}
+
+function v2HttpFailure(method, path, response, data = null) {
+  const detail = typeof data?.message === "string"
+    ? `: ${oneLine(data.message, "GitHub API error").slice(0, 1_000)}`
+    : "";
+  const options = response.status === 401 || response.status === 403
+    ? {
+        recoveryCode: "repair_permissions",
+        httpStatus: response.status,
+        responseReceived: true,
+        responsePhase: "http",
+      }
+    : {
+        httpStatus: response.status,
+        responseReceived: true,
+        responsePhase: "http",
+      };
+  return new V2RuntimeFailure(
+    `GitHub ${method} ${path} returned HTTP ${response.status}${detail}`,
+    options,
+  );
 }
 
 class V2SnapshotDeadlineFailure extends V2RuntimeFailure {
@@ -846,9 +927,9 @@ class V2GitHubClient {
     this.fetchImpl = fetchImpl;
   }
 
-  async request(method, path, body = undefined, { budget = null, retry = true } = {}) {
+  async request(method, path, body = undefined, { budget = null, safeRead = false } = {}) {
     const url = path.startsWith("http") ? path : `${this.config.apiUrl}${path}`;
-    const attempts = retry && method === "GET" ? 3 : 1;
+    const attempts = safeRead ? 3 : 1;
     let lastError;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       budget?.consumeAttempt(path);
@@ -858,6 +939,7 @@ class V2GitHubClient {
         budget?.requestTimeoutMilliseconds(path) ?? V2_HARD_LIMITS.requestTimeoutMs,
       );
       let response;
+      let raw;
       try {
         response = await this.fetchImpl(url, {
           method,
@@ -870,32 +952,48 @@ class V2GitHubClient {
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: controller.signal,
         });
+        raw = await readBoundedResponseText(response, MAX_RESPONSE_BYTES, path);
       } catch (error) {
         clearTimeout(timeout);
         if (budget && budget.remainingMilliseconds() <= 0) {
           throw new V2SnapshotDeadlineFailure(path);
         }
-        lastError = new V2RuntimeFailure(
-          `GitHub ${method} ${path} failed: ${error?.message || String(error)}`,
+        if (
+          response &&
+          !response.ok &&
+          (!safeRead || !V2_RETRYABLE_STATUS.has(response.status))
+        ) {
+          throw v2HttpFailure(method, path, response);
+        }
+        if (error instanceof V2ResponseSizeFailure) {
+          error.httpStatus = response?.status ?? null;
+          error.responseReceived = Boolean(response);
+          error.responsePhase = response ? "body" : "transport";
+          throw error;
+        }
+        const phase = response ? "response failed" : "failed";
+        lastError = transientV2SafeReadFailure(
+          `GitHub ${method} ${path} ${phase}: ${oneLine(
+            error?.message || String(error),
+            "unknown response failure",
+          ).slice(0, 1_000)}`,
+          {
+            httpStatus: response?.status ?? null,
+            responseReceived: Boolean(response),
+            responsePhase: response ? "body" : "transport",
+          },
         );
-        if (attempt < attempts) {
+        if (safeRead && attempt < attempts) {
           await sleepV2RetryDelay(250 * attempt, budget, path);
           continue;
         }
-        throw lastError;
-      }
-      let raw;
-      try {
-        raw = await readBoundedResponseText(response, MAX_RESPONSE_BYTES, path);
-      } catch (error) {
-        throw error instanceof V2RuntimeFailure
-          ? error
-          : new V2RuntimeFailure(
-              `GitHub ${method} ${path} response failed: ${oneLine(
-                error?.message || String(error),
-                "unknown response failure",
-              ).slice(0, 1_000)}`,
-            );
+        throw safeRead
+          ? lastError
+          : new V2RuntimeFailure(lastError.message, {
+              httpStatus: lastError.httpStatus,
+              responseReceived: lastError.responseReceived,
+              responsePhase: lastError.responsePhase,
+            });
       } finally {
         clearTimeout(timeout);
       }
@@ -905,25 +1003,56 @@ class V2GitHubClient {
         try {
           data = JSON.parse(raw);
         } catch {
-          throw new V2RuntimeFailure(`GitHub ${method} ${path} returned non-JSON data`);
+          if (
+            !response.ok &&
+            (!safeRead || !V2_RETRYABLE_STATUS.has(response.status))
+          ) {
+            throw v2HttpFailure(method, path, response);
+          }
+          lastError = transientV2SafeReadFailure(
+            `GitHub ${method} ${path} returned non-JSON data`,
+            {
+              httpStatus: response.status,
+              responseReceived: true,
+              responsePhase: "decode",
+            },
+          );
+          if (safeRead && attempt < attempts) {
+            await sleepV2RetryDelay(250 * attempt, budget, path);
+            continue;
+          }
+          throw safeRead
+            ? lastError
+            : new V2RuntimeFailure(lastError.message, {
+                httpStatus: lastError.httpStatus,
+                responseReceived: true,
+                responsePhase: lastError.responsePhase,
+              });
         }
       }
-      if (response.ok) return { data, headers: response.headers };
+      if (response.ok) {
+        return { data, headers: response.headers, status: response.status };
+      }
 
-      const detail = typeof data?.message === "string"
-        ? `: ${oneLine(data.message, "GitHub API error").slice(0, 1_000)}`
-        : "";
-      lastError = new V2RuntimeFailure(
-        `GitHub ${method} ${path} returned HTTP ${response.status}${detail}`,
-        { httpStatus: response.status },
-      );
-      if (attempt < attempts && V2_RETRYABLE_STATUS.has(response.status)) {
+      lastError = v2HttpFailure(method, path, response, data);
+      if (
+        safeRead &&
+        attempt < attempts &&
+        V2_RETRYABLE_STATUS.has(response.status)
+      ) {
         await sleepV2RetryDelay(
           retryDelay(response.headers.get("retry-after"), attempt),
           budget,
           path,
         );
         continue;
+      }
+      if (safeRead && V2_RETRYABLE_STATUS.has(response.status)) {
+        throw transientV2SafeReadFailure(lastError.message, {
+          httpStatus: response.status,
+          responseReceived: true,
+          responsePhase: "http",
+        });
       }
       throw lastError;
     }
@@ -945,7 +1074,7 @@ class V2GitHubClient {
         "GET",
         `${path}${separator}per_page=100&page=${page}`,
         undefined,
-        { budget },
+        { budget, safeRead: true },
       );
       budget.consumePage(label);
       if (!Array.isArray(data)) {
@@ -996,121 +1125,74 @@ export async function runV2GateCli({
     prNumber: null,
     headSha: "",
     expectedHeadSha: "",
+    testMergeSha: "",
     repositoryId: "",
     issueComments: [],
-    statusReady: false,
+    triggerKind: "",
+    headValidated: false,
   };
   try {
     config = readV2Config(environment);
     context.prNumber = config.prNumber;
     Object.assign(config, validateV2Trigger(config));
+    context.triggerKind = config.triggerKind;
     client = new V2GitHubClient(config, fetchImpl);
-
-    const [repository, initialPr] = await Promise.all([
-      loadV2Repository(client, config, null),
-      loadV2PullRequest(client, config, null),
-    ]);
-    context.repositoryId = String(repository.id);
-    config.repositoryId = context.repositoryId;
-    if (
-      config.triggerKind === "provider" &&
-      (initialPr.state !== "open" || initialPr.merged === true || initialPr.merged_at)
-    ) {
-      context.headSha = initialPr.head.sha.toLowerCase();
-      context.expectedHeadSha = context.headSha;
-      return finishV2WithoutWrites(config, context, staleV2Report(
-        "The provider event arrived after the pull request stopped being open",
-      ));
+    if (config.triggerKind === "verifier") {
+      return await runV2Verifier(client, config, context, {
+        sleep,
+        now,
+        stabilityIntervalMs,
+        stabilityWindowMs: stabilityWindowMs ?? config.limits.reconcileBudgetMs,
+      });
     }
-    const unsupported = classifyUnsupportedV2Target(repository, initialPr, config);
-    if (unsupported) {
-      return finishV2WithoutWrites(config, context, buildV2GateReport({
-        executionHealth: "unhealthy",
-        gateOutcome: "not_applicable",
-        reason: unsupported,
-        recoveryCode: "unsupported_target",
-      }));
-    }
-    config.snapshotScope = Object.freeze({
-      repositoryId: repository.id,
-      repositoryFullName: repository.full_name,
-      defaultBranch: repository.default_branch,
-      baseRef: initialPr.base.ref,
-      baseRepositoryId: initialPr.base.repo.id,
-      baseRepositoryFullName: initialPr.base.repo.full_name,
-    });
-
-    const initialHead = initialPr.head.sha.toLowerCase();
-    const expectedHead = config.expectedHeadSha || initialHead;
-    config.expectedHeadSha = expectedHead;
-    context.headSha = expectedHead;
-    context.expectedHeadSha = expectedHead;
-    if (initialHead !== expectedHead) {
-      const reason =
-        `Expected head ${expectedHead} no longer matches current head ${initialHead}`;
-      return finishV2WithoutWrites(
-        config,
-        context,
-        config.triggerKind === "manual"
-          ? buildV2GateReport({
-              executionHealth: "unhealthy",
-              gateOutcome: "not_applicable",
-              reason,
-              recoveryCode: "refresh_head",
-            })
-          : staleV2Report(reason),
-      );
-    }
-    if (
-      config.triggerKind === "provider" &&
-      providerEventIsStale(config.event, initialHead, {
-        owner: config.owner,
-        repo: config.repo,
-      })
-    ) {
-      return finishV2WithoutWrites(config, context, staleV2Report(
-        "The provider event is bound to an older pull-request head",
-      ));
-    }
-
-    await postV2Status(
-      client,
-      config,
-      expectedHead,
-      "pending",
-      config.operation === "begin-review"
-        ? "Preparing a current-head Codex review request"
-        : "Reconciling current-head Codex review evidence",
-    );
-    context.statusReady = true;
-
-    if (config.triggerKind === "base-change") {
-      return await finishV2Run(client, config, context, buildV2GateReport({
-        executionHealth: "healthy",
-        gateOutcome: "pending",
-        reason:
-          "The pull-request base ref changed; a strictly newer authorized Codex review generation is required",
-        recoveryCode: "request_clean_generation",
-        statusProjection: "pending",
-      }));
-    }
-    if (config.operation === "begin-review") {
-      return await runV2BeginReview(client, config, context, initialPr, { now });
-    }
-    return await runV2Reconcile(client, config, context, {
+    return await runV2ControllerAction(client, config, context, {
       sleep,
       now,
-      stabilityIntervalMs,
-      stabilityWindowMs: stabilityWindowMs ?? config.limits.reconcileBudgetMs,
+      pollIntervalMs: stabilityIntervalMs,
+      pollWindowMs: stabilityWindowMs ?? config.limits.reconcileBudgetMs,
     });
   } catch (error) {
     const counts = normalizeV2FailureCounts(error?.counts);
-    if (error instanceof V2StaleFailure) {
-      let report = buildV2GateReport({
-        executionHealth: "healthy",
-        gateOutcome: "not_applicable",
-        reason: error.message,
-        recoveryCode: "refresh_head",
+    const stale = error instanceof V2StaleFailure;
+    const safeBeginRetry =
+      config?.triggerKind === "controller" &&
+      config?.operation === "begin-review" &&
+      error?.recoveryCode === "retry_reconcile" &&
+      error?.retrySafe === true;
+    let report = buildV2GateReport({
+      executionHealth: stale ? "healthy" : error?.executionHealth || "unhealthy",
+      gateOutcome: stale
+        ? "not_applicable"
+        : error?.gateOutcome ?? (context.headValidated ? "pending" : "unknown"),
+      reason: error?.message || String(error),
+      recoveryCode: stale
+        ? "refresh_head"
+        : safeBeginRetry
+          ? "retry_begin"
+          : error?.recoveryCode ?? (config ? "wait_then_reconcile" : "unsupported_target"),
+      retrySafe: error?.retrySafe,
+      findingsUnresolved: counts.unresolved,
+      findingsResolved: counts.resolved,
+      findingsHistorical: counts.historical,
+      findingsIndeterminate: counts.indeterminate,
+    });
+    try {
+      report = await finalizeV2Report(client, config || {
+        outputPath: environment.GITHUB_OUTPUT || "",
+        summaryPath: environment.GITHUB_STEP_SUMMARY || "",
+      }, context, report, {
+        diagnostic:
+          config?.triggerKind === "controller" &&
+          context.headValidated &&
+          !stale,
+      });
+    } catch (reportError) {
+      console.error(`failed to finalize v2 gate report: ${reportError.message}`);
+      report = buildV2GateReport({
+        executionHealth: "unhealthy",
+        gateOutcome: error?.gateOutcome === "failure" ? "failure" : "unknown",
+        reason: `Failed to persist the v2 gate report: ${reportError.message}`,
+        recoveryCode: "repair_permissions",
         findingsUnresolved: counts.unresolved,
         findingsResolved: counts.resolved,
         findingsHistorical: counts.historical,
@@ -1121,93 +1203,10 @@ export async function runV2GateCli({
           outputPath: environment.GITHUB_OUTPUT || "",
           summaryPath: environment.GITHUB_STEP_SUMMARY || "",
         }, report, context);
-      } catch (reportError) {
-        report = buildV2GateReport({
-          executionHealth: "unhealthy",
-          gateOutcome: "unknown",
-          reason: `The run became stale and its local report could not be persisted: ${reportError.message}`,
-          recoveryCode: "repair_permissions",
-          statusProjection: "failed",
-          findingsUnresolved: counts.unresolved,
-          findingsResolved: counts.resolved,
-          findingsHistorical: counts.historical,
-          findingsIndeterminate: counts.indeterminate,
-        });
-        try {
-          persistV2ReportFiles(config || {
-            outputPath: environment.GITHUB_OUTPUT || "",
-            summaryPath: environment.GITHUB_STEP_SUMMARY || "",
-          }, report, context);
-        } catch (finalReportError) {
-          console.error(
-            `failed to persist final stale v2 gate report: ${finalReportError.message}`,
-          );
-        }
-      }
-      console.warn(error.message);
-      return {
-        report,
-        exitCode: report.executionHealth === "healthy" ? 0 : 1,
-      };
-    }
-    const hasValidatedExpectedHead = context.statusReady && FULL_SHA.test(context.expectedHeadSha);
-    const gateOutcome = error?.gateOutcome || (hasValidatedExpectedHead ? "pending" : "unknown");
-    let report = buildV2GateReport({
-      executionHealth: error?.executionHealth || "unhealthy",
-      gateOutcome,
-      reason: error?.message || String(error),
-      recoveryCode: error?.recoveryCode || (hasValidatedExpectedHead
-        ? "retry_reconcile"
-        : "repair_permissions"),
-      retrySafe: error?.retrySafe,
-      statusProjection: hasValidatedExpectedHead ? "pending" : "failed",
-      findingsUnresolved: counts.unresolved,
-      findingsResolved: counts.resolved,
-      findingsHistorical: counts.historical,
-      findingsIndeterminate: counts.indeterminate,
-    });
-
-    try {
-      if (config && hasValidatedExpectedHead) {
-        await finishV2Run(client, config, context, report);
-      } else if (config) {
-        persistV2ReportFiles(config, report, context);
-      } else {
-        persistV2ReportFiles({
-          outputPath: environment.GITHUB_OUTPUT || "",
-          summaryPath: environment.GITHUB_STEP_SUMMARY || "",
-        }, report, context);
-      }
-    } catch (reportError) {
-      console.error(`failed to finalize v2 gate report: ${reportError.message}`);
-      const provisionalWasHealthy = report.executionHealth === "healthy";
-      report = buildV2GateReport({
-        executionHealth: "unhealthy",
-        gateOutcome: gateOutcome === "failure" ? "failure" : "unknown",
-        reason: `Failed to persist the v2 gate report: ${reportError.message}`,
-        recoveryCode: "repair_permissions",
-        statusProjection: "failed",
-        findingsUnresolved: counts.unresolved,
-        findingsResolved: counts.resolved,
-        findingsHistorical: counts.historical,
-        findingsIndeterminate: counts.indeterminate,
-      });
-      try {
-        if (config) {
-          persistV2ReportFiles(config, report, context);
-        } else {
-          persistV2ReportFiles({
-            outputPath: environment.GITHUB_OUTPUT || "",
-            summaryPath: environment.GITHUB_STEP_SUMMARY || "",
-          }, report, context);
-        }
       } catch (finalReportError) {
         console.error(
           `failed to persist final unhealthy v2 gate report: ${finalReportError.message}`,
         );
-      }
-      if (client && config) {
-        await writeV2StickyBestEffort(client, config, context, report);
       }
     }
     if (report.executionHealth === "unhealthy") {
@@ -1217,25 +1216,632 @@ export async function runV2GateCli({
     }
     return {
       report,
-      exitCode: report.executionHealth === "healthy" ? 0 : 1,
+      exitCode: exitCodeForV2Report(report, config?.triggerKind),
     };
   }
 }
 
-async function runV2BeginReview(client, config, context, initialPr, { now }) {
+async function runV2Verifier(client, config, context, {
+  sleep,
+  now,
+  stabilityIntervalMs,
+  stabilityWindowMs,
+}) {
+  const [repository, initialPr] = await Promise.all([
+    loadV2Repository(client, config, null),
+    loadV2PullRequest(client, config, null),
+  ]);
+  initializeV2Scope(config, context, repository, initialPr);
+  const unsupported = classifyUnsupportedV2Target(repository, initialPr, config);
+  if (unsupported) {
+    const report = buildV2GateReport({
+      executionHealth: "unhealthy",
+      gateOutcome: "not_applicable",
+      reason: unsupported,
+      recoveryCode: "unsupported_target",
+    });
+    await finalizeV2Report(client, config, context, report);
+    return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
+  }
+  assertV2VerifierLaunchScope(config, initialPr);
+  context.headValidated = true;
+  return runV2Reconcile(client, config, context, {
+    sleep,
+    now,
+    stabilityIntervalMs,
+    stabilityWindowMs,
+  });
+}
+
+async function runV2ControllerAction(client, config, context, {
+  sleep,
+  now,
+  pollIntervalMs,
+  pollWindowMs,
+}) {
+  const [repository, initialPr] = await Promise.all([
+    loadV2Repository(client, config, null),
+    loadV2PullRequest(client, config, null),
+  ]);
+  initializeV2Scope(config, context, repository, initialPr, {
+    expectedHeadSha: config.expectedHeadSha || String(initialPr?.head?.sha || "").toLowerCase(),
+  });
+  if (
+    config.triggerSource === "provider" &&
+    !isOpenV2PullRequest(initialPr)
+  ) {
+    const report = staleV2Report(
+      "The provider event arrived after the pull request stopped being open",
+    );
+    await finalizeV2Report(client, config, context, report);
+    return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
+  }
+  const unsupported = classifyUnsupportedV2Target(repository, initialPr, config);
+  if (unsupported) {
+    const report = buildV2GateReport({
+      executionHealth: "unhealthy",
+      gateOutcome: "not_applicable",
+      reason: unsupported,
+      recoveryCode: "unsupported_target",
+    });
+    await finalizeV2Report(client, config, context, report);
+    return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
+  }
+  if (initialPr.head.sha.toLowerCase() !== config.expectedHeadSha) {
+    throw new V2RuntimeFailure(
+      `Expected head ${config.expectedHeadSha} no longer matches current head ` +
+        `${initialPr.head.sha.toLowerCase()}`,
+      { gateOutcome: "not_applicable", recoveryCode: "refresh_head" },
+    );
+  }
+  context.headValidated = true;
+  if (config.triggerSource === "provider") {
+    await exactRefetchV2ControllerProviderEvent(client, config);
+    if (providerEventIsStale(config.event, config.expectedHeadSha, {
+      owner: config.owner,
+      repo: config.repo,
+    })) {
+      const report = staleV2Report("The provider event is bound to an older pull-request head");
+      await finalizeV2Report(client, config, context, report);
+      return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
+    }
+  }
+  if (config.operation === "begin-review") {
+    await ensureV2ControllerReviewRequest(client, config, context, initialPr, { now });
+  }
+  const refresh = await rerunCurrentV2Verifier(client, config, context, initialPr, {
+    sleep,
+    now,
+    pollIntervalMs,
+    pollWindowMs,
+  });
+  context.verifierRunId = refresh.runId;
+  context.verifierRunAttempt = refresh.runAttempt;
+  context.verifierRunUrl = refresh.runUrl;
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason:
+      `Verifier run ${refresh.runId} attempt ${refresh.runAttempt} is observable ` +
+      `with its unique ${V2_REQUIRED_CHECK_NAME} CheckRun queued or in progress`,
+    recoveryCode: "wait_provider",
+    retrySafe: false,
+    findingsUnresolved: "unknown",
+    findingsResolved: "unknown",
+    findingsHistorical: "unknown",
+    findingsIndeterminate: "unknown",
+  });
+  await finalizeV2Report(client, config, context, report, { diagnostic: true });
+  return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
+}
+
+function initializeV2Scope(
+  config,
+  context,
+  repository,
+  pullRequest,
+  { expectedHeadSha = config.expectedHeadSha } = {},
+) {
+  context.repositoryId = String(repository.id);
+  config.repositoryId = context.repositoryId;
+  config.expectedHeadSha = expectedHeadSha;
+  context.headSha = expectedHeadSha;
+  context.expectedHeadSha = expectedHeadSha;
+  context.testMergeSha = String(pullRequest?.merge_commit_sha || "").toLowerCase();
+  config.testMergeSha = context.testMergeSha;
+  config.snapshotScope = Object.freeze({
+    repositoryId: repository.id,
+    repositoryFullName: repository.full_name,
+    defaultBranch: repository.default_branch,
+    headRef: pullRequest.head.ref,
+    headRepositoryId: pullRequest.head.repo.id,
+    headRepositoryFullName: pullRequest.head.repo.full_name,
+    baseSha: pullRequest.base.sha.toLowerCase(),
+    baseRef: pullRequest.base.ref,
+    baseRepositoryId: pullRequest.base.repo.id,
+    baseRepositoryFullName: pullRequest.base.repo.full_name,
+    testMergeSha: context.testMergeSha,
+  });
+}
+
+function assertV2VerifierLaunchScope(config, pullRequest) {
+  const eventPr = config.event?.pull_request;
+  const eventMergeSha = String(eventPr?.merge_commit_sha || "").toLowerCase();
+  const currentMergeSha = String(pullRequest?.merge_commit_sha || "").toLowerCase();
+  const githubSha = String(config.environment.GITHUB_SHA || "").toLowerCase();
+  const expectedMergeRef = `refs/pull/${config.prNumber}/merge`;
+  if (
+    !FULL_SHA.test(eventMergeSha) ||
+    !FULL_SHA.test(currentMergeSha) ||
+    !FULL_SHA.test(githubSha) ||
+    eventMergeSha !== currentMergeSha ||
+    githubSha !== currentMergeSha ||
+    config.environment.GITHUB_REF !== expectedMergeRef ||
+    String(pullRequest.head.sha || "").toLowerCase() !== config.expectedHeadSha ||
+    String(eventPr?.head?.sha || "").toLowerCase() !== config.expectedHeadSha ||
+    String(eventPr?.base?.sha || "").toLowerCase() !==
+      String(pullRequest.base.sha || "").toLowerCase() ||
+    eventPr?.base?.ref !== pullRequest.base.ref ||
+    eventPr?.head?.ref !== pullRequest.head.ref ||
+    eventPr?.base?.repo?.full_name !== config.repository ||
+    eventPr?.head?.repo?.full_name !== config.repository
+  ) {
+    throw new V2StaleFailure(
+      "The pull_request verifier is not bound to the exact current PR head, base, and test-merge commit",
+    );
+  }
+}
+
+async function finalizeV2Report(client, config, context, report, {
+  diagnostic = false,
+} = {}) {
+  persistV2ReportFiles(config || {
+    outputPath: "",
+    summaryPath: "",
+  }, report, context);
+  if (
+    diagnostic &&
+    client &&
+    config &&
+    Number.isSafeInteger(context.prNumber) &&
+    FULL_SHA.test(context.headSha)
+  ) {
+    await writeV2StickyBestEffort(client, config, context, report);
+  }
+  return report;
+}
+
+function exitCodeForV2Report(report, triggerKind) {
+  if (triggerKind === "verifier") {
+    return report.executionHealth === "healthy" && report.gateOutcome === "success" ? 0 : 1;
+  }
+  return report.executionHealth === "healthy" ? 0 : 1;
+}
+
+async function exactRefetchV2ControllerProviderEvent(client, config) {
+  const eventComment = config.event?.comment;
+  const commentId = canonicalPositiveId(eventComment?.id);
+  if (!commentId) {
+    throw new V2RuntimeFailure("The admitted provider comment has no canonical id", {
+      gateOutcome: "not_applicable",
+      recoveryCode: "unsupported_target",
+    });
+  }
+  requireV2IssueCommentShape(eventComment, "admitted provider comment");
+  const budget = new V2SnapshotBudget(config);
+  const { data: refetched } = await client.request(
+    "GET",
+    `${config.repoPath}/issues/comments/${commentId}`,
+    undefined,
+    { budget, safeRead: true },
+  );
+  requireV2IssueCommentShape(refetched, "refetched provider comment");
+  if (
+    String(refetched.id) !== commentId ||
+    !hasExactProviderIdentity(refetched) ||
+    canonicalJson(fingerprintIssueComment(refetched)) !==
+      canonicalJson(fingerprintIssueComment(eventComment))
+  ) {
+    throw new V2StaleFailure(
+      "The admitted provider comment changed or lost exact Codex identity before controller readback",
+    );
+  }
+}
+
+async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
+  sleep,
+  now,
+  pollIntervalMs,
+  pollWindowMs,
+}) {
+  validateV2StabilityTiming(pollIntervalMs, pollWindowMs);
+  if (!FULL_SHA.test(context.testMergeSha)) {
+    throw missingV2VerifierRunFailure(
+      "The current pull request has no full test-merge commit SHA",
+    );
+  }
+  const deadlineMs = now() + pollWindowMs;
+  const budget = new V2SnapshotBudget(config, { deadlineMs, now });
+  const currentPr = await loadV2PullRequest(client, config, budget);
+  assertV2ExpectedSnapshotScope(currentPr, config);
+  assertV2BeginReviewScopeSnapshot(currentPr, config, pullRequest);
+  const inventory = await listCurrentV2VerifierRuns(client, config, currentPr, budget);
+  const current = selectCurrentV2VerifierRun(inventory, config, currentPr);
+  if (!current) {
+    throw missingV2VerifierRunFailure(
+      `No canonical pull_request verifier run exists for test-merge ${context.testMergeSha}`,
+    );
+  }
+  const active = inventory.filter((run) =>
+    run.id !== current.id && isActiveV2ActionsStatus(run.status)
+  );
+  if (active.length > 0 || isActiveV2ActionsStatus(current.status)) {
+    throw new V2RuntimeFailure(
+      "A canonical verifier attempt is already queued or running; wait for it to settle, then reconcile again",
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  if (current.status !== "completed") {
+    throw new V2RuntimeFailure(
+      `Verifier run ${current.id} has unsupported baseline status ${current.status}`,
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  const baselineAttempt = current.run_attempt;
+  let rerunError = null;
+  try {
+    const response = await client.request(
+      "POST",
+      `${config.repoPath}/actions/runs/${current.id}/rerun`,
+      undefined,
+      { budget, safeRead: false },
+    );
+    if (response.status !== 201) {
+      throw new V2RuntimeFailure(
+        `Verifier rerun returned unexpected HTTP ${response.status}`,
+        { responseReceived: true, httpStatus: response.status, responsePhase: "ack" },
+      );
+    }
+  } catch (error) {
+    if (error?.httpStatus === 401 || error?.httpStatus === 403) throw error;
+    if (
+      Number.isInteger(error?.httpStatus) &&
+      error.httpStatus >= 400 &&
+      error.httpStatus < 500 &&
+      error.httpStatus !== 408 &&
+      error.httpStatus !== 429
+    ) {
+      throw new V2RuntimeFailure(
+        `GitHub definitely rejected verifier rerun ${current.id}: ${error.message}`,
+        {
+          gateOutcome: "pending",
+          recoveryCode: "wait_then_reconcile",
+          retrySafe: false,
+          httpStatus: error.httpStatus,
+          responseReceived: error.responseReceived,
+          responsePhase: error.responsePhase,
+        },
+      );
+    }
+    rerunError = error;
+  }
+
+  for (;;) {
+    if (now() >= deadlineMs) break;
+    const observed = await loadExactV2VerifierRun(
+      client,
+      config,
+      currentPr,
+      current.id,
+      budget,
+    );
+    if (observed.run_attempt > baselineAttempt + 1) {
+      throw new V2RuntimeFailure(
+        `Verifier run ${current.id} advanced from attempt ${baselineAttempt} to ` +
+          `${observed.run_attempt}; the controller cannot attribute the competing rerun`,
+        { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+      );
+    }
+    if (observed.run_attempt === baselineAttempt + 1) {
+      const job = await loadUniqueV2VerifierJob(
+        client,
+        config,
+        observed,
+        baselineAttempt + 1,
+        budget,
+      );
+      if (job) {
+        const checkRun = await loadV2VerifierCheckRun(client, config, job, budget);
+        if (
+          (job.status === "queued" || job.status === "in_progress") &&
+          (checkRun.status === "queued" || checkRun.status === "in_progress")
+        ) {
+          return {
+            runId: String(observed.id),
+            runAttempt: observed.run_attempt,
+            runUrl: observed.html_url,
+            jobId: String(job.id),
+            checkRunId: String(checkRun.id),
+          };
+        }
+        if (job.status === "completed" || checkRun.status === "completed") {
+          throw new V2RuntimeFailure(
+            `Verifier attempt ${observed.run_attempt} completed before the controller observed ` +
+              "its canonical CheckRun queued or in progress",
+            { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+          );
+        }
+      }
+    } else if (observed.run_attempt < baselineAttempt) {
+      throw new V2RuntimeFailure(
+        `Verifier run ${current.id} regressed below baseline attempt ${baselineAttempt}`,
+        { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+      );
+    }
+    const remainingMs = deadlineMs - now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(pollIntervalMs, remainingMs));
+  }
+  const suffix = rerunError
+    ? `; the rerun POST result was ambiguous: ${rerunError.message}`
+    : "";
+  throw new V2RuntimeFailure(
+    `Verifier rerun ${current.id} attempt ${baselineAttempt + 1} did not become ` +
+      `uniquely observable before the controller deadline${suffix}`,
+    { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+  );
+}
+
+async function listCurrentV2VerifierRuns(client, config, pullRequest, budget) {
+  const workflow = encodeURIComponent(V2_VERIFIER_WORKFLOW_PATH);
+  const runs = [];
+  const seen = new Set();
+  for (const associatedSha of new Set([config.expectedHeadSha, config.testMergeSha])) {
+    let queryCount = 0;
+    for (let page = 1; ; page += 1) {
+      const path =
+        `${config.repoPath}/actions/workflows/${workflow}/runs` +
+        `?event=pull_request&head_sha=${encodeURIComponent(associatedSha)}` +
+        `&per_page=100&page=${page}`;
+      const { data, headers } = await client.request(
+        "GET",
+        path,
+        undefined,
+        { budget, safeRead: true },
+      );
+      budget.consumePage(`canonical verifier workflow runs for ${associatedSha}`);
+      if (
+        !isPlainRecord(data) ||
+        !isNonNegativeSafeInteger(data.total_count) ||
+        !Array.isArray(data.workflow_runs) ||
+        data.workflow_runs.length > 100
+      ) {
+        throw new V2RuntimeFailure("Verifier workflow-run inventory has an invalid shape");
+      }
+      queryCount += data.workflow_runs.length;
+      for (const [index, run] of data.workflow_runs.entries()) {
+        requireV2VerifierRunShape(run, `verifier workflow run ${runs.length + index + 1}`);
+        const id = String(run.id);
+        if (!seen.has(id)) {
+          seen.add(id);
+          runs.push(run);
+        }
+      }
+      budget.consumeObjects(data.workflow_runs.length, "canonical verifier workflow runs");
+      const { hasNext } = inspectV2PaginationLink(
+        headers.get("link"),
+        "canonical verifier workflow runs",
+      );
+      if (!hasNext) {
+        if (queryCount !== data.total_count) {
+          throw new V2RuntimeFailure(
+            `Verifier workflow-run inventory count changed (${queryCount} != ${data.total_count})`,
+            { recoveryCode: "wait_then_reconcile" },
+          );
+        }
+        break;
+      }
+    }
+  }
+  return runs.filter((run) => v2VerifierRunMatchesScope(run, config, pullRequest));
+}
+
+function selectCurrentV2VerifierRun(runs, config, pullRequest) {
+  const candidates = runs
+    .filter((run) => v2VerifierRunMatchesScope(run, config, pullRequest))
+    .sort((left, right) =>
+      right.run_number - left.run_number || right.id - left.id
+    );
+  if (candidates.length > 1) {
+    const first = candidates[0];
+    const second = candidates[1];
+    if (first.run_number === second.run_number) {
+      throw new V2RuntimeFailure(
+        "Canonical verifier workflow-run ordering is ambiguous",
+        { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+      );
+    }
+  }
+  return candidates[0] || null;
+}
+
+function v2VerifierRunMatchesScope(run, config, pullRequest) {
+  const matchingPrs = run.pull_requests.filter((value) =>
+    Number(value?.number) === config.prNumber &&
+    String(value?.head?.sha || "").toLowerCase() === config.expectedHeadSha &&
+    String(value?.base?.sha || "").toLowerCase() ===
+      String(pullRequest.base.sha || "").toLowerCase()
+  );
+  return run.event === "pull_request" &&
+    isCanonicalV2VerifierWorkflowPath(run.path) &&
+    (run.head_sha === config.expectedHeadSha || run.head_sha === config.testMergeSha) &&
+    matchingPrs.length === 1;
+}
+
+function isCanonicalV2VerifierWorkflowPath(path) {
+  const canonical = `.github/workflows/${V2_VERIFIER_WORKFLOW_PATH}`;
+  return path === canonical || path.startsWith(`${canonical}@`);
+}
+
+function requireV2VerifierRunShape(run, label) {
+  if (
+    !isPlainRecord(run) ||
+    !Number.isSafeInteger(run.id) ||
+    run.id <= 0 ||
+    !Number.isSafeInteger(run.run_number) ||
+    run.run_number <= 0 ||
+    !Number.isSafeInteger(run.run_attempt) ||
+    run.run_attempt <= 0 ||
+    typeof run.event !== "string" ||
+    typeof run.path !== "string" ||
+    !FULL_SHA.test(String(run.head_sha || "").toLowerCase()) ||
+    typeof run.status !== "string" ||
+    typeof run.html_url !== "string" ||
+    !Array.isArray(run.pull_requests)
+  ) {
+    throw new V2RuntimeFailure(`${label} has an incomplete or inconsistent shape`);
+  }
+}
+
+async function loadExactV2VerifierRun(client, config, pullRequest, runId, budget) {
+  const { data } = await client.request(
+    "GET",
+    `${config.repoPath}/actions/runs/${runId}`,
+    undefined,
+    { budget, safeRead: true },
+  );
+  requireV2VerifierRunShape(data, `verifier workflow run ${runId}`);
+  if (
+    String(data.id) !== String(runId) ||
+    !v2VerifierRunMatchesScope(data, config, pullRequest)
+  ) {
+    throw new V2RuntimeFailure(`Verifier workflow run ${runId} changed identity during readback`);
+  }
+  return data;
+}
+
+async function loadUniqueV2VerifierJob(client, config, run, attempt, budget) {
+  const jobs = [];
+  const seen = new Set();
+  for (let page = 1; ; page += 1) {
+    const path =
+      `${config.repoPath}/actions/runs/${run.id}/attempts/${attempt}/jobs` +
+      `?per_page=100&page=${page}`;
+    const { data, headers } = await client.request(
+      "GET",
+      path,
+      undefined,
+      { budget, safeRead: true },
+    );
+    budget.consumePage(`verifier attempt ${attempt} jobs`);
+    if (
+      !isPlainRecord(data) ||
+      !isNonNegativeSafeInteger(data.total_count) ||
+      !Array.isArray(data.jobs) ||
+      data.jobs.length > 100
+    ) {
+      throw new V2RuntimeFailure(`Verifier attempt ${attempt} jobs have an invalid shape`);
+    }
+    for (const job of data.jobs) {
+      requireV2VerifierJobShape(job, run, attempt, config);
+      const id = String(job.id);
+      if (seen.has(id)) {
+        throw new V2RuntimeFailure(`Verifier attempt ${attempt} repeats job ${id}`);
+      }
+      seen.add(id);
+    }
+    budget.consumeObjects(data.jobs.length, `verifier attempt ${attempt} jobs`);
+    jobs.push(...data.jobs);
+    const { hasNext } = inspectV2PaginationLink(
+      headers.get("link"),
+      `verifier attempt ${attempt} jobs`,
+    );
+    if (!hasNext) {
+      if (jobs.length !== data.total_count) {
+        throw new V2RuntimeFailure(
+          `Verifier attempt ${attempt} job count changed (${jobs.length} != ${data.total_count})`,
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      break;
+    }
+  }
+  const matches = jobs.filter((job) => job.name === V2_REQUIRED_CHECK_NAME);
+  if (matches.length > 1) {
+    throw new V2RuntimeFailure(
+      `Verifier attempt ${attempt} has ${matches.length} canonical jobs`,
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  return matches[0] || null;
+}
+
+function requireV2VerifierJobShape(job, run, attempt, config) {
+  if (
+    !isPlainRecord(job) ||
+    !Number.isSafeInteger(job.id) ||
+    job.id <= 0 ||
+    Number(job.run_id) !== run.id ||
+    Number(job.run_attempt) !== attempt ||
+    typeof job.name !== "string" ||
+    String(job.head_sha || "").toLowerCase() !== config.testMergeSha ||
+    typeof job.status !== "string" ||
+    typeof job.check_run_url !== "string"
+  ) {
+    throw new V2RuntimeFailure(
+      `Verifier attempt ${attempt} contains an incomplete or inconsistent job`,
+    );
+  }
+}
+
+async function loadV2VerifierCheckRun(client, config, job, budget) {
+  const expectedPrefix = `${config.apiUrl}${config.repoPath}/check-runs/`;
+  if (!job.check_run_url.startsWith(expectedPrefix)) {
+    throw new V2RuntimeFailure("Canonical verifier job exposed an out-of-scope CheckRun URL");
+  }
+  const { data } = await client.request(
+    "GET",
+    job.check_run_url,
+    undefined,
+    { budget, safeRead: true },
+  );
+  if (
+    !isPlainRecord(data) ||
+    !Number.isSafeInteger(data.id) ||
+    data.id <= 0 ||
+    data.name !== V2_REQUIRED_CHECK_NAME ||
+    String(data.head_sha || "").toLowerCase() !== config.testMergeSha ||
+    typeof data.status !== "string" ||
+    data.app?.id !== V2_GITHUB_ACTIONS_APP_ID ||
+    data.app?.slug !== "github-actions"
+  ) {
+    throw new V2RuntimeFailure(
+      "Canonical verifier CheckRun failed exact name, head, or GitHub Actions source readback",
+    );
+  }
+  return data;
+}
+
+function isActiveV2ActionsStatus(status) {
+  return new Set(["queued", "in_progress", "pending", "requested", "waiting"]).has(status);
+}
+
+function missingV2VerifierRunFailure(reason) {
+  return new V2RuntimeFailure(reason, {
+    gateOutcome: "not_applicable",
+    recoveryCode: "create_verifier_run",
+    retrySafe: false,
+  });
+}
+
+async function ensureV2ControllerReviewRequest(client, config, context, initialPr, { now }) {
   const budget = new V2SnapshotBudget(config, {
     deadlineMs: now() + config.limits.reconcileBudgetMs,
     now,
   });
   if (!config.requestReview) {
     await assertV2BeginReviewScope(client, config, initialPr, budget);
-    return finishV2Run(client, config, context, buildV2GateReport({
-      executionHealth: "healthy",
-      gateOutcome: "pending",
-      reason: "The current head is pending; request creation was disabled",
-      recoveryCode: "wait_provider",
-      statusProjection: "pending",
-    }));
+    return { kind: "disabled", commentId: null };
   }
 
   const comments = await client.paginate(
@@ -1266,15 +1872,11 @@ async function runV2BeginReview(client, config, context, initialPr, { now }) {
   );
   if (matching.length > 0) {
     await assertV2BeginReviewScope(client, config, initialPr, budget);
-    return finishV2Run(client, config, context, buildV2GateReport({
-      executionHealth: "healthy",
-      gateOutcome: "pending",
-      reason: matching.length === 1
-        ? "The exact same-run Codex review request already exists"
-        : `${matching.length} duplicate same-run requests exist and were folded conservatively`,
-      recoveryCode: "wait_provider",
-      statusProjection: "pending",
-    }));
+    return {
+      kind: matching.length === 1 ? "adopted" : "duplicates",
+      commentId: matching[0].id,
+      duplicateCount: matching.length,
+    };
   }
 
   const prePostPr = await loadV2PullRequest(client, config, budget);
@@ -1295,66 +1897,113 @@ async function runV2BeginReview(client, config, context, initialPr, { now }) {
     baseRepositoryId: initialPr.base.repo.id,
     runId: config.runId,
   });
-  let created;
+  let mayHaveCommitted = false;
+  let postReturnedSuccessfully = false;
   try {
-    ({ data: created } = await client.request(
-      "POST",
-      `${config.repoPath}/issues/${config.prNumber}/comments`,
-      { body: requestBody },
-      { retry: false, budget },
-    ));
-  } catch (postError) {
-    let visible = [];
     try {
-      const reread = await client.paginate(
+      mayHaveCommitted = true;
+      const { data: created } = await client.request(
+        "POST",
         `${config.repoPath}/issues/${config.prNumber}/comments`,
-        {
-          budget,
-          label: "post-unknown review-request comments",
-          validate: requireV2IssueCommentShape,
-        },
+        { body: requestBody },
+        { budget },
       );
-      context.issueComments = reread;
-      visible = canonicalV2RequestComments(reread).filter(({ binding }) =>
-        binding.repositoryId === context.repositoryId &&
-        binding.prNumber === String(config.prNumber) &&
-        binding.headSha === context.expectedHeadSha &&
-        binding.baseSha === String(initialPr.base.sha).toLowerCase() &&
-        binding.baseRef === initialPr.base.ref &&
-        binding.baseRepositoryId === String(initialPr.base.repo.id) &&
-        binding.runId === config.runId
+      postReturnedSuccessfully = true;
+      const createdId = canonicalPositiveId(created?.id);
+      if (!createdId) {
+        throw new V2RuntimeFailure(
+          "Review-request POST response omitted a canonical comment id",
+        );
+      }
+      const { data: refetched } = await client.request(
+        "GET",
+        `${config.repoPath}/issues/comments/${createdId}`,
+        undefined,
+        { budget, safeRead: true },
       );
-    } catch {
-      // The POST and its visibility are both unknown; never blindly repeat it.
+      requireExactV2CreatedReviewRequest(
+        refetched,
+        createdId,
+        requestBody,
+        config.runId,
+      );
+      context.issueComments = [...comments, refetched];
+
+      const postRequestPr = await loadV2PullRequest(client, config, budget);
+      assertV2BeginReviewScopeSnapshot(postRequestPr, config, initialPr);
+      mayHaveCommitted = false;
+      return { kind: "created", commentId: createdId };
+    } catch (postError) {
+      if (
+        !postReturnedSuccessfully &&
+        (postError?.httpStatus === 401 || postError?.httpStatus === 403)
+      ) {
+        mayHaveCommitted = false;
+        throw postError;
+      }
+      let visible = [];
+      let visibilityError = null;
+      try {
+        const reread = await client.paginate(
+          `${config.repoPath}/issues/${config.prNumber}/comments`,
+          {
+            budget,
+            label: "post-unknown review-request comments",
+            validate: requireV2IssueCommentShape,
+          },
+        );
+        context.issueComments = reread;
+        visible = canonicalV2RequestComments(reread).filter(({ binding }) =>
+          binding.repositoryId === context.repositoryId &&
+          binding.prNumber === String(config.prNumber) &&
+          binding.headSha === context.expectedHeadSha &&
+          binding.baseSha === String(initialPr.base.sha).toLowerCase() &&
+          binding.baseRef === initialPr.base.ref &&
+          binding.baseRepositoryId === String(initialPr.base.repo.id) &&
+          binding.runId === config.runId
+        );
+        if (visible.length > 0) {
+          await exactRefetchV2RelevantObjects(
+            client,
+            config,
+            budget,
+            reread,
+            [],
+            visible,
+          );
+        }
+      } catch (error) {
+        visibilityError = error;
+      }
+      await assertV2BeginReviewScope(client, config, initialPr, budget);
+      if (visible.length > 0 && visibilityError === null) {
+        mayHaveCommitted = false;
+        return {
+          kind: visible.length === 1 ? "adopted-after-unknown" : "duplicates-after-unknown",
+          commentId: visible[0].id,
+          duplicateCount: visible.length,
+        };
+      }
+      const detail = visibilityError
+        ? `; visibility verification failed: ${visibilityError.message}`
+        : "";
+      throw new V2RuntimeFailure(
+        `Review-request POST visibility remains unknown: ${postError.message}${detail}`,
+      );
     }
-    await assertV2BeginReviewScope(client, config, initialPr, budget);
-    if (visible.length > 0) {
-      return finishV2Run(client, config, context, buildV2GateReport({
-        executionHealth: "healthy",
-        gateOutcome: "pending",
-        reason: "The POST result was unknown, but the exact same-run request is now visible",
-        recoveryCode: "wait_provider",
-        statusProjection: "pending",
-      }));
+  } catch (error) {
+    if (!mayHaveCommitted || isSaferV2BeginReviewFailure(error)) throw error;
+    if (error?.recoveryCode === "retry_begin" && error?.retrySafe === false) {
+      throw error;
     }
     throw new V2RuntimeFailure(
-      `Review-request POST visibility remains unknown: ${postError.message}`,
-      { recoveryCode: "retry_begin" },
+      `Review-request creation may have committed but was not fully verified: ${error.message}`,
+      { recoveryCode: "retry_begin", retrySafe: false },
     );
   }
-  const createdId = canonicalPositiveId(created?.id);
-  if (!createdId) {
-    throw new V2RuntimeFailure(
-      "Review-request POST response omitted a canonical comment id",
-      { recoveryCode: "retry_begin" },
-    );
-  }
-  const { data: refetched } = await client.request(
-    "GET",
-    `${config.repoPath}/issues/comments/${createdId}`,
-    undefined,
-    { budget },
-  );
+}
+
+function requireExactV2CreatedReviewRequest(refetched, createdId, requestBody, runId) {
   requireV2IssueCommentShape(refetched, "created review request");
   if (
     String(refetched?.id ?? "") !== createdId ||
@@ -1362,23 +2011,16 @@ async function runV2BeginReview(client, config, context, initialPr, { now }) {
     refetched?.user?.login !== GITHUB_ACTIONS_BOT_LOGIN ||
     refetched?.user?.type !== "Bot" ||
     refetched?.created_at !== refetched?.updated_at ||
-    parseCanonicalV2ReviewRequestBody(refetched.body)?.runId !== config.runId
+    parseCanonicalV2ReviewRequestBody(refetched.body)?.runId !== runId
   ) {
-    throw new V2RuntimeFailure("Created review request failed exact refetch binding", {
-      recoveryCode: "retry_begin",
-    });
+    throw new V2RuntimeFailure("Created review request failed exact refetch binding");
   }
-  context.issueComments = [...comments, refetched];
+}
 
-  const postRequestPr = await loadV2PullRequest(client, config, budget);
-  assertV2BeginReviewScopeSnapshot(postRequestPr, config, initialPr);
-  return finishV2Run(client, config, context, buildV2GateReport({
-    executionHealth: "healthy",
-    gateOutcome: "pending",
-    reason: "Codex review was requested for the exact expected head",
-    recoveryCode: "wait_provider",
-    statusProjection: "pending",
-  }));
+function isSaferV2BeginReviewFailure(error) {
+  return error instanceof V2StaleFailure ||
+    error?.recoveryCode === "refresh_head" ||
+    error?.recoveryCode === "unsupported_target";
 }
 
 async function assertV2BeginReviewScope(client, config, initialPr, budget) {
@@ -1476,66 +2118,18 @@ async function publishV2SnapshotDecision(client, config, context, snapshot) {
   context.headSha = snapshot.headSha;
   context.issueComments = snapshot.issueComments;
   const decision = snapshot.decision;
-  const state = decision.gateOutcome === "success"
-    ? "success"
-    : decision.gateOutcome === "failure"
-      ? "failure"
-      : "pending";
   const report = buildV2GateReport({
     executionHealth: "healthy",
     gateOutcome: decision.gateOutcome,
     reason: decision.reason,
     recoveryCode: decision.recoveryCode,
-    statusProjection: state,
     findingsUnresolved: snapshot.counts.unresolved,
     findingsResolved: snapshot.counts.resolved,
     findingsHistorical: snapshot.counts.historical,
     findingsIndeterminate: snapshot.counts.indeterminate,
   });
-  if (state === "success") {
-    // Persist every mandatory local result before the authoritative success write.
-    // After GitHub acknowledges success, only best-effort diagnostics may run.
-    persistV2ReportFiles(config, report, context);
-    try {
-      await postV2Status(client, config, context.headSha, state, decision.statusDescription);
-    } catch (error) {
-      const failed = buildV2GateReport({
-        executionHealth: "unhealthy",
-        gateOutcome: "unknown",
-        reason: `Clean evidence was stable, but success projection failed: ${error.message}`,
-        recoveryCode: "repair_permissions",
-        statusProjection: "failed",
-        findingsUnresolved: snapshot.counts.unresolved,
-        findingsResolved: snapshot.counts.resolved,
-        findingsHistorical: snapshot.counts.historical,
-        findingsIndeterminate: snapshot.counts.indeterminate,
-      });
-      persistV2ReportFiles(config, failed, context);
-      await writeV2StickyBestEffort(client, config, context, failed);
-      return { report: failed, exitCode: 1 };
-    }
-    await writeV2StickyBestEffort(client, config, context, report);
-    return { report, exitCode: 0 };
-  }
-  if (state === "failure") {
-    try {
-      await postV2Status(client, config, context.headSha, state, decision.statusDescription);
-    } catch (error) {
-      const failed = buildV2GateReport({
-        executionHealth: "unhealthy",
-        gateOutcome: "failure",
-        reason: `${decision.reason}; failure projection failed: ${error.message}`,
-        recoveryCode: "repair_permissions",
-        statusProjection: "failed",
-        findingsUnresolved: snapshot.counts.unresolved,
-        findingsResolved: snapshot.counts.resolved,
-        findingsHistorical: snapshot.counts.historical,
-        findingsIndeterminate: snapshot.counts.indeterminate,
-      });
-      return finishV2Run(client, config, context, failed);
-    }
-  }
-  return finishV2Run(client, config, context, report);
+  await finalizeV2Report(client, config, context, report);
+  return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
 }
 
 async function publishV2UnstablePending(client, config, context, snapshot, detail = "") {
@@ -1544,17 +2138,18 @@ async function publishV2UnstablePending(client, config, context, snapshot, detai
   }
   context.issueComments = snapshot?.issueComments || [];
   const detailSuffix = detail ? `: ${oneLine(detail, "unstable evidence")}` : "";
-  return finishV2Run(client, config, context, buildV2GateReport({
+  const report = buildV2GateReport({
     executionHealth: "unhealthy",
     gateOutcome: "pending",
     reason: `GitHub review evidence did not stabilize across two complete snapshots${detailSuffix}`,
     recoveryCode: "wait_then_reconcile",
-    statusProjection: "pending",
     findingsUnresolved: snapshot?.counts?.unresolved ?? "unknown",
     findingsResolved: snapshot?.counts?.resolved ?? "unknown",
     findingsHistorical: snapshot?.counts?.historical ?? "unknown",
     findingsIndeterminate: snapshot?.counts?.indeterminate ?? "unknown",
-  }));
+  });
+  await finalizeV2Report(client, config, context, report);
+  return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
 }
 
 function staleV2Report(reason) {
@@ -1566,35 +2161,12 @@ function staleV2Report(reason) {
   });
 }
 
-function finishV2WithoutWrites(config, context, report) {
-  persistV2ReportFiles(config, report, context);
-  return { report, exitCode: report.executionHealth === "healthy" ? 0 : 1 };
-}
-
 function normalizeV2FailureCounts(counts) {
   return {
     unresolved: counts?.unresolved ?? "unknown",
     resolved: counts?.resolved ?? "unknown",
     historical: counts?.historical ?? "unknown",
     indeterminate: counts?.indeterminate ?? "unknown",
-  };
-}
-
-async function finishV2Run(client, config, context, report) {
-  if (config) {
-    persistV2ReportFiles(config, report, context);
-  }
-  if (
-    client &&
-    config &&
-    Number.isSafeInteger(context.prNumber) &&
-    FULL_SHA.test(context.headSha)
-  ) {
-    await writeV2StickyBestEffort(client, config, context, report);
-  }
-  return {
-    report,
-    exitCode: report.executionHealth === "healthy" ? 0 : 1,
   };
 }
 
@@ -1700,52 +2272,67 @@ function readV2Config(environment) {
 function validateV2Trigger(config) {
   const eventName = String(config.environment.GITHUB_EVENT_NAME || "");
   if (
+    eventName !== "pull_request" &&
     eventName !== "issue_comment" &&
-    eventName !== "pull_request_target" &&
     eventName !== "workflow_dispatch"
   ) {
-    throw new V2RuntimeFailure(`Unsupported v2 runtime event: ${eventName}`);
+    throw new V2RuntimeFailure(`Unsupported v2 runtime event: ${eventName}`, {
+      gateOutcome: "not_applicable",
+      recoveryCode: "unsupported_target",
+    });
   }
   const event = readEvent(config.environment.GITHUB_EVENT_PATH);
-  if (eventName === "workflow_dispatch") {
+  if (eventName === "pull_request") {
+    const allowedActions = new Set(["opened", "reopened", "synchronize", "ready_for_review"]);
+    const eventPr = event?.pull_request;
+    const eventHead = String(eventPr?.head?.sha || "").toLowerCase();
     if (
-      !config.expectedHeadSha ||
-      (event?.repository?.full_name != null &&
-        event.repository.full_name !== config.repository)
-    ) {
-      throw new V2RuntimeFailure(
-        "workflow_dispatch did not bind the exact repository and expected head",
-        { gateOutcome: "not_applicable", recoveryCode: "unsupported_target" },
-      );
-    }
-    return { triggerKind: "manual", event };
-  }
-  if (eventName === "pull_request_target") {
-    const previousBaseRef = event?.changes?.base?.ref?.from;
-    if (
-      event?.action !== "edited" ||
-      !isPlainRecord(event?.pull_request) ||
-      Number(event?.number ?? event?.pull_request?.number) !== config.prNumber ||
-      Number(event?.pull_request?.number) !== config.prNumber ||
+      !allowedActions.has(event?.action) ||
+      !isPlainRecord(eventPr) ||
+      Number(event?.number) !== config.prNumber ||
+      Number(eventPr?.number) !== config.prNumber ||
       event?.repository?.full_name !== config.repository ||
-      typeof event?.repository?.default_branch !== "string" ||
-      event.repository.default_branch.trim() === "" ||
-      typeof previousBaseRef !== "string" ||
-      previousBaseRef.trim() === "" ||
-      previousBaseRef === event?.pull_request?.base?.ref ||
-      event?.pull_request?.base?.ref !== event.repository.default_branch ||
-      event?.pull_request?.base?.repo?.full_name !== config.repository ||
-      String(event?.pull_request?.head?.sha || "").toLowerCase() !==
-        config.expectedHeadSha ||
+      eventPr?.base?.repo?.full_name !== config.repository ||
+      eventPr?.head?.repo?.full_name !== config.repository ||
+      !FULL_SHA.test(eventHead) ||
+      config.expectedHeadSha !== eventHead ||
       config.operation !== "reconcile" ||
       config.requestReview !== false ||
       config.requestCommentId !== ""
     ) {
       throw new V2RuntimeFailure(
-        "pull_request_target trigger did not satisfy the exact base-ref-change contract",
+        "pull_request trigger did not satisfy the exact read-only verifier contract",
+        { gateOutcome: "not_applicable", recoveryCode: "unsupported_target" },
       );
     }
-    return { triggerKind: "base-change", event };
+    return { triggerKind: "verifier", triggerSource: "pull_request", event };
+  }
+  if (eventName === "workflow_dispatch") {
+    const inputs = event?.inputs;
+    let eventRequestReview;
+    try {
+      eventRequestReview = normalizeV2RequestReview(inputs?.request_review);
+    } catch {
+      eventRequestReview = null;
+    }
+    if (
+      !config.expectedHeadSha ||
+      (event?.repository?.full_name != null &&
+        event.repository.full_name !== config.repository) ||
+      !isPlainRecord(inputs) ||
+      String(inputs.operation || "") !== config.operation ||
+      String(inputs.pr_number || "") !== String(config.prNumber) ||
+      String(inputs.expected_head_sha || "").toLowerCase() !== config.expectedHeadSha ||
+      String(inputs.request_comment_id || "") !== config.requestCommentId ||
+      eventRequestReview !== config.requestReview ||
+      (config.operation === "reconcile" && config.requestReview !== false)
+    ) {
+      throw new V2RuntimeFailure(
+        "workflow_dispatch did not bind the exact controller operation, repository, PR, and head",
+        { gateOutcome: "not_applicable", recoveryCode: "unsupported_target" },
+      );
+    }
+    return { triggerKind: "controller", triggerSource: "manual", event };
   }
   if (
     (event?.action !== "created" && event?.action !== "edited") ||
@@ -1760,13 +2347,21 @@ function validateV2Trigger(config) {
     (config.requestCommentId !== "" &&
       config.requestCommentId !== canonicalPositiveId(event?.comment?.id))
   ) {
-    throw new V2RuntimeFailure("issue_comment trigger did not satisfy the exact Codex sender/author contract");
+    throw new V2RuntimeFailure(
+      "issue_comment trigger did not satisfy the exact Codex sender/author contract",
+      { gateOutcome: "not_applicable", recoveryCode: "unsupported_target" },
+    );
   }
-  return { triggerKind: "provider", event };
+  return { triggerKind: "controller", triggerSource: "provider", event };
 }
 
 async function loadV2Repository(client, config, budget) {
-  const { data } = await client.request("GET", config.repoPath, undefined, { budget });
+  const { data } = await client.request(
+    "GET",
+    config.repoPath,
+    undefined,
+    { budget, safeRead: true },
+  );
   budget?.consumeObjects(1, "repository metadata");
   if (
     !isPlainRecord(data) ||
@@ -1820,7 +2415,7 @@ function classifyUnsupportedV2Target(repository, pullRequest, config) {
   ) {
     return "Action v2 supports ordinary, non-bot same-repository branches only";
   }
-  if (config.triggerKind === "manual") {
+  if (config.triggerSource === "manual") {
     const refType = String(config.environment.GITHUB_REF_TYPE || "");
     const refName = String(config.environment.GITHUB_REF_NAME || "");
     if (refType !== "branch" || refName !== repository.default_branch) {
@@ -1858,14 +2453,53 @@ async function loadCompleteV2Snapshot(client, config, {
   const before = await loadV2PullRequest(client, config, budget);
   assertV2ExpectedSnapshotScope(before, config);
   assertV2FixedSnapshotScope(beforeRepository, before, config);
+  const opening = await loadV2DecisionCarriers(client, config, budget, before);
+  const closing = await loadV2DecisionCarriers(client, config, budget, before);
+  const afterRepository = await loadV2Repository(client, config, budget);
+  const after = await loadV2PullRequest(client, config, budget);
+  assertV2ExpectedSnapshotScope(after, config);
+  assertV2FixedSnapshotScope(afterRepository, after, config);
+
+  const selfConsistent =
+    sameV2RepositoryScope(beforeRepository, afterRepository) &&
+    sameV2PullRequestScope(before, after) &&
+    sameV2InventoryCounts(before, after) &&
+    opening.fingerprint === closing.fingerprint;
+  const fingerprintPayload = {
+    repository: {
+      opening: fingerprintV2RepositoryScope(beforeRepository),
+      closing: fingerprintV2RepositoryScope(afterRepository),
+    },
+    pullRequest: {
+      opening: fingerprintV2PullRequestScope(before),
+      closing: fingerprintV2PullRequestScope(after),
+    },
+    decisionCarriers: {
+      opening: opening.fingerprint,
+      closing: closing.fingerprint,
+    },
+  };
+  budget.assertWithinDeadline("complete GitHub snapshot");
+  return {
+    selfConsistent,
+    headSha: config.expectedHeadSha,
+    baseSha: after.base.sha.toLowerCase(),
+    fingerprint: fingerprintV2Snapshot(fingerprintPayload),
+    issueComments: closing.issueComments,
+    counts: closing.decisionEvidence.counts,
+    decision: closing.decisionEvidence.decision,
+  };
+}
+
+async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
   const headSha = config.expectedHeadSha;
-  const baseSha = before.base.sha.toLowerCase();
-  const [issueComments, reviews, beforeBaseEpoch] = await Promise.all([
+  const baseSha = pullRequest.base.sha.toLowerCase();
+  const [issueComments, reviews, baseEpoch] = await Promise.all([
     client.paginate(`${config.repoPath}/issues/${config.prNumber}/comments`, {
       budget,
       label: "pull-request issue comments",
       validate: requireV2IssueCommentShape,
-      expectedCount: before.comments,
+      expectedCount: pullRequest.comments,
     }),
     client.paginate(`${config.repoPath}/pulls/${config.prNumber}/reviews`, {
       budget,
@@ -1874,7 +2508,7 @@ async function loadCompleteV2Snapshot(client, config, {
     }),
     loadLatestV2BaseEpoch(client, config, budget),
   ]);
-  requireMatchingV2InventoryCount(before.comments, issueComments, "issue comments");
+  requireMatchingV2InventoryCount(pullRequest.comments, issueComments, "issue comments");
   const requestAuthority = await collectAuthorizedV2Requests(
     client,
     config,
@@ -1892,9 +2526,9 @@ async function loadCompleteV2Snapshot(client, config, {
   const { generationRequests: reactionRequests } = selectCurrentV2RequestGenerations({
     headSha,
     baseSha,
-    baseRef: before.base.ref,
-    baseRepositoryId: String(before.base.repo.id),
-    baseEpoch: beforeBaseEpoch,
+    baseRef: pullRequest.base.ref,
+    baseRepositoryId: String(pullRequest.base.repo.id),
+    baseEpoch,
     requests: requestAuthority.authorized,
   });
   const requestReactions = new Map();
@@ -1929,57 +2563,20 @@ async function loadCompleteV2Snapshot(client, config, {
   const decisionEvidence = reduceV2Evidence({
     headSha,
     baseSha,
-    baseRef: before.base.ref,
-    baseRepositoryId: String(before.base.repo.id),
-    baseEpoch: beforeBaseEpoch,
+    baseRef: pullRequest.base.ref,
+    baseRepositoryId: String(pullRequest.base.repo.id),
+    baseEpoch,
     requests: requestAuthority.authorized,
     requestErrors: requestAuthority.errors,
     requestReactions,
     artifacts: providerEvidence.artifacts,
     providerErrors: providerEvidence.errors,
   });
-  const [afterRepository, after, afterBaseEpoch] = await Promise.all([
-    loadV2Repository(client, config, budget),
-    loadV2PullRequest(client, config, budget),
-    loadLatestV2BaseEpoch(client, config, budget),
-  ]);
-  assertV2ExpectedSnapshotScope(after, config);
-  assertV2FixedSnapshotScope(afterRepository, after, config);
-  const selfConsistent =
-    sameV2RepositoryScope(beforeRepository, afterRepository) &&
-    sameV2PullRequestScope(before, after) &&
-    sameV2InventoryCounts(before, after) &&
-    canonicalJson(beforeBaseEpoch) === canonicalJson(afterBaseEpoch);
-  const fingerprintPayload = {
-    repository: {
-      id: beforeRepository.id,
-      fullName: beforeRepository.full_name,
-      defaultBranch: beforeRepository.default_branch,
-      closingId: afterRepository.id,
-      closingFullName: afterRepository.full_name,
-      closingDefaultBranch: afterRepository.default_branch,
-    },
-    pullRequest: {
-      number: before.number,
-      state: before.state,
-      draft: before.draft,
-      merged: before.merged === true,
-      mergedAt: before.merged_at || null,
-      headSha,
-      baseSha,
-      baseRef: before.base.ref,
-      baseRepoId: before.base.repo.id,
-      baseRepoFullName: before.base.repo.full_name,
-      closingState: after.state,
-      closingDraft: after.draft,
-      closingMerged: after.merged === true,
-      closingMergedAt: after.merged_at || null,
-      closingHeadSha: String(after.head?.sha || "").toLowerCase(),
-      closingBaseSha: String(after.base?.sha || "").toLowerCase(),
-      closingBaseRef: after.base?.ref || null,
-      closingBaseRepoId: after.base?.repo?.id ?? null,
-      closingBaseRepoFullName: after.base?.repo?.full_name || null,
-    },
+  const carrierPayload = {
+    headSha,
+    baseSha,
+    baseRef: pullRequest.base.ref,
+    baseRepositoryId: String(pullRequest.base.repo.id),
     issueComments: issueComments
       .filter(isRelevantV2IssueComment)
       .sort(compareV2IssueCommentsOldestFirst)
@@ -1994,6 +2591,7 @@ async function loadCompleteV2Snapshot(client, config, {
             reaction?.user?.type === "Bot" &&
             (reaction?.content === "+1" || reaction?.content === "eyes"),
           )
+          .sort(compareV2CanonicalIdsAscending)
           .map(fingerprintReaction),
       })),
     reviews: reviews
@@ -2008,25 +2606,17 @@ async function loadCompleteV2Snapshot(client, config, {
       revisionAt: request.comment.updated_at,
     })),
     requestErrors: requestAuthority.errors,
-    baseEpoch: {
-      opening: beforeBaseEpoch,
-      closing: afterBaseEpoch,
-    },
+    baseEpoch,
     commitResolutions: providerEvidence.commitResolutions,
     providerErrors: providerEvidence.errors,
     exactRefetch: true,
     decision: decisionEvidence.decision,
     counts: decisionEvidence.counts,
   };
-  budget.assertWithinDeadline("complete GitHub snapshot");
   return {
-    selfConsistent,
-    headSha,
-    baseSha,
-    fingerprint: fingerprintV2Snapshot(fingerprintPayload),
+    fingerprint: fingerprintV2Snapshot(carrierPayload),
     issueComments,
-    counts: decisionEvidence.counts,
-    decision: decisionEvidence.decision,
+    decisionEvidence,
   };
 }
 
@@ -2234,7 +2824,6 @@ function reduceV2Evidence({
           ? `; evidence warning: ${oneLine(blockingErrors[0], "invalid evidence")}`
           : ""),
       recoveryCode: "fix_findings",
-      statusDescription: `Codex reported ${counts.unresolved} unresolved finding(s)`,
     };
   } else if (blockingErrors.length > 0) {
     decision = {
@@ -2243,7 +2832,6 @@ function reduceV2Evidence({
         `Codex evidence is invalid or incomplete: ` +
         `${oneLine(blockingErrors[0], "unknown error")}`,
       recoveryCode: "request_clean_generation",
-      statusDescription: "Codex review evidence is invalid or incomplete",
     };
   } else if (selectedClean && requestEpoch.selected) {
     decision = {
@@ -2251,14 +2839,12 @@ function reduceV2Evidence({
       reason:
         `Stable current-head Codex clean evidence from ${selectedClean.source} ${selectedClean.id}`,
       recoveryCode: "none",
-      statusDescription: "Stable current-head Codex review is clean",
     };
   } else if (cleanBlockedByLiveness) {
     decision = {
       gateOutcome: "pending",
       reason: "Codex activity at or after the latest clean evidence indicates review is still in progress",
       recoveryCode: "wait_provider",
-      statusDescription: "Waiting for Codex review activity to reach a terminal result",
     };
   } else if (hasUnattributableEpochTerminalClean) {
     decision = {
@@ -2268,14 +2854,12 @@ function reduceV2Evidence({
         "attributed to the latest exact head/base-bound canonical request; obtain a qualifying " +
         "Codex +1 reaction on that request, then run manual reconcile",
       recoveryCode: "request_clean_generation",
-      statusDescription: "Waiting for base-bound Codex clean reaction evidence",
     };
   } else {
     decision = {
       gateOutcome: "pending",
       reason: "No complete Codex terminal result is bound to the current head",
       recoveryCode: "wait_provider",
-      statusDescription: "Waiting for a current-head Codex terminal result",
     };
   }
   return { counts, decision };
@@ -2390,6 +2974,13 @@ function assertV2ExpectedSnapshotScope(pullRequest, config) {
       recoveryCode: "unsupported_target",
     });
   }
+  const testMergeSha = String(pullRequest?.merge_commit_sha || "").toLowerCase();
+  if (!FULL_SHA.test(testMergeSha) || testMergeSha !== config.testMergeSha) {
+    throw new V2StaleFailure(
+      `Pull-request test-merge commit changed from ${config.testMergeSha || "unknown"} ` +
+        `to ${testMergeSha || "unknown"}`,
+    );
+  }
 }
 
 function assertV2FixedSnapshotScope(repository, pullRequest, config) {
@@ -2403,10 +2994,15 @@ function assertV2FixedSnapshotScope(repository, pullRequest, config) {
     repository.id !== expected.repositoryId ||
     repository.full_name !== expected.repositoryFullName ||
     repository.default_branch !== expected.defaultBranch ||
+    pullRequest.head?.ref !== expected.headRef ||
+    pullRequest.head?.repo?.id !== expected.headRepositoryId ||
+    pullRequest.head?.repo?.full_name !== expected.headRepositoryFullName ||
+    String(pullRequest.base?.sha || "").toLowerCase() !== expected.baseSha ||
     pullRequest.base?.ref !== expected.baseRef ||
     pullRequest.base?.ref !== repository.default_branch ||
     pullRequest.base?.repo?.id !== expected.baseRepositoryId ||
-    pullRequest.base?.repo?.full_name !== expected.baseRepositoryFullName
+    pullRequest.base?.repo?.full_name !== expected.baseRepositoryFullName ||
+    String(pullRequest.merge_commit_sha || "").toLowerCase() !== expected.testMergeSha
   ) {
     throw new V2RuntimeFailure(
       "Pull-request default-branch or base-ref scope changed while loading review evidence",
@@ -2456,7 +3052,7 @@ async function exactRefetchV2RelevantObjects(
       "GET",
       `${config.repoPath}/issues/comments/${id}`,
       undefined,
-      { budget },
+      { budget, safeRead: true },
     );
     budget.consumeObjects(1, `exact issue-comment refetch ${id}`);
     requireV2IssueCommentShape(data, `exact issue-comment refetch ${id}`);
@@ -2472,7 +3068,7 @@ async function exactRefetchV2RelevantObjects(
       "GET",
       `${config.repoPath}/pulls/${config.prNumber}/reviews/${id}`,
       undefined,
-      { budget },
+      { budget, safeRead: true },
     );
     budget.consumeObjects(1, `exact review refetch ${id}`);
     requireV2ReviewShape(data, `exact review refetch ${id}`);
@@ -2541,7 +3137,7 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
             "GET",
             `${config.repoPath}/collaborators/${encodeURIComponent(comment.user.login)}/permission`,
             undefined,
-            { budget },
+            { budget, safeRead: true },
           ));
         } catch (error) {
           if (error?.httpStatus === 404) {
@@ -2643,7 +3239,7 @@ async function collectV2ProviderEvidence(
         "GET",
         `${config.repoPath}/commits/${encodeURIComponent(ref)}`,
         undefined,
-        { budget },
+        { budget, safeRead: true },
       );
       budget.consumeObjects(1, `reviewed commit resolution ${ref}`);
       const resolvedSha = String(data?.sha || "");
@@ -2727,7 +3323,7 @@ async function loadLatestV2BaseEpoch(client, config, budget) {
         number: config.prNumber,
       },
     },
-    { budget },
+    { budget, safeRead: true },
   );
   budget.consumePage("latest pull-request base epoch");
   if (
@@ -2862,7 +3458,7 @@ async function loadV2PullRequest(client, config, budget) {
     "GET",
     `${config.repoPath}/pulls/${config.prNumber}`,
     undefined,
-    { budget },
+    { budget, safeRead: true },
   );
   budget?.consumeObjects(1, "pull-request metadata");
   if (
@@ -2870,6 +3466,10 @@ async function loadV2PullRequest(client, config, budget) {
     data.number !== config.prNumber ||
     !FULL_SHA.test(String(data.head?.sha || "")) ||
     !FULL_SHA.test(String(data.base?.sha || "")) ||
+    !(
+      data.merge_commit_sha === null ||
+      FULL_SHA.test(String(data.merge_commit_sha || ""))
+    ) ||
     !Number.isSafeInteger(data.base?.repo?.id) ||
     data.base.repo.id <= 0 ||
     data.base.repo.full_name !== config.repository ||
@@ -2989,29 +3589,6 @@ function requireV2ReactionShape(reactionValue, label) {
   requireV2ActorShape(reactionValue.user, label);
 }
 
-async function postV2Status(client, config, headSha, state, description) {
-  if (!FULL_SHA.test(headSha)) throw new V2RuntimeFailure("Status target is not a full SHA");
-  const { data } = await client.request(
-    "POST",
-    `${config.repoPath}/statuses/${headSha}`,
-    {
-      state,
-      context: V2_STATUS_CONTEXT,
-      description: oneLine(description, "Codex review gate").slice(0, 140),
-      target_url: config.runUrl,
-    },
-    { retry: false },
-  );
-  if (
-    data?.sha !== headSha ||
-    data?.state !== state ||
-    data?.context !== V2_STATUS_CONTEXT ||
-    data?.target_url !== config.runUrl
-  ) {
-    throw new V2RuntimeFailure("Commit-status response did not confirm the exact v2 status write");
-  }
-}
-
 function isOpenV2PullRequest(pullRequest) {
   return pullRequest.state === "open" &&
     pullRequest.merged === false &&
@@ -3058,14 +3635,14 @@ async function writeV2StickyBestEffort(client, config, context, report) {
         "PATCH",
         `${config.repoPath}/issues/comments/${sticky.id}`,
         { body },
-        { retry: false },
+        { safeRead: false },
       );
     } else {
       await client.request(
         "POST",
         `${config.repoPath}/issues/${config.prNumber}/comments`,
         { body },
-        { retry: false },
+        { safeRead: false },
       );
     }
   } catch (error) {
@@ -3215,27 +3792,53 @@ function isRelevantV2IssueComment(comment) {
 }
 
 function sameV2PullRequestScope(left, right) {
-  return left?.state === "open" &&
+  return canonicalJson(fingerprintV2PullRequestScope(left)) ===
+    canonicalJson(fingerprintV2PullRequestScope(right)) &&
+    left?.state === "open" &&
     right?.state === "open" &&
     left?.draft === false &&
     right?.draft === false &&
     left?.merged !== true &&
     right?.merged !== true &&
     !left?.merged_at &&
-    !right?.merged_at &&
-    String(left?.head?.sha || "").toLowerCase() ===
-      String(right?.head?.sha || "").toLowerCase() &&
-    String(left?.base?.sha || "").toLowerCase() ===
-      String(right?.base?.sha || "").toLowerCase() &&
-    left?.base?.ref === right?.base?.ref &&
-    left?.base?.repo?.id === right?.base?.repo?.id &&
-    left?.base?.repo?.full_name === right?.base?.repo?.full_name;
+    !right?.merged_at;
 }
 
 function sameV2RepositoryScope(left, right) {
-  return left?.id === right?.id &&
-    left?.full_name === right?.full_name &&
-    left?.default_branch === right?.default_branch;
+  return canonicalJson(fingerprintV2RepositoryScope(left)) ===
+    canonicalJson(fingerprintV2RepositoryScope(right));
+}
+
+function fingerprintV2RepositoryScope(repository) {
+  return {
+    id: repository?.id ?? null,
+    fullName: repository?.full_name ?? null,
+    defaultBranch: repository?.default_branch ?? null,
+    fork: repository?.fork ?? null,
+  };
+}
+
+function fingerprintV2PullRequestScope(pullRequest) {
+  return {
+    number: pullRequest?.number ?? null,
+    state: pullRequest?.state ?? null,
+    draft: pullRequest?.draft ?? null,
+    merged: pullRequest?.merged === true,
+    mergedAt: pullRequest?.merged_at ?? null,
+    authorType: pullRequest?.user?.type ?? null,
+    headSha: String(pullRequest?.head?.sha || "").toLowerCase(),
+    testMergeSha: String(pullRequest?.merge_commit_sha || "").toLowerCase() || null,
+    headRef: pullRequest?.head?.ref ?? null,
+    headRepositoryId: pullRequest?.head?.repo?.id ?? null,
+    headRepositoryFullName: pullRequest?.head?.repo?.full_name ?? null,
+    headAuthorType: pullRequest?.head?.user?.type ?? null,
+    baseSha: String(pullRequest?.base?.sha || "").toLowerCase(),
+    baseRef: pullRequest?.base?.ref ?? null,
+    baseRepositoryId: pullRequest?.base?.repo?.id ?? null,
+    baseRepositoryFullName: pullRequest?.base?.repo?.full_name ?? null,
+    comments: pullRequest?.comments ?? null,
+    commits: pullRequest?.commits ?? null,
+  };
 }
 
 function sameV2InventoryCounts(left, right) {
@@ -3384,7 +3987,9 @@ async function readBoundedResponseText(response, maxBytes, label) {
   if (!response?.body || typeof response.body.getReader !== "function") {
     const text = await response.text();
     if (Buffer.byteLength(text) > maxBytes) {
-      throw new V2RuntimeFailure(`GitHub response for ${label} exceeded ${maxBytes} bytes`);
+      throw new V2ResponseSizeFailure(
+        `GitHub response for ${label} exceeded ${maxBytes} bytes`,
+      );
     }
     return text;
   }
@@ -3398,7 +4003,9 @@ async function readBoundedResponseText(response, maxBytes, label) {
       length += value.byteLength;
       if (length > maxBytes) {
         await reader.cancel("response too large").catch(() => {});
-        throw new V2RuntimeFailure(`GitHub response for ${label} exceeded ${maxBytes} bytes`);
+        throw new V2ResponseSizeFailure(
+          `GitHub response for ${label} exceeded ${maxBytes} bytes`,
+        );
       }
       chunks.push(value);
     }
@@ -3439,7 +4046,7 @@ function stripSlashes(value) {
 }
 
 function readEvent(path) {
-  if (!path) throw new V2RuntimeFailure("GITHUB_EVENT_PATH is required for provider events");
+  if (!path) throw new V2RuntimeFailure("GITHUB_EVENT_PATH is required for v2 events");
   let parsed;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
