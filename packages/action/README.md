@@ -3,7 +3,13 @@
 Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
 Codex Review Gate reduces trusted OpenAI Codex review evidence for one pull
-request to the native required CheckRun `codex/github-review-gate` on the PR
+request to the native required CheckRun `codex/github-review-gate`. GitHub
+records the verifier run/job/CheckRun against the exact PR feature-head SHA.
+The canonical `pull_request` verifier still executes on
+`refs/pull/N/merge`; inside the Action it strictly validates `GITHUB_REF`,
+`GITHUB_SHA`, the event head/base/test-merge SHAs and a fresh PR read. A
+successful feature-head CheckRun is therefore execution-bound to the exact
+current test-merge, even though the CheckRun itself is not attached to the
 test-merge SHA. Every verifier run rebuilds its decision from GitHub. A
 database, workflow artifact, sticky comment, controller run or earlier
 verifier is never decision authority.
@@ -110,7 +116,7 @@ targets the current default branch. A base retarget does not create a current
 verifier because `pull_request.edited` is intentionally absent. For a ready PR,
 convert it to draft and mark it ready again; for an already-draft PR, mark it
 ready. The resulting `ready_for_review` event creates a verifier for the new
-base and test-merge SHA. A native rerun of the old event is not a substitute.
+exact head/base/test-merge scope. A native rerun of the old event is not a substitute.
 
 Manual runs use the protected default-branch workflow. A feature-ref dispatch
 is unsupported. The typed `workflow_dispatch` business inputs are:
@@ -165,7 +171,8 @@ request, including a deliberate same-head re-review after an earlier success.
 ### `reconcile`
 
 `reconcile` re-reads the selected PR and locates exactly one canonical verifier
-for its current test-merge SHA. It then uses the same baseline/rerun/readback
+whose native CheckRun is on its current feature head and whose run is bound to
+the current test-merge. It then uses the same baseline/rerun/readback
 handshake to establish a strictly newer full verifier attempt. The controller
 never supplies a verdict or rewrites a CheckRun; the read-only verifier alone
 collects evidence and its native job conclusion carries the required result.
@@ -284,7 +291,9 @@ Findings normally produce `healthy/failure`, not an execution error.
 `healthy/success` may conclude successfully; findings, pending evidence,
 unsupported scope, cancellation, timeout and every unhealthy result remain
 blocking. The required verifier CheckRun belongs to the exact current PR
-test-merge SHA. The controller's CheckRun is attached to the default-branch commit
+feature-head SHA. Its `pull_request` run executes on `refs/pull/N/merge`, and
+the Action's environment/event/fresh-read checks bind success to the unchanged
+head, base and test-merge. The controller's CheckRun is attached to the default-branch commit
 and is never the required PR signal. Direct status projection and
 `status_projection` are deleted. Finding counts remain summary-only, not public
 Action outputs.
@@ -317,8 +326,8 @@ observe the strictly newer verifier attempt and its unique canonical CheckRun,
 and require all of the following at one final read:
 
 - Action result `healthy/success`;
-- `codex/github-review-gate` success from the canonical verifier on the same
-  current test-merge SHA;
+- `codex/github-review-gate` success from the canonical verifier on the exact
+  current feature-head SHA, from the run bound to the same current test-merge;
 - the PR head, base and test-merge SHA remain unchanged;
 - the branch is up to date;
 - all review conversations are resolved; and

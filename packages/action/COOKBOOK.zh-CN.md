@@ -149,7 +149,10 @@ generation/reconcile。stale run 绝不跟随 new head，也不向它写入本�
 failure 描述 evaluator health，不表示 Codex finding。正常 run 的
 `gate_outcome=failure` 表示 evaluator 正常工作，merge 必须继续阻塞。
 
-必须要求 current PR test-merge SHA 上存在唯一 canonical verifier CheckRun。controller
+必须要求 exact current PR feature-head SHA 上存在唯一 canonical verifier
+run/job/CheckRun。
+verifier 仍在 `refs/pull/N/merge` 上执行；严格的 `GITHUB_REF`/`GITHUB_SHA`、event scope
+与 fresh PR 校验把 success 绑定到 unchanged current head、base 与 test-merge。controller
 CheckRun 绑定 default-branch commit，不是 required signal。controller 必须观察严格更新的
 verifier attempt 与其唯一 job/CheckRun；rerun state 有歧义时保持 blocking。commit-status
 projection 与 status-POST recovery path 已删除。
@@ -176,7 +179,7 @@ change。
 | `repair_permissions` | 恢复两份 canonical workflow permission boundaries 或报告的其他 access boundary，再 reconcile。 |
 | `retry_begin` | 不可立即安全 retry：先等待 exact same-run marker 的可见性稳定；若仍不存在，只 rerun 原 workflow run；不要另行 dispatch generation 或盲目发送 duplicates。 |
 | `unsupported_target` | 移至文档化 supported scope，或者保持 gate blocked。 |
-| `create_verifier_run` | ready PR 先转 draft 再 mark ready；already-draft PR 直接 mark ready。确认 current test-merge SHA 上出现新的 `ready_for_review` verifier，再 reconcile。 |
+| `create_verifier_run` | ready PR 先转 draft 再 mark ready；already-draft PR 直接 mark ready。确认 exact current head/base/test-merge scope 出现新的 `ready_for_review` verifier，再 reconcile。 |
 
 summary 才是该 code category 内具体 reason 和 object links 的 authority。该表不允许
 绕过 missing data 自行猜测。
@@ -280,8 +283,8 @@ merge 前立即：
 
 1. 重读 PR current head；
 2. 用该 exact SHA dispatch controller `reconcile`；
-3. 观察严格更新的 verifier attempt，以及 current test-merge SHA 上唯一 canonical
-   `codex/github-review-gate` CheckRun；
+3. 观察严格更新的 verifier attempt，以及 current feature-head SHA 上唯一 canonical
+   `codex/github-review-gate` CheckRun，并要求该 verifier run 绑定 current test-merge；
 4. 要求 `execution_health=healthy`、`gate_outcome=success` 且 verifier conclusion 成功；
 5. 重读 unchanged PR head、base 与 test-merge SHA；
 6. 要求 branch up to date 且 all conversations resolved；
@@ -312,7 +315,8 @@ installation PR merge 后：
 2. 以 Disabled stage supplied ruleset，且没有 bypass actors；
 3. 另开一个无害 canary PR；
 4. 运行普通 `@v2` review/reconcile path；
-5. 验证 exact canonical verifier run、native test-merge CheckRun、freshness、
+5. 验证 exact canonical verifier run、绑定 unchanged head/base/test-merge scope 的 native
+   feature-head CheckRun、freshness、
    conversation enforcement，且不存在 same-name collision；
 6. 激活已验证 ruleset；
 7. 不 merge，直接关闭 canary PR。

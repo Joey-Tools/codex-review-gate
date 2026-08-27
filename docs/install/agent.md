@@ -310,7 +310,7 @@ The canonical workflows must have this contract after the merge:
 - verifier path `.github/workflows/codex-review-gate.yml`, workflow name
   `Codex Review Gate Verifier`, `pull_request` types `opened`, `reopened`,
   `synchronize`, `ready_for_review`, and required job
-  `codex/github-review-gate` on the PR test-merge SHA;
+  `codex/github-review-gate` on the exact PR feature-head SHA;
 - controller path `.github/workflows/codex-review-gate-controller.yml`, workflow
   name `Codex Review Gate Controller`, exact Codex `issue_comment`
   `created`/`edited`, and default-branch `workflow_dispatch`;
@@ -438,18 +438,21 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
    that liveness change arrives without a later qualifying bot comment event,
    dispatch a manual exact-head `reconcile` to observe it.
 
-   Before choosing this low-cost path, identify the verifier run and native
-   `codex/github-review-gate` CheckRun for the PR's current test-merge SHA. The
+   Before choosing this low-cost path, identify the native
+   `codex/github-review-gate` verifier run/job/CheckRun that GitHub records
+   against the exact current PR feature-head SHA, and require that run to be
+   bound to the current test-merge. The
    workflow deliberately has no cron or writable review event. If this exact
    scope already has a successful verifier and the caller needs a deliberate
    same-head re-review, use step 4 `begin-review` first and require a strictly
    newer verifier attempt. Do not rely on a direct comment to atomically
    invalidate the old success.
 
-   If a base retarget leaves no verifier for the current test-merge SHA, follow
+   If a base retarget leaves no verifier for the current exact
+   head/base/test-merge scope, follow
    `create_verifier_run`: for a ready PR, convert it to draft and mark it ready
    again; for an already-draft PR, mark it ready. Require a new
-   `ready_for_review` verifier on the current test-merge SHA before reconciling.
+   `ready_for_review` verifier for that exact scope before reconciling.
    Rerunning the old event is not valid retarget recovery.
 
    If the controller summary reports a base epoch, base retarget, or
@@ -564,21 +567,26 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
 
 1. Re-read the pull request. Require it to remain open, non-draft, based on
    `DEFAULT_BRANCH`, and still at `CANARY_HEAD`.
-2. Read the exact current test-merge SHA and native CheckRun:
+2. Read the exact current test-merge SHA and the native CheckRun on the exact
+   feature head:
 
    ```bash
    CANARY_TEST_MERGE_SHA="$(gh api \
      "repos/$REPO/pulls/$CANARY_PR" \
      --jq '.merge_commit_sha')"
    test -n "$CANARY_TEST_MERGE_SHA"
-   gh api "repos/$REPO/commits/$CANARY_TEST_MERGE_SHA/check-runs" \
+   gh api "repos/$REPO/commits/$CANARY_HEAD/check-runs" \
      --jq '[.check_runs[] | select(.name == "codex/github-review-gate")] | map({id, status, conclusion, head_sha, app: .app.id, details_url})'
    ```
 
    Require exactly one current canonical verifier CheckRun with
-   `head_sha=$CANARY_TEST_MERGE_SHA`, GitHub Actions App ID `15368`, and
-   `conclusion=success`. Bind it to the strictly newer verifier attempt reported
-   by the controller. Also require the verifier summary to report
+   `head_sha=$CANARY_HEAD`, GitHub Actions App ID `15368`, and
+   `conclusion=success`. The canonical `pull_request` verifier executes on
+   `refs/pull/N/merge`; inside the Action it strictly validates `GITHUB_REF`,
+   `GITHUB_SHA`, the event PR head/base/test-merge SHAs and a fresh PR read.
+   Bind the feature-head CheckRun to the strictly newer verifier attempt
+   reported by the controller and require that attempt to be execution-bound
+   to `CANARY_TEST_MERGE_SHA`. Also require the verifier summary to report
    `execution_health=healthy` and `gate_outcome=success`. A different current
    head, base or test-merge SHA invalidates the result.
 
@@ -601,7 +609,7 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
    ```
 
 4. The helper must re-read the canary lifecycle, base, head, test-merge SHA,
-   exact verifier run/job/CheckRun and collision inventory, plus the exact
+   exact feature-head verifier run/job/CheckRun and collision inventory, plus the exact
    default-branch workflow inventory, CODEOWNERS errors, and
    owner permission immediately before every active ruleset POST or PUT. After
    the write, read back the exact ruleset and the complete consumer security
@@ -633,7 +641,8 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
    Require `state=CLOSED` and `mergedAt=null`.
 
 7. Report the migration PR, closed-unmerged canary PR, both canonical workflow
-   paths, active ruleset ID, exact successful canary head/test-merge SHA and
+   paths, active ruleset ID, exact successful canary feature head and bound
+   test-merge SHA, plus the
    verifier run URL, and any
    persistent profile or runner-fallback variables.
 

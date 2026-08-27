@@ -33,11 +33,13 @@ pull_request opened/reopened/synchronize/ready_for_review
                                 |
           JoeyTeng/codex-review-gate-action@v2
           - bind PR head, base and test-merge SHA
+          - validate refs/pull/N/merge, GITHUB_REF and GITHUB_SHA
+          - refresh PR and require unchanged head/base/test-merge
           - fully paginate and reduce GitHub evidence
           - require two stable snapshots for clean
                                 |
                                 v
-         native CheckRun codex/github-review-gate
+ native CheckRun codex/github-review-gate on exact feature head
                                 |
                                 v
  ruleset: expected source + Code Owner review + stale dismissal
@@ -86,8 +88,15 @@ CODEOWNERS、Code Owner review、strict freshness、no bypass 与 canary collisi
 verifier 只接收 `pull_request` `opened`、`reopened`、`synchronize` 与
 `ready_for_review`，并在不是 same-repository、open、ready、default-base scope 时 fail
 closed。`edited` 被明确排除：base retarget 后，ready PR 必须转为 draft 再 mark ready，
-已经是 draft 的 PR 直接 mark ready。新的 `ready_for_review` event 会在 current base 与
-test-merge SHA 上创建 verifier；旧 event rerun 不能代替。
+已经是 draft 的 PR 直接 mark ready。新的 `ready_for_review` event 会为 current exact
+head/base/test-merge scope 创建 verifier；旧 event rerun 不能代替。
+
+GitHub 会把 verifier run/job/native CheckRun 记录在 exact PR feature-head SHA 上，尽管
+canonical `pull_request` workflow 在 `refs/pull/N/merge` 上执行。Action 内部要求
+`GITHUB_REF`、`GITHUB_SHA` 精确匹配该 merge ref 与 event test-merge SHA，并要求 event
+head/base/test-merge values 与 fresh PR read 一致。这个 execution binding 使 successful
+feature-head CheckRun 能证明它评估了 exact current test-merge；CheckRun 本身并不属于
+test-merge SHA。
 
 controller 接收 `issue_comment` `created`/`edited` 与 default-branch
 `workflow_dispatch`。comment admission 在 runner 分配前，把 event sender 与 comment
@@ -174,8 +183,8 @@ checks 运行期间避免 Actions runner。`begin-review` 保留为 coordinated 
 ### `reconcile`
 
 manual reconcile 要求 caller 提供完整 `expected_head_sha`；automatic path 在启动时
-绑定等价值。controller 重读 PR、为 current test-merge SHA 定位唯一 canonical
-verifier、记录 baseline attempt `A`、证明没有 canonical attempt 正在 queued/running，
+绑定等价值。controller 重读 PR、定位 native CheckRun 挂在 current feature head 且 run
+绑定 current test-merge 的唯一 canonical verifier、记录 baseline attempt `A`、证明没有 canonical attempt 正在 queued/running，
 只请求一次 full rerun，并要求 exact attempt `A+1` 与其唯一 job/CheckRun 可见。attempt
 jump、duplicate、POST ambiguous 或 inventory unreadable 都保持 blocking，绝不盲目重试。
 
@@ -352,7 +361,9 @@ immediate retry 是否为有效 recovery operation。closed recovery-code set �
 
 `unhealthy/success` 被禁止。verifier job 只把 stable `healthy/success` 映射为成功的
 native conclusion，其他 pair 全部映射为 blocking conclusion，从而区分普通 findings 与
-evaluator failure。required verifier CheckRun 属于 exact current PR test-merge SHA。
+evaluator failure。required verifier CheckRun 属于 exact current PR feature-head SHA；
+它的 `pull_request` run 在 `refs/pull/N/merge` 上执行，严格的
+environment/event/fresh-read 校验把 success 绑定到 unchanged head、base 与 test-merge。
 controller CheckRun 绑定 default-branch commit，绝不提供 required PR
 result。direct status projection 与 `statusProjection` 已删除。
 
@@ -380,8 +391,8 @@ stable A/B snapshots 只证明短暂 observation window，不会锁定 PR。merg
 
 1. 重读 exact current PR head；
 2. 为该 exact head dispatch controller `reconcile`；
-3. 观察严格更新的 verifier attempt，以及 current test-merge SHA 上唯一 canonical
-   `codex/github-review-gate` CheckRun；
+3. 观察严格更新的 verifier attempt，以及 current feature-head SHA 上唯一 canonical
+   `codex/github-review-gate` CheckRun，并要求该 run 绑定 current test-merge；
 4. 要求 Action output 为 `healthy/success` 且 verifier conclusion 成功；
 5. 重读 unchanged PR head、base 与 test-merge SHA；
 6. 要求 ruleset 确认 branch up to date、all conversations resolved 且 merge

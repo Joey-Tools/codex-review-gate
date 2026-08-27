@@ -991,7 +991,7 @@ test("agent activation closure rereads canary authority and the complete written
     const activation = markdownSection(installGuides[name], heading);
     assert.match(activation, /(?:re-read|重读)[\s\S]{0,120}canary[\s\S]{0,120}lifecycle/iu, name);
     assert.match(activation, /base(?:[\s/,]+)head/iu, name);
-    assert.match(activation, /exact verifier run\/job\/CheckRun/iu, name);
+    assert.match(activation, /exact feature-head verifier\s+run\/job\/CheckRun/iu, name);
     assert.match(activation, /(?:(?:before)[\s\S]{0,100}(?:active|enable)|(?:active|启用)[\s\S]{0,100}立即前)[\s\S]{0,100}(?:POST|PUT|write)/iu, name);
     assert.match(activation, /(?:(?:after|后)[\s\S]{0,80}(?:write|写入)|write 后)[\s\S]{0,120}exact ruleset/iu, name);
     assert.match(activation, /complete consumer security\s+snapshot|完整 consumer\s+security snapshot/iu, name);
@@ -1222,10 +1222,19 @@ test("installation guides use only the default-branch workflow dispatch API", ()
   }
 });
 
-test("installation guides preserve the native test-merge CheckRun boundary", () => {
+test("installation guides preserve the feature-head CheckRun and test-merge execution binding", () => {
   for (const [name, guide] of Object.entries(installGuides)) {
     assert.match(guide, /test-merge SHA/iu, name);
     assert.match(guide, /(?:native|原生)[\s\S]{0,80}CheckRun/iu, name);
+    assert.match(
+      guide,
+      /(?:verifier run\/job\/CheckRun[\s\S]{0,160}feature-head\s+SHA|feature-head\s+SHA[\s\S]{0,160}verifier run\/job\/CheckRun)/iu,
+      name,
+    );
+    assert.match(guide, /refs\/pull\/N\/merge/u, name);
+    assert.match(guide, /GITHUB_REF/u, name);
+    assert.match(guide, /GITHUB_SHA/u, name);
+    assert.match(guide, /fresh PR[ -]read/iu, name);
     assert.match(guide, /ready_for_review/u, name);
     assert.match(guide, /(?:convert|转)[\s\S]{0,80}draft[\s\S]{0,80}(?:ready|标记 ready)/iu, name);
     assert.match(guide, /(?:status bridge|commit-status)/iu, name);

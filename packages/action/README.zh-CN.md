@@ -2,8 +2,13 @@
 
 语言：[British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
-Codex Review Gate 把单个 PR 上可信的 OpenAI Codex review 证据归约为 PR test-merge
-SHA 上的 native required CheckRun `codex/github-review-gate`。每次 verifier run 都从
+Codex Review Gate 把单个 PR 上可信的 OpenAI Codex review 证据归约为 native required
+CheckRun `codex/github-review-gate`。GitHub 把 verifier run/job/CheckRun 记录在 exact PR
+feature-head SHA 上。canonical
+`pull_request` verifier 仍在 `refs/pull/N/merge` 上执行；Action 内部严格校验
+`GITHUB_REF`、`GITHUB_SHA`、event head/base/test-merge SHAs 和 fresh PR read。因此
+successful feature-head CheckRun 会在执行语义上绑定 exact current test-merge，但
+CheckRun 本身并不挂在 test-merge SHA 上。每次 verifier run 都从
 GitHub 重建决策；数据库、workflow artifact、sticky comment、controller run 或旧
 verifier 都不是决策 authority。
 
@@ -101,7 +106,7 @@ edited Codex comment 可能使旧决策失效，所以 `created` 与 `edited` �
 verifier 会在 PR 不是 same-repository、open、ready 或 current-default-base 时 fail
 closed。`pull_request.edited` 被明确排除，所以 base retarget 不会生成 current verifier。
 对于 ready PR，先转为 draft 再 mark ready；对于已经是 draft 的 PR，直接 mark ready。
-新的 `ready_for_review` event 会为新 base 与 test-merge SHA 创建 verifier；native rerun
+新的 `ready_for_review` event 会为新的 exact head/base/test-merge scope 创建 verifier；native rerun
 旧 event 不能代替这一步。
 
 manual run 使用受保护 default branch 上的 workflow；feature-ref dispatch 不受
@@ -151,7 +156,8 @@ same-head re-review。
 
 ### `reconcile`
 
-`reconcile` 重读所选 PR，并为 current test-merge SHA 定位唯一 canonical verifier。
+`reconcile` 重读所选 PR，并定位 native CheckRun 挂在 current feature head、run 绑定
+current test-merge 的唯一 canonical verifier。
 随后使用同一套 baseline/rerun/readback handshake 建立严格更新的 full verifier attempt。
 controller 不提供 verdict，也不改写 CheckRun；只有只读 verifier 收集证据，其 native job
 conclusion 承载 required result。
@@ -260,7 +266,9 @@ create_verifier_run
 finding 通常得到 `healthy/failure`，而不是 execution error；`unhealthy/success` 非法。
 在 verifier workflow 中，只有被证明稳定的 `healthy/success` 可以成功结束；findings、
 pending evidence、unsupported scope、cancel、timeout 与全部 unhealthy 结果都保持
-blocking。required verifier CheckRun 属于 exact current PR test-merge SHA。controller 的
+blocking。required verifier CheckRun 属于 exact current PR feature-head SHA；它的
+`pull_request` run 在 `refs/pull/N/merge` 上执行，Action 的 environment/event/fresh-read
+校验把 success 绑定到 unchanged head、base 与 test-merge。controller 的
 CheckRun 绑定 default-branch commit，绝不是 required PR signal。
 direct status projection 与 `status_projection` 已删除。finding counts 仍只出现在 summary，
 不是 public Action outputs。
@@ -290,8 +298,8 @@ current head dispatch controller `reconcile`，观察严格更新的 verifier at
 canonical CheckRun，并在一次 final read 中同时要求：
 
 - Action result 为 `healthy/success`；
-- 同一 current test-merge SHA 上来自 canonical verifier 的
-  `codex/github-review-gate` 为 success；
+- exact current feature-head SHA 上来自 canonical verifier 的
+  `codex/github-review-gate` 为 success，且该 run 绑定同一个 current test-merge；
 - PR head、base 与 test-merge SHA 保持不变；
 - branch up to date；
 - 所有 review conversations 均已 resolved；

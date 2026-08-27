@@ -70,9 +70,11 @@ superseded_by:
 - V2 ships a JavaScript Action, two copied canonical thin workflows, and an
   importable disabled ruleset template. A reusable workflow is not the
   consumer ABI. The read-only `pull_request` verifier owns the native required
-  CheckRun on the PR test-merge SHA; the protected-default-branch controller
-  owns provider/manual wake-up, review-request creation, and exact verifier
-  rerun orchestration.
+  CheckRun on the exact PR feature-head SHA. Its merge-ref environment, event
+  scope, and fresh PR read bind that result to the unchanged current
+  head/base/test-merge scope. The protected-default-branch controller owns
+  provider/manual wake-up, review-request creation, and exact verifier rerun
+  orchestration.
   - Explicit reason: copied workflows own triggers, separate permissions,
     separate concurrency namespaces, typed dispatch, and pre-runner filtering
     that an Action step cannot own.
@@ -193,9 +195,10 @@ superseded_by:
   requires branches to be up to date, requires all conversations resolved, and
   carries no repository-specific bypass actors.
 - No consumer workflow receives `statuses: write`. Installation first observes
-  the verifier's native PR test-merge CheckRun and actual expected source on a
-  canary, validates the imported disabled ruleset, and only then activates it;
-  `Any source` is not accepted.
+  the verifier's native feature-head CheckRun, its execution binding to the
+  current test-merge, and actual expected source on a canary, validates the
+  imported disabled ruleset, and only then activates it; `Any source` is not
+  accepted.
 - The expected-source integration ID identifies the GitHub Actions App, not one
   particular workflow. Installation therefore exact-byte verifies both
   canonical default-branch workflows and fails closed on any noncanonical
@@ -203,9 +206,10 @@ superseded_by:
   v1/v2 direct or reusable gate caller. The only admitted write boundary is the
   exact canonical controller's reviewed `actions: write`/`issues: write`
   surface. The canary must resolve the unique required-name CheckRun to the
-  exact canonical `pull_request` verifier run on the current PR test-merge SHA,
-  reject legacy same-name status or CheckRun collisions, and prove the scoped
-  CODEOWNERS/ruleset compound control plane before activation.
+  exact canonical `pull_request` verifier run whose native CheckRun is on the
+  current PR feature head and whose execution is bound to the current
+  test-merge, reject legacy same-name status or CheckRun collisions, and prove
+  the scoped CODEOWNERS/ruleset compound control plane before activation.
   - Explicit reason: otherwise another GitHub Actions workflow could present
     the same required job name or acquire controller authority while sharing
     the same integration identity.
@@ -310,10 +314,13 @@ superseded_by:
 
 - A verifier is admitted only for the exact `pull_request` event PR, head,
   base, and test-merge SHA. It never follows a changed target and has no
-  authoritative write API. GitHub's native job CheckRun on that test-merge SHA
-  is the gate result: only a proved stable `healthy/success` may conclude
-  successfully; findings, pending evidence, unsupported scope, cancellation,
-  timeout, API uncertainty, and every unhealthy result remain blocking.
+  authoritative write API. GitHub attaches the native job CheckRun to the
+  feature-head SHA while the workflow executes on `refs/pull/N/merge`; strict
+  `GITHUB_REF`/`GITHUB_SHA`, event-scope, and fresh-PR checks bind its result to
+  the unchanged current test-merge. Only a proved stable `healthy/success` may
+  conclude successfully; findings, pending evidence, unsupported scope,
+  cancellation, timeout, API uncertainty, and every unhealthy result remain
+  blocking.
 - A deliberate same-head re-review uses controller `begin-review` to create or
   adopt the canonical request and then establish a strictly newer full
   verifier attempt. A provider or manual reconcile similarly establishes a
@@ -1301,9 +1308,10 @@ superseded_by:
   solved retry case.
 - A separate zero-context ordinary `gpt-5.6-sol` / `ultra` architecture lane
   proved a no-runtime-App alternative: a read-only `pull_request` verifier whose
-  GitHub-managed CheckRun is required on the PR test-merge SHA, plus a protected
-  default-branch controller that creates review requests and precisely reruns
-  the current verifier. That shape removes authoritative status POSTs and makes
+  GitHub-managed CheckRun is required on the PR feature-head SHA and
+  execution-bound to the current test-merge, plus a protected default-branch
+  controller that creates review requests and precisely reruns the current
+  verifier. That shape removes authoritative status POSTs and makes
   every non-`healthy/success` verifier result blocking. It also changes adopted
   decisions: one canonical workflow becomes two; workflow conclusion becomes
   gate authority rather than execution-health-only telemetry; each PR/head
@@ -1324,25 +1332,27 @@ superseded_by:
   full verifier allocation for ordinary title/body edits. A retarget therefore
   remains fail closed until an operator or agent creates a new PR lifecycle
   event: convert a ready PR to draft and mark it ready for review, or mark an
-  already-draft PR ready. That `ready_for_review` event creates the verifier on
-  the current base and test-merge SHA; native rerun of the old run is not a
-  substitute because it retains the old event SHA and ref.
+  already-draft PR ready. That `ready_for_review` event creates the verifier for
+  the current exact head/base/test-merge scope; native rerun of the old run is
+  not a substitute because it retains the old event SHA and ref.
 - The human-readable and agent-executable usage guides must both document that
   retarget recovery. The controller must also emit the same next action in its
   Actions summary when it cannot locate exactly one canonical `pull_request`
-  verifier run for the current test-merge SHA. The machine-readable result is
+  verifier run for the current exact head/base/test-merge scope. The
+  machine-readable result is
   `recovery_code=create_verifier_run` with `retry_safe=false`: for a ready PR,
   convert it to draft and mark it ready again; for an already-draft PR, mark it
-  ready; then verify a new `ready_for_review` verifier attempt exists on the
-  current test-merge SHA before reconciling again. The controller does not
+  ready; then verify a new `ready_for_review` verifier attempt exists for that
+  exact scope before reconciling again. The controller does not
   change draft state itself and must not present an identical manual rerun as a
   valid recovery. Updating the PR head to emit `synchronize`, or close/reopen as
   a secondary manual recovery, remains valid but is not the primary retarget
   instruction.
 - The adopted architecture's race boundary is layered rather than supplied by
   concurrency alone. It removes every authoritative commit-status POST; binds
-  the GitHub-managed required CheckRun to the exact current PR test-merge SHA;
-  permits only one current verifier per PR with latest-generation cancellation;
+  the GitHub-managed required CheckRun to the exact current PR feature-head SHA
+  and binds its execution to the current test-merge; permits only one current
+  verifier per PR with latest-generation cancellation;
   and maps every conclusion except a proved stable `healthy/success` to a
   blocking result. The verifier concurrency is therefore latest-wins
   single-flight, not a FIFO queue: `cancel-in-progress: true` cancels an older
@@ -1379,8 +1389,11 @@ superseded_by:
 
 ### Final Native-CheckRun Implementation Checkpoint
 
-- Phase: implementation and documentation reconciliation complete; final
-  signed implementation checkpoint and frozen-head review remain pending.
+- Phase: signed implementation checkpoint
+  `063b612e86757284a6b905de4cac45ce01266672` exists. Its first frozen-range
+  review found the platform-subject error recorded below; the correction is
+  staged, and a new signed checkpoint plus fresh whole-range review remain
+  pending.
 - The direct JavaScript Action now routes trusted `pull_request` launches to a
   read-only verifier and `issue_comment` / `workflow_dispatch` launches to the
   non-authoritative controller. The verifier retains the full reducer,
@@ -1396,7 +1409,8 @@ superseded_by:
 - Bootstrap installs and exact-byte verifies both workflows plus scoped
   CODEOWNERS. Inventory rejects alternate required-name producers and relevant
   write authority; activation proves the unique native GitHub Actions CheckRun
-  on the exact test-merge SHA, rejects a same-name legacy status, preserves the
+  on the exact feature-head SHA and separately preserves its current
+  test-merge execution scope, rejects a same-name legacy status, preserves the
   disabled/readback/canary/active sequence, and fails closed on unmanaged
   CODEOWNERS policy expansion.
 - Human-readable and agent-executable installation guides, package design and
@@ -1428,6 +1442,59 @@ superseded_by:
   `Use 'client-id' instead` deprecation message, so the workflow remains on
   `client-id`. The publisher script, standalone ShellCheck, and 46-test release
   suite pass.
+
+### Frozen-Range Review Correction: CheckRun Subject Versus Execution Scope
+
+- The first independent frozen review covered
+  `10217253306ca2ee6f312f766a331f8924e26e47..063b612e86757284a6b905de4cac45ce01266672`
+  in an isolated exact-pack workspace. The native reviewer role was unavailable,
+  so the explicitly authorized fallback was a zero-context ordinary general
+  agent using `gpt-5.6-sol` with `ultra` reasoning. Preparation and post-review
+  workspace validation, prefix receipts, and control-bundle digest all matched.
+- That review found one P1: activation expected the REST workflow-run `path` to
+  contain `@refs/pull/N/merge`, while the live API exposes the canonical path
+  without that suffix. The fixture had repeated the same false assumption, so
+  it could not catch a live activation failure.
+- Parent adjudication checked current GitHub objects rather than narrowing the
+  fix to that string. Live `pull_request` run `33019349074` and its CheckRun/job
+  expose feature head `6b7509216181e9b1c31976bf4261364b08ba26b6` as
+  `head_sha`; PR #34 separately reports test-merge
+  `439319b6e80dd18f696767bf96d39090d642daa4`. The run path is the pure
+  `.github/workflows/ci.yml`. This establishes two different facts that must
+  not be collapsed:
+  - GitHub attaches the native workflow run, job, and required CheckRun to the
+    exact PR feature-head SHA.
+  - The `pull_request` workflow executes on `refs/pull/N/merge`; the verifier
+    must strictly require `GITHUB_SHA == pull_request.merge_commit_sha`, the
+    exact merge ref, matching event/current head and base, and a stable fresh PR
+    read. That is the test-merge execution binding.
+- The correction therefore queries and validates native run/job/CheckRun
+  objects only against the feature head, requires the canary REST run path to
+  equal the pure canonical workflow path, and keeps test-merge validation as a
+  separate launch/snapshot invariant. Regression fixtures reject a test-merge
+  subject, stale feature heads, attacker/decorated workflow paths, and drift in
+  any run/job/CheckRun binding.
+- Explicit reason: a ruleset consumes the GitHub-managed feature-head CheckRun,
+  while merge-code validation must still prove that the successful evaluator
+  ran against the exact current test-merge. Treating either SHA as both objects
+  would make activation fail against the live API or would weaken the tested
+  merge scope.
+- Validation on the corrected working tree passed:
+  - `npm test`: 702 of 702 passed, 0 failed, in 1265194 ms;
+  - `npm run check`: passed;
+  - focused v2 runtime suite: 68 of 68 passed;
+  - bootstrap suite: 68 of 68 passed;
+  - workflow-security suite: 30 of 30 passed;
+  - actionlint passed both copied consumer workflows;
+  - `bash -n` and ShellCheck passed both tracked shell scripts;
+  - `git diff --check` and project-journal validation passed.
+- This correction does not turn success into a lease. Same-head base or evidence
+  changes can leave an older feature-head success visible. Under the adopted
+  eventual-reconciliation boundary, the supported agent merge path must force
+  an exact-current verifier refresh, observe the new canonical attempt and
+  CheckRun, require stable `healthy/success`, reread unchanged
+  head/base/test-merge and ruleset state, and merge the exact head. Direct human
+  UI merge outside that closure remains unsupported.
 
 ### Verified Two-Workflow Platform Boundaries And Resolution
 
@@ -1464,8 +1531,9 @@ superseded_by:
   - The public contract must not describe `integration_id: 15368` as
     single-producer proof. It is the GitHub-owned GitHub Actions App that
     produces native workflow CheckRuns, including the verifier CheckRun on the
-    PR test-merge SHA; it is neither the removed commit-status projection nor
-    the private Publisher App.
+    PR feature-head SHA; it is neither the removed commit-status projection nor
+    the private Publisher App. The verifier's separate merge-ref checks provide
+    the current test-merge execution binding.
 - An organization/enterprise required-workflow ruleset is the strongest native
   no-runtime-App alternative because it can bind a source repository, path,
   ref, and SHA. It requires an eligible organization plan and owner-level

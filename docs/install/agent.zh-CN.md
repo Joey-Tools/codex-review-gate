@@ -286,7 +286,7 @@ GitHub.com/default-branch PR scope 时停止。
 - `JoeyTeng/codex-review-gate-action@v2`；
 - verifier path `.github/workflows/codex-review-gate.yml`、workflow name
   `Codex Review Gate Verifier`、`pull_request` types `opened`、`reopened`、
-  `synchronize`、`ready_for_review`，以及 PR test-merge SHA 上的 required job
+  `synchronize`、`ready_for_review`，以及 exact PR feature-head SHA 上的 required job
   `codex/github-review-gate`；
 - controller path `.github/workflows/codex-review-gate-controller.yml`、workflow
   name `Codex Review Gate Controller`、exact Codex `issue_comment`
@@ -400,15 +400,16 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
    变化没有伴随后续合格 bot comment event，必须手动 dispatch exact-head `reconcile` 才能
    观察到它。
 
-   选择这个低成本路径前，识别当前 PR test-merge SHA 上的 verifier run 和原生
-   `codex/github-review-gate` CheckRun。Workflow 刻意没有 cron 或可写 review event。若
+   选择这个低成本路径前，识别 GitHub 记录在 exact current PR feature-head SHA 上的原生
+   `codex/github-review-gate` verifier run/job/CheckRun，并要求该 run 绑定 current test-merge。
+   Workflow 刻意没有 cron 或可写 review event。若
    当前 exact scope 已有成功 verifier，而 caller 需要 deliberate same-head re-review，
    先执行第 4 步 `begin-review` 并要求严格更新的 verifier attempt。不能依靠 direct
    comment 原子化地使旧 success 失效。
 
-   若 base retarget 后当前 test-merge SHA 没有 verifier，按
+   若 base retarget 后 current exact head/base/test-merge scope 没有 verifier，按
    `create_verifier_run` 恢复：ready PR 先转 draft 再标记 ready；already-draft PR 直接标记
-   ready。Reconcile 前必须要求当前 test-merge SHA 上出现新的 `ready_for_review` verifier；
+   ready。Reconcile 前必须要求该 exact scope 出现新的 `ready_for_review` verifier；
    rerun 旧 event 不是有效的 retarget recovery。
 
    如果 controller summary 报告 base epoch、base retarget 或
@@ -510,20 +511,23 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
 
 1. 重新读取 PR，要求仍 open、non-draft、base 为 `DEFAULT_BRANCH`，head 仍为
    `CANARY_HEAD`。
-2. 读取当前 exact test-merge SHA 与原生 CheckRun：
+2. 读取当前 exact test-merge SHA 与 exact feature-head 上的原生 CheckRun：
 
    ```bash
    CANARY_TEST_MERGE_SHA="$(gh api \
      "repos/$REPO/pulls/$CANARY_PR" \
      --jq '.merge_commit_sha')"
    test -n "$CANARY_TEST_MERGE_SHA"
-   gh api "repos/$REPO/commits/$CANARY_TEST_MERGE_SHA/check-runs" \
+   gh api "repos/$REPO/commits/$CANARY_HEAD/check-runs" \
      --jq '[.check_runs[] | select(.name == "codex/github-review-gate")] | map({id, status, conclusion, head_sha, app: .app.id, details_url})'
    ```
 
    要求 current canonical verifier CheckRun 恰好一个，
-   `head_sha=$CANARY_TEST_MERGE_SHA`、GitHub Actions App ID 为 `15368`、
-   `conclusion=success`，并绑定到 controller 报告的 strictly newer verifier attempt。
+   `head_sha=$CANARY_HEAD`、GitHub Actions App ID 为 `15368`、
+   `conclusion=success`。canonical `pull_request` verifier 在 `refs/pull/N/merge` 上执行；
+   Action 内部严格校验 `GITHUB_REF`、`GITHUB_SHA`、event PR head/base/test-merge SHAs 与
+   fresh PR read。把该 feature-head CheckRun 绑定到 controller 报告的 strictly newer
+   verifier attempt，并要求该 attempt 在执行语义上绑定 `CANARY_TEST_MERGE_SHA`。
    Verifier summary 还必须报告 `execution_health=healthy`、`gate_outcome=success`。当前
    head、base 或 test-merge SHA 任一变化都会使结果失效。
 
@@ -546,7 +550,8 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
    ```
 
    对于 active ruleset，Helper 必须在 mutation 立即前重读 authority，随后才执行 POST/PUT。
-   该重读包括 canary lifecycle、base/head、test-merge SHA、exact verifier run/job/CheckRun
+   该重读包括 canary lifecycle、base/head、test-merge SHA、exact feature-head verifier
+   run/job/CheckRun
    与 collision inventory，以及 exact default-branch workflow inventory、
    CODEOWNERS errors 与 owner permission；并在 write 后
    读回 exact ruleset 与完整 consumer security snapshot。要求 active default-branch
@@ -577,7 +582,7 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
    要求 `state=CLOSED`、`mergedAt=null`。
 
 6. 报告 migration PR、closed-unmerged canary PR、两份 canonical workflow paths、active
-   ruleset ID、successful canary exact head/test-merge SHA 与 verifier run URL，以及持久 profile、runner 或
+   ruleset ID、successful canary exact feature head/bound test-merge SHA 与 verifier run URL，以及持久 profile、runner 或
    request-author-policy variables。
 
 本流程没有 cron recovery loop。Bot event 丢失，或 evidence 只通过 review/reaction 到达

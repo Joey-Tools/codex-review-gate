@@ -7,7 +7,12 @@ Do not include sensitive repository data, private source code, or secrets in pub
 ## Installation trust boundary
 
 This Action coordinates Codex review requests and reduces evidence into the
-native `codex/github-review-gate` verifier CheckRun on the PR test-merge SHA.
+native `codex/github-review-gate` verifier CheckRun. GitHub records the verifier
+run/job/CheckRun against the exact PR feature-head SHA. The verifier executes
+on `refs/pull/N/merge` and strictly validates
+`GITHUB_REF`, `GITHUB_SHA`, event head/base/test-merge SHAs and a fresh PR read,
+so success is execution-bound to the exact current test-merge without claiming
+that the CheckRun itself is attached to that merge SHA.
 Install the complete three-asset-group contract: both canonical workflows, the
 managed `.github/CODEOWNERS` control plane, and the supplied ruleset. Use the canonical
 `bootstrap-codex-review-gate.mjs` helper with an explicit
@@ -53,7 +58,9 @@ write, pull-request write or OIDC authority. There is no `pull_request_target`,
 cron, runtime GitHub App, webhook or durable ledger.
 
 Only the verifier job's GitHub-managed CheckRun on the exact current PR
-test-merge SHA is the protected signal. The controller may create or adopt a
+feature-head SHA is the protected signal. Its success is valid only when the
+run's merge-ref environment, event scope and fresh PR read bind it to unchanged
+head, base and test-merge SHAs. The controller may create or adopt a
 review request and request one full rerun, but it cannot supply a verdict or
 rewrite that CheckRun. It must bind baseline attempt `A`, observe exact attempt
 `A+1` and its unique canonical job/CheckRun, and fail closed on ambiguous or

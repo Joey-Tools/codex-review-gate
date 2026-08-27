@@ -486,25 +486,25 @@ async function assertCanaryCheckRunSource({
 
   const checkRuns = await loadCompleteCheckRuns({
     repoSlug,
-    sha: mergeCommitSha,
+    sha: headSha,
     checkName: DEFAULT_STATUS_CONTEXT,
   });
   if (checkRuns.length !== 1) {
     throw new Error(
-      `Canary test-merge ${mergeCommitSha} must have exactly one latest CheckRun named ${DEFAULT_STATUS_CONTEXT}; found ${checkRuns.length}, so activation cannot exclude a missing or competing producer.`,
+      `Canary feature head ${headSha} must have exactly one latest CheckRun named ${DEFAULT_STATUS_CONTEXT}; found ${checkRuns.length}, so activation cannot exclude a missing or competing producer.`,
     );
   }
   const checkRun = checkRuns[0];
   if (
     checkRun.name !== DEFAULT_STATUS_CONTEXT ||
-    checkRun.head_sha !== mergeCommitSha ||
+    checkRun.head_sha !== headSha ||
     checkRun.status !== "completed" ||
     checkRun.conclusion !== "success" ||
     Number(checkRun?.app?.id) !== DEFAULT_STATUS_INTEGRATION_ID ||
     checkRun?.app?.slug !== "github-actions"
   ) {
     throw new Error(
-      `Canary ${DEFAULT_STATUS_CONTEXT} is not a successful native GitHub Actions CheckRun on the exact current test-merge SHA.`,
+      `Canary ${DEFAULT_STATUS_CONTEXT} is not a successful native GitHub Actions CheckRun on the exact current feature head.`,
     );
   }
 
@@ -513,13 +513,12 @@ async function assertCanaryCheckRunSource({
     repoSlug,
   );
   const run = await ghJson(`repos/${repoSlug}/actions/runs/${runId}`);
-  const expectedRunPath = `${DEFAULT_WORKFLOW_PATH}@refs/pull/${prNumber}/merge`;
   if (
     Number(run?.id) !== runId ||
     run?.repository?.full_name !== repoSlug ||
     run?.head_repository?.full_name !== repoSlug ||
-    run?.path !== expectedRunPath ||
-    run?.head_sha !== mergeCommitSha ||
+    run?.path !== DEFAULT_WORKFLOW_PATH ||
+    run?.head_sha !== headSha ||
     run?.event !== "pull_request" ||
     run?.status !== "completed" ||
     run?.conclusion !== "success" ||
@@ -535,7 +534,7 @@ async function assertCanaryCheckRunSource({
     })
   ) {
     throw new Error(
-      `Canary CheckRun does not resolve to a successful current pull_request run of ${DEFAULT_WORKFLOW_PATH} on refs/pull/${prNumber}/merge.`,
+      `Canary CheckRun does not resolve to a successful current pull_request run of the exact canonical ${DEFAULT_WORKFLOW_PATH} at feature head ${headSha}.`,
     );
   }
   const workflow = await ghJson(
@@ -605,7 +604,7 @@ async function assertCanaryCheckRunSource({
   if (
     canonicalJobs.length !== 1 ||
     canonicalJobs[0].id !== jobId ||
-    canonicalJobs[0].head_sha !== mergeCommitSha ||
+    canonicalJobs[0].head_sha !== headSha ||
     canonicalJobs[0].status !== "completed" ||
     canonicalJobs[0].conclusion !== "success"
   ) {
@@ -625,7 +624,7 @@ async function assertCanaryCheckRunSource({
   }
 
   console.log(
-    `Canary: #${prNumber} at head ${headSha} has one successful native ${DEFAULT_STATUS_CONTEXT} CheckRun on test-merge ${mergeCommitSha}.`,
+    `Canary: #${prNumber} has one successful native ${DEFAULT_STATUS_CONTEXT} CheckRun on feature head ${headSha}; the current verifier execution scope is test-merge ${mergeCommitSha}.`,
   );
 }
 

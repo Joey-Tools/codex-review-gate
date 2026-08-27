@@ -48,7 +48,10 @@ repository:
 
 - `.github/workflows/codex-review-gate.yml` is the read-only `pull_request`
   verifier. Its GitHub-managed job CheckRun, `codex/github-review-gate`, is the
-  required signal on the PR test-merge SHA.
+  required signal on the exact PR feature-head SHA. The workflow still executes
+  on `refs/pull/N/merge` and binds that CheckRun to the unchanged current
+  head/base/test-merge scope through strict environment, event and fresh-read
+  validation.
 - `.github/workflows/codex-review-gate-controller.yml` is the protected
   default-branch controller. It admits exact Codex events and typed manual
   operations, creates review requests, and establishes a strictly newer full
@@ -64,7 +67,8 @@ The copied workflows own separate triggers, minimal permissions, per-PR
 concurrency namespaces, typed `workflow_dispatch`, exact pre-runner Codex-bot
 filtering and protected repository configuration. The Action remains API-only:
 it never checks out or executes pull-request code. There is no commit-status
-bridge: only the verifier's native PR test-merge CheckRun can satisfy the gate.
+bridge: only the verifier's native feature-head CheckRun, execution-bound to the
+current test-merge, can satisfy the gate.
 
 The required CheckRun is `codex/github-review-gate`. The importable ruleset
 binds it to GitHub Actions (`integration_id: 15368`), requires the branch to be up to

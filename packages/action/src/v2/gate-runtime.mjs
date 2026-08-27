@@ -1469,7 +1469,7 @@ async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
   const current = selectCurrentV2VerifierRun(inventory, config, currentPr);
   if (!current) {
     throw missingV2VerifierRunFailure(
-      `No canonical pull_request verifier run exists for test-merge ${context.testMergeSha}`,
+      `No canonical pull_request verifier run exists for feature head ${config.expectedHeadSha}`,
     );
   }
   const active = inventory.filter((run) =>
@@ -1596,51 +1596,49 @@ async function listCurrentV2VerifierRuns(client, config, pullRequest, budget) {
   const workflow = encodeURIComponent(V2_VERIFIER_WORKFLOW_PATH);
   const runs = [];
   const seen = new Set();
-  for (const associatedSha of new Set([config.expectedHeadSha, config.testMergeSha])) {
-    let queryCount = 0;
-    for (let page = 1; ; page += 1) {
-      const path =
-        `${config.repoPath}/actions/workflows/${workflow}/runs` +
-        `?event=pull_request&head_sha=${encodeURIComponent(associatedSha)}` +
-        `&per_page=100&page=${page}`;
-      const { data, headers } = await client.request(
-        "GET",
-        path,
-        undefined,
-        { budget, safeRead: true },
-      );
-      budget.consumePage(`canonical verifier workflow runs for ${associatedSha}`);
-      if (
-        !isPlainRecord(data) ||
-        !isNonNegativeSafeInteger(data.total_count) ||
-        !Array.isArray(data.workflow_runs) ||
-        data.workflow_runs.length > 100
-      ) {
-        throw new V2RuntimeFailure("Verifier workflow-run inventory has an invalid shape");
+  let queryCount = 0;
+  for (let page = 1; ; page += 1) {
+    const path =
+      `${config.repoPath}/actions/workflows/${workflow}/runs` +
+      `?event=pull_request&head_sha=${encodeURIComponent(config.expectedHeadSha)}` +
+      `&per_page=100&page=${page}`;
+    const { data, headers } = await client.request(
+      "GET",
+      path,
+      undefined,
+      { budget, safeRead: true },
+    );
+    budget.consumePage(`canonical verifier workflow runs for ${config.expectedHeadSha}`);
+    if (
+      !isPlainRecord(data) ||
+      !isNonNegativeSafeInteger(data.total_count) ||
+      !Array.isArray(data.workflow_runs) ||
+      data.workflow_runs.length > 100
+    ) {
+      throw new V2RuntimeFailure("Verifier workflow-run inventory has an invalid shape");
+    }
+    queryCount += data.workflow_runs.length;
+    for (const [index, run] of data.workflow_runs.entries()) {
+      requireV2VerifierRunShape(run, `verifier workflow run ${runs.length + index + 1}`);
+      const id = String(run.id);
+      if (!seen.has(id)) {
+        seen.add(id);
+        runs.push(run);
       }
-      queryCount += data.workflow_runs.length;
-      for (const [index, run] of data.workflow_runs.entries()) {
-        requireV2VerifierRunShape(run, `verifier workflow run ${runs.length + index + 1}`);
-        const id = String(run.id);
-        if (!seen.has(id)) {
-          seen.add(id);
-          runs.push(run);
-        }
+    }
+    budget.consumeObjects(data.workflow_runs.length, "canonical verifier workflow runs");
+    const { hasNext } = inspectV2PaginationLink(
+      headers.get("link"),
+      "canonical verifier workflow runs",
+    );
+    if (!hasNext) {
+      if (queryCount !== data.total_count) {
+        throw new V2RuntimeFailure(
+          `Verifier workflow-run inventory count changed (${queryCount} != ${data.total_count})`,
+          { recoveryCode: "wait_then_reconcile" },
+        );
       }
-      budget.consumeObjects(data.workflow_runs.length, "canonical verifier workflow runs");
-      const { hasNext } = inspectV2PaginationLink(
-        headers.get("link"),
-        "canonical verifier workflow runs",
-      );
-      if (!hasNext) {
-        if (queryCount !== data.total_count) {
-          throw new V2RuntimeFailure(
-            `Verifier workflow-run inventory count changed (${queryCount} != ${data.total_count})`,
-            { recoveryCode: "wait_then_reconcile" },
-          );
-        }
-        break;
-      }
+      break;
     }
   }
   return runs.filter((run) => v2VerifierRunMatchesScope(run, config, pullRequest));
@@ -1674,7 +1672,8 @@ function v2VerifierRunMatchesScope(run, config, pullRequest) {
   );
   return run.event === "pull_request" &&
     isCanonicalV2VerifierWorkflowPath(run.path) &&
-    (run.head_sha === config.expectedHeadSha || run.head_sha === config.testMergeSha) &&
+    String(run.head_sha || "").toLowerCase() === config.expectedHeadSha &&
+    run.pull_requests.length === 1 &&
     matchingPrs.length === 1;
 }
 
@@ -1784,7 +1783,7 @@ function requireV2VerifierJobShape(job, run, attempt, config) {
     Number(job.run_id) !== run.id ||
     Number(job.run_attempt) !== attempt ||
     typeof job.name !== "string" ||
-    String(job.head_sha || "").toLowerCase() !== config.testMergeSha ||
+    String(job.head_sha || "").toLowerCase() !== config.expectedHeadSha ||
     typeof job.status !== "string" ||
     typeof job.check_run_url !== "string"
   ) {
@@ -1810,7 +1809,7 @@ async function loadV2VerifierCheckRun(client, config, job, budget) {
     !Number.isSafeInteger(data.id) ||
     data.id <= 0 ||
     data.name !== V2_REQUIRED_CHECK_NAME ||
-    String(data.head_sha || "").toLowerCase() !== config.testMergeSha ||
+    String(data.head_sha || "").toLowerCase() !== config.expectedHeadSha ||
     typeof data.status !== "string" ||
     data.app?.id !== V2_GITHUB_ACTIONS_APP_ID ||
     data.app?.slug !== "github-actions"

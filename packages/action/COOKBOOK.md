@@ -158,8 +158,11 @@ workflow failure describes evaluator health, not a Codex finding. A normal run
 with `gate_outcome=failure` means the evaluator worked and the merge must
 remain blocked.
 
-Require the unique canonical verifier CheckRun on the current PR test-merge
-SHA. A controller CheckRun binds the default-branch commit and is not the
+Require the unique canonical verifier run/job/CheckRun recorded against the
+exact current PR feature-head SHA. The verifier still executes on
+`refs/pull/N/merge`; strict
+`GITHUB_REF`/`GITHUB_SHA`, event-scope and fresh-PR checks bind its success to
+the unchanged current head, base and test-merge. A controller CheckRun binds the default-branch commit and is not the
 required signal. The controller must observe a strictly newer verifier attempt
 and its unique job/CheckRun; ambiguous rerun state stays blocking. Commit-status
 projection and the status-POST recovery path have been removed.
@@ -186,7 +189,7 @@ provider wait or finding change named by `recovery_code`.
 | `repair_permissions` | Restore both canonical workflow permission boundaries or the named access boundary, then reconcile. |
 | `retry_begin` | Not immediately retry-safe: wait for the exact same-run marker to settle, then rerun the original workflow run only if it remains absent; do not dispatch a new generation or blindly post duplicates. |
 | `unsupported_target` | Move to a documented supported scope or leave the gate blocked. |
-| `create_verifier_run` | If ready, convert the PR to draft and mark it ready again; if already draft, mark it ready. Verify a new `ready_for_review` verifier on the current test-merge SHA, then reconcile. |
+| `create_verifier_run` | If ready, convert the PR to draft and mark it ready again; if already draft, mark it ready. Verify a new `ready_for_review` verifier for the exact current head/base/test-merge scope, then reconcile. |
 
 The summary is authoritative for the concrete reason and object links within
 the code category. The table does not authorise guessing around missing data.
@@ -301,7 +304,8 @@ Immediately before merge:
 1. reread the PR's current head;
 2. dispatch controller `reconcile` with that exact SHA;
 3. observe the strictly newer verifier attempt and its unique canonical
-   `codex/github-review-gate` CheckRun on the current test-merge SHA;
+   `codex/github-review-gate` CheckRun on the current feature-head SHA, with
+   that verifier run bound to the current test-merge;
 4. require `execution_health=healthy`, `gate_outcome=success` and a successful
    verifier conclusion;
 5. reread unchanged PR head, base and test-merge SHA;
@@ -335,7 +339,8 @@ After the installation PR merges:
 2. stage the supplied ruleset as Disabled with no bypass actors;
 3. open a separate harmless canary PR;
 4. exercise the ordinary `@v2` review/reconcile path;
-5. verify the exact canonical verifier run, native test-merge CheckRun,
+5. verify the exact canonical verifier run, native feature-head CheckRun bound
+   to the unchanged head/base/test-merge scope,
    freshness and conversation enforcement with no same-name collision;
 6. activate the validated ruleset; and
 7. close the canary PR without merging.

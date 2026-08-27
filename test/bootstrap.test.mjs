@@ -23,6 +23,7 @@ import {
   DEFAULT_CONTROL_PLANE_OWNER,
   DEFAULT_STATUS_CONTEXT,
   DEFAULT_STATUS_INTEGRATION_ID,
+  DEFAULT_WORKFLOW_PATH,
   LEGACY_STATUS_CONTEXT,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
@@ -2816,7 +2817,7 @@ test("activation rejects a colliding exact-name check run before ruleset update"
   const repoSlug = "Joey-Tools/consumer";
   const disabledRuleset = completeDisabledRulesetFixture(7);
   const checkRunsEndpoint =
-    `repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`;
+    `repos/${repoSlug}/commits/${CANARY_HEAD_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`;
   try {
     createFakeGhExecutable(fakeBin);
     const responses = {
@@ -2970,7 +2971,7 @@ test("activation revalidates canary PR lifecycle and exact head immediately befo
   }
 });
 
-test("activation revalidates the native test-merge CheckRun immediately before update", () => {
+test("activation revalidates the native feature-head CheckRun immediately before update", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
   const stateDir = join(fixtureRoot, "state");
@@ -2987,7 +2988,7 @@ test("activation revalidates the native test-merge CheckRun immediately before u
       [`GET repos/${repoSlug}/pulls/7`]: {
         __fake_sequence: [validPullRequest, validPullRequest],
       },
-      [`GET repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: {
+      [`GET repos/${repoSlug}/commits/${headSha}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: {
         __fake_sequence: [
           [{ total_count: 1, check_runs: [canonicalCanaryCheckRunFixture(repoSlug)] }],
           [{
@@ -3015,7 +3016,7 @@ test("activation revalidates the native test-merge CheckRun immediately before u
     const calls = readFileSync(callLog, "utf8");
     assert.equal(countLines(calls, `GET repos/${repoSlug}/pulls/7`), 2);
     assert.equal(
-      countLines(calls, `GET repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`),
+      countLines(calls, `GET repos/${repoSlug}/commits/${headSha}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`),
       2,
     );
     assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
@@ -3024,30 +3025,54 @@ test("activation revalidates the native test-merge CheckRun immediately before u
   }
 });
 
-test("activation rejects a spoofed CheckRun URL and a non-canonical verifier run", () => {
+test("activation rejects spoofed source bindings and stale feature-head subjects", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
   const headSha = "0123456789abcdef0123456789abcdef01234567";
   const validPullRequest = canaryPullRequestFixture(repoSlug, headSha);
   try {
-    for (const [name, checkRunOverrides, runOverrides, expected] of [
+    for (const [name, checkRunOverrides, runOverrides, jobOverrides, expected] of [
       [
         "spoof-target",
         { details_url: "https://example.invalid/Joey-Tools/consumer/actions/runs/9007/job/18017" },
+        {},
         {},
         /not a canonical same-repository GitHub Actions job URL/u,
       ],
       [
         "wrong-workflow",
         {},
-        { path: ".github/workflows/attacker.yml@refs/pull/7/merge" },
+        { path: ".github/workflows/attacker.yml" },
+        {},
         /does not resolve to a successful current pull_request run/u,
       ],
       [
-        "wrong-test-merge",
+        "decorated-workflow-path",
+        {},
+        { path: `${DEFAULT_WORKFLOW_PATH}@refs/pull/7/merge` },
+        {},
+        /does not resolve to a successful current pull_request run/u,
+      ],
+      [
+        "stale-run-feature-head",
         {},
         { head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        {},
         /does not resolve to a successful current pull_request run/u,
+      ],
+      [
+        "stale-checkrun-feature-head",
+        { head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        {},
+        {},
+        /CheckRun inventory is incomplete, malformed, or inconsistent/u,
+      ],
+      [
+        "stale-job-feature-head",
+        {},
+        {},
+        { head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        /canonical job bound to its exact head/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
@@ -3057,11 +3082,19 @@ test("activation rejects a spoofed CheckRun URL and a non-canonical verifier run
         ...canonicalRemoteWorkflowResponses(repoSlug),
         ...canaryRunResponses(repoSlug, runOverrides),
         [`GET repos/${repoSlug}/pulls/7`]: validPullRequest,
-        [`repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: [
+        [`repos/${repoSlug}/commits/${headSha}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: [
           {
             total_count: 1,
             check_runs: [
               { ...canonicalCanaryCheckRunFixture(repoSlug), ...checkRunOverrides },
+            ],
+          },
+        ],
+        [`repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}/attempts/1/jobs?per_page=100`]: [
+          {
+            total_count: 1,
+            jobs: [
+              { ...canonicalCanaryJobFixture(repoSlug), ...jobOverrides },
             ],
           },
         ],
@@ -3293,7 +3326,7 @@ test("activation fails closed when post-update ruleset readback drifts", () => {
   }
 });
 
-test("activation reads only the current test-merge CheckRun and succeeds after complete readback", () => {
+test("activation reads only the current feature-head CheckRun and succeeds after complete readback", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
   const stateDir = join(fixtureRoot, "state");
@@ -3337,7 +3370,7 @@ test("activation reads only the current test-merge CheckRun and succeeds after c
     assert.equal(
       countLines(
         calls,
-        `GET repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`,
+        `GET repos/${repoSlug}/commits/${headSha}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`,
       ),
       2,
     );
@@ -3537,8 +3570,8 @@ function canaryRunResponses(repoSlug, overrides = {}) {
       id: CANARY_RUN_ID,
       repository: { full_name: repoSlug },
       head_repository: { full_name: repoSlug },
-      path: ".github/workflows/codex-review-gate.yml@refs/pull/7/merge",
-      head_sha: CANARY_MERGE_SHA,
+      path: DEFAULT_WORKFLOW_PATH,
+      head_sha: CANARY_HEAD_SHA,
       event: "pull_request",
       status: "completed",
       conclusion: "success",
@@ -3561,7 +3594,7 @@ function canaryRunResponses(repoSlug, overrides = {}) {
     },
     [`repos/${repoSlug}/actions/workflows/${CANARY_WORKFLOW_ID}`]: {
       id: CANARY_WORKFLOW_ID,
-      path: ".github/workflows/codex-review-gate.yml",
+      path: DEFAULT_WORKFLOW_PATH,
       state: "active",
     },
     [`repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}/attempts/1/jobs?per_page=100`]: [
@@ -3573,7 +3606,7 @@ function canaryRunResponses(repoSlug, overrides = {}) {
     [`repos/${repoSlug}/pulls/7/files?per_page=100`]: [[]],
     [`repos/${repoSlug}/commits/${CANARY_HEAD_SHA}/statuses?per_page=100`]: [[]],
     [`repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/statuses?per_page=100`]: [[]],
-    [`repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: [
+    [`repos/${repoSlug}/commits/${CANARY_HEAD_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: [
       {
         total_count: 1,
         check_runs: [canonicalCanaryCheckRunFixture(repoSlug)],
@@ -3586,7 +3619,7 @@ function canonicalCanaryJobFixture(repoSlug) {
   return {
     id: CANARY_JOB_ID,
     run_id: CANARY_RUN_ID,
-    head_sha: CANARY_MERGE_SHA,
+    head_sha: CANARY_HEAD_SHA,
     name: DEFAULT_STATUS_CONTEXT,
     status: "completed",
     conclusion: "success",
@@ -3599,7 +3632,7 @@ function canonicalCanaryCheckRunFixture(repoSlug) {
   return {
     id: CANARY_CHECK_RUN_ID,
     name: DEFAULT_STATUS_CONTEXT,
-    head_sha: CANARY_MERGE_SHA,
+    head_sha: CANARY_HEAD_SHA,
     status: "completed",
     conclusion: "success",
     details_url:

@@ -41,9 +41,11 @@ npm run test:release-provenance
 
 V2 consumer 把两份 canonical workflows 复制到目标仓库的相同路径：
 
-- `.github/workflows/codex-review-gate.yml` 是只读 `pull_request` verifier；它在 PR
-  test-merge SHA 上生成 GitHub-managed job CheckRun
-  `codex/github-review-gate`，这就是 required signal。
+- `.github/workflows/codex-review-gate.yml` 是只读 `pull_request` verifier；它在 exact
+  PR feature-head SHA 上生成 GitHub-managed job CheckRun
+  `codex/github-review-gate`，这就是 required signal。Workflow 仍在
+  `refs/pull/N/merge` 上执行，并通过严格的 environment、event 与 fresh-read 校验，把
+  CheckRun 绑定到 unchanged current head/base/test-merge scope。
 - `.github/workflows/codex-review-gate-controller.yml` 是受保护 default branch 上的
   controller；它接收 exact Codex events 与 typed manual operations、创建 review request，
   并在需要 reconcile 时建立严格更新的 full verifier attempt。
@@ -57,7 +59,8 @@ uses: JoeyTeng/codex-review-gate-action@v2
 Copied workflows 分别负责 triggers、最小 permissions、独立 per-PR concurrency、typed
 `workflow_dispatch`、runner 分配前的 exact Codex-bot filtering，以及受保护 repository
 configuration。Action 仅访问 API，绝不 checkout 或执行 PR code。V2 没有 commit-status
-bridge；只有 verifier 在 PR test-merge SHA 上的 native CheckRun 能满足 gate。
+bridge；只有 verifier 在 feature-head SHA 上、且执行语义绑定 current test-merge 的
+native CheckRun 能满足 gate。
 
 Required CheckRun 是 `codex/github-review-gate`。Importable ruleset 把它绑定到 GitHub
 Actions（`integration_id: 15368`），要求 branch up to date、all review conversations

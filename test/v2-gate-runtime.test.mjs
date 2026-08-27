@@ -1931,7 +1931,7 @@ test("manual controller reruns exact attempt A+1 and reads back one canonical Ch
   assert.deepEqual(github.statusWrites, []);
 });
 
-test("controller reports create_verifier_run when the current test-merge has no verifier", async (context) => {
+test("controller reports create_verifier_run when the current feature head has no verifier", async (context) => {
   const github = createGitHubMock({ verifierRuns: [] });
   const environment = runtimeEnvironment(context, {
     suffix: "missing-verifier",
@@ -1963,7 +1963,21 @@ test("an unobservable verifier rerun remains fail-closed and is never posted twi
   assert.deepEqual(github.rerunRequests, ["7001"]);
 });
 
-test("controller accepts either documented associated SHA domain and a ref-qualified workflow path", async (context) => {
+test("controller binds REST run, job, and CheckRun to feature head while verifier launch uses test-merge", async (context) => {
+  const verifierEnvironment = runtimeEnvironment(context, {
+    suffix: "feature-head-rest-verifier-launch",
+  });
+  const { result: verifierResult } = await runGate(
+    verifierEnvironment,
+    createGitHubMock(),
+  );
+  assert.notEqual(verifierResult.report.gateOutcome, "success");
+  assert.equal(verifierEnvironment.GITHUB_SHA, TEST_MERGE);
+  assert.equal(verifierEnvironment.GITHUB_REF, `refs/pull/${PR}/merge`);
+  assert.equal(verifierRun().head_sha, HEAD);
+  assert.equal(verifierJob().head_sha, HEAD);
+  assert.equal(verifierCheckRun().head_sha, HEAD);
+
   const github = createGitHubMock({
     verifierRuns: [verifierRun({
       head_sha: HEAD,
@@ -1977,6 +1991,46 @@ test("controller accepts either documented associated SHA domain and a ref-quali
   const { result } = await runGate(environment, github);
   assert.equal(result.exitCode, 0);
   assert.deepEqual(github.rerunRequests, ["7001"]);
+  const inventoryCall = github.calls.find(({ path }) =>
+    path === `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`
+  );
+  assert.equal(inventoryCall.search.includes(`head_sha=${HEAD}`), true);
+  assert.equal(inventoryCall.search.includes(`head_sha=${TEST_MERGE}`), false);
+});
+
+test("controller rejects verifier REST objects attached to the test-merge SHA", async (context) => {
+  for (const fixture of ["run", "job", "check"]) {
+    const github = createGitHubMock({
+      verifierRuns: [verifierRun(fixture === "run" ? { head_sha: TEST_MERGE } : {})],
+      requestInterceptor: ({ method, path }) => {
+        if (
+          fixture === "job" &&
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/actions/runs/7001/attempts/2/jobs`
+        ) {
+          return jsonResponse({
+            total_count: 1,
+            jobs: [verifierJob({ head_sha: TEST_MERGE })],
+          });
+        }
+        if (
+          fixture === "check" &&
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/check-runs/9001`
+        ) {
+          return jsonResponse(verifierCheckRun({ head_sha: TEST_MERGE }));
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `test-merge-rest-${fixture}`,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, fixture);
+    assert.notEqual(result.report.gateOutcome, "success", fixture);
+  }
 });
 
 test("controller never reruns an active verifier baseline", async (context) => {
@@ -2366,7 +2420,7 @@ function verifierRun(overrides = {}) {
     run_attempt: 1,
     event: "pull_request",
     path: ".github/workflows/codex-review-gate.yml",
-    head_sha: TEST_MERGE,
+    head_sha: HEAD,
     head_branch: "feature",
     status: "completed",
     conclusion: "failure",
@@ -2386,7 +2440,7 @@ function verifierJob({ runId = 7001, runAttempt = 2, status = "queued", ...overr
     run_id: runId,
     run_attempt: runAttempt,
     name: V2_REQUIRED_CHECK_NAME,
-    head_sha: TEST_MERGE,
+    head_sha: HEAD,
     status,
     conclusion: null,
     check_run_url: `https://api.github.com/repos/${REPOSITORY}/check-runs/9001`,
@@ -2398,7 +2452,7 @@ function verifierCheckRun({ status = "queued", ...overrides } = {}) {
   return {
     id: 9001,
     name: V2_REQUIRED_CHECK_NAME,
-    head_sha: TEST_MERGE,
+    head_sha: HEAD,
     status,
     conclusion: null,
     app: { id: 15_368, slug: "github-actions" },

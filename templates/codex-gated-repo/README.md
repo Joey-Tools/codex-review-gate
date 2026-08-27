@@ -79,9 +79,13 @@ Rollout order:
 4. import or stage the ruleset as Disabled;
 5. create a separate harmless PR, request `@codex review`, and reconcile its
    exact head when needed;
-6. verify exactly one successful native `codex/github-review-gate` CheckRun on
-   the exact current PR test-merge SHA, bound to the canonical verifier
-   run/job, with no same-name legacy commit status or competing CheckRun;
+6. verify exactly one successful native `codex/github-review-gate` verifier
+   run/job/CheckRun recorded against the exact current PR feature-head SHA and
+   bound to its unchanged head/base/test-merge scope, with no same-name
+   legacy commit status or competing CheckRun; the verifier executes on
+   `refs/pull/N/merge` and validates `GITHUB_REF`, `GITHUB_SHA`, the event scope
+   and a fresh PR read, so the CheckRun itself does not belong to the
+   test-merge SHA;
 7. read back the unchanged disabled ruleset and control plane, activate it,
    and read the active policy back exactly; and
 8. close the canary without merging it.

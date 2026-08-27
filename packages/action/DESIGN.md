@@ -36,11 +36,13 @@ pull_request opened/reopened/synchronize/ready_for_review
                                 |
           JoeyTeng/codex-review-gate-action@v2
           - bind PR head, base and test-merge SHA
+          - validate refs/pull/N/merge, GITHUB_REF and GITHUB_SHA
+          - refresh PR and require unchanged head/base/test-merge
           - fully paginate and reduce GitHub evidence
           - require two stable snapshots for clean
                                 |
                                 v
-         native CheckRun codex/github-review-gate
+ native CheckRun codex/github-review-gate on exact feature head
                                 |
                                 v
  ruleset: expected source + Code Owner review + stale dismissal
@@ -98,8 +100,16 @@ The verifier admits only `pull_request` `opened`, `reopened`, `synchronize` and
 default-base scope. `edited` is deliberately absent: after a base retarget, a
 ready PR must be converted to draft and marked ready again, while an
 already-draft PR is marked ready. The new `ready_for_review` event creates a
-verifier on the current base and test-merge SHA; rerunning the old event does
-not.
+verifier for the current exact head/base/test-merge scope; rerunning the old
+event does not.
+
+GitHub records the verifier run/job/native CheckRun against the exact PR
+feature-head SHA even though the canonical `pull_request` workflow executes on
+`refs/pull/N/merge`. Inside the Action, `GITHUB_REF` and `GITHUB_SHA` must match
+that merge ref and the event test-merge SHA; the event head/base/test-merge
+values must also match a fresh PR read. This is the execution binding that lets
+a successful feature-head CheckRun prove evaluation of the exact current
+test-merge. The CheckRun itself does not belong to the test-merge SHA.
 
 The controller admits `issue_comment` `created`/`edited` and default-branch
 `workflow_dispatch`. Comment admission checks both event sender and comment
@@ -196,7 +206,8 @@ same-head re-review that must establish a newer verifier generation.
 
 Manual reconcile requires the caller's full `expected_head_sha`; the automatic
 path binds the equivalent value at startup. The controller rereads the PR,
-locates exactly one canonical verifier on its current test-merge SHA, records
+locates exactly one canonical verifier whose native CheckRun is on the current
+feature head and whose run is bound to the current test-merge, records
 baseline attempt `A`, establishes that no canonical attempt is queued or
 running, requests one full rerun, and requires exact attempt `A+1` plus its
 unique job/CheckRun to become observable. A jump, duplicate, ambiguous POST or
@@ -395,7 +406,9 @@ success.
 `healthy/success` to a successful native conclusion. Every other pair maps to
 a blocking conclusion, keeping ordinary findings distinct from evaluator
 failure. The required verifier CheckRun belongs to the exact current PR
-test-merge SHA. The controller's CheckRun is bound to the default-branch commit and
+feature-head SHA. Its `pull_request` run executes on `refs/pull/N/merge`, and
+strict environment/event/fresh-read validation binds success to the unchanged
+head, base and test-merge. The controller's CheckRun is bound to the default-branch commit and
 never supplies the required PR result. Direct status projection and
 `statusProjection` are deleted.
 
@@ -427,7 +440,8 @@ the PR. Immediately before merge, an agent must:
 1. reread the exact current PR head;
 2. dispatch controller `reconcile` for that exact head;
 3. observe the strictly newer verifier attempt and its unique canonical
-   `codex/github-review-gate` CheckRun on the current test-merge SHA;
+   `codex/github-review-gate` CheckRun on the current feature-head SHA, with
+   that run bound to the current test-merge;
 4. require Action output `healthy/success` and a successful verifier conclusion;
 5. reread unchanged PR head, base and test-merge SHA; and
 6. require the ruleset to confirm branch up to date, all conversations

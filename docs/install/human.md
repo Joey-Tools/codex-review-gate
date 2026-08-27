@@ -39,7 +39,8 @@ boundaries that an Action step cannot define:
 
 - the read-only verifier uses only `pull_request` activity types `opened`,
   `reopened`, `synchronize`, and `ready_for_review`; its native
-  `codex/github-review-gate` CheckRun on the PR test-merge SHA is required;
+  `codex/github-review-gate` CheckRun on the exact PR feature-head SHA is
+  required;
 - controller automatic wake-ups use only `issue_comment` activity types
   `created` and `edited`;
 - before a runner is allocated, both the event sender and comment author must
@@ -368,7 +369,12 @@ wakes the controller, which establishes a strictly newer full verifier attempt.
 If the provider result arrives only as a review or reaction, or another
 recovery is needed, run a manual reconcile.
 
-The native required CheckRun belongs to the verifier's PR test-merge SHA.
+GitHub records the verifier run/job/CheckRun against the exact PR feature-head
+SHA, not its test-merge SHA. The canonical `pull_request` verifier still
+executes on `refs/pull/N/merge`; inside the Action it strictly checks
+`GITHUB_REF`, `GITHUB_SHA`, the event PR head/base/test-merge SHAs and a fresh
+PR read. A successful feature-head CheckRun is therefore execution-bound to
+the exact current test-merge.
 There is deliberately no cron or writable review event. The verifier starts on
 `opened`, `reopened`, `synchronize`, and `ready_for_review`; controller and
 verifier have separate per-PR concurrency namespaces. Before a deliberate
@@ -376,10 +382,11 @@ same-head re-review, run `begin-review` so the new request is read back and a
 strictly newer verifier attempt becomes observable. A direct comment alone
 does not atomically invalidate an older success.
 
-If a base retarget leaves no verifier for the current test-merge SHA, follow
+If a base retarget leaves no verifier for the current exact
+head/base/test-merge scope, follow
 `create_verifier_run`: for a ready PR, convert it to draft and mark it ready
 again; for an already-draft PR, mark it ready. Verify that a new
-`ready_for_review` verifier exists on the current test-merge SHA, then
+`ready_for_review` verifier exists for the current exact head/base/test-merge scope, then
 reconcile. Rerunning the old verifier is not valid retarget recovery.
 
 After a base retarget or a detected base force-push epoch, always use
@@ -455,14 +462,17 @@ Then reread the exact head and run one scoped controller reconcile. Manual
 dispatch has no limits-profile or numeric override. Only the named profiles
 are supported.
 
-Finally, re-read the PR, verifier attempt and exact test-merge CheckRun. Require
+Finally, re-read the PR, verifier attempt and exact feature-head CheckRun.
+Require
 all of the following:
 
 - the PR head is still `FULL_HEAD_SHA`;
 - the PR base and test-merge SHA are unchanged;
 - the controller established a strictly newer verifier attempt and its unique
-  canonical `codex/github-review-gate` CheckRun is `success` on that test-merge
-  SHA;
+  canonical `codex/github-review-gate` CheckRun is `success` on that exact
+  feature-head SHA;
+- that verifier run is bound to the unchanged current test-merge by its
+  merge-ref environment, event scope and fresh PR read;
 - the CheckRun expected source is GitHub Actions; and
 - the run summary reports `execution_health=healthy` and
   `gate_outcome=success`.
@@ -506,4 +516,4 @@ it and delete only its temporary branch.
 Installation is complete when the default branch contains both canonical `@v2`
 workflows, the active ruleset has the expected source and protections, and the
 closed-unmerged canary records the exact successful native CheckRun on its
-current test-merge SHA.
+current feature-head SHA, bound to its unchanged current test-merge.
