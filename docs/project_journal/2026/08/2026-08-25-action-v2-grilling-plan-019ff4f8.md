@@ -14,14 +14,16 @@ superseded_by:
 
 ## Summary
 
-- This is the authoritative confirmed plan and implementation ledger for the
+- This is the authoritative adopted plan and implementation ledger for the
   replacement Codex review gate v2 runtime, consumer installation, publisher,
   and rollout. It records individually adopted decisions, accepted tradeoffs,
   explicit deferrals, implementation evidence, and delivery handoffs.
-- Joey explicitly confirmed the complete shared summary and requested execution
-  on 2026-08-26. That confirmation closed grilling and authorized the
-  implementation/delivery workflow described here; privileged Environment
-  approval remains a separate release-time control.
+- Joey confirmed the then-complete shared summary and requested execution on
+  2026-08-26. Later review evidence reopened the authoritative-result
+  architecture branch. Q25-Q28 resolved that branch on 2026-08-27. Joey then
+  reconfirmed the revised complete shared understanding and authorized plan
+  commit plus execution on 2026-08-27. Implementation has resumed; privileged
+  Environment approval remains a separate release-time control.
 - A reason appears here only when the rollout contains an explicit reason from
   Joey or from a proposal that Joey explicitly adopted. Absence of a recorded
   reason does not invite a later implementation to invent one.
@@ -33,11 +35,13 @@ superseded_by:
   `42773dd2736af2f8759951fc7ebf6e21ebf3275b`; its uncommitted audit fixes are in
   stash `7f96293371cc2adfa0aeccc49effbf4c9d519ff2`. Neither is design authority;
   both must be reconciled against this confirmed plan before delivery.
-- Normative implementation documentation lives in
+- Normative implementation documentation will live in
   `packages/action/DESIGN.md` and `packages/action/DESIGN.zh-CN.md`; release and
   operator procedure lives in `docs/RELEASING.md` and
   `docs/RELEASING.zh-CN.md`; human and agent installation procedures live under
-  `docs/install/`. This journal remains the decision, evidence, and handoff
+  `docs/install/`. Those documents currently require native-CheckRun migration;
+  this journal overrides any inconsistent status-bridge wording until that
+  reconciliation lands. It remains the decision, evidence, and handoff
   authority rather than duplicating those operational documents in full.
 
 ## Adopted Product And Rollout Contract
@@ -63,12 +67,15 @@ superseded_by:
 
 ### Packaging And Workflow ABI
 
-- V2 ships a JavaScript Action, a copied canonical thin workflow wrapper, and
-  an importable disabled ruleset template. A reusable workflow is not the
-  consumer ABI.
-  - Explicit reason: the copied wrapper owns triggers, permissions,
-    concurrency, typed dispatch, and pre-runner filtering that an Action step
-    cannot own.
+- V2 ships a JavaScript Action, two copied canonical thin workflows, and an
+  importable disabled ruleset template. A reusable workflow is not the
+  consumer ABI. The read-only `pull_request` verifier owns the native required
+  CheckRun on the PR test-merge SHA; the protected-default-branch controller
+  owns provider/manual wake-up, review-request creation, and exact verifier
+  rerun orchestration.
+  - Explicit reason: copied workflows own triggers, separate permissions,
+    separate concurrency namespaces, typed dispatch, and pre-runner filtering
+    that an Action step cannot own.
 - The Action step uses `JoeyTeng/codex-review-gate-action@v2`. Consumers follow
   the floating major so ordinary compatible releases do not require edits in
   every installed repository.
@@ -81,10 +88,16 @@ superseded_by:
 - There is no cron.
   - Explicit reason: private repositories with no relevant PR activity should
     not consume billable Actions minutes.
+- The verifier uses `pull_request` activity types `opened`, `reopened`,
+  `synchronize`, and `ready_for_review`. It fails closed outside the adopted
+  same-repository, open, ready, default-base scope. `edited` is deliberately
+  absent; a base retarget is refreshed by draft-to-ready lifecycle recovery,
+  while strict up-to-date policy protects an advanced base until a new
+  test-merge verifier run exists.
 - Provider-driven automation uses `issue_comment` activity types `created` and
   `edited`, with exact event sender and comment-author filtering before runner
-  allocation. An edit may invalidate prior success, while the absence of edits
-  costs no runner time.
+  allocation in the controller. An edit may invalidate prior success, while
+  the absence of edits costs no runner time.
 - There is no writable automatic `pull_request_review` job. Review-object and
   reaction-only outcomes are discovered by a later authoritative manual
   reconcile.
@@ -99,10 +112,11 @@ superseded_by:
     avoids a second parser and test surface.
 - Manual business inputs are `operation`, `pr_number`, `expected_head_sha`,
   optional `request_comment_id`, `request_review` for `begin-review` with
-  default `true`, and `limits_profile` (`default` or `expanded`) for manual
-  reconcile. Every input is untrusted and revalidated from GitHub. Callers
-  cannot supply a verdict, status, bot identity, status context, stale override,
-  or skip-full-reconcile override.
+  default `true`. Every input is untrusted and revalidated from GitHub. Callers
+  cannot supply a verdict, CheckRun result, bot identity, required-check name,
+  stale override, skip-full-reconcile override, or temporary limits profile.
+  The selected soft-limit profile comes from protected repository
+  configuration.
 - Manual selectors and hints may locate evidence or stop a backward scan early,
   but they never supply authority. The reducer must prove that no newer relevant
   evidence was skipped before accepting an early stop.
@@ -117,36 +131,48 @@ superseded_by:
 ### Begin, Reconcile, And Concurrency
 
 - The two logical operations are `begin-review` and `reconcile`.
-- `begin-review` first establishes pending and, by default, posts a fresh exact
-  `@codex review` request. `request_review=false` is an advanced best-effort
-  option and does not add a dedicated barrier.
+- `begin-review` creates or safely adopts a fresh exact hidden-marker
+  `@codex review` request by default, reads that request back, and then requests
+  a full verifier rerun. The newer native verifier CheckRun establishes the
+  observable pending/blocking generation once it appears. The accepted
+  eventual-reconciliation boundary means request creation and that CheckRun
+  are not an atomic transaction. `request_review=false` is an advanced
+  best-effort option and does not add a dedicated barrier.
 - An agent should normally post exact `@codex review` directly when the required
   check is not already passing, then use GHA only when reconciliation is needed.
   - Explicit reason: direct posting avoids unnecessary runner minutes; the
     workflow-owned path remains available when pending and request creation need
     to be coordinated.
-- Same-PR status writers share one concurrency group with
-  `cancel-in-progress: false`. GitHub may replace one not-yet-started pending
-  wake-up, so an agent must observe the exact `begin-review` run complete before
-  treating it as a successful barrier or posting a dependent request. GitHub
-  provides no operation-aware queue priority or coalescing.
+- Verifiers and controllers use separate per-PR concurrency namespaces. The
+  verifier is latest-generation single-flight with `cancel-in-progress: true`;
+  cancellation is blocking and cannot satisfy the required check. Controllers
+  retain `cancel-in-progress: false` because `begin-review` can cross a
+  may-have-committed comment-creation boundary. GitHub may still replace one
+  not-yet-started pending controller wake-up, so agents must observe the exact
+  controller operation and later verifier attempt required by its recovery
+  contract. Concurrency supplies scheduling, not an event or mutation fence.
 - A `begin-review` logical attempt is keyed by repository ID, PR, expected head,
   and `GITHUB_RUN_ID`. A rerun adopts an existing exact, unedited, matching
   hidden marker. After an unknown POST result it rereads before retrying; if
-  visibility remains unknown, it keeps pending and reports `retry_begin` with
-  `retry_safe=false`. GitHub issue-comment creation has no idempotency key, so
-  the side effect may have succeeded before the failure became visible; the
-  caller must wait for the exact same-run marker to settle and, if it remains
-  absent, rerun the original workflow run instead of immediately retrying or
-  dispatching a new generation. Duplicate same-run requests are folded
-  conservatively and reported rather than selecting a convenient clean result.
+  visibility remains unknown, the controller reports `unhealthy/pending` with
+  `retry_begin` and `retry_safe=false`; it does not request a verifier rerun or
+  claim that the required CheckRun is pending. GitHub issue-comment creation
+  has no idempotency key, so the side effect may have succeeded before the
+  failure became visible. The caller must wait for the exact same-run marker to
+  settle and, if it remains absent, rerun the original controller workflow run
+  instead of immediately retrying the POST or dispatching a new generation.
+  Duplicate same-run requests are folded conservatively and reported rather
+  than selecting a convenient clean result.
 
 ### Permissions And Execution Boundary
 
-- The runner job grants only `contents: read`, `issues: write`,
-  `pull-requests: read`, and `statuses: write`. It does not grant write access
-  to pull requests, checks, contents, Actions, or OIDC, and does not require
-  `actions: read`.
+- The verifier grants only the read permissions needed for repository, issue,
+  review, reaction, and pull-request evidence; it has no `statuses`, `checks`,
+  `actions`, `issues`, `pull-requests`, contents, or OIDC write authority. The
+  controller grants `actions: write` for the exact verifier rerun plus
+  `issues: write` for canonical request and diagnostic comments, with only the
+  necessary read permissions otherwise. It has no `statuses: write`,
+  `checks: write`, contents write, pull-request write, or OIDC authority.
 - Runtime is API-only. It never checks out or executes consumer or PR code,
   accepts repository identity only from `GITHUB_REPOSITORY` plus a strict PR
   number, treats all PR text as untrusted, and obtains protected policy only
@@ -166,19 +192,23 @@ superseded_by:
   requires `codex/github-review-gate` from expected source GitHub Actions,
   requires branches to be up to date, requires all conversations resolved, and
   carries no repository-specific bypass actors.
-- Only the gate workflow receives `statuses: write`. Installation first
-  observes the actual expected status source on a canary, validates the imported
-  disabled ruleset, and only then activates it; `Any source` is not accepted.
+- No consumer workflow receives `statuses: write`. Installation first observes
+  the verifier's native PR test-merge CheckRun and actual expected source on a
+  canary, validates the imported disabled ruleset, and only then activates it;
+  `Any source` is not accepted.
 - The expected-source integration ID identifies the GitHub Actions App, not one
-  particular workflow. Installation therefore also requires repository-default
-  workflow permissions to be read-only, rejects every non-canonical default-
-  branch workflow or job that grants `statuses: write` or `write-all`, and
-  rejects every additional v1 or v2 direct/reusable gate caller. The canary
-  status target URL must resolve to a successful run of the exact canonical
-  workflow in the same repository at the current default-branch head.
-  - Explicit reason: otherwise another GitHub Actions workflow could publish
-    the same required status context, or a duplicate gate caller could race the
-    canonical workflow while still presenting the same integration identity.
+  particular workflow. Installation therefore exact-byte verifies both
+  canonical default-branch workflows and fails closed on any noncanonical
+  reserved job/check name, relevant write authority, `write-all`, or additional
+  v1/v2 direct or reusable gate caller. The only admitted write boundary is the
+  exact canonical controller's reviewed `actions: write`/`issues: write`
+  surface. The canary must resolve the unique required-name CheckRun to the
+  exact canonical `pull_request` verifier run on the current PR test-merge SHA,
+  reject legacy same-name status or CheckRun collisions, and prove the scoped
+  CODEOWNERS/ruleset compound control plane before activation.
+  - Explicit reason: otherwise another GitHub Actions workflow could present
+    the same required job name or acquire controller authority while sharing
+    the same integration identity.
 - Immediately before an active ruleset POST or PUT, installation rereads the
   repository default branch and head, canonical workflow bytes and complete
   workflow inventory, canary run, and the full existing ruleset. A PUT proceeds
@@ -192,9 +222,10 @@ superseded_by:
 - Stable `v2.0.0` supports GitHub.com public and private repositories;
   same-repository ordinary branches targeting an open, non-draft,
   default-branch PR; `ubuntu-slim` with `ubuntu-latest` fallback; rulesets,
-  required status, conversation resolution, and up-to-date enforcement;
-  `issue_comment` plus `workflow_dispatch`; and ordinary merge, squash, and
-  rebase methods.
+  native required CheckRun, conversation resolution, and up-to-date
+  enforcement; `pull_request` verifier plus `issue_comment` and
+  `workflow_dispatch` controller entry points; and ordinary merge, squash, and
+  rebase methods under the documented agent merge closure.
 - Stable `v2.0.0` fails closed for GHES, forks, merge queues, non-default bases,
   drafts, bot-owned PRs, self-hosted/Windows/macOS runners, and new operations on
   closed or merged PRs.
@@ -275,32 +306,42 @@ superseded_by:
   - Explicit reason: fail-closed handling must preserve current uncertainty
     without making a provider formatting error on an old head unrecoverable.
 
-### Head, Status, And Merge Closure
+### Head, Native CheckRun, And Merge Closure
 
-- A valid reconcile rereads the selected PR and, only while its head equals
-  `expected_head_sha`, replaces that SHA's gate status with pending before
-  collecting evidence. A stale run never follows or writes a new head. This
-  invalidates old success during a recheck and leaves an interrupted run
-  fail-closed at pending.
-- A deliberate same-head re-review uses `begin-review` to write pending and, by
-  default, create the new request in the same run.
-- A success is a stable observation, not a permanent review lease. Commit
-  statuses do not expire and automatic events can be lost, so an agent-driven
-  merge must run an exact-current-head reconcile immediately before merge,
-  carrying `expected_head_sha`, then require `healthy/success`, the confirmed
-  current-head status from GitHub Actions, unchanged head, and ruleset allowance.
+- A verifier is admitted only for the exact `pull_request` event PR, head,
+  base, and test-merge SHA. It never follows a changed target and has no
+  authoritative write API. GitHub's native job CheckRun on that test-merge SHA
+  is the gate result: only a proved stable `healthy/success` may conclude
+  successfully; findings, pending evidence, unsupported scope, cancellation,
+  timeout, API uncertainty, and every unhealthy result remain blocking.
+- A deliberate same-head re-review uses controller `begin-review` to create or
+  adopt the canonical request and then establish a strictly newer full
+  verifier attempt. A provider or manual reconcile similarly establishes a
+  newer attempt only through the adopted ledgerless baseline/readback
+  handshake. Cancelled or ambiguous attempts are never success substitutes.
+- Success is a stable observation, not a permanent review lease. Native
+  CheckRuns do not expire merely because later provider evidence appears, and
+  automatic wake-ups can be lost. An agent-driven merge must therefore run an
+  exact-current reconcile immediately before merge; observe the strictly newer
+  attempt and unique canonical CheckRun; require `healthy/success`; reread the
+  unchanged PR head, base, test-merge SHA, and ruleset allowance; and merge with
+  an exact-head compare-and-swap. The accepted eventual-reconciliation contract
+  does not claim atomic invalidation of an older success, and direct human UI
+  merge outside this closure is unsupported.
 - Public result semantics are fixed:
   - stable clean: `healthy/success`;
   - findings: `healthy/failure`;
-  - findings proved but failure-status projection failed:
+  - findings proved but execution or result finalization also failed:
     `unhealthy/failure`;
   - provider not complete: `healthy/pending`;
   - API, pagination, cap, or stability failure: `unhealthy/pending`;
   - stale delayed event: `healthy/not_applicable`;
   - invalid manual target or unsupported scope: `unhealthy/not_applicable`;
-  - no trusted state can be read or projected: `unhealthy/unknown`.
-  `unhealthy/success` is invalid. Workflow conclusion reports execution health;
-  the PR-head status reports gate outcome.
+  - no trusted state can be read: `unhealthy/unknown`.
+  `unhealthy/success` is invalid. The structured outputs and Actions summary
+  preserve execution-health and gate-outcome detail, while the required native
+  verifier job/CheckRun maps only `healthy/success` to a successful conclusion.
+  Every other pair maps to a blocking conclusion.
 - Public Action outputs are `execution_health`, `gate_outcome`,
   `recovery_code`, and `retry_safe`. `execution_health` is `healthy` or
   `unhealthy`; `gate_outcome` is `success`, `failure`, `pending`,
@@ -308,10 +349,11 @@ superseded_by:
   `recovery_code` values are `none`, `wait_provider`, `reconcile`,
   `fix_findings`, `request_clean_generation`, `retry_reconcile`,
   `wait_then_reconcile`, `use_expanded_limits`, `raise_protected_limit`,
-  `refresh_head`, `repair_permissions`, `retry_begin`, and
-  `unsupported_target`. `status_projection` is summary-only. Findings do not
-  make execution unhealthy; `retry_safe` means an immediate identical-input
-  retry is a valid recovery action.
+  `refresh_head`, `repair_permissions`, `retry_begin`, `unsupported_target`,
+  and `create_verifier_run`; the last covers an absent current
+  test-merge verifier. Direct status projection and `status_projection` are
+  deleted. Findings do not make execution unhealthy; `retry_safe` means an
+  immediate identical-input retry is a valid recovery action.
 
 ### Snapshot Stability And Limits
 
@@ -379,10 +421,10 @@ superseded_by:
 ### Diagnostics And Recovery
 
 - Runtime favors conservative at-least-once recovery. Small duplicate requests,
-  statuses, or diagnostic comments are acceptable when they are reconciled
-  conservatively; a duplicate must never hide a finding or manufacture pass.
-  Later provider events and manual reconcile are the recovery paths from an
-  interrupted or unknown state.
+  verifier attempts, or diagnostic comments are acceptable when they are
+  reconciled conservatively; a duplicate must never hide a finding or
+  manufacture pass. Later provider events and manual reconcile are the recovery
+  paths from an interrupted or unknown state.
   - Explicit reason: Joey preferred automatic recovery from failure and
     accepted a small amount of duplication so long as findings are never missed.
 - Public reporting separates execution health from gate outcome and uses a
@@ -710,19 +752,30 @@ superseded_by:
 
 ## Confirmation And Implementation Gate
 
-- No reachable design or fact-investigation node remains open.
-- Joey confirmed the complete shared summary and requested implementation on
-  2026-08-26. Implementation resumes from the recoverable branch/stash only
-  after an explicit contract audit; historical implementation detail cannot
-  override this journal.
+- Joey confirmed the then-complete shared summary and requested implementation
+  on 2026-08-26. Later review evidence reopened only the authoritative-result
+  architecture branch: the fixed-context commit-status bridge could not fence
+  a delayed success after an ambiguous mutation response.
+- Joey adopted the two-workflow native-CheckRun architecture on 2026-08-27.
+  The dependent source-authenticity, event-visibility, merge-closure, and
+  ledger nodes are now resolved. A complete frontier audit found no remaining
+  reachable product decision. Joey reconfirmed the revised shared understanding
+  and authorized execution on 2026-08-27. Historical implementation detail
+  cannot override this journal.
+- This journal-only signed commit is the required plan checkpoint before
+  implementation reconciliation. The task list then advances from planning to
+  implementation; no product decision remains open.
 - Local implementation, tests, documentation, fresh-context review, and signed
   commit precede PR readiness. Merge precedes the approved publisher run;
   release read-back precedes consumer installation and canary expansion.
+- If the specialized local reviewer role is unavailable, the fresh local review
+  lane uses an ordinary general agent with `gpt-5.6-sol` and `ultra` reasoning.
+  PR #32 remains outside this delivery workstream.
 
 ## Implementation Checkpoint
 
-- Phase: infrastructure implementation and contract reconciliation, started
-  after confirmation on 2026-08-26.
+- Phase: final plan checkpoint followed by infrastructure implementation and
+  contract reconciliation, authorized on 2026-08-27.
 - Recovery source: `wip/v2-release-review` at
   `42773dd2736af2f8759951fc7ebf6e21ebf3275b`, with stash
   `7f96293371cc2adfa0aeccc49effbf4c9d519ff2` applied but deliberately retained
@@ -1164,6 +1217,286 @@ superseded_by:
   #34 recorded above do not cross that rollout boundary.
 - Existing source-repository PR #32 is explicitly outside this workstream and
   does not block or supply changes to this delivery.
+- After signed checkpoint `2b1397bf1c972ba276a0c9a0f79d84dd5ff53bdb`,
+  fresh ordinary-agent review at the explicitly required
+  `gpt-5.6-sol` / `ultra` profile found additional runtime, installer,
+  publisher, and installation-runbook defects. These repairs remain in the
+  working tree and are not yet a landing commit; all final evidence below is
+  therefore working-tree evidence until a new signed checkpoint freezes it.
+- Runtime complete-snapshot closure now rereads and fingerprints every
+  decision-relevant issue comment, review, reaction, request-authority result,
+  short-SHA resolution, base epoch, repository identity, and PR scope. A clean
+  result still requires two independently fetched, fully paginated snapshots;
+  a mutation between snapshots restarts the stability observation instead of
+  inheriting a stale clean result. Safe-read retry classification covers
+  read-only GraphQL POSTs as well as GETs, while begin-review preserves its
+  non-idempotent may-have-committed boundary until the same-run request marker
+  is completely reconciled.
+- Runtime status-response handling now preserves the received HTTP status and
+  response phase through body-stream, size, JSON, and exact-ACK failures.
+  Permission rejections, definite transient rejections, and permanent target
+  errors therefore keep distinct recovery codes. The mandatory pre-mutation
+  receipt is separate from the one authoritative final Actions summary, so an
+  ambiguous or rejected success projection cannot leave contradictory
+  `success/none` and recovery blocks in the same summary. The current complete
+  runtime test file passes `59/59`; `npm run check:v2` and scoped diff checks
+  pass.
+- Consumer bootstrap now enforces the no-runtime-App single-producer boundary
+  against extra workflows with `statuses`, `checks`, `issues`, or
+  `pull-requests` write authority, `write-all`, exact or dynamic reserved job
+  names, and direct or reusable v1/v2 callers. Ambiguous YAML carriers fail
+  closed. Classic branch protection is read from the parent protection
+  endpoint with exact absent/error classification, activation requires an
+  already staged and exactly read-back disabled ruleset, and the canary proves
+  the canonical run/job plus the required PR-head signal without accepting a
+  same-name PR-head CheckRun. The complete bootstrap test file passes `65/65`.
+- Publisher remediation keeps privileged admission closed to an exact writable
+  plan, double-checks immutable-Release policy and source-branch/ruleset state
+  before mutation and at success readback, and classifies public verification
+  and Release `404` states without turning deterministic conflicts into generic
+  retries. Full-tag history, immutable Release, assets, and forward-only stable
+  alias reconciliation retain exact readback. The complete focused publisher
+  suite passed `46/46`, with Bash syntax, ShellCheck, Node syntax, and scoped
+  diff checks passing on the frozen publisher bytes.
+- Installation documentation is now split into a human-readable guide and a
+  separately agent-executable guide rather than treating “agent” as a shorter
+  audience summary. The first migration remains fail closed: every inventoried
+  v1 requirement stays active through the exact-head synchronous merge; the
+  transaction then rereads the current repository default plus merged/base/head
+  PR scope before removing any legacy requirement. A base retarget after the
+  pre-merge read therefore cannot open a v1/v2 protection gap.
+- The canonical preapproval/final legacy snapshot is implemented once in
+  tracked executable
+  `scripts/build-legacy-review-gate-inventory.sh`. Its canonical JSON binds the
+  repository and default branch, full ruleset identity/source/conditions,
+  enforcement and target, complete `bypass_actors`, the complete matching
+  effective `required_status_checks` rule and parameters, and the classic
+  parent required-status object. Both approval and final merge transaction call
+  that same helper and compare SHA-256 over the same bytes. Focused fixtures
+  prove that bypass or strict-policy drift changes the digest and malformed
+  rule/bypass schema fails without output. Conditions and other set-valued
+  policy arrays are recursively canonicalized within their reviewed scope, so
+  API ordering of repository IDs, property values, include/exclude patterns,
+  bypass actors, required checks, and classic contexts/checks does not create a
+  false drift. The current documentation/security contract suite passes
+  `30/30`; the helper passes `bash -n` and ShellCheck. A final zero-context
+  ordinary `gpt-5.6-sol` / `ultra` delta audit reported `Clean` on helper
+  SHA-256 `b3c82d024785728c860e748ed2fc08aaf184fd15201b86d3c6864f5c42864b81`
+  and contract-test SHA-256
+  `d7e56c1c3e39b3fc206abc1107fa0ca076345089a1f7fc87311c1e8ec6c7be9e`.
+- The fresh runtime review also proved one unresolved P1 architectural limit in
+  the adopted fixed-context PR-head commit-status projection. An exact GitHub
+  `201 Created` followed by an unreadable body provides an ordering boundary,
+  but a complete `5xx`, gateway timeout, transport abort, or no-response result
+  does not prove that the origin stopped processing the old success request.
+  Because GitHub selects the latest status for the same SHA/context and the
+  controller job's native CheckRun is bound to the default-branch SHA, a late
+  old success can overwrite a later same-head failure without a PR-head
+  generation fence. `target_url`, description, readback absence, serial
+  concurrency, and `retry_safe=false` are diagnostics, not a server-side fence.
+  The current working tree intentionally does not disguise this limit as a
+  solved retry case.
+- A separate zero-context ordinary `gpt-5.6-sol` / `ultra` architecture lane
+  proved a no-runtime-App alternative: a read-only `pull_request` verifier whose
+  GitHub-managed CheckRun is required on the PR test-merge SHA, plus a protected
+  default-branch controller that creates review requests and precisely reruns
+  the current verifier. That shape removes authoritative status POSTs and makes
+  every non-`healthy/success` verifier result blocking. It also changes adopted
+  decisions: one canonical workflow becomes two; workflow conclusion becomes
+  gate authority rather than execution-health-only telemetry; each PR/head
+  allocates a verifier runner; controller-triggered reconcile usually adds a
+  second run; `actions: write` replaces `statuses: write`; and per-dispatch
+  `limits_profile` cannot flow through a native rerun without another reviewed
+  carrier. Joey explicitly adopted this architecture on 2026-08-27. The
+  fixed-context commit-status bridge is superseded and must not ship in stable
+  v2. The accepted tradeoff is the additional workflow, permission, runner,
+  and ABI cost in exchange for mechanically removing delayed-success overwrite
+  while retaining the no-runtime-App boundary.
+- Joey superseded the temporary `edited` selection. The adopted
+  `pull_request` activity types are `opened`, `reopened`, `synchronize`, and
+  `ready_for_review`; `edited` is deliberately absent. A base-ref retarget does
+  not create an exact-current verifier run, while advancing the existing base
+  ref was never covered by `edited` and remains protected by strict up-to-date
+  policy until a head update emits `synchronize`. Omitting `edited` avoids a
+  full verifier allocation for ordinary title/body edits. A retarget therefore
+  remains fail closed until an operator or agent creates a new PR lifecycle
+  event: convert a ready PR to draft and mark it ready for review, or mark an
+  already-draft PR ready. That `ready_for_review` event creates the verifier on
+  the current base and test-merge SHA; native rerun of the old run is not a
+  substitute because it retains the old event SHA and ref.
+- The human-readable and agent-executable usage guides must both document that
+  retarget recovery. The controller must also emit the same next action in its
+  Actions summary when it cannot locate exactly one canonical `pull_request`
+  verifier run for the current test-merge SHA. The machine-readable result is
+  `recovery_code=create_verifier_run` with `retry_safe=false`: for a ready PR,
+  convert it to draft and mark it ready again; for an already-draft PR, mark it
+  ready; then verify a new `ready_for_review` verifier attempt exists on the
+  current test-merge SHA before reconciling again. The controller does not
+  change draft state itself and must not present an identical manual rerun as a
+  valid recovery. Updating the PR head to emit `synchronize`, or close/reopen as
+  a secondary manual recovery, remains valid but is not the primary retarget
+  instruction.
+- The adopted architecture's race boundary is layered rather than supplied by
+  concurrency alone. It removes every authoritative commit-status POST; binds
+  the GitHub-managed required CheckRun to the exact current PR test-merge SHA;
+  permits only one current verifier per PR with latest-generation cancellation;
+  and maps every conclusion except a proved stable `healthy/success` to a
+  blocking result. The verifier concurrency is therefore latest-wins
+  single-flight, not a FIFO queue: `cancel-in-progress: true` cancels an older
+  verifier, and a cancelled, timed-out, failed, pending, or unhealthy verifier
+  cannot satisfy the gate. A controller wake-up that finds a verifier already
+  running must not assume that run observed the new evidence; it must establish
+  a later full-reconcile attempt or fail closed with an explicit recovery path.
+  In particular, cancellation or an accepted-but-not-yet-visible rerun request
+  is not a barrier: the controller must read back the exact `run_id`, a strictly
+  newer `run_attempt`, and its canonical verifier job/CheckRun as queued or in
+  progress before treating refresh as established. Verifier and controller use
+  separate per-PR concurrency namespaces. Controller operations retain
+  `cancel-in-progress: false` because `begin-review` can create a comment with
+  a may-have-committed, non-idempotent result.
+- Native rerun does not atomically connect a newly created provider event to a
+  required pending CheckRun. Until the controller proves the newer attempt,
+  an older same-head success can remain visible. The controlled lifecycle must
+  therefore establish and read back the new attempt before a dependent review
+  request, and merge automation must retain the exact-current verifier rerun
+  and readback closure. An already-running verifier is never presumed to have
+  observed a later event. Eliminating this wake-up window for arbitrary
+  out-of-band review requests would require an additional authenticated event
+  carrier or runtime App; bare concurrency and cancellation do not supply it.
+- The existing evidence reducer, complete pagination, exact provider filtering,
+  terminal-clean and `+1` semantics, commit-binding and unambiguous short-SHA
+  handling, finding accounting, base/head/test-merge validation, two-snapshot
+  stability proof, soft limits, decision/recovery codes, and Actions summary
+  move into the read-only `pull_request` verifier. Review-request creation,
+  hidden-marker deduplication, automatic `issue_comment` admission, manual
+  dispatch validation, exact current-run selection, and Actions rerun remain in
+  the protected default-branch controller. Direct commit-status projection and
+  its mutation/readback recovery state are deleted rather than migrated; the
+  ruleset continues to own up-to-date-branch and resolved-conversation policy.
+
+### Verified Two-Workflow Platform Boundaries And Open Nodes
+
+- Required-CheckRun source selection is not workflow provenance. GitHub's
+  ruleset schema binds a required check to `context` plus `integration_id`;
+  `15368` identifies the GitHub Actions App as a whole, not a workflow ID,
+  workflow path, event, ref, or step graph. A `pull_request` run evaluates the
+  PR merge commit's workflow definition, and required-check matching uses the
+  job name. A PR can therefore propose a same-name replacement producer; an
+  additional duplicate name may instead make the required check ambiguous and
+  block. Sources: [rules schema](https://docs.github.com/en/rest/orgs/rules),
+  [required-check troubleshooting](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules#troubleshooting-required-status-checks),
+  [pull-request event](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request),
+  and [protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
+- Joey adopted the repository-level no-runtime-App design on 2026-08-27. It
+  provides a compound merge-safety boundary, not machine-verifiable workflow
+  provenance: exact-byte verification of both canonical default-branch
+  workflows; fail-closed inventory rejection of noncanonical reserved-name
+  producers and relevant write authority; CODEOWNERS coverage of
+  `/.github/workflows/` and `/.github/CODEOWNERS`; required Code Owner review;
+  stale-approval dismissal; strict up-to-date policy; no bypass; and
+  canonical-run/no-collision canary readback. The ordinary required-approval
+  count remains zero, so a business-code PR that does not modify an owned
+  control-plane path needs no human approval. A control-plane-changing PR may
+  display a misleading same-name success, but the independent Code Owner rule
+  prevents that change from merging without explicit authorization.
+  - Explicit reason: protect the gate against a PR modifying `.github` control
+    files to forge a pass without imposing human review on every ordinary PR.
+  - The installer must not silently broaden approval policy. If Code Owner
+    review is not already required and an existing CODEOWNERS file contains any
+    effective non-managed owner pattern, activation stops with an explicit
+    policy-expansion decision instead of making those existing paths newly
+    approval-gated. Existing already-enforced owner policy is preserved.
+  - The public contract must not describe `integration_id: 15368` as
+    single-producer proof. It is the GitHub-owned GitHub Actions App that
+    produces native workflow CheckRuns, including the verifier CheckRun on the
+    PR test-merge SHA; it is neither the removed commit-status projection nor
+    the private Publisher App.
+- An organization/enterprise required-workflow ruleset is the strongest native
+  no-runtime-App alternative because it can bind a source repository, path,
+  ref, and SHA. It requires an eligible organization plan and owner-level
+  installation, excludes personal-repository-only deployment, and changes the
+  adopted event and floating-version assumptions. A push-ruleset path freeze is
+  another organization-level hardening option but adds narrow-bypass and
+  control-plane-update friction. Neither is a stable-v2 installation
+  prerequisite; they remain optional future hardening profiles.
+- Native rerun provides an observable attempt boundary but no event-to-attempt
+  transaction. A successful full-rerun request returns only `201 Created` and
+  accepts no operation inputs; `GITHUB_RUN_ID` remains stable while
+  `run_attempt` increments, and the controller can query the exact attempt's
+  jobs and CheckRuns. GitHub documents no idempotency key, duplicate-POST
+  suppression, read-after-write deadline, or comment/manual-event binding.
+  Sources: [workflow-run rerun](https://docs.github.com/en/rest/actions/workflow-runs#re-run-a-workflow),
+  [GitHub context](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#github-context),
+  and [attempt jobs](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt).
+- The minimum ledgerless handshake is therefore: refetch the exact current
+  verifier run; record baseline attempt `A`; issue one rerun request; require a
+  later attempt plus its unique canonical job/CheckRun to become observable;
+  and never blindly repeat an ambiguous POST. This does not atomically revoke
+  an older success between a new provider event and the new CheckRun becoming
+  visible. Eliminating command-to-attempt ambiguity requires a separate
+  authenticated append-only command marker and verifier receipt, which would
+  make that marker an authority/ledger and supersede the adopted best-effort
+  sticky-comment boundary.
+- Joey adopted the ledgerless handshake on 2026-08-27. Controller inputs such
+  as PR number, expected head, operation, and optional comment hint provide
+  validation and early-stop information only; they are not verifier authority
+  and cannot replace the complete GitHub evidence scan. The mutable sticky
+  comment remains best-effort diagnostics and recovery guidance only.
+  - For automatic admission, the controller must exactly refetch and validate
+    the admitted provider event before requesting a rerun. For manual
+    reconcile, the exact current PR/head contract is mandatory while any event
+    or comment hint remains optional acceleration.
+  - For `begin-review`, the controller creates or safely adopts the canonical
+    hidden-marker `@codex review` request, reads that exact request back, and
+    only then requests the full verifier rerun. Direct agent-authored
+    `@codex review` remains the lower-minutes default when no controller pending
+    transition is needed.
+  - The controller records baseline attempt `A`, establishes that no competing
+    canonical attempt is queued or running, issues one rerun request, and
+    requires exact attempt `A+1` plus its unique canonical job/CheckRun. A jump
+    beyond `A+1`, duplicate/conflicting attempt, unreadable response, or timeout
+    is inconclusive. The same operation never blindly repeats an ambiguous
+    POST; a later reconcile refetches the settled attempt inventory, adopts a
+    new baseline, and requests a fresh attempt if necessary.
+  - Native rerun carries no manual operation inputs. The verifier therefore
+    takes its soft-limit profile from protected repository configuration;
+    temporary per-dispatch numeric or profile overrides remain deferred.
+  - An authenticated append-only command/receipt ledger is not adopted.
+- A controller-only merge path cannot be built from the repository's ordinary
+  `GITHUB_TOKEN` under the current no-dedicated-App boundary. GitHub rulesets do
+  allow GitHub Apps as bypass actors, and `Restrict updates` applies to PR
+  merges, but the GitHub-owned Actions App is not selectable as a bypass actor
+  in the current GitHub.com ruleset UI. Read-only checks on both
+  `JoeyTeng/codex-review-gate-action` and
+  `Joey-Tools/codex-review-gate` returned no GitHub Actions candidate. GitHub
+  does not document support for registering App ID `15368` through the API, so
+  an undocumented write is not an installation contract. Even if it became
+  selectable later, bypass would bind the shared App integration rather than a
+  canonical workflow and would therefore grant the same bypass identity to any
+  sufficiently privileged repository workflow. Sources:
+  [ruleset bypass](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository#granting-bypass-permissions-for-your-branch-or-tag-ruleset),
+  [`GITHUB_TOKEN` identity](https://docs.github.com/en/actions/concepts/security/github_token),
+  and [rules REST schema](https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
+- Merge queue and organization required workflows are not substitutes for the
+  missing event transaction. They add merge/test freshness or workflow-source
+  provenance, but an arbitrary later Codex comment or review does not
+  atomically create a new pending required check. They also exclude the adopted
+  personal-repository baseline or change its event, cost, and installation
+  assumptions. Therefore the next product decision must choose between a
+  documented eventual-reconciliation/merge-procedure boundary, reopening a
+  dedicated merge identity and materially broader infrastructure, or deferring
+  stable v2 if a zero-window server-side guarantee is non-negotiable.
+- Joey adopted the documented eventual-reconciliation boundary on 2026-08-27.
+  Stable v2 does not claim that GitHub atomically revokes an older same-SHA
+  success when arbitrary later provider evidence arrives. Automatic controller
+  admission is a wake-up mechanism, not independent decision authority. The
+  supported agent merge path must request an exact-current verifier refresh,
+  observe the strictly newer attempt and its unique canonical job/CheckRun,
+  require the complete stable reducer result to be `healthy/success`, reread
+  current PR scope and ruleset state, and merge immediately with exact-head
+  compare-and-swap. A direct human UI merge that skips this closure is outside
+  the stable-v2 safety contract. Dedicated runtime/merge identity and stable-v2
+  deferral are not adopted for this node.
 
 ## Verified Facts And Required Live Preflight
 
@@ -1199,6 +1532,12 @@ superseded_by:
 
 ## Next Steps
 
+- Reconcile the confirmed contract across implementation, installation assets,
+  tests, and this journal; freeze a new signed checkpoint; then run one fresh
+  ordinary `gpt-5.6-sol` / `ultra` whole-range review over the exact final head.
+- Run the already specified hidden-marker canary and live
+  publisher/runner/Environment preflights as execution evidence; they are not
+  remaining grilling choices.
 - Satisfy infrastructure PR #34's CI, review, and merge-readiness gates without
   involving PR #32.
 - After the infrastructure PR merges, create the separate release-intent PR and
