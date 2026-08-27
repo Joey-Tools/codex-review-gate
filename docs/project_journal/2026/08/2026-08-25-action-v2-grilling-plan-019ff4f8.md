@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-08-26
+updated: 2026-08-27
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -1140,6 +1140,15 @@ superseded_by:
   stays pending; an older finding remains blocking while such liveness is
   active; and ordinary, unauthorized, or pre-base-epoch requests do not consume
   reaction-query budget when they cannot be the current generation.
+- The required rerun used another zero-context ordinary `gpt-5.6-sol` / `ultra`
+  agent against the independently prepared and immediately validated frozen
+  `10217253306ca2ee6f312f766a331f8924e26e47..7b8d4a1ceab04e9d47f09e7584935bd9fe067943`
+  range. It repeated the already adjudicated immutable-SHA recommendation for
+  the secret-bearing publisher Action. That recommendation remains a conscious
+  non-goal under Joey's fixed floating-major policy above and is not an
+  implementation defect. Its other finding was valid: this entry's `updated`
+  field still named `2026-08-26` after evidence added on `2026-08-27`; the
+  frontmatter now records the actual latest update date.
 - The production configuration preconditions were applied and read back before
   publication. Source Environment `marketplace-production` now has
   administrator bypass disabled, keeps `JoeyTeng` as its sole required reviewer,
