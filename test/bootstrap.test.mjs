@@ -2327,6 +2327,34 @@ test("remote bootstrap rejects default workflow write permissions", () => {
   }
 });
 
+test("remote bootstrap binds every gh api request to github.com despite hostile GH_HOST", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
+    };
+    const result = runBootstrap(["--repo", repoSlug], {
+      env: {
+        ...process.env,
+        GH_HOST: "hostile.invalid",
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Dry run: would create repository ruleset/u);
+    assert.notEqual(readFileSync(callLog, "utf8").trim(), "");
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("classic branch protection aggregates legacy contexts and fails closed", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
@@ -2810,6 +2838,67 @@ test("activation refuses to silently approval-gate existing unmanaged CODEOWNERS
   }
 });
 
+test("activation does not treat bypassable or unreadable rulesets as equivalent Code Owner policy", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const [name, bypassActors] of [
+      ["non-empty", [{ actor_id: 7, actor_type: "Team", bypass_mode: "always" }]],
+      ["missing", undefined],
+      ["malformed", {}],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const disabledRuleset = completeDisabledRulesetFixture(7);
+      const existingCodeOwnerPolicy = {
+        ...completeActiveRulesetFixture(8),
+        name: "Existing Code Owner Policy",
+        source_type: "Organization",
+        bypass_actors: bypassActors,
+      };
+      if (bypassActors === undefined) {
+        delete existingCodeOwnerPolicy.bypass_actors;
+      }
+      const unmanagedCodeowners = ensureControlPlaneCodeownersContent(
+        "/src/** @Alice\n",
+      ).content;
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`repos/${repoSlug}/git/blobs/codeowners-blob`]: {
+          encoding: "base64",
+          content: Buffer.from(unmanagedCodeowners, "utf8").toString("base64"),
+        },
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[
+          disabledRuleset,
+          existingCodeOwnerPolicy,
+        ]],
+        [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
+        [`repos/${repoSlug}/rulesets/8`]: existingCodeOwnerPolicy,
+      };
+      const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(
+        result.stderr,
+        /will not silently broaden approval policy/u,
+        name,
+      );
+      const calls = readFileSync(callLog, "utf8");
+      assert.doesNotMatch(calls, new RegExp(`^GET repos/${repoSlug}/pulls/7$`, "mu"));
+      assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("activation rejects a colliding exact-name check run before ruleset update", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
@@ -2885,6 +2974,10 @@ test("native canary rejects legacy status projection and control-plane changes",
       [
         "control-plane-change",
         (responses) => {
+          responses[`repos/${repoSlug}/pulls/7`] = {
+            ...responses[`repos/${repoSlug}/pulls/7`],
+            changed_files: 1,
+          };
           responses[`repos/${repoSlug}/pulls/7/files?per_page=100`] = [[{
             filename: DEFAULT_CONTROLLER_WORKFLOW_PATH,
           }]];
@@ -2918,6 +3011,101 @@ test("native canary rejects legacy status projection and control-plane changes",
         },
       });
       assert.equal(result.status, 1, name);
+      assert.match(result.stderr, expected, name);
+      assert.doesNotMatch(
+        readFileSync(callLog, "utf8"),
+        new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"),
+      );
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("native canary requires a complete authoritative and rename-aware file inventory", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const [name, pullRequestOverrides, filePages, expected] of [
+      [
+        "missing-authoritative-count",
+        { changed_files: undefined },
+        [[]],
+        /lacks an authoritative non-negative changed_files count/u,
+      ],
+      [
+        "over-api-limit",
+        { changed_files: 3_001 },
+        [[]],
+        /beyond GitHub's 3000-file pull-request files API limit/u,
+      ],
+      [
+        "truncated-inventory",
+        { changed_files: 1 },
+        [[]],
+        /incomplete or inconsistent with authoritative changed_files=1/u,
+      ],
+      [
+        "malformed-filename",
+        { changed_files: 1 },
+        [[{ filename: null }]],
+        /malformed file record/u,
+      ],
+      [
+        "malformed-previous-filename",
+        { changed_files: 1 },
+        [[{ filename: "docs/canary.md", previous_filename: null }]],
+        /malformed file record/u,
+      ],
+      [
+        "duplicate-record",
+        { changed_files: 2 },
+        [[
+          { filename: "docs/canary.md" },
+          { filename: "docs/canary.md" },
+        ]],
+        /duplicate filename/u,
+      ],
+      [
+        "rename-away-from-control-plane",
+        { changed_files: 1 },
+        [[{
+          filename: "docs/moved-workflow.yml",
+          previous_filename: DEFAULT_WORKFLOW_PATH,
+        }]],
+        /changes the protected control plane/u,
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const disabledRuleset = completeDisabledRulesetFixture(7);
+      const pullRequest = {
+        ...canaryPullRequestFixture(repoSlug, CANARY_HEAD_SHA),
+        ...pullRequestOverrides,
+      };
+      if (pullRequestOverrides.changed_files === undefined) {
+        delete pullRequest.changed_files;
+      }
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        ...canaryRunResponses(repoSlug),
+        [`repos/${repoSlug}/pulls/7`]: pullRequest,
+        [`repos/${repoSlug}/pulls/7/files?per_page=100`]: filePages,
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [disabledRuleset],
+        ],
+        [`repos/${repoSlug}/rulesets/7`]: disabledRuleset,
+      };
+      const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
       assert.match(result.stderr, expected, name);
       assert.doesNotMatch(
         readFileSync(callLog, "utf8"),
@@ -3650,6 +3838,7 @@ function canaryPullRequestFixture(repoSlug, headSha) {
     state: "open",
     merged: false,
     draft: false,
+    changed_files: 0,
     base: {
       ref: "master",
       sha: DEFAULT_BRANCH_SHA,
@@ -3731,6 +3920,7 @@ function activationArguments(repoSlug, headSha) {
 function fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }) {
   return {
     ...process.env,
+    GH_HOST: "hostile.invalid",
     PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
     FAKE_GH_RESPONSES: JSON.stringify(responses),
     FAKE_GH_STATE_DIR: stateDir,
@@ -3777,7 +3967,15 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path";
 
 const responses = JSON.parse(process.env.FAKE_GH_RESPONSES);
-const endpoint = process.argv[3];
+if (
+  process.argv[2] !== "api" ||
+  process.argv[3] !== "--hostname" ||
+  process.argv[4] !== "github.com"
+) {
+  process.stderr.write("gh api request is not explicitly bound to github.com\\n");
+  process.exit(2);
+}
+const endpoint = process.argv[5];
 const methodIndex = process.argv.indexOf("--method");
 const method = methodIndex === -1 ? "GET" : process.argv[methodIndex + 1];
 const requestKey = \`\${method} \${endpoint}\`;

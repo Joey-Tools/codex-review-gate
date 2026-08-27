@@ -59,6 +59,8 @@ const CANONICAL_CONTROLLER_WORKFLOW_SOURCE = join(
   "templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
 );
 const GH_NOT_FOUND = Symbol("GitHub API not found");
+const GITHUB_PULL_REQUEST_FILES_LIMIT = 3_000;
+const GITHUB_PULL_REQUEST_FILES_PAGE_SIZE = 100;
 
 async function main() {
   const options = readCliOptions();
@@ -480,7 +482,11 @@ async function assertCanaryCheckRunSource({
     );
   }
 
-  await assertCanaryControlPlaneUnchanged({ repoSlug, prNumber });
+  await assertCanaryControlPlaneUnchanged({
+    repoSlug,
+    prNumber,
+    changedFiles: pullRequest?.changed_files,
+  });
   await assertNoLegacyGateStatus({ repoSlug, sha: headSha });
   await assertNoLegacyGateStatus({ repoSlug, sha: mergeCommitSha });
 
@@ -669,24 +675,93 @@ function parseCanonicalActionsJobDetailsUrl(value, repoSlug) {
   return { runId, jobId };
 }
 
-async function assertCanaryControlPlaneUnchanged({ repoSlug, prNumber }) {
+async function assertCanaryControlPlaneUnchanged({
+  repoSlug,
+  prNumber,
+  changedFiles,
+}) {
+  if (!Number.isSafeInteger(changedFiles) || changedFiles < 0) {
+    throw new Error(
+      `Canary PR #${prNumber} lacks an authoritative non-negative changed_files count; the protected-control-plane inventory is inconclusive.`,
+    );
+  }
+  if (changedFiles > GITHUB_PULL_REQUEST_FILES_LIMIT) {
+    throw new Error(
+      `Canary PR #${prNumber} reports ${changedFiles} changed files, beyond GitHub's ${GITHUB_PULL_REQUEST_FILES_LIMIT}-file pull-request files API limit; use a smaller canary PR.`,
+    );
+  }
+
   const pages = await ghJson(
     `repos/${repoSlug}/pulls/${prNumber}/files?per_page=100`,
     { paginate: true },
   );
-  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
+  const expectedPageCount = Math.max(
+    1,
+    Math.ceil(changedFiles / GITHUB_PULL_REQUEST_FILES_PAGE_SIZE),
+  );
+  if (
+    !Array.isArray(pages) ||
+    pages.length !== expectedPageCount ||
+    pages.some((page, pageIndex) => {
+      if (!Array.isArray(page)) {
+        return true;
+      }
+      const expectedPageSize = Math.min(
+        GITHUB_PULL_REQUEST_FILES_PAGE_SIZE,
+        Math.max(
+          0,
+          changedFiles - pageIndex * GITHUB_PULL_REQUEST_FILES_PAGE_SIZE,
+        ),
+      );
+      return page.length !== expectedPageSize;
+    })
+  ) {
     throw new Error(
-      "Canary changed-file readback did not return complete paginated arrays.",
+      `Canary changed-file readback is incomplete or inconsistent with authoritative changed_files=${changedFiles}.`,
     );
   }
-  const changedControlPlanePaths = pages
-    .flat()
-    .map((file) => file?.filename)
+
+  const files = pages.flat();
+  const filenames = new Set();
+  const candidatePaths = [];
+  for (const file of files) {
+    if (
+      file === null ||
+      typeof file !== "object" ||
+      Array.isArray(file) ||
+      typeof file.filename !== "string" ||
+      file.filename === "" ||
+      (file.previous_filename !== undefined &&
+        (typeof file.previous_filename !== "string" ||
+          file.previous_filename === ""))
+    ) {
+      throw new Error(
+        "Canary changed-file inventory contains a malformed file record.",
+      );
+    }
+    if (filenames.has(file.filename)) {
+      throw new Error(
+        `Canary changed-file inventory contains duplicate filename ${JSON.stringify(file.filename)}.`,
+      );
+    }
+    filenames.add(file.filename);
+    candidatePaths.push(file.filename);
+    if (file.previous_filename !== undefined) {
+      candidatePaths.push(file.previous_filename);
+    }
+  }
+
+  if (files.length !== changedFiles) {
+    throw new Error(
+      `Canary changed-file inventory contains ${files.length} records but authoritative changed_files=${changedFiles}.`,
+    );
+  }
+
+  const changedControlPlanePaths = [...new Set(candidatePaths)]
     .filter(
       (path) =>
-        typeof path === "string" &&
-        (path === DEFAULT_CODEOWNERS_PATH ||
-          path.startsWith(".github/workflows/")),
+        path === DEFAULT_CODEOWNERS_PATH ||
+        path.startsWith(".github/workflows/"),
     )
     .sort();
   if (changedControlPlanePaths.length > 0) {
@@ -1389,6 +1464,8 @@ function assertCodeownersActivationDoesNotExpandPolicy({
     rulesets.some(
       (ruleset) =>
         ruleset?.enforcement === "active" &&
+        Array.isArray(ruleset.bypass_actors) &&
+        ruleset.bypass_actors.length === 0 &&
         rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
         (ruleset.rules ?? []).some(
           (rule) =>
@@ -2026,7 +2103,7 @@ function ghJson(
   } = {},
 ) {
   return new Promise((resolve, reject) => {
-    const args = ["api", endpoint];
+    const args = ["api", "--hostname", "github.com", endpoint];
     if (method !== "GET") {
       args.push("--method", method);
     }

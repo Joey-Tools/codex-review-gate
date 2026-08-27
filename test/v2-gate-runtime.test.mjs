@@ -2048,6 +2048,55 @@ test("controller never reruns an active verifier baseline", async (context) => {
   assert.deepEqual(github.rerunRequests, []);
 });
 
+test("controller fails closed when verifier-run pagination repeats a boundary ID", async (context) => {
+  const firstPage = Array.from({ length: 100 }, (_, index) =>
+    verifierRun({
+      id: 8_000 - index,
+      run_number: 200 - index,
+    })
+  );
+  const repeatedBoundary = {
+    ...structuredClone(firstPage.at(-1)),
+    status: "in_progress",
+    conclusion: null,
+  };
+  const github = createGitHubMock({
+    requestInterceptor: ({ method, path, url }) => {
+      if (
+        method !== "GET" ||
+        path !== `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`
+      ) {
+        return undefined;
+      }
+      if (url.searchParams.get("page") === "1") {
+        const next = new URL(url);
+        next.searchParams.set("page", "2");
+        return jsonResponse(
+          { total_count: 101, workflow_runs: firstPage },
+          200,
+          { link: `<${next.href}>; rel="next"` },
+        );
+      }
+      return jsonResponse({
+        total_count: 101,
+        workflow_runs: [repeatedBoundary],
+      });
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "verifier-run-pagination-churn",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(result.report.retrySafe, false);
+  assert.match(result.report.reason, /duplicate identity 7901 across paginated evidence/iu);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
 test("controller adopts an ambiguous rerun POST only after exact A+1 readback", async (context) => {
   const github = createGitHubMock({ verifierRerunStatus: 500 });
   const environment = runtimeEnvironment(context, {

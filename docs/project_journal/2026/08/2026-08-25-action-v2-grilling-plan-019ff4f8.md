@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-08-27
+updated: 2026-08-28
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -1495,6 +1495,58 @@ superseded_by:
   CheckRun, require stable `healthy/success`, reread unchanged
   head/base/test-merge and ruleset state, and merge the exact head. Direct human
   UI merge outside that closure remains unsupported.
+
+### Whole-Range Review At The Feature-Head Correction
+
+- The next independent review covered the complete frozen range
+  `10217253306ca2ee6f312f766a331f8924e26e47..0033c1b9d15b34c396aa912b6dd67ab483d8ad61`
+  in a clean detached no-local clone. The source and review workspace both
+  resolved tree `80dfe90548965be005ae7153b09639ae8c247b5a`; the workspace was clean before
+  and after review. The dedicated reviewer role was unavailable, so the
+  explicitly authorized zero-context ordinary `gpt-5.6-sol` / `ultra` fallback
+  performed the review.
+- The reviewer retained four actionable findings:
+  - canary PR-file pagination was not bound to `changed_files`, did not reject
+    an unsafe truncated/limit inventory, and checked only `filename`, so a
+    rename away from a protected control-plane path could evade the canary
+    change check;
+  - verifier workflow-run pagination silently deduplicated a repeated boundary
+    ID, so concurrent newest-first insertion could omit an active run while the
+    raw count still appeared complete;
+  - the GitHub.com-only installer did not explicitly pass
+    `--hostname github.com` to `gh api`, allowing ambient `GH_HOST` to redirect
+    a same-slug read or write;
+  - the existing-Code-Owner-policy equivalence ignored non-empty bypass actors,
+    so a new no-bypass ruleset could silently expand approval requirements for
+    an actor that previously bypassed unmanaged CODEOWNERS paths.
+- The parent review correctly did not retain a proposal to add
+  `pull_request.edited`: that would reverse the explicitly adopted low-cost
+  trigger and draft-to-ready retarget-recovery boundary rather than repair an
+  implementation defect within it. It also did not retain two bootstrap
+  candidates whose complete security boundary or migration deadlock was not
+  established by the final review.
+- Remediation is implemented on the subsequent checkpoint:
+  - canary activation requires an authoritative non-negative `changed_files`
+    count within the GitHub REST 3,000-file bound, exact page and record counts,
+    well-formed unique current filenames, and both current and previous rename
+    paths to be outside the protected control plane;
+  - any duplicate verifier workflow-run ID across pages is unstable evidence
+    and fails closed as `pending/wait_then_reconcile` before a rerun request;
+  - every helper `gh api` call carries `--hostname github.com`, and a hostile
+    ambient `GH_HOST` is covered by regression;
+  - an existing Code Owner rule is policy-equivalent only when its
+    `bypass_actors` field is readable and explicitly empty.
+- Validation on the remediation working tree passed:
+  - `npm test`: 706 of 706 passed, 0 failed, in 1611120 ms;
+  - `npm run check`: passed;
+  - focused v2 runtime suite: 69 of 69 passed;
+  - bootstrap suite: 71 of 71 passed;
+  - `git diff --check` and project-journal validation passed;
+  - local `gh api --help` confirmed the explicit
+    `gh api --hostname github.com <endpoint>` argument order.
+- The remediation checkpoint remains subject to another fresh whole-range
+  review before delivery; earlier reviews are finding evidence, not acceptance
+  evidence for changed bytes.
 
 ### Verified Two-Workflow Platform Boundaries And Resolution
 

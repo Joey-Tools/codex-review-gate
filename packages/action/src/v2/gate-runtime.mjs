@@ -1621,10 +1621,15 @@ async function listCurrentV2VerifierRuns(client, config, pullRequest, budget) {
     for (const [index, run] of data.workflow_runs.entries()) {
       requireV2VerifierRunShape(run, `verifier workflow run ${runs.length + index + 1}`);
       const id = String(run.id);
-      if (!seen.has(id)) {
-        seen.add(id);
-        runs.push(run);
+      if (seen.has(id)) {
+        throw new V2RuntimeFailure(
+          `Canonical verifier workflow runs contain duplicate identity ${id} ` +
+            "across paginated evidence",
+          { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+        );
       }
+      seen.add(id);
+      runs.push(run);
     }
     budget.consumeObjects(data.workflow_runs.length, "canonical verifier workflow runs");
     const { hasNext } = inspectV2PaginationLink(
