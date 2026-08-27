@@ -479,10 +479,11 @@ test("latest base-ref timeline epoch invalidates older positive evidence on the 
     ["retarget-epoch", baseRefChangedEvent()],
     ["force-push-epoch", baseRefForcePushedEvent()],
   ]) {
+    const ordinary = ordinaryRequest();
     const github = createGitHubMock({
       baseEpoch: epoch,
       issueComments: [
-        ordinaryRequest(),
+        ordinary,
         cleanIssueComment(HEAD, {
           created_at: "2026-08-25T08:02:00Z",
           updated_at: "2026-08-25T08:02:00Z",
@@ -496,6 +497,11 @@ test("latest base-ref timeline epoch invalidates older positive evidence on the 
     assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
     assert.match(result.report.reason, /strictly newer than base epoch/u, suffix);
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    assert.equal(
+      github.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
+      false,
+      `${suffix}: ordinary requests are not generations after a base epoch`,
+    );
   }
 });
 
@@ -688,7 +694,7 @@ test("terminal clean without an authorized request generation cannot pass", asyn
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("ordinary writer request can bind terminal clean but never makes reaction-only clean head-bound", async (context) => {
+test("ordinary writer request queries liveness reactions but never makes reaction-only clean head-bound", async (context) => {
   const ordinary = ordinaryRequest();
   const terminal = cleanIssueComment(HEAD, {
     created_at: "2026-08-25T08:02:00Z",
@@ -702,6 +708,45 @@ test("ordinary writer request can bind terminal clean but never makes reaction-o
     terminalGitHub.calls.some((call) => call.path.endsWith(`/commits/${HEAD}`)),
     false,
   );
+  assert.equal(
+    terminalGitHub.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
+    true,
+  );
+
+  for (const [suffix, createdAt] of [
+    ["ordinary-active-same-time", "2026-08-25T08:02:00Z"],
+    ["ordinary-active-later", "2026-08-25T08:03:00Z"],
+  ]) {
+    const activeGitHub = createGitHubMock({
+      issueComments: [ordinary, terminal],
+      reactionsByCommentId: new Map([[String(ordinary.id), [reaction({
+        content: "eyes",
+        created_at: createdAt,
+      })]]]),
+    });
+    const activeEnvironment = runtimeEnvironment(context, { suffix });
+    const { result: activeResult } = await runGate(activeEnvironment, activeGitHub);
+    assert.equal(activeResult.report.gateOutcome, "pending", suffix);
+    assert.equal(activeResult.report.recoveryCode, "wait_provider", suffix);
+    assert.match(activeResult.report.reason, /review is still in progress/u, suffix);
+  }
+
+  const untrustedEyesGitHub = createGitHubMock({
+    issueComments: [ordinary, terminal],
+    reactionsByCommentId: new Map([[String(ordinary.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:03:00Z",
+      user: HUMAN,
+    })]]]),
+  });
+  const untrustedEyesEnvironment = runtimeEnvironment(context, {
+    suffix: "ordinary-untrusted-eyes",
+  });
+  const { result: untrustedEyesResult } = await runGate(
+    untrustedEyesEnvironment,
+    untrustedEyesGitHub,
+  );
+  assert.equal(untrustedEyesResult.report.gateOutcome, "success");
 
   const reactionGitHub = createGitHubMock({
     issueComments: [ordinary],
@@ -712,7 +757,7 @@ test("ordinary writer request can bind terminal clean but never makes reaction-o
   assert.equal(reactionResult.report.gateOutcome, "pending");
   assert.equal(
     reactionGitHub.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
-    false,
+    true,
   );
 });
 
@@ -731,6 +776,10 @@ test("ordinary request author permission is enforced without letting a 404 comme
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(
+    github.calls.some((call) => call.path.endsWith(`/${request.id}/reactions`)),
+    false,
+  );
 
   const anyGitHub = createGitHubMock({ issueComments: [request, terminal] });
   const anyEnvironment = runtimeEnvironment(context, { suffix: "permission-any" });
@@ -780,6 +829,13 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
       ),
       false,
       `denied request ${denied.id} must not be exact-refetched`,
+    );
+    assert.equal(
+      deniedGitHub.calls.some(({ path }) =>
+        path === `/repos/${REPOSITORY}/issues/comments/${denied.id}/reactions`
+      ),
+      false,
+      `denied request ${denied.id} must not consume reaction budget`,
     );
   }
   assert.equal(
@@ -1188,6 +1244,32 @@ test("later eyes or progress prevents a clean from superseding an older finding"
   assert.equal(eyesResult.report.gateOutcome, "failure");
   assert.equal(eyesResult.report.counts.unresolved, 1);
   assert.equal(eyesResult.report.counts.resolved, 0);
+
+  const ordinaryGeneration = ordinaryRequest({
+    id: 103,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const ordinaryEyesGitHub = createGitHubMock({
+    issueComments: [ordinaryGeneration, clean],
+    reviews: [finding],
+    reactionsByCommentId: new Map([[String(ordinaryGeneration.id), [reaction({
+      id: 503,
+      content: "eyes",
+      created_at: "2026-08-25T08:16:00Z",
+    })]]]),
+  });
+  const ordinaryEyesEnvironment = runtimeEnvironment(context, {
+    suffix: "ordinary-supersession-eyes",
+  });
+  const { result: ordinaryEyesResult } = await runGate(
+    ordinaryEyesEnvironment,
+    ordinaryEyesGitHub,
+  );
+  assert.equal(ordinaryEyesResult.report.gateOutcome, "failure");
+  assert.equal(ordinaryEyesResult.report.recoveryCode, "fix_findings");
+  assert.equal(ordinaryEyesResult.report.counts.unresolved, 1);
+  assert.equal(ordinaryEyesResult.report.counts.resolved, 0);
 
   const progressGitHub = createGitHubMock({
     issueComments: [generation, clean, progressIssueComment()],

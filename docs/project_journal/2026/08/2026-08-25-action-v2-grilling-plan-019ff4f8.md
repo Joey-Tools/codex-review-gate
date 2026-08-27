@@ -1119,6 +1119,36 @@ superseded_by:
   Dependabot and a separate policy change. The review thread is resolved as an
   explicitly accepted dependency-policy tradeoff rather than by silently
   reversing the decision.
+- The native collaboration `reviewer` role remained unavailable after bounded
+  retries. Joey explicitly authorized one fresh ordinary Codex agent at the
+  fixed `gpt-5.6-sol` / `ultra` profile, with zero inherited turns, to replace
+  that local lane for the frozen
+  `10217253306ca2ee6f312f766a331f8924e26e47..6b7509216181e9b1c31976bf4261364b08ba26b6`
+  range. It ran against the independently materialized and immediately
+  revalidated read-only workspace and reported one P1: reactions were fetched
+  only for exact head/base-bound canonical requests, even though an authorized
+  ordinary `@codex review` request can be the active generation when no base
+  epoch exists. Consequently, an official `eyes` reaction simultaneous with or
+  later than terminal clean evidence on that ordinary request was invisible to
+  the liveness veto and could allow success while review activity continued.
+  The snapshot loader and reducer now share one generation-selection function,
+  and reactions are fetched and fingerprinted for every request that can be the
+  current generation. Reaction-only `+1` clean remains restricted to canonical
+  head/base-bound requests. Focused regressions prove ordinary terminal clean
+  still passes; simultaneous or later official `eyes` produces
+  `pending/wait_provider`; non-provider `eyes` is ignored; ordinary `+1` alone
+  stays pending; an older finding remains blocking while such liveness is
+  active; and ordinary, unauthorized, or pre-base-epoch requests do not consume
+  reaction-query budget when they cannot be the current generation.
+- The production configuration preconditions were applied and read back before
+  publication. Source Environment `marketplace-production` now has
+  administrator bypass disabled, keeps `JoeyTeng` as its sole required reviewer,
+  permits self-review, and admits only source `master`; the expected two secret
+  names and three App variables remained unchanged. Target tag rules now use
+  active no-bypass `freeze-v1-tags` for `v1`/`v1.*` plus
+  `publisher-v2-plus-tags` for other `v*` tags with App ID `4700530` as the sole
+  bypass. This completed the previously required no-gap migration without
+  changing any v1 ref.
 - At the pre-PR implementation checkpoint, no target-repository write, Release,
   tag, alias, Marketplace change, ruleset mutation, or consumer installation
   had occurred. The later source-repository branch pushes and infrastructure PR
@@ -1134,16 +1164,13 @@ superseded_by:
   result `4461418036`.
 - Remaining marker verification: live-canary the final v2 hidden-marker byte
   grammar on an unchanged head before stable admission.
-- Read-only live preflight verified that `marketplace-production` exists with
-  reviewer `JoeyTeng`, self-review permitted, source branch restricted to
-  `master`, the three expected non-secret App variables, and the two expected
-  secret names. It also verified current target immutable-Release support and
-  valid signed v1 tags. No secret value was read.
-- The same preflight found two required configuration corrections before
-  publication: Environment administrator bypass is currently enabled and must
-  be disabled, and the target still has one Publisher-App-bypass ruleset for
-  all `v*` tags. The latter must be replaced by the adopted no-bypass v1 freeze
-  plus the v2-and-later Publisher ruleset before credentials may publish.
+- Live preflight and post-write readback verified that
+  `marketplace-production` requires reviewer `JoeyTeng`, permits self-review,
+  disables administrator bypass, restricts deployment to source `master`, and
+  retains the three expected non-secret App variables plus two expected secret
+  names. It also verified current target immutable-Release support, valid signed
+  v1 tags, and the adopted non-overlapping v1-freeze/v2-plus tag rulesets. No
+  secret value was read.
 - The private App's Bot identity is visible, but ordinary user credentials
   cannot read its private App or installation metadata. Before publication,
   authenticated installation evidence or the logged-in App settings must prove

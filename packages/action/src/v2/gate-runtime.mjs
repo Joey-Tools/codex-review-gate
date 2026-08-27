@@ -1889,16 +1889,17 @@ async function loadCompleteV2Snapshot(client, config, {
     reviews,
     requestAuthority.authorized,
   );
-  const requests = requestAuthority.authorized.filter((request) =>
-    request.headBound === true &&
-    request.binding.headSha === headSha &&
-    request.binding.baseSha === baseSha &&
-    request.binding.baseRef === before.base.ref &&
-    request.binding.baseRepositoryId === String(before.base.repo.id)
-  );
+  const { generationRequests: reactionRequests } = selectCurrentV2RequestGenerations({
+    headSha,
+    baseSha,
+    baseRef: before.base.ref,
+    baseRepositoryId: String(before.base.repo.id),
+    baseEpoch: beforeBaseEpoch,
+    requests: requestAuthority.authorized,
+  });
   const requestReactions = new Map();
   const reactionInventories = await mapV2Bounded(
-    requests,
+    reactionRequests,
     V2_REACTION_FETCH_CONCURRENCY,
     async ({ comment }) => {
       const id = String(comment.id);
@@ -2045,21 +2046,18 @@ function reduceV2Evidence({
     .map(normalizeV2EvidenceError);
   const blockingErrors = [];
   let indeterminate = scopedErrors.length;
-  const baseEpochMs = baseEpoch?.event && isCanonicalUtcTimestamp(baseEpoch.event.createdAt)
-    ? Date.parse(baseEpoch.event.createdAt)
-    : null;
-  const currentRequests = (requests ?? []).filter((request) => {
-    if (!Number.isFinite(request.revisionMs)) return false;
-    if (baseEpochMs !== null && request.revisionMs <= baseEpochMs) return false;
-    if (request.headBound !== true) return true;
-    return request.binding.headSha === headSha &&
-      request.binding.baseSha === baseSha &&
-      request.binding.baseRef === baseRef &&
-      request.binding.baseRepositoryId === baseRepositoryId;
+  const {
+    baseEpochMs,
+    currentRequests,
+    generationRequests,
+  } = selectCurrentV2RequestGenerations({
+    headSha,
+    baseSha,
+    baseRef,
+    baseRepositoryId,
+    baseEpoch,
+    requests,
   });
-  const generationRequests = baseEpochMs === null
-    ? currentRequests
-    : currentRequests.filter((request) => request.headBound === true);
   const requestEpoch = selectLatestV2RequestEpoch(generationRequests);
   if (requestEpoch.error) {
     blockingErrors.push(requestEpoch.error);
@@ -2281,6 +2279,32 @@ function reduceV2Evidence({
     };
   }
   return { counts, decision };
+}
+
+function selectCurrentV2RequestGenerations({
+  headSha,
+  baseSha,
+  baseRef,
+  baseRepositoryId,
+  baseEpoch,
+  requests,
+}) {
+  const baseEpochMs = baseEpoch?.event && isCanonicalUtcTimestamp(baseEpoch.event.createdAt)
+    ? Date.parse(baseEpoch.event.createdAt)
+    : null;
+  const currentRequests = (requests ?? []).filter((request) => {
+    if (!Number.isFinite(request.revisionMs)) return false;
+    if (baseEpochMs !== null && request.revisionMs <= baseEpochMs) return false;
+    if (request.headBound !== true) return true;
+    return request.binding.headSha === headSha &&
+      request.binding.baseSha === baseSha &&
+      request.binding.baseRef === baseRef &&
+      request.binding.baseRepositoryId === baseRepositoryId;
+  });
+  const generationRequests = baseEpochMs === null
+    ? currentRequests
+    : currentRequests.filter((request) => request.headBound === true);
+  return { baseEpochMs, currentRequests, generationRequests };
 }
 
 function normalizeV2EvidenceError(value) {
