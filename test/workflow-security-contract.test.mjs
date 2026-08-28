@@ -549,16 +549,109 @@ test("gh guidance scanner rejects duplicate selectors and implicit merge targets
   ]);
 
   const implicitMerge = scanShellGhInvocations(
-    'gh pr merge --repo "github.com/$REPO"',
+    'gh pr merge --repo "github.com/$REPO" ' +
+      '--match-head-commit "$HEAD_SHA"',
   );
   assert.deepEqual(githubHostPinViolations(implicitMerge), [
-    "gh pr merge --repo github.com/$REPO: gh pr merge must explicitly target $PR_NUMBER",
+    "gh pr merge --repo github.com/$REPO --match-head-commit $HEAD_SHA: " +
+      "gh pr merge must explicitly target $PR_NUMBER",
+  ]);
+
+  const missingCas = scanShellGhInvocations(
+    'gh pr merge "$PR_NUMBER" --repo "github.com/$REPO"',
+  );
+  assert.deepEqual(githubHostPinViolations(missingCas), [
+    "gh pr merge $PR_NUMBER --repo github.com/$REPO: " +
+      'gh pr merge must use exactly one canonical --match-head-commit "$HEAD_SHA"',
+  ]);
+
+  const duplicateCas = scanShellGhInvocations(
+    'gh pr merge "$PR_NUMBER" --repo "github.com/$REPO" ' +
+      '--match-head-commit "$HEAD_SHA" --match-head-commit "$OTHER_SHA"',
+  );
+  assert.deepEqual(githubHostPinViolations(duplicateCas), [
+    "gh pr merge $PR_NUMBER --repo github.com/$REPO " +
+      "--match-head-commit $HEAD_SHA --match-head-commit $OTHER_SHA: " +
+      'gh pr merge must use exactly one canonical --match-head-commit "$HEAD_SHA"',
+  ]);
+
+  const attachedCas = scanShellGhInvocations(
+    'gh pr merge "$PR_NUMBER" --repo "github.com/$REPO" ' +
+      '--match-head-commit="$HEAD_SHA"',
+  );
+  assert.deepEqual(githubHostPinViolations(attachedCas), [
+    "gh pr merge $PR_NUMBER --repo github.com/$REPO " +
+      "--match-head-commit=$HEAD_SHA: " +
+      'gh pr merge must use exactly one canonical --match-head-commit "$HEAD_SHA"',
+  ]);
+
+  const wrongCas = scanShellGhInvocations(
+    'gh pr merge "$PR_NUMBER" --repo "github.com/$REPO" ' +
+      '--match-head-commit "$OTHER_SHA"',
+  );
+  assert.deepEqual(githubHostPinViolations(wrongCas), [
+    "gh pr merge $PR_NUMBER --repo github.com/$REPO " +
+      "--match-head-commit $OTHER_SHA: " +
+      'gh pr merge must use exactly one canonical --match-head-commit "$HEAD_SHA"',
   ]);
   assert.deepEqual(
     githubHostPinViolations(scanShellGhInvocations(
-      'gh pr merge "$PR_NUMBER" --repo "github.com/$REPO"',
+      'gh pr merge "$PR_NUMBER" --repo "github.com/$REPO" ' +
+        '--match-head-commit "$HEAD_SHA"',
     )),
     [],
+  );
+});
+
+test("gh guidance scanner unwraps command and exec but closes ambiguous wrappers", () => {
+  const reviewerExamples = scanShellGhInvocations([
+    "command gh api user",
+    "command -- gh api user",
+    "exec gh api user",
+  ].join("\n"));
+  assert.deepEqual(
+    reviewerExamples.map(({ text }) => text),
+    ["gh api user", "gh api user", "gh api user"],
+  );
+  assert.deepEqual(githubHostPinViolations(reviewerExamples), [
+    "gh api user: gh api must start with exactly one --hostname github.com",
+    "gh api user: gh api must start with exactly one --hostname github.com",
+    "gh api user: gh api must start with exactly one --hostname github.com",
+  ]);
+
+  const safeWrappers = scanShellGhInvocations([
+    "command -p gh api --hostname github.com user",
+    'command -- gh pr view "$PR_NUMBER" --repo "github.com/$REPO"',
+    'exec -- gh run list --repo "github.com/$REPO"',
+    'exec -c -l -a codex-gh gh workflow run gate.yml --repo "github.com/$REPO"',
+  ].join("\n"));
+  assert.deepEqual(
+    safeWrappers.map(({ command }) => command),
+    ["api", "pr", "run", "workflow"],
+  );
+  assert.deepEqual(githubHostPinViolations(safeWrappers), []);
+
+  assert.deepEqual(
+    scanShellGhInvocations("command -v gh\ncommand -V gh\ncommand -pv gh"),
+    [],
+  );
+  assert.throws(
+    () => scanShellGhInvocations("env -S 'gh api --hostname github.com user'"),
+    /env split-string wrapper cannot be audited safely/u,
+  );
+  assert.throws(
+    () => scanShellGhInvocations(
+      "env --split-string='gh api --hostname github.com user'",
+    ),
+    /env split-string wrapper cannot be audited safely/u,
+  );
+  assert.throws(
+    () => scanShellGhInvocations("sudo gh api --hostname github.com user"),
+    /literal gh is not in a proven executable position/u,
+  );
+  assert.throws(
+    () => scanShellGhInvocations("bash -c 'gh api --hostname github.com user'"),
+    /literal gh is not in a proven executable position/u,
   );
 });
 
@@ -1971,8 +2064,26 @@ function executableGhInvocations(source) {
 function scanShellGhInvocations(source) {
   const invocations = [];
   for (const segment of shellCommandSegments(source)) {
-    const commandIndex = shellExecutableTokenIndex(segment);
-    if (commandIndex === -1 || segment[commandIndex].value !== "gh") {
+    const position = shellExecutablePosition(segment);
+    if (position.kind !== "execute") {
+      continue;
+    }
+    const commandIndex = position.index;
+    if (segment[commandIndex].value !== "gh") {
+      const hasAmbiguousGh = segment
+        .slice(commandIndex + 1)
+        .some(({ value }) =>
+          value === "gh" || /(?:^|[\s;&|()])gh(?:$|[\s;&|()])/u.test(value)
+        );
+      const displayCommand = new Set(["echo", "printf"]).has(
+        segment[commandIndex].value,
+      );
+      if (hasAmbiguousGh && !displayCommand) {
+        throw new Error(
+          `${segment.map(({ value }) => value).join(" ")}: ` +
+            "literal gh is not in a proven executable position",
+        );
+      }
       continue;
     }
     const words = segment.slice(commandIndex).map((token) => token.value);
@@ -2023,6 +2134,21 @@ function githubHostPinViolations(invocations) {
     if (command === "pr" && words[2] === "merge" && words[3] !== "$PR_NUMBER") {
       violations.push(`${text}: gh pr merge must explicitly target $PR_NUMBER`);
     }
+    if (command === "pr" && words[2] === "merge") {
+      const selectors = ghSelectorIndices(words, "--match-head-commit");
+      const selectorIndex = words.indexOf("--match-head-commit", 3);
+      if (
+        selectors.length !== 1 ||
+        selectors[0] !== selectorIndex ||
+        selectorIndex === -1 ||
+        words[selectorIndex + 1] !== "$HEAD_SHA"
+      ) {
+        violations.push(
+          `${text}: gh pr merge must use exactly one canonical ` +
+            '--match-head-commit "$HEAD_SHA"',
+        );
+      }
+    }
   }
   return violations;
 }
@@ -2056,7 +2182,7 @@ function ghSelectorIndices(words, longName, shortName = null) {
   });
 }
 
-function shellExecutableTokenIndex(segment) {
+function shellExecutablePosition(segment) {
   const commandPrefixes = new Set(["if", "then", "elif", "else", "while", "until", "do"]);
   let index = 0;
   while (commandPrefixes.has(segment[index]?.value)) {
@@ -2065,33 +2191,130 @@ function shellExecutableTokenIndex(segment) {
   while (shellAssignment(segment[index]?.value)) {
     index += 1;
   }
-  while (segment[index]?.value === "env") {
-    index += 1;
-    while (index < segment.length) {
-      const value = segment[index].value;
-      if (value === "--") {
-        index += 1;
-        break;
+  while (index < segment.length) {
+    const wrapper = segment[index].value;
+    if (wrapper === "env") {
+      index = unwrapEnvCommand(segment, index);
+      continue;
+    }
+    if (wrapper === "command") {
+      const command = unwrapCommandBuiltin(segment, index);
+      if (command.kind === "query") {
+        return command;
       }
-      if (shellAssignment(value)) {
-        index += 1;
-        continue;
-      }
-      if (["-u", "--unset", "-C", "--chdir", "--argv0"].includes(value)) {
-        index += 2;
-        continue;
-      }
-      if (value.startsWith("-")) {
-        index += 1;
-        continue;
-      }
+      index = command.index;
+      continue;
+    }
+    if (wrapper === "exec") {
+      index = unwrapExecBuiltin(segment, index);
+      continue;
+    }
+    break;
+  }
+  return index < segment.length ? { kind: "execute", index } : { kind: "none" };
+}
+
+function unwrapEnvCommand(segment, wrapperIndex) {
+  let index = wrapperIndex + 1;
+  while (index < segment.length) {
+    const value = segment[index].value;
+    if (
+      value === "-S" ||
+      value === "--split-string" ||
+      value.startsWith("--split-string=")
+    ) {
+      throw new Error(
+        `${segment.map((token) => token.value).join(" ")}: ` +
+          "env split-string wrapper cannot be audited safely",
+      );
+    }
+    if (value === "--") {
+      index += 1;
       break;
     }
-    while (shellAssignment(segment[index]?.value)) {
+    if (shellAssignment(value)) {
       index += 1;
+      continue;
     }
+    if (["-u", "--unset", "-C", "--chdir", "--argv0", "-P"].includes(value)) {
+      index += 2;
+      continue;
+    }
+    if (
+      ["-i", "--ignore-environment", "-0", "--null", "-v", "--debug"]
+        .includes(value) ||
+      /^-(?:u|C|P).+/u.test(value) ||
+      /^--(?:unset|chdir|argv0)=/u.test(value)
+    ) {
+      index += 1;
+      continue;
+    }
+    if (value.startsWith("-")) {
+      throw new Error(
+        `${segment.map((token) => token.value).join(" ")}: ` +
+          `unsupported env wrapper option ${value}`,
+      );
+    }
+    break;
   }
-  return index < segment.length ? index : -1;
+  while (shellAssignment(segment[index]?.value)) {
+    index += 1;
+  }
+  return index;
+}
+
+function unwrapCommandBuiltin(segment, wrapperIndex) {
+  let index = wrapperIndex + 1;
+  let query = false;
+  while (index < segment.length) {
+    const value = segment[index].value;
+    if (value === "--") {
+      index += 1;
+      break;
+    }
+    if (!value.startsWith("-") || value === "-") {
+      break;
+    }
+    if (!/^-[pVv]+$/u.test(value)) {
+      throw new Error(
+        `${segment.map((token) => token.value).join(" ")}: ` +
+          `unsupported command wrapper option ${value}`,
+      );
+    }
+    query ||= /[Vv]/u.test(value);
+    index += 1;
+  }
+  return query ? { kind: "query" } : { kind: "execute", index };
+}
+
+function unwrapExecBuiltin(segment, wrapperIndex) {
+  let index = wrapperIndex + 1;
+  while (index < segment.length) {
+    const value = segment[index].value;
+    if (value === "--") {
+      index += 1;
+      break;
+    }
+    if (value === "-a") {
+      if (segment[index + 1] === undefined) {
+        throw new Error("exec -a wrapper is missing its argv[0] value");
+      }
+      index += 2;
+      continue;
+    }
+    if (/^-[cl]+$/u.test(value)) {
+      index += 1;
+      continue;
+    }
+    if (value.startsWith("-")) {
+      throw new Error(
+        `${segment.map((token) => token.value).join(" ")}: ` +
+          `unsupported exec wrapper option ${value}`,
+      );
+    }
+    break;
+  }
+  return index;
 }
 
 function shellAssignment(value) {
@@ -2099,8 +2322,10 @@ function shellAssignment(value) {
 }
 
 // Tokenize shell simple commands while recursively preserving command
-// substitutions. Executable-position quoted words are commands; quoted words
-// and `gh` literals in argument position remain ordinary arguments.
+// substitutions. The scanner unwraps only the explicit env/command/exec forms
+// above. Literal `gh` tokens or command strings behind non-display commands,
+// unknown wrapper options, and env split-string forms fail closed. Arbitrary
+// expansion, aliases, and function bodies remain outside this static model.
 function shellCommandSegments(source) {
   const segments = [];
   let offset = 0;

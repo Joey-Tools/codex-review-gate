@@ -1832,6 +1832,39 @@ superseded_by:
   A signed checkpoint and new exact-head whole-range review remain mandatory
   before PR delivery resumes.
 
+### Whole-Range Review At The Manual-Recovery Checkpoint
+
+- A fresh no-local clone reviewed the exact frozen range
+  `10217253306ca2ee6f312f766a331f8924e26e47..03a7f751498e8c77229d6c151f2cc199c69cc4f6`
+  at tree `ef68efdca69171d9a6ae8985e8f12663be967354`. The local lane used an
+  ordinary general agent with `gpt-5.6-sol` / `ultra`, as explicitly selected
+  for environments without a dedicated reviewer role. It found two remaining
+  P2 documentation-audit gaps; it confirmed that the prior manual-dispatch and
+  merge-target findings were otherwise closed.
+  - A documented `gh pr merge` could bind the repository and PR but omit the
+    exact-head compare-and-swap selector. The scanner now requires exactly one
+    two-token `--match-head-commit "$HEAD_SHA"`; missing, duplicated, attached
+    `=`, and wrong-value forms are rejected. Reason: repository and PR binding
+    prevent ambient-target drift, while the exact-head selector independently
+    prevents a newly pushed head from being merged under stale verification.
+  - Literal `gh` execution behind `command` or `exec` wrappers could evade the
+    executable-position scanner. Those two wrappers and their supported static
+    options are now unwrapped, while `command -v` / `-V` lookup forms remain
+    non-executing. `env -S` / `--split-string`, unsupported wrapper options,
+    and literal `gh` behind a non-display command whose execution position
+    cannot be proven fail closed. Reason: a documentation security contract
+    must reject statically ambiguous execution instead of treating it as
+    harmless prose.
+- The scanner still does not expand arbitrary variable-generated commands,
+  aliases, or function bodies. This is an explicit static-analysis boundary,
+  not a claim that those dynamic forms are safe. Direct literal command
+  strings behind wrappers such as `bash -c` are rejected, and `echo` / `printf`
+  remain the narrow display-only exceptions.
+- Independent validation passed after remediation: workflow security contract
+  36/36, full repository suite 721/721, `npm run check`, and
+  `git diff --check`. A signed exact-head whole-range review remains required
+  before PR delivery.
+
 ### Verified Two-Workflow Platform Boundaries And Resolution
 
 - Required-CheckRun source selection is not workflow provenance. GitHub's
