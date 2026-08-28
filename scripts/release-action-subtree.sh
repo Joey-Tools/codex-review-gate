@@ -60,6 +60,7 @@ target_url="$TARGET_URL"
 source_url="$SOURCE_URL"
 test_release_dir=""
 skip_signatures=false
+enforce_live_signer_policy_in_test=false
 
 usage() {
   cat <<'USAGE'
@@ -380,6 +381,11 @@ while (($#)); do
       skip_signatures=true
       shift
       ;;
+    --test-enforce-live-signer-policy)
+      require_test_environment
+      enforce_live_signer_policy_in_test=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -394,6 +400,16 @@ done
 
 [[ -n "$mode" ]] || { usage >&2; exit 2; }
 [[ -n "$control_ref" ]] || control_ref="$source_ref"
+if [[ "$enforce_live_signer_policy_in_test" == true ]]; then
+  [[ "$mode" == "publish" ]] || {
+    echo "error: --test-enforce-live-signer-policy is valid only with --publish" >&2
+    exit 2
+  }
+  [[ -z "$test_release_dir" ]] || {
+    echo "error: --test-enforce-live-signer-policy requires the production-shaped GitHub Release path" >&2
+    exit 2
+  }
+fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
@@ -1580,7 +1596,9 @@ signer_policy_counter=0
 verify_live_release_signer_policy() {
   local label="$1"
   local github_keys github_keys_error live_public_key approved_public_key
-  is_test_environment && return 0
+  if is_test_environment && [[ "$enforce_live_signer_policy_in_test" != true ]]; then
+    return 0
+  fi
   signer_policy_counter=$((signer_policy_counter + 1))
   github_keys="$temporary_root/github-signing-keys-${signer_policy_counter}-${label}.json"
   github_keys_error="$temporary_root/github-signing-keys-${signer_policy_counter}-${label}.err"
@@ -2862,29 +2880,43 @@ reconcile_github_release() {
 
   validate_remote_full_tag_snapshot() {
     local lines="$1"
-    local direct peeled
-    [[ "$(printf '%s\n' "$lines" | sed '/^$/d' | wc -l | tr -d ' ')" == "2" ]] || {
+    local line object ref direct="" peeled="" count=0
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      count=$((count + 1))
+      [[ "$line" == *$'\t'* ]] || {
+        echo "error: immutable tag binding is missing or malformed at the Release boundary" >&2
+        return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+      }
+      object="${line%%$'\t'*}"
+      ref="${line#*$'\t'}"
+      [[ "$ref" != *$'\t'* && "$object" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "error: immutable tag binding is missing or malformed at the Release boundary" >&2
+        return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+      }
+      case "$ref" in
+        "refs/tags/$immutable_tag")
+          [[ -z "$direct" ]] || return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+          direct="$object"
+          ;;
+        "refs/tags/$immutable_tag^{}")
+          [[ -z "$peeled" ]] || return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+          peeled="$object"
+          ;;
+        *)
+          return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+          ;;
+      esac
+    done <<< "$lines"
+    [[ "$count" == "2" && -n "$direct" && -n "$peeled" ]] || {
       echo "error: immutable tag binding is missing or malformed at the Release boundary" >&2
       return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
     }
-    direct="$(printf '%s\n' "$lines" | awk -v ref="refs/tags/$immutable_tag" '$2 == ref {print $1}')"
-    peeled="$(printf '%s\n' "$lines" | awk -v ref="refs/tags/$immutable_tag^{}" '$2 == ref {print $1}')"
     [[ "$direct" == "$full_tag_object" && "$peeled" == "$release_commit" ]] || {
       echo "error: immutable tag binding differs from the approved Release boundary" >&2
       return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
     }
     printf '%s\t%s\n' "$direct" "$peeled"
-  }
-
-  remote_full_tag_binding() {
-    local lines status
-    if lines="$(read_remote_full_tag_snapshot)"; then
-      :
-    else
-      status=$?
-      return "$status"
-    fi
-    validate_remote_full_tag_snapshot "$lines"
   }
 
   capture_release_boundary() {
@@ -2982,30 +3014,72 @@ reconcile_github_release() {
     esac
   }
 
+  read_remote_release_presence() {
+    local output_file="$1"
+    local error_file="$2"
+    if publisher_gh api \
+        "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$output_file" 2> "$error_file"; then
+      printf 'present\n'
+      return 0
+    fi
+    if grep -Fq "HTTP 404" "$error_file"; then
+      printf 'absent\n'
+      return 0
+    fi
+    cat "$error_file" >&2
+    return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+  }
+
   capture_absent_release_boundary() {
     local label="$1"
-    local first_api second_api first_error second_error first_tag second_tag
+    local first_api second_api first_error second_error
+    local first_presence second_presence first_tag_raw second_tag_raw
+    local validated_tag status
     release_boundary_counter=$((release_boundary_counter + 1))
     first_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.json"
     second_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.json"
     first_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.err"
     second_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.err"
-    if publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$first_api" 2> "$first_error"; then
-      echo "error: GitHub Release appeared before its draft-create boundary" >&2
-      return 1
+    if first_presence="$(read_remote_release_presence "$first_api" "$first_error")"; then
+      :
+    else
+      status=$?
+      return "$status"
     fi
-    grep -Fq "HTTP 404" "$first_error" || { cat "$first_error" >&2; return 1; }
-    first_tag="$(remote_full_tag_binding)" || return 1
-    if publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$second_api" 2> "$second_error"; then
-      echo "error: GitHub Release appeared during its draft-create boundary" >&2
-      return 1
+    if first_tag_raw="$(read_remote_full_tag_snapshot)"; then
+      :
+    else
+      status=$?
+      return "$status"
     fi
-    grep -Fq "HTTP 404" "$second_error" || { cat "$second_error" >&2; return 1; }
-    second_tag="$(remote_full_tag_binding)" || return 1
-    [[ "$first_tag" == "$second_tag" ]] || return 1
+    if second_presence="$(read_remote_release_presence "$second_api" "$second_error")"; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
+    if second_tag_raw="$(read_remote_full_tag_snapshot)"; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
+    [[ "$first_presence" == "$second_presence" && "$first_tag_raw" == "$second_tag_raw" ]] || {
+      return "$RELEASE_BOUNDARY_STATE_CHANGED"
+    }
+    [[ "$second_presence" == "absent" ]] || {
+      echo "error: GitHub Release is stably present at its expected-absence boundary" >&2
+      return "$RELEASE_BOUNDARY_STATE_CHANGED"
+    }
+    if validated_tag="$(validate_remote_full_tag_snapshot "$second_tag_raw")"; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
     jq -cn \
-      --arg object "${first_tag%%$'\t'*}" \
-      --arg commit "${first_tag#*$'\t'}" \
+      --arg object "${validated_tag%%$'\t'*}" \
+      --arg commit "${validated_tag#*$'\t'}" \
       '{release:"absent",assets:[],tag:{object:$object,commit:$commit}}'
   }
 
@@ -3049,8 +3123,7 @@ reconcile_github_release() {
       return 1
     fi
     absent_boundary="$(capture_absent_release_boundary pre-create)" || {
-      fail_reconcile inconclusive remote-state-changed \
-        "GitHub Release absence or immutable tag binding changed before draft creation"
+      fail_release_boundary_capture "$?" "absent GitHub Release draft-create boundary"
     }
     require_publication_mutation release-completion
     create_args=(release create "$immutable_tag" --repo "$TARGET_REPOSITORY" --verify-tag --draft --title "$immutable_tag" --notes "$expected_release_body")

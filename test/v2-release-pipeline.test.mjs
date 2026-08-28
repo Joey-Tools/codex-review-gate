@@ -25,6 +25,31 @@ const baselinePath = join(repositoryRoot, "docs", "release", "action-v2-reposito
 const actionMetadata = readFileSync(join(repositoryRoot, "packages", "action", "action.yml"), "utf8");
 const PRIMARY = "AD403DAB5377F9FA0F7D775EC2844D3367B8A71B";
 const SUBKEY = "4DD48552DDEAF6D961769DD4A49827EC48984E2C";
+const RELEASE_SIGNING_PUBLIC_KEY = `-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEaowbyBYJKwYBBAHaRw8BAQdAY29ZomqF1Ca0db1zFK6QQSB5UR2wK+mh77cC
+6i+Zobu0V0pvZXlUZW5nLUNvZGV4IChGb3IgSm9leS1Ub29scy9jb2RleC1yZXZp
+ZXctZ2F0ZS1hY3Rpb24gcmVsZWFzZSBvbmx5KSA8Y29kZXhAbWFoYW5lLm1lPoiT
+BBMWCgA7FiEErUA9q1N3+foPfXdewoRNM2e4pxsFAmqMG8gCGwMFCwkIBwICIgIG
+FQoJCAsCBBYCAwECHgcCF4AACgkQwoRNM2e4pxtVLAD/UOjJDnO309VsRcwYlbi1
+pPP0P+NZkR3HmrLN1bXd3wwA/3vjaTbZtEQGFifJCMbUDDPczkfXWa48wEbzyjif
+3j8PtFVKb2V5VGVuZy1Db2RleCAoRm9yIEpvZXlUZW5nL2NvZGV4LXJldmlldy1n
+YXRlLWFjdGlvbiByZWxlYXNlIG9ubHkpIDxjb2RleEBtYWhhbmUubWU+iJYEExYK
+AD4CGwMFCwkIBwICIgIGFQoJCAsCBBYCAwECHgcCF4AWIQStQD2rU3f5+g99d17C
+hE0zZ7inGwUCaow2kwIZAQAKCRDChE0zZ7inGyvAAQDUmwztSXWn+ImXcOWmmjKK
+YY7zT3X6nbdLCeFPZO18nwD/ZTVvo5ge7Du/I2U6epsdq7DL0GsBfedO6l4pr8EC
+9QG4OARqjBvIEgorBgEEAZdVAQUBAQdAlnj5jeGelfwd8nowsU4u2mN0634NiYdg
+fvQVBu4mHHQDAQgHiHgEGBYKACAWIQStQD2rU3f5+g99d17ChE0zZ7inGwUCaowb
+yAIbDAAKCRDChE0zZ7inG3R1AQDqu+hYRTHAevMyZ/iooJiYvkLMEk4ceDp7kq8y
+oL/X6AEA5QgLb5O1yzywP2LZwr3h4EJ5JGomiqLg1i7pH/OIvwK4MwRqjCK+Fgkr
+BgEEAdpHDwEBB0B6uJCtDIMdB8Ts7f2b6ZQ3tGoDJ0BF1DqNL3nbhTm4Z4jvBBgW
+CgAgFiEErUA9q1N3+foPfXdewoRNM2e4pxsFAmqMIr4CGwIAgQkQwoRNM2e4pxt2
+IAQZFgoAHRYhBE3UhVLd6vbZYXad1KSYJ+xImE4sBQJqjCK+AAoJEKSYJ+xImE4s
+0e0A/1XDBldzpvb802mkYdXXzTdwUz8qLDuIYZFvzvLpLwo/AQCIY/AzytqOKItd
+CipWc2AK9P8q4CxCSQgoEWLsh3JACfTSAP92wbpsxFL6QR++Z4EI1t0kePBYE2Uz
+o9vhFyL26ME6bAEAi0DEqdr3gczrcwfU8JLBtGDNjLoX+yQjvBcZIJ6rgAs=
+=sJtz
+-----END PGP PUBLIC KEY BLOCK-----`;
 const RELEASE_WORKFLOW_REF =
   "Joey-Tools/codex-review-gate/.github/workflows/sync-action-subtree.yml@refs/heads/master";
 const SYNTHETIC_TOKEN_FIXTURE = Object.freeze({
@@ -443,6 +468,9 @@ function invokePublish(state, built, options = {}) {
     built.assembled,
     "--publication-plan-file",
     built.publicationPlan,
+    ...(options.enforceLiveSignerPolicy
+      ? ["--test-enforce-live-signer-policy"]
+      : []),
     ...(options.testRelease === false
       ? ["--test-skip-signatures"]
       : ["--test-release-dir", state.releases, "--test-skip-signatures"]),
@@ -651,10 +679,12 @@ function fakeGithubEnvironment(state, mutationPhase) {
     final_publication_policy_read_complete: false,
     final_publication_boundary_reads: 0,
     raw_boundary_mutation_done: false,
+    absent_boundary_api_reads: 0,
     release_api_reads: 0,
     release_download_reads: 0,
     release_view_reads: 0,
     ruleset_drift: false,
+    signer_policy_reads: 0,
     call_trace: [],
     assets: [],
   });
@@ -755,6 +785,23 @@ const releaseApi = (state) => ({
   },
   assets: state.assets.map((asset) => assetRecord(state, asset.name, asset.id)),
 });
+const signingKeyInventory = ({ revoked = false, replaceCertificate = false } = {}) => [{
+  id: 5277815,
+  primary_key_id: null,
+  key_id: ${JSON.stringify(PRIMARY.slice(-16))},
+  raw_key: ${JSON.stringify(RELEASE_SIGNING_PUBLIC_KEY)} + (replaceCertificate ? "\\n" : ""),
+  revoked,
+  expires_at: null,
+  can_sign: true,
+  subkeys: [{
+    id: 5277817,
+    primary_key_id: 5277815,
+    key_id: ${JSON.stringify(SUBKEY.slice(-16))},
+    revoked: false,
+    expires_at: null,
+    can_sign: true,
+  }],
+}];
 const mutateProvenance = (state) => {
   if (state.mutation_done) return state;
   const name = "release-provenance.json";
@@ -767,7 +814,8 @@ const mutateProvenance = (state) => {
   return state;
 };
 
-const apiEndpoint = args.slice(1).find((arg) => arg.startsWith("repos/"));
+const apiEndpoint = args.slice(1).find((arg) =>
+  arg.startsWith("repos/") || arg.startsWith("users/"));
 const requestedMethod = option("--method") || "GET";
 const classifyRemoteCall = () => {
   if (args[0] === "api") {
@@ -775,6 +823,7 @@ const classifyRemoteCall = () => {
       return "release-patch";
     }
     if (apiEndpoint?.endsWith("/immutable-releases")) return "immutable-policy-read";
+    if (apiEndpoint === "users/JoeyTeng-Codex/gpg_keys") return "signer-policy-read";
     if (apiEndpoint?.endsWith("/rulesets")) return "ruleset-list-read";
     if (/\\/rulesets\\/\\d+$/u.test(apiEndpoint || "")) return "ruleset-detail-read";
     if (apiEndpoint?.endsWith("/releases?per_page=100")) return "release-list-read";
@@ -808,6 +857,29 @@ if (args[0] === "api") {
       process.exit(2);
     }
   };
+  if (endpoint === "users/JoeyTeng-Codex/gpg_keys") {
+    state.signer_policy_reads += 1;
+    const criticalFence = state.publish_patch_calls === 0 && state.immutable_policy_reads === 2
+      ? "publication"
+      : state.publish_patch_calls === 1 && state.immutable_policy_reads === 2
+        ? "alias"
+        : null;
+    const trace = state.call_trace.at(-1);
+    trace.signer_policy_read = state.signer_policy_reads;
+    trace.critical_fence = criticalFence;
+    save(state);
+    const targetsCriticalFence = criticalFence !== null && phase.endsWith("-" + criticalFence);
+    if (targetsCriticalFence && phase.startsWith("live-signer-api-unreadable-")) {
+      process.stderr.write("simulated " + criticalFence + " signer inventory outage\\n");
+      process.exit(1);
+    }
+    process.stdout.write(JSON.stringify(signingKeyInventory({
+      revoked: targetsCriticalFence && phase.startsWith("live-signer-revoked-"),
+      replaceCertificate:
+        targetsCriticalFence && phase.startsWith("live-signer-cert-replacement-"),
+    })) + "\\n");
+    process.exit(0);
+  }
   if (endpoint?.endsWith("/immutable-releases")) {
     requireCurrentApiVersion();
     state.immutable_policy_reads += 1;
@@ -1006,6 +1078,25 @@ if (args[0] === "api") {
     process.exit(0);
   }
   if (endpoint.includes("/releases/tags/")) {
+    if (!state.exists && phase.startsWith("absent-boundary-") &&
+        process.env.FAKE_ABSENT_BOUNDARY_API_MARKER &&
+        existsSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER)) {
+      state.absent_boundary_api_reads += 1;
+      const apiRead = state.absent_boundary_api_reads;
+      save(state);
+      if ((phase === "absent-boundary-api-unreadable-first" && apiRead === 1) ||
+          (phase === "absent-boundary-api-unreadable-second" && apiRead === 2)) {
+        process.stderr.write("simulated absent Release API outage\\n");
+        process.exit(1);
+      }
+      if (phase === "absent-boundary-release-appears" && apiRead === 2) {
+        state.exists = true;
+        save(state);
+        process.stdout.write(JSON.stringify(releaseApi(state)) + "\\n");
+        process.exit(0);
+      }
+      fail404();
+    }
     if (!state.exists) fail404();
     state.release_api_reads += 1;
     if (state.final_publication_policy_read_complete && state.draft) {
@@ -1065,6 +1156,10 @@ if (args[0] === "api") {
 
 if (args[0] === "release" && args[1] === "view") {
   const state = readState();
+  if (!state.exists && phase.startsWith("absent-boundary-") &&
+      process.env.FAKE_ABSENT_BOUNDARY_API_MARKER) {
+    writeFileSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER, "active\\n");
+  }
   if (!state.exists) fail404();
   state.release_view_reads += 1;
   const releaseView404 = phase === "verify-final-view-404" && state.release_view_reads === 2;
@@ -1292,6 +1387,92 @@ exit "$status"
   };
 }
 
+function absentBoundaryDriftEnvironment(
+  state,
+  githubEnvironment,
+  phase,
+  replacementTagObject,
+) {
+  const fakeBin = join(state.root, `${phase}-bin`);
+  const fakeGit = join(fakeBin, "git");
+  const apiMarker = join(state.root, `${phase}-api.marker`);
+  const tagReadCountFile = join(state.root, `${phase}-tag-read-count`);
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -u
+full_tag_read=false
+for argument in "$@"; do
+  case "$argument" in
+    refs/tags/v2.0.0|refs/tags/v2.0.0^\\{\\}) full_tag_read=true ;;
+  esac
+done
+
+tag_read=0
+if [ "$full_tag_read" = true ] && [ -e "$ABSENT_BOUNDARY_API_MARKER" ]; then
+  if [ -f "$ABSENT_TAG_READ_COUNT_FILE" ]; then
+    read -r tag_read < "$ABSENT_TAG_READ_COUNT_FILE"
+  fi
+  tag_read=$((tag_read + 1))
+  printf '%s\\n' "$tag_read" > "$ABSENT_TAG_READ_COUNT_FILE"
+  case "$ABSENT_BOUNDARY_PHASE" in
+    tag-unreadable-first)
+      if [ "$tag_read" -eq 1 ]; then exit 73; fi
+      ;;
+    tag-unreadable-second)
+      if [ "$tag_read" -eq 2 ]; then exit 74; fi
+      ;;
+    stable-mismatch)
+      if [ "$tag_read" -eq 1 ]; then
+        "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+          refs/tags/v2.0.0 "$REPLACEMENT_TAG_OBJECT"
+      fi
+      ;;
+    stable-lightweight)
+      if [ "$tag_read" -eq 1 ]; then
+        "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+          refs/tags/v2.0.0 "$REPLACEMENT_TAG_COMMIT"
+      fi
+      ;;
+  esac
+fi
+
+status=0
+"$REAL_GIT" "$@" || status=$?
+if [ "$status" -eq 0 ] && [ "$full_tag_read" = true ] &&
+    [ "$ABSENT_BOUNDARY_PHASE" = tag-drift ] && [ "$tag_read" -eq 1 ]; then
+  "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+    refs/tags/v2.0.0 "$REPLACEMENT_TAG_OBJECT"
+fi
+exit "$status"
+`);
+  chmodSync(fakeGit, 0o755);
+  return {
+    ...githubEnvironment,
+    ABSENT_BOUNDARY_API_MARKER: apiMarker,
+    ABSENT_BOUNDARY_PHASE: phase,
+    ABSENT_TAG_READ_COUNT_FILE: tagReadCountFile,
+    FAKE_ABSENT_BOUNDARY_API_MARKER: apiMarker,
+    MUTATION_TARGET: state.target,
+    PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+    REAL_GIT: run("which", ["git"]),
+    REPLACEMENT_TAG_COMMIT: git(
+      state.target,
+      ["rev-parse", `${replacementTagObject}^{}`],
+    ),
+    REPLACEMENT_TAG_OBJECT: replacementTagObject,
+  };
+}
+
+function liveSignerPolicyEnvironment(state, githubEnvironment, label) {
+  const runnerTemp = join(state.root, `live-signer-${label}`);
+  mkdirSync(runnerTemp, { mode: 0o700 });
+  write(join(runnerTemp, "release-signing-public-key.asc"), RELEASE_SIGNING_PUBLIC_KEY);
+  return {
+    ...githubEnvironment,
+    RUNNER_TEMP: runnerTemp,
+  };
+}
+
 test("publisher fixtures isolate the host workflow identity and credentials", () => {
   const observed = JSON.parse(run(process.execPath, [
     "-e",
@@ -1452,7 +1633,11 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.match(
     publisher,
-    /verify_live_release_signer_policy\(\)[\s\S]*is_test_environment && return 0[\s\S]*publisher_gh api users\/JoeyTeng-Codex\/gpg_keys[\s\S]*verify-github-signing-key[\s\S]*cmp -s -- "\$approved_public_key" "\$live_public_key"/u,
+    /verify_live_release_signer_policy\(\)[\s\S]*is_test_environment && \[\[ "\$enforce_live_signer_policy_in_test" != true \]\][\s\S]*publisher_gh api users\/JoeyTeng-Codex\/gpg_keys[\s\S]*verify-github-signing-key[\s\S]*cmp -s -- "\$approved_public_key" "\$live_public_key"/u,
+  );
+  assert.match(
+    publisher,
+    /--test-enforce-live-signer-policy\)[\s\S]*require_test_environment[\s\S]*enforce_live_signer_policy_in_test=true[\s\S]*"\$mode" == "publish"[\s\S]*-z "\$test_release_dir"/u,
   );
   assert.match(
     publisher,
@@ -1486,6 +1671,42 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
       rawStability < releasePolicyValidation &&
       releasePolicyValidation < tagPolicyValidation,
     "both complete raw Release/tag snapshots must be compared before policy validation",
+  );
+  const absentBoundaryStart = publisher.indexOf("  capture_absent_release_boundary() {");
+  const absentBoundaryEnd = publisher.indexOf("\n  read_latest_release_tag() {", absentBoundaryStart);
+  assert.notEqual(absentBoundaryStart, -1, "missing absent Release boundary helper");
+  assert.notEqual(absentBoundaryEnd, -1, "missing absent Release boundary helper end");
+  const absentBoundary = publisher.slice(absentBoundaryStart, absentBoundaryEnd);
+  const firstPresence = absentBoundary.indexOf(
+    'first_presence="$(read_remote_release_presence',
+  );
+  const firstAbsentTag = absentBoundary.indexOf(
+    'first_tag_raw="$(read_remote_full_tag_snapshot)',
+  );
+  const secondPresence = absentBoundary.indexOf(
+    'second_presence="$(read_remote_release_presence',
+  );
+  const secondAbsentTag = absentBoundary.indexOf(
+    'second_tag_raw="$(read_remote_full_tag_snapshot)',
+  );
+  const absentRawStability = absentBoundary.indexOf(
+    '[[ "$first_presence" == "$second_presence" && "$first_tag_raw" == "$second_tag_raw" ]]',
+  );
+  const stableAbsencePolicy = absentBoundary.indexOf(
+    '[[ "$second_presence" == "absent" ]]',
+  );
+  const absentTagPolicy = absentBoundary.indexOf(
+    'validate_remote_full_tag_snapshot "$second_tag_raw"',
+  );
+  assert.ok(
+    firstPresence !== -1 &&
+      firstPresence < firstAbsentTag &&
+      firstAbsentTag < secondPresence &&
+      secondPresence < secondAbsentTag &&
+      secondAbsentTag < absentRawStability &&
+      absentRawStability < stableAbsencePolicy &&
+      stableAbsencePolicy < absentTagPolicy,
+    "absence and full-tag raw A/B reads must complete before stable-state validation",
   );
   const publicationStart = publisher.indexOf(
     'if [[ "$current_draft" == "true" ]]; then\n    require_publication_mutation release-completion',
@@ -2910,6 +3131,107 @@ for (const releaseCase of [
   });
 }
 
+test("enforced live signer policy reaches both publication and alias critical fences", (t) => {
+  const state = fixture(t);
+  const label = "live-signer-valid";
+  const built = buildAssembledCandidate(state, { label });
+  const githubEnvironment = fakeGithubEnvironment(state, label);
+  const result = invokePublish(state, built, {
+    enforceLiveSignerPolicy: true,
+    testRelease: false,
+    env: liveSignerPolicyEnvironment(state, githubEnvironment, label),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${label}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2"]), "tag");
+  const publicationFence = fakeState.call_trace.findIndex(
+    ({ kind, critical_fence: criticalFence }) =>
+      kind === "signer-policy-read" && criticalFence === "publication",
+  );
+  const patch = fakeState.call_trace.findIndex(({ kind }) => kind === "release-patch");
+  const aliasFence = fakeState.call_trace.findIndex(
+    ({ kind, critical_fence: criticalFence }) =>
+      kind === "signer-policy-read" && criticalFence === "alias",
+  );
+  assert.ok(
+    publicationFence !== -1 && publicationFence < patch && patch < aliasFence,
+    "the enforced signer inventory must be valid immediately before PATCH and alias mutation",
+  );
+});
+
+for (const signerFailure of [
+  {
+    phase: "live-signer-api-unreadable-publication",
+    fence: "publication",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedPatchCalls: 0,
+  },
+  {
+    phase: "live-signer-revoked-publication",
+    fence: "publication",
+    state: "blocked_conflict",
+    recoveryCode: "signing-key-policy-changed",
+    expectedPatchCalls: 0,
+  },
+  {
+    phase: "live-signer-api-unreadable-alias",
+    fence: "alias",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedPatchCalls: 1,
+  },
+  {
+    phase: "live-signer-cert-replacement-alias",
+    fence: "alias",
+    state: "blocked_conflict",
+    recoveryCode: "signing-key-policy-changed",
+    expectedPatchCalls: 1,
+  },
+]) {
+  test(`${signerFailure.phase} stops the next privileged mutation`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: signerFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, signerFailure.phase);
+    const result = invokePublish(state, built, {
+      enforceLiveSignerPolicy: true,
+      testRelease: false,
+      env: liveSignerPolicyEnvironment(state, githubEnvironment, signerFailure.phase),
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${signerFailure.state}`, "u"));
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${signerFailure.recoveryCode}`, "u"),
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${signerFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.publish_patch_calls, signerFailure.expectedPatchCalls);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    const criticalSignerRead = fakeState.call_trace.findIndex(
+      ({ kind, critical_fence: criticalFence }) =>
+        kind === "signer-policy-read" && criticalFence === signerFailure.fence,
+    );
+    assert.notEqual(criticalSignerRead, -1, `missing ${signerFailure.fence} signer fence`);
+    const patchIndex = fakeState.call_trace.findIndex(({ kind }) => kind === "release-patch");
+    if (signerFailure.fence === "publication") {
+      assert.equal(patchIndex, -1);
+    } else {
+      assert.ok(patchIndex !== -1 && patchIndex < criticalSignerRead);
+    }
+  });
+}
+
 for (const patchFailure of [
   {
     phase: "patch-failure-before-apply",
@@ -3234,6 +3556,106 @@ for (const boundaryFailure of [
         assert.equal(fakeState.mutation_done, true);
       }
     }
+  });
+}
+
+for (const absentBoundaryFailure of [
+  {
+    phase: "stable-mismatch",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+  {
+    phase: "stable-lightweight",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+  {
+    phase: "tag-drift",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+  {
+    phase: "api-unreadable-first",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedApiReads: 1,
+    expectedTagReads: 0,
+  },
+  {
+    phase: "api-unreadable-second",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedApiReads: 2,
+    expectedTagReads: 1,
+  },
+  {
+    phase: "tag-unreadable-first",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedApiReads: 1,
+    expectedTagReads: 1,
+  },
+  {
+    phase: "tag-unreadable-second",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+  {
+    phase: "release-appears",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+]) {
+  test(`fresh absent boundary ${absentBoundaryFailure.phase} is classified precisely`, (t) => {
+    const state = fixture(t);
+    const label = `absent-boundary-${absentBoundaryFailure.phase}`;
+    const built = buildAssembledCandidate(state, { label });
+    const replacement = createDetachedAliasObject(state, `replacement-${label}`);
+    const githubEnvironment = fakeGithubEnvironment(state, label);
+    const absentEnvironment = absentBoundaryDriftEnvironment(
+      state,
+      githubEnvironment,
+      absentBoundaryFailure.phase,
+      replacement.object,
+    );
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: absentEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      new RegExp(`reconcile_state=${absentBoundaryFailure.state}`, "u"),
+    );
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${absentBoundaryFailure.recoveryCode}`, "u"),
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${label}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.absent_boundary_api_reads, absentBoundaryFailure.expectedApiReads);
+    const observedTagReads = existsSync(absentEnvironment.ABSENT_TAG_READ_COUNT_FILE)
+      ? Number(readFileSync(absentEnvironment.ABSENT_TAG_READ_COUNT_FILE, "utf8").trim())
+      : 0;
+    assert.equal(observedTagReads, absentBoundaryFailure.expectedTagReads);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.equal(fakeState.exists, absentBoundaryFailure.phase === "release-appears");
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
   });
 }
 

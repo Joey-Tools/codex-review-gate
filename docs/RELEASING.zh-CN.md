@@ -219,6 +219,14 @@ mutation fence 都必须重新读取并验证这组 live primary/subkey/certific
 persistent verification result 只能证明该 object 的 signature state；它不能
 替代 pinned signer 仍存在于 current account inventory 的证明。
 
+显式的 `--test-enforce-live-signer-policy` seam 只供测试，并受双重
+environment gate 约束：必须同时存在
+`CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY=1` 与 `NODE_ENV=test`。它还只能与
+`--publish` 以及 production-shaped GitHub Release path 组合；若同时使用 filesystem
+`--test-release-dir` path，则直接拒绝。启用后，test path 会执行真实的 GitHub
+inventory validator，并在 production fences 把它导出的 raw certificate 与 approved
+certificate 逐字节比较。Production 不存在 signer-policy skip path。
+
 首次写入前，just-in-time token 必须证明属于 expected Publisher App installation 与
 唯一 target repository；target rulesets 随后只把该 App 作为 publication bypass
 identity。GPG identity 是写入 publication Git objects 的 author、committer 与 signer，
@@ -387,6 +395,16 @@ expected-policy validation。它只产生以下 closed classification：
 
 这个 raw-first 顺序是刻意的：若在比较 A 与 B 之前就用 expected policy 验证任一
 observation，稳定的错误状态可能被伪装成 transient read failure。
+
+Fresh draft creation 不是例外。它的 expected-absence boundary 依次读取
+Release presence A、raw full-tag binding A、Release presence B 与 raw full-tag
+binding B。它先比较两次 presence 与 tag observations，只有观察到稳定
+absence 后才按 publication policy 验证 tag。Presence 或 tag observation 不可读归为
+`inconclusive` / `remote-read-inconclusive`；A/B drift 或 expected-absence boundary 上稳定
+present 归为 `inconclusive` / `remote-state-changed`；稳定 absence 但 tag binding
+malformed、lightweight 或不是 approved tag 归为
+`blocked_conflict` / `immutable-release-mismatch`。Fresh path 保持 raw-first，避免它成为
+例外并把稳定错误状态伪装成 transient failure。
 
 GitHub 官方 Release REST endpoint 没有为这个 `PATCH` 提供受支持的
 conditional compare-and-swap precondition；publisher 不依赖 undocumented conditional

@@ -2342,6 +2342,30 @@ superseded_by:
   `inconclusive` / `remote-state-changed`. Stable A equal to B but not an
   annotated tag with the exact planned direct object and peeled commit is
   `blocked_conflict` / `malformed-major-alias-target`.
+- The first formal exact-head review reported two P2 findings, and both are
+  fixed on the current working tree.
+  - Fresh-create expected absence now uses the complete raw-first sequence:
+    presence A, raw tag A, presence B, raw tag B; compare both pairs; only after
+    stable absence validate tag policy. Remote unreadability is
+    `inconclusive` / `remote-read-inconclusive`; A/B drift or stable presence is
+    `inconclusive` / `remote-state-changed`; and a stable-absence malformed,
+    lightweight, or wrong tag is `blocked_conflict` /
+    `immutable-release-mismatch`.
+    - Explicit reason: the fresh path must not be an exception that lets an
+      early validator disguise stable wrong state as transient read failure.
+  - An explicit `--test-enforce-live-signer-policy` production-shaped seam is
+    gated by both `CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY=1` and
+    `NODE_ENV=test`, accepted only for `--publish`, and rejected with the
+    filesystem `--test-release-dir` path. Production never skips the signer
+    fence. The enabled seam executes the real GitHub inventory validator and
+    byte-compares the exported raw certificate with the approved certificate.
+    Dynamic coverage includes the valid path reaching publication `PATCH` and
+    alias mutation, live-inventory API outage at publication and alias fences,
+    revoked inventory, and raw-certificate replacement; each failure is
+    fail-closed before its protected write.
+    - Explicit reason: the production signer fence needed dynamic evidence of
+      the real validator and certificate-content comparison without creating a
+      signer-policy bypass that production could activate.
 - GitHub's official Release REST endpoint has no supported conditional
   compare-and-swap precondition for the publish `PATCH`. The resulting small
   GET-to-PATCH concurrent-asset window cannot be removed by this client.
@@ -2356,17 +2380,16 @@ superseded_by:
   frozen draft is unchanged or that the exact Release is already immutable; it
   does not blindly advance to another version. A deterministic post-readback
   mismatch remains blocked.
-- Validation state: the implementation, bilingual documentation, and focused
-  regression fixes are complete on the frozen working tree. Focused coverage
-  passed for direct stable/RC publication, raw-first Release and alias A/B
-  classification, deterministic frozen-boundary conflicts, immutable-policy
-  and signer fences, publication response ambiguity with exact-source
-  recovery, and post-write alias validation. `bash -n`, ShellCheck 0.11,
-  `npm run check`, the 39-test workflow-security contract, `git diff --check`,
-  and project-journal validation passed. The complete serialized repository
-  suite then passed 794/794 with exit status zero. This checkpoint does not yet
-  claim a signed landing commit or the fresh exact-head review; both remain
-  required before PR #35 can leave Draft or any publication can resume.
+- Validation state remains in progress. Focused evidence for these two P2
+  fixes passed: expected-absence boundary 8/8; live-signer valid path 1/1 and
+  failure paths 4/4; static seam contract 1/1. This is dynamic focused evidence
+  for the signer fences, not merely static coverage. `bash -n`, ShellCheck
+  0.11, `npm run check`, the 39-test workflow-security contract,
+  `git diff --check`, and project-journal validation also passed. The complete
+  serialized repository suite on the frozen corrected tree then passed
+  807/807 with exit status zero. A new signed landing checkpoint and a fresh
+  formal exact-head review remain pending. This checkpoint does not grant
+  permission for PR #35 to leave Draft or for publication to resume.
 
 ## Verified Facts And Required Live Preflight
 

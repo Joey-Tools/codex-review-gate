@@ -258,6 +258,16 @@ publication fence. A persistent GitHub verification result on an existing
 commit or tag proves that object's signature state; it does not substitute for
 proof that the pinned signer is still present in the current account inventory.
 
+The explicit `--test-enforce-live-signer-policy` seam is test-only and doubly
+environment-gated: both
+`CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY=1` and `NODE_ENV=test` must be
+present. It is additionally accepted only with `--publish` on the
+production-shaped GitHub Release path; combining it with the filesystem
+`--test-release-dir` path is rejected. When enabled, the test path executes the
+real GitHub inventory validator and byte-compares its raw exported certificate
+with the approved certificate at the production fences. Production has no
+signer-policy skip path.
+
 The just-in-time token is proved, before the first write, to belong to the
 expected Publisher App installation and sole target repository. The target
 rulesets then admit that App as the only publication bypass identity. The GPG
@@ -452,6 +462,18 @@ classification is:
 This raw-first order is intentional: validating either observation against
 expected policy before comparing A and B could disguise a stable wrong state
 as a transient read failure.
+
+Fresh draft creation is not an exception. Its expected-absence boundary reads
+Release presence A, raw full-tag binding A, Release presence B, and raw
+full-tag binding B in that order. It compares both presence and tag
+observations first, and only after observing stable absence validates the tag
+against publication policy. An unreadable presence or tag observation is
+`inconclusive` / `remote-read-inconclusive`; A/B drift or stable presence at
+the expected-absence boundary is `inconclusive` / `remote-state-changed`; and a
+stable-absence boundary with a malformed, lightweight, or wrong approved tag
+binding is `blocked_conflict` / `immutable-release-mismatch`. Keeping the fresh
+path raw-first prevents it from becoming an exception that can disguise stable
+wrong state as transient failure.
 
 GitHub's official Release REST endpoint exposes no supported conditional
 compare-and-swap precondition for this `PATCH`; the publisher does not rely on
