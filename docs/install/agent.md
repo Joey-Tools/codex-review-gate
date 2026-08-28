@@ -572,8 +572,9 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
    feature head:
 
    ```bash
+   DEFAULT_BRANCH_URI="$(jq -rn --arg value "$DEFAULT_BRANCH" '$value | @uri')"
    DEFAULT_BRANCH_HEAD_SHA="$(gh api --hostname github.com \
-     "repos/$REPO/branches/$DEFAULT_BRANCH" \
+     "repos/$REPO/branches/$DEFAULT_BRANCH_URI" \
      --jq '.commit.sha')"
    CANARY_TEST_MERGE_SHA="$(gh api --hostname github.com \
      "repos/$REPO/pulls/$CANARY_PR" \

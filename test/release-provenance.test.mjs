@@ -230,7 +230,7 @@ test("publisher workflow keeps App JWT and installation-token authentication cla
   assert.equal([...executableIdentityStep.matchAll(/\bgh api\b/gu)].length, 1);
   assert.match(
     identityStep,
-    /GH_TOKEN="\$installation_token" gh api installation\/repositories/u,
+    /env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$installation_token"[\s\\]*gh api --hostname github\.com installation\/repositories/u,
   );
 });
 

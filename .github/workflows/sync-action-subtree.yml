@@ -58,7 +58,9 @@ jobs:
             echo "source_sha must be a lowercase, full 40-character commit SHA." >&2
             exit 1
           }
-          live_master_sha="$(gh api "repos/$EXPECTED_REPOSITORY/git/ref/heads/master" --jq .object.sha)"
+          live_master_sha="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            GH_HOST=github.com gh api --hostname github.com \
+              "repos/$EXPECTED_REPOSITORY/git/ref/heads/master" --jq .object.sha)"
           [[ "$live_master_sha" =~ ^[0-9a-f]{40}$ && "$CONTROL_SHA" == "$live_master_sha" ]] || {
             echo "the workflow control commit must equal live $EXPECTED_REPOSITORY@refs/heads/master." >&2
             exit 1
@@ -482,8 +484,10 @@ jobs:
              .permissions == {administration:"read", contents:"write", metadata:"read"} and
              .events == []' \
             "$installation_file" >/dev/null
-          repository_scope="$(GH_TOKEN="$installation_token" gh api installation/repositories \
-            --jq '[.total_count, (.repositories | length), .repositories[0].full_name] | @tsv')"
+          repository_scope="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            GH_HOST=github.com GH_TOKEN="$installation_token" \
+              gh api --hostname github.com installation/repositories \
+                --jq '[.total_count, (.repositories | length), .repositories[0].full_name] | @tsv')"
           unset installation_token
           [[ "$repository_scope" == $'1\t1\tJoeyTeng/codex-review-gate-action' ]]
       - name: Configure target-scoped ephemeral Git authentication

@@ -286,6 +286,39 @@ test("output persistence failure leaves one authoritative unhealthy summary", as
   assert.match(summary, /Failed to persist the v2 gate report/iu);
 });
 
+test("output failure preserves a proven finding verdict and recovery", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), findingIssueComment(HEAD)],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "finding-output-persistence-failure",
+  });
+  mkdirSync(environment.GITHUB_OUTPUT);
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.equal(result.report.retrySafe, false);
+  assert.deepEqual(result.report.counts, {
+    unresolved: 1,
+    resolved: 0,
+    historical: 0,
+    indeterminate: 0,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.equal(summary.match(/^## Codex GitHub Review Gate$/gmu)?.length, 1);
+  assert.equal(summary.match(/Execution health: \*\*unhealthy\*\*/gu)?.length, 1);
+  assert.doesNotMatch(summary, /Execution health: \*\*healthy\*\*/u);
+  assert.match(summary, /Gate outcome: \*\*failure\*\*/u);
+  assert.match(summary, /Recovery code: `fix_findings`/u);
+  assert.match(summary, /1 unresolved, 0 resolved, 0 historical, 0 indeterminate/u);
+  assert.match(summary, /Fix the unresolved Codex findings/iu);
+  assert.match(summary, /Failed to persist the v2 gate report/iu);
+});
+
 test("the JavaScript Action reads INPUT_* values without composite env bridging", async (context) => {
   const github = createGitHubMock({ issueComments: [workflowRequest()] });
   const environment = runtimeEnvironment(context);

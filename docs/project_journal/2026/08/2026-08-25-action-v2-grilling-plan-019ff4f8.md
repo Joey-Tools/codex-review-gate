@@ -1685,6 +1685,89 @@ superseded_by:
     helper;
   - project-journal validation and `git diff --check` passed.
 
+### Whole-Range Review At The Host-And-Summary Checkpoint
+
+- A sixth independent review covered
+  `10217253306ca2ee6f312f766a331f8924e26e47..2d9f4efb318c0b942c4822bd921d26039474a943`
+  in a clean detached no-local clone at tree
+  `6df40996dba31a3a8f82b12d2a320feb1cd13b73`. The dedicated reviewer role
+  remained unavailable, so the explicitly authorized zero-context ordinary
+  `gpt-5.6-sol` / `ultra` fallback reviewed all 15 commits and 89 changed paths.
+- The reviewer retained two P1 and three P2 findings:
+  - publisher Release/API operations and direct workflow `gh` calls still
+    inherited ambient host and enterprise-token state, allowing Git pushes to
+    GitHub.com while Release mutations targeted a same-slug GHES repository;
+  - executable Cookbook recovery commands still used unqualified
+    `OWNER/REPO`, so a hostile `GH_HOST` could redirect head reads, dispatches,
+    and repository-variable writes;
+  - output-persistence recovery preserved fail-closed job exit but changed an
+    already proved finding verdict and counts from `failure` to `unknown`, then
+    recommended permission repair instead of finding remediation;
+  - the agent canary branch endpoint interpolated an unescaped default branch,
+    so a valid branch such as `release/v2` produced the wrong REST path;
+  - the new executable-`gh` regex scanned only the first apparent command per
+    physical line, missed split `gh`/subcommand syntax, and treated comments or
+    quoted strings as commands. It therefore could both false-pass and
+    false-fail while claiming a closed command contract.
+- The adopted remediation pins and sanitizes the publisher's complete GitHub
+  CLI boundary, extends host-qualified command guidance and contracts to both
+  Cookbooks, preserves a proved finding verdict/counts when finalization itself
+  becomes unhealthy, URI-encodes the agent guide's branch path parameter, and
+  replaces the regex with a shell-aware closed executable-command audit backed
+  by explicit multi-command, continuation, comment, and string regressions.
+  The resulting checkpoint again requires focused/full validation, a signed
+  commit, and a fresh whole-range review before delivery.
+
+### Host, Recovery, And Documentation Remediation
+
+- The publisher now treats GitHub.com as an explicit trust boundary instead of
+  inheriting ambient GitHub CLI routing:
+  - the privileged script captures its intended publisher token before clearing
+    `GH_HOST`, `GH_ENTERPRISE_TOKEN`, and `GITHUB_ENTERPRISE_TOKEN`;
+  - every publisher `gh` subprocess receives only that token and an explicit
+    `GH_HOST=github.com` after enterprise-token removal;
+  - the two direct workflow API reads likewise use `--hostname github.com`, and
+    the target-scoped installation token remains command-scoped;
+  - a hostile-environment release regression verifies the child process sees
+    the intended publisher token, GitHub.com, and no competing credential.
+- A report-output write failure no longer erases an already proved finding
+  verdict. When the completed evaluator report is `healthy/failure` with
+  `fix_findings` and four proved nonnegative counts, finalization still becomes
+  `unhealthy/failure`, retains those exact counts and recovery code, marks the
+  invocation retry-unsafe, emits one authoritative unhealthy summary, and exits
+  nonzero. A clean or otherwise unproved result still fails closed as
+  `unhealthy/unknown` with permission repair guidance.
+- All executable `gh api` commands in the four installation guides and both
+  Cookbooks now begin with `--hostname github.com`; executable
+  `gh pr`, `gh run`, `gh variable`, and `gh workflow` commands bind
+  `--repo "github.com/$REPO"`. The agent canary separately URI-encodes the
+  default branch with `jq @uri`, so a valid `release/v2` branch addresses
+  `release%2Fv2` rather than changing the REST path structure.
+- The documentation contract no longer relies on a first-command-per-line
+  regex. Its conservative shell scanner enumerates literal executable `gh`
+  commands across compound separators, pipelines, command substitutions,
+  backticks, and backslash continuations while ignoring comments and purely
+  quoted strings; every unknown literal `gh` subcommand fails the host audit
+  closed. Regressions cover an unsafe second command after a safe first command,
+  split `gh`/subcommand syntax, substitutions, and quoted/comment examples.
+- The first frozen full-suite run exposed one stale independent provenance
+  assertion that still required the former unqualified installation-token
+  command. The contract now requires the sanitized enterprise-token boundary,
+  explicit GitHub.com host, intended installation token, and explicit API
+  hostname. Its focused 38/38 rerun passed before restarting the full suite.
+- Validation at this remediation checkpoint passed:
+  - full repository suite: 717/717 on the frozen worktree after the stale
+    provenance-contract correction;
+  - v2 runtime: 77/77;
+  - v2 aggregate: 86/86;
+  - release pipeline: 46/46;
+  - workflow security contract: 33/33;
+  - `npm run check`, `bash -n`, `shellcheck`, project-journal validation, and
+    `git diff --check`;
+  - `actionlint 1.7.12` retained only its known
+    `actions/create-github-app-token@v3` `client-id` metadata false positive and
+    the existing SC2016 informational messages in the immutable jq program.
+
 ### Verified Two-Workflow Platform Boundaries And Resolution
 
 - Required-CheckRun source selection is not workflow provenance. GitHub's

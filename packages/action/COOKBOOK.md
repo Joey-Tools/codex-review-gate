@@ -24,7 +24,9 @@ WORKFLOW="codex-review-gate-controller.yml"
 Read the exact current head immediately before each dispatch:
 
 ```bash
-HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+HEAD_SHA="$(gh pr view "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --json headRefOid --jq .headRefOid)"
 ```
 
 Do not reuse that value after a push, update-branch operation, base change,
@@ -61,7 +63,7 @@ request, including a deliberate same-head re-review after an earlier success:
 
 ```bash
 gh workflow run "$WORKFLOW" \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   -f operation=begin-review \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA" \
@@ -76,7 +78,7 @@ The advanced form:
 
 ```bash
 gh workflow run "$WORKFLOW" \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   -f operation=begin-review \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA" \
@@ -93,7 +95,7 @@ reconcile:
 
 ```bash
 gh workflow run "$WORKFLOW" \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   -f operation=reconcile \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA"
@@ -105,7 +107,7 @@ permits a partial negative-evidence scan:
 
 ```bash
 gh workflow run "$WORKFLOW" \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   -f operation=reconcile \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA" \
@@ -262,7 +264,7 @@ without modifying either canonical workflow:
 
 ```bash
 gh variable set CODEX_REVIEW_GATE_LIMITS_PROFILE \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   --body expanded
 ```
 

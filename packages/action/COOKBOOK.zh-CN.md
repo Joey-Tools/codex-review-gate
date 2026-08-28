@@ -24,7 +24,9 @@ WORKFLOW="codex-review-gate-controller.yml"
 每次 dispatch 前立即读取 exact current head：
 
 ```bash
-HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+HEAD_SHA="$(gh pr view "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --json headRefOid --jq .headRefOid)"
 ```
 
 push、update-branch operation、base change、close/reopen transition，或 PR state 存在
@@ -59,7 +61,7 @@ success 后的 deliberate same-head re-review：
 
 ```bash
 gh workflow run "$WORKFLOW" \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   -f operation=begin-review \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA" \
@@ -74,7 +76,7 @@ gh workflow run "$WORKFLOW" \
 
 ```bash
 gh workflow run "$WORKFLOW" \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   -f operation=begin-review \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA" \
@@ -90,7 +92,7 @@ Codex evidence 到达后，或者 recovery instruction 要求 reconcile 时：
 
 ```bash
 gh workflow run "$WORKFLOW" \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   -f operation=reconcile \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA"
@@ -102,7 +104,7 @@ negative-evidence scan：
 
 ```bash
 gh workflow run "$WORKFLOW" \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   -f operation=reconcile \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA" \
@@ -243,7 +245,7 @@ stability budget 结束前没有两次匹配 clean snapshots 时，应得到
 
 ```bash
 gh variable set CODEX_REVIEW_GATE_LIMITS_PROFILE \
-  --repo "$REPO" \
+  --repo "github.com/$REPO" \
   --body expanded
 ```
 

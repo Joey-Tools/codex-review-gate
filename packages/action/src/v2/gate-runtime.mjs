@@ -1188,11 +1188,17 @@ export async function runV2GateCli({
       });
     } catch (reportError) {
       console.error(`failed to finalize v2 gate report: ${reportError.message}`);
+      const preserveFindingFailure =
+        error?.gateOutcome === "failure" &&
+        error?.recoveryCode === "fix_findings" &&
+        Object.values(counts).every((value) =>
+          Number.isSafeInteger(value) && value >= 0
+        );
       report = buildV2GateReport({
         executionHealth: "unhealthy",
-        gateOutcome: error?.gateOutcome === "failure" ? "failure" : "unknown",
+        gateOutcome: preserveFindingFailure ? "failure" : "unknown",
         reason: `Failed to persist the v2 gate report: ${reportError.message}`,
-        recoveryCode: "repair_permissions",
+        recoveryCode: preserveFindingFailure ? error.recoveryCode : "repair_permissions",
         findingsUnresolved: counts.unresolved,
         findingsResolved: counts.resolved,
         findingsHistorical: counts.historical,
@@ -2278,7 +2284,7 @@ function persistV2ReportFiles(config, report, context, {
     }
   }
   if (outputFailed && !allowSummaryAfterOutputFailure) {
-    throw new V2RuntimeFailure(`Failed to persist v2 report (${failures.join("; ")})`);
+    throw v2ReportPersistenceFailure(failures, report);
   }
   try {
     appendV2GateSummary(config.summaryPath || "", report, context);
@@ -2286,8 +2292,29 @@ function persistV2ReportFiles(config, report, context, {
     failures.push(`step summary: ${error.message}`);
   }
   if (failures.length > 0) {
-    throw new V2RuntimeFailure(`Failed to persist v2 report (${failures.join("; ")})`);
+    throw v2ReportPersistenceFailure(failures, report);
   }
+}
+
+function v2ReportPersistenceFailure(failures, report) {
+  const preserveFindingFailure =
+    report.executionHealth === "healthy" &&
+    report.gateOutcome === "failure" &&
+    report.recoveryCode === "fix_findings" &&
+    Object.values(report.counts).every((value) =>
+      Number.isSafeInteger(value) && value >= 0
+    );
+  return new V2RuntimeFailure(
+    `Failed to persist v2 report (${failures.join("; ")})`,
+    preserveFindingFailure
+      ? {
+          gateOutcome: "failure",
+          recoveryCode: report.recoveryCode,
+          retrySafe: false,
+          counts: report.counts,
+        }
+      : {},
+  );
 }
 
 function readV2Config(environment) {

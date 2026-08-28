@@ -416,30 +416,73 @@ test("installation bootstrap invocations bind the owner exactly once", () => {
   }
 });
 
-test("all executable install-guide gh commands pin github.com", () => {
-  for (const [name, guide] of Object.entries(installGuides)) {
+test("all executable install and Cookbook gh commands pin github.com", () => {
+  const guides = {
+    ...Object.fromEntries(
+      Object.entries(installGuides).map(([name, guide]) => [
+        `docs/install/${name}`,
+        guide,
+      ]),
+    ),
+    "packages/action/COOKBOOK.md": packageDocs["COOKBOOK.md"],
+    "packages/action/COOKBOOK.zh-CN.md": packageDocs["COOKBOOK.zh-CN.md"],
+  };
+  for (const [name, guide] of Object.entries(guides)) {
     const invocations = executableGhInvocations(guide);
     assert.ok(invocations.length > 0, `${name}: missing executable gh guidance`);
-    for (const { command, text } of invocations) {
-      if (command === "api") {
-        assert.match(
-          text,
-          /^gh api --hostname github\.com\b/u,
-          `${name}: gh api must explicitly bind github.com:\n${text}`,
-        );
-        continue;
-      }
-      assert.ok(
-        ["pr", "run", "variable", "workflow"].includes(command),
-        `${name}: unclassified executable gh command:\n${text}`,
-      );
-      assert.match(
-        text,
-        /--repo "github\.com\/\$REPO"/u,
-        `${name}: gh ${command} must bind github.com in --repo:\n${text}`,
-      );
-    }
+    assert.deepEqual(githubHostPinViolations(invocations), [], name);
   }
+});
+
+test("gh guidance scanner closes compound, continuation, substitution, and quoting gaps", () => {
+  const compound = scanShellGhInvocations(
+    "gh api --hostname github.com user; gh api user",
+  );
+  assert.equal(compound.length, 2);
+  assert.deepEqual(
+    githubHostPinViolations(compound),
+    ["gh api user: gh api must start with --hostname github.com"],
+  );
+
+  const continued = scanShellGhInvocations(String.raw`gh \
+  api user`);
+  assert.equal(continued.length, 1);
+  assert.equal(continued[0].command, "api");
+  assert.deepEqual(
+    githubHostPinViolations(continued),
+    ["gh api user: gh api must start with --hostname github.com"],
+  );
+
+  const safeCompound = scanShellGhInvocations(
+    [
+      'actor="$(gh api --hostname github.com user)" &&',
+      '  gh pr view "$PR_NUMBER" --repo "github.com/$REPO" |',
+      '  gh run list --repo "github.com/$REPO" ||',
+      '  gh variable set PROFILE --repo "github.com/$REPO" --body expanded',
+      'legacy=`gh api --hostname github.com user`',
+    ].join("\n"),
+  );
+  assert.deepEqual(
+    safeCompound.map(({ command }) => command),
+    ["api", "pr", "run", "variable", "api"],
+  );
+  assert.deepEqual(githubHostPinViolations(safeCompound), []);
+
+  const ambientRepo = scanShellGhInvocations(
+    'gh pr view "$PR_NUMBER" --repo "$REPO"',
+  );
+  assert.deepEqual(githubHostPinViolations(ambientRepo), [
+    "gh pr view $PR_NUMBER --repo $REPO: gh pr must use --repo github.com/$REPO",
+  ]);
+
+  const ignored = scanShellGhInvocations(String.raw`
+# gh api user
+printf '%s\n' 'gh api user'
+printf '%s\n' "gh api user"
+printf '%s\n' 'gh' "gh"
+printf '%s\n' "$(printf '%s' 'gh api user')"
+`);
+  assert.deepEqual(ignored, []);
 });
 
 test("legacy inventory helper pins github.com despite hostile GH_HOST and builds canonical output", () => {
@@ -1271,6 +1314,48 @@ test("installation guides use only the default-branch workflow dispatch API", ()
   }
 });
 
+test("agent canary reads URI-encode slash-containing default branches", () => {
+  const encoded = spawnSync(
+    "jq",
+    ["-rn", "--arg", "value", "release/v2", "$value | @uri"],
+    { encoding: "utf8" },
+  );
+  assert.equal(encoded.status, 0, encoded.stderr);
+  assert.equal(encoded.stdout, "release%2Fv2\n");
+
+  const headings = {
+    "agent.md": "## Phase 5: prove the canary and activate protection",
+    "agent.zh-CN.md": "## 阶段 5：证明 canary、启用保护并清理",
+  };
+  for (const [name, heading] of Object.entries(headings)) {
+    const activation = markdownSection(installGuides[name], heading);
+    const readBlock = shellCodeBlocks(activation).find((block) =>
+      block.includes("DEFAULT_BRANCH_HEAD_SHA"),
+    );
+    assert.ok(readBlock, `${name}: missing canary branch read`);
+    assert.match(
+      readBlock,
+      /DEFAULT_BRANCH_URI="\$\(jq -rn --arg value "\$DEFAULT_BRANCH" '\$value \| @uri'\)"/u,
+      name,
+    );
+    assert.match(
+      readBlock,
+      /repos\/\$REPO\/branches\/\$DEFAULT_BRANCH_URI/u,
+      name,
+    );
+    assert.doesNotMatch(
+      readBlock,
+      /repos\/\$REPO\/branches\/\$DEFAULT_BRANCH(?:["/?]|$)/u,
+      name,
+    );
+    assert.ok(
+      readBlock.indexOf("DEFAULT_BRANCH_URI=") <
+        readBlock.indexOf("DEFAULT_BRANCH_HEAD_SHA="),
+      `${name}: URI encoding must precede the branch API read`,
+    );
+  }
+});
+
 test("installation guides preserve the feature-head CheckRun and test-merge execution binding", () => {
   for (const [name, guide] of Object.entries(installGuides)) {
     assert.match(guide, /test-merge SHA/iu, name);
@@ -1787,24 +1872,217 @@ function shellInvocations(source, startPattern) {
 }
 
 function executableGhInvocations(source) {
+  return shellCodeBlocks(source).flatMap(scanShellGhInvocations);
+}
+
+function scanShellGhInvocations(source) {
   const invocations = [];
-  for (const block of shellCodeBlocks(source)) {
-    const lines = block.split(/\r?\n/u);
-    for (let index = 0; index < lines.length; index += 1) {
-      const match = lines[index].match(/\bgh ([a-z][a-z-]*)\b/u);
-      if (match === null) {
+  for (const segment of shellCommandSegments(source)) {
+    for (let index = 0; index < segment.length; index += 1) {
+      if (segment[index].value !== "gh" || !segment[index].hasUnquoted) {
         continue;
       }
-      const invocation = [lines[index].slice(match.index)];
-      while (invocation.at(-1).trimEnd().endsWith("\\")) {
-        index += 1;
-        assert.ok(index < lines.length, "unterminated gh shell continuation");
-        invocation.push(lines[index]);
-      }
-      invocations.push({ command: match[1], text: invocation.join("\n") });
+      const nextGh = segment.findIndex(
+        (token, candidateIndex) =>
+          candidateIndex > index &&
+          token.value === "gh" &&
+          token.hasUnquoted,
+      );
+      const words = segment
+        .slice(index, nextGh === -1 ? undefined : nextGh)
+        .map((token) => token.value);
+      invocations.push({
+        command: words[1] ?? "",
+        text: words.join(" "),
+        words,
+      });
     }
   }
   return invocations;
+}
+
+function githubHostPinViolations(invocations) {
+  const repositoryCommands = new Set(["pr", "run", "variable", "workflow"]);
+  const violations = [];
+  for (const { command, text, words } of invocations) {
+    if (command === "api") {
+      if (words[2] !== "--hostname" || words[3] !== "github.com") {
+        violations.push(
+          `${text}: gh api must start with --hostname github.com`,
+        );
+      }
+      continue;
+    }
+    if (!repositoryCommands.has(command)) {
+      violations.push(`${text}: unclassified executable gh command`);
+      continue;
+    }
+    const repoIndex = words.indexOf("--repo", 2);
+    if (repoIndex === -1 || words[repoIndex + 1] !== "github.com/$REPO") {
+      violations.push(
+        `${text}: gh ${command} must use --repo github.com/$REPO`,
+      );
+    }
+  }
+  return violations;
+}
+
+// Conservatively treat every unquoted `gh` word as executable. Quoted literals
+// are ignored, while command substitutions are scanned recursively.
+function shellCommandSegments(source) {
+  const segments = [];
+  let offset = 0;
+
+  function scanContext(stopCharacter = null) {
+    let words = [];
+    let word = null;
+
+    const append = (value, hasUnquoted = false) => {
+      word ??= { hasUnquoted: false, value: "" };
+      word.value += value;
+      word.hasUnquoted ||= hasUnquoted;
+    };
+    const flushWord = () => {
+      if (word !== null) {
+        words.push(word);
+        word = null;
+      }
+    };
+    const flushSegment = () => {
+      flushWord();
+      if (words.length > 0) {
+        segments.push(words);
+        words = [];
+      }
+    };
+    const scanSingleQuote = () => {
+      offset += 1;
+      while (offset < source.length && source[offset] !== "'") {
+        append(source[offset]);
+        offset += 1;
+      }
+      assert.ok(offset < source.length, "unterminated single-quoted shell word");
+      offset += 1;
+    };
+    const scanDoubleQuote = () => {
+      offset += 1;
+      while (offset < source.length) {
+        const character = source[offset];
+        if (character === '"') {
+          offset += 1;
+          return;
+        }
+        if (character === "\\") {
+          const next = source[offset + 1];
+          if (next === "\n") {
+            offset += 2;
+          } else if (["$", "`", '"', "\\"].includes(next)) {
+            append(next);
+            offset += 2;
+          } else {
+            append("\\");
+            offset += 1;
+          }
+          continue;
+        }
+        if (character === "$" && source[offset + 1] === "(") {
+          append("$()");
+          offset += 2;
+          scanContext(")");
+          continue;
+        }
+        if (character === "`") {
+          append("``");
+          offset += 1;
+          scanContext("`");
+          continue;
+        }
+        append(character);
+        offset += 1;
+      }
+      assert.fail("unterminated double-quoted shell word");
+    };
+
+    while (offset < source.length) {
+      const character = source[offset];
+      if (stopCharacter !== null && character === stopCharacter) {
+        flushSegment();
+        offset += 1;
+        return;
+      }
+      if (character === "'") {
+        scanSingleQuote();
+        continue;
+      }
+      if (character === '"') {
+        scanDoubleQuote();
+        continue;
+      }
+      if (character === "\\") {
+        const next = source[offset + 1];
+        if (next === "\n") {
+          offset += 2;
+        } else if (next === undefined) {
+          append("\\", true);
+          offset += 1;
+        } else {
+          append(next, true);
+          offset += 2;
+        }
+        continue;
+      }
+      if (character === "$" && source[offset + 1] === "(") {
+        append("$()", true);
+        offset += 2;
+        scanContext(")");
+        continue;
+      }
+      if (character === "`") {
+        append("``", true);
+        offset += 1;
+        scanContext("`");
+        continue;
+      }
+      if (character === "#" && word === null) {
+        while (offset < source.length && source[offset] !== "\n") {
+          offset += 1;
+        }
+        continue;
+      }
+      if (/\s/u.test(character)) {
+        flushWord();
+        if (character === "\n" || character === "\r") {
+          flushSegment();
+        }
+        offset += 1;
+        continue;
+      }
+      if (";&|<>!{}".includes(character)) {
+        flushSegment();
+        offset += 1;
+        continue;
+      }
+      if (character === "(") {
+        flushSegment();
+        offset += 1;
+        scanContext(")");
+        continue;
+      }
+      if (character === ")") {
+        flushSegment();
+        offset += 1;
+        continue;
+      }
+      append(character, true);
+      offset += 1;
+    }
+
+    flushSegment();
+    assert.equal(stopCharacter, null, `unterminated shell ${stopCharacter}`);
+  }
+
+  scanContext();
+  return segments;
 }
 
 function escapeRegExp(value) {

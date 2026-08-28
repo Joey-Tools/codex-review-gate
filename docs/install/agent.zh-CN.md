@@ -515,8 +515,9 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
 2. 读取当前 exact test-merge SHA 与 exact feature-head 上的原生 CheckRun：
 
    ```bash
+   DEFAULT_BRANCH_URI="$(jq -rn --arg value "$DEFAULT_BRANCH" '$value | @uri')"
    DEFAULT_BRANCH_HEAD_SHA="$(gh api --hostname github.com \
-     "repos/$REPO/branches/$DEFAULT_BRANCH" \
+     "repos/$REPO/branches/$DEFAULT_BRANCH_URI" \
      --jq '.commit.sha')"
    CANARY_TEST_MERGE_SHA="$(gh api --hostname github.com \
      "repos/$REPO/pulls/$CANARY_PR" \

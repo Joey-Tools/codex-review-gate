@@ -27,6 +27,7 @@ publisher_token="${RELEASE_PUBLISHER_TOKEN:-${GH_TOKEN:-${PUBLISHER_TOKEN:-${GIT
 release_target_askpass="${RELEASE_TARGET_ASKPASS:-}"
 export -n publisher_token release_target_askpass
 unset RELEASE_PUBLISHER_TOKEN GH_TOKEN GITHUB_TOKEN PUBLISHER_TOKEN
+unset GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS
 readonly publisher_token release_target_askpass
 export GIT_TERMINAL_PROMPT=0
@@ -464,7 +465,8 @@ target_git() {
 
 publisher_gh() {
   env -u GITHUB_TOKEN -u PUBLISHER_TOKEN -u RELEASE_PUBLISHER_TOKEN \
-    GH_TOKEN="$publisher_token" gh "$@"
+    -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+    GH_HOST=github.com GH_TOKEN="$publisher_token" gh "$@"
 }
 
 target_git_push() {

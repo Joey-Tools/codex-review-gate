@@ -603,6 +603,31 @@ const statePath = join(root, "state.json");
 const assetsDir = join(root, "assets");
 const phase = process.env.FAKE_GH_MUTATION_PHASE;
 const productionRulesets = ${JSON.stringify(FAKE_PRODUCTION_RULESETS)};
+if (process.env.FAKE_EXPECT_PINNED_GITHUB_HOST === "true") {
+  const inheritedCredentials = [
+    "GITHUB_TOKEN",
+    "PUBLISHER_TOKEN",
+    "RELEASE_PUBLISHER_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+  ].filter((name) => Object.hasOwn(process.env, name));
+  if (
+    process.env.GH_HOST !== "github.com" ||
+    process.env.GH_TOKEN !== ${JSON.stringify(SYNTHETIC_TOKEN_FIXTURE.value)} ||
+    inheritedCredentials.length !== 0
+  ) {
+    process.stderr.write(
+      "publisher gh invocation inherited hostile host or credential state: " +
+        JSON.stringify({
+          ghHost: process.env.GH_HOST,
+          publisherTokenMatches: process.env.GH_TOKEN === ${JSON.stringify(SYNTHETIC_TOKEN_FIXTURE.value)},
+          inheritedCredentials,
+        }) +
+        "\\n",
+    );
+    process.exit(89);
+  }
+}
 const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
 const save = (state) => writeFileSync(statePath, JSON.stringify(state, null, 2) + "\\n");
 const option = (name) => {
@@ -988,7 +1013,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.doesNotMatch(workflow, /GH_TOKEN="\$app_jwt"|Authorization:\s*token/u);
   assert.match(
     workflow,
-    /GH_TOKEN="\$installation_token" gh api installation\/repositories/u,
+    /env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$installation_token"[\s\\]*gh api --hostname github\.com installation\/repositories/u,
   );
   assert.doesNotMatch(workflow, /(?:APP_PRIVATE_KEY|app_jwt).*GITHUB_ENV/u);
   assert.match(workflow, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
@@ -997,7 +1022,29 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(workflow, /Password for 'https:\/\/x-access-token@github\.com\/JoeyTeng\/codex-review-gate-action\.git'/u);
   assert.match(
     publisher,
-    /set \+x[\s\S]*set \+v[\s\S]*set \+a[\s\S]*release_target_askpass="\$\{RELEASE_TARGET_ASKPASS:-\}"[\s\S]*export -n publisher_token release_target_askpass[\s\S]*unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS[\s\S]*readonly publisher_token release_target_askpass/u,
+    /set \+x[\s\S]*set \+v[\s\S]*set \+a[\s\S]*release_target_askpass="\$\{RELEASE_TARGET_ASKPASS:-\}"[\s\S]*export -n publisher_token release_target_askpass[\s\S]*unset GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN[\s\S]*unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS[\s\S]*readonly publisher_token release_target_askpass/u,
+  );
+  assert.match(
+    publisher,
+    /publisher_gh\(\) \{[\s\S]{0,240}env -u GITHUB_TOKEN -u PUBLISHER_TOKEN -u RELEASE_PUBLISHER_TOKEN[\s\\]*-u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$publisher_token" gh "\$@"[\s\S]{0,20}\}/u,
+  );
+  assert.match(
+    workflow,
+    /live_master_sha="\$\(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com gh api --hostname github\.com/u,
+  );
+  for (const line of workflow.split("\n").filter((value) =>
+    /\bgh api\b/u.test(value) && !value.trimStart().startsWith("#")
+  )) {
+    assert.match(line, /gh api --hostname github\.com\b/u, line);
+  }
+  assert.equal(
+    (workflow.match(/\bgh api --hostname github\.com\b/gu) ?? []).length,
+    2,
+    "every direct workflow gh API call must bind github.com explicitly",
+  );
+  assert.doesNotMatch(
+    publisher,
+    /^\s*(?!publisher_gh\b).*\bgh (?:api|release)\b/mu,
   );
   assert.match(
     publisher,
@@ -2099,9 +2146,17 @@ test("disabled immutable-release policy blocks the first durable mutation", (t) 
 test("mutable post-publication readback blocks the floating alias", (t) => {
   const state = fixture(t);
   const built = buildAssembledCandidate(state, { label: "post-publish-mutable" });
+  const hostileGithubEnvironment = fakeGithubEnvironment(state, "post-publish-mutable");
   const result = invokePublish(state, built, {
     testRelease: false,
-    env: fakeGithubEnvironment(state, "post-publish-mutable"),
+    env: {
+      ...hostileGithubEnvironment,
+      FAKE_EXPECT_PINNED_GITHUB_HOST: "true",
+      GH_ENTERPRISE_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      GITHUB_ENTERPRISE_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      GH_HOST: "hostile.invalid",
+      RELEASE_PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+    },
   });
 
   assert.notEqual(result.status, 0);
