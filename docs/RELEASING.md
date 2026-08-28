@@ -390,19 +390,30 @@ re-reads live source `master` to determine
 whether target writes remain eligible. `publish` then repeats the target-head,
 ruleset, existing-tag, and existing-Release checks and follows this order:
 
-At every durable mutation fence, the governing source, ruleset, and current-
-signer policy reads complete before the final exact object boundary for that
-mutation. Immutable-Release policy is checked at the first mutation and then
-freshly re-read at the two applicable critical irreversible fences: immutable-
-Release publication and major-alias mutation. The cached first-mutation policy
+Ordinary durable mutation fences revalidate the live source, effective
+rulesets, and current signer immediately around the mutation. The stronger
+ordered sequence—complete the governing policy reads, then perform the final
+exact object boundary—is enforced specifically for immutable Release
+publication and major-alias mutation. Each of those critical irreversible
+fences freshly re-reads immutable-Release policy; the cached first-mutation
 result is not proof of the policy at either later fence. In particular,
-immediately before publishing an immutable Release, the publisher first
-completes its source/ruleset/current-signer fence and explicit immutable-
-Release-policy re-read, then performs one final exact read of the frozen draft
-Release ID, its complete asset inventory, and its tag binding. It then addresses
-that frozen Release ID with a direct REST `PATCH` carrying the exact intended
-metadata. It must not use `gh release edit`, whose convenience implementation
-may perform a hidden read after the publisher's final boundary.
+immediately before publishing an immutable Release, the publisher completes
+its source/ruleset/current-signer fence and explicit immutable-Release-policy
+re-read, then performs one final exact read of the frozen draft Release ID, its
+complete asset inventory, and its tag binding. It then addresses that frozen
+Release ID with a direct REST `PATCH` carrying the exact intended metadata. It
+must not use `gh release edit`, whose convenience implementation may perform a
+hidden read after the publisher's final boundary.
+
+The GitHub REST `2026-03-10` endpoint documents `200` only when immutable
+Releases are enabled and `404` when they are disabled. A `404` is therefore
+`blocked_conflict` / `immutable-release-policy-disabled`; any other API or read
+failure is `inconclusive` / `immutable-release-policy-unreadable`. A `200` body
+is still schema-validated as an extensible object: documented fields `enabled`
+and `enforced_by_owner` must be booleans, `enabled` must be `true`, and
+`enforced_by_owner=false` plus additive response fields remain valid. A
+non-object or missing/wrong-typed documented field fails closed before the
+protected write.
 
 1. Construct and locally verify the signed, single-parent wrapper commit.
 2. Fast-forward target `master` without force, then re-read its exact commit,
@@ -475,6 +486,11 @@ binding is `blocked_conflict` / `immutable-release-mismatch`. Keeping the fresh
 path raw-first prevents it from becoming an exception that can disguise stable
 wrong state as transient failure.
 
+Fresh Release absence is classified through the REST presence/404 path; the
+publisher does not infer an HTTP status by parsing `gh release view` porcelain
+stderr. Only a proved REST 404 is absence. Any other unreadable or malformed
+presence result remains `inconclusive` / `remote-read-inconclusive`.
+
 GitHub's official Release REST endpoint exposes no supported conditional
 compare-and-swap precondition for this `PATCH`; the publisher does not rely on
 undocumented conditional headers. Consequently, the small interval between
@@ -485,12 +501,13 @@ private Publisher App the only automated Release writer and treats
 `JoeyTeng`, the repository owner, as the explicit trusted manual writer. Any
 other concurrent Release writer violates the deployment contract. If
 post-publication readback detects a mismatch, publication remains blocked and
-must not claim automatic recovery. A nonzero direct `PATCH`, lost response, or
-malformed response is `inconclusive` / `release-publication-unknown`, because
-the mutation may have applied. Reconcile must retry the same exact source and
-prove either that the frozen draft remains unchanged or that the exact Release
-is already immutable; it must not blindly choose a different version. A
-deterministic post-publication mismatch remains blocked.
+must not claim automatic recovery. A nonzero direct `PATCH`, or a zero-exit
+response that is empty, malformed, or identifies a different Release ID, is
+`inconclusive` / `release-publication-unknown`, because the mutation may have
+applied. Reconcile must retry the same exact source and prove either that the
+frozen draft remains unchanged or that the exact Release is already immutable;
+it must not blindly choose a different version. A deterministic
+post-publication mismatch remains blocked.
 
 There is no `v2.0` alias in this contract. A floating alias does not receive a
 separate GitHub Release; Releases belong only to immutable full-version tags.
@@ -515,6 +532,14 @@ or a supported non-success recovery code with the exact next action when any
 required state is incomplete, conflicting, or could not be proved. The summary
 must not omit the recovery result or substitute an open-ended instruction to
 guess at repair.
+
+Public verification obtains both its initial and final Release-view metadata
+from the direct REST release-by-tag endpoint using the GitHub REST `2026-03-10`
+contract. It projects `draft`, `prerelease`, `tag_name`, `name`, and `body` into
+the closed view used for comparison. A documented REST HTTP 404 is classified
+as the applicable missing or disappeared Release state; other API failures are
+inconclusive. Verification never infers an HTTP status from `gh release view`
+porcelain stderr.
 
 Every full SemVer, including every prerelease, minor, and patch version,
 receives its immutable full tag and immutable GitHub Release. Marketplace is a

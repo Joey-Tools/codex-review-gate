@@ -744,6 +744,10 @@ const fail404 = () => {
   process.stderr.write("HTTP 404: Not Found\\n");
   process.exit(1);
 };
+const failReleaseViewNotFound = () => {
+  process.stderr.write("release not found\\n");
+  process.exit(1);
+};
 const digest = (bytes) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
 const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z") => {
   const bytes = readFileSync(join(assetsDir, name));
@@ -785,6 +789,8 @@ const releaseApi = (state) => ({
   },
   assets: state.assets.map((asset) => assetRecord(state, asset.name, asset.id)),
 });
+const releaseViewProjection =
+  "{isDraft:.draft,isPrerelease:.prerelease,tagName:.tag_name,name:.name,body:.body}";
 const signingKeyInventory = ({ revoked = false, replaceCertificate = false } = {}) => [{
   id: 5277815,
   primary_key_id: null,
@@ -802,6 +808,25 @@ const signingKeyInventory = ({ revoked = false, replaceCertificate = false } = {
     can_sign: true,
   }],
 }];
+const immutableReleasePolicy = (state) => {
+  if (phase === "immutable-policy-additive-fields") {
+    return {
+      enabled: state.immutable_policy_enabled,
+      enforced_by_owner: false,
+      future_policy_field: "ignored",
+    };
+  }
+  if (phase === "immutable-policy-missing-owner-field") {
+    return { enabled: state.immutable_policy_enabled };
+  }
+  if (phase === "immutable-policy-enabled-wrong-type") {
+    return { enabled: "true", enforced_by_owner: false };
+  }
+  if (phase === "immutable-policy-owner-wrong-type") {
+    return { enabled: state.immutable_policy_enabled, enforced_by_owner: "false" };
+  }
+  return { enabled: state.immutable_policy_enabled, enforced_by_owner: false };
+};
 const mutateProvenance = (state) => {
   if (state.mutation_done) return state;
   const name = "release-provenance.json";
@@ -828,6 +853,8 @@ const classifyRemoteCall = () => {
     if (/\\/rulesets\\/\\d+$/u.test(apiEndpoint || "")) return "ruleset-detail-read";
     if (apiEndpoint?.endsWith("/releases?per_page=100")) return "release-list-read";
     if (apiEndpoint?.endsWith("/releases/latest")) return "latest-release-read";
+    if (apiEndpoint?.includes("/releases/tags/") &&
+        option("--jq") === releaseViewProjection) return "release-view";
     if (apiEndpoint?.includes("/releases/tags/")) return "release-tag-read";
     if (apiEndpoint?.includes("/commits/") || apiEndpoint?.includes("/git/tags/")) {
       return "signed-object-read";
@@ -895,7 +922,16 @@ if (args[0] === "api") {
         immutable_policy_read: state.immutable_policy_reads,
       });
     }
-    process.stdout.write(JSON.stringify({ enabled: state.immutable_policy_enabled }) + "\\n");
+    if (!state.immutable_policy_enabled) {
+      save(state);
+      fail404();
+    }
+    if (phase === "immutable-policy-api-unreadable") {
+      save(state);
+      process.stderr.write("simulated immutable-release policy API outage\\n");
+      process.exit(1);
+    }
+    process.stdout.write(JSON.stringify(immutableReleasePolicy(state)) + "\\n");
     if (!state.policy_mutation_done && phase === "source-policy-drift") {
       execFileSync(process.env.REAL_GIT, [
         "-C",
@@ -1037,6 +1073,20 @@ if (args[0] === "api") {
       process.stderr.write("simulated Release PATCH response loss after apply\\n");
       process.exit(1);
     }
+    if (phase === "patch-zero-exit-empty-response") {
+      process.exit(0);
+    }
+    if (phase === "patch-zero-exit-malformed-response") {
+      process.stdout.write("{malformed-json\\n");
+      process.exit(0);
+    }
+    if (phase === "patch-zero-exit-wrong-id-response") {
+      process.stdout.write(JSON.stringify({
+        ...releaseApi(state),
+        id: state.release_id + 1,
+      }) + "\\n");
+      process.exit(0);
+    }
     process.stdout.write(JSON.stringify(releaseApi(state)) + "\\n");
     process.exit(0);
   }
@@ -1078,9 +1128,29 @@ if (args[0] === "api") {
     process.exit(0);
   }
   if (endpoint.includes("/releases/tags/")) {
+    if (jq === releaseViewProjection) {
+      state.release_view_reads += 1;
+      const releaseViewNotFound =
+        phase === "verify-final-view-404" && state.release_view_reads === 2;
+      save(state);
+      if (!state.exists || releaseViewNotFound) fail404();
+      process.stdout.write(JSON.stringify({
+        isDraft: state.draft,
+        isPrerelease: state.prerelease,
+        tagName: state.tag,
+        name: state.name,
+        body: state.body,
+      }) + "\\n");
+      process.exit(0);
+    }
     if (!state.exists && phase.startsWith("absent-boundary-") &&
-        process.env.FAKE_ABSENT_BOUNDARY_API_MARKER &&
-        existsSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER)) {
+        process.env.FAKE_ABSENT_BOUNDARY_API_MARKER) {
+      if (!existsSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER)) {
+        if (state.immutable_policy_reads > 0) {
+          writeFileSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER, "active\\n");
+        }
+        fail404();
+      }
       state.absent_boundary_api_reads += 1;
       const apiRead = state.absent_boundary_api_reads;
       save(state);
@@ -1122,7 +1192,18 @@ if (args[0] === "api") {
       if (phase === "after-immutable") mutateProvenance(state);
       process.exit(0);
     }
-    process.stdout.write(JSON.stringify(releaseApi(state)) + "\\n");
+    const response = releaseApi(state);
+    if (state.final_publication_policy_read_complete && state.draft &&
+        (phase === "pre-publication-stable-schema-invalid" ||
+          (phase === "pre-publication-valid-to-schema-invalid" &&
+            state.final_publication_boundary_reads === 2))) {
+      response.author.id = "not-a-number";
+      if (phase === "pre-publication-valid-to-schema-invalid") {
+        state.raw_boundary_mutation_done = true;
+        save(state);
+      }
+    }
+    process.stdout.write(JSON.stringify(response) + "\\n");
     if (state.draft && state.final_publication_boundary_reads === 1) {
       if (phase === "pre-publication-boundary-snapshot-changed") {
         state.raw_boundary_mutation_done = true;
@@ -1156,15 +1237,11 @@ if (args[0] === "api") {
 
 if (args[0] === "release" && args[1] === "view") {
   const state = readState();
-  if (!state.exists && phase.startsWith("absent-boundary-") &&
-      process.env.FAKE_ABSENT_BOUNDARY_API_MARKER) {
-    writeFileSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER, "active\\n");
-  }
-  if (!state.exists) fail404();
+  if (!state.exists) failReleaseViewNotFound();
   state.release_view_reads += 1;
-  const releaseView404 = phase === "verify-final-view-404" && state.release_view_reads === 2;
+  const releaseViewNotFound = phase === "verify-final-view-404" && state.release_view_reads === 2;
   save(state);
-  if (releaseView404) fail404();
+  if (releaseViewNotFound) failReleaseViewNotFound();
   if (option("--jq") === ".assets[].name") {
     process.stdout.write(state.assets.map((asset) => asset.name).sort().join("\\n") + (state.assets.length ? "\\n" : ""));
     process.exit(0);
@@ -1625,7 +1702,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(publisher, /prewrite-target-audit[\s\S]*audit_release_inventory[\s\S]*audit_release_history[\s\S]*initial_remote_ref_fingerprint/u);
   assert.match(
     publisher,
-    /require_immutable_release_policy\(\)[\s\S]*X-GitHub-Api-Version: 2026-03-10[\s\S]*immutable-releases[\s\S]*keys == \["enabled"\][\s\S]*\.enabled == true/u,
+    /require_immutable_release_policy\(\)[\s\S]*X-GitHub-Api-Version: 2026-03-10[\s\S]*immutable-releases[\s\S]*\(\.enabled \| type == "boolean"\)[\s\S]*\.enabled == true[\s\S]*\(\.enforced_by_owner \| type == "boolean"\)/u,
   );
   assert.match(
     publisher,
@@ -1643,6 +1720,36 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     publisher,
     /verify_final_policy_fence\(\)[\s\S]*preflight_live_source[\s\S]*verify_ruleset_policy_snapshot "\$label"[\s\S]*verify_live_release_signer_policy "\$label"/u,
   );
+  const remoteTagReadStart = publisher.indexOf("  read_remote_full_tag_snapshot() {");
+  const remoteTagReadEnd = publisher.indexOf(
+    "\n  validate_remote_full_tag_snapshot() {",
+    remoteTagReadStart,
+  );
+  assert.notEqual(remoteTagReadStart, -1, "missing remote full-tag snapshot reader");
+  assert.notEqual(remoteTagReadEnd, -1, "missing remote full-tag snapshot reader end");
+  const remoteTagRead = publisher.slice(remoteTagReadStart, remoteTagReadEnd);
+  const tagLsRemote = remoteTagRead.indexOf("target_git ls-remote");
+  const tagPostprocessGuard = remoteTagRead.indexOf("if ! printf '%s\\n'", tagLsRemote);
+  const tagStripBlank = remoteTagRead.indexOf("| sed '/^$/d'", tagPostprocessGuard);
+  const tagSort = remoteTagRead.indexOf("| LC_ALL=C sort", tagStripBlank);
+  const tagPostprocessGuardEnd = remoteTagRead.indexOf("; then", tagSort);
+  const tagUnreadable = remoteTagRead.indexOf(
+    'return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"',
+    tagPostprocessGuardEnd,
+  );
+  assert.ok(
+    tagLsRemote !== -1 &&
+      tagLsRemote < tagPostprocessGuard &&
+      tagPostprocessGuard < tagStripBlank &&
+      tagStripBlank < tagSort &&
+      tagSort < tagPostprocessGuardEnd &&
+      tagPostprocessGuardEnd < tagUnreadable,
+    "tag-snapshot post-processing failures must map to the unreadable boundary status",
+  );
+  assert.match(
+    publisher,
+    /fail_release_boundary_capture\(\)[\s\S]*RELEASE_BOUNDARY_REMOTE_UNREADABLE[\s\S]*fail_reconcile inconclusive remote-read-inconclusive/u,
+  );
   const boundaryCaptureStart = publisher.indexOf("  capture_release_boundary() {");
   const boundaryCaptureEnd = publisher.indexOf(
     "\n  fail_release_boundary_capture() {",
@@ -1655,7 +1762,12 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   const firstRawTag = boundaryCapture.indexOf("read_remote_full_tag_snapshot", firstRawRelease);
   const secondRawRelease = boundaryCapture.indexOf("> \"$second_api\"");
   const secondRawTag = boundaryCapture.indexOf("read_remote_full_tag_snapshot", secondRawRelease);
-  const neutralProjection = boundaryCapture.indexOf("snapshot-release-inventory");
+  const firstCanonicalRelease = boundaryCapture.indexOf(
+    'first_raw="$(jq -cS . "$first_api")"',
+  );
+  const secondCanonicalRelease = boundaryCapture.indexOf(
+    'second_raw="$(jq -cS . "$second_api")"',
+  );
   const rawStability = boundaryCapture.indexOf(
     '[[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]]',
   );
@@ -1666,8 +1778,9 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
       firstRawRelease < firstRawTag &&
       firstRawTag < secondRawRelease &&
       secondRawRelease < secondRawTag &&
-      secondRawTag < neutralProjection &&
-      neutralProjection < rawStability &&
+      secondRawTag < firstCanonicalRelease &&
+      firstCanonicalRelease < secondCanonicalRelease &&
+      secondCanonicalRelease < rawStability &&
       rawStability < releasePolicyValidation &&
       releasePolicyValidation < tagPolicyValidation,
     "both complete raw Release/tag snapshots must be compared before policy validation",
@@ -1707,6 +1820,18 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
       absentRawStability < stableAbsencePolicy &&
       stableAbsencePolicy < absentTagPolicy,
     "absence and full-tag raw A/B reads must complete before stable-state validation",
+  );
+  const githubReconcileStart = publisher.indexOf("reconcile_github_release() {");
+  const githubReconcileEnd = publisher.indexOf(
+    '\n}\n\nif [[ -n "$test_release_dir" ]]',
+    githubReconcileStart,
+  );
+  assert.notEqual(githubReconcileStart, -1, "missing GitHub Release reconcile helper");
+  assert.notEqual(githubReconcileEnd, -1, "missing GitHub Release reconcile helper end");
+  assert.doesNotMatch(
+    publisher.slice(githubReconcileStart, githubReconcileEnd),
+    /publisher_gh release view[\s\S]*HTTP\[\[:space:\]\]404/u,
+    "fresh Release absence must be established through the API boundary, not porcelain stderr",
   );
   const publicationStart = publisher.indexOf(
     'if [[ "$current_draft" == "true" ]]; then\n    require_publication_mutation release-completion',
@@ -2670,11 +2795,11 @@ test("public verification treats confirmed Release disappearance as a determinis
   });
   writeJson(fakeStatePath, publishedState);
 
-  for (const phase of [
-    "verify-initial-api-404",
-    "verify-download-404",
-    "verify-final-view-404",
-    "verify-final-api-404",
+  for (const verificationFailure of [
+    { phase: "verify-initial-api-404", expectedApiReads: 1, expectedViewReads: 0 },
+    { phase: "verify-download-404", expectedApiReads: 1, expectedViewReads: 1 },
+    { phase: "verify-final-view-404", expectedApiReads: 1, expectedViewReads: 2 },
+    { phase: "verify-final-api-404", expectedApiReads: 2, expectedViewReads: 2 },
   ]) {
     const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
     fakeState.release_api_reads = 0;
@@ -2684,12 +2809,23 @@ test("public verification treats confirmed Release disappearance as a determinis
 
     const result = invokeVerifyPublished(state, built, {
       testRelease: false,
-      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: verificationFailure.phase },
     });
-    assert.notEqual(result.status, 0, `${phase} must fail closed`);
+    assert.notEqual(result.status, 0, `${verificationFailure.phase} must fail closed`);
     assert.match(result.stderr, /verification_state=blocked_conflict/u);
     assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
     assert.match(result.stderr, /next_action=investigate-published-state/u);
+    const observedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+    assert.equal(
+      observedState.release_api_reads,
+      verificationFailure.expectedApiReads,
+      `${verificationFailure.phase} raw API read count`,
+    );
+    assert.equal(
+      observedState.release_view_reads,
+      verificationFailure.expectedViewReads,
+      `${verificationFailure.phase} projected API read count`,
+    );
   }
 });
 
@@ -3022,25 +3158,134 @@ exec "$REAL_GIT" "$@"
   assert.equal(existsSync(join(state.releases, "v2.0.0")), false);
 });
 
-test("disabled immutable-release policy blocks the first durable mutation", (t) => {
+test("fake GitHub distinguishes API and release-view missing diagnostics", (t) => {
   const state = fixture(t);
-  const built = buildAssembledCandidate(state, { label: "immutable-policy-disabled" });
-  const result = invokePublish(state, built, {
-    testRelease: false,
-    env: fakeGithubEnvironment(state, "immutable-policy-disabled"),
-  });
+  const env = fakeGithubEnvironment(state, "missing-release-diagnostics");
+  const api = invoke("gh", [
+    "api",
+    "repos/JoeyTeng/codex-review-gate-action/releases/tags/v2.0.0",
+  ], { env });
+  const view = invoke("gh", [
+    "release",
+    "view",
+    "v2.0.0",
+    "--repo",
+    "JoeyTeng/codex-review-gate-action",
+    "--json",
+    "isDraft",
+  ], { env });
 
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
-  assert.match(result.stderr, /recovery_code=immutable-release-policy-disabled/u);
+  assert.equal(api.status, 1);
+  assert.match(api.stderr, /HTTP 404: Not Found/u);
+  assert.doesNotMatch(api.stderr, /release not found/u);
+  assert.equal(view.status, 1);
+  assert.equal(view.stderr, "release not found\n");
+  assert.doesNotMatch(view.stderr, /HTTP 404/u);
+});
+
+for (const policyCase of [
+  {
+    label: "enabled true with owner enforcement false",
+    phase: "immutable-policy-owner-not-enforced",
+  },
+  {
+    label: "an additive response field",
+    phase: "immutable-policy-additive-fields",
+  },
+]) {
+  test(`immutable-release policy accepts ${policyCase.label}`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: policyCase.phase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, policyCase.phase),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${policyCase.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.immutable, true);
+    assert.equal(fakeState.immutable_policy_reads, 3);
+    const releaseCreate = fakeState.call_trace.findIndex(
+      ({ type, kind }) => type === "remote" && kind === "release-create",
+    );
+    assert.notEqual(releaseCreate, -1);
+    assert.equal(
+      fakeState.call_trace
+        .slice(0, releaseCreate)
+        .some(({ type, kind }) => type === "remote" && kind === "release-view"),
+      false,
+      "fresh publication must not use gh release view to classify absence",
+    );
+    assert.notEqual(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  });
+}
+
+test("disabled, invalid, or unreadable immutable-release policy responses fail closed", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "immutable-policy-rejections" });
+
+  for (const policyCase of [
+    {
+      label: "disabled HTTP 404",
+      phase: "immutable-policy-disabled",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-policy-disabled",
+    },
+    {
+      label: "missing enforced_by_owner",
+      phase: "immutable-policy-missing-owner-field",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-policy-disabled",
+    },
+    {
+      label: "enabled with the wrong type",
+      phase: "immutable-policy-enabled-wrong-type",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-policy-disabled",
+    },
+    {
+      label: "enforced_by_owner with the wrong type",
+      phase: "immutable-policy-owner-wrong-type",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-policy-disabled",
+    },
+    {
+      label: "non-404 API failure",
+      phase: "immutable-policy-api-unreadable",
+      state: "inconclusive",
+      recoveryCode: "immutable-release-policy-unreadable",
+    },
+  ]) {
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, policyCase.phase),
+    });
+
+    assert.notEqual(result.status, 0, policyCase.label);
+    assert.match(
+      result.stderr,
+      new RegExp(`reconcile_state=${policyCase.state}`, "u"),
+      policyCase.label,
+    );
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${policyCase.recoveryCode}`, "u"),
+      policyCase.label,
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${policyCase.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.exists, false, policyCase.label);
+    assert.deepEqual(fakeState.assets, [], policyCase.label);
+    assert.equal(fakeState.immutable_policy_reads, 1, policyCase.label);
+  }
+
   assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
   assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
-  const fakeState = JSON.parse(readFileSync(
-    join(state.root, "fake-gh-state-immutable-policy-disabled", "state.json"),
-    "utf8",
-  ));
-  assert.equal(fakeState.exists, false);
-  assert.deepEqual(fakeState.assets, []);
 });
 
 for (const releaseCase of [
@@ -3287,6 +3532,68 @@ for (const patchFailure of [
   });
 }
 
+for (const responseFailure of [
+  { label: "an empty body", phase: "patch-zero-exit-empty-response" },
+  { label: "malformed JSON", phase: "patch-zero-exit-malformed-response" },
+  { label: "a different numeric Release id", phase: "patch-zero-exit-wrong-id-response" },
+]) {
+  test(`zero-exit Release PATCH with ${responseFailure.label} is unknown and recoverable`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: responseFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, responseFailure.phase);
+    const failed = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /reconcile_state=inconclusive/u);
+    assert.match(failed.stderr, /recovery_code=release-publication-unknown/u);
+    assert.match(failed.stderr, /response was missing or malformed/u);
+    assert.match(failed.stderr, /exact source SHA/u);
+    let fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${responseFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.publish_patch_calls, 1);
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
+    assert.equal(fakeState.latest, "v2.0.0");
+    assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0"]), "tag");
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+
+    const recovered = invokePublish(state, built, {
+      testRelease: false,
+      env: {
+        ...githubEnvironment,
+        FAKE_GH_MUTATION_PHASE: "patch-zero-exit-response-recovery",
+      },
+    });
+
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+    fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${responseFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.publish_patch_calls, 1, "retry must prove the applied PATCH without repeating it");
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.equal(
+      fakeState.call_trace.filter(
+        ({ type, kind }) => type === "remote" && kind === "release-patch",
+      ).length,
+      1,
+      "exact-source retry must not issue a second Release PATCH",
+    );
+    assert.equal(fakeState.tag, "v2.0.0");
+    const releaseCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+    assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), releaseCommit);
+    assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), releaseCommit);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.1"]));
+  });
+}
+
 test("mutable post-publication readback blocks the floating alias", (t) => {
   const state = fixture(t);
   const built = buildAssembledCandidate(state, { label: "post-publish-mutable" });
@@ -3525,6 +3832,16 @@ for (const boundaryFailure of [
     state: "inconclusive",
     recoveryCode: "remote-state-changed",
   },
+  {
+    phase: "pre-publication-stable-schema-invalid",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+  },
+  {
+    phase: "pre-publication-valid-to-schema-invalid",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+  },
 ]) {
   test(`${boundaryFailure.phase} preserves the draft with precise classification`, (t) => {
     const state = fixture(t);
@@ -3549,6 +3866,20 @@ for (const boundaryFailure of [
     assert.equal(fakeState.draft, true);
     assert.equal(fakeState.immutable, false);
     assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    if (boundaryFailure.phase === "pre-publication-stable-schema-invalid") {
+      assert.equal(fakeState.final_publication_boundary_reads, 2);
+      assert.equal(fakeState.raw_boundary_mutation_done, false);
+      assert.match(
+        result.stderr,
+        /GitHub Release boundary metadata or author differs from policy/u,
+      );
+    }
+    if (boundaryFailure.phase === "pre-publication-valid-to-schema-invalid") {
+      assert.doesNotMatch(
+        result.stderr,
+        /GitHub Release boundary metadata or author differs from policy/u,
+      );
+    }
     if (boundaryFailure.recoveryCode === "remote-state-changed") {
       assert.equal(fakeState.final_publication_boundary_reads, 2);
       assert.equal(fakeState.raw_boundary_mutation_done, true);

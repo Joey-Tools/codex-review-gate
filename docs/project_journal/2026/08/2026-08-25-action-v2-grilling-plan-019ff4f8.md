@@ -2319,10 +2319,12 @@ superseded_by:
     lookup.
 - The landed fence shape distinguishes ordinary mutations from the two
   critical irreversible Release/alias boundaries. Every durable mutation
-  revalidates source, rulesets, and the current signer. Immutable-Release policy
-  is cached after the first-mutation check for ordinary work, but that cached
-  result is explicitly insufficient at Release publication and alias mutation;
-  each of those fences performs a fresh policy read.
+  revalidates source, rulesets, and the current signer immediately around the
+  mutation. The stronger ordered sequence—governing policy reads followed by
+  the final exact object boundary—is specific to immutable Release publication
+  and major-alias mutation. Immutable-Release policy is cached after the
+  first-mutation check for ordinary work, but that cached result is explicitly
+  insufficient at either critical fence; each performs a fresh policy read.
 - Alias mutation now follows one exact order: lease-protected alias binding
   raw-first A/B double-read; final source/ruleset/current-signer policy fence;
   explicit immutable-Release-policy re-read; fresh exact immutable
@@ -2380,16 +2382,72 @@ superseded_by:
   frozen draft is unchanged or that the exact Release is already immutable; it
   does not blindly advance to another version. A deterministic post-readback
   mismatch remains blocked.
-- Validation state remains in progress. Focused evidence for these two P2
-  fixes passed: expected-absence boundary 8/8; live-signer valid path 1/1 and
-  failure paths 4/4; static seam contract 1/1. This is dynamic focused evidence
-  for the signer fences, not merely static coverage. `bash -n`, ShellCheck
-  0.11, `npm run check`, the 39-test workflow-security contract,
-  `git diff --check`, and project-journal validation also passed. The complete
-  serialized repository suite on the frozen corrected tree then passed
-  807/807 with exit status zero. A new signed landing checkpoint and a fresh
-  formal exact-head review remain pending. This checkpoint does not grant
-  permission for PR #35 to leave Draft or for publication to resume.
+- A live production preflight against GitHub REST API `2026-03-10` exposed an
+  additional release blocker before any mutation. The immutable-Release policy
+  response was `{"enabled":true,"enforced_by_owner":false}`. The publisher's
+  exact-key equality against only `enabled` rejected that valid enabled policy;
+  the blocker was the brittle response-shape check, not a disabled policy.
+  The correction validates both documented fields as booleans, requires
+  `enabled=true`, permits `enforced_by_owner=false`, and tolerates additive
+  response fields. Unreadable, non-object, missing/wrong-typed, or disabled
+  policy evidence still fails closed.
+  - Explicit reason: a valid enabled policy must not be rejected merely because
+    GitHub returns another documented field, while unreadable or malformed
+    policy evidence must never authorize a publication mutation.
+  - Follow-up reviewer evidence refined the endpoint status contract from the
+    official GitHub REST `2026-03-10` documentation: `200` is returned only
+    when immutable Releases are enabled, while disabled state returns `404`.
+    The correction classifies that `404` as `blocked_conflict` /
+    `immutable-release-policy-disabled`, classifies every other API failure as
+    `inconclusive` / `immutable-release-policy-unreadable`, and still validates
+    the schema of a successful `200` body.
+- The same live production preflight confirmed a second P1 on the fresh
+  Release path. That path parsed `gh release view` stderr for `HTTP 404`, but
+  `gh` 2.88.1 actually emits `release not found` when the Release does not
+  exist. A valid first-release absence was therefore misclassified as
+  `inconclusive` / `remote-read-inconclusive`, blocking every initial publish
+  attempt in that runtime.
+  - Remediation: fresh absence now reuses the REST presence/404 classifier, and
+    fixtures keep REST API status semantics distinct from `gh` porcelain error
+    text. Only a proved REST 404 is absence; unreadable or malformed results
+    remain fail closed.
+  - Explicit reason: porcelain stderr is not a stable carrier for REST status,
+    so absence authority must come from the API classifier rather than a
+    version-specific CLI message.
+- A follow-up review also corrected an overbroad release-document statement:
+  ordinary mutation fences revalidate source, rulesets, and the current signer
+  immediately around the mutation, while only immutable Release publication
+  and major-alias mutation enforce governing policy reads before their final
+  exact object boundary. No broader ordering is claimed for ordinary writes.
+- Two further reviewer-reported P2 fixes, stable-schema-invalid A/B and the
+  tag-pipeline path, were addressed in the correction set. Dynamic coverage was
+  also added for a direct publication `PATCH` that
+  exits zero but returns an empty, malformed, or wrong-Release-ID response. The
+  expected result remains `inconclusive` / `release-publication-unknown`, the
+  floating alias remains unmoved, and recovery reconciles the same exact source
+  rather than advancing publication blindly.
+- The first complete serialized suite attempt after these production-focused
+  changes exited `1` with 9 failures; it was not a passing run. One failure was
+  a real public-verification defect in the same error-semantics class as fresh
+  publication: it still expected `HTTP 404` in `gh release view` porcelain
+  stderr, while `gh` 2.88.1 reports `release not found`. The other eight were
+  stale absence-marker fixture failures whose markers still depended on the
+  removed porcelain Release-view path.
+  - Remediation moves public-verification Release-view metadata to the direct
+    REST `2026-03-10` release-by-tag projection with documented HTTP 404
+    classification, and moves the eight fixture markers to the authoritative
+    REST absence boundary. The independently rerun affected set then passed
+    9/9, and the separate CLI/API missing-Release diagnostic passed 1/1.
+- Final validation on the corrected tree then ran
+  `npm test -- --test-reporter=dot --test-concurrency=1`. The second complete
+  serialized command exited `0`, and its dot-only output was counted exactly as
+  815/815. The earlier 807/807 checkpoint remains historical evidence from the
+  then-frozen tree and predates the live-production corrections above.
+- Current fast gates also passed: `bash -n`, ShellCheck, `npm run check`, the
+  workflow-security contract 39/39, `git diff --check`, and project-journal
+  validation. The new signed landing checkpoint and fresh formal exact-head
+  review remain pending; this ledger does not yet claim a commit or review.
+  Publication therefore remains paused, and PR #35 must not leave Draft yet.
 
 ## Verified Facts And Required Live Preflight
 

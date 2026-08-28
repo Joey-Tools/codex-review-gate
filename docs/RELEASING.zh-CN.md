@@ -332,18 +332,26 @@ controls。Preflight 也重新读取 live source `master`，判断 target writes
 资格。随后 `publish` 再次检查 target
 head、rulesets、existing tags 与 existing Release，并按以下顺序执行：
 
-在每个 durable mutation fence，必须先完成约束该 mutation 的 source、
-ruleset 与 current-signer policy reads，然后才做该 mutation 最终的 exact
-object boundary。Immutable-Release policy 会在 first mutation 时检查一次，之后
-只在两个适用的 critical irreversible fences 进行 fresh re-read：immutable Release
-publication 与 major-alias mutation。Cached first-mutation policy result 不能证明
-这两个较晚 fence 当时的 policy。特别是，发布 immutable Release 之前，
-publisher 必须先完成 source/ruleset/current-signer fence 和显式的
-immutable-Release-policy re-read，再对 frozen draft Release ID、其完整 asset
-inventory 与 tag binding 做一次最终 exact read。之后它使用 direct REST
-`PATCH` 向该 frozen Release ID 提交 exact intended metadata。不得使用
-`gh release edit`，因为该 convenience command 的实现可能在 publisher 最终
-boundary 之后执行 hidden read。
+普通 durable mutation fence 会在 mutation 的紧邻位置重新验证 live source、
+effective rulesets 与 current signer。更强的有序序列——先完成 governing policy
+reads，再执行 final exact object boundary——只在 immutable Release publication 与
+major-alias mutation 两个 critical irreversible fences 强制执行。两个 fence 都会
+fresh 重读 immutable-Release policy；cached first-mutation result 不能证明这些较晚
+fence 当时的 policy。特别是，发布 immutable Release 之前，publisher 必须先完成
+source/ruleset/current-signer fence 和显式 immutable-Release-policy re-read，再对
+frozen draft Release ID、其完整 asset inventory 与 tag binding 做一次 final exact
+read。之后它使用 direct REST `PATCH` 向该 frozen Release ID 提交 exact intended
+metadata。不得使用 `gh release edit`，因为该 convenience command 的实现可能在
+publisher 最终 boundary 之后执行 hidden read。
+
+GitHub REST `2026-03-10` endpoint 规定：immutable Releases 已启用时才返回 `200`，
+已禁用时返回 `404`。因此 `404` 归为 `blocked_conflict` /
+`immutable-release-policy-disabled`；其他 API 或读取失败归为 `inconclusive` /
+`immutable-release-policy-unreadable`。`200` body 仍须按 extensible object 做 schema
+validation：documented fields `enabled` 与 `enforced_by_owner` 都必须是 boolean，
+`enabled` 必须为 `true`；`enforced_by_owner=false` 和 additive response fields 仍然
+有效。Response 不是 object、缺少 documented field 或字段类型错误，都会在
+protected write 前 fail closed。
 
 1. 构造并在本地验证 signed single-parent wrapper commit。
 2. 在不 force 的情况下 fast-forward target `master`，然后重新读取 exact commit、
@@ -406,6 +414,11 @@ malformed、lightweight 或不是 approved tag 归为
 `blocked_conflict` / `immutable-release-mismatch`。Fresh path 保持 raw-first，避免它成为
 例外并把稳定错误状态伪装成 transient failure。
 
+Fresh Release absence 通过 REST presence/404 path 分类；publisher 不会解析
+`gh release view` porcelain stderr 来推断 HTTP status。只有经证明的 REST 404 才表示
+absence；其他不可读或 malformed presence result 仍归为 `inconclusive` /
+`remote-read-inconclusive`。
+
 GitHub 官方 Release REST endpoint 没有为这个 `PATCH` 提供受支持的
 conditional compare-and-swap precondition；publisher 不依赖 undocumented conditional
 headers。因此，最终 draft/asset/tag read 与 publish `PATCH` 之间的微小
@@ -414,11 +427,11 @@ headers。因此，最终 draft/asset/tag read 与 publish `PATCH` 之间的微�
 是唯一 automated Release writer，并把 repository owner `JoeyTeng` 明确视为 trusted
 manual writer。任何其他 concurrent Release writer 都违反 deployment contract。如果
 post-publication readback 检测到 mismatch，publication 必须保持 blocked，不得声称
-可以自动恢复。Direct `PATCH` nonzero、response 丢失或 malformed response 归为
-`inconclusive` / `release-publication-unknown`，因为 mutation 可能已生效。Reconcile
-必须使用同一 exact source，证明 frozen draft 仍未变化，或 exact Release 已经
-immutable；不得盲目换用另一 version。Deterministic post-publication mismatch 仍保持
-blocked。
+可以自动恢复。Direct `PATCH` nonzero，或者 zero-exit response 为空、malformed 或返回
+不同 Release ID，都归为 `inconclusive` / `release-publication-unknown`，因为 mutation
+可能已生效。Reconcile 必须使用同一 exact source，证明 frozen draft 仍未变化，或
+exact Release 已经 immutable；不得盲目换用另一 version。Deterministic
+post-publication mismatch 仍保持 blocked。
 
 本合约没有 `v2.0` alias。Floating alias 不建立单独 GitHub Release；Release 只
 属于 immutable full-version tags。Stable release admit 后，consumer 使用
@@ -440,6 +453,13 @@ observed state 和一个 closed recovery result：verification 完成时为
 `recovery_code=none`；任一 required state 不完整、冲突或无法证明时，则为一个
 supported non-success recovery code 及其 exact next action。Summary 不得遗漏 recovery
 result，也不得改用开放式的“自行猜测如何修复”指示。
+
+Public verification 的 initial 与 final Release-view metadata 都通过 direct REST
+release-by-tag endpoint 获取，并遵循 GitHub REST `2026-03-10` contract。它把
+`draft`、`prerelease`、`tag_name`、`name` 与 `body` 投影成用于比较的 closed view。
+Documented REST HTTP 404 会按对应阶段归类为 Release missing 或 disappeared；其他 API
+failure 归为 inconclusive。Verification 绝不从 `gh release view` porcelain stderr
+推断 HTTP status。
 
 每个 full SemVer（包括每个 prerelease、minor 与 patch version）都获得 immutable full
 tag 与 immutable GitHub Release。Marketplace 是完全独立的 manual out-of-band
