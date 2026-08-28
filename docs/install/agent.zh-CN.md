@@ -522,8 +522,9 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
      --jq '.merge_commit_sha')"
    test -n "$DEFAULT_BRANCH_HEAD_SHA"
    test -n "$CANARY_TEST_MERGE_SHA"
-   gh api "repos/$REPO/commits/$CANARY_HEAD/check-runs" \
-     --jq '[.check_runs[] | select(.name == "codex/github-review-gate")] | map({id, status, conclusion, head_sha, app: .app.id, details_url})'
+   gh api --paginate --slurp \
+     "repos/$REPO/commits/$CANARY_HEAD/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100" \
+     --jq '[.[].check_runs[] | {id, status, conclusion, head_sha, app: .app.id, details_url}]'
    ```
 
    要求 current canonical verifier CheckRun 恰好一个，

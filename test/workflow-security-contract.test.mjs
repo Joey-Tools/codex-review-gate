@@ -1244,6 +1244,11 @@ test("installation guides preserve the feature-head CheckRun and test-merge exec
     const guide = installGuides[name];
     assert.match(guide, /exact `headRefOid`/u, name);
     assert.match(guide, /codex\/github-review-gate/u, name);
+    assert.match(
+      guide,
+      /gh api --paginate --slurp[\s\S]{0,220}check-runs\?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100[\s\S]{0,160}\.\[\]\.check_runs\[\]/u,
+      `${name}: canary CheckRun inventory must be server-filtered and completely paginated`,
+    );
   }
 });
 

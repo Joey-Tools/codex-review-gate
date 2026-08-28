@@ -1606,6 +1606,35 @@ superseded_by:
   evidence. The 712-test result above is the subsequent uninterrupted run on
   the corrected, frozen working tree.
 
+### Whole-Range Review At The Stable-Receipt Checkpoint
+
+- A fourth independent review covered
+  `10217253306ca2ee6f312f766a331f8924e26e47..40797a032fb4f9d2fa732cd6fa4d1a82cdeb073a`
+  in a clean detached no-local clone at tree
+  `b61c9f170796237047366211846333d66b88c478`. The dedicated reviewer role
+  remained unavailable, so the explicitly authorized zero-context ordinary
+  `gpt-5.6-sol` / `ultra` fallback reviewed all 13 commits and 89 changed paths.
+- The reviewer retained one P3 documentation defect. The executable agent
+  canary command queried the default first CheckRun page and filtered locally;
+  a valid `codex/github-review-gate` beyond that page would be omitted and the
+  agent installer would falsely reject the canary. The runtime and bootstrap
+  helper were not affected because their authoritative inventories already
+  use complete pagination.
+- Both agent installation guides now use the server-side
+  `check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100` query with
+  `gh api --paginate --slurp`, then flatten every returned page. The workflow
+  security contract pins this executable guidance so the first-page-only bug
+  cannot silently return. Local `gh api --help` confirms that `--slurp` wraps
+  every paginated response into the outer array consumed by the documented jq
+  expression.
+- This documentation checkpoint requires focused validation, a new signed
+  commit, and another fresh whole-range review before it can become acceptance
+  evidence.
+- Focused validation on the documentation remediation passed:
+  - workflow-security contract: 30 of 30 passed;
+  - `npm run check`: passed;
+  - project-journal validation and `git diff --check`: passed.
+
 ### Verified Two-Workflow Platform Boundaries And Resolution
 
 - Required-CheckRun source selection is not workflow provenance. GitHub's

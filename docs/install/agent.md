@@ -579,8 +579,9 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
      --jq '.merge_commit_sha')"
    test -n "$DEFAULT_BRANCH_HEAD_SHA"
    test -n "$CANARY_TEST_MERGE_SHA"
-   gh api "repos/$REPO/commits/$CANARY_HEAD/check-runs" \
-     --jq '[.check_runs[] | select(.name == "codex/github-review-gate")] | map({id, status, conclusion, head_sha, app: .app.id, details_url})'
+   gh api --paginate --slurp \
+     "repos/$REPO/commits/$CANARY_HEAD/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100" \
+     --jq '[.[].check_runs[] | {id, status, conclusion, head_sha, app: .app.id, details_url}]'
    ```
 
    Require exactly one current canonical verifier CheckRun with
