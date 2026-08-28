@@ -211,6 +211,14 @@ primary/signing fingerprints，执行固定 sign/verify probe，并在结束后�
 公开 encryption-only subkey metadata 无害；额外可用的 secret signing、encryption
 或 authentication subkey 会被拒绝。
 
+Current signer inventory 是 live access-policy 与 content boundary。它绑定 pinned
+primary fingerprint、pinned signing-subkey fingerprint 与 exact raw public
+certificate，但刻意不绑定 GitHub GPG-key REST object ID。每个 durable
+mutation fence 都必须重新读取并验证这组 live primary/subkey/certificate，
+尤其是最终 immutable Release publication fence。既有 commit 或 tag 的 GitHub
+persistent verification result 只能证明该 object 的 signature state；它不能
+替代 pinned signer 仍存在于 current account inventory 的证明。
+
 首次写入前，just-in-time token 必须证明属于 expected Publisher App installation 与
 唯一 target repository；target rulesets 随后只把该 App 作为 publication bypass
 identity。GPG identity 是写入 publication Git objects 的 author、committer 与 signer，
@@ -316,6 +324,19 @@ controls。Preflight 也重新读取 live source `master`，判断 target writes
 资格。随后 `publish` 再次检查 target
 head、rulesets、existing tags 与 existing Release，并按以下顺序执行：
 
+在每个 durable mutation fence，必须先完成约束该 mutation 的 source、
+ruleset 与 current-signer policy reads，然后才做该 mutation 最终的 exact
+object boundary。Immutable-Release policy 会在 first mutation 时检查一次，之后
+只在两个适用的 critical irreversible fences 进行 fresh re-read：immutable Release
+publication 与 major-alias mutation。Cached first-mutation policy result 不能证明
+这两个较晚 fence 当时的 policy。特别是，发布 immutable Release 之前，
+publisher 必须先完成 source/ruleset/current-signer fence 和显式的
+immutable-Release-policy re-read，再对 frozen draft Release ID、其完整 asset
+inventory 与 tag binding 做一次最终 exact read。之后它使用 direct REST
+`PATCH` 向该 frozen Release ID 提交 exact intended metadata。不得使用
+`gh release edit`，因为该 convenience command 的实现可能在 publisher 最终
+boundary 之后执行 hidden read。
+
 1. 构造并在本地验证 signed single-parent wrapper commit。
 2. 在不 force 的情况下 fast-forward target `master`，然后重新读取 exact commit、
    parent、tree 与 GitHub signature result。这证明 accepted Git state，不证明 immutable
@@ -326,14 +347,60 @@ head、rulesets、existing tags 与 existing Release，并按以下顺序执行�
    commit、commit tree 与 GitHub signature result。Publisher identity 在首次写入前
    通过 minted token 实际输出的 App slug 与 installation ID、target scope 及
    effective rulesets 完成绑定。
-4. 为 full tag 创建或恢复 draft GitHub Release，上传 release assets、canonical
-   provenance、checksums 与 detached provenance signature。
-5. 重新读取 draft tag binding 及每个 asset byte/digest，然后在 repository 的
-   immutable-release policy 下发布 Release，并验证 immutable published Release。
-6. 仅对 stable version，创建 signed annotated floating major tag（例如 `v2`），
-   并对刚观察到的旧 tag object 使用 exact lease 更新。Alias 只能在 version history
+4. 为 full tag 创建或恢复 draft GitHub Release，冻结其 Release ID，然后上传
+   release assets、canonical provenance、checksums 与 detached provenance signature。
+5. 完成 governing policy reads，再执行上述最终 exact draft Release、asset 与
+   tag boundary。通过对 frozen Release ID 发送携带 exact metadata 的 direct
+   `PATCH` 完成发布，然后验证 immutable published Release。
+6. 仅对 stable version，先采集 live alias binding 的两份 neutral canonical raw
+   observations A 与 B，并在解读 tag shape 或 expected policy 之前比较它们。
+   只有 A 与 B 相等后，才验证 absent creation boundary 或 annotated
+   direct/peeled binding，并把 exact previously observed tag object 绑定为 update
+   lease。然后运行最终 source/ruleset/current-signer policy
+   fence，显式重读 immutable-Release policy，并捕获一份 fresh exact immutable
+   Release/asset/full-tag boundary。然后创建 signed annotated floating major tag
+   （例如 `v2`），或使用 exact lease 更新。Alias 只能在 version history
    中向前移动。
-7. 重新读取 alias。Prerelease 在此步骤前停止，绝不修改 `v2`。
+7. 采集并比较 mutation 后 alias 的 neutral canonical raw observations A 与 B。
+   A 与 B 不同归为 `inconclusive` / `remote-state-changed`。A 与 B 相等时，
+   再验证稳定 binding 是 annotated tag，且其 direct object 与 peeled commit
+   exact 匹配 planned state；malformed 或 lightweight tag，或其他稳定 binding，归为
+   `blocked_conflict` / `malformed-major-alias-target`。然后重读 immutable
+   Release/asset/full-tag boundary，
+   必须与 pre-alias boundary 相同。Prerelease 在 alias mutation 之前停止，
+   绝不修改 `v2`。
+
+在 pre-mutation 或 post-mutation alias boundary，命令或 canonical raw projection
+不可读都归为 `inconclusive` / `remote-read-inconclusive`。
+
+每个 exact Release boundary 同样采用 raw-first A/B。它对 Release API response
+与 immutable full-tag `ls-remote` binding 获取两份 neutral canonical
+observations，先比较这两份 observation，只有它们稳定后才做 structural 与
+expected-policy validation。它只产生以下 closed classification：
+
+- API、`ls-remote` 或 canonical raw projection 不可读：
+  `inconclusive` / `remote-read-inconclusive`；
+- raw observations A 与 B 不同：`inconclusive` / `remote-state-changed`；
+- 稳定但 malformed 或 lightweight 的 tag，或稳定 Release metadata、author、asset、
+  tag、frozen-draft 或 planned-state mismatch：
+  `blocked_conflict` / `immutable-release-mismatch`。
+
+这个 raw-first 顺序是刻意的：若在比较 A 与 B 之前就用 expected policy 验证任一
+observation，稳定的错误状态可能被伪装成 transient read failure。
+
+GitHub 官方 Release REST endpoint 没有为这个 `PATCH` 提供受支持的
+conditional compare-and-swap precondition；publisher 不依赖 undocumented conditional
+headers。因此，最终 draft/asset/tag read 与 publish `PATCH` 之间的微小
+窗口无法由 client 消除。Workflow concurrency 可串行化 publisher runs，但不能
+串行化独立 Release writer。因此 deployment contract 规定 private Publisher App
+是唯一 automated Release writer，并把 repository owner `JoeyTeng` 明确视为 trusted
+manual writer。任何其他 concurrent Release writer 都违反 deployment contract。如果
+post-publication readback 检测到 mismatch，publication 必须保持 blocked，不得声称
+可以自动恢复。Direct `PATCH` nonzero、response 丢失或 malformed response 归为
+`inconclusive` / `release-publication-unknown`，因为 mutation 可能已生效。Reconcile
+必须使用同一 exact source，证明 frozen draft 仍未变化，或 exact Release 已经
+immutable；不得盲目换用另一 version。Deterministic post-publication mismatch 仍保持
+blocked。
 
 本合约没有 `v2.0` alias。Floating alias 不建立单独 GitHub Release；Release 只
 属于 immutable full-version tags。Stable release admit 后，consumer 使用
@@ -418,7 +485,8 @@ privileged retry 都先 full reconcile：
 - 预期 wrapper commit 与 full tag object；
 - draft/published Release state 及每个 asset digest；
 - stable release 的 floating alias；
-- effective branch/tag rulesets。
+- effective branch/tag rulesets；
+- current pinned signer 的 primary/subkey/raw-certificate inventory。
 
 Reconcile 必须返回恰好一种 remote-state classification：`fresh`、
 `resumable_partial`、`already_complete`、`superseded`、`blocked_conflict` 或

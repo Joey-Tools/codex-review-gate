@@ -1575,6 +1575,37 @@ temporary_root="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/codex-review-gate-r
 stage_repo="$temporary_root/target"
 ruleset_snapshot_counter=0
 immutable_policy_counter=0
+signer_policy_counter=0
+
+verify_live_release_signer_policy() {
+  local label="$1"
+  local github_keys github_keys_error live_public_key approved_public_key
+  is_test_environment && return 0
+  signer_policy_counter=$((signer_policy_counter + 1))
+  github_keys="$temporary_root/github-signing-keys-${signer_policy_counter}-${label}.json"
+  github_keys_error="$temporary_root/github-signing-keys-${signer_policy_counter}-${label}.err"
+  live_public_key="$temporary_root/release-signing-public-key-${signer_policy_counter}-${label}.asc"
+  approved_public_key="${RUNNER_TEMP:-}/release-signing-public-key.asc"
+  if ! publisher_gh api users/JoeyTeng-Codex/gpg_keys > "$github_keys" 2> "$github_keys_error"; then
+    cat "$github_keys_error" >&2
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "the live GitHub signing-key inventory could not be read at the $label policy fence"
+  fi
+  node "$generator" verify-github-signing-key \
+    --input "$github_keys" \
+    --output-public-key "$live_public_key" || {
+    fail_reconcile blocked_conflict signing-key-policy-changed \
+      "the release signing key is missing, revoked, expired, duplicated, or otherwise differs from policy at the $label policy fence"
+  }
+  [[ -n "${RUNNER_TEMP:-}" && -f "$approved_public_key" && ! -L "$approved_public_key" ]] || {
+    fail_reconcile blocked_conflict signing-key-policy-changed \
+      "the approved release signing certificate is unavailable at the $label policy fence"
+  }
+  cmp -s -- "$approved_public_key" "$live_public_key" || {
+    fail_reconcile blocked_conflict signing-key-policy-changed \
+      "the live release signing certificate content differs from the approved certificate at the $label policy fence"
+  }
+}
 
 verify_ruleset_policy_snapshot() {
   local label="$1"
@@ -1629,6 +1660,7 @@ verify_final_policy_fence() {
       "source master moved after the publication plan; reconcile the partial prefix with the exact source SHA"
   }
   verify_ruleset_policy_snapshot "$label"
+  verify_live_release_signer_policy "$label"
 }
 
 require_immutable_release_policy() {
@@ -2629,28 +2661,8 @@ later_same_major_stable_version="$saved_later_same_major_stable_version"
     "the complete target ref or GitHub Release inventory changed during reconcile"
 }
 
+verify_live_release_signer_policy final-prewrite
 if ! is_test_environment; then
-  final_github_keys="$temporary_root/github-signing-keys-final-prewrite.json"
-  final_public_key="$temporary_root/release-signing-public-key-final-prewrite.asc"
-  publisher_gh api users/JoeyTeng-Codex/gpg_keys > "$final_github_keys" || {
-    fail_reconcile inconclusive remote-read-inconclusive \
-      "the live GitHub signing-key inventory could not be re-read before publication"
-  }
-  node "$generator" verify-github-signing-key \
-    --input "$final_github_keys" \
-    --output-public-key "$final_public_key" || {
-    fail_reconcile blocked_conflict signing-key-policy-changed \
-      "the release signing key was revoked, expired, duplicated, or otherwise changed before publication"
-  }
-  [[ -f "${RUNNER_TEMP:?}/release-signing-public-key.asc" &&
-      ! -L "$RUNNER_TEMP/release-signing-public-key.asc" ]] || {
-    fail_reconcile blocked_conflict signing-key-policy-changed \
-      "the approved release signing certificate is unavailable for final comparison"
-  }
-  cmp -- "$RUNNER_TEMP/release-signing-public-key.asc" "$final_public_key" || {
-    fail_reconcile blocked_conflict signing-key-policy-changed \
-      "the live release signing certificate changed after approval"
-  }
   stable_release_api="$temporary_root/current-release-final-prewrite.json"
   stable_release_error="$temporary_root/current-release-final-prewrite.err"
   if [[ "$release_exists" == true ]]; then
@@ -2823,71 +2835,161 @@ reconcile_test_release() {
   [[ "$actual_test_inventory" == "$expected_test_inventory" ]] || { echo "error: test Release asset inventory differs from policy" >&2; return 1; }
 }
 
+readonly RELEASE_BOUNDARY_REMOTE_UNREADABLE=75
+readonly RELEASE_BOUNDARY_STATE_CHANGED=76
+readonly RELEASE_BOUNDARY_POLICY_MISMATCH=77
+release_boundary_counter=0
 reconcile_github_release() {
   local state asset_names asset name download_dir expected_asset_names
   local latest_before latest_after view_error
   local final_release_api final_confirm_api final_release_identity final_confirm_identity
   local final_asset_snapshot final_confirm_snapshot final_download_dir final_provenance_status
-  local post_publish_release_api
-  local current_boundary before_boundary after_boundary published_boundary pre_alias_immutable
+  local post_publish_release_api publication_payload publication_response publication_error
+  local release_id release_make_latest
+  local current_boundary before_boundary after_boundary published_boundary
   local absent_boundary created_boundary
-  local boundary_counter=0
   local -a missing_assets=()
   expected_release_body="Signed release of $SOURCE_REPOSITORY@$source_commit."
 
-  remote_full_tag_binding() {
-    local lines direct peeled
-    lines="$(target_git ls-remote "$target_url" \
-      "refs/tags/$immutable_tag" "refs/tags/$immutable_tag^{}")" || return 1
-    [[ "$(printf '%s\n' "$lines" | sed '/^$/d' | wc -l | tr -d ' ')" == "2" ]] || return 1
+  read_remote_full_tag_snapshot() {
+    local lines
+    if ! lines="$(target_git ls-remote "$target_url" \
+        "refs/tags/$immutable_tag" "refs/tags/$immutable_tag^{}")"; then
+      return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+    fi
+    printf '%s\n' "$lines" | sed '/^$/d' | LC_ALL=C sort
+  }
+
+  validate_remote_full_tag_snapshot() {
+    local lines="$1"
+    local direct peeled
+    [[ "$(printf '%s\n' "$lines" | sed '/^$/d' | wc -l | tr -d ' ')" == "2" ]] || {
+      echo "error: immutable tag binding is missing or malformed at the Release boundary" >&2
+      return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+    }
     direct="$(printf '%s\n' "$lines" | awk -v ref="refs/tags/$immutable_tag" '$2 == ref {print $1}')"
     peeled="$(printf '%s\n' "$lines" | awk -v ref="refs/tags/$immutable_tag^{}" '$2 == ref {print $1}')"
-    [[ "$direct" == "$full_tag_object" && "$peeled" == "$release_commit" ]] || return 1
+    [[ "$direct" == "$full_tag_object" && "$peeled" == "$release_commit" ]] || {
+      echo "error: immutable tag binding differs from the approved Release boundary" >&2
+      return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+    }
     printf '%s\t%s\n' "$direct" "$peeled"
+  }
+
+  remote_full_tag_binding() {
+    local lines status
+    if lines="$(read_remote_full_tag_snapshot)"; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
+    validate_remote_full_tag_snapshot "$lines"
   }
 
   capture_release_boundary() {
     local label="$1"
     local expected_draft="$2"
     local expected_immutable="$3"
-    local first_api second_api first_snapshot second_snapshot first_tag second_tag
-    boundary_counter=$((boundary_counter + 1))
-    first_api="$temporary_root/release-boundary-${boundary_counter}-${label}-a.json"
-    second_api="$temporary_root/release-boundary-${boundary_counter}-${label}-b.json"
-    publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$first_api" || return 1
-    first_snapshot="$(node "$generator" snapshot-release-boundary \
-      --input "$first_api" \
-      --tag "$immutable_tag" \
-      --body "$expected_release_body" \
-      --prerelease "$prerelease" \
-      --draft "$expected_draft" \
-      --immutable "$expected_immutable")" || return 1
-    first_tag="$(remote_full_tag_binding)" || return 1
-    publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$second_api" || return 1
-    second_snapshot="$(node "$generator" snapshot-release-boundary \
-      --input "$second_api" \
-      --tag "$immutable_tag" \
-      --body "$expected_release_body" \
-      --prerelease "$prerelease" \
-      --draft "$expected_draft" \
-      --immutable "$expected_immutable")" || return 1
-    second_tag="$(remote_full_tag_binding)" || return 1
-    [[ "$first_snapshot" == "$second_snapshot" && "$first_tag" == "$second_tag" ]] || return 1
+    local first_api second_api first_error second_error
+    local first_inventory_input second_inventory_input first_raw second_raw
+    local first_tag_raw second_tag_raw boundary_snapshot validated_tag status
+    release_boundary_counter=$((release_boundary_counter + 1))
+    first_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.json"
+    second_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.json"
+    first_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.err"
+    second_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.err"
+    first_inventory_input="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a-inventory.json"
+    second_inventory_input="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b-inventory.json"
+    if ! publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$first_api" 2> "$first_error"; then
+      cat "$first_error" >&2
+      return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+    fi
+    if first_tag_raw="$(read_remote_full_tag_snapshot)"; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
+    if ! publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$second_api" 2> "$second_error"; then
+      cat "$second_error" >&2
+      return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+    fi
+    if second_tag_raw="$(read_remote_full_tag_snapshot)"; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
+
+    # Compare complete neutral Release and tag projections before applying the
+    # expected publication policy. This preserves a first-valid/second-drift
+    # observation as remote state change instead of misclassifying the newer
+    # snapshot as a stable policy conflict.
+    if ! jq -cS '[[.]]' "$first_api" > "$first_inventory_input" ||
+        ! jq -cS '[[.]]' "$second_api" > "$second_inventory_input" ||
+        ! first_raw="$(node "$generator" snapshot-release-inventory --input "$first_inventory_input")" ||
+        ! second_raw="$(node "$generator" snapshot-release-inventory --input "$second_inventory_input")"; then
+      echo "error: GitHub Release boundary response could not be parsed as a complete canonical snapshot" >&2
+      return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+    fi
+    [[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]] || {
+      return "$RELEASE_BOUNDARY_STATE_CHANGED"
+    }
+
+    if ! boundary_snapshot="$(node "$generator" snapshot-release-boundary \
+        --input "$second_api" \
+        --tag "$immutable_tag" \
+        --body "$expected_release_body" \
+        --prerelease "$prerelease" \
+        --draft "$expected_draft" \
+        --immutable "$expected_immutable")"; then
+      return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+    fi
+    if validated_tag="$(validate_remote_full_tag_snapshot "$second_tag_raw")"; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
     jq -cn \
-      --argjson boundary "$first_snapshot" \
-      --arg object "${first_tag%%$'\t'*}" \
-      --arg commit "${first_tag#*$'\t'}" \
+      --argjson boundary "$boundary_snapshot" \
+      --arg object "${validated_tag%%$'\t'*}" \
+      --arg commit "${validated_tag#*$'\t'}" \
       '$boundary + {tag:{object:$object,commit:$commit}}'
+  }
+
+  fail_release_boundary_capture() {
+    local status="$1"
+    local context="$2"
+    case "$status" in
+      "$RELEASE_BOUNDARY_REMOTE_UNREADABLE")
+        fail_reconcile inconclusive remote-read-inconclusive \
+          "$context could not be read completely; reconcile the same exact source SHA"
+        ;;
+      "$RELEASE_BOUNDARY_STATE_CHANGED")
+        fail_reconcile inconclusive remote-state-changed \
+          "$context changed between two complete canonical remote snapshots; reconcile the same exact source SHA"
+        ;;
+      "$RELEASE_BOUNDARY_POLICY_MISMATCH")
+        fail_reconcile blocked_conflict immutable-release-mismatch \
+          "$context deterministically differs from the approved metadata, author, asset, or tag policy"
+        ;;
+      *)
+        fail_reconcile inconclusive release-boundary-verification-failed \
+          "$context could not be classified safely; inspect the verifier and reconcile the same exact source SHA"
+        ;;
+    esac
   }
 
   capture_absent_release_boundary() {
     local label="$1"
     local first_api second_api first_error second_error first_tag second_tag
-    boundary_counter=$((boundary_counter + 1))
-    first_api="$temporary_root/release-boundary-${boundary_counter}-${label}-a.json"
-    second_api="$temporary_root/release-boundary-${boundary_counter}-${label}-b.json"
-    first_error="$temporary_root/release-boundary-${boundary_counter}-${label}-a.err"
-    second_error="$temporary_root/release-boundary-${boundary_counter}-${label}-b.err"
+    release_boundary_counter=$((release_boundary_counter + 1))
+    first_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.json"
+    second_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.json"
+    first_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.err"
+    second_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.err"
     if publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$first_api" 2> "$first_error"; then
       echo "error: GitHub Release appeared before its draft-create boundary" >&2
       return 1
@@ -2955,12 +3057,11 @@ reconcile_github_release() {
     [[ "$prerelease" == true ]] && create_args+=(--prerelease)
     publisher_gh "${create_args[@]}"
     created_boundary="$(capture_release_boundary post-create true false)" || {
-      echo "error: created draft GitHub Release failed its exact boundary readback" >&2
-      return 1
+      fail_release_boundary_capture "$?" "created draft GitHub Release boundary"
     }
     [[ "$(printf '%s' "$absent_boundary" | jq -Sc .tag)" == "$(printf '%s' "$created_boundary" | jq -Sc .tag)" ]] || {
-      echo "error: immutable tag binding changed during draft creation" >&2
-      return 1
+      fail_reconcile inconclusive remote-state-changed \
+        "immutable tag binding changed during draft creation; reconcile the same exact source SHA"
     }
     current_boundary="$created_boundary"
   fi
@@ -2974,8 +3075,7 @@ reconcile_github_release() {
   [[ "$current_draft" == "false" ]] && current_immutable=true
   if [[ -z "$current_boundary" ]]; then
     current_boundary="$(capture_release_boundary initial "$current_draft" "$current_immutable")" || {
-      echo "error: GitHub Release metadata, author, tag binding, or assets changed at the initial mutation boundary" >&2
-      return 1
+      fail_release_boundary_capture "$?" "initial GitHub Release mutation boundary"
     }
   fi
   asset_names="$(printf '%s' "$current_boundary" | jq -r '.assets[].name')"
@@ -3002,18 +3102,22 @@ reconcile_github_release() {
       missing_assets+=("$asset")
     fi
   done
-  before_boundary="$(capture_release_boundary pre-upload "$current_draft" "$current_immutable")" || return 1
+  before_boundary="$(capture_release_boundary pre-upload "$current_draft" "$current_immutable")" || {
+    fail_release_boundary_capture "$?" "pre-upload GitHub Release boundary"
+  }
   [[ "$before_boundary" == "$current_boundary" ]] || {
-    echo "error: GitHub Release boundary changed before the upload phase" >&2
-    return 1
+    fail_reconcile inconclusive remote-state-changed \
+      "GitHub Release boundary changed before the upload phase; reconcile the same exact source SHA"
   }
   if [[ "${#missing_assets[@]}" -gt 0 ]]; then
     for asset in "${missing_assets[@]}"; do
       name="${asset##*/}"
-      before_boundary="$(capture_release_boundary "before-upload-$name" true false)" || return 1
+      before_boundary="$(capture_release_boundary "before-upload-$name" true false)" || {
+        fail_release_boundary_capture "$?" "GitHub Release boundary before uploading $name"
+      }
       [[ "$before_boundary" == "$current_boundary" ]] || {
-        echo "error: GitHub Release boundary changed before uploading $name" >&2
-        return 1
+        fail_reconcile inconclusive remote-state-changed \
+          "GitHub Release boundary changed before uploading $name; reconcile the same exact source SHA"
       }
       require_publication_mutation release-completion
       publisher_gh release upload "$immutable_tag" "$asset" --repo "$TARGET_REPOSITORY"
@@ -3021,7 +3125,9 @@ reconcile_github_release() {
       mkdir "$download_dir"
       publisher_gh release download "$immutable_tag" --repo "$TARGET_REPOSITORY" --pattern "$name" --dir "$download_dir"
       cmp -- "$asset" "$download_dir/$name" || { echo "error: uploaded release asset failed readback: $name" >&2; return 1; }
-      after_boundary="$(capture_release_boundary "after-upload-$name" true false)" || return 1
+      after_boundary="$(capture_release_boundary "after-upload-$name" true false)" || {
+        fail_release_boundary_capture "$?" "GitHub Release boundary after uploading $name"
+      }
       jq -e -n \
         --arg name "$name" \
         --argjson before "$current_boundary" \
@@ -3030,8 +3136,8 @@ reconcile_github_release() {
          all($before.assets[]; . as $old | any($after.assets[]; . == $old)) and
          ([ $after.assets[] | select(.name == $name) ] | length) == 1 and
          ($after.assets | length) == (($before.assets | length) + 1)' >/dev/null || {
-        echo "error: GitHub Release boundary changed unexpectedly while uploading $name" >&2
-        return 1
+        fail_reconcile inconclusive remote-state-changed \
+          "GitHub Release boundary changed unexpectedly while uploading $name; reconcile the same exact source SHA"
       }
       current_boundary="$after_boundary"
     done
@@ -3044,24 +3150,62 @@ reconcile_github_release() {
     echo "error: GitHub Release has unexpected assets" >&2
     return 1
   }
-  before_boundary="$(capture_release_boundary pre-publish "$current_draft" "$current_immutable")" || return 1
-  [[ "$before_boundary" == "$current_boundary" ]] || {
-    echo "error: GitHub Release boundary changed before publication" >&2
-    return 1
-  }
   if [[ "$current_draft" == "true" ]]; then
     require_publication_mutation release-completion
     require_immutable_release_policy release-publication
     verify_final_policy_fence before-release-publication
-    edit_args=(release edit "$immutable_tag" --repo "$TARGET_REPOSITORY" --draft=false)
-    if [[ "$prerelease" == true ]]; then
-      edit_args+=(--prerelease --latest=false)
-    elif [[ "$preflight_write_eligible" == "true" ]]; then
-      edit_args+=(--latest)
-    else
-      edit_args+=(--latest=false)
+    before_boundary="$(capture_release_boundary pre-publication-mutation true false)" || {
+      fail_release_boundary_capture "$?" "final draft GitHub Release publication boundary"
+    }
+    [[ "$before_boundary" == "$current_boundary" ]] || {
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "the stable final draft GitHub Release identity, author, tag binding, or assets differ from the frozen publication boundary"
+    }
+    release_id="$(printf '%s' "$before_boundary" | jq -er \
+      '.release.id | select(type == "number" and floor == . and . > 0)')" || {
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "the frozen draft GitHub Release has an invalid numeric id"
+    }
+    release_make_latest=false
+    if [[ "$prerelease" == false && "$preflight_write_eligible" == "true" ]]; then
+      release_make_latest=true
     fi
-    publisher_gh "${edit_args[@]}"
+    publication_payload="$temporary_root/release-publication-payload.json"
+    publication_response="$temporary_root/release-publication-response.json"
+    publication_error="$temporary_root/release-publication-response.err"
+    jq -cS -n \
+      --arg tag_name "$immutable_tag" \
+      --arg name "$immutable_tag" \
+      --arg body "$expected_release_body" \
+      --argjson prerelease "$prerelease" \
+      --arg make_latest "$release_make_latest" \
+      '{tag_name:$tag_name,name:$name,body:$body,draft:false,prerelease:$prerelease,make_latest:$make_latest}' \
+      > "$publication_payload"
+    # GitHub's Release PATCH has no compare-and-swap primitive. Keep this
+    # trusted-writer boundary adjacent to the mutation so only the unavoidable
+    # GET-to-PATCH race remains; the strict post-readback still fails closed.
+    if ! publisher_gh api \
+        --method PATCH \
+        --header 'X-GitHub-Api-Version: 2026-03-10' \
+        "repos/$TARGET_REPOSITORY/releases/$release_id" \
+        --input "$publication_payload" > "$publication_response" 2> "$publication_error"; then
+      cat "$publication_error" >&2
+      fail_reconcile inconclusive release-publication-unknown \
+        "the direct GitHub Release publication PATCH failed and may have applied; reconcile the same exact source SHA"
+    fi
+    jq -e --argjson release_id "$release_id" \
+      'type == "object" and .id == $release_id' "$publication_response" >/dev/null 2>&1 || {
+      fail_reconcile inconclusive release-publication-unknown \
+        "the direct GitHub Release publication PATCH response was missing or malformed; reconcile the same exact source SHA"
+    }
+  else
+    before_boundary="$(capture_release_boundary pre-publish false true)" || {
+      fail_release_boundary_capture "$?" "existing immutable GitHub Release pre-publish boundary"
+    }
+    [[ "$before_boundary" == "$current_boundary" ]] || {
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "the stable immutable GitHub Release boundary differs from the frozen publication boundary"
+    }
   fi
   post_publish_release_api="$temporary_root/current-release-post-publish.json"
   publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$post_publish_release_api" || {
@@ -3073,8 +3217,7 @@ reconcile_github_release() {
       "published GitHub Release must report draft=false and immutable=true before alias advancement"
   }
   published_boundary="$(capture_release_boundary post-publish false true)" || {
-    echo "error: published GitHub Release failed the exact immutable boundary readback" >&2
-    return 1
+    fail_release_boundary_capture "$?" "published immutable GitHub Release boundary"
   }
   jq -e -n \
     --argjson before "$current_boundary" \
@@ -3082,20 +3225,20 @@ reconcile_github_release() {
     '($before.release | del(.draft,.immutable)) == ($after.release | del(.draft,.immutable)) and
      $before.assets == $after.assets and $before.tag == $after.tag and
      $after.release.draft == false and $after.release.immutable == true' >/dev/null || {
-    echo "error: GitHub Release identity, author, tag binding, or assets changed during publication" >&2
-    return 1
+    fail_reconcile blocked_conflict immutable-release-mismatch \
+      "published GitHub Release identity, author, tag binding, or assets differ from the frozen draft boundary"
   }
   current_boundary="$published_boundary"
   latest_after="$(read_latest_release_tag after)"
   if [[ "$preflight_write_eligible" == "true" && "$prerelease" != "true" ]]; then
     [[ "$latest_after" == "$immutable_tag" ]] || {
-      echo "error: fresh stable release did not become the latest GitHub Release" >&2
-      return 1
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "fresh stable release did not become the latest GitHub Release"
     }
   else
     [[ "$latest_after" == "$latest_before" ]] || {
-      echo "error: stale or prerelease completion changed the latest GitHub Release" >&2
-      return 1
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "stale or prerelease completion changed the latest GitHub Release"
     }
   fi
 
@@ -3104,12 +3247,11 @@ reconcile_github_release() {
   # bytes and signed provenance, then prove the API snapshot stayed stable
   # across that verification. Asset names alone cannot detect replacement.
   final_boundary="$(capture_release_boundary final-immutable false true)" || {
-    fail_reconcile inconclusive remote-read-inconclusive \
-      "immutable GitHub Release boundary could not be captured before alias advancement"
+    fail_release_boundary_capture "$?" "immutable GitHub Release boundary before final verification"
   }
   [[ "$final_boundary" == "$current_boundary" ]] || {
-    fail_reconcile inconclusive remote-state-changed \
-      "immutable GitHub Release identity, author, tag binding, or assets changed before final verification"
+    fail_reconcile blocked_conflict immutable-release-mismatch \
+      "the stable immutable GitHub Release identity, author, tag binding, or assets differ from the frozen published boundary"
   }
   final_release_api="$temporary_root/current-release-final-immutable.json"
   publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$final_release_api" || {
@@ -3183,40 +3325,16 @@ reconcile_github_release() {
       "immutable GitHub Release could not be re-read after asset verification"
   }
   final_confirm_boundary="$(capture_release_boundary final-confirm false true)" || {
-    fail_reconcile inconclusive remote-read-inconclusive \
-      "immutable GitHub Release boundary could not be captured after asset verification"
+    fail_release_boundary_capture "$?" "immutable GitHub Release boundary after asset verification"
   }
   final_confirm_identity="$(printf '%s' "$final_confirm_boundary" | jq -Sc .release)"
   final_confirm_snapshot="$(printf '%s' "$final_confirm_boundary" | jq -Sc .assets)"
   [[ "$final_confirm_boundary" == "$final_boundary" &&
       "$final_confirm_identity" == "$final_release_identity" &&
       "$final_confirm_snapshot" == "$final_asset_snapshot" ]] || {
-    fail_reconcile inconclusive remote-state-changed \
-      "immutable GitHub Release metadata or asset identity changed during final verification"
+    fail_reconcile blocked_conflict immutable-release-mismatch \
+      "the stable immutable GitHub Release metadata or asset identity differs from the frozen final-verification boundary"
   }
-  if [[ -n "$major_alias" ]]; then
-    # Independently confirm the server-side immutable bit immediately before
-    # the final canonical pre-alias snapshot. The following full snapshot must
-    # therefore detect any same-name asset replacement racing immediately
-    # after this narrow read, rather than advancing the alias from stale bytes.
-    if ! pre_alias_immutable="$(publisher_gh api \
-        "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" --jq .immutable)"; then
-      fail_reconcile inconclusive remote-read-inconclusive \
-        "immutable GitHub Release state could not be read immediately before alias mutation"
-    fi
-    [[ "$pre_alias_immutable" == "true" ]] || {
-      fail_reconcile inconclusive remote-state-changed \
-        "GitHub Release no longer reports immutable immediately before alias mutation"
-    }
-    pre_alias_boundary="$(capture_release_boundary pre-alias false true)" || {
-      fail_reconcile inconclusive remote-read-inconclusive \
-        "immutable GitHub Release boundary could not be captured immediately before alias mutation"
-    }
-    [[ "$pre_alias_boundary" == "$final_confirm_boundary" ]] || {
-      fail_reconcile inconclusive remote-state-changed \
-        "immutable GitHub Release identity, author, tag binding, or assets changed before alias mutation"
-    }
-  fi
 }
 
 if [[ -n "$test_release_dir" ]]; then
@@ -3226,45 +3344,91 @@ else
 fi
 
 if [[ -n "$major_alias" ]]; then
-  remote_alias_binding() {
-    local lines direct peeled
-    lines="$(target_git ls-remote "$target_url" \
-      "refs/tags/$major_alias" "refs/tags/$major_alias^{}")" || return 1
+  if [[ -z "$test_release_dir" ]]; then
+    pre_alias_boundary="$final_confirm_boundary"
+  fi
+  read_remote_alias_snapshot() {
+    local lines
+    if ! lines="$(target_git ls-remote "$target_url" \
+        "refs/tags/$major_alias" "refs/tags/$major_alias^{}")"; then
+      return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+    fi
+    printf '%s\n' "$lines" | sed '/^$/d' | LC_ALL=C sort
+  }
+  validate_remote_alias_snapshot() {
+    local lines="$1"
+    local line object ref direct="" peeled="" count=0
     if [[ -z "$lines" ]]; then
       printf 'absent\n'
       return 0
     fi
-    [[ "$(printf '%s\n' "$lines" | sed '/^$/d' | wc -l | tr -d ' ')" == "2" ]] || return 1
-    direct="$(printf '%s\n' "$lines" | awk -v ref="refs/tags/$major_alias" '$2 == ref {print $1}')"
-    peeled="$(printf '%s\n' "$lines" | awk -v ref="refs/tags/$major_alias^{}" '$2 == ref {print $1}')"
-    [[ "$direct" =~ ^[0-9a-f]{40}$ && "$peeled" =~ ^[0-9a-f]{40}$ ]] || return 1
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      count=$((count + 1))
+      [[ "$line" == *$'\t'* ]] || return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+      object="${line%%$'\t'*}"
+      ref="${line#*$'\t'}"
+      [[ "$ref" != *$'\t'* && "$object" =~ ^[0-9a-f]{40}$ ]] || {
+        return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+      }
+      case "$ref" in
+        "refs/tags/$major_alias")
+          [[ -z "$direct" ]] || return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+          direct="$object"
+          ;;
+        "refs/tags/$major_alias^{}")
+          [[ -z "$peeled" ]] || return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+          peeled="$object"
+          ;;
+        *)
+          return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+          ;;
+      esac
+    done <<< "$lines"
+    [[ "$count" == "2" && -n "$direct" && -n "$peeled" ]] || {
+      return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+    }
     printf '%s\t%s\n' "$direct" "$peeled"
   }
   if [[ "$alias_needs_push" == true ]]; then
-    alias_boundary_before_a="$(remote_alias_binding)" || {
+    alias_raw_before_a="$(read_remote_alias_snapshot)" || {
       fail_reconcile inconclusive remote-read-inconclusive \
-        "floating alias binding could not be read immediately before mutation"
+        "floating alias raw binding could not be read immediately before mutation"
     }
-    alias_boundary_before_b="$(remote_alias_binding)" || {
+    alias_raw_before_b="$(read_remote_alias_snapshot)" || {
       fail_reconcile inconclusive remote-read-inconclusive \
-        "floating alias binding could not be confirmed immediately before mutation"
+        "floating alias raw binding could not be confirmed immediately before mutation"
     }
-    [[ "$alias_boundary_before_a" == "$alias_boundary_before_b" ]] || {
+    [[ "$alias_raw_before_a" == "$alias_raw_before_b" ]] || {
       fail_reconcile inconclusive remote-state-changed \
-        "floating alias binding changed immediately before mutation"
+        "floating alias raw binding changed immediately before mutation"
+    }
+    alias_boundary_before="$(validate_remote_alias_snapshot "$alias_raw_before_b")" || {
+      fail_reconcile blocked_conflict malformed-major-alias-target \
+        "stable floating alias binding is malformed or is not an annotated tag immediately before mutation"
     }
     if [[ "$alias_before" == "none" ]]; then
-      [[ "$alias_boundary_before_a" == "absent" ]] || {
+      [[ "$alias_boundary_before" == "absent" ]] || {
         fail_reconcile inconclusive remote-state-changed \
           "floating alias appeared immediately before creation"
       }
     else
-      [[ "$alias_boundary_before_a" == "$alias_before"$'\t'"$old_alias_commit" ]] || {
+      [[ "$alias_boundary_before" == "$alias_before"$'\t'"$old_alias_commit" ]] || {
         fail_reconcile inconclusive remote-state-changed \
           "floating alias direct object or target changed immediately before update"
       }
     fi
     require_publication_mutation alias
+    require_immutable_release_policy alias-mutation
+    if [[ -z "$test_release_dir" ]]; then
+      pre_alias_boundary="$(capture_release_boundary pre-alias-mutation false true)" || {
+        fail_release_boundary_capture "$?" "final immutable GitHub Release boundary before alias mutation"
+      }
+      [[ "$pre_alias_boundary" == "$final_confirm_boundary" ]] || {
+        fail_reconcile blocked_conflict immutable-release-mismatch \
+          "the stable immutable GitHub Release identity, author, tag binding, or assets differ from the frozen pre-alias boundary"
+      }
+    fi
     if [[ "$alias_mode" == "force-with-lease" ]]; then
       target_git_push --force-with-lease="refs/tags/$major_alias:$alias_before" \
         "refs/tags/$major_alias:refs/tags/$major_alias"
@@ -3272,28 +3436,34 @@ if [[ -n "$major_alias" ]]; then
       target_git_push "refs/tags/$major_alias:refs/tags/$major_alias"
     fi
   fi
-  alias_boundary_after_a="$(remote_alias_binding)" || {
+  alias_raw_after_a="$(read_remote_alias_snapshot)" || {
     fail_reconcile inconclusive remote-read-inconclusive \
-      "floating alias binding could not be read after reconcile"
+      "floating alias raw binding could not be read after reconcile"
   }
-  alias_boundary_after_b="$(remote_alias_binding)" || {
+  alias_raw_after_b="$(read_remote_alias_snapshot)" || {
     fail_reconcile inconclusive remote-read-inconclusive \
-      "floating alias binding could not be confirmed after reconcile"
+      "floating alias raw binding could not be confirmed after reconcile"
   }
-  [[ "$alias_boundary_after_a" == "$alias_boundary_after_b" &&
-      "$alias_boundary_after_a" == "$planned_alias_object"$'\t'"$planned_alias_commit" ]] || {
+  [[ "$alias_raw_after_a" == "$alias_raw_after_b" ]] || {
     fail_reconcile inconclusive remote-state-changed \
-      "floating alias direct object or target differs from the approved transition"
+      "floating alias raw binding changed between post-mutation readbacks"
+  }
+  alias_boundary_after="$(validate_remote_alias_snapshot "$alias_raw_after_b")" || {
+    fail_reconcile blocked_conflict malformed-major-alias-target \
+      "stable floating alias binding is malformed or is not an annotated tag after reconcile"
+  }
+  [[ "$alias_boundary_after" == "$planned_alias_object"$'\t'"$planned_alias_commit" ]] || {
+    fail_reconcile blocked_conflict malformed-major-alias-target \
+      "stable floating alias direct object or target differs from the approved transition"
   }
   remote_alias_object="$planned_alias_object"
   if [[ -z "$test_release_dir" ]]; then
     post_alias_boundary="$(capture_release_boundary post-alias false true)" || {
-      fail_reconcile inconclusive remote-read-inconclusive \
-        "immutable GitHub Release boundary could not be captured after alias reconcile"
+      fail_release_boundary_capture "$?" "immutable GitHub Release boundary after alias reconcile"
     }
     [[ "$post_alias_boundary" == "$pre_alias_boundary" ]] || {
-      fail_reconcile inconclusive remote-state-changed \
-        "immutable GitHub Release identity, assets, or full-tag binding changed during alias reconcile"
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "the stable immutable GitHub Release identity, assets, or full-tag binding differ from the frozen alias-mutation boundary"
     }
   fi
   if ! is_test_environment; then

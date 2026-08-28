@@ -249,6 +249,15 @@ signing fingerprints, performs a fixed sign/verify probe, and destroys the
 keyring afterward. Public encryption-only subkey metadata is harmless; another
 usable secret signing, encryption, or authentication subkey is rejected.
 
+The current signer inventory is a live access-policy and content boundary. It
+binds the pinned primary fingerprint, pinned signing-subkey fingerprint, and
+exact raw public certificate; it deliberately does not bind a GitHub GPG-key
+REST object ID. Every durable mutation fence must re-read and revalidate that
+live primary/subkey/certificate tuple, especially the final immutable-Release
+publication fence. A persistent GitHub verification result on an existing
+commit or tag proves that object's signature state; it does not substitute for
+proof that the pinned signer is still present in the current account inventory.
+
 The just-in-time token is proved, before the first write, to belong to the
 expected Publisher App installation and sole target repository. The target
 rulesets then admit that App as the only publication bypass identity. The GPG
@@ -371,6 +380,20 @@ re-reads live source `master` to determine
 whether target writes remain eligible. `publish` then repeats the target-head,
 ruleset, existing-tag, and existing-Release checks and follows this order:
 
+At every durable mutation fence, the governing source, ruleset, and current-
+signer policy reads complete before the final exact object boundary for that
+mutation. Immutable-Release policy is checked at the first mutation and then
+freshly re-read at the two applicable critical irreversible fences: immutable-
+Release publication and major-alias mutation. The cached first-mutation policy
+result is not proof of the policy at either later fence. In particular,
+immediately before publishing an immutable Release, the publisher first
+completes its source/ruleset/current-signer fence and explicit immutable-
+Release-policy re-read, then performs one final exact read of the frozen draft
+Release ID, its complete asset inventory, and its tag binding. It then addresses
+that frozen Release ID with a direct REST `PATCH` carrying the exact intended
+metadata. It must not use `gh release edit`, whose convenience implementation
+may perform a hidden read after the publisher's final boundary.
+
 1. Construct and locally verify the signed, single-parent wrapper commit.
 2. Fast-forward target `master` without force, then re-read its exact commit,
    parent, tree, and GitHub signature result. This proves the accepted Git
@@ -383,17 +406,69 @@ ruleset, existing-tag, and existing-Release checks and follows this order:
    result. Publisher identity is bound before the first write from the minted
    token's actual App slug and installation ID, target scope, and effective
    rulesets.
-4. Create or resume a draft GitHub Release for the full tag. Upload release
-   assets, canonical provenance, checksums, and the detached provenance
-   signature.
-5. Re-read the draft tag binding and every asset byte/digest, then publish the
-   Release under the repository's immutable-release policy and verify the
+4. Create or resume a draft GitHub Release for the full tag. Freeze its Release
+   ID, upload release assets, canonical provenance, checksums, and the detached
+   provenance signature.
+5. Complete the governing policy reads, then perform the final exact draft
+   Release, asset, and tag boundary described above. Publish by directly
+   patching the frozen Release ID with the exact metadata, then verify the
    immutable published Release.
-6. For a stable version only, create a signed annotated floating major tag such
-   as `v2` and update it with an exact lease on the previously observed tag
-   object. The alias may move only forward through version history.
-7. Re-read the alias. A prerelease stops before this step and never changes
-   `v2`.
+6. For a stable version only, collect neutral canonical raw observations A and
+   B of the live alias binding and compare them before interpreting tag shape
+   or expected policy. Only after A equals B, validate an absent creation
+   boundary or an annotated direct/peeled binding and bind the exact previously
+   observed tag object as the update lease. Then run the final
+   source/ruleset/current-signer policy fence, explicitly re-read immutable-
+   Release policy, and capture a fresh exact immutable Release/asset/full-tag
+   boundary. Then create the signed annotated floating major tag such as `v2`,
+   or update it with the exact lease. The alias may move only forward through
+   version history.
+7. Collect and compare neutral canonical raw post-mutation alias observations A
+   and B. A difference is `inconclusive` / `remote-state-changed`. When A equals
+   B, validate that the stable binding is an annotated tag with the exact
+   planned direct object and peeled commit; a malformed or lightweight tag, or
+   a different stable binding, is `blocked_conflict` /
+   `malformed-major-alias-target`. Then re-read the immutable
+   Release/asset/full-tag boundary and require it to match the pre-alias
+   boundary. A prerelease stops before alias mutation and never changes `v2`.
+
+At either pre- or post-mutation alias boundary, an unreadable command or
+canonical raw projection is `inconclusive` / `remote-read-inconclusive`.
+
+Each exact Release boundary is likewise raw-first A/B. It obtains two neutral
+canonical observations of the Release API response and immutable full-tag
+`ls-remote` binding, compares those observations, and only after they are
+stable performs structural and expected-policy validation. Its closed
+classification is:
+
+- an unreadable API, `ls-remote`, or canonical raw projection is
+  `inconclusive` / `remote-read-inconclusive`;
+- raw observations A and B that differ are
+  `inconclusive` / `remote-state-changed`; and
+- a stable but malformed or lightweight tag, or stable Release metadata,
+  author, asset, tag, frozen-draft, or planned-state mismatch, is
+  `blocked_conflict` / `immutable-release-mismatch`.
+
+This raw-first order is intentional: validating either observation against
+expected policy before comparing A and B could disguise a stable wrong state
+as a transient read failure.
+
+GitHub's official Release REST endpoint exposes no supported conditional
+compare-and-swap precondition for this `PATCH`; the publisher does not rely on
+undocumented conditional headers. Consequently, the small interval between
+the final draft/asset/tag read and the publish `PATCH` cannot be eliminated by
+the client. Workflow concurrency serializes publisher runs but cannot serialize
+an independent Release writer. The deployment contract therefore makes the
+private Publisher App the only automated Release writer and treats
+`JoeyTeng`, the repository owner, as the explicit trusted manual writer. Any
+other concurrent Release writer violates the deployment contract. If
+post-publication readback detects a mismatch, publication remains blocked and
+must not claim automatic recovery. A nonzero direct `PATCH`, lost response, or
+malformed response is `inconclusive` / `release-publication-unknown`, because
+the mutation may have applied. Reconcile must retry the same exact source and
+prove either that the frozen draft remains unchanged or that the exact Release
+is already immutable; it must not blindly choose a different version. A
+deterministic post-publication mismatch remains blocked.
 
 There is no `v2.0` alias in this contract. A floating alias does not receive a
 separate GitHub Release; Releases belong only to immutable full-version tags.
@@ -487,8 +562,9 @@ transaction. Every privileged retry begins with a full reconcile of:
 - current target `master` and its ancestry;
 - the intended wrapper commit and full tag object;
 - draft or published Release state and every asset digest;
-- the floating alias for stable releases; and
-- effective branch and tag rulesets.
+- the floating alias for stable releases;
+- effective branch and tag rulesets; and
+- the current pinned signer primary/subkey/raw-certificate inventory.
 
 Reconcile returns exactly one remote-state class: `fresh`,
 `resumable_partial`, `already_complete`, `superseded`, `blocked_conflict`, or

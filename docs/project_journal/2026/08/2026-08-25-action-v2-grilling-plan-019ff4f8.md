@@ -2293,6 +2293,81 @@ superseded_by:
   the stable-v2 safety contract. Dedicated runtime/merge identity and stable-v2
   deferral are not adopted for this node.
 
+## Delayed Release Review And Final Mutation Fences
+
+- A delayed late-review result arrived after RC release-intent PR #35 had been
+  opened and exposed two P1 publication-boundary findings. PR #35 was converted
+  back to Draft so the infrastructure fixes land first. No RC tag, target
+  update, GitHub Release, asset, or floating alias was published from #35.
+- The first adopted correction treats the current signer inventory as live
+  access-policy and content evidence: it binds the pinned primary fingerprint,
+  pinned signing-subkey fingerprint, and exact raw public certificate, but not
+  a GitHub GPG-key REST object ID. Every durable mutation fence must revalidate
+  that live tuple, especially immutable Release publication. An existing
+  GitHub persistent verification result cannot replace current-inventory
+  proof.
+  - Explicit reason: historical signature verification and current signer
+    authorization are different protected properties.
+- The second adopted correction requires every governing source, ruleset,
+  immutable-Release, and current-signer policy read to complete before the
+  final exact draft-Release/asset/tag boundary. The publisher then uses the
+  frozen Release ID with a direct REST `PATCH` carrying exact metadata; it must
+  not use `gh release edit`, whose convenience implementation may insert a
+  hidden read after that boundary.
+  - Explicit reason: the final object snapshot must be the last read boundary
+    before publication rather than being invalidated by an implicit helper
+    lookup.
+- The landed fence shape distinguishes ordinary mutations from the two
+  critical irreversible Release/alias boundaries. Every durable mutation
+  revalidates source, rulesets, and the current signer. Immutable-Release policy
+  is cached after the first-mutation check for ordinary work, but that cached
+  result is explicitly insufficient at Release publication and alias mutation;
+  each of those fences performs a fresh policy read.
+- Alias mutation now follows one exact order: lease-protected alias binding
+  raw-first A/B double-read; final source/ruleset/current-signer policy fence;
+  explicit immutable-Release-policy re-read; fresh exact immutable
+  Release/asset/full-tag boundary; alias push; and exact post-alias binding plus
+  Release-boundary readback. This prevents an early policy observation from
+  being represented as proof of the policy at the later alias mutation.
+- Both Release and alias boundaries are raw-first A/B: they first capture and
+  neutrally canonicalize both raw observations, compare A with B, and only then
+  apply structural and expected-policy validation. An unreadable command or
+  canonical projection is `inconclusive` / `remote-read-inconclusive`; A/B
+  drift is `inconclusive` / `remote-state-changed`; and a stable malformed,
+  lightweight, wrong-frozen, or wrong-planned Release state is
+  `blocked_conflict` / `immutable-release-mismatch`.
+  - Explicit reason: validating one observation before the raw A/B comparison
+    can disguise a stable wrong state as a transient read failure.
+- For alias post-write specifically, raw A different from raw B is
+  `inconclusive` / `remote-state-changed`. Stable A equal to B but not an
+  annotated tag with the exact planned direct object and peeled commit is
+  `blocked_conflict` / `malformed-major-alias-target`.
+- GitHub's official Release REST endpoint has no supported conditional
+  compare-and-swap precondition for the publish `PATCH`. The resulting small
+  GET-to-PATCH concurrent-asset window cannot be removed by this client.
+  Workflow concurrency serializes publisher runs, the private Publisher App is
+  the only automated Release writer, and `JoeyTeng` is the explicitly trusted
+  manual writer. Any other concurrent Release writer violates the deployment
+  contract. A post-publication mismatch blocks the release and must not be
+  represented as automatically recoverable.
+- A nonzero direct publication `PATCH`, missing response, or malformed response
+  is `inconclusive` / `release-publication-unknown`: the request may have
+  applied. Recovery reconciles the same exact source and proves either that the
+  frozen draft is unchanged or that the exact Release is already immutable; it
+  does not blindly advance to another version. A deterministic post-readback
+  mismatch remains blocked.
+- Validation state: the implementation, bilingual documentation, and focused
+  regression fixes are complete on the frozen working tree. Focused coverage
+  passed for direct stable/RC publication, raw-first Release and alias A/B
+  classification, deterministic frozen-boundary conflicts, immutable-policy
+  and signer fences, publication response ambiguity with exact-source
+  recovery, and post-write alias validation. `bash -n`, ShellCheck 0.11,
+  `npm run check`, the 39-test workflow-security contract, `git diff --check`,
+  and project-journal validation passed. The complete serialized repository
+  suite then passed 794/794 with exit status zero. This checkpoint does not yet
+  claim a signed landing commit or the fresh exact-head review; both remain
+  required before PR #35 can leave Draft or any publication can resume.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -2336,10 +2411,12 @@ superseded_by:
 - Run the already specified hidden-marker canary and live
   publisher/runner/Environment preflights as execution evidence; they are not
   remaining grilling choices.
-- Satisfy infrastructure PR #34's CI, review, and merge-readiness gates without
-  involving PR #32.
-- After the infrastructure PR merges, create the separate release-intent PR and
-  execute the approved publisher workflow through RC and stable `v2.0.0`.
+- Keep RC release-intent PR #35 in Draft while the two delayed-review P1
+  infrastructure findings are fixed, validated, signed, reviewed, and landed;
+  do not involve PR #32.
+- After the corrected infrastructure lands, revalidate and return the separate
+  release-intent PR to the normal approval path, then execute the approved
+  publisher workflow through RC and stable `v2.0.0`.
   Verify immutable refs, Release/assets, signatures, and floating alias before
   carrying out the explicitly selected consumer migrations and canaries.
   Marketplace publication remains the separate stable-major manual checklist
