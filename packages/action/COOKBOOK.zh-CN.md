@@ -338,10 +338,25 @@ installation PR merge 后：
 6. 激活已验证 ruleset，并精确读回完整 Active policy；
 7. 直到第 6 步完成，每次 stage/activation preview 与 apply 都必须显式传入同一个
    owner-approved digest，即使 helper invocations 位于不同 process；
-8. 只有之后才执行另行授权的 legacy cleanup；cleanup 会改变旧 digest，因此使用不携带该
-   digest 的只读 `--verify-post-cleanup`，同时证明两个 legacy surfaces 均已清空，且 v2
-   仍是同一完整 Active policy；
-9. 不 merge，直接关闭 canary PR。
+8. 只有之后才对完整 pre-cleanup security snapshot 运行只读
+   `--derive-post-cleanup-plan`，传入同一个 external owner-approved legacy-inventory digest，
+   参数名为 `--expected-legacy-inventory-sha256`，并要求 current pre-state 匹配；审阅
+   canonical plan，确认它只删除
+   `codex/review-gate`；status rule 变空时可删除该 rule，ruleset 只有在不剩其他 rule 时才可
+   删除；emptied classic required-status policy 也可消失；这些是唯一 structural
+   exceptions。要求精确保留 repository/default head、workflow/CODEOWNERS inventory、owner
+   permission、surviving classic policy 的全部 fields/non-legacy checks（包括
+   `strict`/`app_id`），以及每个 retained ruleset 的 identity、conditions、bypass actors 与
+   unrelated rules；记录
+   `expected_post_cleanup_security_sha256`；
+9. 执行另行授权的 legacy cleanup，再运行只读
+   `--verify-post-cleanup --expected-post-cleanup-security-sha256 <digest>`；要求两轮相同的
+   完整 security snapshot 都匹配 external digest、两个 legacy surfaces 均 clear，且 v2
+   仍是同一 complete Active policy；
+10. 不 merge，关闭 canary PR，验证已记录的 head repository/ref/OID，并只 lease-delete
+    仍精确匹配的 temporary ref。
 
 canary 失败时，通过普通 forward Git history 修复。不要把 `v2` release alias 向后
-移动，也不要削弱 ruleset 来制造 pass。
+移动，也不要削弱 ruleset 来制造 pass。v2 一旦写为 Active，cleanup 或 verification
+inconclusive 时也要保持 Active，只运行 read-only diagnostics；不得因此 disable 或
+rollback。

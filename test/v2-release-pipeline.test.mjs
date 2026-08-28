@@ -577,6 +577,28 @@ function replaceAliasWithNestedTag(state, alias, fullTag) {
   return object;
 }
 
+function createReplacementAliasObject(state, alias) {
+  const work = join(state.root, `replacement-${alias}`);
+  run("git", ["clone", "-q", state.target, work]);
+  git(work, ["config", "user.name", "JoeyTeng-Codex"]);
+  git(work, ["config", "user.email", "codex@mahane.me"]);
+  const commit = git(work, ["rev-parse", `refs/tags/${alias}^{}`]);
+  git(work, ["tag", "-d", alias]);
+  execFileSync(
+    "git",
+    ["-C", work, "tag", "-a", alias, commit, "-m", `Codex Review Gate Action ${alias}`],
+    {
+      env: { ...executionEnv, GIT_COMMITTER_DATE: "2031-01-02T03:04:05Z" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const object = git(work, ["rev-parse", `refs/tags/${alias}`]);
+  assert.notEqual(object, git(state.target, ["rev-parse", `refs/tags/${alias}`]));
+  assert.equal(git(work, ["rev-parse", `refs/tags/${alias}^{}`]), commit);
+  git(state.target, ["fetch", "-q", work, object]);
+  return { commit, object };
+}
+
 function fakeGithubEnvironment(state, mutationPhase) {
   const fakeBin = join(state.root, `fake-gh-${mutationPhase}`);
   const fakeGh = join(fakeBin, "gh");
@@ -1072,7 +1094,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   }
   assert.equal(
     (workflow.match(/\bgh api --hostname github\.com\b/gu) ?? []).length,
-    2,
+    4,
     "every direct workflow gh API call must bind github.com explicitly",
   );
   assert.doesNotMatch(
@@ -1727,6 +1749,102 @@ test("public verification emits one closed recovery tuple for success and key fa
   assert.match(unreadable.stderr, /verification_state=inconclusive/u);
   assert.match(unreadable.stderr, /recovery_code=release-api-unreadable/u);
   assert.match(unreadable.stderr, /next_action=retry-public-verification/u);
+});
+
+test("public verification rejects a rolled-back alias behind the highest complete stable release", (t) => {
+  const state = fixture(t);
+  const old = buildAssembledCandidate(state, { label: "public-highest-stable-old" });
+  publishCandidate(state, old);
+  const oldCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+
+  advanceIntent(state, "2.1.0", oldCommit, "2.0.0");
+  const middle = buildAssembledCandidate(state, { label: "public-highest-stable-middle" });
+  publishCandidate(state, middle);
+  const middleCommit = git(state.target, ["rev-parse", "refs/tags/v2.1.0^{}"]);
+  const middleAliasObject = git(state.target, ["rev-parse", "refs/tags/v2"]);
+
+  advanceIntent(state, "2.2.0", middleCommit, "2.1.0");
+  const highest = buildAssembledCandidate(state, { label: "public-highest-stable-highest" });
+  publishCandidate(state, highest);
+  const highestCommit = git(state.target, ["rev-parse", "refs/tags/v2.2.0^{}"]);
+  git(state.target, ["update-ref", "refs/tags/v2", middleAliasObject]);
+
+  const result = invokeVerifyPublished(state, old);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /verification_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(result.stderr, /highest complete stable release v2\.2\.0/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), highestCommit);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), middleCommit);
+});
+
+test("public verification requires a later alias Release to pass complete asset and provenance validation", (t) => {
+  const state = fixture(t);
+  const old = buildAssembledCandidate(state, { label: "public-strong-later-old" });
+  publishCandidate(state, old);
+  const oldCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+
+  advanceIntent(state, "2.1.0", oldCommit, "2.0.0");
+  const later = buildAssembledCandidate(state, { label: "public-strong-later-new" });
+  publishCandidate(state, later);
+  const laterArchive = join(
+    state.releases,
+    "v2.1.0",
+    "codex-review-gate-action-v2.1.0.tar.gz",
+  );
+  writeFileSync(laterArchive, Buffer.concat([
+    readFileSync(laterArchive),
+    Buffer.from("tampered-after-publication\n"),
+  ]));
+
+  const result = invokeVerifyPublished(state, old);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /verification_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(result.stderr, /later stable tag v2\.1\.0 is not a complete immutable release/u);
+});
+
+test("public verification binds the floating alias annotated-tag object across clone and readback", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "public-alias-object-binding" });
+  publishCandidate(state, built);
+  const originalAliasObject = git(state.target, ["rev-parse", "refs/tags/v2"]);
+  const { commit, object: replacementAliasObject } = createReplacementAliasObject(state, "v2");
+  const fakeBin = join(state.root, "public-alias-object-binding-bin");
+  const fakeGit = join(fakeBin, "git");
+  const mutationMarker = join(state.root, "public-alias-object-binding-mutated");
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+is_clone=false
+for argument in "$@"; do
+  [ "$argument" = clone ] && is_clone=true
+done
+"$REAL_GIT" "$@"
+if [ "$is_clone" = true ] && [ ! -e "$MUTATION_MARKER" ]; then
+  "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref refs/tags/v2 "$REPLACEMENT_ALIAS_OBJECT"
+  : > "$MUTATION_MARKER"
+fi
+`);
+  chmodSync(fakeGit, 0o755);
+
+  const result = invokeVerifyPublished(state, built, {
+    env: {
+      MUTATION_MARKER: mutationMarker,
+      MUTATION_TARGET: state.target,
+      PATH: `${fakeBin}:${executionEnv.PATH}`,
+      REAL_GIT: run("which", ["git"]),
+      REPLACEMENT_ALIAS_OBJECT: replacementAliasObject,
+    },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /verification_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(result.stderr, /complete target tag namespace changed/u);
+  assert.equal(existsSync(mutationMarker), true);
+  assert.notEqual(replacementAliasObject, originalAliasObject);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2"]), replacementAliasObject);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), commit);
 });
 
 test("public verification treats a missing later alias Release as a deterministic conflict", (t) => {

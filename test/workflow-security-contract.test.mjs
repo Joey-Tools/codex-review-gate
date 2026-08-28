@@ -13,7 +13,10 @@ import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { canonicalLegacyReviewGateInventoryBytes } from "../src/bootstrap.mjs";
+import {
+  canonicalLegacyReviewGateInventoryBytes,
+  validateCanonicalV2ControllerWorkflowContent,
+} from "../src/bootstrap.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const actionPath = join(repoRoot, "packages/action/action.yml");
@@ -1467,7 +1470,7 @@ test("installation runbooks inventory rulesets and classic legacy contexts", () 
   }
 });
 
-test("installation runbooks bind pre-cleanup remote writes and use a digest-free final closure probe", () => {
+test("installation runbooks derive and verify one explicit post-cleanup security state", () => {
   for (const [name, guide] of Object.entries(installGuides)) {
     assert.match(
       guide,
@@ -1477,8 +1480,8 @@ test("installation runbooks bind pre-cleanup remote writes and use a digest-free
     const remoteCommands = bootstrapRemoteCommands(guide);
     assert.equal(
       remoteCommands.length,
-      5,
-      `${name}: expected stage preview/apply, activation preview/apply, and final probe`,
+      6,
+      `${name}: expected stage preview/apply, activation preview/apply, cleanup-plan derivation, and final probe`,
     );
     for (const { text } of remoteCommands) {
       assert.match(
@@ -1493,9 +1496,16 @@ test("installation runbooks bind pre-cleanup remote writes and use a digest-free
     );
     assert.equal(finalProbes.length, 1, `${name}: one explicit post-cleanup probe`);
     const [finalProbe] = finalProbes;
-    const preCleanup = remoteCommands.filter((command) => command !== finalProbe);
-    assert.equal(preCleanup.length, 4, `${name}: four pre-cleanup remote commands`);
-    for (const { text } of preCleanup) {
+    const deriveCommands = remoteCommands.filter(({ text }) =>
+      text.includes("--derive-post-cleanup-plan"),
+    );
+    assert.equal(deriveCommands.length, 1, `${name}: one pre-cleanup derivation`);
+    const [deriveCommand] = deriveCommands;
+    const preCleanupWrites = remoteCommands.filter(
+      (command) => command !== finalProbe && command !== deriveCommand,
+    );
+    assert.equal(preCleanupWrites.length, 4, `${name}: four pre-cleanup remote write commands`);
+    for (const { text } of [...preCleanupWrites, deriveCommand]) {
       assert.equal(
         (text.match(/--expected-legacy-inventory-sha256/gu) ?? []).length,
         1,
@@ -1509,25 +1519,34 @@ test("installation runbooks bind pre-cleanup remote writes and use a digest-free
       assert.doesNotMatch(text, /--verify-post-cleanup/u, name);
     }
     assert.equal(
-      preCleanup.filter(({ text }) => text.includes("--activate")).length,
+      preCleanupWrites.filter(({ text }) => text.includes("--activate")).length,
       2,
       `${name}: activation preview and apply`,
     );
     assert.equal(
-      preCleanup.filter(({ text }) => text.includes("--apply")).length,
+      preCleanupWrites.filter(({ text }) => text.includes("--apply")).length,
       2,
       `${name}: staging and activation apply`,
     );
     assert.doesNotMatch(
-      finalProbe.text,
-      /--expected-legacy-inventory-sha256|LEGACY_INVENTORY_SHA256|--apply|--activate/u,
-      `${name}: post-cleanup closure must not replay the stale digest or mutate`,
+      deriveCommand.text,
+      /--apply|--activate|--verify-post-cleanup/u,
+      `${name}: derivation must remain read-only and pre-cleanup`,
     );
-    const lastPreCleanupEnd = Math.max(...preCleanup.map(({ end }) => end));
+    assert.doesNotMatch(
+      finalProbe.text,
+      /--expected-legacy-inventory-sha256|LEGACY_INVENTORY_SHA256|--apply|--activate|--derive-post-cleanup-plan/u,
+      `${name}: post-cleanup closure must not replay the stale legacy digest or mutate`,
+    );
     assert.match(
-      guide.slice(lastPreCleanupEnd, finalProbe.start),
+      finalProbe.text,
+      /--expected-post-cleanup-security-sha256\s+\\\n\s*"\$\{EXPECTED_POST_CLEANUP_SECURITY_SHA256\}"/u,
+      `${name}: final probe must bind the pre-derived post-state`,
+    );
+    assert.match(
+      guide.slice(deriveCommand.end, finalProbe.start),
       /(?:legacy cleanup|cleanup[\s\S]{0,100}legacy|(?:移除|删除)[\s\S]{0,100}legacy)/iu,
-      `${name}: legacy cleanup must separate activation from final closure`,
+      `${name}: legacy cleanup must separate derivation from final closure`,
     );
   }
 });
@@ -1629,7 +1648,12 @@ test("release docs bind artifact retention to the approval window", () => {
   for (const [name, guide] of Object.entries(releaseGuides)) {
     assert.match(
       guide,
-      /`plan`[\s\S]{0,140}candidate A\/B[\s\S]{0,140}(?:one day|1 天)/iu,
+      /`plan`[\s\S]{0,40}artifact[\s\S]{0,80}(?:90 days|90 天)/iu,
+      name,
+    );
+    assert.match(
+      guide,
+      /candidate\s+A\/B artifacts[\s\S]{0,140}(?:one day|1\s*天)/iu,
       name,
     );
     assert.match(
@@ -1645,7 +1669,7 @@ test("release docs bind artifact retention to the approval window", () => {
   }
 
   for (const [step, days] of [
-    ["Upload release plan", 1],
+    ["Upload release plan", 90],
     ["Upload candidate A", 1],
     ["Upload candidate B", 1],
     ["Upload assembled candidate", 35],
@@ -1781,6 +1805,191 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
   }
   for (const mutation of controllerMutations) {
     assert.throws(() => parseControllerWorkflow(mutation));
+  }
+});
+
+test("production controller validation rejects alternate YAML execution surfaces", () => {
+  assert.equal(
+    validateCanonicalV2ControllerWorkflowContent(templateController),
+    templateController,
+  );
+
+  const replaceOnce = (before, after) => {
+    assert.equal(
+      templateController.split(before).length,
+      2,
+      `controller fixture must contain one mutation anchor: ${before}`,
+    );
+    return templateController.replace(before, after);
+  };
+  const mutations = [
+    [
+      "extra runner job",
+      () => replaceOnce(
+        "jobs:\n",
+        [
+          "jobs:",
+          "  attacker-runner:",
+          "    runs-on: ubuntu-latest",
+          "    steps:",
+          "      - run: echo attacker",
+          "",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "extra run key",
+      () => replaceOnce(
+        "        id: controller\n",
+        "        id: controller\n        run: echo attacker\n",
+      ),
+    ],
+    [
+      "extra reusable-workflow job",
+      () => replaceOnce(
+        "jobs:\n",
+        [
+          "jobs:",
+          "  attacker-reusable:",
+          "    uses: attacker/example/.github/workflows/reusable.yml@main",
+          "",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "quoted uses",
+      () => replaceOnce(
+        `        uses: ${MARKETPLACE_ACTION}`,
+        `        uses: "${MARKETPLACE_ACTION}"`,
+      ),
+    ],
+    [
+      "tagged uses",
+      () => replaceOnce(
+        `        uses: ${MARKETPLACE_ACTION}`,
+        `        uses: !!str ${MARKETPLACE_ACTION}`,
+      ),
+    ],
+    [
+      "explicit uses",
+      () => replaceOnce(
+        `        uses: ${MARKETPLACE_ACTION}`,
+        `        ? uses\n        : ${MARKETPLACE_ACTION}`,
+      ),
+    ],
+    [
+      "flow uses",
+      () => replaceOnce(
+        `        uses: ${MARKETPLACE_ACTION}`,
+        `        uses: [${MARKETPLACE_ACTION}]`,
+      ),
+    ],
+    [
+      "secrets inherit",
+      () => replaceOnce(
+        "    timeout-minutes: 14\n",
+        "    timeout-minutes: 14\n    secrets: inherit\n",
+      ),
+    ],
+    [
+      "secrets expression",
+      () => replaceOnce(
+        "    timeout-minutes: 14\n",
+        "    timeout-minutes: 14\n    secrets: ${{ github.token }}\n",
+      ),
+    ],
+    [
+      "plain workflow_call",
+      () => replaceOnce(
+        "name: Codex Review Gate Controller\n\non:\n",
+        "name: Codex Review Gate Controller\n\non:\n  workflow_call:\n",
+      ),
+    ],
+    [
+      "quoted workflow_call",
+      () => replaceOnce(
+        "name: Codex Review Gate Controller\n\non:\n",
+        'name: Codex Review Gate Controller\n\non:\n  "workflow_call":\n',
+      ),
+    ],
+    [
+      "tagged workflow_call",
+      () => replaceOnce(
+        "name: Codex Review Gate Controller\n\non:\n",
+        "name: Codex Review Gate Controller\n\non:\n  !!str workflow_call:\n",
+      ),
+    ],
+    [
+      "explicit workflow_call",
+      () => replaceOnce(
+        "name: Codex Review Gate Controller\n\non:\n",
+        "name: Codex Review Gate Controller\n\non:\n  ? workflow_call\n  :\n",
+      ),
+    ],
+    [
+      "flow workflow_call",
+      () => replaceOnce(
+        "name: Codex Review Gate Controller\n\non:\n",
+        "name: Codex Review Gate Controller\n\non:\n  workflow_call: {}\n",
+      ),
+    ],
+    [
+      "duplicate flow on",
+      () => `${templateController}\non: {}\n`,
+    ],
+    [
+      "duplicate flow jobs",
+      () => `${templateController}\njobs: {}\n`,
+    ],
+    [
+      "extra step",
+      () => replaceOnce(
+        "    steps:\n",
+        [
+          "    steps:",
+          "      - name: Attacker step",
+          "        run: echo attacker",
+          "",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "extra callee",
+      () => replaceOnce(
+        `        uses: ${MARKETPLACE_ACTION}`,
+        [
+          `        uses: ${MARKETPLACE_ACTION}`,
+          "        uses: attacker/example@v1",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "required fragment decoy in comment",
+      () => replaceOnce(
+        "          github_token: ${{ github.token }}",
+        "          token: ${{ github.token }}\n# github_token:",
+      ),
+    ],
+    [
+      "required fragment decoy in block scalar",
+      () => replaceOnce(
+        "        description: Optional GitHub comment ID used only as an evidence hint",
+        "        description: |\n          github_token:\n          This is inert block-scalar text.",
+      ).replace(
+        "          github_token: ${{ github.token }}",
+        "          token: ${{ github.token }}",
+      ),
+    ],
+  ];
+
+  for (const [label, mutate] of mutations) {
+    const mutation = mutate();
+    assert.notEqual(mutation, templateController, label);
+    assert.throws(
+      () => validateCanonicalV2ControllerWorkflowContent(mutation),
+      undefined,
+      label,
+    );
   }
 });
 

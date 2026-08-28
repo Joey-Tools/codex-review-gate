@@ -1508,6 +1508,30 @@ async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
       { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
     );
   }
+  const prePostPr = await loadV2PullRequest(client, config, budget);
+  assertV2ControllerRerunScopeSnapshot(prePostPr, config);
+  const prePostInventory = await listCurrentV2VerifierRuns(client, config, budget);
+  if (
+    canonicalV2VerifierInventoryFingerprint(prePostInventory) !==
+    inventoryFingerprint
+  ) {
+    throw new V2RuntimeFailure(
+      "Canonical verifier workflow-run inventory changed immediately before rerun POST",
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  const prePostCurrent = selectCurrentV2VerifierRun(prePostInventory, config, prePostPr);
+  if (
+    !prePostCurrent ||
+    prePostCurrent.id !== current.id ||
+    prePostCurrent.run_attempt !== current.run_attempt ||
+    prePostCurrent.status !== "completed"
+  ) {
+    throw new V2RuntimeFailure(
+      "The canonical verifier baseline changed immediately before rerun POST",
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
   const baselineAttempt = current.run_attempt;
   let rerunError = null;
   try {
@@ -1565,6 +1589,20 @@ async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
         );
       }
       if (observed.run_attempt === baselineAttempt + 1) {
+        if (observed.status === "completed") {
+          throw new V2RuntimeFailure(
+            `Verifier attempt ${observed.run_attempt} completed before the controller observed ` +
+              "its canonical CheckRun queued or in progress",
+            { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+          );
+        }
+        if (!isActiveV2ActionsStatus(observed.status) || observed.conclusion !== null) {
+          throw new V2RuntimeFailure(
+            `Verifier attempt ${observed.run_attempt} became inconsistent before the controller ` +
+              "observed its canonical CheckRun queued or in progress",
+            { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+          );
+        }
         const job = await loadUniqueV2VerifierJob(
           client,
           config,
@@ -1578,10 +1616,35 @@ async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
             (job.status === "queued" || job.status === "in_progress") &&
             (checkRun.status === "queued" || checkRun.status === "in_progress")
           ) {
+            if (
+              canonicalV2VerifierRunLineageFingerprint(observed) !==
+              canonicalV2VerifierRunLineageFingerprint(prePostCurrent)
+            ) {
+              throw new V2RuntimeFailure(
+                "The exact verifier A+1 readback changed immutable run identity",
+                { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+              );
+            }
+            const postObservationPr = await loadV2PullRequest(client, config, budget);
+            assertV2ControllerRerunScopeSnapshot(postObservationPr, config);
+            const postObservationInventory = await listCurrentV2VerifierRuns(
+              client,
+              config,
+              budget,
+            );
+            const corroboratedRun = assertV2PostRerunInventory({
+              baselineInventory: prePostInventory,
+              observedInventory: postObservationInventory,
+              config,
+              pullRequest: postObservationPr,
+              runId: current.id,
+              runAttempt: baselineAttempt + 1,
+              exactObservedRun: observed,
+            });
             return {
-              runId: String(observed.id),
-              runAttempt: observed.run_attempt,
-              runUrl: observed.html_url,
+              runId: String(corroboratedRun.id),
+              runAttempt: corroboratedRun.run_attempt,
+              runUrl: corroboratedRun.html_url,
               jobId: String(job.id),
               checkRunId: String(checkRun.id),
             };
@@ -1615,6 +1678,66 @@ async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
   } catch (error) {
     throw failClosedAfterV2VerifierRerunSubmission(error, current.id);
   }
+}
+
+function assertV2ControllerRerunScopeSnapshot(pullRequest, config) {
+  assertV2ExpectedSnapshotScope(pullRequest, config);
+  const expected = config.snapshotScope;
+  if (
+    !isPlainRecord(expected) ||
+    pullRequest.head?.ref !== expected.headRef ||
+    pullRequest.head?.repo?.id !== expected.headRepositoryId ||
+    pullRequest.head?.repo?.full_name !== expected.headRepositoryFullName ||
+    String(pullRequest.base?.sha || "").toLowerCase() !== expected.baseSha ||
+    pullRequest.base?.ref !== expected.baseRef ||
+    pullRequest.base?.repo?.id !== expected.baseRepositoryId ||
+    pullRequest.base?.repo?.full_name !== expected.baseRepositoryFullName ||
+    String(pullRequest.merge_commit_sha || "").toLowerCase() !== expected.testMergeSha
+  ) {
+    throw new V2StaleFailure(
+      "Pull-request head, base, or test-merge scope changed during verifier rerun",
+    );
+  }
+}
+
+function assertV2PostRerunInventory({
+  baselineInventory,
+  observedInventory,
+  config,
+  pullRequest,
+  runId,
+  runAttempt,
+  exactObservedRun,
+}) {
+  if (
+    canonicalV2VerifierInventoryLineageFingerprint(observedInventory, runId) !==
+    canonicalV2VerifierInventoryLineageFingerprint(baselineInventory, runId)
+  ) {
+    throw new V2RuntimeFailure(
+      "Canonical verifier workflow-run inventory changed after observing the new attempt",
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  const current = selectCurrentV2VerifierRun(observedInventory, config, pullRequest);
+  const competingActive = observedInventory.filter((run) =>
+    run.id !== runId && isActiveV2ActionsStatus(run.status)
+  );
+  if (
+    !current ||
+    current.id !== runId ||
+    current.run_attempt !== runAttempt ||
+    !isActiveV2ActionsStatus(current.status) ||
+    current.conclusion !== null ||
+    canonicalV2VerifierRunLineageFingerprint(current) !==
+      canonicalV2VerifierRunLineageFingerprint(exactObservedRun) ||
+    competingActive.length > 0
+  ) {
+    throw new V2RuntimeFailure(
+      "The canonical verifier run changed after observing the new attempt",
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  return current;
 }
 
 function failClosedAfterV2VerifierRerunSubmission(error, runId) {
@@ -1735,6 +1858,63 @@ function canonicalV2VerifierInventoryFingerprint(runs) {
           ),
       })),
   );
+}
+
+function canonicalV2VerifierInventoryLineageFingerprint(runs, mutableRunId) {
+  return canonicalJson(
+    [...runs]
+      .sort((left, right) => left.id - right.id)
+      .map((run) => ({
+        id: run.id,
+        runNumber: run.run_number,
+        event: run.event,
+        path: run.path,
+        displayTitle: run.display_title,
+        headSha: String(run.head_sha).toLowerCase(),
+        htmlUrl: run.html_url,
+        ...(run.id === mutableRunId
+          ? {}
+          : {
+              runAttempt: run.run_attempt,
+              status: run.status,
+              conclusion: run.conclusion ?? null,
+            }),
+        pullRequests: run.pull_requests
+          .map((pullRequest) => ({
+            number: Number(pullRequest?.number),
+            headSha: String(pullRequest?.head?.sha || "").toLowerCase(),
+            baseSha: String(pullRequest?.base?.sha || "").toLowerCase(),
+          }))
+          .sort((left, right) =>
+            left.number - right.number ||
+            left.headSha.localeCompare(right.headSha) ||
+            left.baseSha.localeCompare(right.baseSha)
+          ),
+      })),
+  );
+}
+
+function canonicalV2VerifierRunLineageFingerprint(run) {
+  return canonicalJson({
+    id: run.id,
+    runNumber: run.run_number,
+    event: run.event,
+    path: run.path,
+    displayTitle: run.display_title,
+    headSha: String(run.head_sha).toLowerCase(),
+    htmlUrl: run.html_url,
+    pullRequests: run.pull_requests
+      .map((pullRequest) => ({
+        number: Number(pullRequest?.number),
+        headSha: String(pullRequest?.head?.sha || "").toLowerCase(),
+        baseSha: String(pullRequest?.base?.sha || "").toLowerCase(),
+      }))
+      .sort((left, right) =>
+        left.number - right.number ||
+        left.headSha.localeCompare(right.headSha) ||
+        left.baseSha.localeCompare(right.baseSha)
+      ),
+  });
 }
 
 function selectCurrentV2VerifierRun(runs, config, pullRequest) {
@@ -2800,6 +2980,7 @@ function reduceV2Evidence({
   indeterminate += reactionEvidence.errors.length;
 
   const currentArtifacts = [];
+  const currentHeadTerminalArtifacts = [];
   const historicalArtifacts = [];
   const progressArtifacts = [];
   for (const artifact of allArtifacts) {
@@ -2845,6 +3026,7 @@ function reduceV2Evidence({
       continue;
     }
     if (artifactHead === headSha) {
+      currentHeadTerminalArtifacts.push({ ...artifact, headSha: artifactHead });
       if (
         artifact.kind === "clean" &&
         (
@@ -2864,6 +3046,12 @@ function reduceV2Evidence({
   }
 
   currentArtifacts.sort(compareTerminalArtifactsNewestFirst);
+  currentHeadTerminalArtifacts.sort(compareTerminalArtifactsNewestFirst);
+  const generationLineage = buildV2GenerationLineage({
+    currentRequests: generationRequests,
+    currentArtifacts: currentHeadTerminalArtifacts,
+    requestReactions,
+  });
   const sameTimeConflicts = findCrossChannelTimestampConflicts(currentArtifacts);
   for (const conflict of sameTimeConflicts) {
     scopedErrors.push(normalizeV2EvidenceError(conflict));
@@ -2884,18 +3072,36 @@ function reduceV2Evidence({
     currentArtifacts.some((artifact) =>
       artifact.kind === "clean" && artifact.source !== "request-reaction"
     );
-  let selectedClean = positiveCleans[0] || null;
+  const directSelectedGenerationClean = positiveCleans.find((artifact) =>
+    artifact.source === "request-reaction" &&
+    artifact.requestId === requestEpoch.selected?.id
+  );
+  let selectedClean = directSelectedGenerationClean || positiveCleans[0] || null;
   let cleanBlockedByLiveness = false;
   if (selectedClean) {
-    cleanBlockedByLiveness = requestEpoch.selected
-      ? !isV2QualifyingCleanForGeneration(
-          selectedClean,
-          requestEpoch.selected,
-          requestReactions,
-          progressArtifacts,
-        )
-      : false;
-    if (cleanBlockedByLiveness) selectedClean = null;
+    const lineageError = requestEpoch.selected
+      ? v2UnlinkedCleanLineageError({
+          clean: selectedClean,
+          generation: requestEpoch.selected,
+          generationLineage,
+        })
+      : null;
+    if (lineageError) {
+      blockingErrors.push(lineageError);
+      indeterminate += 1;
+      selectedClean = null;
+    } else {
+      cleanBlockedByLiveness = requestEpoch.selected
+        ? !isV2QualifyingCleanForGeneration(
+            selectedClean,
+            requestEpoch.selected,
+            requestReactions,
+            progressArtifacts,
+            generationLineage,
+          )
+        : false;
+      if (cleanBlockedByLiveness) selectedClean = null;
+    }
   } else {
     cleanBlockedByLiveness = reactionEvidence.livenessVetoed;
   }
@@ -2907,6 +3113,7 @@ function reduceV2Evidence({
       currentCleans: positiveCleans,
       requestReactions,
       progressArtifacts,
+      generationLineage,
     })) {
       blockingErrors.push(error.message);
     }
@@ -2922,6 +3129,7 @@ function reduceV2Evidence({
       currentCleans: positiveCleans,
       requestReactions,
       progressArtifacts,
+      generationLineage,
     });
     if (supersession) {
       resolvedFindings.push(finding);
@@ -3041,6 +3249,7 @@ function findV2SupersedingGenerationClean({
   currentCleans,
   requestReactions,
   progressArtifacts,
+  generationLineage,
 }) {
   if (!Number.isFinite(evidenceMs)) return null;
   const generations = currentRequests
@@ -3055,6 +3264,7 @@ function findV2SupersedingGenerationClean({
         generation,
         requestReactions,
         progressArtifacts,
+        generationLineage,
       )
     );
     if (clean) return { generation, clean };
@@ -3067,6 +3277,7 @@ function isV2QualifyingCleanForGeneration(
   generation,
   requestReactions,
   progressArtifacts,
+  generationLineage,
 ) {
   const cleanMs = Date.parse(clean.createdAt);
   if (!Number.isFinite(cleanMs) || cleanMs <= generation.revisionMs) return false;
@@ -3074,6 +3285,13 @@ function isV2QualifyingCleanForGeneration(
     clean.source === "request-reaction" &&
     (clean.requestId !== generation.id || generation.headBound !== true)
   ) {
+    return false;
+  }
+  if (v2UnlinkedCleanLineageError({
+    clean,
+    generation,
+    generationLineage,
+  })) {
     return false;
   }
   const laterEyes = (requestReactions.get(generation.id) || []).some((reaction) =>
@@ -3088,6 +3306,125 @@ function isV2QualifyingCleanForGeneration(
     Date.parse(artifact.createdAt) >= cleanMs
   );
   return !laterEyes && !laterProgress;
+}
+
+function v2UnlinkedCleanLineageError({
+  clean,
+  generation,
+  generationLineage,
+}) {
+  if (clean.source === "request-reaction") return null;
+  const generationIndex = generationLineage?.indexById?.get(generation.id);
+  if (!Number.isSafeInteger(generationIndex)) {
+    return `Terminal clean ${clean.source}:${clean.id} is not bound to a known review generation`;
+  }
+  const cleanMs = Date.parse(clean.createdAt);
+  const nextGeneration = generationLineage.generations[generationIndex + 1];
+  if (nextGeneration && cleanMs >= nextGeneration.revisionMs) {
+    return (
+      `Terminal clean ${clean.source}:${clean.id} cannot be attributed to earlier review request ` +
+      `${generation.id}: newer request ${nextGeneration.id} already existed`
+    );
+  }
+  const unclosedIndex = generationLineage.firstUnclosedGapByGeneration[generationIndex];
+  if (Number.isSafeInteger(unclosedIndex)) {
+    const predecessor = generationLineage.generations[unclosedIndex];
+    const successor = generationLineage.generations[unclosedIndex + 1];
+    return (
+      `Terminal clean ${clean.source}:${clean.id} cannot be attributed to review request ` +
+      `${generation.id}: earlier request ${predecessor.id} had no terminal provider result ` +
+      `before newer request ${successor.id}`
+    );
+  }
+  return null;
+}
+
+function buildV2GenerationLineage({ currentRequests, currentArtifacts, requestReactions }) {
+  const generations = [...(currentRequests ?? [])]
+    .filter((request) => Number.isFinite(request?.revisionMs))
+    .sort((left, right) =>
+      left.revisionMs - right.revisionMs ||
+      (BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0)
+    );
+  const indexById = new Map(generations.map((request, index) => [request.id, index]));
+  const terminalTimes = (currentArtifacts ?? [])
+    .filter((artifact) =>
+      artifact.source !== "request-reaction" &&
+      (artifact.kind === "clean" || artifact.kind === "finding")
+    )
+    .map((artifact) => Date.parse(artifact.createdAt))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  const canonicalReactionIdCounts = new Map();
+  for (const inventory of requestReactions?.values() ?? []) {
+    for (const reaction of inventory) {
+      const id = canonicalPositiveId(reaction?.id);
+      if (id) canonicalReactionIdCounts.set(id, (canonicalReactionIdCounts.get(id) || 0) + 1);
+    }
+  }
+  const firstUnclosedGapByGeneration = Array(generations.length).fill(null);
+  let firstUnclosedGap = null;
+  let terminalIndex = 0;
+  for (let index = 0; index + 1 < generations.length; index += 1) {
+    const predecessor = generations[index];
+    const successor = generations[index + 1];
+    while (
+      terminalIndex < terminalTimes.length &&
+      terminalTimes[terminalIndex] <= predecessor.revisionMs
+    ) {
+      terminalIndex += 1;
+    }
+    const providerClosed = terminalIndex < terminalTimes.length &&
+      terminalTimes[terminalIndex] < successor.revisionMs;
+    const reactionClosed = predecessor.headBound === true &&
+      hasV2DirectReactionClosureBefore({
+        request: predecessor,
+        beforeMs: successor.revisionMs,
+        requestReactions,
+        canonicalReactionIdCounts,
+      });
+    if (!providerClosed && !reactionClosed && firstUnclosedGap === null) {
+      firstUnclosedGap = index;
+    }
+    firstUnclosedGapByGeneration[index + 1] = firstUnclosedGap;
+  }
+  return {
+    generations,
+    indexById,
+    firstUnclosedGapByGeneration,
+  };
+}
+
+function hasV2DirectReactionClosureBefore({
+  request,
+  beforeMs,
+  requestReactions,
+  canonicalReactionIdCounts,
+}) {
+  const reactions = requestReactions?.get(request.id) ?? [];
+  const officialEyes = reactions.filter((reaction) =>
+    reaction?.content === "eyes" &&
+    reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN &&
+    reaction?.user?.type === "Bot" &&
+    isCanonicalUtcTimestamp(reaction.created_at)
+  );
+  return reactions.some((reaction) => {
+    const id = canonicalPositiveId(reaction?.id);
+    if (
+      !id ||
+      canonicalReactionIdCounts.get(id) !== 1 ||
+      reaction?.content !== "+1" ||
+      reaction?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN ||
+      reaction?.user?.type !== "Bot" ||
+      !isCanonicalUtcTimestamp(reaction.created_at)
+    ) {
+      return false;
+    }
+    const plusOneMs = Date.parse(reaction.created_at);
+    return plusOneMs > request.revisionMs &&
+      plusOneMs < beforeMs &&
+      !officialEyes.some((eyes) => Date.parse(eyes.created_at) >= plusOneMs);
+  });
 }
 
 function assertV2ExpectedSnapshotScope(pullRequest, config) {

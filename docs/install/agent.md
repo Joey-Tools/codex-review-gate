@@ -437,8 +437,16 @@ legacy before v2 is Active and read back.
      --repo "github.com/$REPO" \
      --json headRefOid \
      --jq '.headRefOid')"
+   CANARY_HEAD_REPO="$(gh api --hostname github.com \
+     "repos/$REPO/pulls/$CANARY_PR" \
+     --jq '.head.repo.full_name')"
+   CANARY_HEAD_REF="$(gh api --hostname github.com \
+     "repos/$REPO/pulls/$CANARY_PR" \
+     --jq '.head.ref')"
    test "$CANARY_BASE" = "$DEFAULT_BRANCH"
    test "${#CANARY_HEAD}" -eq 40
+   test "$CANARY_HEAD_REPO" = "$REPO"
+   test -n "$CANARY_HEAD_REF"
    ```
 
 3. Prefer a direct exact request. This path does not allocate a gate runner
@@ -665,42 +673,109 @@ legacy before v2 is Active and read back.
    non-fast-forward default-branch protection, and an explicitly empty
    `bypass_actors` array. Treat a missing or non-array value as incomplete, not
    as empty.
-5. Only after step 4 proves the exact complete Active v2 ruleset, execute the
-   separately authorised legacy cleanup. Remove `codex/review-gate` from its
-   ruleset or classic branch-protection surface. This authorised change must
-   change the pre-cleanup digest, so do not replay that stale digest. A cleanup
-   or readback failure is not permission to disable v2. Leave the complete
-   Active v2 gate in place and report the exact remaining surface.
-6. Run the dedicated read-only post-cleanup closure with the recorded ruleset
-   name. It must prove both legacy surfaces clear and the same complete v2
-   ruleset still Active. It repeats the complete legacy-plus-v2 read and
-   requires identical rounds, so a cross-surface swap cannot form a false
-   clear snapshot. It accepts neither the stale pre-cleanup digest nor a
-   mutation flag:
+5. Only after step 4 proves the exact complete Active v2 ruleset, derive the
+   sole admissible cleanup state from the complete pre-cleanup security
+   snapshot. This read-only mode first requires the current legacy inventory
+   to equal the original owner-approved digest. Its stdout is only one
+   deterministic JSON object, so save and review it before any external write:
+
+   ```bash
+   POST_CLEANUP_PLAN="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --expected-legacy-inventory-sha256 \
+     "${LEGACY_INVENTORY_SHA256}" \
+     --derive-post-cleanup-plan > "$POST_CLEANUP_PLAN"
+   jq . "$POST_CLEANUP_PLAN"
+   EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
+     '.expected_post_cleanup_security_sha256 |
+      select(test("^[0-9a-f]{64}$"))' \
+     "$POST_CLEANUP_PLAN")"
+   ```
+
+   The plan may remove only `codex/review-gate`. If that removes the last item
+   from classic required-status policy, that empty policy and its `strict`
+   field may disappear. If it empties a ruleset status rule, that rule may
+   disappear; the whole dedicated legacy-only ruleset may disappear only when
+   no other rule remains. Those are the only structural exceptions. Require
+   exact preservation of repository/default-head identity, workflow and
+   CODEOWNERS inventory, owner permission, every field and non-legacy check
+   (including `strict` and `app_id`) in a surviving classic policy, and every
+   retained ruleset's identity, conditions, bypass actors, and unrelated
+   rules. Any other delta is not an authorised cleanup plan.
+6. Execute only that reviewed plan as the separately authorised legacy
+   cleanup. Do not re-derive after a write. A cleanup or readback failure is
+   not permission to disable or roll back v2: leave the complete Active v2
+   gate in place, run only read-only diagnostics, and report the exact
+   remaining or indeterminate surface.
+7. Run the dedicated read-only post-cleanup closure with the recorded ruleset
+   name and externally recorded expected-state digest. It takes two complete
+   security snapshots; both rounds must be identical, must equal the expected
+   digest, must show both legacy surfaces clear, and must show the same exact
+   complete v2 ruleset Active. Thus neither an unrelated-policy change nor a
+   cross-surface swap can form a false clear snapshot:
 
    ```bash
    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
      --repo "$REPO" \
      --control-plane-owner "$CONTROL_PLANE_OWNER" \
      --ruleset-name "$V2_RULESET_NAME" \
-     --verify-post-cleanup
+     --verify-post-cleanup \
+     --expected-post-cleanup-security-sha256 \
+     "${EXPECTED_POST_CLEANUP_SECURITY_SHA256}"
    ```
 
-7. Close the canary without merging and delete only its temporary branch:
+   An inconclusive result keeps v2 Active and requires read-only diagnostics;
+   never disable or roll it back to make closure pass.
+8. Close the canary without merging. Do not let `gh` delete the branch as part
+   of the close operation. First prove the closed PR still names the recorded
+   head repository, ref, and OID; then delete that remote ref with an atomic
+   exact-OID lease:
 
    ```bash
-   gh pr close "$CANARY_PR" --repo "github.com/$REPO" --delete-branch
-   gh pr view "$CANARY_PR" \
-     --repo "github.com/$REPO" \
-     --json state,mergedAt
+   (
+     set -euo pipefail
+     trap 'printf "%s\n" "Canary cleanup did not prove completion. Do not issue an unconditional delete; inspect and report the exact PR/ref scope." >&2' ERR
+
+     gh pr close "$CANARY_PR" --repo "github.com/$REPO"
+     CANARY_CLOSED_STATE="$(gh api --hostname github.com \
+       "repos/$REPO/pulls/$CANARY_PR")"
+     jq -e \
+       --arg repo "$CANARY_HEAD_REPO" \
+       --arg ref "$CANARY_HEAD_REF" \
+       --arg sha "$CANARY_HEAD" \
+       '.state == "closed" and .merged_at == null and
+        .head.repo.full_name == $repo and .head.ref == $ref and .head.sha == $sha' \
+       <<< "$CANARY_CLOSED_STATE" > /dev/null
+
+     CANARY_REMOTE="https://github.com/$CANARY_HEAD_REPO.git"
+     REMOTE_CANARY_HEAD="$(git ls-remote --refs "$CANARY_REMOTE" \
+       "refs/heads/$CANARY_HEAD_REF" |
+       awk 'NR == 1 { print $1 } END { if (NR != 1) exit 1 }')"
+     test "$REMOTE_CANARY_HEAD" = "$CANARY_HEAD"
+     git push \
+       --force-with-lease="refs/heads/$CANARY_HEAD_REF:$CANARY_HEAD" \
+       "$CANARY_REMOTE" \
+       ":refs/heads/$CANARY_HEAD_REF"
+     POST_DELETE_REMOTE_CANARY="$(git ls-remote --refs "$CANARY_REMOTE" \
+       "refs/heads/$CANARY_HEAD_REF")"
+     test -z "$POST_DELETE_REMOTE_CANARY"
+   )
    ```
 
-   Require `state=CLOSED` and `mergedAt=null`.
+   A missing or different remote OID, changed PR head identity, or failed lease
+   is inconclusive. A mismatch detected before the leased push leaves the
+   branch intact; a post-push read failure leaves deletion outcome unknown.
+   Stop and report the observed scope; never retry with an unconditional ref
+   deletion.
 
-8. Report the migration PR, closed-unmerged canary PR, both canonical workflow
+9. Report the migration PR, closed-unmerged canary PR, both canonical workflow
    paths, active ruleset ID, exact successful canary feature head and bound
    default-branch base/test-merge SHA and canonical run-name receipt, plus the
-   verifier run URL, final dual-surface legacy inventory readback, and any
+   verifier run URL, reviewed cleanup-plan digest, final two-round security
+   closure and dual-surface legacy inventory readback, and any
    persistent profile or runner-fallback variables.
 
 There is no scheduled recovery loop. If a bot event is missed or evidence

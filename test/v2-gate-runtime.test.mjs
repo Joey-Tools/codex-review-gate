@@ -874,38 +874,69 @@ test("pull_request edited is rejected before GitHub API access", async (context)
 });
 
 test("pull_request verifier rejects every tampered launch binding", async (context) => {
+  const successEvidence = [ordinaryRequest(), cleanIssueComment(HEAD)];
+  const controlGitHub = createGitHubMock({ issueComments: successEvidence });
+  const controlEnvironment = runtimeEnvironment(context, {
+    suffix: "pull-request-binding-control",
+  });
+  const { result: control } = await runGate(controlEnvironment, controlGitHub);
+  assert.equal(control.exitCode, 0);
+  assert.equal(control.report.gateOutcome, "success");
+
   const cases = [
     {
       label: "github-sha",
       mutateEnvironment: (environment) => { environment.GITHUB_SHA = NEXT_HEAD; },
+      expectedReason:
+        "The pull_request verifier is not bound to the exact current PR head, base, and " +
+        "test-merge commit",
+      expectedReadCount: 2,
     },
     {
       label: "github-ref",
       mutateEnvironment: (environment) => { environment.GITHUB_REF = "refs/heads/main"; },
+      expectedReason:
+        "The pull_request verifier is not bound to the exact current PR head, base, and " +
+        "test-merge commit",
+      expectedReadCount: 2,
     },
     {
       label: "event-repository",
       mutateEvent: (event) => { event.repository.full_name = "other/repository"; },
+      expectedReason: "pull_request trigger did not satisfy the exact read-only verifier contract",
+      expectedReadCount: 0,
     },
     {
       label: "event-head",
       mutateEvent: (event) => { event.pull_request.head.sha = NEXT_HEAD; },
+      expectedReason: "pull_request trigger did not satisfy the exact read-only verifier contract",
+      expectedReadCount: 0,
     },
     {
       label: "event-base",
       mutateEvent: (event) => { event.pull_request.base.sha = NEXT_HEAD; },
+      expectedReason:
+        "The pull_request verifier is not bound to the exact current PR head, base, and " +
+        "test-merge commit",
+      expectedReadCount: 2,
     },
     {
       label: "operation",
       mutateEnvironment: (environment) => { environment.OPERATION_INPUT = "begin-review"; },
+      expectedReason: "pull_request trigger did not satisfy the exact read-only verifier contract",
+      expectedReadCount: 0,
     },
     {
       label: "request-review",
       mutateEnvironment: (environment) => { environment.REQUEST_REVIEW_INPUT = "true"; },
+      expectedReason: "pull_request trigger did not satisfy the exact read-only verifier contract",
+      expectedReadCount: 0,
     },
     {
       label: "request-comment",
       mutateEnvironment: (environment) => { environment.REQUEST_COMMENT_ID = "123"; },
+      expectedReason: "pull_request trigger did not satisfy the exact read-only verifier contract",
+      expectedReadCount: 0,
     },
   ];
   for (const scenario of cases) {
@@ -916,11 +947,22 @@ test("pull_request verifier rejects every tampered launch binding", async (conte
       event,
     });
     scenario.mutateEnvironment?.(environment);
-    const github = createGitHubMock();
+    const github = createGitHubMock({ issueComments: successEvidence });
     const { result } = await runGate(environment, github);
     assert.equal(result.exitCode, 1, scenario.label);
     assert.notEqual(result.report.gateOutcome, "success", scenario.label);
+    assert.equal(result.report.reason, scenario.expectedReason, scenario.label);
+    assert.equal(github.calls.length, scenario.expectedReadCount, scenario.label);
+    assert.equal(
+      github.calls.every(({ method }) => method === "GET"),
+      true,
+      scenario.label,
+    );
     assert.deepEqual(github.statusWrites, [], scenario.label);
+    assert.deepEqual(github.requestBodies, [], scenario.label);
+    assert.deepEqual(github.rerunRequests, [], scenario.label);
+    assert.deepEqual(github.stickyCreates, [], scenario.label);
+    assert.deepEqual(github.stickyPatches, [], scenario.label);
   }
 });
 
@@ -1182,6 +1224,207 @@ test("newer authorized generation prevents reuse of older canonical +1", async (
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "wait_provider");
+});
+
+test("a delayed terminal clean from generation A cannot satisfy overlapping generation B", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const delayedCleanFromA = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 203,
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+  });
+  const overlappingReactions = new Map([
+    ["101", [reaction({
+      id: 501,
+      content: "eyes",
+      created_at: "2026-08-25T08:01:00Z",
+    })]],
+    ["102", [reaction({
+      id: 502,
+      content: "eyes",
+      created_at: "2026-08-25T08:03:00Z",
+    })]],
+  ]);
+  const ambiguousGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reactionsByCommentId: overlappingReactions,
+  });
+  const ambiguousEnvironment = runtimeEnvironment(context, {
+    suffix: "overlapping-generation-delayed-clean",
+  });
+  const { result: ambiguous } = await runGate(ambiguousEnvironment, ambiguousGitHub);
+  assert.equal(ambiguous.exitCode, 1);
+  assert.equal(ambiguous.report.gateOutcome, "pending");
+  assert.equal(ambiguous.report.recoveryCode, "request_clean_generation");
+  assert.equal(ambiguous.report.counts.indeterminate, 1);
+  assert.match(
+    ambiguous.report.reason,
+    /earlier request 101 had no terminal provider result before newer request 102/iu,
+  );
+  assert.equal(
+    ambiguousGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+  assert.ok(
+    ambiguousGitHub.calls.some(({ path }) =>
+      path.endsWith(`/commits/${HEAD.slice(0, 10)}`)
+    ),
+    "the short commit still resolves exactly before lineage admission",
+  );
+
+  const unresolvedFindingGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reviews: [findingReview(HEAD, {
+      submitted_at: "2026-08-25T07:59:00Z",
+    })],
+    reactionsByCommentId: overlappingReactions,
+  });
+  const unresolvedFindingEnvironment = runtimeEnvironment(context, {
+    suffix: "overlapping-generation-preserves-finding",
+  });
+  const { result: unresolvedFinding } = await runGate(
+    unresolvedFindingEnvironment,
+    unresolvedFindingGitHub,
+  );
+  assert.equal(unresolvedFinding.exitCode, 1);
+  assert.equal(unresolvedFinding.report.gateOutcome, "failure");
+  assert.equal(unresolvedFinding.report.recoveryCode, "fix_findings");
+  assert.equal(unresolvedFinding.report.counts.unresolved, 1);
+  assert.equal(unresolvedFinding.report.counts.resolved, 0);
+  assert.equal(
+    unresolvedFindingGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const directlyBoundGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reactionsByCommentId: new Map([
+      ...overlappingReactions,
+      ["102", [
+        ...overlappingReactions.get("102"),
+        reaction({ id: 503, created_at: "2026-08-25T08:05:00Z" }),
+      ]],
+    ]),
+  });
+  const directlyBoundEnvironment = runtimeEnvironment(context, {
+    suffix: "overlapping-generation-direct-plus-one",
+  });
+  const { result: directlyBound } = await runGate(
+    directlyBoundEnvironment,
+    directlyBoundGitHub,
+  );
+  assert.equal(directlyBound.exitCode, 0);
+  assert.equal(directlyBound.report.gateOutcome, "success");
+  assert.match(directlyBound.report.reason, /request-reaction 503/u);
+
+  const earlierDirectBindingGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({
+        id: 507,
+        content: "eyes",
+        created_at: "2026-08-25T08:01:00Z",
+      })]],
+      ["102", [
+        reaction({
+          id: 508,
+          content: "eyes",
+          created_at: "2026-08-25T08:02:30Z",
+        }),
+        reaction({ id: 509, created_at: "2026-08-25T08:03:00Z" }),
+      ]],
+    ]),
+  });
+  const earlierDirectBindingEnvironment = runtimeEnvironment(context, {
+    suffix: "overlapping-generation-early-direct-plus-one",
+  });
+  const { result: earlierDirectBinding } = await runGate(
+    earlierDirectBindingEnvironment,
+    earlierDirectBindingGitHub,
+  );
+  assert.equal(earlierDirectBinding.exitCode, 0);
+  assert.equal(earlierDirectBinding.report.gateOutcome, "success");
+  assert.match(earlierDirectBinding.report.reason, /request-reaction 509/u);
+
+  const predecessorClosedGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 504, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({
+        id: 505,
+        content: "eyes",
+        created_at: "2026-08-25T08:03:00Z",
+      })]],
+    ]),
+  });
+  const predecessorClosedEnvironment = runtimeEnvironment(context, {
+    suffix: "prior-generation-direct-plus-one",
+  });
+  const { result: predecessorClosed } = await runGate(
+    predecessorClosedEnvironment,
+    predecessorClosedGitHub,
+  );
+  assert.equal(predecessorClosed.exitCode, 0);
+  assert.equal(predecessorClosed.report.gateOutcome, "success");
+  assert.match(predecessorClosed.report.reason, /issue-comment 203/u);
+
+  const completedGenerationA = cleanIssueComment(HEAD, {
+    id: 202,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const providerClosedGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      completedGenerationA,
+      generationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 506,
+      content: "eyes",
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const providerClosedEnvironment = runtimeEnvironment(context, {
+    suffix: "prior-generation-provider-terminal",
+  });
+  const { result: providerClosed } = await runGate(
+    providerClosedEnvironment,
+    providerClosedGitHub,
+  );
+  assert.equal(providerClosed.exitCode, 0);
+  assert.equal(providerClosed.report.gateOutcome, "success");
+  assert.match(providerClosed.report.reason, /issue-comment 203/u);
+
+  const equalBoundaryGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      cleanIssueComment(HEAD, {
+        id: 202,
+        created_at: generationB.created_at,
+        updated_at: generationB.updated_at,
+      }),
+      generationB,
+      delayedCleanFromA,
+    ],
+  });
+  const equalBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "generation-lineage-equal-boundary",
+  });
+  const { result: equalBoundary } = await runGate(
+    equalBoundaryEnvironment,
+    equalBoundaryGitHub,
+  );
+  assert.equal(equalBoundary.exitCode, 1);
+  assert.equal(equalBoundary.report.gateOutcome, "pending");
+  assert.equal(equalBoundary.report.recoveryCode, "request_clean_generation");
 });
 
 test("short Reviewed commit is accepted only through GitHub unambiguous resolution", async (context) => {
@@ -2415,6 +2658,198 @@ test("controller adopts an ambiguous rerun POST only after exact A+1 readback", 
   assert.equal(result.exitCode, 0);
   assert.equal(result.report.executionHealth, "healthy");
   assert.deepEqual(github.rerunRequests, ["7001"]);
+  const rerunIndex = github.calls.findIndex(({ method, path }) =>
+    method === "POST" && path === `/repos/${REPOSITORY}/actions/runs/7001/rerun`
+  );
+  assert.deepEqual(
+    github.calls.slice(rerunIndex - 2, rerunIndex).map(({ method, path }) => [method, path]),
+    [
+      ["GET", `/repos/${REPOSITORY}/pulls/${PR}`],
+      ["GET", `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`],
+    ],
+    "the final PR scope and complete run inventory are the last reads before rerun POST",
+  );
+  const checkIndex = github.calls.findIndex(({ method, path }) =>
+    method === "GET" && path === `/repos/${REPOSITORY}/check-runs/9001`
+  );
+  assert.deepEqual(
+    github.calls.slice(checkIndex + 1, checkIndex + 3).map(({ method, path }) => [method, path]),
+    [
+      ["GET", `/repos/${REPOSITORY}/pulls/${PR}`],
+      ["GET", `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`],
+    ],
+    "the controller revalidates PR scope and current run inventory after observing A+1",
+  );
+});
+
+test("controller rejects exact PR scope drift immediately before rerun POST", async (context) => {
+  const driftCases = [
+    ["head", { head: { sha: NEXT_HEAD } }],
+    ["base", { base: { sha: NEXT_HEAD } }],
+    ["test-merge", { merge_commit_sha: NEXT_HEAD }],
+  ];
+  for (const [label, drift] of driftCases) {
+    const github = createGitHubMock({
+      pullRequestSequence: [{}, {}, drift],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `pre-rerun-post-${label}-drift`,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 0, label);
+    assert.equal(result.report.executionHealth, "healthy", label);
+    assert.equal(result.report.gateOutcome, "not_applicable", label);
+    assert.equal(result.report.recoveryCode, "refresh_head", label);
+    assert.deepEqual(github.rerunRequests, [], label);
+    assert.equal(
+      github.calls.some(({ method, path }) =>
+        method === "POST" && path.endsWith("/cancel")
+      ),
+      false,
+      label,
+    );
+  }
+});
+
+test("controller keeps a submitted verifier running when PR scope drifts after A+1", async (context) => {
+  const driftCases = [
+    ["head", { head: { sha: NEXT_HEAD } }],
+    ["base", { base: { sha: NEXT_HEAD } }],
+    ["test-merge", { merge_commit_sha: NEXT_HEAD }],
+  ];
+  for (const [label, drift] of driftCases) {
+    const github = createGitHubMock({
+      pullRequestSequence: [{}, {}, {}, drift],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `post-a-plus-one-${label}-drift`,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, label);
+    assert.equal(result.report.executionHealth, "unhealthy", label);
+    assert.equal(result.report.gateOutcome, "pending", label);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", label);
+    assert.equal(result.report.retrySafe, false, label);
+    assert.match(result.report.reason, /may have been submitted/iu, label);
+    assert.deepEqual(github.rerunRequests, ["7001"], label);
+    assert.equal(
+      github.calls.some(({ method, path }) =>
+        method === "POST" && path.endsWith("/cancel")
+      ),
+      false,
+      label,
+    );
+  }
+});
+
+test("controller rejects canonical run inventory drift before and after rerun submission", async (context) => {
+  for (const phase of ["before-post", "after-a-plus-one"]) {
+    let inventoryReads = 0;
+    const github = createGitHubMock({
+      requestInterceptor: ({ method, path }) => {
+        if (
+          method !== "GET" ||
+          path !== `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`
+        ) {
+          return undefined;
+        }
+        inventoryReads += 1;
+        const driftRead = phase === "before-post" ? 3 : 4;
+        if (inventoryReads !== driftRead) return undefined;
+        return jsonResponse({
+          total_count: 1,
+          workflow_runs: [verifierRun({
+            run_attempt: phase === "before-post" ? 1 : 2,
+            status: phase === "before-post" ? "completed" : "queued",
+            conclusion: phase === "before-post" ? "failure" : null,
+            display_title: `codex-review-gate-verifier/${PR}/${NEXT_HEAD}`,
+          })],
+        });
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `run-inventory-drift-${phase}`,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, phase);
+    assert.equal(result.report.executionHealth, "unhealthy", phase);
+    assert.equal(result.report.gateOutcome, "pending", phase);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", phase);
+    assert.equal(result.report.retrySafe, false, phase);
+    assert.match(
+      result.report.reason,
+      phase === "before-post"
+        ? /changed immediately before rerun POST/iu
+        : /changed after observing the new attempt/iu,
+      phase,
+    );
+    assert.deepEqual(
+      github.rerunRequests,
+      phase === "before-post" ? [] : ["7001"],
+      phase,
+    );
+    assert.equal(
+      github.calls.some(({ method, path }) =>
+        method === "POST" && path.endsWith("/cancel")
+      ),
+      false,
+      phase,
+    );
+  }
+});
+
+test("controller cross-checks exact A+1 immutable identity and explicit null conclusion", async (context) => {
+  for (const fixture of ["run-number", "html-url", "missing-conclusion"]) {
+    const github = createGitHubMock({
+      requestInterceptor: ({ method, path, calls }) => {
+        if (
+          method !== "GET" ||
+          path !== `/repos/${REPOSITORY}/actions/runs/7001` ||
+          !calls.some(({ method: priorMethod, path: priorPath }) =>
+            priorMethod === "POST" && priorPath.endsWith("/actions/runs/7001/rerun")
+          )
+        ) {
+          return undefined;
+        }
+        const exact = verifierRun({
+          run_attempt: 2,
+          status: "queued",
+          conclusion: null,
+          ...(fixture === "run-number" ? { run_number: 42 } : {}),
+          ...(fixture === "html-url"
+            ? { html_url: `https://github.com/${REPOSITORY}/actions/runs/other` }
+            : {}),
+        });
+        if (fixture === "missing-conclusion") delete exact.conclusion;
+        return jsonResponse(exact);
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `exact-a-plus-one-${fixture}`,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, fixture);
+    assert.equal(result.report.gateOutcome, "pending", fixture);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", fixture);
+    assert.equal(result.report.retrySafe, false, fixture);
+    assert.match(
+      result.report.reason,
+      fixture === "missing-conclusion" ? /became inconsistent/iu : /immutable run identity/iu,
+      fixture,
+    );
+    assert.deepEqual(github.rerunRequests, ["7001"], fixture);
+    assert.equal(
+      github.calls.some(({ method, path }) =>
+        method === "POST" && path.endsWith("/cancel")
+      ),
+      false,
+      fixture,
+    );
+  }
 });
 
 test("controller preserves definite rerun rejection and completed-at-readback semantics", async (context) => {
@@ -3126,7 +3561,18 @@ function createGitHubMock({
     ) {
       return jsonResponse({
         total_count: verifierRuns.length,
-        workflow_runs: verifierRuns.map((run) => structuredClone(run)),
+        workflow_runs: verifierRuns.map((run) => ({
+          ...structuredClone(run),
+          run_attempt: rerunRequested && verifierRerunAdvances
+            ? run.run_attempt + verifierRerunAttemptDelta
+            : run.run_attempt,
+          status: rerunRequested && verifierRerunAdvances
+            ? verifierAttemptStatus
+            : run.status,
+          conclusion: rerunRequested && verifierRerunAdvances
+            ? null
+            : run.conclusion,
+        })),
       });
     }
     const exactRun = /^\/repos\/owner\/repo\/actions\/runs\/(\d+)$/u.exec(path);
@@ -3141,6 +3587,9 @@ function createGitHubMock({
         status: rerunRequested && verifierRerunAdvances
           ? verifierAttemptStatus
           : run.status,
+        conclusion: rerunRequested && verifierRerunAdvances
+          ? (verifierAttemptStatus === "completed" ? run.conclusion : null)
+          : run.conclusion,
       });
     }
     const rerun = /^\/repos\/owner\/repo\/actions\/runs\/(\d+)\/rerun$/u.exec(path);

@@ -68,10 +68,26 @@ ruleset as Disabled, prove it with a harmless canary, then activate and read
 back the exact complete Active policy. Every pre-cleanup stage/activation
 preview and apply must explicitly reuse the same owner-approved digest across
 processes through that Active readback. Only afterward may separately
-authorised cleanup remove the inventoried legacy requirements. Because cleanup
-necessarily changes the old digest, final closure uses the read-only
-`--verify-post-cleanup` mode without that digest and proves both legacy
-surfaces clear while the same v2 policy remains Active.
+authorised cleanup remove the inventoried legacy requirements. Before cleanup,
+read-only `--derive-post-cleanup-plan` requires the same external
+owner-approved legacy-inventory digest through
+`--expected-legacy-inventory-sha256`, verifies that baseline against a
+complete security snapshot, and emits a canonical, human-reviewable plan plus
+an external expected post-cleanup security SHA-256. The only admissible delta
+removes `codex/review-gate`. An emptied classic required-status policy, an
+emptied ruleset status rule, and a dedicated legacy-only ruleset left with no
+rules are the only structures that may disappear. Repository/default head,
+workflow/CODEOWNERS inventory, owner permission, every field/non-legacy check
+including `strict` and `app_id` in a surviving classic policy, and every
+retained ruleset's identity, conditions, bypass actors, and unrelated rules are
+preserved exactly. After
+the separately authorised cleanup, read-only `--verify-post-cleanup` requires
+that external digest through `--expected-post-cleanup-security-sha256` and
+accepts only two identical complete security rounds,
+each matching the expected digest, showing both legacy surfaces clear and the
+same complete v2 policy Active. An inconclusive derivation, cleanup, or
+verification leaves v2 Active and calls only for read-only diagnostics; it is
+never a reason to disable or roll back v2.
 Approval plus a head reread alone is insufficient.
 
 The copied workflows own separate triggers, typed dispatch inputs,

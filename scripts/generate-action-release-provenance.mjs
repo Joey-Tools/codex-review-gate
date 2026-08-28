@@ -15,7 +15,6 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,15 +28,21 @@ const TARGET_REPOSITORY = "JoeyTeng/codex-review-gate-action";
 const TARGET_BRANCH = "master";
 const PRIMARY_FINGERPRINT = "AD403DAB5377F9FA0F7D775EC2844D3367B8A71B";
 const SIGNING_SUBKEY_FINGERPRINT = "4DD48552DDEAF6D961769DD4A49827EC48984E2C";
-const RELEASE_MANIFEST_SCHEMA = "urn:joey-tools:codex-review-gate:release-manifest:2";
-const CONTRACT_VERSIONS = Object.freeze({
+const V2_0_RELEASE_MANIFEST_SCHEMA = "urn:joey-tools:codex-review-gate:release-manifest:2";
+const RELEASE_CONTRACT_ID = "codex-review-gate-action-v2.0-contract-v1";
+const V2_0_RELEASE_PLAN_SCHEMA = "codex-review-gate-action-release-plan-v2";
+const V2_0_RELEASE_CANDIDATE_SCHEMA = "codex-review-gate-action-candidate-v2";
+const V2_0_PUBLICATION_PLAN_SCHEMA = "codex-review-gate-action-publication-plan-v2";
+const V2_0_RELEASE_PROVENANCE_SCHEMA = "codex-review-gate-action-release-provenance-v2";
+const V2_0_PUSH_ADMISSION_SCHEMA = "codex-review-gate-action-push-admission-v1";
+const V2_0_CONTRACT_VERSIONS = Object.freeze({
   toolchain: "node20",
   release_schema: 2,
   status: 2,
   template: 2,
   baseline: 3,
 });
-const ENTRYPOINT_POLICY = Object.freeze({
+const V2_0_ENTRYPOINT_POLICY = Object.freeze({
   metadata_path: "action.yml",
   using: "node20",
   main: "src/v2/gate-runtime.mjs",
@@ -46,7 +51,7 @@ const MAX_TRANSPORT_BYTES = 64 * 1024 * 1024;
 const MAX_TRANSPORT_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_TRANSPORT_ENTRIES = 4096;
 const MAX_GITHUB_APP_INSTALLATION_RESPONSE_BYTES = 1024 * 1024;
-const CONTROL_PATH_LIST = Object.freeze([
+const V2_0_CONTROL_PATH_LIST = Object.freeze([
   ".github/workflows/required-ci-router.yml",
   ".github/workflows/required-ci.yml",
   ".github/workflows/sync-action-subtree.yml",
@@ -58,16 +63,81 @@ const CONTROL_PATH_LIST = Object.freeze([
   "test/required-ci-workflow.test.mjs",
   "test/v2-release-pipeline.test.mjs",
 ].sort((left, right) => Buffer.from(left).compare(Buffer.from(right))));
-const CONTROL_PATHS = new Set(CONTROL_PATH_LIST);
-const REQUIRED_V2_RUNTIME_MODULE_PATHS = Object.freeze([
+const V2_0_RUNTIME_MODULE_PATHS = Object.freeze([
   "src/v2/gate-runtime.mjs",
 ]);
-const SIGNER_POLICY = Object.freeze({
+const V2_0_SIGNER_POLICY = Object.freeze({
   name: "JoeyTeng-Codex",
   email: "codex@mahane.me",
   primary_fingerprint: PRIMARY_FINGERPRINT,
   signing_subkey_fingerprint: SIGNING_SUBKEY_FINGERPRINT,
 });
+
+function deepFreeze(value) {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const nested of Object.values(value)) deepFreeze(nested);
+  }
+  return value;
+}
+
+// Published contracts are append-only. Historical verification selects one
+// from the signed provenance schema instead of applying the active publisher
+// policy retroactively to immutable releases.
+const RELEASE_CONTRACT_V2_0 = deepFreeze({
+  id: RELEASE_CONTRACT_ID,
+  source_repository: SOURCE_REPOSITORY,
+  source_path: SOURCE_PATH,
+  target_repository: TARGET_REPOSITORY,
+  target_branch: TARGET_BRANCH,
+  action_package_repository: "git+https://github.com/JoeyTeng/codex-review-gate-action.git",
+  manifest: {
+    schema: V2_0_RELEASE_MANIFEST_SCHEMA,
+    schema_version: 2,
+    contract_versions: { ...V2_0_CONTRACT_VERSIONS },
+  },
+  plan: { schema: V2_0_RELEASE_PLAN_SCHEMA, schema_version: 2 },
+  candidate: { schema: V2_0_RELEASE_CANDIDATE_SCHEMA, schema_version: 2 },
+  publication_plan: { schema: V2_0_PUBLICATION_PLAN_SCHEMA, schema_version: 2 },
+  provenance: { schema: V2_0_RELEASE_PROVENANCE_SCHEMA, schema_version: 2 },
+  entrypoint: { ...V2_0_ENTRYPOINT_POLICY },
+  signer: { ...V2_0_SIGNER_POLICY },
+  runtime_paths: [...V2_0_RUNTIME_MODULE_PATHS],
+  control_paths: [...V2_0_CONTROL_PATH_LIST],
+  executable_control_paths: [
+    "scripts/generate-action-release-provenance.mjs",
+    "scripts/release-action-subtree.sh",
+  ],
+  archive_encoder: "canonical-ustar-gzip-store-v1",
+  semver_policy: "canonical-semver-v2-plus-v1",
+  push_admission: {
+    schema: V2_0_PUSH_ADMISSION_SCHEMA,
+    schema_version: 1,
+    event: "push",
+  },
+  floating_alias_modes: {
+    create: { requires_before: false },
+    "force-with-lease": { requires_before: true },
+    "already-current": { requires_before: true },
+    superseded: { requires_before: true },
+  },
+});
+const HISTORICAL_RELEASE_CONTRACTS = new Map([
+  [`${V2_0_RELEASE_PROVENANCE_SCHEMA}:2`, RELEASE_CONTRACT_V2_0],
+]);
+const HISTORICAL_PLAN_CONTRACTS = new Map([
+  [`${V2_0_RELEASE_PLAN_SCHEMA}:2`, RELEASE_CONTRACT_V2_0],
+]);
+const HISTORICAL_CANDIDATE_CONTRACTS = new Map([
+  [`${V2_0_RELEASE_CANDIDATE_SCHEMA}:2`, RELEASE_CONTRACT_V2_0],
+]);
+const CURRENT_RELEASE_CONTRACT = RELEASE_CONTRACT_V2_0;
+
+function releaseContractFor(record, registry, label) {
+  const contract = registry.get(`${record?.schema}:${record?.schema_version}`);
+  if (contract === undefined) fail(`unsupported ${label} schema`);
+  return contract;
+}
 
 function fail(message) {
   throw new Error(message);
@@ -218,7 +288,7 @@ function createOnly(path, bytes) {
   }
 }
 
-function parseSemverAny(version) {
+function parseSemverAnyV1(version) {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/u.exec(version);
   if (!match) fail(`release version is not canonical SemVer: ${version}`);
   if (match[4]?.split(".").some((identifier) => /^0\d+$/u.test(identifier))) {
@@ -240,8 +310,8 @@ function parseSemverAny(version) {
   });
 }
 
-export function parseSemver(version) {
-  const parsed = parseSemverAny(version);
+function parseSemverV1(version) {
+  const parsed = parseSemverAnyV1(version);
   if (BigInt(parsed.major) < 2n) fail("new v1 releases are forbidden");
   return parsed;
 }
@@ -267,9 +337,9 @@ function comparePrerelease(left, right) {
   return 0;
 }
 
-export function compareSemver(leftVersion, rightVersion) {
-  const left = parseSemverAny(leftVersion);
-  const right = parseSemverAny(rightVersion);
+function compareSemverV1(leftVersion, rightVersion) {
+  const left = parseSemverAnyV1(leftVersion);
+  const right = parseSemverAnyV1(rightVersion);
   for (const field of ["major", "minor", "patch"]) {
     const leftInteger = BigInt(left[field]);
     const rightInteger = BigInt(right[field]);
@@ -278,7 +348,27 @@ export function compareSemver(leftVersion, rightVersion) {
   return comparePrerelease(left.prerelease, right.prerelease);
 }
 
-function validateReleaseManifest(manifest) {
+function parseSemverForContract(version, contract) {
+  if (contract.semver_policy === "canonical-semver-v2-plus-v1") return parseSemverV1(version);
+  fail(`release contract ${contract.id} has no frozen SemVer parser`);
+}
+
+function compareSemverForContract(leftVersion, rightVersion, contract) {
+  if (contract.semver_policy === "canonical-semver-v2-plus-v1") {
+    return compareSemverV1(leftVersion, rightVersion);
+  }
+  fail(`release contract ${contract.id} has no frozen SemVer comparator`);
+}
+
+export function parseSemver(version) {
+  return parseSemverForContract(version, CURRENT_RELEASE_CONTRACT);
+}
+
+export function compareSemver(leftVersion, rightVersion) {
+  return compareSemverForContract(leftVersion, rightVersion, CURRENT_RELEASE_CONTRACT);
+}
+
+function validateReleaseManifest(manifest, contract = CURRENT_RELEASE_CONTRACT) {
   if (!hasExactKeys(manifest, [
     "$schema",
     "schema_version",
@@ -290,19 +380,22 @@ function validateReleaseManifest(manifest) {
     "entrypoint",
     "signer",
   ])) fail("release manifest field set differs from schema v2 policy");
-  if (manifest.$schema !== RELEASE_MANIFEST_SCHEMA || manifest.schema_version !== 2) {
+  if (
+    manifest.$schema !== contract.manifest.schema ||
+    manifest.schema_version !== contract.manifest.schema_version
+  ) {
     fail("unsupported release manifest schema");
   }
   if (
-    !hasExactKeys(manifest.contract_versions, Object.keys(CONTRACT_VERSIONS)) ||
-    !sameCanonicalValue(manifest.contract_versions, CONTRACT_VERSIONS)
+    !hasExactKeys(manifest.contract_versions, Object.keys(contract.manifest.contract_versions)) ||
+    !sameCanonicalValue(manifest.contract_versions, contract.manifest.contract_versions)
   ) {
     fail("release manifest contract versions differ from policy");
   }
   if (
     !hasExactKeys(manifest.source, ["repository", "path", "tree"]) ||
-    manifest.source.repository !== SOURCE_REPOSITORY ||
-    manifest.source.path !== SOURCE_PATH ||
+    manifest.source.repository !== contract.source_repository ||
+    manifest.source.path !== contract.source_path ||
     !/^[0-9a-f]{40}$/u.test(manifest.source.tree ?? "")
   ) {
     fail("release manifest source repository/path/tree differs from policy");
@@ -310,7 +403,10 @@ function validateReleaseManifest(manifest) {
   if (
     !hasExactKeys(manifest.target, ["repository", "ref", "expected_head", "previous_version"])
   ) fail("release manifest target field set differs from policy");
-  if (manifest.target?.repository !== TARGET_REPOSITORY || manifest.target?.ref !== `refs/heads/${TARGET_BRANCH}`) {
+  if (
+    manifest.target?.repository !== contract.target_repository ||
+    manifest.target?.ref !== `refs/heads/${contract.target_branch}`
+  ) {
     fail("release manifest target repository/ref differs from policy");
   }
   if (!/^[0-9a-f]{40}$/u.test(manifest.target?.expected_head ?? "")) {
@@ -319,15 +415,15 @@ function validateReleaseManifest(manifest) {
   if (typeof manifest.target?.previous_version !== "string") {
     fail("release manifest target.previous_version is required");
   }
-  validatePayloadInventory(manifest.files);
+  validatePayloadInventory(manifest.files, contract);
   if (
-    !hasExactKeys(manifest.entrypoint, Object.keys(ENTRYPOINT_POLICY)) ||
-    !sameCanonicalValue(manifest.entrypoint, ENTRYPOINT_POLICY)
+    !hasExactKeys(manifest.entrypoint, Object.keys(contract.entrypoint)) ||
+    !sameCanonicalValue(manifest.entrypoint, contract.entrypoint)
   ) {
     fail("release manifest action entrypoint differs from policy");
   }
-  const actionMetadata = manifest.files.find((record) => record.path === ENTRYPOINT_POLICY.metadata_path);
-  const runtime = manifest.files.find((record) => record.path === ENTRYPOINT_POLICY.main);
+  const actionMetadata = manifest.files.find((record) => record.path === contract.entrypoint.metadata_path);
+  const runtime = manifest.files.find((record) => record.path === contract.entrypoint.main);
   if (
     actionMetadata?.type !== "file" || actionMetadata.mode !== "100644" ||
     runtime?.type !== "file" || runtime.mode !== "100644"
@@ -335,30 +431,30 @@ function validateReleaseManifest(manifest) {
     fail("release manifest must declare regular non-executable action metadata and v2 runtime files");
   }
   if (
-    !hasExactKeys(manifest.signer, Object.keys(SIGNER_POLICY)) ||
-    !sameCanonicalValue(manifest.signer, SIGNER_POLICY)
+    !hasExactKeys(manifest.signer, Object.keys(contract.signer)) ||
+    !sameCanonicalValue(manifest.signer, contract.signer)
   ) {
     fail("release manifest signer identity differs from policy");
   }
-  const release = parseSemver(manifest.version);
-  if (compareSemver(manifest.version, manifest.target.previous_version) <= 0) {
+  const release = parseSemverForContract(manifest.version, contract);
+  if (compareSemverForContract(manifest.version, manifest.target.previous_version, contract) <= 0) {
     fail("release manifest version must advance target.previous_version");
   }
   return Object.freeze({ ...manifest, release });
 }
 
 export function readReleaseManifest(path) {
-  return validateReleaseManifest(readJson(path));
+  return validateReleaseManifest(readJson(path), CURRENT_RELEASE_CONTRACT);
 }
 
-function readReleaseManifestAt(repo, sourceCommit) {
+function readReleaseManifestAt(repo, sourceCommit, contract = CURRENT_RELEASE_CONTRACT) {
   let manifest;
   try {
     manifest = JSON.parse(gitBytes(repo, ["show", `${sourceCommit}:release-manifest.json`]).toString("utf8"));
   } catch (error) {
     fail(`frozen release manifest is missing or invalid JSON: ${error.message}`);
   }
-  return validateReleaseManifest(manifest);
+  return validateReleaseManifest(manifest, contract);
 }
 
 function decodeGitPath(bytes) {
@@ -417,19 +513,23 @@ function inventoryRecord(repo, entry) {
   };
 }
 
-function readPayloadInventory(repo, sourceCommit) {
+function readPayloadTree(repo, sourceCommit, contract = CURRENT_RELEASE_CONTRACT) {
   const raw = gitBytes(repo, [
     "ls-tree",
     "-rz",
     "--full-tree",
     "--format=%(objectmode)%x09%(objecttype)%x09%(objectname)%x09%(path)",
-    `${sourceCommit}:${SOURCE_PATH}`,
+    `${sourceCommit}:${contract.source_path}`,
   ]);
-  const inventory = parseLsTree(raw)
-    .map((entry) => inventoryRecord(repo, entry))
+  const entries = parseLsTree(raw)
     .sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
-  validatePayloadInventory(inventory);
-  return inventory;
+  const inventory = entries.map((entry) => inventoryRecord(repo, entry));
+  validatePayloadInventory(inventory, contract);
+  return { entries, inventory };
+}
+
+function readPayloadInventory(repo, sourceCommit, contract = CURRENT_RELEASE_CONTRACT) {
+  return readPayloadTree(repo, sourceCommit, contract).inventory;
 }
 
 function readTarText(field, label) {
@@ -514,6 +614,135 @@ function parseTarEntries(bytes, { maxBytes = MAX_TRANSPORT_BYTES } = {}) {
   return entries;
 }
 
+function writeTarTextField(header, offset, length, value, label) {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength > length) fail(`release tar ${label} exceeds its ustar field`);
+  bytes.copy(header, offset);
+}
+
+function writeTarOctalField(header, offset, length, value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) fail(`release tar ${label} is out of range`);
+  const digits = value.toString(8);
+  if (digits.length > length - 1) fail(`release tar ${label} exceeds its ustar field`);
+  header.write(`${digits.padStart(length - 1, "0")}\0`, offset, length, "ascii");
+}
+
+function splitUstarPath(path) {
+  const bytes = Buffer.from(path, "utf8");
+  if (bytes.byteLength <= 100) return { name: path, prefix: "" };
+  const components = path.split("/");
+  for (let index = components.length - 1; index > 0; index -= 1) {
+    const prefix = components.slice(0, index).join("/");
+    const name = components.slice(index).join("/");
+    if (Buffer.byteLength(prefix) <= 155 && Buffer.byteLength(name) <= 100) {
+      return { name, prefix };
+    }
+  }
+  fail(`release tar path exceeds the canonical ustar path fields: ${path}`);
+}
+
+function canonicalTarHeader({ path, mode, size, type }) {
+  const header = Buffer.alloc(512);
+  const { name, prefix } = splitUstarPath(path);
+  writeTarTextField(header, 0, 100, name, "name");
+  writeTarOctalField(header, 100, 8, mode, "mode");
+  writeTarOctalField(header, 108, 8, 0, "uid");
+  writeTarOctalField(header, 116, 8, 0, "gid");
+  writeTarOctalField(header, 124, 12, size, "size");
+  writeTarOctalField(header, 136, 12, 0, "mtime");
+  header.fill(0x20, 148, 156);
+  header[156] = type === "directory" ? 0x35 : 0x30;
+  writeTarTextField(header, 257, 6, "ustar\0", "magic");
+  writeTarTextField(header, 263, 2, "00", "version");
+  writeTarTextField(header, 345, 155, prefix, "prefix");
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  const checksumDigits = checksum.toString(8);
+  if (checksumDigits.length > 6) fail("release tar checksum exceeds its ustar field");
+  header.write(`${checksumDigits.padStart(6, "0")}\0 `, 148, 8, "ascii");
+  return header;
+}
+
+function crc32(bytes) {
+  let value = 0xffffffff;
+  for (const byte of bytes) {
+    value ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (value ^ 0xffffffff) >>> 0;
+}
+
+function gzipStored(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.byteLength > MAX_TRANSPORT_BYTES) {
+    fail("release archive exceeds its bounded byte budget");
+  }
+  const chunks = [Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff])];
+  for (let offset = 0; offset < bytes.byteLength;) {
+    const length = Math.min(65_535, bytes.byteLength - offset);
+    const final = offset + length === bytes.byteLength;
+    const framing = Buffer.alloc(5);
+    framing[0] = final ? 0x01 : 0x00;
+    framing.writeUInt16LE(length, 1);
+    framing.writeUInt16LE((~length) & 0xffff, 3);
+    chunks.push(framing, bytes.subarray(offset, offset + length));
+    offset += length;
+  }
+  const trailer = Buffer.alloc(8);
+  trailer.writeUInt32LE(crc32(bytes), 0);
+  trailer.writeUInt32LE(bytes.byteLength >>> 0, 4);
+  chunks.push(trailer);
+  return Buffer.concat(chunks);
+}
+
+function encodeCanonicalReleaseArchiveV1(files, archiveRootName) {
+  decodeGitPath(Buffer.from(archiveRootName, "utf8"));
+  if (!Array.isArray(files) || files.length === 0) {
+    fail("canonical release archive requires a non-empty file list");
+  }
+  const ordered = [...files].sort((left, right) =>
+    Buffer.from(left.path ?? "").compare(Buffer.from(right.path ?? "")));
+  const names = new Set();
+  let tarSize = 512 + 1024;
+  const chunks = [canonicalTarHeader({
+    path: `${archiveRootName}/`,
+    mode: 0o755,
+    size: 0,
+    type: "directory",
+  })];
+  for (const file of ordered) {
+    decodeGitPath(Buffer.from(file.path ?? "", "utf8"));
+    if (names.has(file.path)) fail(`canonical release archive contains a duplicate path: ${file.path}`);
+    names.add(file.path);
+    if (file.mode !== "100644" || !Buffer.isBuffer(file.bytes)) {
+      fail(`canonical release archive file differs from payload policy: ${file.path}`);
+    }
+    if (file.bytes.byteLength > MAX_TRANSPORT_FILE_BYTES) {
+      fail(`canonical release archive entry exceeds its byte budget: ${file.path}`);
+    }
+    tarSize += 512 + Math.ceil(file.bytes.byteLength / 512) * 512;
+    if (tarSize > MAX_TRANSPORT_BYTES) fail("canonical release archive exceeds its byte budget");
+    const path = `${archiveRootName}/${file.path}`;
+    chunks.push(canonicalTarHeader({ path, mode: 0o644, size: file.bytes.byteLength, type: "file" }));
+    chunks.push(file.bytes);
+    const padding = (512 - (file.bytes.byteLength % 512)) % 512;
+    if (padding !== 0) chunks.push(Buffer.alloc(padding));
+  }
+  chunks.push(Buffer.alloc(1024));
+  return gzipStored(Buffer.concat(chunks));
+}
+
+export function encodeCanonicalReleaseArchive(
+  files,
+  archiveRootName,
+  encoder = CURRENT_RELEASE_CONTRACT.archive_encoder,
+) {
+  if (encoder === "canonical-ustar-gzip-store-v1") {
+    return encodeCanonicalReleaseArchiveV1(files, archiveRootName);
+  }
+  fail(`unsupported canonical release archive encoder: ${encoder}`);
+}
+
 function readArchivePayloadInventory(archivePath, archiveRootName) {
   let uncompressed;
   try {
@@ -569,8 +798,8 @@ export function extractCandidateTransport({ archivePath, outputDir }) {
   return true;
 }
 
-function readControlInventory(repo, controlCommit) {
-  return CONTROL_PATH_LIST.map((path) => {
+function readControlInventory(repo, controlCommit, contract = CURRENT_RELEASE_CONTRACT) {
+  return contract.control_paths.map((path) => {
     const raw = gitBytes(repo, [
       "ls-tree",
       "-z",
@@ -587,7 +816,7 @@ function readControlInventory(repo, controlCommit) {
   });
 }
 
-function validatePayloadInventory(inventory) {
+function validatePayloadInventory(inventory, contract = CURRENT_RELEASE_CONTRACT) {
   if (!Array.isArray(inventory) || inventory.length === 0) fail("release payload inventory must be a non-empty array");
   let previous = null;
   for (const record of inventory) {
@@ -595,6 +824,9 @@ function validatePayloadInventory(inventory) {
       fail("release payload inventory record shape differs from policy");
     }
     decodeGitPath(Buffer.from(record.path, "utf8"));
+    if (record.path.startsWith(".github/workflows/")) {
+      fail(`release payload rejects workflow definitions: ${record.path}`);
+    }
     if (
       record.type !== "file" ||
       record.mode !== "100644" ||
@@ -612,14 +844,14 @@ function validatePayloadInventory(inventory) {
   const actualRuntimePaths = discoverV2RuntimeModulePaths(
     Object.fromEntries(inventory.map((record) => [record.path, record])),
   );
-  if (!sameCanonicalValue(actualRuntimePaths, REQUIRED_V2_RUNTIME_MODULE_PATHS)) {
+  if (!sameCanonicalValue(actualRuntimePaths, contract.runtime_paths)) {
     fail(`released v2 runtime module closure differs from policy: ${actualRuntimePaths.join(", ")}`);
   }
   return inventory;
 }
 
-function nulDelimitedInventoryDigest(inventory) {
-  validatePayloadInventory(inventory);
+function nulDelimitedInventoryDigest(inventory, contract = CURRENT_RELEASE_CONTRACT) {
+  validatePayloadInventory(inventory, contract);
   const hash = createHash("sha256");
   for (const record of inventory) {
     for (const field of [record.path, record.type, record.mode, String(record.size), record.sha256]) {
@@ -630,13 +862,13 @@ function nulDelimitedInventoryDigest(inventory) {
   return hash.digest("hex");
 }
 
-function validateControlInventory(inventory) {
-  if (!Array.isArray(inventory) || inventory.length !== CONTROL_PATH_LIST.length) {
+function validateControlInventory(inventory, contract = CURRENT_RELEASE_CONTRACT) {
+  if (!Array.isArray(inventory) || inventory.length !== contract.control_paths.length) {
     fail("release control inventory is incomplete");
   }
-  for (let index = 0; index < CONTROL_PATH_LIST.length; index += 1) {
+  for (let index = 0; index < contract.control_paths.length; index += 1) {
     const record = inventory[index];
-    if (record?.path !== CONTROL_PATH_LIST[index] || typeof record.present !== "boolean") {
+    if (record?.path !== contract.control_paths[index] || typeof record.present !== "boolean") {
       fail("release control inventory paths differ from policy");
     }
     if (record.present === false) {
@@ -646,8 +878,7 @@ function validateControlInventory(inventory) {
     if (!hasExactKeys(record, ["path", "type", "mode", "size", "sha256", "present"])) {
       fail(`present control inventory record is malformed: ${record.path}`);
     }
-    const expectedMode = record.path === "scripts/generate-action-release-provenance.mjs" ||
-      record.path === "scripts/release-action-subtree.sh" ? "100755" : "100644";
+    const expectedMode = contract.executable_control_paths.includes(record.path) ? "100755" : "100644";
     decodeGitPath(Buffer.from(record.path, "utf8"));
     if (
       record.type !== "file" ||
@@ -673,6 +904,10 @@ function changedPaths(repo, parent, commit) {
     .map((path) => decodeGitPath(Buffer.from(path, "binary")));
 }
 
+function isPublisherControlPath(path, contract = CURRENT_RELEASE_CONTRACT) {
+  return contract.control_paths.includes(path) || path.startsWith(".github/workflows/");
+}
+
 function requireLinearRange(repo, ancestor, descendant) {
   try {
     git(repo, ["merge-base", "--is-ancestor", ancestor, descendant]);
@@ -694,7 +929,59 @@ function requireLinearRange(repo, ancestor, descendant) {
   return commits;
 }
 
-function assertControlClosure(repo, sourceCommit, controlCommit) {
+function validatePushAdmission(admission, contract = CURRENT_RELEASE_CONTRACT) {
+  if (
+    !hasExactKeys(admission, [
+      "schema",
+      "schema_version",
+      "event",
+      "before_commit",
+      "after_commit",
+      "landing_commits",
+    ]) ||
+    admission.schema !== contract.push_admission.schema ||
+    admission.schema_version !== contract.push_admission.schema_version ||
+    admission.event !== contract.push_admission.event ||
+    !/^[0-9a-f]{40}$/u.test(admission.before_commit ?? "") ||
+    !/^[0-9a-f]{40}$/u.test(admission.after_commit ?? "") ||
+    admission.before_commit === admission.after_commit ||
+    !Array.isArray(admission.landing_commits) ||
+    admission.landing_commits.length === 0 ||
+    admission.landing_commits.some((commit) => !/^[0-9a-f]{40}$/u.test(commit)) ||
+    new Set(admission.landing_commits).size !== admission.landing_commits.length ||
+    admission.landing_commits.at(-1) !== admission.after_commit
+  ) {
+    fail("release push admission record differs from policy");
+  }
+  return admission;
+}
+
+function expectedPushAdmission(repo, beforeCommit, afterCommit, contract = CURRENT_RELEASE_CONTRACT) {
+  if (!/^[0-9a-f]{40}$/u.test(beforeCommit) || !/^[0-9a-f]{40}$/u.test(afterCommit)) {
+    fail("push admission before/after commits must be full SHA-1 object IDs");
+  }
+  const landingCommits = requireLinearRange(repo, beforeCommit, afterCommit);
+  if (landingCommits.length === 0) fail("release push admission range must be non-empty");
+  let previous = beforeCommit;
+  for (const commit of landingCommits) {
+    const forbidden = changedPaths(repo, previous, commit)
+      .filter((path) => isPublisherControlPath(path, contract));
+    if (forbidden.length > 0) {
+      fail(`recovery_code=publisher-control-landing; push landing changed publisher controls: ${forbidden.join(", ")}`);
+    }
+    previous = commit;
+  }
+  return validatePushAdmission({
+    schema: contract.push_admission.schema,
+    schema_version: contract.push_admission.schema_version,
+    event: contract.push_admission.event,
+    before_commit: beforeCommit,
+    after_commit: afterCommit,
+    landing_commits: landingCommits,
+  }, contract);
+}
+
+function assertControlClosure(repo, sourceCommit, controlCommit, contract = CURRENT_RELEASE_CONTRACT) {
   const parents = git(repo, ["show", "-s", "--format=%P", sourceCommit]).split(/\s+/u).filter(Boolean);
   if (parents.length !== 1) fail("release intent commit must have exactly one parent");
   const parent = parents[0];
@@ -709,7 +996,8 @@ function assertControlClosure(repo, sourceCommit, controlCommit) {
   if (parentManifestObject === currentManifestObject) {
     fail("recovery_code=source-not-release-intent; source_sha must be the commit that changes release-manifest.json");
   }
-  const intentControls = changedPaths(repo, parent, sourceCommit).filter((path) => CONTROL_PATHS.has(path));
+  const intentControls = changedPaths(repo, parent, sourceCommit)
+    .filter((path) => isPublisherControlPath(path, contract));
   if (intentControls.length > 0) {
     fail(`recovery_code=publisher-control-closure; release intent and publisher controls changed together: ${intentControls.join(", ")}`);
   }
@@ -811,7 +1099,7 @@ function metadataScalar(mapping, key, label) {
   return value;
 }
 
-export function validateActionMetadata(bytes) {
+function validateActionMetadataV2_0(bytes) {
   if (![...bytes].every((byte) => byte === 0x0a || (byte >= 0x20 && byte <= 0x7e))) {
     fail("root action.yml must contain only printable ASCII bytes and LF line endings");
   }
@@ -883,64 +1171,136 @@ export function validateActionMetadata(bytes) {
   return true;
 }
 
-function expectedReleasePlan({ repo, sourceCommit, controlCommit }) {
+export function validateActionMetadata(bytes, contract = CURRENT_RELEASE_CONTRACT) {
+  if (contract.id === RELEASE_CONTRACT_V2_0.id) return validateActionMetadataV2_0(bytes);
+  fail(`release contract ${contract.id} has no frozen Action metadata validator`);
+}
+
+function expectedReleasePlan({
+  repo,
+  sourceCommit,
+  controlCommit,
+  pushAdmission,
+  contract = CURRENT_RELEASE_CONTRACT,
+}) {
+  validatePushAdmission(pushAdmission, contract);
+  if (pushAdmission.after_commit !== sourceCommit) {
+    fail("release push admission does not bind the exact source commit");
+  }
   const manifestBytes = gitBytes(repo, ["show", `${sourceCommit}:release-manifest.json`]);
-  const manifest = readReleaseManifestAt(repo, sourceCommit);
-  assertControlClosure(repo, sourceCommit, controlCommit);
-  const executionControlFiles = readControlInventory(repo, controlCommit);
-  const sourceTree = git(repo, ["rev-parse", `${sourceCommit}:${SOURCE_PATH}`]);
+  const manifest = readReleaseManifestAt(repo, sourceCommit, contract);
+  assertControlClosure(repo, sourceCommit, controlCommit, contract);
+  const executionControlFiles = readControlInventory(repo, controlCommit, contract);
+  const sourceTree = git(repo, ["rev-parse", `${sourceCommit}:${contract.source_path}`]);
   if (sourceTree !== manifest.source.tree) {
     fail("release manifest source.tree differs from the exact Action subtree");
   }
-  const payloadFiles = readPayloadInventory(repo, sourceCommit);
+  const payloadFiles = readPayloadInventory(repo, sourceCommit, contract);
   if (!sameCanonicalValue(payloadFiles, manifest.files)) {
     fail("release manifest file inventory differs from the exact Action subtree");
   }
-  validateActionMetadata(gitBytes(repo, ["show", `${sourceCommit}:${SOURCE_PATH}/${ENTRYPOINT_POLICY.metadata_path}`]));
-  const actionPackage = JSON.parse(git(repo, ["show", `${sourceCommit}:${SOURCE_PATH}/package.json`]));
+  validateActionMetadata(
+    gitBytes(repo, ["show", `${sourceCommit}:${contract.source_path}/${contract.entrypoint.metadata_path}`]),
+    contract,
+  );
+  const actionPackage = JSON.parse(git(repo, ["show", `${sourceCommit}:${contract.source_path}/package.json`]));
   if (actionPackage.version !== manifest.version) {
     fail("release manifest version must equal packages/action/package.json version");
   }
-  if (actionPackage.repository?.url !== "git+https://github.com/JoeyTeng/codex-review-gate-action.git") {
+  if (actionPackage.repository?.url !== contract.action_package_repository) {
     fail("released action package repository metadata differs from target repository");
   }
   return {
-    schema: "codex-review-gate-action-release-plan-v1",
-    schema_version: 1,
+    schema: contract.plan.schema,
+    schema_version: contract.plan.schema_version,
+    release_contract: contract.id,
+    push_admission: pushAdmission,
     version: manifest.version,
     immutable_tag: manifest.release.immutableTag,
     major_alias: manifest.release.majorAlias,
     prerelease: manifest.release.prerelease !== null,
-    source_repository: SOURCE_REPOSITORY,
+    source_repository: contract.source_repository,
     source_commit: sourceCommit,
-    source_path: SOURCE_PATH,
+    source_path: contract.source_path,
     source_tree: sourceTree,
     manifest_sha256: createHash("sha256").update(manifestBytes).digest("hex"),
     release_intent_commit: sourceCommit,
-    control_repository: SOURCE_REPOSITORY,
+    control_repository: contract.source_repository,
     control_commit: controlCommit,
     control_files: executionControlFiles,
-    target_repository: TARGET_REPOSITORY,
-    target_branch: TARGET_BRANCH,
+    target_repository: contract.target_repository,
+    target_branch: contract.target_branch,
     target_master_before: manifest.target.expected_head,
     previous_version: manifest.target.previous_version,
     signer: { ...manifest.signer },
   };
 }
 
-export function createReleasePlan({ repo, sourceRef, controlRef = sourceRef }) {
-  const sourceCommit = git(repo, ["rev-parse", "--verify", `${sourceRef}^{commit}`]);
-  const controlCommit = git(repo, ["rev-parse", "--verify", `${controlRef}^{commit}`]);
-  return expectedReleasePlan({ repo, sourceCommit, controlCommit });
+function recoverPushAdmission(repo, sourceCommit, admissionPlanPath) {
+  const admittedPlan = validatePlan(readJson(admissionPlanPath));
+  if (
+    admittedPlan.release_contract !== CURRENT_RELEASE_CONTRACT.id ||
+    admittedPlan.source_commit !== sourceCommit ||
+    admittedPlan.push_admission.after_commit !== sourceCommit
+  ) {
+    fail("persisted push admission does not bind the requested exact source commit");
+  }
+  const expectedAdmission = expectedPushAdmission(
+    repo,
+    admittedPlan.push_admission.before_commit,
+    sourceCommit,
+    CURRENT_RELEASE_CONTRACT,
+  );
+  const originalControlCommit = git(repo, ["rev-parse", "--verify", `${admittedPlan.control_commit}^{commit}`]);
+  const expectedOriginalPlan = expectedReleasePlan({
+    repo,
+    sourceCommit,
+    controlCommit: originalControlCommit,
+    pushAdmission: expectedAdmission,
+    contract: CURRENT_RELEASE_CONTRACT,
+  });
+  if (!sameCanonicalValue(admittedPlan, expectedOriginalPlan)) {
+    fail("persisted push admission plan differs from the original exact source and controls");
+  }
+  return expectedAdmission;
 }
 
-export function validatePlan(plan) {
-  if (plan.schema !== "codex-review-gate-action-release-plan-v1" || plan.schema_version !== 1) {
+export function createReleasePlan({
+  repo,
+  sourceRef,
+  controlRef = sourceRef,
+  admissionBeforeRef,
+  admissionPlanPath,
+}) {
+  const sourceCommit = git(repo, ["rev-parse", "--verify", `${sourceRef}^{commit}`]);
+  const controlCommit = git(repo, ["rev-parse", "--verify", `${controlRef}^{commit}`]);
+  if ((admissionBeforeRef === undefined) === (admissionPlanPath === undefined)) {
+    fail("release planning requires exactly one push admission source");
+  }
+  const pushAdmission = admissionPlanPath === undefined
+    ? expectedPushAdmission(
+      repo,
+      git(repo, ["rev-parse", "--verify", `${admissionBeforeRef}^{commit}`]),
+      sourceCommit,
+      CURRENT_RELEASE_CONTRACT,
+    )
+    : recoverPushAdmission(repo, sourceCommit, admissionPlanPath);
+  return expectedReleasePlan({ repo, sourceCommit, controlCommit, pushAdmission });
+}
+
+export function validatePlan(plan, contract = releaseContractFor(
+  plan,
+  HISTORICAL_PLAN_CONTRACTS,
+  "release plan",
+)) {
+  if (plan.schema !== contract.plan.schema || plan.schema_version !== contract.plan.schema_version) {
     fail("candidate uses an unsupported release plan");
   }
   if (!hasExactKeys(plan, [
     "schema",
     "schema_version",
+    "release_contract",
+    "push_admission",
     "version",
     "immutable_tag",
     "major_alias",
@@ -962,7 +1322,11 @@ export function validatePlan(plan) {
   ])) {
     fail("release plan field set differs from policy");
   }
-  const release = parseSemver(plan.version);
+  const release = parseSemverForContract(plan.version, contract);
+  if (plan.release_contract !== contract.id) {
+    fail("release plan contract differs from policy");
+  }
+  validatePushAdmission(plan.push_admission, contract);
   if (
     plan.immutable_tag !== release.immutableTag ||
     plan.major_alias !== release.majorAlias ||
@@ -971,9 +1335,9 @@ export function validatePlan(plan) {
     fail("release plan tags do not match SemVer policy");
   }
   if (
-    plan.source_repository !== SOURCE_REPOSITORY ||
-    plan.control_repository !== SOURCE_REPOSITORY ||
-    plan.target_repository !== TARGET_REPOSITORY
+    plan.source_repository !== contract.source_repository ||
+    plan.control_repository !== contract.source_repository ||
+    plan.target_repository !== contract.target_repository
   ) {
     fail("release plan repository identity differs from policy");
   }
@@ -981,20 +1345,23 @@ export function validatePlan(plan) {
     if (!/^[0-9a-f]{40}$/u.test(plan[field] ?? "")) fail(`release plan ${field} must be a full SHA-1 object ID`);
   }
   if (plan.release_intent_commit !== plan.source_commit) fail("release intent commit must equal source commit");
+  if (plan.push_admission.after_commit !== plan.source_commit) {
+    fail("release plan push admission must end at the exact source commit");
+  }
   if (!/^[0-9a-f]{64}$/u.test(plan.manifest_sha256 ?? "")) fail("release plan manifest digest is invalid");
-  if (plan.source_path !== SOURCE_PATH || plan.target_branch !== TARGET_BRANCH) {
+  if (plan.source_path !== contract.source_path || plan.target_branch !== contract.target_branch) {
     fail("release plan source path or target branch differs from policy");
   }
-  if (compareSemver(plan.version, plan.previous_version) <= 0) {
+  if (compareSemverForContract(plan.version, plan.previous_version, contract) <= 0) {
     fail("release plan does not advance previous_version");
   }
   if (
-    !hasExactKeys(plan.signer, Object.keys(SIGNER_POLICY)) ||
-    !sameCanonicalValue(plan.signer, SIGNER_POLICY)
+    !hasExactKeys(plan.signer, Object.keys(contract.signer)) ||
+    !sameCanonicalValue(plan.signer, contract.signer)
   ) {
     fail("release plan signer differs from policy");
   }
-  validateControlInventory(plan.control_files);
+  validateControlInventory(plan.control_files, contract);
   return plan;
 }
 
@@ -1491,16 +1858,30 @@ export function validateSigningKeyHome({
 }
 
 function validatePlanAgainstSource({ repo, sourceRef, controlRef, plan }) {
+  const contract = releaseContractFor(plan, HISTORICAL_PLAN_CONTRACTS, "release plan");
+  validatePlan(plan, contract);
   const sourceCommit = git(repo, ["rev-parse", "--verify", `${sourceRef}^{commit}`]);
   const controlCommit = git(repo, ["rev-parse", "--verify", `${controlRef}^{commit}`]);
-  const expected = expectedReleasePlan({ repo, sourceCommit, controlCommit });
+  const pushAdmission = expectedPushAdmission(
+    repo,
+    plan.push_admission.before_commit,
+    sourceCommit,
+    contract,
+  );
+  const expected = expectedReleasePlan({ repo, sourceCommit, controlCommit, pushAdmission, contract });
   if (!sameCanonicalValue(plan, expected)) {
     fail("release plan differs from the exact frozen manifest, source, or publisher controls");
   }
   return { sourceCommit, controlCommit, expected };
 }
 
-function assertLiveSourceClosure(repo, sourceCommit, controlCommit, liveMasterCommit) {
+function assertLiveSourceClosure(
+  repo,
+  sourceCommit,
+  controlCommit,
+  liveMasterCommit,
+  contract = CURRENT_RELEASE_CONTRACT,
+) {
   const sourceRange = requireLinearRange(repo, sourceCommit, liveMasterCommit);
   const controlRange = requireLinearRange(repo, controlCommit, liveMasterCommit);
   // A post-plan control change always invalidates the approval, even when the
@@ -1508,7 +1889,8 @@ function assertLiveSourceClosure(repo, sourceCommit, controlCommit, liveMasterCo
   // authorize completion of a proved partial prefix; control drift may not.
   for (const commit of controlRange) {
     const parent = git(repo, ["show", "-s", "--format=%P", commit]);
-    const forbidden = changedPaths(repo, parent, commit).filter((path) => CONTROL_PATHS.has(path));
+    const forbidden = changedPaths(repo, parent, commit)
+      .filter((path) => isPublisherControlPath(path, contract));
     if (forbidden.length > 0) {
       fail(`recovery_code=publisher-control-drift; live source master changed publisher controls during approval: ${forbidden.join(", ")}`);
     }
@@ -1522,19 +1904,21 @@ function assertLiveSourceClosure(repo, sourceCommit, controlCommit, liveMasterCo
   }
 }
 
-function validateCandidatePayload(payload, plan) {
+function validateCandidatePayload(payload, plan, contract = CURRENT_RELEASE_CONTRACT) {
   if (!hasExactKeys(payload, ["tree", "inventory_sha256", "files"]) || payload.tree !== plan.source_tree) {
     fail("release candidate payload does not bind the planned source tree");
   }
-  validatePayloadInventory(payload.files);
-  if (payload.inventory_sha256 !== nulDelimitedInventoryDigest(payload.files)) {
+  validatePayloadInventory(payload.files, contract);
+  if (payload.inventory_sha256 !== nulDelimitedInventoryDigest(payload.files, contract)) {
     fail("release candidate NUL-delimited inventory digest differs from its file records");
   }
   return payload;
 }
 
 export function buildCandidate({ repo, sourceRef, controlRef, planPath, outputDir }) {
-  const plan = validatePlan(readJson(planPath));
+  const rawPlan = readJson(planPath);
+  const contract = releaseContractFor(rawPlan, HISTORICAL_PLAN_CONTRACTS, "release plan");
+  const plan = validatePlan(rawPlan, contract);
   const effectiveControlRef = controlRef ?? plan.control_commit;
   const { sourceCommit } = validatePlanAgainstSource({
     repo,
@@ -1542,7 +1926,7 @@ export function buildCandidate({ repo, sourceRef, controlRef, planPath, outputDi
     controlRef: effectiveControlRef,
     plan,
   });
-  const sourceTree = git(repo, ["rev-parse", `${sourceCommit}:${SOURCE_PATH}`]);
+  const sourceTree = git(repo, ["rev-parse", `${sourceCommit}:${contract.source_path}`]);
   if (sourceCommit !== plan.source_commit || sourceTree !== plan.source_tree) {
     fail("candidate source differs from the immutable release plan");
   }
@@ -1551,37 +1935,33 @@ export function buildCandidate({ repo, sourceRef, controlRef, planPath, outputDi
   const archiveName = `codex-review-gate-action-${plan.immutable_tag}.tar.gz`;
   const archiveRootName = `codex-review-gate-action-${plan.immutable_tag}`;
   const archivePath = join(outputDir, archiveName);
-  const tarPath = join(outputDir, ".candidate.tar");
-  const payloadFiles = readPayloadInventory(repo, sourceCommit);
-  const sourceTimestamp = git(repo, ["show", "-s", "--format=%ct", sourceCommit]);
-  execFileSync("git", [
-    "-c", "tar.umask=0022",
-    "-C", repo,
-    "archive",
-    "--format=tar",
-    `--mtime=@${sourceTimestamp}`,
-    `--prefix=codex-review-gate-action-${plan.immutable_tag}/`,
-    "-o", tarPath,
-    `${sourceCommit}:${SOURCE_PATH}`,
-  ], { stdio: ["ignore", "pipe", "pipe"] });
-  const compressed = execFileSync("gzip", ["-n", "-9", "-c", tarPath], {
-    encoding: null,
-    maxBuffer: 64 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  if (contract.archive_encoder !== "canonical-ustar-gzip-store-v1") {
+    fail(`release contract ${contract.id} has no frozen archive encoder`);
+  }
+  const payloadTree = readPayloadTree(repo, sourceCommit, contract);
+  const payloadFiles = payloadTree.inventory;
+  const archiveFiles = payloadTree.entries.map((entry) => ({
+    path: entry.path,
+    mode: entry.mode,
+    bytes: gitBytes(repo, ["cat-file", "blob", entry.objectId]),
+  }));
+  const compressed = encodeCanonicalReleaseArchive(
+    archiveFiles,
+    archiveRootName,
+    contract.archive_encoder,
+  );
   writeFileSync(archivePath, compressed, { flag: "wx", mode: 0o600 });
-  unlinkSync(tarPath);
   const archivedPayloadFiles = readArchivePayloadInventory(archivePath, archiveRootName);
   if (!sameCanonicalValue(archivedPayloadFiles, payloadFiles)) {
     fail("release archive payload differs from the exact frozen Git-tree inventory");
   }
   const candidate = {
-    schema: "codex-review-gate-action-candidate-v1",
-    schema_version: 1,
+    schema: contract.candidate.schema,
+    schema_version: contract.candidate.schema_version,
     plan,
     payload: {
       tree: sourceTree,
-      inventory_sha256: nulDelimitedInventoryDigest(payloadFiles),
+      inventory_sha256: nulDelimitedInventoryDigest(payloadFiles, contract),
       files: payloadFiles,
     },
     archive: {
@@ -1606,14 +1986,12 @@ export function verifyCandidate(candidateDir) {
     }
   }
   const candidate = readJson(join(candidateDir, "candidate.json"));
-  if (candidate.schema !== "codex-review-gate-action-candidate-v1" || candidate.schema_version !== 1) {
-    fail("unsupported release candidate schema");
-  }
+  const contract = releaseContractFor(candidate, HISTORICAL_CANDIDATE_CONTRACTS, "release candidate");
   if (!hasExactKeys(candidate, ["schema", "schema_version", "plan", "payload", "archive"])) {
     fail("release candidate field set differs from policy");
   }
-  validatePlan(candidate.plan);
-  validateCandidatePayload(candidate.payload, candidate.plan);
+  validatePlan(candidate.plan, contract);
+  validateCandidatePayload(candidate.payload, candidate.plan, contract);
   if (!hasExactKeys(candidate.archive, ["name", "sha256", "size"])) {
     fail("release candidate archive record differs from policy");
   }
@@ -1678,6 +2056,8 @@ export function validatePublicationInput({
   controlRef,
   liveMasterRef,
 }) {
+  const candidate = verifyCandidate(candidateDir);
+  const contract = releaseContractFor(candidate, HISTORICAL_CANDIDATE_CONTRACTS, "release candidate");
   const { sourceCommit, controlCommit } = validateCandidateAgainstSource({
     candidateDir,
     repo,
@@ -1686,7 +2066,7 @@ export function validatePublicationInput({
   });
   const liveMasterCommit = git(repo, ["rev-parse", "--verify", `${liveMasterRef}^{commit}`]);
   try {
-    assertLiveSourceClosure(repo, sourceCommit, controlCommit, liveMasterCommit);
+    assertLiveSourceClosure(repo, sourceCommit, controlCommit, liveMasterCommit, contract);
     return { write_eligible: true, recovery_code: null, reason: null };
   } catch (error) {
     if (!/recovery_code=(?:publisher-control-drift|release-intent-superseded|source-not-current-master-ancestor|nonlinear-release-control-range|incomplete-release-control-range)/u.test(error.message)) {
@@ -1709,6 +2089,7 @@ function expectedPublicationPlan({
   liveMasterRef,
 }) {
   const candidate = verifyCandidate(candidateDir);
+  const contract = releaseContractFor(candidate, HISTORICAL_CANDIDATE_CONTRACTS, "release candidate");
   const { sourceCommit, controlCommit } = validateCandidateAgainstSource({
     candidateDir,
     repo,
@@ -1724,8 +2105,8 @@ function expectedPublicationPlan({
     liveMasterRef: liveMasterCommit,
   });
   return {
-    schema: "codex-review-gate-action-publication-plan-v1",
-    schema_version: 1,
+    schema: contract.publication_plan.schema,
+    schema_version: contract.publication_plan.schema_version,
     source_commit: sourceCommit,
     control_commit: controlCommit,
     live_source_master: liveMasterCommit,
@@ -1806,8 +2187,9 @@ function requireExactObjectHeaders(fields, required, optional, label) {
   }
 }
 
-function validateReleaseIdentity(value, label) {
-  if (!/^JoeyTeng-Codex <codex@mahane\.me> [0-9]+ [+-][0-9]{4}$/u.test(value)) {
+function validateReleaseIdentity(value, label, contract = CURRENT_RELEASE_CONTRACT) {
+  const expectedPrefix = `${contract.signer.name} <${contract.signer.email}> `;
+  if (!value.startsWith(expectedPrefix) || !/^[0-9]+ [+-][0-9]{4}$/u.test(value.slice(expectedPrefix.length))) {
     fail(`${label} identity differs from release policy`);
   }
 }
@@ -1832,9 +2214,11 @@ export function validateTargetReleaseObjects({
   releaseCommit,
   fullTagObject,
 }) {
+  const contract = releaseContractFor(plan, HISTORICAL_PLAN_CONTRACTS, "release plan");
+  validatePlan(plan, contract);
   if (!targetRepo) fail("target repository is required for published object verification");
   const releaseSubject = `Release codex-review-gate-action ${plan.immutable_tag}`;
-  const expectedCommitMessage = `${releaseSubject}\n\nSource: ${SOURCE_REPOSITORY}@${plan.source_commit}\nManifest-SHA256: ${plan.manifest_sha256}\n`;
+  const expectedCommitMessage = `${releaseSubject}\n\nSource: ${contract.source_repository}@${plan.source_commit}\nManifest-SHA256: ${plan.manifest_sha256}\n`;
   const expectedTagMessage = `${releaseSubject}\n`;
   if (
     git(targetRepo, ["cat-file", "-t", releaseCommit]) !== "commit" ||
@@ -1869,10 +2253,12 @@ export function validateTargetReleaseObjects({
   validateReleaseIdentity(
     exactOne(commitObject.fields, "author", "published release commit"),
     "published release commit author",
+    contract,
   );
   validateReleaseIdentity(
     exactOne(commitObject.fields, "committer", "published release commit"),
     "published release commit committer",
+    contract,
   );
   let previousCommit;
   try {
@@ -1912,6 +2298,7 @@ export function validateTargetReleaseObjects({
   validateReleaseIdentity(
     exactOne(tagObject.fields, "tagger", "published immutable tag"),
     "published immutable tagger",
+    contract,
   );
   return true;
 }
@@ -1928,14 +2315,19 @@ export function verifyPublishedAssets({
     fail("published release commit and tag object must be full SHA-1 object IDs");
   }
   const sourceCommit = git(repo, ["rev-parse", "--verify", `${sourceRef}^{commit}`]);
-  const sourceTree = git(repo, ["rev-parse", `${sourceCommit}:${SOURCE_PATH}`]);
   const manifestBytes = gitBytes(repo, ["show", `${sourceCommit}:release-manifest.json`]);
   const provenancePath = join(assetDir, "release-provenance.json");
   const provenanceSignaturePath = join(assetDir, "release-provenance.json.asc");
   const provenance = readJson(provenancePath);
+  const contract = releaseContractFor(
+    provenance,
+    HISTORICAL_RELEASE_CONTRACTS,
+    "published provenance",
+  );
+  const sourceTree = git(repo, ["rev-parse", `${sourceCommit}:${contract.source_path}`]);
   if (
-    provenance.schema !== "codex-review-gate-action-release-provenance-v1" ||
-    provenance.schema_version !== 1 ||
+    provenance.schema !== contract.provenance.schema ||
+    provenance.schema_version !== contract.provenance.schema_version ||
     !hasExactKeys(provenance, [
       "schema",
       "schema_version",
@@ -1951,8 +2343,8 @@ export function verifyPublishedAssets({
   ) {
     fail("unsupported published provenance schema");
   }
-  const plan = validatePlan(provenance.plan);
-  validateCandidatePayload(provenance.payload, plan);
+  const plan = validatePlan(provenance.plan, contract);
+  validateCandidatePayload(provenance.payload, plan, contract);
   if (
     plan.source_commit !== sourceCommit ||
     plan.source_tree !== sourceTree ||
@@ -1960,8 +2352,8 @@ export function verifyPublishedAssets({
     provenance.manifest?.sha256 !== plan.manifest_sha256 ||
     provenance.manifest?.source_commit !== sourceCommit ||
     provenance.manifest?.version !== plan.version ||
-    provenance.target?.repository !== TARGET_REPOSITORY ||
-    provenance.target?.branch !== TARGET_BRANCH ||
+    provenance.target?.repository !== contract.target_repository ||
+    provenance.target?.branch !== contract.target_branch ||
     provenance.target?.parent !== plan.target_master_before ||
     provenance.target?.commit !== releaseCommit ||
     provenance.target?.tree !== sourceTree ||
@@ -1972,9 +2364,9 @@ export function verifyPublishedAssets({
   }
   validateTargetReleaseObjects({ targetRepo, plan, releaseCommit, fullTagObject });
   if (
-    provenance.workflow?.repository !== SOURCE_REPOSITORY ||
+    provenance.workflow?.repository !== contract.source_repository ||
     provenance.workflow?.workflow_sha !== plan.control_commit ||
-    provenance.workflow?.workflow_ref !== `${SOURCE_REPOSITORY}/.github/workflows/sync-action-subtree.yml@refs/heads/master` ||
+    provenance.workflow?.workflow_ref !== `${contract.source_repository}/.github/workflows/sync-action-subtree.yml@refs/heads/master` ||
     !/^[1-9][0-9]*$/u.test(provenance.workflow?.run_id ?? "") ||
     !Number.isSafeInteger(provenance.workflow?.run_attempt) ||
     provenance.workflow.run_attempt < 1
@@ -1983,8 +2375,8 @@ export function verifyPublishedAssets({
   }
   const expectedSignature = (object) => ({
     object,
-    primary_fingerprint: PRIMARY_FINGERPRINT,
-    signing_subkey_fingerprint: SIGNING_SUBKEY_FINGERPRINT,
+    primary_fingerprint: contract.signer.primary_fingerprint,
+    signing_subkey_fingerprint: contract.signer.signing_subkey_fingerprint,
   });
   if (
     !sameCanonicalValue(provenance.signatures?.commit, expectedSignature(releaseCommit)) ||
@@ -1992,13 +2384,13 @@ export function verifyPublishedAssets({
     !sameCanonicalValue(provenance.signatures?.provenance, {
       path: "release-provenance.json",
       detached_signature: "release-provenance.json.asc",
-      primary_fingerprint: PRIMARY_FINGERPRINT,
-      signing_subkey_fingerprint: SIGNING_SUBKEY_FINGERPRINT,
+      primary_fingerprint: contract.signer.primary_fingerprint,
+      signing_subkey_fingerprint: contract.signer.signing_subkey_fingerprint,
     })
   ) {
     fail("published provenance signature bindings differ from policy");
   }
-  const release = parseSemver(plan.version);
+  const release = parseSemverForContract(plan.version, contract);
   if (release.majorAlias === null) {
     if (!sameCanonicalValue(provenance.alias_transition, {
       name: null,
@@ -2014,20 +2406,23 @@ export function verifyPublishedAssets({
     !(provenance.alias_transition.before === null || /^[0-9a-f]{40}$/u.test(provenance.alias_transition.before)) ||
     provenance.alias_transition.target_commit !== releaseCommit ||
     provenance.alias_transition.target_version !== plan.version ||
-    !["create", "force-with-lease", "already-current", "superseded"].includes(provenance.alias_transition.mode) ||
-    (provenance.alias_transition.mode === "create"
-      ? provenance.alias_transition.before !== null
-      : provenance.alias_transition.before === null) ||
     !sameCanonicalValue(
       provenance.signatures.floating_alias,
       {
         required: true,
-        primary_fingerprint: PRIMARY_FINGERPRINT,
-        signing_subkey_fingerprint: SIGNING_SUBKEY_FINGERPRINT,
+        primary_fingerprint: contract.signer.primary_fingerprint,
+        signing_subkey_fingerprint: contract.signer.signing_subkey_fingerprint,
       },
     )
   ) {
     fail("stable provenance floating-alias transition differs from policy");
+  }
+  if (release.majorAlias !== null) {
+    validateFloatingAliasMode(
+      provenance.alias_transition.mode,
+      provenance.alias_transition.before,
+      contract,
+    );
   }
   if (!existsSync(provenanceSignaturePath) || readFileSync(provenanceSignaturePath).byteLength === 0) {
     fail("published provenance detached signature is missing or empty");
@@ -2037,7 +2432,7 @@ export function verifyPublishedAssets({
   try {
     const manifestPath = join(scratch, "release-manifest.json");
     writeFileSync(manifestPath, manifestBytes, { flag: "wx", mode: 0o600 });
-    const manifest = readReleaseManifest(manifestPath);
+    const manifest = validateReleaseManifest(readJson(manifestPath), contract);
     if (
       manifest.version !== plan.version ||
       manifest.target.expected_head !== plan.target_master_before ||
@@ -2046,10 +2441,10 @@ export function verifyPublishedAssets({
     ) {
       fail("published provenance differs from the source release manifest");
     }
-    const actionPackage = JSON.parse(git(repo, ["show", `${sourceCommit}:${SOURCE_PATH}/package.json`]));
+    const actionPackage = JSON.parse(git(repo, ["show", `${sourceCommit}:${contract.source_path}/package.json`]));
     if (
       actionPackage.version !== manifest.version ||
-      actionPackage.repository?.url !== "git+https://github.com/JoeyTeng/codex-review-gate-action.git"
+      actionPackage.repository?.url !== contract.action_package_repository
     ) {
       fail("published action package metadata differs from the release manifest");
     }
@@ -2094,6 +2489,18 @@ function optionalObjectId(value, label) {
   return value;
 }
 
+function validateFloatingAliasMode(mode, before, contract) {
+  const policy = contract.floating_alias_modes[mode];
+  if (
+    policy === undefined ||
+    !hasExactKeys(policy, ["requires_before"]) ||
+    typeof policy.requires_before !== "boolean" ||
+    (before !== null) !== policy.requires_before
+  ) {
+    fail("stable provenance alias transition mode/object relationship differs from policy");
+  }
+}
+
 export function finalizeProvenance({
   candidateDir,
   releaseCommit,
@@ -2108,6 +2515,7 @@ export function finalizeProvenance({
   outputDir,
 }) {
   const candidate = verifyCandidate(candidateDir);
+  const contract = releaseContractFor(candidate, HISTORICAL_CANDIDATE_CONTRACTS, "release candidate");
   if (
     !/^[0-9a-f]{40}$/u.test(releaseCommit) ||
     !/^[0-9a-f]{40}$/u.test(fullTagObject) ||
@@ -2116,26 +2524,19 @@ export function finalizeProvenance({
     fail("release parent, commit, and full tag object must be full SHA-1 object IDs");
   }
   const before = optionalObjectId(aliasBefore, "alias before object");
-  const release = parseSemver(candidate.plan.version);
+  const release = parseSemverForContract(candidate.plan.version, contract);
   const canonicalAliasName = aliasName === "none" || aliasName === "" ? null : aliasName;
   if (release.majorAlias === null) {
     if (canonicalAliasName !== null || before !== null || aliasMode !== "not-applicable") {
       fail("prerelease provenance cannot declare a floating alias transition");
     }
   } else if (
-    canonicalAliasName !== release.majorAlias ||
-    !["create", "force-with-lease", "already-current", "superseded"].includes(aliasMode)
+    canonicalAliasName !== release.majorAlias
   ) {
     fail("stable provenance requires the exact floating-major alias transition");
   }
-  if (
-    (aliasMode === "create" && before !== null) ||
-    (aliasMode === "force-with-lease" && before === null) ||
-    (["already-current", "superseded"].includes(aliasMode) && before === null)
-  ) {
-    fail("stable provenance alias transition mode/object relationship differs from policy");
-  }
-  if (workflowRef !== `${SOURCE_REPOSITORY}/.github/workflows/sync-action-subtree.yml@refs/heads/master`) {
+  if (release.majorAlias !== null) validateFloatingAliasMode(aliasMode, before, contract);
+  if (workflowRef !== `${contract.source_repository}/.github/workflows/sync-action-subtree.yml@refs/heads/master`) {
     fail("release provenance workflow_ref differs from policy");
   }
   if (!/^[1-9][0-9]*$/u.test(workflowRunId) || !/^[1-9][0-9]*$/u.test(workflowRunAttempt)) {
@@ -2148,12 +2549,12 @@ export function finalizeProvenance({
   copyFileSync(sourceArchive, outputArchive, constants.COPYFILE_EXCL);
   const signatureBinding = (object) => ({
     object,
-    primary_fingerprint: PRIMARY_FINGERPRINT,
-    signing_subkey_fingerprint: SIGNING_SUBKEY_FINGERPRINT,
+    primary_fingerprint: contract.signer.primary_fingerprint,
+    signing_subkey_fingerprint: contract.signer.signing_subkey_fingerprint,
   });
   const provenance = {
-    schema: "codex-review-gate-action-release-provenance-v1",
-    schema_version: 1,
+    schema: contract.provenance.schema,
+    schema_version: contract.provenance.schema_version,
     plan: candidate.plan,
     payload: candidate.payload,
     manifest: {
@@ -2162,15 +2563,15 @@ export function finalizeProvenance({
       version: candidate.plan.version,
     },
     workflow: {
-      repository: SOURCE_REPOSITORY,
+      repository: contract.source_repository,
       workflow_ref: workflowRef,
       workflow_sha: candidate.plan.control_commit,
       run_id: workflowRunId,
       run_attempt: Number(workflowRunAttempt),
     },
     target: {
-      repository: TARGET_REPOSITORY,
-      branch: TARGET_BRANCH,
+      repository: contract.target_repository,
+      branch: contract.target_branch,
       parent: releaseParent,
       commit: releaseCommit,
       tree: candidate.plan.source_tree,
@@ -2182,14 +2583,14 @@ export function finalizeProvenance({
       immutable_tag: signatureBinding(fullTagObject),
       floating_alias: canonicalAliasName === null ? null : {
         required: true,
-        primary_fingerprint: PRIMARY_FINGERPRINT,
-        signing_subkey_fingerprint: SIGNING_SUBKEY_FINGERPRINT,
+        primary_fingerprint: contract.signer.primary_fingerprint,
+        signing_subkey_fingerprint: contract.signer.signing_subkey_fingerprint,
       },
       provenance: {
         path: "release-provenance.json",
         detached_signature: "release-provenance.json.asc",
-        primary_fingerprint: PRIMARY_FINGERPRINT,
-        signing_subkey_fingerprint: SIGNING_SUBKEY_FINGERPRINT,
+        primary_fingerprint: contract.signer.primary_fingerprint,
+        signing_subkey_fingerprint: contract.signer.signing_subkey_fingerprint,
       },
     },
     alias_transition: {
@@ -2256,7 +2657,7 @@ export function parseVerifiedOpenPgpStatus(result, expectedName, {
 
 export function discoverV2RuntimeModulePaths(tree) {
   return Object.keys(tree)
-    .filter((path) => /^src\/v2\/[a-z0-9]+(?:-[a-z0-9]+)*\.mjs$/u.test(path))
+    .filter((path) => path.startsWith("src/v2/"))
     .sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
 }
 
@@ -2289,10 +2690,20 @@ async function main(argv) {
   const { command, options } = parseArguments(argv);
   if (command === "plan") {
     const repo = resolve(required(options, "repo"));
+    const sourceRef = required(options, "source-ref");
+    const testOnlyImplicitAdmission =
+      options["admission-before"] === undefined &&
+      options["admission-plan"] === undefined &&
+      process.env.CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY === "1" &&
+      process.env.NODE_ENV === "test";
     const plan = createReleasePlan({
       repo,
-      sourceRef: required(options, "source-ref"),
+      sourceRef,
       controlRef: required(options, "control-ref"),
+      admissionBeforeRef: testOnlyImplicitAdmission ? `${sourceRef}^` : options["admission-before"],
+      admissionPlanPath: options["admission-plan"] === undefined
+        ? undefined
+        : resolve(options["admission-plan"]),
     });
     writeFileSync(required(options, "output"), canonicalJson(plan), { flag: "wx", mode: 0o600 });
     return;

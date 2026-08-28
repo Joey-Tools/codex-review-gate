@@ -576,6 +576,11 @@ export function rulesetCoversDefaultBranch(ruleset, defaultBranch = null) {
 
   const include = refName.include ?? [];
   const exclude = refName.exclude ?? [];
+  if (!Array.isArray(include) || !Array.isArray(exclude)) {
+    throw new Error(
+      "Ruleset ref_name include/exclude conditions must be arrays before branch coverage can be proved.",
+    );
+  }
 
   if (exclude.some((pattern) => refPatternMatchesDefaultBranch(pattern, defaultBranch))) {
     return false;
@@ -933,6 +938,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     throw new Error("Canonical v2 controller workflow must be non-empty UTF-8 text.");
   }
   assertCanonicalWorkflowLineEndings(value);
+  const controllerMappings = assertCanonicalControllerWorkflowStructure(value);
   assertOneCanonicalActionCall(value, "controller");
   assertCommonWorkflowSafety(value, "controller");
   if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
@@ -969,6 +975,82 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
   if (!/^  cancel-in-progress: false$/m.test(value)) {
     throw new Error("Canonical v2 controller workflow must not cancel an active request.");
   }
+
+  assertControllerMappingScalar(
+    controllerMappings,
+    "name",
+    "Codex Review Gate Controller",
+  );
+  assertControllerMappingScalar(
+    controllerMappings,
+    "on.issue_comment.types",
+    "[created, edited]",
+  );
+  for (const [path, expected] of [
+    ["on.workflow_dispatch.inputs.operation.required", "true"],
+    ["on.workflow_dispatch.inputs.operation.type", "choice"],
+    ["on.workflow_dispatch.inputs.operation.default", "reconcile"],
+    ["on.workflow_dispatch.inputs.pr_number.required", "true"],
+    ["on.workflow_dispatch.inputs.pr_number.type", "number"],
+    ["on.workflow_dispatch.inputs.expected_head_sha.required", "true"],
+    ["on.workflow_dispatch.inputs.expected_head_sha.type", "string"],
+    ["on.workflow_dispatch.inputs.request_comment_id.required", "false"],
+    ["on.workflow_dispatch.inputs.request_comment_id.type", "string"],
+    ["on.workflow_dispatch.inputs.request_review.required", "false"],
+    ["on.workflow_dispatch.inputs.request_review.type", "boolean"],
+    ["on.workflow_dispatch.inputs.request_review.default", "true"],
+    ["permissions.actions", "write"],
+    ["permissions.checks", "read"],
+    ["permissions.contents", "read"],
+    ["permissions.issues", "write"],
+    ["permissions.pull-requests", "read"],
+    ["concurrency.cancel-in-progress", "false"],
+    ["jobs.codex-review-gate-controller.name", "codex/review-gate-controller"],
+    ["jobs.codex-review-gate-controller.if", ">-"],
+    [
+      "jobs.codex-review-gate-controller.runs-on",
+      "${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}",
+    ],
+    ["jobs.codex-review-gate-controller.timeout-minutes", "14"],
+    ["jobs.codex-review-gate-controller.steps.name", "Refresh Codex review gate"],
+    ["jobs.codex-review-gate-controller.steps.id", "controller"],
+    ["jobs.codex-review-gate-controller.steps.uses", CANONICAL_V2_WORKFLOW_USES],
+    [
+      "jobs.codex-review-gate-controller.steps.env.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
+      "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    ],
+    [
+      "jobs.codex-review-gate-controller.steps.with.github_token",
+      "${{ github.token }}",
+    ],
+    [
+      "jobs.codex-review-gate-controller.steps.with.pr_number",
+      "${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
+    ],
+    [
+      "jobs.codex-review-gate-controller.steps.with.expected_head_sha",
+      "${{ github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}",
+    ],
+    [
+      "jobs.codex-review-gate-controller.steps.with.operation",
+      "${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
+    ],
+    [
+      "jobs.codex-review-gate-controller.steps.with.request_comment_id",
+      "${{ github.event_name == 'workflow_dispatch' && inputs.request_comment_id || github.event.comment.id }}",
+    ],
+    [
+      "jobs.codex-review-gate-controller.steps.with.request_review",
+      "${{ github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
+    ],
+    [
+      "jobs.codex-review-gate-controller.steps.with.limits_profile",
+      "${{ vars.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' || 'default' }}",
+    ],
+  ]) {
+    assertControllerMappingScalar(controllerMappings, path, expected);
+  }
+  assertControllerOperationOptions(value);
 
   for (const fragment of [
     "jobs:\n  codex-review-gate-controller:",
@@ -1026,6 +1108,177 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     );
   }
   return value;
+}
+
+const CANONICAL_CONTROLLER_MAPPING_PATHS = [
+  "name",
+  "on",
+  "on.issue_comment",
+  "on.issue_comment.types",
+  "on.workflow_dispatch",
+  "on.workflow_dispatch.inputs",
+  "on.workflow_dispatch.inputs.operation",
+  "on.workflow_dispatch.inputs.operation.description",
+  "on.workflow_dispatch.inputs.operation.required",
+  "on.workflow_dispatch.inputs.operation.type",
+  "on.workflow_dispatch.inputs.operation.options",
+  "on.workflow_dispatch.inputs.operation.default",
+  "on.workflow_dispatch.inputs.pr_number",
+  "on.workflow_dispatch.inputs.pr_number.description",
+  "on.workflow_dispatch.inputs.pr_number.required",
+  "on.workflow_dispatch.inputs.pr_number.type",
+  "on.workflow_dispatch.inputs.expected_head_sha",
+  "on.workflow_dispatch.inputs.expected_head_sha.description",
+  "on.workflow_dispatch.inputs.expected_head_sha.required",
+  "on.workflow_dispatch.inputs.expected_head_sha.type",
+  "on.workflow_dispatch.inputs.request_comment_id",
+  "on.workflow_dispatch.inputs.request_comment_id.description",
+  "on.workflow_dispatch.inputs.request_comment_id.required",
+  "on.workflow_dispatch.inputs.request_comment_id.type",
+  "on.workflow_dispatch.inputs.request_review",
+  "on.workflow_dispatch.inputs.request_review.description",
+  "on.workflow_dispatch.inputs.request_review.required",
+  "on.workflow_dispatch.inputs.request_review.type",
+  "on.workflow_dispatch.inputs.request_review.default",
+  "permissions",
+  "permissions.actions",
+  "permissions.checks",
+  "permissions.contents",
+  "permissions.issues",
+  "permissions.pull-requests",
+  "concurrency",
+  "concurrency.group",
+  "concurrency.cancel-in-progress",
+  "jobs",
+  "jobs.codex-review-gate-controller",
+  "jobs.codex-review-gate-controller.name",
+  "jobs.codex-review-gate-controller.if",
+  "jobs.codex-review-gate-controller.runs-on",
+  "jobs.codex-review-gate-controller.timeout-minutes",
+  "jobs.codex-review-gate-controller.steps",
+  "jobs.codex-review-gate-controller.steps.name",
+  "jobs.codex-review-gate-controller.steps.id",
+  "jobs.codex-review-gate-controller.steps.uses",
+  "jobs.codex-review-gate-controller.steps.env",
+  "jobs.codex-review-gate-controller.steps.env.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
+  "jobs.codex-review-gate-controller.steps.with",
+  "jobs.codex-review-gate-controller.steps.with.github_token",
+  "jobs.codex-review-gate-controller.steps.with.pr_number",
+  "jobs.codex-review-gate-controller.steps.with.expected_head_sha",
+  "jobs.codex-review-gate-controller.steps.with.operation",
+  "jobs.codex-review-gate-controller.steps.with.request_comment_id",
+  "jobs.codex-review-gate-controller.steps.with.request_review",
+  "jobs.codex-review-gate-controller.steps.with.limits_profile",
+];
+
+function assertCanonicalControllerWorkflowStructure(value) {
+  if (value.startsWith("\uFEFF") || /\uFEFF|[\u0085\u2028\u2029\t]/u.test(value)) {
+    throw new Error(
+      "Canonical v2 controller workflow must use plain LF YAML without BOM, tabs, or non-ASCII line separators.",
+    );
+  }
+  if (/\$\{\{\s*secrets\./iu.test(value)) {
+    throw new Error("Canonical v2 controller workflow must not reference secrets.");
+  }
+
+  const entries = [];
+  const stack = [];
+  const lines = value.split("\n");
+  let blockScalarIndent = null;
+  for (const rawLine of lines) {
+    const rawIndent = rawLine.match(/^ */u)[0].length;
+    if (blockScalarIndent !== null) {
+      if (rawLine.trim() === "" || rawIndent > blockScalarIndent) {
+        continue;
+      }
+      blockScalarIndent = null;
+    }
+    const line = stripYamlComment(rawLine);
+    if (line.trim() === "") {
+      continue;
+    }
+    const trimmed = line.trimStart();
+    if (
+      /^(?:-\s*)?(?:["']|\?|:|!!|!<|![A-Za-z_]|&[A-Za-z0-9_-]+|\*[A-Za-z0-9_-]+|<<\s*:|\{)/u.test(trimmed)
+    ) {
+      throw new Error(
+        "Canonical v2 controller workflow uses a quoted, tagged, explicit, aliased, merged, or flow-style mapping key.",
+      );
+    }
+
+    let match = line.match(/^( *)([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$/u);
+    let indent;
+    let key;
+    let mappingValue;
+    if (match !== null) {
+      indent = match[1].length;
+      key = match[2];
+      mappingValue = match[3];
+    } else {
+      match = line.match(/^( *)-\s+([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$/u);
+      if (match === null) {
+        continue;
+      }
+      indent = match[1].length + 2;
+      key = match[2];
+      mappingValue = match[3];
+    }
+    if (
+      mappingValue.startsWith("{") &&
+      !mappingValue.startsWith("${{")
+    ) {
+      throw new Error(
+        "Canonical v2 controller workflow must not use flow-style mappings.",
+      );
+    }
+    if (/(?:^|\s)(?:!!|!<|![A-Za-z_]|&[A-Za-z0-9_-]+|\*[A-Za-z0-9_-]+)(?:\s|$)/u.test(mappingValue)) {
+      throw new Error(
+        "Canonical v2 controller workflow must not use YAML tags, anchors, or aliases.",
+      );
+    }
+    while (stack.length > 0 && stack.at(-1).indent >= indent) {
+      stack.pop();
+    }
+    const path = [...stack.map((entry) => entry.key), key].join(".");
+    entries.push({ path, value: mappingValue });
+    stack.push({ indent, key });
+    if (/^[|>][+-]?[1-9]?$/u.test(mappingValue)) {
+      blockScalarIndent = indent;
+    }
+  }
+
+  const actualPaths = entries.map((entry) => entry.path);
+  if (
+    actualPaths.length !== CANONICAL_CONTROLLER_MAPPING_PATHS.length ||
+    actualPaths.some(
+      (path, index) => path !== CANONICAL_CONTROLLER_MAPPING_PATHS[index],
+    )
+  ) {
+    throw new Error(
+      "Canonical v2 controller workflow must contain only the adopted closed event, permission, job, step, env, and input mappings.",
+    );
+  }
+  return new Map(entries.map(({ path, value: mappingValue }) => [path, mappingValue]));
+}
+
+function assertControllerMappingScalar(mappings, path, expected) {
+  if (mappings.get(path) !== expected) {
+    throw new Error(
+      `Canonical v2 controller workflow has an unexpected ${path} value.`,
+    );
+  }
+}
+
+function assertControllerOperationOptions(value) {
+  if (
+    !/^        options:\n          - reconcile\n          - begin-review\n        default: reconcile$/mu.test(
+      value,
+    )
+  ) {
+    throw new Error(
+      "Canonical v2 controller workflow must expose only reconcile and begin-review operations.",
+    );
+  }
 }
 
 export function installedWorkflowMatchesCanonical(installed, canonical) {
@@ -2068,8 +2321,16 @@ function addDefaultBranchToConditions(conditions, defaultBranch) {
 
   const nextConditions = structuredCloneSafe(conditions);
   const refName = nextConditions.ref_name ?? {};
-  const include = Array.isArray(refName.include) ? [...refName.include] : [];
-  const exclude = Array.isArray(refName.exclude) ? [...refName.exclude] : [];
+  if (
+    (refName.include !== undefined && !Array.isArray(refName.include)) ||
+    (refName.exclude !== undefined && !Array.isArray(refName.exclude))
+  ) {
+    throw new Error(
+      "Existing ruleset ref_name include/exclude conditions are malformed; refusing to change branch coverage.",
+    );
+  }
+  const include = [...(refName.include ?? [])];
+  const exclude = [...(refName.exclude ?? [])];
   const broadDefaultBranchExclude = exclude.find(
     (pattern) =>
       refPatternMatchesDefaultBranch(pattern, defaultBranch) &&
@@ -2126,6 +2387,7 @@ function refPatternMatchesDefaultBranch(pattern, defaultBranch) {
     return true;
   }
 
+  assertSupportedGitHubRulesetPattern(pattern);
   if (pattern.includes("*") || pattern.includes("?") || pattern.includes("[")) {
     const regex = branchPatternToRegExp(pattern);
     return regex.test(defaultBranch) || regex.test(branchRef);
@@ -2152,9 +2414,13 @@ function branchPatternToRegExp(pattern) {
   for (let index = 0; index < pattern.length; index += 1) {
     const char = pattern[index];
     if (char === "*") {
-      if (pattern[index + 1] === "*") {
-        source += ".*";
-        index += 1;
+      if (
+        pattern[index + 1] === "*" &&
+        pattern[index + 2] === "/" &&
+        (index === 0 || pattern[index - 1] === "/")
+      ) {
+        source += "(?:[^/]+/)*";
+        index += 2;
       } else {
         source += "[^/]*";
       }
@@ -2162,44 +2428,72 @@ function branchPatternToRegExp(pattern) {
       source += "[^/]";
     } else if (char === "[") {
       const characterClass = readCharacterClass(pattern, index);
-      if (characterClass === null) {
-        source += escapeRegExp(char);
-      } else {
-        source += characterClass.source;
-        index = characterClass.end;
-      }
+      source += characterClass.source;
+      index = characterClass.end;
     } else {
       source += escapeRegExp(char);
     }
   }
-  return new RegExp(`^${source}$`);
+  try {
+    return new RegExp(`^${source}$`);
+  } catch (error) {
+    throw new Error(`Unsupported GitHub ruleset fnmatch pattern "${pattern}": ${error.message}`);
+  }
 }
 
 function readCharacterClass(pattern, start) {
   const end = pattern.indexOf("]", start + 1);
   if (end === -1) {
-    return null;
+    throw new Error(`Unsupported GitHub ruleset fnmatch pattern "${pattern}": unclosed character class.`);
   }
 
   let body = pattern.slice(start + 1, end);
   if (body === "") {
-    return null;
+    throw new Error(`Unsupported GitHub ruleset fnmatch pattern "${pattern}": empty character class.`);
   }
 
   let negate = "";
-  if (body.startsWith("!") || body.startsWith("^")) {
+  if (body.startsWith("^")) {
+    throw new Error(
+      `Unsupported GitHub ruleset fnmatch pattern "${pattern}": caret-complemented character classes are not supported by GitHub.`,
+    );
+  }
+  if (body.startsWith("!")) {
     negate = "^";
     body = body.slice(1);
   }
   if (body === "") {
-    return null;
+    throw new Error(`Unsupported GitHub ruleset fnmatch pattern "${pattern}": empty character class.`);
   }
 
   const escapedBody = escapeCharacterClassBody(body);
-  const source = negate === "^" && !body.includes("/")
+  const source = negate === "^"
     ? `[^/${escapedBody}]`
-    : `[${negate}${escapedBody}]`;
+    : `(?!/)[${escapedBody}]`;
   return { end, source };
+}
+
+function assertSupportedGitHubRulesetPattern(pattern) {
+  if (pattern.startsWith("~")) {
+    throw new Error(
+      `Unsupported GitHub ruleset ref token "${pattern}"; only ~DEFAULT_BRANCH and ~ALL are understood.`,
+    );
+  }
+  if (pattern.includes("\\")) {
+    throw new Error(
+      `Unsupported GitHub ruleset fnmatch pattern "${pattern}": backslash quoting is not supported by GitHub.`,
+    );
+  }
+  for (let index = 0; index < pattern.length; index += 1) {
+    if (pattern[index] === "[") {
+      const characterClass = readCharacterClass(pattern, index);
+      index = characterClass.end;
+    } else if (pattern[index] === "]") {
+      throw new Error(
+        `Unsupported GitHub ruleset fnmatch pattern "${pattern}": unmatched closing character class.`,
+      );
+    }
+  }
 }
 
 function escapeCharacterClassBody(value) {

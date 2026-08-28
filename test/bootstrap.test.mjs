@@ -696,7 +696,54 @@ test("matches default branch ruleset glob patterns", () => {
       },
       "release/2026/05",
     ),
+    false,
+  );
+  assert.equal(
+    rulesetCoversDefaultBranch(
+      {
+        target: "branch",
+        conditions: {
+          ref_name: {
+            include: ["release/**"],
+            exclude: [],
+          },
+        },
+      },
+      "release/2026",
+    ),
     true,
+  );
+  for (const branch of ["release/2026", "release/2026/05"]) {
+    assert.equal(
+      rulesetCoversDefaultBranch(
+        {
+          target: "branch",
+          conditions: {
+            ref_name: {
+              include: ["release/**/*"],
+              exclude: [],
+            },
+          },
+        },
+        branch,
+      ),
+      true,
+    );
+  }
+  assert.equal(
+    rulesetCoversDefaultBranch(
+      {
+        target: "branch",
+        conditions: {
+          ref_name: {
+            include: ["release[/]2026"],
+            exclude: [],
+          },
+        },
+      },
+      "release/2026",
+    ),
+    false,
   );
   assert.equal(
     rulesetCoversDefaultBranch(
@@ -712,6 +759,33 @@ test("matches default branch ruleset glob patterns", () => {
       "main1",
     ),
     false,
+  );
+});
+
+test("fails closed on unsupported or malformed GitHub ruleset patterns", () => {
+  for (const pattern of ["[^m]ain", "[z-a]ain", "main\\*", "~UNKNOWN"]) {
+    assert.throws(
+      () => rulesetCoversDefaultBranch({
+        target: "branch",
+        conditions: { ref_name: { include: [pattern], exclude: [] } },
+      }, "main"),
+      /Unsupported GitHub ruleset/u,
+      pattern,
+    );
+  }
+  assert.throws(
+    () => rulesetCoversDefaultBranch({
+      target: "branch",
+      conditions: { ref_name: { include: ["~ALL"], exclude: ["[^m]ain"] } },
+    }, "main"),
+    /Unsupported GitHub ruleset/u,
+  );
+  assert.throws(
+    () => rulesetCoversDefaultBranch({
+      target: "branch",
+      conditions: { ref_name: { include: "~ALL", exclude: [] } },
+    }, "main"),
+    /must be arrays/u,
   );
 });
 
@@ -1461,6 +1535,67 @@ test("prepare-worktree blocks an additional direct v2 caller before writing", ()
   }
 });
 
+test("prepare-worktree rebinds the full local security inventory and reports partial apply", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-local-race-"));
+  try {
+    for (const [mode, expected, verify] of [
+      [
+        "pre-first-rename",
+        /Additional workflows have a v1\/v2 gate caller|Local workflow\/CODEOWNERS security inventory changed/u,
+        (targetRoot, result) => {
+          assert.equal(
+            existsSync(join(targetRoot, ".github", "CODEOWNERS")),
+            false,
+          );
+          assert.doesNotMatch(result.stdout, /Applied:|Next:/u);
+        },
+      ],
+      [
+        "second-rename-fails",
+        /Partial local apply: installed CODEOWNERS.*verifier-workflow, controller-workflow were not installed or verified/su,
+        (targetRoot, result) => {
+          assert.equal(existsSync(join(targetRoot, ".github", "CODEOWNERS")), true);
+          assert.equal(
+            existsSync(join(targetRoot, ".github", "workflows", "codex-review-gate.yml")),
+            false,
+          );
+          assert.doesNotMatch(result.stdout, /Applied:|Next:/u);
+        },
+      ],
+      [
+        "final-boundary",
+        /Partial local apply: installed CODEOWNERS, verifier-workflow, controller-workflow.*final security closure was not verified/su,
+        (_targetRoot, result) => {
+          assert.doesNotMatch(result.stdout, /Applied:|Next:/u);
+        },
+      ],
+    ]) {
+      const targetRoot = join(fixtureRoot, mode);
+      mkdirSync(targetRoot);
+      initializeGitRepository(targetRoot);
+      const preloadPath = join(fixtureRoot, `${mode}.cjs`);
+      writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+      const result = runBootstrap([
+        "--prepare-worktree",
+        targetRoot,
+        "--apply",
+      ], {
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `--require=${preloadPath}`,
+          CODEX_BOOTSTRAP_TEST_RACE_MODE: mode,
+          CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+        },
+      });
+      assert.equal(result.status, 1, `${mode}: ${result.stderr}`);
+      assert.match(result.stderr, expected, mode);
+      verify(targetRoot, result);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("prepare-worktree rejects a symlinked workflow parent without writing outside", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bootstrap-"));
   const outsideRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-outside-"));
@@ -2038,7 +2173,7 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
           "  repository_dispatch:",
         ),
       ),
-    /must not expose repository_dispatch/,
+    /closed event|must not expose repository_dispatch/u,
   );
   assert.throws(
     () =>
@@ -2055,7 +2190,7 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
       validateCanonicalV2ControllerWorkflowContent(
         CANONICAL_CONTROLLER_WORKFLOW.replace("          github_token:", "          request_author_permission:\n          github_token:"),
       ),
-    /rejected legacy surface: request_author_permission:/u,
+    /closed event|rejected legacy surface: request_author_permission:/u,
   );
   assert.throws(
     () =>
@@ -2249,6 +2384,7 @@ test("remote staging and activation reject a post-merge extra v1 caller", () => 
       [`repos/${repoSlug}`]: repositoryMetadataFixture(repoSlug),
       [`repos/${repoSlug}/actions/permissions/workflow`]: {
         default_workflow_permissions: "read",
+        can_approve_pull_request_reviews: false,
       },
       [`repos/${repoSlug}/collaborators/JoeyTeng/permission`]:
         controlPlaneOwnerPermissionFixture(),
@@ -2433,6 +2569,7 @@ test("remote bootstrap rejects default workflow write permissions", () => {
       ...canonicalRemoteWorkflowResponses(repoSlug),
       [`repos/${repoSlug}/actions/permissions/workflow`]: {
         default_workflow_permissions: "write",
+        can_approve_pull_request_reviews: false,
       },
     };
     const result = runBootstrap(["--repo", repoSlug], {
@@ -2443,7 +2580,10 @@ test("remote bootstrap rejects default workflow write permissions", () => {
       },
     });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /must set default workflow permissions to read/u);
+    assert.match(
+      result.stderr,
+      /must expose a complete Actions workflow-permission policy with default permissions set to read/u,
+    );
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -2558,6 +2698,123 @@ test("remote staging refuses to disable a same-name active incomplete non-legacy
   }
 });
 
+test("remote bootstrap rejects every ambiguous same-name repository ruleset inventory", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-same-name-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const [name, targets] of [
+      ["two-branch", ["branch", "branch"]],
+      ["branch-and-tag", ["branch", "tag"]],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const candidates = targets.map((target, index) => ({
+        ...completeDisabledRulesetFixture(7 + index),
+        target,
+      }));
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          candidates,
+        ],
+        ...Object.fromEntries(candidates.map((ruleset) => [
+          `repos/${repoSlug}/rulesets/${ruleset.id}`,
+          ruleset,
+        ])),
+      };
+      const result = runBootstrap(["--repo", repoSlug, "--apply"], {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, 1, name);
+      assert.match(result.stderr, /ruleset name .* is ambiguous.*id 7.*id 8/iu, name);
+      assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu, name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("ruleset create binds final absence, a fresh response id, and one final named candidate", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-create-bind-"));
+  const repoSlug = "Joey-Tools/consumer";
+  const createdRuleset = completeDisabledRulesetFixture(8);
+  try {
+    for (const scenario of [
+      {
+        name: "appeared-before-post",
+        lists: [[[]], [[createdRuleset]]],
+        post: { id: 8 },
+        expected: /appeared during final create preflight/u,
+        expectPost: false,
+      },
+      {
+        name: "non-positive-created-id",
+        lists: [[[]], [[]]],
+        post: { id: 0 },
+        expected: /fresh positive integer id/u,
+        expectPost: true,
+      },
+      {
+        name: "missing-final-candidate",
+        lists: [[[]], [[]], [[]]],
+        post: { id: 8 },
+        expected: /Final ruleset inventory does not uniquely bind/u,
+        expectPost: true,
+      },
+      {
+        name: "duplicate-final-candidate",
+        lists: [[[]], [[]], [[
+          createdRuleset,
+          { ...createdRuleset, id: 9 },
+        ]]],
+        post: { id: 8 },
+        expected: /ruleset name .* is ambiguous/iu,
+        expectPost: true,
+      },
+      {
+        name: "wrong-final-id",
+        lists: [[[]], [[]], [[{ ...createdRuleset, id: 9 }]]],
+        post: { id: 8 },
+        expected: /does not uniquely bind.*created id 8/iu,
+        expectPost: true,
+      },
+    ]) {
+      const fakeBin = join(fixtureRoot, scenario.name);
+      const stateDir = join(fixtureRoot, `${scenario.name}-state`);
+      const callLog = join(fixtureRoot, `${scenario.name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`GET repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: {
+          __fake_sequence: scenario.lists,
+        },
+        [`POST repos/${repoSlug}/rulesets`]: scenario.post,
+        [`GET repos/${repoSlug}/rulesets/8`]: createdRuleset,
+      };
+      const result = runBootstrap(["--repo", repoSlug, "--apply"], {
+        env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+      });
+      assert.equal(result.status, 1, `${scenario.name}: ${result.stderr}`);
+      assert.match(result.stderr, scenario.expected, scenario.name);
+      const calls = readFileSync(callLog, "utf8");
+      assert.equal(
+        /^POST /mu.test(calls),
+        scenario.expectPost,
+        scenario.name,
+      );
+      assert.doesNotMatch(result.stdout, /Created ruleset/u, scenario.name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("stages a distinct disabled v2 ruleset while a legacy ruleset remains active", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
@@ -2574,9 +2831,13 @@ test("stages a distinct disabled v2 ruleset while a legacy ruleset remains activ
     };
     const responses = {
       ...canonicalRemoteWorkflowResponses(repoSlug),
-      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
-        [legacyRuleset],
-      ],
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: {
+        __fake_sequence: [
+          [[legacyRuleset]],
+          [[legacyRuleset]],
+          [[legacyRuleset, disabledV2]],
+        ],
+      },
       [`repos/${repoSlug}/rulesets/7`]: legacyRuleset,
       [`POST repos/${repoSlug}/rulesets`]: { id: 8, name: v2RulesetName },
       [`GET repos/${repoSlug}/rulesets/8`]: disabledV2,
@@ -2742,7 +3003,13 @@ test("stages a disabled v2 ruleset while classic legacy protection remains activ
           checks: [],
         },
       },
-      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: {
+        __fake_sequence: [
+          [[]],
+          [[]],
+          [[disabledV2]],
+        ],
+      },
       [`POST repos/${repoSlug}/rulesets`]: {
         id: 7,
         name: "Must Pass Codex Review",
@@ -4269,6 +4536,11 @@ test("activation fails closed when post-update ruleset readback drifts", () => {
 
       assert.equal(result.status, 1, `${name}: ${result.stderr}`);
       assert.match(result.stderr, expected);
+      assert.match(result.stderr, /Active write may already have completed/u);
+      assert.match(result.stderr, /preserve the v2 ruleset/u);
+      assert.match(result.stderr, /every legacy protection/u);
+      assert.match(result.stderr, /do not disable, delete, or overwrite/u);
+      assert.doesNotMatch(result.stderr, /repair or disable it/u);
       const calls = readFileSync(callLog, "utf8");
       assert.match(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
       assert.match(calls, new RegExp(`^GET repos/${repoSlug}/rulesets/7$`, "mu"));
@@ -4278,6 +4550,73 @@ test("activation fails closed when post-update ruleset readback drifts", () => {
           calls.lastIndexOf(`GET repos/${repoSlug}/rulesets/7`),
       );
     }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("active post-write API failures preserve v2 and never advise disable", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const headSha = "0123456789abcdef0123456789abcdef01234567";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const repository = repositoryMetadataFixture(repoSlug);
+    const disabled = completeDisabledRulesetFixture(7);
+    const active = completeActiveRulesetFixture(7);
+    const validPullRequest = canaryPullRequestFixture(repoSlug, headSha);
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canaryRunResponses(repoSlug),
+      [`repos/${repoSlug}`]: {
+        __fake_sequence: [
+          repository,
+          repository,
+          repository,
+          repository,
+          repository,
+          repository,
+          repository,
+          repository,
+          repository,
+          { __fake_http_error: 503, message: "post-write repository read failed" },
+        ],
+      },
+      [`GET repos/${repoSlug}/pulls/7`]: {
+        __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [disabled],
+      ],
+      [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
+      [`GET repos/${repoSlug}/rulesets/7`]: {
+        __fake_sequence: [
+          disabled,
+          disabled,
+          disabled,
+          disabled,
+          disabled,
+          active,
+        ],
+      },
+    };
+    const result = runBootstrap(activationArguments(repoSlug, headSha), {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /post-write repository read failed/u);
+    const calls = readFileSync(callLog, "utf8");
+    assert.match(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+    assert.match(result.stderr, /Active write may already have completed/u);
+    assert.match(result.stderr, /preserve the v2 ruleset/u);
+    assert.match(result.stderr, /every legacy protection/u);
+    assert.match(result.stderr, /do not disable, delete, or overwrite/u);
+    assert.doesNotMatch(result.stderr, /repair or disable it/u);
+    assert.doesNotMatch(result.stdout, /Updated ruleset/u);
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -4747,6 +5086,22 @@ test("post-cleanup verification admission remains read-only and rejects the old 
       ],
       /read-only.*pre-cleanup legacy digest/u,
     ],
+    [
+      "missing-expected-post-state",
+      ["--repo", repoSlug, "--verify-post-cleanup"],
+      /requires --expected-post-cleanup-security-sha256/u,
+    ],
+    [
+      "malformed-expected-post-state",
+      [
+        "--repo",
+        repoSlug,
+        "--verify-post-cleanup",
+        "--expected-post-cleanup-security-sha256",
+        "abc",
+      ],
+      /exact lowercase 64-hex SHA-256/u,
+    ],
   ]) {
     const result = runBootstrap(args, {
       addExpectedLegacyInventoryDigest: false,
@@ -4783,10 +5138,27 @@ test("post-cleanup verification accepts empty legacy surfaces and unrelated clas
       ],
       [`repos/${repoSlug}/rulesets/7`]: activeV2,
     };
+    const derive = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--derive-post-cleanup-plan",
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+    assert.equal(derive.status, 0, derive.stderr);
+    const plan = JSON.parse(derive.stdout);
+    assert.match(plan.expected_post_cleanup_security_sha256, /^[0-9a-f]{64}$/u);
     const result = runBootstrap([
       "--repo",
       repoSlug,
       "--verify-post-cleanup",
+      "--expected-post-cleanup-security-sha256",
+      plan.expected_post_cleanup_security_sha256,
     ], {
       env: {
         ...process.env,
@@ -4799,6 +5171,159 @@ test("post-cleanup verification accepts empty legacy surfaces and unrelated clas
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Post-cleanup verified/u);
     assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("pre-cleanup derivation authorizes only legacy elision and preserves unrelated protections", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-cleanup-plan-"));
+  const repoSlug = "Joey-Tools/consumer";
+  const classicPre = {
+    strict: true,
+    contexts: ["lint", LEGACY_STATUS_CONTEXT],
+    checks: [
+      { context: "build", app_id: 15368 },
+      { context: LEGACY_STATUS_CONTEXT, app_id: null },
+    ],
+  };
+  const classicPost = {
+    strict: true,
+    contexts: ["lint"],
+    checks: [{ context: "build", app_id: 15368 }],
+  };
+  try {
+    const activeWithLegacy = completeActiveRulesetFixture(7);
+    activeWithLegacy.rules
+      .find((rule) => rule.type === "required_status_checks")
+      .parameters.required_status_checks.push({
+        context: LEGACY_STATUS_CONTEXT,
+      });
+    const activeWithoutLegacy = completeActiveRulesetFixture(7);
+    const dedicatedLegacy = activeLegacyRulesetFixture(9);
+    const unrelatedRuleset = {
+      ...activeLegacyRulesetFixture(10, { name: "Preserve force-push policy" }),
+      rules: [{ type: "non_fast_forward" }],
+    };
+    const effectivePre = [[
+      effectiveLegacyRequiredStatusChecksRule(activeWithLegacy),
+      effectiveLegacyRequiredStatusChecksRule(dedicatedLegacy),
+    ]];
+    const preInventory = legacyInventoryResponseFixtures(repoSlug, {
+      effectiveRulePages: effectivePre,
+      rulesets: [activeWithLegacy, dedicatedLegacy],
+      classicRequiredStatusChecks: classicPre,
+    });
+    const preResponses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...preInventory.responses,
+      [`repos/${repoSlug}/branches/master/protection`]: {
+        required_status_checks: classicPre,
+        enforce_admins: { enabled: true, url: "https://api.github.com/ignored" },
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[
+        activeWithLegacy,
+        dedicatedLegacy,
+        unrelatedRuleset,
+      ]],
+      [`repos/${repoSlug}/rulesets/7`]: activeWithLegacy,
+      [`repos/${repoSlug}/rulesets/9`]: dedicatedLegacy,
+      [`repos/${repoSlug}/rulesets/10`]: unrelatedRuleset,
+    };
+    const preBin = join(fixtureRoot, "pre-bin");
+    const preLog = join(fixtureRoot, "pre.log");
+    createFakeGhExecutable(preBin);
+    const derive = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--derive-post-cleanup-plan",
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${preBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(preResponses),
+        FAKE_GH_CALL_LOG: preLog,
+      },
+    });
+    assert.equal(derive.status, 0, derive.stderr);
+    const plan = JSON.parse(derive.stdout);
+    assert.equal(plan.cleanup_actions.classic_required_status_check_removed, true);
+    assert.deepEqual(
+      plan.cleanup_actions.rulesets.map(({ id, action }) => ({ id, action })),
+      [
+        { id: 7, action: "remove-legacy-check-only" },
+        { id: 9, action: "delete-dedicated-legacy-only-ruleset" },
+      ],
+    );
+    assert.doesNotMatch(readFileSync(preLog, "utf8"), /^(?:POST|PUT) /mu);
+
+    const postInventory = legacyInventoryResponseFixtures(repoSlug, {
+      classicRequiredStatusChecks: classicPost,
+    });
+    const basePostResponses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...postInventory.responses,
+      [`repos/${repoSlug}/branches/master/protection`]: {
+        required_status_checks: classicPost,
+        enforce_admins: { enabled: true, url: "https://api.github.com/ignored" },
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[
+        activeWithoutLegacy,
+        unrelatedRuleset,
+      ]],
+      [`repos/${repoSlug}/rulesets/7`]: activeWithoutLegacy,
+      [`repos/${repoSlug}/rulesets/10`]: unrelatedRuleset,
+    };
+    for (const [name, mutate, expectedStatus] of [
+      ["valid", () => {}, 0],
+      [
+        "unrelated-ruleset-deleted",
+        (responses) => {
+          responses[`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`] = [[
+            activeWithoutLegacy,
+          ]];
+          delete responses[`repos/${repoSlug}/rulesets/10`];
+        },
+        1,
+      ],
+      [
+        "classic-admin-policy-drift",
+        (responses) => {
+          responses[`repos/${repoSlug}/branches/master/protection`] = {
+            required_status_checks: classicPost,
+            enforce_admins: { enabled: false, url: "https://api.github.com/ignored" },
+          };
+        },
+        1,
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, `${name}-bin`);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const responses = structuredClone(basePostResponses);
+      mutate(responses);
+      const verify = runBootstrap([
+        "--repo",
+        repoSlug,
+        "--verify-post-cleanup",
+        "--expected-post-cleanup-security-sha256",
+        plan.expected_post_cleanup_security_sha256,
+      ], {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(verify.status, expectedStatus, `${name}: ${verify.stderr}`);
+      if (expectedStatus === 0) {
+        assert.match(verify.stdout, /Post-cleanup verified/u, name);
+      } else {
+        assert.match(verify.stderr, /does not equal the pre-cleanup derived/u, name);
+      }
+      assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu);
+    }
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -4862,6 +5387,8 @@ test("post-cleanup verification rejects legacy residuals and a non-active select
         "--repo",
         repoSlug,
         "--verify-post-cleanup",
+        "--expected-post-cleanup-security-sha256",
+        "0".repeat(64),
       ], {
         env: {
           ...process.env,
@@ -5001,7 +5528,13 @@ test("HTTP 200 null or empty classic status JSON cannot authorize activation or 
         };
         const args = mode === "activate"
           ? activationArguments(repoSlug, CANARY_HEAD_SHA)
-          : ["--repo", repoSlug, "--verify-post-cleanup"];
+          : [
+              "--repo",
+              repoSlug,
+              "--verify-post-cleanup",
+              "--expected-post-cleanup-security-sha256",
+              "0".repeat(64),
+            ];
         const result = runBootstrap(args, {
           env: {
             ...process.env,
@@ -5177,12 +5710,18 @@ test("post-cleanup double readback rejects torn classic-to-ruleset surface swaps
         "--repo",
         repoSlug,
         "--verify-post-cleanup",
+        "--expected-post-cleanup-security-sha256",
+        "0".repeat(64),
       ], {
         env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
       });
 
       assert.equal(result.status, 1, name);
-      assert.match(result.stderr, /codex\/review-gate remains required after cleanup/u, name);
+      assert.match(
+        result.stderr,
+        /codex\/review-gate remains required after cleanup|changed between the (?:complete ruleset|full security snapshot) and legacy-inventory readback(?:s)?/u,
+        name,
+      );
       assert.doesNotMatch(result.stdout, /Post-cleanup verified/u, name);
       const calls = readFileSync(callLog, "utf8");
       assert.equal(
@@ -5485,6 +6024,8 @@ function stageThenActivationResponseFixtures({
       [`GET repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: {
         __fake_sequence: [
           [legacyRulesets],
+          [legacyRulesets],
+          [[...legacyRulesets, disabledV2]],
           [[...legacyRulesets, disabledV2]],
           [[...legacyRulesets, disabledV2]],
         ],
@@ -5541,6 +6082,7 @@ function canonicalRemoteWorkflowResponses(repoSlug) {
     [`repos/${repoSlug}`]: repositoryMetadataFixture(repoSlug),
     [`repos/${repoSlug}/actions/permissions/workflow`]: {
       default_workflow_permissions: "read",
+      can_approve_pull_request_reviews: false,
     },
     [`repos/${repoSlug}/collaborators/JoeyTeng/permission`]:
       controlPlaneOwnerPermissionFixture(),
@@ -5993,4 +6535,57 @@ process.stdout.write(JSON.stringify(response));
     "utf8",
   );
   chmodSync(fakeGh, 0o755);
+}
+
+function localApplyRacePreloadSource() {
+  return `
+const fs = require("node:fs");
+const { join, basename } = require("node:path");
+const { syncBuiltinESMExports } = require("node:module");
+
+const promises = fs.promises;
+const originalWriteFile = promises.writeFile.bind(promises);
+const originalRename = promises.rename.bind(promises);
+const mode = process.env.CODEX_BOOTSTRAP_TEST_RACE_MODE;
+const targetRoot = process.env.CODEX_BOOTSTRAP_TEST_RACE_ROOT;
+let injectedBeforeFirstRename = false;
+let renameCount = 0;
+
+promises.writeFile = async function patchedWriteFile(path, ...args) {
+  const result = await originalWriteFile(path, ...args);
+  if (
+    mode === "pre-first-rename" &&
+    !injectedBeforeFirstRename &&
+    basename(String(path)).startsWith(".codex-review-gate.")
+  ) {
+    injectedBeforeFirstRename = true;
+    await originalWriteFile(
+      join(targetRoot, ".github", "workflows", "attacker.yml"),
+      "permissions:\\n  statuses: write\\njobs: {}\\n",
+      "utf8",
+    );
+  }
+  return result;
+};
+
+promises.rename = async function patchedRename(from, to) {
+  renameCount += 1;
+  if (mode === "second-rename-fails" && renameCount === 2) {
+    const error = new Error("synthetic second rename failure");
+    error.code = "EACCES";
+    throw error;
+  }
+  const result = await originalRename(from, to);
+  if (mode === "final-boundary" && renameCount === 3) {
+    await originalWriteFile(
+      join(targetRoot, ".github", "workflows", "attacker.yml"),
+      "permissions:\\n  statuses: write\\njobs: {}\\n",
+      "utf8",
+    );
+  }
+  return result;
+};
+
+syncBuiltinESMExports();
+`;
 }

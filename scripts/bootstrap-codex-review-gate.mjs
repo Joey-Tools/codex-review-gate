@@ -80,20 +80,34 @@ async function main() {
     return;
   }
 
+  if (options.derivePostCleanupPlan) {
+    await printDerivedPostCleanupPlan({
+      options,
+      canonicalWorkflows,
+    });
+    return;
+  }
+
+  if (options.verifyPostCleanup) {
+    await verifyExpectedPostCleanupState({
+      options,
+      canonicalWorkflows,
+    });
+    return;
+  }
+
   const initialSecuritySnapshot = await loadConsumerSecuritySnapshot({
     repoSlug: options.repo.slug,
     canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
   });
   const { defaultBranch } = initialSecuritySnapshot;
-  if (!options.verifyPostCleanup) {
-    await assertExpectedLegacyInventoryDigest({
-      repoSlug: options.repo.slug,
-      defaultBranch,
-      expectedDigest: options.expectedLegacyInventorySha256,
-      phase: "initial approval-snapshot readback",
-    });
-  }
+  await assertExpectedLegacyInventoryDigest({
+    repoSlug: options.repo.slug,
+    defaultBranch,
+    expectedDigest: options.expectedLegacyInventorySha256,
+    phase: "initial approval-snapshot readback",
+  });
 
   const effectiveRulesets = await loadRulesets(options.repo.slug);
   if (options.activate) {
@@ -115,70 +129,19 @@ async function main() {
     );
   }
 
-  const repoRulesets = effectiveRulesets.filter(
-    (ruleset) =>
-      ruleset.source_type === "Repository" && ruleset.name === options.rulesetName,
-  );
-  const repoRuleset = repoRulesets.find(
-    (ruleset) => ruleset.target === undefined || ruleset.target === "branch",
-  );
-  const nonBranchRuleset = repoRulesets.find(
-    (ruleset) => ruleset.target !== undefined && ruleset.target !== "branch",
+  const repoRuleset = selectUniqueNamedRepositoryRuleset(
+    effectiveRulesets,
+    options.rulesetName,
   );
 
-  if (repoRuleset === undefined && nonBranchRuleset !== undefined) {
+  if (
+    repoRuleset !== undefined &&
+    repoRuleset.target !== undefined &&
+    repoRuleset.target !== "branch"
+  ) {
     throw new Error(
-      `Repository ruleset "${options.rulesetName}" already targets ${nonBranchRuleset.target}; refusing to rewrite it as a branch ruleset. Use a different --ruleset-name or rename the existing ruleset.`,
+      `Repository ruleset "${options.rulesetName}" already targets ${repoRuleset.target}; refusing to rewrite it as a branch ruleset. Use a different --ruleset-name or rename the existing ruleset.`,
     );
-  }
-
-  if (options.verifyPostCleanup) {
-    const firstLegacyInventory = await assertPostCleanupLegacyInventoryClear({
-      repoSlug: options.repo.slug,
-      defaultBranch,
-      repositoryId: initialSecuritySnapshot.repoId,
-      repositoryNodeId: initialSecuritySnapshot.repoNodeId,
-    });
-    if (repoRuleset === undefined) {
-      throw new Error(
-        `Post-cleanup verification requires repository ruleset "${options.rulesetName}" to exist.`,
-      );
-    }
-    const firstFullRuleset = await loadPostCleanupV2Ruleset({
-      repoSlug: options.repo.slug,
-      rulesetId: repoRuleset.id,
-      rulesetName: options.rulesetName,
-      defaultBranch,
-      context: options.context,
-      integrationId: options.integrationId,
-    });
-    const secondLegacyInventory = await assertPostCleanupLegacyInventoryClear({
-      repoSlug: options.repo.slug,
-      defaultBranch,
-      repositoryId: initialSecuritySnapshot.repoId,
-      repositoryNodeId: initialSecuritySnapshot.repoNodeId,
-    });
-    const secondFullRuleset = await loadPostCleanupV2Ruleset({
-      repoSlug: options.repo.slug,
-      rulesetId: repoRuleset.id,
-      rulesetName: options.rulesetName,
-      defaultBranch,
-      context: options.context,
-      integrationId: options.integrationId,
-    });
-    if (
-      firstLegacyInventory !== secondLegacyInventory ||
-      postCleanupRulesetFingerprint(firstFullRuleset) !==
-        postCleanupRulesetFingerprint(secondFullRuleset)
-    ) {
-      throw new Error(
-        "Post-cleanup repository, legacy-inventory, or v2-ruleset state changed across the two complete readbacks; verification is inconclusive and must be rerun against a stable repository.",
-      );
-    }
-    console.log(
-      `Post-cleanup verified across two complete stable readbacks: both legacy requirement surfaces are clear and ${rulesetLabel(secondFullRuleset)} remains the complete Active v2 gate.`,
-    );
-    return;
   }
 
   const overlappingLegacyRulesets = effectiveRulesets.filter(
@@ -265,49 +228,94 @@ async function main() {
         headSha: options.canaryHead,
       });
     }
-    const created = await ghJson(`repos/${options.repo.slug}/rulesets`, {
-      method: "POST",
-      body: payload,
-    });
-    await assertRulesetReadback({
-      repoSlug: options.repo.slug,
-      rulesetId: created?.id,
-      defaultBranch,
-      context: options.context,
-      integrationId: options.integrationId,
-      enforcement: payload.enforcement,
-      expectedPayload: payload,
-      exactWritableFields: false,
-      logSuccess: false,
-    });
-    const postWriteSecuritySnapshot = await loadConsumerSecuritySnapshot({
-      repoSlug: options.repo.slug,
-      canonicalWorkflows,
-      controlPlaneOwner: options.controlPlaneOwner,
-      expectedDefaultBranch: defaultBranch,
-    });
-    assertConsumerSecuritySnapshotStable(
-      currentSecuritySnapshot,
-      postWriteSecuritySnapshot,
-      { phase: "ruleset post-write readback" },
+    const preCreateSummaries = await loadRulesetSummaries(options.repo.slug);
+    if (
+      selectUniqueNamedRepositoryRuleset(
+        preCreateSummaries,
+        options.rulesetName,
+      ) !== undefined
+    ) {
+      throw new Error(
+        `Repository ruleset "${options.rulesetName}" appeared during final create preflight; refusing to create a duplicate.`,
+      );
+    }
+    const preCreateIds = new Set(preCreateSummaries.map((ruleset) => ruleset.id));
+    const finalCreatedRuleset = await withPostWriteRecoveryGuidance(
+      {
+        enforcement: payload.enforcement,
+      },
+      async () => {
+        const created = await ghJson(`repos/${options.repo.slug}/rulesets`, {
+          method: "POST",
+          body: payload,
+        });
+        if (
+          !Number.isSafeInteger(created?.id) ||
+          created.id <= 0 ||
+          preCreateIds.has(created.id)
+        ) {
+          throw new Error(
+            "Ruleset create response did not return a fresh positive integer id absent from the final pre-create inventory.",
+          );
+        }
+        await assertRulesetReadback({
+          repoSlug: options.repo.slug,
+          rulesetId: created.id,
+          defaultBranch,
+          context: options.context,
+          integrationId: options.integrationId,
+          enforcement: payload.enforcement,
+          expectedPayload: payload,
+          exactWritableFields: false,
+          logSuccess: false,
+          inconclusiveWriteEnforcement: payload.enforcement,
+        });
+        const postWriteSecuritySnapshot = await loadConsumerSecuritySnapshot({
+          repoSlug: options.repo.slug,
+          canonicalWorkflows,
+          controlPlaneOwner: options.controlPlaneOwner,
+          expectedDefaultBranch: defaultBranch,
+        });
+        assertConsumerSecuritySnapshotStable(
+          currentSecuritySnapshot,
+          postWriteSecuritySnapshot,
+          {
+            phase: "ruleset post-write readback",
+            attemptedEnforcement: payload.enforcement,
+          },
+        );
+        await assertExpectedLegacyInventoryDigest({
+          repoSlug: options.repo.slug,
+          defaultBranch,
+          expectedDigest: options.expectedLegacyInventorySha256,
+          phase: "ruleset post-write readback",
+          attemptedEnforcement: payload.enforcement,
+        });
+        const authoritativeCreatedRuleset = await assertRulesetReadback({
+          repoSlug: options.repo.slug,
+          rulesetId: created.id,
+          defaultBranch,
+          context: options.context,
+          integrationId: options.integrationId,
+          enforcement: payload.enforcement,
+          expectedPayload: payload,
+          exactWritableFields: false,
+          inconclusiveWriteEnforcement: payload.enforcement,
+        });
+        const finalSummaries = await loadRulesetSummaries(options.repo.slug);
+        const finalNamedRuleset = selectUniqueNamedRepositoryRuleset(
+          finalSummaries,
+          options.rulesetName,
+        );
+        if (finalNamedRuleset?.id !== created.id) {
+          throw new Error(
+            `Final ruleset inventory does not uniquely bind repository ruleset "${options.rulesetName}" to created id ${created.id}.`,
+          );
+        }
+        return authoritativeCreatedRuleset;
+      },
     );
-    await assertExpectedLegacyInventoryDigest({
-      repoSlug: options.repo.slug,
-      defaultBranch,
-      expectedDigest: options.expectedLegacyInventorySha256,
-      phase: "ruleset post-write readback",
-    });
-    await assertRulesetReadback({
-      repoSlug: options.repo.slug,
-      rulesetId: created?.id,
-      defaultBranch,
-      context: options.context,
-      integrationId: options.integrationId,
-      enforcement: payload.enforcement,
-      expectedPayload: payload,
-      exactWritableFields: false,
-    });
-    console.log(`Created ruleset: ${rulesetLabel(created)}`);
+    console.log(`Created ruleset: ${rulesetLabel(finalCreatedRuleset)}`);
     return;
   }
 
@@ -499,49 +507,63 @@ async function main() {
   // Bracket the legacy read with full target-ruleset reads, then keep this
   // second writable-field reread adjacent to PUT. These are the final
   // best-effort lost-update boundaries without an API If-Match contract.
-  const updated = await ghJson(`repos/${options.repo.slug}/rulesets/${fullRuleset.id}`, {
-    method: "PUT",
-    body: payload,
-  });
-  await assertRulesetReadback({
-    repoSlug: options.repo.slug,
-    rulesetId: fullRuleset.id,
-    defaultBranch,
-    context: options.context,
-    integrationId: options.integrationId,
-    enforcement: payload.enforcement,
-    expectedPayload: payload,
-    exactWritableFields: true,
-    logSuccess: false,
-  });
-  const postWriteSecuritySnapshot = await loadConsumerSecuritySnapshot({
-    repoSlug: options.repo.slug,
-    canonicalWorkflows,
-    controlPlaneOwner: options.controlPlaneOwner,
-    expectedDefaultBranch: defaultBranch,
-  });
-  assertConsumerSecuritySnapshotStable(
-    currentSecuritySnapshot,
-    postWriteSecuritySnapshot,
-    { phase: "ruleset post-write readback" },
+  const finalUpdatedRuleset = await withPostWriteRecoveryGuidance(
+    {
+      enforcement: payload.enforcement,
+      rulesetId: fullRuleset.id,
+    },
+    async () => {
+      await ghJson(`repos/${options.repo.slug}/rulesets/${fullRuleset.id}`, {
+        method: "PUT",
+        body: payload,
+      });
+      await assertRulesetReadback({
+        repoSlug: options.repo.slug,
+        rulesetId: fullRuleset.id,
+        defaultBranch,
+        context: options.context,
+        integrationId: options.integrationId,
+        enforcement: payload.enforcement,
+        expectedPayload: payload,
+        exactWritableFields: true,
+        logSuccess: false,
+        inconclusiveWriteEnforcement: payload.enforcement,
+      });
+      const postWriteSecuritySnapshot = await loadConsumerSecuritySnapshot({
+        repoSlug: options.repo.slug,
+        canonicalWorkflows,
+        controlPlaneOwner: options.controlPlaneOwner,
+        expectedDefaultBranch: defaultBranch,
+      });
+      assertConsumerSecuritySnapshotStable(
+        currentSecuritySnapshot,
+        postWriteSecuritySnapshot,
+        {
+          phase: "ruleset post-write readback",
+          attemptedEnforcement: payload.enforcement,
+        },
+      );
+      await assertExpectedLegacyInventoryDigest({
+        repoSlug: options.repo.slug,
+        defaultBranch,
+        expectedDigest: options.expectedLegacyInventorySha256,
+        phase: "ruleset post-write readback",
+        attemptedEnforcement: payload.enforcement,
+      });
+      return assertRulesetReadback({
+        repoSlug: options.repo.slug,
+        rulesetId: fullRuleset.id,
+        defaultBranch,
+        context: options.context,
+        integrationId: options.integrationId,
+        enforcement: payload.enforcement,
+        expectedPayload: payload,
+        exactWritableFields: true,
+        inconclusiveWriteEnforcement: payload.enforcement,
+      });
+    },
   );
-  await assertExpectedLegacyInventoryDigest({
-    repoSlug: options.repo.slug,
-    defaultBranch,
-    expectedDigest: options.expectedLegacyInventorySha256,
-    phase: "ruleset post-write readback",
-  });
-  await assertRulesetReadback({
-    repoSlug: options.repo.slug,
-    rulesetId: fullRuleset.id,
-    defaultBranch,
-    context: options.context,
-    integrationId: options.integrationId,
-    enforcement: payload.enforcement,
-    expectedPayload: payload,
-    exactWritableFields: true,
-  });
-  console.log(`Updated ruleset: ${rulesetLabel(updated)}`);
+  console.log(`Updated ruleset: ${rulesetLabel(finalUpdatedRuleset)}`);
 }
 
 function readCliOptions() {
@@ -551,8 +573,10 @@ function readCliOptions() {
       "prepare-worktree": { type: "string" },
       apply: { type: "boolean", default: false },
       activate: { type: "boolean", default: false },
+      "derive-post-cleanup-plan": { type: "boolean", default: false },
       "verify-post-cleanup": { type: "boolean", default: false },
       "expected-legacy-inventory-sha256": { type: "string" },
+      "expected-post-cleanup-security-sha256": { type: "string" },
       "ruleset-name": { type: "string", default: DEFAULT_RULESET_NAME },
       "control-plane-owner": {
         type: "string",
@@ -592,6 +616,14 @@ function readCliOptions() {
   if (hasPrepareWorktree && values["verify-post-cleanup"]) {
     throw new Error("--verify-post-cleanup is valid only with --repo.");
   }
+  if (hasPrepareWorktree && values["derive-post-cleanup-plan"]) {
+    throw new Error("--derive-post-cleanup-plan is valid only with --repo.");
+  }
+  if (values["derive-post-cleanup-plan"] && values["verify-post-cleanup"]) {
+    throw new Error(
+      "--derive-post-cleanup-plan and --verify-post-cleanup are separate read-only phases.",
+    );
+  }
   if (
     hasRepo &&
     !values["verify-post-cleanup"] &&
@@ -611,6 +643,33 @@ function readCliOptions() {
   ) {
     throw new Error(
       "--verify-post-cleanup is read-only and cannot be combined with --apply, --activate, canary inputs, or the pre-cleanup legacy digest.",
+    );
+  }
+  if (
+    values["derive-post-cleanup-plan"] &&
+    (values.apply ||
+      values.activate ||
+      values["canary-pr"] !== undefined ||
+      values["canary-head"] !== undefined)
+  ) {
+    throw new Error(
+      "--derive-post-cleanup-plan is read-only and cannot be combined with --apply, --activate, or canary inputs.",
+    );
+  }
+  if (
+    values["verify-post-cleanup"] &&
+    values["expected-post-cleanup-security-sha256"] === undefined
+  ) {
+    throw new Error(
+      "--verify-post-cleanup requires --expected-post-cleanup-security-sha256 from the pre-cleanup derived plan.",
+    );
+  }
+  if (
+    !values["verify-post-cleanup"] &&
+    values["expected-post-cleanup-security-sha256"] !== undefined
+  ) {
+    throw new Error(
+      "--expected-post-cleanup-security-sha256 is valid only with --verify-post-cleanup.",
     );
   }
   if (values.activate && (values["canary-pr"] === undefined || values["canary-head"] === undefined)) {
@@ -636,6 +695,7 @@ function readCliOptions() {
     prepareWorktree: hasPrepareWorktree ? resolve(values["prepare-worktree"]) : null,
     apply: values.apply,
     activate: values.activate,
+    derivePostCleanupPlan: values["derive-post-cleanup-plan"],
     verifyPostCleanup: values["verify-post-cleanup"],
     rulesetName: values["ruleset-name"],
     controlPlaneOwner: normalizeControlPlaneOwner(values["control-plane-owner"]),
@@ -644,6 +704,12 @@ function readCliOptions() {
     expectedLegacyInventorySha256: hasRepo && !values["verify-post-cleanup"]
       ? parseExpectedLegacyInventorySha256(
           values["expected-legacy-inventory-sha256"],
+        )
+      : null,
+    expectedPostCleanupSecuritySha256: values["verify-post-cleanup"]
+      ? parseExpectedSecuritySha256(
+          values["expected-post-cleanup-security-sha256"],
+          "--expected-post-cleanup-security-sha256",
         )
       : null,
     canaryPr: values.activate ? parseCanaryPr(values["canary-pr"]) : null,
@@ -656,7 +722,8 @@ function printUsage() {
   node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--control-plane-owner @USER] [--apply]
   node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 [--control-plane-owner @USER] [--apply]
   node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --activate --canary-pr NUMBER --canary-head SHA [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --verify-post-cleanup [--control-plane-owner @USER]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --derive-post-cleanup-plan [--control-plane-owner @USER]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --verify-post-cleanup --expected-post-cleanup-security-sha256 SHA256 [--control-plane-owner @USER]
 
 Options:
   --prepare-worktree PATH Prepare a local consumer checkout for one installation PR.
@@ -664,7 +731,11 @@ Options:
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
   --expected-legacy-inventory-sha256
                           Exact lowercase SHA-256 from the external owner approval snapshot. Required for every remote staging/activation preview and apply.
-  --verify-post-cleanup   Read-only final proof that legacy requirements are clear and the selected v2 ruleset remains Active.
+  --derive-post-cleanup-plan
+                          Read-only pre-cleanup derivation of the only authorized legacy-elision post-state.
+  --verify-post-cleanup   Read-only two-round proof against the pre-cleanup derived post-state.
+  --expected-post-cleanup-security-sha256
+                          Exact lowercase SHA-256 emitted by --derive-post-cleanup-plan.
   --activate              Activate only after verifying the named temporary-PR canary.
   --canary-pr NUMBER      Open canary PR to verify before activation.
   --canary-head SHA       Exact lowercase 40-hex canary head to verify before activation.
@@ -691,6 +762,15 @@ function parseExpectedLegacyInventorySha256(value) {
   if (!/^[0-9a-f]{64}$/u.test(value)) {
     throw new Error(
       `--expected-legacy-inventory-sha256 must be an exact lowercase 64-hex SHA-256: ${value}`,
+    );
+  }
+  return value;
+}
+
+function parseExpectedSecuritySha256(value, optionName) {
+  if (!/^[0-9a-f]{64}$/u.test(value)) {
+    throw new Error(
+      `${optionName} must be an exact lowercase 64-hex SHA-256: ${value}`,
     );
   }
   return value;
@@ -1159,6 +1239,7 @@ async function assertRulesetReadback({
   expectedPayload,
   exactWritableFields,
   logSuccess = true,
+  inconclusiveWriteEnforcement = null,
 }) {
   if (!Number.isSafeInteger(rulesetId) || rulesetId <= 0) {
     throw new Error(
@@ -1166,9 +1247,19 @@ async function assertRulesetReadback({
     );
   }
 
-  const ruleset = assertCompleteRulesetApiObject(
-    await ghJson(`repos/${repoSlug}/rulesets/${rulesetId}`),
-  );
+  let ruleset;
+  try {
+    ruleset = assertCompleteRulesetApiObject(
+      await ghJson(`repos/${repoSlug}/rulesets/${rulesetId}`),
+    );
+  } catch (error) {
+    if (inconclusiveWriteEnforcement === null) {
+      throw error;
+    }
+    throw new Error(
+      `${error.message} ${postWriteRecoveryGuidance(inconclusiveWriteEnforcement, rulesetId)}`,
+    );
+  }
   if (
     ruleset.id !== rulesetId ||
     ruleset.source_type !== "Repository" ||
@@ -1183,7 +1274,7 @@ async function assertRulesetReadback({
       : !createReadbackMatchesPlannedShape(ruleset, expectedPayload))
   ) {
     throw new Error(
-      `Ruleset readback for id ${rulesetId} is incomplete or drifted: expected exact writable fields with ${enforcement} default-branch coverage, strict ${context} from GitHub Actions (${integrationId}), code-owner review without weakening an existing approval count, resolved conversations, non-fast-forward protection, and explicit empty bypass actors.`,
+      `Ruleset readback for id ${rulesetId} is incomplete or drifted: expected exact writable fields with ${enforcement} default-branch coverage, strict ${context} from GitHub Actions (${integrationId}), code-owner review without weakening an existing approval count, resolved conversations, non-fast-forward protection, and explicit empty bypass actors.${inconclusiveWriteEnforcement === null ? "" : ` ${postWriteRecoveryGuidance(inconclusiveWriteEnforcement, rulesetId)}`}`,
     );
   }
 
@@ -1375,12 +1466,15 @@ async function loadConsumerSecuritySnapshot({
   const workflowPermissions = await ghJson(
     `repos/${repoSlug}/actions/permissions/workflow`,
   );
-  if (workflowPermissions?.default_workflow_permissions !== "read") {
+  if (
+    workflowPermissions?.default_workflow_permissions !== "read" ||
+    typeof workflowPermissions?.can_approve_pull_request_reviews !== "boolean"
+  ) {
     throw new Error(
-      `${repoSlug} must set default workflow permissions to read before the GitHub Actions source can be uniquely trusted.`,
+      `${repoSlug} must expose a complete Actions workflow-permission policy with default permissions set to read before the GitHub Actions source can be uniquely trusted.`,
     );
   }
-  const controlPlaneOwnerPermission = await loadControlPlaneOwnerPermission({
+  const controlPlaneOwnerAccess = await loadControlPlaneOwnerPermission({
     repoSlug,
     owner: controlPlaneOwner,
   });
@@ -1438,9 +1532,19 @@ async function loadConsumerSecuritySnapshot({
       defaultBranch,
       defaultBranchHeadSha,
       workflowInventoryFingerprint: fingerprintWorkflowInventory(workflowFiles),
+      workflowInventory: [...workflowFiles]
+        .sort((left, right) => left.path.localeCompare(right.path))
+        .map((file) => ({
+          path: file.path,
+          mode: file.mode,
+          content_sha256: fingerprintText(file.content),
+        })),
       codeownersFingerprint: fingerprintText(codeownersContent),
+      codeownersErrors: canonicalizeSecurityApiValue(codeownersErrors.errors),
       hasEffectiveUnmanagedCodeownersPatterns:
         codeownersHasEffectiveUnmanagedPatterns(codeownersContent),
+      actionsWorkflowPermissions:
+        canonicalizeSecurityApiValue(workflowPermissions),
       // Keep the complete classic producer-binding representation. contexts[]
       // and checks[] are distinct surfaces, strict is writable policy, and
       // app_id null/-1/positive values have different meanings. Missing or
@@ -1448,10 +1552,14 @@ async function loadConsumerSecuritySnapshot({
       classicRequiredStatusChecksFingerprint: fingerprintText(
         JSON.stringify(classicBranchProtection.requiredStatusChecks),
       ),
+      classicRequiredStatusChecks:
+        classicBranchProtection.requiredStatusChecks,
       classicLegacyStatusRequired,
       classicCodeOwnerReviewRequired:
         classicBranchProtection.codeOwnerReviewRequired,
-      controlPlaneOwnerPermission,
+      classicBranchProtection: classicBranchProtection.protection,
+      controlPlaneOwnerPermission: controlPlaneOwnerAccess.fingerprint,
+      controlPlaneOwner: controlPlaneOwnerAccess.projection,
     };
   } catch (error) {
     throw new Error(
@@ -1463,7 +1571,10 @@ async function loadConsumerSecuritySnapshot({
 function assertConsumerSecuritySnapshotStable(
   expected,
   current,
-  { phase = "ruleset pre-write readback" } = {},
+  {
+    phase = "ruleset pre-write readback",
+    attemptedEnforcement = null,
+  } = {},
 ) {
   if (
     current.repoId !== expected.repoId ||
@@ -1482,7 +1593,7 @@ function assertConsumerSecuritySnapshotStable(
   ) {
     if (phase === "ruleset post-write readback") {
       throw new Error(
-        "The ruleset write completed, but repository identity, default branch, canonical workflow inventory, CODEOWNERS, classic legacy-gate overlap, or control-plane owner permission changed during post-write readback. Do not treat staging or activation as complete; inspect the written ruleset and restore or disable it before retrying.",
+        `The ruleset write completed, but repository identity, default branch, canonical workflow inventory, CODEOWNERS, classic legacy-gate overlap, or control-plane owner permission changed during post-write readback. Do not treat staging or activation as complete. ${postWriteRecoveryGuidance(attemptedEnforcement)}`,
       );
     }
     throw new Error(
@@ -1502,6 +1613,7 @@ async function loadClassicBranchProtectionPolicy({
     return {
       requiredStatusChecks: null,
       codeOwnerReviewRequired: false,
+      protection: null,
     };
   }
   if (
@@ -1534,12 +1646,14 @@ async function loadClassicBranchProtectionPolicy({
     return {
       requiredStatusChecks: null,
       codeOwnerReviewRequired,
+      protection: canonicalClassicProtectionProjection(response),
     };
   }
   return {
     requiredStatusChecks:
       canonicalClassicRequiredStatusChecks(requiredStatusChecks),
     codeOwnerReviewRequired,
+    protection: canonicalClassicProtectionProjection(response),
   };
 }
 
@@ -1558,6 +1672,66 @@ function fingerprintWorkflowInventory(workflowFiles) {
 
 function fingerprintText(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function canonicalClassicProtectionProjection(response) {
+  const projection = canonicalizeSecurityApiValue(response);
+  projection.required_status_checks = response.required_status_checks === null
+    ? null
+    : canonicalClassicRequiredStatusChecks(response.required_status_checks);
+  return projection;
+}
+
+function canonicalizeSecurityApiValue(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(
+        "Security-policy API projection contains a non-safe-integer number.",
+      );
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => canonicalizeSecurityApiValue(item))
+      .sort((left, right) =>
+        canonicalSecurityJson(left).localeCompare(canonicalSecurityJson(right)));
+  }
+  if (value === undefined || typeof value !== "object") {
+    throw new Error("Security-policy API projection contains an unsupported value.");
+  }
+  const result = {};
+  for (const key of Object.keys(value).sort()) {
+    if (
+      key === "url" ||
+      key.endsWith("_url") ||
+      ["created_at", "updated_at", "avatar_url", "html_url"].includes(key)
+    ) {
+      continue;
+    }
+    result[key] = canonicalizeSecurityApiValue(value[key]);
+  }
+  return result;
+}
+
+function canonicalSecurityJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalSecurityJson(item)).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalSecurityJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalSecurityBytes(value) {
+  return `${canonicalSecurityJson(value)}\n`;
 }
 
 async function loadControlPlaneOwnerPermission({ repoSlug, owner }) {
@@ -1579,13 +1753,23 @@ async function loadControlPlaneOwnerPermission({ repoSlug, owner }) {
       `${owner} must resolve to a repository collaborator with write, maintain, or admin permission on ${repoSlug}.`,
     );
   }
-  return [
+  const fingerprint = [
     permission.user.login.toLowerCase(),
     permission.user.type,
     permission.user.id,
     permission.user.node_id,
     permission.permission,
   ].join(":");
+  return {
+    fingerprint,
+    projection: {
+      login: permission.user.login.toLowerCase(),
+      type: permission.user.type,
+      id: permission.user.id,
+      node_id: permission.user.node_id,
+      permission: permission.permission,
+    },
+  };
 }
 
 async function loadDefaultBranchControlPlaneInventory({ repoSlug, treeRef }) {
@@ -1708,6 +1892,40 @@ async function loadRulesets(repoSlug) {
   return rulesets;
 }
 
+function selectUniqueNamedRepositoryRuleset(rulesets, rulesetName) {
+  const matches = rulesets.filter(
+    (ruleset) =>
+      ruleset?.source_type === "Repository" && ruleset?.name === rulesetName,
+  );
+  if (matches.length > 1) {
+    throw new Error(
+      `Repository ruleset name "${rulesetName}" is ambiguous; found ${matches
+        .map((ruleset) => `id ${ruleset.id} (${ruleset.target ?? "branch"})`)
+        .join(", ")}. Rename or remove duplicates before bootstrap.`,
+    );
+  }
+  return matches[0];
+}
+
+async function loadRulesetSummaries(repoSlug) {
+  const pages = await ghJson(
+    `repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`,
+    { paginate: true },
+  );
+  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
+    throw new Error("Repository ruleset listing is not a complete paginated array.");
+  }
+  const summaries = pages.flat();
+  const ids = summaries.map((ruleset) => ruleset?.id);
+  if (
+    ids.some((id) => !Number.isSafeInteger(id) || id <= 0) ||
+    new Set(ids).size !== ids.length
+  ) {
+    throw new Error("Repository ruleset listing contains malformed or duplicate ids.");
+  }
+  return summaries;
+}
+
 // Protected property: from the externally approved owner snapshot through the
 // Disabled stage, canary, activation write, and exact Active readback, every
 // original legacy ruleset/classic requirement keeps the same identity,
@@ -1720,6 +1938,7 @@ async function assertExpectedLegacyInventoryDigest({
   defaultBranch,
   expectedDigest,
   phase,
+  attemptedEnforcement = null,
 }) {
   let bytes;
   try {
@@ -1735,37 +1954,344 @@ async function assertExpectedLegacyInventoryDigest({
       ? "The ruleset write completed, but"
       : "Refusing the write because";
     throw new Error(
-      `${prefix} the canonical legacy review-gate inventory digest mismatched the external owner approval snapshot during ${phase}: expected ${expectedDigest}, read ${actualDigest}.`,
+      `${prefix} the canonical legacy review-gate inventory digest mismatched the external owner approval snapshot during ${phase}: expected ${expectedDigest}, read ${actualDigest}.${phase === "ruleset post-write readback" ? ` ${postWriteRecoveryGuidance(attemptedEnforcement)}` : ""}`,
     );
   }
 }
 
-// Post-cleanup proof intentionally uses a new read-only mode rather than the
-// pre-cleanup approval digest: an authorised cleanup must change that digest.
-// The protected property here is absence of the legacy context on both
-// effective ruleset and classic branch-protection surfaces. Other classic
-// required checks remain valid and do not make the proof inconclusive.
-async function assertPostCleanupLegacyInventoryClear({
-  repoSlug,
-  defaultBranch,
-  repositoryId,
-  repositoryNodeId,
-}) {
-  let bytes;
+function postWriteRecoveryGuidance(enforcement, rulesetId = null) {
+  const idClause = Number.isSafeInteger(rulesetId)
+    ? ` for exact ruleset id ${rulesetId}`
+    : " against the complete authoritative ruleset inventory, binding any candidate by exact id";
+  if (enforcement === "active") {
+    return `The Active write may already have completed: preserve the v2 ruleset and every legacy protection, do not disable, delete, or overwrite the v2 gate, and perform an authoritative readback${idClause} before any separately authorized repair.`;
+  }
+  return `The Disabled staging write may already have completed: inspect an authoritative readback${idClause}; repair or disable it only after its exact state is known.`;
+}
+
+async function withPostWriteRecoveryGuidance(
+  { enforcement, rulesetId = null },
+  operation,
+) {
   try {
-    bytes = await loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch });
+    return await operation();
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const guidance = postWriteRecoveryGuidance(enforcement, rulesetId);
+    const guidancePrefix = enforcement === "active"
+      ? "The Active write may already have completed:"
+      : "The Disabled staging write may already have completed:";
+    if (message.includes(guidancePrefix)) {
+      throw error;
+    }
+    throw new Error(`${message} ${guidance}`);
+  }
+}
+
+// Cleanup never trusts a digest manufactured from the already-mutated state.
+// The read-only derive phase captures two identical complete pre-cleanup
+// closures and deterministically removes only the legacy status requirement.
+// The read-only verify phase then requires two complete post-cleanup closures
+// to equal that pre-derived state. No original-repository write credential or
+// in-repository ledger is needed.
+async function printDerivedPostCleanupPlan({ options, canonicalWorkflows }) {
+  const first = await loadCleanupSecurityClosure({
+    options,
+    canonicalWorkflows,
+    requireLegacyClear: false,
+  });
+  assertLegacyInventoryDigestBytes(
+    first.legacyInventoryBytes,
+    options.expectedLegacyInventorySha256,
+    "post-cleanup plan first pre-state readback",
+  );
+  const second = await loadCleanupSecurityClosure({
+    options,
+    canonicalWorkflows,
+    requireLegacyClear: false,
+  });
+  assertLegacyInventoryDigestBytes(
+    second.legacyInventoryBytes,
+    options.expectedLegacyInventorySha256,
+    "post-cleanup plan second pre-state readback",
+  );
+  assertCleanupClosureStable(first, second, "pre-cleanup plan derivation");
+
+  const firstDerived = deriveAuthorizedPostCleanupState(first);
+  const secondDerived = deriveAuthorizedPostCleanupState(second);
+  if (
+    canonicalSecurityBytes(firstDerived.state) !==
+    canonicalSecurityBytes(secondDerived.state)
+  ) {
     throw new Error(
-      `Post-cleanup legacy review-gate inventory is unreadable or schema-inconclusive; refusing to treat either legacy surface as clear.\n${error.message}`,
+      "The deterministic post-cleanup state changed across the two pre-cleanup readbacks; refusing to emit an approval digest.",
+    );
+  }
+  const expectedDigest = fingerprintText(
+    canonicalSecurityBytes(firstDerived.state),
+  );
+  const plan = {
+    schema_version: 1,
+    repository: first.state.repository,
+    authorized_legacy_context: LEGACY_STATUS_CONTEXT,
+    pre_cleanup_security_sha256: fingerprintText(
+      canonicalSecurityBytes(first.state),
+    ),
+    expected_post_cleanup_security_sha256: expectedDigest,
+    selected_v2_ruleset: {
+      id: first.selectedV2.id,
+      name: first.selectedV2.name,
+      source_type: first.selectedV2.source_type,
+      source: first.selectedV2.source,
+      target: first.selectedV2.target,
+    },
+    cleanup_actions: firstDerived.actions,
+    expected_post_cleanup_security_state: firstDerived.state,
+  };
+  process.stdout.write(`${JSON.stringify(JSON.parse(canonicalSecurityJson(plan)), null, 2)}\n`);
+}
+
+async function verifyExpectedPostCleanupState({ options, canonicalWorkflows }) {
+  const first = await loadCleanupSecurityClosure({
+    options,
+    canonicalWorkflows,
+    requireLegacyClear: true,
+  });
+  const second = await loadCleanupSecurityClosure({
+    options,
+    canonicalWorkflows,
+    requireLegacyClear: true,
+  });
+  assertCleanupClosureStable(first, second, "post-cleanup verification");
+  const firstDigest = fingerprintText(canonicalSecurityBytes(first.state));
+  const secondDigest = fingerprintText(canonicalSecurityBytes(second.state));
+  if (
+    firstDigest !== options.expectedPostCleanupSecuritySha256 ||
+    secondDigest !== options.expectedPostCleanupSecuritySha256
+  ) {
+    throw new Error(
+      `Post-cleanup security state does not equal the pre-cleanup derived authorized state: expected ${options.expectedPostCleanupSecuritySha256}, read ${firstDigest} and ${secondDigest}. Preserve the Active v2 ruleset and every remaining protection; do not delete, disable, or overwrite the v2 gate while investigating the drift.`,
+    );
+  }
+  console.log(
+    `Post-cleanup verified across two complete stable security snapshots: both legacy requirement surfaces are clear, every unrelated protection matches the pre-derived state, and ${rulesetLabel(second.selectedV2)} remains the complete Active v2 gate.`,
+  );
+}
+
+async function loadCleanupSecurityClosure({
+  options,
+  canonicalWorkflows,
+  requireLegacyClear,
+}) {
+  const securitySnapshot = await loadConsumerSecuritySnapshot({
+    repoSlug: options.repo.slug,
+    canonicalWorkflows,
+    controlPlaneOwner: options.controlPlaneOwner,
+  });
+  const rulesets = await loadRulesets(options.repo.slug);
+  const selectedV2 = selectUniqueNamedRepositoryRuleset(
+    rulesets,
+    options.rulesetName,
+  );
+  if (
+    selectedV2 === undefined ||
+    selectedV2.target !== "branch" ||
+    selectedV2.enforcement !== "active" ||
+    !rulesetCoversDefaultBranch(selectedV2, securitySnapshot.defaultBranch) ||
+    !rulesetHasGatePolicy(selectedV2, options.context, {
+      integrationId: options.integrationId,
+    }) ||
+    (requireLegacyClear &&
+      rulesetHasRequiredStatusContext(selectedV2, LEGACY_STATUS_CONTEXT, {
+        integrationId: undefined,
+      }))
+  ) {
+    throw new Error(
+      `Cleanup closure requires the unique repository ruleset "${options.rulesetName}" to remain the complete Active v2 policy${requireLegacyClear ? ` without ${LEGACY_STATUS_CONTEXT}` : ""}.`,
     );
   }
 
+  let legacyInventoryBytes;
+  try {
+    legacyInventoryBytes = await loadCanonicalLegacyInventoryBytes({
+      repoSlug: options.repo.slug,
+      defaultBranch: securitySnapshot.defaultBranch,
+    });
+  } catch (error) {
+    throw new Error(
+      `Cleanup security closure could not read a complete legacy inventory.\n${error.message}`,
+    );
+  }
+  const legacyInventory = decodeBoundLegacyInventory({
+    bytes: legacyInventoryBytes,
+    repoSlug: options.repo.slug,
+    repositoryId: securitySnapshot.repoId,
+    repositoryNodeId: securitySnapshot.repoNodeId,
+    defaultBranch: securitySnapshot.defaultBranch,
+  });
+  if (
+    canonicalSecurityJson(legacyInventory.classic_required_status_checks) !==
+    canonicalSecurityJson(securitySnapshot.classicRequiredStatusChecks)
+  ) {
+    throw new Error(
+      "Classic required-status policy changed between the full security snapshot and legacy-inventory readback.",
+    );
+  }
+  const byId = new Map(rulesets.map((ruleset) => [ruleset.id, ruleset]));
+  for (const legacyRuleset of legacyInventory.rulesets) {
+    const fullRuleset = byId.get(legacyRuleset.id);
+    if (
+      fullRuleset === undefined ||
+      postCleanupRulesetFingerprint(fullRuleset) !==
+        postCleanupRulesetFingerprint(legacyRuleset)
+    ) {
+      throw new Error(
+        `Effective legacy ruleset ${legacyRuleset.id} changed between the complete ruleset and legacy-inventory readbacks.`,
+      );
+    }
+  }
+  if (requireLegacyClear) {
+    assertDecodedLegacyInventoryClear(legacyInventory, options.repo.slug);
+  }
+
+  return {
+    legacyInventory,
+    legacyInventoryBytes,
+    selectedV2,
+    state: buildCleanupSecurityState({
+      repoSlug: options.repo.slug,
+      securitySnapshot,
+      rulesets,
+    }),
+  };
+}
+
+function buildCleanupSecurityState({ repoSlug, securitySnapshot, rulesets }) {
+  return {
+    schema_version: 1,
+    repository: {
+      full_name: repoSlug,
+      id: securitySnapshot.repoId,
+      node_id: securitySnapshot.repoNodeId,
+      default_branch: securitySnapshot.defaultBranch,
+      default_branch_head_sha: securitySnapshot.defaultBranchHeadSha,
+    },
+    actions_workflow_permissions: securitySnapshot.actionsWorkflowPermissions,
+    control_plane_owner: securitySnapshot.controlPlaneOwner,
+    workflow_inventory: securitySnapshot.workflowInventory,
+    codeowners: {
+      content_sha256: securitySnapshot.codeownersFingerprint,
+      errors: securitySnapshot.codeownersErrors,
+      has_effective_unmanaged_patterns:
+        securitySnapshot.hasEffectiveUnmanagedCodeownersPatterns,
+    },
+    classic_branch_protection: securitySnapshot.classicBranchProtection,
+    rulesets: rulesets
+      .map(rulesetSecurityProjection)
+      .sort((left, right) => left.id - right.id),
+  };
+}
+
+function rulesetSecurityProjection(ruleset) {
+  return {
+    id: ruleset.id,
+    name: ruleset.name,
+    source_type: ruleset.source_type,
+    source: ruleset.source,
+    writable: canonicalizeSecurityApiValue(
+      JSON.parse(rulesetWritableFingerprint(ruleset)),
+    ),
+  };
+}
+
+function deriveAuthorizedPostCleanupState(closure) {
+  const state = structuredClone(closure.state);
+  const actions = {
+    classic_required_status_check_removed: false,
+    rulesets: [],
+  };
+  const classic = state.classic_branch_protection?.required_status_checks ?? null;
+  if (classic !== null) {
+    const nextClassic = removeLegacyFromClassicStatusPolicy(classic);
+    actions.classic_required_status_check_removed =
+      canonicalSecurityJson(nextClassic) !== canonicalSecurityJson(classic);
+    state.classic_branch_protection.required_status_checks = nextClassic;
+  }
+
+  const effectiveLegacyIds = new Set(
+    closure.legacyInventory.rulesets.map((ruleset) => ruleset.id),
+  );
+  state.rulesets = state.rulesets.flatMap((ruleset) => {
+    if (!effectiveLegacyIds.has(ruleset.id)) {
+      return [ruleset];
+    }
+    const nextRules = ruleset.writable.rules.flatMap((rule) => {
+      if (rule.type !== "required_status_checks") {
+        return [rule];
+      }
+      const checks = rule.parameters.required_status_checks.filter(
+        (check) => check.context !== LEGACY_STATUS_CONTEXT,
+      );
+      if (checks.length === rule.parameters.required_status_checks.length) {
+        return [rule];
+      }
+      if (checks.length === 0) {
+        return [];
+      }
+      return [{
+        ...rule,
+        parameters: {
+          ...rule.parameters,
+          required_status_checks: checks,
+        },
+      }];
+    });
+    if (nextRules.length === 0) {
+      actions.rulesets.push({
+        id: ruleset.id,
+        name: ruleset.name,
+        action: "delete-dedicated-legacy-only-ruleset",
+      });
+      return [];
+    }
+    const updated = structuredClone(ruleset);
+    updated.writable.rules = nextRules;
+    actions.rulesets.push({
+      id: ruleset.id,
+      name: ruleset.name,
+      action: "remove-legacy-check-only",
+    });
+    return [updated];
+  });
+  return { state, actions };
+}
+
+function removeLegacyFromClassicStatusPolicy(classic) {
+  const contexts = classic.contexts.filter(
+    (context) => context !== LEGACY_STATUS_CONTEXT,
+  );
+  const checks = classic.checks.filter(
+    (check) => check.context !== LEGACY_STATUS_CONTEXT,
+  );
+  if (contexts.length === 0 && checks.length === 0) {
+    return null;
+  }
+  return { ...classic, contexts, checks };
+}
+
+function decodeBoundLegacyInventory({
+  bytes,
+  repoSlug,
+  repositoryId,
+  repositoryNodeId,
+  defaultBranch,
+}) {
   let inventory;
   try {
     inventory = JSON.parse(bytes);
   } catch (error) {
     throw new Error(
-      `Post-cleanup legacy review-gate inventory could not be decoded; verification is inconclusive.\n${error.message}`,
+      `Legacy review-gate inventory could not be decoded; verification is inconclusive.\n${error.message}`,
     );
   }
   if (
@@ -1776,50 +2302,44 @@ async function assertPostCleanupLegacyInventoryClear({
     !Array.isArray(inventory?.rulesets)
   ) {
     throw new Error(
-      "Post-cleanup legacy review-gate inventory lost its repository/default-branch binding or ruleset array; verification is inconclusive.",
+      "Legacy review-gate inventory lost its repository/default-branch binding or ruleset array.",
     );
   }
+  return inventory;
+}
 
+function assertDecodedLegacyInventoryClear(inventory, repoSlug) {
   const classic = inventory.classic_required_status_checks;
   const classicHasLegacy = classic !== null &&
     (classic.contexts.includes(LEGACY_STATUS_CONTEXT) ||
       classic.checks.some((check) => check.context === LEGACY_STATUS_CONTEXT));
   if (inventory.rulesets.length > 0 || classicHasLegacy) {
     throw new Error(
-      `${LEGACY_STATUS_CONTEXT} remains required after cleanup on ${repoSlug}'s ${defaultBranch} branch; leave the v2 ruleset active, remove the remaining legacy requirement, and rerun this read-only verification.`,
+      `${LEGACY_STATUS_CONTEXT} remains required after cleanup on ${repoSlug}; leave the v2 ruleset active, remove only the remaining authorized legacy requirement, and rerun this read-only verification.`,
     );
   }
-  return bytes;
 }
 
-async function loadPostCleanupV2Ruleset({
-  repoSlug,
-  rulesetId,
-  rulesetName,
-  defaultBranch,
-  context,
-  integrationId,
-}) {
-  const fullRuleset = assertCompleteRulesetApiObject(
-    await ghJson(`repos/${repoSlug}/rulesets/${rulesetId}`),
-  );
+function assertCleanupClosureStable(first, second, phase) {
   if (
-    fullRuleset.id !== rulesetId ||
-    fullRuleset.name !== rulesetName ||
-    fullRuleset.source_type !== "Repository" ||
-    fullRuleset.source !== repoSlug ||
-    fullRuleset.enforcement !== "active" ||
-    !rulesetCoversDefaultBranch(fullRuleset, defaultBranch) ||
-    !rulesetHasGatePolicy(fullRuleset, context, { integrationId }) ||
-    rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
-      integrationId: undefined,
-    })
+    first.legacyInventoryBytes !== second.legacyInventoryBytes ||
+    canonicalSecurityBytes(first.state) !== canonicalSecurityBytes(second.state) ||
+    postCleanupRulesetFingerprint(first.selectedV2) !==
+      postCleanupRulesetFingerprint(second.selectedV2)
   ) {
     throw new Error(
-      `Post-cleanup verification requires repository ruleset "${rulesetName}" to remain the complete Active v2 policy without ${LEGACY_STATUS_CONTEXT}.`,
+      `Repository security state changed across the two complete ${phase} readbacks; the result is inconclusive and must be rerun against a stable repository.`,
     );
   }
-  return fullRuleset;
+}
+
+function assertLegacyInventoryDigestBytes(bytes, expectedDigest, phase) {
+  const actualDigest = fingerprintText(bytes);
+  if (actualDigest !== expectedDigest) {
+    throw new Error(
+      `Canonical legacy review-gate inventory mismatched the owner-approved pre-cleanup snapshot during ${phase}: expected ${expectedDigest}, read ${actualDigest}.`,
+    );
+  }
 }
 
 function assertSelectedRepositoryRulesetIdentity(
@@ -1842,11 +2362,13 @@ function assertSelectedRepositoryRulesetIdentity(
 }
 
 function postCleanupRulesetFingerprint(ruleset) {
-  return JSON.stringify({
+  return canonicalSecurityJson({
     id: ruleset.id,
     source_type: ruleset.source_type,
     source: ruleset.source,
-    writable: rulesetWritableFingerprint(ruleset),
+    writable: canonicalizeSecurityApiValue(
+      JSON.parse(rulesetWritableFingerprint(ruleset)),
+    ),
   });
 }
 
@@ -2025,25 +2547,14 @@ async function prepareConsumerWorktree({
     controllerWorkflowPath,
   );
   const currentCodeowners = await readOptionalRegularFile(codeownersPath);
-  const lowerPrecedenceCodeowners = await findLowerPrecedenceCodeowners(targetRoot);
-  if (lowerPrecedenceCodeowners !== null) {
-    throw new Error(
-      `${lowerPrecedenceCodeowners} is a lower-precedence CODEOWNERS file. ${DEFAULT_CODEOWNERS_PATH} would shadow or already shadows it; merge its entries into ${DEFAULT_CODEOWNERS_PATH}, remove the lower-precedence file in the same installation PR, then rerun the helper.`,
-    );
-  }
   const preparedCodeowners = ensureControlPlaneCodeownersContent(
     currentCodeowners,
     controlPlaneOwner,
   );
-  const otherWorkflowConflicts = await findOtherGateCallerWorkflowPaths({
+  const initialLocalSecurityState = await loadLocalInstallationSecurityState({
     targetRoot,
     canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
   });
-  if (otherWorkflowConflicts.length > 0) {
-    throw new Error(
-      `Additional workflows have a v1/v2 gate caller, reserved CheckRun name, or relevant write authority and require explicit removal or review in the same installation PR: ${otherWorkflowConflicts.join(", ")}`,
-    );
-  }
   await revalidateDirectoryChain(parentWitnesses, "after local workflow inspection");
 
   const verifierChanged =
@@ -2064,6 +2575,15 @@ async function prepareConsumerWorktree({
     console.log("No change: local CODEOWNERS already has canonical final control-plane ownership.");
   }
   if (!verifierChanged && !controllerChanged && !preparedCodeowners.changed) {
+    const finalNoopState = await loadLocalInstallationSecurityState({
+      targetRoot,
+      canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
+    });
+    assertLocalInstallationSecurityStateStable(
+      initialLocalSecurityState,
+      finalNoopState,
+      "no-op success readback",
+    );
     return;
   }
 
@@ -2094,58 +2614,120 @@ async function prepareConsumerWorktree({
   if (parentWitnesses.github === null || parentWitnesses.workflows === null) {
     throw new Error("Verified workflow parent chain is incomplete before write.");
   }
-  if (preparedCodeowners.changed) {
-    await installPreparedConsumerFile({
-      path: codeownersPath,
-      content: preparedCodeowners.content,
-      expectedContent: currentCodeowners,
-      parentWitnesses,
-      label: "CODEOWNERS",
+  const plannedChanges = [
+    ...(preparedCodeowners.changed
+      ? [{
+          path: codeownersPath,
+          content: preparedCodeowners.content,
+          expectedContent: currentCodeowners,
+          label: "CODEOWNERS",
+        }]
+      : []),
+    ...(verifierChanged
+      ? [{
+          path: verifierWorkflowPath,
+          content: canonicalWorkflows.verifier,
+          expectedContent: currentVerifierWorkflow,
+          label: "verifier-workflow",
+        }]
+      : []),
+    ...(controllerChanged
+      ? [{
+          path: controllerWorkflowPath,
+          content: canonicalWorkflows.controller,
+          expectedContent: currentControllerWorkflow,
+          label: "controller-workflow",
+        }]
+      : []),
+  ];
+  const expectedFinalLocalSecurityState = buildExpectedFinalLocalSecurityState({
+    initialState: initialLocalSecurityState,
+    targetRoot,
+    verifierWorkflowPath,
+    controllerWorkflowPath,
+    codeownersContent: preparedCodeowners.content,
+    verifierContent: canonicalWorkflows.verifier,
+    controllerContent: canonicalWorkflows.controller,
+  });
+  const installedLabels = [];
+  let firstRenameBoundaryComplete = false;
+  try {
+    for (const change of plannedChanges) {
+      await installPreparedConsumerFile({
+        ...change,
+        parentWitnesses,
+        beforeRename: async () => {
+          if (firstRenameBoundaryComplete) {
+            return;
+          }
+          const preRenameState = await loadLocalInstallationSecurityState({
+            targetRoot,
+            canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
+          });
+          assertLocalInstallationSecurityStateStable(
+            initialLocalSecurityState,
+            preRenameState,
+            "immediately before the first install rename",
+          );
+          firstRenameBoundaryComplete = true;
+        },
+      });
+      installedLabels.push(change.label);
+    }
+
+    const finalLocalSecurityState = await loadLocalInstallationSecurityState({
+      targetRoot,
+      canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
     });
-  }
-  if (verifierChanged) {
-    await installPreparedConsumerFile({
-      path: verifierWorkflowPath,
-      content: canonicalWorkflows.verifier,
-      expectedContent: currentVerifierWorkflow,
-      parentWitnesses,
-      label: "verifier-workflow",
-    });
-  }
-  if (controllerChanged) {
-    await installPreparedConsumerFile({
-      path: controllerWorkflowPath,
-      content: canonicalWorkflows.controller,
-      expectedContent: currentControllerWorkflow,
-      parentWitnesses,
-      label: "controller-workflow",
-    });
+    assertLocalInstallationSecurityStateStable(
+      expectedFinalLocalSecurityState,
+      finalLocalSecurityState,
+      "final local apply success readback",
+    );
+  } catch (error) {
+    if (installedLabels.length > 0) {
+      throw buildPartialLocalApplyError(error, installedLabels, plannedChanges);
+    }
+    throw error;
   }
 
-  const installedVerifier = await readOptionalRegularFile(verifierWorkflowPath);
-  const installedController = await readOptionalRegularFile(
-    controllerWorkflowPath,
-  );
-  if (
-    !installedWorkflowMatchesCanonical(
-      installedVerifier,
-      canonicalWorkflows.verifier,
-    ) ||
-    !installedWorkflowMatchesCanonical(
-      installedController,
-      canonicalWorkflows.controller,
-    )
-  ) {
-    throw new Error(
-      "Local verifier/controller workflows failed exact-byte post-install verification.",
+  try {
+    const installedVerifier = await readOptionalRegularFile(verifierWorkflowPath);
+    const installedController = await readOptionalRegularFile(
+      controllerWorkflowPath,
     );
+    if (
+      !installedWorkflowMatchesCanonical(
+        installedVerifier,
+        canonicalWorkflows.verifier,
+      ) ||
+      !installedWorkflowMatchesCanonical(
+        installedController,
+        canonicalWorkflows.controller,
+      )
+    ) {
+      throw new Error(
+        "Local verifier/controller workflows failed exact-byte post-install verification.",
+      );
+    }
+    const installedCodeowners = await readOptionalRegularFile(codeownersPath);
+    validateControlPlaneCodeownersContent(installedCodeowners, controlPlaneOwner);
+    if (installedCodeowners !== preparedCodeowners.content) {
+      throw new Error("Local CODEOWNERS failed exact-byte post-install verification.");
+    }
+    await revalidateDirectoryChain(parentWitnesses, "after exact-byte verification");
+    const successBoundaryState = await loadLocalInstallationSecurityState({
+      targetRoot,
+      canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
+    });
+    assertLocalInstallationSecurityStateStable(
+      expectedFinalLocalSecurityState,
+      successBoundaryState,
+      "immediately before local apply success",
+    );
+  } catch (error) {
+    throw buildPartialLocalApplyError(error, installedLabels, plannedChanges);
   }
-  const installedCodeowners = await readOptionalRegularFile(codeownersPath);
-  validateControlPlaneCodeownersContent(installedCodeowners, controlPlaneOwner);
-  if (installedCodeowners !== preparedCodeowners.content) {
-    throw new Error("Local CODEOWNERS failed exact-byte post-install verification.");
-  }
-  await revalidateDirectoryChain(parentWitnesses, "after exact-byte verification");
   if (verifierChanged) {
     console.log(`Applied: ${verifierAction}.`);
   }
@@ -2160,12 +2742,22 @@ async function prepareConsumerWorktree({
   );
 }
 
+function buildPartialLocalApplyError(error, installedLabels, plannedChanges) {
+  const remainingLabels = plannedChanges
+    .map((change) => change.label)
+    .filter((label) => !installedLabels.includes(label));
+  return new Error(
+    `${error.message}\nPartial local apply: installed ${installedLabels.join(", ") || "no completed target"}; ${remainingLabels.length > 0 ? `${remainingLabels.join(", ")} were not installed or verified` : "all planned renames completed but the final security closure was not verified"}. Inspect the target-repository diff and rerun the helper; no rollback was claimed or attempted.`,
+  );
+}
+
 async function installPreparedConsumerFile({
   path,
   content,
   expectedContent,
   parentWitnesses,
   label,
+  beforeRename = async () => {},
 }) {
   const temporaryPath = join(
     dirname(path),
@@ -2183,6 +2775,7 @@ async function installPreparedConsumerFile({
     });
     temporaryOwned = true;
     await revalidateDirectoryChain(parentWitnesses, `after temporary ${label} write`);
+    await beforeRename();
     await revalidateDirectoryChain(parentWitnesses, `before ${label} install rename`);
     await assertConsumerFileContentStable(path, expectedContent, label);
     await rename(temporaryPath, path);
@@ -2519,10 +3112,16 @@ async function revalidateDirectoryChain(witnesses, phase) {
   }
 }
 
-async function findOtherGateCallerWorkflowPaths({
+async function loadLocalInstallationSecurityState({
   targetRoot,
   canonicalWorkflowPaths,
 }) {
+  const lowerPrecedenceCodeowners = await findLowerPrecedenceCodeowners(targetRoot);
+  if (lowerPrecedenceCodeowners !== null) {
+    throw new Error(
+      `${lowerPrecedenceCodeowners} is a lower-precedence CODEOWNERS file. ${DEFAULT_CODEOWNERS_PATH} would shadow or already shadows it; merge its entries into ${DEFAULT_CODEOWNERS_PATH}, remove the lower-precedence file in the same installation PR, then rerun the helper.`,
+    );
+  }
   const workflowsDirectory = join(targetRoot, ".github", "workflows");
   const canonicalPaths = new Set(canonicalWorkflowPaths);
   const entries = await readdir(workflowsDirectory, { withFileTypes: true }).catch((error) => {
@@ -2531,31 +3130,88 @@ async function findOtherGateCallerWorkflowPaths({
     }
     throw error;
   });
-  const callerPaths = [];
+  const workflowFiles = [];
+  const conflicts = [];
   for (const entry of entries) {
     if (!/\.ya?ml$/.test(entry.name)) {
       continue;
     }
     const absolutePath = join(workflowsDirectory, entry.name);
-    if (canonicalPaths.has(absolutePath)) {
-      continue;
-    }
     if (!entry.isFile() || entry.isSymbolicLink()) {
       throw new Error(`Cannot safely inspect non-regular workflow: ${absolutePath}`);
     }
     const content = await readFile(absolutePath, "utf8");
+    const relativePath = absolutePath.slice(targetRoot.length + 1);
+    workflowFiles.push({
+      path: relativePath,
+      content_sha256: fingerprintText(content),
+    });
+    if (canonicalPaths.has(absolutePath)) {
+      continue;
+    }
     const violations = [];
     if (workflowContainsCodexReviewGateCaller(content)) {
       violations.push("gate caller");
     }
     violations.push(...workflowSingleProducerPolicyViolations(content));
     if (violations.length > 0) {
-      callerPaths.push(
-        `${absolutePath.slice(targetRoot.length + 1)} (${violations.join(", ")})`,
+      conflicts.push(
+        `${relativePath} (${violations.join(", ")})`,
       );
     }
   }
-  return callerPaths.sort();
+  if (conflicts.length > 0) {
+    throw new Error(
+      `Additional workflows have a v1/v2 gate caller, reserved CheckRun name, or relevant write authority and require explicit removal or review in the same installation PR: ${conflicts.sort().join(", ")}`,
+    );
+  }
+  const codeownersContent = await readOptionalRegularFile(
+    join(targetRoot, ...DEFAULT_CODEOWNERS_PATH.split("/")),
+  );
+  return {
+    lower_precedence_codeowners: null,
+    codeowners_sha256: codeownersContent === null
+      ? null
+      : fingerprintText(codeownersContent),
+    workflows: workflowFiles.sort((left, right) => left.path.localeCompare(right.path)),
+  };
+}
+
+function buildExpectedFinalLocalSecurityState({
+  initialState,
+  targetRoot,
+  verifierWorkflowPath,
+  controllerWorkflowPath,
+  codeownersContent,
+  verifierContent,
+  controllerContent,
+}) {
+  const workflows = new Map(
+    initialState.workflows.map((file) => [file.path, file.content_sha256]),
+  );
+  workflows.set(
+    verifierWorkflowPath.slice(targetRoot.length + 1),
+    fingerprintText(verifierContent),
+  );
+  workflows.set(
+    controllerWorkflowPath.slice(targetRoot.length + 1),
+    fingerprintText(controllerContent),
+  );
+  return {
+    lower_precedence_codeowners: null,
+    codeowners_sha256: fingerprintText(codeownersContent),
+    workflows: [...workflows.entries()]
+      .map(([path, content_sha256]) => ({ path, content_sha256 }))
+      .sort((left, right) => left.path.localeCompare(right.path)),
+  };
+}
+
+function assertLocalInstallationSecurityStateStable(expected, current, phase) {
+  if (canonicalSecurityJson(expected) !== canonicalSecurityJson(current)) {
+    throw new Error(
+      `Local workflow/CODEOWNERS security inventory changed during ${phase}; refusing to continue or report success.`,
+    );
+  }
 }
 
 async function readOptionalRegularFile(path) {

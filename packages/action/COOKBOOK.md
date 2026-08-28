@@ -367,12 +367,29 @@ After the installation PR merges:
 7. through step 6, pass the same owner-approved digest explicitly to every
    stage/activation preview and apply, even though those helper invocations are
    separate processes;
-8. only then perform separately authorised legacy cleanup; because cleanup
-   changes the old digest, use read-only `--verify-post-cleanup` without that
-   digest to prove both legacy surfaces clear and v2 still the same complete
-   Active policy; and
-9. close the canary PR without merging.
+8. only then run read-only `--derive-post-cleanup-plan` against the complete
+   pre-cleanup security snapshot, passing the same external owner-approved
+   legacy-inventory digest as `--expected-legacy-inventory-sha256` and requiring
+   the current pre-state to match it;
+   review its canonical plan, which may remove
+   only `codex/review-gate`; an emptied status rule may be removed and a whole
+   dedicated legacy-only ruleset only when no other rule remains; an emptied
+   classic required-status policy may also disappear; require exact
+   preservation of repository/default head, workflow/CODEOWNERS inventory,
+   owner permission, all fields/non-legacy checks including `strict`/`app_id`
+   in a surviving classic policy, and every retained ruleset's identity,
+   conditions, bypass actors, and unrelated rules; record its
+   `expected_post_cleanup_security_sha256`;
+9. perform the separately authorised legacy cleanup, then run read-only
+   `--verify-post-cleanup --expected-post-cleanup-security-sha256 <digest>`;
+   require two identical complete security rounds that both match the external
+   digest, show both legacy surfaces clear and show the same complete v2 policy
+   Active; and
+10. close the canary PR without merging, verify its recorded head
+    repository/ref/OID, and lease-delete only that still-exact temporary ref.
 
 If the canary fails, repair through ordinary forward Git history. Do not move
 the `v2` release alias backwards and do not weaken the ruleset to manufacture a
-pass.
+pass. Once v2 has been written Active, an inconclusive cleanup or verification
+also leaves it Active: use read-only diagnostics and never disable or roll it
+back in response.

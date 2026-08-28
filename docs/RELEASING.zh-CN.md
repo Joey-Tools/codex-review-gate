@@ -47,15 +47,28 @@ binding，不是公开 consumer selector。
 
 Publisher workflow 是 `.github/workflows/sync-action-subtree.yml`。Normal trigger
 是改变 `release-manifest.json` 的 source `master` push。Recovery
-`workflow_dispatch` 只接受一个 required `source_sha`：引入目标 manifest 的 exact
-lowercase 40-hex commit。若该 source 不含 manifest、SHA 是 short/ambiguous，或 source
-不在允许的受保护 history 中，workflow 会在 publication 前拒绝。
+`workflow_dispatch` 精确要求三个 inputs：
+
+- `source_sha`：引入目标 manifest 的 exact lowercase 40-hex commit；
+- `admission_run_id`：原始 admitted `master` push 的 positive Actions run ID；
+- `admission_run_attempt`：持久化 admission plan 的 exact positive successful planning
+  attempt。
+
+Source checkout 前，dispatch 先通过 exact run-attempt 与 artifact REST identities，要求
+原事件为 push、head branch/source SHA、workflow path 与 attempt 都精确匹配。随后要求该
+run 恰有一个未过期的 `release-plan-<attempt>.json` artifact，且 server 返回 positive
+artifact ID 与 `sha256:<64hex>` digest；workflow 按该 ID/run 下载，并要求 downloaded
+file 匹配 REST digest。Publisher 最后还会从 Git 重新计算原 admission 与 plan，要求与
+persisted JSON 完全一致。Identity、digest、manifest、history 或 Git recomputation 任一
+缺失或不匹配都会在 publication 前拒绝。Dispatch 不能只从 `source_sha` 推断 admission、
+自由重建 rejected admission，也不能替换成其他 run/attempt/artifact。
 
 Dispatch 始终执行触发时 `github.sha` 所记录的 live source `master` workflow 与
 publisher controls；绝不把旧 commit checkout 成可执行 release control。所选
 `source_sha` 必须是 linear ancestor 上实际修改 `release-manifest.json` 的 commit。
-该 source 冻结 release manifest 和完整 `packages/action` payload/tree。Recovery 不
-要求旧 source commit 中的 publisher controls 与当前 controls 相同；每次 attempt 都
+该 source 冻结 release manifest 和完整 `packages/action` payload/tree。Recovery 必须先
+按上述流程认证 persisted original push admission；旧 source commit 中的 publisher
+controls 不必与 current controls 相同。只有 admission binding 成功后，本次 attempt 才
 使用当前受保护 source `master` 的 control commit，重新生成绑定该 current control
 inventory 的 plan、deterministic candidates A/B、publication plan，并重新取得
 Environment approval。若 source `master` 或这些 controls 在本次 plan 创建后发生
@@ -67,6 +80,16 @@ release；较旧 source 只能 reconcile 并恢复其 exact canonical prefix。R
 Manifest 还绑定 source path、target repository/branch 与预期 signing identity。
 Publisher 在任何写入前都会用 release policy 和当前 remote state 验证 manifest。
 不得通过编辑 baseline 来认可意外 remote drift。
+
+Frozen v2.0 release line 记录
+`release_contract=codex-review-gate-action-v2.0-contract-v1`。Plan、candidate、
+publication-plan 与 published provenance schemas 依次是
+`codex-review-gate-action-release-plan-v2`、
+`codex-review-gate-action-candidate-v2`、
+`codex-review-gate-action-publication-plan-v2` 与
+`codex-review-gate-action-release-provenance-v2`，schema version 都是 2。Published
+provenance 会选择这套 frozen contract 执行 historical verification；publisher 后续演进
+不得用 newer schema 重新解释 v2.0 artifacts。
 
 ## Workflow stages 与权限边界
 
@@ -101,20 +124,22 @@ approval 最多 pending 30 天。在批准前：
 - candidate artifact 不含 credential 或 signing-key material。
 
 Artifacts 只是 jobs 之间的 transport，不是 ledger，也不是权威发布证据。`plan`
-artifact 与 candidate A/B artifacts（`candidate-a` 和 `candidate-b`）保留 1 天。
-Assembled canonical candidate 与 publication plan artifacts 各保留 35 天，覆盖
-Environment 最长 30 天的 approval wait。它们是 `publish` 需要的两份 frozen
-inputs。`publication-plan` stage 会生成这份 plan；不存在单独名为或被分类为
-admission artifact 的 artifact。Artifact display name 包含 workflow run ID 与
-attempt；consumer 绑定 server-returned artifact ID 和经过验证的 exact basename，而
-不是信任 display name。权威状态仍是 committed manifest 与重新读取的 Git/Release
-state。
+artifact 保留 90 天；candidate A/B artifacts（`candidate-a` 和 `candidate-b`）保留 1
+天。Assembled canonical candidate 与 publication plan artifacts 各保留 35 天，覆盖
+Environment 最长 30 天的 approval wait。它们是 `publish` 需要的两份 frozen inputs。
+原 push run 的 90-day plan 同时是 exact dispatch recovery 使用的 bounded persisted
+admission；不存在单独名为或被分类为 admission artifact 的 artifact。只有 exact
+run/attempt/artifact REST binding、downloaded-byte SHA-256 verification 与 Git
+recomputation 都成功时才接受它，不能只信任 artifact display name。权威状态仍是
+committed manifest 与重新读取的 Git/Release state。
 
 等待 Required reviewer 批准期间，GitHub 不会为受保护 job 分配 runner，该等待也不
 消耗 billable runner time。平台上限是 30 天，并非无限等待。若批准被拒绝、取消或
-过期，任何 privileged step 都尚未运行；dispatch 同一个 committed source SHA 即可
-在届时当前受保护 controls 下重新构建 frozen payload、生成新的 plan 与 candidates
-A/B，并申请新的批准。只有新 plan 创建后的 drift 才会使该 attempt 失效。批准后
+过期，任何 privileged step 都尚未运行。只要原 90-day push-plan artifact 仍可用，就可
+携带其 exact `source_sha`、`admission_run_id` 与 `admission_run_attempt` dispatch，认证该
+admission、在届时当前受保护 controls 下重新 materialize，并申请新的批准。只有新 plan
+创建后的 drift 才会使该 attempt 失效。一旦原 admission plan 过期或不可用，recovery
+fail closed，必须创建新的 reviewed release intent；workflow 不承诺无限 replay。批准后
 privileged runner 的 timeout 是 30 分钟；Environment 等待发生在该 runner time
 分配之前。
 
@@ -186,8 +211,15 @@ primary/signing fingerprints，执行固定 sign/verify probe，并在结束后�
 公开 encryption-only subkey metadata 无害；额外可用的 secret signing、encryption
 或 authentication subkey 会被拒绝。
 
-App 是 pusher；GPG identity 是 author、committer 与 signer。GitHub 接受
-publication commit 后，两种 identities 都必须复核。
+首次写入前，just-in-time token 必须证明属于 expected Publisher App installation 与
+唯一 target repository；target rulesets 随后只把该 App 作为 publication bypass
+identity。GPG identity 是写入 publication Git objects 的 author、committer 与 signer，
+其 signatures 在发布后仍可独立验证。
+
+不得过度解读之后的 GitHub state checks：ref、commit、signature 与 Release readback
+可以证明最终 objects 与当前 repository state，但 GitHub 不提供可证明某个已接受 ref
+update 当时由哪个 token push 的 immutable historical receipt。因此 post-write
+verification 不得声称重建了历史 Publisher App pusher attribution。
 
 ## Target rulesets
 
@@ -286,7 +318,9 @@ head、rulesets、existing tags 与 existing Release，并按以下顺序执行�
 
 1. 构造并在本地验证 signed single-parent wrapper commit。
 2. 在不 force 的情况下 fast-forward target `master`，然后重新读取 exact commit、
-   parent、tree、App pusher 与 GitHub signature result。
+   parent、tree 与 GitHub signature result。这证明 accepted Git state，不证明 immutable
+   historical pusher attribution；Publisher App identity 已在写入前通过 minted
+   credential 与 effective rulesets 绑定。
 3. 在不 force 的情况下创建 signed annotated immutable full tag `v<version>`。
    它直接指向 wrapper commit，永不移动或删除。重新读取 exact tag object、peeled
    commit、commit tree 与 GitHub signature result。Publisher identity 在首次写入前
@@ -406,13 +440,16 @@ signature、Release asset、意外 target advance 或 unknown state 都应 fail 
 recovery 是经过 review 的 forward release，通常为新 patch version。
 
 每次 attempt 的 immutable plan 都绑定 frozen release intent、该 attempt 使用的
-current protected control commit 与完整 control-file digests。若 artifact 过期或不可
-用，应重新 dispatch exact source SHA，在届时当前受保护 controls 下独立
-rematerialize 两份 candidates，构造新的 plan/publication plan，并重新取得
-Environment approval。新 run 在任何写入前仍必须 classify 并 reconcile 每个 remote
-object；它只能恢复 exact valid prefix，否则以 `blocked_conflict` 或 `inconclusive`
-停止。若 durable immutable conflict 无法 reconcile，应保留现场用于 diagnosis，并
-通过经过 review 的更高版本 forward repair。只有这个更高版本可以历史性恢复较旧
+current protected control commit 与完整 control-file digests。若短期 candidate、
+assembled-candidate 或 publication-plan artifact 过期或不可用，但原 90-day push-plan
+admission 仍有效，则 exact three-input dispatch 可以认证该 persisted admission，在届时
+当前受保护 controls 下独立 rematerialize 两份 candidates，构造新的 plan/publication
+plan，并重新取得 Environment approval。新 run 在任何写入前仍必须 classify 并
+reconcile 每个 remote object；它只能恢复 exact valid prefix，否则以
+`blocked_conflict` 或 `inconclusive` 停止。若原 push-plan admission 过期或不可用，
+recovery 必须 fail closed 并创建新的 reviewed release intent，不得只从 Git 重建
+admission。若 durable immutable conflict 无法 reconcile，应保留现场用于 diagnosis，
+并通过经过 review 的更高版本 forward repair。只有这个更高版本可以历史性恢复较旧
 代码；floating alias 在 version history 中永不向后移动。
 
 Workflow-level concurrency 合约为：

@@ -53,32 +53,61 @@ selector.
 
 The publisher workflow is `.github/workflows/sync-action-subtree.yml`. Its
 normal trigger is a push to source `master` that changes
-`release-manifest.json`. Its recovery `workflow_dispatch` requires one
-`source_sha`: the exact lowercase 40-hex commit that introduced the intended
-manifest. A dispatch with no manifest at that source, a short or ambiguous SHA,
-or a source outside the admitted protected history is rejected before
-publication.
+`release-manifest.json`. Its recovery `workflow_dispatch` requires exactly
+three inputs:
+
+- `source_sha`: the exact lowercase 40-hex commit that introduced the intended
+  manifest;
+- `admission_run_id`: the positive Actions run ID of the original admitted
+  `master` push; and
+- `admission_run_attempt`: the exact positive successful planning attempt that
+  persisted the admission plan.
+
+Before source checkout, dispatch uses the exact run-attempt and artifact REST
+identities to require the original push event, `master` head/source SHA,
+workflow path and attempt. It then requires exactly one unexpired
+`release-plan-<attempt>.json` artifact with a server-returned positive artifact
+ID and `sha256:<64hex>` digest, downloads by that ID from that run, and matches
+the downloaded file to the REST digest. The publisher finally recomputes the
+original admission and plan from Git and requires exact equality with the
+persisted JSON. A dispatch with missing or mismatched identity, digest,
+manifest, history or Git recomputation is rejected before publication. A
+dispatch cannot infer admission from `source_sha` alone, freely rebuild a
+rejected admission, or substitute another run/attempt/artifact.
 
 A dispatch always executes the workflow and publisher controls from the live
 source `master` commit recorded by `github.sha`; it never checks out an old
 commit as executable release control. The selected `source_sha` must be the
 linear ancestor commit that changed `release-manifest.json`. That source freezes
 the release manifest and complete `packages/action` payload and tree. Recovery
-does not require the publisher controls at the old source commit to match the
-current controls. Instead, every attempt uses the current protected source
-`master` control commit to create a fresh plan, deterministic candidates A and
-B, publication plan, and Environment approval that bind that current control
-inventory. If source `master` or those controls advance after the attempt's
-plan is created, publication fails closed before App-token minting or any
-durable mutation and must be rematerialized and approved again. A later release
-intent cannot leapfrog an older partial release; the older source may only
-reconcile and resume its exact canonical prefix. Mismatched frozen payload or
-remote publication state is never blessed as recovery.
+must first authenticate the persisted original push admission as described
+above; it does not require the publisher controls at the old source commit to
+match the current controls. Only after that binding succeeds does the attempt
+use the current protected source `master` control commit to create a fresh
+plan, deterministic candidates A and B, publication plan, and Environment
+approval that bind that current control inventory. If source `master` or those
+controls advance after the attempt's plan is created, publication fails closed
+before App-token minting or any durable mutation and must be rematerialized and
+approved again. A later release intent cannot leapfrog an older partial
+release; the older source may only reconcile and resume its exact canonical
+prefix. Mismatched frozen payload or remote publication state is never blessed
+as recovery.
 
 The manifest also binds the source path, target repository and branch, and the
 expected signing identity. The publisher validates it against release policy
 and current remote state before any write. Editing a baseline to bless
 unexpected remote drift is not recovery.
+
+The frozen v2.0 release line records
+`release_contract=codex-review-gate-action-v2.0-contract-v1`. Its plan,
+candidate, publication-plan, and published provenance schemas are respectively
+`codex-review-gate-action-release-plan-v2`,
+`codex-review-gate-action-candidate-v2`,
+`codex-review-gate-action-publication-plan-v2`, and
+`codex-review-gate-action-release-provenance-v2`, each with schema version 2.
+Published provenance selects this frozen contract for historical verification;
+later publisher evolution must not reinterpret v2.0 artifacts through a newer
+schema.
 
 ## Workflow stages and privilege boundary
 
@@ -118,26 +147,30 @@ days. Before approval:
 - the candidate artifact contains no credential or signing-key material.
 
 Artifacts are transport between jobs, not a ledger or authoritative
-publication evidence. The `plan` artifact and candidate A/B artifacts
-(`candidate-a` and `candidate-b`) are retained for one day. The assembled
-canonical candidate and publication plan artifacts are each retained for 35
-days, covering the Environment's maximum 30-day approval wait. Those are the
-two frozen inputs to `publish`. The `publication-plan` stage creates the plan;
-there is no separate artifact named or classified as an admission artifact.
-Artifact display names include the workflow run ID and attempt. Consumers bind
-the server-returned artifact ID and a validated exact basename instead of
-trusting a display name. The committed manifest plus re-read Git and Release
-state remain authoritative.
+publication evidence. The `plan` artifact is retained for 90 days; candidate
+A/B artifacts (`candidate-a` and `candidate-b`) are retained for one day. The
+assembled canonical candidate and publication plan artifacts are each retained
+for 35 days, covering the Environment's maximum 30-day approval wait. Those
+are the two frozen inputs to `publish`. The original push run's 90-day plan is
+also the bounded persisted admission used for exact dispatch recovery; there
+is no separate artifact named or classified as an admission artifact. It is
+accepted only after exact run/attempt/artifact REST binding, downloaded-byte
+SHA-256 verification, and Git recomputation. Artifact display names alone are
+not trusted. The committed manifest plus re-read Git and Release state remain
+authoritative.
 
 GitHub does not allocate the protected job's runner while it waits for required
 reviewer approval, and that wait does not consume billable runner time. The
 platform limit is 30 days, not an infinite wait. If approval is rejected,
-cancelled, or expires, no privileged step has run; dispatch the same committed
-source SHA to rebuild its frozen payload under the then-current protected
-controls, create a fresh plan and candidates A/B, and request fresh approval.
-Only drift after that new plan is created invalidates the attempt. The
-privileged runner has a 30-minute timeout after approval; the Environment wait
-occurs before that runner time is allocated.
+cancelled, or expires, no privileged step has run. While the original 90-day
+push-plan artifact remains available, dispatch with its exact `source_sha`,
+`admission_run_id`, and `admission_run_attempt` may authenticate that admission,
+rematerialize under the then-current protected controls, and request fresh
+approval. Only drift after the new plan is created invalidates that attempt.
+Once the original admission plan expires or is unavailable, recovery fails
+closed and requires a new reviewed release intent; the workflow does not
+promise indefinite replay. The privileged runner has a 30-minute timeout after
+approval; the Environment wait occurs before that runner time is allocated.
 
 ## Publisher identities and secrets
 
@@ -216,8 +249,17 @@ signing fingerprints, performs a fixed sign/verify probe, and destroys the
 keyring afterward. Public encryption-only subkey metadata is harmless; another
 usable secret signing, encryption, or authentication subkey is rejected.
 
-The App is the pusher; the GPG identity is the author, committer, and signer.
-Both identities are checked after GitHub accepts a publication commit.
+The just-in-time token is proved, before the first write, to belong to the
+expected Publisher App installation and sole target repository. The target
+rulesets then admit that App as the only publication bypass identity. The GPG
+identity is the author, committer, and signer embedded in the publication Git
+objects, and its signatures remain independently verifiable after publication.
+
+Do not over-read the later GitHub state checks: ref, commit, signature, and
+Release readback proves the resulting objects and current repository state, but
+GitHub does not expose an immutable historical receipt that proves which token
+pushed an already accepted ref update. Consequently post-write verification
+must not claim to reconstruct historical Publisher App pusher attribution.
 
 ## Target rulesets
 
@@ -331,7 +373,10 @@ ruleset, existing-tag, and existing-Release checks and follows this order:
 
 1. Construct and locally verify the signed, single-parent wrapper commit.
 2. Fast-forward target `master` without force, then re-read its exact commit,
-   parent, tree, App pusher, and GitHub signature result.
+   parent, tree, and GitHub signature result. This proves the accepted Git
+   state, not immutable historical pusher attribution; Publisher App identity
+   was instead bound from the minted credential and effective rulesets before
+   the write.
 3. Create the signed annotated immutable full tag `v<version>` without force.
    It points directly to the wrapper commit and is never moved or deleted.
    Re-read the exact tag object, peeled commit, commit tree, and GitHub signature
@@ -469,16 +514,20 @@ conflict is a reviewed forward release, normally a new patch version.
 
 Each attempt's immutable plan binds the frozen release intent and the current
 protected control commit and complete control-file digests used for that
-attempt. If an artifact expires or becomes unavailable, dispatch the exact
-source SHA again, independently rematerialize both candidates under the
+attempt. If a short-lived candidate, assembled-candidate, or publication-plan
+artifact expires or becomes unavailable while the original 90-day push-plan
+admission remains valid, the exact three-input dispatch may authenticate that
+persisted admission, independently rematerialize both candidates under the
 then-current protected controls, construct a fresh plan and publication plan,
 and obtain Environment approval again. The new run must still classify and
 reconcile every remote object before writing. It may resume only an exact valid
-prefix; otherwise it stops with `blocked_conflict` or `inconclusive`. If a
-durable immutable conflict cannot be reconciled, preserve it for diagnosis and
-publish a reviewed higher version that repairs forward. Historically restoring
-earlier code is allowed only through that higher version; the floating alias
-never moves backward through version history.
+prefix; otherwise it stops with `blocked_conflict` or `inconclusive`. If the
+original push-plan admission expires or is unavailable, recovery fails closed
+and requires a new reviewed release intent rather than reconstructing admission
+from Git alone. If a durable immutable conflict cannot be reconciled, preserve
+it for diagnosis and publish a reviewed higher version that repairs forward.
+Historically restoring earlier code is allowed only through that higher
+version; the floating alias never moves backward through version history.
 
 The workflow-level concurrency contract is:
 

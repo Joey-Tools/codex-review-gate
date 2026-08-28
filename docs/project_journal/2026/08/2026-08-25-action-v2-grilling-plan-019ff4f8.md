@@ -1989,6 +1989,110 @@ superseded_by:
   journal, syntax, diff, and exact-head review gates rather than rerunning the
   18-minute release simulation solely for its own recorded result.
 
+### Exact-Head Acceptance Review And Remediation Round
+
+- The first formal whole-range lane reviewed the exact signed checkpoint
+  `10217253306ca2ee6f312f766a331f8924e26e47..29a7646bc3905ecb6371dfd58d219a1245c6722c`
+  at tree `20c170722e6ac727e2701da98b9c12a851c975fa`. It was a fresh
+  no-local clone and an ordinary general agent running `gpt-5.6-sol` / `ultra`,
+  not a dedicated reviewer role. The checkpoint had a Good GPG signature from
+  `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`. The review returned five P1,
+  nine P2, and one P3 actionable findings. No remote PR, release, or consumer
+  mutation occurred while the findings were open.
+- Runtime evidence is now generation-safe rather than timestamp-only. An
+  unbound terminal clean cannot satisfy a later request after that request has
+  shown liveness; ambiguous lineage remains pending and cannot clear retained
+  findings. The exact `+1`, uniquely resolved short-SHA, terminal clean-text,
+  and direct-request behavior remain supported. The controller additionally
+  rereads exact PR scope and the complete canonical-run inventory immediately
+  before its sole rerun POST and after observing attempt `A+1`; a synchronize,
+  retarget, or competing-run drift is retry-unsafe pending and never cancels a
+  new verifier. The former tampered-launch test is now success-capable except
+  for the single altered binding, so deleting the guard makes the test fail.
+  Reason: asynchronous Codex terminal evidence and native reruns have no
+  request transaction ID, so absence of provable lineage must not become a
+  success shortcut.
+- Bootstrap now implements the supported GitHub/Ruby `File.fnmatch` branch
+  subset with `FNM_PATHNAME` semantics. In particular, naked `**` matches one
+  path component while a component-leading `**/` is recursive; unsupported or
+  malformed patterns are inconclusive rather than coverage. Controller source
+  validation is a closed YAML structure and rejects explicit, quoted, tagged,
+  flow, alias, merge-key, secrets, extra-job, extra-step, and alternate-callee
+  forms. Local apply re-enumerates and content-binds the complete security-
+  relevant workflow/CODEOWNERS set immediately before its first rename and
+  again before success, reporting a partial apply when a post-write race is
+  observed. Repository branch rulesets with the selected name must be unique
+  at discovery, immediately before create, and after create, with a fresh exact
+  ID bound through the final authoritative GET. Reason: these checks protect
+  actual access-policy content and object selection, not benign directory
+  metadata or API order.
+- Legacy cleanup has a new two-phase, read-only proof. Before cleanup, an owner
+  runs `--derive-post-cleanup-plan` with the original approved legacy digest.
+  Two identical complete pre-state closures are transformed only by removing
+  `codex/review-gate`; stdout is deterministic reviewable JSON containing the
+  complete expected state, permitted actions, selected v2 identity, and
+  `expected_post_cleanup_security_sha256`. Only an empty status policy/rule or
+  a truly dedicated legacy-only ruleset may disappear structurally. After the
+  separately authorised cleanup, `--verify-post-cleanup` requires the external
+  `--expected-post-cleanup-security-sha256`; two identical complete security
+  closures must both match it, show no legacy requirement, and retain the same
+  unique complete Active v2 ruleset. Neither mode can mutate. Active write
+  uncertainty always says to preserve v2 and every legacy protection and use
+  read-only diagnostics; it never advises disable or rollback. Reason: an
+  actual post-cleanup snapshot cannot self-authorise deletion of unrelated
+  rules, checks, strictness, producer binding, workflows, CODEOWNERS, or owner
+  authority.
+- Publisher admission now binds a push's complete
+  `github.event.before..github.sha` landing range and rejects any release-
+  control path change in that range. Manual dispatch accepts only
+  `source_sha`, `admission_run_id`, and `admission_run_attempt`; it binds the
+  exact push run/attempt and exact non-expired artifact ID/name/server digest,
+  verifies downloaded bytes again, and recomputes the entire plan from Git.
+  It cannot freely rebuild or substitute an admission. Plan artifacts retain
+  for 90 days, candidate A/B artifacts for one day, and assembled/publication
+  artifacts for 35 days. Ninety days is chosen to cover the Environment
+  approval and bounded recovery window; expiry is intentionally fail-closed
+  and requires a new reviewed release intent rather than promising indefinite
+  recovery or treating an artifact as a ledger.
+- Release payload validation rejects all `.github/workflows/**` content and
+  enumerates every tracked `src/v2/**` entry before applying its exact runtime
+  allowlist. Archive bytes are now produced by the repository-owned
+  deterministic ustar/gzip encoder with a golden digest instead of floating
+  host `git archive`/`gzip`. Historical validation routes the v2 plan,
+  candidate, publication-plan, and provenance v2 schemas through the frozen
+  `codex-review-gate-action-v2.0-contract-v1` behavior so a future legitimate
+  contract upgrade does not retroactively reinterpret old immutable releases.
+- Public verification fully inventories the major's stable releases and
+  requires its floating alias to identify the highest complete SemVer. A later
+  release used as forward-alias proof receives the same metadata, wrapper,
+  source, asset-byte/uploader, provenance, and signature validation as the
+  current release. The remote annotated-tag direct object ID and peeled commit
+  are both bound through stable readback, closing same-commit tag-object
+  replacement. Release documentation no longer claims that current Git/ref
+  readback reconstructs historical Publisher App pusher attribution: it proves
+  the current App token/installation before mutation and the signed Git object,
+  ref, and Release state afterward. GPG signer identity remains independently
+  verified.
+- Canary cleanup no longer uses `gh pr close --delete-branch`. It first closes
+  without deletion, verifies closed-unmerged state plus the exact head
+  repository/ref/OID, and deletes only the still-exact remote ref with an
+  exact-OID lease. Mismatch or transport uncertainty preserves the branch and
+  reports recovery. The documented, previously adopted no-`edited` boundary is
+  unchanged: base retarget refresh remains draft-to-ready/manual and direct
+  human UI merge remains outside the stable-v2 agent merge contract.
+- Focused final remediation evidence passed: runtime 83/83, bootstrap 100/100,
+  workflow-security contract 39/39, release provenance 46/46, and release
+  pipeline 50/50. `npm run check`, Node syntax checks, `bash -n`, ShellCheck,
+  actionlint, owned-file `git diff --check`, documentation shell snippets, and
+  project-specific independent read-only audits also passed. These are focused
+  integration checkpoints. The root then reran the four principal integrated
+  files from the combined working tree (83/83, 100/100, 39/39, and 46/46) and
+  ran `npm test -- --test-reporter=dot --test-concurrency=1`; the serialized
+  whole suite passed 779/779 with exit code zero. Serial execution is retained
+  as the final gate because the repository and GitHub-state fixtures must not
+  create cross-file contention. The new exact-head acceptance result is
+  recorded only after this combined tree is signed and frozen.
+
 ### Follow-Up Migration Witness Review And Resolution
 
 - A fresh ordinary-agent pre-review retained four defects in the first overlap

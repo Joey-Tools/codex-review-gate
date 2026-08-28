@@ -388,7 +388,20 @@ inconclusive, not absence. Do not remove any legacy requirement in this phase.
 
 Create a temporary branch from the merged default branch, make one harmless
 reviewable change, and open a non-draft PR. Record its pull request number and
-full current head SHA.
+full current head SHA. Also bind the same-repository head ref that may later be
+deleted; do not infer it from a branch name after the canary has run:
+
+```bash
+CANARY_HEAD="$(gh api --hostname github.com \
+  "repos/$REPO/pulls/$CANARY_PR" --jq '.head.sha')"
+CANARY_HEAD_REPO="$(gh api --hostname github.com \
+  "repos/$REPO/pulls/$CANARY_PR" --jq '.head.repo.full_name')"
+CANARY_HEAD_REF="$(gh api --hostname github.com \
+  "repos/$REPO/pulls/$CANARY_PR" --jq '.head.ref')"
+test "${#CANARY_HEAD}" -eq 40
+test "$CANARY_HEAD_REPO" = "$REPO"
+test -n "$CANARY_HEAD_REF"
+```
 
 Normally, request the review directly on the PR:
 
@@ -556,27 +569,99 @@ default of zero ordinary approvals without lowering an existing higher count,
 conversation resolution, non-fast-forward default-branch protection, and an
 explicitly empty `bypass_actors` array.
 
-Only after that exact Active readback, execute the separately authorised legacy
-cleanup. Remove `codex/review-gate` from its repository/inherited ruleset or
-classic branch-protection surface. That authorised change necessarily makes
-the pre-cleanup owner-approved digest stale, so do not replay it. A cleanup or
-readback failure leaves v2 active and is not permission to disable it. Instead,
-perform one read-only post-cleanup closure with the same selected name. It
-requires both legacy surfaces to be clear and independently requires the same
-complete v2 ruleset to remain Active. It repeats that complete legacy-plus-v2
-read and requires both rounds to be identical, preventing a cross-surface swap
-from being mistaken for simultaneous cleanup:
+Only after that exact Active readback, derive the sole admissible cleanup state
+from the complete pre-cleanup security snapshot. This read-only command first
+requires the current legacy inventory to equal the original owner-approved
+digest. Its stdout is one deterministic JSON object:
+
+```bash
+POST_CLEANUP_PLAN="$(mktemp)"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo OWNER/REPO \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}" \
+  --derive-post-cleanup-plan > "$POST_CLEANUP_PLAN"
+jq . "$POST_CLEANUP_PLAN"
+EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
+  '.expected_post_cleanup_security_sha256 |
+   select(test("^[0-9a-f]{64}$"))' \
+  "$POST_CLEANUP_PLAN")"
+```
+
+Review the plan before authorising cleanup. It may remove only
+`codex/review-gate`. If that removes the final item from classic
+required-status policy, that empty policy and its `strict` field may disappear.
+An emptied ruleset status rule may disappear, and the whole dedicated
+legacy-only ruleset may disappear only if no other rule remains. Those are the
+only structural exceptions. Repository/default-head identity, workflow and
+CODEOWNERS inventory, owner permission, every field and non-legacy check
+including `strict` and `app_id` in a surviving classic policy, and every
+retained ruleset's identity, conditions, bypass actors, and unrelated rules
+must remain exact.
+
+Execute only that reviewed plan as the separately authorised legacy cleanup,
+then perform the read-only post-cleanup closure with the same selected name and
+recorded expected digest. It reads two complete security snapshots and
+requires both rounds to be identical, equal the expected digest, clear on both
+legacy surfaces, and bound to the same exact complete Active v2 policy:
 
 ```bash
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --repo OWNER/REPO \
   --control-plane-owner "$CONTROL_PLANE_OWNER" \
   --ruleset-name "$V2_RULESET_NAME" \
-  --verify-post-cleanup
+  --verify-post-cleanup \
+  --expected-post-cleanup-security-sha256 \
+  "${EXPECTED_POST_CLEANUP_SECURITY_SHA256}"
 ```
 
-Then close the canary without merging it and delete only its temporary
-branch.
+Do not re-derive after cleanup. Any cleanup/readback/verification failure or
+inconclusive result leaves v2 Active. Preserve it, run only read-only
+diagnostics, and report the exact remaining or indeterminate state; never
+disable or roll back v2 to manufacture closure.
+
+Then close the canary without merging it. Do not use `--delete-branch` on the
+close command. Prove that the closed-unmerged PR still carries the recorded
+head repository, ref, and OID, then use Git's exact-OID lease so deletion is
+atomic with the final remote-ref comparison:
+
+```bash
+(
+  set -euo pipefail
+  trap 'printf "%s\n" "Canary cleanup did not prove completion. Do not issue an unconditional delete; inspect and report the exact PR/ref scope." >&2' ERR
+
+  gh pr close "$CANARY_PR" --repo "github.com/$REPO"
+  CANARY_CLOSED_STATE="$(gh api --hostname github.com \
+    "repos/$REPO/pulls/$CANARY_PR")"
+  jq -e \
+    --arg repo "$CANARY_HEAD_REPO" \
+    --arg ref "$CANARY_HEAD_REF" \
+    --arg sha "$CANARY_HEAD" \
+    '.state == "closed" and .merged_at == null and
+     .head.repo.full_name == $repo and .head.ref == $ref and .head.sha == $sha' \
+    <<< "$CANARY_CLOSED_STATE" > /dev/null
+
+  CANARY_REMOTE="https://github.com/$CANARY_HEAD_REPO.git"
+  REMOTE_CANARY_HEAD="$(git ls-remote --refs "$CANARY_REMOTE" \
+    "refs/heads/$CANARY_HEAD_REF" |
+    awk 'NR == 1 { print $1 } END { if (NR != 1) exit 1 }')"
+  test "$REMOTE_CANARY_HEAD" = "$CANARY_HEAD"
+  git push \
+    --force-with-lease="refs/heads/$CANARY_HEAD_REF:$CANARY_HEAD" \
+    "$CANARY_REMOTE" \
+    ":refs/heads/$CANARY_HEAD_REF"
+  POST_DELETE_REMOTE_CANARY="$(git ls-remote --refs "$CANARY_REMOTE" \
+    "refs/heads/$CANARY_HEAD_REF")"
+  test -z "$POST_DELETE_REMOTE_CANARY"
+)
+```
+
+If the PR identity, remote OID, or lease does not match, stop and report it.
+A mismatch before the leased push leaves the branch intact; a post-push read
+failure leaves deletion outcome unknown. Never replace the leased deletion
+with an unconditional delete.
 
 Installation is complete when the default branch contains both canonical `@v2`
 workflows, the active ruleset has the expected source and protections, both

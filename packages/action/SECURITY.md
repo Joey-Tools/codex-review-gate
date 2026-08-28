@@ -47,9 +47,26 @@ remains active, prove it with a canary, then activate and read back the complete
 Active policy with no bypass actors. Every pre-cleanup stage/activation preview
 and apply must explicitly reuse that same owner-approved digest across
 processes through the exact Active readback. Only then may separately
-authorised cleanup remove the inventoried legacy requirements. Cleanup changes
-the old digest, so final closure uses read-only `--verify-post-cleanup` without
-it to prove both legacy surfaces clear and the same v2 policy Active.
+authorised cleanup remove the inventoried legacy requirements. Immediately
+before cleanup, read-only `--derive-post-cleanup-plan` requires the same
+external owner-approved legacy-inventory digest through
+`--expected-legacy-inventory-sha256`, verifies the pre-state
+against it, and derives a canonical expected state from the complete security
+snapshot. It may remove only `codex/review-gate`; an emptied status rule may be
+removed, as may an emptied classic required-status policy; a whole dedicated
+legacy-only ruleset may be deleted only when no other rule remains. Those are
+the only structural exceptions. Repository/default head, workflow/CODEOWNERS
+inventory, owner permission, every field/non-legacy check including `strict`
+and `app_id` in a surviving classic policy, and every retained ruleset's
+identity, conditions, bypass actors, and unrelated rules must remain exact. The
+plan exports an expected post-cleanup security SHA-256. Read-only
+`--verify-post-cleanup`
+requires that external digest through
+`--expected-post-cleanup-security-sha256` and accepts only two identical complete security
+rounds that both match it, prove both legacy surfaces clear, and prove the same
+complete v2 policy Active. Any inconclusive derivation, cleanup readback, or
+verification keeps v2 Active and requires read-only diagnosis; never disable
+or roll back v2 in response.
 The active ruleset requires Code Owner review and stale-approval dismissal.
 Required-check `integration_id: 15368` identifies the entire GitHub Actions App,
 not either workflow. Exact-byte verification of both workflows, fail-closed

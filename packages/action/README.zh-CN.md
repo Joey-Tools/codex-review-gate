@@ -60,8 +60,20 @@ requirements active。Readback 成功后仍保留 legacy，另把 supplied v2 ru
 stage，通过无害 canary 证明，再 activate 并精确读回完整 Active policy。Cleanup 前每次
 stage/activation preview 与 apply 都必须跨进程显式复用同一个 owner-approved digest，直到
 该 Active readback。只有之后才可在单独授权下删除 inventoried legacy requirements；
-cleanup 必然改变旧 digest，因此 final closure 使用不携带该 digest 的只读
-`--verify-post-cleanup`，同时证明两个 legacy surfaces 已清空且同一 v2 policy 仍为 Active。
+cleanup 前先运行只读 `--derive-post-cleanup-plan`，携带同一个 external owner-approved
+legacy-inventory digest（`--expected-legacy-inventory-sha256`），对完整 security snapshot
+验证该 baseline，再派生 canonical、
+human-reviewable plan 与外部 expected post-cleanup security SHA-256；唯一允许的 delta 是删除
+`codex/review-gate`。只有 emptied classic required-status policy、emptied ruleset status
+rule，以及不剩任何 rule 的 dedicated legacy-only ruleset 可以消失。Repository/default
+head、workflow/CODEOWNERS inventory、owner permission、surviving classic policy 的全部
+fields/non-legacy checks（包括 `strict`/`app_id`），以及每个 retained ruleset 的 identity、
+conditions、bypass actors 与 unrelated rules 必须精确保留。另行授权 cleanup 后，只读
+`--verify-post-cleanup` 必须通过 `--expected-post-cleanup-security-sha256` 携带该 external
+digest，并且只有两轮相同的完整 security
+snapshot 都匹配 expected digest、两个 legacy surfaces 均 clear 且同一 complete v2 policy
+仍 Active 才通过。Derivation、cleanup 或 verification inconclusive 时保留 v2 Active，只运行
+read-only diagnostics；不得 disable 或 rollback v2。
 仅有 approval 与 head reread 不足以闭环。
 
 复制的 workflows 分别负责 triggers、typed dispatch inputs、permissions、独立

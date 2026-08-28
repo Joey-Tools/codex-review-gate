@@ -398,8 +398,16 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
      --repo "github.com/$REPO" \
      --json headRefOid \
      --jq '.headRefOid')"
+   CANARY_HEAD_REPO="$(gh api --hostname github.com \
+     "repos/$REPO/pulls/$CANARY_PR" \
+     --jq '.head.repo.full_name')"
+   CANARY_HEAD_REF="$(gh api --hostname github.com \
+     "repos/$REPO/pulls/$CANARY_PR" \
+     --jq '.head.ref')"
    test "$CANARY_BASE" = "$DEFAULT_BRANCH"
    test "${#CANARY_HEAD}" -eq 40
+   test "$CANARY_HEAD_REPO" = "$REPO"
+   test -n "$CANARY_HEAD_REF"
    ```
 
 3. 优先发送 exact request。这个路径不需要仅为了请求 review 而分配 gate runner：
@@ -601,39 +609,99 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    conversations resolved、default-branch non-fast-forward protection，以及显式空
    bypass actors。
 
-4. 只有第 3 步已证明 exact complete Active v2 ruleset，才执行另行授权的 legacy cleanup。
-   从 ruleset 或 classic branch-protection surface 移除 `codex/review-gate`。这项授权变更
-   必然改变 cleanup 前的 digest，因此不得重放该 stale digest。Cleanup 或 readback 失败
-   不能成为 disable v2 的理由；保留 complete Active v2 gate，并报告 exact remaining
-   surface。
-5. 使用已记录的 ruleset name 运行专用的只读 post-cleanup closure。它必须同时证明两个
-   legacy surfaces 已 clear，并证明同一 complete v2 ruleset 仍为 Active；它会完整重复
-   legacy-plus-v2 read 并要求两轮一致，使 cross-surface swap 不能形成 false clear snapshot。
-   不得携带 stale pre-cleanup digest 或 mutation flag：
+4. 只有第 3 步已证明 exact complete Active v2 ruleset，才从完整 pre-cleanup security
+   snapshot 派生唯一可接受的 cleanup state。该 read-only mode 首先要求 current legacy
+   inventory 等于原 owner-approved digest。stdout 只含一个 deterministic JSON object；在
+   任何 external write 前保存并审阅：
+
+   ```bash
+   POST_CLEANUP_PLAN="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --expected-legacy-inventory-sha256 \
+     "${LEGACY_INVENTORY_SHA256}" \
+     --derive-post-cleanup-plan > "$POST_CLEANUP_PLAN"
+   jq . "$POST_CLEANUP_PLAN"
+   EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
+     '.expected_post_cleanup_security_sha256 |
+      select(test("^[0-9a-f]{64}$"))' \
+     "$POST_CLEANUP_PLAN")"
+   ```
+
+   Plan 只能删除 `codex/review-gate`。如果这移除了 classic required-status policy 的最后
+   item，则该 empty policy 及其 `strict` field 可消失；如果 ruleset status rule 因而变空，
+   该 rule 可消失，而 dedicated legacy-only ruleset 只有在不剩其他 rule 时才可整体消失。
+   这些是唯一 structural exceptions。必须精确保留 repository/default-head identity、
+   workflow/CODEOWNERS inventory、owner permission、surviving classic policy 的全部 fields
+   与 non-legacy checks（包括 `strict`/`app_id`），以及每个 retained ruleset 的 identity、
+   conditions、bypass actors 与 unrelated rules。任何其他 delta 都不是获授权的 cleanup
+   plan。
+5. 只执行该已审阅 plan，作为另行授权的 legacy cleanup；write 后不得重新派生。
+   Cleanup 或 readback 失败不能成为 disable/rollback v2 的理由；保留 complete Active v2
+   gate，只运行 read-only diagnostics，并报告 exact remaining 或 indeterminate surface。
+6. 使用已记录 ruleset name 与 externally recorded expected-state digest 运行专用只读
+   post-cleanup closure。它读取两轮完整 security snapshot；两轮必须相同、都等于 expected
+   digest、两个 legacy surfaces 均 clear，并且同一 exact complete v2 ruleset 仍 Active。
+   因此 unrelated-policy change 与 cross-surface swap 都不能伪造 clear snapshot：
 
    ```bash
    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
      --repo "$REPO" \
      --control-plane-owner "$CONTROL_PLANE_OWNER" \
      --ruleset-name "$V2_RULESET_NAME" \
-     --verify-post-cleanup
+     --verify-post-cleanup \
+     --expected-post-cleanup-security-sha256 \
+     "${EXPECTED_POST_CLEANUP_SECURITY_SHA256}"
    ```
 
-6. 关闭 canary、不合并，并只删除临时 branch：
+   Inconclusive 时保持 v2 Active，只运行 read-only diagnostics；不得 disable/rollback 以
+   制造 closure pass。
+7. 关闭 canary、不合并。关闭操作本身不得让 `gh` 删除 branch；先证明 closed PR 仍绑定已
+   记录的 head repository、ref 与 OID，再用 atomic exact-OID lease 删除该 remote ref：
 
    ```bash
-   gh pr close "$CANARY_PR" --repo "github.com/$REPO" --delete-branch
-   gh pr view "$CANARY_PR" \
-     --repo "github.com/$REPO" \
-     --json state,mergedAt
+   (
+     set -euo pipefail
+     trap 'printf "%s\n" "Canary cleanup did not prove completion. Do not issue an unconditional delete; inspect and report the exact PR/ref scope." >&2' ERR
+
+     gh pr close "$CANARY_PR" --repo "github.com/$REPO"
+     CANARY_CLOSED_STATE="$(gh api --hostname github.com \
+       "repos/$REPO/pulls/$CANARY_PR")"
+     jq -e \
+       --arg repo "$CANARY_HEAD_REPO" \
+       --arg ref "$CANARY_HEAD_REF" \
+       --arg sha "$CANARY_HEAD" \
+       '.state == "closed" and .merged_at == null and
+        .head.repo.full_name == $repo and .head.ref == $ref and .head.sha == $sha' \
+       <<< "$CANARY_CLOSED_STATE" > /dev/null
+
+     CANARY_REMOTE="https://github.com/$CANARY_HEAD_REPO.git"
+     REMOTE_CANARY_HEAD="$(git ls-remote --refs "$CANARY_REMOTE" \
+       "refs/heads/$CANARY_HEAD_REF" |
+       awk 'NR == 1 { print $1 } END { if (NR != 1) exit 1 }')"
+     test "$REMOTE_CANARY_HEAD" = "$CANARY_HEAD"
+     git push \
+       --force-with-lease="refs/heads/$CANARY_HEAD_REF:$CANARY_HEAD" \
+       "$CANARY_REMOTE" \
+       ":refs/heads/$CANARY_HEAD_REF"
+     POST_DELETE_REMOTE_CANARY="$(git ls-remote --refs "$CANARY_REMOTE" \
+       "refs/heads/$CANARY_HEAD_REF")"
+     test -z "$POST_DELETE_REMOTE_CANARY"
+   )
    ```
 
-   要求 `state=CLOSED`、`mergedAt=null`。
+   Remote OID missing/different、PR head identity 改变或 lease failure 都属于
+   inconclusive。Leased push 前发现 mismatch 时 branch 保持不动；post-push read failure
+   时 deletion outcome 为 unknown。停止并报告 observed scope；不得改用 unconditional
+   ref deletion 重试。
 
-7. 报告 migration PR、closed-unmerged canary PR、两份 canonical workflow paths、active
+8. 报告 migration PR、closed-unmerged canary PR、两份 canonical workflow paths、active
    ruleset ID、successful canary exact feature head、bound default-branch
    base/test-merge SHA、canonical run-name receipt、verifier run URL 与 final dual-surface
-   legacy inventory readback，以及持久 profile、runner 或 request-author-policy variables。
+   reviewed cleanup-plan digest、final two-round security closure、legacy inventory
+   readback，以及持久 profile、runner 或 request-author-policy variables。
 
 本流程没有 cron recovery loop。Bot event 丢失，或 evidence 只通过 review/reaction 到达
 时，对该 PR dispatch 一个 exact-head `reconcile`，并执行它报告的恢复动作。

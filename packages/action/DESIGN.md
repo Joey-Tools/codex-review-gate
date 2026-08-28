@@ -93,9 +93,25 @@ Disabled while legacy remains active, proved by canary, then activated and read
 back with no bypass actors. Every pre-cleanup stage/activation preview and
 apply explicitly reuses the same owner-approved digest across processes
 through that exact Active readback. Only then may the separately authorised
-plan remove the inventoried legacy requirements. Cleanup necessarily changes
-the old digest, so final closure uses read-only `--verify-post-cleanup` without
-that digest to prove both legacy surfaces clear and v2 still Active. The
+plan remove the inventoried legacy requirements. Immediately before cleanup,
+read-only `--derive-post-cleanup-plan` requires the same external
+owner-approved legacy-inventory digest through
+`--expected-legacy-inventory-sha256`, verifies the pre-state against it, and
+derives a canonical expected state from the complete security snapshot. Its
+reviewable plan may remove only `codex/review-gate`; an emptied status rule may
+be removed, as may an emptied classic required-status policy; a whole dedicated
+legacy-only ruleset may be deleted only when no other rule remains. Those are
+the only structural exceptions. Repository/default head, workflow/CODEOWNERS
+inventory, owner permission, every field/non-legacy check including `strict`
+and `app_id` in a surviving classic policy, and every retained ruleset's
+identity, conditions, bypass actors, and unrelated rules are preserved exactly.
+The plan exports an expected post-cleanup security SHA-256. Final read-only
+`--verify-post-cleanup` requires that external digest through
+`--expected-post-cleanup-security-sha256` and accepts only two
+identical complete security rounds that both match it, show both legacy
+surfaces clear, and show the same complete v2 policy Active. Inconclusive
+post-write state leaves v2 Active and permits only read-only diagnosis, never a
+disable or rollback. The
 migration PR carries both workflows plus CODEOWNERS. Once active,
 Code Owner review and stale-approval dismissal protect
 later changes. Required check `integration_id: 15368` denotes the entire GitHub
@@ -503,6 +519,9 @@ workflow plus CODEOWNERS in one PR after the pre-merge canonical inventory
 fingerprint closure. It keeps the inventoried legacy requirements active,
 stages a separate v2 ruleset as Disabled, verifies it in a harmless canary PR,
 then activates and reads the complete Active policy back. Only afterward does
-separately authorised cleanup remove and read back legacy; final closure proves
-both legacy surfaces clear and v2 still Active before the canary closes
-unmerged.
+the read-only derived plan freeze the exact legacy-only removal and expected
+complete post-state. Separately authorised cleanup follows that plan; two-round
+read-only closure matches the external expected-state digest, proves both
+legacy surfaces clear, and proves v2 still exactly Active before the canary
+closes unmerged. Any inconclusive result preserves Active v2 for read-only
+diagnosis.

@@ -102,12 +102,29 @@ Rollout order:
    the test-merge SHA;
 7. read back the unchanged disabled ruleset and control plane, activate it,
    and read the complete Active policy back exactly;
-8. only after that Active readback, perform the separately authorised legacy
-   cleanup; because cleanup changes the old digest, run the read-only
-   `--verify-post-cleanup` mode without that digest to prove both ruleset and
-   classic legacy surfaces clear and re-read the same complete Active v2
-   policy; and
-9. close the canary without merging it.
+8. only after that Active readback, run read-only
+   `--derive-post-cleanup-plan` on the complete pre-cleanup security snapshot;
+   pass the same external owner-approved legacy-inventory digest as
+   `--expected-legacy-inventory-sha256` and require
+   the current pre-state to match it; review the canonical plan, which may
+   remove only `codex/review-gate`; an emptied status rule may be removed and a
+   whole dedicated legacy-only ruleset only when no other rule remains; an
+   emptied classic required-status policy may also disappear; require exact
+   preservation of repository/default head, workflow/CODEOWNERS inventory,
+   owner permission, all fields/non-legacy checks including `strict`/`app_id`
+   in a surviving classic policy, and every retained ruleset's identity,
+   conditions, bypass actors, and unrelated rules; then
+   record `expected_post_cleanup_security_sha256`;
+9. perform the separately authorised legacy cleanup, then run read-only
+   `--verify-post-cleanup --expected-post-cleanup-security-sha256 <digest>`;
+   require two identical complete security rounds that both match the external
+   digest, prove both ruleset and classic legacy surfaces clear, and re-read
+   the same complete Active v2 policy; and
+10. close the canary without merging, verify its recorded head
+    repository/ref/OID, and lease-delete only that still-exact temporary ref.
+
+After v2 is written Active, any inconclusive cleanup or verification keeps it
+Active. Use read-only diagnostics; never disable or roll back v2 in response.
 
 Installation documentation:
 

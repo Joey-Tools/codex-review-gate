@@ -331,7 +331,20 @@ final probe 中始终传同一变量。Legacy inventory 无法读取或 schema m
 ## 3. 创建并运行独立 canary PR
 
 从已合并的默认分支创建临时分支，做一个无害且可 review 的变更，开 non-draft PR，并记录
-PR number 与完整 current head SHA。
+PR number 与完整 current head SHA。还要绑定稍后唯一允许删除的 same-repository head
+ref；canary 跑完后不得只根据 branch name 重新推断：
+
+```bash
+CANARY_HEAD="$(gh api --hostname github.com \
+  "repos/$REPO/pulls/$CANARY_PR" --jq '.head.sha')"
+CANARY_HEAD_REPO="$(gh api --hostname github.com \
+  "repos/$REPO/pulls/$CANARY_PR" --jq '.head.repo.full_name')"
+CANARY_HEAD_REF="$(gh api --hostname github.com \
+  "repos/$REPO/pulls/$CANARY_PR" --jq '.head.ref')"
+test "${#CANARY_HEAD}" -eq 40
+test "$CANARY_HEAD_REPO" = "$REPO"
+test -n "$CANARY_HEAD_REF"
+```
 
 通常直接在 PR 发：
 
@@ -468,21 +481,91 @@ dismiss stale approvals、新 ruleset 的普通 approval count 默认为 0 且�
 count、conversation resolution、default-branch non-fast-forward protection，以及显式空
 `bypass_actors`。
 
-只有 exact Active readback 成功后，才执行另行授权的 legacy cleanup：从 repository /
-inherited ruleset 或 classic branch-protection surface 移除 `codex/review-gate`。这项授权
-变更必然使 cleanup 前的 owner-approved digest 失效，因此 final proof 不得复用旧 digest。
-Cleanup 或 readback 失败时必须保持 v2 active，不能以此为由 disable。关闭 canary 前，
-使用同一个 selected name 运行一次只读 post-cleanup closure；它同时要求两个 legacy
-surfaces 都已 clear，并独立要求同一完整 v2 ruleset 仍为 Active。该 closure 会完整重复
-legacy-plus-v2 read，并要求两轮完全一致，避免 cross-surface swap 被误认作同时 cleanup：
+只有 exact Active readback 成功后，才从完整 pre-cleanup security snapshot 派生唯一可接受
+的 cleanup state。该 read-only command 首先要求 current legacy inventory 等于原
+owner-approved digest；stdout 只含一个 deterministic JSON object：
+
+```bash
+POST_CLEANUP_PLAN="$(mktemp)"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo OWNER/REPO \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}" \
+  --derive-post-cleanup-plan > "$POST_CLEANUP_PLAN"
+jq . "$POST_CLEANUP_PLAN"
+EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
+  '.expected_post_cleanup_security_sha256 |
+   select(test("^[0-9a-f]{64}$"))' \
+  "$POST_CLEANUP_PLAN")"
+```
+
+授权 cleanup 前审阅该 plan。它只能删除 `codex/review-gate`。如果这移除了 classic
+required-status policy 的最后 item，则该 empty policy 及其 `strict` field 可消失；ruleset
+status rule 因而变空时该 rule 可消失，而 dedicated legacy-only ruleset 只有在不剩其他
+rule 时才可整体消失。这些是唯一 structural exceptions。Repository/default-head identity、
+workflow/CODEOWNERS inventory、owner permission、surviving classic policy 的全部 fields
+与 non-legacy checks（包括 `strict`/`app_id`），以及每个 retained ruleset 的 identity、
+conditions、bypass actors 与 unrelated rules 都必须精确保留。
+
+只执行该已审阅 plan 作为另行授权的 legacy cleanup；之后使用相同 selected name 与记录的
+expected digest 运行只读 post-cleanup closure。它读取两轮完整 security snapshot，要求
+两轮完全相同、都等于 expected digest、两个 legacy surfaces 均 clear，并绑定同一 exact
+complete Active v2 policy：
 
 ```bash
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --repo OWNER/REPO \
   --control-plane-owner "$CONTROL_PLANE_OWNER" \
   --ruleset-name "$V2_RULESET_NAME" \
-  --verify-post-cleanup
+  --verify-post-cleanup \
+  --expected-post-cleanup-security-sha256 \
+  "${EXPECTED_POST_CLEANUP_SECURITY_SHA256}"
 ```
+
+Cleanup 后不得重新派生。任何 cleanup/readback/verification failure 或 inconclusive 都必须
+保持 v2 Active，只运行 read-only diagnostics，并报告 exact remaining 或 indeterminate
+state；不得 disable/rollback v2 来制造 closure。
+
+随后关闭 canary，但不 merge，也不在 close 命令使用 `--delete-branch`。先证明
+closed-unmerged PR 仍携带已记录的 head repository、ref 与 OID，再用 Git exact-OID lease
+让 deletion 与最后一次 remote-ref comparison 保持 atomic：
+
+```bash
+(
+  set -euo pipefail
+  trap 'printf "%s\n" "Canary cleanup did not prove completion. Do not issue an unconditional delete; inspect and report the exact PR/ref scope." >&2' ERR
+
+  gh pr close "$CANARY_PR" --repo "github.com/$REPO"
+  CANARY_CLOSED_STATE="$(gh api --hostname github.com \
+    "repos/$REPO/pulls/$CANARY_PR")"
+  jq -e \
+    --arg repo "$CANARY_HEAD_REPO" \
+    --arg ref "$CANARY_HEAD_REF" \
+    --arg sha "$CANARY_HEAD" \
+    '.state == "closed" and .merged_at == null and
+     .head.repo.full_name == $repo and .head.ref == $ref and .head.sha == $sha' \
+    <<< "$CANARY_CLOSED_STATE" > /dev/null
+
+  CANARY_REMOTE="https://github.com/$CANARY_HEAD_REPO.git"
+  REMOTE_CANARY_HEAD="$(git ls-remote --refs "$CANARY_REMOTE" \
+    "refs/heads/$CANARY_HEAD_REF" |
+    awk 'NR == 1 { print $1 } END { if (NR != 1) exit 1 }')"
+  test "$REMOTE_CANARY_HEAD" = "$CANARY_HEAD"
+  git push \
+    --force-with-lease="refs/heads/$CANARY_HEAD_REF:$CANARY_HEAD" \
+    "$CANARY_REMOTE" \
+    ":refs/heads/$CANARY_HEAD_REF"
+  POST_DELETE_REMOTE_CANARY="$(git ls-remote --refs "$CANARY_REMOTE" \
+    "refs/heads/$CANARY_HEAD_REF")"
+  test -z "$POST_DELETE_REMOTE_CANARY"
+)
+```
+
+PR identity、remote OID 或 lease 不匹配时立即停止并报告，保持 branch 不动；不得用
+unconditional delete 代替 leased deletion。Leased push 前发现 mismatch 时 branch 保持
+不动；post-push read failure 时 deletion outcome 为 unknown。
 
 默认分支含两份 canonical `@v2` workflows、ruleset active 且完整、两个 legacy surfaces
 都已读回不含 `codex/review-gate`，且 closed-unmerged canary 在 current feature-head SHA

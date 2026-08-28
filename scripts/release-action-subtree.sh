@@ -683,22 +683,43 @@ if [[ "$mode" == "verify-published" ]]; then
   mkdir -m 700 "$assets_dir"
 
   verification_stage="immutable-tag"
-  if ! remote_full="$(git ls-remote "$target_url" "refs/tags/$immutable_tag" "refs/tags/$immutable_tag^{}")"; then
+  if ! initial_remote_tag_namespace="$(git ls-remote "$target_url" 'refs/tags/v*')"; then
     fail_verification inconclusive remote-read-inconclusive immutable-tag \
-      retry-public-verification "immutable tag state could not be read"
+      retry-public-verification "complete target tag namespace could not be read"
   fi
-  [[ -n "$remote_full" ]] || {
+  initial_remote_tag_namespace="$(printf '%s\n' "$initial_remote_tag_namespace" | LC_ALL=C sort)"
+
+  remote_tag_binding_from_snapshot() {
+    local snapshot="$1"
+    local tag="$2"
+    local lines direct peeled
+    lines="$(printf '%s\n' "$snapshot" | awk -v direct_ref="refs/tags/$tag" \
+      -v peeled_ref="refs/tags/$tag^{}" '$2 == direct_ref || $2 == peeled_ref')"
+    [[ "$(printf '%s\n' "$lines" | sed '/^$/d' | wc -l | tr -d ' ')" == "2" ]] || return 1
+    direct="$(printf '%s\n' "$lines" | awk -v ref="refs/tags/$tag" '$2 == ref {print $1}')"
+    peeled="$(printf '%s\n' "$lines" | awk -v ref="refs/tags/$tag^{}" '$2 == ref {print $1}')"
+    [[ "$direct" =~ ^[0-9a-f]{40}$ && "$peeled" =~ ^[0-9a-f]{40}$ ]] || return 1
+    printf '%s\t%s\n' "$direct" "$peeled"
+  }
+
+  if ! remote_full_binding="$(remote_tag_binding_from_snapshot \
+      "$initial_remote_tag_namespace" "$immutable_tag")"; then
     fail_verification blocked_conflict immutable-tag-missing immutable-tag \
       reconcile-exact-source "immutable tag is not published"
-  }
-  full_tag_object="$(printf '%s\n' "$remote_full" | awk -v r="refs/tags/$immutable_tag" '$2 == r {print $1}')"
-  full_commit="$(printf '%s\n' "$remote_full" | awk -v r="refs/tags/$immutable_tag^{}" '$2 == r {print $1}')"
-  [[ -n "$full_tag_object" && -n "$full_commit" ]] || {
-    fail_published_state immutable-tag "immutable tag must be annotated"
-  }
+  fi
+  IFS=$'\t' read -r full_tag_object full_commit <<< "$remote_full_binding"
   git clone --quiet "$target_url" "$verify_repo" || {
     fail_verification inconclusive remote-read-inconclusive immutable-tag \
       retry-public-verification "target repository could not be cloned"
+  }
+  if ! post_clone_remote_tag_namespace="$(git ls-remote "$target_url" 'refs/tags/v*')"; then
+    fail_verification inconclusive remote-read-inconclusive immutable-tag \
+      retry-public-verification "target tag namespace could not be re-read after clone"
+  fi
+  post_clone_remote_tag_namespace="$(printf '%s\n' "$post_clone_remote_tag_namespace" | LC_ALL=C sort)"
+  [[ "$post_clone_remote_tag_namespace" == "$initial_remote_tag_namespace" ]] || {
+    fail_published_state immutable-tag \
+      "complete target tag namespace changed while the verifier cloned release objects"
   }
   public_direct_tag_commit() {
     local tag="$1"
@@ -795,34 +816,205 @@ if [[ "$mode" == "verify-published" ]]; then
     node "$generator" verify-openpgp-status --input "$status_file" --name "$kind $object"
   }
 
-  verify_later_release_completion() {
+  public_full_stable_tag() {
     local tag="$1"
-    local expected actual release_path api_file error_file api_status
-    expected="$(printf '%s\n' \
+    local version major
+    [[ "$tag" == v* ]] || return 1
+    version="${tag#v}"
+    [[ "$version" != *-* ]] || return 1
+    major="${version%%.*}"
+    [[ "$major" == "${release_version%%.*}" ]] || return 1
+    is_v2_plus_major "$major" || return 1
+    node "$generator" compare-semver --left "$version" --right "$version" >/dev/null 2>&1
+  }
+
+  public_release_inventory_snapshot() {
+    local label="$1"
+    local output_file="$2"
+    local error_file="$3"
+    local raw_file="$verify_root/release-inventory-${label}.json"
+    if [[ -n "$test_release_dir" ]]; then
+      if [[ ! -e "$test_release_dir" ]]; then
+        printf '<absent>\n' > "$output_file"
+        return 0
+      fi
+      [[ -d "$test_release_dir" ]] || return 1
+      find "$test_release_dir" -mindepth 1 -maxdepth 2 -type f -print0 | \
+        while IFS= read -r -d '' path; do
+          printf '%s\t%s\n' "${path#"$test_release_dir"/}" \
+            "$(shasum -a 256 "$path" | awk '{print $1}')"
+        done | LC_ALL=C sort > "$output_file"
+      return 0
+    fi
+    if ! publisher_gh api --paginate --slurp \
+        "repos/$TARGET_REPOSITORY/releases?per_page=100" > "$raw_file" 2> "$error_file"; then
+      public_api_error_is_http_404 "$error_file" && return 44
+      return 75
+    fi
+    node "$generator" snapshot-release-inventory --input "$raw_file" > "$output_file" || return 1
+  }
+
+  public_release_tags_from_inventory() {
+    local snapshot_file="$1"
+    if [[ -n "$test_release_dir" ]]; then
+      find "$test_release_dir" -mindepth 1 -maxdepth 1 -type d -exec basename {} \;
+      return
+    fi
+    jq -r '.[].tag_name' "$snapshot_file"
+  }
+
+  validate_public_completed_release() {
+    local tag="$1"
+    local expected_source_ref="$2"
+    local expected_tag_object="$3"
+    local expected_release_commit="$4"
+    local expected_assets actual_assets expected_prerelease expected_body
+    local release_path release_assets_dir source_ref local_tag_object local_release_commit
+    local initial_api initial_api_error final_api final_api_error api_status
+    local initial_boundary final_boundary initial_view final_view view_error
+    local provenance_status commit_verification tag_verification
+
+    local_tag_object="$(git -C "$verify_repo" rev-parse "refs/tags/$tag" 2>/dev/null)" || return 1
+    local_release_commit="$(public_direct_tag_commit \
+      "$tag" "Release codex-review-gate-action $tag")" || return 1
+    [[ "$local_tag_object" == "$expected_tag_object" &&
+        "$local_release_commit" == "$expected_release_commit" ]] || return 1
+    git -C "$verify_repo" merge-base --is-ancestor "$local_release_commit" "$target_master" || return 1
+
+    expected_assets="$(printf '%s\n' \
       "codex-review-gate-action-${tag}.tar.gz" \
       "release-provenance.json" \
       "release-provenance.json.asc" | LC_ALL=C sort)"
+    expected_prerelease=false
+    [[ "${tag#v}" == *-* ]] && expected_prerelease=true
+    release_assets_dir="$(mktemp -d "$verify_root/completed-release-${tag}.XXXXXX")" || return 75
+
     if [[ -n "$test_release_dir" ]]; then
       release_path="$test_release_dir/$tag"
-      [[ -f "$release_path/published" && -f "$release_path/immutable" ]] || return 1
-      actual="$(find "$release_path" -mindepth 1 -maxdepth 1 -type f \
+      [[ -f "$release_path/published" ]] || return 44
+      [[ -f "$release_path/immutable" ]] || return 45
+      [[ -f "$release_path/prerelease" &&
+          "$(cat "$release_path/prerelease")" == "$expected_prerelease" ]] || return 46
+      actual_assets="$(find "$release_path" -mindepth 1 -maxdepth 1 -type f \
         ! -name prerelease ! -name published ! -name immutable -exec basename {} \; | LC_ALL=C sort)"
-      [[ "$actual" == "$expected" ]]
-      return
-    fi
-    api_file="$verify_root/later-release-${tag}.json"
-    error_file="$verify_root/later-release-${tag}.err"
-    if read_public_release_api "$tag" "$api_file" "$error_file"; then
-      :
+      [[ "$actual_assets" == "$expected_assets" ]] || return 1
+      while IFS= read -r asset_name; do
+        cp "$release_path/$asset_name" "$release_assets_dir/$asset_name" || return 75
+      done <<< "$expected_assets"
     else
-      api_status=$?
-      return "$api_status"
+      initial_api="$verify_root/completed-release-${tag}-initial.json"
+      initial_api_error="$verify_root/completed-release-${tag}-initial.err"
+      if read_public_release_api "$tag" "$initial_api" "$initial_api_error"; then
+        :
+      else
+        api_status=$?
+        [[ "$api_status" != 44 ]] || return 47
+        return "$api_status"
+      fi
+      [[ "$(jq -r .immutable "$initial_api")" == "true" ]] || return 45
+      actual_assets="$(node "$generator" snapshot-release-assets --input "$initial_api" | \
+        jq -r '.[].name' | LC_ALL=C sort)" || return 1
+      [[ "$actual_assets" == "$expected_assets" ]] || return 1
+      view_error="$verify_root/completed-release-${tag}-initial-view.err"
+      if initial_view="$(publisher_gh release view "$tag" --repo "$TARGET_REPOSITORY" \
+          --json isDraft,isPrerelease,tagName,name,body 2> "$view_error")"; then
+        :
+      elif public_api_error_is_http_404 "$view_error"; then
+        return 47
+      else
+        return 75
+      fi
+      view_error="$verify_root/completed-release-${tag}-download.err"
+      if publisher_gh release download "$tag" --repo "$TARGET_REPOSITORY" \
+          --pattern '*' --dir "$release_assets_dir" 2> "$view_error"; then
+        :
+      elif public_api_error_is_http_404 "$view_error"; then
+        return 47
+      else
+        return 75
+      fi
     fi
-    [[ "$(jq -r .draft "$api_file")" == "false" &&
-        "$(jq -r .immutable "$api_file")" == "true" &&
-        "$(jq -r .author.login "$api_file")" == "codex-review-gate-action-publisher[bot]" ]] || return 1
-    actual="$(jq -r '.assets[].name' "$api_file" | LC_ALL=C sort)"
-    [[ "$actual" == "$expected" ]]
+
+    actual_assets="$(find "$release_assets_dir" -mindepth 1 -maxdepth 1 -type f \
+      -exec basename {} \; | LC_ALL=C sort)"
+    [[ "$actual_assets" == "$expected_assets" ]] || return 1
+    source_ref="$(jq -er '.plan.source_commit | select(test("^[0-9a-f]{40}$"))' \
+      "$release_assets_dir/release-provenance.json")" || return 1
+    [[ -z "$expected_source_ref" || "$source_ref" == "$expected_source_ref" ]] || return 1
+    if ! git -C "$repo_root" cat-file -e "$source_ref^{commit}" 2>/dev/null; then
+      source_git -C "$repo_root" fetch --quiet --no-tags "$source_url" "$source_ref" || return 75
+    fi
+    node "$generator" verify-published-assets \
+      --repo "$repo_root" \
+      --target-repo "$verify_repo" \
+      --source-ref "$source_ref" \
+      --asset-dir "$release_assets_dir" \
+      --release-commit "$local_release_commit" \
+      --full-tag-object "$local_tag_object" || return 1
+
+    if [[ -z "$test_release_dir" ]]; then
+      expected_body="Signed release of $SOURCE_REPOSITORY@$source_ref."
+      initial_boundary="$(node "$generator" snapshot-release-boundary \
+        --input "$initial_api" \
+        --tag "$tag" \
+        --body "$expected_body" \
+        --prerelease "$expected_prerelease" \
+        --draft false \
+        --immutable true)" || return 1
+      [[ "$(printf '%s' "$initial_view" | jq -r .isDraft)" == "false" &&
+          "$(printf '%s' "$initial_view" | jq -r .isPrerelease)" == "$expected_prerelease" &&
+          "$(printf '%s' "$initial_view" | jq -r .tagName)" == "$tag" &&
+          "$(printf '%s' "$initial_view" | jq -r .name)" == "$tag" &&
+          "$(printf '%s' "$initial_view" | jq -r .body)" == "$expected_body" ]] || return 1
+      if ! is_test_environment; then
+        verify_public_signature tag "$tag" || return 1
+        verify_public_signature commit "$local_release_commit" || return 1
+        commit_verification="$(publisher_gh api \
+          "repos/$TARGET_REPOSITORY/commits/$local_release_commit" \
+          --jq '[.commit.verification.verified,.commit.verification.reason] | map(tostring) | join(" ")')" || return 75
+        [[ "$commit_verification" == "true valid" ]] || return 1
+        tag_verification="$(publisher_gh api \
+          "repos/$TARGET_REPOSITORY/git/tags/$local_tag_object" \
+          --jq '[.verification.verified,.verification.reason] | map(tostring) | join(" ")')" || return 75
+        [[ "$tag_verification" == "true valid" ]] || return 1
+        provenance_status="$verify_root/completed-release-${tag}.gpg-status"
+        gpg --batch --status-fd=1 --verify \
+          "$release_assets_dir/release-provenance.json.asc" \
+          "$release_assets_dir/release-provenance.json" > "$provenance_status" 2>/dev/null || return 1
+        node "$generator" verify-openpgp-status \
+          --input "$provenance_status" \
+          --name "completed release $tag provenance" || return 1
+      fi
+
+      view_error="$verify_root/completed-release-${tag}-final-view.err"
+      if final_view="$(publisher_gh release view "$tag" --repo "$TARGET_REPOSITORY" \
+          --json isDraft,isPrerelease,tagName,name,body 2> "$view_error")"; then
+        :
+      elif public_api_error_is_http_404 "$view_error"; then
+        return 47
+      else
+        return 75
+      fi
+      [[ "$final_view" == "$initial_view" ]] || return 1
+      final_api="$verify_root/completed-release-${tag}-final.json"
+      final_api_error="$verify_root/completed-release-${tag}-final.err"
+      if read_public_release_api "$tag" "$final_api" "$final_api_error"; then
+        :
+      else
+        api_status=$?
+        [[ "$api_status" != 44 ]] || return 47
+        return "$api_status"
+      fi
+      final_boundary="$(node "$generator" snapshot-release-boundary \
+        --input "$final_api" \
+        --tag "$tag" \
+        --body "$expected_body" \
+        --prerelease "$expected_prerelease" \
+        --draft false \
+        --immutable true)" || return 1
+      [[ "$final_boundary" == "$initial_boundary" ]] || return 1
+    fi
+    printf '%s\n' "$source_ref"
   }
 
   if ! is_test_environment; then
@@ -847,23 +1039,174 @@ if [[ "$mode" == "verify-published" ]]; then
     }
   fi
 
+  public_has_other_stable_tag=false
+  while IFS= read -r tag; do
+    [[ "$tag" != "$immutable_tag" ]] || continue
+    if public_full_stable_tag "$tag"; then
+      public_has_other_stable_tag=true
+      break
+    fi
+  done < <(printf '%s\n' "$initial_remote_tag_namespace" | \
+    awk '$2 ~ /^refs\/tags\/v[^\^]+$/ {sub(/^refs\/tags\//, "", $2); print $2}')
+
+  initial_release_inventory="$verify_root/release-inventory-initial.snapshot"
+  initial_release_inventory_error="$verify_root/release-inventory-initial.err"
+  if public_release_inventory_snapshot initial \
+      "$initial_release_inventory" "$initial_release_inventory_error"; then
+    :
+  else
+    inventory_status=$?
+    if [[ "$inventory_status" == 75 ]]; then
+      if [[ "$public_has_other_stable_tag" == true ]]; then
+        fail_verification inconclusive remote-read-inconclusive floating-alias \
+          retry-public-verification "complete GitHub Release inventory could not be read"
+      fi
+      fail_verification inconclusive release-api-unreadable immutable-release \
+        retry-public-verification "GitHub Release inventory could not be read"
+    fi
+    fail_published_state immutable-release \
+      "complete GitHub Release inventory is missing or malformed"
+  fi
+
+  stable_release_tags="$verify_root/stable-release-tags"
+  stable_release_inventory_tags="$verify_root/stable-release-inventory-tags"
+  : > "$stable_release_tags"
+  : > "$stable_release_inventory_tags"
+  printf '%s\n' "$immutable_tag" >> "$stable_release_tags"
+  while IFS= read -r tag; do
+    public_full_stable_tag "$tag" || continue
+    printf '%s\n' "$tag" >> "$stable_release_tags"
+  done < <(printf '%s\n' "$initial_remote_tag_namespace" | \
+    awk '$2 ~ /^refs\/tags\/v[^\^]+$/ {sub(/^refs\/tags\//, "", $2); print $2}')
+  while IFS= read -r tag; do
+    if [[ "$tag" != "$immutable_tag" ]]; then
+      public_full_stable_tag "$tag" || continue
+    fi
+    printf '%s\n' "$tag" >> "$stable_release_tags"
+    printf '%s\n' "$tag" >> "$stable_release_inventory_tags"
+  done < <(public_release_tags_from_inventory "$initial_release_inventory")
+  if [[ -n "$(LC_ALL=C sort "$stable_release_inventory_tags" | uniq -d)" ]]; then
+    fail_published_state immutable-release \
+      "multiple GitHub Releases claim the same stable full-version tag"
+  fi
+  LC_ALL=C sort -u "$stable_release_tags" -o "$stable_release_tags"
+
+  highest_stable_tag=""
+  highest_stable_version=""
+  highest_stable_tag_object=""
+  highest_stable_commit=""
+  highest_stable_ambiguous=false
+  current_release_validated=false
+  while IFS= read -r candidate_tag; do
+    [[ -n "$candidate_tag" ]] || continue
+    [[ "$(grep -Fxc -- "$candidate_tag" "$stable_release_inventory_tags")" == "1" ]] || {
+      fail_published_state immutable-release \
+        "stable full-version tag $candidate_tag does not have exactly one inventoried GitHub Release"
+    }
+    if ! candidate_binding="$(remote_tag_binding_from_snapshot \
+        "$initial_remote_tag_namespace" "$candidate_tag")"; then
+      fail_published_state floating-alias \
+        "stable Release $candidate_tag is missing an exact annotated full-version tag binding"
+    fi
+    IFS=$'\t' read -r candidate_tag_object candidate_commit <<< "$candidate_binding"
+    expected_candidate_source=""
+    if [[ "$candidate_tag" == "$immutable_tag" ]]; then
+      expected_candidate_source="$source_commit"
+    fi
+    if candidate_source="$(validate_public_completed_release \
+        "$candidate_tag" "$expected_candidate_source" \
+        "$candidate_tag_object" "$candidate_commit")"; then
+      :
+    else
+      candidate_status=$?
+      if [[ "$candidate_tag" == "$immutable_tag" ]]; then
+        case "$candidate_status" in
+          44)
+            fail_verification blocked_conflict release-state-incomplete immutable-release \
+              reconcile-exact-source "GitHub Release is missing or incomplete"
+            ;;
+          45)
+            fail_verification blocked_conflict mutable-release immutable-release \
+              repair-immutable-release-and-reconcile "published GitHub Release is mutable"
+            ;;
+          46)
+            fail_verification blocked_conflict release-state-mismatch immutable-release \
+              repair-immutable-release-and-reconcile "published GitHub Release state differs from policy"
+            ;;
+          75)
+            fail_verification inconclusive release-api-unreadable immutable-release \
+              retry-public-verification "GitHub Release state could not be read completely"
+            ;;
+          *)
+            fail_published_state immutable-release \
+              "GitHub Release is not a complete immutable release of the exact source"
+            ;;
+        esac
+      fi
+      if [[ "$candidate_status" == 75 ]]; then
+        fail_verification inconclusive remote-read-inconclusive floating-alias \
+          retry-public-verification "later GitHub Release $candidate_tag could not be read completely"
+      fi
+      fail_published_state floating-alias \
+        "later stable tag $candidate_tag is not a complete immutable release"
+    fi
+    if [[ "$candidate_tag" == "$immutable_tag" ]]; then
+      [[ "$candidate_source" == "$source_commit" ]] || {
+        fail_published_state immutable-release \
+          "GitHub Release provenance differs from the requested exact source"
+      }
+      current_release_validated=true
+    fi
+    candidate_version="${candidate_tag#v}"
+    if [[ -z "$highest_stable_version" ]]; then
+      highest_stable_tag="$candidate_tag"
+      highest_stable_version="$candidate_version"
+      highest_stable_tag_object="$candidate_tag_object"
+      highest_stable_commit="$candidate_commit"
+      highest_stable_ambiguous=false
+    else
+      stable_comparison="$(node "$generator" compare-semver \
+        --left "$candidate_version" --right "$highest_stable_version")"
+      if [[ "$stable_comparison" == "0" &&
+            "$candidate_version" != "$highest_stable_version" ]]; then
+        highest_stable_ambiguous=true
+      fi
+      if [[ "$stable_comparison" == "1" ]]; then
+        highest_stable_tag="$candidate_tag"
+        highest_stable_version="$candidate_version"
+        highest_stable_tag_object="$candidate_tag_object"
+        highest_stable_commit="$candidate_commit"
+        highest_stable_ambiguous=false
+      fi
+    fi
+  done < "$stable_release_tags"
+  [[ "$current_release_validated" == true ]] || {
+    fail_published_state immutable-release \
+      "requested stable release is absent from the complete tag and Release inventories"
+  }
+  [[ -n "$highest_stable_tag" && -n "$highest_stable_tag_object" &&
+      -n "$highest_stable_commit" ]] || {
+    fail_published_state floating-alias \
+      "no complete stable release exists for the requested major"
+  }
+  [[ "$highest_stable_ambiguous" == false ]] || {
+    fail_published_state floating-alias \
+      "stable release history has multiple distinct tags at the highest SemVer precedence"
+  }
+
   alias_tag_object=""
   if [[ -n "$major_alias" ]]; then
     verification_stage="floating-alias"
-    if ! remote_alias="$(git ls-remote "$target_url" "refs/tags/$major_alias" "refs/tags/$major_alias^{}")"; then
-      fail_verification inconclusive remote-read-inconclusive floating-alias \
-        retry-public-verification "stable major alias state could not be read"
-    fi
-    [[ -n "$remote_alias" ]] || {
+    if ! remote_alias_binding="$(remote_tag_binding_from_snapshot \
+        "$initial_remote_tag_namespace" "$major_alias")"; then
       fail_verification blocked_conflict major-alias-missing floating-alias \
         reconcile-exact-source "stable major alias is not published"
-    }
-    alias_tag_object="$(printf '%s\n' "$remote_alias" | awk -v r="refs/tags/$major_alias" '$2 == r {print $1}')"
-    alias_commit="$(printf '%s\n' "$remote_alias" | awk -v r="refs/tags/$major_alias^{}" '$2 == r {print $1}')"
-    [[ -n "$alias_tag_object" && -n "$alias_commit" &&
+    fi
+    IFS=$'\t' read -r alias_tag_object alias_commit <<< "$remote_alias_binding"
+    [[ "$(git -C "$verify_repo" rev-parse "refs/tags/$major_alias" 2>/dev/null)" == "$alias_tag_object" &&
         "$(public_direct_tag_commit "$major_alias" "Codex Review Gate Action $major_alias")" == "$alias_commit" ]] || {
       fail_published_state floating-alias \
-        "stable major alias must be an exact annotated tag directly targeting a commit"
+        "stable major alias tag object or peeled commit differs from the initial remote binding"
     }
     [[ "$(git -C "$verify_repo" for-each-ref --format='%(contents:subject)' "refs/tags/$major_alias")" == "Codex Review Gate Action $major_alias" ]] || {
       fail_published_state floating-alias "stable major alias message differs from policy"
@@ -871,48 +1214,10 @@ if [[ "$mode" == "verify-published" ]]; then
     git -C "$verify_repo" merge-base --is-ancestor "$alias_commit" "$target_master" || {
       fail_published_state floating-alias "target master does not contain the major alias commit"
     }
-    if [[ "$alias_commit" != "$full_commit" ]]; then
-      git -C "$verify_repo" merge-base --is-ancestor "$full_commit" "$alias_commit" || {
-        fail_published_state floating-alias \
-          "stable major alias target is not forward from the requested release"
-      }
-      later_release_found=false
-      later_release_read_failed=false
-      while IFS= read -r later_tag; do
-        [[ "$later_tag" == v* ]] || continue
-        later_version="${later_tag#v}"
-        [[ "$later_version" != *-* ]] || continue
-        later_major="${later_version%%.*}"
-        is_v2_plus_major "$later_major" || continue
-        node "$generator" compare-semver --left "$later_version" --right "$later_version" >/dev/null 2>&1 || continue
-        [[ "$later_major" == "${release_version%%.*}" ]] || continue
-        [[ "$(git -C "$verify_repo" rev-parse "refs/tags/$later_tag^{}")" == "$alias_commit" ]] || continue
-        [[ "$(node "$generator" compare-semver --left "${later_tag#v}" --right "$release_version")" == "1" ]] || continue
-        [[ "$(public_direct_tag_commit "$later_tag" "Release codex-review-gate-action $later_tag")" == "$alias_commit" ]] || continue
-        if ! is_test_environment; then
-          verify_public_signature tag "$later_tag" || continue
-          verify_public_signature commit "$alias_commit" || continue
-        fi
-        if verify_later_release_completion "$later_tag"; then
-          later_release_found=true
-          break
-        else
-          later_release_status=$?
-          if [[ "$later_release_status" == 75 ]]; then
-            later_release_read_failed=true
-          fi
-          continue
-        fi
-      done < <(git -C "$verify_repo" tag --points-at "$alias_commit" --list 'v*')
-      [[ "$later_release_read_failed" != true ]] || {
-        fail_verification inconclusive remote-read-inconclusive floating-alias \
-          retry-public-verification "later GitHub Release state could not be read"
-      }
-      [[ "$later_release_found" == true ]] || {
-        fail_published_state floating-alias \
-          "stable major alias is neither current nor a verified later stable release"
-      }
-    fi
+    [[ "$alias_commit" == "$highest_stable_commit" ]] || {
+      fail_published_state floating-alias \
+        "stable major alias does not target highest complete stable release $highest_stable_tag"
+    }
     if ! is_test_environment; then
       verify_public_signature tag "$major_alias" || {
         fail_published_state floating-alias "major alias signature is invalid"
@@ -1105,11 +1410,42 @@ if [[ "$mode" == "verify-published" ]]; then
         "GitHub Release author changed during public verification"
     }
   fi
+  final_release_inventory="$verify_root/release-inventory-final.snapshot"
+  final_release_inventory_error="$verify_root/release-inventory-final.err"
+  if public_release_inventory_snapshot final \
+      "$final_release_inventory" "$final_release_inventory_error"; then
+    :
+  else
+    final_inventory_status=$?
+    if [[ "$final_inventory_status" == 75 ]]; then
+      fail_verification inconclusive remote-read-inconclusive immutable-release \
+        retry-public-verification "final complete GitHub Release inventory could not be read"
+    fi
+    fail_published_state immutable-release \
+      "final complete GitHub Release inventory is missing or malformed"
+  fi
+  cmp -- "$initial_release_inventory" "$final_release_inventory" || {
+    fail_published_state immutable-release \
+      "complete GitHub Release inventory changed during public verification"
+  }
+  if ! final_remote_tag_namespace="$(git ls-remote "$target_url" 'refs/tags/v*')"; then
+    fail_verification inconclusive remote-read-inconclusive immutable-release \
+      retry-public-verification "final complete target tag namespace could not be read"
+  fi
+  final_remote_tag_namespace="$(printf '%s\n' "$final_remote_tag_namespace" | LC_ALL=C sort)"
+  [[ "$final_remote_tag_namespace" == "$initial_remote_tag_namespace" ]] || {
+    fail_published_state immutable-release \
+      "complete target tag namespace changed during public verification"
+  }
   if ! final_full="$(git ls-remote "$target_url" "refs/tags/$immutable_tag" "refs/tags/$immutable_tag^{}")"; then
     fail_verification inconclusive remote-read-inconclusive immutable-release \
       retry-public-verification "immutable tag final state could not be read"
   fi
-  [[ "$final_full" == "$remote_full" ]] || {
+  final_full_binding="$(remote_tag_binding_from_snapshot "$final_full" "$immutable_tag")" || {
+    fail_published_state immutable-release \
+      "immutable tag final state is missing or malformed"
+  }
+  [[ "$final_full_binding" == "$remote_full_binding" ]] || {
     fail_published_state immutable-release "immutable tag changed during public verification"
   }
   if [[ -n "$major_alias" ]]; then
@@ -1117,7 +1453,11 @@ if [[ "$mode" == "verify-published" ]]; then
       fail_verification inconclusive remote-read-inconclusive immutable-release \
         retry-public-verification "major alias final state could not be read"
     fi
-    [[ "$final_alias" == "$remote_alias" ]] || {
+    final_alias_binding="$(remote_tag_binding_from_snapshot "$final_alias" "$major_alias")" || {
+      fail_published_state immutable-release \
+        "major alias final state is missing or malformed"
+    }
+    [[ "$final_alias_binding" == "$remote_alias_binding" ]] || {
       fail_published_state immutable-release "major alias changed during public verification"
     }
   fi

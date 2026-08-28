@@ -11,8 +11,17 @@ on:
         description: Exact 40-character frozen release-intent commit on master to reconcile.
         required: true
         type: string
+      admission_run_id:
+        description: Push workflow run that persisted admission for source_sha.
+        required: true
+        type: string
+      admission_run_attempt:
+        description: Exact successful planning attempt whose immutable plan artifact is reused.
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -22,6 +31,7 @@ concurrency:
 env:
   RELEASE_SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
   RELEASE_CONTROL_SHA: ${{ github.sha }}
+  RELEASE_ADMISSION_BEFORE_SHA: ${{ github.event.before }}
 
 jobs:
   plan:
@@ -42,6 +52,8 @@ jobs:
           ACTUAL_REF: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          ADMISSION_RUN_ID: ${{ inputs.admission_run_id }}
+          ADMISSION_RUN_ATTEMPT: ${{ inputs.admission_run_attempt }}
           CONTROL_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -58,6 +70,10 @@ jobs:
             echo "source_sha must be a lowercase, full 40-character commit SHA." >&2
             exit 1
           }
+          [[ "$ADMISSION_RUN_ID" =~ ^[1-9][0-9]*$ && "$ADMISSION_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
+            echo "admission_run_id and admission_run_attempt must be positive integers." >&2
+            exit 1
+          }
           live_master_sha="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
             GH_HOST=github.com gh api --hostname github.com \
               "repos/$EXPECTED_REPOSITORY/git/ref/heads/master" --jq .object.sha)"
@@ -65,6 +81,34 @@ jobs:
             echo "the workflow control commit must equal live $EXPECTED_REPOSITORY@refs/heads/master." >&2
             exit 1
           }
+          admission_run="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            GH_HOST=github.com gh api --hostname github.com \
+              "repos/$EXPECTED_REPOSITORY/actions/runs/$ADMISSION_RUN_ID/attempts/$ADMISSION_RUN_ATTEMPT" \
+              --jq '[.event, .head_branch, .head_sha, .path, .run_attempt] | @tsv')"
+          IFS=$'\t' read -r run_event run_branch run_head run_path run_attempt <<< "$admission_run"
+          [[ "$run_event" == "push" &&
+              "$run_branch" == "master" &&
+              "$run_head" == "$SOURCE_SHA" &&
+              "$run_path" == ".github/workflows/sync-action-subtree.yml" &&
+              "$run_attempt" == "$ADMISSION_RUN_ATTEMPT" ]] || {
+            echo "the persisted admission must come from this workflow's exact master push for source_sha." >&2
+            exit 1
+          }
+          artifact_name="release-plan-$ADMISSION_RUN_ATTEMPT.json"
+          admission_artifact="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            GH_HOST=github.com gh api --hostname github.com \
+              "repos/$EXPECTED_REPOSITORY/actions/runs/$ADMISSION_RUN_ID/artifacts?name=$artifact_name" \
+              --jq 'if (.artifacts | length) == 1 then [.artifacts[0].id, .artifacts[0].name, .artifacts[0].digest, .artifacts[0].expired] | @tsv else error("expected exactly one admission artifact") end')"
+          IFS=$'\t' read -r artifact_id actual_artifact_name artifact_digest artifact_expired <<< "$admission_artifact"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ &&
+              "$actual_artifact_name" == "$artifact_name" &&
+              "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ &&
+              "$artifact_expired" == "false" ]] || {
+            echo "the exact persisted admission artifact is missing, expired, or has no immutable SHA-256 digest." >&2
+            exit 1
+          }
+          printf 'artifact-id=%s\n' "$artifact_id" >> "$GITHUB_OUTPUT"
+          printf 'artifact-digest=%s\n' "$artifact_digest" >> "$GITHUB_OUTPUT"
       - name: Explain rejected dispatch
         if: ${{ failure() && steps.dispatch-boundary.outcome == 'failure' }}
         run: |
@@ -73,8 +117,19 @@ jobs:
 
           No source checkout occurred and no privileged Environment job can
           start. Run only from `Joey-Tools/codex-review-gate@master`, passing
-          the exact frozen release-intent commit as `source_sha`.
+          the exact frozen release-intent commit plus its admitted push run and
+          attempt. A rejected push cannot be resurrected by dispatch.
           SUMMARY
+      - name: Download persisted push admission
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.dispatch-boundary.outputs.artifact-id }}
+          path: ${{ runner.temp }}/persisted-push-admission
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.admission_run_id }}
+          merge-multiple: true
+          digest-mismatch: error
       - name: Check out exact publisher control commit
         uses: actions/checkout@v4
         with:
@@ -90,10 +145,27 @@ jobs:
         env:
           EXPECTED_SOURCE_COMMIT: ${{ env.RELEASE_SOURCE_SHA }}
           EXPECTED_CONTROL_COMMIT: ${{ env.RELEASE_CONTROL_SHA }}
+          ADMISSION_RUN_ATTEMPT: ${{ inputs.admission_run_attempt }}
+          EXPECTED_ADMISSION_ARTIFACT_DIGEST: ${{ steps.dispatch-boundary.outputs.artifact-digest }}
         run: |
-          scripts/release-action-subtree.sh --plan \
+          set -euo pipefail
+          admission_args=(--admission-before "$RELEASE_ADMISSION_BEFORE_SHA")
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            persisted_plan="$RUNNER_TEMP/persisted-push-admission/release-plan-$ADMISSION_RUN_ATTEMPT.json"
+            [[ -f "$persisted_plan" && ! -L "$persisted_plan" ]]
+            actual_artifact_digest="sha256:$(sha256sum "$persisted_plan" | cut -d ' ' -f 1)"
+            [[ "$EXPECTED_ADMISSION_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ &&
+                "$actual_artifact_digest" == "$EXPECTED_ADMISSION_ARTIFACT_DIGEST" ]] || {
+              echo "the downloaded admission plan differs from its immutable Actions artifact digest." >&2
+              exit 1
+            }
+            admission_args=(--admission-plan "$persisted_plan")
+          fi
+          node scripts/generate-action-release-provenance.mjs plan \
+            --repo "$GITHUB_WORKSPACE" \
             --source-ref "$RELEASE_SOURCE_SHA" \
             --control-ref "$RELEASE_CONTROL_SHA" \
+            "${admission_args[@]}" \
             --output "$RUNNER_TEMP/release-plan-$GITHUB_RUN_ATTEMPT.json"
           printf 'artifact-basename=release-plan-%s.json\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Explain plan recovery
@@ -102,19 +174,21 @@ jobs:
           cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
           ## Release plan blocked
 
-          Inspect `recovery_code`. For `publisher-control-closure`, merge the
-          infrastructure first, then introduce `release-manifest.json` in a
-          separate release-intent PR. Never bypass `frozen-source-superseded`.
+          Inspect `recovery_code`. For `publisher-control-closure` or
+          `publisher-control-landing`, merge the infrastructure first, then
+          introduce `release-manifest.json` in a separately landed
+          release-intent PR. Dispatch must reuse the exact persisted push
+          admission and cannot repair a rejected landing.
           SUMMARY
       - name: Upload release plan
         id: upload-plan
         uses: actions/upload-artifact@v7
         with:
-          name: release-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: release-plan-${{ github.run_attempt }}.json
           path: ${{ runner.temp }}/release-plan-${{ github.run_attempt }}.json
           archive: false
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
 
   candidate-a:
     name: Build candidate A
@@ -558,9 +632,10 @@ jobs:
           Inspect the first failure, `reconcile_state`, and `recovery_code`.
           Exact-prefix recovery never overwrites immutable objects. If an
           artifact is missing or expired, redispatch the same exact
-          release-intent `source_sha`; both candidates are rebuilt and a new
-          Environment approval is required. Complete any older partial release
-          before attempting a newer version.
+          release-intent `source_sha` together with the original admitted push
+          `admission_run_id` and `admission_run_attempt`; both candidates are
+          rebuilt and a new Environment approval is required. Complete any
+          older partial release before attempting a newer version.
           SUMMARY
 
   verify:

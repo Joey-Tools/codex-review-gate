@@ -84,8 +84,22 @@ fail-closed 顺序另建 Disabled v2 ruleset，同时继续保持 legacy active�
 activate 并精确读回完整 Active policy，且没有 bypass actors。只有该 Active readback 成功，
 才可按单独授权移除并读回 inventoried legacy requirements。Cleanup 前每次
 stage/activation preview 与 apply 都必须跨进程显式复用同一个 owner-approved digest，直到
-该 exact Active readback。Cleanup 必然改变旧 digest，因此 final closure 使用不携带该
-digest 的只读 `--verify-post-cleanup`，要求两个 legacy surfaces 都已清空且 v2 仍 Active。
+该 exact Active readback。Cleanup 前先使用只读 `--derive-post-cleanup-plan`，携带同一个
+external owner-approved legacy-inventory digest（`--expected-legacy-inventory-sha256`），
+对 pre-state 验证该 baseline，再从完整
+security snapshot 派生 canonical expected state。其可审阅 plan 只能删除
+`codex/review-gate`；status rule 变空时可删除该 rule，ruleset 只有在不剩其他 rule 时才可
+删除；emptied classic required-status policy 也可消失。这些是唯一 structural exceptions。
+Repository/default head、workflow/CODEOWNERS inventory、owner permission、surviving
+classic policy 的全部 fields/non-legacy checks（包括 `strict`/`app_id`），以及每个
+retained ruleset 的 identity、conditions、bypass actors 与 unrelated rules 必须精确保留。Plan 输出 expected
+post-cleanup security SHA-256。最终只读
+`--verify-post-cleanup` 不复用已经 stale 的 legacy digest，而是强制携带派生出的 expected
+post-cleanup external digest（`--expected-post-cleanup-security-sha256`）；只有两轮相同的
+完整 security snapshot
+都匹配该 digest、两个 legacy surfaces 均 clear 且同一 complete v2 policy 仍 Active 才通过。
+Post-write state inconclusive 时保持 v2 Active，只做 read-only diagnosis，绝不 disable 或
+rollback。
 Migration PR 只承载两份 workflows 与 CODEOWNERS。启用后，
 Code Owner review 与 push 后 stale-approval dismissal 会保护后续变更。
 required check 的 `integration_id: 15368` 标识整个 GitHub Actions App，因此单独使用它
@@ -450,6 +464,8 @@ compatibility selector、不修改 v1 refs，也不 fallback 到 v1 reducer。�
 canonical inventory fingerprint closure 后，用一个 PR 删除 v1 caller、安装 canonical v2
 workflow 与 CODEOWNERS；合并后先完成 current-default 与 exact merged/base/head readback，
 失败则保留 legacy。成功后也继续保持 legacy active，另把 v2 ruleset 以 Disabled stage，
-用单独无害 canary 验证，再 activate 并读回完整 Active policy。只有之后才移除并读回
-inventoried legacy requirements；确认两个 legacy surfaces 清空且 v2 仍 Active 后，关闭
-canary、不合并。
+用单独无害 canary 验证，再 activate 并读回完整 Active policy。只有之后才用只读 derived
+plan 冻结 exact legacy-only removal 与 expected complete post-state；另行授权 cleanup 只
+执行该 plan。两轮只读 closure 匹配 external expected-state digest、证明两个 legacy
+surfaces clear，并证明 v2 仍 exact Active，之后才关闭 canary、不合并。任何 inconclusive
+result 都保留 Active v2，只做 read-only diagnosis。

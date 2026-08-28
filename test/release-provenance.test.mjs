@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   buildCandidate,
@@ -25,6 +26,7 @@ import {
   createPublicationPlan,
   createReleasePlan,
   discoverV2RuntimeModulePaths,
+  encodeCanonicalReleaseArchive,
   extractCandidateTransport,
   finalizeProvenance,
   parseSemver,
@@ -50,6 +52,10 @@ const WORKFLOW_REF =
 const ACTION_METADATA = readFileSync(new URL("../packages/action/action.yml", import.meta.url), "utf8");
 const PUBLISHER_WORKFLOW = readFileSync(
   new URL("../.github/workflows/sync-action-subtree.yml", import.meta.url),
+  "utf8",
+);
+const PROVENANCE_GENERATOR = readFileSync(
+  new URL("../scripts/generate-action-release-provenance.mjs", import.meta.url),
   "utf8",
 );
 const RELEASE_SIGNING_PUBLIC_KEY = `-----BEGIN PGP PUBLIC KEY BLOCK-----
@@ -232,6 +238,37 @@ test("publisher workflow keeps App JWT and installation-token authentication cla
     identityStep,
     /env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$installation_token"[\s\\]*gh api --hostname github\.com installation\/repositories/u,
   );
+});
+
+test("publisher workflow persists exact push admission and dispatch can only reuse that push artifact", () => {
+  assert.match(PUBLISHER_WORKFLOW, /admission_run_id:[\s\S]*?required: true/u);
+  assert.match(PUBLISHER_WORKFLOW, /admission_run_attempt:[\s\S]*?required: true/u);
+  assert.match(
+    PUBLISHER_WORKFLOW,
+    /repos\/\$EXPECTED_REPOSITORY\/actions\/runs\/\$ADMISSION_RUN_ID\/attempts\/\$ADMISSION_RUN_ATTEMPT/u,
+  );
+  assert.match(PUBLISHER_WORKFLOW, /\.event, \.head_branch, \.head_sha, \.path, \.run_attempt/u);
+  assert.match(PUBLISHER_WORKFLOW, /\$run_event" == "push"/u);
+  assert.match(PUBLISHER_WORKFLOW, /\$run_head" == "\$SOURCE_SHA"/u);
+  assert.match(PUBLISHER_WORKFLOW, /\$run_attempt" == "\$ADMISSION_RUN_ATTEMPT"/u);
+  assert.match(
+    PUBLISHER_WORKFLOW,
+    /actions\/runs\/\$ADMISSION_RUN_ID\/artifacts\?name=\$artifact_name/u,
+  );
+  assert.match(PUBLISHER_WORKFLOW, /\$artifact_digest" =~ \^sha256:\[0-9a-f\]\{64\}\$/u);
+  assert.match(PUBLISHER_WORKFLOW, /artifact-ids: \$\{\{ steps\.dispatch-boundary\.outputs\.artifact-id \}\}/u);
+  assert.match(PUBLISHER_WORKFLOW, /run-id: \$\{\{ inputs\.admission_run_id \}\}/u);
+  assert.match(PUBLISHER_WORKFLOW, /merge-multiple: true/u);
+  assert.match(PUBLISHER_WORKFLOW, /digest-mismatch: error/u);
+  assert.match(
+    PUBLISHER_WORKFLOW,
+    /actual_artifact_digest="sha256:\$\(sha256sum "\$persisted_plan" \| cut -d ' ' -f 1\)"/u,
+  );
+  assert.match(PUBLISHER_WORKFLOW, /\$actual_artifact_digest" == "\$EXPECTED_ADMISSION_ARTIFACT_DIGEST"/u);
+  assert.match(PUBLISHER_WORKFLOW, /name: release-plan-\$\{\{ github\.run_attempt \}\}\.json/u);
+  assert.match(PUBLISHER_WORKFLOW, /--admission-before "\$RELEASE_ADMISSION_BEFORE_SHA"/u);
+  assert.match(PUBLISHER_WORKFLOW, /--admission-plan "\$persisted_plan"/u);
+  assert.match(PUBLISHER_WORKFLOW, /retention-days: 90/u);
 });
 
 function ruleset({
@@ -522,7 +559,13 @@ function releaseFixture(t, { version = "2.0.0" } = {}) {
   const files = payloadInventory(repo, payloadCommit);
   writeJson(join(repo, "release-manifest.json"), manifest({ version, tree, files, expectedHead: targetHead }));
   const sourceCommit = commit(repo, `Release intent ${version}`);
-  const plan = createReleasePlan({ repo, sourceRef: sourceCommit, controlRef: sourceCommit });
+  const admissionBefore = git(repo, ["rev-parse", `${sourceCommit}^`]);
+  const plan = createReleasePlan({
+    repo,
+    sourceRef: sourceCommit,
+    controlRef: sourceCommit,
+    admissionBeforeRef: admissionBefore,
+  });
   const planPath = join(root, "release-plan.json");
   writeJson(planPath, plan);
   const candidateDir = join(root, "candidate");
@@ -695,11 +738,139 @@ test("manifest v2 binds baseline v3, exact inventory, signer, and Node.js entryp
   }
 });
 
+test("release payload rejects every workflow definition path", () => {
+  const root = mkdtempSync(join(tmpdir(), "release-workflow-payload-"));
+  try {
+    const path = join(root, "release-manifest.json");
+    const candidate = manifest();
+    candidate.files.push(inventoryRecord(
+      ".github/workflows/nested/publisher.yaml",
+      "e".repeat(64),
+      12,
+    ));
+    candidate.files.sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+    writeJson(path, candidate);
+    assert.throws(() => readReleaseManifest(path), /rejects workflow definitions/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("v2 runtime closure enumerates nested, underscored, and alternate-extension entries before rejection", () => {
+  const paths = [
+    "src/v2/gate-runtime.mjs",
+    "src/v2/nested/helper.mjs",
+    "src/v2/private_helper.mjs",
+    "src/v2/sidecar.js",
+  ];
+  assert.deepEqual(discoverV2RuntimeModulePaths(Object.fromEntries(
+    paths.map((path) => [path, {}]),
+  )), paths);
+  for (const unexpected of paths.slice(1)) {
+    const root = mkdtempSync(join(tmpdir(), "release-runtime-closure-"));
+    try {
+      const path = join(root, "release-manifest.json");
+      const candidate = manifest();
+      candidate.files.push(inventoryRecord(unexpected, "e".repeat(64), 12));
+      candidate.files.sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+      writeJson(path, candidate);
+      assert.throws(() => readReleaseManifest(path), /runtime module closure differs/u, unexpected);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("release planning validates the real JavaScript Action and manifest tree", (t) => {
   const state = releaseFixture(t);
+  assert.equal(state.plan.schema, "codex-review-gate-action-release-plan-v2");
+  assert.equal(state.plan.release_contract, "codex-review-gate-action-v2.0-contract-v1");
+  assert.equal(state.plan.push_admission.before_commit, git(state.repo, ["rev-parse", `${state.sourceCommit}^`]));
+  assert.equal(state.plan.push_admission.after_commit, state.sourceCommit);
+  assert.deepEqual(state.plan.push_admission.landing_commits, [state.sourceCommit]);
   assert.equal(state.plan.source_tree, state.tree);
   assert.deepEqual(state.candidate.payload.files, state.files);
   assert.equal(state.candidate.payload.inventory_sha256, nulInventoryDigest(state.files));
+});
+
+test("push admission rejects a two-commit landing that changes publisher controls", (t) => {
+  const state = releaseFixture(t);
+  write(join(state.repo, ".github", "workflows", "required-ci.yml"), "name: Changed control\n");
+  writeJson(join(state.repo, "packages", "action", "package.json"), {
+    name: "codex-review-gate-action",
+    version: "2.0.1",
+    type: "module",
+    repository: {
+      type: "git",
+      url: "git+https://github.com/JoeyTeng/codex-review-gate-action.git",
+    },
+  });
+  write(join(state.repo, "packages", "action", "src", "v2", "gate-runtime.mjs"),
+    "export const version = \"2.0.1\";\n");
+  const payloadAndControl = commit(state.repo, "Land publisher control and payload");
+  const tree = git(state.repo, ["rev-parse", `${payloadAndControl}:packages/action`]);
+  const files = payloadInventory(state.repo, payloadAndControl);
+  writeJson(join(state.repo, "release-manifest.json"), manifest({
+    version: "2.0.1",
+    tree,
+    files,
+    expectedHead: state.targetHead,
+  }));
+  const releaseIntent = commit(state.repo, "Release intent 2.0.1");
+  assert.equal(git(state.repo, ["rev-list", "--count", `${state.sourceCommit}..${releaseIntent}`]), "2");
+  assert.throws(() => createReleasePlan({
+    repo: state.repo,
+    sourceRef: releaseIntent,
+    controlRef: releaseIntent,
+    admissionBeforeRef: state.sourceCommit,
+  }), /recovery_code=publisher-control-landing/u);
+});
+
+test("push admission rejects a rebase-style range whose event.before is not an ancestor", (t) => {
+  const state = releaseFixture(t);
+  const sourceParent = git(state.repo, ["rev-parse", `${state.sourceCommit}^`]);
+  git(state.repo, ["switch", "-q", "--detach", sourceParent]);
+  write(join(state.repo, "sibling.txt"), "sibling landing\n");
+  const sibling = commit(state.repo, "Create sibling landing");
+  git(state.repo, ["switch", "-q", "master"]);
+  assert.throws(() => createReleasePlan({
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    admissionBeforeRef: sibling,
+  }), /recovery_code=source-not-current-master-ancestor/u);
+});
+
+test("workflow dispatch rebuilds only from a byte-exact persisted push admission plan", (t) => {
+  const state = releaseFixture(t);
+  const admittedPlanPath = join(state.root, "admitted-push-plan.json");
+  writeJson(admittedPlanPath, state.plan);
+  const recovered = createReleasePlan({
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    admissionPlanPath: admittedPlanPath,
+  });
+  assert.deepEqual(recovered, state.plan);
+  const tampered = structuredClone(state.plan);
+  tampered.push_admission.landing_commits = [tampered.push_admission.before_commit, state.sourceCommit];
+  writeJson(admittedPlanPath, tampered);
+  assert.throws(() => createReleasePlan({
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    admissionPlanPath: admittedPlanPath,
+  }), /persisted push admission plan/u);
+
+  const controlTampered = structuredClone(state.plan);
+  controlTampered.control_files[0].present = !controlTampered.control_files[0].present;
+  writeJson(admittedPlanPath, controlTampered);
+  assert.throws(() => createReleasePlan({
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    admissionPlanPath: admittedPlanPath,
+  }), /control inventory/u);
 });
 
 test("Action metadata parser admits only the closed node20 JavaScript schema", () => {
@@ -796,7 +967,12 @@ test("release planning rejects a composite Action even when its manifest claims 
   }));
   const sourceCommit = commit(repo, "Release intent");
   assert.throws(
-    () => createReleasePlan({ repo, sourceRef: sourceCommit, controlRef: sourceCommit }),
+    () => createReleasePlan({
+      repo,
+      sourceRef: sourceCommit,
+      controlRef: sourceCommit,
+      admissionBeforeRef: git(repo, ["rev-parse", `${sourceCommit}^`]),
+    }),
     /closed mapping-only subset|JavaScript Action policy/u,
   );
 });
@@ -812,6 +988,33 @@ test("candidate verification binds the NUL-delimited inventory digest", (t) => {
   assert.throws(() => verifyCandidate(state.candidateDir), /NUL-delimited inventory digest/u);
   writeFileSync(candidatePath, original);
   assert.equal(verifyCandidate(state.candidateDir).payload.inventory_sha256, nulInventoryDigest(state.files));
+});
+
+test("repository-owned archive encoding is invariant to input order, umask, locale, and host archivers", () => {
+  const files = [
+    { path: "src/v2/gate-runtime.mjs", mode: "100644", bytes: Buffer.from("export {};\n") },
+    { path: "package.json", mode: "100644", bytes: Buffer.from("{}\n") },
+    { path: "action.yml", mode: "100644", bytes: Buffer.from("name: Test\n") },
+  ];
+  const previousUmask = process.umask();
+  let first;
+  let second;
+  try {
+    process.umask(0o022);
+    first = encodeCanonicalReleaseArchive(files, "codex-review-gate-action-v2.0.0");
+    process.umask(0o077);
+    second = encodeCanonicalReleaseArchive([...files].reverse(), "codex-review-gate-action-v2.0.0");
+  } finally {
+    process.umask(previousUmask);
+  }
+  assert.deepEqual(second, first);
+  assert.equal(first.byteLength, 4631);
+  assert.equal(
+    createHash("sha256").update(first).digest("hex"),
+    "f2b71598a5d0bbad9f0ed384dafc84b658bcc6f677977a0cf1166bab07a08d22",
+  );
+  assert.doesNotMatch(PROVENANCE_GENERATOR, /execFileSync\("gzip"/u);
+  assert.doesNotMatch(PROVENANCE_GENERATOR, /"archive",\s*"--format=tar"/u);
 });
 
 test("candidate transport extracts only the two exact root regular files", (t) => {
@@ -864,7 +1067,7 @@ test("publication plan rebinds the candidate and exact live source closure", (t)
     controlRef: state.sourceCommit,
     liveMasterRef: liveMaster,
   });
-  assert.equal(publicationPlan.schema, "codex-review-gate-action-publication-plan-v1");
+  assert.equal(publicationPlan.schema, "codex-review-gate-action-publication-plan-v2");
   assert.equal(publicationPlan.live_source_master, liveMaster);
   assert.equal(publicationPlan.write_eligible, true);
   assert.equal(publicationPlan.candidate.archive_sha256, state.candidate.archive.sha256);
@@ -923,6 +1126,9 @@ test("provenance binds workflow, release objects, signatures, and alias transiti
     workflowRunAttempt: "2",
     outputDir,
   });
+  assert.equal(result.provenance.schema, "codex-review-gate-action-release-provenance-v2");
+  assert.equal(result.provenance.schema_version, 2);
+  assert.equal(result.provenance.plan.release_contract, "codex-review-gate-action-v2.0-contract-v1");
   assert.equal(result.provenance.workflow.run_id, "123456");
   assert.equal(result.provenance.target.parent, state.targetHead);
   assert.deepEqual(result.provenance.alias_transition, {
@@ -967,6 +1173,88 @@ test("provenance binds workflow, release objects, signatures, and alias transiti
     fullTagObject,
   }), /deterministic archive/u);
   writeFileSync(archivePath, archiveBytes, { flag: "w" });
+});
+
+test("historical verification routes immutable v2.0 provenance through its frozen contract after publisher evolution", async (t) => {
+  const state = releaseFixture(t);
+  const outputDir = join(state.root, "historical-release-assets");
+  const { releaseCommit, fullTagObject } = materializeTargetRelease(state);
+  write(join(state.repo, "packages", "action", "action.yml"),
+    ACTION_METADATA.replace("  main: src/v2/gate-runtime.mjs", "  main: src/v3/gate-runtime.mjs"));
+  write(join(state.repo, "packages", "action", "src", "v3", "gate-runtime.mjs"), "export {};\n");
+  commit(state.repo, "Upgrade publisher runtime policy after v2.0");
+
+  const upgradedGeneratorPath = join(state.root, "upgraded-publisher.mjs");
+  const currentContractNeedle = "const CURRENT_RELEASE_CONTRACT = RELEASE_CONTRACT_V2_0;";
+  const futureContract = `const FUTURE_CURRENT_RELEASE_CONTRACT = deepFreeze({
+  ...RELEASE_CONTRACT_V2_0,
+  id: "codex-review-gate-action-v3.0-contract-v1",
+  manifest: {
+    schema: "urn:joey-tools:codex-review-gate:release-manifest:3",
+    schema_version: 3,
+    contract_versions: { ...V2_0_CONTRACT_VERSIONS, toolchain: "node24", release_schema: 3 },
+  },
+  plan: { schema: "codex-review-gate-action-release-plan-v3", schema_version: 3 },
+  candidate: { schema: "codex-review-gate-action-candidate-v3", schema_version: 3 },
+  publication_plan: { schema: "codex-review-gate-action-publication-plan-v3", schema_version: 3 },
+  provenance: { schema: "codex-review-gate-action-release-provenance-v3", schema_version: 3 },
+  entrypoint: { metadata_path: "action.yml", using: "node24", main: "src/v3/gate-runtime.mjs" },
+  runtime_paths: ["src/v3/gate-runtime.mjs"],
+});
+const CURRENT_RELEASE_CONTRACT = FUTURE_CURRENT_RELEASE_CONTRACT;`;
+  const upgradedGenerator = PROVENANCE_GENERATOR.replace(currentContractNeedle, futureContract);
+  assert.notEqual(upgradedGenerator, PROVENANCE_GENERATOR);
+  writeFileSync(upgradedGeneratorPath, upgradedGenerator, { flag: "wx", mode: 0o600 });
+  const upgradedPublisher = await import(pathToFileURL(upgradedGeneratorPath).href);
+  assert.throws(
+    () => upgradedPublisher.readReleaseManifest(join(state.repo, "release-manifest.json")),
+    /unsupported release manifest schema/u,
+  );
+
+  const finalized = upgradedPublisher.finalizeProvenance({
+    candidateDir: state.candidateDir,
+    releaseCommit,
+    fullTagObject,
+    releaseParent: state.targetHead,
+    aliasName: "v2",
+    aliasBefore: "none",
+    aliasMode: "create",
+    workflowRef: WORKFLOW_REF,
+    workflowRunId: "123456",
+    workflowRunAttempt: "2",
+    outputDir,
+  });
+  assert.equal(finalized.provenance.schema, "codex-review-gate-action-release-provenance-v2");
+  assert.equal(finalized.provenance.schema_version, 2);
+  writeFileSync(join(outputDir, "release-provenance.json.asc"), "test-only detached signature\n", {
+    flag: "wx",
+    mode: 0o600,
+  });
+
+  assert.equal(upgradedPublisher.verifyPublishedAssets({
+    assetDir: outputDir,
+    repo: state.repo,
+    targetRepo: state.targetRepo,
+    sourceRef: state.sourceCommit,
+    releaseCommit,
+    fullTagObject,
+  }), true);
+  assert.match(PROVENANCE_GENERATOR,
+    /HISTORICAL_RELEASE_CONTRACTS[\s\S]*RELEASE_PROVENANCE_SCHEMA/u);
+
+  const provenancePath = join(outputDir, "release-provenance.json");
+  const unsupported = JSON.parse(readFileSync(provenancePath, "utf8"));
+  unsupported.schema = "codex-review-gate-action-release-provenance-v3";
+  unsupported.schema_version = 3;
+  writeJson(provenancePath, unsupported);
+  assert.throws(() => upgradedPublisher.verifyPublishedAssets({
+    assetDir: outputDir,
+    repo: state.repo,
+    targetRepo: state.targetRepo,
+    sourceRef: state.sourceCommit,
+    releaseCommit,
+    fullTagObject,
+  }), /unsupported published provenance schema/u);
 });
 
 test("published provenance is cross-checked against actual wrapper and annotated tag objects", (t) => {
