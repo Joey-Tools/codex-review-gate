@@ -2879,6 +2879,7 @@ async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
     baseRepositoryId: String(pullRequest.base.repo.id),
     baseEpoch,
     requests: requestAuthority.authorized,
+    requestBoundaries: requestAuthority.boundaries,
     requestErrors: requestAuthority.errors,
     requestReactions,
     artifacts: providerEvidence.artifacts,
@@ -2917,6 +2918,14 @@ async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
       permission: request.permission,
       revisionAt: request.comment.updated_at,
     })),
+    requestBoundaries: requestAuthority.boundaries.map((request) => ({
+      id: request.id,
+      headBound: request.headBound,
+      binding: request.binding,
+      authorized: request.authorized,
+      permission: request.permission,
+      revisionAt: request.comment.updated_at,
+    })),
     requestErrors: requestAuthority.errors,
     baseEpoch,
     commitResolutions: providerEvidence.commitResolutions,
@@ -2939,6 +2948,7 @@ function reduceV2Evidence({
   baseRepositoryId,
   baseEpoch,
   requests,
+  requestBoundaries,
   requestErrors,
   requestReactions,
   artifacts,
@@ -2948,17 +2958,25 @@ function reduceV2Evidence({
     .map(normalizeV2EvidenceError);
   const blockingErrors = [];
   let indeterminate = scopedErrors.length;
-  const {
-    baseEpochMs,
-    currentRequests,
-    generationRequests,
-  } = selectCurrentV2RequestGenerations({
+  const authorizedScope = selectCurrentV2RequestGenerations({
     headSha,
     baseSha,
     baseRef,
     baseRepositoryId,
     baseEpoch,
     requests,
+  });
+  const {
+    baseEpochMs,
+    generationRequests,
+  } = authorizedScope;
+  const boundaryScope = selectCurrentV2RequestGenerations({
+    headSha,
+    baseSha,
+    baseRef,
+    baseRepositoryId,
+    baseEpoch,
+    requests: requestBoundaries,
   });
   const requestEpoch = selectLatestV2RequestEpoch(generationRequests);
   if (requestEpoch.error) {
@@ -3048,7 +3066,7 @@ function reduceV2Evidence({
   currentArtifacts.sort(compareTerminalArtifactsNewestFirst);
   currentHeadTerminalArtifacts.sort(compareTerminalArtifactsNewestFirst);
   const generationLineage = buildV2GenerationLineage({
-    currentRequests: generationRequests,
+    currentRequests: boundaryScope.currentRequests,
     currentArtifacts: currentHeadTerminalArtifacts,
     requestReactions,
   });
@@ -3080,7 +3098,7 @@ function reduceV2Evidence({
   let cleanBlockedByLiveness = false;
   if (selectedClean) {
     const lineageError = requestEpoch.selected
-      ? v2UnlinkedCleanLineageError({
+      ? v2CleanLineageError({
           clean: selectedClean,
           generation: requestEpoch.selected,
           generationLineage,
@@ -3287,7 +3305,7 @@ function isV2QualifyingCleanForGeneration(
   ) {
     return false;
   }
-  if (v2UnlinkedCleanLineageError({
+  if (v2CleanLineageError({
     clean,
     generation,
     generationLineage,
@@ -3308,17 +3326,26 @@ function isV2QualifyingCleanForGeneration(
   return !laterEyes && !laterProgress;
 }
 
-function v2UnlinkedCleanLineageError({
+function v2CleanLineageError({
   clean,
   generation,
   generationLineage,
 }) {
-  if (clean.source === "request-reaction") return null;
   const generationIndex = generationLineage?.indexById?.get(generation.id);
   if (!Number.isSafeInteger(generationIndex)) {
     return `Terminal clean ${clean.source}:${clean.id} is not bound to a known review generation`;
   }
   const cleanMs = Date.parse(clean.createdAt);
+  if (clean.source === "request-reaction") {
+    const latestBoundary = generationLineage.generations.at(-1);
+    if (latestBoundary && cleanMs <= latestBoundary.revisionMs) {
+      return (
+        `Direct clean ${clean.source}:${clean.id} predates later review-request boundary ` +
+        `${latestBoundary.id}`
+      );
+    }
+    return null;
+  }
   const nextGeneration = generationLineage.generations[generationIndex + 1];
   if (nextGeneration && cleanMs >= nextGeneration.revisionMs) {
     return (
@@ -3551,6 +3578,7 @@ async function exactRefetchV2RelevantObjects(
 
 async function collectAuthorizedV2Requests(client, config, budget, issueComments) {
   const authorized = [];
+  const boundaries = [];
   const errors = [];
   const ordinaryCandidates = [];
   const permissionByLogin = new Map();
@@ -3574,14 +3602,16 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
         });
         continue;
       }
-      authorized.push({
+      const request = {
         comment,
         binding: canonical,
         id: String(comment.id),
         revisionMs: Date.parse(comment.updated_at),
         headBound: true,
         permission: "workflow",
-      });
+      };
+      authorized.push(request);
+      boundaries.push({ ...request, authorized: true });
       continue;
     }
     if (comment?.body !== "@codex review") continue;
@@ -3597,6 +3627,7 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
   }
   for (const comment of ordinaryCandidates) {
     let permission = "any";
+    let isAuthorized = true;
     if (config.requestAuthorPermission === "write") {
       const loginKey = comment.user.login.toLowerCase();
       if (!permissionByLogin.has(loginKey)) {
@@ -3611,27 +3642,32 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
         } catch (error) {
           if (error?.httpStatus === 404) {
             permissionByLogin.set(loginKey, null);
-            continue;
+          } else {
+            throw error;
           }
-          throw error;
         }
-        budget.consumeObjects(1, `request-author permission ${comment.user.login}`);
-        permissionByLogin.set(loginKey, String(data?.permission || ""));
+        if (data !== undefined) {
+          budget.consumeObjects(1, `request-author permission ${comment.user.login}`);
+          permissionByLogin.set(loginKey, String(data?.permission || ""));
+        }
       }
       permission = permissionByLogin.get(loginKey);
-      if (!["write", "maintain", "admin"].includes(permission)) continue;
+      isAuthorized = ["write", "maintain", "admin"].includes(permission);
     }
-    authorized.push({
+    const request = {
       comment,
       binding: null,
       id: String(comment.id),
       revisionMs: Date.parse(comment.updated_at),
       headBound: false,
       permission,
-    });
+    };
+    boundaries.push({ ...request, authorized: isAuthorized });
+    if (isAuthorized) authorized.push(request);
   }
   authorized.sort(compareV2RequestEpochNewestFirst);
-  return { authorized, errors };
+  boundaries.sort(compareV2RequestEpochNewestFirst);
+  return { authorized, boundaries, errors };
 }
 
 async function collectV2ProviderEvidence(

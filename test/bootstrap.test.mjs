@@ -3352,6 +3352,77 @@ test("legacy ruleset disappearance at the activation write boundary prevents PUT
   }
 });
 
+test("legacy disappearance during final activation closure prevents PUT", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const validPullRequest = canaryPullRequestFixture(repoSlug, CANARY_HEAD_SHA);
+    const legacyRuleset = activeLegacyRulesetFixture(7);
+    const effectiveRulePages = [[
+      effectiveLegacyRequiredStatusChecksRule(legacyRuleset),
+    ]];
+    const legacyInventory = legacyInventoryResponseFixtures(repoSlug, {
+      effectiveRulePages,
+      rulesets: [legacyRuleset],
+    });
+    const disabledV2 = {
+      ...completeDisabledRulesetFixture(8),
+      name: v2RulesetName,
+    };
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canaryRunResponses(repoSlug),
+      ...legacyInventory.responses,
+      [`GET repos/${repoSlug}/rules/branches/master?per_page=100`]: {
+        __fake_sequence: [
+          effectiveRulePages,
+          effectiveRulePages,
+          effectiveRulePages,
+          [[]],
+        ],
+      },
+      [`GET repos/${repoSlug}/pulls/7`]: {
+        __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [legacyRuleset, disabledV2],
+      ],
+      [`GET repos/${repoSlug}/rulesets/8`]: disabledV2,
+      [`PUT repos/${repoSlug}/rulesets/8`]: { id: 8, name: v2RulesetName },
+    };
+    const result = runBootstrap([
+      ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+      "--ruleset-name",
+      v2RulesetName,
+    ], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /canonical legacy review-gate inventory digest mismatched.*activation final write-boundary readback/iu,
+    );
+    const calls = readFileSync(callLog, "utf8");
+    assert.equal(
+      countLines(
+        calls,
+        `GET repos/${repoSlug}/rules/branches/master?per_page=100`,
+      ),
+      4,
+    );
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("activates v2 while classic legacy protection remains active and stable", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
@@ -4582,6 +4653,8 @@ test("active post-write API failures preserve v2 and never advise disable", () =
           repository,
           repository,
           repository,
+          repository,
+          repository,
           { __fake_http_error: 503, message: "post-write repository read failed" },
         ],
       },
@@ -4818,7 +4891,7 @@ test("independent staging and activation runs preserve stable legacy and greenfi
       const stageCalls = readFileSync(stageLog, "utf8");
       const activationCalls = readFileSync(activationLog, "utf8");
       assert.equal(countLines(stageCalls, inventoryEndpoint), 3, name);
-      assert.equal(countLines(activationCalls, inventoryEndpoint), 4, name);
+      assert.equal(countLines(activationCalls, inventoryEndpoint), 5, name);
       assert.match(stageCalls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
       assert.doesNotMatch(stageCalls, /^PUT /mu, name);
       assert.match(
@@ -4841,6 +4914,10 @@ test("independent staging and activation runs preserve stable legacy and greenfi
       const putIndex = activationLines.indexOf(
         `PUT repos/${repoSlug}/rulesets/8`,
       );
+      const finalLegacyRead = activationLines.lastIndexOf(
+        inventoryEndpoint,
+        putIndex - 1,
+      );
       const finalTargetRead = activationLines.lastIndexOf(
         `GET repos/${repoSlug}/rulesets/8`,
         putIndex - 1,
@@ -4849,9 +4926,10 @@ test("independent staging and activation runs preserve stable legacy and greenfi
         finalCanaryJobs !== -1 &&
           finalCanaryJobs < finalSecurityRepository &&
           finalSecurityRepository < finalSecurityProtection &&
-          finalSecurityProtection < finalTargetRead &&
+          finalSecurityProtection < finalLegacyRead &&
+          finalLegacyRead < finalTargetRead &&
           finalTargetRead < putIndex,
-        `${name}: final canary, security, target, and PUT order drifted`,
+        `${name}: final canary, security, legacy, target, and PUT order drifted`,
       );
     }
   } finally {

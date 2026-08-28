@@ -1098,6 +1098,133 @@ test("ordinary request author permission is enforced without letting a 404 comme
   assert.equal(anyResult.report.gateOutcome, "success");
 });
 
+test("a denied exact request remains a lineage boundary without granting clean authority", async (context) => {
+  const authorizedA = ordinaryRequest({ id: 101 });
+  const deniedU = ordinaryRequest({
+    id: 102,
+    user: READER,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const delayedUnboundClean = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+  });
+  const permissionByLogin = new Map([
+    [HUMAN.login, "write"],
+    [READER.login, "read"],
+  ]);
+  const ambiguousGitHub = createGitHubMock({
+    issueComments: [authorizedA, deniedU, delayedUnboundClean],
+    permissionByLogin,
+  });
+  const ambiguousEnvironment = runtimeEnvironment(context, {
+    suffix: "denied-request-lineage-boundary",
+  });
+  const { result: ambiguous } = await runGate(ambiguousEnvironment, ambiguousGitHub);
+  assert.equal(ambiguous.exitCode, 1);
+  assert.equal(ambiguous.report.gateOutcome, "pending");
+  assert.equal(ambiguous.report.recoveryCode, "request_clean_generation");
+  assert.match(ambiguous.report.reason, /newer request 102 already existed/iu);
+  assert.equal(
+    ambiguousGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+  assert.equal(
+    ambiguousGitHub.calls.some(({ path }) =>
+      path === `/repos/${REPOSITORY}/issues/comments/${deniedU.id}` ||
+      path === `/repos/${REPOSITORY}/issues/comments/${deniedU.id}/reactions`
+    ),
+    false,
+    "the denied boundary remains read-only snapshot evidence without extra API fan-out",
+  );
+
+  const lateFindingGitHub = createGitHubMock({
+    issueComments: [authorizedA, deniedU, delayedUnboundClean],
+    reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:04:00Z" })],
+    permissionByLogin,
+  });
+  const lateFindingEnvironment = runtimeEnvironment(context, {
+    suffix: "denied-request-late-finding",
+  });
+  const { result: lateFinding } = await runGate(
+    lateFindingEnvironment,
+    lateFindingGitHub,
+  );
+  assert.equal(lateFinding.exitCode, 1);
+  assert.equal(lateFinding.report.gateOutcome, "failure");
+  assert.equal(lateFinding.report.recoveryCode, "fix_findings");
+  assert.equal(lateFinding.report.counts.unresolved, 1);
+  assert.equal(lateFinding.report.counts.resolved, 0);
+
+  const authorizedB = workflowRequest({
+    id: 104,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+  });
+  const directRecoveryGitHub = createGitHubMock({
+    issueComments: [authorizedA, deniedU, delayedUnboundClean, authorizedB],
+    reactionsByCommentId: new Map([["104", [reaction({
+      id: 504,
+      created_at: "2026-08-25T08:05:00Z",
+    })]]]),
+    permissionByLogin,
+  });
+  const directRecoveryEnvironment = runtimeEnvironment(context, {
+    suffix: "denied-request-direct-authorized-recovery",
+  });
+  const { result: directRecovery } = await runGate(
+    directRecoveryEnvironment,
+    directRecoveryGitHub,
+  );
+  assert.equal(directRecovery.exitCode, 0);
+  assert.equal(directRecovery.report.gateOutcome, "success");
+  assert.match(directRecovery.report.reason, /request-reaction 504/u);
+
+  const canonicalA = workflowRequest({
+    id: 105,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+  });
+  const staleDirectGitHub = createGitHubMock({
+    issueComments: [canonicalA, deniedU, delayedUnboundClean],
+    reactionsByCommentId: new Map([["105", [reaction({
+      id: 505,
+      created_at: "2026-08-25T08:01:00Z",
+    })]]]),
+    permissionByLogin,
+  });
+  const staleDirectEnvironment = runtimeEnvironment(context, {
+    suffix: "denied-request-after-direct-clean",
+  });
+  const { result: staleDirect } = await runGate(staleDirectEnvironment, staleDirectGitHub);
+  assert.equal(staleDirect.exitCode, 1);
+  assert.equal(staleDirect.report.gateOutcome, "pending");
+  assert.equal(staleDirect.report.recoveryCode, "request_clean_generation");
+  assert.match(staleDirect.report.reason, /predates later review-request boundary 102/iu);
+
+  const refreshedDirectGitHub = createGitHubMock({
+    issueComments: [canonicalA, deniedU, delayedUnboundClean],
+    reactionsByCommentId: new Map([["105", [
+      reaction({ id: 505, created_at: "2026-08-25T08:01:00Z" }),
+      reaction({ id: 506, created_at: "2026-08-25T08:04:00Z" }),
+    ]]]),
+    permissionByLogin,
+  });
+  const refreshedDirectEnvironment = runtimeEnvironment(context, {
+    suffix: "denied-request-before-refreshed-direct-clean",
+  });
+  const { result: refreshedDirect } = await runGate(
+    refreshedDirectEnvironment,
+    refreshedDirectGitHub,
+  );
+  assert.equal(refreshedDirect.exitCode, 0);
+  assert.equal(refreshedDirect.report.gateOutcome, "success");
+  assert.match(refreshedDirect.report.reason, /request-reaction 506/u);
+});
+
 test("authority filtering caches permissions and avoids exact-refetch DoS", async (context) => {
   const deniedRequests = Array.from({ length: 70 }, (_, index) => {
     const id = 1_000 + index;

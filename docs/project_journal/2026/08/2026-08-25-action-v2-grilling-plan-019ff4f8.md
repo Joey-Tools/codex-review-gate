@@ -2093,6 +2093,48 @@ superseded_by:
   create cross-file contention. The new exact-head acceptance result is
   recorded only after this combined tree is signed and frozen.
 
+### Exact-Head Acceptance Review Round Two And Race Closure
+
+- The second formal whole-range lane reviewed the exact signed checkpoint
+  `10217253306ca2ee6f312f766a331f8924e26e47..acedef36333a913779e83fdd6031e8d2106b6b2e`
+  at tree `98f8aa4321ff5a36c47fd27a1f273ad9905ecc2d`. The lane used a
+  fresh `git clone --no-local`, detached the exact head, verified a clean
+  worktree and the 20-commit DAG, and ran an ordinary general agent with
+  `gpt-5.6-sol` / `ultra`. It made no local or GitHub mutation. The checkpoint
+  had a Good GPG signature from
+  `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`.
+- That lane retained two P1 fail-closed defects, so the checkpoint was not
+  pushed. First, an exact, unedited `@codex review` from a user lacking write
+  permission was discarded entirely. Its later unbound terminal clean could
+  therefore be assigned to an earlier authorised generation and pass before
+  that earlier request emitted a finding. The reducer now retains every exact,
+  unedited request as a lineage and liveness boundary while allowing only
+  authorised requests to grant positive authority. A denied boundary prevents
+  later unbound clean and any earlier direct `+1` from passing; a new direct
+  `+1` on an authorised canonical request after the boundary can recover. The
+  denied request still causes no exact-refetch or reaction fan-out.
+- Second, Active ruleset activation performed its final approved legacy digest
+  before the final canary and complete consumer-security closure. Concurrent
+  removal of the last legacy requirement during those reads could therefore
+  leave both gates absent until the later v2 PUT, while the post-write digest
+  could only report the already-created gap. The final write sequence is now
+  `final canary -> complete consumer-security closure -> approved legacy
+  digest -> authoritative target GET/fingerprint -> PUT Active`. A new
+  interleaving fixture makes the legacy inventory disappear on that final
+  read, requires the named write-boundary mismatch, and proves zero v2 or
+  legacy PUTs. This is the tightest best-effort boundary available because the
+  GitHub ruleset API exposes neither a transaction nor an `If-Match` update
+  contract.
+- Post-fix focused integration passed runtime 84/84, bootstrap 101/101, and
+  workflow-security contract 39/39. `npm run check`, owned-file
+  `git diff --check`, and project-journal validation also passed. The root then
+  ran `npm test -- --test-reporter=dot --test-concurrency=1`; the final combined
+  implementation tree passed 781/781 with exit code zero. This evidence covers
+  the code and documentation snapshot immediately before this evidence-only
+  journal append; the append is revalidated by the journal, syntax, diff, and
+  new exact-head review gates rather than rerunning the approximately
+  20-minute release simulation solely for its own recorded result.
+
 ### Follow-Up Migration Witness Review And Resolution
 
 - A fresh ordinary-agent pre-review retained four defects in the first overlap

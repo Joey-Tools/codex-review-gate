@@ -486,6 +486,12 @@ async function main() {
       finalSecuritySnapshot,
       { phase: "final ruleset pre-write readback" },
     );
+    await assertExpectedLegacyInventoryDigest({
+      repoSlug: options.repo.slug,
+      defaultBranch,
+      expectedDigest: options.expectedLegacyInventorySha256,
+      phase: "activation final write-boundary readback",
+    });
   }
   const finalFullRuleset = assertSelectedRepositoryRulesetIdentity(
     await ghJson(`repos/${options.repo.slug}/rulesets/${fullRuleset.id}`),
@@ -504,9 +510,10 @@ async function main() {
     );
   }
   // GitHub's ruleset API does not expose an If-Match update contract here.
-  // Bracket the legacy read with full target-ruleset reads, then keep this
-  // second writable-field reread adjacent to PUT. These are the final
-  // best-effort lost-update boundaries without an API If-Match contract.
+  // Bracket the final legacy read with full target-ruleset reads, after the
+  // complete canary/security closure, then keep this second writable-field
+  // reread adjacent to PUT. These are the final best-effort lost-update and
+  // zero-gate boundaries without an API transaction or If-Match contract.
   const finalUpdatedRuleset = await withPostWriteRecoveryGuidance(
     {
       enforcement: payload.enforcement,
