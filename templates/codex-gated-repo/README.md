@@ -68,16 +68,28 @@ path-based file operations between checkpoints. Run it only in a worktree whose
 parent directories are not being concurrently modified by an untrusted
 process; do not bypass a reported safety failure with a manual copy.
 
+Before the migration approval, record the canonical legacy-inventory SHA-256.
+It binds repository/default branch, each matching ruleset's complete identity,
+source, enforcement, target, conditions, bypass actors, rules, and effective
+required-status rule, plus the complete classic required-status object and
+every check producer `app_id`. Even an empty legacy inventory has a bound
+digest. Incomplete API/schema data or any drift fails closed. Explicitly pass
+that same owner-approved digest to every pre-cleanup stage/activation preview
+and apply, across processes, through the exact Active readback.
+
 Rollout order:
 
 1. use one migration PR to remove v1, install both canonical v2 workflows, and
    install or merge the control-plane CODEOWNERS rules;
 2. obtain an independent approval from the named control-plane owner;
 3. merge that exact reviewed head while every inventoried v1 requirement
-   remains active, then reread the merged/default/head scope before removing
-   the legacy requirement;
-4. import or stage the ruleset as Disabled;
-5. create a separate harmless PR, request `@codex review`, and reconcile its
+   remains active, then reread the merged/default/head scope while keeping the
+   legacy requirement active;
+4. import or stage a separate v2 ruleset as Disabled; if an active legacy or
+   incomplete ruleset occupies the selected name, choose a distinct v2 ruleset
+   name instead of disabling or replacing the legacy ruleset;
+5. with the legacy gate still active, create a separate harmless PR, request
+   `@codex review`, and reconcile its
    exact head when needed;
 6. verify exactly one successful native `codex/github-review-gate` verifier
    run/job/CheckRun recorded against the exact current PR feature-head SHA and
@@ -89,8 +101,13 @@ Rollout order:
    event scope and a fresh PR read, so the CheckRun itself does not belong to
    the test-merge SHA;
 7. read back the unchanged disabled ruleset and control plane, activate it,
-   and read the active policy back exactly; and
-8. close the canary without merging it.
+   and read the complete Active policy back exactly;
+8. only after that Active readback, perform the separately authorised legacy
+   cleanup; because cleanup changes the old digest, run the read-only
+   `--verify-post-cleanup` mode without that digest to prove both ruleset and
+   classic legacy surfaces clear and re-read the same complete Active v2
+   policy; and
+9. close the canary without merging it.
 
 Installation documentation:
 

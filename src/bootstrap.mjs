@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+
 export const DEFAULT_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
 export const DEFAULT_STATUS_INTEGRATION_ID = 15368;
@@ -255,8 +257,11 @@ export function codeownersHasEffectiveUnmanagedPatterns(value) {
 export function rulesetHasRequiredStatusContext(
   ruleset,
   context = DEFAULT_STATUS_CONTEXT,
-  { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+  options = {},
 ) {
+  const integrationId = Object.prototype.hasOwnProperty.call(options, "integrationId")
+    ? options.integrationId
+    : DEFAULT_STATUS_INTEGRATION_ID;
   return requiredStatusChecks(ruleset).some((check) =>
     requiredStatusCheckMatches(check, context, integrationId),
   );
@@ -288,8 +293,7 @@ export function rulesetHasGatePolicy(
   { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
 ) {
   return (
-    rulesetHasRequiredStatusContext(ruleset, context, { integrationId }) &&
-    rulesetHasStrictStatusPolicy(ruleset, context) &&
+    rulesetHasOneBoundStrictStatusPolicy(ruleset, context, integrationId) &&
     rulesetHasRequiredPullRequestPolicy(ruleset) &&
     rulesetHasNonFastForwardPolicy(ruleset) &&
     Array.isArray(ruleset.bypass_actors) &&
@@ -309,14 +313,16 @@ function requiredStatusChecks(ruleset) {
     .flatMap((rule) => rule.parameters?.required_status_checks ?? []);
 }
 
-function rulesetHasStrictStatusPolicy(ruleset, context) {
-  return (ruleset.rules ?? []).some(
-    (rule) =>
-      rule.type === "required_status_checks" &&
-      rule.parameters?.strict_required_status_checks_policy === true &&
-      (rule.parameters?.required_status_checks ?? []).some(
-        (check) => check?.context === context,
-      ),
+function rulesetHasOneBoundStrictStatusPolicy(ruleset, context, integrationId) {
+  const statusRules = (ruleset.rules ?? []).filter(
+    (rule) => rule.type === "required_status_checks",
+  );
+  return (
+    statusRules.length === 1 &&
+    statusRules[0].parameters?.strict_required_status_checks_policy === true &&
+    (statusRules[0].parameters?.required_status_checks ?? []).some(
+      (check) => requiredStatusCheckMatches(check, context, integrationId),
+    )
   );
 }
 
@@ -344,6 +350,218 @@ export function findEffectiveRulesetWithGatePolicy(
       rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
       rulesetHasGatePolicy(ruleset, context, { integrationId }),
   );
+}
+
+export function assertCompleteRulesetApiObject(ruleset) {
+  assertJsonNumbersAreSafeIntegers(ruleset, "Full ruleset API readback");
+  if (
+    ruleset === null ||
+    typeof ruleset !== "object" ||
+    Array.isArray(ruleset) ||
+    !Number.isSafeInteger(ruleset.id) ||
+    ruleset.id <= 0 ||
+    typeof ruleset.name !== "string" ||
+    ruleset.name === "" ||
+    typeof ruleset.source_type !== "string" ||
+    ruleset.source_type === "" ||
+    typeof ruleset.source !== "string" ||
+    ruleset.source === "" ||
+    typeof ruleset.enforcement !== "string" ||
+    ruleset.enforcement === "" ||
+    typeof ruleset.target !== "string" ||
+    ruleset.target === "" ||
+    ruleset.conditions === null ||
+    typeof ruleset.conditions !== "object" ||
+    Array.isArray(ruleset.conditions) ||
+    !Array.isArray(ruleset.bypass_actors) ||
+    !Array.isArray(ruleset.rules)
+  ) {
+    throw new Error(
+      "Full ruleset API readback is malformed or omits identity, source, enforcement, target, conditions, bypass_actors, or rules.",
+    );
+  }
+
+  for (const actor of ruleset.bypass_actors) {
+    assertLegacyInventoryBypassActor(actor, ruleset.target);
+  }
+  for (const rule of ruleset.rules) {
+    assertLegacyInventoryRule(rule, "Full ruleset API readback");
+  }
+  if (
+    ruleset.rules.filter((rule) => rule.type === "required_status_checks").length > 1
+  ) {
+    throw new Error(
+      "Full ruleset API readback contains duplicate required_status_checks rules.",
+    );
+  }
+  return ruleset;
+}
+
+export function canonicalClassicRequiredStatusChecks(value) {
+  if (value === null) {
+    return null;
+  }
+  if (
+    value === undefined ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    typeof value.strict !== "boolean" ||
+    !Array.isArray(value.contexts) ||
+    !Array.isArray(value.checks)
+  ) {
+    throw new Error(
+      "Classic branch protection required_status_checks is malformed or incomplete.",
+    );
+  }
+
+  const contexts = value.contexts.map((context) => {
+    if (typeof context !== "string" || context === "") {
+      throw new Error(
+        "Classic branch protection contexts contain a malformed status context.",
+      );
+    }
+    return context;
+  });
+  const checks = value.checks.map((check) => {
+    if (
+      check === null ||
+      typeof check !== "object" ||
+      Array.isArray(check) ||
+      typeof check.context !== "string" ||
+      check.context === "" ||
+      !Object.prototype.hasOwnProperty.call(check, "app_id") ||
+      !validClassicAppId(check.app_id)
+    ) {
+      throw new Error(
+        "Classic branch protection checks must contain a status context and explicit app_id (positive integer, -1, or null).",
+      );
+    }
+    return { context: check.context, app_id: check.app_id };
+  });
+
+  contexts.sort(compareCanonicalText);
+  checks.sort(compareClassicStatusCheck);
+  return { strict: value.strict, contexts, checks };
+}
+
+export function buildCanonicalLegacyReviewGateInventory({
+  repository,
+  repositoryId,
+  repositoryNodeId,
+  defaultBranch,
+  effectiveRulePages,
+  rulesets,
+  classicRequiredStatusChecks,
+}) {
+  if (typeof repository !== "string" || repository === "") {
+    throw new Error("Legacy inventory repository must be a non-empty string.");
+  }
+  if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) {
+    throw new Error("Legacy inventory repository id must be a positive safe integer.");
+  }
+  if (typeof repositoryNodeId !== "string" || repositoryNodeId === "") {
+    throw new Error("Legacy inventory repository node id must be a non-empty string.");
+  }
+  if (typeof defaultBranch !== "string" || defaultBranch === "") {
+    throw new Error("Legacy inventory default branch must be a non-empty string.");
+  }
+  if (
+    !Array.isArray(effectiveRulePages) ||
+    effectiveRulePages.length === 0 ||
+    effectiveRulePages.some((page) => !Array.isArray(page))
+  ) {
+    throw new Error(
+      "Effective ruleset inventory must be a complete paginated array of arrays.",
+    );
+  }
+  if (!Array.isArray(rulesets)) {
+    throw new Error("Legacy full-ruleset inventory must be an array.");
+  }
+
+  const effectiveLegacyRules = [];
+  for (const rule of effectiveRulePages.flat()) {
+    assertEffectiveRulesetRule(rule);
+    if (
+      rule.type === "required_status_checks" &&
+      rule.parameters.required_status_checks.some(
+        (check) => check.context === LEGACY_STATUS_CONTEXT,
+      )
+    ) {
+      effectiveLegacyRules.push(rule);
+    }
+  }
+
+  const rulesetsById = new Map();
+  for (const ruleset of rulesets) {
+    assertCompleteRulesetApiObject(ruleset);
+    if (rulesetsById.has(ruleset.id)) {
+      throw new Error(`Legacy full-ruleset inventory repeats id ${ruleset.id}.`);
+    }
+    rulesetsById.set(ruleset.id, ruleset);
+  }
+  const expectedIds = new Set(effectiveLegacyRules.map((rule) => rule.ruleset_id));
+  if (
+    rulesetsById.size !== expectedIds.size ||
+    [...rulesetsById.keys()].some((id) => !expectedIds.has(id))
+  ) {
+    throw new Error(
+      "Legacy full-ruleset inventory does not exactly cover the effective legacy ruleset ids.",
+    );
+  }
+
+  const canonicalRulesets = effectiveLegacyRules.map((effectiveRule) => {
+    const ruleset = rulesetsById.get(effectiveRule.ruleset_id);
+    if (ruleset === undefined) {
+      throw new Error(
+        `Effective legacy ruleset ${effectiveRule.ruleset_id} lacks a full API readback.`,
+      );
+    }
+    if (
+      !ruleset.rules.some(
+        (rule) =>
+          rule.type === "required_status_checks" &&
+          rule.parameters.required_status_checks.some(
+            (check) => check.context === LEGACY_STATUS_CONTEXT,
+          ),
+      )
+    ) {
+      throw new Error(
+        `Full ruleset ${ruleset.id} disagrees with its effective legacy status-check rule.`,
+      );
+    }
+    return {
+      id: ruleset.id,
+      name: ruleset.name,
+      source_type: ruleset.source_type,
+      source: ruleset.source,
+      enforcement: ruleset.enforcement,
+      target: ruleset.target,
+      conditions: canonicalSemanticValue(ruleset.conditions),
+      bypass_actors: ruleset.bypass_actors
+        .map((actor) => structuredCloneSafe(actor))
+        .sort(compareLegacyBypassActor),
+      rules: canonicalSemanticValue(ruleset.rules),
+      effective_required_status_checks_rule:
+        canonicalEffectiveRequiredStatusChecksRule(effectiveRule),
+    };
+  });
+  canonicalRulesets.sort((left, right) =>
+    compareCanonicalText(canonicalJson(left), canonicalJson(right))
+  );
+
+  return {
+    repository,
+    repository_id: repositoryId,
+    repository_node_id: repositoryNodeId,
+    default_branch: defaultBranch,
+    rulesets: canonicalRulesets,
+    classic_required_status_checks:
+      canonicalClassicRequiredStatusChecks(classicRequiredStatusChecks),
+  };
+}
+
+export function canonicalLegacyReviewGateInventoryBytes(input) {
+  return `${canonicalJson(buildCanonicalLegacyReviewGateInventory(input))}\n`;
 }
 
 export function rulesetCoversDefaultBranch(ruleset, defaultBranch = null) {
@@ -508,6 +726,7 @@ export function ensureGatePolicyInRules(
     integrationId = DEFAULT_STATUS_INTEGRATION_ID,
     strict = true,
     doNotEnforceOnCreate = undefined,
+    removeContexts = [LEGACY_STATUS_CONTEXT],
   } = {},
 ) {
   const pullRequest = ensurePullRequestPolicyInRules(existingRules);
@@ -515,6 +734,7 @@ export function ensureGatePolicyInRules(
     integrationId,
     strict,
     doNotEnforceOnCreate,
+    removeContexts,
   });
   const nonFastForward = ensureNonFastForwardPolicyInRules(status.rules);
   return {
@@ -573,6 +793,11 @@ export function buildUpdateRulesetPayload(
   const requiredEnforcement = enforcement ?? (
     preservesCompleteActivePolicy ? "active" : DEFAULT_RULESET_ENFORCEMENT
   );
+  if (ruleset.enforcement === "active" && !preservesCompleteActivePolicy) {
+    throw new Error(
+      `Ruleset "${ruleset.name}" is an active legacy or incomplete gate; refusing to disable it during v2 staging. Keep it active and use a distinct --ruleset-name for the disabled v2 ruleset.`,
+    );
+  }
   const requiredConditions = coversDefaultBranch
     ? structuredCloneSafe(ruleset.conditions)
     : addDefaultBranchToConditions(ruleset.conditions, defaultBranch);
@@ -583,6 +808,7 @@ export function buildUpdateRulesetPayload(
       integrationId,
       strict,
       doNotEnforceOnCreate,
+      removeContexts: preservesCompleteActivePolicy ? [] : [LEGACY_STATUS_CONTEXT],
     },
   );
   const changed =
@@ -1334,7 +1560,7 @@ export function validateCanonicalV2WorkflowInventory(
       violations: workflowSingleProducerPolicyViolations(file?.content),
     }))
     .filter((file) => file.violations.length > 0)
-    .sort((left, right) => left.path.localeCompare(right.path));
+    .sort((left, right) => compareCanonicalText(left.path, right.path));
   if (producerViolations.length > 0) {
     throw new Error(
       `Additional workflows violate the codex/github-review-gate single-producer policy: ${producerViolations
@@ -1592,6 +1818,226 @@ function stripBypassActorForRulesetPayload(actor) {
   return Object.fromEntries(
     Object.entries(stripped).filter(([, value]) => value !== undefined),
   );
+}
+
+function assertEffectiveRulesetRule(rule) {
+  assertJsonNumbersAreSafeIntegers(rule, "Effective ruleset inventory");
+  if (
+    rule === null ||
+    typeof rule !== "object" ||
+    Array.isArray(rule) ||
+    typeof rule.type !== "string" ||
+    rule.type === "" ||
+    !Number.isSafeInteger(rule.ruleset_id) ||
+    rule.ruleset_id <= 0
+  ) {
+    throw new Error("Effective ruleset inventory contains a malformed rule.");
+  }
+  if (rule.type === "required_status_checks") {
+    assertRequiredStatusChecksParameters(
+      rule.parameters,
+      "Effective required_status_checks rule",
+    );
+  }
+}
+
+function assertJsonNumbersAreSafeIntegers(value, label) {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(`${label} contains a non-safe-integer JSON number.`);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      assertJsonNumbersAreSafeIntegers(item, label);
+    }
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const item of Object.values(value)) {
+      assertJsonNumbersAreSafeIntegers(item, label);
+    }
+  }
+}
+
+function assertLegacyInventoryRule(rule, label) {
+  if (
+    rule === null ||
+    typeof rule !== "object" ||
+    Array.isArray(rule) ||
+    typeof rule.type !== "string" ||
+    rule.type === ""
+  ) {
+    throw new Error(`${label} contains a malformed rule.`);
+  }
+  if (rule.type === "required_status_checks") {
+    assertRequiredStatusChecksParameters(rule.parameters, label);
+  } else if (
+    Object.prototype.hasOwnProperty.call(rule, "parameters") &&
+    (rule.parameters === null ||
+      typeof rule.parameters !== "object" ||
+      Array.isArray(rule.parameters))
+  ) {
+    throw new Error(`${label} contains malformed rule parameters.`);
+  }
+}
+
+function assertRequiredStatusChecksParameters(parameters, label) {
+  if (
+    parameters === null ||
+    typeof parameters !== "object" ||
+    Array.isArray(parameters) ||
+    typeof parameters.strict_required_status_checks_policy !== "boolean" ||
+    !Array.isArray(parameters.required_status_checks) ||
+    (Object.prototype.hasOwnProperty.call(parameters, "do_not_enforce_on_create") &&
+      typeof parameters.do_not_enforce_on_create !== "boolean")
+  ) {
+    throw new Error(`${label} is malformed or incomplete.`);
+  }
+  for (const check of parameters.required_status_checks) {
+    if (
+      check === null ||
+      typeof check !== "object" ||
+      Array.isArray(check) ||
+      typeof check.context !== "string" ||
+      check.context === "" ||
+      (Object.prototype.hasOwnProperty.call(check, "integration_id") &&
+        (!Number.isSafeInteger(check.integration_id) || check.integration_id <= 0))
+    ) {
+      throw new Error(`${label} contains a malformed required status check.`);
+    }
+  }
+}
+
+function assertLegacyInventoryBypassActor(actor, target) {
+  const actorTypes = new Set([
+    "Integration",
+    "OrganizationAdmin",
+    "RepositoryRole",
+    "Team",
+    "DeployKey",
+    "EnterpriseOwner",
+    "EnterpriseRole",
+    "User",
+  ]);
+  const bypassModes = new Set(["always", "pull_request", "exempt"]);
+  if (
+    actor === null ||
+    typeof actor !== "object" ||
+    Array.isArray(actor) ||
+    !actorTypes.has(actor.actor_type) ||
+    !bypassModes.has(actor.bypass_mode)
+  ) {
+    throw new Error("Full ruleset API readback contains a malformed bypass actor.");
+  }
+  const nullableActor =
+    actor.actor_type === "DeployKey" ||
+    actor.actor_type === "OrganizationAdmin" ||
+    actor.actor_type === "EnterpriseOwner";
+  if (
+    (actor.actor_id === null && !nullableActor) ||
+    (actor.actor_id !== null &&
+      (!Number.isSafeInteger(actor.actor_id) || actor.actor_id <= 0)) ||
+    (actor.actor_type === "DeployKey" && actor.actor_id !== null) ||
+    (actor.bypass_mode === "pull_request" &&
+      (actor.actor_type === "DeployKey" || target !== "branch"))
+  ) {
+    throw new Error("Full ruleset API readback contains an invalid bypass actor binding.");
+  }
+}
+
+function validClassicAppId(value) {
+  return value === null || value === -1 || (Number.isSafeInteger(value) && value > 0);
+}
+
+function compareClassicStatusCheck(left, right) {
+  return compareTuple(
+    [
+      left.context,
+      left.app_id === null ? "null" : "number",
+      String(left.app_id),
+      canonicalJson(left),
+    ],
+    [
+      right.context,
+      right.app_id === null ? "null" : "number",
+      String(right.app_id),
+      canonicalJson(right),
+    ],
+  );
+}
+
+function compareLegacyBypassActor(left, right) {
+  return compareTuple(
+    [
+      left.actor_type,
+      left.actor_id ?? -1,
+      left.bypass_mode,
+      canonicalJson(left),
+    ],
+    [
+      right.actor_type,
+      right.actor_id ?? -1,
+      right.bypass_mode,
+      canonicalJson(right),
+    ],
+  );
+}
+
+function compareTuple(left, right) {
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] === right[index]) {
+      continue;
+    }
+    if (typeof left[index] === "number" && typeof right[index] === "number") {
+      return left[index] - right[index];
+    }
+    return compareCanonicalText(String(left[index]), String(right[index]));
+  }
+  return 0;
+}
+
+function canonicalEffectiveRequiredStatusChecksRule(rule) {
+  const normalized = structuredCloneSafe(rule);
+  normalized.parameters.required_status_checks.sort((left, right) =>
+    compareTuple(
+      [
+        left.context,
+        left.integration_id ?? -1,
+        canonicalJson(left),
+      ],
+      [
+        right.context,
+        right.integration_id ?? -1,
+        canonicalJson(right),
+      ],
+    )
+  );
+  return normalized;
+}
+
+function canonicalSemanticValue(value) {
+  if (Array.isArray(value)) {
+    const items = value.map(canonicalSemanticValue);
+    items.sort((left, right) =>
+      compareCanonicalText(canonicalJson(left), canonicalJson(right))
+    );
+    return items;
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, canonicalSemanticValue(item)]),
+    );
+  }
+  return value;
+}
+
+// Canonical order must not depend on the host locale. GitHub JSON text is
+// valid UTF-8, whose bytewise order preserves Unicode scalar order and matches
+// jq's deterministic string ordering for this shared inventory contract.
+function compareCanonicalText(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function structuredCloneSafe(value) {

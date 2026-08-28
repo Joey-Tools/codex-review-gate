@@ -119,8 +119,8 @@ jobs:
   candidate-a:
     name: Build candidate A
     needs: plan
-    runs-on: ubuntu-slim
-    timeout-minutes: 14
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     outputs:
       artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
       artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}
@@ -173,8 +173,8 @@ jobs:
   candidate-b:
     name: Build candidate B
     needs: plan
-    runs-on: ubuntu-slim
-    timeout-minutes: 14
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     outputs:
       artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
       artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}

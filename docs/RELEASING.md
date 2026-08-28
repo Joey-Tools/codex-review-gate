@@ -95,10 +95,15 @@ stages:
 | `publish` | Privileged | After Environment approval, revalidate everything and perform signed remote publication. |
 | `verify` | Unprivileged | Re-read public refs and Release state and report the observed result. |
 
-The unprivileged `plan`, `candidate-a`, `candidate-b`, `assemble`,
-`publication-plan`, and `verify` jobs use `ubuntu-slim` with 14-minute
-timeouts. The privileged `publish` job uses `ubuntu-24.04` with a 30-minute
-timeout.
+The light unprivileged `plan`, `assemble`, `publication-plan`, and `verify`
+jobs use `ubuntu-slim` with 14-minute timeouts. GitHub imposes a separate
+15-minute hard limit on that single-CPU runner, so the low-frequency, heavy
+`candidate-a` and `candidate-b` jobs use `ubuntu-24.04` with 30-minute
+timeouts. The full suite alone had consumed about 755.6 seconds before its
+final release-pipeline test completed, leaving inadequate headroom on
+`ubuntu-slim` for checkout, setup, candidate materialization, packaging, and
+upload. The privileged `publish` job also retains `ubuntu-24.04` with its
+existing 30-minute timeout.
 
 Only `publish` binds the `marketplace-production` Environment. Despite its
 historical name, this is the production publication-credential and approval

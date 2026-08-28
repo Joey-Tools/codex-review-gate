@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -27,8 +28,10 @@ import {
   DEFAULT_VERIFIER_RUN_NAME_PREFIX,
   DEFAULT_WORKFLOW_PATH,
   LEGACY_STATUS_CONTEXT,
+  assertCompleteRulesetApiObject,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
+  canonicalLegacyReviewGateInventoryBytes,
   buildUpdateRulesetPayload,
   codeownersHasEffectiveUnmanagedPatterns,
   decodeGitHubBlobContent,
@@ -91,6 +94,13 @@ const CANARY_WORKFLOW_ID = 17;
 const CANARY_JOB_ID = 18017;
 const CANARY_CHECK_RUN_ID = 28017;
 const CANARY_MERGE_SHA = "fedcba9876543210fedcba9876543210fedcba98";
+const EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS = Object.freeze({
+  strict: true,
+  contexts: [],
+  checks: [],
+});
+const EXPECTED_LEGACY_INVENTORY_FIXTURE_KEY =
+  "__test_expected_legacy_inventory_approval";
 
 test("builds a disabled complete default-branch ruleset payload", () => {
   const payload = buildCreateRulesetPayload();
@@ -397,7 +407,7 @@ test("requires explicit empty bypass actors and repairs missing or malformed val
   const complete = {
     name: "Must Pass Codex Review",
     target: "branch",
-    enforcement: "active",
+    enforcement: "evaluate",
     conditions: {
       ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] },
     },
@@ -456,6 +466,23 @@ test("detects effective rulesets with the codex status context", () => {
   };
 
   assert.equal(rulesetHasRequiredStatusContext(inheritedRuleset), true);
+  assert.equal(
+    rulesetHasRequiredStatusContext(
+      {
+        rules: [
+          {
+            type: "required_status_checks",
+            parameters: {
+              required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+            },
+          },
+        ],
+      },
+      LEGACY_STATUS_CONTEXT,
+      { integrationId: undefined },
+    ),
+    true,
+  );
   assert.equal(
     rulesetHasRequiredStatusContext(inheritedRuleset, DEFAULT_STATUS_CONTEXT, {
       integrationId: null,
@@ -815,7 +842,7 @@ test("preserves an existing complete active v2 ruleset by default", () => {
   assert.equal(payload.enforcement, "active");
 });
 
-test("removes a same-ruleset legacy status without downgrading complete active v2", () => {
+test("preserves a same-ruleset legacy status in a complete active v2 payload", () => {
   const completeRules = ensureGatePolicyInRules([]).rules;
   const statusRule = completeRules.find(
     (rule) => rule.type === "required_status_checks",
@@ -838,20 +865,84 @@ test("removes a same-ruleset legacy status without downgrading complete active v
     rules: completeRules,
   });
 
-  assert.equal(changed, true);
+  assert.equal(changed, false);
   assert.equal(payload.enforcement, "active");
   assert.equal(
     requiredStatusCheckContexts(payload).includes(LEGACY_STATUS_CONTEXT),
-    false,
+    true,
   );
   assert.equal(rulesetHasGatePolicy(payload), true);
 });
 
-test("stages an existing incomplete active ruleset as disabled by default", () => {
+test("refuses to disable existing active legacy or incomplete rulesets during v2 staging", () => {
+  const candidates = [
+    {
+      conditions: {
+        ref_name: {
+          include: ["~DEFAULT_BRANCH"],
+          exclude: [],
+        },
+      },
+      rules: [
+        {
+          type: "required_status_checks",
+          parameters: {
+            strict_required_status_checks_policy: false,
+            required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+          },
+        },
+      ],
+    },
+    {
+      conditions: {
+        ref_name: {
+          include: ["~DEFAULT_BRANCH"],
+          exclude: [],
+        },
+      },
+      rules: [
+        {
+          type: "required_status_checks",
+          parameters: {
+            strict_required_status_checks_policy: true,
+            required_status_checks: [{ context: "ci/test" }],
+          },
+        },
+      ],
+    },
+    {
+      conditions: {
+        ref_name: {
+          include: ["release/*"],
+          exclude: [],
+        },
+      },
+      rules: ensureGatePolicyInRules([]).rules,
+    },
+  ];
+
+  for (const candidate of candidates) {
+    assert.throws(
+      () =>
+        buildUpdateRulesetPayload({
+          name: "Must Pass Codex Review",
+          target: "branch",
+          enforcement: "active",
+          ...candidate,
+        }, {
+          defaultBranch: "master",
+        }),
+      /active legacy or incomplete gate.*distinct --ruleset-name/u,
+    );
+  }
+});
+
+test("repairs a disabled legacy-only ruleset into a complete disabled v2 stage", () => {
   const { changed, payload } = buildUpdateRulesetPayload({
     name: "Must Pass Codex Review",
     target: "branch",
-    enforcement: "active",
+    enforcement: "disabled",
+    bypass_actors: [],
     conditions: {
       ref_name: {
         include: ["~DEFAULT_BRANCH"],
@@ -867,11 +958,17 @@ test("stages an existing incomplete active ruleset as disabled by default", () =
         },
       },
     ],
+  }, {
+    defaultBranch: "master",
   });
 
   assert.equal(changed, true);
   assert.equal(payload.enforcement, "disabled");
   assert.equal(rulesetHasGatePolicy(payload), true);
+  assert.equal(
+    requiredStatusCheckContexts(payload).includes(LEGACY_STATUS_CONTEXT),
+    false,
+  );
 });
 
 test("refuses to rewrite non-branch rulesets as branch rulesets", () => {
@@ -939,7 +1036,7 @@ test("removes default branch exclusions when extending same-name rulesets", () =
     {
       name: "Must Pass Codex Review",
       target: "branch",
-      enforcement: "active",
+      enforcement: "evaluate",
       conditions: {
         ref_name: {
           include: ["release/*"],
@@ -981,7 +1078,7 @@ test("refuses to broaden non-exact default branch exclusions", () => {
         {
           name: "Must Pass Codex Review",
           target: "branch",
-          enforcement: "active",
+          enforcement: "evaluate",
           conditions: {
             ref_name: {
               include: ["~ALL"],
@@ -1015,7 +1112,7 @@ test("preserves broader same-name ruleset branch coverage", () => {
     {
       name: "Must Pass Codex Review",
       target: "branch",
-      enforcement: "active",
+      enforcement: "evaluate",
       conditions: {
         ref_name: {
           include: ["~ALL"],
@@ -2380,7 +2477,294 @@ test("remote bootstrap binds every gh api request to github.com despite hostile 
   }
 });
 
-test("classic branch protection aggregates legacy contexts and fails closed", () => {
+test("remote staging refuses to disable a same-name active legacy ruleset", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const legacyRuleset = activeLegacyRulesetFixture(7, {
+      name: "Must Pass Codex Review",
+    });
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [legacyRuleset],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: legacyRuleset,
+    };
+    const result = runBootstrap(["--repo", repoSlug, "--apply"], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /active legacy or incomplete gate/u);
+    assert.match(result.stderr, /distinct --ruleset-name/u);
+    assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("remote staging refuses to disable a same-name active incomplete non-legacy ruleset", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const incompleteRuleset = {
+      ...activeLegacyRulesetFixture(7, {
+        name: "Must Pass Codex Review",
+      }),
+      rules: [
+        {
+          type: "required_status_checks",
+          parameters: {
+            strict_required_status_checks_policy: true,
+            required_status_checks: [{ context: "ci/test" }],
+          },
+        },
+      ],
+    };
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [incompleteRuleset],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: incompleteRuleset,
+    };
+    const result = runBootstrap(["--repo", repoSlug, "--apply"], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /active legacy or incomplete gate/u);
+    assert.match(result.stderr, /distinct --ruleset-name/u);
+    assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("stages a distinct disabled v2 ruleset while a legacy ruleset remains active", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const legacyRuleset = activeLegacyRulesetFixture(7);
+    const disabledV2 = {
+      ...completeDisabledRulesetFixture(8),
+      name: v2RulesetName,
+    };
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [legacyRuleset],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: legacyRuleset,
+      [`POST repos/${repoSlug}/rulesets`]: { id: 8, name: v2RulesetName },
+      [`GET repos/${repoSlug}/rulesets/8`]: disabledV2,
+    };
+    const result = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--ruleset-name",
+      v2RulesetName,
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Fail-closed migration overlap/u);
+    assert.match(result.stdout, /Created ruleset/u);
+    const calls = readFileSync(callLog, "utf8");
+    assert.match(calls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy ruleset disappearance or policy drift before staging prevents every write", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const [name, mutateEffectiveRules] of [
+      ["disappeared", () => [[]]],
+      ["policy-drift", (pages) => {
+        const drifted = structuredClone(pages);
+        drifted[0][0].parameters.strict_required_status_checks_policy = false;
+        return drifted;
+      }],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const stateDir = join(fixtureRoot, `${name}-state`);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const legacyRuleset = activeLegacyRulesetFixture(7);
+      const effectiveRulePages = [[
+        effectiveLegacyRequiredStatusChecksRule(legacyRuleset),
+      ]];
+      const legacyInventory = legacyInventoryResponseFixtures(repoSlug, {
+        effectiveRulePages,
+        rulesets: [legacyRuleset],
+      });
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        ...legacyInventory.responses,
+        [`GET repos/${repoSlug}/rules/branches/master?per_page=100`]: {
+          __fake_sequence: [
+            effectiveRulePages,
+            mutateEffectiveRules(effectiveRulePages),
+          ],
+        },
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [legacyRuleset],
+        ],
+        [`POST repos/${repoSlug}/rulesets`]: { id: 8 },
+      };
+      const result = runBootstrap([
+        "--repo",
+        repoSlug,
+        "--ruleset-name",
+        "Must Pass Codex Review v2",
+        "--apply",
+      ], {
+        env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+      });
+
+      assert.equal(result.status, 1, name);
+      assert.match(
+        result.stderr,
+        /canonical legacy review-gate inventory digest mismatched.*ruleset pre-write readback/iu,
+        name,
+      );
+      assert.doesNotMatch(
+        readFileSync(callLog, "utf8"),
+        /^(?:POST|PUT) /mu,
+        name,
+      );
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy ruleset drift after staging prevents a completion report", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const legacyRuleset = activeLegacyRulesetFixture(7);
+    const effectiveRulePages = [[
+      effectiveLegacyRequiredStatusChecksRule(legacyRuleset),
+    ]];
+    const legacyInventory = legacyInventoryResponseFixtures(repoSlug, {
+      effectiveRulePages,
+      rulesets: [legacyRuleset],
+    });
+    const disabledV2 = {
+      ...completeDisabledRulesetFixture(8),
+      name: v2RulesetName,
+    };
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...legacyInventory.responses,
+      [`GET repos/${repoSlug}/rules/branches/master?per_page=100`]: {
+        __fake_sequence: [effectiveRulePages, effectiveRulePages, [[]]],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [legacyRuleset],
+      ],
+      [`POST repos/${repoSlug}/rulesets`]: { id: 8, name: v2RulesetName },
+      [`GET repos/${repoSlug}/rulesets/8`]: disabledV2,
+    };
+    const result = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--ruleset-name",
+      v2RulesetName,
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /write completed.*canonical legacy review-gate inventory digest mismatched.*post-write readback/iu,
+    );
+    const calls = readFileSync(callLog, "utf8");
+    assert.match(calls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
+    assert.doesNotMatch(result.stdout, /Created ruleset/u);
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("stages a disabled v2 ruleset while classic legacy protection remains active", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const disabledV2 = completeDisabledRulesetFixture(7);
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [`repos/${repoSlug}/branches/master/protection`]: {
+        required_status_checks: {
+          strict: true,
+          contexts: [LEGACY_STATUS_CONTEXT],
+          checks: [],
+        },
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
+      [`POST repos/${repoSlug}/rulesets`]: {
+        id: 7,
+        name: "Must Pass Codex Review",
+      },
+      [`GET repos/${repoSlug}/rulesets/7`]: disabledV2,
+    };
+    const result = runBootstrap(["--repo", repoSlug, "--apply"], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Created ruleset/u);
+    assert.match(
+      readFileSync(callLog, "utf8"),
+      new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"),
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("classic branch protection aggregates legacy contexts and permits migration overlap", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
   const endpoint =
@@ -2396,8 +2780,8 @@ test("classic branch protection aggregates legacy contexts and fails closed", ()
             checks: [],
           },
         },
-        1,
-        /codex\/review-gate is still required by classic branch protection/u,
+        0,
+        /Dry run: would create repository ruleset/u,
       ],
       [
         "legacy-check",
@@ -2408,8 +2792,8 @@ test("classic branch protection aggregates legacy contexts and fails closed", ()
             checks: [{ context: LEGACY_STATUS_CONTEXT, app_id: 15368 }],
           },
         },
-        1,
-        /codex\/review-gate is still required by classic branch protection/u,
+        0,
+        /Dry run: would create repository ruleset/u,
       ],
       [
         "malformed",
@@ -2511,7 +2895,7 @@ test("classic legacy protection appearing during staging prevents every write", 
             required_status_checks: {
               strict: true,
               contexts: [],
-              checks: [{ context: LEGACY_STATUS_CONTEXT }],
+              checks: [{ context: LEGACY_STATUS_CONTEXT, app_id: null }],
             },
           },
         ],
@@ -2523,7 +2907,7 @@ test("classic legacy protection appearing during staging prevents every write", 
       env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
     });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /classic branch protection/u);
+    assert.match(result.stderr, /classic legacy-gate overlap/u);
     assert.doesNotMatch(
       readFileSync(callLog, "utf8"),
       new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"),
@@ -2533,7 +2917,7 @@ test("classic legacy protection appearing during staging prevents every write", 
   }
 });
 
-test("classic endpoint presence and unrelated policy drift do not freeze staging", () => {
+test("classic required status policy drift before staging prevents every write", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const fakeBin = join(fixtureRoot, "bin");
   const stateDir = join(fixtureRoot, "state");
@@ -2570,12 +2954,245 @@ test("classic endpoint presence and unrelated policy drift do not freeze staging
     const result = runBootstrap(["--repo", repoSlug, "--apply"], {
       env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
     });
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /Created ruleset/u);
-    assert.match(
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /classic legacy-gate overlap/u);
+    assert.doesNotMatch(
       readFileSync(callLog, "utf8"),
       new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"),
     );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("activates a distinct v2 ruleset while a separate legacy ruleset remains active", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const validPullRequest = canaryPullRequestFixture(repoSlug, CANARY_HEAD_SHA);
+    const legacyRuleset = activeLegacyRulesetFixture(7);
+    const disabledV2 = {
+      ...completeDisabledRulesetFixture(8),
+      name: v2RulesetName,
+    };
+    const activeV2 = {
+      ...completeActiveRulesetFixture(8),
+      name: v2RulesetName,
+    };
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canaryRunResponses(repoSlug),
+      [`GET repos/${repoSlug}/pulls/7`]: {
+        __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [legacyRuleset, disabledV2],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: legacyRuleset,
+      [`GET repos/${repoSlug}/rulesets/8`]: {
+        __fake_sequence: [
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          activeV2,
+          activeV2,
+        ],
+      },
+      [`PUT repos/${repoSlug}/rulesets/8`]: { id: 8, name: v2RulesetName },
+    };
+    const result = runBootstrap([
+      ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+      "--ruleset-name",
+      v2RulesetName,
+    ], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Fail-closed migration overlap/u);
+    assert.match(result.stdout, /Ruleset readback: Must Pass Codex Review v2/u);
+    const calls = readFileSync(callLog, "utf8");
+    assert.match(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy ruleset disappearance at the activation write boundary prevents PUT", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const validPullRequest = canaryPullRequestFixture(repoSlug, CANARY_HEAD_SHA);
+    const legacyRuleset = activeLegacyRulesetFixture(7);
+    const effectiveRulePages = [[
+      effectiveLegacyRequiredStatusChecksRule(legacyRuleset),
+    ]];
+    const legacyInventory = legacyInventoryResponseFixtures(repoSlug, {
+      effectiveRulePages,
+      rulesets: [legacyRuleset],
+    });
+    const disabledV2 = {
+      ...completeDisabledRulesetFixture(8),
+      name: v2RulesetName,
+    };
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canaryRunResponses(repoSlug),
+      ...legacyInventory.responses,
+      [`GET repos/${repoSlug}/rules/branches/master?per_page=100`]: {
+        __fake_sequence: [effectiveRulePages, effectiveRulePages, [[]]],
+      },
+      [`GET repos/${repoSlug}/pulls/7`]: {
+        __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [legacyRuleset, disabledV2],
+      ],
+      [`GET repos/${repoSlug}/rulesets/8`]: disabledV2,
+      [`PUT repos/${repoSlug}/rulesets/8`]: { id: 8, name: v2RulesetName },
+    };
+    const result = runBootstrap([
+      ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+      "--ruleset-name",
+      v2RulesetName,
+    ], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /canonical legacy review-gate inventory digest mismatched.*final ruleset pre-write readback/iu,
+    );
+    const calls = readFileSync(callLog, "utf8");
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("activates v2 while classic legacy protection remains active and stable", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const validPullRequest = canaryPullRequestFixture(repoSlug, CANARY_HEAD_SHA);
+    const disabledV2 = completeDisabledRulesetFixture(7);
+    const activeV2 = completeActiveRulesetFixture(7);
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canaryRunResponses(repoSlug),
+      [`repos/${repoSlug}/branches/master/protection`]: {
+        required_status_checks: {
+          strict: true,
+          contexts: [LEGACY_STATUS_CONTEXT],
+          checks: [],
+        },
+      },
+      [`GET repos/${repoSlug}/pulls/7`]: {
+        __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [disabledV2],
+      ],
+      [`GET repos/${repoSlug}/rulesets/7`]: {
+        __fake_sequence: [
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          activeV2,
+          activeV2,
+        ],
+      },
+      [`PUT repos/${repoSlug}/rulesets/7`]: {
+        id: 7,
+        name: "Must Pass Codex Review",
+      },
+    };
+    const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /classic branch protection continues to require/u);
+    assert.match(result.stdout, /Ruleset readback: Must Pass Codex Review/u);
+    assert.match(
+      readFileSync(callLog, "utf8"),
+      new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"),
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("a failed canary leaves the active legacy ruleset untouched", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const legacyRuleset = activeLegacyRulesetFixture(7);
+    const disabledV2 = {
+      ...completeDisabledRulesetFixture(8),
+      name: v2RulesetName,
+    };
+    const failedCheckRun = {
+      ...canonicalCanaryCheckRunFixture(repoSlug),
+      conclusion: "failure",
+    };
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canaryRunResponses(repoSlug),
+      [`repos/${repoSlug}/pulls/7`]: canaryPullRequestFixture(
+        repoSlug,
+        CANARY_HEAD_SHA,
+      ),
+      [`repos/${repoSlug}/commits/${CANARY_HEAD_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: [
+        { total_count: 1, check_runs: [failedCheckRun] },
+      ],
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [legacyRuleset, disabledV2],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: legacyRuleset,
+      [`repos/${repoSlug}/rulesets/8`]: disabledV2,
+    };
+    const result = runBootstrap([
+      ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+      "--ruleset-name",
+      v2RulesetName,
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /not a successful native GitHub Actions CheckRun/u);
+    assert.doesNotMatch(readFileSync(callLog, "utf8"), /^PUT /mu);
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -2709,6 +3326,7 @@ test("plain remote apply does not downgrade a complete active v2 ruleset", () =>
       id: 7,
       name: "Must Pass Codex Review",
       source_type: "Repository",
+      source: repoSlug,
       target: "branch",
       enforcement: "active",
       bypass_actors: [],
@@ -2775,7 +3393,7 @@ test("activation requires a staged disabled repository ruleset and preserves act
           },
         ],
         1,
-        /must be exactly read back as disabled before --activate/u,
+        /active legacy or incomplete gate.*distinct --ruleset-name/u,
       ],
       [
         "disabled-incomplete",
@@ -2867,10 +3485,22 @@ test("activation does not treat bypassable or unreadable rulesets as equivalent 
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
   try {
-    for (const [name, bypassActors] of [
-      ["non-empty", [{ actor_id: 7, actor_type: "Team", bypass_mode: "always" }]],
-      ["missing", undefined],
-      ["malformed", {}],
+    for (const [name, bypassActors, expected] of [
+      [
+        "non-empty",
+        [{ actor_id: 7, actor_type: "Team", bypass_mode: "always" }],
+        /will not silently broaden approval policy/u,
+      ],
+      [
+        "missing",
+        undefined,
+        /Full ruleset API readback is malformed/u,
+      ],
+      [
+        "malformed",
+        {},
+        /Full ruleset API readback is malformed/u,
+      ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
       const callLog = join(fixtureRoot, `${name}.log`);
@@ -2912,7 +3542,7 @@ test("activation does not treat bypassable or unreadable rulesets as equivalent 
       assert.equal(result.status, 1, `${name}: ${result.stderr}`);
       assert.match(
         result.stderr,
-        /will not silently broaden approval policy/u,
+        expected,
         name,
       );
       const calls = readFileSync(callLog, "utf8");
@@ -3374,7 +4004,7 @@ test("ruleset update refuses a lost-update overwrite after a fresh full read", (
   const repoSlug = "Joey-Tools/consumer";
   try {
     createFakeGhExecutable(fakeBin);
-    const initial = completeActiveRulesetFixture(7);
+    const initial = completeDisabledRulesetFixture(7);
     initial.rules = initial.rules.filter((rule) => rule.type !== "pull_request");
     const drifted = structuredClone(initial);
     drifted.conditions.ref_name.exclude = ["refs/heads/release-freeze"];
@@ -3399,39 +4029,48 @@ test("ruleset update refuses a lost-update overwrite after a fresh full read", (
   }
 });
 
-test("an active ruleset PUT cannot bypass the activation canary contract", () => {
+test("a complete active v2 ruleset preserves same-ruleset legacy without PUT", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
-  const fakeBin = join(fixtureRoot, "bin");
-  const callLog = join(fixtureRoot, "calls.log");
   const repoSlug = "Joey-Tools/consumer";
   try {
-    createFakeGhExecutable(fakeBin);
     const activeWithLegacy = completeActiveRulesetFixture(7);
     activeWithLegacy.rules
       .find((rule) => rule.type === "required_status_checks")
       .parameters.required_status_checks.push({ context: LEGACY_STATUS_CONTEXT });
-    const responses = {
-      ...canonicalRemoteWorkflowResponses(repoSlug),
-      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
-        [activeWithLegacy],
-      ],
-      [`repos/${repoSlug}/rulesets/7`]: activeWithLegacy,
-      [`PUT repos/${repoSlug}/rulesets/7`]: activeWithLegacy,
-    };
-    const result = runBootstrap(["--repo", repoSlug, "--apply"], {
-      env: {
-        ...process.env,
-        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
-        FAKE_GH_RESPONSES: JSON.stringify(responses),
-        FAKE_GH_CALL_LOG: callLog,
-      },
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /active ruleset update requires --activate/u);
-    assert.doesNotMatch(
-      readFileSync(callLog, "utf8"),
-      new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"),
-    );
+    for (const [name, args] of [
+      ["plain", ["--repo", repoSlug, "--apply"]],
+      ["activate", activationArguments(repoSlug, CANARY_HEAD_SHA)],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [activeWithLegacy],
+        ],
+        [`repos/${repoSlug}/rulesets/7`]: activeWithLegacy,
+        [`PUT repos/${repoSlug}/rulesets/7`]: activeWithLegacy,
+      };
+      const result = runBootstrap(args, {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, 0, `${name}: ${result.stderr}`);
+      assert.match(result.stdout, /No cleanup: codex\/review-gate remains required/u, name);
+      assert.match(result.stdout, /No change/u, name);
+      const calls = readFileSync(callLog, "utf8");
+      assert.doesNotMatch(
+        calls,
+        new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"),
+        name,
+      );
+      assert.doesNotMatch(calls, new RegExp(`^GET repos/${repoSlug}/pulls/7$`, "mu"), name);
+    }
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -3449,6 +4088,8 @@ test("activation update refuses default-branch and workflow drift between securi
         (responses) => {
           responses[`repos/${repoSlug}`] = {
             __fake_sequence: [
+              repositoryMetadataFixture(repoSlug),
+              repositoryMetadataFixture(repoSlug),
               repositoryMetadataFixture(repoSlug),
               repositoryMetadataFixture(repoSlug, { default_branch: "main" }),
             ],
@@ -3578,12 +4219,24 @@ test("activation fails closed when post-update ruleset readback drifts", () => {
       .find((rule) => rule.type === "pull_request")
       .parameters.future_unreviewed_field = true;
 
-    for (const [name, readback] of [
-      ["inactive", { ...complete, enforcement: "disabled" }],
-      ["wrong-branch", releaseOnly],
-      ["missing-bypass", missingBypass],
-      ["wrong-source", wrongSource],
-      ["unknown-server-expansion", unknownServerExpansion],
+    for (const [name, readback, expected] of [
+      [
+        "inactive",
+        { ...complete, enforcement: "disabled" },
+        /Ruleset readback for id 7 is incomplete/u,
+      ],
+      ["wrong-branch", releaseOnly, /Ruleset readback for id 7 is incomplete/u],
+      [
+        "missing-bypass",
+        missingBypass,
+        /Full ruleset API readback is malformed/u,
+      ],
+      ["wrong-source", wrongSource, /Ruleset readback for id 7 is incomplete/u],
+      [
+        "unknown-server-expansion",
+        unknownServerExpansion,
+        /Ruleset readback for id 7 is incomplete/u,
+      ],
     ]) {
       const stateDir = join(fixtureRoot, `state-${name}`);
       const callLog = join(fixtureRoot, `calls-${name}.log`);
@@ -3592,14 +4245,21 @@ test("activation fails closed when post-update ruleset readback drifts", () => {
         ...canonicalRemoteWorkflowResponses(repoSlug),
         ...canaryRunResponses(repoSlug),
         [`GET repos/${repoSlug}/pulls/7`]: {
-          __fake_sequence: [validPullRequest, validPullRequest],
+          __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
         },
         [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
           [disabled],
         ],
         [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
         [`GET repos/${repoSlug}/rulesets/7`]: {
-          __fake_sequence: [disabled, disabled, disabled, disabled, readback],
+          __fake_sequence: [
+            disabled,
+            disabled,
+            disabled,
+            disabled,
+            disabled,
+            readback,
+          ],
         },
       };
 
@@ -3608,10 +4268,11 @@ test("activation fails closed when post-update ruleset readback drifts", () => {
       });
 
       assert.equal(result.status, 1, `${name}: ${result.stderr}`);
-      assert.match(result.stderr, /Ruleset readback for id 7 is incomplete/u);
+      assert.match(result.stderr, expected);
       const calls = readFileSync(callLog, "utf8");
       assert.match(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
       assert.match(calls, new RegExp(`^GET repos/${repoSlug}/rulesets/7$`, "mu"));
+      assert.doesNotMatch(result.stdout, /Updated ruleset/u);
       assert.ok(
         calls.indexOf(`PUT repos/${repoSlug}/rulesets/7`) <
           calls.lastIndexOf(`GET repos/${repoSlug}/rulesets/7`),
@@ -3638,7 +4299,7 @@ test("activation reads only the current feature-head CheckRun and succeeds after
       ...canonicalRemoteWorkflowResponses(repoSlug),
       ...canaryRunResponses(repoSlug),
       [`GET repos/${repoSlug}/pulls/7`]: {
-        __fake_sequence: [validPullRequest, validPullRequest],
+        __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
       },
       [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
         [disabled],
@@ -3648,7 +4309,15 @@ test("activation reads only the current feature-head CheckRun and succeeds after
         name: "Must Pass Codex Review",
       },
       [`GET repos/${repoSlug}/rulesets/7`]: {
-        __fake_sequence: [disabled, disabled, disabled, disabled, active],
+        __fake_sequence: [
+          disabled,
+          disabled,
+          disabled,
+          disabled,
+          disabled,
+          active,
+          active,
+        ],
       },
     };
 
@@ -3661,14 +4330,14 @@ test("activation reads only the current feature-head CheckRun and succeeds after
     const calls = readFileSync(callLog, "utf8");
     assert.equal(
       countLines(calls, `GET repos/${repoSlug}/pulls/7`),
-      2,
+      3,
     );
     assert.equal(
       countLines(
         calls,
         `GET repos/${repoSlug}/commits/${headSha}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`,
       ),
-      2,
+      3,
     );
     assert.equal(
       countLines(
@@ -3677,6 +4346,943 @@ test("activation reads only the current feature-head CheckRun and succeeds after
       ),
       0,
     );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("remote digest admission rejects missing, malformed, and mismatching approvals before writes", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
+    };
+    assert.notEqual(
+      legacyInventoryResponseFixtures(repoSlug).approval.sha256,
+      legacyInventoryResponseFixtures("Joey-Tools/other-consumer").approval.sha256,
+    );
+    assert.notEqual(
+      legacyInventoryResponseFixtures(repoSlug).approval.sha256,
+      legacyInventoryResponseFixtures(repoSlug, { defaultBranch: "main" }).approval
+        .sha256,
+    );
+
+    for (const [name, args, expected] of [
+      [
+        "missing",
+        ["--repo", repoSlug],
+        /requires --expected-legacy-inventory-sha256/u,
+      ],
+      [
+        "malformed-uppercase",
+        [
+          "--repo",
+          repoSlug,
+          "--expected-legacy-inventory-sha256",
+          "A".repeat(64),
+        ],
+        /exact lowercase 64-hex SHA-256/u,
+      ],
+      [
+        "mismatch",
+        [
+          "--repo",
+          repoSlug,
+          "--expected-legacy-inventory-sha256",
+          "0".repeat(64),
+        ],
+        /canonical legacy review-gate inventory digest mismatched.*initial approval-snapshot readback/iu,
+      ],
+    ]) {
+      const callLog = join(fixtureRoot, `${name}.log`);
+      const result = runBootstrap(args, {
+        addExpectedLegacyInventoryDigest: false,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, 1, name);
+      assert.match(result.stderr, expected, name);
+      const calls = existsSync(callLog) ? readFileSync(callLog, "utf8") : "";
+      assert.doesNotMatch(calls, /^(?:POST|PUT) /mu, name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("independent staging and activation runs preserve stable legacy and greenfield inventories", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    for (const [name, legacyRulesets] of [
+      ["greenfield", []],
+      ["stable-legacy", [activeLegacyRulesetFixture(7)]],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const stateDir = join(fixtureRoot, `${name}-state`);
+      const stageLog = join(fixtureRoot, `${name}-stage.log`);
+      const activationLog = join(fixtureRoot, `${name}-activation.log`);
+      createFakeGhExecutable(fakeBin);
+      const migration = stageThenActivationResponseFixtures({
+        repoSlug,
+        legacyRulesets,
+        v2RulesetName,
+      });
+
+      const stage = runBootstrap([
+        "--repo",
+        repoSlug,
+        "--ruleset-name",
+        v2RulesetName,
+        "--apply",
+      ], {
+        env: fakeGhEnvironment({
+          fakeBin,
+          responses: migration.responses,
+          stateDir,
+          callLog: stageLog,
+        }),
+      });
+      assert.equal(stage.status, 0, `${name} stage: ${stage.stderr}`);
+      assert.match(stage.stdout, /Created ruleset/u, name);
+
+      const activation = runBootstrap([
+        ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+        "--ruleset-name",
+        v2RulesetName,
+      ], {
+        env: fakeGhEnvironment({
+          fakeBin,
+          responses: migration.responses,
+          stateDir,
+          callLog: activationLog,
+        }),
+      });
+      assert.equal(
+        activation.status,
+        0,
+        `${name} activation: ${activation.stderr}`,
+      );
+      assert.match(activation.stdout, /Updated ruleset/u, name);
+
+      const inventoryEndpoint =
+        `GET repos/${repoSlug}/rules/branches/master?per_page=100`;
+      const stageCalls = readFileSync(stageLog, "utf8");
+      const activationCalls = readFileSync(activationLog, "utf8");
+      assert.equal(countLines(stageCalls, inventoryEndpoint), 3, name);
+      assert.equal(countLines(activationCalls, inventoryEndpoint), 4, name);
+      assert.match(stageCalls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
+      assert.doesNotMatch(stageCalls, /^PUT /mu, name);
+      assert.match(
+        activationCalls,
+        new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"),
+      );
+      assert.doesNotMatch(activationCalls, /^POST /mu, name);
+      const activationLines = activationCalls.trimEnd().split("\n");
+      const finalCanaryJobs = activationLines.lastIndexOf(
+        `GET repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}/attempts/1/jobs?per_page=100`,
+      );
+      const finalSecurityRepository = activationLines.indexOf(
+        `GET repos/${repoSlug}`,
+        finalCanaryJobs + 1,
+      );
+      const finalSecurityProtection = activationLines.indexOf(
+        `GET repos/${repoSlug}/branches/master/protection`,
+        finalSecurityRepository + 1,
+      );
+      const putIndex = activationLines.indexOf(
+        `PUT repos/${repoSlug}/rulesets/8`,
+      );
+      const finalTargetRead = activationLines.lastIndexOf(
+        `GET repos/${repoSlug}/rulesets/8`,
+        putIndex - 1,
+      );
+      assert.ok(
+        finalCanaryJobs !== -1 &&
+          finalCanaryJobs < finalSecurityRepository &&
+          finalSecurityRepository < finalSecurityProtection &&
+          finalSecurityProtection < finalTargetRead &&
+          finalTargetRead < putIndex,
+        `${name}: final canary, security, target, and PUT order drifted`,
+      );
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("independent activation rejects approved legacy inventory disappearance, subset, classic drift, and incomplete schema", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  const legacyA = activeLegacyRulesetFixture(7, { name: "Legacy A" });
+  const legacyB = activeLegacyRulesetFixture(9, { name: "Legacy B" });
+  const classicLegacy = {
+    strict: true,
+    contexts: [],
+    checks: [{ context: LEGACY_STATUS_CONTEXT, app_id: 15368 }],
+  };
+  try {
+    for (const scenario of [
+      {
+        name: "ruleset-disappeared",
+        legacyRulesets: [legacyA],
+        configure(migration) {
+          return {
+            [`GET repos/${repoSlug}/rules/branches/master?per_page=100`]: {
+              __fake_sequence: [
+                migration.effectiveRulePages,
+                migration.effectiveRulePages,
+                migration.effectiveRulePages,
+                [[]],
+              ],
+            },
+          };
+        },
+      },
+      {
+        name: "two-ruleset-baseline-lost-one",
+        legacyRulesets: [legacyA, legacyB],
+        configure(migration) {
+          return {
+            [`GET repos/${repoSlug}/rules/branches/master?per_page=100`]: {
+              __fake_sequence: [
+                migration.effectiveRulePages,
+                migration.effectiveRulePages,
+                migration.effectiveRulePages,
+                [[migration.effectiveRulePages[0][0]]],
+              ],
+            },
+          };
+        },
+      },
+      {
+        name: "classic-disappeared",
+        classicRequiredStatusChecks: classicLegacy,
+        configure(migration) {
+          return classicDriftSequences({
+            repoSlug,
+            baseline: classicLegacy,
+            drifted: null,
+            parentBaseline: migration.parentProtection,
+          });
+        },
+      },
+      {
+        name: "classic-app-id-drift",
+        classicRequiredStatusChecks: classicLegacy,
+        configure(migration) {
+          const drifted = structuredClone(classicLegacy);
+          drifted.checks[0].app_id = null;
+          return classicDriftSequences({
+            repoSlug,
+            baseline: classicLegacy,
+            drifted,
+            parentBaseline: migration.parentProtection,
+          });
+        },
+      },
+      {
+        name: "classic-strict-drift",
+        classicRequiredStatusChecks: classicLegacy,
+        configure(migration) {
+          const drifted = { ...classicLegacy, strict: false };
+          return classicDriftSequences({
+            repoSlug,
+            baseline: classicLegacy,
+            drifted,
+            parentBaseline: migration.parentProtection,
+          });
+        },
+      },
+      {
+        name: "incomplete-full-ruleset-schema",
+        legacyRulesets: [legacyA],
+        schemaInconclusive: true,
+        configure() {
+          const incomplete = structuredClone(legacyA);
+          delete incomplete.source;
+          return {
+            [`GET repos/${repoSlug}/rulesets/7`]: {
+              __fake_sequence: [
+                legacyA,
+                legacyA,
+                legacyA,
+                legacyA,
+                incomplete,
+              ],
+            },
+          };
+        },
+      },
+    ]) {
+      const fakeBin = join(fixtureRoot, scenario.name);
+      const stateDir = join(fixtureRoot, `${scenario.name}-state`);
+      const stageLog = join(fixtureRoot, `${scenario.name}-stage.log`);
+      const activationLog = join(
+        fixtureRoot,
+        `${scenario.name}-activation.log`,
+      );
+      createFakeGhExecutable(fakeBin);
+      const migration = stageThenActivationResponseFixtures({
+        repoSlug,
+        legacyRulesets: scenario.legacyRulesets ?? [],
+        classicRequiredStatusChecks:
+          scenario.classicRequiredStatusChecks ??
+          EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS,
+        v2RulesetName,
+      });
+      const responses = {
+        ...migration.responses,
+        ...scenario.configure(migration),
+      };
+
+      const stage = runBootstrap([
+        "--repo",
+        repoSlug,
+        "--ruleset-name",
+        v2RulesetName,
+        "--apply",
+      ], {
+        env: fakeGhEnvironment({
+          fakeBin,
+          responses,
+          stateDir,
+          callLog: stageLog,
+        }),
+      });
+      assert.equal(
+        stage.status,
+        0,
+        `${scenario.name} stage: ${stage.stderr}`,
+      );
+      assert.match(stage.stdout, /Created ruleset/u, scenario.name);
+
+      const activation = runBootstrap([
+        ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+        "--ruleset-name",
+        v2RulesetName,
+      ], {
+        env: fakeGhEnvironment({
+          fakeBin,
+          responses,
+          stateDir,
+          callLog: activationLog,
+        }),
+      });
+      assert.equal(activation.status, 1, scenario.name);
+      if (scenario.schemaInconclusive) {
+        assert.match(activation.stderr, /unreadable or schema-inconclusive/u);
+        assert.match(activation.stderr, /Full ruleset API readback is malformed/u);
+      } else {
+        assert.match(
+          activation.stderr,
+          /canonical legacy review-gate inventory digest mismatched.*initial approval-snapshot readback/iu,
+          scenario.name,
+        );
+      }
+      const activationCalls = readFileSync(activationLog, "utf8");
+      assert.doesNotMatch(activationCalls, /^(?:POST|PUT) /mu, scenario.name);
+      assert.doesNotMatch(activation.stdout, /Updated ruleset/u, scenario.name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("post-cleanup verification admission remains read-only and rejects the old digest", () => {
+  const repoSlug = "Joey-Tools/consumer";
+  for (const [name, args, expected] of [
+    [
+      "without-repo",
+      ["--verify-post-cleanup"],
+      /Choose exactly one mode/u,
+    ],
+    [
+      "prepare-worktree",
+      ["--prepare-worktree", "/tmp/consumer", "--verify-post-cleanup"],
+      /valid only with --repo/u,
+    ],
+    [
+      "apply",
+      ["--repo", repoSlug, "--verify-post-cleanup", "--apply"],
+      /read-only/u,
+    ],
+    [
+      "activate",
+      [
+        "--repo",
+        repoSlug,
+        "--verify-post-cleanup",
+        "--activate",
+        "--canary-pr",
+        "7",
+        "--canary-head",
+        CANARY_HEAD_SHA,
+      ],
+      /read-only/u,
+    ],
+    [
+      "canary-input",
+      ["--repo", repoSlug, "--verify-post-cleanup", "--canary-pr", "7"],
+      /read-only/u,
+    ],
+    [
+      "old-digest",
+      [
+        "--repo",
+        repoSlug,
+        "--verify-post-cleanup",
+        "--expected-legacy-inventory-sha256",
+        "0".repeat(64),
+      ],
+      /read-only.*pre-cleanup legacy digest/u,
+    ],
+  ]) {
+    const result = runBootstrap(args, {
+      addExpectedLegacyInventoryDigest: false,
+    });
+    assert.equal(result.status, 1, name);
+    assert.match(result.stderr, expected, name);
+  }
+});
+
+test("post-cleanup verification accepts empty legacy surfaces and unrelated classic checks", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const classicRequiredStatusChecks = {
+    strict: false,
+    contexts: ["lint"],
+    checks: [{ context: "build", app_id: 15368 }],
+  };
+  try {
+    createFakeGhExecutable(fakeBin);
+    const activeV2 = completeActiveRulesetFixture(7);
+    const inventory = legacyInventoryResponseFixtures(repoSlug, {
+      classicRequiredStatusChecks,
+    });
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...inventory.responses,
+      [`repos/${repoSlug}/branches/master/protection`]: {
+        required_status_checks: classicRequiredStatusChecks,
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [activeV2],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: activeV2,
+    };
+    const result = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--verify-post-cleanup",
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Post-cleanup verified/u);
+    assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("post-cleanup verification rejects legacy residuals and a non-active selected v2 gate", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const scenario of [
+      {
+        name: "ruleset-residual",
+        legacyRulesets: [activeLegacyRulesetFixture(9)],
+        selectedV2: completeActiveRulesetFixture(7),
+        expected: /codex\/review-gate remains required after cleanup/u,
+      },
+      {
+        name: "classic-residual",
+        classicRequiredStatusChecks: {
+          strict: true,
+          contexts: [LEGACY_STATUS_CONTEXT],
+          checks: [],
+        },
+        selectedV2: completeActiveRulesetFixture(7),
+        expected: /codex\/review-gate remains required after cleanup/u,
+      },
+      {
+        name: "disabled-v2",
+        selectedV2: completeDisabledRulesetFixture(7),
+        expected: /remain the complete Active v2 policy/u,
+      },
+    ]) {
+      const fakeBin = join(fixtureRoot, scenario.name);
+      const callLog = join(fixtureRoot, `${scenario.name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const legacyRulesets = scenario.legacyRulesets ?? [];
+      const classicRequiredStatusChecks =
+        scenario.classicRequiredStatusChecks ??
+        EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS;
+      const effectiveRulePages = [[
+        ...legacyRulesets.map(effectiveLegacyRequiredStatusChecksRule),
+      ]];
+      const inventory = legacyInventoryResponseFixtures(repoSlug, {
+        effectiveRulePages,
+        rulesets: legacyRulesets,
+        classicRequiredStatusChecks,
+      });
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        ...inventory.responses,
+        [`repos/${repoSlug}/branches/master/protection`]: {
+          required_status_checks: classicRequiredStatusChecks,
+        },
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[
+          ...legacyRulesets,
+          scenario.selectedV2,
+        ]],
+        [`repos/${repoSlug}/rulesets/7`]: scenario.selectedV2,
+      };
+      const result = runBootstrap([
+        "--repo",
+        repoSlug,
+        "--verify-post-cleanup",
+      ], {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+
+      assert.equal(result.status, 1, scenario.name);
+      assert.match(result.stderr, scenario.expected, scenario.name);
+      assert.doesNotMatch(
+        readFileSync(callLog, "utf8"),
+        /^(?:POST|PUT) /mu,
+        scenario.name,
+      );
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("approved canonical inventory rejects repository id or node replacement across independent runs", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    for (const [name, replacement] of [
+      ["repository-id", repositoryMetadataFixture(repoSlug, { id: 5678 })],
+      [
+        "repository-node-id",
+        repositoryMetadataFixture(repoSlug, { node_id: "R_kgDOReplacement" }),
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const stateDir = join(fixtureRoot, `${name}-state`);
+      const stageLog = join(fixtureRoot, `${name}-stage.log`);
+      const activationLog = join(fixtureRoot, `${name}-activation.log`);
+      createFakeGhExecutable(fakeBin);
+      const migration = stageThenActivationResponseFixtures({
+        repoSlug,
+        v2RulesetName,
+      });
+      const baseline = repositoryMetadataFixture(repoSlug);
+      const responses = {
+        ...migration.responses,
+        [`GET repos/${repoSlug}`]: {
+          __fake_sequence: [
+            ...Array.from({ length: 9 }, () => baseline),
+            replacement,
+            replacement,
+            replacement,
+          ],
+        },
+      };
+
+      const stage = runBootstrap([
+        "--repo",
+        repoSlug,
+        "--ruleset-name",
+        v2RulesetName,
+        "--apply",
+      ], {
+        env: fakeGhEnvironment({
+          fakeBin,
+          responses,
+          stateDir,
+          callLog: stageLog,
+        }),
+      });
+      assert.equal(stage.status, 0, `${name} stage: ${stage.stderr}`);
+      assert.match(stage.stdout, /Created ruleset/u, name);
+
+      const activation = runBootstrap([
+        ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+        "--ruleset-name",
+        v2RulesetName,
+      ], {
+        env: fakeGhEnvironment({
+          fakeBin,
+          responses,
+          stateDir,
+          callLog: activationLog,
+        }),
+      });
+      assert.equal(activation.status, 1, name);
+      assert.match(
+        activation.stderr,
+        /canonical legacy review-gate inventory digest mismatched.*initial approval-snapshot readback/iu,
+        name,
+      );
+      assert.doesNotMatch(
+        readFileSync(activationLog, "utf8"),
+        /^(?:POST|PUT) /mu,
+        name,
+      );
+      assert.doesNotMatch(activation.stdout, /Updated ruleset/u, name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("HTTP 200 null or empty classic status JSON cannot authorize activation or post-cleanup", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const [valueName, value, expected] of [
+      [
+        "null",
+        null,
+        /HTTP 200 with null JSON; only a verified 404 can prove that surface absent/u,
+      ],
+      [
+        "empty-object",
+        {},
+        /required_status_checks is malformed or incomplete/u,
+      ],
+    ]) {
+      for (const mode of ["activate", "verify-post-cleanup"]) {
+        const name = `${mode}-${valueName}`;
+        const fakeBin = join(fixtureRoot, name);
+        const callLog = join(fixtureRoot, `${name}.log`);
+        createFakeGhExecutable(fakeBin);
+        const selected = mode === "activate"
+          ? completeDisabledRulesetFixture(7)
+          : completeActiveRulesetFixture(7);
+        const responses = {
+          ...canonicalRemoteWorkflowResponses(repoSlug),
+          [`repos/${repoSlug}/branches/master/protection/required_status_checks`]:
+            value,
+          [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+            [selected],
+          ],
+          [`repos/${repoSlug}/rulesets/7`]: selected,
+          [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
+        };
+        const args = mode === "activate"
+          ? activationArguments(repoSlug, CANARY_HEAD_SHA)
+          : ["--repo", repoSlug, "--verify-post-cleanup"];
+        const result = runBootstrap(args, {
+          env: {
+            ...process.env,
+            PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+            FAKE_GH_RESPONSES: JSON.stringify(responses),
+            FAKE_GH_CALL_LOG: callLog,
+          },
+        });
+
+        assert.equal(result.status, 1, name);
+        assert.match(result.stderr, expected, name);
+        const calls = readFileSync(callLog, "utf8");
+        assert.doesNotMatch(calls, /^PUT /mu, name);
+        assert.doesNotMatch(result.stdout, /Post-cleanup verified/u, name);
+      }
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("duplicate required-status rules cannot compose one complete gate or reach PUT", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    const duplicate = completeDisabledRulesetFixture(7);
+    const statusRuleIndex = duplicate.rules.findIndex(
+      (rule) => rule.type === "required_status_checks",
+    );
+    duplicate.rules.splice(
+      statusRuleIndex,
+      1,
+      {
+        type: "required_status_checks",
+        parameters: {
+          strict_required_status_checks_policy: true,
+          required_status_checks: [{ context: "ci/unbound-strict" }],
+        },
+      },
+      {
+        type: "required_status_checks",
+        parameters: {
+          strict_required_status_checks_policy: false,
+          required_status_checks: [{
+            context: DEFAULT_STATUS_CONTEXT,
+            integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+          }],
+        },
+      },
+    );
+
+    assert.equal(rulesetHasGatePolicy(duplicate), false);
+    assert.throws(
+      () => assertCompleteRulesetApiObject(duplicate),
+      /duplicate required_status_checks rules/u,
+    );
+
+    createFakeGhExecutable(fakeBin);
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [duplicate],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: duplicate,
+      [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
+    };
+    const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responses),
+        FAKE_GH_CALL_LOG: callLog,
+      },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /duplicate required_status_checks rules/u);
+    assert.doesNotMatch(readFileSync(callLog, "utf8"), /^PUT /mu);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("selected target identity drift after the initial listing prevents every write", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    const selected = completeDisabledRulesetFixture(7);
+    for (const [name, drifted] of [
+      ["renamed", { ...selected, name: "Renamed v2 gate" }],
+      ["source", { ...selected, source: "Joey-Tools/replacement" }],
+      ["id", { ...selected, id: 8 }],
+      ["target", { ...selected, target: "tag" }],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const stateDir = join(fixtureRoot, `${name}-state`);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [selected],
+        ],
+        [`GET repos/${repoSlug}/rulesets/7`]: {
+          __fake_sequence: [selected, drifted],
+        },
+        [`PUT repos/${repoSlug}/rulesets/7`]: { id: 7 },
+      };
+      const result = runBootstrap(activationArguments(repoSlug, CANARY_HEAD_SHA), {
+        env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+      });
+
+      assert.equal(result.status, 1, name);
+      assert.match(
+        result.stderr,
+        /Selected ruleset id 7 no longer has the approved repository identity, name, source, and branch target/u,
+        name,
+      );
+      const calls = readFileSync(callLog, "utf8");
+      assert.equal(countLines(calls, `GET repos/${repoSlug}/rulesets/7`), 2, name);
+      assert.doesNotMatch(calls, /^PUT /mu, name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("post-cleanup double readback rejects torn classic-to-ruleset surface swaps", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  const activeV2 = completeActiveRulesetFixture(7);
+  const legacyRuleset = activeLegacyRulesetFixture(9);
+  const effectiveLegacy = effectiveLegacyRequiredStatusChecksRule(legacyRuleset);
+  const classicLegacy = {
+    strict: true,
+    contexts: [LEGACY_STATUS_CONTEXT],
+    checks: [],
+  };
+  try {
+    for (const [name, effectiveSequence, classicSequence] of [
+      [
+        "classic-to-ruleset",
+        [[[]], [[effectiveLegacy]]],
+        [EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS, EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS],
+      ],
+      [
+        "ruleset-to-classic",
+        [[[]], [[]]],
+        [EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS, classicLegacy],
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, name);
+      const stateDir = join(fixtureRoot, `${name}-state`);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const responses = {
+        ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`GET repos/${repoSlug}/rules/branches/master?per_page=100`]: {
+          __fake_sequence: effectiveSequence,
+        },
+        [`GET repos/${repoSlug}/branches/master/protection/required_status_checks`]: {
+          __fake_sequence: classicSequence,
+        },
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+          [activeV2],
+        ],
+        [`repos/${repoSlug}/rulesets/7`]: activeV2,
+        [`repos/${repoSlug}/rulesets/9`]: legacyRuleset,
+      };
+      const result = runBootstrap([
+        "--repo",
+        repoSlug,
+        "--verify-post-cleanup",
+      ], {
+        env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+      });
+
+      assert.equal(result.status, 1, name);
+      assert.match(result.stderr, /codex\/review-gate remains required after cleanup/u, name);
+      assert.doesNotMatch(result.stdout, /Post-cleanup verified/u, name);
+      const calls = readFileSync(callLog, "utf8");
+      assert.equal(
+        countLines(
+          calls,
+          `GET repos/${repoSlug}/rules/branches/master?per_page=100`,
+        ),
+        2,
+        name,
+      );
+      assert.equal(
+        countLines(
+          calls,
+          `GET repos/${repoSlug}/branches/master/protection/required_status_checks`,
+        ),
+        2,
+        name,
+      );
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("create and update reject target drift between their two post-write readbacks", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const mode of ["create", "update"]) {
+      const fakeBin = join(fixtureRoot, mode);
+      const stateDir = join(fixtureRoot, `${mode}-state`);
+      const callLog = join(fixtureRoot, `${mode}.log`);
+      createFakeGhExecutable(fakeBin);
+      const complete = completeDisabledRulesetFixture(7);
+      const drifted = { ...complete, target: "tag" };
+      let args;
+      let expectedReadCount;
+      let responses;
+      if (mode === "create") {
+        args = ["--repo", repoSlug, "--apply"];
+        expectedReadCount = 2;
+        responses = {
+          ...canonicalRemoteWorkflowResponses(repoSlug),
+          [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
+          [`POST repos/${repoSlug}/rulesets`]: {
+            id: 7,
+            name: "Must Pass Codex Review",
+          },
+          [`GET repos/${repoSlug}/rulesets/7`]: {
+            __fake_sequence: [complete, drifted],
+          },
+        };
+      } else {
+        const incomplete = completeDisabledRulesetFixture(7);
+        incomplete.rules = incomplete.rules.filter(
+          (rule) => rule.type !== "non_fast_forward",
+        );
+        args = ["--repo", repoSlug, "--apply"];
+        expectedReadCount = 6;
+        responses = {
+          ...canonicalRemoteWorkflowResponses(repoSlug),
+          [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+            [incomplete],
+          ],
+          [`PUT repos/${repoSlug}/rulesets/7`]: {
+            id: 7,
+            name: "Must Pass Codex Review",
+          },
+          [`GET repos/${repoSlug}/rulesets/7`]: {
+            __fake_sequence: [
+              incomplete,
+              incomplete,
+              incomplete,
+              incomplete,
+              complete,
+              drifted,
+            ],
+          },
+        };
+      }
+
+      const result = runBootstrap(args, {
+        env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+      });
+      assert.equal(result.status, 1, `${mode}: ${result.stderr}`);
+      assert.match(result.stderr, /Ruleset readback for id 7 is incomplete or drifted/u, mode);
+      const calls = readFileSync(callLog, "utf8");
+      assert.equal(
+        countLines(calls, `GET repos/${repoSlug}/rulesets/7`),
+        expectedReadCount,
+        mode,
+      );
+      assert.match(
+        calls,
+        new RegExp(`^${mode === "create" ? "POST" : "PUT"} repos/${repoSlug}/rulesets(?:/7)?$`, "mu"),
+        mode,
+      );
+      assert.doesNotMatch(result.stdout, /Ruleset readback:/u, mode);
+      assert.doesNotMatch(result.stdout, /(?:Created|Updated) ruleset/u, mode);
+    }
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -3768,9 +5374,170 @@ test("canonical template and importable ruleset implement the staged v2 contract
   ]);
 });
 
+function legacyInventoryResponseFixtures(
+  repoSlug,
+  {
+    repositoryId = 1234,
+    repositoryNodeId = "R_kgDOConsumer",
+    defaultBranch = "master",
+    effectiveRulePages = [[]],
+    rulesets = [],
+    classicRequiredStatusChecks = EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS,
+  } = {},
+) {
+  const inventory = {
+    repository: repoSlug,
+    repositoryId,
+    repositoryNodeId,
+    defaultBranch,
+    effectiveRulePages,
+    rulesets,
+    classicRequiredStatusChecks,
+  };
+  const sha256 = createHash("sha256")
+    .update(canonicalLegacyReviewGateInventoryBytes(inventory))
+    .digest("hex");
+  const branchUri = encodeURIComponent(defaultBranch);
+  return {
+    approval: {
+      repository: repoSlug,
+      repositoryId,
+      repositoryNodeId,
+      defaultBranch,
+      sha256,
+    },
+    responses: {
+      [EXPECTED_LEGACY_INVENTORY_FIXTURE_KEY]: {
+        repository: repoSlug,
+        repositoryId,
+        repositoryNodeId,
+        defaultBranch,
+        sha256,
+      },
+      [`repos/${repoSlug}/rules/branches/${branchUri}?per_page=100`]:
+        effectiveRulePages,
+      [`repos/${repoSlug}/branches/${branchUri}/protection/required_status_checks`]:
+        classicRequiredStatusChecks === null
+          ? { __fake_http_error: 404, message: "Branch not protected" }
+          : classicRequiredStatusChecks,
+      ...Object.fromEntries(
+        rulesets.map((ruleset) => [
+          `repos/${repoSlug}/rulesets/${ruleset.id}`,
+          ruleset,
+        ]),
+      ),
+    },
+  };
+}
+
+function effectiveLegacyRequiredStatusChecksRule(ruleset) {
+  const rule = ruleset.rules.find(
+    (candidate) =>
+      candidate.type === "required_status_checks" &&
+      candidate.parameters.required_status_checks.some(
+        (check) => check.context === LEGACY_STATUS_CONTEXT,
+      ),
+  );
+  assert.ok(rule, `ruleset ${ruleset.id} must require ${LEGACY_STATUS_CONTEXT}`);
+  return { ...structuredClone(rule), ruleset_id: ruleset.id };
+}
+
+function stageThenActivationResponseFixtures({
+  repoSlug,
+  legacyRulesets = [],
+  classicRequiredStatusChecks = EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS,
+  v2RulesetName = "Must Pass Codex Review v2",
+} = {}) {
+  const effectiveRulePages = [[
+    ...legacyRulesets.map(effectiveLegacyRequiredStatusChecksRule),
+  ]];
+  const legacyInventory = legacyInventoryResponseFixtures(repoSlug, {
+    effectiveRulePages,
+    rulesets: legacyRulesets,
+    classicRequiredStatusChecks,
+  });
+  const disabledV2 = {
+    ...completeDisabledRulesetFixture(8),
+    name: v2RulesetName,
+  };
+  const activeV2 = {
+    ...completeActiveRulesetFixture(8),
+    name: v2RulesetName,
+  };
+  const validPullRequest = canaryPullRequestFixture(repoSlug, CANARY_HEAD_SHA);
+  const parentProtection = classicRequiredStatusChecks === null
+    ? { __fake_http_error: 404, message: "Branch not protected" }
+    : { required_status_checks: classicRequiredStatusChecks };
+  return {
+    activeV2,
+    disabledV2,
+    effectiveRulePages,
+    legacyInventory,
+    parentProtection,
+    responses: {
+      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canaryRunResponses(repoSlug),
+      ...legacyInventory.responses,
+      [`repos/${repoSlug}/branches/master/protection`]: parentProtection,
+      [`GET repos/${repoSlug}/pulls/7`]: {
+        __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
+      },
+      [`GET repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: {
+        __fake_sequence: [
+          [legacyRulesets],
+          [[...legacyRulesets, disabledV2]],
+          [[...legacyRulesets, disabledV2]],
+        ],
+      },
+      [`POST repos/${repoSlug}/rulesets`]: { id: 8, name: v2RulesetName },
+      [`GET repos/${repoSlug}/rulesets/8`]: {
+        __fake_sequence: [
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          activeV2,
+          activeV2,
+        ],
+      },
+      [`PUT repos/${repoSlug}/rulesets/8`]: { id: 8, name: v2RulesetName },
+    },
+  };
+}
+
+function classicDriftSequences({
+  repoSlug,
+  baseline,
+  drifted,
+  parentBaseline,
+}) {
+  const unavailable = { __fake_http_error: 404, message: "Branch not protected" };
+  const exactDrifted = drifted === null ? unavailable : drifted;
+  const parentDrifted = drifted === null
+    ? unavailable
+    : { required_status_checks: drifted };
+  return {
+    [`GET repos/${repoSlug}/branches/master/protection/required_status_checks`]: {
+      __fake_sequence: [baseline, baseline, baseline, exactDrifted],
+    },
+    [`GET repos/${repoSlug}/branches/master/protection`]: {
+      __fake_sequence: [
+        parentBaseline,
+        parentBaseline,
+        parentBaseline,
+        parentDrifted,
+      ],
+    },
+  };
+}
+
 function canonicalRemoteWorkflowResponses(repoSlug) {
   const codeowners = ensureControlPlaneCodeownersContent(null).content;
   return {
+    ...legacyInventoryResponseFixtures(repoSlug).responses,
     [`repos/${repoSlug}`]: repositoryMetadataFixture(repoSlug),
     [`repos/${repoSlug}/actions/permissions/workflow`]: {
       default_workflow_permissions: "read",
@@ -3783,9 +5550,7 @@ function canonicalRemoteWorkflowResponses(repoSlug) {
     },
     [`repos/${repoSlug}/branches/master/protection`]: {
       required_status_checks: {
-        strict: true,
-        contexts: [],
-        checks: [],
+        ...EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS,
       },
     },
     [`repos/${repoSlug}/git/trees/${DEFAULT_BRANCH_SHA}`]: {
@@ -4003,6 +5768,7 @@ function completeActiveRulesetFixture(id) {
     id,
     name: "Must Pass Codex Review",
     source_type: "Repository",
+    source: "Joey-Tools/consumer",
     target: "branch",
     enforcement: "active",
     bypass_actors: [],
@@ -4017,6 +5783,33 @@ function completeDisabledRulesetFixture(id) {
   return {
     ...completeActiveRulesetFixture(id),
     enforcement: "disabled",
+  };
+}
+
+function activeLegacyRulesetFixture(
+  id,
+  { name = "Legacy Codex Review", sourceType = "Repository" } = {},
+) {
+  return {
+    id,
+    name,
+    source_type: sourceType,
+    source: sourceType === "Repository" ? "Joey-Tools/consumer" : "Joey-Tools",
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [],
+    conditions: {
+      ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] },
+    },
+    rules: [
+      {
+        type: "required_status_checks",
+        parameters: {
+          strict_required_status_checks_policy: true,
+          required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+        },
+      },
+    ],
   };
 }
 
@@ -4052,8 +5845,52 @@ function canonicalWorkflowFixture() {
   return CANONICAL_WORKFLOW;
 }
 
-function runBootstrap(args, { env = process.env } = {}) {
-  return spawnSync(process.execPath, [BOOTSTRAP_SCRIPT, ...args], {
+function runBootstrap(
+  args,
+  {
+    env = process.env,
+    addExpectedLegacyInventoryDigest = true,
+  } = {},
+) {
+  const preparedArgs = [...args];
+  const repoIndex = preparedArgs.indexOf("--repo");
+  const verifiesPostCleanup = preparedArgs.includes("--verify-post-cleanup");
+  if (
+    repoIndex !== -1 &&
+    !verifiesPostCleanup &&
+    !preparedArgs.includes("--expected-legacy-inventory-sha256") &&
+    addExpectedLegacyInventoryDigest
+  ) {
+    const repoSlug = preparedArgs[repoIndex + 1];
+    let approval = null;
+    if (typeof env.FAKE_GH_RESPONSES === "string") {
+      const responses = JSON.parse(env.FAKE_GH_RESPONSES);
+      approval = responses[EXPECTED_LEGACY_INVENTORY_FIXTURE_KEY] ?? null;
+    }
+    if (approval === null) {
+      approval = legacyInventoryResponseFixtures(repoSlug).approval;
+    }
+    assert.deepEqual(
+      {
+        repository: approval.repository,
+        repositoryId: approval.repositoryId,
+        repositoryNodeId: approval.repositoryNodeId,
+        defaultBranch: approval.defaultBranch,
+      },
+      {
+        repository: repoSlug,
+        repositoryId: 1234,
+        repositoryNodeId: "R_kgDOConsumer",
+        defaultBranch: "master",
+      },
+      "legacy inventory approval must bind the exact remote repository object and default branch",
+    );
+    preparedArgs.push(
+      "--expected-legacy-inventory-sha256",
+      approval.sha256,
+    );
+  }
+  return spawnSync(process.execPath, [BOOTSTRAP_SCRIPT, ...preparedArgs], {
     encoding: "utf8",
     env,
   });

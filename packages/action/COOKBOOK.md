@@ -339,27 +339,39 @@ Use one migration PR to remove the v1 caller and install both canonical v2
 workflows plus managed CODEOWNERS. Keep every inventoried legacy requirement
 active through the migration merge. Bind the canonical read-only legacy inventory SHA-256 in
 the owner approval snapshot, then require a fresh strict inventory with that
-same external digest. It includes complete ruleset `bypass_actors` and the
-complete matching effective `required_status_checks` rule with every parameter,
-not merely one matching check. Then require the owner as current actor, the owner's latest exact-head
-approval and the synchronous exact-SHA merge. Immediately reread the current
+same external digest. It binds repository/default branch, each matching
+ruleset's complete identity, source, enforcement, target, conditions,
+`bypass_actors`, `rules`, and effective `required_status_checks` rule, plus the
+complete classic required-status object including every producer `app_id`.
+Even an empty legacy inventory has a repository/branch-bound digest;
+incomplete API/schema data or any drift fails closed. Then require the owner as
+current actor, the owner's latest exact-head approval and the synchronous
+exact-SHA merge. Immediately reread the current
 default and require merged lifecycle, base, and head to remain the exact
 approved scope. A failed readback keeps all legacy requirements active; only
-success permits separately authorised legacy removal and readback.
+success permits Disabled staging to begin while legacy remains active.
 Do not treat approval plus a head reread
 as sufficient, and do not replace v1 with only a bare `uses: ...@v2` step.
 
 After the installation PR merges:
 
-1. confirm the inventoried legacy requirements were removed and read back;
-2. stage the supplied ruleset as Disabled with no bypass actors;
-3. open a separate harmless canary PR;
+1. keep every inventoried legacy requirement active;
+2. stage a separate supplied v2 ruleset as Disabled with no bypass actors;
+3. open a separate harmless canary PR while legacy still blocks merges;
 4. exercise the ordinary `@v2` review/reconcile path;
 5. verify the exact canonical verifier run, native feature-head CheckRun bound
    to the unchanged head/base/test-merge scope,
    freshness and conversation enforcement with no same-name collision;
-6. activate the validated ruleset; and
-7. close the canary PR without merging.
+6. activate the validated ruleset and read the exact complete Active policy
+   back;
+7. through step 6, pass the same owner-approved digest explicitly to every
+   stage/activation preview and apply, even though those helper invocations are
+   separate processes;
+8. only then perform separately authorised legacy cleanup; because cleanup
+   changes the old digest, use read-only `--verify-post-cleanup` without that
+   digest to prove both legacy surfaces clear and v2 still the same complete
+   Active policy; and
+9. close the canary PR without merging.
 
 If the canary fails, repair through ordinary forward Git history. Do not move
 the `v2` release alias backwards and do not weaken the ruleset to manufacture a

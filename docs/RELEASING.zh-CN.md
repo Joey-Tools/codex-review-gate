@@ -82,9 +82,13 @@ Publisher 在任何写入前都会用 release policy 和当前 remote state 验�
 | `publish` | 有特权 | Environment 人工批准后重新验证全部状态并执行 signed remote publication。 |
 | `verify` | 无特权 | 重新读取公开 refs 与 Release state，并报告观察结果。 |
 
-无特权 `plan`、`candidate-a`、`candidate-b`、`assemble`、`publication-plan` 与
-`verify` jobs 使用 `ubuntu-slim`，timeout 为 14 分钟；privileged `publish` job 使用
-`ubuntu-24.04`，timeout 为 30 分钟。
+轻量的无特权 `plan`、`assemble`、`publication-plan` 与 `verify` jobs 使用
+`ubuntu-slim` 与 14 分钟 timeout。GitHub 对这个单核 runner 另有 15 分钟硬上限，
+所以低频但重型的 `candidate-a` 与 `candidate-b` 改用 `ubuntu-24.04` 与 30 分钟
+timeout。仅完整测试套件在最后一个 release-pipeline test 完成前就已耗时约 755.6 秒，
+`ubuntu-slim` 无法为 checkout、setup、candidate materialization、packaging 与 upload
+留出足够余量。privileged `publish` job 也继续使用 `ubuntu-24.04` 与既有 30 分钟
+timeout。
 
 只有 `publish` 绑定 `marketplace-production` Environment。尽管保留了历史名称，它
 实际代表 production publication credentials 与人工批准边界，并不表示 workflow 会

@@ -52,17 +52,27 @@ the consumer repository. The first migration PR contains both canonical
 workflows and CODEOWNERS, not the ruleset mutation. Before merging it, keep
 every legacy requirement active, bind a canonical read-only legacy inventory
 SHA-256 into the owner approval snapshot and require a fresh identical inventory
-in the final transaction. That inventory includes the complete ruleset
-`bypass_actors` and the complete matching effective `required_status_checks`
-rule with every parameter, not merely its matching check. Then require the authenticated actor to be that
-owner, freshly reread the owner's exact-head approval, and use the synchronous
+in the final transaction. The digest binds repository/default branch, each
+matching ruleset's full identity, source, enforcement, target, conditions,
+`bypass_actors`, and `rules`, its complete effective
+`required_status_checks` rule, and the complete classic required-status object
+including each check's producer `app_id`. Even an empty legacy inventory has a
+repository/branch-bound digest. Incomplete API/schema data or any drift fails
+closed. Then require the authenticated actor to be that owner, freshly reread
+the owner's exact-head approval, and use the synchronous
 exact-SHA merge endpoint. Immediately after merge, first reread the current
 default branch and require the PR to be merged with base and head still exactly
 the approved scope. If that readback fails, keep every legacy requirement
-active. Only after it succeeds, remove and read back the inventoried legacy
-requirements under separate authorization.
-Approval plus a head reread alone is insufficient. After merge, stage the
-supplied ruleset as Disabled, prove it with a harmless canary, then activate it.
+active. After it succeeds, keep legacy active, stage a separate supplied v2
+ruleset as Disabled, prove it with a harmless canary, then activate and read
+back the exact complete Active policy. Every pre-cleanup stage/activation
+preview and apply must explicitly reuse the same owner-approved digest across
+processes through that Active readback. Only afterward may separately
+authorised cleanup remove the inventoried legacy requirements. Because cleanup
+necessarily changes the old digest, final closure uses the read-only
+`--verify-post-cleanup` mode without that digest and proves both legacy
+surfaces clear while the same v2 policy remains Active.
+Approval plus a head reread alone is insufficient.
 
 The copied workflows own separate triggers, typed dispatch inputs,
 permissions, concurrency namespaces and runner-free event filtering. The

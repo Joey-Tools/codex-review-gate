@@ -1865,6 +1865,151 @@ superseded_by:
   `git diff --check`. A signed exact-head whole-range review remains required
   before PR delivery.
 
+### Whole-Range Review At The Command-Audit Checkpoint
+
+- A fresh no-local clone reviewed the exact frozen range
+  `10217253306ca2ee6f312f766a331f8924e26e47..8210c6fae7250c3c4ce1e4b1262ac31557ce8e8f`
+  at tree `a810126a06e26621aea27bde541e0f5743098c1e`. The lane was an
+  ordinary general agent using `gpt-5.6-sol` / `ultra`, with no dedicated
+  reviewer role. It confirmed the command-audit remediation and found one P1
+  installation-order defect plus one P2 release-job budget defect.
+- P1: the documented and enforced migration removed every legacy
+  `codex/review-gate` requirement before staging v2 Disabled, running the
+  canary, and activating v2. That created an unbounded interval in which no
+  Codex review gate was required, contradicting the fail-closed installation
+  contract. Classic branch protection, a separate/inherited legacy ruleset,
+  and a same-name active legacy ruleset all exposed this window.
+  - The adopted order is now intentionally overlapping: retain every active
+    legacy gate; stage a distinct v2 ruleset Disabled; run the canary while
+    legacy still blocks merges; activate v2; read the exact complete Active
+    v2 policy back; only then perform separately authorised legacy cleanup;
+    finally prove both legacy surfaces clear and the same v2 policy still
+    Active. A canary need not merge, so legacy blocking it remains compatible
+    with this sequence.
+  - An active legacy or otherwise incomplete ruleset occupying the selected
+    v2 name is never disabled or rewritten. Staging stops before a write and
+    requires a distinct `--ruleset-name`. A complete Active v2 ruleset that
+    still contains the legacy context is a preserve/no-op state; bootstrap
+    does not silently perform cleanup.
+  - The protected overlap property is explicit and spans separate bootstrap
+    processes. Before the first remote stage command, the owner records one
+    canonical SHA-256 inventory for the exact repository and default branch.
+    Repository binding includes the exact slug, numeric repository ID, opaque
+    repository node ID, and default-branch name so repository replacement or
+    retargeting cannot replay an old approval. The external shell producer and
+    runtime consumer call the same Node canonicalizer and therefore share one
+    byte ordering, numeric domain, schema, and trailing-newline contract rather
+    than attempting to keep independent jq and JavaScript serializers aligned.
+    That inventory contains every effective legacy ruleset's identity, source,
+    enforcement, target, conditions, bypass actors, complete rules, and
+    effective required-check rule, plus the complete classic required-status
+    object including `strict`, `contexts`, `checks`, and each check's explicit
+    producer `app_id`. Even an empty legacy inventory remains repository- and
+    branch-bound and therefore has an approval digest. Every Disabled-stage
+    and activation preview/apply must present the same digest; bootstrap reads
+    and compares the complete inventory initially, immediately before a write,
+    again after the final target-ruleset lost-update readback, and after the
+    exact v2 write/readback. Every digest read verifies repository identity and
+    default-branch existence at both ends. Successful empty or JSON `null`
+    classic responses are schema-inconclusive; only the two recognised exact
+    404 absence states are canonicalized as absent. API or schema unreadability
+    is inconclusive rather than legacy absence, while any readable inventory
+    drift fails closed.
+    Reason: a process-local witness would reset its baseline between stage and
+    activation, a context-only classic witness would lose producer binding,
+    and summary ruleset objects can omit security-relevant policy fields.
+  - An authorised legacy cleanup necessarily changes the pre-cleanup approval
+    digest. The final proof therefore uses a separate read-only
+    `--verify-post-cleanup` mode rather than accepting a new unapproved digest.
+    It requires no effective legacy ruleset and no classic legacy context,
+    while allowing unrelated classic checks, and independently reads back the
+    selected v2 ruleset as the complete Active policy. It performs two complete
+    ordered legacy-plus-selected-v2 reads and requires byte-identical legacy
+    inventories and identical selected-v2 writable fingerprints. This prevents
+    a classic-to-ruleset surface swap from being assembled into a false clear
+    snapshot. It has no mutation path.
+  - The active update's final mutation boundary is fixed as complete final
+    canary readback, complete final consumer-security snapshot, exact selected
+    target readback, and then the immediately adjacent PUT. The target readback
+    binds ID, name, repository source, and branch target. After PUT, bootstrap
+    performs an immediate exact readback, the complete security and legacy
+    checks, and a second exact target readback before reporting success. GitHub
+    exposes no ruleset ETag or conditional update, so the final GET-to-PUT gap
+    cannot be eliminated; the two write-back reads make any observable race
+    fail closed instead of claiming completion.
+- P2: `candidate-a` and `candidate-b` had only 14 minutes for checkout, setup,
+  deterministic candidate materialisation, packaging/upload, syntax checks,
+  and the complete test suite. The suite alone had consumed about 755.6
+  seconds before its last release-pipeline test completed, leaving inadequate
+  headroom and making a valid release likely to time out before assembly.
+  A subsequent platform check found that GitHub imposes a separate 15-minute
+  hard limit on the single-CPU `ubuntu-slim` runner, so merely declaring a
+  30-minute workflow timeout would not extend these jobs. The two
+  low-frequency heavy candidate jobs therefore use `ubuntu-24.04` with
+  30-minute timeouts. The four light unprivileged jobs remain on
+  `ubuntu-slim` at 14 minutes, and the privileged publisher remains on
+  `ubuntu-24.04` at its existing 30-minute limit. This keeps the low-cost
+  runner preference for genuinely light work without relying on an
+  unenforceable timeout for the full suite.
+- Focused post-remediation validation passed: bootstrap 83/83, workflow
+  security contract 38/38, release-pipeline contract 2/2, `npm run check`, and
+  `git diff --check`. `actionlint` retained only the three already recorded
+  baseline diagnostics for App-token metadata and the quoted summary body;
+  the exact baseline-filtered run was clean. A serialized repository baseline
+  subsequently passed 736/736 before the cross-process inventory hardening
+  described above. Those results are historical checkpoints, not acceptance
+  evidence for the new digest and post-cleanup modes; the final focused and
+  complete suites, signed checkpoint, and fresh exact-head whole-range review
+  remain mandatory.
+
+### Canonical Inventory And Mutation-Boundary Follow-Up
+
+- A focused ordinary-agent audit of the latest shared tree found no remaining
+  actionable production defect in the migration digest, active-write
+  sequencing, or post-cleanup closure. It explicitly confirmed shared
+  canonical bytes, repository identity binding, complete status-rule producer
+  binding, selected-target identity, the final
+  `canary -> security -> target GET -> PUT` order, and the two-round read-only
+  cleanup proof. The unavoidable final GET-to-PUT interval is the minimum
+  remaining race under GitHub's API and is followed by two exact target
+  readbacks. This was a focused pre-review, not the required whole-range
+  acceptance lane.
+- Regression coverage now fixes the previously implicit boundaries: repository
+  numeric/node identity replacement, successful `null` classic responses,
+  duplicate status-rule splicing, selected-target identity drift, cross-surface
+  torn cleanup reads, drift after the first write readback, and the final active
+  call order. Final focused validation passed bootstrap 94/94, workflow-security
+  contract 38/38, and release-pipeline 47/47; the release-pipeline file took
+  about 1,106 seconds, independently validating the standard-Ubuntu runner
+  decision. The final serialized repository suite passed 747/747 with exit
+  status zero. `npm run check`, shell `bash -n`, ShellCheck, the baseline-filtered
+  actionlint invocation, `git diff --check`, and project-journal validation also
+  passed. This evidence covers the code and documentation snapshot immediately
+  before this evidence-only journal append; the append is revalidated by the
+  journal, syntax, diff, and exact-head review gates rather than rerunning the
+  18-minute release simulation solely for its own recorded result.
+
+### Follow-Up Migration Witness Review And Resolution
+
+- A fresh ordinary-agent pre-review retained four defects in the first overlap
+  remediation. Two were P1 security-contract defects: each bootstrap process
+  chose a fresh legacy baseline, so stage and activation could approve
+  different inventories, and the classic witness reduced a check to its
+  context while discarding `app_id`. A third defect treated incomplete
+  ruleset API objects as if no legacy policy existed. The fourth was the
+  release-runner defect recorded above: `ubuntu-slim` has a platform hard limit
+  of 15 minutes, so a declared 30-minute candidate timeout was ineffective.
+- The adopted remediation is the external canonical digest, strict full-object
+  validation, preserved classic producer binding, read-only post-cleanup proof,
+  and standard-Ubuntu candidate runners described in this section. No atomic
+  multi-object compare-and-swap exists in GitHub's ruleset and branch-
+  protection APIs. Bootstrap therefore combines exact full-object readbacks,
+  repeated digest checks around the target-ruleset lost-update check, and a
+  post-write digest/readback. A detected pre-write drift prevents mutation; a
+  detected post-write drift refuses to claim completion and requires an owner
+  to inspect the independently concurrent change. The v2 write itself never
+  removes a retained legacy surface.
+
 ### Verified Two-Workflow Platform Boundaries And Resolution
 
 - Required-CheckRun source selection is not workflow provenance. GitHub's
@@ -2014,8 +2159,9 @@ superseded_by:
   installation identity, sole target repository, and actual permissions; the
   configured layered rulesets; GitHub read-back of an App-pushed,
   JoeyTeng-Codex-signed commit and tag; compatibility of the selected floating
-  Action majors; `ubuntu-slim` jobs completing within the adopted 14-minute
-  budget; and Environment waiting allocating no runner in the live workflow.
+  Action majors; each light `ubuntu-slim` job completing within the adopted
+  14-minute budget; each standard-Ubuntu candidate job completing within 30
+  minutes; and Environment waiting allocating no runner in the live workflow.
 - The stable-major operator checklist includes manually publishing `v2.0.0`
   through the Action Marketplace Release UI. This is deliberately not a
   publisher gate or machine-read-back requirement. Historical v1 evidence

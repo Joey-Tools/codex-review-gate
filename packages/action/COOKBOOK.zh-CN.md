@@ -314,26 +314,34 @@ stable snapshots 不会在 run 后锁定 PR；跳过此 closure 的 direct human
 使用一个 migration PR 移除 v1 caller，并安装两份 canonical v2 workflows 与受管
 CODEOWNERS。旧保护保留到 merge；把 canonical read-only legacy inventory SHA-256 绑定进
 owner approval snapshot，随后要求 fresh strict inventory 匹配该 external digest。Inventory
-包含完整 ruleset `bypass_actors` 与全部 parameters 的完整 matching effective
-`required_status_checks` rule，而不只是 matching check；随后要求 current
+绑定 repository/default branch、每个 matching ruleset 的完整 identity、source、
+enforcement、target、conditions、`bypass_actors`、`rules` 与 effective
+`required_status_checks` rule，以及包括每个 producer `app_id` 的完整 classic
+required-status object。即使 legacy inventory 为空，也有绑定 repository/branch 的 digest；
+API/schema 不完整或任何 drift 都 fail closed。随后要求 current
 actor 是 owner、owner latest exact-head approval，并同步 merge exact SHA。Merge 后先立即
 重读 current default，并要求 merged lifecycle、base 与 head 仍精确等于 approved scope；
-readback 失败时保留全部 legacy requirements active，成功后才在单独授权下移除并读回
-inventoried legacy requirements。
+readback 失败时保留全部 legacy requirements active；成功后也继续保留 legacy，在其保护下
+开始 Disabled v2 staging。
 不得把 approval 加 head reread 当作充分闭环，也不要只用裸
 `uses: ...@v2` step 替换 v1 workflow call。
 
 installation PR merge 后：
 
-1. 确认 inventoried legacy requirements 已删除并读回；
-2. 以 Disabled stage supplied ruleset，且没有 bypass actors；
-3. 另开一个无害 canary PR；
+1. 保持全部 inventoried legacy requirements active；
+2. 另以 Disabled stage supplied v2 ruleset，且没有 bypass actors；
+3. 在 legacy 继续阻塞 merge 时另开一个无害 canary PR；
 4. 运行普通 `@v2` review/reconcile path；
 5. 验证 exact canonical verifier run、绑定 unchanged head/base/test-merge scope 的 native
    feature-head CheckRun、freshness、
    conversation enforcement，且不存在 same-name collision；
-6. 激活已验证 ruleset；
-7. 不 merge，直接关闭 canary PR。
+6. 激活已验证 ruleset，并精确读回完整 Active policy；
+7. 直到第 6 步完成，每次 stage/activation preview 与 apply 都必须显式传入同一个
+   owner-approved digest，即使 helper invocations 位于不同 process；
+8. 只有之后才执行另行授权的 legacy cleanup；cleanup 会改变旧 digest，因此使用不携带该
+   digest 的只读 `--verify-post-cleanup`，同时证明两个 legacy surfaces 均已清空，且 v2
+   仍是同一完整 Active policy；
+9. 不 merge，直接关闭 canary PR。
 
 canary 失败时，通过普通 forward Git history 修复。不要把 `v2` release alias 向后
 移动，也不要削弱 ruleset 来制造 pass。

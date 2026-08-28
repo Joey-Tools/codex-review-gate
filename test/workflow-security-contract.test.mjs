@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { canonicalLegacyReviewGateInventoryBytes } from "../src/bootstrap.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const actionPath = join(repoRoot, "packages/action/action.yml");
@@ -41,6 +42,14 @@ const legacyInventoryHelperPath = join(
   "scripts/build-legacy-review-gate-inventory.sh",
 );
 const legacyInventoryHelper = readFileSync(legacyInventoryHelperPath, "utf8");
+const legacyInventoryCanonicalizerPath = join(
+  repoRoot,
+  "scripts/canonicalize-legacy-review-gate-inventory.mjs",
+);
+const legacyInventoryCanonicalizer = readFileSync(
+  legacyInventoryCanonicalizerPath,
+  "utf8",
+);
 const installGuides = Object.fromEntries(
   ["human.md", "human.zh-CN.md", "agent.md", "agent.zh-CN.md"].map((name) => [
     name,
@@ -83,6 +92,8 @@ const retiredPackageWorkflowPaths = [
     "packages/action/.github/workflows/codex-review-gate-reconcile.yml",
   ),
 ];
+const ACTIVE_V2_READBACK_PATTERN =
+  /(?:activate(?:d)?|activation|激活)[\s\S]{0,220}?(?:read\s+back[\s\S]{0,100}?(?:Active\s+(?:policy|readback)|complete\s+Active)|(?:Active\s+policy|complete\s+Active)[\s\S]{0,40}?back|Active\s+readback|读回[\s\S]{0,100}?(?:完整\s+Active|Active\s+policy))/iu;
 
 const action = readFileSync(actionPath, "utf8");
 const sourceConsumer = readFileSync(sourceConsumerPath, "utf8");
@@ -345,7 +356,7 @@ test("public package docs preserve bootstrap sequencing", () => {
   }
 });
 
-test("public package docs keep legacy active until exact post-merge scope readback", () => {
+test("public package docs keep legacy active through v2 activation before cleanup", () => {
   const sections = {
     "README.md": "## Install the complete consumer contract",
     "README.zh-CN.md": "## 安装完整消费者契约",
@@ -360,16 +371,54 @@ test("public package docs keep legacy active until exact post-merge scope readba
     const merge = section.search(/(?:synchronous|同步)[\s\S]{0,80}merge/iu);
     const readback = section.search(/(?:current\s+default|current-default)/iu);
     const approvedScope = section.search(/approved scope/iu);
-    const removalOffset = section.slice(approvedScope).search(
-      /(?:(?:remove|removal|移除|删除)[\s\S]{0,100}(?:legacy|inventoried)|legacy[\s\S]{0,40}removal)/iu,
+    const disabledOffset = section.slice(approvedScope).search(/Disabled/u);
+    const disabled = disabledOffset < 0 ? -1 : approvedScope + disabledOffset;
+    const canaryOffset = section.slice(disabled).search(/canary/iu);
+    const canary = canaryOffset < 0 ? -1 : disabled + canaryOffset;
+    const activeReadbackEnd = matchEndAfter(
+      section,
+      canary,
+      ACTIVE_V2_READBACK_PATTERN,
     );
-    const removal = removalOffset < 0 ? -1 : approvedScope + removalOffset;
+    const cleanupOffset = section.slice(activeReadbackEnd).search(
+      /(?:(?:cleanup|remove|removal|移除|删除)[\s\S]{0,120}(?:legacy|inventoried)|(?:legacy|inventoried)[\s\S]{0,80}(?:cleanup|remove|removal|移除|删除))/iu,
+    );
+    const cleanup = cleanupOffset < 0 ? -1 : activeReadbackEnd + cleanupOffset;
     assert.ok(
-      merge >= 0 && readback > merge && approvedScope >= readback && removal > approvedScope,
-      `${name}: merge < current-default merged/base/head readback < legacy removal`,
+      merge >= 0 &&
+        readback > merge &&
+        approvedScope >= readback &&
+        disabled > approvedScope &&
+        canary > disabled &&
+        activeReadbackEnd > canary &&
+        cleanup >= activeReadbackEnd,
+      `${name}: merge < scope readback < Disabled stage < canary < Active readback < legacy cleanup`,
     );
     assert.match(section, /(?:failed readback|readback fails|readback 失败|failure|失败)[\s\S]{0,100}(?:keep|preserve|保留)[\s\S]{0,80}legacy/iu, name);
+    assert.match(
+      section.slice(cleanup),
+      /(?:(?:both|两个)[\s\S]{0,40}legacy\s+surfaces[\s\S]{0,100}(?:v2|Active)|(?:v2|Active)[\s\S]{0,100}(?:both|两个)[\s\S]{0,40}legacy\s+surfaces)/iu,
+      `${name}: final closure proves both legacy surfaces clear and v2 Active`,
+    );
   }
+});
+
+test("documentation ordering treats completed Active readback as the cleanup boundary", () => {
+  const valid =
+    "canary; activate v2 and read back the complete Active policy; legacy cleanup";
+  const invalid =
+    "canary; activate v2; legacy cleanup; then read back the complete Active policy";
+  const validEnd = matchEndAfter(valid, valid.indexOf("canary"), ACTIVE_V2_READBACK_PATTERN);
+  const invalidEnd = matchEndAfter(
+    invalid,
+    invalid.indexOf("canary"),
+    ACTIVE_V2_READBACK_PATTERN,
+  );
+
+  assert.ok(validEnd > 0);
+  assert.match(valid.slice(validEnd), /legacy cleanup/u);
+  assert.ok(invalidEnd > 0);
+  assert.doesNotMatch(invalid.slice(invalidEnd), /legacy cleanup/u);
 });
 
 test("public package docs preserve native verifier and controller recovery", () => {
@@ -689,9 +738,9 @@ if [[ $1 == --paginate ]]; then
     printf '%s\n' '[[{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[{"context":"codex/review-gate","integration_id":15368}]}}]]'
   else
     if [[ $FIXTURE_PERMUTED == true ]]; then
-      checks='[{"context":"ci/test","integration_id":15368},{"context":"codex/review-gate","integration_id":15368}]'
+      checks='[{"context":"codex/review-gate","integration_id":15368},{"context":"ci/test","integration_id":15368},{"context":"codex/review-gate"}]'
     else
-      checks='[{"context":"codex/review-gate","integration_id":15368},{"context":"ci/test","integration_id":15368}]'
+      checks='[{"context":"codex/review-gate"},{"context":"codex/review-gate","integration_id":15368},{"context":"ci/test","integration_id":15368}]'
     fi
     printf '[[{"type":"required_status_checks","ruleset_id":7,"parameters":{"strict_required_status_checks_policy":%s,"do_not_enforce_on_create":false,"required_status_checks":%s}}]]\n' "$FIXTURE_STRICT" "$checks"
   fi
@@ -703,15 +752,28 @@ if [[ $1 == --include ]]; then
 fi
 case "$1" in
   repos/OWNER/REPO)
+    printf '%s\n' '{"id":1234,"node_id":"R_kgDOConsumer","full_name":"OWNER/REPO","default_branch":"main"}'
+    ;;
+  repos/OWNER/REPO/branches/main)
     printf 'main\n'
     ;;
   repos/OWNER/REPO/branches/main/protection/required_status_checks)
     if [[ $FIXTURE_MALFORMED == classic-missing-strict ]]; then
       printf '%s\n' '{"contexts":["codex/review-gate"],"checks":[{"context":"codex/review-gate","app_id":15368}]}'
+    elif [[ $FIXTURE_MALFORMED == classic-missing-app-id ]]; then
+      printf '%s\n' '{"strict":true,"contexts":["codex/review-gate"],"checks":[{"context":"codex/review-gate"}]}'
+    elif [[ $FIXTURE_MALFORMED == classic-zero-app-id ]]; then
+      printf '%s\n' '{"strict":true,"contexts":["codex/review-gate"],"checks":[{"context":"codex/review-gate","app_id":0}]}'
+    elif [[ $FIXTURE_MALFORMED == classic-negative-app-id ]]; then
+      printf '%s\n' '{"strict":true,"contexts":["codex/review-gate"],"checks":[{"context":"codex/review-gate","app_id":-2}]}'
+    elif [[ $FIXTURE_MALFORMED == classic-fraction-app-id ]]; then
+      printf '%s\n' '{"strict":true,"contexts":["codex/review-gate"],"checks":[{"context":"codex/review-gate","app_id":1.5}]}'
+    elif [[ $FIXTURE_MALFORMED == classic-string-app-id ]]; then
+      printf '%s\n' '{"strict":true,"contexts":["codex/review-gate"],"checks":[{"context":"codex/review-gate","app_id":"15368"}]}'
     elif [[ $FIXTURE_PERMUTED == true ]]; then
-      printf '{"strict":%s,"contexts":["ci/test","codex/review-gate"],"checks":[{"context":"ci/test","app_id":15368},{"context":"codex/review-gate","app_id":15368}]}\n' "$FIXTURE_CLASSIC_STRICT"
+      printf '{"url":"https://api.github.com/repos/OWNER/REPO/branches/main/protection/required_status_checks","strict":%s,"contexts_url":"https://api.github.com/repos/OWNER/REPO/branches/main/protection/required_status_checks/contexts","contexts":["ci/test","codex/review-gate"],"checks":[{"context":"codex/review-gate","app_id":15368,"response_only":"ignored"},{"context":"codex/review-gate","app_id":-1},{"context":"ci/test","app_id":15368},{"context":"codex/review-gate","app_id":null}]}\n' "$FIXTURE_CLASSIC_STRICT"
     else
-      printf '{"strict":%s,"contexts":["codex/review-gate","ci/test"],"checks":[{"context":"codex/review-gate","app_id":15368},{"context":"ci/test","app_id":15368}]}\n' "$FIXTURE_CLASSIC_STRICT"
+      printf '{"url":"https://api.github.com/repos/OWNER/REPO/branches/main/protection/required_status_checks","strict":%s,"contexts_url":"https://api.github.com/repos/OWNER/REPO/branches/main/protection/required_status_checks/contexts","contexts":["codex/review-gate","ci/test"],"checks":[{"context":"codex/review-gate","app_id":null},{"context":"ci/test","app_id":15368,"response_only":"ignored"},{"context":"codex/review-gate","app_id":-1},{"context":"codex/review-gate","app_id":15368}]}\n' "$FIXTURE_CLASSIC_STRICT"
     fi
     ;;
   repos/OWNER/REPO/rulesets/7)
@@ -739,7 +801,19 @@ case "$1" in
     else
       conditions='{"ref_name":{"include":["~DEFAULT_BRANCH","refs/heads/release"],"exclude":["refs/heads/tmp*","refs/heads/wip*"]},"repository_id":{"repository_ids":[1001,1002]},"repository_property":{"include":[{"name":"tier","property_values":["beta","alpha"]},{"name":"visibility","property_values":["private","public"]}],"exclude":[{"name":"state","property_values":["blocked","archived"]}]}}'
     fi
-    printf '{"id":7,"name":"legacy","source_type":"Repository","source":"OWNER/REPO","enforcement":"active","target":"branch","conditions":%s,"rules":[],"bypass_actors":%s}\n' "$conditions" "$bypass"
+    if [[ $FIXTURE_RULES_CHANGED == true ]]; then
+      extra_rule='{"type":"non_fast_forward","parameters":{"policy_revision":2}}'
+    else
+      extra_rule='{"type":"non_fast_forward"}'
+    fi
+    if [[ $FIXTURE_PERMUTED == true ]]; then
+      rules_checks='[{"context":"codex/review-gate","integration_id":15368},{"context":"ci/test","integration_id":15368},{"context":"codex/review-gate"}]'
+      rules="$(printf '[%s,{\"parameters\":{\"required_status_checks\":%s,\"do_not_enforce_on_create\":false,\"strict_required_status_checks_policy\":%s},\"type\":\"required_status_checks\"}]' "$extra_rule" "$rules_checks" "$FIXTURE_STRICT")"
+    else
+      rules_checks='[{"context":"codex/review-gate"},{"context":"codex/review-gate","integration_id":15368},{"context":"ci/test","integration_id":15368}]'
+      rules="$(printf '[{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":%s,\"do_not_enforce_on_create\":false,\"required_status_checks\":%s}},%s]' "$FIXTURE_STRICT" "$rules_checks" "$extra_rule")"
+    fi
+    printf '{"id":7,"name":"legacy","source_type":"Repository","source":"OWNER/REPO","enforcement":"active","target":"branch","conditions":%s,"rules":%s,"bypass_actors":%s}\n' "$conditions" "$rules" "$bypass"
     ;;
   *) exit 91 ;;
 esac
@@ -763,6 +837,7 @@ esac
             FIXTURE_CLASSIC_STRICT: "true",
             FIXTURE_MALFORMED: "",
             FIXTURE_PERMUTED: "false",
+            FIXTURE_RULES_CHANGED: "false",
             FIXTURE_STRICT: "true",
             ...fixtureEnv,
           },
@@ -774,10 +849,24 @@ esac
     const { output, result } = baseline;
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^LEGACY_INVENTORY_SHA256=[0-9a-f]{64}\n$/u);
-    assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), {
+    const inventory = JSON.parse(readFileSync(output, "utf8"));
+    const effectiveChecks = inventory.rulesets[0]
+      .effective_required_status_checks_rule.parameters.required_status_checks;
+    assert.deepEqual(
+      effectiveChecks.map((check) => JSON.stringify(check)).sort(),
+      [
+        { context: "ci/test", integration_id: 15368 },
+        { context: "codex/review-gate", integration_id: 15368 },
+        { context: "codex/review-gate" },
+      ].map((check) => JSON.stringify(check)).sort(),
+      "effective required checks must preserve every producer binding",
+    );
+    assert.deepEqual(inventory, {
       classic_required_status_checks: {
         checks: [
           { app_id: 15368, context: "ci/test" },
+          { app_id: null, context: "codex/review-gate" },
+          { app_id: -1, context: "codex/review-gate" },
           { app_id: 15368, context: "codex/review-gate" },
         ],
         contexts: ["ci/test", "codex/review-gate"],
@@ -785,6 +874,8 @@ esac
       },
       default_branch: "main",
       repository: "OWNER/REPO",
+      repository_id: 1234,
+      repository_node_id: "R_kgDOConsumer",
       rulesets: [
         {
           conditions: {
@@ -824,16 +915,28 @@ esac
           ],
           id: 7,
           name: "legacy",
+          rules: [
+            {
+              parameters: {
+                do_not_enforce_on_create: false,
+                required_status_checks: [
+                  { context: "ci/test", integration_id: 15368 },
+                  {
+                    context: "codex/review-gate",
+                    integration_id: 15368,
+                  },
+                  { context: "codex/review-gate" },
+                ],
+                strict_required_status_checks_policy: true,
+              },
+              type: "required_status_checks",
+            },
+            { type: "non_fast_forward" },
+          ],
           effective_required_status_checks_rule: {
             parameters: {
               do_not_enforce_on_create: false,
-              required_status_checks: [
-                { context: "ci/test", integration_id: 15368 },
-                {
-                  context: "codex/review-gate",
-                  integration_id: 15368,
-                },
-              ],
+              required_status_checks: effectiveChecks,
               strict_required_status_checks_policy: true,
             },
             ruleset_id: 7,
@@ -845,6 +948,115 @@ esac
         },
       ],
     });
+    const nodeInventoryInput = {
+      repository: "OWNER/REPO",
+      repositoryId: 1234,
+      repositoryNodeId: "R_kgDOConsumer",
+      defaultBranch: "main",
+      effectiveRulePages: [[{
+        type: "required_status_checks",
+        ruleset_id: 7,
+        parameters: {
+          strict_required_status_checks_policy: true,
+          do_not_enforce_on_create: false,
+          required_status_checks: [
+            { context: "codex/review-gate" },
+            { context: "codex/review-gate", integration_id: 15368 },
+            { context: "ci/test", integration_id: 15368 },
+          ],
+        },
+      }]],
+      rulesets: [{
+        id: 7,
+        name: "legacy",
+        source_type: "Repository",
+        source: "OWNER/REPO",
+        enforcement: "active",
+        target: "branch",
+        conditions: {
+          ref_name: {
+            include: ["~DEFAULT_BRANCH", "refs/heads/release"],
+            exclude: ["refs/heads/tmp*", "refs/heads/wip*"],
+          },
+          repository_id: { repository_ids: [1001, 1002] },
+          repository_property: {
+            include: [
+              { name: "tier", property_values: ["beta", "alpha"] },
+              {
+                name: "visibility",
+                property_values: ["private", "public"],
+              },
+            ],
+            exclude: [
+              { name: "state", property_values: ["blocked", "archived"] },
+            ],
+          },
+        },
+        rules: [
+          {
+            type: "required_status_checks",
+            parameters: {
+              strict_required_status_checks_policy: true,
+              do_not_enforce_on_create: false,
+              required_status_checks: [
+                { context: "codex/review-gate" },
+                { context: "codex/review-gate", integration_id: 15368 },
+                { context: "ci/test", integration_id: 15368 },
+              ],
+            },
+          },
+          { type: "non_fast_forward" },
+        ],
+        bypass_actors: [
+          { actor_id: 42, actor_type: "Team", bypass_mode: "always" },
+          {
+            actor_id: null,
+            actor_type: "OrganizationAdmin",
+            bypass_mode: "always",
+          },
+          {
+            actor_id: null,
+            actor_type: "DeployKey",
+            bypass_mode: "always",
+          },
+        ],
+      }],
+      classicRequiredStatusChecks: {
+        url: "https://api.github.com/repos/OWNER/REPO/branches/main/protection/required_status_checks",
+        contexts_url:
+          "https://api.github.com/repos/OWNER/REPO/branches/main/protection/required_status_checks/contexts",
+        strict: true,
+        contexts: ["codex/review-gate", "ci/test"],
+        checks: [
+          { context: "codex/review-gate", app_id: null },
+          { context: "ci/test", app_id: 15368, response_only: "ignored" },
+          { context: "codex/review-gate", app_id: -1 },
+          { context: "codex/review-gate", app_id: 15368 },
+        ],
+      },
+    };
+    const nodeCanonicalBytes = canonicalLegacyReviewGateInventoryBytes(
+      nodeInventoryInput,
+    );
+    assert.equal(
+      readFileSync(output, "utf8"),
+      nodeCanonicalBytes,
+      "shell and Node inventory canonicalization must emit identical bytes",
+    );
+    for (const invalidCheck of [
+      { context: "codex/review-gate" },
+      { context: "codex/review-gate", app_id: 0 },
+      { context: "codex/review-gate", app_id: -2 },
+      { context: "codex/review-gate", app_id: 1.5 },
+      { context: "codex/review-gate", app_id: "15368" },
+    ]) {
+      const invalidInput = structuredClone(nodeInventoryInput);
+      invalidInput.classicRequiredStatusChecks.checks = [invalidCheck];
+      assert.throws(
+        () => canonicalLegacyReviewGateInventoryBytes(invalidInput),
+        /explicit app_id \(positive integer, -1, or null\)/u,
+      );
+    }
     const bypassChanged = runFixture("bypass-changed", {
       FIXTURE_BYPASS: "changed",
     });
@@ -870,6 +1082,15 @@ esac
     assert.notDeepEqual(
       JSON.parse(readFileSync(parameterChanged.output, "utf8")),
       JSON.parse(readFileSync(baseline.output, "utf8")),
+    );
+    const rulesChanged = runFixture("rules-changed", {
+      FIXTURE_RULES_CHANGED: "true",
+    });
+    assert.equal(rulesChanged.result.status, 0, rulesChanged.result.stderr);
+    assert.notEqual(
+      rulesChanged.result.stdout,
+      baseline.result.stdout,
+      "non-effective full-ruleset rule drift must change the digest",
     );
     const classicStrictChanged = runFixture("classic-strict-changed", {
       FIXTURE_CLASSIC_STRICT: "false",
@@ -901,6 +1122,11 @@ esac
       "missing-strict",
       "bypass",
       "classic-missing-strict",
+      "classic-missing-app-id",
+      "classic-zero-app-id",
+      "classic-negative-app-id",
+      "classic-fraction-app-id",
+      "classic-string-app-id",
     ]) {
       const rejected = runFixture(`malformed-${malformed}`, {
         FIXTURE_MALFORMED: malformed,
@@ -969,41 +1195,38 @@ test("installation runbooks pin github.com and close the trust-bootstrap merge o
     /if \.bypass_mode == "pull_request" then\s*\.actor_type != "DeployKey" and \$ruleset\.target == "branch"/u,
   );
   assert.match(legacyInventoryHelper, /\.strict \| type == "boolean"/u);
-  assert.match(
-    legacyInventoryHelper,
-    /if type == "array" then\s*map\(canonical_condition_value\) \| sort_by\(tojson\)/u,
-  );
-  assert.match(
-    legacyInventoryHelper,
-    /elif type == "object" then\s*to_entries\s*\| sort_by\(\.key\)/u,
-  );
-  assert.match(legacyInventoryHelper, /\.parameters\.required_status_checks \|=\s*sort_by/u);
-  assert.match(legacyInventoryHelper, /bypass_actors:\(\$ruleset\.bypass_actors\s*\| sort_by/u);
-  assert.match(legacyInventoryHelper, /\.contexts \|= sort/u);
-  assert.match(legacyInventoryHelper, /\.checks \|= sort_by/u);
   assert.match(legacyInventoryHelper, /\.contexts \| type == "array"/u);
   assert.match(legacyInventoryHelper, /\.checks \| type == "array"/u);
-  assert.match(legacyInventoryHelper, /\. == null or/u);
+  assert.match(legacyInventoryHelper, /has\("app_id"\)/u);
+  assert.match(
+    legacyInventoryHelper,
+    /\.app_id == null or\s*\(\.app_id \| type == "number" and floor == \. and \(\. == -1 or \. > 0\)\)/u,
+  );
   assert.match(legacyInventoryHelper, /printf 'null\\n' > "\$classic_status"/u);
   assert.doesNotMatch(legacyInventoryHelper, /(?:required_status_checks|contexts|checks)\[\]\?/u);
-  assert.match(legacyInventoryHelper, /jq -S -c -n/u);
+  assert.match(
+    legacyInventoryHelper,
+    /node "\$canonicalizer"[\s\S]*?"\$repository_id"[\s\S]*?"\$repository_node_id"[\s\S]*?> "\$canonical_inventory"/u,
+  );
+  assert.match(
+    legacyInventoryCanonicalizer,
+    /canonicalLegacyReviewGateInventoryBytes/u,
+  );
   for (const field of [
     "repository",
-    "default_branch",
-    "id",
-    "name",
-    "source_type",
-    "source",
-    "enforcement",
-    "target",
-    "conditions",
-    "bypass_actors",
-    "effective_required_status_checks_rule",
-    "classic_required_status_checks",
+    "repositoryId",
+    "repositoryNodeId",
+    "defaultBranch",
+    "effectiveRulePages",
+    "rulesets",
+    "classicRequiredStatusChecks",
   ]) {
-    assert.match(legacyInventoryHelper, new RegExp(`${field}:`, "u"), `helper: ${field}`);
+    assert.match(
+      legacyInventoryCanonicalizer,
+      new RegExp(`\\b${field}\\b`, "u"),
+      `canonicalizer: ${field}`,
+    );
   }
-  assert.match(legacyInventoryHelper, /sort_by\(\[\.id,?\s*\.name,?\s*\.source_type/iu);
   assert.match(legacyInventoryHelper, /mv "\$output_staging" "\$output"/u);
   assert.match(legacyInventoryHelper, /LEGACY_INVENTORY_SHA256=%s/u);
   const helperCleanup = legacyInventoryHelper.slice(
@@ -1083,7 +1306,11 @@ test("installation runbooks pin github.com and close the trust-bootstrap merge o
     assert.equal((transaction.match(/^\s*LEGACY_INVENTORY_SHA256=/gmu) ?? []).length, 0, name);
     assert.doesNotMatch(transaction, /test "\$RULESET_LEGACY_COUNT" -eq 0/u, name);
     assert.doesNotMatch(transaction, /test "\$CLASSIC_LEGACY_COUNT" -eq 0/u, name);
-    assert.match(trustBootstrap, /(?:keep every legacy requirement active|让全部 legacy requirements 保持 active|保留全部 legacy requirements|保留所有 legacy requirement)/iu, name);
+    assert.match(
+      trustBootstrap,
+      /(?:keep every legacy requirement active|让全部\s+legacy\s+requirements\s+保持\s+active|保留全部\s+legacy\s+requirements|保留所有\s+legacy\s+requirement)/iu,
+      name,
+    );
     assert.match(trustBootstrap, /(?:post-merge|merge 后立即)/iu, name);
 
     const freshHashIndex = transaction.indexOf('FRESH_LEGACY_INVENTORY_SHA256="$(node');
@@ -1183,17 +1410,27 @@ test("installation runbooks pin github.com and close the trust-bootstrap merge o
     );
     const afterMerge = trustBootstrap.slice(globalMergeIndex);
     const lifecycleReadIndex = afterMerge.indexOf('--json baseRefName,headRefOid,state,mergedAt');
-    const removalIndex = afterMerge.search(/(?:remove all|删除 inventory 中全部|removal plan)/iu);
     const disabledIndex = afterMerge.indexOf("Disabled");
-    const canaryIndex = afterMerge.search(/canary/iu);
-    const activeIndex = afterMerge.search(/(?:activate|active|激活)/iu);
+    const canaryOffset = afterMerge.slice(disabledIndex).search(/canary/iu);
+    const canaryIndex = canaryOffset < 0 ? -1 : disabledIndex + canaryOffset;
+    const activeReadbackEnd = matchEndAfter(
+      afterMerge,
+      canaryIndex,
+      ACTIVE_V2_READBACK_PATTERN,
+    );
+    const removalOffset = afterMerge
+      .slice(activeReadbackEnd)
+      .search(/(?:legacy-removal plan|legacy removal plan|legacy cleanup|cleanup[\s\S]{0,80}legacy|(?:移除|删除)[\s\S]{0,80}legacy)/iu);
+    const removalIndex = removalOffset < 0
+      ? -1
+      : activeReadbackEnd + removalOffset;
     assert.ok(
       lifecycleReadIndex >= 0 &&
-        removalIndex > lifecycleReadIndex &&
-        disabledIndex > removalIndex &&
+        disabledIndex > lifecycleReadIndex &&
         canaryIndex > disabledIndex &&
-        activeIndex > canaryIndex,
-      `${name}: merge readback, legacy removal, Disabled, canary, Active order`,
+        activeReadbackEnd > canaryIndex &&
+        removalIndex >= activeReadbackEnd,
+      `${name}: merge readback, Disabled, canary, Active readback, legacy cleanup order`,
     );
   }
 });
@@ -1211,11 +1448,87 @@ test("installation runbooks require read-only default workflow permissions", () 
 test("installation runbooks inventory rulesets and classic legacy contexts", () => {
   for (const [name, guide] of Object.entries(installGuides)) {
     assert.match(guide, /effective\s+repository\s+rulesets/iu, name);
-    assert.match(guide, /classic branch protection/iu, name);
+    assert.match(guide, /classic\s+branch\s+protection/iu, name);
     assert.match(guide, /codex\/review-gate/u, name);
-    assert.match(guide, /(?:remove (?:it|the context) manually|人工移除)/iu, name);
-    assert.match(guide, /fails?\s+closed/iu, name);
+    assert.match(
+      guide,
+      /(?:(?:keep|preserve)[\s\S]{0,120}legacy[\s\S]{0,80}active|保留[\s\S]{0,120}active[\s\S]{0,80}legacy|legacy[\s\S]{0,80}保持\s*active)/iu,
+      name,
+    );
+    assert.match(
+      guide,
+      /(?:distinct[\s\S]{0,80}V2_RULESET_NAME|V2_RULESET_NAME[\s\S]{0,80}distinct)/iu,
+      name,
+    );
+    assert.match(guide, /(?:Active readback|Active policy)/u, name);
+    assert.match(guide, /(?:separately authorised|另行授权)[\s\S]{0,100}(?:cleanup|legacy)/iu, name);
+    assert.match(guide, /fails?(?:\s+|-)+closed/iu, name);
     assert.match(guide, /inconclusive/iu, name);
+  }
+});
+
+test("installation runbooks bind pre-cleanup remote writes and use a digest-free final closure probe", () => {
+  for (const [name, guide] of Object.entries(installGuides)) {
+    assert.match(
+      guide,
+      /V2_RULESET_NAME\s*=[^\n]*Must Pass Codex Review/u,
+      name,
+    );
+    const remoteCommands = bootstrapRemoteCommands(guide);
+    assert.equal(
+      remoteCommands.length,
+      5,
+      `${name}: expected stage preview/apply, activation preview/apply, and final probe`,
+    );
+    for (const { text } of remoteCommands) {
+      assert.match(
+        text,
+        /--ruleset-name "\$V2_RULESET_NAME"/u,
+        `${name}: ${text}`,
+      );
+    }
+
+    const finalProbes = remoteCommands.filter(({ text }) =>
+      text.includes("--verify-post-cleanup"),
+    );
+    assert.equal(finalProbes.length, 1, `${name}: one explicit post-cleanup probe`);
+    const [finalProbe] = finalProbes;
+    const preCleanup = remoteCommands.filter((command) => command !== finalProbe);
+    assert.equal(preCleanup.length, 4, `${name}: four pre-cleanup remote commands`);
+    for (const { text } of preCleanup) {
+      assert.equal(
+        (text.match(/--expected-legacy-inventory-sha256/gu) ?? []).length,
+        1,
+        `${name}: one approval digest per pre-cleanup command`,
+      );
+      assert.match(
+        text,
+        /--expected-legacy-inventory-sha256\s+\\\n\s*"\$\{LEGACY_INVENTORY_SHA256\}"/u,
+        `${name}: ${text}`,
+      );
+      assert.doesNotMatch(text, /--verify-post-cleanup/u, name);
+    }
+    assert.equal(
+      preCleanup.filter(({ text }) => text.includes("--activate")).length,
+      2,
+      `${name}: activation preview and apply`,
+    );
+    assert.equal(
+      preCleanup.filter(({ text }) => text.includes("--apply")).length,
+      2,
+      `${name}: staging and activation apply`,
+    );
+    assert.doesNotMatch(
+      finalProbe.text,
+      /--expected-legacy-inventory-sha256|LEGACY_INVENTORY_SHA256|--apply|--activate/u,
+      `${name}: post-cleanup closure must not replay the stale digest or mutate`,
+    );
+    const lastPreCleanupEnd = Math.max(...preCleanup.map(({ end }) => end));
+    assert.match(
+      guide.slice(lastPreCleanupEnd, finalProbe.start),
+      /(?:legacy cleanup|cleanup[\s\S]{0,100}legacy|(?:移除|删除)[\s\S]{0,100}legacy)/iu,
+      `${name}: legacy cleanup must separate activation from final closure`,
+    );
   }
 });
 
@@ -2484,4 +2797,36 @@ function shellCommandSegments(source) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function matchEndAfter(value, start, pattern) {
+  if (!Number.isInteger(start) || start < 0) {
+    return -1;
+  }
+  const match = pattern.exec(value.slice(start));
+  return match === null ? -1 : start + match.index + match[0].length;
+}
+
+function bootstrapRemoteCommands(markdown) {
+  const lines = markdown.split("\n");
+  const commands = [];
+  let offset = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const start = offset;
+    const command = [lines[index]];
+    offset += lines[index].length + 1;
+    if (!lines[index].includes("bootstrap-codex-review-gate.mjs")) {
+      continue;
+    }
+    while (command.at(-1).trimEnd().endsWith("\\") && index + 1 < lines.length) {
+      index += 1;
+      command.push(lines[index]);
+      offset += lines[index].length + 1;
+    }
+    const text = command.join("\n");
+    if (text.includes("--repo")) {
+      commands.push({ text, start, end: offset - 1 });
+    }
+  }
+  return commands;
 }

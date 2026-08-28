@@ -78,17 +78,26 @@ base-branch CODEOWNERS policy cannot enforce its own bootstrap. That approval
 is necessary but insufficient: keep legacy protection through merge, bind a
 canonical read-only inventory SHA-256 into the approval snapshot, and require
 the final transaction to rebuild the strict inventory and match that external
-digest. The inventory binds complete ruleset `bypass_actors` and the complete
-matching effective `required_status_checks` rule with every parameter, not
-merely one matching check. It then authenticates the owner as current actor, rereads the latest
-exact-head approval, and synchronously merges the exact SHA. Immediately after
+digest. It binds repository/default branch, each matching ruleset's complete
+identity, source, enforcement, target, conditions, `bypass_actors`, `rules`,
+and effective `required_status_checks` rule, plus the complete classic
+required-status object including each check's producer `app_id`. A canonical
+empty inventory still has a repository/branch-bound digest; incomplete
+API/schema data or any drift fails closed. It then authenticates the owner as
+current actor, rereads the latest exact-head approval, and synchronously merges
+the exact SHA. Immediately after
 merge, it rereads the current default and requires the PR's merged lifecycle,
 base, and head to remain the exact approved scope. Failure preserves every
-legacy requirement active; only success permits the separately authorised plan
-to remove and read back the inventoried legacy requirements.
-The migration PR carries both workflows plus CODEOWNERS. The ruleset is staged only
-after merge as Disabled, proved by canary, then activated with no bypass
-actors. Once active, Code Owner review and stale-approval dismissal protect
+legacy requirement active. After success, a separate v2 ruleset is staged as
+Disabled while legacy remains active, proved by canary, then activated and read
+back with no bypass actors. Every pre-cleanup stage/activation preview and
+apply explicitly reuses the same owner-approved digest across processes
+through that exact Active readback. Only then may the separately authorised
+plan remove the inventoried legacy requirements. Cleanup necessarily changes
+the old digest, so final closure uses read-only `--verify-post-cleanup` without
+that digest to prove both legacy surfaces clear and v2 still Active. The
+migration PR carries both workflows plus CODEOWNERS. Once active,
+Code Owner review and stale-approval dismissal protect
 later changes. Required check `integration_id: 15368` denotes the entire GitHub
 Actions App, so it is not by itself proof that the canonical verifier produced
 the CheckRun. Exact bytes, complete workflow inventory, CODEOWNERS, Code Owner
@@ -491,7 +500,9 @@ v1 remains frozen and valid for consumers that have not migrated. v2 does not
 read v1 state, publish a compatibility selector, mutate v1 refs or fall back to
 the v1 reducer. Migration removes the v1 caller and installs the canonical v2
 workflow plus CODEOWNERS in one PR after the pre-merge canonical inventory
-fingerprint closure. It then removes and reads back the inventoried legacy
-requirements, stages the v2 ruleset as Disabled, verifies
-it in a separate harmless canary PR, then activates it and closes the canary
+fingerprint closure. It keeps the inventoried legacy requirements active,
+stages a separate v2 ruleset as Disabled, verifies it in a harmless canary PR,
+then activates and reads the complete Active policy back. Only afterward does
+separately authorised cleanup remove and read back legacy; final closure proves
+both legacy surfaces clear and v2 still Active before the canary closes
 unmerged.

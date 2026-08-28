@@ -30,18 +30,26 @@ and CODEOWNERS. Keep
 every active or inherited legacy `codex/review-gate` requirement through the
 merge. Before merge, the owner approval snapshot records a canonical read-only legacy
 inventory SHA-256; the final fail-fast transaction must rebuild the same strict
-inventory and match that external digest. It includes complete ruleset
-`bypass_actors` and the complete matching effective `required_status_checks`
-rule with every parameter, not merely one matching check. The transaction must prove the current actor is the named
-owner and that owner's latest exact-head review remains approved, then call
+inventory and match that external digest. The digest binds repository/default
+branch, each matching ruleset's full identity, source, enforcement, target,
+conditions, `bypass_actors`, `rules`, and effective `required_status_checks`
+rule, plus the complete classic required-status object including every check's
+producer `app_id`. Even an empty legacy inventory has a repository/branch-bound
+digest. Incomplete API/schema data or any drift fails closed. The transaction
+must prove the current actor is the named owner and that owner's latest
+exact-head review remains approved, then call
 the synchronous exact-SHA merge endpoint. Approval and head stability alone do
 not close bootstrap trust. After merge, immediately reread the current default
 and require the PR's merged lifecycle, base, and head to remain the exact
 approved scope. A failed readback keeps every legacy requirement active. Only
-after success, remove and read back the inventoried legacy requirements under
-separate authorization. Stage the
-supplied ruleset only after merge as
-Disabled, prove it with a canary, then activate it with no bypass actors.
+after success, stage a separate supplied v2 ruleset as Disabled while legacy
+remains active, prove it with a canary, then activate and read back the complete
+Active policy with no bypass actors. Every pre-cleanup stage/activation preview
+and apply must explicitly reuse that same owner-approved digest across
+processes through the exact Active readback. Only then may separately
+authorised cleanup remove the inventoried legacy requirements. Cleanup changes
+the old digest, so final closure uses read-only `--verify-post-cleanup` without
+it to prove both legacy surfaces clear and the same v2 policy Active.
 The active ruleset requires Code Owner review and stale-approval dismissal.
 Required-check `integration_id: 15368` identifies the entire GitHub Actions App,
 not either workflow. Exact-byte verification of both workflows, fail-closed

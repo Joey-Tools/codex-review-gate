@@ -103,6 +103,18 @@ const executionEnv = {
 };
 let verificationInvocationCounter = 0;
 
+function workflowJobBlock(workflow, jobName) {
+  const marker = `  ${jobName}:\n`;
+  const start = workflow.indexOf(marker, workflow.indexOf("\njobs:\n"));
+  assert.notEqual(start, -1, `missing workflow job: ${jobName}`);
+  const bodyStart = start + marker.length;
+  const nextJobOffset = workflow
+    .slice(bodyStart)
+    .search(/^  [A-Za-z0-9_-]+:\s*$/mu);
+  const end = nextJobOffset === -1 ? workflow.length : bodyStart + nextJobOffset;
+  return workflow.slice(start, end);
+}
+
 function run(file, args, options = {}) {
   return execFileSync(file, args, {
     encoding: "utf8",
@@ -953,6 +965,27 @@ test("publisher fixtures isolate the host workflow identity and credentials", ()
     output: "",
     tokens: ["", "", "", ""],
   });
+});
+
+test("only heavy release-candidate jobs receive extended timeout headroom", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  assert.equal(workflow.match(/^    timeout-minutes: 30$/gmu)?.length ?? 0, 3);
+  assert.equal(workflow.match(/^    timeout-minutes: 14$/gmu)?.length ?? 0, 4);
+  for (const jobName of ["candidate-a", "candidate-b"]) {
+    const job = workflowJobBlock(workflow, jobName);
+    assert.match(job, /^    runs-on: ubuntu-24\.04$/mu, jobName);
+    assert.match(job, /^    timeout-minutes: 30$/mu, jobName);
+    assert.doesNotMatch(job, /^    timeout-minutes: 14$/mu, jobName);
+  }
+  for (const jobName of ["plan", "assemble", "publication_plan", "verify"]) {
+    const job = workflowJobBlock(workflow, jobName);
+    assert.match(job, /^    runs-on: ubuntu-slim$/mu, jobName);
+    assert.match(job, /^    timeout-minutes: 14$/mu, jobName);
+    assert.doesNotMatch(job, /^    timeout-minutes: 30$/mu, jobName);
+  }
+  const publish = workflowJobBlock(workflow, "publish");
+  assert.match(publish, /^    runs-on: ubuntu-24\.04$/mu);
+  assert.match(publish, /^    timeout-minutes: 30$/mu);
 });
 
 test("workflow and publisher expose the adopted staged ABI and scoped credentials", () => {

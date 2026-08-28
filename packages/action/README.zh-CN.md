@@ -48,15 +48,21 @@ owner 的独立 exact-head approval。首次 migration PR 只包含两份 canoni
 CODEOWNERS，不在其中修改 ruleset。合并前移除所有 legacy `codex/review-gate`
 requirement 并不安全；应保留旧保护，把 canonical read-only legacy inventory
 SHA-256 绑定进 owner approval snapshot，并在 final transaction fresh 重建、精确匹配。
-Inventory 包含完整 ruleset `bypass_actors` 与全部 parameters 的完整 matching effective
-`required_status_checks` rule，而不只是 matching check。
+Digest 绑定 repository/default branch、每个 matching ruleset 的完整 identity、source、
+enforcement、target、conditions、`bypass_actors` 与 `rules`、完整 effective
+`required_status_checks` rule，以及包括每个 check producer `app_id` 的完整 classic
+required-status object。即使 legacy inventory 为空，也有绑定 repository/branch 的 digest；
+API/schema 不完整或任何 drift 都 fail closed。
 随后要求 authenticated actor 就是该 owner、fresh 重读 owner exact-head approval，并调用
 synchronous exact-SHA merge endpoint。Merge 后先立即重读 current default，并要求 PR
 确已 merged、base/head 仍精确等于 approved scope；readback 失败时保留全部 legacy
-requirements active。只有 readback 成功后，才在单独授权下删除并读回 inventoried legacy
-requirements。
-仅有 approval 与 head reread 不足以闭环。Merge 后把 supplied ruleset 以 Disabled stage，
-通过无害 canary 证明后才 activate。
+requirements active。Readback 成功后仍保留 legacy，另把 supplied v2 ruleset 以 Disabled
+stage，通过无害 canary 证明，再 activate 并精确读回完整 Active policy。Cleanup 前每次
+stage/activation preview 与 apply 都必须跨进程显式复用同一个 owner-approved digest，直到
+该 Active readback。只有之后才可在单独授权下删除 inventoried legacy requirements；
+cleanup 必然改变旧 digest，因此 final closure 使用不携带该 digest 的只读
+`--verify-post-cleanup`，同时证明两个 legacy surfaces 已清空且同一 v2 policy 仍为 Active。
+仅有 approval 与 head reread 不足以闭环。
 
 复制的 workflows 分别负责 triggers、typed dispatch inputs、permissions、独立
 concurrency namespace 与 runner 启动前事件过滤。verifier 的 GitHub-managed job

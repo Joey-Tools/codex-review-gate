@@ -72,14 +72,22 @@ contract。canonical helper 安装两份 workflows，并写入最终生效的两
 的 approval，因为尚未进入 base branch 的新 CODEOWNERS policy 不能自行强制 bootstrap；
 但 approval 并不充分。旧保护保留到 merge；owner approval snapshot 绑定 canonical
 read-only legacy inventory SHA-256，final transaction fresh 重建 strict inventory 并匹配该 external
-digest。Inventory 绑定完整 ruleset `bypass_actors` 与全部 parameters 的完整 matching
-effective `required_status_checks` rule，而不只是 matching check；随后再证明 current actor
+digest。它绑定 repository/default branch、每个 matching ruleset 的完整 identity、source、
+enforcement、target、conditions、`bypass_actors`、`rules` 与 effective
+`required_status_checks` rule，以及包括每个 check producer `app_id` 的完整 classic
+required-status object。Canonical empty inventory 仍有绑定 repository/branch 的 digest；
+API/schema 不完整或任何 drift 都 fail closed。随后再证明 current actor
 就是 owner、latest exact-head approval 仍有效，然后同步 merge
 exact SHA。Merge 后先立即重读 current default，并要求 PR 的 merged lifecycle、base 与 head
 仍精确等于 approved scope；失败时保留全部 legacy requirements active。只有成功后才按
-单独授权移除并读回 inventoried legacy requirements。Migration PR
-只承载两份 workflows 与 CODEOWNERS；ruleset 随后才以 Disabled stage，经 canary 证明后 activate，且没有
-bypass actors。启用后，Code Owner review 与 push 后 stale-approval dismissal 会保护后续变更。
+fail-closed 顺序另建 Disabled v2 ruleset，同时继续保持 legacy active；经 canary 证明后
+activate 并精确读回完整 Active policy，且没有 bypass actors。只有该 Active readback 成功，
+才可按单独授权移除并读回 inventoried legacy requirements。Cleanup 前每次
+stage/activation preview 与 apply 都必须跨进程显式复用同一个 owner-approved digest，直到
+该 exact Active readback。Cleanup 必然改变旧 digest，因此 final closure 使用不携带该
+digest 的只读 `--verify-post-cleanup`，要求两个 legacy surfaces 都已清空且 v2 仍 Active。
+Migration PR 只承载两份 workflows 与 CODEOWNERS。启用后，
+Code Owner review 与 push 后 stale-approval dismissal 会保护后续变更。
 required check 的 `integration_id: 15368` 标识整个 GitHub Actions App，因此单独使用它
 不能证明 canonical verifier 产生了 CheckRun。exact bytes、完整 workflow inventory、
 CODEOWNERS、Code Owner review、strict freshness、no bypass 与 canary collision readback
@@ -441,6 +449,7 @@ v1 对尚未迁移的 consumers 保持 frozen 和 valid。v2 不读取 v1 state�
 compatibility selector、不修改 v1 refs，也不 fallback 到 v1 reducer。迁移在 pre-merge
 canonical inventory fingerprint closure 后，用一个 PR 删除 v1 caller、安装 canonical v2
 workflow 与 CODEOWNERS；合并后先完成 current-default 与 exact merged/base/head readback，
-失败则保留 legacy，成功后才移除并读回 inventoried legacy requirements，再把 v2
-ruleset 以 Disabled stage，用单独无害 canary 验证后
-activate，并关闭 canary、不合并。
+失败则保留 legacy。成功后也继续保持 legacy active，另把 v2 ruleset 以 Disabled stage，
+用单独无害 canary 验证，再 activate 并读回完整 Active policy。只有之后才移除并读回
+inventoried legacy requirements；确认两个 legacy surfaces 清空且 v2 仍 Active 后，关闭
+canary、不合并。

@@ -25,8 +25,11 @@ import {
   DEFAULT_VERIFIER_RUN_NAME_PREFIX,
   DEFAULT_WORKFLOW_PATH,
   LEGACY_STATUS_CONTEXT,
+  assertCompleteRulesetApiObject,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
+  canonicalClassicRequiredStatusChecks,
+  canonicalLegacyReviewGateInventoryBytes,
   buildUpdateRulesetPayload,
   codeownersHasEffectiveUnmanagedPatterns,
   decodeGitHubBlobContent,
@@ -83,6 +86,14 @@ async function main() {
     controlPlaneOwner: options.controlPlaneOwner,
   });
   const { defaultBranch } = initialSecuritySnapshot;
+  if (!options.verifyPostCleanup) {
+    await assertExpectedLegacyInventoryDigest({
+      repoSlug: options.repo.slug,
+      defaultBranch,
+      expectedDigest: options.expectedLegacyInventorySha256,
+      phase: "initial approval-snapshot readback",
+    });
+  }
 
   const effectiveRulesets = await loadRulesets(options.repo.slug);
   if (options.activate) {
@@ -98,6 +109,11 @@ async function main() {
   console.log(`Verifier: ${DEFAULT_WORKFLOW_PATH} exactly matches the canonical v2 verifier`);
   console.log(`Controller: ${DEFAULT_CONTROLLER_WORKFLOW_PATH} exactly matches the canonical v2 controller`);
   console.log(`Control plane: ${DEFAULT_CODEOWNERS_PATH} protects the workflow and itself for ${options.controlPlaneOwner}`);
+  if (initialSecuritySnapshot.classicLegacyStatusRequired) {
+    console.log(
+      `Fail-closed migration overlap: classic branch protection continues to require ${LEGACY_STATUS_CONTEXT} until the separate v2 ruleset is active and read back.`,
+    );
+  }
 
   const repoRulesets = effectiveRulesets.filter(
     (ruleset) =>
@@ -116,7 +132,56 @@ async function main() {
     );
   }
 
-  const unmanageableLegacyRulesets = effectiveRulesets.filter(
+  if (options.verifyPostCleanup) {
+    const firstLegacyInventory = await assertPostCleanupLegacyInventoryClear({
+      repoSlug: options.repo.slug,
+      defaultBranch,
+      repositoryId: initialSecuritySnapshot.repoId,
+      repositoryNodeId: initialSecuritySnapshot.repoNodeId,
+    });
+    if (repoRuleset === undefined) {
+      throw new Error(
+        `Post-cleanup verification requires repository ruleset "${options.rulesetName}" to exist.`,
+      );
+    }
+    const firstFullRuleset = await loadPostCleanupV2Ruleset({
+      repoSlug: options.repo.slug,
+      rulesetId: repoRuleset.id,
+      rulesetName: options.rulesetName,
+      defaultBranch,
+      context: options.context,
+      integrationId: options.integrationId,
+    });
+    const secondLegacyInventory = await assertPostCleanupLegacyInventoryClear({
+      repoSlug: options.repo.slug,
+      defaultBranch,
+      repositoryId: initialSecuritySnapshot.repoId,
+      repositoryNodeId: initialSecuritySnapshot.repoNodeId,
+    });
+    const secondFullRuleset = await loadPostCleanupV2Ruleset({
+      repoSlug: options.repo.slug,
+      rulesetId: repoRuleset.id,
+      rulesetName: options.rulesetName,
+      defaultBranch,
+      context: options.context,
+      integrationId: options.integrationId,
+    });
+    if (
+      firstLegacyInventory !== secondLegacyInventory ||
+      postCleanupRulesetFingerprint(firstFullRuleset) !==
+        postCleanupRulesetFingerprint(secondFullRuleset)
+    ) {
+      throw new Error(
+        "Post-cleanup repository, legacy-inventory, or v2-ruleset state changed across the two complete readbacks; verification is inconclusive and must be rerun against a stable repository.",
+      );
+    }
+    console.log(
+      `Post-cleanup verified across two complete stable readbacks: both legacy requirement surfaces are clear and ${rulesetLabel(secondFullRuleset)} remains the complete Active v2 gate.`,
+    );
+    return;
+  }
+
+  const overlappingLegacyRulesets = effectiveRulesets.filter(
     (ruleset) =>
       ruleset.enforcement === "active" &&
       rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
@@ -125,11 +190,23 @@ async function main() {
       }) &&
       ruleset.id !== repoRuleset?.id,
   );
-  if (unmanageableLegacyRulesets.length > 0) {
-    throw new Error(
-      `${LEGACY_STATUS_CONTEXT} is still required by ${unmanageableLegacyRulesets
+  if (overlappingLegacyRulesets.length > 0) {
+    console.log(
+      `Fail-closed migration overlap: ${LEGACY_STATUS_CONTEXT} remains active in ${overlappingLegacyRulesets
         .map(rulesetLabel)
-        .join(", ")}; remove that legacy requirement in the installation PR or ruleset settings before activating v2.`,
+        .join(", ")} until the separate v2 ruleset is active and read back.`,
+    );
+  }
+
+  if (
+    repoRuleset?.enforcement === "active" &&
+    (!rulesetCoversDefaultBranch(repoRuleset, defaultBranch) ||
+      !rulesetHasGatePolicy(repoRuleset, options.context, {
+        integrationId: options.integrationId,
+      }))
+  ) {
+    throw new Error(
+      `Repository ruleset "${options.rulesetName}" is an active legacy or incomplete gate; refusing to disable or replace it during v2 staging. Keep it active and rerun with a distinct --ruleset-name for the disabled v2 ruleset.`,
     );
   }
 
@@ -173,6 +250,12 @@ async function main() {
       initialSecuritySnapshot,
       currentSecuritySnapshot,
     );
+    await assertExpectedLegacyInventoryDigest({
+      repoSlug: options.repo.slug,
+      defaultBranch,
+      expectedDigest: options.expectedLegacyInventorySha256,
+      phase: "ruleset pre-write readback",
+    });
     if (options.activate) {
       await assertCanaryCheckRunSource({
         repoSlug: options.repo.slug,
@@ -195,6 +278,7 @@ async function main() {
       enforcement: payload.enforcement,
       expectedPayload: payload,
       exactWritableFields: false,
+      logSuccess: false,
     });
     const postWriteSecuritySnapshot = await loadConsumerSecuritySnapshot({
       repoSlug: options.repo.slug,
@@ -207,22 +291,51 @@ async function main() {
       postWriteSecuritySnapshot,
       { phase: "ruleset post-write readback" },
     );
+    await assertExpectedLegacyInventoryDigest({
+      repoSlug: options.repo.slug,
+      defaultBranch,
+      expectedDigest: options.expectedLegacyInventorySha256,
+      phase: "ruleset post-write readback",
+    });
+    await assertRulesetReadback({
+      repoSlug: options.repo.slug,
+      rulesetId: created?.id,
+      defaultBranch,
+      context: options.context,
+      integrationId: options.integrationId,
+      enforcement: payload.enforcement,
+      expectedPayload: payload,
+      exactWritableFields: false,
+    });
     console.log(`Created ruleset: ${rulesetLabel(created)}`);
     return;
   }
 
-  const fullRuleset = await ghJson(`repos/${options.repo.slug}/rulesets/${repoRuleset.id}`);
+  const fullRuleset = assertSelectedRepositoryRulesetIdentity(
+    await ghJson(`repos/${options.repo.slug}/rulesets/${repoRuleset.id}`),
+    {
+      repoSlug: options.repo.slug,
+      rulesetId: repoRuleset.id,
+      rulesetName: options.rulesetName,
+    },
+  );
   if (
     options.activate &&
     fullRuleset?.enforcement === "active" &&
     rulesetCoversDefaultBranch(fullRuleset, defaultBranch) &&
     rulesetHasGatePolicy(fullRuleset, options.context, {
       integrationId: options.integrationId,
-    }) &&
-    !rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
-      integrationId: undefined,
     })
   ) {
+    if (
+      rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
+        integrationId: undefined,
+      })
+    ) {
+      console.log(
+        `No cleanup: ${LEGACY_STATUS_CONTEXT} remains required by the active v2 ruleset until a separately authorised legacy cleanup removes it.`,
+      );
+    }
     console.log(
       `No change: the complete v2 gate policy is already enforced by ${rulesetLabel(fullRuleset)}.`,
     );
@@ -269,6 +382,15 @@ async function main() {
     });
   }
   if (!changed) {
+    if (
+      rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
+        integrationId: undefined,
+      })
+    ) {
+      console.log(
+        `No cleanup: ${LEGACY_STATUS_CONTEXT} remains required by the active v2 ruleset until a separately authorised legacy cleanup removes it.`,
+      );
+    }
     console.log(`No change: ${options.context} is already required by ${rulesetLabel(fullRuleset)}.`);
     return;
   }
@@ -309,8 +431,19 @@ async function main() {
       headSha: options.canaryHead,
     });
   }
-  const currentFullRuleset = await ghJson(
-    `repos/${options.repo.slug}/rulesets/${fullRuleset.id}`,
+  await assertExpectedLegacyInventoryDigest({
+    repoSlug: options.repo.slug,
+    defaultBranch,
+    expectedDigest: options.expectedLegacyInventorySha256,
+    phase: "ruleset pre-write readback",
+  });
+  const currentFullRuleset = assertSelectedRepositoryRulesetIdentity(
+    await ghJson(`repos/${options.repo.slug}/rulesets/${fullRuleset.id}`),
+    {
+      repoSlug: options.repo.slug,
+      rulesetId: fullRuleset.id,
+      rulesetName: options.rulesetName,
+    },
   );
   if (
     rulesetWritableFingerprint(currentFullRuleset) !==
@@ -320,9 +453,52 @@ async function main() {
       `Ruleset ${fullRuleset.id} changed after planning; refusing a lost-update overwrite. Re-run bootstrap against the latest ruleset.`,
     );
   }
+  await assertExpectedLegacyInventoryDigest({
+    repoSlug: options.repo.slug,
+    defaultBranch,
+    expectedDigest: options.expectedLegacyInventorySha256,
+    phase: "final ruleset pre-write readback",
+  });
+  if (activeWrite) {
+    await assertCanaryCheckRunSource({
+      repoSlug: options.repo.slug,
+      defaultBranch,
+      defaultBranchHeadSha: currentSecuritySnapshot.defaultBranchHeadSha,
+      prNumber: options.canaryPr,
+      headSha: options.canaryHead,
+    });
+    const finalSecuritySnapshot = await loadConsumerSecuritySnapshot({
+      repoSlug: options.repo.slug,
+      canonicalWorkflows,
+      controlPlaneOwner: options.controlPlaneOwner,
+      expectedDefaultBranch: defaultBranch,
+    });
+    assertConsumerSecuritySnapshotStable(
+      currentSecuritySnapshot,
+      finalSecuritySnapshot,
+      { phase: "final ruleset pre-write readback" },
+    );
+  }
+  const finalFullRuleset = assertSelectedRepositoryRulesetIdentity(
+    await ghJson(`repos/${options.repo.slug}/rulesets/${fullRuleset.id}`),
+    {
+      repoSlug: options.repo.slug,
+      rulesetId: fullRuleset.id,
+      rulesetName: options.rulesetName,
+    },
+  );
+  if (
+    rulesetWritableFingerprint(finalFullRuleset) !==
+    rulesetWritableFingerprint(fullRuleset)
+  ) {
+    throw new Error(
+      `Ruleset ${fullRuleset.id} changed during the final legacy-inventory readback; refusing a lost-update overwrite. Re-run bootstrap against the latest ruleset.`,
+    );
+  }
   // GitHub's ruleset API does not expose an If-Match update contract here.
-  // This full writable-field reread is therefore the final best-effort
-  // lost-update boundary immediately before PUT.
+  // Bracket the legacy read with full target-ruleset reads, then keep this
+  // second writable-field reread adjacent to PUT. These are the final
+  // best-effort lost-update boundaries without an API If-Match contract.
   const updated = await ghJson(`repos/${options.repo.slug}/rulesets/${fullRuleset.id}`, {
     method: "PUT",
     body: payload,
@@ -336,6 +512,7 @@ async function main() {
     enforcement: payload.enforcement,
     expectedPayload: payload,
     exactWritableFields: true,
+    logSuccess: false,
   });
   const postWriteSecuritySnapshot = await loadConsumerSecuritySnapshot({
     repoSlug: options.repo.slug,
@@ -348,6 +525,22 @@ async function main() {
     postWriteSecuritySnapshot,
     { phase: "ruleset post-write readback" },
   );
+  await assertExpectedLegacyInventoryDigest({
+    repoSlug: options.repo.slug,
+    defaultBranch,
+    expectedDigest: options.expectedLegacyInventorySha256,
+    phase: "ruleset post-write readback",
+  });
+  await assertRulesetReadback({
+    repoSlug: options.repo.slug,
+    rulesetId: fullRuleset.id,
+    defaultBranch,
+    context: options.context,
+    integrationId: options.integrationId,
+    enforcement: payload.enforcement,
+    expectedPayload: payload,
+    exactWritableFields: true,
+  });
   console.log(`Updated ruleset: ${rulesetLabel(updated)}`);
 }
 
@@ -358,6 +551,8 @@ function readCliOptions() {
       "prepare-worktree": { type: "string" },
       apply: { type: "boolean", default: false },
       activate: { type: "boolean", default: false },
+      "verify-post-cleanup": { type: "boolean", default: false },
+      "expected-legacy-inventory-sha256": { type: "string" },
       "ruleset-name": { type: "string", default: DEFAULT_RULESET_NAME },
       "control-plane-owner": {
         type: "string",
@@ -386,6 +581,38 @@ function readCliOptions() {
   if (hasPrepareWorktree && values.activate) {
     throw new Error("--activate is only valid with --repo after the canary passes.");
   }
+  if (
+    hasPrepareWorktree &&
+    values["expected-legacy-inventory-sha256"] !== undefined
+  ) {
+    throw new Error(
+      "--expected-legacy-inventory-sha256 is only valid with --repo after the owner approval snapshot is recorded.",
+    );
+  }
+  if (hasPrepareWorktree && values["verify-post-cleanup"]) {
+    throw new Error("--verify-post-cleanup is valid only with --repo.");
+  }
+  if (
+    hasRepo &&
+    !values["verify-post-cleanup"] &&
+    values["expected-legacy-inventory-sha256"] === undefined
+  ) {
+    throw new Error(
+      "--repo requires --expected-legacy-inventory-sha256 from the external owner approval snapshot, including when both legacy surfaces were empty.",
+    );
+  }
+  if (
+    values["verify-post-cleanup"] &&
+    (values.apply ||
+      values.activate ||
+      values["canary-pr"] !== undefined ||
+      values["canary-head"] !== undefined ||
+      values["expected-legacy-inventory-sha256"] !== undefined)
+  ) {
+    throw new Error(
+      "--verify-post-cleanup is read-only and cannot be combined with --apply, --activate, canary inputs, or the pre-cleanup legacy digest.",
+    );
+  }
   if (values.activate && (values["canary-pr"] === undefined || values["canary-head"] === undefined)) {
     throw new Error("--activate requires both --canary-pr and --canary-head for source readback.");
   }
@@ -409,10 +636,16 @@ function readCliOptions() {
     prepareWorktree: hasPrepareWorktree ? resolve(values["prepare-worktree"]) : null,
     apply: values.apply,
     activate: values.activate,
+    verifyPostCleanup: values["verify-post-cleanup"],
     rulesetName: values["ruleset-name"],
     controlPlaneOwner: normalizeControlPlaneOwner(values["control-plane-owner"]),
     context: values.context,
     integrationId: DEFAULT_STATUS_INTEGRATION_ID,
+    expectedLegacyInventorySha256: hasRepo && !values["verify-post-cleanup"]
+      ? parseExpectedLegacyInventorySha256(
+          values["expected-legacy-inventory-sha256"],
+        )
+      : null,
     canaryPr: values.activate ? parseCanaryPr(values["canary-pr"]) : null,
     canaryHead: values.activate ? parseCanaryHead(values["canary-head"]) : null,
   };
@@ -421,13 +654,17 @@ function readCliOptions() {
 function printUsage() {
   console.log(`Usage:
   node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --activate --canary-pr NUMBER --canary-head SHA [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --activate --canary-pr NUMBER --canary-head SHA [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --verify-post-cleanup [--control-plane-owner @USER]
 
 Options:
   --prepare-worktree PATH Prepare a local consumer checkout for one installation PR.
   --repo OWNER/REPO       Inspect or stage the merged repository ruleset.
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
+  --expected-legacy-inventory-sha256
+                          Exact lowercase SHA-256 from the external owner approval snapshot. Required for every remote staging/activation preview and apply.
+  --verify-post-cleanup   Read-only final proof that legacy requirements are clear and the selected v2 ruleset remains Active.
   --activate              Activate only after verifying the named temporary-PR canary.
   --canary-pr NUMBER      Open canary PR to verify before activation.
   --canary-head SHA       Exact lowercase 40-hex canary head to verify before activation.
@@ -448,6 +685,15 @@ function parseCanaryPr(value) {
     throw new Error(`--canary-pr exceeds the safe integer range: ${value}`);
   }
   return parsed;
+}
+
+function parseExpectedLegacyInventorySha256(value) {
+  if (!/^[0-9a-f]{64}$/u.test(value)) {
+    throw new Error(
+      `--expected-legacy-inventory-sha256 must be an exact lowercase 64-hex SHA-256: ${value}`,
+    );
+  }
+  return value;
 }
 
 function parseCanaryHead(value) {
@@ -912,6 +1158,7 @@ async function assertRulesetReadback({
   enforcement,
   expectedPayload,
   exactWritableFields,
+  logSuccess = true,
 }) {
   if (!Number.isSafeInteger(rulesetId) || rulesetId <= 0) {
     throw new Error(
@@ -919,8 +1166,13 @@ async function assertRulesetReadback({
     );
   }
 
-  const ruleset = await ghJson(`repos/${repoSlug}/rulesets/${rulesetId}`);
+  const ruleset = assertCompleteRulesetApiObject(
+    await ghJson(`repos/${repoSlug}/rulesets/${rulesetId}`),
+  );
   if (
+    ruleset.id !== rulesetId ||
+    ruleset.source_type !== "Repository" ||
+    ruleset.source !== repoSlug ||
     ruleset?.target !== "branch" ||
     ruleset?.enforcement !== enforcement ||
     !rulesetCoversDefaultBranch(ruleset, defaultBranch) ||
@@ -935,9 +1187,11 @@ async function assertRulesetReadback({
     );
   }
 
-  console.log(
-    `Ruleset readback: ${rulesetLabel(ruleset)} is complete with ${enforcement} enforcement.`,
-  );
+  if (logSuccess) {
+    console.log(
+      `Ruleset readback: ${rulesetLabel(ruleset)} is complete with ${enforcement} enforcement.`,
+    );
+  }
   return ruleset;
 }
 
@@ -1168,11 +1422,16 @@ async function loadConsumerSecuritySnapshot({
         repoSlug,
         defaultBranch,
       });
-    if (classicBranchProtection.requiredStatusContexts.includes(LEGACY_STATUS_CONTEXT)) {
-      throw new Error(
-        `${LEGACY_STATUS_CONTEXT} is still required by classic branch protection on ${defaultBranch}; remove that legacy requirement manually before staging or activating v2.`,
+    const classicLegacyStatusRequired =
+      classicBranchProtection.requiredStatusChecks !== null &&
+      (
+        classicBranchProtection.requiredStatusChecks.contexts.includes(
+          LEGACY_STATUS_CONTEXT,
+        ) ||
+        classicBranchProtection.requiredStatusChecks.checks.some(
+          (check) => check.context === LEGACY_STATUS_CONTEXT,
+        )
       );
-    }
     return {
       repoId: repoInfo.id,
       repoNodeId: repoInfo.node_id,
@@ -1182,12 +1441,14 @@ async function loadConsumerSecuritySnapshot({
       codeownersFingerprint: fingerprintText(codeownersContent),
       hasEffectiveUnmanagedCodeownersPatterns:
         codeownersHasEffectiveUnmanagedPatterns(codeownersContent),
-      // The protected property is continued absence of the legacy context.
-      // Every snapshot independently validates endpoint/schema completeness and
-      // rejects that name across contexts plus checks[].context. Presence versus
-      // absence, strict, app_id, duplicates, and unrelated context changes do
-      // not change this property and intentionally are not frozen.
-      classicLegacyStatusAbsent: true,
+      // Keep the complete classic producer-binding representation. contexts[]
+      // and checks[] are distinct surfaces, strict is writable policy, and
+      // app_id null/-1/positive values have different meanings. Missing or
+      // unreadable schema never becomes an empty witness.
+      classicRequiredStatusChecksFingerprint: fingerprintText(
+        JSON.stringify(classicBranchProtection.requiredStatusChecks),
+      ),
+      classicLegacyStatusRequired,
       classicCodeOwnerReviewRequired:
         classicBranchProtection.codeOwnerReviewRequired,
       controlPlaneOwnerPermission,
@@ -1213,18 +1474,19 @@ function assertConsumerSecuritySnapshotStable(
     current.codeownersFingerprint !== expected.codeownersFingerprint ||
     current.hasEffectiveUnmanagedCodeownersPatterns !==
       expected.hasEffectiveUnmanagedCodeownersPatterns ||
-    current.classicLegacyStatusAbsent !== expected.classicLegacyStatusAbsent ||
+    current.classicRequiredStatusChecksFingerprint !==
+      expected.classicRequiredStatusChecksFingerprint ||
     current.classicCodeOwnerReviewRequired !==
       expected.classicCodeOwnerReviewRequired ||
     current.controlPlaneOwnerPermission !== expected.controlPlaneOwnerPermission
   ) {
     if (phase === "ruleset post-write readback") {
       throw new Error(
-        "The ruleset write completed, but repository identity, default branch, canonical workflow inventory, CODEOWNERS, or control-plane owner permission changed during post-write readback. Do not treat staging or activation as complete; inspect the written ruleset and restore or disable it before retrying.",
+        "The ruleset write completed, but repository identity, default branch, canonical workflow inventory, CODEOWNERS, classic legacy-gate overlap, or control-plane owner permission changed during post-write readback. Do not treat staging or activation as complete; inspect the written ruleset and restore or disable it before retrying.",
       );
     }
     throw new Error(
-      `Repository identity, default branch, canonical workflow inventory, CODEOWNERS, or control-plane owner permission changed during ${phase}; no conditional API write is available, so refusing the write.`,
+      `Repository identity, default branch, canonical workflow inventory, CODEOWNERS, classic legacy-gate overlap, or control-plane owner permission changed during ${phase}; no conditional API write is available, so refusing the write.`,
     );
   }
 }
@@ -1238,7 +1500,7 @@ async function loadClassicBranchProtectionPolicy({
   const response = await ghJson(endpoint, { allowNotFound: true });
   if (response === GH_NOT_FOUND) {
     return {
-      requiredStatusContexts: [],
+      requiredStatusChecks: null,
       codeOwnerReviewRequired: false,
     };
   }
@@ -1270,46 +1532,13 @@ async function loadClassicBranchProtectionPolicy({
   }
   if (requiredStatusChecks === null) {
     return {
-      requiredStatusContexts: [],
+      requiredStatusChecks: null,
       codeOwnerReviewRequired,
     };
   }
-  if (
-    typeof requiredStatusChecks !== "object" ||
-    Array.isArray(requiredStatusChecks) ||
-    typeof requiredStatusChecks.strict !== "boolean" ||
-    !Array.isArray(requiredStatusChecks.contexts) ||
-    !Array.isArray(requiredStatusChecks.checks)
-  ) {
-    throw new Error(
-      "Classic branch protection required_status_checks is malformed or incomplete.",
-    );
-  }
-  const contexts = [];
-  for (const context of requiredStatusChecks.contexts) {
-    if (typeof context !== "string" || context === "") {
-      throw new Error(
-        "Classic branch protection contexts contain a malformed status context.",
-      );
-    }
-    contexts.push(context);
-  }
-  for (const check of requiredStatusChecks.checks) {
-    if (
-      check === null ||
-      typeof check !== "object" ||
-      Array.isArray(check) ||
-      typeof check.context !== "string" ||
-      check.context === ""
-    ) {
-      throw new Error(
-        "Classic branch protection checks contain a malformed status context.",
-      );
-    }
-    contexts.push(check.context);
-  }
   return {
-    requiredStatusContexts: [...new Set(contexts)].sort(),
+    requiredStatusChecks:
+      canonicalClassicRequiredStatusChecks(requiredStatusChecks),
     codeOwnerReviewRequired,
   };
 }
@@ -1455,10 +1684,262 @@ async function loadRulesets(repoSlug) {
   const pages = await ghJson(`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`, {
     paginate: true,
   });
+  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
+    throw new Error("Repository ruleset listing is not a complete paginated array.");
+  }
   const summaries = pages.flat();
-  return Promise.all(
-    summaries.map((ruleset) => ghJson(`repos/${repoSlug}/rulesets/${ruleset.id}`)),
+  const summaryIds = summaries.map((ruleset) => ruleset?.id);
+  if (
+    summaryIds.some((id) => !Number.isSafeInteger(id) || id <= 0) ||
+    new Set(summaryIds).size !== summaryIds.length
+  ) {
+    throw new Error("Repository ruleset listing contains malformed or duplicate ids.");
+  }
+  const rulesets = await Promise.all(summaryIds.map(async (id) => {
+    const ruleset = await ghJson(`repos/${repoSlug}/rulesets/${id}`);
+    if (ruleset?.id !== id) {
+      throw new Error(`Ruleset detail endpoint ${id} returned a different identity.`);
+    }
+    return ruleset;
+  }));
+  for (const ruleset of rulesets) {
+    assertCompleteRulesetApiObject(ruleset);
+  }
+  return rulesets;
+}
+
+// Protected property: from the externally approved owner snapshot through the
+// Disabled stage, canary, activation write, and exact Active readback, every
+// original legacy ruleset/classic requirement keeps the same identity,
+// effective branch coverage, complete writable policy, and producer binding.
+// The repository/default-branch fields bind even an empty inventory. API or
+// schema unreadability is inconclusive and remains distinct from a readable
+// digest mismatch; neither is treated as legacy absence.
+async function assertExpectedLegacyInventoryDigest({
+  repoSlug,
+  defaultBranch,
+  expectedDigest,
+  phase,
+}) {
+  let bytes;
+  try {
+    bytes = await loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch });
+  } catch (error) {
+    throw new Error(
+      `Legacy review-gate inventory is unreadable or schema-inconclusive during ${phase}; refusing to treat any legacy surface as absent.\n${error.message}`,
+    );
+  }
+  const actualDigest = createHash("sha256").update(bytes).digest("hex");
+  if (actualDigest !== expectedDigest) {
+    const prefix = phase === "ruleset post-write readback"
+      ? "The ruleset write completed, but"
+      : "Refusing the write because";
+    throw new Error(
+      `${prefix} the canonical legacy review-gate inventory digest mismatched the external owner approval snapshot during ${phase}: expected ${expectedDigest}, read ${actualDigest}.`,
+    );
+  }
+}
+
+// Post-cleanup proof intentionally uses a new read-only mode rather than the
+// pre-cleanup approval digest: an authorised cleanup must change that digest.
+// The protected property here is absence of the legacy context on both
+// effective ruleset and classic branch-protection surfaces. Other classic
+// required checks remain valid and do not make the proof inconclusive.
+async function assertPostCleanupLegacyInventoryClear({
+  repoSlug,
+  defaultBranch,
+  repositoryId,
+  repositoryNodeId,
+}) {
+  let bytes;
+  try {
+    bytes = await loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch });
+  } catch (error) {
+    throw new Error(
+      `Post-cleanup legacy review-gate inventory is unreadable or schema-inconclusive; refusing to treat either legacy surface as clear.\n${error.message}`,
+    );
+  }
+
+  let inventory;
+  try {
+    inventory = JSON.parse(bytes);
+  } catch (error) {
+    throw new Error(
+      `Post-cleanup legacy review-gate inventory could not be decoded; verification is inconclusive.\n${error.message}`,
+    );
+  }
+  if (
+    inventory?.repository !== repoSlug ||
+    inventory?.repository_id !== repositoryId ||
+    inventory?.repository_node_id !== repositoryNodeId ||
+    inventory?.default_branch !== defaultBranch ||
+    !Array.isArray(inventory?.rulesets)
+  ) {
+    throw new Error(
+      "Post-cleanup legacy review-gate inventory lost its repository/default-branch binding or ruleset array; verification is inconclusive.",
+    );
+  }
+
+  const classic = inventory.classic_required_status_checks;
+  const classicHasLegacy = classic !== null &&
+    (classic.contexts.includes(LEGACY_STATUS_CONTEXT) ||
+      classic.checks.some((check) => check.context === LEGACY_STATUS_CONTEXT));
+  if (inventory.rulesets.length > 0 || classicHasLegacy) {
+    throw new Error(
+      `${LEGACY_STATUS_CONTEXT} remains required after cleanup on ${repoSlug}'s ${defaultBranch} branch; leave the v2 ruleset active, remove the remaining legacy requirement, and rerun this read-only verification.`,
+    );
+  }
+  return bytes;
+}
+
+async function loadPostCleanupV2Ruleset({
+  repoSlug,
+  rulesetId,
+  rulesetName,
+  defaultBranch,
+  context,
+  integrationId,
+}) {
+  const fullRuleset = assertCompleteRulesetApiObject(
+    await ghJson(`repos/${repoSlug}/rulesets/${rulesetId}`),
   );
+  if (
+    fullRuleset.id !== rulesetId ||
+    fullRuleset.name !== rulesetName ||
+    fullRuleset.source_type !== "Repository" ||
+    fullRuleset.source !== repoSlug ||
+    fullRuleset.enforcement !== "active" ||
+    !rulesetCoversDefaultBranch(fullRuleset, defaultBranch) ||
+    !rulesetHasGatePolicy(fullRuleset, context, { integrationId }) ||
+    rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
+      integrationId: undefined,
+    })
+  ) {
+    throw new Error(
+      `Post-cleanup verification requires repository ruleset "${rulesetName}" to remain the complete Active v2 policy without ${LEGACY_STATUS_CONTEXT}.`,
+    );
+  }
+  return fullRuleset;
+}
+
+function assertSelectedRepositoryRulesetIdentity(
+  ruleset,
+  { repoSlug, rulesetId, rulesetName },
+) {
+  const fullRuleset = assertCompleteRulesetApiObject(ruleset);
+  if (
+    fullRuleset.id !== rulesetId ||
+    fullRuleset.name !== rulesetName ||
+    fullRuleset.source_type !== "Repository" ||
+    fullRuleset.source !== repoSlug ||
+    fullRuleset.target !== "branch"
+  ) {
+    throw new Error(
+      `Selected ruleset id ${rulesetId} no longer has the approved repository identity, name, source, and branch target; refusing to plan or write a different ruleset.`,
+    );
+  }
+  return fullRuleset;
+}
+
+function postCleanupRulesetFingerprint(ruleset) {
+  return JSON.stringify({
+    id: ruleset.id,
+    source_type: ruleset.source_type,
+    source: ruleset.source,
+    writable: rulesetWritableFingerprint(ruleset),
+  });
+}
+
+async function loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch }) {
+  const repository = await loadLegacyInventoryRepositoryMetadata({
+    repoSlug,
+    defaultBranch,
+  });
+  const branchUri = encodeURIComponent(defaultBranch);
+  const effectiveRulePages = await ghJson(
+    `repos/${repoSlug}/rules/branches/${branchUri}?per_page=100`,
+    { paginate: true },
+  );
+  if (
+    !Array.isArray(effectiveRulePages) ||
+    effectiveRulePages.some((page) => !Array.isArray(page))
+  ) {
+    throw new Error(
+      "Effective default-branch rules endpoint did not return complete paginated arrays.",
+    );
+  }
+  const legacyRulesetIds = [...new Set(
+    effectiveRulePages
+      .flat()
+      .filter(
+        (rule) =>
+          rule?.type === "required_status_checks" &&
+          Array.isArray(rule?.parameters?.required_status_checks) &&
+          rule.parameters.required_status_checks.some(
+            (check) => check?.context === LEGACY_STATUS_CONTEXT,
+          ),
+      )
+      .map((rule) => rule.ruleset_id),
+  )].sort((left, right) => Number(left) - Number(right));
+  const rulesets = await Promise.all(
+    legacyRulesetIds.map((id) => ghJson(`repos/${repoSlug}/rulesets/${id}`)),
+  );
+  const classicResponse = await ghJson(
+    `repos/${repoSlug}/branches/${branchUri}/protection/required_status_checks`,
+    { allowNotFound: true },
+  );
+  if (classicResponse === null) {
+    throw new Error(
+      "Classic required-status endpoint returned HTTP 200 with null JSON; only a verified 404 can prove that surface absent.",
+    );
+  }
+  const classicRequiredStatusChecks = classicResponse === GH_NOT_FOUND
+    ? null
+    : classicResponse;
+  const finalRepository = await loadLegacyInventoryRepositoryMetadata({
+    repoSlug,
+    defaultBranch,
+  });
+  if (
+    finalRepository.id !== repository.id ||
+    finalRepository.node_id !== repository.node_id
+  ) {
+    throw new Error(
+      "Repository identity changed during the legacy inventory readback.",
+    );
+  }
+  const finalBranch = await ghJson(`repos/${repoSlug}/branches/${branchUri}`);
+  if (finalBranch?.name !== defaultBranch) {
+    throw new Error(
+      "The approved default branch was not readable after the legacy inventory readback.",
+    );
+  }
+  return canonicalLegacyReviewGateInventoryBytes({
+    repository: repoSlug,
+    repositoryId: repository.id,
+    repositoryNodeId: repository.node_id,
+    defaultBranch,
+    effectiveRulePages,
+    rulesets,
+    classicRequiredStatusChecks,
+  });
+}
+
+async function loadLegacyInventoryRepositoryMetadata({ repoSlug, defaultBranch }) {
+  const repository = await ghJson(`repos/${repoSlug}`);
+  if (
+    repository?.full_name !== repoSlug ||
+    !Number.isSafeInteger(repository?.id) ||
+    repository.id <= 0 ||
+    typeof repository?.node_id !== "string" ||
+    repository.node_id === "" ||
+    repository.default_branch !== defaultBranch
+  ) {
+    throw new Error(
+      "Repository metadata no longer proves the approved object identity and default branch.",
+    );
+  }
+  return repository;
 }
 
 function assertCodeownersActivationDoesNotExpandPolicy({
@@ -2150,7 +2631,10 @@ function ghJson(
       if (code !== 0) {
         if (
           allowNotFound &&
-          stderr.trim() === "gh: Branch not protected (HTTP 404)"
+          [
+            "gh: Branch not protected (HTTP 404)",
+            "gh: Required status checks not enabled (HTTP 404)",
+          ].includes(stderr.trim())
         ) {
           resolve(GH_NOT_FOUND);
           return;

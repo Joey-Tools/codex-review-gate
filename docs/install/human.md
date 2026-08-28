@@ -194,16 +194,31 @@ LEGACY_INVENTORY_SHA256="${LEGACY_INVENTORY_SHA256#LEGACY_INVENTORY_SHA256=}"
 printf 'LEGACY_INVENTORY_SHA256=%s\n' "$LEGACY_INVENTORY_SHA256"
 ```
 
-It binds repository, default branch, every matching active/inherited ruleset's
-identity, conditions, enforcement, target and complete `bypass_actors`, plus
-the complete matching effective `required_status_checks` rule with all
-parameters, and the complete classic parent required-status object (including
-`strict`) or explicit `null`. Before hashing, it sorts semantically unordered
+It binds the exact repository slug, numeric repository ID, opaque node ID, and
+default branch; every matching active/inherited
+ruleset's ID, name, source, enforcement, target, conditions, complete
+`bypass_actors`, and complete `rules`; the complete matching effective
+`required_status_checks` rule with all parameters; and the complete classic
+parent required-status object, including `strict` and every check's producer
+`app_id`, or explicit `null`. The shell helper and runtime use the same Node
+canonicalizer, so approval and enforcement hash identical bytes. Before
+hashing, it sorts semantically unordered
 bypass actors, required checks, classic contexts/checks, and condition
-`include`/`exclude` sets. Keep every legacy requirement active
-until this migration merges, so later failure remains fail closed. Preserve
-`MIGRATION_HEAD` and the approval snapshot, then supply its recorded digest
-externally as `LEGACY_INVENTORY_SHA256`; the transaction has no default for it.
+`include`/`exclude` sets. Even a repository with no legacy requirement has a
+digest because the canonical empty inventory remains bound to the repository
+and default branch. An incomplete API response or schema is inconclusive, and
+any digest drift fails closed rather than being treated as absence. A successful
+empty or JSON `null` classic response is inconclusive; only an explicitly
+recognised absence response becomes canonical `null`.
+
+Keep every legacy requirement active until this migration merges, so later
+failure remains fail closed. Preserve `MIGRATION_HEAD` and the owner-approved
+snapshot, then supply its recorded digest externally as
+`LEGACY_INVENTORY_SHA256`; the transaction has no default for it. The same
+digest is also the cross-process baseline for every remote staging and
+activation preview/apply below. It must remain identical through the Disabled
+stage, canary, activation write, and exact Active readback; a new helper
+process does not establish a new baseline.
 
 The entire final gate and merge is one fail-fast transaction. It refreshes the
 legacy inventory, default branch, PR base/head/state, authenticated actor, and
@@ -296,11 +311,14 @@ GitHub still has no atomic compare-and-swap over review state and head, so the
 hard actor check requires the trusted owner to perform this direct merge
 immediately after the fresh review readback. A head-only reread is insufficient.
 
-Only after that immediate post-merge default/base/head/lifecycle readback
-succeeds, execute the separately authorised plan to remove all
-inventoried legacy requirements and read both ruleset and classic surfaces back.
-New PRs may remain blocked during this short staged window, but protection does
-not fail open. Then stage v2 as Disabled, run the canary, and activate it.
+After that immediate post-merge default/base/head/lifecycle readback succeeds,
+keep every inventoried legacy requirement active. Stage a separate v2 ruleset
+as Disabled, run the canary while the legacy gate continues to block merges,
+then activate v2 and read the exact complete Active policy back. Only after
+that Active readback may you perform a separately authorised cleanup that
+removes the legacy requirements and reads both ruleset and classic surfaces
+back. This overlap may
+temporarily require both gates; it never permits an interval with neither gate.
 
 Afterward, read the PR back as merged, refresh a clean checkout of the default
 branch, compare both installed workflows byte for byte with their canonical
@@ -313,12 +331,19 @@ After the migration is present on the default branch, preview and apply remote
 staging:
 
 ```bash
-node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
-  --repo OWNER/REPO \
-  --control-plane-owner "$CONTROL_PLANE_OWNER"
+V2_RULESET_NAME="Must Pass Codex Review"
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --repo OWNER/REPO \
   --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo OWNER/REPO \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}" \
   --apply
 ```
 
@@ -342,15 +367,22 @@ Before continuing, verify that the staged ruleset:
 - blocks non-fast-forward updates to the default branch; and
 - has no bypass actors.
 
+Every preview and apply compares the complete canonical dual-surface inventory
+with the same owner-approved digest. API/schema incompleteness and any drift in
+repository, default branch, ruleset policy, or classic producer binding are
+inconclusive and fail closed.
+
 The helper inventories the legacy `codex/review-gate` context in both effective
 repository rulesets and classic branch protection required-status contexts.
-If another active or inherited ruleset still requires v1, remove that
-requirement explicitly. If classic branch protection requires it, the helper
-fails closed and never edits that classic policy; remove the context manually
-in repository settings, read the classic protection back, and rerun the
-helper. An unreadable or malformed classic-protection response is
-inconclusive, not absence. Keep the protection gap between staging and
-activation limited to the canary work below.
+Keep those active legacy requirements unchanged throughout Disabled staging,
+the canary, and v2 activation. The helper permits this fail-closed overlap and
+never edits classic protection or a separately managed legacy ruleset. If an
+active legacy or incomplete ruleset already uses the selected v2 ruleset name,
+the helper refuses every write; set `V2_RULESET_NAME` to a distinct name before
+staging, and pass that same variable to staging, activation, and the final
+probe. An unreadable or malformed legacy inventory, or any change that makes
+the full canonical inventory differ from the owner-approved digest, is
+inconclusive, not absence. Do not remove any legacy requirement in this phase.
 
 ## 3. Create and exercise the separate canary PR
 
@@ -492,12 +524,18 @@ Only after the exact-head canary passes, preview and activate the ruleset:
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --repo OWNER/REPO \
   --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}" \
   --activate \
   --canary-pr PR_NUMBER \
   --canary-head FULL_HEAD_SHA
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --repo OWNER/REPO \
   --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}" \
   --apply \
   --activate \
   --canary-pr PR_NUMBER \
@@ -511,15 +549,38 @@ re-reads the canary lifecycle, base/head/test-merge SHA, exact verifier
 run/job/CheckRun, exact canonical `display_title`, sole PR head/base binding,
 and collision inventory. After a write it reads the exact
 ruleset and the complete consumer security snapshot back.
-Confirm active enforcement, the same expected GitHub Actions source, strict
+Use the recorded `V2_RULESET_NAME` in every staging, activation, and final
+probe command. Confirm active enforcement, the same expected GitHub Actions source, strict
 up-to-date, Code Owner review with stale approval dismissal, the new-ruleset
 default of zero ordinary approvals without lowering an existing higher count,
 conversation resolution, non-fast-forward default-branch protection, and an
-explicitly empty `bypass_actors` array. Then close the canary without merging
-it and delete only its temporary branch.
+explicitly empty `bypass_actors` array.
+
+Only after that exact Active readback, execute the separately authorised legacy
+cleanup. Remove `codex/review-gate` from its repository/inherited ruleset or
+classic branch-protection surface. That authorised change necessarily makes
+the pre-cleanup owner-approved digest stale, so do not replay it. A cleanup or
+readback failure leaves v2 active and is not permission to disable it. Instead,
+perform one read-only post-cleanup closure with the same selected name. It
+requires both legacy surfaces to be clear and independently requires the same
+complete v2 ruleset to remain Active. It repeats that complete legacy-plus-v2
+read and requires both rounds to be identical, preventing a cross-surface swap
+from being mistaken for simultaneous cleanup:
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo OWNER/REPO \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --verify-post-cleanup
+```
+
+Then close the canary without merging it and delete only its temporary
+branch.
 
 Installation is complete when the default branch contains both canonical `@v2`
-workflows, the active ruleset has the expected source and protections, and the
-closed-unmerged canary records the exact successful native CheckRun on its
-current feature-head SHA, plus the canonical run-name receipt and PR binding
-for its unchanged current default-branch base and test-merge.
+workflows, the active ruleset has the expected source and protections, both
+legacy surfaces read back without `codex/review-gate`, and the closed-unmerged
+canary records the exact successful native CheckRun on its current feature-head
+SHA, plus the canonical run-name receipt and PR binding for its unchanged
+current default-branch base and test-merge.

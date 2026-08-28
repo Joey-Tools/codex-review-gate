@@ -162,14 +162,24 @@ LEGACY_INVENTORY_SHA256="${LEGACY_INVENTORY_SHA256#LEGACY_INVENTORY_SHA256=}"
 printf 'LEGACY_INVENTORY_SHA256=%s\n' "$LEGACY_INVENTORY_SHA256"
 ```
 
-该 inventory 绑定 repository、default branch、每个 matching active/inherited ruleset 的
-identity、conditions、enforcement、target 与完整 `bypass_actors`，以及包含全部 parameters 的
-完整 matching effective `required_status_checks` rule；它还绑定 classic parent 的完整
-required-status object（包括 `strict`）或显式 `null`。Hash 前会排序语义无序的 bypass
-actors、required checks、classic contexts/checks 与 conditions `include`/`exclude` sets。
-保留 exact-head read 得到的 `MIGRATION_HEAD` 与 owner-approval snapshot，
-并让全部 legacy requirements 保持 active 直到 merge。把已记录 digest 从外部传为
-`LEGACY_INVENTORY_SHA256`；transaction 不提供默认值。
+该 inventory 绑定 exact repository slug、numeric repository ID、opaque node ID 与
+default branch；每个 matching active/inherited ruleset 的
+ID、name、source、enforcement、target、conditions、完整 `bypass_actors` 与完整 `rules`；
+包含全部 parameters 的完整 matching effective `required_status_checks` rule；以及 classic
+parent 的完整 required-status object（包括 `strict` 与每个 check 的 producer `app_id`）或
+显式 `null`。Shell helper 与 runtime 使用同一 Node canonicalizer，因此 approval 与
+enforcement 会 hash 完全相同的 bytes。Hash 前会排序语义无序的 bypass actors、required checks、classic
+contexts/checks 与 conditions `include`/`exclude` sets。即使仓库没有 legacy requirement，
+canonical empty inventory 仍绑定 repository 与 default branch，因此也会得到 digest。API
+response 或 schema 不完整属于 inconclusive；任何 digest drift 都 fail closed，不能视为
+legacy absent。HTTP success 的空 body 或 JSON `null` 也属于 inconclusive；只有明确识别的
+absence response 才会 canonicalize 为 `null`。
+
+保留 exact-head read 得到的 `MIGRATION_HEAD` 与 owner-approved snapshot，并让全部 legacy
+requirements 保持 active 直到 merge。把已记录 digest 从外部传为
+`LEGACY_INVENTORY_SHA256`；transaction 不提供默认值。下方每次远端 staging/activation 的
+preview 与 apply 都必须复用同一个跨进程 baseline，从 Disabled stage、canary、activation
+write 一直贯穿 exact Active readback；新 helper process 不会建立新 baseline。
 
 最终 gate 与 merge 必须处在同一个 fail-fast transaction 中。唯一 mutation 前，它会刷新
 legacy inventory、default branch、PR base/head/state、authenticated actor 与完整 owner-review
@@ -257,10 +267,11 @@ temporary files。REST endpoint 只能即时 merge 或失败（包括 405/409）
 review state 与 head 的 atomic compare-and-swap，所以 actor 硬校验要求 trusted owner 在
 fresh review readback 后立即执行 direct merge；只重读 head 不足以闭环。
 
-只有 merge 后立即重读 current default、exact base/head 与 merged lifecycle 全部成功，才按
-另行授权的 plan 删除 inventory 中全部 legacy requirements，并读回 ruleset
-与 classic surfaces。这个短暂 staged window 可能继续阻塞新 PR，但不会 fail open；随后才
-以 Disabled stage v2、运行 canary、再 activate。
+Merge 后立即重读 current default、exact base/head 与 merged lifecycle 全部成功后，仍须让
+inventory 中全部 legacy requirements 保持 active。另建一个 Disabled v2 ruleset，在 legacy
+gate 继续阻塞 merge 的状态下运行 canary，再 activate v2 并精确读回完整 Active policy。只有
+这个 Active readback 成功后，才可按另行授权的 cleanup 删除 legacy，并读回 ruleset 与
+classic 两个 surfaces。短暂双重要求是预期状态；任何“两边都不要求”的窗口都不允许。
 
 合并后读回 PR，确认确已 merged；刷新默认分支的干净 checkout，再次逐字节比较已安装
 workflow 与 canonical template，并读回最终有效的 CODEOWNERS block 与显式 owner。
@@ -270,12 +281,19 @@ workflow 与 canonical template，并读回最终有效的 CODEOWNERS block 与�
 Migration 已在默认分支后，预览并执行远端 staging：
 
 ```bash
-node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
-  --repo OWNER/REPO \
-  --control-plane-owner "$CONTROL_PLANE_OWNER"
+V2_RULESET_NAME="Must Pass Codex Review"
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --repo OWNER/REPO \
   --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo OWNER/REPO \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}" \
   --apply
 ```
 
@@ -296,13 +314,19 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
 - 阻止 default branch 的 non-fast-forward update；
 - `bypass_actors` 明确为空。
 
+每次 preview 与 apply 都会用同一个 owner-approved digest 比较完整 canonical dual-surface
+inventory。Repository、default branch、ruleset policy 或 classic producer binding 的任何
+漂移，以及 API/schema 不完整，都属于 inconclusive 并 fail closed。
+
 Helper 会同时在 effective repository rulesets 与 classic branch protection required
-status contexts 中检查 legacy `codex/review-gate`。若其他 active 或 inherited ruleset
-仍要求 v1，必须显式移除。若 classic branch protection 仍要求该 context，helper 会 fail
-closed 且绝不修改 classic policy；应在 repository settings 中人工移除，读回 classic
-protection 后再重跑 helper。Classic-protection response 无法读取或 schema malformed 时是
-inconclusive，不能当作 absent。Staging 与 activation 之间的 protection gap 只用于下述
-canary。
+status contexts 中检查 legacy `codex/review-gate`。Disabled staging、canary、activation 与
+exact Active readback 全程都必须保留这些 active legacy requirements。Helper 允许这个
+fail-closed overlap，且绝不修改 classic protection 或 separately managed legacy ruleset。
+若 active legacy/incomplete ruleset 已占用选定的 v2 ruleset name，helper 会在任何 write 前
+拒绝；请在 staging 前把 `V2_RULESET_NAME` 改成 distinct name，并在 staging、activation 与
+final probe 中始终传同一变量。Legacy inventory 无法读取或 schema malformed，或任何变化
+使完整 canonical inventory 不再匹配 owner-approved digest 时，都属于 inconclusive，不能
+当作 absent。本阶段不得删除任何 legacy requirement。
 
 ## 3. 创建并运行独立 canary PR
 
@@ -414,12 +438,18 @@ Head 变化后必须为新 head 取得 evidence 并重新 reconcile；不得接�
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --repo OWNER/REPO \
   --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}" \
   --activate \
   --canary-pr PR_NUMBER \
   --canary-head FULL_HEAD_SHA
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --repo OWNER/REPO \
   --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --expected-legacy-inventory-sha256 \
+  "${LEGACY_INVENTORY_SHA256}" \
   --apply \
   --activate \
   --canary-pr PR_NUMBER \
@@ -431,13 +461,30 @@ default-branch workflow inventory、CODEOWNERS errors 与指定 owner 的 reposi
 permission；active write 前还会重新读取 canary lifecycle、base/head/test-merge SHA、
 exact verifier run/job/CheckRun、exact canonical `display_title`、唯一 PR head/base
 binding 与 collision inventory。Write 后会读回 exact ruleset 与
-完整 consumer security snapshot。确认 active
+完整 consumer security snapshot。每条 staging、activation 与 final probe command 都必须
+传入已记录的同一个 `V2_RULESET_NAME`。确认 active
 enforcement、相同 GitHub Actions source、strict up-to-date、Code Owner review、push 后
 dismiss stale approvals、新 ruleset 的普通 approval count 默认为 0 且不降低既有更高
 count、conversation resolution、default-branch non-fast-forward protection，以及显式空
-`bypass_actors`。然后关闭 canary、不合并，只删除临时 branch。
+`bypass_actors`。
 
-默认分支含两份 canonical `@v2` workflows、ruleset active 且完整、closed-unmerged
-canary 在 current feature-head SHA 留下 exact successful native CheckRun，且该 run 绑定
-unchanged current default-branch base/test-merge 的 canonical run-name receipt 与 PR
-binding 后，安装才算完成。
+只有 exact Active readback 成功后，才执行另行授权的 legacy cleanup：从 repository /
+inherited ruleset 或 classic branch-protection surface 移除 `codex/review-gate`。这项授权
+变更必然使 cleanup 前的 owner-approved digest 失效，因此 final proof 不得复用旧 digest。
+Cleanup 或 readback 失败时必须保持 v2 active，不能以此为由 disable。关闭 canary 前，
+使用同一个 selected name 运行一次只读 post-cleanup closure；它同时要求两个 legacy
+surfaces 都已 clear，并独立要求同一完整 v2 ruleset 仍为 Active。该 closure 会完整重复
+legacy-plus-v2 read，并要求两轮完全一致，避免 cross-surface swap 被误认作同时 cleanup：
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo OWNER/REPO \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --verify-post-cleanup
+```
+
+默认分支含两份 canonical `@v2` workflows、ruleset active 且完整、两个 legacy surfaces
+都已读回不含 `codex/review-gate`，且 closed-unmerged canary 在 current feature-head SHA
+留下 exact successful native CheckRun、该 run 绑定 unchanged current default-branch
+base/test-merge 的 canonical run-name receipt 与 PR binding 后，安装才算完成。
