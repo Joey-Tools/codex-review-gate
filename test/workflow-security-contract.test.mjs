@@ -416,7 +416,7 @@ test("installation bootstrap invocations bind the owner exactly once", () => {
   }
 });
 
-test("all executable install and Cookbook gh commands pin github.com", () => {
+test("all executable install and package gh commands pin github.com", () => {
   const guides = {
     ...Object.fromEntries(
       Object.entries(installGuides).map(([name, guide]) => [
@@ -424,12 +424,26 @@ test("all executable install and Cookbook gh commands pin github.com", () => {
         guide,
       ]),
     ),
-    "packages/action/COOKBOOK.md": packageDocs["COOKBOOK.md"],
-    "packages/action/COOKBOOK.zh-CN.md": packageDocs["COOKBOOK.zh-CN.md"],
+    ...Object.fromEntries(
+      Object.entries(packageDocs).map(([name, guide]) => [
+        `packages/action/${name}`,
+        guide,
+      ]),
+    ),
   };
+  const expectedExecutablePackageDocs = new Set([
+    "packages/action/README.md",
+    "packages/action/README.zh-CN.md",
+    "packages/action/DESIGN.md",
+    "packages/action/DESIGN.zh-CN.md",
+    "packages/action/COOKBOOK.md",
+    "packages/action/COOKBOOK.zh-CN.md",
+  ]);
   for (const [name, guide] of Object.entries(guides)) {
     const invocations = executableGhInvocations(guide);
-    assert.ok(invocations.length > 0, `${name}: missing executable gh guidance`);
+    if (name.startsWith("docs/install/") || expectedExecutablePackageDocs.has(name)) {
+      assert.ok(invocations.length > 0, `${name}: missing executable gh guidance`);
+    }
     assert.deepEqual(githubHostPinViolations(invocations), [], name);
   }
 });
@@ -441,7 +455,7 @@ test("gh guidance scanner closes compound, continuation, substitution, and quoti
   assert.equal(compound.length, 2);
   assert.deepEqual(
     githubHostPinViolations(compound),
-    ["gh api user: gh api must start with --hostname github.com"],
+    ["gh api user: gh api must start with exactly one --hostname github.com"],
   );
 
   const continued = scanShellGhInvocations(String.raw`gh \
@@ -450,7 +464,7 @@ test("gh guidance scanner closes compound, continuation, substitution, and quoti
   assert.equal(continued[0].command, "api");
   assert.deepEqual(
     githubHostPinViolations(continued),
-    ["gh api user: gh api must start with --hostname github.com"],
+    ["gh api user: gh api must start with exactly one --hostname github.com"],
   );
 
   const safeCompound = scanShellGhInvocations(
@@ -472,17 +486,92 @@ test("gh guidance scanner closes compound, continuation, substitution, and quoti
     'gh pr view "$PR_NUMBER" --repo "$REPO"',
   );
   assert.deepEqual(githubHostPinViolations(ambientRepo), [
-    "gh pr view $PR_NUMBER --repo $REPO: gh pr must use --repo github.com/$REPO",
+    "gh pr view $PR_NUMBER --repo $REPO: " +
+      "gh pr must use exactly one canonical --repo github.com/$REPO",
   ]);
+
+  const quotedCommand = scanShellGhInvocations("'gh' api user");
+  assert.equal(quotedCommand.length, 1);
+  assert.deepEqual(githubHostPinViolations(quotedCommand), [
+    "gh api user: gh api must start with exactly one --hostname github.com",
+  ]);
+
+  const wrapped = scanShellGhInvocations([
+    "GH_HOST=hostile.example gh api --hostname github.com user",
+    "env GH_HOST=hostile.example 'gh' pr view \"$PR_NUMBER\" " +
+      "--repo \"github.com/$REPO\"",
+  ].join("\n"));
+  assert.deepEqual(wrapped.map(({ command }) => command), ["api", "pr"]);
+  assert.deepEqual(githubHostPinViolations(wrapped), []);
 
   const ignored = scanShellGhInvocations(String.raw`
 # gh api user
+printf '%s\n' gh
 printf '%s\n' 'gh api user'
 printf '%s\n' "gh api user"
 printf '%s\n' 'gh' "gh"
 printf '%s\n' "$(printf '%s' 'gh api user')"
 `);
   assert.deepEqual(ignored, []);
+});
+
+test("gh guidance scanner rejects duplicate selectors and implicit merge targets", () => {
+  const duplicateHostname = scanShellGhInvocations(
+    "gh api --hostname github.com user --hostname hostile.example",
+  );
+  assert.deepEqual(githubHostPinViolations(duplicateHostname), [
+    "gh api --hostname github.com user --hostname hostile.example: " +
+      "gh api must start with exactly one --hostname github.com",
+  ]);
+
+  const duplicateRepo = scanShellGhInvocations(
+    'gh pr view "$PR_NUMBER" --repo "github.com/$REPO" -R hostile/repo',
+  );
+  assert.deepEqual(githubHostPinViolations(duplicateRepo), [
+    "gh pr view $PR_NUMBER --repo github.com/$REPO -R hostile/repo: " +
+      "gh pr must use exactly one canonical --repo github.com/$REPO",
+  ]);
+
+  const attachedShortRepo = scanShellGhInvocations(
+    'gh pr view "$PR_NUMBER" --repo "github.com/$REPO" -Rhostile/repo',
+  );
+  assert.deepEqual(githubHostPinViolations(attachedShortRepo), [
+    "gh pr view $PR_NUMBER --repo github.com/$REPO -Rhostile/repo: " +
+      "gh pr must use exactly one canonical --repo github.com/$REPO",
+  ]);
+
+  const equalsRepo = scanShellGhInvocations(
+    "gh run list --repo=github.com/$REPO",
+  );
+  assert.deepEqual(githubHostPinViolations(equalsRepo), [
+    "gh run list --repo=github.com/$REPO: " +
+      "gh run must use exactly one canonical --repo github.com/$REPO",
+  ]);
+
+  const implicitMerge = scanShellGhInvocations(
+    'gh pr merge --repo "github.com/$REPO"',
+  );
+  assert.deepEqual(githubHostPinViolations(implicitMerge), [
+    "gh pr merge --repo github.com/$REPO: gh pr merge must explicitly target $PR_NUMBER",
+  ]);
+  assert.deepEqual(
+    githubHostPinViolations(scanShellGhInvocations(
+      'gh pr merge "$PR_NUMBER" --repo "github.com/$REPO"',
+    )),
+    [],
+  );
+});
+
+test("gh guidance scanner audits executable inline snippets but ignores command names", () => {
+  const invocations = executableGhInvocations([
+    "Use `gh api` for REST calls.",
+    "Do not use `gh pr merge` or auto-merge.",
+    "Run `gh api user` to inspect the current account.",
+  ].join("\n"));
+  assert.deepEqual(invocations.map(({ text }) => text), ["gh api user"]);
+  assert.deepEqual(githubHostPinViolations(invocations), [
+    "gh api user: gh api must start with exactly one --hostname github.com",
+  ]);
 });
 
 test("legacy inventory helper pins github.com despite hostile GH_HOST and builds canonical output", () => {
@@ -1214,7 +1303,7 @@ test("consumer routing fixes automatic reconciliation and permits only reviewed 
     request_comment_id:
       "${{ github.event_name == 'workflow_dispatch' && inputs.request_comment_id || github.event.comment.id }}",
     request_review:
-      "${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'begin-review' && inputs.request_review || false }}",
+      "${{ github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
     limits_profile:
       "${{ vars.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' || 'default' }}",
   });
@@ -1872,31 +1961,26 @@ function shellInvocations(source, startPattern) {
 }
 
 function executableGhInvocations(source) {
-  return shellCodeBlocks(source).flatMap(scanShellGhInvocations);
+  const fenced = shellCodeBlocks(source).flatMap(scanShellGhInvocations);
+  const inline = inlineCodeSpans(source)
+    .flatMap(scanShellGhInvocations)
+    .filter(inlineGhInvocationIsExecutable);
+  return [...fenced, ...inline];
 }
 
 function scanShellGhInvocations(source) {
   const invocations = [];
   for (const segment of shellCommandSegments(source)) {
-    for (let index = 0; index < segment.length; index += 1) {
-      if (segment[index].value !== "gh" || !segment[index].hasUnquoted) {
-        continue;
-      }
-      const nextGh = segment.findIndex(
-        (token, candidateIndex) =>
-          candidateIndex > index &&
-          token.value === "gh" &&
-          token.hasUnquoted,
-      );
-      const words = segment
-        .slice(index, nextGh === -1 ? undefined : nextGh)
-        .map((token) => token.value);
-      invocations.push({
-        command: words[1] ?? "",
-        text: words.join(" "),
-        words,
-      });
+    const commandIndex = shellExecutableTokenIndex(segment);
+    if (commandIndex === -1 || segment[commandIndex].value !== "gh") {
+      continue;
     }
+    const words = segment.slice(commandIndex).map((token) => token.value);
+    invocations.push({
+      command: words[1] ?? "",
+      text: words.join(" "),
+      words,
+    });
   }
   return invocations;
 }
@@ -1906,9 +1990,15 @@ function githubHostPinViolations(invocations) {
   const violations = [];
   for (const { command, text, words } of invocations) {
     if (command === "api") {
-      if (words[2] !== "--hostname" || words[3] !== "github.com") {
+      const selectors = ghSelectorIndices(words, "--hostname");
+      if (
+        selectors.length !== 1 ||
+        selectors[0] !== 2 ||
+        words[2] !== "--hostname" ||
+        words[3] !== "github.com"
+      ) {
         violations.push(
-          `${text}: gh api must start with --hostname github.com`,
+          `${text}: gh api must start with exactly one --hostname github.com`,
         );
       }
       continue;
@@ -1917,18 +2007,100 @@ function githubHostPinViolations(invocations) {
       violations.push(`${text}: unclassified executable gh command`);
       continue;
     }
+    const selectors = ghSelectorIndices(words, "--repo", "-R");
     const repoIndex = words.indexOf("--repo", 2);
-    if (repoIndex === -1 || words[repoIndex + 1] !== "github.com/$REPO") {
+    if (
+      selectors.length !== 1 ||
+      selectors[0] !== repoIndex ||
+      repoIndex === -1 ||
+      words[repoIndex + 1] !== "github.com/$REPO"
+    ) {
       violations.push(
-        `${text}: gh ${command} must use --repo github.com/$REPO`,
+        `${text}: gh ${command} must use exactly one canonical ` +
+          "--repo github.com/$REPO",
       );
+    }
+    if (command === "pr" && words[2] === "merge" && words[3] !== "$PR_NUMBER") {
+      violations.push(`${text}: gh pr merge must explicitly target $PR_NUMBER`);
     }
   }
   return violations;
 }
 
-// Conservatively treat every unquoted `gh` word as executable. Quoted literals
-// are ignored, while command substitutions are scanned recursively.
+function inlineCodeSpans(source) {
+  const prose = source.replace(/```[\s\S]*?```/gu, "");
+  return [...prose.matchAll(/(?<!`)`([^`\r\n]+)`(?!`)/gu)].map(
+    (match) => match[1],
+  );
+}
+
+function inlineGhInvocationIsExecutable({ command, words }) {
+  const commandReferenceLength = new Set(["pr", "run", "variable", "workflow"])
+      .has(command)
+    ? 3
+    : 2;
+  return words.length > commandReferenceLength;
+}
+
+function ghSelectorIndices(words, longName, shortName = null) {
+  return words.flatMap((word, index) => {
+    if (
+      word === longName ||
+      word.startsWith(`${longName}=`) ||
+      (shortName !== null &&
+        (word === shortName || word.startsWith(shortName)))
+    ) {
+      return [index];
+    }
+    return [];
+  });
+}
+
+function shellExecutableTokenIndex(segment) {
+  const commandPrefixes = new Set(["if", "then", "elif", "else", "while", "until", "do"]);
+  let index = 0;
+  while (commandPrefixes.has(segment[index]?.value)) {
+    index += 1;
+  }
+  while (shellAssignment(segment[index]?.value)) {
+    index += 1;
+  }
+  while (segment[index]?.value === "env") {
+    index += 1;
+    while (index < segment.length) {
+      const value = segment[index].value;
+      if (value === "--") {
+        index += 1;
+        break;
+      }
+      if (shellAssignment(value)) {
+        index += 1;
+        continue;
+      }
+      if (["-u", "--unset", "-C", "--chdir", "--argv0"].includes(value)) {
+        index += 2;
+        continue;
+      }
+      if (value.startsWith("-")) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+    while (shellAssignment(segment[index]?.value)) {
+      index += 1;
+    }
+  }
+  return index < segment.length ? index : -1;
+}
+
+function shellAssignment(value) {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/u.test(value ?? "");
+}
+
+// Tokenize shell simple commands while recursively preserving command
+// substitutions. Executable-position quoted words are commands; quoted words
+// and `gh` literals in argument position remain ordinary arguments.
 function shellCommandSegments(source) {
   const segments = [];
   let offset = 0;

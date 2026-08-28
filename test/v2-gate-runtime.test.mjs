@@ -1698,6 +1698,11 @@ test("begin-review posts one exact same-run marker, adopts it on rerun, and supp
     suffix: "begin",
     operation: "begin-review",
   });
+  assert.equal(environment.REQUEST_REVIEW_INPUT, "true");
+  assert.equal(
+    JSON.parse(readFileSync(environment.GITHUB_EVENT_PATH, "utf8")).inputs.request_review,
+    true,
+  );
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "wait_provider");
@@ -1727,6 +1732,11 @@ test("begin-review posts one exact same-run marker, adopts it on rerun, and supp
     operation: "begin-review",
     requestReview: "false",
   });
+  assert.equal(
+    JSON.parse(readFileSync(disabledEnvironment.GITHUB_EVENT_PATH, "utf8"))
+      .inputs.request_review,
+    false,
+  );
   const { result: disabled } = await runGate(disabledEnvironment, disabledGitHub);
   assert.equal(disabled.report.gateOutcome, "pending");
   assert.deepEqual(disabledGitHub.requestBodies, []);
@@ -1964,12 +1974,17 @@ test("healthy findings block the native verifier without any status projection",
   assert.equal(github.calls.some(({ path }) => path.includes("/statuses/")), false);
 });
 
-test("manual controller reruns exact attempt A+1 and reads back one canonical CheckRun", async (context) => {
+test("default UI reconcile ignores request_review after exact binding and reruns A+1", async (context) => {
   const github = createGitHubMock();
   const environment = runtimeEnvironment(context, {
     suffix: "manual-controller-rerun",
     eventName: "workflow_dispatch",
   });
+  const event = JSON.parse(readFileSync(environment.GITHUB_EVENT_PATH, "utf8"));
+  assert.equal(environment.OPERATION_INPUT, "reconcile");
+  assert.equal(environment.REQUEST_REVIEW_INPUT, "true");
+  assert.equal(event.inputs.operation, "reconcile");
+  assert.equal(event.inputs.request_review, true);
   const { result } = await runGate(environment, github);
   assert.equal(result.exitCode, 0);
   assert.equal(result.report.executionHealth, "healthy");
@@ -1986,6 +2001,23 @@ test("manual controller reruns exact attempt A+1 and reads back one canonical Ch
     true,
   );
   assert.deepEqual(github.statusWrites, []);
+});
+
+test("manual reconcile binds request_review before ignoring its business value", async (context) => {
+  const environment = runtimeEnvironment(context, {
+    suffix: "manual-controller-request-review-tamper",
+    eventName: "workflow_dispatch",
+    requestReview: "false",
+    event: workflowDispatchEvent({ requestReview: true }),
+  });
+  const result = await runV2GateCli({
+    environment,
+    fetchImpl: async () => { throw new Error("fetch must not run"); },
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "unsupported_target");
+  assert.match(result.report.reason, /exact controller operation/u);
 });
 
 test("controller reports create_verifier_run when the current feature head has no verifier", async (context) => {
@@ -2822,11 +2854,11 @@ function verifierCheckRun({ status = "queued", ...overrides } = {}) {
 function runtimeEnvironment(context, {
   suffix = "default",
   operation = "reconcile",
-  requestReview = operation === "begin-review" ? "true" : "false",
+  eventName = operation === "begin-review" ? "workflow_dispatch" : "pull_request",
+  requestReview = eventName === "workflow_dispatch" ? "true" : "false",
   requestCommentId = "",
   limitsProfile = "default",
   expectedHeadSha = HEAD,
-  eventName = operation === "begin-review" ? "workflow_dispatch" : "pull_request",
   event = null,
   serverUrl = "https://github.com",
 } = {}) {
@@ -2863,20 +2895,34 @@ function runtimeEnvironment(context, {
     environment.GITHUB_EVENT_PATH,
     `${JSON.stringify(event || (eventName === "pull_request"
       ? pullRequestEvent()
-      : {
-          ref: "refs/heads/main",
-          repository: { full_name: REPOSITORY, default_branch: "main" },
-          inputs: {
-            operation,
-            pr_number: String(PR),
-            expected_head_sha: expectedHeadSha,
-            request_comment_id: requestCommentId,
-            request_review: String(requestReview).toLowerCase() !== "false",
-          },
-        }))}\n`,
+      : workflowDispatchEvent({
+          operation,
+          expectedHeadSha,
+          requestCommentId,
+          requestReview: String(requestReview).toLowerCase() !== "false",
+        })))}\n`,
     "utf8",
   );
   return environment;
+}
+
+function workflowDispatchEvent({
+  operation = "reconcile",
+  expectedHeadSha = HEAD,
+  requestCommentId = "",
+  requestReview = true,
+} = {}) {
+  return {
+    ref: "refs/heads/main",
+    repository: { full_name: REPOSITORY, default_branch: "main" },
+    inputs: {
+      operation,
+      pr_number: String(PR),
+      expected_head_sha: expectedHeadSha,
+      request_comment_id: requestCommentId,
+      request_review: requestReview,
+    },
+  };
 }
 
 async function runGate(environment, github, {

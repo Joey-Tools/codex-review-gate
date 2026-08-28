@@ -177,9 +177,14 @@ test("manual dispatch exposes only the typed single-PR business inputs", () => {
     ],
   );
   assert.match(yamlChildBlock(dispatch, "operation", 6), /^        type: choice$/mu);
+  assert.match(yamlChildBlock(dispatch, "operation", 6), /^        default: reconcile$/mu);
   assert.match(yamlChildBlock(dispatch, "pr_number", 6), /^        type: number$/mu);
   assert.match(yamlChildBlock(dispatch, "expected_head_sha", 6), /^        type: string$/mu);
   assert.match(yamlChildBlock(dispatch, "request_review", 6), /^        type: boolean$/mu);
+  assert.match(
+    yamlChildBlock(dispatch, "request_review", 6),
+    /^        description: .*ignored during reconcile$/mu,
+  );
   assert.match(yamlChildBlock(dispatch, "request_review", 6), /^        default: true$/mu);
   assert.doesNotMatch(
     dispatch,
@@ -278,7 +283,7 @@ test("canonical controller has only the adopted write authority and ledgerless i
   );
   assert.match(
     templateController,
-    /^          request_review: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.operation == 'begin-review' && inputs\.request_review \|\| false \}\}$/mu,
+    /^          request_review: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.request_review \|\| false \}\}$/mu,
   );
   assert.match(
     templateController,

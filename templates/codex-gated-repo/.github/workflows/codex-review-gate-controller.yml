@@ -26,7 +26,7 @@ on:
         required: false
         type: string
       request_review:
-        description: Post a fresh Codex request during begin-review
+        description: Post a fresh Codex request during begin-review; ignored during reconcile
         required: false
         type: boolean
         default: true
@@ -76,5 +76,5 @@ jobs:
           expected_head_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}
           operation: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}
           request_comment_id: ${{ github.event_name == 'workflow_dispatch' && inputs.request_comment_id || github.event.comment.id }}
-          request_review: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'begin-review' && inputs.request_review || false }}
+          request_review: ${{ github.event_name == 'workflow_dispatch' && inputs.request_review || false }}
           limits_profile: ${{ vars.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' || 'default' }}

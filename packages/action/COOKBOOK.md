@@ -48,9 +48,9 @@ the normal agent path is:
 4. dispatch `reconcile` for that exact head; and
 5. follow the summary until the final exact-head merge closure passes.
 
-Prefer a task-scoped body file with `gh pr comment --body-file` so shell quoting
-cannot add visible text. Do not construct the workflow-owned hidden marker by
-hand; the `begin-review` operation owns that form.
+Prefer the GitHub CLI pull-request comment command with a task-scoped body file
+so shell quoting cannot add visible text. Do not construct the workflow-owned
+hidden marker by hand; the `begin-review` operation owns that form.
 
 An ordinary request author's default minimum permission is `write`, `maintain`
 or `admin`, unless protected default-branch configuration deliberately selects
@@ -97,6 +97,7 @@ reconcile:
 gh workflow run "$WORKFLOW" \
   --repo "github.com/$REPO" \
   -f operation=reconcile \
+  -f request_review=false \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA"
 ```
@@ -109,6 +110,7 @@ permits a partial negative-evidence scan:
 gh workflow run "$WORKFLOW" \
   --repo "github.com/$REPO" \
   -f operation=reconcile \
+  -f request_review=false \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA" \
   -f request_comment_id="$REQUEST_COMMENT_ID"
@@ -320,9 +322,16 @@ Immediately before merge:
 7. require the ruleset to allow the intended merge.
 
 If the head or any gate changes, do not merge; repeat the closure for the new
-state. Otherwise merge immediately with an exact-head compare-and-swap such as
-`gh pr merge --match-head-commit "$HEAD_SHA"`. Stable snapshots do not lock the
-PR after the run; direct human UI merge outside this closure is unsupported.
+state. Otherwise merge immediately with this exact-head compare-and-swap:
+
+```bash
+gh pr merge "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --match-head-commit "$HEAD_SHA"
+```
+
+Stable snapshots do not lock the PR after the run; direct human UI merge
+outside this closure is unsupported.
 
 ## Migrating from v1
 

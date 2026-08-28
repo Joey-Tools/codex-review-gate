@@ -2452,15 +2452,19 @@ function validateV2Trigger(config) {
       String(inputs.pr_number || "") !== String(config.prNumber) ||
       String(inputs.expected_head_sha || "").toLowerCase() !== config.expectedHeadSha ||
       String(inputs.request_comment_id || "") !== config.requestCommentId ||
-      eventRequestReview !== config.requestReview ||
-      (config.operation === "reconcile" && config.requestReview !== false)
+      eventRequestReview !== config.requestReview
     ) {
       throw new V2RuntimeFailure(
         "workflow_dispatch did not bind the exact controller operation, repository, PR, and head",
         { gateOutcome: "not_applicable", recoveryCode: "unsupported_target" },
       );
     }
-    return { triggerKind: "controller", triggerSource: "manual", event };
+    return {
+      triggerKind: "controller",
+      triggerSource: "manual",
+      event,
+      requestReview: config.operation === "begin-review" ? config.requestReview : false,
+    };
   }
   if (
     (event?.action !== "created" && event?.action !== "edited") ||

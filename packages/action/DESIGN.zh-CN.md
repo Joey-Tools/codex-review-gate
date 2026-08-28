@@ -401,10 +401,17 @@ stable A/B snapshots 只证明短暂 observation window，不会锁定 PR。merg
 6. 要求 ruleset 确认 branch up to date、all conversations resolved 且 merge
    allowed。
 
-任何 head 或 policy change 都必须重启该 closure。随后立刻用
-`gh pr merge --match-head-commit "$HEAD_SHA"` 之类的 exact-head compare-and-swap
-merge。旧 success 绝不是 permanent review lease；跳过该 closure 的 direct human UI
-merge 不受支持。
+任何 head 或 policy change 都必须重启该 closure。否则立刻用以下 exact-head
+compare-and-swap merge：
+
+```bash
+gh pr merge "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --match-head-commit "$HEAD_SHA"
+```
+
+旧 success 绝不是 permanent review lease；跳过该 closure 的 direct human UI merge
+不受支持。
 
 ## 支持边界和 non-goals
 

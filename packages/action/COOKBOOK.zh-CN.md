@@ -47,9 +47,9 @@ push、update-branch operation、base change、close/reopen transition，或 PR 
 4. 为该 exact head dispatch `reconcile`；
 5. 按 summary 前进，直到 final exact-head merge closure 通过。
 
-优先使用 task-scoped body file 和 `gh pr comment --body-file`，避免 shell quoting
-增加 visible text。不要手工构造 workflow-owned hidden marker；该形式由
-`begin-review` operation 负责。
+GitHub CLI pull-request comment command 应优先使用 task-scoped body file，避免
+shell quoting 增加 visible text。不要手工构造 workflow-owned hidden marker；该形式
+由 `begin-review` operation 负责。
 
 普通 request author 的默认最低权限是 `write`、`maintain` 或 `admin`，除非受保护的
 default-branch configuration 明确选择 `any`。
@@ -94,6 +94,7 @@ Codex evidence 到达后，或者 recovery instruction 要求 reconcile 时：
 gh workflow run "$WORKFLOW" \
   --repo "github.com/$REPO" \
   -f operation=reconcile \
+  -f request_review=false \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA"
 ```
@@ -106,6 +107,7 @@ negative-evidence scan：
 gh workflow run "$WORKFLOW" \
   --repo "github.com/$REPO" \
   -f operation=reconcile \
+  -f request_review=false \
   -f pr_number="$PR_NUMBER" \
   -f expected_head_sha="$HEAD_SHA" \
   -f request_comment_id="$REQUEST_COMMENT_ID"
@@ -296,9 +298,16 @@ merge 前立即：
 7. 要求 ruleset 允许目标 merge。
 
 head 或任一 gate 发生变化时，不要 merge；为 new state 重复 closure。否则立刻用
-`gh pr merge --match-head-commit "$HEAD_SHA"` 之类的 exact-head compare-and-swap
-merge。stable snapshots 不会在 run 后锁定 PR；跳过此 closure 的 direct human UI
-merge 不受支持。
+以下 exact-head compare-and-swap merge：
+
+```bash
+gh pr merge "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --match-head-commit "$HEAD_SHA"
+```
+
+stable snapshots 不会在 run 后锁定 PR；跳过此 closure 的 direct human UI merge
+不受支持。
 
 ## 从 v1 迁移
 

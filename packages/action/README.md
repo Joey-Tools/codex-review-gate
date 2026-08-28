@@ -337,10 +337,16 @@ and require all of the following at one final read:
 - all review conversations are resolved; and
 - the ruleset allows the merge.
 
-If any item changes, stop and reconcile the new current state. Merge
-immediately with an exact-head compare-and-swap such as
-`gh pr merge --match-head-commit "$HEAD_SHA"`; direct human UI merge outside
-this closure is unsupported.
+If any item changes, stop and reconcile the new current state. Otherwise merge
+immediately with this exact-head compare-and-swap:
+
+```bash
+gh pr merge "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --match-head-commit "$HEAD_SHA"
+```
+
+Direct human UI merge outside this closure is unsupported.
 
 ## Supported boundary
 

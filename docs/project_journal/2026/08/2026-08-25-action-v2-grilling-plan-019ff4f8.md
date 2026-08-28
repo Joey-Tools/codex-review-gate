@@ -1768,6 +1768,70 @@ superseded_by:
     `actions/create-github-app-token@v3` `client-id` metadata false positive and
     the existing SC2016 informational messages in the immutable jq program.
 
+### Whole-Range Review At The Host-And-Recovery Checkpoint
+
+- A seventh independent review covered
+  `10217253306ca2ee6f312f766a331f8924e26e47..0d25abde1b048a3a902a0c35b5c3565b642e3e90`
+  in a clean detached no-local clone at tree
+  `f5bd7b01275ec6346b444716845ccfc429b6a9ce`. The explicitly authorized
+  zero-context ordinary `gpt-5.6-sol` / `ultra` reviewer checked all 16 commits
+  and 89 changed paths without editing, networking, or accessing a PR.
+- The reviewer confirmed that the publisher host/token split, finding verdict
+  preservation after output failure, and default-branch URI encoding were
+  closed, and retained two P1 and one P2 findings:
+  - the GitHub UI defaulted to `operation=reconcile` plus
+    `request_review=true`, while the controller passed false for reconcile and
+    runtime required the raw values to match; the primary manual recovery path
+    therefore rejected its own default input combination;
+  - the documented final merge command used only `--match-head-commit`, so it
+    did not bind the selected GitHub.com repository or PR and could operate on
+    ambient checkout/host context;
+  - the literal-`gh` documentation scanner still confused command and argument
+    positions, ignored complete inline commands, and accepted later selector
+    overrides such as a second `--hostname` or `-R`.
+
+### Manual Dispatch, Merge Closure, And Command-Audit Remediation
+
+- The controller retains the adopted UI defaults: reconcile remains the
+  default operation, and `request_review=true` remains the begin-review default
+  while false remains its advanced option. The workflow now forwards the raw
+  boolean unchanged. Runtime first requires the event payload and Action input
+  to match exactly, then treats that value as semantically ignored/false only
+  for reconcile. This preserves the anti-tamper binding without making a
+  begin-review user opt in again or making default reconcile invalid.
+  - Runtime regressions use the real default UI event instead of silently
+    rewriting the event input, prove that default reconcile requests verifier
+    attempt `A+1`, reject event/Action mismatch before API access, and retain
+    begin-review true/false behavior.
+  - Cookbook commands still pass `request_review=false` explicitly for
+    deterministic agent execution rather than relying on the ignored UI field.
+- The complete merge command is now a fenced executable block in both
+  Cookbooks, READMEs, and DESIGN documents. It simultaneously supplies
+  `PR_NUMBER`, `--repo "github.com/$REPO"`, and
+  `--match-head-commit "$HEAD_SHA"`; exact-head compare-and-swap is therefore
+  not mistaken for repository, host, or PR selection.
+- The documentation audit now parses the literal simple-command position:
+  quoted command names are executable, while a `gh` argument to `printf` is
+  not. It audits installation guides and all package documents, including
+  complete inline snippets, while permitting short inline command-name
+  references and prohibitions. For API calls it requires exactly one canonical
+  leading `--hostname github.com`; for repository commands it requires exactly
+  one two-word `--repo github.com/$REPO`, rejects long/short attached or later
+  overrides, and requires `gh pr merge` to target `$PR_NUMBER` explicitly.
+  The scanner handles the documented compound-command, pipeline, command
+  substitution, backtick, continuation, assignment, and `env` forms. It does
+  not claim to expand dynamic `eval`, `sh -c` strings, aliases, or shell
+  functions; such dynamically generated commands are outside the executable
+  documentation contract.
+- Focused validation passed at this checkpoint:
+  - full repository suite: 720/720 on the frozen remediation worktree;
+  - v2 aggregate: 87/87;
+  - workflow security contract: 35/35;
+  - controller template `actionlint`, `npm run check`, project-journal
+    validation, and `git diff --check`.
+  A signed checkpoint and new exact-head whole-range review remain mandatory
+  before PR delivery resumes.
+
 ### Verified Two-Workflow Platform Boundaries And Resolution
 
 - Required-CheckRun source selection is not workflow provenance. GitHub's

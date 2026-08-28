@@ -308,9 +308,16 @@ canonical CheckRun，并在一次 final read 中同时要求：
 - 所有 review conversations 均已 resolved；
 - ruleset 允许 merge。
 
-任一项变化都必须停止，并对新的 current state 重新 reconcile。随后立刻用
-`gh pr merge --match-head-commit "$HEAD_SHA"` 之类的 exact-head compare-and-swap
-完成 merge；跳过此 closure 的 direct human UI merge 不受支持。
+任一项变化都必须停止，并对新的 current state 重新 reconcile。否则立刻用以下
+exact-head compare-and-swap 完成 merge：
+
+```bash
+gh pr merge "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --match-head-commit "$HEAD_SHA"
+```
+
+跳过此 closure 的 direct human UI merge 不受支持。
 
 ## 支持边界
 

@@ -451,10 +451,17 @@ the PR. Immediately before merge, an agent must:
 6. require the ruleset to confirm branch up to date, all conversations
    resolved and merge allowed.
 
-Any head or policy change restarts this closure. Merge immediately with an
-exact-head compare-and-swap such as `gh pr merge --match-head-commit
-"$HEAD_SHA"`. A previous success is never a permanent review lease, and direct
-human UI merge outside this closure is unsupported.
+Any head or policy change restarts this closure. Otherwise merge immediately
+with this exact-head compare-and-swap:
+
+```bash
+gh pr merge "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --match-head-commit "$HEAD_SHA"
+```
+
+A previous success is never a permanent review lease, and direct human UI
+merge outside this closure is unsupported.
 
 ## Supported boundary and non-goals
 
