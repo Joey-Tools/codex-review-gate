@@ -4,11 +4,11 @@
   "description": "Deterministic GitHub status gate for Codex pull request reviews.",
   "type": "module",
   "scripts": {
-    "check": "node --check src/core.mjs && node --check src/evidence-budget.mjs && node --check src/gate.mjs && node --check src/v2/action.mjs && node --check src/v2/controller-input-reader.mjs && node --check src/v2/candidate-inventory.mjs && node --check src/v2/control-plane-receipt.mjs && node --check src/v2/schema.mjs && node --check src/v2/reducer.mjs && node --check src/v2/public-report.mjs && node --check src/v2/public-report-projector.mjs && node --check src/v2/runner.mjs && node --check src/v2/scheduler.mjs && node --check src/v2/transport.mjs && node --check src/v2/git-ledger.mjs && node --check src/v2/persistent-frontier.mjs && node --check src/v2/projector.mjs && node --check src/v2/projection.mjs && node --check src/v2/effect-status-wal.mjs && node --check src/v2/workflow-command.mjs && node --check src/v2/workflow-controller.mjs && node --check src/v2/workflow-preflight.mjs"
+    "check": "node --check src/core.mjs && node --check src/evidence-budget.mjs && node --check src/gate.mjs && node --check src/v2/gate-runtime.mjs"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Joey-Tools/codex-review-gate-action.git"
+    "url": "git+https://github.com/JoeyTeng/codex-review-gate-action.git"
   },
   "license": "Apache-2.0"
 }

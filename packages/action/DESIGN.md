@@ -2,463 +2,526 @@
 
 Languages: [British English (en-GB)](DESIGN.md) | [简体中文 (zh-CN)](DESIGN.zh-CN.md)
 
-## Goal and activation state
+## Goal
 
-V2 turns one sealed Codex provider-evidence snapshot into a closed decision,
-then lets a trusted controller perform the authorised request, status, and
-sticky-projection effects in a durable order. The public status context is
-`codex/github-review-gate`.
+v2 supplies a low-cost, fail-closed native required CheckRun for one pull request at a
+time. It must not report success while qualifying Codex findings are present,
+while evidence is incomplete or unstable, or after the selected PR head has
+changed. It favours recovery from GitHub's current state over durable private
+state and tolerates small at-least-once duplicates when uncertainty follows a
+write.
 
-The public trust boundary is the organisation reusable workflow:
+Existing GitHub controls keep their native responsibilities:
+
+- GitHub stores PR lifecycle, comments, reviews and reactions;
+- two copied consumer workflows own separate event admission, permissions and
+  serialisation boundaries;
+- managed CODEOWNERS plus Code Owner review protect both workflows as part of
+  the compound no-runtime-App control plane;
+- the Action reconstructs and reduces non-inline Codex evidence;
+- the ruleset requires the status, branch freshness, resolved conversations
+  and non-fast-forward protection; and
+- the merge agent closes the loop with an exact-current-head reconcile and
+  final server-side reread.
+
+The Action is not a second conversation resolver or branch-protection system.
+
+## Architecture and trust boundaries
+
+```text
+pull_request opened/reopened/synchronize/ready_for_review
+                                |
+                                v
+          copied read-only canonical verifier
+                                |
+          JoeyTeng/codex-review-gate-action@v2
+          - bind PR head, base and test-merge SHA
+          - validate refs/pull/N/merge, GITHUB_REF and GITHUB_SHA
+          - refresh PR and require unchanged head/base/test-merge
+          - fully paginate and reduce GitHub evidence
+          - require two stable snapshots for clean
+                                |
+                                v
+ native CheckRun codex/github-review-gate on exact feature head
+                                |
+                                v
+ ruleset: expected source + Code Owner review + stale dismissal
+          + up to date + conversations resolved + no force-push
+
+Codex issue_comment created/edited       protected workflow_dispatch
+                 |                                  |
+                 +----------------------------------+
+                                v
+          copied protected-default-branch controller
+          - exact pre-runner bot filter / typed inputs
+          - create or adopt review request
+          - establish and read back newer verifier attempt
+                                |
+                                +---- full rerun ----> verifier
+                                +---- summary / best-effort sticky
+```
+
+### Consumer workflows
+
+The copied canonical verifier and controller are trusted repository
+configuration and form the supported consumer envelope. A bare Action step
+cannot own events, runner-admission filters, permissions, typed dispatch or
+concurrency.
+
+The two workflows, managed `.github/CODEOWNERS` control plane and supplied ruleset
+are one installation contract. The canonical helper installs both workflows and
+the two final effective CODEOWNERS rules for `/.github/workflows/` and
+`/.github/CODEOWNERS`; callers explicitly select a GitHub user with `write`,
+`maintain` or `admin` permission as `--control-plane-owner @USER`. The first
+installation PR needs that owner's exact-current-head approval because its new
+base-branch CODEOWNERS policy cannot enforce its own bootstrap. That approval
+is necessary but insufficient: keep legacy protection through merge, bind a
+canonical read-only inventory SHA-256 into the approval snapshot, and require
+the final transaction to rebuild the strict inventory and match that external
+digest. It binds repository/default branch, each matching ruleset's complete
+identity, source, enforcement, target, conditions, `bypass_actors`, `rules`,
+and effective `required_status_checks` rule, plus the complete classic
+required-status object including each check's producer `app_id`. A canonical
+empty inventory still has a repository/branch-bound digest; incomplete
+API/schema data or any drift fails closed. It then authenticates the owner as
+current actor, rereads the latest exact-head approval, and synchronously merges
+the exact SHA. Immediately after
+merge, it rereads the current default and requires the PR's merged lifecycle,
+base, and head to remain the exact approved scope. Failure preserves every
+legacy requirement active. After success, a separate v2 ruleset is staged as
+Disabled while legacy remains active, proved by canary, then activated and read
+back with no bypass actors. Every pre-cleanup stage/activation preview and
+apply explicitly reuses the same owner-approved digest across processes
+through that exact Active readback. Only then may the separately authorised
+plan remove the inventoried legacy requirements. Immediately before cleanup,
+read-only `--derive-post-cleanup-plan` requires the same external
+owner-approved legacy-inventory digest through
+`--expected-legacy-inventory-sha256`, verifies the pre-state against it, and
+derives a canonical expected state from the complete security snapshot. Its
+reviewable plan may remove only `codex/review-gate`; an emptied status rule may
+be removed, as may an emptied classic required-status policy; a whole dedicated
+legacy-only ruleset may be deleted only when no other rule remains. Those are
+the only structural exceptions. Repository/default head, workflow/CODEOWNERS
+inventory, owner permission, every field/non-legacy check including `strict`
+and `app_id` in a surviving classic policy, and every retained ruleset's
+identity, conditions, bypass actors, and unrelated rules are preserved exactly.
+The plan exports an expected post-cleanup security SHA-256. Final read-only
+`--verify-post-cleanup` requires that external digest through
+`--expected-post-cleanup-security-sha256` and accepts only two
+identical complete security rounds that both match it, show both legacy
+surfaces clear, and show the same complete v2 policy Active. Inconclusive
+post-write state leaves v2 Active and permits only read-only diagnosis, never a
+disable or rollback. The
+migration PR carries both workflows plus CODEOWNERS. Once active,
+Code Owner review and stale-approval dismissal protect
+later changes. Required check `integration_id: 15368` denotes the entire GitHub
+Actions App, so it is not by itself proof that the canonical verifier produced
+the CheckRun. Exact bytes, complete workflow inventory, CODEOWNERS, Code Owner
+review, strict freshness, no bypass and canary collision readback provide the
+adopted compound boundary.
+
+The verifier admits only `pull_request` `opened`, `reopened`, `synchronize` and
+`ready_for_review`. It fails closed outside same-repository, open, ready,
+default-base scope. `edited` is deliberately absent: after a base retarget, a
+ready PR must be converted to draft and marked ready again, while an
+already-draft PR is marked ready. The new `ready_for_review` event creates a
+verifier for the current exact head/base/test-merge scope; rerunning the old
+event does not.
+
+GitHub records the verifier run/job/native CheckRun against the exact PR
+feature-head SHA even though the canonical `pull_request` workflow executes on
+`refs/pull/N/merge`. Inside the Action, `GITHUB_REF` and `GITHUB_SHA` must match
+that merge ref and the event test-merge SHA; the event head/base/test-merge
+values must also match a fresh PR read. The protected top-level `run-name`
+provides a second receipt: the run `display_title` must be
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>`, and its sole PR
+binding must carry the current feature head and default-branch base SHA. This
+is the execution binding that lets a successful feature-head CheckRun prove
+evaluation of the exact current test-merge. The CheckRun itself does not
+belong to the test-merge SHA.
+
+The controller admits `issue_comment` `created`/`edited` and default-branch
+`workflow_dispatch`. Comment admission checks both event sender and comment
+author against exact login `chatgpt-codex-connector[bot]` and exact type `Bot`
+before runner allocation. The Action revalidates the admitted event because
+the two checks protect different boundaries.
+
+The only manual entry is `workflow_dispatch` using the protected default-
+branch workflow. The manual inputs are closed and typed as documented in
+[README.md](README.md). A feature-ref dispatch is unsupported. Same-repository
+writers with the native repository and Actions permission to dispatch are an
+explicit trust boundary; v2 does not maintain a hard-coded actor allowlist.
+
+There is no cron, `repository_dispatch`, `pull_request_target` or writable
+automatic `pull_request_review` job. The absence of cron avoids
+billable no-op runs in private repositories. Review-object and reaction
+changes that do not create or edit a qualifying issue comment converge through
+manual reconcile.
+
+All runtime jobs are API-only. They do not check out or execute consumer or PR
+code. The verifier is read-only. The controller alone receives the narrow
+mutation surface needed to create requests and rerun the exact verifier:
 
 ```yaml
-uses: Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2
+permissions:
+  actions: write
+  checks: read
+  contents: read
+  issues: write
+  pull-requests: read
 ```
 
-`@v2` is a release alias over an immutable signed v2 commit. The called job
-materialises the exact selected workflow repository and object. This is a
-centralised compatible-major delegation, not permission to execute arbitrary
-code from a consumer repository.
+Neither workflow receives statuses/checks/content/PR write or OIDC authority.
+There is no dedicated runtime GitHub App. The separate publisher App is never
+installed in a consumer repository.
 
-Production activation remains blocked. The trusted production controller-input
-assembler, durable scheduled dispatcher, and automatic effect protocol are
-implemented and locally gated; publication admission and live activation proof
-remain P0 prerequisites. The current package documents a completed local
-implementation boundary, not a supported required-check rollout. Missing
-release, environment, server-time, or canary evidence fails closed.
+### Dispatch and Action inputs
 
-## Architecture
+`workflow_dispatch` exposes `operation`, `pr_number`, `expected_head_sha`,
+optional `request_comment_id` and `request_review`. Every
+value is untrusted and revalidated against GitHub. The manual path requires a
+full expected SHA. The automatic issue-comment path may omit it; runtime then
+binds the authoritative PR head at startup. Both paths freeze that head for the
+remainder of the run.
 
-```mermaid
-flowchart LR
-  A["Generated consumer caller"] --> B["Organisation reusable workflow @v2"]
-  B --> C["Trusted controller-input assembler"]
-  C --> D["Complete transport snapshots"]
-  D --> E["Projector"]
-  E --> F["Pure v2 reducer"]
-  F --> G["Scheduler and effect plans"]
-  G --> H["Durable controller ledger"]
-  H --> I["Remote effects and exact responses"]
-  I --> J["Sticky projection and final status"]
-  K["Composite action.yml"] -. "plan-only adapter" .-> D
-  K -. "never completes the gate" .-> G
+The controller Action uses underscore-named inputs `github_token`, `pr_number`,
+`expected_head_sha`, `operation`, `request_comment_id` and `request_review`.
+`operation` is closed to `reconcile|begin-review`, and `request_review` is boolean.
+Verdicts, identities, status context, stale overrides, numeric limits and
+skip-reconcile controls are not inputs.
+
+Both Action steps derive `limits_profile=default|expanded` only from protected
+repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`. Dispatch has no profile
+or numeric override.
+
+`request_comment_id` is only a locator hint. The reducer may use it to avoid
+unnecessary backward requests, but must prove that every newer relevant
+request, finding, progress artifact, malformed artifact and conflict has been
+accounted for before stopping. A hint never supplies evidence authority.
+
+## Operations and head binding
+
+### `begin-review`
+
+`begin-review` validates the selected supported PR and bound head, and by
+default creates or safely adopts a fresh exact `@codex review` request with the
+canonical controller marker. The marker binds
+the v2 format, full head, current base repository/ref/SHA and workflow run.
+`request_review=false` skips posting; it is best effort and creates no special
+barrier. After exact request readback, the controller establishes a newer full
+verifier attempt.
+
+A logical workflow-authored request attempt is bound to repository ID, PR,
+expected head and `GITHUB_RUN_ID`. A rerun may adopt its own exact, unedited,
+matching marker. If the POST result is unknown, runtime first rereads GitHub;
+it does not blindly repeat the request. Continued uncertainty keeps pending and
+reports `retry_begin` with `retry_safe=false`, because GitHub issue-comment
+creation has no idempotency key and the side effect may have succeeded before
+the failure became visible. The caller waits for the exact same-run marker to
+settle and, if it remains absent, reruns the original workflow run; an immediate
+retry or distinct dispatch could create a duplicate generation.
+
+Same-PR controllers use `cancel-in-progress: false`. This serialises active writers
+but cannot prevent GitHub from replacing a not-yet-started pending run. A
+caller therefore observes the exact `begin-review` run complete before treating
+it as a barrier or posting a dependent request.
+
+Agents normally start Codex directly with exact `@codex review` when the check
+is not already passing, avoiding an Actions runner while other checks run.
+`begin-review` remains the coordinated path, especially for a deliberate
+same-head re-review that must establish a newer verifier generation.
+
+### `reconcile`
+
+Manual reconcile requires the caller's full `expected_head_sha`; the automatic
+path binds the equivalent value at startup. The controller rereads the PR,
+locates exactly one canonical verifier whose native CheckRun is on the current
+feature head and whose run is bound to the current test-merge, records
+baseline attempt `A`, establishes that no canonical attempt is queued or
+running, requests one full rerun, and requires exact attempt `A+1` plus its
+unique job/CheckRun to become observable. A jump, duplicate, ambiguous POST or
+unreadable inventory remains blocking and is never blindly retried.
+
+The verifier is latest-generation single-flight with `cancel-in-progress:
+true`; cancellation cannot satisfy the gate. A stale verifier never follows a
+different head, base or test-merge SHA. Direct commit-status projection and its
+old mutation/readback state are deleted.
+
+## Authority model
+
+### GitHub is the reconstructive source
+
+Every reconcile rebuilds authority from GitHub PR objects. There is no durable
+Git ledger, Actions-artifact ledger, central controller, cached receipt or
+sticky-comment authority. Artifacts are not uploaded and raw API payloads are
+not retained.
+
+The best-effort sticky diagnostic is an output projection only. Its v2 marker
+is distinct from request markers and contains no `@codex review`. Only a
+`github-actions[bot]` marker comment qualifies. Runtime updates the oldest
+canonical duplicate when possible, warns without deleting extras and may
+recreate a deleted diagnostic. Missing, edited, duplicate or unwritable sticky
+state cannot change a gate decision.
+
+### Admitted evidence
+
+The reducer consumes qualifying Codex top-level issue comments and pull-request
+review bodies. It does not treat inline review threads or conversation
+resolution as reducer authority; the installed ruleset owns that condition.
+
+Provider carriers must bind exact bot identity. Similar names, copied text or
+user-authored claims have no authority. A finding's severity label does not
+affect blocking: any qualifying finding blocks.
+
+### Review generations
+
+An authorised generation begins only with an exact, unedited
+`@codex review` request. Its first visible line is exact and there is no other
+visible text. By default, an ordinary request author must have `write`,
+`maintain` or `admin` repository permission. Protected default-branch
+configuration may deliberately set the threshold to `any`. A workflow-authored
+request additionally needs the exact v2 marker binding the full head and run.
+
+The permission threshold protects generation resets, not negative evidence.
+Qualifying provider findings block regardless of the request author's
+permission.
+
+Terminal clean text and a qualifying provider `+1` are normally equal clean
+carriers. After any observed base epoch, terminal payloads cannot prove which
+request/base snapshot produced them. In that degraded lineage mode, only a
+qualifying `+1` directly attached to the latest strictly post-epoch,
+base-bound canonical workflow request is a positive or superseding carrier.
+An unlineaged terminal clean remains diagnostic evidence and cannot pass or
+clear a finding. This is a deliberate fail-closed exception to carrier parity.
+Ordinary request reactions are provider-liveness signals only; ordinary `+1`
+cannot head-bind clean. Same-time/later official `eyes`/progress from Codex
+vetoes candidate clean evidence. Because reaction changes do not trigger the
+consumer workflow, a later provider event or manual reconcile must observe the
+settled state.
+When a terminal carrier includes a reviewed commit, a full or abbreviated SHA
+is accepted only if GitHub resolves it unambiguously to the current bound head.
+For a pull-request review, the resolved commit must also equal native
+`commit_id`. A short prefix with zero or multiple relevant matches is
+indeterminate; runtime never guesses or loosely extracts a convenient token.
+
+### Finding supersession
+
+A qualifying current-head finding has conservative precedence. On the same
+head, an older non-inline finding is superseded only when both of these are
+proved:
+
+1. a strictly newer authorised review generation exists; and
+2. a later head-bound terminal clean or qualifying `+1` belongs to that newer
+   generation, subject to the base-epoch direct-reaction rule above.
+
+An unrelated later clean cannot clear the finding. Ambiguous temporal order,
+generation binding or head binding remains failure or inconclusive. A
+superseded finding remains historical evidence for diagnostic accounting; it
+is not erased from GitHub.
+
+This asymmetry admits recovery from an obsolete or inapplicable finding without
+letting positive evidence mask a finding silently.
+
+## Complete snapshots and stable success
+
+A “snapshot” is one independent, fully paginated set of GitHub API reads used
+to decide the fixed PR/head scope. It includes:
+
+- PR identity, lifecycle, base and head;
+- the latest filtered `BaseRefChangedEvent` or `BaseRefForcePushedEvent` from
+  the PR timeline;
+- review-request IDs, revisions, authors and candidate reactions;
+- qualifying Codex top-level comments and review bodies, including IDs,
+  timestamps, actor/App identity and body digests;
+- reviewed-commit resolution and native review `commit_id`; and
+- collection completeness and exact-object refetch results.
+
+The fingerprint is a deterministic representation of every decision-relevant
+value in that snapshot. It is only an equality check between fresh reads, not
+a durable receipt.
+
+GitHub does not offer an atomic cross-endpoint read. Webhook delivery may lead
+API visibility; Codex may publish request, review and terminal objects at
+different times; and pagination may span changing server state. Negative
+evidence is asymmetric: a qualifying finding can be proved immediately, while
+clean requires complete evidence that no blocker exists.
+
+Therefore only a clean candidate uses the stability protocol:
+
+1. fetch snapshot A completely;
+2. wait five seconds;
+3. independently fetch snapshot B completely; and
+4. require the same fixed head and decision-relevant fingerprint.
+
+A relevant same-head request, edit, reaction, comment/review change or
+exact-refetch change restarts the stability window. A head change, closure,
+merge or expected-head mismatch makes the run stale and stops retargeting.
+Pagination, API and cap failure make a read incomplete rather than “changed”.
+No incomplete or unstable observation can produce success.
+
+The latest base event is also an evidence-epoch barrier. A request generation
+must be strictly newer than it before clean evidence can pass; equal timestamps
+are ambiguous. Because GitHub does not expose provider-authenticated
+request-to-terminal-payload lineage, a post-epoch canonical request must receive
+its own qualifying provider `+1`; a later terminal clean alone cannot pass.
+Workflow markers bind the current base directly. Findings remain conservative.
+The imported ruleset blocks non-fast-forward
+default-branch updates, and strict up-to-date handles ordinary fast-forward
+movement that expands the required head. If an administrator temporarily
+disables those protections and force-pushes anyway, the next exact verifier
+reconstructs the timeline and remains blocking. V2 does not claim atomic
+invalidation of an older same-SHA success after arbitrary provider activity;
+the documented exact-current merge closure supplies that eventual boundary
+without a webhook App or cron.
+
+The stability/reconcile budget is shared across retries. If it expires without
+a stable clean pair, runtime reports `unhealthy/pending` with
+`wait_then_reconcile`; a later provider event or manual reconcile reconstructs
+from current GitHub state.
+
+## Resource profiles
+
+Every authoritative collection is fully paginated. A cap hit remains
+`unhealthy/pending` and reports the exact cap, stopping point and safe next
+action. It never truncates evidence into success.
+
+The profiles are policy, not arbitrary dispatch numbers:
+
+| Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `default` | 20 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
+| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
+
+Page size is 100, one response is capped at 8 MiB, the clean inter-read delay
+is five seconds and the workflow job timeout is 14 minutes. Repositories with
+legitimate large PRs may persistently select the reviewed `expanded` profile
+through protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`.
+Per-dispatch profile and numeric overrides are deferred beyond v2.0.
+
+## Result and projection model
+
+The public outputs are exactly:
+
+```text
+execution_health
+gate_outcome
+recovery_code
+retry_safe
 ```
 
-The production assembler converts each trusted event, scan, observation
-boundary, and durable history into the exact controller command. The
-package-local reconcile workflow is a template/contract fixture for this shape,
-not a hosted central router and not activation evidence.
-
-## Trust boundaries
-
-### Consumer boundary
-
-The consumer owns only its generated caller, permission ceiling, and the
-organisation `@v2` call. A called workflow cannot elevate `GITHUB_TOKEN`.
-Consumer PR code, checkout files, and caller-supplied arbitrary JSON are not
-trusted controller inputs.
-
-### Release boundary
-
-The release pipeline publishes the complete `packages/action` subtree to
-`Joey-Tools/codex-review-gate-action`. The personal
-`JoeyTeng/codex-review-gate-action` repository is a frozen v1 archive. V2
-documentation, runtime identity, and release aliases never select it.
-
-The selected reusable workflow checks out:
-
-- `repository: ${{ job.workflow_repository }}`
-- `ref: ${{ job.workflow_sha }}`
-- `persist-credentials: false`
-
-The exact selected object is the runtime source for that invocation. The
-floating major alias permits compatible v2 releases; the immutable release
-commit and signed tags are established by release policy, not by a caller
-claim.
-
-### Controller boundary
-
-The trusted controller owns:
-
-- canonical input construction and state reconstruction;
-- complete read transport and bounded final reread;
-- durable request reservations and effect ledger persistence;
-- effect ordering and retry-zero enforcement;
-- response validation and binding;
-- sticky projection and commit-status publication;
-- server-time-bound wait transitions.
-
-The reducer and plan adapter cannot grant these capabilities to themselves.
-
-### Provider-evidence boundary
-
-Events and wakeup hints are observation triggers only. Request comments,
-terminal provider artefacts, findings, reactions, thread state, no-start
-responses, and lifecycle data are admitted only after complete transport,
-closed-schema projection, and stability checks. A commit status, generic bot
-creator, sticky comment, scheduler deadline, or prior decision is not provider
-evidence.
-
-## Plan-only composite adapter
-
-`action.yml` executes `src/v2/action.mjs`. It accepts an operation input path
-under `RUNNER_TEMP`, confines the read to the selected `RUNNER_TEMP` directory
-object rather than a checkout/PR-controlled path, performs read-only transport,
-and returns closed plans.
-
-On Linux and macOS, the reader holds the selected `RUNNER_TEMP` directory open
-while one isolated child walks from `/`. Each directory component is opened
-without following the leaf, held across `chdir`, and compared by device, inode,
-and file type before traversal continues. The leaf is opened nonblocking and
-without following it in the parent and remains held as inherited descriptor 4.
-The child reads only that selected descriptor and requires the relative leaf to
-match its device, inode, file type, access policy, and selected size both before
-and after the two positioned reads. The stable bytes must also be strict UTF-8
-and the unique canonical JSON representation. This protects against redirection
-to a different directory or leaf object; it does not prove producer provenance
-or that a race-time symlink resolving to the same object was never traversed.
-It also assumes no privileged bind-mount, mount-namespace, or filesystem
-identity-semantic attack; those require native mount-aware APIs. Other platforms
-fail closed.
-
-At each observed leaf stat, the access-policy predicate is exactly: regular
-file, link count one, and POSIX group/other write mode bits clear. It does not
-inspect extended ACLs and does not establish protection from a same-UID writer,
-owner provenance, or privileged mount authority; those are outside the fixed
-Ubuntu production threat model.
-
-Its operations are `prepare-request`, `bind-request`, and `evaluate-only`.
-Its required, no-default status target enum is `head` or
-`test-merge-with-head-sentinel`. `head` authorizes only non-success sentinel
-writes; clean/skipped status publication is explicitly suppressed. Every
-terminal verdict is publishable only to a validated potential merge. The
-Joey-Tools production reusable workflow hardcodes
-`test-merge-with-head-sentinel` and exposes no selector for it.
-
-The adapter explicitly rejects non-read GitHub transport and any runner result
-that claims performed writes. It does not:
-
-- create `@codex review` comments;
-- write pending, success, failure, or error statuses;
-- persist a scheduler intent or effect ledger;
-- bind a remote response as an executed effect;
-- perform an environment wait;
-- publish a sticky state projection;
-- complete branch protection.
-
-Therefore direct composite use, including an exact-SHA invocation, is a
-low-level controller-development interface only. Plan files are not effect
-receipts. A controller that consumes them must independently preserve the
-closed schemas, durability, ordering, idempotency, and response-binding
-contracts.
-
-## Projection and reduction
-
-The projector joins immutable discovery and exact-evidence snapshots with
-explicit controller state. It binds the repository, pull request, base, head,
-unique merge base, potential merge commit/tree/parents, lifecycle, selection,
-server enforcement, requests, provider artefacts, thread resolution,
-acknowledgements, no-start observations, and inventory completeness.
-
-Selection is available only through explicit v2 controller intent or compatible
-v2 server enforcement. There is no filesystem, tag-name, legacy-file, or
-decision-table heuristic that selects a policy major.
-
-The reducer is pure: it has no I/O, clock, or environment dependency. It
-accepts only the closed schema and returns one of:
-
-- `not-selected`
-- `pending`
-- `clean`
-- `findings`
-- `inconclusive`
-- `skipped-unavailable`
-- `blocked-configuration`
-- `blocked-input`
-
-Key precedence rules are:
-
-1. Disabled or ineligible v2 selection is `not-selected`.
-2. An invalid/currently unbound review epoch is `blocked-input`.
-3. Missing compatible workflow/ruleset/App enforcement is
-   `blocked-configuration`.
-4. A trustworthy blocking finding is `findings`, even if another inventory is
-   incomplete.
-5. Unstable scope, incomplete pagination/final reread, malformed or unstable
-   evidence, or exhausted request authority is `inconclusive`.
-6. A confirmed no-start response is `skipped-unavailable` only for implicit
-   selection; an explicitly requested route is blocked instead.
-7. `clean` requires complete stable evidence and an accepted closed reaction
-   basis. A terminal clean classifies the provider artifact but is not positive
-   completion authority.
-8. Otherwise the selected current epoch remains `pending`.
-
-Positive completion is deliberately stricter than negative evidence. A
-finding may block from a trustworthy carrier even when unrelated acquisition
-is incomplete; clean never arises from a partial snapshot.
-
-Reaction-only clean selects the unique latest eligible request and its exact
-provider `+1`. An exact-provider `eyes` reaction at the same or a later
-semantic time vetoes that reaction-only result; an earlier `eyes` reaction does
-not. Reactions never override a selected terminal payload, including in the
-`mixed` profile.
-
-## Review epoch and status targets
-
-One v2 review epoch binds repository and PR identity plus exact base, head,
-merge base, and ordered potential-merge data. Lifecycle must remain open.
-Initial and final scope projections must match before positive completion.
-
-Request quotas and automatic generation continuity remain head-scoped across a
-base retarget, so an older generation is never hidden or refunded. Positive
-`+1` and no-start authority are narrower: they must bind the latest admitted
-head generation, and that request must also match the current base and head.
-An earlier-base request can therefore support the next recovery generation or
-retain negative finding history, but it cannot authorize the current review
-epoch after the test-merge input changes. A stable current-head terminal clean
-may still classify the published artifact, but no accepted provider schema
-binds that carrier to a request, run, or input base.
-
-Durable controller history is partitioned deliberately. Only
-`automatic-request-reservation` intents and `review-request`,
-`request-binding`, `artifact-binding`, and `scheduler-state` responses survive
-a same-PR, same-head base or potential-merge retarget. Status and sentinel
-bindings, no-start and thread-resolution observations, and control/sticky
-comment bindings remain exact-current and are read only from the current
-incarnation: the exact-scope suffix after the latest durable same-head record
-from another base or potential merge. This prevents an A-to-B-to-A retarget
-from reviving A's earlier scheduler, status, sentinel, no-start, or comment
-authority. Retained earlier-base history preserves budget, generation,
-retry-zero, recovery, and negative-finding continuity, but cannot become
-current positive authority. An automatic reservation defines its generation
-origin. Its later review-request and request-binding records reference that
-origin even when a same-head retarget moves the request operation into a new
-exact scope; a manual request binding defines its own generation because it has
-no reservation. Artifact-binding and scheduler-state records likewise
-reference an existing origin and never redefine it from their current
-operation scope.
-
-Partial transactions obey the same split. A head-scoped reservation that has
-not reached its retry-zero attempt remains charged after a retarget, while the
-recovered attempt and request binding must bind the new exact scope and its
-scheduler observation. An unanswered artifact-binding intent is exact-current
-and current-incarnation: an intent from an old scope, or from an earlier visit
-to the same exact tuple separated by a durable foreign-scope record, is
-quarantined rather than compared with or replayed as the current candidate.
-The stable incarnation anchor is the latest durable same-head foreign-scope
-record; it participates in the effect identity, while a crash or lease change
-inside one incarnation resumes the same transaction.
-
-The control-plane audit receipt is schema version 2. Its serialized validator
-also accepts the exact closed legacy version-1 shape for audit compatibility,
-but deserialization never recreates the process-local authority handle. Version
-2 marks request bindings with `current_incarnation`, requires the true markers
-to form one ledger suffix, and joins each current binding to its exact current
-generation. A visible request comment from an earlier head must still have a
-durable audit binding, but it is excluded from exact selectors, projected
-requests, and reactions. A visible current-head request without a binding fails
-closed.
-
-The legacy version-1 receipt retains its original request-binding ceiling of
-three automatic plus sixty-four manual bindings. Sticky schema-version-1
-projections recognize the exact historical `terminal-clean`,
-`terminal-findings`, `malformed-evidence`, and `unresolved-inline-finding`
-whole-PR scope profiles for audit and continuation compatibility only; current
-snapshots still require their current scope assurance.
-
-An address command that uniquely targets an exact-refetched, closed-provider
-finding carrier excluded solely because it belongs to an earlier head is
-historical and is ignored. Unknown targets, non-canonical or misbound URLs,
-ambiguous carriers, and invalid current-head targets still fail closed. Likewise,
-provider reactions from an earlier incarnation or before the selected current
-request do not suppress a valid current no-start result. Only exact-provider
-activity bound to that selected request at or after its request time is a
-no-start disqualifier.
-
-Serialized receipts retain record OIDs, payload digests, response times, and
-other audit pointers. The generic projector surface exposes only fields that
-the closed receipt can independently join or that the branded live-ledger path
-authorizes; it deliberately omits source-row pointers that a deserialized
-manifest digest cannot independently revalidate. Closed generation admissions
-are the exception only where the receipt proves the prior-binding,
-recovery-transition, and next-binding order and identities together.
-
-Control-comment create/update history alone is not prior runner scheduling
-state. The first scheduler observation after such a comment-only predecessor
-still requires the same-load initial runner authority; after that observation
-and its status transaction, later scheduling requires established authority.
-
-A stable, final-reread current-head terminal clean is classification-only. It
-produces `inconclusive` with a `terminal-payload` (or `mixed`) profile and an
-exact `artifact-publication-only` artifact basis. Its selected request,
-generation, and recovery fields remain null, and a reaction cannot override the
-terminal classification. The runner exposes no terminal-clean binding
-candidate, the ledger admits no new terminal-clean completion transaction, and
-the projector never manufactures request lineage for such a carrier. Exact
-rich carrier commitments remain useful for findings and audit integrity, while
-legacy two-field bindings remain findings-only.
-
-Conversely, a completing current-request reaction binds its selected request
-and has no selected artifact. A non-null finding-recovery receipt is valid only
-on that reaction basis. Stable input blockers map only to `blocked-input`; they
-cannot manufacture `blocked-configuration`.
-
-Finding recovery remains stricter: after the prior finding is proved closed and
-a causally later current request generation is admitted, only a later reaction
-on that current request may complete clean. A terminal-clean carrier cannot
-supply or replace this recovery step. The completing request may be a manual
-generation when automatic quota is exhausted; automatic-to-automatic recovery
-still requires the strictly increasing closed generation chain.
-
-The ledger candidate-authority compatibility boundary therefore remains
-findings-only: schema version 1 retains its original byte and digest identity
-for `finding-recovery` / `findings` in automatic generations 1 and 2, and no
-version may turn an unauthenticated terminal clean into completion authority.
-Any historical terminal-clean-shaped record is audit-only and cannot be
-continued or projected as positive evidence. The closed parser may recognize
-its bytes, but durable replay rejects the terminal-clean binding purpose before
-any scheduler or generation lineage could authorize it.
-
-The pre-activation B boundary still makes production effects unreachable.
-Local proof composes the real runner, protected ledger transactions, fresh
-control-plane receipt, projector, reducer, and controller ordering without
-inventing a positive terminal-clean route. It is not activation evidence.
-
-The primary terminal policy targets the test-merge commit. Where required, the
-controller also writes a head sentinel so a stale or mismatched merge result
-cannot silently satisfy a head-only rule. Target choice is a closed scheduler
-mode, not a consumer-defined SHA. When no potential merge is validated,
-`not-selected` and configuration-blocked results retain a null primary target;
-they do not substitute the head commit for a missing test-merge target.
-
-Commit Status remains keyed by repository SHA and context. It is not a
-cryptographic attestation, provider artefact, or PR-isolation proof. V2 relies
-on controller receipts, exact epoch binding, complete provider reduction, and
-final reread rather than creator/context appearance alone.
-
-## Scheduling and public waits
-
-The scheduler computes effects without sleeping or performing I/O. It returns
-closed actions, `due-at`, and `wakeup-hints`; these are advisory scheduling
-state, never evidence or verdicts.
-
-The repository schedule has a separate durable dispatch protocol. A coordinator
-completes or resumes the protected candidate inventory, proves the full-cycle
-record and byte budget, persists one active reservation, and only then projects
-up to 64 canonical matrix rows. Scheduled rows execute serially and must present
-the original dispatch binding. The ledger enforces one attempt per candidate,
-requires the complete acquire/effect/release authority before acknowledgement,
-and records batch/cycle completion. Restart completes partial bookkeeping or
-exposes a typed recovery state; it never lists an attempted candidate again.
-
-Public routes require three distinct 15-minute environment boundaries:
-
-- `codex-review-gate-public-initial-15m`
-- `codex-review-gate-public-post-request-15m`
-- `codex-review-gate-public-no-start-15m`
-
-Each environment must have an exact 15-minute wait-timer protection rule. Its
-name alone provides no assurance. A trusted API preflight and live canary must
-prove the rules, and the controller must validate server-time observations so
-an early release cannot authorise an effect. A shell sleep, delayed cron, or
-immediate workflow rerun is not an equivalent boundary.
-
-Manual dispatch is `evaluate-only`: it may evaluate but cannot request a
-review or publish a status. Provider events are hints to rebuild the snapshot;
-they do not directly carry a trusted decision.
-
-## Durable effect ordering
-
-The controller effect ledger is scoped to repository, PR, and head. Each effect
-has an identity and idempotency key and moves through a persist-before-effect
-protocol.
-
-For review requests:
-
-1. reserve the scheduler request;
-2. complete the exact safe pre-scope read;
-3. persist the pre-effect attempt;
-4. persist the retry-zero request intent;
-5. perform exactly one request POST;
-6. bind the exact 201 response;
-7. rebuild/reduce the subsequent snapshot;
-8. publish only controller-authorised status and sticky effects.
-
-An attempted effect with an ambiguous response is never reclaimed or replayed.
-A pre-scope read failure leaves neither a pre-effect attempt nor a retry-zero
-request intent, and remains retryable without claiming that a POST happened.
-Later invocations may reuse an already bound response but cannot create a second
-effect for the same idempotency key. Status and sticky effects follow the same
-reserve, persist, perform, and bind discipline.
-
-The trusted server-time chain is ordered as `pre-scope <= pre-effect attempt <=
-retry-zero request intent <= request created_at <= POST response <= exact
-refetch <= post-scope`. The request-intent boundary therefore proves
-write-ahead persistence before the public POST; it must not be misused as a
-lower bound on the earlier pre-scope observation.
-
-This provides durable causal ordering, not distributed atomicity. If
-persistence or response binding cannot be proved, the controller stops closed
-and retains the ledger for recovery.
-
-## Server enforcement and activation
-
-V2 selection is meaningful only when the trusted controller and required
-server-side workflow/ruleset/App bindings are compatible. The reducer exposes
-that distinction as selection and server-enforcement status instead of
-inferring readiness from a workflow file in a branch.
-
-Production activation requires all of these properties simultaneously:
-
-- the admitted release contains the reviewed assembler, durable dispatch, and
-  effect protocol and matches the locally gated tree;
-- the organisation reusable workflow at `@v2` is the selected public entry;
-- all environment wait rules pass trusted API preflight;
-- a live canary proves wait and server-time enforcement;
-- controller concurrency and durable ledger scope are correct;
-- the exact status target/sentinel behaviour is proven;
-- the final snapshot and effect receipts remain stable;
-- only then is `codex/github-review-gate` added to the ruleset.
-
-Until then, the supported state is pre-activation validation. A copied caller,
-package-local reconcile fixture, green adapter run, or locally constructed
-controller JSON cannot satisfy this gate.
-
-## Major isolation and retained v1 artefacts
-
-The release tree retains the v1 implementation and decision documents to
-preserve history and the frozen archive:
-
-- `src/core.mjs` and `src/gate.mjs` are legacy v1 runtime files;
-- `decision-table.json` remains authoritative only for v1 policy major 1;
-- `producer-receipt.schema.json` describes legacy producer receipt v1;
-- personal-repository `@v1` references remain frozen v1 consumers.
-
-These files are deliberately unselected in v2. The v2 projector, reducer,
-scheduler, plan adapter, and workflow controller import their own `src/v2`
-modules and closed schemas. The v2 controller has no option, environment
-variable, tag fallback, error recovery, or compatibility route that selects
-the v1 reducer. A v2 failure remains `blocked-*`, `inconclusive`, or another
-closed v2 outcome.
-
-The organisation v2 target must expose no `v1*` branch or tag selector. File
-presence in the split history does not create selection authority. This
-major-isolated retention permits audit and archive continuity without making
-v1 a downgrade path.
-
-## Security non-guarantees
-
-V2 does not claim that:
-
-- a floating major alias is post-run immutable provenance;
-- `github-actions[bot]` proves which workflow code ran;
-- a commit status alone proves provider evidence or PR isolation;
-- environment names prove their protection rules;
-- the composite adapter executes its plans;
-- a plan/result digest is a signature or remote-effect receipt;
-- one point-in-time reread eliminates all TOCTOU risk;
-- retained v1 files are selectable by v2.
-
-The design instead uses explicit release selection, closed schemas, complete
-snapshots, stable rereads, durable effect identities, response binding, and
-fail-closed activation evidence.
+`execution_health` is `healthy|unhealthy`; `gate_outcome` is
+`success|failure|pending|not_applicable|unknown`; `retry_safe` says whether an
+immediate identical-input retry is a valid recovery operation. The closed
+recovery-code set is documented in [README.md](README.md).
+
+Legal semantic combinations are:
+
+| Health/outcome | Meaning |
+| --- | --- |
+| `healthy/success` | Two stable complete snapshots proved current-head clean. |
+| `healthy/failure` | Qualifying findings were proved. |
+| `unhealthy/failure` | Findings were proved but execution or final result handling also failed. |
+| `healthy/pending` | Evaluation completed safely, but current state cannot authorise success yet. Follow `recovery_code`; only `wait_provider` is a pure wait. |
+| `unhealthy/pending` | API, pagination, cap or stability execution is incomplete. |
+| `healthy/not_applicable` | A delayed automatic event is stale. |
+| `unhealthy/not_applicable` | A manual target is invalid or the scope is unsupported. |
+| `unhealthy/unknown` | No trusted state can be read. |
+
+Every pending result remains blocking; `healthy/pending` is not a weak
+success.
+
+`unhealthy/success` is forbidden. The verifier job maps only a stable
+`healthy/success` to a successful native conclusion. Every other pair maps to
+a blocking conclusion, keeping ordinary findings distinct from evaluator
+failure. The required verifier CheckRun belongs to the exact current PR
+feature-head SHA. Its `pull_request` run executes on `refs/pull/N/merge`, and
+strict environment/event/fresh-read validation binds success to the unchanged
+head, base and test-merge. The controller's CheckRun is bound to the default-branch commit and
+never supplies the required PR result. Direct status projection and
+`statusProjection` are deleted.
+
+Every result is interpreted through its `recovery_code`; the health/outcome
+pair is not an instruction by itself. Only `wait_provider` is a pure wait.
+
+When no additional evidence query is needed, the summary and sticky report
+`findings_unresolved`,
+`findings_resolved`, `findings_historical` and `findings_indeterminate`.
+Incomplete pagination, API failure or cap hits make affected values `unknown`,
+not zero. These are diagnostics for normalised non-inline findings, not public
+Action outputs or inline-thread authority.
+
+Summary and sticky contain a bounded reason, recovery code and concrete next
+action. They expose object identities, digests, bounded escaped excerpts and
+links when useful, but never tokens, headers, raw payload dumps or untrusted
+workflow commands.
+
+At-least-once recovery may create small duplicate requests, verifier attempts
+or diagnostic comments after an unknown write result. Duplicates are folded or
+reported conservatively; they never authorise selection of a convenient clean
+or omission of a finding.
+
+## Exact-head merge closure
+
+Stable A/B snapshots prove only a short observation window; they do not lock
+the PR. Immediately before merge, an agent must:
+
+1. reread the exact current PR head;
+2. dispatch controller `reconcile` for that exact head;
+3. observe the strictly newer verifier attempt and its unique canonical
+   `codex/github-review-gate` CheckRun on the current feature-head SHA, with
+   that run bound to the current test-merge;
+4. require Action output `healthy/success` and a successful verifier conclusion;
+5. reread unchanged PR head, base and test-merge SHA; and
+6. require the ruleset to confirm branch up to date, all conversations
+   resolved and merge allowed.
+
+Any head or policy change restarts this closure. Otherwise merge immediately
+with this exact-head compare-and-swap:
+
+```bash
+gh pr merge "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --match-head-commit "$HEAD_SHA"
+```
+
+A previous success is never a permanent review lease, and direct human UI
+merge outside this closure is unsupported.
+
+## Supported boundary and non-goals
+
+Stable v2.0 supports GitHub.com public and private repositories, an open
+non-draft PR from an ordinary same-repository branch to the default branch,
+GitHub-hosted Linux runners and ordinary merge/squash/rebase methods.
+
+It fails closed for GHES, forks, merge queues, non-default bases, drafts,
+bot-owned PRs, self-hosted/Windows/macOS runners and new operations on closed or
+merged PRs.
+
+The design does not claim that:
+
+- sticky diagnostics are durable, unique or authoritative;
+- two snapshots prevent a change after snapshot B;
+- retries are exactly once;
+- an ambiguous short SHA can be made safe by guessing;
+- the Action duplicates branch freshness or conversation resolution;
+- a stale run follows or repairs a new head;
+- the required CheckRun proves workflow provenance beyond the compound
+  CODEOWNERS/inventory/canary boundary; or
+- the release publisher App contributes runtime authority.
+
+## v1 isolation
+
+v1 remains frozen and valid for consumers that have not migrated. v2 does not
+read v1 state, publish a compatibility selector, mutate v1 refs or fall back to
+the v1 reducer. Migration removes the v1 caller and installs the canonical v2
+workflow plus CODEOWNERS in one PR after the pre-merge canonical inventory
+fingerprint closure. It keeps the inventoried legacy requirements active,
+stages a separate v2 ruleset as Disabled, verifies it in a harmless canary PR,
+then activates and reads the complete Active policy back. Only afterward does
+the read-only derived plan freeze the exact legacy-only removal and expected
+complete post-state. Separately authorised cleanup follows that plan; two-round
+read-only closure matches the external expected-state digest, proves both
+legacy surfaces clear, and proves v2 still exactly Active before the canary
+closes unmerged. Any inconclusive result preserves Active v2 for read-only
+diagnosis.

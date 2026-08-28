@@ -1,168 +1,740 @@
-name: Release Action Subtree v2
+name: Release Action Subtree
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
     paths:
-      - .github/workflows/sync-action-subtree.yml
-      - package.json
-      - packages/action/**
-      - scripts/generate-action-release-provenance.mjs
-      - scripts/release-action-subtree.sh
-      - docs/release/action-v2-repository-baselines.json
+      - release-manifest.json
   workflow_dispatch:
     inputs:
-      publish_v2:
-        description: Publish the fixed signed v2.0.0 release and signed aliases.
+      source_sha:
+        description: Exact 40-character frozen release-intent commit on master to reconcile.
         required: true
-        default: false
-        type: boolean
+        type: string
+      admission_run_id:
+        description: Push workflow run that persisted admission for source_sha.
+        required: true
+        type: string
+      admission_run_attempt:
+        description: Exact successful planning attempt whose immutable plan artifact is reused.
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: release-action-subtree-v2
+  group: codex-review-gate-action-release
   cancel-in-progress: false
 
+env:
+  RELEASE_SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
+  RELEASE_CONTROL_SHA: ${{ github.sha }}
+  RELEASE_ADMISSION_BEFORE_SHA: ${{ github.event.before }}
+
 jobs:
-  reject-invalid-publish:
-    name: Reject invalid v2 publication request
-    if: >-
-      ${{
-        github.event_name == 'workflow_dispatch' &&
-        inputs.publish_v2 &&
-        (
-          github.repository != 'Joey-Tools/codex-review-gate' ||
-          github.ref != 'refs/heads/master'
-        )
-      }}
-    permissions: {}
-    runs-on: ubuntu-latest
+  plan:
+    name: Plan immutable release
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
+    outputs:
+      artifact-id: ${{ steps.upload-plan.outputs.artifact-id }}
+      artifact-basename: ${{ steps.release-plan.outputs.artifact-basename }}
     steps:
-      - name: Fail closed outside the exact release source
+      - name: Validate exact source dispatch boundary
+        id: dispatch-boundary
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          EXPECTED_REPOSITORY: Joey-Tools/codex-review-gate
+          EXPECTED_REF: refs/heads/master
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ADMISSION_RUN_ID: ${{ inputs.admission_run_id }}
+          ADMISSION_RUN_ATTEMPT: ${{ inputs.admission_run_attempt }}
+          CONTROL_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "publish_v2=true requires Joey-Tools/codex-review-gate at refs/heads/master." >&2
-          exit 1
+          set -euo pipefail
+          [[ "$ACTUAL_REPOSITORY" == "$EXPECTED_REPOSITORY" ]] || {
+            echo "workflow_dispatch is restricted to $EXPECTED_REPOSITORY." >&2
+            exit 1
+          }
+          [[ "$DEFAULT_BRANCH" == "master" && "$ACTUAL_REF" == "$EXPECTED_REF" ]] || {
+            echo "workflow_dispatch must target the live refs/heads/master default branch." >&2
+            exit 1
+          }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "source_sha must be a lowercase, full 40-character commit SHA." >&2
+            exit 1
+          }
+          [[ "$ADMISSION_RUN_ID" =~ ^[1-9][0-9]*$ && "$ADMISSION_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
+            echo "admission_run_id and admission_run_attempt must be positive integers." >&2
+            exit 1
+          }
+          live_master_sha="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            GH_HOST=github.com gh api --hostname github.com \
+              "repos/$EXPECTED_REPOSITORY/git/ref/heads/master" --jq .object.sha)"
+          [[ "$live_master_sha" =~ ^[0-9a-f]{40}$ && "$CONTROL_SHA" == "$live_master_sha" ]] || {
+            echo "the workflow control commit must equal live $EXPECTED_REPOSITORY@refs/heads/master." >&2
+            exit 1
+          }
+          admission_run="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            GH_HOST=github.com gh api --hostname github.com \
+              "repos/$EXPECTED_REPOSITORY/actions/runs/$ADMISSION_RUN_ID/attempts/$ADMISSION_RUN_ATTEMPT" \
+              --jq '[.event, .head_branch, .head_sha, .path, .run_attempt] | @tsv')"
+          IFS=$'\t' read -r run_event run_branch run_head run_path run_attempt <<< "$admission_run"
+          [[ "$run_event" == "push" &&
+              "$run_branch" == "master" &&
+              "$run_head" == "$SOURCE_SHA" &&
+              "$run_path" == ".github/workflows/sync-action-subtree.yml" &&
+              "$run_attempt" == "$ADMISSION_RUN_ATTEMPT" ]] || {
+            echo "the persisted admission must come from this workflow's exact master push for source_sha." >&2
+            exit 1
+          }
+          artifact_name="release-plan-$ADMISSION_RUN_ATTEMPT.json"
+          admission_artifact="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            GH_HOST=github.com gh api --hostname github.com \
+              "repos/$EXPECTED_REPOSITORY/actions/runs/$ADMISSION_RUN_ID/artifacts?name=$artifact_name" \
+              --jq 'if (.artifacts | length) == 1 then [.artifacts[0].id, .artifacts[0].name, .artifacts[0].digest, .artifacts[0].expired] | @tsv else error("expected exactly one admission artifact") end')"
+          IFS=$'\t' read -r artifact_id actual_artifact_name artifact_digest artifact_expired <<< "$admission_artifact"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ &&
+              "$actual_artifact_name" == "$artifact_name" &&
+              "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ &&
+              "$artifact_expired" == "false" ]] || {
+            echo "the exact persisted admission artifact is missing, expired, or has no immutable SHA-256 digest." >&2
+            exit 1
+          }
+          printf 'artifact-id=%s\n' "$artifact_id" >> "$GITHUB_OUTPUT"
+          printf 'artifact-digest=%s\n' "$artifact_digest" >> "$GITHUB_OUTPUT"
+      - name: Explain rejected dispatch
+        if: ${{ failure() && steps.dispatch-boundary.outcome == 'failure' }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## Release dispatch rejected
 
-  validate:
-    name: Validate v2 subtree release candidate
-    if: >-
-      ${{
-        github.repository == 'Joey-Tools/codex-review-gate' &&
-        (github.event_name != 'workflow_dispatch' || !inputs.publish_v2)
-      }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out exact source commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+          No source checkout occurred and no privileged Environment job can
+          start. Run only from `Joey-Tools/codex-review-gate@master`, passing
+          the exact frozen release-intent commit plus its admitted push run and
+          attempt. A rejected push cannot be resurrected by dispatch.
+          SUMMARY
+      - name: Download persisted push admission
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.dispatch-boundary.outputs.artifact-id }}
+          path: ${{ runner.temp }}/persisted-push-admission
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.admission_run_id }}
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Check out exact publisher control commit
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Verify split DAG, repository baselines, and v2 identities
+      - name: Build release plan
+        id: release-plan
         env:
-          EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
-        run: scripts/release-action-subtree.sh --check --source-ref "$GITHUB_SHA"
-
-  publish:
-    name: Publish signed immutable v2 refs
-    if: >-
-      ${{
-        github.event_name == 'workflow_dispatch' &&
-        inputs.publish_v2 &&
-        github.repository == 'Joey-Tools/codex-review-gate' &&
-        github.ref == 'refs/heads/master'
-      }}
-    runs-on: ubuntu-latest
-    environment: action-v2-release
-    steps:
-      - name: Check out exact source commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: "20"
-
-      - name: Configure closed HTTPS publication credential
-        env:
-          ACTION_REPO_PUSH_TOKEN_V2: ${{ secrets.ACTION_REPO_PUSH_TOKEN_V2 }}
+          EXPECTED_SOURCE_COMMIT: ${{ env.RELEASE_SOURCE_SHA }}
+          EXPECTED_CONTROL_COMMIT: ${{ env.RELEASE_CONTROL_SHA }}
+          ADMISSION_RUN_ATTEMPT: ${{ inputs.admission_run_attempt }}
+          EXPECTED_ADMISSION_ARTIFACT_DIGEST: ${{ steps.dispatch-boundary.outputs.artifact-digest }}
         run: |
           set -euo pipefail
-          if [ -z "$ACTION_REPO_PUSH_TOKEN_V2" ]; then
-            echo "ACTION_REPO_PUSH_TOKEN_V2 is required for the v2 target." >&2
-            exit 1
+          admission_args=(--admission-before "$RELEASE_ADMISSION_BEFORE_SHA")
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            persisted_plan="$RUNNER_TEMP/persisted-push-admission/release-plan-$ADMISSION_RUN_ATTEMPT.json"
+            [[ -f "$persisted_plan" && ! -L "$persisted_plan" ]]
+            actual_artifact_digest="sha256:$(sha256sum "$persisted_plan" | cut -d ' ' -f 1)"
+            [[ "$EXPECTED_ADMISSION_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ &&
+                "$actual_artifact_digest" == "$EXPECTED_ADMISSION_ARTIFACT_DIGEST" ]] || {
+              echo "the downloaded admission plan differs from its immutable Actions artifact digest." >&2
+              exit 1
+            }
+            admission_args=(--admission-plan "$persisted_plan")
           fi
-
-          credential_config="$RUNNER_TEMP/action-v2-gitconfig"
-          umask 077
-          : > "$credential_config"
-          authorization="$(printf 'x-access-token:%s' "$ACTION_REPO_PUSH_TOKEN_V2" | base64 -w 0)"
-          git config --file "$credential_config" \
-            http.https://github.com/Joey-Tools/codex-review-gate-action.git.extraheader \
-            "AUTHORIZATION: basic $authorization"
-          unset ACTION_REPO_PUSH_TOKEN_V2 authorization
-          printf 'GIT_CONFIG_GLOBAL=%s\n' "$credential_config" >> "$GITHUB_ENV"
-          printf 'ACTION_REPO_PUSH_AUTHENTICATED_V2=1\n' >> "$GITHUB_ENV"
-
-      - name: Import and bind the v2 OpenPGP signing key
-        env:
-          ACTION_RELEASE_SIGNING_PRIVATE_KEY_V2: ${{ secrets.ACTION_RELEASE_SIGNING_PRIVATE_KEY_V2 }}
-          EXPECTED_FINGERPRINT: ${{ secrets.ACTION_RELEASE_SIGNING_FINGERPRINT_V2 }}
+          node scripts/generate-action-release-provenance.mjs plan \
+            --repo "$GITHUB_WORKSPACE" \
+            --source-ref "$RELEASE_SOURCE_SHA" \
+            --control-ref "$RELEASE_CONTROL_SHA" \
+            "${admission_args[@]}" \
+            --output "$RUNNER_TEMP/release-plan-$GITHUB_RUN_ATTEMPT.json"
+          printf 'artifact-basename=release-plan-%s.json\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Explain plan recovery
+        if: ${{ failure() && steps.release-plan.outcome == 'failure' }}
         run: |
-          set -euo pipefail
-          if [ -z "$ACTION_RELEASE_SIGNING_PRIVATE_KEY_V2" ] || [ -z "$EXPECTED_FINGERPRINT" ]; then
-            echo "ACTION_RELEASE_SIGNING_PRIVATE_KEY_V2 and ACTION_RELEASE_SIGNING_FINGERPRINT_V2 are required." >&2
-            exit 1
-          fi
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## Release plan blocked
 
-          signing_home="$RUNNER_TEMP/action-v2-gnupg"
-          install -d -m 700 "$signing_home"
-          export GNUPGHOME="$signing_home"
-          printf '%s' "$ACTION_RELEASE_SIGNING_PRIVATE_KEY_V2" | gpg --batch --import
-          unset ACTION_RELEASE_SIGNING_PRIVATE_KEY_V2
-
-          expected="$(printf '%s' "$EXPECTED_FINGERPRINT" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-          actual="$(gpg --batch --with-colons --list-secret-keys "$expected" | awk -F: '$1 == "fpr" { print toupper($10); exit }')"
-          if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
-            echo "Imported OpenPGP primary fingerprint does not match release policy." >&2
-            exit 1
-          fi
-          printf 'GNUPGHOME=%s\n' "$signing_home" >> "$GITHUB_ENV"
-          printf 'ACTION_RELEASE_SIGNING_FINGERPRINT_V2=%s\n' "$expected" >> "$GITHUB_ENV"
-
-      - name: Atomically publish v2 refs and provenance
-        env:
-          EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
-        run: >-
-          scripts/release-action-subtree.sh
-          --publish
-          --source-ref "$GITHUB_SHA"
-          --output "$RUNNER_TEMP/codex-review-gate-action-v2.0.0-provenance.json"
-
-      - name: Upload v2 release provenance
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+          Inspect `recovery_code`. For `publisher-control-closure` or
+          `publisher-control-landing`, merge the infrastructure first, then
+          introduce `release-manifest.json` in a separately landed
+          release-intent PR. Dispatch must reuse the exact persisted push
+          admission and cannot repair a rejected landing.
+          SUMMARY
+      - name: Upload release plan
+        id: upload-plan
+        uses: actions/upload-artifact@v7
         with:
-          name: codex-review-gate-action-v2.0.0-provenance
-          path: ${{ runner.temp }}/codex-review-gate-action-v2.0.0-provenance.json
+          name: release-plan-${{ github.run_attempt }}.json
+          path: ${{ runner.temp }}/release-plan-${{ github.run_attempt }}.json
+          archive: false
           if-no-files-found: error
-          overwrite: false
           retention-days: 90
 
-      - name: Remove ephemeral release credentials
+  candidate-a:
+    name: Build candidate A
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
+      artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.plan.outputs.artifact-id }}
+          path: ${{ runner.temp }}/plan
+          digest-mismatch: error
+      - name: Materialize candidate A
+        env:
+          PLAN_ARTIFACT_BASENAME: ${{ needs.plan.outputs.artifact-basename }}
+        run: |
+          [[ "$PLAN_ARTIFACT_BASENAME" =~ ^release-plan-[1-9][0-9]*\.json$ ]]
+          scripts/release-action-subtree.sh --build-candidate \
+            --source-ref "$RELEASE_SOURCE_SHA" \
+            --control-ref "$RELEASE_CONTROL_SHA" \
+            --plan-file "$RUNNER_TEMP/plan/$PLAN_ARTIFACT_BASENAME" \
+            --output-dir "$RUNNER_TEMP/candidate-a"
+      - name: Pack candidate A transport
+        id: pack-candidate
+        run: |
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -cf "$RUNNER_TEMP/release-candidate-a-$GITHUB_RUN_ATTEMPT.tar" \
+            -C "$RUNNER_TEMP/candidate-a" .
+          printf 'artifact-basename=release-candidate-a-%s.tar\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Upload candidate A
+        id: upload-candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-candidate-a-${{ github.run_attempt }}.tar
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+      - name: Validate candidate A source independently
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/candidate-a-source" "$RELEASE_SOURCE_SHA"
+          npm --prefix "$RUNNER_TEMP/candidate-a-source" run check
+          npm --prefix "$RUNNER_TEMP/candidate-a-source" test -- --test-reporter=dot
+
+  candidate-b:
+    name: Build candidate B
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
+      artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.plan.outputs.artifact-id }}
+          path: ${{ runner.temp }}/plan
+          digest-mismatch: error
+      - name: Materialize candidate B
+        env:
+          PLAN_ARTIFACT_BASENAME: ${{ needs.plan.outputs.artifact-basename }}
+        run: |
+          [[ "$PLAN_ARTIFACT_BASENAME" =~ ^release-plan-[1-9][0-9]*\.json$ ]]
+          scripts/release-action-subtree.sh --build-candidate \
+            --source-ref "$RELEASE_SOURCE_SHA" \
+            --control-ref "$RELEASE_CONTROL_SHA" \
+            --plan-file "$RUNNER_TEMP/plan/$PLAN_ARTIFACT_BASENAME" \
+            --output-dir "$RUNNER_TEMP/candidate-b"
+      - name: Pack candidate B transport
+        id: pack-candidate
+        run: |
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -cf "$RUNNER_TEMP/release-candidate-b-$GITHUB_RUN_ATTEMPT.tar" \
+            -C "$RUNNER_TEMP/candidate-b" .
+          printf 'artifact-basename=release-candidate-b-%s.tar\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Upload candidate B
+        id: upload-candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-b-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-candidate-b-${{ github.run_attempt }}.tar
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+      - name: Validate candidate B source independently
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/candidate-b-source" "$RELEASE_SOURCE_SHA"
+          npm --prefix "$RUNNER_TEMP/candidate-b-source" run check
+          npm --prefix "$RUNNER_TEMP/candidate-b-source" test -- --test-reporter=dot
+
+  assemble:
+    name: Compare and assemble candidates
+    needs: [candidate-a, candidate-b]
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
+    outputs:
+      artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
+      artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.candidate-a.outputs.artifact-id }}
+          path: ${{ runner.temp }}/candidate-a-transport
+          digest-mismatch: error
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.candidate-b.outputs.artifact-id }}
+          path: ${{ runner.temp }}/candidate-b-transport
+          digest-mismatch: error
+      - name: Validate and extract candidate transports
+        env:
+          CANDIDATE_A_ARTIFACT_BASENAME: ${{ needs.candidate-a.outputs.artifact-basename }}
+          CANDIDATE_B_ARTIFACT_BASENAME: ${{ needs.candidate-b.outputs.artifact-basename }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_A_ARTIFACT_BASENAME" =~ ^release-candidate-a-[1-9][0-9]*\.tar$ ]]
+          [[ "$CANDIDATE_B_ARTIFACT_BASENAME" =~ ^release-candidate-b-[1-9][0-9]*\.tar$ ]]
+          node scripts/generate-action-release-provenance.mjs extract-transport \
+            --archive "$RUNNER_TEMP/candidate-a-transport/$CANDIDATE_A_ARTIFACT_BASENAME" \
+            --output-dir "$RUNNER_TEMP/candidate-a"
+          node scripts/generate-action-release-provenance.mjs extract-transport \
+            --archive "$RUNNER_TEMP/candidate-b-transport/$CANDIDATE_B_ARTIFACT_BASENAME" \
+            --output-dir "$RUNNER_TEMP/candidate-b"
+      - name: Require byte-identical candidates
+        run: |
+          scripts/release-action-subtree.sh --assemble \
+            --source-ref "$RELEASE_SOURCE_SHA" \
+            --control-ref "$RELEASE_CONTROL_SHA" \
+            --candidate-a "$RUNNER_TEMP/candidate-a" \
+            --candidate-b "$RUNNER_TEMP/candidate-b" \
+            --output-dir "$RUNNER_TEMP/release-candidate"
+      - name: Pack assembled candidate transport
+        id: pack-candidate
+        run: |
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -cf "$RUNNER_TEMP/release-candidate-$GITHUB_RUN_ATTEMPT.tar" \
+            -C "$RUNNER_TEMP/release-candidate" .
+          printf 'artifact-basename=release-candidate-%s.tar\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Upload assembled candidate
+        id: upload-candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-candidate-${{ github.run_attempt }}.tar
+          archive: false
+          if-no-files-found: error
+          retention-days: 35
+
+  publication_plan:
+    name: Build credential-free publication plan
+    needs: assemble
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
+    outputs:
+      artifact-id: ${{ steps.upload-publication-plan.outputs.artifact-id }}
+      artifact-basename: ${{ steps.publication-plan.outputs.artifact-basename }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.assemble.outputs.artifact-id }}
+          path: ${{ runner.temp }}/candidate-transport
+          digest-mismatch: error
+      - name: Validate and extract assembled candidate transport
+        env:
+          ASSEMBLED_ARTIFACT_BASENAME: ${{ needs.assemble.outputs.artifact-basename }}
+        run: |
+          [[ "$ASSEMBLED_ARTIFACT_BASENAME" =~ ^release-candidate-[1-9][0-9]*\.tar$ ]]
+          node scripts/generate-action-release-provenance.mjs extract-transport \
+            --archive "$RUNNER_TEMP/candidate-transport/$ASSEMBLED_ARTIFACT_BASENAME" \
+            --output-dir "$RUNNER_TEMP/release-candidate"
+      - name: Build credential-free publication plan
+        id: publication-plan
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ env.RELEASE_SOURCE_SHA }}
+          EXPECTED_CONTROL_COMMIT: ${{ env.RELEASE_CONTROL_SHA }}
+        run: |
+          scripts/release-action-subtree.sh --publication-plan \
+            --source-ref "$RELEASE_SOURCE_SHA" \
+            --control-ref "$RELEASE_CONTROL_SHA" \
+            --candidate "$RUNNER_TEMP/release-candidate" \
+            --output "$RUNNER_TEMP/publication-plan-$GITHUB_RUN_ATTEMPT.json"
+          printf 'artifact-basename=publication-plan-%s.json\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Explain privileged-boundary rejection
+        if: ${{ failure() && steps.publication-plan.outcome == 'failure' }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## Publication plan rejected
+
+          The credential-free admission stage rejected this source. The
+          privileged Environment did not start, no publisher token was minted,
+          and no signing key was imported. Only `write_eligible=true` or the
+          bounded `release-intent-superseded` recovery class may cross the
+          approval boundary.
+          SUMMARY
+      - name: Upload publication plan
+        id: upload-publication-plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: publication-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publication-plan-${{ github.run_attempt }}.json
+          archive: false
+          if-no-files-found: error
+          retention-days: 35
+
+  publish:
+    name: Publish signed release
+    needs: [assemble, publication_plan]
+    outputs:
+      reconcile_state: ${{ steps.reconcile.outputs.reconcile_state }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: marketplace-production
+    steps:
+      - name: Check out exact publisher control commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.assemble.outputs.artifact-id }}
+          path: ${{ runner.temp }}/candidate-transport
+          digest-mismatch: error
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.publication_plan.outputs.artifact-id }}
+          path: ${{ runner.temp }}/publication-plan-transport
+          digest-mismatch: error
+      - name: Validate and extract approved transport inputs
+        env:
+          ASSEMBLED_ARTIFACT_BASENAME: ${{ needs.assemble.outputs.artifact-basename }}
+          PUBLICATION_PLAN_ARTIFACT_BASENAME: ${{ needs.publication_plan.outputs.artifact-basename }}
+        run: |
+          set -euo pipefail
+          [[ "$ASSEMBLED_ARTIFACT_BASENAME" =~ ^release-candidate-[1-9][0-9]*\.tar$ ]]
+          [[ "$PUBLICATION_PLAN_ARTIFACT_BASENAME" =~ ^publication-plan-[1-9][0-9]*\.json$ ]]
+          node scripts/generate-action-release-provenance.mjs extract-transport \
+            --archive "$RUNNER_TEMP/candidate-transport/$ASSEMBLED_ARTIFACT_BASENAME" \
+            --output-dir "$RUNNER_TEMP/release-candidate"
+          publication_plan_source="$RUNNER_TEMP/publication-plan-transport/$PUBLICATION_PLAN_ARTIFACT_BASENAME"
+          [[ -f "$publication_plan_source" && ! -L "$publication_plan_source" ]]
+          install -m 600 \
+            "$publication_plan_source" \
+            "$RUNNER_TEMP/publication-plan.json"
+      - name: Revalidate publication plan before minting credentials
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ env.RELEASE_SOURCE_SHA }}
+          EXPECTED_CONTROL_COMMIT: ${{ env.RELEASE_CONTROL_SHA }}
+        run: |
+          scripts/release-action-subtree.sh --verify-publication-plan \
+            --source-ref "$RELEASE_SOURCE_SHA" \
+            --control-ref "$RELEASE_CONTROL_SHA" \
+            --candidate "$RUNNER_TEMP/release-candidate" \
+            --publication-plan-file "$RUNNER_TEMP/publication-plan.json"
+      - name: Validate live release signing certificate before minting credentials
+        run: |
+          set -euo pipefail
+          github_keys="$RUNNER_TEMP/github-signing-keys.json"
+          current_public_key="$RUNNER_TEMP/release-signing-public-key.asc"
+          umask 077
+          curl --fail --silent --show-error \
+            --proto '=https' \
+            --tlsv1.2 \
+            --retry 3 \
+            --retry-all-errors \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --output "$github_keys" \
+            'https://api.github.com/users/JoeyTeng-Codex/gpg_keys'
+          node scripts/generate-action-release-provenance.mjs verify-github-signing-key \
+            --input "$github_keys" \
+            --output-public-key "$current_public_key"
+      # Security policy: allowlisted GitHub-owned Actions intentionally follow
+      # floating major refs so upstream patch fixes arrive automatically. Moving
+      # to immutable SHAs requires Dependabot and a separate policy change.
+      - name: Create least-privilege publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: ${{ vars.RELEASE_PUBLISHER_APP_OWNER }}
+          repositories: codex-review-gate-action
+          permission-administration: read
+          permission-contents: write
+          skip-token-revoke: false
+      - name: Validate publisher identity and repository scope
+        env:
+          APP_CLIENT_ID: ${{ vars.RELEASE_PUBLISHER_APP_CLIENT_ID }}
+          APP_OWNER: ${{ vars.RELEASE_PUBLISHER_APP_OWNER }}
+          APP_PRIVATE_KEY: ${{ secrets.RELEASE_PUBLISHER_APP_PRIVATE_KEY }}
+          APP_SLUG: ${{ vars.RELEASE_PUBLISHER_APP_SLUG }}
+          ACTUAL_APP_SLUG: ${{ steps.publisher-token.outputs.app-slug }}
+          ACTUAL_INSTALLATION_ID: ${{ steps.publisher-token.outputs.installation-id }}
+          INSTALLATION_TOKEN: ${{ steps.publisher-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ "$APP_OWNER" == "JoeyTeng" ]]
+          [[ "$APP_SLUG" == "codex-review-gate-action-publisher" ]]
+          [[ "$ACTUAL_APP_SLUG" == "$APP_SLUG" ]]
+          [[ "$ACTUAL_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]]
+          installation_file="$RUNNER_TEMP/publisher-installation.json"
+          app_private_key="$APP_PRIVATE_KEY"
+          installation_token="$INSTALLATION_TOKEN"
+          unset APP_PRIVATE_KEY INSTALLATION_TOKEN
+          # GitHub permits installation metadata only through an App JWT.
+          # Do not route that JWT through GH_TOKEN/gh api: the identity read
+          # requires the Bearer scheme emitted by the bounded Node client.
+          # Installation tokens remain limited to the selected repository.
+          RELEASE_PUBLISHER_APP_PRIVATE_KEY="$app_private_key" \
+            node scripts/generate-action-release-provenance.mjs github-app-installation \
+              --client-id "$APP_CLIENT_ID" \
+              --installation-id "$ACTUAL_INSTALLATION_ID" \
+              --output "$installation_file"
+          unset app_private_key
+          jq -e \
+            --arg slug "$APP_SLUG" \
+            --arg owner "$APP_OWNER" \
+            --argjson installation_id "$ACTUAL_INSTALLATION_ID" \
+            '.id == $installation_id and
+             .app_id == 4700530 and
+             .app_slug == $slug and
+             .account.login == $owner and
+             .account.type == "User" and
+             .repository_selection == "selected" and
+             .suspended_at == null and
+             .permissions == {administration:"read", contents:"write", metadata:"read"} and
+             .events == []' \
+            "$installation_file" >/dev/null
+          repository_scope="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+            GH_HOST=github.com GH_TOKEN="$installation_token" \
+              gh api --hostname github.com installation/repositories \
+                --jq '[.total_count, (.repositories | length), .repositories[0].full_name] | @tsv')"
+          unset installation_token
+          [[ "$repository_scope" == $'1\t1\tJoeyTeng/codex-review-gate-action' ]]
+      - name: Configure target-scoped ephemeral Git authentication
+        run: |
+          set -euo pipefail
+          askpass="$RUNNER_TEMP/release-target-askpass"
+          umask 077
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -euo pipefail' \
+            "[[ \"\${CODEX_RELEASE_TARGET_URL:-}\" == \"https://github.com/JoeyTeng/codex-review-gate-action.git\" ]] || exit 1" \
+            'prompt="${1:-}"' \
+            'prompt="${prompt% }"' \
+            'case "$prompt" in' \
+            "  \"Username for 'https://github.com/JoeyTeng/codex-review-gate-action.git':\") printf '%s\\n' 'x-access-token' ;;" \
+            "  \"Password for 'https://x-access-token@github.com/JoeyTeng/codex-review-gate-action.git':\") printf '%s\\n' \"\${PUBLISHER_TOKEN:?}\" ;;" \
+            '  *) exit 1 ;;' \
+            'esac' > "$askpass"
+          chmod 700 "$askpass"
+      - name: Import and verify signing subkey
+        env:
+          PRIVATE_SUBKEY: ${{ secrets.RELEASE_SIGNING_GPG_PRIVATE_SUBKEY }}
+        run: |
+          set -euo pipefail
+          signing_home="$RUNNER_TEMP/release-gnupg"
+          current_public_key="$RUNNER_TEMP/release-signing-public-key.asc"
+          umask 077
+          install -d -m 700 "$signing_home"
+          export GNUPGHOME="$signing_home"
+          [[ -f "$current_public_key" && ! -L "$current_public_key" ]]
+          gpg --batch --import "$current_public_key"
+          printf '%s' "$PRIVATE_SUBKEY" | gpg --batch --import
+          unset PRIVATE_SUBKEY
+          node scripts/generate-action-release-provenance.mjs verify-signing-key \
+            --gnupg-home "$signing_home"
+          printf 'GNUPGHOME=%s\n' "$signing_home" >> "$GITHUB_ENV"
+      - name: Reconcile release publication
+        id: reconcile
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ env.RELEASE_SOURCE_SHA }}
+          EXPECTED_CONTROL_COMMIT: ${{ env.RELEASE_CONTROL_SHA }}
+          RELEASE_PUBLISHER_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          RELEASE_TARGET_ASKPASS: ${{ runner.temp }}/release-target-askpass
+          RELEASE_PUBLISHER_APP_OWNER: ${{ vars.RELEASE_PUBLISHER_APP_OWNER }}
+          RELEASE_PUBLISHER_APP_SLUG: ${{ vars.RELEASE_PUBLISHER_APP_SLUG }}
+        run: |
+          scripts/release-action-subtree.sh --publish \
+            --source-ref "$RELEASE_SOURCE_SHA" \
+            --control-ref "$RELEASE_CONTROL_SHA" \
+            --candidate "$RUNNER_TEMP/release-candidate" \
+            --publication-plan-file "$RUNNER_TEMP/publication-plan.json"
+      - name: Remove ephemeral local credentials
         if: ${{ always() }}
         run: |
           set -euo pipefail
           gpgconf --kill all || true
-          rm -f -- "$RUNNER_TEMP/action-v2-gitconfig"
-          rm -rf -- "$RUNNER_TEMP/action-v2-gnupg"
+          rm -f -- "$RUNNER_TEMP/release-target-askpass"
+          rm -f -- "$RUNNER_TEMP/github-signing-keys.json"
+          rm -f -- "$RUNNER_TEMP/release-signing-public-key.asc"
+          rm -rf -- "$RUNNER_TEMP/release-gnupg"
+      - name: Explain publication recovery
+        if: ${{ failure() }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## Publisher execution failed
+
+          Inspect the first failure, `reconcile_state`, and `recovery_code`.
+          Exact-prefix recovery never overwrites immutable objects. If an
+          artifact is missing or expired, redispatch the same exact
+          release-intent `source_sha` together with the original admitted push
+          `admission_run_id` and `admission_run_attempt`; both candidates are
+          rebuilt and a new Environment approval is required. Complete any
+          older partial release before attempting a newer version.
+          SUMMARY
+
+  verify:
+    name: Verify published release
+    needs: publish
+    if: ${{ needs.publish.outputs.reconcile_state != 'superseded' }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Read back public release state
+        id: public-verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release-action-subtree.sh --verify-published \
+            --source-ref "$RELEASE_SOURCE_SHA" \
+            --control-ref "$RELEASE_CONTROL_SHA"
+      - name: Summarize closed public verification
+        if: ${{ always() }}
+        env:
+          OBSERVED_SOURCE: ${{ steps.public-verification.outputs.observed_source }}
+          OBSERVED_TAG: ${{ steps.public-verification.outputs.observed_tag }}
+          RECOVERY_CODE: ${{ steps.public-verification.outputs.recovery_code }}
+          VERIFICATION_STAGE: ${{ steps.public-verification.outputs.verification_stage }}
+          VERIFICATION_STATE: ${{ steps.public-verification.outputs.verification_state }}
+          NEXT_ACTION: ${{ steps.public-verification.outputs.next_action }}
+          STEP_OUTCOME: ${{ steps.public-verification.outcome }}
+        run: |
+          set -euo pipefail
+          summary_valid=true
+          tuple="$STEP_OUTCOME:$VERIFICATION_STATE:$RECOVERY_CODE:$NEXT_ACTION:$VERIFICATION_STAGE"
+          case "$tuple" in
+            success:verified:none:none:complete)
+              action_text='No action is required.'
+              ;;
+            failure:blocked_conflict:immutable-tag-missing:reconcile-exact-source:immutable-tag|\
+            failure:blocked_conflict:major-alias-missing:reconcile-exact-source:floating-alias|\
+            failure:blocked_conflict:release-state-missing:reconcile-exact-source:immutable-release|\
+            failure:blocked_conflict:release-state-incomplete:reconcile-exact-source:immutable-release)
+              action_text='Redispatch the exact release-intent source SHA to reconcile the missing public prefix.'
+              ;;
+            failure:blocked_conflict:release-state-mismatch:repair-immutable-release-and-reconcile:immutable-release|\
+            failure:blocked_conflict:mutable-release:repair-immutable-release-and-reconcile:immutable-release)
+              action_text='Restore the immutable Release policy and state, then reconcile this exact source SHA.'
+              ;;
+            failure:blocked_conflict:published-state-mismatch:investigate-published-state:immutable-tag|\
+            failure:blocked_conflict:published-state-mismatch:investigate-published-state:floating-alias|\
+            failure:blocked_conflict:published-state-mismatch:investigate-published-state:immutable-release)
+              action_text='Stop mutation and inspect the conflicting immutable ref or Release state before any recovery attempt.'
+              ;;
+            failure:inconclusive:release-api-unreadable:retry-public-verification:immutable-release|\
+            failure:inconclusive:remote-read-inconclusive:retry-public-verification:immutable-tag|\
+            failure:inconclusive:remote-read-inconclusive:retry-public-verification:floating-alias|\
+            failure:inconclusive:remote-read-inconclusive:retry-public-verification:immutable-release)
+              action_text='Retry only the public verification job after GitHub reads recover.'
+              ;;
+            failure:inconclusive:verification-execution-failure:repair-verifier-and-rerun:initialization|\
+            failure:inconclusive:verification-execution-failure:repair-verifier-and-rerun:immutable-tag|\
+            failure:inconclusive:verification-execution-failure:repair-verifier-and-rerun:floating-alias|\
+            failure:inconclusive:verification-execution-failure:repair-verifier-and-rerun:immutable-release|\
+            failure:inconclusive:verification-state-missing:repair-verifier-and-rerun:initialization|\
+            failure:inconclusive:verification-state-missing:repair-verifier-and-rerun:immutable-tag|\
+            failure:inconclusive:verification-state-missing:repair-verifier-and-rerun:floating-alias|\
+            failure:inconclusive:verification-state-missing:repair-verifier-and-rerun:immutable-release)
+              action_text='Repair the verifier workflow, then rerun public verification for the same exact source SHA.'
+              ;;
+            *)
+              summary_valid=false
+              VERIFICATION_STATE=inconclusive
+              RECOVERY_CODE=verification-output-missing
+              VERIFICATION_STAGE=workflow
+              OBSERVED_SOURCE=unknown
+              OBSERVED_TAG=unknown
+              action_text='Repair the verifier workflow, then rerun public verification for the same exact source SHA.'
+              ;;
+          esac
+          if [[ ! "$OBSERVED_SOURCE" =~ ^[0-9a-f]{40}$ ||
+                ! "$OBSERVED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            summary_valid=false
+            OBSERVED_SOURCE=unknown
+            OBSERVED_TAG=unknown
+          fi
+          {
+            echo '## Public release verification'
+            echo
+            printf -- '- State: `%s`\n' "$VERIFICATION_STATE"
+            printf -- '- Stage: `%s`\n' "$VERIFICATION_STAGE"
+            printf -- '- Observed source: `%s`\n' "$OBSERVED_SOURCE"
+            printf -- '- Observed tag: `%s`\n' "$OBSERVED_TAG"
+            printf -- '- Recovery code: `%s`\n' "$RECOVERY_CODE"
+            printf -- '- Next action: %s\n' "$action_text"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [[ "$summary_valid" == true ]]

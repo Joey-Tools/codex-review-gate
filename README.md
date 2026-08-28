@@ -2,24 +2,25 @@
 
 Languages: [British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
-This repository is the source workspace for Codex Review Gate. The GitHub Action
-package lives in [packages/action](packages/action/README.md), and that
-directory is the publishable subtree for
-[JoeyTeng/codex-review-gate-action](https://github.com/JoeyTeng/codex-review-gate-action).
+This repository is the canonical source for Codex Review Gate. The publishable
+JavaScript Action package lives under `packages/action/`; releases are
+materialised into the existing Marketplace repository
+[`JoeyTeng/codex-review-gate-action`](https://github.com/JoeyTeng/codex-review-gate-action).
 
 ## Layout
 
-- `packages/action/`: complete Marketplace action package. Its contents become
-  the root of the release repository.
-- `test/`: source-repository tests for the action state machine, GitHub runner,
-  and repository bootstrap helper.
-- `src/bootstrap.mjs`: shared logic for repository ruleset bootstrap.
-- `scripts/bootstrap-codex-review-gate.mjs`: CLI helper for creating or updating
-  repository rulesets that require `codex/review-gate`.
-- `templates/codex-gated-repo/`: language-neutral starter repository with the
-  gate workflow preinstalled.
-- `.github/workflows/`: source-repository CI and self-gating workflows.
-- `docs/RELEASING.md`: subtree split release procedure.
+- `packages/action/`: complete Action release subtree, including the root
+  `action.yml` and JavaScript runtime;
+- `templates/codex-gated-repo/`: two canonical copied consumer workflows and
+  a disabled importable ruleset;
+- `src/bootstrap.mjs` and `scripts/bootstrap-codex-review-gate.mjs`: local
+  installation and remote ruleset staging/activation helper;
+- `docs/install/`: one human-readable installation guide and one
+  agent-executable presentation of the same procedure, in English and
+  Simplified Chinese;
+- `test/`: source, runtime, workflow, installer and publisher contract tests;
+- `.github/workflows/`: source CI, self-gating and the staged publisher;
+- `docs/RELEASING.md`: complete publisher and repository-protection contract.
 
 ## Development
 
@@ -30,82 +31,108 @@ npm run check
 npm test
 ```
 
-Run the action package check in isolation:
+Focused commands are available for the v2 Action, bootstrap helper and release
+contract:
 
 ```bash
-npm run check:action
-```
-
-Run only the bootstrap helper checks:
-
-```bash
-npm run check:bootstrap
+npm run check:v2
+npm run test:v2
 npm run test:bootstrap
+npm run test:release-provenance
 ```
 
-## Gated Repository Bootstrap
+## Consumer Model
 
-For new repositories, start from the language-neutral template source in
-`templates/codex-gated-repo` or the GitHub template repository
-[`Joey-Tools/codex-gated-repo-template`](https://github.com/Joey-Tools/codex-gated-repo-template).
-The template keeps only the gate workflow and basic repository scaffolding; add
-project-specific CI separately.
+V2 consumers copy both canonical workflows into the same paths in their
+repository:
 
-After the workflow exists on the target repository default branch, run the
-bootstrap helper from this source repository. It defaults to dry-run, verifies
-that `.github/workflows/codex-review-gate.yml` is a workflow file on the default
-branch, and then creates or updates a repository ruleset requiring
-`codex/review-gate` from the GitHub Actions source.
+- `.github/workflows/codex-review-gate.yml` is the read-only `pull_request`
+  verifier. Its GitHub-managed job CheckRun, `codex/github-review-gate`, is the
+  required signal on the exact PR feature-head SHA. The workflow still executes
+  on `refs/pull/N/merge` and binds that CheckRun to the unchanged current
+  head/base/test-merge scope through strict environment, event and fresh-read
+  validation.
+- `.github/workflows/codex-review-gate-controller.yml` is the protected
+  default-branch controller. It admits exact Codex events and typed manual
+  operations, creates review requests, and establishes a strictly newer full
+  verifier attempt when reconciliation is needed.
+
+Both workflows call the compatible floating major:
+
+```yaml
+uses: JoeyTeng/codex-review-gate-action@v2
+```
+
+The copied workflows own separate triggers, minimal permissions, per-PR
+concurrency namespaces, typed `workflow_dispatch`, exact pre-runner Codex-bot
+filtering and protected repository configuration. The Action remains API-only:
+it never checks out or executes pull-request code. There is no commit-status
+bridge: only the verifier's native feature-head CheckRun, execution-bound to the
+current test-merge, can satisfy the gate.
+
+The required CheckRun is `codex/github-review-gate`. The importable ruleset
+binds it to GitHub Actions (`integration_id: 15368`), requires the branch to be up to
+date, requires all review conversations to be resolved, blocks
+non-fast-forward default-branch updates and has no bypass actors. “Any source”
+is not supported.
+
+See [the human installation guide](docs/install/human.md) or
+[the agent execution runbook](docs/install/agent.md). Both implement the same
+two-PR rollout: one migration PR removes v1 and installs v2, then a separate
+harmless canary PR proves the live gate and is closed unmerged.
+
+## Bootstrap
+
+Choose a control-plane owner with `write`, `maintain`, or `admin` permission,
+then prepare a consumer worktree with a dry run followed by an explicit apply.
+Keep that owner explicit at every phase of this generic quickstart:
 
 ```bash
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
+CONTROL_PLANE_OWNER=@USER
+node scripts/bootstrap-codex-review-gate.mjs \
+  --prepare-worktree /path/to/consumer \
+  --control-plane-owner "$CONTROL_PLANE_OWNER"
+node scripts/bootstrap-codex-review-gate.mjs \
+  --prepare-worktree /path/to/consumer \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --apply
 ```
 
-Use `--integration-id any` only if the repository intentionally wants a required
-status from any source instead of the GitHub Actions app.
+This quickstart performs local preparation only. It does not authorize or
+replace the repository-side preconditions, trusted-owner synchronous merge transaction,
+legacy-protection inventory, canary, or activation readbacks in the complete
+[human installation guide](docs/install/human.md) and
+[agent execution runbook](docs/install/agent.md). Do not merge or activate from
+this abbreviated example alone.
+
+The helper default `@JoeyTeng` is only for Joey-owned repositories. Other
+repositories must supply their own eligible `@USER`; do not rely on that
+default in a generic installation. Continue with repository staging, canary and
+activation only through one of the complete guides above.
 
 ## Release Model
 
-The release repository is not maintained by copying a loose allowlist from the
-source repository root. Instead, `packages/action` is the stable subtree
-boundary. Use `scripts/release-action-subtree.sh` to validate the source tree
-and compute the split commit for the action repository.
+Publisher infrastructure lands and passes review before any release intent.
+A separate PR then adds a deterministic `release-manifest.json` for one exact
+source commit. The source-repository publisher validates and independently
+materialises the Action twice before the privileged `publish` job enters the
+`marketplace-production` Environment and waits for human approval.
 
-The canonical GitHub.com workflow delegates the privileged job to the
-centrally deployed reusable workflow through the compatible v1 selector:
+The approved publisher uses the narrowly installed
+`JoeyTeng/codex-review-gate-action-publisher` GitHub App and the dedicated
+OpenPGP signing subkey. It creates a signed single-parent release commit, signed
+immutable full-version tag, immutable GitHub Release, signed provenance assets
+and, for a stable release only, a forward-moving floating major alias such as
+`v2`. Every durable object is read back; partial state is reconciled without
+deleting or force-overwriting immutable history.
 
-```yaml
-jobs:
-  codex-review-gate:
-    name: codex/review-gate runner
-    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1
-```
+Every SemVer gets its own immutable full tag and GitHub Release. Marketplace
+publication is a manual out-of-band step only for the first stable release of a
+major (beginning with `v2.0.0`); minor and patch releases advance `@v2` without
+another Marketplace operation. Existing v1 tags and consumers remain valid and
+frozen until each consumer is deliberately migrated.
 
-Floating `@v1` is the intentional centralised pre-execution trust boundary. It
-is not post-run immutable provenance. Consumers resolve the server-selected
-called-workflow object from the exact run attempt and admit it only through a
-trusted-signer, immutable compatible v1.x.y release and its complete
-provenance-v2 tree and protocol bindings. This lets compatible v1.x Action
-releases upgrade centrally without changing the caller or consuming Skill.
-
-The direct composite interface remains available for GitHub Enterprise Server
-and immutable audits. Pin it to the exact v1.5.1 Action release commit:
-
-```yaml
-- uses: JoeyTeng/codex-review-gate-action@59eeda2af2a7baab3f3f15a59fbbaee015fa6c01
-```
-
-`codex/review-gate` reports only this action's required commit-status result;
-it does not attest a named triple review or overall merge readiness. See the
-[action semantics](packages/action/README.md#what-it-checks) and
-[evidence-reconciliation design](packages/action/DESIGN.md#evidence-reconciliation).
-The v1 producer receipt supplies causal producer evidence for an exact direct
-or reusable invocation, but consumers must validate its run-attempt artifact,
-the called-workflow W/C mapping, and signed immutable release provenance, then
-still reduce provider evidence independently; see
-[invocation provenance](packages/action/README.md#invocation-provenance).
-Immutable tags such as `v1.5.1`, `v1.4.0`, and the existing `v1.3.x` releases remain
-available for audits and rollbacks.
-
-See [docs/RELEASING.md](docs/RELEASING.md) for the full release flow.
+During the initial infrastructure landing, the source repository's live v1
+self-gate remains in place until the published `@v2` alias exists. See
+[docs/RELEASING.md](docs/RELEASING.md) for the complete staged flow, recovery
+states and protection baseline.

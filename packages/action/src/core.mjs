@@ -370,6 +370,7 @@ export function parseCodexIssueCommentArtifact(
     owner = "",
     repo = "",
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
+    allowShortCommitRefs = false,
   } = {},
 ) {
   const body = normalizeCodexCommentBody(comment?.body);
@@ -427,11 +428,10 @@ export function parseCodexIssueCommentArtifact(
       };
     }
     const markerLabels = body.match(/\*\*Reviewed commit:\*\*/gi) || [];
-    const matches = [
-      ...body.matchAll(
-        /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{10}|[0-9a-f]{40})`[ \t]*\r?$/gm,
-      ),
-    ];
+    const commitPattern = allowShortCommitRefs
+      ? /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{7,40})`[ \t]*\r?$/gm
+      : /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{10}|[0-9a-f]{40})`[ \t]*\r?$/gm;
+    const matches = [...body.matchAll(commitPattern)];
     if (markerLabels.length !== 1 || matches.length !== 1) {
       return {
         ...base,
@@ -467,6 +467,7 @@ export function parseCodexIssueCommentArtifact(
       kind: "finding",
       headSha: parsed.headSha,
       samples: parsed.samples,
+      findingCount: parsed.findingCount,
     };
   }
 
@@ -483,6 +484,7 @@ export function parseCodexReviewArtifact(
     owner = "",
     repo = "",
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
+    allowShortCommitRefs = false,
   } = {},
 ) {
   const body = String(review?.body || "").trim();
@@ -519,10 +521,36 @@ export function parseCodexReviewArtifact(
     };
   }
 
+  if (body.startsWith("### 💡 Codex Review")) {
+    const parsed = parseExactRepositoryBlobFindings(body, owner, repo);
+    if (parsed.error) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: parsed.error,
+      };
+    }
+    if (parsed.headSha !== review.commit_id.toLowerCase()) {
+      return {
+        ...base,
+        kind: "malformed",
+        reason: "Codex review finding links conflict with the parent review commit",
+      };
+    }
+    return {
+      ...base,
+      kind: "finding",
+      headSha: parsed.headSha,
+      samples: parsed.samples,
+      findingCount: parsed.findingCount,
+    };
+  }
+
   if (review.state === "APPROVED") {
     const bodyCommitReferencesAgree = approvedReviewBodyCommitReferencesAgree(
       body,
       review.commit_id,
+      allowShortCommitRefs,
     );
     if (
       cleanBodyContainsFindingSignals(body) ||
@@ -552,30 +580,17 @@ export function parseCodexReviewArtifact(
     };
   }
 
-  const parsed = parseExactRepositoryBlobFindings(body, owner, repo);
-  if (parsed.error) {
-    return {
-      ...base,
-      kind: "malformed",
-      reason: parsed.error,
-    };
-  }
-  if (parsed.headSha !== review.commit_id.toLowerCase()) {
-    return {
-      ...base,
-      kind: "malformed",
-      reason: "Codex review finding links conflict with the parent review commit",
-    };
-  }
   return {
     ...base,
-    kind: "finding",
-    headSha: parsed.headSha,
-    samples: parsed.samples,
+    kind: "malformed",
+    reason: "unrecognized Codex terminal pull-request-review format",
   };
 }
 
-export function codexInlineParentReviewBodyHasClosedGrammar(review) {
+export function codexInlineParentReviewBodyHasClosedGrammar(
+  review,
+  { allowShortCommitRefs = false } = {},
+) {
   if (review?.state !== "COMMENTED" || !isFullCommitSha(review?.commit_id)) {
     return false;
   }
@@ -595,9 +610,10 @@ export function codexInlineParentReviewBodyHasClosedGrammar(review) {
     return false;
   }
 
-  const reviewedCommit = /^\*\*Reviewed commit:\*\* `([0-9a-f]{10}|[0-9a-f]{40})`$/i.exec(
-    lines[2] || "",
-  )?.[1]?.toLowerCase();
+  const commitPattern = allowShortCommitRefs
+    ? /^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`$/i
+    : /^\*\*Reviewed commit:\*\* `([0-9a-f]{10}|[0-9a-f]{40})`$/i;
+  const reviewedCommit = commitPattern.exec(lines[2] || "")?.[1]?.toLowerCase();
   const parentCommit = review.commit_id.toLowerCase();
   if (
     !reviewedCommit ||
@@ -1462,6 +1478,7 @@ function parseExactRepositoryBlobFindings(body, owner, repo) {
   return {
     headSha: [...headShas][0],
     samples: samples.slice(0, 3),
+    findingCount: samples.length,
   };
 }
 
@@ -1573,15 +1590,19 @@ function officialCodexDisclosureHasClosedGrammar(value) {
   ].join("\n");
 }
 
-function approvedReviewBodyCommitReferencesAgree(body, nativeCommitId) {
+function approvedReviewBodyCommitReferencesAgree(
+  body,
+  nativeCommitId,
+  allowShortCommitRefs = false,
+) {
   const commitId = String(nativeCommitId || "").toLowerCase();
   if (!isFullCommitSha(commitId)) {
     return false;
   }
 
-  const references = [
-    ...String(body || "").matchAll(/`([0-9a-f]{40}|[0-9a-f]{10})`/gi),
-  ];
+  const references = allowShortCommitRefs
+    ? [...String(body || "").matchAll(/`([0-9a-f]{7,40})`/gi)]
+    : [...String(body || "").matchAll(/`([0-9a-f]{40}|[0-9a-f]{10})`/gi)];
   return references.every((reference) => {
     const normalized = reference[1].toLowerCase();
     return normalized.length === 40

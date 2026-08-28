@@ -1,62 +1,90 @@
 {
-  "$schema": "urn:joey-tools:codex-review-gate:action-v2-repository-baselines:1",
-  "schema_version": 1,
-  "frozen_repository": {
-    "repository": "JoeyTeng/codex-review-gate-action",
-    "url": "https://github.com/JoeyTeng/codex-review-gate-action.git",
-    "default_branch": "master",
-    "default_commit_oid": "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
-    "default_tree_oid": "8d909dd441b28b6915c46f60e8a144e64fd5268b",
-    "refs": {
-      "refs/heads/codex/release-v1.2.0": "be8dcbc75eef5c9f3812ac654e5760018576e608",
-      "refs/heads/master": "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
-      "refs/heads/pre-subtree-master-2026-05-18": "554187e15f08ffa4ff54717442c15d037451ea20",
-      "refs/pull/1/head": "dd158e654573f931c99866a86b0e199b2780321c",
-      "refs/pull/2/head": "be8dcbc75eef5c9f3812ac654e5760018576e608",
-      "refs/pull/3/head": "8008f5b283e75699c0284197ea6f0669637d3229",
-      "refs/pull/4/head": "82abf4fd2f1576996d84022e1906c0dd6afa9ebd",
-      "refs/pull/5/head": "25240574ed5397ef2837b7d27055be0bb5e18602",
-      "refs/pull/6/head": "3b7ee46126a75b05eaf537247254eea682ce5787",
-      "refs/pull/6/merge": "051a96bf49da7a1f98d7178a92fd7a9a4fbb1910",
-      "refs/tags/v1": "9e9f2377342805156afcb0724f501509ef4e444c",
-      "refs/tags/v1.1.0": "7b07114ecaed481a93d5df354b4d63332f98b793",
-      "refs/tags/v1.2": "a5d35d6a27fd89ab639e3b5715954c3c5af20b98",
-      "refs/tags/v1.2.0": "7e7c187e2f1b05d2c2ac1b77c9450796ec499995",
-      "refs/tags/v1.2.1": "d5a873b674f2e8af453d390328c74cf681367f1e",
-      "refs/tags/v1.3": "dc9c7a359e80a9dbb3e74769da57e5079abd1d8f",
-      "refs/tags/v1.3.0": "5750682a7044799cfe7d19553b2c52878ffbe9eb",
-      "refs/tags/v1.3.1": "3913a70b7417a2680f39fca72564cf87f26a48f6",
-      "refs/tags/v1.3.2": "4cde9cf54a3d0238c0f2d1e992e7efb33d52441e",
-      "refs/tags/v1.3.3": "a4f0acbb3f7e2e7103f52a94396515253c6a1514",
-      "refs/tags/v1.3.4": "19eda307edd6efc15f9782a66da789ef834382a2",
-      "refs/tags/v1.3.5": "869971ffe16988e99d7ce2fd71877ef62c8fc21a",
-      "refs/tags/v1.4": "6f5db818f77d8ce1d6b144ed6a1e899d72dd8d20",
-      "refs/tags/v1.4.0": "2bd0a4dbb9d01a175788c4f0a5bd91ff72a06c96",
-      "refs/tags/v1.5": "ab610036500f2eacb483abd3a6c272fd86ce5dec",
-      "refs/tags/v1.5.0": "a4d8258608546515c247aa78b8fe73bfdf12ecbc",
-      "refs/tags/v1.5.1": "f9201d016b0abd21403550c3bf8030eb0beb76b4"
-    }
-  },
-  "target_repository": {
-    "repository": "Joey-Tools/codex-review-gate-action",
-    "url": "https://github.com/Joey-Tools/codex-review-gate-action.git",
-    "default_branch": "master",
-    "default_commit_oid": "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
-    "default_tree_oid": "8d909dd441b28b6915c46f60e8a144e64fd5268b",
-    "head_commit_count": 21,
-    "head_root_count": 2,
-    "refs": {
-      "refs/heads/archive/pre-subtree-release-candidate-2026-05-16": "be8dcbc75eef5c9f3812ac654e5760018576e608",
-      "refs/heads/master": "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
-      "refs/heads/pre-subtree-master-2026-05-18": "554187e15f08ffa4ff54717442c15d037451ea20"
-    }
-  },
-  "release": {
-    "version": "2.0.0",
-    "immutable_tag": "v2.0.0",
-    "aliases": [
-      "v2.0",
-      "v2"
+  "$schema": "urn:joey-tools:codex-review-gate:action-release-baseline:3",
+  "schema_version": 3,
+  "source_repository": "Joey-Tools/codex-review-gate",
+  "target_repository": "JoeyTeng/codex-review-gate-action",
+  "target_branch": "master",
+  "initial_target_master": "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
+  "latest_legacy_release": "v1.5.1",
+  "latest_legacy_release_commit": "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
+  "publisher_app": {
+    "owner": "JoeyTeng",
+    "slug": "codex-review-gate-action-publisher",
+    "app_id": 4700530,
+    "installation_scope": [
+      "JoeyTeng/codex-review-gate-action"
     ]
+  },
+  "required_rulesets": {
+    "publisher_master_update": {
+      "name": "publisher-master-update",
+      "target": "branch",
+      "include": [
+        "refs/heads/master"
+      ],
+      "exclude": [],
+      "sole_bypass_app_id": 4700530,
+      "rule_types": [
+        "update"
+      ]
+    },
+    "master_integrity": {
+      "name": "master-integrity",
+      "target": "branch",
+      "include": [
+        "refs/heads/master"
+      ],
+      "exclude": [],
+      "bypass_actors": [],
+      "rule_types": [
+        "deletion",
+        "non_fast_forward",
+        "required_linear_history",
+        "required_signatures"
+      ]
+    },
+    "freeze_v1_tags": {
+      "name": "freeze-v1-tags",
+      "target": "tag",
+      "include": [
+        "refs/tags/v1",
+        "refs/tags/v1.*"
+      ],
+      "exclude": [],
+      "bypass_actors": [],
+      "rule_types": [
+        "creation",
+        "update",
+        "deletion",
+        "non_fast_forward"
+      ]
+    },
+    "publisher_v2_plus_tags": {
+      "name": "publisher-v2-plus-tags",
+      "target": "tag",
+      "include": [
+        "refs/tags/v*"
+      ],
+      "exclude": [
+        "refs/tags/v1",
+        "refs/tags/v1.*"
+      ],
+      "sole_bypass_app_id": 4700530,
+      "rule_types": [
+        "creation",
+        "update",
+        "deletion",
+        "non_fast_forward"
+      ]
+    }
+  },
+  "observed_ids_are_execution_dependencies": false,
+  "publication_policy": {
+    "minimum_new_major": 2,
+    "immutable_tag": "full_semver",
+    "stable_alias": "major_only",
+    "prerelease_alias": null,
+    "automatic_alias_rollback": false,
+    "marketplace_gate": false
   }
 }

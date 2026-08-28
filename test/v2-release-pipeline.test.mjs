@@ -7,9 +7,9 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,1315 +19,2542 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workflowPath = join(repositoryRoot, ".github", "workflows", "sync-action-subtree.yml");
-const rootCallerPath = join(
-  repositoryRoot,
-  ".github",
-  "workflows",
-  "codex-review-gate.yml",
-);
-const reconcileWorkflowPath = join(
-  repositoryRoot,
-  "packages",
-  "action",
-  ".github",
-  "workflows",
-  "codex-review-gate-reconcile.yml",
-);
-const reusableWorkflowPath = join(
-  repositoryRoot,
-  "packages",
-  "action",
-  ".github",
-  "workflows",
-  "codex-review-gate.yml",
-);
-const releaseRunbookPaths = Object.freeze([
-  join(repositoryRoot, "docs", "RELEASING.md"),
-  join(repositoryRoot, "docs", "RELEASING.zh-CN.md"),
-]);
-const releaseScriptPath = join(repositoryRoot, "scripts", "release-action-subtree.sh");
-const generatorPath = join(repositoryRoot, "scripts", "generate-action-release-provenance.mjs");
-const baselinePath = join(
-  repositoryRoot,
-  "docs",
-  "release",
-  "action-v2-repository-baselines.json",
-);
-const EVIDENCE_AUTHORITY_POLICY_PATH =
-  "github-codex-evidence-authority-v2.json";
-const SOURCE_PACKAGE_IDENTITY = Object.freeze({
-  name: "codex-review-gate-source",
-  version: "2.0.0",
-  repository: {
-    type: "git",
-    url: "git+https://github.com/Joey-Tools/codex-review-gate.git",
+const releaseScript = join(repositoryRoot, "scripts", "release-action-subtree.sh");
+const generator = join(repositoryRoot, "scripts", "generate-action-release-provenance.mjs");
+const baselinePath = join(repositoryRoot, "docs", "release", "action-v2-repository-baselines.json");
+const actionMetadata = readFileSync(join(repositoryRoot, "packages", "action", "action.yml"), "utf8");
+const PRIMARY = "AD403DAB5377F9FA0F7D775EC2844D3367B8A71B";
+const SUBKEY = "4DD48552DDEAF6D961769DD4A49827EC48984E2C";
+const RELEASE_WORKFLOW_REF =
+  "Joey-Tools/codex-review-gate/.github/workflows/sync-action-subtree.yml@refs/heads/master";
+const SYNTHETIC_TOKEN_FIXTURE = Object.freeze({
+  catalog: "joey-private-v3",
+  id: "access-a",
+  value: "codex_synth_v1_access_a",
+});
+const FAKE_PUBLISHER_BYPASS = [{
+  actor_id: 4700530,
+  actor_type: "Integration",
+  bypass_mode: "always",
+}];
+const FAKE_PRODUCTION_RULESETS = [
+  {
+    id: 1,
+    name: "publisher-master-update",
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: ["refs/heads/master"], exclude: [] } },
+    bypass_actors: FAKE_PUBLISHER_BYPASS,
+    rules: [{ type: "update" }],
   },
-});
-const ACTION_PACKAGE_IDENTITY = Object.freeze({
-  name: "codex-review-gate-action",
-  version: "2.0.0",
-  repository: {
-    type: "git",
-    url: "git+https://github.com/Joey-Tools/codex-review-gate-action.git",
+  {
+    id: 2,
+    name: "master-integrity",
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: ["refs/heads/master"], exclude: [] } },
+    bypass_actors: [],
+    rules: ["deletion", "non_fast_forward", "required_linear_history", "required_signatures"]
+      .map((type) => ({ type })),
   },
-});
-const EXPECTED_V2_RUNTIME_MODULE_PATHS = Object.freeze([
-  "src/v2/action.mjs",
-  "src/v2/candidate-inventory.mjs",
-  "src/v2/control-plane-receipt.mjs",
-  "src/v2/controller-input-reader.mjs",
-  "src/v2/effect-status-wal.mjs",
-  "src/v2/git-ledger.mjs",
-  "src/v2/persistent-frontier.mjs",
-  "src/v2/projection.mjs",
-  "src/v2/projector.mjs",
-  "src/v2/public-report-projector.mjs",
-  "src/v2/public-report.mjs",
-  "src/v2/reducer.mjs",
-  "src/v2/runner.mjs",
-  "src/v2/scheduler.mjs",
-  "src/v2/schema.mjs",
-  "src/v2/transport.mjs",
-  "src/v2/workflow-command.mjs",
-  "src/v2/workflow-controller.mjs",
-  "src/v2/workflow-preflight.mjs",
-]);
-const SOURCE_ONLY_REQUIRED_CI_PATHS = Object.freeze([
-  ".github/workflows/required-ci.yml",
-]);
-const PRODUCTION_ACTION_REPOSITORY = "Joey-Tools/codex-review-gate-action";
-const PRODUCTION_REUSABLE_PATH = ".github/workflows/codex-review-gate.yml";
-const PRODUCTION_CHECKOUT_TARGET =
-  "actions/checkout@11d5960a326750d5838078e36cf38b85af677262";
-const RELEASED_SHA_FIXTURE = "0123456789abcdef0123456789abcdef01234567";
-const REUSABLE_WORKFLOW_JOBS = Object.freeze([
-  "codex-review-gate",
-  "schedule-dispatch",
-  "scheduled-pull-requests",
-]);
-const CONTROLLER_JOBS = Object.freeze([
-  "initial",
-  "after-public-initial",
-  "after-public-post-request",
-  "after-public-no-start",
-]);
-const WAIT_JOBS = Object.freeze([
-  Object.freeze({
-    name: "public-initial-wait",
-    needs: "initial",
-    wakeupSource: "initial",
-    wakeupHint: "public-initial-wait",
-    environment: "codex-review-gate-public-initial-15m",
-  }),
-  Object.freeze({
-    name: "public-post-request-wait",
-    needs: "after-public-initial",
-    wakeupSource: "after-public-initial",
-    wakeupHint: "public-post-request-wait",
-    environment: "codex-review-gate-public-post-request-15m",
-  }),
-  Object.freeze({
-    name: "public-no-start-wait",
-    needs: "after-public-post-request",
-    wakeupSource: "after-public-post-request",
-    wakeupHint: "public-no-start-wait",
-    environment: "codex-review-gate-public-no-start-15m",
-  }),
-]);
-const REUSABLE_WAIT_ENVIRONMENTS = Object.freeze([
-  Object.freeze({
-    variable: "V2_PUBLIC_WAIT_ENVIRONMENT_INITIAL",
-    value: "codex-review-gate-public-initial-15m",
-  }),
-  Object.freeze({
-    variable: "V2_PUBLIC_WAIT_ENVIRONMENT_POST_REQUEST",
-    value: "codex-review-gate-public-post-request-15m",
-  }),
-  Object.freeze({
-    variable: "V2_PUBLIC_WAIT_ENVIRONMENT_NO_START",
-    value: "codex-review-gate-public-no-start-15m",
-  }),
-]);
-const FIXTURE_EVIDENCE_AUTHORITY_POLICY = Object.freeze({
-  schema: "github-codex-evidence-authority-v2",
-  schema_version: 2,
-  scope: "release-pipeline-fixture",
-});
-const testEnvironment = {
+  {
+    id: 3,
+    name: "freeze-v1-tags",
+    enforcement: "active",
+    target: "tag",
+    conditions: { ref_name: { include: ["refs/tags/v1", "refs/tags/v1.*"], exclude: [] } },
+    bypass_actors: [],
+    rules: ["creation", "update", "deletion", "non_fast_forward"].map((type) => ({ type })),
+  },
+  {
+    id: 4,
+    name: "publisher-v2-plus-tags",
+    enforcement: "active",
+    target: "tag",
+    conditions: {
+      ref_name: {
+        include: ["refs/tags/v*"],
+        exclude: ["refs/tags/v1", "refs/tags/v1.*"],
+      },
+    },
+    bypass_actors: FAKE_PUBLISHER_BYPASS,
+    rules: ["creation", "update", "deletion", "non_fast_forward"].map((type) => ({ type })),
+  },
+];
+const executionEnv = {
   ...process.env,
   CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "1",
   GIT_ASKPASS: "/usr/bin/false",
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_TERMINAL_PROMPT: "0",
+  // These tests invoke the publisher directly. Bind its production workflow
+  // identity and remove host-owned output/credentials instead of inheriting
+  // the unrelated workflow hosting the tests.
+  GH_TOKEN: "",
+  GITHUB_OUTPUT: "",
+  GITHUB_RUN_ATTEMPT: "1",
+  GITHUB_RUN_ID: "1",
+  GITHUB_TOKEN: "",
+  GITHUB_WORKFLOW_REF: RELEASE_WORKFLOW_REF,
   NODE_ENV: "test",
+  PUBLISHER_TOKEN: "",
+  RELEASE_PUBLISHER_TOKEN: "",
 };
+let verificationInvocationCounter = 0;
 
-function git(repo, args, { encoding = "utf8" } = {}) {
+function workflowJobBlock(workflow, jobName) {
+  const marker = `  ${jobName}:\n`;
+  const start = workflow.indexOf(marker, workflow.indexOf("\njobs:\n"));
+  assert.notEqual(start, -1, `missing workflow job: ${jobName}`);
+  const bodyStart = start + marker.length;
+  const nextJobOffset = workflow
+    .slice(bodyStart)
+    .search(/^  [A-Za-z0-9_-]+:\s*$/mu);
+  const end = nextJobOffset === -1 ? workflow.length : bodyStart + nextJobOffset;
+  return workflow.slice(start, end);
+}
+
+function run(file, args, options = {}) {
+  return execFileSync(file, args, {
+    encoding: "utf8",
+    env: executionEnv,
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...options,
+  }).trim();
+}
+
+function invoke(file, args, options = {}) {
+  return spawnSync(file, args, {
+    cwd: options.cwd,
+    encoding: "utf8",
+    env: { ...executionEnv, ...options.env },
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+function git(repo, args) {
+  return run("git", ["-C", repo, ...args]);
+}
+
+function gitBytes(repo, args) {
   return execFileSync("git", ["-C", repo, ...args], {
-    encoding,
-    env: testEnvironment,
+    encoding: null,
+    env: executionEnv,
     maxBuffer: 64 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
 
-function gitText(repo, args) {
-  return git(repo, args).trim();
-}
-
-function initialiseRepository(path, { bare = false } = {}) {
-  mkdirSync(path, { recursive: true });
-  git(path, bare
-    ? ["init", "-q", "--bare"]
-    : ["init", "-q", "--initial-branch=master"]);
-  if (!bare) {
-    git(path, ["config", "user.name", "Release Pipeline Fixture"]);
-    git(path, ["config", "user.email", "pipeline-fixture@example.invalid"]);
-    git(path, ["config", "commit.gpgSign", "false"]);
-    git(path, ["config", "tag.gpgSign", "false"]);
-  }
-}
-
-function writeText(path, value, mode) {
+function write(path, value) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, value);
-  if (mode !== undefined) chmodSync(path, mode);
 }
 
 function writeJson(path, value) {
-  writeText(path, `${JSON.stringify(value, null, 2)}\n`);
+  write(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function commitAll(repo, message) {
+function commit(repo, message) {
   git(repo, ["add", "--all"]);
   git(repo, ["commit", "-q", "-m", message]);
-  return gitText(repo, ["rev-parse", "HEAD"]);
+  return git(repo, ["rev-parse", "HEAD"]);
 }
 
-function sortedObject(entries) {
-  return Object.fromEntries(
-    Object.entries(entries).sort(([left], [right]) => left.localeCompare(right)),
-  );
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
-function compareUtf8Paths(left, right) {
-  return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
+function inventoryDigest(files) {
+  const hash = createHash("sha256");
+  for (const file of files) {
+    for (const field of [file.path, file.type, file.mode, String(file.size), file.sha256]) {
+      hash.update(field, "utf8");
+      hash.update("\0", "binary");
+    }
+  }
+  return hash.digest("hex");
 }
 
-function liveV2RuntimeModulePaths() {
-  const runtimeRoot = join(repositoryRoot, "packages", "action", "src", "v2");
-  return readdirSync(runtimeRoot, { withFileTypes: true })
-    .map((entry) => {
-      assert.equal(
-        entry.isFile(),
-        true,
-        `live v2 runtime entry must be a regular file: ${entry.name}`,
-      );
-      assert.match(
-        entry.name,
-        /^[a-z0-9]+(?:-[a-z0-9]+)*\.mjs$/u,
-        `live v2 runtime entry must have a canonical module name: ${entry.name}`,
-      );
-      return `src/v2/${entry.name}`;
+function stagedActionSnapshot(source) {
+  git(source, ["add", "--", "packages/action"]);
+  const indexTree = git(source, ["write-tree"]);
+  const tree = git(source, ["rev-parse", `${indexTree}:packages/action`]);
+  const files = gitBytes(source, [
+    "ls-tree",
+    "-rz",
+    "--full-tree",
+    "--format=%(objectmode)%x09%(objecttype)%x09%(objectname)%x09%(path)",
+    tree,
+  ])
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const [mode, type, object, ...pathParts] = line.split("\t");
+      const path = pathParts.join("\t");
+      assert.equal(mode, "100644", path);
+      assert.equal(type, "blob", path);
+      const bytes = gitBytes(source, ["cat-file", "blob", object]);
+      return { path, type: "file", mode, size: bytes.byteLength, sha256: sha256(bytes) };
     })
-    .sort(compareUtf8Paths);
+    .sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+  return { tree, files };
 }
 
-function workflowJobNames(source) {
-  const lines = source.split("\n");
-  const jobsIndex = lines.findIndex((line) => line === "jobs:");
-  assert.notEqual(jobsIndex, -1, "missing workflow jobs mapping");
-  return lines.slice(jobsIndex + 1)
-    .flatMap((line) => /^  ([A-Za-z0-9_-]+):\s*$/u.exec(line)?.[1] ?? []);
-}
-
-function workflowTriggerNames(source) {
-  const match = /^on:\n([\s\S]*?)^permissions:/mu.exec(source);
-  assert.ok(match, "missing closed workflow trigger section");
-  return [...match[1].matchAll(/^  ([a-z_]+):$/gmu)]
-    .map((trigger) => trigger[1]);
-}
-
-function workflowJobBlock(source, name) {
-  const lines = source.split("\n");
-  const start = lines.findIndex((line) => line === `  ${name}:`);
-  assert.notEqual(start, -1, `missing workflow job ${name}`);
-  let end = start + 1;
-  while (end < lines.length && !/^  [A-Za-z0-9_-]+:\s*$/u.test(lines[end])) {
-    end += 1;
-  }
-  return lines.slice(start, end).join("\n");
-}
-
-function workflowJobCondition(source, name) {
-  const block = workflowJobBlock(source, name);
-  const condition = /^    if: >-\n      \$\{\{\n([\s\S]*?)^      \}\}$/mu.exec(block)?.[1];
-  assert.ok(condition, `missing closed workflow condition for ${name}`);
-  return condition.replace(/\s+/gu, " ").trim();
-}
-
-function workflowCallInputBlock(source, name) {
-  const lines = source.split("\n");
-  const start = lines.findIndex((line) => line === `      ${name}:`);
-  assert.notEqual(start, -1, `missing workflow_call input ${name}`);
-  let end = start + 1;
-  while (end < lines.length && lines[end].startsWith("        ")) {
-    end += 1;
-  }
-  return lines.slice(start, end).join("\n");
-}
-
-function assertWorkflowCallInput(source, name, expected) {
-  const block = workflowCallInputBlock(source, name);
-  const fields = Object.fromEntries(
-    block.split("\n").slice(1).map((line) => {
-      const match = /^        ([a-z-]+): (.*)$/u.exec(line);
-      assert.ok(match, `malformed workflow_call input field for ${name}`);
-      return [match[1], match[2]];
-    }),
-  );
-  assert.deepEqual(Object.keys(fields), [
-    "description",
-    "required",
-    "type",
-    ...(Object.hasOwn(expected, "default") ? ["default"] : []),
-  ]);
-  assert.equal(fields.required, expected.required);
-  assert.equal(fields.type, expected.type);
-  if (Object.hasOwn(expected, "default")) {
-    assert.equal(fields.default, expected.default);
-  }
-}
-
-function assertExactOccurrence(source, value, label) {
-  assert.equal(
-    source.split(value).length - 1,
-    1,
-    `${label} must occur exactly once`,
-  );
-}
-
-function assertReusableWorkflowContract(reusable) {
-  assert.deepEqual(workflowJobNames(reusable), REUSABLE_WORKFLOW_JOBS);
-  const specs = [
-    {
-      name: "codex-review-gate",
-      jobIf: "    if: inputs.controller-mode != 'scan-all-open'",
-      timeout: "10",
-      route: "${{ inputs.controller-mode }}",
-      observationBoundary: "${{ inputs.observation-boundary }}",
-      pullRequest: "${{ inputs.pull-request }}",
-      dispatchBinding: '""',
-      matrixGateCount: 0,
-    },
-    {
-      name: "schedule-dispatch",
-      jobIf: "    if: inputs.controller-mode == 'scan-all-open'",
-      timeout: "15",
-      route: "scan-all-open",
-      observationBoundary: "initial",
-      pullRequest: '""',
-      dispatchBinding: '""',
-      matrixGateCount: 0,
-    },
-    {
-      name: "scheduled-pull-requests",
-      jobIf: "    if: inputs.controller-mode == 'scan-all-open'",
-      timeout: "10",
-      route: "ordinary",
-      observationBoundary: "initial",
-      pullRequest: "${{ matrix.pull_request }}",
-      dispatchBinding: "${{ matrix.dispatch_binding }}",
-      matrixGateCount: 2,
-    },
-  ];
-
-  for (const spec of specs) {
-    const block = workflowJobBlock(reusable, spec.name);
-    assertExactOccurrence(block, spec.jobIf, `${spec.name} route gate`);
-    assertExactOccurrence(
-      block,
-      "    runs-on: ubuntu-slim",
-      `${spec.name} runner`,
-    );
-    assertExactOccurrence(
-      block,
-      `    timeout-minutes: ${spec.timeout}`,
-      `${spec.name} timeout`,
-    );
-    assertExactOccurrence(
-      block,
-      "      - name: Check out exact called-workflow release",
-      `${spec.name} checkout step`,
-    );
-    assertExactOccurrence(
-      block,
-      `        uses: ${PRODUCTION_CHECKOUT_TARGET}`,
-      `${spec.name} checkout action`,
-    );
-    assertExactOccurrence(
-      block,
-      "          repository: ${{ job.workflow_repository }}",
-      `${spec.name} checkout repository`,
-    );
-    assertExactOccurrence(
-      block,
-      "          ref: ${{ job.workflow_sha }}",
-      `${spec.name} checkout ref`,
-    );
-    assertExactOccurrence(
-      block,
-      "          path: .codex-review-gate-action",
-      `${spec.name} checkout path`,
-    );
-    assertExactOccurrence(
-      block,
-      "          persist-credentials: false",
-      `${spec.name} checkout credentials`,
-    );
-    assertExactOccurrence(
-      block,
-      "          V2_STATUS_CONTEXT: codex/github-review-gate",
-      `${spec.name} status context`,
-    );
-    assertExactOccurrence(
-      block,
-      `          V2_CONTROLLER_ROUTE: ${spec.route}`,
-      `${spec.name} controller route`,
-    );
-    assertExactOccurrence(
-      block,
-      `          V2_CONTROLLER_OBSERVATION_BOUNDARY: ${spec.observationBoundary}`,
-      `${spec.name} observation boundary`,
-    );
-    assertExactOccurrence(
-      block,
-      `          V2_CONTROLLER_PULL_REQUEST: ${spec.pullRequest}`,
-      `${spec.name} pull-request binding`,
-    );
-    assertExactOccurrence(
-      block,
-      `          V2_CONTROLLER_DISPATCH_BINDING: ${spec.dispatchBinding}`,
-      `${spec.name} dispatch binding`,
-    );
-    assertExactOccurrence(
-      block,
-      '          V2_PUBLIC_WAIT_MINUTES: "15"',
-      `${spec.name} public wait duration`,
-    );
-    for (const wait of REUSABLE_WAIT_ENVIRONMENTS) {
-      assertExactOccurrence(
-        block,
-        `          ${wait.variable}: ${wait.value}`,
-        `${spec.name} ${wait.value}`,
-      );
-    }
-    assertExactOccurrence(
-      block,
-      '          test "$V2_CHECKED_OUT_RELEASE_SHA" = "$V2_EXPECTED_WORKFLOW_SHA"',
-      `${spec.name} checked-out release verification`,
-    );
-    assert.equal(
-      (block.match(/^        if: matrix\.enabled$/gmu) ?? []).length,
-      spec.matrixGateCount,
-      `${spec.name} must retain its exact matrix step gates`,
-    );
-  }
-
-  const coordinator = workflowJobBlock(reusable, "schedule-dispatch");
-  assertExactOccurrence(
-    coordinator,
-    "      matrix: ${{ steps.controller.outputs.matrix }}",
-    "schedule coordinator matrix output",
-  );
-  assertExactOccurrence(
-    coordinator,
-    '          node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" schedule-dispatch',
-    "schedule coordinator command",
-  );
-
-  const scheduled = workflowJobBlock(reusable, "scheduled-pull-requests");
-  assertExactOccurrence(
-    scheduled,
-    "    needs: schedule-dispatch",
-    "scheduled fanout dependency",
-  );
-  assertExactOccurrence(
-    scheduled,
-    `    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix: \${{ fromJSON(needs.schedule-dispatch.outputs.matrix) }}`,
-    "scheduled serial matrix topology",
-  );
-}
-
-function renderProductionConsumer({
-  repository = PRODUCTION_ACTION_REPOSITORY,
-  selector = RELEASED_SHA_FIXTURE,
-} = {}) {
-  const template = readFileSync(reconcileWorkflowPath, "utf8");
-  const localUse = "    uses: ./.github/workflows/codex-review-gate.yml";
-  assert.equal(
-    template.split(localUse).length - 1,
-    CONTROLLER_JOBS.length,
-    "released reconcile template must expose exactly four local controller calls",
-  );
-  return template.replaceAll(
-    localUse,
-    `    uses: ${repository}/${PRODUCTION_REUSABLE_PATH}@${selector}`,
-  );
-}
-
-function assertProductionConsumerActivationContract({
-  consumer,
-  releasedSha,
-  reusable = readFileSync(reusableWorkflowPath, "utf8"),
-}) {
-  assert.match(releasedSha, /^[0-9a-f]{40}$/u);
-  const expectedUse = `${PRODUCTION_ACTION_REPOSITORY}/${PRODUCTION_REUSABLE_PATH}@${releasedSha}`;
-  const useTargets = [...consumer.matchAll(/^    uses: (\S+)$/gmu)]
-    .map((match) => match[1]);
-  assert.deepEqual(
-    useTargets,
-    Array.from({ length: CONTROLLER_JOBS.length }, () => expectedUse),
-    "every production controller call must use the same admitted release SHA",
-  );
-  assert.doesNotMatch(consumer, /JoeyTeng\/codex-review-gate-action/u);
-  assert.doesNotMatch(consumer, /^    uses: \.\//gmu);
-
-  assert.deepEqual(workflowJobNames(consumer), [
-    "initial",
-    "public-initial-wait",
-    "after-public-initial",
-    "public-post-request-wait",
-    "after-public-post-request",
-    "public-no-start-wait",
-    "after-public-no-start",
-  ]);
-  assert.deepEqual(workflowTriggerNames(consumer), [
-    "pull_request_target",
-    "issue_comment",
-    "pull_request_review",
-    "pull_request_review_comment",
-    "schedule",
-    "workflow_dispatch",
-  ]);
-  assert.match(
-    consumer,
-    /^  pull_request_target:\n    types: \[opened, reopened, synchronize, ready_for_review\]$/mu,
-  );
-  assert.match(consumer, /^  issue_comment:\n    types: \[created, edited\]$/mu);
-  assert.match(
-    consumer,
-    /^  pull_request_review:\n    types: \[submitted, edited, dismissed\]$/mu,
-  );
-  assert.match(
-    consumer,
-    /^  pull_request_review_comment:\n    types: \[created, edited, deleted\]$/mu,
-  );
-  assert.match(consumer, /^permissions: \{\}$/mu);
-  assert.equal((consumer.match(/^permissions:/gmu) ?? []).length, 1);
-  assert.match(consumer, /cron: "17 \*\/2 \* \* \*"/u);
-  assert.match(
-    consumer,
-    /^  group: codex-review-gate-v2-\$\{\{ github\.repository \}\}$/mu,
-  );
-  assert.match(consumer, /^  cancel-in-progress: false$/mu);
-  assert.match(
-    consumer,
-    /^      pull-request:\n        description: [^\n]+\n        required: true\n        type: string$/mu,
-  );
-
-  const exactControllerPermissions = [
-    "    permissions:",
-    "      contents: write",
-    "      id-token: write",
-    "      issues: write",
-    "      pull-requests: write",
-    "      statuses: write",
-  ].join("\n");
-  const pullRequestInput = "      pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}";
-  assert.equal(consumer.split(pullRequestInput).length - 1, CONTROLLER_JOBS.length);
-  assert.equal(
-    (consumer.match(/^      selection-policy: joey-default$/gmu) ?? []).length,
-    CONTROLLER_JOBS.length,
-  );
-  const controllerBoundaries = new Map([
-    ["initial", "initial"],
-    ["after-public-initial", "public-initial-wait-complete"],
-    ["after-public-post-request", "public-post-request-wait-complete"],
-    ["after-public-no-start", "public-no-start-wait-complete"],
-  ]);
-  const controllerDependencies = new Map([
-    ["initial", null],
-    ["after-public-initial", "public-initial-wait"],
-    ["after-public-post-request", "public-post-request-wait"],
-    ["after-public-no-start", "public-no-start-wait"],
-  ]);
-  const initialRoute = "      controller-mode: ${{ github.event_name == 'workflow_dispatch' && 'evaluate-only' || github.event_name == 'schedule' && 'scan-all-open' || (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment') && 'provider-event-hint' || 'ordinary' }}";
-  for (const name of CONTROLLER_JOBS) {
-    const block = workflowJobBlock(consumer, name);
-    assert.ok(
-      block.includes(`${exactControllerPermissions}\n    uses: ${expectedUse}\n    with:`),
-      `${name} must retain the exact controller permissions and immutable use`,
-    );
-    assert.equal(block.split(pullRequestInput).length - 1, 1);
-    assert.equal((block.match(/^      selection-policy: joey-default$/gmu) ?? []).length, 1);
-    const withSection = /\n    with:\n([\s\S]*)$/u.exec(block)?.[1];
-    assert.ok(withSection, `${name} must expose one closed with mapping`);
-    assert.deepEqual(
-      [...withSection.matchAll(/^      ([a-z][a-z-]*): /gmu)]
-        .map((match) => match[1]),
-      ["pull-request", "selection-policy", "controller-mode", "observation-boundary"],
-    );
-    assert.doesNotMatch(block, /^    secrets:/gmu);
-    if (name === "initial") {
-      assert.equal(block.split(initialRoute).length - 1, 1);
-      assert.doesNotMatch(block, /^    needs:/gmu);
-    } else {
-      assert.equal(
-        (block.match(new RegExp(
-          `^    needs: ${controllerDependencies.get(name)}$`,
-          "mu",
-        )) ?? []).length,
-        1,
-      );
-      assert.equal((block.match(/^      controller-mode: ordinary$/gmu) ?? []).length, 1);
-    }
-    assert.equal(
-      (block.match(new RegExp(
-        `^      observation-boundary: ${controllerBoundaries.get(name)}$`,
-        "mu",
-      )) ?? []).length,
-      1,
-    );
-  }
-
-  for (const wait of WAIT_JOBS) {
-    const block = workflowJobBlock(consumer, wait.name);
-    assert.match(block, new RegExp(`^    needs: ${wait.needs}$`, "mu"));
-    assert.ok(block.includes(
-      "    if: ${{ needs." + wait.wakeupSource
-      + ".outputs.wakeup-hints == '" + wait.wakeupHint + "' }}",
-    ));
-    assert.equal((block.match(/^    permissions: \{\}$/gmu) ?? []).length, 1);
-    assert.equal((block.match(/^    runs-on: ubuntu-slim$/gmu) ?? []).length, 1);
-    assert.equal((block.match(/^    timeout-minutes: 5$/gmu) ?? []).length, 1);
-    assert.ok(block.includes(
-      `    environment:\n      name: ${wait.environment}\n      deployment: false`,
-    ));
-    assert.doesNotMatch(block, /^\s+uses:|^\s+secrets:/gmu);
-  }
-
-  assertWorkflowCallInput(reusable, "pull-request", {
-    required: "false",
-    type: "string",
-    default: "\"\"",
-  });
-  assertWorkflowCallInput(reusable, "selection-policy", {
-    required: "true",
-    type: "string",
-  });
-  assertWorkflowCallInput(reusable, "controller-mode", {
-    required: "false",
-    type: "string",
-    default: "ordinary",
-  });
-  assertWorkflowCallInput(reusable, "observation-boundary", {
-    required: "false",
-    type: "string",
-    default: "initial",
-  });
-  const inputSection = /^    inputs:\n([\s\S]*?)^    outputs:$/mu.exec(reusable)?.[1];
-  assert.ok(inputSection, "reusable workflow must expose a closed input section");
-  assert.deepEqual(
-    [...inputSection.matchAll(/^      ([a-z][a-z-]*):$/gmu)]
-      .map((match) => match[1]),
-    ["pull-request", "selection-policy", "controller-mode", "observation-boundary"],
-  );
-  assert.match(
-    reusable,
-    /^permissions:\n  contents: write\n  id-token: write\n  issues: write\n  pull-requests: write\n  statuses: write\n\njobs:$/mu,
-  );
-  assertReusableWorkflowContract(reusable);
-}
-
-function writeV2ActionTree(sourceRepo) {
-  const actionRoot = join(sourceRepo, "packages", "action");
-  writeJson(join(sourceRepo, "package.json"), {
-    ...SOURCE_PACKAGE_IDENTITY,
-    private: true,
-    type: "module",
-  });
-  writeText(
-    join(actionRoot, "action.yml"),
-    `name: Codex Review Gate v2 Plan Adapter
-runs:
-  using: composite
-  steps:
-    - shell: bash
-      run: node "$GITHUB_ACTION_PATH/src/v2/action.mjs"
-`,
-  );
-  writeText(
-    join(actionRoot, ".github", "workflows", "codex-review-gate.yml"),
-    `name: Codex Review Gate v2
-on:
-  workflow_call:
-jobs:
-  gate:
-    runs-on: ubuntu-latest
-    steps:
-      - run: node "$GITHUB_WORKSPACE/.codex-review-gate-action/src/v2/workflow-controller.mjs" run
-`,
-  );
-  writeText(
-    join(actionRoot, ".github", "workflows", "codex-review-gate-reconcile.yml"),
-    `name: Codex Review Gate v2 Reconcile
-on:
-  workflow_dispatch:
-jobs:
-  reconcile:
-    uses: ./.github/workflows/codex-review-gate.yml
-`,
-  );
-  writeJson(join(actionRoot, "package.json"), {
-    ...ACTION_PACKAGE_IDENTITY,
-    type: "module",
-  });
-  for (const path of EXPECTED_V2_RUNTIME_MODULE_PATHS) {
-    writeText(
-      join(actionRoot, path),
-      `export const moduleName = ${JSON.stringify(path)};\n`,
-    );
-  }
-  writeJson(
-    join(actionRoot, EVIDENCE_AUTHORITY_POLICY_PATH),
-    FIXTURE_EVIDENCE_AUTHORITY_POLICY,
-  );
-  writeText(join(actionRoot, "src", "core.mjs"), "export const retainedCore = true;\n");
-  writeText(join(actionRoot, "src", "gate.mjs"), "export const retainedGate = true;\n");
-  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
-    writeText(join(sourceRepo, path), "name: Source-only required CI fixture\n");
-  }
-}
-
-function createPipelineFixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "v2-release-pipeline-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const sourceRepo = join(root, "source");
-  const archiveRepo = join(root, "archive");
-  const targetRepo = join(root, "target.git");
-  const frozenRepo = join(root, "frozen.git");
-  initialiseRepository(sourceRepo);
-
-  for (let index = 1; index <= 14; index += 1) {
-    writeText(join(sourceRepo, "packages", "action", "history.txt"), `${index}\n`);
-    writeText(join(sourceRepo, "source-history.txt"), `${index}\n`);
-    commitAll(sourceRepo, `source action history ${index}`);
-  }
-  const baselineSourceCommit = gitText(sourceRepo, ["rev-parse", "HEAD"]);
-  const baselineMaster = gitText(sourceRepo, [
-    "subtree",
-    "split",
-    "--prefix=packages/action",
-    baselineSourceCommit,
-  ]);
-  const firstRootCommits = gitText(sourceRepo, ["rev-list", "--reverse", baselineMaster]).split("\n");
-  assert.equal(firstRootCommits.length, 14);
-  const preSubtree = firstRootCommits[7];
-
-  initialiseRepository(archiveRepo);
-  let archiveHead;
-  for (let index = 1; index <= 7; index += 1) {
-    writeText(join(archiveRepo, "archive.txt"), `${index}\n`);
-    archiveHead = commitAll(archiveRepo, `archive ${index}`);
-  }
-
-  initialiseRepository(targetRepo, { bare: true });
-  initialiseRepository(frozenRepo, { bare: true });
-  git(sourceRepo, ["push", "-q", targetRepo,
-    `${baselineMaster}:refs/heads/master`,
-    `${preSubtree}:refs/heads/pre-subtree-master-2026-05-18`,
-  ]);
-  git(archiveRepo, ["push", "-q", targetRepo,
-    `${archiveHead}:refs/heads/archive/pre-subtree-release-candidate-2026-05-16`,
-  ]);
-  git(sourceRepo, ["push", "-q", frozenRepo, `${baselineMaster}:refs/heads/master`]);
-
-  const fixtureBaselinePath = join(sourceRepo, "docs", "release", "action-v2-repository-baselines.json");
-  const frozenRefs = sortedObject({
-    "refs/heads/master": baselineMaster,
-  });
-  const targetRefs = sortedObject({
-    "refs/heads/archive/pre-subtree-release-candidate-2026-05-16": archiveHead,
-    "refs/heads/master": baselineMaster,
-    "refs/heads/pre-subtree-master-2026-05-18": preSubtree,
-  });
-  const baselineTree = gitText(sourceRepo, ["rev-parse", `${baselineMaster}^{tree}`]);
-  writeJson(fixtureBaselinePath, {
-    $schema: "urn:joey-tools:codex-review-gate:action-v2-repository-baselines:1",
-    schema_version: 1,
-    frozen_repository: {
-      repository: "JoeyTeng/codex-review-gate-action",
-      url: frozenRepo,
-      default_branch: "master",
-      default_commit_oid: baselineMaster,
-      default_tree_oid: baselineTree,
-      refs: frozenRefs,
-    },
-    target_repository: {
-      repository: "Joey-Tools/codex-review-gate-action",
-      url: targetRepo,
-      default_branch: "master",
-      default_commit_oid: baselineMaster,
-      default_tree_oid: baselineTree,
-      head_commit_count: 21,
-      head_root_count: 2,
-      refs: targetRefs,
-    },
-    release: {
-      version: "2.0.0",
-      immutable_tag: "v2.0.0",
-      aliases: ["v2.0", "v2"],
-    },
-  });
-  mkdirSync(join(sourceRepo, "scripts"), { recursive: true });
-  copyFileSync(releaseScriptPath, join(sourceRepo, "scripts", "release-action-subtree.sh"));
-  copyFileSync(generatorPath, join(sourceRepo, "scripts", "generate-action-release-provenance.mjs"));
-  chmodSync(join(sourceRepo, "scripts", "release-action-subtree.sh"), 0o755);
-  writeV2ActionTree(sourceRepo);
-  const sourceCommit = commitAll(sourceRepo, "prepare v2.0.0 release");
+function releaseManifest(version, snapshot, expectedHead, previousVersion) {
   return {
-    root,
-    sourceRepo,
-    sourceCommit,
-    targetRepo,
-    frozenRepo,
-    baselinePath: fixtureBaselinePath,
-    frozenRefsBefore: gitText(frozenRepo, ["for-each-ref", "--format=%(objectname) %(refname)"]),
+    $schema: "urn:joey-tools:codex-review-gate:release-manifest:2",
+    schema_version: 2,
+    version,
+    contract_versions: {
+      toolchain: "node20",
+      release_schema: 2,
+      status: 2,
+      template: 2,
+      baseline: 3,
+    },
+    source: {
+      repository: "Joey-Tools/codex-review-gate",
+      path: "packages/action",
+      tree: snapshot.tree,
+    },
+    target: {
+      repository: "JoeyTeng/codex-review-gate-action",
+      ref: "refs/heads/master",
+      expected_head: expectedHead,
+      previous_version: previousVersion,
+    },
+    files: snapshot.files,
+    entrypoint: {
+      metadata_path: "action.yml",
+      using: "node20",
+      main: "src/v2/gate-runtime.mjs",
+    },
+    signer: {
+      name: "JoeyTeng-Codex",
+      email: "codex@mahane.me",
+      primary_fingerprint: PRIMARY,
+      signing_subkey_fingerprint: SUBKEY,
+    },
   };
 }
 
-function runRelease(fixture, output) {
-  return spawnSync(
-    join(fixture.sourceRepo, "scripts", "release-action-subtree.sh"),
-    [
-      "--publish",
-      "--source-ref",
-      fixture.sourceCommit,
-      "--output",
-      output,
-      "--test-target-url",
-      fixture.targetRepo,
-      "--test-frozen-url",
-      fixture.frozenRepo,
-      "--test-baseline",
-      fixture.baselinePath,
-      "--test-skip-checks",
-      "--test-skip-signatures",
-    ],
-    {
-      cwd: fixture.sourceRepo,
-      encoding: "utf8",
-      env: testEnvironment,
-      maxBuffer: 64 * 1024 * 1024,
-      timeout: 120_000,
+function writeActionPayload(source, version) {
+  const actionRoot = join(source, "packages", "action");
+  write(
+    join(actionRoot, "action.yml"),
+    actionMetadata,
+  );
+  writeJson(join(actionRoot, "package.json"), {
+    name: "codex-review-gate-action",
+    version,
+    type: "module",
+    repository: {
+      type: "git",
+      url: "git+https://github.com/JoeyTeng/codex-review-gate-action.git",
     },
+  });
+  write(
+    join(actionRoot, "src", "v2", "gate-runtime.mjs"),
+    `export const releaseVersion = ${JSON.stringify(version)};\n`,
   );
 }
 
-test("workflow exposes only a manual, environment-gated HTTPS v2 publish interface", () => {
-  const workflow = readFileSync(workflowPath, "utf8");
-  assert.match(workflow, /github\.repository == 'Joey-Tools\/codex-review-gate'/);
-  assert.match(workflow, /publish_v2:/);
-  assert.match(
-    workflow,
-    /github\.event_name != 'workflow_dispatch' \|\| !inputs\.publish_v2/,
+function writeReleaseIntent(source, version, expectedHead, previousVersion) {
+  writeActionPayload(source, version);
+  const snapshot = stagedActionSnapshot(source);
+  writeJson(
+    join(source, "release-manifest.json"),
+    releaseManifest(version, snapshot, expectedHead, previousVersion),
   );
-  assert.match(workflow, /environment: action-v2-release/);
-  assert.match(workflow, /ACTION_REPO_PUSH_TOKEN_V2/);
-  assert.match(workflow, /ACTION_RELEASE_SIGNING_PRIVATE_KEY_V2/);
-  assert.match(workflow, /ACTION_RELEASE_SIGNING_FINGERPRINT_V2/);
-  assert.match(
-    workflow,
-    /http\.https:\/\/github\.com\/Joey-Tools\/codex-review-gate-action\.git\.extraheader/,
-  );
-  assert.match(workflow, /--publish/);
-  assert.match(workflow, /--check/);
-  assert.equal(
-    (workflow.match(/EXPECTED_SOURCE_COMMIT: \$\{\{ github\.sha \}\}/g) ?? []).length,
-    2,
-  );
-  assert.doesNotMatch(workflow, /JoeyTeng\/codex-review-gate-action/);
-  assert.doesNotMatch(workflow, /ACTION_REPO_DEPLOY_KEY|ACTION_REPO_PUSH_TOKEN(?!_V2)/);
-  assert.doesNotMatch(workflow, /ssh-keyscan|GIT_SSH_COMMAND|git@github\.com/);
-  assert.doesNotMatch(workflow, /force-with-lease|push --force/);
-  assert.doesNotMatch(workflow, /^    needs: validate$/mu);
-  assert.match(workflow, /persist-credentials: false/g);
-});
+  return commit(source, `Release intent ${version}`);
+}
 
-test("invalid manual publish requests fail instead of producing an empty green run", () => {
-  const workflow = readFileSync(workflowPath, "utf8");
-  assert.deepEqual(workflowJobNames(workflow), [
-    "reject-invalid-publish",
-    "validate",
-    "publish",
-  ]);
-  const reject = workflowJobBlock(workflow, "reject-invalid-publish");
-  assert.match(reject, /^    name: Reject invalid v2 publication request$/mu);
-  assert.match(reject, /github\.event_name == 'workflow_dispatch'/u);
-  assert.match(reject, /inputs\.publish_v2/u);
-  assert.match(
-    reject,
-    /github\.repository != 'Joey-Tools\/codex-review-gate' \|\|\n\s+github\.ref != 'refs\/heads\/master'/u,
-  );
-  assert.match(reject, /^    permissions: \{\}$/mu);
-  assert.match(reject, /^    runs-on: ubuntu-latest$/mu);
-  assert.match(reject, /^          exit 1$/mu);
-  assert.doesNotMatch(reject, /continue-on-error|actions\/checkout|ACTION_REPO_PUSH_TOKEN/u);
-  assert.equal(
-    workflowJobCondition(workflow, "reject-invalid-publish"),
-    "github.event_name == 'workflow_dispatch' && inputs.publish_v2 && ( github.repository != 'Joey-Tools/codex-review-gate' || github.ref != 'refs/heads/master' )",
-  );
+function fixture(t, version = "2.0.0") {
+  const root = mkdtempSync(join(tmpdir(), "action-release-pipeline-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const targetWork = join(root, "target-work");
+  const target = join(root, "target.git");
+  const source = join(root, "source");
+  const releases = join(root, "releases");
 
-  const validate = workflowJobBlock(workflow, "validate");
-  assert.match(
-    validate,
-    /github\.event_name != 'workflow_dispatch' \|\| !inputs\.publish_v2/u,
-  );
-  assert.doesNotMatch(validate, /github\.ref == 'refs\/heads\/master'/u);
-  assert.equal(
-    workflowJobCondition(workflow, "validate"),
-    "github.repository == 'Joey-Tools/codex-review-gate' && (github.event_name != 'workflow_dispatch' || !inputs.publish_v2)",
-  );
+  mkdirSync(targetWork);
+  git(targetWork, ["init", "-q", "--initial-branch=master"]);
+  git(targetWork, ["config", "user.name", "Legacy Publisher"]);
+  git(targetWork, ["config", "user.email", "legacy@example.invalid"]);
+  write(join(targetWork, "action.yml"), "name: Legacy action\n");
+  const initialTarget = commit(targetWork, "Release v1.5.1");
+  git(targetWork, ["tag", "-a", "v1.5.1", initialTarget, "-m", "Release v1.5.1"]);
+  run("git", ["clone", "-q", "--bare", targetWork, target]);
 
-  const publish = workflowJobBlock(workflow, "publish");
-  assert.match(publish, /github\.event_name == 'workflow_dispatch'/u);
-  assert.match(publish, /inputs\.publish_v2/u);
-  assert.match(publish, /github\.repository == 'Joey-Tools\/codex-review-gate'/u);
-  assert.match(publish, /github\.ref == 'refs\/heads\/master'/u);
-  assert.equal(
-    workflowJobCondition(workflow, "publish"),
-    "github.event_name == 'workflow_dispatch' && inputs.publish_v2 && github.repository == 'Joey-Tools/codex-review-gate' && github.ref == 'refs/heads/master'",
-  );
-});
-
-test("master validation runs when the root release package identity changes", () => {
-  const workflow = readFileSync(workflowPath, "utf8");
-  const pushPaths = /^    paths:\n((?:      - [^\n]+\n)+)/mu.exec(workflow)?.[1];
-  assert.ok(pushPaths, "release workflow must expose a master push path filter");
-  const paths = pushPaths.trim().split("\n")
-    .map((line) => line.replace(/^\s*- /u, ""));
-  assert.deepEqual(paths, [
-    ".github/workflows/sync-action-subtree.yml",
-    "package.json",
-    "packages/action/**",
-    "scripts/generate-action-release-provenance.mjs",
-    "scripts/release-action-subtree.sh",
-    "docs/release/action-v2-repository-baselines.json",
-  ]);
-});
-
-test("publication preserves the v1 root caller until a separate activation", () => {
-  const rootCaller = readFileSync(rootCallerPath, "utf8");
-  assert.equal(
-    (rootCaller.match(
-      /^    uses: JoeyTeng\/codex-review-gate-action\/\.github\/workflows\/codex-review-gate\.yml@v1$/gmu,
-    ) ?? []).length,
-    1,
-  );
-  assert.doesNotMatch(
-    rootCaller,
-    /Joey-Tools\/codex-review-gate-action|@(?:[0-9a-f]{40}|v2[^\s]*)/u,
-  );
-
-  for (const path of releaseRunbookPaths) {
-    const runbook = readFileSync(path, "utf8");
-    assert.match(runbook, /publication.*activation|Publication.*activation/su);
-    assert.match(
-      runbook,
-      /JoeyTeng\/codex-review-gate-action\/\.github\/workflows\/codex-review-gate\.yml@v1/u,
-    );
-    assert.match(runbook, /RELEASE_SHA/u);
-    assert.match(runbook, /\^\[0-9a-f\]\{40\}\$/u);
-    assert.match(runbook, /live canary/iu);
-    assert.match(runbook, /codex\/github-review-gate/u);
-    assert.match(runbook, /rollback/iu);
-    assert.match(runbook, /required-context ruleset\/branch-protection switch/u);
-    for (const { environment } of WAIT_JOBS) {
-      assert.match(runbook, new RegExp(environment, "u"));
-    }
-  }
-
-  const english = readFileSync(releaseRunbookPaths[0], "utf8").replace(/\s+/gu, " ");
-  const englishForward = [
-    "Keep the legacy v1 caller enabled and keep its recorded required context",
-    "Add `codex/github-review-gate` to the required contexts",
-    "before removing the recorded legacy v1 required context",
-    "Retire the legacy caller only after the rollback window closes",
-  ].map((value) => english.indexOf(value));
-  assert.ok(englishForward.every((index) => index >= 0));
-  assert.deepEqual(englishForward, [...englishForward].sort((left, right) => left - right));
-  assert.match(
-    english,
-    /Rollback uses the inverse authority order: first restore or retain the legacy v1 caller, then re-add and prove its required context, then remove the v2 required context, and only then disable or remove the v2 consumer graph\./u,
-  );
-
-  const chinese = readFileSync(releaseRunbookPaths[1], "utf8").replace(/\s+/gu, " ");
-  const chineseForward = [
-    "保持 legacy v1 caller enabled，并在 branch protection 中保留其已记录 required context",
-    "先把 `codex/github-review-gate` 加入 required contexts",
-    "再移除已记录 legacy v1 required context",
-    "只有 rollback window 关闭后，才能退役 legacy caller",
-  ].map((value) => chinese.indexOf(value));
-  assert.ok(chineseForward.every((index) => index >= 0));
-  assert.deepEqual(chineseForward, [...chineseForward].sort((left, right) => left - right));
-  assert.match(
-    chinese,
-    /Rollback 必须使用相反的 authority order：先恢复或保留 legacy v1 caller，再重新加入\s+并证明它的 required context，然后移除 v2 required context，最后才 disable\/remove v2 consumer graph。/u,
-  );
-});
-
-test("production activation accepts only the admitted exact release SHA", () => {
-  assert.doesNotThrow(() => assertProductionConsumerActivationContract({
-    consumer: renderProductionConsumer(),
-    releasedSha: RELEASED_SHA_FIXTURE,
-  }));
-
-  const rejected = [
-    {
-      name: "personal repository at the exact SHA",
-      repository: "JoeyTeng/codex-review-gate-action",
-      selector: RELEASED_SHA_FIXTURE,
-    },
-    { name: "legacy major", selector: "v1" },
-    { name: "v2 major", selector: "v2" },
-    { name: "v2 minor", selector: "v2.0" },
-    { name: "v2 immutable tag", selector: "v2.0.0" },
-    { name: "default branch", selector: "master" },
-    { name: "heads ref", selector: "refs/heads/master" },
-    { name: "tags ref", selector: "refs/tags/v2.0.0" },
-    { name: "short SHA", selector: RELEASED_SHA_FIXTURE.slice(0, 12) },
-    { name: "upper-case SHA", selector: RELEASED_SHA_FIXTURE.toUpperCase() },
-    { name: "digest selector", selector: `sha256:${RELEASED_SHA_FIXTURE}` },
-    { name: "expression selector", selector: "${{ inputs.release-sha }}" },
-    { name: "different full SHA", selector: "f".repeat(40) },
-  ];
-  for (const candidate of rejected) {
-    assert.throws(
-      () => assertProductionConsumerActivationContract({
-        consumer: renderProductionConsumer(candidate),
-        releasedSha: RELEASED_SHA_FIXTURE,
-      }),
-      undefined,
-      candidate.name,
-    );
-  }
-});
-
-test("production activation locks the complete reconcile graph and reusable contract", () => {
-  const consumer = renderProductionConsumer();
-  assertProductionConsumerActivationContract({
-    consumer,
-    releasedSha: RELEASED_SHA_FIXTURE,
-  });
-
-  const mutations = [
-    ["missing controller", workflowJobBlock(consumer, "after-public-no-start"), ""],
-    ["wrong permission", "      statuses: write", "      statuses: read"],
-    ["wrong selection policy", "      selection-policy: joey-default", "      selection-policy: arbitrary"],
-    ["wrong schedule", '    - cron: "17 */2 * * *"', '    - cron: "*/5 * * * *"'],
-    ["wrong concurrency", "  group: codex-review-gate-v2-${{ github.repository }}", "  group: codex-review-gate-v2-${{ github.repository }}-${{ github.event.pull_request.number }}"],
-    ["cancel enabled", "  cancel-in-progress: false", "  cancel-in-progress: true"],
-    ["wrong wait environment", "codex-review-gate-public-initial-15m", "codex-review-gate-public-initial-10m"],
-    ["credentialed wait", "    permissions: {}", "    permissions:\n      contents: read"],
-    ["wrong wait dependency", "    needs: public-initial-wait", "    needs: initial"],
-    ["action-backed wait", '        run: ":"', "        uses: actions/checkout@v4"],
-    ["wrong observation boundary", "      observation-boundary: public-post-request-wait-complete", "      observation-boundary: initial"],
-  ];
-  for (const [name, before, after] of mutations) {
-    assert.ok(consumer.includes(before), `${name} mutation fixture must exist`);
-    assert.throws(
-      () => assertProductionConsumerActivationContract({
-        consumer: consumer.replace(before, after),
-        releasedSha: RELEASED_SHA_FIXTURE,
-      }),
-      undefined,
-      name,
-    );
-  }
-
-  const reusable = readFileSync(reusableWorkflowPath, "utf8");
-  for (const [name, before, after] of [
-    ["wrong status context", "V2_STATUS_CONTEXT: codex/github-review-gate", "V2_STATUS_CONTEXT: codex/review-gate"],
-    ["wrong wait duration", 'V2_PUBLIC_WAIT_MINUTES: "15"', 'V2_PUBLIC_WAIT_MINUTES: "10"'],
-    ["optional selection policy", "        required: true\n        type: string\n      controller-mode:", "        required: false\n        type: string\n      controller-mode:"],
-    ["missing status permission", "  statuses: write", "  statuses: read"],
-    ["mutable checkout ref", "ref: ${{ job.workflow_sha }}", "ref: v2"],
-    [
-      "ordinary dispatch binding",
-      "V2_CONTROLLER_PULL_REQUEST: ${{ inputs.pull-request }}\n          V2_CONTROLLER_DISPATCH_BINDING: \"\"",
-      "V2_CONTROLLER_PULL_REQUEST: ${{ inputs.pull-request }}\n          V2_CONTROLLER_DISPATCH_BINDING: ${{ inputs.pull-request }}",
-    ],
-    [
-      "coordinator dispatch binding",
-      "V2_CONTROLLER_ROUTE: scan-all-open\n          V2_CONTROLLER_OBSERVATION_BOUNDARY: initial\n          V2_CONTROLLER_PULL_REQUEST: \"\"\n          V2_CONTROLLER_DISPATCH_BINDING: \"\"",
-      "V2_CONTROLLER_ROUTE: scan-all-open\n          V2_CONTROLLER_OBSERVATION_BOUNDARY: initial\n          V2_CONTROLLER_PULL_REQUEST: \"\"\n          V2_CONTROLLER_DISPATCH_BINDING: ${{ inputs.pull-request }}",
-    ],
-    [
-      "scheduled raw dispatch binding",
-      "V2_CONTROLLER_PULL_REQUEST: ${{ matrix.pull_request }}\n          V2_CONTROLLER_DISPATCH_BINDING: ${{ matrix.dispatch_binding }}",
-      "V2_CONTROLLER_PULL_REQUEST: ${{ matrix.pull_request }}\n          V2_CONTROLLER_DISPATCH_BINDING: ${{ toJSON(matrix.dispatch_binding) }}",
-    ],
-    [
-      "scheduled raw pull request",
-      "V2_CONTROLLER_PULL_REQUEST: ${{ matrix.pull_request }}",
-      "V2_CONTROLLER_PULL_REQUEST: ${{ toJSON(matrix.pull_request) }}",
-    ],
-    ["parallel scheduled fanout", "      max-parallel: 1", "      max-parallel: 2"],
-    ["fail-fast scheduled fanout", "      fail-fast: false", "      fail-fast: true"],
-    [
-      "caller-selected scheduled matrix",
-      "      matrix: ${{ fromJSON(needs.schedule-dispatch.outputs.matrix) }}",
-      "      matrix: ${{ fromJSON(inputs.matrix) }}",
-    ],
-    [
-      "ungated scheduled checkout",
-      "      - name: Check out exact called-workflow release\n        if: matrix.enabled",
-      "      - name: Check out exact called-workflow release\n        if: always()",
-    ],
-  ]) {
-    assert.ok(reusable.includes(before), `${name} mutation fixture must exist`);
-    assert.throws(
-      () => assertProductionConsumerActivationContract({
-        consumer,
-        releasedSha: RELEASED_SHA_FIXTURE,
-        reusable: reusable.replace(before, after),
-      }),
-      undefined,
-      name,
-    );
-  }
-});
-
-test("release fixture locks every live v2 runtime module in byte order", () => {
-  assert.deepEqual(
-    liveV2RuntimeModulePaths(),
-    EXPECTED_V2_RUNTIME_MODULE_PATHS,
-  );
-  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
-    assert.equal(
-      existsSync(join(repositoryRoot, "packages", "action", path)),
-      false,
-      `${path} must remain outside the released action subtree`,
-    );
-  }
-  for (const [path, expected] of [
-    [join(repositoryRoot, "package.json"), SOURCE_PACKAGE_IDENTITY],
-    [join(repositoryRoot, "packages", "action", "package.json"), ACTION_PACKAGE_IDENTITY],
-  ]) {
-    const actual = JSON.parse(readFileSync(path, "utf8"));
-    assert.deepEqual(
-      {
-        name: actual.name,
-        version: actual.version,
-        repository: actual.repository,
-      },
-      expected,
-    );
-  }
-});
-
-test("release script has one fixed writable target and a read-only frozen repository", () => {
-  const script = readFileSync(releaseScriptPath, "utf8");
-  assert.match(script, /TARGET_REPOSITORY_URL="https:\/\/github\.com\/Joey-Tools\/codex-review-gate-action\.git"/);
-  assert.match(script, /FROZEN_REPOSITORY_URL="https:\/\/github\.com\/JoeyTeng\/codex-review-gate-action\.git"/);
-  assert.match(script, /git -C "\$stage_repo" push --atomic "\$target_url"/);
-  assert.doesNotMatch(script, /push[^\n]*\$frozen_url|push[^\n]*FROZEN_REPOSITORY/);
-  assert.doesNotMatch(script, /--force(?:-with-lease)?/);
-  assert.doesNotMatch(script, /ACTION_REPO_DEPLOY_KEY|ACTION_REPO_PUSH_TOKEN(?!_V2)/);
-  assert.match(script, /v2\.0\.0:refs\/tags\/v2\.0\.0/);
-  assert.match(script, /v2\.0:refs\/tags\/v2\.0/);
-  assert.match(script, /v2:refs\/tags\/v2/);
-});
-
-test("pipeline publishes one complete v2 DAG atomically and reruns idempotently", (t) => {
-  const fixture = createPipelineFixture(t);
-  const firstOutput = join(fixture.root, "v2.0.0-provenance.json");
-  const first = runRelease(fixture, firstOutput);
-  assert.equal(first.status, 0, `${first.stdout}\n${first.stderr}`);
-  const firstManifest = JSON.parse(readFileSync(firstOutput, "utf8"));
-  const remoteMaster = gitText(fixture.targetRepo, ["rev-parse", "refs/heads/master"]);
-  assert.equal(firstManifest.action.commit_oid, remoteMaster);
-  const sourcePackageBytes = readFileSync(
-    join(fixture.sourceRepo, "package.json"),
-  );
-  assert.deepEqual(firstManifest.source.package_identity, {
-    role: "v2-source-package",
-    path: "package.json",
-    object_oid: gitText(fixture.sourceRepo, [
-      "rev-parse",
-      `${fixture.sourceCommit}:package.json`,
-    ]),
-    sha256: createHash("sha256").update(sourcePackageBytes).digest("hex"),
-    name: SOURCE_PACKAGE_IDENTITY.name,
-    version: SOURCE_PACKAGE_IDENTITY.version,
-    repository_url: SOURCE_PACKAGE_IDENTITY.repository.url,
-  });
-  assert.equal(firstManifest.history.transferred_initial_heads.commit_count, 21);
-  assert.equal(firstManifest.history.transferred_initial_heads.root_count, 2);
-  assert.equal(firstManifest.remote_state.target.no_v1_refs, true);
-  assert.deepEqual(
-    firstManifest.runtime_identity.runtime_modules.map(({ path }) => path),
-    EXPECTED_V2_RUNTIME_MODULE_PATHS,
-  );
-  const policyBytes = readFileSync(
-    join(
-      fixture.sourceRepo,
-      "packages",
-      "action",
-      EVIDENCE_AUTHORITY_POLICY_PATH,
-    ),
-  );
-  const policySha256 = createHash("sha256").update(policyBytes).digest("hex");
-  const policyTreeEntry = firstManifest.released_tree.entries.find(
-    ({ path }) => path === EVIDENCE_AUTHORITY_POLICY_PATH,
-  );
-  assert.ok(policyTreeEntry);
-  assert.deepEqual(firstManifest.runtime_identity.evidence_authority_policy, {
-    role: "v2-evidence-authority-policy",
-    path: EVIDENCE_AUTHORITY_POLICY_PATH,
-    object_oid: policyTreeEntry.object_oid,
-    sha256: policySha256,
-    policy_digest: `sha256:${policySha256}`,
-  });
-  const actionPackageBytes = readFileSync(
-    join(fixture.sourceRepo, "packages", "action", "package.json"),
-  );
-  const actionPackageTreeEntry = firstManifest.released_tree.entries.find(
-    ({ path }) => path === "package.json",
-  );
-  assert.ok(actionPackageTreeEntry);
-  assert.deepEqual(firstManifest.runtime_identity.package, {
-    role: "v2-action-package",
-    path: "package.json",
-    object_oid: actionPackageTreeEntry.object_oid,
-    sha256: createHash("sha256").update(actionPackageBytes).digest("hex"),
-    name: ACTION_PACKAGE_IDENTITY.name,
-    version: ACTION_PACKAGE_IDENTITY.version,
-    repository_url: ACTION_PACKAGE_IDENTITY.repository.url,
-  });
-  const releasedPaths = new Set(
-    firstManifest.released_tree.entries.map(({ path }) => path),
-  );
-  const targetPaths = new Set(
-    gitText(fixture.targetRepo, ["ls-tree", "-r", "--name-only", remoteMaster])
-      .split("\n"),
-  );
-  for (const path of SOURCE_ONLY_REQUIRED_CI_PATHS) {
-    assert.equal(existsSync(join(fixture.sourceRepo, path)), true);
-    assert.equal(releasedPaths.has(path), false);
-    assert.equal(targetPaths.has(path), false);
-  }
-  assert.doesNotMatch(
-    JSON.stringify(firstManifest.runtime_identity),
-    /required-ci/u,
-  );
-  for (const tag of ["v2.0.0", "v2.0", "v2"]) {
-    assert.equal(gitText(fixture.targetRepo, ["cat-file", "-t", `refs/tags/${tag}`]), "tag");
-    assert.equal(gitText(fixture.targetRepo, ["rev-parse", `${tag}^{commit}`]), remoteMaster);
-  }
-  const refsAfterFirst = gitText(fixture.targetRepo, [
-    "for-each-ref",
-    "--format=%(objectname) %(refname)",
-  ]);
-  assert.doesNotMatch(refsAfterFirst, /refs\/(?:heads|tags)\/v1(?:[./-]|$)/);
-  assert.equal(
-    gitText(fixture.frozenRepo, ["for-each-ref", "--format=%(objectname) %(refname)"]),
-    fixture.frozenRefsBefore,
-  );
-
-  const secondOutput = join(fixture.root, "v2.0.0-provenance-rerun.json");
-  const second = runRelease(fixture, secondOutput);
-  assert.equal(second.status, 0, `${second.stdout}\n${second.stderr}`);
-  assert.match(second.stdout, /already has the exact immutable v2 release/);
-  assert.equal(
-    gitText(fixture.targetRepo, ["for-each-ref", "--format=%(objectname) %(refname)"]),
-    refsAfterFirst,
-  );
-  assert.deepEqual(
-    JSON.parse(readFileSync(secondOutput, "utf8")),
-    firstManifest,
-  );
-});
-
-test("first publication refuses an unrecorded target ref without any mutation", (t) => {
-  const fixture = createPipelineFixture(t);
-  const rogueCommit = gitText(fixture.sourceRepo, ["rev-parse", "HEAD"]);
-  git(fixture.sourceRepo, [
-    "push",
-    "-q",
-    fixture.targetRepo,
-    `${rogueCommit}:refs/heads/rogue`,
-  ]);
-  const refsBefore = gitText(fixture.targetRepo, [
-    "for-each-ref",
-    "--format=%(objectname) %(refname)",
-  ]);
-  const output = join(fixture.root, "rejected-provenance.json");
-  const result = runRelease(fixture, output);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /exact recorded target and frozen baselines/);
-  assert.equal(
-    gitText(fixture.targetRepo, ["for-each-ref", "--format=%(objectname) %(refname)"]),
-    refsBefore,
-  );
-  assert.equal(
-    gitText(fixture.frozenRepo, ["for-each-ref", "--format=%(objectname) %(refname)"]),
-    fixture.frozenRefsBefore,
-  );
-});
-
-test("production test overrides fail closed", () => {
-  const result = spawnSync(releaseScriptPath, ["--test-skip-signatures"], {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-    env: {
-      ...testEnvironment,
-      CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY: "0",
-    },
-  });
-  assert.equal(result.status, 2);
-  assert.match(result.stderr, /test-only release override requires/);
-});
-
-test("even the closed test interface cannot select the frozen repository for writes", () => {
-  const result = spawnSync(
-    releaseScriptPath,
-    [
-      "--test-target-url",
-      "https://github.com/JoeyTeng/codex-review-gate-action.git",
-    ],
-    {
-      cwd: repositoryRoot,
-      encoding: "utf8",
-      env: testEnvironment,
-    },
-  );
-  assert.equal(result.status, 2);
-  assert.match(result.stderr, /can never be a publication target/);
-});
-
-test("production baseline remains the only accepted live old-personal state", () => {
+  mkdirSync(source);
+  git(source, ["init", "-q", "--initial-branch=master"]);
+  git(source, ["config", "user.name", "Source Fixture"]);
+  git(source, ["config", "user.email", "source@example.invalid"]);
+  mkdirSync(join(source, "scripts"), { recursive: true });
+  copyFileSync(releaseScript, join(source, "scripts", "release-action-subtree.sh"));
+  copyFileSync(generator, join(source, "scripts", "generate-action-release-provenance.mjs"));
+  chmodSync(join(source, "scripts", "release-action-subtree.sh"), 0o755);
+  chmodSync(join(source, "scripts", "generate-action-release-provenance.mjs"), 0o755);
+  write(join(source, ".github", "workflows", "sync-action-subtree.yml"), "name: fixture control\n");
+  writeJson(join(source, "package.json"), { type: "module" });
   const baseline = JSON.parse(readFileSync(baselinePath, "utf8"));
-  assert.equal(baseline.frozen_repository.default_commit_oid, baseline.target_repository.default_commit_oid);
-  assert.equal(baseline.frozen_repository.default_tree_oid, baseline.target_repository.default_tree_oid);
-  assert.equal(Object.keys(baseline.target_repository.refs).length, 3);
-  assert.equal(
-    Object.keys(baseline.target_repository.refs).filter((ref) => ref.startsWith("refs/tags/")).length,
-    0,
+  baseline.initial_target_master = initialTarget;
+  baseline.latest_legacy_release_commit = initialTarget;
+  writeJson(join(source, "docs", "release", "action-v2-repository-baselines.json"), baseline);
+
+  writeActionPayload(source, "2.0.0-rc.0");
+  const bootstrapSnapshot = stagedActionSnapshot(source);
+  writeJson(
+    join(source, "release-manifest.json"),
+    releaseManifest("2.0.0-rc.0", bootstrapSnapshot, initialTarget, "1.5.1"),
   );
+  commit(source, "Install release controls");
+
+  const sourceCommit = writeReleaseIntent(source, version, initialTarget, "1.5.1");
+  return { root, target, source, releases, initialTarget, sourceCommit };
+}
+
+function releaseArgs(state, ...args) {
+  return [
+    join(state.source, "scripts", "release-action-subtree.sh"),
+    ...args,
+    "--test-target-url",
+    state.target,
+  ];
+}
+
+function buildAssembledCandidate(
+  state,
+  { sourceCommit = state.sourceCommit, controlCommit = sourceCommit, label = "initial" } = {},
+) {
+  const suffix = `${sourceCommit.slice(0, 12)}-${label}`;
+  const plan = join(state.root, `plan-${suffix}.json`);
+  const a = join(state.root, `candidate-a-${suffix}`);
+  const b = join(state.root, `candidate-b-${suffix}`);
+  const assembled = join(state.root, `assembled-${suffix}`);
+  const publicationPlan = join(state.root, `publication-plan-${suffix}.json`);
+  run("bash", releaseArgs(
+    state,
+    "--plan",
+    "--source-ref",
+    sourceCommit,
+    "--control-ref",
+    controlCommit,
+    "--output",
+    plan,
+  ), { cwd: state.source });
+  for (const outputDir of [a, b]) {
+    run("bash", releaseArgs(
+      state,
+      "--build-candidate",
+      "--source-ref",
+      sourceCommit,
+      "--control-ref",
+      controlCommit,
+      "--plan-file",
+      plan,
+      "--output-dir",
+      outputDir,
+    ), { cwd: state.source });
+  }
+  assert.deepEqual(readFileSync(join(a, "candidate.json")), readFileSync(join(b, "candidate.json")));
+  run("bash", releaseArgs(
+    state,
+    "--assemble",
+    "--source-ref",
+    sourceCommit,
+    "--control-ref",
+    controlCommit,
+    "--candidate-a",
+    a,
+    "--candidate-b",
+    b,
+    "--output-dir",
+    assembled,
+  ), { cwd: state.source });
+  run("bash", releaseArgs(
+    state,
+    "--publication-plan",
+    "--source-ref",
+    sourceCommit,
+    "--control-ref",
+    controlCommit,
+    "--candidate",
+    assembled,
+    "--output",
+    publicationPlan,
+  ), { cwd: state.source });
+  run("bash", releaseArgs(
+    state,
+    "--verify-publication-plan",
+    "--source-ref",
+    sourceCommit,
+    "--control-ref",
+    controlCommit,
+    "--candidate",
+    assembled,
+    "--publication-plan-file",
+    publicationPlan,
+  ), { cwd: state.source });
+  return { plan, a, b, assembled, publicationPlan, sourceCommit, controlCommit };
+}
+
+function publishCandidate(state, built) {
+  const output = run("bash", releaseArgs(
+    state,
+    "--publish",
+    "--source-ref",
+    built.sourceCommit,
+    "--control-ref",
+    built.controlCommit,
+    "--candidate",
+    built.assembled,
+    "--publication-plan-file",
+    built.publicationPlan,
+    "--test-release-dir",
+    state.releases,
+    "--test-skip-signatures",
+  ), { cwd: state.source });
+  assert.equal(
+    [...output.matchAll(/(?:^|\n)reconcile_state=[a-z_]+(?=\n|$)/gu)].length,
+    1,
+    `successful publish must emit exactly one reconcile state\n${output}`,
+  );
+  assert.deepEqual(
+    [...output.matchAll(/recovery_code=([a-z0-9-]+)/gu)].map((match) => match[1]),
+    ["none"],
+    `successful publish must emit exactly one closed no-op recovery code\n${output}`,
+  );
+  return output;
+}
+
+function invokePublish(state, built, options = {}) {
+  const result = invoke("bash", releaseArgs(
+    state,
+    "--publish",
+    "--source-ref",
+    built.sourceCommit,
+    "--control-ref",
+    built.controlCommit,
+    "--candidate",
+    built.assembled,
+    "--publication-plan-file",
+    built.publicationPlan,
+    ...(options.testRelease === false
+      ? ["--test-skip-signatures"]
+      : ["--test-release-dir", state.releases, "--test-skip-signatures"]),
+  ), { cwd: state.source, env: options.env });
+  assert.equal(
+    [...result.stdout.matchAll(/(?:^|\n)reconcile_state=[a-z_]+(?=\n|$)/gu),
+      ...result.stderr.matchAll(/(?:^|\n)reconcile_state=[a-z_]+(?=\n|$)/gu)].length,
+    1,
+    `publish must emit exactly one reconcile state\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  const recoveryCodes = [
+    ...result.stdout.matchAll(/recovery_code=([a-z0-9-]+)/gu),
+    ...result.stderr.matchAll(/recovery_code=([a-z0-9-]+)/gu),
+  ].map((match) => match[1]);
+  assert.equal(
+    recoveryCodes.length,
+    1,
+    `publish must emit exactly one recovery code\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  if (result.status === 0) assert.deepEqual(recoveryCodes, ["none"]);
+  return result;
+}
+
+function invokeVerifyPublished(state, built, options = {}) {
+  verificationInvocationCounter += 1;
+  const githubOutput = join(state.root, `verify-published-${verificationInvocationCounter}.output`);
+  write(githubOutput, "");
+  const result = invoke("bash", releaseArgs(
+    state,
+    "--verify-published",
+    "--source-ref",
+    built.sourceCommit,
+    "--control-ref",
+    built.controlCommit,
+    ...(options.testRelease === false
+      ? []
+      : ["--test-release-dir", state.releases]),
+  ), {
+    cwd: state.source,
+    env: { ...options.env, GITHUB_OUTPUT: githubOutput },
+  });
+  const combined = `${result.stdout}\n${result.stderr}`;
+  const output = readFileSync(githubOutput, "utf8");
+  for (const field of [
+    "verification_state",
+    "verification_stage",
+    "recovery_code",
+    "next_action",
+    "observed_source",
+    "observed_tag",
+  ]) {
+    assert.equal(
+      [...combined.matchAll(new RegExp(`(?:^|\\n)${field}=[^\\n]+(?=\\n|$)`, "gu"))].length,
+      1,
+      `public verification must emit exactly one ${field}\n${combined}`,
+    );
+    assert.equal(
+      [...output.matchAll(new RegExp(`(?:^|\\n)${field}=[^\\n]+(?=\\n|$)`, "gu"))].length,
+      1,
+      `public verification output must contain exactly one ${field}\n${output}`,
+    );
+  }
+  return Object.assign(result, { githubOutput: output });
+}
+
+function advanceIntent(state, version, expectedHead, previousVersion) {
+  git(state.source, ["switch", "-q", "master"]);
+  const sourceCommit = writeReleaseIntent(state.source, version, expectedHead, previousVersion);
+  state.sourceCommit = sourceCommit;
+  return sourceCommit;
+}
+
+function releaseAssets(state, tag) {
+  return run("find", [
+    join(state.releases, tag),
+    "-mindepth",
+    "1",
+    "-maxdepth",
+    "1",
+    "-type",
+    "f",
+    "-exec",
+    "basename",
+    "{}",
+    ";",
+  ]).split("\n").filter(Boolean).sort();
+}
+
+function createTagBeforeMaster(state, built) {
+  const work = join(state.root, "out-of-order-target");
+  run("git", ["clone", "-q", state.target, work]);
+  git(work, ["config", "user.name", "JoeyTeng-Codex"]);
+  git(work, ["config", "user.email", "codex@mahane.me"]);
+  git(work, ["fetch", "-q", "--no-tags", state.source, built.sourceCommit]);
+  const candidate = JSON.parse(readFileSync(join(built.assembled, "candidate.json"), "utf8"));
+  const manifestBytes = gitBytes(state.source, ["show", `${built.sourceCommit}:release-manifest.json`]);
+  const tag = `v${candidate.plan.version}`;
+  const subject = `Release codex-review-gate-action ${tag}`;
+  const body = `${subject}\n\nSource: Joey-Tools/codex-review-gate@${built.sourceCommit}\nManifest-SHA256: ${sha256(manifestBytes)}\n`;
+  const releaseCommit = execFileSync(
+    "git",
+    ["-C", work, "commit-tree", candidate.plan.source_tree, "-p", state.initialTarget],
+    {
+      encoding: "utf8",
+      env: {
+        ...executionEnv,
+        GIT_AUTHOR_NAME: "JoeyTeng-Codex",
+        GIT_AUTHOR_EMAIL: "codex@mahane.me",
+        GIT_COMMITTER_NAME: "JoeyTeng-Codex",
+        GIT_COMMITTER_EMAIL: "codex@mahane.me",
+      },
+      input: body,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  ).trim();
+  git(work, ["tag", "-a", tag, releaseCommit, "-m", subject]);
+  git(work, ["push", "-q", "origin", `refs/tags/${tag}:refs/tags/${tag}`]);
+  return { releaseCommit, tag };
+}
+
+function replaceAliasWithNestedTag(state, alias, fullTag) {
+  const work = join(state.root, `nested-${alias}`);
+  run("git", ["clone", "-q", state.target, work]);
+  git(work, ["config", "user.name", "JoeyTeng-Codex"]);
+  git(work, ["config", "user.email", "codex@mahane.me"]);
+  git(work, ["tag", "-f", "-a", alias, fullTag, "-m", `Codex Review Gate Action ${alias}`]);
+  const object = git(work, ["rev-parse", `refs/tags/${alias}`]);
+  const direct = git(work, ["cat-file", "tag", object]).split("\n").find((line) => line.startsWith("object "))?.slice(7);
+  assert.equal(git(work, ["cat-file", "-t", direct]), "tag", "fixture must be a tag-to-tag alias");
+  git(state.target, ["fetch", "-q", work, object]);
+  git(state.target, ["update-ref", `refs/tags/${alias}`, object]);
+  return object;
+}
+
+function createReplacementAliasObject(state, alias) {
+  const work = join(state.root, `replacement-${alias}`);
+  run("git", ["clone", "-q", state.target, work]);
+  git(work, ["config", "user.name", "JoeyTeng-Codex"]);
+  git(work, ["config", "user.email", "codex@mahane.me"]);
+  const commit = git(work, ["rev-parse", `refs/tags/${alias}^{}`]);
+  git(work, ["tag", "-d", alias]);
+  execFileSync(
+    "git",
+    ["-C", work, "tag", "-a", alias, commit, "-m", `Codex Review Gate Action ${alias}`],
+    {
+      env: { ...executionEnv, GIT_COMMITTER_DATE: "2031-01-02T03:04:05Z" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const object = git(work, ["rev-parse", `refs/tags/${alias}`]);
+  assert.notEqual(object, git(state.target, ["rev-parse", `refs/tags/${alias}`]));
+  assert.equal(git(work, ["rev-parse", `refs/tags/${alias}^{}`]), commit);
+  git(state.target, ["fetch", "-q", work, object]);
+  return { commit, object };
+}
+
+function fakeGithubEnvironment(state, mutationPhase) {
+  const fakeBin = join(state.root, `fake-gh-${mutationPhase}`);
+  const fakeGh = join(fakeBin, "gh");
+  const fakeState = join(state.root, `fake-gh-state-${mutationPhase}`);
+  mkdirSync(fakeBin, { recursive: true });
+  mkdirSync(join(fakeState, "assets"), { recursive: true });
+  writeJson(join(fakeState, "state.json"), {
+    exists: false,
+    draft: true,
+    immutable: false,
+    prerelease: false,
+    tag: "v2.0.0",
+    name: "v2.0.0",
+    body: "",
+    latest: null,
+    next_asset_id: 1,
+    mutation_done: false,
+    policy_mutation_done: false,
+    immutable_policy_reads: 0,
+    immutable_policy_enabled: mutationPhase !== "immutable-policy-disabled",
+    release_api_reads: 0,
+    release_download_reads: 0,
+    release_view_reads: 0,
+    ruleset_drift: false,
+    assets: [],
+  });
+  write(fakeGh, `#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { createHash } from "node:crypto";
+
+const args = process.argv.slice(2);
+const root = process.env.FAKE_GH_STATE;
+const statePath = join(root, "state.json");
+const assetsDir = join(root, "assets");
+const phase = process.env.FAKE_GH_MUTATION_PHASE;
+const productionRulesets = ${JSON.stringify(FAKE_PRODUCTION_RULESETS)};
+if (process.env.FAKE_EXPECT_PINNED_GITHUB_HOST === "true") {
+  const inheritedCredentials = [
+    "GITHUB_TOKEN",
+    "PUBLISHER_TOKEN",
+    "RELEASE_PUBLISHER_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+  ].filter((name) => Object.hasOwn(process.env, name));
+  if (
+    process.env.GH_HOST !== "github.com" ||
+    process.env.GH_TOKEN !== ${JSON.stringify(SYNTHETIC_TOKEN_FIXTURE.value)} ||
+    inheritedCredentials.length !== 0
+  ) {
+    process.stderr.write(
+      "publisher gh invocation inherited hostile host or credential state: " +
+        JSON.stringify({
+          ghHost: process.env.GH_HOST,
+          publisherTokenMatches: process.env.GH_TOKEN === ${JSON.stringify(SYNTHETIC_TOKEN_FIXTURE.value)},
+          inheritedCredentials,
+        }) +
+        "\\n",
+    );
+    process.exit(89);
+  }
+}
+const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
+const save = (state) => writeFileSync(statePath, JSON.stringify(state, null, 2) + "\\n");
+const option = (name) => {
+  const index = args.indexOf(name);
+  return index === -1 ? null : args[index + 1];
+};
+const fail404 = () => {
+  process.stderr.write("HTTP 404: Not Found\\n");
+  process.exit(1);
+};
+const digest = (bytes) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
+const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z") => {
+  const bytes = readFileSync(join(assetsDir, name));
+  return {
+    id,
+    node_id: "asset-" + id,
+    name,
+    state: "uploaded",
+    content_type: "application/octet-stream",
+    size: bytes.byteLength,
+    digest: digest(bytes),
+    created_at: created,
+    updated_at: state.mutation_done && name === "release-provenance.json" ? "2026-08-26T00:00:01Z" : created,
+    url: "https://api.invalid/assets/" + id,
+    browser_download_url: "https://download.invalid/" + name,
+    uploader: {
+      id: 4700530,
+      node_id: "publisher-app",
+      login: "codex-review-gate-action-publisher[bot]",
+      type: "Bot",
+    },
+  };
+};
+const releaseApi = (state) => ({
+  id: 1,
+  node_id: "release-1",
+  tag_name: state.tag,
+  name: state.name,
+  body: state.body,
+  target_commitish: "master",
+  prerelease: state.prerelease,
+  draft: state.draft,
+  immutable: state.immutable,
+  author: {
+    id: 4700530,
+    node_id: "publisher-app",
+    login: "codex-review-gate-action-publisher[bot]",
+    type: "Bot",
+  },
+  assets: state.assets.map((asset) => assetRecord(state, asset.name, asset.id)),
+});
+const mutateProvenance = (state) => {
+  if (state.mutation_done) return state;
+  const name = "release-provenance.json";
+  const path = join(assetsDir, name);
+  writeFileSync(path, readFileSync(path, "utf8") + "replaced-after-upload\\n");
+  const record = state.assets.find((asset) => asset.name === name);
+  if (record) record.id = state.next_asset_id++;
+  state.mutation_done = true;
+  save(state);
+  return state;
+};
+
+if (args[0] === "api") {
+  const endpoint = args.slice(1).find((arg) => arg.startsWith("repos/"));
+  const jq = option("--jq");
+  let state = readState();
+  const requireCurrentApiVersion = () => {
+    if (!args.includes("X-GitHub-Api-Version: 2026-03-10")) {
+      process.stderr.write("missing immutable-release API version header\\n");
+      process.exit(2);
+    }
+  };
+  if (endpoint?.endsWith("/immutable-releases")) {
+    requireCurrentApiVersion();
+    state.immutable_policy_reads += 1;
+    process.stdout.write(JSON.stringify({ enabled: state.immutable_policy_enabled }) + "\\n");
+    if (!state.policy_mutation_done && phase === "source-policy-drift") {
+      execFileSync(process.env.REAL_GIT, [
+        "-C",
+        process.env.FAKE_SOURCE_REPOSITORY,
+        "update-ref",
+        "refs/heads/master",
+        process.env.FAKE_SOURCE_DRIFT_COMMIT,
+      ]);
+      state.policy_mutation_done = true;
+      save(state);
+    } else if (!state.policy_mutation_done && phase === "ruleset-policy-drift") {
+      state.ruleset_drift = true;
+      state.policy_mutation_done = true;
+      save(state);
+    } else if (!state.policy_mutation_done &&
+        phase === "source-drift-during-release-policy-read" &&
+        state.immutable_policy_reads === 2) {
+      execFileSync(process.env.REAL_GIT, [
+        "-C",
+        process.env.FAKE_SOURCE_REPOSITORY,
+        "update-ref",
+        "refs/heads/master",
+        process.env.FAKE_SOURCE_DRIFT_COMMIT,
+      ]);
+      state.policy_mutation_done = true;
+      save(state);
+    } else {
+      save(state);
+    }
+    process.exit(0);
+  }
+  if (endpoint?.endsWith("/rulesets")) {
+    requireCurrentApiVersion();
+    process.stdout.write(JSON.stringify([productionRulesets.map(({ id, name, enforcement, target }) => ({
+      id,
+      name,
+      enforcement,
+      target,
+    }))]) + "\\n");
+    process.exit(0);
+  }
+  const rulesetMatch = endpoint?.match(/\\/rulesets\\/(\\d+)$/u);
+  if (rulesetMatch) {
+    requireCurrentApiVersion();
+    const ruleset = productionRulesets.find(({ id }) => String(id) === rulesetMatch[1]);
+    if (!ruleset) fail404();
+    const markerDrift = process.env.FAKE_RULESET_DRIFT_MARKER &&
+      existsSync(process.env.FAKE_RULESET_DRIFT_MARKER);
+    const result = (state.ruleset_drift || markerDrift) && ruleset.id === 1
+      ? { ...ruleset, enforcement: "disabled" }
+      : ruleset;
+    process.stdout.write(JSON.stringify(result) + "\\n");
+    process.exit(0);
+  }
+  if (endpoint?.endsWith("/releases?per_page=100")) {
+    process.stdout.write(JSON.stringify([state.exists ? [releaseApi(state)] : []]) + "\\n");
+    process.exit(0);
+  }
+  if (endpoint.endsWith("/releases/latest")) {
+    if (!state.latest) fail404();
+    process.stdout.write(state.latest + "\\n");
+    process.exit(0);
+  }
+  if (endpoint.includes("/releases/tags/")) {
+    if (!state.exists) fail404();
+    state.release_api_reads += 1;
+    const releaseApi404 =
+      (phase === "verify-initial-api-404" && state.release_api_reads === 1) ||
+      (phase === "verify-final-api-404" && state.release_api_reads === 2);
+    save(state);
+    if (releaseApi404) fail404();
+    if (jq === ".author.login") {
+      process.stdout.write("codex-review-gate-action-publisher[bot]\\n");
+      process.exit(0);
+    }
+    if (jq === ".immutable") {
+      process.stdout.write(String(state.immutable) + "\\n");
+      if (phase === "after-immutable") mutateProvenance(state);
+      process.exit(0);
+    }
+    process.stdout.write(JSON.stringify(releaseApi(state)) + "\\n");
+    process.exit(0);
+  }
+  if (endpoint.includes("/commits/") || endpoint.includes("/git/tags/")) {
+    if (jq) {
+      process.stdout.write("true valid\\n");
+    } else {
+      process.stdout.write(JSON.stringify({
+        commit: { verification: { verified: true, reason: "valid" } },
+        verification: { verified: true, reason: "valid" },
+      }) + "\\n");
+    }
+    process.exit(0);
+  }
+  process.stderr.write("unsupported fake gh api: " + endpoint + "\\n");
+  process.exit(2);
+}
+
+if (args[0] === "release" && args[1] === "view") {
+  const state = readState();
+  if (!state.exists) fail404();
+  state.release_view_reads += 1;
+  const releaseView404 = phase === "verify-final-view-404" && state.release_view_reads === 2;
+  save(state);
+  if (releaseView404) fail404();
+  if (option("--jq") === ".assets[].name") {
+    process.stdout.write(state.assets.map((asset) => asset.name).sort().join("\\n") + (state.assets.length ? "\\n" : ""));
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({
+    isDraft: state.draft,
+    isPrerelease: state.prerelease,
+    tagName: state.tag,
+    name: state.name,
+    body: state.body,
+    assets: releaseApi(state).assets,
+  }) + "\\n");
+  process.exit(0);
+}
+
+if (args[0] === "release" && args[1] === "create") {
+  const state = readState();
+  state.exists = true;
+  state.draft = true;
+  state.immutable = false;
+  state.prerelease = args.includes("--prerelease");
+  state.tag = args[2];
+  state.name = option("--title");
+  state.body = option("--notes");
+  save(state);
+  process.exit(0);
+}
+
+if (args[0] === "release" && args[1] === "upload") {
+  const state = readState();
+  const source = args[3];
+  const name = basename(source);
+  copyFileSync(source, join(assetsDir, name));
+  state.assets.push({ name, id: state.next_asset_id++ });
+  save(state);
+  process.exit(0);
+}
+
+if (args[0] === "release" && args[1] === "download") {
+  const state = readState();
+  state.release_download_reads += 1;
+  save(state);
+  if (phase === "verify-download-404" && state.release_download_reads === 1) fail404();
+  const pattern = option("--pattern");
+  const destination = option("--dir");
+  mkdirSync(destination, { recursive: true });
+  const selected = pattern === "*" ? state.assets : state.assets.filter((asset) => asset.name === pattern);
+  for (const asset of selected) copyFileSync(join(assetsDir, asset.name), join(destination, asset.name));
+  process.exit(selected.length > 0 ? 0 : 1);
+}
+
+if (args[0] === "release" && args[1] === "edit") {
+  let state = readState();
+  if (phase === "before-immutable") state = mutateProvenance(state);
+  state.draft = false;
+  state.immutable = phase !== "post-publish-mutable";
+  state.latest = args.includes("--latest") ? state.tag : state.latest;
+  save(state);
+  process.exit(0);
+}
+
+process.stderr.write("unsupported fake gh call: " + args.join(" ") + "\\n");
+process.exit(2);
+`);
+  chmodSync(fakeGh, 0o755);
+  return {
+    FAKE_GH_MUTATION_PHASE: mutationPhase,
+    FAKE_GH_STATE: fakeState,
+    PATH: `${fakeBin}:${executionEnv.PATH}`,
+  };
+}
+
+function danglingCommit(repo, parent, message) {
+  const tree = git(repo, ["rev-parse", `${parent}^{tree}`]);
+  return execFileSync(
+    "git",
+    ["-C", repo, "commit-tree", tree, "-p", parent],
+    {
+      encoding: "utf8",
+      env: executionEnv,
+      input: `${message}\n`,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  ).trim();
+}
+
+function driftAfterMasterPushEnvironment(state, githubEnvironment, kind) {
+  const fakeBin = join(state.root, `post-master-${kind}-bin`);
+  const fakeGit = join(fakeBin, "git");
+  const mutationMarker = join(state.root, `post-master-${kind}.marker`);
+  const rulesetDriftMarker = join(state.root, `post-master-${kind}.ruleset-drift`);
+  const realGit = run("which", ["git"]);
+  const sourceBefore = git(state.source, ["rev-parse", "refs/heads/master"]);
+  const sourceDriftCommit = danglingCommit(
+    state.source,
+    sourceBefore,
+    `Source drift after publisher master write (${kind})`,
+  );
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+master_push=false
+for argument in "$@"; do
+  case "$argument" in
+    *:refs/heads/master) master_push=true ;;
+  esac
+done
+"$REAL_GIT" "$@"
+if [ "$master_push" = true ] && [ ! -e "$MUTATION_MARKER" ]; then
+  : > "$MUTATION_MARKER"
+  if [ "$DRIFT_KIND" = source ]; then
+    "$REAL_GIT" -C "$DRIFT_SOURCE_REPOSITORY" update-ref refs/heads/master "$DRIFT_SOURCE_COMMIT"
+  else
+    : > "$RULESET_DRIFT_MARKER"
+  fi
+fi
+`);
+  chmodSync(fakeGit, 0o755);
+  return {
+    ...githubEnvironment,
+    DRIFT_KIND: kind,
+    DRIFT_SOURCE_COMMIT: sourceDriftCommit,
+    DRIFT_SOURCE_REPOSITORY: state.source,
+    FAKE_RULESET_DRIFT_MARKER: rulesetDriftMarker,
+    MUTATION_MARKER: mutationMarker,
+    PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+    REAL_GIT: realGit,
+    RULESET_DRIFT_MARKER: rulesetDriftMarker,
+  };
+}
+
+test("publisher fixtures isolate the host workflow identity and credentials", () => {
+  const observed = JSON.parse(run(process.execPath, [
+    "-e",
+    "process.stdout.write(JSON.stringify({ workflowRef: process.env.GITHUB_WORKFLOW_REF, runId: process.env.GITHUB_RUN_ID, runAttempt: process.env.GITHUB_RUN_ATTEMPT, output: process.env.GITHUB_OUTPUT, tokens: [process.env.GH_TOKEN, process.env.GITHUB_TOKEN, process.env.PUBLISHER_TOKEN, process.env.RELEASE_PUBLISHER_TOKEN] }))",
+  ]));
+  assert.deepEqual(observed, {
+    workflowRef: RELEASE_WORKFLOW_REF,
+    runId: "1",
+    runAttempt: "1",
+    output: "",
+    tokens: ["", "", "", ""],
+  });
+});
+
+test("only heavy release-candidate jobs receive extended timeout headroom", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  assert.equal(workflow.match(/^    timeout-minutes: 30$/gmu)?.length ?? 0, 3);
+  assert.equal(workflow.match(/^    timeout-minutes: 14$/gmu)?.length ?? 0, 4);
+  for (const jobName of ["candidate-a", "candidate-b"]) {
+    const job = workflowJobBlock(workflow, jobName);
+    assert.match(job, /^    runs-on: ubuntu-24\.04$/mu, jobName);
+    assert.match(job, /^    timeout-minutes: 30$/mu, jobName);
+    assert.doesNotMatch(job, /^    timeout-minutes: 14$/mu, jobName);
+  }
+  for (const jobName of ["plan", "assemble", "publication_plan", "verify"]) {
+    const job = workflowJobBlock(workflow, jobName);
+    assert.match(job, /^    runs-on: ubuntu-slim$/mu, jobName);
+    assert.match(job, /^    timeout-minutes: 14$/mu, jobName);
+    assert.doesNotMatch(job, /^    timeout-minutes: 30$/mu, jobName);
+  }
+  const publish = workflowJobBlock(workflow, "publish");
+  assert.match(publish, /^    runs-on: ubuntu-24\.04$/mu);
+  assert.match(publish, /^    timeout-minutes: 30$/mu);
+});
+
+test("workflow and publisher expose the adopted staged ABI and scoped credentials", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  const publisher = readFileSync(releaseScript, "utf8");
+  const help = run("bash", [releaseScript, "--help"], { cwd: repositoryRoot });
+
+  for (const mode of [
+    "--plan",
+    "--build-candidate",
+    "--assemble",
+    "--publication-plan",
+    "--verify-publication-plan",
+    "--publish",
+    "--verify-published",
+  ]) {
+    assert.ok(help.includes(mode), mode);
+  }
+  assert.match(workflow, /plan:[\s\S]*candidate-a:[\s\S]*candidate-b:[\s\S]*assemble:[\s\S]*publication_plan:[\s\S]*publish:[\s\S]*verify:/u);
+  assert.match(workflow, /publication_plan:[\s\S]*runs-on: ubuntu-slim/u);
+  assert.match(workflow, /publish:[\s\S]*environment: marketplace-production/u);
+  assert.ok(
+    workflow.indexOf("Build credential-free publication plan") <
+      workflow.indexOf("Explain privileged-boundary rejection") &&
+      workflow.indexOf("Explain privileged-boundary rejection") <
+        workflow.indexOf("environment: marketplace-production"),
+  );
+  assert.match(
+    publisher,
+    /\.write_eligible == true and \.recovery_code == null and \.reason == null[\s\S]*\.write_eligible == false[\s\S]*release-intent-superseded[\s\S]*publication-admission-invalid[\s\S]*publication is not eligible for the privileged boundary/u,
+  );
+  assert.ok(
+    workflow.indexOf("Revalidate publication plan before minting credentials") <
+      workflow.indexOf("Validate live release signing certificate before minting credentials") &&
+      workflow.indexOf("Validate live release signing certificate before minting credentials") <
+        workflow.indexOf("Create least-privilege publisher token"),
+  );
+  assert.match(workflow, /--verify-publication-plan[\s\S]*--publication-plan-file/u);
+  assert.match(workflow, /--publish[\s\S]*--publication-plan-file/u);
+  assert.doesNotMatch(workflow, /^\s*uses:\s*[^\s]+@(?:main|master|[0-9a-f]{40})/mu);
+  for (const line of workflow.split("\n").filter((value) => /^\s*-?\s*uses:/u.test(value))) {
+    assert.match(line, /@v[1-9][0-9]*$/u, line);
+  }
+  assert.match(
+    workflow,
+    /Security policy: allowlisted GitHub-owned Actions intentionally follow[\s\S]*Moving[\s\S]*to immutable SHAs requires Dependabot and a separate policy change[\s\S]*uses: actions\/create-github-app-token@v3/u,
+  );
+
+  assert.doesNotMatch(workflow, /GIT_ASKPASS:\s*\$\{\{\s*steps\.publisher-token/u);
+  assert.doesNotMatch(workflow, /GIT_ASKPASS=.*>>\s*"\$GITHUB_ENV"/u);
+  assert.match(workflow, /RELEASE_TARGET_ASKPASS: \$\{\{ runner\.temp \}\}\/release-target-askpass/u);
+  assert.doesNotMatch(workflow, /gh api installation\s*>/u);
+  assert.match(workflow, /github-app-installation[\s\S]*--client-id "\$APP_CLIENT_ID"[\s\S]*--installation-id "\$ACTUAL_INSTALLATION_ID"[\s\S]*--output "\$installation_file"/u);
+  assert.match(
+    workflow,
+    /RELEASE_PUBLISHER_APP_PRIVATE_KEY="\$app_private_key"[\s\S]*github-app-installation/u,
+  );
+  assert.doesNotMatch(workflow, /GH_TOKEN="\$app_jwt"|Authorization:\s*token/u);
+  assert.match(
+    workflow,
+    /env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$installation_token"[\s\\]*gh api --hostname github\.com installation\/repositories/u,
+  );
+  assert.doesNotMatch(workflow, /(?:APP_PRIVATE_KEY|app_jwt).*GITHUB_ENV/u);
+  assert.match(workflow, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
+  assert.doesNotMatch(workflow, /^\s+(?:GH_TOKEN|PUBLISHER_TOKEN): \$\{\{ steps\.publisher-token\.outputs\.token \}\}/mu);
+  assert.match(workflow, /Username for 'https:\/\/github\.com\/JoeyTeng\/codex-review-gate-action\.git'/u);
+  assert.match(workflow, /Password for 'https:\/\/x-access-token@github\.com\/JoeyTeng\/codex-review-gate-action\.git'/u);
+  assert.match(
+    publisher,
+    /set \+x[\s\S]*set \+v[\s\S]*set \+a[\s\S]*release_target_askpass="\$\{RELEASE_TARGET_ASKPASS:-\}"[\s\S]*export -n publisher_token release_target_askpass[\s\S]*unset GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN[\s\S]*unset RELEASE_TARGET_ASKPASS GIT_ASKPASS SSH_ASKPASS[\s\S]*readonly publisher_token release_target_askpass/u,
+  );
+  assert.match(
+    publisher,
+    /publisher_gh\(\) \{[\s\S]{0,240}env -u GITHUB_TOKEN -u PUBLISHER_TOKEN -u RELEASE_PUBLISHER_TOKEN[\s\\]*-u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$publisher_token" gh "\$@"[\s\S]{0,20}\}/u,
+  );
+  assert.match(
+    workflow,
+    /live_master_sha="\$\(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com gh api --hostname github\.com/u,
+  );
+  for (const line of workflow.split("\n").filter((value) =>
+    /\bgh api\b/u.test(value) && !value.trimStart().startsWith("#")
+  )) {
+    assert.match(line, /gh api --hostname github\.com\b/u, line);
+  }
+  assert.equal(
+    (workflow.match(/\bgh api --hostname github\.com\b/gu) ?? []).length,
+    4,
+    "every direct workflow gh API call must bind github.com explicitly",
+  );
+  assert.doesNotMatch(
+    publisher,
+    /^\s*(?!publisher_gh\b).*\bgh (?:api|release)\b/mu,
+  );
+  assert.match(
+    publisher,
+    /target_git_push\(\)[\s\S]*push_argv=\([^\n]*credential\.helper=[\s\S]*credential\.useHttpPath=true[\s\S]*http\.extraHeader=[\s\S]*"\$target_url" "\$refspec"\)[\s\S]*GIT_ASKPASS="\$release_target_askpass"[\s\S]*GIT_CONFIG_GLOBAL=\/dev\/null[\s\S]*GIT_CONFIG_NOSYSTEM=1[\s\S]*PUBLISHER_TOKEN="\$publisher_token"[\s\S]*command git "\$\{push_argv\[@\]\}"/u,
+  );
+  assert.match(publisher, /source_live_master\(\)[\s\S]*source_git ls-remote/u);
+  assert.doesNotMatch(publisher, /readonly manifest=|\[\[ -f "\$manifest"/u);
+  assert.match(publisher, /git cat-file -e "\$source_commit:release-manifest\.json"/u);
+  assert.match(
+    publisher,
+    /fetch --quiet --force --no-write-fetch-head[\s\S]*'\+refs\/tags\/\*:refs\/tags\/\*'/u,
+  );
+  assert.match(
+    publisher,
+    /gh api --paginate --slurp[\s\S]*releases\?per_page=100[\s\S]*audit_release_inventory[\s\S]*audit_release_history/u,
+  );
+  assert.match(
+    publisher,
+    /verify-published[\s\S]*gh api users\/JoeyTeng-Codex\/gpg_keys[\s\S]*verify-github-signing-key[\s\S]*gpg --batch --import/u,
+  );
+  assert.match(
+    publisher,
+    /git\(\)[\s\S]*unset GH_TOKEN GITHUB_TOKEN PUBLISHER_TOKEN RELEASE_PUBLISHER_TOKEN[\s\S]*GIT_CONFIG_GLOBAL=\/dev\/null GIT_CONFIG_NOSYSTEM=1[\s\S]*command git -c credential\.helper= -c credential\.useHttpPath=true[\s\S]*http\.https:\/\/github\.com\/\.extraheader=/u,
+  );
+  assert.match(publisher, /prewrite-target-audit[\s\S]*audit_release_inventory[\s\S]*audit_release_history[\s\S]*initial_remote_ref_fingerprint/u);
+  assert.match(
+    publisher,
+    /require_immutable_release_policy\(\)[\s\S]*X-GitHub-Api-Version: 2026-03-10[\s\S]*immutable-releases[\s\S]*keys == \["enabled"\][\s\S]*\.enabled == true/u,
+  );
+  assert.match(
+    publisher,
+    /require_publication_mutation\(\)[\s\S]*require_immutable_release_policy first-mutation[\s\S]*verify_final_policy_fence "before-\$mutation_class"/u,
+  );
+  assert.match(
+    publisher,
+    /verify_final_policy_fence\(\)[\s\S]*preflight_live_source[\s\S]*verify_ruleset_policy_snapshot/u,
+  );
+  assert.match(
+    publisher,
+    /require_immutable_release_policy release-publication[\s\S]*verify_final_policy_fence before-release-publication[\s\S]*release edit[\s\S]*draft=false[\s\S]*\.draft == false and \.immutable == true/u,
+  );
+  assert.ok(
+    publisher.indexOf('[[ "$prewrite_ref_fingerprint_cloned" == "$initial_remote_ref_fingerprint" ]]') <
+      publisher.indexOf('audit_release_inventory "$initial_release_inventory_fingerprint"'),
+    "prewrite namespace drift must become inconclusive before semantic history audit",
+  );
+  assert.match(publisher, /audit_release_inventory\(\)[\s\S]*expected_fingerprint[\s\S]*remote-state-changed/u);
+  assert.match(publisher, /is_v2_plus_major_alias "\$tag"[\s\S]*floating-alias-release/u);
+  assert.match(
+    publisher,
+    /direct_annotated_tag_commit\(\)[\s\S]*cat-file tag "\$object"[\s\S]*direct_type[\s\S]*cat-file -t "\$direct_object"[\s\S]*== "commit"/u,
+  );
+  assert.match(
+    publisher,
+    /final_github_keys=.*final-prewrite[\s\S]*publisher_gh api users\/JoeyTeng-Codex\/gpg_keys[\s\S]*verify-github-signing-key[\s\S]*cmp -- "\$RUNNER_TEMP\/release-signing-public-key\.asc" "\$final_public_key"[\s\S]*target_git_push/u,
+  );
+  assert.match(
+    publisher,
+    /capture_absent_release_boundary[\s\S]*pre-create[\s\S]*post-create[\s\S]*before-upload-[\s\S]*after-upload-[\s\S]*pre-publish[\s\S]*post-publish[\s\S]*pre-alias[\s\S]*post-alias/u,
+  );
+  assert.match(workflow, /outputs:[\s\S]*reconcile_state: \$\{\{ steps\.reconcile\.outputs\.reconcile_state \}\}[\s\S]*id: reconcile/u);
+  assert.match(workflow, /verify:[\s\S]*if: \$\{\{ needs\.publish\.outputs\.reconcile_state != 'superseded' \}\}/u);
+  assert.match(
+    workflow,
+    /id: public-verification[\s\S]*Summarize closed public verification[\s\S]*Observed source:[\s\S]*Recovery code:[\s\S]*Next action:/u,
+  );
+  assert.match(
+    workflow,
+    /tuple="\$STEP_OUTCOME:\$VERIFICATION_STATE:\$RECOVERY_CODE:\$NEXT_ACTION:\$VERIFICATION_STAGE"[\s\S]*success:verified:none:none:complete[\s\S]*summary_valid=false[\s\S]*\[\[ "\$summary_valid" == true \]\]/u,
+  );
+  assert.doesNotMatch(workflow, /publish-next-version/u);
+});
+
+test("malformed publish invocations still emit exactly one closed state and recovery code", (t) => {
+  const state = fixture(t);
+  for (const arguments_ of [
+    ["--publish"],
+    ["--publish", "--candidate"],
+    ["--publish", "--unknown-publisher-option"],
+    ["--publish", "--publish"],
+    ["--publish", "--verify-published"],
+  ]) {
+    const result = invoke("bash", [join(state.source, "scripts", "release-action-subtree.sh"), ...arguments_], {
+      cwd: state.source,
+    });
+    assert.notEqual(result.status, 0, arguments_.join(" "));
+    const combined = `${result.stdout}\n${result.stderr}`;
+    assert.equal(
+      [...combined.matchAll(/(?:^|\n)reconcile_state=(?:fresh|resumable_partial|already_complete|superseded|blocked_conflict|inconclusive)(?=\n|$)/gu)].length,
+      1,
+      `${arguments_.join(" ")}\n${combined}`,
+    );
+    assert.equal(
+      [...combined.matchAll(/recovery_code=[a-z0-9-]+/gu)].length,
+      1,
+      `${arguments_.join(" ")}\n${combined}`,
+    );
+  }
+});
+
+test("publisher disables inherited shell tracing before reading credentials", () => {
+  const result = invoke("bash", [releaseScript, "--help"], {
+    cwd: repositoryRoot,
+    env: {
+      RELEASE_PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      RELEASE_TARGET_ASKPASS: "/private/tmp/codex-review-gate-synthetic-askpass",
+      SHELLOPTS: "allexport:verbose:xtrace",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, new RegExp(SYNTHETIC_TOKEN_FIXTURE.value, "u"));
+  assert.doesNotMatch(result.stderr, /(?:publisher_token|release_target_askpass)=/u);
+  assert.equal(SYNTHETIC_TOKEN_FIXTURE.catalog, "joey-private-v3");
+  assert.equal(SYNTHETIC_TOKEN_FIXTURE.id, "access-a");
+});
+
+test("target pushes command-scope the approved synthetic credential through askpass", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  const fakeBin = join(state.root, "askpass-bin");
+  const fakeGit = join(fakeBin, "git");
+  const askpass = join(state.root, "target-askpass");
+  const askpassLog = join(state.root, "askpass.log");
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+is_push=false
+for argument in "$@"; do
+  [ "$argument" = push ] && is_push=true
+done
+if [ "$is_push" = true ]; then
+  [ -n "\${GIT_ASKPASS:-}" ] || { printf '%s\n' push-without-askpass >> "$ASKPASS_LOG"; exit 96; }
+  [ -z "\${publisher_token:-}\${release_target_askpass:-}" ] || { printf '%s\n' push-observed-lowercase-credential >> "$ASKPASS_LOG"; exit 95; }
+  [ "\${GIT_CONFIG_GLOBAL:-}" = /dev/null ]
+  [ "\${GIT_CONFIG_NOSYSTEM:-}" = 1 ]
+  arguments=" $* "
+  case "$arguments" in *" -c credential.helper= "*) ;; *) exit 94 ;; esac
+  case "$arguments" in *" -c credential.useHttpPath=true "*) ;; *) exit 94 ;; esac
+  case "$arguments" in *" -c http.extraHeader= "*) ;; *) exit 94 ;; esac
+  username="$("$GIT_ASKPASS" "Username for 'https://github.com/JoeyTeng/codex-review-gate-action.git': ")"
+  password="$("$GIT_ASKPASS" "Password for 'https://x-access-token@github.com/JoeyTeng/codex-review-gate-action.git': ")"
+  [ "$username" = x-access-token ]
+  [ "$password" = "$PUBLISHER_TOKEN" ]
+  printf '%s\n' push-with-askpass >> "$ASKPASS_LOG"
+elif [ -n "\${PUBLISHER_TOKEN:-}\${GH_TOKEN:-}\${GITHUB_TOKEN:-}\${RELEASE_PUBLISHER_TOKEN:-}\${RELEASE_TARGET_ASKPASS:-}\${GIT_ASKPASS:-}\${publisher_token:-}\${release_target_askpass:-}" ]; then
+  printf '%s\n' non-push-observed-publisher-credential >> "$ASKPASS_LOG"
+  exit 98
+elif [ -n "\${GIT_ASKPASS:-}" ]; then
+  printf '%s\n' non-push-observed-askpass >> "$ASKPASS_LOG"
+  exit 97
+fi
+exec "$REAL_GIT" "$@"
+`);
+  chmodSync(fakeGit, 0o755);
+write(askpass, `#!/bin/sh
+set -eu
+[ "\${CODEX_RELEASE_TARGET_URL:-}" = "$EXPECTED_TARGET_URL" ]
+prompt="\${1:-}"
+prompt="\${prompt% }"
+case "$prompt" in
+  "Username for 'https://github.com/JoeyTeng/codex-review-gate-action.git':") printf '%s\n' x-access-token ;;
+  "Password for 'https://x-access-token@github.com/JoeyTeng/codex-review-gate-action.git':")
+    [ "\${PUBLISHER_TOKEN:-}" = "${SYNTHETIC_TOKEN_FIXTURE.value}" ]
+    printf '%s\n' "$PUBLISHER_TOKEN"
+    ;;
+  *) exit 1 ;;
+esac
+`);
+  chmodSync(askpass, 0o700);
+
+  const result = invokePublish(state, built, {
+    env: {
+      ASKPASS_LOG: askpassLog,
+      CODEX_REVIEW_GATE_TEST_ENFORCE_ASKPASS: "1",
+      EXPECTED_TARGET_URL: state.target,
+      GIT_ASKPASS: "",
+      PATH: `${fakeBin}:${executionEnv.PATH}`,
+      PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      REAL_GIT: run("which", ["git"]),
+      RELEASE_TARGET_ASKPASS: askpass,
+      SHELLOPTS: "allexport",
+      publisher_token: SYNTHETIC_TOKEN_FIXTURE.value,
+      release_target_askpass: askpass,
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(SYNTHETIC_TOKEN_FIXTURE.catalog, "joey-private-v3");
+  assert.equal(SYNTHETIC_TOKEN_FIXTURE.id, "access-a");
+  assert.deepEqual(readFileSync(askpassLog, "utf8").trim().split("\n"), [
+    "push-with-askpass",
+    "push-with-askpass",
+    "push-with-askpass",
+  ]);
+});
+
+test("target askpass rejects a remote URL other than the actual target", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  const fakeBin = join(state.root, "rejecting-askpass-bin");
+  const fakeGit = join(fakeBin, "git");
+  const askpass = join(state.root, "rejecting-target-askpass");
+  const askpassLog = join(state.root, "rejecting-askpass.log");
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+is_push=false
+for argument in "$@"; do
+  [ "$argument" = push ] && is_push=true
+done
+if [ "$is_push" = true ]; then
+  "$GIT_ASKPASS" 'Username for target'
+  exit 98
+fi
+[ -z "\${GIT_ASKPASS:-}" ]
+exec "$REAL_GIT" "$@"
+`);
+  chmodSync(fakeGit, 0o755);
+  write(askpass, `#!/bin/sh
+set -eu
+if [ "\${CODEX_RELEASE_TARGET_URL:-}" != "$EXPECTED_TARGET_URL" ]; then
+  printf '%s\n' rejected-remote-url >> "$ASKPASS_LOG"
+  exit 1
+fi
+case "\${1:-}" in
+  *Username*) printf '%s\n' x-access-token ;;
+  *Password*) printf '%s\n' "$PUBLISHER_TOKEN" ;;
+  *) exit 1 ;;
+esac
+`);
+  chmodSync(askpass, 0o700);
+
+  const result = invokePublish(state, built, {
+    env: {
+      ASKPASS_LOG: askpassLog,
+      CODEX_REVIEW_GATE_TEST_ENFORCE_ASKPASS: "1",
+      EXPECTED_TARGET_URL: `${state.target}.different`,
+      GIT_ASKPASS: "",
+      PATH: `${fakeBin}:${executionEnv.PATH}`,
+      PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      REAL_GIT: run("which", ["git"]),
+      RELEASE_TARGET_ASKPASS: askpass,
+    },
+  });
+  assert.notEqual(result.status, 0);
+  assert.equal(readFileSync(askpassLog, "utf8"), "rejected-remote-url\n");
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+test("target askpass rejects a non-canonical Git credential prompt", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "wrong-prompt" });
+  const fakeBin = join(state.root, "wrong-prompt-bin");
+  const fakeGit = join(fakeBin, "git");
+  const askpass = join(state.root, "wrong-prompt-askpass");
+  const askpassLog = join(state.root, "wrong-prompt.log");
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+is_push=false
+for argument in "$@"; do
+  [ "$argument" = push ] && is_push=true
+done
+if [ "$is_push" = true ]; then
+  "$GIT_ASKPASS" "Username for 'https://github.com/JoeyTeng/not-the-release-target.git': "
+  exit 98
+fi
+[ -z "\${GIT_ASKPASS:-}" ]
+exec "$REAL_GIT" "$@"
+`);
+  chmodSync(fakeGit, 0o755);
+  write(askpass, `#!/bin/sh
+set -eu
+[ "\${CODEX_RELEASE_TARGET_URL:-}" = "$EXPECTED_TARGET_URL" ]
+prompt="\${1:-}"
+prompt="\${prompt% }"
+case "$prompt" in
+  "Username for 'https://github.com/JoeyTeng/codex-review-gate-action.git':") printf '%s\n' x-access-token ;;
+  "Password for 'https://x-access-token@github.com/JoeyTeng/codex-review-gate-action.git':") printf '%s\n' "$PUBLISHER_TOKEN" ;;
+  *) printf '%s\n' rejected-prompt >> "$ASKPASS_LOG"; exit 1 ;;
+esac
+`);
+  chmodSync(askpass, 0o700);
+
+  const result = invokePublish(state, built, {
+    env: {
+      ASKPASS_LOG: askpassLog,
+      CODEX_REVIEW_GATE_TEST_ENFORCE_ASKPASS: "1",
+      EXPECTED_TARGET_URL: state.target,
+      GIT_ASKPASS: "",
+      PATH: `${fakeBin}:${executionEnv.PATH}`,
+      PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      REAL_GIT: run("which", ["git"]),
+      RELEASE_TARGET_ASKPASS: askpass,
+    },
+  });
+  assert.notEqual(result.status, 0);
+  assert.equal(readFileSync(askpassLog, "utf8"), "rejected-prompt\n");
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+for (const stagedRemoteFailure of ["wrong-origin", "pushurl", "credential-config"]) {
+  test(`target push rejects staged ${stagedRemoteFailure} before invoking askpass`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: stagedRemoteFailure });
+    const fakeBin = join(state.root, `${stagedRemoteFailure}-bin`);
+    const fakeGit = join(fakeBin, "git");
+    const askpass = join(state.root, `${stagedRemoteFailure}-askpass`);
+    const transportLog = join(state.root, `${stagedRemoteFailure}-transport.log`);
+    const askpassLog = join(state.root, `${stagedRemoteFailure}-askpass.log`);
+    mkdirSync(fakeBin);
+    write(fakeGit, `#!/bin/sh
+set -eu
+arguments=" $* "
+case "$arguments" in
+  *" config --local --get-all remote.origin.url "*)
+    if [ "$STAGED_REMOTE_FAILURE" = wrong-origin ]; then
+      printf '%s\n' reported-wrong-origin >> "$TRANSPORT_LOG"
+      printf '%s\n' "$EXPECTED_TARGET_URL.different"
+      exit 0
+    fi
+    ;;
+  *" config --local --get-regexp ^remote\\..*\\.pushurl$ "*)
+    if [ "$STAGED_REMOTE_FAILURE" = pushurl ]; then
+      printf '%s\n' reported-pushurl >> "$TRANSPORT_LOG"
+      printf '%s\n' "remote.origin.pushurl $EXPECTED_TARGET_URL.different"
+      exit 0
+    fi
+    ;;
+  *" config --local --get-regexp ^(credential\\..*|http\\..*\\.extraheader|http\\.extraheader)$ "*)
+    if [ "$STAGED_REMOTE_FAILURE" = credential-config ]; then
+      printf '%s\n' reported-credential-config >> "$TRANSPORT_LOG"
+      printf '%s\n' "credential.helper malicious-helper"
+      exit 0
+    fi
+    ;;
+esac
+is_push=false
+for argument in "$@"; do
+  [ "$argument" = push ] && is_push=true
+done
+if [ "$is_push" = true ]; then
+  printf '%s\n' push-attempted >> "$TRANSPORT_LOG"
+  if [ -n "\${GIT_ASKPASS:-}\${PUBLISHER_TOKEN:-}" ]; then
+    printf '%s\n' credential-exposed-to-push >> "$TRANSPORT_LOG"
+  fi
+  exit 95
+fi
+exec "$REAL_GIT" "$@"
+`);
+    chmodSync(fakeGit, 0o755);
+    write(askpass, `#!/bin/sh
+set -eu
+printf '%s\n' askpass-invoked >> "$ASKPASS_LOG"
+exit 96
+`);
+    chmodSync(askpass, 0o700);
+
+    const result = invokePublish(state, built, {
+      env: {
+        ASKPASS_LOG: askpassLog,
+        CODEX_REVIEW_GATE_TEST_ENFORCE_ASKPASS: "1",
+        EXPECTED_TARGET_URL: state.target,
+        GIT_ASKPASS: "",
+        PATH: `${fakeBin}:${executionEnv.PATH}`,
+        PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+        REAL_GIT: run("which", ["git"]),
+        RELEASE_TARGET_ASKPASS: askpass,
+        STAGED_REMOTE_FAILURE: stagedRemoteFailure,
+        TRANSPORT_LOG: transportLog,
+      },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+    assert.match(result.stderr, /recovery_code=publisher-execution-failure/u);
+    assert.equal(readFileSync(transportLog, "utf8"), `reported-${stagedRemoteFailure}\n`);
+    assert.equal(existsSync(askpassLog), false);
+    assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
+
+test("schema-v2 manifest produces deterministic node20 candidates with a NUL inventory digest", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  const manifest = JSON.parse(git(state.source, ["show", `${state.sourceCommit}:release-manifest.json`]));
+  const baseline = JSON.parse(readFileSync(join(state.source, "docs", "release", "action-v2-repository-baselines.json"), "utf8"));
+  const candidate = JSON.parse(readFileSync(join(built.assembled, "candidate.json"), "utf8"));
+
+  assert.equal(manifest.schema_version, 2);
+  assert.equal(manifest.$schema, "urn:joey-tools:codex-review-gate:release-manifest:2");
+  assert.equal(manifest.contract_versions.baseline, 3);
+  assert.equal(baseline.schema_version, 3);
+  assert.equal(baseline.$schema, "urn:joey-tools:codex-review-gate:action-release-baseline:3");
+  assert.deepEqual(manifest.entrypoint, {
+    metadata_path: "action.yml",
+    using: "node20",
+    main: "src/v2/gate-runtime.mjs",
+  });
+  assert.equal(candidate.plan.source_tree, manifest.source.tree);
+  assert.deepEqual(candidate.payload.files, manifest.files);
+  assert.equal(candidate.payload.inventory_sha256, inventoryDigest(candidate.payload.files));
+  assert.deepEqual(readFileSync(join(built.a, "candidate.json")), readFileSync(join(built.b, "candidate.json")));
+  assert.deepEqual(
+    readFileSync(join(built.a, candidate.archive.name)),
+    readFileSync(join(built.b, candidate.archive.name)),
+  );
+  assert.equal(candidate.payload.files.filter((entry) => entry.path.startsWith("src/v2/")).length, 1);
+  assert.equal(candidate.payload.files.find((entry) => entry.path === "src/v2/gate-runtime.mjs")?.mode, "100644");
+});
+
+test("candidate transport is validated before extraction and rejects symlinks", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  const transport = join(state.root, "candidate.tar");
+  run("tar", ["--format=ustar", "-cf", transport, "-C", built.assembled, "."], {
+    env: { ...executionEnv, COPYFILE_DISABLE: "1" },
+  });
+  const extracted = join(state.root, "extracted");
+  run("node", [generator, "extract-transport", "--archive", transport, "--output-dir", extracted]);
+  assert.deepEqual(readFileSync(join(extracted, "candidate.json")), readFileSync(join(built.assembled, "candidate.json")));
+
+  const unsafe = join(state.root, "unsafe");
+  mkdirSync(unsafe);
+  const candidate = JSON.parse(readFileSync(join(built.assembled, "candidate.json"), "utf8"));
+  symlinkSync(join(built.assembled, "candidate.json"), join(unsafe, "candidate.json"));
+  copyFileSync(join(built.assembled, candidate.archive.name), join(unsafe, candidate.archive.name));
+  const unsafeTransport = join(state.root, "unsafe.tar");
+  run("tar", ["--format=ustar", "-cf", unsafeTransport, "-C", unsafe, "."], {
+    env: { ...executionEnv, COPYFILE_DISABLE: "1" },
+  });
+  const result = invoke("node", [
+    generator,
+    "extract-transport",
+    "--archive",
+    unsafeTransport,
+    "--output-dir",
+    join(state.root, "unsafe-extracted"),
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /release tar rejects links and special entries: candidate\.json|exactly two root regular files|root-scoped mode-0600 regular files/u,
+  );
+});
+
+test("publication plan is mandatory, candidate-bound, and verified before publication", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  const missing = invoke("bash", releaseArgs(
+    state,
+    "--publish",
+    "--source-ref",
+    built.sourceCommit,
+    "--control-ref",
+    built.controlCommit,
+    "--candidate",
+    built.assembled,
+    "--test-release-dir",
+    state.releases,
+    "--test-skip-signatures",
+  ), { cwd: state.source });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /requires --candidate and --publication-plan-file/u);
+
+  const plan = JSON.parse(readFileSync(built.publicationPlan, "utf8"));
+  plan.candidate.archive_sha256 = "0".repeat(64);
+  writeJson(built.publicationPlan, plan);
+  const tampered = invokePublish(state, built);
+  assert.notEqual(tampered.status, 0);
+  assert.match(tampered.stderr, /recovery_code=publication-input-preflight/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+
+  const fakeBin = join(state.root, "contradictory-admission-bin");
+  const fakeNode = join(fakeBin, "node");
+  mkdirSync(fakeBin);
+  write(fakeNode, `#!/bin/sh
+set -eu
+if [ "\${2:-}" = publication-plan ]; then
+  output=
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --output ]; then
+      shift
+      output="$1"
+    fi
+    shift
+  done
+  [ -n "$output" ]
+  printf '%s\n' "$FAKE_PLAN_JSON" > "$output"
+  exit 0
+fi
+exec "$REAL_NODE" "$@"
+`);
+  chmodSync(fakeNode, 0o755);
+  for (const [label, fakePlan] of [
+    ["eligible-with-conflict", {
+      write_eligible: true,
+      recovery_code: "publisher-control-drift",
+      reason: "contradictory",
+    }],
+    ["invalid-with-superseded", {
+      write_eligible: "invalid",
+      recovery_code: "release-intent-superseded",
+      reason: "contradictory",
+    }],
+  ]) {
+    const contradictoryOutput = join(state.root, `publication-plan-${label}.json`);
+    const contradictory = invoke("bash", releaseArgs(
+      state,
+      "--publication-plan",
+      "--source-ref",
+      built.sourceCommit,
+      "--control-ref",
+      built.controlCommit,
+      "--candidate",
+      built.assembled,
+      "--output",
+      contradictoryOutput,
+    ), {
+      cwd: state.source,
+      env: {
+        FAKE_PLAN_JSON: JSON.stringify(fakePlan),
+        PATH: `${fakeBin}:${executionEnv.PATH}`,
+        REAL_NODE: process.execPath,
+      },
+    });
+    assert.notEqual(contradictory.status, 0, label);
+    assert.match(contradictory.stderr, /recovery_code=publication-admission-invalid/u);
+  }
+});
+
+test("credential-free publication admission rejects non-superseded control drift", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "admission-before-drift" });
+  write(join(state.source, ".github", "workflows", "required-ci.yml"), "name: Drifted publisher control\n");
+  const driftedMaster = commit(state.source, "Drift publisher controls before admission");
+  const rejectedPlan = join(state.root, "publication-plan-control-drift.json");
+
+  const result = invoke("bash", releaseArgs(
+    state,
+    "--publication-plan",
+    "--source-ref",
+    built.sourceCommit,
+    "--control-ref",
+    built.controlCommit,
+    "--candidate",
+    built.assembled,
+    "--output",
+    rejectedPlan,
+  ), { cwd: state.source });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /recovery_code=publisher-control-drift/u);
+  const plan = JSON.parse(readFileSync(rejectedPlan, "utf8"));
+  assert.equal(plan.live_source_master, driftedMaster);
+  assert.equal(plan.write_eligible, false);
+  assert.equal(plan.recovery_code, "publisher-control-drift");
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+});
+
+test("fresh stable publication verifies the immutable Release before advancing its alias", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  const output = publishCandidate(state, built);
+  assert.match(output, /reconcile_state=fresh/u);
+
+  const releaseCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), releaseCommit);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), releaseCommit);
+  assert.equal(git(state.target, ["show", "-s", "--format=%P", releaseCommit]), state.initialTarget);
+  assert.equal(git(state.target, ["rev-parse", `${releaseCommit}^{tree}`]), git(state.source, ["rev-parse", `${state.sourceCommit}:packages/action`]));
+  assert.deepEqual(releaseAssets(state, "v2.0.0"), [
+    "codex-review-gate-action-v2.0.0.tar.gz",
+    "immutable",
+    "prerelease",
+    "published",
+    "release-provenance.json",
+    "release-provenance.json.asc",
+  ]);
+});
+
+test("public verification emits one closed recovery tuple for success and key failure states", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "verify-closed-tuples" });
+  publishCandidate(state, built);
+  const fullObject = git(state.target, ["rev-parse", "refs/tags/v2.0.0"]);
+  const aliasObject = git(state.target, ["rev-parse", "refs/tags/v2"]);
+
+  const success = invokeVerifyPublished(state, built);
+  assert.equal(success.status, 0, success.stderr);
+  assert.match(success.stdout, /verification_state=verified/u);
+  assert.match(success.stdout, /verification_stage=complete/u);
+  assert.match(success.stdout, /recovery_code=none/u);
+  assert.match(success.stdout, /next_action=none/u);
+
+  git(state.target, ["update-ref", "-d", "refs/tags/v2"]);
+  const missingAlias = invokeVerifyPublished(state, built);
+  assert.notEqual(missingAlias.status, 0);
+  assert.match(missingAlias.stderr, /verification_state=blocked_conflict/u);
+  assert.match(missingAlias.stderr, /recovery_code=major-alias-missing/u);
+  assert.match(missingAlias.stderr, /next_action=reconcile-exact-source/u);
+  git(state.target, ["update-ref", "refs/tags/v2", aliasObject]);
+
+  replaceAliasWithNestedTag(state, "v2", "v2.0.0");
+  const malformedAlias = invokeVerifyPublished(state, built);
+  assert.notEqual(malformedAlias.status, 0);
+  assert.match(malformedAlias.stderr, /verification_state=blocked_conflict/u);
+  assert.match(malformedAlias.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(malformedAlias.stderr, /next_action=investigate-published-state/u);
+  git(state.target, ["update-ref", "refs/tags/v2", aliasObject]);
+
+  rmSync(join(state.releases, "v2.0.0", "immutable"));
+  const mutableRelease = invokeVerifyPublished(state, built);
+  assert.notEqual(mutableRelease.status, 0);
+  assert.match(mutableRelease.stderr, /verification_state=blocked_conflict/u);
+  assert.match(mutableRelease.stderr, /recovery_code=mutable-release/u);
+  assert.match(
+    mutableRelease.stderr,
+    /next_action=repair-immutable-release-and-reconcile/u,
+  );
+  write(join(state.releases, "v2.0.0", "immutable"), "");
+
+  git(state.target, ["update-ref", "-d", "refs/tags/v2.0.0"]);
+  const missingFullTag = invokeVerifyPublished(state, built);
+  assert.notEqual(missingFullTag.status, 0);
+  assert.match(missingFullTag.stderr, /verification_state=blocked_conflict/u);
+  assert.match(missingFullTag.stderr, /recovery_code=immutable-tag-missing/u);
+  assert.match(missingFullTag.stderr, /next_action=reconcile-exact-source/u);
+  git(state.target, ["update-ref", "refs/tags/v2.0.0", fullObject]);
+
+  const fakeBin = join(state.root, "verify-unreadable-bin");
+  const fakeGh = join(fakeBin, "gh");
+  mkdirSync(fakeBin);
+  write(fakeGh, "#!/bin/sh\necho 'simulated public API outage' >&2\nexit 1\n");
+  chmodSync(fakeGh, 0o755);
+  const unreadable = invokeVerifyPublished(state, built, {
+    testRelease: false,
+    env: { PATH: `${fakeBin}:${executionEnv.PATH}` },
+  });
+  assert.notEqual(unreadable.status, 0);
+  assert.match(unreadable.stderr, /verification_state=inconclusive/u);
+  assert.match(unreadable.stderr, /recovery_code=release-api-unreadable/u);
+  assert.match(unreadable.stderr, /next_action=retry-public-verification/u);
+});
+
+test("public verification rejects a rolled-back alias behind the highest complete stable release", (t) => {
+  const state = fixture(t);
+  const old = buildAssembledCandidate(state, { label: "public-highest-stable-old" });
+  publishCandidate(state, old);
+  const oldCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+
+  advanceIntent(state, "2.1.0", oldCommit, "2.0.0");
+  const middle = buildAssembledCandidate(state, { label: "public-highest-stable-middle" });
+  publishCandidate(state, middle);
+  const middleCommit = git(state.target, ["rev-parse", "refs/tags/v2.1.0^{}"]);
+  const middleAliasObject = git(state.target, ["rev-parse", "refs/tags/v2"]);
+
+  advanceIntent(state, "2.2.0", middleCommit, "2.1.0");
+  const highest = buildAssembledCandidate(state, { label: "public-highest-stable-highest" });
+  publishCandidate(state, highest);
+  const highestCommit = git(state.target, ["rev-parse", "refs/tags/v2.2.0^{}"]);
+  git(state.target, ["update-ref", "refs/tags/v2", middleAliasObject]);
+
+  const result = invokeVerifyPublished(state, old);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /verification_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(result.stderr, /highest complete stable release v2\.2\.0/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), highestCommit);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), middleCommit);
+});
+
+test("public verification requires a later alias Release to pass complete asset and provenance validation", (t) => {
+  const state = fixture(t);
+  const old = buildAssembledCandidate(state, { label: "public-strong-later-old" });
+  publishCandidate(state, old);
+  const oldCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+
+  advanceIntent(state, "2.1.0", oldCommit, "2.0.0");
+  const later = buildAssembledCandidate(state, { label: "public-strong-later-new" });
+  publishCandidate(state, later);
+  const laterArchive = join(
+    state.releases,
+    "v2.1.0",
+    "codex-review-gate-action-v2.1.0.tar.gz",
+  );
+  writeFileSync(laterArchive, Buffer.concat([
+    readFileSync(laterArchive),
+    Buffer.from("tampered-after-publication\n"),
+  ]));
+
+  const result = invokeVerifyPublished(state, old);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /verification_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(result.stderr, /later stable tag v2\.1\.0 is not a complete immutable release/u);
+});
+
+test("public verification binds the floating alias annotated-tag object across clone and readback", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "public-alias-object-binding" });
+  publishCandidate(state, built);
+  const originalAliasObject = git(state.target, ["rev-parse", "refs/tags/v2"]);
+  const { commit, object: replacementAliasObject } = createReplacementAliasObject(state, "v2");
+  const fakeBin = join(state.root, "public-alias-object-binding-bin");
+  const fakeGit = join(fakeBin, "git");
+  const mutationMarker = join(state.root, "public-alias-object-binding-mutated");
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+is_clone=false
+for argument in "$@"; do
+  [ "$argument" = clone ] && is_clone=true
+done
+"$REAL_GIT" "$@"
+if [ "$is_clone" = true ] && [ ! -e "$MUTATION_MARKER" ]; then
+  "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref refs/tags/v2 "$REPLACEMENT_ALIAS_OBJECT"
+  : > "$MUTATION_MARKER"
+fi
+`);
+  chmodSync(fakeGit, 0o755);
+
+  const result = invokeVerifyPublished(state, built, {
+    env: {
+      MUTATION_MARKER: mutationMarker,
+      MUTATION_TARGET: state.target,
+      PATH: `${fakeBin}:${executionEnv.PATH}`,
+      REAL_GIT: run("which", ["git"]),
+      REPLACEMENT_ALIAS_OBJECT: replacementAliasObject,
+    },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /verification_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(result.stderr, /complete target tag namespace changed/u);
+  assert.equal(existsSync(mutationMarker), true);
+  assert.notEqual(replacementAliasObject, originalAliasObject);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2"]), replacementAliasObject);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), commit);
+});
+
+test("public verification treats a missing later alias Release as a deterministic conflict", (t) => {
+  const state = fixture(t);
+  const old = buildAssembledCandidate(state, { label: "verify-later-release-404-old" });
+  publishCandidate(state, old);
+  const oldCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+
+  advanceIntent(state, "2.1.0", oldCommit, "2.0.0");
+  const newer = buildAssembledCandidate(state, { label: "verify-later-release-404-newer" });
+  publishCandidate(state, newer);
+
+  const fakeBin = join(state.root, "verify-later-release-api-bin");
+  const fakeGh = join(fakeBin, "gh");
+  mkdirSync(fakeBin);
+  write(fakeGh, `#!/bin/sh
+if [ "\${FAKE_RELEASE_API_MODE:-}" = 404 ]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+else
+  echo 'simulated public API outage' >&2
+fi
+exit 1
+`);
+  chmodSync(fakeGh, 0o755);
+  const verifyEnv = { PATH: `${fakeBin}:${executionEnv.PATH}` };
+
+  const missing = invokeVerifyPublished(state, old, {
+    testRelease: false,
+    env: { ...verifyEnv, FAKE_RELEASE_API_MODE: "404" },
+  });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /verification_state=blocked_conflict/u);
+  assert.match(missing.stderr, /recovery_code=published-state-mismatch/u);
+  assert.match(missing.stderr, /next_action=investigate-published-state/u);
+
+  const unreadable = invokeVerifyPublished(state, old, {
+    testRelease: false,
+    env: { ...verifyEnv, FAKE_RELEASE_API_MODE: "outage" },
+  });
+  assert.notEqual(unreadable.status, 0);
+  assert.match(unreadable.stderr, /verification_state=inconclusive/u);
+  assert.match(unreadable.stderr, /recovery_code=remote-read-inconclusive/u);
+  assert.match(unreadable.stderr, /next_action=retry-public-verification/u);
+});
+
+test("public verification treats confirmed Release disappearance as a deterministic conflict", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "verify-confirmed-release-404" });
+  publishCandidate(state, built);
+  const githubEnvironment = fakeGithubEnvironment(state, "public-verify-release-404");
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-public-verify-release-404",
+    "state.json",
+  );
+  const fakeAssets = join(dirname(fakeStatePath), "assets");
+  const assetNames = releaseAssets(state, "v2.0.0").filter((name) =>
+    !["immutable", "prerelease", "published"].includes(name));
+  for (const name of assetNames) {
+    copyFileSync(join(state.releases, "v2.0.0", name), join(fakeAssets, name));
+  }
+  const publishedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  Object.assign(publishedState, {
+    assets: assetNames.map((name, index) => ({ name, id: index + 1 })),
+    body: `Signed release of Joey-Tools/codex-review-gate@${built.sourceCommit}.`,
+    draft: false,
+    exists: true,
+    immutable: true,
+    latest: "v2.0.0",
+    name: "v2.0.0",
+    next_asset_id: assetNames.length + 1,
+    prerelease: false,
+    tag: "v2.0.0",
+  });
+  writeJson(fakeStatePath, publishedState);
+
+  for (const phase of [
+    "verify-initial-api-404",
+    "verify-download-404",
+    "verify-final-view-404",
+    "verify-final-api-404",
+  ]) {
+    const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+    fakeState.release_api_reads = 0;
+    fakeState.release_download_reads = 0;
+    fakeState.release_view_reads = 0;
+    writeJson(fakeStatePath, fakeState);
+
+    const result = invokeVerifyPublished(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+    });
+    assert.notEqual(result.status, 0, `${phase} must fail closed`);
+    assert.match(result.stderr, /verification_state=blocked_conflict/u);
+    assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
+    assert.match(result.stderr, /next_action=investigate-published-state/u);
+  }
+});
+
+test("an already-complete release is a byte-stable no-op on rerun", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  publishCandidate(state, built);
+  const before = {
+    master: git(state.target, ["rev-parse", "refs/heads/master"]),
+    full: git(state.target, ["rev-parse", "refs/tags/v2.0.0"]),
+    alias: git(state.target, ["rev-parse", "refs/tags/v2"]),
+    provenance: readFileSync(join(state.releases, "v2.0.0", "release-provenance.json")),
+  };
+  const output = publishCandidate(state, built);
+  assert.match(output, /reconcile_state=already_complete/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), before.master);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2.0.0"]), before.full);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2"]), before.alias);
+  assert.deepEqual(readFileSync(join(state.releases, "v2.0.0", "release-provenance.json")), before.provenance);
+});
+
+test("a complete immutable Release with a missing alias resumes only the alias", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  publishCandidate(state, built);
+  const master = git(state.target, ["rev-parse", "refs/heads/master"]);
+  const full = git(state.target, ["rev-parse", "refs/tags/v2.0.0"]);
+  git(state.target, ["update-ref", "-d", "refs/tags/v2"]);
+
+  const output = publishCandidate(state, built);
+  assert.match(output, /reconcile_state=resumable_partial/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), master);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2.0.0"]), full);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), master);
+});
+
+test("a nested annotated floating alias is rejected instead of recursively peeled", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "nested-alias" });
+  publishCandidate(state, built);
+  const master = git(state.target, ["rev-parse", "refs/heads/master"]);
+  const full = git(state.target, ["rev-parse", "refs/tags/v2.0.0"]);
+  const nested = replaceAliasWithNestedTag(state, "v2", "v2.0.0");
+
+  const result = invokePublish(state, built);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /major alias must be an annotated tag that directly targets a commit|malformed-major-alias-target/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), master);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2.0.0"]), full);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2"]), nested);
+});
+
+test("a published Release that is not immutable blocks alias recovery", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  publishCandidate(state, built);
+  git(state.target, ["update-ref", "-d", "refs/tags/v2"]);
+  rmSync(join(state.releases, "v2.0.0", "immutable"));
+
+  const result = invokePublish(state, built);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /published test Release is incomplete or mutable/u);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+test("an older partial release blocks a newer release from leapfrogging", (t) => {
+  const state = fixture(t);
+  const first = buildAssembledCandidate(state);
+  publishCandidate(state, first);
+  const firstCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+  rmSync(join(state.releases, "v2.0.0", "immutable"));
+
+  advanceIntent(state, "2.0.1", firstCommit, "2.0.0");
+  const second = buildAssembledCandidate(state, { label: "next" });
+  const result = invokePublish(state, second);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=older-partial-release/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), firstCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.1"]));
+});
+
+test("a historical partial release blocks a newer version even when the immediate predecessor is complete", (t) => {
+  const state = fixture(t);
+  const first = buildAssembledCandidate(state, { label: "historical-first" });
+  publishCandidate(state, first);
+  const firstCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+
+  advanceIntent(state, "2.0.1", firstCommit, "2.0.0");
+  const second = buildAssembledCandidate(state, { label: "historical-second" });
+  publishCandidate(state, second);
+  const secondCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.1^{}"]);
+  rmSync(join(state.releases, "v2.0.0", "immutable"));
+
+  advanceIntent(state, "2.0.2", secondCommit, "2.0.1");
+  const third = buildAssembledCandidate(state, { label: "historical-third" });
+  const result = invokePublish(state, third);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=older-partial-release/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), secondCommit);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), secondCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.2"]));
+});
+
+test("an independently inventoried Release without a full tag blocks publication", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "release-without-tag" });
+  const orphanRelease = join(state.releases, "v2.0.1");
+  mkdirSync(orphanRelease, { recursive: true });
+  write(join(orphanRelease, "prerelease"), "false\n");
+
+  const result = invokePublish(state, built);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=release-without-full-tag/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+});
+
+test("an unreachable remote full tag is discovered and blocks later publication", (t) => {
+  const state = fixture(t);
+  const first = buildAssembledCandidate(state, { label: "unreachable-first" });
+  publishCandidate(state, first);
+  const firstCommit = git(state.target, ["rev-parse", "refs/heads/master"]);
+
+  advanceIntent(state, "2.1.0", firstCommit, "2.0.0");
+  const second = buildAssembledCandidate(state, { label: "unreachable-second" });
+  publishCandidate(state, second);
+  const secondCommit = git(state.target, ["rev-parse", "refs/heads/master"]);
+  assert.notEqual(secondCommit, firstCommit);
+  git(state.target, ["update-ref", "refs/heads/master", firstCommit, secondCommit]);
+
+  advanceIntent(state, "2.2.0", firstCommit, "2.0.0");
+  const later = buildAssembledCandidate(state, { label: "unreachable-later" });
+  const result = invokePublish(state, later);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=out-of-order-release-prefix/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), firstCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.2.0"]));
+});
+
+test("a later complete release classifies an old unpublished intent as superseded", (t) => {
+  const state = fixture(t, "2.0.1");
+  const oldSource = state.sourceCommit;
+  advanceIntent(state, "2.1.0", state.initialTarget, "1.5.1");
+  const later = buildAssembledCandidate(state, { label: "later" });
+  publishCandidate(state, later);
+  const laterMaster = git(state.target, ["rev-parse", "refs/heads/master"]);
+  const old = buildAssembledCandidate(state, {
+    sourceCommit: oldSource,
+    controlCommit: state.sourceCommit,
+    label: "old-current-plan",
+  });
+
+  const result = invokePublish(state, old);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /reconcile_state=superseded/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), laterMaster);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.1"]));
+});
+
+test("an old unpublished intent rejects a rolled-back alias behind the highest complete stable release", (t) => {
+  const state = fixture(t, "2.0.1");
+  const oldSource = state.sourceCommit;
+
+  advanceIntent(state, "2.1.0", state.initialTarget, "1.5.1");
+  const firstLater = buildAssembledCandidate(state, { label: "unpublished-rollback-first-later" });
+  publishCandidate(state, firstLater);
+  const firstLaterCommit = git(state.target, ["rev-parse", "refs/tags/v2.1.0^{}"]);
+  const firstLaterAliasObject = git(state.target, ["rev-parse", "refs/tags/v2"]);
+
+  advanceIntent(state, "2.2.0", firstLaterCommit, "2.1.0");
+  const highest = buildAssembledCandidate(state, { label: "unpublished-rollback-highest" });
+  publishCandidate(state, highest);
+  const highestCommit = git(state.target, ["rev-parse", "refs/tags/v2.2.0^{}"]);
+  git(state.target, ["update-ref", "refs/tags/v2", firstLaterAliasObject]);
+
+  const refsBefore = git(state.target, ["show-ref"]);
+  const old = buildAssembledCandidate(state, {
+    sourceCommit: oldSource,
+    controlCommit: state.sourceCommit,
+    label: "unpublished-rollback-old",
+  });
+  const result = invokePublish(state, old);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=older-partial-release/u);
+  assert.match(result.stderr, /highest complete stable release v2\.2\.0/u);
+  assert.equal(git(state.target, ["show-ref"]), refsBefore);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), highestCommit);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), firstLaterCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.1"]));
+});
+
+test("an old exact-source rerun never recreates a missing alias behind a completed newer stable release", (t) => {
+  const state = fixture(t);
+  const oldSource = state.sourceCommit;
+  const first = buildAssembledCandidate(state, { label: "no-rollback-first" });
+  publishCandidate(state, first);
+  const firstCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+
+  advanceIntent(state, "2.1.0", firstCommit, "2.0.0");
+  const newer = buildAssembledCandidate(state, { label: "no-rollback-newer" });
+  publishCandidate(state, newer);
+  const newerCommit = git(state.target, ["rev-parse", "refs/tags/v2.1.0^{}"]);
+  git(state.target, ["update-ref", "-d", "refs/tags/v2"]);
+
+  const old = buildAssembledCandidate(state, {
+    sourceCommit: oldSource,
+    controlCommit: oldSource,
+    label: "no-rollback-old-rerun",
+  });
+  const result = invokePublish(state, old);
+  if (result.status === 0) {
+    assert.match(result.stdout, /reconcile_state=superseded/u);
+  } else {
+    assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+    assert.match(result.stderr, /recovery_code=older-partial-release/u);
+  }
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), newerCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+test("an old rerun cannot accept a rolled-back alias when a newer same-major release is complete", (t) => {
+  const state = fixture(t);
+  const oldSource = state.sourceCommit;
+  const first = buildAssembledCandidate(state, { label: "rolled-back-alias-first" });
+  publishCandidate(state, first);
+  const firstCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+  const firstAliasObject = git(state.target, ["rev-parse", "refs/tags/v2"]);
+
+  advanceIntent(state, "2.1.0", firstCommit, "2.0.0");
+  const newer = buildAssembledCandidate(state, { label: "rolled-back-alias-newer" });
+  publishCandidate(state, newer);
+  const newerCommit = git(state.target, ["rev-parse", "refs/tags/v2.1.0^{}"]);
+  git(state.target, ["update-ref", "refs/tags/v2", firstAliasObject]);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), firstCommit);
+
+  const refsBefore = git(state.target, ["show-ref"]);
+  const releasesBefore = Object.fromEntries(["v2.0.0", "v2.1.0"].flatMap((tag) =>
+    releaseAssets(state, tag).map((name) => [
+      `${tag}/${name}`,
+      sha256(readFileSync(join(state.releases, tag, name))),
+    ])));
+  const old = buildAssembledCandidate(state, {
+    sourceCommit: oldSource,
+    controlCommit: state.sourceCommit,
+    label: "rolled-back-alias-old-rerun",
+  });
+  const result = invokePublish(state, old);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /reconcile_state=already_complete/u);
+  if (result.status === 0) {
+    assert.match(result.stdout, /reconcile_state=superseded/u);
+  } else {
+    assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  }
+  assert.equal(git(state.target, ["show-ref"]), refsBefore);
+  assert.deepEqual(Object.fromEntries(["v2.0.0", "v2.1.0"].flatMap((tag) =>
+    releaseAssets(state, tag).map((name) => [
+      `${tag}/${name}`,
+      sha256(readFileSync(join(state.releases, tag, name))),
+    ]))), releasesBefore);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), newerCommit);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), firstCommit);
+});
+
+test("an unreadable GitHub Release snapshot is inconclusive and performs no durable write", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state);
+  const fakeBin = join(state.root, "fake-bin");
+  mkdirSync(fakeBin);
+  const fakeGh = join(fakeBin, "gh");
+  write(fakeGh, "#!/bin/sh\necho 'simulated remote read failure' >&2\nexit 1\n");
+  chmodSync(fakeGh, 0o755);
+
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: { PATH: `${fakeBin}:${executionEnv.PATH}` },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=inconclusive/u);
+  assert.match(result.stderr, /recovery_code=remote-read-inconclusive/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+});
+
+test("prewrite namespace drift becomes inconclusive before malformed history can write", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "prewrite-namespace-drift" });
+  const fakeBin = join(state.root, "prewrite-drift-bin");
+  const fakeGit = join(fakeBin, "git");
+  const mutationMarker = join(state.root, "prewrite-drift-mutated");
+  const realGit = run("which", ["git"]);
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+for argument in "$@"; do
+  case "$argument" in
+    *prewrite-target-audit*)
+      if [ ! -e "$MUTATION_MARKER" ]; then
+        "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref refs/tags/v2.9.9 "$MUTATION_COMMIT" || exit $?
+        : > "$MUTATION_MARKER"
+      fi
+      ;;
+  esac
+done
+exec "$REAL_GIT" "$@"
+`);
+  chmodSync(fakeGit, 0o755);
+
+  const result = invokePublish(state, built, {
+    env: {
+      MUTATION_COMMIT: state.initialTarget,
+      MUTATION_MARKER: mutationMarker,
+      MUTATION_TARGET: state.target,
+      PATH: `${fakeBin}:${executionEnv.PATH}`,
+      REAL_GIT: realGit,
+    },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=inconclusive/u);
+  assert.match(result.stderr, /recovery_code=remote-state-changed/u);
+  assert.equal(existsSync(mutationMarker), true);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.9.9"]), "commit");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  assert.equal(existsSync(join(state.releases, "v2.0.0")), false);
+});
+
+test("disabled immutable-release policy blocks the first durable mutation", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "immutable-policy-disabled" });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, "immutable-policy-disabled"),
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=immutable-release-policy-disabled/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-immutable-policy-disabled", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.exists, false);
+  assert.deepEqual(fakeState.assets, []);
+});
+
+test("mutable post-publication readback blocks the floating alias", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "post-publish-mutable" });
+  const hostileGithubEnvironment = fakeGithubEnvironment(state, "post-publish-mutable");
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...hostileGithubEnvironment,
+      FAKE_EXPECT_PINNED_GITHUB_HOST: "true",
+      GH_ENTERPRISE_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      GITHUB_ENTERPRISE_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+      GH_HOST: "hostile.invalid",
+      RELEASE_PUBLISHER_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=immutable-release-mismatch/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-post-publish-mutable", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.exists, true);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, false);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0"]), "tag");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+for (const policyDrift of ["source", "ruleset"]) {
+  test(`${policyDrift} policy drift after the first write stops the partial prefix`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: `post-master-${policyDrift}-drift` });
+    const githubEnvironment = fakeGithubEnvironment(state, `post-master-${policyDrift}-drift`);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: driftAfterMasterPushEnvironment(state, githubEnvironment, policyDrift),
+    });
+
+    assert.notEqual(result.status, 0);
+    if (policyDrift === "source") {
+      assert.match(result.stderr, /reconcile_state=inconclusive/u);
+      assert.match(result.stderr, /recovery_code=source-state-changed/u);
+    } else {
+      assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+      assert.match(result.stderr, /recovery_code=publisher-ruleset-policy-changed/u);
+    }
+    assert.notEqual(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-post-master-${policyDrift}-drift`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.exists, false);
+    assert.deepEqual(fakeState.assets, []);
+  });
+}
+
+test("release-policy read drift is fenced again before draft publication", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "pre-release-edit-source-drift" });
+  const sourceBefore = git(state.source, ["rev-parse", "refs/heads/master"]);
+  const sourceDriftCommit = danglingCommit(
+    state.source,
+    sourceBefore,
+    "Source drift during immutable-policy read",
+  );
+  const githubEnvironment = fakeGithubEnvironment(
+    state,
+    "source-drift-during-release-policy-read",
+  );
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      FAKE_SOURCE_DRIFT_COMMIT: sourceDriftCommit,
+      FAKE_SOURCE_REPOSITORY: state.source,
+      REAL_GIT: run("which", ["git"]),
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=inconclusive/u);
+  assert.match(result.stderr, /recovery_code=source-state-changed/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-source-drift-during-release-policy-read", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.immutable_policy_reads, 2);
+  assert.equal(fakeState.exists, true);
+  assert.equal(fakeState.draft, true);
+  assert.equal(fakeState.immutable, false);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0"]), "tag");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+for (const mutationPhase of ["before-immutable", "after-immutable"]) {
+  test(`same-name provenance replacement ${mutationPhase} blocks the floating alias`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: mutationPhase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, mutationPhase),
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconcile_state=(?:blocked_conflict|inconclusive)/u);
+    const fakeState = JSON.parse(readFileSync(join(state.root, `fake-gh-state-${mutationPhase}`, "state.json"), "utf8"));
+    assert.equal(fakeState.mutation_done, true);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
+
+test("a full version tag published before target master is an out-of-order hard conflict", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "tag-before-master" });
+  const { releaseCommit } = createTagBeforeMaster(state, built);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]), releaseCommit);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+
+  const result = invokePublish(state, built);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]), releaseCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+test("future two-digit majors receive their own floating alias", (t) => {
+  const state = fixture(t, "10.0.0");
+  const built = buildAssembledCandidate(state);
+  publishCandidate(state, built);
+  const releaseCommit = git(state.target, ["rev-parse", "refs/tags/v10.0.0^{}"]);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v10^{}"]), releaseCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v1"]));
+});
+
+test("huge SemVer majors never overflow or round the floating alias", (t) => {
+  const version = "9007199254740993.0.0";
+  const exactAlias = "v9007199254740993";
+  const state = fixture(t, version);
+  const built = buildAssembledCandidate(state, { label: "huge-major" });
+  publishCandidate(state, built);
+  const releaseCommit = git(state.target, ["rev-parse", `refs/tags/v${version}^{}`]);
+  assert.equal(git(state.target, ["rev-parse", `refs/tags/${exactAlias}^{}`]), releaseCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v9007199254740992"]));
+});
+
+test("exact-source rematerialization can recover an old alias after source master advances", (t) => {
+  const state = fixture(t);
+  const oldSource = state.sourceCommit;
+  const first = buildAssembledCandidate(state, { label: "first" });
+  publishCandidate(state, first);
+  const oldRelease = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+  const firstArchive = readFileSync(join(first.assembled, "codex-review-gate-action-v2.0.0.tar.gz"));
+  git(state.target, ["update-ref", "-d", "refs/tags/v2"]);
+
+  advanceIntent(state, "2.1.0", oldRelease, "2.0.0");
+  const currentControl = state.sourceCommit;
+  const recovered = buildAssembledCandidate(state, {
+    sourceCommit: oldSource,
+    controlCommit: currentControl,
+    label: "recovered",
+  });
+  assert.deepEqual(
+    readFileSync(join(recovered.assembled, "codex-review-gate-action-v2.0.0.tar.gz")),
+    firstArchive,
+  );
+  const publicationPlan = JSON.parse(readFileSync(recovered.publicationPlan, "utf8"));
+  assert.equal(publicationPlan.source_commit, oldSource);
+  assert.equal(publicationPlan.control_commit, currentControl);
+  assert.equal(publicationPlan.live_source_master, state.sourceCommit);
+  assert.equal(publicationPlan.write_eligible, false);
+  assert.equal(publicationPlan.recovery_code, "release-intent-superseded");
+
+  const output = publishCandidate(state, recovered);
+  assert.match(output, /reconcile_state=resumable_partial/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), oldRelease);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.1.0"]));
+});
+
+test("exact-source recovery reads the frozen manifest when current control has no root manifest", (t) => {
+  const state = fixture(t);
+  const oldSource = state.sourceCommit;
+  const first = buildAssembledCandidate(state, { label: "manifestless-control-first" });
+  publishCandidate(state, first);
+  const releaseCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+  git(state.target, ["update-ref", "-d", "refs/tags/v2"]);
+
+  rmSync(join(state.source, "release-manifest.json"));
+  const currentControl = commit(state.source, "Remove completed release intent manifest");
+  assert.equal(existsSync(join(state.source, "release-manifest.json")), false);
+  const recovered = buildAssembledCandidate(state, {
+    sourceCommit: oldSource,
+    controlCommit: currentControl,
+    label: "manifestless-control-recovered",
+  });
+  const plan = JSON.parse(readFileSync(recovered.publicationPlan, "utf8"));
+  assert.equal(plan.source_commit, oldSource);
+  assert.equal(plan.control_commit, currentControl);
+  assert.equal(plan.live_source_master, currentControl);
+  assert.equal(plan.write_eligible, false);
+
+  const output = publishCandidate(state, recovered);
+  assert.match(output, /reconcile_state=resumable_partial/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), releaseCommit);
+});
+
+test("exact-source recovery fails closed when publisher controls drift", (t) => {
+  const state = fixture(t);
+  const oldSource = state.sourceCommit;
+  const first = buildAssembledCandidate(state, { label: "control-drift-first" });
+  publishCandidate(state, first);
+  const releaseCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+  git(state.target, ["update-ref", "-d", "refs/tags/v2"]);
+  const targetRefsBefore = git(state.target, ["show-ref"]);
+  const releaseBytesBefore = Object.fromEntries(releaseAssets(state, "v2.0.0").map((name) => [
+    name,
+    sha256(readFileSync(join(state.releases, "v2.0.0", name))),
+  ]));
+
+  write(join(state.source, "README.md"), "Source advanced without changing release controls.\n");
+  const approvedControl = commit(state.source, "Advance source without changing release controls");
+  const recovered = buildAssembledCandidate(state, {
+    sourceCommit: oldSource,
+    controlCommit: approvedControl,
+    label: "control-drift-recovered",
+  });
+  assert.deepEqual(
+    readFileSync(join(recovered.assembled, "codex-review-gate-action-v2.0.0.tar.gz")),
+    readFileSync(join(first.assembled, "codex-review-gate-action-v2.0.0.tar.gz")),
+  );
+  const plan = JSON.parse(readFileSync(recovered.publicationPlan, "utf8"));
+  assert.equal(plan.source_commit, oldSource);
+  assert.equal(plan.control_commit, approvedControl);
+  assert.equal(plan.live_source_master, approvedControl);
+
+  write(join(state.source, ".github", "workflows", "required-ci.yml"), "name: Drifted release control\n");
+  const driftedControl = writeReleaseIntent(state.source, "2.1.0", releaseCommit, "2.0.0");
+  assert.equal(git(state.source, ["ls-remote", state.source, "refs/heads/master"]).split("\t")[0], driftedControl);
+
+  const result = invokePublish(state, recovered);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /publisher-control-drift|publication-input-preflight/u);
+  assert.equal(git(state.target, ["show-ref"]), targetRefsBefore);
+  assert.deepEqual(Object.fromEntries(releaseAssets(state, "v2.0.0").map((name) => [
+    name,
+    sha256(readFileSync(join(state.releases, "v2.0.0", name))),
+  ])), releaseBytesBefore);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), releaseCommit);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]), releaseCommit);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+test("prereleases publish only the full immutable tag", (t) => {
+  const state = fixture(t, "2.0.0-rc.1");
+  const built = buildAssembledCandidate(state);
+  const output = publishCandidate(state, built);
+  assert.match(output, /reconcile_state=fresh/u);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0-rc.1"]), "tag");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  assert.equal(readFileSync(join(state.releases, "v2.0.0-rc.1", "prerelease"), "utf8"), "true\n");
 });

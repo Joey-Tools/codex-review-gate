@@ -2,230 +2,394 @@
 
 Languages: [British English (en-GB)](COOKBOOK.md) | [简体中文 (zh-CN)](COOKBOOK.zh-CN.md)
 
-This cookbook documents the v2 public boundary and pre-activation checks. It
-does not authorise production activation: the controller and scheduled
-dispatcher are locally gated, but publication admission and live activation
-proof are still P0 prerequisites.
+This cookbook starts after the complete canonical verifier and controller
+[workflow bundle](https://github.com/Joey-Tools/codex-review-gate/tree/master/templates/codex-gated-repo/.github/workflows),
+the managed `.github/CODEOWNERS` control plane, and the disabled
+[ruleset template](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json)
+have been installed. For installation and canary activation, use the
+[human-readable guide](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/human.md)
+or let an agent follow the
+[agent-executable guide](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/agent.md).
 
-## Choose the correct entry point
+## Command variables
 
-For an ordinary repository, the target call is always the organisation-owned
-trusted reusable workflow:
+The examples use:
 
-```yaml
-jobs:
-  codex-review-gate:
-    uses: Joey-Tools/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2
-    with:
-      pull-request: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pull-request || '' }}
-      selection-policy: joey-default
-      controller-mode: ordinary
-      observation-boundary: initial
+```bash
+REPO="OWNER/REPO"
+PR_NUMBER="123"
+WORKFLOW="codex-review-gate-controller.yml"
 ```
 
-The caller also grants only:
+Read the exact current head immediately before each dispatch:
 
-```yaml
-permissions:
-  contents: write
-  id-token: write
-  issues: write
-  pull-requests: write
-  statuses: write
+```bash
+HEAD_SHA="$(gh pr view "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --json headRefOid --jq .headRefOid)"
 ```
 
-`@v2` is the documented release alias. The release pipeline publishes it over
-an immutable signed v2 commit, and the reusable workflow checks out the exact
-selected workflow object. Do not substitute either of these forms:
+Do not reuse that value after a push, update-branch operation, base change,
+close/reopen transition or any uncertainty about PR state.
 
-```yaml
-- uses: Joey-Tools/codex-review-gate-action@v2
-- uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1
+Each dispatch handles one PR. To recover several PRs, invoke separate runs with
+each PR's independently read head.
+
+## Choose the path
+
+### Ordinary low-cost review
+
+When the exact head is not already carrying a success that must be invalidated,
+the normal agent path is:
+
+1. read the open PR and exact current head;
+2. post a comment whose complete visible content is exact `@codex review`;
+3. let Codex publish its evidence without occupying an Actions runner;
+4. dispatch `reconcile` for that exact head; and
+5. follow the summary until the final exact-head merge closure passes.
+
+Prefer the GitHub CLI pull-request comment command with a task-scoped body file
+so shell quoting cannot add visible text. Do not construct the workflow-owned
+hidden marker by hand; the `begin-review` operation owns that form.
+
+An ordinary request author's default minimum permission is `write`, `maintain`
+or `admin`, unless protected default-branch configuration deliberately selects
+`any`.
+
+### Workflow-coordinated review
+
+Use `begin-review` when the controller must own the
+request, including a deliberate same-head re-review after an earlier success:
+
+```bash
+gh workflow run "$WORKFLOW" \
+  --repo "github.com/$REPO" \
+  -f operation=begin-review \
+  -f pr_number="$PR_NUMBER" \
+  -f expected_head_sha="$HEAD_SHA" \
+  -f request_review=true
 ```
 
-The first is only the plan adapter; the second is the frozen personal v1
-archive. Neither is a v2 consumer gate.
+Observe that exact controller run establish and read back the strictly newer
+verifier attempt before relying on it. The same-PR controller concurrency group
+uses `cancel-in-progress: false`, but concurrency is not a mutation fence.
 
-## Pre-activation checklist
+The advanced form:
 
-Keep the repository fail-closed until every item is proved:
-
-1. The reviewed release contains the complete caller, closed controller inputs,
-   durable scheduled dispatcher, and automatic effect protocol for all enabled
-   event and scan paths.
-2. The generated caller selects the organisation reusable workflow at `@v2`,
-   not the composite Action or personal archive.
-3. The three public-wait environments exist with exact 15-minute wait timers:
-   `codex-review-gate-public-initial-15m`,
-   `codex-review-gate-public-post-request-15m`, and
-   `codex-review-gate-public-no-start-15m`.
-4. A trusted Environment API preflight has read and validated those protection
-   rules. Matching environment names are not sufficient.
-5. A live canary proves that server time and observation boundaries reject an
-   early environment release and cannot authorise a request or terminal write.
-6. Controller-owned concurrency serialises effects for the same repository,
-   PR, and review epoch.
-7. The ruleset does not require `codex/github-review-gate` until all earlier
-   checks pass.
-
-The release package's `codex-review-gate-reconcile.yml` is a template and
-contract fixture used to validate orchestration shape. It is not a hosted
-central router and is not production activation evidence.
-
-## Validate scheduled fan-out
-
-The schedule route must remain one protected coordinator followed by a serial
-matrix fan-out:
-
-- only the coordinator receives `scan-all-open` and an empty pull-request;
-- its output is parsed directly with
-  `fromJSON(needs.schedule-dispatch.outputs.matrix)`;
-- every enabled row passes the coordinator's pull-request number and raw
-  `dispatch_binding`, never a caller selector or re-encoded object;
-- the matrix uses `max-parallel: 1` and `fail-fast: false`;
-- each scheduled leg rehydrates the durable reservation before acquiring a
-  lease, then releases and acknowledges exactly that candidate; and
-- an empty inventory emits one disabled sentinel, while an attempted candidate
-  enters recovery instead of being emitted again.
-
-Reject a caller that lists open pull requests itself, constructs rows from an
-input PR number, converts the binding with `toJSON`, runs scheduled rows in
-parallel, or omits the `matrix.enabled` step guards.
-
-## Validate the selected major
-
-Before enabling a generated caller, inspect only its callsite and selected
-repository/ref:
-
-```text
-repository: Joey-Tools/codex-review-gate-action
-workflow: .github/workflows/codex-review-gate.yml
-release alias: v2
-status context: codex/github-review-gate
+```bash
+gh workflow run "$WORKFLOW" \
+  --repo "github.com/$REPO" \
+  -f operation=begin-review \
+  -f pr_number="$PR_NUMBER" \
+  -f expected_head_sha="$HEAD_SHA" \
+  -f request_review=false
 ```
 
-Reject activation when a caller references `JoeyTeng`, `@v1`, a direct root
-Action, a copied runtime file, or a locally invented controller mode.
+does not post. It is best effort and adds no dedicated barrier. Post the new
+exact `@codex review` only after the exact controller run completes.
 
-The v2 repository may retain `src/core.mjs`, `src/gate.mjs`,
-`decision-table.json`, and `producer-receipt.schema.json` because its history
-contains the v1 archive. Those paths do not select a runtime. There must be no
-`v1*` branch/tag selector in the v2 target, and the v2 controller has no code
-path that falls back to the v1 reducer.
+### Reconcile one exact head
 
-## Interpret an adapter run
+After Codex evidence arrives, or whenever a recovery instruction says to
+reconcile:
 
-The composite adapter accepts one trusted, controller-generated operation
-input and returns files under `RUNNER_TEMP`. Use it only while implementing or
-testing a controller.
+```bash
+gh workflow run "$WORKFLOW" \
+  --repo "github.com/$REPO" \
+  -f operation=reconcile \
+  -f request_review=false \
+  -f pr_number="$PR_NUMBER" \
+  -f expected_head_sha="$HEAD_SHA"
+```
 
-A normal adapter result may include:
+`request_comment_id` may be supplied as a locator hint when the summary or
+provider event identifies the relevant request. It never supplies a verdict or
+permits a partial negative-evidence scan:
 
-- a closed reducer `decision`;
-- the canonical rich public v2 report (the compact reducer result stays internal);
-- a status plan;
-- a request reservation or retry-zero intent;
-- an exact-201 binding plan.
+```bash
+gh workflow run "$WORKFLOW" \
+  --repo "github.com/$REPO" \
+  -f operation=reconcile \
+  -f request_review=false \
+  -f pr_number="$PR_NUMBER" \
+  -f expected_head_sha="$HEAD_SHA" \
+  -f request_comment_id="$REQUEST_COMMENT_ID"
+```
 
-It does not mean that a status, comment, sticky projection, or ledger record
-exists on GitHub. Do not expose adapter plans to a later untrusted job, upload
-them as an execution command, or translate a green step into gate success.
+Never pass `--ref`, use `repository_dispatch`, or supply ad-hoc numeric limit
+inputs. Omitting the ref selects the protected default-branch workflow. Read
+the created run back and reject it unless its `headBranch` is the current
+default branch.
 
-If an adapter attempts a non-read transport or reports that it performed a
-write, treat the invocation as invalid. The trusted workflow controller, not
-the adapter, owns durable reservation, pre-effect attempt recording, the one
-remote effect, response binding, sticky projection, and final status.
+## Ordinary agent loop
 
-## Manual evaluation
+1. Prove the target is an open, non-draft, same-repository PR to the default
+   branch and read its exact head.
+2. If a new review generation is needed, choose direct exact
+   `@codex review` or `begin-review` as described above.
+3. Wait for Codex. Do not create a cron or repeated blind request loop.
+4. Dispatch `reconcile` for the exact head.
+5. Read the four Action outputs and the Actions summary:
+   `execution_health`, `gate_outcome`, `recovery_code`, `retry_safe`.
+6. Always follow the one concrete `recovery_code` action in the summary. Only
+   `wait_provider` is a pure wait. Do not infer clean from zero counts, a
+   pending result or a sticky comment.
+7. When the result reaches `healthy/success`, perform the exact-head merge
+   closure below immediately before merge.
 
-`evaluate-only` is a controller-owned manual route. It must not publish a
-status or request a review. It is useful for validating a projected snapshot,
-but a clean evaluation is not a remote gate result and cannot satisfy branch
-protection.
+If the head changes at any step, stop. Read the new current head and begin a
+fresh generation/reconcile as appropriate. A stale run never follows or writes
+its decision to the new head.
 
-Do not use `evaluate-only` to bypass the activation gate or manufacture a
-success status. A manual caller must still be generated by the trusted
-assembler once that assembler is supported.
+## Interpret results
 
-## Diagnose common blocked outcomes
+| Result | Meaning | Operator action |
+| --- | --- | --- |
+| `healthy/success` | Stable complete current-head clean evidence was proved. | Perform the final verifier/head/ruleset reread; merge only if all still match. |
+| `healthy/failure` | Qualifying findings were proved. | Follow finding links, fix or obtain an authorised newer clean generation, then reconcile. |
+| `unhealthy/failure` | Findings were proved but execution or final result handling also failed. | Keep the findings blocking, repair the named execution boundary and reconcile. |
+| `healthy/pending` | Evaluation completed safely, but current state cannot authorise success yet. | Follow `recovery_code`; wait without another action only for `wait_provider`. |
+| `unhealthy/pending` | API, pagination, cap or stability execution is incomplete. | Follow the recovery code; do not treat it as no findings. |
+| `healthy/not_applicable` | A delayed automatic event no longer applies. | Usually no action; reconcile the current head if a gate decision is still needed. |
+| `unhealthy/not_applicable` | The manual target is invalid or unsupported. | Correct the target or use a supported scope; do not bypass the ruleset. |
+| `unhealthy/unknown` | No trusted state could be read. | Repair access/execution, reread the PR, then use the summary's recovery action. |
 
-### `blocked-configuration`
+Every pending result remains blocking; `healthy/pending` is not a weak
+success.
 
-Check the trusted workflow selection, required ruleset/source binding, GitHub
-App binding, public-wait environments, and activation evidence. Do not retry
-through the composite or fall back to v1.
+`unhealthy/success` is never legal. `healthy/pending` is not a weak success. A
+workflow failure describes evaluator health, not a Codex finding. A normal run
+with `gate_outcome=failure` means the evaluator worked and the merge must
+remain blocked.
 
-### `blocked-input`
+Require the unique canonical verifier run/job/CheckRun recorded against the
+exact current PR feature-head SHA. The verifier still executes on
+`refs/pull/N/merge`; strict
+`GITHUB_REF`/`GITHUB_SHA`, event-scope and fresh-PR checks bind its success to
+the unchanged current head, base and test-merge. For activation, also require
+the canonical run-name receipt
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>` in `display_title`
+and the run's sole PR binding to carry the current feature head and
+default-branch base SHA. A controller CheckRun binds the default-branch commit
+and is not the required signal. The controller must observe a strictly newer
+verifier attempt and its unique job/CheckRun; ambiguous rerun state stays
+blocking. Commit-status projection and the status-POST recovery path have been
+removed.
 
-Check the PR lifecycle, exact base/head/merge-base/test-merge epoch, canonical
-input schema, and controller-generated path ownership. PR-controlled checkout
-files are not valid operation inputs.
+`retry_safe=true` means an immediate rerun with identical inputs is a valid
+recovery action. It does not mean success is likely or that the runtime may
+skip evidence. When false, first perform the head refresh, permission repair,
+provider wait or finding change named by `recovery_code`.
 
-### `inconclusive`
+## Recovery codes
 
-Check complete pagination, scope stability, final reread, evidence grammar,
-request limits, and durable controller history. Preserve the outcome until a
-new complete and stable observation is available; do not reinterpret it as
-clean.
+| Code | Safe next action |
+| --- | --- |
+| `none` | No evaluator recovery is required; perform exact-head merge closure. |
+| `wait_provider` | Wait for Codex to publish terminal evidence; do not spam requests. |
+| `reconcile` | Reread the exact current head and run one scoped reconcile. |
+| `fix_findings` | Fix the reported current findings, separately resolve inline conversations, obtain later head-bound clean evidence, then reconcile. |
+| `request_clean_generation` | Request a strictly newer authorised generation for the same head and wait for clean bound to it; an arbitrary later clean is insufficient. |
+| `retry_reconcile` | Retry the same exact-head reconcile when `retry_safe` permits it. |
+| `wait_then_reconcile` | Let GitHub/Codex settle, reread the head, then reconcile. |
+| `use_expanded_limits` | Set protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`, then reconcile the same exact head. |
+| `raise_protected_limit` | The reviewed profiles are insufficient; change the protected product/configuration limit through ordinary review rather than supplying an ad-hoc number. |
+| `refresh_head` | Read the authoritative current head and start a fresh operation; never make the stale run follow it. |
+| `repair_permissions` | Restore both canonical workflow permission boundaries or the named access boundary, then reconcile. |
+| `retry_begin` | Not immediately retry-safe: wait for the exact same-run marker to settle, then rerun the original workflow run only if it remains absent; do not dispatch a new generation or blindly post duplicates. |
+| `unsupported_target` | Move to a documented supported scope or leave the gate blocked. |
+| `create_verifier_run` | If ready, convert the PR to draft and mark it ready again; if already draft, mark it ready. Verify a new `ready_for_review` verifier for the exact current head/base/test-merge scope, then reconcile. |
 
-### `findings`
+The summary is authoritative for the concrete reason and object links within
+the code category. The table does not authorise guessing around missing data.
 
-Treat the selected trustworthy finding as blocking negative evidence. Resolve
-the finding through the provider-supported review flow, then let a later
-controller observation rebuild the complete snapshot. Do not edit controller
-state to erase it.
+## Finding accounting and supersession
 
-### `pending`
+When derivable without another evidence query, the summary and best-effort
+sticky report:
 
-Follow `due-at` and `wakeup-hints` only through the generated orchestration.
-They are scheduling advice, not evidence. Public routes require the configured
-environment wait and a subsequent server-time-bound observation; a sleeping
-shell step or immediate rerun is not equivalent.
+- `findings_unresolved` — admitted current unresolved non-inline findings;
+- `findings_resolved` — admitted resolved findings in the reducer model;
+- `findings_historical` — superseded or otherwise historical findings retained
+  for audit;
+- `findings_indeterminate` — findings whose current classification cannot be
+  safely resolved.
 
-### `skipped-unavailable`
+An incomplete API read, page set or capped scan makes affected values
+`unknown`, never zero. Counts are diagnostic only. Inline conversations are
+not counted; the ruleset's “all conversations resolved” requirement owns them.
 
-This is a closed v2 decision for an implicitly selected route with a confirmed
-no-start outcome. It does not authorise v1 fallback. An explicitly requested
-route instead remains blocked when its required provider configuration is
-unavailable.
+Any qualifying current-head non-inline finding blocks immediately. It is not a
+permanent lease: on the same head it may be superseded, but only by a strictly
+newer authorised `@codex review` generation followed by clean bound to that
+generation and head. An unrelated later clean, an edited request or ambiguous
+ordering cannot erase it.
 
-## Request-effect recovery
+If the finding is real, fix it and use `fix_findings`. If the code does not need
+to change but the finding is obsolete or inapplicable, use
+`request_clean_generation`. In both cases, reconcile after the later provider
+result; resolving an inline conversation alone does not change reducer state.
 
-Review-request publication is retry-zero. The controller persists a
-reservation, intent, and pre-effect attempt before the one POST, then binds the
-exact 201 response. If the POST result is ambiguous, do not rerun or reclaim
-the effect. Preserve the ledger and investigate from its authoritative effect
-identity.
+Terminal clean text and a qualifying provider `+1` otherwise carry equal clean
+authority. The exception is a PR with an observed base epoch: only a qualifying
+`+1` directly on the latest post-epoch, base-bound canonical request can pass
+or supersede a finding; unlineaged terminal clean remains pending.
 
-Similarly, commit-status and sticky-comment effects are reserved in the
-durable effect ledger before execution. A repeated invocation may reuse an
-already bound response, but it must not replay an attempted, unbound identity.
+Ordinary request reactions are liveness signals only; ordinary `+1` cannot
+head-bind clean. Same-time/later official `eyes`/progress from Codex prevents
+candidate clean from completing. Reaction-only changes do not start an
+automatic run; use a later provider event or manual reconcile to observe them.
 
-## Status and branch-protection checks
+## Stable-snapshot recovery
 
-Before making the gate required, prove in a live canary that:
+Only a clean candidate pays for two independent, fully paginated GitHub reads
+five seconds apart. A same-head request, edit, reaction or other
+decision-relevant change restarts the pair. A changed head or lifecycle makes
+the run stale. API, pagination and cap failures make the read incomplete.
 
-- terminal policy targets the expected test-merge commit;
-- the documented head sentinel is present when required;
-- the latest exact context is `codex/github-review-gate`;
-- remote effect receipts bind the expected repository, PR, epoch, and response;
-- final reread remains stable through the terminal write;
-- an early or missing public wait fails closed.
+If the stability budget ends before two matching clean snapshots, expect
+`unhealthy/pending` with `wait_then_reconcile`:
 
-A generic `github-actions[bot]` creator, matching context text, composite
-success, or runner-temp report path is insufficient on its own.
+1. stop changing PR/provider evidence;
+2. let GitHub and Codex settle;
+3. reread the exact current head; and
+4. dispatch one scoped reconcile.
+
+Do not delete provider evidence, weaken the required status or treat an
+unstable read as clean.
+
+## Large PRs and profiles
+
+Start with the protected repository default profile. If the summary reports
+`use_expanded_limits`, set the reviewed profile as a repository variable
+without modifying either canonical workflow:
+
+```bash
+gh variable set CODEX_REVIEW_GATE_LIMITS_PROFILE \
+  --repo "github.com/$REPO" \
+  --body expanded
+```
+
+Then reread the exact head and run one scoped controller `reconcile`. The
+manual dispatch deliberately has no `limits_profile` input.
+
+Do not edit the canonical wrapper, and do not add temporary `max_pages`,
+`max_objects` or other numeric dispatch inputs. If even `expanded` is
+insufficient, follow `raise_protected_limit` and change the protected limit
+through the product's ordinary review/release path.
+
+## Short-SHA evidence
+
+Provider terminal evidence may name a short reviewed SHA. Runtime asks GitHub
+to resolve it within the relevant PR scope:
+
+- one unambiguous match equal to current head can bind the evidence;
+- no match remains unbound;
+- multiple matches are indeterminate and cannot pass; and
+- a pull-request review must also have native `commit_id` equal to the resolved
+  current head.
+
+Do not edit provider evidence merely to expand a prefix. If it is ambiguous or
+bound to another commit, request a new current-head generation.
+
+## Sticky diagnostic recovery
+
+The sticky is a best-effort report, not a receipt. If it is missing, edited,
+duplicated or stale:
+
+1. leave provider evidence intact;
+2. reread the current head;
+3. run one exact-head reconcile; and
+4. trust the new verifier CheckRun and summary reconstructed from GitHub.
+
+Sticky write failure does not clear findings. Runtime may update the oldest
+canonical diagnostic and warn about later duplicates, but it never needs to
+delete duplicates to decide the gate.
+
+## Exact-head merge closure
+
+Immediately before merge:
+
+1. reread the PR's current head;
+2. dispatch controller `reconcile` with that exact SHA;
+3. observe the strictly newer verifier attempt and its unique canonical
+   `codex/github-review-gate` CheckRun on the current feature-head SHA, with
+   that verifier run bound to the current test-merge;
+4. require `execution_health=healthy`, `gate_outcome=success` and a successful
+   verifier conclusion;
+5. reread unchanged PR head, base and test-merge SHA;
+6. require branch up to date and all conversations resolved; and
+7. require the ruleset to allow the intended merge.
+
+If the head or any gate changes, do not merge; repeat the closure for the new
+state. Otherwise merge immediately with this exact-head compare-and-swap:
+
+```bash
+gh pr merge "$PR_NUMBER" \
+  --repo "github.com/$REPO" \
+  --match-head-commit "$HEAD_SHA"
+```
+
+Stable snapshots do not lock the PR after the run; direct human UI merge
+outside this closure is unsupported.
 
 ## Migrating from v1
 
-Do not edit an existing personal `@v1` caller in place until v2 activation is
-supported. Preserve the frozen v1 workflow while preparing a separately named
-v2 generated caller and canary. After all v2 prerequisites pass, migrate the
-required check to `codex/github-review-gate` under an explicit repository
-rollout plan.
+Use one migration PR to remove the v1 caller and install both canonical v2
+workflows plus managed CODEOWNERS. Keep every inventoried legacy requirement
+active through the migration merge. Bind the canonical read-only legacy inventory SHA-256 in
+the owner approval snapshot, then require a fresh strict inventory with that
+same external digest. It binds repository/default branch, each matching
+ruleset's complete identity, source, enforcement, target, conditions,
+`bypass_actors`, `rules`, and effective `required_status_checks` rule, plus the
+complete classic required-status object including every producer `app_id`.
+Even an empty legacy inventory has a repository/branch-bound digest;
+incomplete API/schema data or any drift fails closed. Then require the owner as
+current actor, the owner's latest exact-head approval and the synchronous
+exact-SHA merge. Immediately reread the current
+default and require merged lifecycle, base, and head to remain the exact
+approved scope. A failed readback keeps all legacy requirements active; only
+success permits Disabled staging to begin while legacy remains active.
+Do not treat approval plus a head reread
+as sufficient, and do not replace v1 with only a bare `uses: ...@v2` step.
 
-Never copy v1 `decision-table.json` settings into v2 controller inputs. The v1
-table is legacy authority for policy major 1 only; v2 selection, evidence,
-decisions, scheduling, and effect ledgers are closed under their own schemas.
+After the installation PR merges:
 
-For the trust and state model, see [DESIGN.md](DESIGN.md). For the public
-interface, see [README.md](README.md).
+1. keep every inventoried legacy requirement active;
+2. stage a separate supplied v2 ruleset as Disabled with no bypass actors;
+3. open a separate harmless canary PR while legacy still blocks merges;
+4. exercise the ordinary `@v2` review/reconcile path;
+5. verify the exact canonical verifier run, native feature-head CheckRun bound
+   to the unchanged head/base/test-merge scope,
+   freshness and conversation enforcement with no same-name collision;
+6. activate the validated ruleset and read the exact complete Active policy
+   back;
+7. through step 6, pass the same owner-approved digest explicitly to every
+   stage/activation preview and apply, even though those helper invocations are
+   separate processes;
+8. only then run read-only `--derive-post-cleanup-plan` against the complete
+   pre-cleanup security snapshot, passing the same external owner-approved
+   legacy-inventory digest as `--expected-legacy-inventory-sha256` and requiring
+   the current pre-state to match it;
+   review its canonical plan, which may remove
+   only `codex/review-gate`; an emptied status rule may be removed and a whole
+   dedicated legacy-only ruleset only when no other rule remains; an emptied
+   classic required-status policy may also disappear; require exact
+   preservation of repository/default head, workflow/CODEOWNERS inventory,
+   owner permission, all fields/non-legacy checks including `strict`/`app_id`
+   in a surviving classic policy, and every retained ruleset's identity,
+   conditions, bypass actors, and unrelated rules; record its
+   `expected_post_cleanup_security_sha256`;
+9. perform the separately authorised legacy cleanup, then run read-only
+   `--verify-post-cleanup --expected-post-cleanup-security-sha256 <digest>`;
+   require two identical complete security rounds that both match the external
+   digest, show both legacy surfaces clear and show the same complete v2 policy
+   Active; and
+10. close the canary PR without merging, verify its recorded head
+    repository/ref/OID, and lease-delete only that still-exact temporary ref.
+
+If the canary fails, repair through ordinary forward Git history. Do not move
+the `v2` release alias backwards and do not weaken the ruleset to manufacture a
+pass. Once v2 has been written Active, an inconclusive cleanup or verification
+also leaves it Active: use read-only diagnostics and never disable or roll it
+back in response.
