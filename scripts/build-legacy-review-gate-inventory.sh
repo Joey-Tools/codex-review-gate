@@ -34,20 +34,20 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
-default_branch_fresh=$(gh repo view "$repository" \
-  --json defaultBranchRef --jq '.defaultBranchRef.name')
+default_branch_fresh=$(gh api --hostname github.com \
+  "repos/$repository" --jq '.default_branch')
 test "$default_branch_fresh" = "$expected_default_branch"
 default_branch_uri=$(jq -rn --arg value "$default_branch_fresh" '$value | @uri')
 
-gh api --paginate --slurp \
+gh api --hostname github.com --paginate --slurp \
   "repos/$repository/rules/branches/$default_branch_uri?per_page=100" \
   > "$ruleset_pages"
 
 classic_endpoint="repos/$repository/branches/$default_branch_uri/protection/required_status_checks"
-if gh api --include --silent "$classic_endpoint" \
+if gh api --hostname github.com --include --silent "$classic_endpoint" \
   > "$classic_headers" 2> "$classic_error"; then
   grep -Eq '^HTTP/[^ ]+ 200 ' "$classic_headers"
-  gh api "$classic_endpoint" > "$classic_status"
+  gh api --hostname github.com "$classic_endpoint" > "$classic_status"
 else
   grep -Eq '^HTTP/[^ ]+ 404 ' "$classic_headers"
   printf 'null\n' > "$classic_status"
@@ -90,7 +90,8 @@ jq -r '[.[][]
       .context == "codex/review-gate"))
   | .ruleset_id] | unique | sort | .[]' "$ruleset_pages" \
   | while IFS= read -r ruleset_id; do
-      gh api "repos/$repository/rulesets/$ruleset_id" > "$ruleset_detail"
+      gh api --hostname github.com \
+        "repos/$repository/rulesets/$ruleset_id" > "$ruleset_detail"
       jq -e '
         type == "object"
         and (.id | type == "number")

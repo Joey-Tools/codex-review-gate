@@ -57,9 +57,9 @@ Maintain these invariants:
 1. Resolve and record the default branch:
 
    ```bash
-   DEFAULT_BRANCH="$(gh repo view "$REPO" \
-     --json defaultBranchRef \
-     --jq '.defaultBranchRef.name')"
+   DEFAULT_BRANCH="$(gh api --hostname github.com \
+     "repos/$REPO" \
+     --jq '.default_branch')"
    test -n "$DEFAULT_BRANCH"
    ```
 
@@ -67,7 +67,7 @@ Maintain these invariants:
    permissions before changing the worktree:
 
    ```bash
-   DEFAULT_WORKFLOW_PERMISSIONS="$(gh api \
+   DEFAULT_WORKFLOW_PERMISSIONS="$(gh api --hostname github.com \
      "repos/$REPO/actions/permissions/workflow" \
      --jq '.default_workflow_permissions')"
    test "$DEFAULT_WORKFLOW_PERMISSIONS" = read
@@ -149,11 +149,11 @@ Maintain these invariants:
    ```bash
    CONTROL_PLANE_LOGIN="${CONTROL_PLANE_OWNER#@}"
    MIGRATION_HEAD="$(gh pr view "$MIGRATION_PR" \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --json headRefOid,state,isDraft \
      --jq 'if .state == "OPEN" and (.isDraft | not) then .headRefOid else error("migration PR is not open and ready") end')"
    REVIEW_PAGES="$(mktemp)"
-   gh api --paginate --slurp \
+   gh api --hostname github.com --paginate --slurp \
      "repos/$REPO/pulls/$MIGRATION_PR/reviews?per_page=100" \
      > "$REVIEW_PAGES"
    jq -e \
@@ -165,7 +165,7 @@ Maintain these invariants:
       | .state == "APPROVED" and ((.commit_id | ascii_downcase) == ($head | ascii_downcase))' \
      "$REVIEW_PAGES"
    rm -f "$REVIEW_PAGES"
-   test "$(gh pr view "$MIGRATION_PR" --repo "$REPO" --json headRefOid --jq .headRefOid)" = "$MIGRATION_HEAD"
+   test "$(gh pr view "$MIGRATION_PR" --repo "github.com/$REPO" --json headRefOid --jq .headRefOid)" = "$MIGRATION_HEAD"
    ```
 
    Stop if `jq -e` fails, the owner is the PR author, the head changes, or a
@@ -211,8 +211,8 @@ Maintain these invariants:
      trap cleanup EXIT
      trap 'exit 130' HUP INT TERM
 
-     DEFAULT_BRANCH_FRESH="$(gh repo view "$REPO" \
-       --json defaultBranchRef --jq '.defaultBranchRef.name')"
+     DEFAULT_BRANCH_FRESH="$(gh api --hostname github.com \
+       "repos/$REPO" --jq '.default_branch')"
      test "$DEFAULT_BRANCH_FRESH" = "$DEFAULT_BRANCH"
      "$SOURCE_ROOT/scripts/build-legacy-review-gate-inventory.sh" \
        "$REPO" "$DEFAULT_BRANCH_FRESH" "$LEGACY_INVENTORY" > /dev/null
@@ -223,17 +223,17 @@ Maintain these invariants:
      test "$FRESH_LEGACY_INVENTORY_SHA256" = \
        "${LEGACY_INVENTORY_SHA256:?external approval-snapshot digest is required}"
 
-     gh pr view "$MIGRATION_PR" --repo "$REPO" \
+     gh pr view "$MIGRATION_PR" --repo "github.com/$REPO" \
        --json author,baseRefName,headRefOid,state,isDraft > "$PR_STATE"
      jq -e --arg base "$DEFAULT_BRANCH_FRESH" --arg head "$MIGRATION_HEAD" \
        --arg owner "$CONTROL_PLANE_LOGIN" \
        '.baseRefName == $base and .headRefOid == $head and .state == "OPEN" and (.isDraft | not)
         and (((.author.login // "") | ascii_downcase) != ($owner | ascii_downcase))' \
        "$PR_STATE"
-     CURRENT_ACTOR="$(gh api user --jq '.login')"
+     CURRENT_ACTOR="$(gh api --hostname github.com user --jq '.login')"
      jq -ne --arg actor "$CURRENT_ACTOR" --arg owner "$CONTROL_PLANE_LOGIN" \
        '($actor | ascii_downcase) == ($owner | ascii_downcase)'
-     gh api --paginate --slurp \
+     gh api --hostname github.com --paginate --slurp \
        "repos/$REPO/pulls/$MIGRATION_PR/reviews?per_page=100" \
        > "$FINAL_REVIEW_PAGES"
      jq -e --arg owner "$CONTROL_PLANE_LOGIN" --arg head "$MIGRATION_HEAD" \
@@ -244,12 +244,13 @@ Maintain these invariants:
 
      jq -n --arg sha "$MIGRATION_HEAD" --arg method "$MERGE_METHOD" \
        '{sha:$sha, merge_method:$method}' > "$MERGE_BODY"
-     gh api --method PUT "repos/$REPO/pulls/$MIGRATION_PR/merge" \
+     gh api --hostname github.com --method PUT \
+       "repos/$REPO/pulls/$MIGRATION_PR/merge" \
        --input "$MERGE_BODY" > "$MERGE_RESPONSE"
      jq -e '.merged == true' "$MERGE_RESPONSE"
-     test "$(gh repo view "$REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')" = \
+     test "$(gh api --hostname github.com "repos/$REPO" --jq '.default_branch')" = \
        "$DEFAULT_BRANCH_FRESH"
-     gh pr view "$MIGRATION_PR" --repo "$REPO" \
+     gh pr view "$MIGRATION_PR" --repo "github.com/$REPO" \
        --json baseRefName,headRefOid,state,mergedAt > "$POST_MERGE_STATE"
      jq -e --arg base "$DEFAULT_BRANCH_FRESH" --arg head "$MIGRATION_HEAD" \
        '.state == "MERGED" and .mergedAt != null and .baseRefName == $base
@@ -279,7 +280,7 @@ Maintain these invariants:
 
    ```bash
    gh pr view "$MIGRATION_PR" \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --json state,mergedAt,headRefOid \
      | jq -e --arg head "$MIGRATION_HEAD" \
        '.state == "MERGED" and .mergedAt != null and ((.headRefOid | ascii_downcase) == ($head | ascii_downcase))'
@@ -399,15 +400,15 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
 
    ```bash
    CANARY_PR="$(gh pr view CANARY_SELECTOR \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --json number \
      --jq '.number')"
    CANARY_BASE="$(gh pr view "$CANARY_PR" \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --json baseRefName \
      --jq '.baseRefName')"
    CANARY_HEAD="$(gh pr view "$CANARY_PR" \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --json headRefOid \
      --jq '.headRefOid')"
    test "$CANARY_BASE" = "$DEFAULT_BRANCH"
@@ -418,7 +419,7 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
    merely to ask for review:
 
    ```bash
-   REQUEST_COMMENT_ID="$(gh api \
+   REQUEST_COMMENT_ID="$(gh api --hostname github.com \
      --method POST \
      "repos/$REPO/issues/$CANARY_PR/comments" \
      -f body='@codex review' \
@@ -468,7 +469,7 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
    ```bash
    DISPATCHED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
    gh workflow run codex-review-gate-controller.yml \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      -f operation=begin-review \
      -f pr_number="$CANARY_PR" \
      -f expected_head_sha="$CANARY_HEAD" \
@@ -484,7 +485,7 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
 
    ```bash
    gh run list \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --workflow codex-review-gate-controller.yml \
      --event workflow_dispatch \
      --created ">=$DISPATCHED_AT" \
@@ -507,7 +508,7 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
    ```bash
    DISPATCHED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
    gh workflow run codex-review-gate-controller.yml \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      -f operation=reconcile \
      -f pr_number="$CANARY_PR" \
      -f expected_head_sha="$CANARY_HEAD" \
@@ -544,7 +545,7 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
 
    ```bash
    gh variable set CODEX_REVIEW_GATE_LIMITS_PROFILE \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --body expanded
    ```
 
@@ -557,7 +558,7 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
 
    ```bash
    gh variable set CODEX_REVIEW_GATE_USE_UBUNTU_LATEST \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --body true
    ```
 
@@ -571,15 +572,15 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
    feature head:
 
    ```bash
-   DEFAULT_BRANCH_HEAD_SHA="$(gh api \
+   DEFAULT_BRANCH_HEAD_SHA="$(gh api --hostname github.com \
      "repos/$REPO/branches/$DEFAULT_BRANCH" \
      --jq '.commit.sha')"
-   CANARY_TEST_MERGE_SHA="$(gh api \
+   CANARY_TEST_MERGE_SHA="$(gh api --hostname github.com \
      "repos/$REPO/pulls/$CANARY_PR" \
      --jq '.merge_commit_sha')"
    test -n "$DEFAULT_BRANCH_HEAD_SHA"
    test -n "$CANARY_TEST_MERGE_SHA"
-   gh api --paginate --slurp \
+   gh api --hostname github.com --paginate --slurp \
      "repos/$REPO/commits/$CANARY_HEAD/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100" \
      --jq '[.[].check_runs[] | {id, status, conclusion, head_sha, app: .app.id, details_url}]'
    ```
@@ -642,9 +643,9 @@ inconclusive, not absent. Do not activate v2 before the canary passes.
 6. Close the canary without merging and delete only its temporary branch:
 
    ```bash
-   gh pr close "$CANARY_PR" --repo "$REPO" --delete-branch
+   gh pr close "$CANARY_PR" --repo "github.com/$REPO" --delete-branch
    gh pr view "$CANARY_PR" \
-     --repo "$REPO" \
+     --repo "github.com/$REPO" \
      --json state,mergedAt
    ```
 

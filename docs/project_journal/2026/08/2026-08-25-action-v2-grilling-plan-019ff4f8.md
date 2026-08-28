@@ -1635,6 +1635,56 @@ superseded_by:
   - `npm run check`: passed;
   - project-journal validation and `git diff --check`: passed.
 
+### Whole-Range Review At The Paginated-Canary Checkpoint
+
+- A fifth independent review covered
+  `10217253306ca2ee6f312f766a331f8924e26e47..866ee16f1ba7e69133e72266f23c10c638dce559`
+  in a clean detached no-local clone at tree
+  `91ceca54c30af3783796709d8e82b48731e9dca8`. The dedicated reviewer role
+  remained unavailable, so the explicitly authorized zero-context ordinary
+  `gpt-5.6-sol` / `ultra` fallback reviewed all 14 commits and 89 changed paths.
+- The reviewer retained one P1 and one P3:
+  - the GitHub.com-only installation transaction did not pin every executable
+    `gh` read and merge write to `github.com`; a hostile ambient `GH_HOST` plus
+    a same-slug GHES mirror could make the legacy inventory, owner/review
+    authorization, and final merge PUT self-consistent on the wrong host;
+  - the runtime appended a healthy success summary before persisting required
+    `GITHUB_OUTPUT` values, so an output-write failure could leave that success
+    block followed by an unhealthy recovery block. The native CheckRun still
+    failed closed, but the Actions page no longer had one authoritative final
+    summary.
+- The adopted remediation is explicit GitHub.com binding for every executable
+  helper and installation-transaction `gh` operation, with hostile-`GH_HOST`
+  regression coverage. Runtime finalization must persist all required outputs
+  before appending the success summary, so a persistence failure reaches the
+  recovery path without any stale success projection. Both remediations require
+  focused/full validation, a signed checkpoint, and another fresh whole-range
+  review before delivery.
+- The host-binding remediation removes `gh repo view` from the legacy inventory
+  helper and pins all of its REST reads with `--hostname github.com`. Across all
+  executable shell blocks in the four installation guides, every `gh api` call
+  now carries that explicit hostname and every `gh pr`, `gh workflow`, `gh run`,
+  and `gh variable` operation uses the host-qualified
+  `--repo "github.com/$REPO"`. A closed command classifier fails the docs
+  contract on an unknown executable `gh` family, while the dynamic helper test
+  runs under hostile `GH_HOST` and rejects any unpinned request.
+- Runtime finalization now writes required `GITHUB_OUTPUT` values before it
+  appends the ordinary final summary. If output persistence fails, the top-level
+  recovery path downgrades the report and invokes an explicit failure-only
+  finalization mode: it may append the single unhealthy summary even though the
+  output path remains broken, then exits nonzero. A regression with a writable
+  summary path and a directory in place of `GITHUB_OUTPUT` requires exactly one
+  summary heading, one unhealthy result, and no healthy/success projection.
+- Final validation on the frozen remediation working tree passed:
+  - `npm test -- --test-reporter=dot`: 714 of 714 passed, 0 failed;
+  - focused runtime suite: 76 of 76 passed;
+  - focused v2 suite: 85 of 85 passed;
+  - workflow-security contract: 31 of 31 passed;
+  - `npm run check`: passed;
+  - `bash -n` and ShellCheck 0.11.0 passed for the changed legacy inventory
+    helper;
+  - project-journal validation and `git diff --check` passed.
+
 ### Verified Two-Workflow Platform Boundaries And Resolution
 
 - Required-CheckRun source selection is not workflow provenance. GitHub's

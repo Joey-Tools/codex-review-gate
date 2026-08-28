@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -260,6 +261,29 @@ test("pull_request verifier publishes exact outputs and succeeds only for stable
     assert.match(body.query, /BASE_REF_FORCE_PUSHED_EVENT/u);
     assert.match(body.query, /timelineItems\(\s*last: 1/su);
   }
+});
+
+test("output persistence failure leaves one authoritative unhealthy summary", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "output-persistence-failure" });
+  mkdirSync(environment.GITHUB_OUTPUT);
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "unknown");
+  assert.equal(result.report.recoveryCode, "repair_permissions");
+  assert.equal(result.report.retrySafe, false);
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.equal(summary.match(/^## Codex GitHub Review Gate$/gmu)?.length, 1);
+  assert.equal(summary.match(/Execution health: \*\*unhealthy\*\*/gu)?.length, 1);
+  assert.doesNotMatch(summary, /Execution health: \*\*healthy\*\*/u);
+  assert.doesNotMatch(summary, /Gate outcome: \*\*success\*\*/u);
+  assert.match(summary, /Failed to persist the v2 gate report/iu);
 });
 
 test("the JavaScript Action reads INPUT_* values without composite env bridging", async (context) => {

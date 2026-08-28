@@ -1202,7 +1202,7 @@ export async function runV2GateCli({
         persistV2ReportFiles(config || {
           outputPath: environment.GITHUB_OUTPUT || "",
           summaryPath: environment.GITHUB_STEP_SUMMARY || "",
-        }, report, context);
+        }, report, context, { allowSummaryAfterOutputFailure: true });
       } catch (finalReportError) {
         console.error(
           `failed to persist final unhealthy v2 gate report: ${finalReportError.message}`,
@@ -2264,19 +2264,26 @@ function normalizeV2FailureCounts(counts) {
   };
 }
 
-function persistV2ReportFiles(config, report, context) {
+function persistV2ReportFiles(config, report, context, {
+  allowSummaryAfterOutputFailure = false,
+} = {}) {
   const failures = [];
-  try {
-    appendV2GateSummary(config.summaryPath || "", report, context);
-  } catch (error) {
-    failures.push(`step summary: ${error.message}`);
-  }
+  let outputFailed = false;
   if (config.outputPath) {
     try {
       writeV2GateOutputs(config.outputPath, report);
     } catch (error) {
+      outputFailed = true;
       failures.push(`Action outputs: ${error.message}`);
     }
+  }
+  if (outputFailed && !allowSummaryAfterOutputFailure) {
+    throw new V2RuntimeFailure(`Failed to persist v2 report (${failures.join("; ")})`);
+  }
+  try {
+    appendV2GateSummary(config.summaryPath || "", report, context);
+  } catch (error) {
+    failures.push(`step summary: ${error.message}`);
   }
   if (failures.length > 0) {
     throw new V2RuntimeFailure(`Failed to persist v2 report (${failures.join("; ")})`);

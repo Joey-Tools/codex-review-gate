@@ -416,7 +416,33 @@ test("installation bootstrap invocations bind the owner exactly once", () => {
   }
 });
 
-test("legacy inventory helper builds canonical output from complete GitHub fixtures", () => {
+test("all executable install-guide gh commands pin github.com", () => {
+  for (const [name, guide] of Object.entries(installGuides)) {
+    const invocations = executableGhInvocations(guide);
+    assert.ok(invocations.length > 0, `${name}: missing executable gh guidance`);
+    for (const { command, text } of invocations) {
+      if (command === "api") {
+        assert.match(
+          text,
+          /^gh api --hostname github\.com\b/u,
+          `${name}: gh api must explicitly bind github.com:\n${text}`,
+        );
+        continue;
+      }
+      assert.ok(
+        ["pr", "run", "variable", "workflow"].includes(command),
+        `${name}: unclassified executable gh command:\n${text}`,
+      );
+      assert.match(
+        text,
+        /--repo "github\.com\/\$REPO"/u,
+        `${name}: gh ${command} must bind github.com in --repo:\n${text}`,
+      );
+    }
+  }
+});
+
+test("legacy inventory helper pins github.com despite hostile GH_HOST and builds canonical output", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-inventory-test-"));
   try {
     const fixtureBin = join(fixtureRoot, "bin");
@@ -426,14 +452,11 @@ test("legacy inventory helper builds canonical output from complete GitHub fixtu
       fakeGh,
       String.raw`#!/usr/bin/env bash
 set -euo pipefail
-if [[ $1 == repo && $2 == view ]]; then
-  printf 'main\n'
-  exit 0
-fi
-if [[ $1 != api ]]; then
+if [[ $1 != api || $2 != --hostname || $3 != github.com ]]; then
+  printf 'GitHub API request is not pinned to github.com\n' >&2
   exit 90
 fi
-shift
+shift 3
 if [[ $1 == --paginate ]]; then
   if [[ $FIXTURE_MALFORMED == parameters ]]; then
     printf '%s\n' '[[{"type":"required_status_checks","ruleset_id":7,"parameters":{"strict_required_status_checks_policy":"not-a-boolean","required_status_checks":{}}}]]'
@@ -454,6 +477,9 @@ if [[ $1 == --include ]]; then
   exit 0
 fi
 case "$1" in
+  repos/OWNER/REPO)
+    printf 'main\n'
+    ;;
   repos/OWNER/REPO/branches/main/protection/required_status_checks)
     if [[ $FIXTURE_MALFORMED == classic-missing-strict ]]; then
       printf '%s\n' '{"contexts":["codex/review-gate"],"checks":[{"context":"codex/review-gate","app_id":15368}]}'
@@ -505,6 +531,7 @@ esac
           encoding: "utf8",
           env: {
             ...process.env,
+            GH_HOST: "hostile.invalid",
             PATH: `${fixtureBin}:${process.env.PATH}`,
             TMPDIR: fixtureRoot,
             FIXTURE_BYPASS: "",
@@ -676,7 +703,7 @@ esac
   }
 });
 
-test("installation runbooks close the initial trust-bootstrap merge on the approved head", () => {
+test("installation runbooks pin github.com and close the trust-bootstrap merge on the approved head", () => {
   const headings = {
     "human.md": "## 1. Create and merge the migration PR",
     "human.zh-CN.md": "## 1. 创建并合并 migration PR",
@@ -688,6 +715,13 @@ test("installation runbooks close the initial trust-bootstrap merge on the appro
   assert.match(legacyInventoryHelper, /\[\[ \$# -ne 3 \]\]/u);
   assert.match(legacyInventoryHelper, /trap cleanup EXIT/u);
   assert.match(legacyInventoryHelper, /trap 'exit 130' HUP INT TERM/u);
+  assert.doesNotMatch(legacyInventoryHelper, /\bgh repo\b/u);
+  assert.equal(
+    (legacyInventoryHelper.match(/\bgh api\b/gu) ?? []).length,
+    (legacyInventoryHelper.match(/\bgh api --hostname github\.com\b/gu) ?? [])
+      .length,
+    "every legacy inventory API read must be pinned to github.com",
+  );
   assert.match(legacyInventoryHelper, /repos\/\$repository\/rules\/branches\//u);
   assert.match(legacyInventoryHelper, /protection\/required_status_checks/u);
   assert.match(legacyInventoryHelper, /all\(\.\[\]; type == "array"\)/u);
@@ -770,7 +804,9 @@ test("installation runbooks close the initial trust-bootstrap merge on the appro
   for (const [name, heading] of Object.entries(headings)) {
     const trustBootstrap = markdownSection(installGuides[name], heading);
     const transactions = shellCodeBlocks(trustBootstrap).filter((block) =>
-      block.includes('gh api --method PUT "repos/$REPO/pulls/$MIGRATION_PR/merge"'),
+      /gh api --hostname github\.com --method PUT[\s\S]{0,80}"repos\/\$REPO\/pulls\/\$MIGRATION_PR\/merge"/u.test(
+        block,
+      ),
     );
     assert.equal(transactions.length, 1, `${name}: expected one fail-fast transaction`);
     const [transaction] = transactions;
@@ -805,7 +841,11 @@ test("installation runbooks close the initial trust-bootstrap merge on the appro
       name,
     );
     assert.match(transaction, /\.author\.login[\s\S]{0,100}ascii_downcase[\s\S]{0,100}!= \(\$owner \| ascii_downcase\)/u, name);
-    assert.match(transaction, /CURRENT_ACTOR="\$\(gh api user --jq '\.login'\)"/u, name);
+    assert.match(
+      transaction,
+      /CURRENT_ACTOR="\$\(gh api --hostname github\.com user --jq '\.login'\)"/u,
+      name,
+    );
     assert.match(transaction, /\(\$actor \| ascii_downcase\) == \(\$owner \| ascii_downcase\)/u, name);
     assert.match(transaction, /\.user\.type == "User"/u, name);
     assert.match(transaction, /\| sort_by\(\[\.submitted_at, \.id\]\) \| last/u, name);
@@ -830,7 +870,7 @@ test("installation runbooks close the initial trust-bootstrap merge on the appro
       "pulls/$MIGRATION_PR/reviews?per_page=100",
     );
     const mergeIndex = transaction.indexOf(
-      'gh api --method PUT "repos/$REPO/pulls/$MIGRATION_PR/merge"',
+      "gh api --hostname github.com --method PUT",
     );
     assert.ok(
       freshHashIndex >= 0 &&
@@ -848,7 +888,7 @@ test("installation runbooks close the initial trust-bootstrap merge on the appro
     const finalRead = transaction.slice(finalReviewApiIndex, mergeIndex);
     assert.match(
       transaction,
-      /gh api --paginate --slurp[\s\S]{0,160}pulls\/\$MIGRATION_PR\/reviews\?per_page=100/u,
+      /gh api --hostname github\.com --paginate --slurp[\s\S]{0,160}pulls\/\$MIGRATION_PR\/reviews\?per_page=100/u,
       name,
     );
     assert.match(finalRead, /sort_by\(\[\.submitted_at, \.id\]\)/u, name);
@@ -864,20 +904,29 @@ test("installation runbooks close the initial trust-bootstrap merge on the appro
     assert.match(transaction, /--arg method "\$MERGE_METHOD"/u, name);
     assert.match(transaction, /jq -e '\.merged == true' "\$MERGE_RESPONSE"/u, name);
     assert.equal(
-      (transaction.match(/gh api --method PUT "repos\/\$REPO\/pulls\/\$MIGRATION_PR\/merge"[\s\S]{0,100}--input "\$MERGE_BODY"/gu) ?? []).length,
+      (transaction.match(/gh api --hostname github\.com --method PUT[\s\S]{0,100}"repos\/\$REPO\/pulls\/\$MIGRATION_PR\/merge"[\s\S]{0,100}--input "\$MERGE_BODY"/gu) ?? []).length,
       1,
       `${name}: exactly one synchronous merge mutation is allowed`,
     );
     assert.equal(
-      (transaction.match(/\bgh api --method PUT\b/gu) ?? []).length,
+      (transaction.match(/\bgh api --hostname github\.com --method PUT\b/gu) ?? []).length,
       1,
       `${name}: transaction must contain exactly one PUT mutation`,
     );
     assert.doesNotMatch(transaction, /gh pr merge|--auto|--admin|merge_queue|enqueue|graphql|enablePullRequestAutoMerge/u, name);
-    assert.doesNotMatch(transaction, /gh api --method (?:POST|PATCH|DELETE)\b/u, name);
-    assert.equal((transaction.match(/gh api --method\s+\S+/gu) ?? []).length, 1, name);
+    assert.doesNotMatch(
+      transaction,
+      /gh api --hostname github\.com --method (?:POST|PATCH|DELETE)\b/u,
+      name,
+    );
+    assert.equal(
+      (transaction.match(/gh api --hostname github\.com --method\s+\S+/gu) ?? [])
+        .length,
+      1,
+      name,
+    );
     const postMergeRegion = transaction.slice(mergeIndex);
-    const defaultReadIndex = postMergeRegion.indexOf("defaultBranchRef.name");
+    const defaultReadIndex = postMergeRegion.indexOf(".default_branch");
     const postMergeReadIndex = postMergeRegion.indexOf('--json baseRefName,headRefOid,state,mergedAt');
     assert.ok(defaultReadIndex >= 0 && postMergeReadIndex > defaultReadIndex, `${name}: current default precedes PR readback`);
     assert.ok(postMergeReadIndex >= 0, `${name}: post-merge state readback follows PUT`);
@@ -905,7 +954,7 @@ test("installation runbooks close the initial trust-bootstrap merge on the appro
     assert.match(trustBootstrap, /(?:head-only reread|只重读 head)/iu, name);
     assert.match(trustBootstrap, /405\/409/u, name);
     const globalMergeIndex = trustBootstrap.indexOf(
-      'gh api --method PUT "repos/$REPO/pulls/$MIGRATION_PR/merge"',
+      "gh api --hostname github.com --method PUT",
     );
     const afterMerge = trustBootstrap.slice(globalMergeIndex);
     const lifecycleReadIndex = afterMerge.indexOf('--json baseRefName,headRefOid,state,mergedAt');
@@ -1246,7 +1295,7 @@ test("installation guides preserve the feature-head CheckRun and test-merge exec
     assert.match(guide, /codex\/github-review-gate/u, name);
     assert.match(
       guide,
-      /gh api --paginate --slurp[\s\S]{0,220}check-runs\?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100[\s\S]{0,160}\.\[\]\.check_runs\[\]/u,
+      /gh api --hostname github\.com --paginate --slurp[\s\S]{0,220}check-runs\?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100[\s\S]{0,160}\.\[\]\.check_runs\[\]/u,
       `${name}: canary CheckRun inventory must be server-filtered and completely paginated`,
     );
   }
@@ -1732,6 +1781,27 @@ function shellInvocations(source, startPattern) {
         invocation.push(lines[index]);
       }
       invocations.push(invocation.join("\n"));
+    }
+  }
+  return invocations;
+}
+
+function executableGhInvocations(source) {
+  const invocations = [];
+  for (const block of shellCodeBlocks(source)) {
+    const lines = block.split(/\r?\n/u);
+    for (let index = 0; index < lines.length; index += 1) {
+      const match = lines[index].match(/\bgh ([a-z][a-z-]*)\b/u);
+      if (match === null) {
+        continue;
+      }
+      const invocation = [lines[index].slice(match.index)];
+      while (invocation.at(-1).trimEnd().endsWith("\\")) {
+        index += 1;
+        assert.ok(index < lines.length, "unterminated gh shell continuation");
+        invocation.push(lines[index]);
+      }
+      invocations.push({ command: match[1], text: invocation.join("\n") });
     }
   }
   return invocations;

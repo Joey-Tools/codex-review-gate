@@ -112,10 +112,10 @@ Before changing the consumer worktree, perform a read-only preflight:
 
 ```bash
 REPO=OWNER/REPO
-DEFAULT_BRANCH="$(gh repo view "$REPO" \
-  --json defaultBranchRef \
-  --jq '.defaultBranchRef.name')"
-DEFAULT_WORKFLOW_PERMISSIONS="$(gh api \
+DEFAULT_BRANCH="$(gh api --hostname github.com \
+  "repos/$REPO" \
+  --jq '.default_branch')"
+DEFAULT_WORKFLOW_PERMISSIONS="$(gh api --hostname github.com \
   "repos/$REPO/actions/permissions/workflow" \
   --jq '.default_workflow_permissions')"
 test -n "$DEFAULT_BRANCH"
@@ -237,8 +237,8 @@ repository-approved merge method:
   trap cleanup EXIT
   trap 'exit 130' HUP INT TERM
 
-  DEFAULT_BRANCH_FRESH="$(gh repo view "$REPO" \
-    --json defaultBranchRef --jq '.defaultBranchRef.name')"
+  DEFAULT_BRANCH_FRESH="$(gh api --hostname github.com \
+    "repos/$REPO" --jq '.default_branch')"
   test "$DEFAULT_BRANCH_FRESH" = "$DEFAULT_BRANCH"
   "$SOURCE_ROOT/scripts/build-legacy-review-gate-inventory.sh" \
     "$REPO" "$DEFAULT_BRANCH_FRESH" "$LEGACY_INVENTORY" > /dev/null
@@ -251,17 +251,17 @@ repository-approved merge method:
   test "$FRESH_LEGACY_INVENTORY_SHA256" = \
     "${LEGACY_INVENTORY_SHA256:?external approval-snapshot digest is required}"
 
-  gh pr view "$MIGRATION_PR" --repo "$REPO" \
+  gh pr view "$MIGRATION_PR" --repo "github.com/$REPO" \
     --json author,baseRefName,headRefOid,state,isDraft > "$PR_STATE"
   jq -e --arg base "$DEFAULT_BRANCH_FRESH" --arg head "$MIGRATION_HEAD" \
     --arg owner "$CONTROL_PLANE_LOGIN" \
     '.baseRefName == $base and .headRefOid == $head and .state == "OPEN" and (.isDraft | not)
      and (((.author.login // "") | ascii_downcase) != ($owner | ascii_downcase))' \
     "$PR_STATE"
-  CURRENT_ACTOR="$(gh api user --jq '.login')"
+  CURRENT_ACTOR="$(gh api --hostname github.com user --jq '.login')"
   jq -ne --arg actor "$CURRENT_ACTOR" --arg owner "$CONTROL_PLANE_LOGIN" \
     '($actor | ascii_downcase) == ($owner | ascii_downcase)'
-  gh api --paginate --slurp \
+  gh api --hostname github.com --paginate --slurp \
     "repos/$REPO/pulls/$MIGRATION_PR/reviews?per_page=100" \
     > "$FINAL_REVIEW_PAGES"
   jq -e --arg owner "$CONTROL_PLANE_LOGIN" --arg head "$MIGRATION_HEAD" \
@@ -272,12 +272,13 @@ repository-approved merge method:
 
   jq -n --arg sha "$MIGRATION_HEAD" --arg method "$MERGE_METHOD" \
     '{sha:$sha, merge_method:$method}' > "$MERGE_BODY"
-  gh api --method PUT "repos/$REPO/pulls/$MIGRATION_PR/merge" \
+  gh api --hostname github.com --method PUT \
+    "repos/$REPO/pulls/$MIGRATION_PR/merge" \
     --input "$MERGE_BODY" > "$MERGE_RESPONSE"
   jq -e '.merged == true' "$MERGE_RESPONSE"
-  test "$(gh repo view "$REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')" = \
+  test "$(gh api --hostname github.com "repos/$REPO" --jq '.default_branch')" = \
     "$DEFAULT_BRANCH_FRESH"
-  gh pr view "$MIGRATION_PR" --repo "$REPO" \
+  gh pr view "$MIGRATION_PR" --repo "github.com/$REPO" \
     --json baseRefName,headRefOid,state,mergedAt > "$POST_MERGE_STATE"
   jq -e --arg base "$DEFAULT_BRANCH_FRESH" --arg head "$MIGRATION_HEAD" \
     '.state == "MERGED" and .mergedAt != null and .baseRefName == $base
@@ -404,7 +405,7 @@ coordinated. For example:
 
 ```bash
 gh workflow run codex-review-gate-controller.yml \
-  --repo OWNER/REPO \
+  --repo "github.com/$REPO" \
   -f operation=begin-review \
   -f pr_number=PR_NUMBER \
   -f expected_head_sha=FULL_HEAD_SHA \
@@ -416,7 +417,7 @@ dispatch, locate the new run and read it back:
 
 ```bash
 gh run list \
-  --repo OWNER/REPO \
+  --repo "github.com/$REPO" \
   --workflow codex-review-gate-controller.yml \
   --event workflow_dispatch \
   --limit 10 \
@@ -432,7 +433,7 @@ automatic bot-comment run already completed:
 
 ```bash
 gh workflow run codex-review-gate-controller.yml \
-  --repo OWNER/REPO \
+  --repo "github.com/$REPO" \
   -f operation=reconcile \
   -f pr_number=PR_NUMBER \
   -f expected_head_sha=FULL_HEAD_SHA \
@@ -457,7 +458,7 @@ when the summary reports `use_expanded_limits`:
 
 ```bash
 gh variable set CODEX_REVIEW_GATE_LIMITS_PROFILE \
-  --repo OWNER/REPO \
+  --repo "github.com/$REPO" \
   --body expanded
 ```
 
