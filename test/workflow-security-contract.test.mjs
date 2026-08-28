@@ -1308,12 +1308,17 @@ function parseVerifierWorkflow(source) {
   const root = yamlRoot(source);
   assert.deepEqual(blockDirectKeys(root), [
     "name",
+    "run-name",
     "on",
     "permissions",
     "concurrency",
     "jobs",
   ]);
   assert.equal(blockScalar(root, "name"), "Codex Review Gate Verifier");
+  assert.equal(
+    blockScalar(root, "run-name"),
+    "codex-review-gate-verifier/${{ github.event.pull_request.number }}/${{ github.sha }}",
+  );
 
   const events = blockChild(root, "on");
   assert.deepEqual(blockDirectKeys(events), ["pull_request"]);

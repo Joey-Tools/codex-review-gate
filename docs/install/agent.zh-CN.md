@@ -514,9 +514,13 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
 2. 读取当前 exact test-merge SHA 与 exact feature-head 上的原生 CheckRun：
 
    ```bash
+   DEFAULT_BRANCH_HEAD_SHA="$(gh api \
+     "repos/$REPO/branches/$DEFAULT_BRANCH" \
+     --jq '.commit.sha')"
    CANARY_TEST_MERGE_SHA="$(gh api \
      "repos/$REPO/pulls/$CANARY_PR" \
      --jq '.merge_commit_sha')"
+   test -n "$DEFAULT_BRANCH_HEAD_SHA"
    test -n "$CANARY_TEST_MERGE_SHA"
    gh api "repos/$REPO/commits/$CANARY_HEAD/check-runs" \
      --jq '[.check_runs[] | select(.name == "codex/github-review-gate")] | map({id, status, conclusion, head_sha, app: .app.id, details_url})'
@@ -526,8 +530,12 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
    `head_sha=$CANARY_HEAD`、GitHub Actions App ID 为 `15368`、
    `conclusion=success`。canonical `pull_request` verifier 在 `refs/pull/N/merge` 上执行；
    Action 内部严格校验 `GITHUB_REF`、`GITHUB_SHA`、event PR head/base/test-merge SHAs 与
-   fresh PR read。把该 feature-head CheckRun 绑定到 controller 报告的 strictly newer
-   verifier attempt，并要求该 attempt 在执行语义上绑定 `CANARY_TEST_MERGE_SHA`。
+   fresh PR read。要求该 run 的 exact `display_title` 为
+   `codex-review-gate-verifier/$CANARY_PR/$CANARY_TEST_MERGE_SHA`，且唯一
+   `pull_requests` binding 含 current feature head 与
+   `base.sha=$DEFAULT_BRANCH_HEAD_SHA`。把该 feature-head CheckRun 绑定到 controller 报告的
+   strictly newer verifier attempt，并要求该 attempt 在执行语义上绑定
+   `CANARY_TEST_MERGE_SHA`。
    Verifier summary 还必须报告 `execution_health=healthy`、`gate_outcome=success`。当前
    head、base 或 test-merge SHA 任一变化都会使结果失效。
 
@@ -551,7 +559,7 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
 
    对于 active ruleset，Helper 必须在 mutation 立即前重读 authority，随后才执行 POST/PUT。
    该重读包括 canary lifecycle、base/head、test-merge SHA、exact feature-head verifier
-   run/job/CheckRun
+   run/job/CheckRun、canonical `display_title`、唯一 PR head/base binding
    与 collision inventory，以及 exact default-branch workflow inventory、
    CODEOWNERS errors 与 owner permission；并在 write 后
    读回 exact ruleset 与完整 consumer security snapshot。要求 active default-branch
@@ -582,8 +590,9 @@ inconclusive，不能当作 absent。Canary pass 前不得 activate。
    要求 `state=CLOSED`、`mergedAt=null`。
 
 6. 报告 migration PR、closed-unmerged canary PR、两份 canonical workflow paths、active
-   ruleset ID、successful canary exact feature head/bound test-merge SHA 与 verifier run URL，以及持久 profile、runner 或
-   request-author-policy variables。
+   ruleset ID、successful canary exact feature head、bound default-branch
+   base/test-merge SHA、canonical run-name receipt 与 verifier run URL，以及持久 profile、
+   runner 或 request-author-policy variables。
 
 本流程没有 cron recovery loop。Bot event 丢失，或 evidence 只通过 review/reaction 到达
 时，对该 PR dispatch 一个 exact-head `reconcile`，并执行它报告的恢复动作。

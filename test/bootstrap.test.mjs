@@ -23,6 +23,8 @@ import {
   DEFAULT_CONTROL_PLANE_OWNER,
   DEFAULT_STATUS_CONTEXT,
   DEFAULT_STATUS_INTEGRATION_ID,
+  DEFAULT_VERIFIER_RUN_NAME,
+  DEFAULT_VERIFIER_RUN_NAME_PREFIX,
   DEFAULT_WORKFLOW_PATH,
   LEGACY_STATUS_CONTEXT,
   assertDirectoryWitnessStable,
@@ -1606,6 +1608,29 @@ test("parent revalidation ignores benign child-entry churn", () => {
 test("validates exact canonical v2 workflow shape and remote bytes", () => {
   const canonical = canonicalWorkflowFixture();
   assert.equal(validateCanonicalV2WorkflowContent(canonical), canonical);
+  for (const [name, invalid] of [
+    [
+      "omitted run-name",
+      canonical.replace(`run-name: ${DEFAULT_VERIFIER_RUN_NAME}\n`, ""),
+    ],
+    [
+      "tampered run-name",
+      canonical.replace(DEFAULT_VERIFIER_RUN_NAME, "attacker/${{ github.sha }}"),
+    ],
+    [
+      "duplicate quoted run-name",
+      canonical.replace(
+        `run-name: ${DEFAULT_VERIFIER_RUN_NAME}\n`,
+        `run-name: ${DEFAULT_VERIFIER_RUN_NAME}\n'run-name': attacker\n`,
+      ),
+    ],
+  ]) {
+    assert.throws(
+      () => validateCanonicalV2WorkflowContent(invalid),
+      /exactly one top-level run-name/u,
+      name,
+    );
+  }
   assert.equal(installedWorkflowMatchesCanonical(canonical, canonical), true);
   assert.equal(installedWorkflowMatchesCanonical(`${canonical}\n`, canonical), false);
   assert.equal(workflowContainsLegacyV1Caller(canonical), false);
@@ -3249,6 +3274,41 @@ test("activation rejects spoofed source bindings and stale feature-head subjects
         /does not resolve to a successful current pull_request run/u,
       ],
       [
+        "stale-run-base",
+        {},
+        {
+          pull_requests: [canonicalCanaryRunPullRequestFixture(repoSlug, {
+            baseSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          })],
+        },
+        {},
+        /does not resolve to a successful current pull_request run/u,
+      ],
+      [
+        "missing-test-merge-receipt",
+        {},
+        { display_title: undefined },
+        {},
+        /lacks the exact current test-merge run-name receipt/u,
+      ],
+      [
+        "stale-test-merge-receipt",
+        {},
+        {
+          display_title:
+            `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/7/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`,
+        },
+        {},
+        /lacks the exact current test-merge run-name receipt/u,
+      ],
+      [
+        "wrong-test-merge-receipt",
+        {},
+        { display_title: `other-verifier/7/${CANARY_MERGE_SHA}` },
+        {},
+        /lacks the exact current test-merge run-name receipt/u,
+      ],
+      [
         "stale-checkrun-feature-head",
         { head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
         {},
@@ -3413,6 +3473,54 @@ test("activation update refuses default-branch and workflow drift between securi
           };
         },
         /differs from the canonical v2 verifier workflow bytes/u,
+      ],
+      [
+        "run-name-omitted",
+        (responses) => {
+          responses[`repos/${repoSlug}/git/blobs/canonical-blob`] = {
+            __fake_sequence: [
+              {
+                encoding: "base64",
+                content: Buffer.from(CANONICAL_WORKFLOW, "utf8").toString("base64"),
+              },
+              {
+                encoding: "base64",
+                content: Buffer.from(
+                  CANONICAL_WORKFLOW.replace(
+                    `run-name: ${DEFAULT_VERIFIER_RUN_NAME}\n`,
+                    "",
+                  ),
+                  "utf8",
+                ).toString("base64"),
+              },
+            ],
+          };
+        },
+        /exactly one top-level run-name/u,
+      ],
+      [
+        "run-name-tampered",
+        (responses) => {
+          responses[`repos/${repoSlug}/git/blobs/canonical-blob`] = {
+            __fake_sequence: [
+              {
+                encoding: "base64",
+                content: Buffer.from(CANONICAL_WORKFLOW, "utf8").toString("base64"),
+              },
+              {
+                encoding: "base64",
+                content: Buffer.from(
+                  CANONICAL_WORKFLOW.replace(
+                    DEFAULT_VERIFIER_RUN_NAME,
+                    "attacker/${{ github.sha }}",
+                  ),
+                  "utf8",
+                ).toString("base64"),
+              },
+            ],
+          };
+        },
+        /exactly one top-level run-name/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
@@ -3759,25 +3867,15 @@ function canaryRunResponses(repoSlug, overrides = {}) {
       repository: { full_name: repoSlug },
       head_repository: { full_name: repoSlug },
       path: DEFAULT_WORKFLOW_PATH,
+      display_title:
+        `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/7/${CANARY_MERGE_SHA}`,
       head_sha: CANARY_HEAD_SHA,
       event: "pull_request",
       status: "completed",
       conclusion: "success",
       workflow_id: CANARY_WORKFLOW_ID,
       run_attempt: 1,
-      pull_requests: [
-        {
-          number: 7,
-          head: {
-            sha: CANARY_HEAD_SHA,
-            repo: { full_name: repoSlug },
-          },
-          base: {
-            ref: "master",
-            repo: { full_name: repoSlug },
-          },
-        },
-      ],
+      pull_requests: [canonicalCanaryRunPullRequestFixture(repoSlug)],
       ...overrides,
     },
     [`repos/${repoSlug}/actions/workflows/${CANARY_WORKFLOW_ID}`]: {
@@ -3800,6 +3898,24 @@ function canaryRunResponses(repoSlug, overrides = {}) {
         check_runs: [canonicalCanaryCheckRunFixture(repoSlug)],
       },
     ],
+  };
+}
+
+function canonicalCanaryRunPullRequestFixture(
+  repoSlug,
+  { baseSha = DEFAULT_BRANCH_SHA } = {},
+) {
+  return {
+    number: 7,
+    head: {
+      sha: CANARY_HEAD_SHA,
+      repo: { full_name: repoSlug },
+    },
+    base: {
+      ref: "master",
+      sha: baseSha,
+      repo: { full_name: repoSlug },
+    },
   };
 }
 

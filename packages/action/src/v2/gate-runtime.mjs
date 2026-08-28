@@ -1465,7 +1465,7 @@ async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
   const currentPr = await loadV2PullRequest(client, config, budget);
   assertV2ExpectedSnapshotScope(currentPr, config);
   assertV2BeginReviewScopeSnapshot(currentPr, config, pullRequest);
-  const inventory = await listCurrentV2VerifierRuns(client, config, currentPr, budget);
+  const inventory = await listCurrentV2VerifierRuns(client, config, budget);
   const current = selectCurrentV2VerifierRun(inventory, config, currentPr);
   if (!current) {
     throw missingV2VerifierRunFailure(
@@ -1484,6 +1484,21 @@ async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
   if (current.status !== "completed") {
     throw new V2RuntimeFailure(
       `Verifier run ${current.id} has unsupported baseline status ${current.status}`,
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  const inventoryFingerprint = canonicalV2VerifierInventoryFingerprint(inventory);
+  const confirmedInventory = await listCurrentV2VerifierRuns(
+    client,
+    config,
+    budget,
+  );
+  if (
+    canonicalV2VerifierInventoryFingerprint(confirmedInventory) !==
+    inventoryFingerprint
+  ) {
+    throw new V2RuntimeFailure(
+      "Canonical verifier workflow-run inventory changed between pre-rerun snapshots",
       { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
     );
   }
@@ -1526,77 +1541,105 @@ async function rerunCurrentV2Verifier(client, config, context, pullRequest, {
     rerunError = error;
   }
 
-  for (;;) {
-    if (now() >= deadlineMs) break;
-    const observed = await loadExactV2VerifierRun(
-      client,
-      config,
-      currentPr,
-      current.id,
-      budget,
-    );
-    if (observed.run_attempt > baselineAttempt + 1) {
-      throw new V2RuntimeFailure(
-        `Verifier run ${current.id} advanced from attempt ${baselineAttempt} to ` +
-          `${observed.run_attempt}; the controller cannot attribute the competing rerun`,
-        { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
-      );
-    }
-    if (observed.run_attempt === baselineAttempt + 1) {
-      const job = await loadUniqueV2VerifierJob(
+  try {
+    for (;;) {
+      if (now() >= deadlineMs) break;
+      const observed = await loadExactV2VerifierRun(
         client,
         config,
-        observed,
-        baselineAttempt + 1,
+        currentPr,
+        current.id,
         budget,
       );
-      if (job) {
-        const checkRun = await loadV2VerifierCheckRun(client, config, job, budget);
-        if (
-          (job.status === "queued" || job.status === "in_progress") &&
-          (checkRun.status === "queued" || checkRun.status === "in_progress")
-        ) {
-          return {
-            runId: String(observed.id),
-            runAttempt: observed.run_attempt,
-            runUrl: observed.html_url,
-            jobId: String(job.id),
-            checkRunId: String(checkRun.id),
-          };
-        }
-        if (job.status === "completed" || checkRun.status === "completed") {
-          throw new V2RuntimeFailure(
-            `Verifier attempt ${observed.run_attempt} completed before the controller observed ` +
-              "its canonical CheckRun queued or in progress",
-            { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
-          );
-        }
+      if (observed.run_attempt > baselineAttempt + 1) {
+        throw new V2RuntimeFailure(
+          `Verifier run ${current.id} advanced from attempt ${baselineAttempt} to ` +
+            `${observed.run_attempt}; the controller cannot attribute the competing rerun`,
+          { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+        );
       }
-    } else if (observed.run_attempt < baselineAttempt) {
-      throw new V2RuntimeFailure(
-        `Verifier run ${current.id} regressed below baseline attempt ${baselineAttempt}`,
-        { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
-      );
+      if (observed.run_attempt === baselineAttempt + 1) {
+        const job = await loadUniqueV2VerifierJob(
+          client,
+          config,
+          observed,
+          baselineAttempt + 1,
+          budget,
+        );
+        if (job) {
+          const checkRun = await loadV2VerifierCheckRun(client, config, job, budget);
+          if (
+            (job.status === "queued" || job.status === "in_progress") &&
+            (checkRun.status === "queued" || checkRun.status === "in_progress")
+          ) {
+            return {
+              runId: String(observed.id),
+              runAttempt: observed.run_attempt,
+              runUrl: observed.html_url,
+              jobId: String(job.id),
+              checkRunId: String(checkRun.id),
+            };
+          }
+          if (job.status === "completed" || checkRun.status === "completed") {
+            throw new V2RuntimeFailure(
+              `Verifier attempt ${observed.run_attempt} completed before the controller observed ` +
+                "its canonical CheckRun queued or in progress",
+              { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+            );
+          }
+        }
+      } else if (observed.run_attempt < baselineAttempt) {
+        throw new V2RuntimeFailure(
+          `Verifier run ${current.id} regressed below baseline attempt ${baselineAttempt}`,
+          { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+        );
+      }
+      const remainingMs = deadlineMs - now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(pollIntervalMs, remainingMs));
     }
-    const remainingMs = deadlineMs - now();
-    if (remainingMs <= 0) break;
-    await sleep(Math.min(pollIntervalMs, remainingMs));
+    const suffix = rerunError
+      ? `; the rerun POST result was ambiguous: ${rerunError.message}`
+      : "";
+    throw new V2RuntimeFailure(
+      `Verifier rerun ${current.id} attempt ${baselineAttempt + 1} did not become ` +
+        `uniquely observable before the controller deadline${suffix}`,
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  } catch (error) {
+    throw failClosedAfterV2VerifierRerunSubmission(error, current.id);
   }
-  const suffix = rerunError
-    ? `; the rerun POST result was ambiguous: ${rerunError.message}`
-    : "";
-  throw new V2RuntimeFailure(
-    `Verifier rerun ${current.id} attempt ${baselineAttempt + 1} did not become ` +
-      `uniquely observable before the controller deadline${suffix}`,
-    { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+}
+
+function failClosedAfterV2VerifierRerunSubmission(error, runId) {
+  if (
+    error instanceof V2RuntimeFailure &&
+    error.gateOutcome === "pending" &&
+    error.recoveryCode === "wait_then_reconcile" &&
+    error.retrySafe === false
+  ) {
+    return error;
+  }
+  return new V2RuntimeFailure(
+    `Verifier rerun ${runId} may have been submitted, but its exact readback failed: ` +
+      `${error?.message || String(error)}`,
+    {
+      gateOutcome: "pending",
+      recoveryCode: "wait_then_reconcile",
+      retrySafe: false,
+      httpStatus: error?.httpStatus ?? null,
+      responseReceived: error?.responseReceived ?? false,
+      responsePhase: error?.responsePhase ?? "none",
+    },
   );
 }
 
-async function listCurrentV2VerifierRuns(client, config, pullRequest, budget) {
+async function listCurrentV2VerifierRuns(client, config, budget) {
   const workflow = encodeURIComponent(V2_VERIFIER_WORKFLOW_PATH);
   const runs = [];
   const seen = new Set();
   let queryCount = 0;
+  let frozenTotalCount = null;
   for (let page = 1; ; page += 1) {
     const path =
       `${config.repoPath}/actions/workflows/${workflow}/runs` +
@@ -1616,6 +1659,15 @@ async function listCurrentV2VerifierRuns(client, config, pullRequest, budget) {
       data.workflow_runs.length > 100
     ) {
       throw new V2RuntimeFailure("Verifier workflow-run inventory has an invalid shape");
+    }
+    if (frozenTotalCount === null) {
+      frozenTotalCount = data.total_count;
+    } else if (data.total_count !== frozenTotalCount) {
+      throw new V2RuntimeFailure(
+        `Verifier workflow-run inventory total_count changed across pages ` +
+          `(${frozenTotalCount} != ${data.total_count})`,
+        { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+      );
     }
     queryCount += data.workflow_runs.length;
     for (const [index, run] of data.workflow_runs.entries()) {
@@ -1637,16 +1689,46 @@ async function listCurrentV2VerifierRuns(client, config, pullRequest, budget) {
       "canonical verifier workflow runs",
     );
     if (!hasNext) {
-      if (queryCount !== data.total_count) {
+      if (queryCount !== frozenTotalCount) {
         throw new V2RuntimeFailure(
-          `Verifier workflow-run inventory count changed (${queryCount} != ${data.total_count})`,
-          { recoveryCode: "wait_then_reconcile" },
+          `Verifier workflow-run inventory count changed (${queryCount} != ${frozenTotalCount})`,
+          { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
         );
       }
       break;
     }
   }
-  return runs.filter((run) => v2VerifierRunMatchesScope(run, config, pullRequest));
+  return runs;
+}
+
+function canonicalV2VerifierInventoryFingerprint(runs) {
+  return canonicalJson(
+    [...runs]
+      .sort((left, right) => left.id - right.id)
+      .map((run) => ({
+        id: run.id,
+        runNumber: run.run_number,
+        runAttempt: run.run_attempt,
+        event: run.event,
+        path: run.path,
+        displayTitle: run.display_title,
+        headSha: String(run.head_sha).toLowerCase(),
+        status: run.status,
+        conclusion: run.conclusion ?? null,
+        htmlUrl: run.html_url,
+        pullRequests: run.pull_requests
+          .map((pullRequest) => ({
+            number: Number(pullRequest?.number),
+            headSha: String(pullRequest?.head?.sha || "").toLowerCase(),
+            baseSha: String(pullRequest?.base?.sha || "").toLowerCase(),
+          }))
+          .sort((left, right) =>
+            left.number - right.number ||
+            left.headSha.localeCompare(right.headSha) ||
+            left.baseSha.localeCompare(right.baseSha)
+          ),
+      })),
+  );
 }
 
 function selectCurrentV2VerifierRun(runs, config, pullRequest) {
@@ -1677,9 +1759,16 @@ function v2VerifierRunMatchesScope(run, config, pullRequest) {
   );
   return run.event === "pull_request" &&
     isCanonicalV2VerifierWorkflowPath(run.path) &&
+    run.display_title === expectedV2VerifierDisplayTitle(config, pullRequest) &&
     String(run.head_sha || "").toLowerCase() === config.expectedHeadSha &&
     run.pull_requests.length === 1 &&
     matchingPrs.length === 1;
+}
+
+function expectedV2VerifierDisplayTitle(config, pullRequest) {
+  return `codex-review-gate-verifier/${config.prNumber}/${String(
+    pullRequest.merge_commit_sha || "",
+  ).toLowerCase()}`;
 }
 
 function isCanonicalV2VerifierWorkflowPath(path) {
@@ -1698,6 +1787,7 @@ function requireV2VerifierRunShape(run, label) {
     run.run_attempt <= 0 ||
     typeof run.event !== "string" ||
     typeof run.path !== "string" ||
+    typeof run.display_title !== "string" ||
     !FULL_SHA.test(String(run.head_sha || "").toLowerCase()) ||
     typeof run.status !== "string" ||
     typeof run.html_url !== "string" ||

@@ -107,9 +107,13 @@ GitHub records the verifier run/job/native CheckRun against the exact PR
 feature-head SHA even though the canonical `pull_request` workflow executes on
 `refs/pull/N/merge`. Inside the Action, `GITHUB_REF` and `GITHUB_SHA` must match
 that merge ref and the event test-merge SHA; the event head/base/test-merge
-values must also match a fresh PR read. This is the execution binding that lets
-a successful feature-head CheckRun prove evaluation of the exact current
-test-merge. The CheckRun itself does not belong to the test-merge SHA.
+values must also match a fresh PR read. The protected top-level `run-name`
+provides a second receipt: the run `display_title` must be
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>`, and its sole PR
+binding must carry the current feature head and default-branch base SHA. This
+is the execution binding that lets a successful feature-head CheckRun prove
+evaluation of the exact current test-merge. The CheckRun itself does not
+belong to the test-merge SHA.
 
 The controller admits `issue_comment` `created`/`edited` and default-branch
 `workflow_dispatch`. Comment admission checks both event sender and comment

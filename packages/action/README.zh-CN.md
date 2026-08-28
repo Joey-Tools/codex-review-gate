@@ -6,9 +6,12 @@ Codex Review Gate 把单个 PR 上可信的 OpenAI Codex review 证据归约为 
 CheckRun `codex/github-review-gate`。GitHub 把 verifier run/job/CheckRun 记录在 exact PR
 feature-head SHA 上。canonical
 `pull_request` verifier 仍在 `refs/pull/N/merge` 上执行；Action 内部严格校验
-`GITHUB_REF`、`GITHUB_SHA`、event head/base/test-merge SHAs 和 fresh PR read。因此
-successful feature-head CheckRun 会在执行语义上绑定 exact current test-merge，但
-CheckRun 本身并不挂在 test-merge SHA 上。每次 verifier run 都从
+`GITHUB_REF`、`GITHUB_SHA`、event head/base/test-merge SHAs 和 fresh PR read。受保护的
+top-level `run-name` 还会让 GitHub 把
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>` 暴露为 run 的 exact
+`display_title`；activation 同时要求 run 唯一的 PR binding 含 current feature head 与
+default-branch base SHA。这些 receipts 把 successful feature-head CheckRun 绑定到 exact
+current test-merge，但 CheckRun 本身并不挂在 test-merge SHA 上。每次 verifier run 都从
 GitHub 重建决策；数据库、workflow artifact、sticky comment、controller run 或旧
 verifier 都不是决策 authority。
 

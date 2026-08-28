@@ -321,8 +321,10 @@ verifier attempt；若结果只出现在 review 或 reaction，或者需要恢�
 GitHub 把 verifier run/job/CheckRun 记录在 exact PR feature-head SHA 上，而不是
 test-merge SHA 上。canonical `pull_request` verifier 仍在 `refs/pull/N/merge` 上执行；Action
 内部严格检查 `GITHUB_REF`、`GITHUB_SHA`、event PR head/base/test-merge SHAs 与 fresh PR
-read。因此 successful feature-head CheckRun 会在执行语义上绑定 exact current
-test-merge。为了避免 idle PR 消耗
+read。受保护的 top-level `run-name` 还让 GitHub 把 exact
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>` 暴露为 `display_title`；run
+唯一的 PR binding 必须携带 current feature head 与 default-branch base SHA。因此
+successful feature-head CheckRun 会在执行语义上绑定 exact current test-merge。为了避免 idle PR 消耗
 minutes，没有 cron 或可写 review event。verifier 在 `opened`、`reopened`、
 `synchronize` 与 `ready_for_review` 上启动；controller 与 verifier 使用独立 per-PR
 concurrency namespace。若要对同一 head deliberate re-review，先运行 `begin-review`，
@@ -426,7 +428,8 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
 每一次 ruleset write（包括 Disabled staging）之前，helper 都会重新读取 exact
 default-branch workflow inventory、CODEOWNERS errors 与指定 owner 的 repository
 permission；active write 前还会重新读取 canary lifecycle、base/head/test-merge SHA、
-exact verifier run/job/CheckRun 与 collision inventory。Write 后会读回 exact ruleset 与
+exact verifier run/job/CheckRun、exact canonical `display_title`、唯一 PR head/base
+binding 与 collision inventory。Write 后会读回 exact ruleset 与
 完整 consumer security snapshot。确认 active
 enforcement、相同 GitHub Actions source、strict up-to-date、Code Owner review、push 后
 dismiss stale approvals、新 ruleset 的普通 approval count 默认为 0 且不降低既有更高
@@ -435,4 +438,5 @@ count、conversation resolution、default-branch non-fast-forward protection，�
 
 默认分支含两份 canonical `@v2` workflows、ruleset active 且完整、closed-unmerged
 canary 在 current feature-head SHA 留下 exact successful native CheckRun，且该 run 绑定
-unchanged current test-merge 后，安装才算完成。
+unchanged current default-branch base/test-merge 的 canonical run-name receipt 与 PR
+binding 后，安装才算完成。

@@ -11,8 +11,12 @@ native `codex/github-review-gate` verifier CheckRun. GitHub records the verifier
 run/job/CheckRun against the exact PR feature-head SHA. The verifier executes
 on `refs/pull/N/merge` and strictly validates
 `GITHUB_REF`, `GITHUB_SHA`, event head/base/test-merge SHAs and a fresh PR read,
-so success is execution-bound to the exact current test-merge without claiming
-that the CheckRun itself is attached to that merge SHA.
+while the protected top-level `run-name` produces an exact
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>` `display_title`.
+Activation also binds the run's sole PR record to the current feature head and
+default-branch base SHA. Together these receipts bind success to the exact
+current test-merge without claiming that the CheckRun itself is attached to
+that merge SHA.
 Install the complete three-asset-group contract: both canonical workflows, the
 managed `.github/CODEOWNERS` control plane, and the supplied ruleset. Use the canonical
 `bootstrap-codex-review-gate.mjs` helper with an explicit

@@ -3,6 +3,9 @@ export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
 export const DEFAULT_STATUS_INTEGRATION_ID = 15368;
 export const DEFAULT_RULESET_NAME = "Must Pass Codex Review";
 export const DEFAULT_WORKFLOW_PATH = ".github/workflows/codex-review-gate.yml";
+export const DEFAULT_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
+export const DEFAULT_VERIFIER_RUN_NAME =
+  `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/\${{ github.event.pull_request.number }}/\${{ github.sha }}`;
 export const DEFAULT_CONTROLLER_WORKFLOW_PATH =
   ".github/workflows/codex-review-gate-controller.yml";
 export const DEFAULT_RULESET_ENFORCEMENT = "disabled";
@@ -631,6 +634,20 @@ export function validateCanonicalV2VerifierWorkflowContent(value) {
     throw new Error("Canonical v2 verifier workflow must be non-empty UTF-8 text.");
   }
   assertCanonicalWorkflowLineEndings(value);
+  const runNameLines = value
+    .split("\n")
+    .filter((line) => {
+      const mapping = matchSimpleYamlMappingLine(line);
+      return mapping?.indent === 0 && mapping.key === "run-name";
+    });
+  if (
+    runNameLines.length !== 1 ||
+    runNameLines[0] !== `run-name: ${DEFAULT_VERIFIER_RUN_NAME}`
+  ) {
+    throw new Error(
+      `Canonical v2 verifier workflow must expose exactly one top-level run-name: ${DEFAULT_VERIFIER_RUN_NAME}`,
+    );
+  }
   assertOneCanonicalActionCall(value, "verifier");
   assertCommonWorkflowSafety(value, "verifier");
   if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
@@ -1283,6 +1300,11 @@ export function validateCanonicalV2WorkflowInventory(
       throw new Error(
         `${path} must occur exactly once in the complete default-branch workflow inventory.`,
       );
+    }
+    if (role === "verifier") {
+      validateCanonicalV2VerifierWorkflowContent(matches[0].content);
+    } else {
+      validateCanonicalV2ControllerWorkflowContent(matches[0].content);
     }
     if (!installedWorkflowMatchesCanonical(matches[0].content, content)) {
       throw new Error(`${path} differs from the canonical v2 ${role} workflow bytes.`);

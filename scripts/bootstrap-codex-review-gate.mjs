@@ -22,6 +22,7 @@ import {
   DEFAULT_RULESET_NAME,
   DEFAULT_STATUS_CONTEXT,
   DEFAULT_STATUS_INTEGRATION_ID,
+  DEFAULT_VERIFIER_RUN_NAME_PREFIX,
   DEFAULT_WORKFLOW_PATH,
   LEGACY_STATUS_CONTEXT,
   assertDirectoryWitnessStable,
@@ -519,6 +520,13 @@ async function assertCanaryCheckRunSource({
     repoSlug,
   );
   const run = await ghJson(`repos/${repoSlug}/actions/runs/${runId}`);
+  const expectedDisplayTitle =
+    `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/${prNumber}/${mergeCommitSha}`;
+  if (run?.display_title !== expectedDisplayTitle) {
+    throw new Error(
+      `Canary run ${runId} lacks the exact current test-merge run-name receipt ${expectedDisplayTitle}.`,
+    );
+  }
   if (
     Number(run?.id) !== runId ||
     run?.repository?.full_name !== repoSlug ||
@@ -537,6 +545,7 @@ async function assertCanaryCheckRunSource({
       prNumber,
       headSha,
       defaultBranch,
+      defaultBranchHeadSha,
     })
   ) {
     throw new Error(
@@ -838,7 +847,7 @@ async function loadCompleteCheckRuns({ repoSlug, sha, checkName }) {
 
 function runContainsCanaryPullRequest(
   run,
-  { repoSlug, prNumber, headSha, defaultBranch },
+  { repoSlug, prNumber, headSha, defaultBranch, defaultBranchHeadSha },
 ) {
   if (!Array.isArray(run?.pull_requests) || run.pull_requests.length !== 1) {
     return false;
@@ -849,6 +858,7 @@ function runContainsCanaryPullRequest(
     pullRequest?.head?.sha === headSha &&
     pullRequest?.head?.repo?.full_name === repoSlug &&
     pullRequest?.base?.ref === defaultBranch &&
+    pullRequest?.base?.sha === defaultBranchHeadSha &&
     pullRequest?.base?.repo?.full_name === repoSlug
   );
 }

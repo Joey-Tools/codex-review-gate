@@ -152,7 +152,10 @@ failure 描述 evaluator health，不表示 Codex finding。正常 run 的
 必须要求 exact current PR feature-head SHA 上存在唯一 canonical verifier
 run/job/CheckRun。
 verifier 仍在 `refs/pull/N/merge` 上执行；严格的 `GITHUB_REF`/`GITHUB_SHA`、event scope
-与 fresh PR 校验把 success 绑定到 unchanged current head、base 与 test-merge。controller
+与 fresh PR 校验把 success 绑定到 unchanged current head、base 与 test-merge。activation
+还必须要求 `display_title` 中存在 canonical run-name receipt
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>`，并要求 run 唯一的 PR binding
+携带 current feature head 与 default-branch base SHA。controller
 CheckRun 绑定 default-branch commit，不是 required signal。controller 必须观察严格更新的
 verifier attempt 与其唯一 job/CheckRun；rerun state 有歧义时保持 blocking。commit-status
 projection 与 status-POST recovery path 已删除。

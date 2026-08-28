@@ -1548,6 +1548,64 @@ superseded_by:
   review before delivery; earlier reviews are finding evidence, not acceptance
   evidence for changed bytes.
 
+### Whole-Range Review At The Snapshot-Hardening Checkpoint
+
+- A third independent review covered
+  `10217253306ca2ee6f312f766a331f8924e26e47..8dbf6805f0087540db7bf0824bfcd6e686ac3049`
+  in a clean detached no-local clone at tree
+  `fe1375f703fd3b4021ba23b9b5d142a5a0d817fe`. The dedicated reviewer role was
+  already proved unavailable, so the explicitly authorized zero-context
+  ordinary `gpt-5.6-sol` / `ultra` fallback reviewed all 12 commits and 89
+  changed paths. The workspace was clean and retained the exact head/tree after
+  review.
+- The reviewer retained two P1 findings and one P3:
+  - the installer tied a canary run to feature head, base ref, and repository,
+    but not the run's exact base SHA or a machine-readable receipt for the
+    current `merge_commit_sha`; an old same-head success could therefore be
+    accepted after the default branch advanced;
+  - after the non-idempotent verifier-rerun POST may have committed, a transient
+    run/job/CheckRun read failure could still escape as
+    `retry_reconcile/retrySafe=true` and map `begin-review` to an immediately
+    retry-safe `retry_begin`, allowing a blind extra attempt;
+  - workflow-run pagination compared the accumulated count only with the final
+    page's `total_count`; a deletion between pages could lower that count and
+    make an incomplete inventory look complete.
+- The adopted remediation is a canonical verifier run-name receipt
+  `codex-review-gate-verifier/<pr-number>/<test-merge-full-sha>`, generated from
+  `github.event.pull_request.number` and `github.sha`. Installer and runtime
+  must require that exact current value in addition to feature-head and exact
+  base-SHA bindings. Once the rerun POST may have committed, every later
+  readback failure becomes `pending/wait_then_reconcile/retrySafe=false`.
+  Workflow-run pagination freezes the first `total_count` and rejects any later
+  drift or duplicate. The resulting checkpoint again requires focused/full
+  validation and a fresh whole-range review before delivery.
+- A parent-side focused audit then found that a frozen count and duplicate-ID
+  check alone still allowed a same-count member replacement while pagination
+  was in progress: one new active run could enter while one old run disappeared,
+  leaving an apparently complete but stale inventory. The mutation boundary now
+  requires two complete workflow-run inventories with identical canonical
+  fingerprints before the rerun POST. The fingerprint covers every member's
+  identity, attempt, workflow receipt, head and PR/base bindings, status,
+  conclusion, and URL. Any member replacement, status change, per-snapshot
+  count drift, or duplicate remains
+  `pending/wait_then_reconcile/retrySafe=false` and performs no POST. This is a
+  finite stability observation rather than an atomic GitHub transaction; its
+  purpose is to reject an internally unstable pre-mutation snapshot, while
+  later attempt readback and the strict up-to-date ruleset remain the outer
+  race controls.
+- Final validation on the frozen remediation working tree passed:
+  - `npm test -- --test-reporter=dot`: 712 of 712 passed, 0 failed;
+  - focused runtime suite: 75 of 75 passed;
+  - focused v2 suite: 84 of 84 passed;
+  - focused bootstrap suite: 71 of 71 passed;
+  - `npm run check`: passed;
+  - `actionlint` passed for both canonical consumer workflows;
+  - project-journal validation and `git diff --check` passed.
+- The first full-suite attempt was intentionally interrupted after the focused
+  audit exposed the same-count replacement race. It is not acceptance
+  evidence. The 712-test result above is the subsequent uninterrupted run on
+  the corrected, frozen working tree.
+
 ### Verified Two-Workflow Platform Boundaries And Resolution
 
 - Required-CheckRun source selection is not workflow provenance. GitHub's

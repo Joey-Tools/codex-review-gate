@@ -8,9 +8,13 @@ records the verifier run/job/CheckRun against the exact PR feature-head SHA.
 The canonical `pull_request` verifier still executes on
 `refs/pull/N/merge`; inside the Action it strictly validates `GITHUB_REF`,
 `GITHUB_SHA`, the event head/base/test-merge SHAs and a fresh PR read. A
-successful feature-head CheckRun is therefore execution-bound to the exact
-current test-merge, even though the CheckRun itself is not attached to the
-test-merge SHA. Every verifier run rebuilds its decision from GitHub. A
+protected top-level `run-name` makes GitHub expose
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>` as the run's exact
+`display_title`; activation also requires the run's sole PR binding to contain
+the current feature head and default-branch base SHA. These receipts bind a
+successful feature-head CheckRun to the exact current test-merge, even though
+the CheckRun itself is not attached to the test-merge SHA. Every verifier run
+rebuilds its decision from GitHub. A
 database, workflow artifact, sticky comment, controller run or earlier
 verifier is never decision authority.
 

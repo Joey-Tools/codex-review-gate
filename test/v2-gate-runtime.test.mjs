@@ -1963,6 +1963,82 @@ test("an unobservable verifier rerun remains fail-closed and is never posted twi
   assert.deepEqual(github.rerunRequests, ["7001"]);
 });
 
+test("post-rerun safe-read exhaustion is retry-unsafe for reconcile and begin-review", async (context) => {
+  for (const operation of ["reconcile", "begin-review"]) {
+    const github = createGitHubMock({
+      requestInterceptor: ({ method, path }) => {
+        if (
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/actions/runs/7001`
+        ) {
+          return jsonResponse({ message: "synthetic post-rerun read failure" }, 502);
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `post-rerun-safe-read-${operation}`,
+      operation,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, operation);
+    assert.equal(result.report.executionHealth, "unhealthy", operation);
+    assert.equal(result.report.gateOutcome, "pending", operation);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", operation);
+    assert.equal(result.report.retrySafe, false, operation);
+    assert.match(result.report.reason, /may have been submitted/iu, operation);
+    assert.deepEqual(github.rerunRequests, ["7001"], operation);
+    assert.equal(github.requestBodies.length, operation === "begin-review" ? 1 : 0);
+  }
+});
+
+test("controller requires the exact verifier display-title execution receipt", async (context) => {
+  const missingTitle = verifierRun();
+  delete missingTitle.display_title;
+  for (const [suffix, run] of [
+    ["missing", missingTitle],
+    ["wrong", verifierRun({
+      display_title: `codex-review-gate-verifier/${PR}/${NEXT_HEAD}`,
+    })],
+  ]) {
+    const github = createGitHubMock({ verifierRuns: [run] });
+    const environment = runtimeEnvironment(context, {
+      suffix: `verifier-display-title-${suffix}`,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.deepEqual(github.rerunRequests, [], suffix);
+  }
+
+  const refetchGitHub = createGitHubMock({
+    requestInterceptor: ({ method, path }) => {
+      if (method === "GET" && path === `/repos/${REPOSITORY}/actions/runs/7001`) {
+        return jsonResponse(verifierRun({
+          run_attempt: 2,
+          status: "queued",
+          conclusion: null,
+          display_title: `codex-review-gate-verifier/${PR}/${NEXT_HEAD}`,
+        }));
+      }
+      return undefined;
+    },
+  });
+  const refetchEnvironment = runtimeEnvironment(context, {
+    suffix: "verifier-display-title-refetch",
+    eventName: "workflow_dispatch",
+  });
+  const { result: refetchResult } = await runGate(refetchEnvironment, refetchGitHub);
+  assert.equal(refetchResult.exitCode, 1);
+  assert.equal(refetchResult.report.gateOutcome, "pending");
+  assert.equal(refetchResult.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(refetchResult.report.retrySafe, false);
+  assert.deepEqual(refetchGitHub.rerunRequests, ["7001"]);
+});
+
 test("controller binds REST run, job, and CheckRun to feature head while verifier launch uses test-merge", async (context) => {
   const verifierEnvironment = runtimeEnvironment(context, {
     suffix: "feature-head-rest-verifier-launch",
@@ -2097,6 +2173,149 @@ test("controller fails closed when verifier-run pagination repeats a boundary ID
   assert.deepEqual(github.rerunRequests, []);
 });
 
+test("controller freezes verifier-run total_count across pages before rerun POST", async (context) => {
+  const firstPage = Array.from({ length: 100 }, (_, index) =>
+    verifierRun({
+      id: 8_000 - index,
+      run_number: 200 - index,
+    })
+  );
+  const github = createGitHubMock({
+    requestInterceptor: ({ method, path, url }) => {
+      if (
+        method !== "GET" ||
+        path !== `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`
+      ) {
+        return undefined;
+      }
+      if (url.searchParams.get("page") === "1") {
+        const next = new URL(url);
+        next.searchParams.set("page", "2");
+        return jsonResponse(
+          { total_count: 100, workflow_runs: firstPage },
+          200,
+          { link: `<${next.href}>; rel="next"` },
+        );
+      }
+      return jsonResponse({
+        total_count: 101,
+        workflow_runs: [verifierRun({ id: 9_001, run_number: 300 })],
+      });
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "verifier-run-total-count-drift",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(result.report.retrySafe, false);
+  assert.match(result.report.reason, /total_count changed across pages \(100 != 101\)/u);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("controller rejects same-count verifier member replacement before rerun POST", async (context) => {
+  let inventoryReads = 0;
+  const github = createGitHubMock({
+    requestInterceptor: ({ method, path }) => {
+      if (
+        method !== "GET" ||
+        path !== `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`
+      ) {
+        return undefined;
+      }
+      inventoryReads += 1;
+      return jsonResponse({
+        total_count: 1,
+        workflow_runs: [inventoryReads === 1
+          ? verifierRun()
+          : verifierRun({
+              id: 7_002,
+              run_number: 42,
+              status: "in_progress",
+              conclusion: null,
+            })],
+      });
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "verifier-run-same-count-replacement",
+    eventName: "workflow_dispatch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(result.report.retrySafe, false);
+  assert.match(result.report.reason, /inventory changed between pre-rerun snapshots/iu);
+  assert.equal(inventoryReads, 2);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("second pre-rerun inventory snapshot preserves pagination churn checks", async (context) => {
+  for (const fixture of ["duplicate", "total-count-drift"]) {
+    let snapshot = 0;
+    const secondSnapshotFirstPage = Array.from({ length: 100 }, (_, index) =>
+      verifierRun({
+        id: 8_000 - index,
+        run_number: 200 - index,
+      })
+    );
+    const github = createGitHubMock({
+      requestInterceptor: ({ method, path, url }) => {
+        if (
+          method !== "GET" ||
+          path !== `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`
+        ) {
+          return undefined;
+        }
+        if (url.searchParams.get("page") === "1") {
+          snapshot += 1;
+          if (snapshot === 1) {
+            return jsonResponse({ total_count: 1, workflow_runs: [verifierRun()] });
+          }
+          const next = new URL(url);
+          next.searchParams.set("page", "2");
+          return jsonResponse(
+            {
+              total_count: fixture === "duplicate" ? 101 : 100,
+              workflow_runs: secondSnapshotFirstPage,
+            },
+            200,
+            { link: `<${next.href}>; rel="next"` },
+          );
+        }
+        return jsonResponse({
+          total_count: 101,
+          workflow_runs: [fixture === "duplicate"
+            ? structuredClone(secondSnapshotFirstPage.at(-1))
+            : verifierRun({ id: 9_001, run_number: 300 })],
+        });
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `second-verifier-inventory-${fixture}`,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, fixture);
+    assert.equal(result.report.gateOutcome, "pending", fixture);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", fixture);
+    assert.equal(result.report.retrySafe, false, fixture);
+    assert.match(
+      result.report.reason,
+      fixture === "duplicate" ? /duplicate identity/iu : /total_count changed/iu,
+      fixture,
+    );
+    assert.equal(snapshot, 2, fixture);
+    assert.deepEqual(github.rerunRequests, [], fixture);
+  }
+});
+
 test("controller adopts an ambiguous rerun POST only after exact A+1 readback", async (context) => {
   const github = createGitHubMock({ verifierRerunStatus: 500 });
   const environment = runtimeEnvironment(context, {
@@ -2107,6 +2326,39 @@ test("controller adopts an ambiguous rerun POST only after exact A+1 readback", 
   assert.equal(result.exitCode, 0);
   assert.equal(result.report.executionHealth, "healthy");
   assert.deepEqual(github.rerunRequests, ["7001"]);
+});
+
+test("controller preserves definite rerun rejection and completed-at-readback semantics", async (context) => {
+  for (const status of [401, 403, 422]) {
+    const github = createGitHubMock({ verifierRerunStatus: status });
+    const environment = runtimeEnvironment(context, {
+      suffix: `definite-rerun-rejection-${status}`,
+      eventName: "workflow_dispatch",
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, String(status));
+    assert.equal(result.report.gateOutcome, "pending", String(status));
+    assert.equal(
+      result.report.recoveryCode,
+      status === 401 || status === 403 ? "repair_permissions" : "wait_then_reconcile",
+      String(status),
+    );
+    assert.equal(result.report.retrySafe, false, String(status));
+    assert.deepEqual(github.rerunRequests, ["7001"], String(status));
+  }
+
+  const completedGitHub = createGitHubMock({ verifierAttemptStatus: "completed" });
+  const completedEnvironment = runtimeEnvironment(context, {
+    suffix: "rerun-completed-at-readback",
+    eventName: "workflow_dispatch",
+  });
+  const { result: completed } = await runGate(completedEnvironment, completedGitHub);
+  assert.equal(completed.exitCode, 1);
+  assert.equal(completed.report.gateOutcome, "pending");
+  assert.equal(completed.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(completed.report.retrySafe, false);
+  assert.match(completed.report.reason, /completed before the controller observed/iu);
+  assert.deepEqual(completedGitHub.rerunRequests, ["7001"]);
 });
 
 test("controller rejects an A+2 jump as a competing rerun", async (context) => {
@@ -2469,6 +2721,7 @@ function verifierRun(overrides = {}) {
     run_attempt: 1,
     event: "pull_request",
     path: ".github/workflows/codex-review-gate.yml",
+    display_title: `codex-review-gate-verifier/${PR}/${TEST_MERGE}`,
     head_sha: HEAD,
     head_branch: "feature",
     status: "completed",

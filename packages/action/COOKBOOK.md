@@ -162,10 +162,15 @@ Require the unique canonical verifier run/job/CheckRun recorded against the
 exact current PR feature-head SHA. The verifier still executes on
 `refs/pull/N/merge`; strict
 `GITHUB_REF`/`GITHUB_SHA`, event-scope and fresh-PR checks bind its success to
-the unchanged current head, base and test-merge. A controller CheckRun binds the default-branch commit and is not the
-required signal. The controller must observe a strictly newer verifier attempt
-and its unique job/CheckRun; ambiguous rerun state stays blocking. Commit-status
-projection and the status-POST recovery path have been removed.
+the unchanged current head, base and test-merge. For activation, also require
+the canonical run-name receipt
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>` in `display_title`
+and the run's sole PR binding to carry the current feature head and
+default-branch base SHA. A controller CheckRun binds the default-branch commit
+and is not the required signal. The controller must observe a strictly newer
+verifier attempt and its unique job/CheckRun; ambiguous rerun state stays
+blocking. Commit-status projection and the status-POST recovery path have been
+removed.
 
 `retry_safe=true` means an immediate rerun with identical inputs is a valid
 recovery action. It does not mean success is likely or that the runtime may

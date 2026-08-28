@@ -108,6 +108,14 @@ test("canonical verifier owns the native required CheckRun on selected pull-requ
     templateVerifier,
     /^name: Codex Review Gate Verifier$/mu,
   );
+  assert.equal(
+    templateVerifier.match(/^run-name:/gmu)?.length ?? 0,
+    1,
+  );
+  assert.match(
+    templateVerifier,
+    /^run-name: codex-review-gate-verifier\/\$\{\{ github\.event\.pull_request\.number \}\}\/\$\{\{ github\.sha \}\}$/mu,
+  );
   assert.match(
     templateVerifier,
     /^  pull_request:\n    types: \[opened, reopened, synchronize, ready_for_review\]$/mu,

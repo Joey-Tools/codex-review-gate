@@ -94,7 +94,10 @@ head/base/test-merge scope 创建 verifier；旧 event rerun 不能代替。
 GitHub 会把 verifier run/job/native CheckRun 记录在 exact PR feature-head SHA 上，尽管
 canonical `pull_request` workflow 在 `refs/pull/N/merge` 上执行。Action 内部要求
 `GITHUB_REF`、`GITHUB_SHA` 精确匹配该 merge ref 与 event test-merge SHA，并要求 event
-head/base/test-merge values 与 fresh PR read 一致。这个 execution binding 使 successful
+head/base/test-merge values 与 fresh PR read 一致。受保护的 top-level `run-name` 提供第二份
+receipt：run `display_title` 必须是
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>`，其唯一 PR binding 还必须携带
+current feature head 与 default-branch base SHA。这个 execution binding 使 successful
 feature-head CheckRun 能证明它评估了 exact current test-merge；CheckRun 本身并不属于
 test-merge SHA。
 

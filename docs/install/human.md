@@ -373,8 +373,11 @@ GitHub records the verifier run/job/CheckRun against the exact PR feature-head
 SHA, not its test-merge SHA. The canonical `pull_request` verifier still
 executes on `refs/pull/N/merge`; inside the Action it strictly checks
 `GITHUB_REF`, `GITHUB_SHA`, the event PR head/base/test-merge SHAs and a fresh
-PR read. A successful feature-head CheckRun is therefore execution-bound to
-the exact current test-merge.
+PR read. Its protected top-level `run-name` also makes GitHub expose the exact
+`codex-review-gate-verifier/<PR>/<current test-merge SHA>` as `display_title`;
+the run's sole PR binding must carry the current feature head and
+default-branch base SHA. A successful feature-head CheckRun is therefore
+execution-bound to the exact current test-merge.
 There is deliberately no cron or writable review event. The verifier starts on
 `opened`, `reopened`, `synchronize`, and `ready_for_review`; controller and
 verifier have separate per-PR concurrency namespaces. Before a deliberate
@@ -504,7 +507,8 @@ Immediately before every ruleset write, including Disabled staging, the helper
 re-reads the exact default-branch workflow inventory, CODEOWNERS errors, and
 the named owner's repository permission. Before an active write it also
 re-reads the canary lifecycle, base/head/test-merge SHA, exact verifier
-run/job/CheckRun and collision inventory. After a write it reads the exact
+run/job/CheckRun, exact canonical `display_title`, sole PR head/base binding,
+and collision inventory. After a write it reads the exact
 ruleset and the complete consumer security snapshot back.
 Confirm active enforcement, the same expected GitHub Actions source, strict
 up-to-date, Code Owner review with stale approval dismissal, the new-ruleset
@@ -516,4 +520,5 @@ it and delete only its temporary branch.
 Installation is complete when the default branch contains both canonical `@v2`
 workflows, the active ruleset has the expected source and protections, and the
 closed-unmerged canary records the exact successful native CheckRun on its
-current feature-head SHA, bound to its unchanged current test-merge.
+current feature-head SHA, plus the canonical run-name receipt and PR binding
+for its unchanged current default-branch base and test-merge.
