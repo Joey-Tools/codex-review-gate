@@ -2134,6 +2134,18 @@ superseded_by:
   journal append; the append is revalidated by the journal, syntax, diff, and
   new exact-head review gates rather than rerunning the approximately
   20-minute release simulation solely for its own recorded result.
+- The resulting signed checkpoint is
+  `37690cbadfdf52a8412ac5af42dd07a294631fe5` at tree
+  `13de9d7a420c989ef58cd4548f1b7e9d9434efa8`. `git verify-commit`
+  accepted its ED25519 signature from
+  `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`, and the worktree was clean.
+  A third fresh no-local, ordinary `gpt-5.6-sol` / `ultra` whole-range review
+  of
+  `10217253306ca2ee6f312f766a331f8924e26e47..37690cbadfdf52a8412ac5af42dd07a294631fe5`
+  explicitly rechecked both round-two P1 closures plus the earlier remediation
+  set and returned no findings. This evidence-only append changes no
+  implementation bytes; its final signed landing head still receives a fresh
+  exact-head read-only confirmation before push.
 
 ### Follow-Up Migration Witness Review And Resolution
 
@@ -2316,9 +2328,11 @@ superseded_by:
 
 ## Next Steps
 
-- Freeze the reconciled implementation, tests, docs, and this journal in a new
-  signed checkpoint; then run one fresh ordinary `gpt-5.6-sol` / `ultra`
-  whole-range review over that exact head and append only required fixes.
+- Preserve exact-head acceptance: any implementation or contract change after
+  the clean checkpoint above requires a new full-range review. The
+  evidence-only landing commit is separately signed and exact-head confirmed
+  before push; its own hash remains Git evidence rather than self-referential
+  journal content.
 - Run the already specified hidden-marker canary and live
   publisher/runner/Environment preflights as execution evidence; they are not
   remaining grilling choices.
