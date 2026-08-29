@@ -252,22 +252,29 @@ request 还需要 exact v2 marker，绑定 full head 和 run。
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。
 
-通常情况下，terminal clean text 与符合条件的 provider `+1` 是同等 clean carriers，
-但前提是 generation lineage 已完整闭合。每条物理 request comment 都是 generation
-boundary，同一次 workflow run 产生的 duplicate hidden markers 也不例外。后一个
-generation 要 pass，前一个 generation 必须在自身 boundary 与后继 boundary 之间严格
-收到 provider terminal evidence，或在自身 request 上收到合格的 `+1`。如果 official
-`eyes` 或 provider progress 不早于该 `+1` 且不晚于后继 boundary，前一个 generation
-仍保持 open。GitHub timestamp 精度下与后继 boundary 同时属于 ordering ambiguity，
-不能证明 review activity 已在新 generation 前结束。绑定最新 request 的 clean 不能
-跨过更早的 unclosed gap；后继 boundary 之后才出现的 evidence 也不能倒推修复该 gap。
+terminal clean text 与符合条件的 provider `+1`，只有在没有 base epoch、single-flight
+lineage 的第一个物理 generation 中才是同等 clean carriers。每条物理 request comment
+都是 generation boundary，同一次 workflow run 的 duplicate hidden markers 也不例外。
+没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider terminal
+evidence 只能闭合第一个 gap。之后的每个 predecessor-to-successor gap，以及任何前面
+已有物理 request 的 generation 所需 positive/superseding authority，都必须来自直接
+附着于该 request 的合格 `+1`。provider terminal payload 没有 originating request ID；
+后到的 carrier 可能来自任一旧 generation，两个 stable snapshots 也无法使该归属唯一。
+出现 base epoch 后，provider terminal 连第一个 gap 也不能闭合。
 
-带有单一、无歧义 commit binding 的 progress 会直接归入对应 head。unbound progress
-只有在最近的严格更早物理 request boundary 唯一、canonical 且绑定到不同 head 时，
-才能作为 historical 排除。没有更早 boundary、最近 boundary 是 ordinary 或存在冲突，
-以及任一 boundary 与 progress 同时，都必须在 current-head inventory 中保持
-fail-closed。这样既避免 old-head progress 污染新 generation，也不会把时间顺序有
-歧义的 review activity 猜测成已结束。
+如果 official `eyes` 或 provider progress 不早于 request-bound `+1` 且不晚于后继
+boundary，前一个 generation 仍保持 open。GitHub timestamp 精度下与后继 boundary
+同时属于 ordering ambiguity，不能证明 review activity 已在新 generation 前结束。
+绑定最新 request 的 clean 不能跨过更早的 unclosed gap；后继 boundary 之后才出现的
+evidence 也不能倒推修复该 gap。
+
+带有单一、无歧义 commit binding 的 progress 会直接归入对应 head。unbound edited
+progress 被视为从 immutable creation time 到当前 revision time 的 carrier interval。
+只有两个端点顺序 canonical，且从严格更早 origin 到 revision 的每条物理 request
+boundary 始终唯一绑定到同一个其他 full head 时，才能作为 historical 排除。缺少
+origin、ordinary/conflicting boundary、区间内 head transition，或任一端点与 boundary
+同时，都必须在 current-head inventory 中保持 fail-closed。这样既能过滤可证明的
+old-head progress，也不会猜测丢弃 edited 或 same-time activity。
 
 一旦观察到 base epoch，terminal payload 无法证明它由哪个 request/base snapshot
 产生；在这个降级 lineage mode 中，只有直接附着在最新且严格晚于 epoch、绑定当前
@@ -289,8 +296,9 @@ indeterminate；runtime 绝不猜测，也不从无关 prose 中模糊提取方�
 non-inline finding 只有同时证明以下两项时才被 supersede：
 
 1. 存在严格更新的 authorised review generation；
-2. 之后出现属于该新 generation、绑定该 head 的 terminal clean 或合格 `+1`，并满足
-   上述 base-epoch direct-reaction rule。
+2. 之后出现符合上述 lineage rule、属于该新 generation 且绑定该 head 的 clean：只有
+   no-base-epoch 的第一个物理 generation 可以使用 unbound terminal，其他情况必须
+   使用合格的 request-bound `+1`。
 
 无关 later clean 不能清除 finding。temporal order、generation binding 或 head
 binding 有歧义时，仍为 failure 或 inconclusive。superseded finding 会作为

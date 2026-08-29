@@ -79,6 +79,19 @@ changes do not themselves start a consumer job, so let a later qualifying bot
 comment run the gate or dispatch a manual exact-head `reconcile`.
 For predecessor-to-successor generation closure, liveness at the same timestamp
 as the successor request is also ambiguous and keeps the predecessor open.
+Once a second physical request boundary exists, an unbound terminal cannot
+prove that it belongs to the newer request rather than an older flight. Without
+a base epoch, provider terminal evidence may close only the first gap; every
+later gap and the newer generation's clean authority require a qualifying `+1`
+directly on the corresponding canonical request. With a base epoch, every gap
+does. If an older gap can no longer be closed inside its original window,
+create a legitimate new head and start only one canonical producer flight.
+Unbound edited progress is treated as activity from its creation through its
+latest revision. It may be excluded as historical only when both endpoints
+are canonically ordered and every physical boundary from the strictly earlier
+origin through the revision uniquely binds the same different full head. A
+missing origin, an ordinary or conflicting boundary, a head transition, or a
+boundary at either endpoint remains fail-closed.
 
 Choose one GitHub user as `CONTROL_PLANE_OWNER`. That account must have
 `write`, `maintain`, or `admin` permission on the consumer repository. The

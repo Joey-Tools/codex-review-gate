@@ -652,6 +652,61 @@ test("after a base epoch only a direct canonical-request +1 can recover clean", 
   assert.equal(recovered.report.gateOutcome, "success");
   assert.match(recovered.report.reason, /request-reaction/u);
 
+  const nextGeneration = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const firstGenerationTerminal = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:11:00Z",
+    updated_at: "2026-08-25T08:11:00Z",
+  });
+  const providerGapAfterEpochGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation, firstGenerationTerminal, nextGeneration],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 503,
+      created_at: "2026-08-25T08:15:00Z",
+    })]]]),
+  });
+  const providerGapAfterEpochEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-provider-terminal-cannot-close-first-gap",
+  });
+  const { result: providerGapAfterEpoch } = await runGate(
+    providerGapAfterEpochEnvironment,
+    providerGapAfterEpochGitHub,
+  );
+  assert.equal(providerGapAfterEpoch.exitCode, 1);
+  assert.equal(providerGapAfterEpoch.report.gateOutcome, "pending");
+  assert.equal(providerGapAfterEpoch.report.recoveryCode, "request_clean_generation");
+  assert.match(providerGapAfterEpoch.report.reason, /earlier request 101.*newer request 102/iu);
+  assert.equal(
+    providerGapAfterEpochGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const directChainAfterEpochGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation, firstGenerationTerminal, nextGeneration],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 504, created_at: "2026-08-25T08:11:30Z" })]],
+      ["102", [reaction({ id: 505, created_at: "2026-08-25T08:15:00Z" })]],
+    ]),
+  });
+  const directChainAfterEpochEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-all-generations-directly-closed",
+  });
+  const { result: directChainAfterEpoch } = await runGate(
+    directChainAfterEpochEnvironment,
+    directChainAfterEpochGitHub,
+  );
+  assert.equal(directChainAfterEpoch.exitCode, 0);
+  assert.equal(directChainAfterEpoch.report.gateOutcome, "success");
+  assert.match(directChainAfterEpoch.report.reason, /request-reaction 505/u);
+
   const ordinaryBoundary = ordinaryRequest({
     id: 102,
     created_at: "2026-08-25T08:12:00Z",
@@ -1630,13 +1685,14 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
       progressIssueComment({
         id: 206,
         created_at: "2026-08-25T08:01:30Z",
-        updated_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:45Z",
       }),
       currentGenerationB,
       delayedCleanFromA,
     ],
     reactionsByCommentId: new Map([
       ["101", [reaction({ id: 523, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 528, created_at: "2026-08-25T08:05:00Z" })]],
     ]),
   });
   const oldHeadProgressEnvironment = runtimeEnvironment(context, {
@@ -1648,7 +1704,7 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
   );
   assert.equal(oldHeadProgress.exitCode, 0);
   assert.equal(oldHeadProgress.report.gateOutcome, "success");
-  assert.match(oldHeadProgress.report.reason, /issue-comment 203/u);
+  assert.match(oldHeadProgress.report.reason, /request-reaction 528/u);
 
   const progressAtCurrentSuccessorGitHub = createGitHubMock({
     issueComments: [
@@ -1664,6 +1720,7 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     ],
     reactionsByCommentId: new Map([
       ["101", [reaction({ id: 526, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 529, created_at: "2026-08-25T08:05:00Z" })]],
     ]),
   });
   const progressAtCurrentSuccessorEnvironment = runtimeEnvironment(context, {
@@ -1703,6 +1760,7 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     ],
     reactionsByCommentId: new Map([
       ["101", [reaction({ id: 527, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 530, created_at: "2026-08-25T08:05:00Z" })]],
     ]),
   });
   const progressAtOldHeadBoundaryEnvironment = runtimeEnvironment(context, {
@@ -1745,6 +1803,7 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     reactionsByCommentId: new Map([
       ["101", [reaction({ id: 524, created_at: "2026-08-25T08:01:00Z" })]],
       ["102", [reaction({ id: 525, created_at: "2026-08-25T08:01:20Z" })]],
+      ["103", [reaction({ id: 531, created_at: "2026-08-25T08:05:00Z" })]],
     ]),
   });
   const currentHeadProgressEnvironment = runtimeEnvironment(context, {
@@ -1765,6 +1824,118 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     /earlier request 102.*newer request 103/iu,
   );
 
+  const oldHeadAfterCurrentBoundary = workflowRequest({
+    id: 104,
+    body: canonicalRequestBody(OLD_HEAD, { runId: "126" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-104`,
+  });
+  const editedProgressAcrossHeadBoundariesGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      currentGenerationB,
+      progressIssueComment({
+        id: 210,
+        created_at: currentGenerationB.created_at,
+        updated_at: "2026-08-25T08:03:30Z",
+      }),
+      oldHeadAfterCurrentBoundary,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 535, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 536, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const editedProgressAcrossHeadBoundariesEnvironment = runtimeEnvironment(context, {
+    suffix: "edited-progress-crosses-current-and-old-head-boundaries",
+  });
+  const { result: editedProgressAcrossHeadBoundaries } = await runGate(
+    editedProgressAcrossHeadBoundariesEnvironment,
+    editedProgressAcrossHeadBoundariesGitHub,
+  );
+  assert.equal(editedProgressAcrossHeadBoundaries.exitCode, 1);
+  assert.equal(editedProgressAcrossHeadBoundaries.report.gateOutcome, "pending");
+  assert.equal(
+    editedProgressAcrossHeadBoundaries.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(
+    editedProgressAcrossHeadBoundaries.report.reason,
+    /earlier request 101.*newer request 103/iu,
+  );
+  assert.equal(
+    editedProgressAcrossHeadBoundariesGitHub.statusWrites.some(
+      ({ state }) => state === "success",
+    ),
+    false,
+  );
+
+  const intervalCurrentBoundary = workflowRequest({
+    id: 105,
+    body: canonicalRequestBody(HEAD, { runId: "127" }),
+    created_at: "2026-08-25T08:01:45Z",
+    updated_at: "2026-08-25T08:01:45Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-105`,
+  });
+  const intervalOldBoundary = workflowRequest({
+    id: 106,
+    body: canonicalRequestBody(OLD_HEAD, { runId: "128" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-106`,
+  });
+  const intervalCurrentSuccessor = workflowRequest({
+    id: 107,
+    body: canonicalRequestBody(HEAD, { runId: "129" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-107`,
+  });
+  const editedProgressOldCurrentOldGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      oldHeadBoundary,
+      progressIssueComment({
+        id: 211,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:02:30Z",
+      }),
+      intervalCurrentBoundary,
+      intervalOldBoundary,
+      intervalCurrentSuccessor,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 537, created_at: "2026-08-25T08:01:00Z" })]],
+      ["105", [reaction({ id: 538, created_at: "2026-08-25T08:02:45Z" })]],
+      ["107", [reaction({ id: 539, created_at: "2026-08-25T08:04:00Z" })]],
+    ]),
+  });
+  const editedProgressOldCurrentOldEnvironment = runtimeEnvironment(context, {
+    suffix: "edited-progress-crosses-old-current-old-window",
+  });
+  const { result: editedProgressOldCurrentOld } = await runGate(
+    editedProgressOldCurrentOldEnvironment,
+    editedProgressOldCurrentOldGitHub,
+  );
+  assert.equal(editedProgressOldCurrentOld.exitCode, 1);
+  assert.equal(editedProgressOldCurrentOld.report.gateOutcome, "pending");
+  assert.equal(
+    editedProgressOldCurrentOld.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(
+    editedProgressOldCurrentOld.report.reason,
+    /earlier request 101.*newer request 105/iu,
+  );
+  assert.equal(
+    editedProgressOldCurrentOldGitHub.statusWrites.some(
+      ({ state }) => state === "success",
+    ),
+    false,
+  );
+
   const predecessorClosedGitHub = createGitHubMock({
     issueComments: [generationA, generationB, delayedCleanFromA],
     reactionsByCommentId: new Map([
@@ -1783,9 +1954,35 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     predecessorClosedEnvironment,
     predecessorClosedGitHub,
   );
-  assert.equal(predecessorClosed.exitCode, 0);
-  assert.equal(predecessorClosed.report.gateOutcome, "success");
-  assert.match(predecessorClosed.report.reason, /issue-comment 203/u);
+  assert.equal(predecessorClosed.exitCode, 1);
+  assert.equal(predecessorClosed.report.gateOutcome, "pending");
+  assert.equal(
+    predecessorClosed.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(predecessorClosed.report.reason, /cannot be uniquely attributed.*request 102/iu);
+  assert.equal(
+    predecessorClosedGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const predecessorAndLatestDirectGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 532, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({ id: 533, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const predecessorAndLatestDirectEnvironment = runtimeEnvironment(context, {
+    suffix: "all-overlapping-generations-directly-closed",
+  });
+  const { result: predecessorAndLatestDirect } = await runGate(
+    predecessorAndLatestDirectEnvironment,
+    predecessorAndLatestDirectGitHub,
+  );
+  assert.equal(predecessorAndLatestDirect.exitCode, 0);
+  assert.equal(predecessorAndLatestDirect.report.gateOutcome, "success");
+  assert.match(predecessorAndLatestDirect.report.reason, /request-reaction 533/u);
 
   const completedGenerationA = cleanIssueComment(HEAD, {
     id: 202,
@@ -1812,9 +2009,33 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     providerClosedEnvironment,
     providerClosedGitHub,
   );
-  assert.equal(providerClosed.exitCode, 0);
-  assert.equal(providerClosed.report.gateOutcome, "success");
-  assert.match(providerClosed.report.reason, /issue-comment 203/u);
+  assert.equal(providerClosed.exitCode, 1);
+  assert.equal(providerClosed.report.gateOutcome, "pending");
+  assert.equal(providerClosed.report.recoveryCode, "request_clean_generation");
+  assert.match(providerClosed.report.reason, /cannot be uniquely attributed.*request 102/iu);
+
+  const providerFirstGapDirectLatestGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      completedGenerationA,
+      generationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 534,
+      created_at: "2026-08-25T08:05:00Z",
+    })]]]),
+  });
+  const providerFirstGapDirectLatestEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-first-gap-direct-latest",
+  });
+  const { result: providerFirstGapDirectLatest } = await runGate(
+    providerFirstGapDirectLatestEnvironment,
+    providerFirstGapDirectLatestGitHub,
+  );
+  assert.equal(providerFirstGapDirectLatest.exitCode, 0);
+  assert.equal(providerFirstGapDirectLatest.report.gateOutcome, "success");
+  assert.match(providerFirstGapDirectLatest.report.reason, /request-reaction 534/u);
 
   const equalBoundaryGitHub = createGitHubMock({
     issueComments: [
@@ -1838,6 +2059,172 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
   assert.equal(equalBoundary.exitCode, 1);
   assert.equal(equalBoundary.report.gateOutcome, "pending");
   assert.equal(equalBoundary.report.recoveryCode, "request_clean_generation");
+});
+
+test("unbound terminal carriers cannot cross overlapping generations", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const terminalA = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const delayedTerminalA = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+  });
+
+  const ambiguousLatestGitHub = createGitHubMock({
+    issueComments: [generationA, terminalA, generationB, delayedTerminalA],
+  });
+  const ambiguousLatestEnvironment = runtimeEnvironment(context, {
+    suffix: "unbound-terminal-cannot-satisfy-second-generation",
+  });
+  const { result: ambiguousLatest } = await runGate(
+    ambiguousLatestEnvironment,
+    ambiguousLatestGitHub,
+  );
+  assert.equal(ambiguousLatest.exitCode, 1);
+  assert.equal(ambiguousLatest.report.gateOutcome, "pending");
+  assert.equal(ambiguousLatest.report.recoveryCode, "request_clean_generation");
+  assert.match(ambiguousLatest.report.reason, /cannot be uniquely attributed.*request 102/iu);
+  assert.equal(
+    ambiguousLatestGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const findingA = findingIssueComment(HEAD, {
+    id: 202,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const ambiguousSupersessionGitHub = createGitHubMock({
+    issueComments: [generationA, findingA, generationB, delayedTerminalA],
+  });
+  const ambiguousSupersessionEnvironment = runtimeEnvironment(context, {
+    suffix: "unbound-terminal-cannot-supersede-finding-for-second-generation",
+  });
+  const { result: ambiguousSupersession } = await runGate(
+    ambiguousSupersessionEnvironment,
+    ambiguousSupersessionGitHub,
+  );
+  assert.equal(ambiguousSupersession.exitCode, 1);
+  assert.equal(ambiguousSupersession.report.gateOutcome, "failure");
+  assert.equal(ambiguousSupersession.report.recoveryCode, "fix_findings");
+  assert.equal(ambiguousSupersession.report.counts.unresolved, 1);
+  assert.equal(ambiguousSupersession.report.counts.resolved, 0);
+  assert.equal(
+    ambiguousSupersessionGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const directLatestGitHub = createGitHubMock({
+    issueComments: [generationA, terminalA, generationB, delayedTerminalA],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 540,
+      created_at: "2026-08-25T08:03:30Z",
+    })]]]),
+  });
+  const directLatestEnvironment = runtimeEnvironment(context, {
+    suffix: "first-provider-gap-and-direct-latest-recover",
+  });
+  const { result: directLatest } = await runGate(
+    directLatestEnvironment,
+    directLatestGitHub,
+  );
+  assert.equal(directLatest.exitCode, 0);
+  assert.equal(directLatest.report.gateOutcome, "success");
+  assert.match(directLatest.report.reason, /request-reaction 540/u);
+
+  const generationC = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const threeGenerationGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      terminalA,
+      generationB,
+      delayedTerminalA,
+      generationC,
+    ],
+    reactionsByCommentId: new Map([["103", [reaction({
+      id: 541,
+      created_at: "2026-08-25T08:05:00Z",
+    })]]]),
+  });
+  const threeGenerationEnvironment = runtimeEnvironment(context, {
+    suffix: "delayed-terminal-cannot-close-second-of-three-generations",
+  });
+  const { result: threeGeneration } = await runGate(
+    threeGenerationEnvironment,
+    threeGenerationGitHub,
+  );
+  assert.equal(threeGeneration.exitCode, 1);
+  assert.equal(threeGeneration.report.gateOutcome, "pending");
+  assert.equal(threeGeneration.report.recoveryCode, "request_clean_generation");
+  assert.match(threeGeneration.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(
+    threeGenerationGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const threeGenerationRecoveredGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      terminalA,
+      generationB,
+      delayedTerminalA,
+      generationC,
+    ],
+    reactionsByCommentId: new Map([
+      ["102", [reaction({ id: 542, created_at: "2026-08-25T08:03:30Z" })]],
+      ["103", [reaction({ id: 543, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const threeGenerationRecoveredEnvironment = runtimeEnvironment(context, {
+    suffix: "each-later-generation-directly-closed",
+  });
+  const { result: threeGenerationRecovered } = await runGate(
+    threeGenerationRecoveredEnvironment,
+    threeGenerationRecoveredGitHub,
+  );
+  assert.equal(threeGenerationRecovered.exitCode, 0);
+  assert.equal(threeGenerationRecovered.report.gateOutcome, "success");
+  assert.match(threeGenerationRecovered.report.reason, /request-reaction 543/u);
+
+  const directFirstGapGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedTerminalA, generationC],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 544, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 545, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const directFirstGapEnvironment = runtimeEnvironment(context, {
+    suffix: "direct-first-gap-does-not-rearm-unbound-terminal",
+  });
+  const { result: directFirstGap } = await runGate(
+    directFirstGapEnvironment,
+    directFirstGapGitHub,
+  );
+  assert.equal(directFirstGap.exitCode, 1);
+  assert.equal(directFirstGap.report.gateOutcome, "pending");
+  assert.equal(directFirstGap.report.recoveryCode, "request_clean_generation");
+  assert.match(directFirstGap.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(
+    directFirstGapGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
 });
 
 test("same-run request siblings preserve every physical generation gap", async (context) => {
@@ -1994,12 +2381,14 @@ test("same-head finding remains blocking after clean from the same generation", 
   assert.deepEqual(github.statusWrites, []);
 });
 
-test("finding supersession requires a strictly newer authorized generation and later head-bound clean", async (context) => {
+test("finding supersession requires a strictly newer authorized generation and request-bound clean", async (context) => {
   const first = ordinaryRequest({ id: 101 });
-  const second = ordinaryRequest({
+  const second = workflowRequest({
     id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
     created_at: "2026-08-25T08:10:00Z",
     updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
   });
   const clean = cleanIssueComment(HEAD, {
     id: 203,
@@ -2009,6 +2398,10 @@ test("finding supersession requires a strictly newer authorized generation and l
   const github = createGitHubMock({
     issueComments: [first, second, clean],
     reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00Z" })],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 550,
+      created_at: "2026-08-25T08:15:30Z",
+    })]]]),
   });
   const environment = runtimeEnvironment(context, { suffix: "superseded" });
   const { result } = await runGate(environment, github);
@@ -2031,10 +2424,12 @@ test("finding supersession requires a strictly newer authorized generation and l
 });
 
 test("a strict later generation can supersede an older cross-channel timestamp ambiguity", async (context) => {
-  const laterGeneration = ordinaryRequest({
+  const laterGeneration = workflowRequest({
     id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
     created_at: "2026-08-25T08:10:00Z",
     updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
   });
   const laterClean = cleanIssueComment(HEAD, {
     id: 203,
@@ -2052,6 +2447,10 @@ test("a strict later generation can supersede an older cross-channel timestamp a
       laterClean,
     ],
     reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00.900Z" })],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 551,
+      created_at: "2026-08-25T08:15:30Z",
+    })]]]),
   });
   const environment = runtimeEnvironment(context, { suffix: "old-channel-conflict" });
   const { result } = await runGate(environment, github);

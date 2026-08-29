@@ -3097,6 +3097,7 @@ function reduceV2Evidence({
     currentArtifacts: currentHeadTerminalArtifacts,
     requestReactions,
     progressArtifacts: scopedProgressArtifacts,
+    allowProviderTerminalFirstGapClosure: baseEpochMs === null,
   });
   const sameTimeConflicts = findCrossChannelTimestampConflicts(currentArtifacts);
   for (const conflict of sameTimeConflicts) {
@@ -3347,10 +3348,10 @@ function isV2QualifyingCleanForGeneration(
     isCanonicalUtcTimestamp(reaction?.created_at) &&
     Date.parse(reaction.created_at) >= cleanMs
   );
-  const laterProgress = progressArtifacts.some((artifact) =>
-    isCanonicalUtcTimestamp(artifact.createdAt) &&
-    Date.parse(artifact.createdAt) >= cleanMs
-  );
+  const laterProgress = progressArtifacts.some((artifact) => {
+    const window = v2ProgressActivityWindow(artifact);
+    return !window || window.revisionMs >= cleanMs;
+  });
   return !laterEyes && !laterProgress;
 }
 
@@ -3388,6 +3389,14 @@ function v2CleanLineageError({
       `before newer request ${successor.id}`
     );
   }
+  if (clean.source !== "request-reaction" && generationIndex > 0) {
+    const predecessor = generationLineage.generations[generationIndex - 1];
+    return (
+      `Terminal clean ${clean.source}:${clean.id} cannot be uniquely attributed to review request ` +
+      `${generation.id}: earlier physical request ${predecessor.id} can emit delayed or duplicate ` +
+      `terminal carriers; obtain a qualifying Codex +1 directly on request ${generation.id}`
+    );
+  }
   return null;
 }
 
@@ -3396,6 +3405,7 @@ function buildV2GenerationLineage({
   currentArtifacts,
   requestReactions,
   progressArtifacts,
+  allowProviderTerminalFirstGapClosure = true,
 }) {
   const generations = [...(currentRequests ?? [])]
     .filter((request) => Number.isFinite(request?.revisionMs))
@@ -3404,14 +3414,24 @@ function buildV2GenerationLineage({
       (BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0)
     );
   const indexById = new Map(generations.map((request, index) => [request.id, index]));
-  const terminalTimes = (currentArtifacts ?? [])
+  const providerTerminals = (currentArtifacts ?? [])
     .filter((artifact) =>
       artifact.source !== "request-reaction" &&
       (artifact.kind === "clean" || artifact.kind === "finding")
     )
-    .map((artifact) => Date.parse(artifact.createdAt))
-    .filter(Number.isFinite)
-    .sort((left, right) => left - right);
+    .map((artifact) => ({
+      source: artifact.source,
+      id: artifact.id,
+      kind: artifact.kind,
+      createdAt: artifact.createdAt,
+      createdMs: Date.parse(artifact.createdAt),
+    }))
+    .filter((artifact) => Number.isFinite(artifact.createdMs))
+    .sort((left, right) =>
+      left.createdMs - right.createdMs ||
+      left.source.localeCompare(right.source) ||
+      compareV2CanonicalIdsAscending(left, right)
+    );
   const canonicalReactionIdCounts = new Map();
   for (const inventory of requestReactions?.values() ?? []) {
     for (const reaction of inventory) {
@@ -3420,19 +3440,17 @@ function buildV2GenerationLineage({
     }
   }
   const firstUnclosedGapByGeneration = Array(generations.length).fill(null);
+  const gapClosures = Array(Math.max(0, generations.length - 1)).fill(null);
   let firstUnclosedGap = null;
-  let terminalIndex = 0;
   for (let index = 0; index + 1 < generations.length; index += 1) {
     const predecessor = generations[index];
     const successor = generations[index + 1];
-    while (
-      terminalIndex < terminalTimes.length &&
-      terminalTimes[terminalIndex] <= predecessor.revisionMs
-    ) {
-      terminalIndex += 1;
-    }
-    const providerClosed = terminalIndex < terminalTimes.length &&
-      terminalTimes[terminalIndex] < successor.revisionMs;
+    const providerClosure = allowProviderTerminalFirstGapClosure && index === 0
+      ? providerTerminals.find((terminal) =>
+          terminal.createdMs > predecessor.revisionMs &&
+          terminal.createdMs < successor.revisionMs
+        ) ?? null
+      : null;
     const reactionClosed = predecessor.headBound === true &&
       hasV2DirectReactionClosureBefore({
         request: predecessor,
@@ -3441,7 +3459,18 @@ function buildV2GenerationLineage({
         canonicalReactionIdCounts,
         progressArtifacts,
       });
-    if (!providerClosed && !reactionClosed && firstUnclosedGap === null) {
+    if (providerClosure) {
+      gapClosures[index] = {
+        kind: "provider-terminal",
+        source: providerClosure.source,
+        id: providerClosure.id,
+      };
+    } else if (reactionClosed) {
+      gapClosures[index] = {
+        kind: "request-reaction",
+        requestId: predecessor.id,
+      };
+    } else if (firstUnclosedGap === null) {
       firstUnclosedGap = index;
     }
     firstUnclosedGapByGeneration[index + 1] = firstUnclosedGap;
@@ -3450,7 +3479,82 @@ function buildV2GenerationLineage({
     generations,
     indexById,
     firstUnclosedGapByGeneration,
+    gapClosures,
   };
+}
+
+function v2ProgressActivityWindow(artifact) {
+  const carrierCreatedAt = artifact?.carrierCreatedAt;
+  const revisionAt = artifact?.revisionAt || artifact?.createdAt;
+  if (
+    !isCanonicalUtcTimestamp(carrierCreatedAt) ||
+    !isCanonicalUtcTimestamp(revisionAt)
+  ) {
+    return null;
+  }
+  const carrierCreatedMs = Date.parse(carrierCreatedAt);
+  const revisionMs = Date.parse(revisionAt);
+  if (
+    !Number.isFinite(carrierCreatedMs) ||
+    !Number.isFinite(revisionMs) ||
+    revisionMs < carrierCreatedMs
+  ) {
+    return null;
+  }
+  return { carrierCreatedMs, revisionMs };
+}
+
+function uniqueV2BoundaryGroupHead(boundaries) {
+  const heads = (boundaries ?? []).map((boundary) =>
+    boundary?.headBound === true
+      ? String(boundary?.binding?.headSha || "").toLowerCase()
+      : ""
+  );
+  if (heads.length === 0 || heads.some((head) => !FULL_SHA.test(head))) {
+    return null;
+  }
+  const uniqueHeads = new Set(heads);
+  return uniqueHeads.size === 1 ? heads[0] : null;
+}
+
+function v2UnboundProgressWindowHead(artifact, boundaries) {
+  const window = v2ProgressActivityWindow(artifact);
+  if (!window) return null;
+
+  const boundaryGroups = new Map();
+  for (const boundary of boundaries ?? []) {
+    if (!Number.isFinite(boundary?.revisionMs)) continue;
+    const group = boundaryGroups.get(boundary.revisionMs) ?? [];
+    group.push(boundary);
+    boundaryGroups.set(boundary.revisionMs, group);
+  }
+  if (
+    boundaryGroups.has(window.carrierCreatedMs) ||
+    boundaryGroups.has(window.revisionMs)
+  ) {
+    return null;
+  }
+
+  const orderedTimes = [...boundaryGroups.keys()].sort((left, right) => left - right);
+  const originMs = orderedTimes
+    .filter((boundaryMs) => boundaryMs < window.carrierCreatedMs)
+    .at(-1);
+  if (!Number.isFinite(originMs)) return null;
+
+  const originHead = uniqueV2BoundaryGroupHead(boundaryGroups.get(originMs));
+  if (!originHead) return null;
+  for (const boundaryMs of orderedTimes) {
+    if (
+      boundaryMs <= window.carrierCreatedMs ||
+      boundaryMs >= window.revisionMs
+    ) {
+      continue;
+    }
+    if (uniqueV2BoundaryGroupHead(boundaryGroups.get(boundaryMs)) !== originHead) {
+      return null;
+    }
+  }
+  return originHead;
 }
 
 function scopeV2ProgressArtifactsToCurrentHead({
@@ -3476,31 +3580,8 @@ function scopeV2ProgressArtifactsToCurrentHead({
       return true;
     }
 
-    const progressMs = Date.parse(artifact?.createdAt);
-    if (!Number.isFinite(progressMs)) return true;
-    let latestBoundaryMs = Number.NEGATIVE_INFINITY;
-    let latestBoundaries = [];
-    for (const boundary of boundaries) {
-      if (boundary.revisionMs === progressMs) return true;
-      if (boundary.revisionMs > progressMs) continue;
-      if (boundary.revisionMs > latestBoundaryMs) {
-        latestBoundaryMs = boundary.revisionMs;
-        latestBoundaries = [boundary];
-      } else if (boundary.revisionMs === latestBoundaryMs) {
-        latestBoundaries.push(boundary);
-      }
-    }
-    if (latestBoundaries.length === 0) return true;
-
-    const boundHeads = latestBoundaries.map((boundary) =>
-      boundary?.headBound === true
-        ? String(boundary?.binding?.headSha || "").toLowerCase()
-        : ""
-    );
-    if (boundHeads.some((boundHead) => !FULL_SHA.test(boundHead))) return true;
-    const uniqueHeads = new Set(boundHeads);
-    if (uniqueHeads.size !== 1) return true;
-    return boundHeads[0] === headSha;
+    const windowHead = v2UnboundProgressWindowHead(artifact, boundaries);
+    return !windowHead || windowHead === headSha;
   });
 }
 
@@ -3531,11 +3612,13 @@ function hasV2DirectReactionClosureBefore({
       return false;
     }
     const plusOneMs = Date.parse(reaction.created_at);
-    const laterProgressBeforeBoundary = (progressArtifacts ?? []).some((artifact) =>
-      isCanonicalUtcTimestamp(artifact?.createdAt) &&
-      Date.parse(artifact.createdAt) >= plusOneMs &&
-      Date.parse(artifact.createdAt) <= beforeMs
-    );
+    const laterProgressBeforeBoundary = (progressArtifacts ?? []).some((artifact) => {
+      const window = v2ProgressActivityWindow(artifact);
+      return !window || (
+        window.revisionMs >= plusOneMs &&
+        window.carrierCreatedMs <= beforeMs
+      );
+    });
     return plusOneMs > request.revisionMs &&
       plusOneMs < beforeMs &&
       !officialEyes.some((eyes) =>

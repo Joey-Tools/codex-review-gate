@@ -235,19 +235,28 @@ marker on PRs that have no base epoch. Findings remain conservative across the
 epoch boundary, and an unlineaged terminal clean stays pending rather than
 being guessed into the new generation.
 
-Terminal clean text and a qualifying provider `+1` otherwise have equal clean
-authority once request lineage is complete; the base-epoch rule above is the
-deliberate carrier exception. Every physical request comment is a generation
-boundary, including duplicate hidden markers from one workflow run. A clean
-for a newer request cannot cross an earlier unclosed boundary. The predecessor
-must have received provider terminal evidence, or its own qualifying
-request-bound `+1`, strictly before the successor request. A same-or-later
-official `eyes` or provider progress signal no later than that successor keeps
-the predecessor open; equality with the successor is timestamp-ordering
-ambiguity, not proof of completion. A later clean cannot repair an already
-ambiguous gap. Unbound progress is discarded as historical only when the most
-recent strictly earlier physical request boundary uniquely binds another head;
-missing, ordinary, conflicting, or same-time boundaries stay fail-closed.
+Terminal clean text and a qualifying provider `+1` have equal clean authority
+only for the first physical generation of a no-base-epoch, single-flight
+lineage. Every physical request comment is a generation boundary, including
+duplicate hidden markers from one workflow run. Without a base epoch, provider
+terminal evidence strictly between the first request and its successor may
+close only that first gap. Every later gap, and positive clean authority for any
+generation that has a physical predecessor, requires a qualifying `+1`
+directly on that request. An unbound terminal cannot prove whether it belongs
+to the newer request or is a delayed or duplicate carrier from an older one;
+it therefore cannot pass or supersede findings for the newer generation. With
+a base epoch, even the first gap requires request-bound `+1` evidence.
+
+A same-or-later official `eyes` or provider progress signal no later than a
+successor keeps the predecessor open; equality with the successor is
+timestamp-ordering ambiguity, not proof of completion. A later clean cannot
+repair an already ambiguous gap. Explicitly commit-bound progress is scoped to
+that head. Unbound edited progress is treated as the closed carrier interval
+from `created_at` through its current revision time. It is discarded as
+historical only when that entire interval, including every intervening
+physical boundary, uniquely remains on one different full head. Missing,
+ordinary, conflicting, cross-head, or endpoint-same-time boundaries stay
+fail-closed.
 Ordinary request reactions are provider liveness signals only; ordinary `+1`
 cannot head-bind clean by itself. Same-time/later official `eyes`/progress from
 Codex vetoes a candidate clean because review activity has not been proved
@@ -262,7 +271,9 @@ Any qualifying current-head non-inline finding blocks immediately. On the
 same head, an older finding can be superseded only by:
 
 1. a strictly newer authorised review generation; and
-2. a later clean result bound to that generation and head.
+2. a later clean result bound to that generation and head under the lineage
+   rule above: an unbound terminal only for the first no-base-epoch generation,
+   otherwise a qualifying request-bound `+1`.
 
 An arbitrary later clean does not erase findings. Ambiguous order or binding
 cannot pass. Historical findings remain visible in diagnostics.

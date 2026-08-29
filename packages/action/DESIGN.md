@@ -286,25 +286,34 @@ The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
 permission.
 
-Terminal clean text and a qualifying provider `+1` are normally equal clean
-carriers after generation lineage is complete. Every physical request comment
-is a generation boundary, including same-run duplicate hidden markers. Before
-a later generation can pass, each predecessor must have provider terminal
-evidence, or its own qualifying request-bound `+1`, strictly between that
-predecessor and its successor. Official `eyes` or provider progress at or after
-the `+1` and no later than the successor keeps the predecessor open. Equality
-with the successor is ambiguous at GitHub's timestamp precision and therefore
-cannot prove that review activity ended before the new generation. A clean
-bound to the latest request cannot bypass an earlier unclosed gap, and evidence
-arriving after the successor cannot retroactively repair that gap.
+Terminal clean text and a qualifying provider `+1` are equal clean carriers
+only for the first physical generation of a no-base-epoch, single-flight
+lineage. Every physical request comment is a generation boundary, including
+same-run duplicate hidden markers. Without a base epoch, provider terminal
+evidence strictly between the first request and its successor may close only
+that first gap. Every later predecessor-to-successor gap, and positive or
+superseding authority for any generation with a physical predecessor, requires
+a qualifying `+1` directly on that request. Provider terminal payloads have no
+originating request ID, so a later carrier could be delayed or duplicated from
+any older generation; stable snapshots cannot make that attribution unique.
+After a base epoch, provider terminal evidence cannot close even the first gap.
+
+Official `eyes` or provider progress at or after a request-bound `+1` and no
+later than the successor keeps the predecessor open. Equality with the
+successor is ambiguous at GitHub's timestamp precision and therefore cannot
+prove that review activity ended before the new generation. A clean bound to
+the latest request cannot bypass an earlier unclosed gap, and evidence arriving
+after the successor cannot retroactively repair that gap.
 
 Progress with one unambiguous commit binding is scoped directly to that head.
-Unbound progress may be excluded as historical only when its most recent
-strictly earlier physical request boundary is uniquely canonical and bound to a
-different head. An ordinary or conflicting boundary, no earlier boundary, or a
-boundary at the same timestamp remains fail-closed in the current-head
-inventory. This prevents old-head progress from contaminating a new generation
-without guessing ambiguous activity away.
+Unbound edited progress is a carrier interval from its immutable creation time
+through its current revision time. It may be excluded as historical only when
+both endpoints are canonically ordered and every physical request boundary
+from the strictly earlier origin through the revision uniquely binds the same
+different full head. No origin, an ordinary or conflicting boundary, a head
+transition inside the interval, or a boundary equal to either endpoint remains
+fail-closed in the current-head inventory. This filters provably old-head
+progress without guessing edited or same-time activity away.
 
 After any observed base epoch, terminal payloads cannot prove which
 request/base snapshot produced them. In that degraded lineage mode, only a
@@ -330,8 +339,9 @@ head, an older non-inline finding is superseded only when both of these are
 proved:
 
 1. a strictly newer authorised review generation exists; and
-2. a later head-bound terminal clean or qualifying `+1` belongs to that newer
-   generation, subject to the base-epoch direct-reaction rule above.
+2. a later clean belongs to that newer generation under the lineage rule
+   above: an unbound terminal only when it is the first no-base-epoch physical
+   generation, otherwise a qualifying request-bound `+1`.
 
 An unrelated later clean cannot clear the finding. Ambiguous temporal order,
 generation binding or head binding remains failure or inconclusive. A

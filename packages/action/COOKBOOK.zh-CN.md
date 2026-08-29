@@ -223,15 +223,19 @@ finding 真实存在时，修复后使用 `fix_findings`。代码无需变化、
 或不适用时，使用 `request_clean_generation`。两种情况都要等待 later provider
 result 后 reconcile；只解决 inline conversation 不会改变 reducer state。
 
-除此之外，terminal clean text 与合格 provider `+1` 具有相同 clean authority。明确例外是
-已经观察到 base epoch 的 PR：只有直接附着于 latest post-epoch、base-bound canonical
-request 的合格 `+1` 可以 pass 或 supersede finding；无法归因的 terminal clean 保持
-pending。
+terminal clean text 与合格 provider `+1`，只有在没有 base epoch、single-flight
+lineage 的第一个物理 generation 中才具有相同 clean authority。出现第二个物理
+request 后，provider terminal evidence 只能闭合第一个 gap；之后的每个 gap，以及新
+generation 的 positive/superseding authority，都必须来自直接附着于相关 request 的
+合格 `+1`。延迟或重复、无法归因的 terminal 保持 pending。已经观察到 base epoch 时，
+每个 gap 和 latest generation 都必须使用 request-bound `+1`。
 
 ordinary request reactions 仅用于 liveness；ordinary `+1` 不能 head-bind clean。
 same-time/later official `eyes`/progress from Codex 会阻止 candidate clean 完成。
 reaction-only change 不会启动 automatic run；通过 later provider event or manual
 reconcile 观察它。
+unbound edited progress 在 creation-to-revision interval 内始终属于 liveness，除非
+整个区间可证明只归属于同一个其他 full head。
 
 ## Stable-snapshot 恢复
 

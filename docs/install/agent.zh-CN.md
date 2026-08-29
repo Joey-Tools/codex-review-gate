@@ -444,6 +444,16 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    liveness 也无法排序，必须保持 predecessor open。不要用更晚证据修补该 gap；应创建一个
    合法新 head，并只启动一个 canonical review generation。
 
+   把每条物理 request 都视为 generation boundary。没有 base epoch 时，unbound provider
+   terminal evidence 只能闭合第一个 gap；只要前面已有物理 request，之后的每个 gap 和
+   positive/superseding authority 都必须来自直接附着在对应 canonical request 上的合格
+   `+1`。有 base epoch 时，每个 gap 都必须使用 direct `+1`。绝不能只按 timestamp 把
+   later terminal 归给新 generation；它可能是旧 flight 的延迟或重复 carrier。unbound
+   edited progress 必须按从创建到 revision 的区间处理。只有两个端点顺序 canonical，且从
+   严格更早 origin 到 revision 的每条物理 boundary 都唯一绑定同一个其他 full head 时，
+   才能作为 historical 排除。缺少 origin、ordinary/conflicting boundary、区间内 head
+   transition，或任一端点与 boundary 同时，都保留为 fail-closed。
+
    选择这个低成本路径前，识别 GitHub 记录在 exact current PR feature-head SHA 上的原生
    `codex/github-review-gate` verifier run/job/CheckRun，并要求该 run 绑定 current test-merge。
    Workflow 刻意没有 cron 或可写 review event。若

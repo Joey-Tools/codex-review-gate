@@ -206,22 +206,26 @@ recovery rule：只有直接附着在 epoch 后、绑定当前 base 的 canonica
 `@codex review`。findings 在 epoch boundary 两侧始终保守阻塞；无法归因的 terminal
 clean 保持 pending，runtime 不会猜测它属于新 generation。
 
-除此 base-epoch lineage 例外外，terminal clean 文本和符合条件的 provider `+1`
-具有相同 clean authority。
-每条物理 request comment 都是 generation boundary，同一次 workflow run 的 duplicate
-hidden markers 也不例外。后一个 generation 要 pass，前一个 generation 必须在自身与
-后继 boundary 之间严格收到 provider terminal evidence，或在自身 request 上收到合格
-的 `+1`。同一个或更晚的 official `eyes`/provider progress 如果不晚于后继 boundary，
-会让前一个 generation 保持 open；与后继 boundary 同时属于 timestamp-ordering
-ambiguity，不能证明 review 已经完成。最新 request 的 clean 不能跨过更早的 unclosed
-gap，后继 boundary 之后才到达的 evidence 也不能倒推修复该 gap。
+terminal clean 文本和符合条件的 provider `+1`，只有在没有 base epoch、single-flight
+lineage 的第一个物理 generation 中才具有相同 clean authority。每条物理 request
+comment 都是 generation boundary，同一次 workflow run 的 duplicate hidden markers
+也不例外。没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider
+terminal evidence 只能闭合第一个 gap。之后的每个 gap，以及任何前面已有物理 request
+的 generation 所需 positive clean/superseding authority，都必须来自直接附着于该
+request 的合格 `+1`。terminal payload 没有 originating request ID，无法证明它属于
+新 request，还是旧 generation 的延迟或重复 carrier，因此不能让新 generation pass
+或 supersede findings。出现 base epoch 后，连第一个 gap 也必须使用 request-bound
+`+1`。
 
-带有单一、无歧义 commit binding 的 progress 会直接归入对应 head。unbound progress
-只有在最近的严格更早物理 request boundary 唯一、canonical 且绑定到其他 head 时，
-才能作为 historical 排除。没有更早 boundary、最近 boundary 是 ordinary 或存在冲突，
-以及任一 boundary 与 progress 同时，都必须在 current-head inventory 中保持
-fail-closed。这样可以过滤确定属于 old head 的 progress，同时不会猜测丢弃时间顺序
-有歧义的 review activity。
+同一个或更晚的 official `eyes`/provider progress 如果不晚于后继 boundary，会让前一个
+generation 保持 open；与后继 boundary 同时属于 timestamp-ordering ambiguity，不能
+证明 review 已经完成。最新 request 的 clean 不能跨过更早的 unclosed gap，后继
+boundary 之后才到达的 evidence 也不能倒推修复该 gap。带有单一、无歧义 commit
+binding 的 progress 会直接归入对应 head。unbound edited progress 被视为从
+`created_at` 到当前 revision time 的闭区间；只有两个端点及区间内每条物理 boundary
+始终唯一绑定到同一个其他 full head 时，才能作为 historical 排除。缺少 origin、
+ordinary/conflicting boundary、区间内 head transition，或任一端点与 boundary 同时，
+都必须在 current-head inventory 中保持 fail-closed。
 ordinary request reactions 仅用于 provider liveness；ordinary `+1` 本身不能
 head-bind clean。same-time/later official `eyes`/progress from Codex 会 veto candidate
 clean，因为 review activity 尚未被证明 terminal。reaction-only change 没有 automatic
@@ -234,7 +238,9 @@ resolved SHA 还必须与 review 原生 `commit_id` 一致。
 旧 finding 只有同时满足以下条件才能被 supersede：
 
 1. 存在严格更新的 authorised review generation；
-2. 随后出现绑定该 generation 和 head 的 clean result。
+2. 随后出现符合上述 lineage rule、绑定该 generation 和 head 的 clean result：只有
+   no-base-epoch 的第一个 generation 可以使用 unbound terminal，其他情况必须使用
+   合格的 request-bound `+1`。
 
 任意更晚的 clean 不能抹掉 findings。ordering 或 binding 有歧义时不能 pass。
 historical findings 仍保留在 diagnostics 中。

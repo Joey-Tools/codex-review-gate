@@ -65,6 +65,16 @@ activity 仍然有效并 veto success。Reaction 变化本身不会启动 consum
 后续合格 bot comment 触发，或手动 dispatch exact-head `reconcile`。
 在 predecessor-to-successor generation closure 中，与 successor request 同一时间戳的
 liveness 也无法排序，必须保持 predecessor open。
+一旦出现第二个物理 request boundary，unbound terminal 就无法证明自己属于新 request，
+而不是旧 flight 的延迟结果。没有 base epoch 时，provider terminal evidence 只能闭合
+第一个 gap；之后的每个 gap 和新 generation 的 clean authority，都必须来自直接附着在
+对应 canonical request 上的合格 `+1`。有 base epoch 时，每个 gap 都必须如此。若旧 gap
+已经无法在原始窗口内闭合，应创建一个合法新 head，并且只启动一个 canonical producer
+flight。unbound edited progress 会被视为从创建到最新 revision 的持续 activity。只有
+两个端点顺序 canonical，且从严格更早 origin 到 revision 的每条物理 boundary 都唯一
+绑定同一个其他 full head 时，才能作为 historical 排除。缺少 origin、
+ordinary/conflicting boundary、区间内 head transition，或任一端点与 boundary 同时，
+都保持 fail-closed。
 
 先选择一个 GitHub user 作为 `CONTROL_PLANE_OWNER`；该账号必须对 consumer repository
 拥有 `write`、`maintain` 或 `admin` 权限。Helper 默认使用 `@JoeyTeng`，所有非 Joey

@@ -3005,12 +3005,14 @@ superseded_by:
   allow the delayed clean to pass. This contradicted the adopted rule that a
   same-time physical boundary is ordering ambiguity and must remain
   fail-closed.
-- The runtime now retains unbound progress whenever any physical request
-  boundary has the same revision timestamp. Only after ruling out that
-  ambiguity does it apply the existing most-recent-strictly-earlier-boundary
-  rule. It deliberately does not use comment IDs as a timestamp tie-break:
+- The `7e8d174` follow-up retained unbound progress whenever any physical
+  request boundary had the same revision timestamp. Only after ruling out that
+  ambiguity did it apply the existing most-recent-strictly-earlier-boundary
+  rule. It deliberately did not use comment IDs as a timestamp tie-break:
   provider progress can use an edited comment's revision time, while a comment
   ID orders creation and cannot prove the within-second edit/request order.
+  The subsequent frozen-head review below proved that revision-only scoping was
+  still incomplete and superseded it with the carrier-interval rule.
 - Two integration regressions close both sides of the contract. The first
   reproduces the fail-open combination with the current-head successor at the
   same time as progress. The second keeps progress fail-closed when the
@@ -3030,6 +3032,77 @@ superseded_by:
   - `npm run check` passed.
   The follow-up still requires the ordinary diff checks, journal validation,
   signed commit, and a new fresh whole-range exact-head review before push.
+
+### Second frozen-head review: terminal attribution and edited progress
+
+- The next fresh ordinary GPT-5.6 Sol Ultra lane reviewed the complete exact
+  range
+  `cf640dc84d2d59ead9acc2ea9cd1c74e4441aaff..7e8d174ca1e1699712f693faec3e5d31fd5c5010`.
+  It found one High terminal-attribution fail-open and one Medium edited-
+  progress fail-open. It found no other High or Medium issue in the
+  Publisher/Release/tag/alias, CI matrix/partial-rerun, or bilingual-contract
+  paths.
+- The High sequence used two or more physical review generations on one head.
+  Provider terminal comments and reviews do not carry an originating request
+  ID. The prior reducer flattened those carriers to timestamps, allowed one
+  terminal from generation A before request B to close `A -> B`, and then
+  allowed a delayed or duplicate second A carrier after B to act as B's clean.
+  With three generations, the same timestamp-only rule could also let a
+  delayed A carrier close `B -> C`, after which a direct `+1` on C would pass
+  even though B remained outstanding. Two identical stable snapshots prove
+  object stability, not carrier-to-request attribution, so waiting longer does
+  not repair this ambiguity.
+- The corrected lineage preserves each provider terminal's source, ID, kind,
+  and time. In a no-base-epoch lineage, unbound provider terminal evidence may
+  close only the first physical gap and may be positive clean authority only
+  for the first physical generation. Every later gap, latest clean, finding
+  supersession, and evidence-error supersession requires a qualifying direct
+  `+1` on the corresponding head-bound request. After a base epoch, provider
+  terminal evidence cannot close even the first gap; every gap and the latest
+  positive carrier must be request-bound. This keeps ordinary/single-flight
+  terminal clean useful while preventing any delayed or duplicate carrier from
+  crossing an overlapping generation.
+- Negative evidence remains asymmetric. A finding used as first-gap terminal
+  evidence still remains an unresolved finding. An ambiguous later terminal
+  cannot supersede it; only a strictly newer authorised generation and a clean
+  carrier admissible under the rule above can do so. This is the reason the
+  shared clean qualifier, rather than only final success selection, owns the
+  attribution check.
+- The Medium sequence involved an edited progress comment. Its immutable
+  `created_at` can belong to or equal a current-head request boundary while its
+  later revision follows an old-head boundary. Revision-only scoping could
+  classify it as historical and also fail to veto the predecessor's `+1`.
+  Unbound edited progress is now a closed carrier interval from creation
+  through revision. It is filtered only if both endpoints are canonical and
+  every physical boundary from the strictly earlier origin through the
+  revision uniquely stays on the same different full head. Missing, ordinary,
+  conflicting, cross-head, or endpoint-same-time boundaries retain the
+  progress. Gap liveness uses interval intersection; post-clean liveness uses
+  the revision endpoint. Comment IDs are deliberately excluded because they
+  order carrier creation, not later edits.
+- Dynamic regressions now cover two- and three-generation delayed terminal
+  carriers, findings that ambiguous clean must not resolve, direct-reaction
+  recovery for every later gap, base-epoch first-gap rejection, unedited and
+  edited same-time progress, a fully old-head edited interval that remains
+  filterable, and a cross-head edited interval that remains pending. English
+  and Chinese README, DESIGN, COOKBOOK, human install, and agent install
+  guidance state the same operator recovery rule.
+- Validation for this correction:
+  - the focused base-epoch, delayed-terminal, and multi-generation tests passed
+    3/3;
+  - the first complete v2 rerun correctly exposed two old supersession tests
+    whose expected unbound-terminal success contradicted the new invariant;
+    they were converted to canonical request-bound `+1` recovery cases; and
+  - the corrected `npm run test:v2 -- --test-reporter=dot` rerun passed 96/96,
+    and `npm run check` passed.
+  A focused pre-commit review inspected all 13 dirty files and found one
+  Medium documentation mismatch: the install guides said any crossed physical
+  boundary retained edited progress, while the implementation correctly
+  permits multiple canonical boundaries when all of them bind the same
+  different full head. The English and Chinese human and agent guides now
+  match the DESIGN interval rule, and focused follow-up review returned
+  `No findings.` A signed follow-up commit and a new fresh whole-range
+  exact-head review remain required before push.
 
 ## Verified Facts And Required Live Preflight
 

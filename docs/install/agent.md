@@ -489,6 +489,20 @@ legacy before v2 is Active and read back.
    open. Do not try to repair that gap with later evidence; create a legitimate
    new head and one canonical review generation.
 
+   Treat every physical request as a generation boundary. Without a base
+   epoch, unbound provider terminal evidence can close only the first gap; once
+   any predecessor exists, every later gap and positive/superseding authority
+   require a qualifying `+1` directly on the corresponding canonical request.
+   With a base epoch, every gap requires direct `+1` evidence. Never attribute
+   a later terminal to a newer generation merely by timestamp; it may be a
+   delayed or duplicate carrier from an older flight. Treat edited unbound
+   progress as the interval from creation through revision. It may be excluded
+   as historical only when both endpoints are canonically ordered and every
+   physical boundary from the strictly earlier origin through the revision
+   uniquely binds the same different full head. A missing origin, an ordinary
+   or conflicting boundary, a head transition, or a boundary at either
+   endpoint remains fail-closed.
+
    Before choosing this low-cost path, identify the native
    `codex/github-review-gate` verifier run/job/CheckRun that GitHub records
    against the exact current PR feature-head SHA, and require that run to be

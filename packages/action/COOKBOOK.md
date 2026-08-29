@@ -244,15 +244,22 @@ to change but the finding is obsolete or inapplicable, use
 `request_clean_generation`. In both cases, reconcile after the later provider
 result; resolving an inline conversation alone does not change reducer state.
 
-Terminal clean text and a qualifying provider `+1` otherwise carry equal clean
-authority. The exception is a PR with an observed base epoch: only a qualifying
-`+1` directly on the latest post-epoch, base-bound canonical request can pass
-or supersede a finding; unlineaged terminal clean remains pending.
+Terminal clean text and a qualifying provider `+1` carry equal clean authority
+only for the first physical generation in a no-base-epoch, single-flight
+lineage. If a second physical request exists, provider terminal evidence may
+close only the first gap; every later gap and the newer generation's positive
+or superseding authority require a qualifying `+1` directly on the relevant
+request. A delayed or duplicate unbound terminal remains pending. With an
+observed base epoch, request-bound `+1` evidence is required for every gap and
+for the latest generation.
 
 Ordinary request reactions are liveness signals only; ordinary `+1` cannot
 head-bind clean. Same-time/later official `eyes`/progress from Codex prevents
 candidate clean from completing. Reaction-only changes do not start an
 automatic run; use a later provider event or manual reconcile to observe them.
+Unbound edited progress remains liveness across its creation-to-revision
+interval unless that entire interval is provably confined to one different
+full head.
 
 ## Stable-snapshot recovery
 
