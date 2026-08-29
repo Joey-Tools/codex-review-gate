@@ -363,8 +363,16 @@ protected write 前 fail closed。
    commit、commit tree 与 GitHub signature result。Publisher identity 在首次写入前
    通过 minted token 实际输出的 App slug 与 installation ID、target scope 及
    effective rulesets 完成绑定。
-4. 为 full tag 创建或恢复 draft GitHub Release，冻结其 Release ID，然后上传
-   release assets、canonical provenance、checksums 与 detached provenance signature。
+4. 由 Publisher App 枚举完整分页 GitHub Release inventory；该 push-authorized
+   身份可以看见 drafts。要求 outer page array 非空（空 repository 的合法结果是
+   `[[]]`）、所有 ID 都是全局唯一的 safe positive integer，并且 exact tag 只能有
+   0 或 1 个匹配。已有 draft 按 inventory 中的 ID 恢复；fresh Release 先用两份稳定
+   complete inventory 证明 exact-tag absence，创建后再用两份稳定 complete inventory
+   唯一发现一个 Release 并冻结其 ID。随后向该对象上传 release assets、canonical
+   provenance、checksums 与 detached provenance signature，但只能使用 numeric-ID
+   `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets` endpoint，绝不
+   使用会重新按 tag 解析对象的 upload command。每个 response 必须返回 positive safe
+   asset ID、exact name 与 `uploaded` state，之后才可由 by-ID Release boundary admit。
 5. 完成 governing policy reads，再执行上述最终 exact draft Release、asset 与
    tag boundary。通过对 frozen Release ID 发送携带 exact metadata 的 direct
    `PATCH` 完成发布，然后验证 immutable published Release。
@@ -389,10 +397,16 @@ protected write 前 fail closed。
 在 pre-mutation 或 post-mutation alias boundary，命令或 canonical raw projection
 不可读都归为 `inconclusive` / `remote-read-inconclusive`。
 
-每个 exact Release boundary 同样采用 raw-first A/B。它对 Release API response
-与 immutable full-tag `ls-remote` binding 获取两份 neutral canonical
-observations，先比较这两份 observation，只有它们稳定后才做 structural 与
-expected-policy validation。它只产生以下 closed classification：
+单次 publisher invocation 完成 inventory 对象发现后，每个 exact Release boundary 同样
+采用 raw-first A/B。
+它对 `/releases/{frozen_id}` 与 immutable full-tag `ls-remote` binding 各读取两份
+neutral canonical observations，先比较它们，要求每个 response 的 `.id` 都与 path
+中的 frozen ID 完全一致，然后才做 structural 与 expected-policy validation。ID
+endpoint 的 `404` 或其他 unreadable 结果绝不在该 invocation 内授权重新绑定或重建。
+后续 exact-source retry 没有可持久化的 Release-ID ledger：它重新执行 full reconcile，
+从当时的 complete inventory 选出唯一 exact-tag object，并为新的 invocation 冻结该 ID。
+Trusted-owner boundary 禁止跨 attempt 删除或替换对象；publisher 不声称跨 run 的历史 ID
+连续性。它只产生以下 closed classification：
 
 - API、`ls-remote` 或 canonical raw projection 不可读：
   `inconclusive` / `remote-read-inconclusive`；
@@ -404,20 +418,39 @@ expected-policy validation。它只产生以下 closed classification：
 这个 raw-first 顺序是刻意的：若在比较 A 与 B 之前就用 expected policy 验证任一
 observation，稳定的错误状态可能被伪装成 transient read failure。
 
-Fresh draft creation 不是例外。它的 expected-absence boundary 依次读取
-Release presence A、raw full-tag binding A、Release presence B 与 raw full-tag
-binding B。它先比较两次 presence 与 tag observations，只有观察到稳定
-absence 后才按 publication policy 验证 tag。Presence 或 tag observation 不可读归为
-`inconclusive` / `remote-read-inconclusive`；A/B drift 或 expected-absence boundary 上稳定
-present 归为 `inconclusive` / `remote-state-changed`；稳定 absence 但 tag binding
-malformed、lightweight 或不是 approved tag 归为
-`blocked_conflict` / `immutable-release-mismatch`。Fresh path 保持 raw-first，避免它成为
-例外并把稳定错误状态伪装成 transient failure。
+Fresh draft creation 不是例外。它的 expected-absence boundary 依次读取 complete
+paginated inventory A、raw full-tag binding A、complete inventory B 与 raw full-tag
+binding B。它先比较两组 canonical raw observations，再验证 inventory completeness 与
+exact-tag mapping。稳定的 0 match 才是 absence；该 boundary 上稳定出现 exact-tag
+match 或 A/B drift 都归为 `inconclusive` / `remote-state-changed`。同一 exact tag 被多个
+不同 ID claim，归为 `blocked_conflict` / `duplicate-release-tag`。Outer `[]`、malformed
+pages、unsafe ID、重复 numeric ID（包括 pagination overlap）或任一 unreadable page 都
+属于不完整证据，归为 `inconclusive` / `remote-read-inconclusive`。Post-create discovery
+重复同样的两份 complete inventory/tag observations，要求 exact tag 唯一匹配，然后才
+冻结 positive numeric ID。两个 inventory boundary 都保持 raw-first，避免 incomplete
+或 torn enumeration 授权 create 或 object selection。
 
-Fresh Release absence 通过 REST presence/404 path 分类；publisher 不会解析
-`gh release view` porcelain stderr 来推断 HTTP status。只有经证明的 REST 404 才表示
-absence；其他不可读或 malformed presence result 仍归为 `inconclusive` /
-`remote-read-inconclusive`。
+GitHub 的接口语义要求做出这个区分。REST
+[release-by-tag endpoint](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10#get-a-release-by-tag-name)
+只返回 published Release，因此它的 `404` 不能证明 draft 不存在；
+[complete Release list](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10#list-releases)
+会向具有 push access 的调用者返回 drafts。GitHub CLI 自己的
+[`FetchRelease`](https://github.com/cli/cli/blob/trunk/pkg/cmd/release/shared/fetch.go#L179-L259)
+也会分别查找 published-by-tag 与 draft candidates，然后通过 `/releases/{id}` 读取选中的
+draft。Publisher 遵循同一 identity rule，但不依赖 porcelain：inventory 必须选出唯一
+numeric ID，所有 mutable/draft boundary 继续固定在该 ID；只有 already-published
+Release 的 public verification 才使用 release-by-tag。
+
+Asset upload 同样是绑定 object identity 的 mutation。Nonzero upload result，或者
+zero-exit response 为空、malformed、包含 unsafe asset ID、返回不同 asset name，或未
+报告 `state=uploaded`，都归为 `inconclusive` /
+`release-asset-upload-unknown`：bytes 可能已经写入 frozen Release。Exact-source
+POST 返回成功后，publisher 先捕获 frozen by-ID Release boundary，并要求 returned asset
+ID 属于该对象；随后使用 binary media type 通过 `/releases/assets/{asset_id}` 直接读取
+bytes，并与 intended file 比较。这个 post-upload path 绝不按 tag 重新解析 Release。GET
+失败或 bytes mismatch 同样归为 `release-asset-upload-unknown`，因为 mutation 已经发生。
+当前 invocation 内的 recovery 不会 rebind；下一次 exact-source retry 从 complete inventory
+重新冻结当时唯一的 exact-tag object，并依赖 trusted-owner no-replacement contract。
 
 GitHub 官方 Release REST endpoint 没有为这个 `PATCH` 提供受支持的
 conditional compare-and-swap precondition；publisher 不依赖 undocumented conditional
@@ -429,8 +462,9 @@ manual writer。任何其他 concurrent Release writer 都违反 deployment cont
 post-publication readback 检测到 mismatch，publication 必须保持 blocked，不得声称
 可以自动恢复。Direct `PATCH` nonzero，或者 zero-exit response 为空、malformed 或返回
 不同 Release ID，都归为 `inconclusive` / `release-publication-unknown`，因为 mutation
-可能已生效。Reconcile 必须使用同一 exact source，证明 frozen draft 仍未变化，或
-exact Release 已经 immutable；不得盲目换用另一 version。Deterministic
+可能已生效。Reconcile 必须使用同一 exact source，从 complete inventory 重新选出当时唯一
+的 exact-tag object，并证明其 draft state 仍是 valid prefix，或 exact Release 已经
+immutable；不得盲目换用另一 version，也不得声称跨 run ID continuity。Deterministic
 post-publication mismatch 仍保持 blocked。
 
 本合约没有 `v2.0` alias。Floating alias 不建立单独 GitHub Release；Release 只
@@ -456,10 +490,14 @@ result，也不得改用开放式的“自行猜测如何修复”指示。
 
 Public verification 的 initial 与 final Release-view metadata 都通过 direct REST
 release-by-tag endpoint 获取，并遵循 GitHub REST `2026-03-10` contract。它把
-`draft`、`prerelease`、`tag_name`、`name` 与 `body` 投影成用于比较的 closed view。
-Documented REST HTTP 404 会按对应阶段归类为 Release missing 或 disappeared；其他 API
-failure 归为 inconclusive。Verification 绝不从 `gh release view` porcelain stderr
-推断 HTTP status。
+Historical completed-Release by-tag reads 也显式使用同一 API version。它把 `draft`、
+`prerelease`、`tag_name`、`name` 与 `body` 投影成用于比较的 closed view。Initial 与
+final complete Release inventories 使用和 publication 相同的 structural validator：
+outer 至少一页、每页为 array、所有 ID 都是 positive safe numeric ID 且全局唯一。
+Outer `[]`、malformed pages 或重复 ID 都是不完整证据，归为 `inconclusive` /
+`remote-read-inconclusive`。Documented REST HTTP 404 会按对应阶段归类为 Release
+missing 或 disappeared；其他 API failure 归为 inconclusive。Verification 绝不从
+`gh release view` porcelain stderr 推断 HTTP status。
 
 每个 full SemVer（包括每个 prerelease、minor 与 patch version）都获得 immutable full
 tag 与 immutable GitHub Release。Marketplace 是完全独立的 manual out-of-band

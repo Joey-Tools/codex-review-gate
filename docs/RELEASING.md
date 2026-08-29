@@ -427,9 +427,19 @@ protected write.
    result. Publisher identity is bound before the first write from the minted
    token's actual App slug and installation ID, target scope, and effective
    rulesets.
-4. Create or resume a draft GitHub Release for the full tag. Freeze its Release
-   ID, upload release assets, canonical provenance, checksums, and the detached
-   provenance signature.
+4. Enumerate the complete, paginated GitHub Release inventory with the
+   Publisher App. That push-authorized identity can see drafts. Require a
+   nonempty outer page array (`[[]]` is the valid empty-repository result),
+   safe positive globally unique numeric IDs, and zero or one exact-tag match.
+   A pre-existing draft is resumed by its inventory ID. For a fresh Release,
+   two stable complete inventories prove exact-tag absence before creation;
+   two new stable complete inventories then discover exactly one Release and
+   freeze its ID. Upload release assets, canonical provenance, checksums, and
+   the detached provenance signature through the numeric-ID
+   `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets`
+   endpoint, never through a tag-resolving upload command. Each response must
+   identify one positive safe asset ID with the exact name and `uploaded`
+   state before the by-ID Release boundary can admit it.
 5. Complete the governing policy reads, then perform the final exact draft
    Release, asset, and tag boundary described above. Publish by directly
    patching the frozen Release ID with the exact metadata, then verify the
@@ -456,11 +466,17 @@ protected write.
 At either pre- or post-mutation alias boundary, an unreadable command or
 canonical raw projection is `inconclusive` / `remote-read-inconclusive`.
 
-Each exact Release boundary is likewise raw-first A/B. It obtains two neutral
-canonical observations of the Release API response and immutable full-tag
-`ls-remote` binding, compares those observations, and only after they are
-stable performs structural and expected-policy validation. Its closed
-classification is:
+After inventory discovery within one publisher invocation, each exact Release
+boundary is likewise raw-first A/B. It reads `/releases/{frozen_id}` twice together with two immutable
+full-tag `ls-remote` bindings, compares the neutral canonical observations,
+requires every response `.id` to equal the frozen path ID, and only then
+performs structural and expected-policy validation. An ID-endpoint `404` or
+other unreadable result never authorizes rebinding or recreation within that
+invocation. A later exact-source retry has no persisted Release-ID ledger: it
+performs a new full reconcile, selects the then-unique exact-tag object from
+the complete inventory, and freezes that ID for the new invocation. The
+trusted-owner boundary forbids deletion or replacement between attempts; the
+publisher does not claim historical ID continuity across runs. Its closed classification is:
 
 - an unreadable API, `ls-remote`, or canonical raw projection is
   `inconclusive` / `remote-read-inconclusive`;
@@ -475,21 +491,46 @@ expected policy before comparing A and B could disguise a stable wrong state
 as a transient read failure.
 
 Fresh draft creation is not an exception. Its expected-absence boundary reads
-Release presence A, raw full-tag binding A, Release presence B, and raw
-full-tag binding B in that order. It compares both presence and tag
-observations first, and only after observing stable absence validates the tag
-against publication policy. An unreadable presence or tag observation is
-`inconclusive` / `remote-read-inconclusive`; A/B drift or stable presence at
-the expected-absence boundary is `inconclusive` / `remote-state-changed`; and a
-stable-absence boundary with a malformed, lightweight, or wrong approved tag
-binding is `blocked_conflict` / `immutable-release-mismatch`. Keeping the fresh
-path raw-first prevents it from becoming an exception that can disguise stable
-wrong state as transient failure.
+complete paginated inventory A, raw full-tag binding A, complete inventory B,
+and raw full-tag binding B in that order. It compares both canonical raw pairs
+first, then validates inventory completeness and the exact-tag mapping. Stable
+zero-match is absence; a stable exact-tag match at this boundary or A/B drift
+is `inconclusive` / `remote-state-changed`. A stable exact tag claimed by
+multiple distinct IDs is `blocked_conflict` / `duplicate-release-tag`.
+Outer `[]`, malformed pages, an unsafe ID, a repeated numeric ID (including
+pagination overlap), or any unreadable page is incomplete evidence and becomes
+`inconclusive` / `remote-read-inconclusive`. Post-create discovery repeats the
+same two complete inventory/tag observations, requires one unique exact-tag
+match, and only then freezes the positive numeric ID. Keeping both inventory
+boundaries raw-first prevents incomplete or torn enumeration from authorizing
+creation or object selection.
 
-Fresh Release absence is classified through the REST presence/404 path; the
-publisher does not infer an HTTP status by parsing `gh release view` porcelain
-stderr. Only a proved REST 404 is absence. Any other unreadable or malformed
-presence result remains `inconclusive` / `remote-read-inconclusive`.
+This distinction is required by GitHub's interfaces. The REST
+[release-by-tag endpoint](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10#get-a-release-by-tag-name)
+is published-only, so its `404` does not prove that no draft exists. The
+[complete Release list](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10#list-releases)
+includes drafts for callers with push access. GitHub CLI's own
+[`FetchRelease`](https://github.com/cli/cli/blob/trunk/pkg/cmd/release/shared/fetch.go#L179-L259)
+therefore looks up published-by-tag and draft candidates separately, then reads
+a selected draft through `/releases/{id}`. The publisher follows the same
+identity rule without relying on porcelain: inventory selects exactly one
+numeric ID, and every mutable or draft boundary stays on that ID. Only public
+verification of an already published Release uses release-by-tag.
+
+Asset upload is also an identity-bound mutation. A nonzero upload result, or
+a zero-exit response that is empty, malformed, has an unsafe asset ID, names a
+different asset, or does not report `state=uploaded`, is `inconclusive` /
+`release-asset-upload-unknown`: bytes may already have reached the frozen
+Release. After a successful POST response, the publisher first captures the
+frozen by-ID Release boundary and requires the returned asset ID to belong to
+that object. It then downloads bytes directly through
+`/releases/assets/{asset_id}` with the binary media type and compares them to
+the intended file; this post-upload path never resolves a Release by tag. A
+read failure or byte mismatch is also `release-asset-upload-unknown` because
+the mutation already occurred. Within the current invocation, recovery never
+rebinds the Release. A later exact-source retry starts from a complete
+inventory and freezes the then-unique exact-tag object under the trusted-owner
+no-replacement contract.
 
 GitHub's official Release REST endpoint exposes no supported conditional
 compare-and-swap precondition for this `PATCH`; the publisher does not rely on
@@ -504,9 +545,11 @@ post-publication readback detects a mismatch, publication remains blocked and
 must not claim automatic recovery. A nonzero direct `PATCH`, or a zero-exit
 response that is empty, malformed, or identifies a different Release ID, is
 `inconclusive` / `release-publication-unknown`, because the mutation may have
-applied. Reconcile must retry the same exact source and prove either that the
-frozen draft remains unchanged or that the exact Release is already immutable;
-it must not blindly choose a different version. A deterministic
+applied. Reconcile must retry the same exact source, reselect the then-unique
+exact-tag object from the complete inventory, and prove either that its draft
+state remains a valid prefix or that the exact Release is already immutable;
+it must not blindly choose a different version or claim cross-run ID
+continuity. A deterministic
 post-publication mismatch remains blocked.
 
 There is no `v2.0` alias in this contract. A floating alias does not receive a
@@ -535,11 +578,16 @@ guess at repair.
 
 Public verification obtains both its initial and final Release-view metadata
 from the direct REST release-by-tag endpoint using the GitHub REST `2026-03-10`
-contract. It projects `draft`, `prerelease`, `tag_name`, `name`, and `body` into
-the closed view used for comparison. A documented REST HTTP 404 is classified
-as the applicable missing or disappeared Release state; other API failures are
-inconclusive. Verification never infers an HTTP status from `gh release view`
-porcelain stderr.
+contract. Historical completed-Release by-tag reads use the same explicit API
+version. It projects `draft`, `prerelease`, `tag_name`, `name`, and `body` into
+the closed view used for comparison. Its initial and final complete Release
+inventories use the same structural validator as publication: at least one
+outer page, array pages, positive safe numeric IDs, and global ID uniqueness.
+Outer `[]`, malformed pages, or repeated IDs are incomplete evidence and are
+`inconclusive` / `remote-read-inconclusive`. A documented REST HTTP 404 is
+classified as the applicable missing or disappeared Release state; other API
+failures are inconclusive. Verification never infers an HTTP status from
+`gh release view` porcelain stderr.
 
 Every full SemVer, including every prerelease, minor, and patch version,
 receives its immutable full tag and immutable GitHub Release. Marketplace is a

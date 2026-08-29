@@ -2346,15 +2346,18 @@ superseded_by:
   `blocked_conflict` / `malformed-major-alias-target`.
 - The first formal exact-head review reported two P2 findings, and both are
   fixed on the current working tree.
-  - Fresh-create expected absence now uses the complete raw-first sequence:
-    presence A, raw tag A, presence B, raw tag B; compare both pairs; only after
-    stable absence validate tag policy. Remote unreadability is
+  - The first correction changed fresh-create expected absence to the then-
+    understood raw-first point-presence sequence: presence A, raw tag A,
+    presence B, raw tag B; compare both pairs; only after stable absence
+    validate tag policy. Remote unreadability is
     `inconclusive` / `remote-read-inconclusive`; A/B drift or stable presence is
     `inconclusive` / `remote-state-changed`; and a stable-absence malformed,
     lightweight, or wrong tag is `blocked_conflict` /
     `immutable-release-mismatch`.
     - Explicit reason: the fresh path must not be an exception that lets an
       early validator disguise stable wrong state as transient read failure.
+      The later draft-aware correction below supersedes point presence with the
+      complete paginated inventory because release-by-tag cannot see drafts.
   - An explicit `--test-enforce-live-signer-policy` production-shaped seam is
     gated by both `CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY=1` and
     `NODE_ENV=test`, accepted only for `--publish`, and rejected with the
@@ -2407,10 +2410,12 @@ superseded_by:
   exist. A valid first-release absence was therefore misclassified as
   `inconclusive` / `remote-read-inconclusive`, blocking every initial publish
   attempt in that runtime.
-  - Remediation: fresh absence now reuses the REST presence/404 classifier, and
-    fixtures keep REST API status semantics distinct from `gh` porcelain error
-    text. Only a proved REST 404 is absence; unreadable or malformed results
-    remain fail closed.
+  - Intermediate remediation replaced porcelain stderr with the REST
+    release-by-tag status classifier, and fixtures kept REST status semantics
+    distinct from `gh` porcelain text. The later draft-aware review proved that
+    even a real release-by-tag `404` is not complete absence evidence because a
+    draft can exist; the complete inventory correction below supersedes that
+    intermediate classifier for publisher absence.
   - Explicit reason: porcelain stderr is not a stable carrier for REST status,
     so absence authority must come from the API classifier rather than a
     version-specific CLI message.
@@ -2448,6 +2453,213 @@ superseded_by:
   validation. The new signed landing checkpoint and fresh formal exact-head
   review remain pending; this ledger does not yet claim a commit or review.
   Publication therefore remains paused, and PR #35 must not leave Draft yet.
+
+### Draft-aware Release identity correction
+
+- A later exact-head review found a further P1 in the GitHub Release object
+  lookup contract: `GET /releases/tags/{tag}` is a published-Release lookup and
+  cannot establish either draft presence or draft absence. The publisher still
+  used that endpoint for initial/prewrite state and draft mutation boundaries,
+  so an existing draft could look absent and a fresh draft could become
+  unreadable immediately after creation.
+- Official implementation evidence confirms the required split. GitHub CLI's
+  `FetchRelease` independently looks up a published Release by tag and draft
+  candidates, obtains the selected draft's database ID, and then reads
+  `/releases/{id}`. GitHub's complete Release-list contract exposes drafts to a
+  caller with push access; the dedicated Publisher App has that access. Public
+  verification may continue to use the published-only release-by-tag endpoint.
+- The protected property is now explicit: one exact tag maps to exactly one
+  positive safe numeric Release ID, and every mutable/draft observation remains
+  bound to that frozen object identity. The publisher now:
+  - reads the complete `per_page=100`, `--paginate --slurp` inventory with the
+    REST `2026-03-10` header;
+  - requires an outer page array with at least one page (`[[]]` is valid empty
+    state), page arrays, safe positive IDs, global ID uniqueness, and at most
+    one exact-tag match;
+  - treats outer `[]`, malformed pages, unsafe or repeated IDs, pagination
+    failure, and normalization failure as `inconclusive` /
+    `remote-read-inconclusive` because absence was not proved;
+  - treats one exact tag claimed by distinct unique IDs as
+    `blocked_conflict` / `duplicate-release-tag`;
+  - proves fresh absence through two complete inventory plus full-tag raw A/B
+    snapshots, then discovers a newly created draft through another two
+    complete inventory plus full-tag raw A/B snapshots before freezing its ID;
+  - obtains an existing draft or published Release ID from the complete
+    inventory and never rebinds within that publisher invocation; a later run
+    has no persisted ID ledger and performs a new full inventory selection;
+    and
+  - reads every later Release boundary through `/releases/{frozen_id}` twice,
+    requires each response `.id` to equal the path/frozen ID, and treats `404`
+    or unreadability as inconclusive rather than selecting another object or
+    creating a replacement.
+- The same review reported a P3 API-version drift: public Release-view REST
+  reads did not explicitly send `X-GitHub-Api-Version: 2026-03-10`. The public
+  raw/view/list calls and publisher inventory/ID calls now send that version,
+  and fake GitHub rejects an omitted header. This preserves the access-policy
+  and response-contract boundary instead of inheriting the CLI default.
+- Fake GitHub now models the real distinction: a draft is visible in the
+  complete list and by numeric ID while release-by-tag returns REST `404` until
+  publication. Draft boundary mutation/unreadable/schema hooks moved to the
+  by-ID path.
+- Validation actually run on this correction so far:
+  - `bash -n scripts/release-action-subtree.sh`,
+    `node --check test/v2-release-pipeline.test.mjs`, and `git diff --check`
+    passed after the core migration;
+  - the existing focused boundary/PATCH group first ran 20 tests with 14 pass
+    and 6 expected migration regressions: four missing REST-version headers on
+    post-publish by-tag reads and two stale trace assertions still observing
+    `release-tag-read`; after correcting those, the six affected tests passed
+    6/6;
+  - the publisher static contract passed 1/1 after changing the absence
+    contract from point presence to complete inventory; and
+  - the first command covering seven new dynamic cases passed 6/7; its sole
+    failure was an unsaved fake inventory-read counter, not publisher behavior.
+    After saving that observation counter, the affected fresh-creation case
+    passed 1/1. The covered behaviors are fresh creation and frozen-ID
+    boundaries, exact-source recovery of a draft found on the second page
+    without a second create, outer `[]`, repeated ID, same exact tag with
+    distinct IDs, and post-create ID/presence A/B drift;
+  - public release disappearance plus the API/porcelain diagnostic distinction
+    passed 2/2 with the explicit public REST version header; and
+  - frozen-ID `404` and stable wrong-body-ID cases passed 2/2, proving that the
+    publisher neither rebinds nor creates a second draft when the selected ID
+    endpoint disappears or returns a different object identity; and
+  - the existing nonzero direct-`PATCH` unknown-result recovery cases passed
+    2/2 after the draft-aware migration, including response loss after apply;
+    exact-source reconcile proved the frozen object without a second publish
+    mutation; and
+  - the final fast gate passed `bash -n`, ShellCheck, `node --check`,
+    `git diff --check`, `npm run check`, and project-journal validation.
+- The complete serialized suite, signed checkpoint, and fresh exact-head review
+  are still pending and are not claimed by this entry.
+
+### Frozen-ID asset upload and public-inventory follow-up
+
+- The parent lane's first complete serialized baseline after the draft-aware
+  correction ran 824 tests: 820 passed and 4 failed. No other failures were
+  observed. The four failures were stale test expectations rather than runtime
+  regressions: stable and RC direct-PATCH cases still expected two
+  `release-tag-read` traces before publication, the post-publication
+  same-name-asset replacement case still searched for by-tag reads, and the
+  alias-policy drift case did the same. All four boundaries had intentionally
+  migrated to `release-id-read`.
+- A follow-up review retained one P1, one P2, and one P3:
+  - P1: asset upload still used `gh release upload <tag>`, which could resolve
+    a different Release after the publisher had frozen a numeric ID. Asset
+    upload now posts raw bytes directly to the numeric-ID
+    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets`
+    endpoint with explicit Accept, `application/octet-stream`, and REST
+    `2026-03-10` headers. It accepts only a positive safe returned asset ID,
+    exact name, `uploaded` state, and nonempty identity URLs; the next by-ID
+    boundary must contain that exact asset ID. Nonzero, empty, malformed, or
+    identity-mismatched responses are `inconclusive` /
+    `release-asset-upload-unknown` because the bytes may already have been
+    written. Within that invocation recovery keeps the frozen Release ID. A
+    later exact-source retry performs a new full reconcile and freezes the
+    then-unique exact-tag object; cross-run object replacement is prohibited by
+    the trusted-owner boundary rather than detected by a persisted ID ledger.
+  - P2: initial/final public complete inventories did not yet enforce the
+    publisher's page and object-identity schema. Both paths now share the same
+    validator: the outer array has at least one page (`[[]]` is valid empty),
+    every page is an array, every Release ID is a positive safe integer, and
+    IDs are globally unique. Outer `[]`, malformed pages, unsafe IDs, and
+    repeated IDs remain incomplete evidence and produce `inconclusive` /
+    `remote-read-inconclusive`.
+  - P3: historical completed-Release by-tag reads inherited the GitHub CLI API
+    version. They now explicitly send `X-GitHub-Api-Version: 2026-03-10`, as do
+    the existing public and publisher Release reads.
+- Fake GitHub now rejects tag-resolving asset uploads, accepts only the absolute
+  frozen-ID upload route with the exact method/headers/input, and models tag
+  resolution replacement independently from the frozen object. It also models
+  upload failure before apply, response loss after apply, zero-exit empty or
+  malformed responses, and structurally inconclusive public inventories.
+- Validation actually run for this follow-up so far:
+  - the four stale serialized-baseline failures passed 4/4 after their trace
+    expectations moved to `release-id-read`;
+  - seven new dynamic cases passed 7/7: frozen-ID upload under tag-resolution
+    replacement, five unknown upload outcomes, and public outer-`[]`/duplicate-
+    ID inventory rejection (the last test covers both public shapes);
+  - the focused staged-ABI/publisher static contract passed 1/1; and
+  - `bash -n scripts/release-action-subtree.sh`,
+    `shellcheck scripts/release-action-subtree.sh`,
+    `node --check test/v2-release-pipeline.test.mjs`, `git diff --check`,
+    `npm run check`, and the project-journal validator passed after the
+    implementation, tests, and documentation update.
+- A second complete serialized suite is not claimed here; the parent lane owns
+  that final rerun after the shared correction is complete.
+
+### Asset-ID byte readback and per-attempt identity scope
+
+- A third review retained one residual P2: after the upload POST returned an
+  asset ID, the publisher still ran `gh release download <tag>` before its
+  frozen by-ID boundary. That porcelain command could resolve a replacement
+  Release and read bytes from the wrong object. The fake tag-replacement case
+  did not previously change `gh release download`, so it could not expose the
+  defect.
+- The mutation/readback order is now exact: direct POST to the frozen Release
+  ID, validate the returned asset identity, capture and validate the frozen
+  by-ID Release boundary, require that boundary to contain the returned asset
+  ID, then raw-GET `/releases/assets/{asset_id}` with binary Accept and REST
+  `2026-03-10` headers and compare bytes. Any asset-ID GET failure or byte
+  mismatch after mutation is `inconclusive` /
+  `release-asset-upload-unknown`; the post-upload path no longer uses a
+  tag-resolving download.
+- The identity scope is intentionally limited to one publisher invocation.
+  There is no persisted Release-ID ledger. A later exact-source retry performs
+  a new full reconcile, selects the then-unique exact-tag object from the
+  complete inventory, and freezes that ID for the new invocation. The
+  trusted-owner contract forbids deletion or replacement between attempts; the
+  publisher does not claim to detect historical ID replacement or preserve
+  cross-run ID continuity.
+- Fake GitHub now supports raw asset-ID downloads, requires their binary Accept
+  and REST-version headers, records the asset ID and owning frozen Release ID,
+  and makes tag-based download resolve the replacement object while an upload
+  readback is pending. This would fail the removed tag-download implementation
+  while allowing later published-Release validation to exercise its separate
+  existing path.
+- Focused validation so far:
+  - the first combined run passed the response-lost exact-source retry but
+    failed the tag-replacement case after the new fake also redirected a later,
+    unrelated alias-admission download; the fake was narrowed to the pending
+    post-upload readback interval;
+  - the next tag-replacement run completed the publication but its assertion
+    incorrectly prohibited every later tag download rather than only the
+    upload-to-asset-ID-read interval; the assertion was narrowed to each exact
+    interval; and
+  - the corrected tag-replacement case then passed 1/1. The response-lost case
+    had already passed 1/1 and proved that the next exact-source full reconcile
+    selected the same still-existing remote object, adopted the already-written
+    first asset without a second upload, uploaded only the two missing assets,
+    and completed publication; and
+  - the final affected group passed 4/4: the corrected tag-replacement case,
+    response-lost exact-source recovery, asset-ID GET failure, and asset-ID byte
+    mismatch. Both readback failures produced
+    `release-asset-upload-unknown` after the durable upload;
+  - the first static-contract run failed because its new regex expected the
+    asset endpoint text before the Accept header even though the implemented
+    command correctly placed the header first. Correcting only that assertion
+    made the focused static contract pass 1/1; and
+  - final fast gates passed `bash -n`, ShellCheck,
+    `node --check test/v2-release-pipeline.test.mjs`, `git diff --check`, and
+    `npm run check`.
+- No complete serialized suite is claimed for this follow-up.
+
+### Final frozen-identity validation checkpoint
+
+- The complete serialized suite was rerun on the final implementation with
+  `npm test -- --test-reporter=dot --test-concurrency=1` and completed with
+  exit status 0: all 833 tests passed. This supersedes the earlier explicit
+  "not yet claimed" checkpoints without erasing their intermediate failure and
+  correction evidence.
+- The final fast gates remained green: `bash -n`, ShellCheck,
+  `node --check test/v2-release-pipeline.test.mjs`, `git diff --check`,
+  `npm run check`, and the project-journal validator. The journal-only final
+  evidence update is revalidated separately before landing.
+- Two independent targeted read-only audits of the final shared tree reported
+  no findings: one covered the publisher script and one covered its tests and
+  release documentation. These targeted audits are supporting evidence only;
+  the required fresh full-range exact-head review still runs after the final
+  signed landing commit freezes the complete `origin/master..HEAD` range.
 
 ## Verified Facts And Required Live Preflight
 

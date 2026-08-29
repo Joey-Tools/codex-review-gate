@@ -665,6 +665,13 @@ function fakeGithubEnvironment(state, mutationPhase) {
     asset_uploader_login: "codex-review-gate-action-publisher[bot]",
     latest: null,
     next_asset_id: 1,
+    asset_upload_calls: 0,
+    asset_upload_target_release_ids: [],
+    asset_readback_calls: 0,
+    asset_readback_ids: [],
+    asset_readback_release_ids: [],
+    replacement_release_assets: [],
+    tag_resolution_release_id: null,
     mutation_done: false,
     metadata_mutation_done: false,
     poisoned_after_pre_publish_boundary: false,
@@ -681,6 +688,10 @@ function fakeGithubEnvironment(state, mutationPhase) {
     raw_boundary_mutation_done: false,
     absent_boundary_api_reads: 0,
     release_api_reads: 0,
+    release_id_reads: 0,
+    release_inventory_reads: 0,
+    release_create_calls: 0,
+    post_create_inventory_reads: 0,
     release_download_reads: 0,
     release_view_reads: 0,
     ruleset_drift: false,
@@ -691,7 +702,7 @@ function fakeGithubEnvironment(state, mutationPhase) {
   write(fakeGh, `#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 const args = process.argv.slice(2);
@@ -840,10 +851,15 @@ const mutateProvenance = (state) => {
 };
 
 const apiEndpoint = args.slice(1).find((arg) =>
-  arg.startsWith("repos/") || arg.startsWith("users/"));
+  arg.startsWith("repos/") || arg.startsWith("users/") ||
+  arg.startsWith("https://uploads.github.com/"));
 const requestedMethod = option("--method") || "GET";
 const classifyRemoteCall = () => {
   if (args[0] === "api") {
+    if (requestedMethod === "POST" &&
+        apiEndpoint?.startsWith("https://uploads.github.com/")) {
+      return "release-asset-upload";
+    }
     if (requestedMethod === "PATCH" && /\\/releases\\/\\d+$/u.test(apiEndpoint || "")) {
       return "release-patch";
     }
@@ -853,6 +869,10 @@ const classifyRemoteCall = () => {
     if (/\\/rulesets\\/\\d+$/u.test(apiEndpoint || "")) return "ruleset-detail-read";
     if (apiEndpoint?.endsWith("/releases?per_page=100")) return "release-list-read";
     if (apiEndpoint?.endsWith("/releases/latest")) return "latest-release-read";
+    if (/\\/releases\\/assets\\/\\d+$/u.test(apiEndpoint || "")) {
+      return "release-asset-read";
+    }
+    if (/\\/releases\\/\\d+$/u.test(apiEndpoint || "")) return "release-id-read";
     if (apiEndpoint?.includes("/releases/tags/") &&
         option("--jq") === releaseViewProjection) return "release-view";
     if (apiEndpoint?.includes("/releases/tags/")) return "release-tag-read";
@@ -884,6 +904,62 @@ if (args[0] === "api") {
       process.exit(2);
     }
   };
+  const uploadUrl = endpoint?.startsWith("https://uploads.github.com/")
+    ? new URL(endpoint)
+    : null;
+  const uploadMatch = uploadUrl?.pathname.match(
+    /^\\/repos\\/JoeyTeng\\/codex-review-gate-action\\/releases\\/(\\d+)\\/assets$/u,
+  );
+  if (option("--method") === "POST" && uploadMatch) {
+    requireCurrentApiVersion();
+    if (!args.includes("Accept: application/vnd.github+json") ||
+        !args.includes("Content-Type: application/octet-stream")) {
+      process.stderr.write("asset upload is missing deterministic API headers\\n");
+      process.exit(2);
+    }
+    const targetReleaseId = Number(uploadMatch[1]);
+    const input = option("--input");
+    const names = uploadUrl.searchParams.getAll("name");
+    if (!Number.isSafeInteger(targetReleaseId) || targetReleaseId <= 0 ||
+        targetReleaseId !== state.release_id || names.length !== 1 || !names[0] ||
+        !input || input === "-") {
+      process.stderr.write("asset upload did not bind a valid frozen Release id, name, and input\\n");
+      process.exit(2);
+    }
+    if (phase === "asset-upload-failure-before-apply") {
+      process.stderr.write("simulated asset upload failure before apply\\n");
+      process.exit(1);
+    }
+    if (phase === "asset-upload-tag-resolution-replaced" &&
+        state.tag_resolution_release_id === null) {
+      state.tag_resolution_release_id = state.release_id + 1000;
+    }
+    const name = names[0];
+    copyFileSync(input, join(assetsDir, name));
+    const id = state.next_asset_id++;
+    state.assets.push({ name, id });
+    state.asset_upload_calls += 1;
+    state.asset_upload_target_release_ids.push(targetReleaseId);
+    save(state);
+    if (phase === "asset-upload-response-lost-after-apply") {
+      process.stderr.write("simulated asset upload response loss after apply\\n");
+      process.exit(1);
+    }
+    if (phase === "asset-upload-zero-exit-empty-response") process.exit(0);
+    if (phase === "asset-upload-zero-exit-malformed-response") {
+      process.stdout.write("{malformed-json\\n");
+      process.exit(0);
+    }
+    if (phase === "asset-upload-zero-exit-wrong-id-response") {
+      process.stdout.write(JSON.stringify({
+        ...assetRecord(state, name, id),
+        id: id + 1000,
+      }) + "\\n");
+      process.exit(0);
+    }
+    process.stdout.write(JSON.stringify(assetRecord(state, name, id)) + "\\n");
+    process.exit(0);
+  }
   if (endpoint === "users/JoeyTeng-Codex/gpg_keys") {
     state.signer_policy_reads += 1;
     const criticalFence = state.publish_patch_calls === 0 && state.immutable_policy_reads === 2
@@ -1114,7 +1190,59 @@ if (args[0] === "api") {
     process.exit(0);
   }
   if (endpoint?.endsWith("/releases?per_page=100")) {
-    process.stdout.write(JSON.stringify([state.exists ? [releaseApi(state)] : []]) + "\\n");
+    requireCurrentApiVersion();
+    state.release_inventory_reads += 1;
+    if (!state.exists && phase.startsWith("absent-boundary-") &&
+        process.env.FAKE_ABSENT_BOUNDARY_API_MARKER &&
+        state.immutable_policy_reads > 0) {
+      if (!existsSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER)) {
+        writeFileSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER, "active\\n");
+      }
+      state.absent_boundary_api_reads += 1;
+      const apiRead = state.absent_boundary_api_reads;
+      save(state);
+      if ((phase === "absent-boundary-api-unreadable-first" && apiRead === 1) ||
+          (phase === "absent-boundary-api-unreadable-second" && apiRead === 2)) {
+        process.stderr.write("simulated absent Release inventory outage\\n");
+        process.exit(1);
+      }
+      if (phase === "absent-boundary-release-appears" && apiRead === 2) {
+        state.exists = true;
+        save(state);
+      }
+    }
+    if (["release-inventory-outer-empty", "verify-release-inventory-outer-empty"].includes(phase)) {
+      process.stdout.write("[]\\n");
+      process.exit(0);
+    }
+    if (["release-inventory-duplicate-id", "verify-release-inventory-duplicate-id"].includes(phase)) {
+      const repeated = releaseApi(state);
+      process.stdout.write(JSON.stringify([[repeated], [repeated]]) + "\\n");
+      process.exit(0);
+    }
+    if (phase === "release-inventory-duplicate-exact-tag") {
+      const first = releaseApi(state);
+      const second = { ...releaseApi(state), id: state.release_id + 1, node_id: "release-2" };
+      process.stdout.write(JSON.stringify([[first, second]]) + "\\n");
+      process.exit(0);
+    }
+    if (state.exists && state.release_create_calls > 0 &&
+        phase.startsWith("post-create-inventory-")) {
+      state.post_create_inventory_reads += 1;
+      if (state.post_create_inventory_reads === 2) {
+        if (phase === "post-create-inventory-id-drift") {
+          state.release_id += 1;
+        } else if (phase === "post-create-inventory-release-disappears") {
+          state.exists = false;
+        }
+      }
+      save(state);
+    }
+    const pages = phase === "release-inventory-target-second-page"
+      ? [[], state.exists ? [releaseApi(state)] : []]
+      : [state.exists ? [releaseApi(state)] : []];
+    save(state);
+    process.stdout.write(JSON.stringify(pages) + "\\n");
     process.exit(0);
   }
   if (endpoint.endsWith("/releases/latest")) {
@@ -1127,48 +1255,42 @@ if (args[0] === "api") {
     }
     process.exit(0);
   }
-  if (endpoint.includes("/releases/tags/")) {
-    if (jq === releaseViewProjection) {
-      state.release_view_reads += 1;
-      const releaseViewNotFound =
-        phase === "verify-final-view-404" && state.release_view_reads === 2;
-      save(state);
-      if (!state.exists || releaseViewNotFound) fail404();
-      process.stdout.write(JSON.stringify({
-        isDraft: state.draft,
-        isPrerelease: state.prerelease,
-        tagName: state.tag,
-        name: state.name,
-        body: state.body,
-      }) + "\\n");
+  const assetReadMatch = endpoint?.match(/\\/releases\\/assets\\/(\\d+)$/u);
+  if (assetReadMatch) {
+    requireCurrentApiVersion();
+    if (option("--method") !== null ||
+        !args.includes("Accept: application/octet-stream")) {
+      process.stderr.write("asset readback must use raw GET with deterministic headers\\n");
+      process.exit(2);
+    }
+    const assetId = Number(assetReadMatch[1]);
+    const asset = state.assets.find(({ id }) => id === assetId);
+    if (!Number.isSafeInteger(assetId) || assetId <= 0 || !asset) fail404();
+    state.asset_readback_calls += 1;
+    state.asset_readback_ids.push(assetId);
+    state.asset_readback_release_ids.push(state.release_id);
+    save(state);
+    if (phase === "asset-readback-failure") {
+      process.stderr.write("simulated asset-ID readback failure\\n");
+      process.exit(1);
+    }
+    if (phase === "asset-readback-byte-mismatch") {
+      process.stdout.write(Buffer.concat([
+        readFileSync(join(assetsDir, asset.name)),
+        Buffer.from("mismatched-readback\\n"),
+      ]));
       process.exit(0);
     }
-    if (!state.exists && phase.startsWith("absent-boundary-") &&
-        process.env.FAKE_ABSENT_BOUNDARY_API_MARKER) {
-      if (!existsSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER)) {
-        if (state.immutable_policy_reads > 0) {
-          writeFileSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER, "active\\n");
-        }
-        fail404();
-      }
-      state.absent_boundary_api_reads += 1;
-      const apiRead = state.absent_boundary_api_reads;
-      save(state);
-      if ((phase === "absent-boundary-api-unreadable-first" && apiRead === 1) ||
-          (phase === "absent-boundary-api-unreadable-second" && apiRead === 2)) {
-        process.stderr.write("simulated absent Release API outage\\n");
-        process.exit(1);
-      }
-      if (phase === "absent-boundary-release-appears" && apiRead === 2) {
-        state.exists = true;
-        save(state);
-        process.stdout.write(JSON.stringify(releaseApi(state)) + "\\n");
-        process.exit(0);
-      }
-      fail404();
-    }
-    if (!state.exists) fail404();
-    state.release_api_reads += 1;
+    process.stdout.write(readFileSync(join(assetsDir, asset.name)));
+    process.exit(0);
+  }
+  const releaseIdMatch = endpoint?.match(/\\/releases\\/(\\d+)$/u);
+  if (releaseIdMatch) {
+    requireCurrentApiVersion();
+    if (!state.exists || Number(releaseIdMatch[1]) !== state.release_id) fail404();
+    state.release_id_reads += 1;
+    save(state);
+    if (phase === "release-id-boundary-404") fail404();
     if (state.final_publication_policy_read_complete && state.draft) {
       state.final_publication_boundary_reads += 1;
       save(state);
@@ -1178,21 +1300,8 @@ if (args[0] === "api") {
         process.exit(1);
       }
     }
-    const releaseApi404 =
-      (phase === "verify-initial-api-404" && state.release_api_reads === 1) ||
-      (phase === "verify-final-api-404" && state.release_api_reads === 2);
-    save(state);
-    if (releaseApi404) fail404();
-    if (jq === ".author.login") {
-      process.stdout.write(state.author_login + "\\n");
-      process.exit(0);
-    }
-    if (jq === ".immutable") {
-      process.stdout.write(String(state.immutable) + "\\n");
-      if (phase === "after-immutable") mutateProvenance(state);
-      process.exit(0);
-    }
     const response = releaseApi(state);
+    if (phase === "release-id-boundary-wrong-id") response.id = state.release_id + 1;
     if (state.final_publication_policy_read_complete && state.draft &&
         (phase === "pre-publication-stable-schema-invalid" ||
           (phase === "pre-publication-valid-to-schema-invalid" &&
@@ -1218,6 +1327,43 @@ if (args[0] === "api") {
         save(state);
       }
     }
+    process.exit(0);
+  }
+  if (endpoint.includes("/releases/tags/")) {
+    requireCurrentApiVersion();
+    if (jq === releaseViewProjection) {
+      state.release_view_reads += 1;
+      const releaseViewNotFound =
+        phase === "verify-final-view-404" && state.release_view_reads === 2;
+      save(state);
+      if (!state.exists || state.draft || releaseViewNotFound) fail404();
+      process.stdout.write(JSON.stringify({
+        isDraft: state.draft,
+        isPrerelease: state.prerelease,
+        tagName: state.tag,
+        name: state.name,
+        body: state.body,
+      }) + "\\n");
+      process.exit(0);
+    }
+    if (!state.exists || state.draft) fail404();
+    state.release_api_reads += 1;
+    const releaseApi404 =
+      (phase === "verify-initial-api-404" && state.release_api_reads === 1) ||
+      (phase === "verify-final-api-404" && state.release_api_reads === 2);
+    save(state);
+    if (releaseApi404) fail404();
+    if (jq === ".author.login") {
+      process.stdout.write(state.author_login + "\\n");
+      process.exit(0);
+    }
+    if (jq === ".immutable") {
+      process.stdout.write(String(state.immutable) + "\\n");
+      if (phase === "after-immutable") mutateProvenance(state);
+      process.exit(0);
+    }
+    const response = releaseApi(state);
+    process.stdout.write(JSON.stringify(response) + "\\n");
     process.exit(0);
   }
   if (endpoint.includes("/commits/") || endpoint.includes("/git/tags/")) {
@@ -1259,6 +1405,7 @@ if (args[0] === "release" && args[1] === "view") {
 
 if (args[0] === "release" && args[1] === "create") {
   const state = readState();
+  state.release_create_calls += 1;
   state.exists = true;
   state.draft = true;
   state.immutable = false;
@@ -1271,13 +1418,8 @@ if (args[0] === "release" && args[1] === "create") {
 }
 
 if (args[0] === "release" && args[1] === "upload") {
-  const state = readState();
-  const source = args[3];
-  const name = basename(source);
-  copyFileSync(source, join(assetsDir, name));
-  state.assets.push({ name, id: state.next_asset_id++ });
-  save(state);
-  process.exit(0);
+  process.stderr.write("publisher must not resolve asset uploads by mutable tag name\\n");
+  process.exit(2);
 }
 
 if (args[0] === "release" && args[1] === "download") {
@@ -1288,7 +1430,15 @@ if (args[0] === "release" && args[1] === "download") {
   const pattern = option("--pattern");
   const destination = option("--dir");
   mkdirSync(destination, { recursive: true });
-  const selected = pattern === "*" ? state.assets : state.assets.filter((asset) => asset.name === pattern);
+  const uploadReadbackStillPending =
+    state.asset_readback_calls < state.asset_upload_calls;
+  const tagSelectedAssets = state.tag_resolution_release_id !== null &&
+      uploadReadbackStillPending
+    ? state.replacement_release_assets
+    : state.assets;
+  const selected = pattern === "*"
+    ? tagSelectedAssets
+    : tagSelectedAssets.filter((asset) => asset.name === pattern);
   for (const asset of selected) copyFileSync(join(assetsDir, asset.name), join(destination, asset.name));
   process.exit(selected.length > 0 ? 0 : 1);
 }
@@ -1785,28 +1935,28 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
       releasePolicyValidation < tagPolicyValidation,
     "both complete raw Release/tag snapshots must be compared before policy validation",
   );
-  const absentBoundaryStart = publisher.indexOf("  capture_absent_release_boundary() {");
+  const absentBoundaryStart = publisher.indexOf("  capture_inventory_release_boundary() {");
   const absentBoundaryEnd = publisher.indexOf("\n  read_latest_release_tag() {", absentBoundaryStart);
   assert.notEqual(absentBoundaryStart, -1, "missing absent Release boundary helper");
   assert.notEqual(absentBoundaryEnd, -1, "missing absent Release boundary helper end");
   const absentBoundary = publisher.slice(absentBoundaryStart, absentBoundaryEnd);
   const firstPresence = absentBoundary.indexOf(
-    'first_presence="$(read_remote_release_presence',
+    'fetch_complete_release_inventory "$first_api" "$first_error"',
   );
   const firstAbsentTag = absentBoundary.indexOf(
     'first_tag_raw="$(read_remote_full_tag_snapshot)',
   );
   const secondPresence = absentBoundary.indexOf(
-    'second_presence="$(read_remote_release_presence',
+    'fetch_complete_release_inventory "$second_api" "$second_error"',
   );
   const secondAbsentTag = absentBoundary.indexOf(
     'second_tag_raw="$(read_remote_full_tag_snapshot)',
   );
   const absentRawStability = absentBoundary.indexOf(
-    '[[ "$first_presence" == "$second_presence" && "$first_tag_raw" == "$second_tag_raw" ]]',
+    '[[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]]',
   );
   const stableAbsencePolicy = absentBoundary.indexOf(
-    '[[ "$second_presence" == "absent" ]]',
+    '[[ "$exact_state" == "absent" ]]',
   );
   const absentTagPolicy = absentBoundary.indexOf(
     'validate_remote_full_tag_snapshot "$second_tag_raw"',
@@ -1817,9 +1967,34 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
       firstAbsentTag < secondPresence &&
       secondPresence < secondAbsentTag &&
       secondAbsentTag < absentRawStability &&
-      absentRawStability < stableAbsencePolicy &&
-      stableAbsencePolicy < absentTagPolicy,
-    "absence and full-tag raw A/B reads must complete before stable-state validation",
+      absentRawStability < absentTagPolicy &&
+      absentTagPolicy < stableAbsencePolicy,
+    "complete inventory and full-tag raw A/B reads must finish before exact-tag absence validation",
+  );
+  assert.match(
+    boundaryCapture,
+    /repos\/\$TARGET_REPOSITORY\/releases\/\$frozen_release_id[\s\S]*\.id == \$release_id/u,
+    "all post-discovery Release boundaries must read and validate the frozen numeric id",
+  );
+  assert.doesNotMatch(
+    publisher.slice(publisher.indexOf("reconcile_github_release() {")),
+    /publisher_gh release upload/u,
+    "asset upload must not re-resolve a mutable tag name",
+  );
+  assert.match(
+    publisher.slice(publisher.indexOf("reconcile_github_release() {")),
+    /https:\/\/uploads\.github\.com\/repos\/\$TARGET_REPOSITORY\/releases\/\$frozen_release_id\/assets\?name=\$encoded_name[\s\S]*--method POST[\s\S]*Content-Type: application\/octet-stream[\s\S]*--input "\$asset"/u,
+    "asset upload must bind the frozen numeric Release id and raw asset input",
+  );
+  assert.match(
+    publisher.slice(publisher.indexOf("reconcile_github_release() {")),
+    /\.name == \$name and \.state == "uploaded"[\s\S]*9007199254740991/u,
+    "asset upload must validate the returned asset identity and state",
+  );
+  assert.match(
+    publisher,
+    /read_public_release_view\(\)[\s\S]*X-GitHub-Api-Version: 2026-03-10[\s\S]*releases\/tags\/\$tag/u,
+    "published public verification must pin the GitHub REST API version",
   );
   const githubReconcileStart = publisher.indexOf("reconcile_github_release() {");
   const githubReconcileEnd = publisher.indexOf(
@@ -1828,8 +2003,30 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.notEqual(githubReconcileStart, -1, "missing GitHub Release reconcile helper");
   assert.notEqual(githubReconcileEnd, -1, "missing GitHub Release reconcile helper end");
+  const githubReconcile = publisher.slice(githubReconcileStart, githubReconcileEnd);
+  const missingAssetUploadStart = githubReconcile.indexOf(
+    'if [[ "${#missing_assets[@]}" -gt 0 ]]; then',
+  );
+  const missingAssetUploadEnd = githubReconcile.indexOf(
+    '  asset_names="$(printf',
+    missingAssetUploadStart,
+  );
+  const missingAssetUpload = githubReconcile.slice(
+    missingAssetUploadStart,
+    missingAssetUploadEnd,
+  );
   assert.doesNotMatch(
-    publisher.slice(githubReconcileStart, githubReconcileEnd),
+    missingAssetUpload,
+    /publisher_gh release download/u,
+    "post-upload readback must not resolve a Release by tag",
+  );
+  assert.match(
+    missingAssetUpload,
+    /capture_release_boundary "after-upload-\$name"[\s\S]*Accept: application\/octet-stream[\s\S]*releases\/assets\/\$uploaded_asset_id[\s\S]*cmp -- "\$asset" "\$asset_readback"/u,
+    "post-upload readback must validate the frozen by-ID boundary before raw asset-ID bytes",
+  );
+  assert.doesNotMatch(
+    githubReconcile,
     /publisher_gh release view[\s\S]*HTTP\[\[:space:\]\]404/u,
     "fresh Release absence must be established through the API boundary, not porcelain stderr",
   );
@@ -2032,7 +2229,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.match(
     publisher,
-    /capture_absent_release_boundary[\s\S]*pre-create[\s\S]*post-create[\s\S]*before-upload-[\s\S]*after-upload-[\s\S]*pre-publication-mutation[\s\S]*post-publish[\s\S]*pre-alias-mutation[\s\S]*post-alias/u,
+    /capture_inventory_release_boundary[\s\S]*pre-create absent[\s\S]*post-create present[\s\S]*before-upload-[\s\S]*after-upload-[\s\S]*pre-publication-mutation[\s\S]*post-publish[\s\S]*pre-alias-mutation[\s\S]*post-alias/u,
   );
   assert.match(workflow, /outputs:[\s\S]*reconcile_state: \$\{\{ steps\.reconcile\.outputs\.reconcile_state \}\}[\s\S]*id: reconcile/u);
   assert.match(workflow, /verify:[\s\S]*if: \$\{\{ needs\.publish\.outputs\.reconcile_state != 'superseded' \}\}/u);
@@ -2829,6 +3026,52 @@ test("public verification treats confirmed Release disappearance as a determinis
   }
 });
 
+test("public verification rejects structurally inconclusive complete Release inventories", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "verify-release-inventory-shape" });
+  publishCandidate(state, built);
+  const githubEnvironment = fakeGithubEnvironment(state, "verify-release-inventory-shape");
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-verify-release-inventory-shape",
+    "state.json",
+  );
+  const fakeAssets = join(dirname(fakeStatePath), "assets");
+  const assetNames = releaseAssets(state, "v2.0.0").filter((name) =>
+    !["immutable", "prerelease", "published"].includes(name));
+  for (const name of assetNames) {
+    copyFileSync(join(state.releases, "v2.0.0", name), join(fakeAssets, name));
+  }
+  const publishedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  Object.assign(publishedState, {
+    assets: assetNames.map((name, index) => ({ name, id: index + 1 })),
+    body: `Signed release of Joey-Tools/codex-review-gate@${built.sourceCommit}.`,
+    draft: false,
+    exists: true,
+    immutable: true,
+    latest: "v2.0.0",
+    name: "v2.0.0",
+    next_asset_id: assetNames.length + 1,
+    prerelease: false,
+    tag: "v2.0.0",
+  });
+  writeJson(fakeStatePath, publishedState);
+
+  for (const phase of [
+    "verify-release-inventory-outer-empty",
+    "verify-release-inventory-duplicate-id",
+  ]) {
+    const result = invokeVerifyPublished(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+    });
+    assert.notEqual(result.status, 0, `${phase} must fail closed`);
+    assert.match(result.stderr, /verification_state=inconclusive/u);
+    assert.match(result.stderr, /recovery_code=remote-read-inconclusive/u);
+    assert.match(result.stderr, /next_action=retry-public-verification/u);
+  }
+});
+
 test("an already-complete release is a byte-stable no-op on rerun", (t) => {
   const state = fixture(t);
   const built = buildAssembledCandidate(state);
@@ -3163,6 +3406,8 @@ test("fake GitHub distinguishes API and release-view missing diagnostics", (t) =
   const env = fakeGithubEnvironment(state, "missing-release-diagnostics");
   const api = invoke("gh", [
     "api",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
     "repos/JoeyTeng/codex-review-gate-action/releases/tags/v2.0.0",
   ], { env });
   const view = invoke("gh", [
@@ -3181,7 +3426,198 @@ test("fake GitHub distinguishes API and release-view missing diagnostics", (t) =
   assert.equal(view.status, 1);
   assert.equal(view.stderr, "release not found\n");
   assert.doesNotMatch(view.stderr, /HTTP 404/u);
+
+  const fakeStatePath = join(env.FAKE_GH_STATE, "state.json");
+  const draftState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  draftState.exists = true;
+  draftState.body = "Signed draft fixture.";
+  writeJson(fakeStatePath, draftState);
+  const draftByTag = invoke("gh", [
+    "api",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
+    "repos/JoeyTeng/codex-review-gate-action/releases/tags/v2.0.0",
+  ], { env });
+  const draftInventory = invoke("gh", [
+    "api",
+    "--paginate",
+    "--slurp",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
+    "repos/JoeyTeng/codex-review-gate-action/releases?per_page=100",
+  ], { env });
+  const draftById = invoke("gh", [
+    "api",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
+    `repos/JoeyTeng/codex-review-gate-action/releases/${draftState.release_id}`,
+  ], { env });
+  assert.equal(draftByTag.status, 1);
+  assert.match(draftByTag.stderr, /HTTP 404: Not Found/u);
+  assert.equal(draftInventory.status, 0, draftInventory.stderr);
+  assert.equal(JSON.parse(draftInventory.stdout)[0][0].draft, true);
+  assert.equal(draftById.status, 0, draftById.stderr);
+  assert.equal(JSON.parse(draftById.stdout).id, draftState.release_id);
+  assert.equal(JSON.parse(draftById.stdout).draft, true);
 });
+
+test("fresh GitHub publication discovers and freezes its draft through complete inventories", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "draft-inventory-fresh" });
+  const githubEnvironment = fakeGithubEnvironment(state, "draft-inventory-fresh");
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /reconcile_state=fresh/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-draft-inventory-fresh", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.release_create_calls, 1);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.ok(fakeState.release_inventory_reads >= 2);
+  assert.ok(
+    fakeState.call_trace.some(
+      ({ type, kind, draft }) => type === "remote" && kind === "release-id-read" && draft,
+    ),
+    "draft boundaries must use the frozen numeric Release id",
+  );
+  assert.equal(
+    fakeState.call_trace.some(
+      ({ type, kind, draft }) => type === "remote" && kind === "release-tag-read" && draft,
+    ),
+    false,
+    "the published-only by-tag endpoint must not be used to read a draft",
+  );
+});
+
+test("an exact-source retry finds a pre-existing draft on the second inventory page", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "draft-inventory-second-page" });
+  const githubEnvironment = fakeGithubEnvironment(state, "draft-inventory-second-page");
+  const first = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "patch-failure-before-apply" },
+  });
+  assert.notEqual(first.status, 0);
+  assert.match(first.stderr, /recovery_code=release-publication-unknown/u);
+
+  const recovered = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      FAKE_GH_MUTATION_PHASE: "release-inventory-target-second-page",
+    },
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-draft-inventory-second-page", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.release_create_calls, 1, "retry must not create a second draft");
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.ok(fakeState.release_id_reads > 0);
+});
+
+for (const inventoryFailure of [
+  {
+    phase: "release-inventory-outer-empty",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+  },
+  {
+    phase: "release-inventory-duplicate-id",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+  },
+  {
+    phase: "release-inventory-duplicate-exact-tag",
+    state: "blocked_conflict",
+    recoveryCode: "duplicate-release-tag",
+  },
+]) {
+  test(`${inventoryFailure.phase} fails closed before any durable write`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: inventoryFailure.phase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, inventoryFailure.phase),
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${inventoryFailure.state}`, "u"));
+    assert.match(result.stderr, new RegExp(`recovery_code=${inventoryFailure.recoveryCode}`, "u"));
+    assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  });
+}
+
+for (const postCreateDrift of [
+  "post-create-inventory-id-drift",
+  "post-create-inventory-release-disappears",
+]) {
+  test(`${postCreateDrift} fails closed before draft mutation`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: postCreateDrift });
+    const githubEnvironment = fakeGithubEnvironment(state, postCreateDrift);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconcile_state=inconclusive/u);
+    assert.match(result.stderr, /recovery_code=remote-state-changed/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${postCreateDrift}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.release_create_calls, 1);
+    assert.equal(fakeState.post_create_inventory_reads, 2);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
+
+for (const frozenIdFailure of [
+  {
+    phase: "release-id-boundary-404",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+  },
+  {
+    phase: "release-id-boundary-wrong-id",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+  },
+]) {
+  test(`${frozenIdFailure.phase} never rebinds or recreates the draft`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: frozenIdFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, frozenIdFailure.phase);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${frozenIdFailure.state}`, "u"));
+    assert.match(result.stderr, new RegExp(`recovery_code=${frozenIdFailure.recoveryCode}`, "u"));
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${frozenIdFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.release_create_calls, 1);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.release_id, 987654321);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
 
 for (const policyCase of [
   {
@@ -3351,7 +3787,7 @@ for (const releaseCase of [
     assert.notEqual(patchIndex, -1, "missing direct Release PATCH trace");
     assert.deepEqual(
       remoteCalls.slice(patchIndex - 2, patchIndex).map(({ kind }) => kind),
-      ["release-tag-read", "release-tag-read"],
+      ["release-id-read", "release-id-read"],
       "the final exact boundary's two GitHub reads must immediately precede PATCH",
     );
     for (const boundaryRead of remoteCalls.slice(patchIndex - 2, patchIndex)) {
@@ -3373,6 +3809,121 @@ for (const releaseCase of [
       remoteCalls.slice(0, patchIndex).some(({ kind }) => kind === "release-edit"),
       false,
     );
+  });
+}
+
+test("asset uploads keep the frozen Release id when tag resolution is replaced", (t) => {
+  const state = fixture(t);
+  const phase = "asset-upload-tag-resolution-replaced";
+  const built = buildAssembledCandidate(state, { label: phase });
+  const githubEnvironment = fakeGithubEnvironment(state, phase);
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${phase}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.asset_upload_calls, 3);
+  assert.deepEqual(
+    fakeState.asset_upload_target_release_ids,
+    [fakeState.release_id, fakeState.release_id, fakeState.release_id],
+  );
+  assert.equal(fakeState.tag_resolution_release_id, fakeState.release_id + 1000);
+  assert.deepEqual(fakeState.replacement_release_assets, []);
+  assert.equal(fakeState.asset_readback_calls, 3);
+  assert.deepEqual(fakeState.asset_readback_ids, fakeState.assets.map(({ id }) => id));
+  assert.deepEqual(
+    fakeState.asset_readback_release_ids,
+    [fakeState.release_id, fakeState.release_id, fakeState.release_id],
+  );
+  const uploadCalls = fakeState.call_trace.filter(
+    ({ type, kind }) => type === "remote" && kind === "release-asset-upload",
+  );
+  assert.equal(uploadCalls.length, 3);
+  for (const call of uploadCalls) {
+    assert.match(
+      call.endpoint,
+      new RegExp(`/releases/${fakeState.release_id}/assets\\?name=`, "u"),
+    );
+  }
+  for (const uploadCall of uploadCalls) {
+    const uploadIndex = fakeState.call_trace.indexOf(uploadCall);
+    const assetReadIndex = fakeState.call_trace.findIndex(
+      ({ type, kind }, index) => index > uploadIndex &&
+        type === "remote" && kind === "release-asset-read",
+    );
+    assert.ok(assetReadIndex > uploadIndex, "each upload must have an asset-ID readback");
+    assert.equal(
+      fakeState.call_trace.slice(uploadIndex + 1, assetReadIndex).some(
+        ({ type, kind }) => type === "remote" && kind === "release-download",
+      ),
+      false,
+      "post-upload readback must not resolve the Release again by tag",
+    );
+  }
+});
+
+for (const uploadFailure of [
+  { phase: "asset-upload-failure-before-apply", appliedAssets: 0 },
+  { phase: "asset-upload-response-lost-after-apply", appliedAssets: 1 },
+  { phase: "asset-upload-zero-exit-empty-response", appliedAssets: 1 },
+  { phase: "asset-upload-zero-exit-malformed-response", appliedAssets: 1 },
+  { phase: "asset-upload-zero-exit-wrong-id-response", appliedAssets: 1 },
+  { phase: "asset-readback-failure", appliedAssets: 1 },
+  { phase: "asset-readback-byte-mismatch", appliedAssets: 1 },
+]) {
+  test(`${uploadFailure.phase} preserves an unknown mutation outcome`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: uploadFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, uploadFailure.phase);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconcile_state=inconclusive/u);
+    assert.match(result.stderr, /recovery_code=release-asset-upload-unknown/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${uploadFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.assets.length, uploadFailure.appliedAssets);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.draft, true);
+    assert.equal(fakeState.immutable, false);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    if (uploadFailure.phase === "asset-upload-response-lost-after-apply") {
+      const selectedReleaseId = fakeState.release_id;
+      const recovered = invokePublish(state, built, {
+        testRelease: false,
+        env: {
+          ...githubEnvironment,
+          FAKE_GH_MUTATION_PHASE: "asset-upload-exact-source-retry",
+        },
+      });
+      assert.equal(recovered.status, 0, recovered.stderr);
+      assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+      const recoveredState = JSON.parse(readFileSync(
+        join(state.root, `fake-gh-state-${uploadFailure.phase}`, "state.json"),
+        "utf8",
+      ));
+      assert.equal(recoveredState.release_id, selectedReleaseId);
+      assert.equal(recoveredState.release_create_calls, 1);
+      assert.equal(recoveredState.asset_upload_calls, 3);
+      assert.equal(
+        recoveredState.assets.filter(({ name }) =>
+          name === "codex-review-gate-action-v2.0.0.tar.gz").length,
+        1,
+        "the exact-source retry must adopt the already-applied asset",
+      );
+      assert.equal(recoveredState.draft, false);
+      assert.equal(recoveredState.immutable, true);
+    }
   });
 }
 
@@ -3732,7 +4283,7 @@ for (const mutationPhase of [
     assert.notEqual(mutationTraceIndex, -1, "missing policy-window mutation trace");
     const oldBoundaryReads = fakeState.call_trace
       .slice(0, mutationTraceIndex)
-      .filter(({ type, kind }) => type === "remote" && kind === "release-tag-read")
+      .filter(({ type, kind }) => type === "remote" && kind === "release-id-read")
       .slice(-2);
     assert.equal(oldBoundaryReads.length, 2, "the old exact boundary must precede mutation");
     for (const boundaryRead of oldBoundaryReads) {
@@ -3743,7 +4294,7 @@ for (const mutationPhase of [
     }
     const newBoundaryReads = fakeState.call_trace
       .slice(mutationTraceIndex + 1)
-      .filter(({ type, kind }) => type === "remote" && kind === "release-tag-read");
+      .filter(({ type, kind }) => type === "remote" && kind === "release-id-read");
     assert.ok(newBoundaryReads.length >= 1, "the new final boundary must observe the mutation");
     if (mutationPhase === "asset-drift-during-final-policy-read") {
       assert.ok(newBoundaryReads.length >= 2, "stable asset drift must complete both boundary reads");
@@ -4062,7 +4613,7 @@ test("stable same-name asset replacement after publication is a frozen-boundary 
   assert.notEqual(mutationIndex, -1);
   const readsAfterMutation = fakeState.call_trace
     .slice(mutationIndex + 1)
-    .filter(({ type, kind }) => type === "remote" && kind === "release-tag-read");
+    .filter(({ type, kind }) => type === "remote" && kind === "release-id-read");
   assert.ok(readsAfterMutation.length >= 2);
   assert.equal(readsAfterMutation[0].mutation_done, true);
   assert.equal(readsAfterMutation[1].mutation_done, true);
@@ -4133,7 +4684,7 @@ for (const aliasFenceFailure of [
       const mutationIndex = fakeState.call_trace.indexOf(aliasMutation);
       const finalAliasBoundaryReads = fakeState.call_trace
         .slice(mutationIndex + 1)
-        .filter(({ type, kind }) => type === "remote" && kind === "release-tag-read");
+        .filter(({ type, kind }) => type === "remote" && kind === "release-id-read");
       assert.ok(finalAliasBoundaryReads.length >= 2);
       assert.equal(finalAliasBoundaryReads[0].mutation_done, true);
       assert.equal(finalAliasBoundaryReads[1].mutation_done, true);

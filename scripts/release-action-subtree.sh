@@ -111,6 +111,23 @@ is_v2_plus_major() {
   [[ "$major" =~ ^(0|[1-9][0-9]*)$ && "$major" != "0" && "$major" != "1" ]]
 }
 
+validate_complete_release_inventory() {
+  local inventory_file="$1"
+  jq -e '
+    if type == "array" and length >= 1 and all(.[]; type == "array") then
+      [.[][]] as $releases |
+      all($releases[];
+        type == "object" and
+        (.id | type == "number" and . > 0 and floor == . and . <= 9007199254740991) and
+        (.tag_name | type == "string")
+      ) and
+      (($releases | map(.id) | unique | length) == ($releases | length))
+    else
+      false
+    end
+  ' "$inventory_file" >/dev/null
+}
+
 temporary_root=""
 reconcile_started=false
 reconcile_state_emitted=""
@@ -770,7 +787,9 @@ if [[ "$mode" == "verify-published" ]]; then
     local output_file="$2"
     local error_file="$3"
     local api_status
-    if publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$tag" \
+    if publisher_gh api \
+      --header 'X-GitHub-Api-Version: 2026-03-10' \
+      "repos/$TARGET_REPOSITORY/releases/tags/$tag" \
       > "$output_file" 2> "$error_file"; then
       return 0
     else
@@ -786,7 +805,9 @@ if [[ "$mode" == "verify-published" ]]; then
     local tag="$1"
     local error_file="$2"
     local api_status
-    if publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$tag" \
+    if publisher_gh api \
+        --header 'X-GitHub-Api-Version: 2026-03-10' \
+        "repos/$TARGET_REPOSITORY/releases/tags/$tag" \
         --jq '{isDraft:.draft,isPrerelease:.prerelease,tagName:.tag_name,name:.name,body:.body}' \
         2> "$error_file"; then
       return 0
@@ -880,11 +901,13 @@ if [[ "$mode" == "verify-published" ]]; then
       return 0
     fi
     if ! publisher_gh api --paginate --slurp \
+        --header 'X-GitHub-Api-Version: 2026-03-10' \
         "repos/$TARGET_REPOSITORY/releases?per_page=100" > "$raw_file" 2> "$error_file"; then
       public_api_error_is_http_404 "$error_file" && return 44
       return 75
     fi
-    node "$generator" snapshot-release-inventory --input "$raw_file" > "$output_file" || return 1
+    validate_complete_release_inventory "$raw_file" || return 76
+    node "$generator" snapshot-release-inventory --input "$raw_file" > "$output_file" || return 76
   }
 
   public_release_tags_from_inventory() {
@@ -1087,6 +1110,10 @@ if [[ "$mode" == "verify-published" ]]; then
     :
   else
     inventory_status=$?
+    if [[ "$inventory_status" == 76 ]]; then
+      fail_verification inconclusive remote-read-inconclusive immutable-release \
+        retry-public-verification "complete GitHub Release inventory is structurally inconclusive"
+    fi
     if [[ "$inventory_status" == 75 ]]; then
       if [[ "$public_has_other_stable_tag" == true ]]; then
         fail_verification inconclusive remote-read-inconclusive floating-alias \
@@ -1451,7 +1478,7 @@ if [[ "$mode" == "verify-published" ]]; then
     :
   else
     final_inventory_status=$?
-    if [[ "$final_inventory_status" == 75 ]]; then
+    if [[ "$final_inventory_status" == 75 || "$final_inventory_status" == 76 ]]; then
       fail_verification inconclusive remote-read-inconclusive immutable-release \
         retry-public-verification "final complete GitHub Release inventory could not be read"
     fi
@@ -1880,7 +1907,9 @@ validate_completed_release_state() {
   fi
   api_file="$temporary_root/completed-release-${tag}.json"
   error_file="$temporary_root/completed-release-${tag}.err"
-  if ! publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$tag" > "$api_file" 2> "$error_file"; then
+  if ! publisher_gh api \
+      --header 'X-GitHub-Api-Version: 2026-03-10' \
+      "repos/$TARGET_REPOSITORY/releases/tags/$tag" > "$api_file" 2> "$error_file"; then
     cat "$error_file" >&2
     grep -Fq "HTTP 404" "$error_file" && return 1
     return 75
@@ -1988,6 +2017,11 @@ later_same_major_stable_version=""
 later_release_tag=""
 later_release_version=""
 release_inventory_fingerprint=""
+release_inventory_exact_api=""
+readonly RELEASE_BOUNDARY_REMOTE_UNREADABLE=75
+readonly RELEASE_BOUNDARY_STATE_CHANGED=76
+readonly RELEASE_BOUNDARY_POLICY_MISMATCH=77
+readonly RELEASE_BOUNDARY_DUPLICATE_RELEASE_TAG=78
 remote_ref_fingerprint() {
   local snapshot
   snapshot="$(target_git ls-remote "$target_url" \
@@ -1996,9 +2030,46 @@ remote_ref_fingerprint() {
   printf '%s\n' "$snapshot" | LC_ALL=C sort | shasum -a 256 | awk '{print $1}'
 }
 
+fetch_complete_release_inventory() {
+  local output_file="$1"
+  local error_file="$2"
+  if publisher_gh api --paginate --slurp \
+      --header 'X-GitHub-Api-Version: 2026-03-10' \
+      "repos/$TARGET_REPOSITORY/releases?per_page=100" \
+      > "$output_file" 2> "$error_file"; then
+    return 0
+  fi
+  cat "$error_file" >&2
+  return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+}
+
+write_exact_release_from_inventory() {
+  local inventory_file="$1"
+  local output_file="$2"
+  local matches count
+  matches="$(jq -cS --arg tag "$immutable_tag" \
+    '[.[][] | select(.tag_name == $tag)]' "$inventory_file")" || {
+    return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+  }
+  count="$(jq -r 'length' <<< "$matches")"
+  if [[ "$count" == "0" ]]; then
+    printf 'null\n' > "$output_file"
+    printf 'absent\n'
+    return 0
+  fi
+  if [[ "$count" != "1" ]]; then
+    return "$RELEASE_BOUNDARY_DUPLICATE_RELEASE_TAG"
+  fi
+  jq -cS '.[0]' <<< "$matches" > "$output_file" || {
+    return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+  }
+  printf 'present\n'
+}
+
 audit_release_inventory() {
   local expected_fingerprint="${1:-}"
-  local inventory_file inventory_snapshot entry tag duplicate_tags
+  local inventory_file inventory_error inventory_snapshot entry tag duplicate_tags
+  local exact_state status
   if [[ -n "$test_release_dir" ]]; then
     if [[ ! -e "$test_release_dir" ]]; then
       release_inventory_fingerprint="$(printf '<absent>\n' | shasum -a 256 | awk '{print $1}')"
@@ -2036,18 +2107,16 @@ audit_release_inventory() {
   fi
 
   inventory_file="$temporary_root/github-releases.json"
-  if ! publisher_gh api --paginate --slurp \
-      "repos/$TARGET_REPOSITORY/releases?per_page=100" > "$inventory_file"; then
+  inventory_error="$temporary_root/github-releases.err"
+  if fetch_complete_release_inventory "$inventory_file" "$inventory_error"; then
+    :
+  else
     fail_reconcile inconclusive remote-read-inconclusive \
       "the complete paginated GitHub Release inventory could not be read"
   fi
-  jq -e '
-    type == "array" and
-    all(.[]; type == "array") and
-    (flatten | all(.[]; type == "object" and (.id | type == "number") and (.tag_name | type == "string")))
-  ' "$inventory_file" >/dev/null || {
+  validate_complete_release_inventory "$inventory_file" || {
     fail_reconcile inconclusive remote-read-inconclusive \
-      "the paginated GitHub Release inventory is malformed or incomplete"
+      "the paginated GitHub Release inventory is malformed, incomplete, outer-empty, or repeats a numeric Release id"
   }
   if ! inventory_snapshot="$(
     node "$generator" snapshot-release-inventory --input "$inventory_file"
@@ -2075,6 +2144,23 @@ audit_release_inventory() {
     fail_reconcile blocked_conflict duplicate-release-tag \
       "multiple GitHub Releases claim immutable tag $tag"
   done <<< "$duplicate_tags"
+  release_inventory_exact_api="$temporary_root/github-release-exact-tag.json"
+  if exact_state="$(write_exact_release_from_inventory \
+      "$inventory_file" "$release_inventory_exact_api")"; then
+    :
+  else
+    status=$?
+    if [[ "$status" == "$RELEASE_BOUNDARY_DUPLICATE_RELEASE_TAG" ]]; then
+      fail_reconcile blocked_conflict duplicate-release-tag \
+        "multiple GitHub Releases claim immutable tag $immutable_tag"
+    fi
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "the exact-tag entry could not be derived from the complete GitHub Release inventory"
+  fi
+  [[ "$exact_state" == "present" || "$exact_state" == "absent" ]] || {
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "the exact-tag state derived from the complete GitHub Release inventory is invalid"
+  }
   while IFS= read -r -d '' tag; do
     if is_v2_plus_major_alias "$tag"; then
       fail_reconcile blocked_conflict floating-alias-release \
@@ -2297,6 +2383,7 @@ existing_assets_dir="$temporary_root/existing-release-assets"
 mkdir -m 700 "$existing_assets_dir"
 release_exists=false
 release_complete=false
+frozen_release_id=""
 expected_release_assets="$(release_asset_inventory_for_tag "$immutable_tag")"
 valid_release_asset_prefix() {
   local actual="$1"
@@ -2353,15 +2440,29 @@ if [[ -n "$test_release_dir" ]]; then
   fi
 else
   current_release_api="$temporary_root/current-release-prewrite.json"
-  current_release_error="$temporary_root/current-release-prewrite.err"
-  if publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$current_release_api" 2> "$current_release_error"; then
+  [[ -n "$release_inventory_exact_api" && -f "$release_inventory_exact_api" ]] || {
+    emit_reconcile_state inconclusive stderr
+    emit_recovery_code remote-read-inconclusive \
+      "the exact-tag state is missing from the complete GitHub Release inventory"
+    exit 1
+  }
+  cp "$release_inventory_exact_api" "$current_release_api"
+  if jq -e 'type == "object"' "$current_release_api" >/dev/null; then
     release_exists=true
-  elif grep -Fq "HTTP 404" "$current_release_error"; then
+    frozen_release_id="$(jq -er \
+      '.id | select(type == "number" and . > 0 and floor == . and . <= 9007199254740991)' \
+      "$current_release_api")" || {
+      emit_reconcile_state inconclusive stderr
+      emit_recovery_code remote-read-inconclusive \
+        "the exact-tag GitHub Release has no safe positive numeric id"
+      exit 1
+    }
+  elif jq -e 'type == "null"' "$current_release_api" >/dev/null; then
     release_exists=false
   else
-    cat "$current_release_error" >&2
     emit_reconcile_state inconclusive stderr
-    emit_recovery_code remote-read-inconclusive "GitHub Release state could not be read"
+    emit_recovery_code remote-read-inconclusive \
+      "the exact-tag state from the complete GitHub Release inventory is malformed"
     exit 1
   fi
   if [[ "$release_exists" == true ]]; then
@@ -2710,12 +2811,19 @@ later_same_major_stable_version="$saved_later_same_major_stable_version"
 verify_live_release_signer_policy final-prewrite
 if ! is_test_environment; then
   stable_release_api="$temporary_root/current-release-final-prewrite.json"
-  stable_release_error="$temporary_root/current-release-final-prewrite.err"
+  [[ -n "$release_inventory_exact_api" && -f "$release_inventory_exact_api" ]] || {
+    emit_reconcile_state inconclusive stderr
+    emit_recovery_code remote-read-inconclusive \
+      "the final exact-tag state is missing from the complete GitHub Release inventory"
+    exit 1
+  }
+  cp "$release_inventory_exact_api" "$stable_release_api"
   if [[ "$release_exists" == true ]]; then
-    if ! publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$stable_release_api" 2> "$stable_release_error"; then
-      cat "$stable_release_error" >&2
+    if ! jq -e --argjson release_id "$frozen_release_id" \
+        'type == "object" and .id == $release_id' "$stable_release_api" >/dev/null; then
       emit_reconcile_state inconclusive stderr
-      emit_recovery_code remote-read-inconclusive "GitHub Release changed or became unreadable before the write phase"
+      emit_recovery_code remote-state-changed \
+        "the exact-tag GitHub Release identity changed before the write phase"
       exit 1
     fi
     initial_release_identity="$(jq -Sc '{tag_name,name,body,prerelease,draft,immutable,author_login:.author.login}' "$current_release_api")"
@@ -2726,14 +2834,14 @@ if ! is_test_environment; then
       emit_recovery_code remote-state-changed "GitHub Release metadata or asset identity changed during reconcile"
       exit 1
     }
-  elif publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$stable_release_api" 2> "$stable_release_error"; then
+  elif jq -e 'type == "object"' "$stable_release_api" >/dev/null; then
     emit_reconcile_state inconclusive stderr
     emit_recovery_code remote-state-changed "GitHub Release appeared during reconcile"
     exit 1
-  elif ! grep -Fq "HTTP 404" "$stable_release_error"; then
-    cat "$stable_release_error" >&2
+  elif ! jq -e 'type == "null"' "$stable_release_api" >/dev/null; then
     emit_reconcile_state inconclusive stderr
-    emit_recovery_code remote-read-inconclusive "GitHub Release absence could not be revalidated"
+    emit_recovery_code remote-read-inconclusive \
+      "GitHub Release absence could not be derived from the complete inventory"
     exit 1
   fi
 fi
@@ -2881,14 +2989,12 @@ reconcile_test_release() {
   [[ "$actual_test_inventory" == "$expected_test_inventory" ]] || { echo "error: test Release asset inventory differs from policy" >&2; return 1; }
 }
 
-readonly RELEASE_BOUNDARY_REMOTE_UNREADABLE=75
-readonly RELEASE_BOUNDARY_STATE_CHANGED=76
-readonly RELEASE_BOUNDARY_POLICY_MISMATCH=77
 release_boundary_counter=0
 reconcile_github_release() {
   local asset_names asset name download_dir expected_asset_names
-  local latest_before latest_after current_presence current_presence_api
-  local current_presence_error presence_status
+  local encoded_name upload_url upload_response upload_error uploaded_asset_id
+  local asset_readback asset_readback_error
+  local latest_before latest_after
   local final_release_api final_confirm_api final_release_identity final_confirm_identity
   local final_asset_snapshot final_confirm_snapshot final_download_dir final_provenance_status
   local post_publish_release_api publication_payload publication_response publication_error
@@ -2962,7 +3068,14 @@ reconcile_github_release() {
     second_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.json"
     first_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.err"
     second_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.err"
-    if ! publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$first_api" 2> "$first_error"; then
+    [[ "$frozen_release_id" =~ ^[1-9][0-9]*$ ]] || {
+      echo "error: GitHub Release boundary has no frozen positive numeric id" >&2
+      return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+    }
+    if ! publisher_gh api \
+        --header 'X-GitHub-Api-Version: 2026-03-10' \
+        "repos/$TARGET_REPOSITORY/releases/$frozen_release_id" \
+        > "$first_api" 2> "$first_error"; then
       cat "$first_error" >&2
       return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
     fi
@@ -2972,7 +3085,10 @@ reconcile_github_release() {
       status=$?
       return "$status"
     fi
-    if ! publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$second_api" 2> "$second_error"; then
+    if ! publisher_gh api \
+        --header 'X-GitHub-Api-Version: 2026-03-10' \
+        "repos/$TARGET_REPOSITORY/releases/$frozen_release_id" \
+        > "$second_api" 2> "$second_error"; then
       cat "$second_error" >&2
       return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
     fi
@@ -2994,6 +3110,11 @@ reconcile_github_release() {
     fi
     [[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]] || {
       return "$RELEASE_BOUNDARY_STATE_CHANGED"
+    }
+    jq -e --argjson release_id "$frozen_release_id" \
+      'type == "object" and .id == $release_id' "$second_api" >/dev/null || {
+      echo "error: GitHub Release id endpoint did not return the frozen object identity" >&2
+      return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
     }
 
     if ! boundary_snapshot="$(node "$generator" snapshot-release-boundary \
@@ -3034,6 +3155,10 @@ reconcile_github_release() {
         fail_reconcile blocked_conflict immutable-release-mismatch \
           "$context deterministically differs from the approved metadata, author, asset, or tag policy"
         ;;
+      "$RELEASE_BOUNDARY_DUPLICATE_RELEASE_TAG")
+        fail_reconcile blocked_conflict duplicate-release-tag \
+          "$context found multiple GitHub Releases claiming immutable tag $immutable_tag"
+        ;;
       *)
         fail_reconcile inconclusive release-boundary-verification-failed \
           "$context could not be classified safely; inspect the verifier and reconcile the same exact source SHA"
@@ -3041,33 +3166,21 @@ reconcile_github_release() {
     esac
   }
 
-  read_remote_release_presence() {
-    local output_file="$1"
-    local error_file="$2"
-    if publisher_gh api \
-        "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$output_file" 2> "$error_file"; then
-      printf 'present\n'
-      return 0
-    fi
-    if grep -Fq "HTTP 404" "$error_file"; then
-      printf 'absent\n'
-      return 0
-    fi
-    cat "$error_file" >&2
-    return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
-  }
-
-  capture_absent_release_boundary() {
+  capture_inventory_release_boundary() {
     local label="$1"
-    local first_api second_api first_error second_error
-    local first_presence second_presence first_tag_raw second_tag_raw
-    local validated_tag status
+    local expected_presence="$2"
+    local expected_draft="$3"
+    local expected_immutable="$4"
+    local first_api second_api first_error second_error second_exact
+    local first_raw second_raw first_tag_raw second_tag_raw
+    local exact_state validated_tag boundary_snapshot status
     release_boundary_counter=$((release_boundary_counter + 1))
     first_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.json"
     second_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.json"
     first_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.err"
     second_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.err"
-    if first_presence="$(read_remote_release_presence "$first_api" "$first_error")"; then
+    second_exact="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b-exact.json"
+    if fetch_complete_release_inventory "$first_api" "$first_error"; then
       :
     else
       status=$?
@@ -3079,7 +3192,7 @@ reconcile_github_release() {
       status=$?
       return "$status"
     fi
-    if second_presence="$(read_remote_release_presence "$second_api" "$second_error")"; then
+    if fetch_complete_release_inventory "$second_api" "$second_error"; then
       :
     else
       status=$?
@@ -3091,23 +3204,59 @@ reconcile_github_release() {
       status=$?
       return "$status"
     fi
-    [[ "$first_presence" == "$second_presence" && "$first_tag_raw" == "$second_tag_raw" ]] || {
+    if ! first_raw="$(jq -cS . "$first_api")" ||
+        ! second_raw="$(jq -cS . "$second_api")"; then
+      echo "error: complete GitHub Release inventory could not be parsed as canonical JSON" >&2
+      return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
+    fi
+    [[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]] || {
       return "$RELEASE_BOUNDARY_STATE_CHANGED"
     }
-    [[ "$second_presence" == "absent" ]] || {
-      echo "error: GitHub Release is stably present at its expected-absence boundary" >&2
-      return "$RELEASE_BOUNDARY_STATE_CHANGED"
+    validate_complete_release_inventory "$second_api" || {
+      echo "error: stable complete GitHub Release inventory is malformed, incomplete, outer-empty, or repeats a numeric id" >&2
+      return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
     }
+    if exact_state="$(write_exact_release_from_inventory "$second_api" "$second_exact")"; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
     if validated_tag="$(validate_remote_full_tag_snapshot "$second_tag_raw")"; then
       :
     else
       status=$?
       return "$status"
     fi
+    if [[ "$expected_presence" == "absent" ]]; then
+      [[ "$exact_state" == "absent" ]] || {
+        echo "error: GitHub Release is stably present at its expected-absence boundary" >&2
+        return "$RELEASE_BOUNDARY_STATE_CHANGED"
+      }
+      jq -cn \
+        --arg object "${validated_tag%%$'\t'*}" \
+        --arg commit "${validated_tag#*$'\t'}" \
+        '{release:"absent",assets:[],tag:{object:$object,commit:$commit}}'
+      return 0
+    fi
+    [[ "$expected_presence" == "present" && "$exact_state" == "present" ]] || {
+      echo "error: GitHub Release is stably absent at its expected-presence boundary" >&2
+      return "$RELEASE_BOUNDARY_STATE_CHANGED"
+    }
+    if ! boundary_snapshot="$(node "$generator" snapshot-release-boundary \
+        --input "$second_exact" \
+        --tag "$immutable_tag" \
+        --body "$expected_release_body" \
+        --prerelease "$prerelease" \
+        --draft "$expected_draft" \
+        --immutable "$expected_immutable")"; then
+      return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
+    fi
     jq -cn \
+      --argjson boundary "$boundary_snapshot" \
       --arg object "${validated_tag%%$'\t'*}" \
       --arg commit "${validated_tag#*$'\t'}" \
-      '{release:"absent",assets:[],tag:{object:$object,commit:$commit}}'
+      '$boundary + {tag:{object:$object,commit:$commit}}'
   }
 
   read_latest_release_tag() {
@@ -3132,21 +3281,7 @@ reconcile_github_release() {
   }
   latest_before="$(read_latest_release_tag before)"
   current_boundary=""
-  current_presence_api="$temporary_root/current-release-reconcile.json"
-  current_presence_error="$temporary_root/current-release-reconcile.err"
-  if current_presence="$(read_remote_release_presence \
-      "$current_presence_api" "$current_presence_error")"; then
-    :
-  else
-    presence_status=$?
-    fail_release_boundary_capture "$presence_status" \
-      "GitHub Release presence during reconcile"
-  fi
-  if [[ "$current_presence" == "present" ]]; then
-    [[ "$release_exists" == true ]] || {
-      fail_reconcile inconclusive remote-state-changed \
-        "GitHub Release appeared during reconcile; reconcile the same exact source SHA"
-    }
+  if [[ "$release_exists" == true ]]; then
     current_draft="$(jq -r .draft "$current_release_api")"
     [[ "$current_draft" == "true" || "$current_draft" == "false" ]] || {
       fail_reconcile inconclusive remote-read-inconclusive \
@@ -3157,29 +3292,29 @@ reconcile_github_release() {
     current_boundary="$(capture_release_boundary initial "$current_draft" "$current_immutable")" || {
       fail_release_boundary_capture "$?" "initial GitHub Release mutation boundary"
     }
-  elif [[ "$current_presence" == "absent" ]]; then
-    [[ "$release_exists" != true ]] || {
-      fail_reconcile inconclusive remote-state-changed \
-        "GitHub Release disappeared during reconcile; reconcile the same exact source SHA"
-    }
-    absent_boundary="$(capture_absent_release_boundary pre-create)" || {
+  else
+    absent_boundary="$(capture_inventory_release_boundary \
+      pre-create absent false false)" || {
       fail_release_boundary_capture "$?" "absent GitHub Release draft-create boundary"
     }
     require_publication_mutation release-completion
     create_args=(release create "$immutable_tag" --repo "$TARGET_REPOSITORY" --verify-tag --draft --title "$immutable_tag" --notes "$expected_release_body")
     [[ "$prerelease" == true ]] && create_args+=(--prerelease)
     publisher_gh "${create_args[@]}"
-    created_boundary="$(capture_release_boundary post-create true false)" || {
+    created_boundary="$(capture_inventory_release_boundary \
+      post-create present true false)" || {
       fail_release_boundary_capture "$?" "created draft GitHub Release boundary"
+    }
+    frozen_release_id="$(printf '%s' "$created_boundary" | jq -er \
+      '.release.id | select(type == "number" and . > 0 and floor == . and . <= 9007199254740991)')" || {
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "the uniquely discovered draft GitHub Release has an invalid numeric id"
     }
     [[ "$(printf '%s' "$absent_boundary" | jq -Sc .tag)" == "$(printf '%s' "$created_boundary" | jq -Sc .tag)" ]] || {
       fail_reconcile inconclusive remote-state-changed \
         "immutable tag binding changed during draft creation; reconcile the same exact source SHA"
     }
     current_boundary="$created_boundary"
-  else
-    fail_reconcile inconclusive release-boundary-verification-failed \
-      "GitHub Release presence returned an invalid state during reconcile"
   fi
   current_draft="$(printf '%s' "$current_boundary" | jq -r .release.draft)"
   [[ "$current_draft" == "true" || "$current_draft" == "false" ]] || return 1
@@ -3227,11 +3362,39 @@ reconcile_github_release() {
           "GitHub Release boundary changed before uploading $name; reconcile the same exact source SHA"
       }
       require_publication_mutation release-completion
-      publisher_gh release upload "$immutable_tag" "$asset" --repo "$TARGET_REPOSITORY"
-      download_dir="$temporary_root/download-uploaded-$name"
-      mkdir "$download_dir"
-      publisher_gh release download "$immutable_tag" --repo "$TARGET_REPOSITORY" --pattern "$name" --dir "$download_dir"
-      cmp -- "$asset" "$download_dir/$name" || { echo "error: uploaded release asset failed readback: $name" >&2; return 1; }
+      encoded_name="$(jq -rn --arg value "$name" '$value | @uri')" || {
+        fail_reconcile inconclusive release-asset-upload-unknown \
+          "asset upload URL could not be constructed for frozen Release id $frozen_release_id; reconcile the same exact source SHA"
+      }
+      [[ -n "$encoded_name" && "$encoded_name" != *$'\n'* ]] || {
+        fail_reconcile inconclusive release-asset-upload-unknown \
+          "asset upload URL is invalid for frozen Release id $frozen_release_id; reconcile the same exact source SHA"
+      }
+      upload_url="https://uploads.github.com/repos/$TARGET_REPOSITORY/releases/$frozen_release_id/assets?name=$encoded_name"
+      upload_response="$temporary_root/release-asset-upload-${release_boundary_counter}-${name}.json"
+      upload_error="$temporary_root/release-asset-upload-${release_boundary_counter}-${name}.err"
+      if ! publisher_gh api \
+          --method POST \
+          --header 'Accept: application/vnd.github+json' \
+          --header 'Content-Type: application/octet-stream' \
+          --header 'X-GitHub-Api-Version: 2026-03-10' \
+          "$upload_url" \
+          --input "$asset" > "$upload_response" 2> "$upload_error"; then
+        cat "$upload_error" >&2
+        fail_reconcile inconclusive release-asset-upload-unknown \
+          "asset upload may have applied to frozen Release id $frozen_release_id; reconcile the same exact source SHA without rebinding the Release"
+      fi
+      uploaded_asset_id="$(jq -er --arg name "$name" '
+        select(type == "object") |
+        select(.name == $name and .state == "uploaded") |
+        select(.url | type == "string" and length > 0) |
+        select(.browser_download_url | type == "string" and length > 0) |
+        .id |
+        select(type == "number" and . > 0 and floor == . and . <= 9007199254740991)
+      ' "$upload_response")" || {
+        fail_reconcile inconclusive release-asset-upload-unknown \
+          "asset upload response is missing a valid uploaded asset identity for frozen Release id $frozen_release_id; reconcile the same exact source SHA without rebinding the Release"
+      }
       after_boundary="$(capture_release_boundary "after-upload-$name" true false)" || {
         fail_release_boundary_capture "$?" "GitHub Release boundary after uploading $name"
       }
@@ -3245,6 +3408,31 @@ reconcile_github_release() {
          ($after.assets | length) == (($before.assets | length) + 1)' >/dev/null || {
         fail_reconcile inconclusive remote-state-changed \
           "GitHub Release boundary changed unexpectedly while uploading $name; reconcile the same exact source SHA"
+      }
+      jq -e -n \
+        --arg name "$name" \
+        --argjson uploaded_asset_id "$uploaded_asset_id" \
+        --argjson after "$after_boundary" \
+        '([ $after.assets[] |
+          select(.name == $name and .id == $uploaded_asset_id) ] | length) == 1' \
+        >/dev/null || {
+        fail_reconcile inconclusive release-asset-upload-unknown \
+          "asset upload response identity does not match the asset on frozen Release id $frozen_release_id; reconcile the same exact source SHA without rebinding the Release"
+      }
+      asset_readback="$temporary_root/release-asset-readback-${release_boundary_counter}-${name}"
+      asset_readback_error="$temporary_root/release-asset-readback-${release_boundary_counter}-${name}.err"
+      if ! publisher_gh api \
+          --header 'Accept: application/octet-stream' \
+          --header 'X-GitHub-Api-Version: 2026-03-10' \
+          "repos/$TARGET_REPOSITORY/releases/assets/$uploaded_asset_id" \
+          > "$asset_readback" 2> "$asset_readback_error"; then
+        cat "$asset_readback_error" >&2
+        fail_reconcile inconclusive release-asset-upload-unknown \
+          "asset bytes could not be read by returned asset id from frozen Release id $frozen_release_id; reconcile the same exact source SHA"
+      fi
+      cmp -- "$asset" "$asset_readback" || {
+        fail_reconcile inconclusive release-asset-upload-unknown \
+          "asset bytes read by returned asset id differ from the intended bytes on frozen Release id $frozen_release_id; reconcile the same exact source SHA"
       }
       current_boundary="$after_boundary"
     done
@@ -3315,11 +3503,16 @@ reconcile_github_release() {
     }
   fi
   post_publish_release_api="$temporary_root/current-release-post-publish.json"
-  publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$post_publish_release_api" || {
+  publisher_gh api \
+    --header 'X-GitHub-Api-Version: 2026-03-10' \
+    "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" \
+    > "$post_publish_release_api" || {
     fail_reconcile inconclusive remote-read-inconclusive \
       "published GitHub Release could not be read back after publication"
   }
-  jq -e '.draft == false and .immutable == true' "$post_publish_release_api" >/dev/null || {
+  jq -e --argjson release_id "$frozen_release_id" \
+    '.id == $release_id and .draft == false and .immutable == true' \
+    "$post_publish_release_api" >/dev/null || {
     fail_reconcile blocked_conflict immutable-release-mismatch \
       "published GitHub Release must report draft=false and immutable=true before alias advancement"
   }
@@ -3361,15 +3554,19 @@ reconcile_github_release() {
       "the stable immutable GitHub Release identity, author, tag binding, or assets differ from the frozen published boundary"
   }
   final_release_api="$temporary_root/current-release-final-immutable.json"
-  publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$final_release_api" || {
+  publisher_gh api \
+    --header 'X-GitHub-Api-Version: 2026-03-10' \
+    "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" \
+    > "$final_release_api" || {
     fail_reconcile inconclusive remote-read-inconclusive \
       "immutable GitHub Release metadata could not be read before alias advancement"
   }
   jq -e \
+    --argjson release_id "$frozen_release_id" \
     --arg tag "$immutable_tag" \
     --arg body "$expected_release_body" \
     --argjson prerelease "$prerelease" \
-    '.tag_name == $tag and .name == $tag and .body == $body and
+    '.id == $release_id and .tag_name == $tag and .name == $tag and .body == $body and
      .prerelease == $prerelease and .draft == false and .immutable == true and
      .author.login == "codex-review-gate-action-publisher[bot]"' \
     "$final_release_api" >/dev/null || {
@@ -3427,9 +3624,17 @@ reconcile_github_release() {
   fi
 
   final_confirm_api="$temporary_root/current-release-final-confirm.json"
-  publisher_gh api "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" > "$final_confirm_api" || {
+  publisher_gh api \
+    --header 'X-GitHub-Api-Version: 2026-03-10' \
+    "repos/$TARGET_REPOSITORY/releases/tags/$immutable_tag" \
+    > "$final_confirm_api" || {
     fail_reconcile inconclusive remote-read-inconclusive \
       "immutable GitHub Release could not be re-read after asset verification"
+  }
+  jq -e --argjson release_id "$frozen_release_id" \
+    'type == "object" and .id == $release_id' "$final_confirm_api" >/dev/null || {
+    fail_reconcile blocked_conflict immutable-release-mismatch \
+      "published by-tag readback no longer names the frozen GitHub Release id"
   }
   final_confirm_boundary="$(capture_release_boundary final-confirm false true)" || {
     fail_release_boundary_capture "$?" "immutable GitHub Release boundary after asset verification"
