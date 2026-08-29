@@ -3481,7 +3481,8 @@ function scopeV2ProgressArtifactsToCurrentHead({
     let latestBoundaryMs = Number.NEGATIVE_INFINITY;
     let latestBoundaries = [];
     for (const boundary of boundaries) {
-      if (boundary.revisionMs >= progressMs) continue;
+      if (boundary.revisionMs === progressMs) return true;
+      if (boundary.revisionMs > progressMs) continue;
       if (boundary.revisionMs > latestBoundaryMs) {
         latestBoundaryMs = boundary.revisionMs;
         latestBoundaries = [boundary];

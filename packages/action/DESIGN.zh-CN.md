@@ -252,7 +252,23 @@ request 还需要 exact v2 marker，绑定 full head 和 run。
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。
 
-通常情况下，terminal clean text 与符合条件的 provider `+1` 是同等 clean carriers。
+通常情况下，terminal clean text 与符合条件的 provider `+1` 是同等 clean carriers，
+但前提是 generation lineage 已完整闭合。每条物理 request comment 都是 generation
+boundary，同一次 workflow run 产生的 duplicate hidden markers 也不例外。后一个
+generation 要 pass，前一个 generation 必须在自身 boundary 与后继 boundary 之间严格
+收到 provider terminal evidence，或在自身 request 上收到合格的 `+1`。如果 official
+`eyes` 或 provider progress 不早于该 `+1` 且不晚于后继 boundary，前一个 generation
+仍保持 open。GitHub timestamp 精度下与后继 boundary 同时属于 ordering ambiguity，
+不能证明 review activity 已在新 generation 前结束。绑定最新 request 的 clean 不能
+跨过更早的 unclosed gap；后继 boundary 之后才出现的 evidence 也不能倒推修复该 gap。
+
+带有单一、无歧义 commit binding 的 progress 会直接归入对应 head。unbound progress
+只有在最近的严格更早物理 request boundary 唯一、canonical 且绑定到不同 head 时，
+才能作为 historical 排除。没有更早 boundary、最近 boundary 是 ordinary 或存在冲突，
+以及任一 boundary 与 progress 同时，都必须在 current-head inventory 中保持
+fail-closed。这样既避免 old-head progress 污染新 generation，也不会把时间顺序有
+歧义的 review activity 猜测成已结束。
+
 一旦观察到 base epoch，terminal payload 无法证明它由哪个 request/base snapshot
 产生；在这个降级 lineage mode 中，只有直接附着在最新且严格晚于 epoch、绑定当前
 base 的 canonical workflow request 上的合格 `+1`，才能作为 positive 或

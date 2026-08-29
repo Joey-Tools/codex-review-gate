@@ -1650,6 +1650,79 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
   assert.equal(oldHeadProgress.report.gateOutcome, "success");
   assert.match(oldHeadProgress.report.reason, /issue-comment 203/u);
 
+  const progressAtCurrentSuccessorGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      oldHeadBoundary,
+      progressIssueComment({
+        id: 208,
+        created_at: currentGenerationB.created_at,
+        updated_at: currentGenerationB.updated_at,
+      }),
+      currentGenerationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 526, created_at: "2026-08-25T08:01:00Z" })]],
+    ]),
+  });
+  const progressAtCurrentSuccessorEnvironment = runtimeEnvironment(context, {
+    suffix: "old-head-progress-at-current-successor-boundary",
+  });
+  const { result: progressAtCurrentSuccessor } = await runGate(
+    progressAtCurrentSuccessorEnvironment,
+    progressAtCurrentSuccessorGitHub,
+  );
+  assert.equal(progressAtCurrentSuccessor.exitCode, 1);
+  assert.equal(progressAtCurrentSuccessor.report.gateOutcome, "pending");
+  assert.equal(
+    progressAtCurrentSuccessor.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.equal(progressAtCurrentSuccessor.report.counts.indeterminate, 1);
+  assert.match(
+    progressAtCurrentSuccessor.report.reason,
+    /earlier request 101.*newer request 103/iu,
+  );
+  assert.equal(
+    progressAtCurrentSuccessorGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const progressAtOldHeadBoundaryGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      progressIssueComment({
+        id: 209,
+        created_at: oldHeadBoundary.created_at,
+        updated_at: oldHeadBoundary.updated_at,
+      }),
+      oldHeadBoundary,
+      currentGenerationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 527, created_at: "2026-08-25T08:01:00Z" })]],
+    ]),
+  });
+  const progressAtOldHeadBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "progress-at-old-head-boundary",
+  });
+  const { result: progressAtOldHeadBoundary } = await runGate(
+    progressAtOldHeadBoundaryEnvironment,
+    progressAtOldHeadBoundaryGitHub,
+  );
+  assert.equal(progressAtOldHeadBoundary.exitCode, 1);
+  assert.equal(progressAtOldHeadBoundary.report.gateOutcome, "pending");
+  assert.equal(
+    progressAtOldHeadBoundary.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.equal(
+    progressAtOldHeadBoundaryGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
   const currentHeadMiddleBoundary = workflowRequest({
     id: 102,
     body: canonicalRequestBody(HEAD, { runId: "124" }),

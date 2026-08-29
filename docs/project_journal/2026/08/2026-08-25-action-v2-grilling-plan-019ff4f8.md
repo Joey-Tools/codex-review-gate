@@ -2987,6 +2987,50 @@ superseded_by:
   focused re-review reported no remaining High or Medium finding. This is not
   the required new whole-range exact-head acceptance review.
 
+### Frozen-head whole-range review follow-up
+
+- A fresh ordinary general-agent lane using GPT-5.6 Sol Ultra reviewed the
+  complete exact range
+  `cf640dc84d2d59ead9acc2ea9cd1c74e4441aaff..75f54b662459fd42553638f90eea9f80eb18ee50`.
+  It found no High issue, one Medium fail-open progress-attribution race, and
+  one Low documentation-consistency issue. No other High or Medium issue was
+  reported.
+- The Medium sequence was: a predecessor current-head request received a
+  qualifying `+1`; a later old-head physical request boundary appeared; an
+  unbound provider-progress revision shared GitHub's one-second timestamp with
+  the next current-head request; and a delayed clean arrived afterward. The
+  first implementation ignored all boundaries at or after the progress time,
+  selected the uniquely old-head strictly earlier boundary, and discarded the
+  progress as historical. The predecessor `+1` could then close the gap and
+  allow the delayed clean to pass. This contradicted the adopted rule that a
+  same-time physical boundary is ordering ambiguity and must remain
+  fail-closed.
+- The runtime now retains unbound progress whenever any physical request
+  boundary has the same revision timestamp. Only after ruling out that
+  ambiguity does it apply the existing most-recent-strictly-earlier-boundary
+  rule. It deliberately does not use comment IDs as a timestamp tie-break:
+  provider progress can use an edited comment's revision time, while a comment
+  ID orders creation and cannot prove the within-second edit/request order.
+- Two integration regressions close both sides of the contract. The first
+  reproduces the fail-open combination with the current-head successor at the
+  same time as progress. The second keeps progress fail-closed when the
+  old-head boundary itself is at the same time; this prevents a future change
+  from merely replacing `>=` with `>` and attributing the ambiguous signal to
+  the old head. The existing strictly ordered old-head-progress case still
+  passes, so known historical activity remains filtered.
+- The Low issue was accurate: the English DESIGN and README contained the
+  physical-generation-boundary, predecessor-gap, and unbound-progress rules,
+  while their Chinese counterparts still had only the earlier short form. The
+  Chinese DESIGN and README now state the same normative rules and recovery
+  boundary; no runtime policy was changed for this documentation fix.
+- Validation actually run for this follow-up:
+  - the focused overlapping-generation regression passed 1/1;
+  - `npm run test:v2 -- --test-reporter=dot` passed 95/95, including both new
+    combinations and all runtime, Action ABI, and workflow-contract cases; and
+  - `npm run check` passed.
+  The follow-up still requires the ordinary diff checks, journal validation,
+  signed commit, and a new fresh whole-range exact-head review before push.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
