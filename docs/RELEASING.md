@@ -431,14 +431,20 @@ protected write.
    Publisher App. That push-authorized identity can see drafts. Require a
    nonempty outer page array (`[[]]` is the valid empty-repository result),
    safe positive globally unique numeric IDs, and zero or one exact-tag match.
-   A pre-existing draft is resumed by its inventory ID. For a fresh Release,
-   two stable complete inventories prove exact-tag absence before creation.
-   The publisher issues exactly one create request in that invocation, captures
-   its status without treating it as authoritative, and always takes two new
-   stable complete inventories. If they discover exactly one Release, it
-   freezes that ID and continues even when the create response was lost after
-   GitHub applied the request. Stable absence is `inconclusive` /
-   `release-creation-unknown`; the invocation never retries create. Upload
+   A pre-existing draft is resumed by its inventory ID. A fresh invocation
+   receives draft-create authority only when the immutable full tag was absent
+   at invocation start and that same invocation non-force-pushed the tag, then
+   read back its exact tag object and peeled commit. Two stable complete
+   inventories must still prove exact-tag Release absence before creation. The
+   publisher issues exactly one create request in that invocation, captures its
+   status without treating it as authoritative, and always takes two new stable
+   complete inventories. If they discover exactly one Release, it freezes that
+   ID and continues even when the create response was lost after GitHub applied
+   the request. Stable absence after that request is `inconclusive` /
+   `release-creation-unknown`; the invocation never retries create. If the full
+   tag already existed at invocation start while the stable complete inventory
+   has no exact-tag Release, the publisher emits `inconclusive` /
+   `release-create-attempt-unknown` without issuing any create request. Upload
    release assets, canonical provenance, checksums, and
    the detached provenance signature through the numeric-ID
    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets`
@@ -481,10 +487,13 @@ requires every response `.id` to equal the frozen path ID, and only then
 performs structural and expected-policy validation. An ID-endpoint `404` or
 other unreadable result never authorizes rebinding or recreation within that
 invocation. A later exact-source retry has no persisted Release-ID ledger: it
-performs a new full reconcile, selects the then-unique exact-tag object from
-the complete inventory, and freezes that ID for the new invocation. The
-trusted-owner boundary forbids deletion or replacement between attempts; the
-publisher does not claim historical ID continuity across runs. Its closed classification is:
+performs a new full reconcile and, when the complete inventory selects one
+unique exact-tag object, freezes that ID for the new invocation. Stable absence
+does not authorize recreation when the immutable full tag existed at invocation
+start. The pre-existing tag is the durable cross-run create-attempt fence, and
+the retry stops as `release-create-attempt-unknown`. The trusted-owner boundary
+forbids deletion or replacement between attempts; the publisher does not claim
+historical ID continuity across runs. Its closed classification is:
 
 - an unreadable API, `ls-remote`, or canonical raw projection is
   `inconclusive` / `remote-read-inconclusive`;
@@ -513,7 +522,15 @@ inventory/tag observations. One unique exact-tag match freezes the positive
 numeric ID and safely recovers a lost response in the same invocation. Stable
 absence is `inconclusive` / `release-creation-unknown`, because eventual
 visibility is not proof that a second create would be safe; that invocation
-stops without another create. Unreadable, drifting, malformed, or duplicate
+stops without another create. A later invocation that starts with the immutable
+full tag already present also does not create: stable Release absence is
+`inconclusive` / `release-create-attempt-unknown`. Neither the same
+`source_sha`/admission inputs nor a new Environment approval resets this
+cross-run fence. Consequently, a crash after tag push but before create, or a
+create request that fails before GitHub visibly applies it, requires explicitly
+reviewed manual intervention; an ordinary dispatch cannot retry the create.
+Response loss remains automatically recoverable when the complete inventory
+finds one unique eligible draft. Unreadable, drifting, malformed, or duplicate
 observations retain the closed classifications above. The pre-create and
 post-create tag A/B boundaries must also match exactly. Keeping both inventory
 boundaries raw-first prevents an ambiguous create result, incomplete
@@ -721,7 +738,11 @@ Downloading an asset during reconcile can change a download counter without
 changing any protected publication property; treating that counter as state
 mutation would make the verifier invalidate its own otherwise stable snapshot.
 
-An exact completed step is verified and reused; an absent next step may resume.
+A completed exact step is verified and reused; an absent next step may resume
+only when that mutation's contract authorizes it. Draft Release creation is the
+exception: once the immutable full tag exists across invocations, stable
+Release absence returns `release-create-attempt-unknown` and requires an
+explicitly reviewed manual recovery rather than another ordinary dispatch.
 A conflicting tag, commit, signature, Release asset, unexpected target advance,
 or unknown state fails closed with a specific recovery summary. The publisher
 never deletes or rewrites an immutable full tag or Release, force-pushes

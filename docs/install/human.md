@@ -77,6 +77,8 @@ progress artifact at the same time as or later than candidate terminal clean
 evidence vetoes success because review activity is still current. Reaction
 changes do not themselves start a consumer job, so let a later qualifying bot
 comment run the gate or dispatch a manual exact-head `reconcile`.
+For predecessor-to-successor generation closure, liveness at the same timestamp
+as the successor request is also ambiguous and keeps the predecessor open.
 
 Choose one GitHub user as `CONTROL_PLANE_OWNER`. That account must have
 `write`, `maintain`, or `admin` permission on the consumer repository. The

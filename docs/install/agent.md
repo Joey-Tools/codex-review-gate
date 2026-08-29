@@ -484,6 +484,11 @@ legacy before v2 is Active and read back.
    that liveness change arrives without a later qualifying bot comment event,
    dispatch a manual exact-head `reconcile` to observe it.
 
+   For predecessor-to-successor generation closure, liveness whose timestamp
+   equals the successor request is also ambiguous and keeps the predecessor
+   open. Do not try to repair that gap with later evidence; create a legitimate
+   new head and one canonical review generation.
+
    Before choosing this low-cost path, identify the native
    `codex/github-review-gate` verifier run/job/CheckRun that GitHub records
    against the exact current PR feature-head SHA, and require that run to be

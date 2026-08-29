@@ -636,6 +636,12 @@ jobs:
           `admission_run_id` and `admission_run_attempt`; both candidates are
           rebuilt and a new Environment approval is required. Complete any
           older partial release before attempting a newer version.
+
+          `release-create-attempt-unknown` is the exception to ordinary
+          dispatch recovery: the immutable tag already consumed the cross-run
+          draft-create permission while no unique Release is visible. Do not
+          rerun or add a force-create input. Obtain explicitly reviewed manual
+          recovery evidence or wait for the unique draft to become visible.
           SUMMARY
 
   verify:

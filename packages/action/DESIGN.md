@@ -292,9 +292,19 @@ is a generation boundary, including same-run duplicate hidden markers. Before
 a later generation can pass, each predecessor must have provider terminal
 evidence, or its own qualifying request-bound `+1`, strictly between that
 predecessor and its successor. Official `eyes` or provider progress at or after
-the `+1` but before the successor keeps the predecessor open. A clean bound to
-the latest request cannot bypass an earlier unclosed gap, and evidence arriving
-after the successor cannot retroactively repair that gap.
+the `+1` and no later than the successor keeps the predecessor open. Equality
+with the successor is ambiguous at GitHub's timestamp precision and therefore
+cannot prove that review activity ended before the new generation. A clean
+bound to the latest request cannot bypass an earlier unclosed gap, and evidence
+arriving after the successor cannot retroactively repair that gap.
+
+Progress with one unambiguous commit binding is scoped directly to that head.
+Unbound progress may be excluded as historical only when its most recent
+strictly earlier physical request boundary is uniquely canonical and bound to a
+different head. An ordinary or conflicting boundary, no earlier boundary, or a
+boundary at the same timestamp remains fail-closed in the current-head
+inventory. This prevents old-head progress from contaminating a new generation
+without guessing ambiguous activity away.
 
 After any observed base epoch, terminal payloads cannot prove which
 request/base snapshot produced them. In that degraded lineage mode, only a

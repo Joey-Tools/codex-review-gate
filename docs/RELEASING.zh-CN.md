@@ -366,13 +366,18 @@ protected write 前 fail closed。
 4. 由 Publisher App 枚举完整分页 GitHub Release inventory；该 push-authorized
    身份可以看见 drafts。要求 outer page array 非空（空 repository 的合法结果是
    `[[]]`）、所有 ID 都是全局唯一的 safe positive integer，并且 exact tag 只能有
-   0 或 1 个匹配。已有 draft 按 inventory 中的 ID 恢复；fresh Release 先用两份稳定
-   complete inventory 证明 exact-tag absence。Publisher 在该 invocation 中只发送一次
-   create request；它捕获 status 但不把 status 当作 authoritative，并且无论 status
-   如何都再取得两份稳定 complete inventory。若其中唯一发现一个 Release，就冻结其
-   ID 并继续，即使 GitHub 已应用 request 后 create response 丢失也可自动恢复。稳定
-   absence 归为 `inconclusive` / `release-creation-unknown`，该 invocation 绝不再次
-   create。随后向该对象上传 release assets、canonical
+   0 或 1 个匹配。已有 draft 按 inventory 中的 ID 恢复。只有 immutable full tag 在
+   invocation 开始时不存在、并且同一 invocation 以 non-force push 创建该 tag 后精确读回
+   tag object 与 peeled commit，fresh invocation 才获得 draft-create 权限；create 前仍须
+   用两份稳定 complete inventory 证明 exact-tag Release absence。Publisher 在该
+   invocation 中只发送一次 create request；它捕获 status 但不把 status 当作
+   authoritative，并且无论 status 如何都再取得两份稳定 complete inventory。若其中唯一
+   发现一个 Release，就冻结其 ID 并继续，即使 GitHub 已应用 request 后 create response
+   丢失也可自动恢复。Request 后稳定 absence 归为 `inconclusive` /
+   `release-creation-unknown`，该 invocation 绝不再次 create。若 invocation 开始时 full
+   tag 已存在，而稳定 complete inventory 中没有 exact-tag Release，则 publisher 返回
+   `inconclusive` / `release-create-attempt-unknown`，且不发送任何 create request。随后向
+   已选择的对象上传 release assets、canonical
    provenance、checksums 与 detached provenance signature，但只能使用 numeric-ID
    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets` endpoint，绝不
    使用会重新按 tag 解析对象的 upload command。每个 response 必须返回 positive safe
@@ -409,10 +414,12 @@ protected write 前 fail closed。
 neutral canonical observations，先比较它们，要求每个 response 的 `.id` 都与 path
 中的 frozen ID 完全一致，然后才做 structural 与 expected-policy validation。ID
 endpoint 的 `404` 或其他 unreadable 结果绝不在该 invocation 内授权重新绑定或重建。
-后续 exact-source retry 没有可持久化的 Release-ID ledger：它重新执行 full reconcile，
-从当时的 complete inventory 选出唯一 exact-tag object，并为新的 invocation 冻结该 ID。
-Trusted-owner boundary 禁止跨 attempt 删除或替换对象；publisher 不声称跨 run 的历史 ID
-连续性。它只产生以下 closed classification：
+后续 exact-source retry 没有可持久化的 Release-ID ledger：它重新执行 full reconcile；
+若 complete inventory 选出唯一 exact-tag object，就为新的 invocation 冻结该 ID。若
+invocation 开始时 immutable full tag 已存在，稳定 absence 不授权重建 Release；这个已有
+tag 是持久化的跨 run create-attempt fence，retry 会以
+`release-create-attempt-unknown` 停止。Trusted-owner boundary 禁止跨 attempt 删除或替换
+对象；publisher 不声称跨 run 的历史 ID 连续性。它只产生以下 closed classification：
 
 - API、`ls-remote` 或 canonical raw projection 不可读：
   `inconclusive` / `remote-read-inconclusive`；
@@ -436,7 +443,13 @@ pages、unsafe ID、重复 numeric ID（包括 pagination overlap）或任一 un
 inventory/tag observations。若 exact tag 唯一匹配，就冻结 positive numeric ID，并在同一
 invocation 内安全恢复丢失的 response。若稳定 absence，则归为 `inconclusive` /
 `release-creation-unknown`：eventual visibility 不能证明第二次 create 安全，因此该
-invocation 会停止且不再次 create。不可读、drift、malformed 或 duplicate observation
+invocation 会停止且不再次 create。后续 invocation 若在启动时已经存在 immutable full
+tag，也不会发出 create：稳定的 Release absence 归为 `inconclusive` /
+`release-create-attempt-unknown`。相同的 `source_sha`/admission inputs 或新的 Environment
+approval 都不会重置这个跨 run fence。因此，tag push 之后、create 之前发生 crash，或者
+create request 在 GitHub 可见地 apply 之前失败，都需要明确 review 的人工介入；普通
+dispatch 不得重试 create。若 response 丢失，但 complete inventory 发现唯一合格 draft，
+则仍可自动采用并恢复。不可读、drift、malformed 或 duplicate observation
 仍使用上述 closed classifications。Pre-create 与 post-create tag A/B boundaries 也必须
 exact 相等。两个 inventory boundary 都保持 raw-first，避免 ambiguous create result、
 incomplete 或 torn enumeration 授权重复 create 或 object selection。
@@ -609,7 +622,10 @@ placement 或 response order 不会被视为 mutation，同时仍保留全部 pr
 A/B 比较再解释 policy。Reconcile 下载 asset 本身就可能改变 download counter，但不会改变任何受保护
 的发布属性；若把该计数视为状态 mutation，verifier 会让自己的稳定 snapshot 失效。
 
-Exact 已完成步骤经过验证后沿用；缺失的下一步可以恢复。Conflicting tag、commit、
+Exact 已完成步骤经过验证后沿用；缺失的下一步只有在该 mutation contract 允许时才能
+恢复。Draft Release creation 是例外：一旦 immutable full tag 跨 invocation 已存在，稳定
+Release absence 就返回 `release-create-attempt-unknown`，并要求经过明确 review 的人工
+恢复，而不是再次运行普通 dispatch。Conflicting tag、commit、
 signature、Release asset、意外 target advance 或 unknown state 都应 fail closed，
 并在 summary 给出具体 recovery。Publisher 不删除或改写 immutable full tag/Release，
 不 force-push `master`，也不把 major alias 向后移动。Immutable conflict 的

@@ -3087,11 +3087,16 @@ function reduceV2Evidence({
 
   currentArtifacts.sort(compareTerminalArtifactsNewestFirst);
   currentHeadTerminalArtifacts.sort(compareTerminalArtifactsNewestFirst);
+  const scopedProgressArtifacts = scopeV2ProgressArtifactsToCurrentHead({
+    headSha,
+    progressArtifacts,
+    requestBoundaries,
+  });
   const generationLineage = buildV2GenerationLineage({
     currentRequests: boundaryScope.currentRequests,
     currentArtifacts: currentHeadTerminalArtifacts,
     requestReactions,
-    progressArtifacts,
+    progressArtifacts: scopedProgressArtifacts,
   });
   const sameTimeConflicts = findCrossChannelTimestampConflicts(currentArtifacts);
   for (const conflict of sameTimeConflicts) {
@@ -3137,7 +3142,7 @@ function reduceV2Evidence({
             selectedClean,
             requestEpoch.selected,
             requestReactions,
-            progressArtifacts,
+            scopedProgressArtifacts,
             generationLineage,
           )
         : false;
@@ -3153,7 +3158,7 @@ function reduceV2Evidence({
       currentRequests: generationRequests,
       currentCleans: positiveCleans,
       requestReactions,
-      progressArtifacts,
+      progressArtifacts: scopedProgressArtifacts,
       generationLineage,
     })) {
       blockingErrors.push(error.message);
@@ -3169,7 +3174,7 @@ function reduceV2Evidence({
       currentRequests: generationRequests,
       currentCleans: positiveCleans,
       requestReactions,
-      progressArtifacts,
+      progressArtifacts: scopedProgressArtifacts,
       generationLineage,
     });
     if (supersession) {
@@ -3448,6 +3453,56 @@ function buildV2GenerationLineage({
   };
 }
 
+function scopeV2ProgressArtifactsToCurrentHead({
+  headSha,
+  progressArtifacts,
+  requestBoundaries,
+}) {
+  const boundaries = (requestBoundaries ?? []).filter((request) =>
+    Number.isFinite(request?.revisionMs)
+  );
+  return (progressArtifacts ?? []).filter((artifact) => {
+    if (artifact?.resolutionError) return true;
+
+    const explicitRefs = artifactCommitReferences(artifact);
+    const explicitHead = String(
+      artifact?.resolvedHeadSha || artifact?.headSha || "",
+    ).toLowerCase();
+    if (FULL_SHA.test(explicitHead)) return explicitHead === headSha;
+    if (
+      explicitRefs.length > 0 ||
+      (typeof artifact?.headSha === "string" && artifact.headSha.trim() !== "")
+    ) {
+      return true;
+    }
+
+    const progressMs = Date.parse(artifact?.createdAt);
+    if (!Number.isFinite(progressMs)) return true;
+    let latestBoundaryMs = Number.NEGATIVE_INFINITY;
+    let latestBoundaries = [];
+    for (const boundary of boundaries) {
+      if (boundary.revisionMs >= progressMs) continue;
+      if (boundary.revisionMs > latestBoundaryMs) {
+        latestBoundaryMs = boundary.revisionMs;
+        latestBoundaries = [boundary];
+      } else if (boundary.revisionMs === latestBoundaryMs) {
+        latestBoundaries.push(boundary);
+      }
+    }
+    if (latestBoundaries.length === 0) return true;
+
+    const boundHeads = latestBoundaries.map((boundary) =>
+      boundary?.headBound === true
+        ? String(boundary?.binding?.headSha || "").toLowerCase()
+        : ""
+    );
+    if (boundHeads.some((boundHead) => !FULL_SHA.test(boundHead))) return true;
+    const uniqueHeads = new Set(boundHeads);
+    if (uniqueHeads.size !== 1) return true;
+    return boundHeads[0] === headSha;
+  });
+}
+
 function hasV2DirectReactionClosureBefore({
   request,
   beforeMs,
@@ -3478,13 +3533,13 @@ function hasV2DirectReactionClosureBefore({
     const laterProgressBeforeBoundary = (progressArtifacts ?? []).some((artifact) =>
       isCanonicalUtcTimestamp(artifact?.createdAt) &&
       Date.parse(artifact.createdAt) >= plusOneMs &&
-      Date.parse(artifact.createdAt) < beforeMs
+      Date.parse(artifact.createdAt) <= beforeMs
     );
     return plusOneMs > request.revisionMs &&
       plusOneMs < beforeMs &&
       !officialEyes.some((eyes) =>
         Date.parse(eyes.created_at) >= plusOneMs &&
-        Date.parse(eyes.created_at) < beforeMs
+        Date.parse(eyes.created_at) <= beforeMs
       ) &&
       !laterProgressBeforeBoundary;
   });

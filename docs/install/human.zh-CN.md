@@ -63,6 +63,8 @@ evidence 读取。普通 request 上的 `+1` 不能独立产生 head-bound clean
 Codex `eyes` reaction 或 progress artifact 与候选 terminal clean 同时或更晚，则说明 review
 activity 仍然有效并 veto success。Reaction 变化本身不会启动 consumer job，因此需要等待
 后续合格 bot comment 触发，或手动 dispatch exact-head `reconcile`。
+在 predecessor-to-successor generation closure 中，与 successor request 同一时间戳的
+liveness 也无法排序，必须保持 predecessor open。
 
 先选择一个 GitHub user 作为 `CONTROL_PLANE_OWNER`；该账号必须对 consumer repository
 拥有 `write`、`maintain` 或 `admin` 权限。Helper 默认使用 `@JoeyTeng`，所有非 Joey

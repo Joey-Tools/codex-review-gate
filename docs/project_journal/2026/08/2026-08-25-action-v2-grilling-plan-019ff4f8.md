@@ -2853,6 +2853,76 @@ superseded_by:
     remained active for 25 minutes 25 seconds. No complete-suite result is
     claimed for the new tree; required CI must complete before merge.
 
+### Exact-head follow-up: time-bound lineage and cross-run Release create
+
+- The fresh full-range review of signed head `cc566ce79981bf85f232489161650c5f37ae6165`
+  found two additional fail-open boundaries. A predecessor `+1` ignored
+  official `eyes` or provider progress whose timestamp equalled the successor
+  request, even though GitHub's timestamp precision cannot prove the liveness
+  signal happened first. Progress artifacts were also collected before current-
+  head scoping, so an old-head review's progress could keep an unrelated
+  current-head generation open.
+- Generation closure now treats official `eyes` or provider progress at or
+  after the `+1` and no later than the successor as ambiguous liveness. An
+  unambiguous explicit commit binding scopes progress directly. Unbound
+  progress is excluded as historical only when its most recent strictly earlier
+  physical request boundary is uniquely canonical and bound to another head;
+  missing, ordinary, conflicting, or same-time boundaries remain fail-closed.
+  This protects generation completion while avoiding false current-head
+  contamination from a proved old-head flight.
+- Four controls were added inside the existing overlap-generation test: equal-
+  successor `eyes`, equal-successor progress, old-head progress exclusion, and
+  current-head progress retention. The focused runtime file passed all 86 tests
+  after the change.
+- The same review found that `release-creation-unknown` prevented a second
+  Release POST only within one publisher invocation. A later exact-source run
+  could observe stable absence and issue another non-idempotent create, even
+  though GitHub does not provide a documented Release-create idempotency key or
+  tag-uniqueness guarantee for drafts.
+- The corrected cross-run contract supersedes the earlier checkpoint that
+  allowed the fake's known-before-apply failure to make a second total POST on
+  the next invocation. The target immutable full tag is the durable one-shot
+  create fence. Only the invocation that began with that tag absent, created it
+  non-force, and read back the exact tag object and peeled commit may issue one
+  Release-create POST. If the tag pre-existed while the complete Release
+  inventory is stably absent, the later invocation emits `inconclusive` /
+  `release-create-attempt-unknown` and issues no POST. The producing invocation
+  still uses `release-creation-unknown` when its one POST is followed by stable
+  absence, and it still adopts a uniquely discovered exact draft after response
+  loss.
+  - Explicit reason: once a POST has started, its process exit status cannot be
+    durable evidence that GitHub did not apply it. The signed protected full tag
+    already precedes Release creation and survives runs, so reusing it adds no
+    App permission, workflow input, service, or separate ledger.
+  - Explicit liveness cost: a crash after tag readback but before the POST, or a
+    create attempt that remains stably invisible, blocks ordinary automated
+    retry. A new Environment approval, dispatch, Actions run, or artifact does
+    not re-arm the one-shot permission. A richer automatic recovery would need
+    a separately reviewed target-side deterministic attempt marker and its own
+    protection/provenance contract.
+- The two test-harness gaps from the same review are corrected. The final-fence
+  static extractor accepts horizontal indentation and explicitly proves that
+  `publisher_gh`, `capture_release_boundary`, and
+  `read_remote_full_tag_snapshot` enter its remote-capable helper set. The tag-
+  replacement fake now builds an independent Release ID and asset identities;
+  every tag resolver selects that object while upload readback is pending,
+  while frozen numeric Release/asset endpoints remain on the original object.
+- Validation actually run for this follow-up so far:
+  - the five focused publisher cases passed 5/5: static publisher contract,
+    fresh create, cross-run create fence, create response-loss adoption, and
+    frozen-ID upload under real tag-resolution replacement;
+  - `node --test --test-reporter=dot test/v2-gate-runtime.test.mjs` passed all
+    86 tests, and `npm run test:v2 -- --test-reporter=dot` passed 95/95;
+  - `npm run check`, `bash -n`, ShellCheck, the release-test syntax check,
+    `git diff --check`, and project-journal validation passed; and
+  - the complete serialized suite was attempted with
+    `npm test -- --test-reporter=dot --test-concurrency=1`. It completed the
+    preceding test groups, then stopped producing output inside the known slow
+    release-pipeline file. The parent interrupted it after it exceeded the prior
+    25-minute-25-second bound. It emitted no failure before interruption, but no
+    complete-suite result is claimed; required GitHub CI must complete before
+    merge.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact

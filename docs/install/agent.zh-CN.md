@@ -440,6 +440,10 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    变化没有伴随后续合格 bot comment event，必须手动 dispatch exact-head `reconcile` 才能
    观察到它。
 
+   在 predecessor-to-successor generation closure 中，与 successor request 同一时间戳的
+   liveness 也无法排序，必须保持 predecessor open。不要用更晚证据修补该 gap；应创建一个
+   合法新 head，并只启动一个 canonical review generation。
+
    选择这个低成本路径前，识别 GitHub 记录在 exact current PR feature-head SHA 上的原生
    `codex/github-review-gate` verifier run/job/CheckRun，并要求该 run 绑定 current test-merge。
    Workflow 刻意没有 cron 或可写 review event。若

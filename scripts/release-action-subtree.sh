@@ -2269,6 +2269,10 @@ if [[ -n "$major_alias" && -n "$later_same_major_stable_tag" ]]; then
 fi
 
 full_exists=false
+# Draft creation is authorized only by this invocation's fresh non-force tag
+# creation and exact readback. A tag inherited from an earlier invocation is a
+# durable fail-closed fence against repeating a possibly applied create POST.
+fresh_release_create_authorized=false
 if git -C "$stage_repo" show-ref --verify --quiet "refs/tags/$immutable_tag"; then
   full_exists=true
   release_commit="$(direct_annotated_tag_commit "$immutable_tag" "$release_subject")" || {
@@ -2994,9 +2998,22 @@ if [[ "$full_exists" != true ]]; then
   }
   require_publication_mutation immutable-tag
   target_git_push "refs/tags/$immutable_tag:refs/tags/$immutable_tag"
-  remote_full_object="$(git ls-remote "$target_url" "refs/tags/$immutable_tag" | awk 'NR == 1 {print $1}')"
-  remote_full_commit="$(git ls-remote "$target_url" "refs/tags/$immutable_tag^{}" | awk 'NR == 1 {print $1}')"
-  [[ "$remote_full_object" == "$full_tag_object" && "$remote_full_commit" == "$release_commit" ]]
+  if ! remote_full_object="$(git ls-remote "$target_url" \
+      "refs/tags/$immutable_tag" | awk 'NR == 1 {print $1}')"; then
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "immutable tag object could not be read back after creation"
+  fi
+  if ! remote_full_commit="$(git ls-remote "$target_url" \
+      "refs/tags/$immutable_tag^{}" | awk 'NR == 1 {print $1}')"; then
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "immutable tag peeled commit could not be read back after creation"
+  fi
+  [[ "$remote_full_object" == "$full_tag_object" &&
+      "$remote_full_commit" == "$release_commit" ]] || {
+    fail_reconcile inconclusive remote-state-changed \
+      "immutable tag readback differs from the exact object and peeled commit created by this invocation"
+  }
+  fresh_release_create_authorized=true
 fi
 
 if ! is_test_environment; then
@@ -3392,6 +3409,10 @@ reconcile_github_release() {
     absent_boundary="$(capture_inventory_release_boundary \
       pre-create absent false false)" || {
       fail_release_boundary_capture "$?" "absent GitHub Release draft-create boundary"
+    }
+    [[ "$fresh_release_create_authorized" == true ]] || {
+      fail_reconcile inconclusive release-create-attempt-unknown \
+        "the immutable full tag existed when this invocation began while its complete Release inventory is stably absent; ordinary dispatch and a new Environment approval cannot authorize another draft-create request, so an explicitly reviewed manual recovery is required"
     }
     require_publication_mutation release-completion
     create_args=(release create "$immutable_tag" --repo "$TARGET_REPOSITORY" --verify-tag --draft --title "$immutable_tag" --notes "$expected_release_body")

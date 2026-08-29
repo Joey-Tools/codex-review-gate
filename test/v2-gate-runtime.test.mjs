@@ -1553,6 +1553,145 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     /earlier request 101.*newer request 102/iu,
   );
 
+  const eyesAtSuccessorBoundaryGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reactionsByCommentId: new Map([
+      ["101", [
+        reaction({ id: 520, created_at: "2026-08-25T08:01:00Z" }),
+        reaction({
+          id: 521,
+          content: "eyes",
+          created_at: generationB.created_at,
+        }),
+      ]],
+    ]),
+  });
+  const eyesAtSuccessorBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "prior-plus-one-eyes-at-successor-boundary",
+  });
+  const { result: eyesAtSuccessorBoundary } = await runGate(
+    eyesAtSuccessorBoundaryEnvironment,
+    eyesAtSuccessorBoundaryGitHub,
+  );
+  assert.equal(eyesAtSuccessorBoundary.exitCode, 1);
+  assert.equal(eyesAtSuccessorBoundary.report.gateOutcome, "pending");
+  assert.equal(
+    eyesAtSuccessorBoundary.report.recoveryCode,
+    "request_clean_generation",
+  );
+
+  const progressAtSuccessorBoundaryGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      progressIssueComment({
+        id: 205,
+        created_at: generationB.created_at,
+        updated_at: generationB.updated_at,
+      }),
+      generationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 522, created_at: "2026-08-25T08:01:00Z" })]],
+    ]),
+  });
+  const progressAtSuccessorBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "prior-plus-one-progress-at-successor-boundary",
+  });
+  const { result: progressAtSuccessorBoundary } = await runGate(
+    progressAtSuccessorBoundaryEnvironment,
+    progressAtSuccessorBoundaryGitHub,
+  );
+  assert.equal(progressAtSuccessorBoundary.exitCode, 1);
+  assert.equal(progressAtSuccessorBoundary.report.gateOutcome, "pending");
+  assert.equal(
+    progressAtSuccessorBoundary.report.recoveryCode,
+    "request_clean_generation",
+  );
+
+  const oldHeadBoundary = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(OLD_HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:01:15Z",
+    updated_at: "2026-08-25T08:01:15Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const currentGenerationB = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: generationB.created_at,
+    updated_at: generationB.updated_at,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const oldHeadProgressGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      oldHeadBoundary,
+      progressIssueComment({
+        id: 206,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      }),
+      currentGenerationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 523, created_at: "2026-08-25T08:01:00Z" })]],
+    ]),
+  });
+  const oldHeadProgressEnvironment = runtimeEnvironment(context, {
+    suffix: "old-head-progress-does-not-veto-current-lineage",
+  });
+  const { result: oldHeadProgress } = await runGate(
+    oldHeadProgressEnvironment,
+    oldHeadProgressGitHub,
+  );
+  assert.equal(oldHeadProgress.exitCode, 0);
+  assert.equal(oldHeadProgress.report.gateOutcome, "success");
+  assert.match(oldHeadProgress.report.reason, /issue-comment 203/u);
+
+  const currentHeadMiddleBoundary = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:01:15Z",
+    updated_at: "2026-08-25T08:01:15Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const currentHeadProgressGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      currentHeadMiddleBoundary,
+      progressIssueComment({
+        id: 207,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      }),
+      currentGenerationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 524, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({ id: 525, created_at: "2026-08-25T08:01:20Z" })]],
+    ]),
+  });
+  const currentHeadProgressEnvironment = runtimeEnvironment(context, {
+    suffix: "current-head-progress-vetoes-current-lineage",
+  });
+  const { result: currentHeadProgress } = await runGate(
+    currentHeadProgressEnvironment,
+    currentHeadProgressGitHub,
+  );
+  assert.equal(currentHeadProgress.exitCode, 1);
+  assert.equal(currentHeadProgress.report.gateOutcome, "pending");
+  assert.equal(
+    currentHeadProgress.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(
+    currentHeadProgress.report.reason,
+    /earlier request 102.*newer request 103/iu,
+  );
+
   const predecessorClosedGitHub = createGitHubMock({
     issueComments: [generationA, generationB, delayedCleanFromA],
     reactionsByCommentId: new Map([
