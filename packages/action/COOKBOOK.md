@@ -52,6 +52,13 @@ Prefer the GitHub CLI pull-request comment command with a task-scoped body file
 so shell quoting cannot add visible text. Do not construct the workflow-owned
 hidden marker by hand; the `begin-review` operation owns that form.
 
+Before posting, prove that no `begin-review` run with `request_review=true` is
+active for the exact head and that it has not already emitted a canonical
+marker. Direct and controller request producers are mutually exclusive for one
+head generation. If ownership is uncertain, inspect the controller run,
+canonical marker, sticky diagnostic, and provider evidence instead of sending
+another request.
+
 An ordinary request author's default minimum permission is `write`, `maintain`
 or `admin`, unless protected default-branch configuration deliberately selects
 `any`.
@@ -87,6 +94,13 @@ gh workflow run "$WORKFLOW" \
 
 does not post. It is best effort and adds no dedicated barrier. Post the new
 exact `@codex review` only after the exact controller run completes.
+
+Do not overlap the two producers. An unclosed request followed by another
+request creates a lineage gap because terminal Codex text has no originating
+request ID. V2 intentionally remains pending; later clean text, reaction
+removal, and quiescence do not repair the historical ordering. Recover with a
+legitimate new head, one canonical request generation, and an exact-head
+reconcile.
 
 ### Reconcile one exact head
 

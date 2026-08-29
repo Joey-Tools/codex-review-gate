@@ -287,7 +287,16 @@ Qualifying provider findings block regardless of the request author's
 permission.
 
 Terminal clean text and a qualifying provider `+1` are normally equal clean
-carriers. After any observed base epoch, terminal payloads cannot prove which
+carriers after generation lineage is complete. Every physical request comment
+is a generation boundary, including same-run duplicate hidden markers. Before
+a later generation can pass, each predecessor must have provider terminal
+evidence, or its own qualifying request-bound `+1`, strictly between that
+predecessor and its successor. Official `eyes` or provider progress at or after
+the `+1` but before the successor keeps the predecessor open. A clean bound to
+the latest request cannot bypass an earlier unclosed gap, and evidence arriving
+after the successor cannot retroactively repair that gap.
+
+After any observed base epoch, terminal payloads cannot prove which
 request/base snapshot produced them. In that degraded lineage mode, only a
 qualifying `+1` directly attached to the latest strictly post-epoch,
 base-bound canonical workflow request is a positive or superseding carrier.
@@ -457,8 +466,9 @@ links when useful, but never tokens, headers, raw payload dumps or untrusted
 workflow commands.
 
 At-least-once recovery may create small duplicate requests, verifier attempts
-or diagnostic comments after an unknown write result. Duplicates are folded or
-reported conservatively; they never authorise selection of a convenient clean
+or diagnostic comments after an unknown write result. Duplicate diagnostics
+may be folded, but physical review requests remain separate conservative
+generation boundaries. They never authorise selection of a convenient clean
 or omission of a finding.
 
 ## Exact-head merge closure

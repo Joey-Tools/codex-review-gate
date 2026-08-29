@@ -2795,6 +2795,64 @@ superseded_by:
   journal validator successfully. A fresh exact-range acceptance review still
   remains required after the signed commit.
 
+### PR #36 single-producer recovery
+
+- PR #36 exposed an operational race on exact head
+  `dd5bcd03cbb534732a983b006756fd1298a72e8a`. The live v1 controller emitted
+  canonical hidden-marker request `5460371122` at `2026-08-29T04:38:05Z`.
+  Before that asynchronous request became visible in the first read, the
+  operator also posted direct request `5460371900` at `04:38:18Z`. Codex later
+  produced exact-head terminal clean comment `5460417719` at `04:49:49Z`.
+- The live v1 aggregate gate associated that terminal result with its marker
+  and passed. V2 must not inherit that weaker result: both comments start
+  request generations, there was no terminal or qualifying request-bound
+  `+1` between them, and the terminal text does not identify its originating
+  request. The first-to-second generation gap therefore remains unclosed under
+  the v2 ordering contract. Waiting, removing `eyes`, or observing a second
+  stable snapshot cannot retroactively prove lineage.
+- PR #36 remains unmerged despite green live-v1 checks. Recovery is a useful
+  documentation change that creates a legitimate new head, followed by one
+  controller-owned canonical request, a new frozen-range GPT-5.6 Sol Ultra
+  review, CI, and exact-head merge closure. No manual direct request is sent
+  while that controller flight is active.
+- Durable operator rule: choose exactly one producer for every exact-head
+  generation. Prefer a direct request only before any controller auto-begin
+  flight exists. Once `begin-review` with `request_review=true` is dispatched,
+  starting, or has emitted its marker, inspect controller/sticky/marker/provider
+  state rather than blindly posting another request. An overlap recovers on a
+  legitimate new head and fresh canonical generation, not by late evidence on
+  the ambiguous head.
+- The incident audit also found implementation drift behind that operational
+  rule. Request-bound `+1` returned before checking the earlier-generation gap,
+  so the latest physical request could pass while a predecessor remained
+  outstanding. The same shortcut let an older post-base-epoch canonical
+  request pass after a newer ordinary request boundary. Predecessor `+1`
+  closure also ignored provider progress between the `+1` and successor, and
+  reaction-ID uniqueness was checked only inside the selected request. The
+  adopted and post-unknown adoption branches additionally read the wrapper's
+  nonexistent `.id` instead of `.comment.id`.
+- The reducer now treats every physical request comment as a conservative
+  generation boundary, including same-run hidden-marker siblings. Every clean,
+  including a directly request-bound `+1`, must pass the earlier-gap check; a
+  later boundary blocks an older request's reaction. A predecessor `+1` closes
+  its gap only when no same-or-later official `eyes` or provider progress
+  appears before the successor. Reaction IDs are unique across the complete
+  fetched request inventory, and both adoption paths return the physical
+  comment ID. Provider terminal evidence retains the previously adopted strict
+  predecessor-to-successor time-window contract, and the two-snapshot
+  5-second/60-second stability semantics are unchanged.
+- Validation actually run on this remediation:
+  - `node --test --test-reporter=dot test/v2-gate-runtime.test.mjs` passed all
+    86 tests;
+  - `npm run test:v2` passed all 95 tests;
+  - `npm run check`, both changed-file Node syntax checks, `git diff --check`,
+    and project-journal validation passed before this evidence append;
+  - the prior signed exact head passed the complete 853-test serialized suite.
+    A new complete serialized run was attempted, but the parent deliberately
+    interrupted it after the unchanged `test/v2-release-pipeline.test.mjs`
+    remained active for 25 minutes 25 seconds. No complete-suite result is
+    claimed for the new tree; required CI must complete before merge.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact

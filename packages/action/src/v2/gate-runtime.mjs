@@ -256,7 +256,14 @@ export function buildV2ReactionCleanArtifacts(requests, reactionsByCommentId) {
   const artifacts = [];
   const errors = [];
   let livenessVetoed = false;
-  const seenReactionIds = new Set();
+  const canonicalReactionIdCounts = new Map();
+  for (const inventory of reactionsByCommentId?.values() ?? []) {
+    for (const reaction of inventory) {
+      const id = canonicalPositiveId(reaction?.id);
+      if (id) canonicalReactionIdCounts.set(id, (canonicalReactionIdCounts.get(id) || 0) + 1);
+    }
+  }
+  const reportedDuplicateReactionIds = new Set();
   for (const { comment, binding } of requests ?? []) {
     const commentId = String(comment.id);
     if (
@@ -289,11 +296,15 @@ export function buildV2ReactionCleanArtifacts(requests, reactionsByCommentId) {
         );
         continue;
       }
-      if (seenReactionIds.has(reactionId)) {
-        errors.push(`Codex ${reaction.content} reaction identity ${reactionId} appears more than once`);
+      if (canonicalReactionIdCounts.get(reactionId) !== 1) {
+        if (!reportedDuplicateReactionIds.has(reactionId)) {
+          errors.push(
+            `Codex ${reaction.content} reaction identity ${reactionId} appears more than once`,
+          );
+          reportedDuplicateReactionIds.add(reactionId);
+        }
         continue;
       }
-      seenReactionIds.add(reactionId);
       if (!isCanonicalUtcTimestamp(reaction.created_at)) {
         errors.push(`Codex ${reaction.content} reaction ${reactionId} has no canonical creation time`);
         continue;
@@ -1313,7 +1324,18 @@ async function runV2ControllerAction(client, config, context, {
     }
   }
   if (config.operation === "begin-review") {
-    await ensureV2ControllerReviewRequest(client, config, context, initialPr, { now });
+    const reviewRequest = await ensureV2ControllerReviewRequest(
+      client,
+      config,
+      context,
+      initialPr,
+      { now },
+    );
+    if (config.requestReview && !canonicalPositiveId(reviewRequest.commentId)) {
+      throw new V2RuntimeFailure(
+        "The adopted or created review request has no canonical comment identity",
+      );
+    }
   }
   const refresh = await rerunCurrentV2Verifier(client, config, context, initialPr, {
     sleep,
@@ -2154,7 +2176,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     await assertV2BeginReviewScope(client, config, initialPr, budget);
     return {
       kind: matching.length === 1 ? "adopted" : "duplicates",
-      commentId: matching[0].id,
+      commentId: canonicalPositiveId(matching[0].comment.id),
       duplicateCount: matching.length,
     };
   }
@@ -2260,7 +2282,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         mayHaveCommitted = false;
         return {
           kind: visible.length === 1 ? "adopted-after-unknown" : "duplicates-after-unknown",
-          commentId: visible[0].id,
+          commentId: canonicalPositiveId(visible[0].comment.id),
           duplicateCount: visible.length,
         };
       }
@@ -3069,6 +3091,7 @@ function reduceV2Evidence({
     currentRequests: boundaryScope.currentRequests,
     currentArtifacts: currentHeadTerminalArtifacts,
     requestReactions,
+    progressArtifacts,
   });
   const sameTimeConflicts = findCrossChannelTimestampConflicts(currentArtifacts);
   for (const conflict of sameTimeConflicts) {
@@ -3336,18 +3359,15 @@ function v2CleanLineageError({
     return `Terminal clean ${clean.source}:${clean.id} is not bound to a known review generation`;
   }
   const cleanMs = Date.parse(clean.createdAt);
+  const nextGeneration = generationLineage.generations[generationIndex + 1];
   if (clean.source === "request-reaction") {
-    const latestBoundary = generationLineage.generations.at(-1);
-    if (latestBoundary && cleanMs <= latestBoundary.revisionMs) {
+    if (nextGeneration) {
       return (
-        `Direct clean ${clean.source}:${clean.id} predates later review-request boundary ` +
-        `${latestBoundary.id}`
+        `Direct clean ${clean.source}:${clean.id} cannot be attributed to earlier review request ` +
+        `${generation.id}: newer request ${nextGeneration.id} already existed`
       );
     }
-    return null;
-  }
-  const nextGeneration = generationLineage.generations[generationIndex + 1];
-  if (nextGeneration && cleanMs >= nextGeneration.revisionMs) {
+  } else if (nextGeneration && cleanMs >= nextGeneration.revisionMs) {
     return (
       `Terminal clean ${clean.source}:${clean.id} cannot be attributed to earlier review request ` +
       `${generation.id}: newer request ${nextGeneration.id} already existed`
@@ -3366,7 +3386,12 @@ function v2CleanLineageError({
   return null;
 }
 
-function buildV2GenerationLineage({ currentRequests, currentArtifacts, requestReactions }) {
+function buildV2GenerationLineage({
+  currentRequests,
+  currentArtifacts,
+  requestReactions,
+  progressArtifacts,
+}) {
   const generations = [...(currentRequests ?? [])]
     .filter((request) => Number.isFinite(request?.revisionMs))
     .sort((left, right) =>
@@ -3409,6 +3434,7 @@ function buildV2GenerationLineage({ currentRequests, currentArtifacts, requestRe
         beforeMs: successor.revisionMs,
         requestReactions,
         canonicalReactionIdCounts,
+        progressArtifacts,
       });
     if (!providerClosed && !reactionClosed && firstUnclosedGap === null) {
       firstUnclosedGap = index;
@@ -3427,6 +3453,7 @@ function hasV2DirectReactionClosureBefore({
   beforeMs,
   requestReactions,
   canonicalReactionIdCounts,
+  progressArtifacts,
 }) {
   const reactions = requestReactions?.get(request.id) ?? [];
   const officialEyes = reactions.filter((reaction) =>
@@ -3448,9 +3475,18 @@ function hasV2DirectReactionClosureBefore({
       return false;
     }
     const plusOneMs = Date.parse(reaction.created_at);
+    const laterProgressBeforeBoundary = (progressArtifacts ?? []).some((artifact) =>
+      isCanonicalUtcTimestamp(artifact?.createdAt) &&
+      Date.parse(artifact.createdAt) >= plusOneMs &&
+      Date.parse(artifact.createdAt) < beforeMs
+    );
     return plusOneMs > request.revisionMs &&
       plusOneMs < beforeMs &&
-      !officialEyes.some((eyes) => Date.parse(eyes.created_at) >= plusOneMs);
+      !officialEyes.some((eyes) =>
+        Date.parse(eyes.created_at) >= plusOneMs &&
+        Date.parse(eyes.created_at) < beforeMs
+      ) &&
+      !laterProgressBeforeBoundary;
   });
 }
 

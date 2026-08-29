@@ -194,6 +194,13 @@ test("qualifying +1 is strict, head-bound, and vetoed by same-or-later eyes", ()
   ]]]));
   assert.equal(vetoed.artifacts.length, 0);
   assert.equal(vetoed.livenessVetoed, true);
+
+  const globallyDuplicated = buildV2ReactionCleanArtifacts(requests, new Map([
+    ["101", [reaction({ id: 205, created_at: "2026-08-25T08:01:00Z" })]],
+    ["102", [reaction({ id: 205, created_at: "2026-08-25T08:02:00Z" })]],
+  ]));
+  assert.equal(globallyDuplicated.artifacts.length, 0);
+  assert.match(globallyDuplicated.errors[0], /identity 205 appears more than once/u);
   assert.equal(canonicalV2RequestComments([ordinaryRequest()]).length, 0);
 });
 
@@ -644,6 +651,35 @@ test("after a base epoch only a direct canonical-request +1 can recover clean", 
   const { result: recovered } = await runGate(reactionEnvironment, reactionGitHub);
   assert.equal(recovered.report.gateOutcome, "success");
   assert.match(recovered.report.reason, /request-reaction/u);
+
+  const ordinaryBoundary = ordinaryRequest({
+    id: 102,
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const crossedBoundaryGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation, ordinaryBoundary],
+    reactionsByCommentId: new Map([[String(generation.id), [reaction({
+      id: 502,
+      created_at: "2026-08-25T08:15:00Z",
+    })]]]),
+  });
+  const crossedBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-direct-reaction-after-ordinary-boundary",
+  });
+  const { result: crossedBoundary } = await runGate(
+    crossedBoundaryEnvironment,
+    crossedBoundaryGitHub,
+  );
+  assert.equal(crossedBoundary.report.gateOutcome, "pending");
+  assert.equal(crossedBoundary.report.recoveryCode, "request_clean_generation");
+  assert.match(crossedBoundary.report.reason, /newer request 102 already existed/iu);
+  assert.equal(
+    crossedBoundaryGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
 });
 
 test("base-bound workflow markers do not cross base commit epochs", async (context) => {
@@ -1180,9 +1216,10 @@ test("a denied exact request remains a lineage boundary without granting clean a
     directRecoveryEnvironment,
     directRecoveryGitHub,
   );
-  assert.equal(directRecovery.exitCode, 0);
-  assert.equal(directRecovery.report.gateOutcome, "success");
-  assert.match(directRecovery.report.reason, /request-reaction 504/u);
+  assert.equal(directRecovery.exitCode, 1);
+  assert.equal(directRecovery.report.gateOutcome, "pending");
+  assert.equal(directRecovery.report.recoveryCode, "request_clean_generation");
+  assert.match(directRecovery.report.reason, /earlier request 101.*newer request 102/iu);
 
   const canonicalA = workflowRequest({
     id: 105,
@@ -1203,7 +1240,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
   assert.equal(staleDirect.exitCode, 1);
   assert.equal(staleDirect.report.gateOutcome, "pending");
   assert.equal(staleDirect.report.recoveryCode, "request_clean_generation");
-  assert.match(staleDirect.report.reason, /predates later review-request boundary 102/iu);
+  assert.match(staleDirect.report.reason, /newer request 102 already existed/iu);
 
   const refreshedDirectGitHub = createGitHubMock({
     issueComments: [canonicalA, deniedU, delayedUnboundClean],
@@ -1220,9 +1257,10 @@ test("a denied exact request remains a lineage boundary without granting clean a
     refreshedDirectEnvironment,
     refreshedDirectGitHub,
   );
-  assert.equal(refreshedDirect.exitCode, 0);
-  assert.equal(refreshedDirect.report.gateOutcome, "success");
-  assert.match(refreshedDirect.report.reason, /request-reaction 506/u);
+  assert.equal(refreshedDirect.exitCode, 1);
+  assert.equal(refreshedDirect.report.gateOutcome, "pending");
+  assert.equal(refreshedDirect.report.recoveryCode, "request_clean_generation");
+  assert.match(refreshedDirect.report.reason, /newer request 102 already existed/iu);
 });
 
 test("authority filtering caches permissions and avoids exact-refetch DoS", async (context) => {
@@ -1446,9 +1484,10 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     directlyBoundEnvironment,
     directlyBoundGitHub,
   );
-  assert.equal(directlyBound.exitCode, 0);
-  assert.equal(directlyBound.report.gateOutcome, "success");
-  assert.match(directlyBound.report.reason, /request-reaction 503/u);
+  assert.equal(directlyBound.exitCode, 1);
+  assert.equal(directlyBound.report.gateOutcome, "pending");
+  assert.equal(directlyBound.report.recoveryCode, "request_clean_generation");
+  assert.match(directlyBound.report.reason, /earlier request 101.*newer request 102/iu);
 
   const earlierDirectBindingGitHub = createGitHubMock({
     issueComments: [generationA, generationB, delayedCleanFromA],
@@ -1475,9 +1514,44 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     earlierDirectBindingEnvironment,
     earlierDirectBindingGitHub,
   );
-  assert.equal(earlierDirectBinding.exitCode, 0);
-  assert.equal(earlierDirectBinding.report.gateOutcome, "success");
-  assert.match(earlierDirectBinding.report.reason, /request-reaction 509/u);
+  assert.equal(earlierDirectBinding.exitCode, 1);
+  assert.equal(earlierDirectBinding.report.gateOutcome, "pending");
+  assert.equal(earlierDirectBinding.report.recoveryCode, "request_clean_generation");
+  assert.match(earlierDirectBinding.report.reason, /earlier request 101.*newer request 102/iu);
+
+  const progressAfterPredecessorCleanGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      progressIssueComment({
+        id: 204,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      }),
+      generationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 510, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({ id: 511, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const progressAfterPredecessorCleanEnvironment = runtimeEnvironment(context, {
+    suffix: "prior-generation-direct-plus-one-followed-by-progress",
+  });
+  const { result: progressAfterPredecessorClean } = await runGate(
+    progressAfterPredecessorCleanEnvironment,
+    progressAfterPredecessorCleanGitHub,
+  );
+  assert.equal(progressAfterPredecessorClean.exitCode, 1);
+  assert.equal(progressAfterPredecessorClean.report.gateOutcome, "pending");
+  assert.equal(
+    progressAfterPredecessorClean.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(
+    progressAfterPredecessorClean.report.reason,
+    /earlier request 101.*newer request 102/iu,
+  );
 
   const predecessorClosedGitHub = createGitHubMock({
     issueComments: [generationA, generationB, delayedCleanFromA],
@@ -1552,6 +1626,64 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
   assert.equal(equalBoundary.exitCode, 1);
   assert.equal(equalBoundary.report.gateOutcome, "pending");
   assert.equal(equalBoundary.report.recoveryCode, "request_clean_generation");
+});
+
+test("same-run request siblings preserve every physical generation gap", async (context) => {
+  const siblingA = workflowRequest({ id: 101 });
+  const siblingB = workflowRequest({
+    id: 102,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    issueComments: [siblingA, siblingB],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 512,
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "same-run-physical-gap" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.match(result.report.reason, /earlier request 101.*newer request 102/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a globally duplicated reaction identity cannot authorize the latest generation", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    issueComments: [
+      generationA,
+      cleanIssueComment(HEAD, {
+        id: 202,
+        created_at: "2026-08-25T08:01:00Z",
+        updated_at: "2026-08-25T08:01:00Z",
+      }),
+      generationB,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 513, created_at: "2026-08-25T08:01:30Z" })]],
+      ["102", [reaction({ id: 513, created_at: "2026-08-25T08:03:00Z" })]],
+    ]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "global-reaction-id-duplicate" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.counts.indeterminate, 1);
+  assert.match(result.report.reason, /reaction identity 513 appears more than once/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("short Reviewed commit is accepted only through GitHub unambiguous resolution", async (context) => {

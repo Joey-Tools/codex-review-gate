@@ -236,7 +236,14 @@ epoch boundary, and an unlineaged terminal clean stays pending rather than
 being guessed into the new generation.
 
 Terminal clean text and a qualifying provider `+1` otherwise have equal clean
-authority; the base-epoch lineage rule above is the deliberate exception.
+authority once request lineage is complete; the base-epoch rule above is the
+deliberate carrier exception. Every physical request comment is a generation
+boundary, including duplicate hidden markers from one workflow run. A clean
+for a newer request cannot cross an earlier unclosed boundary. The predecessor
+must have received provider terminal evidence, or its own qualifying
+request-bound `+1`, strictly before the successor request. A same-or-later
+official `eyes` or provider progress signal before that successor keeps the
+predecessor open. A later clean cannot repair an already ambiguous gap.
 Ordinary request reactions are provider liveness signals only; ordinary `+1`
 cannot head-bind clean by itself. Same-time/later official `eyes`/progress from
 Codex vetoes a candidate clean because review activity has not been proved

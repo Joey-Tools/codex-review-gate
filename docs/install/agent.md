@@ -44,6 +44,12 @@ Maintain these invariants:
   prove that it used `DEFAULT_BRANCH`;
 - prefer direct `@codex review`; use `begin-review` only when request creation
   and a newer verifier attempt need controller coordination;
+- select exactly one request producer for each exact-head review generation.
+  A direct request is preferred only while no controller `begin-review` with
+  `request_review=true` is active for that head. Once such a run has been
+  dispatched, is starting, or has emitted its hidden marker, do not also post
+  a direct `@codex review`. If ownership is uncertain, read the controller run,
+  canonical marker, sticky diagnostic, and provider evidence before mutating;
 - select only `default` and `expanded` through protected repository variable
   `CODEX_REVIEW_GATE_LIMITS_PROFILE`, never dispatch or numeric overrides.
 - treat `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION` as protected wrapper
@@ -461,6 +467,11 @@ legacy before v2 is Active and read back.
    test -n "$REQUEST_COMMENT_ID"
    ```
 
+   Before posting, prove that no controller `begin-review` with
+   `request_review=true` is already active for `CANARY_HEAD` and that no
+   matching canonical hidden marker exists. Do not race a controller-owned
+   request with this low-cost path.
+
    Do not add prose to the request. A qualifying Codex bot `issue_comment`
    `created` or `edited` event will wake the installed workflow. A review or
    reaction alone does not have an automatic consumer job; use manual
@@ -513,6 +524,15 @@ legacy before v2 is Active and read back.
    `request_review=true` is the default, but pass it explicitly in an agent
    run. `request_review=false` is an advanced best-effort path; if used, wait
    for that controller run to complete before posting a new direct request.
+
+   Never overlap the direct and controller producers for the same head. Each
+   request starts a review generation, while terminal Codex text has no
+   originating request ID. If a newer request appears before the previous
+   generation is terminally closed, v2 intentionally preserves an unclosed
+   lineage gap and keeps the verifier pending; a later clean result, reaction
+   removal, or quiescence cannot repair that historical ordering. Recover by
+   making a legitimate new head and allowing exactly one canonical generation
+   to run, then reconcile that exact head.
 
 5. After every manual dispatch, wait for GitHub to index the run and list only
    runs created after `DISPATCHED_AT`:

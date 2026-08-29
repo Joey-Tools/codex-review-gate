@@ -39,6 +39,11 @@ GitHub.com/default-branch PR scope 时停止。
   `DEFAULT_BRANCH`；
 - 优先直接发 `@codex review`；只有 request creation 与更新 verifier attempt 需要
   controller 协调时才用 `begin-review`；
+- 每个 exact-head review generation 只选择一个 request producer。只有该 head 上没有
+  `request_review=true` 的 active controller `begin-review` 时，才优先 direct request。
+  一旦该 run 已 dispatch、正在启动或已经发出 hidden marker，就不得再手动发送 direct
+  `@codex review`。不确定 producer ownership 时，先读取 controller run、canonical marker、
+  sticky diagnostic 与 provider evidence，再决定是否 mutation；
 - limit profile 只允许通过 protected repository variable
   `CODEX_REVIEW_GATE_LIMITS_PROFILE` 选择 `default` 与 `expanded`，不得增加 dispatch
   或 numeric override；
@@ -421,6 +426,10 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    test -n "$REQUEST_COMMENT_ID"
    ```
 
+   发送前必须证明 `CANARY_HEAD` 上没有已经 active 的 `request_review=true` controller
+   `begin-review`，也不存在 matching canonical hidden marker。不得让这个低成本路径与
+   controller-owned request 发生 race。
+
    不要增加 prose。Caller-authored event 会被 pre-runner bot filter 跳过，Codex bot 之后的
    合格 `issue_comment` `created` 或 `edited` event 才启动 controller workflow。Review 或
    reaction 本身没有自动 consumer job，需要时手动 reconcile。
@@ -465,6 +474,13 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    `request_review=true` 是默认值，但 agent 执行时仍显式传入。
    `request_review=false` 是高级 best-effort path。若使用，先等该 controller run 完成，
    再发 fresh direct request。
+
+   同一 head 上绝不重叠 direct 与 controller producers。每条 request 都会开始一个 review
+   generation，而 Codex terminal text 不携带 originating request ID。前一 generation 尚未
+   terminal-closed 时出现新 request，v2 会刻意保留 unclosed lineage gap 并让 verifier
+   保持 pending；之后到达的 clean、reaction removal 或 quiescence 都不能修复已经发生的
+   ordering。恢复方式是生成一个有实际意义的新 head，只允许一个 canonical generation
+   运行，再 reconcile 该 exact head。
 
 5. 每次 dispatch 后只列出 `DISPATCHED_AT` 之后的新 run：
 

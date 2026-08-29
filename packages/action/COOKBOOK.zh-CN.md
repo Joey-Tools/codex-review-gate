@@ -51,6 +51,11 @@ GitHub CLI pull-request comment command 应优先使用 task-scoped body file，
 shell quoting 增加 visible text。不要手工构造 workflow-owned hidden marker；该形式
 由 `begin-review` operation 负责。
 
+发送前必须证明 exact head 上没有 active 的 `request_review=true` `begin-review` run，
+也没有已经生成的 canonical marker。一个 head generation 的 direct 与 controller request
+producer 必须互斥。不确定 ownership 时，应读取 controller run、canonical marker、sticky
+diagnostic 与 provider evidence，不得盲目再发一条 request。
+
 普通 request author 的默认最低权限是 `write`、`maintain` 或 `admin`，除非受保护的
 default-branch configuration 明确选择 `any`。
 
@@ -85,6 +90,11 @@ gh workflow run "$WORKFLOW" \
 
 不发送 request。它是 best effort，不增加专用 barrier。只有观察 exact controller
 run 完成后，才发送新的 exact `@codex review`。
+
+不得重叠两种 producer。前一 request 尚未闭合时出现下一条 request，会因为 terminal
+Codex text 没有 originating request ID 而形成 lineage gap。V2 会刻意保持 pending；later
+clean、reaction removal 与 quiescence 都不能修复历史 ordering。恢复时应生成一个有实际
+意义的新 head，只运行一个 canonical request generation，再做 exact-head reconcile。
 
 ### Reconcile 一个 exact head
 
