@@ -373,6 +373,8 @@ protected write 前 fail closed。
    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets` endpoint，绝不
    使用会重新按 tag 解析对象的 upload command。每个 response 必须返回 positive safe
    asset ID、exact name 与 `uploaded` state，之后才可由 by-ID Release boundary admit。
+   已上传 prefix asset 只有在通过其 frozen asset ID raw-read 并完成 bytes 对比后才能
+   复用；exact-source recovery 不会通过 tag-resolving command 下载这些资产。
 5. 完成 governing policy reads，再执行上述最终 exact draft Release、asset 与
    tag boundary。通过对 frozen Release ID 发送携带 exact metadata 的 direct
    `PATCH` 完成发布，然后验证 immutable published Release。
@@ -451,6 +453,25 @@ bytes，并与 intended file 比较。这个 post-upload path 绝不按 tag 重�
 失败或 bytes mismatch 同样归为 `release-asset-upload-unknown`，因为 mutation 已经发生。
 当前 invocation 内的 recovery 不会 rebind；下一次 exact-source retry 从 complete inventory
 重新冻结当时唯一的 exact-tag object，并依赖 trusted-owner no-replacement contract。
+
+GitHub 文档说明，upload `502` 可能留下一个空的 `starter` asset。Retry 只允许 neutral
+inventory 接纳该 state，以比较其 typed identity 与 content fields；它不代表 completed
+asset。自动恢复严格限制为 selected mutable draft 上正好一个 `starter`，且必须由 Publisher
+App 上传、使用 planned `application/octet-stream`、size 为 0、digest 为空、name 属于
+expected inventory，并且正好占据 verified uploaded canonical prefix 的下一个 slot。Asset
+name 与 numeric ID 都必须唯一，其中 asset ID 在完整 inventory 内也必须全局唯一。完成
+final policy fence 后，publisher 立即取得 fresh stable by-ID A/B boundary，要求它与已选择
+boundary 完全相同，随后只对该 frozen asset ID 发出一次 unconditional DELETE。无论 DELETE
+返回 `204`、`404`、network failure 还是 response loss，都再通过 stable frozen-ID boundary
+reconcile；只有 exact starter ID 已消失且其他 protected fields 全部不变，publication 才能
+继续。否则返回 `inconclusive` / `starter-asset-deletion-unknown`，且本 invocation 不会发出
+第二次 DELETE。Uploaded、nonzero、wrong-name、wrong-slot、wrong-uploader、
+wrong-content-type 或未绑定的 asset 永远不会被删除。
+
+Asset DELETE endpoint 没有 state-predicate compare-and-swap，因此最后一次 GET 到 DELETE
+之间仍存在 client 无法消除的小窗口。安全自动恢复依赖 trusted-owner/single-writer 部署边界，
+以及 GitHub 文档所描述的 empty `starter` terminal orphan 形状；该窗口内出现其他 Release
+writer 会违反部署契约。
 
 GitHub 官方 Release REST endpoint 没有为这个 `PATCH` 提供受支持的
 conditional compare-and-swap precondition；publisher 不依赖 undocumented conditional
@@ -573,8 +594,10 @@ partial release 会阻止较新的 release leapfrog。
 Fully paginated Release inventory 的稳定性 fingerprint 使用 closed、
 decision-relevant projection：它绑定 Release/asset object identity、tag 与 lifecycle
 policy、immutable metadata、asset digest/byte metadata，以及 author/uploader identity；
-刻意排除 `assets[].download_count` 与 profile URL 等 observational/decorative API
-字段。Reconcile 下载 asset 本身就可能改变 download counter，但不会改变任何受保护
+刻意排除 `assets[].download_count`、timestamps 与 profile URL 等 observational/decorative API
+字段。Projection 会 canonicalize Release/page 与 asset array ordering，因此单纯的 pagination
+placement 或 response order 不会被视为 mutation，同时仍保留全部 protected values，先做
+A/B 比较再解释 policy。Reconcile 下载 asset 本身就可能改变 download counter，但不会改变任何受保护
 的发布属性；若把该计数视为状态 mutation，verifier 会让自己的稳定 snapshot 失效。
 
 Exact 已完成步骤经过验证后沿用；缺失的下一步可以恢复。Conflicting tag、commit、

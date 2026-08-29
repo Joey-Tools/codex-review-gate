@@ -1483,6 +1483,8 @@ test("release inventory fingerprints only decision-relevant stable metadata", ()
   const initial = canonicalReleaseInventorySnapshot([[release], [secondRelease]]);
   const observationalChange = structuredClone(release);
   observationalChange.assets[0].download_count = 999;
+  observationalChange.assets[0].created_at = "2030-01-02T03:04:05Z";
+  observationalChange.assets[0].updated_at = "2030-01-02T03:04:06Z";
   observationalChange.assets[0].uploader.avatar_url = "https://avatars.invalid/new";
   observationalChange.author.html_url = "https://github.com/JoeyTeng";
   assert.equal(

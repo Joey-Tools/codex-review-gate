@@ -439,7 +439,10 @@ protected write.
    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets`
    endpoint, never through a tag-resolving upload command. Each response must
    identify one positive safe asset ID with the exact name and `uploaded`
-   state before the by-ID Release boundary can admit it.
+   state before the by-ID Release boundary can admit it. Existing uploaded
+   prefix assets are adopted only after a raw byte read through their frozen
+   asset IDs; exact-source recovery never downloads them through a tag-resolving
+   command.
 5. Complete the governing policy reads, then perform the final exact draft
    Release, asset, and tag boundary described above. Publish by directly
    patching the frozen Release ID with the exact metadata, then verify the
@@ -531,6 +534,32 @@ the mutation already occurred. Within the current invocation, recovery never
 rebinds the Release. A later exact-source retry starts from a complete
 inventory and freezes the then-unique exact-tag object under the trusted-owner
 no-replacement contract.
+
+GitHub documents that an upload `502` can leave an empty asset in `starter`
+state. A retry admits that state into the neutral inventory only so its typed
+identity and content fields can be compared; it is not accepted as a completed
+asset. Automatic recovery is limited to exactly one `starter` on the selected
+mutable draft, with the Publisher App uploader, the planned
+`application/octet-stream` type, zero bytes, no digest, an expected name, and
+the single next slot after the verified uploaded canonical prefix. Asset names
+and numeric IDs must be unique, including asset IDs across the complete
+inventory. After the final policy fence, the publisher takes a fresh stable
+by-ID A/B boundary and requires it to equal the selected boundary before it
+issues one unconditional DELETE for that frozen asset ID. It then reconciles
+every DELETE outcome, including `204`, `404`, network failure, and response
+loss, through another stable frozen-ID boundary. Publication continues only
+when the exact starter ID is absent and every other protected field is
+unchanged; otherwise it returns `inconclusive` /
+`starter-asset-deletion-unknown` without a second DELETE in that invocation.
+Uploaded, nonzero, wrong-name, wrong-slot, wrong-uploader, wrong-content-type,
+or otherwise unbound assets are never deleted.
+
+The asset DELETE endpoint has no state-predicate compare-and-swap. The final
+GET-to-DELETE interval therefore retains a small race that the client cannot
+eliminate. Safe automatic recovery depends on the trusted-owner/single-writer
+deployment boundary and GitHub's documented empty `starter` terminal orphan
+shape; another Release writer in that interval violates the deployment
+contract.
 
 GitHub's official Release REST endpoint exposes no supported conditional
 compare-and-swap precondition for this `PATCH`; the publisher does not rely on
@@ -671,7 +700,11 @@ The fully paginated Release-inventory stability fingerprint is a closed,
 decision-relevant projection. It binds Release and asset object identities,
 tag and lifecycle policy, immutable metadata, asset digests and byte metadata,
 and author/uploader identities. It deliberately excludes observational or
-decorative API fields such as `assets[].download_count` and profile URLs.
+decorative API fields such as `assets[].download_count`, timestamps, and
+profile URLs.
+It canonicalizes Release/page and asset array order, so pagination placement
+or response ordering alone is not treated as mutation, while preserving all
+protected values for A/B comparison before policy interpretation.
 Downloading an asset during reconcile can change a download counter without
 changing any protected publication property; treating that counter as state
 mutation would make the verifier invalidate its own otherwise stable snapshot.

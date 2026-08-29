@@ -670,6 +670,14 @@ function fakeGithubEnvironment(state, mutationPhase) {
     asset_readback_calls: 0,
     asset_readback_ids: [],
     asset_readback_release_ids: [],
+    asset_delete_attempts: 0,
+    asset_delete_applied: 0,
+    asset_delete_ids: [],
+    asset_download_count: 0,
+    asset_order_reversed: false,
+    asset_timestamp_variant: false,
+    observational_mutation_done: false,
+    starter_predelete_fence_armed: false,
     replacement_release_assets: [],
     tag_resolution_release_id: null,
     mutation_done: false,
@@ -701,7 +709,7 @@ function fakeGithubEnvironment(state, mutationPhase) {
   });
   write(fakeGh, `#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -760,24 +768,32 @@ const failReleaseViewNotFound = () => {
   process.exit(1);
 };
 const digest = (bytes) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
-const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z") => {
-  const bytes = readFileSync(join(assetsDir, name));
+const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z", options = {}) => {
+  const assetPath = join(assetsDir, name);
+  const bytes = existsSync(assetPath) ? readFileSync(assetPath) : Buffer.alloc(0);
+  const assetState = options.state || "uploaded";
   return {
     id,
     node_id: "asset-" + id,
     name,
-    state: "uploaded",
-    content_type: "application/octet-stream",
-    size: bytes.byteLength,
-    digest: digest(bytes),
+    state: assetState,
+    content_type: options.content_type || "application/octet-stream",
+    size: options.size ?? bytes.byteLength,
+    digest: options.digest !== undefined
+      ? options.digest
+      : assetState === "starter" ? null : digest(bytes),
+    download_count: state.asset_download_count,
     created_at: created,
-    updated_at: state.mutation_done && name === "release-provenance.json" ? "2026-08-26T00:00:01Z" : created,
+    updated_at: state.asset_timestamp_variant ||
+      (state.mutation_done && name === "release-provenance.json")
+      ? "2026-08-26T00:00:01Z"
+      : created,
     url: "https://api.invalid/assets/" + id,
     browser_download_url: "https://download.invalid/" + name,
     uploader: {
       id: 4700530,
       node_id: "publisher-app",
-      login: state.asset_uploader_login,
+      login: options.uploader_login || state.asset_uploader_login,
       type: "Bot",
     },
   };
@@ -798,7 +814,8 @@ const releaseApi = (state) => ({
     login: state.author_login,
     type: "Bot",
   },
-  assets: state.assets.map((asset) => assetRecord(state, asset.name, asset.id)),
+  assets: (state.asset_order_reversed ? [...state.assets].reverse() : state.assets)
+    .map((asset) => assetRecord(state, asset.name, asset.id, undefined, asset)),
 });
 const releaseViewProjection =
   "{isDraft:.draft,isPrerelease:.prerelease,tagName:.tag_name,name:.name,body:.body}";
@@ -862,6 +879,10 @@ const classifyRemoteCall = () => {
     }
     if (requestedMethod === "PATCH" && /\\/releases\\/\\d+$/u.test(apiEndpoint || "")) {
       return "release-patch";
+    }
+    if (requestedMethod === "DELETE" &&
+        /\\/releases\\/assets\\/\\d+$/u.test(apiEndpoint || "")) {
+      return "release-asset-delete";
     }
     if (apiEndpoint?.endsWith("/immutable-releases")) return "immutable-policy-read";
     if (apiEndpoint === "users/JoeyTeng-Codex/gpg_keys") return "signer-policy-read";
@@ -935,9 +956,19 @@ if (args[0] === "api") {
       state.tag_resolution_release_id = state.release_id + 1000;
     }
     const name = names[0];
+    if (phase === "asset-upload-502-starter" && state.asset_upload_calls === 0) {
+      writeFileSync(join(assetsDir, name), Buffer.alloc(0));
+      const id = state.next_asset_id++;
+      state.assets.push({ name, id, release_id: targetReleaseId, state: "starter", size: 0 });
+      state.asset_upload_calls += 1;
+      state.asset_upload_target_release_ids.push(targetReleaseId);
+      save(state);
+      process.stderr.write("simulated 502 after GitHub created a starter asset\\n");
+      process.exit(1);
+    }
     copyFileSync(input, join(assetsDir, name));
     const id = state.next_asset_id++;
-    state.assets.push({ name, id });
+    state.assets.push({ name, id, release_id: targetReleaseId });
     state.asset_upload_calls += 1;
     state.asset_upload_target_release_ids.push(targetReleaseId);
     save(state);
@@ -986,6 +1017,11 @@ if (args[0] === "api") {
   if (endpoint?.endsWith("/immutable-releases")) {
     requireCurrentApiVersion();
     state.immutable_policy_reads += 1;
+    if ((phase === "starter-predelete-state-drift" ||
+        phase === "starter-predelete-unrelated-drift") &&
+        state.assets.some(({ state: assetState }) => assetState === "starter")) {
+      state.starter_predelete_fence_armed = true;
+    }
     if (state.immutable_policy_reads === 2) {
       state.final_publication_policy_read_complete = true;
     }
@@ -1238,9 +1274,16 @@ if (args[0] === "api") {
       }
       save(state);
     }
-    const pages = phase === "release-inventory-target-second-page"
-      ? [[], state.exists ? [releaseApi(state)] : []]
-      : [state.exists ? [releaseApi(state)] : []];
+    let pages;
+    if (phase === "release-inventory-target-second-page") {
+      pages = [[], state.exists ? [releaseApi(state)] : []];
+    } else if (phase === "release-inventory-ordering-drift" && state.exists) {
+      pages = state.release_inventory_reads % 2 === 0
+        ? [[], [releaseApi(state)]]
+        : [[releaseApi(state)], []];
+    } else {
+      pages = [state.exists ? [releaseApi(state)] : []];
+    }
     save(state);
     process.stdout.write(JSON.stringify(pages) + "\\n");
     process.exit(0);
@@ -1258,14 +1301,45 @@ if (args[0] === "api") {
   const assetReadMatch = endpoint?.match(/\\/releases\\/assets\\/(\\d+)$/u);
   if (assetReadMatch) {
     requireCurrentApiVersion();
+    const assetId = Number(assetReadMatch[1]);
+    const assetIndex = state.assets.findIndex(({ id }) => id === assetId);
+    const asset = state.assets[assetIndex];
+    if (requestedMethod === "DELETE") {
+      if (!args.includes("Accept: application/vnd.github+json")) {
+        process.stderr.write("starter deletion is missing the JSON API Accept header\\n");
+        process.exit(2);
+      }
+      if (!Number.isSafeInteger(assetId) || assetId <= 0 || !asset) fail404();
+      if (asset.release_id !== state.release_id) fail404();
+      state.asset_delete_attempts += 1;
+      state.asset_delete_ids.push(assetId);
+      save(state);
+      // GitHub's asset DELETE endpoint is unconditional and has no state
+      // predicate. The production publisher, not this fake, must prove the
+      // zero-byte starter precondition before issuing the request.
+      if (phase === "starter-delete-failure-before-apply") {
+        process.stderr.write("simulated starter deletion failure before apply\\n");
+        process.exit(1);
+      }
+      state.assets.splice(assetIndex, 1);
+      const assetPath = join(assetsDir, asset.name);
+      if (existsSync(assetPath)) unlinkSync(assetPath);
+      state.asset_delete_applied += 1;
+      save(state);
+      if (phase === "starter-delete-response-lost-after-apply") {
+        process.stderr.write("simulated starter deletion response loss after apply\\n");
+        process.exit(1);
+      }
+      if (phase === "starter-delete-404-after-apply") fail404();
+      process.exit(0);
+    }
     if (option("--method") !== null ||
         !args.includes("Accept: application/octet-stream")) {
       process.stderr.write("asset readback must use raw GET with deterministic headers\\n");
       process.exit(2);
     }
-    const assetId = Number(assetReadMatch[1]);
-    const asset = state.assets.find(({ id }) => id === assetId);
     if (!Number.isSafeInteger(assetId) || assetId <= 0 || !asset) fail404();
+    if (asset.release_id !== state.release_id) fail404();
     state.asset_readback_calls += 1;
     state.asset_readback_ids.push(assetId);
     state.asset_readback_release_ids.push(state.release_id);
@@ -1289,6 +1363,15 @@ if (args[0] === "api") {
     requireCurrentApiVersion();
     if (!state.exists || Number(releaseIdMatch[1]) !== state.release_id) fail404();
     state.release_id_reads += 1;
+    if (state.starter_predelete_fence_armed && !state.observational_mutation_done) {
+      if (phase === "starter-predelete-state-drift") {
+        const starter = state.assets.find(({ state: assetState }) => assetState === "starter");
+        if (starter) starter.state = "uploaded";
+      } else if (phase === "starter-predelete-unrelated-drift") {
+        state.body += "\\nchanged-before-starter-delete";
+      }
+      state.observational_mutation_done = true;
+    }
     save(state);
     if (phase === "release-id-boundary-404") fail404();
     if (state.final_publication_policy_read_complete && state.draft) {
@@ -1313,6 +1396,22 @@ if (args[0] === "api") {
       }
     }
     process.stdout.write(JSON.stringify(response) + "\\n");
+    if (!state.observational_mutation_done && state.assets.length > 1 &&
+        phase === "release-boundary-download-count-drift") {
+      state.asset_download_count += 1;
+      state.observational_mutation_done = true;
+      save(state);
+    } else if (!state.observational_mutation_done && state.assets.length > 1 &&
+        phase === "release-boundary-asset-order-drift") {
+      state.asset_order_reversed = !state.asset_order_reversed;
+      state.observational_mutation_done = true;
+      save(state);
+    } else if (!state.observational_mutation_done && state.assets.length > 1 &&
+        phase === "release-boundary-timestamp-drift") {
+      state.asset_timestamp_variant = true;
+      state.observational_mutation_done = true;
+      save(state);
+    }
     if (state.draft && state.final_publication_boundary_reads === 1) {
       if (phase === "pre-publication-boundary-snapshot-changed") {
         state.raw_boundary_mutation_done = true;
@@ -1913,10 +2012,10 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   const secondRawRelease = boundaryCapture.indexOf("> \"$second_api\"");
   const secondRawTag = boundaryCapture.indexOf("read_remote_full_tag_snapshot", secondRawRelease);
   const firstCanonicalRelease = boundaryCapture.indexOf(
-    'first_raw="$(jq -cS . "$first_api")"',
+    'first_raw="$(snapshot_neutral_release_api',
   );
   const secondCanonicalRelease = boundaryCapture.indexOf(
-    'second_raw="$(jq -cS . "$second_api")"',
+    'second_raw="$(snapshot_neutral_release_api',
   );
   const rawStability = boundaryCapture.indexOf(
     '[[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]]',
@@ -1933,7 +2032,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
       secondCanonicalRelease < rawStability &&
       rawStability < releasePolicyValidation &&
       releasePolicyValidation < tagPolicyValidation,
-    "both complete raw Release/tag snapshots must be compared before policy validation",
+    "both complete Release/tag snapshots must be neutralized and compared before policy validation",
   );
   const absentBoundaryStart = publisher.indexOf("  capture_inventory_release_boundary() {");
   const absentBoundaryEnd = publisher.indexOf("\n  read_latest_release_tag() {", absentBoundaryStart);
@@ -3921,11 +4020,276 @@ for (const uploadFailure of [
         1,
         "the exact-source retry must adopt the already-applied asset",
       );
+      assert.equal(
+        recoveredState.call_trace.some(
+          ({ type, kind, draft }) =>
+            type === "remote" && kind === "release-download" && draft,
+        ),
+        false,
+        "draft prefix adoption must read bytes by frozen asset id, never by tag",
+      );
       assert.equal(recoveredState.draft, false);
       assert.equal(recoveredState.immutable, true);
     }
   });
 }
+
+for (const phase of [
+  "release-boundary-download-count-drift",
+  "release-boundary-asset-order-drift",
+  "release-boundary-timestamp-drift",
+  "release-inventory-ordering-drift",
+]) {
+  test(`${phase} is neutral to protected Release state`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: phase });
+    const githubEnvironment = fakeGithubEnvironment(state, phase);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
+    if (phase !== "release-inventory-ordering-drift") {
+      assert.equal(fakeState.observational_mutation_done, true);
+    }
+  });
+}
+
+test("a 502 starter is deleted by frozen asset id and exact-source retry is idempotent", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "asset-upload-502-starter" });
+  const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+  const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+
+  assert.notEqual(first.status, 0);
+  assert.match(first.stderr, /recovery_code=release-asset-upload-unknown/u);
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-asset-upload-502-starter",
+    "state.json",
+  );
+  let fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.assets.length, 1);
+  assert.equal(fakeState.assets[0].state, "starter");
+  const frozenReleaseId = fakeState.release_id;
+
+  const recovered = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "starter-asset-recovery" },
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+  fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.release_id, frozenReleaseId);
+  assert.equal(fakeState.release_create_calls, 1);
+  assert.equal(fakeState.asset_delete_attempts, 1);
+  assert.equal(fakeState.asset_delete_applied, 1);
+  assert.deepEqual(fakeState.asset_delete_ids, [1]);
+  assert.equal(fakeState.assets.some(({ state: assetState }) => assetState === "starter"), false);
+  assert.equal(fakeState.assets.every(({ release_id: owner }) => owner === frozenReleaseId), true);
+  assert.equal(fakeState.asset_upload_calls, 4);
+
+  const deleteAttempts = fakeState.asset_delete_attempts;
+  const uploadCalls = fakeState.asset_upload_calls;
+  const complete = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "starter-idempotent-retry" },
+  });
+  assert.equal(complete.status, 0, complete.stderr);
+  assert.match(complete.stdout, /reconcile_state=already_complete/u);
+  fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.asset_delete_attempts, deleteAttempts);
+  assert.equal(fakeState.asset_upload_calls, uploadCalls);
+});
+
+for (const phase of [
+  "starter-delete-response-lost-after-apply",
+  "starter-delete-404-after-apply",
+]) {
+  test(`${phase} reconciles the exact one-asset removal without a second DELETE`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: phase });
+    const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+    const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+    assert.notEqual(first.status, 0);
+
+    const recovered = invokePublish(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+    });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, "fake-gh-state-asset-upload-502-starter", "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.asset_delete_attempts, 1);
+    assert.equal(fakeState.asset_delete_applied, 1);
+    assert.equal(fakeState.assets.some(({ state: assetState }) => assetState === "starter"), false);
+  });
+}
+
+test("starter deletion failure before apply stays retryable and does not upload", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "starter-delete-failure" });
+  const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+  const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+  assert.notEqual(first.status, 0);
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-asset-upload-502-starter",
+    "state.json",
+  );
+  const before = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+
+  const failedDelete = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      FAKE_GH_MUTATION_PHASE: "starter-delete-failure-before-apply",
+    },
+  });
+  assert.notEqual(failedDelete.status, 0);
+  assert.match(failedDelete.stderr, /recovery_code=starter-asset-deletion-unknown/u);
+  const after = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(after.asset_delete_attempts, 1);
+  assert.equal(after.asset_delete_applied, 0);
+  assert.equal(after.asset_upload_calls, before.asset_upload_calls);
+  assert.equal(after.assets.filter(({ state: assetState }) => assetState === "starter").length, 1);
+});
+
+for (const phase of ["starter-predelete-state-drift", "starter-predelete-unrelated-drift"]) {
+  test(`${phase} blocks before the unconditional DELETE`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: phase });
+    const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+    const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+    assert.notEqual(first.status, 0);
+
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /recovery_code=starter-asset-deletion-unknown/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, "fake-gh-state-asset-upload-502-starter", "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.asset_delete_attempts, 0);
+  });
+}
+
+test("duplicate asset ids make the complete Release inventory inconclusive", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "duplicate-starter-asset-id" });
+  const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+  const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+  assert.notEqual(first.status, 0);
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-asset-upload-502-starter",
+    "state.json",
+  );
+  const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  const duplicateName = "release-provenance.json";
+  writeFileSync(join(githubEnvironment.FAKE_GH_STATE, "assets", duplicateName), "duplicate");
+  fakeState.assets.push({
+    name: duplicateName,
+    id: fakeState.assets[0].id,
+    release_id: fakeState.release_id,
+  });
+  writeJson(fakeStatePath, fakeState);
+
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "duplicate-starter-asset-id" },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /recovery_code=remote-read-inconclusive/u);
+  const after = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(after.asset_delete_attempts, 0);
+});
+
+for (const mismatch of [
+  "wrong-name",
+  "wrong-slot",
+  "nonzero",
+  "wrong-digest",
+  "wrong-content-type",
+  "wrong-uploader",
+]) {
+  test(`a stable ${mismatch} starter is blocked and never deleted`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: `starter-${mismatch}` });
+    const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+    const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+    assert.notEqual(first.status, 0);
+    const fakeStatePath = join(
+      state.root,
+      "fake-gh-state-asset-upload-502-starter",
+      "state.json",
+    );
+    const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+    const starter = fakeState.assets[0];
+    if (mismatch === "wrong-name") starter.name = "unexpected.bin";
+    if (mismatch === "wrong-slot") starter.name = "release-provenance.json";
+    if (mismatch === "nonzero") starter.size = 1;
+    if (mismatch === "wrong-digest") starter.digest = `sha256:${"f".repeat(64)}`;
+    if (mismatch === "wrong-content-type") starter.content_type = "text/plain";
+    if (mismatch === "wrong-uploader") starter.uploader_login = "other-writer[bot]";
+    writeJson(fakeStatePath, fakeState);
+
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: `starter-${mismatch}` },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /recovery_code=starter-asset-mismatch/u);
+    const after = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+    assert.equal(after.asset_delete_attempts, 0);
+  });
+}
+
+test("multiple starter assets are blocked before any unconditional DELETE", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "multiple-starter-assets" });
+  const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+  const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+  assert.notEqual(first.status, 0);
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-asset-upload-502-starter",
+    "state.json",
+  );
+  const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  const secondName = "release-provenance.json";
+  writeFileSync(join(githubEnvironment.FAKE_GH_STATE, "assets", secondName), "");
+  fakeState.assets.push({
+    name: secondName,
+    id: fakeState.next_asset_id++,
+    release_id: fakeState.release_id,
+    state: "starter",
+    size: 0,
+  });
+  writeJson(fakeStatePath, fakeState);
+
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "multiple-starter-assets" },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /recovery_code=starter-asset-mismatch/u);
+  const after = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(after.asset_delete_attempts, 0);
+  assert.equal(after.assets.filter(({ state: assetState }) => assetState === "starter").length, 2);
+});
 
 test("enforced live signer policy reaches both publication and alias critical fences", (t) => {
   const state = fixture(t);

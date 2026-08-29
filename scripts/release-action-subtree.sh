@@ -128,6 +128,13 @@ validate_complete_release_inventory() {
   ' "$inventory_file" >/dev/null
 }
 
+snapshot_neutral_release_api() {
+  local input_file="$1"
+  local wrapped_file="$2"
+  jq -c '[[.]]' "$input_file" > "$wrapped_file" || return 1
+  node "$generator" snapshot-release-inventory --input "$wrapped_file" --neutral true
+}
+
 temporary_root=""
 reconcile_started=false
 reconcile_state_emitted=""
@@ -2480,7 +2487,45 @@ else
       echo "error: existing GitHub Release metadata or author conflicts" >&2
       exit 1
     }
-    existing_asset_snapshot="$(node "$generator" snapshot-release-assets --input "$current_release_api")"
+    current_release_neutral_input="$temporary_root/current-release-prewrite-neutral-input.json"
+    if ! initial_release_neutral_snapshot="$(snapshot_neutral_release_api \
+        "$current_release_api" "$current_release_neutral_input")"; then
+      fail_reconcile inconclusive remote-read-inconclusive \
+        "the exact-tag GitHub Release could not be normalized safely"
+    fi
+    starter_asset_count="$(jq -r '[.assets[] | select(.state == "starter")] | length' \
+      "$current_release_api")"
+    if [[ "$starter_asset_count" != "0" ]]; then
+      jq -e '
+        .draft == true and .immutable == false and
+        all(.assets[] | select(.state == "starter");
+          .size == 0 and (.digest == null) and
+          .content_type == "application/octet-stream" and
+          .uploader.login == "codex-review-gate-action-publisher[bot]" and
+          .uploader.type == "Bot")
+      ' "$current_release_api" >/dev/null || {
+        fail_reconcile blocked_conflict starter-asset-mismatch \
+          "only zero-byte starter assets created by the Publisher App on the selected draft are recoverable"
+      }
+      while IFS= read -r starter_asset_name; do
+        grep -Fqx -- "$starter_asset_name" <<< "$expected_release_assets" || {
+          fail_reconcile blocked_conflict starter-asset-mismatch \
+            "starter asset $starter_asset_name is not an expected asset for this exact publication"
+        }
+      done < <(jq -r '.assets[] | select(.state == "starter") | .name' \
+        "$current_release_api")
+    fi
+    uploaded_release_api="$temporary_root/current-release-prewrite-uploaded-only.json"
+    jq '.assets |= map(select(.state == "uploaded"))' \
+      "$current_release_api" > "$uploaded_release_api" || {
+      fail_reconcile inconclusive remote-read-inconclusive \
+        "uploaded assets could not be selected from the exact-tag GitHub Release"
+    }
+    existing_asset_snapshot="$(node "$generator" snapshot-release-assets \
+      --input "$uploaded_release_api")" || {
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "uploaded GitHub Release assets differ from policy"
+    }
     existing_asset_names="$(printf '%s' "$existing_asset_snapshot" | jq -r '.[].name' | LC_ALL=C sort)"
     valid_release_asset_prefix "$existing_asset_names" || {
       emit_reconcile_state blocked_conflict stderr
@@ -2489,7 +2534,25 @@ else
     }
     while IFS= read -r asset_name; do
       [[ -z "$asset_name" ]] && continue
-      publisher_gh release download "$immutable_tag" --repo "$TARGET_REPOSITORY" --pattern "$asset_name" --dir "$existing_assets_dir"
+      existing_asset_id="$(jq -er --arg name "$asset_name" '
+        [.assets[] | select(.name == $name and .state == "uploaded")]
+        | select(length == 1)
+        | .[0].id
+        | select(type == "number" and . > 0 and floor == . and . <= 9007199254740991)
+      ' "$current_release_api")" || {
+        fail_reconcile inconclusive remote-read-inconclusive \
+          "existing asset $asset_name is not uniquely bound to a frozen numeric asset id"
+      }
+      existing_asset_error="$temporary_root/prewrite-existing-asset-${existing_asset_id}.err"
+      if ! publisher_gh api \
+          --header 'Accept: application/octet-stream' \
+          --header 'X-GitHub-Api-Version: 2026-03-10' \
+          "repos/$TARGET_REPOSITORY/releases/assets/$existing_asset_id" \
+          > "$existing_assets_dir/$asset_name" 2> "$existing_asset_error"; then
+        cat "$existing_asset_error" >&2
+        fail_reconcile inconclusive remote-read-inconclusive \
+          "existing asset $asset_name could not be read through its frozen asset id"
+      fi
     done <<< "$existing_asset_names"
     if [[ "$(jq -r .draft "$current_release_api")" == "false" ]]; then
       [[ "$(jq -r .immutable "$current_release_api")" == "true" && "$existing_asset_names" == "$expected_release_assets" ]] || {
@@ -2828,8 +2891,14 @@ if ! is_test_environment; then
     fi
     initial_release_identity="$(jq -Sc '{tag_name,name,body,prerelease,draft,immutable,author_login:.author.login}' "$current_release_api")"
     stable_release_identity="$(jq -Sc '{tag_name,name,body,prerelease,draft,immutable,author_login:.author.login}' "$stable_release_api")"
-    stable_asset_snapshot="$(node "$generator" snapshot-release-assets --input "$stable_release_api")"
-    [[ "$stable_release_identity" == "$initial_release_identity" && "$stable_asset_snapshot" == "$existing_asset_snapshot" ]] || {
+    stable_release_neutral_input="$temporary_root/current-release-final-prewrite-neutral-input.json"
+    stable_release_neutral_snapshot="$(snapshot_neutral_release_api \
+      "$stable_release_api" "$stable_release_neutral_input")" || {
+      fail_reconcile inconclusive remote-read-inconclusive \
+        "the final exact-tag GitHub Release could not be normalized safely"
+    }
+    [[ "$stable_release_identity" == "$initial_release_identity" &&
+        "$stable_release_neutral_snapshot" == "$initial_release_neutral_snapshot" ]] || {
       emit_reconcile_state inconclusive stderr
       emit_recovery_code remote-state-changed "GitHub Release metadata or asset identity changed during reconcile"
       exit 1
@@ -2991,9 +3060,12 @@ reconcile_test_release() {
 
 release_boundary_counter=0
 reconcile_github_release() {
-  local asset_names asset name download_dir expected_asset_names
-  local encoded_name upload_url upload_response upload_error uploaded_asset_id
+  local asset_names asset name expected_asset_names
+  local encoded_name upload_url upload_response upload_error uploaded_asset_id existing_asset_id
   local asset_readback asset_readback_error
+  local starter_assets starter_asset starter_asset_id starter_asset_name
+  local starter_asset_count starter_delete_response starter_delete_error
+  local expected_asset_names_json pre_delete_boundary delete_status allow_starter
   local latest_before latest_after
   local final_release_api final_confirm_api final_release_identity final_confirm_identity
   local final_asset_snapshot final_confirm_snapshot final_download_dir final_provenance_status
@@ -3061,13 +3133,15 @@ reconcile_github_release() {
     local expected_draft="$2"
     local expected_immutable="$3"
     local first_api second_api first_error second_error
-    local first_raw second_raw
+    local first_raw second_raw first_neutral_input second_neutral_input
     local first_tag_raw second_tag_raw boundary_snapshot validated_tag status
     release_boundary_counter=$((release_boundary_counter + 1))
     first_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.json"
     second_api="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.json"
     first_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a.err"
     second_error="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b.err"
+    first_neutral_input="$temporary_root/release-boundary-${release_boundary_counter}-${label}-a-neutral-input.json"
+    second_neutral_input="$temporary_root/release-boundary-${release_boundary_counter}-${label}-b-neutral-input.json"
     [[ "$frozen_release_id" =~ ^[1-9][0-9]*$ ]] || {
       echo "error: GitHub Release boundary has no frozen positive numeric id" >&2
       return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
@@ -3099,13 +3173,15 @@ reconcile_github_release() {
       return "$status"
     fi
 
-    # Compare canonical raw Release responses and tag snapshots before applying
-    # the expected publication policy. This preserves a first-valid/second-drift
-    # observation as remote state change instead of misclassifying the newer
-    # snapshot as a stable policy conflict.
-    if ! first_raw="$(jq -cS . "$first_api")" ||
-        ! second_raw="$(jq -cS . "$second_api")"; then
-      echo "error: GitHub Release boundary response could not be parsed as canonical JSON" >&2
+    # Compare structurally validated, neutral Release projections and tag
+    # snapshots before applying expected publication policy. The projection
+    # binds release/asset identity and content metadata while excluding
+    # observational counters and canonicalizing array order.
+    if ! first_raw="$(snapshot_neutral_release_api \
+        "$first_api" "$first_neutral_input")" ||
+        ! second_raw="$(snapshot_neutral_release_api \
+        "$second_api" "$second_neutral_input")"; then
+      echo "error: GitHub Release boundary response could not be normalized safely" >&2
       return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
     fi
     [[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]] || {
@@ -3123,7 +3199,8 @@ reconcile_github_release() {
         --body "$expected_release_body" \
         --prerelease "$prerelease" \
         --draft "$expected_draft" \
-        --immutable "$expected_immutable")"; then
+        --immutable "$expected_immutable" \
+        --allow-starter "${4:-false}")"; then
       return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
     fi
     if validated_tag="$(validate_remote_full_tag_snapshot "$second_tag_raw")"; then
@@ -3204,9 +3281,11 @@ reconcile_github_release() {
       status=$?
       return "$status"
     fi
-    if ! first_raw="$(jq -cS . "$first_api")" ||
-        ! second_raw="$(jq -cS . "$second_api")"; then
-      echo "error: complete GitHub Release inventory could not be parsed as canonical JSON" >&2
+    if ! first_raw="$(node "$generator" snapshot-release-inventory \
+        --input "$first_api" --neutral true)" ||
+        ! second_raw="$(node "$generator" snapshot-release-inventory \
+        --input "$second_api" --neutral true)"; then
+      echo "error: complete GitHub Release inventory could not be normalized safely" >&2
       return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"
     fi
     [[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]] || {
@@ -3249,7 +3328,8 @@ reconcile_github_release() {
         --body "$expected_release_body" \
         --prerelease "$prerelease" \
         --draft "$expected_draft" \
-        --immutable "$expected_immutable")"; then
+        --immutable "$expected_immutable" \
+        --allow-starter "${5:-false}")"; then
       return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
     fi
     jq -cn \
@@ -3289,7 +3369,14 @@ reconcile_github_release() {
     }
     current_immutable=false
     [[ "$current_draft" == "false" ]] && current_immutable=true
-    current_boundary="$(capture_release_boundary initial "$current_draft" "$current_immutable")" || {
+    allow_starter="$(jq -r 'any(.assets[]; .state == "starter")' \
+      "$current_release_api")"
+    [[ "$allow_starter" == "true" || "$allow_starter" == "false" ]] || {
+      fail_reconcile inconclusive remote-read-inconclusive \
+        "starter asset state could not be derived from the selected GitHub Release"
+    }
+    current_boundary="$(capture_release_boundary \
+      initial "$current_draft" "$current_immutable" "$allow_starter")" || {
       fail_release_boundary_capture "$?" "initial GitHub Release mutation boundary"
     }
   else
@@ -3320,8 +3407,115 @@ reconcile_github_release() {
   [[ "$current_draft" == "true" || "$current_draft" == "false" ]] || return 1
   current_immutable=false
   [[ "$current_draft" == "false" ]] && current_immutable=true
-  asset_names="$(printf '%s' "$current_boundary" | jq -r '.assets[].name')"
   expected_asset_names="$(find "$assets_dir" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
+  expected_asset_names_json="$(printf '%s\n' "$expected_asset_names" | \
+    jq -Rsc 'split("\n") | map(select(length > 0))')"
+  starter_asset_count="$(printf '%s' "$current_boundary" | \
+    jq -r '[.assets[] | select(.state == "starter")] | length')"
+  [[ "$starter_asset_count" == "0" || "$starter_asset_count" == "1" ]] || {
+    fail_reconcile blocked_conflict starter-asset-mismatch \
+      "a recoverable upload interruption can leave only one planned starter asset"
+  }
+  starter_assets="$(printf '%s' "$current_boundary" | \
+    jq -c '.assets[] | select(.state == "starter")')"
+  while IFS= read -r starter_asset; do
+    [[ -n "$starter_asset" ]] || continue
+    [[ "$current_draft" == "true" && "$current_immutable" == "false" ]] || {
+      fail_reconcile blocked_conflict starter-asset-mismatch \
+        "starter assets are recoverable only on the selected mutable draft Release"
+    }
+    starter_asset_id="$(jq -er \
+      '.id | select(type == "number" and . > 0 and floor == . and . <= 9007199254740991)' \
+      <<< "$starter_asset")" || {
+      fail_reconcile inconclusive remote-read-inconclusive \
+        "starter asset identity is not a safe positive numeric id"
+    }
+    starter_asset_name="$(jq -er '.name | select(type == "string" and length > 0)' \
+      <<< "$starter_asset")" || {
+      fail_reconcile blocked_conflict starter-asset-mismatch \
+        "starter asset name is malformed"
+    }
+    grep -Fqx -- "$starter_asset_name" <<< "$expected_asset_names" || {
+      fail_reconcile blocked_conflict starter-asset-mismatch \
+        "starter asset $starter_asset_name is not expected by the exact publication"
+    }
+    jq -e '
+      .state == "starter" and .size == 0 and (.digest == null) and
+      .content_type == "application/octet-stream" and
+      .uploader.login == "codex-review-gate-action-publisher[bot]" and
+      .uploader.type == "Bot"
+    ' <<< "$starter_asset" >/dev/null || {
+      fail_reconcile blocked_conflict starter-asset-mismatch \
+        "starter asset $starter_asset_name is not a zero-byte Publisher App placeholder"
+    }
+    jq -e \
+      --arg starter_name "$starter_asset_name" \
+      --argjson expected "$expected_asset_names_json" '
+      ($expected | index($starter_name)) as $index |
+      $index != null and
+      ([.assets[] | select(.state == "uploaded") | .name] == $expected[0:$index])
+    ' <<< "$current_boundary" >/dev/null || {
+      fail_reconcile blocked_conflict starter-asset-mismatch \
+        "starter asset $starter_asset_name is not the single next asset after the uploaded canonical prefix"
+    }
+    require_publication_mutation release-completion
+    pre_delete_boundary="$(capture_release_boundary \
+      "before-starter-delete-$starter_asset_id" true false true)" || {
+      fail_reconcile inconclusive starter-asset-deletion-unknown \
+        "the frozen Release boundary could not be revalidated immediately before starter deletion"
+    }
+    jq -e -n \
+      --argjson asset_id "$starter_asset_id" \
+      --arg starter_name "$starter_asset_name" \
+      --argjson selected "$current_boundary" \
+      --argjson fenced "$pre_delete_boundary" '
+      $selected == $fenced and
+      ([ $fenced.assets[] | select(
+        .id == $asset_id and .name == $starter_name and
+        .state == "starter" and .size == 0 and .digest == null and
+        .content_type == "application/octet-stream" and
+        .uploader.login == "codex-review-gate-action-publisher[bot]" and
+        .uploader.type == "Bot"
+      ) ] | length) == 1
+    ' >/dev/null || {
+      fail_reconcile inconclusive starter-asset-deletion-unknown \
+        "the selected starter or another protected Release field changed before deletion; no deletion was attempted"
+    }
+    starter_delete_response="$temporary_root/starter-asset-delete-${starter_asset_id}.out"
+    starter_delete_error="$temporary_root/starter-asset-delete-${starter_asset_id}.err"
+    delete_status=0
+    if publisher_gh api \
+        --method DELETE \
+        --header 'Accept: application/vnd.github+json' \
+        --header 'X-GitHub-Api-Version: 2026-03-10' \
+        "repos/$TARGET_REPOSITORY/releases/assets/$starter_asset_id" \
+        > "$starter_delete_response" 2> "$starter_delete_error"; then
+      :
+    else
+      delete_status=$?
+      cat "$starter_delete_error" >&2
+    fi
+    after_boundary="$(capture_release_boundary \
+      "after-starter-delete-$starter_asset_id" true false true)" || {
+      fail_reconcile inconclusive starter-asset-deletion-unknown \
+        "starter deletion outcome $delete_status could not be reconciled by a stable frozen-ID boundary; reconcile the same exact source SHA"
+    }
+    jq -e -n \
+      --argjson asset_id "$starter_asset_id" \
+      --argjson before "$pre_delete_boundary" \
+      --argjson after "$after_boundary" \
+      '$before.release == $after.release and $before.tag == $after.tag and
+       ([ $before.assets[] | select(.id == $asset_id and .state == "starter" and .size == 0) ] | length) == 1 and
+       ([ $after.assets[] | select(.id == $asset_id) ] | length) == 0 and
+       all($before.assets[] | select(.id != $asset_id);
+         . as $old | any($after.assets[]; . == $old)) and
+       ($after.assets | length) == (($before.assets | length) - 1)' >/dev/null || {
+      fail_reconcile inconclusive starter-asset-deletion-unknown \
+        "starter deletion outcome $delete_status did not prove the exact one-asset removal; reconcile the same exact source SHA"
+    }
+    current_boundary="$after_boundary"
+  done <<< "$starter_assets"
+  asset_names="$(printf '%s' "$current_boundary" | jq -r '.assets[].name')"
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     grep -Fqx -- "$name" <<< "$expected_asset_names" || {
@@ -3332,10 +3526,31 @@ reconcile_github_release() {
   for asset in "$assets_dir"/*; do
     name="${asset##*/}"
     if grep -Fqx -- "$name" <<< "$asset_names"; then
-      download_dir="$temporary_root/download-$name"
-      mkdir "$download_dir"
-      publisher_gh release download "$immutable_tag" --repo "$TARGET_REPOSITORY" --pattern "$name" --dir "$download_dir"
-      cmp -- "$asset" "$download_dir/$name" || { echo "error: existing release asset conflicts: $name" >&2; return 1; }
+      existing_asset_id="$(printf '%s' "$current_boundary" | jq -er \
+        --arg name "$name" '
+        [.assets[] | select(.name == $name and .state == "uploaded")]
+        | select(length == 1)
+        | .[0].id
+        | select(type == "number" and . > 0 and floor == . and . <= 9007199254740991)
+      ')" || {
+        fail_reconcile blocked_conflict immutable-release-mismatch \
+          "existing asset $name is not uniquely bound to an uploaded frozen numeric asset id"
+      }
+      asset_readback="$temporary_root/existing-release-asset-${existing_asset_id}-${name}.bin"
+      asset_readback_error="$temporary_root/existing-release-asset-${existing_asset_id}-${name}.err"
+      if ! publisher_gh api \
+          --header 'Accept: application/octet-stream' \
+          --header 'X-GitHub-Api-Version: 2026-03-10' \
+          "repos/$TARGET_REPOSITORY/releases/assets/$existing_asset_id" \
+          > "$asset_readback" 2> "$asset_readback_error"; then
+        cat "$asset_readback_error" >&2
+        fail_reconcile inconclusive remote-read-inconclusive \
+          "existing asset $name could not be read through its frozen asset id"
+      fi
+      cmp -- "$asset" "$asset_readback" || {
+        fail_reconcile blocked_conflict immutable-release-mismatch \
+          "existing release asset conflicts with the exact publication: $name"
+      }
     else
       [[ "$current_draft" == "true" ]] || {
         echo "error: published GitHub Release is missing asset: $name" >&2

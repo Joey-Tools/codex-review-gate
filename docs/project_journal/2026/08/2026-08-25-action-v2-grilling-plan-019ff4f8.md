@@ -2661,6 +2661,102 @@ superseded_by:
   the required fresh full-range exact-head review still runs after the final
   signed landing commit freezes the complete `origin/master..HEAD` range.
 
+### Neutral Release snapshots and empty-starter recovery
+
+- A fresh full-range review found two fail-closed defects after the 833-test
+  checkpoint above. First, exact Release boundaries compared full API JSON, so
+  observational `assets[].download_count` churn or semantically irrelevant
+  Release/page/asset ordering could produce false `remote-state-changed`.
+  Second, GitHub's documented upload-`502` empty `starter` asset could make a
+  later exact-source retry fail inventory normalization before it froze the
+  unique draft Release ID.
+- Release inventory and by-ID A/B reads now use one structurally validated
+  neutral projection. It preserves the protected properties: Release and asset
+  numeric/node identities, tag/name/body/target and lifecycle fields,
+  author/uploader identity, and asset state/content type/size/digest/identity
+  URLs. It rejects duplicate asset names or IDs, including
+  asset-ID duplication across the complete inventory; it canonicalizes
+  Release/page and asset order and excludes observational counters such as
+  `download_count`, timestamps, and additive decoration. Expected-policy
+  validation remains after A/B equality, so
+  stable invalid protected values are not normalized into success and an
+  actual body change still produces `remote-state-changed`.
+- Starter state is structurally projectable but never treated as completed.
+  Automatic cleanup accepts only one empty Publisher-App starter on the
+  selected mutable draft, with the exact planned content type/name and the
+  next canonical slot after a byte-verified uploaded prefix. The final policy
+  fence is followed immediately by a fresh stable frozen-ID A/B boundary that
+  must equal the selected boundary. The publisher then issues at most one
+  DELETE for that frozen asset ID and reconciles every result through another
+  stable frozen-ID boundary. It proceeds only if precisely that asset ID is
+  absent and all other protected state is unchanged; otherwise recovery is
+  `inconclusive` / `starter-asset-deletion-unknown`. Existing uploaded prefix
+  bytes are read through frozen asset IDs rather than tag resolution.
+- The DELETE API has no state-predicate compare-and-swap. The remaining
+  GET-to-DELETE race is explicitly bounded by the trusted-owner/single-writer
+  deployment contract and GitHub's documented terminal empty-starter shape;
+  the implementation does not claim a client-side CAS guarantee.
+- Focused validation actually run for this remediation so far:
+  - `bash -n scripts/release-action-subtree.sh` passed;
+  - `node --check scripts/generate-action-release-provenance.mjs` and
+    `node --check test/v2-release-pipeline.test.mjs` passed;
+  - the existing fresh draft-inventory publication case passed 1/1;
+  - seven starter/identity cases passed 7/7: normal deletion and completed-run
+    idempotence, response-loss-after-apply, `404`-after-apply,
+    failure-before-apply, starter-state pre-delete drift, unrelated protected
+    pre-delete drift, and duplicate asset IDs;
+  - four stable starter mismatches passed 4/4 and proved wrong name, nonzero
+    size, wrong content type, and wrong uploader are blocked without DELETE;
+  - three observational/order cases plus the protected body-drift control
+    passed 4/4; and
+  - a later timestamp-churn regression initially passed the neutral A/B read
+    but failed 3/4 in the group because the policy-validated boundary returned
+    timestamps to the caller and the upload delta comparison still observed
+    them. The boundary now validates those fields but omits them from its
+    decision projection; the corrected timestamp case passed 1/1;
+  - the raw-first classification control passed 3/3 after splitting neutral
+    comparison from policy interpretation: stable schema-invalid remains
+    `blocked_conflict`, valid-to-invalid remains `remote-state-changed`, and a
+    protected body drift remains `remote-state-changed`;
+  - the focused workflow/publisher static contract passed 1/1 after moving its
+    boundary assertion from raw full-JSON sorting to the neutral projector;
+  - after the final edits, ShellCheck, both Node syntax checks,
+    `git diff --check`, `npm run check`, and the project-journal validator all
+    passed. The normal starter recovery and duplicate-ID cases were also rerun
+    2/2 after the neutral comparison was separated from strict policy checks;
+    and
+  - the response-lost exact-source retry passed again after both prewrite and
+    reconcile prefix adoption moved to frozen asset-ID raw GET. Its dynamic
+    assertion proves no tag-resolving draft download occurs; and
+  - parent-lane review removed a false compare-and-swap guarantee from the fake
+    DELETE endpoint: the fake now models GitHub's unconditional asset deletion,
+    so production preconditions alone must prevent a dangerous request. Three
+    added dynamic controls passed 3/3 and proved a planned but non-next-slot
+    starter, a non-null starter digest, and multiple starters all block before
+    DELETE. The strict inventory fingerprint now validates timestamps but omits
+    them from its decision projection; the focused fingerprint unit passed 1/1.
+    `npm run check`, ShellCheck, both publisher Node syntax checks, the added
+    provenance-test syntax check, `git diff --check`, and project-journal
+    validation also passed after these parent-lane corrections.
+- No complete serialized suite is claimed for this post-checkpoint remediation;
+  the parent lane owns that rerun after the shared tree is frozen again.
+
+### Final post-remediation serialized suite
+
+- The parent lane reran the complete suite on the final shared tree with
+  `npm test -- --test-reporter=dot --test-concurrency=1`. It completed with
+  exit status 0 and all 851 tests passed. The count is the prior 833-test
+  checkpoint plus 15 worker-authored neutral/starter regressions and three
+  parent-lane fake-API and mismatch controls.
+- The same final tree also passed `bash -n`, ShellCheck, `npm run check`, Node
+  syntax checks for the publisher generator and both changed test files,
+  `git diff --check`, and project-journal validation. The journal-only final
+  evidence append is revalidated before the next signed landing commit.
+- Because the earlier fresh full-range review produced the two findings fixed
+  above, it is not acceptance evidence for this new tree. A new ordinary
+  general-agent GPT-5.6 Sol Ultra review must inspect the complete frozen
+  `origin/master..HEAD` range after the signed commit.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
