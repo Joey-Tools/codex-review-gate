@@ -2923,6 +2923,70 @@ superseded_by:
     complete-suite result is claimed; required GitHub CI must complete before
     merge.
 
+### Source CI matrix split before the final frozen head
+
+- PR #36's preceding head showed that both ordinary source-CI jobs were on the
+  critical path: `Node.js` ran from `04:37:52Z` to `04:54:31Z`, and `Node.js
+  24` from `04:37:52Z` to `04:54:12Z`. The release-pipeline suite now registers
+  131 top-level tests, and historical standard-Ubuntu runs show that this one
+  file dominates the complete suite. A file-only matrix would therefore leave
+  the same slow file as the critical path.
+- The source `CI` workflow now runs two symmetric Node-version groups. Each
+  version has one `core` cell plus four release cells. The core cell sets the
+  release suite to `off`, runs syntax checks, and runs every non-release test
+  file with `--test-concurrency=1`; serialization preserves the repository and
+  GitHub-state fixture isolation required by the existing final-gate evidence.
+  The four release cells run only `test/v2-release-pipeline.test.mjs` and select
+  top-level test ordinals modulo four. The current closed inventory is split
+  33/33/33/32, so every release behavior test executes exactly once per Node
+  version while each cell retains the file's sequential execution semantics.
+  Unset shard configuration preserves the ordinary local all-tests behavior;
+  `off` and the four explicit fractions are the only CI values, and an empty or
+  malformed value fails at module load.
+- The adapter exposes a read-only registration count and the release test file
+  asserts the exact current count after synchronous registration. The contract
+  test proves the modulo partition, rejects malformed and unsafe fractions,
+  forbids alternate `test.skip`/`test.only`/`test.todo` registration surfaces,
+  and locks the two-version/four-shard workflow inventory. This converts a
+  future test-addition or conditional-registration drift into an explicit
+  reviewable contract update rather than a silent coverage gap.
+- No aggregate matrix-result job is used. A focused review found that GitHub
+  permits a single job and its dependents to be rerun; relying on the folded
+  `needs.<matrix-job>.result` could therefore let a successful partial rerun
+  replace the aggregate view while another matrix leg's earlier failure was
+  not rerun. Every cell instead has a unique check name and retains its own
+  conclusion. This is both fail-closed and cheaper than starting two extra
+  aggregator runners.
+- Live ruleset readback confirmed that the source repository's required check
+  contexts are `Review gate state machine` and `codex/review-gate`, both from
+  GitHub Actions. The old ordinary-CI names `Node.js` and `Node.js 24` were not
+  required, and the separate fast state-machine workflow is unchanged. The
+  dormant `required-ci.yml` reusable workflow is also unchanged because it has
+  no current source PR/push caller; its complete closure remains available to
+  an explicit future caller.
+- Validation actually run for the CI split:
+  - the new shard/workflow contract passed 5/5 under local Node 24, and the
+    focused ordinary-agent lane independently passed it under Node 22 and Node
+    24;
+  - release `off` mode loaded the real file and skipped the exact 131/131
+    closed inventory; the serialized core group completed with exit zero;
+  - `npm run check`, `actionlint`, all three changed-file Node syntax checks,
+    and `git diff --check` passed; and
+  - a same-host attempt to run all four heavy release cells concurrently was
+    deliberately bounded: three cells were interrupted after about 14 minutes
+    of shared-resource contention, and the remaining cell after about 21
+    minutes. No local release-cell success is claimed from that attempt. The
+    new GitHub head must prove all eight Node-version/release-cell combinations
+    on independent runners before merge, and their observed wall times will
+    determine whether a later weighted partition is warranted.
+- A focused ordinary general-agent review using GPT-5.6 Sol Ultra found and
+  closed two fail-open issues during this change: the first aggregate shape
+  folded matrix results across partial reruns, and the first inventory probe
+  depended on recursive `node:test` reporter output. The final design has no
+  aggregate and uses an in-process registration-count invariant. The latest
+  focused re-review reported no remaining High or Medium finding. This is not
+  the required new whole-range exact-head acceptance review.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact

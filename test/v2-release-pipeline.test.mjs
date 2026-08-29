@@ -14,8 +14,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 import { fileURLToPath } from "node:url";
+import { createShardedTest } from "./support/ci-test-shard.mjs";
+
+const test = createShardedTest(
+  nodeTest,
+  process.env.CODEX_REVIEW_GATE_RELEASE_TEST_SHARD,
+  "release pipeline",
+);
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workflowPath = join(repositoryRoot, ".github", "workflows", "sync-action-subtree.yml");
@@ -5553,3 +5560,9 @@ test("prereleases publish only the full immutable tag", (t) => {
   assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
   assert.equal(readFileSync(join(state.releases, "v2.0.0-rc.1", "prerelease"), "utf8"), "true\n");
 });
+
+assert.equal(
+  test.registeredCount,
+  131,
+  "release pipeline shard registration inventory drift",
+);
