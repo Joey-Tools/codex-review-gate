@@ -1262,10 +1262,10 @@ if (args[0] === "api") {
       process.stdout.write(JSON.stringify([[first, second]]) + "\\n");
       process.exit(0);
     }
-    if (state.exists && state.release_create_calls > 0 &&
-        phase.startsWith("post-create-inventory-")) {
+    if (state.exists && state.release_create_calls > 0) {
       state.post_create_inventory_reads += 1;
-      if (state.post_create_inventory_reads === 2) {
+      if (phase.startsWith("post-create-inventory-") &&
+          state.post_create_inventory_reads === 2) {
         if (phase === "post-create-inventory-id-drift") {
           state.release_id += 1;
         } else if (phase === "post-create-inventory-release-disappears") {
@@ -1505,6 +1505,11 @@ if (args[0] === "release" && args[1] === "view") {
 if (args[0] === "release" && args[1] === "create") {
   const state = readState();
   state.release_create_calls += 1;
+  if (phase === "release-create-failure-before-apply") {
+    save(state);
+    process.stderr.write("simulated Release create failure before apply\\n");
+    process.exit(1);
+  }
   state.exists = true;
   state.draft = true;
   state.immutable = false;
@@ -1513,6 +1518,10 @@ if (args[0] === "release" && args[1] === "create") {
   state.name = option("--title");
   state.body = option("--notes");
   save(state);
+  if (phase === "release-create-response-lost-after-apply") {
+    process.stderr.write("simulated Release create response loss after apply\\n");
+    process.exit(1);
+  }
   process.exit(0);
 }
 
@@ -2328,7 +2337,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.match(
     publisher,
-    /capture_inventory_release_boundary[\s\S]*pre-create absent[\s\S]*post-create present[\s\S]*before-upload-[\s\S]*after-upload-[\s\S]*pre-publication-mutation[\s\S]*post-publish[\s\S]*pre-alias-mutation[\s\S]*post-alias/u,
+    /capture_inventory_release_boundary[\s\S]*pre-create absent[\s\S]*post-create any[\s\S]*before-upload-[\s\S]*after-upload-[\s\S]*pre-publication-mutation[\s\S]*post-publish[\s\S]*pre-alias-mutation[\s\S]*post-alias/u,
   );
   assert.match(workflow, /outputs:[\s\S]*reconcile_state: \$\{\{ steps\.reconcile\.outputs\.reconcile_state \}\}[\s\S]*id: reconcile/u);
   assert.match(workflow, /verify:[\s\S]*if: \$\{\{ needs\.publish\.outputs\.reconcile_state != 'superseded' \}\}/u);
@@ -3592,6 +3601,78 @@ test("fresh GitHub publication discovers and freezes its draft through complete 
     false,
     "the published-only by-tag endpoint must not be used to read a draft",
   );
+});
+
+test("Release create failure before apply defers a new attempt to exact-source retry", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "release-create-failure-before-apply" });
+  const githubEnvironment = fakeGithubEnvironment(state, "release-create-failure-before-apply");
+  const failed = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr, /reconcile_state=inconclusive/u);
+  assert.match(failed.stderr, /recovery_code=release-creation-unknown/u);
+  const failedState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-release-create-failure-before-apply", "state.json"),
+    "utf8",
+  ));
+  assert.equal(failedState.release_create_calls, 1, "one invocation must issue at most one create");
+  assert.equal(failedState.exists, false);
+  assert.equal(failedState.publish_patch_calls, 0);
+
+  const retry = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "release-create-before-apply-retry" },
+  });
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.match(retry.stdout, /reconcile_state=resumable_partial/u);
+  const retriedState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-release-create-failure-before-apply", "state.json"),
+    "utf8",
+  ));
+  assert.equal(retriedState.release_create_calls, 2, "only a new invocation may retry create");
+  assert.equal(retriedState.draft, false);
+  assert.equal(retriedState.immutable, true);
+});
+
+test("Release create response loss adopts the unique draft and exact-source retry never recreates it", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, {
+    label: "release-create-response-lost-after-apply",
+  });
+  const githubEnvironment = fakeGithubEnvironment(
+    state,
+    "release-create-response-lost-after-apply",
+  );
+  const recovered = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /reconcile_state=fresh/u);
+  const recoveredStatePath = join(
+    state.root,
+    "fake-gh-state-release-create-response-lost-after-apply",
+    "state.json",
+  );
+  const recoveredState = JSON.parse(readFileSync(recoveredStatePath, "utf8"));
+  assert.equal(recoveredState.release_create_calls, 1, "response loss must not trigger a second create");
+  assert.equal(recoveredState.draft, false);
+  assert.equal(recoveredState.immutable, true);
+  assert.equal(recoveredState.post_create_inventory_reads, 2);
+
+  const retry = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "release-create-completed-retry" },
+  });
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.match(retry.stdout, /reconcile_state=already_complete/u);
+  const retriedState = JSON.parse(readFileSync(recoveredStatePath, "utf8"));
+  assert.equal(retriedState.release_create_calls, 1, "exact-source retry must not recreate the Release");
 });
 
 test("an exact-source retry finds a pre-existing draft on the second inventory page", (t) => {

@@ -2757,6 +2757,44 @@ superseded_by:
   general-agent GPT-5.6 Sol Ultra review must inspect the complete frozen
   `origin/master..HEAD` range after the signed commit.
 
+### Release-create result-loss reconciliation
+
+- A delayed exact-range review found that `gh release create` still ran as an
+  unguarded command under `set -e`. A nonzero result therefore exited before
+  the post-create complete-inventory/full-tag A/B boundary, even when GitHub had
+  already created the draft, and the generic exit trap misclassified the
+  ambiguous mutation as publisher execution failure.
+- The correction treats the command result as non-authoritative and issues at
+  most one create request per publisher invocation. Regardless of status, it
+  takes the full post-create `any` inventory/tag boundary. A unique exact draft
+  freezes its numeric ID and continues automatically; stable absence is
+  `inconclusive` / `release-creation-unknown` and stops without another create.
+  Unreadable, drifting, malformed, and duplicate observations retain their
+  prior fail-closed classifications, and the pre-create and post-create full-tag
+  boundaries must remain equal.
+  - Explicit reason: a lost response after an applied POST is safely recoverable
+    from the unique exact draft, while eventual visibility cannot prove that a
+    second POST in the same invocation is safe.
+- Focused validation actually run for this correction:
+  - the final create-result command matched two dynamic tests and passed 2/2:
+    failure-before-apply stopped after one attempt, then a new exact-source
+    invocation made the second total attempt and completed; response loss after
+    apply adopted the unique draft in the first invocation, and a later
+    exact-source retry kept the total create count at one;
+  - the adjacent fresh, second-page retry, and two post-create inventory-drift
+    cases passed 4/4; and
+  - the workflow/publisher static ABI check passed together with the earlier
+    form of the two create-result cases, 3/3. ShellCheck, `bash -n`, the test
+    file's Node syntax check, and `git diff --check` also passed during the
+    correction.
+- The parent lane then ran the complete serialized suite with
+  `npm test -- --test-reporter=dot --test-concurrency=1`: exit 0, with 675
+  pre-v2 dots plus 45, 80, and 53 final-file dots, for 853/853 tests passed.
+  It also independently reran `npm run check`, ShellCheck, `bash -n`, the
+  changed test file's Node syntax check, `git diff --check`, and the project
+  journal validator successfully. A fresh exact-range acceptance review still
+  remains required after the signed commit.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact

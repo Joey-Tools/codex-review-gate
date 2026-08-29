@@ -367,8 +367,12 @@ protected write 前 fail closed。
    身份可以看见 drafts。要求 outer page array 非空（空 repository 的合法结果是
    `[[]]`）、所有 ID 都是全局唯一的 safe positive integer，并且 exact tag 只能有
    0 或 1 个匹配。已有 draft 按 inventory 中的 ID 恢复；fresh Release 先用两份稳定
-   complete inventory 证明 exact-tag absence，创建后再用两份稳定 complete inventory
-   唯一发现一个 Release 并冻结其 ID。随后向该对象上传 release assets、canonical
+   complete inventory 证明 exact-tag absence。Publisher 在该 invocation 中只发送一次
+   create request；它捕获 status 但不把 status 当作 authoritative，并且无论 status
+   如何都再取得两份稳定 complete inventory。若其中唯一发现一个 Release，就冻结其
+   ID 并继续，即使 GitHub 已应用 request 后 create response 丢失也可自动恢复。稳定
+   absence 归为 `inconclusive` / `release-creation-unknown`，该 invocation 绝不再次
+   create。随后向该对象上传 release assets、canonical
    provenance、checksums 与 detached provenance signature，但只能使用 numeric-ID
    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets` endpoint，绝不
    使用会重新按 tag 解析对象的 upload command。每个 response 必须返回 positive safe
@@ -428,9 +432,14 @@ match 或 A/B drift 都归为 `inconclusive` / `remote-state-changed`。同一 e
 不同 ID claim，归为 `blocked_conflict` / `duplicate-release-tag`。Outer `[]`、malformed
 pages、unsafe ID、重复 numeric ID（包括 pagination overlap）或任一 unreadable page 都
 属于不完整证据，归为 `inconclusive` / `remote-read-inconclusive`。Post-create discovery
-重复同样的两份 complete inventory/tag observations，要求 exact tag 唯一匹配，然后才
-冻结 positive numeric ID。两个 inventory boundary 都保持 raw-first，避免 incomplete
-或 torn enumeration 授权 create 或 object selection。
+无论 create command 的 exit status 如何都执行，并重复同样的两份 complete
+inventory/tag observations。若 exact tag 唯一匹配，就冻结 positive numeric ID，并在同一
+invocation 内安全恢复丢失的 response。若稳定 absence，则归为 `inconclusive` /
+`release-creation-unknown`：eventual visibility 不能证明第二次 create 安全，因此该
+invocation 会停止且不再次 create。不可读、drift、malformed 或 duplicate observation
+仍使用上述 closed classifications。Pre-create 与 post-create tag A/B boundaries 也必须
+exact 相等。两个 inventory boundary 都保持 raw-first，避免 ambiguous create result、
+incomplete 或 torn enumeration 授权重复 create 或 object selection。
 
 GitHub 的接口语义要求做出这个区分。REST
 [release-by-tag endpoint](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10#get-a-release-by-tag-name)

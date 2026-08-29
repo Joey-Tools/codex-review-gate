@@ -432,9 +432,14 @@ protected write.
    nonempty outer page array (`[[]]` is the valid empty-repository result),
    safe positive globally unique numeric IDs, and zero or one exact-tag match.
    A pre-existing draft is resumed by its inventory ID. For a fresh Release,
-   two stable complete inventories prove exact-tag absence before creation;
-   two new stable complete inventories then discover exactly one Release and
-   freeze its ID. Upload release assets, canonical provenance, checksums, and
+   two stable complete inventories prove exact-tag absence before creation.
+   The publisher issues exactly one create request in that invocation, captures
+   its status without treating it as authoritative, and always takes two new
+   stable complete inventories. If they discover exactly one Release, it
+   freezes that ID and continues even when the create response was lost after
+   GitHub applied the request. Stable absence is `inconclusive` /
+   `release-creation-unknown`; the invocation never retries create. Upload
+   release assets, canonical provenance, checksums, and
    the detached provenance signature through the numeric-ID
    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets`
    endpoint, never through a tag-resolving upload command. Each response must
@@ -502,11 +507,18 @@ is `inconclusive` / `remote-state-changed`. A stable exact tag claimed by
 multiple distinct IDs is `blocked_conflict` / `duplicate-release-tag`.
 Outer `[]`, malformed pages, an unsafe ID, a repeated numeric ID (including
 pagination overlap), or any unreadable page is incomplete evidence and becomes
-`inconclusive` / `remote-read-inconclusive`. Post-create discovery repeats the
-same two complete inventory/tag observations, requires one unique exact-tag
-match, and only then freezes the positive numeric ID. Keeping both inventory
-boundaries raw-first prevents incomplete or torn enumeration from authorizing
-creation or object selection.
+`inconclusive` / `remote-read-inconclusive`. Post-create discovery runs
+regardless of the create command's exit status and repeats the same two complete
+inventory/tag observations. One unique exact-tag match freezes the positive
+numeric ID and safely recovers a lost response in the same invocation. Stable
+absence is `inconclusive` / `release-creation-unknown`, because eventual
+visibility is not proof that a second create would be safe; that invocation
+stops without another create. Unreadable, drifting, malformed, or duplicate
+observations retain the closed classifications above. The pre-create and
+post-create tag A/B boundaries must also match exactly. Keeping both inventory
+boundaries raw-first prevents an ambiguous create result, incomplete
+enumeration, or torn enumeration from authorizing duplicate creation or object
+selection.
 
 This distinction is required by GitHub's interfaces. The REST
 [release-by-tag endpoint](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10#get-a-release-by-tag-name)

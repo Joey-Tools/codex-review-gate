@@ -3072,7 +3072,7 @@ reconcile_github_release() {
   local post_publish_release_api publication_payload publication_response publication_error
   local release_id release_make_latest
   local current_boundary before_boundary after_boundary published_boundary
-  local absent_boundary created_boundary
+  local absent_boundary created_boundary create_status
   local -a missing_assets=()
   expected_release_body="Signed release of $SOURCE_REPOSITORY@$source_commit."
 
@@ -3307,10 +3307,14 @@ reconcile_github_release() {
       status=$?
       return "$status"
     fi
-    if [[ "$expected_presence" == "absent" ]]; then
-      [[ "$exact_state" == "absent" ]] || {
-        echo "error: GitHub Release is stably present at its expected-absence boundary" >&2
+    if [[ "$exact_state" == "absent" ]]; then
+      if [[ "$expected_presence" == "present" ]]; then
+        echo "error: GitHub Release is stably absent at its expected-presence boundary" >&2
         return "$RELEASE_BOUNDARY_STATE_CHANGED"
+      fi
+      [[ "$expected_presence" == "absent" || "$expected_presence" == "any" ]] || {
+        echo "error: GitHub Release boundary has an unsupported expected-presence state" >&2
+        return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
       }
       jq -cn \
         --arg object "${validated_tag%%$'\t'*}" \
@@ -3318,9 +3322,14 @@ reconcile_github_release() {
         '{release:"absent",assets:[],tag:{object:$object,commit:$commit}}'
       return 0
     fi
-    [[ "$expected_presence" == "present" && "$exact_state" == "present" ]] || {
-      echo "error: GitHub Release is stably absent at its expected-presence boundary" >&2
+    if [[ "$expected_presence" == "absent" ]]; then
+      echo "error: GitHub Release is stably present at its expected-absence boundary" >&2
       return "$RELEASE_BOUNDARY_STATE_CHANGED"
+    fi
+    [[ ( "$expected_presence" == "present" || "$expected_presence" == "any" ) &&
+      "$exact_state" == "present" ]] || {
+      echo "error: GitHub Release boundary has an unsupported expected-presence state" >&2
+      return "$RELEASE_BOUNDARY_POLICY_MISMATCH"
     }
     if ! boundary_snapshot="$(node "$generator" snapshot-release-boundary \
         --input "$second_exact" \
@@ -3387,11 +3396,20 @@ reconcile_github_release() {
     require_publication_mutation release-completion
     create_args=(release create "$immutable_tag" --repo "$TARGET_REPOSITORY" --verify-tag --draft --title "$immutable_tag" --notes "$expected_release_body")
     [[ "$prerelease" == true ]] && create_args+=(--prerelease)
-    publisher_gh "${create_args[@]}"
+    create_status=0
+    if publisher_gh "${create_args[@]}"; then
+      :
+    else
+      create_status=$?
+    fi
     created_boundary="$(capture_inventory_release_boundary \
-      post-create present true false)" || {
+      post-create any true false)" || {
       fail_release_boundary_capture "$?" "created draft GitHub Release boundary"
     }
+    if [[ "$(printf '%s' "$created_boundary" | jq -r '.release == "absent"')" == "true" ]]; then
+      fail_reconcile inconclusive release-creation-unknown \
+        "draft creation returned status $create_status but the complete post-create boundary is stably absent; retry the same exact source SHA"
+    fi
     frozen_release_id="$(printf '%s' "$created_boundary" | jq -er \
       '.release.id | select(type == "number" and . > 0 and floor == . and . <= 9007199254740991)')" || {
       fail_reconcile blocked_conflict immutable-release-mismatch \
