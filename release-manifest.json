@@ -1,0 +1,162 @@
+{
+  "$schema": "urn:joey-tools:codex-review-gate:release-manifest:2",
+  "schema_version": 2,
+  "version": "2.0.0-rc.1",
+  "contract_versions": {
+    "toolchain": "node20",
+    "release_schema": 2,
+    "status": 2,
+    "template": 2,
+    "baseline": 3
+  },
+  "source": {
+    "repository": "Joey-Tools/codex-review-gate",
+    "path": "packages/action",
+    "tree": "9df9a439bab7e12f5ffdce5cc710948d7294b661"
+  },
+  "target": {
+    "repository": "JoeyTeng/codex-review-gate-action",
+    "ref": "refs/heads/master",
+    "expected_head": "59eeda2af2a7baab3f3f15a59fbbaee015fa6c01",
+    "previous_version": "1.5.1"
+  },
+  "files": [
+    {
+      "path": "COOKBOOK.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 24035,
+      "sha256": "f08a032fe427f115811f8b94f2b476304e682093e9612cebce1382eb2b40bde6"
+    },
+    {
+      "path": "COOKBOOK.zh-CN.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 23285,
+      "sha256": "0bd16b1325b52d93764c9a1c58f33b93cd3b0671997be37ca4f6f76796dd652d"
+    },
+    {
+      "path": "DESIGN.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 31303,
+      "sha256": "3e99a039d22cc68a8033924e8f8bc7315f1b52f00f6e833b84c7577f309c4e2e"
+    },
+    {
+      "path": "DESIGN.zh-CN.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 30744,
+      "sha256": "3b41006b0ff302eff3f70961c4596e85d8b24ea5955d8019759e70e17ef1ead0"
+    },
+    {
+      "path": "EULA.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 295,
+      "sha256": "dba8750c080e4fffd61aabeea1ef3693486d864fe8574bf4949ce3bc0e580c18"
+    },
+    {
+      "path": "LICENSE",
+      "type": "file",
+      "mode": "100644",
+      "size": 10173,
+      "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+    },
+    {
+      "path": "README.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 23552,
+      "sha256": "a424ae3ac4f9ff8e4c938313242f93d05f56283d1eb73f9733481108c0d866d3"
+    },
+    {
+      "path": "README.zh-CN.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 23247,
+      "sha256": "8e720197e115f13c05f1e2ffe078374f487e9b2898143ee288ea47947bbddf20"
+    },
+    {
+      "path": "SECURITY.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 7476,
+      "sha256": "9cd168604670bff38aa376a62fa9fb5a8f04b2896b8bd5f4507a99e31de3fbbc"
+    },
+    {
+      "path": "SUPPORT.md",
+      "type": "file",
+      "mode": "100644",
+      "size": 508,
+      "sha256": "c32ceba52322eaa1d6d51adf64c480bf1936571fb4f4277e628fd11e9c5ec39e"
+    },
+    {
+      "path": "action.yml",
+      "type": "file",
+      "mode": "100644",
+      "size": 1738,
+      "sha256": "02f644f7cb94ab00ca8dfa415f9b3c13c997897247ed16414a2ad424c295e60b"
+    },
+    {
+      "path": "decision-table.json",
+      "type": "file",
+      "mode": "100644",
+      "size": 24219,
+      "sha256": "6c04ccf20e5033639c2ba88931ea10ba7b6577189f91f6eaeea9b2792892b8a7"
+    },
+    {
+      "path": "package.json",
+      "type": "file",
+      "mode": "100644",
+      "size": 486,
+      "sha256": "9a01e30dd5d3326394b06e94eceac13a98c10d1058a125f9a9c5dfd32b0b03b7"
+    },
+    {
+      "path": "producer-receipt.schema.json",
+      "type": "file",
+      "mode": "100644",
+      "size": 5988,
+      "sha256": "89decfcabeeab817a975b1118498375c4eafe730b35e2cb9aa5c4abde6637b77"
+    },
+    {
+      "path": "src/core.mjs",
+      "type": "file",
+      "mode": "100644",
+      "size": 65522,
+      "sha256": "2963125336dad82e557801af30f120b63664c7fd9c724c8eeab704dca1486336"
+    },
+    {
+      "path": "src/evidence-budget.mjs",
+      "type": "file",
+      "mode": "100644",
+      "size": 5703,
+      "sha256": "39130aaf563e8dd6fe6da59def40a665f08429623b0a518ddea87f9be90d2218"
+    },
+    {
+      "path": "src/gate.mjs",
+      "type": "file",
+      "mode": "100644",
+      "size": 148166,
+      "sha256": "a5bfd2ced0290bc68d88c9a042b33ece182d57704b90576f9452478bd798846c"
+    },
+    {
+      "path": "src/v2/gate-runtime.mjs",
+      "type": "file",
+      "mode": "100644",
+      "size": 224706,
+      "sha256": "a53d8cceae83280a42bba219ead3a8e6db70a54234028759fdcbf2a8eaf10132"
+    }
+  ],
+  "entrypoint": {
+    "metadata_path": "action.yml",
+    "using": "node20",
+    "main": "src/v2/gate-runtime.mjs"
+  },
+  "signer": {
+    "name": "JoeyTeng-Codex",
+    "email": "codex@mahane.me",
+    "primary_fingerprint": "AD403DAB5377F9FA0F7D775EC2844D3367B8A71B",
+    "signing_subkey_fingerprint": "4DD48552DDEAF6D961769DD4A49827EC48984E2C"
+  }
+}
