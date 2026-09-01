@@ -335,6 +335,61 @@ test("publisher installation repository scope persists only a fixed safe project
   assert.equal(errorBodyRead, false);
 });
 
+test("publisher installation repository scope reports target mismatches fail closed", async () => {
+  const expectedRepositoryId = "1239944216";
+  const expectedRepository = "JoeyTeng/codex-review-gate-action";
+  for (const {
+    label,
+    firstRepository,
+    targetShapeMatchesExpected,
+    targetIdMatchesExpected,
+    targetFullNameMatchesExpected,
+  } of [
+    {
+      label: "wrong repository ID",
+      firstRepository: { id: 1239944217, full_name: expectedRepository },
+      targetShapeMatchesExpected: true,
+      targetIdMatchesExpected: false,
+      targetFullNameMatchesExpected: true,
+    },
+    {
+      label: "wrong repository full_name",
+      firstRepository: { id: 1239944216, full_name: "JoeyTeng/not-the-release-target" },
+      targetShapeMatchesExpected: true,
+      targetIdMatchesExpected: true,
+      targetFullNameMatchesExpected: false,
+    },
+    {
+      label: "malformed first repository",
+      firstRepository: [1239944216, expectedRepository],
+      targetShapeMatchesExpected: false,
+      targetIdMatchesExpected: false,
+      targetFullNameMatchesExpected: false,
+    },
+  ]) {
+    const repositoryScope = await readGitHubAppInstallationRepositories({
+      installationToken: "synthetic-installation-token",
+      expectedRepositoryId,
+      expectedRepository,
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({
+          total_count: 1,
+          repositories: [firstRepository],
+        }),
+      }),
+    });
+    assert.deepEqual(repositoryScope, {
+      total_count: 1,
+      returned_count: 1,
+      target_shape_matches_expected: targetShapeMatchesExpected,
+      target_id_matches_expected: targetIdMatchesExpected,
+      target_full_name_matches_expected: targetFullNameMatchesExpected,
+    }, label);
+  }
+});
+
 test("publisher installation repository scope represents malformed and oversized counts fail closed", async () => {
   const expectedRepositoryId = "1239944216";
   const expectedRepository = "JoeyTeng/codex-review-gate-action";
@@ -713,7 +768,7 @@ test("publisher workflow inventories the full installation before minting a targ
     /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$repository_scope_file"/u,
   );
   assert.match(identityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$inventory_installation_token"/u);
-  assert.match(identityStep, /keys == \[\s*"returned_count",\s*"total_count",\s*"target_full_name_matches_expected",\s*"target_id_matches_expected",\s*"target_shape_matches_expected"\s*\]/u);
+  assert.match(identityStep, /keys == \[\s*"returned_count",\s*"target_full_name_matches_expected",\s*"target_id_matches_expected",\s*"target_shape_matches_expected",\s*"total_count"\s*\]/u);
   for (const field of [
     "total_count",
     "returned_count",

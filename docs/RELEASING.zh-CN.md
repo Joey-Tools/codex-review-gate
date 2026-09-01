@@ -158,16 +158,22 @@ installation ID: 156186692
 
 它只安装在 `JoeyTeng/codex-review-gate-action`。签发 credential 前，privileged job
 先 checkout 受保护的 source control、下载并安全解包 assembled artifact，并重复 exact
-admission validation；之后才使用 allowlisted 官方
-`actions/create-github-app-token@v3` Action 即时签发 installation token。请求只点名
-target repository，并明确把 token 收紧为 Administration read 与 Contents write。
-Trusted source-repository generator 是 private key 唯一的另一个 consumer：它只为
+admission validation。之后它会验证配置的 owner 与 App slug，并使用 allowlisted 官方
+`actions/create-github-app-token@v3` Action，以 owner 且不提供 `repositories` input
+的方式即时签发一个只具 `Metadata: read` 的 inventory token。该 token 能读取完整
+App-installation repository inventory，但不能写入。Trusted source-repository generator
+是 private key 唯一的另一个 consumer：它只为
 `GET /app/installations/{installation_id}` 在内存生成 RS256 App JWT，其中
 `iat = now - 60`、`exp = now + 540`，`iss` 等于配置的 App client ID。该 JWT 绝不
-写入 file、`GITHUB_ENV`、artifact、output、summary 或 log。独立的 installation
-token 读取 `GET /installation/repositories`，绑定 expected App identity 与 sole target
-repository，并且是唯一暴露给 Git 的 credential。它不得跨 jobs 传递、嵌入 remote
-URL、存入 artifact 或打印。Checkout 使用 `persist-credentials: false`。Git 只通过
+写入 file、`GITHUB_ENV`、artifact、output、summary 或 log。
+
+inventory token 读取 `GET /installation/repositories`，并必须证明完整 installation
+恰好只含 expected repository，且同时匹配 repository ID 与 canonical name。响应先在
+内存投影为五个固定的 non-secret fields，才会写入本地；临时文件由 `always()` cleanup
+删除。只有该证明通过后，job 才会签发独立的 target-scoped installation token。这个
+write token 只点名 target repository，并请求 Administration read、Contents write 与
+Metadata read。它是唯一暴露给 Git 的 credential：不得跨 jobs 传递、嵌入 remote URL、
+存入 artifact 或打印。Checkout 使用 `persist-credentials: false`。Git 只通过
 owner-private 的临时 `GIT_ASKPASS` helper 取得该 token，并且 helper 只作用于 exact
 target repository。Post step 撤销 token 是 best effort；若 runner 被强制终止，token
 expiry 是剩余边界。
@@ -179,8 +185,9 @@ patch-level upstream drift，以便自动取得官方修复。若未来改成 im
 alias 升级仍需普通 reviewed infrastructure PR，且不得与 release-intent 变更同时落地。
 
 Installed App 授予隐含的 `Metadata: read`、`Contents: read/write` 与
-`Administration: read`。Publisher 为其 one-repository installation token 只请求
-Administration read 与 Contents write；它不需要 Workflows write。
+`Administration: read`。Publisher 先为完整 installation inventory token 只请求
+Metadata read，再为 one-repository write token 请求 Administration read、Contents
+write 与 Metadata read；它不需要 Workflows write。
 
 `marketplace-production` Environment 提供：
 
@@ -192,8 +199,8 @@ RELEASE_PUBLISHER_APP_PRIVATE_KEY=<environment secret>
 ```
 
 Private key 只在 credential-free admission 成功后的 privileged `publish` job 内存在。
-它会提供给 official token Action 以签发 installation token；另一次、也是唯一额外
-用途，是直接提供给 trusted generator，在内存构造上述短期 JWT 来读取 App
+它会提供给 official token Action 以签发 inventory 与 target-scoped token；另一次、
+也是唯一额外用途，是直接提供给 trusted generator，在内存构造上述短期 JWT 来读取 App
 installation identity。Private key 绝不持久化，也绝不通过 `GITHUB_ENV`、artifact、
 output、summary 或 log 暴露。
 
@@ -229,10 +236,11 @@ environment gate 约束：必须同时存在
 inventory validator，并在 production fences 把它导出的 raw certificate 与 approved
 certificate 逐字节比较。Production 不存在 signer-policy skip path。
 
-首次写入前，just-in-time token 必须证明属于 expected Publisher App installation 与
-唯一 target repository；target rulesets 随后只把该 App 作为 publication bypass
-identity。GPG identity 是写入 publication Git objects 的 author、committer 与 signer，
-其 signatures 在发布后仍可独立验证。
+首次写入前，full-installation inventory 必须证明 expected Publisher App installation
+只含唯一 target repository，独立的 write token 还必须绑定同一 App slug 与 installation
+ID；target rulesets 随后只把该 App 作为 publication bypass identity。GPG identity 是
+写入 publication Git objects 的 author、committer 与 signer，其 signatures 在发布后仍可
+独立验证。
 
 不得过度解读之后的 GitHub state checks：ref、commit、signature 与 Release readback
 可以证明最终 objects 与当前 repository state，但 GitHub 不提供可证明某个已接受 ref

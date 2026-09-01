@@ -187,22 +187,29 @@ installation ID: 156186692
 It is installed only on `JoeyTeng/codex-review-gate-action`. Before any
 credential is minted, the privileged job checks out protected source control,
 downloads and safely extracts the assembled artifact, and repeats exact
-admission validation. Only then does it mint a just-in-time installation token
-with the allowlisted official `actions/create-github-app-token@v3` Action. The
-request names only the target repository and explicitly narrows the token to
-Administration read and Contents write. The trusted source-repository
-generator is the private key's only other consumer: it creates an in-memory
-RS256 App JWT with `iat = now - 60`, `exp = now + 540`, and `iss` equal to the
-configured App client ID, solely for
-`GET /app/installations/{installation_id}`. That JWT is never written to a
-file, `GITHUB_ENV`, an artifact, an output, a summary, or a log. The separate
-installation token reads `GET /installation/repositories`, is bound to the
-expected App identity and sole target repository, and is the only credential
-exposed to Git. It is never passed between jobs, embedded in a remote URL,
-stored in an artifact, or printed. Checkout uses `persist-credentials: false`.
-Git receives it only through an owner-private temporary `GIT_ASKPASS` helper
-scoped to the exact target repository. Post-step revocation is best effort;
-expiry is the remaining bound if the runner is forcibly terminated.
+admission validation. It then validates the configured owner and App slug and
+uses the allowlisted official `actions/create-github-app-token@v3` Action to
+mint a metadata-only inventory token with the owner set but no `repositories`
+input. That token can read the complete App-installation repository inventory,
+but cannot write. The trusted source-repository generator is the private key's
+only other consumer: it creates an in-memory RS256 App JWT with `iat = now -
+60`, `exp = now + 540`, and `iss` equal to the configured App client ID, solely
+for `GET /app/installations/{installation_id}`. That JWT is never written to a
+file, `GITHUB_ENV`, an artifact, an output, a summary, or a log.
+
+The inventory token reads `GET /installation/repositories` and must prove that
+the complete installation contains exactly the expected repository, matched by
+both repository ID and canonical name. The response is projected in memory to
+five fixed non-secret fields before it is written locally, and the temporary
+files are removed in an `always()` cleanup. Only after that proof does the job
+mint its separate target-scoped installation token. That write token names only
+the target repository and requests Administration read, Contents write, and
+Metadata read. It is the only credential exposed to Git; it is never passed
+between jobs, embedded in a remote URL, stored in an artifact, or printed.
+Checkout uses `persist-credentials: false`. Git receives it only through an
+owner-private temporary `GIT_ASKPASS` helper scoped to the exact target
+repository. Post-step revocation is best effort; expiry is the remaining bound
+if the runner is forcibly terminated.
 
 Every `uses:` dependency in the publisher workflow must be an allowlisted
 GitHub-official Action referenced by its floating major, such as `@v4`, and
@@ -213,9 +220,10 @@ not missed. A major-alias upgrade remains an ordinary reviewed infrastructure
 PR and must not share a release-intent change.
 
 The installed App grants the implicit `Metadata: read` plus `Contents:
-read/write` and `Administration: read`. The publisher requests only
-Administration read and Contents write for its one-repository installation
-token. It does not require Workflows write.
+read/write` and `Administration: read`. The publisher first requests only
+Metadata read for the complete-installation inventory token, then requests
+Administration read, Contents write, and Metadata read for its one-repository
+write token. It does not require Workflows write.
 
 The `marketplace-production` Environment provides:
 
@@ -228,10 +236,10 @@ RELEASE_PUBLISHER_APP_PRIVATE_KEY=<environment secret>
 
 The private key exists only inside the privileged `publish` job after
 credential-free admission succeeds. It is supplied to the official token
-Action to mint the installation token and, for the single App-installation
-identity read described above, directly to the trusted generator to construct
-the short-lived JWT in memory. It is never persisted or exposed through
-`GITHUB_ENV`, an artifact, an output, a summary, or a log.
+Action for the inventory and target-scoped tokens and, for the single
+App-installation identity read described above, directly to the trusted
+generator to construct the short-lived JWT in memory. It is never persisted or
+exposed through `GITHUB_ENV`, an artifact, an output, a summary, or a log.
 
 Publication commits, immutable tags, and floating aliases are signed by the
 dedicated `JoeyTeng-Codex <codex@mahane.me>` key:
@@ -269,8 +277,9 @@ real GitHub inventory validator and byte-compares its raw exported certificate
 with the approved certificate at the production fences. Production has no
 signer-policy skip path.
 
-The just-in-time token is proved, before the first write, to belong to the
-expected Publisher App installation and sole target repository. The target
+Before the first write, the full-installation inventory proves the expected
+Publisher App installation has the sole target repository, and the separate
+write token is bound to that same App slug and installation ID. The target
 rulesets then admit that App as the only publication bypass identity. The GPG
 identity is the author, committer, and signer embedded in the publication Git
 objects, and its signatures remain independently verifiable after publication.

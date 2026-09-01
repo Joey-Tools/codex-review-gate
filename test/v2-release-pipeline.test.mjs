@@ -159,6 +159,96 @@ function workflowStepBlock(job, stepName) {
   return job.slice(start, end);
 }
 
+function assertPublisherRepositoryScopeGuardFailsClosed(identityStep) {
+  assert.doesNotMatch(identityStep, /^\s*continue-on-error:/mu);
+  const observedScopeStart = identityStep.indexOf(
+    "Publisher App repository scope observed (non-secret)",
+  );
+  const guardStart = identityStep.indexOf("          if ! jq -e \\", observedScopeStart);
+  const guardEndMarker =
+    "          printf '%s\\n' \"Publisher App repository scope check passed.\"";
+  const guardEndStart = identityStep.indexOf(guardEndMarker, guardStart);
+  assert.ok(observedScopeStart >= 0, "repository scope observation must precede the guard");
+  assert.ok(guardStart > observedScopeStart, "repository scope guard must remain present");
+  assert.ok(guardEndStart > guardStart, "repository scope success boundary must remain present");
+  const scopeGuard = identityStep
+    .slice(guardStart, guardEndStart + guardEndMarker.length)
+    .split("\n")
+    .map((line) => line.startsWith("          ") ? line.slice(10) : line)
+    .join("\n");
+
+  const root = mkdtempSync(join(tmpdir(), "release-publisher-scope-guard-"));
+  try {
+    const guardScript = join(root, "scope-guard.sh");
+    writeFileSync(guardScript, `#!/usr/bin/env bash
+set -euo pipefail
+repository_scope_file="$1"
+target_scope_marker="$2"
+${scopeGuard}
+printf '%s\\n' 'target-scoped publisher token entered' > "$target_scope_marker"
+`);
+    chmodSync(guardScript, 0o755);
+
+    const validScope = {
+      total_count: 1,
+      returned_count: 1,
+      target_shape_matches_expected: true,
+      target_id_matches_expected: true,
+      target_full_name_matches_expected: true,
+    };
+    for (const { label, scope, accepted } of [
+      { label: "exact target-only installation", scope: validScope, accepted: true },
+      {
+        label: "more than one installed repository",
+        scope: { ...validScope, total_count: 2, returned_count: 2 },
+        accepted: false,
+      },
+      {
+        label: "malformed target repository",
+        scope: { ...validScope, target_shape_matches_expected: false },
+        accepted: false,
+      },
+      {
+        label: "wrong target repository ID",
+        scope: { ...validScope, target_id_matches_expected: false },
+        accepted: false,
+      },
+      {
+        label: "wrong target repository full_name",
+        scope: { ...validScope, target_full_name_matches_expected: false },
+        accepted: false,
+      },
+      {
+        label: "unexpected persisted projection field",
+        scope: { ...validScope, unexpected: true },
+        accepted: false,
+      },
+    ]) {
+      const stem = label.replaceAll(/[^a-z0-9]+/gu, "-");
+      const scopeFile = join(root, `${stem}.json`);
+      const targetScopeMarker = join(root, `${stem}.target-token-entered`);
+      writeFileSync(scopeFile, `${JSON.stringify(scope)}\n`);
+      const result = invoke("bash", [guardScript, scopeFile, targetScopeMarker], { cwd: root });
+      if (accepted) {
+        assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+        assert.equal(existsSync(targetScopeMarker), true, label);
+        assert.match(result.stdout, /Publisher App repository scope check passed\./u);
+      } else {
+        assert.notEqual(result.status, 0, label);
+        assert.equal(existsSync(targetScopeMarker), false, label);
+        assert.match(
+          result.stderr,
+          /Publisher App repository scope invariant failed; inspect the non-secret observed scope above\./u,
+          label,
+        );
+        assert.doesNotMatch(result.stdout, /target-scoped publisher token entered/u, label);
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function run(file, args, options = {}) {
   return execFileSync(file, args, {
     encoding: "utf8",
@@ -1970,7 +2060,7 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
   );
   assert.match(
     releaseShardStep,
-    /^          cd "\$RUNNER_TEMP\/release-source"\n          node --test test\/v2-release-pipeline\.test\.mjs --test-reporter=dot$/mu,
+    /^          cd "\$RUNNER_TEMP\/release-source"\n          node --test --test-reporter=dot test\/v2-release-pipeline\.test\.mjs$/mu,
   );
   const matrixShardExpression = "${{ matrix." + "suite" + ".release_test_shard }}";
   assert.ok(validation.includes(
@@ -2122,13 +2212,14 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$repository_scope_file"/u,
   );
   assert.match(identityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$inventory_installation_token"/u);
-  assert.match(identityStep, /keys == \[[\s\S]*"returned_count"[\s\S]*"total_count"[\s\S]*"target_full_name_matches_expected"[\s\S]*"target_id_matches_expected"[\s\S]*"target_shape_matches_expected"[\s\S]*\]/u);
+  assert.match(identityStep, /keys == \[[\s\S]*"returned_count"[\s\S]*"target_full_name_matches_expected"[\s\S]*"target_id_matches_expected"[\s\S]*"target_shape_matches_expected"[\s\S]*"total_count"[\s\S]*\]/u);
   assert.match(identityStep, /\.total_count == 1[\s\S]*\.returned_count == 1[\s\S]*\.target_shape_matches_expected == true[\s\S]*\.target_id_matches_expected == true[\s\S]*\.target_full_name_matches_expected == true/u);
   assert.doesNotMatch(identityStep, /\.repositories\b/u);
   assert.match(identityStep, /Publisher App repository scope observed \(non-secret\): \$observed_repository_scope/u);
   assert.match(identityStep, /Publisher App repository scope query completed\./u);
   assert.match(identityStep, /Publisher App repository scope invariant failed; inspect the non-secret observed scope above\./u);
   assert.match(identityStep, /Publisher App repository scope check passed\./u);
+  assertPublisherRepositoryScopeGuardFailsClosed(identityStep);
 
   assert.match(bindingStep, /SCOPED_APP_SLUG: \$\{\{ steps\.publisher-token\.outputs\.app-slug \}\}/u);
   assert.match(bindingStep, /SCOPED_INSTALLATION_ID: \$\{\{ steps\.publisher-token\.outputs\.installation-id \}\}/u);

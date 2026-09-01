@@ -333,7 +333,7 @@ jobs:
           CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release_test_shard }}
         run: |
           cd "$RUNNER_TEMP/release-source"
-          node --test test/v2-release-pipeline.test.mjs --test-reporter=dot
+          node --test --test-reporter=dot test/v2-release-pipeline.test.mjs
 
   assemble:
     name: Compare and assemble candidates
@@ -704,10 +704,10 @@ jobs:
               if type != "object" then false else
                 keys == [
                   "returned_count",
-                  "total_count",
                   "target_full_name_matches_expected",
                   "target_id_matches_expected",
-                  "target_shape_matches_expected"
+                  "target_shape_matches_expected",
+                  "total_count"
                 ] and
                 .total_count == 1 and
                 .returned_count == 1 and

@@ -3261,9 +3261,12 @@ superseded_by:
   `33463583561` then proved the unprivileged plan, dual-candidate, assembly and
   publication-plan stages. Candidate A completed in 17m10s and candidate B in
   17m22s; plan, assembly and publication-plan completed in 26s, 25s and 23s.
-  The run reached `marketplace-production` and remained waiting for the
-  required `JoeyTeng` approval, with no privileged job runner or production
-  write started.
+  At the timing checkpoint, the run had reached `marketplace-production` and
+  was waiting for the required `JoeyTeng` approval, with no privileged job
+  runner or production write started. After approval it did start the
+  privileged job, then ended in the old publisher identity/scope preflight
+  before any target write; the final failure and its observability gap are
+  recorded in `Publisher Identity Diagnostic Recovery` below.
 - Joey explicitly requested matrix/multi-runner splitting when CI proved slow.
   The ordinary PR CI already completed its ten Node 20/24 core-and-Release
   cells in at most 4m35s, while the first live publisher run showed that each
@@ -3282,11 +3285,11 @@ superseded_by:
   - the now-light candidate builders move to `ubuntu-slim` with the adopted
     14-minute limit. Independent construction and byte-identical comparison
     remain unchanged.
-- This optimization is a publisher-control change and is kept on an isolated
-  WIP branch while the admitted RC run is pending. It must not alter live
-  `master` during that run. After the RC closes, it follows the normal signed,
-  reviewed infrastructure PR path; the later stable release intent remains a
-  separate landing.
+- This optimization is a publisher-control change and was kept on an isolated
+  WIP branch while the admitted RC run was pending. It did not alter live
+  `master` during that run. After the RC closed in the identity/scope preflight,
+  it follows the normal signed, reviewed infrastructure PR path; the later
+  stable release intent remains a separate landing.
 - The matrix field uses the expression-safe `release_test_shard` spelling;
   this avoids relying on ambiguous hyphenated property dereferencing in GitHub
   expressions while leaving the public test-shard environment ABI unchanged.
@@ -3307,9 +3310,9 @@ superseded_by:
   still named the removed 30-minute candidate topology, and `Next Steps` still
   treated already-merged PR #35 as a Draft. The corrections above and below
   bind the handoff to the five-cell validation topology and the actual order:
-  close and verify the admitted RC run, land this publisher-control change,
-  then land the separate stable release intent. A new whole-range exact-head
-  review is required after this documentation correction.
+  record the admitted RC run's pre-write failure, land this publisher-control
+  change, then land the separate stable release intent. A new whole-range
+  exact-head review is required after this documentation correction.
 
 ### Publisher Identity Diagnostic Recovery
 
@@ -3359,6 +3362,19 @@ superseded_by:
   check also now requires the `suspended_at` key to exist and be explicitly
   `null`; a missing field is an invariant failure rather than an implicit
   "not suspended" result.
+- Both release guides now describe the two-token sequence, the complete-
+  installation proof, the fixed local projection, and the scoped-token binding
+  in lockstep. They no longer describe the repository-scoped writer as the
+  token that establishes sole-installation scope.
+- An executable regression extracts the real workflow scope guard rather than
+  reproducing its predicate. It proves the exact singleton projection advances
+  to the subsequent target-token boundary while extra repositories, malformed
+  target shape, wrong ID, wrong canonical name, or an extra persisted field
+  terminate before that boundary. This also exposed the required `jq keys`
+  lexical order: `returned_count`, the three `target_*` fields, then
+  `total_count`; the guard now uses that actual order. The source-validation
+  release shard also places Node's `--test-reporter=dot` before its test entry,
+  so the requested compact reporter is actually applied.
 - A bounded read of the failed job's raw log confirms the exact observability
   gap: GitHub evaluated the configured owner, slug, minted App slug and
   installation ID, then ran the four bare predicates and exited with only
@@ -3391,7 +3407,7 @@ superseded_by:
   existing recovery attempt. Land the isolated publisher-control change first,
   then create a fresh RC release intent/run and use its safe diagnostic phase
   to repair only the observed mismatch.
-- Local validation for this isolated change passed `npm run check`, all 56
+- Local validation for this isolated change passed `npm run check`, all 57
   publisher/provenance regressions in `test/release-provenance.test.mjs`, the
   two focused source-validation/publisher credential contracts in
   `test/v2-release-pipeline.test.mjs`, baseline-filtered actionlint,
