@@ -3301,6 +3301,15 @@ superseded_by:
   `npm run check`, the two focused workflow-contract tests, all 13 shard
   contract tests, `actionlint` with the documented upstream-metadata ignores,
   `git diff --check`, and project-journal validation passed.
+- A fresh ordinary GPT-5.6 Sol Ultra exact-head review of signed commit
+  `0cc238cef573b93badce86c7e7e73e088257495a` found no workflow implementation
+  issue, but identified two stale journal handoff statements: the preflight
+  still named the removed 30-minute candidate topology, and `Next Steps` still
+  treated already-merged PR #35 as a Draft. The corrections above and below
+  bind the handoff to the five-cell validation topology and the actual order:
+  close and verify the admitted RC run, land this publisher-control change,
+  then land the separate stable release intent. A new whole-range exact-head
+  review is required after this documentation correction.
 
 ## Verified Facts And Required Live Preflight
 
@@ -3326,9 +3335,11 @@ superseded_by:
   installation identity, sole target repository, and actual permissions; the
   configured layered rulesets; GitHub read-back of an App-pushed,
   JoeyTeng-Codex-signed commit and tag; compatibility of the selected floating
-  Action majors; each light `ubuntu-slim` job completing within the adopted
-  14-minute budget; each standard-Ubuntu candidate job completing within 30
-  minutes; and Environment waiting allocating no runner in the live workflow.
+  Action majors; each `ubuntu-slim` plan, candidate, assembly, publication-plan
+  and verification job completing within the adopted 14-minute budget; each
+  standard-Ubuntu `source-validation` matrix cell completing within 14 minutes;
+  the privileged standard-Ubuntu publish job remaining within 30 minutes; and
+  Environment waiting allocating no runner in the live workflow.
 - The stable-major operator checklist includes manually publishing `v2.0.0`
   through the Action Marketplace Release UI. This is deliberately not a
   publisher gate or machine-read-back requirement. Historical v1 evidence
@@ -3345,16 +3356,19 @@ superseded_by:
 - Run the already specified hidden-marker canary and live
   publisher/runner/Environment preflights as execution evidence; they are not
   remaining grilling choices.
-- Keep RC release-intent PR #35 in Draft while the two delayed-review P1
-  infrastructure findings are fixed, validated, signed, reviewed, and landed;
-  do not involve PR #32.
-- After the corrected infrastructure lands, revalidate and return the separate
-  release-intent PR to the normal approval path, then execute the approved
-  publisher workflow through RC and stable `v2.0.0`.
-  Verify immutable refs, Release/assets, signatures, and floating alias before
-  carrying out the explicitly selected consumer migrations and canaries.
-  Marketplace publication remains the separate stable-major manual checklist
-  item defined above.
+- PR #35 is merged and its RC run has passed every unprivileged stage. Complete
+  or otherwise close that already-admitted run at its current
+  `marketplace-production` approval boundary, then verify the immutable RC ref,
+  prerelease, assets, signatures and public readback. Do not involve PR #32.
+- Only after the RC run closes, land this isolated publisher-control matrix
+  change through its own signed, exact-head-reviewed infrastructure PR and
+  verify all five hosted validation cells meet their 14-minute budget.
+- Then land the stable `v2.0.0` release intent separately and execute its
+  approved publisher workflow. Verify the immutable stable ref,
+  Release/assets, signatures and `v2` floating alias before carrying out the
+  explicitly selected consumer migrations and canaries. Marketplace
+  publication remains the separate stable-major manual checklist item defined
+  above.
 
 ## Evidence
 
