@@ -3311,6 +3311,72 @@ superseded_by:
   then land the separate stable release intent. A new whole-range exact-head
   review is required after this documentation correction.
 
+### Publisher Identity Diagnostic Recovery
+
+- The approved frozen recovery run `33491438854` reused RC source/control SHA
+  `af8430ce086517918e4ac8b8c7b9ff124ebec3ef` and admission run
+  `33463583561`. Its plan, both independent candidates, source-validation
+  matrix, assembly, and publication-plan stages completed. After the required
+  `marketplace-production` approval, `actions/create-github-app-token@v3`
+  successfully minted the selected-repository token, but the following
+  `Validate publisher identity and repository scope` step exited one without a
+  condition-specific line. The publisher did not proceed to a target write;
+  no RC tag or Release was created.
+- The original identity step used bare shell predicates for static App/token
+  outputs, a bare metadata `jq -e` predicate, and a bare installation-token
+  repository-scope command. Any of those failed closed but surfaced only a
+  generic shell exit. The matrix/publisher-control branch now adds explicit
+  phase markers and fixed failure messages for every static predicate, the
+  App-JWT installation read, metadata invariant, repository-scope query, and
+  repository-scope invariant. Its successful installation summary contains
+  only boolean comparisons against expected installation/App/account identity
+  and selected-repository state, suspension state, enum-limited permission
+  values, and a bounded event count; the scope summary contains only bounded
+  numeric counts and a boolean target-repository match.
+- A bounded read of the failed job's raw log confirms the exact observability
+  gap: GitHub evaluated the configured owner, slug, minted App slug and
+  installation ID, then ran the four bare predicates and exited with only
+  `Process completed with exit code 1`. The preceding publisher-token step
+  completed successfully, so the missing line is downstream of token minting;
+  the historical log cannot distinguish which original predicate failed. This
+  is why every newly explicit branch writes its phase-specific message before
+  it exits nonzero, rather than relying on shell `-e` to carry diagnostic
+  meaning.
+- Diagnostics remain credential-safe: xtrace, verbose, and allexport modes are
+  disabled before secret capture; no private key, App JWT, or installation
+  token is printed; non-200 App responses are not read and emit only a closed
+  failure code, numeric HTTP status, and a request-ID-presence boolean (not
+  the request ID itself). The
+  installation-token scope query now uses the same bounded Node HTTP reader,
+  rather than preserving a raw CLI error path, so it has the same closed
+  transport/status diagnostics and never reads a non-200 body. The local
+  App-JWT reader now matches `actions/create-github-app-token@v3` by
+  normalizing escaped PEM newlines; malformed JWT construction emits the fixed
+  `app_jwt_invalid` code rather
+  than an OpenSSL message. Successful response-body I/O failures likewise emit
+  a fixed code, while the pre-existing safe byte-limit diagnostic remains
+  distinct. Regression coverage includes reflected JWT/token response headers,
+  escaped-newline PEM, malformed JWT construction through the real CLI
+  stderr/exit/no-output-file boundary, response-body failures, and limit/cancel
+  failures. Every invariant still fails closed.
+- The precise live mismatch remains unproven until the added non-secret
+  diagnostics run. A frozen recovery is intentionally bound to its original
+  publisher-control SHA, so these new diagnostics cannot be injected into the
+  existing recovery attempt. Land the isolated publisher-control change first,
+  then create a fresh RC release intent/run and use its safe diagnostic phase
+  to repair only the observed mismatch.
+- Local validation for this isolated change passed `npm run check`, the 53
+  publisher/provenance regressions in `test/release-provenance.test.mjs`, the
+  focused staged-ABI/publisher-credential contract in
+  `test/v2-release-pipeline.test.mjs`, extracted `bash -n` and ShellCheck for
+  the identity step, both embedded `jq` programs, baseline-filtered actionlint,
+  `git diff --check`, and project-journal validation. The combined full command
+  containing the entire `test/v2-release-pipeline.test.mjs` was intentionally
+  interrupted after a bounded 20-minute local window while it was still
+  progressing through its serial temporary-Git scenarios; it is not recorded
+  as a passing test. This log-only implementation does not modify its test
+  fixture semantics, and its directly affected workflow contract test passed.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -3356,13 +3422,15 @@ superseded_by:
 - Run the already specified hidden-marker canary and live
   publisher/runner/Environment preflights as execution evidence; they are not
   remaining grilling choices.
-- PR #35 is merged and its RC run has passed every unprivileged stage. Complete
-  or otherwise close that already-admitted run at its current
-  `marketplace-production` approval boundary, then verify the immutable RC ref,
-  prerelease, assets, signatures and public readback. Do not involve PR #32.
-- Only after the RC run closes, land this isolated publisher-control matrix
-  change through its own signed, exact-head-reviewed infrastructure PR and
-  verify all five hosted validation cells meet their 14-minute budget.
+- PR #35 is merged. Its approved frozen RC recovery completed every
+  unprivileged stage but failed before any target write in the publisher
+  identity/scope preflight. Do not involve PR #32.
+- Land the isolated publisher-control matrix-and-diagnostics change through its
+  own signed, exact-head-reviewed infrastructure PR and verify all five hosted
+  validation cells meet their 14-minute budget. Then create a fresh RC release
+  intent/run, use the safe identity diagnostics if it fails, and on success
+  verify the immutable RC ref, prerelease, assets, signatures and public
+  readback.
 - Then land the stable `v2.0.0` release intent separately and execute its
   approved publisher workflow. Verify the immutable stable ref,
   Release/assets, signatures and `v2` floating alias before carrying out the

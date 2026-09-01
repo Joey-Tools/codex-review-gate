@@ -2017,11 +2017,34 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     workflow,
     /RELEASE_PUBLISHER_APP_PRIVATE_KEY="\$app_private_key"[\s\S]*github-app-installation/u,
   );
+  assert.match(workflow, /set \+x[\s\S]*set \+v[\s\S]*set \+a[\s\S]*app_private_key="\$APP_PRIVATE_KEY"/u);
+  assert.match(workflow, /Publisher App configuration invariant failed: expected owner JoeyTeng\./u);
+  assert.match(workflow, /Publisher App configuration invariant failed: expected canonical publisher slug\./u);
+  assert.match(workflow, /Publisher App token invariant failed: token app slug does not match the configured publisher slug\./u);
+  assert.match(workflow, /Publisher App token invariant failed: token output has no valid installation ID\./u);
+  assert.match(workflow, /Publisher App static configuration and token-output checks passed\./u);
+  assert.match(workflow, /Publisher App installation fetch starting\./u);
+  assert.match(workflow, /Publisher App installation fetch completed\./u);
+  assert.match(workflow, /Publisher App installation observed \(non-secret\): \$observed_installation/u);
+  assert.match(workflow, /Publisher App installation invariant failed; inspect the non-secret observed identity above\./u);
+  assert.match(workflow, /Publisher App installation metadata check passed\./u);
+  assert.match(workflow, /installation_id_matches_token_output: \(\.id == \$installation_id\)/u);
+  assert.match(workflow, /permission_shape_matches_expected: \(\.permissions == \{administration:"read", contents:"write", metadata:"read"\}\)/u);
+  assert.doesNotMatch(workflow, /permission_keys:|events: \(if/u);
+  assert.match(workflow, /Publisher App repository scope query starting\./u);
+  assert.match(workflow, /github-app-installation-repository-scope[\s\S]*--output "\$repository_scope_file"/u);
+  assert.match(workflow, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$installation_token"/u);
+  assert.match(workflow, /def bounded_total_count:/u);
+  assert.match(workflow, /def first_repository_matches_target:/u);
+  assert.match(workflow, /Publisher App repository scope observed \(non-secret\): \$observed_repository_scope/u);
+  assert.match(workflow, /Publisher App repository scope query completed\./u);
+  assert.match(workflow, /Publisher App repository scope invariant failed; inspect the non-secret observed scope above\./u);
+  assert.match(workflow, /Publisher App repository scope check passed\./u);
+  assert.match(workflow, /If the first failed step is `Validate publisher identity and[\s\S]*repository scope`/u);
+  assert.match(workflow, /Inspect `reconcile_state` and `recovery_code` only when `Reconcile[\s\S]*release publication` started\./u);
+  assert.doesNotMatch(workflow, /Inspect the first failure, `reconcile_state`, and `recovery_code`\./u);
   assert.doesNotMatch(workflow, /GH_TOKEN="\$app_jwt"|Authorization:\s*token/u);
-  assert.match(
-    workflow,
-    /env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$installation_token"[\s\\]*gh api --hostname github\.com installation\/repositories/u,
-  );
+  assert.doesNotMatch(workflow, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN.*GITHUB_ENV/u);
   assert.doesNotMatch(workflow, /(?:APP_PRIVATE_KEY|app_jwt).*GITHUB_ENV/u);
   assert.match(workflow, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
   assert.doesNotMatch(workflow, /^\s+(?:GH_TOKEN|PUBLISHER_TOKEN): \$\{\{ steps\.publisher-token\.outputs\.token \}\}/mu);
@@ -2046,7 +2069,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   }
   assert.equal(
     (workflow.match(/\bgh api --hostname github\.com\b/gu) ?? []).length,
-    4,
+    3,
     "every direct workflow gh API call must bind github.com explicitly",
   );
   assert.doesNotMatch(

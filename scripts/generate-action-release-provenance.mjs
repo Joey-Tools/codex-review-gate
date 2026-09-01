@@ -143,6 +143,17 @@ function fail(message) {
   throw new Error(message);
 }
 
+class GitHubAppResponseLimitError extends Error {
+  constructor(operation) {
+    super(`${operation} response exceeds the byte limit`);
+  }
+}
+
+function normalizeGitHubAppPrivateKey(privateKey) {
+  if (typeof privateKey !== "string") fail("GitHub App private key is malformed");
+  return privateKey.replace(/\\n/gu, "\n");
+}
+
 function git(repo, args, options = {}) {
   return execFileSync("git", ["-C", repo, ...args], {
     encoding: "utf8",
@@ -177,13 +188,117 @@ export function createGitHubAppJwt({ clientId, privateKey, now = Math.floor(Date
     fail("GitHub App client ID is malformed");
   }
   if (!Number.isSafeInteger(now) || now <= 0) fail("GitHub App JWT time is invalid");
-  const key = createPrivateKey(privateKey);
+  const key = createPrivateKey(normalizeGitHubAppPrivateKey(privateKey));
   if (key.asymmetricKeyType !== "rsa") fail("GitHub App private key must be RSA");
   const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
   const payload = Buffer.from(JSON.stringify({ iat: now - 60, exp: now + 540, iss: clientId })).toString("base64url");
   const unsigned = `${header}.${payload}`;
   const signature = signBytes("RSA-SHA256", Buffer.from(unsigned), key).toString("base64url");
   return `${unsigned}.${signature}`;
+}
+
+function githubAppRequestIdPresence(response) {
+  try {
+    const requestId = response?.headers?.get?.("x-github-request-id");
+    return typeof requestId === "string" && requestId.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function githubAppHttpFailureCode(status) {
+  if (status === 401) return "unauthorized";
+  if (status === 403) return "forbidden";
+  if (status === 404) return "not_found";
+  if (status >= 500) return "server_error";
+  return "unexpected_status";
+}
+
+function githubAppTransportFailureCode(error) {
+  if (error?.name === "AbortError" || error?.name === "TimeoutError") return "request_timed_out";
+  if (error?.name === "TypeError") return "network_error";
+  return "transport_error";
+}
+
+async function readGitHubAppResponseBytes(response, operation) {
+  const declaredLength = response.headers?.get?.("content-length");
+  if (declaredLength !== null && declaredLength !== undefined) {
+    if (!/^(0|[1-9][0-9]*)$/u.test(declaredLength) || Number(declaredLength) > MAX_GITHUB_APP_INSTALLATION_RESPONSE_BYTES) {
+      throw new GitHubAppResponseLimitError(operation);
+    }
+  }
+  if (typeof response.body?.getReader === "function") {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_GITHUB_APP_INSTALLATION_RESPONSE_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The established size policy remains the primary result even if
+          // best-effort stream cleanup itself fails.
+        }
+        throw new GitHubAppResponseLimitError(operation);
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, size);
+  }
+  const text = await response.text();
+  const responseBytes = Buffer.from(text);
+  if (responseBytes.byteLength > MAX_GITHUB_APP_INSTALLATION_RESPONSE_BYTES) {
+    throw new GitHubAppResponseLimitError(operation);
+  }
+  return responseBytes;
+}
+
+async function readGitHubAppJsonResponse({ endpoint, authorization, fetchImpl, operation }) {
+  let response;
+  try {
+    response = await fetchImpl(endpoint, {
+      method: "GET",
+      redirect: "error",
+      signal: AbortSignal.timeout(15_000),
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: authorization,
+        "User-Agent": "codex-review-gate-action-publisher",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+  } catch (error) {
+    fail(`${operation} request failed before an HTTP response (failure_code=${githubAppTransportFailureCode(error)})`);
+  }
+  if (!response || !Number.isInteger(response.status)) {
+    fail(`${operation} response has no valid HTTP status`);
+  }
+  if (response.status !== 200) {
+    fail(
+      `${operation} request failed (failure_code=${githubAppHttpFailureCode(response.status)}; ` +
+      `http_status=${response.status}; request_id_present=${githubAppRequestIdPresence(response)})`,
+    );
+  }
+  let responseBytes;
+  try {
+    responseBytes = await readGitHubAppResponseBytes(response, operation);
+  } catch (error) {
+    if (error instanceof GitHubAppResponseLimitError) throw error;
+    fail(`${operation} response could not be read (failure_code=response_body_unreadable)`);
+  }
+  let result;
+  try {
+    result = JSON.parse(responseBytes.toString("utf8"));
+  } catch {
+    fail(`${operation} response is not valid JSON`);
+  }
+  if (result === null || typeof result !== "object" || Array.isArray(result)) {
+    fail(`${operation} response must be a JSON object`);
+  }
+  return result;
 }
 
 export async function readGitHubAppInstallation({
@@ -197,61 +312,34 @@ export async function readGitHubAppInstallation({
     fail("GitHub App installation ID is malformed");
   }
   if (typeof fetchImpl !== "function") fail("GitHub App installation HTTP client is unavailable");
-  const jwt = createGitHubAppJwt({ clientId, privateKey, now });
-  const endpoint = `https://api.github.com/app/installations/${installationId}`;
-  const response = await fetchImpl(endpoint, {
-    method: "GET",
-    redirect: "error",
-    signal: AbortSignal.timeout(15_000),
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${jwt}`,
-      "User-Agent": "codex-review-gate-action-publisher",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
-  if (response?.status !== 200) {
-    fail(`GitHub App installation request failed with HTTP ${response?.status ?? "unknown"}`);
-  }
-  const declaredLength = response.headers?.get?.("content-length");
-  if (declaredLength !== null && declaredLength !== undefined) {
-    if (!/^(0|[1-9][0-9]*)$/u.test(declaredLength) || Number(declaredLength) > MAX_GITHUB_APP_INSTALLATION_RESPONSE_BYTES) {
-      fail("GitHub App installation response exceeds the byte limit");
-    }
-  }
-  let responseBytes;
-  if (typeof response.body?.getReader === "function") {
-    const reader = response.body.getReader();
-    const chunks = [];
-    let size = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > MAX_GITHUB_APP_INSTALLATION_RESPONSE_BYTES) {
-        await reader.cancel();
-        fail("GitHub App installation response exceeds the byte limit");
-      }
-      chunks.push(Buffer.from(value));
-    }
-    responseBytes = Buffer.concat(chunks, size);
-  } else {
-    const text = await response.text();
-    responseBytes = Buffer.from(text);
-    if (responseBytes.byteLength > MAX_GITHUB_APP_INSTALLATION_RESPONSE_BYTES) {
-      fail("GitHub App installation response exceeds the byte limit");
-    }
-  }
-  let installation;
+  let jwt;
   try {
-    installation = JSON.parse(responseBytes.toString("utf8"));
+    jwt = createGitHubAppJwt({ clientId, privateKey, now });
   } catch {
-    fail("GitHub App installation response is not valid JSON");
+    fail("GitHub App JWT generation failed (failure_code=app_jwt_invalid)");
   }
-  if (installation === null || typeof installation !== "object" || Array.isArray(installation)) {
-    fail("GitHub App installation response must be a JSON object");
+  return readGitHubAppJsonResponse({
+    endpoint: `https://api.github.com/app/installations/${installationId}`,
+    authorization: `Bearer ${jwt}`,
+    fetchImpl,
+    operation: "GitHub App installation",
+  });
+}
+
+export async function readGitHubAppInstallationRepositories({
+  installationToken,
+  fetchImpl = globalThis.fetch,
+}) {
+  if (typeof installationToken !== "string" || installationToken.length === 0 || installationToken.length > 8192) {
+    fail("GitHub App installation token is malformed");
   }
-  return installation;
+  if (typeof fetchImpl !== "function") fail("GitHub App installation HTTP client is unavailable");
+  return readGitHubAppJsonResponse({
+    endpoint: "https://api.github.com/installation/repositories",
+    authorization: `Bearer ${installationToken}`,
+    fetchImpl,
+    operation: "GitHub App installation repository scope",
+  });
 }
 
 function canonicalComparable(value) {
@@ -2964,7 +3052,14 @@ async function main(argv) {
     createOnly(resolve(required(options, "output")), canonicalJson(installation));
     return;
   }
-  fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, verify-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, or github-app-installation command");
+  if (command === "github-app-installation-repository-scope") {
+    const installationToken = process.env.RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN;
+    if (!installationToken) fail("RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN is required");
+    const repositories = await readGitHubAppInstallationRepositories({ installationToken });
+    createOnly(resolve(required(options, "output")), canonicalJson(repositories));
+    return;
+  }
+  fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, verify-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, github-app-installation, or github-app-installation-repository-scope command");
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : null;

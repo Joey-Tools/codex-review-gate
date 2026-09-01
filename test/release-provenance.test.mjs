@@ -4,6 +4,7 @@ import { createHash, generateKeyPairSync, verify as verifyBytes } from "node:cry
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -32,6 +33,7 @@ import {
   parseSemver,
   parseVerifiedOpenPgpStatus,
   readGitHubAppInstallation,
+  readGitHubAppInstallationRepositories,
   readReleaseManifest,
   validatePublicationPlan,
   validateGitHubSigningKeyInventory,
@@ -129,6 +131,21 @@ test("publisher identity preflight creates a short-lived RS256 App JWT", () => {
     ),
     false,
   );
+  const escapedNewlineToken = createGitHubAppJwt({
+    clientId,
+    privateKey: privateKey.replace(/\n/gu, "\\n"),
+    now,
+  });
+  const escapedParts = escapedNewlineToken.split(".");
+  assert.equal(
+    verifyBytes(
+      "RSA-SHA256",
+      Buffer.from(`${escapedParts[0]}.${escapedParts[1]}`),
+      publicKey,
+      Buffer.from(escapedParts[2], "base64url"),
+    ),
+    true,
+  );
 });
 
 test("publisher identity preflight requests installation detail with an in-memory Bearer JWT", async () => {
@@ -161,6 +178,290 @@ test("publisher identity preflight requests installation detail with an in-memor
   assert.match(observed.options.headers.Authorization, /^Bearer [^.]+\.[^.]+\.[^.]+$/u);
   assert.doesNotMatch(observed.options.headers.Authorization, /^token /u);
   assert.equal(observed.options.headers["X-GitHub-Api-Version"], "2022-11-28");
+});
+
+test("publisher identity preflight reports only closed HTTP diagnostics and never reads an error body", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  let issuedJwt = null;
+  let errorBodyRead = false;
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async (_url, options) => {
+        issuedJwt = options.headers.Authorization;
+        return {
+          status: 401,
+          headers: { get: (name) => name === "x-github-request-id" ? issuedJwt : null },
+          text: async () => {
+            errorBodyRead = true;
+            return JSON.stringify({
+              message: `rejected ${privateKey} ${issuedJwt} synthetic-installation-token`,
+            });
+          },
+        };
+      },
+    }),
+    (error) => {
+      assert.match(
+        error.message,
+        /failure_code=unauthorized; http_status=401; request_id_present=true/u,
+      );
+      assert.equal(error.message.includes(privateKey), false);
+      assert.equal(error.message.includes(issuedJwt), false);
+      assert.equal(error.message.includes(issuedJwt.slice("Bearer ".length)), false);
+      assert.equal(error.message.includes("synthetic-installation-token"), false);
+      return true;
+    },
+  );
+  assert.equal(errorBodyRead, false);
+});
+
+test("publisher identity preflight maps transport errors to a closed failure code", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const errorName = "synthetic-installation-token";
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => {
+        const error = new Error("not for logs");
+        error.name = errorName;
+        throw error;
+      },
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "GitHub App installation request failed before an HTTP response (failure_code=transport_error)",
+      );
+      assert.equal(error.message.includes(errorName), false);
+      return true;
+    },
+  );
+});
+
+test("publisher installation repository scope uses a closed installation-token HTTP read", async () => {
+  const installationToken = "synthetic-installation-token";
+  let observed;
+  const repositories = await readGitHubAppInstallationRepositories({
+    installationToken,
+    fetchImpl: async (url, options) => {
+      observed = { url, options };
+      return {
+        status: 200,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({
+          total_count: 1,
+          repositories: [{ full_name: "JoeyTeng/codex-review-gate-action" }],
+        }),
+      };
+    },
+  });
+  assert.deepEqual(repositories, {
+    total_count: 1,
+    repositories: [{ full_name: "JoeyTeng/codex-review-gate-action" }],
+  });
+  assert.equal(observed.url, "https://api.github.com/installation/repositories");
+  assert.equal(observed.options.headers.Authorization, `Bearer ${installationToken}`);
+
+  let errorBodyRead = false;
+  await assert.rejects(
+    readGitHubAppInstallationRepositories({
+      installationToken,
+      fetchImpl: async () => ({
+        status: 403,
+        headers: { get: (name) => name === "x-github-request-id" ? installationToken : null },
+        text: async () => {
+          errorBodyRead = true;
+          return `forbidden ${installationToken}`;
+        },
+      }),
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "GitHub App installation repository scope request failed (failure_code=forbidden; http_status=403; request_id_present=true)",
+      );
+      assert.equal(error.message.includes(installationToken), false);
+      return true;
+    },
+  );
+  assert.equal(errorBodyRead, false);
+});
+
+test("publisher installation CLI emits a closed JWT failure without creating output", () => {
+  const root = mkdtempSync(join(tmpdir(), "release-app-installation-cli-"));
+  const output = join(root, "installation.json");
+  const malformedPrivateKey = "synthetic-private-key-material";
+  try {
+    assert.throws(
+      () => execFileSync(
+        process.execPath,
+        [
+          new URL("../scripts/generate-action-release-provenance.mjs", import.meta.url).pathname,
+          "github-app-installation",
+          "--client-id", "Iv23liSyntheticPublisher",
+          "--installation-id", "12345678",
+          "--output", output,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            RELEASE_PUBLISHER_APP_PRIVATE_KEY: malformedPrivateKey,
+          },
+        },
+      ),
+      (error) => {
+        assert.equal(error.status, 1);
+        assert.equal(error.stdout, "");
+        assert.equal(error.stderr, "error: GitHub App JWT generation failed (failure_code=app_jwt_invalid)\n");
+        assert.equal(error.stderr.includes(malformedPrivateKey), false);
+        return true;
+      },
+    );
+    assert.equal(existsSync(output), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("publisher identity preflight normalizes escaped PEM newlines and closes JWT-construction failures", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const installation = await readGitHubAppInstallation({
+    clientId: "Iv23liSyntheticPublisher",
+    privateKey: privateKey.replace(/\n/gu, "\\n"),
+    installationId: "12345678",
+    now: 1_800_000_000,
+    fetchImpl: async () => ({
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ id: 12345678 }),
+    }),
+  });
+  assert.deepEqual(installation, { id: 12345678 });
+
+  const malformedPrivateKey = "synthetic-private-key-material";
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey: malformedPrivateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => {
+        throw new Error("fetch must not be called for an invalid private key");
+      },
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "GitHub App JWT generation failed (failure_code=app_jwt_invalid)",
+      );
+      assert.equal(error.message.includes(malformedPrivateKey), false);
+      return true;
+    },
+  );
+});
+
+test("publisher identity preflight maps a hostile successful-response body failure to a closed code", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const bodyFailure = new Error(`response stream rejected ${privateKey} synthetic-installation-token`);
+  bodyFailure.name = "synthetic-installation-token";
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get: () => null },
+        text: async () => { throw bodyFailure; },
+      }),
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "GitHub App installation response could not be read (failure_code=response_body_unreadable)",
+      );
+      assert.equal(error.message.includes(privateKey), false);
+      assert.equal(error.message.includes("synthetic-installation-token"), false);
+      return true;
+    },
+  );
+});
+
+test("publisher identity preflight preserves the safe response-size policy diagnostic", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  let bodyRead = false;
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get: (name) => name === "content-length" ? "1048577" : null },
+        text: async () => {
+          bodyRead = true;
+          return "{}";
+        },
+      }),
+    }),
+    /GitHub App installation response exceeds the byte limit/u,
+  );
+  assert.equal(bodyRead, false);
+
+  let cancelCalled = false;
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get: () => null },
+        body: {
+          getReader: () => ({
+            read: async () => ({ done: false, value: new Uint8Array(1_048_577) }),
+            cancel: async () => {
+              cancelCalled = true;
+              throw new Error("synthetic cancel failure");
+            },
+          }),
+        },
+      }),
+    }),
+    /GitHub App installation response exceeds the byte limit/u,
+  );
+  assert.equal(cancelCalled, true);
 });
 
 test("publisher identity preflight rejects malformed App JWT inputs", () => {
@@ -231,13 +532,41 @@ test("publisher workflow keeps App JWT and installation-token authentication cla
   const executableIdentityStep = identityLines
     .filter((line) => !line.trimStart().startsWith("#"))
     .join("\n");
+  const firstSecretCapture = identityLines.findIndex((line) =>
+    line.includes('app_private_key="$APP_PRIVATE_KEY"'));
+  assert.ok(firstSecretCapture > 0, "publisher identity step must capture the private key locally");
+  for (const command of ["set +x", "set +v", "set +a"]) {
+    const commandIndex = identityLines.findIndex((line) => line.trim() === command);
+    assert.ok(commandIndex >= 0 && commandIndex < firstSecretCapture, `${command} must precede secret capture`);
+  }
+  assert.match(identityStep, /Publisher App configuration invariant failed: expected owner JoeyTeng\./u);
+  assert.match(identityStep, /Publisher App configuration invariant failed: expected canonical publisher slug\./u);
+  assert.match(identityStep, /Publisher App token invariant failed: token app slug does not match the configured publisher slug\./u);
+  assert.match(identityStep, /Publisher App token invariant failed: token output has no valid installation ID\./u);
+  assert.match(identityStep, /Publisher App static configuration and token-output checks passed\./u);
   assert.match(identityStep, /--client-id "\$APP_CLIENT_ID"/u);
+  assert.match(identityStep, /Publisher App installation fetch starting\./u);
+  assert.match(identityStep, /Publisher App installation fetch completed\./u);
+  assert.match(identityStep, /Publisher App installation observed \(non-secret\): \$observed_installation/u);
+  assert.match(identityStep, /Publisher App installation invariant failed; inspect the non-secret observed identity above\./u);
+  assert.match(identityStep, /Publisher App installation metadata check passed\./u);
+  assert.match(identityStep, /installation_id_matches_token_output: \(\.id == \$installation_id\)/u);
+  assert.match(identityStep, /account_login_matches_configured_owner:/u);
+  assert.match(identityStep, /permission_shape_matches_expected: \(\.permissions == \{administration:"read", contents:"write", metadata:"read"\}\)/u);
+  assert.match(identityStep, /def bounded_event_count:/u);
+  assert.doesNotMatch(identityStep, /permission_keys:|events: \(if/u);
+  assert.match(identityStep, /Publisher App repository scope query starting\./u);
+  assert.match(identityStep, /github-app-installation-repository-scope[\s\S]*--output "\$repository_scope_file"/u);
+  assert.match(identityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$installation_token"/u);
+  assert.match(identityStep, /def bounded_total_count:/u);
+  assert.match(identityStep, /def first_repository_matches_target:/u);
+  assert.match(identityStep, /Publisher App repository scope observed \(non-secret\): \$observed_repository_scope/u);
+  assert.match(identityStep, /Publisher App repository scope query completed\./u);
+  assert.match(identityStep, /Publisher App repository scope invariant failed; inspect the non-secret observed scope above\./u);
+  assert.match(identityStep, /Publisher App repository scope check passed\./u);
   assert.doesNotMatch(executableIdentityStep, /app\/installations/u);
-  assert.equal([...executableIdentityStep.matchAll(/\bgh api\b/gu)].length, 1);
-  assert.match(
-    identityStep,
-    /env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$installation_token"[\s\\]*gh api --hostname github\.com installation\/repositories/u,
-  );
+  assert.doesNotMatch(executableIdentityStep, /\bgh api\b/u);
+  assert.doesNotMatch(executableIdentityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN.*GITHUB_ENV/u);
 });
 
 test("publisher workflow persists exact push admission and dispatch can only reuse that push artifact", () => {
