@@ -1457,19 +1457,27 @@ export function validatePublisherRulesets(rulesets) {
   return true;
 }
 
-function stableReleaseAssetProjection(release, { requirePublisherUploader = false } = {}) {
+function stableReleaseAssetProjection(release, {
+  allowStarterAssets = false,
+  requirePublisherUploader = false,
+} = {}) {
   if (!Array.isArray(release?.assets)) fail("GitHub Release asset snapshot must contain an assets array");
   const names = new Set();
+  const ids = new Set();
   const snapshot = release.assets.map((asset) => {
     if (
       !Number.isSafeInteger(asset.id) ||
       asset.id <= 0 ||
+      ids.has(asset.id) ||
       typeof asset.node_id !== "string" ||
       asset.node_id.length === 0 ||
       typeof asset.name !== "string" ||
       basename(asset.name) !== asset.name ||
       names.has(asset.name) ||
-      asset.state !== "uploaded" ||
+      !(
+        asset.state === "uploaded" ||
+        (allowStarterAssets && asset.state === "starter")
+      ) ||
       typeof asset.content_type !== "string" ||
       !Number.isSafeInteger(asset.size) ||
       asset.size < 0 ||
@@ -1502,6 +1510,7 @@ function stableReleaseAssetProjection(release, { requirePublisherUploader = fals
       fail(`GitHub Release asset metadata differs from policy: ${asset.name}`);
     }
     names.add(asset.name);
+    ids.add(asset.id);
     return {
       id: asset.id,
       node_id: asset.node_id,
@@ -1535,10 +1544,87 @@ export function canonicalReleaseAssetSnapshot(release) {
   }));
 }
 
+export function canonicalNeutralReleaseInventorySnapshot(pages) {
+  if (!Array.isArray(pages) || pages.length === 0 || !pages.every(Array.isArray)) {
+    fail("GitHub Release inventory must be a nonempty paginated array of arrays");
+  }
+  const releaseIds = new Set();
+  const assetIds = new Set();
+  const snapshot = pages.flat().map((release) => {
+    if (
+      release === null || typeof release !== "object" || Array.isArray(release) ||
+      release.author === null || typeof release.author !== "object" ||
+      Array.isArray(release.author) || !Array.isArray(release.assets)
+    ) {
+      fail("GitHub Release inventory shape cannot be projected safely");
+    }
+    if (Number.isSafeInteger(release.id) && release.id > 0) {
+      if (releaseIds.has(release.id)) fail(`GitHub Release inventory repeats id: ${release.id}`);
+      releaseIds.add(release.id);
+    }
+    const assets = release.assets.map((asset) => {
+      if (
+        asset === null || typeof asset !== "object" || Array.isArray(asset) ||
+        asset.uploader === null || typeof asset.uploader !== "object" ||
+        Array.isArray(asset.uploader)
+      ) {
+        fail("GitHub Release asset shape cannot be projected safely");
+      }
+      if (Number.isSafeInteger(asset.id) && asset.id > 0) {
+        if (assetIds.has(asset.id)) fail(`GitHub Release inventory repeats asset id: ${asset.id}`);
+        assetIds.add(asset.id);
+      }
+      return {
+        id: asset.id,
+        node_id: asset.node_id,
+        name: asset.name,
+        state: asset.state,
+        content_type: asset.content_type,
+        size: asset.size,
+        digest: asset.digest ?? null,
+        url: asset.url,
+        browser_download_url: asset.browser_download_url,
+        uploader: {
+          id: asset.uploader.id,
+          node_id: asset.uploader.node_id,
+          login: asset.uploader.login,
+          type: asset.uploader.type,
+        },
+      };
+    });
+    assets.sort((left, right) => Buffer.from(canonicalJson(left)).compare(
+      Buffer.from(canonicalJson(right)),
+    ));
+    return {
+      id: release.id,
+      node_id: release.node_id,
+      tag_name: release.tag_name,
+      name: release.name,
+      body: release.body,
+      target_commitish: release.target_commitish,
+      prerelease: release.prerelease,
+      draft: release.draft,
+      immutable: release.immutable,
+      author: {
+        id: release.author.id,
+        node_id: release.author.node_id,
+        login: release.author.login,
+        type: release.author.type,
+      },
+      assets,
+    };
+  });
+  snapshot.sort((left, right) => Buffer.from(canonicalJson(left)).compare(
+    Buffer.from(canonicalJson(right)),
+  ));
+  return canonicalJson(snapshot);
+}
+
 export function canonicalReleaseInventorySnapshot(pages) {
   if (!Array.isArray(pages) || !pages.every(Array.isArray)) {
     fail("GitHub Release inventory must be a paginated array of arrays");
   }
+  const allAssetIds = new Set();
   const snapshot = pages.flat().map((release) => {
     if (
       !Number.isSafeInteger(release?.id) || release.id <= 0 ||
@@ -1557,6 +1643,14 @@ export function canonicalReleaseInventorySnapshot(pages) {
     ) {
       fail(`GitHub Release inventory metadata is malformed: ${release?.tag_name ?? "<unknown>"}`);
     }
+    const assets = stableReleaseAssetProjection(release, { allowStarterAssets: true })
+      .map(({ created_at: _createdAt, updated_at: _updatedAt, ...asset }) => asset);
+    for (const asset of assets) {
+      if (allAssetIds.has(asset.id)) {
+        fail(`GitHub Release inventory repeats asset id: ${asset.id}`);
+      }
+      allAssetIds.add(asset.id);
+    }
     return {
       id: release.id,
       node_id: release.node_id,
@@ -1573,7 +1667,7 @@ export function canonicalReleaseInventorySnapshot(pages) {
         login: release.author.login,
         type: release.author.type,
       },
-      assets: stableReleaseAssetProjection(release),
+      assets,
     };
   });
   snapshot.sort((left, right) =>
@@ -1589,6 +1683,7 @@ export function canonicalReleaseBoundarySnapshot(release, {
   prerelease,
   draft,
   immutable,
+  allowStarterAssets = false,
 }) {
   if (
     !Number.isSafeInteger(release?.id) || release.id <= 0 ||
@@ -1607,6 +1702,10 @@ export function canonicalReleaseBoundarySnapshot(release, {
   ) {
     fail("GitHub Release boundary metadata or author differs from policy");
   }
+  const assets = stableReleaseAssetProjection(release, {
+    allowStarterAssets,
+    requirePublisherUploader: true,
+  }).map(({ created_at: _createdAt, updated_at: _updatedAt, ...asset }) => asset);
   return canonicalJson({
     release: {
       id: release.id,
@@ -1625,7 +1724,7 @@ export function canonicalReleaseBoundarySnapshot(release, {
         type: release.author.type,
       },
     },
-    assets: JSON.parse(canonicalReleaseAssetSnapshot(release)),
+    assets,
   });
 }
 
@@ -2805,9 +2904,10 @@ async function main(argv) {
     return;
   }
   if (command === "snapshot-release-inventory") {
-    process.stdout.write(canonicalReleaseInventorySnapshot(
-      readJson(resolve(required(options, "input"))),
-    ));
+    const pages = readJson(resolve(required(options, "input")));
+    process.stdout.write(options.neutral === "true"
+      ? canonicalNeutralReleaseInventorySnapshot(pages)
+      : canonicalReleaseInventorySnapshot(pages));
     return;
   }
   if (command === "snapshot-release-boundary") {
@@ -2819,6 +2919,7 @@ async function main(argv) {
         prerelease: required(options, "prerelease") === "true",
         draft: required(options, "draft") === "true",
         immutable: required(options, "immutable") === "true",
+        allowStarterAssets: options["allow-starter"] === "true",
       },
     ));
     return;

@@ -194,6 +194,13 @@ test("qualifying +1 is strict, head-bound, and vetoed by same-or-later eyes", ()
   ]]]));
   assert.equal(vetoed.artifacts.length, 0);
   assert.equal(vetoed.livenessVetoed, true);
+
+  const globallyDuplicated = buildV2ReactionCleanArtifacts(requests, new Map([
+    ["101", [reaction({ id: 205, created_at: "2026-08-25T08:01:00Z" })]],
+    ["102", [reaction({ id: 205, created_at: "2026-08-25T08:02:00Z" })]],
+  ]));
+  assert.equal(globallyDuplicated.artifacts.length, 0);
+  assert.match(globallyDuplicated.errors[0], /identity 205 appears more than once/u);
   assert.equal(canonicalV2RequestComments([ordinaryRequest()]).length, 0);
 });
 
@@ -253,13 +260,34 @@ test("pull_request verifier publishes exact outputs and succeeds only for stable
   assert.match(summary, /0 unresolved, 0 resolved, 0 historical, 0 indeterminate/u);
   assert.match(summary, new RegExp(TEST_MERGE, "u"));
   assert.equal(github.stickyCreates.length, 0);
-  const baseEpochCalls = github.calls.filter(({ path }) => path === "/graphql");
+  const baseEpochCalls = github.calls.filter(({ path, body }) =>
+    path === "/graphql" && body?.query?.includes("CodexReviewGateBaseEpoch")
+  );
   assert.equal(baseEpochCalls.length, 4);
   for (const { body } of baseEpochCalls) {
     assert.deepEqual(body.variables, { owner: OWNER, repo: REPO, number: PR });
     assert.match(body.query, /BASE_REF_CHANGED_EVENT/u);
     assert.match(body.query, /BASE_REF_FORCE_PUSHED_EVENT/u);
     assert.match(body.query, /timelineItems\(\s*last: 1/su);
+  }
+  const deletedCommentCalls = github.calls.filter(({ path, body }) =>
+    path === "/graphql" && body?.query?.includes("CodexReviewGateDeletedComments")
+  );
+  assert.equal(deletedCommentCalls.length, 4);
+  for (const { body } of deletedCommentCalls) {
+    assert.deepEqual(body.variables, {
+      owner: OWNER,
+      repo: REPO,
+      number: PR,
+      cursor: null,
+      commentCursor: null,
+      includeDeleted: true,
+      includeComments: true,
+    });
+    assert.match(body.query, /totalCount/u);
+    assert.match(body.query, /databaseId:\s*fullDatabaseId/u);
+    assert.match(body.query, /\bbody\b/u);
+    assert.match(body.query, /lastEditedAt/u);
   }
 });
 
@@ -288,7 +316,7 @@ test("output persistence failure leaves one authoritative unhealthy summary", as
 
 test("output failure preserves a proven finding verdict and recovery", async (context) => {
   const github = createGitHubMock({
-    issueComments: [ordinaryRequest(), findingIssueComment(HEAD)],
+    issueComments: [ordinaryRequest({ user: READER }), findingIssueComment(HEAD)],
   });
   const environment = runtimeEnvironment(context, {
     suffix: "finding-output-persistence-failure",
@@ -302,6 +330,7 @@ test("output failure preserves a proven finding verdict and recovery", async (co
   assert.equal(result.report.gateOutcome, "failure");
   assert.equal(result.report.recoveryCode, "fix_findings");
   assert.equal(result.report.retrySafe, false);
+  assert.equal(result.report.requiresReplacementPr, true);
   assert.deepEqual(result.report.counts, {
     unresolved: 1,
     resolved: 0,
@@ -316,7 +345,43 @@ test("output failure preserves a proven finding verdict and recovery", async (co
   assert.match(summary, /Recovery code: `fix_findings`/u);
   assert.match(summary, /1 unresolved, 0 resolved, 0 historical, 0 indeterminate/u);
   assert.match(summary, /Fix the unresolved Codex findings/iu);
+  assert.match(summary, /replacement PR/iu);
   assert.match(summary, /Failed to persist the v2 gate report/iu);
+});
+
+test("output failure preserves replacement-required pending lineage", async (context) => {
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), generationB],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 652,
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-replacement-output-persistence-failure",
+  });
+  mkdirSync(environment.GITHUB_OUTPUT);
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "unknown");
+  assert.equal(result.report.recoveryCode, "repair_permissions");
+  assert.equal(result.report.retrySafe, false);
+  assert.equal(result.report.requiresReplacementPr, true);
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /Failed to persist the v2 gate report/iu);
+  assert.match(summary, /do not add another review boundary on the original PR/iu);
+  assert.match(summary, /requires a replacement PR/iu);
+  assert.match(summary, /exactly one canonical review generation/iu);
 });
 
 test("the JavaScript Action reads INPUT_* values without composite env bridging", async (context) => {
@@ -582,10 +647,237 @@ test("latest base-ref timeline epoch invalidates older positive evidence on the 
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
     assert.equal(
       github.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
-      false,
-      `${suffix}: ordinary requests are not generations after a base epoch`,
+      true,
+      `${suffix}: pre-epoch ordinary request reactions remain negative liveness evidence`,
     );
   }
+});
+
+test("same-second base-epoch requests remain physical without gaining positive authority", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const physicalOnlyAtEpoch = ordinaryRequest({
+    id: 101,
+    user: ACTIONS_BOT,
+    created_at: epoch.createdAt,
+    updated_at: epoch.createdAt,
+  });
+  const ambiguousGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [physicalOnlyAtEpoch, generationB],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 500,
+      created_at: "2026-08-25T08:11:00Z",
+    })]]]),
+  });
+  const ambiguousEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-same-second-physical-only",
+  });
+  const { result: ambiguous } = await runGate(ambiguousEnvironment, ambiguousGitHub);
+  assert.equal(ambiguous.exitCode, 1);
+  assert.equal(ambiguous.report.gateOutcome, "pending");
+  assert.equal(ambiguous.report.recoveryCode, "request_clean_generation");
+  assert.match(ambiguous.report.reason, /earlier request 101.*newer request 102/iu);
+  assert.equal(ambiguousGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const canonicalAtEpoch = workflowRequest({
+    id: 101,
+    created_at: epoch.createdAt,
+    updated_at: epoch.createdAt,
+  });
+  const historicallyClosedGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [canonicalAtEpoch, generationB],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 501, created_at: "2026-08-25T08:06:00Z" })]],
+      ["102", [reaction({ id: 502, created_at: "2026-08-25T08:11:00Z" })]],
+    ]),
+  });
+  const historicallyClosedEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-same-second-historical-direct-closure",
+  });
+  const { result: historicallyClosed } = await runGate(
+    historicallyClosedEnvironment,
+    historicallyClosedGitHub,
+  );
+  assert.equal(historicallyClosed.exitCode, 0);
+  assert.equal(historicallyClosed.report.gateOutcome, "success");
+  assert.match(historicallyClosed.report.reason, /request-reaction 502/u);
+  assert.equal(
+    historicallyClosedGitHub.calls.some(({ path }) =>
+      path.endsWith("/comments/101/reactions")
+    ),
+    true,
+  );
+});
+
+test("a pre-epoch same-head request can veto a later direct clean with post-epoch eyes", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const scenarios = [
+    ["canonical-before-clean", workflowRequest({
+      id: 101,
+      created_at: "2026-08-25T08:04:00Z",
+      updated_at: "2026-08-25T08:04:00Z",
+    }), "2026-08-25T08:10:30Z", 510],
+    ["canonical-after-clean", workflowRequest({
+      id: 101,
+      created_at: "2026-08-25T08:04:00Z",
+      updated_at: "2026-08-25T08:04:00Z",
+    }), "2026-08-25T08:12:00Z", 512],
+    ["ordinary-before-clean", ordinaryRequest({
+      id: 101,
+      created_at: "2026-08-25T08:04:00Z",
+      updated_at: "2026-08-25T08:04:00Z",
+    }), "2026-08-25T08:10:30Z", 514],
+  ];
+  for (const [suffix, generationA, eyesAt, eyesId] of scenarios) {
+    const github = createGitHubMock({
+      baseEpoch: epoch,
+      issueComments: [generationA, generationB],
+      reactionsByCommentId: new Map([
+        ["101", [reaction({
+          id: eyesId,
+          content: "eyes",
+          created_at: eyesAt,
+        })]],
+        ["102", [reaction({
+          id: eyesId + 1,
+          created_at: "2026-08-25T08:11:00Z",
+        })]],
+      ]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `pre-epoch-request-post-epoch-eyes-veto-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_provider", suffix);
+    assert.match(result.report.reason, /review is still in progress/iu, suffix);
+    assert.equal(
+      github.calls.some(({ path }) => path.endsWith("/comments/101/reactions")),
+      true,
+      `${suffix}: pre-epoch requests retain a complete post-epoch liveness inventory`,
+    );
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
+test("duplicate reaction identities across pre-epoch and current inventories block", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const preEpoch = ordinaryRequest({
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+  });
+  const current = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [preEpoch, current],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({
+        id: 520,
+        content: "eyes",
+        created_at: "2026-08-25T08:09:00Z",
+      })]],
+      ["102", [reaction({ id: 520, created_at: "2026-08-25T08:11:00Z" })]],
+    ]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "global-reaction-identity-duplicate",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /repeated official Codex identity 520/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a cross-request +1 tied with the selected clean cannot settle older eyes", async (context) => {
+  const generationA = workflowRequest();
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    issueComments: [generationA, generationB],
+    reactionsByCommentId: new Map([
+      ["101", [
+        reaction({ id: 521, created_at: "2026-08-25T08:01:00Z" }),
+        reaction({ id: 522, content: "eyes", created_at: "2026-08-25T08:02:30Z" }),
+        reaction({ id: 523, created_at: "2026-08-25T08:03:00Z" }),
+      ]],
+      ["102", [reaction({ id: 524, created_at: "2026-08-25T08:03:00Z" })]],
+    ]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "cross-request-plus-one-tied-with-clean",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.match(result.report.reason, /review is still in progress/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("the only canonical request at the base epoch cannot gain authority from its own +1", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const request = workflowRequest({
+    created_at: epoch.createdAt,
+    updated_at: epoch.createdAt,
+  });
+  const github = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [request],
+    reactionsByCommentId: new Map([["101", [reaction({
+      id: 512,
+      created_at: "2026-08-25T08:06:00Z",
+    })]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "only-canonical-request-at-base-epoch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.requiresReplacementPr, false);
+  assert.match(result.report.reason, /strictly newer than base epoch/iu);
+  assert.equal(
+    github.calls.some(({ path }) => path.endsWith("/comments/101/reactions")),
+    true,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("after a base epoch only a direct canonical-request +1 can recover clean", async (context) => {
@@ -644,6 +936,253 @@ test("after a base epoch only a direct canonical-request +1 can recover clean", 
   const { result: recovered } = await runGate(reactionEnvironment, reactionGitHub);
   assert.equal(recovered.report.gateOutcome, "success");
   assert.match(recovered.report.reason, /request-reaction/u);
+
+  const nextGeneration = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const firstGenerationTerminal = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:11:00Z",
+    updated_at: "2026-08-25T08:11:00Z",
+  });
+  const providerGapAfterEpochGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation, firstGenerationTerminal, nextGeneration],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 503,
+      created_at: "2026-08-25T08:15:00Z",
+    })]]]),
+  });
+  const providerGapAfterEpochEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-provider-terminal-cannot-close-first-gap",
+  });
+  const { result: providerGapAfterEpoch } = await runGate(
+    providerGapAfterEpochEnvironment,
+    providerGapAfterEpochGitHub,
+  );
+  assert.equal(providerGapAfterEpoch.exitCode, 1);
+  assert.equal(providerGapAfterEpoch.report.gateOutcome, "pending");
+  assert.equal(providerGapAfterEpoch.report.recoveryCode, "request_clean_generation");
+  assert.match(providerGapAfterEpoch.report.reason, /earlier request 101.*newer request 102/iu);
+  assert.equal(
+    providerGapAfterEpochGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const directChainAfterEpochGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation, firstGenerationTerminal, nextGeneration],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 504, created_at: "2026-08-25T08:11:30Z" })]],
+      ["102", [reaction({ id: 505, created_at: "2026-08-25T08:15:00Z" })]],
+    ]),
+  });
+  const directChainAfterEpochEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-all-generations-directly-closed",
+  });
+  const { result: directChainAfterEpoch } = await runGate(
+    directChainAfterEpochEnvironment,
+    directChainAfterEpochGitHub,
+  );
+  assert.equal(directChainAfterEpoch.exitCode, 0);
+  assert.equal(directChainAfterEpoch.report.gateOutcome, "success");
+  assert.match(directChainAfterEpoch.report.reason, /request-reaction 505/u);
+
+  const ordinaryBoundary = ordinaryRequest({
+    id: 102,
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const crossedBoundaryGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation, ordinaryBoundary],
+    reactionsByCommentId: new Map([[String(generation.id), [reaction({
+      id: 502,
+      created_at: "2026-08-25T08:15:00Z",
+    })]]]),
+  });
+  const crossedBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-direct-reaction-after-ordinary-boundary",
+  });
+  const { result: crossedBoundary } = await runGate(
+    crossedBoundaryEnvironment,
+    crossedBoundaryGitHub,
+  );
+  assert.equal(crossedBoundary.report.gateOutcome, "pending");
+  assert.equal(crossedBoundary.report.recoveryCode, "request_clean_generation");
+  assert.match(crossedBoundary.report.reason, /newer request 102 already existed/iu);
+  assert.equal(
+    crossedBoundaryGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+});
+
+test("same-head old-base requests remain physical after a base epoch without positive authority", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const generationA = workflowRequest({
+    id: 101,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const oldBaseGeneration = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, {
+      baseSha: OLD_HEAD,
+      baseRef: "release",
+      baseRepositoryId: "999",
+      runId: "124",
+    }),
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const generationC = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: "2026-08-25T08:14:00Z",
+    updated_at: "2026-08-25T08:14:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+
+  const unclosedGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generationA, oldBaseGeneration, generationC],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 560, created_at: "2026-08-25T08:11:00Z" })]],
+      ["103", [reaction({ id: 562, created_at: "2026-08-25T08:15:00Z" })]],
+    ]),
+  });
+  const unclosedEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-old-base-physical-gap",
+  });
+  const { result: unclosed } = await runGate(unclosedEnvironment, unclosedGitHub);
+  assert.equal(unclosed.exitCode, 1);
+  assert.equal(unclosed.report.gateOutcome, "pending");
+  assert.equal(unclosed.report.recoveryCode, "request_clean_generation");
+  assert.match(unclosed.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(
+    unclosedGitHub.calls.some(({ path }) => path.endsWith("/comments/102/reactions")),
+    true,
+    "the authorized same-head old-base request needs a complete reaction inventory",
+  );
+
+  const historicalClosureGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generationA, oldBaseGeneration, generationC],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 560, created_at: "2026-08-25T08:11:00Z" })]],
+      ["102", [reaction({ id: 561, created_at: "2026-08-25T08:13:00Z" })]],
+      ["103", [reaction({ id: 562, created_at: "2026-08-25T08:15:00Z" })]],
+    ]),
+  });
+  const historicalClosureEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-old-base-historical-closure",
+  });
+  const { result: historicalClosure } = await runGate(
+    historicalClosureEnvironment,
+    historicalClosureGitHub,
+  );
+  assert.equal(historicalClosure.exitCode, 0);
+  assert.equal(historicalClosure.report.gateOutcome, "success");
+  assert.match(historicalClosure.report.reason, /request-reaction 562/u);
+
+  const lateHistoricalEyesGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generationA, oldBaseGeneration, generationC],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 560, created_at: "2026-08-25T08:11:00Z" })]],
+      ["102", [
+        reaction({ id: 561, created_at: "2026-08-25T08:13:00Z" }),
+        reaction({
+          id: 563,
+          content: "eyes",
+          created_at: "2026-08-25T08:16:00Z",
+        }),
+      ]],
+      ["103", [reaction({ id: 562, created_at: "2026-08-25T08:15:00Z" })]],
+    ]),
+  });
+  const lateHistoricalEyesEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-old-base-late-eyes",
+  });
+  const { result: lateHistoricalEyes } = await runGate(
+    lateHistoricalEyesEnvironment,
+    lateHistoricalEyesGitHub,
+  );
+  assert.equal(lateHistoricalEyes.exitCode, 1);
+  assert.equal(lateHistoricalEyes.report.gateOutcome, "pending");
+  assert.equal(lateHistoricalEyes.report.recoveryCode, "wait_provider");
+  assert.match(lateHistoricalEyes.report.reason, /review is still in progress/u);
+  assert.equal(
+    lateHistoricalEyesGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const noAuthorityGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generationA, oldBaseGeneration],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 560, created_at: "2026-08-25T08:11:00Z" })]],
+      ["102", [reaction({ id: 561, created_at: "2026-08-25T08:13:00Z" })]],
+    ]),
+  });
+  const noAuthorityEnvironment = runtimeEnvironment(context, {
+    suffix: "base-epoch-old-base-no-positive-authority",
+  });
+  const { result: noAuthority } = await runGate(noAuthorityEnvironment, noAuthorityGitHub);
+  assert.equal(noAuthority.exitCode, 1);
+  assert.equal(noAuthority.report.gateOutcome, "pending");
+  assert.equal(noAuthority.report.recoveryCode, "request_clean_generation");
+  assert.equal(noAuthority.report.requiresReplacementPr, false);
+  assert.equal(noAuthorityGitHub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("same-head stale-base requests preserve a physical gap without a base epoch", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const staleBaseGeneration = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, {
+      baseSha: OLD_HEAD,
+      baseRef: "release",
+      baseRepositoryId: "999",
+      runId: "124",
+    }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const generationC = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const github = createGitHubMock({
+    issueComments: [generationA, staleBaseGeneration, generationC],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 520, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 522, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "no-epoch-stale-base-physical-gap",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.match(result.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(
+    github.calls.some(({ path }) => path.endsWith("/comments/102/reactions")),
+    true,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("base-bound workflow markers do not cross base commit epochs", async (context) => {
@@ -681,6 +1220,1795 @@ test("a base epoch change between complete reads cannot publish success", async 
   const environment = runtimeEnvironment(context, { suffix: "base-epoch-snapshot-change" });
   const { result } = await runGate(environment, github, { stabilityWindowMs: 3 });
   assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a base epoch observed in a failed snapshot must reappear or advance before stability recovers", async (context) => {
+  const epochE = baseRefChangedEvent({
+    id: "BRE_failed_snapshot_E",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const epochF = baseRefForcePushedEvent({
+    id: "BRFPE_failed_snapshot_F",
+    createdAt: "2026-08-25T07:30:00Z",
+  });
+  for (const [suffix, baseEpochSequence, shouldSucceed] of [
+    ["missing", [epochE, null, null], false],
+    ["reappears", [epochE, null, epochE, epochE], true],
+    ["strictly-newer", [epochE, epochF, epochF], true],
+    ["older-then-reappears", [epochF, epochE, epochF, epochF], true],
+  ]) {
+    let reviewReads = 0;
+    const github = createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      baseEpochSequence,
+      requestInterceptor: ({ method, path }) => {
+        if (
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/pulls/${PR}/reviews` &&
+          reviewReads++ === 0
+        ) {
+          return jsonResponse({ message: "synthetic sibling carrier failure" }, 502);
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `failed-snapshot-base-epoch-${suffix}`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 8,
+    });
+
+    if (shouldSucceed) {
+      assert.equal(result.exitCode, 0, suffix);
+      assert.equal(result.report.executionHealth, "healthy", suffix);
+      assert.equal(result.report.gateOutcome, "success", suffix);
+      assert.equal(result.report.recoveryCode, "none", suffix);
+    } else {
+      assert.equal(result.exitCode, 1, suffix);
+      assert.equal(result.report.executionHealth, "unhealthy", suffix);
+      assert.equal(result.report.gateOutcome, "pending", suffix);
+      assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+      assert.match(
+        result.report.reason,
+        /base-epoch (?:filteredCount decreased|event .*disappeared)/iu,
+        suffix,
+      );
+      assert.equal(
+        github.statusWrites.some(({ state }) => state === "success"),
+        false,
+        suffix,
+      );
+    }
+  }
+});
+
+test("base-epoch identity conflicts permanently poison the run", async (context) => {
+  const epoch = baseRefChangedEvent({
+    id: "BRE_failed_snapshot_changed",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const changed = {
+    ...epoch,
+    currentRefName: "conflicting-base-ref",
+  };
+  const ambiguous = baseRefForcePushedEvent({
+    id: "BRFPE_failed_snapshot_ambiguous",
+    createdAt: epoch.createdAt,
+  });
+  for (const [suffix, conflict, expectedReason] of [
+    ["fingerprint-change", changed,
+      /previously observed base-epoch event BRE_failed_snapshot_changed changed/iu],
+    ["ambiguous-order", ambiguous,
+      /base-epoch events .* have ambiguous ordering/iu],
+  ]) {
+    let reviewReads = 0;
+    const github = createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      baseEpochSequence: [epoch, conflict, epoch, epoch],
+      requestInterceptor: ({ method, path }) => {
+        if (
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/pulls/${PR}/reviews` &&
+          reviewReads++ === 0
+        ) {
+          return jsonResponse({ message: "synthetic sibling carrier failure" }, 502);
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `failed-snapshot-base-epoch-${suffix}`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 6,
+    });
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
+test("a deleted-comment inventory change can stabilize only as pending", async (context) => {
+  for (const [suffix, deletedCommentAuthor] of [
+    ["user", { __typename: "User", login: HUMAN.login }],
+    ["github-actions", { __typename: "Bot", login: ACTIONS_BOT.login }],
+  ]) {
+    const deleted = deletedCommentEvent({
+      id: `CDE_dynamic_${suffix}`,
+      deletedCommentAuthor,
+    });
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+      deletedCommentEventSnapshots: [[], [deleted], [deleted], [deleted]],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `deleted-comment-snapshot-change-${suffix}`,
+    });
+    const { result, sleeps } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.match(result.report.reason, new RegExp(`deleted:CDE_dynamic_${suffix}`, "iu"), suffix);
+    assert.deepEqual(sleeps, [1], suffix);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
+test("a pre-epoch deletion does not force replacement after a new request-bound clean", async (context) => {
+  const epoch = baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" });
+  const generation = workflowRequest({
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const github = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generation],
+    reviews: [findingReview(HEAD, {
+      id: 401,
+      submitted_at: "2026-08-25T08:11:00Z",
+    })],
+    reactionsByCommentId: new Map([["101", [reaction({
+      id: 531,
+      created_at: "2026-08-25T08:12:00Z",
+    })]]]),
+    deletedCommentEvents: [deletedCommentEvent({
+      id: "CDE_pre_epoch",
+      createdAt: "2026-08-25T07:00:00Z",
+    })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pre-epoch-deletion-does-not-force-replacement",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.equal(result.report.counts.unresolved, 1);
+  assert.equal(result.report.requiresReplacementPr, false);
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /Fix the unresolved Codex findings/u);
+  assert.match(summary, /request a new review generation/iu);
+  assert.doesNotMatch(summary, /replacement PR/iu);
+});
+
+test("a temporarily missing deleted-comment identity can recover in a complete stable inventory", async (context) => {
+  const deleted = deletedCommentEvent({
+    id: "CDE_restored_A",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const replacement = deletedCommentEvent({
+    id: "CDE_restored_B",
+    createdAt: "2026-08-25T07:01:00Z",
+  });
+  const github = createGitHubMock({
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T07:30:00Z" }),
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentEventSnapshots: [
+      [deleted],
+      [replacement],
+      [deleted, replacement],
+      [deleted, replacement],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "deleted-comment-restored-stable-inventory",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 6,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+});
+
+test("a continuously missing deleted-comment identity prevents a stable snapshot", async (context) => {
+  const deleted = deletedCommentEvent({
+    id: "CDE_irreversible",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const replacement = deletedCommentEvent({
+    id: "CDE_replacement",
+    createdAt: "2026-08-25T07:01:00Z",
+  });
+  const github = createGitHubMock({
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T07:30:00Z" }),
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentEventSnapshots: [
+      [deleted],
+      [replacement],
+      [replacement],
+      [replacement],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "deleted-comment-cannot-disappear",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /CDE_irreversible.*disappeared/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a changed fingerprint for the same deleted-comment identity permanently poisons the run", async (context) => {
+  const deleted = deletedCommentEvent({
+    id: "CDE_changed_fingerprint",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const changed = {
+    ...deleted,
+    actor: { __typename: "User", login: "conflicting-actor" },
+  };
+  const github = createGitHubMock({
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T07:30:00Z" }),
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentEventSnapshots: [
+      [deleted],
+      [changed],
+      [deleted],
+      [deleted],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "deleted-comment-fingerprint-change-poison",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /deleted-comment (?:event CDE_changed_fingerprint actor|event CDE_changed_fingerprint changed)/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a deleted event seen before a later pagination failure remains latched", async (context) => {
+  const first = deletedCommentEvent({ id: "CDE_partial_page_1" });
+  const second = deletedCommentEvent({
+    id: "CDE_partial_page_2",
+    createdAt: "2026-08-25T08:03:00Z",
+  });
+  const replacement = deletedCommentEvent({
+    id: "CDE_partial_page_replacement",
+    createdAt: "2026-08-25T08:04:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    deletedCommentEventSnapshots: [
+      [first, second],
+      [first, replacement],
+      [first, replacement],
+      [first, replacement],
+    ],
+    deletedCommentPageSize: 1,
+    deletedCommentResponseMutator: (response, { cursor, snapshotIndex }) => {
+      if (snapshotIndex !== 0 || cursor !== "deleted-comment:1") return response;
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.timelineItems;
+      connection.pageInfo = {
+        hasNextPage: true,
+        endCursor: null,
+      };
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "partial-deleted-comment-page-latch",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /CDE_partial_page_2.*disappeared/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an incomplete deleted-comment page permanently latches its observed inventory lower bound", async (context) => {
+  const first = deletedCommentEvent({ id: "CDE_count_floor_1" });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    deletedCommentEventSnapshots: [[first], [first], [first]],
+    deletedCommentPageSize: 1,
+    deletedCommentResponseMutator: (response, { cursor, snapshotIndex }) => {
+      if (snapshotIndex !== 0 || cursor !== null) return response;
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.timelineItems;
+      connection.totalCount = 2;
+      connection.filteredCount = 2;
+      connection.pageInfo = {
+        hasNextPage: true,
+        endCursor: "deleted-comment:1",
+      };
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "partial-deleted-comment-count-floor",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /deleted-comment inventory lower bound decreased from 2 to 1/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a later deletion page latches its consumed-plus-remaining inventory lower bound", async (context) => {
+  const first = deletedCommentEvent({ id: "CDE_later_floor_1" });
+  const second = deletedCommentEvent({
+    id: "CDE_later_floor_2",
+    createdAt: "2026-08-25T08:03:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    deletedCommentEventSnapshots: [
+      [first, second],
+      [first, second],
+      [first, second],
+      [first, second],
+    ],
+    deletedCommentPageSize: 1,
+    deletedCommentResponseMutator: (response, { cursor, snapshotIndex }) => {
+      if (snapshotIndex !== 0 || cursor !== "deleted-comment:1") return response;
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.timelineItems;
+      connection.totalCount = 3;
+      connection.filteredCount = 2;
+      connection.pageInfo = {
+        hasNextPage: true,
+        endCursor: "deleted-comment:2",
+      };
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "later-page-deleted-comment-count-floor",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /deleted-comment inventory lower bound decreased from 3 to 2/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an identity-less malformed deleted event cannot be forgotten when its count drops", async (context) => {
+  const malformed = deletedCommentEvent({ id: null });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentEventSnapshots: [[malformed], [], [], []],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "malformed-deleted-event-cannot-disappear",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /deleted-comment inventory lower bound decreased from 1 to 0/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("deleted-comment ordering is stable for distinct locale-equivalent IDs", async (context) => {
+  const composed = deletedCommentEvent({ id: "é" });
+  const decomposed = deletedCommentEvent({ id: "e\u0301" });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    deletedCommentEventSnapshots: [
+      [composed, decomposed],
+      [decomposed, composed],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "deleted-comment-strict-id-order",
+  });
+  const { result, sleeps } = await runGate(environment, github, {
+    stabilityWindowMs: 1,
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.deepEqual(sleeps, []);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("deleted-comment GraphQL pagination preserves a second-page boundary", async (context) => {
+  const old = deletedCommentEvent({
+    id: "CDE_old",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const late = deletedCommentEvent({
+    id: "CDE_late",
+    createdAt: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction({
+      id: 530,
+      created_at: "2026-08-25T08:01:00Z",
+    })]]]),
+    deletedCommentEvents: [old, late],
+    deletedCommentPageSize: 1,
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "deleted-comment-second-page",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.match(result.report.reason, /deleted:CDE_late/iu);
+  const calls = github.calls.filter(({ path, body }) =>
+    path === "/graphql" && body?.query?.includes("CodexReviewGateDeletedComments")
+  );
+  assert.equal(calls.every(({ body }) => body.query.includes("totalCount")), true);
+  assert.deepEqual(calls.map(({ body }) => body.variables.cursor), [
+    null,
+    "deleted-comment:1",
+    null,
+    "deleted-comment:1",
+  ]);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("deleted-comment inventory uses filteredCount independently of timeline totalCount", async (context) => {
+  const filteredCounts = [];
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentResponseMutator: (response) => {
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.timelineItems;
+      connection.totalCount = 12;
+      filteredCounts.push(connection.filteredCount);
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "timeline-total-independent-from-deletions",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.deepEqual(filteredCounts, [0, 0, 0, 0]);
+});
+
+test("deleted-comment pagination consumes decreasing filteredCount with stable timeline total", async (context) => {
+  const events = [
+    deletedCommentEvent({ id: "CDE_filtered_1" }),
+    deletedCommentEvent({ id: "CDE_filtered_2", createdAt: "2026-08-25T08:03:00Z" }),
+  ];
+  const observedPages = [];
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    deletedCommentEvents: events,
+    deletedCommentPageSize: 1,
+    deletedCommentResponseMutator: (response, { cursor }) => {
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.timelineItems;
+      connection.totalCount = 12;
+      observedPages.push([cursor, connection.filteredCount, connection.pageCount]);
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "deletion-filtered-count-decreases",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.deepEqual(observedPages, [
+    [null, 2, 1],
+    ["deleted-comment:1", 1, 1],
+    [null, 2, 1],
+    ["deleted-comment:1", 1, 1],
+  ]);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("deleted-comment pagination rejects cross-page timeline totalCount drift", async (context) => {
+  const events = [
+    deletedCommentEvent({ id: "CDE_timeline_total_1" }),
+    deletedCommentEvent({ id: "CDE_timeline_total_2", createdAt: "2026-08-25T08:03:00Z" }),
+  ];
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    deletedCommentEvents: events,
+    deletedCommentPageSize: 1,
+    deletedCommentResponseMutator: (response, { cursor }) => {
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.timelineItems.totalCount =
+        cursor === null ? 12 : 13;
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "deletion-timeline-total-drift",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /timeline total count changed/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("deleted-comment pagination rejects duplicate events and cursor loops", async (context) => {
+  const events = [
+    deletedCommentEvent({ id: "CDE_page_1" }),
+    deletedCommentEvent({ id: "CDE_page_2", createdAt: "2026-08-25T08:03:00Z" }),
+    deletedCommentEvent({ id: "CDE_page_3", createdAt: "2026-08-25T08:04:00Z" }),
+  ];
+  const cases = [
+    ["duplicate-event", (response, { cursor }) => {
+      if (cursor !== "deleted-comment:1") return response;
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.timelineItems.nodes = [structuredClone(events[0])];
+      return mutated;
+    }, /appeared more than once/iu],
+    ["cursor-loop", (response, { cursor }) => {
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.timelineItems;
+      if (cursor === null) {
+        connection.pageInfo.endCursor = "deleted-comment:loop";
+      } else if (cursor === "deleted-comment:loop") {
+        connection.filteredCount = 2;
+        connection.nodes = [structuredClone(events[1])];
+        connection.pageCount = 1;
+        connection.pageInfo = {
+          hasNextPage: true,
+          endCursor: "deleted-comment:loop",
+        };
+      }
+      return mutated;
+    }, /repeated a cursor/iu],
+  ];
+  for (const [suffix, mutate, expectedReason] of cases) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+      deletedCommentEvents: events,
+      deletedCommentPageSize: 1,
+      deletedCommentResponseMutator: mutate,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `deleted-comment-pagination-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("incomplete deleted-comment GraphQL connections fail closed", async (context) => {
+  const cases = [
+    ["total-count", (connection) => { delete connection.totalCount; }],
+    ["filtered-count", (connection) => { delete connection.filteredCount; }],
+    ["page-info", (connection) => { delete connection.pageInfo; }],
+    ["page-info-end-cursor", (connection) => { delete connection.pageInfo.endCursor; }],
+    ["nodes", (connection) => { delete connection.nodes; }],
+    ["inventory-count", (connection) => { connection.filteredCount = 1; }],
+    ["has-next-count", (connection) => {
+      connection.totalCount = 1;
+      connection.filteredCount = 1;
+      connection.pageInfo.hasNextPage = false;
+    }],
+  ];
+  for (const [suffix, mutate] of cases) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+      deletedCommentResponseMutator: (response) => {
+        const mutated = structuredClone(response);
+        mutate(mutated.data.repository.pullRequest.timelineItems);
+        return mutated;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `deleted-comment-${suffix}-incomplete`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.match(result.report.reason, /deleted-comment.*incomplete|inconsistent/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("a one-read incomplete GraphQL history connection can recover after two complete snapshots", async (context) => {
+  for (const [suffix, mutate] of [
+    ["deleted", (pullRequest) => { delete pullRequest.timelineItems.totalCount; }],
+    ["comments", (pullRequest) => { delete pullRequest.comments.totalCount; }],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+        if (snapshotIndex !== 0) return response;
+        const mutated = structuredClone(response);
+        mutate(mutated.data.repository.pullRequest);
+        return mutated;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `one-read-incomplete-${suffix}-history`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.recoveryCode, "none", suffix);
+  }
+});
+
+test("identity-less malformed history nodes can recover to same-count complete inventories", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const currentRequest = workflowRequest({
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const malformedDeletion = deletedCommentEvent({
+    id: null,
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const validDeletion = deletedCommentEvent({
+    id: "CDE_recovered_same_count",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const cases = [
+    [
+      "issue-comment-node",
+      createGitHubMock({
+        issueComments: [workflowRequest()],
+        reactionsByCommentId: new Map([["101", [reaction()]]]),
+        deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+          if (snapshotIndex !== 0) return response;
+          const mutated = structuredClone(response);
+          mutated.data.repository.pullRequest.comments.nodes = [null];
+          return mutated;
+        },
+      }),
+    ],
+    [
+      "deleted-comment-node",
+      createGitHubMock({
+        baseEpoch: epoch,
+        issueComments: [currentRequest],
+        reactionsByCommentId: new Map([["101", [reaction({
+          id: 598,
+          created_at: "2026-08-25T08:11:00Z",
+        })]]]),
+        deletedCommentEventSnapshots: [
+          [malformedDeletion],
+          [validDeletion],
+          [validDeletion],
+          [validDeletion],
+        ],
+      }),
+    ],
+  ];
+
+  for (const [suffix, github] of cases) {
+    const environment = runtimeEnvironment(context, {
+      suffix: `recover-identity-less-history-${suffix}`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.recoveryCode, "none", suffix);
+  }
+});
+
+test("a malformed GraphQL comment can recover when the same raw identity becomes complete", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+      if (snapshotIndex !== 0) return response;
+      const mutated = structuredClone(response);
+      delete mutated.data.repository.pullRequest.comments.nodes[0].body;
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "raw-comment-identity-same-id-upgrade",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+});
+
+test("a malformed GraphQL comment raw identity cannot be replaced at the same count", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+      const mutated = structuredClone(response);
+      const node = mutated.data.repository.pullRequest.comments.nodes[0];
+      if (snapshotIndex === 0) {
+        delete node.body;
+      } else {
+        node.databaseId = "102";
+      }
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "raw-comment-identity-same-count-replacement",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /previously observed issue-comment raw identity 101 disappeared/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("malformed history nodes cannot retract schema-valid facts for the same raw identity", async (context) => {
+  const oldDeletion = deletedCommentEvent({
+    id: "CDE_partial_fact",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  const cases = [
+    ["comment-body", createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+        if (snapshotIndex !== 1) return response;
+        const mutated = structuredClone(response);
+        const node = mutated.data.repository.pullRequest.comments.nodes[0];
+        node.body = `${node.body}\nconflicting partial body`;
+        delete node.createdAt;
+        return mutated;
+      },
+    }), /issue-comment 101 body changed/iu],
+    ["comment-edit-timestamp", createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+        if (snapshotIndex !== 1) return response;
+        const mutated = structuredClone(response);
+        const node = mutated.data.repository.pullRequest.comments.nodes[0];
+        node.updatedAt = "2026-08-25T08:01:00Z";
+        delete node.body;
+        return mutated;
+      },
+    }), /issue-comment 101 updatedAt changed/iu],
+    ["deleted-comment-actor", createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      deletedCommentEvents: [oldDeletion],
+      deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+        if (snapshotIndex !== 1) return response;
+        const mutated = structuredClone(response);
+        const node = mutated.data.repository.pullRequest.timelineItems.nodes[0];
+        node.actor.login = "conflicting-actor";
+        delete node.deletedCommentAuthor;
+        return mutated;
+      },
+    }), /deleted-comment event CDE_partial_fact actor changed/iu],
+  ];
+
+  for (const [suffix, github, expectedReason] of cases) {
+    const environment = runtimeEnvironment(context, {
+      suffix: `partial-history-fact-${suffix}`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
+test("top-level GraphQL failures permanently latch identical history identity duplicates", async (context) => {
+  const oldDeletion = deletedCommentEvent({
+    id: "CDE_duplicate_envelope",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  for (const [suffix, github, expectedReason] of [
+    ["issue-comment", createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+        if (snapshotIndex !== 0) return response;
+        const mutated = structuredClone(response);
+        const connection = mutated.data.repository.pullRequest.comments;
+        connection.nodes.push(structuredClone(connection.nodes[0]));
+        mutated.errors = [{ message: "synthetic partial GraphQL failure" }];
+        return mutated;
+      },
+    }), /issue-comment 101 appeared more than once/iu],
+    ["deleted-comment", createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      deletedCommentEvents: [oldDeletion],
+      deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+        if (snapshotIndex !== 0) return response;
+        const mutated = structuredClone(response);
+        const connection = mutated.data.repository.pullRequest.timelineItems;
+        connection.nodes.push(structuredClone(connection.nodes[0]));
+        mutated.errors = [{ message: "synthetic partial GraphQL failure" }];
+        return mutated;
+      },
+    }), /deleted-comment event CDE_duplicate_envelope appeared more than once/iu],
+  ]) {
+    const environment = runtimeEnvironment(context, {
+      suffix: `top-level-identical-duplicate-${suffix}`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
+test("run latches protect provider reviews without poisoning on unrelated human review state", async (context) => {
+  const humanReview = findingReview(HEAD, {
+    id: 900,
+    state: "CHANGES_REQUESTED",
+    body: "Human reviewer requested a change.",
+    user: HUMAN,
+    app: null,
+    performed_via_github_app: null,
+  });
+  const dismissedHumanReview = {
+    ...humanReview,
+    state: "DISMISSED",
+  };
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reviewSnapshots: [
+      [humanReview],
+      [dismissedHumanReview],
+      [dismissedHumanReview],
+      [dismissedHumanReview],
+    ],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "human-review-state-outside-provider-latch",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+});
+
+test("review identity tombstones prevent a human review from becoming a Codex carrier", async (context) => {
+  const humanReview = findingReview(HEAD, {
+    id: 901,
+    state: "COMMENTED",
+    body: "Human review comment.",
+    user: HUMAN,
+    app: null,
+    performed_via_github_app: null,
+  });
+  const providerReview = approvedReview(HEAD, { id: 901 });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reviewSnapshots: [
+      [humanReview],
+      [providerReview],
+      [providerReview],
+      [providerReview],
+    ],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "human-review-cannot-become-provider-carrier",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /review-identity issue-comment 901 changed/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("reaction tombstones allow unrelated human or official ordinary reactions to disappear", async (context) => {
+  const plusOne = reaction();
+  for (const [suffix, user] of [
+    ["human", HUMAN],
+    ["official-ordinary", CODEX_BOT],
+  ]) {
+    const heart = reaction({
+      id: 590,
+      content: "heart",
+      user,
+    });
+    const github = createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionSnapshotsByCommentId: new Map([["101", [
+        [plusOne, heart],
+        [plusOne],
+        [plusOne],
+        [plusOne],
+      ]]]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `${suffix}-reaction-outside-provider-presence-latch`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+  }
+});
+
+test("reaction identity tombstones prevent ordinary reactions from becoming authority", async (context) => {
+  for (const [suffix, initialReaction] of [
+    ["human-heart", reaction({ id: 594, content: "heart", user: HUMAN })],
+    ["official-heart", reaction({ id: 594, content: "heart" })],
+    ["official-plus-one", reaction({ id: 594, content: "+1" })],
+  ]) {
+    const laterReaction = suffix === "official-plus-one"
+      ? reaction({ id: 594, content: "heart" })
+      : reaction({ id: 594, content: "+1" });
+    const github = createGitHubMock({
+      issueComments: [workflowRequest()],
+      reactionSnapshotsByCommentId: new Map([["101", [
+        [reaction({ id: 501 }), initialReaction],
+        [reaction({ id: 501 }), laterReaction],
+        [reaction({ id: 501 }), laterReaction],
+        [reaction({ id: 501 }), laterReaction],
+      ]]]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `reaction-identity-transition-${suffix}`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, /reaction-identity issue-comment 594 changed/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("an official Codex reaction with invalid actor provenance blocks success", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [
+      reaction(),
+      reaction({
+        id: 592,
+        content: "eyes",
+        created_at: "2026-08-25T08:02:00Z",
+        user: { ...CODEX_BOT, type: "User" },
+      }),
+    ]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "invalid-provider-reaction-provenance",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.match(result.report.reason, /Codex eyes reaction 592 has invalid Bot provenance/iu);
+  assert.equal(result.report.counts.indeterminate > 0, true);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("invalid-provenance Codex reactions remain protected run evidence", async (context) => {
+  const wrongTypeEyes = reaction({
+    id: 593,
+    content: "eyes",
+    created_at: "2026-08-25T08:02:00Z",
+    user: { ...CODEX_BOT, type: "User" },
+  });
+  for (const [suffix, github, expectedReason] of [
+    [
+      "disappearing",
+      createGitHubMock({
+        issueComments: [workflowRequest()],
+        reactionSnapshotsByCommentId: new Map([["101", [
+          [reaction(), wrongTypeEyes],
+          [reaction()],
+          [reaction()],
+          [reaction()],
+        ]]]),
+      }),
+      /reaction-rest:101.*593.*disappeared/iu,
+    ],
+    [
+      "mixed-provenance-duplicate",
+      createGitHubMock({
+        issueComments: [workflowRequest()],
+        reactionsByCommentId: new Map([["101", [
+          wrongTypeEyes,
+          reaction({
+            id: 593,
+            content: "+1",
+            created_at: "2026-08-25T08:03:00Z",
+          }),
+        ]]]),
+      }),
+      /repeated official Codex identity 593/iu,
+    ],
+  ]) {
+    const environment = runtimeEnvironment(context, {
+      suffix: `invalid-provider-reaction-${suffix}`,
+    });
+
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
+test("a provider reaction observed before a later-page failure remains latched", async (context) => {
+  const plusOne = reaction();
+  const eyes = reaction({
+    id: 502,
+    content: "eyes",
+    created_at: "2026-08-25T08:02:00Z",
+  });
+  const humanHearts = Array.from({ length: 100 }, (_, index) => reaction({
+    id: 600 + index,
+    content: "heart",
+    created_at: "2026-08-25T08:03:00Z",
+    user: HUMAN,
+  }));
+  const duplicateHumanTail = reaction({
+    id: 600,
+    content: "heart",
+    created_at: "2026-08-25T08:03:00Z",
+    user: HUMAN,
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionSnapshotsByCommentId: new Map([["101", [
+      [plusOne, eyes, ...humanHearts.slice(0, 98), duplicateHumanTail],
+      [plusOne, ...humanHearts],
+      [plusOne, ...humanHearts],
+      [plusOne, ...humanHearts],
+    ]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "partial-provider-reaction-page-latch",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /reaction-rest:101.*502.*disappeared/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("GraphQL issue-comment edit inventory paginates completely within the default budget", async (context) => {
+  const comments = [
+    workflowRequest(),
+    ...Array.from({ length: 200 }, (_, index) => genericComment(1_000 + index)),
+  ];
+  const github = createGitHubMock({
+    issueComments: comments,
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "graphql-comment-edit-pagination",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  const calls = github.calls.filter(({ path, body }) =>
+    path === "/graphql" && body?.query?.includes("CodexReviewGateDeletedComments")
+  );
+  assert.equal(calls.length, 12);
+  assert.deepEqual(calls.map(({ body }) => body.variables.commentCursor), [
+    null,
+    "issue-comment:100",
+    "issue-comment:200",
+    null,
+    "issue-comment:100",
+    "issue-comment:200",
+    null,
+    "issue-comment:100",
+    "issue-comment:200",
+    null,
+    "issue-comment:100",
+    "issue-comment:200",
+  ]);
+  assert.deepEqual(calls.slice(0, 3).map(({ body }) => body.variables.includeDeleted), [
+    true,
+    false,
+    false,
+  ]);
+  for (const { body } of calls) {
+    assert.match(body.query, /comments\(\s*first:\s*100/su);
+    assert.match(body.query, /databaseId:\s*fullDatabaseId/u);
+    assert.match(body.query, /lastEditedAt/u);
+  }
+});
+
+test("GraphQL issue-comment edit pagination and REST reconciliation fail closed", async (context) => {
+  const first = workflowRequest();
+  const second = genericComment(102);
+  const third = genericComment(103);
+  const cases = [
+    ["total-count-drift", 1, (response, { commentCursor }) => {
+      if (commentCursor !== "issue-comment:1") return response;
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.comments;
+      connection.totalCount = 4;
+      connection.pageInfo = {
+        hasNextPage: true,
+        endCursor: "issue-comment:2",
+      };
+      return mutated;
+    }, /(?:total count changed|issue-comment totalCount decreased from 4 to 3)/iu],
+    ["cursor-loop", 1, (response, { commentCursor }) => {
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.comments;
+      if (commentCursor === null) {
+        connection.pageInfo.endCursor = "issue-comment:loop";
+      } else if (commentCursor === "issue-comment:loop") {
+        connection.nodes = [issueCommentEditGraphQlNode(second)];
+        connection.pageInfo = {
+          hasNextPage: true,
+          endCursor: "issue-comment:loop",
+        };
+      }
+      return mutated;
+    }, /pagination repeated a cursor/iu],
+    ["cross-page-duplicate", 1, (response, { commentCursor }) => {
+      if (commentCursor !== "issue-comment:1") return response;
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.comments.nodes = [
+        issueCommentEditGraphQlNode(first),
+      ];
+      return mutated;
+    }, /issue-comment 101 appeared more than once/iu],
+    ["has-next-count", 1, (response, { commentCursor }) => {
+      if (commentCursor !== null) return response;
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.comments.pageInfo = {
+        hasNextPage: false,
+        endCursor: null,
+      };
+      return mutated;
+    }, /edit connection was incomplete or inconsistent/iu],
+    ["missing-full-id", 100, (response) => {
+      const mutated = structuredClone(response);
+      delete mutated.data.repository.pullRequest.comments.nodes[0].databaseId;
+      return mutated;
+    }, /edit metadata was incomplete or inconsistent/iu],
+    ["missing-rest-mapping", 100, (response) => {
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.comments.nodes[1].databaseId = "999";
+      return mutated;
+    }, /REST and GraphQL.*did not match/iu],
+    ["body-skew", 100, (response) => {
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.comments.nodes[0].body += " stale";
+      return mutated;
+    }, /REST and GraphQL.*did not match/iu],
+  ];
+
+  for (const [suffix, pageSize, mutate, expectedReason] of cases) {
+    const github = createGitHubMock({
+      issueComments: [first, second, third],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      deletedCommentPageSize: pageSize,
+      deletedCommentResponseMutator: mutate,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `graphql-comment-edit-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("an edit observed on a later failing GraphQL page remains latched", async (context) => {
+  const edited = genericComment(102);
+  edited.last_edited_at = "2026-08-25T07:00:00.500Z";
+  edited.graphql_updated_at = "2026-08-25T07:00:00.500Z";
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [workflowRequest(), edited],
+      [workflowRequest()],
+      [workflowRequest()],
+      [workflowRequest()],
+    ],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentPageSize: 1,
+    deletedCommentResponseMutator: (response, { commentCursor, snapshotIndex }) => {
+      if (snapshotIndex !== 0 || commentCursor !== "issue-comment:1") return response;
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.comments;
+      connection.totalCount = 3;
+      connection.pageInfo = {
+        hasNextPage: true,
+        endCursor: "issue-comment:2",
+      };
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "partial-issue-comment-edit-page-latch",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /(?:edit metadata.*102.*(?:disappeared|moved backwards)|issue-comment totalCount decreased from 3 to 1)/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a conflicting duplicate GraphQL comment permanently poisons reconciliation", async (context) => {
+  const conflicting = findingIssueComment(HEAD, {
+    id: 101,
+    created_at: "2026-08-25T08:00:00Z",
+    updated_at: "2026-08-25T08:00:00Z",
+  });
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [workflowRequest(), genericComment(102)],
+      [workflowRequest()],
+      [workflowRequest()],
+      [workflowRequest()],
+    ],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentPageSize: 1,
+    deletedCommentResponseMutator: (response, { commentCursor, snapshotIndex }) => {
+      if (snapshotIndex !== 0 || commentCursor !== "issue-comment:1") return response;
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.comments.nodes = [
+        issueCommentEditGraphQlNode(conflicting),
+      ];
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "conflicting-graphql-comment-duplicate",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /issue-comment 101 changed across paginated inventory/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an identical duplicate GraphQL comment permanently poisons reconciliation", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    deletedCommentPageSize: 1,
+    deletedCommentResponseMutator: (response, { commentCursor, snapshotIndex }) => {
+      if (snapshotIndex !== 0 || commentCursor !== "issue-comment:1") return response;
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.comments.nodes = [
+        issueCommentEditGraphQlNode(workflowRequest()),
+      ];
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "identical-graphql-comment-duplicate",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /issue-comment 101 appeared more than once/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an observed comment identity cannot disappear from a later complete inventory", async (context) => {
+  const phantom = genericComment(999);
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [workflowRequest(), phantom],
+      [workflowRequest(), cleanIssueComment(HEAD)],
+      [workflowRequest(), cleanIssueComment(HEAD)],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "invalid-page-comment-id-latch",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /(?:rest|graphql) issue-comment 999 disappeared/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("all visible history evidence is latched before any combined response failure", async (context) => {
+  const edited = workflowRequest({
+    last_edited_at: "2026-08-25T08:00:00.500Z",
+    graphql_updated_at: "2026-08-25T08:00:00.500Z",
+  });
+  const unedited = workflowRequest({ last_edited_at: null });
+  for (const [suffix, mutate, expectedReason] of [
+    ["deleted-connection", (response) => {
+      delete response.data.repository.pullRequest.timelineItems.totalCount;
+    }, /(?:edit metadata.*101.*(?:disappeared|moved backwards)|issue-comment 101 updatedAt changed)/iu],
+    ["top-level-errors", (response) => {
+      response.errors = [{ message: "synthetic partial GraphQL failure" }];
+    }, /(?:edit metadata.*101.*(?:disappeared|moved backwards)|issue-comment 101 updatedAt changed)/iu],
+  ]) {
+    const github = createGitHubMock({
+      issueCommentSnapshots: [
+        [edited],
+        [unedited],
+        [unedited],
+        [unedited],
+      ],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+        if (snapshotIndex !== 0) return response;
+        const mutated = structuredClone(response);
+        mutate(mutated);
+        return mutated;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `combined-comment-history-${suffix}`,
+    });
+    const { result } = await runGate(environment, github, {
+      stabilityWindowMs: 4,
+    });
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("REST and GraphQL comment conflicts permanently poison the stability run", async (context) => {
+  const clean = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const finding = findingIssueComment(HEAD, {
+    id: 201,
+    created_at: clean.created_at,
+    updated_at: clean.updated_at,
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), clean],
+    deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+      if (snapshotIndex !== 0) return response;
+      const mutated = structuredClone(response);
+      const node = mutated.data.repository.pullRequest.comments.nodes.find(
+        ({ databaseId }) => databaseId === "201",
+      );
+      node.body = finding.body;
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "rest-graphql-comment-conflict-poison",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /REST and GraphQL issue-comment metadata did not match for 201/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an exact-refetch comment conflict permanently poisons the stability run", async (context) => {
+  const clean = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const finding = findingIssueComment(HEAD, {
+    id: 201,
+    created_at: clean.created_at,
+    updated_at: clean.updated_at,
+  });
+  let providerRefetches = 0;
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), clean],
+    commentRefetchMutator: (comment) => {
+      if (String(comment.id) !== "201") return comment;
+      providerRefetches += 1;
+      return providerRefetches === 1 ? finding : comment;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "exact-refetch-comment-conflict-poison",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /Previously observed rest issue-comment 201 changed/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("comment reconciliation latches conflicts even when another carrier read fails", async (context) => {
+  const clean = cleanIssueComment(HEAD);
+  const finding = findingIssueComment(HEAD, {
+    id: clean.id,
+    created_at: clean.created_at,
+    updated_at: clean.updated_at,
+  });
+  let reviewReads = 0;
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), clean],
+    requestInterceptor: ({ method, path }) => {
+      if (
+        method === "GET" &&
+        path === `/repos/${REPOSITORY}/pulls/${PR}/reviews` &&
+        reviewReads < 3
+      ) {
+        reviewReads += 1;
+        return jsonResponse({ message: "synthetic review read failure" }, 502);
+      }
+      return undefined;
+    },
+    deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+      if (snapshotIndex !== 0) return response;
+      const mutated = structuredClone(response);
+      const node = mutated.data.repository.pullRequest.comments.nodes.find(
+        ({ databaseId }) => databaseId === String(clean.id),
+      );
+      node.body = finding.body;
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "parallel-carrier-failure-comment-conflict",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /REST and GraphQL issue-comment metadata did not match for 201/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("REST issue-comment pagination latches valid earlier-page carriers before failure", async (context) => {
+  const firstPage = [
+    workflowRequest(),
+    findingIssueComment(HEAD, {
+      id: 201,
+      created_at: "2026-08-25T08:01:00Z",
+      updated_at: "2026-08-25T08:01:00Z",
+    }),
+    ...Array.from({ length: 98 }, (_, index) => genericComment(1_000 + index)),
+  ];
+  const stable = [workflowRequest(), cleanIssueComment(HEAD)];
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [...firstPage, workflowRequest()],
+      stable,
+      stable,
+    ],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+    deletedCommentResponseMutator: (response) => {
+      const mutated = structuredClone(response);
+      mutated.data.repository.pullRequest.comments = {
+        totalCount: stable.length,
+        nodes: stable.map(issueCommentEditGraphQlNode),
+        pageInfo: { hasNextPage: false, endCursor: null },
+      };
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "rest-partial-page-carrier-latch",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /pull-request issue comments contains duplicate identity 101/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("review exact-refetch conflicts permanently poison the stability run", async (context) => {
+  const finding = findingReview(HEAD, {
+    id: 401,
+    submitted_at: "2026-08-25T08:01:00Z",
+  });
+  let exactReads = 0;
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewSnapshots: [[finding], [], []],
+    reviewRefetchMutator: (review) => {
+      exactReads += 1;
+      return exactReads === 1
+        ? { ...review, state: "APPROVED", body: "Synthetic changed exact review" }
+        : review;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-exact-refetch-conflict-poison",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /review-rest issue-comment 401 changed/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a PR-count mismatch cannot forget a newly visible physical boundary", async (context) => {
+  const physicalOnly = ordinaryRequest({
+    id: 102,
+    user: ACTIONS_BOT,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [workflowRequest(), physicalOnly],
+      [workflowRequest()],
+      [workflowRequest()],
+    ],
+    pullRequestOverrides: { comments: 1 },
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pr-count-physical-boundary-latch",
+  });
+
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /(?:issue-comment totalCount decreased from 2 to 1|issue-comment 102 disappeared)/iu,
+  );
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -1180,9 +3508,10 @@ test("a denied exact request remains a lineage boundary without granting clean a
     directRecoveryEnvironment,
     directRecoveryGitHub,
   );
-  assert.equal(directRecovery.exitCode, 0);
-  assert.equal(directRecovery.report.gateOutcome, "success");
-  assert.match(directRecovery.report.reason, /request-reaction 504/u);
+  assert.equal(directRecovery.exitCode, 1);
+  assert.equal(directRecovery.report.gateOutcome, "pending");
+  assert.equal(directRecovery.report.recoveryCode, "request_clean_generation");
+  assert.match(directRecovery.report.reason, /earlier request 101.*newer request 102/iu);
 
   const canonicalA = workflowRequest({
     id: 105,
@@ -1203,7 +3532,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
   assert.equal(staleDirect.exitCode, 1);
   assert.equal(staleDirect.report.gateOutcome, "pending");
   assert.equal(staleDirect.report.recoveryCode, "request_clean_generation");
-  assert.match(staleDirect.report.reason, /predates later review-request boundary 102/iu);
+  assert.match(staleDirect.report.reason, /newer request 102 already existed/iu);
 
   const refreshedDirectGitHub = createGitHubMock({
     issueComments: [canonicalA, deniedU, delayedUnboundClean],
@@ -1220,9 +3549,383 @@ test("a denied exact request remains a lineage boundary without granting clean a
     refreshedDirectEnvironment,
     refreshedDirectGitHub,
   );
-  assert.equal(refreshedDirect.exitCode, 0);
-  assert.equal(refreshedDirect.report.gateOutcome, "success");
-  assert.match(refreshedDirect.report.reason, /request-reaction 506/u);
+  assert.equal(refreshedDirect.exitCode, 1);
+  assert.equal(refreshedDirect.report.gateOutcome, "pending");
+  assert.equal(refreshedDirect.report.recoveryCode, "request_clean_generation");
+  assert.match(refreshedDirect.report.reason, /newer request 102 already existed/iu);
+});
+
+test("provider-triggerable invalid request shapes remain physical-only boundaries", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const terminalA = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const generationC = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const invalidRequests = [
+    ["canonical-wrong-author", workflowRequest({
+      id: 102,
+      user: HUMAN,
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["canonical-edited", workflowRequest({
+      id: 102,
+      created_at: "2026-08-25T08:01:30Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["canonical-malformed-envelope", workflowRequest({
+      id: 102,
+      body: canonicalRequestBody().replace('"version":2', '"version":3'),
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["canonical-wrong-hidden-marker", workflowRequest({
+      id: 102,
+      body: canonicalRequestBody().replace(
+        "codex-review-gate-request-v2",
+        "codex-review-gate-request-v1",
+      ),
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["canonical-extra-hidden-comment", workflowRequest({
+      id: 102,
+      body: `${canonicalRequestBody()}\n<!-- unrelated hidden metadata -->`,
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["canonical-crlf-envelope", workflowRequest({
+      id: 102,
+      body: canonicalRequestBody().replaceAll("\n", "\r\n"),
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["canonical-unclosed-hidden-comment", workflowRequest({
+      id: 102,
+      body: canonicalRequestBody().replace("-->", ""),
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["canonical-invalid-repository", workflowRequest({
+      id: 102,
+      body: canonicalRequestBody(HEAD, { repositoryId: "999", runId: "124" }),
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-edited", ordinaryRequest({
+      id: 102,
+      created_at: "2026-08-25T08:01:30Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-bot", ordinaryRequest({
+      id: 102,
+      user: ACTIONS_BOT,
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["focused-review-command", ordinaryRequest({
+      id: 102,
+      body: "@codex review for issues in security-sensitive code",
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+  ];
+
+  for (const [suffix, invalidRequest] of invalidRequests) {
+    const github = createGitHubMock({
+      issueComments: [generationA, terminalA, invalidRequest, generationC],
+      reactionsByCommentId: new Map([["103", [reaction({
+        id: 550,
+        created_at: "2026-08-25T08:04:00Z",
+      })]]]),
+    });
+    const environment = runtimeEnvironment(context, { suffix });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    assert.equal(
+      github.calls.some(({ path }) =>
+        path === `/repos/${REPOSITORY}/issues/comments/102` ||
+        path === `/repos/${REPOSITORY}/issues/comments/102/reactions`
+      ),
+      false,
+      `${suffix}: physical-only boundaries must not consume exact-refetch or reaction budget`,
+    );
+  }
+
+  for (const [suffix, invalidRequest] of invalidRequests.filter(([name]) =>
+    name === "canonical-wrong-author" || name === "focused-review-command"
+  )) {
+    const github = createGitHubMock({
+      issueComments: [generationA, terminalA, invalidRequest],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `${suffix}-after-clean`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.match(result.report.reason, /predates newer physical review request 102/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+
+  const mention = genericComment(102);
+  mention.body = "Please ask @codex review when the branch is ready.";
+  mention.created_at = "2026-08-25T08:02:00Z";
+  mention.updated_at = "2026-08-25T08:02:00Z";
+  const nonExactGitHub = createGitHubMock({
+    issueComments: [generationA, terminalA, mention],
+  });
+  const nonExactEnvironment = runtimeEnvironment(context, {
+    suffix: "non-exact-review-mention-is-not-a-boundary",
+  });
+  const { result: nonExact } = await runGate(nonExactEnvironment, nonExactGitHub);
+  assert.equal(nonExact.exitCode, 0);
+  assert.equal(nonExact.report.gateOutcome, "success");
+
+  const visibleTrailer = workflowRequest({
+    id: 102,
+    body: `${canonicalRequestBody()}\nVisible trailer`,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const visibleTrailerGitHub = createGitHubMock({
+    issueComments: [generationA, terminalA, visibleTrailer],
+  });
+  const visibleTrailerEnvironment = runtimeEnvironment(context, {
+    suffix: "visible-envelope-trailer-is-a-physical-boundary",
+  });
+  const { result: visibleTrailerResult } = await runGate(
+    visibleTrailerEnvironment,
+    visibleTrailerGitHub,
+  );
+  assert.equal(visibleTrailerResult.exitCode, 1);
+  assert.equal(visibleTrailerResult.report.gateOutcome, "pending");
+  assert.equal(visibleTrailerResult.report.recoveryCode, "request_clean_generation");
+  assert.equal(
+    visibleTrailerGitHub.calls.some(({ path }) =>
+      path === `/repos/${REPOSITORY}/issues/comments/102` ||
+      path === `/repos/${REPOSITORY}/issues/comments/102/reactions`
+    ),
+    false,
+  );
+});
+
+test("exact Codex provider carriers never become request generations", async (context) => {
+  const generationA = workflowRequest();
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const providerComment = ordinaryRequest({
+    id: 201,
+    user: CODEX_BOT,
+    performed_via_github_app: CODEX_APP,
+    created_at: "2026-08-25T08:00:30Z",
+    updated_at: "2026-08-25T08:00:30Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-201`,
+  });
+  const providerReview = findingReview(HEAD, {
+    id: 401,
+    body: "@codex review",
+    submitted_at: "2026-08-25T08:00:30Z",
+  });
+  for (const [suffix, extraComments, reviews] of [
+    ["issue-comment", [providerComment], []],
+    ["pull-request-review", [], [providerReview]],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: [generationA, ...extraComments, generationB],
+      reviews,
+      reactionsByCommentId: new Map([
+        ["101", [reaction({ id: 680, created_at: "2026-08-25T08:01:00Z" })]],
+        ["102", [reaction({ id: 681, created_at: "2026-08-25T08:03:00Z" })]],
+      ]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `exact-provider-not-request-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.counts.indeterminate, 1, suffix);
+    assert.equal(result.report.requiresReplacementPr, false, suffix);
+    assert.match(result.report.reason, /request-reaction 681/u, suffix);
+    if (suffix === "issue-comment") {
+      assert.equal(
+        github.calls.some(({ path }) =>
+          path === `/repos/${REPOSITORY}/issues/comments/201`
+        ),
+        true,
+      );
+      assert.equal(
+        github.calls.some(({ path }) => path.endsWith("/comments/201/reactions")),
+        false,
+      );
+    } else {
+      assert.equal(
+        github.calls.some(({ path }) =>
+          path === `/repos/${REPOSITORY}/pulls/${PR}/reviews/401`
+        ),
+        true,
+      );
+    }
+  }
+});
+
+test("edited-away trusted request comments remain unknown physical boundaries", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const terminalA = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  for (const [suffix, user, body] of [
+    ["human", HUMAN, "The review request was edited away."],
+    ["github-actions", ACTIONS_BOT, "The review request was edited away."],
+    [
+      "github-actions-forged-sticky",
+      ACTIONS_BOT,
+      `Old diagnostic\n\n<!-- ${V2_STICKY_MARKER} -->\n<!-- {} -->`,
+    ],
+    [
+      "other-app-bot",
+      { id: 77, login: "review-request-app[bot]", type: "Bot" },
+      "The app review request was edited away.",
+    ],
+  ]) {
+    const editedAway = genericComment(102);
+    Object.assign(editedAway, {
+      body,
+      created_at: "2026-08-25T08:00:30Z",
+      updated_at: "2026-08-25T08:02:00Z",
+      user,
+    });
+    const github = createGitHubMock({
+      issueComments: [generationA, terminalA, editedAway],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `edited-away-request-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.match(result.report.reason, /predates newer physical review request 102/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    assert.equal(
+      github.calls.some(({ path }) =>
+        path === `/repos/${REPOSITORY}/issues/comments/102` ||
+        path === `/repos/${REPOSITORY}/issues/comments/102/reactions`
+      ),
+      false,
+      `${suffix}: unknown history stays physical-only without extra API fan-out`,
+    );
+  }
+});
+
+test("only exact unedited Actions sticky diagnostics are outside physical lineage", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const terminalA = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const canonicalBody = canonicalStickyComment({ id: 102 }).body;
+  const nonStringHeadBody = canonicalBody.replace(
+    `"headSha":"${BASE}"`,
+    `"headSha":["${BASE}"]`,
+  );
+  const cases = [
+    {
+      suffix: "forged-marker",
+      comment: stickyComment({
+        id: 102,
+        created_at: "2026-08-25T08:02:00Z",
+        updated_at: "2026-08-25T08:02:00Z",
+      }),
+    },
+    {
+      suffix: "edited-canonical",
+      comment: canonicalStickyComment({
+        id: 102,
+        created_at: "2026-08-25T08:00:30Z",
+        updated_at: "2026-08-25T08:02:00Z",
+      }),
+    },
+    {
+      suffix: "wrong-actions-provenance",
+      comment: genericComment(102),
+    },
+    {
+      suffix: "canonical-crlf",
+      comment: canonicalStickyComment({
+        id: 102,
+        body: canonicalBody.replaceAll("\n", "\r\n"),
+        created_at: "2026-08-25T08:02:00Z",
+        updated_at: "2026-08-25T08:02:00Z",
+      }),
+    },
+    {
+      suffix: "canonical-bare-cr",
+      comment: canonicalStickyComment({
+        id: 102,
+        body: canonicalBody.replaceAll("\n", "\r"),
+        created_at: "2026-08-25T08:02:00Z",
+        updated_at: "2026-08-25T08:02:00Z",
+      }),
+    },
+    {
+      suffix: "canonical-non-string-head",
+      comment: canonicalStickyComment({
+        id: 102,
+        body: nonStringHeadBody,
+        created_at: "2026-08-25T08:02:00Z",
+        updated_at: "2026-08-25T08:02:00Z",
+      }),
+    },
+  ];
+  Object.assign(cases[2].comment, {
+    body: canonicalBody,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    user: HUMAN,
+  });
+
+  for (const { suffix, comment } of cases) {
+    const github = createGitHubMock({
+      issueComments: [generationA, terminalA, comment],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `sticky-physical-boundary-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(result.report.requiresReplacementPr, true, suffix);
+    assert.match(
+      result.report.reason,
+      /physical review request 102|immutable canonical Actions provenance/iu,
+      suffix,
+    );
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
 });
 
 test("authority filtering caches permissions and avoids exact-refetch DoS", async (context) => {
@@ -1251,6 +3954,13 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
   assert.equal(deniedResult.exitCode, 1);
   assert.equal(deniedResult.report.executionHealth, "healthy");
   assert.equal(deniedResult.report.gateOutcome, "pending");
+  assert.equal(deniedResult.report.recoveryCode, "wait_provider");
+  assert.equal(deniedResult.report.requiresReplacementPr, true);
+  const deniedSummary = readFileSync(deniedEnvironment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(deniedSummary, /Do not add another review boundary on the original PR/iu);
+  assert.match(deniedSummary, /Open a replacement PR/iu);
+  assert.match(deniedSummary, /exactly one canonical review generation/iu);
+  assert.doesNotMatch(deniedSummary, /Wait for Codex to publish a terminal result/iu);
   assert.equal(deniedGitHub.statusWrites.some(({ state }) => state === "success"), false);
   assert.equal(
     deniedGitHub.calls.filter(({ path }) =>
@@ -1392,7 +4102,7 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
   assert.equal(ambiguous.report.counts.indeterminate, 1);
   assert.match(
     ambiguous.report.reason,
-    /earlier request 101 had no terminal provider result before newer request 102/iu,
+    /earlier request 101 had no qualifying settled closure before newer request 102/iu,
   );
   assert.equal(
     ambiguousGitHub.statusWrites.some(({ state }) => state === "success"),
@@ -1446,9 +4156,10 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     directlyBoundEnvironment,
     directlyBoundGitHub,
   );
-  assert.equal(directlyBound.exitCode, 0);
-  assert.equal(directlyBound.report.gateOutcome, "success");
-  assert.match(directlyBound.report.reason, /request-reaction 503/u);
+  assert.equal(directlyBound.exitCode, 1);
+  assert.equal(directlyBound.report.gateOutcome, "pending");
+  assert.equal(directlyBound.report.recoveryCode, "request_clean_generation");
+  assert.match(directlyBound.report.reason, /earlier request 101.*newer request 102/iu);
 
   const earlierDirectBindingGitHub = createGitHubMock({
     issueComments: [generationA, generationB, delayedCleanFromA],
@@ -1475,9 +4186,377 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     earlierDirectBindingEnvironment,
     earlierDirectBindingGitHub,
   );
-  assert.equal(earlierDirectBinding.exitCode, 0);
-  assert.equal(earlierDirectBinding.report.gateOutcome, "success");
-  assert.match(earlierDirectBinding.report.reason, /request-reaction 509/u);
+  assert.equal(earlierDirectBinding.exitCode, 1);
+  assert.equal(earlierDirectBinding.report.gateOutcome, "pending");
+  assert.equal(earlierDirectBinding.report.recoveryCode, "request_clean_generation");
+  assert.match(earlierDirectBinding.report.reason, /earlier request 101.*newer request 102/iu);
+
+  const progressAfterPredecessorCleanGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      progressIssueComment({
+        id: 204,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      }),
+      generationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 510, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({ id: 511, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const progressAfterPredecessorCleanEnvironment = runtimeEnvironment(context, {
+    suffix: "prior-generation-direct-plus-one-followed-by-progress",
+  });
+  const { result: progressAfterPredecessorClean } = await runGate(
+    progressAfterPredecessorCleanEnvironment,
+    progressAfterPredecessorCleanGitHub,
+  );
+  assert.equal(progressAfterPredecessorClean.exitCode, 1);
+  assert.equal(progressAfterPredecessorClean.report.gateOutcome, "pending");
+  assert.equal(
+    progressAfterPredecessorClean.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(
+    progressAfterPredecessorClean.report.reason,
+    /earlier request 101.*newer request 102/iu,
+  );
+
+  const eyesAtSuccessorBoundaryGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reactionsByCommentId: new Map([
+      ["101", [
+        reaction({ id: 520, created_at: "2026-08-25T08:01:00Z" }),
+        reaction({
+          id: 521,
+          content: "eyes",
+          created_at: generationB.created_at,
+        }),
+      ]],
+    ]),
+  });
+  const eyesAtSuccessorBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "prior-plus-one-eyes-at-successor-boundary",
+  });
+  const { result: eyesAtSuccessorBoundary } = await runGate(
+    eyesAtSuccessorBoundaryEnvironment,
+    eyesAtSuccessorBoundaryGitHub,
+  );
+  assert.equal(eyesAtSuccessorBoundary.exitCode, 1);
+  assert.equal(eyesAtSuccessorBoundary.report.gateOutcome, "pending");
+  assert.equal(
+    eyesAtSuccessorBoundary.report.recoveryCode,
+    "request_clean_generation",
+  );
+
+  const progressAtSuccessorBoundaryGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      progressIssueComment({
+        id: 205,
+        created_at: generationB.created_at,
+        updated_at: generationB.updated_at,
+      }),
+      generationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 522, created_at: "2026-08-25T08:01:00Z" })]],
+    ]),
+  });
+  const progressAtSuccessorBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "prior-plus-one-progress-at-successor-boundary",
+  });
+  const { result: progressAtSuccessorBoundary } = await runGate(
+    progressAtSuccessorBoundaryEnvironment,
+    progressAtSuccessorBoundaryGitHub,
+  );
+  assert.equal(progressAtSuccessorBoundary.exitCode, 1);
+  assert.equal(progressAtSuccessorBoundary.report.gateOutcome, "pending");
+  assert.equal(
+    progressAtSuccessorBoundary.report.recoveryCode,
+    "request_clean_generation",
+  );
+
+  const oldHeadBoundary = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(OLD_HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:01:15Z",
+    updated_at: "2026-08-25T08:01:15Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const currentGenerationB = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: generationB.created_at,
+    updated_at: generationB.updated_at,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const oldHeadProgressGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      oldHeadBoundary,
+      progressIssueComment({
+        id: 206,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:45Z",
+      }),
+      currentGenerationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 523, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 528, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const oldHeadProgressEnvironment = runtimeEnvironment(context, {
+    suffix: "unbound-progress-near-old-head-stays-current",
+  });
+  const { result: oldHeadProgress } = await runGate(
+    oldHeadProgressEnvironment,
+    oldHeadProgressGitHub,
+  );
+  assert.equal(oldHeadProgress.exitCode, 1);
+  assert.equal(oldHeadProgress.report.gateOutcome, "pending");
+  assert.equal(oldHeadProgress.report.recoveryCode, "request_clean_generation");
+  assert.match(oldHeadProgress.report.reason, /earlier request 101.*newer request 103/iu);
+  assert.equal(
+    oldHeadProgressGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const progressAtCurrentSuccessorGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      oldHeadBoundary,
+      progressIssueComment({
+        id: 208,
+        created_at: currentGenerationB.created_at,
+        updated_at: currentGenerationB.updated_at,
+      }),
+      currentGenerationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 526, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 529, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const progressAtCurrentSuccessorEnvironment = runtimeEnvironment(context, {
+    suffix: "old-head-progress-at-current-successor-boundary",
+  });
+  const { result: progressAtCurrentSuccessor } = await runGate(
+    progressAtCurrentSuccessorEnvironment,
+    progressAtCurrentSuccessorGitHub,
+  );
+  assert.equal(progressAtCurrentSuccessor.exitCode, 1);
+  assert.equal(progressAtCurrentSuccessor.report.gateOutcome, "pending");
+  assert.equal(
+    progressAtCurrentSuccessor.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.equal(progressAtCurrentSuccessor.report.counts.indeterminate, 1);
+  assert.match(
+    progressAtCurrentSuccessor.report.reason,
+    /earlier request 101.*newer request 103/iu,
+  );
+  assert.equal(
+    progressAtCurrentSuccessorGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const progressAtOldHeadBoundaryGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      progressIssueComment({
+        id: 209,
+        created_at: oldHeadBoundary.created_at,
+        updated_at: oldHeadBoundary.updated_at,
+      }),
+      oldHeadBoundary,
+      currentGenerationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 527, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 530, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const progressAtOldHeadBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "progress-at-old-head-boundary",
+  });
+  const { result: progressAtOldHeadBoundary } = await runGate(
+    progressAtOldHeadBoundaryEnvironment,
+    progressAtOldHeadBoundaryGitHub,
+  );
+  assert.equal(progressAtOldHeadBoundary.exitCode, 1);
+  assert.equal(progressAtOldHeadBoundary.report.gateOutcome, "pending");
+  assert.equal(
+    progressAtOldHeadBoundary.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.equal(
+    progressAtOldHeadBoundaryGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const currentHeadMiddleBoundary = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:01:15Z",
+    updated_at: "2026-08-25T08:01:15Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const currentHeadProgressGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      currentHeadMiddleBoundary,
+      progressIssueComment({
+        id: 207,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      }),
+      currentGenerationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 524, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({ id: 525, created_at: "2026-08-25T08:01:20Z" })]],
+      ["103", [reaction({ id: 531, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const currentHeadProgressEnvironment = runtimeEnvironment(context, {
+    suffix: "current-head-progress-vetoes-current-lineage",
+  });
+  const { result: currentHeadProgress } = await runGate(
+    currentHeadProgressEnvironment,
+    currentHeadProgressGitHub,
+  );
+  assert.equal(currentHeadProgress.exitCode, 1);
+  assert.equal(currentHeadProgress.report.gateOutcome, "pending");
+  assert.equal(
+    currentHeadProgress.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(
+    currentHeadProgress.report.reason,
+    /earlier request 102.*newer request 103/iu,
+  );
+
+  const oldHeadAfterCurrentBoundary = workflowRequest({
+    id: 104,
+    body: canonicalRequestBody(OLD_HEAD, { runId: "126" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-104`,
+  });
+  const editedProgressAcrossHeadBoundariesGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      currentGenerationB,
+      progressIssueComment({
+        id: 210,
+        created_at: currentGenerationB.created_at,
+        updated_at: "2026-08-25T08:03:30Z",
+      }),
+      oldHeadAfterCurrentBoundary,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 535, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 536, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const editedProgressAcrossHeadBoundariesEnvironment = runtimeEnvironment(context, {
+    suffix: "edited-progress-crosses-current-and-old-head-boundaries",
+  });
+  const { result: editedProgressAcrossHeadBoundaries } = await runGate(
+    editedProgressAcrossHeadBoundariesEnvironment,
+    editedProgressAcrossHeadBoundariesGitHub,
+  );
+  assert.equal(editedProgressAcrossHeadBoundaries.exitCode, 1);
+  assert.equal(editedProgressAcrossHeadBoundaries.report.gateOutcome, "pending");
+  assert.equal(
+    editedProgressAcrossHeadBoundaries.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(
+    editedProgressAcrossHeadBoundaries.report.reason,
+    /earlier request 101.*newer request 103/iu,
+  );
+  assert.equal(
+    editedProgressAcrossHeadBoundariesGitHub.statusWrites.some(
+      ({ state }) => state === "success",
+    ),
+    false,
+  );
+
+  const intervalCurrentBoundary = workflowRequest({
+    id: 105,
+    body: canonicalRequestBody(HEAD, { runId: "127" }),
+    created_at: "2026-08-25T08:01:45Z",
+    updated_at: "2026-08-25T08:01:45Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-105`,
+  });
+  const intervalOldBoundary = workflowRequest({
+    id: 106,
+    body: canonicalRequestBody(OLD_HEAD, { runId: "128" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-106`,
+  });
+  const intervalCurrentSuccessor = workflowRequest({
+    id: 107,
+    body: canonicalRequestBody(HEAD, { runId: "129" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-107`,
+  });
+  const editedProgressOldCurrentOldGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      oldHeadBoundary,
+      progressIssueComment({
+        id: 211,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:02:30Z",
+      }),
+      intervalCurrentBoundary,
+      intervalOldBoundary,
+      intervalCurrentSuccessor,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 537, created_at: "2026-08-25T08:01:00Z" })]],
+      ["105", [reaction({ id: 538, created_at: "2026-08-25T08:02:45Z" })]],
+      ["107", [reaction({ id: 539, created_at: "2026-08-25T08:04:00Z" })]],
+    ]),
+  });
+  const editedProgressOldCurrentOldEnvironment = runtimeEnvironment(context, {
+    suffix: "edited-progress-crosses-old-current-old-window",
+  });
+  const { result: editedProgressOldCurrentOld } = await runGate(
+    editedProgressOldCurrentOldEnvironment,
+    editedProgressOldCurrentOldGitHub,
+  );
+  assert.equal(editedProgressOldCurrentOld.exitCode, 1);
+  assert.equal(editedProgressOldCurrentOld.report.gateOutcome, "pending");
+  assert.equal(
+    editedProgressOldCurrentOld.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(
+    editedProgressOldCurrentOld.report.reason,
+    /earlier request 101.*newer request 105/iu,
+  );
+  assert.equal(
+    editedProgressOldCurrentOldGitHub.statusWrites.some(
+      ({ state }) => state === "success",
+    ),
+    false,
+  );
 
   const predecessorClosedGitHub = createGitHubMock({
     issueComments: [generationA, generationB, delayedCleanFromA],
@@ -1497,9 +4576,35 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     predecessorClosedEnvironment,
     predecessorClosedGitHub,
   );
-  assert.equal(predecessorClosed.exitCode, 0);
-  assert.equal(predecessorClosed.report.gateOutcome, "success");
-  assert.match(predecessorClosed.report.reason, /issue-comment 203/u);
+  assert.equal(predecessorClosed.exitCode, 1);
+  assert.equal(predecessorClosed.report.gateOutcome, "pending");
+  assert.equal(
+    predecessorClosed.report.recoveryCode,
+    "request_clean_generation",
+  );
+  assert.match(predecessorClosed.report.reason, /cannot be uniquely attributed.*request 102/iu);
+  assert.equal(
+    predecessorClosedGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const predecessorAndLatestDirectGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedCleanFromA],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 532, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({ id: 533, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const predecessorAndLatestDirectEnvironment = runtimeEnvironment(context, {
+    suffix: "all-overlapping-generations-directly-closed",
+  });
+  const { result: predecessorAndLatestDirect } = await runGate(
+    predecessorAndLatestDirectEnvironment,
+    predecessorAndLatestDirectGitHub,
+  );
+  assert.equal(predecessorAndLatestDirect.exitCode, 0);
+  assert.equal(predecessorAndLatestDirect.report.gateOutcome, "success");
+  assert.match(predecessorAndLatestDirect.report.reason, /request-reaction 533/u);
 
   const completedGenerationA = cleanIssueComment(HEAD, {
     id: 202,
@@ -1526,9 +4631,33 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
     providerClosedEnvironment,
     providerClosedGitHub,
   );
-  assert.equal(providerClosed.exitCode, 0);
-  assert.equal(providerClosed.report.gateOutcome, "success");
-  assert.match(providerClosed.report.reason, /issue-comment 203/u);
+  assert.equal(providerClosed.exitCode, 1);
+  assert.equal(providerClosed.report.gateOutcome, "pending");
+  assert.equal(providerClosed.report.recoveryCode, "request_clean_generation");
+  assert.match(providerClosed.report.reason, /cannot be uniquely attributed.*request 102/iu);
+
+  const providerFirstGapDirectLatestGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      completedGenerationA,
+      generationB,
+      delayedCleanFromA,
+    ],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 534,
+      created_at: "2026-08-25T08:05:00Z",
+    })]]]),
+  });
+  const providerFirstGapDirectLatestEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-first-gap-direct-latest",
+  });
+  const { result: providerFirstGapDirectLatest } = await runGate(
+    providerFirstGapDirectLatestEnvironment,
+    providerFirstGapDirectLatestGitHub,
+  );
+  assert.equal(providerFirstGapDirectLatest.exitCode, 0);
+  assert.equal(providerFirstGapDirectLatest.report.gateOutcome, "success");
+  assert.match(providerFirstGapDirectLatest.report.reason, /request-reaction 534/u);
 
   const equalBoundaryGitHub = createGitHubMock({
     issueComments: [
@@ -1552,6 +4681,963 @@ test("a delayed terminal clean from generation A cannot satisfy overlapping gene
   assert.equal(equalBoundary.exitCode, 1);
   assert.equal(equalBoundary.report.gateOutcome, "pending");
   assert.equal(equalBoundary.report.recoveryCode, "request_clean_generation");
+});
+
+test("unbound terminal carriers cannot cross overlapping generations", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const terminalA = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const delayedTerminalA = cleanIssueComment(HEAD, {
+    id: 203,
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+  });
+
+  const ambiguousLatestGitHub = createGitHubMock({
+    issueComments: [generationA, terminalA, generationB, delayedTerminalA],
+  });
+  const ambiguousLatestEnvironment = runtimeEnvironment(context, {
+    suffix: "unbound-terminal-cannot-satisfy-second-generation",
+  });
+  const { result: ambiguousLatest } = await runGate(
+    ambiguousLatestEnvironment,
+    ambiguousLatestGitHub,
+  );
+  assert.equal(ambiguousLatest.exitCode, 1);
+  assert.equal(ambiguousLatest.report.gateOutcome, "pending");
+  assert.equal(ambiguousLatest.report.recoveryCode, "request_clean_generation");
+  assert.match(ambiguousLatest.report.reason, /cannot be uniquely attributed.*request 102/iu);
+  assert.equal(
+    ambiguousLatestGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const findingA = findingIssueComment(HEAD, {
+    id: 202,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const ambiguousSupersessionGitHub = createGitHubMock({
+    issueComments: [generationA, findingA, generationB, delayedTerminalA],
+  });
+  const ambiguousSupersessionEnvironment = runtimeEnvironment(context, {
+    suffix: "unbound-terminal-cannot-supersede-finding-for-second-generation",
+  });
+  const { result: ambiguousSupersession } = await runGate(
+    ambiguousSupersessionEnvironment,
+    ambiguousSupersessionGitHub,
+  );
+  assert.equal(ambiguousSupersession.exitCode, 1);
+  assert.equal(ambiguousSupersession.report.gateOutcome, "failure");
+  assert.equal(ambiguousSupersession.report.recoveryCode, "fix_findings");
+  assert.equal(ambiguousSupersession.report.counts.unresolved, 1);
+  assert.equal(ambiguousSupersession.report.counts.resolved, 0);
+  assert.equal(
+    ambiguousSupersessionGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const directLatestGitHub = createGitHubMock({
+    issueComments: [generationA, terminalA, generationB, delayedTerminalA],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 540,
+      created_at: "2026-08-25T08:03:30Z",
+    })]]]),
+  });
+  const directLatestEnvironment = runtimeEnvironment(context, {
+    suffix: "first-provider-gap-and-direct-latest-recover",
+  });
+  const { result: directLatest } = await runGate(
+    directLatestEnvironment,
+    directLatestGitHub,
+  );
+  assert.equal(directLatest.exitCode, 0);
+  assert.equal(directLatest.report.gateOutcome, "success");
+  assert.match(directLatest.report.reason, /request-reaction 540/u);
+
+  const generationC = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const threeGenerationGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      terminalA,
+      generationB,
+      delayedTerminalA,
+      generationC,
+    ],
+    reactionsByCommentId: new Map([["103", [reaction({
+      id: 541,
+      created_at: "2026-08-25T08:05:00Z",
+    })]]]),
+  });
+  const threeGenerationEnvironment = runtimeEnvironment(context, {
+    suffix: "delayed-terminal-cannot-close-second-of-three-generations",
+  });
+  const { result: threeGeneration } = await runGate(
+    threeGenerationEnvironment,
+    threeGenerationGitHub,
+  );
+  assert.equal(threeGeneration.exitCode, 1);
+  assert.equal(threeGeneration.report.gateOutcome, "pending");
+  assert.equal(threeGeneration.report.recoveryCode, "request_clean_generation");
+  assert.match(threeGeneration.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(
+    threeGenerationGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const threeGenerationRecoveredGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      terminalA,
+      generationB,
+      delayedTerminalA,
+      generationC,
+    ],
+    reactionsByCommentId: new Map([
+      ["102", [reaction({ id: 542, created_at: "2026-08-25T08:03:30Z" })]],
+      ["103", [reaction({ id: 543, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const threeGenerationRecoveredEnvironment = runtimeEnvironment(context, {
+    suffix: "each-later-generation-directly-closed",
+  });
+  const { result: threeGenerationRecovered } = await runGate(
+    threeGenerationRecoveredEnvironment,
+    threeGenerationRecoveredGitHub,
+  );
+  assert.equal(threeGenerationRecovered.exitCode, 0);
+  assert.equal(threeGenerationRecovered.report.gateOutcome, "success");
+  assert.match(threeGenerationRecovered.report.reason, /request-reaction 543/u);
+
+  const directFirstGapGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, delayedTerminalA, generationC],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 544, created_at: "2026-08-25T08:01:00Z" })]],
+      ["103", [reaction({ id: 545, created_at: "2026-08-25T08:05:00Z" })]],
+    ]),
+  });
+  const directFirstGapEnvironment = runtimeEnvironment(context, {
+    suffix: "direct-first-gap-does-not-rearm-unbound-terminal",
+  });
+  const { result: directFirstGap } = await runGate(
+    directFirstGapEnvironment,
+    directFirstGapGitHub,
+  );
+  assert.equal(directFirstGap.exitCode, 1);
+  assert.equal(directFirstGap.report.gateOutcome, "pending");
+  assert.equal(directFirstGap.report.recoveryCode, "request_clean_generation");
+  assert.match(directFirstGap.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(
+    directFirstGapGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+});
+
+test("provider first-gap closure requires a quiet terminal-to-successor window", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const terminalEarly = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const latestReaction = new Map([["102", [reaction({
+    id: 570,
+    created_at: "2026-08-25T08:03:00Z",
+  })]]]);
+
+  const eyesGitHub = createGitHubMock({
+    issueComments: [generationA, terminalEarly, generationB],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({
+        id: 571,
+        content: "eyes",
+        created_at: "2026-08-25T08:01:30Z",
+      })]],
+      ...latestReaction,
+    ]),
+  });
+  const eyesEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-gap-post-terminal-eyes",
+  });
+  const { result: eyes } = await runGate(eyesEnvironment, eyesGitHub);
+  assert.equal(eyes.exitCode, 1);
+  assert.equal(eyes.report.gateOutcome, "pending");
+  assert.equal(eyes.report.recoveryCode, "request_clean_generation");
+
+  for (const [suffix, progressAt] of [
+    ["provider-gap-post-terminal-progress", "2026-08-25T08:01:30Z"],
+    ["provider-gap-same-time-progress", "2026-08-25T08:01:00Z"],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: [
+        generationA,
+        terminalEarly,
+        progressIssueComment({
+          id: 204,
+          created_at: progressAt,
+          updated_at: progressAt,
+        }),
+        generationB,
+      ],
+      reactionsByCommentId: latestReaction,
+    });
+    const environment = runtimeEnvironment(context, { suffix });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+  }
+
+  const terminalLate = cleanIssueComment(HEAD, {
+    id: 202,
+    created_at: "2026-08-25T08:01:45Z",
+    updated_at: "2026-08-25T08:01:45Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
+  });
+  const laterTerminalGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      terminalEarly,
+      progressIssueComment({
+        id: 204,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      }),
+      terminalLate,
+      generationB,
+    ],
+    reactionsByCommentId: latestReaction,
+  });
+  const laterTerminalEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-gap-later-terminal-recovery",
+  });
+  const { result: laterTerminal } = await runGate(
+    laterTerminalEnvironment,
+    laterTerminalGitHub,
+  );
+  assert.equal(laterTerminal.exitCode, 0);
+  assert.equal(laterTerminal.report.gateOutcome, "success");
+  assert.match(laterTerminal.report.reason, /request-reaction 570/u);
+
+  const physicalOnlyA = ordinaryRequest({ id: 101, user: ACTIONS_BOT });
+  const incompleteInventoryGitHub = createGitHubMock({
+    issueComments: [physicalOnlyA, terminalEarly, generationB],
+    reactionsByCommentId: latestReaction,
+  });
+  const incompleteInventoryEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-gap-incomplete-predecessor-reactions",
+  });
+  const { result: incompleteInventory } = await runGate(
+    incompleteInventoryEnvironment,
+    incompleteInventoryGitHub,
+  );
+  assert.equal(incompleteInventory.exitCode, 1);
+  assert.equal(incompleteInventory.report.gateOutcome, "pending");
+  assert.equal(incompleteInventory.report.recoveryCode, "request_clean_generation");
+  assert.equal(
+    incompleteInventoryGitHub.calls.some(({ path }) =>
+      path.endsWith("/comments/101/reactions")
+    ),
+    false,
+  );
+});
+
+test("a later provider clean can supersede an earlier direct candidate", async (context) => {
+  const generation = workflowRequest({ id: 101 });
+  const laterTerminal = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [generation, laterTerminal],
+    reactionsByCommentId: new Map([["101", [reaction({
+      id: 575,
+      created_at: "2026-08-25T08:01:00Z",
+    })]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "later-provider-clean-after-direct-candidate",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.match(result.report.reason, /issue-comment 201/u);
+});
+
+test("direct gap closure treats provider terminal activity as live work", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const generationA = workflowRequest({
+    id: 101,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const providerTerminal = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:11:30Z",
+    updated_at: "2026-08-25T08:11:30Z",
+  });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [generationA, providerTerminal, generationB],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 580, created_at: "2026-08-25T08:11:00Z" })]],
+      ["102", [reaction({ id: 581, created_at: "2026-08-25T08:13:00Z" })]],
+    ]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "direct-gap-post-clean-provider-terminal",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.match(result.report.reason, /earlier request 101.*newer request 102/iu);
+});
+
+test("edited terminal carriers preserve their unknown pre-edit activity interval", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const editedAfterBoundary = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:30Z",
+    updated_at: "2026-08-25T08:03:00Z",
+  });
+  const crossedBoundaryGitHub = createGitHubMock({
+    issueComments: [generationA, editedAfterBoundary, generationB],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 590, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({ id: 591, created_at: "2026-08-25T08:04:00Z" })]],
+    ]),
+  });
+  const crossedBoundaryEnvironment = runtimeEnvironment(context, {
+    suffix: "edited-terminal-crosses-successor-boundary",
+  });
+  const { result: crossedBoundary } = await runGate(
+    crossedBoundaryEnvironment,
+    crossedBoundaryGitHub,
+  );
+  assert.equal(crossedBoundary.exitCode, 1);
+  assert.equal(crossedBoundary.report.gateOutcome, "pending");
+  assert.equal(crossedBoundary.report.recoveryCode, "request_clean_generation");
+  assert.match(crossedBoundary.report.reason, /earlier request 101.*newer request 102/iu);
+
+  const editedBeforeBoundary = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:00:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const ownEndpointGitHub = createGitHubMock({
+    issueComments: [generationA, editedBeforeBoundary, generationB],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 592,
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const ownEndpointEnvironment = runtimeEnvironment(context, {
+    suffix: "edited-terminal-own-endpoint-has-no-clean-authority",
+  });
+  const { result: ownEndpoint } = await runGate(ownEndpointEnvironment, ownEndpointGitHub);
+  assert.equal(ownEndpoint.exitCode, 1);
+  assert.equal(ownEndpoint.report.gateOutcome, "pending");
+  assert.equal(ownEndpoint.report.recoveryCode, "request_clean_generation");
+  assert.match(ownEndpoint.report.reason, /earlier request 101.*newer request 102/iu);
+
+  const otherCarrierSameTimeGitHub = createGitHubMock({
+    issueComments: [
+      generationA,
+      editedBeforeBoundary,
+      progressIssueComment({
+        id: 204,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      }),
+      generationB,
+    ],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 593,
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const otherCarrierSameTimeEnvironment = runtimeEnvironment(context, {
+    suffix: "edited-terminal-does-not-ignore-other-carrier-endpoint",
+  });
+  const { result: otherCarrierSameTime } = await runGate(
+    otherCarrierSameTimeEnvironment,
+    otherCarrierSameTimeGitHub,
+  );
+  assert.equal(otherCarrierSameTime.exitCode, 1);
+  assert.equal(otherCarrierSameTime.report.gateOutcome, "pending");
+  assert.equal(otherCarrierSameTime.report.recoveryCode, "request_clean_generation");
+});
+
+test("an edited provider clean cannot erase an unobservable same-generation finding", async (context) => {
+  const generation = workflowRequest({ id: 101 });
+  const editedClean = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:00:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [generation, editedClean],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "edited-clean-cannot-hide-prior-finding",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.counts.indeterminate > 0, true);
+  assert.match(result.report.reason, /unobservable prior body history/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("malformed and unresolved carriers keep a provider-closed gap live", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const providerClean = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const cases = [
+    ["malformed", cleanIssueComment(HEAD, {
+      id: 202,
+      body: "Codex Review: Didn't find any major issues.",
+      created_at: "2026-08-25T08:01:30Z",
+      updated_at: "2026-08-25T08:01:30Z",
+    }), null],
+    ["unresolved", cleanIssueComment(HEAD.slice(0, 10), {
+      id: 202,
+      created_at: "2026-08-25T08:01:30Z",
+      updated_at: "2026-08-25T08:01:30Z",
+    }), () => ({ status: 422, message: "short SHA is ambiguous" })],
+  ];
+  for (const [suffix, badCarrier, commitResolution] of cases) {
+    const github = createGitHubMock({
+      issueComments: [generationA, providerClean, badCarrier, generationB],
+      reactionsByCommentId: new Map([["102", [reaction({
+        id: suffix === "malformed" ? 600 : 601,
+        created_at: "2026-08-25T08:03:00Z",
+      })]]]),
+      commitResolution,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `provider-clean-gap-${suffix}-activity`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(result.report.counts.indeterminate, 2, suffix);
+    assert.match(result.report.reason, /earlier request 101.*newer request 102/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("malformed and unresolved carriers keep a direct post-epoch gap live", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const generationA = workflowRequest({
+    id: 101,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const cases = [
+    ["malformed", cleanIssueComment(HEAD, {
+      id: 202,
+      body: "Codex Review: Didn't find any major issues.",
+      created_at: "2026-08-25T08:11:30Z",
+      updated_at: "2026-08-25T08:11:30Z",
+    }), null],
+    ["unresolved", cleanIssueComment(HEAD.slice(0, 10), {
+      id: 202,
+      created_at: "2026-08-25T08:11:30Z",
+      updated_at: "2026-08-25T08:11:30Z",
+    }), () => ({ status: 422, message: "short SHA is ambiguous" })],
+  ];
+  for (const [suffix, badCarrier, commitResolution] of cases) {
+    const github = createGitHubMock({
+      baseEpoch: epoch,
+      issueComments: [generationA, badCarrier, generationB],
+      reactionsByCommentId: new Map([
+        ["101", [reaction({ id: 610, created_at: "2026-08-25T08:11:00Z" })]],
+        ["102", [reaction({ id: 611, created_at: "2026-08-25T08:13:00Z" })]],
+      ]),
+      commitResolution,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `base-epoch-direct-gap-${suffix}-activity`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(result.report.counts.indeterminate, 2, suffix);
+    assert.match(result.report.reason, /earlier request 101.*newer request 102/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("a superseded edited malformed error still blocks its historical activity interval", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const editedMalformed = cleanIssueComment(HEAD, {
+    id: 201,
+    body: "Codex Review: Didn't find any major issues.",
+    created_at: "2026-08-25T08:00:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    issueComments: [generationA, editedMalformed, generationB],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 620, created_at: "2026-08-25T08:01:00Z" })]],
+      ["102", [reaction({ id: 621, created_at: "2026-08-25T08:03:00Z" })]],
+    ]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "edited-malformed-superseded-but-gap-live",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.counts.indeterminate, 2);
+  assert.match(result.report.reason, /earlier request 101.*newer request 102/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a pre-generation edited clean is neither generation clean nor finding supersession", async (context) => {
+  const generation = workflowRequest({
+    id: 101,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const editedClean = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:00:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const pendingGitHub = createGitHubMock({
+    issueComments: [editedClean, generation],
+  });
+  const pendingEnvironment = runtimeEnvironment(context, {
+    suffix: "pre-generation-edited-clean-not-generation-clean",
+  });
+  const { result: pending } = await runGate(pendingEnvironment, pendingGitHub);
+  assert.equal(pending.exitCode, 1);
+  assert.equal(pending.report.gateOutcome, "pending");
+  assert.equal(pending.report.recoveryCode, "request_clean_generation");
+  assert.equal(pendingGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const findingGitHub = createGitHubMock({
+    issueComments: [editedClean, generation],
+    reviews: [findingReview(HEAD, {
+      id: 401,
+      submitted_at: "2026-08-25T07:59:00Z",
+    })],
+  });
+  const findingEnvironment = runtimeEnvironment(context, {
+    suffix: "pre-generation-edited-clean-not-finding-supersession",
+  });
+  const { result: finding } = await runGate(findingEnvironment, findingGitHub);
+  assert.equal(finding.exitCode, 1);
+  assert.equal(finding.report.gateOutcome, "failure");
+  assert.equal(finding.report.recoveryCode, "fix_findings");
+  assert.equal(finding.report.counts.unresolved, 1);
+  assert.equal(finding.report.counts.resolved, 0);
+  assert.equal(findingGitHub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("GraphQL lastEditedAt makes same-second request history physical-only", async (context) => {
+  const sameSecondEdit = "2026-08-25T08:02:00.500Z";
+  const editedAwayCases = [
+    ["actions", workflowRequest({
+      id: 102,
+      body: "The request was edited away",
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+      last_edited_at: sameSecondEdit,
+      graphql_updated_at: sameSecondEdit,
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+    })],
+    ["other-app-bot", workflowRequest({
+      id: 102,
+      body: `Forged diagnostic\n\n<!-- ${V2_STICKY_MARKER} -->`,
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+      last_edited_at: sameSecondEdit,
+      graphql_updated_at: sameSecondEdit,
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+      user: { login: "other-app[bot]", type: "Bot" },
+      app: { slug: "other-app" },
+    })],
+  ];
+  for (const [suffix, editedAway] of editedAwayCases) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), editedAway],
+      reactionsByCommentId: new Map([["101", [reaction({
+        id: 660,
+        created_at: "2026-08-25T08:01:00Z",
+      })]]]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `same-second-edited-away-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(result.report.requiresReplacementPr, true, suffix);
+    assert.match(result.report.reason, /unobservable prior body history|newer request 102/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+
+  const editedCanonical = workflowRequest({
+    last_edited_at: "2026-08-25T08:00:00.500Z",
+    graphql_updated_at: "2026-08-25T08:00:00.500Z",
+  });
+  const canonicalGitHub = createGitHubMock({
+    issueComments: [editedCanonical],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const canonicalEnvironment = runtimeEnvironment(context, {
+    suffix: "same-second-edited-canonical-request",
+  });
+  const { result: canonical } = await runGate(canonicalEnvironment, canonicalGitHub);
+  assert.equal(canonical.exitCode, 1);
+  assert.equal(canonical.report.gateOutcome, "pending");
+  assert.equal(canonical.report.requiresReplacementPr, true);
+  assert.match(canonical.report.reason, /invalid binding/iu);
+  assert.equal(
+    canonicalGitHub.calls.some(({ path }) => path.endsWith("/comments/101/reactions")),
+    false,
+  );
+});
+
+test("a same-second edited provider terminal has no positive or superseding authority", async (context) => {
+  const generation = workflowRequest();
+  const editedClean = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    last_edited_at: "2026-08-25T08:01:00.500Z",
+    graphql_updated_at: "2026-08-25T08:01:00.500Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [generation, editedClean],
+    reviews: [findingReview(HEAD, {
+      id: 401,
+      submitted_at: "2026-08-25T08:00:30Z",
+    })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "same-second-edited-provider-clean",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.equal(result.report.counts.unresolved, 1);
+  assert.equal(result.report.counts.resolved, 0);
+  assert.match(result.report.reason, /edited Codex clean|evidence warning/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("observed issue-comment edit metadata cannot disappear during reconciliation", async (context) => {
+  const edited = genericComment(102);
+  edited.last_edited_at = "2026-08-25T08:00:00.500Z";
+  edited.graphql_updated_at = "2026-08-25T08:00:00.500Z";
+  const unedited = genericComment(102);
+  unedited.last_edited_at = null;
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [workflowRequest(), edited],
+      [workflowRequest(), unedited],
+      [workflowRequest(), unedited],
+      [workflowRequest(), unedited],
+      [workflowRequest(), unedited],
+    ],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "issue-comment-edit-metadata-latch",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /(?:edit metadata.*102.*disappeared|REST and GraphQL issue-comment metadata did not match for 102|Previously observed graphql issue-comment 102 changed)/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an updatedAt edit proof cannot roll back to an unedited snapshot", async (context) => {
+  const edited = genericComment(102);
+  edited.updated_at = "2026-08-25T07:00:01Z";
+  edited.last_edited_at = null;
+  const unedited = genericComment(102);
+  unedited.last_edited_at = null;
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [workflowRequest(), edited],
+      [workflowRequest(), unedited],
+      [workflowRequest(), unedited],
+      [workflowRequest(), unedited],
+      [workflowRequest(), unedited],
+    ],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "issue-comment-updated-at-edit-latch",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(
+    result.report.reason,
+    /(?:edit metadata.*102.*(?:disappeared|moved backwards)|rest issue-comment 102 changed)/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("older-request eyes block a later gap and finding supersession across requests", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const generationC = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const reactionsByCommentId = new Map([
+    ["101", [
+      reaction({ id: 630, created_at: "2026-08-25T08:00:30Z" }),
+      reaction({ id: 631, content: "eyes", created_at: "2026-08-25T08:03:00Z" }),
+    ]],
+    ["102", [reaction({ id: 632, created_at: "2026-08-25T08:02:00Z" })]],
+    ["103", [reaction({ id: 633, created_at: "2026-08-25T08:05:00Z" })]],
+  ]);
+  const gapGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, generationC],
+    reactionsByCommentId,
+  });
+  const gapEnvironment = runtimeEnvironment(context, {
+    suffix: "cross-request-eyes-block-later-gap",
+  });
+  const { result: gap } = await runGate(gapEnvironment, gapGitHub);
+  assert.equal(gap.exitCode, 1);
+  assert.equal(gap.report.gateOutcome, "pending");
+  assert.equal(gap.report.recoveryCode, "request_clean_generation");
+  assert.match(gap.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(gapGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const findingGitHub = createGitHubMock({
+    issueComments: [generationA, generationB, generationC],
+    reviews: [findingReview(HEAD, {
+      id: 401,
+      submitted_at: "2026-08-25T08:02:30Z",
+    })],
+    reactionsByCommentId,
+  });
+  const findingEnvironment = runtimeEnvironment(context, {
+    suffix: "cross-request-eyes-block-finding-supersession",
+  });
+  const { result: finding } = await runGate(findingEnvironment, findingGitHub);
+  assert.equal(finding.exitCode, 1);
+  assert.equal(finding.report.gateOutcome, "failure");
+  assert.equal(finding.report.counts.unresolved, 1);
+  assert.equal(finding.report.counts.resolved, 0);
+  assert.equal(findingGitHub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("clean selection falls back only to a qualifying later provider candidate", async (context) => {
+  const oldFinding = findingReview(HEAD, {
+    id: 401,
+    submitted_at: "2026-08-25T07:59:00Z",
+  });
+  const generation = workflowRequest({ id: 101 });
+  const reactionsByCommentId = new Map([["101", [
+    reaction({ id: 640, created_at: "2026-08-25T08:01:00Z" }),
+    reaction({ id: 641, content: "eyes", created_at: "2026-08-25T08:01:30Z" }),
+  ]]]);
+  const providerClean = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const qualifyingGitHub = createGitHubMock({
+    issueComments: [generation, providerClean],
+    reviews: [oldFinding],
+    reactionsByCommentId,
+  });
+  const qualifyingEnvironment = runtimeEnvironment(context, {
+    suffix: "fallback-to-qualifying-provider-clean",
+  });
+  const { result: qualifying } = await runGate(
+    qualifyingEnvironment,
+    qualifyingGitHub,
+  );
+  assert.equal(qualifying.exitCode, 0);
+  assert.equal(qualifying.report.gateOutcome, "success");
+  assert.equal(qualifying.report.counts.unresolved, 0);
+  assert.equal(qualifying.report.counts.resolved, 1);
+  assert.match(qualifying.report.reason, /issue-comment 201/u);
+
+  const editedFallback = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T07:58:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const nonqualifyingGitHub = createGitHubMock({
+    issueComments: [editedFallback, generation],
+    reviews: [oldFinding],
+    reactionsByCommentId,
+  });
+  const nonqualifyingEnvironment = runtimeEnvironment(context, {
+    suffix: "edited-provider-fallback-is-not-qualifying",
+  });
+  const { result: nonqualifying } = await runGate(
+    nonqualifyingEnvironment,
+    nonqualifyingGitHub,
+  );
+  assert.equal(nonqualifying.exitCode, 1);
+  assert.equal(nonqualifying.report.gateOutcome, "failure");
+  assert.equal(nonqualifying.report.counts.unresolved, 1);
+  assert.equal(nonqualifying.report.counts.resolved, 0);
+  assert.equal(nonqualifyingGitHub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("same-run request siblings preserve every physical generation gap", async (context) => {
+  const siblingA = workflowRequest({ id: 101 });
+  const siblingB = workflowRequest({
+    id: 102,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    issueComments: [siblingA, siblingB],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 512,
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "same-run-physical-gap" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.match(result.report.reason, /earlier request 101.*newer request 102/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a globally duplicated reaction identity cannot authorize the latest generation", async (context) => {
+  const generationA = workflowRequest({ id: 101 });
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const github = createGitHubMock({
+    issueComments: [
+      generationA,
+      cleanIssueComment(HEAD, {
+        id: 202,
+        created_at: "2026-08-25T08:01:00Z",
+        updated_at: "2026-08-25T08:01:00Z",
+      }),
+      generationB,
+    ],
+    reactionsByCommentId: new Map([
+      ["101", [reaction({ id: 513, created_at: "2026-08-25T08:01:30Z" })]],
+      ["102", [reaction({ id: 513, created_at: "2026-08-25T08:03:00Z" })]],
+    ]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "global-reaction-id-duplicate" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /repeated official Codex identity 513/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("short Reviewed commit is accepted only through GitHub unambiguous resolution", async (context) => {
@@ -1650,12 +5736,14 @@ test("same-head finding remains blocking after clean from the same generation", 
   assert.deepEqual(github.statusWrites, []);
 });
 
-test("finding supersession requires a strictly newer authorized generation and later head-bound clean", async (context) => {
+test("finding supersession requires a strictly newer authorized generation and request-bound clean", async (context) => {
   const first = ordinaryRequest({ id: 101 });
-  const second = ordinaryRequest({
+  const second = workflowRequest({
     id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
     created_at: "2026-08-25T08:10:00Z",
     updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
   });
   const clean = cleanIssueComment(HEAD, {
     id: 203,
@@ -1665,6 +5753,10 @@ test("finding supersession requires a strictly newer authorized generation and l
   const github = createGitHubMock({
     issueComments: [first, second, clean],
     reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00Z" })],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 550,
+      created_at: "2026-08-25T08:15:30Z",
+    })]]]),
   });
   const environment = runtimeEnvironment(context, { suffix: "superseded" });
   const { result } = await runGate(environment, github);
@@ -1687,10 +5779,12 @@ test("finding supersession requires a strictly newer authorized generation and l
 });
 
 test("a strict later generation can supersede an older cross-channel timestamp ambiguity", async (context) => {
-  const laterGeneration = ordinaryRequest({
+  const laterGeneration = workflowRequest({
     id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
     created_at: "2026-08-25T08:10:00Z",
     updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
   });
   const laterClean = cleanIssueComment(HEAD, {
     id: 203,
@@ -1708,6 +5802,10 @@ test("a strict later generation can supersede an older cross-channel timestamp a
       laterClean,
     ],
     reviews: [findingReview(HEAD, { submitted_at: "2026-08-25T08:05:00.900Z" })],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 551,
+      created_at: "2026-08-25T08:15:30Z",
+    })]]]),
   });
   const environment = runtimeEnvironment(context, { suffix: "old-channel-conflict" });
   const { result } = await runGate(environment, github);
@@ -1803,6 +5901,68 @@ test("older malformed and provider-identity errors become historical after a str
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "success");
   assert.equal(result.report.counts.indeterminate, 2);
+});
+
+test("invalid provider provenance remains activity in the generation quiet window", async (context) => {
+  const generationA = workflowRequest();
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const cases = [
+    ["official-login-wrong-app-comment", {
+      issueComments: [cleanIssueComment(HEAD, {
+        id: 201,
+        performed_via_github_app: { slug: "wrong-provider" },
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      })],
+      reviews: [],
+    }],
+    ["secondary-official-app-signal-comment", {
+      issueComments: [cleanIssueComment(HEAD, {
+        id: 201,
+        user: { login: "wrong-provider[bot]", type: "Bot" },
+        app: { slug: "wrong-provider" },
+        performed_via_github_app: CODEX_APP,
+        created_at: "2026-08-25T08:01:30Z",
+        updated_at: "2026-08-25T08:01:30Z",
+      })],
+      reviews: [],
+    }],
+    ["official-app-signal-review", {
+      issueComments: [],
+      reviews: [findingReview(HEAD, {
+        id: 401,
+        user: { login: "wrong-provider[bot]", type: "Bot" },
+        app: CODEX_APP,
+        submitted_at: "2026-08-25T08:01:30Z",
+      })],
+    }],
+  ];
+  for (const [suffix, carrier] of cases) {
+    const github = createGitHubMock({
+      issueComments: [generationA, ...carrier.issueComments, generationB],
+      reviews: carrier.reviews,
+      reactionsByCommentId: new Map([
+        ["101", [reaction({ id: 670, created_at: "2026-08-25T08:01:00Z" })]],
+        ["102", [reaction({ id: 671, created_at: "2026-08-25T08:03:00Z" })]],
+      ]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `invalid-provider-quiet-window-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(result.report.counts.indeterminate, 2, suffix);
+    assert.match(result.report.reason, /earlier request 101.*newer request 102/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
 });
 
 test("old-head malformed review errors can recover but current-generation provider errors cannot pass", async (context) => {
@@ -2112,6 +6272,304 @@ test("begin-review posts one exact same-run marker, adopts it on rerun, and supp
   assert.deepEqual(disabledGitHub.requestBodies, []);
 });
 
+test("begin-review does not adopt an existing same-second edited canonical request", async (context) => {
+  const edited = workflowRequest({
+    last_edited_at: "2026-08-25T08:00:00.500Z",
+    graphql_updated_at: "2026-08-25T08:00:00.500Z",
+  });
+  const github = createGitHubMock({ issueComments: [edited] });
+  const environment = runtimeEnvironment(context, {
+    suffix: "begin-existing-same-second-edit",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+  assert.equal(
+    github.calls.some(({ path, body }) =>
+      path === "/graphql" &&
+      body?.query?.includes("CodexReviewGateDeletedComments") &&
+      body.query.includes("lastEditedAt")
+    ),
+    true,
+  );
+});
+
+for (const [suffix, postUnknownAfterCreate] of [
+  ["created-refetch", false],
+  ["unknown-post-reread", true],
+]) {
+  test(`begin-review rejects a same-second edited request on ${suffix}`, async (context) => {
+    const github = createGitHubMock({
+      postUnknownAfterCreate,
+      createdCommentOverrides: {
+        last_edited_at: "2026-08-25T09:00:00.500Z",
+        graphql_updated_at: "2026-08-25T09:00:00.500Z",
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `begin-same-second-edit-${suffix}`,
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "retry_begin", suffix);
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.equal(github.requestBodies.length, 1, suffix);
+    assert.equal(
+      github.calls.some(({ path, body }) =>
+        path === "/graphql" &&
+        body?.query?.includes("CodexReviewGateDeletedComments") &&
+        body.query.includes("lastEditedAt")
+      ),
+      true,
+      suffix,
+    );
+  });
+}
+
+test("begin-review cannot forget an edit observed before post-verification fallback", async (context) => {
+  const editedAt = "2026-08-25T09:00:00.500Z";
+  const github = createGitHubMock({
+    deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+      if (snapshotIndex !== 1) return response;
+      const mutated = structuredClone(response);
+      const created = mutated.data.repository.pullRequest.comments.nodes.find(
+        ({ databaseId }) => databaseId === "10000",
+      );
+      if (created) {
+        created.updatedAt = editedAt;
+        created.lastEditedAt = editedAt;
+      }
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "begin-post-verification-edit-rollback",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "retry_begin");
+  assert.equal(result.report.retrySafe, false);
+  assert.equal(github.requestBodies.length, 1);
+  assert.match(
+    result.report.reason,
+    /(?:edit metadata.*10000.*moved backwards|(?:graphql )?issue-comment 10000 (?:changed|updatedAt changed))/iu,
+  );
+});
+
+test("begin-review cannot replace a previously observed deletion identity", async (context) => {
+  const first = deletedCommentEvent({ id: "CDE_begin_E" });
+  const replacement = deletedCommentEvent({
+    id: "CDE_begin_F",
+    createdAt: "2026-08-25T08:03:00Z",
+  });
+  for (const [suffix, options] of [
+    ["post-create-history", {}],
+    ["known-post-fallback", { failDirectHistory: true }],
+    ["unknown-post-fallback", { postUnknownAfterCreate: true }],
+  ]) {
+    let historyRequests = 0;
+    const github = createGitHubMock({
+      deletedCommentEventSnapshots: [
+        [first],
+        [replacement],
+        [replacement],
+        [replacement],
+      ],
+      postUnknownAfterCreate: options.postUnknownAfterCreate === true,
+      requestInterceptor: options.failDirectHistory
+        ? ({ method, path, body }) => {
+            if (
+              method !== "POST" ||
+              path !== "/graphql" ||
+              !body?.query?.includes("CodexReviewGateDeletedComments")
+            ) {
+              return undefined;
+            }
+            historyRequests += 1;
+            if (historyRequests >= 2 && historyRequests <= 4) {
+              return jsonResponse({ message: "synthetic history transport failure" }, 502);
+            }
+            return undefined;
+          }
+        : null,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `begin-deletion-identity-${suffix}`,
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "retry_begin", suffix);
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.equal(github.requestBodies.length, 1, suffix);
+    assert.match(
+      result.report.reason,
+      /CDE_begin_E.*disappeared from later inventory/iu,
+      suffix,
+    );
+  }
+});
+
+test("begin-review latches identical history duplicates before a top-level GraphQL failure", async (context) => {
+  const oldDeletion = deletedCommentEvent({
+    id: "CDE_begin_duplicate",
+    createdAt: "2026-08-25T07:00:00Z",
+  });
+  for (const [suffix, options, expectedReason] of [
+    ["issue-comment", {}, /issue-comment 10000 appeared more than once/iu],
+    ["deleted-comment", {
+      deletedCommentEvents: [oldDeletion],
+    }, /deleted-comment event CDE_begin_duplicate appeared more than once/iu],
+  ]) {
+    const github = createGitHubMock({
+      ...options,
+      deletedCommentResponseMutator: (response, { snapshotIndex }) => {
+        if (snapshotIndex !== 1) return response;
+        const mutated = structuredClone(response);
+        const connection = suffix === "issue-comment"
+          ? mutated.data.repository.pullRequest.comments
+          : mutated.data.repository.pullRequest.timelineItems;
+        connection.nodes.push(structuredClone(connection.nodes[0]));
+        mutated.errors = [{ message: "synthetic partial GraphQL failure" }];
+        return mutated;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `begin-identical-history-duplicate-${suffix}`,
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "retry_begin", suffix);
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.equal(github.requestBodies.length, 1, suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+  }
+});
+
+test("begin-review latches created exact-refetch content before history transport failure", async (context) => {
+  let historyRequests = 0;
+  let createdRefetches = 0;
+  const github = createGitHubMock({
+    commentRefetchMutator: (comment) => {
+      if (String(comment.id) !== "10000") return comment;
+      createdRefetches += 1;
+      return createdRefetches === 1
+        ? { ...comment, body: "synthetic tampered created request" }
+        : comment;
+    },
+    requestInterceptor: ({ method, path, body }) => {
+      if (
+        method !== "POST" ||
+        path !== "/graphql" ||
+        !body?.query?.includes("CodexReviewGateDeletedComments")
+      ) {
+        return undefined;
+      }
+      historyRequests += 1;
+      if (historyRequests >= 2 && historyRequests <= 4) {
+        return jsonResponse({ message: "synthetic history transport failure" }, 502);
+      }
+      return undefined;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "begin-created-refetch-before-history-failure",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "retry_begin");
+  assert.equal(result.report.retrySafe, false);
+  assert.equal(github.requestBodies.length, 1);
+  assert.match(
+    result.report.reason,
+    /Previously observed rest issue-comment 10000 changed/iu,
+  );
+});
+
+test("begin-review cannot replace a known created id with another same-run marker", async (context) => {
+  const tamperedCreated = workflowRequest({
+    id: 10_000,
+    body: "synthetic tampered created request",
+    created_at: "2026-08-25T09:00:00Z",
+    updated_at: "2026-08-25T09:00:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-10000`,
+  });
+  const alternate = workflowRequest({
+    id: 10_001,
+    created_at: "2026-08-25T09:00:01Z",
+    updated_at: "2026-08-25T09:00:01Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-10001`,
+  });
+  let historyRequests = 0;
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [],
+      [tamperedCreated, alternate],
+      [tamperedCreated, alternate],
+    ],
+    pullRequestOverrides: { comments: 0 },
+    commentRefetchMutator: (comment) =>
+      String(comment.id) === "10000" ? tamperedCreated : comment,
+    requestInterceptor: ({ method, path, body }) => {
+      if (
+        method !== "POST" ||
+        path !== "/graphql" ||
+        !body?.query?.includes("CodexReviewGateDeletedComments")
+      ) {
+        return undefined;
+      }
+      historyRequests += 1;
+      if (historyRequests >= 2 && historyRequests <= 4) {
+        return jsonResponse({ message: "synthetic history transport failure" }, 502);
+      }
+      return undefined;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "begin-created-id-cannot-be-substituted",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "retry_begin");
+  assert.equal(result.report.retrySafe, false);
+  assert.equal(github.requestBodies.length, 1);
+  assert.match(result.report.reason, /POST visibility remains unknown/iu);
+});
+
 test("unknown begin-review POST is reconciled by exact same-run reread without duplication", async (context) => {
   const github = createGitHubMock({ postUnknownAfterCreate: true });
   const environment = runtimeEnvironment(context, {
@@ -2269,6 +6727,30 @@ test("begin-review keeps every post-attempt verification failure retry-unsafe", 
         };
       })(),
     },
+    {
+      suffix: "begin-created-final-scope-closed",
+      options: {
+        pullRequestSequence: [{}, {}, { state: "closed" }],
+      },
+    },
+    {
+      suffix: "begin-created-final-scope-draft",
+      options: {
+        pullRequestSequence: [{}, {}, { draft: true }],
+      },
+    },
+    {
+      suffix: "begin-created-final-scope-test-merge-changed",
+      options: {
+        pullRequestSequence: [{}, {}, { merge_commit_sha: NEXT_HEAD }],
+      },
+    },
+    {
+      suffix: "begin-created-final-scope-base-changed",
+      options: {
+        pullRequestSequence: [{}, {}, { base: { sha: NEXT_HEAD } }],
+      },
+    },
   ];
 
   for (const { suffix, options } of cases) {
@@ -2284,6 +6766,9 @@ test("begin-review keeps every post-attempt verification failure retry-unsafe", 
     assert.equal(result.report.recoveryCode, "retry_begin", suffix);
     assert.equal(result.report.retrySafe, false, suffix);
     assert.equal(github.requestBodies.length, 1, suffix);
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.match(summary, /Wait for the exact same-run request marker to settle/u, suffix);
+    assert.doesNotMatch(summary, /Retry the identical exact-head begin-review invocation/u, suffix);
   }
 });
 
@@ -2324,7 +6809,10 @@ test("begin-review terminal paths reread exact PR scope and never add stale diag
     operation: "begin-review",
   });
   const { result: unknown } = await runGate(unknownEnvironment, unknownGitHub);
+  assert.equal(unknown.report.executionHealth, "healthy");
   assert.equal(unknown.report.gateOutcome, "not_applicable");
+  assert.equal(unknown.report.recoveryCode, "refresh_head");
+  assert.equal(unknown.report.retrySafe, false);
   assert.equal(unknownGitHub.requestBodies.length, 1);
   assert.deepEqual(unknownGitHub.stickyCreates, []);
   assert.deepEqual(unknownGitHub.stickyPatches, []);
@@ -3062,13 +7550,17 @@ test("controller requires one canonical job and the GitHub Actions CheckRun sour
   }
 });
 
-test("sticky diagnostics update the lowest-id duplicate and emit one bounded warning", async (context) => {
-  const lowerIdButNewer = stickyComment({
+test("canonical sticky diagnostics remain immutable and never multiply", async (context) => {
+  const lowerIdButNewer = canonicalStickyComment({
     id: 301,
     created_at: "2026-08-25T09:00:00Z",
     updated_at: "2026-08-25T09:00:00Z",
   });
-  const higherIdButOlder = stickyComment({ id: 302, created_at: "2026-08-25T07:00:00Z" });
+  const higherIdButOlder = canonicalStickyComment({
+    id: 302,
+    created_at: "2026-08-25T07:00:00Z",
+    updated_at: "2026-08-25T07:00:00Z",
+  });
   const github = createGitHubMock({
     issueComments: [workflowRequest(), higherIdButOlder, lowerIdButNewer],
   });
@@ -3086,13 +7578,82 @@ test("sticky diagnostics update the lowest-id duplicate and emit one bounded war
     console.warn = originalWarn;
   }
   assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(github.stickyPatches.at(-1).id, "301");
+  assert.deepEqual(github.stickyPatches, []);
   assert.equal(github.stickyCreates.length, 0);
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /^Found 2 canonical v2 sticky diagnostics;/u);
-  assert.match(warnings[0], /updating lowest-id comment 301$/u);
+  assert.equal(
+    warnings[0],
+    "Found 2 canonical v2 sticky diagnostics; preserving them without mutation",
+  );
   assert.equal(warnings[0].length < 160, true);
   assert.equal(github.calls.some(({ method }) => method === "DELETE"), false);
+});
+
+test("controller diagnostics cannot edit themselves into later review boundaries", async (context) => {
+  const historicalSticky = canonicalStickyComment({
+    id: 301,
+    stickyHeadSha: BASE,
+    created_at: "2026-08-25T07:30:00Z",
+    updated_at: "2026-08-25T07:30:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), historicalSticky],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const controllerEnvironment = runtimeEnvironment(context, {
+    suffix: "immutable-sticky-controller",
+    eventName: "workflow_dispatch",
+  });
+  const { result: controller } = await runGate(controllerEnvironment, github);
+  assert.equal(controller.exitCode, 0);
+  assert.equal(controller.report.gateOutcome, "pending");
+  assert.deepEqual(github.stickyPatches, []);
+  assert.equal(github.stickyCreates.length, 0);
+
+  const verifierEnvironment = runtimeEnvironment(context, {
+    suffix: "immutable-sticky-verifier",
+  });
+  const { result: verifier } = await runGate(verifierEnvironment, github);
+  assert.equal(verifier.exitCode, 0);
+  assert.equal(verifier.report.executionHealth, "healthy");
+  assert.equal(verifier.report.gateOutcome, "success");
+  assert.equal(verifier.report.counts.indeterminate, 0);
+  assert.equal(verifier.report.requiresReplacementPr, false);
+  assert.match(verifier.report.reason, /request-reaction 501/u);
+  assert.deepEqual(github.stickyPatches, []);
+  assert.equal(github.stickyCreates.length, 0);
+});
+
+test("sticky creation fresh-reads after a stale controller comment snapshot", async (context) => {
+  const request = workflowRequest();
+  const interveningSticky = canonicalStickyComment({
+    id: 301,
+    created_at: "2026-08-25T08:30:00Z",
+    updated_at: "2026-08-25T08:30:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [request],
+    issueCommentSnapshots: [
+      [request],
+      [request, interveningSticky],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "fresh-sticky-create-suppression",
+    operation: "begin-review",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.stickyPatches, []);
+  assert.equal(github.stickyCreates.length, 0);
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`
+    ).length,
+    2,
+  );
 });
 
 test("summary and sticky diagnostics are bounded Markdown, HTML, and mention safe", (context) => {
@@ -3119,6 +7680,192 @@ test("summary and sticky diagnostics are bounded Markdown, HTML, and mention saf
     assert.match(diagnostic, /&lt;script&gt;&#64;codex review/u);
     assert.equal(diagnostic.length < 5_000, true);
   }
+});
+
+test("recovery diagnostics route request-clean and finding fixes by proven lineage", async (context) => {
+  const generationB = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const replacementGitHub = createGitHubMock({
+    issueComments: [workflowRequest({ id: 101 }), generationB],
+    reactionsByCommentId: new Map([["102", [reaction({
+      id: 650,
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const replacementEnvironment = runtimeEnvironment(context, {
+    suffix: "recovery-lineage-replacement-pr",
+  });
+  const { result: replacement } = await runGate(
+    replacementEnvironment,
+    replacementGitHub,
+  );
+
+  const epoch = baseRefChangedEvent();
+  const currentRequest = workflowRequest({
+    id: 101,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const directGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [currentRequest, cleanIssueComment(HEAD, {
+      id: 201,
+      created_at: "2026-08-25T08:15:00Z",
+      updated_at: "2026-08-25T08:15:00Z",
+    })],
+  });
+  const directEnvironment = runtimeEnvironment(context, {
+    suffix: "recovery-lineage-existing-current-request",
+  });
+  const { result: direct } = await runGate(directEnvironment, directGitHub);
+
+  const generationGitHub = createGitHubMock({ baseEpoch: epoch });
+  const generationEnvironment = runtimeEnvironment(context, {
+    suffix: "recovery-lineage-create-one-generation",
+  });
+  const { result: generation } = await runGate(generationEnvironment, generationGitHub);
+
+  const physicalOnlyRequest = ordinaryRequest({
+    id: 102,
+    user: ACTIONS_BOT,
+    created_at: "2026-08-25T08:01:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const generationC = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "125" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const findingGapGitHub = createGitHubMock({
+    issueComments: [
+      workflowRequest({ id: 101 }),
+      physicalOnlyRequest,
+      progressIssueComment({
+        id: 202,
+        created_at: "2026-08-25T08:02:30Z",
+        updated_at: "2026-08-25T08:02:30Z",
+      }),
+      generationC,
+    ],
+    reviews: [findingReview(HEAD, {
+      id: 401,
+      submitted_at: "2026-08-25T08:02:00Z",
+    })],
+    reactionsByCommentId: new Map([["103", [reaction({
+      id: 651,
+      created_at: "2026-08-25T08:04:00Z",
+    })]]]),
+  });
+  const findingGapEnvironment = runtimeEnvironment(context, {
+    suffix: "recovery-finding-with-unclosable-lineage",
+  });
+  const { result: findingGap } = await runGate(
+    findingGapEnvironment,
+    findingGapGitHub,
+  );
+  assert.equal(findingGap.report.gateOutcome, "failure");
+  assert.equal(findingGap.report.recoveryCode, "fix_findings");
+  assert.equal(findingGap.report.requiresReplacementPr, true);
+
+  const diagnostics = (result, environment) => [
+    readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
+    buildV2StickyCommentBody(result.report, { prNumber: PR, headSha: HEAD }),
+  ];
+  assert.equal(replacement.report.requiresReplacementPr, true);
+  for (const diagnostic of diagnostics(replacement, replacementEnvironment)) {
+    assert.match(diagnostic, /do not add another review boundary on the original PR/iu);
+    assert.match(diagnostic, /historical lineage cannot be closed safely/iu);
+    assert.match(diagnostic, /replacement PR/iu);
+    assert.doesNotMatch(diagnostic, /structured lineage is safe to extend/iu);
+  }
+  for (const [result, environment] of [
+    [direct, directEnvironment],
+    [generation, generationEnvironment],
+  ]) {
+    assert.equal(result.report.requiresReplacementPr, false);
+    for (const diagnostic of diagnostics(result, environment)) {
+      assert.match(diagnostic, /reported request lineage/iu);
+      assert.match(diagnostic, /latest current canonical request/iu);
+      assert.match(diagnostic, /qualifying direct \+1/iu);
+      assert.match(diagnostic, /structured lineage is safe to extend/iu);
+      assert.match(diagnostic, /create exactly one canonical generation/iu);
+      assert.doesNotMatch(diagnostic, /replacement PR/iu);
+    }
+  }
+  for (const diagnostic of diagnostics(findingGap, findingGapEnvironment)) {
+    assert.match(diagnostic, /fix the unresolved Codex findings/iu);
+    assert.match(diagnostic, /do not request another generation on the original PR/iu);
+    assert.match(diagnostic, /unclosable historical lineage/iu);
+    assert.match(diagnostic, /open a replacement PR with the fixes/iu);
+    assert.match(diagnostic, /exactly one canonical review generation/iu);
+  }
+});
+
+test("finding recovery distinguishes authorized ordinary and latest physical-only boundaries", async (context) => {
+  const authorizedGitHub = createGitHubMock({
+    issueComments: [ordinaryRequest(), findingIssueComment(HEAD)],
+  });
+  const authorizedEnvironment = runtimeEnvironment(context, {
+    suffix: "finding-authorized-ordinary-boundary",
+  });
+  const { result: authorized } = await runGate(
+    authorizedEnvironment,
+    authorizedGitHub,
+  );
+
+  assert.equal(authorized.report.gateOutcome, "failure");
+  assert.equal(authorized.report.recoveryCode, "fix_findings");
+  assert.equal(authorized.report.requiresReplacementPr, false);
+  const authorizedSummary = readFileSync(
+    authorizedEnvironment.GITHUB_STEP_SUMMARY,
+    "utf8",
+  );
+  assert.match(authorizedSummary, /request a new review generation/iu);
+  assert.doesNotMatch(authorizedSummary, /replacement PR/iu);
+
+  const physicalOnly = ordinaryRequest({
+    id: 102,
+    user: ACTIONS_BOT,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const physicalGitHub = createGitHubMock({
+    issueComments: [
+      workflowRequest(),
+      findingIssueComment(HEAD, {
+        id: 201,
+        created_at: "2026-08-25T08:01:00Z",
+        updated_at: "2026-08-25T08:01:00Z",
+      }),
+      physicalOnly,
+    ],
+  });
+  const physicalEnvironment = runtimeEnvironment(context, {
+    suffix: "finding-latest-physical-only-boundary",
+  });
+  const { result: physical } = await runGate(
+    physicalEnvironment,
+    physicalGitHub,
+  );
+
+  assert.equal(physical.report.gateOutcome, "failure");
+  assert.equal(physical.report.recoveryCode, "fix_findings");
+  assert.equal(physical.report.requiresReplacementPr, true);
+  const physicalSummary = readFileSync(
+    physicalEnvironment.GITHUB_STEP_SUMMARY,
+    "utf8",
+  );
+  assert.match(physicalSummary, /fix the unresolved Codex findings/iu);
+  assert.match(physicalSummary, /replacement PR/iu);
+  assert.doesNotMatch(physicalSummary, /request a new review generation/iu);
 });
 
 test("untrusted finding excerpts cannot inject review requests, Markdown, or HTML into verifier summary", async (context) => {
@@ -3321,6 +8068,25 @@ function stickyComment(overrides = {}) {
     performed_via_github_app: null,
     ...overrides,
   };
+}
+
+function canonicalStickyComment({
+  stickyHeadSha = BASE,
+  stickyReport = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "Historical gate diagnostic",
+    recoveryCode: "wait_provider",
+  }),
+  ...overrides
+} = {}) {
+  return stickyComment({
+    body: buildV2StickyCommentBody(stickyReport, {
+      prNumber: PR,
+      headSha: stickyHeadSha,
+    }),
+    ...overrides,
+  });
 }
 
 function issueCommentEvent(action, comment, overrides = {}) {
@@ -3533,6 +8299,10 @@ function createGitHubMock({
   baseEpoch = null,
   baseEpochSequence = null,
   baseEpochResponseMutator = null,
+  deletedCommentEvents = [],
+  deletedCommentEventSnapshots = null,
+  deletedCommentResponseMutator = null,
+  deletedCommentPageSize = 100,
   permissionByLogin = new Map([[HUMAN.login, "write"]]),
   permissionMissingLogins = new Set(),
   commitResolution = null,
@@ -3540,6 +8310,7 @@ function createGitHubMock({
   reviewRefetchMutator = null,
   postUnknownAfterCreate = false,
   postUnknownReread = "visible",
+  createdCommentOverrides = {},
   verifierRuns = [verifierRun()],
   verifierAttemptStatus = "queued",
   verifierRerunAdvances = true,
@@ -3553,6 +8324,9 @@ function createGitHubMock({
   const reviewList = reviews.map((value) => structuredClone(value));
   const reviewSnapshotList = reviewSnapshots?.map((snapshotReviews) =>
     snapshotReviews.map((value) => structuredClone(value))) || null;
+  const deletedComments = deletedCommentEvents.map((value) => structuredClone(value));
+  const deletedCommentSnapshots = deletedCommentEventSnapshots?.map((snapshotEvents) =>
+    snapshotEvents.map((value) => structuredClone(value))) || null;
   const calls = [];
   const statusWrites = [];
   const requestBodies = [];
@@ -3565,6 +8339,7 @@ function createGitHubMock({
   let pullRequestIndex = 0;
   let repositoryIndex = 0;
   let baseEpochIndex = 0;
+  let deletedCommentSnapshotIndex = 0;
   const reactionSnapshotIndexes = new Map();
   let activeComments = comments;
   let activeReviews = reviewList;
@@ -3580,6 +8355,13 @@ function createGitHubMock({
   function currentReviews() {
     if (!reviewSnapshotList) return reviewList;
     return reviewSnapshotList[Math.min(reviewSnapshotIndex, reviewSnapshotList.length - 1)] || [];
+  }
+
+  function currentDeletedCommentEvents() {
+    if (!deletedCommentSnapshots) return deletedComments;
+    return deletedCommentSnapshots[
+      Math.min(deletedCommentSnapshotIndex, deletedCommentSnapshots.length - 1)
+    ] || [];
   }
 
   function pullRequest() {
@@ -3743,7 +8525,38 @@ function createGitHubMock({
     if (method === "GET" && path === `/repos/${REPOSITORY}/check-runs/9001`) {
       return jsonResponse(verifierCheckRun({ status: verifierAttemptStatus }));
     }
-    if (method === "POST" && path === "/graphql") {
+    if (
+      method === "POST" &&
+      path === "/graphql" &&
+      body?.query?.includes("CodexReviewGateDeletedComments")
+    ) {
+      const cursor = body.variables?.cursor ?? null;
+      const events = currentDeletedCommentEvents();
+      const response = deletedCommentGraphQlResponse(events, {
+        cursor,
+        commentCursor: body.variables?.commentCursor ?? null,
+        comments: activeComments,
+        includeDeleted: body.variables?.includeDeleted !== false,
+        includeComments: body.variables?.includeComments !== false,
+        pageSize: deletedCommentPageSize,
+      });
+      const mutated = typeof deletedCommentResponseMutator === "function"
+        ? deletedCommentResponseMutator(response.body, {
+            cursor,
+            commentCursor: body.variables?.commentCursor ?? null,
+            includeDeleted: body.variables?.includeDeleted !== false,
+            includeComments: body.variables?.includeComments !== false,
+            snapshotIndex: deletedCommentSnapshotIndex,
+          })
+        : response.body;
+      if (!response.hasNext) deletedCommentSnapshotIndex += 1;
+      return jsonResponse(mutated);
+    }
+    if (
+      method === "POST" &&
+      path === "/graphql" &&
+      body?.query?.includes("CodexReviewGateBaseEpoch")
+    ) {
       const selected = baseEpochSequence
         ? baseEpochSequence[Math.min(baseEpochIndex, baseEpochSequence.length - 1)]
         : baseEpoch;
@@ -3849,6 +8662,7 @@ function createGitHubMock({
         user: ACTIONS_BOT,
         app: null,
         performed_via_github_app: null,
+        ...structuredClone(createdCommentOverrides),
       };
       nextCommentId += 1;
       comments.push(created);
@@ -3904,6 +8718,92 @@ function baseEpochGraphQlResponse(event = null) {
   };
 }
 
+function deletedCommentGraphQlResponse(events, {
+  cursor = null,
+  commentCursor = null,
+  comments = [],
+  includeDeleted = true,
+  includeComments = true,
+  pageSize = 100,
+} = {}) {
+  const match = cursor === null
+    ? null
+    : /^deleted-comment:(\d+)$/u.exec(String(cursor));
+  const start = match ? Number(match[1]) : 0;
+  const size = Math.max(1, Number(pageSize) || 1);
+  const nodes = events.slice(start, start + size).map((event) => structuredClone(event));
+  const nextOffset = start + nodes.length;
+  const deletedHasNext = includeDeleted && nextOffset < events.length;
+  const commentMatch = commentCursor === null
+    ? null
+    : /^issue-comment:(\d+)$/u.exec(String(commentCursor));
+  const commentStart = commentMatch ? Number(commentMatch[1]) : 0;
+  const commentNodes = comments
+    .slice(commentStart, commentStart + size)
+    .map((comment) => issueCommentEditGraphQlNode(comment));
+  const commentNextOffset = commentStart + commentNodes.length;
+  const commentsHaveNext = includeComments && commentNextOffset < comments.length;
+  const pullRequest = { number: PR };
+  if (includeDeleted) {
+    pullRequest.timelineItems = {
+      totalCount: events.length,
+      filteredCount: Math.max(0, events.length - start),
+      pageCount: nodes.length,
+      nodes,
+      pageInfo: {
+        hasNextPage: deletedHasNext,
+        endCursor: deletedHasNext ? `deleted-comment:${nextOffset}` : null,
+      },
+    };
+  }
+  if (includeComments) {
+    pullRequest.comments = {
+      totalCount: comments.length,
+      nodes: commentNodes,
+      pageInfo: {
+        hasNextPage: commentsHaveNext,
+        endCursor: commentsHaveNext ? `issue-comment:${commentNextOffset}` : null,
+      },
+    };
+  }
+  return {
+    body: {
+      data: {
+        repository: {
+          nameWithOwner: REPOSITORY,
+          pullRequest,
+        },
+      },
+    },
+    hasNext: deletedHasNext || commentsHaveNext,
+  };
+}
+
+function issueCommentEditGraphQlNode(comment) {
+  const hasExplicitLastEditedAt = Object.hasOwn(comment, "last_edited_at");
+  const lastEditedAt = hasExplicitLastEditedAt
+    ? comment.last_edited_at
+    : comment.created_at === comment.updated_at
+      ? null
+      : comment.updated_at;
+  const updatedAt = comment.graphql_updated_at ||
+    (isCanonicalTestTimestamp(lastEditedAt) &&
+        Date.parse(lastEditedAt) > Date.parse(comment.updated_at)
+      ? lastEditedAt
+      : comment.updated_at);
+  return {
+    databaseId: String(comment.id),
+    body: comment.graphql_body ?? comment.body,
+    createdAt: comment.created_at,
+    updatedAt,
+    lastEditedAt,
+  };
+}
+
+function isCanonicalTestTimestamp(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
 function baseRefChangedEvent(overrides = {}) {
   return {
     __typename: "BaseRefChangedEvent",
@@ -3925,6 +8825,17 @@ function baseRefForcePushedEvent(overrides = {}) {
     afterCommit: { oid: BASE },
     ref: { name: "main" },
     actor: { __typename: "User", login: HUMAN.login },
+    ...overrides,
+  };
+}
+
+function deletedCommentEvent(overrides = {}) {
+  return {
+    __typename: "CommentDeletedEvent",
+    id: "CDE_kwDOExample1",
+    createdAt: "2026-08-25T08:02:00Z",
+    actor: { __typename: "User", login: HUMAN.login },
+    deletedCommentAuthor: { __typename: "User", login: HUMAN.login },
     ...overrides,
   };
 }
