@@ -486,8 +486,11 @@ legacy before v2 is Active and read back.
 
    For predecessor-to-successor generation closure, liveness whose timestamp
    equals the successor request is also ambiguous and keeps the predecessor
-   open. Do not try to repair that gap with later evidence; create a legitimate
-   new head and one canonical review generation.
+   open. Evidence outside the original gap cannot repair it. A new head is a
+   valid reset only when every ambiguous predecessor is explicitly bound to a
+   different full head. If any predecessor is ordinary, deleted, or otherwise
+   unbound, open a replacement PR and run one canonical review generation
+   there.
 
    Treat every physical request as a generation boundary. Without a base
    epoch, unbound provider terminal evidence can close only the first gap; once
@@ -496,12 +499,15 @@ legacy before v2 is Active and read back.
    With a base epoch, every gap requires direct `+1` evidence. Never attribute
    a later terminal to a newer generation merely by timestamp; it may be a
    delayed or duplicate carrier from an older flight. Treat edited unbound
-   progress as the interval from creation through revision. It may be excluded
-   as historical only when both endpoints are canonically ordered and every
-   physical boundary from the strictly earlier origin through the revision
-   uniquely binds the same different full head. A missing origin, an ordinary
-   or conflicting boundary, a head transition, or a boundary at either
-   endpoint remains fail-closed.
+   provider-triggerable request shape as a physical boundary even when edited,
+   malformed, wrong-author, denied, or stale-base; those conditions remove
+   positive authority, not the possible provider flight. Explicit commit-bound
+   progress is scoped to that head, while every unbound progress carrier stays
+   in the current inventory. An edited terminal also contributes an unbound
+   unknown-activity interval from creation through terminal revision. A
+   provider terminal closes the first gap only when predecessor reactions were
+   read completely and no current `eyes` or provider activity follows it
+   through the successor.
 
    Before choosing this low-cost path, identify the native
    `codex/github-review-gate` verifier run/job/CheckRun that GitHub records
@@ -521,14 +527,35 @@ legacy before v2 is Active and read back.
    Rerunning the old event is not valid retarget recovery.
 
    If the controller summary reports a base epoch, base retarget, or
-   `request_clean_generation`, do not use this zero-run path as the recovery.
-   Dispatch step 4 with `request_review=true`, wait for a qualifying Codex `+1`
-   directly on the generated canonical request, and then reconcile. A later
-   terminal clean is not request/base-lineage proof in this mode and must not be
-   treated as a pass; findings remain blocking.
+   `request_clean_generation`, do not treat the code alone as permission to
+   post. Read its concrete reason, lineage and linked request objects:
+
+   - If a recoverable latest/current canonical request already exists and only
+     lacks attributable clean, stay on the original PR and exact head. Wait for
+     a qualifying Codex `+1` directly on that named request, then reconcile;
+     creating another request would add an unnecessary physical boundary.
+   - If the reason says that no suitable latest/current canonical generation
+     exists and reports no unclosable historical unbound predecessor gap,
+     dispatch step 4 once with `request_review=true`, require a qualifying
+     direct `+1` on the generated request, and then reconcile.
+   - If a historical gap exists but every ambiguous predecessor is explicitly
+     bound to another full head, create a legitimate new head and run exactly
+     one canonical generation there.
+   - If the reason identifies an unclosable historical gap containing an
+     ordinary, edited, malformed, denied, deleted, or otherwise unbound
+     predecessor, do not post another direct or controller request on that
+     PR/head and do not rely on a commit-only reset. Open a replacement PR from the intended
+     branch/commits, run one canonical producer there, validate it, and close
+     the ambiguous PR.
+
+   A later terminal clean is not request/base-lineage proof in these modes and
+   must not be treated as a pass; findings remain blocking.
 
 4. Use `begin-review` instead of step 3 only when the controller must coordinate
-   a fresh request and newer verifier attempt. Dispatch it without `--ref`:
+   a fresh request and newer verifier attempt. This command block is only for
+   the recoverable original-PR branches above; do not run it against a PR with
+   an unclosable historical unbound predecessor gap. Dispatch it without
+   `--ref`:
 
    ```bash
    DISPATCHED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -548,10 +575,14 @@ legacy before v2 is Active and read back.
    request starts a review generation, while terminal Codex text has no
    originating request ID. If a newer request appears before the previous
    generation is terminally closed, v2 intentionally preserves an unclosed
-   lineage gap and keeps the verifier pending; a later clean result, reaction
-   removal, or quiescence cannot repair that historical ordering. Recover by
-   making a legitimate new head and allowing exactly one canonical generation
-   to run, then reconcile that exact head.
+   lineage gap and keeps the verifier pending; evidence arriving outside the
+   original predecessor-to-successor window cannot repair that ordering. If
+   every ambiguous predecessor is canonically bound to another full head,
+   create a legitimate new head and allow exactly one canonical generation.
+   If any predecessor is ordinary, edited, malformed, denied, deleted, or
+   otherwise unbound, open a replacement PR from the intended branch/commits,
+   run one canonical generation there, validate it, and close the ambiguous
+   PR.
 
 5. After every manual dispatch, wait for GitHub to index the run and list only
    runs created after `DISPATCHED_AT`:
@@ -574,8 +605,12 @@ legacy before v2 is Active and read back.
 
 ## Phase 4: reconcile the exact head and interpret the result
 
-1. Refresh `CANARY_HEAD`. If it changed, replace the recorded value and obtain
-   review evidence for the new head before continuing.
+1. Refresh `CANARY_HEAD`. If it changed, stop and reread the summary plus the
+   complete physical lineage; do not automatically start another generation on
+   the same PR. Continue on the new head only when every ambiguous predecessor
+   is explicitly bound to a different full head. If an ordinary, edited,
+   malformed, denied, deleted, or otherwise unbound predecessor leaves an
+   unclosable historical gap, use a replacement PR as described above.
 2. Dispatch a final exact-head reconcile without `--ref`:
 
    ```bash

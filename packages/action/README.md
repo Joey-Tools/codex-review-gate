@@ -237,8 +237,20 @@ being guessed into the new generation.
 
 Terminal clean text and a qualifying provider `+1` have equal clean authority
 only for the first physical generation of a no-base-epoch, single-flight
-lineage. Every physical request comment is a generation boundary, including
-duplicate hidden markers from one workflow run. Without a base epoch, provider
+lineage. Every provider-triggerable request-shaped comment is a physical
+generation boundary, including duplicate hidden markers, edited or malformed
+requests, and requests that fail authorisation. Boundary status records an
+unknown provider flight; it does not grant positive authority. Under the
+default `write` threshold, an otherwise valid ordinary request requires a
+permission lookup, cached per author within each snapshot, before it can be
+classified as denied. Once denied, it causes no reaction or exact-refetch fan-
+out. Boundaries rejected earlier for invalid shape, author, or binding also
+cause no permission, reaction, or exact-refetch fan-out. Every observed
+`CommentDeletedEvent` is an unbound physical-only boundary because its body is
+not recoverable; an unclosable historical gap containing one requires a
+replacement PR. A same-head canonical request remains a boundary when its base
+tuple is stale; only the exact current
+head/base tuple grants authority. Without a base epoch, provider
 terminal evidence strictly between the first request and its successor may
 close only that first gap. Every later gap, and positive clean authority for any
 generation that has a physical predecessor, requires a qualifying `+1`
@@ -247,16 +259,18 @@ to the newer request or is a delayed or duplicate carrier from an older one;
 it therefore cannot pass or supersede findings for the newer generation. With
 a base epoch, even the first gap requires request-bound `+1` evidence.
 
-A same-or-later official `eyes` or provider progress signal no later than a
+A same-or-later official `eyes` or provider activity signal no later than a
 successor keeps the predecessor open; equality with the successor is
-timestamp-ordering ambiguity, not proof of completion. A later clean cannot
-repair an already ambiguous gap. Explicitly commit-bound progress is scoped to
-that head. Unbound edited progress is treated as the closed carrier interval
-from `created_at` through its current revision time. It is discarded as
-historical only when that entire interval, including every intervening
-physical boundary, uniquely remains on one different full head. Missing,
-ordinary, conflicting, cross-head, or endpoint-same-time boundaries stay
-fail-closed.
+timestamp-ordering ambiguity, not proof of completion. Provider terminal
+evidence may close the first gap only when the predecessor reaction inventory
+is complete and no current `eyes` or provider activity follows that terminal
+through the successor. A later clean cannot repair an already ambiguous gap.
+Explicitly commit-bound progress is scoped to that head. Every unbound progress
+carrier remains in the current inventory: nearby request timestamps cannot
+prove its originating flight or head. An edited terminal carrier additionally
+contributes an unbound unknown-activity interval from `created_at` through its
+terminal revision; only that carrier's own terminal endpoint is exempt from
+self-veto when evaluating the same terminal.
 Ordinary request reactions are provider liveness signals only; ordinary `+1`
 cannot head-bind clean by itself. Same-time/later official `eyes`/progress from
 Codex vetoes a candidate clean because review activity has not been proved

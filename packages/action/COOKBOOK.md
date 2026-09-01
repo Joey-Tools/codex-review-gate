@@ -40,7 +40,10 @@ each PR's independently read head.
 ### Ordinary low-cost review
 
 When the exact head is not already carrying a success that must be invalidated,
-the normal agent path is:
+the normal agent path below is available only for the first physical generation
+of a PR with no base epoch. Before posting, verify that the current lineage has
+no earlier provider-triggerable request-shaped boundary that is not explicitly
+bound to another full head:
 
 1. read the open PR and exact current head;
 2. post a comment whose complete visible content is exact `@codex review`;
@@ -97,10 +100,14 @@ exact `@codex review` only after the exact controller run completes.
 
 Do not overlap the two producers. An unclosed request followed by another
 request creates a lineage gap because terminal Codex text has no originating
-request ID. V2 intentionally remains pending; later clean text, reaction
-removal, and quiescence do not repair the historical ordering. Recover with a
-legitimate new head, one canonical request generation, and an exact-head
-reconcile.
+request ID. V2 intentionally remains pending; evidence arriving outside the
+original predecessor-to-successor window cannot repair its ordering. A new
+head is sufficient only when every ambiguous predecessor is canonically bound
+to a different full head. If any predecessor is ordinary, edited, malformed,
+denied, deleted, or otherwise unbound, a commit change cannot prove that its
+provider flight ended. Open a replacement PR from the intended branch/commits, run one
+canonical producer there, and close the ambiguous PR after the replacement is
+validated.
 
 ### Reconcile one exact head
 
@@ -151,16 +158,19 @@ default branch.
 7. When the result reaches `healthy/success`, perform the exact-head merge
    closure below immediately before merge.
 
-If the head changes at any step, stop. Read the new current head and begin a
-fresh generation/reconcile as appropriate. A stale run never follows or writes
-its decision to the new head.
+If the head changes at any step, stop. Read the new current head, summary and
+complete physical lineage; do not automatically begin a same-PR generation. A
+stale run never follows or writes its decision to the new head. Continue on the
+new head only when every ambiguous predecessor is explicitly bound to a
+different full head. An unclosable ordinary, edited, malformed, denied,
+deleted, or otherwise unbound predecessor requires a replacement PR.
 
 ## Interpret results
 
 | Result | Meaning | Operator action |
 | --- | --- | --- |
 | `healthy/success` | Stable complete current-head clean evidence was proved. | Perform the final verifier/head/ruleset reread; merge only if all still match. |
-| `healthy/failure` | Qualifying findings were proved. | Follow finding links, fix or obtain an authorised newer clean generation, then reconcile. |
+| `healthy/failure` | Qualifying findings were proved. | Follow the summary reason and finding links. Fix and reconcile on the original PR only when lineage remains recoverable; an unclosable historical lineage requires a replacement PR carrying the fixes and one canonical generation. |
 | `unhealthy/failure` | Findings were proved but execution or final result handling also failed. | Keep the findings blocking, repair the named execution boundary and reconcile. |
 | `healthy/pending` | Evaluation completed safely, but current state cannot authorise success yet. | Follow `recovery_code`; wait without another action only for `wait_provider`. |
 | `unhealthy/pending` | API, pagination, cap or stability execution is incomplete. | Follow the recovery code; do not treat it as no findings. |
@@ -202,8 +212,8 @@ provider wait or finding change named by `recovery_code`.
 | `none` | No evaluator recovery is required; perform exact-head merge closure. |
 | `wait_provider` | Wait for Codex to publish terminal evidence; do not spam requests. |
 | `reconcile` | Reread the exact current head and run one scoped reconcile. |
-| `fix_findings` | Fix the reported current findings, separately resolve inline conversations, obtain later head-bound clean evidence, then reconcile. |
-| `request_clean_generation` | Request a strictly newer authorised generation for the same head and wait for clean bound to it; an arbitrary later clean is insufficient. |
+| `fix_findings` | Follow the summary reason. Normally fix the reported current findings, separately resolve inline conversations, obtain later head-bound clean evidence, then reconcile. If the reason also reports an unclosable historical lineage, put the fixes on a replacement PR and run exactly one canonical generation there instead of requesting again on the original PR. |
+| `request_clean_generation` | Follow the summary reason and lineage. For a recoverable latest/current canonical request, stay on the original PR: obtain the required direct `+1` on the named request, or create exactly one newer canonical generation only when the reason says one is still needed. A historical gap may reset on a legitimate new head only when every ambiguous predecessor is explicitly bound to another full head. If any ordinary, edited, malformed, denied, deleted, or otherwise unbound predecessor makes that gap unclosable, do not request again on that PR/head; open a replacement PR and run one canonical generation there. |
 | `retry_reconcile` | Retry the same exact-head reconcile when `retry_safe` permits it. |
 | `wait_then_reconcile` | Let GitHub/Codex settle, reread the head, then reconcile. |
 | `use_expanded_limits` | Set protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`, then reconcile the same exact head. |
@@ -214,8 +224,12 @@ provider wait or finding change named by `recovery_code`.
 | `unsupported_target` | Move to a documented supported scope or leave the gate blocked. |
 | `create_verifier_run` | If ready, convert the PR to draft and mark it ready again; if already draft, mark it ready. Verify a new `ready_for_review` verifier for the exact current head/base/test-merge scope, then reconcile. |
 
-The summary is authoritative for the concrete reason and object links within
-the code category. The table does not authorise guessing around missing data.
+The summary is authoritative for the concrete reason, lineage and object links
+within the code category. The recovery code alone does not authorise another
+request. In particular, an existing latest/current canonical request that only
+lacks attributable clean needs its qualifying direct `+1`, not another
+generation boundary. An unclosable historical unbound predecessor gap needs a
+replacement PR, not a same-PR request or a commit-only reset.
 
 ## Finding accounting and supersession
 
@@ -239,9 +253,14 @@ newer authorised `@codex review` generation followed by clean bound to that
 generation and head. An unrelated later clean, an edited request or ambiguous
 ordering cannot erase it.
 
-If the finding is real, fix it and use `fix_findings`. If the code does not need
-to change but the finding is obsolete or inapplicable, use
-`request_clean_generation`. In both cases, reconcile after the later provider
+If the finding is real, fix it and use `fix_findings`; when its reason also
+reports an unclosable historical lineage, carry the fixes to a replacement PR
+and do not request another generation on the original PR. If the code does not
+need to change but the finding is obsolete or inapplicable, follow the
+`request_clean_generation` summary reason. Request or complete the
+latest/current canonical clean on the original PR only when its lineage remains
+recoverable. If the reason instead identifies an unclosable historical unbound
+predecessor gap, use a replacement PR. Reconcile after the later provider
 result; resolving an inline conversation alone does not change reducer state.
 
 Terminal clean text and a qualifying provider `+1` carry equal clean authority
@@ -257,9 +276,10 @@ Ordinary request reactions are liveness signals only; ordinary `+1` cannot
 head-bind clean. Same-time/later official `eyes`/progress from Codex prevents
 candidate clean from completing. Reaction-only changes do not start an
 automatic run; use a later provider event or manual reconcile to observe them.
-Unbound edited progress remains liveness across its creation-to-revision
-interval unless that entire interval is provably confined to one different
-full head.
+Every unbound progress carrier remains liveness; nearby request boundaries
+cannot prove its head. An edited terminal additionally carries unbound unknown
+activity from creation through terminal revision. Its terminal endpoint is a
+self-veto exception only for that same carrier.
 
 ## Stable-snapshot recovery
 
@@ -311,21 +331,40 @@ to resolve it within the relevant PR scope:
   current head.
 
 Do not edit provider evidence merely to expand a prefix. If it is ambiguous or
-bound to another commit, request a new current-head generation.
+bound to another commit, follow the summary reason and lineage. Complete an
+existing current canonical request with its direct `+1`, or create exactly one
+generation only when the lineage remains recoverable and the summary says one
+is needed. An unclosable historical unbound gap requires a replacement PR, not
+another same-PR boundary.
 
 ## Sticky diagnostic recovery
 
-The sticky is a best-effort report, not a receipt. If it is missing, edited,
-duplicated or stale:
+The sticky is a best-effort report, not a receipt. Runtime uses create-once
+semantics: immediately before any write it reads the complete issue-comment
+inventory and posts one canonical diagnostic only when none exists. It never
+patches an existing canonical diagnostic and never posts a replacement while
+one exists. Multiple canonical diagnostics are left untouched and diagnosed
+with a bounded warning.
+
+Only an exact, unedited, official canonical sticky is exempt from physical
+request lineage. An edited, invalid, forged or wrong-provenance marker-looking
+comment fails closed as an unbound physical-only boundary. A non-qualifying
+duplicate is not harmless merely because another canonical sticky exists; it
+can make historical lineage unclosable and require a replacement PR.
+
+If the sticky is missing or stale, its write failed, or duplicates exist:
 
 1. leave provider evidence intact;
 2. reread the current head;
 3. run one exact-head reconcile; and
-4. trust the new verifier CheckRun and summary reconstructed from GitHub.
+4. trust the new verifier CheckRun and summary reconstructed from GitHub, then
+   follow its reason and lineage. Do not edit or delete sticky comments to
+   repair the result; use a replacement PR when the reported boundary cannot
+   close.
 
-Sticky write failure does not clear findings. Runtime may update the oldest
-canonical diagnostic and warn about later duplicates, but it never needs to
-delete duplicates to decide the gate.
+Sticky write failure does not clear findings. Reconcile does not update or
+replace an existing canonical diagnostic; the verifier CheckRun and summary are
+the authoritative current result.
 
 ## Exact-head merge closure
 

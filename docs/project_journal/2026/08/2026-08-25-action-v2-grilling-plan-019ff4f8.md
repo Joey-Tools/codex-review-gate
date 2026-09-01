@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-08-28
+updated: 2026-09-01
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -446,11 +446,14 @@ superseded_by:
   findings only; they neither add inline-conversation authority nor become
   public Action outputs.
 - The diagnostic uses one v2 marker distinct from request markers and contains
-  no `@codex review`. Only `github-actions[bot]` marker comments match. The
-  runtime updates the oldest/lowest-ID canonical duplicate, warns without
-  deleting extras, recreates after deletion, treats write failure as a
-  non-authoritative warning, and excludes the diagnostic from the evidence
-  fingerprint.
+  no `@codex review`. Before writing, runtime reads the complete issue-comment
+  inventory and posts one canonical diagnostic only when none exists. It never
+  patches or replaces an existing canonical diagnostic; duplicates remain
+  untouched and produce a bounded warning. Only an exact, unedited, official
+  `github-actions[bot]` canonical sticky is excluded from physical request
+  lineage. Edited, invalid, forged or wrong-provenance marker-looking comments
+  fail closed as unbound physical boundaries and can require a replacement PR.
+  A write failure remains a non-authoritative warning.
 - Every untrusted excerpt and recovery message is length-bounded and escapes
   mentions, Markdown metacharacters, HTML delimiters, and marker-like content
   before entering the summary, sticky comment, or warning. Duplicate-sticky
@@ -2110,9 +2113,12 @@ superseded_by:
   that earlier request emitted a finding. The reducer now retains every exact,
   unedited request as a lineage and liveness boundary while allowing only
   authorised requests to grant positive authority. A denied boundary prevents
-  later unbound clean and any earlier direct `+1` from passing; a new direct
-  `+1` on an authorised canonical request after the boundary can recover. The
-  denied request still causes no exact-refetch or reaction fan-out.
+  later unbound clean and any earlier direct `+1` from passing. At this
+  checkpoint, a new direct `+1` after the boundary was expected to recover; the
+  later third frozen-head review proved that expectation unsafe because the
+  denied predecessor remains unbound. That intermediate recovery claim is
+  superseded by the replacement-PR rule below. The denied request still causes
+  no exact-refetch or reaction fan-out after its permission classification.
 - Second, Active ruleset activation performed its final approved legacy digest
   before the final canary and complete consumer-security closure. Concurrent
   removal of the last legacy requirement during those reads could therefore
@@ -2235,8 +2241,10 @@ superseded_by:
 - Joey adopted the ledgerless handshake on 2026-08-27. Controller inputs such
   as PR number, expected head, operation, and optional comment hint provide
   validation and early-stop information only; they are not verifier authority
-  and cannot replace the complete GitHub evidence scan. The mutable sticky
-  comment remains best-effort diagnostics and recovery guidance only.
+  and cannot replace the complete GitHub evidence scan. The create-once
+  canonical sticky remains best-effort diagnostics and recovery guidance only:
+  it is never patched or replaced while a canonical candidate exists, and only
+  an exact, unedited, official instance is exempt from physical request lineage.
   - For automatic admission, the controller must exactly refetch and validate
     the admitted provider event before requesting a rerun. For manual
     reconcile, the exact current PR/head contract is mandatory while any event
@@ -2810,18 +2818,23 @@ superseded_by:
   request. The first-to-second generation gap therefore remains unclosed under
   the v2 ordering contract. Waiting, removing `eyes`, or observing a second
   stable snapshot cannot retroactively prove lineage.
-- PR #36 remains unmerged despite green live-v1 checks. Recovery is a useful
-  documentation change that creates a legitimate new head, followed by one
-  controller-owned canonical request, a new frozen-range GPT-5.6 Sol Ultra
-  review, CI, and exact-head merge closure. No manual direct request is sent
-  while that controller flight is active.
+- PR #36 remains unmerged despite green live-v1 checks. Its next implementation
+  and documentation correction creates a new head for the still-deployed v1
+  controller, followed by one controller-owned canonical request, a new frozen-
+  range GPT-5.6 Sol Ultra review, CI, and exact-head merge closure. This is the
+  pre-v2 delivery path for PR #36, not evidence that v2 can reset an unbound
+  lineage by changing commits. No manual direct request is sent while that
+  controller flight is active.
 - Durable operator rule: choose exactly one producer for every exact-head
   generation. Prefer a direct request only before any controller auto-begin
   flight exists. Once `begin-review` with `request_review=true` is dispatched,
   starting, or has emitted its marker, inspect controller/sticky/marker/provider
-  state rather than blindly posting another request. An overlap recovers on a
-  legitimate new head and fresh canonical generation, not by late evidence on
-  the ambiguous head.
+  state rather than blindly posting another request. Under v2, a legitimate
+  new head is sufficient only when every ambiguous predecessor is explicitly
+  bound to another full head. If any predecessor is ordinary, edited,
+  malformed, denied, or otherwise unbound, safe recovery uses a replacement PR
+  and one canonical generation there; late evidence or another commit on the
+  ambiguous PR cannot prove that the old provider flight ended.
 - The incident audit also found implementation drift behind that operational
   rule. Request-bound `+1` returned before checking the earlier-generation gap,
   so the latest physical request could pass while a predecessor remained
@@ -2862,18 +2875,20 @@ superseded_by:
   signal happened first. Progress artifacts were also collected before current-
   head scoping, so an old-head review's progress could keep an unrelated
   current-head generation open.
-- Generation closure now treats official `eyes` or provider progress at or
-  after the `+1` and no later than the successor as ambiguous liveness. An
-  unambiguous explicit commit binding scopes progress directly. Unbound
-  progress is excluded as historical only when its most recent strictly earlier
-  physical request boundary is uniquely canonical and bound to another head;
-  missing, ordinary, conflicting, or same-time boundaries remain fail-closed.
-  This protects generation completion while avoiding false current-head
-  contamination from a proved old-head flight.
+- That intermediate correction made generation closure treat official `eyes`
+  or provider progress at or after the `+1` and no later than the successor as
+  ambiguous liveness. It also attempted to exclude unbound progress when its
+  most recent strictly earlier request boundary uniquely named another head.
+  The later whole-range review documented below proved that the second rule
+  inferred carrier origin from temporal proximity and was unsafe; it is not the
+  final contract. Only an explicit unambiguous commit binding may now scope
+  progress to another head, and every genuinely unbound progress carrier is
+  retained.
 - Four controls were added inside the existing overlap-generation test: equal-
-  successor `eyes`, equal-successor progress, old-head progress exclusion, and
-  current-head progress retention. The focused runtime file passed all 86 tests
-  after the change.
+  successor `eyes`, equal-successor progress, old-head-neighbourhood progress,
+  and current-head progress. The focused runtime file passed all 86 tests at
+  that checkpoint, but the old-head-neighbourhood case encoded the unsafe
+  success expectation and is superseded by the later fail-closed regression.
 - The same review found that `release-creation-unknown` prevented a second
   Release POST only within one publisher invocation. A later exact-source run
   could observe stable absence and issue another non-idempotent create, even
@@ -3018,8 +3033,11 @@ superseded_by:
   same time as progress. The second keeps progress fail-closed when the
   old-head boundary itself is at the same time; this prevents a future change
   from merely replacing `>=` with `>` and attributing the ambiguous signal to
-  the old head. The existing strictly ordered old-head-progress case still
-  passes, so known historical activity remains filtered.
+  the old head. The then-existing strictly ordered old-head-progress case still
+  passed. The later full-range review proved that request timing alone never
+  establishes an unbound carrier's head, so this historical success expectation
+  was unsafe and is superseded by the final rule that retains every unbound
+  progress carrier.
 - The Low issue was accurate: the English DESIGN and README contained the
   physical-generation-boundary, predecessor-gap, and unbound-progress rules,
   while their Chinese counterparts still had only the earlier short form. The
@@ -3072,19 +3090,20 @@ superseded_by:
   `created_at` can belong to or equal a current-head request boundary while its
   later revision follows an old-head boundary. Revision-only scoping could
   classify it as historical and also fail to veto the predecessor's `+1`.
-  Unbound edited progress is now a closed carrier interval from creation
-  through revision. It is filtered only if both endpoints are canonical and
-  every physical boundary from the strictly earlier origin through the
-  revision uniquely stays on the same different full head. Missing, ordinary,
-  conflicting, cross-head, or endpoint-same-time boundaries retain the
-  progress. Gap liveness uses interval intersection; post-clean liveness uses
-  the revision endpoint. Comment IDs are deliberately excluded because they
+  The intermediate correction modeled unbound edited progress as a closed
+  carrier interval from creation through revision, then still attempted to
+  infer a historical head from surrounding request boundaries. The later
+  whole-range review proved that this ordering does not identify the provider
+  flight. The final contract retains every unbound interval; only an explicit,
+  unambiguous commit binding may filter progress to another head. Gap liveness
+  uses interval intersection, and comment IDs remain excluded because they
   order carrier creation, not later edits.
 - Dynamic regressions now cover two- and three-generation delayed terminal
   carriers, findings that ambiguous clean must not resolve, direct-reaction
   recovery for every later gap, base-epoch first-gap rejection, unedited and
-  edited same-time progress, a fully old-head edited interval that remains
-  filterable, and a cross-head edited interval that remains pending. English
+  edited same-time progress, an old-head-neighbourhood edited interval, and a
+  cross-head edited interval. The old-head-neighbourhood success expectation is
+  superseded by the final fail-closed rule described below. English
   and Chinese README, DESIGN, COOKBOOK, human install, and agent install
   guidance state the same operator recovery rule.
 - Validation for this correction:
@@ -3096,13 +3115,144 @@ superseded_by:
   - the corrected `npm run test:v2 -- --test-reporter=dot` rerun passed 96/96,
     and `npm run check` passed.
   A focused pre-commit review inspected all 13 dirty files and found one
-  Medium documentation mismatch: the install guides said any crossed physical
-  boundary retained edited progress, while the implementation correctly
-  permits multiple canonical boundaries when all of them bind the same
-  different full head. The English and Chinese human and agent guides now
-  match the DESIGN interval rule, and focused follow-up review returned
-  `No findings.` A signed follow-up commit and a new fresh whole-range
-  exact-head review remain required before push.
+  Medium documentation mismatch against that intermediate implementation. The
+  four install guides were aligned and focused follow-up review returned
+  `No findings.` The subsequent full-range review nevertheless invalidated the
+  shared head-inference premise itself; those historical validations are not
+  acceptance evidence for the final retained-unbound rule.
+
+### Third frozen-head review: physical evidence completeness (scoped fix loop closed)
+
+- A fresh ordinary GPT-5.6 Sol Ultra lane reviewed the complete exact range
+  `cf640dc84d2d59ead9acc2ea9cd1c74e4441aaff..8b020e507837503831b3e5ca5da10c66b456233b`.
+  It found five High runtime fail-open paths and three Medium contract gaps.
+  The branch was deliberately not pushed. Its independent Release/publisher
+  lane found no additional issue in immutable publication, frozen Release ID,
+  cross-run create-unknown recovery, or signing-key policy fences.
+- The integrated pre-commit review and its adversarial follow-ups superseded
+  every earlier scoped `No findings` result for acceptance. The confirmed
+  runtime findings fell into five connected classes:
+  - physical requests could disappear after edits, same-second edits could be
+    misclassified from REST timestamps, deleted comments had no reconstructive
+    body, and provider-triggerable visible/hidden request envelopes were not
+    completely recognised;
+  - base-epoch filtering, stale-base boundaries, duplicate reaction identity,
+    older-request `eyes`, malformed or unresolved carriers, edited terminals,
+    and provider identity mismatches could leave liveness or predecessor gaps
+    outside the evaluated window;
+  - incomplete GraphQL pagination, unstable ordering, failed pages, abandoned
+    parallel reads, or cross-source body conflicts could let previously
+    observed deletion/edit/finding evidence disappear between stability
+    attempts;
+  - generic recovery text and a display-reason-derived decision could direct
+    another same-PR generation even when an unclosable historical unbound gap
+    required a replacement PR; and
+  - a mutable controller sticky could self-poison physical lineage, a stale
+    pre-create inventory could duplicate the sticky, and a request POST that
+    may already have committed could be forgotten after an unproved scope
+    transition.
+- The fix loop, first validated at a 144-test checkpoint and frozen at 180 v2
+  tests, implemented the following fail-closed correction set:
+  - physical-boundary recognition is separate from positive authority. It
+    retains edited, malformed, wrong-author, denied, stale-base, focused or
+    hidden-envelope request shapes; explicit GraphQL edit metadata prevents
+    same-second REST timestamps from granting unedited authority. A valid
+    ordinary request still performs the cached permission lookup before denial;
+    after denial there is no reaction or exact-refetch fan-out, while earlier
+    invalid shape/author/binding cases perform none of those reads;
+  - complete paginated `CommentDeletedEvent` and issue-comment edit inventories
+    are validated against their connection counts, page state, cursor progress,
+    duplicate identities and strict opaque ordering. The protected property is
+    concrete irreversible evidence, not transient read health. An incomplete
+    node with a stable canonical ID installs an identity tombstone: only a later
+    complete observation of that same identity may upgrade it; replacement,
+    duplicate-identity conflict, or cross-source identity/content conflict
+    fails closed. A pure connection-level schema/read failure that admits no
+    object installs no tombstone, restarts the stability window, and may recover
+    after two later complete identical snapshots. Once a deletion event, edit
+    proof, body identity, count floor or conflicting object has been observed,
+    later validation/retry cannot forget it. A missing previously observed
+    deletion is failed revalidation rather than permanent poison: the observed
+    `(id, fingerprint)` union is retained, the stability window restarts, and
+    both final complete identical snapshots must contain that union. Persistent
+    absence stays pending, `[A] -> [B] -> [A,B] -> [A,B]` may recover, and a
+    changed fingerprint for the same deletion ID permanently poisons the run. A
+    deleted comment has no recoverable body, so it remains an unbound physical-
+    only boundary and provider-activity point;
+  - evidence latches are scoped to the gate property rather than every PR
+    mutation. Issue comments remain fully reconciled because any one may carry,
+    hide or be edited from a provider request. Review latching covers only
+    official-Codex review carriers that are terminal, malformed or provenance-
+    relevant; reaction latching covers only official-Codex `+1`/`eyes` carriers
+    plus identity ambiguity. Human review state and ordinary reactions do not
+    affect this gate and therefore never permanently poison a run. Relevant
+    reactions are inventoried before epoch/head authority filtering. Provider
+    activity, invalid provenance, edited terminal intervals and older-request
+    liveness participate in both predecessor-gap and final-clean checks. Edited
+    terminal comments cannot supply positive or superseding clean authority,
+    and one carrier's endpoint exception cannot exempt another carrier;
+  - recovery propagates the structured `requiresReplacementPr` lineage flag
+    through normal, error and report-persistence paths; controller routing never
+    parses or matches substrings in the human-readable `reason`.
+    `request_clean_generation` distinguishes an existing current canonical
+    request that needs a direct `+1`, a safe missing generation that permits
+    exactly one request, and an unclosable historical unbound gap that requires
+    a replacement PR. `fix_findings` likewise moves the fixes to a replacement
+    PR when that gap coexists with unresolved findings. Recoverable latest
+    ordinary/current boundaries do not falsely require replacement; and
+  - controller diagnostics use one immutable write, never edit themselves, and
+    are excluded from physical request lineage only after strict validation of
+    the original body, hidden-field types, Actions provenance and no-edit proof.
+    A fresh complete inventory immediately before creation suppresses a second
+    POST once a canonical candidate is visible. Existing candidates, including
+    duplicates, remain untouched and are diagnosed; edited, invalid, forged or
+    wrong-provenance marker-looking comments remain physical-only boundaries.
+    After a request POST may have committed, only a proved head change is a safe
+    terminal scope transition; draft, closed, base/test-merge or otherwise
+    unproved scope changes retain retry-unsafe same-run recovery instead of
+    permitting a new generation.
+- The documentation review corrected the same operator contract in the English
+  and Chinese agent, human, COOKBOOK, DESIGN and README guides. Head changes and
+  ambiguous provider evidence no longer imply an automatic same-PR generation;
+  ordinary, edited, malformed, denied, deleted or otherwise unbound historical
+  predecessors use a replacement PR when their original gap cannot close.
+  DESIGN and README now state the exact denied-boundary permission/read fan-out
+  and deleted-comment boundary rules. A fresh read-only bilingual parity review
+  of these changes returned `No findings.`
+- The CI findings showed that the first sharding contract could be bypassed by
+  alternate `node:test` registration forms or suppressed tests, and that one
+  correct job could hide another job's empty matrix cells. The final follow-up
+  exports only the canonical registration factory, locks the adapter and shard-
+  environment identifiers to the Release suite, seals the registered count,
+  and rejects a second-file owner plus the reviewed alias/`describe`/`it`/
+  `skip`/`todo` and late-registration escape fixtures. The workflow contract
+  validates Node 20 and Node 24 independently, including the full core-plus-
+  four-shard matrix, conditions, environment and commands, and rejects extra
+  axes plus `include` or `exclude`. A Node 24.15.0 discovery probe confirmed
+  that test-file symlinks are discoverable, so the scanner explicitly fails
+  closed on every `*.test.mjs` symlink and includes a real-symlink regression;
+  directory symlinks are not recursively discovered. The actual 2-core/8-
+  release workflow shape did not change.
+- Validation actually run on the final frozen runtime bytes:
+  - runtime SHA-256
+    `a53d8cceae83280a42bba219ead3a8e6db70a54234028759fdcbf2a8eaf10132`
+    and runtime-test SHA-256
+    `edc67f9e86c08dc3ee514fadcaf2b9c96e5fefb37e86f0d1d18f03a68ef7e31b`;
+  - `npm run test:v2 -- --test-reporter=dot` passed 180/180;
+  - the six-test sticky/create/post-attempt focused regression passed 6/6;
+  - `npm run check` passed; and
+  - `git diff --check -- packages/action/src/v2/gate-runtime.mjs test/v2-gate-runtime.test.mjs`
+    passed.
+  A zero-context GPT-5.6 Sol Ultra scoped review of those exact runtime/test
+  hashes returned `No findings.` The final CI bytes separately passed
+  `node --test test/ci-test-shard.test.mjs` at 13/13, plus `npm run check` and
+  their scoped diff check. Post-freeze targeted English/Chinese checks confirmed
+  the three recovery branches and the denied/deleted boundary wording; the
+  project-journal validator and full-tree `git diff --check` also passed. No
+  local full Release or core-suite pass is claimed; required GitHub CI must
+  still prove both core cells and all eight independent Release cells. A signed
+  follow-up and a completely new whole-range exact-head review remain required
+  before landing.
 
 ## Verified Facts And Required Live Preflight
 

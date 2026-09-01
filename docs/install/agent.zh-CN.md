@@ -441,18 +441,23 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    观察到它。
 
    在 predecessor-to-successor generation closure 中，与 successor request 同一时间戳的
-   liveness 也无法排序，必须保持 predecessor open。不要用更晚证据修补该 gap；应创建一个
-   合法新 head，并只启动一个 canonical review generation。
+   liveness 也无法排序，必须保持 predecessor open。原 gap 外的 evidence 不能修补它。
+   只有每个歧义 predecessor 都显式绑定另一个 full head 时，新 head 才是有效 reset；若
+   存在 ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，并在其中
+   只运行一个 canonical review generation。
 
    把每条物理 request 都视为 generation boundary。没有 base epoch 时，unbound provider
    terminal evidence 只能闭合第一个 gap；只要前面已有物理 request，之后的每个 gap 和
    positive/superseding authority 都必须来自直接附着在对应 canonical request 上的合格
    `+1`。有 base epoch 时，每个 gap 都必须使用 direct `+1`。绝不能只按 timestamp 把
-   later terminal 归给新 generation；它可能是旧 flight 的延迟或重复 carrier。unbound
-   edited progress 必须按从创建到 revision 的区间处理。只有两个端点顺序 canonical，且从
-   严格更早 origin 到 revision 的每条物理 boundary 都唯一绑定同一个其他 full head 时，
-   才能作为 historical 排除。缺少 origin、ordinary/conflicting boundary、区间内 head
-   transition，或任一端点与 boundary 同时，都保留为 fail-closed。
+   later terminal 归给新 generation；它可能是旧 flight 的延迟或重复 carrier。每条可能
+   触发 provider 的 request shape 都是物理 boundary，即使它 edited、malformed、
+   wrong-author、denied 或 stale-base；这些条件只移除 positive authority，不移除可能的
+   provider flight。显式 commit-bound progress 直接归入对应 head；所有 unbound progress
+   都保留在 current inventory。edited terminal 还会产生从创建到 terminal revision 的
+   unbound unknown-activity interval。provider terminal 只有在 predecessor reactions 已
+   完整读取，且从 terminal 到 successor 没有当前 `eyes` 或 provider activity 时，才能
+   闭合第一个 gap。
 
    选择这个低成本路径前，识别 GitHub 记录在 exact current PR feature-head SHA 上的原生
    `codex/github-review-gate` verifier run/job/CheckRun，并要求该 run 绑定 current test-merge。
@@ -467,13 +472,28 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    rerun 旧 event 不是有效的 retarget recovery。
 
    如果 controller summary 报告 base epoch、base retarget 或
-   `request_clean_generation`，不要用 direct path 恢复。执行第 4 步并保持
-   `request_review=true`，等 Codex 在生成的 canonical request 上直接留下合格 `+1`
-   后再 reconcile。在这个 mode 中，later terminal clean 不能证明 request/base
-   lineage，不得视为 pass；findings 仍始终阻塞。
+   `request_clean_generation`，不能仅凭该 code 就发送 request；先读取具体 reason、lineage
+   和链接的 request objects：
+
+   - 若已存在可恢复的 latest/current canonical request，只缺少可归因 clean，则留在原 PR
+     与 exact head，等待 Codex 直接在 summary 指定的 request 上留下合格 `+1`，再
+     reconcile；另发 request 只会增加不必要的物理 boundary。
+   - 若 reason 表明不存在合适的 latest/current canonical generation，且没有不可闭合的
+     historical unbound predecessor gap，则只执行一次第 4 步并保持
+     `request_review=true`；要求生成的 request 上出现合格 direct `+1` 后再 reconcile。
+   - 若存在 historical gap，但每个歧义 predecessor 都显式绑定另一个 full head，则创建
+     一个有实际意义的新 head，并在其中只运行一个 canonical generation。
+   - 若 reason 指出不可闭合的 historical gap，且其中含 ordinary、edited、malformed、
+     denied、deleted 或其他 unbound predecessor，不得在该 PR/head 再发送 direct 或 controller
+     request，也不能依赖仅修改 commit 来 reset。应从目标 branch/commits 新建 replacement
+     PR，只运行一个 canonical producer；验证通过后关闭旧歧义 PR。
+
+   在这些 mode 中，later terminal clean 不能证明 request/base lineage，不得视为 pass；
+   findings 仍始终阻塞。
 
 4. 只有 controller 必须协调 fresh request 和 newer verifier attempt 时，才使用
-   `begin-review`，并且不传 `--ref`：
+   `begin-review`。下面的 command block 只用于上述可恢复的原 PR 分支；若存在不可闭合的
+   historical unbound predecessor gap，不得对该 PR 执行。运行时不传 `--ref`：
 
    ```bash
    DISPATCHED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -492,9 +512,11 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    同一 head 上绝不重叠 direct 与 controller producers。每条 request 都会开始一个 review
    generation，而 Codex terminal text 不携带 originating request ID。前一 generation 尚未
    terminal-closed 时出现新 request，v2 会刻意保留 unclosed lineage gap 并让 verifier
-   保持 pending；之后到达的 clean、reaction removal 或 quiescence 都不能修复已经发生的
-   ordering。恢复方式是生成一个有实际意义的新 head，只允许一个 canonical generation
-   运行，再 reconcile 该 exact head。
+   保持 pending；原 predecessor-to-successor window 外到达的 evidence 不能修复已经发生的
+   ordering。若每个歧义 predecessor 都 canonical 绑定到另一个 full head，生成一个有实际
+   意义的新 head，只允许一个 canonical generation 运行。若存在 ordinary、edited、
+   malformed、denied、deleted 或其他 unbound predecessor，应从目标 branch/commits 新建 replacement
+   PR，只运行一个 canonical generation；验证通过后关闭旧歧义 PR。
 
 5. 每次 dispatch 后只列出 `DISPATCHED_AT` 之后的新 run：
 
@@ -515,7 +537,10 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
 
 ## 阶段 4：reconcile exact head
 
-1. 刷新 `CANARY_HEAD`。发生变化时，为新 head 取得 review evidence 后再继续。
+1. 刷新 `CANARY_HEAD`。发生变化时先停止，重读 summary 与完整 physical lineage；不得自动在
+   同一 PR 启动另一 generation。只有每个歧义 predecessor 都显式绑定不同 full head 时，
+   才能在 new head 继续。若 ordinary、edited、malformed、denied、deleted 或其他 unbound
+   predecessor 留下不可闭合的 historical gap，应按上文改用 replacement PR。
 2. 执行 final exact-head reconcile：
 
    ```bash

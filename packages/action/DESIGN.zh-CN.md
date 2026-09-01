@@ -227,9 +227,17 @@ authority。runtime 不上传 artifacts，也不保留 raw API payloads。
 
 best-effort sticky diagnostic 只是 output projection。其 v2 marker 与 request
 markers 不同，且不包含 `@codex review`。只有 `github-actions[bot]` marker comment
-符合条件。runtime 会尽量更新最旧的 canonical duplicate，保留并警告其他
-duplicates，也可以重建被删除的 diagnostic。sticky 缺失、编辑、重复或不可写都不能
-改变 gate decision。
+中严格 canonical 的 comment 才符合条件。runtime 在写入前立即读取完整的
+issue-comment inventory；只有不存在 canonical diagnostic 时才 POST 一条。已有
+canonical diagnostic 永不 PATCH；只要已存在一条，也绝不 POST replacement。多条
+canonical diagnostics 会原样保留，并产生 bounded warning。
+
+写入抑制范围比 evidence exemption 更宽。只有原始正文 exact canonical、hidden fields
+类型正确、具有 official Actions provenance、timestamps canonical 且没有 edit proof 的
+sticky，才能从 physical request lineage 中排除。edited、invalid、forged 或
+wrong-provenance 的 marker-looking comment 都会 fail closed，成为 unbound
+physical-only boundary。该 boundary 可能留下不可闭合的 historical gap，并要求
+replacement PR；同时存在另一条 valid sticky 也不能使它变得 harmless。
 
 ### Admitted evidence
 
@@ -253,28 +261,40 @@ permission threshold 保护 generation reset，不保护 negative evidence。符
 provider findings 不受 request-author permission 影响，始终阻塞。
 
 terminal clean text 与符合条件的 provider `+1`，只有在没有 base epoch、single-flight
-lineage 的第一个物理 generation 中才是同等 clean carriers。每条物理 request comment
-都是 generation boundary，同一次 workflow run 的 duplicate hidden markers 也不例外。
-没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider terminal
-evidence 只能闭合第一个 gap。之后的每个 predecessor-to-successor gap，以及任何前面
+lineage 的第一个物理 generation 中才是同等 clean carriers。物理 boundary 识别与
+positive authority 必须分开。每条可能触发 provider 的 request-shaped comment 都恰好是
+一个 boundary，包括 duplicate marker，以及 edited、malformed、wrong-author 或 denied
+request。physical-only boundary 没有 binding 或 positive authority。在默认 `write`
+threshold 下，形状合法的 ordinary request 必须先查询 author permission（同一 snapshot
+内按 author 缓存），才能判定为 denied；判定后不再触发 reaction 或 exact-refetch
+fan-out。更早因 shape、author 或 binding 无效而拒绝的 boundary，不触发 permission、
+reaction 或 exact-refetch fan-out。每个已观察到的 `CommentDeletedEvent` 都在事件时间形成
+unbound physical-only boundary，因为 GitHub 不提供可恢复正文，runtime 无法排除它曾是
+provider-triggering request。该事件进入 stable fingerprint 与本次运行的不可逆 inventory；
+若它留下不可闭合的 historical gap，同一 PR 的后续 evidence 无法修复，必须改用
+replacement PR。绑定 current full head 的 canonical request 即使 base SHA/ref/repository
+tuple 已旧，也仍是 boundary；exact current scope 只决定 authority，不能擦除物理
+boundary。没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider
+terminal evidence 只能闭合第一个 gap。之后的每个 predecessor-to-successor gap，以及任何前面
 已有物理 request 的 generation 所需 positive/superseding authority，都必须来自直接
 附着于该 request 的合格 `+1`。provider terminal payload 没有 originating request ID；
 后到的 carrier 可能来自任一旧 generation，两个 stable snapshots 也无法使该归属唯一。
 出现 base epoch 后，provider terminal 连第一个 gap 也不能闭合。
 
-如果 official `eyes` 或 provider progress 不早于 request-bound `+1` 且不晚于后继
-boundary，前一个 generation 仍保持 open。GitHub timestamp 精度下与后继 boundary
-同时属于 ordering ambiguity，不能证明 review activity 已在新 generation 前结束。
-绑定最新 request 的 clean 不能跨过更早的 unclosed gap；后继 boundary 之后才出现的
+如果 official `eyes` 或 provider activity 不早于 candidate closure 且不晚于后继
+boundary，前一个 generation 仍保持 open。GitHub timestamp 精度下与任一端点同时都属于
+ordering ambiguity。provider terminal 闭合第一个 gap 还要求 predecessor reaction
+inventory 完整；若某个 boundary 的 reactions 被刻意跳过读取，就不能用 unbound terminal
+闭合。绑定最新 request 的 clean 不能跨过更早的 unclosed gap；后继 boundary 之后才出现的
 evidence 也不能倒推修复该 gap。
 
-带有单一、无歧义 commit binding 的 progress 会直接归入对应 head。unbound edited
-progress 被视为从 immutable creation time 到当前 revision time 的 carrier interval。
-只有两个端点顺序 canonical，且从严格更早 origin 到 revision 的每条物理 request
-boundary 始终唯一绑定到同一个其他 full head 时，才能作为 historical 排除。缺少
-origin、ordinary/conflicting boundary、区间内 head transition，或任一端点与 boundary
-同时，都必须在 current-head inventory 中保持 fail-closed。这样既能过滤可证明的
-old-head progress，也不会猜测丢弃 edited 或 same-time activity。
+带有单一、无歧义 commit binding 的 progress 会直接归入对应 head。所有 unbound
+progress carrier 都保留在 current-head inventory；邻近其 creation/revision 的 request
+boundary 只能证明 ordering，不能证明 originating flight 或 head。edited provider
+terminal 还会产生一个从 immutable creation 到 terminal revision 的 unbound unknown-
+activity interval，因为 GitHub 不提供中间 body 历史。只有在评估同一 carrier 的同一
+terminal 时，才豁免其 terminal endpoint 的 self-veto；该区间仍参与 predecessor-gap
+liveness，也不能给其他 carrier 同样豁免。
 
 一旦观察到 base epoch，terminal payload 无法证明它由哪个 request/base snapshot
 产生；在这个降级 lineage mode 中，只有直接附着在最新且严格晚于 epoch、绑定当前
@@ -430,8 +450,12 @@ summary 和 sticky 包含 bounded reason、recovery code 与具体 next action�
 tokens、headers、raw payload dumps 或 untrusted workflow commands。
 
 at-least-once recovery 在 write result unknown 后可能生成少量 duplicate requests、
-verifier attempts 或 diagnostic comments。runtime 会保守地 fold/report duplicates；它们绝不
-允许选择一个方便的 clean 或漏掉 finding。
+verifier attempts 或 diagnostic comments。sticky writer 不会 fold、PATCH 或删除已有
+canonical diagnostics：它在创建前 fresh-read，原样保留 duplicates 并报告。只有每一条
+exact、未编辑、official canonical sticky 才获得狭窄的 physical-lineage exemption；不符合
+条件的 marker-looking duplicate 仍是 conservative boundary。物理 review requests 同样
+保持为彼此独立的 generation boundaries。任何 duplicate 都不能授权选择一个方便的 clean
+或漏掉 finding。
 
 ## Exact-head merge closure
 

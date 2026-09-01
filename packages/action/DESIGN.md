@@ -258,10 +258,20 @@ not retained.
 
 The best-effort sticky diagnostic is an output projection only. Its v2 marker
 is distinct from request markers and contains no `@codex review`. Only a
-`github-actions[bot]` marker comment qualifies. Runtime updates the oldest
-canonical duplicate when possible, warns without deleting extras and may
-recreate a deleted diagnostic. Missing, edited, duplicate or unwritable sticky
-state cannot change a gate decision.
+strict canonical comment from `github-actions[bot]` qualifies. Immediately
+before writing, runtime reads the complete issue-comment inventory. It posts one
+canonical diagnostic only when none exists; it never patches an existing
+canonical diagnostic or posts a replacement while one exists. Multiple
+canonical diagnostics are preserved untouched and diagnosed with a bounded
+warning.
+
+Write suppression is broader than the evidence exemption. Only an exact raw
+canonical body with the required hidden-field types, official Actions
+provenance, canonical timestamps and no edit proof is excluded from physical
+request lineage. An edited, invalid, forged or wrong-provenance marker-looking
+comment fails closed as an unbound physical-only boundary. Such a boundary can
+leave an unclosable historical gap and require a replacement PR; another valid
+sticky does not make the boundary harmless.
 
 ### Admitted evidence
 
@@ -288,32 +298,49 @@ permission.
 
 Terminal clean text and a qualifying provider `+1` are equal clean carriers
 only for the first physical generation of a no-base-epoch, single-flight
-lineage. Every physical request comment is a generation boundary, including
-same-run duplicate hidden markers. Without a base epoch, provider terminal
-evidence strictly between the first request and its successor may close only
-that first gap. Every later predecessor-to-successor gap, and positive or
+lineage. Physical boundary recognition is deliberately separate from positive
+authority. Every provider-triggerable request-shaped comment is one boundary,
+including same-run duplicate markers and edited, malformed, wrong-author, or
+denied requests. Physical-only boundaries are unbound and receive no positive
+authority. Under the default `write` threshold, a syntactically valid ordinary
+request must undergo a permission lookup, cached per author within each
+snapshot, before it can be classified as denied; once denied, it causes no
+reaction or exact-refetch fan-out. Boundaries rejected earlier for invalid
+shape, author, or binding cause no permission, reaction, or exact-refetch fan-
+out. Every observed `CommentDeletedEvent` is an unbound physical-only boundary
+at its event time because GitHub exposes no recoverable body with which to rule
+out a provider-triggering request. It participates in the stable fingerprint
+and current-run irreversible inventory; if it leaves an unclosable historical
+gap, same-PR evidence cannot repair it and recovery requires a replacement PR.
+A canonical request bound to the current full head remains a boundary when its
+base SHA, ref, or repository tuple is stale; exact current scope is an
+authority requirement, not a boundary-erasure rule. Without a base epoch,
+provider terminal evidence strictly between the first request and its
+successor may close only that first gap. Every later predecessor-to-successor gap, and positive or
 superseding authority for any generation with a physical predecessor, requires
 a qualifying `+1` directly on that request. Provider terminal payloads have no
 originating request ID, so a later carrier could be delayed or duplicated from
 any older generation; stable snapshots cannot make that attribution unique.
 After a base epoch, provider terminal evidence cannot close even the first gap.
 
-Official `eyes` or provider progress at or after a request-bound `+1` and no
-later than the successor keeps the predecessor open. Equality with the
-successor is ambiguous at GitHub's timestamp precision and therefore cannot
-prove that review activity ended before the new generation. A clean bound to
-the latest request cannot bypass an earlier unclosed gap, and evidence arriving
-after the successor cannot retroactively repair that gap.
+Official `eyes` or provider activity at or after a candidate closure and no
+later than the successor keeps the predecessor open. Equality with either
+endpoint is ambiguous at GitHub's timestamp precision. Provider-terminal
+first-gap closure additionally requires a complete predecessor reaction
+inventory; a boundary whose reactions were deliberately not loaded cannot be
+closed by unbound terminal evidence. A clean bound to the latest request cannot
+bypass an earlier unclosed gap, and evidence arriving after the successor
+cannot retroactively repair that gap.
 
 Progress with one unambiguous commit binding is scoped directly to that head.
-Unbound edited progress is a carrier interval from its immutable creation time
-through its current revision time. It may be excluded as historical only when
-both endpoints are canonically ordered and every physical request boundary
-from the strictly earlier origin through the revision uniquely binds the same
-different full head. No origin, an ordinary or conflicting boundary, a head
-transition inside the interval, or a boundary equal to either endpoint remains
-fail-closed in the current-head inventory. This filters provably old-head
-progress without guessing edited or same-time activity away.
+Every unbound progress carrier remains in the current-head inventory. Request
+boundaries near its creation or revision prove ordering only, not which flight
+or head produced the carrier. An edited provider terminal also produces an
+unbound unknown-activity interval from immutable creation through terminal
+revision because GitHub exposes no intermediate body history. The same
+carrier's terminal endpoint is exempt only from self-veto while evaluating
+that terminal; the interval still participates in predecessor-gap liveness,
+and no other carrier receives that exemption.
 
 After any observed base epoch, terminal payloads cannot prove which
 request/base snapshot produced them. In that degraded lineage mode, only a
@@ -486,10 +513,14 @@ links when useful, but never tokens, headers, raw payload dumps or untrusted
 workflow commands.
 
 At-least-once recovery may create small duplicate requests, verifier attempts
-or diagnostic comments after an unknown write result. Duplicate diagnostics
-may be folded, but physical review requests remain separate conservative
-generation boundaries. They never authorise selection of a convenient clean
-or omission of a finding.
+or diagnostic comments after an unknown write result. The sticky writer does
+not fold, patch or delete existing canonical diagnostics: it fresh-reads before
+creation, leaves duplicates untouched and reports them. Only each exact,
+unedited, official canonical sticky receives the narrow physical-lineage
+exemption; a non-qualifying marker-looking duplicate remains a conservative
+boundary. Physical review requests likewise remain separate generation
+boundaries. No duplicate authorises selection of a convenient clean or omission
+of a finding.
 
 ## Exact-head merge closure
 

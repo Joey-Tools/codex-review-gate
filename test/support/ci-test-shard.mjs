@@ -38,9 +38,25 @@ export function createShardedTest(baseTest, rawValue, label = "test") {
     throw new TypeError("base test must be a function");
   }
   const shard = parseTestShard(rawValue);
+  let inventorySealed = false;
   let ordinal = 0;
 
   function shardedTest(name, optionsOrFunction, maybeFunction) {
+    if (inventorySealed) {
+      throw new Error(`${label} shard inventory is sealed`);
+    }
+    if (
+      optionsOrFunction !== null &&
+      typeof optionsOrFunction === "object"
+    ) {
+      for (const unsupportedOption of ["only", "skip", "todo"]) {
+        if (Object.hasOwn(optionsOrFunction, unsupportedOption)) {
+          throw new Error(
+            `${label} shard inventory does not support the ${unsupportedOption} option`,
+          );
+        }
+      }
+    }
     const selected = testShardSelects(shard, ordinal);
     ordinal += 1;
     if (selected) {
@@ -63,7 +79,10 @@ export function createShardedTest(baseTest, rawValue, label = "test") {
   Object.defineProperty(shardedTest, "registeredCount", {
     configurable: false,
     enumerable: true,
-    get: () => ordinal,
+    get: () => {
+      inventorySealed = true;
+      return ordinal;
+    },
   });
   return shardedTest;
 }

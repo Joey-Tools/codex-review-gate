@@ -207,9 +207,17 @@ recovery rule：只有直接附着在 epoch 后、绑定当前 base 的 canonica
 clean 保持 pending，runtime 不会猜测它属于新 generation。
 
 terminal clean 文本和符合条件的 provider `+1`，只有在没有 base epoch、single-flight
-lineage 的第一个物理 generation 中才具有相同 clean authority。每条物理 request
-comment 都是 generation boundary，同一次 workflow run 的 duplicate hidden markers
-也不例外。没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider
+lineage 的第一个物理 generation 中才具有相同 clean authority。每条可能触发 provider
+的 request-shaped comment 都是物理 generation boundary，包括 duplicate hidden marker、
+edited/malformed request 和 authorisation 失败的 request。boundary 只表示可能存在未知
+provider flight，不授予 positive authority。在默认 `write` threshold 下，其他条件均合法的
+ordinary request 必须先查询 permission（同一 snapshot 内按 author 缓存），才能判定为
+denied；判定后不再触发 reaction 或 exact-refetch fan-out。更早因 shape、author 或 binding
+无效而拒绝的 boundary，也不触发 permission、reaction 或 exact-refetch fan-out。每个已观察
+到的 `CommentDeletedEvent` 都是 unbound physical-only boundary，因为其正文不可恢复；若它
+处于不可闭合的 historical gap，必须使用 replacement PR。同一 head
+的 canonical request 即使 base tuple 已旧，也仍是 boundary；只有 exact current head/base
+tuple 才有 authority。没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider
 terminal evidence 只能闭合第一个 gap。之后的每个 gap，以及任何前面已有物理 request
 的 generation 所需 positive clean/superseding authority，都必须来自直接附着于该
 request 的合格 `+1`。terminal payload 没有 originating request ID，无法证明它属于
@@ -217,15 +225,17 @@ request 的合格 `+1`。terminal payload 没有 originating request ID，无法
 或 supersede findings。出现 base epoch 后，连第一个 gap 也必须使用 request-bound
 `+1`。
 
-同一个或更晚的 official `eyes`/provider progress 如果不晚于后继 boundary，会让前一个
+同一个或更晚的 official `eyes`/provider activity 如果不晚于后继 boundary，会让前一个
 generation 保持 open；与后继 boundary 同时属于 timestamp-ordering ambiguity，不能
 证明 review 已经完成。最新 request 的 clean 不能跨过更早的 unclosed gap，后继
 boundary 之后才到达的 evidence 也不能倒推修复该 gap。带有单一、无歧义 commit
-binding 的 progress 会直接归入对应 head。unbound edited progress 被视为从
-`created_at` 到当前 revision time 的闭区间；只有两个端点及区间内每条物理 boundary
-始终唯一绑定到同一个其他 full head 时，才能作为 historical 排除。缺少 origin、
-ordinary/conflicting boundary、区间内 head transition，或任一端点与 boundary 同时，
-都必须在 current-head inventory 中保持 fail-closed。
+binding 的 progress 会直接归入对应 head。所有 unbound progress 都必须保留在 current
+inventory；邻近 request 的 timestamp 不能证明其 originating flight 或 head。edited
+terminal carrier 还会产生一个从 `created_at` 到 terminal revision 的 unbound unknown-
+activity interval；只有在评估同一 carrier 的同一 terminal 时，才豁免它自己的 terminal
+endpoint，不能豁免其他 carrier。provider terminal 只有在 predecessor reaction inventory
+完整，且从该 terminal 到 successor 没有当前 `eyes` 或 provider activity 时，才能闭合
+第一个 gap。
 ordinary request reactions 仅用于 provider liveness；ordinary `+1` 本身不能
 head-bind clean。same-time/later official `eyes`/progress from Codex 会 veto candidate
 clean，因为 review activity 尚未被证明 terminal。reaction-only change 没有 automatic
