@@ -63,6 +63,22 @@ evidence 读取。普通 request 上的 `+1` 不能独立产生 head-bound clean
 Codex `eyes` reaction 或 progress artifact 与候选 terminal clean 同时或更晚，则说明 review
 activity 仍然有效并 veto success。Reaction 变化本身不会启动 consumer job，因此需要等待
 后续合格 bot comment 触发，或手动 dispatch exact-head `reconcile`。
+在 predecessor-to-successor generation closure 中，与 successor request 同一时间戳的
+liveness 也无法排序，必须保持 predecessor open。
+一旦出现第二个物理 request boundary，unbound terminal 就无法证明自己属于新 request，
+而不是旧 flight 的延迟结果。没有 base epoch 时，provider terminal evidence 只能闭合
+第一个 gap；之后的每个 gap 和新 generation 的 clean authority，都必须来自直接附着在
+对应 canonical request 上的合格 `+1`。有 base epoch 时，每个 gap 都必须如此。若旧 gap
+已经无法在原始窗口内闭合，必须先区分 physical boundary 与 positive authority：edited、
+malformed、wrong-author、denied 或 stale-base request 可以保留为 boundary，但没有
+authority。只有每个歧义 predecessor 都显式绑定另一个 full head 时，新 head 才能恢复。
+若存在 ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，只运行
+一个 canonical producer；验证 replacement 后关闭旧歧义 PR。
+显式 commit-bound progress 直接归入对应 head；所有 unbound progress 都保留在 current
+inventory，因为邻近 request timestamp 不能证明来源。edited terminal 还会产生从创建到
+terminal revision 的 unbound unknown-activity interval。provider terminal 只有在
+predecessor reaction inventory 完整，且从该 terminal 到 successor 没有当前 `eyes` 或
+provider activity 时，才能闭合第一个 gap。
 
 先选择一个 GitHub user 作为 `CONTROL_PLANE_OWNER`；该账号必须对 consumer repository
 拥有 `write`、`maintain` 或 `admin` 权限。Helper 默认使用 `@JoeyTeng`，所有非 Joey
@@ -441,7 +457,10 @@ scoped controller reconcile。manual dispatch 没有 limits-profile 或 numeric 
 - CheckRun expected source 是 GitHub Actions；
 - summary 是 `execution_health=healthy` 与 `gate_outcome=success`。
 
-Head 变化后必须为新 head 取得 evidence 并重新 reconcile；不得接受旧 commit 的 success。
+Head 变化后先停止并重读 summary 与完整 physical lineage；不得接受旧 commit 的 success，
+也不得自动在同一 PR 启动 generation。只有每个歧义 predecessor 都显式绑定不同 full head
+时，才能在 new head 继续。若 ordinary、edited、malformed、denied、deleted 或其他 unbound
+predecessor 留下不可闭合 gap，必须使用 replacement PR。
 
 ## 4. 启用 ruleset 并关闭 canary
 

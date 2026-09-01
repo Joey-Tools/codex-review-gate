@@ -77,6 +77,26 @@ progress artifact at the same time as or later than candidate terminal clean
 evidence vetoes success because review activity is still current. Reaction
 changes do not themselves start a consumer job, so let a later qualifying bot
 comment run the gate or dispatch a manual exact-head `reconcile`.
+For predecessor-to-successor generation closure, liveness at the same timestamp
+as the successor request is also ambiguous and keeps the predecessor open.
+Once a second physical request boundary exists, an unbound terminal cannot
+prove that it belongs to the newer request rather than an older flight. Without
+a base epoch, provider terminal evidence may close only the first gap; every
+later gap and the newer generation's clean authority require a qualifying `+1`
+directly on the corresponding canonical request. With a base epoch, every gap
+does. Physical boundaries and positive authority are separate: an edited,
+malformed, wrong-author, denied, or stale-base request can remain a boundary
+without gaining authority. A new head recovers an unclosed gap only when every
+ambiguous predecessor is explicitly bound to a different full head. If any
+predecessor is ordinary, deleted, or otherwise unbound, create a replacement
+PR, run one canonical producer there, validate it, and close the ambiguous PR.
+Explicitly commit-bound progress is scoped to that head. Every unbound progress
+carrier remains in the current inventory because nearby request timestamps do
+not prove its source. An edited terminal also contributes an unbound unknown-
+activity interval from creation through terminal revision. Provider terminal
+evidence can close the first gap only with a complete predecessor reaction
+inventory and no current `eyes` or provider activity after that terminal
+through the successor.
 
 Choose one GitHub user as `CONTROL_PLANE_OWNER`. That account must have
 `write`, `maintain`, or `admin` permission on the consumer repository. The
@@ -526,8 +546,12 @@ all of the following:
 - the run summary reports `execution_health=healthy` and
   `gate_outcome=success`.
 
-If the head changes, record the new SHA, obtain review evidence for that head,
-and reconcile again. Never accept success from an older commit.
+If the head changes, stop and reread the summary plus the complete physical
+lineage; never accept success from an older commit or automatically start a
+same-PR generation. Continue on the new head only when every ambiguous
+predecessor is explicitly bound to a different full head. An unclosable
+ordinary, edited, malformed, denied, deleted, or otherwise unbound predecessor
+requires a replacement PR.
 
 ## 4. Activate and close the canary
 

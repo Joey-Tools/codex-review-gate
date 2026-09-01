@@ -11,21 +11,72 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: ${{ matrix.check-name }}
+  test-node-20:
+    name: CI shard / Node.js / ${{ matrix.suite.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - node-version: "20"
-            check-name: Node.js
-          - node-version: "24"
-            check-name: Node.js 24
+        suite:
+          - name: core
+            release-test-shard: "off"
+          - name: release 1/4
+            release-test-shard: "1/4"
+          - name: release 2/4
+            release-test-shard: "2/4"
+          - name: release 3/4
+            release-test-shard: "3/4"
+          - name: release 4/4
+            release-test-shard: "4/4"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: ${{ matrix.node-version }}
-      - run: npm run check
-      - run: npm test
+          node-version: "20"
+      - name: Run checks and non-release tests
+        if: ${{ matrix.suite.release-test-shard == 'off' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
+        run: |
+          npm run check
+          npm test -- --test-concurrency=1
+      - name: Run release pipeline shard
+        if: ${{ matrix.suite.release-test-shard != 'off' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release-test-shard }}
+        run: node --test test/v2-release-pipeline.test.mjs
+
+  test-node-24:
+    name: CI shard / Node.js 24 / ${{ matrix.suite.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: core
+            release-test-shard: "off"
+          - name: release 1/4
+            release-test-shard: "1/4"
+          - name: release 2/4
+            release-test-shard: "2/4"
+          - name: release 3/4
+            release-test-shard: "3/4"
+          - name: release 4/4
+            release-test-shard: "4/4"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Run checks and non-release tests
+        if: ${{ matrix.suite.release-test-shard == 'off' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
+        run: |
+          npm run check
+          npm test -- --test-concurrency=1
+      - name: Run release pipeline shard
+        if: ${{ matrix.suite.release-test-shard != 'off' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release-test-shard }}
+        run: node --test test/v2-release-pipeline.test.mjs

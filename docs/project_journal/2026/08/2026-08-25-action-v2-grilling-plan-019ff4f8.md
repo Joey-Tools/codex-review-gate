@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-08-28
+updated: 2026-09-01
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -446,11 +446,14 @@ superseded_by:
   findings only; they neither add inline-conversation authority nor become
   public Action outputs.
 - The diagnostic uses one v2 marker distinct from request markers and contains
-  no `@codex review`. Only `github-actions[bot]` marker comments match. The
-  runtime updates the oldest/lowest-ID canonical duplicate, warns without
-  deleting extras, recreates after deletion, treats write failure as a
-  non-authoritative warning, and excludes the diagnostic from the evidence
-  fingerprint.
+  no `@codex review`. Before writing, runtime reads the complete issue-comment
+  inventory and posts one canonical diagnostic only when none exists. It never
+  patches or replaces an existing canonical diagnostic; duplicates remain
+  untouched and produce a bounded warning. Only an exact, unedited, official
+  `github-actions[bot]` canonical sticky is excluded from physical request
+  lineage. Edited, invalid, forged or wrong-provenance marker-looking comments
+  fail closed as unbound physical boundaries and can require a replacement PR.
+  A write failure remains a non-authoritative warning.
 - Every untrusted excerpt and recovery message is length-bounded and escapes
   mentions, Markdown metacharacters, HTML delimiters, and marker-like content
   before entering the summary, sticky comment, or warning. Duplicate-sticky
@@ -2110,9 +2113,12 @@ superseded_by:
   that earlier request emitted a finding. The reducer now retains every exact,
   unedited request as a lineage and liveness boundary while allowing only
   authorised requests to grant positive authority. A denied boundary prevents
-  later unbound clean and any earlier direct `+1` from passing; a new direct
-  `+1` on an authorised canonical request after the boundary can recover. The
-  denied request still causes no exact-refetch or reaction fan-out.
+  later unbound clean and any earlier direct `+1` from passing. At this
+  checkpoint, a new direct `+1` after the boundary was expected to recover; the
+  later third frozen-head review proved that expectation unsafe because the
+  denied predecessor remains unbound. That intermediate recovery claim is
+  superseded by the replacement-PR rule below. The denied request still causes
+  no exact-refetch or reaction fan-out after its permission classification.
 - Second, Active ruleset activation performed its final approved legacy digest
   before the final canary and complete consumer-security closure. Concurrent
   removal of the last legacy requirement during those reads could therefore
@@ -2235,8 +2241,10 @@ superseded_by:
 - Joey adopted the ledgerless handshake on 2026-08-27. Controller inputs such
   as PR number, expected head, operation, and optional comment hint provide
   validation and early-stop information only; they are not verifier authority
-  and cannot replace the complete GitHub evidence scan. The mutable sticky
-  comment remains best-effort diagnostics and recovery guidance only.
+  and cannot replace the complete GitHub evidence scan. The create-once
+  canonical sticky remains best-effort diagnostics and recovery guidance only:
+  it is never patched or replaced while a canonical candidate exists, and only
+  an exact, unedited, official instance is exempt from physical request lineage.
   - For automatic admission, the controller must exactly refetch and validate
     the admitted provider event before requesting a rerun. For manual
     reconcile, the exact current PR/head contract is mandatory while any event
@@ -2293,6 +2301,959 @@ superseded_by:
   the stable-v2 safety contract. Dedicated runtime/merge identity and stable-v2
   deferral are not adopted for this node.
 
+## Delayed Release Review And Final Mutation Fences
+
+- A delayed late-review result arrived after RC release-intent PR #35 had been
+  opened and exposed two P1 publication-boundary findings. PR #35 was converted
+  back to Draft so the infrastructure fixes land first. No RC tag, target
+  update, GitHub Release, asset, or floating alias was published from #35.
+- The first adopted correction treats the current signer inventory as live
+  access-policy and content evidence: it binds the pinned primary fingerprint,
+  pinned signing-subkey fingerprint, and exact raw public certificate, but not
+  a GitHub GPG-key REST object ID. Every durable mutation fence must revalidate
+  that live tuple, especially immutable Release publication. An existing
+  GitHub persistent verification result cannot replace current-inventory
+  proof.
+  - Explicit reason: historical signature verification and current signer
+    authorization are different protected properties.
+- The second adopted correction requires every governing source, ruleset,
+  immutable-Release, and current-signer policy read to complete before the
+  final exact draft-Release/asset/tag boundary. The publisher then uses the
+  frozen Release ID with a direct REST `PATCH` carrying exact metadata; it must
+  not use `gh release edit`, whose convenience implementation may insert a
+  hidden read after that boundary.
+  - Explicit reason: the final object snapshot must be the last read boundary
+    before publication rather than being invalidated by an implicit helper
+    lookup.
+- The landed fence shape distinguishes ordinary mutations from the two
+  critical irreversible Release/alias boundaries. Every durable mutation
+  revalidates source, rulesets, and the current signer immediately around the
+  mutation. The stronger ordered sequence—governing policy reads followed by
+  the final exact object boundary—is specific to immutable Release publication
+  and major-alias mutation. Immutable-Release policy is cached after the
+  first-mutation check for ordinary work, but that cached result is explicitly
+  insufficient at either critical fence; each performs a fresh policy read.
+- Alias mutation now follows one exact order: lease-protected alias binding
+  raw-first A/B double-read; final source/ruleset/current-signer policy fence;
+  explicit immutable-Release-policy re-read; fresh exact immutable
+  Release/asset/full-tag boundary; alias push; and exact post-alias binding plus
+  Release-boundary readback. This prevents an early policy observation from
+  being represented as proof of the policy at the later alias mutation.
+- Both Release and alias boundaries are raw-first A/B: they first capture and
+  neutrally canonicalize both raw observations, compare A with B, and only then
+  apply structural and expected-policy validation. An unreadable command or
+  canonical projection is `inconclusive` / `remote-read-inconclusive`; A/B
+  drift is `inconclusive` / `remote-state-changed`; and a stable malformed,
+  lightweight, wrong-frozen, or wrong-planned Release state is
+  `blocked_conflict` / `immutable-release-mismatch`.
+  - Explicit reason: validating one observation before the raw A/B comparison
+    can disguise a stable wrong state as a transient read failure.
+- For alias post-write specifically, raw A different from raw B is
+  `inconclusive` / `remote-state-changed`. Stable A equal to B but not an
+  annotated tag with the exact planned direct object and peeled commit is
+  `blocked_conflict` / `malformed-major-alias-target`.
+- The first formal exact-head review reported two P2 findings, and both are
+  fixed on the current working tree.
+  - The first correction changed fresh-create expected absence to the then-
+    understood raw-first point-presence sequence: presence A, raw tag A,
+    presence B, raw tag B; compare both pairs; only after stable absence
+    validate tag policy. Remote unreadability is
+    `inconclusive` / `remote-read-inconclusive`; A/B drift or stable presence is
+    `inconclusive` / `remote-state-changed`; and a stable-absence malformed,
+    lightweight, or wrong tag is `blocked_conflict` /
+    `immutable-release-mismatch`.
+    - Explicit reason: the fresh path must not be an exception that lets an
+      early validator disguise stable wrong state as transient read failure.
+      The later draft-aware correction below supersedes point presence with the
+      complete paginated inventory because release-by-tag cannot see drafts.
+  - An explicit `--test-enforce-live-signer-policy` production-shaped seam is
+    gated by both `CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY=1` and
+    `NODE_ENV=test`, accepted only for `--publish`, and rejected with the
+    filesystem `--test-release-dir` path. Production never skips the signer
+    fence. The enabled seam executes the real GitHub inventory validator and
+    byte-compares the exported raw certificate with the approved certificate.
+    Dynamic coverage includes the valid path reaching publication `PATCH` and
+    alias mutation, live-inventory API outage at publication and alias fences,
+    revoked inventory, and raw-certificate replacement; each failure is
+    fail-closed before its protected write.
+    - Explicit reason: the production signer fence needed dynamic evidence of
+      the real validator and certificate-content comparison without creating a
+      signer-policy bypass that production could activate.
+- GitHub's official Release REST endpoint has no supported conditional
+  compare-and-swap precondition for the publish `PATCH`. The resulting small
+  GET-to-PATCH concurrent-asset window cannot be removed by this client.
+  Workflow concurrency serializes publisher runs, the private Publisher App is
+  the only automated Release writer, and `JoeyTeng` is the explicitly trusted
+  manual writer. Any other concurrent Release writer violates the deployment
+  contract. A post-publication mismatch blocks the release and must not be
+  represented as automatically recoverable.
+- A nonzero direct publication `PATCH`, missing response, or malformed response
+  is `inconclusive` / `release-publication-unknown`: the request may have
+  applied. Recovery reconciles the same exact source and proves either that the
+  frozen draft is unchanged or that the exact Release is already immutable; it
+  does not blindly advance to another version. A deterministic post-readback
+  mismatch remains blocked.
+- A live production preflight against GitHub REST API `2026-03-10` exposed an
+  additional release blocker before any mutation. The immutable-Release policy
+  response was `{"enabled":true,"enforced_by_owner":false}`. The publisher's
+  exact-key equality against only `enabled` rejected that valid enabled policy;
+  the blocker was the brittle response-shape check, not a disabled policy.
+  The correction validates both documented fields as booleans, requires
+  `enabled=true`, permits `enforced_by_owner=false`, and tolerates additive
+  response fields. Unreadable, non-object, missing/wrong-typed, or disabled
+  policy evidence still fails closed.
+  - Explicit reason: a valid enabled policy must not be rejected merely because
+    GitHub returns another documented field, while unreadable or malformed
+    policy evidence must never authorize a publication mutation.
+  - Follow-up reviewer evidence refined the endpoint status contract from the
+    official GitHub REST `2026-03-10` documentation: `200` is returned only
+    when immutable Releases are enabled, while disabled state returns `404`.
+    The correction classifies that `404` as `blocked_conflict` /
+    `immutable-release-policy-disabled`, classifies every other API failure as
+    `inconclusive` / `immutable-release-policy-unreadable`, and still validates
+    the schema of a successful `200` body.
+- The same live production preflight confirmed a second P1 on the fresh
+  Release path. That path parsed `gh release view` stderr for `HTTP 404`, but
+  `gh` 2.88.1 actually emits `release not found` when the Release does not
+  exist. A valid first-release absence was therefore misclassified as
+  `inconclusive` / `remote-read-inconclusive`, blocking every initial publish
+  attempt in that runtime.
+  - Intermediate remediation replaced porcelain stderr with the REST
+    release-by-tag status classifier, and fixtures kept REST status semantics
+    distinct from `gh` porcelain text. The later draft-aware review proved that
+    even a real release-by-tag `404` is not complete absence evidence because a
+    draft can exist; the complete inventory correction below supersedes that
+    intermediate classifier for publisher absence.
+  - Explicit reason: porcelain stderr is not a stable carrier for REST status,
+    so absence authority must come from the API classifier rather than a
+    version-specific CLI message.
+- A follow-up review also corrected an overbroad release-document statement:
+  ordinary mutation fences revalidate source, rulesets, and the current signer
+  immediately around the mutation, while only immutable Release publication
+  and major-alias mutation enforce governing policy reads before their final
+  exact object boundary. No broader ordering is claimed for ordinary writes.
+- Two further reviewer-reported P2 fixes, stable-schema-invalid A/B and the
+  tag-pipeline path, were addressed in the correction set. Dynamic coverage was
+  also added for a direct publication `PATCH` that
+  exits zero but returns an empty, malformed, or wrong-Release-ID response. The
+  expected result remains `inconclusive` / `release-publication-unknown`, the
+  floating alias remains unmoved, and recovery reconciles the same exact source
+  rather than advancing publication blindly.
+- The first complete serialized suite attempt after these production-focused
+  changes exited `1` with 9 failures; it was not a passing run. One failure was
+  a real public-verification defect in the same error-semantics class as fresh
+  publication: it still expected `HTTP 404` in `gh release view` porcelain
+  stderr, while `gh` 2.88.1 reports `release not found`. The other eight were
+  stale absence-marker fixture failures whose markers still depended on the
+  removed porcelain Release-view path.
+  - Remediation moves public-verification Release-view metadata to the direct
+    REST `2026-03-10` release-by-tag projection with documented HTTP 404
+    classification, and moves the eight fixture markers to the authoritative
+    REST absence boundary. The independently rerun affected set then passed
+    9/9, and the separate CLI/API missing-Release diagnostic passed 1/1.
+- Final validation on the corrected tree then ran
+  `npm test -- --test-reporter=dot --test-concurrency=1`. The second complete
+  serialized command exited `0`, and its dot-only output was counted exactly as
+  815/815. The earlier 807/807 checkpoint remains historical evidence from the
+  then-frozen tree and predates the live-production corrections above.
+- Current fast gates also passed: `bash -n`, ShellCheck, `npm run check`, the
+  workflow-security contract 39/39, `git diff --check`, and project-journal
+  validation. The new signed landing checkpoint and fresh formal exact-head
+  review remain pending; this ledger does not yet claim a commit or review.
+  Publication therefore remains paused, and PR #35 must not leave Draft yet.
+
+### Draft-aware Release identity correction
+
+- A later exact-head review found a further P1 in the GitHub Release object
+  lookup contract: `GET /releases/tags/{tag}` is a published-Release lookup and
+  cannot establish either draft presence or draft absence. The publisher still
+  used that endpoint for initial/prewrite state and draft mutation boundaries,
+  so an existing draft could look absent and a fresh draft could become
+  unreadable immediately after creation.
+- Official implementation evidence confirms the required split. GitHub CLI's
+  `FetchRelease` independently looks up a published Release by tag and draft
+  candidates, obtains the selected draft's database ID, and then reads
+  `/releases/{id}`. GitHub's complete Release-list contract exposes drafts to a
+  caller with push access; the dedicated Publisher App has that access. Public
+  verification may continue to use the published-only release-by-tag endpoint.
+- The protected property is now explicit: one exact tag maps to exactly one
+  positive safe numeric Release ID, and every mutable/draft observation remains
+  bound to that frozen object identity. The publisher now:
+  - reads the complete `per_page=100`, `--paginate --slurp` inventory with the
+    REST `2026-03-10` header;
+  - requires an outer page array with at least one page (`[[]]` is valid empty
+    state), page arrays, safe positive IDs, global ID uniqueness, and at most
+    one exact-tag match;
+  - treats outer `[]`, malformed pages, unsafe or repeated IDs, pagination
+    failure, and normalization failure as `inconclusive` /
+    `remote-read-inconclusive` because absence was not proved;
+  - treats one exact tag claimed by distinct unique IDs as
+    `blocked_conflict` / `duplicate-release-tag`;
+  - proves fresh absence through two complete inventory plus full-tag raw A/B
+    snapshots, then discovers a newly created draft through another two
+    complete inventory plus full-tag raw A/B snapshots before freezing its ID;
+  - obtains an existing draft or published Release ID from the complete
+    inventory and never rebinds within that publisher invocation; a later run
+    has no persisted ID ledger and performs a new full inventory selection;
+    and
+  - reads every later Release boundary through `/releases/{frozen_id}` twice,
+    requires each response `.id` to equal the path/frozen ID, and treats `404`
+    or unreadability as inconclusive rather than selecting another object or
+    creating a replacement.
+- The same review reported a P3 API-version drift: public Release-view REST
+  reads did not explicitly send `X-GitHub-Api-Version: 2026-03-10`. The public
+  raw/view/list calls and publisher inventory/ID calls now send that version,
+  and fake GitHub rejects an omitted header. This preserves the access-policy
+  and response-contract boundary instead of inheriting the CLI default.
+- Fake GitHub now models the real distinction: a draft is visible in the
+  complete list and by numeric ID while release-by-tag returns REST `404` until
+  publication. Draft boundary mutation/unreadable/schema hooks moved to the
+  by-ID path.
+- Validation actually run on this correction so far:
+  - `bash -n scripts/release-action-subtree.sh`,
+    `node --check test/v2-release-pipeline.test.mjs`, and `git diff --check`
+    passed after the core migration;
+  - the existing focused boundary/PATCH group first ran 20 tests with 14 pass
+    and 6 expected migration regressions: four missing REST-version headers on
+    post-publish by-tag reads and two stale trace assertions still observing
+    `release-tag-read`; after correcting those, the six affected tests passed
+    6/6;
+  - the publisher static contract passed 1/1 after changing the absence
+    contract from point presence to complete inventory; and
+  - the first command covering seven new dynamic cases passed 6/7; its sole
+    failure was an unsaved fake inventory-read counter, not publisher behavior.
+    After saving that observation counter, the affected fresh-creation case
+    passed 1/1. The covered behaviors are fresh creation and frozen-ID
+    boundaries, exact-source recovery of a draft found on the second page
+    without a second create, outer `[]`, repeated ID, same exact tag with
+    distinct IDs, and post-create ID/presence A/B drift;
+  - public release disappearance plus the API/porcelain diagnostic distinction
+    passed 2/2 with the explicit public REST version header; and
+  - frozen-ID `404` and stable wrong-body-ID cases passed 2/2, proving that the
+    publisher neither rebinds nor creates a second draft when the selected ID
+    endpoint disappears or returns a different object identity; and
+  - the existing nonzero direct-`PATCH` unknown-result recovery cases passed
+    2/2 after the draft-aware migration, including response loss after apply;
+    exact-source reconcile proved the frozen object without a second publish
+    mutation; and
+  - the final fast gate passed `bash -n`, ShellCheck, `node --check`,
+    `git diff --check`, `npm run check`, and project-journal validation.
+- The complete serialized suite, signed checkpoint, and fresh exact-head review
+  are still pending and are not claimed by this entry.
+
+### Frozen-ID asset upload and public-inventory follow-up
+
+- The parent lane's first complete serialized baseline after the draft-aware
+  correction ran 824 tests: 820 passed and 4 failed. No other failures were
+  observed. The four failures were stale test expectations rather than runtime
+  regressions: stable and RC direct-PATCH cases still expected two
+  `release-tag-read` traces before publication, the post-publication
+  same-name-asset replacement case still searched for by-tag reads, and the
+  alias-policy drift case did the same. All four boundaries had intentionally
+  migrated to `release-id-read`.
+- A follow-up review retained one P1, one P2, and one P3:
+  - P1: asset upload still used `gh release upload <tag>`, which could resolve
+    a different Release after the publisher had frozen a numeric ID. Asset
+    upload now posts raw bytes directly to the numeric-ID
+    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets`
+    endpoint with explicit Accept, `application/octet-stream`, and REST
+    `2026-03-10` headers. It accepts only a positive safe returned asset ID,
+    exact name, `uploaded` state, and nonempty identity URLs; the next by-ID
+    boundary must contain that exact asset ID. Nonzero, empty, malformed, or
+    identity-mismatched responses are `inconclusive` /
+    `release-asset-upload-unknown` because the bytes may already have been
+    written. Within that invocation recovery keeps the frozen Release ID. A
+    later exact-source retry performs a new full reconcile and freezes the
+    then-unique exact-tag object; cross-run object replacement is prohibited by
+    the trusted-owner boundary rather than detected by a persisted ID ledger.
+  - P2: initial/final public complete inventories did not yet enforce the
+    publisher's page and object-identity schema. Both paths now share the same
+    validator: the outer array has at least one page (`[[]]` is valid empty),
+    every page is an array, every Release ID is a positive safe integer, and
+    IDs are globally unique. Outer `[]`, malformed pages, unsafe IDs, and
+    repeated IDs remain incomplete evidence and produce `inconclusive` /
+    `remote-read-inconclusive`.
+  - P3: historical completed-Release by-tag reads inherited the GitHub CLI API
+    version. They now explicitly send `X-GitHub-Api-Version: 2026-03-10`, as do
+    the existing public and publisher Release reads.
+- Fake GitHub now rejects tag-resolving asset uploads, accepts only the absolute
+  frozen-ID upload route with the exact method/headers/input, and models tag
+  resolution replacement independently from the frozen object. It also models
+  upload failure before apply, response loss after apply, zero-exit empty or
+  malformed responses, and structurally inconclusive public inventories.
+- Validation actually run for this follow-up so far:
+  - the four stale serialized-baseline failures passed 4/4 after their trace
+    expectations moved to `release-id-read`;
+  - seven new dynamic cases passed 7/7: frozen-ID upload under tag-resolution
+    replacement, five unknown upload outcomes, and public outer-`[]`/duplicate-
+    ID inventory rejection (the last test covers both public shapes);
+  - the focused staged-ABI/publisher static contract passed 1/1; and
+  - `bash -n scripts/release-action-subtree.sh`,
+    `shellcheck scripts/release-action-subtree.sh`,
+    `node --check test/v2-release-pipeline.test.mjs`, `git diff --check`,
+    `npm run check`, and the project-journal validator passed after the
+    implementation, tests, and documentation update.
+- A second complete serialized suite is not claimed here; the parent lane owns
+  that final rerun after the shared correction is complete.
+
+### Asset-ID byte readback and per-attempt identity scope
+
+- A third review retained one residual P2: after the upload POST returned an
+  asset ID, the publisher still ran `gh release download <tag>` before its
+  frozen by-ID boundary. That porcelain command could resolve a replacement
+  Release and read bytes from the wrong object. The fake tag-replacement case
+  did not previously change `gh release download`, so it could not expose the
+  defect.
+- The mutation/readback order is now exact: direct POST to the frozen Release
+  ID, validate the returned asset identity, capture and validate the frozen
+  by-ID Release boundary, require that boundary to contain the returned asset
+  ID, then raw-GET `/releases/assets/{asset_id}` with binary Accept and REST
+  `2026-03-10` headers and compare bytes. Any asset-ID GET failure or byte
+  mismatch after mutation is `inconclusive` /
+  `release-asset-upload-unknown`; the post-upload path no longer uses a
+  tag-resolving download.
+- The identity scope is intentionally limited to one publisher invocation.
+  There is no persisted Release-ID ledger. A later exact-source retry performs
+  a new full reconcile, selects the then-unique exact-tag object from the
+  complete inventory, and freezes that ID for the new invocation. The
+  trusted-owner contract forbids deletion or replacement between attempts; the
+  publisher does not claim to detect historical ID replacement or preserve
+  cross-run ID continuity.
+- Fake GitHub now supports raw asset-ID downloads, requires their binary Accept
+  and REST-version headers, records the asset ID and owning frozen Release ID,
+  and makes tag-based download resolve the replacement object while an upload
+  readback is pending. This would fail the removed tag-download implementation
+  while allowing later published-Release validation to exercise its separate
+  existing path.
+- Focused validation so far:
+  - the first combined run passed the response-lost exact-source retry but
+    failed the tag-replacement case after the new fake also redirected a later,
+    unrelated alias-admission download; the fake was narrowed to the pending
+    post-upload readback interval;
+  - the next tag-replacement run completed the publication but its assertion
+    incorrectly prohibited every later tag download rather than only the
+    upload-to-asset-ID-read interval; the assertion was narrowed to each exact
+    interval; and
+  - the corrected tag-replacement case then passed 1/1. The response-lost case
+    had already passed 1/1 and proved that the next exact-source full reconcile
+    selected the same still-existing remote object, adopted the already-written
+    first asset without a second upload, uploaded only the two missing assets,
+    and completed publication; and
+  - the final affected group passed 4/4: the corrected tag-replacement case,
+    response-lost exact-source recovery, asset-ID GET failure, and asset-ID byte
+    mismatch. Both readback failures produced
+    `release-asset-upload-unknown` after the durable upload;
+  - the first static-contract run failed because its new regex expected the
+    asset endpoint text before the Accept header even though the implemented
+    command correctly placed the header first. Correcting only that assertion
+    made the focused static contract pass 1/1; and
+  - final fast gates passed `bash -n`, ShellCheck,
+    `node --check test/v2-release-pipeline.test.mjs`, `git diff --check`, and
+    `npm run check`.
+- No complete serialized suite is claimed for this follow-up.
+
+### Final frozen-identity validation checkpoint
+
+- The complete serialized suite was rerun on the final implementation with
+  `npm test -- --test-reporter=dot --test-concurrency=1` and completed with
+  exit status 0: all 833 tests passed. This supersedes the earlier explicit
+  "not yet claimed" checkpoints without erasing their intermediate failure and
+  correction evidence.
+- The final fast gates remained green: `bash -n`, ShellCheck,
+  `node --check test/v2-release-pipeline.test.mjs`, `git diff --check`,
+  `npm run check`, and the project-journal validator. The journal-only final
+  evidence update is revalidated separately before landing.
+- Two independent targeted read-only audits of the final shared tree reported
+  no findings: one covered the publisher script and one covered its tests and
+  release documentation. These targeted audits are supporting evidence only;
+  the required fresh full-range exact-head review still runs after the final
+  signed landing commit freezes the complete `origin/master..HEAD` range.
+
+### Neutral Release snapshots and empty-starter recovery
+
+- A fresh full-range review found two fail-closed defects after the 833-test
+  checkpoint above. First, exact Release boundaries compared full API JSON, so
+  observational `assets[].download_count` churn or semantically irrelevant
+  Release/page/asset ordering could produce false `remote-state-changed`.
+  Second, GitHub's documented upload-`502` empty `starter` asset could make a
+  later exact-source retry fail inventory normalization before it froze the
+  unique draft Release ID.
+- Release inventory and by-ID A/B reads now use one structurally validated
+  neutral projection. It preserves the protected properties: Release and asset
+  numeric/node identities, tag/name/body/target and lifecycle fields,
+  author/uploader identity, and asset state/content type/size/digest/identity
+  URLs. It rejects duplicate asset names or IDs, including
+  asset-ID duplication across the complete inventory; it canonicalizes
+  Release/page and asset order and excludes observational counters such as
+  `download_count`, timestamps, and additive decoration. Expected-policy
+  validation remains after A/B equality, so
+  stable invalid protected values are not normalized into success and an
+  actual body change still produces `remote-state-changed`.
+- Starter state is structurally projectable but never treated as completed.
+  Automatic cleanup accepts only one empty Publisher-App starter on the
+  selected mutable draft, with the exact planned content type/name and the
+  next canonical slot after a byte-verified uploaded prefix. The final policy
+  fence is followed immediately by a fresh stable frozen-ID A/B boundary that
+  must equal the selected boundary. The publisher then issues at most one
+  DELETE for that frozen asset ID and reconciles every result through another
+  stable frozen-ID boundary. It proceeds only if precisely that asset ID is
+  absent and all other protected state is unchanged; otherwise recovery is
+  `inconclusive` / `starter-asset-deletion-unknown`. Existing uploaded prefix
+  bytes are read through frozen asset IDs rather than tag resolution.
+- The DELETE API has no state-predicate compare-and-swap. The remaining
+  GET-to-DELETE race is explicitly bounded by the trusted-owner/single-writer
+  deployment contract and GitHub's documented terminal empty-starter shape;
+  the implementation does not claim a client-side CAS guarantee.
+- Focused validation actually run for this remediation so far:
+  - `bash -n scripts/release-action-subtree.sh` passed;
+  - `node --check scripts/generate-action-release-provenance.mjs` and
+    `node --check test/v2-release-pipeline.test.mjs` passed;
+  - the existing fresh draft-inventory publication case passed 1/1;
+  - seven starter/identity cases passed 7/7: normal deletion and completed-run
+    idempotence, response-loss-after-apply, `404`-after-apply,
+    failure-before-apply, starter-state pre-delete drift, unrelated protected
+    pre-delete drift, and duplicate asset IDs;
+  - four stable starter mismatches passed 4/4 and proved wrong name, nonzero
+    size, wrong content type, and wrong uploader are blocked without DELETE;
+  - three observational/order cases plus the protected body-drift control
+    passed 4/4; and
+  - a later timestamp-churn regression initially passed the neutral A/B read
+    but failed 3/4 in the group because the policy-validated boundary returned
+    timestamps to the caller and the upload delta comparison still observed
+    them. The boundary now validates those fields but omits them from its
+    decision projection; the corrected timestamp case passed 1/1;
+  - the raw-first classification control passed 3/3 after splitting neutral
+    comparison from policy interpretation: stable schema-invalid remains
+    `blocked_conflict`, valid-to-invalid remains `remote-state-changed`, and a
+    protected body drift remains `remote-state-changed`;
+  - the focused workflow/publisher static contract passed 1/1 after moving its
+    boundary assertion from raw full-JSON sorting to the neutral projector;
+  - after the final edits, ShellCheck, both Node syntax checks,
+    `git diff --check`, `npm run check`, and the project-journal validator all
+    passed. The normal starter recovery and duplicate-ID cases were also rerun
+    2/2 after the neutral comparison was separated from strict policy checks;
+    and
+  - the response-lost exact-source retry passed again after both prewrite and
+    reconcile prefix adoption moved to frozen asset-ID raw GET. Its dynamic
+    assertion proves no tag-resolving draft download occurs; and
+  - parent-lane review removed a false compare-and-swap guarantee from the fake
+    DELETE endpoint: the fake now models GitHub's unconditional asset deletion,
+    so production preconditions alone must prevent a dangerous request. Three
+    added dynamic controls passed 3/3 and proved a planned but non-next-slot
+    starter, a non-null starter digest, and multiple starters all block before
+    DELETE. The strict inventory fingerprint now validates timestamps but omits
+    them from its decision projection; the focused fingerprint unit passed 1/1.
+    `npm run check`, ShellCheck, both publisher Node syntax checks, the added
+    provenance-test syntax check, `git diff --check`, and project-journal
+    validation also passed after these parent-lane corrections.
+- No complete serialized suite is claimed for this post-checkpoint remediation;
+  the parent lane owns that rerun after the shared tree is frozen again.
+
+### Final post-remediation serialized suite
+
+- The parent lane reran the complete suite on the final shared tree with
+  `npm test -- --test-reporter=dot --test-concurrency=1`. It completed with
+  exit status 0 and all 851 tests passed. The count is the prior 833-test
+  checkpoint plus 15 worker-authored neutral/starter regressions and three
+  parent-lane fake-API and mismatch controls.
+- The same final tree also passed `bash -n`, ShellCheck, `npm run check`, Node
+  syntax checks for the publisher generator and both changed test files,
+  `git diff --check`, and project-journal validation. The journal-only final
+  evidence append is revalidated before the next signed landing commit.
+- Because the earlier fresh full-range review produced the two findings fixed
+  above, it is not acceptance evidence for this new tree. A new ordinary
+  general-agent GPT-5.6 Sol Ultra review must inspect the complete frozen
+  `origin/master..HEAD` range after the signed commit.
+
+### Release-create result-loss reconciliation
+
+- A delayed exact-range review found that `gh release create` still ran as an
+  unguarded command under `set -e`. A nonzero result therefore exited before
+  the post-create complete-inventory/full-tag A/B boundary, even when GitHub had
+  already created the draft, and the generic exit trap misclassified the
+  ambiguous mutation as publisher execution failure.
+- The correction treats the command result as non-authoritative and issues at
+  most one create request per publisher invocation. Regardless of status, it
+  takes the full post-create `any` inventory/tag boundary. A unique exact draft
+  freezes its numeric ID and continues automatically; stable absence is
+  `inconclusive` / `release-creation-unknown` and stops without another create.
+  Unreadable, drifting, malformed, and duplicate observations retain their
+  prior fail-closed classifications, and the pre-create and post-create full-tag
+  boundaries must remain equal.
+  - Explicit reason: a lost response after an applied POST is safely recoverable
+    from the unique exact draft, while eventual visibility cannot prove that a
+    second POST in the same invocation is safe.
+- Focused validation actually run for this correction:
+  - the final create-result command matched two dynamic tests and passed 2/2:
+    failure-before-apply stopped after one attempt, then a new exact-source
+    invocation made the second total attempt and completed; response loss after
+    apply adopted the unique draft in the first invocation, and a later
+    exact-source retry kept the total create count at one;
+  - the adjacent fresh, second-page retry, and two post-create inventory-drift
+    cases passed 4/4; and
+  - the workflow/publisher static ABI check passed together with the earlier
+    form of the two create-result cases, 3/3. ShellCheck, `bash -n`, the test
+    file's Node syntax check, and `git diff --check` also passed during the
+    correction.
+- The parent lane then ran the complete serialized suite with
+  `npm test -- --test-reporter=dot --test-concurrency=1`: exit 0, with 675
+  pre-v2 dots plus 45, 80, and 53 final-file dots, for 853/853 tests passed.
+  It also independently reran `npm run check`, ShellCheck, `bash -n`, the
+  changed test file's Node syntax check, `git diff --check`, and the project
+  journal validator successfully. A fresh exact-range acceptance review still
+  remains required after the signed commit.
+
+### PR #36 single-producer recovery
+
+- PR #36 exposed an operational race on exact head
+  `dd5bcd03cbb534732a983b006756fd1298a72e8a`. The live v1 controller emitted
+  canonical hidden-marker request `5460371122` at `2026-08-29T04:38:05Z`.
+  Before that asynchronous request became visible in the first read, the
+  operator also posted direct request `5460371900` at `04:38:18Z`. Codex later
+  produced exact-head terminal clean comment `5460417719` at `04:49:49Z`.
+- The live v1 aggregate gate associated that terminal result with its marker
+  and passed. V2 must not inherit that weaker result: both comments start
+  request generations, there was no terminal or qualifying request-bound
+  `+1` between them, and the terminal text does not identify its originating
+  request. The first-to-second generation gap therefore remains unclosed under
+  the v2 ordering contract. Waiting, removing `eyes`, or observing a second
+  stable snapshot cannot retroactively prove lineage.
+- PR #36 remains unmerged despite green live-v1 checks. Its next implementation
+  and documentation correction creates a new head for the still-deployed v1
+  controller, followed by one controller-owned canonical request, a new frozen-
+  range GPT-5.6 Sol Ultra review, CI, and exact-head merge closure. This is the
+  pre-v2 delivery path for PR #36, not evidence that v2 can reset an unbound
+  lineage by changing commits. No manual direct request is sent while that
+  controller flight is active.
+- Durable operator rule: choose exactly one producer for every exact-head
+  generation. Prefer a direct request only before any controller auto-begin
+  flight exists. Once `begin-review` with `request_review=true` is dispatched,
+  starting, or has emitted its marker, inspect controller/sticky/marker/provider
+  state rather than blindly posting another request. Under v2, a legitimate
+  new head is sufficient only when every ambiguous predecessor is explicitly
+  bound to another full head. If any predecessor is ordinary, edited,
+  malformed, denied, or otherwise unbound, safe recovery uses a replacement PR
+  and one canonical generation there; late evidence or another commit on the
+  ambiguous PR cannot prove that the old provider flight ended.
+- The incident audit also found implementation drift behind that operational
+  rule. Request-bound `+1` returned before checking the earlier-generation gap,
+  so the latest physical request could pass while a predecessor remained
+  outstanding. The same shortcut let an older post-base-epoch canonical
+  request pass after a newer ordinary request boundary. Predecessor `+1`
+  closure also ignored provider progress between the `+1` and successor, and
+  reaction-ID uniqueness was checked only inside the selected request. The
+  adopted and post-unknown adoption branches additionally read the wrapper's
+  nonexistent `.id` instead of `.comment.id`.
+- The reducer now treats every physical request comment as a conservative
+  generation boundary, including same-run hidden-marker siblings. Every clean,
+  including a directly request-bound `+1`, must pass the earlier-gap check; a
+  later boundary blocks an older request's reaction. A predecessor `+1` closes
+  its gap only when no same-or-later official `eyes` or provider progress
+  appears before the successor. Reaction IDs are unique across the complete
+  fetched request inventory, and both adoption paths return the physical
+  comment ID. Provider terminal evidence retains the previously adopted strict
+  predecessor-to-successor time-window contract, and the two-snapshot
+  5-second/60-second stability semantics are unchanged.
+- Validation actually run on this remediation:
+  - `node --test --test-reporter=dot test/v2-gate-runtime.test.mjs` passed all
+    86 tests;
+  - `npm run test:v2` passed all 95 tests;
+  - `npm run check`, both changed-file Node syntax checks, `git diff --check`,
+    and project-journal validation passed before this evidence append;
+  - the prior signed exact head passed the complete 853-test serialized suite.
+    A new complete serialized run was attempted, but the parent deliberately
+    interrupted it after the unchanged `test/v2-release-pipeline.test.mjs`
+    remained active for 25 minutes 25 seconds. No complete-suite result is
+    claimed for the new tree; required CI must complete before merge.
+
+### Exact-head follow-up: time-bound lineage and cross-run Release create
+
+- The fresh full-range review of signed head `cc566ce79981bf85f232489161650c5f37ae6165`
+  found two additional fail-open boundaries. A predecessor `+1` ignored
+  official `eyes` or provider progress whose timestamp equalled the successor
+  request, even though GitHub's timestamp precision cannot prove the liveness
+  signal happened first. Progress artifacts were also collected before current-
+  head scoping, so an old-head review's progress could keep an unrelated
+  current-head generation open.
+- That intermediate correction made generation closure treat official `eyes`
+  or provider progress at or after the `+1` and no later than the successor as
+  ambiguous liveness. It also attempted to exclude unbound progress when its
+  most recent strictly earlier request boundary uniquely named another head.
+  The later whole-range review documented below proved that the second rule
+  inferred carrier origin from temporal proximity and was unsafe; it is not the
+  final contract. Only an explicit unambiguous commit binding may now scope
+  progress to another head, and every genuinely unbound progress carrier is
+  retained.
+- Four controls were added inside the existing overlap-generation test: equal-
+  successor `eyes`, equal-successor progress, old-head-neighbourhood progress,
+  and current-head progress. The focused runtime file passed all 86 tests at
+  that checkpoint, but the old-head-neighbourhood case encoded the unsafe
+  success expectation and is superseded by the later fail-closed regression.
+- The same review found that `release-creation-unknown` prevented a second
+  Release POST only within one publisher invocation. A later exact-source run
+  could observe stable absence and issue another non-idempotent create, even
+  though GitHub does not provide a documented Release-create idempotency key or
+  tag-uniqueness guarantee for drafts.
+- The corrected cross-run contract supersedes the earlier checkpoint that
+  allowed the fake's known-before-apply failure to make a second total POST on
+  the next invocation. The target immutable full tag is the durable one-shot
+  create fence. Only the invocation that began with that tag absent, created it
+  non-force, and read back the exact tag object and peeled commit may issue one
+  Release-create POST. If the tag pre-existed while the complete Release
+  inventory is stably absent, the later invocation emits `inconclusive` /
+  `release-create-attempt-unknown` and issues no POST. The producing invocation
+  still uses `release-creation-unknown` when its one POST is followed by stable
+  absence, and it still adopts a uniquely discovered exact draft after response
+  loss.
+  - Explicit reason: once a POST has started, its process exit status cannot be
+    durable evidence that GitHub did not apply it. The signed protected full tag
+    already precedes Release creation and survives runs, so reusing it adds no
+    App permission, workflow input, service, or separate ledger.
+  - Explicit liveness cost: a crash after tag readback but before the POST, or a
+    create attempt that remains stably invisible, blocks ordinary automated
+    retry. A new Environment approval, dispatch, Actions run, or artifact does
+    not re-arm the one-shot permission. A richer automatic recovery would need
+    a separately reviewed target-side deterministic attempt marker and its own
+    protection/provenance contract.
+- The two test-harness gaps from the same review are corrected. The final-fence
+  static extractor accepts horizontal indentation and explicitly proves that
+  `publisher_gh`, `capture_release_boundary`, and
+  `read_remote_full_tag_snapshot` enter its remote-capable helper set. The tag-
+  replacement fake now builds an independent Release ID and asset identities;
+  every tag resolver selects that object while upload readback is pending,
+  while frozen numeric Release/asset endpoints remain on the original object.
+- Validation actually run for this follow-up so far:
+  - the five focused publisher cases passed 5/5: static publisher contract,
+    fresh create, cross-run create fence, create response-loss adoption, and
+    frozen-ID upload under real tag-resolution replacement;
+  - `node --test --test-reporter=dot test/v2-gate-runtime.test.mjs` passed all
+    86 tests, and `npm run test:v2 -- --test-reporter=dot` passed 95/95;
+  - `npm run check`, `bash -n`, ShellCheck, the release-test syntax check,
+    `git diff --check`, and project-journal validation passed; and
+  - the complete serialized suite was attempted with
+    `npm test -- --test-reporter=dot --test-concurrency=1`. It completed the
+    preceding test groups, then stopped producing output inside the known slow
+    release-pipeline file. The parent interrupted it after it exceeded the prior
+    25-minute-25-second bound. It emitted no failure before interruption, but no
+    complete-suite result is claimed; required GitHub CI must complete before
+    merge.
+
+### Source CI matrix split before the final frozen head
+
+- PR #36's preceding head showed that both ordinary source-CI jobs were on the
+  critical path: `Node.js` ran from `04:37:52Z` to `04:54:31Z`, and `Node.js
+  24` from `04:37:52Z` to `04:54:12Z`. The release-pipeline suite now registers
+  131 top-level tests, and historical standard-Ubuntu runs show that this one
+  file dominates the complete suite. A file-only matrix would therefore leave
+  the same slow file as the critical path.
+- The source `CI` workflow now runs two symmetric Node-version groups. Each
+  version has one `core` cell plus four release cells. The core cell sets the
+  release suite to `off`, runs syntax checks, and runs every non-release test
+  file with `--test-concurrency=1`; serialization preserves the repository and
+  GitHub-state fixture isolation required by the existing final-gate evidence.
+  The four release cells run only `test/v2-release-pipeline.test.mjs` and select
+  top-level test ordinals modulo four. The current closed inventory is split
+  33/33/33/32, so every release behavior test executes exactly once per Node
+  version while each cell retains the file's sequential execution semantics.
+  Unset shard configuration preserves the ordinary local all-tests behavior;
+  `off` and the four explicit fractions are the only CI values, and an empty or
+  malformed value fails at module load.
+- The adapter exposes a read-only registration count and the release test file
+  asserts the exact current count after synchronous registration. The contract
+  test proves the modulo partition, rejects malformed and unsafe fractions,
+  forbids alternate `test.skip`/`test.only`/`test.todo` registration surfaces,
+  and locks the two-version/four-shard workflow inventory. This converts a
+  future test-addition or conditional-registration drift into an explicit
+  reviewable contract update rather than a silent coverage gap.
+- No aggregate matrix-result job is used. A focused review found that GitHub
+  permits a single job and its dependents to be rerun; relying on the folded
+  `needs.<matrix-job>.result` could therefore let a successful partial rerun
+  replace the aggregate view while another matrix leg's earlier failure was
+  not rerun. Every cell instead has a unique check name and retains its own
+  conclusion. This is both fail-closed and cheaper than starting two extra
+  aggregator runners.
+- Live ruleset readback confirmed that the source repository's required check
+  contexts are `Review gate state machine` and `codex/review-gate`, both from
+  GitHub Actions. The old ordinary-CI names `Node.js` and `Node.js 24` were not
+  required, and the separate fast state-machine workflow is unchanged. The
+  dormant `required-ci.yml` reusable workflow is also unchanged because it has
+  no current source PR/push caller; its complete closure remains available to
+  an explicit future caller.
+- Validation actually run for the CI split:
+  - the new shard/workflow contract passed 5/5 under local Node 24, and the
+    focused ordinary-agent lane independently passed it under Node 22 and Node
+    24;
+  - release `off` mode loaded the real file and skipped the exact 131/131
+    closed inventory; the serialized core group completed with exit zero;
+  - `npm run check`, `actionlint`, all three changed-file Node syntax checks,
+    and `git diff --check` passed; and
+  - a same-host attempt to run all four heavy release cells concurrently was
+    deliberately bounded: three cells were interrupted after about 14 minutes
+    of shared-resource contention, and the remaining cell after about 21
+    minutes. No local release-cell success is claimed from that attempt. The
+    new GitHub head must prove all eight Node-version/release-cell combinations
+    on independent runners before merge, and their observed wall times will
+    determine whether a later weighted partition is warranted.
+- A focused ordinary general-agent review using GPT-5.6 Sol Ultra found and
+  closed two fail-open issues during this change: the first aggregate shape
+  folded matrix results across partial reruns, and the first inventory probe
+  depended on recursive `node:test` reporter output. The final design has no
+  aggregate and uses an in-process registration-count invariant. The latest
+  focused re-review reported no remaining High or Medium finding. This is not
+  the required new whole-range exact-head acceptance review.
+
+### Frozen-head whole-range review follow-up
+
+- A fresh ordinary general-agent lane using GPT-5.6 Sol Ultra reviewed the
+  complete exact range
+  `cf640dc84d2d59ead9acc2ea9cd1c74e4441aaff..75f54b662459fd42553638f90eea9f80eb18ee50`.
+  It found no High issue, one Medium fail-open progress-attribution race, and
+  one Low documentation-consistency issue. No other High or Medium issue was
+  reported.
+- The Medium sequence was: a predecessor current-head request received a
+  qualifying `+1`; a later old-head physical request boundary appeared; an
+  unbound provider-progress revision shared GitHub's one-second timestamp with
+  the next current-head request; and a delayed clean arrived afterward. The
+  first implementation ignored all boundaries at or after the progress time,
+  selected the uniquely old-head strictly earlier boundary, and discarded the
+  progress as historical. The predecessor `+1` could then close the gap and
+  allow the delayed clean to pass. This contradicted the adopted rule that a
+  same-time physical boundary is ordering ambiguity and must remain
+  fail-closed.
+- The `7e8d174` follow-up retained unbound progress whenever any physical
+  request boundary had the same revision timestamp. Only after ruling out that
+  ambiguity did it apply the existing most-recent-strictly-earlier-boundary
+  rule. It deliberately did not use comment IDs as a timestamp tie-break:
+  provider progress can use an edited comment's revision time, while a comment
+  ID orders creation and cannot prove the within-second edit/request order.
+  The subsequent frozen-head review below proved that revision-only scoping was
+  still incomplete and superseded it with the carrier-interval rule.
+- Two integration regressions close both sides of the contract. The first
+  reproduces the fail-open combination with the current-head successor at the
+  same time as progress. The second keeps progress fail-closed when the
+  old-head boundary itself is at the same time; this prevents a future change
+  from merely replacing `>=` with `>` and attributing the ambiguous signal to
+  the old head. The then-existing strictly ordered old-head-progress case still
+  passed. The later full-range review proved that request timing alone never
+  establishes an unbound carrier's head, so this historical success expectation
+  was unsafe and is superseded by the final rule that retains every unbound
+  progress carrier.
+- The Low issue was accurate: the English DESIGN and README contained the
+  physical-generation-boundary, predecessor-gap, and unbound-progress rules,
+  while their Chinese counterparts still had only the earlier short form. The
+  Chinese DESIGN and README now state the same normative rules and recovery
+  boundary; no runtime policy was changed for this documentation fix.
+- Validation actually run for this follow-up:
+  - the focused overlapping-generation regression passed 1/1;
+  - `npm run test:v2 -- --test-reporter=dot` passed 95/95, including both new
+    combinations and all runtime, Action ABI, and workflow-contract cases; and
+  - `npm run check` passed.
+  The follow-up still requires the ordinary diff checks, journal validation,
+  signed commit, and a new fresh whole-range exact-head review before push.
+
+### Second frozen-head review: terminal attribution and edited progress
+
+- The next fresh ordinary GPT-5.6 Sol Ultra lane reviewed the complete exact
+  range
+  `cf640dc84d2d59ead9acc2ea9cd1c74e4441aaff..7e8d174ca1e1699712f693faec3e5d31fd5c5010`.
+  It found one High terminal-attribution fail-open and one Medium edited-
+  progress fail-open. It found no other High or Medium issue in the
+  Publisher/Release/tag/alias, CI matrix/partial-rerun, or bilingual-contract
+  paths.
+- The High sequence used two or more physical review generations on one head.
+  Provider terminal comments and reviews do not carry an originating request
+  ID. The prior reducer flattened those carriers to timestamps, allowed one
+  terminal from generation A before request B to close `A -> B`, and then
+  allowed a delayed or duplicate second A carrier after B to act as B's clean.
+  With three generations, the same timestamp-only rule could also let a
+  delayed A carrier close `B -> C`, after which a direct `+1` on C would pass
+  even though B remained outstanding. Two identical stable snapshots prove
+  object stability, not carrier-to-request attribution, so waiting longer does
+  not repair this ambiguity.
+- The corrected lineage preserves each provider terminal's source, ID, kind,
+  and time. In a no-base-epoch lineage, unbound provider terminal evidence may
+  close only the first physical gap and may be positive clean authority only
+  for the first physical generation. Every later gap, latest clean, finding
+  supersession, and evidence-error supersession requires a qualifying direct
+  `+1` on the corresponding head-bound request. After a base epoch, provider
+  terminal evidence cannot close even the first gap; every gap and the latest
+  positive carrier must be request-bound. This keeps ordinary/single-flight
+  terminal clean useful while preventing any delayed or duplicate carrier from
+  crossing an overlapping generation.
+- Negative evidence remains asymmetric. A finding used as first-gap terminal
+  evidence still remains an unresolved finding. An ambiguous later terminal
+  cannot supersede it; only a strictly newer authorised generation and a clean
+  carrier admissible under the rule above can do so. This is the reason the
+  shared clean qualifier, rather than only final success selection, owns the
+  attribution check.
+- The Medium sequence involved an edited progress comment. Its immutable
+  `created_at` can belong to or equal a current-head request boundary while its
+  later revision follows an old-head boundary. Revision-only scoping could
+  classify it as historical and also fail to veto the predecessor's `+1`.
+  The intermediate correction modeled unbound edited progress as a closed
+  carrier interval from creation through revision, then still attempted to
+  infer a historical head from surrounding request boundaries. The later
+  whole-range review proved that this ordering does not identify the provider
+  flight. The final contract retains every unbound interval; only an explicit,
+  unambiguous commit binding may filter progress to another head. Gap liveness
+  uses interval intersection, and comment IDs remain excluded because they
+  order carrier creation, not later edits.
+- Dynamic regressions now cover two- and three-generation delayed terminal
+  carriers, findings that ambiguous clean must not resolve, direct-reaction
+  recovery for every later gap, base-epoch first-gap rejection, unedited and
+  edited same-time progress, an old-head-neighbourhood edited interval, and a
+  cross-head edited interval. The old-head-neighbourhood success expectation is
+  superseded by the final fail-closed rule described below. English
+  and Chinese README, DESIGN, COOKBOOK, human install, and agent install
+  guidance state the same operator recovery rule.
+- Validation for this correction:
+  - the focused base-epoch, delayed-terminal, and multi-generation tests passed
+    3/3;
+  - the first complete v2 rerun correctly exposed two old supersession tests
+    whose expected unbound-terminal success contradicted the new invariant;
+    they were converted to canonical request-bound `+1` recovery cases; and
+  - the corrected `npm run test:v2 -- --test-reporter=dot` rerun passed 96/96,
+    and `npm run check` passed.
+  A focused pre-commit review inspected all 13 dirty files and found one
+  Medium documentation mismatch against that intermediate implementation. The
+  four install guides were aligned and focused follow-up review returned
+  `No findings.` The subsequent full-range review nevertheless invalidated the
+  shared head-inference premise itself; those historical validations are not
+  acceptance evidence for the final retained-unbound rule.
+
+### Third frozen-head review: physical evidence completeness (scoped fix loop closed)
+
+- A fresh ordinary GPT-5.6 Sol Ultra lane reviewed the complete exact range
+  `cf640dc84d2d59ead9acc2ea9cd1c74e4441aaff..8b020e507837503831b3e5ca5da10c66b456233b`.
+  It found five High runtime fail-open paths and three Medium contract gaps.
+  The branch was deliberately not pushed. Its independent Release/publisher
+  lane found no additional issue in immutable publication, frozen Release ID,
+  cross-run create-unknown recovery, or signing-key policy fences.
+- The integrated pre-commit review and its adversarial follow-ups superseded
+  every earlier scoped `No findings` result for acceptance. The confirmed
+  runtime findings fell into five connected classes:
+  - physical requests could disappear after edits, same-second edits could be
+    misclassified from REST timestamps, deleted comments had no reconstructive
+    body, and provider-triggerable visible/hidden request envelopes were not
+    completely recognised;
+  - base-epoch filtering, stale-base boundaries, duplicate reaction identity,
+    older-request `eyes`, malformed or unresolved carriers, edited terminals,
+    and provider identity mismatches could leave liveness or predecessor gaps
+    outside the evaluated window;
+  - incomplete GraphQL pagination, unstable ordering, failed pages, abandoned
+    parallel reads, or cross-source body conflicts could let previously
+    observed deletion/edit/finding evidence disappear between stability
+    attempts;
+  - generic recovery text and a display-reason-derived decision could direct
+    another same-PR generation even when an unclosable historical unbound gap
+    required a replacement PR; and
+  - a mutable controller sticky could self-poison physical lineage, a stale
+    pre-create inventory could duplicate the sticky, and a request POST that
+    may already have committed could be forgotten after an unproved scope
+    transition.
+- The fix loop, first validated at a 144-test checkpoint and frozen at 180 v2
+  tests, implemented the following fail-closed correction set:
+  - physical-boundary recognition is separate from positive authority. It
+    retains edited, malformed, wrong-author, denied, stale-base, focused or
+    hidden-envelope request shapes; explicit GraphQL edit metadata prevents
+    same-second REST timestamps from granting unedited authority. A valid
+    ordinary request still performs the cached permission lookup before denial;
+    after denial there is no reaction or exact-refetch fan-out, while earlier
+    invalid shape/author/binding cases perform none of those reads;
+  - complete paginated `CommentDeletedEvent` and issue-comment edit inventories
+    are validated against their connection counts, page state, cursor progress,
+    duplicate identities and strict opaque ordering. The protected property is
+    concrete irreversible evidence, not transient read health. An incomplete
+    node with a stable canonical ID installs an identity tombstone: only a later
+    complete observation of that same identity may upgrade it; replacement,
+    duplicate-identity conflict, or cross-source identity/content conflict
+    fails closed. A pure connection-level schema/read failure that admits no
+    object installs no tombstone, restarts the stability window, and may recover
+    after two later complete identical snapshots. Once a deletion event, edit
+    proof, body identity, count floor or conflicting object has been observed,
+    later validation/retry cannot forget it. A missing previously observed
+    deletion is failed revalidation rather than permanent poison: the observed
+    `(id, fingerprint)` union is retained, the stability window restarts, and
+    both final complete identical snapshots must contain that union. Persistent
+    absence stays pending, `[A] -> [B] -> [A,B] -> [A,B]` may recover, and a
+    changed fingerprint for the same deletion ID permanently poisons the run. A
+    deleted comment has no recoverable body, so it remains an unbound physical-
+    only boundary and provider-activity point;
+  - evidence latches are scoped to the gate property rather than every PR
+    mutation. Issue comments remain fully reconciled because any one may carry,
+    hide or be edited from a provider request. Review latching covers only
+    official-Codex review carriers that are terminal, malformed or provenance-
+    relevant; reaction latching covers only official-Codex `+1`/`eyes` carriers
+    plus identity ambiguity. Human review state and ordinary reactions do not
+    affect this gate and therefore never permanently poison a run. Relevant
+    reactions are inventoried before epoch/head authority filtering. Provider
+    activity, invalid provenance, edited terminal intervals and older-request
+    liveness participate in both predecessor-gap and final-clean checks. Edited
+    terminal comments cannot supply positive or superseding clean authority,
+    and one carrier's endpoint exception cannot exempt another carrier;
+  - recovery propagates the structured `requiresReplacementPr` lineage flag
+    through normal, error and report-persistence paths; controller routing never
+    parses or matches substrings in the human-readable `reason`.
+    `request_clean_generation` distinguishes an existing current canonical
+    request that needs a direct `+1`, a safe missing generation that permits
+    exactly one request, and an unclosable historical unbound gap that requires
+    a replacement PR. `fix_findings` likewise moves the fixes to a replacement
+    PR when that gap coexists with unresolved findings. Recoverable latest
+    ordinary/current boundaries do not falsely require replacement; and
+  - controller diagnostics use one immutable write, never edit themselves, and
+    are excluded from physical request lineage only after strict validation of
+    the original body, hidden-field types, Actions provenance and no-edit proof.
+    A fresh complete inventory immediately before creation suppresses a second
+    POST once a canonical candidate is visible. Existing candidates, including
+    duplicates, remain untouched and are diagnosed; edited, invalid, forged or
+    wrong-provenance marker-looking comments remain physical-only boundaries.
+    After a request POST may have committed, only a proved head change is a safe
+    terminal scope transition; draft, closed, base/test-merge or otherwise
+    unproved scope changes retain retry-unsafe same-run recovery instead of
+    permitting a new generation.
+- The documentation review corrected the same operator contract in the English
+  and Chinese agent, human, COOKBOOK, DESIGN and README guides. Head changes and
+  ambiguous provider evidence no longer imply an automatic same-PR generation;
+  ordinary, edited, malformed, denied, deleted or otherwise unbound historical
+  predecessors use a replacement PR when their original gap cannot close.
+  DESIGN and README now state the exact denied-boundary permission/read fan-out
+  and deleted-comment boundary rules. A fresh read-only bilingual parity review
+  of these changes returned `No findings.`
+- The CI findings showed that the first sharding contract could be bypassed by
+  alternate `node:test` registration forms or suppressed tests, and that one
+  correct job could hide another job's empty matrix cells. The final follow-up
+  exports only the canonical registration factory, locks the adapter and shard-
+  environment identifiers to the Release suite, seals the registered count,
+  and rejects a second-file owner plus the reviewed alias/`describe`/`it`/
+  `skip`/`todo` and late-registration escape fixtures. The workflow contract
+  validates Node 20 and Node 24 independently, including the full core-plus-
+  four-shard matrix, conditions, environment and commands, and rejects extra
+  axes plus `include` or `exclude`. A Node 24.15.0 discovery probe confirmed
+  that test-file symlinks are discoverable, so the scanner explicitly fails
+  closed on every `*.test.mjs` symlink and includes a real-symlink regression;
+  directory symlinks are not recursively discovered. The actual 2-core/8-
+  release workflow shape did not change.
+- Validation actually run on the final frozen runtime bytes:
+  - runtime SHA-256
+    `a53d8cceae83280a42bba219ead3a8e6db70a54234028759fdcbf2a8eaf10132`
+    and runtime-test SHA-256
+    `edc67f9e86c08dc3ee514fadcaf2b9c96e5fefb37e86f0d1d18f03a68ef7e31b`;
+  - `npm run test:v2 -- --test-reporter=dot` passed 180/180;
+  - the six-test sticky/create/post-attempt focused regression passed 6/6;
+  - `npm run check` passed; and
+  - `git diff --check -- packages/action/src/v2/gate-runtime.mjs test/v2-gate-runtime.test.mjs`
+    passed.
+  A zero-context GPT-5.6 Sol Ultra scoped review of those exact runtime/test
+  hashes returned `No findings.` The final CI bytes separately passed
+  `node --test test/ci-test-shard.test.mjs` at 13/13, plus `npm run check` and
+  their scoped diff check. Post-freeze targeted English/Chinese checks confirmed
+  the three recovery branches and the denied/deleted boundary wording; the
+  project-journal validator and full-tree `git diff --check` also passed. No
+  local full Release or core-suite pass is claimed; required GitHub CI must
+  still prove both core cells and all eight independent Release cells. A signed
+  follow-up and a completely new whole-range exact-head review remain required
+  before landing.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -2336,10 +3297,12 @@ superseded_by:
 - Run the already specified hidden-marker canary and live
   publisher/runner/Environment preflights as execution evidence; they are not
   remaining grilling choices.
-- Satisfy infrastructure PR #34's CI, review, and merge-readiness gates without
-  involving PR #32.
-- After the infrastructure PR merges, create the separate release-intent PR and
-  execute the approved publisher workflow through RC and stable `v2.0.0`.
+- Keep RC release-intent PR #35 in Draft while the two delayed-review P1
+  infrastructure findings are fixed, validated, signed, reviewed, and landed;
+  do not involve PR #32.
+- After the corrected infrastructure lands, revalidate and return the separate
+  release-intent PR to the normal approval path, then execute the approved
+  publisher workflow through RC and stable `v2.0.0`.
   Verify immutable refs, Release/assets, signatures, and floating alias before
   carrying out the explicitly selected consumer migrations and canaries.
   Marketplace publication remains the separate stable-major manual checklist

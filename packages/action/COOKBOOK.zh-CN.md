@@ -39,7 +39,9 @@ push、update-branch operation、base change、close/reopen transition，或 PR 
 
 ### 普通低成本 review
 
-如果 exact head 上没有必须先失效的旧 success，普通 agent path 是：
+只有在 PR 没有 base epoch，且这是第一个物理 generation 时，才使用下面的普通 agent
+path。发送前必须确认 current lineage 中没有任何更早、且未显式绑定其他 full head 的
+provider-triggerable request-shaped boundary：
 
 1. 读取 open PR 和 exact current head；
 2. 发送一条 complete visible content 只有 exact `@codex review` 的 comment；
@@ -50,6 +52,11 @@ push、update-branch operation、base change、close/reopen transition，或 PR 
 GitHub CLI pull-request comment command 应优先使用 task-scoped body file，避免
 shell quoting 增加 visible text。不要手工构造 workflow-owned hidden marker；该形式
 由 `begin-review` operation 负责。
+
+发送前必须证明 exact head 上没有 active 的 `request_review=true` `begin-review` run，
+也没有已经生成的 canonical marker。一个 head generation 的 direct 与 controller request
+producer 必须互斥。不确定 ownership 时，应读取 controller run、canonical marker、sticky
+diagnostic 与 provider evidence，不得盲目再发一条 request。
 
 普通 request author 的默认最低权限是 `write`、`maintain` 或 `admin`，除非受保护的
 default-branch configuration 明确选择 `any`。
@@ -85,6 +92,14 @@ gh workflow run "$WORKFLOW" \
 
 不发送 request。它是 best effort，不增加专用 barrier。只有观察 exact controller
 run 完成后，才发送新的 exact `@codex review`。
+
+不得重叠两种 producer。前一 request 尚未闭合时出现下一条 request，会因为 terminal
+Codex text 没有 originating request ID 而形成 lineage gap。V2 会刻意保持 pending；落在
+原 predecessor-to-successor window 之外的 evidence 不能修复该 ordering。只有所有歧义
+predecessor 都 canonical 绑定到另一个 full head 时，新 head 才足以恢复。如果存在
+ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor，commit 变化不能证明其
+provider flight 已结束。应从目标 branch/commits 新开 replacement PR，只运行一个
+canonical producer；replacement 验证通过后关闭旧歧义 PR。
 
 ### Reconcile 一个 exact head
 
@@ -131,15 +146,18 @@ gh workflow run "$WORKFLOW" \
    pure wait。不要根据 zero counts、pending result 或 sticky comment 推断 clean。
 7. 结果达到 `healthy/success` 后，在 merge 前立即执行 exact-head merge closure。
 
-任一步骤中 head 发生变化都必须停止。读取 new current head，再按需开始 fresh
-generation/reconcile。stale run 绝不跟随 new head，也不向它写入本次 decision。
+任一步骤中 head 发生变化都必须停止。读取 new current head、summary 与完整 physical
+lineage；不得自动在同一 PR 启动 generation。stale run 绝不跟随 new head，也不向它写入
+本次 decision。只有每个歧义 predecessor 都显式绑定不同 full head 时，才能在 new head
+继续。若 ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 留下
+不可闭合 gap，必须使用 replacement PR。
 
 ## 解读结果
 
 | Result | 含义 | Operator action |
 | --- | --- | --- |
 | `healthy/success` | 已证明稳定、完整的 current-head clean evidence。 | 执行 final verifier/head/ruleset 重读；全部仍匹配才 merge。 |
-| `healthy/failure` | 已证明符合条件的 findings。 | 按 finding links 修复，或取得 authorised newer clean generation，再 reconcile。 |
+| `healthy/failure` | 已证明符合条件的 findings。 | 按 summary reason 与 finding links 操作。只有 lineage 仍可恢复时，才在原 PR 修复并 reconcile；不可闭合的 historical lineage 必须把修复放到 replacement PR，并在其中只运行一个 canonical generation。 |
 | `unhealthy/failure` | 已证明 findings，但 execution 或 final result handling 同时失败。 | 保持 findings 阻塞，修复指定 execution boundary，再 reconcile。 |
 | `healthy/pending` | evaluation 安全完成，但 current state 尚不能授权 success。 | 按 `recovery_code` 操作；只有 `wait_provider` 可以不执行其他动作而等待。 |
 | `unhealthy/pending` | API、pagination、cap 或 stability execution 不完整。 | 按 recovery code 操作；绝不能把它解释为没有 findings。 |
@@ -176,8 +194,8 @@ change。
 | `none` | evaluator 无需恢复；执行 exact-head merge closure。 |
 | `wait_provider` | 等待 Codex 发布 terminal evidence；不要 spam requests。 |
 | `reconcile` | 重读 exact current head 并运行一次 scoped reconcile。 |
-| `fix_findings` | 修复报告的 current findings，另行解决 inline conversations，取得 later head-bound clean evidence，再 reconcile。 |
-| `request_clean_generation` | 为同一 head 请求严格更新的 authorised generation，并等待绑定它的 clean；任意 later clean 不够。 |
+| `fix_findings` | 按 summary reason 操作。通常先修复报告的 current findings，另行解决 inline conversations，取得 later head-bound clean evidence，再 reconcile。若 reason 同时指出不可闭合的 historical lineage，应把修复放到 replacement PR，并在其中只运行一个 canonical generation，不得在原 PR 重发。 |
+| `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。若 ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |
 | `retry_reconcile` | `retry_safe` 允许时 retry 同一个 exact-head reconcile。 |
 | `wait_then_reconcile` | 等待 GitHub/Codex settle，重读 head，再 reconcile。 |
 | `use_expanded_limits` | 设置受保护 repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`，再 reconcile 同一 exact head。 |
@@ -188,8 +206,11 @@ change。
 | `unsupported_target` | 移至文档化 supported scope，或者保持 gate blocked。 |
 | `create_verifier_run` | ready PR 先转 draft 再 mark ready；already-draft PR 直接 mark ready。确认 exact current head/base/test-merge scope 出现新的 `ready_for_review` verifier，再 reconcile。 |
 
-summary 才是该 code category 内具体 reason 和 object links 的 authority。该表不允许
-绕过 missing data 自行猜测。
+summary 才是该 code category 内具体 reason、lineage 和 object links 的 authority；仅凭
+recovery code 不得另发 request。若已存在的 latest/current canonical request 只缺少可归因
+clean，应取得该 request 上合格的 direct `+1`，不能再增加 generation boundary。若存在不可
+闭合的 historical unbound predecessor gap，必须使用 replacement PR，不能在原 PR 重发或
+仅靠 commit change reset。
 
 ## Finding 对账和 supersession
 
@@ -209,19 +230,27 @@ lease：在同一 head 上可以被 supersede，但只能由严格更新的 auth
 `@codex review` generation 加上之后绑定该 generation/head 的 clean 完成。无关 later
 clean、edited request 或 ambiguous ordering 都不能抹掉它。
 
-finding 真实存在时，修复后使用 `fix_findings`。代码无需变化、finding 已 obsolete
-或不适用时，使用 `request_clean_generation`。两种情况都要等待 later provider
-result 后 reconcile；只解决 inline conversation 不会改变 reducer state。
+finding 真实存在时，修复后使用 `fix_findings`；若其 reason 同时指出不可闭合的 historical
+lineage，应把修复放到 replacement PR，不得在原 PR 再请求 generation。代码无需变化、
+finding 已 obsolete 或不适用时，按 `request_clean_generation` 的 summary reason 分流。
+只有 lineage 仍可恢复时，才在原 PR 请求或完成 latest/current canonical clean；若 reason
+指出不可闭合的 historical unbound predecessor gap，应使用 replacement PR。两种情况都要
+等待 later provider result 后 reconcile；只解决 inline conversation 不会改变 reducer state。
 
-除此之外，terminal clean text 与合格 provider `+1` 具有相同 clean authority。明确例外是
-已经观察到 base epoch 的 PR：只有直接附着于 latest post-epoch、base-bound canonical
-request 的合格 `+1` 可以 pass 或 supersede finding；无法归因的 terminal clean 保持
-pending。
+terminal clean text 与合格 provider `+1`，只有在没有 base epoch、single-flight
+lineage 的第一个物理 generation 中才具有相同 clean authority。出现第二个物理
+request 后，provider terminal evidence 只能闭合第一个 gap；之后的每个 gap，以及新
+generation 的 positive/superseding authority，都必须来自直接附着于相关 request 的
+合格 `+1`。延迟或重复、无法归因的 terminal 保持 pending。已经观察到 base epoch 时，
+每个 gap 和 latest generation 都必须使用 request-bound `+1`。
 
 ordinary request reactions 仅用于 liveness；ordinary `+1` 不能 head-bind clean。
 same-time/later official `eyes`/progress from Codex 会阻止 candidate clean 完成。
 reaction-only change 不会启动 automatic run；通过 later provider event or manual
 reconcile 观察它。
+所有 unbound progress carrier 都保留为 liveness；邻近 request boundary 不能证明其
+head。edited terminal 还会携带从 creation 到 terminal revision 的 unbound unknown
+activity；其 terminal endpoint 只对同一 carrier 构成 self-veto 豁免。
 
 ## Stable-snapshot 恢复
 
@@ -268,21 +297,35 @@ relevant PR scope 内解析：
 - 多个 matches 属于 indeterminate，不能 pass；
 - PR review 的 native `commit_id` 还必须等于 resolved current head。
 
-不要仅为了展开 prefix 而编辑 provider evidence。若它 ambiguous 或绑定其他 commit，
-应请求新的 current-head generation。
+不要仅为了展开 prefix 而编辑 provider evidence。若它 ambiguous 或绑定其他 commit，按
+summary reason 与 lineage 分流：已有 current canonical request 时取得其 direct `+1`；
+只有 lineage 可恢复且 summary 明确要求时，才创建恰好一个 generation。不可闭合的
+historical unbound gap 必须使用 replacement PR，不能在原 PR 增加 boundary。
 
 ## Sticky diagnostic 恢复
 
-sticky 是 best-effort report，不是 receipt。如果它 missing、edited、duplicated 或
-stale：
+sticky 是 best-effort report，不是 receipt。runtime 使用 create-once 语义：每次写入前
+立即读取完整 issue-comment inventory；只有不存在 canonical diagnostic 时才 POST 一条。
+已有 canonical diagnostic 永不 PATCH；只要已存在一条，也绝不 POST replacement。多条
+canonical diagnostics 会原样保留，并产生 bounded warning。
+
+只有 exact、未编辑、official canonical sticky 才能从 physical request lineage 中排除。
+edited、invalid、forged 或 wrong-provenance 的 marker-looking comment 都会 fail closed，
+成为 unbound physical-only boundary。不符合条件的 duplicate 不会因为同时存在另一条
+canonical sticky 就变得 harmless；它可能使 historical lineage 无法闭合，并要求
+replacement PR。
+
+如果 sticky missing 或 stale、写入失败，或存在 duplicates：
 
 1. 保持 provider evidence 不变；
 2. 重读 current head；
 3. 运行一次 exact-head reconcile；
-4. 信任从 GitHub 重建的新 verifier CheckRun 与 summary。
+4. 信任从 GitHub 重建的新 verifier CheckRun 与 summary，再按其 reason 和 lineage 操作。
+   不要通过编辑或删除 sticky comments 修复结果；若报告的 boundary 无法闭合，改用
+   replacement PR。
 
-sticky write failure 不会清除 findings。runtime 可以更新最旧 canonical diagnostic
-并警告之后的 duplicates，但决定 gate 不需要删除 duplicates。
+sticky write failure 不会清除 findings。reconcile 不会更新或替换已有 canonical
+diagnostic；verifier CheckRun 与 summary 才是 authoritative current result。
 
 ## Exact-head merge closure
 

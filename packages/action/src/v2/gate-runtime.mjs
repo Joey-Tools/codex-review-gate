@@ -110,6 +110,73 @@ const V2_BASE_EPOCH_QUERY = `query CodexReviewGateBaseEpoch(
     }
   }
 }`;
+const V2_DELETED_COMMENTS_PAGE_SIZE = 100;
+const V2_OBSERVED_HISTORY_POISON = Symbol("v2-observed-history-poison");
+const V2_OBSERVED_HISTORY_COUNT_FLOOR = Symbol("v2-observed-history-count-floor");
+const V2_OBSERVED_HISTORY_RAW_IDENTITIES = Symbol(
+  "v2-observed-history-raw-identities",
+);
+const V2_OBSERVED_HISTORY_PARTIAL_FACTS = Symbol(
+  "v2-observed-history-partial-facts",
+);
+const V2_OBSERVED_BASE_EPOCH_COUNT_FLOOR = Symbol(
+  "v2-observed-base-epoch-count-floor",
+);
+const V2_OBSERVED_BASE_EPOCH_LATEST = Symbol(
+  "v2-observed-base-epoch-latest",
+);
+const V2_OBSERVED_CARRIER_FINGERPRINTS = Symbol(
+  "v2-observed-carrier-fingerprints",
+);
+const V2_DELETED_COMMENTS_QUERY = `query CodexReviewGateDeletedComments(
+  $owner: String!
+  $repo: String!
+  $number: Int!
+  $cursor: String
+  $commentCursor: String
+  $includeDeleted: Boolean!
+  $includeComments: Boolean!
+) {
+  repository(owner: $owner, name: $repo) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number
+      timelineItems(
+        first: ${V2_DELETED_COMMENTS_PAGE_SIZE}
+        after: $cursor
+        itemTypes: [COMMENT_DELETED_EVENT]
+      ) @include(if: $includeDeleted) {
+        totalCount
+        filteredCount
+        pageCount
+        nodes {
+          __typename
+          ... on CommentDeletedEvent {
+            id
+            createdAt
+            actor { __typename login }
+            deletedCommentAuthor { __typename login }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+      comments(
+        first: ${V2_DELETED_COMMENTS_PAGE_SIZE}
+        after: $commentCursor
+      ) @include(if: $includeComments) {
+        totalCount
+        nodes {
+          databaseId: fullDatabaseId
+          body
+          createdAt
+          updatedAt
+          lastEditedAt
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}`;
 
 export function normalizeV2Operation(raw) {
   const operation = String(raw ?? "").trim() || "reconcile";
@@ -244,7 +311,7 @@ export function canonicalV2RequestComments(comments) {
       !canonicalPositiveId(comment?.id) ||
       comment?.user?.login !== "github-actions[bot]" ||
       comment?.user?.type !== "Bot" ||
-      comment?.created_at !== comment?.updated_at
+      hasV2ObservedIssueCommentEdit(comment)
     ) {
       return [];
     }
@@ -256,7 +323,14 @@ export function buildV2ReactionCleanArtifacts(requests, reactionsByCommentId) {
   const artifacts = [];
   const errors = [];
   let livenessVetoed = false;
-  const seenReactionIds = new Set();
+  const canonicalReactionIdCounts = new Map();
+  for (const inventory of reactionsByCommentId?.values() ?? []) {
+    for (const reaction of inventory) {
+      const id = canonicalPositiveId(reaction?.id);
+      if (id) canonicalReactionIdCounts.set(id, (canonicalReactionIdCounts.get(id) || 0) + 1);
+    }
+  }
+  const reportedDuplicateReactionIds = new Set();
   for (const { comment, binding } of requests ?? []) {
     const commentId = String(comment.id);
     if (
@@ -276,10 +350,9 @@ export function buildV2ReactionCleanArtifacts(requests, reactionsByCommentId) {
     const eyes = [];
     for (const reaction of reactionsByCommentId?.get(commentId) ?? []) {
       if (reaction?.content !== "+1" && reaction?.content !== "eyes") continue;
-      if (
-        reaction?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN ||
-        reaction?.user?.type !== "Bot"
-      ) {
+      if (reaction?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN) continue;
+      if (reaction?.user?.type !== "Bot") {
+        errors.push(v2InvalidProviderReactionProvenanceError(reaction));
         continue;
       }
       const reactionId = canonicalPositiveId(reaction.id);
@@ -289,11 +362,15 @@ export function buildV2ReactionCleanArtifacts(requests, reactionsByCommentId) {
         );
         continue;
       }
-      if (seenReactionIds.has(reactionId)) {
-        errors.push(`Codex ${reaction.content} reaction identity ${reactionId} appears more than once`);
+      if (canonicalReactionIdCounts.get(reactionId) !== 1) {
+        if (!reportedDuplicateReactionIds.has(reactionId)) {
+          errors.push(
+            `Codex ${reaction.content} reaction identity ${reactionId} appears more than once`,
+          );
+          reportedDuplicateReactionIds.add(reactionId);
+        }
         continue;
       }
-      seenReactionIds.add(reactionId);
       if (!isCanonicalUtcTimestamp(reaction.created_at)) {
         errors.push(`Codex ${reaction.content} reaction ${reactionId} has no canonical creation time`);
         continue;
@@ -416,6 +493,7 @@ export function buildV2GateReport({
   reason,
   recoveryCode,
   retrySafe,
+  requiresReplacementPr = false,
   findingsUnresolved = 0,
   findingsResolved = 0,
   findingsHistorical = 0,
@@ -451,12 +529,16 @@ export function buildV2GateReport({
   if (typeof normalizedRetrySafe !== "boolean") {
     throw new Error("retrySafe must be boolean");
   }
+  if (typeof requiresReplacementPr !== "boolean") {
+    throw new Error("requiresReplacementPr must be boolean");
+  }
   return Object.freeze({
     executionHealth,
     gateOutcome,
     reason: normalizedReason,
     recoveryCode,
     retrySafe: normalizedRetrySafe,
+    requiresReplacementPr,
     counts: Object.freeze(counts),
   });
 }
@@ -485,6 +567,7 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
           report.recoveryCode,
           context.prNumber,
           report.retrySafe,
+          report.requiresReplacementPr,
         ),
     "Inspect the workflow run and retry safely.",
   );
@@ -528,6 +611,7 @@ export function buildV2StickyCommentBody(report, context = {}) {
           report.recoveryCode,
           prNumber,
           report.retrySafe,
+          report.requiresReplacementPr,
         ),
     "Inspect the workflow run and retry safely.",
   );
@@ -540,6 +624,7 @@ export function buildV2StickyCommentBody(report, context = {}) {
     reason,
     recoveryCode: report.recoveryCode,
     retrySafe: report.retrySafe,
+    requiresReplacementPr: report.requiresReplacementPr,
     nextAction,
     findingsUnresolved: report.counts.unresolved,
     findingsResolved: report.counts.resolved,
@@ -566,6 +651,84 @@ export function isV2StickyCommentBody(body) {
     body.replace(/\r\n?/gu, "\n").split("\n").includes(`<!-- ${V2_STICKY_MARKER} -->`);
 }
 
+function parseCanonicalV2StickyCommentBody(body) {
+  if (typeof body !== "string") return null;
+  const normalized = body.replace(/\r\n?/gu, "\n");
+  const lines = normalized.split("\n");
+  if (lines.length !== 11 || lines[9] !== `<!-- ${V2_STICKY_MARKER} -->`) {
+    return null;
+  }
+  const hiddenMatch = /^<!-- (\{.*\}) -->$/u.exec(lines[10]);
+  if (!hiddenMatch) return null;
+  let hidden;
+  try {
+    hidden = JSON.parse(hiddenMatch[1]);
+  } catch {
+    return null;
+  }
+  const expectedKeys = [
+    "executionHealth",
+    "findingsHistorical",
+    "findingsIndeterminate",
+    "findingsResolved",
+    "findingsUnresolved",
+    "gateOutcome",
+    "headSha",
+    "nextAction",
+    "prNumber",
+    "reason",
+    "recoveryCode",
+    "requiresReplacementPr",
+    "retrySafe",
+    "version",
+  ];
+  if (
+    !isPlainRecord(hidden) ||
+    canonicalJson(hidden) !== hiddenMatch[1] ||
+    canonicalJson(Object.keys(hidden).sort()) !== canonicalJson(expectedKeys) ||
+    hidden.version !== 2 ||
+    !Number.isSafeInteger(hidden.prNumber) ||
+    hidden.prNumber <= 0 ||
+    typeof hidden.headSha !== "string" ||
+    !FULL_SHA.test(hidden.headSha) ||
+    !new Set(["healthy", "unhealthy"]).has(hidden.executionHealth) ||
+    !new Set(["success", "failure", "pending", "not_applicable", "unknown"])
+      .has(hidden.gateOutcome) ||
+    !V2_RECOVERY_CODES.has(hidden.recoveryCode) ||
+    typeof hidden.reason !== "string" ||
+    typeof hidden.nextAction !== "string" ||
+    typeof hidden.retrySafe !== "boolean" ||
+    typeof hidden.requiresReplacementPr !== "boolean"
+  ) {
+    return null;
+  }
+  const counts = {
+    unresolved: hidden.findingsUnresolved,
+    resolved: hidden.findingsResolved,
+    historical: hidden.findingsHistorical,
+    indeterminate: hidden.findingsIndeterminate,
+  };
+  if (Object.values(counts).some((value) =>
+    value !== "unknown" && (!Number.isSafeInteger(value) || value < 0)
+  )) {
+    return null;
+  }
+  const expected = [
+    "## Codex GitHub Review Gate",
+    "",
+    `**${hidden.gateOutcome}** — ${hidden.reason}`,
+    "",
+    `Findings: ${formatV2FindingCounts(counts)}.`,
+    "",
+    `Recovery: \`${hidden.recoveryCode}\``,
+    `Next action: ${hidden.nextAction}`,
+    "",
+    `<!-- ${V2_STICKY_MARKER} -->`,
+    `<!-- ${hiddenMatch[1]} -->`,
+  ].join("\n");
+  return body === expected ? hidden : null;
+}
+
 function reportOutputValues(report) {
   return {
     execution_health: report.executionHealth,
@@ -579,18 +742,50 @@ function recoveryInstruction(
   code,
   prNumber,
   retrySafe = false,
+  requiresReplacementPr = false,
 ) {
   const target = Number.isSafeInteger(Number(prNumber)) ? ` for PR #${prNumber}` : "";
+  if (code === "fix_findings") {
+    if (requiresReplacementPr) {
+      return (
+        `Fix the unresolved Codex findings${target}, then do not request another generation on ` +
+        `the original PR because the reported evidence warning proves an unclosable historical ` +
+        `lineage. Open a replacement PR with the fixes, run exactly one canonical review ` +
+        `generation there, and then reconcile.`
+      );
+    }
+    return `Fix the unresolved Codex findings, request a new review generation, then reconcile${target}.`;
+  }
+  if (code === "repair_permissions") {
+    if (requiresReplacementPr) {
+      return (
+        `Repair the canonical workflow permissions or installation${target}, then do not add ` +
+        `another review boundary on the original PR because its preserved structured lineage ` +
+        `requires a replacement PR. Open the replacement PR, run exactly one canonical review ` +
+        `generation there, and then reconcile.`
+      );
+    }
+    return `Repair the canonical workflow permissions or installation, then retry${target}.`;
+  }
+  if (requiresReplacementPr) {
+    return (
+      `Do not add another review boundary on the original PR${target}: its observed historical ` +
+      `lineage cannot be closed safely. Open a replacement PR, run exactly one canonical review ` +
+      `generation there, obtain its request-bound clean, and then reconcile.`
+    );
+  }
   if (code === "none") return "No recovery action is required.";
   if (code === "wait_provider") {
     return `Wait for Codex to publish a terminal result, then dispatch reconcile${target}.`;
   }
   if (code === "reconcile") return `Dispatch reconcile${target} against the exact current head.`;
-  if (code === "fix_findings") {
-    return `Fix the unresolved Codex findings, request a new review generation, then reconcile${target}.`;
-  }
   if (code === "request_clean_generation") {
-    return `Create a strictly newer authorized @codex review generation and wait for head-bound clean evidence, then reconcile${target}.`;
+    return (
+      `Follow the reported request lineage${target}. If the latest current canonical request only ` +
+      `lacks request-bound clean, obtain its qualifying direct +1 and then reconcile. Otherwise, ` +
+      `because the structured lineage is safe to extend, create exactly one canonical generation, ` +
+      `wait for its request-bound clean, and then reconcile.`
+    );
   }
   if (code === "retry_reconcile") return `Retry the identical reconcile invocation${target}.`;
   if (code === "wait_then_reconcile") {
@@ -604,9 +799,6 @@ function recoveryInstruction(
   }
   if (code === "refresh_head") {
     return `Read the PR's current head and dispatch a new exact-head operation${target}.`;
-  }
-  if (code === "repair_permissions") {
-    return `Repair the canonical workflow permissions or installation, then retry${target}.`;
   }
   if (code === "retry_begin") {
     if (retrySafe) {
@@ -744,6 +936,7 @@ class V2RuntimeFailure extends Error {
     responseReceived = false,
     responsePhase = "none",
     retrySafe = undefined,
+    requiresReplacementPr = false,
   } = {}) {
     super(message);
     this.name = "V2RuntimeFailure";
@@ -755,6 +948,7 @@ class V2RuntimeFailure extends Error {
     this.responseReceived = responseReceived;
     this.responsePhase = responsePhase;
     this.retrySafe = retrySafe;
+    this.requiresReplacementPr = requiresReplacementPr === true;
   }
 }
 
@@ -819,6 +1013,13 @@ class V2StaleFailure extends V2RuntimeFailure {
       recoveryCode: "refresh_head",
     });
     this.name = "V2StaleFailure";
+  }
+}
+
+class V2HeadChangedFailure extends V2StaleFailure {
+  constructor(message) {
+    super(message);
+    this.name = "V2HeadChangedFailure";
   }
 }
 
@@ -1065,6 +1266,8 @@ class V2GitHubClient {
     identity = (item) => canonicalPositiveId(item?.id),
     validate = null,
     expectedCount = null,
+    observe = null,
+    poison = null,
   }) {
     const items = [];
     const seen = new Set();
@@ -1089,11 +1292,12 @@ class V2GitHubClient {
         if (!id) {
           throw new V2RuntimeFailure(`${label} contains an item without a canonical identity`);
         }
+        observe?.(item, id);
         if (seen.has(id)) {
-          throw new V2RuntimeFailure(
-            `${label} contains duplicate identity ${id} across paginated evidence`,
-            { recoveryCode: "wait_then_reconcile" },
-          );
+          const message =
+            `${label} contains duplicate identity ${id} across paginated evidence`;
+          if (typeof poison === "function") throw poison(message);
+          throw new V2RuntimeFailure(message, { recoveryCode: "wait_then_reconcile" });
         }
         seen.add(id);
       }
@@ -1171,6 +1375,7 @@ export async function runV2GateCli({
           ? "retry_begin"
           : error?.recoveryCode ?? (config ? "wait_then_reconcile" : "unsupported_target"),
       retrySafe: error?.retrySafe,
+      requiresReplacementPr: error?.requiresReplacementPr === true,
       findingsUnresolved: counts.unresolved,
       findingsResolved: counts.resolved,
       findingsHistorical: counts.historical,
@@ -1199,6 +1404,7 @@ export async function runV2GateCli({
         gateOutcome: preserveFindingFailure ? "failure" : "unknown",
         reason: `Failed to persist the v2 gate report: ${reportError.message}`,
         recoveryCode: preserveFindingFailure ? error.recoveryCode : "repair_permissions",
+        requiresReplacementPr: error?.requiresReplacementPr === true,
         findingsUnresolved: counts.unresolved,
         findingsResolved: counts.resolved,
         findingsHistorical: counts.historical,
@@ -1313,7 +1519,18 @@ async function runV2ControllerAction(client, config, context, {
     }
   }
   if (config.operation === "begin-review") {
-    await ensureV2ControllerReviewRequest(client, config, context, initialPr, { now });
+    const reviewRequest = await ensureV2ControllerReviewRequest(
+      client,
+      config,
+      context,
+      initialPr,
+      { now },
+    );
+    if (config.requestReview && !canonicalPositiveId(reviewRequest.commentId)) {
+      throw new V2RuntimeFailure(
+        "The adopted or created review request has no canonical comment identity",
+      );
+    }
   }
   const refresh = await rerunCurrentV2Verifier(client, config, context, initialPr, {
     sleep,
@@ -2119,18 +2336,22 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     deadlineMs: now() + config.limits.reconcileBudgetMs,
     now,
   });
+  const observedDeletedCommentEvents = new Map();
+  const observedIssueCommentEdits = new Map();
   if (!config.requestReview) {
     await assertV2BeginReviewScope(client, config, initialPr, budget);
     return { kind: "disabled", commentId: null };
   }
 
-  const comments = await client.paginate(
-    `${config.repoPath}/issues/${config.prNumber}/comments`,
+  const comments = await loadV2IssueCommentsWithEditHistory(
+    client,
+    config,
+    budget,
     {
-      budget,
       label: "pull-request issue comments",
-      validate: requireV2IssueCommentShape,
       expectedCount: initialPr.comments,
+      observedDeletedCommentEvents,
+      observedIssueCommentEdits,
     },
   );
   context.issueComments = comments;
@@ -2154,7 +2375,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     await assertV2BeginReviewScope(client, config, initialPr, budget);
     return {
       kind: matching.length === 1 ? "adopted" : "duplicates",
-      commentId: matching[0].id,
+      commentId: canonicalPositiveId(matching[0].comment.id),
       duplicateCount: matching.length,
     };
   }
@@ -2179,6 +2400,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
   });
   let mayHaveCommitted = false;
   let postReturnedSuccessfully = false;
+  let createdId = null;
   try {
     try {
       mayHaveCommitted = true;
@@ -2189,7 +2411,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         { budget },
       );
       postReturnedSuccessfully = true;
-      const createdId = canonicalPositiveId(created?.id);
+      createdId = canonicalPositiveId(created?.id);
       if (!createdId) {
         throw new V2RuntimeFailure(
           "Review-request POST response omitted a canonical comment id",
@@ -2200,6 +2422,29 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         `${config.repoPath}/issues/comments/${createdId}`,
         undefined,
         { budget, safeRead: true },
+      );
+      requireV2IssueCommentShape(refetched, "created review request");
+      rememberV2ObservedCarrierFingerprint(
+        observedIssueCommentEdits,
+        "rest",
+        createdId,
+        canonicalJson(fingerprintIssueComment(refetched)),
+      );
+      const { deletedCommentEvents, issueCommentEdits } = await loadV2CommentHistory(
+        client,
+        config,
+        budget,
+        observedDeletedCommentEvents,
+        observedIssueCommentEdits,
+      );
+      retainV2ObservedDeletedCommentEvents(
+        deletedCommentEvents,
+        observedDeletedCommentEvents,
+      );
+      attachV2IssueCommentEditMetadata(
+        [refetched],
+        issueCommentEdits.filter((edit) => edit.id === createdId),
+        observedIssueCommentEdits,
       );
       requireExactV2CreatedReviewRequest(
         refetched,
@@ -2224,16 +2469,18 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
       let visible = [];
       let visibilityError = null;
       try {
-        const reread = await client.paginate(
-          `${config.repoPath}/issues/${config.prNumber}/comments`,
+        const reread = await loadV2IssueCommentsWithEditHistory(
+          client,
+          config,
+          budget,
           {
-            budget,
             label: "post-unknown review-request comments",
-            validate: requireV2IssueCommentShape,
+            observedDeletedCommentEvents,
+            observedIssueCommentEdits,
           },
         );
         context.issueComments = reread;
-        visible = canonicalV2RequestComments(reread).filter(({ binding }) =>
+        const sameRun = canonicalV2RequestComments(reread).filter(({ binding }) =>
           binding.repositoryId === context.repositoryId &&
           binding.prNumber === String(config.prNumber) &&
           binding.headSha === context.expectedHeadSha &&
@@ -2242,6 +2489,11 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
           binding.baseRepositoryId === String(initialPr.base.repo.id) &&
           binding.runId === config.runId
         );
+        visible = postReturnedSuccessfully
+          ? sameRun.filter(({ comment }) =>
+              canonicalPositiveId(comment.id) === createdId
+            )
+          : sameRun;
         if (visible.length > 0) {
           await exactRefetchV2RelevantObjects(
             client,
@@ -2250,7 +2502,16 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
             reread,
             [],
             visible,
+            observedIssueCommentEdits,
           );
+          if (postReturnedSuccessfully && visible.length === 1) {
+            requireExactV2CreatedReviewRequest(
+              visible[0].comment,
+              createdId,
+              requestBody,
+              config.runId,
+            );
+          }
         }
       } catch (error) {
         visibilityError = error;
@@ -2260,7 +2521,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         mayHaveCommitted = false;
         return {
           kind: visible.length === 1 ? "adopted-after-unknown" : "duplicates-after-unknown",
-          commentId: visible[0].id,
+          commentId: canonicalPositiveId(visible[0].comment.id),
           duplicateCount: visible.length,
         };
       }
@@ -2283,6 +2544,55 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
   }
 }
 
+async function loadV2IssueCommentsWithEditHistory(
+  client,
+  config,
+  budget,
+  {
+    label,
+    expectedCount = null,
+    observedDeletedCommentEvents = null,
+    observedIssueCommentEdits = null,
+  },
+) {
+  const comments = await client.paginate(
+    `${config.repoPath}/issues/${config.prNumber}/comments`,
+    {
+      budget,
+      label,
+      validate: requireV2IssueCommentShape,
+      ...(isNonNegativeSafeInteger(expectedCount) ? { expectedCount } : {}),
+      observe: (comment, id) => rememberV2ObservedCarrierFingerprint(
+        observedIssueCommentEdits,
+        "rest",
+        id,
+        canonicalJson(fingerprintIssueComment(comment)),
+      ),
+      poison: (message) => poisonV2ObservedHistory(
+        observedIssueCommentEdits,
+        message,
+      ),
+    },
+  );
+  const { deletedCommentEvents, issueCommentEdits } = await loadV2CommentHistory(
+    client,
+    config,
+    budget,
+    observedDeletedCommentEvents,
+    observedIssueCommentEdits,
+  );
+  retainV2ObservedDeletedCommentEvents(
+    deletedCommentEvents,
+    observedDeletedCommentEvents,
+  );
+  attachV2IssueCommentEditMetadata(
+    comments,
+    issueCommentEdits,
+    observedIssueCommentEdits,
+  );
+  return comments;
+}
+
 function requireExactV2CreatedReviewRequest(refetched, createdId, requestBody, runId) {
   requireV2IssueCommentShape(refetched, "created review request");
   if (
@@ -2290,7 +2600,7 @@ function requireExactV2CreatedReviewRequest(refetched, createdId, requestBody, r
     refetched?.body !== requestBody ||
     refetched?.user?.login !== GITHUB_ACTIONS_BOT_LOGIN ||
     refetched?.user?.type !== "Bot" ||
-    refetched?.created_at !== refetched?.updated_at ||
+    hasV2ObservedIssueCommentEdit(refetched) ||
     parseCanonicalV2ReviewRequestBody(refetched.body)?.runId !== runId
   ) {
     throw new V2RuntimeFailure("Created review request failed exact refetch binding");
@@ -2298,9 +2608,7 @@ function requireExactV2CreatedReviewRequest(refetched, createdId, requestBody, r
 }
 
 function isSaferV2BeginReviewFailure(error) {
-  return error instanceof V2StaleFailure ||
-    error?.recoveryCode === "refresh_head" ||
-    error?.recoveryCode === "unsupported_target";
+  return error instanceof V2HeadChangedFailure;
 }
 
 async function assertV2BeginReviewScope(client, config, initialPr, budget) {
@@ -2336,14 +2644,23 @@ async function runV2Reconcile(client, config, context, {
   let previousClean = null;
   let latestComplete = null;
   let instabilityDetail = "";
+  const observedDeletedCommentEvents = new Map();
+  const observedIssueCommentEdits = new Map();
+  const observedBaseEpoch = new Map();
   for (let attempt = 0; attempt <= comparisons; attempt += 1) {
     if (now() >= deadlineMs) {
-      instabilityDetail = "The monotonic snapshot stability deadline expired";
+      instabilityDetail ||= "The monotonic snapshot stability deadline expired";
       break;
     }
     let current;
     try {
-      current = await loadCompleteV2Snapshot(client, config, { deadlineMs, now });
+      current = await loadCompleteV2Snapshot(client, config, {
+        deadlineMs,
+        now,
+        observedDeletedCommentEvents,
+        observedIssueCommentEdits,
+        observedBaseEpoch,
+      });
     } catch (error) {
       if (error?.recoveryCode !== "wait_then_reconcile") throw error;
       instabilityDetail = error.message;
@@ -2353,7 +2670,7 @@ async function runV2Reconcile(client, config, context, {
     }
 
     if (now() >= deadlineMs) {
-      instabilityDetail = "The monotonic snapshot stability deadline expired";
+      instabilityDetail ||= "The monotonic snapshot stability deadline expired";
       break;
     }
 
@@ -2403,6 +2720,7 @@ async function publishV2SnapshotDecision(client, config, context, snapshot) {
     gateOutcome: decision.gateOutcome,
     reason: decision.reason,
     recoveryCode: decision.recoveryCode,
+    requiresReplacementPr: decision.requiresReplacementPr === true,
     findingsUnresolved: snapshot.counts.unresolved,
     findingsResolved: snapshot.counts.resolved,
     findingsHistorical: snapshot.counts.historical,
@@ -2423,6 +2741,7 @@ async function publishV2UnstablePending(client, config, context, snapshot, detai
     gateOutcome: "pending",
     reason: `GitHub review evidence did not stabilize across two complete snapshots${detailSuffix}`,
     recoveryCode: "wait_then_reconcile",
+    requiresReplacementPr: snapshot?.decision?.requiresReplacementPr === true,
     findingsUnresolved: snapshot?.counts?.unresolved ?? "unknown",
     findingsResolved: snapshot?.counts?.resolved ?? "unknown",
     findingsHistorical: snapshot?.counts?.historical ?? "unknown",
@@ -2491,9 +2810,12 @@ function v2ReportPersistenceFailure(failures, report) {
           gateOutcome: "failure",
           recoveryCode: report.recoveryCode,
           retrySafe: false,
+          requiresReplacementPr: report.requiresReplacementPr === true,
           counts: report.counts,
         }
-      : {},
+      : {
+          requiresReplacementPr: report.requiresReplacementPr === true,
+        },
   );
 }
 
@@ -2759,14 +3081,33 @@ function providerEventIsStale(event, currentHead, { owner, repo } = {}) {
 async function loadCompleteV2Snapshot(client, config, {
   deadlineMs = null,
   now = monotonicMilliseconds,
+  observedDeletedCommentEvents = null,
+  observedIssueCommentEdits = null,
+  observedBaseEpoch = null,
 } = {}) {
   const budget = new V2SnapshotBudget(config, { deadlineMs, now });
   const beforeRepository = await loadV2Repository(client, config, budget);
   const before = await loadV2PullRequest(client, config, budget);
   assertV2ExpectedSnapshotScope(before, config);
   assertV2FixedSnapshotScope(beforeRepository, before, config);
-  const opening = await loadV2DecisionCarriers(client, config, budget, before);
-  const closing = await loadV2DecisionCarriers(client, config, budget, before);
+  const opening = await loadV2DecisionCarriers(
+    client,
+    config,
+    budget,
+    before,
+    observedDeletedCommentEvents,
+    observedIssueCommentEdits,
+    observedBaseEpoch,
+  );
+  const closing = await loadV2DecisionCarriers(
+    client,
+    config,
+    budget,
+    before,
+    observedDeletedCommentEvents,
+    observedIssueCommentEdits,
+    observedBaseEpoch,
+  );
   const afterRepository = await loadV2Repository(client, config, budget);
   const after = await loadV2PullRequest(client, config, budget);
   assertV2ExpectedSnapshotScope(after, config);
@@ -2803,24 +3144,158 @@ async function loadCompleteV2Snapshot(client, config, {
   };
 }
 
-async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
+async function loadV2DecisionCarriers(
+  client,
+  config,
+  budget,
+  pullRequest,
+  observedDeletedCommentEvents = null,
+  observedIssueCommentEdits = null,
+  observedBaseEpoch = null,
+) {
   const headSha = config.expectedHeadSha;
   const baseSha = pullRequest.base.sha.toLowerCase();
-  const [issueComments, reviews, baseEpoch] = await Promise.all([
+  const seenReviewIds = new Set();
+  const providerReviewIds = new Set();
+  const carrierReads = await Promise.allSettled([
     client.paginate(`${config.repoPath}/issues/${config.prNumber}/comments`, {
       budget,
       label: "pull-request issue comments",
       validate: requireV2IssueCommentShape,
-      expectedCount: pullRequest.comments,
+      observe: (comment, id) => rememberV2ObservedCarrierFingerprint(
+        observedIssueCommentEdits,
+        "rest",
+        id,
+        canonicalJson(fingerprintIssueComment(comment)),
+      ),
+      poison: (message) => poisonV2ObservedHistory(
+        observedIssueCommentEdits,
+        message,
+      ),
     }),
     client.paginate(`${config.repoPath}/pulls/${config.prNumber}/reviews`, {
       budget,
       label: "pull-request reviews",
       validate: requireV2ReviewShape,
+      observe: (review, id) => {
+        const providerRelevant = hasAnyV2ProviderIdentitySignal(review);
+        rememberV2ObservedCarrierFingerprint(
+          observedIssueCommentEdits,
+          "review-identity",
+          id,
+          canonicalJson(fingerprintReviewIdentity(review)),
+        );
+        if (
+          seenReviewIds.has(id) &&
+          (providerRelevant || providerReviewIds.has(id))
+        ) {
+          throw poisonV2ObservedHistory(
+            observedIssueCommentEdits,
+            `pull-request reviews repeated provider-relevant identity ${id}`,
+          );
+        }
+        seenReviewIds.add(id);
+        if (!providerRelevant) return;
+        providerReviewIds.add(id);
+        rememberV2ObservedCarrierFingerprint(
+          observedIssueCommentEdits,
+          "review-rest",
+          id,
+          canonicalJson(fingerprintReview(review)),
+        );
+      },
     }),
-    loadLatestV2BaseEpoch(client, config, budget),
+    loadLatestV2BaseEpoch(client, config, budget, observedBaseEpoch),
+    loadV2CommentHistory(
+      client,
+      config,
+      budget,
+      observedDeletedCommentEvents,
+      observedIssueCommentEdits,
+    ),
   ]);
-  requireMatchingV2InventoryCount(pullRequest.comments, issueComments, "issue comments");
+  const [issueCommentRead, reviewRead, baseEpochRead, commentHistoryRead] =
+    carrierReads;
+  let latchError = null;
+  if (issueCommentRead.status === "fulfilled") {
+    try {
+      retainV2ObservedCarrierFingerprints(
+        observedIssueCommentEdits,
+        "rest",
+        issueCommentRead.value.map((comment) => [
+          canonicalPositiveId(comment.id),
+          canonicalJson(fingerprintIssueComment(comment)),
+        ]),
+      );
+    } catch (error) {
+      latchError ??= error;
+    }
+  }
+  if (reviewRead.status === "fulfilled") {
+    try {
+      retainV2ObservedCarrierFingerprints(
+        observedIssueCommentEdits,
+        "review-rest",
+        reviewRead.value
+          .filter(hasAnyV2ProviderIdentitySignal)
+          .map((review) => [
+            canonicalPositiveId(review.id),
+            canonicalJson(fingerprintReview(review)),
+          ]),
+      );
+    } catch (error) {
+      latchError ??= error;
+    }
+  }
+  if (commentHistoryRead.status === "fulfilled") {
+    const { deletedCommentEvents, issueCommentEdits } = commentHistoryRead.value;
+    try {
+      retainV2ObservedDeletedCommentEvents(
+        deletedCommentEvents,
+        observedDeletedCommentEvents,
+      );
+    } catch (error) {
+      latchError ??= error;
+    }
+    try {
+      retainV2ObservedIssueCommentEdits(
+        issueCommentEdits,
+        observedIssueCommentEdits,
+      );
+    } catch (error) {
+      latchError ??= error;
+    }
+  }
+  if (
+    issueCommentRead.status === "fulfilled" &&
+    commentHistoryRead.status === "fulfilled"
+  ) {
+    try {
+      attachV2IssueCommentEditMetadata(
+        issueCommentRead.value,
+        commentHistoryRead.value.issueCommentEdits,
+        observedIssueCommentEdits,
+      );
+    } catch (error) {
+      latchError ??= error;
+    }
+    try {
+      requireMatchingV2InventoryCount(
+        pullRequest.comments,
+        issueCommentRead.value,
+        "issue comments",
+      );
+    } catch (error) {
+      latchError ??= error;
+    }
+  }
+  if (latchError) throw latchError;
+  const failedRead = carrierReads.find((read) => read.status === "rejected");
+  if (failedRead) throw failedRead.reason;
+  const issueComments = issueCommentRead.value;
+  const reviews = reviewRead.value;
+  const baseEpoch = baseEpochRead.value;
+  const { deletedCommentEvents, issueCommentEdits } = commentHistoryRead.value;
   const requestAuthority = await collectAuthorizedV2Requests(
     client,
     config,
@@ -2834,28 +3309,76 @@ async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
     issueComments,
     reviews,
     requestAuthority.authorized,
+    observedIssueCommentEdits,
   );
-  const { generationRequests: reactionRequests } = selectCurrentV2RequestGenerations({
+  const reactionRequests = selectV2ReactionInventoryRequests({
     headSha,
     baseSha,
     baseRef: pullRequest.base.ref,
     baseRepositoryId: String(pullRequest.base.repo.id),
     baseEpoch,
-    requests: requestAuthority.authorized,
+    requests: requestAuthority.boundaries,
+    authorizedRequests: requestAuthority.authorized,
   });
   const requestReactions = new Map();
+  const seenReactionIdentities = new Map();
   const reactionInventories = await mapV2Bounded(
     reactionRequests,
     V2_REACTION_FETCH_CONCURRENCY,
     async ({ comment }) => {
       const id = String(comment.id);
+      const source = `reaction-rest:${id}`;
       const reactions = await client.paginate(
         `${config.repoPath}/issues/comments/${id}/reactions`,
         {
           budget,
           label: `reactions for review request ${id}`,
           validate: requireV2ReactionShape,
+          observe: (reaction, reactionId) => {
+            const officialIdentity =
+              reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN;
+            const previousWasOfficial = seenReactionIdentities.get(reactionId);
+            if (
+              previousWasOfficial !== undefined &&
+              (officialIdentity || previousWasOfficial)
+            ) {
+              throw poisonV2ObservedHistory(
+                observedIssueCommentEdits,
+                `review-request reactions repeated official Codex identity ${reactionId}`,
+              );
+            }
+            seenReactionIdentities.set(
+              reactionId,
+              Boolean(previousWasOfficial) || officialIdentity,
+            );
+            rememberV2ObservedCarrierFingerprint(
+              observedIssueCommentEdits,
+              "reaction-identity",
+              reactionId,
+              canonicalJson({
+                requestId: id,
+                reaction: fingerprintReaction(reaction),
+              }),
+            );
+            if (!hasV2ProviderReactionIdentitySignal(reaction)) return;
+            rememberV2ObservedCarrierFingerprint(
+              observedIssueCommentEdits,
+              source,
+              reactionId,
+              canonicalJson(fingerprintReaction(reaction)),
+            );
+          },
         },
+      );
+      retainV2ObservedCarrierFingerprints(
+        observedIssueCommentEdits,
+        source,
+        reactions
+          .filter(hasV2ProviderReactionIdentitySignal)
+          .map((reaction) => [
+            canonicalPositiveId(reaction.id),
+            canonicalJson(fingerprintReaction(reaction)),
+          ]),
       );
       return [id, reactions];
     },
@@ -2884,6 +3407,7 @@ async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
     requestReactions,
     artifacts: providerEvidence.artifacts,
     providerErrors: providerEvidence.errors,
+    deletedCommentEvents,
   });
   const carrierPayload = {
     headSha,
@@ -2899,11 +3423,7 @@ async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
       .map(([requestId, reactions]) => ({
         requestId,
         reactions: reactions
-          .filter((reaction) =>
-            reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN &&
-            reaction?.user?.type === "Bot" &&
-            (reaction?.content === "+1" || reaction?.content === "eyes"),
-          )
+          .filter(hasV2ProviderReactionIdentitySignal)
           .sort(compareV2CanonicalIdsAscending)
           .map(fingerprintReaction),
       })),
@@ -2916,7 +3436,7 @@ async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
       headBound: request.headBound,
       binding: request.binding,
       permission: request.permission,
-      revisionAt: request.comment.updated_at,
+      revisionAt: v2IssueCommentRevisionAt(request.comment),
     })),
     requestBoundaries: requestAuthority.boundaries.map((request) => ({
       id: request.id,
@@ -2924,10 +3444,13 @@ async function loadV2DecisionCarriers(client, config, budget, pullRequest) {
       binding: request.binding,
       authorized: request.authorized,
       permission: request.permission,
-      revisionAt: request.comment.updated_at,
+      physicalOnlyReason: request.physicalOnlyReason ?? null,
+      revisionAt: v2IssueCommentRevisionAt(request.comment),
     })),
     requestErrors: requestAuthority.errors,
     baseEpoch,
+    deletedCommentEvents,
+    issueCommentEdits,
     commitResolutions: providerEvidence.commitResolutions,
     providerErrors: providerEvidence.errors,
     exactRefetch: true,
@@ -2953,8 +3476,19 @@ function reduceV2Evidence({
   requestReactions,
   artifacts,
   providerErrors,
+  deletedCommentEvents,
 }) {
-  const scopedErrors = [...(requestErrors ?? []), ...(providerErrors ?? [])]
+  const deletedBoundaries = (deletedCommentEvents ?? []).map(v2DeletedCommentBoundary);
+  const scopedErrors = [
+    ...(requestErrors ?? []),
+    ...(providerErrors ?? []),
+    ...(deletedCommentEvents ?? []).map((event) => ({
+      message:
+        `Deleted comment event ${event.id} has no recoverable body history and may hide a ` +
+        `provider-triggering review request`,
+      createdAt: event.createdAt,
+    })),
+  ]
     .map(normalizeV2EvidenceError);
   const blockingErrors = [];
   let indeterminate = scopedErrors.length;
@@ -2970,13 +3504,10 @@ function reduceV2Evidence({
     baseEpochMs,
     generationRequests,
   } = authorizedScope;
-  const boundaryScope = selectCurrentV2RequestGenerations({
+  const boundaryScope = selectV2PhysicalRequestBoundaries({
     headSha,
-    baseSha,
-    baseRef,
-    baseRepositoryId,
     baseEpoch,
-    requests: requestBoundaries,
+    requests: [...(requestBoundaries ?? []), ...deletedBoundaries],
   });
   const requestEpoch = selectLatestV2RequestEpoch(generationRequests);
   if (requestEpoch.error) {
@@ -2994,14 +3525,71 @@ function reduceV2Evidence({
     requestReactions,
   );
   const allArtifacts = [...(artifacts ?? []), ...reactionEvidence.artifacts];
-  blockingErrors.push(...reactionEvidence.errors);
-  indeterminate += reactionEvidence.errors.length;
+  const reactionErrors = [...new Set([
+    ...reactionEvidence.errors,
+    ...findV2GlobalReactionInventoryErrors(requestReactions),
+  ])];
+  blockingErrors.push(...reactionErrors);
+  indeterminate += reactionErrors.length;
 
   const currentArtifacts = [];
   const currentHeadTerminalArtifacts = [];
   const historicalArtifacts = [];
   const progressArtifacts = [];
+  const unboundProviderActivities = (deletedCommentEvents ?? []).map((event) => ({
+    source: "comment-deleted-event",
+    id: event.id,
+    carrierCreatedAt: event.createdAt,
+    revisionAt: event.createdAt,
+    activityKind: "deleted-comment-unknown-history",
+  })).concat(
+    (providerErrors ?? [])
+      .map((error) => error?.activity)
+      .filter((activity) => isPlainRecord(activity)),
+  );
   for (const artifact of allArtifacts) {
+    const artifactHead = String(
+      artifact.resolvedHeadSha || artifact.headSha || "",
+    ).toLowerCase();
+    if (
+      artifact.source !== "request-reaction" &&
+      (
+        artifact.kind === "malformed" ||
+        Boolean(artifact.orderingError) ||
+        Boolean(artifact.resolutionError) ||
+        (
+          (artifact.kind === "clean" || artifact.kind === "finding") &&
+          !FULL_SHA.test(artifactHead)
+        ) ||
+        (
+          artifact.source === "issue-comment" &&
+          artifact.edited === true &&
+          (artifact.kind === "clean" || artifact.kind === "finding")
+        )
+      )
+    ) {
+      unboundProviderActivities.push({
+        source: artifact.source,
+        id: artifact.id,
+        carrierCreatedAt: artifact.carrierCreatedAt || artifact.createdAt,
+        revisionAt: artifact.revisionAt || artifact.createdAt,
+        activityKind: "unbound-provider-carrier",
+      });
+    }
+    if (
+      artifact.source === "issue-comment" &&
+      artifact.edited === true &&
+      (artifact.kind === "clean" || artifact.kind === "finding")
+    ) {
+      scopedErrors.push(normalizeV2EvidenceError({
+        message:
+          `Edited Codex ${artifact.kind} issue-comment ${artifact.id} has unobservable prior ` +
+          `body history and cannot provide positive terminal authority`,
+        createdAt: artifact.createdAt,
+      }));
+      indeterminate += 1;
+      continue;
+    }
     if (artifact.kind === "malformed") {
       scopedErrors.push(normalizeV2EvidenceError({
         message: artifact.reason ||
@@ -3033,7 +3621,6 @@ function reduceV2Evidence({
       indeterminate += 1;
       continue;
     }
-    const artifactHead = String(artifact.resolvedHeadSha || artifact.headSha || "").toLowerCase();
     if (!FULL_SHA.test(artifactHead)) {
       scopedErrors.push(normalizeV2EvidenceError({
         message: artifact.resolutionError ||
@@ -3065,10 +3652,21 @@ function reduceV2Evidence({
 
   currentArtifacts.sort(compareTerminalArtifactsNewestFirst);
   currentHeadTerminalArtifacts.sort(compareTerminalArtifactsNewestFirst);
+  const scopedProgressArtifacts = scopeV2ProgressArtifactsToCurrentHead({
+    headSha,
+    progressArtifacts,
+  });
+  const providerActivityArtifacts = [
+    ...scopedProgressArtifacts,
+    ...unboundProviderActivities,
+  ];
   const generationLineage = buildV2GenerationLineage({
     currentRequests: boundaryScope.currentRequests,
     currentArtifacts: currentHeadTerminalArtifacts,
     requestReactions,
+    providerActivityArtifacts,
+    livenessFloorMs: baseEpochMs,
+    allowProviderTerminalFirstGapClosure: baseEpochMs === null,
   });
   const sameTimeConflicts = findCrossChannelTimestampConflicts(currentArtifacts);
   for (const conflict of sameTimeConflicts) {
@@ -3094,33 +3692,47 @@ function reduceV2Evidence({
     artifact.source === "request-reaction" &&
     artifact.requestId === requestEpoch.selected?.id
   );
-  let selectedClean = directSelectedGenerationClean || positiveCleans[0] || null;
+  const cleanCandidates = directSelectedGenerationClean
+    ? [
+        directSelectedGenerationClean,
+        ...positiveCleans.filter((artifact) => artifact !== directSelectedGenerationClean),
+      ]
+    : positiveCleans;
+  let selectedClean = null;
   let cleanBlockedByLiveness = false;
-  if (selectedClean) {
+  let firstCleanLineageError = null;
+  for (const candidate of cleanCandidates) {
     const lineageError = requestEpoch.selected
       ? v2CleanLineageError({
-          clean: selectedClean,
+          clean: candidate,
           generation: requestEpoch.selected,
           generationLineage,
         })
       : null;
     if (lineageError) {
-      blockingErrors.push(lineageError);
-      indeterminate += 1;
-      selectedClean = null;
-    } else {
-      cleanBlockedByLiveness = requestEpoch.selected
-        ? !isV2QualifyingCleanForGeneration(
-            selectedClean,
-            requestEpoch.selected,
-            requestReactions,
-            progressArtifacts,
-            generationLineage,
-          )
-        : false;
-      if (cleanBlockedByLiveness) selectedClean = null;
+      firstCleanLineageError ??= lineageError;
+      continue;
     }
-  } else {
+    const livenessBlocked = requestEpoch.selected
+      ? !isV2QualifyingCleanForGeneration(
+          candidate,
+          requestEpoch.selected,
+          requestReactions,
+          generationLineage,
+        )
+      : false;
+    if (livenessBlocked) {
+      cleanBlockedByLiveness = true;
+      continue;
+    }
+    selectedClean = candidate;
+    break;
+  }
+  if (!selectedClean && firstCleanLineageError) {
+    blockingErrors.push(firstCleanLineageError);
+    indeterminate += 1;
+  }
+  if (cleanCandidates.length === 0) {
     cleanBlockedByLiveness = reactionEvidence.livenessVetoed;
   }
   const providerFindings = currentArtifacts.filter((artifact) => artifact.kind === "finding");
@@ -3130,7 +3742,6 @@ function reduceV2Evidence({
       currentRequests: generationRequests,
       currentCleans: positiveCleans,
       requestReactions,
-      progressArtifacts,
       generationLineage,
     })) {
       blockingErrors.push(error.message);
@@ -3146,7 +3757,6 @@ function reduceV2Evidence({
       currentRequests: generationRequests,
       currentCleans: positiveCleans,
       requestReactions,
-      progressArtifacts,
       generationLineage,
     });
     if (supersession) {
@@ -3169,6 +3779,12 @@ function reduceV2Evidence({
       .reduce((total, artifact) => total + normalizedV2FindingCount(artifact), 0),
     indeterminate,
   };
+  const latestPhysicalBoundary = generationLineage.generations.at(-1) ?? null;
+  const latestBoundaryCannotBeContinued = latestPhysicalBoundary !== null &&
+    latestPhysicalBoundary.authorized !== true;
+  const requiresReplacementPr =
+    generationLineage.gapClosures.some((closure) => closure === null) ||
+    latestBoundaryCannotBeContinued;
 
   let decision;
   if (counts.unresolved > 0) {
@@ -3220,6 +3836,7 @@ function reduceV2Evidence({
       recoveryCode: "wait_provider",
     };
   }
+  decision.requiresReplacementPr = requiresReplacementPr;
   return { counts, decision };
 }
 
@@ -3249,6 +3866,46 @@ function selectCurrentV2RequestGenerations({
   return { baseEpochMs, currentRequests, generationRequests };
 }
 
+function selectV2PhysicalRequestBoundaries({
+  headSha,
+  baseEpoch,
+  requests,
+}) {
+  const baseEpochMs = baseEpoch?.event && isCanonicalUtcTimestamp(baseEpoch.event.createdAt)
+    ? Date.parse(baseEpoch.event.createdAt)
+    : null;
+  const currentRequests = (requests ?? []).filter((request) => {
+    if (!Number.isFinite(request.revisionMs)) return false;
+    if (baseEpochMs !== null && request.revisionMs < baseEpochMs) return false;
+    if (request.headBound !== true) return true;
+    return request.binding?.headSha === headSha;
+  });
+  return { baseEpochMs, currentRequests };
+}
+
+function selectV2ReactionInventoryRequests({
+  headSha,
+  baseEpoch,
+  requests,
+  authorizedRequests,
+}) {
+  const authorizedIds = new Set((authorizedRequests ?? []).map((request) => request.id));
+  const baseEpochMs = baseEpoch?.event && isCanonicalUtcTimestamp(baseEpoch.event.createdAt)
+    ? Date.parse(baseEpoch.event.createdAt)
+    : null;
+  return (requests ?? []).filter((request) => {
+    if (!Number.isFinite(request.revisionMs)) return false;
+    if (
+      !authorizedIds.has(request.id) &&
+      !(baseEpochMs !== null && request.revisionMs < baseEpochMs)
+    ) {
+      return false;
+    }
+    if (request.headBound !== true) return true;
+    return request.binding?.headSha === headSha;
+  });
+}
+
 function normalizeV2EvidenceError(value) {
   const message = typeof value === "string" ? value : value?.message;
   const createdAt = typeof value === "string" ? null : value?.createdAt;
@@ -3266,7 +3923,6 @@ function findV2SupersedingGenerationClean({
   currentRequests,
   currentCleans,
   requestReactions,
-  progressArtifacts,
   generationLineage,
 }) {
   if (!Number.isFinite(evidenceMs)) return null;
@@ -3281,7 +3937,6 @@ function findV2SupersedingGenerationClean({
         candidate,
         generation,
         requestReactions,
-        progressArtifacts,
         generationLineage,
       )
     );
@@ -3294,7 +3949,6 @@ function isV2QualifyingCleanForGeneration(
   clean,
   generation,
   requestReactions,
-  progressArtifacts,
   generationLineage,
 ) {
   const cleanMs = Date.parse(clean.createdAt);
@@ -3312,18 +3966,24 @@ function isV2QualifyingCleanForGeneration(
   })) {
     return false;
   }
-  const laterEyes = (requestReactions.get(generation.id) || []).some((reaction) =>
-    reaction?.content === "eyes" &&
-    reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN &&
-    reaction?.user?.type === "Bot" &&
-    isCanonicalUtcTimestamp(reaction?.created_at) &&
-    Date.parse(reaction.created_at) >= cleanMs
-  );
-  const laterProgress = progressArtifacts.some((artifact) =>
-    isCanonicalUtcTimestamp(artifact.createdAt) &&
-    Date.parse(artifact.createdAt) >= cleanMs
-  );
-  return !laterEyes && !laterProgress;
+  const laterEyes = hasV2AnyOfficialEyesInClosedWindow({
+    requestReactions,
+    startMs: cleanMs,
+    endMs: Number.POSITIVE_INFINITY,
+  });
+  const unsettledEarlierRequestEyes = hasV2UnsettledOfficialEyesOnOtherRequests({
+    requestReactions,
+    generationId: generation.id,
+    beforeMs: cleanMs,
+    floorMs: generationLineage.livenessFloorMs,
+  });
+  const laterProviderActivity = hasV2ProviderActivityInClosedWindow({
+    activities: generationLineage.providerActivities,
+    startMs: cleanMs,
+    endMs: Number.POSITIVE_INFINITY,
+    ignoredTerminal: clean.source === "request-reaction" ? null : clean,
+  });
+  return !laterEyes && !unsettledEarlierRequestEyes && !laterProviderActivity;
 }
 
 function v2CleanLineageError({
@@ -3336,21 +3996,36 @@ function v2CleanLineageError({
     return `Terminal clean ${clean.source}:${clean.id} is not bound to a known review generation`;
   }
   const cleanMs = Date.parse(clean.createdAt);
-  if (clean.source === "request-reaction") {
-    const latestBoundary = generationLineage.generations.at(-1);
-    if (latestBoundary && cleanMs <= latestBoundary.revisionMs) {
+  if (clean.source !== "request-reaction") {
+    const activityWindow = v2ProviderActivityWindow(clean);
+    if (
+      !activityWindow ||
+      activityWindow.carrierCreatedMs <= generation.revisionMs
+    ) {
       return (
-        `Direct clean ${clean.source}:${clean.id} predates later review-request boundary ` +
-        `${latestBoundary.id}`
+        `Terminal clean ${clean.source}:${clean.id} has an unknown activity interval that ` +
+        `starts at or before review request ${generation.id}`
       );
     }
-    return null;
   }
   const nextGeneration = generationLineage.generations[generationIndex + 1];
-  if (nextGeneration && cleanMs >= nextGeneration.revisionMs) {
+  if (clean.source === "request-reaction") {
+    if (nextGeneration) {
+      return (
+        `Direct clean ${clean.source}:${clean.id} cannot be attributed to earlier review request ` +
+        `${generation.id}: newer request ${nextGeneration.id} already existed`
+      );
+    }
+  } else if (nextGeneration) {
+    if (cleanMs >= nextGeneration.revisionMs) {
+      return (
+        `Terminal clean ${clean.source}:${clean.id} cannot be attributed to earlier review request ` +
+        `${generation.id}: newer request ${nextGeneration.id} already existed`
+      );
+    }
     return (
-      `Terminal clean ${clean.source}:${clean.id} cannot be attributed to earlier review request ` +
-      `${generation.id}: newer request ${nextGeneration.id} already existed`
+      `Terminal clean ${clean.source}:${clean.id} predates newer physical review request ` +
+      `${nextGeneration.id} and cannot satisfy the latest review generation`
     );
   }
   const unclosedIndex = generationLineage.firstUnclosedGapByGeneration[generationIndex];
@@ -3359,29 +4034,60 @@ function v2CleanLineageError({
     const successor = generationLineage.generations[unclosedIndex + 1];
     return (
       `Terminal clean ${clean.source}:${clean.id} cannot be attributed to review request ` +
-      `${generation.id}: earlier request ${predecessor.id} had no terminal provider result ` +
+      `${generation.id}: earlier request ${predecessor.id} had no qualifying settled closure ` +
       `before newer request ${successor.id}`
+    );
+  }
+  if (clean.source !== "request-reaction" && generationIndex > 0) {
+    const predecessor = generationLineage.generations[generationIndex - 1];
+    return (
+      `Terminal clean ${clean.source}:${clean.id} cannot be uniquely attributed to review request ` +
+      `${generation.id}: earlier physical request ${predecessor.id} can emit delayed or duplicate ` +
+      `terminal carriers; obtain a qualifying Codex +1 directly on request ${generation.id}`
     );
   }
   return null;
 }
 
-function buildV2GenerationLineage({ currentRequests, currentArtifacts, requestReactions }) {
+function buildV2GenerationLineage({
+  currentRequests,
+  currentArtifacts,
+  requestReactions,
+  providerActivityArtifacts,
+  livenessFloorMs = null,
+  allowProviderTerminalFirstGapClosure = true,
+}) {
   const generations = [...(currentRequests ?? [])]
     .filter((request) => Number.isFinite(request?.revisionMs))
     .sort((left, right) =>
       left.revisionMs - right.revisionMs ||
-      (BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0)
+      compareV2LineageBoundaryIdsAscending(left, right)
     );
   const indexById = new Map(generations.map((request, index) => [request.id, index]));
-  const terminalTimes = (currentArtifacts ?? [])
+  const providerTerminals = (currentArtifacts ?? [])
     .filter((artifact) =>
       artifact.source !== "request-reaction" &&
       (artifact.kind === "clean" || artifact.kind === "finding")
     )
-    .map((artifact) => Date.parse(artifact.createdAt))
-    .filter(Number.isFinite)
-    .sort((left, right) => left - right);
+    .map((artifact) => ({
+      source: artifact.source,
+      id: artifact.id,
+      kind: artifact.kind,
+      createdAt: artifact.createdAt,
+      createdMs: Date.parse(artifact.createdAt),
+      carrierCreatedAt: artifact.carrierCreatedAt || artifact.createdAt,
+      revisionAt: artifact.revisionAt || artifact.createdAt,
+    }))
+    .filter((artifact) => Number.isFinite(artifact.createdMs))
+    .sort((left, right) =>
+      left.createdMs - right.createdMs ||
+      left.source.localeCompare(right.source) ||
+      compareV2CanonicalIdsAscending(left, right)
+    );
+  const providerActivities = mergeV2ProviderActivities(
+    providerTerminals,
+    providerActivityArtifacts,
+  );
   const canonicalReactionIdCounts = new Map();
   for (const inventory of requestReactions?.values() ?? []) {
     for (const reaction of inventory) {
@@ -3390,27 +4096,52 @@ function buildV2GenerationLineage({ currentRequests, currentArtifacts, requestRe
     }
   }
   const firstUnclosedGapByGeneration = Array(generations.length).fill(null);
+  const gapClosures = Array(Math.max(0, generations.length - 1)).fill(null);
   let firstUnclosedGap = null;
-  let terminalIndex = 0;
   for (let index = 0; index + 1 < generations.length; index += 1) {
     const predecessor = generations[index];
     const successor = generations[index + 1];
-    while (
-      terminalIndex < terminalTimes.length &&
-      terminalTimes[terminalIndex] <= predecessor.revisionMs
-    ) {
-      terminalIndex += 1;
-    }
-    const providerClosed = terminalIndex < terminalTimes.length &&
-      terminalTimes[terminalIndex] < successor.revisionMs;
+    const providerClosure =
+      allowProviderTerminalFirstGapClosure &&
+      index === 0 &&
+      requestReactions?.has(predecessor.id)
+      ? providerTerminals.find((terminal) =>
+          v2ProviderActivityWindow(terminal)?.carrierCreatedMs > predecessor.revisionMs &&
+          terminal.createdMs > predecessor.revisionMs &&
+          terminal.createdMs < successor.revisionMs &&
+          !hasV2AnyOfficialEyesInClosedWindow({
+            requestReactions,
+            startMs: terminal.createdMs,
+            endMs: successor.revisionMs,
+          }) &&
+          !hasV2ProviderActivityInClosedWindow({
+            activities: providerActivities,
+            startMs: terminal.createdMs,
+            endMs: successor.revisionMs,
+            ignoredTerminal: terminal,
+          })
+        ) ?? null
+      : null;
     const reactionClosed = predecessor.headBound === true &&
       hasV2DirectReactionClosureBefore({
         request: predecessor,
         beforeMs: successor.revisionMs,
         requestReactions,
         canonicalReactionIdCounts,
+        providerActivities,
       });
-    if (!providerClosed && !reactionClosed && firstUnclosedGap === null) {
+    if (providerClosure) {
+      gapClosures[index] = {
+        kind: "provider-terminal",
+        source: providerClosure.source,
+        id: providerClosure.id,
+      };
+    } else if (reactionClosed) {
+      gapClosures[index] = {
+        kind: "request-reaction",
+        requestId: predecessor.id,
+      };
+    } else if (firstUnclosedGap === null) {
       firstUnclosedGap = index;
     }
     firstUnclosedGapByGeneration[index + 1] = firstUnclosedGap;
@@ -3419,7 +4150,197 @@ function buildV2GenerationLineage({ currentRequests, currentArtifacts, requestRe
     generations,
     indexById,
     firstUnclosedGapByGeneration,
+    gapClosures,
+    providerActivities,
+    livenessFloorMs: Number.isFinite(livenessFloorMs) ? livenessFloorMs : null,
   };
+}
+
+function v2ProviderActivityWindow(artifact) {
+  const carrierCreatedAt = artifact?.carrierCreatedAt;
+  const revisionAt = artifact?.revisionAt || artifact?.createdAt;
+  if (
+    !isCanonicalUtcTimestamp(carrierCreatedAt) ||
+    !isCanonicalUtcTimestamp(revisionAt)
+  ) {
+    return null;
+  }
+  const carrierCreatedMs = Date.parse(carrierCreatedAt);
+  const revisionMs = Date.parse(revisionAt);
+  if (
+    !Number.isFinite(carrierCreatedMs) ||
+    !Number.isFinite(revisionMs) ||
+    revisionMs < carrierCreatedMs
+  ) {
+    return null;
+  }
+  return { carrierCreatedMs, revisionMs };
+}
+
+function scopeV2ProgressArtifactsToCurrentHead({
+  headSha,
+  progressArtifacts,
+}) {
+  return (progressArtifacts ?? []).filter((artifact) => {
+    if (artifact?.resolutionError) return true;
+
+    const explicitHead = String(
+      artifact?.resolvedHeadSha || artifact?.headSha || "",
+    ).toLowerCase();
+    return !FULL_SHA.test(explicitHead) || explicitHead === headSha;
+  });
+}
+
+function mergeV2ProviderActivities(providerTerminals, providerActivityArtifacts) {
+  const byIdentity = new Map();
+  for (const artifact of [
+    ...(providerTerminals ?? []),
+    ...(providerActivityArtifacts ?? []),
+  ]) {
+    const key = `${artifact?.source || "unknown"}:${artifact?.id || "unknown"}`;
+    const existing = byIdentity.get(key);
+    if (!existing) {
+      byIdentity.set(key, artifact);
+      continue;
+    }
+    const existingWindow = v2ProviderActivityWindow(existing);
+    const candidateWindow = v2ProviderActivityWindow(artifact);
+    if (
+      candidateWindow &&
+      (!existingWindow ||
+        candidateWindow.carrierCreatedMs < existingWindow.carrierCreatedMs ||
+        candidateWindow.revisionMs > existingWindow.revisionMs)
+    ) {
+      byIdentity.set(key, artifact);
+    }
+  }
+  return [...byIdentity.values()];
+}
+
+function hasV2AnyOfficialEyesInClosedWindow({
+  requestReactions,
+  startMs,
+  endMs,
+}) {
+  for (const reactions of requestReactions?.values() ?? []) {
+    if ((reactions ?? []).some((reaction) =>
+      reaction?.content === "eyes" &&
+      reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN &&
+      reaction?.user?.type === "Bot" &&
+      isCanonicalUtcTimestamp(reaction.created_at) &&
+      Date.parse(reaction.created_at) >= startMs &&
+      Date.parse(reaction.created_at) <= endMs
+    )) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findV2GlobalReactionInventoryErrors(requestReactions) {
+  const identities = new Map();
+  const errors = [];
+  for (const reactions of requestReactions?.values() ?? []) {
+    for (const reaction of reactions ?? []) {
+      const id = canonicalPositiveId(reaction?.id);
+      if (!id) continue;
+      const identity = identities.get(id) || { count: 0, officialSignal: null };
+      identity.count += 1;
+      if (hasV2ProviderReactionIdentitySignal(reaction)) {
+        identity.officialSignal ||= reaction.content;
+        if (reaction?.user?.type !== "Bot") {
+          errors.push(v2InvalidProviderReactionProvenanceError(reaction));
+        }
+      }
+      identities.set(id, identity);
+    }
+  }
+  return errors.concat([...identities]
+    .filter(([, identity]) => identity.count !== 1 && identity.officialSignal)
+    .sort(([left], [right]) => BigInt(left) < BigInt(right) ? -1 : 1)
+    .map(([id, identity]) =>
+      `Codex ${identity.officialSignal} reaction identity ${id} appears more than once`
+    ));
+}
+
+function hasV2UnsettledOfficialEyesOnOtherRequests({
+  requestReactions,
+  generationId,
+  beforeMs,
+  floorMs = null,
+}) {
+  const canonicalReactionIdCounts = new Map();
+  for (const reactions of requestReactions?.values() ?? []) {
+    for (const reaction of reactions ?? []) {
+      const id = canonicalPositiveId(reaction?.id);
+      if (id) {
+        canonicalReactionIdCounts.set(
+          id,
+          (canonicalReactionIdCounts.get(id) || 0) + 1,
+        );
+      }
+    }
+  }
+  const lowerBoundMs = Number.isFinite(floorMs)
+    ? floorMs
+    : Number.NEGATIVE_INFINITY;
+  for (const [requestId, reactions] of requestReactions?.entries() ?? []) {
+    if (String(requestId) === String(generationId)) continue;
+    const officialSignals = (reactions ?? []).flatMap((reaction) => {
+      const id = canonicalPositiveId(reaction?.id);
+      if (
+        !id ||
+        canonicalReactionIdCounts.get(id) !== 1 ||
+        (reaction?.content !== "+1" && reaction?.content !== "eyes") ||
+        reaction?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN ||
+        reaction?.user?.type !== "Bot" ||
+        !isCanonicalUtcTimestamp(reaction.created_at)
+      ) {
+        return [];
+      }
+      return [{ content: reaction.content, createdMs: Date.parse(reaction.created_at) }];
+    });
+    const plusOneTimes = officialSignals
+      .filter(({ content, createdMs }) =>
+        content === "+1" && createdMs < beforeMs
+      )
+      .map(({ createdMs }) => createdMs);
+    const hasUnsettledEyes = officialSignals.some(({ content, createdMs }) =>
+      content === "eyes" &&
+      createdMs >= lowerBoundMs &&
+      createdMs < beforeMs &&
+      !plusOneTimes.some((plusOneMs) => plusOneMs > createdMs)
+    );
+    if (hasUnsettledEyes) return true;
+  }
+  return false;
+}
+
+function hasV2ProviderActivityInClosedWindow({
+  activities,
+  startMs,
+  endMs,
+  ignoredTerminal = null,
+}) {
+  return (activities ?? []).some((artifact) => {
+    const window = v2ProviderActivityWindow(artifact);
+    if (!window) return true;
+    if (window.revisionMs < startMs || window.carrierCreatedMs > endMs) {
+      return false;
+    }
+    const sameCarrier =
+      ignoredTerminal &&
+      artifact.source === ignoredTerminal.source &&
+      String(artifact.id) === String(ignoredTerminal.id);
+    if (
+      sameCarrier &&
+      window.revisionMs === startMs &&
+      window.carrierCreatedMs <= startMs
+    ) {
+      return false;
+    }
+    return true;
+  });
 }
 
 function hasV2DirectReactionClosureBefore({
@@ -3427,14 +4348,9 @@ function hasV2DirectReactionClosureBefore({
   beforeMs,
   requestReactions,
   canonicalReactionIdCounts,
+  providerActivities,
 }) {
   const reactions = requestReactions?.get(request.id) ?? [];
-  const officialEyes = reactions.filter((reaction) =>
-    reaction?.content === "eyes" &&
-    reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN &&
-    reaction?.user?.type === "Bot" &&
-    isCanonicalUtcTimestamp(reaction.created_at)
-  );
   return reactions.some((reaction) => {
     const id = canonicalPositiveId(reaction?.id);
     if (
@@ -3450,14 +4366,23 @@ function hasV2DirectReactionClosureBefore({
     const plusOneMs = Date.parse(reaction.created_at);
     return plusOneMs > request.revisionMs &&
       plusOneMs < beforeMs &&
-      !officialEyes.some((eyes) => Date.parse(eyes.created_at) >= plusOneMs);
+      !hasV2AnyOfficialEyesInClosedWindow({
+        requestReactions,
+        startMs: plusOneMs,
+        endMs: beforeMs,
+      }) &&
+      !hasV2ProviderActivityInClosedWindow({
+        activities: providerActivities,
+        startMs: plusOneMs,
+        endMs: beforeMs,
+      });
   });
 }
 
 function assertV2ExpectedSnapshotScope(pullRequest, config) {
   const headSha = String(pullRequest?.head?.sha || "").toLowerCase();
   if (headSha !== config.expectedHeadSha) {
-    throw new V2StaleFailure(
+    throw new V2HeadChangedFailure(
       `Pull-request head changed from ${config.expectedHeadSha} to ${headSha || "unknown"}`,
     );
   }
@@ -3514,24 +4439,20 @@ async function exactRefetchV2RelevantObjects(
   issueComments,
   reviews,
   authorizedRequests,
+  observedIssueCommentEdits = null,
 ) {
   const authorizedRequestIds = new Set(
-    (authorizedRequests ?? []).map((request) => String(request.id)),
+    (authorizedRequests ?? []).map((request) =>
+      String(request.id ?? request.comment?.id),
+    ),
   );
   const commentsById = new Map();
   for (const comment of issueComments) {
     const id = canonicalPositiveId(comment?.id);
     if (!id) continue;
-    const providerCandidate =
-      comment?.user?.login === OFFICIAL_CODEX_BOT_LOGIN ||
-      (comment?.app ?? comment?.performed_via_github_app)?.slug === OFFICIAL_CODEX_APP_SLUG;
-    const canonicalWorkflowCandidate =
-      Boolean(parseCanonicalV2ReviewRequestBody(comment?.body)) &&
-      comment?.user?.login === GITHUB_ACTIONS_BOT_LOGIN &&
-      comment?.user?.type === "Bot";
+    const providerCandidate = hasAnyV2ProviderIdentitySignal(comment);
     if (
       providerCandidate ||
-      canonicalWorkflowCandidate ||
       authorizedRequestIds.has(id)
     ) {
       commentsById.set(id, comment);
@@ -3539,8 +4460,7 @@ async function exactRefetchV2RelevantObjects(
   }
   const comments = [...commentsById.values()];
   const relevantReviews = reviews.filter((review) =>
-    review?.user?.login === OFFICIAL_CODEX_BOT_LOGIN ||
-    (review?.app ?? review?.performed_via_github_app)?.slug === OFFICIAL_CODEX_APP_SLUG
+    hasAnyV2ProviderIdentitySignal(review)
   );
   await mapV2Bounded(comments, V2_REACTION_FETCH_CONCURRENCY, async (comment) => {
     const id = canonicalPositiveId(comment.id);
@@ -3552,10 +4472,17 @@ async function exactRefetchV2RelevantObjects(
     );
     budget.consumeObjects(1, `exact issue-comment refetch ${id}`);
     requireV2IssueCommentShape(data, `exact issue-comment refetch ${id}`);
+    rememberV2ObservedCarrierFingerprint(
+      observedIssueCommentEdits,
+      "rest",
+      id,
+      canonicalJson(fingerprintIssueComment(data)),
+    );
     if (canonicalJson(fingerprintIssueComment(data)) !== canonicalJson(fingerprintIssueComment(comment))) {
-      throw new V2RuntimeFailure(`Issue comment ${id} changed during exact refetch`, {
-        recoveryCode: "wait_then_reconcile",
-      });
+      throw poisonV2ObservedHistory(
+        observedIssueCommentEdits,
+        `Issue comment ${id} changed during exact refetch`,
+      );
     }
   });
   await mapV2Bounded(relevantReviews, V2_REACTION_FETCH_CONCURRENCY, async (review) => {
@@ -3568,10 +4495,17 @@ async function exactRefetchV2RelevantObjects(
     );
     budget.consumeObjects(1, `exact review refetch ${id}`);
     requireV2ReviewShape(data, `exact review refetch ${id}`);
+    rememberV2ObservedCarrierFingerprint(
+      observedIssueCommentEdits,
+      "review-rest",
+      id,
+      canonicalJson(fingerprintReview(data)),
+    );
     if (canonicalJson(fingerprintReview(data)) !== canonicalJson(fingerprintReview(review))) {
-      throw new V2RuntimeFailure(`Pull-request review ${id} changed during exact refetch`, {
-        recoveryCode: "wait_then_reconcile",
-      });
+      throw poisonV2ObservedHistory(
+        observedIssueCommentEdits,
+        `Pull-request review ${id} changed during exact refetch`,
+      );
     }
   });
 }
@@ -3583,22 +4517,38 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
   const ordinaryCandidates = [];
   const permissionByLogin = new Map();
   for (const comment of issueComments) {
+    if (hasExactProviderIdentity(comment)) continue;
+    if (isV2ImmutableStickyDiagnostic(comment, config)) continue;
+    if (isV2StickyCommentBody(comment?.body)) {
+      boundaries.push(v2PhysicalOnlyRequestBoundary(
+        comment,
+        "invalid-sticky-diagnostic",
+      ));
+      errors.push({
+        message:
+          `Sticky-looking comment ${comment.id} lacks immutable canonical Actions provenance`,
+        createdAt: v2IssueCommentRevisionAt(comment),
+      });
+      continue;
+    }
     const canonical = parseCanonicalV2ReviewRequestBody(comment?.body);
     if (canonical) {
       if (
         comment.user?.login !== GITHUB_ACTIONS_BOT_LOGIN ||
         comment.user?.type !== "Bot"
       ) {
+        boundaries.push(v2PhysicalOnlyRequestBoundary(comment, "canonical-wrong-author"));
         continue;
       }
       if (
-        comment.created_at !== comment.updated_at ||
+        hasV2ObservedIssueCommentEdit(comment) ||
         canonical.repositoryId !== config.repositoryId ||
         canonical.prNumber !== String(config.prNumber)
       ) {
+        boundaries.push(v2PhysicalOnlyRequestBoundary(comment, "canonical-invalid-binding"));
         errors.push({
           message: `Workflow-authored review request ${comment.id} has an invalid binding`,
-          createdAt: comment.updated_at,
+          createdAt: v2IssueCommentRevisionAt(comment),
         });
         continue;
       }
@@ -3606,7 +4556,7 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
         comment,
         binding: canonical,
         id: String(comment.id),
-        revisionMs: Date.parse(comment.updated_at),
+        revisionMs: Date.parse(v2IssueCommentRevisionAt(comment)),
         headBound: true,
         permission: "workflow",
       };
@@ -3614,13 +4564,32 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
       boundaries.push({ ...request, authorized: true });
       continue;
     }
-    if (comment?.body !== "@codex review") continue;
+    if (!hasExactV2PhysicalReviewRequestShape(comment?.body)) {
+      if (isV2EditedUnknownRequestBoundary(comment)) {
+        boundaries.push(v2PhysicalOnlyRequestBoundary(
+          comment,
+          "edited-unknown-request-history",
+        ));
+        errors.push({
+          message:
+            `Edited comment ${comment.id} by a potential review-request author has ` +
+            `unobservable prior body history`,
+          createdAt: v2IssueCommentRevisionAt(comment),
+        });
+      }
+      continue;
+    }
     if (
-      comment.created_at !== comment.updated_at ||
+      comment?.body !== "@codex review" ||
+      hasV2ObservedIssueCommentEdit(comment) ||
       comment.user?.type !== "User" ||
       typeof comment.user?.login !== "string" ||
       comment.user.login.trim() === ""
     ) {
+      boundaries.push(v2PhysicalOnlyRequestBoundary(
+        comment,
+        comment?.body === "@codex review" ? "bare-invalid-authority" : "malformed-canonical",
+      ));
       continue;
     }
     ordinaryCandidates.push(comment);
@@ -3658,7 +4627,7 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
       comment,
       binding: null,
       id: String(comment.id),
-      revisionMs: Date.parse(comment.updated_at),
+      revisionMs: Date.parse(v2IssueCommentRevisionAt(comment)),
       headBound: false,
       permission,
     };
@@ -3668,6 +4637,77 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
   authorized.sort(compareV2RequestEpochNewestFirst);
   boundaries.sort(compareV2RequestEpochNewestFirst);
   return { authorized, boundaries, errors };
+}
+
+function hasExactV2PhysicalReviewRequestShape(body) {
+  if (typeof body !== "string") return false;
+  const withoutClosedComments = body.replace(/<!--[\s\S]*?-->/gu, "");
+  const unclosedComment = withoutClosedComments.indexOf("<!--");
+  const visible = unclosedComment === -1
+    ? withoutClosedComments
+    : withoutClosedComments.slice(0, unclosedComment);
+  return /^@codex review(?:\s|$)/u.test(visible.trim());
+}
+
+function isV2EditedUnknownRequestBoundary(comment) {
+  if (
+    !isCanonicalUtcTimestamp(comment?.created_at) ||
+    !isCanonicalUtcTimestamp(comment?.updated_at) ||
+    !hasV2ObservedIssueCommentEdit(comment) ||
+    hasExactV2PhysicalReviewRequestShape(comment?.body) ||
+    hasExactProviderIdentity(comment)
+  ) {
+    return false;
+  }
+  return (comment.user?.type === "User" || comment.user?.type === "Bot") &&
+    typeof comment.user?.login === "string" &&
+    comment.user.login.trim() !== "";
+}
+
+function isV2CanonicalActionsSticky(comment, config) {
+  const binding = parseCanonicalV2StickyCommentBody(comment?.body);
+  return binding?.prNumber === config.prNumber &&
+    comment?.user?.login === GITHUB_ACTIONS_BOT_LOGIN &&
+    comment?.user?.type === "Bot" &&
+    isCanonicalUtcTimestamp(comment?.created_at) &&
+    isCanonicalUtcTimestamp(comment?.updated_at);
+}
+
+function isV2ImmutableStickyDiagnostic(comment, config) {
+  return isV2CanonicalActionsSticky(comment, config) &&
+    !hasV2ObservedIssueCommentEdit(comment);
+}
+
+function hasV2ObservedIssueCommentEdit(comment) {
+  return isCanonicalUtcTimestamp(comment?._v2LastEditedAt) ||
+    (
+      isCanonicalUtcTimestamp(comment?._v2GraphQlUpdatedAt) &&
+      isCanonicalUtcTimestamp(comment?.created_at) &&
+      Date.parse(comment._v2GraphQlUpdatedAt) > Date.parse(comment.created_at)
+    ) ||
+    comment?.created_at !== comment?.updated_at;
+}
+
+function v2IssueCommentRevisionAt(comment) {
+  const revisions = [
+    comment?._v2LastEditedAt,
+    comment?._v2GraphQlUpdatedAt,
+    comment?.updated_at,
+  ].filter(isCanonicalUtcTimestamp);
+  return revisions.sort((left, right) => Date.parse(right) - Date.parse(left))[0];
+}
+
+function v2PhysicalOnlyRequestBoundary(comment, reason) {
+  return {
+    comment,
+    binding: null,
+    id: String(comment.id),
+    revisionMs: Date.parse(v2IssueCommentRevisionAt(comment)),
+    headBound: false,
+    permission: "physical-only",
+    authorized: false,
+    physicalOnlyReason: reason,
+  };
 }
 
 async function collectV2ProviderEvidence(
@@ -3681,32 +4721,73 @@ async function collectV2ProviderEvidence(
   const artifacts = [];
   const errors = [];
   for (const comment of issueComments) {
-    if (comment?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN) continue;
+    if (!hasAnyV2ProviderIdentitySignal(comment)) continue;
+    const revisionAt = v2IssueCommentRevisionAt(comment);
     if (!hasExactProviderIdentity(comment)) {
       errors.push({
         message:
           `Codex issue comment ${comment.id || "<unknown>"} has invalid Bot/App provenance`,
-        createdAt: comment.updated_at,
+        createdAt: revisionAt,
+        activity: {
+          source: "issue-comment",
+          id: String(comment.id),
+          carrierCreatedAt: comment.created_at,
+          revisionAt,
+          activityKind: "invalid-provider-provenance",
+        },
       });
       continue;
     }
-    const artifact = parseCodexIssueCommentArtifact(comment, {
+    const observedEdit = hasV2ObservedIssueCommentEdit(comment);
+    const providerComment = observedEdit
+      ? { ...comment, updated_at: revisionAt }
+      : comment;
+    const artifact = parseCodexIssueCommentArtifact(providerComment, {
       owner: config.owner,
       repo: config.repo,
       botLogins: EXACT_CODEX_LOGINS,
       allowShortCommitRefs: true,
     });
-    if (artifact) artifacts.push(artifact);
+    if (artifact) {
+      if (observedEdit) {
+        artifact.edited = true;
+        artifact.carrierUpdatedAt = revisionAt;
+        artifact.revisionAt = revisionAt;
+      }
+      artifacts.push(artifact);
+    } else if (observedEdit || hasExactV2PhysicalReviewRequestShape(comment?.body)) {
+      artifacts.push({
+        source: "issue-comment",
+        id: String(comment.id),
+        kind: "malformed",
+        reason: observedEdit
+          ? `Edited official Codex comment ${comment.id} has unobservable prior body history`
+          : `Official Codex comment ${comment.id} has request-like malformed provider content`,
+        createdAt: revisionAt,
+        carrierCreatedAt: comment.created_at,
+        carrierUpdatedAt: revisionAt,
+        revisionAt,
+        edited: observedEdit,
+      });
+    }
   }
   for (const review of reviews) {
-    if (review?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN) continue;
+    if (!hasAnyV2ProviderIdentitySignal(review)) continue;
     if (!hasExactProviderIdentity(review, { allowMissingApp: true })) {
+      const revisionAt = review.submitted_at || review.created_at;
       errors.push({
         message: `Codex review ${review.id || "<unknown>"} has invalid Bot/App provenance`,
-        createdAt: review.submitted_at || review.created_at,
+        createdAt: revisionAt,
         headSha: FULL_SHA.test(String(review.commit_id || ""))
           ? review.commit_id.toLowerCase()
           : null,
+        activity: {
+          source: "pull-request-review",
+          id: String(review.id),
+          carrierCreatedAt: review.created_at || revisionAt,
+          revisionAt,
+          activityKind: "invalid-provider-provenance",
+        },
       });
       continue;
     }
@@ -3816,7 +4897,920 @@ function artifactCommitReferences(artifact) {
   return typeof artifact?.commitRef === "string" ? [artifact.commitRef] : [];
 }
 
-async function loadLatestV2BaseEpoch(client, config, budget) {
+async function loadV2CommentHistory(
+  client,
+  config,
+  budget,
+  observedDeletedCommentEvents = null,
+  observedIssueCommentEdits = null,
+) {
+  assertV2ObservedHistoryNotPoisoned(observedDeletedCommentEvents);
+  assertV2ObservedHistoryNotPoisoned(observedIssueCommentEdits);
+  const events = [];
+  const eventIds = new Set();
+  const rawEventIds = new Map();
+  const edits = [];
+  const editIds = new Set();
+  const rawEditIds = new Map();
+  const editFingerprints = new Map();
+  const deletedCursors = new Set();
+  const commentCursors = new Set();
+  let cursor = null;
+  let commentCursor = null;
+  let includeDeleted = true;
+  let includeComments = true;
+  let expectedTimelineCount = null;
+  let expectedDeletedCount = null;
+  let expectedCommentCount = null;
+  while (includeDeleted || includeComments) {
+    const { data } = await client.request(
+      "POST",
+      "/graphql",
+      {
+        query: V2_DELETED_COMMENTS_QUERY,
+        variables: {
+          owner: config.owner,
+          repo: config.repo,
+          number: config.prNumber,
+          cursor,
+          commentCursor,
+          includeDeleted,
+          includeComments,
+        },
+      },
+      { budget, safeRead: true },
+    );
+    budget.consumePage("pull-request comment history");
+    const partialPullRequest = data?.data?.repository?.pullRequest;
+    const latchedPage = latchV2VisibleCommentHistoryNodes({
+      pullRequest: partialPullRequest,
+      includeDeleted,
+      includeComments,
+      observedDeletedCommentEvents,
+      observedIssueCommentEdits,
+      deletedEventsSeen: events.length,
+      rawEventIds,
+      rawEditIds,
+    });
+    const fingerprintError = rememberV2PageIssueCommentFingerprints(
+      latchedPage.pageEdits,
+      editFingerprints,
+      observedIssueCommentEdits,
+    );
+    latchedPage.error ??= fingerprintError;
+    if (
+      !isPlainRecord(data) ||
+      (data.errors !== undefined &&
+        (!Array.isArray(data.errors) || data.errors.length > 0)) ||
+      !isPlainRecord(data.data) ||
+      !isPlainRecord(data.data.repository) ||
+      data.data.repository.nameWithOwner !== config.repository ||
+      !isPlainRecord(data.data.repository.pullRequest) ||
+      data.data.repository.pullRequest.number !== config.prNumber
+    ) {
+      const message =
+        "GitHub GraphQL comment-history response was incomplete or inconsistent";
+      if (latchedPage.error) throw latchedPage.error;
+      throw new V2RuntimeFailure(message, {
+        recoveryCode: "wait_then_reconcile",
+      });
+    }
+    if (latchedPage.error) throw latchedPage.error;
+    const pullRequest = data.data.repository.pullRequest;
+    const { pageEvents, pageEdits } = latchedPage;
+    let pageObjects = 2;
+    if (includeDeleted) {
+      const connection = pullRequest.timelineItems;
+      const pageInfo = connection?.pageInfo;
+      const expectedRemainingDeleted = expectedDeletedCount === null
+        ? connection?.filteredCount
+        : expectedDeletedCount - events.length;
+      if (
+        !isPlainRecord(connection) ||
+        !isNonNegativeSafeInteger(connection.totalCount) ||
+        !isNonNegativeSafeInteger(connection.filteredCount) ||
+        !isNonNegativeSafeInteger(connection.pageCount) ||
+        !Array.isArray(connection.nodes) ||
+        connection.nodes.length > V2_DELETED_COMMENTS_PAGE_SIZE ||
+        connection.pageCount !== connection.nodes.length ||
+        connection.totalCount < events.length + connection.filteredCount ||
+        connection.filteredCount !== expectedRemainingDeleted ||
+        connection.nodes.length > connection.filteredCount ||
+        !isValidV2GraphQlPageInfo(pageInfo, connection.nodes.length) ||
+        pageInfo.hasNextPage !==
+          (connection.nodes.length < connection.filteredCount)
+      ) {
+        throw new V2RuntimeFailure(
+          "GitHub GraphQL deleted-comment connection was incomplete or inconsistent",
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      if (expectedDeletedCount === null) {
+        expectedTimelineCount = connection.totalCount;
+        expectedDeletedCount = connection.filteredCount;
+      } else if (connection.totalCount !== expectedTimelineCount) {
+        throw new V2RuntimeFailure(
+          "GitHub GraphQL timeline total count changed during deleted-comment pagination",
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      pageObjects += connection.nodes.length;
+      for (const event of pageEvents) {
+        if (eventIds.has(event.id)) {
+          throw poisonV2ObservedHistory(
+            observedDeletedCommentEvents,
+            `GitHub GraphQL deleted-comment event ${event.id} appeared more than once`,
+          );
+        }
+        eventIds.add(event.id);
+        events.push(event);
+      }
+      if (pageInfo.hasNextPage) {
+        if (deletedCursors.has(pageInfo.endCursor)) {
+          throw new V2RuntimeFailure(
+            "GitHub GraphQL deleted-comment pagination repeated a cursor",
+            { recoveryCode: "wait_then_reconcile" },
+          );
+        }
+        deletedCursors.add(pageInfo.endCursor);
+        cursor = pageInfo.endCursor;
+      } else {
+        if (events.length !== expectedDeletedCount) {
+          throw new V2RuntimeFailure(
+            `GitHub GraphQL deleted-comment inventory was incomplete: ` +
+              `${events.length} of ${expectedDeletedCount}`,
+            { recoveryCode: "wait_then_reconcile" },
+          );
+        }
+        includeDeleted = false;
+      }
+    }
+    if (includeComments) {
+      const connection = pullRequest.comments;
+      const pageInfo = connection?.pageInfo;
+      if (
+        !isPlainRecord(connection) ||
+        !isNonNegativeSafeInteger(connection.totalCount) ||
+        !Array.isArray(connection.nodes) ||
+        connection.nodes.length > V2_DELETED_COMMENTS_PAGE_SIZE ||
+        connection.nodes.length > connection.totalCount - edits.length ||
+        !isValidV2GraphQlPageInfo(pageInfo, connection.nodes.length) ||
+        pageInfo.hasNextPage !==
+          (connection.nodes.length < connection.totalCount - edits.length)
+      ) {
+        throw new V2RuntimeFailure(
+          "GitHub GraphQL issue-comment edit connection was incomplete or inconsistent",
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      if (expectedCommentCount === null) {
+        expectedCommentCount = connection.totalCount;
+      } else if (connection.totalCount !== expectedCommentCount) {
+        throw new V2RuntimeFailure(
+          "GitHub GraphQL issue-comment total count changed during pagination",
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      pageObjects += connection.nodes.length;
+      for (const edit of pageEdits) {
+        const fingerprint = canonicalJson(edit);
+        if (editIds.has(edit.id)) {
+          throw poisonV2ObservedHistory(
+            observedIssueCommentEdits,
+            `GitHub GraphQL issue-comment ${edit.id} appeared more than once`,
+          );
+        }
+        editIds.add(edit.id);
+        editFingerprints.set(edit.id, fingerprint);
+        edits.push(edit);
+      }
+      if (pageInfo.hasNextPage) {
+        if (commentCursors.has(pageInfo.endCursor)) {
+          throw new V2RuntimeFailure(
+            "GitHub GraphQL issue-comment pagination repeated a cursor",
+            { recoveryCode: "wait_then_reconcile" },
+          );
+        }
+        commentCursors.add(pageInfo.endCursor);
+        commentCursor = pageInfo.endCursor;
+      } else {
+        if (edits.length !== expectedCommentCount) {
+          throw new V2RuntimeFailure(
+            `GitHub GraphQL issue-comment inventory was incomplete: ` +
+              `${edits.length} of ${expectedCommentCount}`,
+            { recoveryCode: "wait_then_reconcile" },
+          );
+        }
+        includeComments = false;
+      }
+    }
+    budget.consumeObjects(pageObjects, "pull-request comment history");
+  }
+  retainV2ObservedHistoryRawIdentities(
+    observedDeletedCommentEvents,
+    events.map((event) => event.id),
+    "deleted-comment event",
+  );
+  retainV2ObservedHistoryRawIdentities(
+    observedIssueCommentEdits,
+    edits.map((edit) => edit.id),
+    "issue-comment",
+  );
+  retainV2ObservedCarrierFingerprints(
+    observedIssueCommentEdits,
+    "graphql",
+    edits.map((edit) => [edit.id, canonicalJson(edit)]),
+  );
+  return {
+    deletedCommentEvents: events.sort((left, right) =>
+      Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
+      compareV2OpaqueStringsAscending(left.id, right.id)
+    ),
+    issueCommentEdits: edits.sort((left, right) =>
+      BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0
+    ),
+  };
+}
+
+function latchV2VisibleCommentHistoryNodes({
+  pullRequest,
+  includeDeleted,
+  includeComments,
+  observedDeletedCommentEvents,
+  observedIssueCommentEdits,
+  deletedEventsSeen,
+  rawEventIds,
+  rawEditIds,
+}) {
+  let pageEvents = [];
+  let pageEdits = [];
+  let error = null;
+  if (includeDeleted) {
+    try {
+      const remaining = pullRequest?.timelineItems?.filteredCount;
+      rememberV2ObservedHistoryCount(
+        observedDeletedCommentEvents,
+        isNonNegativeSafeInteger(remaining) &&
+            isNonNegativeSafeInteger(deletedEventsSeen)
+          ? deletedEventsSeen + remaining
+          : null,
+        "deleted-comment inventory",
+        "lower bound",
+      );
+    } catch (caught) {
+      error ??= caught;
+    }
+    try {
+      const normalizedPage = normalizeAndRememberV2HistoryNodes(
+        Array.isArray(pullRequest?.timelineItems?.nodes)
+          ? pullRequest.timelineItems.nodes
+          : [],
+        normalizeV2DeletedCommentEvent,
+        rememberV2ObservedDeletedCommentEvent,
+        observedDeletedCommentEvents,
+        (node) =>
+          typeof node?.id === "string" && node.id.trim() !== ""
+            ? node.id
+            : null,
+        rawEventIds,
+        "deleted-comment event",
+        v2DeletedCommentPartialFacts,
+        true,
+      );
+      pageEvents = normalizedPage.normalized;
+      error ??= normalizedPage.error;
+    } catch (caught) {
+      error ??= caught;
+    }
+  }
+  if (includeComments) {
+    try {
+      rememberV2ObservedHistoryCount(
+        observedIssueCommentEdits,
+        pullRequest?.comments?.totalCount,
+        "issue-comment",
+      );
+    } catch (caught) {
+      error ??= caught;
+    }
+    try {
+      const normalizedPage = normalizeAndRememberV2HistoryNodes(
+        Array.isArray(pullRequest?.comments?.nodes)
+          ? pullRequest.comments.nodes
+          : [],
+        normalizeV2IssueCommentEdit,
+        rememberV2ObservedIssueCommentEdit,
+        observedIssueCommentEdits,
+        (node) => canonicalPositiveId(node?.databaseId),
+        rawEditIds,
+        "issue-comment",
+        v2IssueCommentPartialFacts,
+        false,
+      );
+      pageEdits = normalizedPage.normalized;
+      error ??= normalizedPage.error;
+    } catch (caught) {
+      error ??= caught;
+    }
+  }
+  return { pageEvents, pageEdits, error };
+}
+
+function rememberV2PageIssueCommentFingerprints(edits, fingerprints, observed) {
+  let error = null;
+  for (const edit of edits ?? []) {
+    const fingerprint = canonicalJson(edit);
+    const previous = fingerprints.get(edit.id);
+    if (previous !== undefined) {
+      error ??= poisonV2ObservedHistory(
+        observed,
+        previous === fingerprint
+          ? `GitHub GraphQL issue-comment ${edit.id} appeared more than once`
+          : `GitHub GraphQL issue-comment ${edit.id} changed across paginated inventory`,
+      );
+      continue;
+    }
+    fingerprints.set(edit.id, fingerprint);
+    try {
+      rememberV2ObservedCarrierFingerprint(
+        observed,
+        "graphql",
+        edit.id,
+        fingerprint,
+      );
+    } catch (caught) {
+      error ??= caught;
+    }
+  }
+  return error;
+}
+
+function rememberV2ObservedCarrierFingerprint(
+  observed,
+  source,
+  id,
+  fingerprint,
+) {
+  if (!(observed instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  let fingerprints = observed.get(V2_OBSERVED_CARRIER_FINGERPRINTS);
+  if (!(fingerprints instanceof Map)) {
+    fingerprints = new Map();
+    observed.set(V2_OBSERVED_CARRIER_FINGERPRINTS, fingerprints);
+  }
+  const key = `${source}:${id}`;
+  const previous = fingerprints.get(key);
+  if (previous !== undefined && previous !== fingerprint) {
+    throw poisonV2ObservedHistory(
+      observed,
+      `Previously observed ${source} issue-comment ${id} changed`,
+    );
+  }
+  fingerprints.set(key, fingerprint);
+}
+
+function retainV2ObservedCarrierFingerprints(observed, source, entries) {
+  if (!(observed instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  const current = new Map(entries ?? []);
+  let fingerprints = observed.get(V2_OBSERVED_CARRIER_FINGERPRINTS);
+  if (!(fingerprints instanceof Map)) {
+    fingerprints = new Map();
+    observed.set(V2_OBSERVED_CARRIER_FINGERPRINTS, fingerprints);
+  }
+  const prefix = `${source}:`;
+  for (const [key, previous] of fingerprints) {
+    if (!key.startsWith(prefix)) continue;
+    const id = key.slice(prefix.length);
+    if (!current.has(id)) {
+      throw poisonV2ObservedHistory(
+        observed,
+        `Previously observed ${source} issue-comment ${id} disappeared`,
+      );
+    }
+    if (current.get(id) !== previous) {
+      throw poisonV2ObservedHistory(
+        observed,
+        `Previously observed ${source} issue-comment ${id} changed`,
+      );
+    }
+  }
+  for (const [id, fingerprint] of current) {
+    rememberV2ObservedCarrierFingerprint(
+      observed,
+      source,
+      id,
+      fingerprint,
+    );
+  }
+}
+
+function rememberV2ObservedHistoryCount(
+  observed,
+  count,
+  label,
+  countField = "totalCount",
+) {
+  if (!(observed instanceof Map) || !isNonNegativeSafeInteger(count)) return;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  const previous = observed.get(V2_OBSERVED_HISTORY_COUNT_FLOOR);
+  if (isNonNegativeSafeInteger(previous) && count < previous) {
+    throw poisonV2ObservedHistory(
+      observed,
+      `Previously observed ${label} ${countField} decreased from ${previous} to ${count}`,
+    );
+  }
+  observed.set(
+    V2_OBSERVED_HISTORY_COUNT_FLOOR,
+    isNonNegativeSafeInteger(previous) ? Math.max(previous, count) : count,
+  );
+}
+
+function normalizeAndRememberV2HistoryNodes(
+  nodes,
+  normalize,
+  remember,
+  observed,
+  rawIdentity,
+  rawIdentitiesSeen,
+  identityLabel,
+  partialFacts,
+  poisonValidDuplicates,
+) {
+  const normalized = [];
+  let firstError = null;
+  for (const node of nodes) {
+    const identity = rawIdentity?.(node) ?? null;
+    const previousIdentityState = identity === null
+      ? undefined
+      : rawIdentitiesSeen?.get(identity);
+    let value;
+    try {
+      value = normalize(node);
+      normalized.push(value);
+    } catch (error) {
+      const message = error?.message || String(error);
+      if (identity !== null) {
+        rememberV2ObservedHistoryRawIdentity(observed, identity);
+        rawIdentitiesSeen?.set(identity, "malformed");
+        if (previousIdentityState !== undefined) {
+          const duplicateError = poisonV2ObservedHistory(
+            observed,
+            `GitHub GraphQL ${identityLabel} ${identity} appeared more than once`,
+          );
+          firstError ??= duplicateError;
+        } else {
+          try {
+            rememberV2ObservedHistoryPartialFacts(
+              observed,
+              identity,
+              partialFacts?.(node),
+              identityLabel,
+            );
+          } catch (caught) {
+            firstError ??= caught;
+          }
+        }
+      }
+      firstError ??= new V2RuntimeFailure(message, {
+        recoveryCode: "wait_then_reconcile",
+      });
+      continue;
+    }
+    if (identity !== null) {
+      rawIdentitiesSeen?.set(identity, "valid");
+      if (
+        previousIdentityState !== undefined &&
+        (poisonValidDuplicates || previousIdentityState === "malformed")
+      ) {
+        const duplicateError = poisonV2ObservedHistory(
+          observed,
+          `GitHub GraphQL ${identityLabel} ${identity} appeared more than once`,
+        );
+        firstError ??= duplicateError;
+      } else if (previousIdentityState === undefined) {
+        try {
+          rememberV2ObservedHistoryPartialFacts(
+            observed,
+            identity,
+            partialFacts?.(node),
+            identityLabel,
+          );
+        } catch (caught) {
+          firstError ??= caught;
+        }
+      }
+    }
+    try {
+      remember(value, observed);
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  return { normalized, error: firstError };
+}
+
+function rememberV2ObservedHistoryRawIdentity(observed, identity) {
+  if (!(observed instanceof Map)) return;
+  let identities = observed.get(V2_OBSERVED_HISTORY_RAW_IDENTITIES);
+  if (!(identities instanceof Set)) {
+    identities = new Set();
+    observed.set(V2_OBSERVED_HISTORY_RAW_IDENTITIES, identities);
+  }
+  identities.add(identity);
+}
+
+function rememberV2ObservedHistoryPartialFacts(
+  observed,
+  identity,
+  facts,
+  identityLabel,
+) {
+  if (!(observed instanceof Map) || !isPlainRecord(facts)) return;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  let identities = observed.get(V2_OBSERVED_HISTORY_PARTIAL_FACTS);
+  if (!(identities instanceof Map)) {
+    identities = new Map();
+    observed.set(V2_OBSERVED_HISTORY_PARTIAL_FACTS, identities);
+  }
+  let remembered = identities.get(identity);
+  if (!(remembered instanceof Map)) {
+    remembered = new Map();
+    identities.set(identity, remembered);
+  }
+  for (const [field, value] of Object.entries(facts)) {
+    const fingerprint = canonicalJson(value);
+    const previous = remembered.get(field);
+    if (previous !== undefined && previous !== fingerprint) {
+      throw poisonV2ObservedHistory(
+        observed,
+        `Previously observed ${identityLabel} ${identity} ${field} changed`,
+      );
+    }
+    remembered.set(field, fingerprint);
+  }
+}
+
+function v2IssueCommentPartialFacts(value) {
+  if (!isPlainRecord(value)) return {};
+  const facts = {};
+  if (typeof value.body === "string") facts.body = value.body;
+  if (isCanonicalUtcTimestamp(value.createdAt)) facts.createdAt = value.createdAt;
+  if (isCanonicalUtcTimestamp(value.updatedAt)) facts.updatedAt = value.updatedAt;
+  if (
+    Object.prototype.hasOwnProperty.call(value, "lastEditedAt") &&
+    (value.lastEditedAt === null || isCanonicalUtcTimestamp(value.lastEditedAt))
+  ) {
+    facts.lastEditedAt = value.lastEditedAt;
+  }
+  return facts;
+}
+
+function v2DeletedCommentPartialFacts(value) {
+  if (!isPlainRecord(value)) return {};
+  const facts = {};
+  if (typeof value.__typename === "string" && value.__typename.trim() !== "") {
+    facts.typename = value.__typename;
+  }
+  if (isCanonicalUtcTimestamp(value.createdAt)) facts.createdAt = value.createdAt;
+  for (const field of ["actor", "deletedCommentAuthor"]) {
+    const actor = v2DeletedCommentActorPartialFact(value[field]);
+    if (actor !== undefined) facts[field] = actor;
+  }
+  return facts;
+}
+
+function v2DeletedCommentActorPartialFact(actor) {
+  if (actor === null) return null;
+  if (
+    !isPlainRecord(actor) ||
+    typeof actor.__typename !== "string" ||
+    actor.__typename.trim() === "" ||
+    typeof actor.login !== "string" ||
+    actor.login.trim() === ""
+  ) {
+    return undefined;
+  }
+  return { typename: actor.__typename, login: actor.login };
+}
+
+function retainV2ObservedHistoryRawIdentities(
+  observed,
+  currentIdentities,
+  identityLabel,
+) {
+  if (!(observed instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  const identities = observed.get(V2_OBSERVED_HISTORY_RAW_IDENTITIES);
+  if (!(identities instanceof Set)) return;
+  const current = new Set(currentIdentities ?? []);
+  for (const identity of identities) {
+    if (!current.has(identity)) {
+      throw poisonV2ObservedHistory(
+        observed,
+        `Previously observed ${identityLabel} raw identity ${identity} disappeared`,
+      );
+    }
+  }
+}
+
+function isValidV2GraphQlPageInfo(pageInfo, nodeCount) {
+  return isPlainRecord(pageInfo) &&
+    typeof pageInfo.hasNextPage === "boolean" &&
+    (
+      pageInfo.endCursor === null ||
+      (typeof pageInfo.endCursor === "string" && pageInfo.endCursor.trim() !== "")
+    ) &&
+    !(pageInfo.hasNextPage && nodeCount === 0) &&
+    !(pageInfo.hasNextPage && pageInfo.endCursor === null);
+}
+
+function retainV2ObservedDeletedCommentEvents(events, observedEvents) {
+  if (!(observedEvents instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observedEvents);
+  const current = new Map((events ?? []).map((event) => [
+    event.id,
+    canonicalJson(event),
+  ]));
+  for (const [id, fingerprint] of observedEvents) {
+    if (typeof id === "symbol") continue;
+    if (!current.has(id)) {
+      throw new V2RuntimeFailure(
+        `Previously observed deleted-comment event ${id} disappeared from later inventory`,
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    if (current.get(id) !== fingerprint) {
+      throw poisonV2ObservedHistory(
+        observedEvents,
+        `Previously observed deleted-comment event ${id} changed in later inventory`,
+      );
+    }
+  }
+  for (const [id, fingerprint] of current) {
+    observedEvents.set(id, fingerprint);
+  }
+}
+
+function rememberV2ObservedDeletedCommentEvent(event, observedEvents) {
+  if (!(observedEvents instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observedEvents);
+  const fingerprint = canonicalJson(event);
+  const previous = observedEvents.get(event.id);
+  if (previous !== undefined && previous !== fingerprint) {
+    throw poisonV2ObservedHistory(
+      observedEvents,
+      `Previously observed deleted-comment event ${event.id} changed in later inventory`,
+    );
+  }
+  observedEvents.set(event.id, fingerprint);
+}
+
+function retainV2ObservedIssueCommentEdits(edits, observedEdits) {
+  if (!(observedEdits instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observedEdits);
+  const current = new Map((edits ?? []).map((edit) => [edit.id, edit]));
+  for (const [id] of observedEdits) {
+    if (typeof id === "symbol") continue;
+    const edit = current.get(id);
+    if (!edit || v2IssueCommentEditProof(edit) === null) {
+      throw new V2RuntimeFailure(
+        `Previously observed edit metadata for issue comment ${id} disappeared`,
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    rememberV2ObservedIssueCommentEdit(edit, observedEdits);
+  }
+  for (const edit of edits ?? []) {
+    rememberV2ObservedIssueCommentEdit(edit, observedEdits);
+  }
+}
+
+function rememberV2ObservedIssueCommentEdit(edit, observedEdits) {
+  if (!(observedEdits instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observedEdits);
+  const proof = v2IssueCommentEditProof(edit);
+  const previous = observedEdits.get(edit.id);
+  if (previous === undefined) {
+    if (proof !== null) observedEdits.set(edit.id, proof);
+    return;
+  }
+  if (
+    proof === null ||
+    proof.createdAt !== previous.createdAt ||
+    Date.parse(proof.updatedAt) < Date.parse(previous.updatedAt) ||
+    (
+      previous.lastEditedAt !== null &&
+      (
+        proof.lastEditedAt === null ||
+        Date.parse(proof.lastEditedAt) < Date.parse(previous.lastEditedAt)
+      )
+    )
+  ) {
+    throw poisonV2ObservedHistory(
+      observedEdits,
+      `Previously observed edit metadata for issue comment ${edit.id} moved backwards`,
+    );
+  }
+  observedEdits.set(edit.id, proof);
+}
+
+function v2IssueCommentEditProof(edit) {
+  const editedAt = isCanonicalUtcTimestamp(edit?.lastEditedAt)
+    ? edit.lastEditedAt
+    : null;
+  if (
+    !isCanonicalUtcTimestamp(edit?.createdAt) ||
+    !isCanonicalUtcTimestamp(edit?.updatedAt) ||
+    (editedAt === null && Date.parse(edit.updatedAt) <= Date.parse(edit.createdAt))
+  ) {
+    return null;
+  }
+  return {
+    createdAt: edit.createdAt,
+    updatedAt: edit.updatedAt,
+    lastEditedAt: editedAt,
+  };
+}
+
+function assertV2ObservedHistoryNotPoisoned(observed) {
+  if (!(observed instanceof Map)) return;
+  const message = observed.get(V2_OBSERVED_HISTORY_POISON);
+  if (typeof message === "string") {
+    throw new V2RuntimeFailure(message, { recoveryCode: "wait_then_reconcile" });
+  }
+}
+
+function poisonV2ObservedHistory(observed, message) {
+  if (observed instanceof Map) {
+    observed.set(
+      V2_OBSERVED_HISTORY_POISON,
+      observed.get(V2_OBSERVED_HISTORY_POISON) || message,
+    );
+  }
+  return new V2RuntimeFailure(message, { recoveryCode: "wait_then_reconcile" });
+}
+
+function normalizeV2DeletedCommentEvent(value) {
+  if (
+    !isPlainRecord(value) ||
+    value.__typename !== "CommentDeletedEvent" ||
+    typeof value.id !== "string" ||
+    value.id.trim() === "" ||
+    !isCanonicalUtcTimestamp(value.createdAt)
+  ) {
+    throw new V2RuntimeFailure(
+      "GitHub GraphQL deleted-comment event was incomplete or inconsistent",
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  return {
+    typename: value.__typename,
+    id: value.id,
+    createdAt: value.createdAt,
+    actor: normalizeV2DeletedCommentActor(value.actor, "actor"),
+    deletedCommentAuthor: normalizeV2DeletedCommentActor(
+      value.deletedCommentAuthor,
+      "deleted comment author",
+    ),
+  };
+}
+
+function normalizeV2IssueCommentEdit(value) {
+  const id = canonicalPositiveId(value?.databaseId);
+  if (
+    !isPlainRecord(value) ||
+    !id ||
+    typeof value.body !== "string" ||
+    !isCanonicalUtcTimestamp(value.createdAt) ||
+    !isCanonicalUtcTimestamp(value.updatedAt) ||
+    !(
+      value.lastEditedAt === null ||
+      isCanonicalUtcTimestamp(value.lastEditedAt)
+    ) ||
+    Date.parse(value.updatedAt) < Date.parse(value.createdAt) ||
+    (
+      value.lastEditedAt !== null &&
+      (
+        Date.parse(value.lastEditedAt) < Date.parse(value.createdAt) ||
+        Date.parse(value.lastEditedAt) > Date.parse(value.updatedAt)
+      )
+    )
+  ) {
+    throw new V2RuntimeFailure(
+      "GitHub GraphQL issue-comment edit metadata was incomplete or inconsistent",
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  return {
+    id,
+    body: value.body,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    lastEditedAt: value.lastEditedAt,
+  };
+}
+
+function attachV2IssueCommentEditMetadata(
+  issueComments,
+  edits,
+  observedIssueCommentEdits = null,
+) {
+  if (!Array.isArray(issueComments) || !Array.isArray(edits) ||
+      issueComments.length !== edits.length) {
+    throw poisonV2ObservedHistory(
+      observedIssueCommentEdits,
+      "REST and GraphQL issue-comment inventories have different counts",
+    );
+  }
+  const editsById = new Map(edits.map((edit) => [edit.id, edit]));
+  if (editsById.size !== edits.length) {
+    throw poisonV2ObservedHistory(
+      observedIssueCommentEdits,
+      "GitHub GraphQL issue-comment inventory contained duplicate ids",
+    );
+  }
+  const commentIds = new Set();
+  for (const comment of issueComments) {
+    const id = canonicalPositiveId(comment?.id);
+    if (!id || commentIds.has(id)) {
+      throw poisonV2ObservedHistory(
+        observedIssueCommentEdits,
+        `REST issue-comment inventory contained duplicate or invalid id ${id || "unknown"}`,
+      );
+    }
+    commentIds.add(id);
+    if (id) {
+      rememberV2ObservedCarrierFingerprint(
+        observedIssueCommentEdits,
+        "rest",
+        id,
+        canonicalJson(fingerprintIssueComment(comment)),
+      );
+    }
+    const edit = id ? editsById.get(id) : null;
+    if (
+      !edit ||
+      edit.body !== comment.body ||
+      Math.floor(Date.parse(edit.createdAt) / 1_000) !==
+        Math.floor(Date.parse(comment.created_at) / 1_000) ||
+      Math.floor(Date.parse(edit.updatedAt) / 1_000) !==
+        Math.floor(Date.parse(comment.updated_at) / 1_000)
+    ) {
+      throw poisonV2ObservedHistory(
+        observedIssueCommentEdits,
+        `REST and GraphQL issue-comment metadata did not match for ${id || "unknown"}`,
+      );
+    }
+    comment._v2LastEditedAt = edit.lastEditedAt;
+    comment._v2GraphQlUpdatedAt = edit.updatedAt;
+  }
+  if (commentIds.size !== editsById.size) {
+    throw poisonV2ObservedHistory(
+      observedIssueCommentEdits,
+      "REST and GraphQL issue-comment inventories have different id sets",
+    );
+  }
+}
+
+function normalizeV2DeletedCommentActor(actor, label) {
+  if (actor === null) return null;
+  if (
+    !isPlainRecord(actor) ||
+    typeof actor.__typename !== "string" ||
+    actor.__typename.trim() === "" ||
+    typeof actor.login !== "string" ||
+    actor.login.trim() === ""
+  ) {
+    throw new V2RuntimeFailure(
+      `GitHub GraphQL deleted-comment ${label} was incomplete or inconsistent`,
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  return { typename: actor.__typename, login: actor.login };
+}
+
+function v2DeletedCommentBoundary(event) {
+  return {
+    comment: null,
+    binding: null,
+    id: `deleted:${event.id}`,
+    revisionMs: Date.parse(event.createdAt),
+    revisionAt: event.createdAt,
+    headBound: false,
+    permission: "physical-only",
+    authorized: false,
+    physicalOnlyReason: "deleted-comment-unknown-history",
+  };
+}
+
+async function loadLatestV2BaseEpoch(
+  client,
+  config,
+  budget,
+  observedBaseEpoch = null,
+) {
+  assertV2ObservedHistoryNotPoisoned(observedBaseEpoch);
   const { data } = await client.request(
     "POST",
     "/graphql",
@@ -3831,6 +5825,11 @@ async function loadLatestV2BaseEpoch(client, config, budget) {
     { budget, safeRead: true },
   );
   budget.consumePage("latest pull-request base epoch");
+  const partialConnection = data?.data?.repository?.pullRequest?.timelineItems;
+  const latched = latchV2VisibleBaseEpoch(
+    partialConnection,
+    observedBaseEpoch,
+  );
   if (
     !isPlainRecord(data) ||
     (data.errors !== undefined &&
@@ -3841,6 +5840,7 @@ async function loadLatestV2BaseEpoch(client, config, budget) {
     !isPlainRecord(data.data.repository.pullRequest) ||
     data.data.repository.pullRequest.number !== config.prNumber
   ) {
+    if (latched.error) throw latched.error;
     throw new V2RuntimeFailure(
       "GitHub GraphQL base-epoch response was incomplete or inconsistent",
     );
@@ -3855,18 +5855,120 @@ async function loadLatestV2BaseEpoch(client, config, budget) {
     connection.pageCount !== connection.nodes.length ||
     (connection.filteredCount === 0) !== (connection.nodes.length === 0)
   ) {
+    if (latched.error) throw latched.error;
     throw new V2RuntimeFailure(
       "GitHub GraphQL base-epoch connection was incomplete or inconsistent",
     );
   }
+  if (latched.error) throw latched.error;
   budget.consumeObjects(2 + connection.nodes.length, "latest pull-request base epoch");
-  const event = connection.nodes.length === 0
-    ? null
-    : normalizeV2BaseEpochEvent(connection.nodes[0]);
+  const event = latched.event;
   return {
     filteredCount: connection.filteredCount,
     event,
   };
+}
+
+function latchV2VisibleBaseEpoch(connection, observedBaseEpoch) {
+  const filteredCount = isNonNegativeSafeInteger(connection?.filteredCount)
+    ? connection.filteredCount
+    : null;
+  let event;
+  let eventAvailable = false;
+  let error = null;
+  if (Array.isArray(connection?.nodes)) {
+    if (connection.nodes.length === 0 && filteredCount === 0) {
+      event = null;
+      eventAvailable = true;
+    } else if (connection.nodes.length === 1) {
+      try {
+        event = normalizeV2BaseEpochEvent(connection.nodes[0]);
+        eventAvailable = true;
+      } catch (caught) {
+        error = caught;
+      }
+    }
+  }
+  try {
+    const observationError = rememberV2ObservedBaseEpoch(
+      observedBaseEpoch,
+      filteredCount,
+      eventAvailable ? event : undefined,
+    );
+    error ??= observationError;
+  } catch (caught) {
+    error ??= caught;
+  }
+  return { event, eventAvailable, error };
+}
+
+function rememberV2ObservedBaseEpoch(observed, filteredCount, event) {
+  if (!(observed instanceof Map)) return null;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  let error = null;
+  if (isNonNegativeSafeInteger(filteredCount)) {
+    const previousCount = observed.get(V2_OBSERVED_BASE_EPOCH_COUNT_FLOOR);
+    if (
+      isNonNegativeSafeInteger(previousCount) &&
+      filteredCount < previousCount
+    ) {
+      error = new V2RuntimeFailure(
+        `Previously observed base-epoch filteredCount decreased from ` +
+          `${previousCount} to ${filteredCount}`,
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    } else {
+      observed.set(
+        V2_OBSERVED_BASE_EPOCH_COUNT_FLOOR,
+        isNonNegativeSafeInteger(previousCount)
+          ? Math.max(previousCount, filteredCount)
+          : filteredCount,
+      );
+    }
+  }
+  if (event === undefined) return error;
+  const previous = observed.get(V2_OBSERVED_BASE_EPOCH_LATEST);
+  if (event === null) {
+    if (isPlainRecord(previous)) {
+      error ??= new V2RuntimeFailure(
+        `Previously observed base-epoch event ${previous.event.id} ` +
+          "disappeared from the latest-event inventory",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    return error;
+  }
+  const fingerprint = canonicalJson(event);
+  if (!isPlainRecord(previous)) {
+    observed.set(V2_OBSERVED_BASE_EPOCH_LATEST, { event, fingerprint });
+    return error;
+  }
+  if (event.id === previous.event.id) {
+    if (fingerprint !== previous.fingerprint) {
+      return poisonV2ObservedHistory(
+        observed,
+        `Previously observed base-epoch event ${event.id} changed`,
+      );
+    }
+    return error;
+  }
+  const order = Date.parse(event.createdAt) - Date.parse(previous.event.createdAt);
+  if (order > 0) {
+    observed.set(V2_OBSERVED_BASE_EPOCH_LATEST, { event, fingerprint });
+    return error;
+  }
+  if (order === 0) {
+    return poisonV2ObservedHistory(
+      observed,
+      `Base-epoch events ${previous.event.id} and ${event.id} have ambiguous ordering`,
+    );
+  }
+  error ??= new V2RuntimeFailure(
+    `Latest base-epoch event moved backwards from ${previous.event.id} ` +
+      `to ${event.id}`,
+    { recoveryCode: "wait_then_reconcile" },
+  );
+  return error;
 }
 
 function normalizeV2BaseEpochEvent(value) {
@@ -4102,54 +6204,34 @@ function isOpenV2PullRequest(pullRequest) {
 
 async function writeV2StickyBestEffort(client, config, context, report) {
   try {
-    let comments = context.issueComments;
-    if (!Array.isArray(comments) || comments.length === 0) {
-      const budget = new V2SnapshotBudget(config);
-      comments = await client.paginate(`${config.repoPath}/issues/${config.prNumber}/comments`, {
+    const budget = new V2SnapshotBudget(config);
+    const comments = await client.paginate(
+      `${config.repoPath}/issues/${config.prNumber}/comments`,
+      {
         budget,
         label: "sticky-comment lookup",
         validate: requireV2IssueCommentShape,
-      });
-    }
+      },
+    );
     const stickyCandidates = comments
       .filter((comment) =>
-        canonicalPositiveId(comment?.id) &&
-        comment?.user?.login === GITHUB_ACTIONS_BOT_LOGIN &&
-        comment?.user?.type === "Bot" &&
-        isCanonicalUtcTimestamp(comment?.created_at) &&
-        isCanonicalUtcTimestamp(comment?.updated_at) &&
-        Date.parse(comment.updated_at) >= Date.parse(comment.created_at) &&
-        isV2StickyCommentBody(comment.body),
+        canonicalPositiveId(comment?.id) && isV2CanonicalActionsSticky(comment, config)
       )
       .sort(compareV2CanonicalIdsAscending);
     if (stickyCandidates.length > 1) {
-      const selectedId = formatV2DiagnosticText(
-        canonicalPositiveId(stickyCandidates[0].id),
-        "unknown",
-        64,
-      );
       console.warn(
         `Found ${stickyCandidates.length} canonical v2 sticky diagnostics; ` +
-          `updating lowest-id comment ${selectedId}`,
+          "preserving them without mutation",
       );
     }
-    const sticky = stickyCandidates[0];
+    if (stickyCandidates.length > 0) return;
     const body = buildV2StickyCommentBody(report, context);
-    if (sticky && canonicalPositiveId(sticky.id)) {
-      await client.request(
-        "PATCH",
-        `${config.repoPath}/issues/comments/${sticky.id}`,
-        { body },
-        { safeRead: false },
-      );
-    } else {
-      await client.request(
-        "POST",
-        `${config.repoPath}/issues/${config.prNumber}/comments`,
-        { body },
-        { safeRead: false },
-      );
-    }
+    await client.request(
+      "POST",
+      `${config.repoPath}/issues/${config.prNumber}/comments`,
+      { body },
+      { safeRead: false },
+    );
   } catch (error) {
     console.warn(`best-effort sticky report was not persisted: ${error.message}`);
   }
@@ -4273,6 +6355,25 @@ function compareV2CanonicalIdsAscending(left, right) {
   return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
 }
 
+function compareV2LineageBoundaryIdsAscending(left, right) {
+  const leftNumeric = canonicalPositiveId(left?.id);
+  const rightNumeric = canonicalPositiveId(right?.id);
+  if (leftNumeric && rightNumeric) {
+    const leftId = BigInt(leftNumeric);
+    const rightId = BigInt(rightNumeric);
+    return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+  }
+  if (leftNumeric) return -1;
+  if (rightNumeric) return 1;
+  return compareV2OpaqueStringsAscending(left?.id, right?.id);
+}
+
+function compareV2OpaqueStringsAscending(left, right) {
+  const leftValue = String(left ?? "");
+  const rightValue = String(right ?? "");
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
 function hasExactProviderIdentity(value, { allowMissingApp = false } = {}) {
   if (
     value?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN ||
@@ -4286,13 +6387,27 @@ function hasExactProviderIdentity(value, { allowMissingApp = false } = {}) {
     (allowMissingApp || apps.length > 0);
 }
 
+function hasAnyV2ProviderIdentitySignal(value) {
+  return value?.user?.login === OFFICIAL_CODEX_BOT_LOGIN ||
+    [value?.app, value?.performed_via_github_app]
+      .some((app) => app?.slug === OFFICIAL_CODEX_APP_SLUG);
+}
+
+function hasV2ProviderReactionIdentitySignal(reaction) {
+  return reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN &&
+    (reaction?.content === "+1" || reaction?.content === "eyes");
+}
+
+function v2InvalidProviderReactionProvenanceError(reaction) {
+  return `Codex ${reaction?.content || "signal"} reaction ` +
+    `${canonicalPositiveId(reaction?.id) || "<unknown>"} has invalid Bot provenance`;
+}
+
 function isRelevantV2IssueComment(comment) {
   return Boolean(
-    parseCanonicalV2ReviewRequestBody(comment?.body) ||
-      comment?.body === "@codex review" ||
-      comment?.user?.login === OFFICIAL_CODEX_BOT_LOGIN ||
-      (comment?.app ?? comment?.performed_via_github_app)?.slug ===
-        OFFICIAL_CODEX_APP_SLUG,
+    hasExactV2PhysicalReviewRequestShape(comment?.body) ||
+      isV2EditedUnknownRequestBoundary(comment) ||
+      hasAnyV2ProviderIdentitySignal(comment),
   );
 }
 
@@ -4376,7 +6491,7 @@ function fingerprintIssueComment(comment) {
     createdAt: comment?.created_at ?? null,
     updatedAt: comment?.updated_at ?? null,
     author: fingerprintActor(comment?.user),
-    appSlug: (comment?.app ?? comment?.performed_via_github_app)?.slug ?? null,
+    appSlugs: [comment?.app?.slug ?? null, comment?.performed_via_github_app?.slug ?? null],
     authorAssociation: comment?.author_association ?? null,
   };
 }
@@ -4389,7 +6504,15 @@ function fingerprintReview(review) {
     commitId: review?.commit_id ?? null,
     submittedAt: review?.submitted_at ?? review?.created_at ?? null,
     author: fingerprintActor(review?.user),
-    appSlug: (review?.app ?? review?.performed_via_github_app)?.slug ?? null,
+    appSlugs: [review?.app?.slug ?? null, review?.performed_via_github_app?.slug ?? null],
+  };
+}
+
+function fingerprintReviewIdentity(review) {
+  return {
+    id: String(review?.id ?? ""),
+    author: fingerprintActor(review?.user),
+    appSlugs: [review?.app?.slug ?? null, review?.performed_via_github_app?.slug ?? null],
   };
 }
 

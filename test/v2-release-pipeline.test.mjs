@@ -14,8 +14,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 import { fileURLToPath } from "node:url";
+import { createShardedTest } from "./support/ci-test-shard.mjs";
+
+const test = createShardedTest(
+  nodeTest,
+  process.env.CODEX_REVIEW_GATE_RELEASE_TEST_SHARD,
+  "release pipeline",
+);
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workflowPath = join(repositoryRoot, ".github", "workflows", "sync-action-subtree.yml");
@@ -25,6 +32,31 @@ const baselinePath = join(repositoryRoot, "docs", "release", "action-v2-reposito
 const actionMetadata = readFileSync(join(repositoryRoot, "packages", "action", "action.yml"), "utf8");
 const PRIMARY = "AD403DAB5377F9FA0F7D775EC2844D3367B8A71B";
 const SUBKEY = "4DD48552DDEAF6D961769DD4A49827EC48984E2C";
+const RELEASE_SIGNING_PUBLIC_KEY = `-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEaowbyBYJKwYBBAHaRw8BAQdAY29ZomqF1Ca0db1zFK6QQSB5UR2wK+mh77cC
+6i+Zobu0V0pvZXlUZW5nLUNvZGV4IChGb3IgSm9leS1Ub29scy9jb2RleC1yZXZp
+ZXctZ2F0ZS1hY3Rpb24gcmVsZWFzZSBvbmx5KSA8Y29kZXhAbWFoYW5lLm1lPoiT
+BBMWCgA7FiEErUA9q1N3+foPfXdewoRNM2e4pxsFAmqMG8gCGwMFCwkIBwICIgIG
+FQoJCAsCBBYCAwECHgcCF4AACgkQwoRNM2e4pxtVLAD/UOjJDnO309VsRcwYlbi1
+pPP0P+NZkR3HmrLN1bXd3wwA/3vjaTbZtEQGFifJCMbUDDPczkfXWa48wEbzyjif
+3j8PtFVKb2V5VGVuZy1Db2RleCAoRm9yIEpvZXlUZW5nL2NvZGV4LXJldmlldy1n
+YXRlLWFjdGlvbiByZWxlYXNlIG9ubHkpIDxjb2RleEBtYWhhbmUubWU+iJYEExYK
+AD4CGwMFCwkIBwICIgIGFQoJCAsCBBYCAwECHgcCF4AWIQStQD2rU3f5+g99d17C
+hE0zZ7inGwUCaow2kwIZAQAKCRDChE0zZ7inGyvAAQDUmwztSXWn+ImXcOWmmjKK
+YY7zT3X6nbdLCeFPZO18nwD/ZTVvo5ge7Du/I2U6epsdq7DL0GsBfedO6l4pr8EC
+9QG4OARqjBvIEgorBgEEAZdVAQUBAQdAlnj5jeGelfwd8nowsU4u2mN0634NiYdg
+fvQVBu4mHHQDAQgHiHgEGBYKACAWIQStQD2rU3f5+g99d17ChE0zZ7inGwUCaowb
+yAIbDAAKCRDChE0zZ7inG3R1AQDqu+hYRTHAevMyZ/iooJiYvkLMEk4ceDp7kq8y
+oL/X6AEA5QgLb5O1yzywP2LZwr3h4EJ5JGomiqLg1i7pH/OIvwK4MwRqjCK+Fgkr
+BgEEAdpHDwEBB0B6uJCtDIMdB8Ts7f2b6ZQ3tGoDJ0BF1DqNL3nbhTm4Z4jvBBgW
+CgAgFiEErUA9q1N3+foPfXdewoRNM2e4pxsFAmqMIr4CGwIAgQkQwoRNM2e4pxt2
+IAQZFgoAHRYhBE3UhVLd6vbZYXad1KSYJ+xImE4sBQJqjCK+AAoJEKSYJ+xImE4s
+0e0A/1XDBldzpvb802mkYdXXzTdwUz8qLDuIYZFvzvLpLwo/AQCIY/AzytqOKItd
+CipWc2AK9P8q4CxCSQgoEWLsh3JACfTSAP92wbpsxFL6QR++Z4EI1t0kePBYE2Uz
+o9vhFyL26ME6bAEAi0DEqdr3gczrcwfU8JLBtGDNjLoX+yQjvBcZIJ6rgAs=
+=sJtz
+-----END PGP PUBLIC KEY BLOCK-----`;
 const RELEASE_WORKFLOW_REF =
   "Joey-Tools/codex-review-gate/.github/workflows/sync-action-subtree.yml@refs/heads/master";
 const SYNTHETIC_TOKEN_FIXTURE = Object.freeze({
@@ -443,6 +475,9 @@ function invokePublish(state, built, options = {}) {
     built.assembled,
     "--publication-plan-file",
     built.publicationPlan,
+    ...(options.enforceLiveSignerPolicy
+      ? ["--test-enforce-live-signer-policy"]
+      : []),
     ...(options.testRelease === false
       ? ["--test-skip-signatures"]
       : ["--test-release-dir", state.releases, "--test-skip-signatures"]),
@@ -599,6 +634,25 @@ function createReplacementAliasObject(state, alias) {
   return { commit, object };
 }
 
+function createDetachedAliasObject(state, alias, commit = state.initialTarget) {
+  const work = join(state.root, `detached-${alias}`);
+  run("git", ["clone", "-q", state.target, work]);
+  git(work, ["config", "user.name", "JoeyTeng-Codex"]);
+  git(work, ["config", "user.email", "codex@mahane.me"]);
+  execFileSync(
+    "git",
+    ["-C", work, "tag", "-a", alias, commit, "-m", `Codex Review Gate Action ${alias}`],
+    {
+      env: { ...executionEnv, GIT_COMMITTER_DATE: "2031-01-02T03:04:05Z" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const object = git(work, ["rev-parse", `refs/tags/${alias}`]);
+  assert.equal(git(work, ["rev-parse", `refs/tags/${alias}^{}`]), commit);
+  git(state.target, ["fetch", "-q", work, object]);
+  return { commit, object };
+}
+
 function fakeGithubEnvironment(state, mutationPhase) {
   const fakeBin = join(state.root, `fake-gh-${mutationPhase}`);
   const fakeGh = join(fakeBin, "gh");
@@ -607,28 +661,64 @@ function fakeGithubEnvironment(state, mutationPhase) {
   mkdirSync(join(fakeState, "assets"), { recursive: true });
   writeJson(join(fakeState, "state.json"), {
     exists: false,
+    release_id: 987654321,
     draft: true,
     immutable: false,
     prerelease: false,
     tag: "v2.0.0",
     name: "v2.0.0",
     body: "",
+    author_login: "codex-review-gate-action-publisher[bot]",
+    asset_uploader_login: "codex-review-gate-action-publisher[bot]",
     latest: null,
     next_asset_id: 1,
+    next_replacement_asset_id: 1000001,
+    asset_upload_calls: 0,
+    asset_upload_target_release_ids: [],
+    asset_readback_calls: 0,
+    asset_readback_ids: [],
+    asset_readback_release_ids: [],
+    asset_delete_attempts: 0,
+    asset_delete_applied: 0,
+    asset_delete_ids: [],
+    asset_download_count: 0,
+    asset_order_reversed: false,
+    asset_timestamp_variant: false,
+    observational_mutation_done: false,
+    starter_predelete_fence_armed: false,
+    replacement_release_assets: [],
+    tag_resolution_release_id: null,
     mutation_done: false,
+    metadata_mutation_done: false,
+    poisoned_after_pre_publish_boundary: false,
+    publish_patch_calls: 0,
+    publish_patch_payload: null,
+    patch_failures_before_apply: 0,
+    patch_failures_after_apply: 0,
+    release_edit_calls: 0,
     policy_mutation_done: false,
     immutable_policy_reads: 0,
     immutable_policy_enabled: mutationPhase !== "immutable-policy-disabled",
+    final_publication_policy_read_complete: false,
+    final_publication_boundary_reads: 0,
+    raw_boundary_mutation_done: false,
+    absent_boundary_api_reads: 0,
     release_api_reads: 0,
+    release_id_reads: 0,
+    release_inventory_reads: 0,
+    release_create_calls: 0,
+    post_create_inventory_reads: 0,
     release_download_reads: 0,
     release_view_reads: 0,
     ruleset_drift: false,
+    signer_policy_reads: 0,
+    call_trace: [],
     assets: [],
   });
   write(fakeGh, `#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 const args = process.argv.slice(2);
@@ -664,6 +754,15 @@ if (process.env.FAKE_EXPECT_PINNED_GITHUB_HOST === "true") {
 }
 const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
 const save = (state) => writeFileSync(statePath, JSON.stringify(state, null, 2) + "\\n");
+const appendTrace = (state, type, kind, details = {}) => {
+  state.call_trace.push({
+    sequence: state.call_trace.length + 1,
+    type,
+    kind,
+    ...details,
+  });
+  save(state);
+};
 const option = (name) => {
   const index = args.indexOf(name);
   return index === -1 ? null : args[index + 1];
@@ -672,47 +771,113 @@ const fail404 = () => {
   process.stderr.write("HTTP 404: Not Found\\n");
   process.exit(1);
 };
+const failReleaseViewNotFound = () => {
+  process.stderr.write("release not found\\n");
+  process.exit(1);
+};
 const digest = (bytes) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
-const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z") => {
-  const bytes = readFileSync(join(assetsDir, name));
+const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z", options = {}) => {
+  const assetPath = join(assetsDir, options.storage_name || name);
+  const bytes = existsSync(assetPath) ? readFileSync(assetPath) : Buffer.alloc(0);
+  const assetState = options.state || "uploaded";
   return {
     id,
     node_id: "asset-" + id,
     name,
-    state: "uploaded",
-    content_type: "application/octet-stream",
-    size: bytes.byteLength,
-    digest: digest(bytes),
+    state: assetState,
+    content_type: options.content_type || "application/octet-stream",
+    size: options.size ?? bytes.byteLength,
+    digest: options.digest !== undefined
+      ? options.digest
+      : assetState === "starter" ? null : digest(bytes),
+    download_count: state.asset_download_count,
     created_at: created,
-    updated_at: state.mutation_done && name === "release-provenance.json" ? "2026-08-26T00:00:01Z" : created,
+    updated_at: state.asset_timestamp_variant ||
+      (state.mutation_done && name === "release-provenance.json")
+      ? "2026-08-26T00:00:01Z"
+      : created,
     url: "https://api.invalid/assets/" + id,
     browser_download_url: "https://download.invalid/" + name,
     uploader: {
       id: 4700530,
       node_id: "publisher-app",
-      login: "codex-review-gate-action-publisher[bot]",
+      login: options.uploader_login || state.asset_uploader_login,
       type: "Bot",
     },
   };
 };
-const releaseApi = (state) => ({
-  id: 1,
-  node_id: "release-1",
+const releaseApi = (state, options = {}) => ({
+  id: options.id ?? state.release_id,
+  node_id: options.node_id || "release-1",
   tag_name: state.tag,
   name: state.name,
   body: state.body,
   target_commitish: "master",
   prerelease: state.prerelease,
-  draft: state.draft,
-  immutable: state.immutable,
+  draft: options.draft ?? state.draft,
+  immutable: options.immutable ?? state.immutable,
   author: {
     id: 4700530,
     node_id: "publisher-app",
-    login: "codex-review-gate-action-publisher[bot]",
+    login: state.author_login,
     type: "Bot",
   },
-  assets: state.assets.map((asset) => assetRecord(state, asset.name, asset.id)),
+  assets: (state.asset_order_reversed
+    ? [...(options.assets || state.assets)].reverse()
+    : (options.assets || state.assets))
+    .map((asset) => assetRecord(state, asset.name, asset.id, undefined, asset)),
 });
+const uploadReadbackStillPending = (state) =>
+  state.asset_readback_calls < state.asset_upload_calls;
+const tagResolvesToReplacement = (state) =>
+  state.tag_resolution_release_id !== null && uploadReadbackStillPending(state);
+const tagResolvedReleaseApi = (state) => tagResolvesToReplacement(state)
+  ? releaseApi(state, {
+      id: state.tag_resolution_release_id,
+      node_id: "replacement-release",
+      draft: false,
+      immutable: true,
+      assets: state.replacement_release_assets,
+    })
+  : releaseApi(state);
+const releaseViewProjection =
+  "{isDraft:.draft,isPrerelease:.prerelease,tagName:.tag_name,name:.name,body:.body}";
+const signingKeyInventory = ({ revoked = false, replaceCertificate = false } = {}) => [{
+  id: 5277815,
+  primary_key_id: null,
+  key_id: ${JSON.stringify(PRIMARY.slice(-16))},
+  raw_key: ${JSON.stringify(RELEASE_SIGNING_PUBLIC_KEY)} + (replaceCertificate ? "\\n" : ""),
+  revoked,
+  expires_at: null,
+  can_sign: true,
+  subkeys: [{
+    id: 5277817,
+    primary_key_id: 5277815,
+    key_id: ${JSON.stringify(SUBKEY.slice(-16))},
+    revoked: false,
+    expires_at: null,
+    can_sign: true,
+  }],
+}];
+const immutableReleasePolicy = (state) => {
+  if (phase === "immutable-policy-additive-fields") {
+    return {
+      enabled: state.immutable_policy_enabled,
+      enforced_by_owner: false,
+      future_policy_field: "ignored",
+    };
+  }
+  if (phase === "immutable-policy-missing-owner-field") {
+    return { enabled: state.immutable_policy_enabled };
+  }
+  if (phase === "immutable-policy-enabled-wrong-type") {
+    return { enabled: "true", enforced_by_owner: false };
+  }
+  if (phase === "immutable-policy-owner-wrong-type") {
+    return { enabled: state.immutable_policy_enabled, enforced_by_owner: "false" };
+  }
+  return { enabled: state.immutable_policy_enabled, enforced_by_owner: false };
+};
 const mutateProvenance = (state) => {
   if (state.mutation_done) return state;
   const name = "release-provenance.json";
@@ -725,8 +890,56 @@ const mutateProvenance = (state) => {
   return state;
 };
 
+const apiEndpoint = args.slice(1).find((arg) =>
+  arg.startsWith("repos/") || arg.startsWith("users/") ||
+  arg.startsWith("https://uploads.github.com/"));
+const requestedMethod = option("--method") || "GET";
+const classifyRemoteCall = () => {
+  if (args[0] === "api") {
+    if (requestedMethod === "POST" &&
+        apiEndpoint?.startsWith("https://uploads.github.com/")) {
+      return "release-asset-upload";
+    }
+    if (requestedMethod === "PATCH" && /\\/releases\\/\\d+$/u.test(apiEndpoint || "")) {
+      return "release-patch";
+    }
+    if (requestedMethod === "DELETE" &&
+        /\\/releases\\/assets\\/\\d+$/u.test(apiEndpoint || "")) {
+      return "release-asset-delete";
+    }
+    if (apiEndpoint?.endsWith("/immutable-releases")) return "immutable-policy-read";
+    if (apiEndpoint === "users/JoeyTeng-Codex/gpg_keys") return "signer-policy-read";
+    if (apiEndpoint?.endsWith("/rulesets")) return "ruleset-list-read";
+    if (/\\/rulesets\\/\\d+$/u.test(apiEndpoint || "")) return "ruleset-detail-read";
+    if (apiEndpoint?.endsWith("/releases?per_page=100")) return "release-list-read";
+    if (apiEndpoint?.endsWith("/releases/latest")) return "latest-release-read";
+    if (/\\/releases\\/assets\\/\\d+$/u.test(apiEndpoint || "")) {
+      return "release-asset-read";
+    }
+    if (/\\/releases\\/\\d+$/u.test(apiEndpoint || "")) return "release-id-read";
+    if (apiEndpoint?.includes("/releases/tags/") &&
+        option("--jq") === releaseViewProjection) return "release-view";
+    if (apiEndpoint?.includes("/releases/tags/")) return "release-tag-read";
+    if (apiEndpoint?.includes("/commits/") || apiEndpoint?.includes("/git/tags/")) {
+      return "signed-object-read";
+    }
+    return "other-api";
+  }
+  if (args[0] === "release" && args[1]) return "release-" + args[1];
+  return "other-gh";
+};
+const invocationState = readState();
+appendTrace(invocationState, "remote", classifyRemoteCall(), {
+  method: requestedMethod,
+  endpoint: apiEndpoint || null,
+  draft: invocationState.draft,
+  immutable: invocationState.immutable,
+  mutation_done: invocationState.mutation_done,
+  metadata_mutation_done: invocationState.metadata_mutation_done,
+});
+
 if (args[0] === "api") {
-  const endpoint = args.slice(1).find((arg) => arg.startsWith("repos/"));
+  const endpoint = apiEndpoint;
   const jq = option("--jq");
   let state = readState();
   const requireCurrentApiVersion = () => {
@@ -735,10 +948,138 @@ if (args[0] === "api") {
       process.exit(2);
     }
   };
+  const uploadUrl = endpoint?.startsWith("https://uploads.github.com/")
+    ? new URL(endpoint)
+    : null;
+  const uploadMatch = uploadUrl?.pathname.match(
+    /^\\/repos\\/JoeyTeng\\/codex-review-gate-action\\/releases\\/(\\d+)\\/assets$/u,
+  );
+  if (option("--method") === "POST" && uploadMatch) {
+    requireCurrentApiVersion();
+    if (!args.includes("Accept: application/vnd.github+json") ||
+        !args.includes("Content-Type: application/octet-stream")) {
+      process.stderr.write("asset upload is missing deterministic API headers\\n");
+      process.exit(2);
+    }
+    const targetReleaseId = Number(uploadMatch[1]);
+    const input = option("--input");
+    const names = uploadUrl.searchParams.getAll("name");
+    if (!Number.isSafeInteger(targetReleaseId) || targetReleaseId <= 0 ||
+        targetReleaseId !== state.release_id || names.length !== 1 || !names[0] ||
+        !input || input === "-") {
+      process.stderr.write("asset upload did not bind a valid frozen Release id, name, and input\\n");
+      process.exit(2);
+    }
+    if (phase === "asset-upload-failure-before-apply") {
+      process.stderr.write("simulated asset upload failure before apply\\n");
+      process.exit(1);
+    }
+    const name = names[0];
+    if (phase === "asset-upload-tag-resolution-replaced") {
+      if (state.tag_resolution_release_id === null) {
+        state.tag_resolution_release_id = state.release_id + 1000;
+      }
+      const replacementStorageName =
+        "replacement-" + state.tag_resolution_release_id + "-" + name;
+      writeFileSync(
+        join(assetsDir, replacementStorageName),
+        "replacement Release asset for " + name + "\\n",
+      );
+      state.replacement_release_assets.push({
+        name,
+        id: state.next_replacement_asset_id++,
+        release_id: state.tag_resolution_release_id,
+        storage_name: replacementStorageName,
+      });
+    }
+    if (phase === "asset-upload-502-starter" && state.asset_upload_calls === 0) {
+      writeFileSync(join(assetsDir, name), Buffer.alloc(0));
+      const id = state.next_asset_id++;
+      state.assets.push({ name, id, release_id: targetReleaseId, state: "starter", size: 0 });
+      state.asset_upload_calls += 1;
+      state.asset_upload_target_release_ids.push(targetReleaseId);
+      save(state);
+      process.stderr.write("simulated 502 after GitHub created a starter asset\\n");
+      process.exit(1);
+    }
+    copyFileSync(input, join(assetsDir, name));
+    const id = state.next_asset_id++;
+    state.assets.push({ name, id, release_id: targetReleaseId });
+    state.asset_upload_calls += 1;
+    state.asset_upload_target_release_ids.push(targetReleaseId);
+    save(state);
+    if (phase === "asset-upload-response-lost-after-apply") {
+      process.stderr.write("simulated asset upload response loss after apply\\n");
+      process.exit(1);
+    }
+    if (phase === "asset-upload-zero-exit-empty-response") process.exit(0);
+    if (phase === "asset-upload-zero-exit-malformed-response") {
+      process.stdout.write("{malformed-json\\n");
+      process.exit(0);
+    }
+    if (phase === "asset-upload-zero-exit-wrong-id-response") {
+      process.stdout.write(JSON.stringify({
+        ...assetRecord(state, name, id),
+        id: id + 1000,
+      }) + "\\n");
+      process.exit(0);
+    }
+    process.stdout.write(JSON.stringify(assetRecord(state, name, id)) + "\\n");
+    process.exit(0);
+  }
+  if (endpoint === "users/JoeyTeng-Codex/gpg_keys") {
+    state.signer_policy_reads += 1;
+    const criticalFence = state.publish_patch_calls === 0 && state.immutable_policy_reads === 2
+      ? "publication"
+      : state.publish_patch_calls === 1 && state.immutable_policy_reads === 2
+        ? "alias"
+        : null;
+    const trace = state.call_trace.at(-1);
+    trace.signer_policy_read = state.signer_policy_reads;
+    trace.critical_fence = criticalFence;
+    save(state);
+    const targetsCriticalFence = criticalFence !== null && phase.endsWith("-" + criticalFence);
+    if (targetsCriticalFence && phase.startsWith("live-signer-api-unreadable-")) {
+      process.stderr.write("simulated " + criticalFence + " signer inventory outage\\n");
+      process.exit(1);
+    }
+    process.stdout.write(JSON.stringify(signingKeyInventory({
+      revoked: targetsCriticalFence && phase.startsWith("live-signer-revoked-"),
+      replaceCertificate:
+        targetsCriticalFence && phase.startsWith("live-signer-cert-replacement-"),
+    })) + "\\n");
+    process.exit(0);
+  }
   if (endpoint?.endsWith("/immutable-releases")) {
     requireCurrentApiVersion();
     state.immutable_policy_reads += 1;
-    process.stdout.write(JSON.stringify({ enabled: state.immutable_policy_enabled }) + "\\n");
+    if ((phase === "starter-predelete-state-drift" ||
+        phase === "starter-predelete-unrelated-drift") &&
+        state.assets.some(({ state: assetState }) => assetState === "starter")) {
+      state.starter_predelete_fence_armed = true;
+    }
+    if (state.immutable_policy_reads === 2) {
+      state.final_publication_policy_read_complete = true;
+    }
+    if (phase === "immutable-policy-disabled-before-alias" &&
+        state.immutable_policy_reads === 3) {
+      state.immutable_policy_enabled = false;
+      state.policy_mutation_done = true;
+      appendTrace(state, "event", "alias-policy-window-mutation", {
+        phase,
+        immutable_policy_read: state.immutable_policy_reads,
+      });
+    }
+    if (!state.immutable_policy_enabled) {
+      save(state);
+      fail404();
+    }
+    if (phase === "immutable-policy-api-unreadable") {
+      save(state);
+      process.stderr.write("simulated immutable-release policy API outage\\n");
+      process.exit(1);
+    }
+    process.stdout.write(JSON.stringify(immutableReleasePolicy(state)) + "\\n");
     if (!state.policy_mutation_done && phase === "source-policy-drift") {
       execFileSync(process.env.REAL_GIT, [
         "-C",
@@ -765,9 +1106,136 @@ if (args[0] === "api") {
       ]);
       state.policy_mutation_done = true;
       save(state);
+    } else if (!state.policy_mutation_done &&
+        phase === "asset-drift-during-final-policy-read" &&
+        state.immutable_policy_reads === 2) {
+      state.poisoned_after_pre_publish_boundary = true;
+      state.policy_mutation_done = true;
+      appendTrace(state, "event", "policy-window-mutation", {
+        phase,
+        immutable_policy_read: state.immutable_policy_reads,
+      });
+      mutateProvenance(state);
+    } else if (!state.policy_mutation_done &&
+        phase === "metadata-drift-during-final-policy-read" &&
+        state.immutable_policy_reads === 2) {
+      state.body += "\\nreplaced-after-pre-publish-boundary";
+      state.metadata_mutation_done = true;
+      state.poisoned_after_pre_publish_boundary = true;
+      state.policy_mutation_done = true;
+      appendTrace(state, "event", "policy-window-mutation", {
+        phase,
+        immutable_policy_read: state.immutable_policy_reads,
+      });
+    } else if (!state.policy_mutation_done &&
+        phase === "stable-invalid-author-before-final-boundary" &&
+        state.immutable_policy_reads === 2) {
+      state.author_login = "unexpected-release-writer[bot]";
+      state.policy_mutation_done = true;
+      appendTrace(state, "event", "policy-window-mutation", {
+        phase,
+        immutable_policy_read: state.immutable_policy_reads,
+      });
+    } else if (!state.policy_mutation_done &&
+        phase === "stable-invalid-asset-before-final-boundary" &&
+        state.immutable_policy_reads === 2) {
+      state.asset_uploader_login = "unexpected-asset-writer[bot]";
+      state.policy_mutation_done = true;
+      appendTrace(state, "event", "policy-window-mutation", {
+        phase,
+        immutable_policy_read: state.immutable_policy_reads,
+      });
+    } else if (!state.policy_mutation_done &&
+        phase === "stable-invalid-tag-before-final-boundary" &&
+        state.immutable_policy_reads === 2) {
+      state.tag = "v2.0.0-unexpected";
+      state.policy_mutation_done = true;
+      appendTrace(state, "event", "policy-window-mutation", {
+        phase,
+        immutable_policy_read: state.immutable_policy_reads,
+      });
+    } else if (!state.policy_mutation_done &&
+        phase === "release-drift-during-alias-policy-read" &&
+        state.immutable_policy_reads === 3) {
+      state.policy_mutation_done = true;
+      appendTrace(state, "event", "alias-policy-window-mutation", {
+        phase,
+        immutable_policy_read: state.immutable_policy_reads,
+      });
+      mutateProvenance(state);
     } else {
       save(state);
     }
+    process.exit(0);
+  }
+  const releasePatchMatch = endpoint?.match(/\\/releases\\/(\\d+)$/u);
+  if (option("--method") === "PATCH" && releasePatchMatch) {
+    requireCurrentApiVersion();
+    if (Number(releasePatchMatch[1]) !== state.release_id) {
+      process.stderr.write("publish PATCH did not target the frozen numeric Release id\\n");
+      process.exit(2);
+    }
+    const input = option("--input");
+    if (!input || input === "-") {
+      process.stderr.write("publish PATCH must use a frozen JSON input file\\n");
+      process.exit(2);
+    }
+    let payload;
+    try {
+      payload = JSON.parse(readFileSync(input, "utf8"));
+    } catch (error) {
+      process.stderr.write("invalid publish PATCH JSON: " + error.message + "\\n");
+      process.exit(2);
+    }
+    const expectedPayload = {
+      body: state.body,
+      draft: false,
+      make_latest: state.prerelease ? "false" : "true",
+      name: state.tag,
+      prerelease: state.prerelease,
+      tag_name: state.tag,
+    };
+    if (JSON.stringify(payload) !== JSON.stringify(expectedPayload)) {
+      process.stderr.write(
+        "publish PATCH payload mismatch: " +
+          JSON.stringify({ expected: expectedPayload, actual: payload }) +
+          "\\n",
+      );
+      process.exit(2);
+    }
+    if (phase === "patch-failure-before-apply") {
+      state.patch_failures_before_apply += 1;
+      save(state);
+      process.stderr.write("simulated Release PATCH failure before apply\\n");
+      process.exit(1);
+    }
+    state.publish_patch_calls += 1;
+    state.publish_patch_payload = payload;
+    state.draft = false;
+    state.immutable = phase !== "post-publish-mutable";
+    state.latest = payload.make_latest === "true" ? state.tag : state.latest;
+    save(state);
+    if (phase === "patch-response-lost-after-apply") {
+      state.patch_failures_after_apply += 1;
+      save(state);
+      process.stderr.write("simulated Release PATCH response loss after apply\\n");
+      process.exit(1);
+    }
+    if (phase === "patch-zero-exit-empty-response") {
+      process.exit(0);
+    }
+    if (phase === "patch-zero-exit-malformed-response") {
+      process.stdout.write("{malformed-json\\n");
+      process.exit(0);
+    }
+    if (phase === "patch-zero-exit-wrong-id-response") {
+      process.stdout.write(JSON.stringify({
+        ...releaseApi(state),
+        id: state.release_id + 1,
+      }) + "\\n");
+      process.exit(0);
+    }
+    process.stdout.write(JSON.stringify(releaseApi(state)) + "\\n");
     process.exit(0);
   }
   if (endpoint?.endsWith("/rulesets")) {
@@ -794,16 +1262,227 @@ if (args[0] === "api") {
     process.exit(0);
   }
   if (endpoint?.endsWith("/releases?per_page=100")) {
-    process.stdout.write(JSON.stringify([state.exists ? [releaseApi(state)] : []]) + "\\n");
+    requireCurrentApiVersion();
+    state.release_inventory_reads += 1;
+    if (!state.exists && phase.startsWith("absent-boundary-") &&
+        process.env.FAKE_ABSENT_BOUNDARY_API_MARKER &&
+        state.immutable_policy_reads > 0) {
+      if (!existsSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER)) {
+        writeFileSync(process.env.FAKE_ABSENT_BOUNDARY_API_MARKER, "active\\n");
+      }
+      state.absent_boundary_api_reads += 1;
+      const apiRead = state.absent_boundary_api_reads;
+      save(state);
+      if ((phase === "absent-boundary-api-unreadable-first" && apiRead === 1) ||
+          (phase === "absent-boundary-api-unreadable-second" && apiRead === 2)) {
+        process.stderr.write("simulated absent Release inventory outage\\n");
+        process.exit(1);
+      }
+      if (phase === "absent-boundary-release-appears" && apiRead === 2) {
+        state.exists = true;
+        save(state);
+      }
+    }
+    if (["release-inventory-outer-empty", "verify-release-inventory-outer-empty"].includes(phase)) {
+      process.stdout.write("[]\\n");
+      process.exit(0);
+    }
+    if (["release-inventory-duplicate-id", "verify-release-inventory-duplicate-id"].includes(phase)) {
+      const repeated = releaseApi(state);
+      process.stdout.write(JSON.stringify([[repeated], [repeated]]) + "\\n");
+      process.exit(0);
+    }
+    if (phase === "release-inventory-duplicate-exact-tag") {
+      const first = releaseApi(state);
+      const second = { ...releaseApi(state), id: state.release_id + 1, node_id: "release-2" };
+      process.stdout.write(JSON.stringify([[first, second]]) + "\\n");
+      process.exit(0);
+    }
+    if (state.exists && state.release_create_calls > 0) {
+      state.post_create_inventory_reads += 1;
+      if (phase.startsWith("post-create-inventory-") &&
+          state.post_create_inventory_reads === 2) {
+        if (phase === "post-create-inventory-id-drift") {
+          state.release_id += 1;
+        } else if (phase === "post-create-inventory-release-disappears") {
+          state.exists = false;
+        }
+      }
+      save(state);
+    }
+    let pages;
+    if (phase === "release-inventory-target-second-page") {
+      pages = [[], state.exists ? [releaseApi(state)] : []];
+    } else if (phase === "release-inventory-ordering-drift" && state.exists) {
+      pages = state.release_inventory_reads % 2 === 0
+        ? [[], [releaseApi(state)]]
+        : [[releaseApi(state)], []];
+    } else {
+      pages = [state.exists ? [releaseApi(state)] : []];
+    }
+    save(state);
+    process.stdout.write(JSON.stringify(pages) + "\\n");
     process.exit(0);
   }
   if (endpoint.endsWith("/releases/latest")) {
     if (!state.latest) fail404();
     process.stdout.write(state.latest + "\\n");
+    if (["after-immutable", "stable-asset-replacement-before-final-boundary"].includes(phase) &&
+        state.immutable && !state.mutation_done) {
+      appendTrace(state, "event", "post-publish-boundary-mutation", { phase });
+      mutateProvenance(state);
+    }
+    process.exit(0);
+  }
+  const assetReadMatch = endpoint?.match(/\\/releases\\/assets\\/(\\d+)$/u);
+  if (assetReadMatch) {
+    requireCurrentApiVersion();
+    const assetId = Number(assetReadMatch[1]);
+    const assetIndex = state.assets.findIndex(({ id }) => id === assetId);
+    const asset = state.assets[assetIndex];
+    if (requestedMethod === "DELETE") {
+      if (!args.includes("Accept: application/vnd.github+json")) {
+        process.stderr.write("starter deletion is missing the JSON API Accept header\\n");
+        process.exit(2);
+      }
+      if (!Number.isSafeInteger(assetId) || assetId <= 0 || !asset) fail404();
+      if (asset.release_id !== state.release_id) fail404();
+      state.asset_delete_attempts += 1;
+      state.asset_delete_ids.push(assetId);
+      save(state);
+      // GitHub's asset DELETE endpoint is unconditional and has no state
+      // predicate. The production publisher, not this fake, must prove the
+      // zero-byte starter precondition before issuing the request.
+      if (phase === "starter-delete-failure-before-apply") {
+        process.stderr.write("simulated starter deletion failure before apply\\n");
+        process.exit(1);
+      }
+      state.assets.splice(assetIndex, 1);
+      const assetPath = join(assetsDir, asset.name);
+      if (existsSync(assetPath)) unlinkSync(assetPath);
+      state.asset_delete_applied += 1;
+      save(state);
+      if (phase === "starter-delete-response-lost-after-apply") {
+        process.stderr.write("simulated starter deletion response loss after apply\\n");
+        process.exit(1);
+      }
+      if (phase === "starter-delete-404-after-apply") fail404();
+      process.exit(0);
+    }
+    if (option("--method") !== null ||
+        !args.includes("Accept: application/octet-stream")) {
+      process.stderr.write("asset readback must use raw GET with deterministic headers\\n");
+      process.exit(2);
+    }
+    if (!Number.isSafeInteger(assetId) || assetId <= 0 || !asset) fail404();
+    if (asset.release_id !== state.release_id) fail404();
+    state.asset_readback_calls += 1;
+    state.asset_readback_ids.push(assetId);
+    state.asset_readback_release_ids.push(state.release_id);
+    save(state);
+    if (phase === "asset-readback-failure") {
+      process.stderr.write("simulated asset-ID readback failure\\n");
+      process.exit(1);
+    }
+    if (phase === "asset-readback-byte-mismatch") {
+      process.stdout.write(Buffer.concat([
+        readFileSync(join(assetsDir, asset.name)),
+        Buffer.from("mismatched-readback\\n"),
+      ]));
+      process.exit(0);
+    }
+    process.stdout.write(readFileSync(join(assetsDir, asset.name)));
+    process.exit(0);
+  }
+  const releaseIdMatch = endpoint?.match(/\\/releases\\/(\\d+)$/u);
+  if (releaseIdMatch) {
+    requireCurrentApiVersion();
+    if (!state.exists || Number(releaseIdMatch[1]) !== state.release_id) fail404();
+    state.release_id_reads += 1;
+    if (state.starter_predelete_fence_armed && !state.observational_mutation_done) {
+      if (phase === "starter-predelete-state-drift") {
+        const starter = state.assets.find(({ state: assetState }) => assetState === "starter");
+        if (starter) starter.state = "uploaded";
+      } else if (phase === "starter-predelete-unrelated-drift") {
+        state.body += "\\nchanged-before-starter-delete";
+      }
+      state.observational_mutation_done = true;
+    }
+    save(state);
+    if (phase === "release-id-boundary-404") fail404();
+    if (state.final_publication_policy_read_complete && state.draft) {
+      state.final_publication_boundary_reads += 1;
+      save(state);
+      if (phase === "pre-publication-boundary-unreadable" &&
+          state.final_publication_boundary_reads === 1) {
+        process.stderr.write("simulated final Release boundary outage\\n");
+        process.exit(1);
+      }
+    }
+    const response = releaseApi(state);
+    if (phase === "release-id-boundary-wrong-id") response.id = state.release_id + 1;
+    if (state.final_publication_policy_read_complete && state.draft &&
+        (phase === "pre-publication-stable-schema-invalid" ||
+          (phase === "pre-publication-valid-to-schema-invalid" &&
+            state.final_publication_boundary_reads === 2))) {
+      response.author.id = "not-a-number";
+      if (phase === "pre-publication-valid-to-schema-invalid") {
+        state.raw_boundary_mutation_done = true;
+        save(state);
+      }
+    }
+    process.stdout.write(JSON.stringify(response) + "\\n");
+    if (!state.observational_mutation_done && state.assets.length > 1 &&
+        phase === "release-boundary-download-count-drift") {
+      state.asset_download_count += 1;
+      state.observational_mutation_done = true;
+      save(state);
+    } else if (!state.observational_mutation_done && state.assets.length > 1 &&
+        phase === "release-boundary-asset-order-drift") {
+      state.asset_order_reversed = !state.asset_order_reversed;
+      state.observational_mutation_done = true;
+      save(state);
+    } else if (!state.observational_mutation_done && state.assets.length > 1 &&
+        phase === "release-boundary-timestamp-drift") {
+      state.asset_timestamp_variant = true;
+      state.observational_mutation_done = true;
+      save(state);
+    }
+    if (state.draft && state.final_publication_boundary_reads === 1) {
+      if (phase === "pre-publication-boundary-snapshot-changed") {
+        state.raw_boundary_mutation_done = true;
+        mutateProvenance(state);
+      } else if (phase === "pre-publication-second-raw-metadata-drift") {
+        state.body += "\\nchanged-between-raw-boundary-snapshots";
+        state.raw_boundary_mutation_done = true;
+        save(state);
+      } else if (phase === "pre-publication-second-raw-tag-drift") {
+        state.tag = "v2.0.0-changed-between-snapshots";
+        state.raw_boundary_mutation_done = true;
+        save(state);
+      }
+    }
     process.exit(0);
   }
   if (endpoint.includes("/releases/tags/")) {
-    if (!state.exists) fail404();
+    requireCurrentApiVersion();
+    const resolvedRelease = tagResolvedReleaseApi(state);
+    if (jq === releaseViewProjection) {
+      state.release_view_reads += 1;
+      const releaseViewNotFound =
+        phase === "verify-final-view-404" && state.release_view_reads === 2;
+      save(state);
+      if (!state.exists || resolvedRelease.draft || releaseViewNotFound) fail404();
+      process.stdout.write(JSON.stringify({
+        isDraft: resolvedRelease.draft,
+        isPrerelease: resolvedRelease.prerelease,
+        tagName: resolvedRelease.tag_name,
+        name: resolvedRelease.name,
+        body: resolvedRelease.body,
+      }) + "\\n");
+      process.exit(0);
+    }
+    if (!state.exists || resolvedRelease.draft) fail404();
     state.release_api_reads += 1;
     const releaseApi404 =
       (phase === "verify-initial-api-404" && state.release_api_reads === 1) ||
@@ -811,15 +1490,15 @@ if (args[0] === "api") {
     save(state);
     if (releaseApi404) fail404();
     if (jq === ".author.login") {
-      process.stdout.write("codex-review-gate-action-publisher[bot]\\n");
+      process.stdout.write(resolvedRelease.author.login + "\\n");
       process.exit(0);
     }
     if (jq === ".immutable") {
-      process.stdout.write(String(state.immutable) + "\\n");
+      process.stdout.write(String(resolvedRelease.immutable) + "\\n");
       if (phase === "after-immutable") mutateProvenance(state);
       process.exit(0);
     }
-    process.stdout.write(JSON.stringify(releaseApi(state)) + "\\n");
+    process.stdout.write(JSON.stringify(resolvedRelease) + "\\n");
     process.exit(0);
   }
   if (endpoint.includes("/commits/") || endpoint.includes("/git/tags/")) {
@@ -839,28 +1518,38 @@ if (args[0] === "api") {
 
 if (args[0] === "release" && args[1] === "view") {
   const state = readState();
-  if (!state.exists) fail404();
+  if (!state.exists) failReleaseViewNotFound();
+  const resolvedRelease = tagResolvedReleaseApi(state);
   state.release_view_reads += 1;
-  const releaseView404 = phase === "verify-final-view-404" && state.release_view_reads === 2;
+  const releaseViewNotFound = phase === "verify-final-view-404" && state.release_view_reads === 2;
   save(state);
-  if (releaseView404) fail404();
+  if (releaseViewNotFound) failReleaseViewNotFound();
   if (option("--jq") === ".assets[].name") {
-    process.stdout.write(state.assets.map((asset) => asset.name).sort().join("\\n") + (state.assets.length ? "\\n" : ""));
+    process.stdout.write(
+      resolvedRelease.assets.map((asset) => asset.name).sort().join("\\n") +
+        (resolvedRelease.assets.length ? "\\n" : ""),
+    );
     process.exit(0);
   }
   process.stdout.write(JSON.stringify({
-    isDraft: state.draft,
-    isPrerelease: state.prerelease,
-    tagName: state.tag,
-    name: state.name,
-    body: state.body,
-    assets: releaseApi(state).assets,
+    isDraft: resolvedRelease.draft,
+    isPrerelease: resolvedRelease.prerelease,
+    tagName: resolvedRelease.tag_name,
+    name: resolvedRelease.name,
+    body: resolvedRelease.body,
+    assets: resolvedRelease.assets,
   }) + "\\n");
   process.exit(0);
 }
 
 if (args[0] === "release" && args[1] === "create") {
   const state = readState();
+  state.release_create_calls += 1;
+  if (phase === "release-create-failure-before-apply") {
+    save(state);
+    process.stderr.write("simulated Release create failure before apply\\n");
+    process.exit(1);
+  }
   state.exists = true;
   state.draft = true;
   state.immutable = false;
@@ -869,17 +1558,16 @@ if (args[0] === "release" && args[1] === "create") {
   state.name = option("--title");
   state.body = option("--notes");
   save(state);
+  if (phase === "release-create-response-lost-after-apply") {
+    process.stderr.write("simulated Release create response loss after apply\\n");
+    process.exit(1);
+  }
   process.exit(0);
 }
 
 if (args[0] === "release" && args[1] === "upload") {
-  const state = readState();
-  const source = args[3];
-  const name = basename(source);
-  copyFileSync(source, join(assetsDir, name));
-  state.assets.push({ name, id: state.next_asset_id++ });
-  save(state);
-  process.exit(0);
+  process.stderr.write("publisher must not resolve asset uploads by mutable tag name\\n");
+  process.exit(2);
 }
 
 if (args[0] === "release" && args[1] === "download") {
@@ -890,19 +1578,28 @@ if (args[0] === "release" && args[1] === "download") {
   const pattern = option("--pattern");
   const destination = option("--dir");
   mkdirSync(destination, { recursive: true });
-  const selected = pattern === "*" ? state.assets : state.assets.filter((asset) => asset.name === pattern);
-  for (const asset of selected) copyFileSync(join(assetsDir, asset.name), join(destination, asset.name));
+  const tagSelectedAssets = state.tag_resolution_release_id !== null &&
+      uploadReadbackStillPending(state)
+    ? state.replacement_release_assets
+    : state.assets;
+  const selected = pattern === "*"
+    ? tagSelectedAssets
+    : tagSelectedAssets.filter((asset) => asset.name === pattern);
+  for (const asset of selected) {
+    copyFileSync(
+      join(assetsDir, asset.storage_name || asset.name),
+      join(destination, asset.name),
+    );
+  }
   process.exit(selected.length > 0 ? 0 : 1);
 }
 
 if (args[0] === "release" && args[1] === "edit") {
-  let state = readState();
-  if (phase === "before-immutable") state = mutateProvenance(state);
-  state.draft = false;
-  state.immutable = phase !== "post-publish-mutable";
-  state.latest = args.includes("--latest") ? state.tag : state.latest;
+  const state = readState();
+  state.release_edit_calls += 1;
   save(state);
-  process.exit(0);
+  process.stderr.write("publisher must not use gh release edit\\n");
+  process.exit(2);
 }
 
 process.stderr.write("unsupported fake gh call: " + args.join(" ") + "\\n");
@@ -972,6 +1669,185 @@ fi
     PATH: `${fakeBin}:${githubEnvironment.PATH}`,
     REAL_GIT: realGit,
     RULESET_DRIFT_MARKER: rulesetDriftMarker,
+  };
+}
+
+function aliasReadbackDriftEnvironment(
+  state,
+  githubEnvironment,
+  phase,
+  replacementAliasObject,
+) {
+  const fakeBin = join(state.root, `${phase}-bin`);
+  const fakeGit = join(fakeBin, "git");
+  const pushMarker = join(state.root, `${phase}-push.marker`);
+  const firstReadMarker = join(state.root, `${phase}-first-read.marker`);
+  const readCountFile = join(state.root, `${phase}-read-count`);
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -u
+alias_push=false
+alias_read=false
+for argument in "$@"; do
+  case "$argument" in
+    *:refs/tags/v2) alias_push=true ;;
+    refs/tags/v2|refs/tags/v2^\\{\\}) alias_read=true ;;
+  esac
+done
+
+if [ "$alias_read" = true ] && [ -e "$ALIAS_PUSH_MARKER" ]; then
+  read_count=0
+  if [ -f "$ALIAS_READ_COUNT_FILE" ]; then
+    read -r read_count < "$ALIAS_READ_COUNT_FILE"
+  fi
+  read_count=$((read_count + 1))
+  printf '%s\\n' "$read_count" > "$ALIAS_READ_COUNT_FILE"
+  case "$ALIAS_READBACK_PHASE" in
+    command-failure-first)
+      if [ "$read_count" -eq 1 ]; then exit 71; fi
+      ;;
+    command-failure-second)
+      if [ "$read_count" -eq 2 ]; then exit 72; fi
+      ;;
+    stable-malformed-two-line)
+      printf '%s\\t%s\\n%s\\t%s\\n' \\
+        "$REPLACEMENT_ALIAS_OBJECT" refs/tags/v2 \\
+        "$REPLACEMENT_ALIAS_COMMIT" refs/tags/v2-malformed
+      exit 0
+      ;;
+    valid-then-shape-drift)
+      if [ "$read_count" -eq 2 ]; then
+        "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+          refs/tags/v2 "$REPLACEMENT_ALIAS_COMMIT"
+      fi
+      ;;
+  esac
+fi
+
+status=0
+"$REAL_GIT" "$@" || status=$?
+if [ "$status" -eq 0 ] && [ "$alias_push" = true ]; then
+  : > "$ALIAS_PUSH_MARKER"
+  case "$ALIAS_READBACK_PHASE" in
+    stable-mismatch|stable-malformed-two-line)
+      "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+        refs/tags/v2 "$REPLACEMENT_ALIAS_OBJECT"
+      ;;
+    stable-lightweight)
+      "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+        refs/tags/v2 "$REPLACEMENT_ALIAS_COMMIT"
+      ;;
+  esac
+elif [ "$status" -eq 0 ] && [ "$alias_read" = true ] &&
+    [ -e "$ALIAS_PUSH_MARKER" ] && [ ! -e "$ALIAS_FIRST_READ_MARKER" ]; then
+  : > "$ALIAS_FIRST_READ_MARKER"
+  if [ "$ALIAS_READBACK_PHASE" = changed-between-reads ]; then
+    "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref refs/tags/v2 "$REPLACEMENT_ALIAS_OBJECT"
+  fi
+fi
+exit "$status"
+`);
+  chmodSync(fakeGit, 0o755);
+  return {
+    ...githubEnvironment,
+    ALIAS_FIRST_READ_MARKER: firstReadMarker,
+    ALIAS_PUSH_MARKER: pushMarker,
+    ALIAS_READBACK_PHASE: phase,
+    ALIAS_READ_COUNT_FILE: readCountFile,
+    MUTATION_TARGET: state.target,
+    PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+    REAL_GIT: run("which", ["git"]),
+    REPLACEMENT_ALIAS_COMMIT: git(
+      state.target,
+      ["rev-parse", `${replacementAliasObject}^{}`],
+    ),
+    REPLACEMENT_ALIAS_OBJECT: replacementAliasObject,
+  };
+}
+
+function absentBoundaryDriftEnvironment(
+  state,
+  githubEnvironment,
+  phase,
+  replacementTagObject,
+) {
+  const fakeBin = join(state.root, `${phase}-bin`);
+  const fakeGit = join(fakeBin, "git");
+  const apiMarker = join(state.root, `${phase}-api.marker`);
+  const tagReadCountFile = join(state.root, `${phase}-tag-read-count`);
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -u
+full_tag_read=false
+for argument in "$@"; do
+  case "$argument" in
+    refs/tags/v2.0.0|refs/tags/v2.0.0^\\{\\}) full_tag_read=true ;;
+  esac
+done
+
+tag_read=0
+if [ "$full_tag_read" = true ] && [ -e "$ABSENT_BOUNDARY_API_MARKER" ]; then
+  if [ -f "$ABSENT_TAG_READ_COUNT_FILE" ]; then
+    read -r tag_read < "$ABSENT_TAG_READ_COUNT_FILE"
+  fi
+  tag_read=$((tag_read + 1))
+  printf '%s\\n' "$tag_read" > "$ABSENT_TAG_READ_COUNT_FILE"
+  case "$ABSENT_BOUNDARY_PHASE" in
+    tag-unreadable-first)
+      if [ "$tag_read" -eq 1 ]; then exit 73; fi
+      ;;
+    tag-unreadable-second)
+      if [ "$tag_read" -eq 2 ]; then exit 74; fi
+      ;;
+    stable-mismatch)
+      if [ "$tag_read" -eq 1 ]; then
+        "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+          refs/tags/v2.0.0 "$REPLACEMENT_TAG_OBJECT"
+      fi
+      ;;
+    stable-lightweight)
+      if [ "$tag_read" -eq 1 ]; then
+        "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+          refs/tags/v2.0.0 "$REPLACEMENT_TAG_COMMIT"
+      fi
+      ;;
+  esac
+fi
+
+status=0
+"$REAL_GIT" "$@" || status=$?
+if [ "$status" -eq 0 ] && [ "$full_tag_read" = true ] &&
+    [ "$ABSENT_BOUNDARY_PHASE" = tag-drift ] && [ "$tag_read" -eq 1 ]; then
+  "$REAL_GIT" --git-dir="$MUTATION_TARGET" update-ref \\
+    refs/tags/v2.0.0 "$REPLACEMENT_TAG_OBJECT"
+fi
+exit "$status"
+`);
+  chmodSync(fakeGit, 0o755);
+  return {
+    ...githubEnvironment,
+    ABSENT_BOUNDARY_API_MARKER: apiMarker,
+    ABSENT_BOUNDARY_PHASE: phase,
+    ABSENT_TAG_READ_COUNT_FILE: tagReadCountFile,
+    FAKE_ABSENT_BOUNDARY_API_MARKER: apiMarker,
+    MUTATION_TARGET: state.target,
+    PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+    REAL_GIT: run("which", ["git"]),
+    REPLACEMENT_TAG_COMMIT: git(
+      state.target,
+      ["rev-parse", `${replacementTagObject}^{}`],
+    ),
+    REPLACEMENT_TAG_OBJECT: replacementTagObject,
+  };
+}
+
+function liveSignerPolicyEnvironment(state, githubEnvironment, label) {
+  const runnerTemp = join(state.root, `live-signer-${label}`);
+  mkdirSync(runnerTemp, { mode: 0o700 });
+  write(join(runnerTemp, "release-signing-public-key.asc"), RELEASE_SIGNING_PUBLIC_KEY);
+  return {
+    ...githubEnvironment,
+    RUNNER_TEMP: runnerTemp,
   };
 }
 
@@ -1127,7 +2003,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(publisher, /prewrite-target-audit[\s\S]*audit_release_inventory[\s\S]*audit_release_history[\s\S]*initial_remote_ref_fingerprint/u);
   assert.match(
     publisher,
-    /require_immutable_release_policy\(\)[\s\S]*X-GitHub-Api-Version: 2026-03-10[\s\S]*immutable-releases[\s\S]*keys == \["enabled"\][\s\S]*\.enabled == true/u,
+    /require_immutable_release_policy\(\)[\s\S]*X-GitHub-Api-Version: 2026-03-10[\s\S]*immutable-releases[\s\S]*\(\.enabled \| type == "boolean"\)[\s\S]*\.enabled == true[\s\S]*\(\.enforced_by_owner \| type == "boolean"\)/u,
   );
   assert.match(
     publisher,
@@ -1135,12 +2011,366 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.match(
     publisher,
-    /verify_final_policy_fence\(\)[\s\S]*preflight_live_source[\s\S]*verify_ruleset_policy_snapshot/u,
+    /verify_live_release_signer_policy\(\)[\s\S]*is_test_environment && \[\[ "\$enforce_live_signer_policy_in_test" != true \]\][\s\S]*publisher_gh api users\/JoeyTeng-Codex\/gpg_keys[\s\S]*verify-github-signing-key[\s\S]*cmp -s -- "\$approved_public_key" "\$live_public_key"/u,
   );
   assert.match(
     publisher,
-    /require_immutable_release_policy release-publication[\s\S]*verify_final_policy_fence before-release-publication[\s\S]*release edit[\s\S]*draft=false[\s\S]*\.draft == false and \.immutable == true/u,
+    /--test-enforce-live-signer-policy\)[\s\S]*require_test_environment[\s\S]*enforce_live_signer_policy_in_test=true[\s\S]*"\$mode" == "publish"[\s\S]*-z "\$test_release_dir"/u,
   );
+  assert.match(
+    publisher,
+    /verify_final_policy_fence\(\)[\s\S]*preflight_live_source[\s\S]*verify_ruleset_policy_snapshot "\$label"[\s\S]*verify_live_release_signer_policy "\$label"/u,
+  );
+  const remoteTagReadStart = publisher.indexOf("  read_remote_full_tag_snapshot() {");
+  const remoteTagReadEnd = publisher.indexOf(
+    "\n  validate_remote_full_tag_snapshot() {",
+    remoteTagReadStart,
+  );
+  assert.notEqual(remoteTagReadStart, -1, "missing remote full-tag snapshot reader");
+  assert.notEqual(remoteTagReadEnd, -1, "missing remote full-tag snapshot reader end");
+  const remoteTagRead = publisher.slice(remoteTagReadStart, remoteTagReadEnd);
+  const tagLsRemote = remoteTagRead.indexOf("target_git ls-remote");
+  const tagPostprocessGuard = remoteTagRead.indexOf("if ! printf '%s\\n'", tagLsRemote);
+  const tagStripBlank = remoteTagRead.indexOf("| sed '/^$/d'", tagPostprocessGuard);
+  const tagSort = remoteTagRead.indexOf("| LC_ALL=C sort", tagStripBlank);
+  const tagPostprocessGuardEnd = remoteTagRead.indexOf("; then", tagSort);
+  const tagUnreadable = remoteTagRead.indexOf(
+    'return "$RELEASE_BOUNDARY_REMOTE_UNREADABLE"',
+    tagPostprocessGuardEnd,
+  );
+  assert.ok(
+    tagLsRemote !== -1 &&
+      tagLsRemote < tagPostprocessGuard &&
+      tagPostprocessGuard < tagStripBlank &&
+      tagStripBlank < tagSort &&
+      tagSort < tagPostprocessGuardEnd &&
+      tagPostprocessGuardEnd < tagUnreadable,
+    "tag-snapshot post-processing failures must map to the unreadable boundary status",
+  );
+  assert.match(
+    publisher,
+    /fail_release_boundary_capture\(\)[\s\S]*RELEASE_BOUNDARY_REMOTE_UNREADABLE[\s\S]*fail_reconcile inconclusive remote-read-inconclusive/u,
+  );
+  const boundaryCaptureStart = publisher.indexOf("  capture_release_boundary() {");
+  const boundaryCaptureEnd = publisher.indexOf(
+    "\n  fail_release_boundary_capture() {",
+    boundaryCaptureStart,
+  );
+  assert.notEqual(boundaryCaptureStart, -1, "missing Release boundary capture helper");
+  assert.notEqual(boundaryCaptureEnd, -1, "missing Release boundary capture helper end");
+  const boundaryCapture = publisher.slice(boundaryCaptureStart, boundaryCaptureEnd);
+  const firstRawRelease = boundaryCapture.indexOf("> \"$first_api\"");
+  const firstRawTag = boundaryCapture.indexOf("read_remote_full_tag_snapshot", firstRawRelease);
+  const secondRawRelease = boundaryCapture.indexOf("> \"$second_api\"");
+  const secondRawTag = boundaryCapture.indexOf("read_remote_full_tag_snapshot", secondRawRelease);
+  const firstCanonicalRelease = boundaryCapture.indexOf(
+    'first_raw="$(snapshot_neutral_release_api',
+  );
+  const secondCanonicalRelease = boundaryCapture.indexOf(
+    'second_raw="$(snapshot_neutral_release_api',
+  );
+  const rawStability = boundaryCapture.indexOf(
+    '[[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]]',
+  );
+  const releasePolicyValidation = boundaryCapture.indexOf("snapshot-release-boundary");
+  const tagPolicyValidation = boundaryCapture.indexOf("validate_remote_full_tag_snapshot");
+  assert.ok(
+    firstRawRelease !== -1 &&
+      firstRawRelease < firstRawTag &&
+      firstRawTag < secondRawRelease &&
+      secondRawRelease < secondRawTag &&
+      secondRawTag < firstCanonicalRelease &&
+      firstCanonicalRelease < secondCanonicalRelease &&
+      secondCanonicalRelease < rawStability &&
+      rawStability < releasePolicyValidation &&
+      releasePolicyValidation < tagPolicyValidation,
+    "both complete Release/tag snapshots must be neutralized and compared before policy validation",
+  );
+  const absentBoundaryStart = publisher.indexOf("  capture_inventory_release_boundary() {");
+  const absentBoundaryEnd = publisher.indexOf("\n  read_latest_release_tag() {", absentBoundaryStart);
+  assert.notEqual(absentBoundaryStart, -1, "missing absent Release boundary helper");
+  assert.notEqual(absentBoundaryEnd, -1, "missing absent Release boundary helper end");
+  const absentBoundary = publisher.slice(absentBoundaryStart, absentBoundaryEnd);
+  const firstPresence = absentBoundary.indexOf(
+    'fetch_complete_release_inventory "$first_api" "$first_error"',
+  );
+  const firstAbsentTag = absentBoundary.indexOf(
+    'first_tag_raw="$(read_remote_full_tag_snapshot)',
+  );
+  const secondPresence = absentBoundary.indexOf(
+    'fetch_complete_release_inventory "$second_api" "$second_error"',
+  );
+  const secondAbsentTag = absentBoundary.indexOf(
+    'second_tag_raw="$(read_remote_full_tag_snapshot)',
+  );
+  const absentRawStability = absentBoundary.indexOf(
+    '[[ "$first_raw" == "$second_raw" && "$first_tag_raw" == "$second_tag_raw" ]]',
+  );
+  const stableAbsencePolicy = absentBoundary.indexOf(
+    '[[ "$exact_state" == "absent" ]]',
+  );
+  const absentTagPolicy = absentBoundary.indexOf(
+    'validate_remote_full_tag_snapshot "$second_tag_raw"',
+  );
+  assert.ok(
+    firstPresence !== -1 &&
+      firstPresence < firstAbsentTag &&
+      firstAbsentTag < secondPresence &&
+      secondPresence < secondAbsentTag &&
+      secondAbsentTag < absentRawStability &&
+      absentRawStability < absentTagPolicy &&
+      absentTagPolicy < stableAbsencePolicy,
+    "complete inventory and full-tag raw A/B reads must finish before exact-tag absence validation",
+  );
+  assert.match(
+    boundaryCapture,
+    /repos\/\$TARGET_REPOSITORY\/releases\/\$frozen_release_id[\s\S]*\.id == \$release_id/u,
+    "all post-discovery Release boundaries must read and validate the frozen numeric id",
+  );
+  assert.doesNotMatch(
+    publisher.slice(publisher.indexOf("reconcile_github_release() {")),
+    /publisher_gh release upload/u,
+    "asset upload must not re-resolve a mutable tag name",
+  );
+  assert.match(
+    publisher.slice(publisher.indexOf("reconcile_github_release() {")),
+    /https:\/\/uploads\.github\.com\/repos\/\$TARGET_REPOSITORY\/releases\/\$frozen_release_id\/assets\?name=\$encoded_name[\s\S]*--method POST[\s\S]*Content-Type: application\/octet-stream[\s\S]*--input "\$asset"/u,
+    "asset upload must bind the frozen numeric Release id and raw asset input",
+  );
+  assert.match(
+    publisher.slice(publisher.indexOf("reconcile_github_release() {")),
+    /\.name == \$name and \.state == "uploaded"[\s\S]*9007199254740991/u,
+    "asset upload must validate the returned asset identity and state",
+  );
+  assert.match(
+    publisher,
+    /read_public_release_view\(\)[\s\S]*X-GitHub-Api-Version: 2026-03-10[\s\S]*releases\/tags\/\$tag/u,
+    "published public verification must pin the GitHub REST API version",
+  );
+  const githubReconcileStart = publisher.indexOf("reconcile_github_release() {");
+  const githubReconcileEnd = publisher.indexOf(
+    '\n}\n\nif [[ -n "$test_release_dir" ]]',
+    githubReconcileStart,
+  );
+  assert.notEqual(githubReconcileStart, -1, "missing GitHub Release reconcile helper");
+  assert.notEqual(githubReconcileEnd, -1, "missing GitHub Release reconcile helper end");
+  const githubReconcile = publisher.slice(githubReconcileStart, githubReconcileEnd);
+  const missingAssetUploadStart = githubReconcile.indexOf(
+    'if [[ "${#missing_assets[@]}" -gt 0 ]]; then',
+  );
+  const missingAssetUploadEnd = githubReconcile.indexOf(
+    '  asset_names="$(printf',
+    missingAssetUploadStart,
+  );
+  const missingAssetUpload = githubReconcile.slice(
+    missingAssetUploadStart,
+    missingAssetUploadEnd,
+  );
+  assert.doesNotMatch(
+    missingAssetUpload,
+    /publisher_gh release download/u,
+    "post-upload readback must not resolve a Release by tag",
+  );
+  assert.match(
+    missingAssetUpload,
+    /capture_release_boundary "after-upload-\$name"[\s\S]*Accept: application\/octet-stream[\s\S]*releases\/assets\/\$uploaded_asset_id[\s\S]*cmp -- "\$asset" "\$asset_readback"/u,
+    "post-upload readback must validate the frozen by-ID boundary before raw asset-ID bytes",
+  );
+  assert.doesNotMatch(
+    githubReconcile,
+    /publisher_gh release view[\s\S]*HTTP\[\[:space:\]\]404/u,
+    "fresh Release absence must be established through the API boundary, not porcelain stderr",
+  );
+  const publicationStart = publisher.indexOf(
+    'if [[ "$current_draft" == "true" ]]; then\n    require_publication_mutation release-completion',
+  );
+  const publicationEnd = publisher.indexOf("  post_publish_release_api=", publicationStart);
+  assert.notEqual(publicationStart, -1, "missing draft publication branch");
+  assert.notEqual(publicationEnd, -1, "missing post-publication readback");
+  const publication = publisher.slice(publicationStart, publicationEnd);
+  const mutationFence = publication.indexOf("require_publication_mutation release-completion");
+  const immutablePolicy = publication.indexOf("require_immutable_release_policy release-publication");
+  const finalPolicy = publication.indexOf("verify_final_policy_fence before-release-publication");
+  const finalBoundary = publication.indexOf(
+    "capture_release_boundary pre-publication-mutation true false",
+  );
+  const finalBoundaryGuard = publication.indexOf(
+    '[[ "$before_boundary" == "$current_boundary" ]] || {',
+    finalBoundary,
+  );
+  const finalBoundaryEndMarker = "\n    }\n    release_id=";
+  const finalBoundaryEnd = publication.indexOf(finalBoundaryEndMarker, finalBoundaryGuard);
+  const frozenReleaseId = publication.indexOf("release_id=", finalBoundary);
+  const payload = publication.indexOf("publication_payload=", frozenReleaseId);
+  const directPatch = publication.indexOf("publisher_gh api", payload);
+  assert.ok(
+    mutationFence < immutablePolicy &&
+      immutablePolicy < finalPolicy &&
+      finalPolicy < finalBoundary &&
+      finalBoundary < finalBoundaryGuard &&
+      finalBoundaryGuard < finalBoundaryEnd &&
+      finalBoundaryEnd < frozenReleaseId &&
+      frozenReleaseId < payload &&
+      payload < directPatch,
+    "all live policy reads must finish before the final exact boundary and direct PATCH",
+  );
+  assert.match(
+    publication,
+    /\.release\.id \| select\(type == "number" and floor == \. and \. > 0\)[\s\S]*jq -cS -n[\s\S]*\{tag_name:\$tag_name,name:\$name,body:\$body,draft:false,prerelease:\$prerelease,make_latest:\$make_latest\}[\s\S]*publisher_gh api[\s\\]*--method PATCH[\s\\]*--header 'X-GitHub-Api-Version: 2026-03-10'[\s\\]*"repos\/\$TARGET_REPOSITORY\/releases\/\$release_id"[\s\\]*--input "\$publication_payload"/u,
+  );
+  const localOnlyAfterFinalBoundary = publication.slice(
+    finalBoundaryEnd + "\n    }\n".length,
+    directPatch,
+  );
+  const shellFunctions = [...publisher.matchAll(
+    /^[ \t]*([A-Za-z_][A-Za-z0-9_]*)\(\)[ \t]+\{/gmu,
+  )]
+    .map((match) => match[1])
+    .filter((name) => name !== "fail_reconcile");
+  for (const requiredFunction of [
+    "publisher_gh",
+    "capture_release_boundary",
+    "read_remote_full_tag_snapshot",
+  ]) {
+    assert.ok(
+      shellFunctions.includes(requiredFunction),
+      `the no-remote-after-final-fence check must include ${requiredFunction}`,
+    );
+  }
+  for (const remoteCapableWrapper of shellFunctions) {
+    assert.doesNotMatch(
+      localOnlyAfterFinalBoundary,
+      new RegExp(`\\b${remoteCapableWrapper}\\b`, "u"),
+      `${remoteCapableWrapper} must not run after the final boundary and before PATCH`,
+    );
+  }
+  const networkCommands = ["gh", "curl", "wget", "ssh", "scp", "rsync", "nc"];
+  for (const networkCommand of networkCommands) {
+    assert.doesNotMatch(
+      localOnlyAfterFinalBoundary,
+      new RegExp(`(?:^|[;&|()\\s])(?:command\\s+)?${networkCommand}(?:\\s|$)`, "u"),
+      `${networkCommand} must not run after the final boundary and before PATCH`,
+    );
+  }
+  assert.doesNotMatch(publisher, /\brelease edit\b/u);
+  assert.match(publisher.slice(publicationEnd), /\.draft == false and \.immutable == true/u);
+  const aliasMutationStart = publisher.indexOf("    require_publication_mutation alias\n");
+  const aliasImmutablePolicy = publisher.indexOf(
+    "    require_immutable_release_policy alias-mutation\n",
+    aliasMutationStart,
+  );
+  const aliasFinalBoundary = publisher.indexOf(
+    "capture_release_boundary pre-alias-mutation false true",
+    aliasImmutablePolicy,
+  );
+  const aliasBoundaryComparison = publisher.indexOf(
+    '[[ "$pre_alias_boundary" == "$final_confirm_boundary" ]] || {',
+    aliasFinalBoundary,
+  );
+  const aliasBoundaryEndMarker = '\n    fi\n    if [[ "$alias_mode" == "force-with-lease" ]]';
+  const aliasBoundaryEnd = publisher.indexOf(aliasBoundaryEndMarker, aliasBoundaryComparison);
+  const aliasPush = publisher.indexOf("      target_git_push", aliasBoundaryEnd);
+  assert.ok(
+    aliasMutationStart !== -1 &&
+      aliasMutationStart < aliasImmutablePolicy &&
+      aliasImmutablePolicy < aliasFinalBoundary &&
+      aliasFinalBoundary < aliasBoundaryComparison &&
+      aliasBoundaryComparison < aliasBoundaryEnd &&
+      aliasBoundaryEnd < aliasPush,
+    "alias source/ruleset/signer and immutable-policy reads must precede the final Release boundary and push",
+  );
+  const localOnlyAfterAliasBoundary = publisher.slice(
+    aliasBoundaryEnd + "\n    fi\n".length,
+    aliasPush,
+  );
+  for (const remoteCapableWrapper of shellFunctions) {
+    assert.doesNotMatch(
+      localOnlyAfterAliasBoundary,
+      new RegExp(`\\b${remoteCapableWrapper}\\b`, "u"),
+      `${remoteCapableWrapper} must not run after the final alias boundary and before push`,
+    );
+  }
+  for (const networkCommand of networkCommands) {
+    assert.doesNotMatch(
+      localOnlyAfterAliasBoundary,
+      new RegExp(`(?:^|[;&|()\\s])(?:command\\s+)?${networkCommand}(?:\\s|$)`, "u"),
+      `${networkCommand} must not run after the final alias boundary and before push`,
+    );
+  }
+  const assertStableBoundaryMismatchBlocked = (startNeedle, endNeedle, label) => {
+    const start = publisher.indexOf(startNeedle);
+    const end = publisher.indexOf(endNeedle, start + startNeedle.length);
+    assert.notEqual(start, -1, `missing ${label} boundary`);
+    assert.notEqual(end, -1, `missing ${label} boundary end`);
+    const mismatchPath = publisher.slice(start, end);
+    assert.match(
+      mismatchPath,
+      /fail_reconcile blocked_conflict immutable-release-mismatch/u,
+      `${label} stable frozen-boundary mismatch must block`,
+    );
+    assert.doesNotMatch(
+      mismatchPath,
+      /fail_reconcile inconclusive remote-state-changed/u,
+      `${label} stable frozen-boundary mismatch must not be classified as torn reads`,
+    );
+  };
+  assertStableBoundaryMismatchBlocked(
+    'published_boundary="$(capture_release_boundary post-publish false true)"',
+    'current_boundary="$published_boundary"',
+    "published",
+  );
+  assertStableBoundaryMismatchBlocked(
+    'final_boundary="$(capture_release_boundary final-immutable false true)"',
+    'final_release_api="$temporary_root/current-release-final-immutable.json"',
+    "final immutable",
+  );
+  assertStableBoundaryMismatchBlocked(
+    'final_confirm_boundary="$(capture_release_boundary final-confirm false true)"',
+    '\n}\n\nif [[ -n "$test_release_dir" ]]',
+    "final confirmation",
+  );
+  assertStableBoundaryMismatchBlocked(
+    'pre_alias_boundary="$(capture_release_boundary pre-alias-mutation false true)"',
+    '\n    fi\n    if [[ "$alias_mode"',
+    "pre-alias",
+  );
+  assertStableBoundaryMismatchBlocked(
+    'post_alias_boundary="$(capture_release_boundary post-alias false true)"',
+    '\n  fi\n  if ! is_test_environment',
+    "post-alias",
+  );
+  const aliasReadbackStart = publisher.indexOf(
+    'alias_raw_after_a="$(read_remote_alias_snapshot)"',
+  );
+  const aliasReadbackEnd = publisher.indexOf(
+    'remote_alias_object="$planned_alias_object"',
+    aliasReadbackStart,
+  );
+  assert.notEqual(aliasReadbackStart, -1, "missing alias raw readback A");
+  assert.notEqual(aliasReadbackEnd, -1, "missing alias readback classification end");
+  const aliasReadback = publisher.slice(aliasReadbackStart, aliasReadbackEnd);
+  assert.match(
+    aliasReadback,
+    /alias_raw_after_b[\s\S]*"\$alias_raw_after_a" == "\$alias_raw_after_b"[\s\S]*fail_reconcile inconclusive remote-state-changed/u,
+  );
+  assert.match(
+    aliasReadback,
+    /validate_remote_alias_snapshot "\$alias_raw_after_b"[\s\S]*fail_reconcile blocked_conflict malformed-major-alias-target[\s\S]*"\$alias_boundary_after" == "\$planned_alias_object"[\s\S]*fail_reconcile blocked_conflict malformed-major-alias-target/u,
+  );
+  assert.match(
+    publisher,
+    /read_remote_alias_snapshot\(\)[\s\S]*target_git ls-remote[\s\S]*return "\$RELEASE_BOUNDARY_REMOTE_UNREADABLE"[\s\S]*validate_remote_alias_snapshot\(\)/u,
+  );
+  const aliasValidatorStart = publisher.indexOf("  validate_remote_alias_snapshot() {");
+  const aliasValidatorEnd = publisher.indexOf(
+    '\n  if [[ "$alias_needs_push" == true ]]',
+    aliasValidatorStart,
+  );
+  assert.notEqual(aliasValidatorStart, -1, "missing alias snapshot validator");
+  assert.notEqual(aliasValidatorEnd, -1, "missing alias snapshot validator end");
+  const aliasValidator = publisher.slice(aliasValidatorStart, aliasValidatorEnd);
+  assert.match(aliasValidator, /"\$object" =~ \^\[0-9a-f\]\{40\}\$/u);
+  assert.match(aliasValidator, /"\$count" == "2" && -n "\$direct" && -n "\$peeled"/u);
   assert.ok(
     publisher.indexOf('[[ "$prewrite_ref_fingerprint_cloned" == "$initial_remote_ref_fingerprint" ]]') <
       publisher.indexOf('audit_release_inventory "$initial_release_inventory_fingerprint"'),
@@ -1152,13 +2382,17 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     publisher,
     /direct_annotated_tag_commit\(\)[\s\S]*cat-file tag "\$object"[\s\S]*direct_type[\s\S]*cat-file -t "\$direct_object"[\s\S]*== "commit"/u,
   );
-  assert.match(
-    publisher,
-    /final_github_keys=.*final-prewrite[\s\S]*publisher_gh api users\/JoeyTeng-Codex\/gpg_keys[\s\S]*verify-github-signing-key[\s\S]*cmp -- "\$RUNNER_TEMP\/release-signing-public-key\.asc" "\$final_public_key"[\s\S]*target_git_push/u,
+  const finalPrewriteSigner = publisher.indexOf(
+    "verify_live_release_signer_policy final-prewrite",
+  );
+  assert.ok(
+    finalPrewriteSigner !== -1 &&
+      finalPrewriteSigner < publisher.indexOf("target_git_push ", finalPrewriteSigner),
+    "the live signer policy must be revalidated before the first target write",
   );
   assert.match(
     publisher,
-    /capture_absent_release_boundary[\s\S]*pre-create[\s\S]*post-create[\s\S]*before-upload-[\s\S]*after-upload-[\s\S]*pre-publish[\s\S]*post-publish[\s\S]*pre-alias[\s\S]*post-alias/u,
+    /capture_inventory_release_boundary[\s\S]*pre-create absent[\s\S]*post-create any[\s\S]*before-upload-[\s\S]*after-upload-[\s\S]*pre-publication-mutation[\s\S]*post-publish[\s\S]*pre-alias-mutation[\s\S]*post-alias/u,
   );
   assert.match(workflow, /outputs:[\s\S]*reconcile_state: \$\{\{ steps\.reconcile\.outputs\.reconcile_state \}\}[\s\S]*id: reconcile/u);
   assert.match(workflow, /verify:[\s\S]*if: \$\{\{ needs\.publish\.outputs\.reconcile_state != 'superseded' \}\}/u);
@@ -1921,11 +3155,11 @@ test("public verification treats confirmed Release disappearance as a determinis
   });
   writeJson(fakeStatePath, publishedState);
 
-  for (const phase of [
-    "verify-initial-api-404",
-    "verify-download-404",
-    "verify-final-view-404",
-    "verify-final-api-404",
+  for (const verificationFailure of [
+    { phase: "verify-initial-api-404", expectedApiReads: 1, expectedViewReads: 0 },
+    { phase: "verify-download-404", expectedApiReads: 1, expectedViewReads: 1 },
+    { phase: "verify-final-view-404", expectedApiReads: 1, expectedViewReads: 2 },
+    { phase: "verify-final-api-404", expectedApiReads: 2, expectedViewReads: 2 },
   ]) {
     const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
     fakeState.release_api_reads = 0;
@@ -1935,12 +3169,69 @@ test("public verification treats confirmed Release disappearance as a determinis
 
     const result = invokeVerifyPublished(state, built, {
       testRelease: false,
-      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: verificationFailure.phase },
     });
-    assert.notEqual(result.status, 0, `${phase} must fail closed`);
+    assert.notEqual(result.status, 0, `${verificationFailure.phase} must fail closed`);
     assert.match(result.stderr, /verification_state=blocked_conflict/u);
     assert.match(result.stderr, /recovery_code=published-state-mismatch/u);
     assert.match(result.stderr, /next_action=investigate-published-state/u);
+    const observedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+    assert.equal(
+      observedState.release_api_reads,
+      verificationFailure.expectedApiReads,
+      `${verificationFailure.phase} raw API read count`,
+    );
+    assert.equal(
+      observedState.release_view_reads,
+      verificationFailure.expectedViewReads,
+      `${verificationFailure.phase} projected API read count`,
+    );
+  }
+});
+
+test("public verification rejects structurally inconclusive complete Release inventories", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "verify-release-inventory-shape" });
+  publishCandidate(state, built);
+  const githubEnvironment = fakeGithubEnvironment(state, "verify-release-inventory-shape");
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-verify-release-inventory-shape",
+    "state.json",
+  );
+  const fakeAssets = join(dirname(fakeStatePath), "assets");
+  const assetNames = releaseAssets(state, "v2.0.0").filter((name) =>
+    !["immutable", "prerelease", "published"].includes(name));
+  for (const name of assetNames) {
+    copyFileSync(join(state.releases, "v2.0.0", name), join(fakeAssets, name));
+  }
+  const publishedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  Object.assign(publishedState, {
+    assets: assetNames.map((name, index) => ({ name, id: index + 1 })),
+    body: `Signed release of Joey-Tools/codex-review-gate@${built.sourceCommit}.`,
+    draft: false,
+    exists: true,
+    immutable: true,
+    latest: "v2.0.0",
+    name: "v2.0.0",
+    next_asset_id: assetNames.length + 1,
+    prerelease: false,
+    tag: "v2.0.0",
+  });
+  writeJson(fakeStatePath, publishedState);
+
+  for (const phase of [
+    "verify-release-inventory-outer-empty",
+    "verify-release-inventory-duplicate-id",
+  ]) {
+    const result = invokeVerifyPublished(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+    });
+    assert.notEqual(result.status, 0, `${phase} must fail closed`);
+    assert.match(result.stderr, /verification_state=inconclusive/u);
+    assert.match(result.stderr, /recovery_code=remote-read-inconclusive/u);
+    assert.match(result.stderr, /next_action=retry-public-verification/u);
   }
 });
 
@@ -2273,26 +3564,1184 @@ exec "$REAL_GIT" "$@"
   assert.equal(existsSync(join(state.releases, "v2.0.0")), false);
 });
 
-test("disabled immutable-release policy blocks the first durable mutation", (t) => {
+test("fake GitHub distinguishes API and release-view missing diagnostics", (t) => {
   const state = fixture(t);
-  const built = buildAssembledCandidate(state, { label: "immutable-policy-disabled" });
+  const env = fakeGithubEnvironment(state, "missing-release-diagnostics");
+  const api = invoke("gh", [
+    "api",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
+    "repos/JoeyTeng/codex-review-gate-action/releases/tags/v2.0.0",
+  ], { env });
+  const view = invoke("gh", [
+    "release",
+    "view",
+    "v2.0.0",
+    "--repo",
+    "JoeyTeng/codex-review-gate-action",
+    "--json",
+    "isDraft",
+  ], { env });
+
+  assert.equal(api.status, 1);
+  assert.match(api.stderr, /HTTP 404: Not Found/u);
+  assert.doesNotMatch(api.stderr, /release not found/u);
+  assert.equal(view.status, 1);
+  assert.equal(view.stderr, "release not found\n");
+  assert.doesNotMatch(view.stderr, /HTTP 404/u);
+
+  const fakeStatePath = join(env.FAKE_GH_STATE, "state.json");
+  const draftState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  draftState.exists = true;
+  draftState.body = "Signed draft fixture.";
+  writeJson(fakeStatePath, draftState);
+  const draftByTag = invoke("gh", [
+    "api",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
+    "repos/JoeyTeng/codex-review-gate-action/releases/tags/v2.0.0",
+  ], { env });
+  const draftInventory = invoke("gh", [
+    "api",
+    "--paginate",
+    "--slurp",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
+    "repos/JoeyTeng/codex-review-gate-action/releases?per_page=100",
+  ], { env });
+  const draftById = invoke("gh", [
+    "api",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
+    `repos/JoeyTeng/codex-review-gate-action/releases/${draftState.release_id}`,
+  ], { env });
+  assert.equal(draftByTag.status, 1);
+  assert.match(draftByTag.stderr, /HTTP 404: Not Found/u);
+  assert.equal(draftInventory.status, 0, draftInventory.stderr);
+  assert.equal(JSON.parse(draftInventory.stdout)[0][0].draft, true);
+  assert.equal(draftById.status, 0, draftById.stderr);
+  assert.equal(JSON.parse(draftById.stdout).id, draftState.release_id);
+  assert.equal(JSON.parse(draftById.stdout).draft, true);
+});
+
+test("fresh GitHub publication discovers and freezes its draft through complete inventories", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "draft-inventory-fresh" });
+  const githubEnvironment = fakeGithubEnvironment(state, "draft-inventory-fresh");
   const result = invokePublish(state, built, {
     testRelease: false,
-    env: fakeGithubEnvironment(state, "immutable-policy-disabled"),
+    env: githubEnvironment,
   });
 
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
-  assert.match(result.stderr, /recovery_code=immutable-release-policy-disabled/u);
-  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
-  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /reconcile_state=fresh/u);
   const fakeState = JSON.parse(readFileSync(
-    join(state.root, "fake-gh-state-immutable-policy-disabled", "state.json"),
+    join(state.root, "fake-gh-state-draft-inventory-fresh", "state.json"),
     "utf8",
   ));
-  assert.equal(fakeState.exists, false);
-  assert.deepEqual(fakeState.assets, []);
+  assert.equal(fakeState.release_create_calls, 1);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.ok(fakeState.release_inventory_reads >= 2);
+  assert.ok(
+    fakeState.call_trace.some(
+      ({ type, kind, draft }) => type === "remote" && kind === "release-id-read" && draft,
+    ),
+    "draft boundaries must use the frozen numeric Release id",
+  );
+  assert.equal(
+    fakeState.call_trace.some(
+      ({ type, kind, draft }) => type === "remote" && kind === "release-tag-read" && draft,
+    ),
+    false,
+    "the published-only by-tag endpoint must not be used to read a draft",
+  );
 });
+
+test("Release create failure before apply leaves later exact-source runs inconclusive", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "release-create-failure-before-apply" });
+  const githubEnvironment = fakeGithubEnvironment(state, "release-create-failure-before-apply");
+  const failed = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr, /reconcile_state=inconclusive/u);
+  assert.match(failed.stderr, /recovery_code=release-creation-unknown/u);
+  const failedState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-release-create-failure-before-apply", "state.json"),
+    "utf8",
+  ));
+  assert.equal(failedState.release_create_calls, 1, "one invocation must issue at most one create");
+  assert.equal(failedState.exists, false);
+  assert.equal(failedState.publish_patch_calls, 0);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0"]), "tag");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+
+  const retry = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "release-create-before-apply-retry" },
+  });
+  assert.notEqual(retry.status, 0);
+  assert.match(retry.stderr, /reconcile_state=inconclusive/u);
+  assert.match(retry.stderr, /recovery_code=release-create-attempt-unknown/u);
+  const retriedState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-release-create-failure-before-apply", "state.json"),
+    "utf8",
+  ));
+  assert.equal(retriedState.release_create_calls, 1, "later runs must not repeat an unknown create");
+  assert.equal(retriedState.exists, false);
+  assert.equal(retriedState.publish_patch_calls, 0);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+test("Release create response loss adopts the unique draft and exact-source retry never recreates it", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, {
+    label: "release-create-response-lost-after-apply",
+  });
+  const githubEnvironment = fakeGithubEnvironment(
+    state,
+    "release-create-response-lost-after-apply",
+  );
+  const recovered = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /reconcile_state=fresh/u);
+  const recoveredStatePath = join(
+    state.root,
+    "fake-gh-state-release-create-response-lost-after-apply",
+    "state.json",
+  );
+  const recoveredState = JSON.parse(readFileSync(recoveredStatePath, "utf8"));
+  assert.equal(recoveredState.release_create_calls, 1, "response loss must not trigger a second create");
+  assert.equal(recoveredState.draft, false);
+  assert.equal(recoveredState.immutable, true);
+  assert.equal(recoveredState.post_create_inventory_reads, 2);
+
+  const retry = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "release-create-completed-retry" },
+  });
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.match(retry.stdout, /reconcile_state=already_complete/u);
+  const retriedState = JSON.parse(readFileSync(recoveredStatePath, "utf8"));
+  assert.equal(retriedState.release_create_calls, 1, "exact-source retry must not recreate the Release");
+});
+
+test("an exact-source retry finds a pre-existing draft on the second inventory page", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "draft-inventory-second-page" });
+  const githubEnvironment = fakeGithubEnvironment(state, "draft-inventory-second-page");
+  const first = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "patch-failure-before-apply" },
+  });
+  assert.notEqual(first.status, 0);
+  assert.match(first.stderr, /recovery_code=release-publication-unknown/u);
+
+  const recovered = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      FAKE_GH_MUTATION_PHASE: "release-inventory-target-second-page",
+    },
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-draft-inventory-second-page", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.release_create_calls, 1, "retry must not create a second draft");
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.ok(fakeState.release_id_reads > 0);
+});
+
+for (const inventoryFailure of [
+  {
+    phase: "release-inventory-outer-empty",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+  },
+  {
+    phase: "release-inventory-duplicate-id",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+  },
+  {
+    phase: "release-inventory-duplicate-exact-tag",
+    state: "blocked_conflict",
+    recoveryCode: "duplicate-release-tag",
+  },
+]) {
+  test(`${inventoryFailure.phase} fails closed before any durable write`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: inventoryFailure.phase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, inventoryFailure.phase),
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${inventoryFailure.state}`, "u"));
+    assert.match(result.stderr, new RegExp(`recovery_code=${inventoryFailure.recoveryCode}`, "u"));
+    assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  });
+}
+
+for (const postCreateDrift of [
+  "post-create-inventory-id-drift",
+  "post-create-inventory-release-disappears",
+]) {
+  test(`${postCreateDrift} fails closed before draft mutation`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: postCreateDrift });
+    const githubEnvironment = fakeGithubEnvironment(state, postCreateDrift);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconcile_state=inconclusive/u);
+    assert.match(result.stderr, /recovery_code=remote-state-changed/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${postCreateDrift}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.release_create_calls, 1);
+    assert.equal(fakeState.post_create_inventory_reads, 2);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
+
+for (const frozenIdFailure of [
+  {
+    phase: "release-id-boundary-404",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+  },
+  {
+    phase: "release-id-boundary-wrong-id",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+  },
+]) {
+  test(`${frozenIdFailure.phase} never rebinds or recreates the draft`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: frozenIdFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, frozenIdFailure.phase);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${frozenIdFailure.state}`, "u"));
+    assert.match(result.stderr, new RegExp(`recovery_code=${frozenIdFailure.recoveryCode}`, "u"));
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${frozenIdFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.release_create_calls, 1);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.release_id, 987654321);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
+
+for (const policyCase of [
+  {
+    label: "enabled true with owner enforcement false",
+    phase: "immutable-policy-owner-not-enforced",
+  },
+  {
+    label: "an additive response field",
+    phase: "immutable-policy-additive-fields",
+  },
+]) {
+  test(`immutable-release policy accepts ${policyCase.label}`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: policyCase.phase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, policyCase.phase),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${policyCase.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.immutable, true);
+    assert.equal(fakeState.immutable_policy_reads, 3);
+    const releaseCreate = fakeState.call_trace.findIndex(
+      ({ type, kind }) => type === "remote" && kind === "release-create",
+    );
+    assert.notEqual(releaseCreate, -1);
+    assert.equal(
+      fakeState.call_trace
+        .slice(0, releaseCreate)
+        .some(({ type, kind }) => type === "remote" && kind === "release-view"),
+      false,
+      "fresh publication must not use gh release view to classify absence",
+    );
+    assert.notEqual(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  });
+}
+
+test("disabled, invalid, or unreadable immutable-release policy responses fail closed", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "immutable-policy-rejections" });
+
+  for (const policyCase of [
+    {
+      label: "disabled HTTP 404",
+      phase: "immutable-policy-disabled",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-policy-disabled",
+    },
+    {
+      label: "missing enforced_by_owner",
+      phase: "immutable-policy-missing-owner-field",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-policy-disabled",
+    },
+    {
+      label: "enabled with the wrong type",
+      phase: "immutable-policy-enabled-wrong-type",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-policy-disabled",
+    },
+    {
+      label: "enforced_by_owner with the wrong type",
+      phase: "immutable-policy-owner-wrong-type",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-policy-disabled",
+    },
+    {
+      label: "non-404 API failure",
+      phase: "immutable-policy-api-unreadable",
+      state: "inconclusive",
+      recoveryCode: "immutable-release-policy-unreadable",
+    },
+  ]) {
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, policyCase.phase),
+    });
+
+    assert.notEqual(result.status, 0, policyCase.label);
+    assert.match(
+      result.stderr,
+      new RegExp(`reconcile_state=${policyCase.state}`, "u"),
+      policyCase.label,
+    );
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${policyCase.recoveryCode}`, "u"),
+      policyCase.label,
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${policyCase.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.exists, false, policyCase.label);
+    assert.deepEqual(fakeState.assets, [], policyCase.label);
+    assert.equal(fakeState.immutable_policy_reads, 1, policyCase.label);
+  }
+
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+});
+
+for (const releaseCase of [
+  {
+    label: "stable",
+    version: "2.0.0",
+    prerelease: false,
+    makeLatest: "true",
+    expectedLatest: "v2.0.0",
+    majorAlias: "v2",
+  },
+  {
+    label: "rc",
+    version: "2.0.0-rc.1",
+    prerelease: true,
+    makeLatest: "false",
+    expectedLatest: null,
+    majorAlias: null,
+  },
+]) {
+  test(`${releaseCase.label} publication PATCH binds the frozen Release id and payload`, (t) => {
+    const state = fixture(t, releaseCase.version);
+    const mutationPhase = `direct-release-patch-${releaseCase.label}`;
+    const built = buildAssembledCandidate(state, { label: mutationPhase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, mutationPhase),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /reconcile_state=fresh/u);
+    const immutableTag = `v${releaseCase.version}`;
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${mutationPhase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.exists, true);
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
+    assert.equal(fakeState.publish_patch_calls, 1);
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.deepEqual(fakeState.publish_patch_payload, {
+      body: `Signed release of Joey-Tools/codex-review-gate@${built.sourceCommit}.`,
+      draft: false,
+      make_latest: releaseCase.makeLatest,
+      name: immutableTag,
+      prerelease: releaseCase.prerelease,
+      tag_name: immutableTag,
+    });
+    assert.equal(fakeState.latest, releaseCase.expectedLatest);
+    assert.equal(git(state.target, ["cat-file", "-t", `refs/tags/${immutableTag}`]), "tag");
+    if (releaseCase.majorAlias) {
+      assert.equal(
+        git(state.target, ["cat-file", "-t", `refs/tags/${releaseCase.majorAlias}`]),
+        "tag",
+      );
+    } else {
+      assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    }
+
+    const remoteCalls = fakeState.call_trace.filter(({ type }) => type === "remote");
+    const patchIndex = remoteCalls.findIndex(({ kind }) => kind === "release-patch");
+    assert.notEqual(patchIndex, -1, "missing direct Release PATCH trace");
+    assert.deepEqual(
+      remoteCalls.slice(patchIndex - 2, patchIndex).map(({ kind }) => kind),
+      ["release-id-read", "release-id-read"],
+      "the final exact boundary's two GitHub reads must immediately precede PATCH",
+    );
+    for (const boundaryRead of remoteCalls.slice(patchIndex - 2, patchIndex)) {
+      assert.equal(boundaryRead.draft, true);
+      assert.equal(boundaryRead.immutable, false);
+    }
+    const immutablePolicyReads = remoteCalls
+      .map((call, index) => ({ call, index }))
+      .filter(({ call }) => call.kind === "immutable-policy-read");
+    assert.equal(immutablePolicyReads.length, releaseCase.majorAlias ? 3 : 2);
+    const immutablePolicyReadsBeforePatch = immutablePolicyReads
+      .filter(({ index }) => index < patchIndex);
+    assert.equal(immutablePolicyReadsBeforePatch.length, 2);
+    assert.ok(
+      immutablePolicyReadsBeforePatch.at(-1).index < patchIndex - 2,
+      "all immutable-policy reads must precede the final exact boundary",
+    );
+    assert.equal(
+      remoteCalls.slice(0, patchIndex).some(({ kind }) => kind === "release-edit"),
+      false,
+    );
+  });
+}
+
+test("asset uploads keep the frozen Release id when tag resolution is replaced", (t) => {
+  const state = fixture(t);
+  const phase = "asset-upload-tag-resolution-replaced";
+  const built = buildAssembledCandidate(state, { label: phase });
+  const githubEnvironment = fakeGithubEnvironment(state, phase);
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeStatePath = join(state.root, `fake-gh-state-${phase}`, "state.json");
+  const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.asset_upload_calls, 3);
+  assert.deepEqual(
+    fakeState.asset_upload_target_release_ids,
+    [fakeState.release_id, fakeState.release_id, fakeState.release_id],
+  );
+  assert.equal(fakeState.tag_resolution_release_id, fakeState.release_id + 1000);
+  assert.equal(fakeState.replacement_release_assets.length, 3);
+  assert.deepEqual(
+    fakeState.replacement_release_assets.map(({ name }) => name).sort(),
+    fakeState.assets.map(({ name }) => name).sort(),
+  );
+  assert.ok(
+    fakeState.replacement_release_assets.every(
+      ({ release_id: releaseId }) => releaseId === fakeState.tag_resolution_release_id,
+    ),
+  );
+  assert.deepEqual(
+    fakeState.replacement_release_assets
+      .map(({ id }) => id)
+      .filter((id) => fakeState.assets.some((asset) => asset.id === id)),
+    [],
+    "replacement and frozen Releases must have independent asset identities",
+  );
+  assert.equal(fakeState.asset_readback_calls, 3);
+  assert.deepEqual(fakeState.asset_readback_ids, fakeState.assets.map(({ id }) => id));
+  assert.deepEqual(
+    fakeState.asset_readback_release_ids,
+    [fakeState.release_id, fakeState.release_id, fakeState.release_id],
+  );
+  const uploadCalls = fakeState.call_trace.filter(
+    ({ type, kind }) => type === "remote" && kind === "release-asset-upload",
+  );
+  assert.equal(uploadCalls.length, 3);
+  for (const call of uploadCalls) {
+    assert.match(
+      call.endpoint,
+      new RegExp(`/releases/${fakeState.release_id}/assets\\?name=`, "u"),
+    );
+  }
+  for (const uploadCall of uploadCalls) {
+    const uploadIndex = fakeState.call_trace.indexOf(uploadCall);
+    const assetReadIndex = fakeState.call_trace.findIndex(
+      ({ type, kind }, index) => index > uploadIndex &&
+        type === "remote" && kind === "release-asset-read",
+    );
+    assert.ok(assetReadIndex > uploadIndex, "each upload must have an asset-ID readback");
+    assert.equal(
+      fakeState.call_trace.slice(uploadIndex + 1, assetReadIndex).some(
+        ({ type, kind }) => type === "remote" &&
+          ["release-download", "release-tag-read", "release-view"].includes(kind),
+      ),
+      false,
+      "post-upload readback must not use any tag-resolving Release path",
+    );
+  }
+
+  const pendingProbeState = {
+    ...fakeState,
+    asset_readback_calls: fakeState.asset_upload_calls - 1,
+  };
+  writeJson(fakeStatePath, pendingProbeState);
+  const apiVersionArgs = ["--header", "X-GitHub-Api-Version: 2026-03-10"];
+  const replacementByTag = invoke("gh", [
+    "api",
+    ...apiVersionArgs,
+    "repos/JoeyTeng/codex-review-gate-action/releases/tags/v2.0.0",
+  ], { env: githubEnvironment });
+  assert.equal(replacementByTag.status, 0, replacementByTag.stderr);
+  const replacementRelease = JSON.parse(replacementByTag.stdout);
+  assert.equal(replacementRelease.id, fakeState.tag_resolution_release_id);
+  assert.deepEqual(
+    replacementRelease.assets.map(({ id }) => id),
+    fakeState.replacement_release_assets.map(({ id }) => id),
+  );
+
+  const frozenById = invoke("gh", [
+    "api",
+    ...apiVersionArgs,
+    `repos/JoeyTeng/codex-review-gate-action/releases/${fakeState.release_id}`,
+  ], { env: githubEnvironment });
+  assert.equal(frozenById.status, 0, frozenById.stderr);
+  const frozenRelease = JSON.parse(frozenById.stdout);
+  assert.equal(frozenRelease.id, fakeState.release_id);
+  assert.deepEqual(
+    frozenRelease.assets.map(({ id }) => id),
+    fakeState.assets.map(({ id }) => id),
+  );
+
+  const probeAsset = fakeState.assets[0];
+  const replacementProbeAsset = fakeState.replacement_release_assets.find(
+    ({ name }) => name === probeAsset.name,
+  );
+  assert.ok(replacementProbeAsset);
+  const replacementDownloadDir = join(state.root, "replacement-tag-download");
+  const replacementDownload = invoke("gh", [
+    "release",
+    "download",
+    "v2.0.0",
+    "--repo",
+    "JoeyTeng/codex-review-gate-action",
+    "--pattern",
+    probeAsset.name,
+    "--dir",
+    replacementDownloadDir,
+  ], { env: githubEnvironment });
+  assert.equal(replacementDownload.status, 0, replacementDownload.stderr);
+  const replacementBytes = readFileSync(join(
+    state.root,
+    `fake-gh-state-${phase}`,
+    "assets",
+    replacementProbeAsset.storage_name,
+  ));
+  const frozenBytes = readFileSync(join(
+    state.root,
+    `fake-gh-state-${phase}`,
+    "assets",
+    probeAsset.name,
+  ));
+  assert.deepEqual(
+    readFileSync(join(replacementDownloadDir, probeAsset.name)),
+    replacementBytes,
+  );
+  assert.notEqual(sha256(replacementBytes), sha256(frozenBytes));
+
+  const frozenAssetRead = invoke("gh", [
+    "api",
+    ...apiVersionArgs,
+    "--header",
+    "Accept: application/octet-stream",
+    `repos/JoeyTeng/codex-review-gate-action/releases/assets/${probeAsset.id}`,
+  ], { env: githubEnvironment });
+  assert.equal(frozenAssetRead.status, 0, frozenAssetRead.stderr);
+  const finalFakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(finalFakeState.asset_readback_release_ids.at(-1), fakeState.release_id);
+});
+
+for (const uploadFailure of [
+  { phase: "asset-upload-failure-before-apply", appliedAssets: 0 },
+  { phase: "asset-upload-response-lost-after-apply", appliedAssets: 1 },
+  { phase: "asset-upload-zero-exit-empty-response", appliedAssets: 1 },
+  { phase: "asset-upload-zero-exit-malformed-response", appliedAssets: 1 },
+  { phase: "asset-upload-zero-exit-wrong-id-response", appliedAssets: 1 },
+  { phase: "asset-readback-failure", appliedAssets: 1 },
+  { phase: "asset-readback-byte-mismatch", appliedAssets: 1 },
+]) {
+  test(`${uploadFailure.phase} preserves an unknown mutation outcome`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: uploadFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, uploadFailure.phase);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconcile_state=inconclusive/u);
+    assert.match(result.stderr, /recovery_code=release-asset-upload-unknown/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${uploadFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.assets.length, uploadFailure.appliedAssets);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.draft, true);
+    assert.equal(fakeState.immutable, false);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    if (uploadFailure.phase === "asset-upload-response-lost-after-apply") {
+      const selectedReleaseId = fakeState.release_id;
+      const recovered = invokePublish(state, built, {
+        testRelease: false,
+        env: {
+          ...githubEnvironment,
+          FAKE_GH_MUTATION_PHASE: "asset-upload-exact-source-retry",
+        },
+      });
+      assert.equal(recovered.status, 0, recovered.stderr);
+      assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+      const recoveredState = JSON.parse(readFileSync(
+        join(state.root, `fake-gh-state-${uploadFailure.phase}`, "state.json"),
+        "utf8",
+      ));
+      assert.equal(recoveredState.release_id, selectedReleaseId);
+      assert.equal(recoveredState.release_create_calls, 1);
+      assert.equal(recoveredState.asset_upload_calls, 3);
+      assert.equal(
+        recoveredState.assets.filter(({ name }) =>
+          name === "codex-review-gate-action-v2.0.0.tar.gz").length,
+        1,
+        "the exact-source retry must adopt the already-applied asset",
+      );
+      assert.equal(
+        recoveredState.call_trace.some(
+          ({ type, kind, draft }) =>
+            type === "remote" && kind === "release-download" && draft,
+        ),
+        false,
+        "draft prefix adoption must read bytes by frozen asset id, never by tag",
+      );
+      assert.equal(recoveredState.draft, false);
+      assert.equal(recoveredState.immutable, true);
+    }
+  });
+}
+
+for (const phase of [
+  "release-boundary-download-count-drift",
+  "release-boundary-asset-order-drift",
+  "release-boundary-timestamp-drift",
+  "release-inventory-ordering-drift",
+]) {
+  test(`${phase} is neutral to protected Release state`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: phase });
+    const githubEnvironment = fakeGithubEnvironment(state, phase);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
+    if (phase !== "release-inventory-ordering-drift") {
+      assert.equal(fakeState.observational_mutation_done, true);
+    }
+  });
+}
+
+test("a 502 starter is deleted by frozen asset id and exact-source retry is idempotent", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "asset-upload-502-starter" });
+  const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+  const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+
+  assert.notEqual(first.status, 0);
+  assert.match(first.stderr, /recovery_code=release-asset-upload-unknown/u);
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-asset-upload-502-starter",
+    "state.json",
+  );
+  let fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.assets.length, 1);
+  assert.equal(fakeState.assets[0].state, "starter");
+  const frozenReleaseId = fakeState.release_id;
+
+  const recovered = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "starter-asset-recovery" },
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+  fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.release_id, frozenReleaseId);
+  assert.equal(fakeState.release_create_calls, 1);
+  assert.equal(fakeState.asset_delete_attempts, 1);
+  assert.equal(fakeState.asset_delete_applied, 1);
+  assert.deepEqual(fakeState.asset_delete_ids, [1]);
+  assert.equal(fakeState.assets.some(({ state: assetState }) => assetState === "starter"), false);
+  assert.equal(fakeState.assets.every(({ release_id: owner }) => owner === frozenReleaseId), true);
+  assert.equal(fakeState.asset_upload_calls, 4);
+
+  const deleteAttempts = fakeState.asset_delete_attempts;
+  const uploadCalls = fakeState.asset_upload_calls;
+  const complete = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "starter-idempotent-retry" },
+  });
+  assert.equal(complete.status, 0, complete.stderr);
+  assert.match(complete.stdout, /reconcile_state=already_complete/u);
+  fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.asset_delete_attempts, deleteAttempts);
+  assert.equal(fakeState.asset_upload_calls, uploadCalls);
+});
+
+for (const phase of [
+  "starter-delete-response-lost-after-apply",
+  "starter-delete-404-after-apply",
+]) {
+  test(`${phase} reconciles the exact one-asset removal without a second DELETE`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: phase });
+    const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+    const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+    assert.notEqual(first.status, 0);
+
+    const recovered = invokePublish(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+    });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, "fake-gh-state-asset-upload-502-starter", "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.asset_delete_attempts, 1);
+    assert.equal(fakeState.asset_delete_applied, 1);
+    assert.equal(fakeState.assets.some(({ state: assetState }) => assetState === "starter"), false);
+  });
+}
+
+test("starter deletion failure before apply stays retryable and does not upload", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "starter-delete-failure" });
+  const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+  const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+  assert.notEqual(first.status, 0);
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-asset-upload-502-starter",
+    "state.json",
+  );
+  const before = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+
+  const failedDelete = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      FAKE_GH_MUTATION_PHASE: "starter-delete-failure-before-apply",
+    },
+  });
+  assert.notEqual(failedDelete.status, 0);
+  assert.match(failedDelete.stderr, /recovery_code=starter-asset-deletion-unknown/u);
+  const after = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(after.asset_delete_attempts, 1);
+  assert.equal(after.asset_delete_applied, 0);
+  assert.equal(after.asset_upload_calls, before.asset_upload_calls);
+  assert.equal(after.assets.filter(({ state: assetState }) => assetState === "starter").length, 1);
+});
+
+for (const phase of ["starter-predelete-state-drift", "starter-predelete-unrelated-drift"]) {
+  test(`${phase} blocks before the unconditional DELETE`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: phase });
+    const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+    const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+    assert.notEqual(first.status, 0);
+
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: phase },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /recovery_code=starter-asset-deletion-unknown/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, "fake-gh-state-asset-upload-502-starter", "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.asset_delete_attempts, 0);
+  });
+}
+
+test("duplicate asset ids make the complete Release inventory inconclusive", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "duplicate-starter-asset-id" });
+  const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+  const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+  assert.notEqual(first.status, 0);
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-asset-upload-502-starter",
+    "state.json",
+  );
+  const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  const duplicateName = "release-provenance.json";
+  writeFileSync(join(githubEnvironment.FAKE_GH_STATE, "assets", duplicateName), "duplicate");
+  fakeState.assets.push({
+    name: duplicateName,
+    id: fakeState.assets[0].id,
+    release_id: fakeState.release_id,
+  });
+  writeJson(fakeStatePath, fakeState);
+
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "duplicate-starter-asset-id" },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /recovery_code=remote-read-inconclusive/u);
+  const after = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(after.asset_delete_attempts, 0);
+});
+
+for (const mismatch of [
+  "wrong-name",
+  "wrong-slot",
+  "nonzero",
+  "wrong-digest",
+  "wrong-content-type",
+  "wrong-uploader",
+]) {
+  test(`a stable ${mismatch} starter is blocked and never deleted`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: `starter-${mismatch}` });
+    const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+    const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+    assert.notEqual(first.status, 0);
+    const fakeStatePath = join(
+      state.root,
+      "fake-gh-state-asset-upload-502-starter",
+      "state.json",
+    );
+    const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+    const starter = fakeState.assets[0];
+    if (mismatch === "wrong-name") starter.name = "unexpected.bin";
+    if (mismatch === "wrong-slot") starter.name = "release-provenance.json";
+    if (mismatch === "nonzero") starter.size = 1;
+    if (mismatch === "wrong-digest") starter.digest = `sha256:${"f".repeat(64)}`;
+    if (mismatch === "wrong-content-type") starter.content_type = "text/plain";
+    if (mismatch === "wrong-uploader") starter.uploader_login = "other-writer[bot]";
+    writeJson(fakeStatePath, fakeState);
+
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: `starter-${mismatch}` },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /recovery_code=starter-asset-mismatch/u);
+    const after = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+    assert.equal(after.asset_delete_attempts, 0);
+  });
+}
+
+test("multiple starter assets are blocked before any unconditional DELETE", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "multiple-starter-assets" });
+  const githubEnvironment = fakeGithubEnvironment(state, "asset-upload-502-starter");
+  const first = invokePublish(state, built, { testRelease: false, env: githubEnvironment });
+  assert.notEqual(first.status, 0);
+  const fakeStatePath = join(
+    state.root,
+    "fake-gh-state-asset-upload-502-starter",
+    "state.json",
+  );
+  const fakeState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  const secondName = "release-provenance.json";
+  writeFileSync(join(githubEnvironment.FAKE_GH_STATE, "assets", secondName), "");
+  fakeState.assets.push({
+    name: secondName,
+    id: fakeState.next_asset_id++,
+    release_id: fakeState.release_id,
+    state: "starter",
+    size: 0,
+  });
+  writeJson(fakeStatePath, fakeState);
+
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "multiple-starter-assets" },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /recovery_code=starter-asset-mismatch/u);
+  const after = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(after.asset_delete_attempts, 0);
+  assert.equal(after.assets.filter(({ state: assetState }) => assetState === "starter").length, 2);
+});
+
+test("enforced live signer policy reaches both publication and alias critical fences", (t) => {
+  const state = fixture(t);
+  const label = "live-signer-valid";
+  const built = buildAssembledCandidate(state, { label });
+  const githubEnvironment = fakeGithubEnvironment(state, label);
+  const result = invokePublish(state, built, {
+    enforceLiveSignerPolicy: true,
+    testRelease: false,
+    env: liveSignerPolicyEnvironment(state, githubEnvironment, label),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${label}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2"]), "tag");
+  const publicationFence = fakeState.call_trace.findIndex(
+    ({ kind, critical_fence: criticalFence }) =>
+      kind === "signer-policy-read" && criticalFence === "publication",
+  );
+  const patch = fakeState.call_trace.findIndex(({ kind }) => kind === "release-patch");
+  const aliasFence = fakeState.call_trace.findIndex(
+    ({ kind, critical_fence: criticalFence }) =>
+      kind === "signer-policy-read" && criticalFence === "alias",
+  );
+  assert.ok(
+    publicationFence !== -1 && publicationFence < patch && patch < aliasFence,
+    "the enforced signer inventory must be valid immediately before PATCH and alias mutation",
+  );
+});
+
+for (const signerFailure of [
+  {
+    phase: "live-signer-api-unreadable-publication",
+    fence: "publication",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedPatchCalls: 0,
+  },
+  {
+    phase: "live-signer-revoked-publication",
+    fence: "publication",
+    state: "blocked_conflict",
+    recoveryCode: "signing-key-policy-changed",
+    expectedPatchCalls: 0,
+  },
+  {
+    phase: "live-signer-api-unreadable-alias",
+    fence: "alias",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedPatchCalls: 1,
+  },
+  {
+    phase: "live-signer-cert-replacement-alias",
+    fence: "alias",
+    state: "blocked_conflict",
+    recoveryCode: "signing-key-policy-changed",
+    expectedPatchCalls: 1,
+  },
+]) {
+  test(`${signerFailure.phase} stops the next privileged mutation`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: signerFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, signerFailure.phase);
+    const result = invokePublish(state, built, {
+      enforceLiveSignerPolicy: true,
+      testRelease: false,
+      env: liveSignerPolicyEnvironment(state, githubEnvironment, signerFailure.phase),
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${signerFailure.state}`, "u"));
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${signerFailure.recoveryCode}`, "u"),
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${signerFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.publish_patch_calls, signerFailure.expectedPatchCalls);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    const criticalSignerRead = fakeState.call_trace.findIndex(
+      ({ kind, critical_fence: criticalFence }) =>
+        kind === "signer-policy-read" && criticalFence === signerFailure.fence,
+    );
+    assert.notEqual(criticalSignerRead, -1, `missing ${signerFailure.fence} signer fence`);
+    const patchIndex = fakeState.call_trace.findIndex(({ kind }) => kind === "release-patch");
+    if (signerFailure.fence === "publication") {
+      assert.equal(patchIndex, -1);
+    } else {
+      assert.ok(patchIndex !== -1 && patchIndex < criticalSignerRead);
+    }
+  });
+}
+
+for (const patchFailure of [
+  {
+    phase: "patch-failure-before-apply",
+    expectedDraftAfterFailure: true,
+    expectedImmutableAfterFailure: false,
+    failureCounter: "patch_failures_before_apply",
+  },
+  {
+    phase: "patch-response-lost-after-apply",
+    expectedDraftAfterFailure: false,
+    expectedImmutableAfterFailure: true,
+    failureCounter: "patch_failures_after_apply",
+  },
+]) {
+  test(`${patchFailure.phase} is inconclusive and exact-source reconcile recovers`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: patchFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, patchFailure.phase);
+    const failed = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /reconcile_state=inconclusive/u);
+    assert.match(failed.stderr, /recovery_code=release-publication-unknown/u);
+    assert.match(failed.stderr, /exact source SHA/u);
+    let fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${patchFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState[patchFailure.failureCounter], 1);
+    assert.equal(fakeState.draft, patchFailure.expectedDraftAfterFailure);
+    assert.equal(fakeState.immutable, patchFailure.expectedImmutableAfterFailure);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+
+    const recovered = invokePublish(state, built, {
+      testRelease: false,
+      env: { ...githubEnvironment, FAKE_GH_MUTATION_PHASE: "patch-recovery" },
+    });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+    fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${patchFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState[patchFailure.failureCounter], 1);
+    assert.equal(fakeState.publish_patch_calls, 1);
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
+    assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2"]), "tag");
+  });
+}
+
+for (const responseFailure of [
+  { label: "an empty body", phase: "patch-zero-exit-empty-response" },
+  { label: "malformed JSON", phase: "patch-zero-exit-malformed-response" },
+  { label: "a different numeric Release id", phase: "patch-zero-exit-wrong-id-response" },
+]) {
+  test(`zero-exit Release PATCH with ${responseFailure.label} is unknown and recoverable`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: responseFailure.phase });
+    const githubEnvironment = fakeGithubEnvironment(state, responseFailure.phase);
+    const failed = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /reconcile_state=inconclusive/u);
+    assert.match(failed.stderr, /recovery_code=release-publication-unknown/u);
+    assert.match(failed.stderr, /response was missing or malformed/u);
+    assert.match(failed.stderr, /exact source SHA/u);
+    let fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${responseFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.publish_patch_calls, 1);
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
+    assert.equal(fakeState.latest, "v2.0.0");
+    assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0"]), "tag");
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+
+    const recovered = invokePublish(state, built, {
+      testRelease: false,
+      env: {
+        ...githubEnvironment,
+        FAKE_GH_MUTATION_PHASE: "patch-zero-exit-response-recovery",
+      },
+    });
+
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+    fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${responseFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.publish_patch_calls, 1, "retry must prove the applied PATCH without repeating it");
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.equal(
+      fakeState.call_trace.filter(
+        ({ type, kind }) => type === "remote" && kind === "release-patch",
+      ).length,
+      1,
+      "exact-source retry must not issue a second Release PATCH",
+    );
+    assert.equal(fakeState.tag, "v2.0.0");
+    const releaseCommit = git(state.target, ["rev-parse", "refs/tags/v2.0.0^{}"]);
+    assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), releaseCommit);
+    assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), releaseCommit);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.1"]));
+  });
+}
 
 test("mutable post-publication readback blocks the floating alias", (t) => {
   const state = fixture(t);
@@ -2392,19 +4841,572 @@ test("release-policy read drift is fenced again before draft publication", (t) =
   assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
 });
 
-for (const mutationPhase of ["before-immutable", "after-immutable"]) {
-  test(`same-name provenance replacement ${mutationPhase} blocks the floating alias`, (t) => {
+for (const mutationPhase of [
+  "asset-drift-during-final-policy-read",
+  "metadata-drift-during-final-policy-read",
+]) {
+  test(`${mutationPhase} is rejected by the final pre-publication boundary`, (t) => {
     const state = fixture(t);
     const built = buildAssembledCandidate(state, { label: mutationPhase });
+    const githubEnvironment = fakeGithubEnvironment(state, mutationPhase);
     const result = invokePublish(state, built, {
       testRelease: false,
-      env: fakeGithubEnvironment(state, mutationPhase),
+      env: githubEnvironment,
     });
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /reconcile_state=(?:blocked_conflict|inconclusive)/u);
-    const fakeState = JSON.parse(readFileSync(join(state.root, `fake-gh-state-${mutationPhase}`, "state.json"), "utf8"));
-    assert.equal(fakeState.mutation_done, true);
+    assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+    assert.match(result.stderr, /recovery_code=immutable-release-mismatch/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${mutationPhase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.policy_mutation_done, true);
+    assert.equal(fakeState.poisoned_after_pre_publish_boundary, true);
+    assert.equal(fakeState.immutable_policy_reads, 2);
+    assert.equal(
+      mutationPhase === "asset-drift-during-final-policy-read"
+        ? fakeState.mutation_done
+        : fakeState.metadata_mutation_done,
+      true,
+    );
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.equal(fakeState.draft, true);
+    assert.equal(fakeState.immutable, false);
     assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+
+    const mutationTraceIndex = fakeState.call_trace.findIndex(
+      ({ type, kind }) => type === "event" && kind === "policy-window-mutation",
+    );
+    assert.notEqual(mutationTraceIndex, -1, "missing policy-window mutation trace");
+    const oldBoundaryReads = fakeState.call_trace
+      .slice(0, mutationTraceIndex)
+      .filter(({ type, kind }) => type === "remote" && kind === "release-id-read")
+      .slice(-2);
+    assert.equal(oldBoundaryReads.length, 2, "the old exact boundary must precede mutation");
+    for (const boundaryRead of oldBoundaryReads) {
+      assert.equal(boundaryRead.draft, true);
+      assert.equal(boundaryRead.immutable, false);
+      assert.equal(boundaryRead.mutation_done, false);
+      assert.equal(boundaryRead.metadata_mutation_done, false);
+    }
+    const newBoundaryReads = fakeState.call_trace
+      .slice(mutationTraceIndex + 1)
+      .filter(({ type, kind }) => type === "remote" && kind === "release-id-read");
+    assert.ok(newBoundaryReads.length >= 1, "the new final boundary must observe the mutation");
+    if (mutationPhase === "asset-drift-during-final-policy-read") {
+      assert.ok(newBoundaryReads.length >= 2, "stable asset drift must complete both boundary reads");
+      assert.equal(newBoundaryReads[0].mutation_done, true);
+      assert.equal(newBoundaryReads[1].mutation_done, true);
+    } else {
+      assert.equal(newBoundaryReads[0].metadata_mutation_done, true);
+    }
+    assert.equal(
+      fakeState.call_trace.some(({ type, kind }) => type === "remote" && kind === "release-patch"),
+      false,
+      "the final boundary must reject the poisoned draft before PATCH",
+    );
+
+    if (mutationPhase === "asset-drift-during-final-policy-read") {
+      // Counterfactual control: the removed sequence proceeded directly from
+      // this poisoned post-policy state to publication. Replaying only that
+      // PATCH against a copy proves it would have locked the replacement asset
+      // into an immutable Release; the production path above did not PATCH.
+      const legacyStateDir = join(state.root, "fake-gh-state-legacy-unfenced-control");
+      const legacyAssetsDir = join(legacyStateDir, "assets");
+      mkdirSync(legacyAssetsDir, { recursive: true });
+      writeJson(join(legacyStateDir, "state.json"), fakeState);
+      for (const asset of fakeState.assets) {
+        copyFileSync(
+          join(dirname(join(
+            state.root,
+            `fake-gh-state-${mutationPhase}`,
+            "state.json",
+          )), "assets", asset.name),
+          join(legacyAssetsDir, asset.name),
+        );
+      }
+      const legacyPayload = join(state.root, "legacy-unfenced-publication.json");
+      writeJson(legacyPayload, {
+        body: fakeState.body,
+        draft: false,
+        make_latest: "true",
+        name: fakeState.tag,
+        prerelease: fakeState.prerelease,
+        tag_name: fakeState.tag,
+      });
+      const legacyPatch = invoke("gh", [
+        "api",
+        "--method",
+        "PATCH",
+        "--header",
+        "X-GitHub-Api-Version: 2026-03-10",
+        `repos/JoeyTeng/codex-review-gate-action/releases/${fakeState.release_id}`,
+        "--input",
+        legacyPayload,
+      ], {
+        env: { ...githubEnvironment, FAKE_GH_STATE: legacyStateDir },
+      });
+      assert.equal(legacyPatch.status, 0, legacyPatch.stderr);
+      const legacyState = JSON.parse(readFileSync(
+        join(legacyStateDir, "state.json"),
+        "utf8",
+      ));
+      assert.equal(legacyState.poisoned_after_pre_publish_boundary, true);
+      assert.equal(legacyState.publish_patch_calls, 1);
+      assert.equal(legacyState.draft, false);
+      assert.equal(legacyState.immutable, true);
+    }
+  });
+}
+
+for (const boundaryFailure of [
+  {
+    phase: "pre-publication-boundary-unreadable",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+  },
+  {
+    phase: "pre-publication-boundary-snapshot-changed",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+  },
+  {
+    phase: "pre-publication-second-raw-metadata-drift",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+  },
+  {
+    phase: "pre-publication-second-raw-tag-drift",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+  },
+  {
+    phase: "pre-publication-stable-schema-invalid",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+  },
+  {
+    phase: "pre-publication-valid-to-schema-invalid",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+  },
+]) {
+  test(`${boundaryFailure.phase} preserves the draft with precise classification`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: boundaryFailure.phase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, boundaryFailure.phase),
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${boundaryFailure.state}`, "u"));
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${boundaryFailure.recoveryCode}`, "u"),
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${boundaryFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.final_publication_boundary_reads >= 1, true);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.draft, true);
+    assert.equal(fakeState.immutable, false);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    if (boundaryFailure.phase === "pre-publication-stable-schema-invalid") {
+      assert.equal(fakeState.final_publication_boundary_reads, 2);
+      assert.equal(fakeState.raw_boundary_mutation_done, false);
+      assert.match(
+        result.stderr,
+        /GitHub Release boundary metadata or author differs from policy/u,
+      );
+    }
+    if (boundaryFailure.phase === "pre-publication-valid-to-schema-invalid") {
+      assert.doesNotMatch(
+        result.stderr,
+        /GitHub Release boundary metadata or author differs from policy/u,
+      );
+    }
+    if (boundaryFailure.recoveryCode === "remote-state-changed") {
+      assert.equal(fakeState.final_publication_boundary_reads, 2);
+      assert.equal(fakeState.raw_boundary_mutation_done, true);
+      if (boundaryFailure.phase === "pre-publication-boundary-snapshot-changed") {
+        assert.equal(fakeState.mutation_done, true);
+      }
+    }
+  });
+}
+
+for (const absentBoundaryFailure of [
+  {
+    phase: "stable-mismatch",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+  {
+    phase: "stable-lightweight",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+  {
+    phase: "tag-drift",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+  {
+    phase: "api-unreadable-first",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedApiReads: 1,
+    expectedTagReads: 0,
+  },
+  {
+    phase: "api-unreadable-second",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedApiReads: 2,
+    expectedTagReads: 1,
+  },
+  {
+    phase: "tag-unreadable-first",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedApiReads: 1,
+    expectedTagReads: 1,
+  },
+  {
+    phase: "tag-unreadable-second",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+  {
+    phase: "release-appears",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+    expectedApiReads: 2,
+    expectedTagReads: 2,
+  },
+]) {
+  test(`fresh absent boundary ${absentBoundaryFailure.phase} is classified precisely`, (t) => {
+    const state = fixture(t);
+    const label = `absent-boundary-${absentBoundaryFailure.phase}`;
+    const built = buildAssembledCandidate(state, { label });
+    const replacement = createDetachedAliasObject(state, `replacement-${label}`);
+    const githubEnvironment = fakeGithubEnvironment(state, label);
+    const absentEnvironment = absentBoundaryDriftEnvironment(
+      state,
+      githubEnvironment,
+      absentBoundaryFailure.phase,
+      replacement.object,
+    );
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: absentEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      new RegExp(`reconcile_state=${absentBoundaryFailure.state}`, "u"),
+    );
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${absentBoundaryFailure.recoveryCode}`, "u"),
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${label}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.absent_boundary_api_reads, absentBoundaryFailure.expectedApiReads);
+    const observedTagReads = existsSync(absentEnvironment.ABSENT_TAG_READ_COUNT_FILE)
+      ? Number(readFileSync(absentEnvironment.ABSENT_TAG_READ_COUNT_FILE, "utf8").trim())
+      : 0;
+    assert.equal(observedTagReads, absentBoundaryFailure.expectedTagReads);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.release_edit_calls, 0);
+    assert.equal(fakeState.exists, absentBoundaryFailure.phase === "release-appears");
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
+
+for (const stablePolicyMismatch of [
+  {
+    phase: "stable-invalid-author-before-final-boundary",
+    changedField: "author_login",
+  },
+  {
+    phase: "stable-invalid-asset-before-final-boundary",
+    changedField: "asset_uploader_login",
+  },
+  {
+    phase: "stable-invalid-tag-before-final-boundary",
+    changedField: "tag",
+  },
+]) {
+  test(`${stablePolicyMismatch.phase} is a stable policy mismatch`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: stablePolicyMismatch.phase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, stablePolicyMismatch.phase),
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+    assert.match(result.stderr, /recovery_code=immutable-release-mismatch/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${stablePolicyMismatch.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.policy_mutation_done, true);
+    assert.equal(fakeState.final_publication_boundary_reads, 2);
+    assert.equal(fakeState.raw_boundary_mutation_done, false);
+    assert.notEqual(
+      fakeState[stablePolicyMismatch.changedField],
+      stablePolicyMismatch.changedField === "tag"
+        ? "v2.0.0"
+        : "codex-review-gate-action-publisher[bot]",
+    );
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.equal(fakeState.draft, true);
+    assert.equal(fakeState.immutable, false);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
+
+test("stable same-name asset replacement after publication is a frozen-boundary conflict", (t) => {
+  const state = fixture(t);
+  const phase = "stable-asset-replacement-before-final-boundary";
+  const built = buildAssembledCandidate(state, { label: phase });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, phase),
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=immutable-release-mismatch/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${phase}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.mutation_done, true);
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+  const mutationIndex = fakeState.call_trace.findIndex(
+    ({ type, kind }) => type === "event" && kind === "post-publish-boundary-mutation",
+  );
+  assert.notEqual(mutationIndex, -1);
+  const readsAfterMutation = fakeState.call_trace
+    .slice(mutationIndex + 1)
+    .filter(({ type, kind }) => type === "remote" && kind === "release-id-read");
+  assert.ok(readsAfterMutation.length >= 2);
+  assert.equal(readsAfterMutation[0].mutation_done, true);
+  assert.equal(readsAfterMutation[1].mutation_done, true);
+});
+
+test("same-name provenance replacement after immutability blocks the floating alias", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "after-immutable" });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, "after-immutable"),
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=immutable-release-mismatch/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-after-immutable", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.mutation_done, true);
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.release_edit_calls, 0);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+for (const aliasFenceFailure of [
+  {
+    phase: "immutable-policy-disabled-before-alias",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-policy-disabled",
+  },
+  {
+    phase: "release-drift-during-alias-policy-read",
+    state: "blocked_conflict",
+    recoveryCode: "immutable-release-mismatch",
+  },
+]) {
+  test(`${aliasFenceFailure.phase} blocks the floating alias before push`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: aliasFenceFailure.phase });
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: fakeGithubEnvironment(state, aliasFenceFailure.phase),
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${aliasFenceFailure.state}`, "u"));
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${aliasFenceFailure.recoveryCode}`, "u"),
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${aliasFenceFailure.phase}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.immutable_policy_reads, 3);
+    assert.equal(fakeState.publish_patch_calls, 1);
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    const aliasMutation = fakeState.call_trace.find(
+      ({ type, kind }) => type === "event" && kind === "alias-policy-window-mutation",
+    );
+    assert.equal(aliasMutation?.immutable_policy_read, 3);
+    if (aliasFenceFailure.phase === "release-drift-during-alias-policy-read") {
+      const mutationIndex = fakeState.call_trace.indexOf(aliasMutation);
+      const finalAliasBoundaryReads = fakeState.call_trace
+        .slice(mutationIndex + 1)
+        .filter(({ type, kind }) => type === "remote" && kind === "release-id-read");
+      assert.ok(finalAliasBoundaryReads.length >= 2);
+      assert.equal(finalAliasBoundaryReads[0].mutation_done, true);
+      assert.equal(finalAliasBoundaryReads[1].mutation_done, true);
+    }
+  });
+}
+
+for (const aliasReadbackFailure of [
+  {
+    phase: "changed-between-reads",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+  },
+  {
+    phase: "stable-mismatch",
+    state: "blocked_conflict",
+    recoveryCode: "malformed-major-alias-target",
+  },
+]) {
+  test(`floating alias post-write ${aliasReadbackFailure.phase} is classified precisely`, (t) => {
+    const state = fixture(t);
+    const label = `alias-readback-${aliasReadbackFailure.phase}`;
+    const built = buildAssembledCandidate(state, { label });
+    const replacement = createDetachedAliasObject(state, "v2");
+    const githubEnvironment = fakeGithubEnvironment(state, label);
+    const aliasEnvironment = aliasReadbackDriftEnvironment(
+      state,
+      githubEnvironment,
+      aliasReadbackFailure.phase,
+      replacement.object,
+    );
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: aliasEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      new RegExp(`reconcile_state=${aliasReadbackFailure.state}`, "u"),
+    );
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${aliasReadbackFailure.recoveryCode}`, "u"),
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${label}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.publish_patch_calls, 1);
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
+    assert.equal(readFileSync(aliasEnvironment.ALIAS_READ_COUNT_FILE, "utf8").trim(), "2");
+    assert.equal(git(state.target, ["rev-parse", "refs/tags/v2"]), replacement.object);
+    assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), replacement.commit);
+  });
+}
+
+for (const aliasRawFailure of [
+  {
+    phase: "stable-lightweight",
+    state: "blocked_conflict",
+    recoveryCode: "malformed-major-alias-target",
+    expectedReads: 2,
+  },
+  {
+    phase: "stable-malformed-two-line",
+    state: "blocked_conflict",
+    recoveryCode: "malformed-major-alias-target",
+    expectedReads: 2,
+  },
+  {
+    phase: "valid-then-shape-drift",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+    expectedReads: 2,
+  },
+  {
+    phase: "command-failure-first",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedReads: 1,
+  },
+  {
+    phase: "command-failure-second",
+    state: "inconclusive",
+    recoveryCode: "remote-read-inconclusive",
+    expectedReads: 2,
+  },
+]) {
+  test(`floating alias raw readback ${aliasRawFailure.phase} is classified precisely`, (t) => {
+    const state = fixture(t);
+    const label = `alias-raw-readback-${aliasRawFailure.phase}`;
+    const built = buildAssembledCandidate(state, { label });
+    const replacement = createDetachedAliasObject(state, "v2");
+    const githubEnvironment = fakeGithubEnvironment(state, label);
+    const aliasEnvironment = aliasReadbackDriftEnvironment(
+      state,
+      githubEnvironment,
+      aliasRawFailure.phase,
+      replacement.object,
+    );
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: aliasEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`reconcile_state=${aliasRawFailure.state}`, "u"));
+    assert.match(
+      result.stderr,
+      new RegExp(`recovery_code=${aliasRawFailure.recoveryCode}`, "u"),
+    );
+    assert.equal(
+      readFileSync(aliasEnvironment.ALIAS_READ_COUNT_FILE, "utf8").trim(),
+      String(aliasRawFailure.expectedReads),
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${label}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.publish_patch_calls, 1);
+    assert.equal(fakeState.draft, false);
+    assert.equal(fakeState.immutable, true);
   });
 }
 
@@ -2558,3 +5560,9 @@ test("prereleases publish only the full immutable tag", (t) => {
   assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
   assert.equal(readFileSync(join(state.releases, "v2.0.0-rc.1", "prerelease"), "utf8"), "true\n");
 });
+
+assert.equal(
+  test.registeredCount,
+  131,
+  "release pipeline shard registration inventory drift",
+);
