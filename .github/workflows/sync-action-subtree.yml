@@ -193,8 +193,8 @@ jobs:
   candidate-a:
     name: Build candidate A
     needs: plan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
     outputs:
       artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
       artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}
@@ -238,17 +238,12 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 1
-      - name: Validate candidate A source independently
-        run: |
-          git worktree add --detach "$RUNNER_TEMP/candidate-a-source" "$RELEASE_SOURCE_SHA"
-          npm --prefix "$RUNNER_TEMP/candidate-a-source" run check
-          npm --prefix "$RUNNER_TEMP/candidate-a-source" test -- --test-reporter=dot
 
   candidate-b:
     name: Build candidate B
     needs: plan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
     outputs:
       artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
       artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}
@@ -292,15 +287,57 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 1
-      - name: Validate candidate B source independently
+
+  source-validation:
+    name: Validate frozen source / ${{ matrix.suite.name }}
+    needs: [candidate-a, candidate-b]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: core
+            release_test_shard: "off"
+          - name: release 1/4
+            release_test_shard: "1/4"
+          - name: release 2/4
+            release_test_shard: "2/4"
+          - name: release 3/4
+            release_test_shard: "3/4"
+          - name: release 4/4
+            release_test_shard: "4/4"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Prepare exact frozen source worktree
         run: |
-          git worktree add --detach "$RUNNER_TEMP/candidate-b-source" "$RELEASE_SOURCE_SHA"
-          npm --prefix "$RUNNER_TEMP/candidate-b-source" run check
-          npm --prefix "$RUNNER_TEMP/candidate-b-source" test -- --test-reporter=dot
+          git worktree add --detach "$RUNNER_TEMP/release-source" "$RELEASE_SOURCE_SHA"
+      - name: Run checks and non-release tests
+        if: ${{ matrix.suite.release_test_shard == 'off' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
+        run: |
+          cd "$RUNNER_TEMP/release-source"
+          npm run check
+          npm test -- --test-concurrency=1 --test-reporter=dot
+      - name: Run release pipeline shard
+        if: ${{ matrix.suite.release_test_shard != 'off' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release_test_shard }}
+        run: |
+          cd "$RUNNER_TEMP/release-source"
+          node --test --test-reporter=dot test/v2-release-pipeline.test.mjs
 
   assemble:
     name: Compare and assemble candidates
-    needs: [candidate-a, candidate-b]
+    needs: [candidate-a, candidate-b, source-validation]
     runs-on: ubuntu-slim
     timeout-minutes: 14
     outputs:
@@ -504,47 +541,118 @@ jobs:
       # Security policy: allowlisted GitHub-owned Actions intentionally follow
       # floating major refs so upstream patch fixes arrive automatically. Moving
       # to immutable SHAs requires Dependabot and a separate policy change.
-      - name: Create least-privilege publisher token
-        id: publisher-token
+      - name: Validate Publisher App static configuration before inventory
+        env:
+          APP_OWNER: ${{ vars.RELEASE_PUBLISHER_APP_OWNER }}
+          APP_SLUG: ${{ vars.RELEASE_PUBLISHER_APP_SLUG }}
+        run: |
+          set -euo pipefail
+          if [[ "$APP_OWNER" != "JoeyTeng" ]]; then
+            printf '%s\n' "Publisher App configuration invariant failed: expected owner JoeyTeng." >&2
+            exit 1
+          fi
+          if [[ "$APP_SLUG" != "codex-review-gate-action-publisher" ]]; then
+            printf '%s\n' "Publisher App configuration invariant failed: expected canonical publisher slug." >&2
+            exit 1
+          fi
+          printf '%s\n' "Publisher App static configuration check passed before inventory token minting."
+      - name: Create inventory-only Publisher App token
+        id: publisher-inventory-token
         uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ vars.RELEASE_PUBLISHER_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_PUBLISHER_APP_PRIVATE_KEY }}
-          owner: ${{ vars.RELEASE_PUBLISHER_APP_OWNER }}
-          repositories: codex-review-gate-action
-          permission-administration: read
-          permission-contents: write
+          # An owner with no repositories requests the App installation's
+          # full owner scope. This token is inventory-only and cannot write.
+          owner: JoeyTeng
+          permission-metadata: read
           skip-token-revoke: false
-      - name: Validate publisher identity and repository scope
+      - name: Validate Publisher App identity and full installation scope
         env:
           APP_CLIENT_ID: ${{ vars.RELEASE_PUBLISHER_APP_CLIENT_ID }}
           APP_OWNER: ${{ vars.RELEASE_PUBLISHER_APP_OWNER }}
           APP_PRIVATE_KEY: ${{ secrets.RELEASE_PUBLISHER_APP_PRIVATE_KEY }}
           APP_SLUG: ${{ vars.RELEASE_PUBLISHER_APP_SLUG }}
-          ACTUAL_APP_SLUG: ${{ steps.publisher-token.outputs.app-slug }}
-          ACTUAL_INSTALLATION_ID: ${{ steps.publisher-token.outputs.installation-id }}
-          INSTALLATION_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          ACTUAL_APP_SLUG: ${{ steps.publisher-inventory-token.outputs.app-slug }}
+          ACTUAL_INSTALLATION_ID: ${{ steps.publisher-inventory-token.outputs.installation-id }}
+          INVENTORY_INSTALLATION_TOKEN: ${{ steps.publisher-inventory-token.outputs.token }}
         run: |
           set -euo pipefail
-          [[ "$APP_OWNER" == "JoeyTeng" ]]
-          [[ "$APP_SLUG" == "codex-review-gate-action-publisher" ]]
-          [[ "$ACTUAL_APP_SLUG" == "$APP_SLUG" ]]
-          [[ "$ACTUAL_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]]
+          set +x
+          set +v
+          set +a
+          if [[ "$APP_OWNER" != "JoeyTeng" ]]; then
+            printf '%s\n' "Publisher App configuration invariant failed: expected owner JoeyTeng." >&2
+            exit 1
+          fi
+          if [[ "$APP_SLUG" != "codex-review-gate-action-publisher" ]]; then
+            printf '%s\n' "Publisher App configuration invariant failed: expected canonical publisher slug." >&2
+            exit 1
+          fi
+          if [[ "$ACTUAL_APP_SLUG" != "$APP_SLUG" ]]; then
+            printf '%s\n' "Publisher App token invariant failed: token app slug does not match the configured publisher slug." >&2
+            exit 1
+          fi
+          if [[ ! "$ACTUAL_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]]; then
+            printf '%s\n' "Publisher App token invariant failed: token output has no valid installation ID." >&2
+            exit 1
+          fi
+          printf '%s\n' "Publisher App static configuration and token-output checks passed."
           installation_file="$RUNNER_TEMP/publisher-installation.json"
+          # shellcheck disable=SC2153 # GitHub Actions injects this step-level secret.
           app_private_key="$APP_PRIVATE_KEY"
-          installation_token="$INSTALLATION_TOKEN"
-          unset APP_PRIVATE_KEY INSTALLATION_TOKEN
+          # shellcheck disable=SC2153 # GitHub Actions injects this action output.
+          inventory_installation_token="$INVENTORY_INSTALLATION_TOKEN"
+          unset APP_PRIVATE_KEY INVENTORY_INSTALLATION_TOKEN
           # GitHub permits installation metadata only through an App JWT.
           # Do not route that JWT through GH_TOKEN/gh api: the identity read
           # requires the Bearer scheme emitted by the bounded Node client.
-          # Installation tokens remain limited to the selected repository.
+          # The inventory token has metadata-only full-installation scope.
+          printf '%s\n' "Publisher App installation fetch starting."
           RELEASE_PUBLISHER_APP_PRIVATE_KEY="$app_private_key" \
             node scripts/generate-action-release-provenance.mjs github-app-installation \
               --client-id "$APP_CLIENT_ID" \
               --installation-id "$ACTUAL_INSTALLATION_ID" \
               --output "$installation_file"
           unset app_private_key
-          jq -e \
+          printf '%s\n' "Publisher App installation fetch completed."
+          observed_installation="$(jq -c \
+            --arg slug "$APP_SLUG" \
+            --arg owner "$APP_OWNER" \
+            --argjson installation_id "$ACTUAL_INSTALLATION_ID" \
+            '
+              def permission_value($name):
+                if (.permissions | type) != "object" then "not_an_object"
+                elif .permissions[$name] == "read" or .permissions[$name] == "write" or .permissions[$name] == "none"
+                then .permissions[$name]
+                else "unexpected"
+                end;
+              def bounded_event_count:
+                if (.events | type) != "array" then "not_an_array"
+                elif (.events | length) <= 99 then (.events | length)
+                else ">=100"
+                end;
+              {
+                installation_id_matches_token_output: (.id == $installation_id),
+                app_id_matches_expected: (.app_id == 4700530),
+                app_slug_matches_configured: (.app_slug == $slug),
+                account_login_matches_configured_owner: (if (.account | type) == "object" then (.account.login == $owner) else false end),
+                account_type_is_user: (if (.account | type) == "object" then (.account.type == "User") else false end),
+                repository_selection_is_selected: (.repository_selection == "selected"),
+                suspension_state:
+                  if (has("suspended_at") | not) then "missing"
+                  elif .suspended_at == null then "not_suspended"
+                  else "suspended"
+                  end,
+                permission_administration: permission_value("administration"),
+                permission_contents: permission_value("contents"),
+                permission_metadata: permission_value("metadata"),
+                permission_shape_matches_expected: (.permissions == {administration:"read", contents:"write", metadata:"read"}),
+                event_count: bounded_event_count
+              }
+            ' "$installation_file")"
+          printf '%s\n' "Publisher App installation observed (non-secret): $observed_installation"
+          if ! jq -e \
             --arg slug "$APP_SLUG" \
             --arg owner "$APP_OWNER" \
             --argjson installation_id "$ACTUAL_INSTALLATION_ID" \
@@ -554,16 +662,155 @@ jobs:
              .account.login == $owner and
              .account.type == "User" and
              .repository_selection == "selected" and
-             .suspended_at == null and
+             has("suspended_at") and .suspended_at == null and
              .permissions == {administration:"read", contents:"write", metadata:"read"} and
              .events == []' \
-            "$installation_file" >/dev/null
-          repository_scope="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
-            GH_HOST=github.com GH_TOKEN="$installation_token" \
-              gh api --hostname github.com installation/repositories \
-                --jq '[.total_count, (.repositories | length), .repositories[0].full_name] | @tsv')"
-          unset installation_token
-          [[ "$repository_scope" == $'1\t1\tJoeyTeng/codex-review-gate-action' ]]
+            "$installation_file" >/dev/null; then
+            printf '%s\n' "Publisher App installation invariant failed; inspect the non-secret observed identity above." >&2
+            exit 1
+          fi
+          printf '%s\n' "Publisher App installation metadata check passed."
+          printf '%s\n' "Publisher App repository scope query starting."
+          repository_scope_file="$RUNNER_TEMP/publisher-installation-repositories.json"
+          RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="$inventory_installation_token" \
+            node scripts/generate-action-release-provenance.mjs github-app-installation-repository-scope \
+              --expected-repository-id 1239944216 \
+              --expected-repository "JoeyTeng/codex-review-gate-action" \
+              --output "$repository_scope_file"
+          unset inventory_installation_token
+          printf '%s\n' "Publisher App repository scope query completed."
+          observed_repository_scope="$(jq -c \
+            '
+              def bounded_count:
+                if type == "number" then
+                  if . >= 0 and . <= 101 and floor == . then . else "unexpected" end
+                else "unexpected"
+                end;
+              if type != "object" then
+                {summary_shape: "unexpected"}
+              else
+                {
+                  total_count: (.total_count | bounded_count),
+                  returned_count: (.returned_count | bounded_count),
+                  target_shape_matches_expected: (.target_shape_matches_expected == true),
+                  target_id_matches_expected: (.target_id_matches_expected == true),
+                  target_full_name_matches_expected: (.target_full_name_matches_expected == true)
+                }
+              end
+            ' "$repository_scope_file")"
+          printf '%s\n' "Publisher App repository scope observed (non-secret): $observed_repository_scope"
+          if ! jq -e \
+            '
+              if type != "object" then false else
+                keys == [
+                  "returned_count",
+                  "target_full_name_matches_expected",
+                  "target_id_matches_expected",
+                  "target_shape_matches_expected",
+                  "total_count"
+                ] and
+                .total_count == 1 and
+                .returned_count == 1 and
+                .target_shape_matches_expected == true and
+                .target_id_matches_expected == true and
+                .target_full_name_matches_expected == true
+              end
+            ' "$repository_scope_file" >/dev/null; then
+            printf '%s\n' "Publisher App repository scope invariant failed; inspect the non-secret observed scope above." >&2
+            exit 1
+          fi
+          printf '%s\n' "Publisher App repository scope check passed."
+      - name: Create target-scoped publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: JoeyTeng
+          repositories: codex-review-gate-action
+          permission-administration: read
+          permission-contents: write
+          permission-metadata: read
+          skip-token-revoke: false
+      - name: Bind and validate target-scoped publisher token
+        env:
+          EXPECTED_APP_SLUG: ${{ vars.RELEASE_PUBLISHER_APP_SLUG }}
+          INVENTORY_APP_SLUG: ${{ steps.publisher-inventory-token.outputs.app-slug }}
+          INVENTORY_INSTALLATION_ID: ${{ steps.publisher-inventory-token.outputs.installation-id }}
+          SCOPED_APP_SLUG: ${{ steps.publisher-token.outputs.app-slug }}
+          SCOPED_INSTALLATION_ID: ${{ steps.publisher-token.outputs.installation-id }}
+          SCOPED_INSTALLATION_TOKEN: ${{ steps.publisher-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          set +x
+          set +v
+          set +a
+          if [[ "$SCOPED_APP_SLUG" != "$EXPECTED_APP_SLUG" ]]; then
+            printf '%s\n' "Publisher App scoped-token invariant failed: scoped token app slug does not match the configured publisher slug." >&2
+            exit 1
+          fi
+          if [[ "$SCOPED_APP_SLUG" != "$INVENTORY_APP_SLUG" ]]; then
+            printf '%s\n' "Publisher App scoped-token invariant failed: scoped token app slug does not match the inventory token." >&2
+            exit 1
+          fi
+          if [[ "$SCOPED_INSTALLATION_ID" != "$INVENTORY_INSTALLATION_ID" ]]; then
+            printf '%s\n' "Publisher App scoped-token invariant failed: scoped token installation ID does not match the inventory token." >&2
+            exit 1
+          fi
+          printf '%s\n' "Publisher App scoped-token binding check passed."
+          scoped_repository_scope_file="$RUNNER_TEMP/publisher-target-installation-repositories.json"
+          # shellcheck disable=SC2153 # GitHub Actions injects this action output.
+          scoped_installation_token="$SCOPED_INSTALLATION_TOKEN"
+          unset SCOPED_INSTALLATION_TOKEN
+          printf '%s\n' "Publisher App target-scoped repository scope query starting."
+          RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="$scoped_installation_token" \
+            node scripts/generate-action-release-provenance.mjs github-app-installation-repository-scope \
+              --expected-repository-id 1239944216 \
+              --expected-repository "JoeyTeng/codex-review-gate-action" \
+              --output "$scoped_repository_scope_file"
+          unset scoped_installation_token
+          printf '%s\n' "Publisher App target-scoped repository scope query completed."
+          observed_scoped_repository_scope="$(jq -c \
+            '
+              def bounded_count:
+                if type == "number" then
+                  if . >= 0 and . <= 101 and floor == . then . else "unexpected" end
+                else "unexpected"
+                end;
+              if type != "object" then
+                {summary_shape: "unexpected"}
+              else
+                {
+                  total_count: (.total_count | bounded_count),
+                  returned_count: (.returned_count | bounded_count),
+                  target_shape_matches_expected: (.target_shape_matches_expected == true),
+                  target_id_matches_expected: (.target_id_matches_expected == true),
+                  target_full_name_matches_expected: (.target_full_name_matches_expected == true)
+                }
+              end
+            ' "$scoped_repository_scope_file")"
+          printf '%s\n' "Publisher App target-scoped repository scope observed (non-secret): $observed_scoped_repository_scope"
+          if ! jq -e \
+            '
+              if type != "object" then false else
+                keys == [
+                  "returned_count",
+                  "target_full_name_matches_expected",
+                  "target_id_matches_expected",
+                  "target_shape_matches_expected",
+                  "total_count"
+                ] and
+                .total_count == 1 and
+                .returned_count == 1 and
+                .target_shape_matches_expected == true and
+                .target_id_matches_expected == true and
+                .target_full_name_matches_expected == true
+              end
+            ' "$scoped_repository_scope_file" >/dev/null; then
+            printf '%s\n' "Publisher App target-scoped repository scope invariant failed; inspect the non-secret observed scope above." >&2
+            exit 1
+          fi
+          printf '%s\n' "Publisher App target-scoped repository scope check passed."
       - name: Configure target-scoped ephemeral Git authentication
         run: |
           set -euo pipefail
@@ -622,6 +869,9 @@ jobs:
           rm -f -- "$RUNNER_TEMP/release-target-askpass"
           rm -f -- "$RUNNER_TEMP/github-signing-keys.json"
           rm -f -- "$RUNNER_TEMP/release-signing-public-key.asc"
+          rm -f -- "$RUNNER_TEMP/publisher-installation.json"
+          rm -f -- "$RUNNER_TEMP/publisher-installation-repositories.json"
+          rm -f -- "$RUNNER_TEMP/publisher-target-installation-repositories.json"
           rm -rf -- "$RUNNER_TEMP/release-gnupg"
       - name: Explain publication recovery
         if: ${{ failure() }}
@@ -629,13 +879,22 @@ jobs:
           cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
           ## Publisher execution failed
 
-          Inspect the first failure, `reconcile_state`, and `recovery_code`.
-          Exact-prefix recovery never overwrites immutable objects. If an
-          artifact is missing or expired, redispatch the same exact
-          release-intent `source_sha` together with the original admitted push
-          `admission_run_id` and `admission_run_attempt`; both candidates are
-          rebuilt and a new Environment approval is required. Complete any
-          older partial release before attempting a newer version.
+          If the first failed step is `Validate Publisher App identity and
+          full installation scope` or `Bind and validate target-scoped
+          publisher token`, inspect the nearest preceding `Publisher App ...`
+          phase marker. Static/token, App-JWT, installation-metadata,
+          installation-scope, scoped-token-binding, and target-token-scope
+          failures each report a closed failure code or a non-secret invariant
+          summary. Repair that named App configuration or installation
+          mismatch, then start a fresh reviewed release intent.
+
+          Inspect `reconcile_state` and `recovery_code` only when `Reconcile
+          release publication` started. Exact-prefix recovery never overwrites
+          immutable objects. If an artifact is missing or expired, redispatch
+          the same exact release-intent `source_sha` together with the original
+          admitted push `admission_run_id` and `admission_run_attempt`; both
+          candidates are rebuilt and a new Environment approval is required.
+          Complete any older partial release before attempting a newer version.
 
           `release-create-attempt-unknown` is the exception to ordinary
           dispatch recovery: the immutable tag already consumed the cross-run

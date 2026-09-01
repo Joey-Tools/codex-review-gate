@@ -117,22 +117,23 @@ stages:
 | Stage | Privilege | Contract |
 | --- | --- | --- |
 | `plan` | Unprivileged | Check the exact source commit, manifest, SemVer, reachability, release policy, and immutable target-parent policy. |
-| `candidate-a` | Unprivileged | Independently materialize and test candidate A on a clean runner; record its tree, inventory, modes, sizes, and SHA-256 digests. |
-| `candidate-b` | Unprivileged | Independently materialize and test candidate B on another clean runner. |
+| `candidate-a` | Unprivileged | Independently materialize and upload candidate A on a clean runner; record its tree, inventory, modes, sizes, and SHA-256 digests. |
+| `candidate-b` | Unprivileged | Independently materialize and upload candidate B on another clean runner. |
+| `source-validation` | Unprivileged | After both candidates are frozen, validate the exact source commit across one core cell and four Release-test shards on five clean runners. |
 | `assemble` | Unprivileged | Require byte-identical candidates and produce the canonical candidate bundle. |
 | `publication-plan` | Unprivileged | Reconstruct and validate the publication plan and candidate before approval; upload no privileged material. |
 | `publish` | Privileged | After Environment approval, revalidate everything and perform signed remote publication. |
 | `verify` | Unprivileged | Re-read public refs and Release state and report the observed result. |
 
-The light unprivileged `plan`, `assemble`, `publication-plan`, and `verify`
-jobs use `ubuntu-slim` with 14-minute timeouts. GitHub imposes a separate
-15-minute hard limit on that single-CPU runner, so the low-frequency, heavy
-`candidate-a` and `candidate-b` jobs use `ubuntu-24.04` with 30-minute
-timeouts. The full suite alone had consumed about 755.6 seconds before its
-final release-pipeline test completed, leaving inadequate headroom on
-`ubuntu-slim` for checkout, setup, candidate materialization, packaging, and
-upload. The privileged `publish` job also retains `ubuntu-24.04` with its
-existing 30-minute timeout.
+The light unprivileged `plan`, `candidate-a`, `candidate-b`, `assemble`,
+`publication-plan`, and `verify` jobs use `ubuntu-slim` with 14-minute
+timeouts. GitHub imposes a separate 15-minute hard limit on that single-CPU
+runner, so exact-source tests run in the `source-validation` matrix on five
+`ubuntu-24.04` runners: one core cell and four Release-test shards, each with a
+14-minute timeout and `fail-fast: false`. This replaces two serial full-suite
+validations that each took more than 17 minutes in the first live RC run while
+preserving independent candidate construction. The privileged `publish` job
+retains `ubuntu-24.04` with its existing 30-minute timeout.
 
 Only `publish` binds the `marketplace-production` Environment. Despite its
 historical name, this is the production publication-credential and approval
@@ -186,22 +187,37 @@ installation ID: 156186692
 It is installed only on `JoeyTeng/codex-review-gate-action`. Before any
 credential is minted, the privileged job checks out protected source control,
 downloads and safely extracts the assembled artifact, and repeats exact
-admission validation. Only then does it mint a just-in-time installation token
-with the allowlisted official `actions/create-github-app-token@v3` Action. The
-request names only the target repository and explicitly narrows the token to
-Administration read and Contents write. The trusted source-repository
-generator is the private key's only other consumer: it creates an in-memory
-RS256 App JWT with `iat = now - 60`, `exp = now + 540`, and `iss` equal to the
-configured App client ID, solely for
-`GET /app/installations/{installation_id}`. That JWT is never written to a
-file, `GITHUB_ENV`, an artifact, an output, a summary, or a log. The separate
-installation token reads `GET /installation/repositories`, is bound to the
-expected App identity and sole target repository, and is the only credential
-exposed to Git. It is never passed between jobs, embedded in a remote URL,
-stored in an artifact, or printed. Checkout uses `persist-credentials: false`.
-Git receives it only through an owner-private temporary `GIT_ASKPASS` helper
-scoped to the exact target repository. Post-step revocation is best effort;
-expiry is the remaining bound if the runner is forcibly terminated.
+admission validation. It then validates the configured owner and App slug and
+uses the allowlisted official `actions/create-github-app-token@v3` Action to
+mint a metadata-only inventory token with the owner set but no `repositories`
+input. That token can read the complete App-installation repository inventory,
+but cannot write. The trusted source-repository generator is the private key's
+only other consumer: it creates an in-memory RS256 App JWT with `iat = now -
+60`, `exp = now + 540`, and `iss` equal to the configured App client ID, solely
+for `GET /app/installations/{installation_id}`. That JWT is never written to a
+file, `GITHUB_ENV`, an artifact, an output, a summary, or a log.
+
+The inventory token reads `GET /installation/repositories` and must prove that
+the complete installation contains exactly the expected repository, matched by
+both repository ID and canonical name. The response is projected in memory to
+five fixed non-secret fields before it is written locally, and the temporary
+files are removed in an `always()` cleanup. Only after that proof does the job
+mint its separate target-scoped installation token. That write token names only
+the target repository and requests Administration read, Contents write, and
+Metadata read. Before it can reach Git, the publisher reads the writer token's
+own repository scope and requires the same exact singleton repository ID and
+canonical name. This second proof binds the newly minted token to the target
+repository object at mint time; matching only the App slug and installation ID
+would not establish that object identity when the token Action accepts a
+repository name. Its response receives the same five-field non-secret
+projection as the inventory response; the raw repository object is never
+persisted, and the temporary projection is removed in `always()` cleanup. It
+is the only credential exposed to Git; it is never passed between jobs,
+embedded in a remote URL, stored in an artifact, or printed.
+Checkout uses `persist-credentials: false`. Git receives it only through an
+owner-private temporary `GIT_ASKPASS` helper scoped to the exact target
+repository. Post-step revocation is best effort; expiry is the remaining bound
+if the runner is forcibly terminated.
 
 Every `uses:` dependency in the publisher workflow must be an allowlisted
 GitHub-official Action referenced by its floating major, such as `@v4`, and
@@ -212,9 +228,10 @@ not missed. A major-alias upgrade remains an ordinary reviewed infrastructure
 PR and must not share a release-intent change.
 
 The installed App grants the implicit `Metadata: read` plus `Contents:
-read/write` and `Administration: read`. The publisher requests only
-Administration read and Contents write for its one-repository installation
-token. It does not require Workflows write.
+read/write` and `Administration: read`. The publisher first requests only
+Metadata read for the complete-installation inventory token, then requests
+Administration read, Contents write, and Metadata read for its one-repository
+write token. It does not require Workflows write.
 
 The `marketplace-production` Environment provides:
 
@@ -227,10 +244,10 @@ RELEASE_PUBLISHER_APP_PRIVATE_KEY=<environment secret>
 
 The private key exists only inside the privileged `publish` job after
 credential-free admission succeeds. It is supplied to the official token
-Action to mint the installation token and, for the single App-installation
-identity read described above, directly to the trusted generator to construct
-the short-lived JWT in memory. It is never persisted or exposed through
-`GITHUB_ENV`, an artifact, an output, a summary, or a log.
+Action for the inventory and target-scoped tokens and, for the single
+App-installation identity read described above, directly to the trusted
+generator to construct the short-lived JWT in memory. It is never persisted or
+exposed through `GITHUB_ENV`, an artifact, an output, a summary, or a log.
 
 Publication commits, immutable tags, and floating aliases are signed by the
 dedicated `JoeyTeng-Codex <codex@mahane.me>` key:
@@ -268,11 +285,13 @@ real GitHub inventory validator and byte-compares its raw exported certificate
 with the approved certificate at the production fences. Production has no
 signer-policy skip path.
 
-The just-in-time token is proved, before the first write, to belong to the
-expected Publisher App installation and sole target repository. The target
-rulesets then admit that App as the only publication bypass identity. The GPG
-identity is the author, committer, and signer embedded in the publication Git
-objects, and its signatures remain independently verifiable after publication.
+Before the first write, the full-installation inventory proves the expected
+Publisher App installation has the sole target repository, and the separate
+write token is bound to that same App slug and installation ID and is reread as
+the exact target repository object. The target rulesets then admit that App as
+the only publication bypass identity. The GPG identity is the author,
+committer, and signer embedded in the publication Git objects, and its
+signatures remain independently verifiable after publication.
 
 Do not over-read the later GitHub state checks: ref, commit, signature, and
 Release readback proves the resulting objects and current repository state, but
@@ -319,11 +338,17 @@ actors after approval and before its first write.
 ## Candidate and signed release commit
 
 `candidate-a` and `candidate-b` start from the same exact source commit but run
-independently. Each materializes, packs, and uploads its candidate before it
-runs `npm run check` and the complete Node test suite from its own detached
-frozen-source worktree. Source test code therefore cannot mutate the uploaded
-candidate, while a failed test still fails the job and prevents assembly. Each
-candidate emits a canonical inventory and digests. The
+independently. Each materializes, packs, and uploads its candidate on a
+separate clean runner. Only after both uploads succeed does the
+`source-validation` matrix create detached exact-source worktrees on five more
+clean runners. Its core cell runs `npm run check` plus every non-Release test;
+its four Release cells partition the complete Release-pipeline inventory. The
+matrix preserves all cell results, and `assemble` depends on the entire matrix,
+so any failed or missing cell blocks publication. Source test code cannot
+mutate either already-uploaded candidate because validation jobs do not
+download those artifacts. Candidate independence remains enforced by the two
+separate builders and the later byte-identical comparison. Each candidate
+emits a canonical inventory and digests. The
 inventory byte-sorts every Git path and records its type, Git mode, logical
 size, and SHA-256 content digest. Only the explicit
 `src/v2/gate-runtime.mjs` v2 runtime module is admitted; reintroducing a retired

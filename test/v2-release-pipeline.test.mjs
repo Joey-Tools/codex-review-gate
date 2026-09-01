@@ -147,6 +147,269 @@ function workflowJobBlock(workflow, jobName) {
   return workflow.slice(start, end);
 }
 
+function workflowStepBlock(job, stepName) {
+  const marker = `      - name: ${stepName}\n`;
+  const start = job.indexOf(marker);
+  assert.notEqual(start, -1, `missing workflow step: ${stepName}`);
+  const bodyStart = start + marker.length;
+  const nextStepOffset = job
+    .slice(bodyStart)
+    .search(/^      - name: /mu);
+  const end = nextStepOffset === -1 ? job.length : bodyStart + nextStepOffset;
+  return job.slice(start, end);
+}
+
+function workflowRunScript(step) {
+  const marker = "        run: |\n";
+  const start = step.indexOf(marker);
+  assert.notEqual(start, -1, "workflow step must contain a literal run script");
+  return step
+    .slice(start + marker.length)
+    .split("\n")
+    .map((line) => line.startsWith("          ") ? line.slice(10) : line)
+    .join("\n");
+}
+
+function assertPublisherRepositoryScopeGuardFailsClosed(identityStep) {
+  assert.doesNotMatch(identityStep, /^\s*continue-on-error:/mu);
+  const observedScopeStart = identityStep.indexOf(
+    "Publisher App repository scope observed (non-secret)",
+  );
+  const guardStart = identityStep.indexOf("          if ! jq -e \\", observedScopeStart);
+  const guardEndMarker =
+    "          printf '%s\\n' \"Publisher App repository scope check passed.\"";
+  const guardEndStart = identityStep.indexOf(guardEndMarker, guardStart);
+  assert.ok(observedScopeStart >= 0, "repository scope observation must precede the guard");
+  assert.ok(guardStart > observedScopeStart, "repository scope guard must remain present");
+  assert.ok(guardEndStart > guardStart, "repository scope success boundary must remain present");
+  const scopeGuard = identityStep
+    .slice(guardStart, guardEndStart + guardEndMarker.length)
+    .split("\n")
+    .map((line) => line.startsWith("          ") ? line.slice(10) : line)
+    .join("\n");
+
+  const root = mkdtempSync(join(tmpdir(), "release-publisher-scope-guard-"));
+  try {
+    const guardScript = join(root, "scope-guard.sh");
+    writeFileSync(guardScript, `#!/usr/bin/env bash
+set -euo pipefail
+repository_scope_file="$1"
+target_scope_marker="$2"
+${scopeGuard}
+printf '%s\\n' 'target-scoped publisher token entered' > "$target_scope_marker"
+`);
+    chmodSync(guardScript, 0o755);
+
+    const validScope = {
+      total_count: 1,
+      returned_count: 1,
+      target_shape_matches_expected: true,
+      target_id_matches_expected: true,
+      target_full_name_matches_expected: true,
+    };
+    for (const { label, scope, accepted } of [
+      { label: "exact target-only installation", scope: validScope, accepted: true },
+      {
+        label: "more than one installed repository",
+        scope: { ...validScope, total_count: 2, returned_count: 2 },
+        accepted: false,
+      },
+      {
+        label: "malformed target repository",
+        scope: { ...validScope, target_shape_matches_expected: false },
+        accepted: false,
+      },
+      {
+        label: "wrong target repository ID",
+        scope: { ...validScope, target_id_matches_expected: false },
+        accepted: false,
+      },
+      {
+        label: "wrong target repository full_name",
+        scope: { ...validScope, target_full_name_matches_expected: false },
+        accepted: false,
+      },
+      {
+        label: "unexpected persisted projection field",
+        scope: { ...validScope, unexpected: true },
+        accepted: false,
+      },
+    ]) {
+      const stem = label.replaceAll(/[^a-z0-9]+/gu, "-");
+      const scopeFile = join(root, `${stem}.json`);
+      const targetScopeMarker = join(root, `${stem}.target-token-entered`);
+      writeFileSync(scopeFile, `${JSON.stringify(scope)}\n`);
+      const result = invoke("bash", [guardScript, scopeFile, targetScopeMarker], { cwd: root });
+      if (accepted) {
+        assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+        assert.equal(existsSync(targetScopeMarker), true, label);
+        assert.match(result.stdout, /Publisher App repository scope check passed\./u);
+      } else {
+        assert.notEqual(result.status, 0, label);
+        assert.equal(existsSync(targetScopeMarker), false, label);
+        assert.match(
+          result.stderr,
+          /Publisher App repository scope invariant failed; inspect the non-secret observed scope above\./u,
+          label,
+        );
+        assert.doesNotMatch(result.stdout, /target-scoped publisher token entered/u, label);
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function assertPublisherBindingAndWriterScopeFailClosed(bindingStep) {
+  const bindingScriptBody = workflowRunScript(bindingStep);
+  const root = mkdtempSync(join(tmpdir(), "release-publisher-binding-guard-"));
+  try {
+    const fakeBin = join(root, "bin");
+    mkdirSync(fakeBin, { recursive: true });
+    const fakeNode = join(fakeBin, "node");
+    writeFileSync(fakeNode, `#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == scripts/generate-action-release-provenance.mjs ]]
+[[ "$2" == github-app-installation-repository-scope ]]
+shift 2
+expected_repository_id=
+expected_repository=
+output=
+while (( $# > 0 )); do
+  case "$1" in
+    --expected-repository-id) expected_repository_id="$2"; shift 2 ;;
+    --expected-repository) expected_repository="$2"; shift 2 ;;
+    --output) output="$2"; shift 2 ;;
+    *) exit 94 ;;
+  esac
+done
+[[ "$expected_repository_id" == 1239944216 ]]
+[[ "$expected_repository" == JoeyTeng/codex-review-gate-action ]]
+[[ -n "$output" ]]
+[[ "\${RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN:-}" == "$EXPECTED_SCOPED_TOKEN" ]]
+cp "$FAKE_SCOPE_FIXTURE" "$output"
+printf '%s\n' helper-entered > "$FAKE_HELPER_MARKER"
+`);
+    chmodSync(fakeNode, 0o755);
+    const bindingScript = join(root, "binding-step.sh");
+    writeFileSync(bindingScript, `#!/usr/bin/env bash
+${bindingScriptBody}
+[[ -z "\${SCOPED_INSTALLATION_TOKEN:-}" ]]
+[[ -z "\${scoped_installation_token:-}" ]]
+[[ -z "\${RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN:-}" ]]
+printf '%s\\n' 'Git authentication downstream entered' > "$DOWNSTREAM_MARKER"
+`);
+    chmodSync(bindingScript, 0o755);
+
+    const canonicalSlug = "codex-review-gate-action-publisher";
+    const installationId = "12345678";
+    const validScope = {
+      total_count: 1,
+      returned_count: 1,
+      target_shape_matches_expected: true,
+      target_id_matches_expected: true,
+      target_full_name_matches_expected: true,
+    };
+    for (const {
+      label,
+      env = {},
+      scope = validScope,
+      accepted,
+      helperEntered,
+      failurePattern,
+    } of [
+      {
+        label: "bound writer token with exact target scope",
+        accepted: true,
+        helperEntered: true,
+      },
+      {
+        label: "configured slug mismatch",
+        env: { EXPECTED_APP_SLUG: "replacement-publisher" },
+        accepted: false,
+        helperEntered: false,
+        failurePattern: /configured publisher slug/u,
+      },
+      {
+        label: "inventory slug mismatch",
+        env: { INVENTORY_APP_SLUG: "replacement-publisher" },
+        accepted: false,
+        helperEntered: false,
+        failurePattern: /inventory token/u,
+      },
+      {
+        label: "inventory installation ID mismatch",
+        env: { INVENTORY_INSTALLATION_ID: "87654321" },
+        accepted: false,
+        helperEntered: false,
+        failurePattern: /installation ID does not match the inventory token/u,
+      },
+      {
+        label: "writer token resolves a replacement repository ID",
+        scope: { ...validScope, target_id_matches_expected: false },
+        accepted: false,
+        helperEntered: true,
+        failurePattern: /target-scoped repository scope invariant failed/u,
+      },
+      {
+        label: "writer token resolves a non-canonical full name",
+        scope: { ...validScope, target_full_name_matches_expected: false },
+        accepted: false,
+        helperEntered: true,
+        failurePattern: /target-scoped repository scope invariant failed/u,
+      },
+      {
+        label: "writer token is not exact singleton scope",
+        scope: { ...validScope, total_count: 2, returned_count: 2 },
+        accepted: false,
+        helperEntered: true,
+        failurePattern: /target-scoped repository scope invariant failed/u,
+      },
+    ]) {
+      const stem = label.replaceAll(/[^a-z0-9]+/gu, "-");
+      const caseRoot = join(root, stem);
+      mkdirSync(caseRoot, { recursive: true });
+      const scopeFixture = join(caseRoot, "scope.json");
+      const helperMarker = join(caseRoot, "helper-entered");
+      const downstreamMarker = join(caseRoot, "downstream-entered");
+      writeFileSync(scopeFixture, `${JSON.stringify(scope)}\n`);
+      const result = invoke("bash", [bindingScript], {
+        cwd: root,
+        env: {
+          DOWNSTREAM_MARKER: downstreamMarker,
+          EXPECTED_APP_SLUG: canonicalSlug,
+          EXPECTED_SCOPED_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+          FAKE_HELPER_MARKER: helperMarker,
+          FAKE_SCOPE_FIXTURE: scopeFixture,
+          INVENTORY_APP_SLUG: canonicalSlug,
+          INVENTORY_INSTALLATION_ID: installationId,
+          PATH: `${fakeBin}:${executionEnv.PATH}`,
+          RUNNER_TEMP: caseRoot,
+          SCOPED_APP_SLUG: canonicalSlug,
+          SCOPED_INSTALLATION_ID: installationId,
+          SCOPED_INSTALLATION_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+          SHELLOPTS: "allexport:verbose:xtrace",
+          ...env,
+        },
+      });
+      const combined = `${result.stdout}\n${result.stderr}`;
+      assert.doesNotMatch(combined, new RegExp(SYNTHETIC_TOKEN_FIXTURE.value, "u"), label);
+      assert.equal(existsSync(helperMarker), helperEntered, label);
+      if (accepted) {
+        assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+        assert.equal(existsSync(downstreamMarker), true, label);
+        assert.match(result.stdout, /target-scoped repository scope check passed\./u);
+      } else {
+        assert.notEqual(result.status, 0, label);
+        assert.equal(existsSync(downstreamMarker), false, label);
+        assert.match(result.stderr, failurePattern, label);
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function run(file, args, options = {}) {
   return execFileSync(file, args, {
     encoding: "utf8",
@@ -1865,25 +2128,106 @@ test("publisher fixtures isolate the host workflow identity and credentials", ()
   });
 });
 
-test("only heavy release-candidate jobs receive extended timeout headroom", () => {
+test("release workflow assigns runners and timeout headroom by workload", () => {
   const workflow = readFileSync(workflowPath, "utf8");
-  assert.equal(workflow.match(/^    timeout-minutes: 30$/gmu)?.length ?? 0, 3);
-  assert.equal(workflow.match(/^    timeout-minutes: 14$/gmu)?.length ?? 0, 4);
-  for (const jobName of ["candidate-a", "candidate-b"]) {
-    const job = workflowJobBlock(workflow, jobName);
-    assert.match(job, /^    runs-on: ubuntu-24\.04$/mu, jobName);
-    assert.match(job, /^    timeout-minutes: 30$/mu, jobName);
-    assert.doesNotMatch(job, /^    timeout-minutes: 14$/mu, jobName);
-  }
-  for (const jobName of ["plan", "assemble", "publication_plan", "verify"]) {
+  assert.equal(workflow.match(/^    timeout-minutes: 30$/gmu)?.length ?? 0, 1);
+  assert.equal(workflow.match(/^    timeout-minutes: 14$/gmu)?.length ?? 0, 7);
+  for (const jobName of [
+    "plan",
+    "candidate-a",
+    "candidate-b",
+    "assemble",
+    "publication_plan",
+    "verify",
+  ]) {
     const job = workflowJobBlock(workflow, jobName);
     assert.match(job, /^    runs-on: ubuntu-slim$/mu, jobName);
     assert.match(job, /^    timeout-minutes: 14$/mu, jobName);
     assert.doesNotMatch(job, /^    timeout-minutes: 30$/mu, jobName);
   }
+  const sourceValidation = workflowJobBlock(workflow, "source-validation");
+  assert.match(sourceValidation, /^    runs-on: ubuntu-24\.04$/mu);
+  assert.match(sourceValidation, /^    timeout-minutes: 14$/mu);
+  assert.doesNotMatch(sourceValidation, /^    timeout-minutes: 30$/mu);
   const publish = workflowJobBlock(workflow, "publish");
   assert.match(publish, /^    runs-on: ubuntu-24\.04$/mu);
   assert.match(publish, /^    timeout-minutes: 30$/mu);
+  const releaseShardEnvironment = [
+    "CODEX",
+    "REVIEW",
+    "GATE",
+    "RELEASE",
+    "TEST",
+    "SHARD",
+  ].join("_");
+  const candidateA = workflowJobBlock(workflow, "candidate-a");
+  const candidateB = workflowJobBlock(workflow, "candidate-b");
+  const validation = workflowJobBlock(workflow, "source-validation");
+  const assemble = workflowJobBlock(workflow, "assemble");
+
+  for (const [jobName, job] of [
+    ["candidate-a", candidateA],
+    ["candidate-b", candidateB],
+  ]) {
+    assert.match(job, /Upload candidate [AB]/u, jobName);
+    assert.doesNotMatch(job, /npm (?:run check|test)|git worktree add/u, jobName);
+  }
+
+  assert.match(validation, /^    name: Validate frozen source \/ \$\{\{ matrix\.suite\.name \}\}$/mu);
+  assert.match(validation, /^    needs: \[candidate-a, candidate-b\]$/mu);
+  const strategyStart = validation.indexOf("    strategy:\n");
+  const stepsStart = validation.indexOf("    steps:\n");
+  assert.ok(strategyStart !== -1 && stepsStart > strategyStart);
+  assert.equal(
+    validation.slice(strategyStart, stepsStart).trimEnd(),
+    [
+      "    strategy:",
+      "      fail-fast: false",
+      "      matrix:",
+      "        suite:",
+      "          - name: core",
+      "            release_test_shard: \"off\"",
+      "          - name: release 1/4",
+      "            release_test_shard: \"1/4\"",
+      "          - name: release 2/4",
+      "            release_test_shard: \"2/4\"",
+      "          - name: release 3/4",
+      "            release_test_shard: \"3/4\"",
+      "          - name: release 4/4",
+      "            release_test_shard: \"4/4\"",
+    ].join("\n"),
+  );
+  assert.match(
+    validation,
+    /git worktree add --detach "\$RUNNER_TEMP\/release-source" "\$RELEASE_SOURCE_SHA"/u,
+  );
+  const coreValidationStep = workflowStepBlock(
+    validation,
+    "Run checks and non-release tests",
+  );
+  assert.match(
+    coreValidationStep,
+    /^      - name: Run checks and non-release tests\n        if: \$\{\{ matrix\.suite\.release_test_shard == 'off' \}\}/mu,
+  );
+  assert.match(
+    coreValidationStep,
+    /^          cd "\$RUNNER_TEMP\/release-source"\n          npm run check\n          npm test -- --test-concurrency=1 --test-reporter=dot$/mu,
+  );
+  assert.ok(validation.includes(`${releaseShardEnvironment}: "off"`));
+  const releaseShardStep = workflowStepBlock(validation, "Run release pipeline shard");
+  assert.match(
+    releaseShardStep,
+    /^      - name: Run release pipeline shard\n        if: \$\{\{ matrix\.suite\.release_test_shard != 'off' \}\}/mu,
+  );
+  assert.match(
+    releaseShardStep,
+    /^          cd "\$RUNNER_TEMP\/release-source"\n          node --test --test-reporter=dot test\/v2-release-pipeline\.test\.mjs$/mu,
+  );
+  const matrixShardExpression = "${{ matrix." + "suite" + ".release_test_shard }}";
+  assert.ok(validation.includes(
+    `${releaseShardEnvironment}: ${matrixShardExpression}`,
+  ));
+  assert.match(assemble, /^    needs: \[candidate-a, candidate-b, source-validation\]$/mu);
 });
 
 test("workflow and publisher expose the adopted staged ABI and scoped credentials", () => {
@@ -1902,7 +2246,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   ]) {
     assert.ok(help.includes(mode), mode);
   }
-  assert.match(workflow, /plan:[\s\S]*candidate-a:[\s\S]*candidate-b:[\s\S]*assemble:[\s\S]*publication_plan:[\s\S]*publish:[\s\S]*verify:/u);
+  assert.match(workflow, /plan:[\s\S]*candidate-a:[\s\S]*candidate-b:[\s\S]*source-validation:[\s\S]*assemble:[\s\S]*publication_plan:[\s\S]*publish:[\s\S]*verify:/u);
   assert.match(workflow, /publication_plan:[\s\S]*runs-on: ubuntu-slim/u);
   assert.match(workflow, /publish:[\s\S]*environment: marketplace-production/u);
   assert.ok(
@@ -1919,7 +2263,19 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     workflow.indexOf("Revalidate publication plan before minting credentials") <
       workflow.indexOf("Validate live release signing certificate before minting credentials") &&
       workflow.indexOf("Validate live release signing certificate before minting credentials") <
-        workflow.indexOf("Create least-privilege publisher token"),
+        workflow.indexOf("Validate Publisher App static configuration before inventory") &&
+      workflow.indexOf("Validate Publisher App static configuration before inventory") <
+        workflow.indexOf("Create inventory-only Publisher App token") &&
+      workflow.indexOf("Create inventory-only Publisher App token") <
+        workflow.indexOf("Validate Publisher App identity and full installation scope") &&
+      workflow.indexOf("Validate Publisher App identity and full installation scope") <
+        workflow.indexOf("Create target-scoped publisher token") &&
+      workflow.indexOf("Create target-scoped publisher token") <
+        workflow.indexOf("Bind and validate target-scoped publisher token") &&
+      workflow.indexOf("Bind and validate target-scoped publisher token") <
+        workflow.indexOf("Configure target-scoped ephemeral Git authentication") &&
+      workflow.indexOf("Configure target-scoped ephemeral Git authentication") <
+        workflow.indexOf("Reconcile release publication"),
   );
   assert.match(workflow, /--verify-publication-plan[\s\S]*--publication-plan-file/u);
   assert.match(workflow, /--publish[\s\S]*--publication-plan-file/u);
@@ -1936,16 +2292,174 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.doesNotMatch(workflow, /GIT_ASKPASS=.*>>\s*"\$GITHUB_ENV"/u);
   assert.match(workflow, /RELEASE_TARGET_ASKPASS: \$\{\{ runner\.temp \}\}\/release-target-askpass/u);
   assert.doesNotMatch(workflow, /gh api installation\s*>/u);
-  assert.match(workflow, /github-app-installation[\s\S]*--client-id "\$APP_CLIENT_ID"[\s\S]*--installation-id "\$ACTUAL_INSTALLATION_ID"[\s\S]*--output "\$installation_file"/u);
+  const publishJob = workflowJobBlock(workflow, "publish");
+  const preInventoryConfigurationStep = workflowStepBlock(
+    publishJob,
+    "Validate Publisher App static configuration before inventory",
+  );
+  const inventoryTokenStep = workflowStepBlock(
+    publishJob,
+    "Create inventory-only Publisher App token",
+  );
+  const identityStep = workflowStepBlock(
+    publishJob,
+    "Validate Publisher App identity and full installation scope",
+  );
+  const scopedTokenStep = workflowStepBlock(
+    publishJob,
+    "Create target-scoped publisher token",
+  );
+  const bindingStep = workflowStepBlock(
+    publishJob,
+    "Bind and validate target-scoped publisher token",
+  );
+  const configureAuthenticationStep = workflowStepBlock(
+    publishJob,
+    "Configure target-scoped ephemeral Git authentication",
+  );
+  const reconcileStep = workflowStepBlock(publishJob, "Reconcile release publication");
+  const cleanupStep = workflowStepBlock(publishJob, "Remove ephemeral local credentials");
+  const recoveryStep = workflowStepBlock(publishJob, "Explain publication recovery");
+
+  assert.match(preInventoryConfigurationStep, /APP_OWNER: \$\{\{ vars\.RELEASE_PUBLISHER_APP_OWNER \}\}/u);
+  assert.match(preInventoryConfigurationStep, /APP_SLUG: \$\{\{ vars\.RELEASE_PUBLISHER_APP_SLUG \}\}/u);
+  assert.match(preInventoryConfigurationStep, /static configuration check passed before inventory token minting/u);
+  assert.doesNotMatch(preInventoryConfigurationStep, /(?:PRIVATE_KEY|TOKEN|GITHUB_ENV|GITHUB_OUTPUT|GITHUB_STEP_SUMMARY)/u);
+  assert.match(inventoryTokenStep, /id: publisher-inventory-token/u);
+  assert.match(inventoryTokenStep, /uses: actions\/create-github-app-token@v3/u);
+  assert.match(inventoryTokenStep, /owner: JoeyTeng/u);
+  assert.match(inventoryTokenStep, /permission-metadata: read/u);
+  assert.match(inventoryTokenStep, /skip-token-revoke: false/u);
+  assert.doesNotMatch(inventoryTokenStep, /^          repositories:/mu);
+  assert.deepEqual(
+    [...inventoryTokenStep.matchAll(/^          (permission-[^:]+): (\S+)$/gmu)]
+      .map((match) => [match[1], match[2]]),
+    [["permission-metadata", "read"]],
+  );
+  assert.match(scopedTokenStep, /id: publisher-token/u);
+  assert.match(scopedTokenStep, /uses: actions\/create-github-app-token@v3/u);
+  assert.match(scopedTokenStep, /owner: JoeyTeng/u);
+  assert.match(scopedTokenStep, /repositories: codex-review-gate-action/u);
+  assert.match(scopedTokenStep, /skip-token-revoke: false/u);
+  assert.deepEqual(
+    [...scopedTokenStep.matchAll(/^          (permission-[^:]+): (\S+)$/gmu)]
+      .map((match) => [match[1], match[2]]),
+    [
+      ["permission-administration", "read"],
+      ["permission-contents", "write"],
+      ["permission-metadata", "read"],
+    ],
+  );
+
+  assert.match(identityStep, /ACTUAL_APP_SLUG: \$\{\{ steps\.publisher-inventory-token\.outputs\.app-slug \}\}/u);
+  assert.match(identityStep, /ACTUAL_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
+  assert.match(identityStep, /INVENTORY_INSTALLATION_TOKEN: \$\{\{ steps\.publisher-inventory-token\.outputs\.token \}\}/u);
+  assert.match(identityStep, /github-app-installation[\s\S]*--client-id "\$APP_CLIENT_ID"[\s\S]*--installation-id "\$ACTUAL_INSTALLATION_ID"[\s\S]*--output "\$installation_file"/u);
   assert.match(
-    workflow,
+    identityStep,
     /RELEASE_PUBLISHER_APP_PRIVATE_KEY="\$app_private_key"[\s\S]*github-app-installation/u,
   );
-  assert.doesNotMatch(workflow, /GH_TOKEN="\$app_jwt"|Authorization:\s*token/u);
+  assert.match(identityStep, /set \+x[\s\S]*set \+v[\s\S]*set \+a[\s\S]*app_private_key="\$APP_PRIVATE_KEY"/u);
+  assert.match(identityStep, /Publisher App configuration invariant failed: expected owner JoeyTeng\./u);
+  assert.match(identityStep, /Publisher App configuration invariant failed: expected canonical publisher slug\./u);
+  assert.match(identityStep, /Publisher App token invariant failed: token app slug does not match the configured publisher slug\./u);
+  assert.match(identityStep, /Publisher App token invariant failed: token output has no valid installation ID\./u);
+  assert.match(identityStep, /Publisher App static configuration and token-output checks passed\./u);
+  assert.match(identityStep, /Publisher App installation fetch starting\./u);
+  assert.match(identityStep, /Publisher App installation fetch completed\./u);
+  assert.match(identityStep, /Publisher App installation observed \(non-secret\): \$observed_installation/u);
+  assert.match(identityStep, /Publisher App installation invariant failed; inspect the non-secret observed identity above\./u);
+  assert.match(identityStep, /Publisher App installation metadata check passed\./u);
+  assert.match(identityStep, /installation_id_matches_token_output: \(\.id == \$installation_id\)/u);
+  assert.match(identityStep, /permission_shape_matches_expected: \(\.permissions == \{administration:"read", contents:"write", metadata:"read"\}\)/u);
+  assert.match(identityStep, /suspension_state:/u);
+  assert.match(identityStep, /has\("suspended_at"\) and \.suspended_at == null/u);
+  assert.doesNotMatch(identityStep, /suspended:\s*\(\.suspended_at != null\)/u);
+  assert.doesNotMatch(identityStep, /permission_keys:|events: \(if/u);
+  assert.match(identityStep, /Publisher App repository scope query starting\./u);
   assert.match(
-    workflow,
-    /env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$installation_token"[\s\\]*gh api --hostname github\.com installation\/repositories/u,
+    identityStep,
+    /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$repository_scope_file"/u,
   );
+  assert.match(identityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$inventory_installation_token"/u);
+  assert.match(identityStep, /keys == \[[\s\S]*"returned_count"[\s\S]*"target_full_name_matches_expected"[\s\S]*"target_id_matches_expected"[\s\S]*"target_shape_matches_expected"[\s\S]*"total_count"[\s\S]*\]/u);
+  assert.match(identityStep, /\.total_count == 1[\s\S]*\.returned_count == 1[\s\S]*\.target_shape_matches_expected == true[\s\S]*\.target_id_matches_expected == true[\s\S]*\.target_full_name_matches_expected == true/u);
+  assert.doesNotMatch(identityStep, /\.repositories\b/u);
+  assert.match(identityStep, /Publisher App repository scope observed \(non-secret\): \$observed_repository_scope/u);
+  assert.match(identityStep, /Publisher App repository scope query completed\./u);
+  assert.match(identityStep, /Publisher App repository scope invariant failed; inspect the non-secret observed scope above\./u);
+  assert.match(identityStep, /Publisher App repository scope check passed\./u);
+  assertPublisherRepositoryScopeGuardFailsClosed(identityStep);
+
+  assert.match(bindingStep, /SCOPED_APP_SLUG: \$\{\{ steps\.publisher-token\.outputs\.app-slug \}\}/u);
+  assert.match(bindingStep, /SCOPED_INSTALLATION_ID: \$\{\{ steps\.publisher-token\.outputs\.installation-id \}\}/u);
+  assert.match(bindingStep, /SCOPED_INSTALLATION_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
+  assert.match(bindingStep, /INVENTORY_APP_SLUG: \$\{\{ steps\.publisher-inventory-token\.outputs\.app-slug \}\}/u);
+  assert.match(bindingStep, /INVENTORY_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
+  assert.match(bindingStep, /scoped token app slug does not match the configured publisher slug/u);
+  assert.match(bindingStep, /scoped token app slug does not match the inventory token/u);
+  assert.match(bindingStep, /scoped token installation ID does not match the inventory token/u);
+  assert.match(bindingStep, /Publisher App scoped-token binding check passed\./u);
+  const bindingLines = bindingStep.split("\n");
+  const scopedTokenCapture = bindingLines.findIndex((line) =>
+    line.includes('scoped_installation_token="$SCOPED_INSTALLATION_TOKEN"'));
+  assert.ok(scopedTokenCapture > 0, "binding step must capture the target-scoped token locally");
+  for (const command of ["set +x", "set +v", "set +a"]) {
+    const commandIndex = bindingLines.findIndex((line) => line.trim() === command);
+    assert.ok(commandIndex >= 0 && commandIndex < scopedTokenCapture, `${command} must precede scoped-token capture`);
+  }
+  assert.match(bindingStep, /unset SCOPED_INSTALLATION_TOKEN/u);
+  assert.match(bindingStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$scoped_installation_token"/u);
+  assert.match(
+    bindingStep,
+    /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$scoped_repository_scope_file"/u,
+  );
+  assert.match(bindingStep, /unset scoped_installation_token/u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope observed \(non-secret\): \$observed_scoped_repository_scope/u);
+  assert.match(bindingStep, /keys == \[[\s\S]*"returned_count"[\s\S]*"target_full_name_matches_expected"[\s\S]*"target_id_matches_expected"[\s\S]*"target_shape_matches_expected"[\s\S]*"total_count"[\s\S]*\]/u);
+  assert.match(bindingStep, /\.total_count == 1[\s\S]*\.returned_count == 1[\s\S]*\.target_shape_matches_expected == true[\s\S]*\.target_id_matches_expected == true[\s\S]*\.target_full_name_matches_expected == true/u);
+  assert.doesNotMatch(bindingStep, /\.repositories\b|\.full_name\b|temp_clone_token/u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope invariant failed; inspect the non-secret observed scope above\./u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope check passed\./u);
+  assert.doesNotMatch(bindingStep, /^\s*continue-on-error:/mu);
+  assertPublisherBindingAndWriterScopeFailClosed(bindingStep);
+  assert.match(configureAuthenticationStep, /release-target-askpass/u);
+  assert.match(reconcileStep, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
+  assert.doesNotMatch(
+    reconcileStep,
+    /(?:INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN)/u,
+  );
+
+  // The secret-bearing steps do not reference workflow output, environment, or
+  // summary sinks at all. This catches both direct and local-variable writes.
+  const secretBearingPublisherSteps = [
+    inventoryTokenStep,
+    identityStep,
+    scopedTokenStep,
+    bindingStep,
+  ].join("\n");
+  assert.doesNotMatch(secretBearingPublisherSteps, /\bGITHUB_(?:ENV|OUTPUT|STEP_SUMMARY)\b/u);
+  const publishSinkLines = publishJob
+    .split("\n")
+    .filter((line) => /\bGITHUB_(?:ENV|OUTPUT|STEP_SUMMARY)\b/u.test(line))
+    .map((line) => line.trim());
+  assert.deepEqual(publishSinkLines, [
+    "printf 'GNUPGHOME=%s\\n' \"$signing_home\" >> \"$GITHUB_ENV\"",
+    "cat >> \"$GITHUB_STEP_SUMMARY\" <<'SUMMARY'",
+  ]);
+  assert.doesNotMatch(
+    recoveryStep,
+    /(?:APP_PRIVATE_KEY|INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_PRIVATE_KEY|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN|app_private_key|inventory_installation_token|scoped_installation_token)/u,
+  );
+  assert.match(cleanupStep, /rm -f -- "\$RUNNER_TEMP\/publisher-installation\.json"/u);
+  assert.match(cleanupStep, /rm -f -- "\$RUNNER_TEMP\/publisher-installation-repositories\.json"/u);
+  assert.match(cleanupStep, /rm -f -- "\$RUNNER_TEMP\/publisher-target-installation-repositories\.json"/u);
+  assert.match(workflow, /If the first failed step is `Validate Publisher App identity and[\s\S]*full installation scope` or `Bind and validate target-scoped[\s\S]*publisher token`/u);
+  assert.match(recoveryStep, /scoped-token-binding, and target-token-scope/u);
+  assert.match(workflow, /Inspect `reconcile_state` and `recovery_code` only when `Reconcile[\s\S]*release publication` started\./u);
+  assert.doesNotMatch(workflow, /Inspect the first failure, `reconcile_state`, and `recovery_code`\./u);
+  assert.doesNotMatch(workflow, /GH_TOKEN="\$app_jwt"|Authorization:\s*token/u);
+  assert.doesNotMatch(workflow, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN.*GITHUB_ENV/u);
   assert.doesNotMatch(workflow, /(?:APP_PRIVATE_KEY|app_jwt).*GITHUB_ENV/u);
   assert.match(workflow, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
   assert.doesNotMatch(workflow, /^\s+(?:GH_TOKEN|PUBLISHER_TOKEN): \$\{\{ steps\.publisher-token\.outputs\.token \}\}/mu);
@@ -1970,7 +2484,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   }
   assert.equal(
     (workflow.match(/\bgh api --hostname github\.com\b/gu) ?? []).length,
-    4,
+    3,
     "every direct workflow gh API call must bind github.com explicitly",
   );
   assert.doesNotMatch(

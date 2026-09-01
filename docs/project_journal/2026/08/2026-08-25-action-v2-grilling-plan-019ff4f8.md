@@ -3254,6 +3254,190 @@ superseded_by:
   follow-up and a completely new whole-range exact-head review remain required
   before landing.
 
+### Live RC staging timing and release-source matrix split
+
+- PR #35 landed the separate `v2.0.0-rc.1` release intent as source commit
+  `af8430ce086517918e4ac8b8c7b9ff124ebec3ef`. Live release run
+  `33463583561` then proved the unprivileged plan, dual-candidate, assembly and
+  publication-plan stages. Candidate A completed in 17m10s and candidate B in
+  17m22s; plan, assembly and publication-plan completed in 26s, 25s and 23s.
+  At the timing checkpoint, the run had reached `marketplace-production` and
+  was waiting for the required `JoeyTeng` approval, with no privileged job
+  runner or production write started. After approval it did start the
+  privileged job, then ended in the old publisher identity/scope preflight
+  before any target write; the final failure and its observability gap are
+  recorded in `Publisher Identity Diagnostic Recovery` below.
+- Joey explicitly requested matrix/multi-runner splitting when CI proved slow.
+  The ordinary PR CI already completed its ten Node 20/24 core-and-Release
+  cells in at most 4m35s, while the first live publisher run showed that each
+  candidate job still repeated the complete Release inventory serially. The
+  publisher source-validation path is therefore split before stable release:
+  - candidate A and B remain independent clean-runner builds and upload their
+    immutable artifacts before source tests can start;
+  - a new `source-validation` job depends on both builders and fans out one
+    core cell plus four Release shards across five clean standard-Ubuntu
+    runners with `fail-fast: false`;
+  - each cell creates its own detached worktree at the exact frozen source
+    commit. Validation jobs never download candidate artifacts, so test code
+    cannot mutate either frozen candidate;
+  - `assemble` depends on the complete matrix as well as both builders, so any
+    failed or missing cell prevents publication; and
+  - the now-light candidate builders move to `ubuntu-slim` with the adopted
+    14-minute limit. Independent construction and byte-identical comparison
+    remain unchanged.
+- This optimization is a publisher-control change and was kept on an isolated
+  WIP branch while the admitted RC run was pending. It did not alter live
+  `master` during that run. After the RC closed in the identity/scope preflight,
+  it follows the normal signed, reviewed infrastructure PR path; the later
+  stable release intent remains a separate landing.
+- The matrix field uses the expression-safe `release_test_shard` spelling;
+  this avoids relying on ambiguous hyphenated property dereferencing in GitHub
+  expressions while leaving the public test-shard environment ABI unchanged.
+- A local five-cell equivalent validation then closed successfully: the core
+  cell exited zero, and Release shards 1/4 through 4/4 passed 33, 33, 33 and 32
+  tests respectively, covering all 131 registered Release tests with zero
+  failures. Running all four heavy shards concurrently on one shared Mac
+  stretched their wall times to roughly 13m52s–15m20s through local resource
+  contention; those timings are not used as the GitHub timeout estimate. The
+  independent GitHub-hosted cells from PR #35 remain the relevant performance
+  evidence, with a 4m35s observed maximum. After the final field-name fix,
+  `npm run check`, the two focused workflow-contract tests, all 13 shard
+  contract tests, `actionlint` with the documented upstream-metadata ignores,
+  `git diff --check`, and project-journal validation passed.
+- A fresh ordinary GPT-5.6 Sol Ultra exact-head review of signed commit
+  `0cc238cef573b93badce86c7e7e73e088257495a` found no workflow implementation
+  issue, but identified two stale journal handoff statements: the preflight
+  still named the removed 30-minute candidate topology, and `Next Steps` still
+  treated already-merged PR #35 as a Draft. The corrections above and below
+  bind the handoff to the five-cell validation topology and the actual order:
+  record the admitted RC run's pre-write failure, land this publisher-control
+  change, then land the separate stable release intent. A new whole-range
+  exact-head review is required after this documentation correction.
+
+### Publisher Identity Diagnostic Recovery
+
+- The approved frozen recovery run `33491438854` reused RC source/control SHA
+  `af8430ce086517918e4ac8b8c7b9ff124ebec3ef` and admission run
+  `33463583561`. Its plan, both independent candidates, source-validation
+  steps embedded in the old candidate jobs, assembly, and publication-plan
+  stages completed. It did not contain the later `source-validation` matrix;
+  that hosted matrix still requires validation after its separate control
+  change lands. After the required `marketplace-production` approval,
+  `actions/create-github-app-token@v3` successfully minted the
+  selected-repository token, but the following
+  `Validate publisher identity and repository scope` step exited one without a
+  condition-specific line. The publisher did not proceed to a target write;
+  no RC tag or Release was created.
+- The original identity step used bare shell predicates for static App/token
+  outputs, a bare metadata `jq -e` predicate, and a bare installation-token
+  repository-scope command. Any of those failed closed but surfaced only a
+  generic shell exit. The matrix/publisher-control branch now adds explicit
+  phase markers and fixed failure messages for every static predicate, the
+  App-JWT installation read, metadata invariant, repository-scope query, and
+  repository-scope invariant. Its successful installation summary contains
+  only boolean comparisons against expected installation/App/account identity
+  and selected-repository state, suspension state, enum-limited permission
+  values, and a bounded event count; the scope summary contains only bounded
+  numeric counts and a boolean target-repository match.
+- The initial diagnostic implementation would have inspected
+  `/installation/repositories` with the target-repository-scoped token. That
+  can prove the token is restricted to the target, but cannot prove that the
+  App installation itself has no second repository: GitHub deliberately narrows
+  that endpoint to the token's scope. The corrected order is therefore:
+  static owner/slug invariants; an inventory-only token with `metadata: read`
+  and no `repositories` input; App-JWT installation-metadata validation; a
+  complete-installation repository inventory; only then a target-scoped
+  write-capable token. The final token must report the same App slug and
+  installation ID as the inventory token. This preserves a narrow credential
+  for publication while making the App private-key installation boundary
+  independently observable before any target write.
+- The target-scoped token receives one more post-mint scope read before Git
+  authentication or reconciliation. It must itself observe the exact singleton
+  repository ID `1239944216` and canonical name
+  `JoeyTeng/codex-review-gate-action`, using the same safe five-field
+  projection. The protected property is repository-object identity: the token
+  Action accepts a repository name, so equality of App slug and installation
+  ID alone does not establish that the freshly minted writer still resolves to
+  the inventory's repository object. This re-read fails closed before the
+  writer can reach Git, and its temporary projection is removed in the
+  `always()` cleanup.
+- The inventory check accepts exactly one complete-installation repository,
+  matched both by immutable repository ID `1239944216` and canonical name
+  `JoeyTeng/codex-review-gate-action`. It never persists the raw API object:
+  the bounded Node helper retains it only in memory and writes an exact
+  five-field summary (`total_count`, `returned_count`, and three target-match
+  booleans). This avoids treating an unreviewed future response field, such as
+  a temporary clone credential, as safe diagnostic data. Every local
+  installation-scope projection, including the post-mint writer projection,
+  is removed in the `always()` cleanup. The metadata check also now requires
+  the `suspended_at` key to exist and be explicitly `null`; a missing field is
+  an invariant failure rather than an implicit "not suspended" result.
+- Both release guides now describe the two-token sequence, the complete-
+  installation proof, the fixed local projection, the scoped-token binding,
+  and the post-mint writer-object proof in lockstep. They no longer describe
+  the repository-scoped writer as the token that establishes sole-installation
+  scope.
+- An executable regression extracts the real workflow scope guard rather than
+  reproducing its predicate. It proves the exact singleton projection advances
+  to the subsequent target-token boundary while extra repositories, malformed
+  target shape, wrong ID, wrong canonical name, or an extra persisted field
+  terminate before that boundary. This also exposed the required `jq keys`
+  lexical order: `returned_count`, the three `target_*` fields, then
+  `total_count`; the guard now uses that actual order. The source-validation
+  release shard also places Node's `--test-reporter=dot` before its test entry,
+  so the requested compact reporter is actually applied.
+- A second executable regression extracts the real post-mint writer binding
+  step. The valid writer scope can advance to the Git-authentication marker;
+  configured/inventory slug or installation-ID mismatches stop before its
+  scope query, while a replacement repository ID, non-canonical name, or
+  non-singleton writer scope stops before Git authentication and reconciliation.
+  It also proves the synthetic writer token is not emitted under inherited
+  xtrace, verbose, or allexport modes.
+- A bounded read of the failed job's raw log confirms the exact observability
+  gap: GitHub evaluated the configured owner, slug, minted App slug and
+  installation ID, then ran the four bare predicates and exited with only
+  `Process completed with exit code 1`. The preceding publisher-token step
+  completed successfully, so the missing line is downstream of token minting;
+  the historical log cannot distinguish which original predicate failed. This
+  is why every newly explicit branch writes its phase-specific message before
+  it exits nonzero, rather than relying on shell `-e` to carry diagnostic
+  meaning.
+- Diagnostics remain credential-safe: xtrace, verbose, and allexport modes are
+  disabled before secret capture; no private key, App JWT, or installation
+  token is printed; non-200 App responses are not read and emit only a closed
+  failure code, numeric HTTP status, and a request-ID-presence boolean (not
+  the request ID itself). The
+  installation-token scope query now uses the same bounded Node HTTP reader,
+  rather than preserving a raw CLI error path, so it has the same closed
+  transport/status diagnostics and never reads a non-200 body. The local
+  App-JWT reader now matches `actions/create-github-app-token@v3` by
+  normalizing escaped PEM newlines; malformed JWT construction emits the fixed
+  `app_jwt_invalid` code rather
+  than an OpenSSL message. Successful response-body I/O failures likewise emit
+  a fixed code, while the pre-existing safe byte-limit diagnostic remains
+  distinct. Regression coverage includes reflected JWT/token response headers,
+  escaped-newline PEM, malformed JWT construction through the real CLI
+  stderr/exit/no-output-file boundary, response-body failures, and limit/cancel
+  failures. Every invariant still fails closed.
+- The precise live mismatch remains unproven until the added non-secret
+  diagnostics run. A frozen recovery is intentionally bound to its original
+  publisher-control SHA, so these new diagnostics cannot be injected into the
+  existing recovery attempt. Land the isolated publisher-control change first,
+  then create a fresh RC release intent/run and use its safe diagnostic phase
+  to repair only the observed mismatch.
+- Local validation for this isolated change passed `npm run check`, all 57
+  publisher/provenance regressions in `test/release-provenance.test.mjs`, the
+  two focused source-validation/publisher credential contracts in
+  `test/v2-release-pipeline.test.mjs`, baseline-filtered actionlint,
+  extracted `bash -n`, ShellCheck, compilation of the three embedded `jq`
+  programs, `git diff --check`, and project-journal validation. The combined
+  full command containing the entire
+  `test/v2-release-pipeline.test.mjs` was intentionally interrupted after a
+  bounded 20-minute local window while it was still progressing through its
+  serial temporary-Git scenarios; it is not recorded as a passing test. The
+  new full-installation inventory and frozen-source-worktree assertions are
+  directly covered by the passing focused contracts.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -3278,9 +3462,11 @@ superseded_by:
   installation identity, sole target repository, and actual permissions; the
   configured layered rulesets; GitHub read-back of an App-pushed,
   JoeyTeng-Codex-signed commit and tag; compatibility of the selected floating
-  Action majors; each light `ubuntu-slim` job completing within the adopted
-  14-minute budget; each standard-Ubuntu candidate job completing within 30
-  minutes; and Environment waiting allocating no runner in the live workflow.
+  Action majors; each `ubuntu-slim` plan, candidate, assembly, publication-plan
+  and verification job completing within the adopted 14-minute budget; each
+  standard-Ubuntu `source-validation` matrix cell completing within 14 minutes;
+  the privileged standard-Ubuntu publish job remaining within 30 minutes; and
+  Environment waiting allocating no runner in the live workflow.
 - The stable-major operator checklist includes manually publishing `v2.0.0`
   through the Action Marketplace Release UI. This is deliberately not a
   publisher gate or machine-read-back requirement. Historical v1 evidence
@@ -3297,16 +3483,21 @@ superseded_by:
 - Run the already specified hidden-marker canary and live
   publisher/runner/Environment preflights as execution evidence; they are not
   remaining grilling choices.
-- Keep RC release-intent PR #35 in Draft while the two delayed-review P1
-  infrastructure findings are fixed, validated, signed, reviewed, and landed;
-  do not involve PR #32.
-- After the corrected infrastructure lands, revalidate and return the separate
-  release-intent PR to the normal approval path, then execute the approved
-  publisher workflow through RC and stable `v2.0.0`.
-  Verify immutable refs, Release/assets, signatures, and floating alias before
-  carrying out the explicitly selected consumer migrations and canaries.
-  Marketplace publication remains the separate stable-major manual checklist
-  item defined above.
+- PR #35 is merged. Its approved frozen RC recovery completed every
+  unprivileged stage but failed before any target write in the publisher
+  identity/scope preflight. Do not involve PR #32.
+- Land the isolated publisher-control matrix-and-diagnostics change through its
+  own signed, exact-head-reviewed infrastructure PR and verify all five hosted
+  validation cells meet their 14-minute budget. Then create a fresh RC release
+  intent/run, use the safe identity diagnostics if it fails, and on success
+  verify the immutable RC ref, prerelease, assets, signatures and public
+  readback.
+- Then land the stable `v2.0.0` release intent separately and execute its
+  approved publisher workflow. Verify the immutable stable ref,
+  Release/assets, signatures and `v2` floating alias before carrying out the
+  explicitly selected consumer migrations and canaries. Marketplace
+  publication remains the separate stable-major manual checklist item defined
+  above.
 
 ## Evidence
 

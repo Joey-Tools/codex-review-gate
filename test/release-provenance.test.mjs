@@ -4,6 +4,7 @@ import { createHash, generateKeyPairSync, verify as verifyBytes } from "node:cry
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -32,6 +33,7 @@ import {
   parseSemver,
   parseVerifiedOpenPgpStatus,
   readGitHubAppInstallation,
+  readGitHubAppInstallationRepositories,
   readReleaseManifest,
   validatePublicationPlan,
   validateGitHubSigningKeyInventory,
@@ -129,6 +131,21 @@ test("publisher identity preflight creates a short-lived RS256 App JWT", () => {
     ),
     false,
   );
+  const escapedNewlineToken = createGitHubAppJwt({
+    clientId,
+    privateKey: privateKey.replace(/\n/gu, "\\n"),
+    now,
+  });
+  const escapedParts = escapedNewlineToken.split(".");
+  assert.equal(
+    verifyBytes(
+      "RSA-SHA256",
+      Buffer.from(`${escapedParts[0]}.${escapedParts[1]}`),
+      publicKey,
+      Buffer.from(escapedParts[2], "base64url"),
+    ),
+    true,
+  );
 });
 
 test("publisher identity preflight requests installation detail with an in-memory Bearer JWT", async () => {
@@ -161,6 +178,467 @@ test("publisher identity preflight requests installation detail with an in-memor
   assert.match(observed.options.headers.Authorization, /^Bearer [^.]+\.[^.]+\.[^.]+$/u);
   assert.doesNotMatch(observed.options.headers.Authorization, /^token /u);
   assert.equal(observed.options.headers["X-GitHub-Api-Version"], "2022-11-28");
+});
+
+test("publisher identity preflight reports only closed HTTP diagnostics and never reads an error body", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  let issuedJwt = null;
+  let errorBodyRead = false;
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async (_url, options) => {
+        issuedJwt = options.headers.Authorization;
+        return {
+          status: 401,
+          headers: { get: (name) => name === "x-github-request-id" ? issuedJwt : null },
+          text: async () => {
+            errorBodyRead = true;
+            return JSON.stringify({
+              message: `rejected ${privateKey} ${issuedJwt} synthetic-installation-token`,
+            });
+          },
+        };
+      },
+    }),
+    (error) => {
+      assert.match(
+        error.message,
+        /failure_code=unauthorized; http_status=401; request_id_present=true/u,
+      );
+      assert.equal(error.message.includes(privateKey), false);
+      assert.equal(error.message.includes(issuedJwt), false);
+      assert.equal(error.message.includes(issuedJwt.slice("Bearer ".length)), false);
+      assert.equal(error.message.includes("synthetic-installation-token"), false);
+      return true;
+    },
+  );
+  assert.equal(errorBodyRead, false);
+});
+
+test("publisher identity preflight maps transport errors to a closed failure code", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const errorName = "synthetic-installation-token";
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => {
+        const error = new Error("not for logs");
+        error.name = errorName;
+        throw error;
+      },
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "GitHub App installation request failed before an HTTP response (failure_code=transport_error)",
+      );
+      assert.equal(error.message.includes(errorName), false);
+      return true;
+    },
+  );
+});
+
+test("publisher installation repository scope persists only a fixed safe projection", async () => {
+  const installationToken = "synthetic-installation-token";
+  const expectedRepositoryId = "1239944216";
+  const expectedRepository = "JoeyTeng/codex-review-gate-action";
+  const temporaryCloneToken = "synthetic-temporary-clone-token";
+  const unknownCanary = "synthetic-unknown-repository-field";
+  let observed;
+  const repositoryScope = await readGitHubAppInstallationRepositories({
+    installationToken,
+    expectedRepositoryId,
+    expectedRepository,
+    fetchImpl: async (url, options) => {
+      observed = { url, options };
+      return {
+        status: 200,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({
+          total_count: 2,
+          repositories: [
+            {
+              id: 1239944216,
+              full_name: expectedRepository,
+              temp_clone_token: temporaryCloneToken,
+              unknown_canary: unknownCanary,
+            },
+            {
+              id: 1239944217,
+              full_name: "JoeyTeng/another-installation-repository",
+              temp_clone_token: `${temporaryCloneToken}-second`,
+            },
+          ],
+          unknown_top_level_canary: unknownCanary,
+        }),
+      };
+    },
+  });
+  assert.deepEqual(repositoryScope, {
+    total_count: 2,
+    returned_count: 2,
+    target_shape_matches_expected: true,
+    target_id_matches_expected: true,
+    target_full_name_matches_expected: true,
+  });
+  const persistedProjection = JSON.stringify(repositoryScope);
+  for (const secretOrUnknownValue of [
+    installationToken,
+    temporaryCloneToken,
+    unknownCanary,
+    "JoeyTeng/another-installation-repository",
+  ]) {
+    assert.equal(persistedProjection.includes(secretOrUnknownValue), false);
+  }
+  assert.equal(observed.url, "https://api.github.com/installation/repositories");
+  assert.equal(observed.options.headers.Authorization, `Bearer ${installationToken}`);
+
+  let errorBodyRead = false;
+  await assert.rejects(
+    readGitHubAppInstallationRepositories({
+      installationToken,
+      expectedRepositoryId,
+      expectedRepository,
+      fetchImpl: async () => ({
+        status: 403,
+        headers: { get: (name) => name === "x-github-request-id" ? installationToken : null },
+        text: async () => {
+          errorBodyRead = true;
+          return `forbidden ${installationToken}`;
+        },
+      }),
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "GitHub App installation repository scope request failed (failure_code=forbidden; http_status=403; request_id_present=true)",
+      );
+      assert.equal(error.message.includes(installationToken), false);
+      return true;
+    },
+  );
+  assert.equal(errorBodyRead, false);
+});
+
+test("publisher installation repository scope reports target mismatches fail closed", async () => {
+  const expectedRepositoryId = "1239944216";
+  const expectedRepository = "JoeyTeng/codex-review-gate-action";
+  for (const {
+    label,
+    firstRepository,
+    targetShapeMatchesExpected,
+    targetIdMatchesExpected,
+    targetFullNameMatchesExpected,
+  } of [
+    {
+      label: "wrong repository ID",
+      firstRepository: { id: 1239944217, full_name: expectedRepository },
+      targetShapeMatchesExpected: true,
+      targetIdMatchesExpected: false,
+      targetFullNameMatchesExpected: true,
+    },
+    {
+      label: "wrong repository full_name",
+      firstRepository: { id: 1239944216, full_name: "JoeyTeng/not-the-release-target" },
+      targetShapeMatchesExpected: true,
+      targetIdMatchesExpected: true,
+      targetFullNameMatchesExpected: false,
+    },
+    {
+      label: "malformed first repository",
+      firstRepository: [1239944216, expectedRepository],
+      targetShapeMatchesExpected: false,
+      targetIdMatchesExpected: false,
+      targetFullNameMatchesExpected: false,
+    },
+  ]) {
+    const repositoryScope = await readGitHubAppInstallationRepositories({
+      installationToken: "synthetic-installation-token",
+      expectedRepositoryId,
+      expectedRepository,
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({
+          total_count: 1,
+          repositories: [firstRepository],
+        }),
+      }),
+    });
+    assert.deepEqual(repositoryScope, {
+      total_count: 1,
+      returned_count: 1,
+      target_shape_matches_expected: targetShapeMatchesExpected,
+      target_id_matches_expected: targetIdMatchesExpected,
+      target_full_name_matches_expected: targetFullNameMatchesExpected,
+    }, label);
+  }
+});
+
+test("publisher installation repository scope represents malformed and oversized counts fail closed", async () => {
+  const expectedRepositoryId = "1239944216";
+  const expectedRepository = "JoeyTeng/codex-review-gate-action";
+  const repositoryScope = await readGitHubAppInstallationRepositories({
+    installationToken: "synthetic-installation-token",
+    expectedRepositoryId,
+    expectedRepository,
+    fetchImpl: async () => ({
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        total_count: 1.5,
+        repositories: Array.from({ length: 101 }, (_, index) => ({
+          id: index === 0 ? 1239944216 : 1239944217 + index,
+          full_name: index === 0 ? expectedRepository : `JoeyTeng/extra-${index}`,
+        })),
+      }),
+    }),
+  });
+  assert.deepEqual(repositoryScope, {
+    total_count: 101,
+    returned_count: 101,
+    target_shape_matches_expected: true,
+    target_id_matches_expected: true,
+    target_full_name_matches_expected: true,
+  });
+});
+
+test("publisher installation repository scope validates expected target parameters before HTTP", async () => {
+  let fetchCalled = false;
+  const fetchImpl = async () => {
+    fetchCalled = true;
+    throw new Error("must not run");
+  };
+  await assert.rejects(
+    readGitHubAppInstallationRepositories({
+      installationToken: "synthetic-installation-token",
+      expectedRepositoryId: "1239944216.0",
+      expectedRepository: "JoeyTeng/codex-review-gate-action",
+      fetchImpl,
+    }),
+    /expected repository ID is malformed/u,
+  );
+  await assert.rejects(
+    readGitHubAppInstallationRepositories({
+      installationToken: "synthetic-installation-token",
+      expectedRepositoryId: "1239944216",
+      expectedRepository: "JoeyTeng/codex-review-gate-action/extra",
+      fetchImpl,
+    }),
+    /expected repository is malformed/u,
+  );
+  assert.equal(fetchCalled, false);
+});
+
+test("publisher installation CLI emits a closed JWT failure without creating output", () => {
+  const root = mkdtempSync(join(tmpdir(), "release-app-installation-cli-"));
+  const output = join(root, "installation.json");
+  const malformedPrivateKey = "synthetic-private-key-material";
+  try {
+    assert.throws(
+      () => execFileSync(
+        process.execPath,
+        [
+          new URL("../scripts/generate-action-release-provenance.mjs", import.meta.url).pathname,
+          "github-app-installation",
+          "--client-id", "Iv23liSyntheticPublisher",
+          "--installation-id", "12345678",
+          "--output", output,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            RELEASE_PUBLISHER_APP_PRIVATE_KEY: malformedPrivateKey,
+          },
+        },
+      ),
+      (error) => {
+        assert.equal(error.status, 1);
+        assert.equal(error.stdout, "");
+        assert.equal(error.stderr, "error: GitHub App JWT generation failed (failure_code=app_jwt_invalid)\n");
+        assert.equal(error.stderr.includes(malformedPrivateKey), false);
+        return true;
+      },
+    );
+    assert.equal(existsSync(output), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("publisher installation repository scope CLI requires the explicit target before HTTP", () => {
+  const root = mkdtempSync(join(tmpdir(), "release-app-installation-scope-cli-"));
+  const output = join(root, "repository-scope.json");
+  try {
+    assert.throws(
+      () => execFileSync(
+        process.execPath,
+        [
+          new URL("../scripts/generate-action-release-provenance.mjs", import.meta.url).pathname,
+          "github-app-installation-repository-scope",
+          "--expected-repository", "JoeyTeng/codex-review-gate-action",
+          "--output", output,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN: "synthetic-installation-token",
+          },
+        },
+      ),
+      (error) => {
+        assert.equal(error.status, 1);
+        assert.equal(error.stdout, "");
+        assert.equal(error.stderr, "error: --expected-repository-id is required\n");
+        return true;
+      },
+    );
+    assert.equal(existsSync(output), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("publisher identity preflight normalizes escaped PEM newlines and closes JWT-construction failures", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const installation = await readGitHubAppInstallation({
+    clientId: "Iv23liSyntheticPublisher",
+    privateKey: privateKey.replace(/\n/gu, "\\n"),
+    installationId: "12345678",
+    now: 1_800_000_000,
+    fetchImpl: async () => ({
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ id: 12345678 }),
+    }),
+  });
+  assert.deepEqual(installation, { id: 12345678 });
+
+  const malformedPrivateKey = "synthetic-private-key-material";
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey: malformedPrivateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => {
+        throw new Error("fetch must not be called for an invalid private key");
+      },
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "GitHub App JWT generation failed (failure_code=app_jwt_invalid)",
+      );
+      assert.equal(error.message.includes(malformedPrivateKey), false);
+      return true;
+    },
+  );
+});
+
+test("publisher identity preflight maps a hostile successful-response body failure to a closed code", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const bodyFailure = new Error(`response stream rejected ${privateKey} synthetic-installation-token`);
+  bodyFailure.name = "synthetic-installation-token";
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get: () => null },
+        text: async () => { throw bodyFailure; },
+      }),
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "GitHub App installation response could not be read (failure_code=response_body_unreadable)",
+      );
+      assert.equal(error.message.includes(privateKey), false);
+      assert.equal(error.message.includes("synthetic-installation-token"), false);
+      return true;
+    },
+  );
+});
+
+test("publisher identity preflight preserves the safe response-size policy diagnostic", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  let bodyRead = false;
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get: (name) => name === "content-length" ? "1048577" : null },
+        text: async () => {
+          bodyRead = true;
+          return "{}";
+        },
+      }),
+    }),
+    /GitHub App installation response exceeds the byte limit/u,
+  );
+  assert.equal(bodyRead, false);
+
+  let cancelCalled = false;
+  await assert.rejects(
+    readGitHubAppInstallation({
+      clientId: "Iv23liSyntheticPublisher",
+      privateKey,
+      installationId: "12345678",
+      now: 1_800_000_000,
+      fetchImpl: async () => ({
+        status: 200,
+        headers: { get: () => null },
+        body: {
+          getReader: () => ({
+            read: async () => ({ done: false, value: new Uint8Array(1_048_577) }),
+            cancel: async () => {
+              cancelCalled = true;
+              throw new Error("synthetic cancel failure");
+            },
+          }),
+        },
+      }),
+    }),
+    /GitHub App installation response exceeds the byte limit/u,
+  );
+  assert.equal(cancelCalled, true);
 });
 
 test("publisher identity preflight rejects malformed App JWT inputs", () => {
@@ -196,26 +674,64 @@ test("publisher identity preflight rejects malformed App JWT inputs", () => {
   );
 });
 
-test("publisher workflow keeps App JWT and installation-token authentication classes separate", () => {
-  const tokenStep = PUBLISHER_WORKFLOW.match(
-    /      - name: Create least-privilege publisher token\n(?<body>[\s\S]*?)(?=\n      - name: )/u,
+test("publisher workflow inventories the full installation before minting a target-scoped token", () => {
+  const extractStep = (name) => PUBLISHER_WORKFLOW.match(
+    new RegExp(`      - name: ${name}\\n(?<body>[\\s\\S]*?)(?=\\n      - name: )`, "u"),
   )?.groups?.body;
-  const identityStep = PUBLISHER_WORKFLOW.match(
-    /      - name: Validate publisher identity and repository scope\n(?<body>[\s\S]*?)(?=\n      - name: )/u,
-  )?.groups?.body;
-  assert.ok(tokenStep, "publisher token step must remain present");
+  const preInventoryConfigurationStep = extractStep("Validate Publisher App static configuration before inventory");
+  const inventoryStep = extractStep("Create inventory-only Publisher App token");
+  const identityStep = extractStep("Validate Publisher App identity and full installation scope");
+  const tokenStep = extractStep("Create target-scoped publisher token");
+  const bindingStep = extractStep("Bind and validate target-scoped publisher token");
+  const configureAuthenticationStep = extractStep("Configure target-scoped ephemeral Git authentication");
+  const reconcileStep = extractStep("Reconcile release publication");
+  assert.ok(preInventoryConfigurationStep, "pre-inventory configuration step must remain present");
+  assert.ok(inventoryStep, "inventory token step must remain present");
   assert.ok(identityStep, "publisher identity step must remain present");
+  assert.ok(tokenStep, "target-scoped publisher token step must remain present");
+  assert.ok(bindingStep, "target-scoped publisher token binding step must remain present");
+  assert.ok(configureAuthenticationStep, "target-scoped Git authentication step must remain present");
+  assert.ok(reconcileStep, "publisher reconcile step must remain present");
+  assert.ok(
+    PUBLISHER_WORKFLOW.indexOf("Validate Publisher App static configuration before inventory") <
+      PUBLISHER_WORKFLOW.indexOf("Create inventory-only Publisher App token") &&
+      PUBLISHER_WORKFLOW.indexOf("Create inventory-only Publisher App token") <
+      PUBLISHER_WORKFLOW.indexOf("Validate Publisher App identity and full installation scope") &&
+      PUBLISHER_WORKFLOW.indexOf("Validate Publisher App identity and full installation scope") <
+        PUBLISHER_WORKFLOW.indexOf("Create target-scoped publisher token") &&
+      PUBLISHER_WORKFLOW.indexOf("Create target-scoped publisher token") <
+        PUBLISHER_WORKFLOW.indexOf("Bind and validate target-scoped publisher token") &&
+      PUBLISHER_WORKFLOW.indexOf("Bind and validate target-scoped publisher token") <
+        PUBLISHER_WORKFLOW.indexOf("Configure target-scoped ephemeral Git authentication") &&
+      PUBLISHER_WORKFLOW.indexOf("Bind and validate target-scoped publisher token") <
+        PUBLISHER_WORKFLOW.indexOf("Reconcile release publication"),
+    "inventory and post-mint writer scope must pass before target Git authentication or reconciliation",
+  );
+  assert.match(preInventoryConfigurationStep, /APP_OWNER: \$\{\{ vars\.RELEASE_PUBLISHER_APP_OWNER \}\}/u);
+  assert.match(preInventoryConfigurationStep, /APP_SLUG: \$\{\{ vars\.RELEASE_PUBLISHER_APP_SLUG \}\}/u);
+  assert.match(preInventoryConfigurationStep, /static configuration check passed before inventory token minting/u);
+  assert.doesNotMatch(preInventoryConfigurationStep, /(?:PRIVATE_KEY|TOKEN|GITHUB_ENV|GITHUB_OUTPUT|GITHUB_STEP_SUMMARY)/u);
+  assert.match(inventoryStep, /uses: actions\/create-github-app-token@v3/u);
+  assert.match(inventoryStep, /client-id: \$\{\{ vars\.RELEASE_PUBLISHER_APP_CLIENT_ID \}\}/u);
+  assert.match(inventoryStep, /^          owner: JoeyTeng$/mu);
+  assert.match(inventoryStep, /^          permission-metadata: read$/mu);
+  assert.match(inventoryStep, /^          skip-token-revoke: false$/mu);
+  assert.doesNotMatch(inventoryStep, /^          repositories:/mu);
+  assert.doesNotMatch(inventoryStep, /^          permission-(?:administration|contents):/mu);
   assert.match(tokenStep, /uses: actions\/create-github-app-token@v3/u);
   assert.match(tokenStep, /client-id: \$\{\{ vars\.RELEASE_PUBLISHER_APP_CLIENT_ID \}\}/u);
-  assert.match(tokenStep, /repositories: codex-review-gate-action/u);
+  assert.match(tokenStep, /^          owner: JoeyTeng$/mu);
+  assert.match(tokenStep, /^          repositories: codex-review-gate-action$/mu);
   assert.deepEqual(
     [...tokenStep.matchAll(/^          (permission-[^:]+): (\S+)$/gmu)]
       .map((match) => [match[1], match[2]]),
     [
       ["permission-administration", "read"],
       ["permission-contents", "write"],
+      ["permission-metadata", "read"],
     ],
   );
+  assert.match(tokenStep, /^          skip-token-revoke: false$/mu);
   const identityLines = identityStep.split("\n");
   const appCommandIndex = identityLines.findIndex((line) =>
     line.includes("node scripts/generate-action-release-provenance.mjs github-app-installation"));
@@ -231,12 +747,88 @@ test("publisher workflow keeps App JWT and installation-token authentication cla
   const executableIdentityStep = identityLines
     .filter((line) => !line.trimStart().startsWith("#"))
     .join("\n");
+  const firstSecretCapture = identityLines.findIndex((line) =>
+    line.includes('app_private_key="$APP_PRIVATE_KEY"'));
+  assert.ok(firstSecretCapture > 0, "publisher identity step must capture the private key locally");
+  for (const command of ["set +x", "set +v", "set +a"]) {
+    const commandIndex = identityLines.findIndex((line) => line.trim() === command);
+    assert.ok(commandIndex >= 0 && commandIndex < firstSecretCapture, `${command} must precede secret capture`);
+  }
+  assert.match(identityStep, /Publisher App configuration invariant failed: expected owner JoeyTeng\./u);
+  assert.match(identityStep, /Publisher App configuration invariant failed: expected canonical publisher slug\./u);
+  assert.match(identityStep, /Publisher App token invariant failed: token app slug does not match the configured publisher slug\./u);
+  assert.match(identityStep, /Publisher App token invariant failed: token output has no valid installation ID\./u);
+  assert.match(identityStep, /Publisher App static configuration and token-output checks passed\./u);
   assert.match(identityStep, /--client-id "\$APP_CLIENT_ID"/u);
-  assert.doesNotMatch(executableIdentityStep, /app\/installations/u);
-  assert.equal([...executableIdentityStep.matchAll(/\bgh api\b/gu)].length, 1);
+  assert.match(identityStep, /Publisher App installation fetch starting\./u);
+  assert.match(identityStep, /Publisher App installation fetch completed\./u);
+  assert.match(identityStep, /Publisher App installation observed \(non-secret\): \$observed_installation/u);
+  assert.match(identityStep, /Publisher App installation invariant failed; inspect the non-secret observed identity above\./u);
+  assert.match(identityStep, /Publisher App installation metadata check passed\./u);
+  assert.match(identityStep, /installation_id_matches_token_output: \(\.id == \$installation_id\)/u);
+  assert.match(identityStep, /account_login_matches_configured_owner:/u);
+  assert.match(identityStep, /permission_shape_matches_expected: \(\.permissions == \{administration:"read", contents:"write", metadata:"read"\}\)/u);
+  assert.match(identityStep, /def bounded_event_count:/u);
+  assert.doesNotMatch(identityStep, /permission_keys:|events: \(if/u);
+  assert.match(identityStep, /Publisher App repository scope query starting\./u);
   assert.match(
     identityStep,
-    /env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN[\s\\]*GH_HOST=github\.com GH_TOKEN="\$installation_token"[\s\\]*gh api --hostname github\.com installation\/repositories/u,
+    /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$repository_scope_file"/u,
+  );
+  assert.match(identityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$inventory_installation_token"/u);
+  assert.match(identityStep, /keys == \[\s*"returned_count",\s*"target_full_name_matches_expected",\s*"target_id_matches_expected",\s*"target_shape_matches_expected",\s*"total_count"\s*\]/u);
+  for (const field of [
+    "total_count",
+    "returned_count",
+    "target_shape_matches_expected",
+    "target_id_matches_expected",
+    "target_full_name_matches_expected",
+  ]) {
+    assert.match(identityStep, new RegExp(`\\.${field}`, "u"));
+  }
+  assert.doesNotMatch(identityStep, /\.repositories\b|\.full_name\b|temp_clone_token/u);
+  assert.match(identityStep, /Publisher App repository scope observed \(non-secret\): \$observed_repository_scope/u);
+  assert.match(identityStep, /Publisher App repository scope query completed\./u);
+  assert.match(identityStep, /Publisher App repository scope invariant failed; inspect the non-secret observed scope above\./u);
+  assert.match(identityStep, /Publisher App repository scope check passed\./u);
+  assert.doesNotMatch(executableIdentityStep, /app\/installations/u);
+  assert.doesNotMatch(executableIdentityStep, /\bgh api\b/u);
+  assert.doesNotMatch(executableIdentityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN.*GITHUB_ENV/u);
+  assert.match(identityStep, /ACTUAL_APP_SLUG: \$\{\{ steps\.publisher-inventory-token\.outputs\.app-slug \}\}/u);
+  assert.match(identityStep, /ACTUAL_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
+  assert.match(identityStep, /INVENTORY_INSTALLATION_TOKEN: \$\{\{ steps\.publisher-inventory-token\.outputs\.token \}\}/u);
+  assert.match(bindingStep, /INVENTORY_APP_SLUG: \$\{\{ steps\.publisher-inventory-token\.outputs\.app-slug \}\}/u);
+  assert.match(bindingStep, /INVENTORY_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
+  assert.match(bindingStep, /SCOPED_APP_SLUG: \$\{\{ steps\.publisher-token\.outputs\.app-slug \}\}/u);
+  assert.match(bindingStep, /SCOPED_INSTALLATION_ID: \$\{\{ steps\.publisher-token\.outputs\.installation-id \}\}/u);
+  assert.match(bindingStep, /SCOPED_INSTALLATION_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
+  assert.match(bindingStep, /Publisher App scoped-token binding check passed\./u);
+  const bindingLines = bindingStep.split("\n");
+  const scopedTokenCapture = bindingLines.findIndex((line) =>
+    line.includes('scoped_installation_token="$SCOPED_INSTALLATION_TOKEN"'));
+  assert.ok(scopedTokenCapture > 0, "binding step must capture the target-scoped token locally");
+  for (const command of ["set +x", "set +v", "set +a"]) {
+    const commandIndex = bindingLines.findIndex((line) => line.trim() === command);
+    assert.ok(commandIndex >= 0 && commandIndex < scopedTokenCapture, `${command} must precede scoped-token capture`);
+  }
+  assert.match(bindingStep, /unset SCOPED_INSTALLATION_TOKEN/u);
+  assert.match(bindingStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$scoped_installation_token"/u);
+  assert.match(
+    bindingStep,
+    /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$scoped_repository_scope_file"/u,
+  );
+  assert.match(bindingStep, /unset scoped_installation_token/u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope observed \(non-secret\): \$observed_scoped_repository_scope/u);
+  assert.match(bindingStep, /keys == \[\s*"returned_count",\s*"target_full_name_matches_expected",\s*"target_id_matches_expected",\s*"target_shape_matches_expected",\s*"total_count"\s*\]/u);
+  assert.match(bindingStep, /\.total_count == 1[\s\S]*\.returned_count == 1[\s\S]*\.target_shape_matches_expected == true[\s\S]*\.target_id_matches_expected == true[\s\S]*\.target_full_name_matches_expected == true/u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope invariant failed; inspect the non-secret observed scope above\./u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope check passed\./u);
+  assert.doesNotMatch(bindingStep, /\.repositories\b|\.full_name\b|temp_clone_token/u);
+  assert.doesNotMatch(bindingStep, /\bGITHUB_(?:ENV|OUTPUT|STEP_SUMMARY)\b/u);
+  assert.match(reconcileStep, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
+  assert.doesNotMatch(
+    reconcileStep,
+    /(?:INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN)/u,
   );
 });
 

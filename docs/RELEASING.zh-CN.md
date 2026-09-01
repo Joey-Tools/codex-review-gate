@@ -98,20 +98,22 @@ provenance 会选择这套 frozen contract 执行 historical verification；publ
 | Stage | 权限 | 合约 |
 | --- | --- | --- |
 | `plan` | 无特权 | 检查 exact source commit、manifest、SemVer、reachability、release policy 与 immutable target-parent policy。 |
-| `candidate-a` | 无特权 | 在 clean runner 独立 materialize 并测试 candidate A，记录 tree、inventory、modes、sizes 与 SHA-256 digests。 |
-| `candidate-b` | 无特权 | 在另一个 clean runner 独立 materialize 并测试 candidate B。 |
+| `candidate-a` | 无特权 | 在 clean runner 独立 materialize 并上传 candidate A，记录 tree、inventory、modes、sizes 与 SHA-256 digests。 |
+| `candidate-b` | 无特权 | 在另一个 clean runner 独立 materialize 并上传 candidate B。 |
+| `source-validation` | 无特权 | 两份 candidate 冻结后，在五个 clean runners 上用一个 core cell 和四个 Release-test shards 验证 exact source commit。 |
 | `assemble` | 无特权 | 要求两份 candidates byte-identical，并产出 canonical candidate bundle。 |
 | `publication-plan` | 无特权 | 批准前重建并验证 publication plan 与 candidate，不上传任何 privileged material。 |
 | `publish` | 有特权 | Environment 人工批准后重新验证全部状态并执行 signed remote publication。 |
 | `verify` | 无特权 | 重新读取公开 refs 与 Release state，并报告观察结果。 |
 
-轻量的无特权 `plan`、`assemble`、`publication-plan` 与 `verify` jobs 使用
-`ubuntu-slim` 与 14 分钟 timeout。GitHub 对这个单核 runner 另有 15 分钟硬上限，
-所以低频但重型的 `candidate-a` 与 `candidate-b` 改用 `ubuntu-24.04` 与 30 分钟
-timeout。仅完整测试套件在最后一个 release-pipeline test 完成前就已耗时约 755.6 秒，
-`ubuntu-slim` 无法为 checkout、setup、candidate materialization、packaging 与 upload
-留出足够余量。privileged `publish` job 也继续使用 `ubuntu-24.04` 与既有 30 分钟
-timeout。
+轻量的无特权 `plan`、`candidate-a`、`candidate-b`、`assemble`、
+`publication-plan` 与 `verify` jobs 使用 `ubuntu-slim` 与 14 分钟 timeout。
+GitHub 对这个单核 runner 另有 15 分钟硬上限，所以 exact-source tests 在
+`source-validation` matrix 的五个 `ubuntu-24.04` runners 上运行：一个 core cell 和
+四个 Release-test shards，每个 cell 的 timeout 都是 14 分钟，并设置
+`fail-fast: false`。这替代了首次 live RC 中两次各自超过 17 分钟的串行完整套件验证，
+同时保留独立 candidate construction。privileged `publish` job 继续使用
+`ubuntu-24.04` 与既有 30 分钟 timeout。
 
 只有 `publish` 绑定 `marketplace-production` Environment。尽管保留了历史名称，它
 实际代表 production publication credentials 与人工批准边界，并不表示 workflow 会
@@ -156,19 +158,30 @@ installation ID: 156186692
 
 它只安装在 `JoeyTeng/codex-review-gate-action`。签发 credential 前，privileged job
 先 checkout 受保护的 source control、下载并安全解包 assembled artifact，并重复 exact
-admission validation；之后才使用 allowlisted 官方
-`actions/create-github-app-token@v3` Action 即时签发 installation token。请求只点名
-target repository，并明确把 token 收紧为 Administration read 与 Contents write。
-Trusted source-repository generator 是 private key 唯一的另一个 consumer：它只为
+admission validation。之后它会验证配置的 owner 与 App slug，并使用 allowlisted 官方
+`actions/create-github-app-token@v3` Action，以 owner 且不提供 `repositories` input
+的方式即时签发一个只具 `Metadata: read` 的 inventory token。该 token 能读取完整
+App-installation repository inventory，但不能写入。Trusted source-repository generator
+是 private key 唯一的另一个 consumer：它只为
 `GET /app/installations/{installation_id}` 在内存生成 RS256 App JWT，其中
 `iat = now - 60`、`exp = now + 540`，`iss` 等于配置的 App client ID。该 JWT 绝不
-写入 file、`GITHUB_ENV`、artifact、output、summary 或 log。独立的 installation
-token 读取 `GET /installation/repositories`，绑定 expected App identity 与 sole target
-repository，并且是唯一暴露给 Git 的 credential。它不得跨 jobs 传递、嵌入 remote
-URL、存入 artifact 或打印。Checkout 使用 `persist-credentials: false`。Git 只通过
-owner-private 的临时 `GIT_ASKPASS` helper 取得该 token，并且 helper 只作用于 exact
-target repository。Post step 撤销 token 是 best effort；若 runner 被强制终止，token
-expiry 是剩余边界。
+写入 file、`GITHUB_ENV`、artifact、output、summary 或 log。
+
+inventory token 读取 `GET /installation/repositories`，并必须证明完整 installation
+恰好只含 expected repository，且同时匹配 repository ID 与 canonical name。响应先在
+内存投影为五个固定的 non-secret fields，才会写入本地；临时文件由 `always()` cleanup
+删除。只有该证明通过后，job 才会签发独立的 target-scoped installation token。这个
+write token 只点名 target repository，并请求 Administration read、Contents write 与
+Metadata read。在它能交给 Git 前，publisher 会用这个 write token 自己重新读取
+repository scope，并要求同一个 exact singleton repository ID 和 canonical name。第二次
+证明把刚签发的 token 绑定到签发时的 target repository object；仅匹配 App slug 与
+installation ID 不足以建立这个 object identity，因为 token Action 的输入是 repository
+name。它的响应也只会持久化与 inventory response 相同的五字段 non-secret projection；
+raw repository object 永不落盘，临时 projection 由 `always()` cleanup 删除。它是唯一
+暴露给 Git 的 credential：不得跨 jobs 传递、嵌入 remote URL、存入 artifact 或打印。
+Checkout 使用 `persist-credentials: false`。Git 只通过 owner-private 的临时
+`GIT_ASKPASS` helper 取得该 token，并且 helper 只作用于 exact target repository。Post
+step 撤销 token 是 best effort；若 runner 被强制终止，token expiry 是剩余边界。
 
 Publisher workflow 中每个 `uses:` dependency 都必须是 allowlisted GitHub-official
 Action，并使用 floating major（例如 `@v4`），绝不使用 `@main`。我们明确接受
@@ -177,8 +190,9 @@ patch-level upstream drift，以便自动取得官方修复。若未来改成 im
 alias 升级仍需普通 reviewed infrastructure PR，且不得与 release-intent 变更同时落地。
 
 Installed App 授予隐含的 `Metadata: read`、`Contents: read/write` 与
-`Administration: read`。Publisher 为其 one-repository installation token 只请求
-Administration read 与 Contents write；它不需要 Workflows write。
+`Administration: read`。Publisher 先为完整 installation inventory token 只请求
+Metadata read，再为 one-repository write token 请求 Administration read、Contents
+write 与 Metadata read；它不需要 Workflows write。
 
 `marketplace-production` Environment 提供：
 
@@ -190,8 +204,8 @@ RELEASE_PUBLISHER_APP_PRIVATE_KEY=<environment secret>
 ```
 
 Private key 只在 credential-free admission 成功后的 privileged `publish` job 内存在。
-它会提供给 official token Action 以签发 installation token；另一次、也是唯一额外
-用途，是直接提供给 trusted generator，在内存构造上述短期 JWT 来读取 App
+它会提供给 official token Action 以签发 inventory 与 target-scoped token；另一次、
+也是唯一额外用途，是直接提供给 trusted generator，在内存构造上述短期 JWT 来读取 App
 installation identity。Private key 绝不持久化，也绝不通过 `GITHUB_ENV`、artifact、
 output、summary 或 log 暴露。
 
@@ -227,10 +241,11 @@ environment gate 约束：必须同时存在
 inventory validator，并在 production fences 把它导出的 raw certificate 与 approved
 certificate 逐字节比较。Production 不存在 signer-policy skip path。
 
-首次写入前，just-in-time token 必须证明属于 expected Publisher App installation 与
-唯一 target repository；target rulesets 随后只把该 App 作为 publication bypass
-identity。GPG identity 是写入 publication Git objects 的 author、committer 与 signer，
-其 signatures 在发布后仍可独立验证。
+首次写入前，full-installation inventory 必须证明 expected Publisher App installation
+只含唯一 target repository，独立的 write token 还必须绑定同一 App slug 与 installation
+ID，并在 post-mint 重新读取为 exact target repository object；target rulesets 随后只把
+该 App 作为 publication bypass identity。GPG identity 是写入 publication Git objects 的
+author、committer 与 signer，其 signatures 在发布后仍可独立验证。
 
 不得过度解读之后的 GitHub state checks：ref、commit、signature 与 Release readback
 可以证明最终 objects 与当前 repository state，但 GitHub 不提供可证明某个已接受 ref
@@ -271,11 +286,15 @@ Repository administrators 仍能编辑 rulesets；这种 configuration-control a
 
 ## Candidate 与 signed release commit
 
-`candidate-a` 和 `candidate-b` 从同一个 exact source commit 开始，但彼此独立运行。每个 job
-先 materialize、pack 并 upload candidate，再在自己的 detached frozen-source worktree
-中运行 `npm run check` 与完整 Node test suite。因此 source test 无法修改已上传的
-candidate，而 test failure 仍会令 job 失败并阻止 assemble。每份 candidate 都产出
-canonical inventory 与 digests。Inventory 按 Git path bytes 排序，记录每个 entry 的 type、Git
+`candidate-a` 和 `candidate-b` 从同一个 exact source commit 开始，但彼此独立运行。
+每个 job 在单独的 clean runner 上 materialize、pack 并 upload candidate。只有两次
+upload 都成功后，`source-validation` matrix 才会在另外五个 clean runners 上创建
+detached exact-source worktrees。Core cell 运行 `npm run check` 与所有非 Release tests；
+四个 Release cells 分割完整 Release-pipeline inventory。Matrix 保留所有 cell 结果，
+而 `assemble` 依赖整个 matrix，因此任一 cell 失败或缺失都会阻止发布。Validation jobs
+不下载 candidate artifacts，所以 source test 无法修改已经上传的 candidate。两份独立
+builder 与之后的 byte-identical comparison 继续保证 candidate independence。每份
+candidate 都产出 canonical inventory 与 digests。Inventory 按 Git path bytes 排序，记录每个 entry 的 type、Git
 mode、logical size 与 SHA-256 content digest。只允许明确列出的
 `src/v2/gate-runtime.mjs` v2 runtime module；任何 retired v2 module 回流都会阻止
 candidate construction。`assemble` 要求两份 payloads 与所有 identity
