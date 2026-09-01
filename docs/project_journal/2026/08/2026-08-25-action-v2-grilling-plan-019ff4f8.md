@@ -3386,6 +3386,13 @@ superseded_by:
   `total_count`; the guard now uses that actual order. The source-validation
   release shard also places Node's `--test-reporter=dot` before its test entry,
   so the requested compact reporter is actually applied.
+- A second executable regression extracts the real post-mint writer binding
+  step. The valid writer scope can advance to the Git-authentication marker;
+  configured/inventory slug or installation-ID mismatches stop before its
+  scope query, while a replacement repository ID, non-canonical name, or
+  non-singleton writer scope stops before Git authentication and reconciliation.
+  It also proves the synthetic writer token is not emitted under inherited
+  xtrace, verbose, or allexport modes.
 - A bounded read of the failed job's raw log confirms the exact observability
   gap: GitHub evaluated the configured owner, slug, minted App slug and
   installation ID, then ran the four bare predicates and exited with only

@@ -209,8 +209,11 @@ own repository scope and requires the same exact singleton repository ID and
 canonical name. This second proof binds the newly minted token to the target
 repository object at mint time; matching only the App slug and installation ID
 would not establish that object identity when the token Action accepts a
-repository name. It is the only credential exposed to Git; it is never passed
-between jobs, embedded in a remote URL, stored in an artifact, or printed.
+repository name. Its response receives the same five-field non-secret
+projection as the inventory response; the raw repository object is never
+persisted, and the temporary projection is removed in `always()` cleanup. It
+is the only credential exposed to Git; it is never passed between jobs,
+embedded in a remote URL, stored in an artifact, or printed.
 Checkout uses `persist-credentials: false`. Git receives it only through an
 owner-private temporary `GIT_ASKPASS` helper scoped to the exact target
 repository. Post-step revocation is best effort; expiry is the remaining bound

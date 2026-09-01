@@ -176,10 +176,12 @@ Metadata read。在它能交给 Git 前，publisher 会用这个 write token 自
 repository scope，并要求同一个 exact singleton repository ID 和 canonical name。第二次
 证明把刚签发的 token 绑定到签发时的 target repository object；仅匹配 App slug 与
 installation ID 不足以建立这个 object identity，因为 token Action 的输入是 repository
-name。它是唯一暴露给 Git 的 credential：不得跨 jobs 传递、嵌入 remote URL、存入
-artifact 或打印。Checkout 使用 `persist-credentials: false`。Git 只通过 owner-private 的
-临时 `GIT_ASKPASS` helper 取得该 token，并且 helper 只作用于 exact target repository。
-Post step 撤销 token 是 best effort；若 runner 被强制终止，token expiry 是剩余边界。
+name。它的响应也只会持久化与 inventory response 相同的五字段 non-secret projection；
+raw repository object 永不落盘，临时 projection 由 `always()` cleanup 删除。它是唯一
+暴露给 Git 的 credential：不得跨 jobs 传递、嵌入 remote URL、存入 artifact 或打印。
+Checkout 使用 `persist-credentials: false`。Git 只通过 owner-private 的临时
+`GIT_ASKPASS` helper 取得该 token，并且 helper 只作用于 exact target repository。Post
+step 撤销 token 是 best effort；若 runner 被强制终止，token expiry 是剩余边界。
 
 Publisher workflow 中每个 `uses:` dependency 都必须是 allowlisted GitHub-official
 Action，并使用 floating major（例如 `@v4`），绝不使用 `@main`。我们明确接受
