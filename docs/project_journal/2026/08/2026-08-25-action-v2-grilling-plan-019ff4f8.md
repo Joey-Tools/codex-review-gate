@@ -3316,9 +3316,12 @@ superseded_by:
 - The approved frozen recovery run `33491438854` reused RC source/control SHA
   `af8430ce086517918e4ac8b8c7b9ff124ebec3ef` and admission run
   `33463583561`. Its plan, both independent candidates, source-validation
-  matrix, assembly, and publication-plan stages completed. After the required
-  `marketplace-production` approval, `actions/create-github-app-token@v3`
-  successfully minted the selected-repository token, but the following
+  steps embedded in the old candidate jobs, assembly, and publication-plan
+  stages completed. It did not contain the later `source-validation` matrix;
+  that hosted matrix still requires validation after its separate control
+  change lands. After the required `marketplace-production` approval,
+  `actions/create-github-app-token@v3` successfully minted the
+  selected-repository token, but the following
   `Validate publisher identity and repository scope` step exited one without a
   condition-specific line. The publisher did not proceed to a target write;
   no RC tag or Release was created.
@@ -3333,6 +3336,29 @@ superseded_by:
   and selected-repository state, suspension state, enum-limited permission
   values, and a bounded event count; the scope summary contains only bounded
   numeric counts and a boolean target-repository match.
+- The initial diagnostic implementation would have inspected
+  `/installation/repositories` with the target-repository-scoped token. That
+  can prove the token is restricted to the target, but cannot prove that the
+  App installation itself has no second repository: GitHub deliberately narrows
+  that endpoint to the token's scope. The corrected order is therefore:
+  static owner/slug invariants; an inventory-only token with `metadata: read`
+  and no `repositories` input; App-JWT installation-metadata validation; a
+  complete-installation repository inventory; only then a target-scoped
+  write-capable token. The final token must report the same App slug and
+  installation ID as the inventory token. This preserves a narrow credential
+  for publication while making the App private-key installation boundary
+  independently observable before any target write.
+- The inventory check accepts exactly one complete-installation repository,
+  matched both by immutable repository ID `1239944216` and canonical name
+  `JoeyTeng/codex-review-gate-action`. It never persists the raw API object:
+  the bounded Node helper retains it only in memory and writes an exact
+  five-field summary (`total_count`, `returned_count`, and three target-match
+  booleans). This avoids treating an unreviewed future response field, such as
+  a temporary clone credential, as safe diagnostic data. Both local
+  installation JSON files are removed in the `always()` cleanup. The metadata
+  check also now requires the `suspended_at` key to exist and be explicitly
+  `null`; a missing field is an invariant failure rather than an implicit
+  "not suspended" result.
 - A bounded read of the failed job's raw log confirms the exact observability
   gap: GitHub evaluated the configured owner, slug, minted App slug and
   installation ID, then ran the four bare predicates and exited with only
@@ -3365,17 +3391,18 @@ superseded_by:
   existing recovery attempt. Land the isolated publisher-control change first,
   then create a fresh RC release intent/run and use its safe diagnostic phase
   to repair only the observed mismatch.
-- Local validation for this isolated change passed `npm run check`, the 53
+- Local validation for this isolated change passed `npm run check`, all 56
   publisher/provenance regressions in `test/release-provenance.test.mjs`, the
-  focused staged-ABI/publisher-credential contract in
-  `test/v2-release-pipeline.test.mjs`, extracted `bash -n` and ShellCheck for
-  the identity step, both embedded `jq` programs, baseline-filtered actionlint,
-  `git diff --check`, and project-journal validation. The combined full command
-  containing the entire `test/v2-release-pipeline.test.mjs` was intentionally
-  interrupted after a bounded 20-minute local window while it was still
-  progressing through its serial temporary-Git scenarios; it is not recorded
-  as a passing test. This log-only implementation does not modify its test
-  fixture semantics, and its directly affected workflow contract test passed.
+  two focused source-validation/publisher credential contracts in
+  `test/v2-release-pipeline.test.mjs`, baseline-filtered actionlint,
+  extracted `bash -n`, ShellCheck, compilation of the three embedded `jq`
+  programs, `git diff --check`, and project-journal validation. The combined
+  full command containing the entire
+  `test/v2-release-pipeline.test.mjs` was intentionally interrupted after a
+  bounded 20-minute local window while it was still progressing through its
+  serial temporary-Git scenarios; it is not recorded as a passing test. The
+  new full-installation inventory and frozen-source-worktree assertions are
+  directly covered by the passing focused contracts.
 
 ## Verified Facts And Required Live Preflight
 

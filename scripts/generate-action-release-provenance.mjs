@@ -51,6 +51,14 @@ const MAX_TRANSPORT_BYTES = 64 * 1024 * 1024;
 const MAX_TRANSPORT_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_TRANSPORT_ENTRIES = 4096;
 const MAX_GITHUB_APP_INSTALLATION_RESPONSE_BYTES = 1024 * 1024;
+// Repository scope evidence is a diagnostic gate, not a repository inventory.
+// Keep its persisted projection small enough that only an exact singleton target
+// can satisfy the workflow's strict predicate.  101 is a fail-closed sentinel
+// for non-integer, negative, or over-limit counts; it is never interpreted as
+// an actual safe count by the workflow.
+const MAX_GITHUB_APP_REPOSITORY_SCOPE_COUNT = 100;
+const GITHUB_APP_REPOSITORY_SCOPE_UNREPRESENTABLE_COUNT =
+  MAX_GITHUB_APP_REPOSITORY_SCOPE_COUNT + 1;
 const V2_0_CONTROL_PATH_LIST = Object.freeze([
   ".github/workflows/required-ci-router.yml",
   ".github/workflows/required-ci.yml",
@@ -328,18 +336,61 @@ export async function readGitHubAppInstallation({
 
 export async function readGitHubAppInstallationRepositories({
   installationToken,
+  expectedRepositoryId,
+  expectedRepository,
   fetchImpl = globalThis.fetch,
 }) {
   if (typeof installationToken !== "string" || installationToken.length === 0 || installationToken.length > 8192) {
     fail("GitHub App installation token is malformed");
   }
+  if (typeof expectedRepositoryId !== "string" || !/^[1-9][0-9]*$/u.test(expectedRepositoryId)) {
+    fail("expected repository ID is malformed");
+  }
+  const expectedRepositoryIdNumber = Number(expectedRepositoryId);
+  if (!Number.isSafeInteger(expectedRepositoryIdNumber)) {
+    fail("expected repository ID is malformed");
+  }
+  if (
+    typeof expectedRepository !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/u.test(expectedRepository)
+  ) {
+    fail("expected repository is malformed");
+  }
   if (typeof fetchImpl !== "function") fail("GitHub App installation HTTP client is unavailable");
-  return readGitHubAppJsonResponse({
+  const response = await readGitHubAppJsonResponse({
     endpoint: "https://api.github.com/installation/repositories",
     authorization: `Bearer ${installationToken}`,
     fetchImpl,
     operation: "GitHub App installation repository scope",
   });
+  const repositories = response.repositories;
+  const firstRepository = Array.isArray(repositories) ? repositories[0] : undefined;
+  const targetShapeMatchesExpected =
+    firstRepository !== null &&
+    typeof firstRepository === "object" &&
+    !Array.isArray(firstRepository);
+  const boundedCount = (value) => (
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= MAX_GITHUB_APP_REPOSITORY_SCOPE_COUNT
+      ? value
+      : GITHUB_APP_REPOSITORY_SCOPE_UNREPRESENTABLE_COUNT
+  );
+  // Do not return a subset of the remote object: GitHub may add sensitive
+  // fields (for example, temporary clone credentials) without notice.
+  return {
+    total_count: boundedCount(response.total_count),
+    returned_count: boundedCount(Array.isArray(repositories) ? repositories.length : undefined),
+    target_shape_matches_expected: targetShapeMatchesExpected,
+    target_id_matches_expected:
+      targetShapeMatchesExpected &&
+      Number.isSafeInteger(firstRepository.id) &&
+      firstRepository.id === expectedRepositoryIdNumber,
+    target_full_name_matches_expected:
+      targetShapeMatchesExpected &&
+      typeof firstRepository.full_name === "string" &&
+      firstRepository.full_name === expectedRepository,
+  };
 }
 
 function canonicalComparable(value) {
@@ -3055,8 +3106,12 @@ async function main(argv) {
   if (command === "github-app-installation-repository-scope") {
     const installationToken = process.env.RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN;
     if (!installationToken) fail("RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN is required");
-    const repositories = await readGitHubAppInstallationRepositories({ installationToken });
-    createOnly(resolve(required(options, "output")), canonicalJson(repositories));
+    const repositoryScope = await readGitHubAppInstallationRepositories({
+      installationToken,
+      expectedRepositoryId: required(options, "expected-repository-id"),
+      expectedRepository: required(options, "expected-repository"),
+    });
+    createOnly(resolve(required(options, "output")), canonicalJson(repositoryScope));
     return;
   }
   fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, verify-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, github-app-installation, or github-app-installation-repository-scope command");

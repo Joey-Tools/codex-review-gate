@@ -253,27 +253,58 @@ test("publisher identity preflight maps transport errors to a closed failure cod
   );
 });
 
-test("publisher installation repository scope uses a closed installation-token HTTP read", async () => {
+test("publisher installation repository scope persists only a fixed safe projection", async () => {
   const installationToken = "synthetic-installation-token";
+  const expectedRepositoryId = "1239944216";
+  const expectedRepository = "JoeyTeng/codex-review-gate-action";
+  const temporaryCloneToken = "synthetic-temporary-clone-token";
+  const unknownCanary = "synthetic-unknown-repository-field";
   let observed;
-  const repositories = await readGitHubAppInstallationRepositories({
+  const repositoryScope = await readGitHubAppInstallationRepositories({
     installationToken,
+    expectedRepositoryId,
+    expectedRepository,
     fetchImpl: async (url, options) => {
       observed = { url, options };
       return {
         status: 200,
         headers: { get: () => null },
         text: async () => JSON.stringify({
-          total_count: 1,
-          repositories: [{ full_name: "JoeyTeng/codex-review-gate-action" }],
+          total_count: 2,
+          repositories: [
+            {
+              id: 1239944216,
+              full_name: expectedRepository,
+              temp_clone_token: temporaryCloneToken,
+              unknown_canary: unknownCanary,
+            },
+            {
+              id: 1239944217,
+              full_name: "JoeyTeng/another-installation-repository",
+              temp_clone_token: `${temporaryCloneToken}-second`,
+            },
+          ],
+          unknown_top_level_canary: unknownCanary,
         }),
       };
     },
   });
-  assert.deepEqual(repositories, {
-    total_count: 1,
-    repositories: [{ full_name: "JoeyTeng/codex-review-gate-action" }],
+  assert.deepEqual(repositoryScope, {
+    total_count: 2,
+    returned_count: 2,
+    target_shape_matches_expected: true,
+    target_id_matches_expected: true,
+    target_full_name_matches_expected: true,
   });
+  const persistedProjection = JSON.stringify(repositoryScope);
+  for (const secretOrUnknownValue of [
+    installationToken,
+    temporaryCloneToken,
+    unknownCanary,
+    "JoeyTeng/another-installation-repository",
+  ]) {
+    assert.equal(persistedProjection.includes(secretOrUnknownValue), false);
+  }
   assert.equal(observed.url, "https://api.github.com/installation/repositories");
   assert.equal(observed.options.headers.Authorization, `Bearer ${installationToken}`);
 
@@ -281,6 +312,8 @@ test("publisher installation repository scope uses a closed installation-token H
   await assert.rejects(
     readGitHubAppInstallationRepositories({
       installationToken,
+      expectedRepositoryId,
+      expectedRepository,
       fetchImpl: async () => ({
         status: 403,
         headers: { get: (name) => name === "x-github-request-id" ? installationToken : null },
@@ -300,6 +333,61 @@ test("publisher installation repository scope uses a closed installation-token H
     },
   );
   assert.equal(errorBodyRead, false);
+});
+
+test("publisher installation repository scope represents malformed and oversized counts fail closed", async () => {
+  const expectedRepositoryId = "1239944216";
+  const expectedRepository = "JoeyTeng/codex-review-gate-action";
+  const repositoryScope = await readGitHubAppInstallationRepositories({
+    installationToken: "synthetic-installation-token",
+    expectedRepositoryId,
+    expectedRepository,
+    fetchImpl: async () => ({
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        total_count: 1.5,
+        repositories: Array.from({ length: 101 }, (_, index) => ({
+          id: index === 0 ? 1239944216 : 1239944217 + index,
+          full_name: index === 0 ? expectedRepository : `JoeyTeng/extra-${index}`,
+        })),
+      }),
+    }),
+  });
+  assert.deepEqual(repositoryScope, {
+    total_count: 101,
+    returned_count: 101,
+    target_shape_matches_expected: true,
+    target_id_matches_expected: true,
+    target_full_name_matches_expected: true,
+  });
+});
+
+test("publisher installation repository scope validates expected target parameters before HTTP", async () => {
+  let fetchCalled = false;
+  const fetchImpl = async () => {
+    fetchCalled = true;
+    throw new Error("must not run");
+  };
+  await assert.rejects(
+    readGitHubAppInstallationRepositories({
+      installationToken: "synthetic-installation-token",
+      expectedRepositoryId: "1239944216.0",
+      expectedRepository: "JoeyTeng/codex-review-gate-action",
+      fetchImpl,
+    }),
+    /expected repository ID is malformed/u,
+  );
+  await assert.rejects(
+    readGitHubAppInstallationRepositories({
+      installationToken: "synthetic-installation-token",
+      expectedRepositoryId: "1239944216",
+      expectedRepository: "JoeyTeng/codex-review-gate-action/extra",
+      fetchImpl,
+    }),
+    /expected repository is malformed/u,
+  );
+  assert.equal(fetchCalled, false);
 });
 
 test("publisher installation CLI emits a closed JWT failure without creating output", () => {
@@ -330,6 +418,40 @@ test("publisher installation CLI emits a closed JWT failure without creating out
         assert.equal(error.stdout, "");
         assert.equal(error.stderr, "error: GitHub App JWT generation failed (failure_code=app_jwt_invalid)\n");
         assert.equal(error.stderr.includes(malformedPrivateKey), false);
+        return true;
+      },
+    );
+    assert.equal(existsSync(output), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("publisher installation repository scope CLI requires the explicit target before HTTP", () => {
+  const root = mkdtempSync(join(tmpdir(), "release-app-installation-scope-cli-"));
+  const output = join(root, "repository-scope.json");
+  try {
+    assert.throws(
+      () => execFileSync(
+        process.execPath,
+        [
+          new URL("../scripts/generate-action-release-provenance.mjs", import.meta.url).pathname,
+          "github-app-installation-repository-scope",
+          "--expected-repository", "JoeyTeng/codex-review-gate-action",
+          "--output", output,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN: "synthetic-installation-token",
+          },
+        },
+      ),
+      (error) => {
+        assert.equal(error.status, 1);
+        assert.equal(error.stdout, "");
+        assert.equal(error.stderr, "error: --expected-repository-id is required\n");
         return true;
       },
     );
@@ -497,26 +619,56 @@ test("publisher identity preflight rejects malformed App JWT inputs", () => {
   );
 });
 
-test("publisher workflow keeps App JWT and installation-token authentication classes separate", () => {
-  const tokenStep = PUBLISHER_WORKFLOW.match(
-    /      - name: Create least-privilege publisher token\n(?<body>[\s\S]*?)(?=\n      - name: )/u,
+test("publisher workflow inventories the full installation before minting a target-scoped token", () => {
+  const extractStep = (name) => PUBLISHER_WORKFLOW.match(
+    new RegExp(`      - name: ${name}\\n(?<body>[\\s\\S]*?)(?=\\n      - name: )`, "u"),
   )?.groups?.body;
-  const identityStep = PUBLISHER_WORKFLOW.match(
-    /      - name: Validate publisher identity and repository scope\n(?<body>[\s\S]*?)(?=\n      - name: )/u,
-  )?.groups?.body;
-  assert.ok(tokenStep, "publisher token step must remain present");
+  const preInventoryConfigurationStep = extractStep("Validate Publisher App static configuration before inventory");
+  const inventoryStep = extractStep("Create inventory-only Publisher App token");
+  const identityStep = extractStep("Validate Publisher App identity and full installation scope");
+  const tokenStep = extractStep("Create target-scoped publisher token");
+  const bindingStep = extractStep("Bind target-scoped publisher token to inventory identity");
+  assert.ok(preInventoryConfigurationStep, "pre-inventory configuration step must remain present");
+  assert.ok(inventoryStep, "inventory token step must remain present");
   assert.ok(identityStep, "publisher identity step must remain present");
+  assert.ok(tokenStep, "target-scoped publisher token step must remain present");
+  assert.ok(bindingStep, "target-scoped publisher token binding step must remain present");
+  assert.ok(
+    PUBLISHER_WORKFLOW.indexOf("Validate Publisher App static configuration before inventory") <
+      PUBLISHER_WORKFLOW.indexOf("Create inventory-only Publisher App token") &&
+      PUBLISHER_WORKFLOW.indexOf("Create inventory-only Publisher App token") <
+      PUBLISHER_WORKFLOW.indexOf("Validate Publisher App identity and full installation scope") &&
+      PUBLISHER_WORKFLOW.indexOf("Validate Publisher App identity and full installation scope") <
+        PUBLISHER_WORKFLOW.indexOf("Create target-scoped publisher token") &&
+      PUBLISHER_WORKFLOW.indexOf("Create target-scoped publisher token") <
+        PUBLISHER_WORKFLOW.indexOf("Bind target-scoped publisher token to inventory identity"),
+    "static configuration must pass before inventory; inventory must succeed before a target-scoped publisher token is minted and bound",
+  );
+  assert.match(preInventoryConfigurationStep, /APP_OWNER: \$\{\{ vars\.RELEASE_PUBLISHER_APP_OWNER \}\}/u);
+  assert.match(preInventoryConfigurationStep, /APP_SLUG: \$\{\{ vars\.RELEASE_PUBLISHER_APP_SLUG \}\}/u);
+  assert.match(preInventoryConfigurationStep, /static configuration check passed before inventory token minting/u);
+  assert.doesNotMatch(preInventoryConfigurationStep, /(?:PRIVATE_KEY|TOKEN|GITHUB_ENV|GITHUB_OUTPUT|GITHUB_STEP_SUMMARY)/u);
+  assert.match(inventoryStep, /uses: actions\/create-github-app-token@v3/u);
+  assert.match(inventoryStep, /client-id: \$\{\{ vars\.RELEASE_PUBLISHER_APP_CLIENT_ID \}\}/u);
+  assert.match(inventoryStep, /^          owner: JoeyTeng$/mu);
+  assert.match(inventoryStep, /^          permission-metadata: read$/mu);
+  assert.match(inventoryStep, /^          skip-token-revoke: false$/mu);
+  assert.doesNotMatch(inventoryStep, /^          repositories:/mu);
+  assert.doesNotMatch(inventoryStep, /^          permission-(?:administration|contents):/mu);
   assert.match(tokenStep, /uses: actions\/create-github-app-token@v3/u);
   assert.match(tokenStep, /client-id: \$\{\{ vars\.RELEASE_PUBLISHER_APP_CLIENT_ID \}\}/u);
-  assert.match(tokenStep, /repositories: codex-review-gate-action/u);
+  assert.match(tokenStep, /^          owner: JoeyTeng$/mu);
+  assert.match(tokenStep, /^          repositories: codex-review-gate-action$/mu);
   assert.deepEqual(
     [...tokenStep.matchAll(/^          (permission-[^:]+): (\S+)$/gmu)]
       .map((match) => [match[1], match[2]]),
     [
       ["permission-administration", "read"],
       ["permission-contents", "write"],
+      ["permission-metadata", "read"],
     ],
   );
+  assert.match(tokenStep, /^          skip-token-revoke: false$/mu);
   const identityLines = identityStep.split("\n");
   const appCommandIndex = identityLines.findIndex((line) =>
     line.includes("node scripts/generate-action-release-provenance.mjs github-app-installation"));
@@ -556,10 +708,22 @@ test("publisher workflow keeps App JWT and installation-token authentication cla
   assert.match(identityStep, /def bounded_event_count:/u);
   assert.doesNotMatch(identityStep, /permission_keys:|events: \(if/u);
   assert.match(identityStep, /Publisher App repository scope query starting\./u);
-  assert.match(identityStep, /github-app-installation-repository-scope[\s\S]*--output "\$repository_scope_file"/u);
-  assert.match(identityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$installation_token"/u);
-  assert.match(identityStep, /def bounded_total_count:/u);
-  assert.match(identityStep, /def first_repository_matches_target:/u);
+  assert.match(
+    identityStep,
+    /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$repository_scope_file"/u,
+  );
+  assert.match(identityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$inventory_installation_token"/u);
+  assert.match(identityStep, /keys == \[\s*"returned_count",\s*"total_count",\s*"target_full_name_matches_expected",\s*"target_id_matches_expected",\s*"target_shape_matches_expected"\s*\]/u);
+  for (const field of [
+    "total_count",
+    "returned_count",
+    "target_shape_matches_expected",
+    "target_id_matches_expected",
+    "target_full_name_matches_expected",
+  ]) {
+    assert.match(identityStep, new RegExp(`\\.${field}`, "u"));
+  }
+  assert.doesNotMatch(identityStep, /\.repositories\b|\.full_name\b|temp_clone_token/u);
   assert.match(identityStep, /Publisher App repository scope observed \(non-secret\): \$observed_repository_scope/u);
   assert.match(identityStep, /Publisher App repository scope query completed\./u);
   assert.match(identityStep, /Publisher App repository scope invariant failed; inspect the non-secret observed scope above\./u);
@@ -567,6 +731,14 @@ test("publisher workflow keeps App JWT and installation-token authentication cla
   assert.doesNotMatch(executableIdentityStep, /app\/installations/u);
   assert.doesNotMatch(executableIdentityStep, /\bgh api\b/u);
   assert.doesNotMatch(executableIdentityStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN.*GITHUB_ENV/u);
+  assert.match(identityStep, /ACTUAL_APP_SLUG: \$\{\{ steps\.publisher-inventory-token\.outputs\.app-slug \}\}/u);
+  assert.match(identityStep, /ACTUAL_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
+  assert.match(identityStep, /INVENTORY_INSTALLATION_TOKEN: \$\{\{ steps\.publisher-inventory-token\.outputs\.token \}\}/u);
+  assert.match(bindingStep, /INVENTORY_APP_SLUG: \$\{\{ steps\.publisher-inventory-token\.outputs\.app-slug \}\}/u);
+  assert.match(bindingStep, /INVENTORY_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
+  assert.match(bindingStep, /SCOPED_APP_SLUG: \$\{\{ steps\.publisher-token\.outputs\.app-slug \}\}/u);
+  assert.match(bindingStep, /SCOPED_INSTALLATION_ID: \$\{\{ steps\.publisher-token\.outputs\.installation-id \}\}/u);
+  assert.match(bindingStep, /Publisher App scoped-token binding check passed\./u);
 });
 
 test("publisher workflow persists exact push admission and dispatch can only reuse that push artifact", () => {
