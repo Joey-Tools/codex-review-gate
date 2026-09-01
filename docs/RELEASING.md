@@ -204,7 +204,12 @@ five fixed non-secret fields before it is written locally, and the temporary
 files are removed in an `always()` cleanup. Only after that proof does the job
 mint its separate target-scoped installation token. That write token names only
 the target repository and requests Administration read, Contents write, and
-Metadata read. It is the only credential exposed to Git; it is never passed
+Metadata read. Before it can reach Git, the publisher reads the writer token's
+own repository scope and requires the same exact singleton repository ID and
+canonical name. This second proof binds the newly minted token to the target
+repository object at mint time; matching only the App slug and installation ID
+would not establish that object identity when the token Action accepts a
+repository name. It is the only credential exposed to Git; it is never passed
 between jobs, embedded in a remote URL, stored in an artifact, or printed.
 Checkout uses `persist-credentials: false`. Git receives it only through an
 owner-private temporary `GIT_ASKPASS` helper scoped to the exact target
@@ -279,10 +284,11 @@ signer-policy skip path.
 
 Before the first write, the full-installation inventory proves the expected
 Publisher App installation has the sole target repository, and the separate
-write token is bound to that same App slug and installation ID. The target
-rulesets then admit that App as the only publication bypass identity. The GPG
-identity is the author, committer, and signer embedded in the publication Git
-objects, and its signatures remain independently verifiable after publication.
+write token is bound to that same App slug and installation ID and is reread as
+the exact target repository object. The target rulesets then admit that App as
+the only publication bypass identity. The GPG identity is the author,
+committer, and signer embedded in the publication Git objects, and its
+signatures remain independently verifiable after publication.
 
 Do not over-read the later GitHub state checks: ref, commit, signature, and
 Release readback proves the resulting objects and current repository state, but

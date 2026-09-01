@@ -3351,21 +3351,32 @@ superseded_by:
   installation ID as the inventory token. This preserves a narrow credential
   for publication while making the App private-key installation boundary
   independently observable before any target write.
+- The target-scoped token receives one more post-mint scope read before Git
+  authentication or reconciliation. It must itself observe the exact singleton
+  repository ID `1239944216` and canonical name
+  `JoeyTeng/codex-review-gate-action`, using the same safe five-field
+  projection. The protected property is repository-object identity: the token
+  Action accepts a repository name, so equality of App slug and installation
+  ID alone does not establish that the freshly minted writer still resolves to
+  the inventory's repository object. This re-read fails closed before the
+  writer can reach Git, and its temporary projection is removed in the
+  `always()` cleanup.
 - The inventory check accepts exactly one complete-installation repository,
   matched both by immutable repository ID `1239944216` and canonical name
   `JoeyTeng/codex-review-gate-action`. It never persists the raw API object:
   the bounded Node helper retains it only in memory and writes an exact
   five-field summary (`total_count`, `returned_count`, and three target-match
   booleans). This avoids treating an unreviewed future response field, such as
-  a temporary clone credential, as safe diagnostic data. Both local
-  installation JSON files are removed in the `always()` cleanup. The metadata
-  check also now requires the `suspended_at` key to exist and be explicitly
-  `null`; a missing field is an invariant failure rather than an implicit
-  "not suspended" result.
+  a temporary clone credential, as safe diagnostic data. Every local
+  installation-scope projection, including the post-mint writer projection,
+  is removed in the `always()` cleanup. The metadata check also now requires
+  the `suspended_at` key to exist and be explicitly `null`; a missing field is
+  an invariant failure rather than an implicit "not suspended" result.
 - Both release guides now describe the two-token sequence, the complete-
-  installation proof, the fixed local projection, and the scoped-token binding
-  in lockstep. They no longer describe the repository-scoped writer as the
-  token that establishes sole-installation scope.
+  installation proof, the fixed local projection, the scoped-token binding,
+  and the post-mint writer-object proof in lockstep. They no longer describe
+  the repository-scoped writer as the token that establishes sole-installation
+  scope.
 - An executable regression extracts the real workflow scope guard rather than
   reproducing its predicate. It proves the exact singleton projection advances
   to the subsequent target-token boundary while extra repositories, malformed

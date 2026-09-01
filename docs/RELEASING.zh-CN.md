@@ -172,11 +172,14 @@ inventory token 读取 `GET /installation/repositories`，并必须证明完整 
 内存投影为五个固定的 non-secret fields，才会写入本地；临时文件由 `always()` cleanup
 删除。只有该证明通过后，job 才会签发独立的 target-scoped installation token。这个
 write token 只点名 target repository，并请求 Administration read、Contents write 与
-Metadata read。它是唯一暴露给 Git 的 credential：不得跨 jobs 传递、嵌入 remote URL、
-存入 artifact 或打印。Checkout 使用 `persist-credentials: false`。Git 只通过
-owner-private 的临时 `GIT_ASKPASS` helper 取得该 token，并且 helper 只作用于 exact
-target repository。Post step 撤销 token 是 best effort；若 runner 被强制终止，token
-expiry 是剩余边界。
+Metadata read。在它能交给 Git 前，publisher 会用这个 write token 自己重新读取
+repository scope，并要求同一个 exact singleton repository ID 和 canonical name。第二次
+证明把刚签发的 token 绑定到签发时的 target repository object；仅匹配 App slug 与
+installation ID 不足以建立这个 object identity，因为 token Action 的输入是 repository
+name。它是唯一暴露给 Git 的 credential：不得跨 jobs 传递、嵌入 remote URL、存入
+artifact 或打印。Checkout 使用 `persist-credentials: false`。Git 只通过 owner-private 的
+临时 `GIT_ASKPASS` helper 取得该 token，并且 helper 只作用于 exact target repository。
+Post step 撤销 token 是 best effort；若 runner 被强制终止，token expiry 是剩余边界。
 
 Publisher workflow 中每个 `uses:` dependency 都必须是 allowlisted GitHub-official
 Action，并使用 floating major（例如 `@v4`），绝不使用 `@main`。我们明确接受
@@ -238,9 +241,9 @@ certificate 逐字节比较。Production 不存在 signer-policy skip path。
 
 首次写入前，full-installation inventory 必须证明 expected Publisher App installation
 只含唯一 target repository，独立的 write token 还必须绑定同一 App slug 与 installation
-ID；target rulesets 随后只把该 App 作为 publication bypass identity。GPG identity 是
-写入 publication Git objects 的 author、committer 与 signer，其 signatures 在发布后仍可
-独立验证。
+ID，并在 post-mint 重新读取为 exact target repository object；target rulesets 随后只把
+该 App 作为 publication bypass identity。GPG identity 是写入 publication Git objects 的
+author、committer 与 signer，其 signatures 在发布后仍可独立验证。
 
 不得过度解读之后的 GitHub state checks：ref、commit、signature 与 Release readback
 可以证明最终 objects 与当前 repository state，但 GitHub 不提供可证明某个已接受 ref

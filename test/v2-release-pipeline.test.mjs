@@ -159,6 +159,17 @@ function workflowStepBlock(job, stepName) {
   return job.slice(start, end);
 }
 
+function workflowRunScript(step) {
+  const marker = "        run: |\n";
+  const start = step.indexOf(marker);
+  assert.notEqual(start, -1, "workflow step must contain a literal run script");
+  return step
+    .slice(start + marker.length)
+    .split("\n")
+    .map((line) => line.startsWith("          ") ? line.slice(10) : line)
+    .join("\n");
+}
+
 function assertPublisherRepositoryScopeGuardFailsClosed(identityStep) {
   assert.doesNotMatch(identityStep, /^\s*continue-on-error:/mu);
   const observedScopeStart = identityStep.indexOf(
@@ -242,6 +253,156 @@ printf '%s\\n' 'target-scoped publisher token entered' > "$target_scope_marker"
           label,
         );
         assert.doesNotMatch(result.stdout, /target-scoped publisher token entered/u, label);
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function assertPublisherBindingAndWriterScopeFailClosed(bindingStep) {
+  const bindingScriptBody = workflowRunScript(bindingStep);
+  const root = mkdtempSync(join(tmpdir(), "release-publisher-binding-guard-"));
+  try {
+    const fakeBin = join(root, "bin");
+    mkdirSync(fakeBin, { recursive: true });
+    const fakeNode = join(fakeBin, "node");
+    writeFileSync(fakeNode, `#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == scripts/generate-action-release-provenance.mjs ]]
+[[ "$2" == github-app-installation-repository-scope ]]
+shift 2
+expected_repository_id=
+expected_repository=
+output=
+while (( $# > 0 )); do
+  case "$1" in
+    --expected-repository-id) expected_repository_id="$2"; shift 2 ;;
+    --expected-repository) expected_repository="$2"; shift 2 ;;
+    --output) output="$2"; shift 2 ;;
+    *) exit 94 ;;
+  esac
+done
+[[ "$expected_repository_id" == 1239944216 ]]
+[[ "$expected_repository" == JoeyTeng/codex-review-gate-action ]]
+[[ -n "$output" ]]
+[[ "\${RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN:-}" == "$EXPECTED_SCOPED_TOKEN" ]]
+cp "$FAKE_SCOPE_FIXTURE" "$output"
+printf '%s\n' helper-entered > "$FAKE_HELPER_MARKER"
+`);
+    chmodSync(fakeNode, 0o755);
+    const bindingScript = join(root, "binding-step.sh");
+    writeFileSync(bindingScript, `#!/usr/bin/env bash
+${bindingScriptBody}
+[[ -z "\${SCOPED_INSTALLATION_TOKEN:-}" ]]
+[[ -z "\${scoped_installation_token:-}" ]]
+[[ -z "\${RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN:-}" ]]
+printf '%s\\n' 'Git authentication downstream entered' > "$DOWNSTREAM_MARKER"
+`);
+    chmodSync(bindingScript, 0o755);
+
+    const canonicalSlug = "codex-review-gate-action-publisher";
+    const installationId = "12345678";
+    const validScope = {
+      total_count: 1,
+      returned_count: 1,
+      target_shape_matches_expected: true,
+      target_id_matches_expected: true,
+      target_full_name_matches_expected: true,
+    };
+    for (const {
+      label,
+      env = {},
+      scope = validScope,
+      accepted,
+      helperEntered,
+      failurePattern,
+    } of [
+      {
+        label: "bound writer token with exact target scope",
+        accepted: true,
+        helperEntered: true,
+      },
+      {
+        label: "configured slug mismatch",
+        env: { EXPECTED_APP_SLUG: "replacement-publisher" },
+        accepted: false,
+        helperEntered: false,
+        failurePattern: /configured publisher slug/u,
+      },
+      {
+        label: "inventory slug mismatch",
+        env: { INVENTORY_APP_SLUG: "replacement-publisher" },
+        accepted: false,
+        helperEntered: false,
+        failurePattern: /inventory token/u,
+      },
+      {
+        label: "inventory installation ID mismatch",
+        env: { INVENTORY_INSTALLATION_ID: "87654321" },
+        accepted: false,
+        helperEntered: false,
+        failurePattern: /installation ID does not match the inventory token/u,
+      },
+      {
+        label: "writer token resolves a replacement repository ID",
+        scope: { ...validScope, target_id_matches_expected: false },
+        accepted: false,
+        helperEntered: true,
+        failurePattern: /target-scoped repository scope invariant failed/u,
+      },
+      {
+        label: "writer token resolves a non-canonical full name",
+        scope: { ...validScope, target_full_name_matches_expected: false },
+        accepted: false,
+        helperEntered: true,
+        failurePattern: /target-scoped repository scope invariant failed/u,
+      },
+      {
+        label: "writer token is not exact singleton scope",
+        scope: { ...validScope, total_count: 2, returned_count: 2 },
+        accepted: false,
+        helperEntered: true,
+        failurePattern: /target-scoped repository scope invariant failed/u,
+      },
+    ]) {
+      const stem = label.replaceAll(/[^a-z0-9]+/gu, "-");
+      const caseRoot = join(root, stem);
+      mkdirSync(caseRoot, { recursive: true });
+      const scopeFixture = join(caseRoot, "scope.json");
+      const helperMarker = join(caseRoot, "helper-entered");
+      const downstreamMarker = join(caseRoot, "downstream-entered");
+      writeFileSync(scopeFixture, `${JSON.stringify(scope)}\n`);
+      const result = invoke("bash", [bindingScript], {
+        cwd: root,
+        env: {
+          DOWNSTREAM_MARKER: downstreamMarker,
+          EXPECTED_APP_SLUG: canonicalSlug,
+          EXPECTED_SCOPED_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+          FAKE_HELPER_MARKER: helperMarker,
+          FAKE_SCOPE_FIXTURE: scopeFixture,
+          INVENTORY_APP_SLUG: canonicalSlug,
+          INVENTORY_INSTALLATION_ID: installationId,
+          PATH: `${fakeBin}:${executionEnv.PATH}`,
+          RUNNER_TEMP: caseRoot,
+          SCOPED_APP_SLUG: canonicalSlug,
+          SCOPED_INSTALLATION_ID: installationId,
+          SCOPED_INSTALLATION_TOKEN: SYNTHETIC_TOKEN_FIXTURE.value,
+          SHELLOPTS: "allexport:verbose:xtrace",
+          ...env,
+        },
+      });
+      const combined = `${result.stdout}\n${result.stderr}`;
+      assert.doesNotMatch(combined, new RegExp(SYNTHETIC_TOKEN_FIXTURE.value, "u"), label);
+      assert.equal(existsSync(helperMarker), helperEntered, label);
+      if (accepted) {
+        assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+        assert.equal(existsSync(downstreamMarker), true, label);
+        assert.match(result.stdout, /target-scoped repository scope check passed\./u);
+      } else {
+        assert.notEqual(result.status, 0, label);
+        assert.equal(existsSync(downstreamMarker), false, label);
+        assert.match(result.stderr, failurePattern, label);
       }
     }
   } finally {
@@ -2110,7 +2271,11 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
       workflow.indexOf("Validate Publisher App identity and full installation scope") <
         workflow.indexOf("Create target-scoped publisher token") &&
       workflow.indexOf("Create target-scoped publisher token") <
-        workflow.indexOf("Bind target-scoped publisher token to inventory identity"),
+        workflow.indexOf("Bind and validate target-scoped publisher token") &&
+      workflow.indexOf("Bind and validate target-scoped publisher token") <
+        workflow.indexOf("Configure target-scoped ephemeral Git authentication") &&
+      workflow.indexOf("Configure target-scoped ephemeral Git authentication") <
+        workflow.indexOf("Reconcile release publication"),
   );
   assert.match(workflow, /--verify-publication-plan[\s\S]*--publication-plan-file/u);
   assert.match(workflow, /--publish[\s\S]*--publication-plan-file/u);
@@ -2146,8 +2311,13 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   const bindingStep = workflowStepBlock(
     publishJob,
-    "Bind target-scoped publisher token to inventory identity",
+    "Bind and validate target-scoped publisher token",
   );
+  const configureAuthenticationStep = workflowStepBlock(
+    publishJob,
+    "Configure target-scoped ephemeral Git authentication",
+  );
+  const reconcileStep = workflowStepBlock(publishJob, "Reconcile release publication");
   const cleanupStep = workflowStepBlock(publishJob, "Remove ephemeral local credentials");
   const recoveryStep = workflowStepBlock(publishJob, "Explain publication recovery");
 
@@ -2223,12 +2393,42 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
 
   assert.match(bindingStep, /SCOPED_APP_SLUG: \$\{\{ steps\.publisher-token\.outputs\.app-slug \}\}/u);
   assert.match(bindingStep, /SCOPED_INSTALLATION_ID: \$\{\{ steps\.publisher-token\.outputs\.installation-id \}\}/u);
+  assert.match(bindingStep, /SCOPED_INSTALLATION_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
   assert.match(bindingStep, /INVENTORY_APP_SLUG: \$\{\{ steps\.publisher-inventory-token\.outputs\.app-slug \}\}/u);
   assert.match(bindingStep, /INVENTORY_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
   assert.match(bindingStep, /scoped token app slug does not match the configured publisher slug/u);
   assert.match(bindingStep, /scoped token app slug does not match the inventory token/u);
   assert.match(bindingStep, /scoped token installation ID does not match the inventory token/u);
   assert.match(bindingStep, /Publisher App scoped-token binding check passed\./u);
+  const bindingLines = bindingStep.split("\n");
+  const scopedTokenCapture = bindingLines.findIndex((line) =>
+    line.includes('scoped_installation_token="$SCOPED_INSTALLATION_TOKEN"'));
+  assert.ok(scopedTokenCapture > 0, "binding step must capture the target-scoped token locally");
+  for (const command of ["set +x", "set +v", "set +a"]) {
+    const commandIndex = bindingLines.findIndex((line) => line.trim() === command);
+    assert.ok(commandIndex >= 0 && commandIndex < scopedTokenCapture, `${command} must precede scoped-token capture`);
+  }
+  assert.match(bindingStep, /unset SCOPED_INSTALLATION_TOKEN/u);
+  assert.match(bindingStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$scoped_installation_token"/u);
+  assert.match(
+    bindingStep,
+    /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$scoped_repository_scope_file"/u,
+  );
+  assert.match(bindingStep, /unset scoped_installation_token/u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope observed \(non-secret\): \$observed_scoped_repository_scope/u);
+  assert.match(bindingStep, /keys == \[[\s\S]*"returned_count"[\s\S]*"target_full_name_matches_expected"[\s\S]*"target_id_matches_expected"[\s\S]*"target_shape_matches_expected"[\s\S]*"total_count"[\s\S]*\]/u);
+  assert.match(bindingStep, /\.total_count == 1[\s\S]*\.returned_count == 1[\s\S]*\.target_shape_matches_expected == true[\s\S]*\.target_id_matches_expected == true[\s\S]*\.target_full_name_matches_expected == true/u);
+  assert.doesNotMatch(bindingStep, /\.repositories\b|\.full_name\b|temp_clone_token/u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope invariant failed; inspect the non-secret observed scope above\./u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope check passed\./u);
+  assert.doesNotMatch(bindingStep, /^\s*continue-on-error:/mu);
+  assertPublisherBindingAndWriterScopeFailClosed(bindingStep);
+  assert.match(configureAuthenticationStep, /release-target-askpass/u);
+  assert.match(reconcileStep, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
+  assert.doesNotMatch(
+    reconcileStep,
+    /(?:INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN)/u,
+  );
 
   // The secret-bearing steps do not reference workflow output, environment, or
   // summary sinks at all. This catches both direct and local-variable writes.
@@ -2249,11 +2449,13 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   ]);
   assert.doesNotMatch(
     recoveryStep,
-    /(?:APP_PRIVATE_KEY|INVENTORY_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_PRIVATE_KEY|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN|app_private_key|inventory_installation_token)/u,
+    /(?:APP_PRIVATE_KEY|INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_PRIVATE_KEY|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN|app_private_key|inventory_installation_token|scoped_installation_token)/u,
   );
   assert.match(cleanupStep, /rm -f -- "\$RUNNER_TEMP\/publisher-installation\.json"/u);
   assert.match(cleanupStep, /rm -f -- "\$RUNNER_TEMP\/publisher-installation-repositories\.json"/u);
-  assert.match(workflow, /If the first failed step is `Validate Publisher App identity and[\s\S]*full installation scope` or `Bind target-scoped publisher token to[\s\S]*inventory identity`/u);
+  assert.match(cleanupStep, /rm -f -- "\$RUNNER_TEMP\/publisher-target-installation-repositories\.json"/u);
+  assert.match(workflow, /If the first failed step is `Validate Publisher App identity and[\s\S]*full installation scope` or `Bind and validate target-scoped[\s\S]*publisher token`/u);
+  assert.match(recoveryStep, /scoped-token-binding, and target-token-scope/u);
   assert.match(workflow, /Inspect `reconcile_state` and `recovery_code` only when `Reconcile[\s\S]*release publication` started\./u);
   assert.doesNotMatch(workflow, /Inspect the first failure, `reconcile_state`, and `recovery_code`\./u);
   assert.doesNotMatch(workflow, /GH_TOKEN="\$app_jwt"|Authorization:\s*token/u);

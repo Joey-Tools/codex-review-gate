@@ -682,12 +682,16 @@ test("publisher workflow inventories the full installation before minting a targ
   const inventoryStep = extractStep("Create inventory-only Publisher App token");
   const identityStep = extractStep("Validate Publisher App identity and full installation scope");
   const tokenStep = extractStep("Create target-scoped publisher token");
-  const bindingStep = extractStep("Bind target-scoped publisher token to inventory identity");
+  const bindingStep = extractStep("Bind and validate target-scoped publisher token");
+  const configureAuthenticationStep = extractStep("Configure target-scoped ephemeral Git authentication");
+  const reconcileStep = extractStep("Reconcile release publication");
   assert.ok(preInventoryConfigurationStep, "pre-inventory configuration step must remain present");
   assert.ok(inventoryStep, "inventory token step must remain present");
   assert.ok(identityStep, "publisher identity step must remain present");
   assert.ok(tokenStep, "target-scoped publisher token step must remain present");
   assert.ok(bindingStep, "target-scoped publisher token binding step must remain present");
+  assert.ok(configureAuthenticationStep, "target-scoped Git authentication step must remain present");
+  assert.ok(reconcileStep, "publisher reconcile step must remain present");
   assert.ok(
     PUBLISHER_WORKFLOW.indexOf("Validate Publisher App static configuration before inventory") <
       PUBLISHER_WORKFLOW.indexOf("Create inventory-only Publisher App token") &&
@@ -696,8 +700,12 @@ test("publisher workflow inventories the full installation before minting a targ
       PUBLISHER_WORKFLOW.indexOf("Validate Publisher App identity and full installation scope") <
         PUBLISHER_WORKFLOW.indexOf("Create target-scoped publisher token") &&
       PUBLISHER_WORKFLOW.indexOf("Create target-scoped publisher token") <
-        PUBLISHER_WORKFLOW.indexOf("Bind target-scoped publisher token to inventory identity"),
-    "static configuration must pass before inventory; inventory must succeed before a target-scoped publisher token is minted and bound",
+        PUBLISHER_WORKFLOW.indexOf("Bind and validate target-scoped publisher token") &&
+      PUBLISHER_WORKFLOW.indexOf("Bind and validate target-scoped publisher token") <
+        PUBLISHER_WORKFLOW.indexOf("Configure target-scoped ephemeral Git authentication") &&
+      PUBLISHER_WORKFLOW.indexOf("Bind and validate target-scoped publisher token") <
+        PUBLISHER_WORKFLOW.indexOf("Reconcile release publication"),
+    "inventory and post-mint writer scope must pass before target Git authentication or reconciliation",
   );
   assert.match(preInventoryConfigurationStep, /APP_OWNER: \$\{\{ vars\.RELEASE_PUBLISHER_APP_OWNER \}\}/u);
   assert.match(preInventoryConfigurationStep, /APP_SLUG: \$\{\{ vars\.RELEASE_PUBLISHER_APP_SLUG \}\}/u);
@@ -793,7 +801,35 @@ test("publisher workflow inventories the full installation before minting a targ
   assert.match(bindingStep, /INVENTORY_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
   assert.match(bindingStep, /SCOPED_APP_SLUG: \$\{\{ steps\.publisher-token\.outputs\.app-slug \}\}/u);
   assert.match(bindingStep, /SCOPED_INSTALLATION_ID: \$\{\{ steps\.publisher-token\.outputs\.installation-id \}\}/u);
+  assert.match(bindingStep, /SCOPED_INSTALLATION_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
   assert.match(bindingStep, /Publisher App scoped-token binding check passed\./u);
+  const bindingLines = bindingStep.split("\n");
+  const scopedTokenCapture = bindingLines.findIndex((line) =>
+    line.includes('scoped_installation_token="$SCOPED_INSTALLATION_TOKEN"'));
+  assert.ok(scopedTokenCapture > 0, "binding step must capture the target-scoped token locally");
+  for (const command of ["set +x", "set +v", "set +a"]) {
+    const commandIndex = bindingLines.findIndex((line) => line.trim() === command);
+    assert.ok(commandIndex >= 0 && commandIndex < scopedTokenCapture, `${command} must precede scoped-token capture`);
+  }
+  assert.match(bindingStep, /unset SCOPED_INSTALLATION_TOKEN/u);
+  assert.match(bindingStep, /RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="\$scoped_installation_token"/u);
+  assert.match(
+    bindingStep,
+    /github-app-installation-repository-scope[\s\S]*--expected-repository-id 1239944216[\s\S]*--expected-repository "JoeyTeng\/codex-review-gate-action"[\s\S]*--output "\$scoped_repository_scope_file"/u,
+  );
+  assert.match(bindingStep, /unset scoped_installation_token/u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope observed \(non-secret\): \$observed_scoped_repository_scope/u);
+  assert.match(bindingStep, /keys == \[\s*"returned_count",\s*"target_full_name_matches_expected",\s*"target_id_matches_expected",\s*"target_shape_matches_expected",\s*"total_count"\s*\]/u);
+  assert.match(bindingStep, /\.total_count == 1[\s\S]*\.returned_count == 1[\s\S]*\.target_shape_matches_expected == true[\s\S]*\.target_id_matches_expected == true[\s\S]*\.target_full_name_matches_expected == true/u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope invariant failed; inspect the non-secret observed scope above\./u);
+  assert.match(bindingStep, /Publisher App target-scoped repository scope check passed\./u);
+  assert.doesNotMatch(bindingStep, /\.repositories\b|\.full_name\b|temp_clone_token/u);
+  assert.doesNotMatch(bindingStep, /\bGITHUB_(?:ENV|OUTPUT|STEP_SUMMARY)\b/u);
+  assert.match(reconcileStep, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
+  assert.doesNotMatch(
+    reconcileStep,
+    /(?:INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN)/u,
+  );
 });
 
 test("publisher workflow persists exact push admission and dispatch can only reuse that push artifact", () => {

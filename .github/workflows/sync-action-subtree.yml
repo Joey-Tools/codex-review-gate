@@ -732,15 +732,19 @@ jobs:
           permission-contents: write
           permission-metadata: read
           skip-token-revoke: false
-      - name: Bind target-scoped publisher token to inventory identity
+      - name: Bind and validate target-scoped publisher token
         env:
           EXPECTED_APP_SLUG: ${{ vars.RELEASE_PUBLISHER_APP_SLUG }}
           INVENTORY_APP_SLUG: ${{ steps.publisher-inventory-token.outputs.app-slug }}
           INVENTORY_INSTALLATION_ID: ${{ steps.publisher-inventory-token.outputs.installation-id }}
           SCOPED_APP_SLUG: ${{ steps.publisher-token.outputs.app-slug }}
           SCOPED_INSTALLATION_ID: ${{ steps.publisher-token.outputs.installation-id }}
+          SCOPED_INSTALLATION_TOKEN: ${{ steps.publisher-token.outputs.token }}
         run: |
           set -euo pipefail
+          set +x
+          set +v
+          set +a
           if [[ "$SCOPED_APP_SLUG" != "$EXPECTED_APP_SLUG" ]]; then
             printf '%s\n' "Publisher App scoped-token invariant failed: scoped token app slug does not match the configured publisher slug." >&2
             exit 1
@@ -754,6 +758,59 @@ jobs:
             exit 1
           fi
           printf '%s\n' "Publisher App scoped-token binding check passed."
+          scoped_repository_scope_file="$RUNNER_TEMP/publisher-target-installation-repositories.json"
+          # shellcheck disable=SC2153 # GitHub Actions injects this action output.
+          scoped_installation_token="$SCOPED_INSTALLATION_TOKEN"
+          unset SCOPED_INSTALLATION_TOKEN
+          printf '%s\n' "Publisher App target-scoped repository scope query starting."
+          RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN="$scoped_installation_token" \
+            node scripts/generate-action-release-provenance.mjs github-app-installation-repository-scope \
+              --expected-repository-id 1239944216 \
+              --expected-repository "JoeyTeng/codex-review-gate-action" \
+              --output "$scoped_repository_scope_file"
+          unset scoped_installation_token
+          printf '%s\n' "Publisher App target-scoped repository scope query completed."
+          observed_scoped_repository_scope="$(jq -c \
+            '
+              def bounded_count:
+                if type == "number" then
+                  if . >= 0 and . <= 101 and floor == . then . else "unexpected" end
+                else "unexpected"
+                end;
+              if type != "object" then
+                {summary_shape: "unexpected"}
+              else
+                {
+                  total_count: (.total_count | bounded_count),
+                  returned_count: (.returned_count | bounded_count),
+                  target_shape_matches_expected: (.target_shape_matches_expected == true),
+                  target_id_matches_expected: (.target_id_matches_expected == true),
+                  target_full_name_matches_expected: (.target_full_name_matches_expected == true)
+                }
+              end
+            ' "$scoped_repository_scope_file")"
+          printf '%s\n' "Publisher App target-scoped repository scope observed (non-secret): $observed_scoped_repository_scope"
+          if ! jq -e \
+            '
+              if type != "object" then false else
+                keys == [
+                  "returned_count",
+                  "target_full_name_matches_expected",
+                  "target_id_matches_expected",
+                  "target_shape_matches_expected",
+                  "total_count"
+                ] and
+                .total_count == 1 and
+                .returned_count == 1 and
+                .target_shape_matches_expected == true and
+                .target_id_matches_expected == true and
+                .target_full_name_matches_expected == true
+              end
+            ' "$scoped_repository_scope_file" >/dev/null; then
+            printf '%s\n' "Publisher App target-scoped repository scope invariant failed; inspect the non-secret observed scope above." >&2
+            exit 1
+          fi
+          printf '%s\n' "Publisher App target-scoped repository scope check passed."
       - name: Configure target-scoped ephemeral Git authentication
         run: |
           set -euo pipefail
@@ -814,6 +871,7 @@ jobs:
           rm -f -- "$RUNNER_TEMP/release-signing-public-key.asc"
           rm -f -- "$RUNNER_TEMP/publisher-installation.json"
           rm -f -- "$RUNNER_TEMP/publisher-installation-repositories.json"
+          rm -f -- "$RUNNER_TEMP/publisher-target-installation-repositories.json"
           rm -rf -- "$RUNNER_TEMP/release-gnupg"
       - name: Explain publication recovery
         if: ${{ failure() }}
@@ -822,13 +880,13 @@ jobs:
           ## Publisher execution failed
 
           If the first failed step is `Validate Publisher App identity and
-          full installation scope` or `Bind target-scoped publisher token to
-          inventory identity`, inspect the nearest preceding `Publisher App
-          ...` phase marker. Static/token, App-JWT, installation-metadata,
-          installation-scope, and scoped-token-binding failures each report a
-          closed failure code or a non-secret invariant summary. Repair that
-          named App configuration or installation mismatch, then start a fresh
-          reviewed release intent.
+          full installation scope` or `Bind and validate target-scoped
+          publisher token`, inspect the nearest preceding `Publisher App ...`
+          phase marker. Static/token, App-JWT, installation-metadata,
+          installation-scope, scoped-token-binding, and target-token-scope
+          failures each report a closed failure code or a non-secret invariant
+          summary. Repair that named App configuration or installation
+          mismatch, then start a fresh reviewed release intent.
 
           Inspect `reconcile_state` and `recovery_code` only when `Reconcile
           release publication` started. Exact-prefix recovery never overwrites
