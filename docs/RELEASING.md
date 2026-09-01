@@ -117,22 +117,23 @@ stages:
 | Stage | Privilege | Contract |
 | --- | --- | --- |
 | `plan` | Unprivileged | Check the exact source commit, manifest, SemVer, reachability, release policy, and immutable target-parent policy. |
-| `candidate-a` | Unprivileged | Independently materialize and test candidate A on a clean runner; record its tree, inventory, modes, sizes, and SHA-256 digests. |
-| `candidate-b` | Unprivileged | Independently materialize and test candidate B on another clean runner. |
+| `candidate-a` | Unprivileged | Independently materialize and upload candidate A on a clean runner; record its tree, inventory, modes, sizes, and SHA-256 digests. |
+| `candidate-b` | Unprivileged | Independently materialize and upload candidate B on another clean runner. |
+| `source-validation` | Unprivileged | After both candidates are frozen, validate the exact source commit across one core cell and four Release-test shards on five clean runners. |
 | `assemble` | Unprivileged | Require byte-identical candidates and produce the canonical candidate bundle. |
 | `publication-plan` | Unprivileged | Reconstruct and validate the publication plan and candidate before approval; upload no privileged material. |
 | `publish` | Privileged | After Environment approval, revalidate everything and perform signed remote publication. |
 | `verify` | Unprivileged | Re-read public refs and Release state and report the observed result. |
 
-The light unprivileged `plan`, `assemble`, `publication-plan`, and `verify`
-jobs use `ubuntu-slim` with 14-minute timeouts. GitHub imposes a separate
-15-minute hard limit on that single-CPU runner, so the low-frequency, heavy
-`candidate-a` and `candidate-b` jobs use `ubuntu-24.04` with 30-minute
-timeouts. The full suite alone had consumed about 755.6 seconds before its
-final release-pipeline test completed, leaving inadequate headroom on
-`ubuntu-slim` for checkout, setup, candidate materialization, packaging, and
-upload. The privileged `publish` job also retains `ubuntu-24.04` with its
-existing 30-minute timeout.
+The light unprivileged `plan`, `candidate-a`, `candidate-b`, `assemble`,
+`publication-plan`, and `verify` jobs use `ubuntu-slim` with 14-minute
+timeouts. GitHub imposes a separate 15-minute hard limit on that single-CPU
+runner, so exact-source tests run in the `source-validation` matrix on five
+`ubuntu-24.04` runners: one core cell and four Release-test shards, each with a
+14-minute timeout and `fail-fast: false`. This replaces two serial full-suite
+validations that each took more than 17 minutes in the first live RC run while
+preserving independent candidate construction. The privileged `publish` job
+retains `ubuntu-24.04` with its existing 30-minute timeout.
 
 Only `publish` binds the `marketplace-production` Environment. Despite its
 historical name, this is the production publication-credential and approval
@@ -319,11 +320,17 @@ actors after approval and before its first write.
 ## Candidate and signed release commit
 
 `candidate-a` and `candidate-b` start from the same exact source commit but run
-independently. Each materializes, packs, and uploads its candidate before it
-runs `npm run check` and the complete Node test suite from its own detached
-frozen-source worktree. Source test code therefore cannot mutate the uploaded
-candidate, while a failed test still fails the job and prevents assembly. Each
-candidate emits a canonical inventory and digests. The
+independently. Each materializes, packs, and uploads its candidate on a
+separate clean runner. Only after both uploads succeed does the
+`source-validation` matrix create detached exact-source worktrees on five more
+clean runners. Its core cell runs `npm run check` plus every non-Release test;
+its four Release cells partition the complete Release-pipeline inventory. The
+matrix preserves all cell results, and `assemble` depends on the entire matrix,
+so any failed or missing cell blocks publication. Source test code cannot
+mutate either already-uploaded candidate because validation jobs do not
+download those artifacts. Candidate independence remains enforced by the two
+separate builders and the later byte-identical comparison. Each candidate
+emits a canonical inventory and digests. The
 inventory byte-sorts every Git path and records its type, Git mode, logical
 size, and SHA-256 content digest. Only the explicit
 `src/v2/gate-runtime.mjs` v2 runtime module is admitted; reintroducing a retired

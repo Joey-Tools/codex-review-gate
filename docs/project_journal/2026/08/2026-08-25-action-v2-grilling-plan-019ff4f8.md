@@ -3254,6 +3254,54 @@ superseded_by:
   follow-up and a completely new whole-range exact-head review remain required
   before landing.
 
+### Live RC staging timing and release-source matrix split
+
+- PR #35 landed the separate `v2.0.0-rc.1` release intent as source commit
+  `af8430ce086517918e4ac8b8c7b9ff124ebec3ef`. Live release run
+  `33463583561` then proved the unprivileged plan, dual-candidate, assembly and
+  publication-plan stages. Candidate A completed in 17m10s and candidate B in
+  17m22s; plan, assembly and publication-plan completed in 26s, 25s and 23s.
+  The run reached `marketplace-production` and remained waiting for the
+  required `JoeyTeng` approval, with no privileged job runner or production
+  write started.
+- Joey explicitly requested matrix/multi-runner splitting when CI proved slow.
+  The ordinary PR CI already completed its ten Node 20/24 core-and-Release
+  cells in at most 4m35s, while the first live publisher run showed that each
+  candidate job still repeated the complete Release inventory serially. The
+  publisher source-validation path is therefore split before stable release:
+  - candidate A and B remain independent clean-runner builds and upload their
+    immutable artifacts before source tests can start;
+  - a new `source-validation` job depends on both builders and fans out one
+    core cell plus four Release shards across five clean standard-Ubuntu
+    runners with `fail-fast: false`;
+  - each cell creates its own detached worktree at the exact frozen source
+    commit. Validation jobs never download candidate artifacts, so test code
+    cannot mutate either frozen candidate;
+  - `assemble` depends on the complete matrix as well as both builders, so any
+    failed or missing cell prevents publication; and
+  - the now-light candidate builders move to `ubuntu-slim` with the adopted
+    14-minute limit. Independent construction and byte-identical comparison
+    remain unchanged.
+- This optimization is a publisher-control change and is kept on an isolated
+  WIP branch while the admitted RC run is pending. It must not alter live
+  `master` during that run. After the RC closes, it follows the normal signed,
+  reviewed infrastructure PR path; the later stable release intent remains a
+  separate landing.
+- The matrix field uses the expression-safe `release_test_shard` spelling;
+  this avoids relying on ambiguous hyphenated property dereferencing in GitHub
+  expressions while leaving the public test-shard environment ABI unchanged.
+- A local five-cell equivalent validation then closed successfully: the core
+  cell exited zero, and Release shards 1/4 through 4/4 passed 33, 33, 33 and 32
+  tests respectively, covering all 131 registered Release tests with zero
+  failures. Running all four heavy shards concurrently on one shared Mac
+  stretched their wall times to roughly 13m52s–15m20s through local resource
+  contention; those timings are not used as the GitHub timeout estimate. The
+  independent GitHub-hosted cells from PR #35 remain the relevant performance
+  evidence, with a 4m35s observed maximum. After the final field-name fix,
+  `npm run check`, the two focused workflow-contract tests, all 13 shard
+  contract tests, `actionlint` with the documented upstream-metadata ignores,
+  `git diff --check`, and project-journal validation passed.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact

@@ -193,8 +193,8 @@ jobs:
   candidate-a:
     name: Build candidate A
     needs: plan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
     outputs:
       artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
       artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}
@@ -238,17 +238,12 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 1
-      - name: Validate candidate A source independently
-        run: |
-          git worktree add --detach "$RUNNER_TEMP/candidate-a-source" "$RELEASE_SOURCE_SHA"
-          npm --prefix "$RUNNER_TEMP/candidate-a-source" run check
-          npm --prefix "$RUNNER_TEMP/candidate-a-source" test -- --test-reporter=dot
 
   candidate-b:
     name: Build candidate B
     needs: plan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
     outputs:
       artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
       artifact-basename: ${{ steps.pack-candidate.outputs.artifact-basename }}
@@ -292,15 +287,57 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 1
-      - name: Validate candidate B source independently
+
+  source-validation:
+    name: Validate frozen source / ${{ matrix.suite.name }}
+    needs: [candidate-a, candidate-b]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: core
+            release_test_shard: "off"
+          - name: release 1/4
+            release_test_shard: "1/4"
+          - name: release 2/4
+            release_test_shard: "2/4"
+          - name: release 3/4
+            release_test_shard: "3/4"
+          - name: release 4/4
+            release_test_shard: "4/4"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_CONTROL_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Prepare exact frozen source worktree
         run: |
-          git worktree add --detach "$RUNNER_TEMP/candidate-b-source" "$RELEASE_SOURCE_SHA"
-          npm --prefix "$RUNNER_TEMP/candidate-b-source" run check
-          npm --prefix "$RUNNER_TEMP/candidate-b-source" test -- --test-reporter=dot
+          git worktree add --detach "$RUNNER_TEMP/release-source" "$RELEASE_SOURCE_SHA"
+      - name: Run checks and non-release tests
+        if: ${{ matrix.suite.release_test_shard == 'off' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
+        run: |
+          cd "$RUNNER_TEMP/release-source"
+          npm run check
+          npm test -- --test-concurrency=1 --test-reporter=dot
+      - name: Run release pipeline shard
+        if: ${{ matrix.suite.release_test_shard != 'off' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release_test_shard }}
+        run: |
+          cd "$RUNNER_TEMP/release-source"
+          node --test test/v2-release-pipeline.test.mjs --test-reporter=dot
 
   assemble:
     name: Compare and assemble candidates
-    needs: [candidate-a, candidate-b]
+    needs: [candidate-a, candidate-b, source-validation]
     runs-on: ubuntu-slim
     timeout-minutes: 14
     outputs:

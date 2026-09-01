@@ -1865,25 +1865,101 @@ test("publisher fixtures isolate the host workflow identity and credentials", ()
   });
 });
 
-test("only heavy release-candidate jobs receive extended timeout headroom", () => {
+test("release workflow assigns runners and timeout headroom by workload", () => {
   const workflow = readFileSync(workflowPath, "utf8");
-  assert.equal(workflow.match(/^    timeout-minutes: 30$/gmu)?.length ?? 0, 3);
-  assert.equal(workflow.match(/^    timeout-minutes: 14$/gmu)?.length ?? 0, 4);
-  for (const jobName of ["candidate-a", "candidate-b"]) {
-    const job = workflowJobBlock(workflow, jobName);
-    assert.match(job, /^    runs-on: ubuntu-24\.04$/mu, jobName);
-    assert.match(job, /^    timeout-minutes: 30$/mu, jobName);
-    assert.doesNotMatch(job, /^    timeout-minutes: 14$/mu, jobName);
-  }
-  for (const jobName of ["plan", "assemble", "publication_plan", "verify"]) {
+  assert.equal(workflow.match(/^    timeout-minutes: 30$/gmu)?.length ?? 0, 1);
+  assert.equal(workflow.match(/^    timeout-minutes: 14$/gmu)?.length ?? 0, 7);
+  for (const jobName of [
+    "plan",
+    "candidate-a",
+    "candidate-b",
+    "assemble",
+    "publication_plan",
+    "verify",
+  ]) {
     const job = workflowJobBlock(workflow, jobName);
     assert.match(job, /^    runs-on: ubuntu-slim$/mu, jobName);
     assert.match(job, /^    timeout-minutes: 14$/mu, jobName);
     assert.doesNotMatch(job, /^    timeout-minutes: 30$/mu, jobName);
   }
+  const sourceValidation = workflowJobBlock(workflow, "source-validation");
+  assert.match(sourceValidation, /^    runs-on: ubuntu-24\.04$/mu);
+  assert.match(sourceValidation, /^    timeout-minutes: 14$/mu);
+  assert.doesNotMatch(sourceValidation, /^    timeout-minutes: 30$/mu);
   const publish = workflowJobBlock(workflow, "publish");
   assert.match(publish, /^    runs-on: ubuntu-24\.04$/mu);
   assert.match(publish, /^    timeout-minutes: 30$/mu);
+  const releaseShardEnvironment = [
+    "CODEX",
+    "REVIEW",
+    "GATE",
+    "RELEASE",
+    "TEST",
+    "SHARD",
+  ].join("_");
+  const candidateA = workflowJobBlock(workflow, "candidate-a");
+  const candidateB = workflowJobBlock(workflow, "candidate-b");
+  const validation = workflowJobBlock(workflow, "source-validation");
+  const assemble = workflowJobBlock(workflow, "assemble");
+
+  for (const [jobName, job] of [
+    ["candidate-a", candidateA],
+    ["candidate-b", candidateB],
+  ]) {
+    assert.match(job, /Upload candidate [AB]/u, jobName);
+    assert.doesNotMatch(job, /npm (?:run check|test)|git worktree add/u, jobName);
+  }
+
+  assert.match(validation, /^    name: Validate frozen source \/ \$\{\{ matrix\.suite\.name \}\}$/mu);
+  assert.match(validation, /^    needs: \[candidate-a, candidate-b\]$/mu);
+  const strategyStart = validation.indexOf("    strategy:\n");
+  const stepsStart = validation.indexOf("    steps:\n");
+  assert.ok(strategyStart !== -1 && stepsStart > strategyStart);
+  assert.equal(
+    validation.slice(strategyStart, stepsStart).trimEnd(),
+    [
+      "    strategy:",
+      "      fail-fast: false",
+      "      matrix:",
+      "        suite:",
+      "          - name: core",
+      "            release_test_shard: \"off\"",
+      "          - name: release 1/4",
+      "            release_test_shard: \"1/4\"",
+      "          - name: release 2/4",
+      "            release_test_shard: \"2/4\"",
+      "          - name: release 3/4",
+      "            release_test_shard: \"3/4\"",
+      "          - name: release 4/4",
+      "            release_test_shard: \"4/4\"",
+    ].join("\n"),
+  );
+  assert.match(
+    validation,
+    /git worktree add --detach "\$RUNNER_TEMP\/release-source" "\$RELEASE_SOURCE_SHA"/u,
+  );
+  assert.match(
+    validation,
+    /Run checks and non-release tests\n        if: \$\{\{ matrix\.suite\.release_test_shard == 'off' \}\}/u,
+  );
+  assert.match(
+    validation,
+    /Run checks and non-release tests[\s\S]*npm run check[\s\S]*npm test -- --test-concurrency=1 --test-reporter=dot/u,
+  );
+  assert.ok(validation.includes(`${releaseShardEnvironment}: "off"`));
+  assert.match(
+    validation,
+    /Run release pipeline shard\n        if: \$\{\{ matrix\.suite\.release_test_shard != 'off' \}\}/u,
+  );
+  assert.match(
+    validation,
+    /Run release pipeline shard[\s\S]*node --test test\/v2-release-pipeline\.test\.mjs --test-reporter=dot/u,
+  );
+  const matrixShardExpression = "${{ matrix." + "suite" + ".release_test_shard }}";
+  assert.ok(validation.includes(
+    `${releaseShardEnvironment}: ${matrixShardExpression}`,
+  ));
+  assert.match(assemble, /^    needs: \[candidate-a, candidate-b, source-validation\]$/mu);
 });
 
 test("workflow and publisher expose the adopted staged ABI and scoped credentials", () => {
@@ -1902,7 +1978,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   ]) {
     assert.ok(help.includes(mode), mode);
   }
-  assert.match(workflow, /plan:[\s\S]*candidate-a:[\s\S]*candidate-b:[\s\S]*assemble:[\s\S]*publication_plan:[\s\S]*publish:[\s\S]*verify:/u);
+  assert.match(workflow, /plan:[\s\S]*candidate-a:[\s\S]*candidate-b:[\s\S]*source-validation:[\s\S]*assemble:[\s\S]*publication_plan:[\s\S]*publish:[\s\S]*verify:/u);
   assert.match(workflow, /publication_plan:[\s\S]*runs-on: ubuntu-slim/u);
   assert.match(workflow, /publish:[\s\S]*environment: marketplace-production/u);
   assert.ok(

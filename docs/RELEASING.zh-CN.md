@@ -98,20 +98,22 @@ provenance 会选择这套 frozen contract 执行 historical verification；publ
 | Stage | 权限 | 合约 |
 | --- | --- | --- |
 | `plan` | 无特权 | 检查 exact source commit、manifest、SemVer、reachability、release policy 与 immutable target-parent policy。 |
-| `candidate-a` | 无特权 | 在 clean runner 独立 materialize 并测试 candidate A，记录 tree、inventory、modes、sizes 与 SHA-256 digests。 |
-| `candidate-b` | 无特权 | 在另一个 clean runner 独立 materialize 并测试 candidate B。 |
+| `candidate-a` | 无特权 | 在 clean runner 独立 materialize 并上传 candidate A，记录 tree、inventory、modes、sizes 与 SHA-256 digests。 |
+| `candidate-b` | 无特权 | 在另一个 clean runner 独立 materialize 并上传 candidate B。 |
+| `source-validation` | 无特权 | 两份 candidate 冻结后，在五个 clean runners 上用一个 core cell 和四个 Release-test shards 验证 exact source commit。 |
 | `assemble` | 无特权 | 要求两份 candidates byte-identical，并产出 canonical candidate bundle。 |
 | `publication-plan` | 无特权 | 批准前重建并验证 publication plan 与 candidate，不上传任何 privileged material。 |
 | `publish` | 有特权 | Environment 人工批准后重新验证全部状态并执行 signed remote publication。 |
 | `verify` | 无特权 | 重新读取公开 refs 与 Release state，并报告观察结果。 |
 
-轻量的无特权 `plan`、`assemble`、`publication-plan` 与 `verify` jobs 使用
-`ubuntu-slim` 与 14 分钟 timeout。GitHub 对这个单核 runner 另有 15 分钟硬上限，
-所以低频但重型的 `candidate-a` 与 `candidate-b` 改用 `ubuntu-24.04` 与 30 分钟
-timeout。仅完整测试套件在最后一个 release-pipeline test 完成前就已耗时约 755.6 秒，
-`ubuntu-slim` 无法为 checkout、setup、candidate materialization、packaging 与 upload
-留出足够余量。privileged `publish` job 也继续使用 `ubuntu-24.04` 与既有 30 分钟
-timeout。
+轻量的无特权 `plan`、`candidate-a`、`candidate-b`、`assemble`、
+`publication-plan` 与 `verify` jobs 使用 `ubuntu-slim` 与 14 分钟 timeout。
+GitHub 对这个单核 runner 另有 15 分钟硬上限，所以 exact-source tests 在
+`source-validation` matrix 的五个 `ubuntu-24.04` runners 上运行：一个 core cell 和
+四个 Release-test shards，每个 cell 的 timeout 都是 14 分钟，并设置
+`fail-fast: false`。这替代了首次 live RC 中两次各自超过 17 分钟的串行完整套件验证，
+同时保留独立 candidate construction。privileged `publish` job 继续使用
+`ubuntu-24.04` 与既有 30 分钟 timeout。
 
 只有 `publish` 绑定 `marketplace-production` Environment。尽管保留了历史名称，它
 实际代表 production publication credentials 与人工批准边界，并不表示 workflow 会
@@ -271,11 +273,15 @@ Repository administrators 仍能编辑 rulesets；这种 configuration-control a
 
 ## Candidate 与 signed release commit
 
-`candidate-a` 和 `candidate-b` 从同一个 exact source commit 开始，但彼此独立运行。每个 job
-先 materialize、pack 并 upload candidate，再在自己的 detached frozen-source worktree
-中运行 `npm run check` 与完整 Node test suite。因此 source test 无法修改已上传的
-candidate，而 test failure 仍会令 job 失败并阻止 assemble。每份 candidate 都产出
-canonical inventory 与 digests。Inventory 按 Git path bytes 排序，记录每个 entry 的 type、Git
+`candidate-a` 和 `candidate-b` 从同一个 exact source commit 开始，但彼此独立运行。
+每个 job 在单独的 clean runner 上 materialize、pack 并 upload candidate。只有两次
+upload 都成功后，`source-validation` matrix 才会在另外五个 clean runners 上创建
+detached exact-source worktrees。Core cell 运行 `npm run check` 与所有非 Release tests；
+四个 Release cells 分割完整 Release-pipeline inventory。Matrix 保留所有 cell 结果，
+而 `assemble` 依赖整个 matrix，因此任一 cell 失败或缺失都会阻止发布。Validation jobs
+不下载 candidate artifacts，所以 source test 无法修改已经上传的 candidate。两份独立
+builder 与之后的 byte-identical comparison 继续保证 candidate independence。每份
+candidate 都产出 canonical inventory 与 digests。Inventory 按 Git path bytes 排序，记录每个 entry 的 type、Git
 mode、logical size 与 SHA-256 content digest。只允许明确列出的
 `src/v2/gate-runtime.mjs` v2 runtime module；任何 retired v2 module 回流都会阻止
 candidate construction。`assemble` 要求两份 payloads 与所有 identity
