@@ -1527,6 +1527,91 @@ function exactRuleTypes(ruleset, requiredTypes) {
     requiredTypes.every((type) => present.has(type));
 }
 
+const PUBLISHER_RULESET_DIAGNOSTIC_COUNT_CAP = 5;
+
+function boundedPublisherRulesetDiagnosticCount(values) {
+  return Math.min(values.length, PUBLISHER_RULESET_DIAGNOSTIC_COUNT_CAP);
+}
+
+function publisherRulesetDiagnosticEntry(active, name, {
+  target,
+  include,
+  exclude = [],
+  publisherBypass,
+  ruleTypes,
+}) {
+  const matches = active.filter((ruleset) => ruleset.name === name);
+  const ruleset = matches.length === 1 ? matches[0] : undefined;
+  const bypassMatches = publisherBypass
+    ? exactPublisherBypass(ruleset ?? {})
+    : Array.isArray(ruleset?.bypass_actors) && ruleset.bypass_actors.length === 0;
+  return {
+    active_match_count: boundedPublisherRulesetDiagnosticCount(matches),
+    target_matches: ruleset?.target === target,
+    ref_condition_matches: ruleset !== undefined && exactRefCondition(ruleset, include, exclude),
+    bypass_matches: ruleset !== undefined && bypassMatches,
+    rule_types_match: Array.isArray(ruleset?.rules) && exactRuleTypes(ruleset, ruleTypes),
+  };
+}
+
+export function publisherRulesetDiagnosticProjection(rulesets) {
+  const snapshotIsArray = Array.isArray(rulesets);
+  const active = snapshotIsArray
+    ? rulesets.filter((ruleset) => ruleset?.enforcement === "active")
+    : [];
+  const expectedNames = new Set([
+    "publisher-master-update",
+    "master-integrity",
+    "freeze-v1-tags",
+    "publisher-v2-plus-tags",
+  ]);
+  const distinctActiveNames = new Set(active.map((ruleset) => ruleset?.name));
+  const unexpectedActive = active.filter((ruleset) => !expectedNames.has(ruleset?.name));
+  return {
+    schema: "codex-review-gate-action-publisher-ruleset-diagnostic-v1",
+    count_cap: PUBLISHER_RULESET_DIAGNOSTIC_COUNT_CAP,
+    snapshot_is_array: snapshotIsArray,
+    active_count: boundedPublisherRulesetDiagnosticCount(active),
+    unexpected_active_count: boundedPublisherRulesetDiagnosticCount(unexpectedActive),
+    active_inventory_matches: snapshotIsArray &&
+      active.length === expectedNames.size &&
+      distinctActiveNames.size === expectedNames.size &&
+      unexpectedActive.length === 0,
+    adopted_rulesets: {
+      publisher_master_update: publisherRulesetDiagnosticEntry(active, "publisher-master-update", {
+        target: "branch",
+        include: ["refs/heads/master"],
+        publisherBypass: true,
+        ruleTypes: ["update"],
+      }),
+      master_integrity: publisherRulesetDiagnosticEntry(active, "master-integrity", {
+        target: "branch",
+        include: ["refs/heads/master"],
+        publisherBypass: false,
+        ruleTypes: [
+          "required_signatures",
+          "required_linear_history",
+          "deletion",
+          "non_fast_forward",
+        ],
+      }),
+      freeze_v1_tags: publisherRulesetDiagnosticEntry(active, "freeze-v1-tags", {
+        target: "tag",
+        include: ["refs/tags/v1", "refs/tags/v1.*"],
+        publisherBypass: false,
+        ruleTypes: ["creation", "update", "deletion", "non_fast_forward"],
+      }),
+      publisher_v2_plus_tags: publisherRulesetDiagnosticEntry(active, "publisher-v2-plus-tags", {
+        target: "tag",
+        include: ["refs/tags/v*"],
+        exclude: ["refs/tags/v1", "refs/tags/v1.*"],
+        publisherBypass: true,
+        ruleTypes: ["creation", "update", "deletion", "non_fast_forward"],
+      }),
+    },
+  };
+}
+
 export function validatePublisherRulesets(rulesets) {
   if (!Array.isArray(rulesets)) fail("publisher ruleset snapshot must be an array");
   const active = rulesets.filter((ruleset) => ruleset.enforcement === "active");
@@ -3038,6 +3123,12 @@ async function main(argv) {
     validatePublisherRulesets(readJson(resolve(required(options, "input"))));
     return;
   }
+  if (command === "summarize-rulesets") {
+    process.stdout.write(canonicalJson(
+      publisherRulesetDiagnosticProjection(readJson(resolve(required(options, "input")))),
+    ));
+    return;
+  }
   if (command === "snapshot-release-assets") {
     process.stdout.write(canonicalReleaseAssetSnapshot(readJson(resolve(required(options, "input")))));
     return;
@@ -3114,7 +3205,7 @@ async function main(argv) {
     createOnly(resolve(required(options, "output")), canonicalJson(repositoryScope));
     return;
   }
-  fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, verify-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, github-app-installation, or github-app-installation-repository-scope command");
+  fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, summarize-rulesets, verify-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, github-app-installation, or github-app-installation-repository-scope command");
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : null;

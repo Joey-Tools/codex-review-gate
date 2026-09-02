@@ -1524,9 +1524,24 @@ if (args[0] === "api") {
     if (!ruleset) fail404();
     const markerDrift = process.env.FAKE_RULESET_DRIFT_MARKER &&
       existsSync(process.env.FAKE_RULESET_DRIFT_MARKER);
-    const result = (state.ruleset_drift || markerDrift) && ruleset.id === 1
+    const hostileCanary = process.env.FAKE_RULESET_HOSTILE_CANARY;
+    let result = (state.ruleset_drift || markerDrift) && ruleset.id === 1
       ? { ...ruleset, enforcement: "disabled" }
       : ruleset;
+    if (hostileCanary && ruleset.id === 1) {
+      result = {
+        ...ruleset,
+        target: hostileCanary,
+        conditions: { ref_name: { include: [hostileCanary], exclude: [hostileCanary] } },
+        bypass_actors: [{
+          actor_id: 987654321,
+          actor_type: hostileCanary,
+          bypass_mode: hostileCanary,
+        }],
+        rules: [{ type: hostileCanary }],
+        message: hostileCanary,
+      };
+    }
     process.stdout.write(JSON.stringify(result) + "\\n");
     process.exit(0);
   }
@@ -1938,6 +1953,28 @@ fi
     PATH: `${fakeBin}:${githubEnvironment.PATH}`,
     REAL_GIT: realGit,
     RULESET_DRIFT_MARKER: rulesetDriftMarker,
+  };
+}
+
+function diagnosticSummarizerFailureEnvironment(state, githubEnvironment) {
+  const fakeBin = join(state.root, "diagnostic-summarizer-failure-bin");
+  const fakeNode = join(fakeBin, "node");
+  mkdirSync(fakeBin);
+  write(fakeNode, `#!/bin/sh
+set -eu
+for argument in "$@"; do
+  if [ "$argument" = summarize-rulesets ]; then
+    printf '%s\\n' 'simulated diagnostic failure' >&2
+    exit 79
+  fi
+done
+exec "$REAL_NODE" "$@"
+`);
+  chmodSync(fakeNode, 0o755);
+  return {
+    ...githubEnvironment,
+    PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+    REAL_NODE: process.execPath,
   };
 }
 
@@ -2573,6 +2610,10 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(
     publisher,
     /verify_final_policy_fence\(\)[\s\S]*preflight_live_source[\s\S]*verify_ruleset_policy_snapshot "\$label"[\s\S]*verify_live_release_signer_policy "\$label"/u,
+  );
+  assert.match(
+    publisher,
+    /jq -s '\.' "\$details_dir"\/\*\.json > "\$details_file"[\s\S]*if ! node "\$generator" summarize-rulesets --input "\$details_file" 2>\/dev\/null; then[\s\S]*fi[\s\S]*node "\$generator" verify-rulesets --input "\$details_file" \|\| \{[\s\S]*fail_reconcile blocked_conflict publisher-ruleset-policy-changed/u,
   );
   const remoteTagReadStart = publisher.indexOf("  read_remote_full_tag_snapshot() {");
   const remoteTagReadEnd = publisher.indexOf(
@@ -5353,6 +5394,15 @@ for (const policyDrift of ["source", "ruleset"]) {
     } else {
       assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
       assert.match(result.stderr, /recovery_code=publisher-ruleset-policy-changed/u);
+      assert.match(result.stdout, /Publisher ruleset policy diagnostic \(safe projection\):/u);
+      assert.match(
+        result.stdout,
+        /"schema": "codex-review-gate-action-publisher-ruleset-diagnostic-v1"/u,
+      );
+      assert.match(
+        result.stdout,
+        /"publisher_master_update": \{\n\s+"active_match_count": 0,\n\s+"target_matches": false,\n\s+"ref_condition_matches": false,\n\s+"bypass_matches": false,\n\s+"rule_types_match": false/u,
+      );
     }
     assert.notEqual(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
     assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
@@ -5365,6 +5415,68 @@ for (const policyDrift of ["source", "ruleset"]) {
     assert.deepEqual(fakeState.assets, []);
   });
 }
+
+test("publisher ruleset diagnostic is available and safe for hostile detail", (t) => {
+  const hostileCanary = "REMOTE_RULESET_CANARY_DO_NOT_REFLECT";
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "hostile-ruleset-diagnostic" });
+  const githubEnvironment = fakeGithubEnvironment(state, "hostile-ruleset-diagnostic");
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      FAKE_RULESET_HOSTILE_CANARY: hostileCanary,
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=publisher-ruleset-policy-changed/u);
+  assert.match(result.stdout, /Publisher ruleset policy diagnostic \(safe projection\):/u);
+  assert.match(
+    result.stdout,
+    /"schema": "codex-review-gate-action-publisher-ruleset-diagnostic-v1"/u,
+  );
+  assert.match(
+    result.stdout,
+    /"publisher_master_update": \{\n\s+"active_match_count": 1,\n\s+"target_matches": false,\n\s+"ref_condition_matches": false,\n\s+"bypass_matches": false,\n\s+"rule_types_match": false/u,
+  );
+  assert.doesNotMatch(result.stdout, new RegExp(hostileCanary, "u"));
+  assert.doesNotMatch(result.stderr, new RegExp(hostileCanary, "u"));
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+});
+
+test("publisher ruleset verifier stays authoritative when the diagnostic fails", (t) => {
+  const hostileCanary = "REMOTE_RULESET_DIAGNOSTIC_FAILURE_CANARY";
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "ruleset-diagnostic-failure" });
+  const githubEnvironment = fakeGithubEnvironment(state, "ruleset-diagnostic-failure");
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: diagnosticSummarizerFailureEnvironment(state, {
+      ...githubEnvironment,
+      FAKE_RULESET_HOSTILE_CANARY: hostileCanary,
+    }),
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /Publisher ruleset policy diagnostic \(safe projection\):/u);
+  assert.doesNotMatch(
+    result.stdout,
+    /codex-review-gate-action-publisher-ruleset-diagnostic-v1/u,
+  );
+  assert.match(
+    result.stderr,
+    /Publisher ruleset policy diagnostic unavailable; verifier remains authoritative\./u,
+  );
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=publisher-ruleset-policy-changed/u);
+  assert.doesNotMatch(result.stdout, new RegExp(hostileCanary, "u"));
+  assert.doesNotMatch(result.stderr, new RegExp(hostileCanary, "u"));
+  assert.doesNotMatch(result.stdout, /simulated diagnostic failure/u);
+  assert.doesNotMatch(result.stderr, /simulated diagnostic failure/u);
+  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
+});
 
 test("release-policy read drift is fenced again before draft publication", (t) => {
   const state = fixture(t);
@@ -6126,6 +6238,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  131,
+  133,
   "release pipeline shard registration inventory drift",
 );

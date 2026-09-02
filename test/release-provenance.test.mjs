@@ -32,6 +32,7 @@ import {
   finalizeProvenance,
   parseSemver,
   parseVerifiedOpenPgpStatus,
+  publisherRulesetDiagnosticProjection,
   readGitHubAppInstallation,
   readGitHubAppInstallationRepositories,
   readReleaseManifest,
@@ -1449,6 +1450,102 @@ test("publisher rulesets match the four-rule production contract", () => {
     ruleTypes: ["update"],
   }));
   assert.throws(() => validatePublisherRulesets(unexpected), /exactly the four adopted/u);
+});
+
+test("publisher ruleset diagnostic projects only fixed predicates and bounded counts", () => {
+  const matchingEntry = {
+    active_match_count: 1,
+    target_matches: true,
+    ref_condition_matches: true,
+    bypass_matches: true,
+    rule_types_match: true,
+  };
+  assert.deepEqual(publisherRulesetDiagnosticProjection(productionRulesets()), {
+    schema: "codex-review-gate-action-publisher-ruleset-diagnostic-v1",
+    count_cap: 5,
+    snapshot_is_array: true,
+    active_count: 4,
+    unexpected_active_count: 0,
+    active_inventory_matches: true,
+    adopted_rulesets: {
+      publisher_master_update: matchingEntry,
+      master_integrity: matchingEntry,
+      freeze_v1_tags: matchingEntry,
+      publisher_v2_plus_tags: matchingEntry,
+    },
+  });
+
+  const tooMany = productionRulesets();
+  for (let index = 0; index < 4; index += 1) {
+    tooMany.push(ruleset({
+      name: `unexpected-${index}`,
+      include: ["refs/heads/release"],
+      ruleTypes: ["update"],
+    }));
+  }
+  const capped = publisherRulesetDiagnosticProjection(tooMany);
+  assert.equal(capped.active_count, capped.count_cap);
+  assert.equal(capped.unexpected_active_count, 4);
+  assert.equal(capped.active_inventory_matches, false);
+});
+
+test("publisher ruleset diagnostic isolates each publisher-master predicate", () => {
+  const cases = [
+    {
+      field: "target_matches",
+      mutate: (ruleset) => { ruleset.target = "tag"; },
+    },
+    {
+      field: "ref_condition_matches",
+      mutate: (ruleset) => { ruleset.conditions.ref_name.include = ["~DEFAULT_BRANCH"]; },
+    },
+    {
+      field: "bypass_matches",
+      mutate: (ruleset) => { ruleset.bypass_actors = []; },
+    },
+    {
+      field: "rule_types_match",
+      mutate: (ruleset) => { ruleset.rules = [{ type: "required_status_checks" }]; },
+    },
+  ];
+  for (const { field, mutate } of cases) {
+    const observed = productionRulesets();
+    mutate(observed[0]);
+    const projection = publisherRulesetDiagnosticProjection(observed);
+    const publisherMaster = projection.adopted_rulesets.publisher_master_update;
+    assert.equal(publisherMaster[field], false, `${field} must identify the drift`);
+    assert.equal(publisherMaster.active_match_count, 1);
+    assert.equal(projection.active_inventory_matches, true);
+    assert.throws(() => validatePublisherRulesets(observed), /publisher-master-update/u);
+  }
+});
+
+test("publisher ruleset diagnostic never reflects hostile remote strings or identifiers", () => {
+  const hostile = "REMOTE_SECRET_CANARY_DO_NOT_REFLECT";
+  const observed = productionRulesets();
+  observed[0] = {
+    ...observed[0],
+    id: 987654321,
+    target: hostile,
+    conditions: { ref_name: { include: [hostile], exclude: [hostile] } },
+    bypass_actors: [{
+      actor_id: 987654321,
+      actor_type: hostile,
+      bypass_mode: hostile,
+    }],
+    rules: [{ type: hostile, parameters: { message: hostile } }],
+    message: hostile,
+  };
+  observed.push({
+    name: hostile,
+    enforcement: "active",
+    target: hostile,
+    message: hostile,
+  });
+
+  const serialized = JSON.stringify(publisherRulesetDiagnosticProjection(observed));
+  assert.equal(serialized.includes(hostile), false);
+  assert.equal(serialized.includes("987654321"), false);
 });
 
 test("master integrity cannot grant a bypass or omit a required protection", () => {
