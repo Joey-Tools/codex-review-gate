@@ -769,6 +769,43 @@ test("publisher workflow inventories the full installation before minting a targ
   assert.match(identityStep, /account_login_matches_configured_owner:/u);
   assert.match(identityStep, /permission_shape_matches_expected: \(\.permissions == \{administration:"read", contents:"write", metadata:"read"\}\)/u);
   assert.match(identityStep, /def bounded_event_count:/u);
+  assert.match(identityStep, /suspension_state:\s*\(\s*if[\s\S]*?end\s*\),/u);
+  const installationSummaryStart = identityStep.indexOf('          observed_installation="$(jq -c \\\n');
+  assert.ok(installationSummaryStart >= 0, "publisher installation summary must remain present");
+  const installationFilterOpening = "\n            '";
+  const installationFilterStart = identityStep.indexOf(
+    installationFilterOpening,
+    installationSummaryStart,
+  );
+  assert.ok(installationFilterStart >= 0, "publisher installation summary filter must open");
+  const installationFilterEndMarker = "\n            ' \"$installation_file\")\"";
+  const installationFilterEnd = identityStep.indexOf(
+    installationFilterEndMarker,
+    installationFilterStart + installationFilterOpening.length,
+  );
+  assert.ok(installationFilterEnd >= 0, "publisher installation summary filter must close");
+  const installationSummaryFilter = identityStep.slice(
+    installationFilterStart + installationFilterOpening.length,
+    installationFilterEnd,
+  );
+  for (const { fixture, expected } of [
+    { fixture: {}, expected: "missing" },
+    { fixture: { suspended_at: null }, expected: "not_suspended" },
+    { fixture: { suspended_at: "2026-09-02T00:00:00Z" }, expected: "suspended" },
+  ]) {
+    const observed = JSON.parse(execFileSync(
+      "jq",
+      [
+        "-c",
+        "--arg", "slug", "codex-review-gate-action-publisher",
+        "--arg", "owner", "JoeyTeng",
+        "--argjson", "installation_id", "156186692",
+        installationSummaryFilter,
+      ],
+      { input: `${JSON.stringify(fixture)}\n`, encoding: "utf8" },
+    ));
+    assert.equal(observed.suspension_state, expected);
+  }
   assert.doesNotMatch(identityStep, /permission_keys:|events: \(if/u);
   assert.match(identityStep, /Publisher App repository scope query starting\./u);
   assert.match(

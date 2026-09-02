@@ -639,11 +639,12 @@ jobs:
                 account_login_matches_configured_owner: (if (.account | type) == "object" then (.account.login == $owner) else false end),
                 account_type_is_user: (if (.account | type) == "object" then (.account.type == "User") else false end),
                 repository_selection_is_selected: (.repository_selection == "selected"),
-                suspension_state:
+                suspension_state: (
                   if (has("suspended_at") | not) then "missing"
                   elif .suspended_at == null then "not_suspended"
                   else "suspended"
-                  end,
+                  end
+                ),
                 permission_administration: permission_value("administration"),
                 permission_contents: permission_value("contents"),
                 permission_metadata: permission_value("metadata"),
