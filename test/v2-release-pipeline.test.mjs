@@ -2334,10 +2334,14 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   const recoveryStep = workflowStepBlock(publishJob, "Explain publication recovery");
 
   assert.match(workflowTransitionStep, /id: publisher-workflow-transition/u);
-  assert.match(workflowTransitionStep, /publication_plan="\$RUNNER_TEMP\/publication-plan\.json"/u);
+  assert.match(workflowTransitionStep, /candidate_json="\$RUNNER_TEMP\/release-candidate\/candidate\.json"/u);
   assert.match(workflowTransitionStep, /baseline="docs\/release\/action-v2-repository-baselines\.json"/u);
-  assert.match(workflowTransitionStep, /\.target_master_before/u);
-  assert.match(workflowTransitionStep, /\.initial_target_master/u);
+  assert.match(workflowTransitionStep, /jq -er '\.plan\.target_master_before \| strings' "\$candidate_json"/u);
+  assert.match(workflowTransitionStep, /jq -er '\.initial_target_master \| strings' "\$baseline"/u);
+  assert.doesNotMatch(workflowTransitionStep, /publication_plan="\$RUNNER_TEMP\/publication-plan\.json"/u);
+  assert.doesNotMatch(workflowTransitionStep, /jq -er '\.target_master_before'/u);
+  assert.match(workflowTransitionStep, /assembled candidate has no valid frozen target master/u);
+  assert.match(workflowTransitionStep, /repository baseline has no valid initial target master/u);
   assert.match(workflowTransitionStep, /requires_workflows_write=true/u);
   assert.match(workflowTransitionStep, /requires_workflows_write=false/u);
   assert.match(workflowTransitionStep, /target commit identities must be full SHA-1 values/u);

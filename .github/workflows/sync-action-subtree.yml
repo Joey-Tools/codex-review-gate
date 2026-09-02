@@ -542,10 +542,16 @@ jobs:
         id: publisher-workflow-transition
         run: |
           set -euo pipefail
-          publication_plan="$RUNNER_TEMP/publication-plan.json"
+          candidate_json="$RUNNER_TEMP/release-candidate/candidate.json"
           baseline="docs/release/action-v2-repository-baselines.json"
-          planned_target_master="$(jq -er '.target_master_before' "$publication_plan")"
-          initial_target_master="$(jq -er '.initial_target_master' "$baseline")"
+          if ! planned_target_master="$(jq -er '.plan.target_master_before | strings' "$candidate_json" 2>/dev/null)"; then
+            printf '%s\n' "Publisher App transition invariant failed: assembled candidate has no valid frozen target master." >&2
+            exit 1
+          fi
+          if ! initial_target_master="$(jq -er '.initial_target_master | strings' "$baseline" 2>/dev/null)"; then
+            printf '%s\n' "Publisher App transition invariant failed: repository baseline has no valid initial target master." >&2
+            exit 1
+          fi
           if [[ ! "$planned_target_master" =~ ^[0-9a-f]{40}$ || ! "$initial_target_master" =~ ^[0-9a-f]{40}$ ]]; then
             printf '%s\n' "Publisher App transition invariant failed: target commit identities must be full SHA-1 values." >&2
             exit 1
