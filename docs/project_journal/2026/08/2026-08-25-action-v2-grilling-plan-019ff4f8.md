@@ -3445,6 +3445,26 @@ superseded_by:
   serial temporary-Git scenarios; it is not recorded as a passing test. The
   new full-installation inventory and frozen-source-worktree assertions are
   directly covered by the passing focused contracts.
+- 新的 RC 恢复运行 `33605481641` 再次复用同一冻结 source 与 admission，控制
+  commit 为 `88b6961fc7ffff5fa82309b684d79a9b915e03a3`。所有无特权阶段均完成，
+  Environment 批准后，失败仍发生在任何 target write 之前：App identity、owner、
+  selected installation、sole-target scope、suspension state 与前三项 permission
+  均匹配，唯一不匹配的是严格的 installation permission shape。
+- 登录的 App settings 与该 run 的 non-secret observation 共同确认，实际安装还具有
+  `Workflows: write`。这不是应当删除的多余权限：发布脚本用 verified candidate
+  tree 建立完整 target commit，而当前 target 仍含 legacy
+  `.github/workflows/codex-review-gate.yml`；v2 transition 会删除它，GitHub 将该
+  删除视为 workflow write。Candidate payload 继续拒绝 workflow definitions，因而
+  这项权限只允许 target complete-tree replacement 执行已审查的删除，不扩大 payload
+  内容。
+- 决定保持 fail-closed 而不是永久扩权：workflow 以 frozen publication plan 的
+  `target_master_before` 是否等于 recorded `initial_target_master` 决定 exact surface。
+  只有该一次性 v1→v2 transition 要求安装与 target-scoped writer token 具有
+  `workflows: write`；inventory token 始终仅请求 `metadata: read`。immutable RC
+  readback 完成且不再需要 recovery 后，stable release 前必须从 App 移除 Workflows
+  permission；新的 target head 会使 workflow 严格要求三权限 surface 并让 writer token
+  不再请求 Workflows。文档、transition 检查和实际执行的 `jq` guard 回归共同锁定这两种
+  exact surface，防止旧三权限误阻断 RC 或额外权限静默进入 stable token。
 
 ## Verified Facts And Required Live Preflight
 
@@ -3465,7 +3485,9 @@ superseded_by:
   cannot read its private App or installation metadata. Before publication,
   authenticated installation evidence or the logged-in App settings must prove
   owner `JoeyTeng`, active selected-repository installation, the sole target,
-  and the reviewed Contents/Administration/Metadata permission surface.
+  and the reviewed transition-dependent permission surface: the one-time RC
+  transition has Contents/Administration/Metadata/Workflows, while later
+  releases have exactly Contents/Administration/Metadata.
 - Live publisher preflight must establish the private Publisher App's slug,
   installation identity, sole target repository, and actual permissions; the
   configured layered rulesets; GitHub read-back of an App-pushed,
@@ -3494,12 +3516,17 @@ superseded_by:
 - PR #35 is merged. Its approved frozen RC recovery completed every
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
-- PR #37 已合并，且新的 RC 恢复运行已验证五个 hosted source-validation
-  cells 与安全身份诊断路径。先以带括号的 `jq` compatibility correction
-  完成同等签名、精确头审查和合并；随后以同一冻结 source/admission 创建新的
-  RC recovery run。成功后验证 immutable RC ref、prerelease、assets、signatures
-  与 public readback；失败时使用现在具有阶段字段的安全诊断，只修复已观察到的
-  不匹配。
+- PR #37 与 PR #38 已合并。新的 RC 恢复运行已验证五个 hosted
+  source-validation cells、安全身份诊断路径与旧 runner 的 `jq` compatibility
+  correction；`33605481641` 进一步将剩余失败收敛到 complete-tree transition 所需的
+  Workflows permission contract。先完成该最小权限契约修复、同等签名与精确头审查，
+  随后以同一冻结 source/admission 创建新的 RC recovery run。成功后验证 immutable
+  RC ref、prerelease、assets、signatures 与 public readback；失败时继续只修复已观察
+  到的明确不匹配。
+- RC 的 immutable ref、prerelease、assets、signatures 与 public readback 全部验证后，
+  且确认不再需要 RC recovery，先在 Publisher App settings 移除 `Workflows: read/write`；
+  再创建 stable `v2.0.0` release intent。stable workflow 会以新的 target head 要求
+  严格三权限 surface，而不是保留一次性迁移权限。
 - Then land the stable `v2.0.0` release intent separately and execute its
   approved publisher workflow. Verify the immutable stable ref,
   Release/assets, signatures and `v2` floating alias before carrying out the

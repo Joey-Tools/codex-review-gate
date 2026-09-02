@@ -567,7 +567,7 @@ function writeReleaseIntent(source, version, expectedHead, previousVersion) {
   return commit(source, `Release intent ${version}`);
 }
 
-function fixture(t, version = "2.0.0") {
+function fixture(t, version = "2.0.0", { includeLegacyWorkflow = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "action-release-pipeline-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const targetWork = join(root, "target-work");
@@ -580,6 +580,12 @@ function fixture(t, version = "2.0.0") {
   git(targetWork, ["config", "user.name", "Legacy Publisher"]);
   git(targetWork, ["config", "user.email", "legacy@example.invalid"]);
   write(join(targetWork, "action.yml"), "name: Legacy action\n");
+  if (includeLegacyWorkflow) {
+    write(
+      join(targetWork, ".github", "workflows", "codex-review-gate.yml"),
+      "name: Legacy review gate\n",
+    );
+  }
   const initialTarget = commit(targetWork, "Release v1.5.1");
   git(targetWork, ["tag", "-a", "v1.5.1", initialTarget, "-m", "Release v1.5.1"]);
   run("git", ["clone", "-q", "--bare", targetWork, target]);
@@ -2260,9 +2266,11 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     /\.write_eligible == true and \.recovery_code == null and \.reason == null[\s\S]*\.write_eligible == false[\s\S]*release-intent-superseded[\s\S]*publication-admission-invalid[\s\S]*publication is not eligible for the privileged boundary/u,
   );
   assert.ok(
-    workflow.indexOf("Revalidate publication plan before minting credentials") <
+      workflow.indexOf("Revalidate publication plan before minting credentials") <
       workflow.indexOf("Validate live release signing certificate before minting credentials") &&
       workflow.indexOf("Validate live release signing certificate before minting credentials") <
+        workflow.indexOf("Determine frozen target workflow-transition permission") &&
+      workflow.indexOf("Determine frozen target workflow-transition permission") <
         workflow.indexOf("Validate Publisher App static configuration before inventory") &&
       workflow.indexOf("Validate Publisher App static configuration before inventory") <
         workflow.indexOf("Create inventory-only Publisher App token") &&
@@ -2293,6 +2301,10 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(workflow, /RELEASE_TARGET_ASKPASS: \$\{\{ runner\.temp \}\}\/release-target-askpass/u);
   assert.doesNotMatch(workflow, /gh api installation\s*>/u);
   const publishJob = workflowJobBlock(workflow, "publish");
+  const workflowTransitionStep = workflowStepBlock(
+    publishJob,
+    "Determine frozen target workflow-transition permission",
+  );
   const preInventoryConfigurationStep = workflowStepBlock(
     publishJob,
     "Validate Publisher App static configuration before inventory",
@@ -2321,6 +2333,14 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   const cleanupStep = workflowStepBlock(publishJob, "Remove ephemeral local credentials");
   const recoveryStep = workflowStepBlock(publishJob, "Explain publication recovery");
 
+  assert.match(workflowTransitionStep, /id: publisher-workflow-transition/u);
+  assert.match(workflowTransitionStep, /publication_plan="\$RUNNER_TEMP\/publication-plan\.json"/u);
+  assert.match(workflowTransitionStep, /baseline="docs\/release\/action-v2-repository-baselines\.json"/u);
+  assert.match(workflowTransitionStep, /\.target_master_before/u);
+  assert.match(workflowTransitionStep, /\.initial_target_master/u);
+  assert.match(workflowTransitionStep, /requires_workflows_write=true/u);
+  assert.match(workflowTransitionStep, /requires_workflows_write=false/u);
+  assert.match(workflowTransitionStep, /target commit identities must be full SHA-1 values/u);
   assert.match(preInventoryConfigurationStep, /APP_OWNER: \$\{\{ vars\.RELEASE_PUBLISHER_APP_OWNER \}\}/u);
   assert.match(preInventoryConfigurationStep, /APP_SLUG: \$\{\{ vars\.RELEASE_PUBLISHER_APP_SLUG \}\}/u);
   assert.match(preInventoryConfigurationStep, /static configuration check passed before inventory token minting/u);
@@ -2350,10 +2370,16 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
       ["permission-metadata", "read"],
     ],
   );
+  assert.match(
+    scopedTokenStep,
+    /permission-workflows: \$\{\{ steps\.publisher-workflow-transition\.outputs\.requires_workflows_write == 'true' && 'write' \|\| '' \}\}/u,
+  );
+  assert.doesNotMatch(scopedTokenStep, /^          permission-workflows: write$/mu);
 
   assert.match(identityStep, /ACTUAL_APP_SLUG: \$\{\{ steps\.publisher-inventory-token\.outputs\.app-slug \}\}/u);
   assert.match(identityStep, /ACTUAL_INSTALLATION_ID: \$\{\{ steps\.publisher-inventory-token\.outputs\.installation-id \}\}/u);
   assert.match(identityStep, /INVENTORY_INSTALLATION_TOKEN: \$\{\{ steps\.publisher-inventory-token\.outputs\.token \}\}/u);
+  assert.match(identityStep, /PUBLISHER_WORKFLOW_TRANSITION: \$\{\{ steps\.publisher-workflow-transition\.outputs\.requires_workflows_write \}\}/u);
   assert.match(identityStep, /github-app-installation[\s\S]*--client-id "\$APP_CLIENT_ID"[\s\S]*--installation-id "\$ACTUAL_INSTALLATION_ID"[\s\S]*--output "\$installation_file"/u);
   assert.match(
     identityStep,
@@ -2371,7 +2397,14 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(identityStep, /Publisher App installation invariant failed; inspect the non-secret observed identity above\./u);
   assert.match(identityStep, /Publisher App installation metadata check passed\./u);
   assert.match(identityStep, /installation_id_matches_token_output: \(\.id == \$installation_id\)/u);
-  assert.match(identityStep, /permission_shape_matches_expected: \(\.permissions == \{administration:"read", contents:"write", metadata:"read"\}\)/u);
+  assert.match(identityStep, /permission_workflows: permission_value\("workflows"\),/u);
+  assert.match(identityStep, /workflow_transition_requires_write: \(\$requires_workflows_write == "true"\),/u);
+  assert.match(identityStep, /permission_shape_matches_expected: \(\.permissions == \$expected_permissions\)/u);
+  assert.match(identityStep, /case "\$PUBLISHER_WORKFLOW_TRANSITION" in/u);
+  assert.match(identityStep, /expected_permissions='\{"administration":"read","contents":"write","metadata":"read","workflows":"write"\}'/u);
+  assert.match(identityStep, /expected_permissions='\{"administration":"read","contents":"write","metadata":"read"\}'/u);
+  assert.match(identityStep, /--argjson expected_permissions "\$expected_permissions"/u);
+  assert.match(identityStep, /Publisher App non-transition policy expects no Workflows permission after completed RC readback\./u);
   assert.match(identityStep, /suspension_state:/u);
   assert.match(identityStep, /has\("suspended_at"\) and \.suspended_at == null/u);
   assert.doesNotMatch(identityStep, /suspended:\s*\(\.suspended_at != null\)/u);
@@ -2444,6 +2477,8 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     .filter((line) => /\bGITHUB_(?:ENV|OUTPUT|STEP_SUMMARY)\b/u.test(line))
     .map((line) => line.trim());
   assert.deepEqual(publishSinkLines, [
+    "printf '%s\\n' 'requires_workflows_write=true' >> \"$GITHUB_OUTPUT\"",
+    "printf '%s\\n' 'requires_workflows_write=false' >> \"$GITHUB_OUTPUT\"",
     "printf 'GNUPGHOME=%s\\n' \"$signing_home\" >> \"$GITHUB_ENV\"",
     "cat >> \"$GITHUB_STEP_SUMMARY\" <<'SUMMARY'",
   ]);
@@ -3414,8 +3449,12 @@ test("credential-free publication admission rejects non-superseded control drift
   assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
 });
 
-test("fresh stable publication verifies the immutable Release before advancing its alias", (t) => {
-  const state = fixture(t);
+test("fresh stable publication verifies the immutable Release and replaces a legacy target workflow", (t) => {
+  const state = fixture(t, "2.0.0", { includeLegacyWorkflow: true });
+  assert.equal(
+    git(state.target, ["cat-file", "-t", `${state.initialTarget}:.github/workflows/codex-review-gate.yml`]),
+    "blob",
+  );
   const built = buildAssembledCandidate(state);
   const output = publishCandidate(state, built);
   assert.match(output, /reconcile_state=fresh/u);
@@ -3425,6 +3464,12 @@ test("fresh stable publication verifies the immutable Release before advancing i
   assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), releaseCommit);
   assert.equal(git(state.target, ["show", "-s", "--format=%P", releaseCommit]), state.initialTarget);
   assert.equal(git(state.target, ["rev-parse", `${releaseCommit}^{tree}`]), git(state.source, ["rev-parse", `${state.sourceCommit}:packages/action`]));
+  assert.throws(() =>
+    git(state.target, [
+      "cat-file",
+      "-e",
+      `${releaseCommit}:.github/workflows/codex-review-gate.yml`,
+    ]));
   assert.deepEqual(releaseAssets(state, "v2.0.0"), [
     "codex-review-gate-action-v2.0.0.tar.gz",
     "immutable",

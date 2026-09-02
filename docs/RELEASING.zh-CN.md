@@ -172,13 +172,18 @@ inventory token 读取 `GET /installation/repositories`，并必须证明完整 
 内存投影为五个固定的 non-secret fields，才会写入本地；临时文件由 `always()` cleanup
 删除。只有该证明通过后，job 才会签发独立的 target-scoped installation token。这个
 write token 只点名 target repository，并请求 Administration read、Contents write 与
-Metadata read。在它能交给 Git 前，publisher 会用这个 write token 自己重新读取
-repository scope，并要求同一个 exact singleton repository ID 和 canonical name。第二次
-证明把刚签发的 token 绑定到签发时的 target repository object；仅匹配 App slug 与
-installation ID 不足以建立这个 object identity，因为 token Action 的输入是 repository
-name。它的响应也只会持久化与 inventory response 相同的五字段 non-secret projection；
-raw repository object 永不落盘，临时 projection 由 `always()` cleanup 删除。它是唯一
-暴露给 Git 的 credential：不得跨 jobs 传递、嵌入 remote URL、存入 artifact 或打印。
+Metadata read。workflow 会把 frozen publication plan 的 target head 与记录的 v1 baseline
+比较；仅在两者相等时，才额外要求并请求 Workflows write：complete-tree v2 transition
+会删除 target repository 的 legacy workflow，而 GitHub 将该删除视为 workflow write。
+之后不同的 target head 属于 non-transition release：它要求严格的三权限 App surface，
+并把可选的 Workflows input 留空，因此 resulting writer token 不能更新 workflow。
+在它能交给 Git 前，publisher 会用这个 write token 自己重新读取 repository scope，并
+要求同一个 exact singleton repository ID 和 canonical name。第二次证明把刚签发的 token
+绑定到签发时的 target repository object；仅匹配 App slug 与 installation ID 不足以建立
+这个 object identity，因为 token Action 的输入是 repository name。它的响应也只会持久化
+与 inventory response 相同的五字段 non-secret projection；raw repository object 永不落盘，
+临时 projection 由 `always()` cleanup 删除。它是唯一暴露给 Git 的 credential：不得跨
+jobs 传递、嵌入 remote URL、存入 artifact 或打印。
 Checkout 使用 `persist-credentials: false`。Git 只通过 owner-private 的临时
 `GIT_ASKPASS` helper 取得该 token，并且 helper 只作用于 exact target repository。Post
 step 撤销 token 是 best effort；若 runner 被强制终止，token expiry 是剩余边界。
@@ -189,10 +194,13 @@ patch-level upstream drift，以便自动取得官方修复。若未来改成 im
 则必须在 `Joey-Tools/codex-review-gate` 配置 Dependabot，避免漏掉重要更新。Major
 alias 升级仍需普通 reviewed infrastructure PR，且不得与 release-intent 变更同时落地。
 
-Installed App 授予隐含的 `Metadata: read`、`Contents: read/write` 与
-`Administration: read`。Publisher 先为完整 installation inventory token 只请求
-Metadata read，再为 one-repository write token 请求 Administration read、Contents
-write 与 Metadata read；它不需要 Workflows write。
+一次性 RC transition 期间，Installed App 授予隐含的 `Metadata: read`、
+`Contents: read/write`、`Administration: read` 与 `Workflows: read/write`。Publisher
+先为完整 installation inventory token 只请求 Metadata read，再为 one-repository
+transition writer token 请求全部四项权限。immutable RC readback 完成且不再需要 RC
+recovery 后，在准备 stable release 前从 App 移除 `Workflows: read/write`。新的 frozen
+target head 会使下一次 run 严格要求 Metadata read、Contents read/write 与 Administration
+read，并把可选 Workflows input 留空；若 App 仍保留该权限则 fail closed。
 
 `marketplace-production` Environment 提供：
 
