@@ -2574,6 +2574,10 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     publisher,
     /verify_final_policy_fence\(\)[\s\S]*preflight_live_source[\s\S]*verify_ruleset_policy_snapshot "\$label"[\s\S]*verify_live_release_signer_policy "\$label"/u,
   );
+  assert.match(
+    publisher,
+    /jq -s '\.' "\$details_dir"\/\*\.json > "\$details_file"[\s\S]*if ! node "\$generator" summarize-rulesets --input "\$details_file" 2>\/dev\/null; then[\s\S]*fi[\s\S]*node "\$generator" verify-rulesets --input "\$details_file" \|\| \{[\s\S]*fail_reconcile blocked_conflict publisher-ruleset-policy-changed/u,
+  );
   const remoteTagReadStart = publisher.indexOf("  read_remote_full_tag_snapshot() {");
   const remoteTagReadEnd = publisher.indexOf(
     "\n  validate_remote_full_tag_snapshot() {",

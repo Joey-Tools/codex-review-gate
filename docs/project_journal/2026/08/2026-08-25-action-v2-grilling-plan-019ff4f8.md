@@ -3481,6 +3481,26 @@ superseded_by:
   回归测试直接执行 extracted workflow Bash，覆盖 initial transition、later release 及两条
   缺字段 fail-closed 路径；文档同步说明字段来源，防止 artifact-boundary drift。
 
+## RC Recovery Ruleset Observation
+
+- 在合并 receipt 修复后的 RC recovery `33632789351` 中，所有无特权阶段和 Publisher
+  App/GPG 前置检查完成；Environment 批准后，`Reconcile release publication` 在第一条
+  target ruleset policy fence 停止，错误为
+  `publisher-master-update must actively protect only master updates with the sole publisher App bypass`。
+  该 fence 位于 target clone、push、tag 与 Release mutation 之前；后续 published-release
+  verification 被跳过，job cleanup 完成短期凭证撤销。因此没有将这次失败表示为部分发布。
+- 同一 control commit 的 current user-token readback，以及早于该 run 的最新
+  `publisher-master-update` history version，都满足四条 active ruleset inventory 和该规则的
+  target、master ref、唯一 Publisher App bypass 与唯一 `update` 条件。没有证据表明 live
+  ruleset 被持久修改，也不能从已清理的 job 临时文件重建当时 Publisher App token 的原始
+  detail response。
+- 继续保持原有 exact verifier 及其 `blocked_conflict /
+  publisher-ruleset-policy-changed` 语义。为下一次同一冻结 recovery 可诊断地验证该运行时
+  视图，在 verifier 前新增只输出固定 schema、封顶计数和 predicate booleans 的安全投影；
+  它不回显 ruleset ID、名称、任意远端字符串、HTTP 内容或凭证，且投影自身异常不会放行或
+  替代 verifier。这样下一次失败能区分 publisher-master 的 target、ref、bypass 与 rule-type
+  子条件，而不把未证实的 App-token/API 表示差异写成根因。
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
