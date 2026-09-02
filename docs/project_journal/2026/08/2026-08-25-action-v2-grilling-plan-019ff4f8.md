@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-09-01
+updated: 2026-09-02
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -3419,12 +3419,20 @@ superseded_by:
   escaped-newline PEM, malformed JWT construction through the real CLI
   stderr/exit/no-output-file boundary, response-body failures, and limit/cancel
   failures. Every invariant still fails closed.
-- The precise live mismatch remains unproven until the added non-secret
-  diagnostics run. A frozen recovery is intentionally bound to its original
-  publisher-control SHA, so these new diagnostics cannot be injected into the
-  existing recovery attempt. Land the isolated publisher-control change first,
-  then create a fresh RC release intent/run and use its safe diagnostic phase
-  to repair only the observed mismatch.
+- 新的 RC 恢复运行 `33544572196` 已复用冻结 source
+  `af8430ce086517918e4ac8b8c7b9ff124ebec3ef` 与 admission run
+  `33463583561`，并以合并后的 publisher control
+  `a280c3d3d9c3b1aac5efc698e6ff34832b5b8e04` 完成所有无特权阶段。
+  在新的 `marketplace-production` 批准后，新增的静态 App/token 检查和
+  App-JWT installation fetch 均成功；失败发生在任何 metadata invariant、
+  repository-scope query、writer-token、Git authentication、reconcile 或目标写入之前。
+- 该失败不是 App 配置、安装范围或远端 API 的不匹配：runner 的较旧 `jq`
+  parser 不能将对象字段值直接写成裸 `if`，而本地 `jq 1.8.1` 接受该写法，
+  因而旧本地验证未暴露兼容性差异。`suspension_state` 现在必须把完整
+  `if`/`elif`/`else` 表达式包在括号中，语义仍严格区分 missing、explicit
+  `null` 与 suspended，并继续对缺失 `suspended_at` fail closed。回归测试从
+  真实 workflow 提取完整 `jq` filter，在 `{}`、`suspended_at: null` 和非
+  `null` 三种输入上执行；这使 source-validation runner 自身固定该兼容性边界。
 - Local validation for this isolated change passed `npm run check`, all 57
   publisher/provenance regressions in `test/release-provenance.test.mjs`, the
   two focused source-validation/publisher credential contracts in
@@ -3486,12 +3494,12 @@ superseded_by:
 - PR #35 is merged. Its approved frozen RC recovery completed every
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
-- Land the isolated publisher-control matrix-and-diagnostics change through its
-  own signed, exact-head-reviewed infrastructure PR and verify all five hosted
-  validation cells meet their 14-minute budget. Then create a fresh RC release
-  intent/run, use the safe identity diagnostics if it fails, and on success
-  verify the immutable RC ref, prerelease, assets, signatures and public
-  readback.
+- PR #37 已合并，且新的 RC 恢复运行已验证五个 hosted source-validation
+  cells 与安全身份诊断路径。先以带括号的 `jq` compatibility correction
+  完成同等签名、精确头审查和合并；随后以同一冻结 source/admission 创建新的
+  RC recovery run。成功后验证 immutable RC ref、prerelease、assets、signatures
+  与 public readback；失败时使用现在具有阶段字段的安全诊断，只修复已观察到的
+  不匹配。
 - Then land the stable `v2.0.0` release intent separately and execute its
   approved publisher workflow. Verify the immutable stable ref,
   Release/assets, signatures and `v2` floating alias before carrying out the
