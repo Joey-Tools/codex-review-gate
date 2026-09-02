@@ -678,6 +678,7 @@ test("publisher workflow inventories the full installation before minting a targ
   const extractStep = (name) => PUBLISHER_WORKFLOW.match(
     new RegExp(`      - name: ${name}\\n(?<body>[\\s\\S]*?)(?=\\n      - name: )`, "u"),
   )?.groups?.body;
+  const workflowTransitionStep = extractStep("Determine frozen target workflow-transition permission");
   const preInventoryConfigurationStep = extractStep("Validate Publisher App static configuration before inventory");
   const inventoryStep = extractStep("Create inventory-only Publisher App token");
   const identityStep = extractStep("Validate Publisher App identity and full installation scope");
@@ -685,6 +686,7 @@ test("publisher workflow inventories the full installation before minting a targ
   const bindingStep = extractStep("Bind and validate target-scoped publisher token");
   const configureAuthenticationStep = extractStep("Configure target-scoped ephemeral Git authentication");
   const reconcileStep = extractStep("Reconcile release publication");
+  assert.ok(workflowTransitionStep, "workflow-transition step must remain present");
   assert.ok(preInventoryConfigurationStep, "pre-inventory configuration step must remain present");
   assert.ok(inventoryStep, "inventory token step must remain present");
   assert.ok(identityStep, "publisher identity step must remain present");
@@ -693,7 +695,9 @@ test("publisher workflow inventories the full installation before minting a targ
   assert.ok(configureAuthenticationStep, "target-scoped Git authentication step must remain present");
   assert.ok(reconcileStep, "publisher reconcile step must remain present");
   assert.ok(
-    PUBLISHER_WORKFLOW.indexOf("Validate Publisher App static configuration before inventory") <
+    PUBLISHER_WORKFLOW.indexOf("Determine frozen target workflow-transition permission") <
+      PUBLISHER_WORKFLOW.indexOf("Validate Publisher App static configuration before inventory") &&
+      PUBLISHER_WORKFLOW.indexOf("Validate Publisher App static configuration before inventory") <
       PUBLISHER_WORKFLOW.indexOf("Create inventory-only Publisher App token") &&
       PUBLISHER_WORKFLOW.indexOf("Create inventory-only Publisher App token") <
       PUBLISHER_WORKFLOW.indexOf("Validate Publisher App identity and full installation scope") &&
@@ -707,6 +711,13 @@ test("publisher workflow inventories the full installation before minting a targ
         PUBLISHER_WORKFLOW.indexOf("Reconcile release publication"),
     "inventory and post-mint writer scope must pass before target Git authentication or reconciliation",
   );
+  assert.match(workflowTransitionStep, /publication_plan="\$RUNNER_TEMP\/publication-plan\.json"/u);
+  assert.match(workflowTransitionStep, /baseline="docs\/release\/action-v2-repository-baselines\.json"/u);
+  assert.match(workflowTransitionStep, /\.target_master_before/u);
+  assert.match(workflowTransitionStep, /\.initial_target_master/u);
+  assert.match(workflowTransitionStep, /requires_workflows_write=true/u);
+  assert.match(workflowTransitionStep, /requires_workflows_write=false/u);
+  assert.match(workflowTransitionStep, /target commit identities must be full SHA-1 values/u);
   assert.match(preInventoryConfigurationStep, /APP_OWNER: \$\{\{ vars\.RELEASE_PUBLISHER_APP_OWNER \}\}/u);
   assert.match(preInventoryConfigurationStep, /APP_SLUG: \$\{\{ vars\.RELEASE_PUBLISHER_APP_SLUG \}\}/u);
   assert.match(preInventoryConfigurationStep, /static configuration check passed before inventory token minting/u);
@@ -731,6 +742,11 @@ test("publisher workflow inventories the full installation before minting a targ
       ["permission-metadata", "read"],
     ],
   );
+  assert.match(
+    tokenStep,
+    /permission-workflows: \$\{\{ steps\.publisher-workflow-transition\.outputs\.requires_workflows_write == 'true' && 'write' \|\| '' \}\}/u,
+  );
+  assert.doesNotMatch(tokenStep, /^          permission-workflows: write$/mu);
   assert.match(tokenStep, /^          skip-token-revoke: false$/mu);
   const identityLines = identityStep.split("\n");
   const appCommandIndex = identityLines.findIndex((line) =>
@@ -758,6 +774,10 @@ test("publisher workflow inventories the full installation before minting a targ
   assert.match(identityStep, /Publisher App configuration invariant failed: expected canonical publisher slug\./u);
   assert.match(identityStep, /Publisher App token invariant failed: token app slug does not match the configured publisher slug\./u);
   assert.match(identityStep, /Publisher App token invariant failed: token output has no valid installation ID\./u);
+  assert.match(identityStep, /PUBLISHER_WORKFLOW_TRANSITION: \$\{\{ steps\.publisher-workflow-transition\.outputs\.requires_workflows_write \}\}/u);
+  assert.match(identityStep, /case "\$PUBLISHER_WORKFLOW_TRANSITION" in/u);
+  assert.match(identityStep, /expected_permissions='\{"administration":"read","contents":"write","metadata":"read","workflows":"write"\}'/u);
+  assert.match(identityStep, /expected_permissions='\{"administration":"read","contents":"write","metadata":"read"\}'/u);
   assert.match(identityStep, /Publisher App static configuration and token-output checks passed\./u);
   assert.match(identityStep, /--client-id "\$APP_CLIENT_ID"/u);
   assert.match(identityStep, /Publisher App installation fetch starting\./u);
@@ -767,7 +787,11 @@ test("publisher workflow inventories the full installation before minting a targ
   assert.match(identityStep, /Publisher App installation metadata check passed\./u);
   assert.match(identityStep, /installation_id_matches_token_output: \(\.id == \$installation_id\)/u);
   assert.match(identityStep, /account_login_matches_configured_owner:/u);
-  assert.match(identityStep, /permission_shape_matches_expected: \(\.permissions == \{administration:"read", contents:"write", metadata:"read"\}\)/u);
+  assert.match(identityStep, /permission_workflows: permission_value\("workflows"\),/u);
+  assert.match(identityStep, /workflow_transition_requires_write: \(\$requires_workflows_write == "true"\),/u);
+  assert.match(identityStep, /permission_shape_matches_expected: \(\.permissions == \$expected_permissions\)/u);
+  assert.match(identityStep, /--argjson expected_permissions "\$expected_permissions"/u);
+  assert.match(identityStep, /Publisher App non-transition policy expects no Workflows permission after completed RC readback\./u);
   assert.match(identityStep, /def bounded_event_count:/u);
   assert.match(identityStep, /suspension_state:\s*\(\s*if[\s\S]*?end\s*\),/u);
   const installationSummaryStart = identityStep.indexOf('          observed_installation="$(jq -c \\\n');
@@ -800,11 +824,85 @@ test("publisher workflow inventories the full installation before minting a targ
         "--arg", "slug", "codex-review-gate-action-publisher",
         "--arg", "owner", "JoeyTeng",
         "--argjson", "installation_id", "156186692",
+        "--argjson", "expected_permissions", JSON.stringify({
+          administration: "read",
+          contents: "write",
+          metadata: "read",
+          workflows: "write",
+        }),
+        "--arg", "requires_workflows_write", "true",
         installationSummaryFilter,
       ],
       { input: `${JSON.stringify(fixture)}\n`, encoding: "utf8" },
     ));
     assert.equal(observed.suspension_state, expected);
+  }
+  const installationGuardStart = identityStep.indexOf("          if ! jq -e \\\n");
+  assert.ok(installationGuardStart >= 0, "publisher installation guard must remain present");
+  const installationGuardFilterStart = identityStep.indexOf(
+    installationFilterOpening,
+    installationGuardStart,
+  );
+  assert.ok(installationGuardFilterStart >= 0, "publisher installation guard filter must open");
+  const installationGuardFileInvocation = identityStep.indexOf(
+    "\n            \"$installation_file\" >/dev/null; then",
+    installationGuardFilterStart + installationFilterOpening.length,
+  );
+  assert.ok(installationGuardFileInvocation >= 0, "publisher installation guard filter must close");
+  const installationGuardSource = identityStep.slice(
+    installationGuardFilterStart + installationFilterOpening.length,
+    installationGuardFileInvocation,
+  );
+  assert.equal(installationGuardSource.at(-1), "\\");
+  assert.equal(installationGuardSource.at(-2), " ");
+  assert.equal(installationGuardSource.at(-3), "'");
+  const installationGuardFilter = installationGuardSource.slice(0, -3);
+  const exactThreePermissions = {
+    administration: "read",
+    contents: "write",
+    metadata: "read",
+  };
+  const exactFourPermissions = { ...exactThreePermissions, workflows: "write" };
+  const installationFixture = {
+    id: 156186692,
+    app_id: 4700530,
+    app_slug: "codex-review-gate-action-publisher",
+    account: { login: "JoeyTeng", type: "User" },
+    repository_selection: "selected",
+    suspended_at: null,
+    permissions: exactFourPermissions,
+    events: [],
+  };
+  const executeInstallationGuard = (fixture, expectedPermissions) => execFileSync(
+    "jq",
+    [
+      "-e",
+      "--arg", "slug", "codex-review-gate-action-publisher",
+      "--arg", "owner", "JoeyTeng",
+      "--argjson", "installation_id", "156186692",
+      "--argjson", "expected_permissions", JSON.stringify(expectedPermissions),
+      installationGuardFilter,
+    ],
+    { input: `${JSON.stringify(fixture)}\n`, encoding: "utf8" },
+  );
+  assert.equal(executeInstallationGuard(installationFixture, exactFourPermissions).trim(), "true");
+  assert.equal(
+    executeInstallationGuard(
+      { ...installationFixture, permissions: exactThreePermissions },
+      exactThreePermissions,
+    ).trim(),
+    "true",
+  );
+  for (const [label, permissions] of [
+    ["missing workflows", exactThreePermissions],
+    ["read workflows", { ...exactThreePermissions, workflows: "read" }],
+    ["none workflows", { ...exactThreePermissions, workflows: "none" }],
+    ["extra permission", { ...exactFourPermissions, actions: "read" }],
+  ]) {
+    assert.throws(
+      () => executeInstallationGuard({ ...installationFixture, permissions }, exactFourPermissions),
+      label,
+    );
   }
   assert.doesNotMatch(identityStep, /permission_keys:|events: \(if/u);
   assert.match(identityStep, /Publisher App repository scope query starting\./u);

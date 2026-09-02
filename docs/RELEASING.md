@@ -204,16 +204,23 @@ five fixed non-secret fields before it is written locally, and the temporary
 files are removed in an `always()` cleanup. Only after that proof does the job
 mint its separate target-scoped installation token. That write token names only
 the target repository and requests Administration read, Contents write, and
-Metadata read. Before it can reach Git, the publisher reads the writer token's
-own repository scope and requires the same exact singleton repository ID and
-canonical name. This second proof binds the newly minted token to the target
-repository object at mint time; matching only the App slug and installation ID
-would not establish that object identity when the token Action accepts a
-repository name. Its response receives the same five-field non-secret
-projection as the inventory response; the raw repository object is never
-persisted, and the temporary projection is removed in `always()` cleanup. It
-is the only credential exposed to Git; it is never passed between jobs,
-embedded in a remote URL, stored in an artifact, or printed.
+Metadata read. The workflow compares the frozen publication plan's target head
+with the recorded v1 baseline. Only when they match does it additionally
+require and request Workflows write: the complete-tree v2 transition removes
+the target repository's legacy workflow, and GitHub treats that deletion as a
+workflow write. Any later target head is a non-transition release: it requires
+the exact three-permission App surface and leaves the optional Workflows input
+empty, so the resulting writer token cannot update workflows. Before it can
+reach Git, the publisher reads the writer token's own repository scope and
+requires the same exact singleton repository ID and canonical name. This second
+proof binds the newly minted token to the target repository object at mint time;
+matching only the App slug and installation ID would not establish that object
+identity when the token Action accepts a repository name. Its response receives
+the same five-field non-secret projection as the inventory response; the raw
+repository object is never persisted, and the temporary projection is removed
+in `always()` cleanup. It is the only credential exposed to Git; it is never
+passed between jobs, embedded in a remote URL, stored in an artifact, or
+printed.
 Checkout uses `persist-credentials: false`. Git receives it only through an
 owner-private temporary `GIT_ASKPASS` helper scoped to the exact target
 repository. Post-step revocation is best effort; expiry is the remaining bound
@@ -227,11 +234,16 @@ Dependabot in `Joey-Tools/codex-review-gate` mandatory so important updates are
 not missed. A major-alias upgrade remains an ordinary reviewed infrastructure
 PR and must not share a release-intent change.
 
-The installed App grants the implicit `Metadata: read` plus `Contents:
-read/write` and `Administration: read`. The publisher first requests only
-Metadata read for the complete-installation inventory token, then requests
-Administration read, Contents write, and Metadata read for its one-repository
-write token. It does not require Workflows write.
+For the one-time RC transition, the installed App grants the implicit
+`Metadata: read` plus `Contents: read/write`, `Administration: read`, and
+`Workflows: read/write`. The publisher first requests only Metadata read for
+the complete-installation inventory token, then requests all four permissions
+for its one-repository transition writer token. After immutable RC readback is
+complete and no further RC recovery is needed, remove `Workflows: read/write`
+from the App before preparing the stable release. Its different frozen target
+head makes the next run require exactly Metadata read, Contents read/write, and
+Administration read; it leaves the optional Workflows input empty and fails
+closed if the App still retains it.
 
 The `marketplace-production` Environment provides:
 

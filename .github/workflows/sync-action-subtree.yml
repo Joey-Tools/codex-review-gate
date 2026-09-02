@@ -538,6 +538,25 @@ jobs:
           node scripts/generate-action-release-provenance.mjs verify-github-signing-key \
             --input "$github_keys" \
             --output-public-key "$current_public_key"
+      - name: Determine frozen target workflow-transition permission
+        id: publisher-workflow-transition
+        run: |
+          set -euo pipefail
+          publication_plan="$RUNNER_TEMP/publication-plan.json"
+          baseline="docs/release/action-v2-repository-baselines.json"
+          planned_target_master="$(jq -er '.target_master_before' "$publication_plan")"
+          initial_target_master="$(jq -er '.initial_target_master' "$baseline")"
+          if [[ ! "$planned_target_master" =~ ^[0-9a-f]{40}$ || ! "$initial_target_master" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' "Publisher App transition invariant failed: target commit identities must be full SHA-1 values." >&2
+            exit 1
+          fi
+          if [[ "$planned_target_master" == "$initial_target_master" ]]; then
+            printf '%s\n' 'requires_workflows_write=true' >> "$GITHUB_OUTPUT"
+            printf '%s\n' "Publisher App transition requires Workflows write to remove the legacy target workflow."
+          else
+            printf '%s\n' 'requires_workflows_write=false' >> "$GITHUB_OUTPUT"
+            printf '%s\n' "Publisher App transition does not require Workflows write."
+          fi
       # Security policy: allowlisted GitHub-owned Actions intentionally follow
       # floating major refs so upstream patch fixes arrive automatically. Moving
       # to immutable SHAs requires Dependabot and a separate policy change.
@@ -576,6 +595,7 @@ jobs:
           ACTUAL_APP_SLUG: ${{ steps.publisher-inventory-token.outputs.app-slug }}
           ACTUAL_INSTALLATION_ID: ${{ steps.publisher-inventory-token.outputs.installation-id }}
           INVENTORY_INSTALLATION_TOKEN: ${{ steps.publisher-inventory-token.outputs.token }}
+          PUBLISHER_WORKFLOW_TRANSITION: ${{ steps.publisher-workflow-transition.outputs.requires_workflows_write }}
         run: |
           set -euo pipefail
           set +x
@@ -597,6 +617,18 @@ jobs:
             printf '%s\n' "Publisher App token invariant failed: token output has no valid installation ID." >&2
             exit 1
           fi
+          case "$PUBLISHER_WORKFLOW_TRANSITION" in
+            true)
+              expected_permissions='{"administration":"read","contents":"write","metadata":"read","workflows":"write"}'
+              ;;
+            false)
+              expected_permissions='{"administration":"read","contents":"write","metadata":"read"}'
+              ;;
+            *)
+              printf '%s\n' "Publisher App transition invariant failed: expected a boolean workflow-transition output." >&2
+              exit 1
+              ;;
+          esac
           printf '%s\n' "Publisher App static configuration and token-output checks passed."
           installation_file="$RUNNER_TEMP/publisher-installation.json"
           # shellcheck disable=SC2153 # GitHub Actions injects this step-level secret.
@@ -620,6 +652,8 @@ jobs:
             --arg slug "$APP_SLUG" \
             --arg owner "$APP_OWNER" \
             --argjson installation_id "$ACTUAL_INSTALLATION_ID" \
+            --argjson expected_permissions "$expected_permissions" \
+            --arg requires_workflows_write "$PUBLISHER_WORKFLOW_TRANSITION" \
             '
               def permission_value($name):
                 if (.permissions | type) != "object" then "not_an_object"
@@ -648,7 +682,9 @@ jobs:
                 permission_administration: permission_value("administration"),
                 permission_contents: permission_value("contents"),
                 permission_metadata: permission_value("metadata"),
-                permission_shape_matches_expected: (.permissions == {administration:"read", contents:"write", metadata:"read"}),
+                permission_workflows: permission_value("workflows"),
+                workflow_transition_requires_write: ($requires_workflows_write == "true"),
+                permission_shape_matches_expected: (.permissions == $expected_permissions),
                 event_count: bounded_event_count
               }
             ' "$installation_file")"
@@ -657,6 +693,7 @@ jobs:
             --arg slug "$APP_SLUG" \
             --arg owner "$APP_OWNER" \
             --argjson installation_id "$ACTUAL_INSTALLATION_ID" \
+            --argjson expected_permissions "$expected_permissions" \
             '.id == $installation_id and
              .app_id == 4700530 and
              .app_slug == $slug and
@@ -664,9 +701,12 @@ jobs:
              .account.type == "User" and
              .repository_selection == "selected" and
              has("suspended_at") and .suspended_at == null and
-             .permissions == {administration:"read", contents:"write", metadata:"read"} and
+             .permissions == $expected_permissions and
              .events == []' \
             "$installation_file" >/dev/null; then
+            if [[ "$PUBLISHER_WORKFLOW_TRANSITION" == "false" ]]; then
+              printf '%s\n' "Publisher App non-transition policy expects no Workflows permission after completed RC readback." >&2
+            fi
             printf '%s\n' "Publisher App installation invariant failed; inspect the non-secret observed identity above." >&2
             exit 1
           fi
@@ -732,6 +772,9 @@ jobs:
           permission-administration: read
           permission-contents: write
           permission-metadata: read
+          # The Action ignores an empty optional permission input. Only the
+          # frozen initial v1 target needs this to delete its legacy workflow.
+          permission-workflows: ${{ steps.publisher-workflow-transition.outputs.requires_workflows_write == 'true' && 'write' || '' }}
           skip-token-revoke: false
       - name: Bind and validate target-scoped publisher token
         env:
