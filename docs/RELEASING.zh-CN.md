@@ -172,7 +172,7 @@ inventory token 读取 `GET /installation/repositories`，并必须证明完整 
 内存投影为五个固定的 non-secret fields，才会写入本地；临时文件由 `always()` cleanup
 删除。只有该证明通过后，job 才会签发独立的 target-scoped installation token。这个
 write token 只点名 target repository，并请求 Administration read、Contents write 与
-Metadata read。workflow 会把 frozen publication plan 的 target head 与记录的 v1 baseline
+Metadata read。workflow 会把经 publication-plan revalidation 的 candidate receipt 中冻结的 target head 与记录的 v1 baseline
 比较；仅在两者相等时，才额外要求并请求 Workflows write：complete-tree v2 transition
 会删除 target repository 的 legacy workflow，而 GitHub 将该删除视为 workflow write。
 之后不同的 target head 属于 non-transition release：它要求严格的三权限 App surface，

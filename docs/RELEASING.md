@@ -204,7 +204,7 @@ five fixed non-secret fields before it is written locally, and the temporary
 files are removed in an `always()` cleanup. Only after that proof does the job
 mint its separate target-scoped installation token. That write token names only
 the target repository and requests Administration read, Contents write, and
-Metadata read. The workflow compares the frozen publication plan's target head
+Metadata read. The workflow compares the frozen target head in the verified candidate receipt
 with the recorded v1 baseline. Only when they match does it additionally
 require and request Workflows write: the complete-tree v2 transition removes
 the target repository's legacy workflow, and GitHub treats that deletion as a

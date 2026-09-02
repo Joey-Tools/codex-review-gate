@@ -3457,14 +3457,29 @@ superseded_by:
   删除视为 workflow write。Candidate payload 继续拒绝 workflow definitions，因而
   这项权限只允许 target complete-tree replacement 执行已审查的删除，不扩大 payload
   内容。
-- 决定保持 fail-closed 而不是永久扩权：workflow 以 frozen publication plan 的
-  `target_master_before` 是否等于 recorded `initial_target_master` 决定 exact surface。
+- 决定保持 fail-closed 而不是永久扩权：workflow 以经 publication-plan revalidation 的
+  verified candidate receipt 中 `plan.target_master_before` 是否等于 recorded
+  `initial_target_master` 决定 exact surface。
   只有该一次性 v1→v2 transition 要求安装与 target-scoped writer token 具有
   `workflows: write`；inventory token 始终仅请求 `metadata: read`。immutable RC
   readback 完成且不再需要 recovery 后，stable release 前必须从 App 移除 Workflows
   permission；新的 target head 会使 workflow 严格要求三权限 surface 并让 writer token
   不再请求 Workflows。文档、transition 检查和实际执行的 `jq` guard 回归共同锁定这两种
   exact surface，防止旧三权限误阻断 RC 或额外权限静默进入 stable token。
+- 新的 RC 恢复运行 `33622507589` 继续复用同一冻结 source 与 admission，并以合并后的
+  control commit `7ed0da980ca145d9397acbac60aabe0c99372fef` 完成所有无特权阶段。
+  Environment 批准后，它在 `Determine frozen target workflow-transition permission`
+  停止，仍早于 Publisher token minting、GPG import、target push、tag 或 Release mutation。
+- 根因是两个刻意不同的 artifact schema 被混淆：credential-free
+  `publication-plan.json` 只保存 candidate digest 等跨阶段绑定字段，并没有顶层
+  `target_master_before`；已解包、已验证且刚刚完成 publication-plan revalidation 的
+  `release-candidate/candidate.json` 才保存
+  `plan.target_master_before`。旧的 `jq -er` 置于 `set -e` command substitution 中，
+  对缺失字段直接以 exit 1 终止，因此没有机会打印 custom invariant error。
+- 修复保持相同的冻结值与最小权限决策，只改为从 verified candidate receipt 读取
+  `plan.target_master_before`，并显式处理 candidate/baseline 的缺失或非字符串字段。
+  回归测试直接执行 extracted workflow Bash，覆盖 initial transition、later release 及两条
+  缺字段 fail-closed 路径；文档同步说明字段来源，防止 artifact-boundary drift。
 
 ## Verified Facts And Required Live Preflight
 

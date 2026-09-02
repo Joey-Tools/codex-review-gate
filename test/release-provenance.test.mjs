@@ -711,10 +711,14 @@ test("publisher workflow inventories the full installation before minting a targ
         PUBLISHER_WORKFLOW.indexOf("Reconcile release publication"),
     "inventory and post-mint writer scope must pass before target Git authentication or reconciliation",
   );
-  assert.match(workflowTransitionStep, /publication_plan="\$RUNNER_TEMP\/publication-plan\.json"/u);
+  assert.match(workflowTransitionStep, /candidate_json="\$RUNNER_TEMP\/release-candidate\/candidate\.json"/u);
   assert.match(workflowTransitionStep, /baseline="docs\/release\/action-v2-repository-baselines\.json"/u);
-  assert.match(workflowTransitionStep, /\.target_master_before/u);
-  assert.match(workflowTransitionStep, /\.initial_target_master/u);
+  assert.match(workflowTransitionStep, /jq -er '\.plan\.target_master_before \| strings' "\$candidate_json"/u);
+  assert.match(workflowTransitionStep, /jq -er '\.initial_target_master \| strings' "\$baseline"/u);
+  assert.doesNotMatch(workflowTransitionStep, /publication_plan="\$RUNNER_TEMP\/publication-plan\.json"/u);
+  assert.doesNotMatch(workflowTransitionStep, /jq -er '\.target_master_before'/u);
+  assert.match(workflowTransitionStep, /assembled candidate has no valid frozen target master/u);
+  assert.match(workflowTransitionStep, /repository baseline has no valid initial target master/u);
   assert.match(workflowTransitionStep, /requires_workflows_write=true/u);
   assert.match(workflowTransitionStep, /requires_workflows_write=false/u);
   assert.match(workflowTransitionStep, /target commit identities must be full SHA-1 values/u);
@@ -964,6 +968,64 @@ test("publisher workflow inventories the full installation before minting a targ
   assert.doesNotMatch(
     reconcileStep,
     /(?:INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN)/u,
+  );
+});
+
+test("publisher workflow transition reads the frozen candidate receipt rather than the redacted publication plan", () => {
+  const workflowTransitionStep = PUBLISHER_WORKFLOW.match(
+    /      - name: Determine frozen target workflow-transition permission\n(?<body>[\s\S]*?)(?=\n      - name: )/u,
+  )?.groups?.body;
+  assert.ok(workflowTransitionStep, "workflow-transition step must remain present");
+  const runMarker = "        run: |\n";
+  const runStart = workflowTransitionStep.indexOf(runMarker);
+  assert.notEqual(runStart, -1, "workflow-transition step must contain a literal run script");
+  const transitionScript = workflowTransitionStep
+    .slice(runStart + runMarker.length)
+    .split("\n")
+    .map((line) => line.startsWith("          ") ? line.slice(10) : line)
+    .join("\n");
+
+  const runTransition = ({ candidate, baseline }) => {
+    const root = mkdtempSync(join(tmpdir(), "release-workflow-transition-"));
+    const output = join(root, "github-output");
+    try {
+      writeJson(join(root, "publication-plan.json"), {
+        schema: "codex-review-gate-action-publication-plan-v2",
+        candidate: { archive_sha256: "a".repeat(64) },
+      });
+      writeJson(join(root, "release-candidate", "candidate.json"), candidate);
+      writeJson(join(root, "docs", "release", "action-v2-repository-baselines.json"), baseline);
+      const stdout = execFileSync("bash", ["-c", transitionScript], {
+        cwd: root,
+        encoding: "utf8",
+        env: { ...process.env, RUNNER_TEMP: root, GITHUB_OUTPUT: output },
+      });
+      return { output: readFileSync(output, "utf8"), stdout };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  const candidate = { plan: { target_master_before: TARGET_HEAD } };
+  const baseline = { initial_target_master: TARGET_HEAD };
+  const initialTransition = runTransition({ candidate, baseline });
+  assert.equal(initialTransition.output, "requires_workflows_write=true\n");
+  assert.match(initialTransition.stdout, /transition requires Workflows write/u);
+
+  const laterTransition = runTransition({
+    candidate: { plan: { target_master_before: "a".repeat(40) } },
+    baseline,
+  });
+  assert.equal(laterTransition.output, "requires_workflows_write=false\n");
+  assert.match(laterTransition.stdout, /does not require Workflows write/u);
+
+  assert.throws(
+    () => runTransition({ candidate: { plan: {} }, baseline }),
+    /assembled candidate has no valid frozen target master/u,
+  );
+  assert.throws(
+    () => runTransition({ candidate, baseline: {} }),
+    /repository baseline has no valid initial target master/u,
   );
 });
 
