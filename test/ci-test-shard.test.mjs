@@ -268,7 +268,7 @@ function assertReleaseRegistrationContract(source) {
       "u",
     ),
   );
-  assert.equal([...source.matchAll(/^\s*test\(/gmu)].length, 79);
+  assert.equal([...source.matchAll(/^\s*test\(/gmu)].length, 81);
   assert.doesNotMatch(
     source,
     /\b(?:describe|it|suite)\s*(?:\(|\.|\[)|\b(?:nodeTest|test)\s*(?:\.(?:only|skip|todo)|\[)|\bt\.test\s*\(|\b(?:only|skip|todo)\s*:/mu,
@@ -281,7 +281,7 @@ function assertReleaseRegistrationContract(source) {
   );
   assert.match(
     source,
-    /assert\.equal\(\s*test\.registeredCount,\s*131,\s*"release pipeline shard registration inventory drift",?\s*\)/u,
+    /assert\.equal\(\s*test\.registeredCount,\s*133,\s*"release pipeline shard registration inventory drift",?\s*\)/u,
   );
 }
 

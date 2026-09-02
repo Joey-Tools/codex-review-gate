@@ -3500,6 +3500,10 @@ superseded_by:
   它不回显 ruleset ID、名称、任意远端字符串、HTTP 内容或凭证，且投影自身异常不会放行或
   替代 verifier。这样下一次失败能区分 publisher-master 的 target、ref、bypass 与 rule-type
   子条件，而不把未证实的 App-token/API 表示差异写成根因。
+- 回归不仅检查投影函数：production-shaped fake Publisher App detail 注入 hostile remote
+  value 时，真实 release shell 必须输出 schema 与四个 false predicate、不得反射该值；
+  强制 `summarize-rulesets` 非零时，shell 只写固定 fallback，原 verifier 仍以相同 closed
+  recovery code 停止。测试注册清单随新增 cases 同步更新，防止 CI shard 静默漏跑它们。
 
 ## Verified Facts And Required Live Preflight
 
