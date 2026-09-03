@@ -325,7 +325,8 @@ one bypassable ruleset:
 The currently verified rule IDs are `16454474` for
 `publisher-master-update` and `21461558` for `master-integrity`. IDs are
 informational read-back evidence, not substitutes for verifying each rule's
-name, target, enforcement state, rules, and bypass actors.
+name, target, enforcement state, rules, and bypass-actor policy through the
+appropriate authority.
 
 Tag protection uses two non-overlapping rulesets:
 
@@ -339,13 +340,40 @@ Both rulesets restrict creation, update, and deletion as appropriate and block
 unauthorized force updates. The publisher also fails closed before its first
 target write if an invocation would mutate any v1 tag, v1 GitHub Release, or v1
 Release asset. Ruleset IDs are only informational read-back evidence; the
-publisher verifies names, targets, enforcement, ref conditions, rules, and
-bypass actors.
+publisher runtime verifies the active inventory, names, targets, enforcement,
+ref conditions, and rules.
 
 Repository administrators can still edit rulesets; that configuration-control
-authority is outside a repository-hosted workflow. `publish` therefore
-re-reads the exact named rules, ref conditions, enforcement state, and bypass
-actors after approval and before its first write.
+authority is outside a repository-hosted workflow.
+
+### Bypass-actor visibility and owner audit
+
+The Publisher App token intentionally has `Administration: read`, not write.
+GitHub's repository-ruleset detail API returns `bypass_actors` only to an
+identity with write access to that ruleset. Consequently, the same correctly
+configured rule can be returned to `publish` without that property. This is a
+[documented API visibility boundary](https://docs.github.com/en/rest/repos/rules?apiVersion=2022-11-28#get-a-repository-ruleset),
+not evidence that the bypass policy changed.
+
+At every policy fence, `publish` still re-reads the exact named rules and all
+observable policy fields. Its `verify-runtime-rulesets` check accepts only a
+*missing* `bypass_actors` property as `redacted`; a visible wrong array, `null`,
+or any other malformed value still fails closed. The safe diagnostic labels the
+observation rather than printing actor data.
+
+`redacted` is not proof that no one added another bypass actor. The runtime
+cannot automatically discover an additional actor while retaining its
+read-only Administration permission. Do not widen the Publisher App to
+Administration write merely to make this observation visible.
+
+Instead, an owner or administrator with ruleset write access must perform the
+strict audit during Publisher App/target-ruleset setup, after every target
+ruleset change, and before the first stable release of each new major. The
+source command `verify-rulesets` remains that audit: it requires an array made
+from the four individual ruleset-detail `GET` responses (not the paginated
+`/rulesets` list) and proves the exact sole Publisher App bypass or an empty
+array as applicable. If that credential cannot see `bypass_actors`, the owner
+audit is incomplete and must not be reported as successful.
 
 ## Candidate and signed release commit
 

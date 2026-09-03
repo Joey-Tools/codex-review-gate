@@ -272,7 +272,8 @@ Repository rules 提供两个不同性质，不能合并成一套可被整体 by
 
 当前已验证的 rule IDs 是：`publisher-master-update` 为 `16454474`，
 `master-integrity` 为 `21461558`。这些 ID 只属于 read-back evidence，不能替代对
-各规则 name、target、enforcement state、rules 与 bypass actors 的验证。
+各规则 name、target、enforcement state、rules 与由合适权限执行的 bypass-actor policy
+验证。
 
 Tag protection 使用两套互不重叠的 rulesets：
 
@@ -285,12 +286,35 @@ Tag protection 使用两套互不重叠的 rulesets：
 两套 rulesets 都会按各自职责限制 create、update 与 delete，并阻止未授权 force
 updates。Publisher 在首次 target write 前还会 fail closed：任何 invocation 都不得
 修改 v1 tag、v1 GitHub Release 或其 asset。Ruleset IDs 仅是 informational
-read-back evidence；publisher 必须验证 name、target、enforcement、ref conditions、
-rules 与 bypass actors。
+read-back evidence；publisher runtime 必须验证 active inventory、name、target、
+enforcement、ref conditions 与 rules。
 
 Repository administrators 仍能编辑 rulesets；这种 configuration-control authority
-不能由 repository-hosted workflow 消除。因此 `publish` 在获批后、首次写入前还会
-重新读取 exact named rules、ref conditions、enforcement state 与 bypass actors。
+不能由 repository-hosted workflow 消除。
+
+### Bypass actor 的可见性与 owner audit
+
+Publisher App token 有意只取得 `Administration: read`，而不是 write。GitHub 的
+repository-ruleset detail API 只向对该 ruleset 具有 write access 的 identity 返回
+`bypass_actors`；因此，即使配置正确，同一条规则对 `publish` 也可能不包含这个 property。
+这是[已记录的 API 可见性边界](https://docs.github.com/en/rest/repos/rules?apiVersion=2022-11-28#get-a-repository-ruleset)，
+不是 bypass policy 发生变化的证据。
+
+每个 policy fence 中，`publish` 仍会重新读取 exact named rules 和全部可观察 policy
+fields。`verify-runtime-rulesets` 只把*完全缺失*的 `bypass_actors` property 当作
+`redacted`；可见但错误的 array、`null` 或任意其他 malformed value 都继续 fail closed。
+安全 diagnostic 只标记 observation，不打印 actor data。
+
+`redacted` 不证明没有人新增 bypass actor。保留只读 Administration permission 的 runtime
+无法自动发现额外 actor；不得只为获得该可见性而把 Publisher App 扩大为
+Administration write。
+
+改由对 ruleset 具有 write access 的 owner 或 administrator 执行严格 audit：在 Publisher
+App/target-ruleset setup、每次 target ruleset change 之后，以及每个新 major 的首次 stable
+release 之前执行。source 中的 `verify-rulesets` 仍是该 audit：它要求由四个 individual
+ruleset-detail `GET` responses 组成的 array（不是分页 `/rulesets` list），并精确验证唯一
+Publisher App bypass 或相应的空 array。若该 credential 仍看不到 `bypass_actors`，owner audit
+即不完整，不得报告成功。
 
 ## Candidate 与 signed release commit
 
