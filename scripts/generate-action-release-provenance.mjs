@@ -1519,6 +1519,29 @@ function exactPublisherBypass(ruleset) {
     actors[0]?.bypass_mode === "always";
 }
 
+function exactNoBypass(ruleset) {
+  const actors = ruleset?.bypass_actors;
+  return Array.isArray(actors) && actors.length === 0;
+}
+
+function publisherRulesetBypassObservation(ruleset, publisherBypass) {
+  if (ruleset === null || typeof ruleset !== "object") return "not_evaluated";
+  if (!Object.prototype.hasOwnProperty.call(ruleset, "bypass_actors")) return "redacted";
+  if (!Array.isArray(ruleset.bypass_actors)) return "malformed";
+  const matches = publisherBypass
+    ? exactPublisherBypass(ruleset)
+    : exactNoBypass(ruleset);
+  return matches ? "matched" : "mismatched";
+}
+
+function bypassMatchesPublisherPolicy(ruleset, publisherBypass, {
+  acceptRedactedBypassActors = false,
+} = {}) {
+  const observation = publisherRulesetBypassObservation(ruleset, publisherBypass);
+  return observation === "matched" ||
+    (acceptRedactedBypassActors && observation === "redacted");
+}
+
 function exactRuleTypes(ruleset, requiredTypes) {
   const types = (ruleset.rules ?? []).map((rule) => rule.type);
   const present = new Set(types);
@@ -1542,14 +1565,11 @@ function publisherRulesetDiagnosticEntry(active, name, {
 }) {
   const matches = active.filter((ruleset) => ruleset.name === name);
   const ruleset = matches.length === 1 ? matches[0] : undefined;
-  const bypassMatches = publisherBypass
-    ? exactPublisherBypass(ruleset ?? {})
-    : Array.isArray(ruleset?.bypass_actors) && ruleset.bypass_actors.length === 0;
   return {
     active_match_count: boundedPublisherRulesetDiagnosticCount(matches),
     target_matches: ruleset?.target === target,
     ref_condition_matches: ruleset !== undefined && exactRefCondition(ruleset, include, exclude),
-    bypass_matches: ruleset !== undefined && bypassMatches,
+    bypass_observation: publisherRulesetBypassObservation(ruleset, publisherBypass),
     rule_types_match: Array.isArray(ruleset?.rules) && exactRuleTypes(ruleset, ruleTypes),
   };
 }
@@ -1568,7 +1588,7 @@ export function publisherRulesetDiagnosticProjection(rulesets) {
   const distinctActiveNames = new Set(active.map((ruleset) => ruleset?.name));
   const unexpectedActive = active.filter((ruleset) => !expectedNames.has(ruleset?.name));
   return {
-    schema: "codex-review-gate-action-publisher-ruleset-diagnostic-v1",
+    schema: "codex-review-gate-action-publisher-ruleset-diagnostic-v2",
     count_cap: PUBLISHER_RULESET_DIAGNOSTIC_COUNT_CAP,
     snapshot_is_array: snapshotIsArray,
     active_count: boundedPublisherRulesetDiagnosticCount(active),
@@ -1612,7 +1632,9 @@ export function publisherRulesetDiagnosticProjection(rulesets) {
   };
 }
 
-export function validatePublisherRulesets(rulesets) {
+function validatePublisherRulesetsWithBypassVisibility(rulesets, {
+  acceptRedactedBypassActors = false,
+} = {}) {
   if (!Array.isArray(rulesets)) fail("publisher ruleset snapshot must be an array");
   const active = rulesets.filter((ruleset) => ruleset.enforcement === "active");
   const expectedNames = new Set([
@@ -1632,7 +1654,7 @@ export function validatePublisherRulesets(rulesets) {
   if (
     publisherMaster?.target !== "branch" ||
     !exactRefCondition(publisherMaster, ["refs/heads/master"]) ||
-    !exactPublisherBypass(publisherMaster) ||
+    !bypassMatchesPublisherPolicy(publisherMaster, true, { acceptRedactedBypassActors }) ||
     !exactRuleTypes(publisherMaster, ["update"])
   ) {
     fail("publisher-master-update must actively protect only master updates with the sole publisher App bypass");
@@ -1642,8 +1664,7 @@ export function validatePublisherRulesets(rulesets) {
   if (
     masterIntegrity?.target !== "branch" ||
     !exactRefCondition(masterIntegrity, ["refs/heads/master"]) ||
-    !Array.isArray(masterIntegrity.bypass_actors) ||
-    masterIntegrity.bypass_actors.length !== 0 ||
+    !bypassMatchesPublisherPolicy(masterIntegrity, false, { acceptRedactedBypassActors }) ||
     !exactRuleTypes(masterIntegrity, [
       "required_signatures",
       "required_linear_history",
@@ -1658,8 +1679,7 @@ export function validatePublisherRulesets(rulesets) {
   if (
     freezeV1?.target !== "tag" ||
     !exactRefCondition(freezeV1, ["refs/tags/v1", "refs/tags/v1.*"]) ||
-    !Array.isArray(freezeV1.bypass_actors) ||
-    freezeV1.bypass_actors.length !== 0 ||
+    !bypassMatchesPublisherPolicy(freezeV1, false, { acceptRedactedBypassActors }) ||
     !exactRuleTypes(freezeV1, ["creation", "update", "deletion", "non_fast_forward"])
   ) {
     fail("freeze-v1-tags must freeze refs/tags/v1 and refs/tags/v1.* without bypass actors");
@@ -1673,12 +1693,22 @@ export function validatePublisherRulesets(rulesets) {
       ["refs/tags/v*"],
       ["refs/tags/v1", "refs/tags/v1.*"],
     ) ||
-    !exactPublisherBypass(publisherV2Plus) ||
+    !bypassMatchesPublisherPolicy(publisherV2Plus, true, { acceptRedactedBypassActors }) ||
     !exactRuleTypes(publisherV2Plus, ["creation", "update", "deletion", "non_fast_forward"])
   ) {
     fail("publisher-v2-plus-tags must protect v2+ tags with the sole publisher App bypass and exact v1 exclusions");
   }
   return true;
+}
+
+export function validatePublisherRulesets(rulesets) {
+  return validatePublisherRulesetsWithBypassVisibility(rulesets);
+}
+
+export function validatePublisherRuntimeRulesets(rulesets) {
+  return validatePublisherRulesetsWithBypassVisibility(rulesets, {
+    acceptRedactedBypassActors: true,
+  });
 }
 
 function stableReleaseAssetProjection(release, {
@@ -3123,6 +3153,10 @@ async function main(argv) {
     validatePublisherRulesets(readJson(resolve(required(options, "input"))));
     return;
   }
+  if (command === "verify-runtime-rulesets") {
+    validatePublisherRuntimeRulesets(readJson(resolve(required(options, "input"))));
+    return;
+  }
   if (command === "summarize-rulesets") {
     process.stdout.write(canonicalJson(
       publisherRulesetDiagnosticProjection(readJson(resolve(required(options, "input")))),
@@ -3205,7 +3239,7 @@ async function main(argv) {
     createOnly(resolve(required(options, "output")), canonicalJson(repositoryScope));
     return;
   }
-  fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, summarize-rulesets, verify-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, github-app-installation, or github-app-installation-repository-scope command");
+  fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, summarize-rulesets, verify-rulesets, verify-runtime-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, github-app-installation, or github-app-installation-repository-scope command");
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : null;

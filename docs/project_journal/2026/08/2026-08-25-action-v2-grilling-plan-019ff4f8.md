@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-09-02
+updated: 2026-09-03
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -3494,16 +3494,39 @@ superseded_by:
   target、master ref、唯一 Publisher App bypass 与唯一 `update` 条件。没有证据表明 live
   ruleset 被持久修改，也不能从已清理的 job 临时文件重建当时 Publisher App token 的原始
   detail response。
-- 继续保持原有 exact verifier 及其 `blocked_conflict /
-  publisher-ruleset-policy-changed` 语义。为下一次同一冻结 recovery 可诊断地验证该运行时
-  视图，在 verifier 前新增只输出固定 schema、封顶计数和 predicate booleans 的安全投影；
-  它不回显 ruleset ID、名称、任意远端字符串、HTTP 内容或凭证，且投影自身异常不会放行或
-  替代 verifier。这样下一次失败能区分 publisher-master 的 target、ref、bypass 与 rule-type
-  子条件，而不把未证实的 App-token/API 表示差异写成根因。
+- 当时保留 strict verifier，同时新增只输出固定 schema、封顶计数和 predicate booleans 的
+  安全投影；它不回显 ruleset ID、名称、任意远端字符串、HTTP 内容或凭证，且投影自身异常
+  不会放行或替代 verifier。该步骤只把失败收敛到 bypass predicate；它本身没有证明
+  App-token/API 表示差异，也没有授权把这种差异当作已知根因。
 - 回归不仅检查投影函数：production-shaped fake Publisher App detail 注入 hostile remote
   value 时，真实 release shell 必须输出 schema 与四个 false predicate、不得反射该值；
   强制 `summarize-rulesets` 非零时，shell 只写固定 fallback，原 verifier 仍以相同 closed
   recovery code 停止。测试注册清单随新增 cases 同步更新，防止 CI shard 静默漏跑它们。
+
+## Publisher Ruleset Bypass Visibility Boundary
+
+- RC recovery `33643251528` 复用同一 frozen source 和 admission，并在 Environment 批准后
+  于第一个 target ruleset policy fence 停止，仍早于 target clone、push、tag 和 Release
+  mutation。安全 diagnostic 显示四条 adopted ruleset 的 inventory、target、ref condition
+  与 rule types 都匹配；只有 bypass predicate 为 false。
+- 以 repository owner credential、相同 `X-GitHub-Api-Version: 2026-03-10` 直接读取四个
+  ruleset detail endpoint，得到的配置与 adopted contract 相符：两个 publisher ruleset
+  只有 App `4700530` 的 `Integration`/`always` bypass，另两个 ruleset 都是空 array。
+  因此没有把该失败归因为已观察到的 live ruleset drift。
+- GitHub 的 repository-ruleset detail API 明确规定：只有请求 identity 对 ruleset 具有
+  write access 时才返回 `bypass_actors`。Publisher App 的 `Administration: read` 是有意
+  保持的最小权限，因而 runtime 详情可以完全省略该 property。Joey 确认不为获得该可见性
+  把 Publisher App 扩大到 Administration write。
+- 已采用的修正是双层而非降级 policy：runtime 只把完全缺失的 `bypass_actors` 表示为安全的
+  `redacted` observation，继续严格验证 inventory、name、target、enforcement、ref
+  conditions 与 rule types；任何可见但错误的 array、`null` 或非-array 仍 fail closed。
+  `redacted` 不等于“没有额外 actor”：runtime 不能自动发现后来加入的 bypass actor。
+- 完整 bypass 集合继续由有 ruleset write access 的 owner/administrator strict audit 负责，
+  使用 `verify-rulesets` 对四个 individual detail GET response 组成的 array 作 exact
+  verification；在 Publisher App/target-ruleset setup、每次 target ruleset change 后、以及
+  每个新 major 的首次 stable release 前执行。若 audit credential 看不到该 property，audit
+  不完整。发布文档必须清楚区分此 owner audit 和 Publisher runtime，防止日后把
+  `redacted` 误读为自动 drift detection。
 
 ## Verified Facts And Required Live Preflight
 
@@ -3555,13 +3578,13 @@ superseded_by:
 - PR #35 is merged. Its approved frozen RC recovery completed every
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
-- PR #37 与 PR #38 已合并。新的 RC 恢复运行已验证五个 hosted
-  source-validation cells、安全身份诊断路径与旧 runner 的 `jq` compatibility
-  correction；`33605481641` 进一步将剩余失败收敛到 complete-tree transition 所需的
-  Workflows permission contract。先完成该最小权限契约修复、同等签名与精确头审查，
-  随后以同一冻结 source/admission 创建新的 RC recovery run。成功后验证 immutable
-  RC ref、prerelease、assets、signatures 与 public readback；失败时继续只修复已观察
-  到的明确不匹配。
+- PR #37、#38、#39、#40 与 #41 已合并。最新 RC recovery `33643251528` 已验证五个 hosted
+  source-validation cells、App installation/permission contracts、receipt boundary 与安全
+  ruleset diagnostic，但因 Publisher App detail response 的 documented bypass-field
+  redaction 而在首次 policy fence 停止，未产生 target write。最小权限可见性 boundary 已
+  由 runtime/owner-audit split、文档、同等签名与精确头审查修复；下一步以同一 frozen
+  source/admission 创建新的 RC recovery run。成功后验证 immutable RC ref、prerelease、
+  assets、signatures 与 public readback；失败时继续只修复已观察到的明确不匹配。
 - RC 的 immutable ref、prerelease、assets、signatures 与 public readback 全部验证后，
   且确认不再需要 RC recovery，先在 Publisher App settings 移除 `Workflows: read/write`；
   再创建 stable `v2.0.0` release intent。stable workflow 会以新的 target head 要求

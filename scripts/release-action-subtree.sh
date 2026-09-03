@@ -1715,7 +1715,7 @@ verify_ruleset_policy_snapshot() {
   if ! node "$generator" summarize-rulesets --input "$details_file" 2>/dev/null; then
     printf '%s\n' 'Publisher ruleset policy diagnostic unavailable; verifier remains authoritative.' >&2
   fi
-  node "$generator" verify-rulesets --input "$details_file" || {
+  node "$generator" verify-runtime-rulesets --input "$details_file" || {
     fail_reconcile blocked_conflict publisher-ruleset-policy-changed \
       "effective target rulesets differ from the adopted publisher and integrity contract"
   }

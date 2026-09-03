@@ -40,6 +40,7 @@ import {
   validateGitHubSigningKeyInventory,
   validateActionMetadata,
   validatePublisherRulesets,
+  validatePublisherRuntimeRulesets,
   validateSigningKeyHome,
   validateTargetReleaseObjects,
   verifyCandidate,
@@ -1457,11 +1458,11 @@ test("publisher ruleset diagnostic projects only fixed predicates and bounded co
     active_match_count: 1,
     target_matches: true,
     ref_condition_matches: true,
-    bypass_matches: true,
+    bypass_observation: "matched",
     rule_types_match: true,
   };
   assert.deepEqual(publisherRulesetDiagnosticProjection(productionRulesets()), {
-    schema: "codex-review-gate-action-publisher-ruleset-diagnostic-v1",
+    schema: "codex-review-gate-action-publisher-ruleset-diagnostic-v2",
     count_cap: 5,
     snapshot_is_array: true,
     active_count: 4,
@@ -1500,7 +1501,8 @@ test("publisher ruleset diagnostic isolates each publisher-master predicate", ()
       mutate: (ruleset) => { ruleset.conditions.ref_name.include = ["~DEFAULT_BRANCH"]; },
     },
     {
-      field: "bypass_matches",
+      field: "bypass_observation",
+      expected: "mismatched",
       mutate: (ruleset) => { ruleset.bypass_actors = []; },
     },
     {
@@ -1508,16 +1510,41 @@ test("publisher ruleset diagnostic isolates each publisher-master predicate", ()
       mutate: (ruleset) => { ruleset.rules = [{ type: "required_status_checks" }]; },
     },
   ];
-  for (const { field, mutate } of cases) {
+  for (const { field, expected = false, mutate } of cases) {
     const observed = productionRulesets();
     mutate(observed[0]);
     const projection = publisherRulesetDiagnosticProjection(observed);
     const publisherMaster = projection.adopted_rulesets.publisher_master_update;
-    assert.equal(publisherMaster[field], false, `${field} must identify the drift`);
+    assert.equal(publisherMaster[field], expected, `${field} must identify the drift`);
     assert.equal(publisherMaster.active_match_count, 1);
     assert.equal(projection.active_inventory_matches, true);
     assert.throws(() => validatePublisherRulesets(observed), /publisher-master-update/u);
   }
+});
+
+test("publisher runtime treats only an omitted bypass field as documented redaction", () => {
+  const redacted = productionRulesets().map(({ bypass_actors: _bypassActors, ...ruleset }) => ruleset);
+  assert.equal(validatePublisherRuntimeRulesets(redacted), true);
+  assert.throws(() => validatePublisherRulesets(redacted), /publisher-master-update/u);
+  const diagnostic = publisherRulesetDiagnosticProjection(redacted);
+  for (const entry of Object.values(diagnostic.adopted_rulesets)) {
+    assert.equal(entry.bypass_observation, "redacted");
+  }
+
+  const extraVisibleActor = productionRulesets();
+  extraVisibleActor[0].bypass_actors = [...APP_BYPASS, {
+    actor_id: 123456789,
+    actor_type: "Integration",
+    bypass_mode: "always",
+  }];
+  assert.throws(
+    () => validatePublisherRuntimeRulesets(extraVisibleActor),
+    /publisher-master-update/u,
+  );
+
+  const nullBypassActors = productionRulesets();
+  nullBypassActors[1].bypass_actors = null;
+  assert.throws(() => validatePublisherRuntimeRulesets(nullBypassActors), /master-integrity/u);
 });
 
 test("publisher ruleset diagnostic never reflects hostile remote strings or identifiers", () => {
