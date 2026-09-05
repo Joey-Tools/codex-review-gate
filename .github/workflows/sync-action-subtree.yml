@@ -81,6 +81,7 @@ jobs:
             exit 1
           }
           if [[ -n "$EXISTING_DRAFT_RELEASE_ID" ]]; then
+            # shellcheck disable=SC2071 # Fixed-width decimal strings avoid arithmetic overflow.
             [[ "$EXISTING_DRAFT_RELEASE_ID" =~ ^[1-9][0-9]*$ &&
                 ${#EXISTING_DRAFT_RELEASE_ID} -le 16 &&
                 ( ${#EXISTING_DRAFT_RELEASE_ID} -lt 16 ||

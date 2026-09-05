@@ -1052,6 +1052,10 @@ test("publisher dispatch reuses exact push admission and can bind one reviewed D
   );
   assert.match(
     PUBLISHER_WORKFLOW,
+    /# shellcheck disable=SC2071 # Fixed-width decimal strings avoid arithmetic overflow\./u,
+  );
+  assert.match(
+    PUBLISHER_WORKFLOW,
     /repos\/\$EXPECTED_REPOSITORY\/actions\/runs\/\$ADMISSION_RUN_ID\/attempts\/\$ADMISSION_RUN_ATTEMPT/u,
   );
   assert.match(PUBLISHER_WORKFLOW, /\.event, \.head_branch, \.head_sha, \.path, \.run_attempt/u);
