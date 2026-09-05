@@ -967,6 +967,10 @@ test("publisher workflow inventories the full installation before minting a targ
   assert.doesNotMatch(bindingStep, /\.repositories\b|\.full_name\b|temp_clone_token/u);
   assert.doesNotMatch(bindingStep, /\bGITHUB_(?:ENV|OUTPUT|STEP_SUMMARY)\b/u);
   assert.match(reconcileStep, /RELEASE_PUBLISHER_TOKEN: \$\{\{ steps\.publisher-token\.outputs\.token \}\}/u);
+  assert.match(
+    reconcileStep,
+    /if \[\[ -n "\$RELEASE_EXISTING_DRAFT_RELEASE_ID" \]\]; then[\s\S]*publish_args\+=\(--existing-draft-release-id "\$RELEASE_EXISTING_DRAFT_RELEASE_ID"\)[\s\S]*release-action-subtree\.sh "\$\{publish_args\[@\]\}"/u,
+  );
   assert.doesNotMatch(
     reconcileStep,
     /(?:INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_INSTALLATION_TOKEN)/u,
@@ -1031,9 +1035,25 @@ test("publisher workflow transition reads the frozen candidate receipt rather th
   );
 });
 
-test("publisher workflow persists exact push admission and dispatch can only reuse that push artifact", () => {
+test("publisher dispatch reuses exact push admission and can bind one reviewed Draft id", () => {
   assert.match(PUBLISHER_WORKFLOW, /admission_run_id:[\s\S]*?required: true/u);
   assert.match(PUBLISHER_WORKFLOW, /admission_run_attempt:[\s\S]*?required: true/u);
+  assert.match(
+    PUBLISHER_WORKFLOW,
+    /existing_draft_release_id:[\s\S]*?required: false[\s\S]*?type: string/u,
+  );
+  assert.match(
+    PUBLISHER_WORKFLOW,
+    /RELEASE_EXISTING_DRAFT_RELEASE_ID: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.existing_draft_release_id \|\| '' \}\}/u,
+  );
+  assert.match(
+    PUBLISHER_WORKFLOW,
+    /if \[\[ -n "\$EXISTING_DRAFT_RELEASE_ID" \]\]; then[\s\S]*existing_draft_release_id must be a safe positive numeric GitHub Release ID when supplied/u,
+  );
+  assert.match(
+    PUBLISHER_WORKFLOW,
+    /# shellcheck disable=SC2071 # Fixed-width decimal strings avoid arithmetic overflow\./u,
+  );
   assert.match(
     PUBLISHER_WORKFLOW,
     /repos\/\$EXPECTED_REPOSITORY\/actions\/runs\/\$ADMISSION_RUN_ID\/attempts\/\$ADMISSION_RUN_ATTEMPT/u,

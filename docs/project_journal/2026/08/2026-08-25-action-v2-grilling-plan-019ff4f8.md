@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-09-03
+updated: 2026-09-05
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -2897,10 +2897,11 @@ superseded_by:
 - The corrected cross-run contract supersedes the earlier checkpoint that
   allowed the fake's known-before-apply failure to make a second total POST on
   the next invocation. The target immutable full tag is the durable one-shot
-  create fence. Only the invocation that began with that tag absent, created it
-  non-force, and read back the exact tag object and peeled commit may issue one
-  Release-create POST. If the tag pre-existed while the complete Release
-  inventory is stably absent, the later invocation emits `inconclusive` /
+  create fence. Only the invocation that began with that tag absent, obtained
+  the one exact full-tag newly-created porcelain receipt from its create-only
+  absent-ref lease push, and read back the exact tag object and peeled commit
+  may issue one Release-create POST. If the tag pre-existed while the complete
+  Release inventory is stably absent, the later invocation emits `inconclusive` /
   `release-create-attempt-unknown` and issues no POST. The producing invocation
   still uses `release-creation-unknown` when its one POST is followed by stable
   absence, and it still adopts a uniquely discovered exact draft after response
@@ -3528,6 +3529,80 @@ superseded_by:
   不完整。发布文档必须清楚区分此 owner audit 和 Publisher runtime，防止日后把
   `redacted` 误读为自动 drift detection。
 
+## Direct Release-Create Receipt And Known-ID Recovery
+
+- Approved RC recovery run `33746380608` successfully created the target
+  wrapper commit, immutable tag `v2.0.0-rc.1`, and empty Draft Release
+  `381957863`, then stopped before asset upload because its normal success path
+  required the new Draft to appear in a post-create complete Release list. The
+  Publisher App list observation did not expose it at that boundary. The Draft
+  was subsequently observable by its numeric ID; no asset, publication PATCH,
+  or floating-alias mutation occurred.
+- The adopted correction makes a usable direct REST create response the
+  immediate creation receipt. The response must supply a safe positive ID and
+  exactly match the planned tag, name, body, prerelease, mutable Draft state,
+  Publisher App Bot author, and empty asset inventory. The publisher freezes
+  that ID directly and performs no normal post-create list or by-ID retry.
+  - Explicit reason: the POST response already supplies the created state and
+    required Release ID, so the post-create read retry is skipped.
+- When the create transport or response is unavailable, a complete stable
+  inventory may be used only to reconcile that ambiguous outcome. A unique
+  eligible Draft may be adopted, but the publisher never issues a second POST;
+  stable absence remains `release-creation-unknown`.
+- Implementation invariant, not a new product decision: the fresh-Draft REST
+  request body must be fully constructed and exact-validated before the first
+  durable target write, including the target `master` and immutable full-tag
+  pushes. The later create step may use only that already validated request.
+  Any local JSON construction, file creation, or request-field validation
+  failure therefore stops while the target is still unchanged.
+  - Reason: the immutable full tag is the cross-run one-shot create fence. If a
+    local request-preparation failure happened only after that tag was pushed,
+    an ordinary retry would be forbidden from issuing the first create request
+    and could leave the new tag stranded without a Draft Release.
+- The same pre-write liveness invariant includes opening the create response
+  and error sinks before the first target write and retaining those file
+  descriptors through the one allowed POST. A response-redirection setup
+  failure after the immutable tag is pushed must be classified as local
+  preflight failure, not as an ambiguous POST outcome, because no request may
+  have reached GitHub.
+- The immutable-tag create fence now requires an explicit create-only push and
+  exactly one well-formed, tab-separated, three-field ref-status record among
+  its porcelain output: first field `*`, second field the exact full-tag
+  refspec. Non-status transport prose is not a ref-status record. A zero push
+  exit is not creation proof because an identical tag may instead be reported
+  up to date as `=`. Any extra, malformed, truncated, or non-target ref-status
+  row, `=` receipt, rejection, or uncertain output therefore grants
+  no Release POST authority and stops for inspection/recovery, preserving the
+  fence across later invocations.
+- Recovery `workflow_dispatch` adds optional
+  `existing_draft_release_id`. It is a manually reviewed locator, not durable
+  ledger state or publication authority. The fresh-create path rejects it. A
+  recovery run uses one direct ID read to admit only an exact Publisher-App-
+  authored, mutable Draft with the planned metadata and either no assets or a
+  machine-verified canonical uploaded prefix with at most one expected
+  zero-byte Publisher-App starter. The Release list may omit it, but any
+  visible exact-tag inventory match must have the same ID. The existing
+  frozen-ID/full-tag A/B boundary still runs before upload or publication. The
+  selector never authorizes create, delete, replacement, or a different release
+  intent.
+  - This supersedes only the earlier conclusion that recovery needs no workflow
+    input. It does not supersede the immutable full-tag one-shot create fence:
+    an ordinary retry without the selector still stops at
+    `release-create-attempt-unknown`.
+- Failure summaries for `release-creation-unknown` and
+  `release-create-attempt-unknown` direct the operator or agent to confirm the
+  exact recoverable Draft, then supply its reviewed ID together with all three
+  required identity inputs on the original admitted-source dispatch and obtain
+  a new Environment approval. Without that evidence, recovery remains stopped;
+  it never force-creates or recreates the Release.
+- Post-review correctness correction: an empty-only selector leaves a
+  list-hidden Draft permanently unrecoverable if a numeric-ID asset upload
+  applied before its response was lost, or if GitHub left its single allowed
+  starter asset. A later exact-source run cannot create again because the full
+  tag is the durable one-shot fence. The selector therefore admits the proven
+  canonical prefix above, while frozen-ID download-and-byte comparison and the
+  existing single-starter checks continue to reject arbitrary partial state.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -3578,13 +3653,16 @@ superseded_by:
 - PR #35 is merged. Its approved frozen RC recovery completed every
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
-- PR #37、#38、#39、#40 与 #41 已合并。最新 RC recovery `33643251528` 已验证五个 hosted
-  source-validation cells、App installation/permission contracts、receipt boundary 与安全
-  ruleset diagnostic，但因 Publisher App detail response 的 documented bypass-field
-  redaction 而在首次 policy fence 停止，未产生 target write。最小权限可见性 boundary 已
-  由 runtime/owner-audit split、文档、同等签名与精确头审查修复；下一步以同一 frozen
-  source/admission 创建新的 RC recovery run。成功后验证 immutable RC ref、prerelease、
-  assets、signatures 与 public readback；失败时继续只修复已观察到的明确不匹配。
+- PR #37、#38、#39、#40 与 #41 已合并。后续 RC recovery `33746380608` 已创建
+  target `master`/immutable tag `v2.0.0-rc.1`（均指向
+  `04158a216445d9171b4519fad33baa70edb84226`）和 empty Draft Release
+  `381957863`，但在 post-create list 未发现新 Draft 后停止；没有上传 asset、发布 Release
+  或更新 alias。Known-ID recovery correction 合并后，使用 original
+  `source_sha=af8430ce086517918e4ac8b8c7b9ff124ebec3ef`、
+  `admission_run_id=33463583561`、`admission_run_attempt=1` 与
+  `existing_draft_release_id=381957863` 创建新的 approved recovery run。成功后验证
+  immutable RC ref、prerelease、assets、signatures 与 public readback；失败时继续只修复
+  已观察到的明确不匹配。
 - RC 的 immutable ref、prerelease、assets、signatures 与 public readback 全部验证后，
   且确认不再需要 RC recovery，先在 Publisher App settings 移除 `Workflows: read/write`；
   再创建 stable `v2.0.0` release intent。stable workflow 会以新的 target head 要求

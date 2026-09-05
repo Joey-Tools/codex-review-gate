@@ -19,6 +19,10 @@ on:
         description: Exact successful planning attempt whose immutable plan artifact is reused.
         required: true
         type: string
+      existing_draft_release_id:
+        description: Optional manually reviewed recoverable Draft Release ID to resume without draft-list discovery.
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -32,6 +36,7 @@ env:
   RELEASE_SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
   RELEASE_CONTROL_SHA: ${{ github.sha }}
   RELEASE_ADMISSION_BEFORE_SHA: ${{ github.event.before }}
+  RELEASE_EXISTING_DRAFT_RELEASE_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.existing_draft_release_id || '' }}
 
 jobs:
   plan:
@@ -54,6 +59,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           ADMISSION_RUN_ID: ${{ inputs.admission_run_id }}
           ADMISSION_RUN_ATTEMPT: ${{ inputs.admission_run_attempt }}
+          EXISTING_DRAFT_RELEASE_ID: ${{ inputs.existing_draft_release_id }}
           CONTROL_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -74,6 +80,18 @@ jobs:
             echo "admission_run_id and admission_run_attempt must be positive integers." >&2
             exit 1
           }
+          if [[ -n "$EXISTING_DRAFT_RELEASE_ID" ]]; then
+            # shellcheck disable=SC2071 # Fixed-width decimal strings avoid arithmetic overflow.
+            [[ "$EXISTING_DRAFT_RELEASE_ID" =~ ^[1-9][0-9]*$ &&
+                ${#EXISTING_DRAFT_RELEASE_ID} -le 16 &&
+                ( ${#EXISTING_DRAFT_RELEASE_ID} -lt 16 ||
+                  # Fixed-width decimal comparison avoids arithmetic overflow.
+                  "$EXISTING_DRAFT_RELEASE_ID" < "9007199254740991" ||
+                  "$EXISTING_DRAFT_RELEASE_ID" == "9007199254740991" ) ]] || {
+              echo "existing_draft_release_id must be a safe positive numeric GitHub Release ID when supplied." >&2
+              exit 1
+            }
+          fi
           live_master_sha="$(env -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
             GH_HOST=github.com gh api --hostname github.com \
               "repos/$EXPECTED_REPOSITORY/git/ref/heads/master" --jq .object.sha)"
@@ -906,11 +924,18 @@ jobs:
           RELEASE_PUBLISHER_APP_OWNER: ${{ vars.RELEASE_PUBLISHER_APP_OWNER }}
           RELEASE_PUBLISHER_APP_SLUG: ${{ vars.RELEASE_PUBLISHER_APP_SLUG }}
         run: |
-          scripts/release-action-subtree.sh --publish \
-            --source-ref "$RELEASE_SOURCE_SHA" \
-            --control-ref "$RELEASE_CONTROL_SHA" \
-            --candidate "$RUNNER_TEMP/release-candidate" \
+          set -euo pipefail
+          publish_args=(
+            --publish
+            --source-ref "$RELEASE_SOURCE_SHA"
+            --control-ref "$RELEASE_CONTROL_SHA"
+            --candidate "$RUNNER_TEMP/release-candidate"
             --publication-plan-file "$RUNNER_TEMP/publication-plan.json"
+          )
+          if [[ -n "$RELEASE_EXISTING_DRAFT_RELEASE_ID" ]]; then
+            publish_args+=(--existing-draft-release-id "$RELEASE_EXISTING_DRAFT_RELEASE_ID")
+          fi
+          scripts/release-action-subtree.sh "${publish_args[@]}"
       - name: Remove ephemeral local credentials
         if: ${{ always() }}
         run: |
@@ -946,11 +971,19 @@ jobs:
           candidates are rebuilt and a new Environment approval is required.
           Complete any older partial release before attempting a newer version.
 
-          `release-create-attempt-unknown` is the exception to ordinary
-          dispatch recovery: the immutable tag already consumed the cross-run
-          draft-create permission while no unique Release is visible. Do not
-          rerun or add a force-create input. Obtain explicitly reviewed manual
-          recovery evidence or wait for the unique draft to become visible.
+          `release-creation-unknown` and
+          `release-create-attempt-unknown` are exceptions to ordinary dispatch
+          recovery: do not rerun with a force-create input. If an operator can
+          directly verify an existing Draft Release, redispatch the same exact
+          `source_sha`, `admission_run_id`, and `admission_run_attempt` with
+          `existing_draft_release_id` set to its numeric ID. The publisher
+          accepts that selector only for the exact Publisher-App-authored,
+          mutable Draft matching this release intent with either no assets or a
+          byte-verified canonical uploaded prefix and at most one known
+          zero-byte starter; it never creates, replaces, or adopts an arbitrary
+          partial Release. The new run still requires a fresh Environment
+          approval. Without that evidence, leave recovery stopped or wait for
+          the unique Draft to become visible.
           SUMMARY
 
   verify:
