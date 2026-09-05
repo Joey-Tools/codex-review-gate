@@ -3566,11 +3566,14 @@ superseded_by:
   preflight failure, not as an ambiguous POST outcome, because no request may
   have reached GitHub.
 - The immutable-tag create fence now requires an explicit create-only push and
-  an exact porcelain receipt containing only the full tag with newly-created
-  status `*`. A zero push exit is not creation proof because an identical tag
-  may instead be reported up to date as `=`. An `=` receipt, rejection, or
-  uncertain output therefore grants no Release POST authority and stops for
-  inspection/recovery, preserving the fence across later invocations.
+  exactly one well-formed, tab-separated, three-field ref-status record among
+  its porcelain output: first field `*`, second field the exact full-tag
+  refspec. Non-status transport prose is not a ref-status record. A zero push
+  exit is not creation proof because an identical tag may instead be reported
+  up to date as `=`. Any extra, malformed, truncated, or non-target ref-status
+  row, `=` receipt, rejection, or uncertain output therefore grants
+  no Release POST authority and stops for inspection/recovery, preserving the
+  fence across later invocations.
 - Recovery `workflow_dispatch` adds optional
   `existing_draft_release_id`. It is a manually reviewed locator, not durable
   ledger state or publication authority. The fresh-create path rejects it. A

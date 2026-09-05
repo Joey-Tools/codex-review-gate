@@ -2687,7 +2687,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.match(
     publisher,
-    /if ! immutable_push_output="\$\(target_git_push[\s\\]*--force-with-lease="refs\/tags\/\$immutable_tag:"[\s\\]*"refs\/tags\/\$immutable_tag:refs\/tags\/\$immutable_tag"\)"; then[\s\S]*fail_reconcile inconclusive remote-read-inconclusive[\s\S]*without a confirmed immutable-tag create receipt[\s\S]*-F '\\t'[\s\\]*-v expected="refs\/tags\/\$immutable_tag:refs\/tags\/\$immutable_tag"[\s\S]*target_lines == 1 && created == 1/u,
+    /if ! immutable_push_output="\$\(target_git_push[\s\\]*--force-with-lease="refs\/tags\/\$immutable_tag:"[\s\\]*"refs\/tags\/\$immutable_tag:refs\/tags\/\$immutable_tag"\)"; then[\s\S]*fail_reconcile inconclusive remote-read-inconclusive[\s\S]*without a confirmed immutable-tag create receipt[\s\S]*-F '\\t'[\s\\]*-v expected="refs\/tags\/\$immutable_tag:refs\/tags\/\$immutable_tag"[\s\S]*index\(\$0, "\\t"\) == 0 \{ next \}[\s\S]*ref_status_records \+= 1[\s\S]*NF != 3[\s\S]*\$1 != "\*"[\s\S]*\$2 != expected[\s\S]*\$3 == ""[\s\S]*ref_status_records == 1 && invalid != 1/u,
   );
   assert.match(publisher, /source_live_master\(\)[\s\S]*source_git ls-remote/u);
   assert.doesNotMatch(publisher, /readonly manifest=|\[\[ -f "\$manifest"/u);
@@ -3387,6 +3387,88 @@ exec "$REAL_GIT" "$@"
     false,
     "a failed full-tag push must not create or mutate a GitHub Release",
   );
+});
+
+test("immutable tag creation rejects extra or malformed porcelain ref-status records", (t) => {
+  for (const receiptMode of ["extra-valid-ref", "truncated-target-ref"]) {
+    const state = fixture(t);
+    const label = `immutable-tag-receipt-${receiptMode}`;
+    const built = buildAssembledCandidate(state, { label });
+    const githubEnvironment = fakeGithubEnvironment(state, label);
+    const fakeBin = join(state.root, `${label}-bin`);
+    const fakeGit = join(fakeBin, "git");
+    const injectionMarker = join(state.root, `${label}.marker`);
+    mkdirSync(fakeBin);
+    write(fakeGit, `#!/bin/sh
+set -eu
+immutable_push=false
+stage_repo=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = -C ]; then
+    stage_repo="$argument"
+  fi
+  case "$argument" in
+    refs/tags/v2.0.0:refs/tags/v2.0.0) immutable_push=true ;;
+  esac
+  previous="$argument"
+done
+if [ "$immutable_push" = true ]; then
+  [ -n "$stage_repo" ]
+  tag_object="$("$REAL_GIT" -C "$stage_repo" rev-parse refs/tags/v2.0.0)"
+  "$REAL_GIT" "$@"
+  printf '%s\n' "$tag_object" > "$INJECTION_MARKER"
+  case "$RECEIPT_MODE" in
+    extra-valid-ref)
+      printf '*\t%s\t%s\n' \
+        refs/tags/v9.9.9:refs/tags/v9.9.9 '[new tag]'
+      ;;
+    truncated-target-ref)
+      printf '*\t%s\n' refs/tags/v2.0.0:refs/tags/v2.0.0
+      ;;
+    *) exit 75 ;;
+  esac
+  exit 0
+fi
+exec "$REAL_GIT" "$@"
+`);
+    chmodSync(fakeGit, 0o755);
+
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: {
+        ...githubEnvironment,
+        INJECTION_MARKER: injectionMarker,
+        PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+        REAL_GIT: run("which", ["git"]),
+        RECEIPT_MODE: receiptMode,
+      },
+    });
+
+    assert.notEqual(result.status, 0, receiptMode);
+    assert.match(result.stderr, /reconcile_state=inconclusive/u, receiptMode);
+    assert.match(result.stderr, /recovery_code=remote-state-changed/u, receiptMode);
+    assert.match(
+      result.stderr,
+      /did not uniquely report creation of a new remote ref/u,
+      receiptMode,
+    );
+    assert.equal(
+      git(state.target, ["rev-parse", "refs/tags/v2.0.0"]),
+      readFileSync(injectionMarker, "utf8").trim(),
+      receiptMode,
+    );
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${label}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.release_create_calls, 0, receiptMode);
+    assert.equal(
+      fakeState.call_trace.some(({ method }) => ["POST", "PATCH", "DELETE"].includes(method)),
+      false,
+      `${receiptMode}: an invalid immutable-tag receipt must not mutate a GitHub Release`,
+    );
+  }
 });
 
 test("malformed publish invocations still emit exactly one closed state and recovery code", (t) => {
@@ -7122,6 +7204,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  149,
+  150,
   "release pipeline shard registration inventory drift",
 );

@@ -508,25 +508,28 @@ protected write.
    the write.
 3. Create the signed annotated immutable full tag `v<version>` with an explicit
    create-only push guarded by an absent-ref lease (the remote ref must not
-   exist). Accept only a porcelain receipt that contains
-   exactly the one full tag and marks it newly created with `*`; a successful
-   push exit alone is insufficient because an identical tag can be reported
-   up to date with `=`. An up-to-date result, rejection, or uncertain receipt
-   fails closed for inspection and recovery and grants no Release-create
-   authority. The tag points directly to the wrapper commit and is never moved
-   or deleted. Re-read the exact tag object, peeled commit, commit tree, and
-   GitHub signature result. Publisher identity is bound before the first write
-   from the minted token's actual App slug and installation ID, target scope,
-   and effective rulesets.
+   exist). Among the porcelain output's tab-separated ref-status records,
+   accept exactly one well-formed, three-field record whose first field is `*`
+   and whose second field is the exact intended full-tag refspec. Non-status
+   transport prose is not a ref-status record. A successful push exit alone is
+   insufficient because an identical tag can be
+   reported up to date with `=`. An extra, malformed, truncated, or non-target
+   ref-status row, an up-to-date result, a rejection, or uncertain output fails closed for
+   inspection and recovery and grants no Release-create authority. The tag
+   points directly to the wrapper commit and is never moved or deleted. Re-read
+   the exact tag object, peeled commit, commit tree, and GitHub signature
+   result. Publisher identity is bound before the first write from the minted
+   token's actual App slug and installation ID, target scope, and effective
+   rulesets.
 4. Enumerate the complete, paginated GitHub Release inventory with the
    Publisher App. That push-authorized identity can see drafts. Require a
    nonempty outer page array (`[[]]` is the valid empty-repository result),
    safe positive globally unique numeric IDs, and zero or one exact-tag match.
    A pre-existing draft is resumed by its inventory ID. A fresh invocation
    receives draft-create authority only when the immutable full tag was absent
-   at invocation start, that same invocation obtained the exact newly-created
-   (`*`) create-only push receipt for the one full tag, and then read back its
-   exact tag object and peeled commit. Two stable complete
+   at invocation start, that same invocation obtained a newly-created (`*`)
+   create-only push receipt in exactly one such ref-status record, and then
+   read back its exact tag object and peeled commit. Two stable complete
    inventories must still prove exact-tag Release absence before creation. The
    publisher issues exactly one direct REST create request in that invocation.
    A usable successful response is the immediate transaction receipt: the

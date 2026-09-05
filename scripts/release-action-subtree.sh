@@ -3188,8 +3188,12 @@ if [[ "$full_exists" != true ]]; then
   fi
   if ! printf '%s\n' "$immutable_push_output" | awk -F '\t' \
       -v expected="refs/tags/$immutable_tag:refs/tags/$immutable_tag" '
-        $2 == expected { target_lines += 1; created += ($1 == "*") }
-        END { exit !(target_lines == 1 && created == 1) }
+        index($0, "\t") == 0 { next }
+        {
+          ref_status_records += 1
+          if (NF != 3 || $1 != "*" || $2 != expected || $3 == "") invalid = 1
+        }
+        END { exit !(ref_status_records == 1 && invalid != 1) }
       '; then
     fail_reconcile inconclusive remote-state-changed \
       "immutable tag push did not uniquely report creation of a new remote ref"
