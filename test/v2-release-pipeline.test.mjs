@@ -2677,6 +2677,18 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     publisher,
     /target_git_push\(\)[\s\S]*push_argv=\([^\n]*credential\.helper=[\s\S]*credential\.useHttpPath=true[\s\S]*http\.extraHeader=[\s\S]*"\$target_url" "\$refspec"\)[\s\S]*GIT_ASKPASS="\$release_target_askpass"[\s\S]*GIT_CONFIG_GLOBAL=\/dev\/null[\s\S]*GIT_CONFIG_NOSYSTEM=1[\s\S]*PUBLISHER_TOKEN="\$publisher_token"[\s\S]*command git "\$\{push_argv\[@\]\}"/u,
   );
+  assert.match(
+    publisher,
+    /"\$refspec" == "refs\/tags\/\$immutable_tag:refs\/tags\/\$immutable_tag"[\s\S]*"\$lease_arg" == "--force-with-lease=refs\/tags\/\$immutable_tag:"/u,
+  );
+  assert.match(
+    publisher,
+    /use_porcelain=true[\s\S]*if \[\[ "\$use_porcelain" == true \]\]; then[\s\S]*push --porcelain[\s\\]*"\$lease_arg" "\$target_url" "\$refspec"/u,
+  );
+  assert.match(
+    publisher,
+    /if ! immutable_push_output="\$\(target_git_push[\s\\]*--force-with-lease="refs\/tags\/\$immutable_tag:"[\s\\]*"refs\/tags\/\$immutable_tag:refs\/tags\/\$immutable_tag"\)"; then[\s\S]*fail_reconcile inconclusive remote-read-inconclusive[\s\S]*without a confirmed immutable-tag create receipt[\s\S]*-F '\\t'[\s\\]*-v expected="refs\/tags\/\$immutable_tag:refs\/tags\/\$immutable_tag"[\s\S]*target_lines == 1 && created == 1/u,
+  );
   assert.match(publisher, /source_live_master\(\)[\s\S]*source_git ls-remote/u);
   assert.doesNotMatch(publisher, /readonly manifest=|\[\[ -f "\$manifest"/u);
   assert.match(publisher, /git cat-file -e "\$source_commit:release-manifest\.json"/u);
@@ -3248,6 +3260,133 @@ exec "$REAL_JQ" "$@"
       `${failureMode} failure must happen before REST create`,
     );
   }
+});
+
+test("an identical immutable tag won after the final precheck cannot authorize Draft creation", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "immutable-tag-create-race" });
+  const githubEnvironment = fakeGithubEnvironment(state, "immutable-tag-create-race");
+  const fakeBin = join(state.root, "immutable-tag-create-race-bin");
+  const fakeGit = join(fakeBin, "git");
+  const raceMarker = join(state.root, "immutable-tag-create-race.marker");
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+immutable_push=false
+stage_repo=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = -C ]; then
+    stage_repo="$argument"
+  fi
+  case "$argument" in
+    refs/tags/v2.0.0:refs/tags/v2.0.0) immutable_push=true ;;
+  esac
+  previous="$argument"
+done
+if [ "$immutable_push" = true ] && [ ! -e "$RACE_MARKER" ]; then
+  [ -n "$stage_repo" ]
+  tag_object="$("$REAL_GIT" -C "$stage_repo" rev-parse refs/tags/v2.0.0)"
+  "$REAL_GIT" -C "$stage_repo" push "$MUTATION_TARGET" \
+    refs/tags/v2.0.0:refs/tags/v2.0.0 >/dev/null 2>&1
+  printf '%s\n' "$tag_object" > "$RACE_MARKER"
+fi
+exec "$REAL_GIT" "$@"
+`);
+  chmodSync(fakeGit, 0o755);
+
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      MUTATION_TARGET: state.target,
+      PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+      RACE_MARKER: raceMarker,
+      REAL_GIT: run("which", ["git"]),
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=inconclusive/u);
+  assert.match(result.stderr, /recovery_code=remote-state-changed/u);
+  assert.match(result.stderr, /did not uniquely report creation of a new remote ref/u);
+  assert.equal(existsSync(raceMarker), true);
+  assert.equal(
+    git(state.target, ["rev-parse", "refs/tags/v2.0.0"]),
+    readFileSync(raceMarker, "utf8").trim(),
+  );
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-immutable-tag-create-race", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.release_create_calls, 0);
+  assert.equal(
+    fakeState.call_trace.some(({ method }) => ["POST", "PATCH", "DELETE"].includes(method)),
+    false,
+    "the losing invocation must not create or mutate a GitHub Release",
+  );
+});
+
+test("a failed immutable tag push closes without creating a tag or Draft Release", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "immutable-tag-push-failure" });
+  const githubEnvironment = fakeGithubEnvironment(state, "immutable-tag-push-failure");
+  const fakeBin = join(state.root, "immutable-tag-push-failure-bin");
+  const fakeGit = join(fakeBin, "git");
+  const pushMarker = join(state.root, "immutable-tag-push-failure.marker");
+  mkdirSync(fakeBin);
+  write(fakeGit, `#!/bin/sh
+set -eu
+immutable_push=false
+for argument in "$@"; do
+  case "$argument" in
+    refs/tags/v2.0.0:refs/tags/v2.0.0) immutable_push=true ;;
+  esac
+done
+if [ "$immutable_push" = true ]; then
+  arguments=" $* "
+  case "$arguments" in
+    *" --porcelain "*) ;;
+    *) exit 78 ;;
+  esac
+  case "$arguments" in
+    *" --force-with-lease=refs/tags/v2.0.0: "*) ;;
+    *) exit 77 ;;
+  esac
+  printf '%s\n' attempted > "$PUSH_MARKER"
+  printf '%s\n' 'simulated immutable tag push failure before apply' >&2
+  exit 76
+fi
+exec "$REAL_GIT" "$@"
+`);
+  chmodSync(fakeGit, 0o755);
+
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: {
+      ...githubEnvironment,
+      PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+      PUSH_MARKER: pushMarker,
+      REAL_GIT: run("which", ["git"]),
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=inconclusive/u);
+  assert.match(result.stderr, /recovery_code=remote-read-inconclusive/u);
+  assert.match(result.stderr, /failed without a confirmed immutable-tag create receipt/u);
+  assert.equal(readFileSync(pushMarker, "utf8"), "attempted\n");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, "fake-gh-state-immutable-tag-push-failure", "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.release_create_calls, 0);
+  assert.equal(
+    fakeState.call_trace.some(({ method }) => ["POST", "PATCH", "DELETE"].includes(method)),
+    false,
+    "a failed full-tag push must not create or mutate a GitHub Release",
+  );
 });
 
 test("malformed publish invocations still emit exactly one closed state and recovery code", (t) => {
@@ -6983,6 +7122,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  147,
+  149,
   "release pipeline shard registration inventory drift",
 );

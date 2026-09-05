@@ -425,17 +425,22 @@ protected write 前 fail closed。
    parent、tree 与 GitHub signature result。这证明 accepted Git state，不证明 immutable
    historical pusher attribution；Publisher App identity 已在写入前通过 minted
    credential 与 effective rulesets 绑定。
-3. 在不 force 的情况下创建 signed annotated immutable full tag `v<version>`。
-   它直接指向 wrapper commit，永不移动或删除。重新读取 exact tag object、peeled
-   commit、commit tree 与 GitHub signature result。Publisher identity 在首次写入前
-   通过 minted token 实际输出的 App slug 与 installation ID、target scope 及
-   effective rulesets 完成绑定。
+3. 使用受 absent-ref lease（远端 ref 必须不存在）保护的显式 create-only push 创建 signed
+   annotated immutable full tag `v<version>`。只接受恰好包含这一个 full tag、并以 `*`
+   标记其为 newly created 的 porcelain receipt；push 成功退出本身并不充分，因为
+   identical tag 可能以 `=` 报告为
+   up to date。出现 up-to-date result、rejection 或无法确定的 receipt 时，必须 fail
+   closed 并进入 inspection/recovery，且不得授予 Release-create 权限。该 tag 直接指向
+   wrapper commit，永不移动或删除。重新读取 exact tag object、peeled commit、commit
+   tree 与 GitHub signature result。Publisher identity 在首次写入前通过 minted token
+   实际输出的 App slug 与 installation ID、target scope 及 effective rulesets 完成绑定。
 4. 由 Publisher App 枚举完整分页 GitHub Release inventory；该 push-authorized
    身份可以看见 drafts。要求 outer page array 非空（空 repository 的合法结果是
    `[[]]`）、所有 ID 都是全局唯一的 safe positive integer，并且 exact tag 只能有
    0 或 1 个匹配。已有 draft 按 inventory 中的 ID 恢复。只有 immutable full tag 在
-   invocation 开始时不存在、并且同一 invocation 以 non-force push 创建该 tag 后精确读回
-   tag object 与 peeled commit，fresh invocation 才获得 draft-create 权限；create 前仍须
+   invocation 开始时不存在、同一 invocation 获得恰好针对这一个 full tag 且标记为 newly
+   created (`*`) 的 create-only push receipt，并在随后精确读回 tag object 与 peeled
+   commit，fresh invocation 才获得 draft-create 权限；create 前仍须
    用两份稳定 complete inventory 证明 exact-tag Release absence。Publisher 在该
    invocation 中只发送一次 direct REST create request。可用的成功 response 是即时
    transaction receipt：publisher 严格验证其中的 positive Release ID、exact intended

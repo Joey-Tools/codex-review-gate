@@ -2897,10 +2897,11 @@ superseded_by:
 - The corrected cross-run contract supersedes the earlier checkpoint that
   allowed the fake's known-before-apply failure to make a second total POST on
   the next invocation. The target immutable full tag is the durable one-shot
-  create fence. Only the invocation that began with that tag absent, created it
-  non-force, and read back the exact tag object and peeled commit may issue one
-  Release-create POST. If the tag pre-existed while the complete Release
-  inventory is stably absent, the later invocation emits `inconclusive` /
+  create fence. Only the invocation that began with that tag absent, obtained
+  the one exact full-tag newly-created porcelain receipt from its create-only
+  absent-ref lease push, and read back the exact tag object and peeled commit
+  may issue one Release-create POST. If the tag pre-existed while the complete
+  Release inventory is stably absent, the later invocation emits `inconclusive` /
   `release-create-attempt-unknown` and issues no POST. The producing invocation
   still uses `release-creation-unknown` when its one POST is followed by stable
   absence, and it still adopts a uniquely discovered exact draft after response
@@ -3564,6 +3565,12 @@ superseded_by:
   failure after the immutable tag is pushed must be classified as local
   preflight failure, not as an ambiguous POST outcome, because no request may
   have reached GitHub.
+- The immutable-tag create fence now requires an explicit create-only push and
+  an exact porcelain receipt containing only the full tag with newly-created
+  status `*`. A zero push exit is not creation proof because an identical tag
+  may instead be reported up to date as `=`. An `=` receipt, rejection, or
+  uncertain output therefore grants no Release POST authority and stops for
+  inspection/recovery, preserving the fence across later invocations.
 - Recovery `workflow_dispatch` adds optional
   `existing_draft_release_id`. It is a manually reviewed locator, not durable
   ledger state or publication authority. The fresh-create path rejects it. A

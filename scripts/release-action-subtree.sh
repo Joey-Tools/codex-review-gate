@@ -538,6 +538,7 @@ publisher_gh() {
 
 target_git_push() {
   local lease_arg="" origin_urls push_urls sensitive_config refspec
+  local use_porcelain=false
   local -a push_argv
   if [[ "$target_url" != "$TARGET_URL" ]] && ! is_test_environment; then
     echo "error: target Git authentication is restricted to the canonical target repository" >&2
@@ -574,14 +575,29 @@ target_git_push() {
     "refs/tags/$major_alias:refs/tags/$major_alias") ;;
     *) echo "error: target Git push refspec is outside the release allowlist" >&2; return 1 ;;
   esac
-  if [[ -n "$lease_arg" ]]; then
-    [[ -n "$major_alias" && "$refspec" == "refs/tags/$major_alias:refs/tags/$major_alias" &&
-        "$lease_arg" == "--force-with-lease=refs/tags/$major_alias:$alias_before" ]] || {
-      echo "error: target Git push lease differs from the verified floating-alias OID" >&2
+  if [[ "$refspec" == "refs/tags/$immutable_tag:refs/tags/$immutable_tag" ]]; then
+    [[ "$lease_arg" == "--force-with-lease=refs/tags/$immutable_tag:" ]] || {
+      echo "error: target Git push must require the immutable tag to be absent" >&2
       return 1
     }
+    use_porcelain=true
+  elif [[ -n "$lease_arg" ]]; then
+    if [[ -n "$major_alias" &&
+        "$refspec" == "refs/tags/$major_alias:refs/tags/$major_alias" ]]; then
+      [[ "$lease_arg" == "--force-with-lease=refs/tags/$major_alias:$alias_before" ]] || {
+        echo "error: target Git push lease differs from the verified floating-alias OID" >&2
+        return 1
+      }
+    else
+      echo "error: target Git push lease is outside the release allowlist" >&2
+      return 1
+    fi
   fi
-  if [[ -n "$lease_arg" ]]; then
+  if [[ "$use_porcelain" == true ]]; then
+    push_argv=(-c credential.helper= -c credential.useHttpPath=true -c http.extraHeader= \
+      -c http.https://github.com/.extraheader= -C "$stage_repo" push --porcelain \
+      "$lease_arg" "$target_url" "$refspec")
+  elif [[ -n "$lease_arg" ]]; then
     push_argv=(-c credential.helper= -c credential.useHttpPath=true -c http.extraHeader= \
       -c http.https://github.com/.extraheader= -C "$stage_repo" push "$lease_arg" "$target_url" "$refspec")
   else
@@ -2300,9 +2316,9 @@ if [[ -n "$major_alias" && -n "$later_same_major_stable_tag" ]]; then
 fi
 
 full_exists=false
-# Draft creation is authorized only by this invocation's fresh non-force tag
-# creation and exact readback. A tag inherited from an earlier invocation is a
-# durable fail-closed fence against repeating a possibly applied create POST.
+# Draft creation is authorized only by this invocation's fresh immutable-tag
+# create receipt and exact readback. A tag inherited from an earlier invocation
+# is a durable fail-closed fence against repeating a possibly applied create POST.
 fresh_release_create_authorized=false
 if git -C "$stage_repo" show-ref --verify --quiet "refs/tags/$immutable_tag"; then
   full_exists=true
@@ -3164,7 +3180,20 @@ if [[ "$full_exists" != true ]]; then
     exit 1
   }
   require_publication_mutation immutable-tag
-  target_git_push "refs/tags/$immutable_tag:refs/tags/$immutable_tag"
+  if ! immutable_push_output="$(target_git_push \
+      --force-with-lease="refs/tags/$immutable_tag:" \
+      "refs/tags/$immutable_tag:refs/tags/$immutable_tag")"; then
+    fail_reconcile inconclusive remote-read-inconclusive \
+      "immutable tag push failed without a confirmed immutable-tag create receipt"
+  fi
+  if ! printf '%s\n' "$immutable_push_output" | awk -F '\t' \
+      -v expected="refs/tags/$immutable_tag:refs/tags/$immutable_tag" '
+        $2 == expected { target_lines += 1; created += ($1 == "*") }
+        END { exit !(target_lines == 1 && created == 1) }
+      '; then
+    fail_reconcile inconclusive remote-state-changed \
+      "immutable tag push did not uniquely report creation of a new remote ref"
+  fi
   if ! remote_full_object="$(git ls-remote "$target_url" \
       "refs/tags/$immutable_tag" | awk 'NR == 1 {print $1}')"; then
     fail_reconcile inconclusive remote-read-inconclusive \
