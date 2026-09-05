@@ -53,15 +53,18 @@ selector.
 
 The publisher workflow is `.github/workflows/sync-action-subtree.yml`. Its
 normal trigger is a push to source `master` that changes
-`release-manifest.json`. Its recovery `workflow_dispatch` requires exactly
-three inputs:
+`release-manifest.json`. Its recovery `workflow_dispatch` has three required
+identity inputs and one optional, narrowly scoped recovery selector:
 
 - `source_sha`: the exact lowercase 40-hex commit that introduced the intended
   manifest;
 - `admission_run_id`: the positive Actions run ID of the original admitted
   `master` push; and
 - `admission_run_attempt`: the exact positive successful planning attempt that
-  persisted the admission plan.
+  persisted the admission plan; and
+- `existing_draft_release_id` (optional): the safe positive numeric ID of an
+  already-created, manually reviewed, empty mutable Draft Release for this
+  exact release intent.
 
 Before source checkout, dispatch uses the exact run-attempt and artifact REST
 identities to require the original push event, `master` head/source SHA,
@@ -74,6 +77,18 @@ persisted JSON. A dispatch with missing or mismatched identity, digest,
 manifest, history or Git recomputation is rejected before publication. A
 dispatch cannot infer admission from `source_sha` alone, freely rebuild a
 rejected admission, or substitute another run/attempt/artifact.
+
+`existing_draft_release_id` does not replace any admission or publication
+proof. It is accepted only on `workflow_dispatch`, only after the immutable
+full tag already exists, and only when one direct `GET /releases/{id}` returns
+the exact expected tag, name, body, prerelease policy, `draft=true`,
+`immutable=false`, Publisher App Bot author, and an empty asset list. The
+complete Release inventory may omit that Draft; if it does expose an exact-tag
+object, its ID must equal the supplied ID. A fresh release path rejects the
+selector. After this one adoption read, the ordinary two-read frozen-ID/full-
+tag boundaries still run before any Release mutation. The selector therefore
+cannot authorize creation, replace an object, adopt arbitrary partial state,
+or bypass fail-closed metadata and asset checks.
 
 A dispatch always executes the workflow and publisher controls from the live
 source `master` commit recorded by `github.sha`; it never checks out an old
@@ -501,15 +516,21 @@ protected write.
    at invocation start and that same invocation non-force-pushed the tag, then
    read back its exact tag object and peeled commit. Two stable complete
    inventories must still prove exact-tag Release absence before creation. The
-   publisher issues exactly one create request in that invocation, captures its
-   status without treating it as authoritative, and always takes two new stable
-   complete inventories. If they discover exactly one Release, it freezes that
-   ID and continues even when the create response was lost after GitHub applied
-   the request. Stable absence after that request is `inconclusive` /
-   `release-creation-unknown`; the invocation never retries create. If the full
-   tag already existed at invocation start while the stable complete inventory
-   has no exact-tag Release, the publisher emits `inconclusive` /
-   `release-create-attempt-unknown` without issuing any create request. Upload
+   publisher issues exactly one direct REST create request in that invocation.
+   A usable successful response is the immediate transaction receipt: the
+   publisher strictly validates its positive Release ID, exact intended
+   metadata and lifecycle state, Publisher App Bot author, and empty asset
+   inventory, then freezes that ID without a post-create list or by-ID read.
+   If the create attempt is nonzero, empty, malformed, or lacks a parseable
+   safe numeric ID, the publisher does not issue a second POST; it may use a
+   new stable complete inventory only to reconcile that ambiguous outcome. One
+   unique eligible exact empty draft freezes its ID, while stable absence is `inconclusive` /
+   `release-creation-unknown`. If the full tag already existed at invocation
+   start while the stable complete inventory has no exact-tag Release, the
+   publisher emits `inconclusive` / `release-create-attempt-unknown` without
+   issuing any create request. A manually reviewed exact Draft may instead be
+   selected on a recovery dispatch through `existing_draft_release_id` under
+   the constraints above. Upload
    release assets, canonical provenance, checksums, and
    the detached provenance signature through the numeric-ID
    `uploads.github.com/repos/{owner}/{repo}/releases/{frozen_id}/assets`
@@ -545,18 +566,22 @@ protected write.
 At either pre- or post-mutation alias boundary, an unreadable command or
 canonical raw projection is `inconclusive` / `remote-read-inconclusive`.
 
-After inventory discovery within one publisher invocation, each exact Release
-boundary is likewise raw-first A/B. It reads `/releases/{frozen_id}` twice together with two immutable
+After Release-ID discovery or strict adoption within one publisher invocation,
+each exact Release boundary is likewise raw-first A/B. It reads
+`/releases/{frozen_id}` twice together with two immutable
 full-tag `ls-remote` bindings, compares the neutral canonical observations,
 requires every response `.id` to equal the frozen path ID, and only then
 performs structural and expected-policy validation. An ID-endpoint `404` or
 other unreadable result never authorizes rebinding or recreation within that
 invocation. A later exact-source retry has no persisted Release-ID ledger: it
-performs a new full reconcile and, when the complete inventory selects one
-unique exact-tag object, freezes that ID for the new invocation. Stable absence
-does not authorize recreation when the immutable full tag existed at invocation
-start. The pre-existing tag is the durable cross-run create-attempt fence, and
-the retry stops as `release-create-attempt-unknown`. The trusted-owner boundary
+ordinarily performs a new full reconcile and, when the complete inventory
+selects one unique exact-tag object, freezes that ID for the new invocation.
+The optional manual selector is an operator-supplied recovery locator, not a
+ledger: it must be supplied again and pass the strict one-read adoption
+contract described above. Stable absence alone does not authorize recreation
+when the immutable full tag existed at invocation start. The pre-existing tag
+is the durable cross-run create-attempt fence, and an ordinary retry stops as
+`release-create-attempt-unknown`. The trusted-owner boundary
 forbids deletion or replacement between attempts; the publisher does not claim
 historical ID continuity across runs. Its closed classification is:
 
@@ -572,35 +597,61 @@ This raw-first order is intentional: validating either observation against
 expected policy before comparing A and B could disguise a stable wrong state
 as a transient read failure.
 
-Fresh draft creation is not an exception. Its expected-absence boundary reads
-complete paginated inventory A, raw full-tag binding A, complete inventory B,
-and raw full-tag binding B in that order. It compares both canonical raw pairs
-first, then validates inventory completeness and the exact-tag mapping. Stable
-zero-match is absence; a stable exact-tag match at this boundary or A/B drift
-is `inconclusive` / `remote-state-changed`. A stable exact tag claimed by
-multiple distinct IDs is `blocked_conflict` / `duplicate-release-tag`.
-Outer `[]`, malformed pages, an unsafe ID, a repeated numeric ID (including
-pagination overlap), or any unreadable page is incomplete evidence and becomes
-`inconclusive` / `remote-read-inconclusive`. Post-create discovery runs
-regardless of the create command's exit status and repeats the same two complete
-inventory/tag observations. One unique exact-tag match freezes the positive
-numeric ID and safely recovers a lost response in the same invocation. Stable
-absence is `inconclusive` / `release-creation-unknown`, because eventual
-visibility is not proof that a second create would be safe; that invocation
-stops without another create. A later invocation that starts with the immutable
-full tag already present also does not create: stable Release absence is
-`inconclusive` / `release-create-attempt-unknown`. Neither the same
-`source_sha`/admission inputs nor a new Environment approval resets this
-cross-run fence. Consequently, a crash after tag push but before create, or a
-create request that fails before GitHub visibly applies it, requires explicitly
-reviewed manual intervention; an ordinary dispatch cannot retry the create.
-Response loss remains automatically recoverable when the complete inventory
-finds one unique eligible draft. Unreadable, drifting, malformed, or duplicate
-observations retain the closed classifications above. The pre-create and
-post-create tag A/B boundaries must also match exactly. Keeping both inventory
-boundaries raw-first prevents an ambiguous create result, incomplete
-enumeration, or torn enumeration from authorizing duplicate creation or object
-selection.
+Fresh draft creation uses the same expected-absence boundary. It reads complete
+paginated inventory A, raw full-tag binding A, complete inventory B, and raw
+full-tag binding B in that order. It compares both canonical raw pairs first,
+then validates inventory completeness and the exact-tag mapping. Stable zero-
+match is absence; a stable exact-tag match at this boundary or A/B drift is
+`inconclusive` / `remote-state-changed`. A stable exact tag claimed by multiple
+distinct IDs is `blocked_conflict` / `duplicate-release-tag`. Outer `[]`,
+malformed pages, an unsafe ID, a repeated numeric ID (including pagination
+overlap), or any unreadable page is incomplete evidence and becomes
+`inconclusive` / `remote-read-inconclusive`.
+
+After that boundary, a successful direct create response is validated as the
+created object and freezes its positive numeric ID. It must carry the exact
+tag, name, body, prerelease and draft/immutable state, Publisher App Bot author,
+and zero assets. The publisher deliberately performs no immediate post-create
+list or by-ID retry: the POST response already supplies the created state and
+ID, so making success depend on a second read would add a separate visibility
+assumption without strengthening that transaction receipt.
+
+If the create attempt is nonzero, empty, malformed, or lacks a parseable safe
+numeric ID, the publisher may repeat the complete inventory/tag A/B boundary
+only as ambiguous-outcome recovery. One unique exact-tag match with zero
+assets freezes the positive numeric ID and recovers the lost response without
+another POST. Stable absence is
+`inconclusive` / `release-creation-unknown`, because eventual visibility is not
+proof that a second create would be safe. Unreadable, drifting, malformed, or
+duplicate observations retain the closed classifications above, and the pre-
+create and recovery tag boundaries must match exactly.
+
+Once a successful response carries a safe numeric ID, that response remains
+the only identity receipt for this invocation. A wrong metadata, author, or
+nonempty-asset policy does not fall back to inventory discovery; it fails
+closed. The ordinary frozen-ID boundary later verifies that the selected ID
+still resolves to the same Draft before any Release mutation, and an unreadable
+or mismatched ID never rebinds to an inventory object.
+
+A later invocation that starts with the immutable full tag already present
+also does not create. Without a selector, stable Release absence is
+`inconclusive` / `release-create-attempt-unknown`. Once an operator has
+independently reviewed an exact empty Draft and obtained its numeric ID, an
+exact-source `workflow_dispatch` may supply `existing_draft_release_id`. The
+publisher performs one direct adoption read and accepts inventory omission,
+but rejects a wrong ID, any visible exact-tag ID disagreement, nonempty assets,
+published or immutable state, wrong metadata, or the wrong author. It then
+uses the ordinary frozen-ID/full-tag A/B boundaries before upload or publish.
+Neither this recovery nor a new Environment approval authorizes a second
+create, deletion, replacement, or a different release intent.
+
+For `release-creation-unknown` or `release-create-attempt-unknown`, the failure
+summary tells the operator or agent to confirm whether the exact empty Draft
+exists and, only when its ID and fields have been reviewed, rerun the original
+admitted source with the three required identity inputs plus
+`existing_draft_release_id`, then obtain a new Environment approval. If no such
+Draft can be confirmed, recovery remains stopped rather than guessing,
+force-creating, recreating, or issuing another POST.
 
 This distinction is required by GitHub's interfaces. The REST
 [release-by-tag endpoint](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10#get-a-release-by-tag-name)
@@ -807,7 +858,10 @@ A completed exact step is verified and reused; an absent next step may resume
 only when that mutation's contract authorizes it. Draft Release creation is the
 exception: once the immutable full tag exists across invocations, stable
 Release absence returns `release-create-attempt-unknown` and requires an
-explicitly reviewed manual recovery rather than another ordinary dispatch.
+explicitly reviewed manual recovery. When that review finds the exact empty
+Draft, the operator supplies its numeric ID through
+`existing_draft_release_id`; otherwise recovery stays stopped rather than
+running another ordinary create attempt.
 A conflicting tag, commit, signature, Release asset, unexpected target advance,
 or unknown state fails closed with a specific recovery summary. The publisher
 never deletes or rewrites an immutable full tag or Release, force-pushes
@@ -818,11 +872,11 @@ Each attempt's immutable plan binds the frozen release intent and the current
 protected control commit and complete control-file digests used for that
 attempt. If a short-lived candidate, assembled-candidate, or publication-plan
 artifact expires or becomes unavailable while the original 90-day push-plan
-admission remains valid, the exact three-input dispatch may authenticate that
-persisted admission, independently rematerialize both candidates under the
-then-current protected controls, construct a fresh plan and publication plan,
-and obtain Environment approval again. The new run must still classify and
-reconcile every remote object before writing. It may resume only an exact valid
+admission remains valid, the three required identity inputs may authenticate
+that persisted admission, independently rematerialize both candidates under
+the then-current protected controls, construct a fresh plan and publication
+plan, and obtain Environment approval again. The new run must still classify
+and reconcile every remote object before writing. It may resume only an exact valid
 prefix; otherwise it stops with `blocked_conflict` or `inconclusive`. If the
 original push-plan admission expires or is unavailable, recovery fails closed
 and requires a new reviewed release intent rather than reconstructing admission

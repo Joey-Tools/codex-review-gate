@@ -54,6 +54,9 @@ const expectedSuites = [
   ["release 3/4", "3/4"],
   ["release 4/4", "4/4"],
 ];
+const expectedReleaseSynchronousTestCalls = 90;
+const expectedReleaseRegistrationCount = 143;
+const expectedReleaseShardDistribution = [36, 36, 36, 35];
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -268,7 +271,10 @@ function assertReleaseRegistrationContract(source) {
       "u",
     ),
   );
-  assert.equal([...source.matchAll(/^\s*test\(/gmu)].length, 81);
+  assert.equal(
+    [...source.matchAll(/^\s*test\(/gmu)].length,
+    expectedReleaseSynchronousTestCalls,
+  );
   assert.doesNotMatch(
     source,
     /\b(?:describe|it|suite)\s*(?:\(|\.|\[)|\b(?:nodeTest|test)\s*(?:\.(?:only|skip|todo)|\[)|\bt\.test\s*\(|\b(?:only|skip|todo)\s*:/mu,
@@ -281,12 +287,24 @@ function assertReleaseRegistrationContract(source) {
   );
   assert.match(
     source,
-    /assert\.equal\(\s*test\.registeredCount,\s*133,\s*"release pipeline shard registration inventory drift",?\s*\)/u,
+    new RegExp(
+      `assert\\.equal\\(\\s*test\\.registeredCount,\\s*${expectedReleaseRegistrationCount},`
+        + '\\s*"release pipeline shard registration inventory drift",?\\s*\\)',
+      "u",
+    ),
   );
 }
 
 test("release test shards partition every ordinal exactly once", () => {
   const shards = ["1/4", "2/4", "3/4", "4/4"].map(parseTestShard);
+  assert.deepEqual(
+    shards.map((shard) => (
+      Array.from({ length: expectedReleaseRegistrationCount }, (_, ordinal) => ordinal)
+        .filter((ordinal) => testShardSelects(shard, ordinal))
+        .length
+    )),
+    expectedReleaseShardDistribution,
+  );
   for (let ordinal = 0; ordinal < 257; ordinal += 1) {
     assert.equal(
       shards.filter((shard) => testShardSelects(shard, ordinal)).length,
