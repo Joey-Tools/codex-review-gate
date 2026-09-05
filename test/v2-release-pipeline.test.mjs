@@ -1232,6 +1232,8 @@ if (args[0] === "api") {
   );
   if (requestedMethod === "POST" &&
       endpoint === "repos/JoeyTeng/codex-review-gate-action/releases") {
+    state.release_create_calls += 1;
+    save(state);
     requireCurrentApiVersion();
     if (!args.includes("Accept: application/vnd.github+json") ||
         !args.includes("Content-Type: application/json")) {
@@ -1260,9 +1262,7 @@ if (args[0] === "api") {
       process.stderr.write("Release create payload is not the exact frozen Draft contract\\n");
       process.exit(2);
     }
-    state.release_create_calls += 1;
     if (phase === "release-create-failure-before-apply") {
-      save(state);
       process.stderr.write("simulated Release create failure before apply\\n");
       process.exit(1);
     }
@@ -1293,7 +1293,7 @@ if (args[0] === "api") {
       process.exit(1);
     }
     if (phase === "release-create-zero-exit-empty-response") process.exit(0);
-    if (phase === "release-create-zero-exit-malformed-response") {
+    if (phase.startsWith("release-create-zero-exit-malformed-response")) {
       process.stdout.write("{malformed-json\\n");
       process.exit(0);
     }
@@ -1347,7 +1347,8 @@ if (args[0] === "api") {
         storage_name: replacementStorageName,
       });
     }
-    if (phase === "asset-upload-502-starter" && state.asset_upload_calls === 0) {
+    if (["asset-upload-502-starter", "asset-upload-502-starter-list-hidden"].includes(phase) &&
+        state.asset_upload_calls === 0) {
       writeFileSync(join(assetsDir, name), Buffer.alloc(0));
       const id = state.next_asset_id++;
       state.assets.push({ name, id, release_id: targetReleaseId, state: "starter", size: 0 });
@@ -1363,7 +1364,10 @@ if (args[0] === "api") {
     state.asset_upload_calls += 1;
     state.asset_upload_target_release_ids.push(targetReleaseId);
     save(state);
-    if (phase === "asset-upload-response-lost-after-apply") {
+    if ([
+      "asset-upload-response-lost-after-apply",
+      "asset-upload-response-lost-after-apply-list-hidden",
+    ].includes(phase)) {
       process.stderr.write("simulated asset upload response loss after apply\\n");
       process.exit(1);
     }
@@ -1674,11 +1678,12 @@ if (args[0] === "api") {
     }
     if (state.exists && state.release_create_calls > 0) {
       state.post_create_inventory_reads += 1;
-      if (phase.startsWith("post-create-inventory-") &&
+      if ((phase.startsWith("post-create-inventory-") ||
+          phase.includes("-post-create-inventory-")) &&
           state.post_create_inventory_reads === 2) {
-        if (phase === "post-create-inventory-id-drift") {
+        if (phase.endsWith("post-create-inventory-id-drift")) {
           state.release_id += 1;
-        } else if (phase === "post-create-inventory-release-disappears") {
+        } else if (phase.endsWith("post-create-inventory-release-disappears")) {
           state.exists = false;
         }
       }
@@ -1687,6 +1692,8 @@ if (args[0] === "api") {
     if (state.exists && state.draft &&
         (phase === "release-create-response-lost-after-apply-list-hidden" ||
           phase === "release-create-success-list-hidden" ||
+          phase === "asset-upload-response-lost-after-apply-list-hidden" ||
+          phase === "asset-upload-502-starter-list-hidden" ||
           phase === "release-inventory-draft-hidden" ||
           phase.startsWith("manual-draft-response-"))) {
       process.stdout.write("[[]]\\n");
@@ -1818,7 +1825,7 @@ if (args[0] === "api") {
     } else if (phase === "manual-draft-response-published") {
       response.draft = false;
       response.immutable = true;
-    } else if (phase === "manual-draft-response-nonempty-assets") {
+    } else if (phase === "manual-draft-response-unknown-asset") {
       writeFileSync(join(assetsDir, "unexpected.txt"), "unexpected\\n");
       response.assets = [assetRecord(state, "unexpected.txt", 999999)];
     }
@@ -3105,11 +3112,11 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.match(
     publisher,
-    /existing_draft_release_id[\s\S]*repos\/\$TARGET_REPOSITORY\/releases\/\$existing_draft_release_id[\s\S]*snapshot-release-boundary[\s\S]*existing_draft_release_id is not an empty Draft Release/u,
+    /existing_draft_release_id[\s\S]*repos\/\$TARGET_REPOSITORY\/releases\/\$existing_draft_release_id[\s\S]*snapshot-release-boundary[\s\S]*--allow-starter true[\s\S]*existing_draft_release_id is not the exact Publisher App Draft Release/u,
   );
   assert.match(
     releaseReconcile,
-    /\$adopted\.release == \$boundary\.release and[\s\S]*\$adopted\.assets == \$boundary\.assets[\s\S]*manually adopted empty Draft Release changed/u,
+    /\$adopted\.release == \$boundary\.release and[\s\S]*\$adopted\.assets == \$boundary\.assets[\s\S]*manually adopted Draft Release changed/u,
   );
   assert.match(workflow, /outputs:[\s\S]*reconcile_state: \$\{\{ steps\.reconcile\.outputs\.reconcile_state \}\}[\s\S]*id: reconcile/u);
   assert.match(workflow, /verify:[\s\S]*if: \$\{\{ needs\.publish\.outputs\.reconcile_state != 'superseded' \}\}/u);
@@ -3129,17 +3136,32 @@ test("fresh Draft request is frozen before every durable target write", (t) => {
   const payloadStart = publisher.indexOf(
     '  fresh_create_payload="$temporary_root/release-create-request.json"',
   );
+  const responseStart = publisher.indexOf(
+    '  fresh_create_response="$temporary_root/release-create-response.json"',
+    payloadStart,
+  );
+  const errorStart = publisher.indexOf(
+    '  fresh_create_error="$temporary_root/release-create-response.err"',
+    responseStart,
+  );
   const payloadMaterialization = publisher.indexOf("  if ! jq -cn", payloadStart);
   const payloadValidation = publisher.indexOf("  if ! jq -e", payloadMaterialization);
-  const needMaster = publisher.indexOf("\nneed_master=false", payloadValidation);
+  const sinkPreparation = publisher.indexOf(
+    '  if ! exec 8> "$fresh_create_response" || ! exec 9> "$fresh_create_error"',
+    payloadValidation,
+  );
+  const needMaster = publisher.indexOf("\nneed_master=false", sinkPreparation);
   const firstTargetPush = publisher.indexOf("  target_git_push ", needMaster);
   assert.ok(
     payloadStart !== -1 &&
-      payloadStart < payloadMaterialization &&
+      payloadStart < responseStart &&
+      responseStart < errorStart &&
+      errorStart < payloadMaterialization &&
       payloadMaterialization < payloadValidation &&
-      payloadValidation < needMaster &&
+      payloadValidation < sinkPreparation &&
+      sinkPreparation < needMaster &&
       needMaster < firstTargetPush,
-    "the exact Draft request must be materialized and validated before master/tag writes",
+    "the exact Draft request and response sinks must be prepared before master/tag writes",
   );
   const releaseReconcile = publisher.slice(publisher.indexOf("reconcile_github_release() {"));
   const reuseStart = releaseReconcile.indexOf(
@@ -3149,58 +3171,83 @@ test("fresh Draft request is frozen before every durable target write", (t) => {
   assert.ok(reuseStart !== -1 && reuseStart < createPost, "missing frozen create-payload reuse");
   const createSetup = releaseReconcile.slice(reuseStart, createPost);
   assert.match(createSetup, /create_payload="\$fresh_create_payload"/u);
+  assert.match(createSetup, /create_response="\$fresh_create_response"/u);
+  assert.match(createSetup, /create_error="\$fresh_create_error"/u);
+  assert.match(createSetup, /"\$fresh_create_sinks_open" == true/u);
+  assert.match(createSetup, /if ! : >&8 2>&9/u);
   assert.doesNotMatch(
     createSetup,
-    /jq -cn/u,
-    "the post-tag reconcile path must not reconstruct the Draft request",
+    /jq -cn|exec [89]>/u,
+    "the post-tag reconcile path must not reconstruct the request or response sinks",
   );
 
-  const state = fixture(t);
-  const built = buildAssembledCandidate(state, { label: "fresh-create-payload-preflight-failure" });
-  const githubEnvironment = fakeGithubEnvironment(
-    state,
-    "fresh-create-payload-preflight-failure",
-  );
-  const fakeBin = join(state.root, "fresh-create-payload-preflight-bin");
-  const fakeJq = join(fakeBin, "jq");
-  mkdirSync(fakeBin);
-  write(fakeJq, `#!/bin/sh
+  const realJq = run("which", ["jq"]);
+  for (const failureMode of ["materialize", "validate"]) {
+    const label = `fresh-create-${failureMode}-preflight-failure`;
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label });
+    const githubEnvironment = fakeGithubEnvironment(state, label);
+    const fakeBin = join(state.root, `${label}-bin`);
+    const fakeJq = join(fakeBin, "jq");
+    mkdirSync(fakeBin);
+    write(fakeJq, `#!/bin/sh
 set -eu
+case "$FAKE_JQ_FAILURE_MODE" in
+  materialize)
+    expected='{tag_name:$tag,name:$name,body:$body,draft:true,prerelease:$prerelease}'
+    ;;
+  validate)
+    expected='type == "object" and . == {tag_name:$tag,name:$name,body:$body,draft:true,prerelease:$prerelease}'
+    ;;
+  *)
+    exit 87
+    ;;
+esac
 for argument in "$@"; do
-  if [ "$argument" = '{tag_name:$tag,name:$name,body:$body,draft:true,prerelease:$prerelease}' ]; then
+  if [ "$argument" = "$expected" ]; then
     printf '%s\\n' 'simulated frozen Draft request failure' >&2
     exit 86
   fi
 done
 exec "$REAL_JQ" "$@"
 `);
-  chmodSync(fakeJq, 0o755);
-  const result = invokePublish(state, built, {
-    testRelease: false,
-    env: {
-      ...githubEnvironment,
-      PATH: `${fakeBin}:${githubEnvironment.PATH}`,
-      REAL_JQ: run("which", ["jq"]),
-    },
-  });
+    chmodSync(fakeJq, 0o755);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: {
+        ...githubEnvironment,
+        FAKE_JQ_FAILURE_MODE: failureMode,
+        PATH: `${fakeBin}:${githubEnvironment.PATH}`,
+        REAL_JQ: realJq,
+      },
+    });
 
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /reconcile_state=inconclusive/u);
-  assert.match(result.stderr, /recovery_code=publication-input-preflight/u);
-  assert.match(result.stderr, /frozen draft-create request could not be materialized/u);
-  assert.equal(git(state.target, ["rev-parse", "refs/heads/master"]), state.initialTarget);
-  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
-  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
-  const fakeState = JSON.parse(readFileSync(
-    join(state.root, "fake-gh-state-fresh-create-payload-preflight-failure", "state.json"),
-    "utf8",
-  ));
-  assert.equal(fakeState.release_create_calls, 0);
-  assert.equal(
-    fakeState.call_trace.some(({ kind }) => kind === "release-create"),
-    false,
-    "preflight failure must happen before REST create",
-  );
+    assert.notEqual(result.status, 0, failureMode);
+    assert.match(result.stderr, /reconcile_state=inconclusive/u, failureMode);
+    assert.match(result.stderr, /recovery_code=publication-input-preflight/u, failureMode);
+    assert.match(
+      result.stderr,
+      /frozen draft-create request (?:could not be materialized|failed exact policy validation)/u,
+      failureMode,
+    );
+    assert.equal(
+      git(state.target, ["rev-parse", "refs/heads/master"]),
+      state.initialTarget,
+      failureMode,
+    );
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2.0.0"]));
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${label}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.release_create_calls, 0, failureMode);
+    assert.equal(
+      fakeState.call_trace.some(({ kind }) => kind === "release-create"),
+      false,
+      `${failureMode} failure must happen before REST create`,
+    );
+  }
 });
 
 test("malformed publish invocations still emit exactly one closed state and recovery code", (t) => {
@@ -4397,6 +4444,28 @@ test("fake GitHub distinguishes API and release-view missing diagnostics", (t) =
   assert.doesNotMatch(view.stderr, /HTTP 404/u);
 
   const fakeStatePath = join(env.FAKE_GH_STATE, "state.json");
+  const invalidCreateInput = join(state.root, "invalid-release-create.json");
+  writeJson(invalidCreateInput, { draft: true });
+  const invalidCreate = invoke("gh", [
+    "api",
+    "--method",
+    "POST",
+    "--header",
+    "Accept: application/vnd.github+json",
+    "--header",
+    "Content-Type: application/json",
+    "--header",
+    "X-GitHub-Api-Version: 2026-03-10",
+    "--input",
+    invalidCreateInput,
+    "repos/JoeyTeng/codex-review-gate-action/releases",
+  ], { env });
+  assert.equal(invalidCreate.status, 2);
+  assert.match(invalidCreate.stderr, /exact frozen Draft contract/u);
+  const invalidCreateState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(invalidCreateState.release_create_calls, 1);
+  assert.equal(invalidCreateState.exists, false);
+
   const draftState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
   draftState.exists = true;
   draftState.body = "Signed draft fixture.";
@@ -4664,7 +4733,7 @@ test("a manually adopted Draft must remain unchanged through its first numeric-I
   assert.notEqual(changed.status, 0);
   assert.match(changed.stderr, /reconcile_state=inconclusive/u);
   assert.match(changed.stderr, /recovery_code=remote-state-changed/u);
-  assert.match(changed.stderr, /manually adopted empty Draft Release changed/u);
+  assert.match(changed.stderr, /manually adopted Draft Release changed/u);
   const changedState = JSON.parse(readFileSync(statePath, "utf8"));
   assert.equal(changedState.release_create_calls, 1);
   assert.equal(changedState.asset_upload_calls, 0);
@@ -4694,6 +4763,13 @@ test("existingDraftReleaseId rejects every non-exact direct-ID selection", (t) =
   );
   const interruptedState = JSON.parse(readFileSync(statePath, "utf8"));
   for (const selectorCase of [
+    {
+      label: "visible inventory selects a different numeric ID",
+      id: interruptedState.release_id + 1,
+      phase: "manual-draft-visible-inventory",
+      state: "blocked_conflict",
+      recoveryCode: "immutable-release-mismatch",
+    },
     {
       label: "missing numeric ID",
       id: interruptedState.release_id + 1,
@@ -4730,9 +4806,9 @@ test("existingDraftReleaseId rejects every non-exact direct-ID selection", (t) =
       recoveryCode: "immutable-release-mismatch",
     },
     {
-      label: "nonempty Draft",
+      label: "Draft with an unknown asset",
       id: interruptedState.release_id,
-      phase: "manual-draft-response-nonempty-assets",
+      phase: "manual-draft-response-unknown-asset",
       state: "blocked_conflict",
       recoveryCode: "immutable-release-mismatch",
     },
@@ -4875,6 +4951,34 @@ for (const unusableCreateResponse of [
     assert.equal(fakeState.draft, false);
     assert.equal(fakeState.immutable, true);
     assert.ok(git(state.target, ["rev-parse", "refs/tags/v2"]));
+  });
+}
+
+for (const ambiguousCreateInventoryDrift of [
+  "release-create-zero-exit-malformed-response-post-create-inventory-id-drift",
+  "release-create-zero-exit-malformed-response-post-create-inventory-release-disappears",
+]) {
+  test(`${ambiguousCreateInventoryDrift} never mutates the unstable Draft`, (t) => {
+    const state = fixture(t);
+    const built = buildAssembledCandidate(state, { label: ambiguousCreateInventoryDrift });
+    const githubEnvironment = fakeGithubEnvironment(state, ambiguousCreateInventoryDrift);
+    const result = invokePublish(state, built, {
+      testRelease: false,
+      env: githubEnvironment,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconcile_state=inconclusive/u);
+    assert.match(result.stderr, /recovery_code=remote-state-changed/u);
+    const fakeState = JSON.parse(readFileSync(
+      join(state.root, `fake-gh-state-${ambiguousCreateInventoryDrift}`, "state.json"),
+      "utf8",
+    ));
+    assert.equal(fakeState.release_create_calls, 1, "ambiguous recovery must never retry POST");
+    assert.equal(fakeState.post_create_inventory_reads, 2);
+    assert.equal(fakeState.asset_upload_calls, 0);
+    assert.equal(fakeState.publish_patch_calls, 0);
+    assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
   });
 }
 
@@ -5343,9 +5447,91 @@ test("asset uploads keep the frozen Release id when tag resolution is replaced",
   assert.equal(finalFakeState.asset_readback_release_ids.at(-1), fakeState.release_id);
 });
 
+test("a list-hidden starter asset is safely recovered through the same manual Release id", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "manual-list-hidden-starter-recovery" });
+  const githubEnvironment = fakeGithubEnvironment(
+    state,
+    "release-create-response-lost-after-apply-list-hidden",
+  );
+  const createdWithoutResponse = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+  assert.notEqual(createdWithoutResponse.status, 0);
+  assert.match(createdWithoutResponse.stderr, /recovery_code=release-creation-unknown/u);
+
+  const statePath = join(
+    state.root,
+    "fake-gh-state-release-create-response-lost-after-apply-list-hidden",
+    "state.json",
+  );
+  const emptyDraft = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(emptyDraft.release_create_calls, 1);
+  assert.deepEqual(emptyDraft.assets, []);
+
+  const interruptedUpload = invokePublish(state, built, {
+    testRelease: false,
+    existingDraftReleaseId: emptyDraft.release_id,
+    env: {
+      ...githubEnvironment,
+      FAKE_GH_MUTATION_PHASE: "asset-upload-502-starter-list-hidden",
+    },
+  });
+  assert.notEqual(interruptedUpload.status, 0);
+  assert.match(interruptedUpload.stderr, /reconcile_state=inconclusive/u);
+  assert.match(interruptedUpload.stderr, /recovery_code=release-asset-upload-unknown/u);
+  const starterDraft = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(starterDraft.release_create_calls, 1);
+  assert.equal(starterDraft.asset_upload_calls, 1);
+  assert.deepEqual(
+    starterDraft.assets.map(({ name, state: assetState, size }) => ({
+      name,
+      state: assetState,
+      size,
+    })),
+    [{
+      name: "codex-review-gate-action-v2.0.0.tar.gz",
+      state: "starter",
+      size: 0,
+    }],
+  );
+  const starterAssetId = starterDraft.assets[0].id;
+
+  const recovered = invokePublish(state, built, {
+    testRelease: false,
+    existingDraftReleaseId: starterDraft.release_id,
+    env: {
+      ...githubEnvironment,
+      FAKE_GH_MUTATION_PHASE: "release-inventory-draft-hidden",
+    },
+  });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /reconcile_state=resumable_partial/u);
+  const recoveredState = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(recoveredState.release_create_calls, 1, "starter recovery must not create again");
+  assert.equal(recoveredState.asset_delete_attempts, 1);
+  assert.equal(recoveredState.asset_delete_applied, 1);
+  assert.deepEqual(recoveredState.asset_delete_ids, [starterAssetId]);
+  assert.equal(recoveredState.asset_upload_calls, 4);
+  assert.deepEqual(
+    recoveredState.assets.map(({ name }) => name).sort(),
+    [
+      "codex-review-gate-action-v2.0.0.tar.gz",
+      "release-provenance.json",
+      "release-provenance.json.asc",
+    ],
+  );
+  assert.equal(new Set(recoveredState.assets.map(({ name }) => name)).size, 3);
+  assert.ok(recoveredState.assets.every(({ state: assetState }) => assetState !== "starter"));
+  assert.equal(recoveredState.draft, false);
+  assert.equal(recoveredState.immutable, true);
+});
+
 for (const uploadFailure of [
   { phase: "asset-upload-failure-before-apply", appliedAssets: 0 },
   { phase: "asset-upload-response-lost-after-apply", appliedAssets: 1 },
+  { phase: "asset-upload-response-lost-after-apply-list-hidden", appliedAssets: 1 },
   { phase: "asset-upload-zero-exit-empty-response", appliedAssets: 1 },
   { phase: "asset-upload-zero-exit-malformed-response", appliedAssets: 1 },
   { phase: "asset-upload-zero-exit-wrong-id-response", appliedAssets: 1 },
@@ -5373,13 +5559,25 @@ for (const uploadFailure of [
     assert.equal(fakeState.draft, true);
     assert.equal(fakeState.immutable, false);
     assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
-    if (uploadFailure.phase === "asset-upload-response-lost-after-apply") {
+    if ([
+      "asset-upload-response-lost-after-apply",
+      "asset-upload-response-lost-after-apply-list-hidden",
+    ].includes(uploadFailure.phase)) {
+      assert.deepEqual(
+        fakeState.assets.map(({ name }) => name),
+        ["codex-review-gate-action-v2.0.0.tar.gz"],
+        "the interrupted Draft must contain exactly the first canonical asset prefix",
+      );
       const selectedReleaseId = fakeState.release_id;
+      const listHidden = uploadFailure.phase.endsWith("-list-hidden");
       const recovered = invokePublish(state, built, {
         testRelease: false,
+        ...(listHidden ? { existingDraftReleaseId: selectedReleaseId } : {}),
         env: {
           ...githubEnvironment,
-          FAKE_GH_MUTATION_PHASE: "asset-upload-exact-source-retry",
+          FAKE_GH_MUTATION_PHASE: listHidden
+            ? "release-inventory-draft-hidden"
+            : "asset-upload-exact-source-retry",
         },
       });
       assert.equal(recovered.status, 0, recovered.stderr);
@@ -5389,13 +5587,21 @@ for (const uploadFailure of [
         "utf8",
       ));
       assert.equal(recoveredState.release_id, selectedReleaseId);
-      assert.equal(recoveredState.release_create_calls, 1);
+      assert.equal(recoveredState.release_create_calls, 1, "recovery must not create a second Draft");
       assert.equal(recoveredState.asset_upload_calls, 3);
+      assert.deepEqual(
+        recoveredState.assets.map(({ name }) => name).sort(),
+        [
+          "codex-review-gate-action-v2.0.0.tar.gz",
+          "release-provenance.json",
+          "release-provenance.json.asc",
+        ],
+      );
       assert.equal(
         recoveredState.assets.filter(({ name }) =>
           name === "codex-review-gate-action-v2.0.0.tar.gz").length,
         1,
-        "the exact-source retry must adopt the already-applied asset",
+        "the exact-source retry must adopt the already-applied canonical prefix",
       );
       assert.equal(
         recoveredState.call_trace.some(
@@ -6777,6 +6983,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  143,
+  147,
   "release pipeline shard registration inventory drift",
 );

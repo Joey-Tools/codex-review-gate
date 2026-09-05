@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       existing_draft_release_id:
-        description: Optional manually reviewed empty Draft Release ID to resume without draft-list discovery.
+        description: Optional manually reviewed recoverable Draft Release ID to resume without draft-list discovery.
         required: false
         type: string
 
@@ -978,10 +978,12 @@ jobs:
           `source_sha`, `admission_run_id`, and `admission_run_attempt` with
           `existing_draft_release_id` set to its numeric ID. The publisher
           accepts that selector only for the exact Publisher-App-authored,
-          empty, mutable Draft matching this release intent; it never creates,
-          replaces, or adopts an arbitrary partial Release. The new run still
-          requires a fresh Environment approval. Without that evidence, leave
-          recovery stopped or wait for the unique Draft to become visible.
+          mutable Draft matching this release intent with either no assets or a
+          byte-verified canonical uploaded prefix and at most one known
+          zero-byte starter; it never creates, replaces, or adopts an arbitrary
+          partial Release. The new run still requires a fresh Environment
+          approval. Without that evidence, leave recovery stopped or wait for
+          the unique Draft to become visible.
           SUMMARY
 
   verify:

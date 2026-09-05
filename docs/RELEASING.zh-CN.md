@@ -55,7 +55,8 @@ recovery selector：
 - `admission_run_attempt`：持久化 admission plan 的 exact positive successful planning
   attempt；
 - `existing_draft_release_id`（optional）：与本次 exact release intent 对应、已经人工
-  review 的既有 empty mutable Draft Release 的 safe positive numeric ID。
+  review 的既有可恢复 Draft Release（empty Draft，或经过机器验证的 canonical uploaded
+  prefix 且至多有一个已知 zero-byte starter asset）的 safe positive numeric ID。
 
 Source checkout 前，dispatch 先通过 exact run-attempt 与 artifact REST identities，要求
 原事件为 push、head branch/source SHA、workflow path 与 attempt 都精确匹配。随后要求该
@@ -69,11 +70,13 @@ persisted JSON 完全一致。Identity、digest、manifest、history 或 Git rec
 `existing_draft_release_id` 不替代任何 admission 或 publication proof。它只允许在
 `workflow_dispatch` 中使用，且 immutable full tag 必须已经存在；一次 direct
 `GET /releases/{id}` 必须返回 exact expected tag、name、body、prerelease policy、
-`draft=true`、`immutable=false`、Publisher App Bot author 与 empty asset list。
-Complete Release inventory 可以漏掉该 Draft；但如果 inventory 暴露 exact-tag object，
-其 ID 必须等于 supplied ID。Fresh release path 会拒绝该 selector。完成这一次 adoption
-read 后，任何 Release mutation 前仍执行普通的两次 frozen-ID/full-tag boundary。
-因此该 selector 不能授权 create、替换对象、采用 arbitrary partial state，也不能绕过
+`draft=true`、`immutable=false` 与 Publisher App Bot author。任何 target write 前，普通
+existing-Release verifier 还只会接受无 assets，或者其 frozen asset ID 能下载并与 exact
+candidate bytes 一致的 canonical uploaded prefix，外加最多一个 expected zero-byte
+Publisher-App starter asset。Complete Release inventory 可以漏掉该 Draft；但如果 inventory
+暴露 exact-tag object，其 ID 必须等于 supplied ID。Fresh release path 会拒绝该 selector。
+完成这一次 adoption read 后，任何 Release mutation 前仍执行普通的两次 frozen-ID/full-tag
+boundary。因此该 selector 不能授权 create、替换对象、采用 arbitrary partial state，也不能绕过
 fail-closed metadata 与 asset checks。
 
 Dispatch 始终执行触发时 `github.sha` 所记录的 live source `master` workflow 与
@@ -444,7 +447,7 @@ protected write 前 fail closed。
    归为 `inconclusive` / `release-creation-unknown`。若 invocation 开始时 full tag 已
    存在，而稳定 complete inventory 中没有 exact-tag Release，则 publisher 返回
    `inconclusive` / `release-create-attempt-unknown`，且不发送任何 create request。
-   已人工 review 的 exact Draft 可以在 recovery dispatch 中按上述限制通过
+   已人工 review 的 exact 可恢复 Draft 可以在 recovery dispatch 中按上述限制通过
    `existing_draft_release_id` 选择。随后向
    已选择的对象上传 release assets、canonical
    provenance、checksums 与 detached provenance signature，但只能使用 numeric-ID
@@ -533,18 +536,19 @@ receipt。metadata、author 或 nonempty-assets policy 不匹配时不得回退�
 
 后续 invocation 若在启动时已经存在 immutable full tag，同样不会 create。没有 selector
 时，稳定 Release absence 归为 `inconclusive` / `release-create-attempt-unknown`。Operator
-独立 review exact empty Draft 并取得其 numeric ID 后，exact-source `workflow_dispatch`
+独立 review exact 可恢复 Draft 并取得其 numeric ID 后，exact-source `workflow_dispatch`
 可以提供 `existing_draft_release_id`。Publisher 只执行一次 direct adoption read，允许
 inventory 漏掉该 Draft，但会拒绝 wrong ID、任何 visible exact-tag ID disagreement、
-nonempty assets、published/immutable state、wrong metadata 或 wrong author。随后仍须在
-upload 或 publish 前执行普通 frozen-ID/full-tag A/B boundaries。该 recovery 与新的
-Environment approval 都不授权第二次 create、删除、替换或不同 release intent。
+published/immutable state、wrong metadata/author、unknown assets、noncanonical uploaded
+prefix 或 invalid starter。随后仍须在 upload 或 publish 前执行普通 frozen-ID/full-tag A/B
+boundaries。该 recovery 与新的 Environment approval 都不授权第二次 create、删除、替换或
+不同 release intent。
 
 遇到 `release-creation-unknown` 或 `release-create-attempt-unknown` 时，failure summary
-会提示 operator/agent 确认 exact empty Draft 是否存在；只有 ID 与 fields 都已经 review，
-才可以带三个 required identity inputs 与 `existing_draft_release_id` 对原 admitted source
-再次 dispatch，并重新取得 Environment approval。若无法确认这样的 Draft，recovery 必须
-保持停止，不得猜测、force-create、recreate 或再次 POST。
+会提示 operator/agent 确认 exact 可恢复 Draft 是否存在；只有 ID、fields 与任何 partial
+assets 都已经 review，才可以带三个 required identity inputs 与 `existing_draft_release_id`
+对原 admitted source 再次 dispatch，并重新取得 Environment approval。若无法确认这样的
+Draft，recovery 必须保持停止，不得猜测、force-create、recreate 或再次 POST。
 
 GitHub 的接口语义要求做出这个区分。REST
 [release-by-tag endpoint](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10#get-a-release-by-tag-name)
@@ -717,7 +721,7 @@ A/B 比较再解释 policy。Reconcile 下载 asset 本身就可能改变 downlo
 Exact 已完成步骤经过验证后沿用；缺失的下一步只有在该 mutation contract 允许时才能
 恢复。Draft Release creation 是例外：一旦 immutable full tag 跨 invocation 已存在，稳定
 Release absence 就返回 `release-create-attempt-unknown`，并要求经过明确 review 的人工
-恢复。若 review 找到 exact empty Draft，operator 通过 `existing_draft_release_id` 提供其
+恢复。若 review 找到 exact 可恢复 Draft，operator 通过 `existing_draft_release_id` 提供其
 numeric ID；否则 recovery 保持停止，不得再次运行普通 create attempt。Conflicting tag、
 commit、
 signature、Release asset、意外 target advance 或 unknown state 都应 fail closed，

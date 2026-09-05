@@ -3558,25 +3558,40 @@ superseded_by:
     local request-preparation failure happened only after that tag was pushed,
     an ordinary retry would be forbidden from issuing the first create request
     and could leave the new tag stranded without a Draft Release.
+- The same pre-write liveness invariant includes opening the create response
+  and error sinks before the first target write and retaining those file
+  descriptors through the one allowed POST. A response-redirection setup
+  failure after the immutable tag is pushed must be classified as local
+  preflight failure, not as an ambiguous POST outcome, because no request may
+  have reached GitHub.
 - Recovery `workflow_dispatch` adds optional
   `existing_draft_release_id`. It is a manually reviewed locator, not durable
   ledger state or publication authority. The fresh-create path rejects it. A
   recovery run uses one direct ID read to admit only an exact Publisher-App-
-  authored, empty, mutable Draft with the planned metadata; the Release list
-  may omit it, but any visible exact-tag inventory match must have the same ID.
-  The existing frozen-ID/full-tag A/B boundary still runs before upload or
-  publication. The selector never authorizes create, delete, replacement, or a
-  different release intent.
+  authored, mutable Draft with the planned metadata and either no assets or a
+  machine-verified canonical uploaded prefix with at most one expected
+  zero-byte Publisher-App starter. The Release list may omit it, but any
+  visible exact-tag inventory match must have the same ID. The existing
+  frozen-ID/full-tag A/B boundary still runs before upload or publication. The
+  selector never authorizes create, delete, replacement, or a different release
+  intent.
   - This supersedes only the earlier conclusion that recovery needs no workflow
     input. It does not supersede the immutable full-tag one-shot create fence:
     an ordinary retry without the selector still stops at
     `release-create-attempt-unknown`.
 - Failure summaries for `release-creation-unknown` and
   `release-create-attempt-unknown` direct the operator or agent to confirm the
-  exact empty Draft, then supply its reviewed ID together with all three
+  exact recoverable Draft, then supply its reviewed ID together with all three
   required identity inputs on the original admitted-source dispatch and obtain
   a new Environment approval. Without that evidence, recovery remains stopped;
   it never force-creates or recreates the Release.
+- Post-review correctness correction: an empty-only selector leaves a
+  list-hidden Draft permanently unrecoverable if a numeric-ID asset upload
+  applied before its response was lost, or if GitHub left its single allowed
+  starter asset. A later exact-source run cannot create again because the full
+  tag is the durable one-shot fence. The selector therefore admits the proven
+  canonical prefix above, while frozen-ID download-and-byte comparison and the
+  existing single-starter checks continue to reject arbitrary partial state.
 
 ## Verified Facts And Required Live Preflight
 

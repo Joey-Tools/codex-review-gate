@@ -89,8 +89,8 @@ Common options:
   --publication-plan-file <path>
                        Credential-free publication plan for verification/publish.
   --existing-draft-release-id <id>
-                       Manually reviewed, existing empty Draft Release ID for
-                       one --publish recovery only.
+                       Manually reviewed, existing recoverable Draft Release
+                       ID for one --publish recovery only.
 USAGE
 }
 
@@ -2422,6 +2422,9 @@ fi
 full_tag_object="$(git -C "$stage_repo" rev-parse "refs/tags/$immutable_tag")"
 expected_release_body="Signed release of $SOURCE_REPOSITORY@$source_commit."
 fresh_create_payload=""
+fresh_create_response=""
+fresh_create_error=""
+fresh_create_sinks_open=false
 
 existing_assets_dir="$temporary_root/existing-release-assets"
 mkdir -m 700 "$existing_assets_dir"
@@ -2547,6 +2550,7 @@ else
         --body "Signed release of $SOURCE_REPOSITORY@$source_commit." \
         --prerelease "$prerelease" \
         --draft true \
+        --allow-starter true \
         --immutable false)"; then
       fail_reconcile blocked_conflict immutable-release-mismatch \
         "existing_draft_release_id is not the exact Publisher App Draft Release for this frozen publication"
@@ -2556,10 +2560,11 @@ else
       fail_reconcile blocked_conflict immutable-release-mismatch \
         "existing_draft_release_id did not bind the direct GitHub Release response identity"
     }
-    [[ "$(printf '%s' "$manual_draft_boundary" | jq -r '.assets | length')" == "0" ]] || {
-      fail_reconcile blocked_conflict immutable-release-mismatch \
-        "existing_draft_release_id is not an empty Draft Release"
-    }
+    # The generic existing-Release checks below run before any target write.
+    # They admit only a byte-verified canonical uploaded prefix and at most one
+    # exact zero-byte Publisher-App starter; a list-hidden partial Draft must
+    # remain resumable after an ambiguous asset upload without trusting unknown
+    # assets or rebinding this manually reviewed ID.
   else
     cp "$release_inventory_exact_api" "$current_release_api"
     if [[ "$inventory_release_exists" == true ]]; then
@@ -2590,6 +2595,10 @@ else
     fi
     starter_asset_count="$(jq -r '[.assets[] | select(.state == "starter")] | length' \
       "$current_release_api")"
+    [[ "$starter_asset_count" =~ ^[0-9]+$ && "$starter_asset_count" -le 1 ]] || {
+      fail_reconcile blocked_conflict starter-asset-mismatch \
+        "at most one zero-byte starter asset is recoverable on the selected Draft"
+    }
     if [[ "$starter_asset_count" != "0" ]]; then
       jq -e '
         .draft == true and .immutable == false and
@@ -2623,6 +2632,10 @@ else
     }
     existing_asset_names="$(printf '%s' "$existing_asset_snapshot" | jq -r '.[].name' | LC_ALL=C sort)"
     valid_release_asset_prefix "$existing_asset_names" || {
+      if [[ -n "$existing_draft_release_id" ]]; then
+        fail_reconcile blocked_conflict immutable-release-mismatch \
+          "existing_draft_release_id does not select a canonical uploaded asset prefix"
+      fi
       emit_reconcile_state blocked_conflict stderr
       echo "error: existing GitHub Release assets are not a canonical prefix" >&2
       exit 1
@@ -3093,6 +3106,8 @@ fi
 # permitted way to create its corresponding Draft Release.
 if [[ "$full_exists" != true && "$release_exists" != true ]]; then
   fresh_create_payload="$temporary_root/release-create-request.json"
+  fresh_create_response="$temporary_root/release-create-response.json"
+  fresh_create_error="$temporary_root/release-create-response.err"
   if ! jq -cn \
       --arg tag "$immutable_tag" \
       --arg name "$immutable_tag" \
@@ -3113,6 +3128,15 @@ if [[ "$full_exists" != true && "$release_exists" != true ]]; then
     fail_reconcile inconclusive publication-input-preflight \
       "the frozen draft-create request failed exact policy validation before target mutation"
   fi
+  # Keep the response sinks open across target writes. The immutable full tag
+  # is a one-shot create fence, so a later shell redirection failure must not
+  # turn a never-issued POST into an ambiguous create outcome.
+  if ! exec 8> "$fresh_create_response" || ! exec 9> "$fresh_create_error" ||
+      [[ ! -f "$fresh_create_response" || ! -f "$fresh_create_error" ]]; then
+    fail_reconcile inconclusive publication-input-preflight \
+      "the frozen draft-create response sinks could not be prepared before target mutation"
+  fi
+  fresh_create_sinks_open=true
 fi
 
 need_master=false
@@ -3557,7 +3581,7 @@ reconcile_github_release() {
           $adopted.assets == $boundary.assets
         ' >/dev/null || {
         fail_reconcile inconclusive remote-state-changed \
-          "the manually adopted empty Draft Release changed before its frozen-ID mutation boundary"
+          "the manually adopted Draft Release changed before its frozen-ID mutation boundary"
       }
     fi
   else
@@ -3567,7 +3591,7 @@ reconcile_github_release() {
     }
     [[ "$fresh_release_create_authorized" == true ]] || {
       fail_reconcile inconclusive release-create-attempt-unknown \
-        "the immutable full tag existed when this invocation began while its complete Release inventory is stably absent; ordinary dispatch cannot authorize another draft-create request, so verify an exact empty mutable Draft and use its existing_draft_release_id for a new approved recovery"
+        "the immutable full tag existed when this invocation began while its complete Release inventory is stably absent; ordinary dispatch cannot authorize another draft-create request, so verify an exact recoverable mutable Draft and use its existing_draft_release_id for a new approved recovery"
     }
     require_publication_mutation release-completion
     [[ -n "$fresh_create_payload" && -f "$fresh_create_payload" ]] || {
@@ -3575,8 +3599,17 @@ reconcile_github_release() {
         "the frozen draft-create request is unavailable after target mutation"
     }
     create_payload="$fresh_create_payload"
-    create_response="$temporary_root/release-create-response.json"
-    create_error="$temporary_root/release-create-response.err"
+    create_response="$fresh_create_response"
+    create_error="$fresh_create_error"
+    [[ "$fresh_create_sinks_open" == true && -n "$create_response" && -n "$create_error" &&
+        -f "$create_response" && -f "$create_error" ]] || {
+      fail_reconcile inconclusive publication-input-preflight \
+        "the frozen draft-create response sinks are unavailable after target mutation"
+    }
+    if ! : >&8 2>&9; then
+      fail_reconcile inconclusive publication-input-preflight \
+        "the frozen draft-create response sinks are unavailable after target mutation"
+    fi
     create_status=0
     create_response_usable=false
     if publisher_gh api \
@@ -3586,7 +3619,7 @@ reconcile_github_release() {
         --header 'X-GitHub-Api-Version: 2026-03-10' \
         --input "$create_payload" \
         "repos/$TARGET_REPOSITORY/releases" \
-        > "$create_response" 2> "$create_error"; then
+        >&8 2>&9; then
       if frozen_release_id="$(jq -er \
           '.id | select(type == "number" and . > 0 and floor == . and . <= 9007199254740991)' \
           "$create_response")"; then
@@ -3624,8 +3657,10 @@ reconcile_github_release() {
       fi
     else
       create_status=$?
-      cat "$create_error" >&2
+      [[ ! -s "$create_error" ]] || cat "$create_error" >&2 || true
     fi
+    exec 8>&- 9>&-
+    fresh_create_sinks_open=false
     if [[ "$create_response_usable" != true ]]; then
       created_boundary="$(capture_inventory_release_boundary \
         post-create any true false)" || {
@@ -3633,7 +3668,7 @@ reconcile_github_release() {
       }
       if [[ "$(printf '%s' "$created_boundary" | jq -r '.release == "absent"')" == "true" ]]; then
         fail_reconcile inconclusive release-creation-unknown \
-          "draft creation returned status $create_status without a usable response and the complete recovery boundary is stably absent; do not create again—verify an exact empty mutable Draft and use its existing_draft_release_id for a new approved recovery"
+          "draft creation returned status $create_status without a usable response and the complete recovery boundary is stably absent; do not create again—verify an exact recoverable mutable Draft and use its existing_draft_release_id for a new approved recovery"
       fi
       [[ "$(printf '%s' "$created_boundary" | jq -r '.assets | length')" == "0" ]] || {
         fail_reconcile inconclusive remote-state-changed \

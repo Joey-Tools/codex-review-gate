@@ -63,8 +63,9 @@ identity inputs and one optional, narrowly scoped recovery selector:
 - `admission_run_attempt`: the exact positive successful planning attempt that
   persisted the admission plan; and
 - `existing_draft_release_id` (optional): the safe positive numeric ID of an
-  already-created, manually reviewed, empty mutable Draft Release for this
-  exact release intent.
+  already-created, manually reviewed recoverable Draft Release (an empty Draft
+  or a machine-verified canonical uploaded prefix with at most one known
+  zero-byte starter asset) for this exact release intent.
 
 Before source checkout, dispatch uses the exact run-attempt and artifact REST
 identities to require the original push event, `master` head/source SHA,
@@ -82,12 +83,16 @@ rejected admission, or substitute another run/attempt/artifact.
 proof. It is accepted only on `workflow_dispatch`, only after the immutable
 full tag already exists, and only when one direct `GET /releases/{id}` returns
 the exact expected tag, name, body, prerelease policy, `draft=true`,
-`immutable=false`, Publisher App Bot author, and an empty asset list. The
-complete Release inventory may omit that Draft; if it does expose an exact-tag
-object, its ID must equal the supplied ID. A fresh release path rejects the
-selector. After this one adoption read, the ordinary two-read frozen-ID/full-
-tag boundaries still run before any Release mutation. The selector therefore
-cannot authorize creation, replace an object, adopt arbitrary partial state,
+`immutable=false`, and Publisher App Bot author. Before any target write, the
+ordinary existing-Release verifier then accepts only either no assets or a
+canonical uploaded prefix whose frozen asset IDs download to the exact
+candidate bytes, plus at most one expected zero-byte Publisher-App starter
+asset. The complete Release inventory may omit that Draft; if it does expose an
+exact-tag object, its ID must equal the supplied ID. A fresh release path
+rejects the selector. After this one adoption read, the ordinary two-read
+frozen-ID/full-tag boundaries still run before any Release mutation. The
+selector therefore cannot authorize creation, replace an object, adopt
+arbitrary partial state,
 or bypass fail-closed metadata and asset checks.
 
 A dispatch always executes the workflow and publisher controls from the live
@@ -528,7 +533,7 @@ protected write.
    `release-creation-unknown`. If the full tag already existed at invocation
    start while the stable complete inventory has no exact-tag Release, the
    publisher emits `inconclusive` / `release-create-attempt-unknown` without
-   issuing any create request. A manually reviewed exact Draft may instead be
+   issuing any create request. A manually reviewed recoverable Draft may instead be
    selected on a recovery dispatch through `existing_draft_release_id` under
    the constraints above. Upload
    release assets, canonical provenance, checksums, and
@@ -636,19 +641,20 @@ or mismatched ID never rebinds to an inventory object.
 A later invocation that starts with the immutable full tag already present
 also does not create. Without a selector, stable Release absence is
 `inconclusive` / `release-create-attempt-unknown`. Once an operator has
-independently reviewed an exact empty Draft and obtained its numeric ID, an
+independently reviewed an exact recoverable Draft and obtained its numeric ID, an
 exact-source `workflow_dispatch` may supply `existing_draft_release_id`. The
 publisher performs one direct adoption read and accepts inventory omission,
-but rejects a wrong ID, any visible exact-tag ID disagreement, nonempty assets,
-published or immutable state, wrong metadata, or the wrong author. It then
-uses the ordinary frozen-ID/full-tag A/B boundaries before upload or publish.
-Neither this recovery nor a new Environment approval authorizes a second
-create, deletion, replacement, or a different release intent.
+but rejects a wrong ID, any visible exact-tag ID disagreement, published or
+immutable state, wrong metadata or author, unknown assets, a noncanonical
+uploaded prefix, or an invalid starter. It then uses the ordinary frozen-ID/
+full-tag A/B boundaries before upload or publish. Neither this recovery nor a
+new Environment approval authorizes a second create, deletion, replacement,
+or a different release intent.
 
 For `release-creation-unknown` or `release-create-attempt-unknown`, the failure
-summary tells the operator or agent to confirm whether the exact empty Draft
-exists and, only when its ID and fields have been reviewed, rerun the original
-admitted source with the three required identity inputs plus
+summary tells the operator or agent to confirm whether the exact recoverable
+Draft exists and, only when its ID, fields, and any partial assets have been
+reviewed, rerun the original admitted source with the three required identity inputs plus
 `existing_draft_release_id`, then obtain a new Environment approval. If no such
 Draft can be confirmed, recovery remains stopped rather than guessing,
 force-creating, recreating, or issuing another POST.
@@ -858,8 +864,9 @@ A completed exact step is verified and reused; an absent next step may resume
 only when that mutation's contract authorizes it. Draft Release creation is the
 exception: once the immutable full tag exists across invocations, stable
 Release absence returns `release-create-attempt-unknown` and requires an
-explicitly reviewed manual recovery. When that review finds the exact empty
-Draft, the operator supplies its numeric ID through
+explicitly reviewed manual recovery. When that review finds an exact
+recoverable Draft (empty or a verified canonical partial prefix), the operator
+supplies its numeric ID through
 `existing_draft_release_id`; otherwise recovery stays stopped rather than
 running another ordinary create attempt.
 A conflicting tag, commit, signature, Release asset, unexpected target advance,
