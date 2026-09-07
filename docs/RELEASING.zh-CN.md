@@ -691,24 +691,35 @@ installation。
    last-push approval，且没有 required status check。记录返回的 ID 和 normalized
    profile，并在创建 bridge PR 前读回同一 profile。不得用 classic branch-protection
    `PUT`/`DELETE` 合成原本不存在的保护：它会替换整个 resource，无法安全地保留并发变更。
+   对该 fixture，"normalized profile" 是 writable fields 的
+   `rulesetWritableFingerprint()` canonical JSON，加上 exact returned numeric ruleset ID、
+   `source_type=Repository` 及 `source=<owner>/<repository>` identity。创建 readback 时冻结
+   这一完整 tuple；之后任一 component 不同都属于 drift。
    每个 bridge/cleanup PR 合并前，都独立证明指定 control-plane owner 不等于 PR author、
    该 owner 从 complete paginated review inventory 得到的最新 review 在 current full head
-   上为 `APPROVED`，并在紧邻 merge 前重读该 head。bridge PR 只新增逐字复制的 verifier/controller workflows；相对 canonical
+   上为 `APPROVED`，并在紧邻 merge 前重读该 head。Merge API mutation 必须以同一 full SHA
+   作为 expected `sha`；SHA 变化或 merge 被拒绝都必须停止，不能合入未经验证的 head。bridge PR 只新增逐字复制的 verifier/controller workflows；相对 canonical
    templates 唯一允许的 byte difference 是两处 selector，且都必须为 exact immutable
    `@v2.0.0-rc.N`。不得新增 CODEOWNERS、ruleset、variable 或 secret。
 3. 从已更新的 default branch 创建一个独立 harmless test PR；对其 exact head 跑完
    normal `begin-review` 和 `reconcile` path，包括 required Codex evidence 与 final gate
    result。
 4. 记录 harmless test PR 的 exact head、controller 与 verifier run IDs 或 URLs，以及
-   resolved tag `v2.0.0-rc.N`。Live gate 成功后，关闭该 harmless test PR，不要合并。
+   resolved tag `v2.0.0-rc.N`。无论 live gate 成功、失败、被取消，还是保持 inconclusive，
+   都必须关闭该 harmless test PR 且不得合并，并完成 forward cleanup。只有 successful live
+   gate 满足 stable admission；每个 terminal result 都仍然要求 cleanup。
 5. 打开并合并一个 forward PR，移除临时 bridge，并恢复两份 default-branch
    workflows 的 exact pre-bridge bytes。若原状态包含 canonical production verifier 与
    controller，两者 selectors 都恢复为 `@v2`；否则删除 temporary RC workflows，不得
    把 immutable RC selector 留在默认分支。Fresh fixture 只删除已记录的两个 workflow
    path，绝不删除整个 `.github` directory。移除临时 ruleset 前，重读其 ID，并要求它与
-   fixture 自己的 normalized ruleset profile 完全匹配；任何 drift 都交给 owner 停止处理，
-   不能覆盖仓库当前 policy。cleanup merge 前，两份 temporary workflow 还必须等于
+   fixture 自己的 normalized ruleset profile 完全匹配；临时 ruleset 必须保持 active，直到
+   cleanup PR successful merge 完成。只有之后进入 exclusive owner maintenance window，才能
+   重读该 ID、要求它与 frozen fixture tuple 完全匹配，并删除同一 ID。没有该 exclusive
+   window 或发现任意 drift 时都必须保留 ruleset 并停止，不能覆盖仓库当前 policy。cleanup
+   merge 前，两份 temporary workflow 还必须等于
    已记录的 exact RC bytes；workflow drift 同样停止，不能直接删除。
+   删除后，重读 effective default-branch rules inventory，要求同一 ID 已不存在。
 
 PR-local wrapper 不合格：trusted verifier 与 controller（包括 controller 的 manual
 dispatch contract）从 default branch 加载。Non-default dispatch 同样不受支持，也不产生

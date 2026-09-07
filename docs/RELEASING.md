@@ -834,11 +834,18 @@ installation.
    then read that same profile back before creating the bridge PR. Do not
    synthesize absent protection with classic branch-protection `PUT`/`DELETE`:
    it replaces a whole resource and cannot safely preserve concurrent changes.
+   For this fixture, "normalized profile" means the canonical JSON returned by
+   `rulesetWritableFingerprint()` for the writable fields, plus the exact
+   returned numeric ruleset ID, `source_type=Repository`, and
+   `source=<owner>/<repository>` identity. Freeze that complete tuple from the
+   creation readback; a later read that differs in any component is drift.
    For
    each bridge and cleanup PR, independently prove that the named control-plane
    owner is not the PR author, that the owner's latest review is `APPROVED` on
    the current full head from a complete paginated review inventory, and reread
-   that head immediately before merge.
+   that head immediately before merge. Make the merge API mutation with that
+   same full SHA as its expected `sha`; a changed SHA or rejected merge stops
+   rather than merging an unverified head.
    The bridge PR adds exactly the copied verifier and controller workflows;
    their only permitted byte differences from the canonical templates are the
    two selectors, each set to the exact immutable `@v2.0.0-rc.N`. It does not
@@ -847,17 +854,25 @@ installation.
    the complete normal `begin-review` and `reconcile` path on its exact head,
    including the required Codex evidence and final gate result.
 4. Record the harmless test PR's exact head, the controller and verifier run
-   IDs or URLs, and the resolved tag `v2.0.0-rc.N`. After the live gate
-   succeeds, close that harmless test PR without merging it.
+   IDs or URLs, and the resolved tag `v2.0.0-rc.N`. Whether the live gate
+   succeeds, fails, is cancelled, or remains inconclusive, close that harmless
+   test PR without merging it and complete the forward cleanup. Only a
+   successful live gate satisfies stable admission; every terminal result still
+   requires cleanup.
 5. Open and merge a forward PR that removes the temporary bridge and restores
    the exact pre-bridge bytes of both default-branch workflows. If that state
    contained the canonical production verifier and controller, both selectors
    return to `@v2`; otherwise remove the temporary RC workflows rather than
    leaving an immutable RC selector behind. A fresh fixture deletes only the
-   two recorded workflow paths, never the whole `.github` directory. Before
-   removing the temporary ruleset, reread its ID and require an exact normalized
-   profile match to the fixture's own ruleset; any drift is an owner stop, not
-   permission to overwrite the repository's current policy. Before the
+   two recorded workflow paths, never the whole `.github` directory. Keep the
+   temporary ruleset active through the cleanup PR's successful merge. Only
+   then, in an exclusive owner maintenance window, reread its ID and require an
+   exact normalized-profile match to the frozen fixture tuple before deleting
+   that same ID. Without that exclusive window, or after
+   any drift, leave the ruleset in place and stop; neither condition is
+   permission to overwrite the repository's current policy. After deletion,
+   reread the effective default-branch rules inventory and require that same ID
+   to be absent. Before the
    cleanup merge, the two temporary workflows must still equal their recorded
    exact RC bytes; workflow drift likewise stops rather than being deleted.
 

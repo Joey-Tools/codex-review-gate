@@ -3635,12 +3635,18 @@ superseded_by:
   than classic branch protection, when it needs temporary PR protection. The
   ruleset is targeted exactly at `refs/heads/master`, has no bypass actor, and
   requires one approval with stale-review dismissal and last-push approval but
-  no required status check. Its returned ID and normalized profile are frozen
-  and must match before deletion. This avoids classic branch protection's
-  whole-resource `PUT`/`DELETE` restoration hazard: a concurrent protection
-  change must stop cleanup rather than be overwritten. REST cannot give a
-  zero-TOCTOU deletion guarantee for a changed same-ID ruleset, so fixture
-  operations retain an exclusive owner window and stop on any observed drift.
+  no required status check. Its returned ID, `source_type`/`source` identity,
+  and `rulesetWritableFingerprint()` projection are frozen and must match
+  before deletion. This avoids classic branch protection's whole-resource
+  `PUT`/`DELETE` restoration hazard: a concurrent protection change must stop
+  cleanup rather than be overwritten. The ruleset remains active through the
+  cleanup merge, whose API request binds the independently approved exact head
+  SHA. The harmless canary PR is closed and forward cleanup runs after every
+  terminal gate result; only success counts for stable admission. REST cannot
+  give a zero-TOCTOU deletion guarantee for a changed same-ID ruleset, so
+  deletion only occurs in an exclusive owner window, then rereads the effective
+  default-branch inventory to require the fixture ID absent, and stops on any
+  observed drift.
 
 ## Verified Facts And Required Live Preflight
 
