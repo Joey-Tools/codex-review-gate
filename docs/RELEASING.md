@@ -827,10 +827,14 @@ installation.
    that absent-path snapshot and the protection snapshot first. Do not use the
    normal installer: it installs `@v2`, CODEOWNERS, and a v2 ruleset, none of
    which belongs to this admission exercise. If the repository has no
-   sufficient existing pull-request protection, temporarily require one
-   approval, stale-approval dismissal, last-push approval, administrator
-   enforcement, and no required status check. Read that exact temporary profile
-   back before creating the bridge PR. For
+   sufficient existing pull-request protection, create one active, uniquely
+   named repository ruleset targeted exactly to the default-branch ref, with no
+   bypass actor, one approval, stale-approval dismissal, last-push approval,
+   and no required status check. Record its returned ID and normalized profile,
+   then read that same profile back before creating the bridge PR. Do not
+   synthesize absent protection with classic branch-protection `PUT`/`DELETE`:
+   it replaces a whole resource and cannot safely preserve concurrent changes.
+   For
    each bridge and cleanup PR, independently prove that the named control-plane
    owner is not the PR author, that the owner's latest review is `APPROVED` on
    the current full head from a complete paginated review inventory, and reread
@@ -851,9 +855,9 @@ installation.
    return to `@v2`; otherwise remove the temporary RC workflows rather than
    leaving an immutable RC selector behind. A fresh fixture deletes only the
    two recorded workflow paths, never the whole `.github` directory. Before
-   removing temporary pull-request protection, reread and require an exact
-   match to the fixture's own protection profile; any drift is an owner stop,
-   not permission to overwrite the repository's current policy. Before the
+   removing the temporary ruleset, reread its ID and require an exact normalized
+   profile match to the fixture's own ruleset; any drift is an owner stop, not
+   permission to overwrite the repository's current policy. Before the
    cleanup merge, the two temporary workflows must still equal their recorded
    exact RC bytes; workflow drift likewise stops rather than being deleted.
 

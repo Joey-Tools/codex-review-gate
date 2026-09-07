@@ -3631,6 +3631,16 @@ superseded_by:
   that the private-repository Codex connector can service an exact
   `@codex review` request; user-reported UI configuration is not substitute
   evidence for that live provider result.
+- The fresh fixture will use a uniquely named active repository ruleset, rather
+  than classic branch protection, when it needs temporary PR protection. The
+  ruleset is targeted exactly at `refs/heads/master`, has no bypass actor, and
+  requires one approval with stale-review dismissal and last-push approval but
+  no required status check. Its returned ID and normalized profile are frozen
+  and must match before deletion. This avoids classic branch protection's
+  whole-resource `PUT`/`DELETE` restoration hazard: a concurrent protection
+  change must stop cleanup rather than be overwritten. REST cannot give a
+  zero-TOCTOU deletion guarantee for a changed same-ID ruleset, so fixture
+  operations retain an exclusive owner window and stop on any observed drift.
 
 ## Verified Facts And Required Live Preflight
 

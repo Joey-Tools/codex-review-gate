@@ -686,9 +686,11 @@ installation。
    canonical workflow 都不存在时才允许使用。先冻结这两个 absent path 与 protection
    snapshot。不得调用 normal installer：它会安装 `@v2`、CODEOWNERS 与 v2 ruleset，
    都不属于本次 admission exercise。若仓库没有足够的现有 pull-request protection，
-   临时要求一名 reviewer approval、dismiss stale approvals、last-push approval、
-   administrator enforcement，且没有 required status check。创建 bridge PR 前读回该
-   exact temporary profile。
+   创建一个 active、唯一命名、精确 target 到 default-branch ref 且没有 bypass actor 的
+   repository ruleset：它必须要求一名 reviewer approval、dismiss stale approvals、
+   last-push approval，且没有 required status check。记录返回的 ID 和 normalized
+   profile，并在创建 bridge PR 前读回同一 profile。不得用 classic branch-protection
+   `PUT`/`DELETE` 合成原本不存在的保护：它会替换整个 resource，无法安全地保留并发变更。
    每个 bridge/cleanup PR 合并前，都独立证明指定 control-plane owner 不等于 PR author、
    该 owner 从 complete paginated review inventory 得到的最新 review 在 current full head
    上为 `APPROVED`，并在紧邻 merge 前重读该 head。bridge PR 只新增逐字复制的 verifier/controller workflows；相对 canonical
@@ -703,9 +705,9 @@ installation。
    workflows 的 exact pre-bridge bytes。若原状态包含 canonical production verifier 与
    controller，两者 selectors 都恢复为 `@v2`；否则删除 temporary RC workflows，不得
    把 immutable RC selector 留在默认分支。Fresh fixture 只删除已记录的两个 workflow
-   path，绝不删除整个 `.github` directory。移除临时 pull-request protection 前，重读并
-   要求它与 fixture 自己的 protection profile 完全匹配；任何 drift 都交给 owner 停止
-   处理，不能覆盖仓库当前 policy。cleanup merge 前，两份 temporary workflow 还必须等于
+   path，绝不删除整个 `.github` directory。移除临时 ruleset 前，重读其 ID，并要求它与
+   fixture 自己的 normalized ruleset profile 完全匹配；任何 drift 都交给 owner 停止处理，
+   不能覆盖仓库当前 policy。cleanup merge 前，两份 temporary workflow 还必须等于
    已记录的 exact RC bytes；workflow drift 同样停止，不能直接删除。
 
 PR-local wrapper 不合格：trusted verifier 与 controller（包括 controller 的 manual
