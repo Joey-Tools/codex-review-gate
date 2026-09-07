@@ -299,7 +299,10 @@ GitHub.com/default-branch PR scope 时停止。
 
 合并后的两份 canonical workflows contract 必须是：
 
-- `JoeyTeng/codex-review-gate-action@v2`；
+- `JoeyTeng/codex-review-gate-action@v2`；prerelease selector 绝不是
+  installation value。唯一例外是 [`RELEASING.zh-CN.md`](../RELEASING.zh-CN.md)
+  中 release operator 使用的 temporary RC admission fixture；它不是 installation 或
+  activation path；
 - verifier path `.github/workflows/codex-review-gate.yml`、workflow name
   `Codex Review Gate Verifier`、`pull_request` types `opened`、`reopened`、
   `synchronize`、`ready_for_review`，以及 exact PR feature-head SHA 上的 required job

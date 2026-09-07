@@ -674,26 +674,46 @@ production bootstrap `@v2` templates 及其 normal floating selectors；应使�
 owner-reviewed 的短期 default-branch bridge：
 
 该 bridge 必须手工准备；不得给 production bootstrap 增加 RC override，也不得为这个
-临时 admission exercise 启用 production v2 ruleset。两次短期 default-branch change
-由 test repository 已有保护与 required owner review 约束。
+临时 admission exercise 启用 production v2 ruleset。它只能使用下述 normal
+selector-only 形式或 narrow fresh-fixture 形式；两者都不是 ordinary consumer
+installation。
 
-1. 在指定 test consumer 中打开一个 selector-only PR，只把已安装的两份 canonical
-   workflows（verifier 与 controller）中的 Action selectors 从 `@v2` 替换为 exact
-   immutable `@v2.0.0-rc.N`。由 repository owner review，然后合入受保护的 default
-   branch。
-2. 从已更新的 default branch 创建一个独立 harmless test PR；对其 exact head 跑完
+1. **Installed-consumer bridge。** 在指定 test consumer 中打开一个 selector-only PR，
+   只把已安装的两份 canonical workflows（verifier 与 controller）中的 Action selectors
+   从 `@v2` 替换为 exact immutable `@v2.0.0-rc.N`。由 test repository 已有保护与
+   owner review 约束后，合入受保护的 default branch。
+2. **Fresh temporary fixture。** 只有 exact pre-bridge default-branch snapshot 中两份
+   canonical workflow 都不存在时才允许使用。先冻结这两个 absent path 与 protection
+   snapshot。不得调用 normal installer：它会安装 `@v2`、CODEOWNERS 与 v2 ruleset，
+   都不属于本次 admission exercise。若仓库没有足够的现有 pull-request protection，
+   临时要求一名 reviewer approval、dismiss stale approvals、last-push approval、
+   administrator enforcement，且没有 required status check。创建 bridge PR 前读回该
+   exact temporary profile。
+   每个 bridge/cleanup PR 合并前，都独立证明指定 control-plane owner 不等于 PR author、
+   该 owner 从 complete paginated review inventory 得到的最新 review 在 current full head
+   上为 `APPROVED`，并在紧邻 merge 前重读该 head。bridge PR 只新增逐字复制的 verifier/controller workflows；相对 canonical
+   templates 唯一允许的 byte difference 是两处 selector，且都必须为 exact immutable
+   `@v2.0.0-rc.N`。不得新增 CODEOWNERS、ruleset、variable 或 secret。
+3. 从已更新的 default branch 创建一个独立 harmless test PR；对其 exact head 跑完
    normal `begin-review` 和 `reconcile` path，包括 required Codex evidence 与 final gate
    result。
-3. 记录 harmless test PR 的 exact head、controller 与 verifier run IDs 或 URLs，以及
+4. 记录 harmless test PR 的 exact head、controller 与 verifier run IDs 或 URLs，以及
    resolved tag `v2.0.0-rc.N`。Live gate 成功后，关闭该 harmless test PR，不要合并。
-4. 打开并合并一个 forward PR，移除临时 bridge，并恢复两份 default-branch
+5. 打开并合并一个 forward PR，移除临时 bridge，并恢复两份 default-branch
    workflows 的 exact pre-bridge bytes。若原状态包含 canonical production verifier 与
    controller，两者 selectors 都恢复为 `@v2`；否则删除 temporary RC workflows，不得
-   把 immutable RC selector 留在默认分支。
+   把 immutable RC selector 留在默认分支。Fresh fixture 只删除已记录的两个 workflow
+   path，绝不删除整个 `.github` directory。移除临时 pull-request protection 前，重读并
+   要求它与 fixture 自己的 protection profile 完全匹配；任何 drift 都交给 owner 停止
+   处理，不能覆盖仓库当前 policy。cleanup merge 前，两份 temporary workflow 还必须等于
+   已记录的 exact RC bytes；workflow drift 同样停止，不能直接删除。
 
 PR-local wrapper 不合格：trusted verifier 与 controller（包括 controller 的 manual
 dispatch contract）从 default branch 加载。Non-default dispatch 同样不受支持，也不产生
-admission evidence。这个临时合入的 selector bridge 是对现有 consumer contract 的
+admission evidence。Fresh fixture 只证明 live private same-repository
+verifier/controller path、Codex evidence、exact-head reconcile 与 native CheckRun；它不
+证明 production CODEOWNERS、all-conversations-resolved、up-to-date、v1-migration 或
+normal-installer closure。这个临时合入的 selector bridge 是对现有 consumer contract 的
 manual use，不是 publisher-integrated immutable-tag canary、floating-alias canary、
 dedicated canary job 或 canary orchestrator。
 
@@ -775,12 +795,12 @@ prerequisites。
 
 Stable `v2.0.0` admission 还要求先发布 `v2.0.0-rc.N`，并在指定 test
 consumer repository 中执行上文 default-branch RC admission bridge。RC 只使用
-immutable full tag，不推进 `v2`。Selector-only bridge PR 需临时合入，使两份 trusted
-default-branch workflows 都能解析 RC；独立 harmless test PR 在成功后关闭且不合并，
-然后用 forward PR 恢复两份 workflows 的 exact pre-bridge bytes：只有原本就有
-canonical production verifier 与 controller 时，两者 selectors 才都恢复为 `@v2`；
-否则删除 temporary RC workflows。普通 post-installation `@v2` consumer canary 仍与
-publisher 分离。
+immutable full tag，不推进 `v2`。已安装 consumer 使用临时 selector-only bridge；fresh
+fixture 使用已严格定义的 temporary canonical pair。独立 harmless test PR 在成功后关闭且
+不合并，然后用 forward PR 恢复 exact pre-bridge bytes：只有原本就有 canonical
+production verifier 与 controller 时，两者 selectors 才都恢复为 `@v2`；否则删除
+temporary RC workflows。普通 post-installation `@v2` consumer canary 仍与 publisher
+分离。
 
 以下事项明确延期，不得将其表述为已经完成，也不得静默升级为当前合约：
 

@@ -812,31 +812,61 @@ short-lived default-branch bridge instead:
 
 Prepare the bridge manually; do not add an RC override to the production
 bootstrap or activate the production v2 ruleset for this temporary admission
-exercise. Existing test-repository protection and the required owner review
-govern the two short-lived default-branch changes.
+exercise. The bridge is either the normal selector-only form below or the
+narrow fresh-fixture form that follows it; neither is ordinary consumer
+installation.
 
-1. In the designated test consumer, open a selector-only PR that changes only
-   the Action selectors in both installed canonical workflows—the verifier and
-   the controller—from `@v2` to the exact immutable `@v2.0.0-rc.N`. Have the
-   repository owner review it and merge it into the protected default branch.
-2. From that updated default branch, open a separate harmless test PR. Exercise
+1. **Installed-consumer bridge.** In the designated test consumer, open a
+   selector-only PR that changes only the Action selectors in both installed
+   canonical workflows—the verifier and the controller—from `@v2` to the
+   exact immutable `@v2.0.0-rc.N`. Existing test-repository protection and an
+   owner review govern the change before it merges into the protected default
+   branch.
+2. **Fresh temporary fixture.** This is permitted only when the exact
+   pre-bridge default-branch snapshot has neither canonical workflow. Freeze
+   that absent-path snapshot and the protection snapshot first. Do not use the
+   normal installer: it installs `@v2`, CODEOWNERS, and a v2 ruleset, none of
+   which belongs to this admission exercise. If the repository has no
+   sufficient existing pull-request protection, temporarily require one
+   approval, stale-approval dismissal, last-push approval, administrator
+   enforcement, and no required status check. Read that exact temporary profile
+   back before creating the bridge PR. For
+   each bridge and cleanup PR, independently prove that the named control-plane
+   owner is not the PR author, that the owner's latest review is `APPROVED` on
+   the current full head from a complete paginated review inventory, and reread
+   that head immediately before merge.
+   The bridge PR adds exactly the copied verifier and controller workflows;
+   their only permitted byte differences from the canonical templates are the
+   two selectors, each set to the exact immutable `@v2.0.0-rc.N`. It does not
+   add CODEOWNERS, a ruleset, a variable, or a secret.
+3. From that updated default branch, open a separate harmless test PR. Exercise
    the complete normal `begin-review` and `reconcile` path on its exact head,
    including the required Codex evidence and final gate result.
-3. Record the harmless test PR's exact head, the controller and verifier run
+4. Record the harmless test PR's exact head, the controller and verifier run
    IDs or URLs, and the resolved tag `v2.0.0-rc.N`. After the live gate
    succeeds, close that harmless test PR without merging it.
-4. Open and merge a forward PR that removes the temporary bridge and restores
+5. Open and merge a forward PR that removes the temporary bridge and restores
    the exact pre-bridge bytes of both default-branch workflows. If that state
    contained the canonical production verifier and controller, both selectors
    return to `@v2`; otherwise remove the temporary RC workflows rather than
-   leaving an immutable RC selector behind.
+   leaving an immutable RC selector behind. A fresh fixture deletes only the
+   two recorded workflow paths, never the whole `.github` directory. Before
+   removing temporary pull-request protection, reread and require an exact
+   match to the fixture's own protection profile; any drift is an owner stop,
+   not permission to overwrite the repository's current policy. Before the
+   cleanup merge, the two temporary workflows must still equal their recorded
+   exact RC bytes; workflow drift likewise stops rather than being deleted.
 
 A PR-local wrapper does not qualify: the trusted verifier and controller,
 including the controller's manual-dispatch contract, are loaded from the
 default branch. A non-default dispatch is likewise unsupported and provides no
-admission evidence. This temporarily merged selector bridge is a manual use of
-the existing consumer contract, not a publisher-integrated immutable-tag
-canary, floating-alias canary, dedicated canary job, or canary orchestrator.
+admission evidence. A fresh fixture proves the live private same-repository
+verifier/controller path, Codex evidence, exact-head reconciliation, and native
+CheckRun only. It does not prove production CODEOWNERS, all-conversations-
+resolved, up-to-date, v1-migration, or normal-installer closure. This
+temporarily merged selector bridge is a manual use of the existing consumer
+contract, not a publisher-integrated immutable-tag canary, floating-alias
+canary, dedicated canary job, or canary orchestrator.
 
 ## Reconcile, retry, and cancellation
 
@@ -931,10 +961,10 @@ or a separate canary orchestrator as release prerequisites.
 Stable `v2.0.0` admission additionally requires a published `v2.0.0-rc.N` and
 the default-branch RC admission bridge described above in the designated test
 consumer repository. The RC uses only its immutable full tag; it does not move
-`v2`. The selector-only bridge PR is merged temporarily so both trusted
-default-branch workflows resolve the RC, the separate harmless test PR is
-closed unmerged after success, and a forward PR then restores both workflows'
-exact pre-bridge bytes: only a consumer that originally had the canonical
+`v2`. An installed consumer uses the temporary selector-only bridge; a fresh
+fixture uses the narrowly defined temporary canonical pair. The separate
+harmless test PR is closed unmerged after success, and a forward PR restores
+the exact pre-bridge bytes: only a consumer that originally had the canonical
 production verifier and controller returns both selectors to `@v2`; otherwise
 the temporary RC workflows are removed. The ordinary post-installation `@v2`
 consumer canary remains separate from the publisher.

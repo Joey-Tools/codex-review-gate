@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-09-05
+updated: 2026-09-07
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -3603,6 +3603,35 @@ superseded_by:
   canonical prefix above, while frozen-ID download-and-byte comparison and the
   existing single-starter checks continue to reject arbitrary partial state.
 
+## Published RC And Fresh Admission Fixture
+
+- The approved recovery run `34102409731` completed successfully. It published
+  immutable prerelease `v2.0.0-rc.1` from source commit
+  `04158a216445d9171b4519fad33baa70edb84226` to
+  `JoeyTeng/codex-review-gate-action`, with immutable full-tag object
+  `57d161b9f9a90653381c0005316d11cbb71478b4`, Release `381957863`, and the
+  approved archive, provenance, and detached OpenPGP-signature assets. The
+  prerelease did not move the `v2` alias.
+- Joey selected private `JoeyTeng/website-checking` as the designated RC test
+  consumer. Its current default branch is `master`, with Actions enabled and
+  read-only default workflow permissions; it has no open PR, ruleset, classic
+  branch protection, or existing review-gate workflow. It has only an unrelated
+  link-checker workflow. No secret, variable, Environment, or runtime GitHub
+  App is required for the fixture.
+- The original selector-only bridge wording did not define how a fresh consumer
+  reaches its temporary canonical pair. Joey adopted the narrow fresh temporary
+  fixture now described in the release manual: a protected, owner-reviewed
+  bridge adds only the two canonical workflows with exact RC selectors; the
+  live same-repository PR proves the runtime loop; a forward cleanup PR deletes
+  only those two paths and then restores the pre-fixture protection state.
+  This is not normal consumer installation, CODEOWNERS/ruleset validation,
+  v1 migration, or production enforcement proof.
+- The named temporary control-plane reviewer is `@JoeyTeng-Codex`, which Joey
+  granted write access to the test repository. The live run must still prove
+  that the private-repository Codex connector can service an exact
+  `@codex review` request; user-reported UI configuration is not substitute
+  evidence for that live provider result.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -3653,20 +3682,14 @@ superseded_by:
 - PR #35 is merged. Its approved frozen RC recovery completed every
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
-- PR #37、#38、#39、#40 与 #41 已合并。后续 RC recovery `33746380608` 已创建
-  target `master`/immutable tag `v2.0.0-rc.1`（均指向
-  `04158a216445d9171b4519fad33baa70edb84226`）和 empty Draft Release
-  `381957863`，但在 post-create list 未发现新 Draft 后停止；没有上传 asset、发布 Release
-  或更新 alias。Known-ID recovery correction 合并后，使用 original
-  `source_sha=af8430ce086517918e4ac8b8c7b9ff124ebec3ef`、
-  `admission_run_id=33463583561`、`admission_run_attempt=1` 与
-  `existing_draft_release_id=381957863` 创建新的 approved recovery run。成功后验证
-  immutable RC ref、prerelease、assets、signatures 与 public readback；失败时继续只修复
-  已观察到的明确不匹配。
-- RC 的 immutable ref、prerelease、assets、signatures 与 public readback 全部验证后，
-  且确认不再需要 RC recovery，先在 Publisher App settings 移除 `Workflows: read/write`；
-  再创建 stable `v2.0.0` release intent。stable workflow 会以新的 target head 要求
-  严格三权限 surface，而不是保留一次性迁移权限。
+- RC `v2.0.0-rc.1` is published and fully verified; no further RC recovery is
+  pending. Complete the designated fresh admission fixture and retain its
+  exact PR/run/CheckRun evidence before creating the stable `v2.0.0` release
+  intent.
+- Before the stable release intent, remove `Workflows: read/write` from the
+  Publisher App in its Settings and read its remaining three-permission surface
+  back. The stable workflow must not retain the one-time RC transition
+  permission.
 - Then land the stable `v2.0.0` release intent separately and execute its
   approved publisher workflow. Verify the immutable stable ref,
   Release/assets, signatures and `v2` floating alias before carrying out the
