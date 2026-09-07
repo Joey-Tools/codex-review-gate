@@ -981,9 +981,10 @@ Stable `v2.0.0` admission additionally requires a published `v2.0.0-rc.N` and
 the default-branch RC admission bridge described above in the designated test
 consumer repository. The RC uses only its immutable full tag; it does not move
 `v2`. An installed consumer uses the temporary selector-only bridge; a fresh
-fixture uses the narrowly defined temporary canonical pair. The separate
-harmless test PR is closed unmerged after success, and a forward PR restores
-the exact pre-bridge bytes: only a consumer that originally had the canonical
+fixture uses the narrowly defined temporary canonical pair. After every
+terminal gate result, the separate harmless test PR is closed unmerged and a
+forward PR restores the exact pre-bridge bytes; only a successful gate satisfies
+stable admission. Only a consumer that originally had the canonical
 production verifier and controller returns both selectors to `@v2`; otherwise
 the temporary RC workflows are removed. The ordinary post-installation `@v2`
 consumer canary remains separate from the publisher.

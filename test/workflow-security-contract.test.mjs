@@ -1709,6 +1709,14 @@ test("release docs define the default-branch RC bridge and closed verification r
     const freshStart = bridge.indexOf("**Fresh temporary fixture");
     assert.notEqual(freshStart, -1, `${name}: fresh fixture heading`);
     const fresh = bridge.slice(freshStart);
+    const scopeStart = Math.max(
+      guide.indexOf("## Initial v2 scope"),
+      guide.indexOf("## 初始 v2 scope"),
+    );
+    const scopeEnd = guide.indexOf("\n## ", scopeStart);
+    assert.notEqual(scopeStart, -1, `${name}: initial-scope heading`);
+    assert.notEqual(scopeEnd, -1, `${name}: initial-scope boundary`);
+    const scope = guide.slice(scopeStart, scopeEnd);
 
     for (const required of [
       /@v2\.0\.0-rc\.N/u,
@@ -1736,7 +1744,7 @@ test("release docs define the default-branch RC bridge and closed verification r
       /dedicated canary job/iu,
       /closed recovery/iu,
       /exact pre-bridge/iu,
-      /(?:only[^.。]{0,120}(?:originally|原本)[^.。]{0,120}@v2|若原状态[^.。]{0,120}@v2)/iu,
+      /(?:only[^.。]{0,120}(?:originally|原本)[^.。]{0,120}@v2|(?:若原状态|原本就有)[^.。]{0,120}@v2)/iu,
       /(?:otherwise[^.。]{0,120}remove|否则[^.。]{0,120}删除)/iu,
     ]) {
       assert.match(guide, required, `${name}: ${required}`);
@@ -1765,6 +1773,13 @@ test("release docs define the default-branch RC bridge and closed verification r
       /exact\s+RC\s+bytes/iu,
     ]) {
       assert.match(fresh, required, `${name}: fresh RC fixture ${required}`);
+    }
+
+    for (const required of [
+      /(?:after\s+every\s+terminal\s+gate\s+result|每个\s+terminal\s+gate\s+result\s+后)[\s\S]{0,120}forward\s+PR/iu,
+      /(?:only a successful gate|只有\s+successful gate)[\s\S]{0,100}stable admission/iu,
+    ]) {
+      assert.match(scope, required, `${name}: RC scope summary ${required}`);
     }
   }
 });

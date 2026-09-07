@@ -809,11 +809,11 @@ prerequisites。
 Stable `v2.0.0` admission 还要求先发布 `v2.0.0-rc.N`，并在指定 test
 consumer repository 中执行上文 default-branch RC admission bridge。RC 只使用
 immutable full tag，不推进 `v2`。已安装 consumer 使用临时 selector-only bridge；fresh
-fixture 使用已严格定义的 temporary canonical pair。独立 harmless test PR 在成功后关闭且
-不合并，然后用 forward PR 恢复 exact pre-bridge bytes：只有原本就有 canonical
-production verifier 与 controller 时，两者 selectors 才都恢复为 `@v2`；否则删除
-temporary RC workflows。普通 post-installation `@v2` consumer canary 仍与 publisher
-分离。
+fixture 使用已严格定义的 temporary canonical pair。每个 terminal gate result 后，独立
+harmless test PR 都关闭且不合并，并用 forward PR 恢复 exact pre-bridge bytes；只有
+successful gate 满足 stable admission。原本就有 canonical production verifier 与 controller
+的 consumer 两者 selectors 才都恢复为 `@v2`；否则删除 temporary RC workflows。普通
+post-installation `@v2` consumer canary 仍与 publisher 分离。
 
 以下事项明确延期，不得将其表述为已经完成，也不得静默升级为当前合约：
 
