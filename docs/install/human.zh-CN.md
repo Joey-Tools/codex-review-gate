@@ -30,6 +30,10 @@ workflows 都使用兼容的 floating major：
 uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
+不得把该 selector 替换成 prerelease。唯一例外是 release operator 在
+[`RELEASING.zh-CN.md`](../RELEASING.zh-CN.md) 中定义的 temporary RC admission bridge，
+包括 installed-consumer 与 fresh fixture 两种形态；两者都不是 consumer installation。
+
 必须逐字复制两份 canonical workflows。Action step 无法定义的不同 event 与 permission
 边界由它们分别负责：
 

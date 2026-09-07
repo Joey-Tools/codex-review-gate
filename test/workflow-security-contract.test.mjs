@@ -330,6 +330,22 @@ test("package installation docs require workflow, CODEOWNERS, and ruleset togeth
   }
 });
 
+test("installation docs reserve prerelease selectors for both RC bridge forms", () => {
+  for (const [name, guide] of Object.entries(installGuides)) {
+    assert.match(guide, /temporary\s+RC\s+admission\s+bridge/iu, name);
+    assert.match(
+      guide,
+      /installed-consumer[\s\S]{0,80}fresh(?:-fixture|\s+fixture)/iu,
+      name,
+    );
+    assert.match(
+      guide,
+      /(?:neither|两者都)[\s\S]{0,100}(?:consumer\s+installation|installation)/iu,
+      name,
+    );
+  }
+});
+
 test("public package docs preserve bootstrap sequencing", () => {
   const sections = {
     "README.md": "## Install the complete consumer contract",
@@ -1685,12 +1701,38 @@ test("release docs bind artifact retention to the approval window", () => {
 
 test("release docs define the default-branch RC bridge and closed verification recovery", () => {
   for (const [name, guide] of Object.entries(releaseGuides)) {
+    const bridgeStart = guide.indexOf("### Stable v2.0 RC admission bridge");
+    const bridgeEnd = guide.indexOf("\n## ", bridgeStart);
+    assert.notEqual(bridgeStart, -1, `${name}: RC bridge heading`);
+    assert.notEqual(bridgeEnd, -1, `${name}: RC bridge boundary`);
+    const bridge = guide.slice(bridgeStart, bridgeEnd);
+    const freshStart = bridge.indexOf("**Fresh temporary fixture");
+    assert.notEqual(freshStart, -1, `${name}: fresh fixture heading`);
+    const fresh = bridge.slice(freshStart);
+    const scopeStart = Math.max(
+      guide.indexOf("## Initial v2 scope"),
+      guide.indexOf("## 初始 v2 scope"),
+    );
+    const scopeEnd = guide.indexOf("\n## ", scopeStart);
+    assert.notEqual(scopeStart, -1, `${name}: initial-scope heading`);
+    assert.notEqual(scopeEnd, -1, `${name}: initial-scope boundary`);
+    const scope = guide.slice(scopeStart, scopeEnd);
+
     for (const required of [
       /@v2\.0\.0-rc\.N/u,
       /test consumer/iu,
       /owner-reviewed/iu,
       /default branch/iu,
       /selector-only/iu,
+      /fresh temporary fixture/iu,
+      /last-push approval/iu,
+      /complete paginated review inventory/iu,
+      /exact RC bytes/iu,
+      /(?:does not|不得).{0,80}CODEOWNERS/iu,
+      /(?:neither is|不是)[\s\S]{0,80}ordinary consumer\s+installation/iu,
+      /(?:unique(?:ly)?\s+named|唯一命名)[\s\S]{0,100}repository\s+ruleset/iu,
+      /classic branch-protection/iu,
+      /normalized\s+(?:profile|ruleset\s+profile)/iu,
       /begin-review/u,
       /reconcile/u,
       /exact head/iu,
@@ -1702,10 +1744,42 @@ test("release docs define the default-branch RC bridge and closed verification r
       /dedicated canary job/iu,
       /closed recovery/iu,
       /exact pre-bridge/iu,
-      /(?:only[^.。]{0,120}(?:originally|原本)[^.。]{0,120}@v2|若原状态[^.。]{0,120}@v2)/iu,
+      /(?:only[^.。]{0,120}(?:originally|原本)[^.。]{0,120}@v2|(?:若原状态|原本就有)[^.。]{0,120}@v2)/iu,
       /(?:otherwise[^.。]{0,120}remove|否则[^.。]{0,120}删除)/iu,
     ]) {
       assert.match(guide, required, `${name}: ${required}`);
+    }
+
+    for (const required of [
+      /(?:unique(?:ly)?\s+named|唯一命名)[\s\S]{0,100}repository\s+ruleset/iu,
+      /(?:no\s+bypass\s+actor|没有\s+bypass\s+actor)/iu,
+      /(?:one\s+approval|一名\s+reviewer\s+approval)/iu,
+      /(?:stale-approval\s+dismissal|dismiss\s+stale\s+approvals)/iu,
+      /last-push\s+approval/iu,
+      /(?:no\s+required\s+status\s+check|没有\s+required\s+status\s+check)/iu,
+      /(?:returned\s+ID|返回的\s+ID)/iu,
+      /rulesetWritableFingerprint\(\)/u,
+      /source_type=Repository/iu,
+      /source=<owner>\/<repository>/iu,
+      /classic\s+branch-protection\s+`PUT`\/`DELETE`/iu,
+      /complete\s+paginated\s+review\s+inventory/iu,
+      /expected\s+`sha`/iu,
+      /(?:It\s+does\s+not\s+add|不得新增)\s+CODEOWNERS/iu,
+      /(?:Whether[\s\S]{0,120}succeeds,[\s\S]{0,120}fails,[\s\S]{0,120}cancelled|无论[\s\S]{0,120}成功、失败、被取消)/u,
+      /(?:every\s+terminal\s+result[\s\S]{0,100}cleanup|每个\s+terminal\s+result[\s\S]{0,100}cleanup)/iu,
+      /(?:keep\s+the\s+temporary\s+ruleset\s+active\s+through\s+the\s+cleanup\s+PR's\s+successful\s+merge|必须保持\s+active，直到[\s\S]{0,80}cleanup\s+PR\s+successful\s+merge)/iu,
+      /exclusive\s+owner\s+(?:maintenance\s+)?window/iu,
+      /(?:reread\s+the\s+effective\s+default-branch\s+rules\s+inventory[\s\S]{0,100}same\s+ID[\s\S]{0,60}absent|重读\s+effective\s+default-branch\s+rules\s+inventory[\s\S]{0,100}同一\s+ID[\s\S]{0,60}不存在)/iu,
+      /exact\s+RC\s+bytes/iu,
+    ]) {
+      assert.match(fresh, required, `${name}: fresh RC fixture ${required}`);
+    }
+
+    for (const required of [
+      /(?:after\s+every\s+terminal\s+gate\s+result|每个\s+terminal\s+gate\s+result\s+后)[\s\S]{0,120}forward\s+PR/iu,
+      /(?:only a successful gate|只有\s+successful gate)[\s\S]{0,100}stable admission/iu,
+    ]) {
+      assert.match(scope, required, `${name}: RC scope summary ${required}`);
     }
   }
 });

@@ -34,6 +34,11 @@ push. Both workflows call the compatible floating major:
 uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
+Do not replace this selector with a prerelease. The only exception is the
+release operator's temporary RC admission bridge in
+[`RELEASING.md`](../RELEASING.md), including its installed-consumer and fresh
+fixture forms; neither is consumer installation.
+
 Copy both canonical workflows unchanged. They own separate event and permission
 boundaries that an Action step cannot define:
 

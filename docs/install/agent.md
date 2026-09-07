@@ -326,7 +326,11 @@ Maintain these invariants:
 
 The canonical workflows must have this contract after the merge:
 
-- `JoeyTeng/codex-review-gate-action@v2`;
+- `JoeyTeng/codex-review-gate-action@v2`; a prerelease selector is never an
+  installation value. The sole exception is the release operator's temporary
+  RC admission bridge in [`RELEASING.md`](../RELEASING.md), including its
+  installed-consumer and fresh-fixture forms; neither is an installation or
+  activation path;
 - verifier path `.github/workflows/codex-review-gate.yml`, workflow name
   `Codex Review Gate Verifier`, `pull_request` types `opened`, `reopened`,
   `synchronize`, `ready_for_review`, and required job
