@@ -10,8 +10,10 @@ This Action coordinates Codex review requests and reduces evidence into the
 native `codex/github-review-gate` verifier CheckRun. GitHub records the verifier
 run/job/CheckRun against the exact PR feature-head SHA. The verifier executes
 on `refs/pull/N/merge` and strictly validates
-`GITHUB_REF`, `GITHUB_SHA`, event head/base/test-merge SHAs and a fresh PR read,
-while the protected top-level `run-name` produces an exact
+`GITHUB_REF`, `GITHUB_SHA`, event head/base scope, and a fresh PR read whose
+test-merge matches the runtime SHA. Event validation is limited to head/base
+SHA, ref, and repository; event `merge_commit_sha` may be missing or historical
+and is not a binding input. The protected top-level `run-name` produces an exact
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>` `display_title`.
 Activation also binds the run's sole PR record to the current feature head and
 default-branch base SHA. Together these receipts bind success to the exact
@@ -88,8 +90,9 @@ cron, runtime GitHub App, webhook or durable ledger.
 
 Only the verifier job's GitHub-managed CheckRun on the exact current PR
 feature-head SHA is the protected signal. Its success is valid only when the
-run's merge-ref environment, event scope and fresh PR read bind it to unchanged
-head, base and test-merge SHAs. The controller may create or adopt a
+run's merge-ref environment, event head/base scope (not event
+`merge_commit_sha`) and fresh PR read bind it to unchanged head, base and
+test-merge SHAs. The controller may create or adopt a
 review request and request one full rerun, but it cannot supply a verdict or
 rewrite that CheckRun. It must bind baseline attempt `A`, observe exact attempt
 `A+1` and its unique canonical job/CheckRun, and fail closed on ambiguous or

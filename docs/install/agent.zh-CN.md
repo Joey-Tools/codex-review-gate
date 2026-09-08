@@ -620,8 +620,10 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    要求 current canonical verifier CheckRun 恰好一个，
    `head_sha=$CANARY_HEAD`、GitHub Actions App ID 为 `15368`、
    `conclusion=success`。canonical `pull_request` verifier 在 `refs/pull/N/merge` 上执行；
-   Action 内部严格校验 `GITHUB_REF`、`GITHUB_SHA`、event PR head/base/test-merge SHAs 与
-   fresh PR read。要求该 run 的 exact `display_title` 为
+   Action 内部严格校验 `GITHUB_REF`、`GITHUB_SHA`、event PR head/base 范围，以及其
+   test-merge 与 runtime SHA 相同的 fresh PR read。事件校验仅限 head/base 的 SHA、ref 与
+   repository；event `merge_commit_sha` 可以缺失或来自历史快照，明确不作为 binding input。
+   要求该 run 的 exact `display_title` 为
    `codex-review-gate-verifier/$CANARY_PR/$CANARY_TEST_MERGE_SHA`，且唯一
    `pull_requests` binding 含 current feature head 与
    `base.sha=$DEFAULT_BRANCH_HEAD_SHA`。把该 feature-head CheckRun 绑定到 controller 报告的

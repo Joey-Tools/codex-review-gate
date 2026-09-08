@@ -702,7 +702,10 @@ legacy before v2 is Active and read back.
    `head_sha=$CANARY_HEAD`, GitHub Actions App ID `15368`, and
    `conclusion=success`. The canonical `pull_request` verifier executes on
    `refs/pull/N/merge`; inside the Action it strictly validates `GITHUB_REF`,
-   `GITHUB_SHA`, the event PR head/base/test-merge SHAs and a fresh PR read.
+   `GITHUB_SHA`, the event PR head/base scope, and a fresh PR read whose
+   test-merge matches the runtime SHA. Event validation is limited to head/base
+   SHA, ref, and repository; an event `merge_commit_sha` may be missing or
+   historical and is not a binding input.
    Require that run's exact `display_title` to equal
    `codex-review-gate-verifier/$CANARY_PR/$CANARY_TEST_MERGE_SHA`, and require
    its single `pull_requests` binding to contain the current feature head and

@@ -50,8 +50,10 @@ repository:
   verifier. Its GitHub-managed job CheckRun, `codex/github-review-gate`, is the
   required signal on the exact PR feature-head SHA. The workflow still executes
   on `refs/pull/N/merge` and binds that CheckRun to the unchanged current
-  head/base/test-merge scope through strict environment, event and fresh-read
-  validation.
+  head/base/test-merge scope through strict runtime merge-ref and fresh-read
+  validation. Event validation is limited to PR head/base SHA, ref, and
+  repository; its `merge_commit_sha` may be missing or historical and is not a
+  binding input.
 - `.github/workflows/codex-review-gate-controller.yml` is the protected
   default-branch controller. It admits exact Codex events and typed manual
   operations, creates review requests, and establishes a strictly newer full

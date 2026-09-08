@@ -443,12 +443,18 @@ recovery is needed, run a manual reconcile.
 GitHub records the verifier run/job/CheckRun against the exact PR feature-head
 SHA, not its test-merge SHA. The canonical `pull_request` verifier still
 executes on `refs/pull/N/merge`; inside the Action it strictly checks
-`GITHUB_REF`, `GITHUB_SHA`, the event PR head/base/test-merge SHAs and a fresh
-PR read. Its protected top-level `run-name` also makes GitHub expose the exact
+`GITHUB_REF`, `GITHUB_SHA`, the event PR head/base scope, and a fresh PR read
+whose test-merge matches the runtime SHA. Its protected top-level `run-name`
+also makes GitHub expose the exact
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>` as `display_title`;
 the run's sole PR binding must carry the current feature head and
 default-branch base SHA. A successful feature-head CheckRun is therefore
 execution-bound to the exact current test-merge.
+
+Event validation is limited to the PR head/base SHA, ref, and repository. Its
+`merge_commit_sha` may be missing or historical and is deliberately not a
+binding input.
+
 There is deliberately no cron or writable review event. The verifier starts on
 `opened`, `reopened`, `synchronize`, and `ready_for_review`; controller and
 verifier have separate per-PR concurrency namespaces. Before a deliberate
@@ -546,7 +552,8 @@ all of the following:
   canonical `codex/github-review-gate` CheckRun is `success` on that exact
   feature-head SHA;
 - that verifier run is bound to the unchanged current test-merge by its
-  merge-ref environment, event scope and fresh PR read;
+  merge-ref environment, event head/base scope (not event `merge_commit_sha`),
+  and fresh PR read;
 - the CheckRun expected source is GitHub Actions; and
 - the run summary reports `execution_health=healthy` and
   `gate_outcome=success`.

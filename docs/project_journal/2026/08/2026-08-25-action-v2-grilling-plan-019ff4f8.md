@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-09-07
+updated: 2026-09-08
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -3648,6 +3648,40 @@ superseded_by:
   default-branch inventory to require the fixture ID absent, and stops on any
   observed drift.
 
+### RC.1 launch-binding correction
+
+- The temporary bridge PR
+  `JoeyTeng/website-checking#3` deliberately failed closed in verifier run
+  `34142070505` before reading Codex evidence. Its native
+  `codex/github-review-gate` job reported that the `pull_request` verifier was
+  not bound to the exact current head/base/test-merge scope. No target default
+  branch or ruleset mutation followed that failure.
+- The visible live facts were coherent: PR feature head
+  `87238815c8286a733d8e91883532d9e3a8e4efea`, base
+  `c927e114075d39f86546baeb586a30b2a8f86598`, and runtime test-merge
+  `066bbede958c0cb29cbf0760d43e56583e953065`, whose parents are exactly that
+  base and head. The runtime and a fresh PR read both identified the same
+  test-merge. The historical frozen `pull_request` payload is not retained by
+  Actions REST, so the exact failing field cannot be reconstructed after the
+  run.
+- The verifier had additionally required the frozen event payload's
+  `pull_request.merge_commit_sha` to be a full SHA equal to the later fresh
+  test-merge. That value is an event snapshot rather than the actual execution
+  binding. The correction removes it from the pass/fail equality while
+  retaining fail-closed checks of the event head/base/repository/ref scope,
+  `GITHUB_REF=refs/pull/<PR>/merge`, and full
+  `GITHUB_SHA == fresh PR merge_commit_sha`. Missing fresh test-merge state
+  remains blocking. Failure summaries now identify the individual mismatched
+  binding fields without exposing credentials.
+- Regression coverage accepts a missing or historical event test-merge value
+  when the actual runtime/fresh binding is exact, and rejects a missing fresh
+  test-merge value. Corresponding design and installation text now distinguish
+  the event head/base snapshot from the runtime merge-ref binding.
+- RC.1 is immutable and the failed bridge pins it, so the fixture must not
+  merge. Publish a new immutable `v2.0.0-rc.2`, close bridge PR #3 unmerged,
+  then create a fresh exact-selector bridge and obtain a new current-head
+  independent approval before resuming the runtime canary.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -3698,10 +3732,11 @@ superseded_by:
 - PR #35 is merged. Its approved frozen RC recovery completed every
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
-- RC `v2.0.0-rc.1` is published and fully verified; no further RC recovery is
-  pending. Complete the designated fresh admission fixture and retain its
-  exact PR/run/CheckRun evidence before creating the stable `v2.0.0` release
-  intent.
+- RC `v2.0.0-rc.1` is immutable and its published assets are fully verified,
+  but its fresh admission fixture exposed the fail-closed launch-binding bug
+  recorded above. Publish `v2.0.0-rc.2`, then create and complete the new
+  exact-selector bridge and retain its exact PR/run/CheckRun evidence before
+  creating the stable `v2.0.0` release intent.
 - Before the stable release intent, remove `Workflows: read/write` from the
   Publisher App in its Settings and read its remaining three-permission surface
   back. The stable workflow must not retain the one-time RC transition

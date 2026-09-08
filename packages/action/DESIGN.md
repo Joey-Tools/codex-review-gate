@@ -131,8 +131,10 @@ event does not.
 GitHub records the verifier run/job/native CheckRun against the exact PR
 feature-head SHA even though the canonical `pull_request` workflow executes on
 `refs/pull/N/merge`. Inside the Action, `GITHUB_REF` and `GITHUB_SHA` must match
-that merge ref and the event test-merge SHA; the event head/base/test-merge
-values must also match a fresh PR read. The protected top-level `run-name`
+that merge ref and the fresh PR test-merge SHA; the event head/base values must
+also match a fresh PR read. Event validation is limited to head/base SHA, ref,
+and repository: event `merge_commit_sha` may be missing or historical and is
+not a binding input. The protected top-level `run-name`
 provides a second receipt: the run `display_title` must be
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>`, and its sole PR
 binding must carry the current feature head and default-branch base SHA. This
@@ -492,8 +494,9 @@ success.
 a blocking conclusion, keeping ordinary findings distinct from evaluator
 failure. The required verifier CheckRun belongs to the exact current PR
 feature-head SHA. Its `pull_request` run executes on `refs/pull/N/merge`, and
-strict environment/event/fresh-read validation binds success to the unchanged
-head, base and test-merge. The controller's CheckRun is bound to the default-branch commit and
+strict runtime merge-ref, event head/base, and fresh-read validation binds success to the unchanged
+head, base and test-merge. The event portion is limited to the PR head/base
+scope, never its `merge_commit_sha`. The controller's CheckRun is bound to the default-branch commit and
 never supplies the required PR result. Direct status projection and
 `statusProjection` are deleted.
 

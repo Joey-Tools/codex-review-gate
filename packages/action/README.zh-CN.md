@@ -6,7 +6,9 @@ Codex Review Gate 把单个 PR 上可信的 OpenAI Codex review 证据归约为 
 CheckRun `codex/github-review-gate`。GitHub 把 verifier run/job/CheckRun 记录在 exact PR
 feature-head SHA 上。canonical
 `pull_request` verifier 仍在 `refs/pull/N/merge` 上执行；Action 内部严格校验
-`GITHUB_REF`、`GITHUB_SHA`、event head/base/test-merge SHAs 和 fresh PR read。受保护的
+`GITHUB_REF`、`GITHUB_SHA`、event head/base 范围，以及其 test-merge 与 runtime SHA
+相同的 fresh PR read。事件校验仅限 head/base 的 SHA、ref 与 repository；event
+`merge_commit_sha` 可以缺失或来自历史快照，不作为 binding input。受保护的
 top-level `run-name` 还会让 GitHub 把
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>` 暴露为 run 的 exact
 `display_title`；activation 同时要求 run 唯一的 PR binding 含 current feature head 与
@@ -318,8 +320,9 @@ finding 通常得到 `healthy/failure`，而不是 execution error；`unhealthy/
 在 verifier workflow 中，只有被证明稳定的 `healthy/success` 可以成功结束；findings、
 pending evidence、unsupported scope、cancel、timeout 与全部 unhealthy 结果都保持
 blocking。required verifier CheckRun 属于 exact current PR feature-head SHA；它的
-`pull_request` run 在 `refs/pull/N/merge` 上执行，Action 的 environment/event/fresh-read
-校验把 success 绑定到 unchanged head、base 与 test-merge。controller 的
+`pull_request` run 在 `refs/pull/N/merge` 上执行，Action 的 runtime merge-ref、event head/base 与 fresh-read
+校验把 success 绑定到 unchanged head、base 与 test-merge；event 部分只绑定 head/base
+范围，绝不使用 event `merge_commit_sha`。controller 的
 CheckRun 绑定 default-branch commit，绝不是 required PR signal。
 direct status projection 与 `status_projection` 已删除。finding counts 仍只出现在 summary，
 不是 public Action outputs。

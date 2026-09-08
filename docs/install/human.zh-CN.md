@@ -378,8 +378,8 @@ verifier attempt；若结果只出现在 review 或 reaction，或者需要恢�
 
 GitHub 把 verifier run/job/CheckRun 记录在 exact PR feature-head SHA 上，而不是
 test-merge SHA 上。canonical `pull_request` verifier 仍在 `refs/pull/N/merge` 上执行；Action
-内部严格检查 `GITHUB_REF`、`GITHUB_SHA`、event PR head/base/test-merge SHAs 与 fresh PR
-read。受保护的 top-level `run-name` 还让 GitHub 把 exact
+内部严格检查 `GITHUB_REF`、`GITHUB_SHA`、event PR head/base 范围，以及其 test-merge 与
+runtime SHA 相同的 fresh PR read。受保护的 top-level `run-name` 还让 GitHub 把 exact
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>` 暴露为 `display_title`；run
 唯一的 PR binding 必须携带 current feature head 与 default-branch base SHA。因此
 successful feature-head CheckRun 会在执行语义上绑定 exact current test-merge。为了避免 idle PR 消耗
@@ -388,6 +388,9 @@ minutes，没有 cron 或可写 review event。verifier 在 `opened`、`reopened
 concurrency namespace。若要对同一 head deliberate re-review，先运行 `begin-review`，
 读回新 request 并观察严格更新的 verifier attempt。单独发 comment 不会 atomically
 invalidate 旧 success。
+
+事件校验仅限 PR head/base 的 SHA、ref 与 repository；其 `merge_commit_sha` 可以缺失或来自
+历史快照，明确不作为 binding input。
 
 若 base retarget 后 current exact head/base/test-merge scope 没有 verifier，遵循
 `create_verifier_run`：ready PR 先转为 draft 再 mark ready；already-draft PR 直接 mark
@@ -456,8 +459,8 @@ scoped controller reconcile。manual dispatch 没有 limits-profile 或 numeric 
 - PR base 与 test-merge SHA 未变；
 - controller 已建立严格更新的 verifier attempt，且该 exact feature-head SHA 上唯一
   canonical `codex/github-review-gate` CheckRun 是 `success`；
-- 该 verifier run 通过 merge-ref environment、event scope 与 fresh PR read 绑定 unchanged
-  current test-merge；
+- 该 verifier run 通过 merge-ref environment、event head/base scope（不使用 event
+  `merge_commit_sha`）与 fresh PR read 绑定 unchanged current test-merge；
 - CheckRun expected source 是 GitHub Actions；
 - summary 是 `execution_health=healthy` 与 `gate_outcome=success`。
 

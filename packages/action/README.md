@@ -7,7 +7,10 @@ request to the native required CheckRun `codex/github-review-gate`. GitHub
 records the verifier run/job/CheckRun against the exact PR feature-head SHA.
 The canonical `pull_request` verifier still executes on
 `refs/pull/N/merge`; inside the Action it strictly validates `GITHUB_REF`,
-`GITHUB_SHA`, the event head/base/test-merge SHAs and a fresh PR read. A
+`GITHUB_SHA`, the event head/base scope, and a fresh PR read whose test-merge
+matches the runtime SHA. Event validation is limited to head/base SHA, ref, and
+repository; event `merge_commit_sha` may be missing or historical and is not a
+binding input. A
 protected top-level `run-name` makes GitHub expose
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>` as the run's exact
 `display_title`; activation also requires the run's sole PR binding to contain
@@ -358,8 +361,9 @@ Findings normally produce `healthy/failure`, not an execution error.
 unsupported scope, cancellation, timeout and every unhealthy result remain
 blocking. The required verifier CheckRun belongs to the exact current PR
 feature-head SHA. Its `pull_request` run executes on `refs/pull/N/merge`, and
-the Action's environment/event/fresh-read checks bind success to the unchanged
-head, base and test-merge. The controller's CheckRun is attached to the default-branch commit
+the Action's runtime merge-ref, event head/base, and fresh-read checks bind success to the unchanged
+head, base and test-merge. Its event checks bind head/base scope, never event
+`merge_commit_sha`. The controller's CheckRun is attached to the default-branch commit
 and is never the required PR signal. Direct status projection and
 `status_projection` are deleted. Finding counts remain summary-only, not public
 Action outputs.
