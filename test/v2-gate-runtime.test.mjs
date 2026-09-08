@@ -3201,8 +3201,11 @@ test("pull_request edited is rejected before GitHub API access", async (context)
   assert.match(result.report.reason, /read-only verifier contract/u);
 });
 
-test("pull_request verifier rejects every tampered launch binding", async (context) => {
+test("pull_request verifier fails closed for altered launch or target bindings", async (context) => {
   const successEvidence = [ordinaryRequest(), cleanIssueComment(HEAD)];
+  const bindingReason =
+    "The pull_request verifier is not bound to the exact current PR head, base, and " +
+    "test-merge commit";
   const controlGitHub = createGitHubMock({ issueComments: successEvidence });
   const controlEnvironment = runtimeEnvironment(context, {
     suffix: "pull-request-binding-control",
@@ -3215,17 +3218,13 @@ test("pull_request verifier rejects every tampered launch binding", async (conte
     {
       label: "github-sha",
       mutateEnvironment: (environment) => { environment.GITHUB_SHA = NEXT_HEAD; },
-      expectedReason:
-        "The pull_request verifier is not bound to the exact current PR head, base, and " +
-        "test-merge commit",
+      expectedReason: `${bindingReason}: runtime_merge_sha`,
       expectedReadCount: 2,
     },
     {
       label: "github-ref",
       mutateEnvironment: (environment) => { environment.GITHUB_REF = "refs/heads/main"; },
-      expectedReason:
-        "The pull_request verifier is not bound to the exact current PR head, base, and " +
-        "test-merge commit",
+      expectedReason: `${bindingReason}: runtime_merge_ref`,
       expectedReadCount: 2,
     },
     {
@@ -3243,9 +3242,68 @@ test("pull_request verifier rejects every tampered launch binding", async (conte
     {
       label: "event-base",
       mutateEvent: (event) => { event.pull_request.base.sha = NEXT_HEAD; },
+      expectedReason: `${bindingReason}: event_base_sha`,
+      expectedReadCount: 2,
+    },
+    {
+      label: "event-base-ref",
+      mutateEvent: (event) => { event.pull_request.base.ref = "release"; },
+      expectedReason: `${bindingReason}: event_base_ref`,
+      expectedReadCount: 2,
+    },
+    {
+      label: "event-head-ref",
+      mutateEvent: (event) => { event.pull_request.head.ref = "replacement"; },
+      expectedReason: `${bindingReason}: event_head_ref`,
+      expectedReadCount: 2,
+    },
+    {
+      label: "event-base-repository",
+      mutateEvent: (event) => {
+        event.pull_request.base.repo.full_name = "other/repository";
+      },
+      expectedReason: "pull_request trigger did not satisfy the exact read-only verifier contract",
+      expectedReadCount: 0,
+    },
+    {
+      label: "event-head-repository",
+      mutateEvent: (event) => {
+        event.pull_request.head.repo.full_name = "other/repository";
+      },
+      expectedReason: "pull_request trigger did not satisfy the exact read-only verifier contract",
+      expectedReadCount: 0,
+    },
+    {
+      label: "fresh-head",
+      githubOptions: { pullRequestOverrides: { head: { sha: NEXT_HEAD } } },
+      expectedReason: `${bindingReason}: current_head_sha`,
+      expectedReadCount: 2,
+    },
+    {
+      label: "fresh-head-ref",
+      githubOptions: { pullRequestOverrides: { head: { ref: "replacement" } } },
+      expectedReason: `${bindingReason}: event_head_ref`,
+      expectedReadCount: 2,
+    },
+    {
+      label: "fresh-fork",
+      githubOptions: {
+        pullRequestOverrides: { head: { repo: { full_name: "other/repository" } } },
+      },
+      expectedReason: "Action v2 does not support fork pull requests",
+      expectedReadCount: 2,
+    },
+    {
+      label: "fresh-base",
+      githubOptions: { pullRequestOverrides: { base: { sha: NEXT_HEAD } } },
+      expectedReason: `${bindingReason}: event_base_sha`,
+      expectedReadCount: 2,
+    },
+    {
+      label: "fresh-nondefault-base",
+      githubOptions: { pullRequestOverrides: { base: { ref: "release" } } },
       expectedReason:
-        "The pull_request verifier is not bound to the exact current PR head, base, and " +
-        "test-merge commit",
+        "Action v2 requires the repository default branch as the pull-request base",
       expectedReadCount: 2,
     },
     {
@@ -3275,7 +3333,10 @@ test("pull_request verifier rejects every tampered launch binding", async (conte
       event,
     });
     scenario.mutateEnvironment?.(environment);
-    const github = createGitHubMock({ issueComments: successEvidence });
+    const github = createGitHubMock({
+      issueComments: successEvidence,
+      ...scenario.githubOptions,
+    });
     const { result } = await runGate(environment, github);
     assert.equal(result.exitCode, 1, scenario.label);
     assert.notEqual(result.report.gateOutcome, "success", scenario.label);
@@ -3294,6 +3355,25 @@ test("pull_request verifier rejects every tampered launch binding", async (conte
   }
 });
 
+test("pull_request verifier accepts an unavailable or historical event test-merge SHA", async (context) => {
+  const successEvidence = [ordinaryRequest(), cleanIssueComment(HEAD)];
+  for (const [label, mergeCommitSha] of [
+    ["missing", null],
+    ["historical", NEXT_HEAD],
+  ]) {
+    const event = pullRequestEvent();
+    event.pull_request.merge_commit_sha = mergeCommitSha;
+    const environment = runtimeEnvironment(context, {
+      suffix: `pull-request-event-test-merge-${label}`,
+      event,
+    });
+    const github = createGitHubMock({ issueComments: successEvidence });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 0, label);
+    assert.equal(result.report.gateOutcome, "success", label);
+  }
+});
+
 test("pull_request verifier rejects a changed test-merge commit without retargeting", async (context) => {
   const github = createGitHubMock({ pullRequestOverrides: { merge_commit_sha: NEXT_HEAD } });
   const environment = runtimeEnvironment(context, { suffix: "test-merge-drift" });
@@ -3303,6 +3383,25 @@ test("pull_request verifier rejects a changed test-merge commit without retarget
   assert.equal(result.report.gateOutcome, "not_applicable");
   assert.equal(result.report.recoveryCode, "refresh_head");
   assert.deepEqual(github.statusWrites, []);
+});
+
+test("pull_request verifier fails closed when the fresh PR has no test-merge SHA", async (context) => {
+  const bindingReason =
+    "The pull_request verifier is not bound to the exact current PR head, base, and " +
+    "test-merge commit: current_test_merge_sha, runtime_merge_sha";
+  const github = createGitHubMock({ pullRequestOverrides: { merge_commit_sha: null } });
+  const environment = runtimeEnvironment(context, { suffix: "missing-fresh-test-merge" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.equal(result.report.reason, bindingReason);
+  assert.deepEqual(github.statusWrites, []);
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.rerunRequests, []);
+  assert.deepEqual(github.stickyCreates, []);
+  assert.deepEqual(github.stickyPatches, []);
 });
 
 test("test-merge drift between complete snapshots invalidates verifier success", async (context) => {

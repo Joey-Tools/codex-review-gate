@@ -115,8 +115,9 @@ head/base/test-merge scope 创建 verifier；旧 event rerun 不能代替。
 
 GitHub 会把 verifier run/job/native CheckRun 记录在 exact PR feature-head SHA 上，尽管
 canonical `pull_request` workflow 在 `refs/pull/N/merge` 上执行。Action 内部要求
-`GITHUB_REF`、`GITHUB_SHA` 精确匹配该 merge ref 与 event test-merge SHA，并要求 event
-head/base/test-merge values 与 fresh PR read 一致。受保护的 top-level `run-name` 提供第二份
+`GITHUB_REF`、`GITHUB_SHA` 精确匹配该 merge ref 与 fresh PR test-merge SHA，并要求 event
+head/base values 与 fresh PR read 一致。事件校验仅限 head/base 的 SHA、ref 与 repository；
+event `merge_commit_sha` 可以缺失或来自历史快照，不作为 binding input。受保护的 top-level `run-name` 提供第二份
 receipt：run `display_title` 必须是
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>`，其唯一 PR binding 还必须携带
 current feature head 与 default-branch base SHA。这个 execution binding 使 successful
@@ -432,8 +433,8 @@ immediate retry 是否为有效 recovery operation。closed recovery-code set �
 native conclusion，其他 pair 全部映射为 blocking conclusion，从而区分普通 findings 与
 evaluator failure。required verifier CheckRun 属于 exact current PR feature-head SHA；
 它的 `pull_request` run 在 `refs/pull/N/merge` 上执行，严格的
-environment/event/fresh-read 校验把 success 绑定到 unchanged head、base 与 test-merge。
-controller CheckRun 绑定 default-branch commit，绝不提供 required PR
+runtime merge-ref、event head/base 与 fresh-read 校验把 success 绑定到 unchanged head、base 与 test-merge。
+其中 event 部分仅绑定 PR head/base 范围，绝不使用其 `merge_commit_sha`。controller CheckRun 绑定 default-branch commit，绝不提供 required PR
 result。direct status projection 与 `statusProjection` 已删除。
 
 每个结果都必须结合自己的 `recovery_code` 解读；health/outcome pair 本身不是操作

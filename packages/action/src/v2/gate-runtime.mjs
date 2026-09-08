@@ -1589,28 +1589,38 @@ function initializeV2Scope(
 
 function assertV2VerifierLaunchScope(config, pullRequest) {
   const eventPr = config.event?.pull_request;
-  const eventMergeSha = String(eventPr?.merge_commit_sha || "").toLowerCase();
   const currentMergeSha = String(pullRequest?.merge_commit_sha || "").toLowerCase();
   const githubSha = String(config.environment.GITHUB_SHA || "").toLowerCase();
   const expectedMergeRef = `refs/pull/${config.prNumber}/merge`;
-  if (
-    !FULL_SHA.test(eventMergeSha) ||
-    !FULL_SHA.test(currentMergeSha) ||
-    !FULL_SHA.test(githubSha) ||
-    eventMergeSha !== currentMergeSha ||
-    githubSha !== currentMergeSha ||
-    config.environment.GITHUB_REF !== expectedMergeRef ||
-    String(pullRequest.head.sha || "").toLowerCase() !== config.expectedHeadSha ||
-    String(eventPr?.head?.sha || "").toLowerCase() !== config.expectedHeadSha ||
-    String(eventPr?.base?.sha || "").toLowerCase() !==
-      String(pullRequest.base.sha || "").toLowerCase() ||
-    eventPr?.base?.ref !== pullRequest.base.ref ||
-    eventPr?.head?.ref !== pullRequest.head.ref ||
-    eventPr?.base?.repo?.full_name !== config.repository ||
-    eventPr?.head?.repo?.full_name !== config.repository
-  ) {
+  const mismatches = [
+    ["current_test_merge_sha", FULL_SHA.test(currentMergeSha)],
+    ["runtime_github_sha", FULL_SHA.test(githubSha)],
+    ["runtime_merge_sha", githubSha === currentMergeSha],
+    ["runtime_merge_ref", config.environment.GITHUB_REF === expectedMergeRef],
+    [
+      "current_head_sha",
+      String(pullRequest.head.sha || "").toLowerCase() === config.expectedHeadSha,
+    ],
+    [
+      "event_head_sha",
+      String(eventPr?.head?.sha || "").toLowerCase() === config.expectedHeadSha,
+    ],
+    [
+      "event_base_sha",
+      String(eventPr?.base?.sha || "").toLowerCase() ===
+        String(pullRequest.base.sha || "").toLowerCase(),
+    ],
+    ["event_base_ref", eventPr?.base?.ref === pullRequest.base.ref],
+    ["event_head_ref", eventPr?.head?.ref === pullRequest.head.ref],
+    ["event_base_repository", eventPr?.base?.repo?.full_name === config.repository],
+    ["event_head_repository", eventPr?.head?.repo?.full_name === config.repository],
+  ]
+    .filter(([, matches]) => !matches)
+    .map(([field]) => field);
+  if (mismatches.length > 0) {
     throw new V2StaleFailure(
-      "The pull_request verifier is not bound to the exact current PR head, base, and test-merge commit",
+      "The pull_request verifier is not bound to the exact current PR head, base, and " +
+        `test-merge commit: ${mismatches.join(", ")}`,
     );
   }
 }
