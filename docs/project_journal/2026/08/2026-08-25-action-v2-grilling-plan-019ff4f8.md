@@ -3717,6 +3717,12 @@ superseded_by:
   The same directional rule applies to immutable no-op recovery, final and
   alias-adjacent publisher captures, and public verification inventories; it
   never weakens an in-capture A/B read.
+- A fresh fixed-head independent review found that the English and Chinese
+  release docs still described cross-capture equality as total. Both now
+  explicitly distinguish exact raw A/B reads within one stable capture from
+  the two permitted cross-capture presentation advances and record that a
+  successful directional comparison rolls its baseline forward. This closes a
+  documentation-drift path without broadening the runtime policy.
 - This is publisher-control-only work and must remain separate from a release
   intent. The one-time v1-to-v2 target transition has completed, so
   `Workflows: read/write` must be removed immediately after its immutable

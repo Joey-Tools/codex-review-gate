@@ -587,11 +587,15 @@ asset。自动恢复严格限制为 selected mutable draft 上正好一个 `star
 App 上传、使用 planned `application/octet-stream`、size 为 0、digest 为空、name 属于
 expected inventory，并且正好占据 verified uploaded canonical prefix 的下一个 slot。Asset
 name 与 numeric ID 都必须唯一，其中 asset ID 在完整 inventory 内也必须全局唯一。完成
-final policy fence 后，publisher 立即取得 fresh stable by-ID A/B boundary，要求它与已选择
-boundary 完全相同，随后只对该 frozen asset ID 发出一次 unconditional DELETE。无论 DELETE
-返回 `204`、`404`、network failure 还是 response loss，都再通过 stable frozen-ID boundary
-reconcile；只有 exact starter ID 已消失且其他 protected fields 全部不变，publication 才能
-继续。否则返回 `inconclusive` / `starter-asset-deletion-unknown`，且本 invocation 不会发出
+final policy fence 后，publisher 立即取得 fresh stable by-ID A/B boundary。该 capture 内的两次
+raw read 必须完全相同；与 selected boundary 的跨 capture 比较只允许既定的 directional metadata
+advancement：忽略 non-authoritative `target_commitish` presentation，且 asset digest 只能保持不变
+或从 `null` 前进到 canonical lowercase `sha256:<64hex>`；接受后的 boundary 成为新的 baseline。
+随后只对该 frozen asset ID 发出一次 unconditional DELETE。无论 DELETE 返回 `204`、`404`、
+network failure 还是 response loss，都再通过 stable frozen-ID boundary reconcile；只有 exact
+starter ID 已消失，且其他变化仅为授权的一项 asset removal 加上至多同样的 directional metadata
+advancement，publication 才能继续。否则返回 `inconclusive` /
+`starter-asset-deletion-unknown`，且本 invocation 不会发出
 第二次 DELETE。Uploaded、nonzero、wrong-name、wrong-slot、wrong-uploader、
 wrong-content-type 或未绑定的 asset 永远不会被删除。
 
@@ -756,9 +760,14 @@ decision-relevant projection：它绑定 Release/asset object identity、tag 与
 policy、immutable metadata、asset digest/byte metadata，以及 author/uploader identity；
 刻意排除 `assets[].download_count`、timestamps 与 profile URL 等 observational/decorative API
 字段。Projection 会 canonicalize Release/page 与 asset array ordering，因此单纯的 pagination
-placement 或 response order 不会被视为 mutation，同时仍保留全部 protected values，先做
-A/B 比较再解释 policy。Reconcile 下载 asset 本身就可能改变 download counter，但不会改变任何受保护
-的发布属性；若把该计数视为状态 mutation，verifier 会让自己的稳定 snapshot 失效。
+placement 或 response order 不会被视为 mutation。单次 stable capture 内，raw A/B projection（包括
+`target_commitish` 与 asset digest）必须完全相同。两个 separately stable capture 之间，除
+non-authoritative `target_commitish` presentation 会被忽略之外，全部 protected values 仍必须 exact；
+asset digest 只能保持不变或从 `null` 前进到 canonical lowercase `sha256:<64hex>`，成功的比较会将
+baseline 向前推进。非空 digest 不得消失或变化。这个窄规则只容纳 service-side derived metadata
+materialization，不会接受 Release 或 asset replacement。Reconcile 下载 asset 本身就可能改变
+download counter，但不会改变任何受保护的发布属性；若把该计数视为状态 mutation，verifier 会让自己的
+稳定 snapshot 失效。
 
 Exact 已完成步骤经过验证后沿用；缺失的下一步只有在该 mutation contract 允许时才能
 恢复。Draft Release creation 是例外：一旦 immutable full tag 跨 invocation 已存在，稳定
