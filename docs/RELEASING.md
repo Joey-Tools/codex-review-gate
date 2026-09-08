@@ -258,10 +258,12 @@ For the one-time RC transition, the installed App grants the implicit
 `Metadata: read` plus `Contents: read/write`, `Administration: read`, and
 `Workflows: read/write`. The publisher first requests only Metadata read for
 the complete-installation inventory token, then requests all four permissions
-for its one-repository transition writer token. After immutable RC readback is
-complete and no further RC recovery is needed, remove `Workflows: read/write`
-from the App before preparing the stable release. Its different frozen target
-head makes the next run require exactly Metadata read, Contents read/write, and
+for its one-repository transition writer token. Once that transition's
+immutable Release has been read back successfully, immediately remove
+`Workflows: read/write` before any later release intent reaches source
+`master`, including a later RC. Recovery of the already immutable transition
+does not need that permission. Its different frozen target head makes every
+later run require exactly Metadata read, Contents read/write, and
 Administration read; it leaves the optional Workflows input empty and fails
 closed if the App still retains it.
 

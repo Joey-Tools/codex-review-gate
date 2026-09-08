@@ -940,6 +940,12 @@ function fakeGithubEnvironment(state, mutationPhase) {
     tag: "v2.0.0",
     name: "v2.0.0",
     body: "",
+    target_commitish: "master",
+    draft_asset_digests_null: [
+      "draft-publication-materializes-target-commitish-and-digest",
+      "draft-publication-late-digest-materialization",
+      "verify-digest-materialization",
+    ].includes(mutationPhase),
     author_login: "codex-review-gate-action-publisher[bot]",
     asset_uploader_login: "codex-review-gate-action-publisher[bot]",
     latest: null,
@@ -977,6 +983,8 @@ function fakeGithubEnvironment(state, mutationPhase) {
     absent_boundary_api_reads: 0,
     release_api_reads: 0,
     release_id_reads: 0,
+    post_publish_release_id_reads: 0,
+    late_digest_materialized: false,
     release_inventory_reads: 0,
     release_create_calls: 0,
     post_create_inventory_reads: 0,
@@ -1061,7 +1069,7 @@ const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z", options 
     size: options.size ?? bytes.byteLength,
     digest: options.digest !== undefined
       ? options.digest
-      : assetState === "starter" ? null : digest(bytes),
+      : assetState === "starter" || state.draft_asset_digests_null ? null : digest(bytes),
     download_count: state.asset_download_count,
     created_at: created,
     updated_at: state.asset_timestamp_variant ||
@@ -1084,7 +1092,7 @@ const releaseApi = (state, options = {}) => ({
   tag_name: state.tag,
   name: state.name,
   body: state.body,
-  target_commitish: "master",
+  target_commitish: options.target_commitish ?? state.target_commitish,
   prerelease: state.prerelease,
   draft: options.draft ?? state.draft,
   immutable: options.immutable ?? state.immutable,
@@ -1572,6 +1580,15 @@ if (args[0] === "api") {
     state.publish_patch_payload = payload;
     state.draft = false;
     state.immutable = phase !== "post-publish-mutable";
+    if (phase === "draft-publication-materializes-target-commitish-and-digest") {
+      state.target_commitish = state.tag;
+      state.draft_asset_digests_null = false;
+    } else if (phase === "draft-publication-digest-mutation") {
+      state.target_commitish = state.tag;
+      if (state.assets.length > 0) {
+        state.assets[0].digest = "sha256:" + "f".repeat(64);
+      }
+    }
     state.latest = payload.make_latest === "true" ? state.tag : state.latest;
     save(state);
     if (phase === "patch-response-lost-after-apply") {
@@ -1711,6 +1728,17 @@ if (args[0] === "api") {
     }
     save(state);
     process.stdout.write(JSON.stringify(pages) + "\\n");
+    if (phase === "prewrite-inventory-digest-materialization" &&
+        state.exists && state.release_inventory_reads === 2 &&
+        !state.late_digest_materialized) {
+      state.target_commitish = state.tag;
+      state.draft_asset_digests_null = false;
+      state.late_digest_materialized = true;
+      appendTrace(state, "event", "prewrite-inventory-digest-materialization", {
+        phase,
+        release_inventory_reads: state.release_inventory_reads,
+      });
+    }
     process.exit(0);
   }
   if (endpoint.endsWith("/releases/latest")) {
@@ -1840,6 +1868,22 @@ if (args[0] === "api") {
       }
     }
     process.stdout.write(JSON.stringify(response) + "\\n");
+    if (phase === "draft-publication-late-digest-materialization" &&
+        state.publish_patch_calls === 1 && !state.draft && state.immutable &&
+        !state.late_digest_materialized) {
+      state.post_publish_release_id_reads += 1;
+      if (state.post_publish_release_id_reads === 2) {
+        state.target_commitish = state.tag;
+        state.draft_asset_digests_null = false;
+        state.late_digest_materialized = true;
+        appendTrace(state, "event", "post-publish-digest-materialization", {
+          phase,
+          post_publish_release_id_reads: state.post_publish_release_id_reads,
+        });
+      } else {
+        save(state);
+      }
+    }
     if (!state.observational_mutation_done && state.assets.length > 1 &&
         phase === "release-boundary-download-count-drift") {
       state.asset_download_count += 1;
@@ -1907,6 +1951,13 @@ if (args[0] === "api") {
       process.exit(0);
     }
     process.stdout.write(JSON.stringify(resolvedRelease) + "\\n");
+    if (phase === "verify-digest-materialization" && state.release_api_reads === 1 &&
+        !state.late_digest_materialized) {
+      state.target_commitish = state.tag;
+      state.draft_asset_digests_null = false;
+      state.late_digest_materialized = true;
+      appendTrace(state, "event", "public-verify-digest-materialization", { phase });
+    }
     process.exit(0);
   }
   if (endpoint.includes("/commits/") || endpoint.includes("/git/tags/")) {
@@ -2907,10 +2958,10 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     "capture_release_boundary pre-publication-mutation true false",
   );
   const finalBoundaryGuard = publication.indexOf(
-    '[[ "$before_boundary" == "$current_boundary" ]] || {',
+    'advance_release_boundary "$current_boundary" "$before_boundary" steady || {',
     finalBoundary,
   );
-  const finalBoundaryEndMarker = "\n    }\n    release_id=";
+  const finalBoundaryEndMarker = "\n    }\n    current_boundary=\"$before_boundary\"\n    release_id=";
   const finalBoundaryEnd = publication.indexOf(finalBoundaryEndMarker, finalBoundaryGuard);
   const frozenReleaseId = publication.indexOf("release_id=", finalBoundary);
   const payload = publication.indexOf("publication_payload=", frozenReleaseId);
@@ -2931,7 +2982,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     /\.release\.id \| select\(type == "number" and floor == \. and \. > 0\)[\s\S]*jq -cS -n[\s\S]*\{tag_name:\$tag_name,name:\$name,body:\$body,draft:false,prerelease:\$prerelease,make_latest:\$make_latest\}[\s\S]*publisher_gh api[\s\\]*--method PATCH[\s\\]*--header 'X-GitHub-Api-Version: 2026-03-10'[\s\\]*"repos\/\$TARGET_REPOSITORY\/releases\/\$release_id"[\s\\]*--input "\$publication_payload"/u,
   );
   const localOnlyAfterFinalBoundary = publication.slice(
-    finalBoundaryEnd + "\n    }\n".length,
+    finalBoundaryEnd + "\n    }\n    current_boundary=\"$before_boundary\"\n".length,
     directPatch,
   );
   const shellFunctions = [...publisher.matchAll(
@@ -2976,7 +3027,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
     aliasImmutablePolicy,
   );
   const aliasBoundaryComparison = publisher.indexOf(
-    '[[ "$pre_alias_boundary" == "$final_confirm_boundary" ]] || {',
+    'advance_release_boundary "$final_confirm_boundary" "$pre_alias_boundary" steady || {',
     aliasFinalBoundary,
   );
   const aliasBoundaryEndMarker = '\n    fi\n    if [[ "$alias_mode" == "force-with-lease" ]]';
@@ -3083,10 +3134,28 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   const aliasValidator = publisher.slice(aliasValidatorStart, aliasValidatorEnd);
   assert.match(aliasValidator, /"\$object" =~ \^\[0-9a-f\]\{40\}\$/u);
   assert.match(aliasValidator, /"\$count" == "2" && -n "\$direct" && -n "\$peeled"/u);
+  const firstPrewriteInventoryAudit = publisher.indexOf(
+    "audit_release_inventory\nprewrite_release_inventory_fingerprint=",
+  );
   assert.ok(
     publisher.indexOf('[[ "$prewrite_ref_fingerprint_cloned" == "$initial_remote_ref_fingerprint" ]]') <
-      publisher.indexOf('audit_release_inventory "$initial_release_inventory_fingerprint"'),
+      firstPrewriteInventoryAudit,
     "prewrite namespace drift must become inconclusive before semantic history audit",
+  );
+  assert.notEqual(firstPrewriteInventoryAudit, -1, "missing prewrite Release inventory capture");
+  const prewriteInventoryAdvance = publisher.slice(
+    firstPrewriteInventoryAudit,
+    publisher.indexOf("audit_release_history", firstPrewriteInventoryAudit),
+  );
+  assert.match(
+    prewriteInventoryAdvance,
+    /advance_release_inventory[\s\\]*"\$initial_release_inventory_snapshot"[\s\\]*"\$prewrite_release_inventory_snapshot"\s*\|\|\s*\{[\s\S]*?fail_reconcile inconclusive remote-state-changed[\s\S]*?\n[ \t]*\}\n[ \t]*initial_release_inventory_snapshot="\$prewrite_release_inventory_snapshot"/u,
+    "cross-capture Release inventories must fail closed before advancing the forward-only baseline",
+  );
+  assert.match(
+    publisher,
+    /stable_release_identity[\s\S]*advance_release_inventory[\s\\]*"\$initial_release_neutral_snapshot"[\s\\]*"\$stable_release_neutral_snapshot"/u,
+    "existing Release prewrite metadata must use the forward-only inventory comparator",
   );
   assert.match(publisher, /audit_release_inventory\(\)[\s\S]*expected_fingerprint[\s\S]*remote-state-changed/u);
   assert.match(publisher, /is_v2_plus_major_alias "\$tag"[\s\S]*floating-alias-release/u);
@@ -3128,7 +3197,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   );
   assert.match(
     releaseReconcile,
-    /\$adopted\.release == \$boundary\.release and[\s\S]*\$adopted\.assets == \$boundary\.assets[\s\S]*manually adopted Draft Release changed/u,
+    /advance_release_boundary "\$manual_draft_with_tag" "\$current_boundary" steady[\s\S]*manually adopted Draft Release changed/u,
   );
   assert.match(workflow, /outputs:[\s\S]*reconcile_state: \$\{\{ steps\.reconcile\.outputs\.reconcile_state \}\}[\s\S]*id: reconcile/u);
   assert.match(workflow, /verify:[\s\S]*if: \$\{\{ needs\.publish\.outputs\.reconcile_state != 'superseded' \}\}/u);
@@ -4059,6 +4128,50 @@ test("public verification emits one closed recovery tuple for success and key fa
   assert.match(unreadable.stderr, /next_action=retry-public-verification/u);
 });
 
+test("public verification permits forward Release metadata materialization", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, { label: "verify-digest-materialization" });
+  publishCandidate(state, built);
+  const phase = "verify-digest-materialization";
+  const githubEnvironment = fakeGithubEnvironment(state, phase);
+  const fakeStatePath = join(state.root, `fake-gh-state-${phase}`, "state.json");
+  const fakeAssets = join(dirname(fakeStatePath), "assets");
+  const assetNames = releaseAssets(state, "v2.0.0").filter((name) =>
+    !["immutable", "prerelease", "published"].includes(name));
+  for (const name of assetNames) {
+    copyFileSync(join(state.releases, "v2.0.0", name), join(fakeAssets, name));
+  }
+  const publishedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  Object.assign(publishedState, {
+    assets: assetNames.map((name, index) => ({ name, id: index + 1 })),
+    body: `Signed release of Joey-Tools/codex-review-gate@${built.sourceCommit}.`,
+    draft: false,
+    exists: true,
+    immutable: true,
+    latest: "v2.0.0",
+    name: "v2.0.0",
+    next_asset_id: assetNames.length + 1,
+    prerelease: false,
+    tag: "v2.0.0",
+  });
+  writeJson(fakeStatePath, publishedState);
+
+  const result = invokeVerifyPublished(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const observedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(observedState.late_digest_materialized, true);
+  assert.equal(observedState.draft_asset_digests_null, false);
+  assert.equal(observedState.target_commitish, "v2.0.0");
+  assert.ok(observedState.release_api_reads >= 2);
+  assert.ok(observedState.call_trace.some(
+    ({ type, kind }) => type === "event" && kind === "public-verify-digest-materialization",
+  ));
+});
+
 test("public verification rejects a rolled-back alias behind the highest complete stable release", (t) => {
   const state = fixture(t);
   const old = buildAssembledCandidate(state, { label: "public-highest-stable-old" });
@@ -4325,6 +4438,62 @@ test("an already-complete release is a byte-stable no-op on rerun", (t) => {
   assert.equal(git(state.target, ["rev-parse", "refs/tags/v2.0.0"]), before.full);
   assert.equal(git(state.target, ["rev-parse", "refs/tags/v2"]), before.alias);
   assert.deepEqual(readFileSync(join(state.releases, "v2.0.0", "release-provenance.json")), before.provenance);
+});
+
+test("an existing complete GitHub Release permits forward prewrite inventory metadata materialization", (t) => {
+  const state = fixture(t);
+  const built = buildAssembledCandidate(state, {
+    label: "prewrite-inventory-digest-materialization",
+  });
+  publishCandidate(state, built);
+  const phase = "prewrite-inventory-digest-materialization";
+  const githubEnvironment = fakeGithubEnvironment(state, phase);
+  const fakeStatePath = join(state.root, `fake-gh-state-${phase}`, "state.json");
+  const fakeAssets = join(dirname(fakeStatePath), "assets");
+  const assetNames = releaseAssets(state, "v2.0.0").filter((name) =>
+    !["immutable", "prerelease", "published"].includes(name));
+  for (const name of assetNames) {
+    copyFileSync(join(state.releases, "v2.0.0", name), join(fakeAssets, name));
+  }
+  const publishedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  Object.assign(publishedState, {
+    assets: assetNames.map((name, index) => ({
+      name,
+      id: index + 1,
+      release_id: publishedState.release_id,
+    })),
+    body: `Signed release of Joey-Tools/codex-review-gate@${built.sourceCommit}.`,
+    draft: false,
+    draft_asset_digests_null: true,
+    exists: true,
+    immutable: true,
+    latest: "v2.0.0",
+    name: "v2.0.0",
+    next_asset_id: assetNames.length + 1,
+    prerelease: false,
+    tag: "v2.0.0",
+    target_commitish: "master",
+  });
+  writeJson(fakeStatePath, publishedState);
+
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: githubEnvironment,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /reconcile_state=already_complete/u);
+  const observedState = JSON.parse(readFileSync(fakeStatePath, "utf8"));
+  assert.equal(observedState.late_digest_materialized, true);
+  assert.equal(observedState.draft_asset_digests_null, false);
+  assert.equal(observedState.target_commitish, "v2.0.0");
+  assert.ok(observedState.release_inventory_reads >= 3);
+  const materialization = observedState.call_trace.find(
+    ({ type, kind }) => type === "event" && kind === "prewrite-inventory-digest-materialization",
+  );
+  assert.equal(materialization?.release_inventory_reads, 2);
+  assert.equal(observedState.release_create_calls, 0, "no-op retry must not create a new Release");
+  assert.equal(observedState.publish_patch_calls, 0, "no-op retry must not patch the completed Release");
 });
 
 test("a complete immutable Release with a missing alias resumes only the alias", (t) => {
@@ -6343,6 +6512,77 @@ test("mutable post-publication readback blocks the floating alias", (t) => {
   assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
 });
 
+test("Draft publication accepts GitHub target_commitish drift and digest materialization", (t) => {
+  const state = fixture(t);
+  const phase = "draft-publication-materializes-target-commitish-and-digest";
+  const built = buildAssembledCandidate(state, { label: phase });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, phase),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${phase}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.target_commitish, "v2.0.0");
+  assert.equal(fakeState.draft_asset_digests_null, false);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2"]), "tag");
+});
+
+test("Draft publication accepts digest materialization after post-publish capture", (t) => {
+  const state = fixture(t);
+  const phase = "draft-publication-late-digest-materialization";
+  const built = buildAssembledCandidate(state, { label: phase });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, phase),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${phase}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.post_publish_release_id_reads, 2);
+  assert.equal(fakeState.late_digest_materialized, true);
+  assert.equal(fakeState.target_commitish, "v2.0.0");
+  assert.equal(fakeState.draft_asset_digests_null, false);
+  assert.ok(fakeState.release_id_reads >= 4);
+  assert.ok(fakeState.call_trace.some(
+    ({ type, kind }) => type === "event" && kind === "post-publish-digest-materialization",
+  ));
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2"]), "tag");
+});
+
+test("Draft publication rejects a digest mutation even when target_commitish drifts", (t) => {
+  const state = fixture(t);
+  const phase = "draft-publication-digest-mutation";
+  const built = buildAssembledCandidate(state, { label: phase });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, phase),
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=immutable-release-mismatch/u);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${phase}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.target_commitish, "v2.0.0");
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
 for (const policyDrift of ["source", "ruleset"]) {
   test(`${policyDrift} policy drift after the first write stops the partial prefix`, (t) => {
     const state = fixture(t);
@@ -7204,6 +7444,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  150,
+  155,
   "release pipeline shard registration inventory drift",
 );

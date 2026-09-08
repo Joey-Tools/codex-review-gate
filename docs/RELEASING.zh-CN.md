@@ -213,10 +213,12 @@ alias 升级仍需普通 reviewed infrastructure PR，且不得与 release-inten
 一次性 RC transition 期间，Installed App 授予隐含的 `Metadata: read`、
 `Contents: read/write`、`Administration: read` 与 `Workflows: read/write`。Publisher
 先为完整 installation inventory token 只请求 Metadata read，再为 one-repository
-transition writer token 请求全部四项权限。immutable RC readback 完成且不再需要 RC
-recovery 后，在准备 stable release 前从 App 移除 `Workflows: read/write`。新的 frozen
-target head 会使下一次 run 严格要求 Metadata read、Contents read/write 与 Administration
-read，并把可选 Workflows input 留空；若 App 仍保留该权限则 fail closed。
+transition writer token 请求全部四项权限。该 transition 的 immutable Release 成功
+readback 后，应立即从 App 移除 `Workflows: read/write`，并且必须在任何后续
+release intent（包括后续 RC）进入 source `master` 前完成。已经 immutable 的 transition
+自身进行 recovery 不需要该权限。不同的 frozen target head 会让之后的每次 run 严格要求
+Metadata read、Contents read/write 与 Administration read，并把可选 Workflows input
+留空；若 App 仍保留该权限则 fail closed。
 
 `marketplace-production` Environment 提供：
 

@@ -3682,6 +3682,48 @@ superseded_by:
   then create a fresh exact-selector bridge and obtain a new current-head
   independent approval before resuming the runtime canary.
 
+### RC.2 GitHub Release boundary correction
+
+- RC.2 release-intent PR #46 landed at source commit
+  `e35104a74f8319706cc7dfd29770d663854bcc07`. Publisher run
+  `34211572329` attempt 2 completed the target mutations and then stopped in
+  the Draft-to-immutable Release boundary comparison. The already published
+  target facts are: target `master`
+  `6eab8d369137207f3b4fd414c5365831317636a1`, annotated tag object
+  `b905fa0e31af8a4efc4b5bedcaf3795ee4c362ad` peeled to that commit, immutable
+  prerelease Release ID `384910871`, and the three expected Publisher App
+  assets. `refs/tags/v2` remains absent; this prerelease never advances a
+  floating alias.
+- The failed attempt happened after the Release PATCH and asset uploads, so it
+  is not evidence that the immutable object was malformed. The raw Draft API
+  response was not retained as a durable artifact; consequently the durable record
+  must not claim which individual presentation field differed. GitHub documents
+  `target_commitish` as unused when the Git tag already exists, while Release
+  asset `digest` is server-produced nullable metadata and the documentation
+  does not promise when a non-null value appears.
+- The adopted correction is a directional boundary-advancement comparison. A
+  single `capture_release_boundary` remains two fully normalized raw API/tag
+  reads that must be exactly equal, so a change *during* a capture is still
+  `remote-state-changed`. Between two separately stable captures, only the
+  non-authoritative `target_commitish` presentation is ignored and an existing
+  asset digest may stay unchanged or advance from `null` to canonical lowercase
+  `sha256:<64hex>`. A non-null digest may never disappear or change.
+- Every protected property remains exact across that advancement: Release ID,
+  node ID, tag/name/body/prerelease/author, state except the explicit
+  Draft-to-published transition, tag object and peeled commit, asset count and
+  ID/node ID/name/state/type/size/URLs/uploader, and every expected mutation's
+  exact one-asset shape. Asset bytes are still downloaded and compared, and the
+  exact-source provenance plus detached OpenPGP signature are still verified.
+  The same directional rule applies to immutable no-op recovery, final and
+  alias-adjacent publisher captures, and public verification inventories; it
+  never weakens an in-capture A/B read.
+- This is publisher-control-only work and must remain separate from a release
+  intent. The one-time v1-to-v2 target transition has completed, so
+  `Workflows: read/write` must be removed immediately after its immutable
+  readback and before any later release intent, including RC.2, reaches
+  `master`. Recovery of the already immutable transition requires only the
+  normal three-permission writer surface.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -3732,15 +3774,16 @@ superseded_by:
 - PR #35 is merged. Its approved frozen RC recovery completed every
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
-- RC `v2.0.0-rc.1` is immutable and its published assets are fully verified,
-  but its fresh admission fixture exposed the fail-closed launch-binding bug
-  recorded above. Publish `v2.0.0-rc.2`, then create and complete the new
-  exact-selector bridge and retain its exact PR/run/CheckRun evidence before
-  creating the stable `v2.0.0` release intent.
-- Before the stable release intent, remove `Workflows: read/write` from the
-  Publisher App in its Settings and read its remaining three-permission surface
-  back. The stable workflow must not retain the one-time RC transition
-  permission.
+- RC `v2.0.0-rc.2` is already an immutable prerelease with its full tag and
+  assets created; complete its exact-source recovery/readback rather than
+  issuing another RC for the boundary-comparator failure. Then close bridge PR
+  #3 unmerged, create and complete the new exact-selector bridge, and retain
+  its exact PR/run/CheckRun evidence before creating the stable `v2.0.0`
+  release intent.
+- Keep the Publisher App at the already reduced three-permission surface
+  (Metadata read, Contents read/write, Administration read). No later release,
+  including the stable release, may retain the one-time transition's
+  `Workflows: read/write` permission.
 - Then land the stable `v2.0.0` release intent separately and execute its
   approved publisher workflow. Verify the immutable stable ref,
   Release/assets, signatures and `v2` floating alias before carrying out the

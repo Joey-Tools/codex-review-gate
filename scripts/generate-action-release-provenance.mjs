@@ -1982,6 +1982,323 @@ export function canonicalReleaseBoundarySnapshot(release, {
   });
 }
 
+function isCanonicalSha256ReleaseAssetDigest(value) {
+  return /^sha256:[0-9a-f]{64}$/u.test(value);
+}
+
+function validateReleaseBoundaryShape(boundary, label) {
+  if (
+    !hasExactKeys(boundary, ["release", "assets", "tag"]) ||
+    !hasExactKeys(boundary.release, [
+      "id",
+      "node_id",
+      "tag_name",
+      "name",
+      "body",
+      "target_commitish",
+      "prerelease",
+      "draft",
+      "immutable",
+      "author",
+    ]) ||
+    !hasExactKeys(boundary.release.author, ["id", "node_id", "login", "type"]) ||
+    !hasExactKeys(boundary.tag, ["object", "commit"]) ||
+    !Array.isArray(boundary.assets) ||
+    !Number.isSafeInteger(boundary.release.id) || boundary.release.id <= 0 ||
+    typeof boundary.release.node_id !== "string" || boundary.release.node_id.length === 0 ||
+    typeof boundary.release.tag_name !== "string" || boundary.release.tag_name.length === 0 ||
+    typeof boundary.release.name !== "string" || boundary.release.name.length === 0 ||
+    typeof boundary.release.body !== "string" ||
+    typeof boundary.release.target_commitish !== "string" ||
+      boundary.release.target_commitish.length === 0 ||
+    typeof boundary.release.prerelease !== "boolean" ||
+    typeof boundary.release.draft !== "boolean" ||
+    typeof boundary.release.immutable !== "boolean" ||
+    !Number.isSafeInteger(boundary.release.author.id) || boundary.release.author.id <= 0 ||
+    typeof boundary.release.author.node_id !== "string" ||
+      boundary.release.author.node_id.length === 0 ||
+    boundary.release.author.login !== "codex-review-gate-action-publisher[bot]" ||
+    boundary.release.author.type !== "Bot" ||
+    !/^[0-9a-f]{40}$/u.test(boundary.tag.object) ||
+    !/^[0-9a-f]{40}$/u.test(boundary.tag.commit)
+  ) {
+    fail(`${label} Release boundary shape is invalid`);
+  }
+
+  const assetIds = new Set();
+  const assetNames = new Set();
+  for (const asset of boundary.assets) {
+    if (
+      !hasExactKeys(asset, [
+        "id",
+        "node_id",
+        "name",
+        "state",
+        "content_type",
+        "size",
+        "digest",
+        "url",
+        "browser_download_url",
+        "uploader",
+      ]) ||
+      !hasExactKeys(asset.uploader, ["id", "node_id", "login", "type"]) ||
+      !Number.isSafeInteger(asset.id) || asset.id <= 0 || assetIds.has(asset.id) ||
+      typeof asset.node_id !== "string" || asset.node_id.length === 0 ||
+      typeof asset.name !== "string" || asset.name.length === 0 ||
+      basename(asset.name) !== asset.name || assetNames.has(asset.name) ||
+      (asset.state !== "uploaded" && asset.state !== "starter") ||
+      typeof asset.content_type !== "string" ||
+      !Number.isSafeInteger(asset.size) || asset.size < 0 ||
+      !(asset.digest === null || isCanonicalSha256ReleaseAssetDigest(asset.digest)) ||
+      typeof asset.url !== "string" || asset.url.length === 0 ||
+      typeof asset.browser_download_url !== "string" || asset.browser_download_url.length === 0 ||
+      !Number.isSafeInteger(asset.uploader.id) || asset.uploader.id <= 0 ||
+      typeof asset.uploader.node_id !== "string" || asset.uploader.node_id.length === 0 ||
+      asset.uploader.login !== "codex-review-gate-action-publisher[bot]" ||
+      asset.uploader.type !== "Bot"
+    ) {
+      fail(`${label} Release boundary asset shape is invalid`);
+    }
+    assetIds.add(asset.id);
+    assetNames.add(asset.name);
+  }
+}
+
+// `target_commitish` is an API presentation field, not the immutable Release
+// binding. The shell separately validates the exact annotated tag object and
+// peeled release commit at every boundary. A service may later report a
+// previously-null asset digest. A boundary advancement therefore ignores only
+// target_commitish and permits an individual digest to advance from null to a
+// canonical SHA-256 value; every other release, tag, asset identity, and asset
+// metadata field remains exact. Capture A/B reads remain raw-equal in the
+// shell, so a change *during* a capture is still inconclusive.
+export function validateReleaseBoundaryAdvancement(before, after, {
+  mode = "steady",
+  assetId = undefined,
+  assetName = undefined,
+} = {}) {
+  const validModes = new Set(["steady", "publish", "add-one", "remove-one"]);
+  if (!validModes.has(mode)) fail("Release boundary advancement mode is invalid");
+  if (
+    assetId !== undefined &&
+    (!Number.isSafeInteger(assetId) || assetId <= 0)
+  ) {
+    fail("Release boundary advancement asset id is invalid");
+  }
+  if (
+    assetName !== undefined &&
+    (typeof assetName !== "string" || assetName.length === 0 || basename(assetName) !== assetName)
+  ) {
+    fail("Release boundary advancement asset name is invalid");
+  }
+  if (
+    (mode === "add-one" && (assetId === undefined || assetName === undefined)) ||
+    (mode === "remove-one" && (assetId === undefined || assetName !== undefined)) ||
+    ((mode === "steady" || mode === "publish") &&
+      (assetId !== undefined || assetName !== undefined))
+  ) {
+    fail("Release boundary advancement mode and asset selector differ");
+  }
+
+  validateReleaseBoundaryShape(before, "previous");
+  validateReleaseBoundaryShape(after, "advanced");
+  const { target_commitish: _beforeTargetCommitish, ...beforeRelease } = before.release;
+  const { target_commitish: _afterTargetCommitish, ...afterRelease } = after.release;
+  if (mode === "publish") {
+    if (
+      before.release.draft !== true || before.release.immutable !== false ||
+      after.release.draft !== false || after.release.immutable !== true
+    ) {
+      fail("Draft-to-published Release boundary has an invalid state transition");
+    }
+    delete beforeRelease.draft;
+    delete beforeRelease.immutable;
+    delete afterRelease.draft;
+    delete afterRelease.immutable;
+  }
+  if (!sameCanonicalValue(beforeRelease, afterRelease)) {
+    fail("advanced Release identity or author differs from the previous boundary");
+  }
+  if (!sameCanonicalValue(before.tag, after.tag)) {
+    fail("advanced immutable tag binding differs from the previous boundary");
+  }
+
+  const beforeAssets = new Map(before.assets.map((asset) => [asset.id, asset]));
+  const afterAssets = new Map(after.assets.map((asset) => [asset.id, asset]));
+  for (const [id, beforeAsset] of beforeAssets) {
+    const afterAsset = afterAssets.get(id);
+    if (afterAsset === undefined) continue;
+    const { digest: beforeDigest, ...beforeComparable } = beforeAsset;
+    const { digest: afterDigest, ...afterComparable } = afterAsset;
+    if (!sameCanonicalValue(beforeComparable, afterComparable)) {
+      fail("advanced Release asset identity or metadata differs from the previous boundary");
+    }
+    if (
+      beforeDigest !== afterDigest &&
+      !(beforeDigest === null && isCanonicalSha256ReleaseAssetDigest(afterDigest))
+    ) {
+      fail("advanced Release asset digest differs from the previous boundary");
+    }
+  }
+
+  const addedAssets = after.assets.filter((asset) => !beforeAssets.has(asset.id));
+  const removedAssets = before.assets.filter((asset) => !afterAssets.has(asset.id));
+  if (mode === "steady" || mode === "publish") {
+    if (addedAssets.length !== 0 || removedAssets.length !== 0) {
+      fail("advanced Release asset inventory differs from the previous boundary");
+    }
+  } else if (mode === "add-one") {
+    if (
+      addedAssets.length !== 1 || removedAssets.length !== 0 ||
+      addedAssets[0].id !== assetId || addedAssets[0].name !== assetName
+    ) {
+      fail("advanced Release asset upload differs from the expected one-asset addition");
+    }
+  } else if (
+    removedAssets.length !== 1 || addedAssets.length !== 0 || removedAssets[0].id !== assetId
+  ) {
+    fail("advanced Release asset deletion differs from the expected one-asset removal");
+  }
+  return true;
+}
+
+export function validateDraftPublicationBoundaryTransition(before, after) {
+  return validateReleaseBoundaryAdvancement(before, after, { mode: "publish" });
+}
+
+function validateReleaseInventorySnapshotShape(snapshot, label) {
+  if (!Array.isArray(snapshot)) fail(`${label} Release inventory snapshot shape is invalid`);
+  const releaseIds = new Set();
+  const assetIds = new Set();
+  for (const release of snapshot) {
+    if (
+      !hasExactKeys(release, [
+        "id",
+        "node_id",
+        "tag_name",
+        "name",
+        "body",
+        "target_commitish",
+        "prerelease",
+        "draft",
+        "immutable",
+        "author",
+        "assets",
+      ]) ||
+      !hasExactKeys(release.author, ["id", "node_id", "login", "type"]) ||
+      !Array.isArray(release.assets) ||
+      !Number.isSafeInteger(release.id) || release.id <= 0 || releaseIds.has(release.id) ||
+      typeof release.node_id !== "string" || release.node_id.length === 0 ||
+      typeof release.tag_name !== "string" || release.tag_name.length === 0 ||
+      !(release.name === null || typeof release.name === "string") ||
+      !(release.body === null || typeof release.body === "string") ||
+      typeof release.target_commitish !== "string" || release.target_commitish.length === 0 ||
+      typeof release.prerelease !== "boolean" ||
+      typeof release.draft !== "boolean" ||
+      typeof release.immutable !== "boolean" ||
+      !Number.isSafeInteger(release.author.id) || release.author.id <= 0 ||
+      typeof release.author.node_id !== "string" || release.author.node_id.length === 0 ||
+      typeof release.author.login !== "string" || release.author.login.length === 0 ||
+      (release.author.type !== "Bot" && release.author.type !== "User")
+    ) {
+      fail(`${label} Release inventory snapshot shape is invalid`);
+    }
+    releaseIds.add(release.id);
+    const assetNames = new Set();
+    for (const asset of release.assets) {
+      if (
+        !hasExactKeys(asset, [
+          "id",
+          "node_id",
+          "name",
+          "state",
+          "content_type",
+          "size",
+          "digest",
+          "url",
+          "browser_download_url",
+          "uploader",
+        ]) ||
+        !hasExactKeys(asset.uploader, ["id", "node_id", "login", "type"]) ||
+        !Number.isSafeInteger(asset.id) || asset.id <= 0 || assetIds.has(asset.id) ||
+        typeof asset.node_id !== "string" || asset.node_id.length === 0 ||
+        typeof asset.name !== "string" || asset.name.length === 0 ||
+        basename(asset.name) !== asset.name || assetNames.has(asset.name) ||
+        (asset.state !== "uploaded" && asset.state !== "starter") ||
+        typeof asset.content_type !== "string" ||
+        !Number.isSafeInteger(asset.size) || asset.size < 0 ||
+        !(asset.digest === null || isCanonicalSha256ReleaseAssetDigest(asset.digest)) ||
+        typeof asset.url !== "string" || asset.url.length === 0 ||
+        typeof asset.browser_download_url !== "string" || asset.browser_download_url.length === 0 ||
+        !Number.isSafeInteger(asset.uploader.id) || asset.uploader.id <= 0 ||
+        typeof asset.uploader.node_id !== "string" || asset.uploader.node_id.length === 0 ||
+        typeof asset.uploader.login !== "string" || asset.uploader.login.length === 0 ||
+        (asset.uploader.type !== "Bot" && asset.uploader.type !== "User")
+      ) {
+        fail(`${label} Release inventory asset snapshot shape is invalid`);
+      }
+      assetIds.add(asset.id);
+      assetNames.add(asset.name);
+    }
+  }
+}
+
+// A full paginated inventory is an additional stability fence. It has no
+// tag-object binding for every historical Release, so it uses the same narrow
+// forward-only API-field allowance without assuming a Publisher App author.
+// Tag/ref verification and byte/provenance checks remain outside this helper.
+export function validateReleaseInventoryAdvancement(before, after) {
+  validateReleaseInventorySnapshotShape(before, "previous");
+  validateReleaseInventorySnapshotShape(after, "advanced");
+  const beforeReleases = new Map(before.map((release) => [release.id, release]));
+  const afterReleases = new Map(after.map((release) => [release.id, release]));
+  if (beforeReleases.size !== afterReleases.size) {
+    fail("advanced Release inventory contains an added or removed Release");
+  }
+  for (const [id, beforeRelease] of beforeReleases) {
+    const afterRelease = afterReleases.get(id);
+    if (afterRelease === undefined) {
+      fail("advanced Release inventory contains an added or removed Release");
+    }
+    const {
+      target_commitish: _beforeTargetCommitish,
+      assets: beforeAssets,
+      ...beforeComparable
+    } = beforeRelease;
+    const {
+      target_commitish: _afterTargetCommitish,
+      assets: afterAssets,
+      ...afterComparable
+    } = afterRelease;
+    if (!sameCanonicalValue(beforeComparable, afterComparable)) {
+      fail("advanced Release inventory metadata or author differs from the previous snapshot");
+    }
+    const beforeAssetsById = new Map(beforeAssets.map((asset) => [asset.id, asset]));
+    const afterAssetsById = new Map(afterAssets.map((asset) => [asset.id, asset]));
+    if (beforeAssetsById.size !== afterAssetsById.size) {
+      fail("advanced Release inventory asset inventory differs from the previous snapshot");
+    }
+    for (const [assetId, beforeAsset] of beforeAssetsById) {
+      const afterAsset = afterAssetsById.get(assetId);
+      if (afterAsset === undefined) {
+        fail("advanced Release inventory asset inventory differs from the previous snapshot");
+      }
+      const { digest: beforeDigest, ...beforeAssetComparable } = beforeAsset;
+      const { digest: afterDigest, ...afterAssetComparable } = afterAsset;
+      if (!sameCanonicalValue(beforeAssetComparable, afterAssetComparable)) {
+        fail("advanced Release inventory asset identity or metadata differs from the previous snapshot");
+      }
+      if (
+        beforeDigest !== afterDigest &&
+        !(beforeDigest === null && isCanonicalSha256ReleaseAssetDigest(afterDigest))
+      ) {
+        fail("advanced Release inventory asset digest differs from the previous snapshot");
+      }
+    }
+  }
+  return true;
+}
+
 function parseSecretKeyInventory(colonText) {
   const records = [];
   let current = null;
@@ -3188,6 +3505,40 @@ async function main(argv) {
     ));
     return;
   }
+  if (command === "verify-draft-publication-boundary-transition") {
+    validateDraftPublicationBoundaryTransition(
+      readJson(resolve(required(options, "before"))),
+      readJson(resolve(required(options, "after"))),
+    );
+    return;
+  }
+  if (command === "verify-release-boundary-advancement") {
+    let assetId;
+    if (options["asset-id"] !== undefined) {
+      if (!/^[1-9][0-9]*$/u.test(options["asset-id"])) {
+        fail("--asset-id must be a safe positive integer");
+      }
+      assetId = Number(options["asset-id"]);
+      if (!Number.isSafeInteger(assetId)) fail("--asset-id must be a safe positive integer");
+    }
+    validateReleaseBoundaryAdvancement(
+      readJson(resolve(required(options, "before"))),
+      readJson(resolve(required(options, "after"))),
+      {
+        mode: required(options, "mode"),
+        assetId,
+        assetName: options["asset-name"],
+      },
+    );
+    return;
+  }
+  if (command === "verify-release-inventory-advancement") {
+    validateReleaseInventoryAdvancement(
+      readJson(resolve(required(options, "before"))),
+      readJson(resolve(required(options, "after"))),
+    );
+    return;
+  }
   if (command === "verify-signing-key") {
     validateSigningKeyHome({ gnupgHome: resolve(required(options, "gnupg-home")) });
     return;
@@ -3239,7 +3590,7 @@ async function main(argv) {
     createOnly(resolve(required(options, "output")), canonicalJson(repositoryScope));
     return;
   }
-  fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, summarize-rulesets, verify-rulesets, verify-runtime-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, github-app-installation, or github-app-installation-repository-scope command");
+  fail("expected plan, candidate, verify-candidate, verify-candidate-source, extract-transport, publication-plan, verify-publication-plan, preflight-publication, finalize, compare-semver, summarize-rulesets, verify-rulesets, verify-runtime-rulesets, snapshot-release-assets, snapshot-release-inventory, snapshot-release-boundary, verify-draft-publication-boundary-transition, verify-release-boundary-advancement, verify-release-inventory-advancement, verify-signing-key, verify-github-signing-key, verify-published-assets, verify-openpgp-status, github-app-installation, or github-app-installation-repository-scope command");
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : null;

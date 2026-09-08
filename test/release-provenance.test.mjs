@@ -21,6 +21,7 @@ import { pathToFileURL } from "node:url";
 import {
   buildCandidate,
   canonicalReleaseAssetSnapshot,
+  canonicalReleaseBoundarySnapshot,
   canonicalReleaseInventorySnapshot,
   compareSemver,
   createGitHubAppJwt,
@@ -41,6 +42,9 @@ import {
   validateActionMetadata,
   validatePublisherRulesets,
   validatePublisherRuntimeRulesets,
+  validateReleaseBoundaryAdvancement,
+  validateReleaseInventoryAdvancement,
+  validateDraftPublicationBoundaryTransition,
   validateSigningKeyHome,
   validateTargetReleaseObjects,
   verifyCandidate,
@@ -1203,6 +1207,50 @@ function releaseAsset(id, overrides = {}) {
       type: "Bot",
     },
     ...overrides,
+  };
+}
+
+function publicationBoundary({
+  draft,
+  immutable,
+  targetCommitish = "master",
+  assetDigest = `sha256:${"a".repeat(64)}`,
+  assetOverrides = {},
+  tagObject = "b".repeat(40),
+  releaseCommit = "c".repeat(40),
+}) {
+  const tag = "v2.0.0-rc.2";
+  const body = "Signed release of Joey-Tools/codex-review-gate@" + "d".repeat(40) + ".";
+  const boundary = JSON.parse(canonicalReleaseBoundarySnapshot({
+    id: 101,
+    node_id: "RE_101",
+    tag_name: tag,
+    name: tag,
+    body,
+    target_commitish: targetCommitish,
+    prerelease: true,
+    draft,
+    immutable,
+    author: {
+      id: 4700530,
+      node_id: "MDM6QXBwNDcwMDUzMA==",
+      login: "codex-review-gate-action-publisher[bot]",
+      type: "Bot",
+    },
+    assets: [releaseAsset(101, { digest: assetDigest, ...assetOverrides })],
+  }, {
+    tag,
+    body,
+    prerelease: true,
+    draft,
+    immutable,
+  }));
+  return {
+    ...boundary,
+    tag: {
+      object: tagObject,
+      commit: releaseCommit,
+    },
   };
 }
 
@@ -2378,6 +2426,86 @@ test("public verification detects a same-name Release asset replacement", () => 
   }), /asset metadata differs from policy/u);
 });
 
+test("Draft publication boundary permits only target_commitish presentation drift and digest materialization", () => {
+  const draft = publicationBoundary({
+    draft: true,
+    immutable: false,
+    targetCommitish: "master",
+    assetDigest: null,
+  });
+  const published = publicationBoundary({
+    draft: false,
+    immutable: true,
+    targetCommitish: "v2.0.0-rc.2",
+    assetDigest: `sha256:${"f".repeat(64)}`,
+  });
+
+  assert.equal(validateDraftPublicationBoundaryTransition(draft, published), true);
+});
+
+test("Draft publication boundary rejects asset, digest, and immutable-tag mutations", () => {
+  const draft = publicationBoundary({ draft: true, immutable: false });
+  const published = publicationBoundary({ draft: false, immutable: true });
+
+  const digestMutation = structuredClone(published);
+  digestMutation.assets[0].digest = `sha256:${"f".repeat(64)}`;
+  assert.throws(
+    () => validateDraftPublicationBoundaryTransition(draft, digestMutation),
+    /asset digest differs/u,
+  );
+
+  const assetMutation = structuredClone(published);
+  assetMutation.assets[0].size += 1;
+  assert.throws(
+    () => validateDraftPublicationBoundaryTransition(draft, assetMutation),
+    /asset identity or metadata differs/u,
+  );
+
+  const tagMutation = structuredClone(published);
+  tagMutation.tag.object = "e".repeat(40);
+  assert.throws(
+    () => validateDraftPublicationBoundaryTransition(draft, tagMutation),
+    /immutable tag binding differs/u,
+  );
+});
+
+test("Release boundary advancement permits only forward digest materialization", () => {
+  const nullDigest = publicationBoundary({
+    draft: false,
+    immutable: true,
+    targetCommitish: "master",
+    assetDigest: null,
+  });
+  const stillNull = structuredClone(nullDigest);
+  stillNull.release.target_commitish = "v2.0.0-rc.2";
+  const materialized = structuredClone(stillNull);
+  materialized.assets[0].digest = `sha256:${"f".repeat(64)}`;
+  const unchanged = structuredClone(materialized);
+
+  assert.equal(validateReleaseBoundaryAdvancement(nullDigest, stillNull), true);
+  assert.equal(validateReleaseBoundaryAdvancement(stillNull, materialized), true);
+  assert.equal(validateReleaseBoundaryAdvancement(materialized, unchanged), true);
+
+  const digestCleared = structuredClone(materialized);
+  digestCleared.assets[0].digest = null;
+  assert.throws(
+    () => validateReleaseBoundaryAdvancement(materialized, digestCleared),
+    /asset digest differs/u,
+  );
+  const digestMutation = structuredClone(materialized);
+  digestMutation.assets[0].digest = `sha256:${"e".repeat(64)}`;
+  assert.throws(
+    () => validateReleaseBoundaryAdvancement(materialized, digestMutation),
+    /asset digest differs/u,
+  );
+  const malformedDigest = structuredClone(nullDigest);
+  malformedDigest.assets[0].digest = "sha256:BAD";
+  assert.throws(
+    () => validateReleaseBoundaryAdvancement(nullDigest, malformedDigest),
+    /asset shape is invalid/u,
+  );
+});
+
 test("release inventory fingerprints only decision-relevant stable metadata", () => {
   const release = {
     id: 11,
@@ -2448,6 +2576,66 @@ test("release inventory fingerprints only decision-relevant stable metadata", ()
   assert.throws(
     () => canonicalReleaseAssetSnapshot(release),
     /asset metadata differs from policy/u,
+  );
+});
+
+test("Release inventory advancement permits only forward digest materialization", () => {
+  const legacy = {
+    id: 11,
+    node_id: "RE_11",
+    tag_name: "v1.5.1",
+    name: "v1.5.1",
+    body: "legacy release",
+    target_commitish: "master",
+    prerelease: false,
+    draft: false,
+    immutable: true,
+    author: { id: 7, node_id: "U_7", login: "JoeyTeng", type: "User" },
+    assets: [releaseAsset(101, {
+      digest: null,
+      uploader: { id: 7, node_id: "U_7", login: "JoeyTeng", type: "User" },
+    })],
+  };
+  const current = {
+    ...structuredClone(legacy),
+    id: 12,
+    node_id: "RE_12",
+    tag_name: "v2.0.0",
+    name: "v2.0.0",
+    body: "current release",
+    assets: [releaseAsset(102, { digest: null })],
+  };
+  const initial = JSON.parse(canonicalReleaseInventorySnapshot([[legacy], [current]]));
+  const advanced = structuredClone(initial);
+  advanced[0].target_commitish = "v1.5.1";
+  advanced[0].assets[0].digest = `sha256:${"b".repeat(64)}`;
+  advanced[1].target_commitish = "v2.0.0";
+  advanced[1].assets[0].digest = `sha256:${"c".repeat(64)}`;
+
+  assert.equal(validateReleaseInventoryAdvancement(initial, advanced), true);
+
+  const digestMutation = structuredClone(advanced);
+  digestMutation[0].assets[0].digest = `sha256:${"d".repeat(64)}`;
+  assert.throws(
+    () => validateReleaseInventoryAdvancement(advanced, digestMutation),
+    /asset digest differs/u,
+  );
+  const missingAsset = structuredClone(advanced);
+  missingAsset[0].assets = [];
+  assert.throws(
+    () => validateReleaseInventoryAdvancement(advanced, missingAsset),
+    /asset inventory differs/u,
+  );
+  const releaseMutation = structuredClone(advanced);
+  releaseMutation[0].body = "mutated";
+  assert.throws(
+    () => validateReleaseInventoryAdvancement(advanced, releaseMutation),
+    /metadata or author differs/u,
+  );
+  const missingRelease = advanced.slice(1);
+  assert.throws(
+    () => validateReleaseInventoryAdvancement(advanced, missingRelease),
+    /added or removed Release/u,
   );
 });
 
