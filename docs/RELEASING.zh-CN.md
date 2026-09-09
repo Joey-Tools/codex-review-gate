@@ -767,7 +767,9 @@ values 仍必须 exact；asset digest 只能保持不变或从 `null` 前进到 
 `sha256:<64hex>`。仅在明确的 Draft-to-published transition 中，GitHub 还可能把每个 asset 的
 `browser_download_url` 从 Draft 的 untagged endpoint 派生为 published full-tag endpoint。成功的
 比较要求该派生完全精确：原 URL 必须是
-`https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-<opaque>/<encoded-asset-name>`，
+`https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-<opaque>/<encoded-asset-name>`，其中
+`<opaque>` 必须是非空、canonical 的 ASCII unreserved path segment
+（`[A-Za-z0-9._~-]+`），
 新 URL 必须是同一 target/same asset 的
 `https://github.com/JoeyTeng/codex-review-gate-action/releases/download/<full-tag>/<encoded-asset-name>`；
 也允许 URL 保持不变。成功的比较会将 baseline 向前推进。非空 digest 不得消失或变化，URL exception

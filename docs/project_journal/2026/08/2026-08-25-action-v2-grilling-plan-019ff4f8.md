@@ -3792,6 +3792,15 @@ superseded_by:
   to the service transformation that RC.3 exhibited, rather than treating the
   field as unprotected metadata. Unit and production-shaped pipeline tests
   cover the valid RC.3 derivation and a post-PATCH foreign-target rejection.
+- A subsequent exact-head local review found that a literal-only delimiter
+  check for the Draft URL's `<opaque>` segment still accepted characters that
+  URL parsers can normalize as a path change (notably backslashes and encoded
+  separators). The comparator now requires the raw segment to be non-empty
+  ASCII unreserved characters (`[A-Za-z0-9._~-]+`) while retaining the fixed
+  raw origin/repository/route and encoded asset suffix. This deliberately
+  rejects malformed percent escapes, Unicode, whitespace, backslashes, and
+  traversal-like separators before a parser could reinterpret endpoint
+  identity; direct boundary tests cover those rejections.
 - The direct-request terminal-LF contract is also now synchronized into the
   previously omitted English human and Chinese agent installation-guide
   mirrors, so the four guides state the same accepted request body grammar.

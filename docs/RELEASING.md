@@ -930,7 +930,9 @@ unchanged or advance from `null` to canonical lowercase `sha256:<64hex>`. For
 the explicit Draft-to-published transition only, GitHub may also derive a
 different per-asset `browser_download_url` from the Draft's untagged endpoint
 to the published full-tag endpoint. The derivation must be exact: the prior
-URL is `https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-<opaque>/<encoded-asset-name>` and the
+URL is `https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-<opaque>/<encoded-asset-name>`, where
+`<opaque>` is a non-empty canonical ASCII unreserved path segment
+(`[A-Za-z0-9._~-]+`), and the
 new URL is the same target and asset at
 `https://github.com/JoeyTeng/codex-review-gate-action/releases/download/<full-tag>/<encoded-asset-name>`;
 an unchanged URL is also permitted. A successful comparison rolls the baseline

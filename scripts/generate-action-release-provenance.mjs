@@ -2082,12 +2082,26 @@ function expectedPublishedReleaseAssetBrowserDownloadUrl(tag, assetName) {
   }/${encodeURIComponent(assetName)}`;
 }
 
+const CANONICAL_UNRESERVED_URL_PATH_CHARACTERS = new Set(
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~",
+);
+
+function isCanonicalUnreservedUrlPathSegment(value) {
+  return value.length > 0 &&
+    [...value].every((character) =>
+      CANONICAL_UNRESERVED_URL_PATH_CHARACTERS.has(character));
+}
+
 function isExpectedDraftReleaseAssetBrowserDownloadUrl(url, assetName) {
   const prefix = `https://github.com/${TARGET_REPOSITORY}/releases/download/untagged-`;
   const suffix = `/${encodeURIComponent(assetName)}`;
   if (!url.startsWith(prefix) || !url.endsWith(suffix)) return false;
   const opaqueDraftId = url.slice(prefix.length, url.length - suffix.length);
-  return opaqueDraftId.length > 0 && !/[/?#]/u.test(opaqueDraftId);
+  // The fixed raw prefix/suffix bind the origin, repository, route, and asset.
+  // The remaining Draft id must be an ASCII unreserved path segment. Do not
+  // parse a permissive URL and compare its normalized pieces: WHATWG URL
+  // parsing can reinterpret a raw backslash or dot segment as a path change.
+  return isCanonicalUnreservedUrlPathSegment(opaqueDraftId);
 }
 
 function validatePublishedReleaseAssetBrowserDownloadUrl(beforeUrl, afterUrl, {
