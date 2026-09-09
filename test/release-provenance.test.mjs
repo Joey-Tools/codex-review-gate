@@ -2426,18 +2426,26 @@ test("public verification detects a same-name Release asset replacement", () => 
   }), /asset metadata differs from policy/u);
 });
 
-test("Draft publication boundary permits only target_commitish presentation drift and digest materialization", () => {
+test("Draft publication boundary permits target_commitish, digest, and download URL derivation", () => {
   const draft = publicationBoundary({
     draft: true,
     immutable: false,
     targetCommitish: "master",
     assetDigest: null,
+    assetOverrides: {
+      browser_download_url:
+        "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-opaque/release-provenance.json",
+    },
   });
   const published = publicationBoundary({
     draft: false,
     immutable: true,
     targetCommitish: "v2.0.0-rc.2",
     assetDigest: `sha256:${"f".repeat(64)}`,
+    assetOverrides: {
+      browser_download_url:
+        "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/v2.0.0-rc.2/release-provenance.json",
+    },
   });
 
   assert.equal(validateDraftPublicationBoundaryTransition(draft, published), true);
@@ -2458,6 +2466,13 @@ test("Draft publication boundary rejects asset, digest, and immutable-tag mutati
   assetMutation.assets[0].size += 1;
   assert.throws(
     () => validateDraftPublicationBoundaryTransition(draft, assetMutation),
+    /asset identity or metadata differs/u,
+  );
+
+  const apiUrlMutation = structuredClone(published);
+  apiUrlMutation.assets[0].url += "?changed";
+  assert.throws(
+    () => validateDraftPublicationBoundaryTransition(draft, apiUrlMutation),
     /asset identity or metadata differs/u,
   );
 
@@ -2497,6 +2512,12 @@ test("Release boundary advancement permits only forward digest materialization",
   assert.throws(
     () => validateReleaseBoundaryAdvancement(materialized, digestMutation),
     /asset digest differs/u,
+  );
+  const browserDownloadUrlMutation = structuredClone(materialized);
+  browserDownloadUrlMutation.assets[0].browser_download_url += "?changed";
+  assert.throws(
+    () => validateReleaseBoundaryAdvancement(materialized, browserDownloadUrlMutation),
+    /asset identity or metadata differs/u,
   );
   const malformedDigest = structuredClone(nullDigest);
   malformedDigest.assets[0].digest = "sha256:BAD";

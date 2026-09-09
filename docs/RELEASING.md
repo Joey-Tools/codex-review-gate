@@ -922,14 +922,18 @@ decorative API fields such as `assets[].download_count`, timestamps, and
 profile URLs.
 It canonicalizes Release/page and asset array order, so pagination placement
 or response ordering alone is not treated as mutation. Within one stable
-capture, the raw A/B projection, including `target_commitish` and asset
-digests, must be exactly equal. Between separately stable captures, every
-protected value remains exact except that the non-authoritative
+capture, the raw A/B projection, including `target_commitish`, asset digests,
+and `browser_download_url`, must be exactly equal. Between separately stable
+captures, every protected value remains exact except that the non-authoritative
 `target_commitish` presentation is ignored and an asset digest may only remain
-unchanged or advance from `null` to canonical lowercase `sha256:<64hex>`; a
-successful comparison rolls the baseline forward. A non-null digest may not
-disappear or change. This narrow rule handles service-side derived metadata
-materialization without accepting a Release or asset replacement.
+unchanged or advance from `null` to canonical lowercase `sha256:<64hex>`. For
+the explicit Draft-to-published transition only, GitHub may also derive a
+different per-asset `browser_download_url` from the Draft's untagged endpoint
+to the published full-tag endpoint. A successful comparison rolls the baseline
+forward. A non-null digest may not disappear or change, and the URL exception
+does not apply to steady, asset-add, or asset-remove boundaries. This narrow
+rule handles service-side derived metadata materialization without accepting a
+Release or asset replacement.
 Downloading an asset during reconcile can change a download counter without
 changing any protected publication property; treating that counter as state
 mutation would make the verifier invalidate its own otherwise stable snapshot.

@@ -946,6 +946,8 @@ function fakeGithubEnvironment(state, mutationPhase) {
       "draft-publication-late-digest-materialization",
       "verify-digest-materialization",
     ].includes(mutationPhase),
+    draft_asset_browser_download_url_uses_untagged_path:
+      mutationPhase === "draft-publication-rewrites-browser-download-url",
     author_login: "codex-review-gate-action-publisher[bot]",
     asset_uploader_login: "codex-review-gate-action-publisher[bot]",
     latest: null,
@@ -980,6 +982,7 @@ function fakeGithubEnvironment(state, mutationPhase) {
     final_publication_policy_read_complete: false,
     final_publication_boundary_reads: 0,
     raw_boundary_mutation_done: false,
+    asset_browser_download_url_suffix: "",
     absent_boundary_api_reads: 0,
     release_api_reads: 0,
     release_id_reads: 0,
@@ -1060,6 +1063,10 @@ const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z", options 
   const assetPath = join(assetsDir, options.storage_name || name);
   const bytes = existsSync(assetPath) ? readFileSync(assetPath) : Buffer.alloc(0);
   const assetState = options.state || "uploaded";
+  const browserDownloadUrl = state.draft_asset_browser_download_url_uses_untagged_path
+    ? "https://download.invalid/releases/download/" +
+      (state.draft ? "untagged-" + state.release_id : state.tag) + "/" + name
+    : "https://download.invalid/" + name + (state.asset_browser_download_url_suffix || "");
   return {
     id,
     node_id: "asset-" + id,
@@ -1077,7 +1084,7 @@ const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z", options 
       ? "2026-08-26T00:00:01Z"
       : created,
     url: "https://api.invalid/assets/" + id,
-    browser_download_url: "https://download.invalid/" + name,
+    browser_download_url: browserDownloadUrl,
     uploader: {
       id: 4700530,
       node_id: "publisher-app",
@@ -1910,6 +1917,10 @@ if (args[0] === "api") {
         save(state);
       } else if (phase === "pre-publication-second-raw-tag-drift") {
         state.tag = "v2.0.0-changed-between-snapshots";
+        state.raw_boundary_mutation_done = true;
+        save(state);
+      } else if (phase === "pre-publication-second-raw-browser-download-url-drift") {
+        state.asset_browser_download_url_suffix = "?changed-between-raw-boundary-snapshots";
         state.raw_boundary_mutation_done = true;
         save(state);
       }
@@ -6534,6 +6545,28 @@ test("Draft publication accepts GitHub target_commitish drift and digest materia
   assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2"]), "tag");
 });
 
+test("Draft publication accepts GitHub browser_download_url derivation", (t) => {
+  const state = fixture(t, "2.0.0-rc.3");
+  const phase = "draft-publication-rewrites-browser-download-url";
+  const built = buildAssembledCandidate(state, { label: phase });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, phase),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${phase}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.draft_asset_browser_download_url_uses_untagged_path, true);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0-rc.3"]), "tag");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
 test("Draft publication accepts digest materialization after post-publish capture", (t) => {
   const state = fixture(t);
   const phase = "draft-publication-late-digest-materialization";
@@ -6859,6 +6892,11 @@ for (const boundaryFailure of [
   },
   {
     phase: "pre-publication-second-raw-tag-drift",
+    state: "inconclusive",
+    recoveryCode: "remote-state-changed",
+  },
+  {
+    phase: "pre-publication-second-raw-browser-download-url-drift",
     state: "inconclusive",
     recoveryCode: "remote-state-changed",
   },
@@ -7444,6 +7482,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  155,
+  157,
   "release pipeline shard registration inventory drift",
 );

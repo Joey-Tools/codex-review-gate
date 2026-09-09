@@ -2067,11 +2067,14 @@ function validateReleaseBoundaryShape(boundary, label) {
 // `target_commitish` is an API presentation field, not the immutable Release
 // binding. The shell separately validates the exact annotated tag object and
 // peeled release commit at every boundary. A service may later report a
-// previously-null asset digest. A boundary advancement therefore ignores only
-// target_commitish and permits an individual digest to advance from null to a
-// canonical SHA-256 value; every other release, tag, asset identity, and asset
-// metadata field remains exact. Capture A/B reads remain raw-equal in the
-// shell, so a change *during* a capture is still inconclusive.
+// previously-null asset digest. GitHub also derives `browser_download_url`
+// from an untagged Draft endpoint to a tag-named published endpoint. A
+// boundary advancement therefore ignores target_commitish, permits an
+// individual digest to advance from null to a canonical SHA-256 value, and
+// ignores browser_download_url only for the explicit Draft-to-published
+// transition. Every other release, tag, asset identity, and asset metadata
+// field remains exact. Capture A/B reads remain raw-equal in the shell, so a
+// change *during* a capture is still inconclusive.
 export function validateReleaseBoundaryAdvancement(before, after, {
   mode = "steady",
   assetId = undefined,
@@ -2128,8 +2131,20 @@ export function validateReleaseBoundaryAdvancement(before, after, {
   for (const [id, beforeAsset] of beforeAssets) {
     const afterAsset = afterAssets.get(id);
     if (afterAsset === undefined) continue;
-    const { digest: beforeDigest, ...beforeComparable } = beforeAsset;
-    const { digest: afterDigest, ...afterComparable } = afterAsset;
+    const {
+      digest: beforeDigest,
+      browser_download_url: beforeBrowserDownloadUrl,
+      ...beforeComparable
+    } = beforeAsset;
+    const {
+      digest: afterDigest,
+      browser_download_url: afterBrowserDownloadUrl,
+      ...afterComparable
+    } = afterAsset;
+    if (mode !== "publish") {
+      beforeComparable.browser_download_url = beforeBrowserDownloadUrl;
+      afterComparable.browser_download_url = afterBrowserDownloadUrl;
+    }
     if (!sameCanonicalValue(beforeComparable, afterComparable)) {
       fail("advanced Release asset identity or metadata differs from the previous boundary");
     }

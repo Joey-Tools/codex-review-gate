@@ -3754,6 +3754,39 @@ superseded_by:
   direct request, verify the full stable verifier result, and close both test
   PRs unmerged.
 
+### RC.3 published-Release download URL correction
+
+- RC.3 release-intent PR #48 merged at source commit
+  `a8d1e02f40b4f1ad3a3873ed288a5ca1a9f7996b`. Its first approved production
+  attempt created the planned target `master` commit
+  `0191565ddcbc4417eeaed5cd485580fce87aa11c`, annotated full tag
+  `v2.0.0-rc.3` object `fd8abc4f531a004e89e0cefcb508a549d82fbb4f`, immutable
+  prerelease Release `385423895`, and the archive, provenance, and detached
+  signature assets. It correctly did not create `refs/tags/v2`.
+- That attempt then falsely classified the final Draft-to-published boundary as
+  `blocked_conflict` / `immutable-release-mismatch`. The exact same frozen job
+  was rerun without recreating an object; it reconciled as already complete and
+  the separate published-release verification succeeded. The immutable release
+  facts above are therefore fully read back, not inferred from a partial write.
+- The observed difference was GitHub's derived per-asset
+  `browser_download_url`: a Draft used an opaque untagged endpoint and the
+  immutable published Release used its full-tag endpoint, while the asset ID,
+  bytes, uploader, content metadata, and canonical API URL remained bound.
+  The correction permits that one presentation-field difference only across
+  the explicit `publish` advancement from a stable Draft capture to a stable
+  immutable capture. It continues to compare that URL exactly for `steady`,
+  asset-add, and asset-remove advancements.
+- The protected stability property is unchanged: every individual release
+  capture still takes two complete API/tag observations, normalizes their
+  decision-relevant projection, and requires exact equality before policy
+  projection. A browser-download URL change within either capture remains
+  `inconclusive` / `remote-state-changed`; all other cross-boundary asset
+  fields and every downloaded asset byte remain exact. Regression coverage
+  models both the real Draft-to-tag URL derivation and an in-capture URL drift.
+- The direct-request terminal-LF contract is also now synchronized into the
+  previously omitted English human and Chinese agent installation-guide
+  mirrors, so the four guides state the same accepted request body grammar.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -3804,13 +3837,14 @@ superseded_by:
 - PR #35 is merged. Its approved frozen RC recovery completed every
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
-- RC `v2.0.0-rc.2` is already an immutable prerelease with its full tag and
-  assets created. Its boundary-comparator recovery completed, bridge PR #3 was
-  closed unmerged, and the RC.2 selector bridge was merged. The direct-request
-  storage mismatch found by canary PR #5 requires a new immutable
-  `v2.0.0-rc.3`; do not retry #5. Publish RC.3, merge a separately approved
-  selector-only bridge, and prove a new replacement canary before creating the
-  stable `v2.0.0` release intent.
+- RC `v2.0.0-rc.2` is immutable with its full tag and assets; its
+  boundary-comparator recovery completed, bridge PR #3 was closed unmerged,
+  and the RC.2 selector bridge was merged. RC `v2.0.0-rc.3` is now also an
+  immutable prerelease with its full tag and assets, and its post-publish
+  false-negative was reconciled successfully. Land the isolated RC.3
+  comparator/doc correction, then merge a separately approved RC.3
+  selector-only bridge and prove a new replacement canary before creating the
+  stable `v2.0.0` release intent. Do not retry canary PR #5.
 - Keep the Publisher App at the already reduced three-permission surface
   (Metadata read, Contents read/write, Administration read). No later release,
   including the stable release, may retain the one-time transition's
