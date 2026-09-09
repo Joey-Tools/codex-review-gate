@@ -3859,8 +3859,8 @@ superseded_by:
   boundary-comparator recovery completed, bridge PR #3 was closed unmerged,
   and the RC.2 selector bridge was merged. RC `v2.0.0-rc.3` is now also an
   immutable prerelease with its full tag and assets, and its post-publish
-  false-negative was reconciled successfully. Land the isolated RC.3
-  comparator/doc correction, then merge a separately approved RC.3
+  false-negative was reconciled successfully. The isolated RC.3
+  comparator/doc correction is landed. Merge a separately approved RC.3
   selector-only bridge and prove a new replacement canary before creating the
   stable `v2.0.0` release intent. Do not retry canary PR #5.
 - Keep the Publisher App at the already reduced three-permission surface
