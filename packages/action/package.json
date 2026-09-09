@@ -1,6 +1,6 @@
 {
   "name": "codex-review-gate-action",
-  "version": "2.0.0-rc.2",
+  "version": "2.0.0-rc.3",
   "description": "Deterministic GitHub status gate for Codex pull request reviews.",
   "type": "module",
   "scripts": {

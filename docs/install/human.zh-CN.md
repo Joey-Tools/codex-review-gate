@@ -372,6 +372,8 @@ test -n "$CANARY_HEAD_REF"
 @codex review
 ```
 
+GitHub 可能把这条单行 direct request 保存为末尾恰好一个 LF 或 CRLF；这两种存储
+形式与精确的 `@codex review` 等价。不得接受或发送其他空白、可见文字或 hidden comment。
 这条路径不会为了创建 request 消耗 Actions minutes。后续满足条件的 Codex bot
 `issue_comment` `created` 或 `edited` event 会启动 controller，由它建立严格更新的 full
 verifier attempt；若结果只出现在 review 或 reaction，或者需要恢复，再手动 reconcile。

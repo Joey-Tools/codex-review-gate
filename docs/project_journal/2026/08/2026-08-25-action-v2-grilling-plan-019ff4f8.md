@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-09-08
+updated: 2026-09-09
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -3730,6 +3730,30 @@ superseded_by:
   `master`. Recovery of the already immutable transition requires only the
   normal three-permission writer surface.
 
+### RC.2 canary direct-request terminal-newline correction
+
+- RC.2's `website-checking` canary PR #5 received a clean official Codex
+  terminal result bound by its uniquely resolvable short SHA to the unchanged
+  current head, yet the verifier correctly remained `healthy/pending`. The
+  original direct request was read back byte-for-byte as `@codex review` plus
+  exactly one terminal LF. The runtime's broad physical request detector
+  recognised that carrier, but the ordinary-request authority check required
+  the no-EOL storage representation, so the request became a physical-only
+  lineage boundary.
+- RC.3 corrects only that storage mismatch. An ordinary direct request is
+  authorized when its raw body is exactly `@codex review`, that string plus one
+  LF, or that string plus one CRLF. It still rejects spaces, tabs, a bare CR,
+  repeated line endings, visible added content, and hidden comments. The broad
+  physical detector remains intentionally broader: malformed but potentially
+  provider-triggering request-shaped comments must still preserve a
+  fail-closed lineage boundary rather than acquire authority.
+- PR #5 cannot be repaired by another request, rerun, or reconcile: its
+  existing physical-only predecessor is deliberately retained as evidence.
+  After immutable `v2.0.0-rc.3` publication and a separately approved selector
+  bridge, create a new harmless replacement canary PR, emit one canonical
+  direct request, verify the full stable verifier result, and close both test
+  PRs unmerged.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
@@ -3781,11 +3805,12 @@ superseded_by:
   unprivileged stage but failed before any target write in the publisher
   identity/scope preflight. Do not involve PR #32.
 - RC `v2.0.0-rc.2` is already an immutable prerelease with its full tag and
-  assets created; complete its exact-source recovery/readback rather than
-  issuing another RC for the boundary-comparator failure. Then close bridge PR
-  #3 unmerged, create and complete the new exact-selector bridge, and retain
-  its exact PR/run/CheckRun evidence before creating the stable `v2.0.0`
-  release intent.
+  assets created. Its boundary-comparator recovery completed, bridge PR #3 was
+  closed unmerged, and the RC.2 selector bridge was merged. The direct-request
+  storage mismatch found by canary PR #5 requires a new immutable
+  `v2.0.0-rc.3`; do not retry #5. Publish RC.3, merge a separately approved
+  selector-only bridge, and prove a new replacement canary before creating the
+  stable `v2.0.0` release intent.
 - Keep the Publisher App at the already reduced three-permission surface
   (Metadata read, Contents read/write, Administration read). No later release,
   including the stable release, may retain the one-time transition's

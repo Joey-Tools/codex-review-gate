@@ -4590,7 +4590,7 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
       continue;
     }
     if (
-      comment?.body !== "@codex review" ||
+      !isExactV2OrdinaryReviewRequestBody(comment?.body) ||
       hasV2ObservedIssueCommentEdit(comment) ||
       comment.user?.type !== "User" ||
       typeof comment.user?.login !== "string" ||
@@ -4598,7 +4598,9 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
     ) {
       boundaries.push(v2PhysicalOnlyRequestBoundary(
         comment,
-        comment?.body === "@codex review" ? "bare-invalid-authority" : "malformed-canonical",
+        isExactV2OrdinaryReviewRequestBody(comment?.body)
+          ? "bare-invalid-authority"
+          : "malformed-canonical",
       ));
       continue;
     }
@@ -4657,6 +4659,12 @@ function hasExactV2PhysicalReviewRequestShape(body) {
     ? withoutClosedComments
     : withoutClosedComments.slice(0, unclosedComment);
   return /^@codex review(?:\s|$)/u.test(visible.trim());
+}
+
+function isExactV2OrdinaryReviewRequestBody(body) {
+  return body === "@codex review" ||
+    body === "@codex review\n" ||
+    body === "@codex review\r\n";
 }
 
 function isV2EditedUnknownRequestBoundary(comment) {

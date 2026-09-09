@@ -3431,24 +3431,34 @@ test("terminal clean without an authorized request generation cannot pass", asyn
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("ordinary writer request queries liveness reactions but never makes reaction-only clean head-bound", async (context) => {
-  const ordinary = ordinaryRequest();
+test("ordinary writer request admits exact terminal line endings and queries liveness reactions", async (context) => {
   const terminal = cleanIssueComment(HEAD, {
     created_at: "2026-08-25T08:02:00Z",
     updated_at: "2026-08-25T08:02:00Z",
   });
-  const terminalGitHub = createGitHubMock({ issueComments: [ordinary, terminal] });
-  const terminalEnvironment = runtimeEnvironment(context, { suffix: "ordinary-terminal" });
-  const { result: terminalResult } = await runGate(terminalEnvironment, terminalGitHub);
-  assert.equal(terminalResult.report.gateOutcome, "success");
-  assert.equal(
-    terminalGitHub.calls.some((call) => call.path.endsWith(`/commits/${HEAD}`)),
-    false,
-  );
-  assert.equal(
-    terminalGitHub.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
-    true,
-  );
+  for (const [suffix, body] of [
+    ["ordinary-terminal-no-eol", "@codex review"],
+    ["ordinary-terminal-lf", "@codex review\n"],
+    ["ordinary-terminal-crlf", "@codex review\r\n"],
+  ]) {
+    const ordinary = ordinaryRequest({ body });
+    const terminalGitHub = createGitHubMock({ issueComments: [ordinary, terminal] });
+    const terminalEnvironment = runtimeEnvironment(context, { suffix });
+    const { result: terminalResult } = await runGate(terminalEnvironment, terminalGitHub);
+    assert.equal(terminalResult.report.gateOutcome, "success", suffix);
+    assert.equal(
+      terminalGitHub.calls.some((call) => call.path.endsWith(`/commits/${HEAD}`)),
+      false,
+      suffix,
+    );
+    assert.equal(
+      terminalGitHub.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
+      true,
+      suffix,
+    );
+  }
+
+  const ordinary = ordinaryRequest();
 
   for (const [suffix, createdAt] of [
     ["ordinary-active-same-time", "2026-08-25T08:02:00Z"],
@@ -3722,6 +3732,48 @@ test("provider-triggerable invalid request shapes remain physical-only boundarie
     ["bare-edited", ordinaryRequest({
       id: 102,
       created_at: "2026-08-25T08:01:30Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-leading-space", ordinaryRequest({
+      id: 102,
+      body: " @codex review",
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-trailing-tab", ordinaryRequest({
+      id: 102,
+      body: "@codex review\t",
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-terminal-cr", ordinaryRequest({
+      id: 102,
+      body: "@codex review\r",
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-two-terminal-lf", ordinaryRequest({
+      id: 102,
+      body: "@codex review\n\n",
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-two-terminal-crlf", ordinaryRequest({
+      id: 102,
+      body: "@codex review\r\n\r\n",
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-hidden-comment", ordinaryRequest({
+      id: 102,
+      body: "@codex review<!-- unrelated hidden metadata -->",
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    })],
+    ["bare-extra-visible-content", ordinaryRequest({
+      id: 102,
+      body: "@codex review\nPlease review the implementation.",
+      created_at: "2026-08-25T08:02:00Z",
       updated_at: "2026-08-25T08:02:00Z",
     })],
     ["bare-bot", ordinaryRequest({
