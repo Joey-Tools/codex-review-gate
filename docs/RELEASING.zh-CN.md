@@ -766,9 +766,13 @@ capture 之间，除 non-authoritative `target_commitish` presentation 会被忽
 values 仍必须 exact；asset digest 只能保持不变或从 `null` 前进到 canonical lowercase
 `sha256:<64hex>`。仅在明确的 Draft-to-published transition 中，GitHub 还可能把每个 asset 的
 `browser_download_url` 从 Draft 的 untagged endpoint 派生为 published full-tag endpoint。成功的
-比较会将 baseline 向前推进。非空 digest 不得消失或变化，URL exception 也不适用于 steady、asset-add
-或 asset-remove boundary。这个窄规则只容纳 service-side derived metadata materialization，不会接受
-Release 或 asset replacement。Reconcile 下载 asset 本身就可能改变 download counter，但不会改变任何
+比较要求该派生完全精确：原 URL 必须是
+`https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-<opaque>/<encoded-asset-name>`，
+新 URL 必须是同一 target/same asset 的
+`https://github.com/JoeyTeng/codex-review-gate-action/releases/download/<full-tag>/<encoded-asset-name>`；
+也允许 URL 保持不变。成功的比较会将 baseline 向前推进。非空 digest 不得消失或变化，URL exception
+也不适用于 steady、asset-add 或 asset-remove boundary。这个窄规则只容纳 service-side derived metadata
+materialization，不会接受 Release 或 asset replacement。Reconcile 下载 asset 本身就可能改变 download counter，但不会改变任何
 受保护的发布属性；若把该计数视为状态 mutation，verifier 会让自己的稳定 snapshot 失效。
 
 Exact 已完成步骤经过验证后沿用；缺失的下一步只有在该 mutation contract 允许时才能

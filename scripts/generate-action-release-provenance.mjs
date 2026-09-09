@@ -2071,10 +2071,38 @@ function validateReleaseBoundaryShape(boundary, label) {
 // from an untagged Draft endpoint to a tag-named published endpoint. A
 // boundary advancement therefore ignores target_commitish, permits an
 // individual digest to advance from null to a canonical SHA-256 value, and
-// ignores browser_download_url only for the explicit Draft-to-published
-// transition. Every other release, tag, asset identity, and asset metadata
-// field remains exact. Capture A/B reads remain raw-equal in the shell, so a
-// change *during* a capture is still inconclusive.
+// permits browser_download_url to either remain exact or take GitHub's one
+// exact Draft-to-published derivation for the same target, tag, and asset.
+// Every other release, tag, asset identity, and asset metadata field remains
+// exact. Capture A/B reads remain raw-equal in the shell, so a change *during*
+// a capture is still inconclusive.
+function expectedPublishedReleaseAssetBrowserDownloadUrl(tag, assetName) {
+  return `https://github.com/${TARGET_REPOSITORY}/releases/download/${
+    encodeURIComponent(tag)
+  }/${encodeURIComponent(assetName)}`;
+}
+
+function isExpectedDraftReleaseAssetBrowserDownloadUrl(url, assetName) {
+  const prefix = `https://github.com/${TARGET_REPOSITORY}/releases/download/untagged-`;
+  const suffix = `/${encodeURIComponent(assetName)}`;
+  if (!url.startsWith(prefix) || !url.endsWith(suffix)) return false;
+  const opaqueDraftId = url.slice(prefix.length, url.length - suffix.length);
+  return opaqueDraftId.length > 0 && !/[/?#]/u.test(opaqueDraftId);
+}
+
+function validatePublishedReleaseAssetBrowserDownloadUrl(beforeUrl, afterUrl, {
+  tag,
+  assetName,
+}) {
+  if (beforeUrl === afterUrl) return;
+  if (
+    !isExpectedDraftReleaseAssetBrowserDownloadUrl(beforeUrl, assetName) ||
+    afterUrl !== expectedPublishedReleaseAssetBrowserDownloadUrl(tag, assetName)
+  ) {
+    fail("advanced Release asset browser download URL differs from the expected Draft-to-published derivation");
+  }
+}
+
 export function validateReleaseBoundaryAdvancement(before, after, {
   mode = "steady",
   assetId = undefined,
@@ -2141,7 +2169,13 @@ export function validateReleaseBoundaryAdvancement(before, after, {
       browser_download_url: afterBrowserDownloadUrl,
       ...afterComparable
     } = afterAsset;
-    if (mode !== "publish") {
+    if (mode === "publish") {
+      validatePublishedReleaseAssetBrowserDownloadUrl(
+        beforeBrowserDownloadUrl,
+        afterBrowserDownloadUrl,
+        { tag: after.release.tag_name, assetName: beforeAsset.name },
+      );
+    } else {
       beforeComparable.browser_download_url = beforeBrowserDownloadUrl;
       afterComparable.browser_download_url = afterBrowserDownloadUrl;
     }

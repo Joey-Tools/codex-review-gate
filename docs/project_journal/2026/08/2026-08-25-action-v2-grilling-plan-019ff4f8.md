@@ -3783,6 +3783,15 @@ superseded_by:
   `inconclusive` / `remote-state-changed`; all other cross-boundary asset
   fields and every downloaded asset byte remain exact. Regression coverage
   models both the real Draft-to-tag URL derivation and an in-capture URL drift.
+- GitHub Codex review on follow-up PR #49 correctly found that merely omitting
+  `browser_download_url` from the publish comparison was too broad: a stable
+  URL for another repository, tag, or asset could otherwise become the new
+  boundary. The correction accepts only equality or the exact GitHub
+  `https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-<opaque>/<encoded-asset-name>`
+  to same-target/full-tag/same-asset derivation. This keeps the exception tied
+  to the service transformation that RC.3 exhibited, rather than treating the
+  field as unprotected metadata. Unit and production-shaped pipeline tests
+  cover the valid RC.3 derivation and a post-PATCH foreign-target rejection.
 - The direct-request terminal-LF contract is also now synchronized into the
   previously omitted English human and Chinese agent installation-guide
   mirrors, so the four guides state the same accepted request body grammar.

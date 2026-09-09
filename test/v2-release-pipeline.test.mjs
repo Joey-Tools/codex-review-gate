@@ -946,8 +946,14 @@ function fakeGithubEnvironment(state, mutationPhase) {
       "draft-publication-late-digest-materialization",
       "verify-digest-materialization",
     ].includes(mutationPhase),
-    draft_asset_browser_download_url_uses_untagged_path:
-      mutationPhase === "draft-publication-rewrites-browser-download-url",
+    draft_asset_browser_download_url_uses_untagged_path: [
+      "draft-publication-rewrites-browser-download-url",
+      "draft-publication-rejects-browser-download-url-derivation",
+    ].includes(mutationPhase),
+    published_asset_browser_download_url_override:
+      mutationPhase === "draft-publication-rejects-browser-download-url-derivation"
+        ? "https://github.com/JoeyTeng/other-action/releases/download/v2.0.0-rc.3/release-provenance.json"
+        : null,
     author_login: "codex-review-gate-action-publisher[bot]",
     asset_uploader_login: "codex-review-gate-action-publisher[bot]",
     latest: null,
@@ -1064,8 +1070,12 @@ const assetRecord = (state, name, id, created = "2026-08-26T00:00:00Z", options 
   const bytes = existsSync(assetPath) ? readFileSync(assetPath) : Buffer.alloc(0);
   const assetState = options.state || "uploaded";
   const browserDownloadUrl = state.draft_asset_browser_download_url_uses_untagged_path
-    ? "https://download.invalid/releases/download/" +
-      (state.draft ? "untagged-" + state.release_id : state.tag) + "/" + name
+    ? state.draft
+      ? "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-" +
+        state.release_id + "/" + encodeURIComponent(name)
+      : state.published_asset_browser_download_url_override ||
+        "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/" +
+        encodeURIComponent(state.tag) + "/" + encodeURIComponent(name)
     : "https://download.invalid/" + name + (state.asset_browser_download_url_suffix || "");
   return {
     id,
@@ -1874,6 +1884,13 @@ if (args[0] === "api") {
         save(state);
       }
     }
+    const releaseIdReadTrace = state.call_trace.at(-1);
+    releaseIdReadTrace.release_id_response_assets = response.assets.map(({
+      id,
+      name,
+      browser_download_url: browserDownloadUrl,
+    }) => ({ id, name, browser_download_url: browserDownloadUrl }));
+    save(state);
     process.stdout.write(JSON.stringify(response) + "\\n");
     if (phase === "draft-publication-late-digest-materialization" &&
         state.publish_patch_calls === 1 && !state.draft && state.immutable &&
@@ -6563,6 +6580,74 @@ test("Draft publication accepts GitHub browser_download_url derivation", (t) => 
   assert.equal(fakeState.draft_asset_browser_download_url_uses_untagged_path, true);
   assert.equal(fakeState.draft, false);
   assert.equal(fakeState.immutable, true);
+  const assetName = "release-provenance.json";
+  const expectedDraftUrl =
+    "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-" +
+    fakeState.release_id + "/" + encodeURIComponent(assetName);
+  const expectedPublishedUrl =
+    "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/" +
+    encodeURIComponent("v2.0.0-rc.3") + "/" + encodeURIComponent(assetName);
+  const remoteCalls = fakeState.call_trace.filter(({ type }) => type === "remote");
+  const patchIndex = remoteCalls.findIndex(({ kind }) => kind === "release-patch");
+  assert.notEqual(patchIndex, -1, "missing Draft publication PATCH");
+  const draftBoundaryReads = remoteCalls
+    .slice(0, patchIndex)
+    .filter(({ kind, draft, immutable }) =>
+      kind === "release-id-read" && draft === true && immutable === false,
+    )
+    .slice(-2);
+  const publishedBoundaryReads = remoteCalls
+    .slice(patchIndex + 1)
+    .filter(({ kind, draft, immutable }) =>
+      kind === "release-id-read" && draft === false && immutable === true,
+    );
+  assert.equal(draftBoundaryReads.length, 2, "missing stable Draft boundary reads");
+  assert.ok(publishedBoundaryReads.length >= 2, "missing stable published boundary reads");
+  const observedAsset = (read) => {
+    const asset = read.release_id_response_assets?.find(({ name }) => name === assetName);
+    assert.ok(asset, `missing ${assetName} in recorded Release-ID response`);
+    return asset;
+  };
+  const draftAssets = draftBoundaryReads.map(observedAsset);
+  const publishedAssets = publishedBoundaryReads.map(observedAsset);
+  assert.deepEqual([...new Set(draftAssets.map(({ id }) => id))], [draftAssets[0].id]);
+  assert.deepEqual([...new Set(publishedAssets.map(({ id }) => id))], [draftAssets[0].id]);
+  assert.deepEqual(
+    [...new Set(draftAssets.map(({ browser_download_url: url }) => url))],
+    [expectedDraftUrl],
+  );
+  assert.deepEqual(
+    [...new Set(publishedAssets.map(({ browser_download_url: url }) => url))],
+    [expectedPublishedUrl],
+  );
+  assert.notEqual(expectedDraftUrl, expectedPublishedUrl);
+  assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0-rc.3"]), "tag");
+  assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
+});
+
+test("Draft publication rejects an unexpected browser_download_url derivation", (t) => {
+  const state = fixture(t, "2.0.0-rc.3");
+  const phase = "draft-publication-rejects-browser-download-url-derivation";
+  const built = buildAssembledCandidate(state, { label: phase });
+  const result = invokePublish(state, built, {
+    testRelease: false,
+    env: fakeGithubEnvironment(state, phase),
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reconcile_state=blocked_conflict/u);
+  assert.match(result.stderr, /recovery_code=immutable-release-mismatch/u);
+  assert.match(
+    result.stderr,
+    /browser download URL differs from the expected Draft-to-published derivation/u,
+  );
+  const fakeState = JSON.parse(readFileSync(
+    join(state.root, `fake-gh-state-${phase}`, "state.json"),
+    "utf8",
+  ));
+  assert.equal(fakeState.publish_patch_calls, 1);
+  assert.equal(fakeState.draft, false);
+  assert.equal(fakeState.immutable, true);
   assert.equal(git(state.target, ["cat-file", "-t", "refs/tags/v2.0.0-rc.3"]), "tag");
   assert.throws(() => git(state.target, ["rev-parse", "refs/tags/v2"]));
 });
@@ -7482,6 +7567,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  157,
+  158,
   "release pipeline shard registration inventory drift",
 );

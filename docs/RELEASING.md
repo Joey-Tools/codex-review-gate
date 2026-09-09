@@ -929,7 +929,11 @@ captures, every protected value remains exact except that the non-authoritative
 unchanged or advance from `null` to canonical lowercase `sha256:<64hex>`. For
 the explicit Draft-to-published transition only, GitHub may also derive a
 different per-asset `browser_download_url` from the Draft's untagged endpoint
-to the published full-tag endpoint. A successful comparison rolls the baseline
+to the published full-tag endpoint. The derivation must be exact: the prior
+URL is `https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-<opaque>/<encoded-asset-name>` and the
+new URL is the same target and asset at
+`https://github.com/JoeyTeng/codex-review-gate-action/releases/download/<full-tag>/<encoded-asset-name>`;
+an unchanged URL is also permitted. A successful comparison rolls the baseline
 forward. A non-null digest may not disappear or change, and the URL exception
 does not apply to steady, asset-add, or asset-remove boundaries. This narrow
 rule handles service-side derived metadata materialization without accepting a

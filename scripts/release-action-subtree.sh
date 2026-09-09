@@ -473,11 +473,11 @@ readonly baseline="$repo_root/docs/release/action-v2-repository-baselines.json"
 # A complete Release capture remains an exact A/B read. Across consecutive
 # captures, the verifier permits only narrowly directional, service-side
 # presentation changes: non-authoritative target_commitish, null-to-SHA asset
-# digest materialization, and the Draft-to-published browser_download_url
-# derivation. The URL relaxation applies only to the explicit publish boundary;
-# it never weakens the A/B read or ordinary mutation boundaries. This helper
-# delegates that comparison and writes both inputs under the mode-specific
-# temporary root for failure diagnosis.
+# digest materialization, and the exact same-target/tag/asset Draft-to-published
+# browser_download_url derivation. The URL relaxation applies only to the
+# explicit publish boundary; it never weakens the A/B read or ordinary mutation
+# boundaries. This helper delegates that comparison and writes both inputs under
+# the mode-specific temporary root for failure diagnosis.
 release_boundary_advance_counter=0
 advance_release_boundary() {
   local before="$1"
