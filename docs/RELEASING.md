@@ -258,10 +258,12 @@ For the one-time RC transition, the installed App grants the implicit
 `Metadata: read` plus `Contents: read/write`, `Administration: read`, and
 `Workflows: read/write`. The publisher first requests only Metadata read for
 the complete-installation inventory token, then requests all four permissions
-for its one-repository transition writer token. After immutable RC readback is
-complete and no further RC recovery is needed, remove `Workflows: read/write`
-from the App before preparing the stable release. Its different frozen target
-head makes the next run require exactly Metadata read, Contents read/write, and
+for its one-repository transition writer token. Once that transition's
+immutable Release has been read back successfully, immediately remove
+`Workflows: read/write` before any later release intent reaches source
+`master`, including a later RC. Recovery of the already immutable transition
+does not need that permission. Its different frozen target head makes every
+later run require exactly Metadata read, Contents read/write, and
 Administration read; it leaves the optional Workflows input empty and fails
 closed if the App still retains it.
 
@@ -705,12 +707,18 @@ mutable draft, with the Publisher App uploader, the planned
 the single next slot after the verified uploaded canonical prefix. Asset names
 and numeric IDs must be unique, including asset IDs across the complete
 inventory. After the final policy fence, the publisher takes a fresh stable
-by-ID A/B boundary and requires it to equal the selected boundary before it
-issues one unconditional DELETE for that frozen asset ID. It then reconciles
-every DELETE outcome, including `204`, `404`, network failure, and response
-loss, through another stable frozen-ID boundary. Publication continues only
-when the exact starter ID is absent and every other protected field is
-unchanged; otherwise it returns `inconclusive` /
+by-ID A/B boundary. The two raw reads inside that capture must be exactly
+equal. Against the selected boundary, the cross-capture comparison permits
+only the documented directional metadata advancement: it ignores the
+non-authoritative `target_commitish` presentation and permits an asset digest
+only to remain unchanged or advance from `null` to canonical lowercase
+`sha256:<64hex>`; the accepted boundary becomes the new baseline. It then
+issues one unconditional DELETE for that frozen asset ID. Every DELETE outcome,
+including `204`, `404`, network failure, and response loss, is reconciled
+through another stable frozen-ID boundary. Publication continues only when the
+exact starter ID is absent and every other change is the authorized
+one-asset removal plus, at most, that same directional metadata advancement;
+otherwise it returns `inconclusive` /
 `starter-asset-deletion-unknown` without a second DELETE in that invocation.
 Uploaded, nonzero, wrong-name, wrong-slot, wrong-uploader, wrong-content-type,
 or otherwise unbound assets are never deleted.
@@ -913,8 +921,15 @@ and author/uploader identities. It deliberately excludes observational or
 decorative API fields such as `assets[].download_count`, timestamps, and
 profile URLs.
 It canonicalizes Release/page and asset array order, so pagination placement
-or response ordering alone is not treated as mutation, while preserving all
-protected values for A/B comparison before policy interpretation.
+or response ordering alone is not treated as mutation. Within one stable
+capture, the raw A/B projection, including `target_commitish` and asset
+digests, must be exactly equal. Between separately stable captures, every
+protected value remains exact except that the non-authoritative
+`target_commitish` presentation is ignored and an asset digest may only remain
+unchanged or advance from `null` to canonical lowercase `sha256:<64hex>`; a
+successful comparison rolls the baseline forward. A non-null digest may not
+disappear or change. This narrow rule handles service-side derived metadata
+materialization without accepting a Release or asset replacement.
 Downloading an asset during reconcile can change a download counter without
 changing any protected publication property; treating that counter as state
 mutation would make the verifier invalidate its own otherwise stable snapshot.

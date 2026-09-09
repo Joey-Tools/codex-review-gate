@@ -470,6 +470,58 @@ fi
 readonly generator="$repo_root/scripts/generate-action-release-provenance.mjs"
 readonly baseline="$repo_root/docs/release/action-v2-repository-baselines.json"
 
+# A complete Release capture remains an exact A/B read. Across consecutive
+# captures, the verifier permits only a service-side, read-only metadata
+# advancement: non-authoritative target_commitish presentation and null-to-SHA
+# asset-digest materialization. This helper delegates that narrowly directional
+# comparison and writes both inputs under the mode-specific temporary root for
+# failure diagnosis.
+release_boundary_advance_counter=0
+advance_release_boundary() {
+  local before="$1"
+  local after="$2"
+  local mode="$3"
+  local asset_id="${4:-}"
+  local asset_name="${5:-}"
+  local before_file after_file
+  local -a command
+  release_boundary_advance_counter=$((release_boundary_advance_counter + 1))
+  before_file="$temporary_root/release-boundary-advance-${release_boundary_advance_counter}-before.json"
+  after_file="$temporary_root/release-boundary-advance-${release_boundary_advance_counter}-after.json"
+  printf '%s\n' "$before" > "$before_file" || return 1
+  printf '%s\n' "$after" > "$after_file" || return 1
+  command=(node "$generator" verify-release-boundary-advancement
+    --before "$before_file" --after "$after_file" --mode "$mode")
+  [[ -z "$asset_id" ]] || command+=(--asset-id "$asset_id")
+  [[ -z "$asset_name" ]] || command+=(--asset-name "$asset_name")
+  "${command[@]}"
+}
+
+release_boundary_with_tag() {
+  local boundary="$1"
+  local tag_object="$2"
+  local tag_commit="$3"
+  jq -cn \
+    --argjson boundary "$boundary" \
+    --arg object "$tag_object" \
+    --arg commit "$tag_commit" \
+    '$boundary + {tag:{object:$object,commit:$commit}}'
+}
+
+release_inventory_advance_counter=0
+advance_release_inventory() {
+  local before="$1"
+  local after="$2"
+  local before_file after_file
+  release_inventory_advance_counter=$((release_inventory_advance_counter + 1))
+  before_file="$temporary_root/release-inventory-advance-${release_inventory_advance_counter}-before.json"
+  after_file="$temporary_root/release-inventory-advance-${release_inventory_advance_counter}-after.json"
+  printf '%s\n' "$before" > "$before_file" || return 1
+  printf '%s\n' "$after" > "$after_file" || return 1
+  node "$generator" verify-release-inventory-advancement \
+    --before "$before_file" --after "$after_file"
+}
+
 [[ -f "$generator" && -f "$baseline" ]] || {
   echo "error: release generator or baseline is missing" >&2
   exit 1
@@ -1066,6 +1118,8 @@ if [[ "$mode" == "verify-published" ]]; then
         --prerelease "$expected_prerelease" \
         --draft false \
         --immutable true)" || return 1
+      initial_boundary="$(release_boundary_with_tag \
+        "$initial_boundary" "$local_tag_object" "$local_release_commit")" || return 1
       [[ "$(printf '%s' "$initial_view" | jq -r .isDraft)" == "false" &&
           "$(printf '%s' "$initial_view" | jq -r .isPrerelease)" == "$expected_prerelease" &&
           "$(printf '%s' "$initial_view" | jq -r .tagName)" == "$tag" &&
@@ -1116,7 +1170,9 @@ if [[ "$mode" == "verify-published" ]]; then
         --prerelease "$expected_prerelease" \
         --draft false \
         --immutable true)" || return 1
-      [[ "$final_boundary" == "$initial_boundary" ]] || return 1
+      final_boundary="$(release_boundary_with_tag \
+        "$final_boundary" "$local_tag_object" "$local_release_commit")" || return 1
+      advance_release_boundary "$initial_boundary" "$final_boundary" steady || return 1
     fi
     printf '%s\n' "$source_ref"
   }
@@ -1406,6 +1462,19 @@ if [[ "$mode" == "verify-published" ]]; then
     initial_asset_snapshot="$(node "$generator" snapshot-release-assets --input "$initial_release_api")" || {
       fail_published_state immutable-release "published GitHub Release asset metadata is malformed"
     }
+    initial_release_boundary="$(node "$generator" snapshot-release-boundary \
+      --input "$initial_release_api" \
+      --tag "$immutable_tag" \
+      --body "$expected_release_body" \
+      --prerelease "$prerelease" \
+      --draft false \
+      --immutable true)" || {
+      fail_published_state immutable-release "published GitHub Release boundary metadata is malformed"
+    }
+    initial_release_boundary="$(release_boundary_with_tag \
+      "$initial_release_boundary" "$full_tag_object" "$full_commit")" || {
+      fail_published_state immutable-release "published GitHub Release tag boundary is malformed"
+    }
     if ! commit_verification="$(publisher_gh api "repos/$TARGET_REPOSITORY/commits/$full_commit" --jq '[.commit.verification.verified,.commit.verification.reason] | map(tostring) | join(" ")')"; then
       fail_verification inconclusive release-api-unreadable immutable-release \
         retry-public-verification "release commit verification state could not be read"
@@ -1512,7 +1581,20 @@ if [[ "$mode" == "verify-published" ]]; then
       fail_published_state immutable-release \
         "final GitHub Release asset metadata is malformed"
     fi
-    [[ "$final_asset_snapshot" == "$initial_asset_snapshot" ]] || {
+    final_release_boundary="$(node "$generator" snapshot-release-boundary \
+      --input "$final_release_api" \
+      --tag "$immutable_tag" \
+      --body "$expected_release_body" \
+      --prerelease "$prerelease" \
+      --draft false \
+      --immutable true)" || {
+      fail_published_state immutable-release "final GitHub Release boundary metadata is malformed"
+    }
+    final_release_boundary="$(release_boundary_with_tag \
+      "$final_release_boundary" "$full_tag_object" "$full_commit")" || {
+      fail_published_state immutable-release "final GitHub Release tag boundary is malformed"
+    }
+    advance_release_boundary "$initial_release_boundary" "$final_release_boundary" steady || {
       fail_published_state immutable-release \
         "GitHub Release asset identity or metadata changed during public verification"
     }
@@ -1535,10 +1617,19 @@ if [[ "$mode" == "verify-published" ]]; then
     fail_published_state immutable-release \
       "final complete GitHub Release inventory is missing or malformed"
   fi
-  cmp -- "$initial_release_inventory" "$final_release_inventory" || {
-    fail_published_state immutable-release \
-      "complete GitHub Release inventory changed during public verification"
-  }
+  if [[ -n "$test_release_dir" ]]; then
+    cmp -- "$initial_release_inventory" "$final_release_inventory" || {
+      fail_published_state immutable-release \
+        "complete test Release inventory changed during public verification"
+    }
+  else
+    advance_release_inventory \
+      "$(<"$initial_release_inventory")" \
+      "$(<"$final_release_inventory")" || {
+      fail_published_state immutable-release \
+        "complete GitHub Release inventory changed during public verification"
+    }
+  fi
   if ! final_remote_tag_namespace="$(git ls-remote "$target_url" 'refs/tags/v*')"; then
     fail_verification inconclusive remote-read-inconclusive immutable-release \
       retry-public-verification "final complete target tag namespace could not be read"
@@ -2071,6 +2162,7 @@ later_same_major_stable_version=""
 later_release_tag=""
 later_release_version=""
 release_inventory_fingerprint=""
+release_inventory_snapshot=""
 release_inventory_exact_api=""
 readonly RELEASE_BOUNDARY_REMOTE_UNREADABLE=75
 readonly RELEASE_BOUNDARY_STATE_CHANGED=76
@@ -2178,6 +2270,7 @@ audit_release_inventory() {
     fail_reconcile inconclusive remote-read-inconclusive \
       "the paginated GitHub Release inventory could not be normalized"
   fi
+  release_inventory_snapshot="$inventory_snapshot"
   release_inventory_fingerprint="$(
     printf '%s\n' "$inventory_snapshot" | shasum -a 256 | awk '{print $1}'
   )"
@@ -2273,6 +2366,7 @@ initial_remote_ref_fingerprint="$(remote_ref_fingerprint)" || {
 }
 audit_release_inventory
 initial_release_inventory_fingerprint="$release_inventory_fingerprint"
+initial_release_inventory_snapshot="$release_inventory_snapshot"
 audit_release_history
 
 # A stable replay may be superseded only while its floating alias names the
@@ -2964,8 +3058,27 @@ later_release_tag=""
 later_release_version=""
 later_same_major_stable_tag=""
 later_same_major_stable_version=""
-audit_release_inventory "$initial_release_inventory_fingerprint"
+audit_release_inventory
 prewrite_release_inventory_fingerprint="$release_inventory_fingerprint"
+prewrite_release_inventory_snapshot="$release_inventory_snapshot"
+if [[ -n "$test_release_dir" ]]; then
+  [[ "$initial_release_inventory_fingerprint" == "$prewrite_release_inventory_fingerprint" ]] || {
+    fail_reconcile inconclusive remote-state-changed \
+      "the complete GitHub Release inventory changed during reconcile"
+  }
+else
+  # Each full paginated inventory is an independent capture. Preserve the
+  # original strict local backend check, while allowing only the same
+  # service-side read-only metadata advancement as the exact Release boundary:
+  # target_commitish presentation and null-to-canonical-SHA asset digests.
+  advance_release_inventory \
+    "$initial_release_inventory_snapshot" \
+    "$prewrite_release_inventory_snapshot" || {
+      fail_reconcile inconclusive remote-state-changed \
+        "the complete GitHub Release inventory changed during reconcile"
+    }
+  initial_release_inventory_snapshot="$prewrite_release_inventory_snapshot"
+fi
 audit_release_history
 [[ "$later_release_tag" == "$saved_later_release_tag" &&
     "$later_release_version" == "$saved_later_release_version" &&
@@ -2974,8 +3087,23 @@ audit_release_history
   fail_reconcile inconclusive remote-state-changed \
     "the verified release history changed during reconcile"
 }
-audit_release_inventory "$initial_release_inventory_fingerprint"
+audit_release_inventory
 prewrite_release_inventory_fingerprint_after="$release_inventory_fingerprint"
+prewrite_release_inventory_snapshot_after="$release_inventory_snapshot"
+if [[ -n "$test_release_dir" ]]; then
+  [[ "$prewrite_release_inventory_fingerprint" == "$prewrite_release_inventory_fingerprint_after" ]] || {
+    fail_reconcile inconclusive remote-state-changed \
+      "the complete GitHub Release inventory changed during reconcile"
+  }
+else
+  advance_release_inventory \
+    "$initial_release_inventory_snapshot" \
+    "$prewrite_release_inventory_snapshot_after" || {
+      fail_reconcile inconclusive remote-state-changed \
+        "the complete GitHub Release inventory changed during reconcile"
+    }
+  initial_release_inventory_snapshot="$prewrite_release_inventory_snapshot_after"
+fi
 prewrite_ref_fingerprint_after="$(remote_ref_fingerprint)" || {
   fail_reconcile inconclusive remote-read-inconclusive \
     "the complete target ref namespace could not be confirmed after the final full reconcile"
@@ -2988,11 +3116,9 @@ later_same_major_stable_tag="$saved_later_same_major_stable_tag"
 later_same_major_stable_version="$saved_later_same_major_stable_version"
 [[ "$initial_remote_ref_fingerprint" == "$prewrite_ref_fingerprint_before" &&
     "$prewrite_ref_fingerprint_before" == "$prewrite_ref_fingerprint_cloned" &&
-    "$prewrite_ref_fingerprint_cloned" == "$prewrite_ref_fingerprint_after" &&
-    "$initial_release_inventory_fingerprint" == "$prewrite_release_inventory_fingerprint" &&
-    "$prewrite_release_inventory_fingerprint" == "$prewrite_release_inventory_fingerprint_after" ]] || {
+    "$prewrite_ref_fingerprint_cloned" == "$prewrite_ref_fingerprint_after" ]] || {
   fail_reconcile inconclusive remote-state-changed \
-    "the complete target ref or GitHub Release inventory changed during reconcile"
+    "the complete target ref namespace changed during reconcile"
 }
 
 verify_live_release_signer_policy final-prewrite
@@ -3043,12 +3169,19 @@ if ! is_test_environment; then
         fail_reconcile inconclusive remote-read-inconclusive \
           "the final exact-tag GitHub Release could not be normalized safely"
       }
-      [[ "$stable_release_identity" == "$initial_release_identity" &&
-          "$stable_release_neutral_snapshot" == "$initial_release_neutral_snapshot" ]] || {
+      [[ "$stable_release_identity" == "$initial_release_identity" ]] || {
+        emit_reconcile_state inconclusive stderr
+        emit_recovery_code remote-state-changed "GitHub Release metadata changed during reconcile"
+        exit 1
+      }
+      advance_release_inventory \
+        "$initial_release_neutral_snapshot" \
+        "$stable_release_neutral_snapshot" || {
         emit_reconcile_state inconclusive stderr
         emit_recovery_code remote-state-changed "GitHub Release metadata or asset identity changed during reconcile"
         exit 1
       }
+      initial_release_neutral_snapshot="$stable_release_neutral_snapshot"
     fi
   elif jq -e 'type == "object"' "$stable_release_api" >/dev/null; then
     emit_reconcile_state inconclusive stderr
@@ -3284,14 +3417,14 @@ reconcile_github_release() {
   local starter_asset_count starter_delete_response starter_delete_error
   local expected_asset_names_json pre_delete_boundary delete_status allow_starter
   local latest_before latest_after
-  local final_release_api final_confirm_api final_release_identity final_confirm_identity
-  local final_asset_snapshot final_confirm_snapshot final_download_dir final_provenance_status
+  local final_release_api final_confirm_api
+  local final_asset_snapshot final_download_dir final_provenance_status
   local post_publish_release_api publication_payload publication_response publication_error
   local release_id release_make_latest
   local current_boundary before_boundary after_boundary published_boundary
   local absent_boundary created_boundary create_status create_response_usable
   local create_payload create_response create_error created_response_boundary
-  local created_response_tag
+  local created_response_tag manual_draft_with_tag
   local -a missing_assets=()
 
   read_remote_full_tag_snapshot() {
@@ -3607,12 +3740,14 @@ reconcile_github_release() {
       fail_release_boundary_capture "$?" "initial GitHub Release mutation boundary"
     }
     if [[ -n "$existing_draft_release_id" ]]; then
-      jq -e -n \
+      manual_draft_with_tag="$(jq -cn \
         --argjson adopted "$manual_draft_boundary" \
-        --argjson boundary "$current_boundary" '
-          $adopted.release == $boundary.release and
-          $adopted.assets == $boundary.assets
-        ' >/dev/null || {
+        --argjson tag "$(printf '%s' "$current_boundary" | jq -c .tag)" \
+        '$adopted + {tag:$tag}')" || {
+        fail_reconcile inconclusive remote-read-inconclusive \
+          "the manually adopted Draft Release could not be assembled with its frozen immutable-tag binding"
+      }
+      advance_release_boundary "$manual_draft_with_tag" "$current_boundary" steady || {
         fail_reconcile inconclusive remote-state-changed \
           "the manually adopted Draft Release changed before its frozen-ID mutation boundary"
       }
@@ -3780,12 +3915,15 @@ reconcile_github_release() {
       fail_reconcile inconclusive starter-asset-deletion-unknown \
         "the frozen Release boundary could not be revalidated immediately before starter deletion"
     }
+    advance_release_boundary "$current_boundary" "$pre_delete_boundary" steady || {
+      fail_reconcile inconclusive starter-asset-deletion-unknown \
+        "the selected Release boundary advanced unexpectedly before starter deletion; no deletion was attempted"
+    }
+    current_boundary="$pre_delete_boundary"
     jq -e -n \
       --argjson asset_id "$starter_asset_id" \
       --arg starter_name "$starter_asset_name" \
-      --argjson selected "$current_boundary" \
       --argjson fenced "$pre_delete_boundary" '
-      $selected == $fenced and
       ([ $fenced.assets[] | select(
         .id == $asset_id and .name == $starter_name and
         .state == "starter" and .size == 0 and .digest == null and
@@ -3816,15 +3954,16 @@ reconcile_github_release() {
       fail_reconcile inconclusive starter-asset-deletion-unknown \
         "starter deletion outcome $delete_status could not be reconciled by a stable frozen-ID boundary; reconcile the same exact source SHA"
     }
+    advance_release_boundary "$pre_delete_boundary" "$after_boundary" remove-one "$starter_asset_id" || {
+      fail_reconcile inconclusive starter-asset-deletion-unknown \
+        "starter deletion outcome $delete_status changed a protected Release boundary; reconcile the same exact source SHA"
+    }
     jq -e -n \
       --argjson asset_id "$starter_asset_id" \
       --argjson before "$pre_delete_boundary" \
-      --argjson after "$after_boundary" \
-      '$before.release == $after.release and $before.tag == $after.tag and
-       ([ $before.assets[] | select(.id == $asset_id and .state == "starter" and .size == 0) ] | length) == 1 and
+      --argjson after "$after_boundary" '
+      ([ $before.assets[] | select(.id == $asset_id and .state == "starter" and .size == 0) ] | length) == 1 and
        ([ $after.assets[] | select(.id == $asset_id) ] | length) == 0 and
-       all($before.assets[] | select(.id != $asset_id);
-         . as $old | any($after.assets[]; . == $old)) and
        ($after.assets | length) == (($before.assets | length) - 1)' >/dev/null || {
       fail_reconcile inconclusive starter-asset-deletion-unknown \
         "starter deletion outcome $delete_status did not prove the exact one-asset removal; reconcile the same exact source SHA"
@@ -3878,20 +4017,22 @@ reconcile_github_release() {
   before_boundary="$(capture_release_boundary pre-upload "$current_draft" "$current_immutable")" || {
     fail_release_boundary_capture "$?" "pre-upload GitHub Release boundary"
   }
-  [[ "$before_boundary" == "$current_boundary" ]] || {
+  advance_release_boundary "$current_boundary" "$before_boundary" steady || {
     fail_reconcile inconclusive remote-state-changed \
       "GitHub Release boundary changed before the upload phase; reconcile the same exact source SHA"
   }
+  current_boundary="$before_boundary"
   if [[ "${#missing_assets[@]}" -gt 0 ]]; then
     for asset in "${missing_assets[@]}"; do
       name="${asset##*/}"
       before_boundary="$(capture_release_boundary "before-upload-$name" true false)" || {
         fail_release_boundary_capture "$?" "GitHub Release boundary before uploading $name"
       }
-      [[ "$before_boundary" == "$current_boundary" ]] || {
+      advance_release_boundary "$current_boundary" "$before_boundary" steady || {
         fail_reconcile inconclusive remote-state-changed \
           "GitHub Release boundary changed before uploading $name; reconcile the same exact source SHA"
       }
+      current_boundary="$before_boundary"
       require_publication_mutation release-completion
       encoded_name="$(jq -rn --arg value "$name" '$value | @uri')" || {
         fail_reconcile inconclusive release-asset-upload-unknown \
@@ -3929,13 +4070,16 @@ reconcile_github_release() {
       after_boundary="$(capture_release_boundary "after-upload-$name" true false)" || {
         fail_release_boundary_capture "$?" "GitHub Release boundary after uploading $name"
       }
+      advance_release_boundary "$current_boundary" "$after_boundary" add-one \
+        "$uploaded_asset_id" "$name" || {
+        fail_reconcile inconclusive release-asset-upload-unknown \
+          "asset upload response or protected Release boundary differs from the expected one-asset addition on frozen Release id $frozen_release_id; reconcile the same exact source SHA without rebinding the Release"
+      }
       jq -e -n \
         --arg name "$name" \
         --argjson before "$current_boundary" \
         --argjson after "$after_boundary" \
-        '$before.release == $after.release and $before.tag == $after.tag and
-         all($before.assets[]; . as $old | any($after.assets[]; . == $old)) and
-         ([ $after.assets[] | select(.name == $name) ] | length) == 1 and
+        '([ $after.assets[] | select(.name == $name) ] | length) == 1 and
          ($after.assets | length) == (($before.assets | length) + 1)' >/dev/null || {
         fail_reconcile inconclusive remote-state-changed \
           "GitHub Release boundary changed unexpectedly while uploading $name; reconcile the same exact source SHA"
@@ -3983,10 +4127,11 @@ reconcile_github_release() {
     before_boundary="$(capture_release_boundary pre-publication-mutation true false)" || {
       fail_release_boundary_capture "$?" "final draft GitHub Release publication boundary"
     }
-    [[ "$before_boundary" == "$current_boundary" ]] || {
+    advance_release_boundary "$current_boundary" "$before_boundary" steady || {
       fail_reconcile blocked_conflict immutable-release-mismatch \
         "the stable final draft GitHub Release identity, author, tag binding, or assets differ from the frozen publication boundary"
     }
+    current_boundary="$before_boundary"
     release_id="$(printf '%s' "$before_boundary" | jq -er \
       '.release.id | select(type == "number" and floor == . and . > 0)')" || {
       fail_reconcile blocked_conflict immutable-release-mismatch \
@@ -4028,10 +4173,11 @@ reconcile_github_release() {
     before_boundary="$(capture_release_boundary pre-publish false true)" || {
       fail_release_boundary_capture "$?" "existing immutable GitHub Release pre-publish boundary"
     }
-    [[ "$before_boundary" == "$current_boundary" ]] || {
+    advance_release_boundary "$current_boundary" "$before_boundary" steady || {
       fail_reconcile blocked_conflict immutable-release-mismatch \
         "the stable immutable GitHub Release boundary differs from the frozen publication boundary"
     }
+    current_boundary="$before_boundary"
   fi
   post_publish_release_api="$temporary_root/current-release-post-publish.json"
   publisher_gh api \
@@ -4050,15 +4196,17 @@ reconcile_github_release() {
   published_boundary="$(capture_release_boundary post-publish false true)" || {
     fail_release_boundary_capture "$?" "published immutable GitHub Release boundary"
   }
-  jq -e -n \
-    --argjson before "$current_boundary" \
-    --argjson after "$published_boundary" \
-    '($before.release | del(.draft,.immutable)) == ($after.release | del(.draft,.immutable)) and
-     $before.assets == $after.assets and $before.tag == $after.tag and
-     $after.release.draft == false and $after.release.immutable == true' >/dev/null || {
-    fail_reconcile blocked_conflict immutable-release-mismatch \
-      "published GitHub Release identity, author, tag binding, or assets differ from the frozen draft boundary"
-  }
+  if [[ "$current_draft" == "true" ]]; then
+    advance_release_boundary "$current_boundary" "$published_boundary" publish || {
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "published GitHub Release identity, author, tag binding, or assets differ from the frozen draft boundary"
+    }
+  else
+    advance_release_boundary "$current_boundary" "$published_boundary" steady || {
+      fail_reconcile blocked_conflict immutable-release-mismatch \
+        "published GitHub Release identity, author, tag binding, or assets differ from the frozen immutable boundary"
+    }
+  fi
   current_boundary="$published_boundary"
   latest_after="$(read_latest_release_tag after)"
   if [[ "$preflight_write_eligible" == "true" && "$prerelease" != "true" ]]; then
@@ -4080,10 +4228,11 @@ reconcile_github_release() {
   final_boundary="$(capture_release_boundary final-immutable false true)" || {
     fail_release_boundary_capture "$?" "immutable GitHub Release boundary before final verification"
   }
-  [[ "$final_boundary" == "$current_boundary" ]] || {
+  advance_release_boundary "$current_boundary" "$final_boundary" steady || {
     fail_reconcile blocked_conflict immutable-release-mismatch \
       "the stable immutable GitHub Release identity, author, tag binding, or assets differ from the frozen published boundary"
   }
+  current_boundary="$final_boundary"
   final_release_api="$temporary_root/current-release-final-immutable.json"
   publisher_gh api \
     --header 'X-GitHub-Api-Version: 2026-03-10' \
@@ -4104,7 +4253,6 @@ reconcile_github_release() {
     fail_reconcile blocked_conflict immutable-release-mismatch \
       "final immutable GitHub Release metadata differs from policy"
   }
-  final_release_identity="$(printf '%s' "$final_boundary" | jq -Sc .release)"
   final_asset_snapshot="$(printf '%s' "$final_boundary" | jq -Sc .assets)"
   asset_names="$(printf '%s' "$final_asset_snapshot" | jq -r '.[].name' | LC_ALL=C sort)"
   [[ "$asset_names" == "$expected_asset_names" ]] || {
@@ -4170,14 +4318,12 @@ reconcile_github_release() {
   final_confirm_boundary="$(capture_release_boundary final-confirm false true)" || {
     fail_release_boundary_capture "$?" "immutable GitHub Release boundary after asset verification"
   }
-  final_confirm_identity="$(printf '%s' "$final_confirm_boundary" | jq -Sc .release)"
-  final_confirm_snapshot="$(printf '%s' "$final_confirm_boundary" | jq -Sc .assets)"
-  [[ "$final_confirm_boundary" == "$final_boundary" &&
-      "$final_confirm_identity" == "$final_release_identity" &&
-      "$final_confirm_snapshot" == "$final_asset_snapshot" ]] || {
+  advance_release_boundary "$current_boundary" "$final_confirm_boundary" steady || {
     fail_reconcile blocked_conflict immutable-release-mismatch \
       "the stable immutable GitHub Release metadata or asset identity differs from the frozen final-verification boundary"
   }
+  final_boundary="$final_confirm_boundary"
+  current_boundary="$final_confirm_boundary"
 }
 
 if [[ -n "$test_release_dir" ]]; then
@@ -4267,10 +4413,11 @@ if [[ -n "$major_alias" ]]; then
       pre_alias_boundary="$(capture_release_boundary pre-alias-mutation false true)" || {
         fail_release_boundary_capture "$?" "final immutable GitHub Release boundary before alias mutation"
       }
-      [[ "$pre_alias_boundary" == "$final_confirm_boundary" ]] || {
+      advance_release_boundary "$final_confirm_boundary" "$pre_alias_boundary" steady || {
         fail_reconcile blocked_conflict immutable-release-mismatch \
           "the stable immutable GitHub Release identity, author, tag binding, or assets differ from the frozen pre-alias boundary"
       }
+      final_confirm_boundary="$pre_alias_boundary"
     fi
     if [[ "$alias_mode" == "force-with-lease" ]]; then
       target_git_push --force-with-lease="refs/tags/$major_alias:$alias_before" \
@@ -4304,10 +4451,11 @@ if [[ -n "$major_alias" ]]; then
     post_alias_boundary="$(capture_release_boundary post-alias false true)" || {
       fail_release_boundary_capture "$?" "immutable GitHub Release boundary after alias reconcile"
     }
-    [[ "$post_alias_boundary" == "$pre_alias_boundary" ]] || {
+    advance_release_boundary "$pre_alias_boundary" "$post_alias_boundary" steady || {
       fail_reconcile blocked_conflict immutable-release-mismatch \
         "the stable immutable GitHub Release identity, assets, or full-tag binding differ from the frozen alias-mutation boundary"
     }
+    pre_alias_boundary="$post_alias_boundary"
   fi
   if ! is_test_environment; then
     alias_verification="$(publisher_gh api "repos/$TARGET_REPOSITORY/git/tags/$remote_alias_object" --jq '[.verification.verified,.verification.reason] | map(tostring) | join(" ")')"
