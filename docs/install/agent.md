@@ -476,7 +476,10 @@ legacy before v2 is Active and read back.
    matching canonical hidden marker exists. Do not race a controller-owned
    request with this low-cost path.
 
-   Do not add prose to the request. A qualifying Codex bot `issue_comment`
+   Do not add prose to the request. GitHub may persist this one-line direct
+   request with exactly one terminal LF or CRLF; those two storage forms are
+   equivalent to exact `@codex review`. Do not accept or emit any other
+   whitespace, visible text, or hidden comment. A qualifying Codex bot `issue_comment`
    `created` or `edited` event will wake the installed workflow. A review or
    reaction alone does not have an automatic consumer job; use manual
    `reconcile` when a later evaluation is needed.
