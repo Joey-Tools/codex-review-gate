@@ -54,9 +54,9 @@ const expectedSuites = [
   ["release 3/4", "3/4"],
   ["release 4/4", "4/4"],
 ];
-const expectedReleaseSynchronousTestCalls = 100;
-const expectedReleaseRegistrationCount = 155;
-const expectedReleaseShardDistribution = [39, 39, 39, 38];
+const expectedReleaseSynchronousTestCalls = 102;
+const expectedReleaseRegistrationCount = 158;
+const expectedReleaseShardDistribution = [40, 40, 39, 39];
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");

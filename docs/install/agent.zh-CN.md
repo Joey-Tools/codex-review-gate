@@ -433,7 +433,9 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    `begin-review`，也不存在 matching canonical hidden marker。不得让这个低成本路径与
    controller-owned request 发生 race。
 
-   不要增加 prose。Caller-authored event 会被 pre-runner bot filter 跳过，Codex bot 之后的
+   GitHub 可能把这条单行 direct request 保存为末尾恰好一个 LF 或 CRLF；这两种存储
+   形式与精确的 `@codex review` 等价。不得接受或发送其他空白、可见文字或 hidden comment。
+   Caller-authored event 会被 pre-runner bot filter 跳过，Codex bot 之后的
    合格 `issue_comment` `created` 或 `edited` event 才启动 controller workflow。Review 或
    reaction 本身没有自动 consumer job，需要时手动 reconcile。
 

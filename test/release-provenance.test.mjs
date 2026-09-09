@@ -2426,26 +2426,53 @@ test("public verification detects a same-name Release asset replacement", () => 
   }), /asset metadata differs from policy/u);
 });
 
-test("Draft publication boundary permits only target_commitish presentation drift and digest materialization", () => {
+test("Draft publication boundary permits target_commitish, digest, and download URL derivation", () => {
   const draft = publicationBoundary({
     draft: true,
     immutable: false,
     targetCommitish: "master",
     assetDigest: null,
+    assetOverrides: {
+      browser_download_url:
+        "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-opaque/release-provenance.json",
+    },
   });
   const published = publicationBoundary({
     draft: false,
     immutable: true,
     targetCommitish: "v2.0.0-rc.2",
     assetDigest: `sha256:${"f".repeat(64)}`,
+    assetOverrides: {
+      browser_download_url:
+        "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/v2.0.0-rc.2/release-provenance.json",
+    },
   });
 
   assert.equal(validateDraftPublicationBoundaryTransition(draft, published), true);
+  const unchangedUrl = structuredClone(published);
+  unchangedUrl.assets[0].browser_download_url = draft.assets[0].browser_download_url;
+  assert.equal(validateDraftPublicationBoundaryTransition(draft, unchangedUrl), true);
 });
 
 test("Draft publication boundary rejects asset, digest, and immutable-tag mutations", () => {
   const draft = publicationBoundary({ draft: true, immutable: false });
   const published = publicationBoundary({ draft: false, immutable: true });
+  const urlBoundDraft = publicationBoundary({
+    draft: true,
+    immutable: false,
+    assetOverrides: {
+      browser_download_url:
+        "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-opaque/release-provenance.json",
+    },
+  });
+  const urlBoundPublished = publicationBoundary({
+    draft: false,
+    immutable: true,
+    assetOverrides: {
+      browser_download_url:
+        "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/v2.0.0-rc.2/release-provenance.json",
+    },
+  });
 
   const digestMutation = structuredClone(published);
   digestMutation.assets[0].digest = `sha256:${"f".repeat(64)}`;
@@ -2460,6 +2487,51 @@ test("Draft publication boundary rejects asset, digest, and immutable-tag mutati
     () => validateDraftPublicationBoundaryTransition(draft, assetMutation),
     /asset identity or metadata differs/u,
   );
+
+  const apiUrlMutation = structuredClone(published);
+  apiUrlMutation.assets[0].url += "?changed";
+  assert.throws(
+    () => validateDraftPublicationBoundaryTransition(draft, apiUrlMutation),
+    /asset identity or metadata differs/u,
+  );
+
+  for (const browserDownloadUrl of [
+    "https://github.com/JoeyTeng/other-action/releases/download/v2.0.0-rc.2/release-provenance.json",
+    "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/v2.0.0-rc.3/release-provenance.json",
+    "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/v2.0.0-rc.2/unexpected.json",
+  ]) {
+    const urlMutation = structuredClone(urlBoundPublished);
+    urlMutation.assets[0].browser_download_url = browserDownloadUrl;
+    assert.throws(
+      () => validateDraftPublicationBoundaryTransition(urlBoundDraft, urlMutation),
+      /browser download URL differs from the expected Draft-to-published derivation/u,
+    );
+  }
+  const unexpectedDraftUrl = structuredClone(urlBoundDraft);
+  unexpectedDraftUrl.assets[0].browser_download_url =
+    "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/v2.0.0-rc.1/release-provenance.json";
+  assert.throws(
+    () => validateDraftPublicationBoundaryTransition(unexpectedDraftUrl, urlBoundPublished),
+    /browser download URL differs from the expected Draft-to-published derivation/u,
+  );
+  for (const opaqueDraftId of [
+    "a%2Fb",
+    "a\\b",
+    "a b",
+    "a%ZZ",
+    "é",
+    "a\n",
+    "a\\..\\..\\OtherOwner\\other-action\\releases\\download\\untagged-b",
+  ]) {
+    const malformedDraftUrl = structuredClone(urlBoundDraft);
+    malformedDraftUrl.assets[0].browser_download_url =
+      "https://github.com/JoeyTeng/codex-review-gate-action/releases/download/untagged-" +
+      `${opaqueDraftId}/release-provenance.json`;
+    assert.throws(
+      () => validateDraftPublicationBoundaryTransition(malformedDraftUrl, urlBoundPublished),
+      /browser download URL differs from the expected Draft-to-published derivation/u,
+    );
+  }
 
   const tagMutation = structuredClone(published);
   tagMutation.tag.object = "e".repeat(40);
@@ -2497,6 +2569,12 @@ test("Release boundary advancement permits only forward digest materialization",
   assert.throws(
     () => validateReleaseBoundaryAdvancement(materialized, digestMutation),
     /asset digest differs/u,
+  );
+  const browserDownloadUrlMutation = structuredClone(materialized);
+  browserDownloadUrlMutation.assets[0].browser_download_url += "?changed";
+  assert.throws(
+    () => validateReleaseBoundaryAdvancement(materialized, browserDownloadUrlMutation),
+    /asset identity or metadata differs/u,
   );
   const malformedDigest = structuredClone(nullDigest);
   malformedDigest.assets[0].digest = "sha256:BAD";

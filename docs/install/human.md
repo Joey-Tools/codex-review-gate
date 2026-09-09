@@ -434,6 +434,11 @@ Normally, request the review directly on the PR:
 @codex review
 ```
 
+Do not add prose to the request. GitHub may persist this one-line direct
+request with exactly one terminal LF or CRLF; those two storage forms are
+equivalent to exact `@codex review`. Do not accept or emit any other
+whitespace, visible text, or hidden comment.
+
 This is the preferred path because it does not spend Actions minutes merely to
 create the request. A later qualifying `created` or `edited` Codex bot comment
 wakes the controller, which establishes a strictly newer full verifier attempt.

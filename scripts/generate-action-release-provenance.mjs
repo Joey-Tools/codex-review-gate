@@ -2067,11 +2067,56 @@ function validateReleaseBoundaryShape(boundary, label) {
 // `target_commitish` is an API presentation field, not the immutable Release
 // binding. The shell separately validates the exact annotated tag object and
 // peeled release commit at every boundary. A service may later report a
-// previously-null asset digest. A boundary advancement therefore ignores only
-// target_commitish and permits an individual digest to advance from null to a
-// canonical SHA-256 value; every other release, tag, asset identity, and asset
-// metadata field remains exact. Capture A/B reads remain raw-equal in the
-// shell, so a change *during* a capture is still inconclusive.
+// previously-null asset digest. GitHub also derives `browser_download_url`
+// from an untagged Draft endpoint to a tag-named published endpoint. A
+// boundary advancement therefore ignores target_commitish, permits an
+// individual digest to advance from null to a canonical SHA-256 value, and
+// permits browser_download_url to either remain exact or take GitHub's one
+// exact Draft-to-published derivation for the same target, tag, and asset.
+// Every other release, tag, asset identity, and asset metadata field remains
+// exact. Capture A/B reads remain raw-equal in the shell, so a change *during*
+// a capture is still inconclusive.
+function expectedPublishedReleaseAssetBrowserDownloadUrl(tag, assetName) {
+  return `https://github.com/${TARGET_REPOSITORY}/releases/download/${
+    encodeURIComponent(tag)
+  }/${encodeURIComponent(assetName)}`;
+}
+
+const CANONICAL_UNRESERVED_URL_PATH_CHARACTERS = new Set(
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~",
+);
+
+function isCanonicalUnreservedUrlPathSegment(value) {
+  return value.length > 0 &&
+    [...value].every((character) =>
+      CANONICAL_UNRESERVED_URL_PATH_CHARACTERS.has(character));
+}
+
+function isExpectedDraftReleaseAssetBrowserDownloadUrl(url, assetName) {
+  const prefix = `https://github.com/${TARGET_REPOSITORY}/releases/download/untagged-`;
+  const suffix = `/${encodeURIComponent(assetName)}`;
+  if (!url.startsWith(prefix) || !url.endsWith(suffix)) return false;
+  const opaqueDraftId = url.slice(prefix.length, url.length - suffix.length);
+  // The fixed raw prefix/suffix bind the origin, repository, route, and asset.
+  // The remaining Draft id must be an ASCII unreserved path segment. Do not
+  // parse a permissive URL and compare its normalized pieces: WHATWG URL
+  // parsing can reinterpret a raw backslash or dot segment as a path change.
+  return isCanonicalUnreservedUrlPathSegment(opaqueDraftId);
+}
+
+function validatePublishedReleaseAssetBrowserDownloadUrl(beforeUrl, afterUrl, {
+  tag,
+  assetName,
+}) {
+  if (beforeUrl === afterUrl) return;
+  if (
+    !isExpectedDraftReleaseAssetBrowserDownloadUrl(beforeUrl, assetName) ||
+    afterUrl !== expectedPublishedReleaseAssetBrowserDownloadUrl(tag, assetName)
+  ) {
+    fail("advanced Release asset browser download URL differs from the expected Draft-to-published derivation");
+  }
+}
+
 export function validateReleaseBoundaryAdvancement(before, after, {
   mode = "steady",
   assetId = undefined,
@@ -2128,8 +2173,26 @@ export function validateReleaseBoundaryAdvancement(before, after, {
   for (const [id, beforeAsset] of beforeAssets) {
     const afterAsset = afterAssets.get(id);
     if (afterAsset === undefined) continue;
-    const { digest: beforeDigest, ...beforeComparable } = beforeAsset;
-    const { digest: afterDigest, ...afterComparable } = afterAsset;
+    const {
+      digest: beforeDigest,
+      browser_download_url: beforeBrowserDownloadUrl,
+      ...beforeComparable
+    } = beforeAsset;
+    const {
+      digest: afterDigest,
+      browser_download_url: afterBrowserDownloadUrl,
+      ...afterComparable
+    } = afterAsset;
+    if (mode === "publish") {
+      validatePublishedReleaseAssetBrowserDownloadUrl(
+        beforeBrowserDownloadUrl,
+        afterBrowserDownloadUrl,
+        { tag: after.release.tag_name, assetName: beforeAsset.name },
+      );
+    } else {
+      beforeComparable.browser_download_url = beforeBrowserDownloadUrl;
+      afterComparable.browser_download_url = afterBrowserDownloadUrl;
+    }
     if (!sameCanonicalValue(beforeComparable, afterComparable)) {
       fail("advanced Release asset identity or metadata differs from the previous boundary");
     }
