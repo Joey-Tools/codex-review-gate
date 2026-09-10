@@ -2,9 +2,10 @@
 
 ## Current State
 - The source workspace keeps the publishable GitHub Action package under `packages/action`.
-- The confirmed v2 runtime, installation, and manifest-driven publisher
-  contract is being implemented from the 2026-08-26 delivery confirmation; no
-  v2 publication or consumer activation is recorded yet.
+- The v2 runtime, installation, and manifest-driven publisher infrastructure
+  are implemented; immutable RC.1–RC.3 prereleases and the RC.3 admission
+  fixture provide release evidence. Stable `v2.0.0`, the floating `v2` alias,
+  and production consumer activation are not yet recorded.
 - Per-workstream details live under `docs/project_journal/`; keep this file as a short repo-wide recovery entrypoint.
 
 ## Recovery Pointers
@@ -14,9 +15,9 @@
 - Superseded v1 release automation history: `docs/project_journal/2026/05/2026-05-18-action-release-automation-9a806cf.md`
 
 ## Global Blockers
-- v2 cannot publish until the infrastructure change is merged and validated,
-  a separate release-intent change is reviewed, and the target Environment,
-  App/GPG, rulesets, and release reconciliation preflights are complete.
+- Stable v2 cannot publish until its separate release intent is merged, the
+  live publisher/App/GPG/ruleset preflight is complete, the target Environment
+  is approved, and immutable-release/alias readback closes successfully.
 
 ## Notes
 - The generated `docs/project_journal/INDEX.md` is a local convenience artifact and should not be committed.
