@@ -3,7 +3,7 @@ id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
 status: active
 created: 2026-08-25
-updated: 2026-09-09
+updated: 2026-09-10
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
@@ -3805,14 +3805,45 @@ superseded_by:
   previously omitted English human and Chinese agent installation-guide
   mirrors, so the four guides state the same accepted request body grammar.
 
+### RC.3 admission fixture completion
+
+- The separately approved selector-only bridge
+  `JoeyTeng/website-checking#7` merged as
+  `29bb593df5364a14cb23540581b9a151dcb6237b`. It changed only the two
+  canonical workflow selectors from immutable RC.2 to immutable RC.3.
+- Replacement canary `JoeyTeng/website-checking#8` used the single direct
+  request `5603394475` and received the official Codex terminal-clean comment
+  `5603413679`, both bound to feature head
+  `e4d6abb2221ef6e223eca987cf78b393bd9fdfb4`. The protected-default-branch
+  manual reconcile run `34363091215` produced the exact-head native
+  `codex/github-review-gate` success CheckRun `102504985826` in verifier run
+  `34362729659`, using immutable `v2.0.0-rc.3` target commit
+  `0191565ddcbc4417eeaed5cd485580fce87aa11c`. The Job Summary itself is UI
+  evidence, but the published RC.3 verifier exits successfully only for
+  `healthy/success`; complete provider readback found no review, inline, or
+  thread finding.
+- Both test PRs `#5` and `#8` were closed unmerged. Forward cleanup PR
+  `JoeyTeng/website-checking#9` then merged as
+  `c9073c6d3e74a1eb4ef66c8980f887156f152f74`, restoring the two workflow
+  blobs exactly to their pre-RC.3 RC.2 state. This selector-bridge cleanup did
+  not delete the workflow paths: its recorded pre-bridge state already
+  contained the RC.2 pair.
+- The temporary fixture ruleset `22464508`
+  (`codex-temp-rc-pr-only-019ff4f8`) remained active and bypass-free through
+  cleanup. In an exclusive owner maintenance window its frozen profile was
+  reread, the exact ID was deleted, and the post-delete repository ruleset
+  inventory was empty; a direct read of that ID returned `404`.
+
 ## Verified Facts And Required Live Preflight
 
 - Verified: a hidden-marker request whose visible first line is exact
   `@codex review` can be authored by `github-actions[bot]` and still trigger
   Codex. On unchanged-head PR #7, request `4461404667` triggered terminal clean
   result `4461418036`.
-- Remaining marker verification: live-canary the final v2 hidden-marker byte
-  grammar on an unchanged head before stable admission.
+- The exact hidden-marker carrier was independently observed to trigger Codex;
+  the RC.3 replacement canary separately completed the direct-request
+  exact-head admission loop. No remaining marker or live-canary verification
+  is required before the stable release intent.
 - Live preflight and post-write readback verified that
   `marketplace-production` requires reviewer `JoeyTeng`, permits self-review,
   disables administrator bypass, restricts deployment to source `master`, and
@@ -3849,30 +3880,22 @@ superseded_by:
   evidence-only landing commit is separately signed and exact-head confirmed
   before push; its own hash remains Git evidence rather than self-referential
   journal content.
-- Run the already specified hidden-marker canary and live
-  publisher/runner/Environment preflights as execution evidence; they are not
+- The RC.3 bridge, replacement canary, forward cleanup, and temporary-ruleset
+  removal are complete. Do not reopen or retry test PR #5 or #8.
+- Land the separate stable `v2.0.0` release intent, then allow its exact
+  source-master push to complete credential-free planning, candidate assembly,
+  and source validation before approving the `marketplace-production`
+  Environment. The privileged publisher performs its own App, GPG, ruleset,
+  immutable-Release, and alias reconciliation; these are execution gates, not
   remaining grilling choices.
-- PR #35 is merged. Its approved frozen RC recovery completed every
-  unprivileged stage but failed before any target write in the publisher
-  identity/scope preflight. Do not involve PR #32.
-- RC `v2.0.0-rc.2` is immutable with its full tag and assets; its
-  boundary-comparator recovery completed, bridge PR #3 was closed unmerged,
-  and the RC.2 selector bridge was merged. RC `v2.0.0-rc.3` is now also an
-  immutable prerelease with its full tag and assets, and its post-publish
-  false-negative was reconciled successfully. The isolated RC.3
-  comparator/doc correction is landed. Merge a separately approved RC.3
-  selector-only bridge and prove a new replacement canary before creating the
-  stable `v2.0.0` release intent. Do not retry canary PR #5.
 - Keep the Publisher App at the already reduced three-permission surface
   (Metadata read, Contents read/write, Administration read). No later release,
   including the stable release, may retain the one-time transition's
   `Workflows: read/write` permission.
-- Then land the stable `v2.0.0` release intent separately and execute its
-  approved publisher workflow. Verify the immutable stable ref,
-  Release/assets, signatures and `v2` floating alias before carrying out the
-  explicitly selected consumer migrations and canaries. Marketplace
-  publication remains the separate stable-major manual checklist item defined
-  above.
+- Verify the immutable stable ref, Release/assets, signatures, and `v2`
+  floating alias before carrying out the explicitly selected consumer
+  migrations and canaries. Marketplace publication remains the separate
+  stable-major manual checklist item defined above.
 
 ## Evidence
 

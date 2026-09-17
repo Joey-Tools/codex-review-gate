@@ -1,7 +1,7 @@
 {
   "$schema": "urn:joey-tools:codex-review-gate:release-manifest:2",
   "schema_version": 2,
-  "version": "2.0.0-rc.3",
+  "version": "2.0.0",
   "contract_versions": {
     "toolchain": "node20",
     "release_schema": 2,
@@ -12,13 +12,13 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "a10ee4a7c6a0895a4bcc6966e52efea7d71661ed"
+    "tree": "cdf16cae08b37f57b4f1657e217fc04be4ba8051"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
     "ref": "refs/heads/master",
-    "expected_head": "6eab8d369137207f3b4fd414c5365831317636a1",
-    "previous_version": "2.0.0-rc.2"
+    "expected_head": "0191565ddcbc4417eeaed5cd485580fce87aa11c",
+    "previous_version": "2.0.0-rc.3"
   },
   "files": [
     {
@@ -109,8 +109,8 @@
       "path": "package.json",
       "type": "file",
       "mode": "100644",
-      "size": 486,
-      "sha256": "f5b858b4b19da8d64ded42d95602eda2e061c2c42edf968cd8637076b1e32fb4"
+      "size": 481,
+      "sha256": "6c5f21ef6f99f34cc81b22d7225406babf75fdf885a62ecda863828ee6fd06ac"
     },
     {
       "path": "producer-receipt.schema.json",
