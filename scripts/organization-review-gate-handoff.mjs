@@ -26,6 +26,17 @@ export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
 export const REQUIRED_REPOSITORY_COUNT = 11;
 export const CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const V2_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
+// These are every documented nonterminal value accepted by the Actions
+// workflow-runs `status` filter. A run in any of them can still execute and
+// overwrite the legacy status, so each legacy-status writer must be empty
+// across the full set before its compatibility evidence is accepted.
+export const NONTERMINAL_WORKFLOW_RUN_STATUSES = Object.freeze([
+  "requested",
+  "waiting",
+  "pending",
+  "queued",
+  "in_progress",
+]);
 const CANARY_PULL_QUERY = `query CanaryPull($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -1942,7 +1953,7 @@ export function validateLegacyProducerRunPages(
   status,
   writer = "legacy-status writer",
 ) {
-  if (!new Set(["queued", "in_progress"]).has(status)) {
+  if (!NONTERMINAL_WORKFLOW_RUN_STATUSES.includes(status)) {
     throw new Error("Legacy producer run inventory requested an unsupported status.");
   }
   if (
@@ -2084,7 +2095,7 @@ async function assertLegacyProducerDrained(repo) {
       [producerWorkflowId, "retained canonical producer"],
       [bridgeWorkflowId, "temporary legacy bridge"],
     ].flatMap(([workflowId, writer]) =>
-      ["queued", "in_progress"].map(async (status) => {
+      NONTERMINAL_WORKFLOW_RUN_STATUSES.map(async (status) => {
         const pages = await ghJson(
           `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?status=${status}&per_page=100`,
           { paginate: true },

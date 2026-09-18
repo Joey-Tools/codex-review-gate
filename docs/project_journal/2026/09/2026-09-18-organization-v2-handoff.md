@@ -166,6 +166,19 @@ the global cutover is closed.
   inventory, then drains both that independent writer and the retained old
   producer workflow before and after the commit-status pagination horizon
   readback.
+- Current-head GitHub Codex review found that the writer drain omitted three
+  documented nonterminal Actions run states: `requested`, `waiting`, and
+  `pending`. A retained producer or bridge in any of those states can later
+  resume and overwrite `codex/review-gate`, so the source patch now queries and
+  requires an empty inventory for all five documented nonterminal states:
+  `requested`, `waiting`, `pending`, `queued`, and `in_progress`. The unit
+  contract covers each accepted state, and the activation integration test
+  asserts that both writers are queried for every one before the organization
+  v2 activation write.
+- Joey selected `GPT-5.6 Terra` with `high` thinking for subsequent independent
+  local Codex review lanes in this workstream. The local review of this repair
+  uses that profile; this is a reviewer-profile choice, not part of the
+  consumer runtime or published Action contract.
 - An installation PR is an intentional manual trust bootstrap. Its new
   controller exists only on the PR head, while `issue_comment` and
   `workflow_dispatch` consume the default-branch workflow. The initial v2
@@ -320,7 +333,7 @@ the global cutover is closed.
 - Prior v2 decisions and implementation ledger:
   `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`.
 - Current delivery validation: `npm run test:organization-handoff` passed
-  224/224; `node --test test/v2-workflow-contract.test.mjs` passed 8/8; and
+  225/225; `node --test test/v2-workflow-contract.test.mjs` passed 8/8; and
   `node --test test/workflow-security-contract.test.mjs` passed 41/41.
   `git diff --check` passed. Project-journal validation is run again after this
   checkpoint is updated.

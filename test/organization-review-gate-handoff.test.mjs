@@ -20,6 +20,7 @@ import {
   GITHUB_ACTIONS_INTEGRATION_ID,
   LEGACY_STATUS_CONTEXT,
   MANIFEST_SCHEMA_VERSION,
+  NONTERMINAL_WORKFLOW_RUN_STATUSES,
   OUTPUT_SCHEMA_VERSION,
   REQUIRED_REPOSITORY_COUNT,
   V2_RULESET_NAME,
@@ -444,8 +445,8 @@ function createFakeGhHarness(
     extraEffectiveRules = [],
     extraEffectiveSecondPageRules = [],
     mutateEffectiveRules = null,
-    legacyProducerRuns = { queued: [], in_progress: [] },
-    legacyBridgeRuns = { queued: [], in_progress: [] },
+    legacyProducerRuns = {},
+    legacyBridgeRuns = {},
     legacyBridgeWorkflowInventory = null,
   } = {},
 ) {
@@ -864,8 +865,9 @@ function createFakeGhHarness(
         },
       );
     }
-    for (const status of ["queued", "in_progress"]) {
-      const runs = repositoryIndex === 0 ? legacyProducerRuns[status] : [];
+    for (const status of NONTERMINAL_WORKFLOW_RUN_STATUSES) {
+      const runs =
+        repositoryIndex === 0 ? (legacyProducerRuns[status] ?? []) : [];
       addFakeResponse(
         responses,
         `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}/runs?status=${status}&per_page=100`,
@@ -874,7 +876,8 @@ function createFakeGhHarness(
           workflow_runs: runs,
         }],
       );
-      const bridgeRuns = repositoryIndex === 0 ? legacyBridgeRuns[status] : [];
+      const bridgeRuns =
+        repositoryIndex === 0 ? (legacyBridgeRuns[status] ?? []) : [];
       addFakeResponse(
         responses,
         `repos/${encodedSlug}/actions/workflows/${bridgeWorkflowId}/runs?status=${status}&per_page=100`,
@@ -1481,12 +1484,16 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   );
   const activationBefore = requests.slice(0, mutationIndex);
   const activationAfter = requests.slice(mutationIndex + 1);
-  for (const repository of boundManifest.repositories) {
+  for (const [repositoryIndex, repository] of boundManifest.repositories.entries()) {
     const encodedSlug = encodeEndpointPathForTest(repository.slug);
     const bridgeEndpoint =
       `repos/${encodedSlug}/git/blobs/${repository.workflows.legacy_bridge.git_blob_sha}`;
     const legacyStatusEndpoint =
       `repos/${encodedSlug}/commits/${repository.canary.head_sha}/statuses?per_page=100`;
+    const legacyWriterWorkflowIds = [
+      repository.canary.v2_workflow_id,
+      34000000 + repositoryIndex,
+    ];
     assert.ok(
       countRequest(activationBefore, "GET", bridgeEndpoint) >= 3,
       `${repository.slug} bridge must be read in stable activation rounds and immediate revalidation`,
@@ -1503,6 +1510,16 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
       countRequest(activationAfter, "GET", legacyStatusEndpoint) >= 2,
       `${repository.slug} legacy status must survive both activation readback rounds`,
     );
+    for (const workflowId of legacyWriterWorkflowIds) {
+      for (const status of NONTERMINAL_WORKFLOW_RUN_STATUSES) {
+        const endpoint =
+          `repos/${encodedSlug}/actions/workflows/${workflowId}/runs?status=${status}&per_page=100`;
+        assert.ok(
+          countRequest(activationBefore, "GET", endpoint) >= 3,
+          `${repository.slug} legacy writer ${workflowId} must be drained for ${status} before activation`,
+        );
+      }
+    }
   }
 
   writeFileSync(harness.logPath, "");
@@ -2584,7 +2601,7 @@ test("manifest rejects wildcard and actual default-branch exclusions", () => {
 
 test("legacy bridge status requires a drained old producer inventory", () => {
   const repo = manifestFixture().repositories[0];
-  for (const status of ["queued", "in_progress"]) {
+  for (const status of NONTERMINAL_WORKFLOW_RUN_STATUSES) {
     assert.doesNotThrow(() =>
       validateLegacyProducerRunPages([
         { total_count: 0, workflow_runs: [] },
