@@ -166,21 +166,32 @@ the global cutover is closed.
   inventory, then drains both that independent writer and the retained old
   producer workflow before and after the commit-status pagination horizon
   readback.
-- Current-head GitHub Codex review found that the writer drain omitted three
-  documented nonterminal Actions run states: `requested`, `waiting`, and
-  `pending`. A retained producer or bridge in any of those states can later
-  resume and overwrite `codex/review-gate`, so the source patch now queries and
-  requires an empty inventory for all five documented nonterminal states:
-  `requested`, `waiting`, `pending`, `queued`, and `in_progress`. The unit
-  contract covers each accepted state, and the activation integration test
-  asserts that both writers are queried for every one before the organization
-  v2 activation write.
+- Current-head GitHub Codex review initially found that the writer drain
+  omitted three documented nonterminal Actions run states: `requested`,
+  `waiting`, and `pending`. A retained producer or bridge in any of those
+  states can later resume and overwrite `codex/review-gate`. The first repair
+  queried all five states separately, but the follow-up review found that this
+  itself was racy: one run can advance between independently timed filtered
+  requests and be absent from every result.
+- The source patch instead reads one complete unfiltered
+  `actions/workflows/{id}/runs?per_page=100` inventory for each independently
+  identified writer, then accepts only `status=completed` rows locally. It
+  rejects every documented nonterminal state (`requested`, `waiting`,
+  `pending`, `queued`, `in_progress`) and any unknown or missing state. This
+  prevents a state transition from moving a writer between separate filter
+  buckets. The unfiltered endpoint deliberately has no `status`, `head_sha`,
+  `created`, or other search filter, so it does not use GitHub's documented
+  1,000-result filtered-search ceiling. The existing 60-second and 8 MiB
+  read budgets remain fail-closed if a complete inventory cannot be obtained.
 - The independent local Terra/high review additionally found that the first
   regression test reused the production status list, so deleting a state could
   shrink the drain, fake endpoints, and assertions together. The test now
-  freezes the exact five literal statuses separately before using them to
-  validate the per-status rejection contract. This deliberately guards the
-  production/test boundary rather than only exercising the shared constant.
+  freezes the exact five literal statuses separately; it verifies local
+  rejection of each state, rejects unknown states, preserves pagination,
+  count, and duplicate-ID fail-closed checks, permits completed historical
+  rows including a 1,001-row inventory, and asserts that activation uses only
+  the exact unfiltered endpoint for both writers. This deliberately guards the
+  production/test boundary and the no-filter invariant together.
 - Joey selected `GPT-5.6 Terra` with `high` thinking for subsequent independent
   local Codex review lanes in this workstream. The local review of this repair
   uses that profile; this is a reviewer-profile choice, not part of the

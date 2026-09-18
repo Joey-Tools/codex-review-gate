@@ -26,10 +26,10 @@ export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
 export const REQUIRED_REPOSITORY_COUNT = 11;
 export const CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const V2_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
-// These are every documented nonterminal value accepted by the Actions
-// workflow-runs `status` filter. A run in any of them can still execute and
-// overwrite the legacy status, so each legacy-status writer must be empty
-// across the full set before its compatibility evidence is accepted.
+// These are every documented nonterminal Actions workflow-run state. A run in
+// any of them can still execute and overwrite the legacy status, so every
+// complete, unfiltered legacy-writer inventory must reject all of them before
+// its compatibility evidence is accepted.
 export const NONTERMINAL_WORKFLOW_RUN_STATUSES = Object.freeze([
   "requested",
   "waiting",
@@ -1947,15 +1947,11 @@ export function validateLegacyStatusPages(pages, repo) {
   return projection;
 }
 
-export function validateLegacyProducerRunPages(
+export function validateLegacyWriterRunPages(
   pages,
   repo,
-  status,
   writer = "legacy-status writer",
 ) {
-  if (!NONTERMINAL_WORKFLOW_RUN_STATUSES.includes(status)) {
-    throw new Error("Legacy producer run inventory requested an unsupported status.");
-  }
   if (
     !Array.isArray(pages) ||
     pages.length === 0 ||
@@ -1967,34 +1963,34 @@ export function validateLegacyProducerRunPages(
         !Array.isArray(page.workflow_runs),
     )
   ) {
-    throw new Error(`${repo.slug} ${status} legacy producer run inventory is incomplete.`);
+    throw new Error(`${repo.slug} legacy writer run inventory is incomplete.`);
   }
   if (pages.some((page, index) => index < pages.length - 1 && page.workflow_runs.length !== 100)) {
-    throw new Error(`${repo.slug} ${status} legacy producer run pagination has an incomplete non-final page.`);
-  }
-  if (pages[0].total_count >= 1_000) {
-    throw new Error(
-      `${repo.slug} ${status} ${writer} run inventory reaches GitHub's 1,000-result cap; it cannot prove this legacy-status writer is drained.`,
-    );
+    throw new Error(`${repo.slug} legacy writer run pagination has an incomplete non-final page.`);
   }
   if (
     pages.some((page) => page.total_count !== pages[0].total_count) ||
     pages.flatMap((page) => page.workflow_runs).length !== pages[0].total_count
   ) {
-    throw new Error(`${repo.slug} ${status} legacy producer run pagination is inconsistent.`);
+    throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
   }
   const runIds = new Set();
   for (const [index, run] of pages.flatMap((page) => page.workflow_runs).entries()) {
-    assertPositiveInteger(run?.id, `${repo.slug} ${status} legacy producer run ${index}.id`);
+    assertPositiveInteger(run?.id, `${repo.slug} legacy writer run ${index}.id`);
     if (runIds.has(run.id)) {
-      throw new Error(`${repo.slug} ${status} legacy producer run pagination contains duplicate IDs.`);
+      throw new Error(`${repo.slug} legacy writer run pagination contains duplicate IDs.`);
     }
     runIds.add(run.id);
-  }
-  if (runIds.size !== 0) {
-    throw new Error(
-      `${repo.slug} ${writer} still has ${status} runs; bridge status cannot be accepted until every legacy-status writer drains.`,
-    );
+    if (NONTERMINAL_WORKFLOW_RUN_STATUSES.includes(run.status)) {
+      throw new Error(
+        `${repo.slug} ${writer} still has ${run.status} runs; bridge status cannot be accepted until every legacy-status writer drains.`,
+      );
+    }
+    if (run.status !== "completed") {
+      throw new Error(
+        `${repo.slug} ${writer} run ${run.id} has unsupported status ${JSON.stringify(run.status)}; bridge status cannot be accepted until the complete legacy-writer inventory is terminal.`,
+      );
+    }
   }
 }
 
@@ -2094,15 +2090,18 @@ async function assertLegacyProducerDrained(repo) {
     [
       [producerWorkflowId, "retained canonical producer"],
       [bridgeWorkflowId, "temporary legacy bridge"],
-    ].flatMap(([workflowId, writer]) =>
-      NONTERMINAL_WORKFLOW_RUN_STATUSES.map(async (status) => {
-        const pages = await ghJson(
-          `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?status=${status}&per_page=100`,
-          { paginate: true },
-        );
-        validateLegacyProducerRunPages(pages, repo, status, writer);
-      }),
-    ),
+    ].map(async ([workflowId, writer]) => {
+      // Do not split this inventory into individual `status` queries. A run
+      // can advance between independently timed filtered requests, leaving
+      // every bucket empty even though it never drained. One unfiltered
+      // paginated inventory retains the run across its mutable status
+      // transition; reject nonterminal statuses locally instead.
+      const pages = await ghJson(
+        `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?per_page=100`,
+        { paginate: true },
+      );
+      validateLegacyWriterRunPages(pages, repo, writer);
+    }),
   );
 }
 

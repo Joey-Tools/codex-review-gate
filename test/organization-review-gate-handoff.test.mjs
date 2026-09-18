@@ -36,7 +36,7 @@ import {
   runCli,
   sha256Canonical,
   validateCanaryPullGraphqlResponse,
-  validateLegacyProducerRunPages,
+  validateLegacyWriterRunPages,
   validateLegacyStatusPages,
   validateDefaultBranchResponse,
   validateManifest,
@@ -438,6 +438,20 @@ function addFakeResponse(responses, endpoint, value) {
   }
 }
 
+function workflowRunPages(runs) {
+  const totalCount = runs.length;
+  const pages = [];
+  for (let offset = 0; offset < totalCount; offset += 100) {
+    pages.push({
+      total_count: totalCount,
+      workflow_runs: runs.slice(offset, offset + 100),
+    });
+  }
+  return pages.length === 0
+    ? [{ total_count: 0, workflow_runs: [] }]
+    : pages;
+}
+
 function createFakeGhHarness(
   t,
   {
@@ -455,8 +469,8 @@ function createFakeGhHarness(
     extraEffectiveRules = [],
     extraEffectiveSecondPageRules = [],
     mutateEffectiveRules = null,
-    legacyProducerRuns = {},
-    legacyBridgeRuns = {},
+    legacyProducerRunPages = null,
+    legacyBridgeRunPages = null,
     legacyBridgeWorkflowInventory = null,
   } = {},
 ) {
@@ -875,28 +889,24 @@ function createFakeGhHarness(
         },
       );
     }
-    for (const status of NONTERMINAL_WORKFLOW_RUN_STATUSES) {
-      const runs =
-        repositoryIndex === 0 ? (legacyProducerRuns[status] ?? []) : [];
-      addFakeResponse(
-        responses,
-        `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}/runs?status=${status}&per_page=100`,
-        [{
-          total_count: runs.length,
-          workflow_runs: runs,
-        }],
-      );
-      const bridgeRuns =
-        repositoryIndex === 0 ? (legacyBridgeRuns[status] ?? []) : [];
-      addFakeResponse(
-        responses,
-        `repos/${encodedSlug}/actions/workflows/${bridgeWorkflowId}/runs?status=${status}&per_page=100`,
-        [{
-          total_count: bridgeRuns.length,
-          workflow_runs: bridgeRuns,
-        }],
-      );
-    }
+    const producerRunPages =
+      repositoryIndex === 0 && legacyProducerRunPages !== null
+        ? legacyProducerRunPages
+        : workflowRunPages([]);
+    addFakeResponse(
+      responses,
+      `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}/runs?per_page=100`,
+      producerRunPages,
+    );
+    const bridgeRunPages =
+      repositoryIndex === 0 && legacyBridgeRunPages !== null
+        ? legacyBridgeRunPages
+        : workflowRunPages([]);
+    addFakeResponse(
+      responses,
+      `repos/${encodedSlug}/actions/workflows/${bridgeWorkflowId}/runs?per_page=100`,
+      bridgeRunPages,
+    );
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/actions/runs/${repository.canary.v2_run_id}/attempts/${repository.canary.v2_run_attempt}/jobs?per_page=100`,
@@ -1521,14 +1531,26 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
       `${repository.slug} legacy status must survive both activation readback rounds`,
     );
     for (const workflowId of legacyWriterWorkflowIds) {
-      for (const status of NONTERMINAL_WORKFLOW_RUN_STATUSES) {
-        const endpoint =
-          `repos/${encodedSlug}/actions/workflows/${workflowId}/runs?status=${status}&per_page=100`;
-        assert.ok(
-          countRequest(activationBefore, "GET", endpoint) >= 3,
-          `${repository.slug} legacy writer ${workflowId} must be drained for ${status} before activation`,
-        );
-      }
+      const endpoint =
+        `repos/${encodedSlug}/actions/workflows/${workflowId}/runs?per_page=100`;
+      assert.ok(
+        countRequest(activationBefore, "GET", endpoint) >= 3,
+        `${repository.slug} legacy writer ${workflowId} must be drained from a complete unfiltered inventory before activation`,
+      );
+      const writerRunEndpoints = activationBefore
+        .filter(
+          (request) =>
+            request.method === "GET" &&
+            request.endpoint.startsWith(
+              `repos/${encodedSlug}/actions/workflows/${workflowId}/runs?`,
+            ),
+        )
+        .map((request) => request.endpoint);
+      assert.ok(writerRunEndpoints.length >= 3);
+      assert.ok(
+        writerRunEndpoints.every((candidate) => candidate === endpoint),
+        `${repository.slug} legacy writer ${workflowId} must use one exact unfiltered inventory query`,
+      );
     }
   }
 
@@ -2609,39 +2631,97 @@ test("manifest rejects wildcard and actual default-branch exclusions", () => {
   }
 });
 
-test("legacy bridge status requires a drained old producer inventory", () => {
+test("legacy bridge status requires a coherent unfiltered writer inventory", () => {
   const repo = manifestFixture().repositories[0];
   assert.deepEqual(
     NONTERMINAL_WORKFLOW_RUN_STATUSES,
     EXPECTED_NONTERMINAL_WORKFLOW_RUN_STATUSES,
-    "the legacy-writer drain must cover every documented nonterminal workflow-run status",
+    "the legacy-writer drain must locally reject every documented nonterminal workflow-run status",
+  );
+  assert.doesNotThrow(() =>
+    validateLegacyWriterRunPages([
+      {
+        total_count: 1,
+        workflow_runs: [{ id: 89999999, status: "completed" }],
+      },
+    ], repo),
   );
   for (const status of EXPECTED_NONTERMINAL_WORKFLOW_RUN_STATUSES) {
-    assert.doesNotThrow(() =>
-      validateLegacyProducerRunPages([
-        { total_count: 0, workflow_runs: [] },
-      ], repo, status),
-    );
     assert.throws(
       () =>
-        validateLegacyProducerRunPages([
-          { total_count: 1, workflow_runs: [{ id: 90000000 }] },
-        ], repo, status),
+        validateLegacyWriterRunPages([
+          { total_count: 1, workflow_runs: [{ id: 90000000, status }] },
+        ], repo),
       new RegExp(`legacy-status writer still has ${status} runs`, "u"),
     );
   }
   assert.throws(
-    () => validateLegacyProducerRunPages([], repo, "queued"),
+    () => validateLegacyWriterRunPages([], repo),
     /inventory is incomplete/u,
+  );
+  assert.throws(
+    () =>
+      validateLegacyWriterRunPages([
+        {
+          total_count: 1,
+          workflow_runs: [{ id: 90000001, status: "unknown-state" }],
+        },
+    ], repo),
+    /unsupported status/u,
+  );
+  assert.throws(
+    () =>
+      validateLegacyWriterRunPages([
+        {
+          total_count: 1,
+          workflow_runs: [{ id: 90000002 }],
+        },
+      ], repo),
+    /unsupported status/u,
+  );
+  const completedRuns = Array.from({ length: 1_001 }, (_value, index) => ({
+    id: 91000000 + index,
+    status: "completed",
+  }));
+  assert.doesNotThrow(() =>
+    validateLegacyWriterRunPages(workflowRunPages(completedRuns), repo),
+  );
+  assert.throws(
+    () =>
+      validateLegacyWriterRunPages([
+        { total_count: 101, workflow_runs: completedRuns.slice(0, 99) },
+        { total_count: 101, workflow_runs: completedRuns.slice(99, 101) },
+    ], repo),
+    /incomplete non-final page/u,
+  );
+  assert.throws(
+    () =>
+      validateLegacyWriterRunPages([
+        { total_count: 1, workflow_runs: [] },
+      ], repo),
+    /pagination is inconsistent/u,
+  );
+  assert.throws(
+    () =>
+      validateLegacyWriterRunPages([
+        {
+          total_count: 2,
+          workflow_runs: [
+            { id: 92000000, status: "completed" },
+            { id: 92000000, status: "completed" },
+          ],
+        },
+      ], repo),
+    /duplicate IDs/u,
   );
 });
 
 test("a queued old producer blocks bridge-status acceptance before activation writes", async (t) => {
   const harness = createFakeGhHarness(t, {
-    legacyProducerRuns: {
-      queued: [{ id: 90000001 }],
-      in_progress: [],
-    },
+    legacyProducerRunPages: workflowRunPages([
+      { id: 90000000, status: "completed" },
+      { id: 90000001, status: "queued" },
+    ]),
   });
   writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
   writeFileSync(harness.v2StatePath, "disabled\n");
@@ -2654,32 +2734,30 @@ test("a queued old producer blocks bridge-status acceptance before activation wr
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 });
 
-test("a capped retained producer run inventory fails closed before activation writes", async (t) => {
+test("unfiltered retained producer history above 1,000 completed runs is accepted", async (t) => {
   const harness = createFakeGhHarness(t, {
-    legacyProducerRuns: {
-      queued: Array.from({ length: 1_000 }, (_value, index) => ({
+    legacyProducerRunPages: workflowRunPages(
+      Array.from({ length: 1_001 }, (_value, index) => ({
         id: 91000000 + index,
+        status: "completed",
       })),
-      in_progress: [],
-    },
+    ),
   });
   writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
   writeFileSync(harness.v2StatePath, "disabled\n");
   writeFileSync(harness.legacyStatePath, "before\n");
   writeFileSync(harness.cleanupStatePath, "before\n");
-  await assert.rejects(
-    runFakeCli(harness, "activate"),
-    /queued retained canonical producer run inventory reaches GitHub's 1,000-result cap/u,
-  );
+  const preview = await runFakeCli(harness, "activate");
+  assert.equal(preview.status, "preview");
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 });
 
 test("a queued temporary legacy bridge blocks bridge-status acceptance before activation writes", async (t) => {
   const harness = createFakeGhHarness(t, {
-    legacyBridgeRuns: {
-      queued: [{ id: 90000002 }],
-      in_progress: [],
-    },
+    legacyBridgeRunPages: workflowRunPages([
+      { id: 90000003, status: "completed" },
+      { id: 90000002, status: "queued" },
+    ]),
   });
   writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
   writeFileSync(harness.v2StatePath, "disabled\n");
