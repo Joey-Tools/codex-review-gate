@@ -43,7 +43,10 @@ uses: JoeyTeng/codex-review-gate-action@v2
 - read-only verifier 只接受 `pull_request` 的 `opened`、`reopened`、`synchronize`
   与 `ready_for_review`；它在 exact PR feature-head SHA 上的 native
   `codex/github-review-gate` CheckRun 是 required signal；
-- controller 自动 wake-up 只接受 `issue_comment` 的 `created` 与 `edited`；
+- controller 自动 wake-up 只接受 `issue_comment` 的 `created` 与 `edited`。它刻意不订阅
+  `pull_request_review`：GitHub 把该 event 绑定到 PR merge ref，而 controller 保留了狭窄的
+  write authority。只由 review 或 reaction 携带的 Codex 结果因此必须走受保护 default branch
+  的手动 `reconcile`；
 - runner 分配前，event sender 与 comment author 都必须精确等于
   `chatgpt-codex-connector[bot]`，GitHub type 必须是 `Bot`；
 - 唯一手动入口是 `workflow_dispatch`，每次只处理一个 PR；
@@ -475,6 +478,11 @@ CODEOWNERS，而新规则此时还没有进入 base，ruleset 也未启用。合
 后再次确认 head 未变。以后修改 workflow 或 CODEOWNERS 的 PR 会由 GitHub 强制同一
 owner 批准最终 head；push 新 commit 会让旧批准失效。V2 workflow 尚未进入默认分支时，
 不要启用 required check。
+
+这个 migration PR 是 manual trust bootstrap，不是它自己的 v2 canary。它合入后，任何在
+安装前已经打开的 PR 都必须先为 current head/base/test-merge scope 建立 fresh verifier，v2
+才能成为 required：push 新 head、reopen，或使用文档中的 draft-to-ready transition。controller
+`reconcile` 可以 rerun 已存在的 exact verifier，但刻意不能从任意 pre-installation PR 创建它。
 
 使用 tracked executable
 `$SOURCE_ROOT/scripts/build-legacy-review-gate-inventory.sh`。它精确接收 repository、

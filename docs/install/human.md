@@ -51,7 +51,10 @@ boundaries that an Action step cannot define:
   `codex/github-review-gate` CheckRun on the exact PR feature-head SHA is
   required;
 - controller automatic wake-ups use only `issue_comment` activity types
-  `created` and `edited`;
+  `created` and `edited`. It deliberately excludes `pull_request_review`:
+  GitHub binds that event to the PR merge ref, while the controller holds
+  narrow write authority. A Codex result carried only by a review or reaction
+  therefore uses the protected default-branch manual `reconcile` path;
 - before a runner is allocated, both the event sender and comment author must
   be the exact Codex bot, `chatgpt-codex-connector[bot]`, with GitHub type
   `Bot`;
@@ -569,6 +572,13 @@ by GitHub and require the same owner to approve the final head; stale approvals
 are dismissed after a push. Do not manually reconstruct the workflow from
 this guide, and do not activate the required check while the v2 workflow exists
 only on a feature branch.
+
+This migration PR is a manual trust bootstrap, not its own v2 canary. After it
+merges, any pull request that was already open needs a fresh verifier for its
+current head/base/test-merge scope before v2 can become required: push a new
+head, reopen it, or use the documented draft-to-ready transition. A controller
+`reconcile` can rerun an existing exact verifier, but deliberately cannot
+create one from an arbitrary pre-installation PR.
 
 ### Canonical legacy inventory generator
 

@@ -139,6 +139,12 @@ automatic `pull_request_review` job, runtime GitHub App or status writer.
 Review objects and reaction-only completion are discovered by a later
 authoritative verifier reconcile.
 
+The controller deliberately does not subscribe its `actions: write` and
+`issues: write` authority to `pull_request_review`: GitHub binds that event to
+the PR merge ref. Keep writable controller execution on the protected default
+branch, and use its typed default-branch `workflow_dispatch` reconcile when a
+Codex result arrives only as a review or reaction.
+
 An automatic comment job is admitted before runner allocation only when both
 the event sender and comment author are the exact Codex provider:
 `chatgpt-codex-connector[bot]`, GitHub type `Bot`. The Action repeats identity

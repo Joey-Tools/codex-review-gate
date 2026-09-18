@@ -109,8 +109,8 @@ the global cutover is closed.
 
 - Source tooling implements the temporary bridge, cohort handoff transaction,
   receipt-bound bridge removal, and their operator-facing guides.
-- No organization ruleset, repository ruleset, consumer default branch, or
-  consumer pull request has been mutated by this workstream yet.
+- No organization ruleset, repository ruleset, or consumer default branch has
+  been mutated by this workstream yet.
 - Read-only inventory confirms that all 11 members inherit old organization
   rule `16590367`; nine additionally retain a repository-level legacy
   `codex/review-gate` requirement. The other two compatibility/history cases
@@ -122,6 +122,64 @@ the global cutover is closed.
   user-run host-level `codex_workspace.py ensure` must initialize the mirror.
   The automation does not bypass that rule by cloning or by writing repository
   contents through an API.
+
+### Execution Update — 2026-09-18
+
+- Ten bridge-preserving migration PRs are open. They install the canonical v2
+  verifier/controller, the managed CODEOWNERS block, and the canonical legacy
+  bridge without changing any required-status policy:
+  - `codex-apple-notes-toolkit#6` at
+    `5eb0b475d85b0f1cb99c2cc84fffb8c3fd3c004a`;
+  - `codex-debug-triage#9` at
+    `86944e7efbe31eeb21f15eb49485a233e656a253`;
+  - `codex-personal-sync#22` at
+    `472679a49b6b8d7d6d5be3eb8ea4e17e69a6474c`;
+  - `codex-project-journal#7` at
+    `e3db9a1b23077df90b6ad9edbed42b7fb2b083f7`;
+  - `codex-review-workflows#115` at
+    `3925e7ae47864ef87696cc73687c213691a0bc4d`;
+  - `codex-rollout-backup#8` at
+    `546df566f05aa36c78220d431a5e7280fe9f955a`;
+  - `codex-session-retrospective-history#7` at
+    `3bd7c6c42b45c8e6434cfd51de4beb9281d35325`;
+  - `codex-toolbox#33` at
+    `ee8ffaa6c5015316925ffb64ec33cbdac423bee8`;
+  - `codex-workflow-hygiene#77` at
+    `518185db0b5577733c9555638d29f04104f9aea4`; and
+  - `codex-private-workflows#193` at
+    `02860ff441d38b01cc8480f76a1a520e6f958558`.
+- An installation PR is an intentional manual trust bootstrap. Its new
+  controller exists only on the PR head, while `issue_comment` and
+  `workflow_dispatch` consume the default-branch workflow. The initial v2
+  verifier can therefore fail closed before a terminal provider result without
+  constituting an Action defect. After merge, a separate harmless canary PR
+  supplies the authoritative current-head v2 and v1 proof used by organization
+  activation.
+- The writable controller intentionally excludes `pull_request_review` and
+  `pull_request_review_comment`. GitHub binds both event families to the PR
+  merge ref; a controller carrying `actions: write` and `issues: write` must
+  remain a protected-default-branch workflow. Review- or reaction-only
+  provider evidence is instead consumed by the typed default-branch manual
+  `reconcile` path. This preserves the single-producer and pre-runner trust
+  boundary without adding a runtime App, status writer, or cron.
+- Before an organization v2 rule is activated, every pre-existing open PR
+  must also have a fresh verifier on its current head/base/test-merge scope.
+  A new push, reopen, or documented draft-to-ready transition creates that
+  verifier; controller reconcile can only rerun an already-existing exact
+  verifier and deliberately cannot synthesize a new pull-request event.
+- Joey confirmed the final policy order: the new organization ruleset has v2
+  as its sole required status context; the old ruleset retains deletion and
+  non-fast-forward protection until the final, receipt-bound removal of its v1
+  context. No organization-policy mutation is authorized before all eleven
+  members have reached the dual-protection proof boundary.
+- Activation also requires a durable independent control-plane Codeowner path.
+  The managed `/.github/**` owner currently names `@JoeyTeng`, while some
+  cohort repositories have no other writable principal. That does not block
+  ordinary pull requests or this bridge preparation, but it would prevent a
+  future control-plane PR authored by that account from receiving the required
+  distinct Codeowner approval. Do not activate the v2 repository policy until
+  a separately authorized writable reviewer path has been selected for every
+  affected repository.
 
 ## Failure And Recovery Boundary
 
