@@ -486,17 +486,164 @@ test("installation bootstrap invocations bind the owner exactly once", () => {
 
 test("cohort guides bind v1 bridge recovery separately from v2 reconcile", () => {
   for (const [name, guide] of Object.entries(installGuides)) {
-    assert.match(guide, /Dual-protection legacy-status recovery/u, name);
-    assert.match(
+    const recovery = markdownSection(
       guide,
+      "### Dual-protection legacy-status recovery",
+    );
+    assert.match(
+      recovery,
       /actions\/runs\/\$LEGACY_RUN_ID\/rerun/u,
       `${name}: missing exact legacy bridge rerun endpoint`,
     );
-    assert.match(guide, /LEGACY_RUN_ATTEMPT \+ 1/u, name);
-    assert.match(guide, /codex\/review-gate/u, name);
-    assert.match(guide, /pull_request_target/u, name);
-    assert.match(guide, /workflow_dispatch/u, name);
-    assert.match(guide, /draft[\s\S]{0,160}ready/iu, name);
+    assert.match(
+      recovery,
+      /(?:complete paginated|完整分页) workflow-run inventory/iu,
+      `${name}: enumerate the complete paginated workflow-run inventory`,
+    );
+    assert.match(
+      recovery,
+      /(?:(?:Reject|拒绝)[\s\S]{0,100}duplicate\s+run ID across pages|跨页重复 run ID[\s\S]{0,100}(?:不能证明空集合|inconclusive|拒绝))/iu,
+      `${name}: duplicate run IDs fail closed`,
+    );
+    assert.match(
+      recovery,
+      /(?:immediately|立即)[\s\S]{0,120}(?:reread|重读|复读)[\s\S]{0,80}(?:page[ -]?1|第一页)[\s\S]{0,220}pagination horizon/iu,
+      `${name}: re-read the workflow-run horizon page`,
+    );
+    assert.match(
+      recovery,
+      /pagination horizon[\s\S]{0,100}(?:invalidates|restart|无效|重新开始)/iu,
+      `${name}: reject a changed workflow-run pagination horizon`,
+    );
+
+    assert.match(
+      recovery,
+      /(?:Only|只有|仅当)[\s\S]{0,120}(?:cardinality )?zero[\s\S]{0,180}(?:draft-to-ready|draft[\s\S]{0,40}ready)/iu,
+      `${name}: draft-to-ready fallback is reserved for zero candidates`,
+    );
+    assert.match(
+      recovery,
+      /(?:Exactly one|恰好一个)[\s\S]{0,40}candidate[\s\S]{0,80}(?:proceed|继续)/iu,
+      `${name}: exactly one candidate may proceed to rerun`,
+    );
+    assert.match(
+      recovery,
+      /(?:more than one|多于一个|超过一个)[\s\S]{0,140}(?:stop|inconclusive|停止|终止|不确定)/iu,
+      `${name}: multiple candidates stop as inconclusive`,
+    );
+
+    assert.match(
+      recovery,
+      /base\s+repository\/ref\/SHA[\s\S]{0,100}\$REPO[\s\S]{0,80}DEFAULT_BRANCH[\s\S]{0,80}DEFAULT_BRANCH_HEAD_SHA/iu,
+      `${name}: bind the current PR base repository, default branch, and base SHA`,
+    );
+    assert.match(
+      recovery,
+      /head_sha=\$CANARY_HEAD/u,
+      `${name}: bind the run head_sha to the current feature head`,
+    );
+    assert.match(
+      recovery,
+      /DEFAULT_BRANCH_HEAD_SHA[\s\S]{0,100}(?:only by|只由)[\s\S]{0,60}pull_requests\[0\]\.base\.sha/iu,
+      `${name}: bind the current base SHA only through the embedded PR`,
+    );
+    assert.match(
+      recovery,
+      /(?:never compare|不得)[\s\S]{0,100}(?:run\.)?head_sha[\s\S]{0,100}default-branch SHA/iu,
+      `${name}: do not confuse the feature-head run SHA with the base SHA`,
+    );
+    assert.match(
+      recovery,
+      /actions\/workflows\/\$LEGACY_WORKFLOW_ID[\s\S]{0,200}state=active/iu,
+      `${name}: bind the active current legacy-bridge workflow identity`,
+    );
+    assert.match(
+      recovery,
+      /contents\/[\s\S]{0,160}ref=\$DEFAULT_BRANCH_HEAD_SHA[\s\S]{0,240}(?:bytes exactly|逐 byte)/iu,
+      `${name}: bind canonical bridge bytes at the current base SHA`,
+    );
+
+    assert.match(
+      recovery,
+      /<canonical-path>@(?:<DEFAULT_BRANCH>|\$DEFAULT_BRANCH)[\s\S]{0,220}(?:Parse|解析)/iu,
+      `${name}: parse the official workflow-run path@ref shape`,
+    );
+    assert.match(
+      recovery,
+      /(?:ref to equal|ref 必须精确等于)[\s\S]{0,60}(?<!refs\/heads\/)\$DEFAULT_BRANCH/iu,
+      `${name}: bind the parsed workflow ref to the current default branch`,
+    );
+    assert.match(
+      recovery,
+      /recovery binding set[\s\S]{0,220}(?:selection[\s\S]{0,100}both sides of the write|candidate selection[\s\S]{0,100}write 前后)/iu,
+      `${name}: define one binding set for selection and both sides of the POST`,
+    );
+
+    const inventoryEnd = matchEndAfter(
+      recovery,
+      0,
+      /(?:complete paginated|完整分页) workflow-run inventory/iu,
+    );
+    const horizonEnd = matchEndAfter(
+      recovery,
+      inventoryEnd,
+      /pagination horizon/iu,
+    );
+    const candidateEnd = matchEndAfter(
+      recovery,
+      horizonEnd,
+      /(?:Only cardinality zero|只有[\s\S]{0,80}cardinality zero)[\s\S]{0,180}(?:draft-to-ready|draft[\s\S]{0,40}ready)/iu,
+    );
+    const prePostEnd = matchEndAfter(
+      recovery,
+      candidateEnd,
+      /(?:pre-POST recovery binding-set read|pre-POST recovery binding set read)/iu,
+    );
+    const rerunEnd = matchEndAfter(
+      recovery,
+      prePostEnd,
+      /actions\/runs\/\$LEGACY_RUN_ID\/rerun/u,
+    );
+    const postPostEnd = matchEndAfter(
+      recovery,
+      rerunEnd,
+      /(?:After the POST|POST 后)[\s\S]{0,260}recovery binding(?: |-)?set/iu,
+    );
+    assert.ok(
+      inventoryEnd > 0 &&
+        horizonEnd > inventoryEnd &&
+        candidateEnd > horizonEnd &&
+        prePostEnd > candidateEnd &&
+        rerunEnd > prePostEnd &&
+        postPostEnd > rerunEnd,
+      `${name}: stable pagination < candidate classification < pre-POST revalidation < POST < post-POST revalidation`,
+    );
+
+    assert.match(
+      recovery,
+      /(?:run_attempt[\s\S]{0,80}(?:exactly|恰好)[\s\S]{0,60}LEGACY_RUN_ATTEMPT \+ 1|LEGACY_RUN_ATTEMPT \+ 1[\s\S]{0,80}run_attempt)/iu,
+      `${name}: require exactly one new rerun attempt`,
+    );
+    assert.match(
+      recovery,
+      /commits\/\$CANARY_HEAD\/statuses\?per_page=100[\s\S]{0,420}codex\/review-gate[\s\S]{0,220}state=success/iu,
+      `${name}: require a stable v1 success inventory on the current head`,
+    );
+    assert.match(
+      recovery,
+      /(?:still-current|仍(?:然)?(?:绑定|为) current)[\s\S]{0,40}CANARY_HEAD/iu,
+      `${name}: revalidate that the successful v1 status is on the current head`,
+    );
+    assert.match(
+      recovery,
+      /(?:ID absent from|不在)[\s\S]{0,100}(?:complete\s+)?pre-POST\s+inventory/iu,
+      `${name}: require a fresh post-POST v1 status ID`,
+    );
+    assert.match(
+      recovery,
+      /(?:Do not add|不得为了)[\s\S]{0,220}workflow_dispatch[\s\S]{0,120}pull_request_review[\s\S]{0,120}pull_request_review_comment[\s\S]{0,120}cron/iu,
+      name,
+    );
   }
 });
 
@@ -2638,7 +2785,13 @@ function markdownSection(source, heading) {
   assert.notEqual(start, -1, `missing Markdown section ${heading}`);
   const level = heading.match(/^#+/u)?.[0].length;
   assert.ok(level, `invalid Markdown heading ${heading}`);
-  const followingHeading = new RegExp(`\\n#{1,${level}}\\s+`, "gu");
+  const lineStart = source.lastIndexOf("\n", start - 1) + 1;
+  const indentation = source.slice(lineStart, start);
+  assert.match(indentation, /^[ \t]*$/u, `invalid Markdown heading ${heading}`);
+  const followingHeading = new RegExp(
+    `\\n[ \\t]{0,${indentation.length}}#{1,${level}}\\s+`,
+    "gu",
+  );
   followingHeading.lastIndex = start + marker.length;
   const next = followingHeading.exec(source);
   return source.slice(start, next?.index ?? source.length);

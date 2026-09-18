@@ -882,16 +882,87 @@ legacy before v2 is Active and read back.
 
    A manual v2 `reconcile` updates only `codex/github-review-gate`; it never
    writes `codex/review-gate`. While both contexts remain required, a review-
-   or reaction-only result can therefore require a separate v1 recovery.
-   Re-read the PR first and bind its number, current `CANARY_HEAD`, base
-   repository, and default branch. Then select exactly one existing run of the current
-   `Codex Review Gate Legacy Bridge` workflow. Its REST object must have all
-   of: `event=pull_request_target`, parsed workflow path
-   `.github/workflows/codex-review-gate-legacy-bridge.yml` (an optional GitHub
-   `@ref` suffix is not part of the path), `head_sha` equal to `CANARY_HEAD`,
-   and exactly one `pull_requests` entry for this PR whose head repository and
-   SHA equal the bound values. Record its `id` and positive `run_attempt`;
-   ambiguity is inconclusive.
+   or reaction-only result can therefore require a separate v1 recovery. First
+   use the REST API to bind one complete current scope. `GET repos/$REPO` must
+   still return `full_name=$REPO`; bind its `default_branch` as
+   `DEFAULT_BRANCH` and bind `DEFAULT_BRANCH_HEAD_SHA` from the corresponding
+   `GET repos/$REPO/branches/$DEFAULT_BRANCH` response. The fresh
+   `GET repos/$REPO/pulls/$CANARY_PR` response must be open, non-draft, and
+   same-repository, with its head repository/ref/SHA equal to `$REPO`,
+   `CANARY_HEAD_REF`, and `CANARY_HEAD` and its base repository/ref/SHA equal
+   to `$REPO`, `DEFAULT_BRANCH`, and `DEFAULT_BRANCH_HEAD_SHA`.
+
+   Resolve the current bridge with
+   `GET repos/$REPO/actions/workflows/codex-review-gate-legacy-bridge.yml`,
+   bind its positive `LEGACY_WORKFLOW_ID`, and verify it again with
+   `GET repos/$REPO/actions/workflows/$LEGACY_WORKFLOW_ID`. Require the same
+   ID, exact path `.github/workflows/codex-review-gate-legacy-bridge.yml`, and
+   `state=active`; the display name is diagnostic, not identity. Read
+   `GET repos/$REPO/contents/.github/workflows/codex-review-gate-legacy-bridge.yml?ref=$DEFAULT_BRANCH_HEAD_SHA`,
+   require `type=file` and the exact path, decode its base64 content, and
+   compare the bytes exactly with
+   `$SOURCE_ROOT/templates/codex-gated-repo/.github/workflows/codex-review-gate-legacy-bridge.yml`.
+   Missing, truncated, undecodable, or different content is inconclusive.
+
+   List runs from
+   `GET repos/$REPO/actions/workflows/$LEGACY_WORKFLOW_ID/runs` with
+   `event=pull_request_target`, `head_sha=$CANARY_HEAD`,
+   `exclude_pull_requests=false`, and `per_page=100`. Follow every pagination
+   link. This must be a complete paginated workflow-run inventory: every page
+   has the same nonnegative `total_count`, every non-final page is full, and
+   the flattened run count equals `total_count`. Reject a malformed run, any
+   duplicate run ID across pages, or a result that reaches GitHub's documented
+   1,000-result filtered-search ceiling; none of those conditions proves an
+   empty set. Then immediately reread page 1 with the identical query and
+   require its canonical JSON, including `total_count` and ordered runs, to
+   equal the captured first page. A changed pagination horizon invalidates the
+   whole read; restart from the scope binding instead of mixing pages from
+   different horizons.
+
+   From that full stable inventory, a run is eligible only when its API
+   `created_at` proves that it is still inside GitHub's documented 30-day
+   rerun window, it is completed, and its REST object has all of the following:
+   the bound positive `workflow_id` and
+   positive `run_attempt`; `repository.full_name` and
+   `head_repository.full_name` equal to `$REPO`; `event=pull_request_target`;
+   `head_sha` equal to `CANARY_HEAD`; and exactly one
+   `pull_requests` entry whose number, head repository/ref/SHA, and base
+   repository/ref/SHA equal the complete bound PR scope. A matching
+   nonterminal run is pending, not evidence of zero candidates. In the run
+   object, `DEFAULT_BRANCH_HEAD_SHA` is bound only by
+   `pull_requests[0].base.sha`; never compare the top-level `run.head_sha` to
+   the default-branch SHA. For `path`,
+   accept the bare canonical path, GitHub's documented
+   `<canonical-path>@<DEFAULT_BRANCH>` form, or the equivalent
+   `<canonical-path>@refs/heads/<DEFAULT_BRANCH>` form. Parse a suffixed form
+   by removing the known canonical-path-plus-`@` prefix and treating the entire
+   nonempty remainder as the ref; require that ref to equal either
+   `$DEFAULT_BRANCH` or `refs/heads/$DEFAULT_BRANCH`, and reject every other
+   path or ref. The bare form is valid only because the independent PR base
+   repository/ref/SHA, feature-head `head_sha`, active workflow identity, and
+   exact bridge-byte checks supply the missing ref binding.
+
+   These repository, branch, PR, workflow, canonical-byte, and stable
+   paginated-inventory values are the **recovery binding set** (the complete
+   state that selection and both sides of the write must revalidate).
+
+   Classify the complete eligible set by cardinality. Exactly one candidate
+   may proceed; set `LEGACY_RUN_ID` and `LEGACY_RUN_ATTEMPT` from its `id` and
+   `run_attempt`. More than one is inconclusive even if one is newer: stop
+   rather than choosing the latest. Only cardinality zero after a complete
+   stable read permits the draft-to-ready fallback below. Missing fields, a
+   pagination cap, duplicate IDs, horizon drift, or unreadable scope is
+   inconclusive, never zero.
+
+   Immediately before the write, repeat the repository, default-branch head,
+   PR, active workflow, exact bridge bytes, complete run pagination,
+   duplicate-ID check, and page-1 horizon reread. Require the same recovery
+   binding set and exactly one candidate with the same `LEGACY_RUN_ID` and
+   `LEGACY_RUN_ATTEMPT`. Also completely paginate and horizon-stabilize
+   `GET repos/$REPO/commits/$CANARY_HEAD/statuses?per_page=100`, reject
+   duplicate status IDs, and record every pre-POST status ID plus the current
+   first reverse-chronological exact-context `codex/review-gate` status. This
+   is the final pre-POST recovery binding-set read.
 
    Re-run that exact pre-existing bridge run, never a different v1 workflow:
 
@@ -902,19 +973,37 @@ legacy before v2 is Active and read back.
    ```
 
    GitHub re-runs preserve the triggering run's `GITHUB_SHA` and `GITHUB_REF`;
-   that preservation is why the source run must already bind this exact PR
-   head. After the POST, re-read the PR and run. Require the same immutable
-   run identity/scope, exactly `LEGACY_RUN_ATTEMPT + 1`, terminal `success`,
-   and a complete status inventory whose latest eligible
-   `codex/review-gate` status is `success` on the still-current `CANARY_HEAD`.
-   A timeout, unchanged attempt, attempt jump, changed PR/head, or a nonunique
-   candidate is inconclusive: do not submit the POST again.
+   that preservation is why the selected run must bind the exact feature head
+   and its embedded PR entry must separately bind the current default-branch
+   repository/ref/SHA. Submit the POST once. An HTTP or transport result that
+   does not prove the documented `201` response is inconclusive; do not replay
+   it.
 
-   If no eligible bridge run exists (including a run past GitHub's re-run
-   window), convert the PR to draft and mark it ready again to create a fresh
-   `pull_request_target` lifecycle run. Rebind the PR scope and restart this
-   selection procedure. Do not add `workflow_dispatch`, a review event, cron,
-   or a new status writer to recover v1.
+   After the POST, poll the exact run ID to a terminal state, then revalidate
+   the same recovery binding set, including the stable full run enumeration.
+   Require the repository, default branch/ref/SHA, PR head/base scope, active
+   workflow ID/path/state, canonical bridge bytes, and sole eligible run ID to
+   be unchanged. The run must now have `run_attempt` exactly
+   `LEGACY_RUN_ATTEMPT + 1`, `status=completed`, and `conclusion=success`.
+   Finally, completely paginate
+   `GET repos/$REPO/commits/$CANARY_HEAD/statuses?per_page=100`, reject
+   duplicate status IDs, stabilize its page-1 horizon in the same way, and
+   require the first reverse-chronological status with exact context
+   `codex/review-gate` to have an ID absent from the complete pre-POST
+   inventory, `state=success`, `creator.login=github-actions[bot]`, and
+   `creator.type=Bot` on the still-current `CANARY_HEAD`. An old success is
+   not rerun evidence. A timeout, unchanged or jumped attempt, changed scope,
+   unstable/incomplete inventory, or nonunique candidate is inconclusive: do
+   not submit the POST again.
+
+   Only when the complete stable eligible set has cardinality zero (including
+   when all otherwise matching runs are outside GitHub's rerun window),
+   convert the PR to draft and mark it ready again to create a fresh
+   `pull_request_target` lifecycle run. Rebind the complete recovery binding
+   set and restart this selection procedure; do not reuse the earlier zero
+   result. Do not add
+   `workflow_dispatch`, `pull_request_review`, `pull_request_review_comment`,
+   cron, or a new status writer to recover v1.
 
    Reactions on an authorized ordinary, unmarked request are liveness-only.
    An ordinary `+1` cannot independently create head-bound clean evidence. An

@@ -174,12 +174,18 @@ the global cutover is closed.
   bridge bytes before it is eligible to merge.
 - During dual enforcement, manual v2 `reconcile` can refresh only the native
   `codex/github-review-gate` CheckRun and must never write the legacy status.
-  Review- or reaction-only evidence therefore recovers v1 only by rerunning
-  one already existing, current-head-bound `pull_request_target` bridge run and
-  proving its exactly-next attempt plus latest successful `codex/review-gate`
-  status; it never adds a writable review event or `workflow_dispatch`. If no
-  unique run remains inside GitHub's rerun window, draft-to-ready creates a new
-  trusted lifecycle run before selection restarts.
+  Review- or reaction-only evidence therefore recovers v1 only from a complete,
+  stable paginated inventory of the current active bridge workflow. Selection
+  binds the current repository/default-branch ref and SHA, canonical bridge
+  bytes at that SHA, the current PR head/base tuple, the feature-head-bound
+  `pull_request_target` run, and its exact workflow identity. Duplicate run IDs,
+  a pagination cap, or a changed page-1 horizon are inconclusive. Exactly one
+  eligible run may be rerun; more than one stops, while only cardinality zero
+  permits draft-to-ready before selection restarts. The same recovery binding
+  set is revalidated immediately before and after the one POST. Success requires
+  exactly the next run attempt and a new current-head `codex/review-gate=success`
+  status ID from `github-actions[bot]`, not an older success. This recovery never
+  adds a writable review event or `workflow_dispatch`.
 - Before an organization v2 rule is activated, every pre-existing open PR
   must also have a fresh verifier on its current head/base/test-merge scope.
   A new push, reopen, or documented draft-to-ready transition creates that
