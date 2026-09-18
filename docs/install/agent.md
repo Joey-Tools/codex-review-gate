@@ -109,11 +109,16 @@ cleanup batch/readback, final old-rule preview/apply, and the separate final
 read-only verify receipt capture and validation.
 No administrator may change an organization/repository ruleset, classic branch
 protection, condition, required check or bypass actor during these freezes.
-GitHub's ruleset endpoint has no documented conditional/CAS update. Plan
+During the third freeze, no cohort repository may be renamed, transferred,
+deleted, have its default branch changed, or be replaced or re-created at its
+original slug. These are operational freezes, not continuous API locks.
+GitHub's ruleset endpoint has no documented conditional/CAS update, and its
+cleanup mutation APIs have no repository-ID conditional/CAS write. Plan
 digests and adjacent rereads reject observed drift but cannot prevent a racing
-write in the final GET-to-PUT interval. Validate only the manifest-bound bypass
-actors; never claim that the runtime automatically discovers an actor added
-outside the bound snapshot.
+write in the final GET-to-PUT or repository-metadata-read-to-write interval;
+the freeze covers those gaps. Validate only the manifest-bound bypass actors;
+never claim that the runtime automatically discovers an actor added outside
+the bound snapshot.
 
 Execute the following state machine in order.
 
@@ -283,16 +288,33 @@ Execute the following state machine in order.
      --expected-plan-sha256 "$HANDOFF_CLEANUP_PLAN_SHA256"
    ```
 
-   For every planned item, require GET to match exact `expected_before`, use
-   the surface-specific mutation, and require a GET matching exact
-   `expected_after`. A stable mix of before and after items is resumable:
-   already-after items are no-ops, and a fresh preview plans only still-before
-   items. If any mutation reports an error or an unknown outcome, the executor
-   performs a narrow read-only reconciliation first. Exact after-state is
-   completed; before-state, drift or an unreadable result stops the batch. Run
-   a fresh preview under the freeze and review that state; never replay the old
-   request or digest blindly. Stop before organization cutover unless every
-   action is at exact `expected_after`.
+   Treat this as an operational freeze, not a continuous repository or API
+   lock. From cleanup preview through final read-only `verify`, prohibit cohort
+   repository rename, transfer, deletion, default-branch change, and
+   replacement or re-creation at an original slug, as well as the listed
+   policy mutations. GitHub cleanup mutation APIs have no repository-ID
+   conditional/CAS write; this freeze covers the final
+   repository-metadata-read-to-write gap.
+
+   Before every cleanup surface GET—including initial classification, normal
+   readback, and error reconciliation—require live GitHub metadata to match the
+   manifest-bound `full_name`, `id`, `node_id`, and `default_branch`. For an
+   item still requiring a write, repeat that identity check immediately before
+   mutation, require exact `expected_before`, use the surface-specific
+   mutation, and require exact `expected_after` readback. `id` and `node_id`
+   bind the repository object; `full_name` binds its expected route and exposes
+   rename, transfer, or slug reuse; `default_branch` binds the branch selector.
+   The snapshots protect selected policy content. Ignore unrelated metadata
+   churn. Any unreadable or mismatched identity stops the batch at that
+   observation: a pre-mutation mismatch emits no write for the current action,
+   and no later mutation runs. A stable mix of before and after items is
+   resumable: already-after items are no-ops, and a fresh preview plans only
+   still-before items. If any mutation reports an error or an unknown outcome,
+   the executor performs a narrow read-only reconciliation first. Exact
+   after-state is completed; before-state, drift or an unreadable result stops
+   the batch. Run a fresh preview under the freeze and review that state; never
+   replay the old request or digest blindly. Stop before organization cutover
+   unless every action is at exact `expected_after`.
 7. Preview and apply final organization cutover:
 
    ```bash
@@ -383,10 +405,16 @@ is not a valid input to the bootstrap.
 entry in the fixed eleven-member receipt cohort. At the pre-rename boundary it
 reads `origin` before and after the live-metadata query, repeats the local
 object checks, then reads `origin` once more immediately before the atomic
-bridge quarantine rename. An observed same-name re-creation, repository
-transfer, default-branch drift, unreadable metadata, or mismatch fails closed
-and leaves the bridge intact. Do not edit the receipt, change `origin`, or
-bypass this proof.
+bridge quarantine rename. After the rename and before unlink, it repeats the
+complete `origin` -> live metadata identity/default-branch -> `origin` check,
+then revalidates the quarantined file's admitted object identity and canonical
+content. If that remote binding check fails, it attempts to restore the same
+admitted bridge to the canonical path with no-clobber hard-link creation. An
+occupied destination or failed restoration verification fails closed, never
+overwrites the occupant, and reports no removal success. These are
+point-in-time remote binding and local identity/content checks, not a
+continuous lock. Do not edit the receipt, change `origin`, or bypass this
+proof.
 
    An absent bridge makes the bridge-removal component an idempotent no-op. An
    existing non-canonical bridge is rejected. The command as a whole also

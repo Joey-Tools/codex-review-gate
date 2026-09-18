@@ -332,9 +332,10 @@ Review the emitted `external_repository_actions`; they may remove only
 setting, repository ruleset identity, condition, bypass actor, `deletion`,
 `non_fast_forward` and unrelated rule bound by the manifest. Do not execute
 the raw actions manually. Apply them through the controlled executor while the
-external organization/repository-admin policy-mutation freeze remains
-continuously in force from this cleanup preview through the cleanup apply and
-readback, the later `verify` preview/apply, and its final stable readback:
+external organization/repository-admin policy-and-target-identity freeze
+remains continuously in force from this cleanup preview through the cleanup
+apply and readback, the later `verify` preview/apply, and its final stable
+readback:
 
 ```bash
 HANDOFF_CLEANUP_PREVIEW="$(mktemp)"
@@ -351,15 +352,34 @@ node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
   --expected-plan-sha256 "$HANDOFF_CLEANUP_PLAN_SHA256"
 ```
 
-For each item, the executor performs GET, requires the exact `expected_before`
-snapshot, uses the surface-specific mutation, and requires an exact
-`expected_after` readback. A stable mixture of before- and after-state items is
-a safe resume point: already-after items are no-ops and only still-before
-items enter the new plan. If a mutation returns an error or its result is
-unknown, the executor first performs a narrow read-only reconciliation. It
-treats exact after-state as completed; before-state, drift, or an unreadable
-result stops the batch. Then run a fresh preview under the freeze, review the
-live state, and never blindly replay the old mutation or old plan digest.
+This is an operational freeze, not a continuous repository or API lock. In
+addition to the policy fields above, from this cleanup preview through the
+final read-only `verify`, operators must prevent every cohort repository from
+being renamed, transferred, deleted, having its default branch changed, or
+being replaced or re-created at its original slug. GitHub's cleanup mutation
+APIs provide no repository-ID conditional/CAS write, so the freeze covers the
+final repository-metadata-read-to-write gap.
+
+Before every cleanup surface read—including initial classification, normal
+readback, and error reconciliation—the executor reads GitHub repository
+metadata and requires exact manifest-bound `full_name`, `id`, `node_id`, and
+`default_branch`. If the item still needs a write, it repeats that identity
+check immediately before mutation, then requires exact
+`expected_before` and `expected_after` policy snapshots around the
+surface-specific write. `id` and `node_id` bind the repository object,
+`full_name` binds its expected route and exposes rename, transfer, or slug
+reuse, and `default_branch` binds the branch selector; the snapshots protect
+the selected policy content. Unrelated metadata churn is not treated as a
+change to either property. Any unreadable or mismatched identity stops the
+batch at that observation: a pre-mutation mismatch emits no write for the
+current action, and no later mutation runs. A stable mixture of before- and
+after-state items is a safe resume point: already-after items are no-ops and
+only still-before items enter the new plan. If a mutation returns an error or
+its result is unknown, the executor first performs a narrow read-only
+reconciliation. It treats exact after-state as completed; before-state, drift,
+or an unreadable result stops the batch. Then run a fresh preview under the
+freeze, review the live state, and never blindly replay the old mutation or old
+plan digest.
 
 Only after all repository cleanup surfaces match their exact `expected_after`
 snapshots may the old organization status rule be removed:
@@ -459,10 +479,18 @@ the current repository metadata from GitHub. It requires exact equality of
 eleven-member receipt cohort. At the pre-rename boundary, it reads `origin`
 before and after the live-metadata query, repeats the local object checks, then
 reads `origin` once more immediately before the atomic bridge quarantine
-rename. An observed same-name re-creation, repository transfer, default-branch
-drift, unreadable metadata, or other mismatch fails closed and leaves the
-bridge in place; a receipt for another cohort or repository cannot authorize
-removal.
+rename. After that rename and before unlink, it repeats the complete
+`origin` -> live metadata identity/default-branch -> `origin` check and then
+revalidates the quarantined file's admitted object identity and canonical
+content. If the remote binding recheck fails, it attempts to restore that same
+admitted bridge at the canonical path with no-clobber hard-link creation. An
+occupied destination or failed restoration verification fails closed, never
+overwrites the occupant, and reports no removal success. Thus an observed
+same-name re-creation, repository transfer, default-branch drift, unreadable
+metadata, or other mismatch cannot authorize unlink; a receipt for another
+cohort or repository cannot authorize removal. These are point-in-time remote
+binding and local identity/content checks, not a continuous lock.
+Do not edit the receipt or retarget `origin` to bypass this proof.
 
 If the bridge is already absent, the bridge-removal component is an idempotent
 no-op. An existing non-canonical bridge is rejected rather than deleted. The

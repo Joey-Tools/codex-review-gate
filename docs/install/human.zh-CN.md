@@ -279,8 +279,8 @@ jq . "$HANDOFF_CUTOVER_PLAN"
 绑定的 non-legacy checks、strictness、repository ruleset identity、conditions、bypass
 actors、`deletion`、`non_fast_forward` 与 unrelated rules 必须全部保留。不得手工执行 raw
 actions。从这次 cleanup preview 开始建立外部 organization/repository admin
-policy-mutation freeze，并连续保持到 cleanup apply/readback、之后的 `verify` preview/apply，
-以及最终 stable readback 全部完成；通过受控 executor 执行：
+policy-and-target-identity freeze，并连续保持到 cleanup apply/readback、之后的 `verify`
+preview/apply，以及最终 stable readback 全部完成；通过受控 executor 执行：
 
 ```bash
 HANDOFF_CLEANUP_PREVIEW="$(mktemp)"
@@ -297,12 +297,25 @@ node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
   --expected-plan-sha256 "$HANDOFF_CLEANUP_PLAN_SHA256"
 ```
 
-Executor 对每一项执行 GET，要求精确匹配 `expected_before`，按 surface 使用对应 mutation，
-再要求 exact `expected_after` readback。稳定的 before/after mixed state 是安全续跑点：已经
-after 的项目是 no-op，只有仍为 before 的项目进入新 plan。如果 mutation 返回 error 或结果
-unknown，executor 会先进行 narrow read-only reconcile；exact after 表示已完成，before、
-drift 或无法读取则停止整个 batch。随后在 freeze 下生成新 preview、review live state；绝不
-盲目重放旧 mutation 或旧 plan digest。
+这是运营冻结，不是持续的 repository 或 API 锁。除上述 policy fields 外，从本次 cleanup
+preview 到最终只读 `verify` 完成，operator 还必须禁止任何 cohort repository 被 rename、
+transfer、delete、改变 default branch，或在原 slug 被 replace/re-create。GitHub cleanup
+mutation API 不提供 repository-ID conditional/CAS write；这段 freeze 覆盖最后一次
+repository metadata read 到 write 之间的区间。
+
+每次 cleanup surface read（包括 initial classification、正常 readback 与 error
+reconciliation）前，executor 都会读取 GitHub repository metadata，并要求 manifest-bound
+`full_name`、`id`、`node_id` 与 `default_branch` 精确相等。若该项仍需写入，它会在紧邻
+mutation 前再次执行相同的 identity check，再围绕 surface-specific write 要求 exact
+`expected_before` 与 `expected_after` policy snapshots。`id`/`node_id` 绑定 repository
+object，`full_name` 绑定 expected route 并暴露 rename、transfer 或 slug reuse，
+`default_branch` 绑定 branch selector；snapshots 保护选定的 policy content。无关 metadata
+churn 不视为这两类属性发生变化。Identity 无法读取或 mismatch 时，batch 会在观测点立即
+停止：pre-mutation mismatch 不会写当前 action，之后也不再执行任何 mutation。稳定的
+before/after mixed state 是安全续跑点：已经 after 的项目是 no-op，只有仍为 before 的项目
+进入新 plan。如果 mutation 返回 error 或结果 unknown，executor 会先进行 narrow read-only
+reconcile；exact after 表示已完成，before、drift 或无法读取则停止整个 batch。随后在 freeze
+下生成新 preview、review live state；绝不盲目重放旧 mutation 或旧 plan digest。
 
 只有全部 repository cleanup surfaces 都匹配各自 exact `expected_after` snapshots，才可
 移除旧 organization status rule：
@@ -388,9 +401,15 @@ Bootstrap 会验证 terminal top-level fields、重新计算 canonical embedded 
 repository metadata。它要求 `full_name`、`id`、`node_id` 与 `default_branch` 都与固定 11 仓
 receipt cohort 中的一项精确相等。在 atomic bridge quarantine rename 前的边界，它会先在
 live-metadata query 前后各读取一次 `origin`，重新验证本地对象后，再紧邻 rename 读取一次
-`origin`。已观测到的同名重建、repository transfer、default-branch drift、metadata 不可读或
-其他 mismatch 都必须 fail closed 并保留 bridge；其他 cohort 或 repository 的 receipt 无法授权
-删除。
+`origin`。Rename 后、unlink 前，它会再次执行完整的 `origin` -> live metadata
+identity/default-branch -> `origin` 检查，并重新验证 quarantine 中 admitted file 的 object
+identity 与 canonical content。若该 remote binding recheck 失败，它会通过 no-clobber
+hard-link creation 尝试把同一 admitted bridge 恢复到 canonical path；若目标路径已被占用或
+恢复后的验证失败，则 fail closed、绝不覆盖占用者，也不报告删除成功。因此，已观测到的
+同名重建、repository transfer、default-branch drift、metadata 不可读或其他 mismatch 都不能
+授权 unlink；其他 cohort 或 repository 的 receipt 也无法授权删除。这些是 point-in-time 的
+remote binding 与 local identity/content checks，并非连续锁。
+不得编辑 receipt 或 retarget `origin` 来绕过这份 proof。
 
 Bridge 已经 absent 时，bridge-removal component 是 idempotent no-op；已有但
 non-canonical 的 bridge 则会被拒绝，不会删除未知文件。整个 command 同时也是 canonical

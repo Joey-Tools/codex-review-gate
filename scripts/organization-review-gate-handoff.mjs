@@ -3145,7 +3145,37 @@ async function loadRepositoryCleanupSurface(repo, action) {
   throw new Error("Unsupported repository cleanup surface.");
 }
 
+async function loadManifestBoundRepositoryCleanupIdentity(repo, label) {
+  const metadata = await ghJson(`repos/${encodeEndpointPath(repo.slug)}`);
+  assertPlainObject(metadata, `${label} repository metadata`);
+  const identity = {
+    full_name: metadata.full_name,
+    id: metadata.id,
+    node_id: metadata.node_id,
+    default_branch: metadata.default_branch,
+  };
+  // Protected property: the cleanup route still selects the exact manifest-bound
+  // repository object and default-branch target. id/node_id bind object identity,
+  // full_name detects redirect/rename/transfer or same-slug reuse, and
+  // default_branch binds the branch selector; unrelated metadata churn is ignored.
+  assertExactSnapshot(
+    identity,
+    {
+      full_name: repo.slug,
+      id: repo.id,
+      node_id: repo.node_id,
+      default_branch: repo.default_branch,
+    },
+    label,
+  );
+  return identity;
+}
+
 async function classifyLiveRepositoryCleanupSurface(record) {
+  await loadManifestBoundRepositoryCleanupIdentity(
+    record.repo,
+    `${record.repo.slug} repository cleanup identity before surface read`,
+  );
   const actual = await loadRepositoryCleanupSurface(record.repo, record.action);
   return {
     actual,
@@ -3160,6 +3190,10 @@ async function executeRepositoryCleanupRecord(record) {
   }
   const payload =
     record.method === "DELETE" ? undefined : record.action.expected_after;
+  await loadManifestBoundRepositoryCleanupIdentity(
+    record.repo,
+    `${record.repo.slug} repository cleanup identity immediately before mutation`,
+  );
   try {
     await ghJson(record.endpoint, { method: record.method, body: payload });
   } catch (error) {

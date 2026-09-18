@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fileSystemConstants } from "node:fs";
 import {
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -3043,6 +3044,15 @@ async function prepareConsumerWorktree({
       );
     }
   };
+  const beforeLegacyBridgeQuarantineUnlink = async () => {
+    if (finalClosureProof !== null) {
+      await assertOrganizationFinalClosureBindingStable(
+        targetRoot,
+        finalClosureProof,
+        "after legacy bridge quarantine rename and before unlink",
+      );
+    }
+  };
   try {
     for (const change of plannedChanges) {
       if (change.operation === "remove") {
@@ -3052,6 +3062,7 @@ async function prepareConsumerWorktree({
           beforeRemove: beforeFirstMutation,
           beforeQuarantineRename: beforeLegacyBridgeQuarantineRename,
           beforeFinalQuarantineRename: beforeFinalLegacyBridgeQuarantineRename,
+          beforeQuarantineUnlink: beforeLegacyBridgeQuarantineUnlink,
         });
       } else {
         await installPreparedConsumerFile({
@@ -3250,10 +3261,11 @@ async function installPreparedConsumerFile({
 // final quarantine check and path-based unlink remain a best-effort boundary
 // under the existing same-UID non-interference assumption.
 // The remote authorization is a point-in-time property: the GitHub repository
-// identity is checked with origin reads both before and after metadata lookup,
-// then origin is checked again after the final local object revalidation.
-// This detects an observed drift through those boundaries; it does not claim a
-// continuous lock against a same-UID origin rewrite after the final check.
+// identity/default branch and origin binding are fully revalidated after the
+// quarantine rename and before unlink. A final local identity/content check
+// follows that remote read, so remote I/O cannot weaken the admitted file-object
+// property. This detects observed drift through those boundaries; it does not
+// claim a continuous lock against a same-UID rewrite after the final checks.
 async function removePreparedConsumerFile({
   path,
   expectedContent,
@@ -3262,6 +3274,7 @@ async function removePreparedConsumerFile({
   beforeRemove = async () => {},
   beforeQuarantineRename = async () => {},
   beforeFinalQuarantineRename = async () => {},
+  beforeQuarantineUnlink = async () => {},
 }) {
   const admittedIdentity = await readConsumerFileIdentity(
     path,
@@ -3275,6 +3288,7 @@ async function removePreparedConsumerFile({
   let quarantineVerified = false;
   let unlinkCompleted = false;
   let quarantineDirectoryRemoved = false;
+  let restorationAttempted = false;
   try {
     await revalidateDirectoryChain(parentWitnesses, `before ${label} removal`);
     await assertConsumerFileIdentityStable(
@@ -3348,6 +3362,31 @@ async function removePreparedConsumerFile({
     );
     quarantineVerified = true;
 
+    try {
+      await beforeQuarantineUnlink();
+    } catch (authorizationError) {
+      restorationAttempted = true;
+      try {
+        await restoreQuarantinedConsumerFile({
+          path,
+          quarantinePath,
+          quarantineDirectory,
+          quarantineDirectoryWitness,
+          admittedIdentity,
+          expectedContent,
+          parentWitnesses,
+          label,
+        });
+        quarantineDirectoryRemoved = true;
+      } catch (restoreError) {
+        throw new Error(
+          `${authorizationError.message}\nFail-closed restoration of the admitted bridge did not complete: ${restoreError.message} The canonical destination was never overwritten; inspect both ${path} and ${quarantinePath}. No further path cleanup was attempted.`,
+        );
+      }
+      throw new Error(
+        `${authorizationError.message}\nThe admitted exact bridge remains installed at ${path}; it was atomically restored without overwriting any concurrent destination, and no removal success was reported.`,
+      );
+    }
     await revalidateDirectoryWitness(
       quarantineDirectoryWitness,
       `before ${label} quarantine unlink`,
@@ -3384,6 +3423,9 @@ async function removePreparedConsumerFile({
         `${error.message}\nUnable to close the admitted bridge handle after failure: ${closeError.message}`,
       );
     }
+    if (restorationAttempted) {
+      throw failure;
+    }
     if (unlinkCompleted) {
       const quarantineDisposition = quarantineDirectoryRemoved
         ? "The task-owned quarantine directory was removed."
@@ -3405,6 +3447,102 @@ async function removePreparedConsumerFile({
     throw failure;
   }
   await admittedIdentity.handle.close();
+}
+
+// Recovery property: a remote-authorization failure after quarantine must
+// leave the admitted exact bridge installed at its canonical path. link(2)
+// creates that path only when absent, so a concurrent destination is never
+// overwritten. dev/ino and exact content bind both hard links to the admitted
+// object before the quarantine link is removed. Directory entry churn alone is
+// not treated as mutation; only object identity, content, or access policy is.
+async function restoreQuarantinedConsumerFile({
+  path,
+  quarantinePath,
+  quarantineDirectory,
+  quarantineDirectoryWitness,
+  admittedIdentity,
+  expectedContent,
+  parentWitnesses,
+  label,
+}) {
+  await revalidateDirectoryWitness(
+    quarantineDirectoryWitness,
+    `before fail-closed ${label} restoration`,
+  );
+  await revalidateDirectoryChain(
+    parentWitnesses,
+    `before fail-closed ${label} restoration`,
+  );
+  await assertConsumerFileIdentityStable(
+    admittedIdentity,
+    quarantinePath,
+    `before fail-closed ${label} restoration`,
+  );
+  await assertConsumerFileContentStable(
+    quarantinePath,
+    expectedContent,
+    `${label} quarantine`,
+  );
+
+  try {
+    await link(quarantinePath, path);
+  } catch (error) {
+    throw new Error(
+      `Unable to atomically restore ${label} without overwriting the canonical path: ${error.message}`,
+    );
+  }
+
+  await revalidateDirectoryWitness(
+    quarantineDirectoryWitness,
+    `after fail-closed ${label} restore link`,
+  );
+  await revalidateDirectoryChain(
+    parentWitnesses,
+    `after fail-closed ${label} restore link`,
+  );
+  await assertConsumerFileIdentityStable(
+    admittedIdentity,
+    path,
+    `after fail-closed ${label} restore link`,
+  );
+  await assertConsumerFileContentStable(path, expectedContent, label);
+  await assertConsumerFileIdentityStable(
+    admittedIdentity,
+    quarantinePath,
+    `before removing the ${label} quarantine link`,
+  );
+  await assertConsumerFileContentStable(
+    quarantinePath,
+    expectedContent,
+    `${label} quarantine`,
+  );
+
+  await unlink(quarantinePath);
+  await revalidateDirectoryWitness(
+    quarantineDirectoryWitness,
+    `after removing the ${label} quarantine link`,
+  );
+  await revalidateDirectoryChain(
+    parentWitnesses,
+    `after removing the ${label} quarantine link`,
+  );
+  await assertConsumerFileIdentityStable(
+    admittedIdentity,
+    path,
+    `after fail-closed ${label} restoration`,
+  );
+  await assertConsumerFileContentStable(path, expectedContent, label);
+  await rmdir(quarantineDirectory);
+  await revalidateDirectoryChain(
+    parentWitnesses,
+    `after fail-closed ${label} quarantine cleanup`,
+  );
+  await assertConsumerFileIdentityStable(
+    admittedIdentity,
+    path,
+    `after fail-closed ${label} quarantine cleanup`,
+  );
+  await assertConsumerFileContentStable(path, expectedContent, label);
 }
 
 // Object identity, not metadata stability, is the selected file property for

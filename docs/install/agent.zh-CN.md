@@ -91,10 +91,13 @@ stable post-write readback。Repository-cleanup preview 前第三次建立 freez
 完整 cleanup batch/readback、最终旧规则 preview/apply，以及另一次最终只读 verify receipt
 capture/validation 全部完成。
 这些 freeze 期间任何管理员都不得修改 organization/repository ruleset、classic branch
-protection、condition、required check 或 bypass actor。GitHub ruleset endpoint 没有 documented
-conditional/CAS update；plan digest 与紧邻重读可以拒绝已观察到的 drift，但无法阻止最后
-GET→PUT 区间的 racing write。只能验证 manifest 绑定的 bypass actors，绝不能声称 runtime
-会自动发现 snapshot 外新增的 actor。
+protection、condition、required check 或 bypass actor。第三次 freeze 期间还禁止任何 cohort
+repository 被 rename、transfer、delete、改变 default branch，或在原 slug 被 replace/
+re-create。这些是运营冻结，不是持续 API 锁。GitHub ruleset endpoint 没有 documented
+conditional/CAS update，cleanup mutation API 也没有 repository-ID conditional/CAS write；
+plan digest 与紧邻重读可以拒绝已观察到的 drift，却无法阻止最后 GET→PUT 或 repository
+metadata read→write 区间的 racing write，这些区间由 freeze 覆盖。只能验证 manifest 绑定的
+bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 actor。
 
 严格按下列 state machine 执行：
 
@@ -245,13 +248,26 @@ GET→PUT 区间的 racing write。只能验证 manifest 绑定的 bypass actors
      --expected-plan-sha256 "$HANDOFF_CLEANUP_PLAN_SHA256"
    ```
 
-   每个 planned item 都必须先 GET 并精确匹配 `expected_before`，再使用 surface-specific
-   mutation，最后 GET 并精确匹配 `expected_after`。稳定的 before/after mixed state 可以
-   安全续跑：已经 after 的项目是 no-op，新 preview 只计划仍为 before 的项目。Mutation
-   返回 error 或结果 unknown 时，executor 必须先做 narrow read-only reconcile；exact after
-   表示完成，before、drift 或无法读取则停止整个 batch。在 freeze 下生成新 preview 并
-   review 该 state；绝不盲目重放旧 request 或 digest。任一 action 未达到 exact
-   `expected_after` 时，不得进入 organization cutover。
+   这是运营冻结，不是持续的 repository 或 API 锁。从 cleanup preview 到最终只读
+   `verify`，除已列出的 policy mutations 外，还必须禁止 cohort repository rename、
+   transfer、delete、default-branch change，以及在原 slug replace/re-create repository。
+   GitHub cleanup mutation API 没有 repository-ID conditional/CAS write；这段 freeze 覆盖
+   最后一次 repository metadata read 到 write 之间的区间。
+
+   每次 cleanup surface GET（包括 initial classification、正常 readback 与 error
+   reconciliation）前，都必须读取 live GitHub metadata，并要求 manifest-bound `full_name`、
+   `id`、`node_id` 与 `default_branch` 精确相等。若该项仍需写入，则在紧邻 mutation 前
+   重复 identity check，要求 exact `expected_before`，执行 surface-specific mutation，最后
+   要求 exact `expected_after` readback。`id`/`node_id` 绑定 repository object；`full_name`
+   绑定 expected route 并暴露 rename、transfer 或 slug reuse；`default_branch` 绑定 branch
+   selector。Snapshots 保护选定的 policy content；无关 metadata churn 应忽略。Identity 无法
+   读取或 mismatch 时，batch 会在观测点立即停止：pre-mutation mismatch 不会写当前
+   action，之后也不再执行任何 mutation。稳定的 before/after mixed state 可以安全续跑：
+   已经 after 的项目是 no-op，新 preview 只计划仍为 before 的项目。Mutation 返回 error 或
+   结果 unknown 时，executor 必须先做 narrow read-only reconcile；exact after 表示完成，
+   before、drift 或无法读取则停止整个 batch。在 freeze 下生成新 preview 并 review 该
+   state；绝不盲目重放旧 request 或 digest。任一 action 未达到 exact `expected_after` 时，
+   不得进入 organization cutover。
 7. Preview 并执行最终 organization cutover：
 
    ```bash
@@ -332,9 +348,13 @@ embedded receipt 不能作为 bootstrap 输入。
 GitHub 读取 live repository metadata。它要求 `full_name`、`id`、`node_id` 与
 `default_branch` 都和固定 11 仓 receipt cohort 中的一项精确相等。在 atomic bridge quarantine
 rename 前的边界，它会先在 live-metadata query 前后各读取一次 `origin`，重新验证本地对象后，
-再紧邻 rename 读取一次 `origin`。已观测到的同名重建、repository transfer、default-branch
-drift、metadata 不可读或 mismatch 都必须 fail closed 并保留 bridge；不得编辑 receipt、切换
-`origin` 或绕过这份 proof。
+再紧邻 rename 读取一次 `origin`。Rename 后、unlink 前，它会再次执行完整的 `origin` ->
+live metadata identity/default-branch -> `origin` 检查，并重新验证 quarantine 中 admitted
+file 的 object identity 与 canonical content。若该 remote binding check 失败，它会通过
+no-clobber hard-link creation 尝试把同一 admitted bridge 恢复到 canonical path；若目标路径
+已被占用或恢复后的验证失败，则 fail closed、绝不覆盖占用者，也不报告删除成功。这些是
+point-in-time 的 remote binding 与 local identity/content checks，并非连续锁。不得编辑
+receipt、切换 `origin` 或绕过这份 proof。
 
    Bridge absent 时，bridge-removal component 是 idempotent no-op；已有但 non-canonical
    的 bridge 会被拒绝。整个 command 也会强制 canonical verifier、controller 与 managed

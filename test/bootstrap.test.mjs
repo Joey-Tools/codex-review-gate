@@ -1777,6 +1777,100 @@ test("legacy bridge removal rejects origin drift during the pre-rename live quer
   }
 });
 
+test("legacy bridge removal restores the bridge when its remote binding drifts at the quarantine rename boundary", () => {
+  for (const [mode, expected] of [
+    [
+      "removal-identity-drift-after-quarantine-rename",
+      /GitHub origin repository identity or default branch changed during after legacy bridge quarantine rename and before unlink/u,
+    ],
+    [
+      "removal-default-branch-drift-after-quarantine-rename",
+      /GitHub origin repository identity or default branch changed during after legacy bridge quarantine rename and before unlink/u,
+    ],
+    [
+      "removal-origin-drift-after-quarantine-rename",
+      /Git origin repository changed during after legacy bridge quarantine rename and before unlink/u,
+    ],
+  ]) {
+    const targetRoot = mkdtempSync(
+      join(tmpdir(), `codex-review-gate-post-rename-binding-${mode}-`),
+    );
+    const workflowsDirectory = join(targetRoot, ".github", "workflows");
+    const bridgePath = join(
+      targetRoot,
+      ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+    );
+    try {
+      initializeGitRepository(targetRoot);
+      const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
+      const finalClosureEnv = finalClosureGhEnvironment(targetRoot);
+      mkdirSync(workflowsDirectory, { recursive: true });
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+        CANONICAL_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+        CANONICAL_CONTROLLER_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+      const admittedBridge = lstatSync(bridgePath, { bigint: true });
+      writeFileSync(
+        join(targetRoot, ".github", "CODEOWNERS"),
+        ensureControlPlaneCodeownersContent(null).content,
+        "utf8",
+      );
+      const preloadPath = join(targetRoot, "post-rename-binding-race.cjs");
+      writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+
+      const result = runBootstrap([
+        "--prepare-worktree",
+        targetRoot,
+        "--remove-legacy-bridge",
+        ...finalClosureArgs,
+        "--apply",
+      ], {
+        env: {
+          ...finalClosureEnv,
+          NODE_OPTIONS: `--require=${preloadPath}`,
+          CODEX_BOOTSTRAP_TEST_RACE_MODE: mode,
+          CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+        },
+      });
+
+      assert.equal(result.status, 1, `${mode}: ${result.stderr}`);
+      assert.match(result.stderr, expected, mode);
+      assert.match(
+        result.stderr,
+        /admitted exact bridge remains installed/u,
+        mode,
+      );
+      assert.equal(
+        readFileSync(bridgePath, "utf8"),
+        CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+        mode,
+      );
+      const restoredBridge = lstatSync(bridgePath, { bigint: true });
+      assert.equal(restoredBridge.dev, admittedBridge.dev, mode);
+      assert.equal(restoredBridge.ino, admittedBridge.ino, mode);
+      assert.equal(
+        readdirSync(workflowsDirectory, { withFileTypes: true }).some(
+          (entry) =>
+            entry.isDirectory() &&
+            entry.name.startsWith(".codex-review-gate-removal-"),
+        ),
+        false,
+        mode,
+      );
+      assert.doesNotMatch(result.stdout, /Applied:|Next:/u, mode);
+    } finally {
+      rmSync(targetRoot, { recursive: true, force: true });
+    }
+  }
+});
+
 test("prepare-worktree installs the bridge before replacing a canonical-path v1 producer", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bridge-order-"));
   const workflowsDirectory = join(targetRoot, ".github", "workflows");
@@ -8012,6 +8106,50 @@ promises.rename = async function patchedRename(from, to) {
     throw error;
   }
   const result = await originalRename(from, to);
+  if (
+    String(from) === bridgePath &&
+    (
+      mode === "removal-identity-drift-after-quarantine-rename" ||
+      mode === "removal-default-branch-drift-after-quarantine-rename"
+    )
+  ) {
+    const responses = JSON.parse(process.env.FAKE_GH_RESPONSES || "{}");
+    const repositoryKey = Object.keys(responses).find((key) =>
+      key.startsWith("repos/")
+    );
+    if (
+      repositoryKey === undefined ||
+      responses[repositoryKey] === null ||
+      typeof responses[repositoryKey] !== "object" ||
+      Array.isArray(responses[repositoryKey])
+    ) {
+      throw new Error("synthetic post-rename repository drift lacks metadata");
+    }
+    responses[repositoryKey] = {
+      ...responses[repositoryKey],
+      ...(mode === "removal-identity-drift-after-quarantine-rename"
+        ? { id: responses[repositoryKey].id + 1 }
+        : { default_branch: "renamed-default" }),
+    };
+    process.env.FAKE_GH_RESPONSES = JSON.stringify(responses);
+  }
+  if (
+    mode === "removal-origin-drift-after-quarantine-rename" &&
+    String(from) === bridgePath
+  ) {
+    execFileSync(
+      "git",
+      [
+        "-C",
+        targetRoot,
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/Joey-Tools/replaced-consumer.git",
+      ],
+      { stdio: "inherit" },
+    );
+  }
   if (
     mode === "removal-origin-drift-after-codeowners" &&
     String(to) === join(targetRoot, ".github", "CODEOWNERS")

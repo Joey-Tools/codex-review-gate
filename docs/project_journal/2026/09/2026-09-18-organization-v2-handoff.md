@@ -62,11 +62,17 @@ superseded_by:
   dual-protection interval.
 - The nine repository-local legacy required-status entries are then removed by
   the controlled `apply-repository-cleanup` mode. Each snapshot-bound action
-  performs GET, exact-before comparison, the surface-specific mutation, and
-  exact-after readback while preserving every other rule. A stable mixture of
-  before/after items is resumable and plans only the remaining before-state
-  items. Only after their readback and a full cohort pre-cutover snapshot may
-  the old organization ruleset be updated.
+  binds exact manifest `full_name`, `id`, `node_id`, and `default_branch`
+  before every surface read and again immediately before any needed mutation,
+  then performs exact-before comparison, the surface-specific mutation, and
+  exact-after readback while preserving every other rule. The metadata tuple
+  protects repository object identity/default-branch selection; the surface
+  snapshots protect selected policy content. Unreadable or mismatched identity
+  stops the batch at observation; a pre-mutation mismatch emits no current
+  write, and no later mutation runs. A stable mixture of before/after items is
+  resumable and plans only the remaining before-state items. Only after their
+  readback and a full cohort pre-cutover snapshot may the old organization
+  ruleset be updated.
 - The sole old-rule cutover mutation is a `PUT` to the existing ruleset ID that
   removes its `codex/review-gate` required-status rule. It never deletes the
   ruleset. Two complete, stable cohort snapshots must show that every member is
@@ -90,8 +96,12 @@ repository metadata that exactly match one receipt entry's `full_name`, `id`,
 `node_id`, and `default_branch`. At the pre-rename boundary it reads `origin`
 before and after the metadata lookup, repeats the local object checks, then
 reads `origin` once more immediately before the atomic bridge quarantine
-rename. An observed same-name re-creation, transfer, default-branch drift,
-unreadable metadata, or mismatch fails closed and leaves the bridge installed.
+rename. After the rename and before unlink, it repeats the complete `origin`
+to live metadata identity/default-branch to `origin` check and revalidates the
+quarantined object's identity and canonical content. Remote-binding failure
+attempts a no-clobber hard-link restoration of that same admitted bridge; an
+occupied canonical path or failed verification stops without overwrite or
+removal success. These are point-in-time checks, not a continuous lock.
 This returns consumers to the ordinary no-v1-caller installation contract after
 the global cutover is closed.
 
@@ -142,10 +152,13 @@ the global cutover is closed.
   stable post-write readback. A third begins before repository-cleanup preview
   and remains continuous through cleanup apply/readback, final-cutover
   preview/apply, and a separate final read-only verify receipt capture and
-  validation. No ruleset, classic branch-protection, condition, required-check,
-  or bypass-actor mutation is allowed during these intervals. The helper checks
-  the exact manifest-bound bypass lists; it does not automatically discover an
-  actor added outside the snapshot.
+  validation. During that third interval no cohort repository may be renamed,
+  transferred, deleted, have its default branch changed, or be replaced or
+  re-created at its original slug, and no ruleset, classic branch-protection,
+  condition, required-check, or bypass-actor mutation is allowed. This is an
+  operational freeze, not a continuous lock. The helper checks exact
+  manifest-bound repository identity/default branch and bypass lists; it does
+  not automatically discover an actor added outside the snapshot.
 - Before the old organization-rule `PUT`, the helper repeats the complete
   cohort revalidation and then reads the old rule's writable identity directly
   adjacent to the write. GitHub's ruleset update endpoint has no conditional
@@ -161,11 +174,15 @@ the global cutover is closed.
   before-state; absent, multiple, Active, or drifted candidates stop. The
   recovery read requires an external organization-admin policy-mutation freeze.
 - Repository cleanup accepts a stable before/after mixture and plans only
-  still-before items. Each mutation is preceded by exact-before validation and
-  followed by exact-after readback. An error or unknown write result triggers
-  an immediate narrow read-only reconciliation: exact after is complete, while
-  before, drift, or an unreadable result stops the batch for a fresh reviewed
-  preview. It never blindly replays the old request or digest.
+  still-before items. Each action binds exact repository identity/default
+  branch before every surface read and immediately before a needed mutation;
+  each mutation is also preceded by exact-before validation and followed by
+  exact-after readback. An error or unknown write result triggers an immediate
+  narrow read-only reconciliation: exact after is complete, while before,
+  identity or policy drift, or an unreadable result stops the batch for a fresh
+  reviewed preview. It never blindly replays the old request or digest. GitHub
+  exposes no repository-ID conditional/CAS mutation, so the operational freeze
+  covers the final metadata-read-to-write gap.
 - The third freeze may end only after the complete final read-only verify JSON
   and its canonical receipt digest are captured. An inconclusive final read,
   bound-policy drift, or a known policy mutation before bridge-removal
@@ -197,6 +214,6 @@ the global cutover is closed.
   `GET /orgs/Joey-Tools/rulesets/16590367` on 2026-09-18.
 - Prior v2 decisions and implementation ledger:
   `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`.
-- Source delivery validation: `npm run test:organization-handoff` passed
-  216/216; `npm run check`, `git diff --check`, and project-journal validation
-  passed before the frozen source review.
+- Current delivery validation: `npm run test:organization-handoff` passed
+  218/218. Documentation `git diff --check` and project-journal validation
+  passed after this boundary update.

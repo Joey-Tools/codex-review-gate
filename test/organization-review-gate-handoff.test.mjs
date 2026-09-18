@@ -438,6 +438,7 @@ function createFakeGhHarness(
     detailedCleanupState = false,
     cleanupMutationErrorAt = null,
     cleanupMutationFailureAt = null,
+    cleanupIdentityDriftAtMetadataRead = null,
     stageCreateResponse = "valid",
     extraEffectiveRules = [],
     extraEffectiveSecondPageRules = [],
@@ -452,6 +453,10 @@ function createFakeGhHarness(
   const v2StatePath = join(directory, "v2-state");
   const legacyStatePath = join(directory, "legacy-state");
   const cleanupStatePath = join(directory, "cleanup-state");
+  const cleanupIdentityReadCountPath = join(
+    directory,
+    "cleanup-identity-read-count",
+  );
   const cleanupActionStatePaths = [];
   const responses = new Map();
   const cleanupResponses = [];
@@ -466,6 +471,7 @@ function createFakeGhHarness(
       ),
     ]),
   );
+  let cleanupIdentityResponse = null;
 
   const organization = manifest.organization;
   const encodedOrganization = encodeURIComponent(organization.login);
@@ -480,6 +486,23 @@ function createFakeGhHarness(
       node_id: repository.node_id,
       default_branch: repository.default_branch,
     });
+    if (repositoryIndex === 0 && cleanupIdentityDriftAtMetadataRead !== null) {
+      cleanupIdentityResponse = {
+        request: `GET:repos/${encodedSlug}`,
+        bound: JSON.stringify({
+          full_name: repository.slug,
+          id: repository.id,
+          node_id: repository.node_id,
+          default_branch: repository.default_branch,
+        }),
+        drifted: JSON.stringify({
+          full_name: repository.slug,
+          id: repository.id + 1,
+          node_id: `${repository.node_id}_replacement`,
+          default_branch: repository.default_branch,
+        }),
+      };
+    }
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/actions/permissions/workflow`,
@@ -1005,6 +1028,19 @@ function createFakeGhHarness(
     }
     scriptLines.push("esac");
   }
+  if (cleanupIdentityResponse !== null) {
+    scriptLines.push(
+      `if [ "$request" = ${shellQuote(cleanupIdentityResponse.request)} ]; then`,
+      `  count="$(cat ${shellQuote(cleanupIdentityReadCountPath)})"`,
+      "  count=$((count + 1))",
+      `  printf '%s\\n' "$count" > ${shellQuote(cleanupIdentityReadCountPath)}`,
+      `  if [ "$count" -ge ${cleanupIdentityDriftAtMetadataRead} ]; then`,
+      `    respond ${shellQuote(cleanupIdentityResponse.drifted)}`,
+      "  fi",
+      `  respond ${shellQuote(cleanupIdentityResponse.bound)}`,
+      "fi",
+    );
+  }
   scriptLines.push('case "$request" in');
   for (const [request, response] of responses.entries()) {
     scriptLines.push(`  ${shellQuote(request)}) respond ${shellQuote(response)} ;;`);
@@ -1022,6 +1058,7 @@ function createFakeGhHarness(
   writeFileSync(v2StatePath, "absent\n");
   writeFileSync(legacyStatePath, "before\n");
   writeFileSync(cleanupStatePath, "before\n");
+  writeFileSync(cleanupIdentityReadCountPath, "0\n");
   if (detailedCleanupState) {
     for (const action of cleanupActionStatePaths) {
       writeFileSync(action.path, "before\n");
@@ -1057,6 +1094,7 @@ function createFakeGhHarness(
     v2StatePath,
     legacyStatePath,
     cleanupStatePath,
+    cleanupIdentityReadCountPath,
     cleanupActionStatePaths,
   };
 }
@@ -1672,6 +1710,47 @@ test("repository cleanup executor performs every pending action in serial exact-
   for (const action of harness.cleanupActionStatePaths) {
     assert.equal(readFileSync(action.path, "utf8"), "after\n");
   }
+});
+
+test("repository cleanup executor rejects same-slug identity drift immediately before mutation", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    detailedCleanupState: true,
+    cleanupIdentityDriftAtMetadataRead: 5,
+  });
+  configureDetailedCleanupHandoff(harness);
+  const preview = await runFakeCli(harness, "apply-repository-cleanup");
+  writeFileSync(harness.logPath, "");
+  writeFileSync(harness.cleanupIdentityReadCountPath, "0\n");
+
+  await assert.rejects(
+    runFakeCli(harness, "apply-repository-cleanup", [
+      "--apply",
+      "--expected-plan-sha256",
+      preview.plan_sha256,
+    ]),
+    /repository cleanup identity immediately before mutation drifted/u,
+  );
+
+  const requests = fakeGhRequests(harness.logPath);
+  const firstAction = harness.cleanupActionStatePaths[0];
+  const repositoryEndpoint =
+    `repos/${encodeEndpointPathForTest(firstAction.repository)}`;
+  const surfaceEndpoint =
+    `${repositoryEndpoint}/rulesets/${firstAction.surface.slice("repository_ruleset:".length)}?includes_parents=false`;
+  assert.deepEqual(
+    requests.slice(-3).map(({ method, endpoint }) => ({ method, endpoint })),
+    [
+      { method: "GET", endpoint: repositoryEndpoint },
+      { method: "GET", endpoint: surfaceEndpoint },
+      { method: "GET", endpoint: repositoryEndpoint },
+    ],
+    "the target identity must be checked both before its surface read and immediately before mutation",
+  );
+  assert.deepEqual(
+    mutationRequests(requests),
+    [],
+    "same-slug repository replacement after cohort revalidation must block every cleanup mutation",
+  );
 });
 
 test("repository cleanup executor resumes a mixed checkpoint without rewriting reconciled actions", async (t) => {
