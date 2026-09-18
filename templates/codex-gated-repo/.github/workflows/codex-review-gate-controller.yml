@@ -35,8 +35,7 @@ permissions:
   actions: write
   checks: read
   contents: read
-  issues: write
-  pull-requests: read
+  pull-requests: write
 
 concurrency:
   group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.issue.number || inputs.pr_number }}

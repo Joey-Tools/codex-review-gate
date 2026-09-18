@@ -21,6 +21,11 @@ entry point, `workflow_dispatch`. One manual run targets one PR and exact
 expected head. Neither workflow has cron, `repository_dispatch`, an automatic
 `pull_request_review` job, a runtime GitHub App, or a ledger.
 
+The controller's sole `pull-requests: write` permission posts its canonical
+request marker and diagnostics only on a PR. GitHub's issue-comment endpoints
+accept that permission for a PR, so the controller does not receive `issues:
+write`, contents, checks, statuses, or OIDC write authority.
+
 The default runner is `ubuntu-slim`. Set the repository Actions variable
 `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` only when the supported
 `ubuntu-latest` fallback is required. Limits are selected only through the

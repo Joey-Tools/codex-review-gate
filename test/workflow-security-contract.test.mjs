@@ -210,8 +210,7 @@ test("consumer permissions and runtime shape cannot read or execute pull-request
     actions: "write",
     checks: "read",
     contents: "read",
-    issues: "write",
-    "pull-requests": "read",
+    "pull-requests": "write",
   });
   assert.equal(
     blockScalar(verifier.job, "runs-on"),
@@ -2664,7 +2663,6 @@ function parseControllerWorkflow(source) {
     "actions",
     "checks",
     "contents",
-    "issues",
     "pull-requests",
   ]);
   const concurrency = blockChild(root, "concurrency");

@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import { resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
 
@@ -26,6 +27,17 @@ export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
 export const REQUIRED_REPOSITORY_COUNT = 11;
 export const CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const V2_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
+// These are every documented nonterminal Actions workflow-run state. A run in
+// any of them can still execute and overwrite the legacy status, so every
+// complete, unfiltered legacy-writer inventory must reject all of them before
+// its compatibility evidence is accepted.
+export const NONTERMINAL_WORKFLOW_RUN_STATUSES = Object.freeze([
+  "requested",
+  "waiting",
+  "pending",
+  "queued",
+  "in_progress",
+]);
 const CANARY_PULL_QUERY = `query CanaryPull($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -52,8 +64,8 @@ export const CANONICAL_WORKFLOW_IDENTITIES = Object.freeze({
   }),
   controller: Object.freeze({
     path: ".github/workflows/codex-review-gate-controller.yml",
-    git_blob_sha: "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-    sha256: "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f",
+    git_blob_sha: "c994a6861414e1efc1e7ab376470c7709d475ef1",
+    sha256: "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e",
   }),
   legacy_bridge: Object.freeze({
     path: ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -67,6 +79,13 @@ const MAX_GH_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const GH_TIMEOUT_MS = 60_000;
 const GH_API_QUEUE_TIMEOUT_MS = 60_000;
+// A writer epoch retains one compact execution identity per historical run.
+// These hard bounds protect the one-time handoff reader's memory and request
+// footprint; they are intentionally distinct from consumer reconcile limits.
+const LEGACY_WRITER_SCAN_TIMEOUT_MS = 60_000;
+const LEGACY_WRITER_RUN_PAGE_SIZE = 100;
+const MAX_LEGACY_WRITER_RUN_ENTRIES = 100_000;
+const MAX_LEGACY_WRITER_RUN_PAGES = 1_000;
 const GH_API_CONCURRENCY = 8;
 const REPOSITORY_EVIDENCE_CONCURRENCY = 2;
 const MODES = new Set([
@@ -389,7 +408,7 @@ function assertV2RepositoryRulesetPolicy(ruleset, defaultBranch, label) {
     !isPlainObject(refName) ||
     !Array.isArray(refName.include) ||
     !Array.isArray(refName.exclude) ||
-    !rulesetCoversDefaultBranch(ruleset, defaultBranch)
+    !rulesetProvablyCoversDefaultBranch(ruleset, defaultBranch)
   ) {
     throw new Error(`${label} does not provably cover the repository default branch.`);
   }
@@ -425,6 +444,24 @@ function assertV2RepositoryRulesetPolicy(ruleset, defaultBranch, label) {
   if (ruleset.rules.filter((rule) => rule.type === "non_fast_forward").length !== 1) {
     throw new Error(`${label} must contain exactly one non_fast_forward rule.`);
   }
+}
+
+function rulesetProvablyCoversDefaultBranch(ruleset, defaultBranch) {
+  const exclude = ruleset.conditions?.ref_name?.exclude;
+  if (!Array.isArray(exclude)) return false;
+  // A wildcard exclusion is not a stable default-branch coverage assertion:
+  // a branch rename can make it effective without changing the ruleset. The
+  // handoff can retain exact exclusions for other known branches, but it must
+  // not admit a broad exclusion into a default-branch gate policy.
+  if (
+    exclude.some(
+      (pattern) =>
+        typeof pattern !== "string" || /[*?[]/u.test(pattern),
+    )
+  ) {
+    return false;
+  }
+  return rulesetCoversDefaultBranch(ruleset, defaultBranch);
 }
 
 function assertWorkflowDescriptor(value, label) {
@@ -1659,35 +1696,39 @@ function parseCheckRunApiUrl(value, repoSlug) {
   return id;
 }
 
-export function parseWorkflowRunPath(value, defaultBranch) {
-  if (value === CANONICAL_WORKFLOW_IDENTITIES.verifier.path) {
-    return {
-      workflow_path: value,
-      workflow_ref: null,
-    };
-  }
+export function parseWorkflowRunPath(value, defaultBranch = undefined) {
   if (typeof value !== "string") {
     throw new Error("Workflow run path must be a string.");
   }
-  const prefix = `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@`;
-  if (!value.startsWith(prefix) || value.length === prefix.length) {
-    throw new Error("Workflow run path is not the canonical verifier path.");
+  const separator = value.lastIndexOf("@");
+  const workflowPath = separator === -1 ? value : value.slice(0, separator);
+  const workflowRef = separator === -1 ? null : value.slice(separator + 1);
+  try {
+    assertRepoRelativeWorkflowPath(workflowPath, "Workflow run path");
+  } catch {
+    throw new Error("Workflow run path is not a normalized workflow path.");
   }
-  const workflowRef = value.slice(prefix.length);
-  // GitHub returns a bare path for some runs and path@ref for others. The
-  // workflow ID, canonical default-branch tree, and canary's protected-file
-  // inventory bind the producer; accepting the documented optional suffix
-  // avoids assuming one undocumented ref spelling.
   if (
-    workflowRef.includes("\n") ||
-    workflowRef.includes("\r") ||
-    workflowRef.includes("\0") ||
+    (workflowRef !== null &&
+      (workflowRef === "" || /[\u0000-\u001f\u007f\s]/u.test(workflowRef))) ||
     (defaultBranch !== undefined && typeof defaultBranch !== "string")
   ) {
     throw new Error("Workflow run path has an invalid source ref.");
   }
+  // GitHub documents this field as ".github/workflows/foo.yml@ref". Keep
+  // accepting its historical bare-path form, but when it supplies a ref bind
+  // it to the manifest's default branch rather than merely recording it.
+  if (
+    defaultBranch !== undefined &&
+    (workflowPath !== CANONICAL_WORKFLOW_IDENTITIES.verifier.path ||
+      (workflowRef !== null &&
+        workflowRef !== defaultBranch &&
+        workflowRef !== `refs/heads/${defaultBranch}`))
+  ) {
+    throw new Error("Workflow run path is not bound to the canonical verifier source.");
+  }
   return {
-    workflow_path: CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+    workflow_path: workflowPath,
     workflow_ref: workflowRef,
   };
 }
@@ -1914,8 +1955,313 @@ export function validateLegacyStatusPages(pages, repo) {
   return projection;
 }
 
-async function loadLegacyStatusEvidence(repo) {
-  const endpoint = `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/statuses?per_page=100`;
+function createLegacyWriterRunInventoryAccumulator(repo, writer) {
+  let totalCount = null;
+  let pageCount = 0;
+  const pageSizes = [];
+  const executions = [];
+  const runIds = new Set();
+
+  return {
+    addPage(page) {
+      if (
+        !isPlainObject(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.workflow_runs) ||
+        page.workflow_runs.length > LEGACY_WRITER_RUN_PAGE_SIZE
+      ) {
+        throw new Error(`${repo.slug} legacy writer run inventory is incomplete.`);
+      }
+      if (totalCount === null) {
+        totalCount = page.total_count;
+        if (totalCount > MAX_LEGACY_WRITER_RUN_ENTRIES) {
+          throw new Error(
+            `${repo.slug} ${writer} history has ${totalCount} runs, beyond the ${MAX_LEGACY_WRITER_RUN_ENTRIES}-entry hard resource bound; the result is inconclusive and no next write is allowed.`,
+          );
+        }
+        if (
+          Math.ceil(totalCount / LEGACY_WRITER_RUN_PAGE_SIZE) >
+          MAX_LEGACY_WRITER_RUN_PAGES
+        ) {
+          throw new Error(
+            `${repo.slug} ${writer} history exceeds the ${MAX_LEGACY_WRITER_RUN_PAGES}-page hard resource bound; the result is inconclusive and no next write is allowed.`,
+          );
+        }
+      } else if (page.total_count !== totalCount) {
+        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+      }
+      if (pageCount >= MAX_LEGACY_WRITER_RUN_PAGES) {
+        throw new Error(
+          `${repo.slug} ${writer} history exceeds the ${MAX_LEGACY_WRITER_RUN_PAGES}-page hard resource bound; the result is inconclusive and no next write is allowed.`,
+        );
+      }
+      pageCount += 1;
+      pageSizes.push(page.workflow_runs.length);
+      const executionOffset = executions.length;
+      for (const [index, run] of page.workflow_runs.entries()) {
+        const runLabel = `${repo.slug} legacy writer run ${executionOffset + index}`;
+        assertPositiveInteger(run?.id, `${runLabel}.id`);
+        assertPositiveInteger(run?.run_attempt, `${runLabel}.run_attempt`);
+        if (runIds.has(run.id)) {
+          throw new Error(`${repo.slug} legacy writer run pagination contains duplicate IDs.`);
+        }
+        runIds.add(run.id);
+        if (NONTERMINAL_WORKFLOW_RUN_STATUSES.includes(run.status)) {
+          throw new Error(
+            `${repo.slug} ${writer} still has ${run.status} runs; bridge status cannot be accepted until every legacy-status writer drains.`,
+          );
+        }
+        if (run.status !== "completed") {
+          throw new Error(
+            `${repo.slug} ${writer} run ${run.id} has unsupported status ${JSON.stringify(run.status)}; bridge status cannot be accepted until the complete legacy-writer inventory is terminal.`,
+          );
+        }
+        executions.push({ id: run.id, run_attempt: run.run_attempt });
+      }
+      if (runIds.size > totalCount) {
+        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+      }
+      if (runIds.size === totalCount) return true;
+      if (page.workflow_runs.length !== LEGACY_WRITER_RUN_PAGE_SIZE) {
+        throw new Error(
+          `${repo.slug} legacy writer run pagination has an incomplete non-final page.`,
+        );
+      }
+      return false;
+    },
+    finish() {
+      if (totalCount === null || runIds.size !== totalCount) {
+        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+      }
+      return {
+        total_count: totalCount,
+        page_count: pageCount,
+        page_sizes: pageSizes,
+        executions: executions.sort(
+          (left, right) =>
+            left.id - right.id || left.run_attempt - right.run_attempt,
+        ),
+      };
+    },
+  };
+}
+
+export function validateLegacyWriterRunPages(
+  pages,
+  repo,
+  writer = "legacy-status writer",
+) {
+  if (!Array.isArray(pages) || pages.length === 0) {
+    throw new Error(`${repo.slug} legacy writer run inventory is incomplete.`);
+  }
+  const accumulator = createLegacyWriterRunInventoryAccumulator(repo, writer);
+  let complete = false;
+  for (const page of pages) {
+    if (complete) {
+      throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+    }
+    complete = accumulator.addPage(page);
+  }
+  if (!complete) {
+    throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+  }
+  return accumulator.finish();
+}
+
+function validateActionsWorkflowInventoryPages(pages, repo) {
+  if (
+    !Array.isArray(pages) ||
+    pages.length === 0 ||
+    pages.some(
+      (page) =>
+        !isPlainObject(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.workflows),
+    )
+  ) {
+    throw new Error(`${repo.slug} Actions workflow inventory is incomplete.`);
+  }
+  if (pages.some((page, index) => index < pages.length - 1 && page.workflows.length !== 100)) {
+    throw new Error(`${repo.slug} Actions workflow inventory has an incomplete non-final page.`);
+  }
+  const workflows = pages.flatMap((page) => page.workflows);
+  if (
+    pages.some((page) => page.total_count !== pages[0].total_count) ||
+    workflows.length !== pages[0].total_count
+  ) {
+    throw new Error(`${repo.slug} Actions workflow inventory is inconsistent.`);
+  }
+  const workflowIds = new Set();
+  for (const [index, workflow] of workflows.entries()) {
+    assertPositiveInteger(workflow?.id, `${repo.slug} Actions workflow ${index}.id`);
+    if (workflowIds.has(workflow.id)) {
+      throw new Error(`${repo.slug} Actions workflow inventory contains duplicate IDs.`);
+    }
+    workflowIds.add(workflow.id);
+    assertRepoRelativeWorkflowPath(
+      workflow?.path,
+      `${repo.slug} Actions workflow ${index}.path`,
+    );
+    assertNonEmptyString(workflow?.state, `${repo.slug} Actions workflow ${index}.state`);
+  }
+  return workflows;
+}
+
+async function loadStableActionsWorkflowInventory(repo) {
+  const endpoint =
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows?per_page=100`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const pages = await ghJson(endpoint, { paginate: true });
+    const workflows = validateActionsWorkflowInventoryPages(pages, repo);
+    const firstPage = await ghJson(`${endpoint}&page=1`);
+    if (
+      Array.isArray(firstPage?.workflows) &&
+      Array.isArray(pages[0]?.workflows) &&
+      canonicalJson(firstPage) === canonicalJson(pages[0])
+    ) {
+      return workflows;
+    }
+  }
+  throw new Error(
+    `${repo.slug} Actions workflow inventory changed during horizon revalidation; the result is inconclusive and no next write is allowed.`,
+  );
+}
+
+async function loadActiveCanonicalWorkflowById(repo, workflowId, expectedPath, label) {
+  const workflow = await ghJson(
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}`,
+  );
+  if (
+    workflow?.id !== workflowId ||
+    workflow?.path !== expectedPath ||
+    workflow?.state !== "active"
+  ) {
+    throw new Error(
+      `${repo.slug} ${label} is not bound to one active canonical Actions workflow identity.`,
+    );
+  }
+  return workflowId;
+}
+
+async function loadActiveCanonicalLegacyBridgeWorkflowId(repo) {
+  const workflows = await loadStableActionsWorkflowInventory(repo);
+  const matches = workflows.filter(
+    (workflow) => workflow.path === CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      `${repo.slug} canonical legacy bridge must have exactly one Actions workflow identity in the complete inventory.`,
+    );
+  }
+  const [bridge] = matches;
+  if (bridge.state !== "active") {
+    throw new Error(`${repo.slug} canonical legacy bridge Actions workflow is not active.`);
+  }
+  return loadActiveCanonicalWorkflowById(
+    repo,
+    bridge.id,
+    CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
+    "canonical legacy bridge",
+  );
+}
+
+function legacyWriterScanDeadlineError(repo, writer, timeoutMs) {
+  return new Error(
+    `${repo.slug} ${writer} complete legacy-writer scan exceeded its ${timeoutMs}ms total deadline; the result is inconclusive and no next write is allowed.`,
+  );
+}
+
+export async function scanLegacyWriterRuns(
+  repo,
+  workflowId,
+  writer,
+  {
+    now = performance.now.bind(performance),
+    timeoutMs = LEGACY_WRITER_SCAN_TIMEOUT_MS,
+    readPage = ghJson,
+  } = {},
+) {
+  if (
+    typeof now !== "function" ||
+    typeof readPage !== "function" ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0
+  ) {
+    throw new Error("Legacy writer scan runtime configuration is invalid.");
+  }
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) {
+    throw new Error("Legacy writer scan clock returned an invalid start time.");
+  }
+  const deadlineAt = startedAt + timeoutMs;
+  if (!Number.isFinite(deadlineAt)) {
+    throw new Error("Legacy writer scan deadline is invalid.");
+  }
+  const deadlineLabel =
+    `${repo.slug} ${writer} ${timeoutMs}ms complete legacy-writer scan`;
+  let lastObservedAt = startedAt;
+  const assertWithinDeadline = () => {
+    const observedAt = now();
+    if (!Number.isFinite(observedAt) || observedAt < lastObservedAt) {
+      throw new Error("Legacy writer scan clock is invalid or moved backwards.");
+    }
+    lastObservedAt = observedAt;
+    if (observedAt >= deadlineAt) {
+      throw legacyWriterScanDeadlineError(repo, writer, timeoutMs);
+    }
+  };
+  const endpoint =
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?per_page=${LEGACY_WRITER_RUN_PAGE_SIZE}`;
+  const accumulator = createLegacyWriterRunInventoryAccumulator(repo, writer);
+  for (let page = 1; ; page += 1) {
+    assertWithinDeadline();
+    const response = await readPage(`${endpoint}&page=${page}`, {
+      deadlineAt,
+      deadlineLabel,
+    });
+    assertWithinDeadline();
+    const complete = accumulator.addPage(response);
+    if (complete) return accumulator.finish();
+  }
+}
+
+async function assertLegacyProducerDrained(repo) {
+  // The verifier retained the old producer's Actions workflow ID by replacing
+  // .github/workflows/codex-review-gate.yml in place. The temporary bridge is
+  // a second, independently identified legacy-status writer and shares its
+  // concurrency key. Bind both live identities and drain both inventories so
+  // neither writer can race the compatibility status snapshot or readback.
+  const [producerWorkflowId, bridgeWorkflowId] = await Promise.all([
+    loadActiveCanonicalWorkflowById(
+      repo,
+      repo.canary.v2_workflow_id,
+      CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+      "retained canonical producer",
+    ),
+    loadActiveCanonicalLegacyBridgeWorkflowId(repo),
+  ]);
+  const writers = await Promise.all(
+    [
+      [producerWorkflowId, "retained canonical producer"],
+      [bridgeWorkflowId, "temporary legacy bridge"],
+    ].map(async ([workflowId, writer]) => {
+      // Do not split this inventory into individual `status` queries. A run
+      // can advance between independently timed filtered requests, leaving
+      // every bucket empty even though it never drained. Scan one unfiltered
+      // inventory page at a time, retaining only execution identity; reject
+      // nonterminal states locally without accumulating full run payloads.
+      return {
+        workflow_id: workflowId,
+        execution_epoch: await scanLegacyWriterRuns(repo, workflowId, writer),
+      };
+    }),
+  );
+  return writers;
+}
+
+async function loadStableLegacyStatusProjection(repo, endpoint) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const pages = await ghJson(endpoint, { paginate: true });
     const projection = validateLegacyStatusPages(pages, repo);
@@ -1930,6 +2276,30 @@ async function loadLegacyStatusEvidence(repo) {
   }
   throw new Error(
     `${repo.slug} commit-status pagination horizon changed during revalidation; the result is inconclusive and no next write is allowed.`,
+  );
+}
+
+async function loadLegacyStatusEvidence(repo) {
+  const endpoint = `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/statuses?per_page=100`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    // GitHub does not expose an atomic cross-resource snapshot. Keep the
+    // status decision inside two complete terminal writer epochs, then read a
+    // second full status projection after the latter epoch. Any new completed
+    // run, rerun, or status-list change forces a bounded retry rather than
+    // authorizing a stale legacy success.
+    const writerEpochBefore = await assertLegacyProducerDrained(repo);
+    const statusBefore = await loadStableLegacyStatusProjection(repo, endpoint);
+    const writerEpochAfter = await assertLegacyProducerDrained(repo);
+    const statusAfter = await loadStableLegacyStatusProjection(repo, endpoint);
+    if (
+      canonicalJson(writerEpochBefore) === canonicalJson(writerEpochAfter) &&
+      canonicalJson(statusBefore) === canonicalJson(statusAfter)
+    ) {
+      return statusAfter;
+    }
+  }
+  throw new Error(
+    `${repo.slug} commit-status or legacy-writer execution horizon changed during revalidation; the result is inconclusive and no next write is allowed.`,
   );
 }
 
@@ -2096,9 +2466,13 @@ async function loadEffectiveBranchRules(repo) {
   );
   if (
     !Array.isArray(response) ||
+    response.length === 0 ||
     response.some((page) => !Array.isArray(page))
   ) {
     throw new Error(`${repo.slug} effective branch-rule inventory is malformed.`);
+  }
+  if (response.some((page, index) => index < response.length - 1 && page.length !== 100)) {
+    throw new Error(`${repo.slug} effective branch-rule pagination has an incomplete non-final page.`);
   }
   return response
     .flat()
@@ -2258,6 +2632,16 @@ async function loadRepositoryEvidence(
   const defaultBranchPromise = loadDefaultBranchHead(repo, {
     requireCanaryBase: requireCanaryEvidence,
   });
+  const [metadata, defaultBranch] = await Promise.all([
+    metadataPromise,
+    defaultBranchPromise,
+  ]);
+  // The default-branch tree binds the canonical bridge bytes before the live
+  // Actions inventory resolves its mutable workflow ID for status-writer drain.
+  const workflowControlPlane = await loadWorkflowInventoryEvidence(
+    repo,
+    defaultBranch.head_sha,
+  );
   const canaryEvidencePromise = requireCanaryEvidence
     ? Promise.allSettled([
         loadCanaryPull(repo),
@@ -2269,13 +2653,8 @@ async function loadRepositoryEvidence(
         return results.map((result) => result.value);
       })
     : Promise.resolve(null);
-  const [metadata, defaultBranch, canaryEvidence] = await Promise.all([
-    metadataPromise,
-    defaultBranchPromise,
-    canaryEvidencePromise,
-  ]);
+  const canaryEvidence = await canaryEvidencePromise;
   const [
-    workflowControlPlane,
     v2Ruleset,
     codeowners,
     actionsWorkflowPermissions,
@@ -2283,7 +2662,6 @@ async function loadRepositoryEvidence(
     classicStatus,
     effectiveBranchRules,
   ] = await Promise.all([
-    loadWorkflowInventoryEvidence(repo, defaultBranch.head_sha),
     loadRepositoryRuleset(repo),
     loadCodeownersEvidence(repo, defaultBranch.head_sha),
     loadActionsWorkflowPermissions(repo),
@@ -3445,10 +3823,35 @@ const ghApiSlots = {
   waiters: [],
 };
 
-async function withGhApiSlot(callback) {
+function deadlineExceededError(deadlineLabel) {
+  return new Error(
+    `${deadlineLabel} exceeded its shared deadline; the result is inconclusive and no next write is allowed.`,
+  );
+}
+
+function remainingDeadlineMs(deadlineAt, deadlineLabel) {
+  if (!Number.isFinite(deadlineAt) || typeof deadlineLabel !== "string" || deadlineLabel === "") {
+    throw new Error("GitHub API deadline configuration is invalid.");
+  }
+  const remaining = deadlineAt - performance.now();
+  if (remaining <= 0) throw deadlineExceededError(deadlineLabel);
+  return Math.ceil(remaining);
+}
+
+async function withGhApiSlot(
+  callback,
+  { deadlineAt = undefined, deadlineLabel = undefined } = {},
+) {
   if (typeof callback !== "function") {
     throw new Error("GitHub API slot callback must be a function.");
   }
+  const queueTimeoutMs =
+    deadlineAt === undefined
+      ? GH_API_QUEUE_TIMEOUT_MS
+      : Math.min(
+          GH_API_QUEUE_TIMEOUT_MS,
+          remainingDeadlineMs(deadlineAt, deadlineLabel),
+        );
   await new Promise((resolvePromise, rejectPromise) => {
     if (ghApiSlots.active < GH_API_CONCURRENCY) {
       ghApiSlots.active += 1;
@@ -3468,11 +3871,13 @@ async function withGhApiSlot(callback) {
       const index = ghApiSlots.waiters.indexOf(waiter);
       if (index !== -1) ghApiSlots.waiters.splice(index, 1);
       rejectPromise(
-        new Error(
-          `GitHub API queue remained full for ${GH_API_QUEUE_TIMEOUT_MS}ms; the result is inconclusive and no next write is allowed.`,
-        ),
+        deadlineAt === undefined
+          ? new Error(
+              `GitHub API queue remained full for ${GH_API_QUEUE_TIMEOUT_MS}ms; the result is inconclusive and no next write is allowed.`,
+            )
+          : deadlineExceededError(deadlineLabel),
       );
-    }, GH_API_QUEUE_TIMEOUT_MS);
+    }, queueTimeoutMs);
     ghApiSlots.waiters.push(waiter);
   });
   try {
@@ -3491,13 +3896,37 @@ function ghJson(
   endpoint,
   options = {},
 ) {
-  return withGhApiSlot(() => ghJsonUnbounded(endpoint, options));
+  const { deadlineAt = undefined, deadlineLabel = undefined, ...requestOptions } = options;
+  return withGhApiSlot(
+    () =>
+      ghJsonUnbounded(endpoint, requestOptions, {
+        timeoutMs:
+          deadlineAt === undefined
+            ? GH_TIMEOUT_MS
+            : Math.min(
+                GH_TIMEOUT_MS,
+                remainingDeadlineMs(deadlineAt, deadlineLabel),
+              ),
+        timeoutError:
+          deadlineAt === undefined
+            ? undefined
+            : deadlineExceededError(deadlineLabel),
+      }),
+    { deadlineAt, deadlineLabel },
+  );
 }
 
 function ghJsonUnbounded(
   endpoint,
   { method = "GET", body = undefined, paginate = false, allowNotFound = false } = {},
+  { timeoutMs = GH_TIMEOUT_MS, timeoutError = undefined } = {},
 ) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("GitHub API request timeout must be a positive safe integer.");
+  }
+  if (timeoutError !== undefined && !(timeoutError instanceof Error)) {
+    throw new Error("GitHub API request timeout error must be an Error when provided.");
+  }
   return new Promise((resolvePromise, rejectPromise) => {
     const args = [
       "api",
@@ -3544,8 +3973,10 @@ function ghJsonUnbounded(
     });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      finish(() => rejectPromise(new Error(`gh api ${endpoint} timed out.`)));
-    }, GH_TIMEOUT_MS);
+      finish(() =>
+        rejectPromise(timeoutError ?? new Error(`gh api ${endpoint} timed out.`)),
+      );
+    }, timeoutMs);
     if (body === undefined) {
       child.stdin.end();
     } else {

@@ -1562,7 +1562,7 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
       targetRoot,
       "--remove-legacy-bridge",
       ...finalClosureArgs,
-    ]);
+    ], { env: finalClosureEnv });
     assert.equal(removalDryRun.status, 0, removalDryRun.stderr);
     assert.match(removalDryRun.stdout, /remove the exact temporary legacy bridge/u);
     assert.equal(existsSync(bridgePath), true);
@@ -1739,7 +1739,10 @@ test("legacy bridge removal rejects origin drift during the pre-rename live quer
     initializeGitRepository(targetRoot);
     const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
     const finalClosureEnv = finalClosureGhEnvironment(targetRoot, {}, {
-      originDriftOnSecondLiveQuery: "Joey-Tools/replaced-consumer",
+      // Calls 1-3 cover admission, the first mutation boundary, and the
+      // first pre-rename authorization check. Call 4 is deliberately after
+      // the local bridge-object revalidation at the final rename boundary.
+      originDriftOnLiveQuery: 4,
     });
     mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
     writeFileSync(
@@ -1774,6 +1777,88 @@ test("legacy bridge removal rejects origin drift during the pre-rename live quer
     assert.doesNotMatch(result.stdout, /Applied: remove/u);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy bridge removal rejects same-slug target replacement after a prior mutation and before quarantine rename", () => {
+  const receiptRepository = buildFinalClosureOutput()
+    .final_closure_receipt.repositories[0];
+  for (const [name, mutate] of [
+    ["id", (metadata) => { metadata.id += 1; }],
+    ["node-id", (metadata) => { metadata.node_id = "R_kgDOSameSlugReplacement"; }],
+    ["default-branch", (metadata) => { metadata.default_branch = "main"; }],
+  ]) {
+    const targetRoot = mkdtempSync(
+      join(tmpdir(), `codex-review-gate-final-rename-${name}-`),
+    );
+    const workflowsDirectory = join(targetRoot, ".github", "workflows");
+    const bridgePath = join(
+      targetRoot,
+      ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+    );
+    try {
+      initializeGitRepository(targetRoot);
+      const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
+      const replacement = structuredClone(receiptRepository);
+      mutate(replacement);
+      const finalClosureEnv = finalClosureGhEnvironment(targetRoot, {}, {
+        repositoryMetadataSequence: [
+          receiptRepository,
+          receiptRepository,
+          receiptRepository,
+          replacement,
+        ],
+      });
+      mkdirSync(workflowsDirectory, { recursive: true });
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+        CANONICAL_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+        CANONICAL_CONTROLLER_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+      // This requires an earlier CODEOWNERS mutation, so the fourth query is
+      // also a regression for drift after a preceding local mutation.
+      writeFileSync(join(targetRoot, ".github", "CODEOWNERS"), "# retained ownership\n", "utf8");
+
+      const result = runBootstrap([
+        "--prepare-worktree",
+        targetRoot,
+        "--remove-legacy-bridge",
+        ...finalClosureArgs,
+        "--apply",
+      ], { env: finalClosureEnv });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(
+        result.stderr,
+        /GitHub origin repository identity or default branch changed during immediately before legacy bridge quarantine rename/u,
+        name,
+      );
+      assert.match(result.stderr, /No workflow object was unlinked/u, name);
+      assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW, name);
+      const quarantineDirectories = readdirSync(workflowsDirectory, {
+        withFileTypes: true,
+      }).filter(
+        (entry) => entry.isDirectory() && entry.name.startsWith(".codex-review-gate-removal-"),
+      );
+      assert.equal(quarantineDirectories.length, 1, name);
+      assert.equal(
+        existsSync(join(
+          workflowsDirectory,
+          quarantineDirectories[0].name,
+          "canonical-legacy-bridge.yml",
+        )),
+        false,
+        name,
+      );
+      assert.doesNotMatch(result.stdout, /Applied: remove|Next:/u, name);
+    } finally {
+      rmSync(targetRoot, { recursive: true, force: true });
+    }
   }
 });
 
@@ -7882,7 +7967,9 @@ function finalClosureGhEnvironment(
   options = {},
   {
     repositoryMetadata = undefined,
-    originDriftOnSecondLiveQuery = undefined,
+    repositoryMetadataSequence = undefined,
+    originDriftOnLiveQuery = undefined,
+    originDriftTarget = "Joey-Tools/replaced-consumer",
   } = {},
 ) {
   const output = buildFinalClosureOutput(options);
@@ -7901,24 +7988,32 @@ function finalClosureGhEnvironment(
   const stateDir = join(targetRoot, ".final-closure-gh-state");
   const callLog = join(targetRoot, ".final-closure-gh-calls.log");
   createFakeGhExecutable(fakeBin);
-  const response = originDriftOnSecondLiveQuery === undefined
+  let responses = repositoryMetadataSequence === undefined
+    ? undefined
+    : [...repositoryMetadataSequence];
+  if (originDriftOnLiveQuery !== undefined) {
+    if (!Number.isSafeInteger(originDriftOnLiveQuery) || originDriftOnLiveQuery < 1) {
+      throw new Error("originDriftOnLiveQuery must be a one-based safe integer.");
+    }
+    responses ??= [];
+    while (responses.length < originDriftOnLiveQuery) {
+      responses.push(metadata);
+    }
+    responses[originDriftOnLiveQuery - 1] = {
+      __fake_origin_drift_to: originDriftTarget,
+      __fake_response: metadata,
+    };
+  }
+  const response = responses === undefined
     ? metadata
-    : {
-        __fake_sequence: [
-          metadata,
-          {
-            __fake_origin_drift_to: originDriftOnSecondLiveQuery,
-            __fake_response: metadata,
-          },
-        ],
-      };
+    : { __fake_sequence: responses };
   const environment = fakeGhEnvironment({
     fakeBin,
     responses: { [`repos/${originRepoSlug}`]: response },
     stateDir,
     callLog,
   });
-  return originDriftOnSecondLiveQuery === undefined
+  return originDriftOnLiveQuery === undefined
     ? environment
     : {
         ...environment,
