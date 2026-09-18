@@ -99,6 +99,22 @@ successful `stage` readback, replace that `null` with only
 `next_manifest_update.v2_ruleset.id`, review the now-complete manifest, and
 rerun `plan`.
 
+Hold an external organization-admin policy-mutation freeze from the stage
+preview through its apply, readback, and any recovery because an ambiguous
+POST may require no-receipt adoption. Establish an organization- and
+repository-admin freeze again for shared-rule activation, from its preview
+through stable post-write readback. Establish it a third time before the
+repository-cleanup preview and keep it continuously through the complete
+cleanup batch/readback, final old-rule preview/apply, and the separate final
+read-only verify receipt capture and validation.
+No administrator may change an organization/repository ruleset, classic branch
+protection, condition, required check or bypass actor during these freezes.
+GitHub's ruleset endpoint has no documented conditional/CAS update. Plan
+digests and adjacent rereads reject observed drift but cannot prevent a racing
+write in the final GET-to-PUT interval. Validate only the manifest-bound bypass
+actors; never claim that the runtime automatically discovers an actor added
+outside the bound snapshot.
+
 Execute the following state machine in order.
 
 1. For each member, replace the ordinary Phase 1 bootstrap calls with the
@@ -176,6 +192,27 @@ Execute the following state machine in order.
    rules from the old organization rule. Bind the returned
    `next_manifest_update.v2_ruleset.id` into the reviewed manifest and rerun
    `plan` before continuing.
+
+   If the POST might have committed but then fails, the helper first attempts
+   one read-only reconciliation. Treat returned `applied-recovered` plus
+   `next_manifest_update` as verified success. If the process was interrupted
+   or still reports an unknown outcome, do not repeat `stage --apply`. Keep
+   `v2_ruleset.id: null` and run the read-only recovery entry:
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode stage \
+     --recover-created-v2
+   ```
+
+   `--recover-created-v2` must not be combined with `--apply` or a digest. It
+   may emit `next_manifest_update` only for one unique same-name rule whose
+   source and entire writable payload equal canonical Disabled v2 while the
+   old organization rule remains at its exact before-state. Absent, multiple,
+   Active or drifted candidates are stop conditions. Hold an external
+   organization-admin policy-mutation freeze for the complete recovery read.
+   Never replay the POST.
 5. Preview and activate the new organization rule:
 
    ```bash
@@ -203,9 +240,17 @@ Execute the following state machine in order.
 
    Only after the activation apply returns its successful post-write
    dual-enforcement readback may every canary be closed without merging. Never
-   close a canary before `activate` completes. Later `derive-cutover` and
-   `verify` use post-activation cohort snapshots and do not require reopening
-   those PRs.
+   close a canary before `activate` completes. Later `derive-cutover`,
+   `apply-repository-cleanup`, and `verify` use post-activation cohort snapshots
+   and do not require reopening those PRs. They also do not require a current
+   default-branch head equal to the historical canary base. Treat the canary
+   receipt only as activation-bound evidence. Each later round instead reads
+   the live default branch and proves the current control-plane/ruleset
+   closure: exact repository identity; a complete regular-blob workflow
+   inventory containing only the three canonical workflows and no extra
+   producer; exact CODEOWNERS; default-read Actions policy with an explicit
+   boolean `can_approve_pull_request_reviews`; Active repository and
+   organization v2 rules; the temporary bridge; and cleanup state.
 6. Derive the cutover transaction read-only:
 
    ```bash
@@ -216,13 +261,38 @@ Execute the following state machine in order.
    jq . "$HANDOFF_CUTOVER_PLAN"
    ```
 
-   The helper never writes repository rulesets or classic branch protection.
-   Review and execute only the manifest-bound `external_repository_actions`,
-   then read every surface back. Each action may remove only
-   `codex/review-gate`; it must retain all non-legacy checks and strictness,
-   ruleset identity and targets, bypass actors, `deletion`,
-   `non_fast_forward` and unrelated rules. Stop before organization cutover
-   unless every action equals its exact `expected_after` snapshot.
+   Review the manifest-bound `external_repository_actions`. Each action may
+   remove only `codex/review-gate`; it must retain all non-legacy checks and
+   strictness, ruleset identity and targets, bypass actors, `deletion`,
+   `non_fast_forward` and unrelated rules. Do not execute the raw actions.
+   Start the continuous cleanup-to-final-verify external policy-mutation
+   freeze, then preview and run the controlled executor:
+
+   ```bash
+   HANDOFF_CLEANUP_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode apply-repository-cleanup > "$HANDOFF_CLEANUP_PREVIEW"
+   HANDOFF_CLEANUP_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_CLEANUP_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode apply-repository-cleanup \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_CLEANUP_PLAN_SHA256"
+   ```
+
+   For every planned item, require GET to match exact `expected_before`, use
+   the surface-specific mutation, and require a GET matching exact
+   `expected_after`. A stable mix of before and after items is resumable:
+   already-after items are no-ops, and a fresh preview plans only still-before
+   items. If any mutation reports an error or an unknown outcome, the executor
+   performs a narrow read-only reconciliation first. Exact after-state is
+   completed; before-state, drift or an unreadable result stops the batch. Run
+   a fresh preview under the freeze and review that state; never replay the old
+   request or digest blindly. Stop before organization cutover unless every
+   action is at exact `expected_after`.
 7. Preview and apply final organization cutover:
 
    ```bash
@@ -238,17 +308,48 @@ Execute the following state machine in order.
      --mode verify \
      --apply \
      --expected-plan-sha256 "$HANDOFF_VERIFY_PLAN_SHA256"
+   HANDOFF_FINAL_VERIFY=/absolute/path/to/final-read-only-verify.json
    node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
      --manifest "$HANDOFF_MANIFEST" \
-     --mode verify
+     --mode verify > "$HANDOFF_FINAL_VERIFY"
+   jq -e '
+     .schema_version == "organization-review-gate-handoff-output/v1" and
+     .mode == "verify" and
+     .status == "final-verified" and
+     .applied == false and
+     .action == null and
+     .final_closure_receipt.schema_version == 1 and
+     (.final_closure_receipt_sha256 | test("^[0-9a-f]{64}$"))
+   ' "$HANDOFF_FINAL_VERIFY"
+   HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256="$(jq -er \
+     '.final_closure_receipt_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_FINAL_VERIFY")"
    ```
 
    `verify --apply` is the only helper operation allowed to change the old
    organization ruleset. It removes the entire legacy-only required-status
    rule and must retain that ruleset's ID, name, conditions, enforcement,
    bypass actors, `deletion`, `non_fast_forward` and every other field. It
-   never deletes the ruleset. Require the final read-only `verify` to report
-   the already-complete state.
+   never deletes the ruleset. Keep the external policy-mutation freeze in
+   force beyond that apply/readback through a distinct final read-only
+   `verify`, because the control plane can drift after the mutating command's
+   `applied-final-verified` boundary. Admit only an output with top-level
+   `schema_version: "organization-review-gate-handoff-output/v1"`,
+   `mode: "verify"`, `status: "final-verified"`, `applied: false`, and
+   `action: null`, plus `final_closure_receipt.schema_version: 1` and a
+   lowercase 64-hex `final_closure_receipt_sha256`. The embedded receipt must
+   bind the organization, reviewed manifest digest, final snapshot digest,
+   legacy/v2 ruleset IDs and states, and the exact repository cohort. Preserve
+   the complete JSON output in `HANDOFF_FINAL_VERIFY`; an extracted embedded
+   receipt is not a valid input to the bootstrap.
+
+   The third freeze ends only after that file and its top-level shape have
+   been validated. If this read is inconclusive or any bound policy differs,
+   keep every bridge, resolve the drift, and repeat the final read-only verify
+   under the freeze. If a known organization/repository policy mutation occurs
+   after capture but before removal preparation, discard the old proof and
+   mint a fresh final read-only output under a new freeze. Never substitute
+   the `verify --apply` response or reuse a known-stale receipt.
 8. Only after step 7 closes successfully, prepare a separate bridge-removal PR
    in every member from a clean worktree:
 
@@ -256,13 +357,26 @@ Execute the following state machine in order.
    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
      --prepare-worktree "$TARGET_ROOT" \
      --remove-legacy-bridge \
+     --final-closure-receipt "$HANDOFF_FINAL_VERIFY" \
+     --expected-final-closure-receipt-sha256 \
+     "$HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256" \
      --control-plane-owner "$CONTROL_PLANE_OWNER"
    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
      --prepare-worktree "$TARGET_ROOT" \
      --remove-legacy-bridge \
+     --final-closure-receipt "$HANDOFF_FINAL_VERIFY" \
+     --expected-final-closure-receipt-sha256 \
+     "$HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256" \
      --control-plane-owner "$CONTROL_PLANE_OWNER" \
      --apply
    ```
+
+   `--final-closure-receipt` takes the complete final read-only verify output,
+   despite the singular option name. The bootstrap validates its terminal
+   top-level fields, recomputes the canonical embedded receipt digest, compares
+   the explicit expected SHA-256, and binds the target worktree's GitHub
+   `origin` to an exact repository entry in that receipt. Stop on any mismatch;
+   do not edit the receipt, change `origin`, or bypass this proof.
 
    An absent bridge makes the bridge-removal component an idempotent no-op. An
    existing non-canonical bridge is rejected. The command as a whole also

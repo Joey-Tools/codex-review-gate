@@ -3881,7 +3881,14 @@ superseded_by: 20260918-organization-v2-handoff
   shows a GitHub Release for every full version while the Marketplace listed
   only selected versions (`v1.2.1`, `v1.3.5`, and `v1.5.1`).
 
-## Next Steps
+## Historical Next Steps (completed or superseded)
+
+The bullets below record the release checkpoint as it existed when this
+completed journal was written; they are not a current execution checklist.
+Stable `v2.0.0` and the floating `v2` alias have since been published. Current
+consumer-transition work is tracked in
+`docs/project_journal/2026/09/2026-09-18-organization-v2-handoff.md`; the
+separate manual Marketplace item remains in `docs/PROJECT_TODO.md`.
 
 - Preserve exact-head acceptance: any implementation or contract change after
   the clean checkpoint above requires a new full-range review. The

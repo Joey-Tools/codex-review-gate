@@ -38,7 +38,7 @@ const CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT = [
   "  statuses: write",
   "",
   "concurrency:",
-  "  group: codex-review-gate-legacy-bridge-${{ github.repository }}",
+  "  group: codex-review-gate-${{ github.repository }}",
   "  cancel-in-progress: false",
   "",
   "jobs:",
@@ -151,6 +151,262 @@ export function parseRepoSlug(value) {
     repo: parts[1],
     slug: `${parts[0]}/${parts[1]}`,
   };
+}
+
+export function parseGitHubRepositoryRemote(value) {
+  if (typeof value !== "string" || value.trim() === "" || /[\0\r\n]/u.test(value)) {
+    throw new Error("Git origin must be one unambiguous GitHub repository URL.");
+  }
+  const remote = value.trim();
+  const scpMatch = remote.match(/^git@github\.com:([^/:]+)\/([^/]+?)(?:\.git)?$/u);
+  if (scpMatch !== null) {
+    return parseRepoSlug(`${scpMatch[1]}/${scpMatch[2]}`);
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(remote);
+  } catch {
+    throw new Error(`Git origin is not a supported GitHub repository URL: ${value}`);
+  }
+  if (
+    !new Set(["https:", "ssh:"]).has(parsed.protocol) ||
+    parsed.hostname.toLowerCase() !== "github.com" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  ) {
+    throw new Error(`Git origin is not a supported GitHub repository URL: ${value}`);
+  }
+  if (
+    (parsed.protocol === "https:" && parsed.username !== "") ||
+    (parsed.protocol === "ssh:" && !new Set(["", "git"]).has(parsed.username))
+  ) {
+    throw new Error(`Git origin contains an unsupported credential or user: ${value}`);
+  }
+  const match = parsed.pathname.match(/^\/([^/]+)\/([^/]+?)(?:\.git)?$/u);
+  if (match === null) {
+    throw new Error(`Git origin is not one GitHub repository path: ${value}`);
+  }
+  let owner;
+  let repo;
+  try {
+    owner = decodeURIComponent(match[1]);
+    repo = decodeURIComponent(match[2]);
+  } catch {
+    throw new Error(`Git origin contains invalid percent encoding: ${value}`);
+  }
+  return parseRepoSlug(`${owner}/${repo}`);
+}
+
+export function validateOrganizationFinalClosureOutput(output) {
+  assertPlainReceiptObject(output, "Organization handoff output");
+  if (output.schema_version !== "organization-review-gate-handoff-output/v1") {
+    throw new Error(
+      "Organization handoff output schema_version is not the supported final-closure format.",
+    );
+  }
+  if (output.mode !== "verify" || output.status !== "final-verified") {
+    throw new Error(
+      'Organization handoff output must be a successful final read-only verify result with mode "verify" and status "final-verified".',
+    );
+  }
+  if (output.applied !== false) {
+    throw new Error(
+      "Organization handoff output must be a read-only final verify result with applied false.",
+    );
+  }
+  if (output.action !== null) {
+    throw new Error(
+      "Organization handoff output must be the final read-only verify result with action null.",
+    );
+  }
+  assertReceiptSha256(output.manifest_sha256, "manifest_sha256");
+  assertReceiptSha256(output.snapshot_sha256, "snapshot_sha256");
+  assertReceiptSha256(
+    output.final_closure_receipt_sha256,
+    "final_closure_receipt_sha256",
+  );
+  const receipt = validateOrganizationFinalClosureReceipt(
+    output.final_closure_receipt,
+  );
+  if (
+    canonicalJson(output.organization) !== canonicalJson(receipt.organization) ||
+    output.manifest_sha256 !== receipt.manifest_sha256 ||
+    output.snapshot_sha256 !== receipt.snapshot_sha256
+  ) {
+    throw new Error(
+      "Organization handoff output and final closure receipt disagree on their bound organization or snapshot.",
+    );
+  }
+  if (
+    !Number.isSafeInteger(output.repositories_verified) ||
+    output.repositories_verified !== receipt.repositories.length
+  ) {
+    throw new Error(
+      "Organization handoff output repositories_verified does not match the final closure receipt.",
+    );
+  }
+  return {
+    receipt,
+    claimedSha256: output.final_closure_receipt_sha256,
+  };
+}
+
+export function canonicalOrganizationFinalClosureReceipt(receipt) {
+  const canonical = validateOrganizationFinalClosureReceipt(receipt);
+  return canonicalJson(canonical);
+}
+
+export function validateOrganizationFinalClosureReceipt(receipt) {
+  assertPlainReceiptObject(receipt, "Organization final closure receipt");
+  assertExactReceiptKeys(
+    receipt,
+    [
+      "schema_version",
+      "organization",
+      "manifest_sha256",
+      "snapshot_sha256",
+      "legacy_ruleset",
+      "v2_ruleset",
+      "repositories",
+    ],
+    "Organization final closure receipt",
+  );
+  if (receipt.schema_version !== 1) {
+    throw new Error("Organization final closure receipt schema_version must be 1.");
+  }
+  const organization = validateReceiptOrganization(receipt.organization);
+  assertReceiptSha256(receipt.manifest_sha256, "receipt manifest_sha256");
+  assertReceiptSha256(receipt.snapshot_sha256, "receipt snapshot_sha256");
+  const legacyRuleset = validateReceiptRuleset(
+    receipt.legacy_ruleset,
+    "after",
+    "legacy_ruleset",
+  );
+  const v2Ruleset = validateReceiptRuleset(
+    receipt.v2_ruleset,
+    "active",
+    "v2_ruleset",
+  );
+  if (legacyRuleset.id === v2Ruleset.id) {
+    throw new Error("Organization final closure receipt ruleset IDs must be distinct.");
+  }
+  if (!Array.isArray(receipt.repositories) || receipt.repositories.length === 0) {
+    throw new Error(
+      "Organization final closure receipt repositories must be a non-empty array.",
+    );
+  }
+  const repositories = receipt.repositories.map((repository, index) =>
+    validateReceiptRepository(repository, organization, index)
+  );
+  const slugs = new Set();
+  const ids = new Set();
+  const nodeIds = new Set();
+  for (const repository of repositories) {
+    const foldedSlug = repository.full_name.toLowerCase();
+    if (
+      slugs.has(foldedSlug) ||
+      ids.has(repository.id) ||
+      nodeIds.has(repository.node_id)
+    ) {
+      throw new Error(
+        "Organization final closure receipt contains duplicate repository identities.",
+      );
+    }
+    slugs.add(foldedSlug);
+    ids.add(repository.id);
+    nodeIds.add(repository.node_id);
+  }
+  return {
+    schema_version: 1,
+    organization,
+    manifest_sha256: receipt.manifest_sha256,
+    snapshot_sha256: receipt.snapshot_sha256,
+    legacy_ruleset: legacyRuleset,
+    v2_ruleset: v2Ruleset,
+    repositories,
+  };
+}
+
+function validateReceiptOrganization(value) {
+  assertPlainReceiptObject(value, "Receipt organization");
+  assertExactReceiptKeys(value, ["login", "id", "node_id"], "Receipt organization");
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u.test(value.login)) {
+    throw new Error("Receipt organization login is invalid.");
+  }
+  assertPositiveReceiptId(value.id, "Receipt organization id");
+  assertReceiptText(value.node_id, "Receipt organization node_id");
+  return { login: value.login, id: value.id, node_id: value.node_id };
+}
+
+function validateReceiptRuleset(value, expectedState, label) {
+  assertPlainReceiptObject(value, `Receipt ${label}`);
+  assertExactReceiptKeys(value, ["id", "state"], `Receipt ${label}`);
+  assertPositiveReceiptId(value.id, `Receipt ${label} id`);
+  if (value.state !== expectedState) {
+    throw new Error(`Receipt ${label} state must be ${expectedState}.`);
+  }
+  return { id: value.id, state: value.state };
+}
+
+function validateReceiptRepository(value, organization, index) {
+  const label = `Receipt repository ${index + 1}`;
+  assertPlainReceiptObject(value, label);
+  assertExactReceiptKeys(
+    value,
+    ["full_name", "id", "node_id", "default_branch"],
+    label,
+  );
+  const parsed = parseRepoSlug(value.full_name);
+  if (parsed.owner.toLowerCase() !== organization.login.toLowerCase()) {
+    throw new Error(`${label} is outside the receipt organization.`);
+  }
+  assertPositiveReceiptId(value.id, `${label} id`);
+  assertReceiptText(value.node_id, `${label} node_id`);
+  assertReceiptText(value.default_branch, `${label} default_branch`);
+  return {
+    full_name: parsed.slug,
+    id: value.id,
+    node_id: value.node_id,
+    default_branch: value.default_branch,
+  };
+}
+
+function assertPlainReceiptObject(value, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+}
+
+function assertExactReceiptKeys(value, keys, label) {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (canonicalJson(actual) !== canonicalJson(expected)) {
+    throw new Error(`${label} has an unexpected or missing field.`);
+  }
+}
+
+function assertPositiveReceiptId(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive safe integer.`);
+  }
+}
+
+function assertReceiptText(value, label) {
+  if (
+    typeof value !== "string" ||
+    value === "" ||
+    /[\0\r\n]/u.test(value)
+  ) {
+    throw new Error(`${label} must be non-empty text without control newlines.`);
+  }
+}
+
+function assertReceiptSha256(value, label) {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) {
+    throw new Error(`${label} must be an exact lowercase SHA-256.`);
+  }
 }
 
 export function normalizeControlPlaneOwner(value) {

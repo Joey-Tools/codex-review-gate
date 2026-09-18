@@ -29,10 +29,12 @@ import {
   deriveLegacyOrganizationCutoverPayload,
   deriveRepositoryCleanupAction,
   loadStableSnapshots,
+  mapWithConcurrency,
+  parseWorkflowRunPath,
   runCli,
   sha256Canonical,
+  validateCanaryPullGraphqlResponse,
   validateLegacyStatusPages,
-  validateCanaryPullResponse,
   validateDefaultBranchResponse,
   validateManifest,
   validateV2CheckRunResponse,
@@ -247,23 +249,26 @@ function assertManifestRejected(mutator, pattern) {
   assert.throws(() => validateManifest(manifest), pattern);
 }
 
-function canaryPullResponse(repo) {
+function canaryPullGraphqlResponse(repo) {
   return {
-    number: repo.canary.pull_number,
-    state: "open",
-    merged: false,
-    draft: false,
-    head: {
-      sha: repo.canary.head_sha,
-      repo: { full_name: repo.slug },
+    data: {
+      repository: {
+        pullRequest: {
+          number: repo.canary.pull_number,
+          state: "OPEN",
+          merged: false,
+          isDraft: false,
+          mergeable: "MERGEABLE",
+          headRefOid: repo.canary.head_sha,
+          baseRefName: repo.default_branch,
+          baseRefOid: repo.canary.base_sha,
+          headRepository: { nameWithOwner: repo.slug },
+          baseRepository: { nameWithOwner: repo.slug },
+          potentialMergeCommit: { oid: repo.canary.test_merge_sha },
+          changedFiles: 1,
+        },
+      },
     },
-    base: {
-      ref: repo.default_branch,
-      sha: repo.canary.base_sha,
-      repo: { full_name: repo.slug },
-    },
-    merge_commit_sha: repo.canary.test_merge_sha,
-    changed_files: 1,
   };
 }
 
@@ -308,6 +313,60 @@ function legacyStatusPages(repo, { newerLegacyContext = null } = {}) {
     });
   }
   return [statuses];
+}
+
+function effectiveStatusRule({ id, sourceType, source, context }) {
+  return {
+    type: "required_status_checks",
+    ruleset_id: id,
+    ruleset_source: source,
+    ruleset_source_type: sourceType,
+    parameters: statusRule([context]).parameters,
+  };
+}
+
+function effectiveBranchRules(repository, manifest, {
+  v2State,
+  legacyState,
+  cleanupState,
+}) {
+  const rules = [
+    effectiveStatusRule({
+      id: repository.v2_ruleset.id,
+      sourceType: "Repository",
+      source: repository.slug,
+      context: V2_STATUS_CONTEXT,
+    }),
+  ];
+  if (legacyState === "before") {
+    rules.push(effectiveStatusRule({
+      id: manifest.legacy_ruleset.id,
+      sourceType: "Organization",
+      source: manifest.organization.login,
+      context: LEGACY_STATUS_CONTEXT,
+    }));
+  }
+  if (v2State === "active") {
+    rules.push(effectiveStatusRule({
+      id: manifest.v2_ruleset.id,
+      sourceType: "Organization",
+      source: manifest.organization.login,
+      context: V2_STATUS_CONTEXT,
+    }));
+  }
+  if (cleanupState === "before") {
+    for (const action of repository.legacy_cleanup) {
+      if (action.surface === "repository_ruleset") {
+        rules.push(effectiveStatusRule({
+          id: action.ruleset_id,
+          sourceType: "Repository",
+          source: repository.slug,
+          context: LEGACY_STATUS_CONTEXT,
+        }));
+      }
+    }
+  }
+  return rules;
 }
 
 function gitBlobSha(bytes) {
@@ -374,6 +433,14 @@ function createFakeGhHarness(
     defaultWorkflowPermissions = "read",
     newerLegacyStatusContext = null,
     unexpectedWorkflowTree = false,
+    postActivationHeadSha = null,
+    detailedCleanupState = false,
+    cleanupMutationErrorAt = null,
+    cleanupMutationFailureAt = null,
+    stageCreateResponse = "valid",
+    extraEffectiveRules = [],
+    extraEffectiveSecondPageRules = [],
+    mutateEffectiveRules = null,
   } = {},
 ) {
   const { manifest, codeownersBytes } = integrationManifestFixture();
@@ -384,8 +451,11 @@ function createFakeGhHarness(
   const v2StatePath = join(directory, "v2-state");
   const legacyStatePath = join(directory, "legacy-state");
   const cleanupStatePath = join(directory, "cleanup-state");
+  const cleanupActionStatePaths = [];
   const responses = new Map();
   const cleanupResponses = [];
+  const effectiveBranchResponses = [];
+  const graphQlResponses = [];
   const notFoundEndpoints = [];
   const workflowBytes = Object.fromEntries(
     Object.entries(CANONICAL_WORKFLOW_IDENTITIES).map(([key, identity]) => [
@@ -402,6 +472,7 @@ function createFakeGhHarness(
 
   for (const [repositoryIndex, repository] of manifest.repositories.entries()) {
     const encodedSlug = encodeEndpointPathForTest(repository.slug);
+    const controlPlaneHead = postActivationHeadSha ?? repository.canary.base_sha;
     addFakeResponse(responses, `repos/${encodedSlug}`, {
       full_name: repository.slug,
       id: repository.id,
@@ -421,7 +492,7 @@ function createFakeGhHarness(
       `repos/${encodedSlug}/branches/${encodeURIComponent(repository.default_branch)}`,
       {
         name: repository.default_branch,
-        commit: { sha: repository.canary.base_sha },
+        commit: { sha: controlPlaneHead },
       },
     );
 
@@ -463,9 +534,9 @@ function createFakeGhHarness(
     }
     addFakeResponse(
       responses,
-      `repos/${encodedSlug}/git/trees/${repository.canary.base_sha}`,
+      `repos/${encodedSlug}/git/trees/${controlPlaneHead}`,
       {
-        sha: repository.canary.base_sha,
+        sha: controlPlaneHead,
         truncated: false,
         tree: [{
           path: ".github",
@@ -513,7 +584,7 @@ function createFakeGhHarness(
     for (const [key, identity] of Object.entries(repository.workflows)) {
       addFakeResponse(
         responses,
-        `repos/${encodedSlug}/contents/${encodeEndpointPathForTest(identity.path)}?ref=${encodeURIComponent(repository.default_branch)}`,
+        `repos/${encodedSlug}/contents/${encodeEndpointPathForTest(identity.path)}?ref=${encodeURIComponent(controlPlaneHead)}`,
         {
           type: "file",
           path: identity.path,
@@ -525,7 +596,7 @@ function createFakeGhHarness(
     }
     addFakeResponse(
       responses,
-      `repos/${encodedSlug}/contents/${encodeEndpointPathForTest(repository.codeowners.path)}?ref=${encodeURIComponent(repository.default_branch)}`,
+      `repos/${encodedSlug}/contents/${encodeEndpointPathForTest(repository.codeowners.path)}?ref=${encodeURIComponent(controlPlaneHead)}`,
       {
         type: "file",
         path: repository.codeowners.path,
@@ -565,8 +636,19 @@ function createFakeGhHarness(
       source: repository.slug,
       enforcement: repository.v2_ruleset.expected.enforcement,
     }];
-    for (const action of repository.legacy_cleanup) {
+    for (const [actionIndex, action] of repository.legacy_cleanup.entries()) {
       assert.equal(action.surface, "repository_ruleset");
+      const actionStatePath = join(
+        directory,
+        `cleanup-action-${repositoryIndex}-${actionIndex}`,
+      );
+      const actionOrdinal = cleanupActionStatePaths.length;
+      cleanupActionStatePaths.push({
+        repository: repository.slug,
+        surface: `repository_ruleset:${action.ruleset_id}`,
+        path: actionStatePath,
+        ordinal: actionOrdinal,
+      });
       localRulesetSummaries.push({
         id: action.ruleset_id,
         name: action.expected_before.name,
@@ -577,6 +659,10 @@ function createFakeGhHarness(
       cleanupResponses.push({
         request:
           `GET:repos/${encodedSlug}/rulesets/${action.ruleset_id}?includes_parents=false`,
+        mutationRequest:
+          `PUT:repos/${encodedSlug}/rulesets/${action.ruleset_id}`,
+        statePath: actionStatePath,
+        ordinal: actionOrdinal,
         before: JSON.stringify(
           completeRulesetResponse(
             action.ruleset_id,
@@ -600,18 +686,57 @@ function createFakeGhHarness(
       `repos/${encodedSlug}/rulesets?includes_parents=false&per_page=100`,
       [localRulesetSummaries],
     );
+    const effectiveResponseByState = {};
+    for (const v2State of ["absent", "disabled", "active"]) {
+      for (const legacyState of ["before", "after"]) {
+        for (const cleanupState of ["before", "after"]) {
+          let rules = effectiveBranchRules(repository, manifest, {
+            v2State,
+            legacyState,
+            cleanupState,
+          });
+          if (repositoryIndex === 0) {
+            rules = [...rules, ...clone(extraEffectiveRules)];
+            if (mutateEffectiveRules !== null) {
+              rules = mutateEffectiveRules(clone(rules), {
+                v2State,
+                legacyState,
+                cleanupState,
+              });
+            }
+          }
+          effectiveResponseByState[`${v2State}:${legacyState}:${cleanupState}`] =
+            JSON.stringify([
+              rules,
+              ...(repositoryIndex === 0 && extraEffectiveSecondPageRules.length > 0
+                ? [clone(extraEffectiveSecondPageRules)]
+                : []),
+            ]);
+        }
+      }
+    }
+    effectiveBranchResponses.push({
+      request: `GET:repos/${encodedSlug}/rules/branches/${encodeURIComponent(repository.default_branch)}?per_page=100`,
+      cleanupStatePath:
+        detailedCleanupState && repository.legacy_cleanup.length === 1
+          ? cleanupActionStatePaths.at(-1).path
+          : null,
+      byState: effectiveResponseByState,
+    });
 
-    const pullResponse = canaryPullResponse(repository);
-    if (canaryState === "closed") {
-      pullResponse.state = "closed";
-    } else {
+    if (canaryState !== "closed") {
       assert.equal(canaryState, "open");
     }
-    addFakeResponse(
-      responses,
-      `repos/${encodedSlug}/pulls/${repository.canary.pull_number}`,
-      pullResponse,
-    );
+    const graphQlResponse = canaryPullGraphqlResponse(repository);
+    if (canaryState === "closed") {
+      graphQlResponse.data.repository.pullRequest.state = "CLOSED";
+    }
+    graphQlResponses.push({
+      owner: repository.slug.split("/")[0],
+      repositoryName: repository.slug.split("/")[1],
+      pullNumber: repository.canary.pull_number,
+      response: JSON.stringify(graphQlResponse),
+    });
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/pulls/${repository.canary.pull_number}/files?per_page=100`,
@@ -679,6 +804,14 @@ function createFakeGhHarness(
           repositoryIndex === 0 ? newerLegacyStatusContext : null,
       }),
     );
+    addFakeResponse(
+      responses,
+      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/statuses?per_page=100&page=1`,
+      legacyStatusPages(repository, {
+        newerLegacyContext:
+          repositoryIndex === 0 ? newerLegacyStatusContext : null,
+      })[0],
+    );
     notFoundEndpoints.push(
       `GET:repos/${encodedSlug}/branches/${encodeURIComponent(repository.default_branch)}/protection/required_status_checks`,
     );
@@ -723,6 +856,10 @@ function createFakeGhHarness(
   const orgRulesetCollection = `orgs/${encodedOrganization}/rulesets`;
   const legacyEndpoint = `${orgRulesetCollection}/${manifest.legacy_ruleset.id}`;
   const v2Endpoint = `${orgRulesetCollection}/${manifest.v2_ruleset.id}`;
+  const stagePostResponse =
+    stageCreateResponse === "invalid"
+      ? JSON.stringify({ id: "invalid-created-ruleset" })
+      : v2Complete(v2Disabled);
 
   const scriptLines = [
     "#!/bin/sh",
@@ -748,7 +885,7 @@ function createFakeGhHarness(
     'case "$request" in',
     `  ${shellQuote(`POST:${orgRulesetCollection}`)})`,
     '    printf \'%s\\n\' \'disabled\' > "${FAKE_GH_V2_STATE:?}"',
-    `    respond ${shellQuote(v2Complete(v2Disabled))} ;;`,
+    `    respond ${shellQuote(stagePostResponse)} ;;`,
     `  ${shellQuote(`PUT:${v2Endpoint}`)})`,
     '    printf \'%s\\n\' \'active\' > "${FAKE_GH_V2_STATE:?}"',
     `    respond ${shellQuote(v2Complete(v2Active))} ;;`,
@@ -780,12 +917,76 @@ function createFakeGhHarness(
     "esac",
   ];
 
+  if (graphQlResponses.length > 0) {
+    scriptLines.push(
+      'if [ "$request" = "POST:graphql" ]; then',
+      '  case "$body" in',
+    );
+    for (const response of graphQlResponses) {
+      const variablesToken = `"variables":{"owner":"${response.owner}","name":"${response.repositoryName}","number":${response.pullNumber}}`;
+      scriptLines.push(
+        `    *${shellQuote(variablesToken)}*) respond ${shellQuote(response.response)} ;;`,
+      );
+    }
+    scriptLines.push(
+      "    *) printf '%s\\n' 'unexpected fake GraphQL variables' >&2; exit 2 ;;",
+      "  esac",
+      "fi",
+    );
+  }
+
+  if (effectiveBranchResponses.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const response of effectiveBranchResponses) {
+      const cleanupStateExpression =
+        response.cleanupStatePath === null
+          ? '$(cat "${FAKE_GH_CLEANUP_STATE:?}")'
+          : `$(cat ${shellQuote(response.cleanupStatePath)})`;
+      scriptLines.push(
+        `  ${shellQuote(response.request)})`,
+        `    state="$(cat \"\${FAKE_GH_V2_STATE:?}\"):$(cat \"\${FAKE_GH_LEGACY_STATE:?}\"):${cleanupStateExpression}"`,
+        '    case "$state" in',
+      );
+      for (const [state, payload] of Object.entries(response.byState)) {
+        scriptLines.push(
+          `      ${shellQuote(state)}) respond ${shellQuote(JSON.stringify(JSON.parse(payload)))} ;;`,
+        );
+      }
+      scriptLines.push(
+        "      *) printf '%s\\n' 'invalid fake effective branch-rule state' >&2; exit 2 ;;",
+        "    esac ;;",
+      );
+    }
+    scriptLines.push("esac");
+  }
+
   if (cleanupResponses.length > 0) {
     scriptLines.push('case "$request" in');
     for (const response of cleanupResponses) {
+      const cleanupStateFile = detailedCleanupState
+        ? shellQuote(response.statePath)
+        : '"${FAKE_GH_CLEANUP_STATE:?}"';
+      scriptLines.push(
+        `  ${shellQuote(response.mutationRequest)})`,
+      );
+      if (cleanupMutationFailureAt === response.ordinal) {
+        scriptLines.push(
+          "    printf '%s\\n' 'simulated cleanup mutation failure' >&2; exit 1 ;;",
+        );
+      } else if (cleanupMutationErrorAt === response.ordinal) {
+        scriptLines.push(
+          `    printf '%s\\n' 'after' > ${cleanupStateFile}`,
+          "    printf '%s\\n' 'simulated ambiguous cleanup mutation result' >&2; exit 1 ;;",
+        );
+      } else {
+        scriptLines.push(
+          `    printf '%s\\n' 'after' > ${cleanupStateFile}`,
+          `    respond ${shellQuote(response.after)} ;;`,
+        );
+      }
       scriptLines.push(
         `  ${shellQuote(response.request)})`,
-        '    case "$(cat "${FAKE_GH_CLEANUP_STATE:?}")" in',
+        `    case "$(cat ${cleanupStateFile})" in`,
         `      before) respond ${shellQuote(response.before)} ;;`,
         `      after) respond ${shellQuote(response.after)} ;;`,
         "      *) printf '%s\\n' 'invalid fake cleanup state' >&2; exit 2 ;;",
@@ -820,6 +1021,11 @@ function createFakeGhHarness(
   writeFileSync(v2StatePath, "absent\n");
   writeFileSync(legacyStatePath, "before\n");
   writeFileSync(cleanupStatePath, "before\n");
+  if (detailedCleanupState) {
+    for (const action of cleanupActionStatePaths) {
+      writeFileSync(action.path, "before\n");
+    }
+  }
 
   const previousEnvironment = new Map(
     ["PATH", "FAKE_GH_LOG", "FAKE_GH_V2_STATE", "FAKE_GH_LEGACY_STATE", "FAKE_GH_CLEANUP_STATE"]
@@ -850,6 +1056,7 @@ function createFakeGhHarness(
     v2StatePath,
     legacyStatePath,
     cleanupStatePath,
+    cleanupActionStatePaths,
   };
 }
 
@@ -906,7 +1113,9 @@ async function runFakeCli(
 }
 
 function mutationRequests(requests) {
-  return requests.filter(({ method }) => method !== "GET");
+  return requests.filter(
+    ({ method, endpoint }) => method !== "GET" && endpoint !== "graphql",
+  );
 }
 
 function countRequest(requests, method, endpoint) {
@@ -938,8 +1147,8 @@ test("exports the closed organization handoff protocol constants", () => {
     },
     legacy_bridge: {
       path: ".github/workflows/codex-review-gate-legacy-bridge.yml",
-      git_blob_sha: "9d894030ca760569c34877baf3812d6e11980af8",
-      sha256: "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6",
+      git_blob_sha: "93aa3fef47034818bb5dfb0e5bdb7dfc3a129831",
+      sha256: "fce11cfef497fd37af6693221519ba73fc91b00da7e0cd148f10094829866730",
     },
   });
 });
@@ -969,7 +1178,10 @@ test("CLI help is read-only and invalid apply shapes fail before reading a manif
   );
   assert.equal(invalidMode.status, 1);
   assert.equal(invalidMode.stdout, "");
-  assert.match(invalidMode.stderr, /--apply is valid only with stage, activate, or verify mode/u);
+  assert.match(
+    invalidMode.stderr,
+    /--apply is valid only with stage, activate, apply-repository-cleanup, or verify mode/u,
+  );
 
   const missingDigest = spawnSync(
     process.execPath,
@@ -1066,7 +1278,9 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     "required_status_checks",
   ]);
   assert.equal(writes[0].body.enforcement, "disabled");
-  let mutationIndex = requests.findIndex(({ method }) => method !== "GET");
+  let mutationIndex = requests.findIndex(
+    ({ method, endpoint }) => method !== "GET" && endpoint !== "graphql",
+  );
   assert.ok(mutationIndex > 0);
   assert.ok(
     countRequest(
@@ -1142,7 +1356,9 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   assert.deepEqual(writes[0].body.rules.map(({ type }) => type), [
     "required_status_checks",
   ]);
-  mutationIndex = requests.findIndex(({ method }) => method !== "GET");
+  mutationIndex = requests.findIndex(
+    ({ method, endpoint }) => method !== "GET" && endpoint !== "graphql",
+  );
   const activationBefore = requests.slice(0, mutationIndex);
   const activationAfter = requests.slice(mutationIndex + 1);
   for (const repository of boundManifest.repositories) {
@@ -1201,7 +1417,11 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
       const endpoint = action.surface === "repository_ruleset"
         ? `repos/${encodeEndpointPathForTest(repository.slug)}/rulesets/${action.ruleset_id}`
         : `repos/${encodeEndpointPathForTest(repository.slug)}/branches/${encodeURIComponent(repository.default_branch)}/protection/required_status_checks`;
-      const method = derived.operation === "delete" ? "DELETE" : "PUT";
+      const method = derived.operation === "delete"
+        ? "DELETE"
+        : action.surface === "repository_ruleset"
+          ? "PUT"
+          : "PATCH";
       const expected = {
         repository: repository.slug,
         surface: action.surface,
@@ -1215,7 +1435,7 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
           endpoint,
         },
       };
-      if (method === "PUT") {
+      if (method !== "DELETE") {
         expected.mutation.payload = action.expected_after;
         expected.mutation.payload_sha256 = sha256Canonical(action.expected_after);
       }
@@ -1228,7 +1448,8 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   assert.equal(expectedRepositoryActions.length, 9);
   assert.deepEqual(cutoverPlan.external_repository_actions, expectedRepositoryActions);
   assert.deepEqual(cutoverPlan.sequencing, [
-    "execute-and-read-back-external-repository-actions",
+    "apply-repository-cleanup-preview",
+    "apply-repository-cleanup-with-exact-plan-digest",
     "run-verify-preview",
     "run-verify-apply-with-exact-plan-digest",
     "run-verify-again-for-final-two-read-closure",
@@ -1243,7 +1464,23 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   });
   assert.match(cutoverPlan.plan_sha256, /^[0-9a-f]{64}$/u);
 
-  writeFileSync(harness.cleanupStatePath, "after\n");
+  writeFileSync(harness.logPath, "");
+  const cleanupPreview = await runFakeCli(harness, "apply-repository-cleanup");
+  assert.equal(cleanupPreview.status, "preview");
+  assert.equal(cleanupPreview.external_repository_actions.length, 9);
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+
+  writeFileSync(harness.logPath, "");
+  const cleanupApplied = await runFakeCli(harness, "apply-repository-cleanup", [
+    "--apply",
+    "--expected-plan-sha256",
+    cleanupPreview.plan_sha256,
+  ]);
+  assert.equal(cleanupApplied.status, "applied-repository-cleanup-verified");
+  writes = mutationRequests(fakeGhRequests(harness.logPath));
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].method, "PUT");
+
   writeFileSync(harness.logPath, "");
   const verifyPreview = await runFakeCli(harness, "verify");
   assert.equal(verifyPreview.status, "preview-cutover-ready");
@@ -1288,7 +1525,9 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     writes[0].body.rules.some(({ type }) => type === "required_status_checks"),
     false,
   );
-  mutationIndex = requests.findIndex(({ method }) => method !== "GET");
+  mutationIndex = requests.findIndex(
+    ({ method, endpoint }) => method !== "GET" && endpoint !== "graphql",
+  );
   const cutoverBefore = requests.slice(0, mutationIndex);
   const cutoverAfter = requests.slice(mutationIndex + 1);
   assert.ok(
@@ -1315,6 +1554,32 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   assert.equal(verifyCompletePreview.status, "final-verified");
   assert.equal(verifyCompletePreview.applied, false);
   assert.equal(verifyCompletePreview.action, null);
+  assert.deepEqual(verifyCompletePreview.final_closure_receipt, {
+    schema_version: 1,
+    organization: boundManifest.organization,
+    manifest_sha256: sha256Canonical(boundManifest),
+    snapshot_sha256: verifyCompletePreview.snapshot_sha256,
+    legacy_ruleset: {
+      id: boundManifest.legacy_ruleset.id,
+      state: "after",
+    },
+    v2_ruleset: {
+      id: boundManifest.v2_ruleset.id,
+      state: "active",
+    },
+    repositories: boundManifest.repositories
+      .map(({ slug, id, node_id, default_branch }) => ({
+        full_name: slug,
+        id,
+        node_id,
+        default_branch,
+      }))
+      .sort((left, right) => left.full_name.localeCompare(right.full_name)),
+  });
+  assert.equal(
+    verifyCompletePreview.final_closure_receipt_sha256,
+    sha256Canonical(verifyCompletePreview.final_closure_receipt),
+  );
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 
   writeFileSync(harness.logPath, "");
@@ -1326,6 +1591,10 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   assert.equal(verifyCompleteApply.status, "final-verified");
   assert.equal(verifyCompleteApply.applied, false);
   assert.equal(verifyCompleteApply.action, null);
+  assert.equal(
+    verifyCompleteApply.final_closure_receipt_sha256,
+    verifyCompletePreview.final_closure_receipt_sha256,
+  );
   assert.deepEqual(
     mutationRequests(fakeGhRequests(harness.logPath)),
     [],
@@ -1353,6 +1622,285 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     [],
     "manifest-bound organization drift must fail before any write",
   );
+});
+
+function configureDetailedCleanupHandoff(harness) {
+  writeFileSync(
+    harness.manifestPath,
+    `${JSON.stringify(harness.manifest, null, 2)}\n`,
+  );
+  writeFileSync(harness.v2StatePath, "active\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  for (const action of harness.cleanupActionStatePaths) {
+    writeFileSync(action.path, "before\n");
+  }
+}
+
+test("repository cleanup executor performs every pending action in serial exact-before/readback order", async (t) => {
+  const harness = createFakeGhHarness(t, { detailedCleanupState: true });
+  configureDetailedCleanupHandoff(harness);
+  const preview = await runFakeCli(harness, "apply-repository-cleanup");
+  assert.equal(preview.status, "preview");
+  assert.equal(preview.external_repository_actions.length, 9);
+  writeFileSync(harness.logPath, "");
+
+  const applied = await runFakeCli(harness, "apply-repository-cleanup", [
+    "--apply",
+    "--expected-plan-sha256",
+    preview.plan_sha256,
+  ]);
+  assert.equal(applied.status, "applied-repository-cleanup-verified");
+  assert.deepEqual(
+    applied.execution_outcomes.map((entry) => entry.outcome),
+    Array(9).fill("applied"),
+  );
+  const writes = mutationRequests(fakeGhRequests(harness.logPath));
+  assert.deepEqual(
+    writes.map(({ method, endpoint }) => ({ method, endpoint })),
+    harness.cleanupActionStatePaths.map(({ repository, surface }) => ({
+      method: "PUT",
+      endpoint: `repos/${encodeEndpointPathForTest(repository)}/rulesets/${surface.slice("repository_ruleset:".length)}`,
+    })),
+  );
+  for (const action of harness.cleanupActionStatePaths) {
+    assert.equal(readFileSync(action.path, "utf8"), "after\n");
+  }
+});
+
+test("repository cleanup executor resumes a mixed checkpoint without rewriting reconciled actions", async (t) => {
+  const harness = createFakeGhHarness(t, { detailedCleanupState: true });
+  configureDetailedCleanupHandoff(harness);
+  const reconciled = harness.cleanupActionStatePaths[0];
+  writeFileSync(reconciled.path, "after\n");
+  const preview = await runFakeCli(harness, "apply-repository-cleanup");
+  assert.equal(preview.status, "preview");
+  assert.equal(preview.completed_repository_cleanup_action_count, 1);
+  assert.equal(preview.external_repository_actions.length, 8);
+  writeFileSync(harness.logPath, "");
+
+  const applied = await runFakeCli(harness, "apply-repository-cleanup", [
+    "--apply",
+    "--expected-plan-sha256",
+    preview.plan_sha256,
+  ]);
+  assert.equal(applied.status, "applied-repository-cleanup-verified");
+  const writes = mutationRequests(fakeGhRequests(harness.logPath));
+  assert.equal(writes.length, 8);
+  assert.equal(
+    writes.some(
+      (entry) =>
+        entry.endpoint ===
+        `repos/${encodeEndpointPathForTest(reconciled.repository)}/rulesets/${reconciled.surface.slice("repository_ruleset:".length)}`,
+    ),
+    false,
+  );
+});
+
+test("repository cleanup executor reconciles an ambiguous write only after exact after-state readback", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    detailedCleanupState: true,
+    cleanupMutationErrorAt: 2,
+  });
+  configureDetailedCleanupHandoff(harness);
+  const preview = await runFakeCli(harness, "apply-repository-cleanup");
+  writeFileSync(harness.logPath, "");
+
+  const applied = await runFakeCli(harness, "apply-repository-cleanup", [
+    "--apply",
+    "--expected-plan-sha256",
+    preview.plan_sha256,
+  ]);
+  assert.equal(applied.status, "applied-repository-cleanup-verified");
+  assert.equal(
+    applied.execution_outcomes[2].outcome,
+    "reconciled-after-write-error",
+  );
+  assert.equal(mutationRequests(fakeGhRequests(harness.logPath)).length, 9);
+});
+
+test("repository cleanup executor stops after a write that remains before-state", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    detailedCleanupState: true,
+    cleanupMutationFailureAt: 2,
+  });
+  configureDetailedCleanupHandoff(harness);
+  const preview = await runFakeCli(harness, "apply-repository-cleanup");
+  writeFileSync(harness.logPath, "");
+
+  await assert.rejects(
+    runFakeCli(harness, "apply-repository-cleanup", [
+      "--apply",
+      "--expected-plan-sha256",
+      preview.plan_sha256,
+    ]),
+    /did not reach its expected-after state/u,
+  );
+  const writes = mutationRequests(fakeGhRequests(harness.logPath));
+  assert.equal(writes.length, 3);
+  assert.deepEqual(
+    writes.map(({ endpoint }) => endpoint),
+    harness.cleanupActionStatePaths.slice(0, 3).map(
+      ({ repository, surface }) =>
+        `repos/${encodeEndpointPathForTest(repository)}/rulesets/${surface.slice("repository_ruleset:".length)}`,
+    ),
+  );
+  assert.equal(readFileSync(harness.cleanupActionStatePaths[0].path, "utf8"), "after\n");
+  assert.equal(readFileSync(harness.cleanupActionStatePaths[1].path, "utf8"), "after\n");
+  assert.equal(readFileSync(harness.cleanupActionStatePaths[2].path, "utf8"), "before\n");
+});
+
+test("stage adopts an exact uniquely created disabled v2 ruleset after an ambiguous POST response", async (t) => {
+  const harness = createFakeGhHarness(t, { stageCreateResponse: "invalid" });
+  const unboundManifest = clone(harness.manifest);
+  unboundManifest.v2_ruleset.id = null;
+  writeFileSync(harness.manifestPath, `${JSON.stringify(unboundManifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "absent\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+
+  const preview = await runFakeCli(harness, "stage");
+  writeFileSync(harness.logPath, "");
+  const recovered = await runFakeCli(harness, "stage", [
+    "--apply",
+    "--expected-plan-sha256",
+    preview.plan_sha256,
+  ]);
+  assert.equal(recovered.status, "applied-recovered");
+  assert.equal(recovered.applied, true);
+  assert.equal(recovered.created_v2_ruleset_id, harness.manifest.v2_ruleset.id);
+  assert.equal(
+    mutationRequests(fakeGhRequests(harness.logPath)).filter(
+      ({ method, endpoint }) =>
+        method === "POST" &&
+        endpoint === `orgs/${encodeURIComponent(harness.manifest.organization.login)}/rulesets`,
+    ).length,
+    1,
+    "an ambiguous create response must be reconciled, never replayed",
+  );
+
+  writeFileSync(harness.logPath, "");
+  const explicitRecovery = await runFakeCli(harness, "stage", [
+    "--recover-created-v2",
+  ]);
+  assert.equal(explicitRecovery.status, "recovered-created-v2");
+  assert.equal(explicitRecovery.created_v2_ruleset_id, harness.manifest.v2_ruleset.id);
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("stage recovery rejects absent or active candidates without sending a POST", async (t) => {
+  const harness = createFakeGhHarness(t);
+  const unboundManifest = clone(harness.manifest);
+  unboundManifest.v2_ruleset.id = null;
+  writeFileSync(harness.manifestPath, `${JSON.stringify(unboundManifest, null, 2)}\n`);
+  for (const v2State of ["absent", "active"]) {
+    writeFileSync(harness.v2StatePath, `${v2State}\n`);
+    writeFileSync(harness.legacyStatePath, "before\n");
+    writeFileSync(harness.cleanupStatePath, "before\n");
+    writeFileSync(harness.logPath, "");
+    await assert.rejects(
+      runFakeCli(harness, "stage", ["--recover-created-v2"]),
+      /recovery|recover|disabled|missing/u,
+    );
+    assert.deepEqual(
+      mutationRequests(fakeGhRequests(harness.logPath)),
+      [],
+      `${v2State} stage recovery must remain read-only`,
+    );
+  }
+});
+
+test("effective inherited legacy context on a later page blocks activation", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    extraEffectiveSecondPageRules: [
+      effectiveStatusRule({
+        id: 99999991,
+        sourceType: "Enterprise",
+        source: "Joey-Enterprise",
+        context: LEGACY_STATUS_CONTEXT,
+      }),
+    ],
+  });
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  writeFileSync(harness.logPath, "");
+  await assert.rejects(
+    runFakeCli(harness, "activate"),
+    /unmanifested legacy context/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("case-variant inherited legacy context blocks activation", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    extraEffectiveRules: [
+      effectiveStatusRule({
+        id: 99999992,
+        sourceType: "Organization",
+        source: ORGANIZATION.login,
+        context: "Codex/Review-Gate",
+      }),
+    ],
+  });
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  writeFileSync(harness.logPath, "");
+  await assert.rejects(
+    runFakeCli(harness, "activate"),
+    /canonical spelling codex\/review-gate/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("an effective local legacy rule remaining after its cleanup blocks cutover", async (t) => {
+  const firstCleanupRuleId = REPOSITORIES[0][2];
+  const harness = createFakeGhHarness(t, {
+    extraEffectiveRules: [
+      effectiveStatusRule({
+        id: firstCleanupRuleId,
+        sourceType: "Repository",
+        source: `${ORGANIZATION.login}/${REPOSITORIES[0][0]}`,
+        context: LEGACY_STATUS_CONTEXT,
+      }),
+    ],
+  });
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "active\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "after\n");
+  writeFileSync(harness.logPath, "");
+  await assert.rejects(
+    runFakeCli(harness, "derive-cutover"),
+    /still requires the legacy context after its cleanup/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("an active v2 rule with a mismatched inherited source blocks cutover", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    mutateEffectiveRules: (rules, { v2State }) =>
+      v2State === "active"
+        ? rules.map((rule) =>
+            rule.ruleset_id === 26590367
+              ? { ...rule, ruleset_source: "Other-Organization" }
+              : rule,
+          )
+        : rules,
+  });
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "active\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "after\n");
+  writeFileSync(harness.logPath, "");
+  await assert.rejects(
+    runFakeCli(harness, "derive-cutover"),
+    /exactly one effective manifest-bound v2 organization status rule/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 });
 
 test("verify apply revalidates the full cohort and legacy rule immediately before PUT", async (t) => {
@@ -1562,9 +2110,37 @@ test("canary closure is rejected before activation", async (t) => {
       "--expected-plan-sha256",
       "a".repeat(64),
     ]),
-    /exact open, non-draft, same-repository, current-base PR\/head\/test-merge/u,
+    /exact open, mergeable, non-draft, same-repository, current-base PR\/head\/test-merge/u,
   );
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("activation sends GraphQL canary queries with exact owner, repository, and PR number", async (t) => {
+  const harness = createFakeGhHarness(t);
+  writeFileSync(
+    harness.manifestPath,
+    `${JSON.stringify(harness.manifest, null, 2)}\n`,
+  );
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  writeFileSync(harness.logPath, "");
+
+  const preview = await runFakeCli(harness, "activate");
+  assert.equal(preview.status, "preview");
+  const expected = new Map(
+    harness.manifest.repositories.map((repository) => {
+      const [owner, name] = repository.slug.split("/");
+      return [name, { owner, name, number: repository.canary.pull_number }];
+    }),
+  );
+  const requests = fakeGhRequests(harness.logPath).filter(
+    ({ method, endpoint }) => method === "POST" && endpoint === "graphql",
+  );
+  assert.ok(requests.length >= harness.manifest.repositories.length * 2);
+  for (const request of requests) {
+    assert.deepEqual(request.body.variables, expected.get(request.body.variables.name));
+  }
 });
 
 test("post-activation cutover accepts canaries that were closed unmerged", async (t) => {
@@ -1608,6 +2184,42 @@ test("post-activation cutover accepts canaries that were closed unmerged", async
       ),
       0,
       "post-activation verification must not depend on a live canary PR",
+    );
+  }
+});
+
+test("post-activation closure binds control-plane reads to the current default head", async (t) => {
+  const currentHead = "f".repeat(40);
+  const harness = createFakeGhHarness(t, { postActivationHeadSha: currentHead });
+  writeFileSync(
+    harness.manifestPath,
+    `${JSON.stringify(harness.manifest, null, 2)}\n`,
+  );
+  writeFileSync(harness.v2StatePath, "active\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  writeFileSync(harness.logPath, "");
+
+  const derived = await runFakeCli(harness, "derive-cutover");
+  assert.equal(derived.status, "derived-read-only");
+  const requests = fakeGhRequests(harness.logPath);
+  for (const repository of harness.manifest.repositories) {
+    const encodedSlug = encodeEndpointPathForTest(repository.slug);
+    assert.ok(
+      countRequest(
+        requests,
+        "GET",
+        `repos/${encodedSlug}/git/trees/${currentHead}`,
+      ) >= 2,
+      `${repository.slug} must read each stable-round workflow tree at the current default head`,
+    );
+    assert.ok(
+      countRequest(
+        requests,
+        "GET",
+        `repos/${encodedSlug}/contents/${encodeEndpointPathForTest(repository.codeowners.path)}?ref=${encodeURIComponent(currentHead)}`,
+      ) >= 2,
+      `${repository.slug} must read CODEOWNERS at the same current immutable head`,
     );
   }
 });
@@ -1728,14 +2340,94 @@ test("default-branch evidence rejects an outdated canary base", () => {
   );
 });
 
-test("canary pull evidence binds one open current-base same-repository test merge", async (t) => {
+test("post-activation default-branch evidence accepts a current immutable head", () => {
   const repo = manifestFixture().repositories[0];
-  const response = canaryPullResponse(repo);
-  assert.deepEqual(validateCanaryPullResponse(response, repo), {
+  const currentHead = "f".repeat(40);
+  assert.deepEqual(
+    validateDefaultBranchResponse(
+      { name: repo.default_branch, commit: { sha: currentHead } },
+      repo,
+      { requireCanaryBase: false },
+    ),
+    { name: repo.default_branch, head_sha: currentHead },
+  );
+  assert.throws(
+    () =>
+      validateDefaultBranchResponse(
+        { name: "retargeted", commit: { sha: currentHead } },
+        repo,
+        { requireCanaryBase: false },
+      ),
+    /does not identify the manifest-bound default branch/u,
+  );
+});
+
+test("workflow-run path accepts GitHub's documented optional source-ref suffix", () => {
+  const repo = manifestFixture().repositories[0];
+  assert.deepEqual(
+    parseWorkflowRunPath(CANONICAL_WORKFLOW_IDENTITIES.verifier.path, repo.default_branch),
+    {
+      workflow_path: CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+      workflow_ref: null,
+    },
+  );
+  assert.deepEqual(
+    parseWorkflowRunPath(
+      `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@${repo.default_branch}`,
+      repo.default_branch,
+    ),
+    {
+      workflow_path: CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+      workflow_ref: repo.default_branch,
+    },
+  );
+  for (const candidate of [
+    ".github/workflows/other.yml@master",
+    `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@`,
+    `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@master\nforeign`,
+    null,
+  ]) {
+    assert.throws(
+      () => parseWorkflowRunPath(candidate, repo.default_branch),
+      /Workflow run path/u,
+    );
+  }
+});
+
+test("bounded repository mapper stops acquiring items after its first error", async () => {
+  const expected = new Error("first mapper failure");
+  const started = [];
+  let releaseSecond;
+  const secondStarted = new Promise((resolvePromise) => {
+    releaseSecond = resolvePromise;
+  });
+  const run = mapWithConcurrency([0, 1, 2, 3], 2, async (_value, index) => {
+    started.push(index);
+    if (index === 0) {
+      await Promise.resolve();
+      throw expected;
+    }
+    if (index === 1) {
+      await secondStarted;
+      return index;
+    }
+    return index;
+  });
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  releaseSecond();
+  await assert.rejects(run, (error) => error === expected);
+  assert.deepEqual(started.sort((left, right) => left - right), [0, 1]);
+});
+
+test("GraphQL canary evidence binds the supported potential test merge commit", async (t) => {
+  const repo = manifestFixture().repositories[0];
+  const response = canaryPullGraphqlResponse(repo);
+  assert.deepEqual(validateCanaryPullGraphqlResponse(response, repo), {
     number: repo.canary.pull_number,
-    state: "open",
+    state: "OPEN",
     merged: false,
     draft: false,
+    mergeable: "MERGEABLE",
     head_sha: repo.canary.head_sha,
     head_repository: repo.slug,
     base_ref: repo.default_branch,
@@ -1744,26 +2436,26 @@ test("canary pull evidence binds one open current-base same-repository test merg
     test_merge_sha: repo.canary.test_merge_sha,
     changed_files: 1,
   });
-
-  const cases = [
-    ["closed", (value) => { value.state = "closed"; }],
-    ["merged", (value) => { value.merged = true; }],
-    ["draft", (value) => { value.draft = true; }],
-    ["wrong head", (value) => { value.head.sha = "f".repeat(40); }],
-    ["fork head", (value) => { value.head.repo.full_name = "fork/example"; }],
-    ["wrong base ref", (value) => { value.base.ref = "release"; }],
-    ["outdated base", (value) => { value.base.sha = "f".repeat(40); }],
-    ["foreign base", (value) => { value.base.repo.full_name = "Other/example"; }],
-    ["wrong test merge", (value) => { value.merge_commit_sha = "f".repeat(40); }],
-    ["truncated file count", (value) => { value.changed_files = 3001; }],
-  ];
-  for (const [name, mutate] of cases) {
+  for (const [name, mutate] of [
+    ["wrong number", (value) => { value.data.repository.pullRequest.number += 1; }],
+    ["merged", (value) => { value.data.repository.pullRequest.merged = true; }],
+    ["draft", (value) => { value.data.repository.pullRequest.isDraft = true; }],
+    ["unknown mergeability", (value) => { value.data.repository.pullRequest.mergeable = "UNKNOWN"; }],
+    ["wrong head", (value) => { value.data.repository.pullRequest.headRefOid = "f".repeat(40); }],
+    ["fork head", (value) => { value.data.repository.pullRequest.headRepository.nameWithOwner = "fork/example"; }],
+    ["wrong base ref", (value) => { value.data.repository.pullRequest.baseRefName = "release"; }],
+    ["wrong base", (value) => { value.data.repository.pullRequest.baseRefOid = "f".repeat(40); }],
+    ["foreign base", (value) => { value.data.repository.pullRequest.baseRepository.nameWithOwner = "Other/example"; }],
+    ["missing potential merge", (value) => { value.data.repository.pullRequest.potentialMergeCommit = null; }],
+    ["wrong potential merge", (value) => { value.data.repository.pullRequest.potentialMergeCommit.oid = "f".repeat(40); }],
+    ["too many files", (value) => { value.data.repository.pullRequest.changedFiles = 3001; }],
+  ]) {
     await t.test(name, () => {
       const candidate = clone(response);
       mutate(candidate);
       assert.throws(
-        () => validateCanaryPullResponse(candidate, repo),
-        /exact open, non-draft, same-repository, current-base PR\/head\/test-merge/u,
+        () => validateCanaryPullGraphqlResponse(candidate, repo),
+        /exact open, mergeable, non-draft, same-repository, current-base PR\/head\/test-merge/u,
       );
     });
   }
@@ -1830,6 +2522,18 @@ test("legacy evidence is a latest successful commit status, never a CheckRun sub
     queried_ref: repo.canary.head_sha,
     creator_login: "github-actions[bot]",
     creator_type: "Bot",
+    pagination_horizon: {
+      page_count: 1,
+      page_sizes: [1],
+      statuses_sha256: sha256Canonical([{
+        id: repo.canary.legacy_status_id,
+        node_id: "SC_legacy_status",
+        context: LEGACY_STATUS_CONTEXT,
+        state: "success",
+        creator_login: "github-actions[bot]",
+        creator_type: "Bot",
+      }]),
+    },
   });
 
   const checkRunSubstitute = [[{
@@ -1846,7 +2550,10 @@ test("legacy evidence is a latest successful commit status, never a CheckRun sub
   );
 
   const projectedV2Status = legacyStatusPages(repo);
-  projectedV2Status[0].push({ context: V2_STATUS_CONTEXT });
+  projectedV2Status[0].push({
+    id: repo.canary.legacy_status_id + 10,
+    context: V2_STATUS_CONTEXT,
+  });
   assert.throws(
     () => validateLegacyStatusPages(projectedV2Status, repo),
     /v2 context must not be projected as a commit status/u,
@@ -1854,6 +2561,7 @@ test("legacy evidence is a latest successful commit status, never a CheckRun sub
 
   const projectedV2StatusVariant = legacyStatusPages(repo);
   projectedV2StatusVariant[0].push({
+    id: repo.canary.legacy_status_id + 10,
     context: V2_STATUS_CONTEXT.toUpperCase(),
   });
   assert.throws(

@@ -15,7 +15,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: codex-review-gate-legacy-bridge-${{ github.repository }}
+  group: codex-review-gate-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:

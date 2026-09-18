@@ -34,6 +34,7 @@ import {
   assertCompleteRulesetApiObject,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
+  canonicalOrganizationFinalClosureReceipt,
   canonicalClassicRequiredStatusChecks,
   canonicalLegacyReviewGateInventoryBytes,
   buildUpdateRulesetPayload,
@@ -45,6 +46,7 @@ import {
   installedWorkflowMatchesCanonical,
   normalizeControlPlaneOwner,
   normalizeWorkflowPath,
+  parseGitHubRepositoryRemote,
   parseRepoSlug,
   rulesetCoversDefaultBranch,
   rulesetHasGatePolicy,
@@ -55,6 +57,7 @@ import {
   validateCanonicalV2VerifierWorkflowContent,
   validateCanonicalV2WorkflowInventory,
   validateControlPlaneCodeownersContent,
+  validateOrganizationFinalClosureOutput,
   workflowContainsCodexReviewGateCaller,
   workflowContainsLegacyV1Caller,
   workflowSingleProducerPolicyViolations,
@@ -90,6 +93,9 @@ async function main() {
       controlPlaneOwner: options.controlPlaneOwner,
       legacyBridge: options.legacyBridge,
       removeLegacyBridge: options.removeLegacyBridge,
+      finalClosureReceiptPath: options.finalClosureReceiptPath,
+      expectedFinalClosureReceiptSha256:
+        options.expectedFinalClosureReceiptSha256,
       apply: options.apply,
     });
     return;
@@ -602,6 +608,8 @@ function readCliOptions() {
       activate: { type: "boolean", default: false },
       "legacy-bridge": { type: "boolean", default: false },
       "remove-legacy-bridge": { type: "boolean", default: false },
+      "final-closure-receipt": { type: "string" },
+      "expected-final-closure-receipt-sha256": { type: "string" },
       "derive-post-cleanup-plan": { type: "boolean", default: false },
       "verify-post-cleanup": { type: "boolean", default: false },
       "expected-legacy-inventory-sha256": { type: "string" },
@@ -642,6 +650,24 @@ function readCliOptions() {
   if (hasRepo && values["remove-legacy-bridge"]) {
     throw new Error(
       "--remove-legacy-bridge is local-only and requires --prepare-worktree after legacy requirements have been removed and verified.",
+    );
+  }
+  if (
+    values["remove-legacy-bridge"] &&
+    (values["final-closure-receipt"] === undefined ||
+      values["expected-final-closure-receipt-sha256"] === undefined)
+  ) {
+    throw new Error(
+      "--remove-legacy-bridge requires --final-closure-receipt and --expected-final-closure-receipt-sha256 from a successful organization handoff final verify.",
+    );
+  }
+  if (
+    !values["remove-legacy-bridge"] &&
+    (values["final-closure-receipt"] !== undefined ||
+      values["expected-final-closure-receipt-sha256"] !== undefined)
+  ) {
+    throw new Error(
+      "--final-closure-receipt and --expected-final-closure-receipt-sha256 are valid only with --remove-legacy-bridge.",
     );
   }
   if (
@@ -736,6 +762,15 @@ function readCliOptions() {
     activate: values.activate,
     legacyBridge: values["legacy-bridge"],
     removeLegacyBridge: values["remove-legacy-bridge"],
+    finalClosureReceiptPath: values["remove-legacy-bridge"]
+      ? resolve(values["final-closure-receipt"])
+      : null,
+    expectedFinalClosureReceiptSha256: values["remove-legacy-bridge"]
+      ? parseExpectedSecuritySha256(
+          values["expected-final-closure-receipt-sha256"],
+          "--expected-final-closure-receipt-sha256",
+        )
+      : null,
     derivePostCleanupPlan: values["derive-post-cleanup-plan"],
     verifyPostCleanup: values["verify-post-cleanup"],
     rulesetName: values["ruleset-name"],
@@ -760,7 +795,7 @@ function readCliOptions() {
 
 function printUsage() {
   console.log(`Usage:
-  node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--legacy-bridge | --remove-legacy-bridge] [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--legacy-bridge | --remove-legacy-bridge --final-closure-receipt PATH --expected-final-closure-receipt-sha256 SHA256] [--control-plane-owner @USER] [--apply]
   node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 [--legacy-bridge] [--control-plane-owner @USER] [--apply]
   node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --activate --canary-pr NUMBER --canary-head SHA [--legacy-bridge] [--control-plane-owner @USER] [--apply]
   node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --derive-post-cleanup-plan [--legacy-bridge] [--control-plane-owner @USER]
@@ -771,7 +806,11 @@ Options:
   --repo OWNER/REPO       Inspect or stage the merged repository ruleset.
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
   --legacy-bridge         Explicitly require/install the exact temporary v1 producer at ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}. Keep this flag through legacy cleanup verification.
-  --remove-legacy-bridge  Local-only post-cutover removal of an exact canonical bridge. Use only after legacy requirements are removed and verified.
+  --remove-legacy-bridge  Local-only post-cutover removal of an exact canonical bridge. Requires a repository-bound final closure receipt.
+  --final-closure-receipt
+                          JSON output from organization handoff mode verify after final closure.
+  --expected-final-closure-receipt-sha256
+                          Exact canonical receipt SHA-256 copied from that successful verify output.
   --expected-legacy-inventory-sha256
                           Exact lowercase SHA-256 from the external owner approval snapshot. Required for every remote staging/activation preview and apply.
   --derive-post-cleanup-plan
@@ -2575,15 +2614,113 @@ async function loadCanonicalWorkflows({ includeLegacyBridge = false } = {}) {
   return canonicalWorkflows;
 }
 
+async function loadAndBindOrganizationFinalClosureProof({
+  targetRoot,
+  receiptPath,
+  expectedSha256,
+}) {
+  const content = await readOptionalRegularFile(receiptPath);
+  if (content === null) {
+    throw new Error(`Organization final closure receipt is missing: ${receiptPath}`);
+  }
+  let output;
+  try {
+    output = JSON.parse(content);
+  } catch (error) {
+    throw new Error(
+      `Organization final closure receipt is not valid JSON: ${error.message}`,
+    );
+  }
+  const validated = validateOrganizationFinalClosureOutput(output);
+  const computedSha256 = fingerprintText(
+    canonicalOrganizationFinalClosureReceipt(validated.receipt),
+  );
+  if (validated.claimedSha256 !== computedSha256) {
+    throw new Error(
+      "Organization final closure receipt SHA-256 does not match its canonical content.",
+    );
+  }
+  if (expectedSha256 !== computedSha256) {
+    throw new Error(
+      `--expected-final-closure-receipt-sha256 does not match the admitted receipt (expected ${computedSha256}).`,
+    );
+  }
+
+  const origin = await loadGitHubOriginRepository(targetRoot);
+  const repository = validated.receipt.repositories.find(
+    (candidate) =>
+      candidate.full_name.toLowerCase() === origin.repository.slug.toLowerCase(),
+  );
+  if (repository === undefined) {
+    throw new Error(
+      `Git origin repository ${origin.repository.slug} is not a member of the organization final closure receipt.`,
+    );
+  }
+  return {
+    receiptPath,
+    sha256: computedSha256,
+    organization: validated.receipt.organization,
+    repository,
+    originRepository: origin.repository,
+  };
+}
+
+async function loadGitHubOriginRepository(targetRoot) {
+  let stdout;
+  try {
+    stdout = await runCommand("git", [
+      "-C",
+      targetRoot,
+      "remote",
+      "get-url",
+      "origin",
+    ]);
+  } catch (error) {
+    throw new Error(
+      `Unable to bind --prepare-worktree to a GitHub origin repository: ${error.message}`,
+    );
+  }
+  const value = stdout.replace(/\r?\n$/u, "");
+  if (/[\r\n]/u.test(value)) {
+    throw new Error("Git origin returned more than one repository URL.");
+  }
+  return { raw: value, repository: parseGitHubRepositoryRemote(value) };
+}
+
+async function assertOrganizationFinalClosureBindingStable(
+  targetRoot,
+  proof,
+  phase,
+) {
+  const current = await loadGitHubOriginRepository(targetRoot);
+  if (
+    current.repository.slug.toLowerCase() !==
+    proof.originRepository.slug.toLowerCase()
+  ) {
+    throw new Error(
+      `Git origin repository changed during ${phase}; refusing bridge removal success.`,
+    );
+  }
+}
+
 async function prepareConsumerWorktree({
   targetRoot,
   canonicalWorkflows,
   controlPlaneOwner,
   legacyBridge,
   removeLegacyBridge,
+  finalClosureReceiptPath,
+  expectedFinalClosureReceiptSha256,
   apply,
 }) {
   const rootWitness = await assertLocalGitWorktree(targetRoot);
+  const finalClosureProof = removeLegacyBridge
+    ? await loadAndBindOrganizationFinalClosureProof({
+        targetRoot,
+        receiptPath: finalClosureReceiptPath,
+        expectedSha256: expectedFinalClosureReceiptSha256,
+      })
+    : null;
   const parentWitnesses = await prepareVerifiedWorkflowParents({
     targetRoot,
     rootWitness,
@@ -2654,6 +2791,9 @@ async function prepareConsumerWorktree({
     console.log(
       `Post-cutover legacy bridge removal: ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}`,
     );
+    console.log(
+      `Final organization closure: ${finalClosureProof.repository.full_name} at ${finalClosureProof.sha256}`,
+    );
   }
   console.log(`Control plane: ${DEFAULT_CODEOWNERS_PATH} -> ${controlPlaneOwner}`);
   if (!verifierChanged) {
@@ -2690,6 +2830,13 @@ async function prepareConsumerWorktree({
       finalNoopState,
       "no-op success readback",
     );
+    if (finalClosureProof !== null) {
+      await assertOrganizationFinalClosureBindingStable(
+        targetRoot,
+        finalClosureProof,
+        "no-op success readback",
+      );
+    }
     return;
   }
 
@@ -2804,6 +2951,13 @@ async function prepareConsumerWorktree({
       preMutationState,
       "immediately before the first install mutation",
     );
+    if (finalClosureProof !== null) {
+      await assertOrganizationFinalClosureBindingStable(
+        targetRoot,
+        finalClosureProof,
+        "immediately before the first install mutation",
+      );
+    }
     firstMutationBoundaryComplete = true;
   };
   try {
@@ -2903,6 +3057,13 @@ async function prepareConsumerWorktree({
       successBoundaryState,
       "immediately before local apply success",
     );
+    if (finalClosureProof !== null) {
+      await assertOrganizationFinalClosureBindingStable(
+        targetRoot,
+        finalClosureProof,
+        "immediately before local apply success",
+      );
+    }
   } catch (error) {
     throw buildPartialLocalApplyError(error, installedLabels, plannedChanges);
   }

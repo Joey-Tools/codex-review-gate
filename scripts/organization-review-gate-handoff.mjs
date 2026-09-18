@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   decodeGitHubBlobContent,
+  rulesetCoversDefaultBranch,
   validateCanonicalV2WorkflowInventory,
 } from "../src/bootstrap.mjs";
 
@@ -24,6 +25,24 @@ export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
 export const REQUIRED_REPOSITORY_COUNT = 11;
 export const CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const V2_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
+const CANARY_PULL_QUERY = `query CanaryPull($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      state
+      isDraft
+      merged
+      mergeable
+      headRefOid
+      baseRefName
+      baseRefOid
+      headRepository { nameWithOwner }
+      baseRepository { nameWithOwner }
+      potentialMergeCommit { oid }
+      changedFiles
+    }
+  }
+}`;
 export const CANONICAL_WORKFLOW_IDENTITIES = Object.freeze({
   verifier: Object.freeze({
     path: ".github/workflows/codex-review-gate.yml",
@@ -37,8 +56,8 @@ export const CANONICAL_WORKFLOW_IDENTITIES = Object.freeze({
   }),
   legacy_bridge: Object.freeze({
     path: ".github/workflows/codex-review-gate-legacy-bridge.yml",
-    git_blob_sha: "9d894030ca760569c34877baf3812d6e11980af8",
-    sha256: "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6",
+    git_blob_sha: "93aa3fef47034818bb5dfb0e5bdb7dfc3a129831",
+    sha256: "fce11cfef497fd37af6693221519ba73fc91b00da7e0cd148f10094829866730",
   }),
 });
 
@@ -46,11 +65,15 @@ const GITHUB_API_VERSION = "2026-03-10";
 const MAX_GH_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const GH_TIMEOUT_MS = 60_000;
+const GH_API_QUEUE_TIMEOUT_MS = 60_000;
+const GH_API_CONCURRENCY = 8;
+const REPOSITORY_EVIDENCE_CONCURRENCY = 2;
 const MODES = new Set([
   "plan",
   "stage",
   "activate",
   "derive-cutover",
+  "apply-repository-cleanup",
   "verify",
 ]);
 const WORKFLOW_KEYS = ["verifier", "controller", "legacy_bridge"];
@@ -126,6 +149,13 @@ function assertNonEmptyString(value, label) {
     throw new Error(`${label} must be a non-empty string.`);
   }
   return value;
+}
+
+function statusContextEquals(candidate, canonical) {
+  return (
+    typeof candidate === "string" &&
+    candidate.toLowerCase() === canonical.toLowerCase()
+  );
 }
 
 function assertPositiveInteger(value, label) {
@@ -358,12 +388,7 @@ function assertV2RepositoryRulesetPolicy(ruleset, defaultBranch, label) {
     !isPlainObject(refName) ||
     !Array.isArray(refName.include) ||
     !Array.isArray(refName.exclude) ||
-    (!refName.include.includes("~DEFAULT_BRANCH") &&
-      !refName.include.includes(`refs/heads/${defaultBranch}`)) ||
-    refName.exclude.some(
-      (pattern) =>
-        pattern === "~DEFAULT_BRANCH" || pattern === `refs/heads/${defaultBranch}`,
-    )
+    !rulesetCoversDefaultBranch(ruleset, defaultBranch)
   ) {
     throw new Error(`${label} does not provably cover the repository default branch.`);
   }
@@ -980,7 +1005,10 @@ function classifyV2OrganizationRuleset(manifest, complete) {
   throw new Error("v2 organization ruleset does not match an authorized exact state.");
 }
 
-async function loadOrganizationRound(manifest) {
+async function loadOrganizationRound(
+  manifest,
+  { allowUnboundV2 = false } = {},
+) {
   const [organization, legacy, summaries] = await Promise.all([
     loadOrganizationIdentity(manifest),
     loadOrganizationRuleset(manifest, manifest.legacy_ruleset.id, "Legacy organization ruleset"),
@@ -1000,9 +1028,26 @@ async function loadOrganizationRound(manifest) {
   const namedV2 = summaries.filter((summary) => summary.name === V2_RULESET_NAME);
   let v2 = null;
   if (manifest.v2_ruleset.id === null) {
-    if (namedV2.length !== 0) {
+    if (namedV2.length !== 0 && !allowUnboundV2) {
       throw new Error(
-        "A v2 organization ruleset exists but manifest.v2_ruleset.id is null; bind its exact ID before continuing.",
+        "A v2 organization ruleset exists but manifest.v2_ruleset.id is null; use stage --recover-created-v2 only after an ambiguous stage creation, or bind its exact ID after verified recovery.",
+      );
+    }
+    if (allowUnboundV2 && namedV2.length !== 0) {
+      if (
+        namedV2.length !== 1 ||
+        namedV2[0].source_type !== "Organization" ||
+        namedV2[0].source !== manifest.organization.login ||
+        namedV2[0].id === manifest.legacy_ruleset.id
+      ) {
+        throw new Error(
+          "Ambiguous or foreign v2 organization ruleset candidate cannot be recovered automatically.",
+        );
+      }
+      v2 = await loadOrganizationRuleset(
+        manifest,
+        namedV2[0].id,
+        "Recoverable v2 organization ruleset",
       );
     }
   } else {
@@ -1143,8 +1188,9 @@ function decodeBase64Content(response, label) {
   return Buffer.from(compact, "base64");
 }
 
-async function loadContentEvidence(repo, expected, label) {
-  const endpoint = `repos/${encodeEndpointPath(repo.slug)}/contents/${encodeEndpointPath(expected.path)}?ref=${encodeURIComponent(repo.default_branch)}`;
+async function loadContentEvidence(repo, expected, label, revision) {
+  assertHex(revision, 40, `${repo.slug} ${label} revision`);
+  const endpoint = `repos/${encodeEndpointPath(repo.slug)}/contents/${encodeEndpointPath(expected.path)}?ref=${encodeURIComponent(revision)}`;
   const response = await ghJson(endpoint);
   assertPlainObject(response, `${repo.slug} ${label} content response`);
   if (response.type !== "file" || response.path !== expected.path) {
@@ -1209,10 +1255,11 @@ function assertGitTreeDirectory(entry, path, repo) {
   }
 }
 
-async function loadWorkflowInventoryEvidence(repo) {
+async function loadWorkflowInventoryEvidence(repo, revision) {
+  assertHex(revision, 40, `${repo.slug} workflow inventory revision`);
   const rootTree = await loadCompleteGitTree(
     repo,
-    repo.canary.base_sha,
+    revision,
     "default-branch root",
   );
   const githubEntry = findUniqueGitTreeEntry(
@@ -1338,11 +1385,12 @@ function validateCodeownersControlPlane(bytes, ownerLogin, label) {
   }
 }
 
-async function loadCodeownersEvidence(repo) {
+async function loadCodeownersEvidence(repo, revision) {
   const loaded = await loadContentEvidence(
     repo,
     repo.codeowners,
     "CODEOWNERS control plane",
+    revision,
   );
   validateCodeownersControlPlane(
     loaded.bytes,
@@ -1417,71 +1465,46 @@ async function loadRepositoryRuleset(repo) {
   return complete;
 }
 
-export function validateDefaultBranchResponse(response, repo) {
+export function validateDefaultBranchResponse(
+  response,
+  repo,
+  { requireCanaryBase = true } = {},
+) {
   const projection = {
     name: response?.name,
     head_sha: response?.commit?.sha,
   };
   if (
     projection.name !== repo.default_branch ||
-    projection.head_sha !== repo.canary.base_sha
+    (requireCanaryBase && projection.head_sha !== repo.canary.base_sha)
   ) {
     throw new Error(
-      `${repo.slug} default branch no longer matches the manifest-bound canary base.`,
+      requireCanaryBase
+        ? `${repo.slug} default branch no longer matches the manifest-bound canary base.`
+        : `${repo.slug} default branch response does not identify the manifest-bound default branch.`,
     );
   }
+  assertHex(projection.head_sha, 40, `${repo.slug} default branch head SHA`);
   return projection;
 }
 
-async function loadDefaultBranchHead(repo) {
+async function loadDefaultBranchHead(repo, { requireCanaryBase = true } = {}) {
   const response = await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/branches/${encodeURIComponent(repo.default_branch)}`,
   );
-  return validateDefaultBranchResponse(response, repo);
-}
-
-export function validateCanaryPullResponse(response, repo) {
-  assertPlainObject(response, `${repo.slug} canary pull request`);
-  const projection = {
-    number: response.number,
-    state: response.state,
-    merged: response.merged,
-    draft: response.draft,
-    head_sha: response.head?.sha,
-    head_repository: response.head?.repo?.full_name,
-    base_ref: response.base?.ref,
-    base_sha: response.base?.sha,
-    base_repository: response.base?.repo?.full_name,
-    test_merge_sha: response.merge_commit_sha,
-    changed_files: response.changed_files,
-  };
-  if (
-    projection.number !== repo.canary.pull_number ||
-    projection.state !== "open" ||
-    projection.merged !== false ||
-    projection.draft !== false ||
-    projection.head_sha !== repo.canary.head_sha ||
-    projection.head_repository !== repo.slug ||
-    projection.base_ref !== repo.default_branch ||
-    projection.base_sha !== repo.canary.base_sha ||
-    projection.base_repository !== repo.slug ||
-    projection.test_merge_sha !== repo.canary.test_merge_sha ||
-    !Number.isSafeInteger(projection.changed_files) ||
-    projection.changed_files < 0 ||
-    projection.changed_files > 3_000
-  ) {
-    throw new Error(
-      `${repo.slug} canary must be the exact open, non-draft, same-repository, current-base PR/head/test-merge.`,
-    );
-  }
-  return projection;
+  return validateDefaultBranchResponse(response, repo, { requireCanaryBase });
 }
 
 async function loadCanaryPull(repo) {
-  const response = await ghJson(
-    `repos/${encodeEndpointPath(repo.slug)}/pulls/${repo.canary.pull_number}`,
-  );
-  const projection = validateCanaryPullResponse(response, repo);
+  const [owner, name] = repo.slug.split("/");
+  const response = await ghJson("graphql", {
+    method: "POST",
+    body: {
+      query: CANARY_PULL_QUERY,
+      variables: { owner, name, number: repo.canary.pull_number },
+    },
+  });
+  const projection = validateCanaryPullGraphqlResponse(response, repo);
   const pages = await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/pulls/${repo.canary.pull_number}/files?per_page=100`,
     { paginate: true },
@@ -1526,6 +1549,46 @@ async function loadCanaryPull(repo) {
     }
   }
   projection.files = [...seenFiles].sort();
+  return projection;
+}
+
+export function validateCanaryPullGraphqlResponse(response, repo) {
+  const pull = response?.data?.repository?.pullRequest;
+  assertPlainObject(pull, `${repo.slug} GraphQL canary pull request`);
+  const projection = {
+    number: pull.number,
+    state: pull.state,
+    merged: pull.merged,
+    draft: pull.isDraft,
+    mergeable: pull.mergeable,
+    head_sha: pull.headRefOid,
+    head_repository: pull.headRepository?.nameWithOwner,
+    base_ref: pull.baseRefName,
+    base_sha: pull.baseRefOid,
+    base_repository: pull.baseRepository?.nameWithOwner,
+    test_merge_sha: pull.potentialMergeCommit?.oid,
+    changed_files: pull.changedFiles,
+  };
+  if (
+    projection.number !== repo.canary.pull_number ||
+    projection.state !== "OPEN" ||
+    projection.merged !== false ||
+    projection.draft !== false ||
+    projection.mergeable !== "MERGEABLE" ||
+    projection.head_sha !== repo.canary.head_sha ||
+    projection.head_repository !== repo.slug ||
+    projection.base_ref !== repo.default_branch ||
+    projection.base_sha !== repo.canary.base_sha ||
+    projection.base_repository !== repo.slug ||
+    projection.test_merge_sha !== repo.canary.test_merge_sha ||
+    !Number.isSafeInteger(projection.changed_files) ||
+    projection.changed_files < 0 ||
+    projection.changed_files > 3_000
+  ) {
+    throw new Error(
+      `${repo.slug} canary must be the exact open, mergeable, non-draft, same-repository, current-base PR/head/test-merge.`,
+    );
+  }
   return projection;
 }
 
@@ -1595,6 +1658,39 @@ function parseCheckRunApiUrl(value, repoSlug) {
   return id;
 }
 
+export function parseWorkflowRunPath(value, defaultBranch) {
+  if (value === CANONICAL_WORKFLOW_IDENTITIES.verifier.path) {
+    return {
+      workflow_path: value,
+      workflow_ref: null,
+    };
+  }
+  if (typeof value !== "string") {
+    throw new Error("Workflow run path must be a string.");
+  }
+  const prefix = `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@`;
+  if (!value.startsWith(prefix) || value.length === prefix.length) {
+    throw new Error("Workflow run path is not the canonical verifier path.");
+  }
+  const workflowRef = value.slice(prefix.length);
+  // GitHub returns a bare path for some runs and path@ref for others. The
+  // workflow ID, canonical default-branch tree, and canary's protected-file
+  // inventory bind the producer; accepting the documented optional suffix
+  // avoids assuming one undocumented ref spelling.
+  if (
+    workflowRef.includes("\n") ||
+    workflowRef.includes("\r") ||
+    workflowRef.includes("\0") ||
+    (defaultBranch !== undefined && typeof defaultBranch !== "string")
+  ) {
+    throw new Error("Workflow run path has an invalid source ref.");
+  }
+  return {
+    workflow_path: CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+    workflow_ref: workflowRef,
+  };
+}
+
 export function validateV2CheckRunResponse(response, repo) {
   if (
     !isPlainObject(response) ||
@@ -1650,6 +1746,7 @@ async function loadV2CanaryEvidence(repo) {
   const run = await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/actions/runs/${runId}`,
   );
+  const workflowPath = parseWorkflowRunPath(run?.path, repo.default_branch);
   const expectedTitle = `${V2_VERIFIER_RUN_NAME_PREFIX}/${repo.canary.pull_number}/${repo.canary.test_merge_sha}`;
   const matchingPull = Array.isArray(run?.pull_requests)
     ? run.pull_requests.filter(
@@ -1666,7 +1763,7 @@ async function loadV2CanaryEvidence(repo) {
     run?.display_title !== expectedTitle ||
     run?.repository?.full_name !== repo.slug ||
     run?.head_repository?.full_name !== repo.slug ||
-    run?.path !== CANONICAL_WORKFLOW_IDENTITIES.verifier.path ||
+    workflowPath.workflow_path !== CANONICAL_WORKFLOW_IDENTITIES.verifier.path ||
     run?.head_sha !== repo.canary.head_sha ||
     run?.event !== "pull_request" ||
     run?.status !== "completed" ||
@@ -1729,6 +1826,8 @@ async function loadV2CanaryEvidence(repo) {
       workflow_id: run.workflow_id,
       run_attempt: run.run_attempt,
       display_title: run.display_title,
+      workflow_path: workflowPath.workflow_path,
+      workflow_ref: workflowPath.workflow_ref,
       head_sha: run.head_sha,
     },
     job: {
@@ -1742,19 +1841,27 @@ export function validateLegacyStatusPages(pages, repo) {
   if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
     throw new Error(`${repo.slug} legacy commit-status inventory is incomplete.`);
   }
+  if (pages.some((page, index) => index < pages.length - 1 && page.length !== 100)) {
+    throw new Error(`${repo.slug} commit-status pagination has an incomplete non-final page.`);
+  }
   const statuses = pages.flat();
-  const contextMatches = (candidate, canonical) =>
-    typeof candidate === "string" &&
-    candidate.toLowerCase() === canonical.toLowerCase();
+  const statusIds = new Set();
+  for (const [index, status] of statuses.entries()) {
+    assertPositiveInteger(status?.id, `${repo.slug} commit status ${index}.id`);
+    if (statusIds.has(status.id)) {
+      throw new Error(`${repo.slug} commit-status pagination contains duplicate IDs.`);
+    }
+    statusIds.add(status.id);
+  }
   if (
     statuses.some((status) =>
-      contextMatches(status?.context, V2_STATUS_CONTEXT),
+      statusContextEquals(status?.context, V2_STATUS_CONTEXT),
     )
   ) {
     throw new Error(`${repo.slug} v2 context must not be projected as a commit status.`);
   }
   const legacyStatuses = statuses.filter(
-    (status) => contextMatches(status?.context, LEGACY_STATUS_CONTEXT),
+    (status) => statusContextEquals(status?.context, LEGACY_STATUS_CONTEXT),
   );
   if (legacyStatuses.length === 0) {
     throw new Error(
@@ -1775,6 +1882,20 @@ export function validateLegacyStatusPages(pages, repo) {
     queried_ref: repo.canary.head_sha,
     creator_login: latest.creator?.login,
     creator_type: latest.creator?.type,
+    pagination_horizon: {
+      page_count: pages.length,
+      page_sizes: pages.map((page) => page.length),
+      statuses_sha256: sha256Canonical(
+        statuses.map((status) => ({
+          id: status.id,
+          node_id: status.node_id ?? null,
+          context: status.context ?? null,
+          state: status.state ?? null,
+          creator_login: status.creator?.login ?? null,
+          creator_type: status.creator?.type ?? null,
+        })),
+      ),
+    },
   };
   if (
     projection.id !== repo.canary.legacy_status_id ||
@@ -1793,20 +1914,42 @@ export function validateLegacyStatusPages(pages, repo) {
 }
 
 async function loadLegacyStatusEvidence(repo) {
-  const pages = await ghJson(
-    `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/statuses?per_page=100`,
-    { paginate: true },
+  const endpoint = `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/statuses?per_page=100`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const pages = await ghJson(endpoint, { paginate: true });
+    const projection = validateLegacyStatusPages(pages, repo);
+    const firstPage = await ghJson(`${endpoint}&page=1`);
+    if (
+      Array.isArray(firstPage) &&
+      Array.isArray(pages[0]) &&
+      canonicalJson(firstPage) === canonicalJson(pages[0])
+    ) {
+      return projection;
+    }
+  }
+  throw new Error(
+    `${repo.slug} commit-status pagination horizon changed during revalidation; the result is inconclusive and no next write is allowed.`,
   );
-  return validateLegacyStatusPages(pages, repo);
 }
 
 function rulesetLegacyContextCount(writable, label) {
   return requiredStatusRules(writable).reduce(
     (count, rule, index) =>
       count +
-      statusChecks(rule, `${label}.required_status_checks[${index}]`).filter(
-        (check) => check.context === LEGACY_STATUS_CONTEXT,
-      ).length,
+      statusChecks(rule, `${label}.required_status_checks[${index}]`).reduce(
+        (ruleCount, check) => {
+          if (!statusContextEquals(check.context, LEGACY_STATUS_CONTEXT)) {
+            return ruleCount;
+          }
+          if (check.context !== LEGACY_STATUS_CONTEXT) {
+            throw new Error(
+              `${label} has a case-variant legacy context; refusing to classify it as unrelated policy.`,
+            );
+          }
+          return ruleCount + 1;
+        },
+        0,
+      ),
     0,
   );
 }
@@ -1815,10 +1958,21 @@ function classicLegacyContextCount(value) {
   if (value === null) {
     return 0;
   }
-  return (
-    value.contexts.filter((context) => context === LEGACY_STATUS_CONTEXT).length +
-    value.checks.filter((check) => check.context === LEGACY_STATUS_CONTEXT).length
-  );
+  const contexts = [
+    ...value.contexts,
+    ...value.checks.map((check) => check.context),
+  ];
+  return contexts.reduce((count, context) => {
+    if (!statusContextEquals(context, LEGACY_STATUS_CONTEXT)) {
+      return count;
+    }
+    if (context !== LEGACY_STATUS_CONTEXT) {
+      throw new Error(
+        "Classic required-status protection has a case-variant legacy context; refusing to classify it as unrelated policy.",
+      );
+    }
+    return count + 1;
+  }, 0);
 }
 
 async function loadLocalRepositoryRulesets(repo) {
@@ -1843,8 +1997,7 @@ async function loadLocalRepositoryRulesets(repo) {
   if (new Set(ids).size !== ids.length) {
     throw new Error(`${repo.slug} local ruleset inventory contains duplicate IDs.`);
   }
-  const complete = await Promise.all(
-    ids.map(async (id) => {
+  const complete = await mapWithConcurrency(ids, 2, async (id) => {
       const responseValue = await ghJson(repositoryRulesetEndpoint(repo, id));
       const ruleset = writableRulesetFromApi(
         responseValue,
@@ -1856,8 +2009,7 @@ async function loadLocalRepositoryRulesets(repo) {
         throw new Error(`${repo.slug} local ruleset ${id} returned the wrong ID.`);
       }
       return ruleset;
-    }),
-  );
+  });
   return complete.sort((left, right) => left.id - right.id);
 }
 
@@ -1886,6 +2038,204 @@ async function loadClassicStatusSurface(repo) {
   );
 }
 
+function canonicalEffectiveBranchRule(value, repo, index) {
+  assertPlainObject(value, `${repo.slug} effective branch rule ${index}`);
+  assertNonEmptyString(value.type, `${repo.slug} effective branch rule ${index}.type`);
+  if (
+    !Object.hasOwn(value, "ruleset_id") ||
+    !Object.hasOwn(value, "ruleset_source") ||
+    !Object.hasOwn(value, "ruleset_source_type")
+  ) {
+    throw new Error(
+      `${repo.slug} effective branch rule ${index} lacks a complete ruleset provenance tuple.`,
+    );
+  }
+  const rulesetId = value.ruleset_id;
+  const rulesetSource = value.ruleset_source;
+  const rulesetSourceType = value.ruleset_source_type;
+  if (rulesetId !== null) {
+    assertPositiveInteger(
+      rulesetId,
+      `${repo.slug} effective branch rule ${index}.ruleset_id`,
+    );
+    assertNonEmptyString(
+      rulesetSource,
+      `${repo.slug} effective branch rule ${index}.ruleset_source`,
+    );
+    assertNonEmptyString(
+      rulesetSourceType,
+      `${repo.slug} effective branch rule ${index}.ruleset_source_type`,
+    );
+  } else if (rulesetSource !== null || rulesetSourceType !== null) {
+    throw new Error(
+      `${repo.slug} effective branch rule ${index} has an incomplete classic-protection provenance tuple.`,
+    );
+  }
+  const projection = {
+    type: value.type,
+    ruleset_id: rulesetId,
+    ruleset_source: rulesetSource,
+    ruleset_source_type: rulesetSourceType,
+    parameters: value.parameters === undefined ? null : cloneJson(value.parameters),
+  };
+  assertJsonData(projection, `${repo.slug} effective branch rule ${index}`);
+  if (projection.type === "required_status_checks") {
+    statusChecks(
+      { type: projection.type, parameters: projection.parameters },
+      `${repo.slug} effective branch rule ${index}`,
+    );
+  }
+  return projection;
+}
+
+async function loadEffectiveBranchRules(repo) {
+  const response = await ghJson(
+    `repos/${encodeEndpointPath(repo.slug)}/rules/branches/${encodeURIComponent(repo.default_branch)}?per_page=100`,
+    { paginate: true },
+  );
+  if (
+    !Array.isArray(response) ||
+    response.some((page) => !Array.isArray(page))
+  ) {
+    throw new Error(`${repo.slug} effective branch-rule inventory is malformed.`);
+  }
+  return response
+    .flat()
+    .map((rule, index) => canonicalEffectiveBranchRule(rule, repo, index))
+    .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+}
+
+function effectiveRuleStatusChecks(rule, repo, index) {
+  if (rule.type !== "required_status_checks") {
+    return [];
+  }
+  return statusChecks(
+    { type: rule.type, parameters: rule.parameters },
+    `${repo.slug} effective branch rule ${index}`,
+  );
+}
+
+function assertEffectiveLegacyClosure(
+  repo,
+  manifest,
+  effectiveBranchRules,
+  cleanup,
+) {
+  const cleanupStateBySurface = new Map(
+    cleanup.map((entry) => [entry.surface, entry.state]),
+  );
+  for (const [index, rule] of effectiveBranchRules.entries()) {
+    for (const check of effectiveRuleStatusChecks(rule, repo, index)) {
+      if (!statusContextEquals(check.context, LEGACY_STATUS_CONTEXT)) {
+        continue;
+      }
+      if (check.context !== LEGACY_STATUS_CONTEXT) {
+        throw new Error(
+          `${repo.slug} effective legacy context must use canonical spelling ${LEGACY_STATUS_CONTEXT}.`,
+        );
+      }
+      if (rule.ruleset_id === manifest.legacy_ruleset.id) {
+        if (
+          rule.ruleset_source_type !== "Organization" ||
+          rule.ruleset_source !== manifest.organization.login
+        ) {
+          throw new Error(
+            `${repo.slug} effective legacy organization rule has an unexpected source identity.`,
+          );
+        }
+        continue;
+      }
+      const localCleanupSurface = `repository_ruleset:${rule.ruleset_id}`;
+      if (cleanupStateBySurface.has(localCleanupSurface)) {
+        if (
+          rule.ruleset_source_type !== "Repository" ||
+          rule.ruleset_source !== repo.slug
+        ) {
+          throw new Error(
+            `${repo.slug} effective local legacy cleanup ruleset has an unexpected source identity.`,
+          );
+        }
+        if (cleanupStateBySurface.get(localCleanupSurface) !== "before") {
+          throw new Error(
+            `${repo.slug} effective local legacy cleanup ruleset still requires the legacy context after its cleanup.`,
+          );
+        }
+        continue;
+      }
+      if (rule.ruleset_id === null) {
+        const classicState = cleanupStateBySurface.get(
+          "classic_required_status_checks",
+        );
+        if (classicState === "before") {
+          continue;
+        }
+        if (classicState === "after") {
+          throw new Error(
+            `${repo.slug} effective classic protection still requires the legacy context after its cleanup.`,
+          );
+        }
+      }
+      if (rule.ruleset_id === null) {
+        throw new Error(
+          `${repo.slug} effective default-branch rules include an unmanifested legacy context from classic protection.`,
+        );
+      }
+      throw new Error(
+        `${repo.slug} effective default-branch rules include an unmanifested legacy context from ruleset ${rule.ruleset_id}.`,
+      );
+    }
+  }
+}
+
+function assertEffectiveOrganizationGateCoverage(snapshot, manifest) {
+  const requireLegacy = snapshot.organization.legacy_state === "before";
+  const requireV2 = snapshot.organization.v2_state === "active";
+  for (const repository of snapshot.repositories) {
+    const rules = repository.effective_default_branch_rules;
+    const repositoryLabel = { slug: repository.identity.full_name };
+    const matches = (context, rulesetId) =>
+      rules.flatMap(
+        (rule, index) => {
+          if (
+            rule.ruleset_id !== rulesetId ||
+            rule.ruleset_source_type !== "Organization" ||
+            rule.ruleset_source !== manifest.organization.login
+          ) {
+            return [];
+          }
+          return effectiveRuleStatusChecks(rule, repositoryLabel, index)
+            .filter(
+              (check) =>
+                check.context === context &&
+                (context !== V2_STATUS_CONTEXT ||
+                  check.integration_id === GITHUB_ACTIONS_INTEGRATION_ID),
+            )
+            .map((check) => ({ rule, index, check }));
+        },
+      );
+    const legacyMatches = matches(
+      LEGACY_STATUS_CONTEXT,
+      manifest.legacy_ruleset.id,
+    );
+    const v2Matches = matches(V2_STATUS_CONTEXT, manifest.v2_ruleset.id);
+    if (requireLegacy && legacyMatches.length !== 1) {
+      throw new Error(
+        `${repository.identity.full_name} must have exactly one effective manifest-bound legacy organization status rule.`,
+      );
+    }
+    if (!requireLegacy && legacyMatches.length !== 0) {
+      throw new Error(
+        `${repository.identity.full_name} still has the effective legacy organization status rule after cutover.`,
+      );
+    }
+    if (requireV2 && v2Matches.length !== 1) {
+      throw new Error(
+        `${repository.identity.full_name} must have exactly one effective manifest-bound v2 organization status rule.`,
+      );
+    }
+  }
+}
+
 function classifyCleanupSurface(action, actual) {
   if (canonicalJson(actual) === canonicalJson(action.expected_before)) {
     return "before";
@@ -1896,37 +2246,50 @@ function classifyCleanupSurface(action, actual) {
   throw new Error("Repository legacy cleanup surface matches neither bound snapshot.");
 }
 
-async function loadRepositoryEvidence(repo, { requireCanaryEvidence = true } = {}) {
+async function loadRepositoryEvidence(
+  repo,
+  { requireCanaryEvidence = true, manifest } = {},
+) {
+  if (manifest === undefined) {
+    throw new Error("Repository evidence requires the validated handoff manifest.");
+  }
   const metadataPromise = ghJson(`repos/${encodeEndpointPath(repo.slug)}`);
+  const defaultBranchPromise = loadDefaultBranchHead(repo, {
+    requireCanaryBase: requireCanaryEvidence,
+  });
   const canaryEvidencePromise = requireCanaryEvidence
-    ? Promise.all([
+    ? Promise.allSettled([
         loadCanaryPull(repo),
         loadV2CanaryEvidence(repo),
         loadLegacyStatusEvidence(repo),
-      ])
+      ]).then((results) => {
+        const rejected = results.find((result) => result.status === "rejected");
+        if (rejected !== undefined) throw rejected.reason;
+        return results.map((result) => result.value);
+      })
     : Promise.resolve(null);
+  const [metadata, defaultBranch, canaryEvidence] = await Promise.all([
+    metadataPromise,
+    defaultBranchPromise,
+    canaryEvidencePromise,
+  ]);
   const [
-    metadata,
-    defaultBranch,
     workflowControlPlane,
     v2Ruleset,
-    canaryEvidence,
     codeowners,
     actionsWorkflowPermissions,
     localRulesets,
     classicStatus,
-  ] =
-    await Promise.all([
-      metadataPromise,
-      loadDefaultBranchHead(repo),
-      loadWorkflowInventoryEvidence(repo),
-      loadRepositoryRuleset(repo),
-      canaryEvidencePromise,
-      loadCodeownersEvidence(repo),
-      loadActionsWorkflowPermissions(repo),
-      loadLocalRepositoryRulesets(repo),
-      loadClassicStatusSurface(repo),
-    ]);
+    effectiveBranchRules,
+  ] = await Promise.all([
+    loadWorkflowInventoryEvidence(repo, defaultBranch.head_sha),
+    loadRepositoryRuleset(repo),
+    loadCodeownersEvidence(repo, defaultBranch.head_sha),
+    loadActionsWorkflowPermissions(repo),
+    loadLocalRepositoryRulesets(repo),
+    loadClassicStatusSurface(repo),
+    loadEffectiveBranchRules(repo),
+  ]);
   assertPlainObject(metadata, `${repo.slug} repository metadata`);
   const identity = {
     full_name: metadata.full_name,
@@ -1991,6 +2354,7 @@ async function loadRepositoryEvidence(repo, { requireCanaryEvidence = true } = {
       snapshot: actual,
     };
   });
+  assertEffectiveLegacyClosure(repo, manifest, effectiveBranchRules, cleanup);
   return {
     identity,
     default_branch: defaultBranch,
@@ -2011,8 +2375,40 @@ async function loadRepositoryEvidence(repo, { requireCanaryEvidence = true } = {
       rulesets: localRulesets,
       classic_required_status_checks: classicStatus,
     },
+    effective_default_branch_rules: effectiveBranchRules,
     legacy_cleanup: cleanup,
   };
+}
+
+export async function mapWithConcurrency(items, limit, mapper) {
+  if (!Array.isArray(items) || !Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error("Bounded mapper requires an array and positive safe-integer limit.");
+  }
+  if (typeof mapper !== "function") {
+    throw new Error("Bounded mapper requires a mapper function.");
+  }
+  const results = new Array(items.length);
+  let next = 0;
+  let firstError = null;
+  const workerCount = Math.min(limit, items.length);
+  await Promise.allSettled(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        if (firstError !== null) return;
+        const index = next;
+        next += 1;
+        if (index >= items.length) return;
+        try {
+          results[index] = await mapper(items[index], index);
+        } catch (error) {
+          if (firstError === null) firstError = error;
+          return;
+        }
+      }
+    }),
+  );
+  if (firstError !== null) throw firstError;
+  return results;
 }
 
 async function loadCoverageRound(
@@ -2021,13 +2417,16 @@ async function loadCoverageRound(
 ) {
   const [organization, repositories] = await Promise.all([
     loadOrganizationRound(manifest),
-    Promise.all(
-      manifest.repositories.map((repo) =>
-        loadRepositoryEvidence(repo, { requireCanaryEvidence }),
-      ),
+    mapWithConcurrency(
+      manifest.repositories,
+      REPOSITORY_EVIDENCE_CONCURRENCY,
+      (repo) =>
+        loadRepositoryEvidence(repo, { requireCanaryEvidence, manifest }),
     ),
   ]);
-  return { organization, repositories };
+  const snapshot = { organization, repositories };
+  assertEffectiveOrganizationGateCoverage(snapshot, manifest);
+  return snapshot;
 }
 
 async function loadPostActivationRound(manifest) {
@@ -2046,6 +2445,18 @@ function assertCleanupState(snapshot, requiredState) {
   }
 }
 
+function assertCleanupStates(snapshot, allowedStates) {
+  for (const [repoIndex, repository] of snapshot.repositories.entries()) {
+    for (const [actionIndex, action] of repository.legacy_cleanup.entries()) {
+      assertState(
+        action.state,
+        allowedStates,
+        `${snapshot.repositories[repoIndex].identity.full_name} legacy cleanup action ${actionIndex}`,
+      );
+    }
+  }
+}
+
 function planDigest(plan) {
   return sha256Canonical(plan);
 }
@@ -2059,16 +2470,56 @@ function mutationDescriptor(method, endpoint, payload = undefined) {
   return descriptor;
 }
 
-function buildRepositoryExternalActions(manifest) {
-  return manifest.repositories.flatMap((repo) =>
-    repo.legacy_cleanup.map((action) => {
+function buildRepositoryExternalActionRecords(manifest, snapshot = null) {
+  if (
+    snapshot !== null &&
+    (!Array.isArray(snapshot.repositories) ||
+      snapshot.repositories.length !== manifest.repositories.length)
+  ) {
+    throw new Error("Repository cleanup snapshot does not match the manifest cohort.");
+  }
+  return manifest.repositories.flatMap((repo, repositoryIndex) =>
+    repo.legacy_cleanup.map((action, actionIndex) => {
+      const observed = snapshot?.repositories[repositoryIndex]?.legacy_cleanup?.[actionIndex];
+      if (snapshot !== null) {
+        if (
+          observed === undefined ||
+          snapshot.repositories[repositoryIndex].identity.full_name !== repo.slug
+        ) {
+          throw new Error("Repository cleanup snapshot action ordering drifted.");
+        }
+        assertState(
+          observed.state,
+          ["before", "after"],
+          `${repo.slug} repository cleanup action ${actionIndex}`,
+        );
+      }
       const derived = deriveRepositoryCleanupAction(action);
       const endpoint =
         action.surface === "repository_ruleset"
           ? repositoryRulesetMutationEndpoint(repo, action.ruleset_id)
           : classicStatusEndpoint(repo);
-      const method = derived.operation === "delete" ? "DELETE" : "PUT";
-      const result = {
+      const method =
+        derived.operation === "delete"
+          ? "DELETE"
+          : action.surface === "repository_ruleset"
+            ? "PUT"
+            : "PATCH";
+      return {
+        repo,
+        action,
+        state: observed?.state ?? "before",
+        derived,
+        endpoint,
+        method,
+      };
+    }),
+  );
+}
+
+function repositoryExternalActionOutput(record) {
+  const { repo, action, endpoint, method } = record;
+  const result = {
         repository: repo.slug,
         surface: action.surface,
         before_sha256: sha256Canonical(action.expected_before),
@@ -2079,15 +2530,19 @@ function buildRepositoryExternalActions(manifest) {
         mutation: mutationDescriptor(
           method,
           endpoint,
-          method === "PUT" ? action.expected_after : undefined,
+          method === "DELETE" ? undefined : action.expected_after,
         ),
       };
-      if (action.surface === "repository_ruleset") {
-        result.ruleset_id = action.ruleset_id;
-      }
-      return result;
-    }),
-  );
+  if (action.surface === "repository_ruleset") {
+    result.ruleset_id = action.ruleset_id;
+  }
+  return result;
+}
+
+function buildRepositoryExternalActions(manifest, snapshot = null) {
+  return buildRepositoryExternalActionRecords(manifest, snapshot)
+    .filter((record) => record.state === "before")
+    .map(repositoryExternalActionOutput);
 }
 
 async function readExactHandleBytes(handle, size, label) {
@@ -2178,6 +2633,7 @@ function readCliOptions(argv = process.argv.slice(2)) {
       manifest: { type: "string" },
       mode: { type: "string" },
       apply: { type: "boolean", default: false },
+      "recover-created-v2": { type: "boolean", default: false },
       "expected-plan-sha256": { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -2192,8 +2648,26 @@ function readCliOptions(argv = process.argv.slice(2)) {
   if (!MODES.has(values.mode)) {
     throw new Error(`--mode must be one of: ${[...MODES].join(", ")}.`);
   }
-  if (values.apply && !new Set(["stage", "activate", "verify"]).has(values.mode)) {
-    throw new Error("--apply is valid only with stage, activate, or verify mode.");
+  if (
+    values.apply &&
+    !new Set(["stage", "activate", "apply-repository-cleanup", "verify"]).has(
+      values.mode,
+    )
+  ) {
+    throw new Error(
+      "--apply is valid only with stage, activate, apply-repository-cleanup, or verify mode.",
+    );
+  }
+  if (values["recover-created-v2"] && values.mode !== "stage") {
+    throw new Error("--recover-created-v2 is valid only with stage mode.");
+  }
+  if (values["recover-created-v2"] && values.apply) {
+    throw new Error("--recover-created-v2 is read-only and cannot be combined with --apply.");
+  }
+  if (values["recover-created-v2"] && values["expected-plan-sha256"] !== undefined) {
+    throw new Error(
+      "--recover-created-v2 is read-only and cannot be combined with --expected-plan-sha256.",
+    );
   }
   if (values.apply && values["expected-plan-sha256"] === undefined) {
     throw new Error("--apply requires --expected-plan-sha256 from the matching preview.");
@@ -2209,6 +2683,7 @@ function readCliOptions(argv = process.argv.slice(2)) {
     manifestPath: values.manifest,
     mode: values.mode,
     apply: values.apply,
+    recoverCreatedV2: values["recover-created-v2"],
     expectedPlanSha256: values["expected-plan-sha256"] ?? null,
   };
 }
@@ -2217,18 +2692,21 @@ function printUsage() {
   process.stdout.write(`Usage:
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode plan
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode stage [--apply --expected-plan-sha256 SHA256]
+  node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode stage --recover-created-v2
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode activate [--apply --expected-plan-sha256 SHA256]
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode derive-cutover
+  node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode apply-repository-cleanup [--apply --expected-plan-sha256 SHA256]
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode verify [--apply --expected-plan-sha256 SHA256]
 
 Modes:
   plan            Read two complete organization snapshots and report the bound phase.
-  stage           Preview or create the exact Disabled v2 organization ruleset.
+  stage           Preview or create the exact Disabled v2 organization ruleset; --recover-created-v2 is the read-only recovery path for an ambiguous create.
   activate        Require 11/11 workflow, bridge, repo-ruleset, and canary proof; preview or activate v2.
-  derive-cutover  Read-only derivation of manifest-bound external repository cleanup actions and the later organization cutover.
+  derive-cutover  Read-only derivation of remaining manifest-bound repository cleanup actions and the later organization cutover.
+  apply-repository-cleanup  Preview or apply the remaining repository cleanup actions with per-action exact-before/readback checks.
   verify          Verify external repository cleanup; preview or apply removal of the whole legacy organization status rule, then close with two reads.
 
-All mutation modes default to preview. Every --apply requires the exact plan digest emitted by its immediately matching preview. This helper never writes a repository-level ruleset or classic branch-protection endpoint.
+All mutation modes default to preview. Every --apply requires the exact plan digest emitted by its immediately matching preview. Repository cleanup writes require the documented organization/repository policy-mutation freeze because GitHub does not offer a supported compare-and-swap precondition for these endpoints.
 `);
 }
 
@@ -2239,6 +2717,44 @@ function baseOutput(mode, manifest, snapshot) {
     organization: cloneJson(manifest.organization),
     manifest_sha256: sha256Canonical(manifest),
     snapshot_sha256: sha256Canonical(snapshot),
+  };
+}
+
+function finalClosureReceipt(manifest, snapshot) {
+  if (
+    snapshot.organization.legacy_state !== "after" ||
+    snapshot.organization.v2_state !== "active"
+  ) {
+    throw new Error("Final closure receipt requires an active v2 and removed legacy organization rule.");
+  }
+  const repositories = snapshot.repositories
+    .map((repository) => cloneJson(repository.identity))
+    .sort((left, right) => left.full_name.localeCompare(right.full_name));
+  if (repositories.length !== REQUIRED_REPOSITORY_COUNT) {
+    throw new Error("Final closure receipt requires the complete repository cohort.");
+  }
+  return {
+    schema_version: 1,
+    organization: cloneJson(snapshot.organization.organization),
+    manifest_sha256: sha256Canonical(manifest),
+    snapshot_sha256: sha256Canonical(snapshot),
+    legacy_ruleset: {
+      id: snapshot.organization.legacy.id,
+      state: snapshot.organization.legacy_state,
+    },
+    v2_ruleset: {
+      id: snapshot.organization.v2.id,
+      state: snapshot.organization.v2_state,
+    },
+    repositories,
+  };
+}
+
+function finalClosureReceiptOutput(manifest, snapshot) {
+  const receipt = finalClosureReceipt(manifest, snapshot);
+  return {
+    final_closure_receipt: receipt,
+    final_closure_receipt_sha256: sha256Canonical(receipt),
   };
 }
 
@@ -2266,7 +2782,89 @@ async function runPlanMode(manifest, runtime) {
   };
 }
 
+async function loadRecoverableStageSnapshot(
+  manifest,
+  runtime,
+  { expectedCreatedId = null, label = "Recoverable v2 organization ruleset" } = {},
+) {
+  if (manifest.v2_ruleset.id !== null) {
+    throw new Error("v2 stage recovery requires manifest.v2_ruleset.id to be null.");
+  }
+  if (expectedCreatedId !== null) {
+    assertPositiveInteger(expectedCreatedId, "Recovered v2 organization ruleset ID");
+  }
+  const snapshot = await loadStable(label, () =>
+    loadOrganizationRound(manifest, { allowUnboundV2: true }),
+    runtime.stableSnapshotOptions,
+  );
+  assertState(snapshot.legacy_state, ["before"], "Legacy organization ruleset");
+  assertState(snapshot.v2_state, ["disabled"], "Recoverable v2 organization ruleset");
+  if (snapshot.v2 === null) {
+    throw new Error("No recoverable v2 organization ruleset exists.");
+  }
+  if (expectedCreatedId !== null && snapshot.v2.id !== expectedCreatedId) {
+    throw new Error(
+      "Recovered v2 organization ruleset ID does not match the post request's exact receipt.",
+    );
+  }
+  return snapshot;
+}
+
+function assertStageRecoveryTransition(before, after, expectedCreatedId = null) {
+  if (
+    canonicalJson(before.organization) !== canonicalJson(after.organization) ||
+    canonicalJson(before.legacy) !== canonicalJson(after.legacy) ||
+    before.legacy_state !== "before" ||
+    after.legacy_state !== "before" ||
+    after.v2 === null
+  ) {
+    throw new Error(
+      "Stage recovery observed organization or legacy ruleset drift and cannot adopt a candidate.",
+    );
+  }
+  if (expectedCreatedId !== null && after.v2.id !== expectedCreatedId) {
+    throw new Error(
+      "Stage recovery candidate differs from the ID returned by the original POST receipt.",
+    );
+  }
+  const priorSummaries = before.summaries;
+  const recoveredSummaries = after.summaries.filter(
+    (summary) => summary.id !== after.v2.id,
+  );
+  if (canonicalJson(priorSummaries) !== canonicalJson(recoveredSummaries)) {
+    throw new Error(
+      "Stage recovery observed an organization ruleset inventory change beyond the one v2 candidate.",
+    );
+  }
+}
+
+function stageRecoveryOutput(
+  manifest,
+  snapshot,
+  { status, action, planSha256, applied = false },
+) {
+  return {
+    ...baseOutput("stage", manifest, snapshot),
+    status,
+    applied,
+    ...(planSha256 === undefined ? {} : { plan_sha256: planSha256 }),
+    ...(action === undefined ? {} : { action }),
+    created_v2_ruleset_id: snapshot.v2.id,
+    next_manifest_update: {
+      v2_ruleset: { id: snapshot.v2.id, name: V2_RULESET_NAME },
+    },
+  };
+}
+
 async function runStageMode(manifest, options, runtime) {
+  if (options.recoverCreatedV2) {
+    const snapshot = await loadRecoverableStageSnapshot(manifest, runtime, {
+      label: "Explicit v2 organization ruleset stage recovery",
+    });
+    return stageRecoveryOutput(manifest, snapshot, {
+      status: "recovered-created-v2",
+    });
+  }
   const snapshot = await loadStable("Organization staging precondition", () =>
     loadOrganizationRound(manifest),
     runtime.stableSnapshotOptions,
@@ -2309,37 +2907,63 @@ async function runStageMode(manifest, options, runtime) {
     snapshot,
     () => loadOrganizationRound(manifest),
   );
-  const response = await ghJson(action.endpoint, { method: "POST", body: desired });
-  const created = writableRulesetFromApi(
-    response,
-    "Organization",
-    manifest.organization.login,
-    "Created v2 organization ruleset",
-  );
-  assertExactSnapshot(created.writable, desired, "Created v2 organization ruleset");
-  if (
-    created.id === manifest.legacy_ruleset.id ||
-    snapshot.summaries.some((summary) => summary.id === created.id)
-  ) {
-    throw new Error("Create response did not return a fresh v2 ruleset ID.");
+  let createdId = null;
+  try {
+    const response = await ghJson(action.endpoint, { method: "POST", body: desired });
+    if (Number.isSafeInteger(response?.id) && response.id > 0) {
+      createdId = response.id;
+    }
+    const created = writableRulesetFromApi(
+      response,
+      "Organization",
+      manifest.organization.login,
+      "Created v2 organization ruleset",
+    );
+    assertExactSnapshot(created.writable, desired, "Created v2 organization ruleset");
+    if (
+      created.id === manifest.legacy_ruleset.id ||
+      snapshot.summaries.some((summary) => summary.id === created.id)
+    ) {
+      throw new Error("Create response did not return a fresh v2 ruleset ID.");
+    }
+    createdId = created.id;
+    const boundManifest = cloneJson(manifest);
+    boundManifest.v2_ruleset.id = created.id;
+    const readback = await loadStable("Staged v2 organization ruleset readback", () =>
+      loadOrganizationRound(boundManifest),
+      runtime.stableSnapshotOptions,
+    );
+    assertState(readback.legacy_state, ["before"], "Legacy organization ruleset");
+    assertState(readback.v2_state, ["disabled"], "v2 organization ruleset");
+    return {
+      ...baseOutput("stage", manifest, readback),
+      status: "applied",
+      applied: true,
+      plan_sha256: digest,
+      action,
+      created_v2_ruleset_id: created.id,
+      next_manifest_update: { v2_ruleset: { id: created.id, name: V2_RULESET_NAME } },
+    };
+  } catch (error) {
+    try {
+      const recovered = await loadRecoverableStageSnapshot(manifest, runtime, {
+        expectedCreatedId: createdId,
+        label: "Ambiguous v2 organization ruleset stage recovery",
+      });
+      assertStageRecoveryTransition(snapshot, recovered, createdId);
+      return stageRecoveryOutput(manifest, recovered, {
+        status: "applied-recovered",
+        action,
+        planSha256: digest,
+        applied: true,
+      });
+    } catch (recoveryError) {
+      throw new Error(
+        "Stage creation outcome is unknown; do not replay POST. Run stage --recover-created-v2 under the organization policy-mutation freeze.",
+        { cause: recoveryError ?? error },
+      );
+    }
   }
-  const boundManifest = cloneJson(manifest);
-  boundManifest.v2_ruleset.id = created.id;
-  const readback = await loadStable("Staged v2 organization ruleset readback", () =>
-    loadOrganizationRound(boundManifest),
-    runtime.stableSnapshotOptions,
-  );
-  assertState(readback.legacy_state, ["before"], "Legacy organization ruleset");
-  assertState(readback.v2_state, ["disabled"], "v2 organization ruleset");
-  return {
-    ...baseOutput("stage", manifest, readback),
-    status: "applied",
-    applied: true,
-    plan_sha256: digest,
-    action,
-    created_v2_ruleset_id: created.id,
-    next_manifest_update: { v2_ruleset: { id: created.id, name: V2_RULESET_NAME } },
-  };
 }
 
 function assertCoveragePhase(snapshot, { legacyState, v2State, cleanupState }) {
@@ -2353,7 +2977,9 @@ function assertCoveragePhase(snapshot, { legacyState, v2State, cleanupState }) {
     Array.isArray(v2State) ? v2State : [v2State],
     "v2 organization ruleset",
   );
-  assertCleanupState(snapshot, cleanupState);
+  if (cleanupState !== undefined) {
+    assertCleanupState(snapshot, cleanupState);
+  }
 }
 
 async function runActivateMode(manifest, options, runtime) {
@@ -2454,12 +3080,11 @@ async function runDeriveCutoverMode(manifest, runtime) {
   assertCoveragePhase(snapshot, {
     legacyState: "before",
     v2State: "active",
-    cleanupState: "before",
   });
-  const externalActions = buildRepositoryExternalActions(manifest);
-  if (externalActions.length !== manifest.expected_legacy_cleanup_action_count) {
-    throw new Error("Derived repository cleanup action count drifted from the manifest.");
-  }
+  assertCleanupStates(snapshot, ["before", "after"]);
+  const externalActions = buildRepositoryExternalActions(manifest, snapshot);
+  const completedActionCount =
+    manifest.expected_legacy_cleanup_action_count - externalActions.length;
   const organizationAction = mutationDescriptor(
     "PUT",
     organizationRulesetEndpoint(manifest, manifest.legacy_ruleset.id),
@@ -2470,6 +3095,7 @@ async function runDeriveCutoverMode(manifest, runtime) {
     manifest_sha256: sha256Canonical(manifest),
     snapshot_sha256: sha256Canonical(snapshot),
     external_repository_actions: externalActions,
+    completed_repository_cleanup_action_count: completedActionCount,
     organization_action_after_external_verification: organizationAction,
   };
   return {
@@ -2477,13 +3103,157 @@ async function runDeriveCutoverMode(manifest, runtime) {
     status: "derived-read-only",
     plan_sha256: planDigest(plan),
     external_repository_actions: externalActions,
+    completed_repository_cleanup_action_count: completedActionCount,
     organization_action_after_external_verification: organizationAction,
     sequencing: [
-      "execute-and-read-back-external-repository-actions",
+      "apply-repository-cleanup-preview",
+      "apply-repository-cleanup-with-exact-plan-digest",
       "run-verify-preview",
       "run-verify-apply-with-exact-plan-digest",
       "run-verify-again-for-final-two-read-closure",
     ],
+  };
+}
+
+async function loadRepositoryCleanupSurface(repo, action) {
+  if (action.surface === "repository_ruleset") {
+    const response = await ghJson(
+      repositoryRulesetEndpoint(repo, action.ruleset_id),
+      { allowNotFound: action.expected_after === null },
+    );
+    if (response === GH_NOT_FOUND) return null;
+    const ruleset = writableRulesetFromApi(
+      response,
+      "Repository",
+      repo.slug,
+      `${repo.slug} repository cleanup ruleset ${action.ruleset_id}`,
+    );
+    if (ruleset.id !== action.ruleset_id) {
+      throw new Error(`${repo.slug} repository cleanup ruleset returned the wrong ID.`);
+    }
+    return ruleset.writable;
+  }
+  if (action.surface === "classic_required_status_checks") {
+    return loadClassicStatusSurface(repo);
+  }
+  throw new Error("Unsupported repository cleanup surface.");
+}
+
+async function classifyLiveRepositoryCleanupSurface(record) {
+  const actual = await loadRepositoryCleanupSurface(record.repo, record.action);
+  return {
+    actual,
+    state: classifyCleanupSurface(record.action, actual),
+  };
+}
+
+async function executeRepositoryCleanupRecord(record) {
+  const initial = await classifyLiveRepositoryCleanupSurface(record);
+  if (initial.state === "after") {
+    return { ...record, outcome: "already-reconciled" };
+  }
+  const payload =
+    record.method === "DELETE" ? undefined : record.action.expected_after;
+  try {
+    await ghJson(record.endpoint, { method: record.method, body: payload });
+  } catch (error) {
+    let reconciliation;
+    try {
+      reconciliation = await classifyLiveRepositoryCleanupSurface(record);
+    } catch (readbackError) {
+      throw new Error(
+        `${record.repo.slug} repository cleanup write outcome is unknown; do not replay it. Re-run a fresh apply-repository-cleanup preview under the policy-mutation freeze.`,
+        { cause: readbackError },
+      );
+    }
+    if (reconciliation.state === "after") {
+      return { ...record, outcome: "reconciled-after-write-error" };
+    }
+    throw new Error(
+      `${record.repo.slug} repository cleanup write did not reach its expected-after state; do not replay it. Re-run a fresh preview after resolving the error.`,
+      { cause: error },
+    );
+  }
+  const readback = await classifyLiveRepositoryCleanupSurface(record);
+  if (readback.state !== "after") {
+    throw new Error(
+      `${record.repo.slug} repository cleanup write did not produce its exact expected-after state.`,
+    );
+  }
+  return { ...record, outcome: "applied" };
+}
+
+async function runApplyRepositoryCleanupMode(manifest, options, runtime) {
+  if (manifest.v2_ruleset.id === null) {
+    throw new Error("apply-repository-cleanup requires manifest.v2_ruleset.id.");
+  }
+  const snapshot = await loadStable("Repository cleanup precondition", () =>
+    loadPostActivationRound(manifest),
+    runtime.stableSnapshotOptions,
+  );
+  assertCoveragePhase(snapshot, {
+    legacyState: "before",
+    v2State: "active",
+  });
+  assertCleanupStates(snapshot, ["before", "after"]);
+  const pendingRecords = buildRepositoryExternalActionRecords(manifest, snapshot)
+    .filter((record) => record.state === "before");
+  const externalActions = pendingRecords.map(repositoryExternalActionOutput);
+  const plan = {
+    mode: "apply-repository-cleanup",
+    manifest_sha256: sha256Canonical(manifest),
+    snapshot_sha256: sha256Canonical(snapshot),
+    external_repository_actions: externalActions,
+  };
+  const digest = planDigest(plan);
+  assertExpectedPlan(options, digest);
+  if (!options.apply || pendingRecords.length === 0) {
+    return {
+      ...baseOutput("apply-repository-cleanup", manifest, snapshot),
+      status:
+        pendingRecords.length === 0
+          ? "verified-repository-cleanup"
+          : "preview",
+      applied: false,
+      plan_sha256: digest,
+      external_repository_actions: externalActions,
+      completed_repository_cleanup_action_count:
+        manifest.expected_legacy_cleanup_action_count - pendingRecords.length,
+    };
+  }
+  await revalidateUnchangedBeforeMutation(
+    "Repository cleanup precondition",
+    snapshot,
+    () => loadPostActivationRound(manifest),
+  );
+  const outcomes = [];
+  for (const record of pendingRecords) {
+    outcomes.push(await executeRepositoryCleanupRecord(record));
+  }
+  const readback = await loadStable("Repository cleanup readback", () =>
+    loadPostActivationRound(manifest),
+    runtime.stableSnapshotOptions,
+  );
+  assertCoveragePhase(readback, {
+    legacyState: "before",
+    v2State: "active",
+    cleanupState: "after",
+  });
+  return {
+    ...baseOutput("apply-repository-cleanup", manifest, readback),
+    status: "applied-repository-cleanup-verified",
+    applied: true,
+    plan_sha256: digest,
+    external_repository_actions: externalActions,
+    execution_outcomes: outcomes.map(({ repo, action, outcome }) => ({
+      repository: repo.slug,
+      surface:
+        action.surface === "repository_ruleset"
+          ? `repository_ruleset:${action.ruleset_id}`
+          : action.surface,
+      outcome,
+    })),
+    repositories_verified: readback.repositories.length,
   };
 }
 
@@ -2519,7 +3289,7 @@ async function runVerifyMode(manifest, options, runtime) {
   const digest = planDigest(plan);
   assertExpectedPlan(options, digest);
   if (!options.apply || action === null) {
-    return {
+    const output = {
       ...baseOutput("verify", manifest, snapshot),
       status: action === null ? "final-verified" : "preview-cutover-ready",
       applied: false,
@@ -2527,6 +3297,9 @@ async function runVerifyMode(manifest, options, runtime) {
       action,
       repositories_verified: snapshot.repositories.length,
     };
+    return action === null
+      ? { ...output, ...finalClosureReceiptOutput(manifest, snapshot) }
+      : output;
   }
   await revalidateUnchangedBeforeMutation(
     "Post-repository-cleanup verification",
@@ -2613,6 +3386,9 @@ export async function runCli(
     case "derive-cutover":
       output = await runDeriveCutoverMode(manifest, runtime);
       break;
+    case "apply-repository-cleanup":
+      output = await runApplyRepositoryCleanupMode(manifest, options, runtime);
+      break;
     case "verify":
       output = await runVerifyMode(manifest, options, runtime);
       break;
@@ -2624,8 +3400,61 @@ export async function runCli(
 }
 
 const GH_NOT_FOUND = Symbol("GitHub API not found");
+const ghApiSlots = {
+  active: 0,
+  waiters: [],
+};
+
+async function withGhApiSlot(callback) {
+  if (typeof callback !== "function") {
+    throw new Error("GitHub API slot callback must be a function.");
+  }
+  await new Promise((resolvePromise, rejectPromise) => {
+    if (ghApiSlots.active < GH_API_CONCURRENCY) {
+      ghApiSlots.active += 1;
+      resolvePromise();
+      return;
+    }
+    let settled = false;
+    const waiter = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise();
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const index = ghApiSlots.waiters.indexOf(waiter);
+      if (index !== -1) ghApiSlots.waiters.splice(index, 1);
+      rejectPromise(
+        new Error(
+          `GitHub API queue remained full for ${GH_API_QUEUE_TIMEOUT_MS}ms; the result is inconclusive and no next write is allowed.`,
+        ),
+      );
+    }, GH_API_QUEUE_TIMEOUT_MS);
+    ghApiSlots.waiters.push(waiter);
+  });
+  try {
+    return await callback();
+  } finally {
+    const next = ghApiSlots.waiters.shift();
+    if (next === undefined) {
+      ghApiSlots.active -= 1;
+    } else {
+      next();
+    }
+  }
+}
 
 function ghJson(
+  endpoint,
+  options = {},
+) {
+  return withGhApiSlot(() => ghJsonUnbounded(endpoint, options));
+}
+
+function ghJsonUnbounded(
   endpoint,
   { method = "GET", body = undefined, paginate = false, allowNotFound = false } = {},
 ) {

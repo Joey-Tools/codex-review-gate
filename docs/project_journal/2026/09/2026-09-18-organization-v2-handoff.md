@@ -61,16 +61,30 @@ superseded_by:
   and read back across the full cohort. This intentionally creates a temporary
   dual-protection interval.
 - The nine repository-local legacy required-status entries are then removed by
-  explicit, snapshot-bound actions which preserve their other rules. Only after
-  their readback and a full cohort pre-cutover snapshot may the old organization
-  ruleset be updated.
+  the controlled `apply-repository-cleanup` mode. Each snapshot-bound action
+  performs GET, exact-before comparison, the surface-specific mutation, and
+  exact-after readback while preserving every other rule. A stable mixture of
+  before/after items is resumable and plans only the remaining before-state
+  items. Only after their readback and a full cohort pre-cutover snapshot may
+  the old organization ruleset be updated.
 - The sole old-rule cutover mutation is a `PUT` to the existing ruleset ID that
   removes its `codex/review-gate` required-status rule. It never deletes the
   ruleset. Two complete, stable cohort snapshots must show that every member is
   covered by v2 and that all old non-v1 policy is unchanged.
-- Removal of each temporary bridge is a later, separate PR phase. It returns
-  consumers to the ordinary no-v1-caller installation contract after the
-  global cutover is closed.
+- The mutating `verify --apply` response does not authorize bridge removal.
+  While the final policy-mutation freeze remains active, a separate read-only
+  `verify` must return top-level
+  `schema_version: organization-review-gate-handoff-output/v1`, `mode: verify`,
+  `status: final-verified`, `applied: false`, and `action: null`. Its schema-v1
+  final-closure receipt
+  binds the organization, reviewed manifest digest, final snapshot digest,
+  terminal legacy/v2 ruleset identities/states, and the exact repository
+  cohort; its canonical SHA-256 is the explicit removal proof.
+- Removal of each temporary bridge is a later, separate PR phase. The local
+  bootstrap accepts only the complete final read-only verify JSON, its exact
+  embedded-receipt SHA-256, and a target worktree whose GitHub `origin` is an
+  exact cohort member. This returns consumers to the ordinary no-v1-caller
+  installation contract after the global cutover is closed.
 
 ## Current State
 
@@ -106,15 +120,50 @@ superseded_by:
   benign transport metadata.
 - Activation requires the live open/non-draft canary evidence through its
   post-write dual-enforcement readback. Once that readback succeeds, later
-  derive/verify snapshots deliberately omit the closed canary lifecycle while
-  retaining every canonical control-plane and policy check.
+  derive/cleanup/verify snapshots deliberately omit the closed canary
+  lifecycle and do not require the default-branch head to remain at the
+  historical canary base. They reread the live default branch and retain the
+  current repository identity, complete regular-blob workflow inventory,
+  canonical workflow/CODEOWNERS bytes, default-read Actions policy including
+  an explicit boolean `can_approve_pull_request_reviews`, bridge, v2 rulesets,
+  and cleanup-state closure.
+- The operator holds an external organization-admin policy-mutation freeze
+  from stage preview through apply, readback, and any recovery. A second
+  organization/repository-admin freeze covers activation preview through its
+  stable post-write readback. A third begins before repository-cleanup preview
+  and remains continuous through cleanup apply/readback, final-cutover
+  preview/apply, and a separate final read-only verify receipt capture and
+  validation. No ruleset, classic branch-protection, condition, required-check,
+  or bypass-actor mutation is allowed during these intervals. The helper checks
+  the exact manifest-bound bypass lists; it does not automatically discover an
+  actor added outside the snapshot.
 - Before the old organization-rule `PUT`, the helper repeats the complete
   cohort revalidation and then reads the old rule's writable identity directly
   adjacent to the write. GitHub's ruleset update endpoint has no conditional
-  compare-and-swap contract, so the final apply requires an external
-  administrator policy-mutation freeze. Readback proves the response and
-  subsequent state but cannot reconstruct an external update overwritten in
-  the final GET-to-PUT interval.
+  compare-and-swap contract. Plan digests and readback detect observed drift,
+  but cannot prevent or reconstruct an external update overwritten in the
+  final GET-to-PUT interval.
+- A potentially successful but unacknowledged stage POST is never replayed.
+  The apply path first attempts one read-only reconciliation and may return
+  `applied-recovered`; interrupted or still-unknown outcomes use the explicit
+  read-only `stage --recover-created-v2` path. It can bind only one unique
+  same-name candidate whose source and complete writable state exactly match
+  the canonical Disabled v2 payload while the old rule remains at its
+  before-state; absent, multiple, Active, or drifted candidates stop. The
+  recovery read requires an external organization-admin policy-mutation freeze.
+- Repository cleanup accepts a stable before/after mixture and plans only
+  still-before items. Each mutation is preceded by exact-before validation and
+  followed by exact-after readback. An error or unknown write result triggers
+  an immediate narrow read-only reconciliation: exact after is complete, while
+  before, drift, or an unreadable result stops the batch for a fresh reviewed
+  preview. It never blindly replays the old request or digest.
+- The third freeze may end only after the complete final read-only verify JSON
+  and its canonical receipt digest are captured. An inconclusive final read,
+  bound-policy drift, or a known policy mutation before bridge-removal
+  preparation leaves every bridge installed. Recovery is to restore the
+  manifest-bound closure and mint a fresh final read-only receipt under a new
+  freeze; neither the `verify --apply` response nor a known-stale receipt may be
+  substituted.
 - A partial activation remains fail closed: the old v1 rule stays active and
   the new v2 rule is not used as evidence to remove v1. The transaction does
   not automatically delete or weaken either rule.
@@ -133,6 +182,8 @@ superseded_by:
 4. Collect each exact canary proof, activate v2 organization protection, remove
    the bound repository-level legacy contexts, and perform the one old-rule
    v1-status removal with double-read verification.
+5. Capture and validate the separate final read-only closure receipt, then use
+   that repository-bound proof in each bridge-removal PR.
 
 ## Evidence
 
