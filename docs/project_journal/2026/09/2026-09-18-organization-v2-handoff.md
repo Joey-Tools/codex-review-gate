@@ -175,6 +175,12 @@ the global cutover is closed.
   contract covers each accepted state, and the activation integration test
   asserts that both writers are queried for every one before the organization
   v2 activation write.
+- The independent local Terra/high review additionally found that the first
+  regression test reused the production status list, so deleting a state could
+  shrink the drain, fake endpoints, and assertions together. The test now
+  freezes the exact five literal statuses separately before using them to
+  validate the per-status rejection contract. This deliberately guards the
+  production/test boundary rather than only exercising the shared constant.
 - Joey selected `GPT-5.6 Terra` with `high` thinking for subsequent independent
   local Codex review lanes in this workstream. The local review of this repair
   uses that profile; this is a reviewer-profile choice, not part of the

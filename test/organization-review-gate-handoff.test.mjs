@@ -46,6 +46,16 @@ import {
 const HANDOFF_SCRIPT = fileURLToPath(
   new URL("../scripts/organization-review-gate-handoff.mjs", import.meta.url),
 );
+// Keep this independent from the production constant. It freezes the complete
+// documented Actions workflow-run nonterminal set so a future production edit
+// cannot silently shrink both the drain and its fake API coverage together.
+const EXPECTED_NONTERMINAL_WORKFLOW_RUN_STATUSES = Object.freeze([
+  "requested",
+  "waiting",
+  "pending",
+  "queued",
+  "in_progress",
+]);
 const JOEY_TEMPLATE = JSON.parse(
   readFileSync(
     new URL(
@@ -2601,7 +2611,12 @@ test("manifest rejects wildcard and actual default-branch exclusions", () => {
 
 test("legacy bridge status requires a drained old producer inventory", () => {
   const repo = manifestFixture().repositories[0];
-  for (const status of NONTERMINAL_WORKFLOW_RUN_STATUSES) {
+  assert.deepEqual(
+    NONTERMINAL_WORKFLOW_RUN_STATUSES,
+    EXPECTED_NONTERMINAL_WORKFLOW_RUN_STATUSES,
+    "the legacy-writer drain must cover every documented nonterminal workflow-run status",
+  );
+  for (const status of EXPECTED_NONTERMINAL_WORKFLOW_RUN_STATUSES) {
     assert.doesNotThrow(() =>
       validateLegacyProducerRunPages([
         { total_count: 0, workflow_runs: [] },
