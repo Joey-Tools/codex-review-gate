@@ -552,6 +552,12 @@ disable v2 or delete the old organization rule as recovery.
    Stop if `jq -e` fails, the owner is the PR author, the head changes, or a
    later owner review is not an exact-head approval. Do not merge on prose or
    a stale UI indication.
+   This migration PR is a manual trust bootstrap, not its own v2 canary. After
+   it merges, every pre-existing open PR needs a fresh verifier for its current
+   head/base/test-merge scope before v2 becomes required: push a new head,
+   reopen it, or use the documented draft-to-ready transition. `reconcile` can
+   rerun an existing exact verifier but deliberately cannot create one for an
+   arbitrary pre-installation PR.
 10. Preserve the exact `MIGRATION_HEAD` and approval snapshot from step 9.
    Keep every legacy requirement active until merge so later failure remains
    fail closed. The canonical read-only inventory and its SHA-256 were recorded
@@ -711,7 +717,11 @@ The canonical workflows must have this contract after the merge:
   `codex/github-review-gate` on the exact PR feature-head SHA;
 - controller path `.github/workflows/codex-review-gate-controller.yml`, workflow
   name `Codex Review Gate Controller`, exact Codex `issue_comment`
-  `created`/`edited`, and default-branch `workflow_dispatch`;
+  `created`/`edited`, and default-branch `workflow_dispatch`. It intentionally
+  excludes `pull_request_review`: GitHub binds review events to the PR merge
+  ref, so a controller with narrow write authority must not execute that
+  ref. Reconcile review- or reaction-only evidence through the protected
+  default-branch dispatch instead;
 - exact pre-runner sender and author checks for
   `chatgpt-codex-connector[bot]` with type `Bot`;
 - `workflow_dispatch` as the only manual trigger, with `operation`,

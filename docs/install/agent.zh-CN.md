@@ -478,6 +478,10 @@ receipt、切换 `origin` 或绕过这份 proof。
 
    `jq -e` 失败、owner 与 PR author 相同、head 漂移，或该 owner 的后续 review 不是
    exact-head approval 时停止；不得依赖 prose 或 stale UI indication 合并。
+   这个 migration PR 是 manual trust bootstrap，不是它自己的 v2 canary。合入后，所有
+   pre-existing open PR 都必须先为 current head/base/test-merge scope 建立 fresh verifier，v2
+   才能成为 required：push 新 head、reopen，或使用文档中的 draft-to-ready transition。
+   `reconcile` 可以 rerun 已存在的 exact verifier，但刻意不能为任意 pre-installation PR 创建它。
 10. 保留第 9 步的 exact `MIGRATION_HEAD` 与 approval snapshot。进入 transaction 前，完成并
    保留全部 legacy requirements 到 merge 完成，使后续失败仍 fail closed。Owner approval
    第 8 步已用 canonical generator 生成只读 inventory，并把 SHA-256 写入 approval snapshot；它绑定
@@ -626,7 +630,10 @@ receipt、切换 `origin` 或绕过这份 proof。
   `codex/github-review-gate`；
 - controller path `.github/workflows/codex-review-gate-controller.yml`、workflow
   name `Codex Review Gate Controller`、exact Codex `issue_comment`
-  `created`/`edited`，以及 default-branch `workflow_dispatch`；
+  `created`/`edited`，以及 default-branch `workflow_dispatch`。它刻意排除
+  `pull_request_review`：GitHub 将 review event 绑定到 PR merge ref，因此具有狭窄 write
+  authority 的 controller 不得在该 ref 执行。只由 review 或 reaction 承载的 evidence 必须通过
+  受保护 default branch dispatch reconcile；
 - runner 前精确校验 sender 与 author 为
   `chatgpt-codex-connector[bot]`、type `Bot`；
 - manual trigger 只有 `workflow_dispatch`，inputs 为 `operation`、`pr_number`、
