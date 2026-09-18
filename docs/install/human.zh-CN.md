@@ -347,9 +347,11 @@ stable two-snapshot readback，并验证保存的输出。该只读结果顶层�
 `schema_version: "organization-review-gate-handoff-output/v1"`、`mode: "verify"`、
 `status: "final-verified"`、`applied: false`、`action: null`；同时包含
 schema version 1 的 `final_closure_receipt`，绑定 organization、reviewed manifest digest、
-final snapshot digest、legacy/v2 ruleset IDs/states 与 exact repository cohort。
-`final_closure_receipt_sha256` 绑定 canonical embedded receipt。必须完整保留
-`HANDOFF_FINAL_VERIFY` 中的 **整份 verify JSON 输出**，不能只保存嵌套 receipt。
+final snapshot digest、legacy/v2 ruleset IDs/states 与按 canonical UTF-8 byte `full_name` order 排列的
+固定、完整 11 仓 cohort；它不接受任意子集或扩大的 cohort。其 top-level `plan_sha256` 必须精确绑定最终只读
+`verify` plan（`mode`、manifest digest、snapshot digest 与 `action: null`）；
+`final_closure_receipt_sha256` 绑定 canonical embedded receipt。必须完整保留 `HANDOFF_FINAL_VERIFY`
+中的 **整份 verify JSON 输出**，不能只保存嵌套 receipt。
 
 这第三段 freeze 可以在完整输出被捕获且验证后结束。如果只读 verify inconclusive、任何
 bound policy 不一致，或 capture 后到准备 bridge removal 之前发生了已知 organization/
@@ -382,8 +384,13 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
 
 尽管参数名是 `--final-closure-receipt`，它接收的是完整的最终只读 verify JSON 文件。
 Bootstrap 会验证 terminal top-level fields、重新计算 canonical embedded receipt digest、比对
-显式 expected SHA-256，并要求 worktree 的 GitHub `origin` repository 精确存在于 receipt 的
-repository bindings 中。其他 cohort 或 repository 的 receipt 无法授权删除。
+显式 expected SHA-256、解析 worktree 中无歧义的 GitHub `origin`，并从 GitHub 读取当前
+repository metadata。它要求 `full_name`、`id`、`node_id` 与 `default_branch` 都与固定 11 仓
+receipt cohort 中的一项精确相等。在 atomic bridge quarantine rename 前的边界，它会先在
+live-metadata query 前后各读取一次 `origin`，重新验证本地对象后，再紧邻 rename 读取一次
+`origin`。已观测到的同名重建、repository transfer、default-branch drift、metadata 不可读或
+其他 mismatch 都必须 fail closed 并保留 bridge；其他 cohort 或 repository 的 receipt 无法授权
+删除。
 
 Bridge 已经 absent 时，bridge-removal component 是 idempotent no-op；已有但
 non-canonical 的 bridge 则会被拒绝，不会删除未知文件。整个 command 同时也是 canonical

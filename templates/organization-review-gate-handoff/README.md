@@ -100,8 +100,11 @@ JSON output**. It must have top-level
 `final_closure_receipt` with `schema_version: 1`; and publish
 `final_closure_receipt_sha256`. The embedded receipt binds the organization,
 manifest and final snapshot digests, legacy/v2 ruleset IDs and terminal states,
-and the exact repository identities. The SHA-256 binds the canonical embedded
-receipt, not the file's formatting.
+and the fixed, complete eleven repository identities in canonical UTF-8-byte
+`full_name` order. It cannot contain a subset or expanded cohort. Its top-level
+`plan_sha256` binds the final read-only `verify` plan (`mode`, manifest digest,
+snapshot digest, and `action: null`). The receipt SHA-256 binds the canonical
+embedded receipt, not the file's formatting.
 
 Keep all temporary legacy bridge workflows installed until that read-only
 verify reports the final two-snapshot closure: the new organization v2 rule is
@@ -118,6 +121,13 @@ Bridge removal is a later, separate repository-PR phase. Pass the full verify
 output to `bootstrap-codex-review-gate.mjs --remove-legacy-bridge` as
 `--final-closure-receipt PATH`, plus the output's exact canonical receipt
 digest as `--expected-final-closure-receipt-sha256 SHA256`. The bootstrap
-requires the worktree's GitHub `origin` repository to appear in the receipt's
-exact cohort; it rejects an apply result, an extracted receipt object, a stale
-or changed digest, and a receipt for another repository.
+parses the worktree's unambiguous GitHub `origin`, reads current repository
+metadata from GitHub, and requires exact `full_name`, `id`, `node_id`, and
+`default_branch` equality with one entry in the fixed eleven-member receipt
+cohort. At the pre-rename boundary it reads `origin` before and after the live
+metadata query, repeats the local object checks, then reads `origin` once more
+immediately before the atomic bridge quarantine rename. An observed same-name
+re-creation, repository transfer, default-branch drift, unreadable metadata,
+or mismatch fails closed and leaves the bridge installed. It also rejects an
+apply result, an extracted receipt object, a stale or changed digest, and a
+receipt for another repository.

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
@@ -2729,7 +2730,12 @@ function finalClosureReceipt(manifest, snapshot) {
   }
   const repositories = snapshot.repositories
     .map((repository) => cloneJson(repository.identity))
-    .sort((left, right) => left.full_name.localeCompare(right.full_name));
+    .sort((left, right) =>
+      Buffer.compare(
+        Buffer.from(left.full_name, "utf8"),
+        Buffer.from(right.full_name, "utf8"),
+      )
+    );
   if (repositories.length !== REQUIRED_REPOSITORY_COUNT) {
     throw new Error("Final closure receipt requires the complete repository cohort.");
   }

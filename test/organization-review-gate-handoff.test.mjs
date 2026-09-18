@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -1574,7 +1575,12 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
         node_id,
         default_branch,
       }))
-      .sort((left, right) => left.full_name.localeCompare(right.full_name)),
+      .sort((left, right) =>
+        Buffer.compare(
+          Buffer.from(left.full_name, "utf8"),
+          Buffer.from(right.full_name, "utf8"),
+        )
+      ),
   });
   assert.equal(
     verifyCompletePreview.final_closure_receipt_sha256,

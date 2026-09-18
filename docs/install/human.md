@@ -408,8 +408,12 @@ That read-only result must have top-level
 `action: null`. It also embeds
 `final_closure_receipt` schema version 1, binding the organization, reviewed
 manifest digest, final snapshot digest, legacy/v2 ruleset IDs and states, and
-the exact repository cohort. `final_closure_receipt_sha256` binds the canonical
-embedded receipt. Preserve the **complete verify JSON output** at
+the fixed, complete eleven-repository cohort in canonical UTF-8-byte
+`full_name` order.
+It admits neither a subset nor an expanded cohort. Its top-level `plan_sha256`
+must exactly bind the final read-only `verify` plan (`mode`, manifest digest,
+snapshot digest, and `action: null`); `final_closure_receipt_sha256` binds the
+canonical embedded receipt. Preserve the **complete verify JSON output** at
 `HANDOFF_FINAL_VERIFY`; do not save only the embedded receipt.
 
 The third freeze may end after that complete output has been captured and
@@ -449,9 +453,16 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
 Despite its option name, `--final-closure-receipt` takes the complete final
 read-only verify JSON file. The bootstrap validates the terminal top-level
 fields, recomputes the canonical embedded receipt digest, compares the explicit
-expected SHA-256, and requires the worktree's GitHub `origin` repository to be
-one of the receipt's exact repository bindings. A receipt for another cohort
-or repository cannot authorize removal.
+expected SHA-256, parses the worktree's unambiguous GitHub `origin`, and reads
+the current repository metadata from GitHub. It requires exact equality of
+`full_name`, `id`, `node_id`, and `default_branch` with one entry in the fixed
+eleven-member receipt cohort. At the pre-rename boundary, it reads `origin`
+before and after the live-metadata query, repeats the local object checks, then
+reads `origin` once more immediately before the atomic bridge quarantine
+rename. An observed same-name re-creation, repository transfer, default-branch
+drift, unreadable metadata, or other mismatch fails closed and leaves the
+bridge in place; a receipt for another cohort or repository cannot authorize
+removal.
 
 If the bridge is already absent, the bridge-removal component is an idempotent
 no-op. An existing non-canonical bridge is rejected rather than deleted. The

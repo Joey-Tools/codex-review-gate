@@ -30,6 +30,7 @@ import {
   DEFAULT_VERIFIER_RUN_NAME_PREFIX,
   DEFAULT_WORKFLOW_PATH,
   LEGACY_STATUS_CONTEXT,
+  ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
   assertCompleteRulesetApiObject,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
@@ -50,6 +51,7 @@ import {
   installedWorkflowMatchesCanonical,
   normalizeControlPlaneOwner,
   normalizeWorkflowPath,
+  organizationFinalClosurePlanSha256,
   parseGitHubRepositoryRemote,
   parseRepoSlug,
   requiredStatusCheckContexts,
@@ -1305,15 +1307,49 @@ test("validates a canonical organization final closure receipt", () => {
     (candidate) => { candidate.status = "applied-final-verified"; },
     (candidate) => { candidate.applied = true; },
     (candidate) => { candidate.action = { method: "PUT" }; },
+    (candidate) => { delete candidate.plan_sha256; },
+    (candidate) => { candidate.plan_sha256 = "4".repeat(64); },
+    (candidate) => { candidate.unreviewed_extension = true; },
     (candidate) => { candidate.final_closure_receipt.legacy_ruleset.state = "before"; },
     (candidate) => { candidate.final_closure_receipt.repositories[0].full_name = "Elsewhere/consumer"; },
+    (candidate) => {
+      candidate.final_closure_receipt.repositories =
+        candidate.final_closure_receipt.repositories.slice(0, 1);
+      candidate.repositories_verified = 1;
+    },
+    (candidate) => {
+      candidate.final_closure_receipt.repositories =
+        candidate.final_closure_receipt.repositories.slice(0, 10);
+      candidate.repositories_verified = 10;
+    },
+    (candidate) => {
+      candidate.final_closure_receipt.repositories.push({
+        full_name: "Joey-Tools/unexpected-cohort-member",
+        id: 999_991,
+        node_id: "R_kgDOUnexpectedCohortMember",
+        default_branch: "master",
+      });
+      candidate.repositories_verified = 12;
+    },
+    (candidate) => {
+      candidate.final_closure_receipt.repositories.reverse();
+      refreshFinalClosureReceiptDigest(candidate);
+    },
+    (candidate) => {
+      candidate.final_closure_receipt.repositories[1].full_name = "Joey-Tools/bad repo";
+      refreshFinalClosureReceiptDigest(candidate);
+    },
+    (candidate) => {
+      candidate.final_closure_receipt.repositories[1].default_branch = "refs/heads/main";
+      refreshFinalClosureReceiptDigest(candidate);
+    },
     (candidate) => { candidate.repositories_verified = 2; },
   ]) {
     const candidate = structuredClone(output);
     mutate(candidate);
     assert.throws(
       () => validateOrganizationFinalClosureOutput(candidate),
-      /final|receipt|repositories_verified|organization/iu,
+      /final|receipt|repositories_verified|organization|plan_sha256|cohort|slug|default_branch|order/iu,
     );
   }
 });
@@ -1472,6 +1508,7 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
   try {
     initializeGitRepository(targetRoot);
     const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
+    const finalClosureEnv = finalClosureGhEnvironment(targetRoot);
     mkdirSync(workflowsDirectory, { recursive: true });
     writeFileSync(verifierPath, legacyVerifier, "utf8");
 
@@ -1536,7 +1573,7 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
       "--remove-legacy-bridge",
       ...finalClosureArgs,
       "--apply",
-    ]);
+    ], { env: finalClosureEnv });
     assert.equal(removal.status, 0, removal.stderr);
     assert.match(removal.stdout, /Applied: remove the exact temporary legacy bridge/u);
     assert.equal(existsSync(bridgePath), false);
@@ -1547,7 +1584,7 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
       "--remove-legacy-bridge",
       ...finalClosureArgs,
       "--apply",
-    ]);
+    ], { env: finalClosureEnv });
     assert.equal(removalRepeat.status, 0, removalRepeat.stderr);
     assert.match(removalRepeat.stdout, /legacy bridge is already absent/u);
     const strictAfterRemoval = runBootstrap([
@@ -1627,6 +1664,116 @@ test("legacy bridge removal requires an exact repository-bound final closure rec
     } finally {
       rmSync(targetRoot, { recursive: true, force: true });
     }
+  }
+});
+
+test("legacy bridge removal rebinds the live GitHub repository identity to the final receipt", () => {
+  const expected = buildFinalClosureOutput().final_closure_receipt.repositories[0];
+  for (const [name, mutate] of [
+    ["replacement-id", (metadata) => { metadata.id += 1; }],
+    ["replacement-node-id", (metadata) => { metadata.node_id = "R_kgDOReplacement"; }],
+    ["default-branch-drift", (metadata) => { metadata.default_branch = "main"; }],
+  ]) {
+    const targetRoot = mkdtempSync(
+      join(tmpdir(), `codex-review-gate-live-identity-${name}-`),
+    );
+    const bridgePath = join(
+      targetRoot,
+      ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+    );
+    try {
+      initializeGitRepository(targetRoot);
+      const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
+      const metadata = structuredClone(expected);
+      mutate(metadata);
+      const finalClosureEnv = finalClosureGhEnvironment(targetRoot, {}, {
+        repositoryMetadata: metadata,
+      });
+      mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+        CANONICAL_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+        CANONICAL_CONTROLLER_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+      writeFileSync(
+        join(targetRoot, ".github", "CODEOWNERS"),
+        ensureControlPlaneCodeownersContent(null).content,
+        "utf8",
+      );
+      const result = runBootstrap([
+        "--prepare-worktree",
+        targetRoot,
+        "--remove-legacy-bridge",
+        ...finalClosureArgs,
+        "--apply",
+      ], { env: finalClosureEnv });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(
+        result.stderr,
+        /GitHub origin repository identity or default branch changed/u,
+        name,
+      );
+      assert.equal(existsSync(bridgePath), true, name);
+      assert.doesNotMatch(result.stdout, /Applied: remove/u, name);
+    } finally {
+      rmSync(targetRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("legacy bridge removal rejects origin drift during the pre-rename live query", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-live-origin-query-race-"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
+    const finalClosureEnv = finalClosureGhEnvironment(targetRoot, {}, {
+      originDriftOnSecondLiveQuery: "Joey-Tools/replaced-consumer",
+    });
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...finalClosureArgs,
+      "--apply",
+    ], { env: finalClosureEnv });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /Git origin repository changed during immediately before legacy bridge quarantine rename/u,
+    );
+    assert.equal(existsSync(bridgePath), true);
+    assert.doesNotMatch(result.stdout, /Applied: remove/u);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
   }
 });
 
@@ -1777,6 +1924,14 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
           assert.equal(existsSync(quarantinePath), false);
         },
       ],
+      [
+        "removal-origin-drift-after-codeowners",
+        /Git origin repository changed during immediately before legacy bridge quarantine rename.*No workflow object was unlinked/su,
+        ({ bridgePath, quarantinePath }) => {
+          assert.equal(existsSync(bridgePath), true);
+          assert.equal(existsSync(quarantinePath), false);
+        },
+      ],
     ]) {
       const targetRoot = join(fixtureRoot, mode);
       const workflowsDirectory = join(targetRoot, ".github", "workflows");
@@ -1787,6 +1942,7 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
       mkdirSync(targetRoot);
       initializeGitRepository(targetRoot);
       const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
+      const finalClosureEnv = finalClosureGhEnvironment(targetRoot);
       mkdirSync(workflowsDirectory, { recursive: true });
       writeFileSync(
         join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
@@ -1801,7 +1957,9 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
       writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
       writeFileSync(
         join(targetRoot, ".github", "CODEOWNERS"),
-        ensureControlPlaneCodeownersContent(null).content,
+        mode === "removal-origin-drift-after-codeowners"
+          ? "# retained ownership\n"
+          : ensureControlPlaneCodeownersContent(null).content,
         "utf8",
       );
       const preloadPath = join(targetRoot, "removal-race.cjs");
@@ -1814,7 +1972,7 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
         "--apply",
       ], {
         env: {
-          ...process.env,
+          ...finalClosureEnv,
           NODE_OPTIONS: `--require=${preloadPath}`,
           CODEX_BOOTSTRAP_TEST_RACE_MODE: mode,
           CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
@@ -7518,6 +7676,23 @@ function buildFinalClosureOutput({
   repositoryNodeId = "R_kgDOConsumer",
   defaultBranch = "master",
 } = {}) {
+  const repositories = Array.from(
+    { length: ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE },
+    (_, index) =>
+      index === 0
+        ? {
+            full_name: repoSlug,
+            id: repositoryId,
+            node_id: repositoryNodeId,
+            default_branch: defaultBranch,
+          }
+        : {
+            full_name: `Joey-Tools/receipt-cohort-${String(index + 1).padStart(2, "0")}`,
+            id: repositoryId + index,
+            node_id: `R_kgDOReceiptCohort${index + 1}`,
+            default_branch: defaultBranch,
+          },
+  );
   const receipt = {
     schema_version: 1,
     organization: {
@@ -7529,12 +7704,7 @@ function buildFinalClosureOutput({
     snapshot_sha256: "2".repeat(64),
     legacy_ruleset: { id: 16590367, state: "after" },
     v2_ruleset: { id: 26590367, state: "active" },
-    repositories: [{
-      full_name: repoSlug,
-      id: repositoryId,
-      node_id: repositoryNodeId,
-      default_branch: defaultBranch,
-    }],
+    repositories,
   };
   return {
     schema_version: "organization-review-gate-handoff-output/v1",
@@ -7544,6 +7714,10 @@ function buildFinalClosureOutput({
     snapshot_sha256: receipt.snapshot_sha256,
     status: "final-verified",
     applied: false,
+    plan_sha256: organizationFinalClosurePlanSha256({
+      manifest_sha256: receipt.manifest_sha256,
+      snapshot_sha256: receipt.snapshot_sha256,
+    }),
     action: null,
     repositories_verified: receipt.repositories.length,
     final_closure_receipt: receipt,
@@ -7551,6 +7725,25 @@ function buildFinalClosureOutput({
       .update(canonicalOrganizationFinalClosureReceipt(receipt))
       .digest("hex"),
   };
+}
+
+function refreshFinalClosureReceiptDigest(output) {
+  output.final_closure_receipt_sha256 = createHash("sha256")
+    .update(canonicalJsonForTest(output.final_closure_receipt))
+    .digest("hex");
+}
+
+function canonicalJsonForTest(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJsonForTest).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJsonForTest(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function prepareFinalClosureReceipt(targetRoot, options = {}) {
@@ -7574,6 +7767,55 @@ function prepareFinalClosureReceipt(targetRoot, options = {}) {
   ];
 }
 
+function finalClosureGhEnvironment(
+  targetRoot,
+  options = {},
+  {
+    repositoryMetadata = undefined,
+    originDriftOnSecondLiveQuery = undefined,
+  } = {},
+) {
+  const output = buildFinalClosureOutput(options);
+  const originRepoSlug = options.originRepoSlug ??
+    output.final_closure_receipt.repositories[0].full_name;
+  const receiptRepository = output.final_closure_receipt.repositories.find(
+    (candidate) => candidate.full_name.toLowerCase() === originRepoSlug.toLowerCase(),
+  );
+  const metadata = repositoryMetadata ?? receiptRepository ?? {
+    full_name: originRepoSlug,
+    id: 1,
+    node_id: "R_kgDOUnboundOrigin",
+    default_branch: "master",
+  };
+  const fakeBin = join(targetRoot, ".final-closure-gh-bin");
+  const stateDir = join(targetRoot, ".final-closure-gh-state");
+  const callLog = join(targetRoot, ".final-closure-gh-calls.log");
+  createFakeGhExecutable(fakeBin);
+  const response = originDriftOnSecondLiveQuery === undefined
+    ? metadata
+    : {
+        __fake_sequence: [
+          metadata,
+          {
+            __fake_origin_drift_to: originDriftOnSecondLiveQuery,
+            __fake_response: metadata,
+          },
+        ],
+      };
+  const environment = fakeGhEnvironment({
+    fakeBin,
+    responses: { [`repos/${originRepoSlug}`]: response },
+    stateDir,
+    callLog,
+  });
+  return originDriftOnSecondLiveQuery === undefined
+    ? environment
+    : {
+        ...environment,
+        FAKE_GH_ORIGIN_DRIFT_TARGET_ROOT: targetRoot,
+      };
+}
+
 function runGit(args) {
   const result = spawnSync("git", args, { encoding: "utf8" });
   assert.equal(
@@ -7590,6 +7832,7 @@ function createFakeGhExecutable(fakeBin) {
   writeFileSync(
     fakeGh,
     `#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -7651,6 +7894,34 @@ if (
   response !== null &&
   typeof response === "object" &&
   !Array.isArray(response) &&
+  typeof response.__fake_origin_drift_to === "string"
+) {
+  if (!process.env.FAKE_GH_ORIGIN_DRIFT_TARGET_ROOT) {
+    process.stderr.write("FAKE_GH_ORIGIN_DRIFT_TARGET_ROOT is required for origin drift responses\\n");
+    process.exit(2);
+  }
+  if (response.__fake_response === undefined) {
+    process.stderr.write("origin drift response is missing __fake_response\\n");
+    process.exit(2);
+  }
+  execFileSync(
+    "git",
+    [
+      "-C",
+      process.env.FAKE_GH_ORIGIN_DRIFT_TARGET_ROOT,
+      "remote",
+      "set-url",
+      "origin",
+      \`https://github.com/\${response.__fake_origin_drift_to}.git\`,
+    ],
+    { stdio: "ignore" },
+  );
+  response = response.__fake_response;
+}
+if (
+  response !== null &&
+  typeof response === "object" &&
+  !Array.isArray(response) &&
   Number.isSafeInteger(response.__fake_http_error)
 ) {
   process.stderr.write(
@@ -7673,6 +7944,7 @@ function localApplyRacePreloadSource() {
   return `
 const fs = require("node:fs");
 const { join, basename } = require("node:path");
+const { execFileSync } = require("node:child_process");
 const { syncBuiltinESMExports } = require("node:module");
 
 const promises = fs.promises;
@@ -7740,6 +8012,23 @@ promises.rename = async function patchedRename(from, to) {
     throw error;
   }
   const result = await originalRename(from, to);
+  if (
+    mode === "removal-origin-drift-after-codeowners" &&
+    String(to) === join(targetRoot, ".github", "CODEOWNERS")
+  ) {
+    execFileSync(
+      "git",
+      [
+        "-C",
+        targetRoot,
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/Joey-Tools/replaced-consumer.git",
+      ],
+      { stdio: "inherit" },
+    );
+  }
   if (mode === "final-boundary" && renameCount === 3) {
     await originalWriteFile(
       join(targetRoot, ".github", "workflows", "attacker.yml"),

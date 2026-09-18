@@ -339,9 +339,12 @@ Execute the following state machine in order.
    `action: null`, plus `final_closure_receipt.schema_version: 1` and a
    lowercase 64-hex `final_closure_receipt_sha256`. The embedded receipt must
    bind the organization, reviewed manifest digest, final snapshot digest,
-   legacy/v2 ruleset IDs and states, and the exact repository cohort. Preserve
-   the complete JSON output in `HANDOFF_FINAL_VERIFY`; an extracted embedded
-   receipt is not a valid input to the bootstrap.
+legacy/v2 ruleset IDs and states, and the fixed complete eleven-repository
+cohort in canonical UTF-8-byte `full_name` order—never a subset or expanded cohort. Its
+top-level `plan_sha256` must exactly bind the final read-only `verify` plan
+(`mode`, manifest digest, snapshot digest, and `action: null`). Preserve the
+complete JSON output in `HANDOFF_FINAL_VERIFY`; an extracted embedded receipt
+is not a valid input to the bootstrap.
 
    The third freeze ends only after that file and its top-level shape have
    been validated. If this read is inconclusive or any bound policy differs,
@@ -374,9 +377,16 @@ Execute the following state machine in order.
    `--final-closure-receipt` takes the complete final read-only verify output,
    despite the singular option name. The bootstrap validates its terminal
    top-level fields, recomputes the canonical embedded receipt digest, compares
-   the explicit expected SHA-256, and binds the target worktree's GitHub
-   `origin` to an exact repository entry in that receipt. Stop on any mismatch;
-   do not edit the receipt, change `origin`, or bypass this proof.
+   the explicit expected SHA-256, parses the target worktree's unambiguous
+   GitHub `origin`, and reads live repository metadata from GitHub. It requires
+   exact `full_name`, `id`, `node_id`, and `default_branch` equality with one
+entry in the fixed eleven-member receipt cohort. At the pre-rename boundary it
+reads `origin` before and after the live-metadata query, repeats the local
+object checks, then reads `origin` once more immediately before the atomic
+bridge quarantine rename. An observed same-name re-creation, repository
+transfer, default-branch drift, unreadable metadata, or mismatch fails closed
+and leaves the bridge intact. Do not edit the receipt, change `origin`, or
+bypass this proof.
 
    An absent bridge makes the bridge-removal component an idempotent no-op. An
    existing non-canonical bridge is rejected. The command as a whole also

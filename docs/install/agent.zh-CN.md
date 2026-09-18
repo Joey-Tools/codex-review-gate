@@ -295,9 +295,11 @@ GET→PUT 区间的 racing write。只能验证 manifest 绑定的 bypass actors
    `status: "final-verified"`、`applied: false`、`action: null`，并包含
    `final_closure_receipt.schema_version: 1` 与 lowercase 64-hex
    `final_closure_receipt_sha256` 的输出。Embedded receipt 必须绑定 organization、reviewed
-   manifest digest、final snapshot digest、legacy/v2 ruleset IDs/states 与 exact repository
-   cohort。必须完整保留 `HANDOFF_FINAL_VERIFY` 中的 JSON output；单独提取 embedded receipt
-   不能作为 bootstrap 输入。
+manifest digest、final snapshot digest、legacy/v2 ruleset IDs/states 与按 canonical UTF-8 byte `full_name`
+order 排列的 exact repository cohort：只能是固定、完整的 11 仓 cohort，不能是任意子集或扩大的 cohort。
+top-level `plan_sha256` 必须精确绑定最终只读 `verify` plan（`mode`、manifest digest、snapshot
+digest 与 `action: null`）。必须完整保留 `HANDOFF_FINAL_VERIFY` 中的 JSON output；单独提取
+embedded receipt 不能作为 bootstrap 输入。
 
    只有该文件及 top-level shape 验证完成后，第三段 freeze 才结束。若本次读取 inconclusive
    或任何 bound policy 不一致，保留所有 bridges，修复 drift，并在 freeze 下重复最终只读
@@ -326,9 +328,13 @@ GET→PUT 区间的 racing write。只能验证 manifest 绑定的 bypass actors
 
    虽然 option 名称是 singular `--final-closure-receipt`，它接收的是完整的最终只读 verify
    output。Bootstrap 会验证 terminal top-level fields、重新计算 canonical embedded receipt
-   digest、比对显式 expected SHA-256，并把 target worktree 的 GitHub `origin` 绑定到 receipt
-   内一个 exact repository entry。任何 mismatch 都必须停止；不得编辑 receipt、切换
-   `origin` 或绕过这份 proof。
+   digest、比对显式 expected SHA-256、解析 target worktree 中无歧义的 GitHub `origin`，并从
+GitHub 读取 live repository metadata。它要求 `full_name`、`id`、`node_id` 与
+`default_branch` 都和固定 11 仓 receipt cohort 中的一项精确相等。在 atomic bridge quarantine
+rename 前的边界，它会先在 live-metadata query 前后各读取一次 `origin`，重新验证本地对象后，
+再紧邻 rename 读取一次 `origin`。已观测到的同名重建、repository transfer、default-branch
+drift、metadata 不可读或 mismatch 都必须 fail closed 并保留 bridge；不得编辑 receipt、切换
+`origin` 或绕过这份 proof。
 
    Bridge absent 时，bridge-removal component 是 idempotent no-op；已有但 non-canonical
    的 bridge 会被拒绝。整个 command 也会强制 canonical verifier、controller 与 managed

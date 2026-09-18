@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 
 export const DEFAULT_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
@@ -199,8 +200,47 @@ export function parseGitHubRepositoryRemote(value) {
   return parseRepoSlug(`${owner}/${repo}`);
 }
 
+export const ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 11;
+
+export function organizationFinalClosurePlanSha256({
+  manifest_sha256: manifestSha256,
+  snapshot_sha256: snapshotSha256,
+}) {
+  assertReceiptSha256(manifestSha256, "plan manifest_sha256");
+  assertReceiptSha256(snapshotSha256, "plan snapshot_sha256");
+  return createHash("sha256")
+    .update(
+      canonicalJson({
+        mode: "verify",
+        manifest_sha256: manifestSha256,
+        snapshot_sha256: snapshotSha256,
+        action: null,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
 export function validateOrganizationFinalClosureOutput(output) {
   assertPlainReceiptObject(output, "Organization handoff output");
+  assertExactReceiptKeys(
+    output,
+    [
+      "schema_version",
+      "mode",
+      "organization",
+      "manifest_sha256",
+      "snapshot_sha256",
+      "status",
+      "applied",
+      "plan_sha256",
+      "action",
+      "repositories_verified",
+      "final_closure_receipt",
+      "final_closure_receipt_sha256",
+    ],
+    "Organization handoff output",
+  );
   if (output.schema_version !== "organization-review-gate-handoff-output/v1") {
     throw new Error(
       "Organization handoff output schema_version is not the supported final-closure format.",
@@ -223,6 +263,15 @@ export function validateOrganizationFinalClosureOutput(output) {
   }
   assertReceiptSha256(output.manifest_sha256, "manifest_sha256");
   assertReceiptSha256(output.snapshot_sha256, "snapshot_sha256");
+  assertReceiptSha256(output.plan_sha256, "plan_sha256");
+  if (
+    output.plan_sha256 !==
+    organizationFinalClosurePlanSha256(output)
+  ) {
+    throw new Error(
+      "Organization handoff output plan_sha256 does not bind the final read-only verify plan.",
+    );
+  }
   assertReceiptSha256(
     output.final_closure_receipt_sha256,
     "final_closure_receipt_sha256",
@@ -292,9 +341,12 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
   if (legacyRuleset.id === v2Ruleset.id) {
     throw new Error("Organization final closure receipt ruleset IDs must be distinct.");
   }
-  if (!Array.isArray(receipt.repositories) || receipt.repositories.length === 0) {
+  if (
+    !Array.isArray(receipt.repositories) ||
+    receipt.repositories.length !== ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE
+  ) {
     throw new Error(
-      "Organization final closure receipt repositories must be a non-empty array.",
+      `Organization final closure receipt repositories must contain exactly ${ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE} cohort members.`,
     );
   }
   const repositories = receipt.repositories.map((repository, index) =>
@@ -317,6 +369,14 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
     slugs.add(foldedSlug);
     ids.add(repository.id);
     nodeIds.add(repository.node_id);
+  }
+  const canonicalOrder = [...repositories].sort((left, right) =>
+    compareCanonicalText(left.full_name, right.full_name)
+  );
+  if (canonicalJson(repositories) !== canonicalJson(canonicalOrder)) {
+    throw new Error(
+      "Organization final closure receipt repositories must use producer canonical full_name order.",
+    );
   }
   return {
     schema_version: 1,
@@ -358,6 +418,10 @@ function validateReceiptRepository(value, organization, index) {
     ["full_name", "id", "node_id", "default_branch"],
     label,
   );
+  assertReceiptText(value.full_name, `${label} full_name`);
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(value.full_name)) {
+    throw new Error(`${label} full_name must be an exact OWNER/REPO slug.`);
+  }
   const parsed = parseRepoSlug(value.full_name);
   if (parsed.owner.toLowerCase() !== organization.login.toLowerCase()) {
     throw new Error(`${label} is outside the receipt organization.`);
@@ -365,6 +429,12 @@ function validateReceiptRepository(value, organization, index) {
   assertPositiveReceiptId(value.id, `${label} id`);
   assertReceiptText(value.node_id, `${label} node_id`);
   assertReceiptText(value.default_branch, `${label} default_branch`);
+  if (
+    value.default_branch.startsWith("refs/") ||
+    value.default_branch.includes("..")
+  ) {
+    throw new Error(`${label} default_branch is malformed.`);
+  }
   return {
     full_name: parsed.slug,
     id: value.id,

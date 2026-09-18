@@ -79,17 +79,26 @@ superseded_by:
   final-closure receipt
   binds the organization, reviewed manifest digest, final snapshot digest,
   terminal legacy/v2 ruleset identities/states, and the exact repository
-  cohort; its canonical SHA-256 is the explicit removal proof.
+cohort in canonical UTF-8-byte `full_name` order. The receipt is valid only for that
+complete fixed eleven-member cohort, never a subset or expanded set; the
+top-level `plan_sha256` must bind its final read-only `verify` plan exactly,
+and the receipt's canonical SHA-256 is the explicit removal proof.
 - Removal of each temporary bridge is a later, separate PR phase. The local
   bootstrap accepts only the complete final read-only verify JSON, its exact
-  embedded-receipt SHA-256, and a target worktree whose GitHub `origin` is an
-  exact cohort member. This returns consumers to the ordinary no-v1-caller
-  installation contract after the global cutover is closed.
+  embedded-receipt SHA-256, an unambiguous GitHub `origin`, and live GitHub
+repository metadata that exactly match one receipt entry's `full_name`, `id`,
+`node_id`, and `default_branch`. At the pre-rename boundary it reads `origin`
+before and after the metadata lookup, repeats the local object checks, then
+reads `origin` once more immediately before the atomic bridge quarantine
+rename. An observed same-name re-creation, transfer, default-branch drift,
+unreadable metadata, or mismatch fails closed and leaves the bridge installed.
+This returns consumers to the ordinary no-v1-caller installation contract after
+the global cutover is closed.
 
 ## Current State
 
-- Source implementation is on `codex/organization-v2-handoff`, based on
-  `dff68c8279a659b79479cd4fc6876eecbb715fc2`.
+- Source tooling implements the temporary bridge, cohort handoff transaction,
+  receipt-bound bridge removal, and their operator-facing guides.
 - No organization ruleset, repository ruleset, consumer default branch, or
   consumer pull request has been mutated by this workstream yet.
 - Read-only inventory confirms that all 11 members inherit old organization
@@ -173,16 +182,12 @@ superseded_by:
 
 ## Next Steps
 
-1. Finish the exact bridge and organization-handoff implementation with unit
-   coverage and operator-facing installation guidance.
-2. Run local validation, journal validation, fixed-head review, and create the
-   source PR.
-3. After the source change lands, create the 11 migration PRs and stage the
+1. After the source change lands, create the 11 migration PRs and stage the
    new organization v2 rule without removing v1.
-4. Collect each exact canary proof, activate v2 organization protection, remove
+2. Collect each exact canary proof, activate v2 organization protection, remove
    the bound repository-level legacy contexts, and perform the one old-rule
    v1-status removal with double-read verification.
-5. Capture and validate the separate final read-only closure receipt, then use
+3. Capture and validate the separate final read-only closure receipt, then use
    that repository-bound proof in each bridge-removal PR.
 
 ## Evidence
@@ -192,3 +197,6 @@ superseded_by:
   `GET /orgs/Joey-Tools/rulesets/16590367` on 2026-09-18.
 - Prior v2 decisions and implementation ledger:
   `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`.
+- Source delivery validation: `npm run test:organization-handoff` passed
+  216/216; `npm run check`, `git diff --check`, and project-journal validation
+  passed before the frozen source review.

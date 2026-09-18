@@ -2687,12 +2687,75 @@ async function loadGitHubOriginRepository(targetRoot) {
   return { raw: value, repository: parseGitHubRepositoryRemote(value) };
 }
 
+function githubRepositoryEndpoint(repository) {
+  return `repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`;
+}
+
+function organizationFinalClosureRepositoryIdentity(value, label) {
+  const identity = {
+    full_name: value?.full_name,
+    id: value?.id,
+    node_id: value?.node_id,
+    default_branch: value?.default_branch,
+  };
+  if (
+    typeof identity.full_name !== "string" ||
+    identity.full_name === "" ||
+    !Number.isSafeInteger(identity.id) ||
+    identity.id <= 0 ||
+    typeof identity.node_id !== "string" ||
+    identity.node_id === "" ||
+    typeof identity.default_branch !== "string" ||
+    identity.default_branch === ""
+  ) {
+    throw new Error(
+      `${label} does not provide a complete GitHub repository identity and default branch.`,
+    );
+  }
+  return identity;
+}
+
+async function loadCurrentOrganizationFinalClosureRepository(
+  originRepository,
+  phase,
+) {
+  const response = await ghJson(githubRepositoryEndpoint(originRepository));
+  return organizationFinalClosureRepositoryIdentity(
+    response,
+    `GitHub origin repository during ${phase}`,
+  );
+}
+
 async function assertOrganizationFinalClosureBindingStable(
   targetRoot,
   proof,
   phase,
 ) {
   const current = await loadGitHubOriginRepository(targetRoot);
+  assertOrganizationFinalClosureOriginMatchesProof(current, proof, phase);
+  const liveRepository = await loadCurrentOrganizationFinalClosureRepository(
+    current.repository,
+    phase,
+  );
+  if (
+    liveRepository.full_name !== proof.repository.full_name ||
+    liveRepository.id !== proof.repository.id ||
+    liveRepository.node_id !== proof.repository.node_id ||
+    liveRepository.default_branch !== proof.repository.default_branch
+  ) {
+    throw new Error(
+      `GitHub origin repository identity or default branch changed during ${phase}; refusing bridge removal success.`,
+    );
+  }
+  const afterMetadataRead = await loadGitHubOriginRepository(targetRoot);
+  assertOrganizationFinalClosureOriginMatchesProof(
+    afterMetadataRead,
+    proof,
+    phase,
+  );
+}
+
+function assertOrganizationFinalClosureOriginMatchesProof(current, proof, phase) {
   if (
     current.repository.slug.toLowerCase() !==
     proof.originRepository.slug.toLowerCase()
@@ -2960,6 +3023,26 @@ async function prepareConsumerWorktree({
     }
     firstMutationBoundaryComplete = true;
   };
+  const beforeLegacyBridgeQuarantineRename = async () => {
+    await beforeFirstMutation();
+    if (finalClosureProof !== null) {
+      await assertOrganizationFinalClosureBindingStable(
+        targetRoot,
+        finalClosureProof,
+        "immediately before legacy bridge quarantine rename",
+      );
+    }
+  };
+  const beforeFinalLegacyBridgeQuarantineRename = async () => {
+    if (finalClosureProof !== null) {
+      const current = await loadGitHubOriginRepository(targetRoot);
+      assertOrganizationFinalClosureOriginMatchesProof(
+        current,
+        finalClosureProof,
+        "immediately before legacy bridge quarantine rename",
+      );
+    }
+  };
   try {
     for (const change of plannedChanges) {
       if (change.operation === "remove") {
@@ -2967,6 +3050,8 @@ async function prepareConsumerWorktree({
           ...change,
           parentWitnesses,
           beforeRemove: beforeFirstMutation,
+          beforeQuarantineRename: beforeLegacyBridgeQuarantineRename,
+          beforeFinalQuarantineRename: beforeFinalLegacyBridgeQuarantineRename,
         });
       } else {
         await installPreparedConsumerFile({
@@ -3164,12 +3249,19 @@ async function installPreparedConsumerFile({
 // Node does not expose unlinkat against an already-open file descriptor, so the
 // final quarantine check and path-based unlink remain a best-effort boundary
 // under the existing same-UID non-interference assumption.
+// The remote authorization is a point-in-time property: the GitHub repository
+// identity is checked with origin reads both before and after metadata lookup,
+// then origin is checked again after the final local object revalidation.
+// This detects an observed drift through those boundaries; it does not claim a
+// continuous lock against a same-UID origin rewrite after the final check.
 async function removePreparedConsumerFile({
   path,
   expectedContent,
   parentWitnesses,
   label,
   beforeRemove = async () => {},
+  beforeQuarantineRename = async () => {},
+  beforeFinalQuarantineRename = async () => {},
 }) {
   const admittedIdentity = await readConsumerFileIdentity(
     path,
@@ -3221,6 +3313,18 @@ async function removePreparedConsumerFile({
       `immediately before ${label} quarantine rename`,
     );
     await assertConsumerFileContentStable(path, expectedContent, label);
+    await beforeQuarantineRename();
+    await revalidateDirectoryChain(
+      parentWitnesses,
+      `after ${label} quarantine authorization revalidation`,
+    );
+    await assertConsumerFileIdentityStable(
+      admittedIdentity,
+      path,
+      `after ${label} quarantine authorization revalidation`,
+    );
+    await assertConsumerFileContentStable(path, expectedContent, label);
+    await beforeFinalQuarantineRename();
     await rename(path, quarantinePath);
     renameCompleted = true;
 
