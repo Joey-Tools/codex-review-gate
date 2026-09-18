@@ -120,6 +120,13 @@ bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 ac
    inventory 检查。Organization cutover 被验证完成前，每次 remote repository bootstrap
    invocation 都必须保留 `--legacy-bridge`。Migration 仍使用普通流程相同的 exact-head
    Code Owner review boundary 合并。
+
+   Bridge 的可写 event envelope 是封闭的：只有 `pull_request_target` 的 `opened`、`reopened`、
+   `synchronize`、`ready_for_review`，以及 `issue_comment` 的 `created`。它刻意排除
+   `pull_request_review`：GitHub 会将该 workflow 绑定到 PR merge ref，而兼容 publisher 的
+   `issues: write` authority 不能安全地在该 ref 执行。不得在 consumer repository 局部加回
+   review trigger。temporary bridge 仍只是 compatibility status publisher；只由 review 承载的
+   v2 provider evidence 走单独文档规定的 manual-reconcile recovery path。
 2. Reviewed repository ruleset name 精确为 `Must Pass Codex Review v2`，不是普通默认值
    `Must Pass Codex Review`。每个 member 只能沿用普通 runbook 的 canonical-file controls
    与阶段 2 Disabled repository-policy staging。每条 repository bootstrap preview/apply 都

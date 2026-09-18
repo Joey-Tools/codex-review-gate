@@ -2934,11 +2934,19 @@ test("validates the exact closed temporary legacy bridge envelope", () => {
   );
   assert.doesNotMatch(bridge, /group: codex-review-gate-legacy-bridge-/u);
   assert.match(bridge, /^  cancel-in-progress: false$/mu);
+  assert.match(
+    bridge,
+    /^  pull_request_target:\n    types: \[opened, reopened, synchronize, ready_for_review\]$/mu,
+  );
+  assert.match(bridge, /^  issue_comment:\n    types: \[created\]$/mu);
   assert.equal(
     workflowSingleProducerPolicyViolations(bridge).join(","),
     "issues: write,statuses: write",
   );
-  assert.doesNotMatch(bridge, /workflow_dispatch|repository_dispatch|schedule|cron:/u);
+  assert.doesNotMatch(
+    bridge,
+    /workflow_dispatch|repository_dispatch|pull_request_review|schedule|cron:/u,
+  );
   assert.doesNotMatch(bridge, /checks:\s*write|actions:\s*write/u);
   assert.doesNotMatch(bridge, /codex\/github-review-gate|@v2/u);
 
@@ -3020,12 +3028,12 @@ test("validates the exact closed temporary legacy bridge envelope", () => {
       /exactly one literal/u,
     ],
     [
-      "extra lifecycle",
+      "forbidden pull request review lifecycle",
       bridge.replace(
-        "  pull_request_review:\n",
-        "  pull_request_review_comment:\n    types: [created]\n  pull_request_review:\n",
+        "  issue_comment:\n",
+        "  pull_request_review:\n    types: [submitted]\n  issue_comment:\n",
       ),
-      /exactly match the closed temporary/u,
+      /must not expose pull_request_review/u,
     ],
     [
       "extra read permission",

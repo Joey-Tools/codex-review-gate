@@ -209,6 +209,15 @@ exactly `Must Pass Codex Review v2`, not the ordinary installer default
 `Must Pass Codex Review`. Pass that distinct name to every repository
 bootstrap call with `--ruleset-name`.
 
+The bridge has a closed writable event envelope: `pull_request_target` only
+for `opened`, `reopened`, `synchronize`, and `ready_for_review`, plus
+`issue_comment` only for `created`. It deliberately excludes
+`pull_request_review`: GitHub binds that workflow to the PR merge ref, where
+the compatibility publisher's `issues: write` authority is not a safe write
+surface. Do not add a local review trigger. The temporary bridge remains a
+compatibility status publisher; v2 review-only evidence uses the separately
+documented manual-reconcile recovery path.
+
 Reuse the ordinary guide only for canonical file preparation, control-plane
 review and staging the complete repository v2 policy as **Disabled**. Do not
 follow its legacy cleanup or canary-close steps. After the migration merges,

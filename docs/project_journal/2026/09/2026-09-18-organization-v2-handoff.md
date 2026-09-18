@@ -147,7 +147,7 @@ the global cutover is closed.
   - `codex-workflow-hygiene#77` at
     `518185db0b5577733c9555638d29f04104f9aea4`; and
   - `codex-private-workflows#193` at
-    `02860ff441d38b01cc8480f76a1a520e6f958558`.
+    `8e80ea15e1cc9a5d61e32f5a024bbc9c5b1ea5f2`.
 - An installation PR is an intentional manual trust bootstrap. Its new
   controller exists only on the PR head, while `issue_comment` and
   `workflow_dispatch` consume the default-branch workflow. The initial v2
@@ -162,6 +162,16 @@ the global cutover is closed.
   provider evidence is instead consumed by the typed default-branch manual
   `reconcile` path. This preserves the single-producer and pre-runner trust
   boundary without adding a runtime App, status writer, or cron.
+- A migration-review bridge run on `codex-review-workflows#115` demonstrated
+  the same merge-ref boundary in practice: run `35355124380` failed its
+  `issues: write` audit-comment POST with `403 Resource not accessible by
+  integration` and wrote `codex/review-gate=error`. The canonical bridge now
+  removes `pull_request_review` from its closed trigger envelope, while
+  retaining only `pull_request_target` lifecycle events and
+  `issue_comment: created`; an exact rerun of the pre-existing trusted
+  default-branch publisher (`35353747519`) restored the current v1 success.
+  Every open migration PR must be re-bootstrapped to the corrected canonical
+  bridge bytes before it is eligible to merge.
 - Before an organization v2 rule is activated, every pre-existing open PR
   must also have a fresh verifier on its current head/base/test-merge scope.
   A new push, reopen, or documented draft-to-ready transition creates that

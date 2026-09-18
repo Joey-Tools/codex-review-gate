@@ -29,8 +29,6 @@ const CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT = [
   "    types: [opened, reopened, synchronize, ready_for_review]",
   "  issue_comment:",
   "    types: [created]",
-  "  pull_request_review:",
-  "    types: [submitted]",
   "",
   "permissions:",
   "  contents: read",
@@ -1230,7 +1228,11 @@ export function validateCanonicalLegacyBridgeWorkflowContent(value) {
   if (/^\s*schedule:\s*$/m.test(value) || /^\s*-?\s*cron:\s*/m.test(value)) {
     throw new Error("Canonical legacy bridge workflow must not allocate cron runners.");
   }
-  for (const forbiddenEvent of ["workflow_dispatch", "repository_dispatch"]) {
+  for (const forbiddenEvent of [
+    "workflow_dispatch",
+    "repository_dispatch",
+    "pull_request_review",
+  ]) {
     if (new RegExp(`^  ${forbiddenEvent}:`, "m").test(value)) {
       throw new Error(
         `Canonical legacy bridge workflow must not expose ${forbiddenEvent}.`,

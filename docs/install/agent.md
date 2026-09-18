@@ -143,6 +143,15 @@ Execute the following state machine in order.
    every remote repository bootstrap invocation until organization cutover is
    verified. Merge the migration with the same exact-head Code Owner review
    boundary as the ordinary path.
+
+   The bridge has a closed writable event envelope: `pull_request_target` only
+   for `opened`, `reopened`, `synchronize`, and `ready_for_review`, plus
+   `issue_comment` only for `created`. It deliberately excludes
+   `pull_request_review`: GitHub binds that workflow to the PR merge ref, where
+   the compatibility publisher's `issues: write` authority is not a safe write
+   surface. Do not add a local review trigger. The temporary bridge remains a
+   compatibility status publisher; v2 review-only evidence uses the separately
+   documented manual-reconcile recovery path.
 2. The reviewed repository ruleset name is exactly
    `Must Pass Codex Review v2`, not the ordinary default
    `Must Pass Codex Review`. For each member, reuse the ordinary runbook only

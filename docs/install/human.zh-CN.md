@@ -173,6 +173,13 @@ flag。Cohort 的 repository ruleset name 精确为
 `Must Pass Codex Review v2`，不是普通 installer 默认的 `Must Pass Codex Review`；每个
 repository bootstrap call 都必须用 `--ruleset-name` 传入这个 distinct name。
 
+Bridge 的可写 event envelope 是封闭的：只有 `pull_request_target` 的 `opened`、`reopened`、
+`synchronize`、`ready_for_review`，以及 `issue_comment` 的 `created`。它刻意排除
+`pull_request_review`：GitHub 会将该 workflow 绑定到 PR merge ref，而兼容 publisher 的
+`issues: write` authority 不能安全地在该 ref 执行。不得在 consumer repository 局部加回
+review trigger。temporary bridge 仍只是 compatibility status publisher；只由 review 承载的
+v2 provider evidence 走单独文档规定的 manual-reconcile recovery path。
+
 普通指南只能沿用于 canonical files preparation、control-plane review，以及把完整
 repository v2 policy 暂存为 **Disabled**；不得沿用其中的 legacy cleanup 或 canary-close
 步骤。Migration 合并后，用 `--legacy-bridge` 暂存 distinct Disabled repository rule；再
