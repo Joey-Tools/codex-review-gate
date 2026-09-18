@@ -1186,8 +1186,8 @@ test("exports the closed organization handoff protocol constants", () => {
     },
     legacy_bridge: {
       path: ".github/workflows/codex-review-gate-legacy-bridge.yml",
-      git_blob_sha: "93aa3fef47034818bb5dfb0e5bdb7dfc3a129831",
-      sha256: "fce11cfef497fd37af6693221519ba73fc91b00da7e0cd148f10094829866730",
+      git_blob_sha: "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+      sha256: "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef",
     },
   });
 });

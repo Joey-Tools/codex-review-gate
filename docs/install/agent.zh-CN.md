@@ -120,6 +120,13 @@ bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 ac
    inventory 检查。Organization cutover 被验证完成前，每次 remote repository bootstrap
    invocation 都必须保留 `--legacy-bridge`。Migration 仍使用普通流程相同的 exact-head
    Code Owner review boundary 合并。
+
+   Bridge 的可写 event envelope 是封闭的：只有 `pull_request_target` 的 `opened`、`reopened`、
+   `synchronize`、`ready_for_review`，以及 `issue_comment` 的 `created`。它刻意排除
+   `pull_request_review`：GitHub 会将该 workflow 绑定到 PR merge ref，而兼容 publisher 的
+   `issues: write` authority 不能安全地在该 ref 执行。不得在 consumer repository 局部加回
+   review trigger。temporary bridge 仍只是 compatibility status publisher；v2 manual reconcile
+   不能刷新它的 v1 status。dual protection 仍生效时所需的 exact-run recovery 见阶段 3。
 2. Reviewed repository ruleset name 精确为 `Must Pass Codex Review v2`，不是普通默认值
    `Must Pass Codex Review`。每个 member 只能沿用普通 runbook 的 canonical-file controls
    与阶段 2 Disabled repository-policy staging。每条 repository bootstrap preview/apply 都
@@ -762,6 +769,155 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    Caller-authored event 会被 pre-runner bot filter 跳过，Codex bot 之后的
    合格 `issue_comment` `created` 或 `edited` event 才启动 controller workflow。Review 或
    reaction 本身没有自动 consumer job，需要时手动 reconcile。
+
+   ### Dual-protection legacy-status recovery
+
+   手动 v2 `reconcile` 只更新 `codex/github-review-gate`，绝不会写
+   `codex/review-gate`。两个 context 仍同时 required 时，只由 review 或 reaction 承载的结果可能需要
+   单独恢复 v1。首先只用 REST API 绑定一份完整的 current scope：`GET repos/$REPO` 必须仍返回
+   `full_name=$REPO`；把它的 `default_branch` 绑定为 `DEFAULT_BRANCH`，并从对应的
+   `GET repos/$REPO/branches/$DEFAULT_BRANCH` 响应绑定 `DEFAULT_BRANCH_HEAD_SHA`。fresh
+   `GET repos/$REPO/pulls/$CANARY_PR` 响应必须 open、non-draft、same-repository；其 head
+   repository/ref/SHA 必须等于 `$REPO`、`CANARY_HEAD_REF` 与 `CANARY_HEAD`，base
+   repository/ref/SHA 必须等于 `$REPO`、`DEFAULT_BRANCH` 与 `DEFAULT_BRANCH_HEAD_SHA`。
+
+   用 `GET repos/$REPO/actions/workflows/codex-review-gate-legacy-bridge.yml` 解析 current bridge，
+   绑定它的正数 `LEGACY_WORKFLOW_ID`，再调用
+   `GET repos/$REPO/actions/workflows/$LEGACY_WORKFLOW_ID`。要求 ID 相同、path 精确为
+   `.github/workflows/codex-review-gate-legacy-bridge.yml`、`state=active`；display name 仅用于诊断，
+   不构成 identity。读取
+   `GET repos/$REPO/contents/.github/workflows/codex-review-gate-legacy-bridge.yml?ref=$DEFAULT_BRANCH_HEAD_SHA`，
+   要求 `type=file` 且 path 精确匹配，解码 base64 content，并与
+   `$SOURCE_ROOT/templates/codex-gated-repo/.github/workflows/codex-review-gate-legacy-bridge.yml`
+   逐 byte 相同。缺失、truncated、无法解码或内容不同都属于 inconclusive。
+
+   调用 `GET repos/$REPO/actions/workflows/$LEGACY_WORKFLOW_ID/runs`，查询参数固定为
+   `event=pull_request_target`、`head_sha=$CANARY_HEAD`、`exclude_pull_requests=false` 与
+   `per_page=100`，并跟完所有 pagination links。结果必须是完整分页 workflow-run inventory：每页
+   `total_count` 必须是相同的非负整数，每个非末页必须满 100 条，flatten 后的 run 数必须等于
+   `total_count`。malformed run、任何跨页重复 run ID，或触及 GitHub 对 filtered search 公开的
+   1,000-result ceiling，都不能证明空集合。完整读取后立即用完全相同的 query 重读 page 1，并要求其
+   canonical JSON（包括 `total_count` 与有序 runs）和捕获的第一页相同。pagination horizon 发生变化会
+   使整次 read 无效；应从 scope binding 重新开始，不能混用两个 horizon 的 pages。
+
+   在这份完整且稳定的 inventory 中，eligible run 的 API `created_at` 必须证明它仍处于 GitHub 公开的
+   30-day rerun window，且 run 已经 completed，并同时满足：正数 `workflow_id` 等于已绑定 ID；
+   `run_attempt` 为正数；
+   `repository.full_name` 与 `head_repository.full_name` 都等于 `$REPO`；
+   `event=pull_request_target`；`head_sha=CANARY_HEAD`；且恰好一个 `pull_requests` entry 的 number、
+   head repository/ref/SHA、base repository/ref/SHA 都等于完整已绑定 PR scope。matching nonterminal run
+   表示 pending，不能当作 candidate cardinality zero。在 run object 内，`DEFAULT_BRANCH_HEAD_SHA` 只由
+   `pull_requests[0].base.sha` 绑定；不得把 top-level `run.head_sha` 与 default-branch SHA 比较。
+   对于 `path`，接受 bare canonical path、GitHub 公开的
+   `<canonical-path>@<DEFAULT_BRANCH>` form，或等价的
+   `<canonical-path>@refs/heads/<DEFAULT_BRANCH>` form。解析 suffixed form 时，只移除已知的
+   canonical-path-plus-`@` prefix，并把全部非空 remainder 当作 ref；该 ref 必须精确等于
+   `$DEFAULT_BRANCH` 或 `refs/heads/$DEFAULT_BRANCH`，其他 path/ref 一律拒绝。bare form 之所以可接受，
+   是因为独立的 PR base repository/ref/SHA、feature-head `head_sha`、active workflow identity 与 exact
+   bridge bytes 已补齐 ref binding。
+
+   上述 repository、branch、PR、workflow、canonical bytes 与稳定分页 inventory 合称完整
+   **recovery binding set**（candidate selection 以及 write 前后都必须复验的全部状态）。按完整 eligible
+   集合的 cardinality 分类：恰好一个 candidate 才可继续，并把它的 `id` 与 `run_attempt` 分别绑定为
+   `LEGACY_RUN_ID` 和 `LEGACY_RUN_ATTEMPT`。多于一个即使其中一个更新也仍是 inconclusive，必须 stop，
+   不得选择 latest。只有完整稳定读取后的 cardinality zero 才允许下方 draft-to-ready fallback。缺失
+   字段、pagination cap、重复 ID、horizon drift 或 scope 无法读取都属于 inconclusive，绝不等于 zero。
+
+   在 write 前一刻，重复读取 repository、default-branch head、PR、active workflow、exact bridge bytes、
+   完整 run pagination、duplicate-ID check 与 page-1 horizon reread；要求同一个完整 recovery binding
+   set，且唯一 candidate 仍具有相同 `LEGACY_RUN_ID` 与 `LEGACY_RUN_ATTEMPT`。同时完整分页并稳定复读
+   `GET repos/$REPO/commits/$CANARY_HEAD/statuses?per_page=100`，拒绝重复 status ID，记录所有 pre-POST
+   status IDs 及当前 reverse-chronological 顺序中的第一个 exact-context `codex/review-gate` status。
+   这是最终 pre-POST recovery binding-set read。
+
+   只 rerun 这个 exact 已有 bridge run，不得改用其他 v1 workflow。write 前先把
+   `LEGACY_RERUN_RECEIPT` 设为 operator 保留的、该 transaction 专用且尚不存在的路径。保留这个
+   exact path；不得另选新路径重试 mutation。no-clobber response-file creation 会阻止这个 block 静默覆盖
+   先前的 receipt：
+
+   ```bash
+   : "${LEGACY_RERUN_RECEIPT:?set an operator-retained recovery receipt path}"
+   if test ! -e "$LEGACY_RERUN_RECEIPT"; then
+     :
+   else
+     printf 'recovery receipt already exists; do not submit the POST: %s\n' \
+       "$LEGACY_RERUN_RECEIPT" >&2
+     exit 1
+   fi
+   if (
+     umask 077
+     set -C
+     gh api --hostname github.com \
+       --include \
+       --header "X-GitHub-Api-Version: 2026-03-10" \
+       --method POST \
+       "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun" \
+       > "$LEGACY_RERUN_RECEIPT"
+   ); then
+     LEGACY_RERUN_GH_EXIT=0
+   else
+     LEGACY_RERUN_GH_EXIT=$?
+   fi
+
+   LEGACY_RERUN_HTTP_VERSION=
+   LEGACY_RERUN_HTTP_STATUS=
+   if IFS=$' \t\r' read -r LEGACY_RERUN_HTTP_VERSION LEGACY_RERUN_HTTP_STATUS _ \
+     < "$LEGACY_RERUN_RECEIPT"; then
+     :
+   else
+     printf 'rerun POST response is inconclusive; retain %s and do not replay\n' \
+       "$LEGACY_RERUN_RECEIPT" >&2
+     exit 1
+   fi
+   case "$LEGACY_RERUN_HTTP_VERSION" in
+     HTTP/1.1|HTTP/2|HTTP/2.0|HTTP/3|HTTP/3.0) ;;
+     *)
+       printf 'rerun POST status line is inconclusive; retain %s and do not replay\n' \
+         "$LEGACY_RERUN_RECEIPT" >&2
+       exit 1
+       ;;
+   esac
+   if test "$LEGACY_RERUN_GH_EXIT" -ne 0; then
+     printf 'rerun POST did not prove HTTP 201; retain %s and do not replay\n' \
+       "$LEGACY_RERUN_RECEIPT" >&2
+     exit 1
+   fi
+   if test "$LEGACY_RERUN_HTTP_STATUS" = 201; then
+     :
+   else
+     printf 'rerun POST did not prove HTTP 201; retain %s and do not replay\n' \
+       "$LEGACY_RERUN_RECEIPT" >&2
+     exit 1
+   fi
+   printf 'recovery receipt retained at %s (HTTP %s)\n' \
+     "$LEGACY_RERUN_RECEIPT" "$LEGACY_RERUN_HTTP_STATUS"
+   ```
+
+   GitHub rerun 会保留触发原 run 的 `GITHUB_SHA` 与 `GITHUB_REF`；这正是 source run 必须已经
+   绑定 exact feature head、而 embedded PR entry 另行绑定 current default-branch repository/ref/SHA
+   的原因。`--include` 会让保留的 response 以 HTTP status line 开头，固定 API-version header 则避免
+   API version negotiation 改变该 request。parser 接受 HTTP/1.1、HTTP/2 与 HTTP/3 输出的 status token，
+   提取第二个 field，并强制它精确等于 `201`。即使 receipt partial 或 empty，也要把它作为
+   inconclusive attempt 的 evidence 保留；它绝不能证明 success。`gh` 非零退出、第一行缺失或
+   malformed、非 `201` status，或任何其他 transport uncertainty 都属于 inconclusive：保留 receipt，
+   绝不再次提交 POST。POST 只能提交一次。
+
+   POST 后轮询该 exact run ID 直到 terminal，然后重新验证同一个 recovery binding set，并重复完整稳定
+   run enumeration。要求 repository、default branch/ref/SHA、PR head/base scope、active workflow
+   ID/path/state、canonical bridge bytes 与 sole eligible run ID 全部未变；该 run 现在必须满足
+   `run_attempt` 恰好等于 `LEGACY_RUN_ATTEMPT + 1`、`status=completed`、`conclusion=success`。最后完整分页
+   `GET repos/$REPO/commits/$CANARY_HEAD/statuses?per_page=100`，拒绝重复 status ID，以同样方式稳定复读
+   page-1 horizon，并要求 reverse-chronological 顺序中的第一个 exact-context `codex/review-gate` status
+   具有一个不在完整 pre-POST inventory 中的 ID、`state=success`、
+   `creator.login=github-actions[bot]` 与 `creator.type=Bot`，且 endpoint 仍绑定 current `CANARY_HEAD`。
+   旧 success 不能作为本次 rerun evidence。timeout、attempt 未变或跳跃、scope 改变、inventory 不稳定/
+   不完整或 candidate 不唯一均为 inconclusive：不得再次提交 POST。
+
+   只有完整稳定的 eligible set cardinality 为 zero（包括所有其他 matching run 均已超出 GitHub rerun
+   window）时，才可把 PR 转成 draft 后再标记 ready，以创建新的 `pull_request_target` lifecycle run。
+   重新绑定完整 recovery binding set 后从本选择步骤开始；不得复用先前的 zero 结果。不得为了恢复 v1
+   加入 `workflow_dispatch`、`pull_request_review`、`pull_request_review_comment`、cron 或新的 status
+   writer。
 
    Authorized ordinary、无 marker request 上的 reactions 只表示 liveness；普通 request 上
    的 `+1` 不能独立产生 head-bound clean evidence。若 official Codex `eyes` reaction 或
