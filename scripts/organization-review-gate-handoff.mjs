@@ -1947,51 +1947,100 @@ export function validateLegacyStatusPages(pages, repo) {
   return projection;
 }
 
+function createLegacyWriterRunInventoryAccumulator(repo, writer) {
+  let totalCount = null;
+  let pageCount = 0;
+  const pageSizes = [];
+  const executions = [];
+  const runIds = new Set();
+
+  return {
+    addPage(page) {
+      if (
+        !isPlainObject(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.workflow_runs) ||
+        page.workflow_runs.length > 100
+      ) {
+        throw new Error(`${repo.slug} legacy writer run inventory is incomplete.`);
+      }
+      if (totalCount === null) {
+        totalCount = page.total_count;
+      } else if (page.total_count !== totalCount) {
+        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+      }
+      pageCount += 1;
+      pageSizes.push(page.workflow_runs.length);
+      const executionOffset = executions.length;
+      for (const [index, run] of page.workflow_runs.entries()) {
+        const runLabel = `${repo.slug} legacy writer run ${executionOffset + index}`;
+        assertPositiveInteger(run?.id, `${runLabel}.id`);
+        assertPositiveInteger(run?.run_attempt, `${runLabel}.run_attempt`);
+        if (runIds.has(run.id)) {
+          throw new Error(`${repo.slug} legacy writer run pagination contains duplicate IDs.`);
+        }
+        runIds.add(run.id);
+        if (NONTERMINAL_WORKFLOW_RUN_STATUSES.includes(run.status)) {
+          throw new Error(
+            `${repo.slug} ${writer} still has ${run.status} runs; bridge status cannot be accepted until every legacy-status writer drains.`,
+          );
+        }
+        if (run.status !== "completed") {
+          throw new Error(
+            `${repo.slug} ${writer} run ${run.id} has unsupported status ${JSON.stringify(run.status)}; bridge status cannot be accepted until the complete legacy-writer inventory is terminal.`,
+          );
+        }
+        executions.push({ id: run.id, run_attempt: run.run_attempt });
+      }
+      if (runIds.size > totalCount) {
+        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+      }
+      if (runIds.size === totalCount) return true;
+      if (page.workflow_runs.length !== 100) {
+        throw new Error(
+          `${repo.slug} legacy writer run pagination has an incomplete non-final page.`,
+        );
+      }
+      return false;
+    },
+    finish() {
+      if (totalCount === null || runIds.size !== totalCount) {
+        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+      }
+      return {
+        total_count: totalCount,
+        page_count: pageCount,
+        page_sizes: pageSizes,
+        executions: executions.sort(
+          (left, right) =>
+            left.id - right.id || left.run_attempt - right.run_attempt,
+        ),
+      };
+    },
+  };
+}
+
 export function validateLegacyWriterRunPages(
   pages,
   repo,
   writer = "legacy-status writer",
 ) {
-  if (
-    !Array.isArray(pages) ||
-    pages.length === 0 ||
-    pages.some(
-      (page) =>
-        !isPlainObject(page) ||
-        !Number.isSafeInteger(page.total_count) ||
-        page.total_count < 0 ||
-        !Array.isArray(page.workflow_runs),
-    )
-  ) {
+  if (!Array.isArray(pages) || pages.length === 0) {
     throw new Error(`${repo.slug} legacy writer run inventory is incomplete.`);
   }
-  if (pages.some((page, index) => index < pages.length - 1 && page.workflow_runs.length !== 100)) {
-    throw new Error(`${repo.slug} legacy writer run pagination has an incomplete non-final page.`);
+  const accumulator = createLegacyWriterRunInventoryAccumulator(repo, writer);
+  let complete = false;
+  for (const page of pages) {
+    if (complete) {
+      throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+    }
+    complete = accumulator.addPage(page);
   }
-  if (
-    pages.some((page) => page.total_count !== pages[0].total_count) ||
-    pages.flatMap((page) => page.workflow_runs).length !== pages[0].total_count
-  ) {
+  if (!complete) {
     throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
   }
-  const runIds = new Set();
-  for (const [index, run] of pages.flatMap((page) => page.workflow_runs).entries()) {
-    assertPositiveInteger(run?.id, `${repo.slug} legacy writer run ${index}.id`);
-    if (runIds.has(run.id)) {
-      throw new Error(`${repo.slug} legacy writer run pagination contains duplicate IDs.`);
-    }
-    runIds.add(run.id);
-    if (NONTERMINAL_WORKFLOW_RUN_STATUSES.includes(run.status)) {
-      throw new Error(
-        `${repo.slug} ${writer} still has ${run.status} runs; bridge status cannot be accepted until every legacy-status writer drains.`,
-      );
-    }
-    if (run.status !== "completed") {
-      throw new Error(
-        `${repo.slug} ${writer} run ${run.id} has unsupported status ${JSON.stringify(run.status)}; bridge status cannot be accepted until the complete legacy-writer inventory is terminal.`,
-      );
-    }
-  }
+  return accumulator.finish();
 }
 
 function validateActionsWorkflowInventoryPages(pages, repo) {
@@ -2018,8 +2067,13 @@ function validateActionsWorkflowInventoryPages(pages, repo) {
   ) {
     throw new Error(`${repo.slug} Actions workflow inventory is inconsistent.`);
   }
+  const workflowIds = new Set();
   for (const [index, workflow] of workflows.entries()) {
     assertPositiveInteger(workflow?.id, `${repo.slug} Actions workflow ${index}.id`);
+    if (workflowIds.has(workflow.id)) {
+      throw new Error(`${repo.slug} Actions workflow inventory contains duplicate IDs.`);
+    }
+    workflowIds.add(workflow.id);
     assertRepoRelativeWorkflowPath(
       workflow?.path,
       `${repo.slug} Actions workflow ${index}.path`,
@@ -2027,6 +2081,26 @@ function validateActionsWorkflowInventoryPages(pages, repo) {
     assertNonEmptyString(workflow?.state, `${repo.slug} Actions workflow ${index}.state`);
   }
   return workflows;
+}
+
+async function loadStableActionsWorkflowInventory(repo) {
+  const endpoint =
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows?per_page=100`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const pages = await ghJson(endpoint, { paginate: true });
+    const workflows = validateActionsWorkflowInventoryPages(pages, repo);
+    const firstPage = await ghJson(`${endpoint}&page=1`);
+    if (
+      Array.isArray(firstPage?.workflows) &&
+      Array.isArray(pages[0]?.workflows) &&
+      canonicalJson(firstPage) === canonicalJson(pages[0])
+    ) {
+      return workflows;
+    }
+  }
+  throw new Error(
+    `${repo.slug} Actions workflow inventory changed during horizon revalidation; the result is inconclusive and no next write is allowed.`,
+  );
 }
 
 async function loadActiveCanonicalWorkflowById(repo, workflowId, expectedPath, label) {
@@ -2046,11 +2120,7 @@ async function loadActiveCanonicalWorkflowById(repo, workflowId, expectedPath, l
 }
 
 async function loadActiveCanonicalLegacyBridgeWorkflowId(repo) {
-  const pages = await ghJson(
-    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows?per_page=100`,
-    { paginate: true },
-  );
-  const workflows = validateActionsWorkflowInventoryPages(pages, repo);
+  const workflows = await loadStableActionsWorkflowInventory(repo);
   const matches = workflows.filter(
     (workflow) => workflow.path === CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
   );
@@ -2071,6 +2141,18 @@ async function loadActiveCanonicalLegacyBridgeWorkflowId(repo) {
   );
 }
 
+export async function scanLegacyWriterRuns(repo, workflowId, writer) {
+  const endpoint =
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?per_page=100`;
+  const accumulator = createLegacyWriterRunInventoryAccumulator(repo, writer);
+  for (let page = 1; ; page += 1) {
+    const complete = accumulator.addPage(
+      await ghJson(`${endpoint}&page=${page}`),
+    );
+    if (complete) return accumulator.finish();
+  }
+}
+
 async function assertLegacyProducerDrained(repo) {
   // The verifier retained the old producer's Actions workflow ID by replacing
   // .github/workflows/codex-review-gate.yml in place. The temporary bridge is
@@ -2086,32 +2168,28 @@ async function assertLegacyProducerDrained(repo) {
     ),
     loadActiveCanonicalLegacyBridgeWorkflowId(repo),
   ]);
-  await Promise.all(
+  const writers = await Promise.all(
     [
       [producerWorkflowId, "retained canonical producer"],
       [bridgeWorkflowId, "temporary legacy bridge"],
     ].map(async ([workflowId, writer]) => {
       // Do not split this inventory into individual `status` queries. A run
       // can advance between independently timed filtered requests, leaving
-      // every bucket empty even though it never drained. One unfiltered
-      // paginated inventory retains the run across its mutable status
-      // transition; reject nonterminal statuses locally instead.
-      const pages = await ghJson(
-        `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?per_page=100`,
-        { paginate: true },
-      );
-      validateLegacyWriterRunPages(pages, repo, writer);
+      // every bucket empty even though it never drained. Scan one unfiltered
+      // inventory page at a time, retaining only execution identity; reject
+      // nonterminal states locally without accumulating full run payloads.
+      return {
+        workflow_id: workflowId,
+        execution_epoch: await scanLegacyWriterRuns(repo, workflowId, writer),
+      };
     }),
   );
+  return writers;
 }
 
-async function loadLegacyStatusEvidence(repo) {
-  const endpoint = `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/statuses?per_page=100`;
+async function loadStableLegacyStatusProjection(repo, endpoint) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const [pages] = await Promise.all([
-      ghJson(endpoint, { paginate: true }),
-      assertLegacyProducerDrained(repo),
-    ]);
+    const pages = await ghJson(endpoint, { paginate: true });
     const projection = validateLegacyStatusPages(pages, repo);
     const firstPage = await ghJson(`${endpoint}&page=1`);
     if (
@@ -2119,12 +2197,35 @@ async function loadLegacyStatusEvidence(repo) {
       Array.isArray(pages[0]) &&
       canonicalJson(firstPage) === canonicalJson(pages[0])
     ) {
-      await assertLegacyProducerDrained(repo);
       return projection;
     }
   }
   throw new Error(
     `${repo.slug} commit-status pagination horizon changed during revalidation; the result is inconclusive and no next write is allowed.`,
+  );
+}
+
+async function loadLegacyStatusEvidence(repo) {
+  const endpoint = `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/statuses?per_page=100`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    // GitHub does not expose an atomic cross-resource snapshot. Keep the
+    // status decision inside two complete terminal writer epochs, then read a
+    // second full status projection after the latter epoch. Any new completed
+    // run, rerun, or status-list change forces a bounded retry rather than
+    // authorizing a stale legacy success.
+    const writerEpochBefore = await assertLegacyProducerDrained(repo);
+    const statusBefore = await loadStableLegacyStatusProjection(repo, endpoint);
+    const writerEpochAfter = await assertLegacyProducerDrained(repo);
+    const statusAfter = await loadStableLegacyStatusProjection(repo, endpoint);
+    if (
+      canonicalJson(writerEpochBefore) === canonicalJson(writerEpochAfter) &&
+      canonicalJson(statusBefore) === canonicalJson(statusAfter)
+    ) {
+      return statusAfter;
+    }
+  }
+  throw new Error(
+    `${repo.slug} commit-status or legacy-writer execution horizon changed during revalidation; the result is inconclusive and no next write is allowed.`,
   );
 }
 

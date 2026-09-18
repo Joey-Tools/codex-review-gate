@@ -255,6 +255,41 @@ the global cutover is closed.
   a separately authorized writable reviewer path has been selected for every
   affected repository.
 
+### Current-head review follow-up — 2026-09-18
+
+- GitHub Codex review `5252527795` on source handoff commit
+  `91fcd5ec710925973ad9e04f3d468836f09f8d6a` found three additional
+  fail-closed boundaries in the legacy-status admission helper. The repaired
+  helper deliberately makes no claim that GitHub exposes an atomic snapshot
+  across Actions runs and commit statuses.
+- Each retained producer/temporary bridge writer is now scanned with explicit
+  unfiltered `per_page=100&page=N` requests. The scanner validates every page
+  incrementally, preserves the per-process 8 MiB response ceiling, retains
+  only `{id, run_attempt}` execution identity plus pagination metadata, and
+  rejects nonterminal/unknown statuses, duplicate run IDs, page/count drift,
+  or incomplete pages. It no longer asks `gh --paginate --slurp` to aggregate
+  an arbitrary history of full workflow-run objects into one bounded stdout.
+  A 701-run fixture with more than 8 MiB of aggregate opaque payload proves
+  the page-at-a-time path while each individual response stays bounded.
+- Legacy compatibility status admission now uses the bounded quiescence
+  protocol `D0 -> S0 -> D1 -> S1`: two complete terminal writer execution
+  epochs (`D`, bound by workflow ID and sorted `{id, run_attempt}`) bracket two
+  independently page-1-stable full commit-status projections (`S`). Both
+  decision-relevant projections must be equal before the tool accepts the
+  latter status. A completed new run or same-run rerun after `S0` therefore
+  cannot leave an old success eligible for the organization-policy write. A
+  finite read-only protocol cannot rule out a writer beginning after `S1`; the
+  existing stable cohort pair and immediate pre-mutation revalidation remain
+  the bounded fail-closed defense for that tail rather than an invented
+  barrier.
+- The temporary bridge identity selection now rejects duplicate Actions
+  workflow IDs and re-reads the first page of its complete Actions workflow
+  inventory before selecting the bridge. A changed horizon retries once and
+  then stops inconclusive, preventing pagination shifts from hiding another
+  historical legacy-status writer. Dedicated regressions cover duplicate IDs,
+  page-horizon drift, the >8 MiB aggregate history, and a same-ID
+  `run_attempt` change coupled to a later legacy-status failure.
+
 ## Failure And Recovery Boundary
 
 - Any changed selector, repository identity/default branch, workflow bytes,
@@ -349,8 +384,8 @@ the global cutover is closed.
   `GET /orgs/Joey-Tools/rulesets/16590367` on 2026-09-18.
 - Prior v2 decisions and implementation ledger:
   `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`.
-- Current delivery validation: `npm run test:organization-handoff` passed
-  225/225; `node --test test/v2-workflow-contract.test.mjs` passed 8/8; and
-  `node --test test/workflow-security-contract.test.mjs` passed 41/41.
-  `git diff --check` passed. Project-journal validation is run again after this
-  checkpoint is updated.
+- Current delivery validation: after the current-head review follow-up,
+  `npm run check` passed and `npm run test:organization-handoff` passed
+  230/230. Earlier dedicated v2 workflow-contract and workflow-security
+  validation remain recorded above. `git diff --check` and project-journal
+  validation passed after this checkpoint was updated.

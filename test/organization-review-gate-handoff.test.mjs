@@ -34,6 +34,7 @@ import {
   mapWithConcurrency,
   parseWorkflowRunPath,
   runCli,
+  scanLegacyWriterRuns,
   sha256Canonical,
   validateCanaryPullGraphqlResponse,
   validateLegacyWriterRunPages,
@@ -304,7 +305,10 @@ function v2CheckRunResponse(repo) {
   };
 }
 
-function legacyStatusPages(repo, { newerLegacyContext = null } = {}) {
+function legacyStatusPages(
+  repo,
+  { newerLegacyContext = null, newerLegacyState = "success" } = {},
+) {
   const canonical = {
     id: repo.canary.legacy_status_id,
     node_id: "SC_legacy_status",
@@ -323,6 +327,7 @@ function legacyStatusPages(repo, { newerLegacyContext = null } = {}) {
       id: repo.canary.legacy_status_id + 1,
       node_id: "SC_newer_case_variant",
       context: newerLegacyContext,
+      state: newerLegacyState,
     });
   }
   return [statuses];
@@ -439,12 +444,13 @@ function addFakeResponse(responses, endpoint, value) {
 }
 
 function workflowRunPages(runs) {
-  const totalCount = runs.length;
+  const normalizedRuns = runs.map((run) => ({ run_attempt: 1, ...run }));
+  const totalCount = normalizedRuns.length;
   const pages = [];
   for (let offset = 0; offset < totalCount; offset += 100) {
     pages.push({
       total_count: totalCount,
-      workflow_runs: runs.slice(offset, offset + 100),
+      workflow_runs: normalizedRuns.slice(offset, offset + 100),
     });
   }
   return pages.length === 0
@@ -472,6 +478,8 @@ function createFakeGhHarness(
     legacyProducerRunPages = null,
     legacyBridgeRunPages = null,
     legacyBridgeWorkflowInventory = null,
+    legacyWriterRace = null,
+    legacyBridgeWorkflowHorizonDrift = false,
   } = {},
 ) {
   const { manifest, codeownersBytes } = integrationManifestFixture();
@@ -486,8 +494,10 @@ function createFakeGhHarness(
     directory,
     "cleanup-identity-read-count",
   );
+  const legacyWriterRaceStatePath = join(directory, "legacy-writer-race-state");
   const cleanupActionStatePaths = [];
   const responses = new Map();
+  const legacyWriterRaceResponses = [];
   const cleanupResponses = [];
   const effectiveBranchResponses = [];
   const graphQlResponses = [];
@@ -870,6 +880,13 @@ function createFakeGhHarness(
         state: "active",
       });
     }
+    if (repositoryIndex === 0 && legacyBridgeWorkflowInventory === "duplicate-id") {
+      actionsWorkflowInventory.push({
+        id: repository.canary.v2_workflow_id,
+        path: ".github/workflows/duplicate-id.yml",
+        state: "active",
+      });
+    }
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/actions/workflows?per_page=100`,
@@ -878,6 +895,24 @@ function createFakeGhHarness(
         workflows: actionsWorkflowInventory,
       }],
     );
+    if (actionsWorkflowInventory !== null) {
+      const workflowHorizonPage = {
+        total_count: actionsWorkflowInventory.length,
+        workflows:
+          repositoryIndex === 0 && legacyBridgeWorkflowHorizonDrift
+            ? actionsWorkflowInventory.map((workflow, index) =>
+                index === 0
+                  ? { ...workflow, id: workflow.id + 1000000 }
+                  : workflow,
+              )
+            : actionsWorkflowInventory,
+      };
+      addFakeResponse(
+        responses,
+        `repos/${encodedSlug}/actions/workflows?per_page=100&page=1`,
+        workflowHorizonPage,
+      );
+    }
     if (actionsWorkflowInventory !== null) {
       addFakeResponse(
         responses,
@@ -893,20 +928,39 @@ function createFakeGhHarness(
       repositoryIndex === 0 && legacyProducerRunPages !== null
         ? legacyProducerRunPages
         : workflowRunPages([]);
-    addFakeResponse(
-      responses,
-      `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}/runs?per_page=100`,
-      producerRunPages,
-    );
+    for (const [pageIndex, page] of producerRunPages.entries()) {
+      addFakeResponse(
+        responses,
+        `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}/runs?per_page=100&page=${pageIndex + 1}`,
+        page,
+      );
+    }
     const bridgeRunPages =
       repositoryIndex === 0 && legacyBridgeRunPages !== null
         ? legacyBridgeRunPages
         : workflowRunPages([]);
-    addFakeResponse(
-      responses,
-      `repos/${encodedSlug}/actions/workflows/${bridgeWorkflowId}/runs?per_page=100`,
-      bridgeRunPages,
-    );
+    const bridgeRunEndpoint =
+      `repos/${encodedSlug}/actions/workflows/${bridgeWorkflowId}/runs?per_page=100`;
+    if (repositoryIndex === 0 && legacyWriterRace !== null) {
+      const bridgeRunPagesAfter = legacyWriterRace.bridge_run_pages_after;
+      assert.ok(Array.isArray(bridgeRunPagesAfter));
+      for (let pageIndex = 0; pageIndex < bridgeRunPagesAfter.length; pageIndex += 1) {
+        legacyWriterRaceResponses.push({
+          request: `GET:${bridgeRunEndpoint}&page=${pageIndex + 1}`,
+          before: JSON.stringify(bridgeRunPages[pageIndex]),
+          after: JSON.stringify(bridgeRunPagesAfter[pageIndex]),
+          advance: false,
+        });
+      }
+    } else {
+      for (const [pageIndex, page] of bridgeRunPages.entries()) {
+        addFakeResponse(
+          responses,
+          `${bridgeRunEndpoint}&page=${pageIndex + 1}`,
+          page,
+        );
+      }
+    }
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/actions/runs/${repository.canary.v2_run_id}/attempts/${repository.canary.v2_run_attempt}/jobs?per_page=100`,
@@ -924,22 +978,38 @@ function createFakeGhHarness(
         }],
       }],
     );
-    addFakeResponse(
-      responses,
-      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/statuses?per_page=100`,
-      legacyStatusPages(repository, {
-        newerLegacyContext:
-          repositoryIndex === 0 ? newerLegacyStatusContext : null,
-      }),
-    );
-    addFakeResponse(
-      responses,
-      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/statuses?per_page=100&page=1`,
-      legacyStatusPages(repository, {
-        newerLegacyContext:
-          repositoryIndex === 0 ? newerLegacyStatusContext : null,
-      })[0],
-    );
+    const legacyStatusEndpoint =
+      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/statuses?per_page=100`;
+    const statusPages = legacyStatusPages(repository, {
+      newerLegacyContext:
+        repositoryIndex === 0 ? newerLegacyStatusContext : null,
+    });
+    if (repositoryIndex === 0 && legacyWriterRace !== null) {
+      const statusPagesAfter =
+        legacyWriterRace.status_pages_after ??
+        legacyStatusPages(repository, {
+          newerLegacyContext: LEGACY_STATUS_CONTEXT,
+          newerLegacyState: "failure",
+        });
+      assert.ok(Array.isArray(statusPagesAfter));
+      legacyWriterRaceResponses.push(
+        {
+          request: `GET:${legacyStatusEndpoint}`,
+          before: JSON.stringify(statusPages),
+          after: JSON.stringify(statusPagesAfter),
+          advance: false,
+        },
+        {
+          request: `GET:${legacyStatusEndpoint}&page=1`,
+          before: JSON.stringify(statusPages[0]),
+          after: JSON.stringify(statusPagesAfter[0]),
+          advance: true,
+        },
+      );
+    } else {
+      addFakeResponse(responses, legacyStatusEndpoint, statusPages);
+      addFakeResponse(responses, `${legacyStatusEndpoint}&page=1`, statusPages[0]);
+    }
     notFoundEndpoints.push(
       `GET:repos/${encodedSlug}/branches/${encodeURIComponent(repository.default_branch)}/protection/required_status_checks`,
     );
@@ -1145,6 +1215,30 @@ function createFakeGhHarness(
       "fi",
     );
   }
+  if (legacyWriterRaceResponses.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const response of legacyWriterRaceResponses) {
+      scriptLines.push(
+        `  ${shellQuote(response.request)})`,
+        '    case "$(cat \"${FAKE_GH_LEGACY_WRITER_RACE_STATE:?}\")" in',
+      );
+      if (response.advance) {
+        scriptLines.push(
+          `      before) printf '%s\\n' 'after' > "\${FAKE_GH_LEGACY_WRITER_RACE_STATE:?}"; respond ${shellQuote(response.before)} ;;`,
+        );
+      } else {
+        scriptLines.push(
+          `      before) respond ${shellQuote(response.before)} ;;`,
+        );
+      }
+      scriptLines.push(
+        `      after) respond ${shellQuote(response.after)} ;;`,
+        "      *) printf '%s\\n' 'invalid fake legacy writer race state' >&2; exit 2 ;;",
+        "    esac ;;",
+      );
+    }
+    scriptLines.push("esac");
+  }
   scriptLines.push('case "$request" in');
   for (const [request, response] of responses.entries()) {
     scriptLines.push(`  ${shellQuote(request)}) respond ${shellQuote(response)} ;;`);
@@ -1163,6 +1257,7 @@ function createFakeGhHarness(
   writeFileSync(legacyStatePath, "before\n");
   writeFileSync(cleanupStatePath, "before\n");
   writeFileSync(cleanupIdentityReadCountPath, "0\n");
+  writeFileSync(legacyWriterRaceStatePath, "before\n");
   if (detailedCleanupState) {
     for (const action of cleanupActionStatePaths) {
       writeFileSync(action.path, "before\n");
@@ -1170,7 +1265,14 @@ function createFakeGhHarness(
   }
 
   const previousEnvironment = new Map(
-    ["PATH", "FAKE_GH_LOG", "FAKE_GH_V2_STATE", "FAKE_GH_LEGACY_STATE", "FAKE_GH_CLEANUP_STATE"]
+    [
+      "PATH",
+      "FAKE_GH_LOG",
+      "FAKE_GH_V2_STATE",
+      "FAKE_GH_LEGACY_STATE",
+      "FAKE_GH_CLEANUP_STATE",
+      "FAKE_GH_LEGACY_WRITER_RACE_STATE",
+    ]
       .map((name) => [name, process.env[name]]),
   );
   process.env.PATH = `${directory}${delimiter}${process.env.PATH ?? ""}`;
@@ -1178,6 +1280,7 @@ function createFakeGhHarness(
   process.env.FAKE_GH_V2_STATE = v2StatePath;
   process.env.FAKE_GH_LEGACY_STATE = legacyStatePath;
   process.env.FAKE_GH_CLEANUP_STATE = cleanupStatePath;
+  process.env.FAKE_GH_LEGACY_WRITER_RACE_STATE = legacyWriterRaceStatePath;
   t.after(() => {
     for (const [name, value] of previousEnvironment.entries()) {
       if (value === undefined) delete process.env[name];
@@ -1199,6 +1302,7 @@ function createFakeGhHarness(
     legacyStatePath,
     cleanupStatePath,
     cleanupIdentityReadCountPath,
+    legacyWriterRaceStatePath,
     cleanupActionStatePaths,
   };
 }
@@ -1534,7 +1638,7 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
       const endpoint =
         `repos/${encodedSlug}/actions/workflows/${workflowId}/runs?per_page=100`;
       assert.ok(
-        countRequest(activationBefore, "GET", endpoint) >= 3,
+        countRequest(activationBefore, "GET", `${endpoint}&page=1`) >= 3,
         `${repository.slug} legacy writer ${workflowId} must be drained from a complete unfiltered inventory before activation`,
       );
       const writerRunEndpoints = activationBefore
@@ -1547,9 +1651,14 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
         )
         .map((request) => request.endpoint);
       assert.ok(writerRunEndpoints.length >= 3);
+      const writerRunPagePrefix = `${endpoint}&page=`;
       assert.ok(
-        writerRunEndpoints.every((candidate) => candidate === endpoint),
-        `${repository.slug} legacy writer ${workflowId} must use one exact unfiltered inventory query`,
+        writerRunEndpoints.every(
+          (candidate) =>
+            candidate.startsWith(writerRunPagePrefix) &&
+            /^[1-9][0-9]*$/u.test(candidate.slice(writerRunPagePrefix.length)),
+        ),
+        `${repository.slug} legacy writer ${workflowId} must scan exact unfiltered inventory pages`,
       );
     }
   }
@@ -2642,7 +2751,7 @@ test("legacy bridge status requires a coherent unfiltered writer inventory", () 
     validateLegacyWriterRunPages([
       {
         total_count: 1,
-        workflow_runs: [{ id: 89999999, status: "completed" }],
+        workflow_runs: [{ id: 89999999, run_attempt: 1, status: "completed" }],
       },
     ], repo),
   );
@@ -2650,7 +2759,7 @@ test("legacy bridge status requires a coherent unfiltered writer inventory", () 
     assert.throws(
       () =>
         validateLegacyWriterRunPages([
-          { total_count: 1, workflow_runs: [{ id: 90000000, status }] },
+          { total_count: 1, workflow_runs: [{ id: 90000000, run_attempt: 1, status }] },
         ], repo),
       new RegExp(`legacy-status writer still has ${status} runs`, "u"),
     );
@@ -2664,7 +2773,7 @@ test("legacy bridge status requires a coherent unfiltered writer inventory", () 
       validateLegacyWriterRunPages([
         {
           total_count: 1,
-          workflow_runs: [{ id: 90000001, status: "unknown-state" }],
+          workflow_runs: [{ id: 90000001, run_attempt: 1, status: "unknown-state" }],
         },
     ], repo),
     /unsupported status/u,
@@ -2674,13 +2783,24 @@ test("legacy bridge status requires a coherent unfiltered writer inventory", () 
       validateLegacyWriterRunPages([
         {
           total_count: 1,
-          workflow_runs: [{ id: 90000002 }],
+          workflow_runs: [{ id: 90000003, status: "completed" }],
+        },
+      ], repo),
+    /run_attempt must be a positive safe integer/u,
+  );
+  assert.throws(
+    () =>
+      validateLegacyWriterRunPages([
+        {
+          total_count: 1,
+          workflow_runs: [{ id: 90000002, run_attempt: 1 }],
         },
       ], repo),
     /unsupported status/u,
   );
   const completedRuns = Array.from({ length: 1_001 }, (_value, index) => ({
     id: 91000000 + index,
+    run_attempt: 1,
     status: "completed",
   }));
   assert.doesNotThrow(() =>
@@ -2699,7 +2819,7 @@ test("legacy bridge status requires a coherent unfiltered writer inventory", () 
       validateLegacyWriterRunPages([
         { total_count: 1, workflow_runs: [] },
       ], repo),
-    /pagination is inconsistent/u,
+    /incomplete non-final page/u,
   );
   assert.throws(
     () =>
@@ -2707,8 +2827,8 @@ test("legacy bridge status requires a coherent unfiltered writer inventory", () 
         {
           total_count: 2,
           workflow_runs: [
-            { id: 92000000, status: "completed" },
-            { id: 92000000, status: "completed" },
+            { id: 92000000, run_attempt: 1, status: "completed" },
+            { id: 92000000, run_attempt: 1, status: "completed" },
           ],
         },
       ], repo),
@@ -2752,6 +2872,74 @@ test("unfiltered retained producer history above 1,000 completed runs is accepte
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 });
 
+test("legacy writer scans oversized aggregate history one bounded page at a time", async (t) => {
+  const oversizedPages = workflowRunPages(
+    Array.from({ length: 701 }, (_value, index) => ({
+      id: 93000000 + index,
+      status: "completed",
+      opaque_payload: "x".repeat(12 * 1024),
+    })),
+  );
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(oversizedPages), "utf8") > 8 * 1024 * 1024,
+    "the aggregate fixture must exceed ghJson's per-process output limit",
+  );
+  const harness = createFakeGhHarness(t, {
+    legacyProducerRunPages: oversizedPages,
+  });
+  const repository = harness.manifest.repositories[0];
+  const epoch = await scanLegacyWriterRuns(
+    repository,
+    repository.canary.v2_workflow_id,
+    "retained canonical producer",
+  );
+  assert.equal(epoch.total_count, 701);
+  assert.equal(epoch.page_count, oversizedPages.length);
+  assert.equal(epoch.executions.length, 701);
+  const endpoint =
+    `repos/${encodeEndpointPathForTest(repository.slug)}/actions/workflows/${repository.canary.v2_workflow_id}/runs?per_page=100`;
+  const requests = fakeGhRequests(harness.logPath)
+    .filter(({ method, endpoint: candidate }) =>
+      method === "GET" && candidate.startsWith(`${endpoint}&page=`),
+    );
+  assert.equal(requests.length, oversizedPages.length);
+  assert.equal(
+    countRequest(fakeGhRequests(harness.logPath), "GET", endpoint),
+    0,
+    "the scanner must not ask gh to aggregate every run page into one stdout payload",
+  );
+});
+
+test("a completed legacy writer rerun after the status snapshot blocks stale activation", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    legacyBridgeRunPages: workflowRunPages([
+      { id: 92000000, run_attempt: 1, status: "completed" },
+    ]),
+    legacyWriterRace: {
+      bridge_run_pages_after: workflowRunPages([
+        { id: 92000000, run_attempt: 2, status: "completed" },
+      ]),
+    },
+  });
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  await assert.rejects(
+    runFakeCli(harness, "activate"),
+    /latest legacy context is not the manifest-bound successful compatibility status/u,
+  );
+  const requests = fakeGhRequests(harness.logPath);
+  const firstRepository = harness.manifest.repositories[0];
+  const bridgeRunPage =
+    `repos/${encodeEndpointPathForTest(firstRepository.slug)}/actions/workflows/34000000/runs?per_page=100&page=1`;
+  assert.ok(
+    countRequest(requests, "GET", bridgeRunPage) >= 2,
+    "the final writer epoch must be read after the status snapshot",
+  );
+  assert.deepEqual(mutationRequests(requests), []);
+});
+
 test("a queued temporary legacy bridge blocks bridge-status acceptance before activation writes", async (t) => {
   const harness = createFakeGhHarness(t, {
     legacyBridgeRunPages: workflowRunPages([
@@ -2790,6 +2978,30 @@ test("malformed or ambiguous canonical legacy bridge workflow inventory fails cl
       [],
       `${inventory} Actions workflow inventory must fail before activation writes`,
     );
+  }
+});
+
+test("legacy bridge Actions inventory rejects duplicate IDs and horizon drift before activation writes", async (t) => {
+  const cases = [
+    {
+      options: { legacyBridgeWorkflowInventory: "duplicate-id" },
+      error: /Actions workflow inventory contains duplicate IDs/u,
+    },
+    {
+      options: { legacyBridgeWorkflowHorizonDrift: true },
+      error: /Actions workflow inventory changed during horizon revalidation/u,
+    },
+  ];
+  for (const { options, error } of cases) {
+    await t.test(JSON.stringify(options), async () => {
+      const harness = createFakeGhHarness(t, options);
+      writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+      writeFileSync(harness.v2StatePath, "disabled\n");
+      writeFileSync(harness.legacyStatePath, "before\n");
+      writeFileSync(harness.cleanupStatePath, "before\n");
+      await assert.rejects(runFakeCli(harness, "activate"), error);
+      assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+    });
   }
 });
 
