@@ -35,7 +35,8 @@ outside the supported GitHub.com/default-branch PR scope.
 
 Maintain these invariants:
 
-- one migration PR may remove v1 and install v2;
+- in the ordinary single-repository path, one migration PR may remove v1 and
+  install v2;
 - the canary is a separate PR created after the migration merges;
 - close the canary without merging it;
 - every manual run targets one PR and one exact expected head;
@@ -58,6 +59,379 @@ Maintain these invariants:
 - keep `CONTROL_PLANE_OWNER` explicit in every bootstrap invocation. It
   defaults to `@JoeyTeng`, but a non-Joey repository must substitute its own
   eligible GitHub user.
+
+## Advanced controlled eleven-repository organization handoff
+
+Use this execution path only when the authorized scope is exactly one reviewed
+eleven-repository cohort covered by a shared v1 organization ruleset. It is
+not a reusable `allow-v1` switch. The ordinary phases below continue to reject
+every v1 caller, and the advanced path must return every member to that same
+final no-v1 contract.
+
+Add these cohort inputs:
+
+```text
+HANDOFF_MANIFEST = absolute path to reviewed JSON
+HANDOFF_SCHEMA = organization-review-gate-handoff-manifest/v1
+V2_ORGANIZATION_RULESET_NAME = Must Pass Codex Review v2
+COHORT_REPOSITORY_V2_RULESET_NAME = Must Pass Codex Review v2
+```
+
+The manifest must bind the exact organization ID and node ID; the complete
+old organization ruleset snapshot; the new rule's name and ID; exactly eleven
+ordered repository slugs, numeric IDs, node IDs and default branches; the Git
+blob and SHA-256 identities of verifier, controller and temporary bridge; the
+effective CODEOWNERS identity; each complete Active repository v2 ruleset;
+and every repository legacy-cleanup before/after action. Each canary must bind
+an exact open, non-draft, same-repository PR to its current head, base and
+test-merge SHAs; the v2 CheckRun, run, workflow, attempt and job IDs; and the
+latest successful legacy commit-status ID. Stop on any incomplete field,
+member-set difference, identity drift or unsupported surface.
+
+Instantiate
+`templates/organization-review-gate-handoff/joey-tools-11-member-manifest.template.json`
+according to the README beside it. Replace every explicit placeholder from
+authoritative live evidence; never synthesize a missing ID or digest. Before
+`stage`, the only permitted incomplete value is literal JSON `null` at
+`v2_ruleset.id`, because the organization v2 ruleset does not yet exist.
+Every other placeholder or incomplete field must fail validation. After the
+successful `stage` readback, replace that `null` with only
+`next_manifest_update.v2_ruleset.id`, review the now-complete manifest, and
+rerun `plan`.
+
+Hold an external organization-admin policy-mutation freeze from the stage
+preview through its apply, readback, and any recovery because an ambiguous
+POST may require no-receipt adoption. Establish an organization- and
+repository-admin freeze again for shared-rule activation, from its preview
+through stable post-write readback. Establish it a third time before the
+repository-cleanup preview and keep it continuously through the complete
+cleanup batch/readback, final old-rule preview/apply, and the separate final
+read-only verify receipt capture and validation.
+No administrator may change an organization/repository ruleset, classic branch
+protection, condition, required check or bypass actor during these freezes.
+During the third freeze, no cohort repository may be renamed, transferred,
+deleted, have its default branch changed, or be replaced or re-created at its
+original slug. These are operational freezes, not continuous API locks.
+GitHub's ruleset endpoint has no documented conditional/CAS update, and its
+cleanup mutation APIs have no repository-ID conditional/CAS write. Plan
+digests and adjacent rereads reject observed drift but cannot prevent a racing
+write in the final GET-to-PUT or repository-metadata-read-to-write interval;
+the freeze covers those gaps. Validate only the manifest-bound bypass actors;
+never claim that the runtime automatically discovers an actor added outside
+the bound snapshot.
+
+Execute the following state machine in order.
+
+1. For each member, replace the ordinary Phase 1 bootstrap calls with the
+   exact bridge profile:
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --prepare-worktree "$TARGET_ROOT" \
+     --legacy-bridge \
+     --control-plane-owner "$CONTROL_PLANE_OWNER"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --prepare-worktree "$TARGET_ROOT" \
+     --legacy-bridge \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --apply
+   ```
+
+   This installs only the fixed canonical
+   `.github/workflows/codex-review-gate-legacy-bridge.yml`. It does not waive
+   the inventory check for any other v1 caller. Preserve `--legacy-bridge` on
+   every remote repository bootstrap invocation until organization cutover is
+   verified. Merge the migration with the same exact-head Code Owner review
+   boundary as the ordinary path.
+2. The reviewed repository ruleset name is exactly
+   `Must Pass Codex Review v2`, not the ordinary default
+   `Must Pass Codex Review`. For each member, reuse the ordinary runbook only
+   for its canonical-file controls and Phase 2 Disabled repository-policy
+   staging. Pass both
+   `--ruleset-name "$COHORT_REPOSITORY_V2_RULESET_NAME"` and
+   `--legacy-bridge` to every repository bootstrap preview/apply. Do not enter
+   the ordinary cleanup or canary-close steps.
+
+   After the Disabled rule is read back, create the cohort canary. Reuse the
+   ordinary evidence mechanics and only the repository activation portion of
+   Phase 5: prove the exact successful `codex/github-review-gate` CheckRun and
+   canonical current-test-merge workflow run/job receipt; prove the latest
+   `codex/review-gate` bridge commit status is successful on the same feature
+   head; then activate the complete repository v2 rule with the same distinct
+   name and bridge profile. Stop before ordinary legacy cleanup. Record every
+   bound ID and keep the canary open, non-draft, same-repository and
+   current-base until shared organization activation is proven. The old
+   organization v1 rule and all repository legacy requirements must still be
+   present.
+3. Complete and independently review `HANDOFF_MANIFEST`. Run the read-only
+   organization plan:
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode plan
+   ```
+
+4. Preview and create the Disabled v2-only organization ruleset. The apply
+   must use the exact digest from the matching preview:
+
+   ```bash
+   HANDOFF_STAGE_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode stage > "$HANDOFF_STAGE_PREVIEW"
+   HANDOFF_STAGE_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_STAGE_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode stage \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_STAGE_PLAN_SHA256"
+   ```
+
+   Require the payload to contain only one strict, source-bound
+   `codex/github-review-gate` requirement for GitHub Actions integration
+   `15368`, exact cohort/default-branch conditions, and an explicitly empty
+   bypass list. It must not copy `deletion`, `non_fast_forward` or pull-request
+   rules from the old organization rule. Bind the returned
+   `next_manifest_update.v2_ruleset.id` into the reviewed manifest and rerun
+   `plan` before continuing.
+
+   If the POST might have committed but then fails, the helper first attempts
+   one read-only reconciliation. Treat returned `applied-recovered` plus
+   `next_manifest_update` as verified success. If the process was interrupted
+   or still reports an unknown outcome, do not repeat `stage --apply`. Keep
+   `v2_ruleset.id: null` and run the read-only recovery entry:
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode stage \
+     --recover-created-v2
+   ```
+
+   `--recover-created-v2` must not be combined with `--apply` or a digest. It
+   may emit `next_manifest_update` only for one unique same-name rule whose
+   source and entire writable payload equal canonical Disabled v2 while the
+   old organization rule remains at its exact before-state. Absent, multiple,
+   Active or drifted candidates are stop conditions. Hold an external
+   organization-admin policy-mutation freeze for the complete recovery read.
+   Never replay the POST.
+5. Preview and activate the new organization rule:
+
+   ```bash
+   HANDOFF_ACTIVATE_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode activate > "$HANDOFF_ACTIVATE_PREVIEW"
+   HANDOFF_ACTIVATE_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_ACTIVATE_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode activate \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_ACTIVATE_PLAN_SHA256"
+   ```
+
+   The helper must prove all eleven exact repository identities, three exact
+   workflows, effective CODEOWNERS identities, complete Active repository v2
+   rulesets, open/non-draft/current-base canaries, exact v2 run/job receipts,
+   latest successful legacy commit statuses, unmodified repository legacy
+   surfaces and the exact old organization rule before writing. Its successful
+   readback is the double-protection handoff point: shared v2 is Active and
+   shared v1 remains Active.
+
+   Only after the activation apply returns its successful post-write
+   dual-enforcement readback may every canary be closed without merging. Never
+   close a canary before `activate` completes. Later `derive-cutover`,
+   `apply-repository-cleanup`, and `verify` use post-activation cohort snapshots
+   and do not require reopening those PRs. They also do not require a current
+   default-branch head equal to the historical canary base. Treat the canary
+   receipt only as activation-bound evidence. Each later round instead reads
+   the live default branch and proves the current control-plane/ruleset
+   closure: exact repository identity; a complete regular-blob workflow
+   inventory containing only the three canonical workflows and no extra
+   producer; exact CODEOWNERS; default-read Actions policy with an explicit
+   boolean `can_approve_pull_request_reviews`; Active repository and
+   organization v2 rules; the temporary bridge; and cleanup state.
+6. Derive the cutover transaction read-only:
+
+   ```bash
+   HANDOFF_CUTOVER_PLAN="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode derive-cutover > "$HANDOFF_CUTOVER_PLAN"
+   jq . "$HANDOFF_CUTOVER_PLAN"
+   ```
+
+   Review the manifest-bound `external_repository_actions`. Each action may
+   remove only `codex/review-gate`; it must retain all non-legacy checks and
+   strictness, ruleset identity and targets, bypass actors, `deletion`,
+   `non_fast_forward` and unrelated rules. Do not execute the raw actions.
+   Start the continuous cleanup-to-final-verify external policy-mutation
+   freeze, then preview and run the controlled executor:
+
+   ```bash
+   HANDOFF_CLEANUP_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode apply-repository-cleanup > "$HANDOFF_CLEANUP_PREVIEW"
+   HANDOFF_CLEANUP_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_CLEANUP_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode apply-repository-cleanup \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_CLEANUP_PLAN_SHA256"
+   ```
+
+   Treat this as an operational freeze, not a continuous repository or API
+   lock. From cleanup preview through final read-only `verify`, prohibit cohort
+   repository rename, transfer, deletion, default-branch change, and
+   replacement or re-creation at an original slug, as well as the listed
+   policy mutations. GitHub cleanup mutation APIs have no repository-ID
+   conditional/CAS write; this freeze covers the final
+   repository-metadata-read-to-write gap.
+
+   Before every cleanup surface GET—including initial classification, normal
+   readback, and error reconciliation—require live GitHub metadata to match the
+   manifest-bound `full_name`, `id`, `node_id`, and `default_branch`. For an
+   item still requiring a write, repeat that identity check immediately before
+   mutation, require exact `expected_before`, use the surface-specific
+   mutation, and require exact `expected_after` readback. `id` and `node_id`
+   bind the repository object; `full_name` binds its expected route and exposes
+   rename, transfer, or slug reuse; `default_branch` binds the branch selector.
+   The snapshots protect selected policy content. Ignore unrelated metadata
+   churn. Any unreadable or mismatched identity stops the batch at that
+   observation: a pre-mutation mismatch emits no write for the current action,
+   and no later mutation runs. A stable mix of before and after items is
+   resumable: already-after items are no-ops, and a fresh preview plans only
+   still-before items. If any mutation reports an error or an unknown outcome,
+   the executor performs a narrow read-only reconciliation first. Exact
+   after-state is completed; before-state, drift or an unreadable result stops
+   the batch. Run a fresh preview under the freeze and review that state; never
+   replay the old request or digest blindly. Stop before organization cutover
+   unless every action is at exact `expected_after`.
+7. Preview and apply final organization cutover:
+
+   ```bash
+   HANDOFF_VERIFY_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode verify > "$HANDOFF_VERIFY_PREVIEW"
+   HANDOFF_VERIFY_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_VERIFY_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode verify \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_VERIFY_PLAN_SHA256"
+   HANDOFF_FINAL_VERIFY=/absolute/path/to/final-read-only-verify.json
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode verify > "$HANDOFF_FINAL_VERIFY"
+   jq -e '
+     .schema_version == "organization-review-gate-handoff-output/v1" and
+     .mode == "verify" and
+     .status == "final-verified" and
+     .applied == false and
+     .action == null and
+     .final_closure_receipt.schema_version == 1 and
+     (.final_closure_receipt_sha256 | test("^[0-9a-f]{64}$"))
+   ' "$HANDOFF_FINAL_VERIFY"
+   HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256="$(jq -er \
+     '.final_closure_receipt_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_FINAL_VERIFY")"
+   ```
+
+   `verify --apply` is the only helper operation allowed to change the old
+   organization ruleset. It removes the entire legacy-only required-status
+   rule and must retain that ruleset's ID, name, conditions, enforcement,
+   bypass actors, `deletion`, `non_fast_forward` and every other field. It
+   never deletes the ruleset. Keep the external policy-mutation freeze in
+   force beyond that apply/readback through a distinct final read-only
+   `verify`, because the control plane can drift after the mutating command's
+   `applied-final-verified` boundary. Admit only an output with top-level
+   `schema_version: "organization-review-gate-handoff-output/v1"`,
+   `mode: "verify"`, `status: "final-verified"`, `applied: false`, and
+   `action: null`, plus `final_closure_receipt.schema_version: 1` and a
+   lowercase 64-hex `final_closure_receipt_sha256`. The embedded receipt must
+   bind the organization, reviewed manifest digest, final snapshot digest,
+legacy/v2 ruleset IDs and states, and the fixed complete eleven-repository
+cohort in canonical UTF-8-byte `full_name` order—never a subset or expanded cohort. Its
+top-level `plan_sha256` must exactly bind the final read-only `verify` plan
+(`mode`, manifest digest, snapshot digest, and `action: null`). Preserve the
+complete JSON output in `HANDOFF_FINAL_VERIFY`; an extracted embedded receipt
+is not a valid input to the bootstrap.
+
+   The third freeze ends only after that file and its top-level shape have
+   been validated. If this read is inconclusive or any bound policy differs,
+   keep every bridge, resolve the drift, and repeat the final read-only verify
+   under the freeze. If a known organization/repository policy mutation occurs
+   after capture but before removal preparation, discard the old proof and
+   mint a fresh final read-only output under a new freeze. Never substitute
+   the `verify --apply` response or reuse a known-stale receipt.
+8. Only after step 7 closes successfully, prepare a separate bridge-removal PR
+   in every member from a clean worktree:
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --prepare-worktree "$TARGET_ROOT" \
+     --remove-legacy-bridge \
+     --final-closure-receipt "$HANDOFF_FINAL_VERIFY" \
+     --expected-final-closure-receipt-sha256 \
+     "$HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --prepare-worktree "$TARGET_ROOT" \
+     --remove-legacy-bridge \
+     --final-closure-receipt "$HANDOFF_FINAL_VERIFY" \
+     --expected-final-closure-receipt-sha256 \
+     "$HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --apply
+   ```
+
+   `--final-closure-receipt` takes the complete final read-only verify output,
+   despite the singular option name. The bootstrap validates its terminal
+   top-level fields, recomputes the canonical embedded receipt digest, compares
+   the explicit expected SHA-256, parses the target worktree's unambiguous
+   GitHub `origin`, and reads live repository metadata from GitHub. It requires
+   exact `full_name`, `id`, `node_id`, and `default_branch` equality with one
+entry in the fixed eleven-member receipt cohort. At the pre-rename boundary it
+reads `origin` before and after the live-metadata query, repeats the local
+object checks, then reads `origin` once more immediately before the atomic
+bridge quarantine rename. After the rename and before unlink, it repeats the
+complete `origin` -> live metadata identity/default-branch -> `origin` check,
+then revalidates the quarantined file's admitted object identity and canonical
+content. If that remote binding check fails, it attempts to restore the same
+admitted bridge to the canonical path with no-clobber hard-link creation. An
+occupied destination or failed restoration verification fails closed, never
+overwrites the occupant, and reports no removal success. These are
+point-in-time remote binding and local identity/content checks, not a
+continuous lock. Do not edit the receipt, change `origin`, or bypass this
+proof.
+
+   An absent bridge makes the bridge-removal component an idempotent no-op. An
+   existing non-canonical bridge is rejected. The command as a whole also
+   enforces the canonical verifier, controller and managed CODEOWNERS block;
+   `--apply` repairs drift in any of those surfaces even when the bridge is
+   already absent. Before applying, verify them independently and inspect the
+   dry run. If it proposes anything other than bridge removal, stop and
+   resolve or separately review the drift rather than treating the change as
+   a bridge-only PR. After merge, run the ordinary bootstrap and inventory
+   checks without `--legacy-bridge`; any remaining v1 caller is a failure.
+
+Every authoritative helper success boundary reads a complete snapshot, waits
+five seconds and reads it again. A selected evidence or policy difference
+restarts the pair. If no identical pair is observed within 60 seconds, the
+result is inconclusive and no next write is allowed. Do not retry with a newly
+derived apply digest until the changed state has been reviewed, and never
+disable v2 or delete the old organization rule as recovery.
 
 ## Phase 1: prepare and merge one migration PR
 

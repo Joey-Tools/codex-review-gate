@@ -30,7 +30,7 @@ GitHub.com/default-branch PR scope 时停止。
 
 保持以下不变量：
 
-- 一个 migration PR 可以同时移除 v1、安装 v2；
+- 普通单仓流程中，一个 migration PR 可以同时移除 v1、安装 v2；
 - migration 合并后才创建独立 canary PR；
 - canary 最后关闭、不合并；
 - 每次 manual run 只处理一个 PR 与一个 exact expected head；
@@ -51,6 +51,323 @@ GitHub.com/default-branch PR scope 时停止。
   只有 exact `any` 覆盖默认 `write`，绝不把它新增为 Action input。
 - 每次调用 bootstrap 都显式保留同一个 `CONTROL_PLANE_OWNER`。默认值是
   `@JoeyTeng`；非 Joey 仓库必须替换成自己的合格 GitHub user。
+
+## Advanced：受控的 11 仓 organization handoff
+
+只有当授权 scope 精确等于一个经过审阅、受共享 v1 organization ruleset 保护的 11 仓
+cohort 时，才使用本执行路径。它不是可复用的 `allow-v1` 开关。下方普通 phases 仍拒绝
+所有 v1 caller；advanced path 最终也必须让每个成员回到同一个 no-v1 contract。
+
+增加以下 cohort inputs：
+
+```text
+HANDOFF_MANIFEST = reviewed JSON 的绝对路径
+HANDOFF_SCHEMA = organization-review-gate-handoff-manifest/v1
+V2_ORGANIZATION_RULESET_NAME = Must Pass Codex Review v2
+COHORT_REPOSITORY_V2_RULESET_NAME = Must Pass Codex Review v2
+```
+
+Manifest 必须绑定 exact organization ID/node ID、旧 organization ruleset 的完整
+snapshot、新 rule 的 name/ID、精确且有序的 11 个 repository slugs/numeric IDs/node IDs/
+default branches、verifier/controller/temporary bridge 的 Git blob SHA 与 SHA-256、
+effective CODEOWNERS identity、每个完整 Active repository v2 ruleset，以及全部 repository
+legacy-cleanup before/after actions。每个 canary 必须把 exact open、non-draft、
+same-repository PR 绑定到 current head/base/test-merge SHAs、v2 CheckRun/run/workflow/
+attempt/job IDs，以及最新 successful legacy commit-status ID。任意字段不完整、member-set
+不同、identity drift 或 unsupported surface 都必须停止。
+
+按同目录 README 实例化
+`templates/organization-review-gate-handoff/joey-tools-11-member-manifest.template.json`。
+每个显式 placeholder 都必须来自 authoritative live evidence；不得合成缺失 ID 或 digest。
+`stage` 之前唯一允许的不完整值，是 `v2_ruleset.id` 的 JSON literal `null`，因为 organization
+v2 ruleset 此时尚不存在。其他 placeholder 或 incomplete field 必须 validation failure。
+`stage` readback 成功后，只能使用 `next_manifest_update.v2_ruleset.id` 替换这个 `null`，
+review 完整 manifest，并重新运行 `plan`。
+
+因为 ambiguous POST 可能需要 no-receipt adoption，stage preview 前必须建立外部
+organization-admin policy-mutation freeze，并保持到 apply、readback 与任何 recovery 完成。
+Shared-rule activation 再建立一次 organization/repository admin freeze，从 preview 保持到
+stable post-write readback。Repository-cleanup preview 前第三次建立 freeze，并连续保持到
+完整 cleanup batch/readback、最终旧规则 preview/apply，以及另一次最终只读 verify receipt
+capture/validation 全部完成。
+这些 freeze 期间任何管理员都不得修改 organization/repository ruleset、classic branch
+protection、condition、required check 或 bypass actor。第三次 freeze 期间还禁止任何 cohort
+repository 被 rename、transfer、delete、改变 default branch，或在原 slug 被 replace/
+re-create。这些是运营冻结，不是持续 API 锁。GitHub ruleset endpoint 没有 documented
+conditional/CAS update，cleanup mutation API 也没有 repository-ID conditional/CAS write；
+plan digest 与紧邻重读可以拒绝已观察到的 drift，却无法阻止最后 GET→PUT 或 repository
+metadata read→write 区间的 racing write，这些区间由 freeze 覆盖。只能验证 manifest 绑定的
+bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 actor。
+
+严格按下列 state machine 执行：
+
+1. 对每个 member，用 exact bridge profile 替换普通阶段 1 的 bootstrap calls：
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --prepare-worktree "$TARGET_ROOT" \
+     --legacy-bridge \
+     --control-plane-owner "$CONTROL_PLANE_OWNER"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --prepare-worktree "$TARGET_ROOT" \
+     --legacy-bridge \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --apply
+   ```
+
+   这只安装固定的 canonical
+   `.github/workflows/codex-review-gate-legacy-bridge.yml`，不会放宽其他 v1 caller 的
+   inventory 检查。Organization cutover 被验证完成前，每次 remote repository bootstrap
+   invocation 都必须保留 `--legacy-bridge`。Migration 仍使用普通流程相同的 exact-head
+   Code Owner review boundary 合并。
+2. Reviewed repository ruleset name 精确为 `Must Pass Codex Review v2`，不是普通默认值
+   `Must Pass Codex Review`。每个 member 只能沿用普通 runbook 的 canonical-file controls
+   与阶段 2 Disabled repository-policy staging。每条 repository bootstrap preview/apply 都
+   必须同时传入 `--ruleset-name "$COHORT_REPOSITORY_V2_RULESET_NAME"` 与
+   `--legacy-bridge`；不得进入普通 cleanup 或 canary-close 步骤。
+
+   Disabled rule 读回后，再创建 cohort canary。沿用普通 evidence mechanics，以及阶段 5
+   中仅 repository activation 的部分：证明 exact successful `codex/github-review-gate`
+   CheckRun 及 canonical current-test-merge workflow run/job receipt，并证明最新
+   `codex/review-gate` bridge commit status 在同一 feature head 上为 success；随后用同一个
+   distinct name 与 bridge profile activate 完整 repository v2 rule。在普通 legacy cleanup
+   前停止。记录所有 bound IDs，并让 canary 保持 open、non-draft、same-repository、
+   current-base，直到 shared organization activation 被证明。旧 organization v1 rule 与
+   所有 repository legacy requirements 必须仍然存在。
+3. 完成并独立审阅 `HANDOFF_MANIFEST`，运行只读 organization plan：
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode plan
+   ```
+
+4. Preview 并创建 Disabled v2-only organization ruleset。Apply 必须使用对应 preview 的
+   exact digest：
+
+   ```bash
+   HANDOFF_STAGE_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode stage > "$HANDOFF_STAGE_PREVIEW"
+   HANDOFF_STAGE_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_STAGE_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode stage \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_STAGE_PLAN_SHA256"
+   ```
+
+   Payload 必须只包含一条 source-bound strict `codex/github-review-gate` requirement，
+   GitHub Actions integration 为 `15368`，conditions 精确绑定 cohort/default branch，且
+   bypass list 显式为空。不得从旧 organization rule 复制 `deletion`、
+   `non_fast_forward` 或 pull-request rules。把返回的
+   `next_manifest_update.v2_ruleset.id` 绑定进 reviewed manifest，并在继续前重新运行
+   `plan`。
+
+   如果 POST 可能已经提交后失败，helper 会先尝试一次只读 reconcile；返回
+   `applied-recovered` 与 `next_manifest_update` 就是已验证成功。如果进程被中断或仍报告
+   unknown outcome，则不得重复 `stage --apply`。保持 `v2_ruleset.id: null`，运行只读恢复
+   入口：
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode stage \
+     --recover-created-v2
+   ```
+
+   `--recover-created-v2` 不得与 `--apply` 或 digest 合用。只有唯一一个同名规则的 source
+   与完整 writable payload 精确等于 canonical Disabled v2，且旧 organization rule 仍在
+   exact before-state 时，才可输出 `next_manifest_update`。Candidate 不存在、多个、已
+   Active 或有 drift 都是停止条件。完整 recovery read 期间必须保持外部
+   organization-admin policy-mutation freeze；绝不重发 POST。
+5. Preview 并 activate 新 organization rule：
+
+   ```bash
+   HANDOFF_ACTIVATE_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode activate > "$HANDOFF_ACTIVATE_PREVIEW"
+   HANDOFF_ACTIVATE_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_ACTIVATE_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode activate \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_ACTIVATE_PLAN_SHA256"
+   ```
+
+   写入前 helper 必须证明 11 个 exact repository identities、三份 exact workflows、完整
+   effective CODEOWNERS identities、Active repository v2 rulesets、open/non-draft/current-
+   base canaries、exact v2 run/job receipts、latest successful legacy commit statuses、未变化
+   的 repository legacy surfaces 与 exact old organization rule。成功 readback 才是双重
+   保护 handoff point：shared v2 Active，同时 shared v1 仍 Active。
+
+   只有 activation apply 返回成功的 post-write dual-enforcement readback 后，才可关闭且不
+   合并每个 canary；`activate` 完成前绝不可关闭。之后的 `derive-cutover`、
+   `apply-repository-cleanup` 与 `verify` 使用 post-activation cohort snapshots，不要求重新
+   打开这些 PR，也不要求当前 default-branch head 等于历史 canary base。Canary receipt 只
+   属于 activation-bound evidence；后续每轮都
+   读取实时 default branch 并验证当前 control-plane/ruleset closure：exact repository
+   identity、只含三份 canonical workflows 且没有额外 producer 的完整 regular-blob
+   workflow inventory、exact CODEOWNERS、包含明确 boolean
+   `can_approve_pull_request_reviews` 的 default-read Actions policy、Active repository/
+   organization v2 rules、temporary bridge 与 cleanup state。
+6. 只读推导 cutover transaction：
+
+   ```bash
+   HANDOFF_CUTOVER_PLAN="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode derive-cutover > "$HANDOFF_CUTOVER_PLAN"
+   jq . "$HANDOFF_CUTOVER_PLAN"
+   ```
+
+   审阅 manifest-bound `external_repository_actions`。每个 action 只可移除
+   `codex/review-gate`；所有 non-legacy checks/strictness、ruleset identity/targets、bypass
+   actors、`deletion`、`non_fast_forward` 与 unrelated rules 必须保留。不得手工执行 raw
+   actions。开始连续覆盖 cleanup 至 final verify 的外部 policy-mutation freeze，再通过受控
+   executor 先 preview 后执行：
+
+   ```bash
+   HANDOFF_CLEANUP_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode apply-repository-cleanup > "$HANDOFF_CLEANUP_PREVIEW"
+   HANDOFF_CLEANUP_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_CLEANUP_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode apply-repository-cleanup \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_CLEANUP_PLAN_SHA256"
+   ```
+
+   这是运营冻结，不是持续的 repository 或 API 锁。从 cleanup preview 到最终只读
+   `verify`，除已列出的 policy mutations 外，还必须禁止 cohort repository rename、
+   transfer、delete、default-branch change，以及在原 slug replace/re-create repository。
+   GitHub cleanup mutation API 没有 repository-ID conditional/CAS write；这段 freeze 覆盖
+   最后一次 repository metadata read 到 write 之间的区间。
+
+   每次 cleanup surface GET（包括 initial classification、正常 readback 与 error
+   reconciliation）前，都必须读取 live GitHub metadata，并要求 manifest-bound `full_name`、
+   `id`、`node_id` 与 `default_branch` 精确相等。若该项仍需写入，则在紧邻 mutation 前
+   重复 identity check，要求 exact `expected_before`，执行 surface-specific mutation，最后
+   要求 exact `expected_after` readback。`id`/`node_id` 绑定 repository object；`full_name`
+   绑定 expected route 并暴露 rename、transfer 或 slug reuse；`default_branch` 绑定 branch
+   selector。Snapshots 保护选定的 policy content；无关 metadata churn 应忽略。Identity 无法
+   读取或 mismatch 时，batch 会在观测点立即停止：pre-mutation mismatch 不会写当前
+   action，之后也不再执行任何 mutation。稳定的 before/after mixed state 可以安全续跑：
+   已经 after 的项目是 no-op，新 preview 只计划仍为 before 的项目。Mutation 返回 error 或
+   结果 unknown 时，executor 必须先做 narrow read-only reconcile；exact after 表示完成，
+   before、drift 或无法读取则停止整个 batch。在 freeze 下生成新 preview 并 review 该
+   state；绝不盲目重放旧 request 或 digest。任一 action 未达到 exact `expected_after` 时，
+   不得进入 organization cutover。
+7. Preview 并执行最终 organization cutover：
+
+   ```bash
+   HANDOFF_VERIFY_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode verify > "$HANDOFF_VERIFY_PREVIEW"
+   HANDOFF_VERIFY_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_VERIFY_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode verify \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_VERIFY_PLAN_SHA256"
+   HANDOFF_FINAL_VERIFY=/absolute/path/to/final-read-only-verify.json
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode verify > "$HANDOFF_FINAL_VERIFY"
+   jq -e '
+     .schema_version == "organization-review-gate-handoff-output/v1" and
+     .mode == "verify" and
+     .status == "final-verified" and
+     .applied == false and
+     .action == null and
+     .final_closure_receipt.schema_version == 1 and
+     (.final_closure_receipt_sha256 | test("^[0-9a-f]{64}$"))
+   ' "$HANDOFF_FINAL_VERIFY"
+   HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256="$(jq -er \
+     '.final_closure_receipt_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_FINAL_VERIFY")"
+   ```
+
+   `verify --apply` 是唯一可修改旧 organization ruleset 的 helper operation。它移除完整的
+   legacy-only required-status rule；旧 ruleset 的 ID、name、conditions、enforcement、
+   bypass actors、`deletion`、`non_fast_forward` 与其他所有 fields 必须保留。绝不删除旧
+   ruleset。因为 mutating command 的 `applied-final-verified` boundary 之后 control plane
+   仍可能 drift，外部 policy-mutation freeze 必须越过 apply/readback，一直保持到另一次最终
+   只读 `verify` 完成。只接受顶层为
+   `schema_version: "organization-review-gate-handoff-output/v1"`、`mode: "verify"`、
+   `status: "final-verified"`、`applied: false`、`action: null`，并包含
+   `final_closure_receipt.schema_version: 1` 与 lowercase 64-hex
+   `final_closure_receipt_sha256` 的输出。Embedded receipt 必须绑定 organization、reviewed
+manifest digest、final snapshot digest、legacy/v2 ruleset IDs/states 与按 canonical UTF-8 byte `full_name`
+order 排列的 exact repository cohort：只能是固定、完整的 11 仓 cohort，不能是任意子集或扩大的 cohort。
+top-level `plan_sha256` 必须精确绑定最终只读 `verify` plan（`mode`、manifest digest、snapshot
+digest 与 `action: null`）。必须完整保留 `HANDOFF_FINAL_VERIFY` 中的 JSON output；单独提取
+embedded receipt 不能作为 bootstrap 输入。
+
+   只有该文件及 top-level shape 验证完成后，第三段 freeze 才结束。若本次读取 inconclusive
+   或任何 bound policy 不一致，保留所有 bridges，修复 drift，并在 freeze 下重复最终只读
+   verify。若 capture 之后到 removal preparation 之前发生了已知 organization/repository
+   policy mutation，则丢弃旧 proof，在新的 freeze 下生成 fresh final read-only output；绝不
+   用 `verify --apply` response 代替，也不复用已知 stale receipt。
+8. 只有步骤 7 成功 closure 后，每个 member 才从 clean worktree 另开 bridge-removal PR：
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --prepare-worktree "$TARGET_ROOT" \
+     --remove-legacy-bridge \
+     --final-closure-receipt "$HANDOFF_FINAL_VERIFY" \
+     --expected-final-closure-receipt-sha256 \
+     "$HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --prepare-worktree "$TARGET_ROOT" \
+     --remove-legacy-bridge \
+     --final-closure-receipt "$HANDOFF_FINAL_VERIFY" \
+     --expected-final-closure-receipt-sha256 \
+     "$HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --apply
+   ```
+
+   虽然 option 名称是 singular `--final-closure-receipt`，它接收的是完整的最终只读 verify
+   output。Bootstrap 会验证 terminal top-level fields、重新计算 canonical embedded receipt
+   digest、比对显式 expected SHA-256、解析 target worktree 中无歧义的 GitHub `origin`，并从
+GitHub 读取 live repository metadata。它要求 `full_name`、`id`、`node_id` 与
+`default_branch` 都和固定 11 仓 receipt cohort 中的一项精确相等。在 atomic bridge quarantine
+rename 前的边界，它会先在 live-metadata query 前后各读取一次 `origin`，重新验证本地对象后，
+再紧邻 rename 读取一次 `origin`。Rename 后、unlink 前，它会再次执行完整的 `origin` ->
+live metadata identity/default-branch -> `origin` 检查，并重新验证 quarantine 中 admitted
+file 的 object identity 与 canonical content。若该 remote binding check 失败，它会通过
+no-clobber hard-link creation 尝试把同一 admitted bridge 恢复到 canonical path；若目标路径
+已被占用或恢复后的验证失败，则 fail closed、绝不覆盖占用者，也不报告删除成功。这些是
+point-in-time 的 remote binding 与 local identity/content checks，并非连续锁。不得编辑
+receipt、切换 `origin` 或绕过这份 proof。
+
+   Bridge absent 时，bridge-removal component 是 idempotent no-op；已有但 non-canonical
+   的 bridge 会被拒绝。整个 command 也会强制 canonical verifier、controller 与 managed
+   CODEOWNERS block；即使 bridge 已经 absent，`--apply` 仍会修复这些 surfaces 的 drift。
+   Apply 前必须独立验证它们并检查 dry run；若提出 bridge removal 之外的变更，必须停止并
+   处理或单独 review drift，不能把改动当作 bridge-only PR。合并后运行不带
+   `--legacy-bridge` 的普通 bootstrap 与 inventory checks；任何残留 v1 caller 都是
+   failure。
+
+每个 authoritative helper success boundary 先读取一份完整 snapshot，等待 5 秒，再读一
+份。Selected evidence 或 policy 不同就重新开始这一对读取；60 秒内始终得不到相同的一对，
+结论就是 inconclusive，不允许下一次 write。除非变化后的 state 已重新 review，不得用新
+推导的 apply digest 重试；恢复时绝不能 disable v2 或删除旧 organization rule。
 
 ## 阶段 1：准备并合并 migration PR
 

@@ -1,0 +1,24 @@
+name: Codex Review Gate Legacy Bridge
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: codex-review-gate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  codex-review-gate-legacy-bridge:
+    name: codex/review-gate legacy bridge
+    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1
