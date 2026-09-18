@@ -476,6 +476,7 @@ function createFakeGhHarness(
     extraEffectiveSecondPageRules = [],
     mutateEffectiveRules = null,
     legacyProducerRunPages = null,
+    legacyProducerRunDelaySeconds = null,
     legacyBridgeRunPages = null,
     legacyBridgeWorkflowInventory = null,
     legacyWriterRace = null,
@@ -497,6 +498,7 @@ function createFakeGhHarness(
   const legacyWriterRaceStatePath = join(directory, "legacy-writer-race-state");
   const cleanupActionStatePaths = [];
   const responses = new Map();
+  const delayedRequests = [];
   const legacyWriterRaceResponses = [];
   const cleanupResponses = [];
   const effectiveBranchResponses = [];
@@ -929,11 +931,19 @@ function createFakeGhHarness(
         ? legacyProducerRunPages
         : workflowRunPages([]);
     for (const [pageIndex, page] of producerRunPages.entries()) {
+      const endpoint =
+        `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}/runs?per_page=100&page=${pageIndex + 1}`;
       addFakeResponse(
         responses,
-        `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}/runs?per_page=100&page=${pageIndex + 1}`,
+        endpoint,
         page,
       );
+      if (repositoryIndex === 0 && legacyProducerRunDelaySeconds !== null) {
+        delayedRequests.push({
+          request: `GET:${endpoint}`,
+          seconds: legacyProducerRunDelaySeconds,
+        });
+      }
     }
     const bridgeRunPages =
       repositoryIndex === 0 && legacyBridgeRunPages !== null
@@ -1235,6 +1245,15 @@ function createFakeGhHarness(
         `      after) respond ${shellQuote(response.after)} ;;`,
         "      *) printf '%s\\n' 'invalid fake legacy writer race state' >&2; exit 2 ;;",
         "    esac ;;",
+      );
+    }
+    scriptLines.push("esac");
+  }
+  if (delayedRequests.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const delayed of delayedRequests) {
+      scriptLines.push(
+        `  ${shellQuote(delayed.request)}) sleep ${shellQuote(String(delayed.seconds))} ;;`,
       );
     }
     scriptLines.push("esac");
@@ -2907,6 +2926,87 @@ test("legacy writer scans oversized aggregate history one bounded page at a time
     countRequest(fakeGhRequests(harness.logPath), "GET", endpoint),
     0,
     "the scanner must not ask gh to aggregate every run page into one stdout payload",
+  );
+});
+
+test("legacy writer scan shares one total deadline through its final page", async () => {
+  const repository = integrationManifestFixture().manifest.repositories[0];
+  const pages = workflowRunPages(
+    Array.from({ length: 101 }, (_value, index) => ({
+      id: 94000000 + index,
+      status: "completed",
+    })),
+  );
+  let nowMs = 0;
+  const requests = [];
+  await assert.rejects(
+    scanLegacyWriterRuns(
+      repository,
+      repository.canary.v2_workflow_id,
+      "retained canonical producer",
+      {
+        now: () => nowMs,
+        timeoutMs: 50,
+        readPage: async (endpoint, options) => {
+          requests.push({ endpoint, options });
+          nowMs += requests.length === 1 ? 20 : 31;
+          return pages[requests.length - 1];
+        },
+      },
+    ),
+    /complete legacy-writer scan exceeded its 50ms total deadline/u,
+  );
+  assert.equal(requests.length, 2);
+  assert.deepEqual(
+    requests.map(({ endpoint }) => endpoint),
+    [
+      `repos/${encodeEndpointPathForTest(repository.slug)}/actions/workflows/${repository.canary.v2_workflow_id}/runs?per_page=100&page=1`,
+      `repos/${encodeEndpointPathForTest(repository.slug)}/actions/workflows/${repository.canary.v2_workflow_id}/runs?per_page=100&page=2`,
+    ],
+  );
+  assert.deepEqual(
+    requests.map(({ options }) => options.deadlineAt),
+    [50, 50],
+  );
+  assert.match(
+    requests[0].options.deadlineLabel,
+    /50ms complete legacy-writer scan/u,
+  );
+});
+
+test("legacy writer scan rejects oversized history before requesting a second page", async () => {
+  const repository = integrationManifestFixture().manifest.repositories[0];
+  const requests = [];
+  await assert.rejects(
+    scanLegacyWriterRuns(
+      repository,
+      repository.canary.v2_workflow_id,
+      "retained canonical producer",
+      {
+        readPage: async (endpoint) => {
+          requests.push(endpoint);
+          return { total_count: 100_001, workflow_runs: [] };
+        },
+      },
+    ),
+    /100000-entry hard resource bound/u,
+  );
+  assert.equal(requests.length, 1);
+});
+
+test("legacy writer scan applies its shared deadline to the real gh child", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    legacyProducerRunDelaySeconds: 0.4,
+  });
+  const repository = harness.manifest.repositories[0];
+  await assert.rejects(
+    scanLegacyWriterRuns(
+      repository,
+      repository.canary.v2_workflow_id,
+      "retained canonical producer",
+      { timeoutMs: 100 },
+    ),
+    /100ms complete legacy-writer scan exceeded its shared deadline/u,
   );
 });
 

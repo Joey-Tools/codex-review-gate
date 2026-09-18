@@ -289,6 +289,23 @@ the global cutover is closed.
   historical legacy-status writer. Dedicated regressions cover duplicate IDs,
   page-horizon drift, the >8 MiB aggregate history, and a same-ID
   `run_attempt` change coupled to a later legacy-status failure.
+- The subsequent independent Terra/high review found that page-at-a-time
+  history reads could accidentally turn the existing 60-second per-`gh`
+  process timeout into an unbounded whole-scan duration: each page could first
+  wait for an API slot and then receive a new 60-second child-process budget.
+  Every complete retained-producer or bridge scan now starts one monotonic
+  60-second deadline. That same absolute deadline is passed to each unfiltered
+  page read; the API-slot wait and the `gh` child both recompute and consume
+  only its remaining time. A page returned at or after the deadline is
+  inconclusive even if it is the final page. This bounds a scan without
+  claiming an atomic GitHub snapshot or changing the separate `D0 -> S0 -> D1
+  -> S1` evidence semantics.
+- The scan also rejects histories beyond its fixed 100,000-entry / 1,000-page
+  hard resource boundary before it stores their compact execution identities.
+  These are source-handoff memory/request bounds, deliberately distinct from
+  consumer reconcile limit profiles. Tests cover a virtual-clock final-page
+  overrun, the real `gh` child inheriting the remaining deadline, and immediate
+  fail-closed rejection of an oversized declared inventory.
 
 ## Failure And Recovery Boundary
 
@@ -386,6 +403,6 @@ the global cutover is closed.
   `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`.
 - Current delivery validation: after the current-head review follow-up,
   `npm run check` passed and `npm run test:organization-handoff` passed
-  230/230. Earlier dedicated v2 workflow-contract and workflow-security
+  233/233. Earlier dedicated v2 workflow-contract and workflow-security
   validation remain recorded above. `git diff --check` and project-journal
   validation passed after this checkpoint was updated.

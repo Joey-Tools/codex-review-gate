@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import { resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
 
@@ -78,6 +79,13 @@ const MAX_GH_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const GH_TIMEOUT_MS = 60_000;
 const GH_API_QUEUE_TIMEOUT_MS = 60_000;
+// A writer epoch retains one compact execution identity per historical run.
+// These hard bounds protect the one-time handoff reader's memory and request
+// footprint; they are intentionally distinct from consumer reconcile limits.
+const LEGACY_WRITER_SCAN_TIMEOUT_MS = 60_000;
+const LEGACY_WRITER_RUN_PAGE_SIZE = 100;
+const MAX_LEGACY_WRITER_RUN_ENTRIES = 100_000;
+const MAX_LEGACY_WRITER_RUN_PAGES = 1_000;
 const GH_API_CONCURRENCY = 8;
 const REPOSITORY_EVIDENCE_CONCURRENCY = 2;
 const MODES = new Set([
@@ -1961,14 +1969,32 @@ function createLegacyWriterRunInventoryAccumulator(repo, writer) {
         !Number.isSafeInteger(page.total_count) ||
         page.total_count < 0 ||
         !Array.isArray(page.workflow_runs) ||
-        page.workflow_runs.length > 100
+        page.workflow_runs.length > LEGACY_WRITER_RUN_PAGE_SIZE
       ) {
         throw new Error(`${repo.slug} legacy writer run inventory is incomplete.`);
       }
       if (totalCount === null) {
         totalCount = page.total_count;
+        if (totalCount > MAX_LEGACY_WRITER_RUN_ENTRIES) {
+          throw new Error(
+            `${repo.slug} ${writer} history has ${totalCount} runs, beyond the ${MAX_LEGACY_WRITER_RUN_ENTRIES}-entry hard resource bound; the result is inconclusive and no next write is allowed.`,
+          );
+        }
+        if (
+          Math.ceil(totalCount / LEGACY_WRITER_RUN_PAGE_SIZE) >
+          MAX_LEGACY_WRITER_RUN_PAGES
+        ) {
+          throw new Error(
+            `${repo.slug} ${writer} history exceeds the ${MAX_LEGACY_WRITER_RUN_PAGES}-page hard resource bound; the result is inconclusive and no next write is allowed.`,
+          );
+        }
       } else if (page.total_count !== totalCount) {
         throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+      }
+      if (pageCount >= MAX_LEGACY_WRITER_RUN_PAGES) {
+        throw new Error(
+          `${repo.slug} ${writer} history exceeds the ${MAX_LEGACY_WRITER_RUN_PAGES}-page hard resource bound; the result is inconclusive and no next write is allowed.`,
+        );
       }
       pageCount += 1;
       pageSizes.push(page.workflow_runs.length);
@@ -1997,7 +2023,7 @@ function createLegacyWriterRunInventoryAccumulator(repo, writer) {
         throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
       }
       if (runIds.size === totalCount) return true;
-      if (page.workflow_runs.length !== 100) {
+      if (page.workflow_runs.length !== LEGACY_WRITER_RUN_PAGE_SIZE) {
         throw new Error(
           `${repo.slug} legacy writer run pagination has an incomplete non-final page.`,
         );
@@ -2141,14 +2167,62 @@ async function loadActiveCanonicalLegacyBridgeWorkflowId(repo) {
   );
 }
 
-export async function scanLegacyWriterRuns(repo, workflowId, writer) {
+function legacyWriterScanDeadlineError(repo, writer, timeoutMs) {
+  return new Error(
+    `${repo.slug} ${writer} complete legacy-writer scan exceeded its ${timeoutMs}ms total deadline; the result is inconclusive and no next write is allowed.`,
+  );
+}
+
+export async function scanLegacyWriterRuns(
+  repo,
+  workflowId,
+  writer,
+  {
+    now = performance.now.bind(performance),
+    timeoutMs = LEGACY_WRITER_SCAN_TIMEOUT_MS,
+    readPage = ghJson,
+  } = {},
+) {
+  if (
+    typeof now !== "function" ||
+    typeof readPage !== "function" ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0
+  ) {
+    throw new Error("Legacy writer scan runtime configuration is invalid.");
+  }
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) {
+    throw new Error("Legacy writer scan clock returned an invalid start time.");
+  }
+  const deadlineAt = startedAt + timeoutMs;
+  if (!Number.isFinite(deadlineAt)) {
+    throw new Error("Legacy writer scan deadline is invalid.");
+  }
+  const deadlineLabel =
+    `${repo.slug} ${writer} ${timeoutMs}ms complete legacy-writer scan`;
+  let lastObservedAt = startedAt;
+  const assertWithinDeadline = () => {
+    const observedAt = now();
+    if (!Number.isFinite(observedAt) || observedAt < lastObservedAt) {
+      throw new Error("Legacy writer scan clock is invalid or moved backwards.");
+    }
+    lastObservedAt = observedAt;
+    if (observedAt >= deadlineAt) {
+      throw legacyWriterScanDeadlineError(repo, writer, timeoutMs);
+    }
+  };
   const endpoint =
-    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?per_page=100`;
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?per_page=${LEGACY_WRITER_RUN_PAGE_SIZE}`;
   const accumulator = createLegacyWriterRunInventoryAccumulator(repo, writer);
   for (let page = 1; ; page += 1) {
-    const complete = accumulator.addPage(
-      await ghJson(`${endpoint}&page=${page}`),
-    );
+    assertWithinDeadline();
+    const response = await readPage(`${endpoint}&page=${page}`, {
+      deadlineAt,
+      deadlineLabel,
+    });
+    assertWithinDeadline();
+    const complete = accumulator.addPage(response);
     if (complete) return accumulator.finish();
   }
 }
@@ -3749,10 +3823,35 @@ const ghApiSlots = {
   waiters: [],
 };
 
-async function withGhApiSlot(callback) {
+function deadlineExceededError(deadlineLabel) {
+  return new Error(
+    `${deadlineLabel} exceeded its shared deadline; the result is inconclusive and no next write is allowed.`,
+  );
+}
+
+function remainingDeadlineMs(deadlineAt, deadlineLabel) {
+  if (!Number.isFinite(deadlineAt) || typeof deadlineLabel !== "string" || deadlineLabel === "") {
+    throw new Error("GitHub API deadline configuration is invalid.");
+  }
+  const remaining = deadlineAt - performance.now();
+  if (remaining <= 0) throw deadlineExceededError(deadlineLabel);
+  return Math.ceil(remaining);
+}
+
+async function withGhApiSlot(
+  callback,
+  { deadlineAt = undefined, deadlineLabel = undefined } = {},
+) {
   if (typeof callback !== "function") {
     throw new Error("GitHub API slot callback must be a function.");
   }
+  const queueTimeoutMs =
+    deadlineAt === undefined
+      ? GH_API_QUEUE_TIMEOUT_MS
+      : Math.min(
+          GH_API_QUEUE_TIMEOUT_MS,
+          remainingDeadlineMs(deadlineAt, deadlineLabel),
+        );
   await new Promise((resolvePromise, rejectPromise) => {
     if (ghApiSlots.active < GH_API_CONCURRENCY) {
       ghApiSlots.active += 1;
@@ -3772,11 +3871,13 @@ async function withGhApiSlot(callback) {
       const index = ghApiSlots.waiters.indexOf(waiter);
       if (index !== -1) ghApiSlots.waiters.splice(index, 1);
       rejectPromise(
-        new Error(
-          `GitHub API queue remained full for ${GH_API_QUEUE_TIMEOUT_MS}ms; the result is inconclusive and no next write is allowed.`,
-        ),
+        deadlineAt === undefined
+          ? new Error(
+              `GitHub API queue remained full for ${GH_API_QUEUE_TIMEOUT_MS}ms; the result is inconclusive and no next write is allowed.`,
+            )
+          : deadlineExceededError(deadlineLabel),
       );
-    }, GH_API_QUEUE_TIMEOUT_MS);
+    }, queueTimeoutMs);
     ghApiSlots.waiters.push(waiter);
   });
   try {
@@ -3795,13 +3896,37 @@ function ghJson(
   endpoint,
   options = {},
 ) {
-  return withGhApiSlot(() => ghJsonUnbounded(endpoint, options));
+  const { deadlineAt = undefined, deadlineLabel = undefined, ...requestOptions } = options;
+  return withGhApiSlot(
+    () =>
+      ghJsonUnbounded(endpoint, requestOptions, {
+        timeoutMs:
+          deadlineAt === undefined
+            ? GH_TIMEOUT_MS
+            : Math.min(
+                GH_TIMEOUT_MS,
+                remainingDeadlineMs(deadlineAt, deadlineLabel),
+              ),
+        timeoutError:
+          deadlineAt === undefined
+            ? undefined
+            : deadlineExceededError(deadlineLabel),
+      }),
+    { deadlineAt, deadlineLabel },
+  );
 }
 
 function ghJsonUnbounded(
   endpoint,
   { method = "GET", body = undefined, paginate = false, allowNotFound = false } = {},
+  { timeoutMs = GH_TIMEOUT_MS, timeoutError = undefined } = {},
 ) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("GitHub API request timeout must be a positive safe integer.");
+  }
+  if (timeoutError !== undefined && !(timeoutError instanceof Error)) {
+    throw new Error("GitHub API request timeout error must be an Error when provided.");
+  }
   return new Promise((resolvePromise, rejectPromise) => {
     const args = [
       "api",
@@ -3848,8 +3973,10 @@ function ghJsonUnbounded(
     });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      finish(() => rejectPromise(new Error(`gh api ${endpoint} timed out.`)));
-    }, GH_TIMEOUT_MS);
+      finish(() =>
+        rejectPromise(timeoutError ?? new Error(`gh api ${endpoint} timed out.`)),
+      );
+    }, timeoutMs);
     if (body === undefined) {
       child.stdin.end();
     } else {
