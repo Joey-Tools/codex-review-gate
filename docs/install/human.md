@@ -215,8 +215,9 @@ for `opened`, `reopened`, `synchronize`, and `ready_for_review`, plus
 `pull_request_review`: GitHub binds that workflow to the PR merge ref, where
 the compatibility publisher's `issues: write` authority is not a safe write
 surface. Do not add a local review trigger. The temporary bridge remains a
-compatibility status publisher; v2 review-only evidence uses the separately
-documented manual-reconcile recovery path.
+compatibility status publisher; v2 manual reconcile cannot refresh its v1
+status. Section 3 documents the separate exact-run recovery required while
+dual protection remains active.
 
 Reuse the ordinary guide only for canonical file preparation, control-plane
 review and staging the complete repository v2 policy as **Disabled**. Do not
@@ -835,6 +836,44 @@ create the request. A later qualifying `created` or `edited` Codex bot comment
 wakes the controller, which establishes a strictly newer full verifier attempt.
 If the provider result arrives only as a review or reaction, or another
 recovery is needed, run a manual reconcile.
+
+### Dual-protection legacy-status recovery
+
+Manual v2 `reconcile` only refreshes `codex/github-review-gate`; it never
+writes `codex/review-gate`. While both contexts remain required, a review- or
+reaction-only result can therefore need a separate v1 recovery. First reread
+the PR and bind its number, current `CANARY_HEAD`, base repository, and
+default branch. In Actions, select exactly one existing run of the current `Codex Review Gate
+Legacy Bridge` workflow. Its REST object must have all of: `event` equal to
+`pull_request_target`, parsed workflow path
+`.github/workflows/codex-review-gate-legacy-bridge.yml` (an optional GitHub
+`@ref` suffix is not part of the path), `head_sha` equal to `CANARY_HEAD`, and
+exactly one `pull_requests` entry for this PR whose head repository and SHA
+equal the bound values. Record its `id` and positive `run_attempt`; ambiguity
+is a stop condition.
+
+Re-run that exact pre-existing bridge run, never a different v1 workflow:
+
+```bash
+gh api --hostname github.com \
+  --method POST \
+  "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun"
+```
+
+GitHub re-runs preserve the original run's `GITHUB_SHA` and `GITHUB_REF`; that
+is why the selected run must already bind this exact PR head. After the POST,
+reread the PR and run. Require the same run identity/scope, exactly
+`LEGACY_RUN_ATTEMPT + 1`, terminal `success`, and a complete status inventory
+whose latest eligible `codex/review-gate` status is `success` on the still
+current `CANARY_HEAD`. A timeout, unchanged attempt, attempt jump, changed
+PR/head, or a nonunique candidate is inconclusive: do not submit the POST
+again.
+
+If no eligible bridge run exists (including a run past GitHub's re-run window),
+convert the PR to draft and mark it ready again to create a fresh
+`pull_request_target` lifecycle run. Rebind the PR scope and restart this
+selection procedure. Do not add `workflow_dispatch`, a review event, cron, or
+a new status writer to recover v1.
 
 GitHub records the verifier run/job/CheckRun against the exact PR feature-head
 SHA, not its test-merge SHA. The canonical `pull_request` verifier still

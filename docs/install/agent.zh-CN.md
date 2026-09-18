@@ -125,8 +125,8 @@ bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 ac
    `synchronize`、`ready_for_review`，以及 `issue_comment` 的 `created`。它刻意排除
    `pull_request_review`：GitHub 会将该 workflow 绑定到 PR merge ref，而兼容 publisher 的
    `issues: write` authority 不能安全地在该 ref 执行。不得在 consumer repository 局部加回
-   review trigger。temporary bridge 仍只是 compatibility status publisher；只由 review 承载的
-   v2 provider evidence 走单独文档规定的 manual-reconcile recovery path。
+   review trigger。temporary bridge 仍只是 compatibility status publisher；v2 manual reconcile
+   不能刷新它的 v1 status。dual protection 仍生效时所需的 exact-run recovery 见阶段 3。
 2. Reviewed repository ruleset name 精确为 `Must Pass Codex Review v2`，不是普通默认值
    `Must Pass Codex Review`。每个 member 只能沿用普通 runbook 的 canonical-file controls
    与阶段 2 Disabled repository-policy staging。每条 repository bootstrap preview/apply 都
@@ -769,6 +769,37 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    Caller-authored event 会被 pre-runner bot filter 跳过，Codex bot 之后的
    合格 `issue_comment` `created` 或 `edited` event 才启动 controller workflow。Review 或
    reaction 本身没有自动 consumer job，需要时手动 reconcile。
+
+   ### Dual-protection legacy-status recovery
+
+   手动 v2 `reconcile` 只更新 `codex/github-review-gate`，绝不会写
+   `codex/review-gate`。两个 context 仍同时 required 时，只由 review 或 reaction 承载的结果可能需要
+   单独恢复 v1。先重新读取 PR，并绑定其 number、current `CANARY_HEAD`、base repository 与 default
+   branch。然后只选择当前 `Codex Review Gate Legacy Bridge` workflow 的一个既有 run。它的 REST
+   object 必须同时满足：`event=pull_request_target`、解析后的 workflow path 为
+   `.github/workflows/codex-review-gate-legacy-bridge.yml`（可选 GitHub `@ref` suffix 不属于
+   path）、`head_sha` 等于 `CANARY_HEAD`，以及恰好一个 `pull_requests` entry 指向该 PR，且其中
+   head repository 与 SHA 都等于已绑定值。记录它的 `id` 与正数 `run_attempt`；任何 ambiguity
+   都是 inconclusive。
+
+   只 rerun 这个 exact 已有 bridge run，不得改用其他 v1 workflow：
+
+   ```bash
+   gh api --hostname github.com \
+     --method POST \
+     "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun"
+   ```
+
+   GitHub rerun 会保留触发原 run 的 `GITHUB_SHA` 与 `GITHUB_REF`；这正是 source run 必须已经
+   绑定该 exact PR head 的原因。POST 后重读 PR 与 run，要求 immutable run identity/scope 不变、
+   `run_attempt` 恰好为 `LEGACY_RUN_ATTEMPT + 1`、terminal 为 `success`，并要求 complete status
+   inventory 中最新 eligible `codex/review-gate` status 在仍为 current 的 `CANARY_HEAD` 上是
+   `success`。timeout、attempt 未变、attempt 跳跃、PR/head 改变或 candidate 不唯一均为
+   inconclusive：不得再次提交 POST。
+
+   若没有 eligible bridge run（包括超出 GitHub rerun window），将 PR 转成 draft 后再标记 ready，
+   以创建新的 `pull_request_target` lifecycle run。重新绑定 PR scope 后从本选择步骤开始。不得为了
+   恢复 v1 加入 `workflow_dispatch`、review event、cron 或新的 status writer。
 
    Authorized ordinary、无 marker request 上的 reactions 只表示 liveness；普通 request 上
    的 `+1` 不能独立产生 head-bound clean evidence。若 official Codex `eyes` reaction 或

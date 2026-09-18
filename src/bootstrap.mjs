@@ -1232,6 +1232,7 @@ export function validateCanonicalLegacyBridgeWorkflowContent(value) {
     "workflow_dispatch",
     "repository_dispatch",
     "pull_request_review",
+    "pull_request_review_comment",
   ]) {
     if (new RegExp(`^  ${forbiddenEvent}:`, "m").test(value)) {
       throw new Error(

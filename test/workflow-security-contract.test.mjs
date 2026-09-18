@@ -484,6 +484,22 @@ test("installation bootstrap invocations bind the owner exactly once", () => {
   }
 });
 
+test("cohort guides bind v1 bridge recovery separately from v2 reconcile", () => {
+  for (const [name, guide] of Object.entries(installGuides)) {
+    assert.match(guide, /Dual-protection legacy-status recovery/u, name);
+    assert.match(
+      guide,
+      /actions\/runs\/\$LEGACY_RUN_ID\/rerun/u,
+      `${name}: missing exact legacy bridge rerun endpoint`,
+    );
+    assert.match(guide, /LEGACY_RUN_ATTEMPT \+ 1/u, name);
+    assert.match(guide, /codex\/review-gate/u, name);
+    assert.match(guide, /pull_request_target/u, name);
+    assert.match(guide, /workflow_dispatch/u, name);
+    assert.match(guide, /draft[\s\S]{0,160}ready/iu, name);
+  }
+});
+
 test("all executable install and package gh commands pin github.com", () => {
   const guides = {
     ...Object.fromEntries(

@@ -3036,6 +3036,14 @@ test("validates the exact closed temporary legacy bridge envelope", () => {
       /must not expose pull_request_review/u,
     ],
     [
+      "forbidden pull request review comment lifecycle",
+      bridge.replace(
+        "  issue_comment:\n",
+        "  pull_request_review_comment:\n    types: [created]\n  issue_comment:\n",
+      ),
+      /must not expose pull_request_review_comment/u,
+    ],
+    [
       "extra read permission",
       bridge.replace("  contents: read\n", "  actions: read\n  contents: read\n"),
       /exactly match the closed temporary/u,

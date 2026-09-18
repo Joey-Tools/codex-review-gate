@@ -150,8 +150,9 @@ Execute the following state machine in order.
    `pull_request_review`: GitHub binds that workflow to the PR merge ref, where
    the compatibility publisher's `issues: write` authority is not a safe write
    surface. Do not add a local review trigger. The temporary bridge remains a
-   compatibility status publisher; v2 review-only evidence uses the separately
-   documented manual-reconcile recovery path.
+   compatibility status publisher; v2 manual reconcile cannot refresh its v1
+   status. Phase 3 documents the separate exact-run recovery required while
+   dual protection remains active.
 2. The reviewed repository ruleset name is exactly
    `Must Pass Codex Review v2`, not the ordinary default
    `Must Pass Codex Review`. For each member, reuse the ordinary runbook only
@@ -876,6 +877,44 @@ legacy before v2 is Active and read back.
    `created` or `edited` event will wake the installed workflow. A review or
    reaction alone does not have an automatic consumer job; use manual
    `reconcile` when a later evaluation is needed.
+
+   ### Dual-protection legacy-status recovery
+
+   A manual v2 `reconcile` updates only `codex/github-review-gate`; it never
+   writes `codex/review-gate`. While both contexts remain required, a review-
+   or reaction-only result can therefore require a separate v1 recovery.
+   Re-read the PR first and bind its number, current `CANARY_HEAD`, base
+   repository, and default branch. Then select exactly one existing run of the current
+   `Codex Review Gate Legacy Bridge` workflow. Its REST object must have all
+   of: `event=pull_request_target`, parsed workflow path
+   `.github/workflows/codex-review-gate-legacy-bridge.yml` (an optional GitHub
+   `@ref` suffix is not part of the path), `head_sha` equal to `CANARY_HEAD`,
+   and exactly one `pull_requests` entry for this PR whose head repository and
+   SHA equal the bound values. Record its `id` and positive `run_attempt`;
+   ambiguity is inconclusive.
+
+   Re-run that exact pre-existing bridge run, never a different v1 workflow:
+
+   ```bash
+   gh api --hostname github.com \
+     --method POST \
+     "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun"
+   ```
+
+   GitHub re-runs preserve the triggering run's `GITHUB_SHA` and `GITHUB_REF`;
+   that preservation is why the source run must already bind this exact PR
+   head. After the POST, re-read the PR and run. Require the same immutable
+   run identity/scope, exactly `LEGACY_RUN_ATTEMPT + 1`, terminal `success`,
+   and a complete status inventory whose latest eligible
+   `codex/review-gate` status is `success` on the still-current `CANARY_HEAD`.
+   A timeout, unchanged attempt, attempt jump, changed PR/head, or a nonunique
+   candidate is inconclusive: do not submit the POST again.
+
+   If no eligible bridge run exists (including a run past GitHub's re-run
+   window), convert the PR to draft and mark it ready again to create a fresh
+   `pull_request_target` lifecycle run. Rebind the PR scope and restart this
+   selection procedure. Do not add `workflow_dispatch`, a review event, cron,
+   or a new status writer to recover v1.
 
    Reactions on an authorized ordinary, unmarked request are liveness-only.
    An ordinary `+1` cannot independently create head-bound clean evidence. An
