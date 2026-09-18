@@ -4,12 +4,15 @@
 确定性的执行清单，并不是另一种安装模式。两份指南都使用
 `templates/codex-gated-repo/` 下的 canonical assets。
 
-安全 rollout 使用两个 PR：
+普通单仓 rollout 使用两个 PR：
 
 1. 一个 migration PR 同时移除 v1 caller、安装两份 canonical v2 workflows；
 2. migration 合并后，另开一个无害 canary PR 验证默认分支 workflow 与 ruleset。
 
 Canary 验证完成后关闭、不合并。
+
+固定 11 仓组织级 handoff 是唯一允许 migration PR 暂不移除 v1 的受控例外。修改该
+cohort 的任何成员前，必须先阅读下方 advanced section。
 
 ## 安装内容
 
@@ -108,6 +111,189 @@ adopted compound boundary。
 variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派生 `limits_profile`；公开 outputs 只有
 `execution_health`、`gate_outcome`、`recovery_code` 与 `retry_safe`。Finding counts
 只出现在 summary 与 sticky diagnostic，不是 outputs。
+
+## Advanced：固定 11 仓组织 cohort 的受控 handoff
+
+只有在一个已明确批准的 organization cohort 的 default branches 全部受同一条共享 v1
+organization ruleset 保护时，才使用这个流程。它不是通用的 `allow-v1` 安装模式。下方
+编号章节中的普通单仓流程，以及每个 cohort member 的最终状态，仍然拒绝所有 v1 caller。
+
+Handoff 刻意把不同保护职责分开：
+
+- 每个仓库都安装完整的 v2 repository ruleset，继续承担本文定义的 strict up-to-date、
+  Code Owner、stale-review、resolved-conversation 与 non-fast-forward 要求；
+- 新建名为 `Must Pass Codex Review v2` 的 organization ruleset，只对精确 11 个成员要求
+  source-bound strict `codex/github-review-gate`；
+- 旧 organization ruleset 在 installation、canary proof、v2 activation 与 repository-level
+  v1 cleanup 全程保持 Active，同时保留 `deletion`、`non_fast_forward` 与唯一的
+  `codex/review-gate` status rule；
+- 旧 organization ruleset 永不删除。最终 cutover 只移除其中完整的 legacy-only
+  required-status rule；其 identity、targets、enforcement、bypass actors、`deletion`、
+  `non_fast_forward` 与其他所有绑定字段必须不变。
+
+这笔 transaction 的 source of truth 是一份经过审阅、schema 为
+`organization-review-gate-handoff-manifest/v1` 的 JSON manifest。它绑定 organization
+identity、旧 organization ruleset 的 exact snapshot、新 ruleset 的 name 与 ID、精确且有序
+的 11 个 repository identities、三份 workflow 的 blob/content hashes、effective
+CODEOWNERS identity、每个完整 Active repository v2 ruleset，以及每个 repository-level
+legacy cleanup 的 before/after snapshots。每个 canary entry 把 open、non-draft、
+same-repository PR 绑定到 exact current head/base/test-merge SHAs、v2 CheckRun 及其 workflow
+run/attempt/job identities，以及最新 successful legacy commit-status ID。成员缺失、额外或
+顺序变化都会 hard fail。
+
+从
+`templates/organization-review-gate-handoff/joey-tools-11-member-manifest.template.json`
+开始，并遵循同目录 README。每一个显式 placeholder 都必须替换为 live、reviewed
+evidence；不得推测缺失 identity。`stage` 之前唯一允许的不完整值，是
+`v2_ruleset.id` 的 JSON literal `null`，因为该 organization ruleset 此时尚不存在。其他
+placeholder 或不完整值都会被拒绝。`stage` readback 成功后，只能用返回的 organization
+ruleset ID 替换这个 `null`，并重新 review 完整 manifest。
+
+每个成员的 migration PR 安装 canonical v2 verifier/controller，以及固定路径
+`.github/workflows/codex-review-gate-legacy-bridge.yml` 下唯一允许的 temporary bridge：
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$TARGET_ROOT" \
+  --legacy-bridge \
+  --control-plane-owner "$CONTROL_PLANE_OWNER"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$TARGET_ROOT" \
+  --legacy-bridge \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --apply
+```
+
+`--legacy-bridge` 只接受这个固定路径和 canonical exact bytes，不允许任意 v1 workflow。
+Bridge 存在期间，每条 repository bootstrap staging 与 activation command 都必须保留该
+flag。Cohort 的 repository ruleset name 精确为
+`Must Pass Codex Review v2`，不是普通 installer 默认的 `Must Pass Codex Review`；每个
+repository bootstrap call 都必须用 `--ruleset-name` 传入这个 distinct name。
+
+普通指南只能沿用于 canonical files preparation、control-plane review，以及把完整
+repository v2 policy 暂存为 **Disabled**；不得沿用其中的 legacy cleanup 或 canary-close
+步骤。Migration 合并后，用 `--legacy-bridge` 暂存 distinct Disabled repository rule；再
+创建无害 open、non-draft canary，证明 exact-head/test-merge v2 CheckRun 与最新 successful
+`codex/review-gate` bridge commit status，并用同一 distinct name/bridge profile activate
+repository rule。Shared organization rule 完成 activation 且 dual-enforcement readback 成功
+之前，canary 必须保持 open。把 current bound evidence 写入 manifest；11 个 entries 全部
+满足条件前不得开始 organization activation。
+
+Organization helper 总是 preview-first；每个有写入的 apply 都必须使用对应 live preview
+输出的 exact `plan_sha256`：
+
+```bash
+HANDOFF_MANIFEST=/absolute/path/to/reviewed-handoff-manifest.json
+
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode plan
+
+HANDOFF_STAGE_PREVIEW="$(mktemp)"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode stage > "$HANDOFF_STAGE_PREVIEW"
+HANDOFF_STAGE_PLAN_SHA256="$(jq -er \
+  '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+  "$HANDOFF_STAGE_PREVIEW")"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode stage \
+  --apply \
+  --expected-plan-sha256 "$HANDOFF_STAGE_PLAN_SHA256"
+```
+
+`stage` 只创建 exact Disabled、v2-only organization ruleset。把返回的
+`next_manifest_update.v2_ruleset.id` 绑定进经审阅的 manifest，然后重新运行 `plan`。当
+11 个 open、non-draft、current-base canaries、canonical workflows、temporary bridges、
+Active repository v2 rulesets 与仍未 cleanup 的 legacy surfaces 都精确匹配 manifest
+后，再 preview 并启用共享 ruleset：
+
+```bash
+HANDOFF_ACTIVATE_PREVIEW="$(mktemp)"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode activate > "$HANDOFF_ACTIVATE_PREVIEW"
+HANDOFF_ACTIVATE_PLAN_SHA256="$(jq -er \
+  '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+  "$HANDOFF_ACTIVATE_PREVIEW")"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode activate \
+  --apply \
+  --expected-plan-sha256 "$HANDOFF_ACTIVATE_PLAN_SHA256"
+```
+
+Activation readback 成功时才到达双重保护 handoff point：11 个成员都具备完整 repository
+v2 policy，共享 v2-only organization rule 已 Active，而旧 organization v1 rule 仍 Active。
+只有 helper 完成该 post-write dual-enforcement proof 后，才可关闭且不合并每个 canary；
+`activate` 完成前绝不可关闭。之后的 `derive-cutover` 与 `verify` 使用 post-activation
+cohort snapshots，不要求重新打开已关闭的 canary。
+
+接着推导 repository-level cleanup，但 helper 不替你执行：
+
+```bash
+HANDOFF_CUTOVER_PLAN="$(mktemp)"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode derive-cutover > "$HANDOFF_CUTOVER_PLAN"
+jq . "$HANDOFF_CUTOVER_PLAN"
+```
+
+该 helper 有意不写 repository rulesets 或 classic branch protection。只能在审阅后执行输出
+中的 `external_repository_actions`，并逐个读回 target。这些 actions 只能移除
+`codex/review-gate`；manifest 绑定的 non-legacy checks、strictness、repository ruleset
+identity、conditions、bypass actors、`deletion`、`non_fast_forward` 与 unrelated rules
+必须全部保留。
+
+只有全部 repository cleanup surfaces 都匹配各自 exact `expected_after` snapshots，才可
+移除旧 organization status rule：
+
+```bash
+HANDOFF_VERIFY_PREVIEW="$(mktemp)"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode verify > "$HANDOFF_VERIFY_PREVIEW"
+HANDOFF_VERIFY_PLAN_SHA256="$(jq -er \
+  '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+  "$HANDOFF_VERIFY_PREVIEW")"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode verify \
+  --apply \
+  --expected-plan-sha256 "$HANDOFF_VERIFY_PLAN_SHA256"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode verify
+```
+
+`verify --apply` 是唯一会修改旧 organization ruleset 的 helper mode。它移除完整的
+legacy-only required-status rule，而不是删除旧 ruleset。最后一次只读 `verify` 再次证明
+完成状态。每个 authoritative success boundary 先读取一份完整 snapshot，等待 5 秒后再读
+一份。若 selected evidence 或 policy 不一致，就重新开始这一对读取；60 秒内始终得不到
+相同的一对时结论为 inconclusive，不允许下一次 write。
+
+Closure 完成后，每个成员另开一个 PR，移除 canonical bridge：
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$TARGET_ROOT" \
+  --remove-legacy-bridge \
+  --control-plane-owner "$CONTROL_PLANE_OWNER"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$TARGET_ROOT" \
+  --remove-legacy-bridge \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --apply
+```
+
+Bridge 已经 absent 时，bridge-removal component 是 idempotent no-op；已有但
+non-canonical 的 bridge 则会被拒绝，不会删除未知文件。整个 command 同时也是 canonical
+local installer：即使没有 bridge 可移除，使用 `--apply` 时仍会修复 drifted verifier/
+controller bytes 或 managed CODEOWNERS block。执行前必须从 clean worktree 开始，并先验证
+这三个 surfaces；若 dry run 提出 bridge removal 之外的变更，必须停止并单独处理或 review
+drift，不能把该 PR 描述为 bridge-only。这些 PR 合并后，重新运行不带
+`--legacy-bridge` 的普通 validation；每个仓库都必须满足最终 no-v1 contract。
 
 ## 1. 创建并合并 migration PR
 

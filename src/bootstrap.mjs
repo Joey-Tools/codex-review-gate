@@ -10,6 +10,8 @@ export const DEFAULT_VERIFIER_RUN_NAME =
   `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/\${{ github.event.pull_request.number }}/\${{ github.sha }}`;
 export const DEFAULT_CONTROLLER_WORKFLOW_PATH =
   ".github/workflows/codex-review-gate-controller.yml";
+export const DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH =
+  ".github/workflows/codex-review-gate-legacy-bridge.yml";
 export const DEFAULT_RULESET_ENFORCEMENT = "disabled";
 export const DEFAULT_CONTROL_PLANE_OWNER = "@JoeyTeng";
 export const DEFAULT_CODEOWNERS_PATH = ".github/CODEOWNERS";
@@ -18,6 +20,33 @@ export const CANONICAL_V2_WORKFLOW_USES =
 export const LEGACY_V1_WORKFLOW_USES =
   "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1";
 const LEGACY_V1_DIRECT_ACTION_USES = "JoeyTeng/codex-review-gate-action@v1";
+const CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT = [
+  "name: Codex Review Gate Legacy Bridge",
+  "",
+  "on:",
+  "  pull_request_target:",
+  "    types: [opened, reopened, synchronize, ready_for_review]",
+  "  issue_comment:",
+  "    types: [created]",
+  "  pull_request_review:",
+  "    types: [submitted]",
+  "",
+  "permissions:",
+  "  contents: read",
+  "  issues: write",
+  "  pull-requests: read",
+  "  statuses: write",
+  "",
+  "concurrency:",
+  "  group: codex-review-gate-legacy-bridge-${{ github.repository }}",
+  "  cancel-in-progress: false",
+  "",
+  "jobs:",
+  "  codex-review-gate-legacy-bridge:",
+  "    name: codex/review-gate legacy bridge",
+  `    uses: ${LEGACY_V1_WORKFLOW_USES}`,
+  "",
+].join("\n");
 const SINGLE_PRODUCER_WRITE_PERMISSIONS = new Set([
   "actions",
   "checks",
@@ -858,6 +887,61 @@ export function rulesetWritableFingerprint(ruleset) {
 
 export function validateCanonicalV2WorkflowContent(value) {
   return validateCanonicalV2VerifierWorkflowContent(value);
+}
+
+export function validateCanonicalLegacyBridgeWorkflowContent(value) {
+  if (typeof value !== "string" || value === "") {
+    throw new Error(
+      "Canonical legacy bridge workflow must be non-empty UTF-8 text.",
+    );
+  }
+  if (value.startsWith("\uFEFF") || /\uFEFF|[\u0085\u2028\u2029\t]/u.test(value)) {
+    throw new Error(
+      "Canonical legacy bridge workflow must use plain LF YAML without BOM, tabs, or non-ASCII line separators.",
+    );
+  }
+  assertCanonicalWorkflowLineEndings(value);
+  if (/^\s*schedule:\s*$/m.test(value) || /^\s*-?\s*cron:\s*/m.test(value)) {
+    throw new Error("Canonical legacy bridge workflow must not allocate cron runners.");
+  }
+  for (const forbiddenEvent of ["workflow_dispatch", "repository_dispatch"]) {
+    if (new RegExp(`^  ${forbiddenEvent}:`, "m").test(value)) {
+      throw new Error(
+        `Canonical legacy bridge workflow must not expose ${forbiddenEvent}.`,
+      );
+    }
+  }
+  if (
+    value.includes(CANONICAL_V2_WORKFLOW_USES) ||
+    value.includes(DEFAULT_STATUS_CONTEXT)
+  ) {
+    throw new Error(
+      "Canonical legacy bridge workflow must not produce or call the v2 gate.",
+    );
+  }
+  const usesMatches = value.match(/^\s*uses:\s*([^\s#]+)\s*$/gm) ?? [];
+  const expectedUses = `uses: ${LEGACY_V1_WORKFLOW_USES}`;
+  if (usesMatches.length !== 1 || usesMatches[0].trim() !== expectedUses) {
+    throw new Error(
+      `Canonical legacy bridge workflow must contain exactly one literal "${expectedUses}" caller.`,
+    );
+  }
+  const producerViolations = workflowSingleProducerPolicyViolations(value);
+  if (
+    producerViolations.length !== 2 ||
+    producerViolations[0] !== "issues: write" ||
+    producerViolations[1] !== "statuses: write"
+  ) {
+    throw new Error(
+      "Canonical legacy bridge workflow may write only issues and legacy commit statuses.",
+    );
+  }
+  if (value !== CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT) {
+    throw new Error(
+      "Canonical legacy bridge workflow must exactly match the closed temporary event, permission, concurrency, and single-caller envelope.",
+    );
+  }
+  return value;
 }
 
 export function validateCanonicalV2VerifierWorkflowContent(value) {
@@ -1768,11 +1852,18 @@ export function decodeGitHubBlobContent(value) {
 export function validateCanonicalV2WorkflowInventory(
   workflowFiles,
   canonicalWorkflows,
+  { legacyBridge = false } = {},
 ) {
   if (!Array.isArray(workflowFiles)) {
     throw new Error("Default-branch workflow inventory must be an array.");
   }
-  const canonicalEntries = normalizeCanonicalWorkflowEntries(canonicalWorkflows);
+  if (typeof legacyBridge !== "boolean") {
+    throw new Error("Legacy bridge inventory admission must be an explicit boolean.");
+  }
+  const canonicalEntries = normalizeCanonicalWorkflowEntries(
+    canonicalWorkflows,
+    { legacyBridge },
+  );
   for (const { path, content, role } of canonicalEntries) {
     const matches = workflowFiles.filter((file) => file?.path === path);
     if (matches.length !== 1) {
@@ -1782,11 +1873,17 @@ export function validateCanonicalV2WorkflowInventory(
     }
     if (role === "verifier") {
       validateCanonicalV2VerifierWorkflowContent(matches[0].content);
-    } else {
+    } else if (role === "controller") {
       validateCanonicalV2ControllerWorkflowContent(matches[0].content);
+    } else {
+      validateCanonicalLegacyBridgeWorkflowContent(matches[0].content);
     }
     if (!installedWorkflowMatchesCanonical(matches[0].content, content)) {
-      throw new Error(`${path} differs from the canonical v2 ${role} workflow bytes.`);
+      throw new Error(
+        role === "legacy bridge"
+          ? `${path} differs from the canonical temporary legacy bridge workflow bytes.`
+          : `${path} differs from the canonical v2 ${role} workflow bytes.`,
+      );
     }
   }
 
@@ -1824,7 +1921,10 @@ export function validateCanonicalV2WorkflowInventory(
   return canonicalWorkflows;
 }
 
-function normalizeCanonicalWorkflowEntries(canonicalWorkflows) {
+function normalizeCanonicalWorkflowEntries(
+  canonicalWorkflows,
+  { legacyBridge = false } = {},
+) {
   if (
     canonicalWorkflows === null ||
     typeof canonicalWorkflows !== "object" ||
@@ -1838,7 +1938,7 @@ function normalizeCanonicalWorkflowEntries(canonicalWorkflows) {
   const controller = canonicalWorkflows.controller;
   validateCanonicalV2VerifierWorkflowContent(verifier);
   validateCanonicalV2ControllerWorkflowContent(controller);
-  return [
+  const entries = [
     {
       role: "verifier",
       path: DEFAULT_WORKFLOW_PATH,
@@ -1850,6 +1950,16 @@ function normalizeCanonicalWorkflowEntries(canonicalWorkflows) {
       content: controller,
     },
   ];
+  if (legacyBridge) {
+    const bridge = canonicalWorkflows.legacyBridge;
+    validateCanonicalLegacyBridgeWorkflowContent(bridge);
+    entries.push({
+      role: "legacy bridge",
+      path: DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+      content: bridge,
+    });
+  }
+  return entries;
 }
 
 function extractCanonicalJobIfExpression(value) {

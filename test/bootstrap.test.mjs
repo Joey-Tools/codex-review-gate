@@ -7,6 +7,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -22,6 +23,7 @@ import {
   CANONICAL_V2_WORKFLOW_USES,
   DEFAULT_CONTROLLER_WORKFLOW_PATH,
   DEFAULT_CONTROL_PLANE_OWNER,
+  DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
   DEFAULT_STATUS_CONTEXT,
   DEFAULT_STATUS_INTEGRATION_ID,
   DEFAULT_VERIFIER_RUN_NAME,
@@ -58,6 +60,7 @@ import {
   validateCanonicalV2WorkflowContent,
   validateCanonicalV2ControllerWorkflowContent,
   validateCanonicalV2WorkflowInventory,
+  validateCanonicalLegacyBridgeWorkflowContent,
   validateControlPlaneCodeownersContent,
   workflowCanWriteStatuses,
   workflowContainsCodexReviewGateCaller,
@@ -83,9 +86,20 @@ const CANONICAL_CONTROLLER_WORKFLOW = readFileSync(
   ),
   "utf8",
 );
+const CANONICAL_LEGACY_BRIDGE_WORKFLOW = readFileSync(
+  new URL(
+    "../templates/codex-gated-repo/.github/workflows/codex-review-gate-legacy-bridge.yml",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const CANONICAL_WORKFLOWS = {
   verifier: CANONICAL_WORKFLOW,
   controller: CANONICAL_CONTROLLER_WORKFLOW,
+};
+const CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE = {
+  ...CANONICAL_WORKFLOWS,
+  legacyBridge: CANONICAL_LEGACY_BRIDGE_WORKFLOW,
 };
 const DEFAULT_BRANCH_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CANARY_HEAD_SHA = "0123456789abcdef0123456789abcdef01234567";
@@ -1384,6 +1398,318 @@ test("prepare-worktree dry-runs and then replaces a canonical-path v1 caller", (
   }
 });
 
+test("prepare-worktree explicitly installs, retains, and removes the exact legacy bridge", () => {
+  const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bridge-"));
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const verifierPath = join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/"));
+  const controllerPath = join(
+    targetRoot,
+    ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  const codeownersPath = join(targetRoot, ".github", "CODEOWNERS");
+  const legacyVerifier =
+    "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n";
+  try {
+    initializeGitRepository(targetRoot);
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(verifierPath, legacyVerifier, "utf8");
+
+    const dryRun = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--legacy-bridge",
+    ]);
+    assert.equal(dryRun.status, 0, dryRun.stderr);
+    assert.match(dryRun.stdout, /install the exact temporary legacy bridge workflow/u);
+    assert.match(dryRun.stdout, /replace the canonical-path v1 caller/u);
+    assert.equal(existsSync(bridgePath), false);
+    assert.equal(existsSync(controllerPath), false);
+    assert.equal(existsSync(codeownersPath), false);
+    assert.equal(readFileSync(verifierPath, "utf8"), legacyVerifier);
+
+    const apply = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--legacy-bridge",
+      "--apply",
+    ]);
+    assert.equal(apply.status, 0, apply.stderr);
+    assert.equal(readFileSync(verifierPath, "utf8"), CANONICAL_WORKFLOW);
+    assert.equal(readFileSync(controllerPath, "utf8"), CANONICAL_CONTROLLER_WORKFLOW);
+    assert.equal(
+      readFileSync(bridgePath, "utf8"),
+      CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+    );
+    validateControlPlaneCodeownersContent(
+      readFileSync(codeownersPath, "utf8"),
+      DEFAULT_CONTROL_PLANE_OWNER,
+    );
+
+    const repeat = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--legacy-bridge",
+      "--apply",
+    ]);
+    assert.equal(repeat.status, 0, repeat.stderr);
+    assert.match(repeat.stdout, /legacy bridge already matches the canonical bytes/u);
+
+    const strict = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
+    assert.equal(strict.status, 1);
+    assert.match(strict.stderr, /Additional workflows have a v1\/v2 gate caller/u);
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+
+    const removalDryRun = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+    ]);
+    assert.equal(removalDryRun.status, 0, removalDryRun.stderr);
+    assert.match(removalDryRun.stdout, /remove the exact temporary legacy bridge/u);
+    assert.equal(existsSync(bridgePath), true);
+
+    const removal = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      "--apply",
+    ]);
+    assert.equal(removal.status, 0, removal.stderr);
+    assert.match(removal.stdout, /Applied: remove the exact temporary legacy bridge/u);
+    assert.equal(existsSync(bridgePath), false);
+
+    const removalRepeat = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      "--apply",
+    ]);
+    assert.equal(removalRepeat.status, 0, removalRepeat.stderr);
+    assert.match(removalRepeat.stdout, /legacy bridge is already absent/u);
+    const strictAfterRemoval = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--apply",
+    ]);
+    assert.equal(strictAfterRemoval.status, 0, strictAfterRemoval.stderr);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("prepare-worktree installs the bridge before replacing a canonical-path v1 producer", () => {
+  const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bridge-order-"));
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const verifierPath = join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/"));
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  const legacyVerifier =
+    "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n";
+  try {
+    initializeGitRepository(targetRoot);
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(verifierPath, legacyVerifier, "utf8");
+    const preloadPath = join(targetRoot, "bridge-order.cjs");
+    writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--legacy-bridge",
+      "--apply",
+    ], {
+      env: {
+        ...process.env,
+        NODE_OPTIONS: `--require=${preloadPath}`,
+        CODEX_BOOTSTRAP_TEST_RACE_MODE: "bridge-verifier-fails",
+        CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+      },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /synthetic verifier replacement failure/u);
+    assert.match(result.stderr, /installed CODEOWNERS, legacy-bridge-workflow/u);
+    assert.equal(readFileSync(verifierPath, "utf8"), legacyVerifier);
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("prepare-worktree refuses removal of a drifted or displaced bridge", () => {
+  for (const mode of ["drifted", "displaced"]) {
+    const targetRoot = mkdtempSync(join(tmpdir(), `codex-review-gate-remove-${mode}-`));
+    const workflowsDirectory = join(targetRoot, ".github", "workflows");
+    const bridgePath = join(
+      targetRoot,
+      ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+    );
+    try {
+      initializeGitRepository(targetRoot);
+      mkdirSync(workflowsDirectory, { recursive: true });
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+        CANONICAL_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+        CANONICAL_CONTROLLER_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(
+        join(targetRoot, ".github", "CODEOWNERS"),
+        ensureControlPlaneCodeownersContent(null).content,
+        "utf8",
+      );
+      if (mode === "drifted") {
+        writeFileSync(
+          bridgePath,
+          CANONICAL_LEGACY_BRIDGE_WORKFLOW.replace(
+            "  pull-requests: read",
+            "  pull-requests: write",
+          ),
+          "utf8",
+        );
+      } else {
+        writeFileSync(
+          join(workflowsDirectory, "moved-legacy-bridge.yml"),
+          CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+          "utf8",
+        );
+      }
+      const removal = runBootstrap([
+        "--prepare-worktree",
+        targetRoot,
+        "--remove-legacy-bridge",
+        "--apply",
+      ]);
+      assert.equal(removal.status, 1, `${mode}: ${removal.stderr}`);
+      assert.match(
+        removal.stderr,
+        mode === "drifted"
+          ? /may write only issues and legacy commit statuses|differs from the exact canonical bridge/u
+          : /Additional workflows have a v1\/v2 gate caller/u,
+      );
+      if (mode === "drifted") {
+        assert.equal(existsSync(bridgePath), true);
+      }
+    } finally {
+      rmSync(targetRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("legacy bridge removal fails closed across replacement, deletion, unlink, and post-unlink races", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-remove-race-"));
+  try {
+    for (const [mode, expected, verify] of [
+      [
+        "removal-check-replacement",
+        /object identity changed.*unverified replacement remains quarantined/su,
+        ({ bridgePath, quarantinePath }) => {
+          assert.equal(
+            readFileSync(`${bridgePath}.admitted`, "utf8"),
+            CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+          );
+          assert.equal(
+            readFileSync(quarantinePath, "utf8"),
+            "attacker replacement\n",
+          );
+        },
+      ],
+      [
+        "removal-check-delete",
+        /ENOENT.*No workflow object was unlinked/su,
+        ({ quarantinePath }) => {
+          assert.equal(existsSync(quarantinePath), false);
+        },
+      ],
+      [
+        "removal-unlink-fails",
+        /synthetic quarantine unlink failure.*admitted exact bridge remains quarantined/su,
+        ({ quarantinePath }) => {
+          assert.equal(
+            readFileSync(quarantinePath, "utf8"),
+            CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+          );
+        },
+      ],
+      [
+        "removal-post-unlink-checkpoint-fails",
+        /access policy changed.*admitted exact bridge unlink completed.*no success was reported/su,
+        ({ quarantinePath }) => {
+          assert.equal(existsSync(quarantinePath), false);
+        },
+      ],
+    ]) {
+      const targetRoot = join(fixtureRoot, mode);
+      const workflowsDirectory = join(targetRoot, ".github", "workflows");
+      const bridgePath = join(
+        targetRoot,
+        ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+      );
+      mkdirSync(targetRoot);
+      initializeGitRepository(targetRoot);
+      mkdirSync(workflowsDirectory, { recursive: true });
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+        CANONICAL_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+        CANONICAL_CONTROLLER_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+      writeFileSync(
+        join(targetRoot, ".github", "CODEOWNERS"),
+        ensureControlPlaneCodeownersContent(null).content,
+        "utf8",
+      );
+      const preloadPath = join(targetRoot, "removal-race.cjs");
+      writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+      const result = runBootstrap([
+        "--prepare-worktree",
+        targetRoot,
+        "--remove-legacy-bridge",
+        "--apply",
+      ], {
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `--require=${preloadPath}`,
+          CODEX_BOOTSTRAP_TEST_RACE_MODE: mode,
+          CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+        },
+      });
+      assert.equal(result.status, 1, `${mode}: ${result.stderr}`);
+      assert.match(result.stderr, expected, mode);
+      assert.doesNotMatch(result.stdout, /Applied:|Next:/u, mode);
+      const quarantineDirectories = readdirSync(workflowsDirectory, {
+        withFileTypes: true,
+      }).filter(
+        (entry) =>
+          entry.isDirectory() &&
+          entry.name.startsWith(".codex-review-gate-removal-"),
+      );
+      assert.equal(quarantineDirectories.length, 1, mode);
+      const quarantinePath = join(
+        workflowsDirectory,
+        quarantineDirectories[0].name,
+        "canonical-legacy-bridge.yml",
+      );
+      verify({ bridgePath, quarantinePath });
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("prepare-worktree preserves unrelated CODEOWNERS entries and is byte-idempotent", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bootstrap-"));
   const githubDirectory = join(targetRoot, ".github");
@@ -2214,6 +2540,133 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
   );
 });
 
+test("validates the exact closed temporary legacy bridge envelope", () => {
+  const bridge = CANONICAL_LEGACY_BRIDGE_WORKFLOW;
+  assert.equal(validateCanonicalLegacyBridgeWorkflowContent(bridge), bridge);
+  assert.equal(
+    workflowSingleProducerPolicyViolations(bridge).join(","),
+    "issues: write,statuses: write",
+  );
+  assert.doesNotMatch(bridge, /workflow_dispatch|repository_dispatch|schedule|cron:/u);
+  assert.doesNotMatch(bridge, /checks:\s*write|actions:\s*write/u);
+  assert.doesNotMatch(bridge, /codex\/github-review-gate|@v2/u);
+
+  for (const [name, invalid, expected] of [
+    [
+      "cron",
+      bridge.replace(
+        "  pull_request_target:\n",
+        "  schedule:\n    - cron: '0 * * * *'\n  pull_request_target:\n",
+      ),
+      /cron runners/u,
+    ],
+    [
+      "manual dispatch",
+      bridge.replace("  pull_request_target:\n", "  workflow_dispatch:\n  pull_request_target:\n"),
+      /must not expose workflow_dispatch/u,
+    ],
+    [
+      "repository dispatch",
+      bridge.replace("  pull_request_target:\n", "  repository_dispatch:\n  pull_request_target:\n"),
+      /must not expose repository_dispatch/u,
+    ],
+    [
+      "checks writer",
+      bridge.replace("  contents: read\n", "  checks: write\n  contents: read\n"),
+      /may write only issues and legacy commit statuses/u,
+    ],
+    [
+      "wide writer",
+      bridge.replace(
+        "permissions:\n  contents: read\n  issues: write\n  pull-requests: read\n  statuses: write",
+        "permissions: write-all",
+      ),
+      /may write only issues and legacy commit statuses/u,
+    ],
+    [
+      "v2 caller",
+      bridge.replace(
+        "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+        CANONICAL_V2_WORKFLOW_USES,
+      ),
+      /must not produce or call the v2 gate/u,
+    ],
+    [
+      "v2 job producer",
+      bridge.replace("codex/review-gate legacy bridge", DEFAULT_STATUS_CONTEXT),
+      /must not produce or call the v2 gate/u,
+    ],
+    [
+      "direct v1 caller",
+      bridge.replace(
+        "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+        "JoeyTeng/codex-review-gate-action@v1",
+      ),
+      /exactly one literal/u,
+    ],
+    [
+      "second caller",
+      bridge.replace(
+        "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
+        "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n  second:\n    uses: JoeyTeng/codex-review-gate-action@v1\n",
+      ),
+      /exactly one literal/u,
+    ],
+    [
+      "opaque caller",
+      bridge.replace(
+        "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+        "    uses: >-\n      JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+      ),
+      /exactly one literal/u,
+    ],
+    [
+      "quoted caller",
+      bridge.replace(
+        "uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+        'uses: "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1"',
+      ),
+      /exactly one literal/u,
+    ],
+    [
+      "extra lifecycle",
+      bridge.replace(
+        "  pull_request_review:\n",
+        "  pull_request_review_comment:\n    types: [created]\n  pull_request_review:\n",
+      ),
+      /exactly match the closed temporary/u,
+    ],
+    [
+      "extra read permission",
+      bridge.replace("  contents: read\n", "  actions: read\n  contents: read\n"),
+      /exactly match the closed temporary/u,
+    ],
+    [
+      "commented extra caller",
+      bridge.replace(
+        "jobs:\n",
+        "# uses: JoeyTeng/codex-review-gate-action@v1\njobs:\n",
+      ),
+      /exactly match the closed temporary/u,
+    ],
+    ["byte drift", `${bridge}\n`, /exactly match the closed temporary/u],
+  ]) {
+    assert.throws(
+      () => validateCanonicalLegacyBridgeWorkflowContent(invalid),
+      expected,
+      name,
+    );
+  }
+  assert.throws(
+    () => validateCanonicalLegacyBridgeWorkflowContent(`\uFEFF${bridge}`),
+    /BOM/u,
+  );
+  assert.throws(
+    () => validateCanonicalLegacyBridgeWorkflowContent(bridge.replaceAll("\n", "\r")),
+    /bare CR/u,
+  );
+});
+
 test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   const canonicalPath = ".github/workflows/codex-review-gate.yml";
   const cleanInventory = [
@@ -2369,6 +2822,139 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       name,
     );
   }
+});
+
+test("legacy bridge inventory requires explicit profile, fixed path, and exact bytes", () => {
+  const v2Inventory = [
+    { path: DEFAULT_WORKFLOW_PATH, content: CANONICAL_WORKFLOW },
+    {
+      path: DEFAULT_CONTROLLER_WORKFLOW_PATH,
+      content: CANONICAL_CONTROLLER_WORKFLOW,
+    },
+  ];
+  const exactBridge = {
+    path: DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+    content: CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+  };
+  const bridgeInventory = [...v2Inventory, exactBridge];
+
+  assert.throws(
+    () =>
+      validateCanonicalV2WorkflowInventory(
+        bridgeInventory,
+        CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+      ),
+    /Additional v1\/v2 gate callers.*codex-review-gate-legacy-bridge\.yml/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2WorkflowInventory(
+        v2Inventory,
+        CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+        { legacyBridge: true },
+      ),
+    /codex-review-gate-legacy-bridge\.yml must occur exactly once/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2WorkflowInventory(
+        [
+          ...v2Inventory,
+          {
+            ...exactBridge,
+            path: ".github/workflows/renamed-legacy-bridge.yml",
+          },
+        ],
+        CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+        { legacyBridge: true },
+      ),
+    /codex-review-gate-legacy-bridge\.yml must occur exactly once/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2WorkflowInventory(
+        [
+          ...v2Inventory,
+          {
+            ...exactBridge,
+            content: CANONICAL_LEGACY_BRIDGE_WORKFLOW.replace(
+              "  pull-requests: read",
+              "  pull-requests: write",
+            ),
+          },
+        ],
+        CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+        { legacyBridge: true },
+      ),
+    /may write only issues and legacy commit statuses/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2WorkflowInventory(
+        [...bridgeInventory, exactBridge],
+        CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+        { legacyBridge: true },
+      ),
+    /codex-review-gate-legacy-bridge\.yml must occur exactly once/u,
+  );
+  for (const [name, content] of [
+    [
+      "reusable-v1",
+      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
+    ],
+    [
+      "reusable-yaml-v1",
+      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yaml@v1\n",
+    ],
+    [
+      "direct-v1",
+      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v1\n",
+    ],
+    [
+      "direct-v2",
+      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+    ],
+    [
+      "future-ref",
+      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v10\n",
+    ],
+    [
+      "malicious-ref",
+      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v1-malicious\n",
+    ],
+    ["writer", "permissions:\n  checks: write\njobs: {}\n"],
+  ]) {
+    assert.throws(
+      () =>
+        validateCanonicalV2WorkflowInventory(
+          [
+            ...bridgeInventory,
+            { path: `.github/workflows/${name}.yml`, content },
+          ],
+          CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+          { legacyBridge: true },
+        ),
+      /Additional v1\/v2 gate callers|single-producer policy/u,
+      name,
+    );
+  }
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      bridgeInventory,
+      CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+      { legacyBridge: true },
+    ),
+    CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2WorkflowInventory(
+        bridgeInventory,
+        CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+        { legacyBridge: "yes" },
+      ),
+    /explicit boolean/u,
+  );
 });
 
 test("remote staging and activation reject a post-merge extra v1 caller", () => {
@@ -4937,6 +5523,175 @@ test("independent staging and activation runs preserve stable legacy and greenfi
   }
 });
 
+test("legacy bridge profile survives every remote staging and activation snapshot", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bridge-remote-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const stageLog = join(fixtureRoot, "stage.log");
+  const activationLog = join(fixtureRoot, "activation.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const migration = stageThenActivationResponseFixtures({
+      repoSlug,
+      legacyRulesets: [activeLegacyRulesetFixture(7)],
+      v2RulesetName,
+      legacyBridge: true,
+    });
+    const stage = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--ruleset-name",
+      v2RulesetName,
+      "--legacy-bridge",
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin,
+        responses: migration.responses,
+        stateDir,
+        callLog: stageLog,
+      }),
+    });
+    assert.equal(stage.status, 0, stage.stderr);
+    assert.match(stage.stdout, /Temporary legacy bridge/u);
+    assert.match(stage.stdout, /Created ruleset/u);
+
+    const activation = runBootstrap([
+      ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+      "--ruleset-name",
+      v2RulesetName,
+      "--legacy-bridge",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin,
+        responses: migration.responses,
+        stateDir,
+        callLog: activationLog,
+      }),
+    });
+    assert.equal(activation.status, 0, activation.stderr);
+    assert.match(activation.stdout, /Temporary legacy bridge/u);
+    assert.match(activation.stdout, /Updated ruleset/u);
+    assert.match(
+      readFileSync(stageLog, "utf8"),
+      new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"),
+    );
+    assert.match(
+      readFileSync(activationLog, "utf8"),
+      new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"),
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("remote bridge admission rejects missing, drifted, displaced, unflagged, or additional callers before writes", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bridge-reject-"));
+  const repoSlug = "Joey-Tools/consumer";
+  try {
+    for (const scenario of [
+      {
+        name: "missing",
+        flag: true,
+        responses: canonicalRemoteWorkflowResponses(repoSlug),
+        expected: /codex-review-gate-legacy-bridge\.yml must occur exactly once/u,
+      },
+      {
+        name: "drifted",
+        flag: true,
+        responses: (() => {
+          const responses = canonicalRemoteWorkflowResponses(repoSlug, {
+            legacyBridge: true,
+          });
+          responses[`repos/${repoSlug}/git/blobs/canonical-legacy-bridge-blob`] = {
+            encoding: "base64",
+            content: Buffer.from(
+              CANONICAL_LEGACY_BRIDGE_WORKFLOW.replace(
+                "  pull-requests: read",
+                "  pull-requests: write",
+              ),
+              "utf8",
+            ).toString("base64"),
+          };
+          return responses;
+        })(),
+        expected: /may write only issues and legacy commit statuses/u,
+      },
+      {
+        name: "displaced",
+        flag: true,
+        responses: (() => {
+          const responses = canonicalRemoteWorkflowResponses(repoSlug, {
+            legacyBridge: true,
+          });
+          const tree = responses[`repos/${repoSlug}/git/trees/workflows-tree`];
+          tree.tree.find(
+            (entry) => entry.sha === "canonical-legacy-bridge-blob",
+          ).path = "renamed-legacy-bridge.yml";
+          return responses;
+        })(),
+        expected: /codex-review-gate-legacy-bridge\.yml must occur exactly once/u,
+      },
+      {
+        name: "unflagged",
+        flag: false,
+        responses: canonicalRemoteWorkflowResponses(repoSlug, {
+          legacyBridge: true,
+        }),
+        expected: /Additional v1\/v2 gate callers/u,
+      },
+      {
+        name: "additional-v2",
+        flag: true,
+        responses: (() => {
+          const responses = canonicalRemoteWorkflowResponses(repoSlug, {
+            legacyBridge: true,
+          });
+          responses[`repos/${repoSlug}/git/trees/workflows-tree`].tree.push({
+            path: "extra-v2.yml",
+            sha: "extra-v2-blob",
+            type: "blob",
+            mode: "100644",
+          });
+          responses[`repos/${repoSlug}/git/blobs/extra-v2-blob`] = {
+            encoding: "base64",
+            content: Buffer.from(
+              "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+              "utf8",
+            ).toString("base64"),
+          };
+          return responses;
+        })(),
+        expected: /Additional v1\/v2 gate callers/u,
+      },
+    ]) {
+      const fakeBin = join(fixtureRoot, scenario.name);
+      const callLog = join(fixtureRoot, `${scenario.name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const args = ["--repo", repoSlug, "--apply"];
+      if (scenario.flag) {
+        args.push("--legacy-bridge");
+      }
+      const result = runBootstrap(args, {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+          FAKE_GH_RESPONSES: JSON.stringify(scenario.responses),
+          FAKE_GH_CALL_LOG: callLog,
+        },
+      });
+      assert.equal(result.status, 1, `${scenario.name}: ${result.stderr}`);
+      assert.match(result.stderr, scenario.expected, scenario.name);
+      const calls = existsSync(callLog) ? readFileSync(callLog, "utf8") : "";
+      assert.doesNotMatch(calls, /^(?:POST|PUT) /mu, scenario.name);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("independent activation rejects approved legacy inventory disappearance, subset, classic drift, and incomplete schema", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
@@ -5120,6 +5875,21 @@ test("post-cleanup verification admission remains read-only and rejects the old 
   const repoSlug = "Joey-Tools/consumer";
   for (const [name, args, expected] of [
     [
+      "mutually-exclusive-bridge-lifecycle",
+      [
+        "--prepare-worktree",
+        "/tmp/consumer",
+        "--legacy-bridge",
+        "--remove-legacy-bridge",
+      ],
+      /mutually exclusive lifecycle phases/u,
+    ],
+    [
+      "remote-bridge-removal",
+      ["--repo", repoSlug, "--remove-legacy-bridge"],
+      /local-only.*--prepare-worktree/u,
+    ],
+    [
       "without-repo",
       ["--verify-post-cleanup"],
       /Choose exactly one mode/u,
@@ -5248,6 +6018,63 @@ test("post-cleanup verification accepts empty legacy surfaces and unrelated clas
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Post-cleanup verified/u);
+    assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy bridge profile remains exact through cleanup derivation and verification", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bridge-cleanup-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const classicRequiredStatusChecks = {
+    strict: false,
+    contexts: ["lint"],
+    checks: [{ context: "build", app_id: 15368 }],
+  };
+  try {
+    createFakeGhExecutable(fakeBin);
+    const activeV2 = completeActiveRulesetFixture(7);
+    const inventory = legacyInventoryResponseFixtures(repoSlug, {
+      classicRequiredStatusChecks,
+    });
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
+      ...inventory.responses,
+      [`repos/${repoSlug}/branches/master/protection`]: {
+        required_status_checks: classicRequiredStatusChecks,
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [activeV2],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: activeV2,
+    };
+    const env = {
+      ...process.env,
+      PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+      FAKE_GH_RESPONSES: JSON.stringify(responses),
+      FAKE_GH_CALL_LOG: callLog,
+    };
+    const derive = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--derive-post-cleanup-plan",
+      "--legacy-bridge",
+    ], { env });
+    assert.equal(derive.status, 0, derive.stderr);
+    const plan = JSON.parse(derive.stdout);
+    const verify = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--verify-post-cleanup",
+      "--expected-post-cleanup-security-sha256",
+      plan.expected_post_cleanup_security_sha256,
+      "--legacy-bridge",
+    ], { env });
+    assert.equal(verify.status, 0, verify.stderr);
+    assert.match(verify.stdout, /Post-cleanup verified/u);
     assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu);
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
@@ -5943,6 +6770,9 @@ test("canonical template and importable ruleset implement the staged v2 contract
   );
 
   validateCanonicalV2WorkflowContent(workflow);
+  validateCanonicalLegacyBridgeWorkflowContent(
+    CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+  );
   validateControlPlaneCodeownersContent(codeowners, DEFAULT_CONTROL_PLANE_OWNER);
   for (const input of [
     "completion-signal-buffer-seconds",
@@ -6064,6 +6894,7 @@ function stageThenActivationResponseFixtures({
   legacyRulesets = [],
   classicRequiredStatusChecks = EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS,
   v2RulesetName = "Must Pass Codex Review v2",
+  legacyBridge = false,
 } = {}) {
   const effectiveRulePages = [[
     ...legacyRulesets.map(effectiveLegacyRequiredStatusChecksRule),
@@ -6092,7 +6923,7 @@ function stageThenActivationResponseFixtures({
     legacyInventory,
     parentProtection,
     responses: {
-      ...canonicalRemoteWorkflowResponses(repoSlug),
+      ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge }),
       ...canaryRunResponses(repoSlug),
       ...legacyInventory.responses,
       [`repos/${repoSlug}/branches/master/protection`]: parentProtection,
@@ -6153,7 +6984,10 @@ function classicDriftSequences({
   };
 }
 
-function canonicalRemoteWorkflowResponses(repoSlug) {
+function canonicalRemoteWorkflowResponses(
+  repoSlug,
+  { legacyBridge = false } = {},
+) {
   const codeowners = ensureControlPlaneCodeownersContent(null).content;
   return {
     ...legacyInventoryResponseFixtures(repoSlug).responses,
@@ -6199,6 +7033,14 @@ function canonicalRemoteWorkflowResponses(repoSlug) {
           type: "blob",
           mode: "100644",
         },
+        ...(legacyBridge
+          ? [{
+              path: "codex-review-gate-legacy-bridge.yml",
+              sha: "canonical-legacy-bridge-blob",
+              type: "blob",
+              mode: "100644",
+            }]
+          : []),
       ],
     },
     [`repos/${repoSlug}/git/blobs/canonical-blob`]: {
@@ -6211,6 +7053,17 @@ function canonicalRemoteWorkflowResponses(repoSlug) {
         "base64",
       ),
     },
+    ...(legacyBridge
+      ? {
+          [`repos/${repoSlug}/git/blobs/canonical-legacy-bridge-blob`]: {
+            encoding: "base64",
+            content: Buffer.from(
+              CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+              "utf8",
+            ).toString("base64"),
+          },
+        }
+      : {}),
     [`repos/${repoSlug}/git/blobs/codeowners-blob`]: {
       encoding: "base64",
       content: Buffer.from(codeowners, "utf8").toString("base64"),
@@ -6624,6 +7477,7 @@ const { syncBuiltinESMExports } = require("node:module");
 const promises = fs.promises;
 const originalWriteFile = promises.writeFile.bind(promises);
 const originalRename = promises.rename.bind(promises);
+const originalUnlink = promises.unlink.bind(promises);
 const mode = process.env.CODEX_BOOTSTRAP_TEST_RACE_MODE;
 const targetRoot = process.env.CODEX_BOOTSTRAP_TEST_RACE_ROOT;
 let injectedBeforeFirstRename = false;
@@ -6648,6 +7502,37 @@ promises.writeFile = async function patchedWriteFile(path, ...args) {
 
 promises.rename = async function patchedRename(from, to) {
   renameCount += 1;
+  const bridgePath = join(
+    targetRoot,
+    ".github",
+    "workflows",
+    "codex-review-gate-legacy-bridge.yml",
+  );
+  if (
+    (mode === "removal-check-delete" || mode === "removal-check-replacement") &&
+    String(from) === bridgePath
+  ) {
+    if (mode === "removal-check-delete") {
+      await originalUnlink(from);
+    } else {
+      await originalRename(from, bridgePath + ".admitted");
+      await originalWriteFile(from, "attacker replacement\\n", "utf8");
+    }
+  }
+  if (
+    mode === "bridge-verifier-fails" &&
+    String(to) === join(targetRoot, ".github", "workflows", "codex-review-gate.yml")
+  ) {
+    if (!fs.existsSync(join(
+      targetRoot,
+      ".github",
+      "workflows",
+      "codex-review-gate-legacy-bridge.yml",
+    ))) {
+      throw new Error("zero-producer ordering: verifier replacement preceded bridge install");
+    }
+    throw new Error("synthetic verifier replacement failure");
+  }
   if (mode === "second-rename-fails" && renameCount === 2) {
     const error = new Error("synthetic second rename failure");
     error.code = "EACCES";
@@ -6660,6 +7545,25 @@ promises.rename = async function patchedRename(from, to) {
       "permissions:\\n  statuses: write\\njobs: {}\\n",
       "utf8",
     );
+  }
+  return result;
+};
+
+promises.unlink = async function patchedUnlink(path, ...args) {
+  if (
+    mode === "removal-unlink-fails" &&
+    basename(String(path)) === "canonical-legacy-bridge.yml"
+  ) {
+    const error = new Error("synthetic quarantine unlink failure");
+    error.code = "EACCES";
+    throw error;
+  }
+  const result = await originalUnlink(path, ...args);
+  if (
+    mode === "removal-post-unlink-checkpoint-fails" &&
+    basename(String(path)) === "canonical-legacy-bridge.yml"
+  ) {
+    fs.chmodSync(join(targetRoot, ".github", "workflows"), 0o700);
   }
   return result;
 };

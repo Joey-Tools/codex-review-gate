@@ -1,16 +1,24 @@
 ---
 id: 20260825-019ff4f8-action-v2-grilling-plan
 title: Action v2 Confirmed Delivery Plan
-status: active
+status: completed
 created: 2026-08-25
-updated: 2026-09-10
+updated: 2026-09-18
 branch: codex/action-v2-release
 pr: 34
 supersedes: [20260813-7bf930a-action-v2-release-pipeline]
-superseded_by:
+superseded_by: 20260918-organization-v2-handoff
 ---
 
 # Action v2 Confirmed Delivery Plan
+
+## Completion Record
+
+- Stable Action `v2.0.0` and the floating `v2` alias have been published from
+  `JoeyTeng/codex-review-gate-action`.
+- The remaining organization-wide consumer transition is tracked by the
+  successor `20260918-organization-v2-handoff` journal. It does not reopen
+  this completed release plan or authorize another stable release.
 
 ## Summary
 

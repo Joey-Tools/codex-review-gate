@@ -1,0 +1,1768 @@
+{
+  "schema_version": "organization-review-gate-handoff-manifest/v1",
+  "organization": {
+    "login": "Joey-Tools",
+    "id": 283943935,
+    "node_id": "O_kgDOEOyj_w"
+  },
+  "legacy_ruleset": {
+    "id": 16590367,
+    "expected_before": {
+      "name": "Must Pass Codex Review",
+      "target": "branch",
+      "enforcement": "active",
+      "bypass_actors": [],
+      "conditions": {
+        "ref_name": {
+          "exclude": [],
+          "include": [
+            "~DEFAULT_BRANCH"
+          ]
+        },
+        "repository_id": {
+          "repository_ids": [
+            1242512097,
+            1242512092,
+            1242511852,
+            1242512336,
+            1242511845,
+            1242511842,
+            1242512323,
+            1242511840,
+            1242512099,
+            1242512084,
+            1246526548
+          ]
+        }
+      },
+      "rules": [
+        {
+          "type": "deletion"
+        },
+        {
+          "type": "non_fast_forward"
+        },
+        {
+          "type": "required_status_checks",
+          "parameters": {
+            "strict_required_status_checks_policy": true,
+            "do_not_enforce_on_create": true,
+            "required_status_checks": [
+              {
+                "context": "codex/review-gate"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "v2_ruleset": {
+    "id": null,
+    "name": "Must Pass Codex Review v2"
+  },
+  "repositories": [
+    {
+      "slug": "Joey-Tools/codex-apple-notes-toolkit",
+      "id": 1242512097,
+      "node_id": "R_kgDOSg864Q",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_1",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_1",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_1",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_1",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_1",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_1",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_1",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_1",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_1",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_1",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_1"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583474,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_1",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_1",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-debug-triage",
+      "id": 1242512092,
+      "node_id": "R_kgDOSg863A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_2",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_2",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_2",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_2",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_2",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_2",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_2",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_2",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_2",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_2",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_2"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583544,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_2",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_2",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-personal-sync",
+      "id": 1242511852,
+      "node_id": "R_kgDOSg857A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_3",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_3",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_3",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_3",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_3",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_3",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_3",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_3",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_3",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_3",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_3"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583466,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_3",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_3",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-private-workflows",
+      "id": 1242512336,
+      "node_id": "R_kgDOSg870A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_4",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_4",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_4",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_4",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_4",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_4",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_4",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_4",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_4",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_4",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_4"
+      },
+      "legacy_cleanup": [],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_4",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_4",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-project-journal",
+      "id": 1242511845,
+      "node_id": "R_kgDOSg855Q",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_5",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_5",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_5",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_5",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_5",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_5",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_5",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_5",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_5",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_5",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_5"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583303,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_5",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_5",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-review-workflows",
+      "id": 1242511842,
+      "node_id": "R_kgDOSg854g",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_6",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_6",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_6",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_6",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_6",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_6",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_6",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_6",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_6",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_6",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_6"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583548,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_6",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_6",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-rollout-backup",
+      "id": 1242512323,
+      "node_id": "R_kgDOSg87ww",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_7",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_7",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_7",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_7",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_7",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_7",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_7",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_7",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_7",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_7",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_7"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583521,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_7",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_7",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-toolbox",
+      "id": 1242511840,
+      "node_id": "R_kgDOSg854A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_8",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_8",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_8",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_8",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_8",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_8",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_8",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_8",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_8",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_8",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_8"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583093,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_8",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_8",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-waited-delivery",
+      "id": 1242512099,
+      "node_id": "R_kgDOSg864w",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_9",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_9",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_9",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_9",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_9",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_9",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_9",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_9",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_9",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_9",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_9"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583524,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_9",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_9",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-workflow-hygiene",
+      "id": 1242512084,
+      "node_id": "R_kgDOSg861A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_10",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_10",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_10",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_10",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_10",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_10",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_10",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_10",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_10",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_10",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_10"
+      },
+      "legacy_cleanup": [
+        {
+          "surface": "repository_ruleset",
+          "ruleset_id": 16583522,
+          "operation": "update",
+          "expected_before": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "codex/review-gate"
+                    },
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          },
+          "expected_after": {
+            "name": "Must Pass CI",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+              "ref_name": {
+                "exclude": [],
+                "include": [
+                  "~DEFAULT_BRANCH"
+                ]
+              }
+            },
+            "rules": [
+              {
+                "parameters": {
+                  "do_not_enforce_on_create": false,
+                  "required_status_checks": [
+                    {
+                      "context": "test",
+                      "integration_id": 15368
+                    }
+                  ],
+                  "strict_required_status_checks_policy": true
+                },
+                "type": "required_status_checks"
+              },
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+        }
+      ],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_10",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_10",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-session-retrospective-history",
+      "id": 1246526548,
+      "node_id": "R_kgDOSkx8VA",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
+          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "9d894030ca760569c34877baf3812d6e11980af8",
+          "sha256": "3b54e3ad161720a239f01d8e1cf031ce15f78793b7d91ca1866a063090a6f2d6"
+        }
+      },
+      "v2_ruleset": {
+        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_11",
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "dismiss_stale_reviews_on_push": true,
+                "require_code_owner_review": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_11",
+        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_11",
+        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_11",
+        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_11",
+        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_11",
+        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_11",
+        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_11",
+        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_11",
+        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_11",
+        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_11"
+      },
+      "legacy_cleanup": [],
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_11",
+        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_11",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      }
+    }
+  ],
+  "expected_legacy_cleanup_action_count": 9
+}

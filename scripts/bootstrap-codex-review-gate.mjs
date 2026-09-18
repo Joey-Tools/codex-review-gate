@@ -1,13 +1,18 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants as fileSystemConstants } from "node:fs";
 import {
   lstat,
   mkdir,
+  mkdtemp,
+  open,
   readFile,
   readdir,
   realpath,
   rename,
+  rmdir,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -18,6 +23,7 @@ import {
   DEFAULT_CODEOWNERS_PATH,
   DEFAULT_CONTROLLER_WORKFLOW_PATH,
   DEFAULT_CONTROL_PLANE_OWNER,
+  DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
   DEFAULT_RULESET_ENFORCEMENT,
   DEFAULT_RULESET_NAME,
   DEFAULT_STATUS_CONTEXT,
@@ -45,6 +51,7 @@ import {
   rulesetHasRequiredStatusContext,
   rulesetWritableFingerprint,
   validateCanonicalV2ControllerWorkflowContent,
+  validateCanonicalLegacyBridgeWorkflowContent,
   validateCanonicalV2VerifierWorkflowContent,
   validateCanonicalV2WorkflowInventory,
   validateControlPlaneCodeownersContent,
@@ -62,19 +69,27 @@ const CANONICAL_CONTROLLER_WORKFLOW_SOURCE = join(
   SOURCE_ROOT,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
 );
+const CANONICAL_LEGACY_BRIDGE_WORKFLOW_SOURCE = join(
+  SOURCE_ROOT,
+  "templates/codex-gated-repo/.github/workflows/codex-review-gate-legacy-bridge.yml",
+);
 const GH_NOT_FOUND = Symbol("GitHub API not found");
 const GITHUB_PULL_REQUEST_FILES_LIMIT = 3_000;
 const GITHUB_PULL_REQUEST_FILES_PAGE_SIZE = 100;
 
 async function main() {
   const options = readCliOptions();
-  const canonicalWorkflows = await loadCanonicalWorkflows();
+  const canonicalWorkflows = await loadCanonicalWorkflows({
+    includeLegacyBridge: options.legacyBridge || options.removeLegacyBridge,
+  });
 
   if (options.prepareWorktree !== null) {
     await prepareConsumerWorktree({
       targetRoot: options.prepareWorktree,
       canonicalWorkflows,
       controlPlaneOwner: options.controlPlaneOwner,
+      legacyBridge: options.legacyBridge,
+      removeLegacyBridge: options.removeLegacyBridge,
       apply: options.apply,
     });
     return;
@@ -122,6 +137,11 @@ async function main() {
   console.log(`Default branch: ${defaultBranch}`);
   console.log(`Verifier: ${DEFAULT_WORKFLOW_PATH} exactly matches the canonical v2 verifier`);
   console.log(`Controller: ${DEFAULT_CONTROLLER_WORKFLOW_PATH} exactly matches the canonical v2 controller`);
+  if (options.legacyBridge) {
+    console.log(
+      `Temporary legacy bridge: ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH} exactly matches the closed canonical v1 producer envelope.`,
+    );
+  }
   console.log(`Control plane: ${DEFAULT_CODEOWNERS_PATH} protects the workflow and itself for ${options.controlPlaneOwner}`);
   if (initialSecuritySnapshot.classicLegacyStatusRequired) {
     console.log(
@@ -580,6 +600,8 @@ function readCliOptions() {
       "prepare-worktree": { type: "string" },
       apply: { type: "boolean", default: false },
       activate: { type: "boolean", default: false },
+      "legacy-bridge": { type: "boolean", default: false },
+      "remove-legacy-bridge": { type: "boolean", default: false },
       "derive-post-cleanup-plan": { type: "boolean", default: false },
       "verify-post-cleanup": { type: "boolean", default: false },
       "expected-legacy-inventory-sha256": { type: "string" },
@@ -611,6 +633,16 @@ function readCliOptions() {
   }
   if (hasPrepareWorktree && values.activate) {
     throw new Error("--activate is only valid with --repo after the canary passes.");
+  }
+  if (values["legacy-bridge"] && values["remove-legacy-bridge"]) {
+    throw new Error(
+      "--legacy-bridge and --remove-legacy-bridge are mutually exclusive lifecycle phases.",
+    );
+  }
+  if (hasRepo && values["remove-legacy-bridge"]) {
+    throw new Error(
+      "--remove-legacy-bridge is local-only and requires --prepare-worktree after legacy requirements have been removed and verified.",
+    );
   }
   if (
     hasPrepareWorktree &&
@@ -702,6 +734,8 @@ function readCliOptions() {
     prepareWorktree: hasPrepareWorktree ? resolve(values["prepare-worktree"]) : null,
     apply: values.apply,
     activate: values.activate,
+    legacyBridge: values["legacy-bridge"],
+    removeLegacyBridge: values["remove-legacy-bridge"],
     derivePostCleanupPlan: values["derive-post-cleanup-plan"],
     verifyPostCleanup: values["verify-post-cleanup"],
     rulesetName: values["ruleset-name"],
@@ -726,16 +760,18 @@ function readCliOptions() {
 
 function printUsage() {
   console.log(`Usage:
-  node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --activate --canary-pr NUMBER --canary-head SHA [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --derive-post-cleanup-plan [--control-plane-owner @USER]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --verify-post-cleanup --expected-post-cleanup-security-sha256 SHA256 [--control-plane-owner @USER]
+  node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--legacy-bridge | --remove-legacy-bridge] [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 [--legacy-bridge] [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --activate --canary-pr NUMBER --canary-head SHA [--legacy-bridge] [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --derive-post-cleanup-plan [--legacy-bridge] [--control-plane-owner @USER]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --verify-post-cleanup --expected-post-cleanup-security-sha256 SHA256 [--legacy-bridge] [--control-plane-owner @USER]
 
 Options:
   --prepare-worktree PATH Prepare a local consumer checkout for one installation PR.
   --repo OWNER/REPO       Inspect or stage the merged repository ruleset.
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
+  --legacy-bridge         Explicitly require/install the exact temporary v1 producer at ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}. Keep this flag through legacy cleanup verification.
+  --remove-legacy-bridge  Local-only post-cutover removal of an exact canonical bridge. Use only after legacy requirements are removed and verified.
   --expected-legacy-inventory-sha256
                           Exact lowercase SHA-256 from the external owner approval snapshot. Required for every remote staging/activation preview and apply.
   --derive-post-cleanup-plan
@@ -1505,6 +1541,7 @@ async function loadConsumerSecuritySnapshot({
     validateCanonicalV2WorkflowInventory(
       workflowFiles,
       canonicalWorkflows,
+      { legacyBridge: canonicalWorkflows.legacyBridge !== undefined },
     );
     validateControlPlaneCodeownersContent(
       codeownersContent,
@@ -1569,8 +1606,11 @@ async function loadConsumerSecuritySnapshot({
       controlPlaneOwner: controlPlaneOwnerAccess.projection,
     };
   } catch (error) {
+    const workflowRequirement = canonicalWorkflows.legacyBridge === undefined
+      ? "remove every v1 caller"
+      : `retain only the exact canonical temporary bridge at ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}`;
     throw new Error(
-      `${repoSlug}@${defaultBranch} does not have the complete canonical v2 workflow and CODEOWNERS control plane; merge the installation PR, protect the control-plane owner, and remove every v1 caller before staging or activating the ruleset.\n${error.message}`,
+      `${repoSlug}@${defaultBranch} does not have the complete canonical v2 workflow and CODEOWNERS control plane; merge the installation PR, protect the control-plane owner, and ${workflowRequirement} before staging or activating the ruleset.\n${error.message}`,
     );
   }
 }
@@ -2515,21 +2555,32 @@ function printDryRun(action, options, payload, existingRuleset = null) {
   console.log(`Run again with --apply to ${action} it.`);
 }
 
-async function loadCanonicalWorkflows() {
+async function loadCanonicalWorkflows({ includeLegacyBridge = false } = {}) {
   const [verifier, controller] = await Promise.all([
     readFile(CANONICAL_VERIFIER_WORKFLOW_SOURCE, "utf8"),
     readFile(CANONICAL_CONTROLLER_WORKFLOW_SOURCE, "utf8"),
   ]);
-  return {
+  const canonicalWorkflows = {
     verifier: validateCanonicalV2VerifierWorkflowContent(verifier),
     controller: validateCanonicalV2ControllerWorkflowContent(controller),
   };
+  if (includeLegacyBridge) {
+    const legacyBridge = await readFile(
+      CANONICAL_LEGACY_BRIDGE_WORKFLOW_SOURCE,
+      "utf8",
+    );
+    canonicalWorkflows.legacyBridge =
+      validateCanonicalLegacyBridgeWorkflowContent(legacyBridge);
+  }
+  return canonicalWorkflows;
 }
 
 async function prepareConsumerWorktree({
   targetRoot,
   canonicalWorkflows,
   controlPlaneOwner,
+  legacyBridge,
+  removeLegacyBridge,
   apply,
 }) {
   const rootWitness = await assertLocalGitWorktree(targetRoot);
@@ -2546,6 +2597,10 @@ async function prepareConsumerWorktree({
     targetRoot,
     ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/"),
   );
+  const legacyBridgeWorkflowPath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
   const codeownersPath = join(targetRoot, ...DEFAULT_CODEOWNERS_PATH.split("/"));
   const currentVerifierWorkflow = await readOptionalRegularFile(
     verifierWorkflowPath,
@@ -2553,6 +2608,21 @@ async function prepareConsumerWorktree({
   const currentControllerWorkflow = await readOptionalRegularFile(
     controllerWorkflowPath,
   );
+  const managesLegacyBridge = legacyBridge || removeLegacyBridge;
+  if (managesLegacyBridge && canonicalWorkflows.legacyBridge === undefined) {
+    throw new Error("Internal error: the selected bridge lifecycle lacks canonical bytes.");
+  }
+  const currentLegacyBridgeWorkflow = managesLegacyBridge
+    ? await readOptionalRegularFile(legacyBridgeWorkflowPath)
+    : null;
+  if (removeLegacyBridge && currentLegacyBridgeWorkflow !== null) {
+    validateCanonicalLegacyBridgeWorkflowContent(currentLegacyBridgeWorkflow);
+    if (currentLegacyBridgeWorkflow !== canonicalWorkflows.legacyBridge) {
+      throw new Error(
+        `${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH} differs from the exact canonical bridge bytes; refusing post-cutover removal.`,
+      );
+    }
+  }
   const currentCodeowners = await readOptionalRegularFile(codeownersPath);
   const preparedCodeowners = ensureControlPlaneCodeownersContent(
     currentCodeowners,
@@ -2560,7 +2630,11 @@ async function prepareConsumerWorktree({
   );
   const initialLocalSecurityState = await loadLocalInstallationSecurityState({
     targetRoot,
-    canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
+    canonicalWorkflowPaths: [
+      verifierWorkflowPath,
+      controllerWorkflowPath,
+      ...(managesLegacyBridge ? [legacyBridgeWorkflowPath] : []),
+    ],
   });
   await revalidateDirectoryChain(parentWitnesses, "after local workflow inspection");
 
@@ -2568,9 +2642,19 @@ async function prepareConsumerWorktree({
     currentVerifierWorkflow !== canonicalWorkflows.verifier;
   const controllerChanged =
     currentControllerWorkflow !== canonicalWorkflows.controller;
+  const legacyBridgeChanged = legacyBridge
+    ? currentLegacyBridgeWorkflow !== canonicalWorkflows.legacyBridge
+    : removeLegacyBridge && currentLegacyBridgeWorkflow !== null;
   console.log(`Target worktree: ${targetRoot}`);
   console.log(`Verifier: ${DEFAULT_WORKFLOW_PATH}`);
   console.log(`Controller: ${DEFAULT_CONTROLLER_WORKFLOW_PATH}`);
+  if (legacyBridge) {
+    console.log(`Temporary legacy bridge: ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}`);
+  } else if (removeLegacyBridge) {
+    console.log(
+      `Post-cutover legacy bridge removal: ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}`,
+    );
+  }
   console.log(`Control plane: ${DEFAULT_CODEOWNERS_PATH} -> ${controlPlaneOwner}`);
   if (!verifierChanged) {
     console.log("No change: local verifier already matches the canonical v2 bytes.");
@@ -2578,13 +2662,28 @@ async function prepareConsumerWorktree({
   if (!controllerChanged) {
     console.log("No change: local controller already matches the canonical v2 bytes.");
   }
+  if (legacyBridge && !legacyBridgeChanged) {
+    console.log("No change: local temporary legacy bridge already matches the canonical bytes.");
+  }
+  if (removeLegacyBridge && !legacyBridgeChanged) {
+    console.log("No change: local temporary legacy bridge is already absent.");
+  }
   if (!preparedCodeowners.changed) {
     console.log("No change: local CODEOWNERS already has canonical final control-plane ownership.");
   }
-  if (!verifierChanged && !controllerChanged && !preparedCodeowners.changed) {
+  if (
+    !verifierChanged &&
+    !controllerChanged &&
+    !legacyBridgeChanged &&
+    !preparedCodeowners.changed
+  ) {
     const finalNoopState = await loadLocalInstallationSecurityState({
       targetRoot,
-      canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
+      canonicalWorkflowPaths: [
+        verifierWorkflowPath,
+        controllerWorkflowPath,
+        ...(managesLegacyBridge ? [legacyBridgeWorkflowPath] : []),
+      ],
     });
     assertLocalInstallationSecurityStateStable(
       initialLocalSecurityState,
@@ -2602,7 +2701,15 @@ async function prepareConsumerWorktree({
   const controllerAction = currentControllerWorkflow === null
     ? "install the canonical v2 controller workflow"
     : "replace the drifted controller workflow with canonical v2 bytes";
+  const legacyBridgeAction = legacyBridge
+    ? currentLegacyBridgeWorkflow === null
+      ? "install the exact temporary legacy bridge workflow"
+      : "replace the drifted temporary legacy bridge with canonical bytes"
+    : "remove the exact temporary legacy bridge after verified legacy cleanup";
   if (!apply) {
+    if (legacyBridgeChanged) {
+      console.log(`Dry run: would ${legacyBridgeAction}.`);
+    }
     if (verifierChanged) {
       console.log(`Dry run: would ${verifierAction}.`);
     }
@@ -2630,6 +2737,14 @@ async function prepareConsumerWorktree({
           label: "CODEOWNERS",
         }]
       : []),
+    ...(legacyBridge && legacyBridgeChanged
+      ? [{
+          path: legacyBridgeWorkflowPath,
+          content: canonicalWorkflows.legacyBridge,
+          expectedContent: currentLegacyBridgeWorkflow,
+          label: "legacy-bridge-workflow",
+        }]
+      : []),
     ...(verifierChanged
       ? [{
           path: verifierWorkflowPath,
@@ -2646,45 +2761,76 @@ async function prepareConsumerWorktree({
           label: "controller-workflow",
         }]
       : []),
+    ...(removeLegacyBridge && legacyBridgeChanged
+      ? [{
+          path: legacyBridgeWorkflowPath,
+          expectedContent: currentLegacyBridgeWorkflow,
+          label: "legacy-bridge-removal",
+          operation: "remove",
+        }]
+      : []),
   ];
   const expectedFinalLocalSecurityState = buildExpectedFinalLocalSecurityState({
     initialState: initialLocalSecurityState,
     targetRoot,
     verifierWorkflowPath,
     controllerWorkflowPath,
+    legacyBridgeWorkflowPath: managesLegacyBridge
+      ? legacyBridgeWorkflowPath
+      : null,
+    legacyBridgeContent: legacyBridge
+      ? canonicalWorkflows.legacyBridge
+      : null,
     codeownersContent: preparedCodeowners.content,
     verifierContent: canonicalWorkflows.verifier,
     controllerContent: canonicalWorkflows.controller,
   });
   const installedLabels = [];
-  let firstRenameBoundaryComplete = false;
+  let firstMutationBoundaryComplete = false;
+  const beforeFirstMutation = async () => {
+    if (firstMutationBoundaryComplete) {
+      return;
+    }
+    const preMutationState = await loadLocalInstallationSecurityState({
+      targetRoot,
+      canonicalWorkflowPaths: [
+        verifierWorkflowPath,
+        controllerWorkflowPath,
+        ...(managesLegacyBridge ? [legacyBridgeWorkflowPath] : []),
+      ],
+    });
+    assertLocalInstallationSecurityStateStable(
+      initialLocalSecurityState,
+      preMutationState,
+      "immediately before the first install mutation",
+    );
+    firstMutationBoundaryComplete = true;
+  };
   try {
     for (const change of plannedChanges) {
-      await installPreparedConsumerFile({
-        ...change,
-        parentWitnesses,
-        beforeRename: async () => {
-          if (firstRenameBoundaryComplete) {
-            return;
-          }
-          const preRenameState = await loadLocalInstallationSecurityState({
-            targetRoot,
-            canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
-          });
-          assertLocalInstallationSecurityStateStable(
-            initialLocalSecurityState,
-            preRenameState,
-            "immediately before the first install rename",
-          );
-          firstRenameBoundaryComplete = true;
-        },
-      });
+      if (change.operation === "remove") {
+        await removePreparedConsumerFile({
+          ...change,
+          parentWitnesses,
+          beforeRemove: beforeFirstMutation,
+        });
+      } else {
+        await installPreparedConsumerFile({
+          ...change,
+          parentWitnesses,
+          beforeRename: beforeFirstMutation,
+        });
+      }
       installedLabels.push(change.label);
     }
 
     const finalLocalSecurityState = await loadLocalInstallationSecurityState({
       targetRoot,
-      canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
+      canonicalWorkflowPaths: [
+        verifierWorkflowPath,
+        controllerWorkflowPath,
+        ...(managesLegacyBridge ? [legacyBridgeWorkflowPath] : []),
+      ],
     });
     assertLocalInstallationSecurityStateStable(
       expectedFinalLocalSecurityState,
@@ -2717,6 +2863,27 @@ async function prepareConsumerWorktree({
         "Local verifier/controller workflows failed exact-byte post-install verification.",
       );
     }
+    if (legacyBridge) {
+      const installedLegacyBridge = await readOptionalRegularFile(
+        legacyBridgeWorkflowPath,
+      );
+      validateCanonicalLegacyBridgeWorkflowContent(installedLegacyBridge);
+      if (
+        !installedWorkflowMatchesCanonical(
+          installedLegacyBridge,
+          canonicalWorkflows.legacyBridge,
+        )
+      ) {
+        throw new Error(
+          "Local temporary legacy bridge failed exact-byte post-install verification.",
+        );
+      }
+    } else if (
+      removeLegacyBridge &&
+      await readOptionalRegularFile(legacyBridgeWorkflowPath) !== null
+    ) {
+      throw new Error("Local temporary legacy bridge remains after post-cutover removal.");
+    }
     const installedCodeowners = await readOptionalRegularFile(codeownersPath);
     validateControlPlaneCodeownersContent(installedCodeowners, controlPlaneOwner);
     if (installedCodeowners !== preparedCodeowners.content) {
@@ -2725,7 +2892,11 @@ async function prepareConsumerWorktree({
     await revalidateDirectoryChain(parentWitnesses, "after exact-byte verification");
     const successBoundaryState = await loadLocalInstallationSecurityState({
       targetRoot,
-      canonicalWorkflowPaths: [verifierWorkflowPath, controllerWorkflowPath],
+      canonicalWorkflowPaths: [
+        verifierWorkflowPath,
+        controllerWorkflowPath,
+        ...(managesLegacyBridge ? [legacyBridgeWorkflowPath] : []),
+      ],
     });
     assertLocalInstallationSecurityStateStable(
       expectedFinalLocalSecurityState,
@@ -2741,20 +2912,38 @@ async function prepareConsumerWorktree({
   if (controllerChanged) {
     console.log(`Applied: ${controllerAction}.`);
   }
+  if (legacyBridgeChanged) {
+    console.log(`Applied: ${legacyBridgeAction}.`);
+  }
   if (preparedCodeowners.changed) {
     console.log(`Applied: protect the control plane with ${controlPlaneOwner}.`);
   }
-  console.log(
-    "Next: review the target-repository diff, open one installation PR, and obtain an independent exact-head control-plane-owner approval.",
-  );
+  if (legacyBridge) {
+    console.log(
+      "Next: review the target-repository diff, open one installation PR, obtain an independent exact-head control-plane-owner approval, and retain --legacy-bridge through disabled staging, activation, and legacy cleanup verification.",
+    );
+  } else if (removeLegacyBridge) {
+    console.log(
+      "Next: review the post-cutover diff and confirm ordinary strict validation rejects any remaining v1 caller before landing the removal.",
+    );
+  } else {
+    console.log(
+      "Next: review the target-repository diff, open one installation PR, and obtain an independent exact-head control-plane-owner approval.",
+    );
+  }
 }
 
 function buildPartialLocalApplyError(error, installedLabels, plannedChanges) {
   const remainingLabels = plannedChanges
     .map((change) => change.label)
     .filter((label) => !installedLabels.includes(label));
+  const hasRemoval = plannedChanges.some((change) => change.operation === "remove");
+  const completedVerb = hasRemoval ? "completed" : "installed";
+  const pendingDescription = hasRemoval
+    ? "were not completed or verified"
+    : "were not installed or verified";
   return new Error(
-    `${error.message}\nPartial local apply: installed ${installedLabels.join(", ") || "no completed target"}; ${remainingLabels.length > 0 ? `${remainingLabels.join(", ")} were not installed or verified` : "all planned renames completed but the final security closure was not verified"}. Inspect the target-repository diff and rerun the helper; no rollback was claimed or attempted.`,
+    `${error.message}\nPartial local apply: ${completedVerb} ${installedLabels.join(", ") || "no completed target"}; ${remainingLabels.length > 0 ? `${remainingLabels.join(", ")} ${pendingDescription}` : "all planned mutations completed but the final security closure was not verified"}. Inspect the target-repository diff and rerun the helper; no rollback was claimed or attempted.`,
   );
 }
 
@@ -2803,6 +2992,237 @@ async function installPreparedConsumerFile({
     throw error;
   }
 
+}
+
+// Protected property: removal may unlink only the regular-file object admitted
+// here by dev/ino identity and exact canonical UTF-8 content. Directory
+// metadata churn is benign for that property. The fixed workflow path is first
+// atomically renamed into a fresh task-owned quarantine directory; identity and
+// content are then rebound at the unpredictable quarantine path before unlink.
+// A replacement won by the fixed-path rename is quarantined but never unlinked.
+// Node does not expose unlinkat against an already-open file descriptor, so the
+// final quarantine check and path-based unlink remain a best-effort boundary
+// under the existing same-UID non-interference assumption.
+async function removePreparedConsumerFile({
+  path,
+  expectedContent,
+  parentWitnesses,
+  label,
+  beforeRemove = async () => {},
+}) {
+  const admittedIdentity = await readConsumerFileIdentity(
+    path,
+    label,
+    expectedContent,
+  );
+  let quarantineDirectory = null;
+  let quarantineDirectoryWitness = null;
+  let quarantinePath = null;
+  let renameCompleted = false;
+  let quarantineVerified = false;
+  let unlinkCompleted = false;
+  let quarantineDirectoryRemoved = false;
+  try {
+    await revalidateDirectoryChain(parentWitnesses, `before ${label} removal`);
+    await assertConsumerFileIdentityStable(
+      admittedIdentity,
+      path,
+      `before ${label} removal`,
+    );
+    await assertConsumerFileContentStable(path, expectedContent, label);
+    await beforeRemove();
+    await revalidateDirectoryChain(
+      parentWitnesses,
+      `before ${label} quarantine`,
+    );
+    await assertConsumerFileIdentityStable(
+      admittedIdentity,
+      path,
+      `before ${label} quarantine`,
+    );
+    await assertConsumerFileContentStable(path, expectedContent, label);
+
+    quarantineDirectory = await mkdtemp(
+      join(dirname(path), ".codex-review-gate-removal-"),
+    );
+    quarantineDirectoryWitness = await readDirectoryWitness(
+      quarantineDirectory,
+      `${label} quarantine`,
+    );
+    quarantinePath = join(quarantineDirectory, "canonical-legacy-bridge.yml");
+    await revalidateDirectoryChain(
+      parentWitnesses,
+      `after ${label} quarantine creation`,
+    );
+    await assertConsumerFileIdentityStable(
+      admittedIdentity,
+      path,
+      `immediately before ${label} quarantine rename`,
+    );
+    await assertConsumerFileContentStable(path, expectedContent, label);
+    await rename(path, quarantinePath);
+    renameCompleted = true;
+
+    await revalidateDirectoryWitness(
+      quarantineDirectoryWitness,
+      `after ${label} quarantine rename`,
+    );
+    await revalidateDirectoryChain(
+      parentWitnesses,
+      `after ${label} quarantine rename`,
+    );
+    await assertConsumerFileIdentityStable(
+      admittedIdentity,
+      quarantinePath,
+      `after ${label} quarantine rename`,
+    );
+    await assertConsumerFileContentStable(
+      quarantinePath,
+      expectedContent,
+      `${label} quarantine`,
+    );
+    quarantineVerified = true;
+
+    await revalidateDirectoryWitness(
+      quarantineDirectoryWitness,
+      `before ${label} quarantine unlink`,
+    );
+    await assertConsumerFileIdentityStable(
+      admittedIdentity,
+      quarantinePath,
+      `before ${label} quarantine unlink`,
+    );
+    await assertConsumerFileContentStable(
+      quarantinePath,
+      expectedContent,
+      `${label} quarantine`,
+    );
+    await unlink(quarantinePath);
+    unlinkCompleted = true;
+    await revalidateDirectoryWitness(
+      quarantineDirectoryWitness,
+      `after ${label} quarantine unlink`,
+    );
+    await revalidateDirectoryChain(parentWitnesses, `after ${label} unlink`);
+    await rmdir(quarantineDirectory);
+    quarantineDirectoryRemoved = true;
+    await revalidateDirectoryChain(
+      parentWitnesses,
+      `after ${label} quarantine removal`,
+    );
+  } catch (error) {
+    let failure = error;
+    try {
+      await admittedIdentity.handle.close();
+    } catch (closeError) {
+      failure = new Error(
+        `${error.message}\nUnable to close the admitted bridge handle after failure: ${closeError.message}`,
+      );
+    }
+    if (unlinkCompleted) {
+      const quarantineDisposition = quarantineDirectoryRemoved
+        ? "The task-owned quarantine directory was removed."
+        : `An empty quarantine directory may remain at ${quarantineDirectory}.`;
+      throw new Error(
+        `${failure.message}\nThe admitted exact bridge unlink completed before the checkpoint mismatch was detected; no success was reported. ${quarantineDisposition} Inspect the intended target and any concurrently substituted parent.`,
+      );
+    }
+    if (renameCompleted) {
+      throw new Error(
+        `${failure.message}\n${quarantineVerified ? "The admitted exact bridge remains" : "An unverified replacement remains"} quarantined at ${quarantinePath}; it was not unlinked and no rollback or success was reported.`,
+      );
+    }
+    if (quarantineDirectory !== null) {
+      throw new Error(
+        `${failure.message}\nNo workflow object was unlinked. An empty task-owned quarantine directory may remain at ${quarantineDirectory}; no path-based cleanup was attempted after failure.`,
+      );
+    }
+    throw failure;
+  }
+  await admittedIdentity.handle.close();
+}
+
+// Object identity, not metadata stability, is the selected file property for
+// removal. dev/ino binds the admitted filesystem object. Content is checked
+// separately at every boundary. Mode/uid/gid and timestamps are deliberately
+// not compared because they do not prove replacement or content mutation and
+// the containing directory controls unlink access.
+async function readConsumerFileIdentity(path, label, expectedContent) {
+  let handle;
+  try {
+    handle = await open(
+      path,
+      fileSystemConstants.O_RDONLY | (fileSystemConstants.O_NOFOLLOW ?? 0),
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`${label} is missing before removal: ${path}`);
+    }
+    throw new Error(`Unable to open ${label} before removal: ${path}: ${error.message}`);
+  }
+
+  try {
+    const [metadata, pathMetadata] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(path, { bigint: true }),
+    ]);
+    if (
+      !metadata.isFile() ||
+      !pathMetadata.isFile() ||
+      pathMetadata.isSymbolicLink()
+    ) {
+      throw new Error(`Refusing to remove non-regular ${label}: ${path}`);
+    }
+    if (metadata.dev !== pathMetadata.dev || metadata.ino !== pathMetadata.ino) {
+      throw new Error(
+        `${label} object identity changed while opening it for removal: ${path}`,
+      );
+    }
+    const bytes = await handle.readFile();
+    const content = bytes.toString("utf8");
+    if (!Buffer.from(content, "utf8").equals(bytes)) {
+      throw new Error(`Refusing to remove non-UTF-8 ${label}: ${path}`);
+    }
+    if (content !== expectedContent) {
+      throw new Error(
+        `${label} changed after local preparation; refusing to remove non-canonical content.`,
+      );
+    }
+    return { dev: metadata.dev, ino: metadata.ino, handle };
+  } catch (error) {
+    try {
+      await handle.close();
+    } catch (closeError) {
+      throw new Error(
+        `${error.message}\nUnable to close the rejected bridge handle: ${closeError.message}`,
+      );
+    }
+    throw error;
+  }
+}
+
+async function assertConsumerFileIdentityStable(expected, path, phase) {
+  let metadata;
+  try {
+    metadata = await lstat(path, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`Admitted bridge object is missing during ${phase}: ${path}`);
+    }
+    throw new Error(
+      `Unable to revalidate the admitted bridge object during ${phase}: ${path}: ${error.message}`,
+    );
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(
+      `Admitted bridge object is no longer a regular file during ${phase}: ${path}`,
+    );
+  }
+  if (metadata.dev !== expected.dev || metadata.ino !== expected.ino) {
+    throw new Error(
+      `Admitted bridge object identity changed during ${phase}: ${path}`,
+    );
+  }
 }
 
 // Protected property: the target file's admitted absence or exact UTF-8
@@ -3189,9 +3609,11 @@ function buildExpectedFinalLocalSecurityState({
   targetRoot,
   verifierWorkflowPath,
   controllerWorkflowPath,
+  legacyBridgeWorkflowPath,
   codeownersContent,
   verifierContent,
   controllerContent,
+  legacyBridgeContent,
 }) {
   const workflows = new Map(
     initialState.workflows.map((file) => [file.path, file.content_sha256]),
@@ -3204,6 +3626,16 @@ function buildExpectedFinalLocalSecurityState({
     controllerWorkflowPath.slice(targetRoot.length + 1),
     fingerprintText(controllerContent),
   );
+  if (legacyBridgeWorkflowPath !== null) {
+    const relativeBridgePath = legacyBridgeWorkflowPath.slice(
+      targetRoot.length + 1,
+    );
+    if (legacyBridgeContent === null) {
+      workflows.delete(relativeBridgePath);
+    } else {
+      workflows.set(relativeBridgePath, fingerprintText(legacyBridgeContent));
+    }
+  }
   return {
     lower_precedence_codeowners: null,
     codeowners_sha256: fingerprintText(codeownersContent),
