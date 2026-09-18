@@ -1,7 +1,7 @@
 {
   "$schema": "urn:joey-tools:codex-review-gate:release-manifest:2",
   "schema_version": 2,
-  "version": "2.0.0",
+  "version": "2.0.1",
   "contract_versions": {
     "toolchain": "node20",
     "release_schema": 2,
@@ -12,13 +12,13 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "cdf16cae08b37f57b4f1657e217fc04be4ba8051"
+    "tree": "cb408ea1d227bdb67d1444b62ce2426be8ca2a70"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
     "ref": "refs/heads/master",
-    "expected_head": "0191565ddcbc4417eeaed5cd485580fce87aa11c",
-    "previous_version": "2.0.0-rc.3"
+    "expected_head": "d45f73b665862a840a6b032750ed0d8aa59c82ab",
+    "previous_version": "2.0.0"
   },
   "files": [
     {
@@ -39,15 +39,15 @@
       "path": "DESIGN.md",
       "type": "file",
       "mode": "100644",
-      "size": 31552,
-      "sha256": "57e3c070defaeaad3e159d716bc22f5e6616113ede9ff7c1b9e5253d679a209a"
+      "size": 31779,
+      "sha256": "b1ac1324a6ba742fc5de340a08bac5cfc3cb0edd6841cd313deec04855e48a34"
     },
     {
       "path": "DESIGN.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 30994,
-      "sha256": "544b3b218e0a7189d8392944a0559fca57257faf5c1c20415cfa5055862ec16a"
+      "size": 31184,
+      "sha256": "b992ecc747754a5f5814b8384f315180e3155dd259d40fb93e92dd5d99b870a3"
     },
     {
       "path": "EULA.md",
@@ -67,8 +67,8 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 23826,
-      "sha256": "4ddd6d56aa203c45aaee1265a2c6db64c0adad753f54c3e181ff52d400002f1b"
+      "size": 24192,
+      "sha256": "a145971a67be12be34b854bd9deb561cf27a2ff45677acf1539840c158a10526"
     },
     {
       "path": "README.zh-CN.md",
@@ -81,8 +81,8 @@
       "path": "SECURITY.md",
       "type": "file",
       "mode": "100644",
-      "size": 7692,
-      "sha256": "6f0954bdac1b37e81d05bc9eae2edcfedd186961e36b4c44b50e357016984c84"
+      "size": 7859,
+      "sha256": "a625050458cc3ef7bf3d6fdcbf9e55173cad19fa4c130bc814f6b912fa8cf81e"
     },
     {
       "path": "SUPPORT.md",
@@ -110,7 +110,7 @@
       "type": "file",
       "mode": "100644",
       "size": 481,
-      "sha256": "6c5f21ef6f99f34cc81b22d7225406babf75fdf885a62ecda863828ee6fd06ac"
+      "sha256": "3ac2e87a841f4e87c70cb65453328ceee3179047d2ae0147c8ee5dd5dba2a082"
     },
     {
       "path": "producer-receipt.schema.json",

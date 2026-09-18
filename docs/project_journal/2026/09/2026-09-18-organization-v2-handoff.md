@@ -108,9 +108,10 @@ the global cutover is closed.
 ## Current State
 
 - Source tooling implements the temporary bridge, cohort handoff transaction,
-  receipt-bound bridge removal, and their operator-facing guides. A follow-up
-  source patch is under review to correct the controller's minimal permission
-  set and harden the handoff/bridge proof boundaries.
+  receipt-bound bridge removal, and their operator-facing guides. Source PR
+  `#54` merged as `5442b851200b6dd1fc85f88f0e2861f64d043906`: it corrects the
+  controller to the required PR-scoped comment authority and hardens the
+  handoff/bridge proof boundaries.
 - Nine consumer default branches have migrated to the canonical v2 verifier,
   controller, CODEOWNERS coverage, and temporary v1 bridge. No organization
   ruleset or required-status policy has been mutated by this workstream yet.
@@ -125,6 +126,10 @@ the global cutover is closed.
   user-run host-level `codex_workspace.py ensure` must initialize the mirror.
   The automation does not bypass that rule by cloning or by writing repository
   contents through an API.
+- The stable `v2.0.0` target package predates source PR `#54`, so its English
+  `DESIGN.md` still describes the old issue-comment permission combination.
+  A `v2.0.1` release intent republishes the already-reviewed package document
+  together with the matching package version; it makes no runtime-code change.
 
 ### Execution Update — 2026-09-18
 
