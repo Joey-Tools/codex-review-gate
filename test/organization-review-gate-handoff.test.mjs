@@ -35,6 +35,7 @@ import {
   runCli,
   sha256Canonical,
   validateCanaryPullGraphqlResponse,
+  validateLegacyProducerRunPages,
   validateLegacyStatusPages,
   validateDefaultBranchResponse,
   validateManifest,
@@ -443,6 +444,9 @@ function createFakeGhHarness(
     extraEffectiveRules = [],
     extraEffectiveSecondPageRules = [],
     mutateEffectiveRules = null,
+    legacyProducerRuns = { queued: [], in_progress: [] },
+    legacyBridgeRuns = { queued: [], in_progress: [] },
+    legacyBridgeWorkflowInventory = null,
   } = {},
 ) {
   const { manifest, codeownersBytes } = integrationManifestFixture();
@@ -728,6 +732,16 @@ function createFakeGhHarness(
                 cleanupState,
               });
             }
+            if (extraEffectiveSecondPageRules.length > 0) {
+              rules.push(
+                ...Array.from({ length: Math.max(0, 100 - rules.length) }, () => ({
+                  type: "deletion",
+                  ruleset_id: null,
+                  ruleset_source: null,
+                  ruleset_source_type: null,
+                })),
+              );
+            }
           }
           effectiveResponseByState[`${v2State}:${legacyState}:${cleanupState}`] =
             JSON.stringify([
@@ -803,6 +817,73 @@ function createFakeGhHarness(
         state: "active",
       },
     );
+    const bridgeWorkflowId = 34000000 + repositoryIndex;
+    let actionsWorkflowInventory = [
+      {
+        id: repository.canary.v2_workflow_id,
+        path: CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+        state: "active",
+      },
+      {
+        id: 35000000 + repositoryIndex,
+        path: CANONICAL_WORKFLOW_IDENTITIES.controller.path,
+        state: "active",
+      },
+      {
+        id: bridgeWorkflowId,
+        path: CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
+        state: "active",
+      },
+    ];
+    if (repositoryIndex === 0 && legacyBridgeWorkflowInventory === "malformed") {
+      actionsWorkflowInventory = null;
+    }
+    if (repositoryIndex === 0 && legacyBridgeWorkflowInventory === "ambiguous") {
+      actionsWorkflowInventory.push({
+        id: 36000000,
+        path: CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
+        state: "active",
+      });
+    }
+    addFakeResponse(
+      responses,
+      `repos/${encodedSlug}/actions/workflows?per_page=100`,
+      [{
+        total_count: actionsWorkflowInventory?.length ?? 3,
+        workflows: actionsWorkflowInventory,
+      }],
+    );
+    if (actionsWorkflowInventory !== null) {
+      addFakeResponse(
+        responses,
+        `repos/${encodedSlug}/actions/workflows/${bridgeWorkflowId}`,
+        {
+          id: bridgeWorkflowId,
+          path: CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
+          state: "active",
+        },
+      );
+    }
+    for (const status of ["queued", "in_progress"]) {
+      const runs = repositoryIndex === 0 ? legacyProducerRuns[status] : [];
+      addFakeResponse(
+        responses,
+        `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}/runs?status=${status}&per_page=100`,
+        [{
+          total_count: runs.length,
+          workflow_runs: runs,
+        }],
+      );
+      const bridgeRuns = repositoryIndex === 0 ? legacyBridgeRuns[status] : [];
+      addFakeResponse(
+        responses,
+        `repos/${encodedSlug}/actions/workflows/${bridgeWorkflowId}/runs?status=${status}&per_page=100`,
+        [{
+          total_count: bridgeRuns.length,
+          workflow_runs: bridgeRuns,
+        }],
+      );
+    }
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/actions/runs/${repository.canary.v2_run_id}/attempts/${repository.canary.v2_run_attempt}/jobs?per_page=100`,
@@ -1181,8 +1262,8 @@ test("exports the closed organization handoff protocol constants", () => {
     },
     controller: {
       path: ".github/workflows/codex-review-gate-controller.yml",
-      git_blob_sha: "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-      sha256: "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f",
+      git_blob_sha: "c994a6861414e1efc1e7ab376470c7709d475ef1",
+      sha256: "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e",
     },
     legacy_bridge: {
       path: ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -2466,15 +2547,138 @@ test("workflow-run path accepts GitHub's documented optional source-ref suffix",
       workflow_ref: repo.default_branch,
     },
   );
+  assert.deepEqual(
+    parseWorkflowRunPath(".github/workflows/foo.yml@refs/heads/release"),
+    {
+      workflow_path: ".github/workflows/foo.yml",
+      workflow_ref: "refs/heads/release",
+    },
+  );
   for (const candidate of [
     ".github/workflows/other.yml@master",
     `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@`,
     `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@master\nforeign`,
+    `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@release`,
     null,
   ]) {
     assert.throws(
       () => parseWorkflowRunPath(candidate, repo.default_branch),
       /Workflow run path/u,
+    );
+  }
+});
+
+test("manifest rejects wildcard and actual default-branch exclusions", () => {
+  for (const exclusion of ["release*", "master", "~DEFAULT_BRANCH"]) {
+    const manifest = manifestFixture();
+    manifest.repositories[0].v2_ruleset.expected.conditions.ref_name.exclude = [
+      exclusion,
+    ];
+    assert.throws(
+      () => validateManifest(manifest),
+      /does not provably cover the repository default branch/u,
+      exclusion,
+    );
+  }
+});
+
+test("legacy bridge status requires a drained old producer inventory", () => {
+  const repo = manifestFixture().repositories[0];
+  for (const status of ["queued", "in_progress"]) {
+    assert.doesNotThrow(() =>
+      validateLegacyProducerRunPages([
+        { total_count: 0, workflow_runs: [] },
+      ], repo, status),
+    );
+    assert.throws(
+      () =>
+        validateLegacyProducerRunPages([
+          { total_count: 1, workflow_runs: [{ id: 90000000 }] },
+        ], repo, status),
+      new RegExp(`legacy-status writer still has ${status} runs`, "u"),
+    );
+  }
+  assert.throws(
+    () => validateLegacyProducerRunPages([], repo, "queued"),
+    /inventory is incomplete/u,
+  );
+});
+
+test("a queued old producer blocks bridge-status acceptance before activation writes", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    legacyProducerRuns: {
+      queued: [{ id: 90000001 }],
+      in_progress: [],
+    },
+  });
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  await assert.rejects(
+    runFakeCli(harness, "activate"),
+    /retained canonical producer still has queued runs/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("a capped retained producer run inventory fails closed before activation writes", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    legacyProducerRuns: {
+      queued: Array.from({ length: 1_000 }, (_value, index) => ({
+        id: 91000000 + index,
+      })),
+      in_progress: [],
+    },
+  });
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  await assert.rejects(
+    runFakeCli(harness, "activate"),
+    /queued retained canonical producer run inventory reaches GitHub's 1,000-result cap/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("a queued temporary legacy bridge blocks bridge-status acceptance before activation writes", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    legacyBridgeRuns: {
+      queued: [{ id: 90000002 }],
+      in_progress: [],
+    },
+  });
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  await assert.rejects(
+    runFakeCli(harness, "activate"),
+    /temporary legacy bridge still has queued runs/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("malformed or ambiguous canonical legacy bridge workflow inventory fails closed", async (t) => {
+  for (const inventory of ["malformed", "ambiguous"]) {
+    const harness = createFakeGhHarness(t, {
+      legacyBridgeWorkflowInventory: inventory,
+    });
+    writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+    writeFileSync(harness.v2StatePath, "disabled\n");
+    writeFileSync(harness.legacyStatePath, "before\n");
+    writeFileSync(harness.cleanupStatePath, "before\n");
+    await assert.rejects(
+      runFakeCli(harness, "activate"),
+      inventory === "malformed"
+        ? /Actions workflow inventory is incomplete/u
+        : /canonical legacy bridge must have exactly one Actions workflow identity/u,
+    );
+    assert.deepEqual(
+      mutationRequests(fakeGhRequests(harness.logPath)),
+      [],
+      `${inventory} Actions workflow inventory must fail before activation writes`,
     );
   }
 });

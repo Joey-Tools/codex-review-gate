@@ -169,11 +169,14 @@ permissions:
   actions: write
   checks: read
   contents: read
-  issues: write
-  pull-requests: read
+  pull-requests: write
 ```
 
-Neither workflow receives statuses/checks/content/PR write or OIDC authority.
+The controller uses its sole `pull-requests: write` permission for canonical
+request and diagnostic comments. The GitHub issue-comment endpoints accept that
+permission for a pull request; this controller never targets a standalone
+issue. Neither workflow receives issues/statuses/checks/content write or OIDC
+authority.
 There is no dedicated runtime GitHub App. The separate publisher App is never
 installed in a consumer repository.
 

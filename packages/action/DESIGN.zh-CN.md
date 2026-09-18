@@ -149,12 +149,13 @@ permissions:
   actions: write
   checks: read
   contents: read
-  issues: write
-  pull-requests: read
+  pull-requests: write
 ```
 
-两份 workflows 都没有 statuses/checks/content/PR write 或 OIDC authority，也没有专用
-runtime GitHub App。独立 publisher App 绝不安装到 consumer repository。
+controller 只使用 `pull-requests: write` 来写 canonical request 与 diagnostic comment。
+GitHub 的 issue-comment endpoint 对 PR 接受这项 permission；controller 从不面向独立
+issue。两份 workflows 都没有 issues/statuses/checks/content write 或 OIDC authority，也
+没有专用 runtime GitHub App。独立 publisher App 绝不安装到 consumer repository。
 
 ### Dispatch 与 Action inputs
 

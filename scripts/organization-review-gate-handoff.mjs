@@ -52,8 +52,8 @@ export const CANONICAL_WORKFLOW_IDENTITIES = Object.freeze({
   }),
   controller: Object.freeze({
     path: ".github/workflows/codex-review-gate-controller.yml",
-    git_blob_sha: "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-    sha256: "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f",
+    git_blob_sha: "c994a6861414e1efc1e7ab376470c7709d475ef1",
+    sha256: "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e",
   }),
   legacy_bridge: Object.freeze({
     path: ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -389,7 +389,7 @@ function assertV2RepositoryRulesetPolicy(ruleset, defaultBranch, label) {
     !isPlainObject(refName) ||
     !Array.isArray(refName.include) ||
     !Array.isArray(refName.exclude) ||
-    !rulesetCoversDefaultBranch(ruleset, defaultBranch)
+    !rulesetProvablyCoversDefaultBranch(ruleset, defaultBranch)
   ) {
     throw new Error(`${label} does not provably cover the repository default branch.`);
   }
@@ -425,6 +425,24 @@ function assertV2RepositoryRulesetPolicy(ruleset, defaultBranch, label) {
   if (ruleset.rules.filter((rule) => rule.type === "non_fast_forward").length !== 1) {
     throw new Error(`${label} must contain exactly one non_fast_forward rule.`);
   }
+}
+
+function rulesetProvablyCoversDefaultBranch(ruleset, defaultBranch) {
+  const exclude = ruleset.conditions?.ref_name?.exclude;
+  if (!Array.isArray(exclude)) return false;
+  // A wildcard exclusion is not a stable default-branch coverage assertion:
+  // a branch rename can make it effective without changing the ruleset. The
+  // handoff can retain exact exclusions for other known branches, but it must
+  // not admit a broad exclusion into a default-branch gate policy.
+  if (
+    exclude.some(
+      (pattern) =>
+        typeof pattern !== "string" || /[*?[]/u.test(pattern),
+    )
+  ) {
+    return false;
+  }
+  return rulesetCoversDefaultBranch(ruleset, defaultBranch);
 }
 
 function assertWorkflowDescriptor(value, label) {
@@ -1659,35 +1677,39 @@ function parseCheckRunApiUrl(value, repoSlug) {
   return id;
 }
 
-export function parseWorkflowRunPath(value, defaultBranch) {
-  if (value === CANONICAL_WORKFLOW_IDENTITIES.verifier.path) {
-    return {
-      workflow_path: value,
-      workflow_ref: null,
-    };
-  }
+export function parseWorkflowRunPath(value, defaultBranch = undefined) {
   if (typeof value !== "string") {
     throw new Error("Workflow run path must be a string.");
   }
-  const prefix = `${CANONICAL_WORKFLOW_IDENTITIES.verifier.path}@`;
-  if (!value.startsWith(prefix) || value.length === prefix.length) {
-    throw new Error("Workflow run path is not the canonical verifier path.");
+  const separator = value.lastIndexOf("@");
+  const workflowPath = separator === -1 ? value : value.slice(0, separator);
+  const workflowRef = separator === -1 ? null : value.slice(separator + 1);
+  try {
+    assertRepoRelativeWorkflowPath(workflowPath, "Workflow run path");
+  } catch {
+    throw new Error("Workflow run path is not a normalized workflow path.");
   }
-  const workflowRef = value.slice(prefix.length);
-  // GitHub returns a bare path for some runs and path@ref for others. The
-  // workflow ID, canonical default-branch tree, and canary's protected-file
-  // inventory bind the producer; accepting the documented optional suffix
-  // avoids assuming one undocumented ref spelling.
   if (
-    workflowRef.includes("\n") ||
-    workflowRef.includes("\r") ||
-    workflowRef.includes("\0") ||
+    (workflowRef !== null &&
+      (workflowRef === "" || /[\u0000-\u001f\u007f\s]/u.test(workflowRef))) ||
     (defaultBranch !== undefined && typeof defaultBranch !== "string")
   ) {
     throw new Error("Workflow run path has an invalid source ref.");
   }
+  // GitHub documents this field as ".github/workflows/foo.yml@ref". Keep
+  // accepting its historical bare-path form, but when it supplies a ref bind
+  // it to the manifest's default branch rather than merely recording it.
+  if (
+    defaultBranch !== undefined &&
+    (workflowPath !== CANONICAL_WORKFLOW_IDENTITIES.verifier.path ||
+      (workflowRef !== null &&
+        workflowRef !== defaultBranch &&
+        workflowRef !== `refs/heads/${defaultBranch}`))
+  ) {
+    throw new Error("Workflow run path is not bound to the canonical verifier source.");
+  }
   return {
-    workflow_path: CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+    workflow_path: workflowPath,
     workflow_ref: workflowRef,
   };
 }
@@ -1914,10 +1936,172 @@ export function validateLegacyStatusPages(pages, repo) {
   return projection;
 }
 
+export function validateLegacyProducerRunPages(
+  pages,
+  repo,
+  status,
+  writer = "legacy-status writer",
+) {
+  if (!new Set(["queued", "in_progress"]).has(status)) {
+    throw new Error("Legacy producer run inventory requested an unsupported status.");
+  }
+  if (
+    !Array.isArray(pages) ||
+    pages.length === 0 ||
+    pages.some(
+      (page) =>
+        !isPlainObject(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.workflow_runs),
+    )
+  ) {
+    throw new Error(`${repo.slug} ${status} legacy producer run inventory is incomplete.`);
+  }
+  if (pages.some((page, index) => index < pages.length - 1 && page.workflow_runs.length !== 100)) {
+    throw new Error(`${repo.slug} ${status} legacy producer run pagination has an incomplete non-final page.`);
+  }
+  if (pages[0].total_count >= 1_000) {
+    throw new Error(
+      `${repo.slug} ${status} ${writer} run inventory reaches GitHub's 1,000-result cap; it cannot prove this legacy-status writer is drained.`,
+    );
+  }
+  if (
+    pages.some((page) => page.total_count !== pages[0].total_count) ||
+    pages.flatMap((page) => page.workflow_runs).length !== pages[0].total_count
+  ) {
+    throw new Error(`${repo.slug} ${status} legacy producer run pagination is inconsistent.`);
+  }
+  const runIds = new Set();
+  for (const [index, run] of pages.flatMap((page) => page.workflow_runs).entries()) {
+    assertPositiveInteger(run?.id, `${repo.slug} ${status} legacy producer run ${index}.id`);
+    if (runIds.has(run.id)) {
+      throw new Error(`${repo.slug} ${status} legacy producer run pagination contains duplicate IDs.`);
+    }
+    runIds.add(run.id);
+  }
+  if (runIds.size !== 0) {
+    throw new Error(
+      `${repo.slug} ${writer} still has ${status} runs; bridge status cannot be accepted until every legacy-status writer drains.`,
+    );
+  }
+}
+
+function validateActionsWorkflowInventoryPages(pages, repo) {
+  if (
+    !Array.isArray(pages) ||
+    pages.length === 0 ||
+    pages.some(
+      (page) =>
+        !isPlainObject(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.workflows),
+    )
+  ) {
+    throw new Error(`${repo.slug} Actions workflow inventory is incomplete.`);
+  }
+  if (pages.some((page, index) => index < pages.length - 1 && page.workflows.length !== 100)) {
+    throw new Error(`${repo.slug} Actions workflow inventory has an incomplete non-final page.`);
+  }
+  const workflows = pages.flatMap((page) => page.workflows);
+  if (
+    pages.some((page) => page.total_count !== pages[0].total_count) ||
+    workflows.length !== pages[0].total_count
+  ) {
+    throw new Error(`${repo.slug} Actions workflow inventory is inconsistent.`);
+  }
+  for (const [index, workflow] of workflows.entries()) {
+    assertPositiveInteger(workflow?.id, `${repo.slug} Actions workflow ${index}.id`);
+    assertRepoRelativeWorkflowPath(
+      workflow?.path,
+      `${repo.slug} Actions workflow ${index}.path`,
+    );
+    assertNonEmptyString(workflow?.state, `${repo.slug} Actions workflow ${index}.state`);
+  }
+  return workflows;
+}
+
+async function loadActiveCanonicalWorkflowById(repo, workflowId, expectedPath, label) {
+  const workflow = await ghJson(
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}`,
+  );
+  if (
+    workflow?.id !== workflowId ||
+    workflow?.path !== expectedPath ||
+    workflow?.state !== "active"
+  ) {
+    throw new Error(
+      `${repo.slug} ${label} is not bound to one active canonical Actions workflow identity.`,
+    );
+  }
+  return workflowId;
+}
+
+async function loadActiveCanonicalLegacyBridgeWorkflowId(repo) {
+  const pages = await ghJson(
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows?per_page=100`,
+    { paginate: true },
+  );
+  const workflows = validateActionsWorkflowInventoryPages(pages, repo);
+  const matches = workflows.filter(
+    (workflow) => workflow.path === CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      `${repo.slug} canonical legacy bridge must have exactly one Actions workflow identity in the complete inventory.`,
+    );
+  }
+  const [bridge] = matches;
+  if (bridge.state !== "active") {
+    throw new Error(`${repo.slug} canonical legacy bridge Actions workflow is not active.`);
+  }
+  return loadActiveCanonicalWorkflowById(
+    repo,
+    bridge.id,
+    CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
+    "canonical legacy bridge",
+  );
+}
+
+async function assertLegacyProducerDrained(repo) {
+  // The verifier retained the old producer's Actions workflow ID by replacing
+  // .github/workflows/codex-review-gate.yml in place. The temporary bridge is
+  // a second, independently identified legacy-status writer and shares its
+  // concurrency key. Bind both live identities and drain both inventories so
+  // neither writer can race the compatibility status snapshot or readback.
+  const [producerWorkflowId, bridgeWorkflowId] = await Promise.all([
+    loadActiveCanonicalWorkflowById(
+      repo,
+      repo.canary.v2_workflow_id,
+      CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+      "retained canonical producer",
+    ),
+    loadActiveCanonicalLegacyBridgeWorkflowId(repo),
+  ]);
+  await Promise.all(
+    [
+      [producerWorkflowId, "retained canonical producer"],
+      [bridgeWorkflowId, "temporary legacy bridge"],
+    ].flatMap(([workflowId, writer]) =>
+      ["queued", "in_progress"].map(async (status) => {
+        const pages = await ghJson(
+          `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?status=${status}&per_page=100`,
+          { paginate: true },
+        );
+        validateLegacyProducerRunPages(pages, repo, status, writer);
+      }),
+    ),
+  );
+}
+
 async function loadLegacyStatusEvidence(repo) {
   const endpoint = `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/statuses?per_page=100`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const pages = await ghJson(endpoint, { paginate: true });
+    const [pages] = await Promise.all([
+      ghJson(endpoint, { paginate: true }),
+      assertLegacyProducerDrained(repo),
+    ]);
     const projection = validateLegacyStatusPages(pages, repo);
     const firstPage = await ghJson(`${endpoint}&page=1`);
     if (
@@ -1925,6 +2109,7 @@ async function loadLegacyStatusEvidence(repo) {
       Array.isArray(pages[0]) &&
       canonicalJson(firstPage) === canonicalJson(pages[0])
     ) {
+      await assertLegacyProducerDrained(repo);
       return projection;
     }
   }
@@ -2096,9 +2281,13 @@ async function loadEffectiveBranchRules(repo) {
   );
   if (
     !Array.isArray(response) ||
+    response.length === 0 ||
     response.some((page) => !Array.isArray(page))
   ) {
     throw new Error(`${repo.slug} effective branch-rule inventory is malformed.`);
+  }
+  if (response.some((page, index) => index < response.length - 1 && page.length !== 100)) {
+    throw new Error(`${repo.slug} effective branch-rule pagination has an incomplete non-final page.`);
   }
   return response
     .flat()
@@ -2258,6 +2447,16 @@ async function loadRepositoryEvidence(
   const defaultBranchPromise = loadDefaultBranchHead(repo, {
     requireCanaryBase: requireCanaryEvidence,
   });
+  const [metadata, defaultBranch] = await Promise.all([
+    metadataPromise,
+    defaultBranchPromise,
+  ]);
+  // The default-branch tree binds the canonical bridge bytes before the live
+  // Actions inventory resolves its mutable workflow ID for status-writer drain.
+  const workflowControlPlane = await loadWorkflowInventoryEvidence(
+    repo,
+    defaultBranch.head_sha,
+  );
   const canaryEvidencePromise = requireCanaryEvidence
     ? Promise.allSettled([
         loadCanaryPull(repo),
@@ -2269,13 +2468,8 @@ async function loadRepositoryEvidence(
         return results.map((result) => result.value);
       })
     : Promise.resolve(null);
-  const [metadata, defaultBranch, canaryEvidence] = await Promise.all([
-    metadataPromise,
-    defaultBranchPromise,
-    canaryEvidencePromise,
-  ]);
+  const canaryEvidence = await canaryEvidencePromise;
   const [
-    workflowControlPlane,
     v2Ruleset,
     codeowners,
     actionsWorkflowPermissions,
@@ -2283,7 +2477,6 @@ async function loadRepositoryEvidence(
     classicStatus,
     effectiveBranchRules,
   ] = await Promise.all([
-    loadWorkflowInventoryEvidence(repo, defaultBranch.head_sha),
     loadRepositoryRuleset(repo),
     loadCodeownersEvidence(repo, defaultBranch.head_sha),
     loadActionsWorkflowPermissions(repo),

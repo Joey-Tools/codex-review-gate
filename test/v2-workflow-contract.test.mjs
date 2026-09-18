@@ -243,7 +243,7 @@ test("canonical verifier is read-only, latest-wins, and uses the direct Action",
 test("canonical controller has only the adopted write authority and ledgerless inputs", () => {
   assert.match(
     templateController,
-    /^permissions:\n  actions: write\n  checks: read\n  contents: read\n  issues: write\n  pull-requests: read$/mu,
+    /^permissions:\n  actions: write\n  checks: read\n  contents: read\n  pull-requests: write$/mu,
   );
   assert.match(
     templateController,
@@ -263,7 +263,7 @@ test("canonical controller has only the adopted write authority and ledgerless i
   );
   assert.doesNotMatch(
     templateController,
-    /actions\/checkout|\.\/\.github\/workflows|secrets:\s*inherit|checks: write|contents: write|pull-requests: write|statuses:|id-token:/u,
+    /actions\/checkout|\.\/\.github\/workflows|secrets:\s*inherit|checks: write|contents: write|issues: write|statuses:|id-token:/u,
   );
   assert.match(
     templateController,

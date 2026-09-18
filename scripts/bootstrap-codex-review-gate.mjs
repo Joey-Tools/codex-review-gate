@@ -2657,13 +2657,14 @@ async function loadAndBindOrganizationFinalClosureProof({
       `Git origin repository ${origin.repository.slug} is not a member of the organization final closure receipt.`,
     );
   }
-  return {
+  const proof = {
     receiptPath,
     sha256: computedSha256,
     organization: validated.receipt.organization,
     repository,
     originRepository: origin.repository,
   };
+  return proof;
 }
 
 async function loadGitHubOriginRepository(targetRoot) {
@@ -2838,6 +2839,19 @@ async function prepareConsumerWorktree({
     ],
   });
   await revalidateDirectoryChain(parentWitnesses, "after local workflow inspection");
+  // Admission follows the fail-closed local workflow/object inspection so a
+  // drifted or displaced bridge receives its local diagnostic without an
+  // unrelated remote API dependency. It still precedes every mutation and
+  // binds the receipt to the current GitHub object, not merely to a reusable
+  // OWNER/REPO path: a repository can be deleted and recreated with the same
+  // slug between the organization handoff and this local cutover.
+  if (finalClosureProof !== null) {
+    await assertOrganizationFinalClosureBindingStable(
+      targetRoot,
+      finalClosureProof,
+      "final closure receipt admission",
+    );
+  }
 
   const verifierChanged =
     currentVerifierWorkflow !== canonicalWorkflows.verifier;
@@ -3036,9 +3050,8 @@ async function prepareConsumerWorktree({
   };
   const beforeFinalLegacyBridgeQuarantineRename = async () => {
     if (finalClosureProof !== null) {
-      const current = await loadGitHubOriginRepository(targetRoot);
-      assertOrganizationFinalClosureOriginMatchesProof(
-        current,
+      await assertOrganizationFinalClosureBindingStable(
+        targetRoot,
         finalClosureProof,
         "immediately before legacy bridge quarantine rename",
       );
@@ -3339,6 +3352,19 @@ async function removePreparedConsumerFile({
     );
     await assertConsumerFileContentStable(path, expectedContent, label);
     await beforeFinalQuarantineRename();
+    // The authorization check above can perform remote I/O. Rebind the local
+    // object after it returns; inode/content (rather than incidental stat
+    // fields) are the protected local property immediately before rename.
+    await revalidateDirectoryChain(
+      parentWitnesses,
+      `after final ${label} quarantine authorization revalidation`,
+    );
+    await assertConsumerFileIdentityStable(
+      admittedIdentity,
+      path,
+      `after final ${label} quarantine authorization revalidation`,
+    );
+    await assertConsumerFileContentStable(path, expectedContent, label);
     await rename(path, quarantinePath);
     renameCompleted = true;
 
@@ -3362,7 +3388,24 @@ async function removePreparedConsumerFile({
     );
     quarantineVerified = true;
 
+    await revalidateDirectoryWitness(
+      quarantineDirectoryWitness,
+      `before ${label} quarantine authorization revalidation`,
+    );
+    await assertConsumerFileIdentityStable(
+      admittedIdentity,
+      quarantinePath,
+      `before ${label} quarantine authorization revalidation`,
+    );
+    await assertConsumerFileContentStable(
+      quarantinePath,
+      expectedContent,
+      `${label} quarantine`,
+    );
     try {
+      // Recheck remote target identity only after the quarantined object's
+      // identity/content have been observed. The post-I/O local check below
+      // then detects a concurrent local replacement before unlink.
       await beforeQuarantineUnlink();
     } catch (authorizationError) {
       restorationAttempted = true;

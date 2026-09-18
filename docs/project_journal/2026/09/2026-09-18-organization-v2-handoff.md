@@ -108,9 +108,12 @@ the global cutover is closed.
 ## Current State
 
 - Source tooling implements the temporary bridge, cohort handoff transaction,
-  receipt-bound bridge removal, and their operator-facing guides.
-- No organization ruleset, repository ruleset, or consumer default branch has
-  been mutated by this workstream yet.
+  receipt-bound bridge removal, and their operator-facing guides. A follow-up
+  source patch is under review to correct the controller's minimal permission
+  set and harden the handoff/bridge proof boundaries.
+- Nine consumer default branches have migrated to the canonical v2 verifier,
+  controller, CODEOWNERS coverage, and temporary v1 bridge. No organization
+  ruleset or required-status policy has been mutated by this workstream yet.
 - Read-only inventory confirms that all 11 members inherit old organization
   rule `16590367`; nine additionally retain a repository-level legacy
   `codex/review-gate` requirement. The other two compatibility/history cases
@@ -125,29 +128,44 @@ the global cutover is closed.
 
 ### Execution Update — 2026-09-18
 
-- Ten bridge-preserving migration PRs are open. They install the canonical v2
-  verifier/controller, the managed CODEOWNERS block, and the canonical legacy
-  bridge without changing any required-status policy:
-  - `codex-apple-notes-toolkit#6` at
-    `5eb0b475d85b0f1cb99c2cc84fffb8c3fd3c004a`;
-  - `codex-debug-triage#9` at
-    `86944e7efbe31eeb21f15eb49485a233e656a253`;
-  - `codex-personal-sync#22` at
-    `472679a49b6b8d7d6d5be3eb8ea4e17e69a6474c`;
-  - `codex-project-journal#7` at
-    `e3db9a1b23077df90b6ad9edbed42b7fb2b083f7`;
-  - `codex-review-workflows#115` at
-    `3925e7ae47864ef87696cc73687c213691a0bc4d`;
-  - `codex-rollout-backup#8` at
-    `546df566f05aa36c78220d431a5e7280fe9f955a`;
-  - `codex-session-retrospective-history#7` at
-    `3bd7c6c42b45c8e6434cfd51de4beb9281d35325`;
-  - `codex-toolbox#33` at
-    `ee8ffaa6c5015316925ffb64ec33cbdac423bee8`;
-  - `codex-workflow-hygiene#77` at
-    `518185db0b5577733c9555638d29f04104f9aea4`; and
-  - `codex-private-workflows#193` at
-    `8e80ea15e1cc9a5d61e32f5a024bbc9c5b1ea5f2`.
+- Nine bridge-preserving migration PRs have merged. They install the canonical
+  v2 verifier/controller, the managed CODEOWNERS block, and the canonical
+  legacy bridge without changing any required-status policy:
+  - `codex-private-workflows#193` at `ce5e5c878fa7d1dca184ab4ad1ae3ddc9007d466`;
+  - `codex-apple-notes-toolkit#6` at `ecef723883234044a88347ba4caf8a38e322aeb0`;
+  - `codex-personal-sync#22` at `7ebca9cb392b2621ff3cd487b21e744953b3afd0`;
+  - `codex-rollout-backup#8` at `1233a535ec36cdc00b7dcd6f249a60be1383f91c`;
+  - `codex-debug-triage#9` at `d3c610fcc39ce90d190f6e510f417aa68c01bd91`;
+  - `codex-project-journal#7` at `58216c543a50051c16e01f9017a7cb65a7a64de3`;
+  - `codex-toolbox#33` at `a8df72542fa89411f8aa75687cdb90eb979b8e01`;
+  - `codex-workflow-hygiene#77` at `feb9bc110a7f3e077a89c50b15c89265a38e333c`; and
+  - `codex-review-workflows#115` at `0be747dff940b36bd7b61712e435c6105a718555`.
+- The corresponding Private Overlay Release completed successfully in run
+  `35378848456`. `codex-waited-delivery` remains blocked on its missing
+  workspace mirror, and `codex-session-retrospective-history#7` remains
+  intentionally unmerged because it has no legacy v1 producer to prove the
+  required dual-protection boundary.
+- Eight harmless, unmerged canary PRs were created for the merged public
+  consumers. Their default-branch `begin-review` controller dispatches all
+  failed at the same marker-comment POST: `403 Resource not accessible by
+  integration`, despite the runner reporting `issues: write` and
+  `pull-requests: read`. The observed failure alone does not prove which
+  permission boundary caused it.
+- The pending source patch applies the documented alternative as a strictly
+  narrower PR-only authority: it removes `issues: write` and changes
+  `pull-requests: read` to `pull-requests: write`. The controller targets only
+  pull-request conversation comments, for which GitHub accepts that write
+  permission. Repository Actions default permission remains `read`, and
+  `can_approve_pull_request_reviews` remains `false`. No new Action package
+  release is needed because this is a copied consumer-workflow template change,
+  not an `@v2` runtime change. The patch also rebinds bridge removal to the
+  live repository identity at each destructive boundary and strengthens the
+  cohort helper's workflow/ref, effective-rule pagination, and manifest
+  identity checks. Its legacy-status admission now resolves the active
+  canonical temporary bridge workflow identity from a complete Actions workflow
+  inventory, then drains both that independent writer and the retained old
+  producer workflow before and after the commit-status pagination horizon
+  readback.
 - An installation PR is an intentional manual trust bootstrap. Its new
   controller exists only on the PR head, while `issue_comment` and
   `workflow_dispatch` consume the default-branch workflow. The initial v2
@@ -157,8 +175,8 @@ the global cutover is closed.
   activation.
 - The writable controller intentionally excludes `pull_request_review` and
   `pull_request_review_comment`. GitHub binds both event families to the PR
-  merge ref; a controller carrying `actions: write` and `issues: write` must
-  remain a protected-default-branch workflow. Review- or reaction-only
+  merge ref; a controller carrying `actions: write` and `pull-requests: write`
+  must remain a protected-default-branch workflow. Review- or reaction-only
   provider evidence is instead consumed by the typed default-branch manual
   `reconcile` path. This preserves the single-producer and pre-runner trust
   boundary without adding a runtime App, status writer, or cron.
@@ -283,13 +301,16 @@ the global cutover is closed.
 
 ## Next Steps
 
-1. After the source change lands, create the 11 migration PRs and stage the
-   new organization v2 rule without removing v1.
-2. Collect each exact canary proof, activate v2 organization protection, remove
-   the bound repository-level legacy contexts, and perform the one old-rule
-   v1-status removal with double-read verification.
-3. Capture and validate the separate final read-only closure receipt, then use
-   that repository-bound proof in each bridge-removal PR.
+1. Merge the source permission/hardening patch, then use reviewed control-plane
+   PRs to update the nine merged consumers' copied controller bytes and retry
+   their existing exact-head canaries through `begin-review`.
+2. Resolve the two remaining cohort blockers: restore the
+   `codex-waited-delivery` workspace mirror through the user-run workspace
+   initialization path, and select an explicitly authorized one-time v1 proof
+   path for `codex-session-retrospective-history`.
+3. Only after all eleven members have current dual-protection canary proof,
+   stage/activate the organization v2 rule, execute the receipt-bound cleanup,
+   and remove the temporary bridges in separate PRs.
 
 ## Evidence
 
@@ -299,5 +320,7 @@ the global cutover is closed.
 - Prior v2 decisions and implementation ledger:
   `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`.
 - Current delivery validation: `npm run test:organization-handoff` passed
-  218/218. Documentation `git diff --check` and project-journal validation
-  passed after this boundary update.
+  224/224; `node --test test/v2-workflow-contract.test.mjs` passed 8/8; and
+  `node --test test/workflow-security-contract.test.mjs` passed 41/41.
+  `git diff --check` passed. Project-journal validation is run again after this
+  checkpoint is updated.

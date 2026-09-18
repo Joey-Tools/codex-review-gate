@@ -54,8 +54,9 @@ uses: JoeyTeng/codex-review-gate-action@v2
 - API-only job 默认使用 `ubuntu-slim`；仅当该 runner 不可用时，repository Actions
   variable `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` 才选择 `ubuntu-latest`；
 - verifier 只有 evidence read permissions；controller 才有创建 request 与 rerun exact
-  verifier 所需的窄 `issues: write` 与 `actions: write`。两者都没有
-  `statuses: write` 或 `checks: write`。
+  verifier 所需的窄 `pull-requests: write` 与 `actions: write`。它只面向 PR conversation
+  comment；GitHub 的 issue-comment REST endpoint 对该目标接受 pull-request write。两者都
+  没有 `issues: write`、`statuses: write`、`checks: write` 或 `contents: write`。
 
 默认情况下，普通用户发出的 `@codex review` 只有在 author 当前拥有 `write`、
 `maintain` 或 `admin` 权限时，才能建立新的 review generation。若仓库明确接受任意

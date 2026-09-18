@@ -66,8 +66,11 @@ boundaries that an Action step cannot define:
   `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` selects the sole supported
   fallback, `ubuntu-latest`;
 - the verifier has read-only evidence permissions; the controller alone has
-  narrow `issues: write` and `actions: write` authority for requests and exact
-  verifier reruns. Neither workflow has `statuses: write` or `checks: write`.
+  narrow `pull-requests: write` and `actions: write` authority for requests
+  and exact verifier reruns. It targets only PR conversation comments, for
+  which GitHub accepts pull-request write authority through the issue-comment
+  REST endpoints. Neither workflow has `issues: write`, `statuses: write`,
+  `checks: write`, or `contents: write`.
 
 By default, an ordinary human-authored `@codex review` request establishes a
 new review generation only when its author currently has `write`, `maintain`,

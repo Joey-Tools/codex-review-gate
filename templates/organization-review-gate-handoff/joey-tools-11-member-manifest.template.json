@@ -75,8 +75,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -244,8 +244,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -413,8 +413,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -582,8 +582,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -672,8 +672,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -841,8 +841,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -1010,8 +1010,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -1179,8 +1179,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -1348,8 +1348,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -1517,8 +1517,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
@@ -1686,8 +1686,8 @@
         },
         "controller": {
           "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "bc6827bdfb94a36b177ecaaa1bab5facd9a71fde",
-          "sha256": "1a6e6ea700874632c0e7413fe60418ce5772a404df5f5acdaf070eb528067a7f"
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
         },
         "legacy_bridge": {
           "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
