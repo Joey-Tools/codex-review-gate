@@ -919,19 +919,81 @@ status IDs, and record every pre-POST status ID plus the current first
 reverse-chronological exact-context `codex/review-gate` status. This is the
 final pre-POST recovery binding-set read.
 
-Re-run that exact pre-existing bridge run, never a different v1 workflow:
+Re-run that exact pre-existing bridge run, never a different v1 workflow.
+Before the write, set `LEGACY_RERUN_RECEIPT` to an operator-retained,
+transaction-specific path that does not exist. Keep that exact path; never
+select a new path to retry the mutation. The no-clobber response-file creation prevents
+this block from silently overwriting an earlier receipt:
 
 ```bash
-gh api --hostname github.com \
-  --method POST \
-  "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun"
+: "${LEGACY_RERUN_RECEIPT:?set an operator-retained recovery receipt path}"
+if test ! -e "$LEGACY_RERUN_RECEIPT"; then
+  :
+else
+  printf 'recovery receipt already exists; do not submit the POST: %s\n' \
+    "$LEGACY_RERUN_RECEIPT" >&2
+  exit 1
+fi
+if (
+  umask 077
+  set -C
+  gh api --hostname github.com \
+    --include \
+    --header "X-GitHub-Api-Version: 2026-03-10" \
+    --method POST \
+    "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun" \
+    > "$LEGACY_RERUN_RECEIPT"
+); then
+  LEGACY_RERUN_GH_EXIT=0
+else
+  LEGACY_RERUN_GH_EXIT=$?
+fi
+
+LEGACY_RERUN_HTTP_VERSION=
+LEGACY_RERUN_HTTP_STATUS=
+if IFS=$' \t\r' read -r LEGACY_RERUN_HTTP_VERSION LEGACY_RERUN_HTTP_STATUS _ \
+  < "$LEGACY_RERUN_RECEIPT"; then
+  :
+else
+  printf 'rerun POST response is inconclusive; retain %s and do not replay\n' \
+    "$LEGACY_RERUN_RECEIPT" >&2
+  exit 1
+fi
+case "$LEGACY_RERUN_HTTP_VERSION" in
+  HTTP/1.1|HTTP/2|HTTP/2.0|HTTP/3|HTTP/3.0) ;;
+  *)
+    printf 'rerun POST status line is inconclusive; retain %s and do not replay\n' \
+      "$LEGACY_RERUN_RECEIPT" >&2
+    exit 1
+    ;;
+esac
+if test "$LEGACY_RERUN_GH_EXIT" -ne 0; then
+  printf 'rerun POST did not prove HTTP 201; retain %s and do not replay\n' \
+    "$LEGACY_RERUN_RECEIPT" >&2
+  exit 1
+fi
+if test "$LEGACY_RERUN_HTTP_STATUS" = 201; then
+  :
+else
+  printf 'rerun POST did not prove HTTP 201; retain %s and do not replay\n' \
+    "$LEGACY_RERUN_RECEIPT" >&2
+  exit 1
+fi
+printf 'recovery receipt retained at %s (HTTP %s)\n' \
+  "$LEGACY_RERUN_RECEIPT" "$LEGACY_RERUN_HTTP_STATUS"
 ```
 
 GitHub re-runs preserve the original run's `GITHUB_SHA` and `GITHUB_REF`; that
 is why the selected run must bind the exact feature head and its embedded PR
 entry must separately bind the current default-branch repository/ref/SHA.
-Submit the POST once. An HTTP or transport result that does not prove the
-documented `201` response is inconclusive; do not replay it.
+`--include` puts the HTTP status line first in the retained response, and the
+fixed API-version header prevents API-version negotiation from changing this
+request. The parser accepts the status tokens emitted for HTTP/1.1, HTTP/2,
+and HTTP/3, extracts the second field, and requires exactly `201`. Retain even
+a partial or empty receipt as evidence of an inconclusive attempt; it can never
+prove success. A nonzero `gh` exit, missing or malformed first line, non-`201`
+status, or any other transport uncertainty is inconclusive: preserve the
+receipt and never submit the POST again. Submit the POST once.
 
 After the POST, poll the exact run ID to a terminal state, then revalidate the
 same recovery binding set, including the stable full run enumeration. Require

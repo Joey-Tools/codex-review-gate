@@ -182,10 +182,12 @@ the global cutover is closed.
   a pagination cap, or a changed page-1 horizon are inconclusive. Exactly one
   eligible run may be rerun; more than one stops, while only cardinality zero
   permits draft-to-ready before selection restarts. The same recovery binding
-  set is revalidated immediately before and after the one POST. Success requires
-  exactly the next run attempt and a new current-head `codex/review-gate=success`
-  status ID from `github-actions[bot]`, not an older success. This recovery never
-  adds a writable review event or `workflow_dispatch`.
+  set is revalidated immediately before and after the one POST. That sole POST
+  must preserve an explicit HTTP `201` receipt; a transport result or response
+  that cannot prove `201` is inconclusive and must not be replayed. Success
+  requires exactly the next run attempt and a new current-head
+  `codex/review-gate=success` status ID from `github-actions[bot]`, not an older
+  success. This recovery never adds a writable review event or `workflow_dispatch`.
 - Before an organization v2 rule is activated, every pre-existing open PR
   must also have a fresh verifier on its current head/base/test-merge scope.
   A new push, reopen, or documented draft-to-ready transition creates that

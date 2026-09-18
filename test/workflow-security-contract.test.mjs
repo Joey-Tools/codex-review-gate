@@ -490,28 +490,165 @@ test("cohort guides bind v1 bridge recovery separately from v2 reconcile", () =>
       guide,
       "### Dual-protection legacy-status recovery",
     );
-    assert.match(
-      recovery,
-      /actions\/runs\/\$LEGACY_RUN_ID\/rerun/u,
-      `${name}: missing exact legacy bridge rerun endpoint`,
+    const rerunEndpoint = "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun";
+    assert.equal(
+      (recovery.match(
+        /repos\/\$REPO\/actions\/runs\/\$LEGACY_RUN_ID\/rerun/gu,
+      ) ?? []).length,
+      1,
+      `${name}: require exactly one exact legacy bridge rerun endpoint`,
+    );
+    const recoveryGhInvocations = executableGhInvocations(recovery);
+    const rerunInvocations = recoveryGhInvocations.filter(
+      ({ words }) => words.includes(rerunEndpoint),
+    );
+    assert.equal(
+      rerunInvocations.length,
+      1,
+      `${name}: require exactly one executable legacy bridge rerun request`,
+    );
+    const [rerunInvocation] = rerunInvocations;
+    assert.equal(rerunInvocation.command, "api", name);
+    const postInvocations = recoveryGhInvocations.filter(({ words }) =>
+      words.some(
+        (word, index) =>
+          ((word === "--method" || word === "-X") &&
+            words[index + 1] === "POST") ||
+          word === "--method=POST" ||
+          word === "-XPOST",
+      ),
+    );
+    assert.equal(
+      postInvocations.length,
+      1,
+      `${name}: recovery contains one executable POST in total`,
+    );
+    assert.equal(postInvocations[0].text, rerunInvocation.text, name);
+    assert.equal(
+      rerunInvocation.words.filter((word) => word === "--method").length,
+      1,
+      `${name}: rerun request has one explicit method`,
+    );
+    assert.equal(
+      rerunInvocation.words[
+        rerunInvocation.words.indexOf("--method") + 1
+      ],
+      "POST",
+      `${name}: rerun request is the sole POST to the exact endpoint`,
+    );
+    assert.equal(
+      rerunInvocation.words.filter((word) => word === "--include").length,
+      1,
+      `${name}: capture the rerun HTTP response headers`,
+    );
+    const apiVersionHeaderIndices = rerunInvocation.words.flatMap(
+      (word, index) =>
+        word === "--header" &&
+        rerunInvocation.words[index + 1] ===
+          "X-GitHub-Api-Version: 2026-03-10"
+          ? [index]
+          : [],
+    );
+    assert.equal(
+      apiVersionHeaderIndices.length,
+      1,
+      `${name}: pin the rerun request to one literal GitHub API version`,
     );
     assert.match(
       recovery,
+      /test\s+!\s+-e\s+"\$LEGACY_RERUN_RECEIPT"/u,
+      `${name}: refuse to overwrite an existing rerun receipt`,
+    );
+    assert.match(
+      recovery,
+      /repos\/\$REPO\/actions\/runs\/\$LEGACY_RUN_ID\/rerun"?[\s\\]*>[\s\\]*"\$LEGACY_RERUN_RECEIPT"/u,
+      `${name}: capture the unique POST response as the rerun receipt`,
+    );
+    assert.match(
+      recovery,
+      /read\s+-r[\s\\]+LEGACY_RERUN_HTTP_VERSION\s+LEGACY_RERUN_HTTP_STATUS[\s\S]{0,120}<\s*"\$LEGACY_RERUN_RECEIPT"/u,
+      `${name}: parse the captured HTTP receipt`,
+    );
+    assert.match(
+      recovery,
+      /case\s+"\$LEGACY_RERUN_HTTP_VERSION"[\s\S]{0,160}HTTP\/1\.1[\s\S]{0,80}HTTP\/2[\s\S]{0,80}HTTP\/3/u,
+      `${name}: validate the captured HTTP status-line version token`,
+    );
+    assert.match(
+      recovery,
+      /test\s+"\$LEGACY_RERUN_GH_EXIT"\s+-ne\s+0/u,
+      `${name}: a nonzero gh exit leaves the rerun outcome inconclusive`,
+    );
+    assert.match(
+      recovery,
+      /test\s+"\$LEGACY_RERUN_HTTP_STATUS"\s+=\s+"?201"?/u,
+      `${name}: accept only a captured HTTP 201 receipt`,
+    );
+    assert.match(
+      recovery,
+      /(?:Submit the POST once|POST[^。；\n]{0,30}(?:只能|仅能)[^。；\n]{0,20}(?:一次|1 次))/iu,
+      `${name}: submit the rerun POST once`,
+    );
+    assert.match(
+      recovery,
+      /(?:do not|never|不得|禁止)[^。\n]{0,50}(?:replay|再次提交|第二次 POST)/iu,
+      `${name}: never replay an unconfirmed rerun POST`,
+    );
+    const runInventoryStart = recovery.indexOf(
+      "actions/workflows/$LEGACY_WORKFLOW_ID/runs",
+    );
+    const eligibilityStart = recovery.indexOf("created_at", runInventoryStart);
+    assert.ok(runInventoryStart >= 0, `${name}: workflow-run inventory endpoint`);
+    assert.ok(
+      eligibilityStart > runInventoryStart,
+      `${name}: workflow-run inventory precedes candidate eligibility`,
+    );
+    const runInventoryContract = recovery.slice(
+      runInventoryStart,
+      eligibilityStart,
+    );
+    assert.match(
+      runInventoryContract,
       /(?:complete paginated|完整分页) workflow-run inventory/iu,
       `${name}: enumerate the complete paginated workflow-run inventory`,
     );
     assert.match(
-      recovery,
-      /(?:(?:Reject|拒绝)[\s\S]{0,100}duplicate\s+run ID across pages|跨页重复 run ID[\s\S]{0,100}(?:不能证明空集合|inconclusive|拒绝))/iu,
+      runInventoryContract,
+      /(?:same[^.。\n]{0,80}total_count|total_count[^.。\n]{0,80}(?:same|相同))/iu,
+      `${name}: every workflow-run page has the same total_count`,
+    );
+    assert.match(
+      runInventoryContract,
+      /(?:non-final page|非末页)[^.。\n]{0,80}(?:full|100|满)/iu,
+      `${name}: every non-final workflow-run page is full`,
+    );
+    assert.match(
+      runInventoryContract,
+      /flatten(?:ed)?[\s\S]{0,80}(?:equals?|等于)[\s\S]{0,30}total_count/iu,
+      `${name}: flattened workflow-run count equals total_count`,
+    );
+    assert.match(
+      runInventoryContract,
+      /1,?000-result[\s\S]{0,120}(?:ceiling|cap)[\s\S]{0,160}(?:inconclusive|empty set|空集合|不能证明)/iu,
+      `${name}: the filtered-search 1000-result cap fails closed`,
+    );
+    assert.match(
+      runInventoryContract,
+      /(?:duplicate\s+run ID across pages|跨页重复 run ID)/iu,
       `${name}: duplicate run IDs fail closed`,
     );
     assert.match(
-      recovery,
-      /(?:immediately|立即)[\s\S]{0,120}(?:reread|重读|复读)[\s\S]{0,80}(?:page[ -]?1|第一页)[\s\S]{0,220}pagination horizon/iu,
-      `${name}: re-read the workflow-run horizon page`,
+      runInventoryContract,
+      /(?:(?:reread|重读|复读)[\s\S]{0,80}(?:page[ -]?1|第一页)[\s\S]{0,140}(?:identical query|完全相同的 query)|(?:identical query|完全相同的 query)[\s\S]{0,80}(?:reread|重读|复读)[\s\S]{0,80}(?:page[ -]?1|第一页))/iu,
+      `${name}: re-read workflow-run page 1 with the identical query`,
     );
     assert.match(
-      recovery,
+      runInventoryContract,
+      /canonical\s+JSON[\s\S]{0,100}total_count[\s\S]{0,80}(?:ordered runs|有序 runs)/iu,
+      `${name}: bind the workflow-run horizon to total_count and ordered runs`,
+    );
+    assert.match(
+      runInventoryContract,
       /pagination horizon[\s\S]{0,100}(?:invalidates|restart|无效|重新开始)/iu,
       `${name}: reject a changed workflow-run pagination horizon`,
     );
@@ -557,10 +694,26 @@ test("cohort guides bind v1 bridge recovery separately from v2 reconcile", () =>
       /actions\/workflows\/\$LEGACY_WORKFLOW_ID[\s\S]{0,200}state=active/iu,
       `${name}: bind the active current legacy-bridge workflow identity`,
     );
+    const bridgeContentsStart = recovery.indexOf(
+      "contents/.github/workflows/codex-review-gate-legacy-bridge.yml",
+    );
+    assert.ok(
+      bridgeContentsStart >= 0 && bridgeContentsStart < runInventoryStart,
+      `${name}: canonical bridge content read precedes run enumeration`,
+    );
+    const bridgeComparison = recovery.slice(
+      bridgeContentsStart,
+      runInventoryStart,
+    );
     assert.match(
-      recovery,
-      /contents\/[\s\S]{0,160}ref=\$DEFAULT_BRANCH_HEAD_SHA[\s\S]{0,240}(?:bytes exactly|逐 byte)/iu,
+      bridgeComparison,
+      /ref=\$DEFAULT_BRANCH_HEAD_SHA[\s\S]{0,360}(?:bytes exactly|逐 byte)/iu,
       `${name}: bind canonical bridge bytes at the current base SHA`,
+    );
+    assert.match(
+      bridgeComparison,
+      /\$SOURCE_ROOT\/templates\/codex-gated-repo\/\.github\/workflows\/codex-review-gate-legacy-bridge\.yml/u,
+      `${name}: compare against the exact canonical SOURCE_ROOT bridge template`,
     );
 
     assert.match(
@@ -624,20 +777,54 @@ test("cohort guides bind v1 bridge recovery separately from v2 reconcile", () =>
       /(?:run_attempt[\s\S]{0,80}(?:exactly|恰好)[\s\S]{0,60}LEGACY_RUN_ATTEMPT \+ 1|LEGACY_RUN_ATTEMPT \+ 1[\s\S]{0,80}run_attempt)/iu,
       `${name}: require exactly one new rerun attempt`,
     );
+    const postRerun = recovery.slice(postPostEnd);
+    const postStatusStart = postRerun.indexOf(
+      "commits/$CANARY_HEAD/statuses?per_page=100",
+    );
+    const postStatusEnd = postRerun.indexOf("draft", postStatusStart);
+    assert.ok(postStatusStart >= 0, `${name}: post-rerun status endpoint`);
+    assert.ok(
+      postStatusEnd > postStatusStart,
+      `${name}: post-rerun status proof precedes the draft fallback`,
+    );
+    const postStatusContract = postRerun.slice(
+      postStatusStart,
+      postStatusEnd,
+    );
     assert.match(
-      recovery,
-      /commits\/\$CANARY_HEAD\/statuses\?per_page=100[\s\S]{0,420}codex\/review-gate[\s\S]{0,220}state=success/iu,
+      postStatusContract,
+      /^commits\/\$CANARY_HEAD\/statuses\?per_page=100/u,
+      `${name}: read the post-rerun status inventory on the current head`,
+    );
+    assert.match(
+      postStatusContract,
+      /(?:duplicate\s+status IDs|重复\s+status IDs?)/iu,
+      `${name}: reject duplicate post-rerun status IDs`,
+    );
+    assert.match(
+      postStatusContract,
+      /(?:page[ -]?1|第一页)[^.。\n]{0,80}horizon/iu,
+      `${name}: stabilize the post-rerun status pagination horizon`,
+    );
+    assert.match(
+      postStatusContract,
+      /codex\/review-gate[\s\S]{0,240}state=success/iu,
       `${name}: require a stable v1 success inventory on the current head`,
     );
     assert.match(
-      recovery,
+      postStatusContract,
       /(?:still-current|仍(?:然)?(?:绑定|为) current)[\s\S]{0,40}CANARY_HEAD/iu,
       `${name}: revalidate that the successful v1 status is on the current head`,
     );
     assert.match(
-      recovery,
+      postStatusContract,
       /(?:ID absent from|不在)[\s\S]{0,100}(?:complete\s+)?pre-POST\s+inventory/iu,
       `${name}: require a fresh post-POST v1 status ID`,
+    );
+    assert.match(
+      postStatusContract,
+      /creator\.login=github-actions\[bot\][\s\S]{0,80}creator\.type=Bot/u,
+      `${name}: require the fresh status to come from the GitHub Actions bot`,
     );
     assert.match(
       recovery,

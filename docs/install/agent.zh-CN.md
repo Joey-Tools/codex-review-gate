@@ -830,18 +830,77 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    status IDs 及当前 reverse-chronological 顺序中的第一个 exact-context `codex/review-gate` status。
    这是最终 pre-POST recovery binding-set read。
 
-   只 rerun 这个 exact 已有 bridge run，不得改用其他 v1 workflow：
+   只 rerun 这个 exact 已有 bridge run，不得改用其他 v1 workflow。write 前先把
+   `LEGACY_RERUN_RECEIPT` 设为 operator 保留的、该 transaction 专用且尚不存在的路径。保留这个
+   exact path；不得另选新路径重试 mutation。no-clobber response-file creation 会阻止这个 block 静默覆盖
+   先前的 receipt：
 
    ```bash
-   gh api --hostname github.com \
-     --method POST \
-     "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun"
+   : "${LEGACY_RERUN_RECEIPT:?set an operator-retained recovery receipt path}"
+   if test ! -e "$LEGACY_RERUN_RECEIPT"; then
+     :
+   else
+     printf 'recovery receipt already exists; do not submit the POST: %s\n' \
+       "$LEGACY_RERUN_RECEIPT" >&2
+     exit 1
+   fi
+   if (
+     umask 077
+     set -C
+     gh api --hostname github.com \
+       --include \
+       --header "X-GitHub-Api-Version: 2026-03-10" \
+       --method POST \
+       "repos/$REPO/actions/runs/$LEGACY_RUN_ID/rerun" \
+       > "$LEGACY_RERUN_RECEIPT"
+   ); then
+     LEGACY_RERUN_GH_EXIT=0
+   else
+     LEGACY_RERUN_GH_EXIT=$?
+   fi
+
+   LEGACY_RERUN_HTTP_VERSION=
+   LEGACY_RERUN_HTTP_STATUS=
+   if IFS=$' \t\r' read -r LEGACY_RERUN_HTTP_VERSION LEGACY_RERUN_HTTP_STATUS _ \
+     < "$LEGACY_RERUN_RECEIPT"; then
+     :
+   else
+     printf 'rerun POST response is inconclusive; retain %s and do not replay\n' \
+       "$LEGACY_RERUN_RECEIPT" >&2
+     exit 1
+   fi
+   case "$LEGACY_RERUN_HTTP_VERSION" in
+     HTTP/1.1|HTTP/2|HTTP/2.0|HTTP/3|HTTP/3.0) ;;
+     *)
+       printf 'rerun POST status line is inconclusive; retain %s and do not replay\n' \
+         "$LEGACY_RERUN_RECEIPT" >&2
+       exit 1
+       ;;
+   esac
+   if test "$LEGACY_RERUN_GH_EXIT" -ne 0; then
+     printf 'rerun POST did not prove HTTP 201; retain %s and do not replay\n' \
+       "$LEGACY_RERUN_RECEIPT" >&2
+     exit 1
+   fi
+   if test "$LEGACY_RERUN_HTTP_STATUS" = 201; then
+     :
+   else
+     printf 'rerun POST did not prove HTTP 201; retain %s and do not replay\n' \
+       "$LEGACY_RERUN_RECEIPT" >&2
+     exit 1
+   fi
+   printf 'recovery receipt retained at %s (HTTP %s)\n' \
+     "$LEGACY_RERUN_RECEIPT" "$LEGACY_RERUN_HTTP_STATUS"
    ```
 
    GitHub rerun 会保留触发原 run 的 `GITHUB_SHA` 与 `GITHUB_REF`；这正是 source run 必须已经
    绑定 exact feature head、而 embedded PR entry 另行绑定 current default-branch repository/ref/SHA
-   的原因。POST 只能提交一次；HTTP 或 transport 结果若不能证明公开的 `201` response，则属于
-   inconclusive，不得 replay。
+   的原因。`--include` 会让保留的 response 以 HTTP status line 开头，固定 API-version header 则避免
+   API version negotiation 改变该 request。parser 接受 HTTP/1.1、HTTP/2 与 HTTP/3 输出的 status token，
+   提取第二个 field，并强制它精确等于 `201`。即使 receipt partial 或 empty，也要把它作为
+   inconclusive attempt 的 evidence 保留；它绝不能证明 success。`gh` 非零退出、第一行缺失或
+   malformed、非 `201` status，或任何其他 transport uncertainty 都属于 inconclusive：保留 receipt，
+   绝不再次提交 POST。POST 只能提交一次。
 
    POST 后轮询该 exact run ID 直到 terminal，然后重新验证同一个 recovery binding set，并重复完整稳定
    run enumeration。要求 repository、default branch/ref/SHA、PR head/base scope、active workflow
