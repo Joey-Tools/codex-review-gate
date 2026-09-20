@@ -471,6 +471,7 @@ function createFakeGhHarness(
     cleanupMutationErrorAt = null,
     cleanupMutationFailureAt = null,
     cleanupIdentityDriftAtMetadataRead = null,
+    cleanupExternalReconcileAtSurfaceRead = null,
     stageCreateResponse = "valid",
     extraEffectiveRules = [],
     extraEffectiveSecondPageRules = [],
@@ -497,6 +498,7 @@ function createFakeGhHarness(
   );
   const legacyWriterRaceStatePath = join(directory, "legacy-writer-race-state");
   const cleanupActionStatePaths = [];
+  const cleanupSurfaceReadCountPaths = [];
   const responses = new Map();
   const delayedRequests = [];
   const legacyWriterRaceResponses = [];
@@ -707,6 +709,10 @@ function createFakeGhHarness(
         directory,
         `cleanup-action-${repositoryIndex}-${actionIndex}`,
       );
+      const surfaceReadCountPath = join(
+        directory,
+        `cleanup-surface-reads-${repositoryIndex}-${actionIndex}`,
+      );
       const actionOrdinal = cleanupActionStatePaths.length;
       cleanupActionStatePaths.push({
         repository: repository.slug,
@@ -714,6 +720,7 @@ function createFakeGhHarness(
         path: actionStatePath,
         ordinal: actionOrdinal,
       });
+      cleanupSurfaceReadCountPaths.push(surfaceReadCountPath);
       localRulesetSummaries.push({
         id: action.ruleset_id,
         name: action.expected_before.name,
@@ -727,6 +734,7 @@ function createFakeGhHarness(
         mutationRequest:
           `PUT:repos/${encodedSlug}/rulesets/${action.ruleset_id}`,
         statePath: actionStatePath,
+        surfaceReadCountPath,
         ordinal: actionOrdinal,
         before: JSON.stringify(
           completeRulesetResponse(
@@ -1194,6 +1202,19 @@ function createFakeGhHarness(
       }
       scriptLines.push(
         `  ${shellQuote(response.request)})`,
+      );
+      if (
+        cleanupExternalReconcileAtSurfaceRead !== null &&
+        cleanupExternalReconcileAtSurfaceRead.ordinal === response.ordinal
+      ) {
+        scriptLines.push(
+          `    count="$(cat ${shellQuote(response.surfaceReadCountPath)})"`,
+          "    count=$((count + 1))",
+          `    printf '%s\\n' "$count" > ${shellQuote(response.surfaceReadCountPath)}`,
+          `    if [ "$count" -ge ${cleanupExternalReconcileAtSurfaceRead.read} ]; then printf '%s\\n' 'after' > ${cleanupStateFile}; fi`,
+        );
+      }
+      scriptLines.push(
         `    case "$(cat ${cleanupStateFile})" in`,
         `      before) respond ${shellQuote(response.before)} ;;`,
         `      after) respond ${shellQuote(response.after)} ;;`,
@@ -1282,6 +1303,9 @@ function createFakeGhHarness(
       writeFileSync(action.path, "before\n");
     }
   }
+  for (const path of cleanupSurfaceReadCountPaths) {
+    writeFileSync(path, "0\n");
+  }
 
   const previousEnvironment = new Map(
     [
@@ -1323,6 +1347,7 @@ function createFakeGhHarness(
     cleanupIdentityReadCountPath,
     legacyWriterRaceStatePath,
     cleanupActionStatePaths,
+    cleanupSurfaceReadCountPaths,
   };
 }
 
@@ -1968,6 +1993,30 @@ test("repository cleanup executor performs every pending action in serial exact-
   for (const action of harness.cleanupActionStatePaths) {
     assert.equal(readFileSync(action.path, "utf8"), "after\n");
   }
+  const firstAction = harness.cleanupActionStatePaths[0];
+  const firstRepositoryEndpoint =
+    `repos/${encodeEndpointPathForTest(firstAction.repository)}`;
+  const firstSurfaceEndpoint =
+    `${firstRepositoryEndpoint}/rulesets/${firstAction.surface.slice("repository_ruleset:".length)}?includes_parents=false`;
+  const firstMutationEndpoint =
+    `${firstRepositoryEndpoint}/rulesets/${firstAction.surface.slice("repository_ruleset:".length)}`;
+  const firstMutationIndex = fakeGhRequests(harness.logPath).findIndex(
+    ({ method, endpoint }) =>
+      method === "PUT" && endpoint === firstMutationEndpoint,
+  );
+  assert.ok(firstMutationIndex >= 4);
+  assert.deepEqual(
+    fakeGhRequests(harness.logPath)
+      .slice(firstMutationIndex - 4, firstMutationIndex)
+      .map(({ method, endpoint }) => ({ method, endpoint })),
+    [
+      { method: "GET", endpoint: firstRepositoryEndpoint },
+      { method: "GET", endpoint: firstSurfaceEndpoint },
+      { method: "GET", endpoint: firstRepositoryEndpoint },
+      { method: "GET", endpoint: firstSurfaceEndpoint },
+    ],
+    "every cleanup write must follow a second exact surface read after its adjacent identity revalidation",
+  );
 });
 
 test("repository cleanup executor rejects same-slug identity drift immediately before mutation", async (t) => {
@@ -2037,6 +2086,40 @@ test("repository cleanup executor resumes a mixed checkpoint without rewriting r
         `repos/${encodeEndpointPathForTest(reconciled.repository)}/rulesets/${reconciled.surface.slice("repository_ruleset:".length)}`,
     ),
     false,
+  );
+});
+
+test("repository cleanup executor recognizes an external exact-after checkpoint on its pre-write surface reread", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    detailedCleanupState: true,
+    cleanupExternalReconcileAtSurfaceRead: { ordinal: 0, read: 5 },
+  });
+  configureDetailedCleanupHandoff(harness);
+  const preview = await runFakeCli(harness, "apply-repository-cleanup");
+  for (const path of harness.cleanupSurfaceReadCountPaths) {
+    writeFileSync(path, "0\n");
+  }
+  writeFileSync(harness.logPath, "");
+
+  const applied = await runFakeCli(harness, "apply-repository-cleanup", [
+    "--apply",
+    "--expected-plan-sha256",
+    preview.plan_sha256,
+  ]);
+  assert.equal(applied.status, "applied-repository-cleanup-verified");
+  assert.equal(
+    applied.execution_outcomes[0].outcome,
+    "already-reconciled-immediately-before-write",
+  );
+  const firstAction = harness.cleanupActionStatePaths[0];
+  const firstMutationEndpoint =
+    `repos/${encodeEndpointPathForTest(firstAction.repository)}/rulesets/${firstAction.surface.slice("repository_ruleset:".length)}`;
+  assert.equal(
+    mutationRequests(fakeGhRequests(harness.logPath)).some(
+      ({ endpoint }) => endpoint === firstMutationEndpoint,
+    ),
+    false,
+    "a live exact-after checkpoint found at the final surface reread must not be overwritten",
   );
 });
 

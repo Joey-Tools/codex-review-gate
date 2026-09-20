@@ -3,7 +3,7 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-18
+updated: 2026-09-21
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -114,17 +114,14 @@ the global cutover is closed.
 - Nine consumer default branches have migrated to the canonical v2 verifier,
   controller, CODEOWNERS coverage, and temporary v1 bridge. No organization
   ruleset or required-status policy has been mutated by this workstream yet.
-- Read-only inventory confirms that all 11 members inherit old organization
-  rule `16590367`; nine additionally retain a repository-level legacy
-  `codex/review-gate` requirement. The other two compatibility/history cases
-  still require an explicit bridge and v2 proof before they can enter the
-  cohort's dual-protection state.
-- `codex-waited-delivery` is currently a workspace retirement tombstone rather
-  than an active configured mirror. Before its migration PR can be prepared,
-  the workspace manifest must restore its prior active specification and a
-  user-run host-level `codex_workspace.py ensure` must initialize the mirror.
-  The automation does not bypass that rule by cloning or by writing repository
-  contents through an API.
+- The initial read-only inventory found that all 11 originally selected members
+  inherited old organization rule `16590367`; nine additionally retained a
+  repository-level legacy `codex/review-gate` requirement. Later bootstrap and
+  canary facts are recorded below and supersede the then-open
+  compatibility/history exception status.
+- `codex-waited-delivery` is archived and explicitly outside this cohort. Its
+  workspace retirement tombstone is therefore not a migration blocker, and
+  the workstream must not restore a mirror or create a migration PR for it.
 
 ### Execution Update — 2026-09-18
 
@@ -141,10 +138,10 @@ the global cutover is closed.
   - `codex-workflow-hygiene#77` at `feb9bc110a7f3e077a89c50b15c89265a38e333c`; and
   - `codex-review-workflows#115` at `0be747dff940b36bd7b61712e435c6105a718555`.
 - The corresponding Private Overlay Release completed successfully in run
-  `35378848456`. `codex-waited-delivery` remains blocked on its missing
-  workspace mirror, and `codex-session-retrospective-history#7` remains
-  intentionally unmerged because it has no legacy v1 producer to prove the
-  required dual-protection boundary.
+  `35378848456`. `codex-waited-delivery` is archived and out of cohort, not
+  waiting for a workspace mirror. The retrospective-history bootstrap
+  `codex-session-retrospective-history#7` has merged at `53c9a165…`; its
+  follow-up canary `#8` passed both v2 and legacy proof, then closed unmerged.
 - Eight harmless, unmerged canary PRs were created for the merged public
   consumers. Their default-branch `begin-review` controller dispatches all
   failed at the same marker-comment POST: `403 Resource not accessible by
@@ -386,11 +383,11 @@ the global cutover is closed.
 1. Merge the source permission/hardening patch, then use reviewed control-plane
    PRs to update the nine merged consumers' copied controller bytes and retry
    their existing exact-head canaries through `begin-review`.
-2. Resolve the two remaining cohort blockers: restore the
-   `codex-waited-delivery` workspace mirror through the user-run workspace
-   initialization path, and select an explicitly authorized one-time v1 proof
-   path for `codex-session-retrospective-history`.
-3. Only after all eleven members have current dual-protection canary proof,
+2. Reconcile the revised approved cohort membership and remaining proof state;
+   `codex-waited-delivery` is not a blocker, and
+   `codex-session-retrospective-history` has completed its bootstrap/canary
+   proof.
+3. Only after every current cohort member has dual-protection canary proof,
    stage/activate the organization v2 rule, execute the receipt-bound cleanup,
    and remove the temporary bridges in separate PRs.
 
