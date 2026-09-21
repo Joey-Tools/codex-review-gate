@@ -3011,60 +3011,51 @@ async function prepareConsumerWorktree({
     controllerContent: canonicalWorkflows.controller,
   });
   const installedLabels = [];
-  let firstMutationBoundaryComplete = false;
-  const beforeFirstMutation = async () => {
-    if (firstMutationBoundaryComplete) {
-      return;
-    }
-    const preMutationState = await loadLocalInstallationSecurityState({
-      targetRoot,
-      canonicalWorkflowPaths: [
-        verifierWorkflowPath,
-        controllerWorkflowPath,
-        ...(managesLegacyBridge ? [legacyBridgeWorkflowPath] : []),
-      ],
-    });
-    assertLocalInstallationSecurityStateStable(
-      initialLocalSecurityState,
-      preMutationState,
-      "immediately before the first install mutation",
-    );
-    if (finalClosureProof !== null) {
-      await assertOrganizationFinalClosureBindingStable(
+  let initialLocalSecurityBoundaryComplete = false;
+  const beforePlannedMutation = async (phase) => {
+    // The initial local inventory can only be compared before the first
+    // planned change: later checkpoints intentionally include prior applied
+    // changes. The remote final-closure proof, however, must bind every
+    // planned mutation boundary so a same-slug repository recreation or a
+    // retargeted origin cannot authorize a later local change.
+    if (!initialLocalSecurityBoundaryComplete) {
+      const preMutationState = await loadLocalInstallationSecurityState({
         targetRoot,
-        finalClosureProof,
+        canonicalWorkflowPaths: [
+          verifierWorkflowPath,
+          controllerWorkflowPath,
+          ...(managesLegacyBridge ? [legacyBridgeWorkflowPath] : []),
+        ],
+      });
+      assertLocalInstallationSecurityStateStable(
+        initialLocalSecurityState,
+        preMutationState,
         "immediately before the first install mutation",
       );
+      initialLocalSecurityBoundaryComplete = true;
     }
-    firstMutationBoundaryComplete = true;
+    if (finalClosureProof !== null) {
+      await assertOrganizationFinalClosureBindingStable(
+        targetRoot,
+        finalClosureProof,
+        phase,
+      );
+    }
   };
   const beforeLegacyBridgeQuarantineRename = async () => {
-    await beforeFirstMutation();
-    if (finalClosureProof !== null) {
-      await assertOrganizationFinalClosureBindingStable(
-        targetRoot,
-        finalClosureProof,
-        "immediately before legacy bridge quarantine rename",
-      );
-    }
+    await beforePlannedMutation(
+      "immediately before legacy bridge quarantine rename",
+    );
   };
   const beforeFinalLegacyBridgeQuarantineRename = async () => {
-    if (finalClosureProof !== null) {
-      await assertOrganizationFinalClosureBindingStable(
-        targetRoot,
-        finalClosureProof,
-        "immediately before legacy bridge quarantine rename",
-      );
-    }
+    await beforePlannedMutation(
+      "immediately before legacy bridge quarantine rename",
+    );
   };
   const beforeLegacyBridgeQuarantineUnlink = async () => {
-    if (finalClosureProof !== null) {
-      await assertOrganizationFinalClosureBindingStable(
-        targetRoot,
-        finalClosureProof,
-        "after legacy bridge quarantine rename and before unlink",
-      );
-    }
+    await beforePlannedMutation(
+      "after legacy bridge quarantine rename and before unlink",
+    );
   };
   try {
     for (const change of plannedChanges) {
@@ -3072,7 +3063,11 @@ async function prepareConsumerWorktree({
         await removePreparedConsumerFile({
           ...change,
           parentWitnesses,
-          beforeRemove: beforeFirstMutation,
+          beforeRemove: async () => {
+            await beforePlannedMutation(
+              "immediately before legacy bridge removal",
+            );
+          },
           beforeQuarantineRename: beforeLegacyBridgeQuarantineRename,
           beforeFinalQuarantineRename: beforeFinalLegacyBridgeQuarantineRename,
           beforeQuarantineUnlink: beforeLegacyBridgeQuarantineUnlink,
@@ -3081,7 +3076,11 @@ async function prepareConsumerWorktree({
         await installPreparedConsumerFile({
           ...change,
           parentWitnesses,
-          beforeRename: beforeFirstMutation,
+          beforeRename: async () => {
+            await beforePlannedMutation(
+              `immediately before ${change.label} install rename`,
+            );
+          },
         });
       }
       installedLabels.push(change.label);

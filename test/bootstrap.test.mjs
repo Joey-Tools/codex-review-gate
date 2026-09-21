@@ -1727,7 +1727,7 @@ test("legacy bridge removal rebinds the live GitHub repository identity to the f
   }
 });
 
-test("legacy bridge removal rejects origin drift during the pre-rename live query", () => {
+test("legacy bridge removal rereads origin after the second fake GitHub metadata lookup", () => {
   const targetRoot = mkdtempSync(
     join(tmpdir(), "codex-review-gate-live-origin-query-race-"),
   );
@@ -1739,10 +1739,10 @@ test("legacy bridge removal rejects origin drift during the pre-rename live quer
     initializeGitRepository(targetRoot);
     const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
     const finalClosureEnv = finalClosureGhEnvironment(targetRoot, {}, {
-      // Calls 1-3 cover admission, the first mutation boundary, and the
-      // first pre-rename authorization check. Call 4 is deliberately after
-      // the local bridge-object revalidation at the final rename boundary.
-      originDriftOnLiveQuery: 4,
+      // Admission is the first live metadata lookup. The second lookup occurs
+      // at the first planned removal boundary, after which the helper must
+      // reread origin before it can create the quarantine or touch the bridge.
+      originDriftOnLiveQuery: 2,
     });
     mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
     writeFileSync(
@@ -1771,7 +1771,7 @@ test("legacy bridge removal rejects origin drift during the pre-rename live quer
     assert.equal(result.status, 1, result.stderr);
     assert.match(
       result.stderr,
-      /Git origin repository changed during immediately before legacy bridge quarantine rename/u,
+      /Git origin repository changed during immediately before legacy bridge removal/u,
     );
     assert.equal(existsSync(bridgePath), true);
     assert.doesNotMatch(result.stdout, /Applied: remove/u);
@@ -1780,7 +1780,7 @@ test("legacy bridge removal rejects origin drift during the pre-rename live quer
   }
 });
 
-test("legacy bridge removal rejects same-slug target replacement after a prior mutation and before quarantine rename", () => {
+test("legacy bridge removal rejects same-slug recreated repository identity drift after a prior mutation", () => {
   const receiptRepository = buildFinalClosureOutput()
     .final_closure_receipt.repositories[0];
   for (const [name, mutate] of [
@@ -1859,6 +1859,90 @@ test("legacy bridge removal rejects same-slug target replacement after a prior m
     } finally {
       rmSync(targetRoot, { recursive: true, force: true });
     }
+  }
+});
+
+test("legacy bridge removal stops before bridge rename or unlink after verifier and controller mutations drift origin", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-controller-origin-drift-"),
+  );
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const verifierPath = join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/"));
+  const controllerPath = join(
+    targetRoot,
+    ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
+    const finalClosureEnv = finalClosureGhEnvironment(targetRoot);
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(
+      verifierPath,
+      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+    const preloadPath = join(targetRoot, "post-controller-origin-drift.cjs");
+    const bridgeMutationLog = join(targetRoot, "bridge-mutation-calls.log");
+    writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...finalClosureArgs,
+      "--apply",
+    ], {
+      env: {
+        ...finalClosureEnv,
+        NODE_OPTIONS: `--require=${preloadPath}`,
+        CODEX_BOOTSTRAP_TEST_RACE_MODE: "removal-origin-drift-after-controller",
+        CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+        CODEX_BOOTSTRAP_TEST_BRIDGE_MUTATION_LOG: bridgeMutationLog,
+      },
+    });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /Git origin repository changed during immediately before legacy bridge removal/u,
+    );
+    assert.match(
+      result.stderr,
+      /Partial local apply: completed verifier-workflow, controller-workflow/u,
+    );
+    assert.equal(readFileSync(verifierPath, "utf8"), CANONICAL_WORKFLOW);
+    assert.equal(
+      readFileSync(controllerPath, "utf8"),
+      CANONICAL_CONTROLLER_WORKFLOW,
+    );
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+    assert.equal(
+      existsSync(bridgeMutationLog),
+      false,
+      "bridge rename and unlink must not be called after origin drift",
+    );
+    assert.equal(
+      readdirSync(workflowsDirectory, { withFileTypes: true }).some(
+        (entry) =>
+          entry.isDirectory() &&
+          entry.name.startsWith(".codex-review-gate-removal-"),
+      ),
+      false,
+    );
+    assert.doesNotMatch(result.stdout, /Applied:|Next:/u);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
   }
 });
 
@@ -2064,10 +2148,11 @@ test("prepare-worktree refuses removal of a drifted or displaced bridge", () => 
 test("legacy bridge removal fails closed across replacement, deletion, unlink, and post-unlink races", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-remove-race-"));
   try {
-    for (const [mode, expected, verify] of [
+    for (const [mode, expected, expectedQuarantineDirectories, verify] of [
       [
         "removal-check-replacement",
         /object identity changed.*unverified replacement remains quarantined/su,
+        1,
         ({ bridgePath, quarantinePath }) => {
           assert.equal(
             readFileSync(`${bridgePath}.admitted`, "utf8"),
@@ -2082,6 +2167,7 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
       [
         "removal-check-delete",
         /ENOENT.*No workflow object was unlinked/su,
+        1,
         ({ quarantinePath }) => {
           assert.equal(existsSync(quarantinePath), false);
         },
@@ -2089,6 +2175,7 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
       [
         "removal-unlink-fails",
         /synthetic quarantine unlink failure.*admitted exact bridge remains quarantined/su,
+        1,
         ({ quarantinePath }) => {
           assert.equal(
             readFileSync(quarantinePath, "utf8"),
@@ -2099,16 +2186,17 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
       [
         "removal-post-unlink-checkpoint-fails",
         /access policy changed.*admitted exact bridge unlink completed.*no success was reported/su,
+        1,
         ({ quarantinePath }) => {
           assert.equal(existsSync(quarantinePath), false);
         },
       ],
       [
         "removal-origin-drift-after-codeowners",
-        /Git origin repository changed during immediately before legacy bridge quarantine rename.*No workflow object was unlinked/su,
-        ({ bridgePath, quarantinePath }) => {
+        /Git origin repository changed during immediately before legacy bridge removal/u,
+        0,
+        ({ bridgePath }) => {
           assert.equal(existsSync(bridgePath), true);
-          assert.equal(existsSync(quarantinePath), false);
         },
       ],
     ]) {
@@ -2167,12 +2255,18 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
           entry.isDirectory() &&
           entry.name.startsWith(".codex-review-gate-removal-"),
       );
-      assert.equal(quarantineDirectories.length, 1, mode);
-      const quarantinePath = join(
-        workflowsDirectory,
-        quarantineDirectories[0].name,
-        "canonical-legacy-bridge.yml",
+      assert.equal(
+        quarantineDirectories.length,
+        expectedQuarantineDirectories,
+        mode,
       );
+      const quarantinePath = expectedQuarantineDirectories === 0
+        ? null
+        : join(
+          workflowsDirectory,
+          quarantineDirectories[0].name,
+          "canonical-legacy-bridge.yml",
+        );
       verify({ bridgePath, quarantinePath });
     }
   } finally {
@@ -8158,8 +8252,15 @@ const originalRename = promises.rename.bind(promises);
 const originalUnlink = promises.unlink.bind(promises);
 const mode = process.env.CODEX_BOOTSTRAP_TEST_RACE_MODE;
 const targetRoot = process.env.CODEX_BOOTSTRAP_TEST_RACE_ROOT;
+const bridgeMutationLog = process.env.CODEX_BOOTSTRAP_TEST_BRIDGE_MUTATION_LOG;
 let injectedBeforeFirstRename = false;
 let renameCount = 0;
+
+function recordBridgeMutation(operation) {
+  if (bridgeMutationLog) {
+    fs.appendFileSync(bridgeMutationLog, \`\${operation}\\n\`, "utf8");
+  }
+}
 
 promises.writeFile = async function patchedWriteFile(path, ...args) {
   const result = await originalWriteFile(path, ...args);
@@ -8186,6 +8287,9 @@ promises.rename = async function patchedRename(from, to) {
     "workflows",
     "codex-review-gate-legacy-bridge.yml",
   );
+  if (String(from) === bridgePath) {
+    recordBridgeMutation("rename");
+  }
   if (
     (mode === "removal-check-delete" || mode === "removal-check-replacement") &&
     String(from) === bridgePath
@@ -8278,6 +8382,28 @@ promises.rename = async function patchedRename(from, to) {
       { stdio: "inherit" },
     );
   }
+  if (
+    mode === "removal-origin-drift-after-controller" &&
+    String(to) === join(
+      targetRoot,
+      ".github",
+      "workflows",
+      "codex-review-gate-controller.yml",
+    )
+  ) {
+    execFileSync(
+      "git",
+      [
+        "-C",
+        targetRoot,
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/Joey-Tools/replaced-consumer.git",
+      ],
+      { stdio: "inherit" },
+    );
+  }
   if (mode === "final-boundary" && renameCount === 3) {
     await originalWriteFile(
       join(targetRoot, ".github", "workflows", "attacker.yml"),
@@ -8289,6 +8415,9 @@ promises.rename = async function patchedRename(from, to) {
 };
 
 promises.unlink = async function patchedUnlink(path, ...args) {
+  if (basename(String(path)) === "canonical-legacy-bridge.yml") {
+    recordBridgeMutation("unlink");
+  }
   if (
     mode === "removal-unlink-fails" &&
     basename(String(path)) === "canonical-legacy-bridge.yml"
