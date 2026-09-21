@@ -893,8 +893,9 @@ Manual v2 `reconcile` only refreshes `codex/github-review-gate`; it never
 writes `codex/review-gate`. While both contexts remain required, a review- or
 reaction-only result can therefore need a separate v1 recovery. First use the
 REST API to bind one complete current scope. `GET repos/$REPO` must still
-return `full_name=$REPO`; bind its `default_branch` as `DEFAULT_BRANCH` and
-bind `DEFAULT_BRANCH_HEAD_SHA` from the corresponding
+return `full_name=$REPO` and a positive `id`; bind that ID as
+`REPOSITORY_ID`, its `default_branch` as `DEFAULT_BRANCH`, and
+`DEFAULT_BRANCH_HEAD_SHA` from the corresponding
 `GET repos/$REPO/branches/$DEFAULT_BRANCH` response. The fresh
 `GET repos/$REPO/pulls/$CANARY_PR` response must be open, non-draft, and
 same-repository, with its head repository/ref/SHA equal to `$REPO`,
@@ -932,10 +933,13 @@ From that full stable inventory, a run is eligible only when its API
 window, it is completed, and its REST object has all of the following: the
 bound positive `workflow_id` and positive
 `run_attempt`; `repository.full_name` and `head_repository.full_name` equal to
-`$REPO`; `event=pull_request_target`; `head_sha` equal to
-`CANARY_HEAD`; and exactly one `pull_requests` entry whose number,
-head repository/ref/SHA, and base repository/ref/SHA equal the complete bound PR
-scope. A matching nonterminal run is pending, not evidence of zero candidates.
+`$REPO` and their IDs equal `REPOSITORY_ID`; `event=pull_request_target`;
+`head_sha` equal to `CANARY_HEAD`; and exactly one `pull_requests` entry whose
+number, head/base ref and SHA, and nested head/base repository IDs equal the
+complete bound PR scope. The embedded Actions-run repository objects are
+minimal `{id,name,url}` references and may omit `full_name`; their positive ID
+must equal `REPOSITORY_ID`, rather than treating a missing name as a match. A
+matching nonterminal run is pending, not evidence of zero candidates.
 In the run object, `DEFAULT_BRANCH_HEAD_SHA` is bound only by
 `pull_requests[0].base.sha`; never compare the top-level `run.head_sha` to the
 default-branch SHA. For `path`, accept the bare canonical path, GitHub's
@@ -1225,7 +1229,9 @@ re-reads the exact default-branch workflow inventory, CODEOWNERS errors, and
 the named owner's repository permission. Before an active write it also
 re-reads the canary lifecycle, base/head/test-merge SHA, exact verifier
 run/job/CheckRun, exact canonical `display_title`, sole PR head/base binding,
-and collision inventory. After a write it reads the exact
+including top-level `run.repository.id` and `run.head_repository.id` plus the
+nested Actions-run repository IDs matching the current repository ID, and
+collision inventory. After a write it reads the exact
 ruleset and the complete consumer security snapshot back.
 Use the recorded `V2_RULESET_NAME` in every staging, activation, and final
 probe command. Confirm active enforcement, the same expected GitHub Actions source, strict

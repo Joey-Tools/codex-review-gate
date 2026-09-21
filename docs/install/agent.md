@@ -929,8 +929,9 @@ legacy before v2 is Active and read back.
    writes `codex/review-gate`. While both contexts remain required, a review-
    or reaction-only result can therefore require a separate v1 recovery. First
    use the REST API to bind one complete current scope. `GET repos/$REPO` must
-   still return `full_name=$REPO`; bind its `default_branch` as
-   `DEFAULT_BRANCH` and bind `DEFAULT_BRANCH_HEAD_SHA` from the corresponding
+   still return `full_name=$REPO` and a positive `id`; bind that ID as
+   `REPOSITORY_ID`, its `default_branch` as `DEFAULT_BRANCH`, and
+   `DEFAULT_BRANCH_HEAD_SHA` from the corresponding
    `GET repos/$REPO/branches/$DEFAULT_BRANCH` response. The fresh
    `GET repos/$REPO/pulls/$CANARY_PR` response must be open, non-draft, and
    same-repository, with its head repository/ref/SHA equal to `$REPO`,
@@ -969,11 +970,14 @@ legacy before v2 is Active and read back.
    rerun window, it is completed, and its REST object has all of the following:
    the bound positive `workflow_id` and
    positive `run_attempt`; `repository.full_name` and
-   `head_repository.full_name` equal to `$REPO`; `event=pull_request_target`;
-   `head_sha` equal to `CANARY_HEAD`; and exactly one
-   `pull_requests` entry whose number, head repository/ref/SHA, and base
-   repository/ref/SHA equal the complete bound PR scope. A matching
-   nonterminal run is pending, not evidence of zero candidates. In the run
+   `head_repository.full_name` equal to `$REPO` and their IDs equal
+   `REPOSITORY_ID`; `event=pull_request_target`; `head_sha` equal to
+   `CANARY_HEAD`; and exactly one `pull_requests` entry whose number, head/base
+   ref and SHA, and nested head/base repository IDs equal the complete bound PR
+   scope. The embedded Actions-run repository objects are minimal
+   `{id,name,url}` references and may omit `full_name`; their positive ID must
+   equal `REPOSITORY_ID`, rather than treating a missing name as a match. A
+   matching nonterminal run is pending, not evidence of zero candidates. In the run
    object, `DEFAULT_BRANCH_HEAD_SHA` is bound only by
    `pull_requests[0].base.sha`; never compare the top-level `run.head_sha` to
    the default-branch SHA. For `path`,
@@ -1340,7 +1344,8 @@ legacy before v2 is Active and read back.
    Require that run's exact `display_title` to equal
    `codex-review-gate-verifier/$CANARY_PR/$CANARY_TEST_MERGE_SHA`, and require
    its single `pull_requests` binding to contain the current feature head and
-   `base.sha=$DEFAULT_BRANCH_HEAD_SHA`. Bind the feature-head CheckRun to the
+   `base.sha=$DEFAULT_BRANCH_HEAD_SHA`, with both nested repository IDs matching
+   the current repository ID obtained from `GET repos/$REPO`. Bind the feature-head CheckRun to the
    strictly newer verifier attempt reported by the controller and require that
    attempt to be execution-bound to `CANARY_TEST_MERGE_SHA`. Also require the
    verifier summary to report `execution_health=healthy` and
@@ -1373,7 +1378,9 @@ legacy before v2 is Active and read back.
 
 4. The helper must re-read the canary lifecycle, base, head, test-merge SHA,
    exact feature-head verifier run/job/CheckRun, canonical `display_title`,
-   sole PR head/base binding and collision inventory, plus the exact
+   sole PR head/base binding (including top-level `run.repository.id` and
+   `run.head_repository.id` plus nested Actions-run repository IDs matching the
+   current repository ID) and collision inventory, plus the exact
    default-branch workflow inventory, CODEOWNERS errors, and
    owner permission immediately before every active ruleset POST or PUT. After
    the write, read back the exact ruleset and the complete consumer security

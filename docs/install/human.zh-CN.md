@@ -746,7 +746,8 @@ verifier attempt；若结果只出现在 review 或 reaction，或者需要恢�
 手动 v2 `reconcile` 只刷新 `codex/github-review-gate`，绝不会写
 `codex/review-gate`。两个 context 仍同时 required 时，只由 review 或 reaction 承载的结果可能需要单独
 恢复 v1。首先只用 REST API 绑定一份完整的 current scope：`GET repos/$REPO` 必须仍返回
-`full_name=$REPO`；把它的 `default_branch` 绑定为 `DEFAULT_BRANCH`，并从对应的
+`full_name=$REPO` 与正数 `id`；把该 ID 绑定为 `REPOSITORY_ID`，把它的
+`default_branch` 绑定为 `DEFAULT_BRANCH`，并从对应的
 `GET repos/$REPO/branches/$DEFAULT_BRANCH` 响应绑定 `DEFAULT_BRANCH_HEAD_SHA`。fresh
 `GET repos/$REPO/pulls/$CANARY_PR` 响应必须 open、non-draft、same-repository；其 head
 repository/ref/SHA 必须等于 `$REPO`、`CANARY_HEAD_REF` 与 `CANARY_HEAD`，base repository/ref/SHA
@@ -774,9 +775,11 @@ canonical JSON（包括 `total_count` 与有序 runs）和捕获的第一页相�
 在这份完整且稳定的 inventory 中，eligible run 的 API `created_at` 必须证明它仍处于 GitHub 公开的
 30-day rerun window，且 run 已经 completed，并同时满足：正数 `workflow_id` 等于已绑定 ID；
 `run_attempt` 为正数；
-`repository.full_name` 与 `head_repository.full_name` 都等于 `$REPO`；
-`event=pull_request_target`；`head_sha=CANARY_HEAD`；且恰好一个 `pull_requests` entry 的 number、
-head repository/ref/SHA、base repository/ref/SHA 都等于完整已绑定 PR scope。matching nonterminal run
+`repository.full_name` 与 `head_repository.full_name` 都等于 `$REPO`，且它们的 ID 都等于
+`REPOSITORY_ID`；`event=pull_request_target`；`head_sha=CANARY_HEAD`；且恰好一个
+`pull_requests` entry 的 number、head/base ref 和 SHA、以及嵌套 head/base repository ID 都等于完整已绑定
+PR scope。Actions-run 中嵌套的 repository object 是最小的 `{id,name,url}` reference，可能没有
+`full_name`；其正数 ID 必须等于 `REPOSITORY_ID`，不得把缺失的名字当作 match。matching nonterminal run
 表示 pending，不能当作 candidate cardinality zero。在 run object 内，`DEFAULT_BRANCH_HEAD_SHA` 只由
 `pull_requests[0].base.sha` 绑定；不得把 top-level `run.head_sha` 与 default-branch SHA 比较。
 对于 `path`，接受 bare canonical path、GitHub 公开的
@@ -1012,7 +1015,8 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
 default-branch workflow inventory、CODEOWNERS errors 与指定 owner 的 repository
 permission；active write 前还会重新读取 canary lifecycle、base/head/test-merge SHA、
 exact verifier run/job/CheckRun、exact canonical `display_title`、唯一 PR head/base
-binding 与 collision inventory。Write 后会读回 exact ruleset 与
+binding（包括 top-level `run.repository.id`、`run.head_repository.id` 以及嵌套 Actions-run
+repository ID 都必须等于 current repository ID）与 collision inventory。Write 后会读回 exact ruleset 与
 完整 consumer security snapshot。每条 staging、activation 与 final probe command 都必须
 传入已记录的同一个 `V2_RULESET_NAME`。确认 active
 enforcement、相同 GitHub Actions source、strict up-to-date、Code Owner review、push 后

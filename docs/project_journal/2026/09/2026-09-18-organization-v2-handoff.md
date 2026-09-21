@@ -122,8 +122,10 @@ the global cutover is closed.
   already-reviewed `DESIGN.md` correction with its matching package version
   and makes no runtime-code change.
 - Ten active cohort default branches have migrated to the canonical v2 verifier,
-  controller, CODEOWNERS coverage, and temporary v1 bridge. No organization
-  ruleset or required-status policy has been mutated by this workstream yet.
+  controller, CODEOWNERS coverage, and temporary v1 bridge. Repository-local
+  v2 rulesets are staged Disabled; no organization ruleset, active v2
+  enforcement, legacy v1 requirement, or retained old-rule protection has been
+  changed by this workstream.
 - The initial read-only inventory found that all 11 originally selected members
   inherited old organization rule `16590367`; nine additionally retained a
   repository-level legacy `codex/review-gate` requirement. Later bootstrap and
@@ -387,6 +389,48 @@ the global cutover is closed.
   overrun, the real `gh` child inheriting the remaining deadline, and immediate
   fail-closed rejection of an oversized declared inventory.
 
+### Execution Update — 2026-09-21
+
+- Source PR `#56` merged as
+  `fd3a5e351017a2ea5a46ed5bc7a26af3b510f999`. Under the owner-approved
+  per-repository legacy-inventory digests, all ten active cohort repositories
+  now have a canonical `Must Pass Codex Review v2` repository ruleset in
+  Disabled enforcement, with a full canonical readback. The inherited v1
+  requirements and the old organization ruleset are unchanged.
+- The first retrospective-history canary, `codex-session-retrospective-history#9`,
+  was closed unmerged because its root `CANARY.md` violates that repository's
+  retained-artifact validator. Its remote branch was deleted only after the
+  closed PR and exact branch object ID were verified. Replacement canary `#10`
+  is open and non-draft at feature head
+  `022df4b432745d6d2ca409615a473a370ad09517`, against default-branch base
+  `53c9a16545147be15c8a5330c5397304a3edb332` and test merge
+  `c28d2b507b94408013ee84ee8cdccb00d0c1920e`.
+- That replacement has one exact direct `@codex review` request, a current
+  Codex terminal-clean comment, a successful native v2 CheckRun from GitHub
+  Actions integration `15368`, and a successful legacy v1
+  `codex/review-gate` status. The legacy bridge's `ubuntu-slim` job waited in
+  the hosted-runner queue for about ten minutes before it ran; the wait was
+  scheduling delay rather than billable execution and did not change the
+  selected runner policy.
+- A read-only activation preview for `#10` made no ruleset write, but exposed a
+  source helper/API-shape mismatch: `GET /repos/{owner}/{repo}/actions/runs/{id}`
+  returned the embedded `pull_requests[0].head.repo` and `.base.repo` as
+  minimal `{id,name,url}` references without `full_name`. The helper had
+  required that unavailable field and therefore rejected valid live canary
+  evidence.
+- The correction keeps the identity boundary fail closed: the previously bound
+  repository ID from `GET /repos/$REPO` is now required on the top-level
+  Actions-run repository objects and on both embedded head/base repository
+  references. It does not treat a missing `full_name` as an empty or matching
+  value. Tests use the observed minimal REST shape and reject missing or
+  mismatched top-level IDs plus mismatched embedded head/base repository IDs.
+  The four installation guides record this contract so future implementations
+  do not reintroduce the full-name assumption.
+- Organization activation remains blocked until this source correction is
+  reviewed and merged, its read-only preview succeeds for open canary `#10`,
+  and the other nine active repositories obtain their own current-base,
+  dual-protection canary evidence.
+
 ## Failure And Recovery Boundary
 
 - Any changed selector, active or legacy-only repository identity/default
@@ -481,13 +525,11 @@ the global cutover is closed.
 
 ## Next Steps
 
-1. Use reviewed control-plane PRs to update affected active consumers' copied
-   controller bytes and retry their existing exact-head canaries through
-   `begin-review`.
-2. Reconcile the 10-member active cohort's remaining proof state;
-   `codex-waited-delivery` is archived, legacy-selector-only, and not a
-   blocker, and `codex-session-retrospective-history` has completed its
-   bootstrap/canary proof.
+1. Merge the source REST-shape correction and rerun the read-only activation
+   preview for open canary `codex-session-retrospective-history#10`.
+2. Create or reconcile a current-base, open/non-draft dual-protection canary
+   for each of the other nine active cohort repositories; keep every accepted
+   canary open until organization activation readback succeeds.
 3. Only after all 10 active cohort members have dual-protection canary proof,
    stage/activate the organization v2 rule, execute the receipt-bound cleanup,
    and remove the temporary bridges in separate PRs.

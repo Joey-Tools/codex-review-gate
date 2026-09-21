@@ -109,6 +109,7 @@ const CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE = {
 };
 const DEFAULT_BRANCH_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CANARY_HEAD_SHA = "0123456789abcdef0123456789abcdef01234567";
+const CANARY_REPOSITORY_ID = 1234;
 const CANARY_RUN_ID = 9007;
 const CANARY_WORKFLOW_ID = 17;
 const CANARY_JOB_ID = 18017;
@@ -5718,6 +5719,56 @@ test("activation rejects spoofed source bindings and stale feature-head subjects
         /does not resolve to a successful current pull_request run/u,
       ],
       [
+        "missing-run-repository-id",
+        {},
+        { repository: { full_name: repoSlug } },
+        {},
+        /does not resolve to a successful current pull_request run/u,
+      ],
+      [
+        "mismatched-run-repository-id",
+        {},
+        { repository: { id: 5678, full_name: repoSlug } },
+        {},
+        /does not resolve to a successful current pull_request run/u,
+      ],
+      [
+        "missing-run-head-repository-id",
+        {},
+        { head_repository: { full_name: repoSlug } },
+        {},
+        /does not resolve to a successful current pull_request run/u,
+      ],
+      [
+        "mismatched-run-head-repository-id",
+        {},
+        { head_repository: { id: 5678, full_name: repoSlug } },
+        {},
+        /does not resolve to a successful current pull_request run/u,
+      ],
+      [
+        "mismatched-run-pr-head-repository",
+        {},
+        {
+          pull_requests: [canonicalCanaryRunPullRequestFixture(repoSlug, {
+            headRepoId: 5678,
+          })],
+        },
+        {},
+        /does not resolve to a successful current pull_request run/u,
+      ],
+      [
+        "mismatched-run-pr-base-repository",
+        {},
+        {
+          pull_requests: [canonicalCanaryRunPullRequestFixture(repoSlug, {
+            baseRepoId: 5678,
+          })],
+        },
+        {},
+        /does not resolve to a successful current pull_request run/u,
+      ],
+      [
         "missing-test-merge-receipt",
         {},
         { display_title: undefined },
@@ -7968,7 +8019,7 @@ function controlPlaneOwnerPermissionFixture(overrides = {}) {
 
 function repositoryMetadataFixture(repoSlug, overrides = {}) {
   return {
-    id: 1234,
+    id: CANARY_REPOSITORY_ID,
     node_id: "R_kgDOConsumer",
     full_name: repoSlug,
     archived: false,
@@ -7981,8 +8032,8 @@ function canaryRunResponses(repoSlug, overrides = {}) {
   return {
     [`repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}`]: {
       id: CANARY_RUN_ID,
-      repository: { full_name: repoSlug },
-      head_repository: { full_name: repoSlug },
+      repository: { id: CANARY_REPOSITORY_ID, full_name: repoSlug },
+      head_repository: { id: CANARY_REPOSITORY_ID, full_name: repoSlug },
       path: DEFAULT_WORKFLOW_PATH,
       display_title:
         `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/7/${CANARY_MERGE_SHA}`,
@@ -8020,19 +8071,31 @@ function canaryRunResponses(repoSlug, overrides = {}) {
 
 function canonicalCanaryRunPullRequestFixture(
   repoSlug,
-  { baseSha = DEFAULT_BRANCH_SHA } = {},
+  {
+    baseSha = DEFAULT_BRANCH_SHA,
+    headRepoId = CANARY_REPOSITORY_ID,
+    baseRepoId = CANARY_REPOSITORY_ID,
+  } = {},
 ) {
   return {
     number: 7,
     head: {
       sha: CANARY_HEAD_SHA,
-      repo: { full_name: repoSlug },
+      repo: canonicalCanaryRunRepositoryReferenceFixture(repoSlug, headRepoId),
     },
     base: {
       ref: "master",
       sha: baseSha,
-      repo: { full_name: repoSlug },
+      repo: canonicalCanaryRunRepositoryReferenceFixture(repoSlug, baseRepoId),
     },
+  };
+}
+
+function canonicalCanaryRunRepositoryReferenceFixture(repoSlug, id) {
+  return {
+    id,
+    name: repoSlug.slice(repoSlug.lastIndexOf("/") + 1),
+    url: `https://api.github.com/repos/${repoSlug}`,
   };
 }
 
