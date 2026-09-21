@@ -249,6 +249,7 @@ async function main() {
     if (options.activate) {
       await assertCanaryCheckRunSource({
         repoSlug: options.repo.slug,
+        repoId: currentSecuritySnapshot.repoId,
         defaultBranch,
         defaultBranchHeadSha: currentSecuritySnapshot.defaultBranchHeadSha,
         prNumber: options.canaryPr,
@@ -410,6 +411,7 @@ async function main() {
     }
     await assertCanaryCheckRunSource({
       repoSlug: options.repo.slug,
+      repoId: initialSecuritySnapshot.repoId,
       defaultBranch,
       defaultBranchHeadSha: initialSecuritySnapshot.defaultBranchHeadSha,
       prNumber: options.canaryPr,
@@ -460,6 +462,7 @@ async function main() {
     });
     await assertCanaryCheckRunSource({
       repoSlug: options.repo.slug,
+      repoId: currentSecuritySnapshot.repoId,
       defaultBranch,
       defaultBranchHeadSha: currentSecuritySnapshot.defaultBranchHeadSha,
       prNumber: options.canaryPr,
@@ -497,6 +500,7 @@ async function main() {
   if (activeWrite) {
     await assertCanaryCheckRunSource({
       repoSlug: options.repo.slug,
+      repoId: currentSecuritySnapshot.repoId,
       defaultBranch,
       defaultBranchHeadSha: currentSecuritySnapshot.defaultBranchHeadSha,
       prNumber: options.canaryPr,
@@ -868,6 +872,7 @@ function parseCanaryHead(value) {
 
 async function assertCanaryCheckRunSource({
   repoSlug,
+  repoId,
   defaultBranch,
   defaultBranchHeadSha,
   prNumber,
@@ -939,7 +944,9 @@ async function assertCanaryCheckRunSource({
   if (
     Number(run?.id) !== runId ||
     run?.repository?.full_name !== repoSlug ||
+    run?.repository?.id !== repoId ||
     run?.head_repository?.full_name !== repoSlug ||
+    run?.head_repository?.id !== repoId ||
     run?.path !== DEFAULT_WORKFLOW_PATH ||
     run?.head_sha !== headSha ||
     run?.event !== "pull_request" ||
@@ -950,7 +957,7 @@ async function assertCanaryCheckRunSource({
     !Number.isSafeInteger(run?.run_attempt) ||
     run.run_attempt <= 0 ||
     !runContainsCanaryPullRequest(run, {
-      repoSlug,
+      repoId,
       prNumber,
       headSha,
       defaultBranch,
@@ -1256,7 +1263,13 @@ async function loadCompleteCheckRuns({ repoSlug, sha, checkName }) {
 
 function runContainsCanaryPullRequest(
   run,
-  { repoSlug, prNumber, headSha, defaultBranch, defaultBranchHeadSha },
+  {
+    repoId,
+    prNumber,
+    headSha,
+    defaultBranch,
+    defaultBranchHeadSha,
+  },
 ) {
   if (!Array.isArray(run?.pull_requests) || run.pull_requests.length !== 1) {
     return false;
@@ -1265,10 +1278,10 @@ function runContainsCanaryPullRequest(
   return (
     Number(pullRequest?.number) === prNumber &&
     pullRequest?.head?.sha === headSha &&
-    pullRequest?.head?.repo?.full_name === repoSlug &&
+    pullRequest?.head?.repo?.id === repoId &&
     pullRequest?.base?.ref === defaultBranch &&
     pullRequest?.base?.sha === defaultBranchHeadSha &&
-    pullRequest?.base?.repo?.full_name === repoSlug
+    pullRequest?.base?.repo?.id === repoId
   );
 }
 
