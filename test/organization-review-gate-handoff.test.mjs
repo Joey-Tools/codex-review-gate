@@ -17,7 +17,9 @@ import { fileURLToPath } from "node:url";
 import {
   CANONICAL_WORKFLOW_IDENTITIES,
   CODEOWNERS_PATH,
+  FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION,
   GITHUB_ACTIONS_INTEGRATION_ID,
+  LEGACY_SELECTOR_REPOSITORY_COUNT,
   LEGACY_STATUS_CONTEXT,
   MANIFEST_SCHEMA_VERSION,
   NONTERMINAL_WORKFLOW_RUN_STATUSES,
@@ -60,7 +62,7 @@ const EXPECTED_NONTERMINAL_WORKFLOW_RUN_STATUSES = Object.freeze([
 const JOEY_TEMPLATE = JSON.parse(
   readFileSync(
     new URL(
-      "../templates/organization-review-gate-handoff/joey-tools-11-member-manifest.template.json",
+      "../templates/organization-review-gate-handoff/joey-tools-10-member-manifest.template.json",
       import.meta.url,
     ),
     "utf8",
@@ -82,9 +84,15 @@ const REPOSITORIES = [
   ["codex-review-workflows", 1242511842, 16583548],
   ["codex-rollout-backup", 1242512323, 16583521],
   ["codex-toolbox", 1242511840, 16583093],
-  ["codex-waited-delivery", 1242512099, 16583524],
   ["codex-workflow-hygiene", 1242512084, 16583522],
   ["codex-session-retrospective-history", 1246526548, null],
+];
+
+const ARCHIVED_LEGACY_ONLY_REPOSITORY_ID = 1242512099;
+const LEGACY_SELECTOR_REPOSITORY_IDS = [
+  ...REPOSITORIES.slice(0, 8).map(([, id]) => id),
+  ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
+  ...REPOSITORIES.slice(8).map(([, id]) => id),
 ];
 
 function clone(value) {
@@ -112,6 +120,47 @@ function defaultBranchConditions() {
       exclude: [],
     },
   };
+}
+
+// Keep these wire expectations independent from the producer helpers.  The
+// fake-gh integration test below must catch a shared regression in a helper
+// and its caller rather than merely compare two values from that helper.
+function expectedOrganizationV2RulesetPayload(manifest, enforcement) {
+  return {
+    name: V2_RULESET_NAME,
+    target: "branch",
+    enforcement,
+    bypass_actors: [],
+    conditions: {
+      ref_name: clone(manifest.legacy_ruleset.expected_before.conditions.ref_name),
+      repository_id: {
+        repository_ids: manifest.repositories.map((repository) => repository.id),
+      },
+    },
+    rules: [
+      {
+        type: "required_status_checks",
+        parameters: {
+          required_status_checks: [
+            {
+              context: V2_STATUS_CONTEXT,
+              integration_id: GITHUB_ACTIONS_INTEGRATION_ID,
+            },
+          ],
+          strict_required_status_checks_policy: true,
+          do_not_enforce_on_create: true,
+        },
+      },
+    ],
+  };
+}
+
+function expectedLegacyOrganizationCutoverPayload(manifest) {
+  const payload = clone(manifest.legacy_ruleset.expected_before);
+  payload.rules = payload.rules.filter(
+    ({ type }) => type !== "required_status_checks",
+  );
+  return payload;
 }
 
 function repositoryV2Ruleset(index) {
@@ -245,7 +294,7 @@ function manifestFixture() {
     legacy_ruleset: {
       id: 16590367,
       expected_before: legacyOrganizationRuleset(
-        repositories.map((repository) => repository.id),
+        [...LEGACY_SELECTOR_REPOSITORY_IDS],
       ),
     },
     v2_ruleset: {
@@ -253,7 +302,7 @@ function manifestFixture() {
       name: V2_RULESET_NAME,
     },
     repositories,
-    expected_legacy_cleanup_action_count: 9,
+    expected_legacy_cleanup_action_count: 8,
   };
 }
 
@@ -1448,9 +1497,11 @@ function countRequest(requests, method, endpoint) {
 }
 
 test("exports the closed organization handoff protocol constants", () => {
-  assert.equal(MANIFEST_SCHEMA_VERSION, "organization-review-gate-handoff-manifest/v1");
-  assert.equal(OUTPUT_SCHEMA_VERSION, "organization-review-gate-handoff-output/v1");
-  assert.equal(REQUIRED_REPOSITORY_COUNT, 11);
+  assert.equal(MANIFEST_SCHEMA_VERSION, "organization-review-gate-handoff-manifest/v2");
+  assert.equal(OUTPUT_SCHEMA_VERSION, "organization-review-gate-handoff-output/v2");
+  assert.equal(FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION, 2);
+  assert.equal(REQUIRED_REPOSITORY_COUNT, 10);
+  assert.equal(LEGACY_SELECTOR_REPOSITORY_COUNT, 11);
   assert.equal(V2_RULESET_NAME, "Must Pass Codex Review v2");
   assert.equal(V2_STATUS_CONTEXT, "codex/github-review-gate");
   assert.equal(LEGACY_STATUS_CONTEXT, "codex/review-gate");
@@ -1578,6 +1629,11 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
       buildV2OrganizationRulesetPayload(stagingManifest, "disabled"),
     ),
   });
+  assert.deepEqual(
+    stagePreview.action.payload,
+    expectedOrganizationV2RulesetPayload(stagingManifest, "disabled"),
+    "the staged organization payload must use the active 10-member cohort",
+  );
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 
   writeFileSync(harness.logPath, "");
@@ -1596,6 +1652,17 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   assert.deepEqual(
     writes[0].body,
     buildV2OrganizationRulesetPayload(stagingManifest, "disabled"),
+  );
+  assert.deepEqual(
+    writes[0].body,
+    expectedOrganizationV2RulesetPayload(stagingManifest, "disabled"),
+    "the stage POST body must be independently bound to the active cohort",
+  );
+  assert.equal(
+    writes[0].body.conditions.repository_id.repository_ids.includes(
+      ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
+    ),
+    false,
   );
   assert.deepEqual(writes[0].body.rules.map(({ type }) => type), [
     "required_status_checks",
@@ -1674,6 +1741,21 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   assert.deepEqual(
     writes[0].body,
     buildV2OrganizationRulesetPayload(boundManifest, "active"),
+  );
+  assert.deepEqual(
+    writes[0].body,
+    expectedOrganizationV2RulesetPayload(boundManifest, "active"),
+    "the activation PUT body must be independently bound to the active cohort",
+  );
+  assert.deepEqual(
+    writes[0].body.conditions.repository_id.repository_ids,
+    boundManifest.repositories.map((repository) => repository.id),
+  );
+  assert.equal(
+    writes[0].body.conditions.repository_id.repository_ids.includes(
+      ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
+    ),
+    false,
   );
   assert.equal(writes[0].body.enforcement, "active");
   assert.deepEqual(writes[0].body.rules.map(({ type }) => type), [
@@ -1799,7 +1881,7 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
       return expected;
     }),
   );
-  assert.equal(expectedRepositoryActions.length, 9);
+  assert.equal(expectedRepositoryActions.length, 8);
   assert.deepEqual(cutoverPlan.external_repository_actions, expectedRepositoryActions);
   assert.deepEqual(cutoverPlan.sequencing, [
     "apply-repository-cleanup-preview",
@@ -1816,12 +1898,17 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
       deriveLegacyOrganizationCutoverPayload(boundManifest),
     ),
   });
+  assert.deepEqual(
+    cutoverPlan.organization_action_after_external_verification.payload,
+    expectedLegacyOrganizationCutoverPayload(boundManifest),
+    "the legacy cutover plan must retain the original 11-member selector",
+  );
   assert.match(cutoverPlan.plan_sha256, /^[0-9a-f]{64}$/u);
 
   writeFileSync(harness.logPath, "");
   const cleanupPreview = await runFakeCli(harness, "apply-repository-cleanup");
   assert.equal(cleanupPreview.status, "preview");
-  assert.equal(cleanupPreview.external_repository_actions.length, 9);
+  assert.equal(cleanupPreview.external_repository_actions.length, 8);
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 
   writeFileSync(harness.logPath, "");
@@ -1871,6 +1958,21 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     writes[0].body,
     deriveLegacyOrganizationCutoverPayload(boundManifest),
   );
+  assert.deepEqual(
+    writes[0].body,
+    expectedLegacyOrganizationCutoverPayload(boundManifest),
+    "the legacy cutover PUT body must be independently bound to the retained selector",
+  );
+  assert.deepEqual(
+    writes[0].body.conditions.repository_id.repository_ids,
+    LEGACY_SELECTOR_REPOSITORY_IDS,
+  );
+  assert.equal(
+    writes[0].body.conditions.repository_id.repository_ids.includes(
+      ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
+    ),
+    true,
+  );
   assert.deepEqual(writes[0].body.rules, [
     { type: "deletion" },
     { type: "non_fast_forward" },
@@ -1905,11 +2007,12 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
 
   writeFileSync(harness.logPath, "");
   const verifyCompletePreview = await runFakeCli(harness, "verify");
+  assert.equal(verifyCompletePreview.schema_version, OUTPUT_SCHEMA_VERSION);
   assert.equal(verifyCompletePreview.status, "final-verified");
   assert.equal(verifyCompletePreview.applied, false);
   assert.equal(verifyCompletePreview.action, null);
   assert.deepEqual(verifyCompletePreview.final_closure_receipt, {
-    schema_version: 1,
+    schema_version: FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION,
     organization: boundManifest.organization,
     manifest_sha256: sha256Canonical(boundManifest),
     snapshot_sha256: verifyCompletePreview.snapshot_sha256,
@@ -1935,6 +2038,17 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
         )
       ),
   });
+  assert.equal(
+    verifyCompletePreview.final_closure_receipt.repositories.length,
+    REQUIRED_REPOSITORY_COUNT,
+  );
+  assert.equal(
+    verifyCompletePreview.final_closure_receipt.repositories.some(
+      ({ id }) => id === ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
+    ),
+    false,
+    "the final receipt must not authorize the archived legacy-only repository",
+  );
   assert.equal(
     verifyCompletePreview.final_closure_receipt_sha256,
     sha256Canonical(verifyCompletePreview.final_closure_receipt),
@@ -2001,7 +2115,7 @@ test("repository cleanup executor performs every pending action in serial exact-
   configureDetailedCleanupHandoff(harness);
   const preview = await runFakeCli(harness, "apply-repository-cleanup");
   assert.equal(preview.status, "preview");
-  assert.equal(preview.external_repository_actions.length, 9);
+  assert.equal(preview.external_repository_actions.length, 8);
   writeFileSync(harness.logPath, "");
 
   const applied = await runFakeCli(harness, "apply-repository-cleanup", [
@@ -2012,7 +2126,7 @@ test("repository cleanup executor performs every pending action in serial exact-
   assert.equal(applied.status, "applied-repository-cleanup-verified");
   assert.deepEqual(
     applied.execution_outcomes.map((entry) => entry.outcome),
-    Array(9).fill("applied"),
+    Array(8).fill("applied"),
   );
   const writes = mutationRequests(fakeGhRequests(harness.logPath));
   assert.deepEqual(
@@ -2104,7 +2218,7 @@ test("repository cleanup executor resumes a mixed checkpoint without rewriting r
   const preview = await runFakeCli(harness, "apply-repository-cleanup");
   assert.equal(preview.status, "preview");
   assert.equal(preview.completed_repository_cleanup_action_count, 1);
-  assert.equal(preview.external_repository_actions.length, 8);
+  assert.equal(preview.external_repository_actions.length, 7);
   writeFileSync(harness.logPath, "");
 
   const applied = await runFakeCli(harness, "apply-repository-cleanup", [
@@ -2114,7 +2228,7 @@ test("repository cleanup executor resumes a mixed checkpoint without rewriting r
   ]);
   assert.equal(applied.status, "applied-repository-cleanup-verified");
   const writes = mutationRequests(fakeGhRequests(harness.logPath));
-  assert.equal(writes.length, 8);
+  assert.equal(writes.length, 7);
   assert.equal(
     writes.some(
       (entry) =>
@@ -2238,7 +2352,7 @@ test("repository cleanup executor reconciles an ambiguous write only after exact
     applied.execution_outcomes[2].outcome,
     "reconciled-after-write-error",
   );
-  assert.equal(mutationRequests(fakeGhRequests(harness.logPath)).length, 9);
+  assert.equal(mutationRequests(fakeGhRequests(harness.logPath)).length, 8);
 });
 
 test("repository cleanup executor stops after a write that remains before-state", async (t) => {
@@ -3482,7 +3596,7 @@ test("legacy evidence is a latest successful commit status, never a CheckRun sub
   }
 });
 
-test("validates and clones a complete exact 11-repository handoff manifest", () => {
+test("validates and clones the complete exact 10-repository active handoff cohort", () => {
   const manifest = manifestFixture();
   const before = clone(manifest);
   const validated = validateManifest(manifest);
@@ -3492,9 +3606,21 @@ test("validates and clones a complete exact 11-repository handoff manifest", () 
   assert.notEqual(validated.repositories, manifest.repositories);
   assert.deepEqual(manifest, before, "validation must not mutate the approval manifest");
   assert.equal(validated.repositories.length, REQUIRED_REPOSITORY_COUNT);
+  const activeRepositoryIds = validated.repositories.map((repository) => repository.id);
+  const legacySelectorRepositoryIds =
+    validated.legacy_ruleset.expected_before.conditions.repository_id.repository_ids;
+  assert.equal(legacySelectorRepositoryIds.length, LEGACY_SELECTOR_REPOSITORY_COUNT);
   assert.deepEqual(
-    validated.legacy_ruleset.expected_before.conditions.repository_id.repository_ids,
-    validated.repositories.map((repository) => repository.id),
+    legacySelectorRepositoryIds.filter((id) => activeRepositoryIds.includes(id)),
+    activeRepositoryIds,
+  );
+  assert.equal(
+    activeRepositoryIds.includes(ARCHIVED_LEGACY_ONLY_REPOSITORY_ID),
+    false,
+  );
+  assert.equal(
+    legacySelectorRepositoryIds.includes(ARCHIVED_LEGACY_ONLY_REPOSITORY_ID),
+    true,
   );
 });
 
@@ -3543,9 +3669,19 @@ test("the checked-in Joey manifest template fixes the approved identities and cl
       identity.sha256,
     );
   }
+  const templateActiveRepositoryIds = JOEY_TEMPLATE.repositories.map(({ id }) => id);
+  const templateLegacySelectorRepositoryIds =
+    JOEY_TEMPLATE.legacy_ruleset.expected_before.conditions.repository_id.repository_ids;
+  assert.deepEqual(templateLegacySelectorRepositoryIds, LEGACY_SELECTOR_REPOSITORY_IDS);
   assert.deepEqual(
-    JOEY_TEMPLATE.legacy_ruleset.expected_before.conditions.repository_id.repository_ids,
-    JOEY_TEMPLATE.repositories.map(({ id }) => id),
+    templateLegacySelectorRepositoryIds.filter((id) =>
+      templateActiveRepositoryIds.includes(id),
+    ),
+    templateActiveRepositoryIds,
+  );
+  assert.equal(
+    templateActiveRepositoryIds.includes(ARCHIVED_LEGACY_ONLY_REPOSITORY_ID),
+    false,
   );
 
   assert.equal(JOEY_TEMPLATE.legacy_ruleset.id, 16590367);
@@ -3557,7 +3693,7 @@ test("the checked-in Joey manifest template fixes the approved identities and cl
     conditions: {
       ref_name: { exclude: [], include: ["~DEFAULT_BRANCH"] },
       repository_id: {
-        repository_ids: JOEY_TEMPLATE.repositories.map(({ id }) => id),
+        repository_ids: LEGACY_SELECTOR_REPOSITORY_IDS,
       },
     },
     rules: [
@@ -3582,8 +3718,8 @@ test("the checked-in Joey manifest template fixes the approved identities and cl
       operation: action.operation,
     })),
   );
-  assert.equal(JOEY_TEMPLATE.expected_legacy_cleanup_action_count, 9);
-  assert.equal(cleanupActions.length, 9);
+  assert.equal(JOEY_TEMPLATE.expected_legacy_cleanup_action_count, 8);
+  assert.equal(cleanupActions.length, 8);
   assert.deepEqual(
     cleanupActions,
     REPOSITORIES.flatMap(([name, , rulesetId]) =>
@@ -3714,8 +3850,12 @@ test("manifest validation is generic but binds every supplied identity and old s
     repository.id = 8000 + index;
     repository.node_id = `R_example_${index + 1}`;
   });
-  manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids =
-    manifest.repositories.map((repository) => repository.id);
+  const activeRepositoryIds = manifest.repositories.map((repository) => repository.id);
+  manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids = [
+    ...activeRepositoryIds.slice(0, 8),
+    9000,
+    ...activeRepositoryIds.slice(8),
+  ];
 
   assert.deepEqual(validateManifest(manifest), manifest);
 });
@@ -3725,12 +3865,19 @@ test("manifest validation rejects incomplete, duplicate, or cross-bound cohort i
     {
       name: "missing member",
       mutate: (manifest) => manifest.repositories.pop(),
-      error: /exactly 11 entries/u,
+      error: /exactly 10 entries/u,
+    },
+    {
+      name: "historical v1 manifest cannot authorize the current cutover",
+      mutate: (manifest) => {
+        manifest.schema_version = "organization-review-gate-handoff-manifest/v1";
+      },
+      error: /v1 manifests are historical 11-member artifacts/u,
     },
     {
       name: "extra member",
       mutate: (manifest) => manifest.repositories.push({ ...clone(manifest.repositories[0]), id: 99 }),
-      error: /exactly 11 entries/u,
+      error: /exactly 10 entries/u,
     },
     {
       name: "duplicate numeric identity",
@@ -3768,11 +3915,27 @@ test("manifest validation rejects incomplete, duplicate, or cross-bound cohort i
       error: /positive safe integer/u,
     },
     {
-      name: "selector order or membership drift",
+      name: "active cohort order drift within legacy selector",
       mutate: (manifest) => {
-        manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids.reverse();
+        manifest.repositories.reverse();
       },
-      error: /exactly match the ordered manifest repository IDs/u,
+      error: /retain every ordered active manifest repository ID/u,
+    },
+    {
+      name: "legacy selector loses an active cohort member",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids[0] =
+          99;
+      },
+      error: /retain every ordered active manifest repository ID/u,
+    },
+    {
+      name: "legacy selector contains a duplicate identity",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids[0] =
+          manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids[1];
+      },
+      error: /exactly 11 unique entries/u,
     },
   ];
 
@@ -4015,7 +4178,12 @@ test("builds a disabled or active organization v2 ruleset with status-only polic
     target: "branch",
     enforcement: "disabled",
     bypass_actors: [],
-    conditions: manifest.legacy_ruleset.expected_before.conditions,
+    conditions: {
+      ref_name: manifest.legacy_ruleset.expected_before.conditions.ref_name,
+      repository_id: {
+        repository_ids: manifest.repositories.map((repository) => repository.id),
+      },
+    },
     rules: [
       {
         type: "required_status_checks",
@@ -4034,7 +4202,21 @@ test("builds a disabled or active organization v2 ruleset with status-only polic
   });
   assert.deepEqual(active, { ...disabled, enforcement: "active" });
   assert.deepEqual(manifest, before, "payload derivation must not mutate the manifest");
-  assert.notEqual(disabled.conditions, manifest.legacy_ruleset.expected_before.conditions);
+  assert.notEqual(
+    disabled.conditions.ref_name,
+    manifest.legacy_ruleset.expected_before.conditions.ref_name,
+  );
+  assert.notEqual(
+    disabled.conditions.repository_id,
+    manifest.legacy_ruleset.expected_before.conditions.repository_id,
+  );
+  assert.equal(
+    disabled.conditions.repository_id.repository_ids.includes(
+      ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
+    ),
+    false,
+    "the active v2 organization rule must not cover the archived legacy-only repository",
+  );
   assert.equal(
     disabled.rules.some(({ type }) =>
       ["deletion", "non_fast_forward", "pull_request"].includes(type)),
@@ -4052,8 +4234,20 @@ test("organization cutover removes only the whole v1 status rule", () => {
   const expected = clone(manifest.legacy_ruleset.expected_before);
   expected.rules = expected.rules.filter(({ type }) => type !== "required_status_checks");
 
-  assert.deepEqual(deriveLegacyOrganizationCutoverPayload(manifest), expected);
+  const cutover = deriveLegacyOrganizationCutoverPayload(manifest);
+  assert.deepEqual(cutover, expected);
   assert.deepEqual(manifest, before, "cutover derivation must be read-only");
+  assert.deepEqual(
+    cutover.conditions.repository_id.repository_ids,
+    LEGACY_SELECTOR_REPOSITORY_IDS,
+  );
+  assert.equal(
+    cutover.conditions.repository_id.repository_ids.includes(
+      ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
+    ),
+    true,
+    "cutover must retain the old rule's archived-repository deletion and non-fast-forward selector",
+  );
   assert.deepEqual(expected.rules, [
     { type: "deletion" },
     { type: "non_fast_forward" },

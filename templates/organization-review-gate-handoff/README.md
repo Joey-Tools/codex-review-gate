@@ -1,11 +1,15 @@
 # Organization review-gate handoff manifest
 
-`joey-tools-11-member-manifest.template.json` is the reviewed starting point
-for the fixed Joey-Tools cohort selected by organization ruleset `16590367`.
-It records the 2026-09-18 organization identity, the exact ordered 11
-repository identities, the complete old organization ruleset writable state,
-the canonical workflow byte identities, and the nine exact repository-local
-legacy cleanup transformations.
+`joey-tools-10-member-manifest.template.json` is the reviewed starting point
+for the active Joey-Tools v2 cohort. It records the 2026-09-18 organization
+identity, the exact ordered 10 active repository identities, the complete old
+organization ruleset writable state, the canonical workflow byte identities,
+and the eight exact active repository-local legacy cleanup transformations.
+The old ruleset's fixed 11-ID selector intentionally still includes archived
+`Joey-Tools/codex-waited-delivery`: it retains that repository's `deletion` and
+`non_fast_forward` protection, but it does not make it an active v2 member.
+The template uses `organization-review-gate-handoff-manifest/v2`; historical
+v1 manifests must not be reused for this cutover.
 
 The template is intentionally not executable as checked in. Replace every
 `REPLACE_WITH_...` value with an API-read identity after the corresponding
@@ -94,17 +98,24 @@ Do not use the `verify --apply` response to authorize bridge removal. Even
 after its write/readback, the control plane may drift. While the third freeze
 is still active, run `verify` again without `--apply` and save its **complete
 JSON output**. It must have top-level
-`schema_version: "organization-review-gate-handoff-output/v1"`,
+`schema_version: "organization-review-gate-handoff-output/v2"`,
 `mode: "verify"`, `status: "final-verified"`, `applied: false`, and
 `action: null`; contain a
-`final_closure_receipt` with `schema_version: 1`; and publish
+`final_closure_receipt` with `schema_version: 2`; and publish
 `final_closure_receipt_sha256`. The embedded receipt binds the organization,
 manifest and final snapshot digests, legacy/v2 ruleset IDs and terminal states,
-and the fixed, complete eleven repository identities in canonical UTF-8-byte
-`full_name` order. It cannot contain a subset or expanded cohort. Its top-level
-`plan_sha256` binds the final read-only `verify` plan (`mode`, manifest digest,
-snapshot digest, and `action: null`). The receipt SHA-256 binds the canonical
-embedded receipt, not the file's formatting.
+and the fixed, complete 10 active repository identities in canonical UTF-8-byte
+`full_name` order. It cannot contain a subset or expanded active cohort. The
+old 11-ID legacy selector is deliberately not an authorization source for
+bridge removal. Its top-level `plan_sha256` binds the final read-only `verify`
+plan (`mode`, manifest digest, snapshot digest, and `action: null`). The receipt
+SHA-256 binds the canonical embedded receipt, not the file's formatting.
+
+Bootstrap accepts historical final receipts only as the strict pair
+`output/v1` plus receipt schema `1` plus 11 members, and current receipts only
+as the strict pair `output/v2` plus receipt schema `2` plus 10 active members.
+It rejects mixed versions and never infers bridge-removal membership from the
+legacy selector.
 
 Keep all temporary legacy bridge workflows installed until that read-only
 verify reports the final two-snapshot closure: the new organization v2 rule is
@@ -123,11 +134,12 @@ output to `bootstrap-codex-review-gate.mjs --remove-legacy-bridge` as
 digest as `--expected-final-closure-receipt-sha256 SHA256`. The bootstrap
 parses the worktree's unambiguous GitHub `origin`, reads current repository
 metadata from GitHub, and requires exact `full_name`, `id`, `node_id`, and
-`default_branch` equality with one entry in the fixed eleven-member receipt
-cohort. At the pre-rename boundary it reads `origin` before and after the live
-metadata query, repeats the local object checks, then reads `origin` once more
-immediately before the atomic bridge quarantine rename. An observed same-name
-re-creation, repository transfer, default-branch drift, unreadable metadata,
-or mismatch fails closed and leaves the bridge installed. It also rejects an
-apply result, an extracted receipt object, a stale or changed digest, and a
-receipt for another repository.
+`default_branch` equality with one entry in the fixed 10-member active receipt
+cohort. `codex-waited-delivery` is intentionally absent and therefore cannot
+authorize bridge removal. At the pre-rename boundary it reads `origin` before
+and after the live metadata query, repeats the local object checks, then reads
+`origin` once more immediately before the atomic bridge quarantine rename. An
+observed same-name re-creation, repository transfer, default-branch drift,
+unreadable metadata, or mismatch fails closed and leaves the bridge installed.
+It also rejects an apply result, an extracted receipt object, a stale or changed
+digest, and a receipt for another repository.

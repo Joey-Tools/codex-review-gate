@@ -17,14 +17,19 @@ import {
 } from "../src/bootstrap.mjs";
 
 export const MANIFEST_SCHEMA_VERSION =
-  "organization-review-gate-handoff-manifest/v1";
+  "organization-review-gate-handoff-manifest/v2";
 export const OUTPUT_SCHEMA_VERSION =
-  "organization-review-gate-handoff-output/v1";
+  "organization-review-gate-handoff-output/v2";
+export const FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION = 2;
 export const V2_RULESET_NAME = "Must Pass Codex Review v2";
 export const V2_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
 export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
-export const REQUIRED_REPOSITORY_COUNT = 11;
+export const REQUIRED_REPOSITORY_COUNT = 10;
+// The current v2 handoff migrates ten active repositories. The inherited
+// organization rule intentionally retains one archived repository so its
+// deletion/non-fast-forward protection survives the v1 status-rule removal.
+export const LEGACY_SELECTOR_REPOSITORY_COUNT = 11;
 export const CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const V2_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
 // These are every documented nonterminal Actions workflow-run state. A run in
@@ -333,7 +338,7 @@ function statusChecks(rule, label) {
   return checks;
 }
 
-function assertLegacyOrganizationRulesetPolicy(ruleset, repositoryIds, label) {
+function assertLegacyOrganizationRulesetPolicy(ruleset, activeRepositoryIds, label) {
   assertWritableRuleset(ruleset, label);
   if (ruleset.enforcement !== "active") {
     throw new Error(`${label} must remain active before global cutover.`);
@@ -345,20 +350,32 @@ function assertLegacyOrganizationRulesetPolicy(ruleset, repositoryIds, label) {
     ["repository_ids"],
     `${label}.conditions.repository_id`,
   );
+  const legacySelectorRepositoryIds = conditions.repository_id.repository_ids;
   if (
-    !Array.isArray(conditions.repository_id.repository_ids) ||
-    conditions.repository_id.repository_ids.some(
+    !Array.isArray(legacySelectorRepositoryIds) ||
+    legacySelectorRepositoryIds.some(
       (id) => !Number.isSafeInteger(id) || id <= 0,
     )
   ) {
     throw new Error(`${label}.conditions.repository_id.repository_ids is malformed.`);
   }
   if (
-    canonicalJson(conditions.repository_id.repository_ids) !==
-    canonicalJson(repositoryIds)
+    legacySelectorRepositoryIds.length !== LEGACY_SELECTOR_REPOSITORY_COUNT ||
+    new Set(legacySelectorRepositoryIds).size !== legacySelectorRepositoryIds.length
   ) {
     throw new Error(
-      `${label} repository IDs must exactly match the ordered manifest repository IDs.`,
+      `${label} repository IDs must contain exactly ${LEGACY_SELECTOR_REPOSITORY_COUNT} unique entries.`,
+    );
+  }
+  let nextActiveRepositoryIndex = 0;
+  for (const repositoryId of legacySelectorRepositoryIds) {
+    if (repositoryId === activeRepositoryIds[nextActiveRepositoryIndex]) {
+      nextActiveRepositoryIndex += 1;
+    }
+  }
+  if (nextActiveRepositoryIndex !== activeRepositoryIds.length) {
+    throw new Error(
+      `${label} repository IDs must retain every ordered active manifest repository ID.`,
     );
   }
   assertExactKeys(
@@ -563,7 +580,7 @@ export function validateManifest(input) {
   );
   if (input.schema_version !== MANIFEST_SCHEMA_VERSION) {
     throw new Error(
-      `manifest.schema_version must be "${MANIFEST_SCHEMA_VERSION}".`,
+      `manifest.schema_version must be "${MANIFEST_SCHEMA_VERSION}"; v1 manifests are historical 11-member artifacts and cannot authorize this 10-member cutover.`,
     );
   }
   assertExactKeys(input.organization, ["login", "id", "node_id"], "manifest.organization");
@@ -756,7 +773,12 @@ export function buildV2OrganizationRulesetPayload(manifest, enforcement = "disab
     target: "branch",
     enforcement,
     bypass_actors: [],
-    conditions: cloneJson(legacy.conditions),
+    conditions: {
+      ref_name: cloneJson(legacy.conditions.ref_name),
+      repository_id: {
+        repository_ids: manifest.repositories.map((repository) => repository.id),
+      },
+    },
     rules: [
       {
         type: "required_status_checks",
@@ -3080,7 +3102,7 @@ function printUsage() {
 Modes:
   plan            Read two complete organization snapshots and report the bound phase.
   stage           Preview or create the exact Disabled v2 organization ruleset; --recover-created-v2 is the read-only recovery path for an ambiguous create.
-  activate        Require 11/11 workflow, bridge, repo-ruleset, and canary proof; preview or activate v2.
+  activate        Require ${REQUIRED_REPOSITORY_COUNT}/${REQUIRED_REPOSITORY_COUNT} workflow, bridge, repo-ruleset, and canary proof; preview or activate v2.
   derive-cutover  Read-only derivation of remaining manifest-bound repository cleanup actions and the later organization cutover.
   apply-repository-cleanup  Preview or apply the remaining repository cleanup actions with per-action exact-before/readback checks.
   verify          Verify external repository cleanup; preview or apply removal of the whole legacy organization status rule, then close with two reads.
@@ -3118,7 +3140,7 @@ function finalClosureReceipt(manifest, snapshot) {
     throw new Error("Final closure receipt requires the complete repository cohort.");
   }
   return {
-    schema_version: 1,
+    schema_version: FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION,
     organization: cloneJson(snapshot.organization.organization),
     manifest_sha256: sha256Canonical(manifest),
     snapshot_sha256: sha256Canonical(snapshot),
@@ -3370,7 +3392,9 @@ async function runActivateMode(manifest, options, runtime) {
   if (manifest.v2_ruleset.id === null) {
     throw new Error("activate mode requires manifest.v2_ruleset.id from stage readback.");
   }
-  const snapshot = await loadStable("11/11 activation coverage", () =>
+  const activationCoverageLabel =
+    `${REQUIRED_REPOSITORY_COUNT}/${REQUIRED_REPOSITORY_COUNT} activation coverage`;
+  const snapshot = await loadStable(activationCoverageLabel, () =>
     loadCoverageRound(manifest),
     runtime.stableSnapshotOptions,
   );
@@ -3411,7 +3435,7 @@ async function runActivateMode(manifest, options, runtime) {
     };
   }
   await revalidateUnchangedBeforeMutation(
-    "11/11 activation coverage",
+    activationCoverageLabel,
     snapshot,
     () => loadCoverageRound(manifest),
   );

@@ -1,5 +1,5 @@
 {
-  "schema_version": "organization-review-gate-handoff-manifest/v1",
+  "schema_version": "organization-review-gate-handoff-manifest/v2",
   "organization": {
     "login": "Joey-Tools",
     "id": 283943935,
@@ -1336,9 +1336,9 @@
       }
     },
     {
-      "slug": "Joey-Tools/codex-waited-delivery",
-      "id": 1242512099,
-      "node_id": "R_kgDOSg864w",
+      "slug": "Joey-Tools/codex-workflow-hygiene",
+      "id": 1242512084,
+      "node_id": "R_kgDOSg861A",
       "default_branch": "master",
       "workflows": {
         "verifier": {
@@ -1416,7 +1416,7 @@
       "legacy_cleanup": [
         {
           "surface": "repository_ruleset",
-          "ruleset_id": 16583524,
+          "ruleset_id": 16583522,
           "operation": "update",
           "expected_before": {
             "name": "Must Pass CI",
@@ -1505,9 +1505,9 @@
       }
     },
     {
-      "slug": "Joey-Tools/codex-workflow-hygiene",
-      "id": 1242512084,
-      "node_id": "R_kgDOSg861A",
+      "slug": "Joey-Tools/codex-session-retrospective-history",
+      "id": 1246526548,
+      "node_id": "R_kgDOSkx8VA",
       "default_branch": "master",
       "workflows": {
         "verifier": {
@@ -1582,86 +1582,7 @@
         "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_10",
         "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_10"
       },
-      "legacy_cleanup": [
-        {
-          "surface": "repository_ruleset",
-          "ruleset_id": 16583522,
-          "operation": "update",
-          "expected_before": {
-            "name": "Must Pass CI",
-            "target": "branch",
-            "enforcement": "active",
-            "bypass_actors": [],
-            "conditions": {
-              "ref_name": {
-                "exclude": [],
-                "include": [
-                  "~DEFAULT_BRANCH"
-                ]
-              }
-            },
-            "rules": [
-              {
-                "parameters": {
-                  "do_not_enforce_on_create": false,
-                  "required_status_checks": [
-                    {
-                      "context": "codex/review-gate"
-                    },
-                    {
-                      "context": "test",
-                      "integration_id": 15368
-                    }
-                  ],
-                  "strict_required_status_checks_policy": true
-                },
-                "type": "required_status_checks"
-              },
-              {
-                "type": "deletion"
-              },
-              {
-                "type": "non_fast_forward"
-              }
-            ]
-          },
-          "expected_after": {
-            "name": "Must Pass CI",
-            "target": "branch",
-            "enforcement": "active",
-            "bypass_actors": [],
-            "conditions": {
-              "ref_name": {
-                "exclude": [],
-                "include": [
-                  "~DEFAULT_BRANCH"
-                ]
-              }
-            },
-            "rules": [
-              {
-                "parameters": {
-                  "do_not_enforce_on_create": false,
-                  "required_status_checks": [
-                    {
-                      "context": "test",
-                      "integration_id": 15368
-                    }
-                  ],
-                  "strict_required_status_checks_policy": true
-                },
-                "type": "required_status_checks"
-              },
-              {
-                "type": "deletion"
-              },
-              {
-                "type": "non_fast_forward"
-              }
-            ]
-          }
-        }
-      ],
+      "legacy_cleanup": [],
       "codeowners": {
         "path": ".github/CODEOWNERS",
         "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_10",
@@ -1672,97 +1593,7 @@
           "node_id": "MDQ6VXNlcjEyNTI0Njgw"
         }
       }
-    },
-    {
-      "slug": "Joey-Tools/codex-session-retrospective-history",
-      "id": 1246526548,
-      "node_id": "R_kgDOSkx8VA",
-      "default_branch": "master",
-      "workflows": {
-        "verifier": {
-          "path": ".github/workflows/codex-review-gate.yml",
-          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
-          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
-        },
-        "controller": {
-          "path": ".github/workflows/codex-review-gate-controller.yml",
-          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
-          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
-        },
-        "legacy_bridge": {
-          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
-          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
-          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
-        }
-      },
-      "v2_ruleset": {
-        "id": "REPLACE_WITH_REPOSITORY_V2_RULESET_ID_11",
-        "expected": {
-          "name": "Must Pass Codex Review v2",
-          "target": "branch",
-          "enforcement": "active",
-          "bypass_actors": [],
-          "conditions": {
-            "ref_name": {
-              "include": [
-                "~DEFAULT_BRANCH"
-              ],
-              "exclude": []
-            }
-          },
-          "rules": [
-            {
-              "type": "pull_request",
-              "parameters": {
-                "dismiss_stale_reviews_on_push": true,
-                "require_code_owner_review": true,
-                "require_last_push_approval": false,
-                "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
-              }
-            },
-            {
-              "type": "required_status_checks",
-              "parameters": {
-                "required_status_checks": [
-                  {
-                    "context": "codex/github-review-gate",
-                    "integration_id": 15368
-                  }
-                ],
-                "strict_required_status_checks_policy": true
-              }
-            },
-            {
-              "type": "non_fast_forward"
-            }
-          ]
-        }
-      },
-      "canary": {
-        "pull_number": "REPLACE_WITH_OPEN_CANARY_PR_11",
-        "head_sha": "REPLACE_WITH_40_HEX_CANARY_HEAD_11",
-        "base_sha": "REPLACE_WITH_40_HEX_CURRENT_DEFAULT_BRANCH_HEAD_11",
-        "test_merge_sha": "REPLACE_WITH_40_HEX_TEST_MERGE_11",
-        "v2_check_run_id": "REPLACE_WITH_V2_CHECK_RUN_ID_11",
-        "v2_run_id": "REPLACE_WITH_V2_RUN_ID_11",
-        "v2_job_id": "REPLACE_WITH_V2_JOB_ID_11",
-        "v2_workflow_id": "REPLACE_WITH_V2_WORKFLOW_ID_11",
-        "v2_run_attempt": "REPLACE_WITH_V2_RUN_ATTEMPT_11",
-        "legacy_status_id": "REPLACE_WITH_LEGACY_BRIDGE_STATUS_ID_11"
-      },
-      "legacy_cleanup": [],
-      "codeowners": {
-        "path": ".github/CODEOWNERS",
-        "git_blob_sha": "REPLACE_WITH_CODEOWNERS_BLOB_SHA_11",
-        "sha256": "REPLACE_WITH_CODEOWNERS_SHA256_11",
-        "owner": {
-          "login": "JoeyTeng",
-          "id": 12524680,
-          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
-        }
-      }
     }
   ],
-  "expected_legacy_cleanup_action_count": 9
+  "expected_legacy_cleanup_action_count": 8
 }
