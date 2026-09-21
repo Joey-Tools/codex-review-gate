@@ -112,9 +112,15 @@ the global cutover is closed.
 ## Current State
 
 - Source tooling implements the temporary bridge, cohort handoff transaction,
-  receipt-bound bridge removal, and their operator-facing guides. A follow-up
-  source patch is under review to correct the controller's minimal permission
-  set and harden the handoff/bridge proof boundaries.
+  receipt-bound bridge removal, and their operator-facing guides. Source PR
+  `#54` merged as `5442b851200b6dd1fc85f88f0e2861f64d043906`: it corrects the
+  controller to the required PR-scoped comment authority and hardens the
+  handoff/bridge proof boundaries.
+- Release PR `#55` merged as `149769eac4b51df023a0edb79ad4a611d7a3edc3`,
+  updating the `v2.0.1` package and release manifest. The stable `v2.0.1`
+  package and floating `v2` alias are published; the release republishes the
+  already-reviewed `DESIGN.md` correction with its matching package version
+  and makes no runtime-code change.
 - Ten active cohort default branches have migrated to the canonical v2 verifier,
   controller, CODEOWNERS coverage, and temporary v1 bridge. No organization
   ruleset or required-status policy has been mutated by this workstream yet.
@@ -395,14 +401,14 @@ the global cutover is closed.
 
 ## Next Steps
 
-1. Merge the source permission/hardening patch, then use reviewed control-plane
-   PRs to update affected active consumers' copied controller bytes and retry
-   their existing exact-head canaries through `begin-review`.
+1. Use reviewed control-plane PRs to update affected active consumers' copied
+   controller bytes and retry their existing exact-head canaries through
+   `begin-review`.
 2. Reconcile the 10-member active cohort's remaining proof state;
-   `codex-waited-delivery` is archived, legacy-selector-only, and not a blocker, and
-   `codex-session-retrospective-history` has completed its bootstrap/canary
-   proof.
-3. Only after every current cohort member has dual-protection canary proof,
+   `codex-waited-delivery` is archived, legacy-selector-only, and not a
+   blocker, and `codex-session-retrospective-history` has completed its
+   bootstrap/canary proof.
+3. Only after all 10 active cohort members have dual-protection canary proof,
    stage/activate the organization v2 rule, execute the receipt-bound cleanup,
    and remove the temporary bridges in separate PRs.
 
