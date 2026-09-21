@@ -20,8 +20,10 @@
   frozen diff: it returned no actionable findings.
 - [x] Create the signed source commit and delivery PR after validation and
   review pass: signed commit `53c49bf` is the head of source PR #56.
-- [ ] Deliver the merged source change, then continue the separately authorized
-  10-repository dual-protection rollout and one-way v1 cutover.
+- [ ] Merge the narrow repository-ruleset readback-ordering correction, then
+  complete the separately authorized organization-v2 activation from its
+  fresh exact plan digest. Do not start v1 cleanup or cutover before the
+  stable dual-protection readback.
 
 ## Later
 

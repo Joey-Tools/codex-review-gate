@@ -123,9 +123,10 @@ the global cutover is closed.
   and makes no runtime-code change.
 - Ten active cohort default branches have migrated to the canonical v2 verifier,
   controller, CODEOWNERS coverage, and temporary v1 bridge. Repository-local
-  v2 rulesets are staged Disabled; no organization ruleset, active v2
-  enforcement, legacy v1 requirement, or retained old-rule protection has been
-  changed by this workstream.
+  v2 rulesets are Active; the old organization rule and its legacy v1
+  requirement/retained protections remain unchanged. The separately staged
+  organization-level v2 rule is Disabled until its full activation proof is
+  read back successfully.
 - The initial read-only inventory found that all 11 originally selected members
   inherited old organization rule `16590367`; nine additionally retained a
   repository-level legacy `codex/review-gate` requirement. Later bootstrap and
@@ -431,6 +432,43 @@ the global cutover is closed.
   and the other nine active repositories obtain their own current-base,
   dual-protection canary evidence.
 
+### Execution Update — 2026-09-21 (continued)
+
+- Source PR `#57` merged as
+  `b39418241c4f38aee88bcfd8c8173cb6da4697f0`, correcting the observed
+  minimal embedded repository shape without weakening the ID identity binding.
+  All ten active repositories subsequently supplied the required current-head,
+  dual-protection canary evidence; their repository-level v2 rulesets are
+  Active.
+- A first organization-level read-only `plan` then succeeded with legacy rule
+  `16590367` still at its exact before snapshot. Source PR `#58` merged as
+  `19247a26686e97efc53530e08a75ce72ca5c6727`, making the organization-selector
+  comparison tolerate GitHub's readback-only numeric ordering while retaining
+  selector membership and multiplicity exactly.
+- The reviewed stage preview (`plan_sha256`
+  `cddce84189dd7b187c58bb22e4be495782ddc17270b29a75c76673c80142fefc`) was
+  then applied and created organization ruleset `23787657`,
+  `Must Pass Codex Review v2`, in
+  Disabled enforcement. The POST payload was bound to exactly the ten active
+  repository IDs, has no bypass actor, and requires only
+  `codex/github-review-gate` from GitHub Actions integration `15368` with
+  strict up-to-date policy. The old v1 organization rule was not modified.
+- The following `activate` preview made no write and stopped at the repository
+  cleanup readback boundary. Live `GET /repos/{owner}/{repo}/rulesets/{id}`
+  responses for all eight legacy cleanup surfaces retain the exact same rules,
+  checks, and parameters as their frozen snapshots, but reorder both the
+  top-level `rules` collection and the unique required-status rule's
+  `required_status_checks` collection. The manifest continues to retain its
+  owner-reviewed write order.
+- The pending source correction therefore compares only those two observed
+  readback collections as full-element multisets for repository cleanup
+  classification. It neither deduplicates nor normalizes any other field or
+  array; rule/check addition, removal, replacement, repetition, context
+  spelling, parameter, or integration-ID drift remains fail closed. Manifest
+  validation, plan digests, and every mutation payload retain their original
+  exact ordering. Disabled organization rule `23787657` must remain Disabled
+  until this correction is merged and a fresh activation preview succeeds.
+
 ## Failure And Recovery Boundary
 
 - Any changed selector, active or legacy-only repository identity/default
@@ -525,14 +563,15 @@ the global cutover is closed.
 
 ## Next Steps
 
-1. Merge the source REST-shape correction and rerun the read-only activation
-   preview for open canary `codex-session-retrospective-history#10`.
-2. Create or reconcile a current-base, open/non-draft dual-protection canary
-   for each of the other nine active cohort repositories; keep every accepted
-   canary open until organization activation readback succeeds.
-3. Only after all 10 active cohort members have dual-protection canary proof,
-   stage/activate the organization v2 rule, execute the receipt-bound cleanup,
-   and remove the temporary bridges in separate PRs.
+1. Merge the narrow repository-ruleset readback-ordering correction and rerun
+   the bound, read-only organization `activate` preview.
+2. Only if that fresh preview succeeds, activate disabled organization ruleset
+   `23787657` using its immediately matching exact plan digest and record the
+   stable dual-protection readback. Do not begin repository cleanup or old-rule
+   cutover in the same step.
+3. Under the later, separately maintained policy-mutation freeze, execute the
+   receipt-bound cleanup and old v1 required-status removal; remove temporary
+   bridges only in separate consumer PRs after a final read-only receipt.
 
 ## Evidence
 

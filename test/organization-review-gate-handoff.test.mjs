@@ -110,6 +110,27 @@ function clone(value) {
   return structuredClone(value);
 }
 
+function compareCanonicalJsonUtf8ForTest(left, right) {
+  return Buffer.compare(
+    Buffer.from(canonicalJson(left), "utf8"),
+    Buffer.from(canonicalJson(right), "utf8"),
+  );
+}
+
+function normalizeRepositoryCleanupRulesetApiReadbackForTest(writable) {
+  const normalized = clone(writable);
+  const statusRules = normalized.rules.filter(
+    ({ type }) => type === "required_status_checks",
+  );
+  if (statusRules.length === 1) {
+    statusRules[0].parameters.required_status_checks.sort(
+      compareCanonicalJsonUtf8ForTest,
+    );
+  }
+  normalized.rules.sort(compareCanonicalJsonUtf8ForTest);
+  return normalized;
+}
+
 function statusRule(contexts) {
   return {
     type: "required_status_checks",
@@ -229,7 +250,7 @@ function repositoryCleanupAction(rulesetId, index) {
     surface: "repository_ruleset",
     ruleset_id: rulesetId,
     operation: "update",
-    expected_before: cleanupRuleset(name, [LEGACY_STATUS_CONTEXT, "test"]),
+    expected_before: cleanupRuleset(name, ["test", LEGACY_STATUS_CONTEXT]),
     expected_after: cleanupRuleset(name, ["test"]),
   };
 }
@@ -547,6 +568,8 @@ function createFakeGhHarness(
     legacyBridgeWorkflowHorizonDrift = false,
     apiSortOrganizationSelectorIds = false,
     apiOrganizationSelectorIds = null,
+    apiSortRepositoryCleanupRulesetArrays = false,
+    mutateRepositoryCleanupRulesetReadback = null,
   } = {},
 ) {
   const { manifest, codeownersBytes } = integrationManifestFixture();
@@ -820,6 +843,29 @@ function createFakeGhHarness(
         source: repository.slug,
         enforcement: action.expected_before.enforcement,
       });
+      const cleanupRulesetApiWritable = (writable, state) => {
+        let apiWritable = clone(writable);
+        if (mutateRepositoryCleanupRulesetReadback !== null) {
+          apiWritable = mutateRepositoryCleanupRulesetReadback(apiWritable, {
+            repository,
+            repositoryIndex,
+            action,
+            actionIndex,
+            ordinal: actionOrdinal,
+            state,
+          });
+        }
+        return apiSortRepositoryCleanupRulesetArrays
+          ? normalizeRepositoryCleanupRulesetApiReadbackForTest(apiWritable)
+          : apiWritable;
+      };
+      const cleanupRulesetResponse = (writable, state) =>
+        completeRulesetResponse(
+          action.ruleset_id,
+          "Repository",
+          repository.slug,
+          cleanupRulesetApiWritable(writable, state),
+        );
       cleanupResponses.push({
         request:
           `GET:repos/${encodedSlug}/rulesets/${action.ruleset_id}?includes_parents=false`,
@@ -829,28 +875,13 @@ function createFakeGhHarness(
         surfaceReadCountPath,
         ordinal: actionOrdinal,
         before: JSON.stringify(
-          completeRulesetResponse(
-            action.ruleset_id,
-            "Repository",
-            repository.slug,
-            action.expected_before,
-          ),
+          cleanupRulesetResponse(action.expected_before, "before"),
         ),
         after: JSON.stringify(
-          completeRulesetResponse(
-            action.ruleset_id,
-            "Repository",
-            repository.slug,
-            action.expected_after,
-          ),
+          cleanupRulesetResponse(action.expected_after, "after"),
         ),
         drifted: JSON.stringify({
-          ...completeRulesetResponse(
-            action.ruleset_id,
-            "Repository",
-            repository.slug,
-            action.expected_before,
-          ),
+          ...cleanupRulesetResponse(action.expected_before, "drifted"),
           name: "Unexpected concurrent cleanup policy edit",
         }),
       });
@@ -1661,10 +1692,12 @@ test("manifest admission uses one non-symlink regular-file descriptor and strict
 });
 
 test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover", async (t) => {
-  // GitHub sorts organization selector IDs on readback even though the
-  // manifest retains the approved cohort order for writes.
+  // Simulate observed GitHub readback reordering while the manifest retains
+  // its approved write order for organization selectors, cleanup rules, and
+  // cleanup status checks.
   const harness = createFakeGhHarness(t, {
     apiSortOrganizationSelectorIds: true,
+    apiSortRepositoryCleanupRulesetArrays: true,
   });
   const boundManifest = clone(harness.manifest);
   const stagingManifest = clone(boundManifest);
@@ -2255,6 +2288,112 @@ function configureDetailedCleanupHandoff(harness) {
     writeFileSync(action.path, "before\n");
   }
 }
+
+test("repository cleanup ruleset readback normalization rejects nonordering drift", async (t) => {
+  const cases = [
+    {
+      name: "rule replacement",
+      mutate: (ruleset) => {
+        ruleset.rules.find(({ type }) => type === "deletion").type = "creation";
+      },
+      error: /Repository legacy cleanup surface matches neither bound snapshot\./u,
+    },
+    {
+      name: "rule missing",
+      mutate: (ruleset) => {
+        ruleset.rules = ruleset.rules.filter(
+          ({ type }) => type !== "non_fast_forward",
+        );
+      },
+      error: /Repository legacy cleanup surface matches neither bound snapshot\./u,
+    },
+    {
+      name: "rule duplicate",
+      mutate: (ruleset) => {
+        ruleset.rules.push(clone(ruleset.rules.find(({ type }) => type === "deletion")));
+      },
+      error: /Repository legacy cleanup surface matches neither bound snapshot\./u,
+    },
+    {
+      name: "required status check replacement",
+      mutate: (ruleset) => {
+        ruleset.rules
+          .find(({ type }) => type === "required_status_checks")
+          .parameters.required_status_checks.find(
+            ({ context }) => context === "test",
+          ).context = "lint";
+      },
+      error: /Repository legacy cleanup surface matches neither bound snapshot\./u,
+    },
+    {
+      name: "required status check missing",
+      mutate: (ruleset) => {
+        const checks = ruleset.rules.find(
+          ({ type }) => type === "required_status_checks",
+        ).parameters.required_status_checks;
+        checks.splice(
+          checks.findIndex(({ context }) => context === "test"),
+          1,
+        );
+      },
+      error: /Repository legacy cleanup surface matches neither bound snapshot\./u,
+    },
+    {
+      name: "required status check duplicate",
+      mutate: (ruleset) => {
+        const checks = ruleset.rules.find(
+          ({ type }) => type === "required_status_checks",
+        ).parameters.required_status_checks;
+        checks.push(clone(checks.find(({ context }) => context === "test")));
+      },
+      error: /duplicate required status contexts/u,
+    },
+    {
+      name: "integration id drift",
+      mutate: (ruleset) => {
+        ruleset.rules
+          .find(({ type }) => type === "required_status_checks")
+          .parameters.required_status_checks[0].integration_id += 1;
+      },
+      error: /Repository legacy cleanup surface matches neither bound snapshot\./u,
+    },
+    {
+      name: "required status parameters drift",
+      mutate: (ruleset) => {
+        ruleset.rules.find(
+          ({ type }) => type === "required_status_checks",
+        ).parameters.strict_required_status_checks_policy = false;
+      },
+      error: /Repository legacy cleanup surface matches neither bound snapshot\./u,
+    },
+  ];
+
+  for (const cleanupCase of cases) {
+    await t.test(cleanupCase.name, async (t) => {
+      const harness = createFakeGhHarness(t, {
+        detailedCleanupState: true,
+        apiSortRepositoryCleanupRulesetArrays: true,
+        mutateRepositoryCleanupRulesetReadback: (ruleset, context) => {
+          if (context.ordinal === 0 && context.state === "before") {
+            cleanupCase.mutate(ruleset);
+          }
+          return ruleset;
+        },
+      });
+      configureDetailedCleanupHandoff(harness);
+
+      await assert.rejects(
+        runFakeCli(harness, "apply-repository-cleanup"),
+        cleanupCase.error,
+      );
+      assert.deepEqual(
+        mutationRequests(fakeGhRequests(harness.logPath)),
+        [],
+        "any policy drift beyond GitHub's documented ordering must fail before a cleanup write",
+      );
+    });
+  }
+});
 
 test("repository cleanup executor performs every pending action in serial exact-before/readback order", async (t) => {
   const harness = createFakeGhHarness(t, { detailedCleanupState: true });
