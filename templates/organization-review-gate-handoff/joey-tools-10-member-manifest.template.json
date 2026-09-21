@@ -7,6 +7,13 @@
   },
   "legacy_ruleset": {
     "id": 16590367,
+    "legacy_only_repository": {
+      "slug": "Joey-Tools/codex-waited-delivery",
+      "id": 1242512099,
+      "node_id": "R_kgDOSg864w",
+      "default_branch": "master",
+      "archived": true
+    },
     "expected_before": {
       "name": "Must Pass Codex Review",
       "target": "branch",

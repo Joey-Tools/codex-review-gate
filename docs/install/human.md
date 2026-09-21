@@ -156,6 +156,12 @@ the original eleven-repository selector so the old rule retains its
 `deletion` and `non_fast_forward` protection after cutover. It is not a member
 of the active v2 cohort and receives no v2 installation, canary,
 repository-level cleanup, final-closure receipt membership, or bridge removal.
+The manifest must identify this one exception at
+`legacy_ruleset.legacy_only_repository` with its exact `slug`, numeric `id`,
+`node_id`, `default_branch`, and `archived: true`. The old selector may contain
+only the ordered ten active IDs plus that identity's ID exactly once. An
+unknown eleventh ID or any overlap with an active repository is a hard failure,
+so retained archive protection cannot be redirected accidentally.
 
 The handoff deliberately separates protection responsibilities:
 
@@ -180,10 +186,10 @@ The source of truth for this transaction is one reviewed JSON manifest with
 schema `organization-review-gate-handoff-manifest/v2`. It binds the
 organization identity, the exact old organization ruleset, the new ruleset
 name and ID, exactly ten ordered active repository identities, and the exact
-original eleven-repository legacy selector; the three workflow blob and
-content hashes; the effective CODEOWNERS identity; each complete Active
-repository v2 ruleset; and every active repository-level legacy-cleanup
-before/after snapshot. Each canary entry binds an open, non-draft,
+original eleven-repository legacy selector plus its fixed archived-only
+repository identity; the three workflow blob and content hashes; the effective
+CODEOWNERS identity; each complete Active repository v2 ruleset; and every
+active repository-level legacy-cleanup before/after snapshot. Each canary entry binds an open, non-draft,
 same-repository PR to its exact current head, base and test-merge SHAs; the v2
 CheckRun plus its workflow run, attempt and job identities; and the latest
 successful legacy commit-status ID. Missing, extra or reordered members are a
@@ -192,6 +198,8 @@ hard failure.
 This is the current v2 handoff path. A previously issued v1 output with a
 schema-1 receipt is historical eleven-member closure evidence only; do not use
 it to install, stage, activate, clean up, or remove a bridge for this cohort.
+Its published JSON shape and canonical receipt digest remain strictly validated
+for historical audit, but schema 1 authorizes no new bridge removal.
 
 Start from
 `templates/organization-review-gate-handoff/joey-tools-10-member-manifest.template.json`
@@ -332,6 +340,15 @@ atomic. The helper checks the exact manifest-bound bypass lists; it cannot
 automatically discover or preserve an actor concurrently added outside that
 snapshot.
 
+Every post-activation and cutover stable snapshot also reads the archived-only
+repository from GitHub and requires exact `full_name`, `id`, `node_id`,
+`default_branch`, and `archived: true` equality with the manifest. Immediately
+before the legacy-rule cutover `PUT`, it rereads that identity alongside the old
+ruleset. An unreadable result, same-slug replacement, identity/default-branch
+drift, or an archive flag that is no longer true is inconclusive and produces
+no cutover write; it does not add the archived repository to v2, the receipt,
+or bridge-removal scope.
+
 The successful activation readback is the double-protection handoff point:
 all ten active members have the complete repository v2 policy, the shared
 v2-only organization rule is Active, and the old organization v1 rule is still
@@ -461,14 +478,20 @@ That read-only result must have top-level
 `action: null`. It also embeds
 `final_closure_receipt` schema version 2, binding the organization, reviewed
 manifest digest, final snapshot digest, legacy/v2 ruleset IDs and states, and
-the fixed, complete ten-repository active v2 cohort in canonical UTF-8-byte
-`full_name` order. It admits neither a subset nor an expanded active cohort.
-The separate old selector remains the original eleven repositories, including
-the archived legacy-only repository, but that repository is not admitted to
-the receipt or bridge removal. Its top-level `plan_sha256` must exactly bind
-the final read-only `verify` plan (`mode`, manifest digest, snapshot digest,
-and `action: null`); `final_closure_receipt_sha256` binds the canonical
-embedded receipt. Preserve the **complete verify JSON output** at
+the fixed, complete ten-repository active v2 cohort twice: schema-2
+`manifest_repositories` is the canonical identity list derived from the
+reviewed manifest, while `repositories` is the stable observed identity list.
+Both list `full_name`, `id`, `node_id`, and `default_branch` in canonical
+UTF-8-byte `full_name` order and must match exactly entry by entry. It admits
+neither a subset nor an expanded active cohort. For this rollout, either list
+is rejected if it contains archived `Joey-Tools/codex-waited-delivery` by
+case-insensitive slug, numeric ID, or node ID; the archive cannot enter an
+active receipt list. The separate old selector remains the original eleven
+repositories, but it is not admitted to the receipt or bridge removal. Its
+top-level `plan_sha256` must exactly bind the final read-only `verify` plan
+(`mode`, manifest digest, snapshot digest, and `action: null`);
+`final_closure_receipt_sha256` binds the canonical embedded receipt. Preserve
+the **complete verify JSON output** at
 `HANDOFF_FINAL_VERIFY`; do not save only the embedded receipt.
 
 The third freeze may end after that complete output has been captured and
@@ -512,11 +535,13 @@ fields, recomputes the canonical embedded receipt digest, compares the explicit
 expected SHA-256, parses the worktree's unambiguous GitHub `origin`, and reads
 the current repository metadata from GitHub. It requires exact equality of
 `full_name`, `id`, `node_id`, and `default_branch` with one entry in the fixed
-ten-member active receipt cohort. The archived legacy-only repository is
-deliberately absent, so it cannot authorize bridge removal. At the pre-rename
-boundary, it reads `origin` before and after the live-metadata query, repeats
-the local object checks, then reads `origin` once more immediately before the
-atomic bridge quarantine rename. After that rename and before unlink, it
+ten-member manifest-derived `manifest_repositories` cohort; the separate
+observed `repositories` list is checked for equality but is not an
+authorization source. The archived legacy-only repository is deliberately
+absent, so it cannot authorize bridge removal. At the pre-rename boundary, it
+reads `origin` before and after the live-metadata query, repeats the local
+object checks, then reads `origin` once more immediately before the atomic
+bridge quarantine rename. After that rename and before unlink, it
 repeats the complete `origin` -> live metadata identity/default-branch ->
 `origin` check and then revalidates the quarantined file's admitted object
 identity and canonical content. If the remote binding recheck fails, it

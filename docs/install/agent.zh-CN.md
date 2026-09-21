@@ -62,6 +62,10 @@ cohort 时，才使用本执行路径。旧 v1 rule 仍保留其原始 11 仓 le
 `Joey-Tools/codex-waited-delivery` 已归档且仅属于 legacy。它留在旧 rule 的原始 11 仓
 selector 中，使 `deletion` 和 `non_fast_forward` 在 cutover 后仍受保护。它不需要 v2
 installation、canary、repository cleanup、final-closure receipt membership 或 bridge removal。
+Manifest 在 `legacy_ruleset.legacy_only_repository` 中绑定这一唯一例外的精确 `slug`、numeric
+`id`、`node_id`、`default_branch` 与 `archived: true`。旧 selector 只能包含按顺序排列的 10 个
+活动 ID，以及该 identity 的 ID 一次；未知的第 11 个 ID、重复项或与活动 cohort 的 identity
+overlap 都必须拒绝，否则归档仓的保护可能被静默重定向。
 
 增加以下 cohort inputs：
 
@@ -72,18 +76,19 @@ V2_ORGANIZATION_RULESET_NAME = Must Pass Codex Review v2
 COHORT_REPOSITORY_V2_RULESET_NAME = Must Pass Codex Review v2
 ```
 
-Manifest 必须绑定 exact organization ID/node ID、旧 organization ruleset 的完整 snapshot 与其
-原始 11 仓 selector、新 rule 的 name/ID、精确且有序的 10 个活动 repository slugs/numeric
-IDs/node IDs/default branches、verifier/controller/temporary bridge 的 Git blob SHA 与
-SHA-256、effective CODEOWNERS identity、每个完整 Active repository v2 ruleset，以及每个
-活动 repository legacy-cleanup before/after action。每个 canary 必须把 exact open、
+Manifest 必须绑定 exact organization ID/node ID、旧 organization ruleset 的完整 snapshot、其
+原始 11 仓 selector 与固定 archived-only repository identity、新 rule 的 name/ID、精确且有序
+的 10 个活动 repository slugs/numeric IDs/node IDs/default branches、verifier/controller/
+temporary bridge 的 Git blob SHA 与 SHA-256、effective CODEOWNERS identity、每个完整 Active
+repository v2 ruleset，以及每个活动 repository legacy-cleanup before/after action。每个 canary 必须把 exact open、
 non-draft、same-repository PR 绑定到 current head/base/test-merge SHAs、v2 CheckRun/run/
 workflow/attempt/job IDs，以及最新 successful legacy commit-status ID。任意字段不完整、
 活动成员集不同、identity drift 或 unsupported surface 都必须停止。
 
 这是当前的 v2 handoff 路径。此前已签发的 v1 output 与 schema-1 receipt 只构成历史 11 仓
 closure evidence；不得用它为本 cohort 执行 installation、staging、activation、cleanup 或
-bridge removal。
+bridge removal。其已经发布的 JSON shape 与 canonical receipt digest 仍会为历史审计而严格
+验证，但 schema 1 不授权任何新的 bridge removal。
 
 按同目录 README 实例化
 `templates/organization-review-gate-handoff/joey-tools-10-member-manifest.template.json`。
@@ -107,6 +112,12 @@ conditional/CAS update，cleanup mutation API 也没有 repository-ID conditiona
 plan digest 与紧邻重读可以拒绝已观察到的 drift，却无法阻止最后 GET→PUT 或 repository
 metadata read→write 区间的 racing write，这些区间由 freeze 覆盖。只能验证 manifest 绑定的
 bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 actor。
+
+每个 post-activation/cutover stable snapshot 还必须从 GitHub 读取 archived-only repository，
+并将 `full_name`、`id`、`node_id`、`default_branch` 与 `archived: true` 同 manifest 精确比对。
+旧规则 cutover `PUT` 前，必须与旧 ruleset 一起紧邻复读该 identity。读取失败、same-slug
+replacement、identity/default-branch drift 或 `archived: false` 都是 inconclusive，绝不能发送
+cutover write；这份 proof 不会使归档仓成为 v2、receipt 或 bridge-removal member。
 
 严格按下列 state machine 执行：
 
@@ -328,12 +339,16 @@ bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 ac
    `final_closure_receipt.schema_version: 2` 与 lowercase 64-hex
    `final_closure_receipt_sha256` 的输出。Embedded receipt 必须绑定 organization、reviewed
    manifest digest、final snapshot digest、legacy/v2 ruleset IDs/states 与按 canonical UTF-8
-   byte `full_name` order 排列的 exact repository cohort：只能是固定、完整的 10 仓活动 v2
-   cohort，不能是任意子集或扩大的活动 cohort。独立的旧 selector 仍是原始 11 仓（包括仅属于
-   legacy 的已归档仓），但不赋予 final-closure receipt membership 或 bridge-removal authority。
-   top-level `plan_sha256` 必须精确绑定最终只读 `verify` plan（`mode`、manifest digest、
-   snapshot digest 与 `action: null`）。必须完整保留 `HANDOFF_FINAL_VERIFY` 中的 JSON output；
-   单独提取 embedded receipt 不能作为 bootstrap 输入。
+   byte `full_name` order 排列的 exact repository cohort 两次：`manifest_repositories` 从
+   reviewed manifest 派生，`repositories` 是 stable observed identity list。两者都含
+   `full_name`、`id`、`node_id` 与 `default_branch`，并且必须逐项完全一致；只能是固定、完整的
+   10 仓活动 v2 cohort，不能是任意子集或扩大的活动 cohort。对于当前 rollout，任一 list 只要按
+   case-insensitive slug、numeric ID 或 node ID 命中已归档的
+   `Joey-Tools/codex-waited-delivery` 就会被拒绝，因此归档仓不能进入 active receipt list。
+   独立的旧 selector 仍是原始 11 仓，但不赋予 final-closure receipt membership 或
+   bridge-removal authority。top-level `plan_sha256` 必须精确绑定最终只读 `verify` plan
+   （`mode`、manifest digest、snapshot digest 与 `action: null`）。必须完整保留
+   `HANDOFF_FINAL_VERIFY` 中的 JSON output；单独提取 embedded receipt 不能作为 bootstrap 输入。
 
    只有该文件及 top-level shape 验证完成后，第三段 freeze 才结束。若本次读取 inconclusive
    或任何 bound policy 不一致，保留所有 bridges，修复 drift，并在 freeze 下重复最终只读
@@ -365,10 +380,11 @@ bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 ac
    output。Bootstrap 会验证 terminal top-level fields、重新计算 canonical embedded receipt
    digest、比对显式 expected SHA-256、解析 target worktree 中无歧义的 GitHub `origin`，并从
 GitHub 读取 live repository metadata。它要求 `full_name`、`id`、`node_id` 与
-`default_branch` 都和固定 10 仓活动 receipt cohort 中的一项精确相等。已归档、仅属于 legacy
-的 repository 被刻意排除，因此不能授权 bridge removal。在 atomic bridge quarantine rename
-前的边界，它会先在 live-metadata query 前后各读取一次 `origin`，重新验证本地对象后，再紧邻
-rename 读取一次 `origin`。Rename 后、unlink 前，它会再次执行完整的 `origin` -> live
+`default_branch` 都和固定 10 仓 manifest-derived `manifest_repositories` cohort 中的一项精确
+相等。Observed `repositories` list 会独立验证完全相等，但不是 authorization source。已归档、
+仅属于 legacy 的 repository 被刻意排除，因此不能授权 bridge removal。在 atomic bridge
+quarantine rename 前的边界，它会先在 live-metadata query 前后各读取一次 `origin`，重新验证
+本地对象后，再紧邻 rename 读取一次 `origin`。Rename 后、unlink 前，它会再次执行完整的 `origin` -> live
 metadata identity/default-branch -> `origin` 检查，并重新验证 quarantine 中 admitted file 的
 object identity 与 canonical content。若该 remote binding check 失败，它会通过 no-clobber
 hard-link creation 尝试把同一 admitted bridge 恢复到 canonical path；若目标路径已被占用或

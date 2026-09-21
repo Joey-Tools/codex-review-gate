@@ -1319,7 +1319,13 @@ test("validates historical v1 and current v2 organization final closure receipts
   );
   assert.deepEqual(
     currentValidated.bridgeRemovalRepositories,
+    output.final_closure_receipt.manifest_repositories,
+    "v2 bridge removal is authorized by the manifest-derived identity cohort",
+  );
+  assert.deepEqual(
+    output.final_closure_receipt.manifest_repositories,
     output.final_closure_receipt.repositories,
+    "a producer's v2 manifest cohort must exactly bind the stable observed cohort",
   );
   assert.equal(
     historicalOutput.final_closure_receipt_sha256,
@@ -1368,6 +1374,29 @@ test("validates historical v1 and current v2 organization final closure receipts
     v2WithElevenRepositories.final_closure_receipt.repositories.length;
   refreshFinalClosureReceiptDigest(v2WithElevenRepositories);
 
+  const v2WithObservedArchiveSubstitution = structuredClone(output);
+  v2WithObservedArchiveSubstitution.final_closure_receipt.repositories = [
+    ...v2WithObservedArchiveSubstitution.final_closure_receipt.repositories.slice(1),
+    {
+      full_name: "Joey-Tools/codex-waited-delivery",
+      id: 1_242_512_099,
+      node_id: "R_kgDOSg864w",
+      default_branch: "master",
+    },
+  ].sort((left, right) =>
+    left.full_name < right.full_name ? -1 : left.full_name > right.full_name ? 1 : 0
+  );
+  refreshFinalClosureReceiptDigest(v2WithObservedArchiveSubstitution);
+
+  const v2WithoutManifestRepositories = structuredClone(output);
+  delete v2WithoutManifestRepositories.final_closure_receipt.manifest_repositories;
+  refreshFinalClosureReceiptDigest(v2WithoutManifestRepositories);
+
+  const v1WithManifestRepositories = structuredClone(historicalOutput);
+  v1WithManifestRepositories.final_closure_receipt.manifest_repositories =
+    structuredClone(output.final_closure_receipt.manifest_repositories);
+  refreshFinalClosureReceiptDigest(v1WithManifestRepositories);
+
   const unknownOutputFormat = structuredClone(output);
   unknownOutputFormat.schema_version = "organization-review-gate-handoff-output/v3";
 
@@ -1400,6 +1429,9 @@ test("validates historical v1 and current v2 organization final closure receipts
     ["cross-paired-v2-output", v2WithV1Receipt],
     ["v1-with-ten-repositories", v1WithTenRepositories],
     ["v2-with-eleven-repositories", v2WithElevenRepositories],
+    ["v2-observed-archive-substitution", v2WithObservedArchiveSubstitution],
+    ["v2-without-manifest-repositories", v2WithoutManifestRepositories],
+    ["v1-with-manifest-repositories", v1WithManifestRepositories],
     ["unknown-output-format", unknownOutputFormat],
     ["unknown-receipt-format", unknownReceiptFormat],
     ["receipt-extra-key", receiptWithExtraKey],
@@ -1454,7 +1486,7 @@ test("validates historical v1 and current v2 organization final closure receipts
   ]) {
     assert.throws(
       () => validateOrganizationFinalClosureOutput(candidate),
-      /final|receipt|repositories_verified|organization|plan_sha256|cohort|schema_version|keys|slug|default_branch|order/iu,
+      /final|receipt|repositories_verified|organization|plan_sha256|cohort|schema_version|keys|slug|default_branch|order|manifest/iu,
       name,
     );
   }
@@ -1735,6 +1767,41 @@ test("legacy bridge removal requires an exact repository-bound final closure rec
       codeownersContent: "# proof-admission-sentinel\n",
     },
     {
+      name: "v2-observed-cohort-substitutes-archived-legacy-only",
+      prepare: (targetRoot) => {
+        const output = buildFinalClosureOutput();
+        const substitutedRepositories =
+          substituteArchivedLegacyOnlyReceiptRepository(
+            output.final_closure_receipt.repositories,
+          );
+        output.final_closure_receipt.repositories = substitutedRepositories;
+        refreshFinalClosureReceiptDigest(output);
+        return prepareFinalClosureReceipt(targetRoot, { output });
+      },
+      expected: /must not authorize the current archived legacy-only repository/u,
+      codeownersContent: "# proof-admission-sentinel\n",
+      assertPreflightNoLocalMutation: true,
+    },
+    {
+      name: "v2-manifest-and-observed-cohort-substitute-archived-legacy-only",
+      prepare: (targetRoot) => {
+        const output = buildFinalClosureOutput();
+        const substitutedRepositories =
+          substituteArchivedLegacyOnlyReceiptRepository(
+            output.final_closure_receipt.repositories,
+          );
+        output.final_closure_receipt.repositories = substitutedRepositories;
+        output.final_closure_receipt.manifest_repositories = structuredClone(
+          substitutedRepositories,
+        );
+        refreshFinalClosureReceiptDigest(output);
+        return prepareFinalClosureReceipt(targetRoot, { output });
+      },
+      expected: /must not authorize the current archived legacy-only repository/u,
+      codeownersContent: "# proof-admission-sentinel\n",
+      assertPreflightNoLocalMutation: true,
+    },
+    {
       name: "wrong-digest",
       prepare: (targetRoot) => {
         const args = prepareFinalClosureReceipt(targetRoot);
@@ -1787,6 +1854,24 @@ test("legacy bridge removal requires an exact repository-bound final closure rec
           readFileSync(join(targetRoot, ".github", "CODEOWNERS"), "utf8"),
           scenario.codeownersContent,
           `${scenario.name}: final closure admission must reject before local mutations`,
+        );
+      }
+      if (scenario.assertPreflightNoLocalMutation === true) {
+        assert.equal(
+          readFileSync(
+            join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+            "utf8",
+          ),
+          CANONICAL_WORKFLOW,
+          `${scenario.name}: admission must reject before verifier mutation`,
+        );
+        assert.equal(
+          readFileSync(
+            join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+            "utf8",
+          ),
+          CANONICAL_CONTROLLER_WORKFLOW,
+          `${scenario.name}: admission must reject before controller mutation`,
         );
       }
     } finally {
@@ -1987,6 +2072,86 @@ test("legacy bridge removal rejects same-slug recreated repository identity drif
     } finally {
       rmSync(targetRoot, { recursive: true, force: true });
     }
+  }
+});
+
+test("legacy bridge removal stops before its final quarantine rename when origin drifts after a prior mutation", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-final-rename-origin-drift-"),
+  );
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const finalClosureArgs = prepareFinalClosureReceipt(targetRoot);
+    const finalClosureEnv = finalClosureGhEnvironment(targetRoot, {}, {
+      // The first query authorizes the preceding CODEOWNERS install; the
+      // fourth is the final live binding check immediately before the bridge
+      // path can be renamed into quarantine.
+      originDriftOnLiveQuery: 4,
+    });
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      "# retained ownership\n",
+      "utf8",
+    );
+    const preloadPath = join(targetRoot, "final-rename-origin-drift.cjs");
+    const bridgeMutationLog = join(targetRoot, "bridge-mutation-calls.log");
+    writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...finalClosureArgs,
+      "--apply",
+    ], {
+      env: {
+        ...finalClosureEnv,
+        NODE_OPTIONS: `--require=${preloadPath}`,
+        CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+        CODEX_BOOTSTRAP_TEST_BRIDGE_MUTATION_LOG: bridgeMutationLog,
+      },
+    });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /Git origin repository changed during immediately before legacy bridge quarantine rename/u,
+    );
+    assert.match(
+      result.stderr,
+      /Partial local apply: completed CODEOWNERS/u,
+    );
+    assert.equal(
+      readFileSync(join(targetRoot, ".github", "CODEOWNERS"), "utf8"),
+      ensureControlPlaneCodeownersContent("# retained ownership\n").content,
+      "the preceding local mutation must have completed before the final binding check",
+    );
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+    assert.equal(
+      existsSync(bridgeMutationLog),
+      false,
+      "origin drift at the final binding check must prevent bridge rename and unlink",
+    );
+    assert.doesNotMatch(result.stdout, /Applied: remove|Next:/u);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
   }
 });
 
@@ -8125,6 +8290,9 @@ function buildFinalClosureOutput({
     v2_ruleset: { id: 26590367, state: "active" },
     repositories,
   };
+  if (closureFormat.receiptSchemaVersion === 2) {
+    receipt.manifest_repositories = structuredClone(repositories);
+  }
   return {
     schema_version: closureFormat.outputSchemaVersion,
     mode: "verify",
@@ -8165,6 +8333,24 @@ function finalClosureFixtureFormat(format) {
   }
 }
 
+function substituteArchivedLegacyOnlyReceiptRepository(repositories) {
+  return [
+    ...repositories.slice(1),
+    {
+      full_name: "Joey-Tools/codex-waited-delivery",
+      id: 1_242_512_099,
+      node_id: "R_kgDOSg864w",
+      default_branch: "master",
+    },
+  ].sort((left, right) =>
+    left.full_name < right.full_name
+      ? -1
+      : left.full_name > right.full_name
+        ? 1
+        : 0
+  );
+}
+
 function refreshFinalClosureReceiptDigest(output) {
   output.final_closure_receipt_sha256 = createHash("sha256")
     .update(canonicalJsonForTest(output.final_closure_receipt))
@@ -8185,7 +8371,7 @@ function canonicalJsonForTest(value) {
 }
 
 function prepareFinalClosureReceipt(targetRoot, options = {}) {
-  const output = buildFinalClosureOutput(options);
+  const output = options.output ?? buildFinalClosureOutput(options);
   const receiptPath = join(targetRoot, "organization-final-closure.json");
   const repoSlug = output.final_closure_receipt.repositories[0].full_name;
   runGit([

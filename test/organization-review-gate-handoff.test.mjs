@@ -15,6 +15,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  validateOrganizationFinalClosureOutput,
+} from "../src/bootstrap.mjs";
+import {
   CANONICAL_WORKFLOW_IDENTITIES,
   CODEOWNERS_PATH,
   FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION,
@@ -28,6 +31,7 @@ import {
   V2_RULESET_NAME,
   V2_STATUS_CONTEXT,
   V2_VERIFIER_RUN_NAME_PREFIX,
+  buildFinalClosureReceipt,
   buildV2OrganizationRulesetPayload,
   canonicalJson,
   deriveLegacyOrganizationCutoverPayload,
@@ -88,7 +92,14 @@ const REPOSITORIES = [
   ["codex-session-retrospective-history", 1246526548, null],
 ];
 
-const ARCHIVED_LEGACY_ONLY_REPOSITORY_ID = 1242512099;
+const ARCHIVED_LEGACY_ONLY_REPOSITORY = Object.freeze({
+  slug: "Joey-Tools/codex-waited-delivery",
+  id: 1242512099,
+  node_id: "R_kgDOSg864w",
+  default_branch: "master",
+  archived: true,
+});
+const ARCHIVED_LEGACY_ONLY_REPOSITORY_ID = ARCHIVED_LEGACY_ONLY_REPOSITORY.id;
 const LEGACY_SELECTOR_REPOSITORY_IDS = [
   ...REPOSITORIES.slice(0, 8).map(([, id]) => id),
   ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
@@ -293,6 +304,7 @@ function manifestFixture() {
     organization: clone(ORGANIZATION),
     legacy_ruleset: {
       id: 16590367,
+      legacy_only_repository: clone(ARCHIVED_LEGACY_ONLY_REPOSITORY),
       expected_before: legacyOrganizationRuleset(
         [...LEGACY_SELECTOR_REPOSITORY_IDS],
       ),
@@ -542,6 +554,10 @@ function createFakeGhHarness(
   const manifestPath = join(directory, "manifest.json");
   const v2StatePath = join(directory, "v2-state");
   const legacyStatePath = join(directory, "legacy-state");
+  const legacyOnlyIdentityStatePath = join(
+    directory,
+    "legacy-only-identity-state",
+  );
   const cleanupStatePath = join(directory, "cleanup-state");
   const cleanupIdentityReadCountPath = join(
     directory,
@@ -570,6 +586,29 @@ function createFakeGhHarness(
   const organization = manifest.organization;
   const encodedOrganization = encodeURIComponent(organization.login);
   addFakeResponse(responses, `orgs/${encodedOrganization}`, organization);
+  const legacyOnlyRepository = manifest.legacy_ruleset.legacy_only_repository;
+  const legacyOnlyRepositoryEndpoint =
+    `repos/${encodeEndpointPathForTest(legacyOnlyRepository.slug)}`;
+  const legacyOnlyRepositoryIdentity = {
+    full_name: legacyOnlyRepository.slug,
+    id: legacyOnlyRepository.id,
+    node_id: legacyOnlyRepository.node_id,
+    default_branch: legacyOnlyRepository.default_branch,
+    archived: legacyOnlyRepository.archived,
+  };
+  const legacyOnlyRepositoryArchiveDrift = {
+    ...legacyOnlyRepositoryIdentity,
+    archived: false,
+  };
+  const legacyOnlyRepositoryIdentityDrift = {
+    ...legacyOnlyRepositoryIdentity,
+    node_id: `${legacyOnlyRepository.node_id}_replacement`,
+  };
+  addFakeResponse(
+    responses,
+    legacyOnlyRepositoryEndpoint,
+    legacyOnlyRepositoryIdentity,
+  );
 
   for (const [repositoryIndex, repository] of manifest.repositories.entries()) {
     const encodedSlug = encodeEndpointPathForTest(repository.slug);
@@ -1360,6 +1399,17 @@ function createFakeGhHarness(
     }
     scriptLines.push("esac");
   }
+  scriptLines.push(
+    `if [ "$request" = ${shellQuote(`GET:${legacyOnlyRepositoryEndpoint}`)} ]; then`,
+    `  case "$(cat ${shellQuote(legacyOnlyIdentityStatePath)})" in`,
+    `    bound) respond ${shellQuote(JSON.stringify(legacyOnlyRepositoryIdentity))} ;;`,
+    `    unarchived) respond ${shellQuote(JSON.stringify(legacyOnlyRepositoryArchiveDrift))} ;;`,
+    `    identity-drift) respond ${shellQuote(JSON.stringify(legacyOnlyRepositoryIdentityDrift))} ;;`,
+    "    unreadable) printf '%s\\n' 'simulated legacy-only repository identity read failure' >&2; exit 1 ;;",
+    "    *) printf '%s\\n' 'invalid fake legacy-only repository identity state' >&2; exit 2 ;;",
+    "  esac",
+    "fi",
+  );
   scriptLines.push('case "$request" in');
   for (const [request, response] of responses.entries()) {
     scriptLines.push(`  ${shellQuote(request)}) respond ${shellQuote(response)} ;;`);
@@ -1376,6 +1426,7 @@ function createFakeGhHarness(
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(v2StatePath, "absent\n");
   writeFileSync(legacyStatePath, "before\n");
+  writeFileSync(legacyOnlyIdentityStatePath, "bound\n");
   writeFileSync(cleanupStatePath, "before\n");
   writeFileSync(cleanupIdentityReadCountPath, "0\n");
   writeFileSync(legacyWriterRaceStatePath, "before\n");
@@ -1424,6 +1475,7 @@ function createFakeGhHarness(
     logPath,
     v2StatePath,
     legacyStatePath,
+    legacyOnlyIdentityStatePath,
     cleanupStatePath,
     cleanupIdentityReadCountPath,
     legacyWriterRaceStatePath,
@@ -1611,6 +1663,10 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     `${organizationRulesetsEndpoint}/${boundManifest.v2_ruleset.id}`;
   const legacyRulesetEndpoint =
     `${organizationRulesetsEndpoint}/${boundManifest.legacy_ruleset.id}`;
+  const legacyOnlyRepositoryEndpoint =
+    `repos/${encodeEndpointPathForTest(
+      boundManifest.legacy_ruleset.legacy_only_repository.slug,
+    )}`;
 
   writeFileSync(harness.logPath, "");
   const plan = await runFakeCli(harness, "plan");
@@ -1990,6 +2046,14 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     countRequest(cutoverBefore, "GET", legacyRulesetEndpoint) >= 4,
     "cutover must finish with a direct legacy organization ruleset read after full-cohort revalidation",
   );
+  assert.ok(
+    countRequest(cutoverBefore, "GET", legacyOnlyRepositoryEndpoint) >= 4,
+    "cutover must stably observe the archived selector identity and reread it immediately before the legacy PUT",
+  );
+  assert.ok(
+    countRequest(cutoverAfter, "GET", legacyOnlyRepositoryEndpoint) >= 2,
+    "final closure must retain two stable archived-selector identity reads",
+  );
   for (const repository of boundManifest.repositories) {
     for (const action of repository.legacy_cleanup) {
       const endpoint =
@@ -2011,6 +2075,19 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   assert.equal(verifyCompletePreview.status, "final-verified");
   assert.equal(verifyCompletePreview.applied, false);
   assert.equal(verifyCompletePreview.action, null);
+  const expectedFinalClosureRepositories = boundManifest.repositories
+    .map(({ slug, id, node_id, default_branch }) => ({
+      full_name: slug,
+      id,
+      node_id,
+      default_branch,
+    }))
+    .sort((left, right) =>
+      Buffer.compare(
+        Buffer.from(left.full_name, "utf8"),
+        Buffer.from(right.full_name, "utf8"),
+      )
+    );
   assert.deepEqual(verifyCompletePreview.final_closure_receipt, {
     schema_version: FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION,
     organization: boundManifest.organization,
@@ -2024,34 +2101,45 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
       id: boundManifest.v2_ruleset.id,
       state: "active",
     },
-    repositories: boundManifest.repositories
-      .map(({ slug, id, node_id, default_branch }) => ({
-        full_name: slug,
-        id,
-        node_id,
-        default_branch,
-      }))
-      .sort((left, right) =>
-        Buffer.compare(
-          Buffer.from(left.full_name, "utf8"),
-          Buffer.from(right.full_name, "utf8"),
-        )
-      ),
+    manifest_repositories: expectedFinalClosureRepositories,
+    repositories: expectedFinalClosureRepositories,
   });
+  assert.deepEqual(
+    verifyCompletePreview.final_closure_receipt.manifest_repositories,
+    verifyCompletePreview.final_closure_receipt.repositories,
+    "the final receipt must bind its observed cohort to manifest.repositories",
+  );
   assert.equal(
     verifyCompletePreview.final_closure_receipt.repositories.length,
     REQUIRED_REPOSITORY_COUNT,
   );
-  assert.equal(
-    verifyCompletePreview.final_closure_receipt.repositories.some(
-      ({ id }) => id === ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
-    ),
-    false,
-    "the final receipt must not authorize the archived legacy-only repository",
-  );
+  for (const [field, repositories] of [
+    ["repositories", verifyCompletePreview.final_closure_receipt.repositories],
+    [
+      "manifest_repositories",
+      verifyCompletePreview.final_closure_receipt.manifest_repositories,
+    ],
+  ]) {
+    assert.equal(
+      repositories.some(
+        ({ id, full_name, node_id }) =>
+          id === ARCHIVED_LEGACY_ONLY_REPOSITORY_ID ||
+          full_name === ARCHIVED_LEGACY_ONLY_REPOSITORY.slug ||
+          node_id === ARCHIVED_LEGACY_ONLY_REPOSITORY.node_id,
+      ),
+      false,
+      `the final receipt ${field} must not authorize the archived legacy-only repository`,
+    );
+  }
   assert.equal(
     verifyCompletePreview.final_closure_receipt_sha256,
     sha256Canonical(verifyCompletePreview.final_closure_receipt),
+  );
+  assert.deepEqual(
+    validateOrganizationFinalClosureOutput(verifyCompletePreview)
+      .bridgeRemovalRepositories,
+    expectedFinalClosureRepositories,
+    "the consumer must admit only the source producer's manifest-bound active cohort",
   );
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 
@@ -2605,6 +2693,71 @@ test("verify apply revalidates the full cohort and legacy rule immediately befor
         [],
         "observed pre-write drift must fail before the legacy organization PUT",
       );
+    });
+  }
+});
+
+test("verify apply fails closed when the retained archived selector cannot be revalidated immediately before PUT", async (t) => {
+  const harness = createFakeGhHarness(t);
+  writeFileSync(
+    harness.manifestPath,
+    `${JSON.stringify(harness.manifest, null, 2)}\n`,
+  );
+  writeFileSync(harness.v2StatePath, "active\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "after\n");
+  writeFileSync(harness.legacyOnlyIdentityStatePath, "bound\n");
+  const preview = await runFakeCli(harness, "verify");
+  assert.equal(preview.status, "preview-cutover-ready");
+
+  const legacyOnlyRepositoryEndpoint =
+    `repos/${encodeEndpointPathForTest(
+      harness.manifest.legacy_ruleset.legacy_only_repository.slug,
+    )}`;
+  const applyArguments = [
+    "--apply",
+    "--expected-plan-sha256",
+    preview.plan_sha256,
+  ];
+  const cases = [
+    { name: "live archive flag becomes false", state: "unarchived" },
+    { name: "same-slug live node identity drifts", state: "identity-drift" },
+    { name: "live archive identity becomes unreadable", state: "unreadable" },
+  ];
+  for (const driftCase of cases) {
+    await t.test(driftCase.name, async () => {
+      writeFileSync(harness.v2StatePath, "active\n");
+      writeFileSync(harness.legacyStatePath, "before\n");
+      writeFileSync(harness.cleanupStatePath, "after\n");
+      writeFileSync(harness.legacyOnlyIdentityStatePath, "bound\n");
+      writeFileSync(harness.logPath, "");
+      await assert.rejects(
+        runFakeCli(
+          harness,
+          "verify",
+          applyArguments,
+          immediateStableRuntime({
+            beforeFinalLegacyRevalidation: () => {
+              writeFileSync(
+                harness.legacyOnlyIdentityStatePath,
+                `${driftCase.state}\n`,
+              );
+            },
+          }),
+        ),
+        /legacy-only archived repository could not be read immediately before cutover; no mutation was sent/u,
+      );
+      const requests = fakeGhRequests(harness.logPath);
+      assert.deepEqual(
+        mutationRequests(requests),
+        [],
+        "an unreadable or mismatched archived selector identity must block the legacy organization PUT",
+      );
+      assert.deepEqual(requests.at(-1), {
+        method: "GET",
+        endpoint: legacyOnlyRepositoryEndpoint,
+        body: null,
+      });
     });
   }
 });
@@ -3670,6 +3823,10 @@ test("the checked-in Joey manifest template fixes the approved identities and cl
     );
   }
   const templateActiveRepositoryIds = JOEY_TEMPLATE.repositories.map(({ id }) => id);
+  assert.deepEqual(
+    JOEY_TEMPLATE.legacy_ruleset.legacy_only_repository,
+    ARCHIVED_LEGACY_ONLY_REPOSITORY,
+  );
   const templateLegacySelectorRepositoryIds =
     JOEY_TEMPLATE.legacy_ruleset.expected_before.conditions.repository_id.repository_ids;
   assert.deepEqual(templateLegacySelectorRepositoryIds, LEGACY_SELECTOR_REPOSITORY_IDS);
@@ -3720,6 +3877,11 @@ test("the checked-in Joey manifest template fixes the approved identities and cl
   );
   assert.equal(JOEY_TEMPLATE.expected_legacy_cleanup_action_count, 8);
   assert.equal(cleanupActions.length, 8);
+  assert.equal(
+    cleanupActions.some(({ slug }) => slug === ARCHIVED_LEGACY_ONLY_REPOSITORY.slug),
+    false,
+    "the archived legacy-only repository must not receive a v2 cleanup action",
+  );
   assert.deepEqual(
     cleanupActions,
     REPOSITORIES.flatMap(([name, , rulesetId]) =>
@@ -3843,6 +4005,13 @@ test("manifest validation is generic but binds every supplied identity and old s
     node_id: "O_example",
   };
   manifest.legacy_ruleset.id = 7001;
+  manifest.legacy_ruleset.legacy_only_repository = {
+    slug: "Example-Organization/archived-legacy-only",
+    id: 9000,
+    node_id: "R_example_archived_legacy_only",
+    default_branch: "master",
+    archived: true,
+  };
   manifest.legacy_ruleset.expected_before.name = "Example legacy gate";
   manifest.v2_ruleset.id = 7002;
   manifest.repositories.forEach((repository, index) => {
@@ -3853,11 +4022,47 @@ test("manifest validation is generic but binds every supplied identity and old s
   const activeRepositoryIds = manifest.repositories.map((repository) => repository.id);
   manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids = [
     ...activeRepositoryIds.slice(0, 8),
-    9000,
+    manifest.legacy_ruleset.legacy_only_repository.id,
     ...activeRepositoryIds.slice(8),
   ];
 
   assert.deepEqual(validateManifest(manifest), manifest);
+});
+
+test("final closure receipt binds manifest and stable snapshot repository identities exactly", () => {
+  const manifest = manifestFixture();
+  const snapshot = {
+    organization: {
+      organization: clone(manifest.organization),
+      legacy: { id: manifest.legacy_ruleset.id },
+      legacy_state: "after",
+      v2: { id: manifest.v2_ruleset.id },
+      v2_state: "active",
+    },
+    repositories: manifest.repositories.map(
+      ({ slug, id, node_id, default_branch }) => ({
+        identity: { full_name: slug, id, node_id, default_branch },
+      }),
+    ),
+  };
+  const receipt = buildFinalClosureReceipt(manifest, snapshot);
+  assert.deepEqual(receipt.manifest_repositories, receipt.repositories);
+  assert.equal(
+    receipt.manifest_repositories.some(
+      ({ id, full_name, node_id }) =>
+        id === ARCHIVED_LEGACY_ONLY_REPOSITORY_ID ||
+        full_name === ARCHIVED_LEGACY_ONLY_REPOSITORY.slug ||
+        node_id === ARCHIVED_LEGACY_ONLY_REPOSITORY.node_id,
+    ),
+    false,
+  );
+
+  const changedSnapshot = clone(snapshot);
+  changedSnapshot.repositories[0].identity.node_id = "R_kgDOReplacement";
+  assert.throws(
+    () => buildFinalClosureReceipt(manifest, changedSnapshot),
+    /stable observed repository identity cohort to exactly match manifest.repositories/u,
+  );
 });
 
 test("manifest validation rejects incomplete, duplicate, or cross-bound cohort identities", async (t) => {
@@ -3936,6 +4141,74 @@ test("manifest validation rejects incomplete, duplicate, or cross-bound cohort i
           manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids[1];
       },
       error: /exactly 11 unique entries/u,
+    },
+    {
+      name: "legacy selector cannot substitute an arbitrary eleventh ID",
+      mutate: (manifest) => {
+        const selector =
+          manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids;
+        selector[selector.indexOf(ARCHIVED_LEGACY_ONLY_REPOSITORY_ID)] = 99;
+      },
+      error: /only the ordered active manifest repository IDs plus manifest\.legacy_ruleset\.legacy_only_repository\.id/u,
+    },
+    {
+      name: "legacy-only repository identity has every required field",
+      mutate: (manifest) => {
+        delete manifest.legacy_ruleset.legacy_only_repository.node_id;
+      },
+      error: /must contain exactly these keys/u,
+    },
+    {
+      name: "legacy-only repository must belong to the manifest organization",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.legacy_only_repository.slug =
+          "Other-Organization/codex-waited-delivery";
+      },
+      error: /legacy_only_repository\.slug must belong to manifest\.organization\.login/u,
+    },
+    {
+      name: "legacy-only repository node identity must be non-empty",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.legacy_only_repository.node_id = "";
+      },
+      error: /legacy_only_repository\.node_id must be a non-empty string/u,
+    },
+    {
+      name: "legacy-only repository default branch must be a branch name",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.legacy_only_repository.default_branch =
+          "refs/heads/master";
+      },
+      error: /legacy_only_repository\.default_branch is malformed/u,
+    },
+    {
+      name: "legacy-only repository must be archived",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.legacy_only_repository.archived = false;
+      },
+      error: /legacy_only_repository\.archived must be true/u,
+    },
+    {
+      name: "legacy-only repository identity cannot overlap an active ID",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.legacy_only_repository.id = manifest.repositories[0].id;
+      },
+      error: /must not overlap an active manifest repository identity/u,
+    },
+    {
+      name: "legacy-only repository identity cannot overlap an active slug",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.legacy_only_repository.slug = manifest.repositories[0].slug;
+      },
+      error: /must not overlap an active manifest repository identity/u,
+    },
+    {
+      name: "legacy-only repository identity cannot overlap an active node ID",
+      mutate: (manifest) => {
+        manifest.legacy_ruleset.legacy_only_repository.node_id =
+          manifest.repositories[0].node_id;
+      },
+      error: /must not overlap an active manifest repository identity/u,
     },
   ];
 

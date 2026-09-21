@@ -135,14 +135,57 @@ the global cutover is closed.
 - The published historical handoff format is immutable: `manifest/v1`,
   `output/v1`, and receipt schema `1` mean an exact 11-member closure. The
   active 10-member contract therefore uses `manifest/v2`, `output/v2`, and
-  receipt schema `2`. Bootstrap accepts only exact same-version pairs; v2
-  bridge removal is authorized from its 10-member receipt, never from the old
-  11-member ruleset selector. Historical v1 proof remains parseable for
-  auditability but does not authorize a new bridge-removal write. This avoids
-  silently redefining published 11-member evidence while keeping the archived
-  repository outside the current mutation scope. No final organization closure
-  receipt has been minted, so this versioned contract change precedes any
-  organization-policy mutation.
+  receipt schema `2`. Bootstrap accepts only exact same-version pairs.
+  Historical schema-1 receipts retain their published JSON shape and canonical
+  digest validation for auditability, but authorize no new bridge-removal
+  write. A schema-2 receipt instead carries `manifest_repositories`, derived
+  from the reviewed active manifest, and the stable observed `repositories`;
+  both canonical identity lists must match entry by entry before producer or
+  consumer admission. Bridge removal is authorized only from the
+  manifest-derived list, never from the observed list or the old 11-member
+  ruleset selector. This avoids silently redefining published 11-member
+  evidence while keeping the archived repository outside the current mutation
+  scope. No final organization closure receipt has been minted, so this
+  versioned contract change precedes any organization-policy mutation.
+- The current source hardening makes the retained archive exception explicit in
+  the unshipped `manifest/v2`: `legacy_ruleset.legacy_only_repository` binds
+  `Joey-Tools/codex-waited-delivery` by `slug`, numeric `id`, `node_id`,
+  `default_branch`, and `archived: true`. The legacy selector is valid only
+  when it contains the ordered 10 active IDs plus that one archived ID exactly
+  once. The archived identity must not overlap an active member. It remains
+  outside the v2 payload, repository cleanup, final receipt, and bridge-removal
+  scope.
+- The reason for this schema tightening is to prevent a selector that merely
+  has 11 unique IDs from substituting an arbitrary eleventh repository and
+  silently removing `codex-waited-delivery`'s retained `deletion` and
+  `non_fast_forward` protection. Post-activation/cutover stable snapshots will
+  read the archive's live `full_name`, `id`, `node_id`, `default_branch`, and
+  `archived` flag; the helper rereads the same identity immediately before the
+  legacy-ruleset `PUT`. An unreadable response, mismatch, same-slug
+  replacement, default-branch drift, or `archived: false` is fail closed and
+  sends no cutover mutation.
+- Regression coverage rejects malformed or overlapping archive descriptors, an
+  arbitrary selector eleventh ID, archive identity drift or an unreadable
+  archive immediately before cutover, and asserts that each such failure sends
+  zero legacy-ruleset `PUT` requests. It also preserves the separate assertions
+  that the v2 payload and final receipt contain only the active 10-member
+  cohort.
+- The second P1 receipt-binding repair makes a schema-2 receipt prove the same
+  active cohort twice: `manifest_repositories` comes only from the reviewed
+  manifest, while `repositories` comes from the stable final observation. Both
+  lists contain canonical `{full_name,id,node_id,default_branch}` identities,
+  and are rejected unless they are exactly equal. Consumer bridge removal reads
+  only `manifest_repositories` as its authorization set. This prevents a
+  digest-valid observed list from expanding or replacing the manifest-approved
+  cohort at the consumer boundary.
+- The current rollout adds a defense-in-depth hard rejection in both schema-2
+  receipt lists for `Joey-Tools/codex-waited-delivery` by case-insensitive slug,
+  numeric ID `1242512099`, or node ID `R_kgDOSg864w`. Slug detects same-slug
+  replacement, rename, or transfer; ID and node ID bind the persistent GitHub
+  object. The regression plan includes a synchronously altered dual-list
+  receipt with a fresh digest and asserts that consumer admission fails before
+  any local mutation. This does not alter schema-1's historical bytes or
+  digest semantics.
 
 ### Execution Update — 2026-09-18
 
@@ -169,7 +212,7 @@ the global cutover is closed.
   integration`, despite the runner reporting `issues: write` and
   `pull-requests: read`. The observed failure alone does not prove which
   permission boundary caused it.
-- The pending source patch applies the documented alternative as a strictly
+- Source PR `#54` applies the documented alternative as a strictly
   narrower PR-only authority: it removes `issues: write` and changes
   `pull-requests: read` to `pull-requests: write`. The controller targets only
   pull-request conversation comments, for which GitHub accepts that write
@@ -191,7 +234,7 @@ the global cutover is closed.
   queried all five states separately, but the follow-up review found that this
   itself was racy: one run can advance between independently timed filtered
   requests and be absent from every result.
-- The source patch instead reads one complete unfiltered
+- That source change instead reads one complete unfiltered
   `actions/workflows/{id}/runs?per_page=100` inventory for each independently
   identified writer, then accepts only `status=completed` rows locally. It
   rejects every documented nonterminal state (`requested`, `waiting`,
@@ -272,6 +315,18 @@ the global cutover is closed.
   distinct Codeowner approval. Do not activate the v2 repository policy until
   a separately authorized writable reviewer path has been selected for every
   affected repository.
+- The frozen implementation and documentation diff then received an independent
+  `GPT-5.6 Terra` review at `high` thinking with no actionable findings. Its
+  completed validation evidence is `npm run check`, bootstrap suite 119/119,
+  organization suite 136/136, `git diff --check`, and project-journal
+  validation. A local unsharded `npm test` attempt was bounded after twenty
+  minutes and is deliberately not recorded as passing: it had no failure
+  assertion output but ended incomplete inside the heavy release-pipeline
+  file. The repository's native CI-equivalent `1/4` through `4/4`
+  release-pipeline shards subsequently each exited zero, covering every
+  sharded release-pipeline test exactly once; the separately interrupted
+  `v2-workflow-contract` and `workflow-security-contract` files also passed
+  independently (8/8 and 41/41).
 
 ### Current-head review follow-up — 2026-09-18
 
@@ -327,10 +382,13 @@ the global cutover is closed.
 
 ## Failure And Recovery Boundary
 
-- Any changed selector, repository identity/default branch, workflow bytes,
-  bridge bytes, complete workflow inventory, Actions default token permission,
-  repository policy, canary evidence, old-rule fingerprint, or incomplete API
-  response is inconclusive and prevents the next mutation. The workflow
+- Any changed selector, active or legacy-only repository identity/default
+  branch/archive state, workflow bytes, bridge bytes, complete workflow
+  inventory, Actions default token permission, repository policy, canary
+  evidence, old-rule fingerprint, or incomplete API response is inconclusive
+  and prevents the next mutation. The legacy selector must be exactly the
+  ordered active 10 IDs plus its one manifest-bound archived-only ID, rather
+  than an arbitrary 11-member set. The workflow
   inventory admits only the three canonical files and rejects any extra v1/v2
   caller, related writer, nested workflow tree, symlink, submodule, or other
   non-regular entry; default workflow permission must be `read`.
@@ -348,6 +406,12 @@ the global cutover is closed.
   canonical workflow/CODEOWNERS bytes, default-read Actions policy including
   an explicit boolean `can_approve_pull_request_reviews`, bridge, v2 rulesets,
   and cleanup-state closure.
+- Each post-activation/cutover stable snapshot separately binds the
+  manifest-declared archived-only repository from live GitHub metadata:
+  `full_name`, `id`, `node_id`, `default_branch`, and `archived: true` must all
+  match. That observation preserves the old rule's non-status protections for
+  the archive; it never adds the archive to v2 coverage or final receipt
+  membership.
 - The operator holds an external organization-admin policy-mutation freeze
   from stage preview through apply, readback, and any recovery. A second
   organization/repository-admin freeze covers activation preview through its
@@ -362,11 +426,20 @@ the global cutover is closed.
   manifest-bound repository identity/default branch and bypass lists; it does
   not automatically discover an actor added outside the snapshot.
 - Before the old organization-rule `PUT`, the helper repeats the complete
-  cohort revalidation and then reads the old rule's writable identity directly
-  adjacent to the write. GitHub's ruleset update endpoint has no conditional
-  compare-and-swap contract. Plan digests and readback detect observed drift,
-  but cannot prevent or reconstruct an external update overwritten in the
-  final GET-to-PUT interval.
+  cohort revalidation and then rereads both the old rule's writable identity
+  and the archived-only repository directly adjacent to the write. GitHub's
+  ruleset update endpoint has no conditional compare-and-swap contract. Plan
+  digests and readback detect observed drift, but cannot prevent or reconstruct
+  an external update overwritten in the final GET-to-PUT interval. A missing,
+  mismatched, or no-longer-archived legacy-only repository blocks the `PUT`.
+- Schema-2 final-closure receipt admission validates the manifest-derived
+  `manifest_repositories` and stable observed `repositories` as independent
+  canonical 10-member identity lists, then requires exact equality before the
+  consumer uses only the former to authorize a bridge removal. Either list
+  rejects the current archived legacy-only repository by slug, ID, or node ID;
+  a receipt that alters both lists and refreshes its digest still fails before
+  any local consumer mutation. Schema 1 remains readable and digest-valid only
+  as historical evidence and returns no bridge-removal authorization.
 - A potentially successful but unacknowledged stage POST is never replayed.
   The apply path first attempts one read-only reconciliation and may return
   `applied-recovered`; interrupted or still-unknown outcomes use the explicit
