@@ -472,6 +472,8 @@ function createFakeGhHarness(
     cleanupMutationFailureAt = null,
     cleanupIdentityDriftAtMetadataRead = null,
     cleanupExternalReconcileAtSurfaceRead = null,
+    cleanupPrewriteSurfaceDriftAtRead = null,
+    cleanupPrewriteSurfaceFailureAtRead = null,
     stageCreateResponse = "valid",
     extraEffectiveRules = [],
     extraEffectiveSecondPageRules = [],
@@ -752,6 +754,15 @@ function createFakeGhHarness(
             action.expected_after,
           ),
         ),
+        drifted: JSON.stringify({
+          ...completeRulesetResponse(
+            action.ruleset_id,
+            "Repository",
+            repository.slug,
+            action.expected_before,
+          ),
+          name: "Unexpected concurrent cleanup policy edit",
+        }),
       });
     }
     addFakeResponse(
@@ -1203,16 +1214,37 @@ function createFakeGhHarness(
       scriptLines.push(
         `  ${shellQuote(response.request)})`,
       );
-      if (
-        cleanupExternalReconcileAtSurfaceRead !== null &&
-        cleanupExternalReconcileAtSurfaceRead.ordinal === response.ordinal
-      ) {
+      const surfaceReadInjections = [
+        ["external-reconcile", cleanupExternalReconcileAtSurfaceRead],
+        ["third-state", cleanupPrewriteSurfaceDriftAtRead],
+        ["read-failure", cleanupPrewriteSurfaceFailureAtRead],
+      ].filter(([, injection]) =>
+        injection !== null && injection.ordinal === response.ordinal,
+      );
+      if (surfaceReadInjections.length > 1) {
+        throw new Error("Fake cleanup surface read injections must not overlap.");
+      }
+      const [surfaceReadInjection] = surfaceReadInjections;
+      if (surfaceReadInjection !== undefined) {
+        const [kind, injection] = surfaceReadInjection;
         scriptLines.push(
           `    count="$(cat ${shellQuote(response.surfaceReadCountPath)})"`,
           "    count=$((count + 1))",
           `    printf '%s\\n' "$count" > ${shellQuote(response.surfaceReadCountPath)}`,
-          `    if [ "$count" -ge ${cleanupExternalReconcileAtSurfaceRead.read} ]; then printf '%s\\n' 'after' > ${cleanupStateFile}; fi`,
         );
+        if (kind === "external-reconcile") {
+          scriptLines.push(
+            `    if [ "$count" -ge ${injection.read} ]; then printf '%s\\n' 'after' > ${cleanupStateFile}; fi`,
+          );
+        } else if (kind === "third-state") {
+          scriptLines.push(
+            `    if [ "$count" -ge ${injection.read} ]; then respond ${shellQuote(response.drifted)}; fi`,
+          );
+        } else {
+          scriptLines.push(
+            `    if [ "$count" -ge ${injection.read} ]; then printf '%s\\n' 'simulated prewrite cleanup surface read failure' >&2; exit 1; fi`,
+          );
+        }
       }
       scriptLines.push(
         `    case "$(cat ${cleanupStateFile})" in`,
@@ -2012,14 +2044,14 @@ test("repository cleanup executor performs every pending action in serial exact-
     [
       { method: "GET", endpoint: firstRepositoryEndpoint },
       { method: "GET", endpoint: firstSurfaceEndpoint },
-      { method: "GET", endpoint: firstRepositoryEndpoint },
       { method: "GET", endpoint: firstSurfaceEndpoint },
+      { method: "GET", endpoint: firstRepositoryEndpoint },
     ],
-    "every cleanup write must follow a second exact surface read after its adjacent identity revalidation",
+    "every cleanup write must follow a final exact surface read and then an adjacent identity check",
   );
 });
 
-test("repository cleanup executor rejects same-slug identity drift immediately before mutation", async (t) => {
+test("repository cleanup executor rejects same-slug identity drift after its final surface reread", async (t) => {
   const harness = createFakeGhHarness(t, {
     detailedCleanupState: true,
     cleanupIdentityDriftAtMetadataRead: 5,
@@ -2035,7 +2067,7 @@ test("repository cleanup executor rejects same-slug identity drift immediately b
       "--expected-plan-sha256",
       preview.plan_sha256,
     ]),
-    /repository cleanup identity immediately before mutation drifted/u,
+    /repository cleanup identity after final surface read immediately before mutation drifted/u,
   );
 
   const requests = fakeGhRequests(harness.logPath);
@@ -2044,14 +2076,18 @@ test("repository cleanup executor rejects same-slug identity drift immediately b
     `repos/${encodeEndpointPathForTest(firstAction.repository)}`;
   const surfaceEndpoint =
     `${repositoryEndpoint}/rulesets/${firstAction.surface.slice("repository_ruleset:".length)}?includes_parents=false`;
+  const firstActionRequests = requests.filter(
+    ({ endpoint }) => endpoint === repositoryEndpoint || endpoint === surfaceEndpoint,
+  );
   assert.deepEqual(
-    requests.slice(-3).map(({ method, endpoint }) => ({ method, endpoint })),
+    firstActionRequests.slice(-4).map(({ method, endpoint }) => ({ method, endpoint })),
     [
       { method: "GET", endpoint: repositoryEndpoint },
       { method: "GET", endpoint: surfaceEndpoint },
+      { method: "GET", endpoint: surfaceEndpoint },
       { method: "GET", endpoint: repositoryEndpoint },
     ],
-    "the target identity must be checked both before its surface read and immediately before mutation",
+    "the final identity check must follow the final surface reread and remain adjacent to mutation",
   );
   assert.deepEqual(
     mutationRequests(requests),
@@ -2120,6 +2156,66 @@ test("repository cleanup executor recognizes an external exact-after checkpoint 
     ),
     false,
     "a live exact-after checkpoint found at the final surface reread must not be overwritten",
+  );
+});
+
+test("repository cleanup executor rejects a third state at its final pre-write surface reread", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    detailedCleanupState: true,
+    cleanupPrewriteSurfaceDriftAtRead: { ordinal: 0, read: 5 },
+  });
+  configureDetailedCleanupHandoff(harness);
+  const preview = await runFakeCli(harness, "apply-repository-cleanup");
+  for (const path of harness.cleanupSurfaceReadCountPaths) {
+    writeFileSync(path, "0\n");
+  }
+  writeFileSync(harness.logPath, "");
+
+  await assert.rejects(
+    runFakeCli(harness, "apply-repository-cleanup", [
+      "--apply",
+      "--expected-plan-sha256",
+      preview.plan_sha256,
+    ]),
+    /Repository legacy cleanup surface matches neither bound snapshot\./u,
+  );
+
+  assert.deepEqual(
+    mutationRequests(fakeGhRequests(harness.logPath)),
+    [],
+    "a concurrent third state found at the final surface reread must fail closed before any cleanup mutation",
+  );
+});
+
+test("repository cleanup executor surfaces a final pre-write read failure without write recovery", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    detailedCleanupState: true,
+    cleanupPrewriteSurfaceFailureAtRead: { ordinal: 0, read: 5 },
+  });
+  configureDetailedCleanupHandoff(harness);
+  const preview = await runFakeCli(harness, "apply-repository-cleanup");
+  for (const path of harness.cleanupSurfaceReadCountPaths) {
+    writeFileSync(path, "0\n");
+  }
+  writeFileSync(harness.logPath, "");
+
+  await assert.rejects(
+    runFakeCli(harness, "apply-repository-cleanup", [
+      "--apply",
+      "--expected-plan-sha256",
+      preview.plan_sha256,
+    ]),
+    (error) => {
+      assert.match(error.message, /simulated prewrite cleanup surface read failure/u);
+      assert.doesNotMatch(error.message, /reconciled-after-write-error/u);
+      return true;
+    },
+  );
+
+  assert.deepEqual(
+    mutationRequests(fakeGhRequests(harness.logPath)),
+    [],
+    "a failed final surface read must not send a mutation or enter write-error recovery",
   );
 });
 

@@ -3568,14 +3568,13 @@ async function executeRepositoryCleanupRecord(record) {
   }
   const payload =
     record.method === "DELETE" ? undefined : record.action.expected_after;
-  await loadManifestBoundRepositoryCleanupIdentity(
-    record.repo,
-    `${record.repo.slug} repository cleanup identity immediately before mutation`,
-  );
   // The external policy-mutation freeze is the accepted protection for the
   // unavoidable final GET-to-write gap. Still, reread the selected surface
-  // after the adjacent identity check so a policy change observed between the
-  // initial checkpoint and this write cannot be overwritten by this executor.
+  // immediately before the final identity check so a policy change observed
+  // between the initial checkpoint and this write cannot be overwritten by
+  // this executor. The following identity read must remain adjacent to the
+  // write boundary: otherwise a same-slug replacement could make this exact
+  // surface read describe a different repository object.
   // `classifyCleanupSurface` accepts only the manifest's exact before/after
   // bytes; a third state fails closed before the mutation.
   const immediatelyBeforeMutation = classifyCleanupSurface(
@@ -3585,6 +3584,10 @@ async function executeRepositoryCleanupRecord(record) {
   if (immediatelyBeforeMutation === "after") {
     return { ...record, outcome: "already-reconciled-immediately-before-write" };
   }
+  await loadManifestBoundRepositoryCleanupIdentity(
+    record.repo,
+    `${record.repo.slug} repository cleanup identity after final surface read immediately before mutation`,
+  );
   try {
     await ghJson(record.endpoint, { method: record.method, body: payload });
   } catch (error) {
