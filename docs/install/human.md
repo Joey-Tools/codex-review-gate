@@ -14,9 +14,10 @@ The ordinary single-repository rollout has two pull requests:
 
 The canary is closed without merging.
 
-The fixed eleven-repository organization handoff is the only controlled
-exception to removing v1 in the migration PR. Read the advanced section below
-before changing any member of that cohort.
+The controlled organization handoff has a fixed active ten-repository v2
+cohort. Its old v1 organization ruleset retains the original eleven-repository
+legacy selector. Read the advanced section below before changing any active
+cohort member.
 
 ## What is installed
 
@@ -141,45 +142,59 @@ protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`. Their only pub
 counts, when available, are diagnostics in the job summary and sticky comment,
 not Action outputs.
 
-## Advanced controlled handoff for one eleven-repository cohort
+## Advanced controlled handoff for one active ten-repository v2 cohort
 
-Use this path only for an explicitly approved organization cohort whose
-default branches are all covered by one shared v1 organization ruleset. It is
-not a general `allow-v1` installation mode. The ordinary path in the numbered
-sections below, and the final state of every cohort member, still reject every
-v1 caller.
+Use this path only for an explicitly approved active ten-repository v2 cohort
+whose default branches are covered by one shared v1 organization ruleset. Its
+original eleven-repository legacy selector remains separate. This is not a
+general `allow-v1` installation mode. The ordinary path in the numbered
+sections below, and the final state of every active cohort member, still reject
+every v1 caller.
+
+`Joey-Tools/codex-waited-delivery` is archived and legacy-only. It remains in
+the original eleven-repository selector so the old rule retains its
+`deletion` and `non_fast_forward` protection after cutover. It is not a member
+of the active v2 cohort and receives no v2 installation, canary,
+repository-level cleanup, final-closure receipt membership, or bridge removal.
 
 The handoff deliberately separates protection responsibilities:
 
-- every repository receives the complete v2 repository ruleset, which keeps
+- every active cohort repository receives the complete v2 repository ruleset,
+  which keeps
   the strict up-to-date, Code Owner, stale-review, resolved-conversation and
   non-fast-forward requirements described in this guide;
 - a new organization ruleset named `Must Pass Codex Review v2` requires only
   the strict, source-bound `codex/github-review-gate` check for the exact
-  eleven members;
-- the old organization ruleset remains Active with `deletion`,
-  `non_fast_forward` and its sole `codex/review-gate` status rule throughout
-  installation, canary proof, v2 activation and repository-level v1 cleanup;
-  and
+  ten active members;
+- the old organization ruleset retains its original eleven-repository selector
+  (including the archived legacy-only repository) and remains Active with
+  `deletion`, `non_fast_forward` and its sole `codex/review-gate` status rule
+  throughout active-cohort installation, canary proof, v2 activation and
+  repository-level v1 cleanup; and
 - the old organization ruleset is never deleted. At the final cutover its
   entire legacy-only required-status rule is removed, while its identity,
   targets, enforcement, bypass actors, `deletion`, `non_fast_forward` and
   every other bound field stay unchanged.
 
 The source of truth for this transaction is one reviewed JSON manifest with
-schema `organization-review-gate-handoff-manifest/v1`. It binds the
+schema `organization-review-gate-handoff-manifest/v2`. It binds the
 organization identity, the exact old organization ruleset, the new ruleset
-name and ID, exactly eleven ordered repository identities, the three workflow
-blob and content hashes, the effective CODEOWNERS identity, each complete
-Active repository v2 ruleset, and every repository-level legacy cleanup
+name and ID, exactly ten ordered active repository identities, and the exact
+original eleven-repository legacy selector; the three workflow blob and
+content hashes; the effective CODEOWNERS identity; each complete Active
+repository v2 ruleset; and every active repository-level legacy-cleanup
 before/after snapshot. Each canary entry binds an open, non-draft,
 same-repository PR to its exact current head, base and test-merge SHAs; the v2
 CheckRun plus its workflow run, attempt and job identities; and the latest
 successful legacy commit-status ID. Missing, extra or reordered members are a
 hard failure.
 
+This is the current v2 handoff path. A previously issued v1 output with a
+schema-1 receipt is historical eleven-member closure evidence only; do not use
+it to install, stage, activate, clean up, or remove a bridge for this cohort.
+
 Start from
-`templates/organization-review-gate-handoff/joey-tools-11-member-manifest.template.json`
+`templates/organization-review-gate-handoff/joey-tools-10-member-manifest.template.json`
 and follow the README beside it. Replace every explicit placeholder with live,
 reviewed evidence; do not infer missing identities. Before `stage`, the only
 permitted incomplete value is the literal JSON `null` at `v2_ruleset.id`,
@@ -188,8 +203,8 @@ or incomplete value is rejected. After the successful `stage` readback,
 replace that `null` with only the returned organization ruleset ID and review
 the completed manifest again.
 
-For each member, the migration PR installs the canonical v2 verifier and
-controller plus the one exact temporary bridge at
+For each active cohort member, the migration PR installs the canonical v2
+verifier and controller plus the one exact temporary bridge at
 `.github/workflows/codex-review-gate-legacy-bridge.yml`:
 
 ```bash
@@ -211,6 +226,7 @@ present. The cohort repository ruleset name is
 exactly `Must Pass Codex Review v2`, not the ordinary installer default
 `Must Pass Codex Review`. Pass that distinct name to every repository
 bootstrap call with `--ruleset-name`.
+Do not run this bootstrap path for the archived legacy-only repository.
 
 The bridge has a closed writable event envelope: `pull_request_target` only
 for `opened`, `reopened`, `synchronize`, and `ready_for_review`, plus
@@ -231,7 +247,7 @@ CheckRun and latest successful `codex/review-gate` bridge commit status, and
 activate that repository rule with the same distinct name and bridge profile.
 Keep the canary open until the shared organization rule has been activated and
 its dual-enforcement readback succeeds. Record its current bound evidence in
-the manifest. Do not start organization activation until all eleven entries
+the manifest. Do not start organization activation until all ten active entries
 meet those conditions.
 
 The organization helper is preview-first. Every mutating apply must use the
@@ -263,10 +279,10 @@ node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
 
 `stage` creates only the exact Disabled, v2-only organization ruleset. Bind
 the returned `next_manifest_update.v2_ruleset.id` into the reviewed manifest,
-then run `plan` again. When all eleven open, non-draft, current-base canaries,
-canonical workflows, temporary bridges, Active repository v2 rulesets and
-still-uncleaned legacy surfaces match that manifest, preview and activate the
-shared rule:
+then run `plan` again. When all ten active open, non-draft, current-base
+canaries, canonical workflows, temporary bridges, Active repository v2
+rulesets and still-uncleaned legacy surfaces match that manifest, preview and
+activate the shared rule:
 
 If the `stage --apply` POST fails after it may have reached GitHub, the helper
 first attempts one read-only reconciliation. A returned `applied-recovered`
@@ -317,17 +333,18 @@ automatically discover or preserve an actor concurrently added outside that
 snapshot.
 
 The successful activation readback is the double-protection handoff point:
-all eleven members have the complete repository v2 policy, the shared v2-only
-organization rule is Active, and the old organization v1 rule is still Active.
-Only after the helper reports that post-write dual-enforcement proof may each
-canary be closed without merging. Never close one before `activate` completes.
-The later `derive-cutover`, `apply-repository-cleanup`, and `verify` modes use
-post-activation cohort snapshots and do not require closed canaries to be
-reopened. They also do not require the current default-branch head to remain
+all ten active members have the complete repository v2 policy, the shared
+v2-only organization rule is Active, and the old organization v1 rule is still
+Active with its original eleven-repository selector. Only after the helper
+reports that post-write dual-enforcement proof may each active canary be closed
+without merging. Never close one before `activate` completes. The later
+`derive-cutover`, `apply-repository-cleanup`, and `verify` modes use
+post-activation active-cohort snapshots and do not require closed canaries to
+be reopened. They also do not require the current default-branch head to remain
 equal to the historical canary base. The canary receipt is activation-bound
-evidence; after activation the helper reads each repository's live default
-branch and proves the current control-plane/ruleset closure instead: exact
-repository identity, a complete regular-blob workflow inventory with the
+evidence; after activation the helper reads each active repository's live
+default branch and proves the current control-plane/ruleset closure instead:
+exact repository identity, a complete regular-blob workflow inventory with the
 three canonical files and no extra producer, exact CODEOWNERS, default-read
 Actions policy with an explicit boolean `can_approve_pull_request_reviews`,
 Active repository and organization v2 rules, the temporary bridge, and current
@@ -418,12 +435,12 @@ node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
   --manifest "$HANDOFF_MANIFEST" \
   --mode verify > "$HANDOFF_FINAL_VERIFY"
 jq -e '
-  .schema_version == "organization-review-gate-handoff-output/v1" and
+  .schema_version == "organization-review-gate-handoff-output/v2" and
   .mode == "verify" and
   .status == "final-verified" and
   .applied == false and
   .action == null and
-  .final_closure_receipt.schema_version == 1 and
+  .final_closure_receipt.schema_version == 2 and
   (.final_closure_receipt_sha256 | test("^[0-9a-f]{64}$"))
 ' "$HANDOFF_FINAL_VERIFY"
 HANDOFF_FINAL_CLOSURE_RECEIPT_SHA256="$(jq -er \
@@ -439,17 +456,19 @@ after that write/readback boundary. Continue the external policy-mutation
 freeze begun before repository cleanup through the separate final read-only
 `verify`, its stable two-snapshot readback, and validation of the saved output.
 That read-only result must have top-level
-`schema_version: "organization-review-gate-handoff-output/v1"`,
+`schema_version: "organization-review-gate-handoff-output/v2"`,
 `mode: "verify"`, `status: "final-verified"`, `applied: false`, and
 `action: null`. It also embeds
-`final_closure_receipt` schema version 1, binding the organization, reviewed
+`final_closure_receipt` schema version 2, binding the organization, reviewed
 manifest digest, final snapshot digest, legacy/v2 ruleset IDs and states, and
-the fixed, complete eleven-repository cohort in canonical UTF-8-byte
-`full_name` order.
-It admits neither a subset nor an expanded cohort. Its top-level `plan_sha256`
-must exactly bind the final read-only `verify` plan (`mode`, manifest digest,
-snapshot digest, and `action: null`); `final_closure_receipt_sha256` binds the
-canonical embedded receipt. Preserve the **complete verify JSON output** at
+the fixed, complete ten-repository active v2 cohort in canonical UTF-8-byte
+`full_name` order. It admits neither a subset nor an expanded active cohort.
+The separate old selector remains the original eleven repositories, including
+the archived legacy-only repository, but that repository is not admitted to
+the receipt or bridge removal. Its top-level `plan_sha256` must exactly bind
+the final read-only `verify` plan (`mode`, manifest digest, snapshot digest,
+and `action: null`); `final_closure_receipt_sha256` binds the canonical
+embedded receipt. Preserve the **complete verify JSON output** at
 `HANDOFF_FINAL_VERIFY`; do not save only the embedded receipt.
 
 The third freeze may end after that complete output has been captured and
@@ -465,8 +484,9 @@ seconds, and reads it again. If their selected evidence or policy differs, the
 pair restarts; after 60 seconds without an identical pair the result is
 inconclusive and no next write is allowed.
 
-After that closure, open a separate PR in every member to remove the canonical
-bridge:
+After that closure, open a separate PR in every active cohort member to remove
+the canonical bridge. Do not prepare one for the archived legacy-only
+repository:
 
 ```bash
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
@@ -492,20 +512,22 @@ fields, recomputes the canonical embedded receipt digest, compares the explicit
 expected SHA-256, parses the worktree's unambiguous GitHub `origin`, and reads
 the current repository metadata from GitHub. It requires exact equality of
 `full_name`, `id`, `node_id`, and `default_branch` with one entry in the fixed
-eleven-member receipt cohort. At the pre-rename boundary, it reads `origin`
-before and after the live-metadata query, repeats the local object checks, then
-reads `origin` once more immediately before the atomic bridge quarantine
-rename. After that rename and before unlink, it repeats the complete
-`origin` -> live metadata identity/default-branch -> `origin` check and then
-revalidates the quarantined file's admitted object identity and canonical
-content. If the remote binding recheck fails, it attempts to restore that same
-admitted bridge at the canonical path with no-clobber hard-link creation. An
-occupied destination or failed restoration verification fails closed, never
-overwrites the occupant, and reports no removal success. Thus an observed
-same-name re-creation, repository transfer, default-branch drift, unreadable
-metadata, or other mismatch cannot authorize unlink; a receipt for another
-cohort or repository cannot authorize removal. These are point-in-time remote
-binding and local identity/content checks, not a continuous lock.
+ten-member active receipt cohort. The archived legacy-only repository is
+deliberately absent, so it cannot authorize bridge removal. At the pre-rename
+boundary, it reads `origin` before and after the live-metadata query, repeats
+the local object checks, then reads `origin` once more immediately before the
+atomic bridge quarantine rename. After that rename and before unlink, it
+repeats the complete `origin` -> live metadata identity/default-branch ->
+`origin` check and then revalidates the quarantined file's admitted object
+identity and canonical content. If the remote binding recheck fails, it
+attempts to restore that same admitted bridge at the canonical path with
+no-clobber hard-link creation. An occupied destination or failed restoration
+verification fails closed, never overwrites the occupant, and reports no
+removal success. Thus an observed same-name re-creation, repository transfer,
+default-branch drift, unreadable metadata, or other mismatch cannot authorize
+unlink; a receipt for another cohort or repository cannot authorize removal.
+These are point-in-time remote binding and local identity/content checks, not a
+continuous lock.
 Do not edit the receipt or retarget `origin` to bypass this proof.
 
 If the bridge is already absent, the bridge-removal component is an idempotent

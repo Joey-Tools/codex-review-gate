@@ -18,9 +18,14 @@
 
 ## Global Blockers
 - The inherited v1 organization gate must remain active until every member of
-  the fixed 11-repository cohort proves its canonical v2 check under a
-  separately active v2-only organization rule. Any missing or drifting proof
+  the fixed active 10-repository v2 cohort proves its canonical v2 check under
+  a separately active v2-only organization rule. Any missing or drifting proof
   leaves the system in the deliberately fail-closed dual-protection state.
+- The old rule's original 11-repository legacy selector remains intact,
+  including archived `Joey-Tools/codex-waited-delivery`. Final cutover removes
+  only the v1 required-status rule; it retains `deletion` and
+  `non_fast_forward`. The archived repository requires no v2 install, canary,
+  repository cleanup, or bridge removal.
 
 ## Notes
 - The generated `docs/project_journal/INDEX.md` is a local convenience artifact and should not be committed.
