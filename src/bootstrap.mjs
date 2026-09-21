@@ -198,7 +198,55 @@ export function parseGitHubRepositoryRemote(value) {
   return parseRepoSlug(`${owner}/${repo}`);
 }
 
-export const ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 11;
+// v1 receipts are published historical evidence and therefore retain their
+// original eleven-member cohort. v2 is the current active cohort, which
+// deliberately excludes the archived legacy-only repository.
+export const LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 11;
+export const ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 10;
+
+// This is a rollout-specific hard boundary in addition to schema v2's
+// generic manifest binding. The archived legacy-only repository remains in
+// the old organization selector solely for deletion/non-fast-forward
+// protection and must never receive bridge-removal authorization. The slug
+// catches a same-slug replacement or rename/transfer path; id and node_id
+// bind the persistent GitHub object identity.
+const CURRENT_LEGACY_ONLY_ARCHIVED_REPOSITORY = Object.freeze({
+  full_name: "Joey-Tools/codex-waited-delivery",
+  id: 1_242_512_099,
+  node_id: "R_kgDOSg864w",
+});
+
+function organizationFinalClosureOutputFormat(schemaVersion) {
+  switch (schemaVersion) {
+    case "organization-review-gate-handoff-output/v1":
+      return {
+        receiptSchemaVersion: 1,
+        bridgeRemovalAuthorized: false,
+      };
+    case "organization-review-gate-handoff-output/v2":
+      return {
+        receiptSchemaVersion: 2,
+        bridgeRemovalAuthorized: true,
+      };
+    default:
+      throw new Error(
+        "Organization handoff output schema_version is not a supported final-closure format.",
+      );
+  }
+}
+
+function organizationFinalClosureReceiptCohortSize(schemaVersion) {
+  switch (schemaVersion) {
+    case 1:
+      return LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE;
+    case 2:
+      return ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE;
+    default:
+      throw new Error(
+        "Organization final closure receipt schema_version is not supported.",
+      );
+  }
+}
 
 export function organizationFinalClosurePlanSha256({
   manifest_sha256: manifestSha256,
@@ -239,11 +287,7 @@ export function validateOrganizationFinalClosureOutput(output) {
     ],
     "Organization handoff output",
   );
-  if (output.schema_version !== "organization-review-gate-handoff-output/v1") {
-    throw new Error(
-      "Organization handoff output schema_version is not the supported final-closure format.",
-    );
-  }
+  const format = organizationFinalClosureOutputFormat(output.schema_version);
   if (output.mode !== "verify" || output.status !== "final-verified") {
     throw new Error(
       'Organization handoff output must be a successful final read-only verify result with mode "verify" and status "final-verified".',
@@ -277,6 +321,11 @@ export function validateOrganizationFinalClosureOutput(output) {
   const receipt = validateOrganizationFinalClosureReceipt(
     output.final_closure_receipt,
   );
+  if (receipt.schema_version !== format.receiptSchemaVersion) {
+    throw new Error(
+      "Organization handoff output schema_version and final closure receipt schema_version are not an admitted format pair.",
+    );
+  }
   if (
     canonicalJson(output.organization) !== canonicalJson(receipt.organization) ||
     output.manifest_sha256 !== receipt.manifest_sha256 ||
@@ -297,6 +346,16 @@ export function validateOrganizationFinalClosureOutput(output) {
   return {
     receipt,
     claimedSha256: output.final_closure_receipt_sha256,
+    // v1 is immutable historical evidence only. Bridge removal is authorized
+    // solely by the current v2 receipt's manifest-bound active cohort.
+    // Consumers must use this explicit result rather than infer membership
+    // from the legacy organization selector, which may contain legacy-only
+    // members. The receipt's observed cohort is intentionally not used as an
+    // authorization source: schema v2 first proves it exactly equals the
+    // producer's manifest-derived cohort.
+    bridgeRemovalRepositories: format.bridgeRemovalAuthorized
+      ? receipt.manifest_repositories
+      : [],
   };
 }
 
@@ -307,6 +366,10 @@ export function canonicalOrganizationFinalClosureReceipt(receipt) {
 
 export function validateOrganizationFinalClosureReceipt(receipt) {
   assertPlainReceiptObject(receipt, "Organization final closure receipt");
+  const cohortSize = organizationFinalClosureReceiptCohortSize(
+    receipt.schema_version,
+  );
+  const manifestBound = receipt.schema_version === 2;
   assertExactReceiptKeys(
     receipt,
     [
@@ -317,12 +380,10 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
       "legacy_ruleset",
       "v2_ruleset",
       "repositories",
+      ...(manifestBound ? ["manifest_repositories"] : []),
     ],
     "Organization final closure receipt",
   );
-  if (receipt.schema_version !== 1) {
-    throw new Error("Organization final closure receipt schema_version must be 1.");
-  }
   const organization = validateReceiptOrganization(receipt.organization);
   assertReceiptSha256(receipt.manifest_sha256, "receipt manifest_sha256");
   assertReceiptSha256(receipt.snapshot_sha256, "receipt snapshot_sha256");
@@ -339,15 +400,87 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
   if (legacyRuleset.id === v2Ruleset.id) {
     throw new Error("Organization final closure receipt ruleset IDs must be distinct.");
   }
-  if (
-    !Array.isArray(receipt.repositories) ||
-    receipt.repositories.length !== ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE
-  ) {
-    throw new Error(
-      `Organization final closure receipt repositories must contain exactly ${ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE} cohort members.`,
+  const repositories = validateReceiptRepositoryCohort(
+    receipt.repositories,
+    organization,
+    cohortSize,
+    "repositories",
+    receipt.schema_version,
+  );
+  const manifestRepositories = manifestBound
+    ? validateReceiptRepositoryCohort(
+        receipt.manifest_repositories,
+        organization,
+        cohortSize,
+        "manifest_repositories",
+        receipt.schema_version,
+      )
+    : null;
+  if (manifestBound) {
+    assertSchemaTwoCohortExcludesCurrentLegacyOnlyRepository(
+      repositories,
+      "repositories",
+    );
+    assertSchemaTwoCohortExcludesCurrentLegacyOnlyRepository(
+      manifestRepositories,
+      "manifest_repositories",
     );
   }
-  const repositories = receipt.repositories.map((repository, index) =>
+  if (
+    manifestRepositories !== null &&
+    canonicalJson(manifestRepositories) !== canonicalJson(repositories)
+  ) {
+    throw new Error(
+      "Organization final closure receipt manifest_repositories must exactly match the observed repositories identity cohort.",
+    );
+  }
+  const canonical = {
+    schema_version: receipt.schema_version,
+    organization,
+    manifest_sha256: receipt.manifest_sha256,
+    snapshot_sha256: receipt.snapshot_sha256,
+    legacy_ruleset: legacyRuleset,
+    v2_ruleset: v2Ruleset,
+    repositories,
+  };
+  if (manifestRepositories !== null) {
+    canonical.manifest_repositories = manifestRepositories;
+  }
+  return canonical;
+}
+
+function assertSchemaTwoCohortExcludesCurrentLegacyOnlyRepository(
+  repositories,
+  field,
+) {
+  const archived = CURRENT_LEGACY_ONLY_ARCHIVED_REPOSITORY;
+  if (
+    repositories.some(
+      (repository) =>
+        repository.full_name.toLowerCase() === archived.full_name.toLowerCase() ||
+        repository.id === archived.id ||
+        repository.node_id === archived.node_id,
+    )
+  ) {
+    throw new Error(
+      `Organization final closure receipt ${field} must not authorize the current archived legacy-only repository.`,
+    );
+  }
+}
+
+function validateReceiptRepositoryCohort(
+  value,
+  organization,
+  cohortSize,
+  field,
+  schemaVersion,
+) {
+  if (!Array.isArray(value) || value.length !== cohortSize) {
+    throw new Error(
+      `Organization final closure receipt ${field} must contain exactly ${cohortSize} cohort members for receipt schema ${schemaVersion}.`,
+    );
+  }
+  const repositories = value.map((repository, index) =>
     validateReceiptRepository(repository, organization, index)
   );
   const slugs = new Set();
@@ -361,7 +494,7 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
       nodeIds.has(repository.node_id)
     ) {
       throw new Error(
-        "Organization final closure receipt contains duplicate repository identities.",
+        `Organization final closure receipt ${field} contains duplicate repository identities.`,
       );
     }
     slugs.add(foldedSlug);
@@ -373,18 +506,10 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
   );
   if (canonicalJson(repositories) !== canonicalJson(canonicalOrder)) {
     throw new Error(
-      "Organization final closure receipt repositories must use producer canonical full_name order.",
+      `Organization final closure receipt ${field} must use producer canonical full_name order.`,
     );
   }
-  return {
-    schema_version: 1,
-    organization,
-    manifest_sha256: receipt.manifest_sha256,
-    snapshot_sha256: receipt.snapshot_sha256,
-    legacy_ruleset: legacyRuleset,
-    v2_ruleset: v2Ruleset,
-    repositories,
-  };
+  return repositories;
 }
 
 function validateReceiptOrganization(value) {

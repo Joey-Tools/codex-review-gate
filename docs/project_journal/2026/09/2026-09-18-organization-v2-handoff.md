@@ -3,7 +3,7 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-18
+updated: 2026-09-21
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -14,15 +14,17 @@ superseded_by:
 
 ## Summary
 
-- Stable Action `v2.0.0` and the floating `v2` alias are published from
+- Stable Action `v2.0.1` and the floating `v2` alias are published from
   `JoeyTeng/codex-review-gate-action`. This workstream implements and carries
   out the user-approved organization-wide transition from the inherited v1
   required status to v2.
-- The cohort (a fixed, complete set of repositories migrated together) is the
-  exact 11-member selector of `Joey-Tools` organization ruleset `16590367`,
-  `Must Pass Codex Review`. Joey explicitly confirmed that this includes the
-  formerly special compatibility, history, and deprecated members for this
-  handoff.
+- The active v2 cohort (the fixed, complete set of repositories migrated
+  together) has exactly 10 members. `Joey-Tools` organization ruleset
+  `16590367`, `Must Pass Codex Review`, retains its original 11-member legacy
+  selector so its `deletion` and `non_fast_forward` protection still applies to
+  archived `codex-waited-delivery`; that archived repository is not an active
+  v2 member and must not receive migration, canary, cleanup, receipt, or bridge
+  removal work.
 - This is not a broad relaxation of the ordinary installer. It adds a separate,
   auditable temporary-bridge profile and a manifest-bound organization handoff
   transaction. The normal completed-installation contract continues to reject
@@ -57,11 +59,13 @@ superseded_by:
   complete. This is required so the handoff can bind the current default-base
   test merge rather than a closed PR's historical result; it is then closed
   unmerged.
-- After all 11 members are in that state, the new organization rule is active
-  and read back across the full cohort. This intentionally creates a temporary
+- After all 10 active members are in that state, the new organization rule is
+  active and read back across the full cohort. This intentionally creates a
+  temporary
   dual-protection interval.
-- The nine repository-local legacy required-status entries are then removed by
-  the controlled `apply-repository-cleanup` mode. Each snapshot-bound action
+- The eight active repository-local legacy required-status entries are then
+  removed by the controlled `apply-repository-cleanup` mode. Each
+  snapshot-bound action
   binds exact manifest `full_name`, `id`, `node_id`, and `default_branch`
   before every surface read and again immediately before any needed mutation,
   then performs exact-before comparison, the surface-specific mutation, and
@@ -80,13 +84,13 @@ superseded_by:
 - The mutating `verify --apply` response does not authorize bridge removal.
   While the final policy-mutation freeze remains active, a separate read-only
   `verify` must return top-level
-  `schema_version: organization-review-gate-handoff-output/v1`, `mode: verify`,
-  `status: final-verified`, `applied: false`, and `action: null`. Its schema-v1
-  final-closure receipt
-  binds the organization, reviewed manifest digest, final snapshot digest,
-  terminal legacy/v2 ruleset identities/states, and the exact repository
-cohort in canonical UTF-8-byte `full_name` order. The receipt is valid only for that
-complete fixed eleven-member cohort, never a subset or expanded set; the
+  `schema_version: organization-review-gate-handoff-output/v2`, `mode: verify`,
+  `status: final-verified`, `applied: false`, and `action: null`. Its
+  `final_closure_receipt.schema_version: 2` binds the organization, reviewed
+  manifest digest, final snapshot digest, terminal legacy/v2 ruleset
+  identities/states, and the exact active repository cohort in canonical
+  UTF-8-byte `full_name` order. The receipt is valid only for that complete
+  fixed 10-member active cohort, never a subset or expanded active set; the
 top-level `plan_sha256` must bind its final read-only `verify` plan exactly,
 and the receipt's canonical SHA-256 is the explicit removal proof.
 - Removal of each temporary bridge is a later, separate PR phase. The local
@@ -112,24 +116,76 @@ the global cutover is closed.
   `#54` merged as `5442b851200b6dd1fc85f88f0e2861f64d043906`: it corrects the
   controller to the required PR-scoped comment authority and hardens the
   handoff/bridge proof boundaries.
-- Nine consumer default branches have migrated to the canonical v2 verifier,
+- Release PR `#55` merged as `149769eac4b51df023a0edb79ad4a611d7a3edc3`,
+  updating the `v2.0.1` package and release manifest. The stable `v2.0.1`
+  package and floating `v2` alias are published; the release republishes the
+  already-reviewed `DESIGN.md` correction with its matching package version
+  and makes no runtime-code change.
+- Ten active cohort default branches have migrated to the canonical v2 verifier,
   controller, CODEOWNERS coverage, and temporary v1 bridge. No organization
   ruleset or required-status policy has been mutated by this workstream yet.
-- Read-only inventory confirms that all 11 members inherit old organization
-  rule `16590367`; nine additionally retain a repository-level legacy
-  `codex/review-gate` requirement. The other two compatibility/history cases
-  still require an explicit bridge and v2 proof before they can enter the
-  cohort's dual-protection state.
-- `codex-waited-delivery` is currently a workspace retirement tombstone rather
-  than an active configured mirror. Before its migration PR can be prepared,
-  the workspace manifest must restore its prior active specification and a
-  user-run host-level `codex_workspace.py ensure` must initialize the mirror.
-  The automation does not bypass that rule by cloning or by writing repository
-  contents through an API.
-- The stable `v2.0.0` target package predates source PR `#54`, so its English
-  `DESIGN.md` still describes the old issue-comment permission combination.
-  A `v2.0.1` release intent republishes the already-reviewed package document
-  together with the matching package version; it makes no runtime-code change.
+- The initial read-only inventory found that all 11 originally selected members
+  inherited old organization rule `16590367`; nine additionally retained a
+  repository-level legacy `codex/review-gate` requirement. Later bootstrap and
+  canary facts are recorded below and supersede the then-open
+  compatibility/history exception status.
+- `codex-waited-delivery` is archived and explicitly outside this cohort. Its
+  workspace retirement tombstone is therefore not a migration blocker, and
+  the workstream must not restore a mirror or create a migration PR for it.
+- The published historical handoff format is immutable: `manifest/v1`,
+  `output/v1`, and receipt schema `1` mean an exact 11-member closure. The
+  active 10-member contract therefore uses `manifest/v2`, `output/v2`, and
+  receipt schema `2`. Bootstrap accepts only exact same-version pairs.
+  Historical schema-1 receipts retain their published JSON shape and canonical
+  digest validation for auditability, but authorize no new bridge-removal
+  write. A schema-2 receipt instead carries `manifest_repositories`, derived
+  from the reviewed active manifest, and the stable observed `repositories`;
+  both canonical identity lists must match entry by entry before producer or
+  consumer admission. Bridge removal is authorized only from the
+  manifest-derived list, never from the observed list or the old 11-member
+  ruleset selector. This avoids silently redefining published 11-member
+  evidence while keeping the archived repository outside the current mutation
+  scope. No final organization closure receipt has been minted, so this
+  versioned contract change precedes any organization-policy mutation.
+- The current source hardening makes the retained archive exception explicit in
+  the unshipped `manifest/v2`: `legacy_ruleset.legacy_only_repository` binds
+  `Joey-Tools/codex-waited-delivery` by `slug`, numeric `id`, `node_id`,
+  `default_branch`, and `archived: true`. The legacy selector is valid only
+  when it contains the ordered 10 active IDs plus that one archived ID exactly
+  once. The archived identity must not overlap an active member. It remains
+  outside the v2 payload, repository cleanup, final receipt, and bridge-removal
+  scope.
+- The reason for this schema tightening is to prevent a selector that merely
+  has 11 unique IDs from substituting an arbitrary eleventh repository and
+  silently removing `codex-waited-delivery`'s retained `deletion` and
+  `non_fast_forward` protection. Post-activation/cutover stable snapshots will
+  read the archive's live `full_name`, `id`, `node_id`, `default_branch`, and
+  `archived` flag; the helper rereads the same identity immediately before the
+  legacy-ruleset `PUT`. An unreadable response, mismatch, same-slug
+  replacement, default-branch drift, or `archived: false` is fail closed and
+  sends no cutover mutation.
+- Regression coverage rejects malformed or overlapping archive descriptors, an
+  arbitrary selector eleventh ID, archive identity drift or an unreadable
+  archive immediately before cutover, and asserts that each such failure sends
+  zero legacy-ruleset `PUT` requests. It also preserves the separate assertions
+  that the v2 payload and final receipt contain only the active 10-member
+  cohort.
+- The second P1 receipt-binding repair makes a schema-2 receipt prove the same
+  active cohort twice: `manifest_repositories` comes only from the reviewed
+  manifest, while `repositories` comes from the stable final observation. Both
+  lists contain canonical `{full_name,id,node_id,default_branch}` identities,
+  and are rejected unless they are exactly equal. Consumer bridge removal reads
+  only `manifest_repositories` as its authorization set. This prevents a
+  digest-valid observed list from expanding or replacing the manifest-approved
+  cohort at the consumer boundary.
+- The current rollout adds a defense-in-depth hard rejection in both schema-2
+  receipt lists for `Joey-Tools/codex-waited-delivery` by case-insensitive slug,
+  numeric ID `1242512099`, or node ID `R_kgDOSg864w`. Slug detects same-slug
+  replacement, rename, or transfer; ID and node ID bind the persistent GitHub
+  object. The regression plan includes a synchronously altered dual-list
+  receipt with a fresh digest and asserts that consumer admission fails before
+  any local mutation. This does not alter schema-1's historical bytes or
+  digest semantics.
 
 ### Execution Update — 2026-09-18
 
@@ -146,17 +202,17 @@ the global cutover is closed.
   - `codex-workflow-hygiene#77` at `feb9bc110a7f3e077a89c50b15c89265a38e333c`; and
   - `codex-review-workflows#115` at `0be747dff940b36bd7b61712e435c6105a718555`.
 - The corresponding Private Overlay Release completed successfully in run
-  `35378848456`. `codex-waited-delivery` remains blocked on its missing
-  workspace mirror, and `codex-session-retrospective-history#7` remains
-  intentionally unmerged because it has no legacy v1 producer to prove the
-  required dual-protection boundary.
+  `35378848456`. `codex-waited-delivery` is archived and out of cohort, not
+  waiting for a workspace mirror. The retrospective-history bootstrap
+  `codex-session-retrospective-history#7` has merged at `53c9a165…`; its
+  follow-up canary `#8` passed both v2 and legacy proof, then closed unmerged.
 - Eight harmless, unmerged canary PRs were created for the merged public
   consumers. Their default-branch `begin-review` controller dispatches all
   failed at the same marker-comment POST: `403 Resource not accessible by
   integration`, despite the runner reporting `issues: write` and
   `pull-requests: read`. The observed failure alone does not prove which
   permission boundary caused it.
-- The pending source patch applies the documented alternative as a strictly
+- Source PR `#54` applies the documented alternative as a strictly
   narrower PR-only authority: it removes `issues: write` and changes
   `pull-requests: read` to `pull-requests: write`. The controller targets only
   pull-request conversation comments, for which GitHub accepts that write
@@ -178,7 +234,7 @@ the global cutover is closed.
   queried all five states separately, but the follow-up review found that this
   itself was racy: one run can advance between independently timed filtered
   requests and be absent from every result.
-- The source patch instead reads one complete unfiltered
+- That source change instead reads one complete unfiltered
   `actions/workflows/{id}/runs?per_page=100` inventory for each independently
   identified writer, then accepts only `status=completed` rows locally. It
   rejects every documented nonterminal state (`requested`, `waiting`,
@@ -249,7 +305,7 @@ the global cutover is closed.
 - Joey confirmed the final policy order: the new organization ruleset has v2
   as its sole required status context; the old ruleset retains deletion and
   non-fast-forward protection until the final, receipt-bound removal of its v1
-  context. No organization-policy mutation is authorized before all eleven
+  context. No organization-policy mutation is authorized before all ten active
   members have reached the dual-protection proof boundary.
 - Activation also requires a durable independent control-plane Codeowner path.
   The managed `/.github/**` owner currently names `@JoeyTeng`, while some
@@ -259,6 +315,25 @@ the global cutover is closed.
   distinct Codeowner approval. Do not activate the v2 repository policy until
   a separately authorized writable reviewer path has been selected for every
   affected repository.
+- The frozen implementation and documentation diff then received an independent
+  `GPT-5.6 Terra` review at `high` thinking with no actionable findings. Its
+  completed validation evidence is `npm run check`, bootstrap suite 119/119,
+  organization suite 136/136, `git diff --check`, and project-journal
+  validation. A local unsharded `npm test` attempt was bounded after twenty
+  minutes and is deliberately not recorded as passing: it had no failure
+  assertion output but ended incomplete inside the heavy release-pipeline
+  file. The repository's native CI-equivalent `1/4` through `4/4`
+  release-pipeline shards subsequently each exited zero, covering every
+  sharded release-pipeline test exactly once; the separately interrupted
+  `v2-workflow-contract` and `workflow-security-contract` files also passed
+  independently (8/8 and 41/41).
+- The reviewed result is committed as signed source commit
+  `53c49bfbb3cb76f83bd598f17b3329b09beddf2d` and delivered for GitHub review
+  as source PR #56. Local signature verification could confirm the embedded
+  OpenPGP signature packet and the available signing subkey, but the current
+  keyboxd service reported no public key for trust verification; this host-side
+  keyboxd mismatch does not change the signed commit bytes or its GitHub
+  review scope.
 
 ### Current-head review follow-up — 2026-09-18
 
@@ -314,10 +389,13 @@ the global cutover is closed.
 
 ## Failure And Recovery Boundary
 
-- Any changed selector, repository identity/default branch, workflow bytes,
-  bridge bytes, complete workflow inventory, Actions default token permission,
-  repository policy, canary evidence, old-rule fingerprint, or incomplete API
-  response is inconclusive and prevents the next mutation. The workflow
+- Any changed selector, active or legacy-only repository identity/default
+  branch/archive state, workflow bytes, bridge bytes, complete workflow
+  inventory, Actions default token permission, repository policy, canary
+  evidence, old-rule fingerprint, or incomplete API response is inconclusive
+  and prevents the next mutation. The legacy selector must be exactly the
+  ordered active 10 IDs plus its one manifest-bound archived-only ID, rather
+  than an arbitrary 11-member set. The workflow
   inventory admits only the three canonical files and rejects any extra v1/v2
   caller, related writer, nested workflow tree, symlink, submodule, or other
   non-regular entry; default workflow permission must be `read`.
@@ -335,6 +413,12 @@ the global cutover is closed.
   canonical workflow/CODEOWNERS bytes, default-read Actions policy including
   an explicit boolean `can_approve_pull_request_reviews`, bridge, v2 rulesets,
   and cleanup-state closure.
+- Each post-activation/cutover stable snapshot separately binds the
+  manifest-declared archived-only repository from live GitHub metadata:
+  `full_name`, `id`, `node_id`, `default_branch`, and `archived: true` must all
+  match. That observation preserves the old rule's non-status protections for
+  the archive; it never adds the archive to v2 coverage or final receipt
+  membership.
 - The operator holds an external organization-admin policy-mutation freeze
   from stage preview through apply, readback, and any recovery. A second
   organization/repository-admin freeze covers activation preview through its
@@ -349,11 +433,20 @@ the global cutover is closed.
   manifest-bound repository identity/default branch and bypass lists; it does
   not automatically discover an actor added outside the snapshot.
 - Before the old organization-rule `PUT`, the helper repeats the complete
-  cohort revalidation and then reads the old rule's writable identity directly
-  adjacent to the write. GitHub's ruleset update endpoint has no conditional
-  compare-and-swap contract. Plan digests and readback detect observed drift,
-  but cannot prevent or reconstruct an external update overwritten in the
-  final GET-to-PUT interval.
+  cohort revalidation and then rereads both the old rule's writable identity
+  and the archived-only repository directly adjacent to the write. GitHub's
+  ruleset update endpoint has no conditional compare-and-swap contract. Plan
+  digests and readback detect observed drift, but cannot prevent or reconstruct
+  an external update overwritten in the final GET-to-PUT interval. A missing,
+  mismatched, or no-longer-archived legacy-only repository blocks the `PUT`.
+- Schema-2 final-closure receipt admission validates the manifest-derived
+  `manifest_repositories` and stable observed `repositories` as independent
+  canonical 10-member identity lists, then requires exact equality before the
+  consumer uses only the former to authorize a bridge removal. Either list
+  rejects the current archived legacy-only repository by slug, ID, or node ID;
+  a receipt that alters both lists and refreshes its digest still fails before
+  any local consumer mutation. Schema 1 remains readable and digest-valid only
+  as historical evidence and returns no bridge-removal authorization.
 - A potentially successful but unacknowledged stage POST is never replayed.
   The apply path first attempts one read-only reconciliation and may return
   `applied-recovered`; interrupted or still-unknown outcomes use the explicit
@@ -388,20 +481,20 @@ the global cutover is closed.
 
 ## Next Steps
 
-1. Merge the source permission/hardening patch, then use reviewed control-plane
-   PRs to update the nine merged consumers' copied controller bytes and retry
-   their existing exact-head canaries through `begin-review`.
-2. Resolve the two remaining cohort blockers: restore the
-   `codex-waited-delivery` workspace mirror through the user-run workspace
-   initialization path, and select an explicitly authorized one-time v1 proof
-   path for `codex-session-retrospective-history`.
-3. Only after all eleven members have current dual-protection canary proof,
+1. Use reviewed control-plane PRs to update affected active consumers' copied
+   controller bytes and retry their existing exact-head canaries through
+   `begin-review`.
+2. Reconcile the 10-member active cohort's remaining proof state;
+   `codex-waited-delivery` is archived, legacy-selector-only, and not a
+   blocker, and `codex-session-retrospective-history` has completed its
+   bootstrap/canary proof.
+3. Only after all 10 active cohort members have dual-protection canary proof,
    stage/activate the organization v2 rule, execute the receipt-bound cleanup,
    and remove the temporary bridges in separate PRs.
 
 ## Evidence
 
-- Stable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.0.0`
+- Stable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.0.1`
 - Old organization ruleset: `Joey-Tools` ruleset `16590367`, read through
   `GET /orgs/Joey-Tools/rulesets/16590367` on 2026-09-18.
 - Prior v2 decisions and implementation ledger:

@@ -3,7 +3,7 @@
 ## Current State
 - The source workspace keeps the publishable GitHub Action package under `packages/action`.
 - The v2 runtime, installation, and manifest-driven publisher infrastructure
-  are released as immutable stable `v2.0.0` with the floating `v2` alias. The
+  are released as immutable stable `v2.0.1` with the floating `v2` alias. The
   current active workstream adds the controlled organization-wide consumer
   handoff needed to migrate the inherited v1 gate without weakening branch
   protections.
@@ -18,9 +18,24 @@
 
 ## Global Blockers
 - The inherited v1 organization gate must remain active until every member of
-  the fixed 11-repository cohort proves its canonical v2 check under a
-  separately active v2-only organization rule. Any missing or drifting proof
+  the fixed active 10-repository v2 cohort proves its canonical v2 check under
+  a separately active v2-only organization rule. Any missing or drifting proof
   leaves the system in the deliberately fail-closed dual-protection state.
+- The old rule's original 11-repository legacy selector remains intact,
+  including archived `Joey-Tools/codex-waited-delivery`. Final cutover removes
+  only the v1 required-status rule; it retains `deletion` and
+  `non_fast_forward`. The archived repository requires no v2 install, canary,
+  repository cleanup, receipt membership, or bridge removal. Its fixed
+  `legacy_only_repository` identity is independently read in post-activation
+  and cutover snapshots, then reread immediately before the legacy-rule `PUT`;
+  an unreadable, mismatched, or non-archived result blocks that write.
+- A schema-2 final receipt must carry both the manifest-derived active
+  `manifest_repositories` list and the stable observed `repositories` list;
+  canonical entry-by-entry equality is required. Bridge removal authorizes only
+  the manifest-derived list. In this rollout, either list rejects
+  `Joey-Tools/codex-waited-delivery` by slug, ID, or node ID. Schema-1 keeps
+  its historical exact shape and canonical digest for audit but authorizes no
+  new bridge removal.
 
 ## Notes
 - The generated `docs/project_journal/INDEX.md` is a local convenience artifact and should not be committed.

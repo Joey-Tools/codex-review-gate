@@ -17,14 +17,19 @@ import {
 } from "../src/bootstrap.mjs";
 
 export const MANIFEST_SCHEMA_VERSION =
-  "organization-review-gate-handoff-manifest/v1";
+  "organization-review-gate-handoff-manifest/v2";
 export const OUTPUT_SCHEMA_VERSION =
-  "organization-review-gate-handoff-output/v1";
+  "organization-review-gate-handoff-output/v2";
+export const FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION = 2;
 export const V2_RULESET_NAME = "Must Pass Codex Review v2";
 export const V2_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
 export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
-export const REQUIRED_REPOSITORY_COUNT = 11;
+export const REQUIRED_REPOSITORY_COUNT = 10;
+// The current v2 handoff migrates ten active repositories. The inherited
+// organization rule intentionally retains one archived repository so its
+// deletion/non-fast-forward protection survives the v1 status-rule removal.
+export const LEGACY_SELECTOR_REPOSITORY_COUNT = 11;
 export const CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const V2_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
 // These are every documented nonterminal Actions workflow-run state. A run in
@@ -333,7 +338,12 @@ function statusChecks(rule, label) {
   return checks;
 }
 
-function assertLegacyOrganizationRulesetPolicy(ruleset, repositoryIds, label) {
+function assertLegacyOrganizationRulesetPolicy(
+  ruleset,
+  activeRepositoryIds,
+  legacyOnlyRepository,
+  label,
+) {
   assertWritableRuleset(ruleset, label);
   if (ruleset.enforcement !== "active") {
     throw new Error(`${label} must remain active before global cutover.`);
@@ -345,20 +355,44 @@ function assertLegacyOrganizationRulesetPolicy(ruleset, repositoryIds, label) {
     ["repository_ids"],
     `${label}.conditions.repository_id`,
   );
+  const legacySelectorRepositoryIds = conditions.repository_id.repository_ids;
   if (
-    !Array.isArray(conditions.repository_id.repository_ids) ||
-    conditions.repository_id.repository_ids.some(
+    !Array.isArray(legacySelectorRepositoryIds) ||
+    legacySelectorRepositoryIds.some(
       (id) => !Number.isSafeInteger(id) || id <= 0,
     )
   ) {
     throw new Error(`${label}.conditions.repository_id.repository_ids is malformed.`);
   }
   if (
-    canonicalJson(conditions.repository_id.repository_ids) !==
-    canonicalJson(repositoryIds)
+    legacySelectorRepositoryIds.length !== LEGACY_SELECTOR_REPOSITORY_COUNT ||
+    new Set(legacySelectorRepositoryIds).size !== legacySelectorRepositoryIds.length
   ) {
     throw new Error(
-      `${label} repository IDs must exactly match the ordered manifest repository IDs.`,
+      `${label} repository IDs must contain exactly ${LEGACY_SELECTOR_REPOSITORY_COUNT} unique entries.`,
+    );
+  }
+  const activeRepositoryIdSet = new Set(activeRepositoryIds);
+  const orderedActiveRepositoryIds = legacySelectorRepositoryIds.filter((id) =>
+    activeRepositoryIdSet.has(id),
+  );
+  if (
+    canonicalJson(orderedActiveRepositoryIds) !==
+    canonicalJson(activeRepositoryIds)
+  ) {
+    throw new Error(
+      `${label} repository IDs must retain every ordered active manifest repository ID.`,
+    );
+  }
+  if (
+    legacySelectorRepositoryIds.filter((id) => id === legacyOnlyRepository.id)
+      .length !== 1 ||
+    legacySelectorRepositoryIds.some(
+      (id) => !activeRepositoryIdSet.has(id) && id !== legacyOnlyRepository.id,
+    )
+  ) {
+    throw new Error(
+      `${label} repository IDs must contain only the ordered active manifest repository IDs plus manifest.legacy_ruleset.legacy_only_repository.id.`,
     );
   }
   assertExactKeys(
@@ -548,6 +582,31 @@ function validateCleanupAction(action, repo, index) {
   deriveRepositoryCleanupAction(action);
 }
 
+function assertLegacyOnlyRepositoryIdentity(value, organization, label) {
+  assertExactKeys(
+    value,
+    ["slug", "id", "node_id", "default_branch", "archived"],
+    label,
+  );
+  assertSlug(value.slug, `${label}.slug`);
+  const [owner] = value.slug.split("/");
+  if (owner.toLowerCase() !== organization.login.toLowerCase()) {
+    throw new Error(`${label}.slug must belong to manifest.organization.login.`);
+  }
+  assertPositiveInteger(value.id, `${label}.id`);
+  assertNonEmptyString(value.node_id, `${label}.node_id`);
+  assertNonEmptyString(value.default_branch, `${label}.default_branch`);
+  if (
+    value.default_branch.startsWith("refs/") ||
+    value.default_branch.includes("..")
+  ) {
+    throw new Error(`${label}.default_branch is malformed.`);
+  }
+  if (value.archived !== true) {
+    throw new Error(`${label}.archived must be true.`);
+  }
+}
+
 export function validateManifest(input) {
   assertExactKeys(
     input,
@@ -563,7 +622,7 @@ export function validateManifest(input) {
   );
   if (input.schema_version !== MANIFEST_SCHEMA_VERSION) {
     throw new Error(
-      `manifest.schema_version must be "${MANIFEST_SCHEMA_VERSION}".`,
+      `manifest.schema_version must be "${MANIFEST_SCHEMA_VERSION}"; v1 manifests are historical 11-member artifacts and cannot authorize this 10-member cutover.`,
     );
   }
   assertExactKeys(input.organization, ["login", "id", "node_id"], "manifest.organization");
@@ -575,10 +634,15 @@ export function validateManifest(input) {
 
   assertExactKeys(
     input.legacy_ruleset,
-    ["id", "expected_before"],
+    ["id", "legacy_only_repository", "expected_before"],
     "manifest.legacy_ruleset",
   );
   assertPositiveInteger(input.legacy_ruleset.id, "manifest.legacy_ruleset.id");
+  assertLegacyOnlyRepositoryIdentity(
+    input.legacy_ruleset.legacy_only_repository,
+    input.organization,
+    "manifest.legacy_ruleset.legacy_only_repository",
+  );
   assertWritableRuleset(
     input.legacy_ruleset.expected_before,
     "manifest.legacy_ruleset.expected_before",
@@ -603,6 +667,7 @@ export function validateManifest(input) {
   }
   const seenIds = new Set();
   const seenSlugs = new Set();
+  const seenNodeIds = new Set();
   const seenCleanupTargets = new Set();
   let cleanupCount = 0;
   for (const [index, repo] of input.repositories.entries()) {
@@ -633,11 +698,16 @@ export function validateManifest(input) {
     if (repo.default_branch.startsWith("refs/") || repo.default_branch.includes("..")) {
       throw new Error(`${label}.default_branch is malformed.`);
     }
-    if (seenIds.has(repo.id) || seenSlugs.has(repo.slug.toLowerCase())) {
+    if (
+      seenIds.has(repo.id) ||
+      seenSlugs.has(repo.slug.toLowerCase()) ||
+      seenNodeIds.has(repo.node_id)
+    ) {
       throw new Error(`${label} duplicates a repository identity.`);
     }
     seenIds.add(repo.id);
     seenSlugs.add(repo.slug.toLowerCase());
+    seenNodeIds.add(repo.node_id);
 
     assertExactKeys(repo.workflows, WORKFLOW_KEYS, `${label}.workflows`);
     const workflowPaths = new Set();
@@ -735,9 +805,20 @@ export function validateManifest(input) {
       "manifest.expected_legacy_cleanup_action_count does not match the listed actions.",
     );
   }
+  const legacyOnlyRepository = input.legacy_ruleset.legacy_only_repository;
+  if (
+    seenIds.has(legacyOnlyRepository.id) ||
+    seenSlugs.has(legacyOnlyRepository.slug.toLowerCase()) ||
+    seenNodeIds.has(legacyOnlyRepository.node_id)
+  ) {
+    throw new Error(
+      "manifest.legacy_ruleset.legacy_only_repository must not overlap an active manifest repository identity.",
+    );
+  }
   assertLegacyOrganizationRulesetPolicy(
     input.legacy_ruleset.expected_before,
     input.repositories.map((repo) => repo.id),
+    legacyOnlyRepository,
     "manifest.legacy_ruleset.expected_before",
   );
   buildV2OrganizationRulesetPayload(input, "disabled");
@@ -756,7 +837,12 @@ export function buildV2OrganizationRulesetPayload(manifest, enforcement = "disab
     target: "branch",
     enforcement,
     bypass_actors: [],
-    conditions: cloneJson(legacy.conditions),
+    conditions: {
+      ref_name: cloneJson(legacy.conditions.ref_name),
+      repository_id: {
+        repository_ids: manifest.repositories.map((repository) => repository.id),
+      },
+    },
     rules: [
       {
         type: "required_status_checks",
@@ -964,6 +1050,37 @@ async function loadOrganizationIdentity(manifest) {
     node_id: response.node_id,
   };
   assertExactSnapshot(identity, manifest.organization, "Organization identity");
+  return identity;
+}
+
+async function loadLegacyOnlyRepositoryIdentity(manifest, label) {
+  const repository = manifest.legacy_ruleset.legacy_only_repository;
+  const response = await ghJson(`repos/${encodeEndpointPath(repository.slug)}`);
+  assertPlainObject(response, `${label} API response`);
+  const identity = {
+    full_name: response.full_name,
+    id: response.id,
+    node_id: response.node_id,
+    default_branch: response.default_branch,
+    archived: response.archived,
+  };
+  // Protected property: this read binds the retained selector entry to the
+  // exact archived repository object and its default-branch selector.
+  // id/node_id bind object identity, full_name detects rename, transfer, or
+  // same-slug reuse, default_branch binds the selector, and archived proves
+  // the exception remains the deliberate archived-only repository. Unrelated
+  // metadata churn is intentionally not treated as a policy change.
+  assertExactSnapshot(
+    identity,
+    {
+      full_name: repository.slug,
+      id: repository.id,
+      node_id: repository.node_id,
+      default_branch: repository.default_branch,
+      archived: repository.archived,
+    },
+    label,
+  );
   return identity;
 }
 
@@ -1203,6 +1320,33 @@ async function revalidateLegacyOrganizationRuleImmediatelyBeforeCutover(
     );
   }
   return latestLegacy;
+}
+
+async function revalidateLegacyOnlyRepositoryImmediatelyBeforeCutover(
+  manifest,
+  plannedSnapshot,
+) {
+  let latestIdentity;
+  try {
+    latestIdentity = await loadLegacyOnlyRepositoryIdentity(
+      manifest,
+      "Final legacy-only archived repository pre-write read",
+    );
+  } catch (error) {
+    throw new Error(
+      `The legacy-only archived repository could not be read immediately before cutover; no mutation was sent. ${error.message}`,
+      { cause: error },
+    );
+  }
+  if (
+    canonicalJson(latestIdentity) !==
+    canonicalJson(plannedSnapshot.legacy_only_repository)
+  ) {
+    throw new Error(
+      `The legacy-only archived repository changed after full-cohort revalidation; no mutation was sent (planned ${sha256Canonical(plannedSnapshot.legacy_only_repository)}, latest ${sha256Canonical(latestIdentity)}).`,
+    );
+  }
+  return latestIdentity;
 }
 
 function assertState(actual, allowed, label) {
@@ -2809,7 +2953,14 @@ async function loadCoverageRound(
 }
 
 async function loadPostActivationRound(manifest) {
-  return loadCoverageRound(manifest, { requireCanaryEvidence: false });
+  const [coverage, legacyOnlyRepository] = await Promise.all([
+    loadCoverageRound(manifest, { requireCanaryEvidence: false }),
+    loadLegacyOnlyRepositoryIdentity(
+      manifest,
+      "Legacy-only archived repository identity",
+    ),
+  ]);
+  return { ...coverage, legacy_only_repository: legacyOnlyRepository };
 }
 
 function assertCleanupState(snapshot, requiredState) {
@@ -3080,7 +3231,7 @@ function printUsage() {
 Modes:
   plan            Read two complete organization snapshots and report the bound phase.
   stage           Preview or create the exact Disabled v2 organization ruleset; --recover-created-v2 is the read-only recovery path for an ambiguous create.
-  activate        Require 11/11 workflow, bridge, repo-ruleset, and canary proof; preview or activate v2.
+  activate        Require ${REQUIRED_REPOSITORY_COUNT}/${REQUIRED_REPOSITORY_COUNT} workflow, bridge, repo-ruleset, and canary proof; preview or activate v2.
   derive-cutover  Read-only derivation of remaining manifest-bound repository cleanup actions and the later organization cutover.
   apply-repository-cleanup  Preview or apply the remaining repository cleanup actions with per-action exact-before/readback checks.
   verify          Verify external repository cleanup; preview or apply removal of the whole legacy organization status rule, then close with two reads.
@@ -3099,26 +3250,37 @@ function baseOutput(mode, manifest, snapshot) {
   };
 }
 
-function finalClosureReceipt(manifest, snapshot) {
+export function buildFinalClosureReceipt(manifest, snapshot) {
   if (
     snapshot.organization.legacy_state !== "after" ||
     snapshot.organization.v2_state !== "active"
   ) {
     throw new Error("Final closure receipt requires an active v2 and removed legacy organization rule.");
   }
-  const repositories = snapshot.repositories
-    .map((repository) => cloneJson(repository.identity))
-    .sort((left, right) =>
-      Buffer.compare(
-        Buffer.from(left.full_name, "utf8"),
-        Buffer.from(right.full_name, "utf8"),
-      )
-    );
-  if (repositories.length !== REQUIRED_REPOSITORY_COUNT) {
+  const repositories = canonicalFinalClosureRepositoryIdentities(
+    snapshot.repositories.map((repository) => repository.identity),
+  );
+  const manifestRepositories = canonicalFinalClosureRepositoryIdentities(
+    manifest.repositories.map((repository) => ({
+      full_name: repository.slug,
+      id: repository.id,
+      node_id: repository.node_id,
+      default_branch: repository.default_branch,
+    })),
+  );
+  if (
+    repositories.length !== REQUIRED_REPOSITORY_COUNT ||
+    manifestRepositories.length !== REQUIRED_REPOSITORY_COUNT
+  ) {
     throw new Error("Final closure receipt requires the complete repository cohort.");
   }
+  if (canonicalJson(repositories) !== canonicalJson(manifestRepositories)) {
+    throw new Error(
+      "Final closure receipt requires the stable observed repository identity cohort to exactly match manifest.repositories.",
+    );
+  }
   return {
-    schema_version: 1,
+    schema_version: FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION,
     organization: cloneJson(snapshot.organization.organization),
     manifest_sha256: sha256Canonical(manifest),
     snapshot_sha256: sha256Canonical(snapshot),
@@ -3130,12 +3292,24 @@ function finalClosureReceipt(manifest, snapshot) {
       id: snapshot.organization.v2.id,
       state: snapshot.organization.v2_state,
     },
+    manifest_repositories: manifestRepositories,
     repositories,
   };
 }
 
+function canonicalFinalClosureRepositoryIdentities(repositories) {
+  return repositories
+    .map((repository) => cloneJson(repository))
+    .sort((left, right) =>
+      Buffer.compare(
+        Buffer.from(left.full_name, "utf8"),
+        Buffer.from(right.full_name, "utf8"),
+      )
+    );
+}
+
 function finalClosureReceiptOutput(manifest, snapshot) {
-  const receipt = finalClosureReceipt(manifest, snapshot);
+  const receipt = buildFinalClosureReceipt(manifest, snapshot);
   return {
     final_closure_receipt: receipt,
     final_closure_receipt_sha256: sha256Canonical(receipt),
@@ -3370,7 +3544,9 @@ async function runActivateMode(manifest, options, runtime) {
   if (manifest.v2_ruleset.id === null) {
     throw new Error("activate mode requires manifest.v2_ruleset.id from stage readback.");
   }
-  const snapshot = await loadStable("11/11 activation coverage", () =>
+  const activationCoverageLabel =
+    `${REQUIRED_REPOSITORY_COUNT}/${REQUIRED_REPOSITORY_COUNT} activation coverage`;
+  const snapshot = await loadStable(activationCoverageLabel, () =>
     loadCoverageRound(manifest),
     runtime.stableSnapshotOptions,
   );
@@ -3411,7 +3587,7 @@ async function runActivateMode(manifest, options, runtime) {
     };
   }
   await revalidateUnchangedBeforeMutation(
-    "11/11 activation coverage",
+    activationCoverageLabel,
     snapshot,
     () => loadCoverageRound(manifest),
   );
@@ -3568,9 +3744,25 @@ async function executeRepositoryCleanupRecord(record) {
   }
   const payload =
     record.method === "DELETE" ? undefined : record.action.expected_after;
+  // The external policy-mutation freeze is the accepted protection for the
+  // unavoidable final GET-to-write gap. Still, reread the selected surface
+  // immediately before the final identity check so a policy change observed
+  // between the initial checkpoint and this write cannot be overwritten by
+  // this executor. The following identity read must remain adjacent to the
+  // write boundary: otherwise a same-slug replacement could make this exact
+  // surface read describe a different repository object.
+  // `classifyCleanupSurface` accepts only the manifest's exact before/after
+  // bytes; a third state fails closed before the mutation.
+  const immediatelyBeforeMutation = classifyCleanupSurface(
+    record.action,
+    await loadRepositoryCleanupSurface(record.repo, record.action),
+  );
+  if (immediatelyBeforeMutation === "after") {
+    return { ...record, outcome: "already-reconciled-immediately-before-write" };
+  }
   await loadManifestBoundRepositoryCleanupIdentity(
     record.repo,
-    `${record.repo.slug} repository cleanup identity immediately before mutation`,
+    `${record.repo.slug} repository cleanup identity after final surface read immediately before mutation`,
   );
   try {
     await ghJson(record.endpoint, { method: record.method, body: payload });
@@ -3728,6 +3920,10 @@ async function runVerifyMode(manifest, options, runtime) {
     await runtime.beforeFinalLegacyRevalidation();
   }
   await revalidateLegacyOrganizationRuleImmediatelyBeforeCutover(
+    manifest,
+    snapshot,
+  );
+  await revalidateLegacyOnlyRepositoryImmediatelyBeforeCutover(
     manifest,
     snapshot,
   );
