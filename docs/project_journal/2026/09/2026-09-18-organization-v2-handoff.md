@@ -327,6 +327,13 @@ the global cutover is closed.
   sharded release-pipeline test exactly once; the separately interrupted
   `v2-workflow-contract` and `workflow-security-contract` files also passed
   independently (8/8 and 41/41).
+- The reviewed result is committed as signed source commit
+  `53c49bfbb3cb76f83bd598f17b3329b09beddf2d` and delivered for GitHub review
+  as source PR #56. Local signature verification could confirm the embedded
+  OpenPGP signature packet and the available signing subkey, but the current
+  keyboxd service reported no public key for trust verification; this host-side
+  keyboxd mismatch does not change the signed commit bytes or its GitHub
+  review scope.
 
 ### Current-head review follow-up — 2026-09-18
 

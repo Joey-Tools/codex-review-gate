@@ -18,8 +18,8 @@
   deliberately not treated as a passing result.
 - [x] Complete a fresh final GPT-5.6 Terra review at high thinking on that
   frozen diff: it returned no actionable findings.
-- [ ] Create the signed source commit and delivery PR after validation and
-  review pass.
+- [x] Create the signed source commit and delivery PR after validation and
+  review pass: signed commit `53c49bf` is the head of source PR #56.
 - [ ] Deliver the merged source change, then continue the separately authorized
   10-repository dual-protection rollout and one-way v1 cutover.
 
