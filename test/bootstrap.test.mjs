@@ -29,6 +29,7 @@ import {
   DEFAULT_VERIFIER_RUN_NAME,
   DEFAULT_VERIFIER_RUN_NAME_PREFIX,
   DEFAULT_WORKFLOW_PATH,
+  LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
   LEGACY_STATUS_CONTEXT,
   ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
   assertCompleteRulesetApiObject,
@@ -1290,66 +1291,171 @@ test("parses supported GitHub origin URLs without accepting credentials or ambig
   }
 });
 
-test("validates a canonical organization final closure receipt", () => {
+test("validates historical v1 and current v2 organization final closure receipts", () => {
+  const historicalOutput = buildFinalClosureOutput({ format: "v1" });
   const output = buildFinalClosureOutput();
-  const validated = validateOrganizationFinalClosureOutput(output);
-  assert.deepEqual(validated.receipt, output.final_closure_receipt);
+  assert.equal(LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE, 11);
+  assert.equal(ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE, 10);
+  const historicalValidated = validateOrganizationFinalClosureOutput(
+    historicalOutput,
+  );
+  const currentValidated = validateOrganizationFinalClosureOutput(output);
+  for (const [candidateOutput, validated] of [
+    [historicalOutput, historicalValidated],
+    [output, currentValidated],
+  ]) {
+    assert.deepEqual(validated.receipt, candidateOutput.final_closure_receipt);
+    assert.equal(
+      createHash("sha256")
+        .update(canonicalOrganizationFinalClosureReceipt(validated.receipt))
+        .digest("hex"),
+      candidateOutput.final_closure_receipt_sha256,
+    );
+  }
+  assert.deepEqual(
+    historicalValidated.bridgeRemovalRepositories,
+    [],
+    "historical v1 evidence cannot authorize a new bridge-removal mutation",
+  );
+  assert.deepEqual(
+    currentValidated.bridgeRemovalRepositories,
+    output.final_closure_receipt.repositories,
+  );
   assert.equal(
-    createHash("sha256")
-      .update(canonicalOrganizationFinalClosureReceipt(validated.receipt))
-      .digest("hex"),
-    output.final_closure_receipt_sha256,
+    historicalOutput.final_closure_receipt_sha256,
+    "6eeb485ac17c561fbd5f9f7c6aa70979ac4d1b4f5f8714937605d443a8f9fa9d",
+    "v1 canonical receipt hashes are a published compatibility contract",
+  );
+  assert.equal(
+    currentValidated.bridgeRemovalRepositories.some(
+      ({ full_name: fullName }) =>
+        fullName.toLowerCase() === "joey-tools/codex-waited-delivery",
+    ),
+    false,
+    "the archived legacy-only repository is not a v2 bridge-removal authorization",
   );
 
-  for (const mutate of [
-    (candidate) => { candidate.schema_version = "organization-review-gate-handoff-output/v2"; },
-    (candidate) => { candidate.mode = "activate"; },
-    (candidate) => { candidate.status = "applied-final-verified"; },
-    (candidate) => { candidate.applied = true; },
-    (candidate) => { candidate.action = { method: "PUT" }; },
-    (candidate) => { delete candidate.plan_sha256; },
-    (candidate) => { candidate.plan_sha256 = "4".repeat(64); },
-    (candidate) => { candidate.unreviewed_extension = true; },
-    (candidate) => { candidate.final_closure_receipt.legacy_ruleset.state = "before"; },
-    (candidate) => { candidate.final_closure_receipt.repositories[0].full_name = "Elsewhere/consumer"; },
-    (candidate) => {
+  const v1WithV2Receipt = structuredClone(historicalOutput);
+  v1WithV2Receipt.final_closure_receipt = structuredClone(
+    output.final_closure_receipt,
+  );
+  v1WithV2Receipt.final_closure_receipt_sha256 =
+    output.final_closure_receipt_sha256;
+  v1WithV2Receipt.repositories_verified = output.repositories_verified;
+
+  const v2WithV1Receipt = structuredClone(output);
+  v2WithV1Receipt.final_closure_receipt = structuredClone(
+    historicalOutput.final_closure_receipt,
+  );
+  v2WithV1Receipt.final_closure_receipt_sha256 =
+    historicalOutput.final_closure_receipt_sha256;
+  v2WithV1Receipt.repositories_verified = historicalOutput.repositories_verified;
+
+  const v1WithTenRepositories = structuredClone(historicalOutput);
+  v1WithTenRepositories.final_closure_receipt.repositories.pop();
+  v1WithTenRepositories.repositories_verified =
+    v1WithTenRepositories.final_closure_receipt.repositories.length;
+  refreshFinalClosureReceiptDigest(v1WithTenRepositories);
+
+  const v2WithElevenRepositories = structuredClone(output);
+  v2WithElevenRepositories.final_closure_receipt.repositories.push({
+    full_name: "Joey-Tools/codex-waited-delivery",
+    id: 1_244,
+    node_id: "R_kgDOReceiptCohort11",
+    default_branch: "master",
+  });
+  v2WithElevenRepositories.repositories_verified =
+    v2WithElevenRepositories.final_closure_receipt.repositories.length;
+  refreshFinalClosureReceiptDigest(v2WithElevenRepositories);
+
+  const unknownOutputFormat = structuredClone(output);
+  unknownOutputFormat.schema_version = "organization-review-gate-handoff-output/v3";
+
+  const unknownReceiptFormat = structuredClone(output);
+  unknownReceiptFormat.final_closure_receipt.schema_version = 3;
+  refreshFinalClosureReceiptDigest(unknownReceiptFormat);
+
+  const receiptWithExtraKey = structuredClone(output);
+  receiptWithExtraKey.final_closure_receipt.unreviewed_extension = true;
+  refreshFinalClosureReceiptDigest(receiptWithExtraKey);
+
+  const receiptWithMissingKey = structuredClone(output);
+  delete receiptWithMissingKey.final_closure_receipt.v2_ruleset;
+  refreshFinalClosureReceiptDigest(receiptWithMissingKey);
+
+  const outputWithExtraKey = structuredClone(output);
+  outputWithExtraKey.unreviewed_extension = true;
+
+  const outputWithMissingKey = structuredClone(output);
+  delete outputWithMissingKey.plan_sha256;
+
+  const mutateCurrentOutput = (mutate) => {
+    const candidate = structuredClone(output);
+    mutate(candidate);
+    return candidate;
+  };
+
+  for (const [name, candidate] of [
+    ["cross-paired-v1-output", v1WithV2Receipt],
+    ["cross-paired-v2-output", v2WithV1Receipt],
+    ["v1-with-ten-repositories", v1WithTenRepositories],
+    ["v2-with-eleven-repositories", v2WithElevenRepositories],
+    ["unknown-output-format", unknownOutputFormat],
+    ["unknown-receipt-format", unknownReceiptFormat],
+    ["receipt-extra-key", receiptWithExtraKey],
+    ["receipt-missing-key", receiptWithMissingKey],
+    ["output-extra-key", outputWithExtraKey],
+    ["output-missing-key", outputWithMissingKey],
+    ["non-verify-mode", mutateCurrentOutput((candidate) => {
+      candidate.mode = "activate";
+    })],
+    ["non-final-status", mutateCurrentOutput((candidate) => {
+      candidate.status = "applied-final-verified";
+    })],
+    ["applied", mutateCurrentOutput((candidate) => {
+      candidate.applied = true;
+    })],
+    ["action", mutateCurrentOutput((candidate) => {
+      candidate.action = { method: "PUT" };
+    })],
+    ["wrong-plan", mutateCurrentOutput((candidate) => {
+      candidate.plan_sha256 = "4".repeat(64);
+    })],
+    ["legacy-ruleset-state", mutateCurrentOutput((candidate) => {
+      candidate.final_closure_receipt.legacy_ruleset.state = "before";
+    })],
+    ["wrong-organization", mutateCurrentOutput((candidate) => {
+      candidate.final_closure_receipt.repositories[0].full_name =
+        "Elsewhere/consumer";
+    })],
+    ["single-repository", mutateCurrentOutput((candidate) => {
       candidate.final_closure_receipt.repositories =
         candidate.final_closure_receipt.repositories.slice(0, 1);
       candidate.repositories_verified = 1;
-    },
-    (candidate) => {
-      candidate.final_closure_receipt.repositories =
-        candidate.final_closure_receipt.repositories.slice(0, 10);
-      candidate.repositories_verified = 10;
-    },
-    (candidate) => {
-      candidate.final_closure_receipt.repositories.push({
-        full_name: "Joey-Tools/unexpected-cohort-member",
-        id: 999_991,
-        node_id: "R_kgDOUnexpectedCohortMember",
-        default_branch: "master",
-      });
-      candidate.repositories_verified = 12;
-    },
-    (candidate) => {
+      refreshFinalClosureReceiptDigest(candidate);
+    })],
+    ["reordered-repositories", mutateCurrentOutput((candidate) => {
       candidate.final_closure_receipt.repositories.reverse();
       refreshFinalClosureReceiptDigest(candidate);
-    },
-    (candidate) => {
-      candidate.final_closure_receipt.repositories[1].full_name = "Joey-Tools/bad repo";
+    })],
+    ["invalid-repository-slug", mutateCurrentOutput((candidate) => {
+      candidate.final_closure_receipt.repositories[1].full_name =
+        "Joey-Tools/bad repo";
       refreshFinalClosureReceiptDigest(candidate);
-    },
-    (candidate) => {
-      candidate.final_closure_receipt.repositories[1].default_branch = "refs/heads/main";
+    })],
+    ["invalid-default-branch", mutateCurrentOutput((candidate) => {
+      candidate.final_closure_receipt.repositories[1].default_branch =
+        "refs/heads/main";
       refreshFinalClosureReceiptDigest(candidate);
-    },
-    (candidate) => { candidate.repositories_verified = 2; },
+    })],
+    ["wrong-repositories-verified", mutateCurrentOutput((candidate) => {
+      candidate.repositories_verified = 2;
+    })],
   ]) {
-    const candidate = structuredClone(output);
-    mutate(candidate);
     assert.throws(
       () => validateOrganizationFinalClosureOutput(candidate),
-      /final|receipt|repositories_verified|organization|plan_sha256|cohort|slug|default_branch|order/iu,
+      /final|receipt|repositories_verified|organization|plan_sha256|cohort|schema_version|keys|slug|default_branch|order/iu,
+      name,
     );
   }
 });
@@ -1611,7 +1717,22 @@ test("legacy bridge removal requires an exact repository-bound final closure rec
         repoSlug: "Joey-Tools/other-consumer",
         originRepoSlug: "Joey-Tools/consumer",
       }),
-      expected: /is not a member of the organization final closure receipt/u,
+      expected: /not authorized for bridge removal/u,
+    },
+    {
+      name: "historical-v1-origin",
+      prepare: (targetRoot) => prepareFinalClosureReceipt(targetRoot, {
+        format: "v1",
+      }),
+      expected: /not authorized for bridge removal/u,
+    },
+    {
+      name: "v2-archived-legacy-only-origin",
+      prepare: (targetRoot) => prepareFinalClosureReceipt(targetRoot, {
+        originRepoSlug: "Joey-Tools/codex-waited-delivery",
+      }),
+      expected: /not authorized for bridge removal/u,
+      codeownersContent: "# proof-admission-sentinel\n",
     },
     {
       name: "wrong-digest",
@@ -1647,7 +1768,7 @@ test("legacy bridge removal requires an exact repository-bound final closure rec
       writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
       writeFileSync(
         join(targetRoot, ".github", "CODEOWNERS"),
-        ensureControlPlaneCodeownersContent(null).content,
+        scenario.codeownersContent ?? ensureControlPlaneCodeownersContent(null).content,
         "utf8",
       );
       const result = runBootstrap([
@@ -1661,6 +1782,13 @@ test("legacy bridge removal requires an exact repository-bound final closure rec
       assert.match(result.stderr, scenario.expected, scenario.name);
       assert.equal(existsSync(bridgePath), true, scenario.name);
       assert.doesNotMatch(result.stdout, /Applied: remove/u, scenario.name);
+      if (scenario.codeownersContent !== undefined) {
+        assert.equal(
+          readFileSync(join(targetRoot, ".github", "CODEOWNERS"), "utf8"),
+          scenario.codeownersContent,
+          `${scenario.name}: final closure admission must reject before local mutations`,
+        );
+      }
     } finally {
       rmSync(targetRoot, { recursive: true, force: true });
     }
@@ -7960,13 +8088,15 @@ function initializeGitRepository(targetRoot) {
 }
 
 function buildFinalClosureOutput({
+  format = "v2",
   repoSlug = "Joey-Tools/consumer",
   repositoryId = 1234,
   repositoryNodeId = "R_kgDOConsumer",
   defaultBranch = "master",
 } = {}) {
+  const closureFormat = finalClosureFixtureFormat(format);
   const repositories = Array.from(
-    { length: ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE },
+    { length: closureFormat.cohortSize },
     (_, index) =>
       index === 0
         ? {
@@ -7983,7 +8113,7 @@ function buildFinalClosureOutput({
           },
   );
   const receipt = {
-    schema_version: 1,
+    schema_version: closureFormat.receiptSchemaVersion,
     organization: {
       login: "Joey-Tools",
       id: 991,
@@ -7996,7 +8126,7 @@ function buildFinalClosureOutput({
     repositories,
   };
   return {
-    schema_version: "organization-review-gate-handoff-output/v1",
+    schema_version: closureFormat.outputSchemaVersion,
     mode: "verify",
     organization: receipt.organization,
     manifest_sha256: receipt.manifest_sha256,
@@ -8014,6 +8144,25 @@ function buildFinalClosureOutput({
       .update(canonicalOrganizationFinalClosureReceipt(receipt))
       .digest("hex"),
   };
+}
+
+function finalClosureFixtureFormat(format) {
+  switch (format) {
+    case "v1":
+      return {
+        outputSchemaVersion: "organization-review-gate-handoff-output/v1",
+        receiptSchemaVersion: 1,
+        cohortSize: LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
+      };
+    case "v2":
+      return {
+        outputSchemaVersion: "organization-review-gate-handoff-output/v2",
+        receiptSchemaVersion: 2,
+        cohortSize: ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
+      };
+    default:
+      throw new Error(`Unsupported final closure fixture format: ${format}`);
+  }
 }
 
 function refreshFinalClosureReceiptDigest(output) {

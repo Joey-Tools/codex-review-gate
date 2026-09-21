@@ -198,7 +198,43 @@ export function parseGitHubRepositoryRemote(value) {
   return parseRepoSlug(`${owner}/${repo}`);
 }
 
-export const ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 11;
+// v1 receipts are published historical evidence and therefore retain their
+// original eleven-member cohort. v2 is the current active cohort, which
+// deliberately excludes the archived legacy-only repository.
+export const LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 11;
+export const ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 10;
+
+function organizationFinalClosureOutputFormat(schemaVersion) {
+  switch (schemaVersion) {
+    case "organization-review-gate-handoff-output/v1":
+      return {
+        receiptSchemaVersion: 1,
+        bridgeRemovalAuthorized: false,
+      };
+    case "organization-review-gate-handoff-output/v2":
+      return {
+        receiptSchemaVersion: 2,
+        bridgeRemovalAuthorized: true,
+      };
+    default:
+      throw new Error(
+        "Organization handoff output schema_version is not a supported final-closure format.",
+      );
+  }
+}
+
+function organizationFinalClosureReceiptCohortSize(schemaVersion) {
+  switch (schemaVersion) {
+    case 1:
+      return LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE;
+    case 2:
+      return ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE;
+    default:
+      throw new Error(
+        "Organization final closure receipt schema_version is not supported.",
+      );
+  }
+}
 
 export function organizationFinalClosurePlanSha256({
   manifest_sha256: manifestSha256,
@@ -239,11 +275,7 @@ export function validateOrganizationFinalClosureOutput(output) {
     ],
     "Organization handoff output",
   );
-  if (output.schema_version !== "organization-review-gate-handoff-output/v1") {
-    throw new Error(
-      "Organization handoff output schema_version is not the supported final-closure format.",
-    );
-  }
+  const format = organizationFinalClosureOutputFormat(output.schema_version);
   if (output.mode !== "verify" || output.status !== "final-verified") {
     throw new Error(
       'Organization handoff output must be a successful final read-only verify result with mode "verify" and status "final-verified".',
@@ -277,6 +309,11 @@ export function validateOrganizationFinalClosureOutput(output) {
   const receipt = validateOrganizationFinalClosureReceipt(
     output.final_closure_receipt,
   );
+  if (receipt.schema_version !== format.receiptSchemaVersion) {
+    throw new Error(
+      "Organization handoff output schema_version and final closure receipt schema_version are not an admitted format pair.",
+    );
+  }
   if (
     canonicalJson(output.organization) !== canonicalJson(receipt.organization) ||
     output.manifest_sha256 !== receipt.manifest_sha256 ||
@@ -297,6 +334,13 @@ export function validateOrganizationFinalClosureOutput(output) {
   return {
     receipt,
     claimedSha256: output.final_closure_receipt_sha256,
+    // v1 is immutable historical evidence only. Bridge removal is authorized
+    // solely by the current v2 receipt's active cohort. Consumers must use
+    // this explicit result rather than infer membership from the legacy
+    // organization selector, which may contain legacy-only members.
+    bridgeRemovalRepositories: format.bridgeRemovalAuthorized
+      ? receipt.repositories
+      : [],
   };
 }
 
@@ -320,9 +364,9 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
     ],
     "Organization final closure receipt",
   );
-  if (receipt.schema_version !== 1) {
-    throw new Error("Organization final closure receipt schema_version must be 1.");
-  }
+  const cohortSize = organizationFinalClosureReceiptCohortSize(
+    receipt.schema_version,
+  );
   const organization = validateReceiptOrganization(receipt.organization);
   assertReceiptSha256(receipt.manifest_sha256, "receipt manifest_sha256");
   assertReceiptSha256(receipt.snapshot_sha256, "receipt snapshot_sha256");
@@ -341,10 +385,10 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
   }
   if (
     !Array.isArray(receipt.repositories) ||
-    receipt.repositories.length !== ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE
+    receipt.repositories.length !== cohortSize
   ) {
     throw new Error(
-      `Organization final closure receipt repositories must contain exactly ${ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE} cohort members.`,
+      `Organization final closure receipt repositories must contain exactly ${cohortSize} cohort members for receipt schema ${receipt.schema_version}.`,
     );
   }
   const repositories = receipt.repositories.map((repository, index) =>
@@ -377,7 +421,7 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
     );
   }
   return {
-    schema_version: 1,
+    schema_version: receipt.schema_version,
     organization,
     manifest_sha256: receipt.manifest_sha256,
     snapshot_sha256: receipt.snapshot_sha256,

@@ -2648,13 +2648,13 @@ async function loadAndBindOrganizationFinalClosureProof({
   }
 
   const origin = await loadGitHubOriginRepository(targetRoot);
-  const repository = validated.receipt.repositories.find(
+  const repository = validated.bridgeRemovalRepositories.find(
     (candidate) =>
       candidate.full_name.toLowerCase() === origin.repository.slug.toLowerCase(),
   );
   if (repository === undefined) {
     throw new Error(
-      `Git origin repository ${origin.repository.slug} is not a member of the organization final closure receipt.`,
+      `Git origin repository ${origin.repository.slug} is not authorized for bridge removal by the organization final closure receipt.`,
     );
   }
   const proof = {
