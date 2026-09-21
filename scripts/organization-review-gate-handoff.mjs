@@ -1021,6 +1021,53 @@ function assertExactSnapshot(actual, expected, label) {
   }
 }
 
+function compareCanonicalJsonUtf8(left, right) {
+  return Buffer.compare(
+    Buffer.from(canonicalJson(left), "utf8"),
+    Buffer.from(canonicalJson(right), "utf8"),
+  );
+}
+
+function normalizeRepositoryCleanupRulesetSnapshot(ruleset, label) {
+  assertWritableRuleset(ruleset, label);
+  const normalized = cloneJson(ruleset);
+  const statusRules = requiredStatusRules(normalized);
+  if (statusRules.length === 1) {
+    const [statusRule] = statusRules;
+    const checks = statusChecks(statusRule, `${label}.required_status_checks`);
+    // Live GitHub readback has been observed to reorder these two policy
+    // collections. Their order has no policy meaning; protect the complete
+    // multiset of full elements, normalize only this observed behavior, and
+    // never deduplicate.
+    statusRule.parameters.required_status_checks = [...checks].sort(
+      compareCanonicalJsonUtf8,
+    );
+  }
+  normalized.rules.sort(compareCanonicalJsonUtf8);
+  return normalized;
+}
+
+function repositoryCleanupRulesetSnapshotsEqual(actual, expected, label) {
+  if (actual === null || expected === null) {
+    return canonicalJson(actual) === canonicalJson(expected);
+  }
+  return (
+    canonicalJson(
+      normalizeRepositoryCleanupRulesetSnapshot(actual, `${label} actual`),
+    ) ===
+    canonicalJson(
+      normalizeRepositoryCleanupRulesetSnapshot(expected, `${label} expected`),
+    )
+  );
+}
+
+function cleanupSurfaceSnapshotsEqual(action, actual, expected, label) {
+  if (action.surface === "repository_ruleset") {
+    return repositoryCleanupRulesetSnapshotsEqual(actual, expected, label);
+  }
+  return canonicalJson(actual) === canonicalJson(expected);
+}
+
 function normalizeOrganizationRulesetSelectorSnapshot(ruleset, label) {
   assertWritableRuleset(ruleset, label);
   const normalized = cloneJson(ruleset);
@@ -2829,10 +2876,24 @@ function assertEffectiveOrganizationGateCoverage(snapshot, manifest) {
 }
 
 function classifyCleanupSurface(action, actual) {
-  if (canonicalJson(actual) === canonicalJson(action.expected_before)) {
+  if (
+    cleanupSurfaceSnapshotsEqual(
+      action,
+      actual,
+      action.expected_before,
+      "Repository legacy cleanup before snapshot",
+    )
+  ) {
     return "before";
   }
-  if (canonicalJson(actual) === canonicalJson(action.expected_after)) {
+  if (
+    cleanupSurfaceSnapshotsEqual(
+      action,
+      actual,
+      action.expected_after,
+      "Repository legacy cleanup after snapshot",
+    )
+  ) {
     return "after";
   }
   throw new Error("Repository legacy cleanup surface matches neither bound snapshot.");
