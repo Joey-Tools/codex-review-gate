@@ -545,6 +545,8 @@ function createFakeGhHarness(
     legacyBridgeWorkflowInventory = null,
     legacyWriterRace = null,
     legacyBridgeWorkflowHorizonDrift = false,
+    apiSortOrganizationSelectorIds = false,
+    apiOrganizationSelectorIds = null,
   } = {},
 ) {
   const { manifest, codeownersBytes } = integrationManifestFixture();
@@ -1138,12 +1140,25 @@ function createFakeGhHarness(
   legacyDrift.name = `${legacyDrift.name} drift`;
   const v2Disabled = buildV2OrganizationRulesetPayload(manifest, "disabled");
   const v2Active = buildV2OrganizationRulesetPayload(manifest, "active");
+  const organizationRulesetApiWritable = (writable) => {
+    const apiWritable = clone(writable);
+    if (apiOrganizationSelectorIds !== null) {
+      apiWritable.conditions.repository_id.repository_ids = clone(
+        apiOrganizationSelectorIds,
+      );
+    } else if (apiSortOrganizationSelectorIds) {
+      apiWritable.conditions.repository_id.repository_ids.sort(
+        (left, right) => left - right,
+      );
+    }
+    return apiWritable;
+  };
   const legacyComplete = (writable) => JSON.stringify(
     completeRulesetResponse(
       manifest.legacy_ruleset.id,
       "Organization",
       organization.login,
-      writable,
+      organizationRulesetApiWritable(writable),
     ),
   );
   const v2Complete = (writable) => JSON.stringify(
@@ -1151,7 +1166,7 @@ function createFakeGhHarness(
       manifest.v2_ruleset.id,
       "Organization",
       organization.login,
-      writable,
+      organizationRulesetApiWritable(writable),
     ),
   );
   const legacySummary = {
@@ -1646,7 +1661,11 @@ test("manifest admission uses one non-symlink regular-file descriptor and strict
 });
 
 test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover", async (t) => {
-  const harness = createFakeGhHarness(t);
+  // GitHub sorts organization selector IDs on readback even though the
+  // manifest retains the approved cohort order for writes.
+  const harness = createFakeGhHarness(t, {
+    apiSortOrganizationSelectorIds: true,
+  });
   const boundManifest = clone(harness.manifest);
   const stagingManifest = clone(boundManifest);
   stagingManifest.v2_ruleset.id = null;
@@ -2183,6 +2202,45 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     [],
     "manifest-bound organization drift must fail before any write",
   );
+});
+
+test("organization selector normalization preserves exact membership and multiplicity", async (t) => {
+  const selector = manifestFixture()
+    .legacy_ruleset.expected_before.conditions.repository_id.repository_ids;
+  const cases = [
+    {
+      name: "a selector member is replaced",
+      selectorIds: selector.map((id, index) => (index === 0 ? 99 : id)),
+    },
+    {
+      name: "a selector member is duplicated",
+      selectorIds: selector.map((id, index) => (index === 0 ? selector[1] : id)),
+    },
+  ];
+
+  for (const selectorCase of cases) {
+    await t.test(selectorCase.name, async (t) => {
+      const harness = createFakeGhHarness(t, {
+        apiOrganizationSelectorIds: selectorCase.selectorIds,
+      });
+      const stagingManifest = clone(harness.manifest);
+      stagingManifest.v2_ruleset.id = null;
+      writeFileSync(
+        harness.manifestPath,
+        `${JSON.stringify(stagingManifest, null, 2)}\n`,
+      );
+
+      await assert.rejects(
+        runFakeCli(harness, "plan"),
+        /Legacy organization ruleset does not match either authorized snapshot/u,
+      );
+      assert.deepEqual(
+        mutationRequests(fakeGhRequests(harness.logPath)),
+        [],
+        "selector membership or multiplicity drift must fail before a write",
+      );
+    });
+  }
 });
 
 function configureDetailedCleanupHandoff(harness) {

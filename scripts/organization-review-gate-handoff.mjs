@@ -1021,6 +1021,55 @@ function assertExactSnapshot(actual, expected, label) {
   }
 }
 
+function normalizeOrganizationRulesetSelectorSnapshot(ruleset, label) {
+  assertWritableRuleset(ruleset, label);
+  const normalized = cloneJson(ruleset);
+  assertExactKeys(
+    normalized.conditions,
+    ["ref_name", "repository_id"],
+    `${label}.conditions`,
+  );
+  assertExactKeys(
+    normalized.conditions.repository_id,
+    ["repository_ids"],
+    `${label}.conditions.repository_id`,
+  );
+  const repositoryIds = normalized.conditions.repository_id.repository_ids;
+  if (
+    !Array.isArray(repositoryIds) ||
+    repositoryIds.some((id) => !Number.isSafeInteger(id) || id <= 0)
+  ) {
+    throw new Error(`${label}.conditions.repository_id.repository_ids is malformed.`);
+  }
+  // GitHub reads organization selector IDs in its own numeric order. The
+  // protected property here is selector membership including multiplicity:
+  // normalize only this one unordered API field, leaving every other policy
+  // field and every other array order exact. In particular, do not dedupe.
+  normalized.conditions.repository_id.repository_ids = [...repositoryIds].sort(
+    (left, right) => left - right,
+  );
+  return normalized;
+}
+
+function organizationRulesetSnapshotsEqual(actual, expected, label) {
+  return (
+    canonicalJson(
+      normalizeOrganizationRulesetSelectorSnapshot(actual, `${label} actual`),
+    ) ===
+    canonicalJson(
+      normalizeOrganizationRulesetSelectorSnapshot(expected, `${label} expected`),
+    )
+  );
+}
+
+function assertExactOrganizationRulesetSnapshot(actual, expected, label) {
+  if (!organizationRulesetSnapshotsEqual(actual, expected, label)) {
+    throw new Error(
+      `${label} drifted from the manifest-bound snapshot (expected ${sha256Canonical(expected)}, got ${sha256Canonical(actual)}).`,
+    );
+  }
+}
+
 function encodeEndpointPath(value) {
   return value.split("/").map(encodeURIComponent).join("/");
 }
@@ -1139,10 +1188,22 @@ async function loadOrganizationRulesetSummaries(manifest) {
 function classifyLegacyOrganizationRuleset(manifest, complete) {
   const before = manifest.legacy_ruleset.expected_before;
   const after = deriveLegacyOrganizationCutoverPayload(manifest);
-  if (canonicalJson(complete.writable) === canonicalJson(before)) {
+  if (
+    organizationRulesetSnapshotsEqual(
+      complete.writable,
+      before,
+      "Legacy organization ruleset before snapshot",
+    )
+  ) {
     return "before";
   }
-  if (canonicalJson(complete.writable) === canonicalJson(after)) {
+  if (
+    organizationRulesetSnapshotsEqual(
+      complete.writable,
+      after,
+      "Legacy organization ruleset after snapshot",
+    )
+  ) {
     return "after";
   }
   throw new Error("Legacy organization ruleset does not match either authorized snapshot.");
@@ -1151,10 +1212,22 @@ function classifyLegacyOrganizationRuleset(manifest, complete) {
 function classifyV2OrganizationRuleset(manifest, complete) {
   const disabled = buildV2OrganizationRulesetPayload(manifest, "disabled");
   const active = buildV2OrganizationRulesetPayload(manifest, "active");
-  if (canonicalJson(complete.writable) === canonicalJson(disabled)) {
+  if (
+    organizationRulesetSnapshotsEqual(
+      complete.writable,
+      disabled,
+      "Disabled v2 organization ruleset snapshot",
+    )
+  ) {
     return "disabled";
   }
-  if (canonicalJson(complete.writable) === canonicalJson(active)) {
+  if (
+    organizationRulesetSnapshotsEqual(
+      complete.writable,
+      active,
+      "Active v2 organization ruleset snapshot",
+    )
+  ) {
     return "active";
   }
   throw new Error("v2 organization ruleset does not match an authorized exact state.");
@@ -3477,7 +3550,11 @@ async function runStageMode(manifest, options, runtime) {
       manifest.organization.login,
       "Created v2 organization ruleset",
     );
-    assertExactSnapshot(created.writable, desired, "Created v2 organization ruleset");
+    assertExactOrganizationRulesetSnapshot(
+      created.writable,
+      desired,
+      "Created v2 organization ruleset",
+    );
     if (
       created.id === manifest.legacy_ruleset.id ||
       snapshot.summaries.some((summary) => summary.id === created.id)
@@ -3604,7 +3681,11 @@ async function runActivateMode(manifest, options, runtime) {
   if (updated.id !== manifest.v2_ruleset.id) {
     throw new Error("v2 activation response returned the wrong ruleset ID.");
   }
-  assertExactSnapshot(updated.writable, action.payload, "Activated v2 organization ruleset");
+  assertExactOrganizationRulesetSnapshot(
+    updated.writable,
+    action.payload,
+    "Activated v2 organization ruleset",
+  );
   const readback = await loadStable("Active dual-enforcement readback", () =>
     loadCoverageRound(manifest),
     runtime.stableSnapshotOptions,
@@ -3940,7 +4021,11 @@ async function runVerifyMode(manifest, options, runtime) {
   if (updated.id !== manifest.legacy_ruleset.id) {
     throw new Error("Legacy organization cutover response returned the wrong ruleset ID.");
   }
-  assertExactSnapshot(updated.writable, action.payload, "Legacy organization cutover response");
+  assertExactOrganizationRulesetSnapshot(
+    updated.writable,
+    action.payload,
+    "Legacy organization cutover response",
+  );
   const readback = await loadStable("Final organization handoff closure", () =>
     loadPostActivationRound(manifest),
     runtime.stableSnapshotOptions,
