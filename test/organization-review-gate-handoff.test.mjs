@@ -28,6 +28,7 @@ import {
   NONTERMINAL_WORKFLOW_RUN_STATUSES,
   OUTPUT_SCHEMA_VERSION,
   REQUIRED_REPOSITORY_COUNT,
+  RetryableHandoffEvidenceUnstableError,
   V2_RULESET_NAME,
   V2_STATUS_CONTEXT,
   V2_VERIFIER_RUN_NAME_PREFIX,
@@ -36,6 +37,7 @@ import {
   canonicalJson,
   deriveLegacyOrganizationCutoverPayload,
   deriveRepositoryCleanupAction,
+  loadLegacyStatusEvidence,
   loadStableSnapshots,
   mapWithConcurrency,
   parseWorkflowRunPath,
@@ -105,6 +107,29 @@ const LEGACY_SELECTOR_REPOSITORY_IDS = [
   ARCHIVED_LEGACY_ONLY_REPOSITORY_ID,
   ...REPOSITORIES.slice(8).map(([, id]) => id),
 ];
+const ACTIVATION_SCHEDULER_REPOSITORY =
+  "Joey-Tools/codex-private-workflows";
+const ACTIVATION_SCHEDULER_WORKFLOW_PATH =
+  ".github/workflows/scheduled-sync-release.yml";
+const ACTIVATION_SCHEDULER_WORKFLOW_BYTES = Buffer.from(
+  [
+    "name: Scheduled Private Overlay Sync Release",
+    "on:",
+    "  schedule:",
+    "    - cron: '17 */8 * * *'",
+    "  workflow_dispatch:",
+    "",
+  ].join("\n"),
+  "utf8",
+);
+const ACTIVATION_SCHEDULER_WORKFLOW = Object.freeze({
+  path: ACTIVATION_SCHEDULER_WORKFLOW_PATH,
+  git_blob_sha: gitBlobSha(ACTIVATION_SCHEDULER_WORKFLOW_BYTES),
+  sha256: createHash("sha256")
+    .update(ACTIVATION_SCHEDULER_WORKFLOW_BYTES)
+    .digest("hex"),
+});
+const ACTIVATION_SCHEDULER_WORKFLOW_ID = 281807666;
 
 function clone(value) {
   return structuredClone(value);
@@ -258,12 +283,25 @@ function repositoryCleanupAction(rulesetId, index) {
 function repositoryEntry([name, id, cleanupRulesetId], index) {
   const digit = ((index % 14) + 1).toString(16);
   const slug = `${ORGANIZATION.login}/${name}`;
+  const isActivationSchedulerRepository =
+    slug === ACTIVATION_SCHEDULER_REPOSITORY;
   return {
     slug,
     id,
     node_id: `R_kgDO${id}`,
     default_branch: "master",
     workflows: clone(CANONICAL_WORKFLOW_IDENTITIES),
+    legacy_writer_scan_timeout_ms: isActivationSchedulerRepository
+      ? 300_000
+      : 60_000,
+    scheduler_quiescence: isActivationSchedulerRepository
+      ? {
+          workflow_id: ACTIVATION_SCHEDULER_WORKFLOW_ID,
+          workflow: clone(ACTIVATION_SCHEDULER_WORKFLOW),
+          expected_initial_state: "active",
+          drain_timeout_ms: 2_100_000,
+        }
+      : null,
     codeowners: {
       path: CODEOWNERS_PATH,
       git_blob_sha: digit.repeat(40),
@@ -333,6 +371,11 @@ function manifestFixture() {
     v2_ruleset: {
       id: 26590367,
       name: V2_RULESET_NAME,
+    },
+    activation: {
+      legacy_evidence_stability_timeout_ms: 900_000,
+      coverage_round_timeout_ms: 7_200_000,
+      coverage_stability_timeout_ms: 14_405_000,
     },
     repositories,
     expected_legacy_cleanup_action_count: 8,
@@ -566,6 +609,9 @@ function createFakeGhHarness(
     legacyBridgeWorkflowInventory = null,
     legacyWriterRace = null,
     legacyBridgeWorkflowHorizonDrift = false,
+    schedulerWorkflowState = "disabled_manually",
+    schedulerRunPages = null,
+    schedulerRunDelaySeconds = null,
     apiSortOrganizationSelectorIds = false,
     apiOrganizationSelectorIds = null,
     apiSortRepositoryCleanupRulesetArrays = false,
@@ -589,11 +635,13 @@ function createFakeGhHarness(
     "cleanup-identity-read-count",
   );
   const legacyWriterRaceStatePath = join(directory, "legacy-writer-race-state");
+  const schedulerStatePath = join(directory, "scheduler-state");
   const cleanupActionStatePaths = [];
   const cleanupSurfaceReadCountPaths = [];
   const responses = new Map();
   const delayedRequests = [];
   const legacyWriterRaceResponses = [];
+  const schedulerWorkflowResponses = [];
   const cleanupResponses = [];
   const effectiveBranchResponses = [];
   const graphQlResponses = [];
@@ -693,6 +741,16 @@ function createFakeGhHarness(
         content: workflowBytes[key],
       }),
     );
+    if (repository.scheduler_quiescence !== null) {
+      const schedulerWorkflow = repository.scheduler_quiescence.workflow;
+      workflowEntries.push({
+        path: schedulerWorkflow.path.split("/").at(-1),
+        mode: "100644",
+        type: "blob",
+        sha: schedulerWorkflow.git_blob_sha,
+        content: ACTIVATION_SCHEDULER_WORKFLOW_BYTES,
+      });
+    }
     if (repositoryIndex === 0 && extraWorkflow !== null) {
       const content = Buffer.from(extraWorkflow.content, "utf8");
       workflowEntries.push({
@@ -773,6 +831,20 @@ function createFakeGhHarness(
           sha: identity.git_blob_sha,
           encoding: "base64",
           content: workflowBytes[key].toString("base64"),
+        },
+      );
+    }
+    if (repository.scheduler_quiescence !== null) {
+      const schedulerWorkflow = repository.scheduler_quiescence.workflow;
+      addFakeResponse(
+        responses,
+        `repos/${encodedSlug}/contents/${encodeEndpointPathForTest(schedulerWorkflow.path)}?ref=${encodeURIComponent(controlPlaneHead)}`,
+        {
+          type: "file",
+          path: schedulerWorkflow.path,
+          sha: schedulerWorkflow.git_blob_sha,
+          encoding: "base64",
+          content: ACTIVATION_SCHEDULER_WORKFLOW_BYTES.toString("base64"),
         },
       );
     }
@@ -1012,6 +1084,19 @@ function createFakeGhHarness(
         state: "active",
       },
     ];
+    if (repository.scheduler_quiescence !== null) {
+      actionsWorkflowInventory.push({
+        id: repository.scheduler_quiescence.workflow_id,
+        path: repository.scheduler_quiescence.workflow.path,
+        state: schedulerWorkflowState,
+      });
+      schedulerWorkflowResponses.push({
+        repository: repository.slug,
+        encodedSlug,
+        workflowId: repository.scheduler_quiescence.workflow_id,
+        workflowPath: repository.scheduler_quiescence.workflow.path,
+      });
+    }
     if (repositoryIndex === 0 && legacyBridgeWorkflowInventory === "malformed") {
       actionsWorkflowInventory = null;
     }
@@ -1054,6 +1139,21 @@ function createFakeGhHarness(
         `repos/${encodedSlug}/actions/workflows?per_page=100&page=1`,
         workflowHorizonPage,
       );
+    }
+    if (repository.scheduler_quiescence !== null) {
+      const schedulerRuns = schedulerRunPages ?? workflowRunPages([]);
+      const schedulerRunEndpoint =
+        `repos/${encodedSlug}/actions/workflows/${repository.scheduler_quiescence.workflow_id}/runs?per_page=100`;
+      for (const [pageIndex, page] of schedulerRuns.entries()) {
+        const endpoint = `${schedulerRunEndpoint}&page=${pageIndex + 1}`;
+        addFakeResponse(responses, endpoint, page);
+        if (schedulerRunDelaySeconds !== null) {
+          delayedRequests.push({
+            request: `GET:${endpoint}`,
+            seconds: schedulerRunDelaySeconds,
+          });
+        }
+      }
     }
     if (actionsWorkflowInventory !== null) {
       addFakeResponse(
@@ -1390,6 +1490,39 @@ function createFakeGhHarness(
     }
     scriptLines.push("esac");
   }
+  if (schedulerWorkflowResponses.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const response of schedulerWorkflowResponses) {
+      const endpoint =
+        `repos/${response.encodedSlug}/actions/workflows/${response.workflowId}`;
+      const disableEndpoint = `${endpoint}/disable`;
+      const enableEndpoint = `${endpoint}/enable`;
+      const responseForState = (state) => JSON.stringify({
+        id: response.workflowId,
+        path: response.workflowPath,
+        state,
+      });
+      scriptLines.push(
+        `  ${shellQuote(`GET:${endpoint}`)})`,
+        '    case "$(cat \"${FAKE_GH_SCHEDULER_STATE:?}\")" in',
+        `      active) respond ${shellQuote(responseForState("active"))} ;;`,
+        `      disabled_manually) respond ${shellQuote(responseForState("disabled_manually"))} ;;`,
+        "      *) printf '%s\\n' 'invalid fake scheduler workflow state' >&2; exit 2 ;;",
+        "    esac ;;",
+        `  ${shellQuote(`PUT:${disableEndpoint}`)})`,
+        '    case "$(cat \"${FAKE_GH_SCHEDULER_STATE:?}\")" in',
+        `      active) printf '%s\\n' 'disabled_manually' > "\${FAKE_GH_SCHEDULER_STATE:?}"; respond '' ;;`,
+        "      *) printf '%s\\n' 'scheduler disable requires an active workflow' >&2; exit 1 ;;",
+        "    esac ;;",
+        `  ${shellQuote(`PUT:${enableEndpoint}`)})`,
+        '    case "$(cat \"${FAKE_GH_SCHEDULER_STATE:?}\")" in',
+        `      disabled_manually) printf '%s\\n' 'active' > "\${FAKE_GH_SCHEDULER_STATE:?}"; respond '' ;;`,
+        "      *) printf '%s\\n' 'scheduler enable requires a manually disabled workflow' >&2; exit 1 ;;",
+        "    esac ;;",
+      );
+    }
+    scriptLines.push("esac");
+  }
   if (notFoundEndpoints.length > 0) {
     scriptLines.push('case "$request" in');
     for (const request of notFoundEndpoints) {
@@ -1476,6 +1609,7 @@ function createFakeGhHarness(
   writeFileSync(cleanupStatePath, "before\n");
   writeFileSync(cleanupIdentityReadCountPath, "0\n");
   writeFileSync(legacyWriterRaceStatePath, "before\n");
+  writeFileSync(schedulerStatePath, `${schedulerWorkflowState}\n`);
   if (detailedCleanupState) {
     for (const action of cleanupActionStatePaths) {
       writeFileSync(action.path, "before\n");
@@ -1493,6 +1627,7 @@ function createFakeGhHarness(
       "FAKE_GH_LEGACY_STATE",
       "FAKE_GH_CLEANUP_STATE",
       "FAKE_GH_LEGACY_WRITER_RACE_STATE",
+      "FAKE_GH_SCHEDULER_STATE",
     ]
       .map((name) => [name, process.env[name]]),
   );
@@ -1502,6 +1637,7 @@ function createFakeGhHarness(
   process.env.FAKE_GH_LEGACY_STATE = legacyStatePath;
   process.env.FAKE_GH_CLEANUP_STATE = cleanupStatePath;
   process.env.FAKE_GH_LEGACY_WRITER_RACE_STATE = legacyWriterRaceStatePath;
+  process.env.FAKE_GH_SCHEDULER_STATE = schedulerStatePath;
   t.after(() => {
     for (const [name, value] of previousEnvironment.entries()) {
       if (value === undefined) delete process.env[name];
@@ -1525,6 +1661,7 @@ function createFakeGhHarness(
     cleanupStatePath,
     cleanupIdentityReadCountPath,
     legacyWriterRaceStatePath,
+    schedulerStatePath,
     cleanupActionStatePaths,
     cleanupSurfaceReadCountPaths,
   };
@@ -1547,9 +1684,13 @@ function fakeGhRequests(logPath) {
 function immediateStableRuntime({
   afterFirstStablePair = null,
   beforeFinalLegacyRevalidation = undefined,
+  legacyEvidenceRetryIntervalMs = 5_000,
+  schedulerDrainRetryIntervalMs = 5_000,
 } = {}) {
   let clock = 0;
   let nowCalls = 0;
+  let legacyEvidenceClock = 0;
+  let schedulerDrainClock = 0;
   return {
     stableSnapshotOptions: {
       intervalMs: 5_000,
@@ -1563,6 +1704,20 @@ function immediateStableRuntime({
       },
       sleep: async (milliseconds) => {
         clock += milliseconds;
+      },
+    },
+    legacyEvidenceRuntime: {
+      retryIntervalMs: legacyEvidenceRetryIntervalMs,
+      now: () => legacyEvidenceClock,
+      sleep: async (milliseconds) => {
+        legacyEvidenceClock += milliseconds;
+      },
+    },
+    schedulerDrainRuntime: {
+      retryIntervalMs: schedulerDrainRetryIntervalMs,
+      now: () => schedulerDrainClock,
+      sleep: async (milliseconds) => {
+        schedulerDrainClock += milliseconds;
       },
     },
     beforeFinalLegacyRevalidation,
@@ -1595,7 +1750,7 @@ function countRequest(requests, method, endpoint) {
 }
 
 test("exports the closed organization handoff protocol constants", () => {
-  assert.equal(MANIFEST_SCHEMA_VERSION, "organization-review-gate-handoff-manifest/v2");
+  assert.equal(MANIFEST_SCHEMA_VERSION, "organization-review-gate-handoff-manifest/v3");
   assert.equal(OUTPUT_SCHEMA_VERSION, "organization-review-gate-handoff-output/v2");
   assert.equal(FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION, 2);
   assert.equal(REQUIRED_REPOSITORY_COUNT, 10);
@@ -1652,7 +1807,7 @@ test("CLI help is read-only and invalid apply shapes fail before reading a manif
   assert.equal(invalidMode.stdout, "");
   assert.match(
     invalidMode.stderr,
-    /--apply is valid only with stage, activate, apply-repository-cleanup, or verify mode/u,
+    /--apply is valid only with stage, quiesce-scheduler, activate, restore-scheduler,/u,
   );
 
   const missingDigest = spawnSync(
@@ -2234,6 +2389,234 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     mutationRequests(fakeGhRequests(harness.logPath)),
     [],
     "manifest-bound organization drift must fail before any write",
+  );
+});
+
+test("scheduler quiesce and restore are explicit manifest-bound lifecycle operations", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    schedulerWorkflowState: "active",
+  });
+  const schedulerRepository = harness.manifest.repositories.find(
+    ({ slug }) => slug === ACTIVATION_SCHEDULER_REPOSITORY,
+  );
+  assert.ok(schedulerRepository);
+  const schedulerEndpoint =
+    `repos/${encodeEndpointPathForTest(schedulerRepository.slug)}/actions/workflows/${ACTIVATION_SCHEDULER_WORKFLOW_ID}`;
+
+  writeFileSync(harness.logPath, "");
+  const quiescePreview = await runFakeCli(harness, "quiesce-scheduler");
+  assert.equal(quiescePreview.status, "preview");
+  assert.deepEqual(quiescePreview.action, {
+    method: "PUT",
+    endpoint: `${schedulerEndpoint}/disable`,
+  });
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+
+  writeFileSync(harness.logPath, "");
+  const quiesceApplied = await runFakeCli(harness, "quiesce-scheduler", [
+    "--apply",
+    "--expected-plan-sha256",
+    quiescePreview.plan_sha256,
+  ]);
+  assert.equal(quiesceApplied.status, "applied-drained");
+  assert.equal(readFileSync(harness.schedulerStatePath, "utf8").trim(), "disabled_manually");
+  let requests = fakeGhRequests(harness.logPath);
+  assert.deepEqual(mutationRequests(requests), [{
+    method: "PUT",
+    endpoint: `${schedulerEndpoint}/disable`,
+    body: null,
+  }]);
+  assert.equal(
+    requests.some(({ endpoint }) => /\/(?:cancel|force-cancel)$/u.test(endpoint)),
+    false,
+    "scheduler drain must wait for existing runs and never cancel them",
+  );
+
+  writeFileSync(harness.logPath, "");
+  const restorePreview = await runFakeCli(harness, "restore-scheduler");
+  assert.equal(restorePreview.status, "preview");
+  assert.deepEqual(restorePreview.action, {
+    method: "PUT",
+    endpoint: `${schedulerEndpoint}/enable`,
+  });
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+
+  writeFileSync(harness.logPath, "");
+  const restoreApplied = await runFakeCli(harness, "restore-scheduler", [
+    "--apply",
+    "--expected-plan-sha256",
+    restorePreview.plan_sha256,
+  ]);
+  assert.equal(restoreApplied.status, "applied-restored");
+  assert.equal(readFileSync(harness.schedulerStatePath, "utf8").trim(), "active");
+  requests = fakeGhRequests(harness.logPath);
+  assert.deepEqual(mutationRequests(requests), [{
+    method: "PUT",
+    endpoint: `${schedulerEndpoint}/enable`,
+    body: null,
+  }]);
+});
+
+test("activate fails closed before coverage or v2 mutation while its scheduler is active", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    schedulerWorkflowState: "active",
+  });
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  writeFileSync(harness.logPath, "");
+  await assert.rejects(
+    runFakeCli(harness, "activate"),
+    /scheduler is not bound to one exact disabled_manually workflow identity\.[\s\S]*recovery_code=activation-scheduler-reconcile-required/u,
+  );
+  const requests = fakeGhRequests(harness.logPath);
+  assert.deepEqual(
+    mutationRequests(requests),
+    [],
+    "an active scheduler must fail before any organization v2 write",
+  );
+  assert.equal(
+    requests.some(({ endpoint }) => endpoint.includes("/runs?")),
+    false,
+    "an active scheduler must fail before legacy-writer coverage begins",
+  );
+});
+
+test("activation stops before its second stable coverage round when the first exhausts the round cap", async (t) => {
+  const harness = createFakeGhHarness(t);
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  writeFileSync(harness.logPath, "");
+
+  let coverageClock = 0;
+  let schedulerClock = 0;
+  const roundTimeoutMs =
+    harness.manifest.activation.coverage_round_timeout_ms;
+  const runtime = immediateStableRuntime();
+  runtime.stableSnapshotOptions = {
+    intervalMs: 5_000,
+    now: () => coverageClock,
+    sleep: async () => {},
+  };
+  runtime.schedulerDrainRuntime = {
+    retryIntervalMs: 5_000,
+    now: () => schedulerClock,
+    sleep: async (milliseconds) => {
+      schedulerClock += milliseconds;
+      // The scheduler itself completes within its 35-minute local budget, but
+      // this first coverage round consumes more than its independent 2-hour
+      // cap. A stable pair must not begin its second round in that state.
+      coverageClock = roundTimeoutMs + 1;
+    },
+  };
+
+  await assert.rejects(
+    runFakeCli(harness, "activate", [], runtime),
+    /could not complete one activation coverage round within 7200000ms; recovery_code=activation-coverage-evidence-unstable\.[\s\S]*Keep v1 protection active[\s\S]*fresh quiesce\/activation preview/u,
+  );
+
+  const schedulerRepository = harness.manifest.repositories.find(
+    ({ slug }) => slug === ACTIVATION_SCHEDULER_REPOSITORY,
+  );
+  assert.ok(schedulerRepository);
+  const schedulerRunsEndpoint =
+    `repos/${encodeEndpointPathForTest(schedulerRepository.slug)}/actions/workflows/${ACTIVATION_SCHEDULER_WORKFLOW_ID}/runs?per_page=100&page=1`;
+  const requests = fakeGhRequests(harness.logPath);
+  assert.equal(
+    countRequest(requests, "GET", schedulerRunsEndpoint),
+    2,
+    "the first round's drain snapshots must fail before a second round starts",
+  );
+  assert.deepEqual(
+    mutationRequests(requests),
+    [],
+    "an exhausted initial coverage round must fail before v2 activation writes",
+  );
+});
+
+test("quiesce leaves durable recovery evidence instead of cancelling an unhealthy scheduler run", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    schedulerWorkflowState: "active",
+    schedulerRunPages: workflowRunPages([
+      { id: 99000001, run_attempt: 1, status: "unsupported" },
+    ]),
+  });
+  const schedulerRepository = harness.manifest.repositories.find(
+    ({ slug }) => slug === ACTIVATION_SCHEDULER_REPOSITORY,
+  );
+  assert.ok(schedulerRepository);
+  const schedulerEndpoint =
+    `repos/${encodeEndpointPathForTest(schedulerRepository.slug)}/actions/workflows/${ACTIVATION_SCHEDULER_WORKFLOW_ID}`;
+  const preview = await runFakeCli(harness, "quiesce-scheduler");
+  writeFileSync(harness.logPath, "");
+  await assert.rejects(
+    runFakeCli(harness, "quiesce-scheduler", [
+      "--apply",
+      "--expected-plan-sha256",
+      preview.plan_sha256,
+    ]),
+    /recovery_code=activation-scheduler-restore-required/u,
+  );
+  const requests = fakeGhRequests(harness.logPath);
+  assert.deepEqual(mutationRequests(requests), [{
+    method: "PUT",
+    endpoint: `${schedulerEndpoint}/disable`,
+    body: null,
+  }]);
+  assert.equal(readFileSync(harness.schedulerStatePath, "utf8").trim(), "disabled_manually");
+  assert.equal(
+    requests.some(({ endpoint }) => /\/(?:cancel|force-cancel)$/u.test(endpoint)),
+    false,
+  );
+});
+
+test("activate re-reads writer coverage after a successful scheduler quiesce", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    schedulerWorkflowState: "active",
+  });
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  const schedulerRepository = harness.manifest.repositories.find(
+    ({ slug }) => slug === ACTIVATION_SCHEDULER_REPOSITORY,
+  );
+  assert.ok(schedulerRepository);
+  const schedulerEndpoint =
+    `repos/${encodeEndpointPathForTest(schedulerRepository.slug)}/actions/workflows/${ACTIVATION_SCHEDULER_WORKFLOW_ID}`;
+  const quiescePreview = await runFakeCli(harness, "quiesce-scheduler");
+  writeFileSync(harness.logPath, "");
+  await runFakeCli(harness, "quiesce-scheduler", [
+    "--apply",
+    "--expected-plan-sha256",
+    quiescePreview.plan_sha256,
+  ]);
+  const afterQuiesce = fakeGhRequests(harness.logPath).length;
+  const activatePreview = await runFakeCli(harness, "activate");
+  assert.equal(activatePreview.status, "preview");
+  const requests = fakeGhRequests(harness.logPath);
+  const disableIndex = requests.findIndex(
+    ({ method, endpoint }) =>
+      method === "PUT" && endpoint === `${schedulerEndpoint}/disable`,
+  );
+  assert.ok(disableIndex >= 0);
+  const privateRetainedWriterEndpoint =
+    `repos/${encodeEndpointPathForTest(schedulerRepository.slug)}/actions/workflows/${schedulerRepository.canary.v2_workflow_id}/runs?per_page=100&page=1`;
+  assert.ok(
+    requests.slice(afterQuiesce).some(
+      ({ method, endpoint }) =>
+        method === "GET" && endpoint === privateRetainedWriterEndpoint,
+    ),
+    "activate must collect a fresh writer epoch after the scheduler was disabled",
+  );
+  assert.deepEqual(
+    mutationRequests(requests),
+    [{
+      method: "PUT",
+      endpoint: `${schedulerEndpoint}/disable`,
+      body: null,
+    }],
+    "activation preview must not write v2 or restore the scheduler implicitly",
   );
 });
 
@@ -3498,7 +3881,79 @@ test("legacy bridge status requires a coherent unfiltered writer inventory", () 
   );
 });
 
-test("a queued old producer blocks bridge-status acceptance before activation writes", async (t) => {
+test("legacy status evidence retries only explicit unstable horizons within its manifest-bound deadline", async () => {
+  const repository = manifestFixture().repositories[0];
+  let nowMs = 0;
+  let writerReadCount = 0;
+  const sleeps = [];
+  const stableStatus = {
+    id: repository.canary.legacy_status_id,
+    state: "success",
+  };
+  const result = await loadLegacyStatusEvidence(repository, {
+    evidenceTimeoutMs: 60_000,
+    retryIntervalMs: 7,
+    now: () => nowMs,
+    sleep: async (milliseconds) => {
+      sleeps.push(milliseconds);
+      nowMs += milliseconds;
+    },
+    loadWriterEpoch: async () => {
+      writerReadCount += 1;
+      return [{
+        workflow_id: 1,
+        execution_epoch: {
+          executions: [{ id: writerReadCount <= 2 ? writerReadCount : 3 }],
+        },
+      }];
+    },
+    loadStatusProjection: async () => stableStatus,
+  });
+  assert.deepEqual(result, stableStatus);
+  assert.equal(writerReadCount, 4);
+  assert.deepEqual(sleeps, [7]);
+});
+
+test("legacy status evidence fails closed without retrying malformed evidence", async () => {
+  const repository = manifestFixture().repositories[0];
+  let sleeps = 0;
+  await assert.rejects(
+    loadLegacyStatusEvidence(repository, {
+      evidenceTimeoutMs: 60_000,
+      sleep: async () => {
+        sleeps += 1;
+      },
+      loadWriterEpoch: async () => {
+        throw new Error("malformed writer identity");
+      },
+      loadStatusProjection: async () => ({ id: 1 }),
+    }),
+    /malformed writer identity/u,
+  );
+  assert.equal(sleeps, 0);
+});
+
+test("legacy status evidence reports a bounded recovery code after persistent writer instability", async () => {
+  const repository = manifestFixture().repositories[0];
+  let nowMs = 0;
+  await assert.rejects(
+    loadLegacyStatusEvidence(repository, {
+      evidenceTimeoutMs: 60_000,
+      retryIntervalMs: 30_000,
+      now: () => nowMs,
+      sleep: async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      loadWriterEpoch: async () => {
+        throw new RetryableHandoffEvidenceUnstableError("queued writer");
+      },
+      loadStatusProjection: async () => ({ id: 1 }),
+    }),
+    /recovery_code=legacy-writer-evidence-unstable/u,
+  );
+});
+
+test("a persistently queued old producer reaches the bounded recovery state before activation writes", async (t) => {
   const harness = createFakeGhHarness(t, {
     legacyProducerRunPages: workflowRunPages([
       { id: 90000000, status: "completed" },
@@ -3510,8 +3965,13 @@ test("a queued old producer blocks bridge-status acceptance before activation wr
   writeFileSync(harness.legacyStatePath, "before\n");
   writeFileSync(harness.cleanupStatePath, "before\n");
   await assert.rejects(
-    runFakeCli(harness, "activate"),
-    /retained canonical producer still has queued runs/u,
+    runFakeCli(
+      harness,
+      "activate",
+      [],
+      immediateStableRuntime({ legacyEvidenceRetryIntervalMs: 900_000 }),
+    ),
+    /recovery_code=legacy-writer-evidence-unstable/u,
   );
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 });
@@ -3683,7 +4143,7 @@ test("a completed legacy writer rerun after the status snapshot blocks stale act
   assert.deepEqual(mutationRequests(requests), []);
 });
 
-test("a queued temporary legacy bridge blocks bridge-status acceptance before activation writes", async (t) => {
+test("a persistently queued temporary legacy bridge reaches the bounded recovery state before activation writes", async (t) => {
   const harness = createFakeGhHarness(t, {
     legacyBridgeRunPages: workflowRunPages([
       { id: 90000003, status: "completed" },
@@ -3695,8 +4155,13 @@ test("a queued temporary legacy bridge blocks bridge-status acceptance before ac
   writeFileSync(harness.legacyStatePath, "before\n");
   writeFileSync(harness.cleanupStatePath, "before\n");
   await assert.rejects(
-    runFakeCli(harness, "activate"),
-    /temporary legacy bridge still has queued runs/u,
+    runFakeCli(
+      harness,
+      "activate",
+      [],
+      immediateStableRuntime({ legacyEvidenceRetryIntervalMs: 900_000 }),
+    ),
+    /recovery_code=legacy-writer-evidence-unstable/u,
   );
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 });
@@ -3728,11 +4193,11 @@ test("legacy bridge Actions inventory rejects duplicate IDs and horizon drift be
   const cases = [
     {
       options: { legacyBridgeWorkflowInventory: "duplicate-id" },
-      error: /Actions workflow inventory contains duplicate IDs/u,
+      error: /recovery_code=legacy-writer-evidence-unstable/u,
     },
     {
       options: { legacyBridgeWorkflowHorizonDrift: true },
-      error: /Actions workflow inventory changed during horizon revalidation/u,
+      error: /recovery_code=legacy-writer-evidence-unstable/u,
     },
   ];
   for (const { options, error } of cases) {
@@ -3742,7 +4207,15 @@ test("legacy bridge Actions inventory rejects duplicate IDs and horizon drift be
       writeFileSync(harness.v2StatePath, "disabled\n");
       writeFileSync(harness.legacyStatePath, "before\n");
       writeFileSync(harness.cleanupStatePath, "before\n");
-      await assert.rejects(runFakeCli(harness, "activate"), error);
+      await assert.rejects(
+        runFakeCli(
+          harness,
+          "activate",
+          [],
+          immediateStableRuntime({ legacyEvidenceRetryIntervalMs: 900_000 }),
+        ),
+        error,
+      );
       assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
     });
   }
@@ -3987,6 +4460,11 @@ test("the checked-in Joey manifest template fixes the approved identities and cl
     id: 283943935,
     node_id: "O_kgDOEOyj_w",
   });
+  assert.deepEqual(JOEY_TEMPLATE.activation, {
+    legacy_evidence_stability_timeout_ms: 900_000,
+    coverage_round_timeout_ms: 7_200_000,
+    coverage_stability_timeout_ms: 14_405_000,
+  });
   assert.equal(JOEY_TEMPLATE.repositories.length, REQUIRED_REPOSITORY_COUNT);
   assert.deepEqual(
     repositoryIdentities,
@@ -4194,16 +4672,11 @@ test("only the documented replacement tokens keep the Joey template non-executab
   assert.deepEqual(validateManifest(materialized), materialized);
 });
 
-test("manifest validation is generic but binds every supplied identity and old snapshot", () => {
+test("manifest validation binds every supplied identity while retaining the approved scheduler target", () => {
   const manifest = manifestFixture();
-  manifest.organization = {
-    login: "Example-Organization",
-    id: 987654,
-    node_id: "O_example",
-  };
   manifest.legacy_ruleset.id = 7001;
   manifest.legacy_ruleset.legacy_only_repository = {
-    slug: "Example-Organization/archived-legacy-only",
+    slug: "Joey-Tools/archived-legacy-only",
     id: 9000,
     node_id: "R_example_archived_legacy_only",
     default_branch: "master",
@@ -4212,7 +4685,9 @@ test("manifest validation is generic but binds every supplied identity and old s
   manifest.legacy_ruleset.expected_before.name = "Example legacy gate";
   manifest.v2_ruleset.id = 7002;
   manifest.repositories.forEach((repository, index) => {
-    repository.slug = `Example-Organization/repository-${index + 1}`;
+    if (repository.slug !== ACTIVATION_SCHEDULER_REPOSITORY) {
+      repository.slug = `Joey-Tools/repository-${index + 1}`;
+    }
     repository.id = 8000 + index;
     repository.node_id = `R_example_${index + 1}`;
   });
@@ -4274,7 +4749,7 @@ test("manifest validation rejects incomplete, duplicate, or cross-bound cohort i
       mutate: (manifest) => {
         manifest.schema_version = "organization-review-gate-handoff-manifest/v1";
       },
-      error: /v1 manifests are historical 11-member artifacts/u,
+      error: /earlier manifests cannot authorize this 10-member cutover/u,
     },
     {
       name: "extra member",
@@ -4540,6 +5015,71 @@ test("manifest validation requires exact workflow, canary, and repository-v2 pro
     },
   ];
 
+  for (const { name, mutate, error } of cases) {
+    await t.test(name, () => assertManifestRejected(mutate, error));
+  }
+});
+
+test("manifest binds activation stability budgets and the sole private scheduler target", async (t) => {
+  const privateRepositoryIndex = manifestFixture().repositories.findIndex(
+    ({ slug }) => slug === ACTIVATION_SCHEDULER_REPOSITORY,
+  );
+  assert.ok(privateRepositoryIndex >= 0);
+  const cases = [
+    {
+      name: "legacy evidence budget has a bounded lower limit",
+      mutate: (manifest) => {
+        manifest.activation.legacy_evidence_stability_timeout_ms = 59_999;
+      },
+      error: /legacy_evidence_stability_timeout_ms must be between 60000ms/u,
+    },
+    {
+      name: "one coverage round must contain scheduler drain, every legacy batch, and control-plane margin",
+      mutate: (manifest) => {
+        manifest.activation.coverage_round_timeout_ms = 7_199_999;
+      },
+      error: /coverage_round_timeout_ms must be between 7200000ms/u,
+    },
+    {
+      name: "the stable coverage pair must contain two complete coverage rounds and the read interval",
+      mutate: (manifest) => {
+        manifest.activation.coverage_stability_timeout_ms = 14_404_999;
+      },
+      error: /coverage_stability_timeout_ms must be between 14405000ms/u,
+    },
+    {
+      name: "per-repository writer scan budget has the approved maximum",
+      mutate: (manifest) => {
+        manifest.repositories[privateRepositoryIndex].legacy_writer_scan_timeout_ms =
+          300_001;
+      },
+      error: /legacy_writer_scan_timeout_ms must be between 60000ms and 300000ms/u,
+    },
+    {
+      name: "only the private overlay repository may bind a scheduler",
+      mutate: (manifest) => {
+        manifest.repositories[0].scheduler_quiescence = clone(
+          manifest.repositories[privateRepositoryIndex].scheduler_quiescence,
+        );
+      },
+      error: /is allowed only for Joey-Tools\/codex-private-workflows/u,
+    },
+    {
+      name: "private scheduler must begin active before an explicit quiesce",
+      mutate: (manifest) => {
+        manifest.repositories[privateRepositoryIndex]
+          .scheduler_quiescence.expected_initial_state = "disabled_manually";
+      },
+      error: /expected_initial_state must be "active"/u,
+    },
+    {
+      name: "private scheduler cannot be omitted from the activation transaction",
+      mutate: (manifest) => {
+        manifest.repositories[privateRepositoryIndex].scheduler_quiescence = null;
+      },
+      error: /scheduler_quiescence must be a JSON object/u,
+    },
+  ];
   for (const { name, mutate, error } of cases) {
     await t.test(name, () => assertManifestRejected(mutate, error));
   }

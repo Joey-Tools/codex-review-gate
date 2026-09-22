@@ -3,7 +3,7 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-21
+updated: 2026-09-22
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -469,6 +469,68 @@ the global cutover is closed.
   exact ordering. Disabled organization rule `23787657` must remain Disabled
   until this correction is merged and a fresh activation preview succeeds.
 
+### Execution Update — 2026-09-22
+
+- Source PR `#59` merged as
+  `83eaf9166302e8b50df47628ab3d5ad8ad0ba91b`, completing the narrow
+  repository-ruleset readback ordering correction. The organization v2
+  ruleset `23787657` remains Disabled; no activation, cleanup, old-rule
+  cutover, or bridge removal was performed by that correction.
+- Live measurement of the retained verifier history in
+  `Joey-Tools/codex-private-workflows` found 2,133 executions across 22
+  unfiltered `per_page=100&page=N` pages. Two independent full inventories
+  completed in 72.946 seconds and 76.608 seconds. The prior uniform 60-second
+  scan deadline would therefore reject a healthy private repository before
+  the organization activation proof could begin.
+- The manifest now uses schema `v3` so that the new authority and capacity
+  boundary cannot be silently omitted from an older reviewed `v2` manifest.
+  It binds a per-repository legacy-writer scan timeout (300 seconds only for
+  the measured private history; 60 seconds elsewhere), a 900-second bounded
+  `D0 -> S0 -> D1 -> S1` legacy-evidence stabilization window, and separate
+  activation budgets for one complete coverage round and its stable two-round
+  pair. The 7,200-second round capacity is the explicit 2,100-second
+  scheduler-drain budget plus five repository-evidence waves at 900 seconds
+  each (the active cohort is 10 and its reader concurrency is 2), plus a
+  600-second control-plane/API margin. The 14,405-second pair is exactly two
+  rounds plus the five-second stable-read interval. This fixes the prior
+  under-budgeted 1,805-second pair, which could fail closed before a valid
+  slow five-wave read completed. The round/pair limits are capacity bounds,
+  not a wall-clock budget for the complete `activate --apply` operation:
+  preview and post-write readback establish a stable pair, while immediate
+  revalidation is deliberately limited to one round. The published
+  output/receipt wire format remains `output/v2` / receipt schema `2`, whose
+  manifest digest binds the reviewed v3 input.
+- A pre-commit audit found that applying only the two-round pair deadline
+  would still let either constituent round consume the whole pair. The helper
+  therefore applies `coverage_round_timeout_ms` independently to each round
+  inside the pair as well as to immediate revalidation, with the pair deadline
+  retained as the outer cap. This preserves the stated scheduler-drain and
+  five-wave capacity boundary, avoids unnecessarily extending the
+  `disabled_manually` interval, and fails closed before a second round starts
+  when the first round exceeds its own cap.
+- The measured private repository has one separately bound workflow,
+  `Scheduled Private Overlay Sync Release` (Actions workflow `281807666`,
+  `.github/workflows/scheduled-sync-release.yml`). It schedules overlay-sync
+  PR work; that work can cause the verifier or temporary bridge to create a
+  new execution while the activation reader is proving their terminal epochs.
+  The handoff therefore uses the explicit, preview-first sequence
+  `quiesce-scheduler -> activate -> restore-scheduler`. Quiesce changes only
+  that exact manifest-bound workflow to `disabled_manually`, waits normally
+  for already-started runs rather than cancelling them, and proves a stable
+  complete unfiltered scheduler epoch before activation starts a fresh
+  coverage read. It never disables either the v2 verifier or the legacy
+  bridge.
+- Scheduler drain has a separately bound 2,100-second budget (the workflow's
+  30-minute job limit plus room for normal completion). An interruption or
+  failure intentionally leaves `disabled_manually` visible rather than
+  guessing at an enable. The operator receives an explicit recovery code and
+  must use a fresh preview of `restore-scheduler` after inspecting whether the
+  interrupted activation reached dual enforcement. The first activation
+  scheduler preflight belongs to the same recovery boundary, so even a
+  transient preflight read failure reports the reconcile path instead of
+  bypassing recovery guidance. There is no durable operation ledger: GitHub
+  state plus a fresh complete readback remains the recovery authority.
+
 ## Failure And Recovery Boundary
 
 - Any changed selector, active or legacy-only repository identity/default
@@ -481,11 +543,30 @@ the global cutover is closed.
   inventory admits only the three canonical files and rejects any extra v1/v2
   caller, related writer, nested workflow tree, symlink, submodule, or other
   non-regular entry; default workflow permission must be `read`.
-- Each authoritative cohort snapshot consists of two complete reads separated
-  by five seconds. A changed fingerprint restarts the pair; after 60 seconds
-  without a stable pair the tool reports inconclusive and performs no next
-  write. The comparison protects the selected policy/evidence content, not
-  benign transport metadata.
+- Ordinary non-activation cohort snapshots consist of two complete reads
+  separated by five seconds and retain the 60-second bound. Activation uses
+  three manifest-bound scopes instead: one complete legacy-writer inventory
+  may take the repository's 60- or 300-second budget; `D0 -> S0 -> D1 -> S1`
+  may retry known run/pagination/epoch instability for at most 900 seconds.
+  One full activation coverage round has 7,200 seconds of manifest-bound
+  capacity: scheduler drain, five bounded repository-evidence waves, and the
+  explicit control-plane/API margin. Its two-read stable pair has 14,405
+  seconds; immediate pre-write revalidation receives only the one-round cap.
+  A changed fingerprint restarts the relevant pair, but malformed responses,
+  unknown run states, policy/identity mismatch, and a bad legacy status remain
+  immediate fail-closed errors. These scopes are not the total wall-clock
+  allowance for preview, revalidation, and post-write readback. The
+  comparisons protect selected policy/evidence content, not benign transport
+  metadata.
+- Before activation, the manifest-bound private overlay scheduler must be
+  explicitly quiesced and read back as `disabled_manually`; its complete
+  unfiltered run inventory must reach two equal terminal epochs. No `status`,
+  `head_sha`, `event`, `created`, or other run filter is used, because
+  independently timed filtered lists cannot prove one atomic drained epoch.
+  The tool never cancels an already-started scheduler run. A quiesce or
+  activation failure leaves the scheduler disabled for explicit operator
+  reconciliation; `restore-scheduler` is a separate preview/apply action and
+  never writes the organization v2 rule.
 - Activation requires the live open/non-draft canary evidence through its
   post-write dual-enforcement readback. Once that readback succeeds, later
   derive/cleanup/verify snapshots deliberately omit the closed canary
@@ -563,12 +644,15 @@ the global cutover is closed.
 
 ## Next Steps
 
-1. Merge the narrow repository-ruleset readback-ordering correction and rerun
-   the bound, read-only organization `activate` preview.
-2. Only if that fresh preview succeeds, activate disabled organization ruleset
-   `23787657` using its immediately matching exact plan digest and record the
-   stable dual-protection readback. Do not begin repository cleanup or old-rule
-   cutover in the same step.
+1. Merge the schema-v3 bounded-writer/scheduler-quiescence hardening, update
+   the reviewed live manifest with its exact private scheduler identity, and
+   run a fresh `quiesce-scheduler` preview/apply.
+2. Only after quiesce has read back `disabled_manually` plus a stable terminal
+   scheduler epoch, run a new `activate` preview. If it succeeds, apply its
+   immediately matching exact plan digest and record the stable
+   dual-protection readback; then run the separately previewed
+   `restore-scheduler`. Do not begin repository cleanup or old-rule cutover in
+   the same step.
 3. Under the later, separately maintained policy-mutation freeze, execute the
    receipt-bound cleanup and old v1 required-status removal; remove temporary
    bridges only in separate consumer PRs after a final read-only receipt.

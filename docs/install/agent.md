@@ -85,7 +85,7 @@ Add these cohort inputs:
 
 ```text
 HANDOFF_MANIFEST = absolute path to reviewed JSON
-HANDOFF_SCHEMA = organization-review-gate-handoff-manifest/v2
+HANDOFF_SCHEMA = organization-review-gate-handoff-manifest/v3
 V2_ORGANIZATION_RULESET_NAME = Must Pass Codex Review v2
 COHORT_REPOSITORY_V2_RULESET_NAME = Must Pass Codex Review v2
 ```
@@ -100,8 +100,20 @@ repository v2 ruleset; and every active repository legacy-cleanup before/after
 action. Each canary must bind an exact
 open, non-draft, same-repository PR to its current head, base and test-merge
 SHAs; the v2 CheckRun, run, workflow, attempt and job IDs; and the latest
-successful legacy commit-status ID. Stop on any incomplete field, active-member
-set difference, identity drift or unsupported surface.
+successful legacy commit-status ID. Version 3 additionally binds the
+per-repository legacy-evidence window, the full-cohort coverage-round capacity,
+the two-round coverage-stability capacity, every repository's
+`legacy_writer_scan_timeout_ms`, and exactly one
+`scheduler_quiescence` descriptor. That descriptor is valid only for
+`Joey-Tools/codex-private-workflows` workflow
+`.github/workflows/scheduled-sync-release.yml`; it binds workflow ID, source
+blob/SHA-256, initial `active` state, and the drain timeout. Stop on any
+incomplete field, active-member set difference, identity drift, unexpected
+scheduler descriptor, or unsupported surface.
+
+The exact `activation` keys are `legacy_evidence_stability_timeout_ms`,
+`coverage_round_timeout_ms`, and `coverage_stability_timeout_ms`. They are
+manifest-bound plan input, never ad hoc CLI overrides.
 
 This is the current v2 handoff path. A previously issued v1 output with a
 schema-1 receipt is historical eleven-member closure evidence only; do not use
@@ -123,13 +135,17 @@ rerun `plan`.
 Hold an external organization-admin policy-mutation freeze from the stage
 preview through its apply, readback, and any recovery because an ambiguous
 POST may require no-receipt adoption. Establish an organization- and
-repository-admin freeze again for shared-rule activation, from its preview
-through stable post-write readback. Establish it a third time before the
+repository-admin freeze again before the scheduler-quiesce preview; retain it
+through the fresh shared-rule activation preview/apply, stable post-write
+readback, and scheduler restore readback. The bound scheduler must remain
+`disabled_manually` between the explicit quiesce and restore commands.
+Establish a third freeze before the
 repository-cleanup preview and keep it continuously through the complete
 cleanup batch/readback, final old-rule preview/apply, and the separate final
 read-only verify receipt capture and validation.
 No administrator may change an organization/repository ruleset, classic branch
-protection, condition, required check or bypass actor during these freezes.
+protection, condition, required check or bypass actor during these freezes; in
+the second freeze, no one may separately enable or disable the bound scheduler.
 During the third freeze, no active cohort repository may be renamed, transferred,
 deleted, have its default branch changed, or be replaced or re-created at its
 original slug. These are operational freezes, not continuous API locks.
@@ -259,7 +275,37 @@ Execute the following state machine in order.
    Active or drifted candidates are stop conditions. Hold an external
    organization-admin policy-mutation freeze for the complete recovery read.
    Never replay the POST.
-5. Preview and activate the new organization rule:
+5. Preview and quiesce the sole manifest-bound private scheduler before any
+   activation proof. This is limited to
+   `Joey-Tools/codex-private-workflows` workflow
+   `.github/workflows/scheduled-sync-release.yml`; it must not disable the v2
+   verifier or temporary legacy bridge. The drain reads the complete unfiltered
+   run inventory (no `status`, `head_sha`, event, or creation-time filter). Do
+   not cancel an already-started run: wait for two identical all-terminal
+   inventories.
+
+   ```bash
+   HANDOFF_QUIESCE_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode quiesce-scheduler > "$HANDOFF_QUIESCE_PREVIEW"
+   HANDOFF_QUIESCE_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_QUIESCE_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode quiesce-scheduler \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_QUIESCE_PLAN_SHA256"
+   ```
+
+   Continue only after `applied-drained`. A failure after disable intentionally
+   leaves the scheduler `disabled_manually`. Read the supplied `recovery_code`,
+   do not replay an ambiguous PUT, and reconcile the exact manifest-bound
+   scheduler state with a fresh preview. The helper never restores the
+   scheduler automatically after failed quiesce or activation.
+6. Preview and activate the new organization rule from a **fresh** post-quiesce
+   coverage snapshot. Never reuse coverage evidence read before quiesce:
 
    ```bash
    HANDOFF_ACTIVATE_PREVIEW="$(mktemp)"
@@ -276,8 +322,9 @@ Execute the following state machine in order.
      --expected-plan-sha256 "$HANDOFF_ACTIVATE_PLAN_SHA256"
    ```
 
-   The helper must prove all ten exact active repository identities, three
-   exact workflows, effective CODEOWNERS identities, complete Active repository
+   The helper must prove all ten exact active repository identities, the three
+   exact canonical workflows plus the manifest-bound quiesced scheduler,
+   effective CODEOWNERS identities, complete Active repository
    v2 rulesets, open/non-draft/current-base canaries, exact v2 run/job
    receipts, latest successful legacy commit statuses, unmodified active
    repository legacy surfaces and the exact old organization rule before
@@ -285,20 +332,43 @@ Execute the following state machine in order.
    shared v2 is Active and shared v1 remains Active with its original
    eleven-repository legacy selector.
 
-   Only after the activation apply returns its successful post-write
-   dual-enforcement readback may every canary be closed without merging. Never
-   close a canary before `activate` completes. Later `derive-cutover`,
+   Do not close a canary before `activate` completes and step 7 restores the
+   scheduler after its successful post-write dual-enforcement readback. Later
+   `derive-cutover`,
    `apply-repository-cleanup`, and `verify` use post-activation active-cohort
    snapshots and do not require reopening those PRs. They also do not require a current
    default-branch head equal to the historical canary base. Treat the canary
    receipt only as activation-bound evidence. Each later round instead reads
    the live default branch and proves the current control-plane/ruleset
    closure: exact repository identity; a complete regular-blob workflow
-   inventory containing only the three canonical workflows and no extra
-   producer; exact CODEOWNERS; default-read Actions policy with an explicit
+   inventory containing the three canonical workflows, the separately
+   manifest-bound scheduler, and no extra producer; exact CODEOWNERS;
+   default-read Actions policy with an explicit
    boolean `can_approve_pull_request_reviews`; Active repository and
    organization v2 rules; the temporary bridge; and cleanup state.
-6. Derive the cutover transaction read-only:
+7. After `activate --apply` returns its successful dual-enforcement readback,
+   preview and restore the scheduler. This is a separate mutation with its own
+   plan digest; it is also the only normal recovery operation after deciding
+   whether an interrupted activation reached dual enforcement.
+
+   ```bash
+   HANDOFF_RESTORE_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode restore-scheduler > "$HANDOFF_RESTORE_PREVIEW"
+   HANDOFF_RESTORE_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_RESTORE_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode restore-scheduler \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_RESTORE_PLAN_SHA256"
+   ```
+
+   An uncertain enable outcome is not retryable by replay: first reconcile the
+   exact workflow state and follow its `recovery_code`.
+8. Derive the cutover transaction read-only:
 
    ```bash
    HANDOFF_CUTOVER_PLAN="$(mktemp)"
@@ -357,7 +427,7 @@ Execute the following state machine in order.
    the batch. Run a fresh preview under the freeze and review that state; never
    replay the old request or digest blindly. Stop before organization cutover
    unless every action is at exact `expected_after`.
-7. Preview and apply final organization cutover:
+9. Preview and apply final organization cutover:
 
    ```bash
    HANDOFF_VERIFY_PREVIEW="$(mktemp)"
@@ -426,7 +496,7 @@ Execute the following state machine in order.
    after capture but before removal preparation, discard the old proof and
    mint a fresh final read-only output under a new freeze. Never substitute
    the `verify --apply` response or reuse a known-stale receipt.
-8. Only after step 7 closes successfully, prepare a separate bridge-removal PR
+10. Only after step 9 closes successfully, prepare a separate bridge-removal PR
    in every active cohort member from a clean worktree. Do not prepare one for
    the archived legacy-only repository:
 
@@ -481,12 +551,25 @@ Execute the following state machine in order.
    a bridge-only PR. After merge, run the ordinary bootstrap and inventory
    checks without `--legacy-bridge`; any remaining v1 caller is a failure.
 
-Every authoritative helper success boundary reads a complete snapshot, waits
-five seconds and reads it again. A selected evidence or policy difference
-restarts the pair. If no identical pair is observed within 60 seconds, the
-result is inconclusive and no next write is allowed. Do not retry with a newly
-derived apply digest until the changed state has been reviewed, and never
-disable v2 or delete the old organization rule as recovery.
+Every ordinary authoritative helper success boundary reads a complete snapshot,
+waits five seconds and reads it again. A selected evidence or policy difference
+restarts the pair. Activation uses the manifest-bound capacity contract instead
+of a generic 60-second cap: 900 seconds for one repository's legacy evidence;
+7,200 seconds for one full-cohort coverage round, consisting of the
+2,100-second scheduler drain, `ceil(10 / 2) * 900` seconds for five
+legacy-evidence windows, and 600 seconds of control-plane/API margin; and
+14,405 seconds for one two-round stable pair plus its five-second interval.
+Pre-write and post-write stable coverage use both bounds: each coverage round
+independently has the round cap, and the complete pair has the pair cap.
+Immediate revalidation uses only the round cap. This prevents one overlong
+round from consuming the pair budget and extending the scheduler's
+`disabled_manually` state. These are upper capacity limits, not the total
+`activate` wall-clock or a GitHub Actions-minutes-free promise: normal
+execution ends when its actual reads finish. No capacity limit permits
+incomplete pagination or a changed execution epoch. Expiry or changed evidence
+is inconclusive and sends no next write; read the `recovery_code`, then take
+the relevant fresh preview. Never disable v2 or delete the old organization
+rule as recovery.
 
 ## Phase 1: prepare and merge one migration PR
 

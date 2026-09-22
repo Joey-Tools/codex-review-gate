@@ -71,7 +71,7 @@ overlap 都必须拒绝，否则归档仓的保护可能被静默重定向。
 
 ```text
 HANDOFF_MANIFEST = reviewed JSON 的绝对路径
-HANDOFF_SCHEMA = organization-review-gate-handoff-manifest/v2
+HANDOFF_SCHEMA = organization-review-gate-handoff-manifest/v3
 V2_ORGANIZATION_RULESET_NAME = Must Pass Codex Review v2
 COHORT_REPOSITORY_V2_RULESET_NAME = Must Pass Codex Review v2
 ```
@@ -82,8 +82,18 @@ Manifest 必须绑定 exact organization ID/node ID、旧 organization ruleset �
 temporary bridge 的 Git blob SHA 与 SHA-256、effective CODEOWNERS identity、每个完整 Active
 repository v2 ruleset，以及每个活动 repository legacy-cleanup before/after action。每个 canary 必须把 exact open、
 non-draft、same-repository PR 绑定到 current head/base/test-merge SHAs、v2 CheckRun/run/
-workflow/attempt/job IDs，以及最新 successful legacy commit-status ID。任意字段不完整、
-活动成员集不同、identity drift 或 unsupported surface 都必须停止。
+workflow/attempt/job IDs，以及最新 successful legacy commit-status ID。Version 3 还绑定单个
+repository 的 legacy-evidence window、full-cohort coverage-round capacity、two-round
+coverage-stability capacity、每个 repository 的 `legacy_writer_scan_timeout_ms`，以及唯一一份
+`scheduler_quiescence` descriptor。该 descriptor 只允许属于
+`Joey-Tools/codex-private-workflows` 的
+`.github/workflows/scheduled-sync-release.yml`，并绑定 workflow ID、source blob/SHA-256、
+initial `active` state 与 drain timeout。任意字段不完整、活动成员集不同、identity drift、
+意外的 scheduler descriptor 或 unsupported surface 都必须停止。
+
+精确的 `activation` keys 是 `legacy_evidence_stability_timeout_ms`、
+`coverage_round_timeout_ms` 与 `coverage_stability_timeout_ms`。它们是 manifest-bound 的
+plan input，绝不是临时 CLI override。
 
 这是当前的 v2 handoff 路径。此前已签发的 v1 output 与 schema-1 receipt 只构成历史 11 仓
 closure evidence；不得用它为本 cohort 执行 installation、staging、activation、cleanup 或
@@ -100,12 +110,15 @@ review 完整 manifest，并重新运行 `plan`。
 
 因为 ambiguous POST 可能需要 no-receipt adoption，stage preview 前必须建立外部
 organization-admin policy-mutation freeze，并保持到 apply、readback 与任何 recovery 完成。
-Shared-rule activation 再建立一次 organization/repository admin freeze，从 preview 保持到
-stable post-write readback。Repository-cleanup preview 前第三次建立 freeze，并连续保持到
+Scheduler quiesce preview 前再建立一次 organization/repository admin freeze，保持到 fresh
+shared-rule activation preview/apply、stable post-write readback 与 scheduler restore readback
+全部完成。两条显式 quiesce/restore command 之间，已绑定 scheduler 必须保持
+`disabled_manually`。Repository-cleanup preview 前第三次建立 freeze，并连续保持到
 完整 cleanup batch/readback、最终旧规则 preview/apply，以及另一次最终只读 verify receipt
 capture/validation 全部完成。
 这些 freeze 期间任何管理员都不得修改 organization/repository ruleset、classic branch
-protection、condition、required check 或 bypass actor。第三次 freeze 期间还禁止任何活动 cohort
+protection、condition、required check 或 bypass actor；第二次 freeze 期间也禁止任何人单独
+enable/disable 已绑定 scheduler。第三次 freeze 期间还禁止任何活动 cohort
 repository 被 rename、transfer、delete、改变 default branch，或在原 slug 被 replace/
 re-create。这些是运营冻结，不是持续 API 锁。GitHub ruleset endpoint 没有 documented
 conditional/CAS update，cleanup mutation API 也没有 repository-ID conditional/CAS write；
@@ -211,7 +224,33 @@ cutover write；这份 proof 不会使归档仓成为 v2、receipt 或 bridge-re
    exact before-state 时，才可输出 `next_manifest_update`。Candidate 不存在、多个、已
    Active 或有 drift 都是停止条件。完整 recovery read 期间必须保持外部
    organization-admin policy-mutation freeze；绝不重发 POST。
-5. Preview 并 activate 新 organization rule：
+5. 在任何 activation proof 前，先 preview 并 quiesce 唯一的 manifest-bound private
+   scheduler。它只限于 `Joey-Tools/codex-private-workflows` 的
+   `.github/workflows/scheduled-sync-release.yml`，不得禁用 v2 verifier 或 temporary legacy
+   bridge。Drain 读取完整且不带 filter 的 run inventory（不得带 `status`、`head_sha`、event 或
+   creation-time filter）。不得取消已启动的 run；等待两份相同且全部 terminal 的 inventory。
+
+   ```bash
+   HANDOFF_QUIESCE_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode quiesce-scheduler > "$HANDOFF_QUIESCE_PREVIEW"
+   HANDOFF_QUIESCE_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_QUIESCE_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode quiesce-scheduler \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_QUIESCE_PLAN_SHA256"
+   ```
+
+   只有返回 `applied-drained` 才继续。Disable 后失败会刻意保留 scheduler
+   `disabled_manually`。读取输出的 `recovery_code`，不得重放结果不明的 PUT；通过 fresh
+   preview reconcile exact manifest-bound scheduler state。Failed quiesce 或 activation 后，helper
+   绝不会自动 restore scheduler。
+6. 从**重新建立的** post-quiesce coverage snapshot preview 并 activate 新 organization
+   rule。绝不复用 quiesce 前读取的 coverage evidence：
 
    ```bash
    HANDOFF_ACTIVATE_PREVIEW="$(mktemp)"
@@ -228,23 +267,46 @@ cutover write；这份 proof 不会使归档仓成为 v2、receipt 或 bridge-re
      --expected-plan-sha256 "$HANDOFF_ACTIVATE_PLAN_SHA256"
    ```
 
-   写入前 helper 必须证明 10 个活动 exact repository identities、三份 exact workflows、完整
-   effective CODEOWNERS identities、Active repository v2 rulesets、open/non-draft/current-
+   写入前 helper 必须证明 10 个活动 exact repository identities、三份 exact canonical workflows
+   与 manifest-bound quiesced scheduler、完整 effective CODEOWNERS identities、Active repository
+   v2 rulesets、open/non-draft/current-
    base canaries、exact v2 run/job receipts、latest successful legacy commit statuses、未变化
    的活动 repository legacy surfaces 与 exact old organization rule。成功 readback 才是双重
    保护 handoff point：shared v2 Active，同时 shared v1 仍以原始 11 仓 legacy selector
    保持 Active。
 
-   只有 activation apply 返回成功的 post-write dual-enforcement readback 后，才可关闭且不
-   合并每个 canary；`activate` 完成前绝不可关闭。之后的 `derive-cutover`、
+   只有 `activate` 完成，且步骤 7 已在成功的 post-write dual-enforcement readback 后 restore
+   scheduler，才可关闭 canary。之后的 `derive-cutover`、
    `apply-repository-cleanup` 与 `verify` 使用 post-activation active-cohort snapshots，不要求
    重新打开这些 PR，也不要求当前 default-branch head 等于历史 canary base。Canary receipt 只
    属于 activation-bound evidence；后续每轮都读取每个活动 repository 的实时 default branch
-   并验证当前 control-plane/ruleset closure：exact repository identity、只含三份 canonical
-   workflows 且没有额外 producer 的完整 regular-blob workflow inventory、exact CODEOWNERS、
+   并验证当前 control-plane/ruleset closure：exact repository identity、包含三份 canonical
+   workflows、单独 manifest-bound scheduler 且没有额外 producer 的完整 regular-blob workflow
+   inventory、exact CODEOWNERS、
    包含明确 boolean `can_approve_pull_request_reviews` 的 default-read Actions policy、Active
    repository/organization v2 rules、temporary bridge 与 cleanup state。
-6. 只读推导 cutover transaction：
+7. `activate --apply` 返回成功的 dual-enforcement readback 后，preview 并 restore scheduler。
+   这是一条有独立 plan digest 的单独 mutation；在先判断 interrupted activation 是否到达 dual
+   enforcement 后，它也是唯一的正常 recovery operation。
+
+   ```bash
+   HANDOFF_RESTORE_PREVIEW="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode restore-scheduler > "$HANDOFF_RESTORE_PREVIEW"
+   HANDOFF_RESTORE_PLAN_SHA256="$(jq -er \
+     '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$HANDOFF_RESTORE_PREVIEW")"
+   node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+     --manifest "$HANDOFF_MANIFEST" \
+     --mode restore-scheduler \
+     --apply \
+     --expected-plan-sha256 "$HANDOFF_RESTORE_PLAN_SHA256"
+   ```
+
+   Enable outcome 不确定时不得重放；先 reconcile exact workflow state，并遵循其
+   `recovery_code`。
+8. 只读推导 cutover transaction：
 
    ```bash
    HANDOFF_CUTOVER_PLAN="$(mktemp)"
@@ -295,7 +357,7 @@ cutover write；这份 proof 不会使归档仓成为 v2、receipt 或 bridge-re
    before、drift 或无法读取则停止整个 batch。在 freeze 下生成新 preview 并 review 该
    state；绝不盲目重放旧 request 或 digest。任一 action 未达到 exact `expected_after` 时，
    不得进入 organization cutover。
-7. Preview 并执行最终 organization cutover：
+9. Preview 并执行最终 organization cutover：
 
    ```bash
    HANDOFF_VERIFY_PREVIEW="$(mktemp)"
@@ -355,7 +417,7 @@ cutover write；这份 proof 不会使归档仓成为 v2、receipt 或 bridge-re
    verify。若 capture 之后到 removal preparation 之前发生了已知 organization/repository
    policy mutation，则丢弃旧 proof，在新的 freeze 下生成 fresh final read-only output；绝不
    用 `verify --apply` response 代替，也不复用已知 stale receipt。
-8. 只有步骤 7 成功 closure 后，每个活动 cohort member 才从 clean worktree 另开
+10. 只有步骤 9 成功 closure 后，每个活动 cohort member 才从 clean worktree 另开
    bridge-removal PR。不得为已归档、仅属于 legacy 的 repository 创建此类 PR：
 
    ```bash
@@ -400,10 +462,20 @@ remote binding 与 local identity/content checks，并非连续锁。不得编�
    `--legacy-bridge` 的普通 bootstrap 与 inventory checks；任何残留 v1 caller 都是
    failure。
 
-每个 authoritative helper success boundary 先读取一份完整 snapshot，等待 5 秒，再读一
-份。Selected evidence 或 policy 不同就重新开始这一对读取；60 秒内始终得不到相同的一对，
-结论就是 inconclusive，不允许下一次 write。除非变化后的 state 已重新 review，不得用新
-推导的 apply digest 重试；恢复时绝不能 disable v2 或删除旧 organization rule。
+普通 authoritative helper success boundary 先读取一份完整 snapshot，等待 5 秒，再读一份。
+Selected evidence 或 policy 不同就重新开始这一对读取。Activation 改用 manifest-bound capacity
+contract，不使用通用 60 秒上限：单个 repository 的 legacy evidence 为 900 秒；一次
+full-cohort coverage round 为 7,200 秒，由 2,100 秒 scheduler drain、`ceil(10 / 2) * 900`
+秒的五个 legacy-evidence window，以及 600 秒 control-plane/API margin 组成；一组
+two-round stable pair 加 5 秒 interval 为 14,405 秒。Pre-write 与 post-write stable coverage
+同时使用两层约束：每个 coverage round 独立受 round cap 限制，完整 pair 受 pair cap 限制；
+immediate revalidation 只使用 round cap。这样可防止单轮过长耗尽 pair budget，并延长
+scheduler 的 `disabled_manually` 状态。这些是 upper capacity limit，不是 `activate` 的总
+wall-clock，也不表示 GitHub Actions minutes free；正常执行会在实际读取结束时
+完成。任何 capacity limit 都不允许 incomplete pagination 或改变后的 execution epoch。
+Deadline 到期或 evidence 改变时，结论为 inconclusive、不允许下一次 write；读取
+`recovery_code` 后再运行对应 fresh preview。恢复时绝不能 disable v2 或删除旧 organization
+rule。
 
 ## 阶段 1：准备并合并 migration PR
 
