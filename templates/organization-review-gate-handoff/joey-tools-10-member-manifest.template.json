@@ -1,5 +1,5 @@
 {
-  "schema_version": "organization-review-gate-handoff-manifest/v2",
+  "schema_version": "organization-review-gate-handoff-manifest/v3",
   "organization": {
     "login": "Joey-Tools",
     "id": 283943935,
@@ -68,12 +68,22 @@
     "id": null,
     "name": "Must Pass Codex Review v2"
   },
+  "activation": {
+    "legacy_evidence_stability_timeout_ms": 900000,
+    "repository_evidence_timeout_ms": 1200000,
+    "scheduler_snapshot_timeout_ms": 120000,
+    "organization_evidence_timeout_ms": 120000,
+    "coverage_round_timeout_ms": 9000000,
+    "coverage_stability_timeout_ms": 18005000
+  },
   "repositories": [
     {
       "slug": "Joey-Tools/codex-apple-notes-toolkit",
       "id": 1242512097,
       "node_id": "R_kgDOSg864Q",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -243,6 +253,8 @@
       "id": 1242512092,
       "node_id": "R_kgDOSg863A",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -412,6 +424,8 @@
       "id": 1242511852,
       "node_id": "R_kgDOSg857A",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -581,6 +595,17 @@
       "id": 1242512336,
       "node_id": "R_kgDOSg870A",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 300000,
+      "scheduler_quiescence": {
+        "workflow_id": 281807666,
+        "workflow": {
+          "path": ".github/workflows/scheduled-sync-release.yml",
+          "git_blob_sha": "e8bec5550e124320c40efbefbd1432a116a061b0",
+          "sha256": "ad9b823f2051a9e5a5346647380b002b9a780c45e58fa63a4d8b8eee5d0944c1"
+        },
+        "expected_initial_state": "active",
+        "drain_timeout_ms": 2100000
+      },
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -671,6 +696,8 @@
       "id": 1242511845,
       "node_id": "R_kgDOSg855Q",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -840,6 +867,8 @@
       "id": 1242511842,
       "node_id": "R_kgDOSg854g",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -1009,6 +1038,8 @@
       "id": 1242512323,
       "node_id": "R_kgDOSg87ww",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -1178,6 +1209,8 @@
       "id": 1242511840,
       "node_id": "R_kgDOSg854A",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -1347,6 +1380,8 @@
       "id": 1242512084,
       "node_id": "R_kgDOSg861A",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",
@@ -1516,6 +1551,8 @@
       "id": 1246526548,
       "node_id": "R_kgDOSkx8VA",
       "default_branch": "master",
+      "legacy_writer_scan_timeout_ms": 60000,
+      "scheduler_quiescence": null,
       "workflows": {
         "verifier": {
           "path": ".github/workflows/codex-review-gate.yml",

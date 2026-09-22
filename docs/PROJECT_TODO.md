@@ -20,10 +20,16 @@
   frozen diff: it returned no actionable findings.
 - [x] Create the signed source commit and delivery PR after validation and
   review pass: signed commit `53c49bf` is the head of source PR #56.
-- [ ] Merge the narrow repository-ruleset readback-ordering correction, then
-  complete the separately authorized organization-v2 activation from its
-  fresh exact plan digest. Do not start v1 cleanup or cutover before the
-  stable dual-protection readback.
+- [x] Add manifest-v3 bounded legacy-writer evidence and the explicit private
+  overlay scheduler quiesce/activate/restore lifecycle, including recovery
+  guidance, explicit per-phase capacity limits, and bounded inventory
+  admission. This remains a source-helper hardening; it performs no
+  organization-policy mutation by itself.
+- [ ] Update the reviewed live manifest to the v3 phase-capacity contract
+  (900/1,200/120/120/9,000/18,005 seconds), then execute a fresh
+  quiesce-scheduler -> activate -> restore-scheduler transaction with matching
+  previews/digests. Do not start v1 cleanup or cutover before stable
+  dual-protection readback and scheduler restoration.
 
 ## Later
 

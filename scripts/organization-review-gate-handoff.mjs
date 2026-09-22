@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
@@ -17,7 +18,7 @@ import {
 } from "../src/bootstrap.mjs";
 
 export const MANIFEST_SCHEMA_VERSION =
-  "organization-review-gate-handoff-manifest/v2";
+  "organization-review-gate-handoff-manifest/v3";
 export const OUTPUT_SCHEMA_VERSION =
   "organization-review-gate-handoff-output/v2";
 export const FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION = 2;
@@ -88,6 +89,35 @@ const GH_API_QUEUE_TIMEOUT_MS = 60_000;
 // These hard bounds protect the one-time handoff reader's memory and request
 // footprint; they are intentionally distinct from consumer reconcile limits.
 const LEGACY_WRITER_SCAN_TIMEOUT_MS = 60_000;
+const MAX_LEGACY_WRITER_SCAN_TIMEOUT_MS = 300_000;
+const LEGACY_EVIDENCE_STABILITY_TIMEOUT_MS = 900_000;
+const MAX_LEGACY_EVIDENCE_STABILITY_TIMEOUT_MS = 900_000;
+const ACTIVATION_STABILITY_INTERVAL_MS = 5_000;
+const ACTIVATION_SCHEDULER_DRAIN_TIMEOUT_MS = 2_100_000;
+const MAX_ACTIVATION_SCHEDULER_DRAIN_TIMEOUT_MS = 2_100_000;
+// A coverage round first proves the complete post-disable scheduler evidence,
+// then reads the ten repositories in five bounded waves. The organization
+// read and every repository evidence pass have independent budgets, so the
+// round formula remains an enforceable capacity bound even when a live
+// workflow or ruleset inventory grows. The pair budget covers two whole rounds
+// plus their stable-read interval.
+const ACTIVATION_REPOSITORY_EVIDENCE_TIMEOUT_MS = 1_200_000;
+const MAX_ACTIVATION_REPOSITORY_EVIDENCE_TIMEOUT_MS = 1_800_000;
+const ACTIVATION_SCHEDULER_SNAPSHOT_TIMEOUT_MS = 120_000;
+const MAX_ACTIVATION_SCHEDULER_SNAPSHOT_TIMEOUT_MS = 300_000;
+const ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS = 120_000;
+const MAX_ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS = 600_000;
+const ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS = 9_000_000;
+const MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS = 15_000_000;
+const ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS = 18_005_000;
+const MAX_ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS =
+  2 * MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS +
+  ACTIVATION_STABILITY_INTERVAL_MS;
+// These inventories feed bounded fan-out reads. Keep their cardinalities small
+// enough that a single evidence phase remains operationally inspectable.
+const MAX_WORKFLOW_INVENTORY_YAML_FILES = 32;
+const MAX_ACTIONS_WORKFLOW_INVENTORY_ENTRIES = 32;
+const MAX_LOCAL_REPOSITORY_RULESETS = 32;
 const LEGACY_WRITER_RUN_PAGE_SIZE = 100;
 const MAX_LEGACY_WRITER_RUN_ENTRIES = 100_000;
 const MAX_LEGACY_WRITER_RUN_PAGES = 1_000;
@@ -96,7 +126,9 @@ const REPOSITORY_EVIDENCE_CONCURRENCY = 2;
 const MODES = new Set([
   "plan",
   "stage",
+  "quiesce-scheduler",
   "activate",
+  "restore-scheduler",
   "derive-cutover",
   "apply-repository-cleanup",
   "verify",
@@ -105,6 +137,28 @@ const WORKFLOW_KEYS = ["verifier", "controller", "legacy_bridge"];
 const CONTROL_PLANE_CODEOWNERS_BEGIN =
   "# BEGIN codex-review-gate control-plane";
 const CONTROL_PLANE_CODEOWNERS_END = "# END codex-review-gate control-plane";
+const ACTIVATION_SCHEDULER_REPOSITORY = "Joey-Tools/codex-private-workflows";
+const ACTIVATION_SCHEDULER_WORKFLOW_PATH =
+  ".github/workflows/scheduled-sync-release.yml";
+
+export class RetryableHandoffEvidenceUnstableError extends Error {
+  constructor(message, options = undefined) {
+    super(message, options);
+    this.name = "RetryableHandoffEvidenceUnstableError";
+  }
+}
+
+class DeadlineExceededError extends Error {
+  constructor(label) {
+    super(
+      `${label} exceeded its shared deadline; the result is inconclusive and no next write is allowed.`,
+    );
+    this.name = "DeadlineExceededError";
+    this.label = label;
+  }
+}
+
+const ghDeadlineContext = new AsyncLocalStorage();
 
 export function canonicalJson(value) {
   return JSON.stringify(canonicalValue(value));
@@ -186,6 +240,14 @@ function statusContextEquals(candidate, canonical) {
 function assertPositiveInteger(value, label) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${label} must be a positive safe integer.`);
+  }
+  return value;
+}
+
+function assertBoundedTimeout(value, minimum, maximum, label) {
+  assertPositiveInteger(value, label);
+  if (value < minimum || value > maximum) {
+    throw new Error(`${label} must be between ${minimum}ms and ${maximum}ms.`);
   }
   return value;
 }
@@ -505,6 +567,137 @@ function assertWorkflowDescriptor(value, label) {
   assertHex(value.sha256, 64, `${label}.sha256`);
 }
 
+function validateActivationConfiguration(value) {
+  assertExactKeys(
+    value,
+    [
+      "legacy_evidence_stability_timeout_ms",
+      "repository_evidence_timeout_ms",
+      "scheduler_snapshot_timeout_ms",
+      "organization_evidence_timeout_ms",
+      "coverage_round_timeout_ms",
+      "coverage_stability_timeout_ms",
+    ],
+    "manifest.activation",
+  );
+  const legacyEvidenceTimeoutMs = assertBoundedTimeout(
+    value.legacy_evidence_stability_timeout_ms,
+    LEGACY_WRITER_SCAN_TIMEOUT_MS,
+    MAX_LEGACY_EVIDENCE_STABILITY_TIMEOUT_MS,
+    "manifest.activation.legacy_evidence_stability_timeout_ms",
+  );
+  const coverageRoundTimeoutMs = assertBoundedTimeout(
+    value.coverage_round_timeout_ms,
+    ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS,
+    MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS,
+    "manifest.activation.coverage_round_timeout_ms",
+  );
+  const repositoryEvidenceTimeoutMs = assertBoundedTimeout(
+    value.repository_evidence_timeout_ms,
+    Math.max(legacyEvidenceTimeoutMs, ACTIVATION_REPOSITORY_EVIDENCE_TIMEOUT_MS),
+    MAX_ACTIVATION_REPOSITORY_EVIDENCE_TIMEOUT_MS,
+    "manifest.activation.repository_evidence_timeout_ms",
+  );
+  const organizationEvidenceTimeoutMs = assertBoundedTimeout(
+    value.organization_evidence_timeout_ms,
+    ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS,
+    MAX_ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS,
+    "manifest.activation.organization_evidence_timeout_ms",
+  );
+  const schedulerSnapshotTimeoutMs = assertBoundedTimeout(
+    value.scheduler_snapshot_timeout_ms,
+    ACTIVATION_SCHEDULER_SNAPSHOT_TIMEOUT_MS,
+    MAX_ACTIVATION_SCHEDULER_SNAPSHOT_TIMEOUT_MS,
+    "manifest.activation.scheduler_snapshot_timeout_ms",
+  );
+  const coverageTimeoutMs = assertBoundedTimeout(
+    value.coverage_stability_timeout_ms,
+    ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS,
+    MAX_ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS,
+    "manifest.activation.coverage_stability_timeout_ms",
+  );
+  return {
+    legacyEvidenceTimeoutMs,
+    repositoryEvidenceTimeoutMs,
+    schedulerSnapshotTimeoutMs,
+    organizationEvidenceTimeoutMs,
+    coverageRoundTimeoutMs,
+    coverageTimeoutMs,
+  };
+}
+
+function activationCoverageRoundMinimum(manifest) {
+  const schedulerRepository = manifest.repositories.find(
+    (repo) => repo.slug === ACTIVATION_SCHEDULER_REPOSITORY,
+  );
+  const scheduler = schedulerRepository?.scheduler_quiescence;
+  if (scheduler === null || scheduler === undefined) {
+    throw new Error(
+      `Validated manifest does not bind one activation scheduler in ${ACTIVATION_SCHEDULER_REPOSITORY}.`,
+    );
+  }
+  return (
+    scheduler.drain_timeout_ms +
+    2 * manifest.activation.scheduler_snapshot_timeout_ms +
+    Math.max(
+      manifest.activation.organization_evidence_timeout_ms,
+      Math.ceil(manifest.repositories.length / REPOSITORY_EVIDENCE_CONCURRENCY) *
+        manifest.activation.repository_evidence_timeout_ms,
+    )
+  );
+}
+
+function assertActivationCoverageBudgetTopology(manifest) {
+  const roundTimeoutMs = manifest.activation.coverage_round_timeout_ms;
+  const minimumRoundTimeoutMs = activationCoverageRoundMinimum(manifest);
+  if (roundTimeoutMs < minimumRoundTimeoutMs) {
+    throw new Error(
+      "manifest.activation.coverage_round_timeout_ms must cover scheduler drain plus both bounded scheduler snapshots and the longer of bounded organization evidence or every bounded repository-evidence wave.",
+    );
+  }
+  const minimumPairTimeoutMs =
+    2 * roundTimeoutMs + ACTIVATION_STABILITY_INTERVAL_MS;
+  if (
+    manifest.activation.coverage_stability_timeout_ms <
+    minimumPairTimeoutMs
+  ) {
+    throw new Error(
+      "manifest.activation.coverage_stability_timeout_ms must cover two complete coverage rounds and their stable-read interval.",
+    );
+  }
+}
+
+function validateSchedulerQuiescence(value, repo, label) {
+  if (repo.slug !== ACTIVATION_SCHEDULER_REPOSITORY) {
+    if (value !== null) {
+      throw new Error(`${label} is allowed only for ${ACTIVATION_SCHEDULER_REPOSITORY}.`);
+    }
+    return null;
+  }
+  assertExactKeys(
+    value,
+    ["workflow_id", "workflow", "expected_initial_state", "drain_timeout_ms"],
+    label,
+  );
+  assertPositiveInteger(value.workflow_id, `${label}.workflow_id`);
+  assertWorkflowDescriptor(value.workflow, `${label}.workflow`);
+  if (value.workflow.path !== ACTIVATION_SCHEDULER_WORKFLOW_PATH) {
+    throw new Error(
+      `${label}.workflow.path must be "${ACTIVATION_SCHEDULER_WORKFLOW_PATH}".`,
+    );
+  }
+  if (value.expected_initial_state !== "active") {
+    throw new Error(`${label}.expected_initial_state must be "active".`);
+  }
+  assertBoundedTimeout(
+    value.drain_timeout_ms,
+    ACTIVATION_STABILITY_INTERVAL_MS,
+    MAX_ACTIVATION_SCHEDULER_DRAIN_TIMEOUT_MS,
+    `${label}.drain_timeout_ms`,
+  );
+  return value;
+}
+
 function assertCodeownersDescriptor(value, label) {
   assertExactKeys(value, ["path", "git_blob_sha", "sha256", "owner"], label);
   if (value.path !== CODEOWNERS_PATH) {
@@ -615,6 +808,7 @@ export function validateManifest(input) {
       "organization",
       "legacy_ruleset",
       "v2_ruleset",
+      "activation",
       "repositories",
       "expected_legacy_cleanup_action_count",
     ],
@@ -622,7 +816,7 @@ export function validateManifest(input) {
   );
   if (input.schema_version !== MANIFEST_SCHEMA_VERSION) {
     throw new Error(
-      `manifest.schema_version must be "${MANIFEST_SCHEMA_VERSION}"; v1 manifests are historical 11-member artifacts and cannot authorize this 10-member cutover.`,
+      `manifest.schema_version must be "${MANIFEST_SCHEMA_VERSION}"; earlier manifests cannot authorize this 10-member cutover because they do not bind its scheduler and coverage-capacity contract.`,
     );
   }
   assertExactKeys(input.organization, ["login", "id", "node_id"], "manifest.organization");
@@ -657,6 +851,8 @@ export function validateManifest(input) {
     throw new Error("The legacy and v2 organization rulesets must have distinct IDs.");
   }
 
+  validateActivationConfiguration(input.activation);
+
   if (
     !Array.isArray(input.repositories) ||
     input.repositories.length !== REQUIRED_REPOSITORY_COUNT
@@ -669,6 +865,7 @@ export function validateManifest(input) {
   const seenSlugs = new Set();
   const seenNodeIds = new Set();
   const seenCleanupTargets = new Set();
+  let schedulerQuiescenceCount = 0;
   let cleanupCount = 0;
   for (const [index, repo] of input.repositories.entries()) {
     const label = `manifest.repositories[${index}]`;
@@ -680,6 +877,8 @@ export function validateManifest(input) {
         "node_id",
         "default_branch",
         "workflows",
+        "legacy_writer_scan_timeout_ms",
+        "scheduler_quiescence",
         "codeowners",
         "v2_ruleset",
         "canary",
@@ -727,6 +926,21 @@ export function validateManifest(input) {
       workflowPaths.add(repo.workflows[key].path);
     }
     assertCodeownersDescriptor(repo.codeowners, `${label}.codeowners`);
+    assertBoundedTimeout(
+      repo.legacy_writer_scan_timeout_ms,
+      LEGACY_WRITER_SCAN_TIMEOUT_MS,
+      MAX_LEGACY_WRITER_SCAN_TIMEOUT_MS,
+      `${label}.legacy_writer_scan_timeout_ms`,
+    );
+    if (
+      validateSchedulerQuiescence(
+        repo.scheduler_quiescence,
+        repo,
+        `${label}.scheduler_quiescence`,
+      ) !== null
+    ) {
+      schedulerQuiescenceCount += 1;
+    }
 
     assertExactKeys(
       repo.v2_ruleset,
@@ -805,6 +1019,12 @@ export function validateManifest(input) {
       "manifest.expected_legacy_cleanup_action_count does not match the listed actions.",
     );
   }
+  if (schedulerQuiescenceCount !== 1) {
+    throw new Error(
+      `manifest must bind exactly one activation scheduler quiescence target in ${ACTIVATION_SCHEDULER_REPOSITORY}.`,
+    );
+  }
+  assertActivationCoverageBudgetTopology(input);
   const legacyOnlyRepository = input.legacy_ruleset.legacy_only_repository;
   if (
     seenIds.has(legacyOnlyRepository.id) ||
@@ -1354,6 +1574,29 @@ function delay(milliseconds) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
+function assertDeadlineConfiguration(deadlineAt, deadlineLabel) {
+  if (
+    !Number.isFinite(deadlineAt) ||
+    typeof deadlineLabel !== "string" ||
+    deadlineLabel === ""
+  ) {
+    throw new Error("GitHub API deadline configuration is invalid.");
+  }
+}
+
+function withGhDeadline(deadlineAt, deadlineLabel, callback) {
+  assertDeadlineConfiguration(deadlineAt, deadlineLabel);
+  if (typeof callback !== "function") {
+    throw new Error("GitHub API deadline callback must be a function.");
+  }
+  const inherited = ghDeadlineContext.getStore();
+  const effective =
+    inherited === undefined || deadlineAt < inherited.deadlineAt
+      ? { deadlineAt, deadlineLabel }
+      : inherited;
+  return ghDeadlineContext.run(effective, callback);
+}
+
 export async function loadStableSnapshots(
   label,
   loader,
@@ -1467,6 +1710,34 @@ async function revalidateLegacyOnlyRepositoryImmediatelyBeforeCutover(
     );
   }
   return latestIdentity;
+}
+
+async function revalidateActivationSchedulerImmediatelyBeforeCutover(
+  manifest,
+  plannedSnapshot,
+  runtime,
+) {
+  let latestScheduler;
+  try {
+    latestScheduler = await loadRestoredActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+    );
+  } catch (error) {
+    throw new Error(
+      `The manifest-bound activation scheduler could not be read as active immediately before cutover; no mutation was sent. ${error.message}`,
+      { cause: error },
+    );
+  }
+  if (
+    canonicalJson(latestScheduler) !==
+    canonicalJson(plannedSnapshot.activation_scheduler)
+  ) {
+    throw new Error(
+      `The manifest-bound activation scheduler changed after full-cohort revalidation; no mutation was sent (planned ${sha256Canonical(plannedSnapshot.activation_scheduler)}, latest ${sha256Canonical(latestScheduler)}).`,
+    );
+  }
+  return latestScheduler;
 }
 
 function assertState(actual, allowed, label) {
@@ -1589,22 +1860,26 @@ async function loadWorkflowInventoryEvidence(repo, revision) {
       );
     }
   }
+  const workflowEntries = workflowsTree.filter((entry) => /\.ya?ml$/u.test(entry.path));
+  if (workflowEntries.length > MAX_WORKFLOW_INVENTORY_YAML_FILES) {
+    throw new Error(
+      `${repo.slug} .github/workflows inventory exceeds the ${MAX_WORKFLOW_INVENTORY_YAML_FILES}-YAML capacity bound; workflow evidence is inconclusive.`,
+    );
+  }
   const workflowFiles = await Promise.all(
-    workflowsTree
-      .filter((entry) => /\.ya?ml$/u.test(entry.path))
-      .map(async (entry) => {
-        const blob = await ghJson(
-          `repos/${encodeEndpointPath(repo.slug)}/git/blobs/${encodeURIComponent(entry.sha)}`,
-        );
-        const content = decodeGitHubBlobContent(blob);
-        return {
-          path: `.github/workflows/${entry.path}`,
-          mode: entry.mode,
-          git_blob_sha: entry.sha,
-          sha256: createHash("sha256").update(content, "utf8").digest("hex"),
-          content,
-        };
-      }),
+    workflowEntries.map(async (entry) => {
+      const blob = await ghJson(
+        `repos/${encodeEndpointPath(repo.slug)}/git/blobs/${encodeURIComponent(entry.sha)}`,
+      );
+      const content = decodeGitHubBlobContent(blob);
+      return {
+        path: `.github/workflows/${entry.path}`,
+        mode: entry.mode,
+        git_blob_sha: entry.sha,
+        sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+        content,
+      };
+    }),
   );
   const canonicalWorkflows = {};
   const canonicalEvidence = {};
@@ -1638,8 +1913,30 @@ async function loadWorkflowInventoryEvidence(repo, revision) {
       { cause: error },
     );
   }
+  let schedulerQuiescence = null;
+  if (repo.scheduler_quiescence !== null) {
+    const expected = repo.scheduler_quiescence.workflow;
+    const matches = workflowFiles.filter((file) => file.path === expected.path);
+    if (matches.length !== 1) {
+      throw new Error(
+        `${repo.slug} activation scheduler workflow must occur exactly once in the complete default-branch workflow inventory.`,
+      );
+    }
+    const file = matches[0];
+    schedulerQuiescence = {
+      path: file.path,
+      git_blob_sha: file.git_blob_sha,
+      sha256: file.sha256,
+    };
+    assertExactSnapshot(
+      schedulerQuiescence,
+      expected,
+      `${repo.slug} activation scheduler workflow`,
+    );
+  }
   return {
     canonical: canonicalEvidence,
+    scheduler_quiescence: schedulerQuiescence,
     inventory: workflowFiles
       .map(({ path, mode, git_blob_sha, sha256 }) => ({
         path,
@@ -2219,7 +2516,11 @@ export function validateLegacyStatusPages(pages, repo) {
   return projection;
 }
 
-function createLegacyWriterRunInventoryAccumulator(repo, writer) {
+function createLegacyWriterRunInventoryAccumulator(
+  repo,
+  writer,
+  { requireTerminal = true, includeStatus = false } = {},
+) {
   let totalCount = null;
   let pageCount = 0;
   const pageSizes = [];
@@ -2253,7 +2554,9 @@ function createLegacyWriterRunInventoryAccumulator(repo, writer) {
           );
         }
       } else if (page.total_count !== totalCount) {
-        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+        throw new RetryableHandoffEvidenceUnstableError(
+          `${repo.slug} legacy writer run pagination is inconsistent.`,
+        );
       }
       if (pageCount >= MAX_LEGACY_WRITER_RUN_PAGES) {
         throw new Error(
@@ -2268,27 +2571,36 @@ function createLegacyWriterRunInventoryAccumulator(repo, writer) {
         assertPositiveInteger(run?.id, `${runLabel}.id`);
         assertPositiveInteger(run?.run_attempt, `${runLabel}.run_attempt`);
         if (runIds.has(run.id)) {
-          throw new Error(`${repo.slug} legacy writer run pagination contains duplicate IDs.`);
+          throw new RetryableHandoffEvidenceUnstableError(
+            `${repo.slug} legacy writer run pagination contains duplicate IDs.`,
+          );
         }
         runIds.add(run.id);
         if (NONTERMINAL_WORKFLOW_RUN_STATUSES.includes(run.status)) {
-          throw new Error(
-            `${repo.slug} ${writer} still has ${run.status} runs; bridge status cannot be accepted until every legacy-status writer drains.`,
-          );
-        }
-        if (run.status !== "completed") {
+          if (requireTerminal) {
+            throw new RetryableHandoffEvidenceUnstableError(
+              `${repo.slug} ${writer} still has ${run.status} runs; bridge status cannot be accepted until every legacy-status writer drains.`,
+            );
+          }
+        } else if (run.status !== "completed") {
           throw new Error(
             `${repo.slug} ${writer} run ${run.id} has unsupported status ${JSON.stringify(run.status)}; bridge status cannot be accepted until the complete legacy-writer inventory is terminal.`,
           );
         }
-        executions.push({ id: run.id, run_attempt: run.run_attempt });
+        executions.push(
+          includeStatus
+            ? { id: run.id, run_attempt: run.run_attempt, status: run.status }
+            : { id: run.id, run_attempt: run.run_attempt },
+        );
       }
       if (runIds.size > totalCount) {
-        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+        throw new RetryableHandoffEvidenceUnstableError(
+          `${repo.slug} legacy writer run pagination is inconsistent.`,
+        );
       }
       if (runIds.size === totalCount) return true;
       if (page.workflow_runs.length !== LEGACY_WRITER_RUN_PAGE_SIZE) {
-        throw new Error(
+        throw new RetryableHandoffEvidenceUnstableError(
           `${repo.slug} legacy writer run pagination has an incomplete non-final page.`,
         );
       }
@@ -2296,7 +2608,9 @@ function createLegacyWriterRunInventoryAccumulator(repo, writer) {
     },
     finish() {
       if (totalCount === null || runIds.size !== totalCount) {
-        throw new Error(`${repo.slug} legacy writer run pagination is inconsistent.`);
+        throw new RetryableHandoffEvidenceUnstableError(
+          `${repo.slug} legacy writer run pagination is inconsistent.`,
+        );
       }
       return {
         total_count: totalCount,
@@ -2355,13 +2669,22 @@ function validateActionsWorkflowInventoryPages(pages, repo) {
     pages.some((page) => page.total_count !== pages[0].total_count) ||
     workflows.length !== pages[0].total_count
   ) {
-    throw new Error(`${repo.slug} Actions workflow inventory is inconsistent.`);
+    throw new RetryableHandoffEvidenceUnstableError(
+      `${repo.slug} Actions workflow inventory is inconsistent.`,
+    );
+  }
+  if (workflows.length > MAX_ACTIONS_WORKFLOW_INVENTORY_ENTRIES) {
+    throw new Error(
+      `${repo.slug} Actions workflow inventory exceeds the ${MAX_ACTIONS_WORKFLOW_INVENTORY_ENTRIES}-entry capacity bound; activation evidence is inconclusive.`,
+    );
   }
   const workflowIds = new Set();
   for (const [index, workflow] of workflows.entries()) {
     assertPositiveInteger(workflow?.id, `${repo.slug} Actions workflow ${index}.id`);
     if (workflowIds.has(workflow.id)) {
-      throw new Error(`${repo.slug} Actions workflow inventory contains duplicate IDs.`);
+      throw new RetryableHandoffEvidenceUnstableError(
+        `${repo.slug} Actions workflow inventory contains duplicate IDs.`,
+      );
     }
     workflowIds.add(workflow.id);
     assertRepoRelativeWorkflowPath(
@@ -2373,13 +2696,23 @@ function validateActionsWorkflowInventoryPages(pages, repo) {
   return workflows;
 }
 
-async function loadStableActionsWorkflowInventory(repo) {
+async function loadStableActionsWorkflowInventory(
+  repo,
+  { deadlineAt = undefined, deadlineLabel = undefined } = {},
+) {
   const endpoint =
     `repos/${encodeEndpointPath(repo.slug)}/actions/workflows?per_page=100`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const pages = await ghJson(endpoint, { paginate: true });
+    const pages = await ghJson(endpoint, {
+      paginate: true,
+      deadlineAt,
+      deadlineLabel,
+    });
     const workflows = validateActionsWorkflowInventoryPages(pages, repo);
-    const firstPage = await ghJson(`${endpoint}&page=1`);
+    const firstPage = await ghJson(`${endpoint}&page=1`, {
+      deadlineAt,
+      deadlineLabel,
+    });
     if (
       Array.isArray(firstPage?.workflows) &&
       Array.isArray(pages[0]?.workflows) &&
@@ -2388,14 +2721,21 @@ async function loadStableActionsWorkflowInventory(repo) {
       return workflows;
     }
   }
-  throw new Error(
+  throw new RetryableHandoffEvidenceUnstableError(
     `${repo.slug} Actions workflow inventory changed during horizon revalidation; the result is inconclusive and no next write is allowed.`,
   );
 }
 
-async function loadActiveCanonicalWorkflowById(repo, workflowId, expectedPath, label) {
+async function loadActiveCanonicalWorkflowById(
+  repo,
+  workflowId,
+  expectedPath,
+  label,
+  { deadlineAt = undefined, deadlineLabel = undefined } = {},
+) {
   const workflow = await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}`,
+    { deadlineAt, deadlineLabel },
   );
   if (
     workflow?.id !== workflowId ||
@@ -2409,8 +2749,14 @@ async function loadActiveCanonicalWorkflowById(repo, workflowId, expectedPath, l
   return workflowId;
 }
 
-async function loadActiveCanonicalLegacyBridgeWorkflowId(repo) {
-  const workflows = await loadStableActionsWorkflowInventory(repo);
+async function loadActiveCanonicalLegacyBridgeWorkflowId(
+  repo,
+  { deadlineAt = undefined, deadlineLabel = undefined } = {},
+) {
+  const workflows = await loadStableActionsWorkflowInventory(repo, {
+    deadlineAt,
+    deadlineLabel,
+  });
   const matches = workflows.filter(
     (workflow) => workflow.path === CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
   );
@@ -2428,16 +2774,17 @@ async function loadActiveCanonicalLegacyBridgeWorkflowId(repo) {
     bridge.id,
     CANONICAL_WORKFLOW_IDENTITIES.legacy_bridge.path,
     "canonical legacy bridge",
+    { deadlineAt, deadlineLabel },
   );
 }
 
 function legacyWriterScanDeadlineError(repo, writer, timeoutMs) {
-  return new Error(
+  return new RetryableHandoffEvidenceUnstableError(
     `${repo.slug} ${writer} complete legacy-writer scan exceeded its ${timeoutMs}ms total deadline; the result is inconclusive and no next write is allowed.`,
   );
 }
 
-export async function scanLegacyWriterRuns(
+async function scanWorkflowRunInventory(
   repo,
   workflowId,
   writer,
@@ -2445,13 +2792,23 @@ export async function scanLegacyWriterRuns(
     now = performance.now.bind(performance),
     timeoutMs = LEGACY_WRITER_SCAN_TIMEOUT_MS,
     readPage = ghJson,
+    requireTerminal = true,
+    includeStatus = false,
+    deadlineAt = undefined,
+    deadlineLabel = undefined,
   } = {},
 ) {
   if (
     typeof now !== "function" ||
     typeof readPage !== "function" ||
     !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs <= 0
+    timeoutMs <= 0 ||
+    typeof requireTerminal !== "boolean" ||
+    typeof includeStatus !== "boolean" ||
+    (deadlineAt !== undefined &&
+      (!Number.isFinite(deadlineAt) ||
+        typeof deadlineLabel !== "string" ||
+        deadlineLabel === ""))
   ) {
     throw new Error("Legacy writer scan runtime configuration is invalid.");
   }
@@ -2459,12 +2816,18 @@ export async function scanLegacyWriterRuns(
   if (!Number.isFinite(startedAt)) {
     throw new Error("Legacy writer scan clock returned an invalid start time.");
   }
-  const deadlineAt = startedAt + timeoutMs;
-  if (!Number.isFinite(deadlineAt)) {
+  const localDeadlineAt = startedAt + timeoutMs;
+  if (!Number.isFinite(localDeadlineAt)) {
     throw new Error("Legacy writer scan deadline is invalid.");
   }
-  const deadlineLabel =
+  const localDeadlineLabel =
     `${repo.slug} ${writer} ${timeoutMs}ms complete legacy-writer scan`;
+  const externalDeadlineWins =
+    deadlineAt !== undefined && deadlineAt <= localDeadlineAt;
+  const effectiveDeadlineAt = externalDeadlineWins ? deadlineAt : localDeadlineAt;
+  const effectiveDeadlineLabel = externalDeadlineWins
+    ? deadlineLabel
+    : localDeadlineLabel;
   let lastObservedAt = startedAt;
   const assertWithinDeadline = () => {
     const observedAt = now();
@@ -2472,18 +2835,24 @@ export async function scanLegacyWriterRuns(
       throw new Error("Legacy writer scan clock is invalid or moved backwards.");
     }
     lastObservedAt = observedAt;
-    if (observedAt >= deadlineAt) {
+    if (observedAt >= effectiveDeadlineAt) {
+      if (externalDeadlineWins) {
+        throw new DeadlineExceededError(effectiveDeadlineLabel);
+      }
       throw legacyWriterScanDeadlineError(repo, writer, timeoutMs);
     }
   };
   const endpoint =
     `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/runs?per_page=${LEGACY_WRITER_RUN_PAGE_SIZE}`;
-  const accumulator = createLegacyWriterRunInventoryAccumulator(repo, writer);
+  const accumulator = createLegacyWriterRunInventoryAccumulator(repo, writer, {
+    requireTerminal,
+    includeStatus,
+  });
   for (let page = 1; ; page += 1) {
     assertWithinDeadline();
     const response = await readPage(`${endpoint}&page=${page}`, {
-      deadlineAt,
-      deadlineLabel,
+      deadlineAt: effectiveDeadlineAt,
+      deadlineLabel: effectiveDeadlineLabel,
     });
     assertWithinDeadline();
     const complete = accumulator.addPage(response);
@@ -2491,7 +2860,24 @@ export async function scanLegacyWriterRuns(
   }
 }
 
-async function assertLegacyProducerDrained(repo) {
+export async function scanLegacyWriterRuns(
+  repo,
+  workflowId,
+  writer,
+  options = undefined,
+) {
+  return scanWorkflowRunInventory(repo, workflowId, writer, options);
+}
+
+async function assertLegacyProducerDrained(
+  repo,
+  {
+    deadlineAt = undefined,
+    deadlineLabel = undefined,
+    writerScanTimeoutMs =
+      repo.legacy_writer_scan_timeout_ms ?? LEGACY_WRITER_SCAN_TIMEOUT_MS,
+  } = {},
+) {
   // The verifier retained the old producer's Actions workflow ID by replacing
   // .github/workflows/codex-review-gate.yml in place. The temporary bridge is
   // a second, independently identified legacy-status writer and shares its
@@ -2503,8 +2889,9 @@ async function assertLegacyProducerDrained(repo) {
       repo.canary.v2_workflow_id,
       CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
       "retained canonical producer",
+      { deadlineAt, deadlineLabel },
     ),
-    loadActiveCanonicalLegacyBridgeWorkflowId(repo),
+    loadActiveCanonicalLegacyBridgeWorkflowId(repo, { deadlineAt, deadlineLabel }),
   ]);
   const writers = await Promise.all(
     [
@@ -2518,18 +2905,33 @@ async function assertLegacyProducerDrained(repo) {
       // nonterminal states locally without accumulating full run payloads.
       return {
         workflow_id: workflowId,
-        execution_epoch: await scanLegacyWriterRuns(repo, workflowId, writer),
+        execution_epoch: await scanLegacyWriterRuns(repo, workflowId, writer, {
+          timeoutMs: writerScanTimeoutMs,
+          deadlineAt,
+          deadlineLabel,
+        }),
       };
     }),
   );
   return writers;
 }
 
-async function loadStableLegacyStatusProjection(repo, endpoint) {
+async function loadStableLegacyStatusProjection(
+  repo,
+  endpoint,
+  { deadlineAt = undefined, deadlineLabel = undefined } = {},
+) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const pages = await ghJson(endpoint, { paginate: true });
+    const pages = await ghJson(endpoint, {
+      paginate: true,
+      deadlineAt,
+      deadlineLabel,
+    });
     const projection = validateLegacyStatusPages(pages, repo);
-    const firstPage = await ghJson(`${endpoint}&page=1`);
+    const firstPage = await ghJson(`${endpoint}&page=1`, {
+      deadlineAt,
+      deadlineLabel,
+    });
     if (
       Array.isArray(firstPage) &&
       Array.isArray(pages[0]) &&
@@ -2538,33 +2940,383 @@ async function loadStableLegacyStatusProjection(repo, endpoint) {
       return projection;
     }
   }
-  throw new Error(
+  throw new RetryableHandoffEvidenceUnstableError(
     `${repo.slug} commit-status pagination horizon changed during revalidation; the result is inconclusive and no next write is allowed.`,
   );
 }
 
-async function loadLegacyStatusEvidence(repo) {
+function legacyEvidenceDeadlineError(repo, timeoutMs) {
+  return new Error(
+    `${repo.slug} legacy status evidence remained unstable for ${timeoutMs}ms; recovery_code=legacy-writer-evidence-unstable. Keep legacy protection active, wait for writers to drain or repair the named evidence drift, then run a fresh activation preview.`,
+  );
+}
+
+export async function loadLegacyStatusEvidence(
+  repo,
+  {
+    evidenceTimeoutMs = LEGACY_EVIDENCE_STABILITY_TIMEOUT_MS,
+    retryIntervalMs = ACTIVATION_STABILITY_INTERVAL_MS,
+    now = performance.now.bind(performance),
+    sleep = delay,
+    loadWriterEpoch = undefined,
+    loadStatusProjection = undefined,
+  } = {},
+) {
+  if (
+    !Number.isSafeInteger(evidenceTimeoutMs) ||
+    evidenceTimeoutMs < LEGACY_WRITER_SCAN_TIMEOUT_MS ||
+    evidenceTimeoutMs > MAX_LEGACY_EVIDENCE_STABILITY_TIMEOUT_MS ||
+    !Number.isSafeInteger(retryIntervalMs) ||
+    retryIntervalMs < 0 ||
+    typeof now !== "function" ||
+    typeof sleep !== "function" ||
+    (loadWriterEpoch !== undefined && typeof loadWriterEpoch !== "function") ||
+    (loadStatusProjection !== undefined && typeof loadStatusProjection !== "function")
+  ) {
+    throw new Error("Legacy status evidence runtime configuration is invalid.");
+  }
   const endpoint = `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/statuses?per_page=100`;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    // GitHub does not expose an atomic cross-resource snapshot. Keep the
-    // status decision inside two complete terminal writer epochs, then read a
-    // second full status projection after the latter epoch. Any new completed
-    // run, rerun, or status-list change forces a bounded retry rather than
-    // authorizing a stale legacy success.
-    const writerEpochBefore = await assertLegacyProducerDrained(repo);
-    const statusBefore = await loadStableLegacyStatusProjection(repo, endpoint);
-    const writerEpochAfter = await assertLegacyProducerDrained(repo);
-    const statusAfter = await loadStableLegacyStatusProjection(repo, endpoint);
-    if (
-      canonicalJson(writerEpochBefore) === canonicalJson(writerEpochAfter) &&
-      canonicalJson(statusBefore) === canonicalJson(statusAfter)
-    ) {
-      return statusAfter;
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) {
+    throw new Error("Legacy status evidence clock returned an invalid start time.");
+  }
+  const localDeadlineAt = startedAt + evidenceTimeoutMs;
+  if (!Number.isFinite(localDeadlineAt)) {
+    throw new Error("Legacy status evidence deadline is invalid.");
+  }
+  const localDeadlineLabel =
+    `${repo.slug} ${evidenceTimeoutMs}ms legacy status evidence stability`;
+  const inherited = ghDeadlineContext.getStore();
+  const externalDeadlineWins =
+    inherited !== undefined && inherited.deadlineAt < localDeadlineAt;
+  const deadlineAt = externalDeadlineWins
+    ? inherited.deadlineAt
+    : localDeadlineAt;
+  const deadlineLabel = externalDeadlineWins
+    ? inherited.deadlineLabel
+    : localDeadlineLabel;
+  const readerOptions = { deadlineAt, deadlineLabel };
+  const readWriterEpoch =
+    loadWriterEpoch ??
+    ((options) =>
+      assertLegacyProducerDrained(repo, {
+        ...options,
+        writerScanTimeoutMs:
+          repo.legacy_writer_scan_timeout_ms ?? LEGACY_WRITER_SCAN_TIMEOUT_MS,
+      }));
+  const readStatusProjection =
+    loadStatusProjection ??
+    ((options) => loadStableLegacyStatusProjection(repo, endpoint, options));
+  let lastObservedAt = startedAt;
+  const remaining = () => {
+    const observedAt = now();
+    if (!Number.isFinite(observedAt) || observedAt < lastObservedAt) {
+      throw new Error("Legacy status evidence clock is invalid or moved backwards.");
+    }
+    lastObservedAt = observedAt;
+    return deadlineAt - observedAt;
+  };
+
+  for (;;) {
+    if (remaining() <= 0) {
+      if (externalDeadlineWins) throw new DeadlineExceededError(deadlineLabel);
+      throw legacyEvidenceDeadlineError(repo, evidenceTimeoutMs);
+    }
+    try {
+      const result = await withGhDeadline(deadlineAt, deadlineLabel, async () => {
+        // GitHub does not expose an atomic cross-resource snapshot. Keep the
+        // status decision inside two complete terminal writer epochs, then read a
+        // second full status projection after the latter epoch. Any new completed
+        // run, rerun, or status-list change forces a bounded retry rather than
+        // authorizing a stale legacy success.
+        const writerEpochBefore = await readWriterEpoch(readerOptions);
+        const statusBefore = await readStatusProjection(readerOptions);
+        const writerEpochAfter = await readWriterEpoch(readerOptions);
+        const statusAfter = await readStatusProjection(readerOptions);
+        if (
+          canonicalJson(writerEpochBefore) !== canonicalJson(writerEpochAfter) ||
+          canonicalJson(statusBefore) !== canonicalJson(statusAfter)
+        ) {
+          throw new RetryableHandoffEvidenceUnstableError(
+            `${repo.slug} commit-status or legacy-writer execution horizon changed during revalidation; the result is inconclusive and no next write is allowed.`,
+          );
+        }
+        return statusAfter;
+      });
+      if (remaining() <= 0) {
+        if (externalDeadlineWins) throw new DeadlineExceededError(deadlineLabel);
+        throw legacyEvidenceDeadlineError(repo, evidenceTimeoutMs);
+      }
+      return result;
+    } catch (error) {
+      if (
+        !(error instanceof RetryableHandoffEvidenceUnstableError) &&
+        !(error instanceof DeadlineExceededError)
+      ) {
+        throw error;
+      }
+      const remainingMs = remaining();
+      if (error instanceof DeadlineExceededError && externalDeadlineWins) {
+        throw error;
+      }
+      if (remainingMs <= 0 || error instanceof DeadlineExceededError) {
+        throw legacyEvidenceDeadlineError(repo, evidenceTimeoutMs);
+      }
+      await sleep(Math.min(retryIntervalMs, remainingMs));
     }
   }
-  throw new Error(
-    `${repo.slug} commit-status or legacy-writer execution horizon changed during revalidation; the result is inconclusive and no next write is allowed.`,
+}
+
+function activationSchedulerRepository(manifest) {
+  const matches = manifest.repositories.filter(
+    (repo) => repo.slug === ACTIVATION_SCHEDULER_REPOSITORY,
   );
+  if (matches.length !== 1 || matches[0].scheduler_quiescence === null) {
+    throw new Error(
+      `Validated manifest does not bind one activation scheduler in ${ACTIVATION_SCHEDULER_REPOSITORY}.`,
+    );
+  }
+  return matches[0];
+}
+
+function activationSchedulerEndpoint(repo, workflowId, operation) {
+  if (!new Set(["disable", "enable"]).has(operation)) {
+    throw new Error("Activation scheduler operation is unsupported.");
+  }
+  return `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${workflowId}/${operation}`;
+}
+
+async function loadActivationSchedulerSnapshot(
+  manifest,
+  {
+    expectedState,
+    requireCanaryBase = true,
+    deadlineAt = undefined,
+    deadlineLabel = undefined,
+  } = {},
+) {
+  const expectedStates = Array.isArray(expectedState)
+    ? expectedState
+    : [expectedState];
+  if (
+    expectedStates.length === 0 ||
+    expectedStates.some(
+      (state) => !new Set(["active", "disabled_manually"]).has(state),
+    )
+  ) {
+    throw new Error("Activation scheduler expected state is unsupported.");
+  }
+  const repo = activationSchedulerRepository(manifest);
+  const scheduler = repo.scheduler_quiescence;
+  const [metadata, defaultBranch] = await Promise.all([
+    ghJson(`repos/${encodeEndpointPath(repo.slug)}`, {
+      deadlineAt,
+      deadlineLabel,
+    }),
+    loadDefaultBranchHead(repo, { requireCanaryBase }),
+  ]);
+  const identity = {
+    full_name: metadata?.full_name,
+    id: metadata?.id,
+    node_id: metadata?.node_id,
+    default_branch: metadata?.default_branch,
+  };
+  assertExactSnapshot(
+    identity,
+    {
+      full_name: repo.slug,
+      id: repo.id,
+      node_id: repo.node_id,
+      default_branch: repo.default_branch,
+    },
+    `${repo.slug} activation scheduler repository identity`,
+  );
+  const workflowInventory = await loadWorkflowInventoryEvidence(
+    repo,
+    defaultBranch.head_sha,
+  );
+  const workflow = await ghJson(
+    `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${scheduler.workflow_id}`,
+    { deadlineAt, deadlineLabel },
+  );
+  if (
+    workflow?.id !== scheduler.workflow_id ||
+    workflow?.path !== scheduler.workflow.path ||
+    !expectedStates.includes(workflow?.state)
+  ) {
+    throw new Error(
+      `${repo.slug} activation scheduler is not bound to one exact ${expectedStates.join(" or ")} workflow identity.`,
+    );
+  }
+  if (
+    canonicalJson(workflowInventory.scheduler_quiescence) !==
+    canonicalJson(scheduler.workflow)
+  ) {
+    throw new Error(
+      `${repo.slug} activation scheduler source identity is not bound to the manifest.`,
+    );
+  }
+  return {
+    repository: identity,
+    default_branch: defaultBranch,
+    workflow: {
+      id: workflow.id,
+      path: workflow.path,
+      state: workflow.state,
+      source: workflowInventory.scheduler_quiescence,
+    },
+  };
+}
+
+function schedulerDrainDeadlineError(repo, timeoutMs) {
+  return new Error(
+    `${repo.slug} activation scheduler did not complete its bound source, control-plane, and stable terminal execution evidence within ${timeoutMs}ms. It remains disabled_manually. Do not activate v2; wait for the already-started run to finish or inspect it, then use a fresh quiesce preview or explicit restore as appropriate.`,
+  );
+}
+
+function activationSchedulerSnapshotDeadlineError(repo, timeoutMs) {
+  return new Error(
+    `${repo.slug} activation scheduler snapshot could not complete within ${timeoutMs}ms; recovery_code=activation-scheduler-snapshot-timeout. Do not make an activation decision from this incomplete observation; inspect the scheduler state, then use a fresh quiesce, activation, or restore preview as appropriate.`,
+  );
+}
+
+function schedulerRunsAreTerminal(inventory) {
+  return inventory.executions.every((execution) => execution.status === "completed");
+}
+
+async function loadStableActivationSchedulerDrain(
+  manifest,
+  {
+    now = performance.now.bind(performance),
+    sleep = delay,
+    retryIntervalMs = ACTIVATION_STABILITY_INTERVAL_MS,
+  } = {},
+) {
+  if (
+    typeof now !== "function" ||
+    typeof sleep !== "function" ||
+    !Number.isSafeInteger(retryIntervalMs) ||
+    retryIntervalMs < 0
+  ) {
+    throw new Error("Activation scheduler drain runtime configuration is invalid.");
+  }
+  const repo = activationSchedulerRepository(manifest);
+  const scheduler = repo.scheduler_quiescence;
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) {
+    throw new Error("Activation scheduler drain clock returned an invalid start time.");
+  }
+  const localDeadlineAt = startedAt + scheduler.drain_timeout_ms;
+  if (!Number.isFinite(localDeadlineAt)) {
+    throw new Error("Activation scheduler drain deadline is invalid.");
+  }
+  const localDeadlineLabel =
+    `${repo.slug} ${scheduler.drain_timeout_ms}ms activation scheduler drain`;
+  const inherited = ghDeadlineContext.getStore();
+  const externalDeadlineWins =
+    inherited !== undefined && inherited.deadlineAt < localDeadlineAt;
+  const deadlineAt = externalDeadlineWins
+    ? inherited.deadlineAt
+    : localDeadlineAt;
+  const deadlineLabel = externalDeadlineWins
+    ? inherited.deadlineLabel
+    : localDeadlineLabel;
+  let lastObservedAt = startedAt;
+  const remaining = () => {
+    const observedAt = now();
+    if (!Number.isFinite(observedAt) || observedAt < lastObservedAt) {
+      throw new Error("Activation scheduler drain clock is invalid or moved backwards.");
+    }
+    lastObservedAt = observedAt;
+    return deadlineAt - observedAt;
+  };
+  const loadInventory = () =>
+    scanWorkflowRunInventory(
+      repo,
+      scheduler.workflow_id,
+      "activation scheduler",
+      {
+        timeoutMs: scheduler.drain_timeout_ms,
+        requireTerminal: false,
+        includeStatus: true,
+        deadlineAt,
+        deadlineLabel,
+      },
+    );
+
+  for (;;) {
+    if (remaining() <= 0) {
+      if (externalDeadlineWins) throw new DeadlineExceededError(deadlineLabel);
+      throw schedulerDrainDeadlineError(repo, scheduler.drain_timeout_ms);
+    }
+    try {
+      const epoch = await withGhDeadline(deadlineAt, deadlineLabel, async () => {
+        const first = await loadInventory();
+        if (!schedulerRunsAreTerminal(first)) {
+          throw new RetryableHandoffEvidenceUnstableError(
+            `${repo.slug} activation scheduler still has nonterminal runs.`,
+          );
+        }
+        await sleep(Math.min(retryIntervalMs, Math.max(0, remaining())));
+        const second = await loadInventory();
+        if (
+          !schedulerRunsAreTerminal(second) ||
+          canonicalJson(first) !== canonicalJson(second)
+        ) {
+          throw new RetryableHandoffEvidenceUnstableError(
+            `${repo.slug} activation scheduler execution epoch changed during drain revalidation.`,
+          );
+        }
+        return second;
+      });
+      if (remaining() <= 0) {
+        if (externalDeadlineWins) throw new DeadlineExceededError(deadlineLabel);
+        throw schedulerDrainDeadlineError(repo, scheduler.drain_timeout_ms);
+      }
+      return epoch;
+    } catch (error) {
+      if (
+        !(error instanceof RetryableHandoffEvidenceUnstableError) &&
+        !(error instanceof DeadlineExceededError)
+      ) {
+        throw error;
+      }
+      const remainingMs = remaining();
+      if (error instanceof DeadlineExceededError && externalDeadlineWins) {
+        throw error;
+      }
+      if (remainingMs <= 0 || error instanceof DeadlineExceededError) {
+        throw schedulerDrainDeadlineError(repo, scheduler.drain_timeout_ms);
+      }
+      await sleep(Math.min(retryIntervalMs, remainingMs));
+    }
+  }
+}
+
+async function loadQuiescedActivationSchedulerEvidence(
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined, snapshotRuntime = runtime } = {},
+) {
+  const before = await loadBoundedActivationSchedulerSnapshot(
+    manifest,
+    snapshotRuntime,
+    { expectedState: "disabled_manually" },
+    { outerDeadlineAt },
+  );
+  const executionEpoch = await loadStableActivationSchedulerDrain(manifest, runtime);
+  const after = await loadBoundedActivationSchedulerSnapshot(
+    manifest,
+    snapshotRuntime,
+    { expectedState: "disabled_manually" },
+    { outerDeadlineAt },
+  );
+  if (canonicalJson(before) !== canonicalJson(after)) {
+    throw new RetryableHandoffEvidenceUnstableError(
+      `${before.repository.full_name} activation scheduler control-plane changed while its execution epoch drained.`,
+    );
+  }
+  return { ...after, execution_epoch: executionEpoch };
 }
 
 function rulesetLegacyContextCount(writable, label) {
@@ -2619,6 +3371,11 @@ async function loadLocalRepositoryRulesets(repo) {
     throw new Error(`${repo.slug} local ruleset inventory pagination is malformed.`);
   }
   const summaries = response.flat();
+  if (summaries.length > MAX_LOCAL_REPOSITORY_RULESETS) {
+    throw new Error(
+      `${repo.slug} local ruleset inventory exceeds the ${MAX_LOCAL_REPOSITORY_RULESETS}-ruleset capacity bound; activation evidence is inconclusive.`,
+    );
+  }
   const ids = summaries.map((summary, index) => {
     assertPlainObject(summary, `${repo.slug} local ruleset summary ${index}`);
     assertPositiveInteger(summary.id, `${repo.slug} local ruleset summary ${index}.id`);
@@ -2901,7 +3658,11 @@ function classifyCleanupSurface(action, actual) {
 
 async function loadRepositoryEvidence(
   repo,
-  { requireCanaryEvidence = true, manifest } = {},
+  {
+    requireCanaryEvidence = true,
+    manifest,
+    legacyEvidenceRuntime = undefined,
+  } = {},
 ) {
   if (manifest === undefined) {
     throw new Error("Repository evidence requires the validated handoff manifest.");
@@ -2924,7 +3685,11 @@ async function loadRepositoryEvidence(
     ? Promise.allSettled([
         loadCanaryPull(repo),
         loadV2CanaryEvidence(repo),
-        loadLegacyStatusEvidence(repo),
+        loadLegacyStatusEvidence(repo, {
+          ...(legacyEvidenceRuntime ?? {}),
+          evidenceTimeoutMs:
+            manifest.activation.legacy_evidence_stability_timeout_ms,
+        }),
       ]).then((results) => {
         const rejected = results.find((result) => result.status === "rejected");
         if (rejected !== undefined) throw rejected.reason;
@@ -3017,6 +3782,7 @@ async function loadRepositoryEvidence(
     default_branch: defaultBranch,
     workflows: workflowControlPlane.canonical,
     workflow_inventory: workflowControlPlane.inventory,
+    scheduler_quiescence: workflowControlPlane.scheduler_quiescence,
     codeowners,
     actions_workflow_permissions: actionsWorkflowPermissions,
     v2_ruleset: v2Ruleset,
@@ -3037,12 +3803,24 @@ async function loadRepositoryEvidence(
   };
 }
 
-export async function mapWithConcurrency(items, limit, mapper) {
-  if (!Array.isArray(items) || !Number.isSafeInteger(limit) || limit <= 0) {
+export async function mapWithConcurrency(
+  items,
+  limit,
+  mapper,
+  { onFirstFailure = undefined } = {},
+) {
+  if (
+    !Array.isArray(items) ||
+    !Number.isSafeInteger(limit) ||
+    limit <= 0
+  ) {
     throw new Error("Bounded mapper requires an array and positive safe-integer limit.");
   }
   if (typeof mapper !== "function") {
     throw new Error("Bounded mapper requires a mapper function.");
+  }
+  if (onFirstFailure !== undefined && typeof onFirstFailure !== "function") {
+    throw new Error("Bounded mapper first-failure callback must be a function.");
   }
   const results = new Array(items.length);
   let next = 0;
@@ -3058,7 +3836,10 @@ export async function mapWithConcurrency(items, limit, mapper) {
         try {
           results[index] = await mapper(items[index], index);
         } catch (error) {
-          if (firstError === null) firstError = error;
+          if (firstError === null) {
+            firstError = error;
+            onFirstFailure?.(error);
+          }
           return;
         }
       }
@@ -3068,33 +3849,384 @@ export async function mapWithConcurrency(items, limit, mapper) {
   return results;
 }
 
+async function awaitCoverageEvidence(organizationFactory, repositoriesFactory) {
+  // Do not let one evidence branch reject while the other continues in the
+  // background. A subsequent stable-read retry must not overlap stale scans
+  // or inherit their API work after the caller has already handled an error.
+  // Preserve the earliest observed failure even when a repository mapper waits
+  // for another already-started worker before its aggregate promise rejects.
+  let failureCaptured = false;
+  let firstFailure;
+  const recordFirstFailure = (error) => {
+    if (!failureCaptured) {
+      failureCaptured = true;
+      firstFailure = error;
+    }
+  };
+  const settle = async (factory) => {
+    try {
+      return await factory(recordFirstFailure);
+    } catch (error) {
+      recordFirstFailure(error);
+      return undefined;
+    }
+  };
+  const [organization, repositories] = await Promise.all([
+    settle(organizationFactory),
+    settle(repositoriesFactory),
+  ]);
+  if (failureCaptured) {
+    throw firstFailure;
+  }
+  return { organization, repositories };
+}
+
 async function loadCoverageRound(
   manifest,
-  { requireCanaryEvidence = true } = {},
+  { requireCanaryEvidence = true, legacyEvidenceRuntime = undefined } = {},
 ) {
-  const [organization, repositories] = await Promise.all([
-    loadOrganizationRound(manifest),
-    mapWithConcurrency(
-      manifest.repositories,
-      REPOSITORY_EVIDENCE_CONCURRENCY,
-      (repo) =>
-        loadRepositoryEvidence(repo, { requireCanaryEvidence, manifest }),
+  const coverage = await awaitCoverageEvidence(
+    () => loadOrganizationRound(manifest),
+    (onFirstFailure) =>
+      mapWithConcurrency(
+        manifest.repositories,
+        REPOSITORY_EVIDENCE_CONCURRENCY,
+        (repo) =>
+          loadRepositoryEvidence(repo, {
+            requireCanaryEvidence,
+            manifest,
+            legacyEvidenceRuntime,
+          }),
+        { onFirstFailure },
+      ),
+  );
+  assertEffectiveOrganizationGateCoverage(coverage, manifest);
+  return coverage;
+}
+
+function activationCoverageDeadlineError(label, timeoutMs) {
+  return new Error(
+    `${label} remained unstable for ${timeoutMs}ms; recovery_code=activation-coverage-evidence-unstable. Keep v1 protection active, repair or wait for the named evidence drift, then start a fresh quiesce/activation preview.`,
+  );
+}
+
+function activationCoverageRoundDeadlineError(label, timeoutMs) {
+  return new Error(
+    `${label} could not complete one activation coverage round within ${timeoutMs}ms; recovery_code=activation-coverage-evidence-unstable. Keep v1 protection active, repair or wait for the named evidence drift, then start a fresh quiesce/activation preview.`,
+  );
+}
+
+function activationRepositoryEvidenceDeadlineError(repo, timeoutMs) {
+  return new Error(
+    `${repo.slug} could not complete its activation repository evidence within ${timeoutMs}ms; recovery_code=activation-repository-evidence-timeout. Keep v1 protection active, repair or wait for the named control-plane or canary evidence drift, then start a fresh quiesce/activation preview.`,
+  );
+}
+
+function activationOrganizationEvidenceDeadlineError(timeoutMs) {
+  return new Error(
+    `Organization activation control-plane evidence could not complete within ${timeoutMs}ms; recovery_code=activation-organization-evidence-timeout. Keep v1 protection active, repair or wait for the named organization evidence drift, then start a fresh quiesce/activation preview.`,
+  );
+}
+
+function activationSnapshotRuntime(runtime) {
+  const supplied = runtime?.stableSnapshotOptions ?? runtime ?? {};
+  const sleep = supplied.sleep ?? delay;
+  const intervalMs = supplied.intervalMs ?? ACTIVATION_STABILITY_INTERVAL_MS;
+  const now = supplied.now ?? performance.now.bind(performance);
+  if (
+    typeof sleep !== "function" ||
+    typeof now !== "function" ||
+    !Number.isSafeInteger(intervalMs) ||
+    intervalMs < 0
+  ) {
+    throw new Error("Activation stable snapshot runtime configuration is invalid.");
+  }
+  return { sleep, now, intervalMs };
+}
+
+function activationSchedulerStableSnapshotOptions(manifest, runtime) {
+  const supplied = runtime?.stableSnapshotOptions ?? {};
+  const { intervalMs } = activationSnapshotRuntime(runtime);
+  const timeoutMs = supplied.timeoutMs ?? 60_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < intervalMs) {
+    return supplied;
+  }
+  return {
+    ...supplied,
+    timeoutMs: Math.max(
+      timeoutMs,
+      2 * manifest.activation.scheduler_snapshot_timeout_ms + intervalMs,
     ),
-  ]);
-  const snapshot = { organization, repositories };
-  assertEffectiveOrganizationGateCoverage(snapshot, manifest);
+  };
+}
+
+async function loadBoundedActivationPhase(
+  runtime,
+  {
+    timeoutMs,
+    outerDeadlineAt = undefined,
+    label,
+    onOwnDeadline,
+    loader,
+  },
+) {
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    typeof label !== "string" ||
+    label === "" ||
+    typeof onOwnDeadline !== "function" ||
+    typeof loader !== "function" ||
+    (outerDeadlineAt !== undefined && !Number.isFinite(outerDeadlineAt))
+  ) {
+    throw new Error("Activation bounded phase configuration is invalid.");
+  }
+  const { now } = activationSnapshotRuntime(runtime);
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) {
+    throw new Error(`${label} clock returned an invalid start time.`);
+  }
+  const ownDeadlineAt = startedAt + timeoutMs;
+  if (!Number.isFinite(ownDeadlineAt)) {
+    throw new Error(`${label} deadline is invalid.`);
+  }
+  const deadlineAt =
+    outerDeadlineAt === undefined
+      ? ownDeadlineAt
+      : Math.min(outerDeadlineAt, ownDeadlineAt);
+  const ownDeadlineWins = ownDeadlineAt <= deadlineAt;
+  const ownDeadlineError = () => {
+    const error = onOwnDeadline();
+    if (!(error instanceof Error)) {
+      throw new Error(`${label} own-deadline callback must return an Error.`);
+    }
+    return error;
+  };
+  if (deadlineAt <= startedAt) {
+    if (ownDeadlineWins) throw ownDeadlineError();
+    throw new DeadlineExceededError(label);
+  }
+  try {
+    const result = await withGhDeadline(deadlineAt, label, () => loader(deadlineAt));
+    const completedAt = now();
+    if (!Number.isFinite(completedAt)) {
+      throw new Error(`${label} clock returned an invalid completion time.`);
+    }
+    if (completedAt >= deadlineAt) {
+      if (ownDeadlineWins) throw ownDeadlineError();
+      throw new DeadlineExceededError(label);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof DeadlineExceededError && ownDeadlineWins) {
+      throw ownDeadlineError();
+    }
+    throw error;
+  }
+}
+
+async function loadBoundedActivationSchedulerSnapshot(
+  manifest,
+  runtime,
+  snapshotOptions,
+  { outerDeadlineAt = undefined } = {},
+) {
+  const repo = activationSchedulerRepository(manifest);
+  const timeoutMs = manifest.activation.scheduler_snapshot_timeout_ms;
+  return loadBoundedActivationPhase(runtime, {
+    timeoutMs,
+    outerDeadlineAt,
+    label: `${repo.slug} activation scheduler snapshot`,
+    onOwnDeadline: () =>
+      activationSchedulerSnapshotDeadlineError(repo, timeoutMs),
+    loader: () => loadActivationSchedulerSnapshot(manifest, snapshotOptions),
+  });
+}
+
+async function loadBoundedActivationSchedulerEvidence(
+  manifest,
+  schedulerRuntime,
+  { outerDeadlineAt = undefined, clockRuntime = schedulerRuntime } = {},
+) {
+  return loadQuiescedActivationSchedulerEvidence(manifest, schedulerRuntime, {
+    outerDeadlineAt,
+    snapshotRuntime: clockRuntime,
+  });
+}
+
+async function loadBoundedActivationRepositoryEvidence(
+  repo,
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined } = {},
+) {
+  const timeoutMs = manifest.activation.repository_evidence_timeout_ms;
+  return loadBoundedActivationPhase(runtime, {
+    timeoutMs,
+    outerDeadlineAt,
+    label: `${repo.slug} activation repository evidence`,
+    onOwnDeadline: () => activationRepositoryEvidenceDeadlineError(repo, timeoutMs),
+    loader: () =>
+      loadRepositoryEvidence(repo, {
+        manifest,
+        legacyEvidenceRuntime: runtime.legacyEvidenceRuntime,
+      }),
+  });
+}
+
+async function loadBoundedActivationOrganizationEvidence(
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined } = {},
+) {
+  const timeoutMs = manifest.activation.organization_evidence_timeout_ms;
+  return loadBoundedActivationPhase(runtime, {
+    timeoutMs,
+    outerDeadlineAt,
+    label: "Organization activation control-plane evidence",
+    onOwnDeadline: () => activationOrganizationEvidenceDeadlineError(timeoutMs),
+    loader: () => loadOrganizationRound(manifest),
+  });
+}
+
+async function loadActivationCoverageRound(
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined } = {},
+) {
+  const { sleep, now } = activationSnapshotRuntime(runtime);
+  const schedulerRuntime = { ...(runtime.schedulerDrainRuntime ?? {}) };
+  if (schedulerRuntime.sleep === undefined) schedulerRuntime.sleep = sleep;
+  if (schedulerRuntime.now === undefined) schedulerRuntime.now = now;
+  const scheduler = await loadBoundedActivationSchedulerEvidence(
+    manifest,
+    schedulerRuntime,
+    { outerDeadlineAt, clockRuntime: runtime },
+  );
+  const coverage = await awaitCoverageEvidence(
+    () =>
+      loadBoundedActivationOrganizationEvidence(manifest, runtime, {
+        outerDeadlineAt,
+      }),
+    (onFirstFailure) =>
+      mapWithConcurrency(
+        manifest.repositories,
+        REPOSITORY_EVIDENCE_CONCURRENCY,
+        (repo) =>
+          loadBoundedActivationRepositoryEvidence(repo, manifest, runtime, {
+            outerDeadlineAt,
+          }),
+        { onFirstFailure },
+      ),
+  );
+  assertEffectiveOrganizationGateCoverage(coverage, manifest);
+  return { ...coverage, activation_scheduler_quiescence: scheduler };
+}
+
+async function loadBoundedActivationCoverageRound(
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined, label },
+) {
+  const roundTimeoutMs = manifest.activation.coverage_round_timeout_ms;
+  return loadBoundedActivationPhase(runtime, {
+    timeoutMs: roundTimeoutMs,
+    outerDeadlineAt,
+    label: `${label} coverage round`,
+    onOwnDeadline: () => activationCoverageRoundDeadlineError(label, roundTimeoutMs),
+    loader: (deadlineAt) =>
+      loadActivationCoverageRound(manifest, runtime, { outerDeadlineAt: deadlineAt }),
+  });
+}
+
+async function loadStableActivationCoverage(manifest, runtime, label) {
+  const { sleep, now, intervalMs } = activationSnapshotRuntime(runtime);
+  const timeoutMs = manifest.activation.coverage_stability_timeout_ms;
+  const startedAt = now();
+  const deadlineAt = startedAt + timeoutMs;
+  if (!Number.isFinite(deadlineAt)) {
+    throw new Error("Activation coverage deadline is invalid.");
+  }
+  let lastObservedAt = startedAt;
+  const remaining = () => {
+    const observedAt = now();
+    if (!Number.isFinite(observedAt) || observedAt < lastObservedAt) {
+      throw new Error("Activation coverage clock is invalid or moved backwards.");
+    }
+    lastObservedAt = observedAt;
+    return deadlineAt - observedAt;
+  };
+  for (;;) {
+    if (remaining() <= 0) throw activationCoverageDeadlineError(label, timeoutMs);
+    try {
+      const snapshot = await withGhDeadline(deadlineAt, label, async () => {
+        const first = await loadBoundedActivationCoverageRound(manifest, runtime, {
+          outerDeadlineAt: deadlineAt,
+          label,
+        });
+        await sleep(Math.min(intervalMs, Math.max(0, remaining())));
+        const second = await loadBoundedActivationCoverageRound(manifest, runtime, {
+          outerDeadlineAt: deadlineAt,
+          label,
+        });
+        if (canonicalJson(first) !== canonicalJson(second)) {
+          throw new RetryableHandoffEvidenceUnstableError(
+            `${label} changed between complete activation coverage snapshots.`,
+          );
+        }
+        return first;
+      });
+      if (remaining() <= 0) throw activationCoverageDeadlineError(label, timeoutMs);
+      return snapshot;
+    } catch (error) {
+      if (!(error instanceof RetryableHandoffEvidenceUnstableError)) {
+        if (error instanceof DeadlineExceededError) {
+          throw activationCoverageDeadlineError(label, timeoutMs);
+        }
+        throw error;
+      }
+      const remainingMs = remaining();
+      if (remainingMs <= 0) throw activationCoverageDeadlineError(label, timeoutMs);
+      await sleep(Math.min(intervalMs, remainingMs));
+    }
+  }
+}
+
+async function loadActivationCoverageRevalidation(manifest, runtime, label) {
+  return loadBoundedActivationCoverageRound(manifest, runtime, { label });
+}
+
+async function loadRestoredActivationSchedulerSnapshot(manifest, runtime) {
+  const snapshot = await loadBoundedActivationSchedulerSnapshot(
+    manifest,
+    runtime,
+    {
+      expectedState: ["active", "disabled_manually"],
+      requireCanaryBase: false,
+    },
+  );
+  if (snapshot.workflow.state !== "active") {
+    throw new Error(
+      `${snapshot.repository.full_name} activation scheduler remains disabled_manually after activation; recovery_code=activation-scheduler-restore-required. Run a fresh restore-scheduler preview/apply, confirm its manifest-bound active readback, then restart the blocked post-activation preview.`,
+    );
+  }
   return snapshot;
 }
 
-async function loadPostActivationRound(manifest) {
-  const [coverage, legacyOnlyRepository] = await Promise.all([
+async function loadPostActivationRound(manifest, runtime) {
+  const [coverage, activationScheduler, legacyOnlyRepository] = await Promise.all([
     loadCoverageRound(manifest, { requireCanaryEvidence: false }),
+    loadRestoredActivationSchedulerSnapshot(manifest, runtime),
     loadLegacyOnlyRepositoryIdentity(
       manifest,
       "Legacy-only archived repository identity",
     ),
   ]);
-  return { ...coverage, legacy_only_repository: legacyOnlyRepository };
+  return {
+    ...coverage,
+    activation_scheduler: activationScheduler,
+    legacy_only_repository: legacyOnlyRepository,
+  };
 }
 
 function assertCleanupState(snapshot, requiredState) {
@@ -3314,12 +4446,17 @@ function readCliOptions(argv = process.argv.slice(2)) {
   }
   if (
     values.apply &&
-    !new Set(["stage", "activate", "apply-repository-cleanup", "verify"]).has(
-      values.mode,
-    )
+    !new Set([
+      "stage",
+      "quiesce-scheduler",
+      "activate",
+      "restore-scheduler",
+      "apply-repository-cleanup",
+      "verify",
+    ]).has(values.mode)
   ) {
     throw new Error(
-      "--apply is valid only with stage, activate, apply-repository-cleanup, or verify mode.",
+      "--apply is valid only with stage, quiesce-scheduler, activate, restore-scheduler, apply-repository-cleanup, or verify mode.",
     );
   }
   if (values["recover-created-v2"] && values.mode !== "stage") {
@@ -3357,7 +4494,9 @@ function printUsage() {
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode plan
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode stage [--apply --expected-plan-sha256 SHA256]
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode stage --recover-created-v2
+  node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode quiesce-scheduler [--apply --expected-plan-sha256 SHA256]
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode activate [--apply --expected-plan-sha256 SHA256]
+  node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode restore-scheduler [--apply --expected-plan-sha256 SHA256]
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode derive-cutover
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode apply-repository-cleanup [--apply --expected-plan-sha256 SHA256]
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode verify [--apply --expected-plan-sha256 SHA256]
@@ -3365,7 +4504,9 @@ function printUsage() {
 Modes:
   plan            Read two complete organization snapshots and report the bound phase.
   stage           Preview or create the exact Disabled v2 organization ruleset; --recover-created-v2 is the read-only recovery path for an ambiguous create.
-  activate        Require ${REQUIRED_REPOSITORY_COUNT}/${REQUIRED_REPOSITORY_COUNT} workflow, bridge, repo-ruleset, and canary proof; preview or activate v2.
+  quiesce-scheduler  Preview or temporarily disable and drain the manifest-bound private overlay scheduler before activation.
+  activate        Require a quiesced scheduler plus ${REQUIRED_REPOSITORY_COUNT}/${REQUIRED_REPOSITORY_COUNT} workflow, bridge, repo-ruleset, and canary proof; preview or activate v2.
+  restore-scheduler  Preview or re-enable the manifest-bound private overlay scheduler after activation or recovery.
   derive-cutover  Read-only derivation of remaining manifest-bound repository cleanup actions and the later organization cutover.
   apply-repository-cleanup  Preview or apply the remaining repository cleanup actions with per-action exact-before/readback checks.
   verify          Verify external repository cleanup; preview or apply removal of the whole legacy organization status rule, then close with two reads.
@@ -3662,6 +4803,225 @@ async function runStageMode(manifest, options, runtime) {
   }
 }
 
+function schedulerTransitionIdentity(snapshot) {
+  return {
+    repository: snapshot.repository,
+    default_branch: snapshot.default_branch,
+    workflow: {
+      id: snapshot.workflow.id,
+      path: snapshot.workflow.path,
+      source: snapshot.workflow.source,
+    },
+  };
+}
+
+function assertSchedulerTransition(before, after, expectedBefore, expectedAfter, label) {
+  if (
+    before.workflow.state !== expectedBefore ||
+    after.workflow.state !== expectedAfter ||
+    canonicalJson(schedulerTransitionIdentity(before)) !==
+      canonicalJson(schedulerTransitionIdentity(after))
+  ) {
+    throw new Error(
+      `${label} did not preserve the manifest-bound scheduler identity/source or exact expected state transition.`,
+    );
+  }
+}
+
+function schedulerModePlan(manifest, mode, snapshot, action) {
+  return {
+    mode,
+    manifest_sha256: sha256Canonical(manifest),
+    snapshot_sha256: sha256Canonical(snapshot),
+    action,
+  };
+}
+
+async function runQuiesceSchedulerMode(manifest, options, runtime) {
+  const repo = activationSchedulerRepository(manifest);
+  const scheduler = repo.scheduler_quiescence;
+  const label = "Activation scheduler quiesce precondition";
+  const snapshot = await loadStable(
+    label,
+    () =>
+      loadBoundedActivationSchedulerSnapshot(
+        manifest,
+        runtime,
+        { expectedState: "active" },
+      ),
+    activationSchedulerStableSnapshotOptions(manifest, runtime),
+  );
+  const action = mutationDescriptor(
+    "PUT",
+    activationSchedulerEndpoint(repo, scheduler.workflow_id, "disable"),
+  );
+  const plan = schedulerModePlan(manifest, "quiesce-scheduler", snapshot, action);
+  const digest = planDigest(plan);
+  assertExpectedPlan(options, digest);
+  if (!options.apply) {
+    return {
+      ...baseOutput("quiesce-scheduler", manifest, snapshot),
+      status: "preview",
+      applied: false,
+      plan_sha256: digest,
+      action,
+      scheduler_quiescence: snapshot,
+    };
+  }
+  await revalidateUnchangedBeforeMutation(label, snapshot, () =>
+    loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      { expectedState: "active" },
+    ),
+  );
+  let disabled;
+  try {
+    await ghJson(action.endpoint, { method: "PUT" });
+    disabled = await loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      { expectedState: "disabled_manually" },
+    );
+  } catch (error) {
+    try {
+      disabled = await loadBoundedActivationSchedulerSnapshot(
+        manifest,
+        runtime,
+        { expectedState: "disabled_manually" },
+      );
+    } catch (recoveryError) {
+      throw new Error(
+        `Activation scheduler disable outcome is unknown; recovery_code=activation-scheduler-state-unknown. Do not replay the disable request. Inspect the manifest-bound scheduler state, then run a fresh quiesce preview if it is active or restore-scheduler only if disabled_manually is intentional.`,
+        { cause: recoveryError ?? error },
+      );
+    }
+  }
+  try {
+    assertSchedulerTransition(snapshot, disabled, "active", "disabled_manually", label);
+    const schedulerRuntime = { ...(runtime.schedulerDrainRuntime ?? {}) };
+    if (schedulerRuntime.sleep === undefined) {
+      schedulerRuntime.sleep = activationSnapshotRuntime(runtime).sleep;
+    }
+    if (schedulerRuntime.now === undefined) {
+      schedulerRuntime.now = activationSnapshotRuntime(runtime).now;
+    }
+    const drained = await loadQuiescedActivationSchedulerEvidence(
+      manifest,
+      schedulerRuntime,
+      { snapshotRuntime: runtime },
+    );
+    assertSchedulerTransition(
+      disabled,
+      drained,
+      "disabled_manually",
+      "disabled_manually",
+      "Activation scheduler drain",
+    );
+    return {
+      ...baseOutput("quiesce-scheduler", manifest, drained),
+      status: "applied-drained",
+      applied: true,
+      plan_sha256: digest,
+      action,
+      scheduler_quiescence: drained,
+      next_action:
+        "Run a fresh activate preview while the scheduler remains disabled_manually.",
+    };
+  } catch (error) {
+    throw new Error(
+      `${error.message} recovery_code=activation-scheduler-restore-required. The manifest-bound scheduler remains disabled_manually; do not activate v2 until its current state and any started run are understood.`,
+      { cause: error },
+    );
+  }
+}
+
+async function runRestoreSchedulerMode(manifest, options, runtime) {
+  const repo = activationSchedulerRepository(manifest);
+  const scheduler = repo.scheduler_quiescence;
+  const label = "Activation scheduler restore precondition";
+  const snapshot = await loadStable(
+    label,
+    () =>
+      loadBoundedActivationSchedulerSnapshot(
+        manifest,
+        runtime,
+        {
+          expectedState: ["active", "disabled_manually"],
+          requireCanaryBase: false,
+        },
+      ),
+    activationSchedulerStableSnapshotOptions(manifest, runtime),
+  );
+  const action =
+    snapshot.workflow.state === "disabled_manually"
+      ? mutationDescriptor(
+          "PUT",
+          activationSchedulerEndpoint(repo, scheduler.workflow_id, "enable"),
+        )
+      : null;
+  const plan = schedulerModePlan(manifest, "restore-scheduler", snapshot, action);
+  const digest = planDigest(plan);
+  assertExpectedPlan(options, digest);
+  if (!options.apply || action === null) {
+    return {
+      ...baseOutput("restore-scheduler", manifest, snapshot),
+      status: action === null ? "verified-active" : "preview",
+      applied: false,
+      plan_sha256: digest,
+      action,
+      scheduler_quiescence: snapshot,
+    };
+  }
+  await revalidateUnchangedBeforeMutation(label, snapshot, () =>
+    loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      {
+        expectedState: "disabled_manually",
+        requireCanaryBase: false,
+      },
+    ),
+  );
+  let active;
+  try {
+    await ghJson(action.endpoint, { method: "PUT" });
+    active = await loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      {
+        expectedState: "active",
+        requireCanaryBase: false,
+      },
+    );
+  } catch (error) {
+    try {
+      active = await loadBoundedActivationSchedulerSnapshot(
+        manifest,
+        runtime,
+        {
+          expectedState: "active",
+          requireCanaryBase: false,
+        },
+      );
+    } catch (recoveryError) {
+      throw new Error(
+        `Activation scheduler enable outcome is unknown; recovery_code=activation-scheduler-state-unknown. Do not replay the enable request. Inspect the manifest-bound scheduler state before choosing a fresh restore preview.`,
+        { cause: recoveryError ?? error },
+      );
+    }
+  }
+  assertSchedulerTransition(snapshot, active, "disabled_manually", "active", label);
+  return {
+    ...baseOutput("restore-scheduler", manifest, active),
+    status: "applied-restored",
+    applied: true,
+    plan_sha256: digest,
+    action,
+    scheduler_quiescence: active,
+  };
+}
+
 function assertCoveragePhase(snapshot, { legacyState, v2State, cleanupState }) {
   assertState(
     snapshot.organization.legacy_state,
@@ -3684,91 +5044,125 @@ async function runActivateMode(manifest, options, runtime) {
   }
   const activationCoverageLabel =
     `${REQUIRED_REPOSITORY_COUNT}/${REQUIRED_REPOSITORY_COUNT} activation coverage`;
-  const snapshot = await loadStable(activationCoverageLabel, () =>
-    loadCoverageRound(manifest),
-    runtime.stableSnapshotOptions,
-  );
-  assertCoveragePhase(snapshot, {
-    legacyState: "before",
-    v2State: ["disabled", "active"],
-    cleanupState: "before",
-  });
-  const action =
-    snapshot.organization.v2_state === "disabled"
-      ? mutationDescriptor(
-          "PUT",
-          organizationRulesetEndpoint(manifest, manifest.v2_ruleset.id),
-          buildV2OrganizationRulesetPayload(manifest, "active"),
-        )
-      : null;
-  const plan = {
-    mode: "activate",
-    manifest_sha256: sha256Canonical(manifest),
-    snapshot_sha256: sha256Canonical(snapshot),
-    action,
-  };
-  const digest = planDigest(plan);
-  assertExpectedPlan(options, digest);
-  if (!options.apply || action === null) {
+  try {
+    // This narrow preflight deliberately happens before the broader coverage
+    // read. A scheduler that is already active is not a safe starting point for
+    // the legacy-writer proof; quiesce-scheduler owns that state transition.
+    // Keep it inside the recovery boundary: quiesce may already have left the
+    // scheduler disabled_manually when a transient control-plane read fails.
+    await loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      { expectedState: "disabled_manually" },
+    );
+    const snapshot = await loadStableActivationCoverage(
+      manifest,
+      runtime,
+      activationCoverageLabel,
+    );
+    assertCoveragePhase(snapshot, {
+      legacyState: "before",
+      v2State: ["disabled", "active"],
+      cleanupState: "before",
+    });
+    const action =
+      snapshot.organization.v2_state === "disabled"
+        ? mutationDescriptor(
+            "PUT",
+            organizationRulesetEndpoint(manifest, manifest.v2_ruleset.id),
+            buildV2OrganizationRulesetPayload(manifest, "active"),
+          )
+        : null;
+    const plan = {
+      mode: "activate",
+      manifest_sha256: sha256Canonical(manifest),
+      snapshot_sha256: sha256Canonical(snapshot),
+      scheduler_quiescence: snapshot.activation_scheduler_quiescence,
+      action,
+    };
+    const digest = planDigest(plan);
+    assertExpectedPlan(options, digest);
+    if (!options.apply || action === null) {
+      return {
+        ...baseOutput("activate", manifest, snapshot),
+        status: action === null ? "verified-dual-enforcement" : "preview",
+        applied: false,
+        plan_sha256: digest,
+        action,
+        scheduler_quiescence: snapshot.activation_scheduler_quiescence,
+        coverage: {
+          repositories_verified: snapshot.repositories.length,
+          required: REQUIRED_REPOSITORY_COUNT,
+          legacy_bridge: true,
+          v2: true,
+        },
+        ...(action === null
+          ? {
+              next_action:
+                "Run restore-scheduler preview/apply after confirming this is the intended dual-enforcement state.",
+            }
+          : {}),
+      };
+    }
+    await revalidateUnchangedBeforeMutation(
+      activationCoverageLabel,
+      snapshot,
+      () =>
+        loadActivationCoverageRevalidation(
+          manifest,
+          runtime,
+          `${activationCoverageLabel} immediate revalidation`,
+        ),
+    );
+    const response = await ghJson(action.endpoint, {
+      method: "PUT",
+      body: action.payload,
+    });
+    const updated = writableRulesetFromApi(
+      response,
+      "Organization",
+      manifest.organization.login,
+      "Activated v2 organization ruleset",
+    );
+    if (updated.id !== manifest.v2_ruleset.id) {
+      throw new Error("v2 activation response returned the wrong ruleset ID.");
+    }
+    assertExactOrganizationRulesetSnapshot(
+      updated.writable,
+      action.payload,
+      "Activated v2 organization ruleset",
+    );
+    const readback = await loadStableActivationCoverage(
+      manifest,
+      runtime,
+      "Active dual-enforcement readback",
+    );
+    assertCoveragePhase(readback, {
+      legacyState: "before",
+      v2State: "active",
+      cleanupState: "before",
+    });
     return {
-      ...baseOutput("activate", manifest, snapshot),
-      status: action === null ? "verified-dual-enforcement" : "preview",
-      applied: false,
+      ...baseOutput("activate", manifest, readback),
+      status: "applied-dual-enforcement-verified",
+      applied: true,
       plan_sha256: digest,
       action,
+      scheduler_quiescence: readback.activation_scheduler_quiescence,
       coverage: {
-        repositories_verified: snapshot.repositories.length,
+        repositories_verified: readback.repositories.length,
         required: REQUIRED_REPOSITORY_COUNT,
         legacy_bridge: true,
         v2: true,
       },
+      next_action: "Run restore-scheduler preview/apply after the documented dual-enforcement readback.",
     };
+  } catch (error) {
+    throw new Error(
+      `${error.message} recovery_code=activation-scheduler-reconcile-required. The scheduler was required to be disabled_manually before activation; inspect its current state. If it remains disabled, use restore-scheduler only after deciding whether the interrupted activation reached dual enforcement; otherwise restore or re-quiesce and start with a fresh activation preview.`,
+      { cause: error },
+    );
   }
-  await revalidateUnchangedBeforeMutation(
-    activationCoverageLabel,
-    snapshot,
-    () => loadCoverageRound(manifest),
-  );
-  const response = await ghJson(action.endpoint, {
-    method: "PUT",
-    body: action.payload,
-  });
-  const updated = writableRulesetFromApi(
-    response,
-    "Organization",
-    manifest.organization.login,
-    "Activated v2 organization ruleset",
-  );
-  if (updated.id !== manifest.v2_ruleset.id) {
-    throw new Error("v2 activation response returned the wrong ruleset ID.");
-  }
-  assertExactOrganizationRulesetSnapshot(
-    updated.writable,
-    action.payload,
-    "Activated v2 organization ruleset",
-  );
-  const readback = await loadStable("Active dual-enforcement readback", () =>
-    loadCoverageRound(manifest),
-    runtime.stableSnapshotOptions,
-  );
-  assertCoveragePhase(readback, {
-    legacyState: "before",
-    v2State: "active",
-    cleanupState: "before",
-  });
-  return {
-    ...baseOutput("activate", manifest, readback),
-    status: "applied-dual-enforcement-verified",
-    applied: true,
-    plan_sha256: digest,
-    action,
-    coverage: {
-      repositories_verified: readback.repositories.length,
-      required: REQUIRED_REPOSITORY_COUNT,
-      legacy_bridge: true,
-      v2: true,
-    },
-  };
 }
 
 async function runDeriveCutoverMode(manifest, runtime) {
@@ -3776,7 +5170,7 @@ async function runDeriveCutoverMode(manifest, runtime) {
     throw new Error("derive-cutover requires manifest.v2_ruleset.id.");
   }
   const snapshot = await loadStable("Dual-enforcement cutover derivation", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertCoveragePhase(snapshot, {
@@ -3940,7 +5334,7 @@ async function runApplyRepositoryCleanupMode(manifest, options, runtime) {
     throw new Error("apply-repository-cleanup requires manifest.v2_ruleset.id.");
   }
   const snapshot = await loadStable("Repository cleanup precondition", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertCoveragePhase(snapshot, {
@@ -3976,14 +5370,14 @@ async function runApplyRepositoryCleanupMode(manifest, options, runtime) {
   await revalidateUnchangedBeforeMutation(
     "Repository cleanup precondition",
     snapshot,
-    () => loadPostActivationRound(manifest),
+    () => loadPostActivationRound(manifest, runtime),
   );
   const outcomes = [];
   for (const record of pendingRecords) {
     outcomes.push(await executeRepositoryCleanupRecord(record));
   }
   const readback = await loadStable("Repository cleanup readback", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertCoveragePhase(readback, {
@@ -4014,7 +5408,7 @@ async function runVerifyMode(manifest, options, runtime) {
     throw new Error("verify requires manifest.v2_ruleset.id.");
   }
   const snapshot = await loadStable("Post-repository-cleanup verification", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertState(
@@ -4056,7 +5450,7 @@ async function runVerifyMode(manifest, options, runtime) {
   await revalidateUnchangedBeforeMutation(
     "Post-repository-cleanup verification",
     snapshot,
-    () => loadPostActivationRound(manifest),
+    () => loadPostActivationRound(manifest, runtime),
   );
   if (runtime.beforeFinalLegacyRevalidation !== undefined) {
     await runtime.beforeFinalLegacyRevalidation();
@@ -4068,6 +5462,11 @@ async function runVerifyMode(manifest, options, runtime) {
   await revalidateLegacyOnlyRepositoryImmediatelyBeforeCutover(
     manifest,
     snapshot,
+  );
+  await revalidateActivationSchedulerImmediatelyBeforeCutover(
+    manifest,
+    snapshot,
+    runtime,
   );
   const response = await ghJson(action.endpoint, {
     method: "PUT",
@@ -4088,7 +5487,7 @@ async function runVerifyMode(manifest, options, runtime) {
     "Legacy organization cutover response",
   );
   const readback = await loadStable("Final organization handoff closure", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertCoveragePhase(readback, {
@@ -4110,6 +5509,8 @@ export async function runCli(
   argv = process.argv.slice(2),
   {
     stableSnapshotOptions = undefined,
+    legacyEvidenceRuntime = undefined,
+    schedulerDrainRuntime = undefined,
     beforeFinalLegacyRevalidation = undefined,
     writeOutput = process.stdout.write.bind(process.stdout),
   } = {},
@@ -4125,7 +5526,12 @@ export async function runCli(
       "CLI runtime beforeFinalLegacyRevalidation must be a function when provided.",
     );
   }
-  const runtime = { stableSnapshotOptions, beforeFinalLegacyRevalidation };
+  const runtime = {
+    stableSnapshotOptions,
+    legacyEvidenceRuntime,
+    schedulerDrainRuntime,
+    beforeFinalLegacyRevalidation,
+  };
   const options = readCliOptions(argv);
   if (options.help) {
     printUsage();
@@ -4140,8 +5546,14 @@ export async function runCli(
     case "stage":
       output = await runStageMode(manifest, options, runtime);
       break;
+    case "quiesce-scheduler":
+      output = await runQuiesceSchedulerMode(manifest, options, runtime);
+      break;
     case "activate":
       output = await runActivateMode(manifest, options, runtime);
+      break;
+    case "restore-scheduler":
+      output = await runRestoreSchedulerMode(manifest, options, runtime);
       break;
     case "derive-cutover":
       output = await runDeriveCutoverMode(manifest, runtime);
@@ -4166,9 +5578,7 @@ const ghApiSlots = {
 };
 
 function deadlineExceededError(deadlineLabel) {
-  return new Error(
-    `${deadlineLabel} exceeded its shared deadline; the result is inconclusive and no next write is allowed.`,
-  );
+  return new DeadlineExceededError(deadlineLabel);
 }
 
 function remainingDeadlineMs(deadlineAt, deadlineLabel) {
@@ -4238,7 +5648,25 @@ function ghJson(
   endpoint,
   options = {},
 ) {
-  const { deadlineAt = undefined, deadlineLabel = undefined, ...requestOptions } = options;
+  const {
+    deadlineAt: requestedDeadlineAt = undefined,
+    deadlineLabel: requestedDeadlineLabel = undefined,
+    ...requestOptions
+  } = options;
+  if (requestedDeadlineAt !== undefined) {
+    assertDeadlineConfiguration(requestedDeadlineAt, requestedDeadlineLabel);
+  }
+  const inherited = ghDeadlineContext.getStore();
+  const useInherited =
+    inherited !== undefined &&
+    (requestedDeadlineAt === undefined ||
+      inherited.deadlineAt < requestedDeadlineAt);
+  const deadlineAt = useInherited
+    ? inherited.deadlineAt
+    : requestedDeadlineAt;
+  const deadlineLabel = useInherited
+    ? inherited.deadlineLabel
+    : requestedDeadlineLabel;
   return withGhApiSlot(
     () =>
       ghJsonUnbounded(endpoint, requestOptions, {

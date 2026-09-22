@@ -15,8 +15,10 @@ that one ID exactly once; an arbitrary eleventh ID, a duplicate, or an identity
 that overlaps an active member is rejected. This prevents a superficially
 valid selector from silently moving the archived repository's protection to an
 unrelated repository.
-The template uses `organization-review-gate-handoff-manifest/v2`; historical
-v1 manifests must not be reused for this cutover.
+The template uses `organization-review-gate-handoff-manifest/v3`; historical
+v1 and v2 manifests must not be reused for this cutover. Version 3 binds the
+activation timing and the one temporary scheduler boundary described below, so
+an older manifest cannot silently omit either control.
 
 The template is intentionally not executable as checked in. Replace every
 `REPLACE_WITH_...` value with an API-read identity after the corresponding
@@ -43,6 +45,77 @@ other unsupported entry types make the inventory inconclusive. Each
 repository must also expose a complete Actions policy with default workflow
 permissions set to `read`; that policy is included in every cohort snapshot.
 
+Version 3 also binds timing and the one scheduler that can create fresh
+legacy-writer work during the organization handoff:
+
+- `activation.legacy_evidence_stability_timeout_ms` is the bounded retry window
+  for one repository's legacy-status proof. The template uses 900,000 ms.
+- `activation.repository_evidence_timeout_ms` bounds every repository's complete
+  activation evidence read, including its legacy proof and control-plane read.
+  The template uses 1,200,000 ms.
+- `activation.scheduler_snapshot_timeout_ms` bounds each scheduler state
+  snapshot. The template uses 120,000 ms. The activation preflight and both
+  scheduler snapshots surrounding the drain each use this bound independently.
+- `activation.organization_evidence_timeout_ms` bounds the organization
+  control-plane read in a coverage round. The template uses 120,000 ms.
+- `activation.coverage_round_timeout_ms` caps one complete full-cohort coverage
+  round. The template uses 9,000,000 ms. A successful round has the explicit
+  8,340-second topology bound: 2,100 seconds for scheduler drain, two
+  120-second scheduler snapshots, then `max(120, ceil(10 / 2) * 1,200)`
+  seconds while the organization read and five two-repository evidence waves
+  run in parallel. The remaining 660 seconds are intentional round slack.
+- After the scheduler sequence, a branch failure retains the first observed
+  error but waits for the sibling branch and every already-started repository
+  worker to finish before returning. An early organization failure can therefore
+  wait for the remaining bounded repository phase; this is intentional
+  fail-closed draining.
+- `activation.coverage_stability_timeout_ms` caps one two-round stable coverage
+  pair. The template uses 18,005,000 ms, exactly two 9,000-second rounds plus
+  the five-second stable-read interval.
+- Every repository binds `legacy_writer_scan_timeout_ms`. The normal value is
+  60,000 ms; `Joey-Tools/codex-private-workflows` alone uses 300,000 ms for its
+  2,133-run historical writer inventory.
+- `scheduler_quiescence` is `null` everywhere except
+  `Joey-Tools/codex-private-workflows`. Its one descriptor binds workflow ID,
+  path `.github/workflows/scheduled-sync-release.yml`, exact Git blob and
+  SHA-256 identities, the required initial `active` state, and a 2,100,000 ms
+  drain timeout. It is not a verifier or legacy bridge descriptor, and no
+  other workflow or repository is permitted to opt into this mechanism.
+
+The workflow YAML inventory, Actions workflow inventory, and local repository
+ruleset inventory each have a hard 32-entry admission cap. Exceeding one is
+inconclusive and fails closed rather than expanding a control-plane read without
+bound. These caps do not claim a hard upper bound on HTTP pagination requests;
+the separately enforced phase deadlines remain the wall-clock boundary for
+paginated GitHub reads.
+
+The reviewed deployment manifest may raise its soft limits only within the
+validated maxima: 1,800 seconds per repository, 300 seconds per scheduler
+snapshot, 600 seconds for organization evidence, 15,000 seconds per round, and
+30,005 seconds per stable pair. Any raised values must still satisfy the
+manifest topology formula; they are reviewed input, not ad hoc CLI overrides.
+
+The private scheduler is the only workflow that is temporarily disabled. It
+can start a repository sync which in turn starts the retained v1/v2 producers;
+the verifier and temporary legacy bridge must remain enabled throughout the
+handoff. The helper inventories every page of the scheduler's run history
+without `status`, `head_sha`, event, or creation-time filters. After disable,
+an already-started run is allowed to finish normally and is never cancelled.
+The helper accepts the drain only after two complete, identical inventories
+show terminal run states; otherwise it leaves the scheduler
+`disabled_manually` and stops before organization activation.
+These are upper capacity limits, not a promise that `activate` consumes the
+whole duration or any kind of GitHub Actions-minutes-free operation. A normal
+path ends when its actual reads complete. Pre-write and post-write stable
+coverage apply both bounds: each constituent coverage round independently has
+the one-round cap, and the complete pair has the two-round cap. Immediate
+revalidation has only the one-round cap. The per-round bound prevents one
+overlong read from consuming the pair budget and keeping the scheduler
+`disabled_manually` longer than its own capacity. Every scheduler snapshot,
+repository evidence read, and organization evidence read also has its own
+deadline, so a single slow control-plane phase cannot silently consume the
+whole round.
+
 Before the initial stage, literal JSON `null` at `v2_ruleset.id` is the only
 permitted incomplete manifest value. If `stage --apply` may have created the
 rule but fails, it first attempts one read-only reconciliation; returned
@@ -55,10 +128,70 @@ old rule remains at its exact before-state. Absent, multiple, Active or
 drifted candidates fail closed. Hold an external organization-admin
 policy-mutation freeze for the complete recovery read.
 
+Before organization activation, use the explicit scheduler lifecycle in this
+order: `quiesce-scheduler` preview/apply, a **fresh** `activate` preview/apply,
+then `restore-scheduler` preview/apply after the successful dual-enforcement
+readback. Each mutating invocation takes only the `plan_sha256` emitted by its
+own immediately preceding preview:
+
+```bash
+HANDOFF_QUIESCE_PREVIEW="$(mktemp)"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode quiesce-scheduler > "$HANDOFF_QUIESCE_PREVIEW"
+HANDOFF_QUIESCE_PLAN_SHA256="$(jq -er \
+  '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+  "$HANDOFF_QUIESCE_PREVIEW")"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode quiesce-scheduler \
+  --apply \
+  --expected-plan-sha256 "$HANDOFF_QUIESCE_PLAN_SHA256"
+
+HANDOFF_ACTIVATE_PREVIEW="$(mktemp)"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode activate > "$HANDOFF_ACTIVATE_PREVIEW"
+HANDOFF_ACTIVATE_PLAN_SHA256="$(jq -er \
+  '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+  "$HANDOFF_ACTIVATE_PREVIEW")"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode activate \
+  --apply \
+  --expected-plan-sha256 "$HANDOFF_ACTIVATE_PLAN_SHA256"
+
+HANDOFF_RESTORE_PREVIEW="$(mktemp)"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode restore-scheduler > "$HANDOFF_RESTORE_PREVIEW"
+HANDOFF_RESTORE_PLAN_SHA256="$(jq -er \
+  '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+  "$HANDOFF_RESTORE_PREVIEW")"
+node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
+  --manifest "$HANDOFF_MANIFEST" \
+  --mode restore-scheduler \
+  --apply \
+  --expected-plan-sha256 "$HANDOFF_RESTORE_PLAN_SHA256"
+```
+
+`activate` refuses to use a pre-quiesce coverage snapshot. It reads the
+manifest-bound scheduler in `disabled_manually` state, proves the scheduler's
+drained execution epoch, and then establishes a new stable coverage snapshot.
+If `quiesce-scheduler` or `activate` fails after disable, the deliberately
+durable `disabled_manually` state is recovery evidence, not a signal to replay
+a PUT. Read the reported `recovery_code`, determine whether dual enforcement
+was reached, then take a new preview. Use `restore-scheduler` only after that
+decision; it is also the explicit recovery operation when activation did not
+proceed. An unknown disable/enable outcome must be reconciled by its exact
+manifest-bound state before another mutation. The helper never restores the
+scheduler automatically after a failed quiesce or activation.
+
 Keep every manifest-bound canary open, non-draft, unmerged, and on the exact
 current default-branch base through the Active organization-rule write and its
 stable dual-enforcement readback. Only after that activation proof succeeds,
-close the canaries unmerged. `derive-cutover`, `apply-repository-cleanup`, and
+restore the scheduler, then close the canaries unmerged. `derive-cutover`,
+`apply-repository-cleanup`, and
 `verify` intentionally do not depend on live canary PR/run/status evidence
 after this boundary; they continue to read each repository's live default
 branch and do not require its head to remain equal to the historical canary
@@ -82,13 +215,19 @@ digest.
 
 Hold an external organization-admin policy-mutation freeze from the `stage`
 preview through apply, readback, and any recovery. Establish an organization-
-and repository-admin freeze again for `activate`, from preview through stable
-post-write readback. Start it a third time before the
+and repository-admin freeze again before the `quiesce-scheduler` preview and
+hold it through the fresh `activate` preview/apply, stable post-write
+dual-enforcement readback, and `restore-scheduler` readback. The scheduler
+remains `disabled_manually` between the explicit quiesce and restore commands;
+do not allow a separate scheduler enable/disable during that boundary. Start a
+third freeze before the
 `apply-repository-cleanup` preview and hold it continuously through cleanup
 apply/readback, final `verify` preview/apply, and a separate final read-only
 `verify` receipt capture and validation. During these freezes, do not change
 any organization/repository ruleset, classic branch protection, condition,
-required check, or bypass actor. The helper validates the exact manifest-bound
+required check, or bypass actor. During the third freeze, the restored
+manifest-bound scheduler must remain `active`; no administrator may separately
+enable or disable it. The helper validates the exact manifest-bound
 bypass lists; it cannot
 automatically discover or preserve an actor concurrently added outside that
 snapshot. GitHub provides no documented conditional/CAS update for the
@@ -98,13 +237,22 @@ cannot make the final GET-to-PUT interval atomic.
 `verify --apply` removes the whole legacy `required_status_checks` rule from
 the old organization ruleset only after all repository actions read back at
 their exact expected post-state. Each post-activation/cutover stable snapshot
-also reads the legacy-only repository from GitHub and requires its returned
+also rereads the manifest-bound scheduler and requires its live Actions
+workflow state to be `active`, then reads the legacy-only repository from
+GitHub and requires its returned
 `full_name`, `id`, `node_id`, `default_branch`, and `archived` flag to match the
 manifest. The final apply performs the stable full-cohort read, an immediate
-complete cohort revalidation, and then direct rereads of both the old
-organization ruleset and the legacy-only repository immediately before its
-PUT. An unreadable response, identity mismatch, or `archived: false` is
+complete cohort revalidation, and then direct rereads of the old organization
+ruleset, the legacy-only repository, and the manifest-bound scheduler as
+`active` and unchanged from the stable snapshot immediately before its PUT. An
+unreadable response, identity mismatch, or `archived: false` is
 inconclusive and sends no cutover write.
+
+If scheduler restoration was skipped or failed, `derive-cutover`,
+`apply-repository-cleanup`, and `verify` fail closed before their next write
+with `recovery_code=activation-scheduler-restore-required`. Run a fresh
+`restore-scheduler` preview/apply, confirm its manifest-bound active readback,
+then restart the blocked post-activation preview.
 
 Do not use the `verify --apply` response to authorize bridge removal. Even
 after its write/readback, the control plane may drift. While the third freeze

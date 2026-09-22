@@ -21,6 +21,13 @@
   the fixed active 10-repository v2 cohort proves its canonical v2 check under
   a separately active v2-only organization rule. Any missing or drifting proof
   leaves the system in the deliberately fail-closed dual-protection state.
+- Before the organization v2 activation proof, the manifest-bound Private
+  Overlay scheduler must be explicitly quiesced, allowed to drain without
+  cancellation, and restored only after the stable dual-enforcement readback.
+  Its preflight snapshots and every activation evidence phase use the reviewed
+  v3 capacity contract; 32-entry workflow/ruleset admission caps and any
+  expired phase fail closed. The authoritative operation/recovery details are
+  in the active handoff journal.
 - The old rule's original 11-repository legacy selector remains intact,
   including archived `Joey-Tools/codex-waited-delivery`. Final cutover removes
   only the v1 required-status rule; it retains `deletion` and
