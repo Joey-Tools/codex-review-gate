@@ -639,6 +639,10 @@ function createFakeGhHarness(
     extraEffectiveRules = [],
     extraEffectiveSecondPageRules = [],
     mutateEffectiveRules = null,
+    repositoryIdentityFailureIndex = null,
+    repositoryIdentityDelayIndex = null,
+    repositoryIdentityDelaySeconds = null,
+    repositoryIdentityDelayCompletionMarker = false,
     legacyProducerRunPages = null,
     legacyProducerRunDelaySeconds = null,
     legacyProducerRunDelayCompletionMarker = false,
@@ -652,6 +656,7 @@ function createFakeGhHarness(
     apiSortOrganizationSelectorIds = false,
     apiOrganizationSelectorIds = null,
     organizationRulesetInventoryFailure = false,
+    organizationRulesetInventoryFailureDelaySeconds = null,
     apiSortRepositoryCleanupRulesetArrays = false,
     mutateRepositoryCleanupRulesetReadback = null,
   } = {},
@@ -671,6 +676,10 @@ function createFakeGhHarness(
       "legacyProducerRunDelayCompletionMarker",
       legacyProducerRunDelayCompletionMarker,
     ],
+    [
+      "repositoryIdentityDelayCompletionMarker",
+      repositoryIdentityDelayCompletionMarker,
+    ],
     ["organizationRulesetInventoryFailure", organizationRulesetInventoryFailure],
   ]) {
     if (typeof value !== "boolean") {
@@ -682,6 +691,44 @@ function createFakeGhHarness(
     ...additionalWorkflowFiles,
   ];
   const { manifest, codeownersBytes } = integrationManifestFixture();
+  for (const [label, value] of [
+    ["repositoryIdentityFailureIndex", repositoryIdentityFailureIndex],
+    ["repositoryIdentityDelayIndex", repositoryIdentityDelayIndex],
+  ]) {
+    if (
+      value !== null &&
+      (!Number.isSafeInteger(value) || value < 0 || value >= manifest.repositories.length)
+    ) {
+      throw new Error(`${label} must name one fixture repository index.`);
+    }
+  }
+  for (const [label, value] of [
+    ["repositoryIdentityDelaySeconds", repositoryIdentityDelaySeconds],
+    [
+      "organizationRulesetInventoryFailureDelaySeconds",
+      organizationRulesetInventoryFailureDelaySeconds,
+    ],
+  ]) {
+    if (value !== null && (!Number.isFinite(value) || value <= 0)) {
+      throw new Error(`${label} must be a positive finite delay.`);
+    }
+  }
+  if (
+    repositoryIdentityDelayCompletionMarker &&
+    (repositoryIdentityDelayIndex === null || repositoryIdentityDelaySeconds === null)
+  ) {
+    throw new Error(
+      "repositoryIdentityDelayCompletionMarker requires an identity delay target.",
+    );
+  }
+  if (
+    organizationRulesetInventoryFailureDelaySeconds !== null &&
+    !organizationRulesetInventoryFailure
+  ) {
+    throw new Error(
+      "organizationRulesetInventoryFailureDelaySeconds requires an organization inventory failure.",
+    );
+  }
   const directory = mkdtempSync(join(tmpdir(), "organization-handoff-fake-gh-"));
   const ghPath = join(directory, "gh");
   const logPath = join(directory, "requests.tsv");
@@ -699,6 +746,10 @@ function createFakeGhHarness(
   );
   const legacyWriterRaceStatePath = join(directory, "legacy-writer-race-state");
   const schedulerStatePath = join(directory, "scheduler-state");
+  const repositoryIdentityDelayCompletionPath =
+    repositoryIdentityDelayCompletionMarker
+      ? join(directory, "repository-identity-delay-complete")
+      : null;
   const legacyProducerRunDelayCompletionPath =
     legacyProducerRunDelayCompletionMarker
       ? join(directory, "legacy-producer-run-delay-complete")
@@ -707,6 +758,7 @@ function createFakeGhHarness(
   const cleanupSurfaceReadCountPaths = [];
   const responses = new Map();
   const delayedRequests = [];
+  const forcedFailureRequests = [];
   const legacyWriterRaceResponses = [];
   const schedulerWorkflowResponses = [];
   const cleanupResponses = [];
@@ -752,13 +804,30 @@ function createFakeGhHarness(
 
   for (const [repositoryIndex, repository] of manifest.repositories.entries()) {
     const encodedSlug = encodeEndpointPathForTest(repository.slug);
+    const repositoryIdentityEndpoint = `repos/${encodedSlug}`;
     const controlPlaneHead = postActivationHeadSha ?? repository.canary.base_sha;
-    addFakeResponse(responses, `repos/${encodedSlug}`, {
+    addFakeResponse(responses, repositoryIdentityEndpoint, {
       full_name: repository.slug,
       id: repository.id,
       node_id: repository.node_id,
       default_branch: repository.default_branch,
     });
+    if (repositoryIndex === repositoryIdentityFailureIndex) {
+      forcedFailureRequests.push({
+        request: `GET:${repositoryIdentityEndpoint}`,
+        message: `simulated repository ${repository.slug} identity failure`,
+      });
+    }
+    if (
+      repositoryIndex === repositoryIdentityDelayIndex &&
+      repositoryIdentityDelaySeconds !== null
+    ) {
+      delayedRequests.push({
+        request: `GET:${repositoryIdentityEndpoint}`,
+        seconds: repositoryIdentityDelaySeconds,
+        completionPath: repositoryIdentityDelayCompletionPath,
+      });
+    }
     if (repositoryIndex === 0 && cleanupIdentityDriftAtMetadataRead !== null) {
       cleanupIdentityResponse = {
         request: `GET:repos/${encodedSlug}`,
@@ -1463,6 +1532,11 @@ function createFakeGhHarness(
     ...(organizationRulesetInventoryFailure
       ? [
           `if [ "$request" = ${shellQuote(`GET:${orgRulesetCollection}?per_page=100`)} ]; then`,
+          ...(organizationRulesetInventoryFailureDelaySeconds === null
+            ? []
+            : [
+                `  sleep ${shellQuote(String(organizationRulesetInventoryFailureDelaySeconds))}`,
+              ]),
           "  printf '%s\\n' 'simulated organization ruleset inventory failure' >&2; exit 1",
           "fi",
         ]
@@ -1682,6 +1756,15 @@ function createFakeGhHarness(
     }
     scriptLines.push("esac");
   }
+  if (forcedFailureRequests.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const failure of forcedFailureRequests) {
+      scriptLines.push(
+        `  ${shellQuote(failure.request)}) printf '%s\\n' ${shellQuote(failure.message)} >&2; exit 1 ;;`,
+      );
+    }
+    scriptLines.push("esac");
+  }
   if (delayedRequests.length > 0) {
     scriptLines.push('case "$request" in');
     for (const delayed of delayedRequests) {
@@ -1727,6 +1810,9 @@ function createFakeGhHarness(
   writeFileSync(cleanupIdentityReadCountPath, "0\n");
   writeFileSync(legacyWriterRaceStatePath, "before\n");
   writeFileSync(schedulerStatePath, `${schedulerWorkflowState}\n`);
+  if (repositoryIdentityDelayCompletionPath !== null) {
+    writeFileSync(repositoryIdentityDelayCompletionPath, "pending\n");
+  }
   if (legacyProducerRunDelayCompletionPath !== null) {
     writeFileSync(legacyProducerRunDelayCompletionPath, "pending\n");
   }
@@ -1782,6 +1868,7 @@ function createFakeGhHarness(
     cleanupIdentityReadCountPath,
     legacyWriterRaceStatePath,
     schedulerStatePath,
+    repositoryIdentityDelayCompletionPath,
     legacyProducerRunDelayCompletionPath,
     cleanupActionStatePaths,
     cleanupSurfaceReadCountPaths,
@@ -2760,6 +2847,50 @@ test("activation settles already-started repository evidence before surfacing or
   );
   assert.deepEqual(
     mutationRequests(fakeGhRequests(harness.logPath)),
+    [],
+    "a failed coverage read must not reach the v2 activation mutation",
+  );
+});
+
+test("activation preserves the first repository failure while its worker wave drains", async (t) => {
+  const harness = createFakeGhHarness(t, {
+    repositoryIdentityFailureIndex: 0,
+    repositoryIdentityDelayIndex: 1,
+    repositoryIdentityDelaySeconds: 0.75,
+    repositoryIdentityDelayCompletionMarker: true,
+    organizationRulesetInventoryFailure: true,
+    organizationRulesetInventoryFailureDelaySeconds: 0.5,
+  });
+  assert.ok(harness.repositoryIdentityDelayCompletionPath);
+  writeFileSync(harness.v2StatePath, "disabled\n");
+  writeFileSync(harness.legacyStatePath, "before\n");
+  writeFileSync(harness.cleanupStatePath, "before\n");
+  writeFileSync(harness.logPath, "");
+
+  const firstRepository = harness.manifest.repositories[0];
+  const organizationInventoryEndpoint =
+    `orgs/${encodeURIComponent(harness.manifest.organization.login)}/rulesets?per_page=100`;
+  await assert.rejects(
+    runFakeCli(harness, "activate"),
+    new RegExp(
+      `simulated repository ${firstRepository.slug.replace("/", "\\/")} identity failure`,
+      "u",
+    ),
+  );
+
+  const requests = fakeGhRequests(harness.logPath);
+  assert.equal(
+    requests.some(({ endpoint }) => endpoint === organizationInventoryEndpoint),
+    true,
+    "the later organization failure must have been observed before the aggregate rejects",
+  );
+  assert.equal(
+    readFileSync(harness.repositoryIdentityDelayCompletionPath, "utf8").trim(),
+    "completed",
+    "the same-wave repository worker must settle before coverage returns its first failure",
+  );
+  assert.deepEqual(
+    mutationRequests(requests),
     [],
     "a failed coverage read must not reach the v2 activation mutation",
   );

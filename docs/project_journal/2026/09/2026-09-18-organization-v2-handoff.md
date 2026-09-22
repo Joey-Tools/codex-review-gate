@@ -531,6 +531,19 @@ the global cutover is closed.
   stable-read retry, and would let asynchronous work survive into test cleanup.
   The convergence wait establishes that the prior round has no remaining
   started reader before recovery or another stable read may begin.
+- A follow-up Terra review made the first-failure boundary inside the bounded
+  repository mapper explicit. Waiting for that mapper's aggregate promise to
+  reject is too late: a same-wave worker can still be draining when a later
+  organization failure arrives, incorrectly replacing the earlier repository
+  failure. The mapper now reports its first caught worker error to the shared
+  converger immediately, stops acquiring further repository items, and still
+  waits for every already-started worker and the sibling organization branch
+  before returning that original error. Regression coverage makes repository
+  worker 0 fail first, delays worker 1's completion, and delays the
+  organization failure until later; it requires the repository error to win,
+  proves worker 1 settled before return, and proves the failed round emitted no
+  mutation. This preserves both diagnostic causality and the no-overlapping-
+  scans recovery boundary.
 - A pre-commit audit found that applying only the two-round pair deadline
   would still let either constituent round consume the whole pair. The helper
   therefore applies `coverage_round_timeout_ms` independently to each round

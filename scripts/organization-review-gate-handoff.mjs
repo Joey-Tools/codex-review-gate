@@ -3773,12 +3773,24 @@ async function loadRepositoryEvidence(
   };
 }
 
-export async function mapWithConcurrency(items, limit, mapper) {
-  if (!Array.isArray(items) || !Number.isSafeInteger(limit) || limit <= 0) {
+export async function mapWithConcurrency(
+  items,
+  limit,
+  mapper,
+  { onFirstFailure = undefined } = {},
+) {
+  if (
+    !Array.isArray(items) ||
+    !Number.isSafeInteger(limit) ||
+    limit <= 0
+  ) {
     throw new Error("Bounded mapper requires an array and positive safe-integer limit.");
   }
   if (typeof mapper !== "function") {
     throw new Error("Bounded mapper requires a mapper function.");
+  }
+  if (onFirstFailure !== undefined && typeof onFirstFailure !== "function") {
+    throw new Error("Bounded mapper first-failure callback must be a function.");
   }
   const results = new Array(items.length);
   let next = 0;
@@ -3794,7 +3806,10 @@ export async function mapWithConcurrency(items, limit, mapper) {
         try {
           results[index] = await mapper(items[index], index);
         } catch (error) {
-          if (firstError === null) firstError = error;
+          if (firstError === null) {
+            firstError = error;
+            onFirstFailure?.(error);
+          }
           return;
         }
       }
@@ -3804,28 +3819,31 @@ export async function mapWithConcurrency(items, limit, mapper) {
   return results;
 }
 
-async function awaitCoverageEvidence(organizationPromise, repositoriesPromise) {
+async function awaitCoverageEvidence(organizationFactory, repositoriesFactory) {
   // Do not let one evidence branch reject while the other continues in the
   // background. A subsequent stable-read retry must not overlap stale scans
   // or inherit their API work after the caller has already handled an error.
-  // Preserve Promise.all's existing first-observed failure semantics after all
-  // already-started work has reached a terminal result.
+  // Preserve the earliest observed failure even when a repository mapper waits
+  // for another already-started worker before its aggregate promise rejects.
   let failureCaptured = false;
   let firstFailure;
-  const recordFailure = async (promise) => {
+  const recordFirstFailure = (error) => {
+    if (!failureCaptured) {
+      failureCaptured = true;
+      firstFailure = error;
+    }
+  };
+  const settle = async (factory) => {
     try {
-      return await promise;
+      return await factory(recordFirstFailure);
     } catch (error) {
-      if (!failureCaptured) {
-        failureCaptured = true;
-        firstFailure = error;
-      }
+      recordFirstFailure(error);
       return undefined;
     }
   };
   const [organization, repositories] = await Promise.all([
-    recordFailure(organizationPromise),
-    recordFailure(repositoriesPromise),
+    settle(organizationFactory),
+    settle(repositoriesFactory),
   ]);
   if (failureCaptured) {
     throw firstFailure;
@@ -3838,17 +3856,19 @@ async function loadCoverageRound(
   { requireCanaryEvidence = true, legacyEvidenceRuntime = undefined } = {},
 ) {
   const coverage = await awaitCoverageEvidence(
-    loadOrganizationRound(manifest),
-    mapWithConcurrency(
-      manifest.repositories,
-      REPOSITORY_EVIDENCE_CONCURRENCY,
-      (repo) =>
-        loadRepositoryEvidence(repo, {
-          requireCanaryEvidence,
-          manifest,
-          legacyEvidenceRuntime,
-        }),
-    ),
+    () => loadOrganizationRound(manifest),
+    (onFirstFailure) =>
+      mapWithConcurrency(
+        manifest.repositories,
+        REPOSITORY_EVIDENCE_CONCURRENCY,
+        (repo) =>
+          loadRepositoryEvidence(repo, {
+            requireCanaryEvidence,
+            manifest,
+            legacyEvidenceRuntime,
+          }),
+        { onFirstFailure },
+      ),
   );
   assertEffectiveOrganizationGateCoverage(coverage, manifest);
   return coverage;
@@ -4054,17 +4074,20 @@ async function loadActivationCoverageRound(
     { outerDeadlineAt, clockRuntime: runtime },
   );
   const coverage = await awaitCoverageEvidence(
-    loadBoundedActivationOrganizationEvidence(manifest, runtime, {
-      outerDeadlineAt,
-    }),
-    mapWithConcurrency(
-      manifest.repositories,
-      REPOSITORY_EVIDENCE_CONCURRENCY,
-      (repo) =>
-        loadBoundedActivationRepositoryEvidence(repo, manifest, runtime, {
-          outerDeadlineAt,
-        }),
-    ),
+    () =>
+      loadBoundedActivationOrganizationEvidence(manifest, runtime, {
+        outerDeadlineAt,
+      }),
+    (onFirstFailure) =>
+      mapWithConcurrency(
+        manifest.repositories,
+        REPOSITORY_EVIDENCE_CONCURRENCY,
+        (repo) =>
+          loadBoundedActivationRepositoryEvidence(repo, manifest, runtime, {
+            outerDeadlineAt,
+          }),
+        { onFirstFailure },
+      ),
   );
   assertEffectiveOrganizationGateCoverage(coverage, manifest);
   return { ...coverage, activation_scheduler_quiescence: scheduler };
